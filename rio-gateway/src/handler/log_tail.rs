@@ -309,9 +309,10 @@ enum DriveEnd {
 /// arrived past it (merged_bug_150). The pre-fix shape kept only
 /// `gap_from` and dropped the chunk — so any exit between the first
 /// sighting and the second (grace edge, orphan, terminal-complete)
-/// lost both the fetched lines AND the marker. Holding the sliced
-/// chunk makes the exit flush total: [`flush_pending_gap`] is the
-/// only way out of this state, and every `run_tail` exit path runs it.
+/// lost both the fetched lines AND the marker. The state lives in a
+/// [`PendingGapCell`] (merged_bug_023): the only operations are
+/// record / same-span merge / heal / flush — a plain assignment that
+/// destroys fetched-but-undisclosed lines is unrepresentable.
 struct PendingGap {
     /// First missing line (== the relay floor at sighting time).
     gap_from: u64,
@@ -321,6 +322,118 @@ struct PendingGap {
     withheld: TaggedLogChunk,
     /// The relay watermark to adopt once the withheld lines flush.
     next_line: u64,
+}
+
+/// What a `GapThenServe` sighting means against the cell's state.
+enum Sighting {
+    /// Nothing pending: this is the hole's first observation.
+    First,
+    /// The store re-served the SAME split — the hole is durable.
+    SameSpan,
+    /// The store's view changed across the re-open (a different
+    /// split): the OLD pending must flush before the chunk is
+    /// re-examined against the advanced floor.
+    Divergent,
+}
+
+/// How a `Serve` interacted with a pending hole.
+enum ServeHeal {
+    /// No pending, or the serve did not reach into the hole.
+    Untouched,
+    /// Partial heal: the hole shrank (`gap_from` advanced); the
+    /// withheld lines stay for the eventual flush.
+    Shrunk,
+    /// The hole fully healed — no marker is owed. The payload is the
+    /// withheld CONTINUATION to relay (trimmed of any prefix the
+    /// serve already covered) with the watermark to adopt; `None`
+    /// when the serve covered the entire withheld span too (true
+    /// duplicates, nothing lost).
+    Healed(Option<(TaggedLogChunk, u64)>),
+}
+
+// r[impl store.log.tail-grace-drain+2]
+/// merged_bug_023: the linear withheld-gap cell. The pre-fix code
+/// mutated `Option<PendingGap>` directly at two in-stream transitions
+/// — the second-sighting accept REPLACED the pending (destroying the
+/// first sighting's withheld lines and widening the marker over
+/// content the relay held in hand), and the serve-arm void fired on
+/// PARTIAL heals (`next_line > gap_from` instead of `>= gap_until`),
+/// discarding withheld lines while the hole persisted. The field is
+/// private; every consuming path either relays the lines (flush,
+/// heal-continuation) or proves them duplicates (over-heal trim,
+/// same-span merge keeping max coverage) — destruction has no API.
+struct PendingGapCell(Option<PendingGap>);
+
+impl PendingGapCell {
+    const fn empty() -> Self {
+        Self(None)
+    }
+
+    fn gap_from(&self) -> Option<u64> {
+        self.0.as_ref().map(|p| p.gap_from)
+    }
+
+    fn classify(&self, gap_from: u64, gap_until: u64) -> Sighting {
+        match &self.0 {
+            None => Sighting::First,
+            Some(p) if p.gap_from == gap_from && p.gap_until == gap_until => Sighting::SameSpan,
+            Some(_) => Sighting::Divergent,
+        }
+    }
+
+    /// First sighting: record the hole and its withheld lines.
+    fn record_first(&mut self, fresh: PendingGap) {
+        debug_assert!(self.0.is_none(), "record_first on a non-empty cell");
+        self.0 = Some(fresh);
+    }
+
+    /// Same-span second sighting: keep whichever copy covers MORE
+    /// (the chunks carry identical numbering, so the longer one is a
+    /// superset — replacing with a shorter fresh copy would drop the
+    /// old tail).
+    fn merge_same_span(&mut self, fresh: PendingGap) {
+        match self.0.as_mut() {
+            None => self.0 = Some(fresh),
+            Some(old) => {
+                if fresh.next_line > old.next_line {
+                    *old = fresh;
+                }
+            }
+        }
+    }
+
+    /// A `Serve` advanced the floor to `next_line`: shrink, keep, or
+    /// heal the pending hole. Healing returns the withheld
+    /// continuation to relay — never silently drops it.
+    fn on_serve(&mut self, next_line: u64) -> ServeHeal {
+        let Some(p) = self.0.as_mut() else {
+            return ServeHeal::Untouched;
+        };
+        if next_line <= p.gap_from {
+            return ServeHeal::Untouched;
+        }
+        if next_line < p.gap_until {
+            // Partial heal: the served prefix [gap_from, next_line)
+            // cannot duplicate the withheld lines (they start at
+            // gap_until); only the residual hole remains.
+            p.gap_from = next_line;
+            return ServeHeal::Shrunk;
+        }
+        // Full heal: the serve covered [.., next_line) ⊇ the hole.
+        let p = self.0.take().expect("checked above");
+        let skip = usize::try_from(next_line - p.gap_until).unwrap_or(usize::MAX);
+        if skip >= p.withheld.lines.len() {
+            // The serve also covered every withheld line — true
+            // duplicates; the floor is already past them.
+            return ServeHeal::Healed(None);
+        }
+        let suffix = TaggedLogChunk {
+            derivation_path: p.withheld.derivation_path.clone(),
+            first_line_number: next_line,
+            lines: p.withheld.lines[skip..].to_vec(),
+        };
+        ServeHeal::Healed(Some((suffix, p.next_line.saturating_sub(1))))
+    }
 }
 
 // r[impl store.log.tail-reconnect]
@@ -362,7 +475,7 @@ async fn run_tail(
     // once — the loop cannot ping-pong on one hole. The lines that
     // arrived past the jump ride along (merged_bug_150) so EVERY exit
     // path can flush them with the disclosure.
-    let mut pending_gap: Option<PendingGap> = None;
+    let mut pending_gap = PendingGapCell::empty();
     // Gaps at line numbers below this have already been disclosed with
     // a marker; never re-mark them.
     let mut accepted_gap_floor: Option<u64> = None;
@@ -461,7 +574,7 @@ async fn run_tail(
                         // span before the gap is accepted and
                         // disclosed.
                         debug!(
-                            gap_from = pending_gap.as_ref().map_or(0, |p| p.gap_from),
+                            gap_from = pending_gap.gap_from().unwrap_or(0),
                             "TailLog stream jumped past the relay floor; re-opening at the gap"
                         );
                         TailStopCause::GapObserved
@@ -655,7 +768,7 @@ async fn drive_stream(
     last_relayed: &mut Option<u64>,
     served_complete: &mut bool,
     grace_deadline: &mut Option<Instant>,
-    pending_gap: &mut Option<PendingGap>,
+    pending_gap: &mut PendingGapCell,
     accepted_gap_floor: &mut Option<u64>,
     terminal_grace: Duration,
     reconnect_backoff: Duration,
@@ -685,22 +798,27 @@ async fn drive_stream(
                     // one `tail_next` needs. Recorded BEFORE the empty
                     // final is dropped below.
                     *served_complete = chunk.is_complete;
-                    let floor = last_relayed.map_or(0, |n| n.saturating_add(1));
-                    let first = chunk.first_line_number;
-                    match visit_chunk(floor, first, chunk.lines.len() as u64) {
-                        ChunkVisit::Skip { .. } => {}
+                    // merged_bug_023: a divergent second sighting
+                    // flushes the OLD pending and re-examines the SAME
+                    // chunk against the advanced floor — at most one
+                    // extra pass (the flush empties the cell, so the
+                    // next classify is First).
+                    loop {
+                        let floor = last_relayed.map_or(0, |n| n.saturating_add(1));
+                        let first = chunk.first_line_number;
+                        match visit_chunk(floor, first, chunk.lines.len() as u64) {
+                        ChunkVisit::Skip { .. } => break,
                         ChunkVisit::Serve { yield_from, yield_until, next_line } => {
-                            // A pending gap whose first missing line is
-                            // now BELOW the relay floor has healed: the
-                            // re-open served the span, so the withheld
-                            // copy is stale — flushing it later would
-                            // disclose a hole that no longer exists and
-                            // duplicate its lines (the composed-drive
-                            // property test caught exactly that). Void
-                            // it; a residual hole re-records fresh.
-                            if pending_gap.as_ref().is_some_and(|p| next_line > p.gap_from) {
-                                *pending_gap = None;
-                            }
+                            // Heal-aware (merged_bug_023): a serve
+                            // reaching INTO the hole shrinks it (the
+                            // withheld lines stay); a serve covering
+                            // the hole heals it — the withheld
+                            // continuation relays (trimmed of any
+                            // duplicate prefix), with NO marker, since
+                            // no hole remains. The pre-fix void fired
+                            // on any next_line > gap_from, destroying
+                            // withheld lines on partial heals.
+                            let heal = pending_gap.on_serve(next_line);
                             let tagged =
                                 slice_chunk(chunk, derivation_path, yield_from, yield_until);
                             *last_relayed = Some(next_line.saturating_sub(1));
@@ -715,6 +833,13 @@ async fn drive_stream(
                             if out_tx.send(tagged).await.is_err() {
                                 return DriveEnd::OutputClosed;
                             }
+                            if let ServeHeal::Healed(Some((suffix, watermark))) = heal {
+                                if out_tx.send(suffix).await.is_err() {
+                                    return DriveEnd::OutputClosed;
+                                }
+                                *last_relayed = Some(watermark);
+                            }
+                            break;
                         }
                         ChunkVisit::GapThenServe {
                             gap_from,
@@ -723,53 +848,111 @@ async fn drive_stream(
                             yield_until,
                             next_line,
                         } => {
-                            let withheld =
-                                slice_chunk(chunk, derivation_path, yield_from, yield_until);
-                            let fresh = PendingGap {
-                                gap_from,
-                                gap_until,
-                                withheld,
-                                next_line,
-                            };
-                            let second_sighting =
-                                pending_gap.as_ref().is_some_and(|p| p.gap_from == gap_from);
-                            // Budget-aware first sighting
-                            // (merged_bug_150): withholding only pays
-                            // off if there is grace left for the
-                            // re-open chance to actually happen. At
-                            // the edge — remaining grace at or under
-                            // one backoff — accept immediately.
-                            let no_budget_for_retry = grace_deadline.is_some_and(|d| {
-                                d.saturating_duration_since(Instant::now()) <= reconnect_backoff
-                            });
-                            if second_sighting || no_budget_for_retry {
-                                // Durable hole (the store re-served the
-                                // same split) or no budget to find out:
-                                // accept and disclose inline (owner
-                                // decision Q8: the marker enters
-                                // client-visible build output).
-                                *pending_gap = Some(fresh);
-                                if !flush_pending_gap(
-                                    pending_gap,
-                                    out_tx,
-                                    last_relayed,
-                                    accepted_gap_floor,
-                                )
-                                .await
-                                {
-                                    return DriveEnd::OutputClosed;
+                            match pending_gap.classify(gap_from, gap_until) {
+                                Sighting::Divergent => {
+                                    // The store's view changed across
+                                    // the re-open. The old withheld
+                                    // lines may be the only copy of
+                                    // their span anywhere: flush them
+                                    // (marker + lines), then re-visit
+                                    // this chunk against the advanced
+                                    // floor — the fresh split's true
+                                    // residual (possibly none) falls
+                                    // out of the re-examination.
+                                    if !flush_pending_gap(
+                                        pending_gap,
+                                        out_tx,
+                                        last_relayed,
+                                        accepted_gap_floor,
+                                    )
+                                    .await
+                                    {
+                                        return DriveEnd::OutputClosed;
+                                    }
+                                    continue;
                                 }
-                            } else {
-                                // First sighting with budget: WITHHOLD
-                                // the sliced lines and give the store
-                                // one re-open at the gap to serve the
-                                // span (a transient: mid-flight cut,
-                                // replica version skew, racing
-                                // manifest read). The withheld copy
-                                // makes every later exit total.
-                                *pending_gap = Some(fresh);
-                                return DriveEnd::Gap;
+                                Sighting::SameSpan => {
+                                    // Durable hole (the store re-served
+                                    // the same split): accept and
+                                    // disclose inline (owner decision
+                                    // Q8: the marker enters
+                                    // client-visible build output).
+                                    // Merge keeps the longer coverage —
+                                    // a shorter fresh copy must not
+                                    // drop the old tail.
+                                    let withheld = slice_chunk(
+                                        chunk,
+                                        derivation_path,
+                                        yield_from,
+                                        yield_until,
+                                    );
+                                    pending_gap.merge_same_span(PendingGap {
+                                        gap_from,
+                                        gap_until,
+                                        withheld,
+                                        next_line,
+                                    });
+                                    if !flush_pending_gap(
+                                        pending_gap,
+                                        out_tx,
+                                        last_relayed,
+                                        accepted_gap_floor,
+                                    )
+                                    .await
+                                    {
+                                        return DriveEnd::OutputClosed;
+                                    }
+                                    break;
+                                }
+                                Sighting::First => {
+                                    // Budget-aware first sighting
+                                    // (merged_bug_150): withholding only
+                                    // pays off if there is grace left
+                                    // for the re-open chance to actually
+                                    // happen. At the edge — remaining
+                                    // grace at or under one backoff —
+                                    // accept immediately.
+                                    let no_budget_for_retry =
+                                        grace_deadline.is_some_and(|d| {
+                                            d.saturating_duration_since(Instant::now())
+                                                <= reconnect_backoff
+                                        });
+                                    let withheld = slice_chunk(
+                                        chunk,
+                                        derivation_path,
+                                        yield_from,
+                                        yield_until,
+                                    );
+                                    pending_gap.record_first(PendingGap {
+                                        gap_from,
+                                        gap_until,
+                                        withheld,
+                                        next_line,
+                                    });
+                                    if no_budget_for_retry {
+                                        if !flush_pending_gap(
+                                            pending_gap,
+                                            out_tx,
+                                            last_relayed,
+                                            accepted_gap_floor,
+                                        )
+                                        .await
+                                        {
+                                            return DriveEnd::OutputClosed;
+                                        }
+                                        break;
+                                    }
+                                    // First sighting with budget:
+                                    // WITHHOLD the sliced lines and give
+                                    // the store one re-open at the gap
+                                    // (a transient: mid-flight cut,
+                                    // replica version skew, racing
+                                    // manifest read). The withheld copy
+                                    // makes every later exit total.
+                                    return DriveEnd::Gap;
+                                }
                             }
+                        }
                         }
                     }
                 }
@@ -834,12 +1017,12 @@ async fn drive_stream(
 /// Returns false iff the output channel is closed (nothing left to
 /// disclose to).
 async fn flush_pending_gap(
-    pending_gap: &mut Option<PendingGap>,
+    pending_gap: &mut PendingGapCell,
     out_tx: &mpsc::Sender<TaggedLogChunk>,
     last_relayed: &mut Option<u64>,
     accepted_gap_floor: &mut Option<u64>,
 ) -> bool {
-    let Some(pending) = pending_gap.take() else {
+    let Some(pending) = pending_gap.0.take() else {
         return true;
     };
     if accepted_gap_floor.is_none_or(|f| pending.gap_from >= f) {
@@ -1679,6 +1862,142 @@ mod tests {
         );
         assert_eq!(rest[1].0, 100, "the withheld lines flushed at exit");
         assert_eq!(rest[5].0, 104);
+        h.set.abort_all();
+    }
+
+    // r[verify store.log.tail-grace-drain+2]
+    /// merged_bug_023 leg 1 (divergent-split second sighting): the
+    /// retry stream re-serves the SAME hole start but a DIFFERENT
+    /// split ([25,35) instead of [20,30)). The first sighting's
+    /// withheld lines [20,25) — which the gateway fetched and may be
+    /// the only remaining copy anywhere — must flush before the new
+    /// shape is adopted, not be overwritten and then affirmatively
+    /// declared "missing" by a widened marker. Recorded red (pre-fix):
+    /// line 20 never reached the output; the marker claimed
+    /// `lines 10-24 missing` over content the relay held in hand.
+    #[tokio::test]
+    async fn divergent_second_sighting_flushes_old_withheld_lines() {
+        let mut h = harness().await;
+        // Stream 1: prefix [0,10) then jump to [20,30) -> withhold.
+        h.mock
+            .push_script(vec![chunk(0, 10), chunk(20, 10)], SessionEnd::Close);
+        // Stream 2 (the one re-open chance): the store's view changed —
+        // only [25,35) is durable now; gap_from is still 10.
+        h.mock.push_script(vec![chunk(25, 10)], SessionEnd::Close);
+        h.set.on_started(DRV, EXEC_A);
+
+        let prefix = recv_lines(&mut h.out_rx, 10).await;
+        assert_eq!(prefix[9].0, 9, "prefix intact");
+
+        h.set.on_terminal(DRV);
+
+        // Post-fix order: marker 10-19, old withheld 20-29, then the
+        // re-visited fresh chunk's residual 30-34.
+        let rest = recv_lines(&mut h.out_rx, 16).await;
+        assert!(
+            rest.iter().any(|(n, _)| *n == 20),
+            "the first sighting's withheld lines must not be destroyed: {rest:?}"
+        );
+        assert!(
+            rest[0].1.contains("lines 10-19 missing"),
+            "the marker covers only the REAL hole, not fetched content: {:?}",
+            rest[0]
+        );
+        assert!(
+            rest.iter().any(|(n, _)| *n == 34),
+            "the divergent chunk's residual still relays: {rest:?}"
+        );
+        h.set.abort_all();
+    }
+
+    // r[verify store.log.tail-grace-drain+2]
+    /// merged_bug_023 leg 2 (partial-heal void): the retry stream
+    /// serves only PART of the hole ([5,7) of [5,10)). The hole
+    /// shrinks; the withheld lines [10,15) must survive to the exit
+    /// flush with a marker covering the residual hole [7,10).
+    /// Recorded red (pre-fix): the log silently truncated at line 6 —
+    /// neither the withheld lines nor any marker reached the output
+    /// (`timed out after 7 of 13 lines`).
+    #[tokio::test]
+    async fn partial_heal_keeps_withheld_lines_and_residual_marker() {
+        let mut h = harness().await;
+        // Stream 1: prefix [0,5) then jump to [10,15) -> withhold.
+        h.mock
+            .push_script(vec![chunk(0, 5), chunk(10, 5)], SessionEnd::Close);
+        // Stream 2: partial heal — only [5,7) is served.
+        h.mock.push_script(vec![chunk(5, 2)], SessionEnd::Close);
+        h.set.on_started(DRV, EXEC_A);
+
+        let head = recv_lines(&mut h.out_rx, 7).await;
+        assert_eq!(head[6].0, 6, "prefix + partial heal relayed");
+
+        h.set.on_terminal(DRV);
+
+        let rest = recv_lines(&mut h.out_rx, 6).await;
+        assert!(
+            rest[0].1.contains("lines 7-9 missing"),
+            "the residual hole is disclosed, shrunk past the heal: {:?}",
+            rest[0]
+        );
+        assert!(
+            rest.iter().any(|(n, _)| *n == 10) && rest.iter().any(|(n, _)| *n == 14),
+            "the withheld lines survive a partial heal: {rest:?}"
+        );
+        h.set.abort_all();
+    }
+
+    // r[verify store.log.tail-grace-drain+2]
+    /// merged_bug_023 conservation corollary (exact heal): the retry
+    /// stream serves the hole EXACTLY ([5,10)). No hole remains, so
+    /// the withheld lines relay as the ordinary continuation — no
+    /// marker, nothing lost, nothing duplicated.
+    #[tokio::test]
+    async fn exact_heal_relays_withheld_without_marker() {
+        let mut h = harness().await;
+        h.mock
+            .push_script(vec![chunk(0, 5), chunk(10, 5)], SessionEnd::Close);
+        h.mock.push_script(vec![chunk(5, 5)], SessionEnd::Close);
+        h.set.on_started(DRV, EXEC_A);
+        h.set.on_terminal(DRV);
+
+        let all = recv_lines(&mut h.out_rx, 15).await;
+        assert_eq!(
+            all.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            (0..15).collect::<Vec<_>>(),
+            "exact heal: contiguous relay, no loss, no duplicates"
+        );
+        assert!(
+            all.iter().all(|(_, t)| !t.contains("missing")),
+            "no marker for a healed hole: {all:?}"
+        );
+        h.set.abort_all();
+    }
+
+    // r[verify store.log.tail-grace-drain+2]
+    /// merged_bug_023 conservation corollary (over-heal): the retry
+    /// stream serves PAST the withheld start ([5,12) over a [5,10)
+    /// hole with withheld [10,15)). The duplicate withheld prefix is
+    /// trimmed; the suffix [12,15) relays; no marker, no regression
+    /// of the dedup floor.
+    #[tokio::test]
+    async fn over_heal_trims_withheld_prefix_and_relays_suffix() {
+        let mut h = harness().await;
+        h.mock
+            .push_script(vec![chunk(0, 5), chunk(10, 5)], SessionEnd::Close);
+        h.mock.push_script(vec![chunk(5, 7)], SessionEnd::Close);
+        h.set.on_started(DRV, EXEC_A);
+        h.set.on_terminal(DRV);
+
+        let all = recv_lines(&mut h.out_rx, 15).await;
+        assert_eq!(
+            all.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            (0..15).collect::<Vec<_>>(),
+            "over-heal: contiguous, the overlap deduplicated exactly once"
+        );
+        assert!(
+            all.iter().all(|(_, t)| !t.contains("missing")),
+            "no marker when the store served the whole hole: {all:?}"
+        );
         h.set.abort_all();
     }
 
