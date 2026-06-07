@@ -919,6 +919,11 @@ let
           i=$((i + 1))
           quint parse --out "ir/$i.json" "$src/$rel"
         done < <(cd "$src" && find . -name '*.qnt' -print0 | sort -z)
+        # Banner (b), bughunt-3 S1: the lint proves every rule arm RED
+        # on planted corpora before it may gate (bug_094's seed-flip
+        # resolver and merged_bug_090's dead P6 arm both lived in this
+        # lint while it certified the formal corpus).
+        python3 "$policyScript" --self-test
         python3 "$policyScript" \
           --manifest "$manifest" \
           --ir-dir ir \

@@ -162,14 +162,29 @@ class Corpus:
         return seen
 
     def visible_decl(self, mod, name):
-        """Lexical lookup: own decls first, then reached modules'."""
+        """Lexical lookup: own decls first, then reached modules' —
+        and cross-module ambiguity is FATAL (bug_094). The old code
+        iterated `reachable_modules` (a plain set), so twin credit and
+        writer verdicts depended on PYTHONHASHSEED whenever a name was
+        declared in 2+ co-reachable modules: the same corpus flipped
+        between `violations: 0` and `violations: 1` across seeds. A
+        merge gate's verdict must be a pure function of the corpus."""
         d = self.mod_decls.get(mod, {}).get(name)
         if d is not None:
             return mod, d
-        for m in self.reachable_modules(mod):
-            d = self.mod_decls.get(m, {}).get(name)
-            if d is not None:
-                return m, d
+        owners = sorted(
+            m
+            for m in self.reachable_modules(mod)
+            if m != mod and name in self.mod_decls.get(m, {})
+        )
+        if len(owners) > 1:
+            fail(
+                f"ambiguous name '{name}' seen from module '{mod}': declared in "
+                f"{', '.join(owners)} — rename or qualify; lint resolution must "
+                f"never depend on set-iteration order (bug_094)"
+            )
+        if owners:
+            return owners[0], self.mod_decls[owners[0]][name]
         return None, None
 
     @staticmethod
@@ -269,31 +284,66 @@ class Corpus:
         return [n for n, d in self.mod_decls.get(mod, {}).items() if d.get("qualifier") == "action"]
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--manifest", required=True)
-    ap.add_argument("--ir-dir", required=True)
-    ap.add_argument("--models-dir", required=True)
-    ap.add_argument("--census-only", action="store_true")
-    ap.add_argument("--assume-latches", default="", help="module:var,var;module:var — provisional P5 domain for census")
-    args = ap.parse_args()
+def run_policy(manifest, corpus, assume_latches=""):
+    """The P1–P6 rule engine over a parsed corpus → (violations, census).
 
-    ir_dir, models_dir = Path(args.ir_dir), Path(args.models_dir)
-    canary(ir_dir)
-    manifest = json.loads(Path(args.manifest).read_text())
-    corpus = Corpus(ir_dir, models_dir)
+    Pure in/out (no I/O beyond the corpus already parsed) so the
+    in-derivation self-test can drive planted corpora through the SAME
+    arms the live gate runs — a rule that cannot fail a fixture is
+    dead code by construction (merged_bug_090's P6 arm was exactly
+    that: condition computed, body `pass`)."""
 
     def is_calib_module(mod):
         f = corpus.mod_file.get(mod, "")
         return f.startswith("calibration/")
 
     # provisional latches for census
-    for part in filter(None, args.assume_latches.split(";")):
+    for part in filter(None, assume_latches.split(";")):
         m, vs = part.split(":", 1)
         corpus.latch_directives.setdefault(m, []).extend(v.strip() for v in vs.split(","))
 
     violations, census = [], defaultdict(list)
     exemptions_used = set()
+
+    # ---- R0 reconciliation: wired == discovered. Every non-null
+    # manifest entry's main module must exist in the parsed IR and
+    # every wired invariant/witness name must resolve — a check wired
+    # against a missing or renamed module otherwise degrades to
+    # silently-vacuous credit (fail-open). Unwired live modules are
+    # censused so coverage holes stay loud.
+    unresolved = set()
+    for cname, meta in sorted(manifest.items()):
+        if not meta:
+            continue
+        main_mod = meta.get("main")
+        if main_mod not in corpus.mod_decls:
+            violations.append(
+                f"R0 {cname}: main module '{main_mod}' not found in parsed IR (wired-but-missing)"
+            )
+            census["R0-missing-main"].append(cname)
+            continue
+        for inv in meta.get("invariants") or []:
+            if corpus.visible_decl(main_mod, inv) == (None, None):
+                violations.append(
+                    f"R0 {cname}: invariant '{inv}' does not resolve from main '{main_mod}'"
+                )
+                census["R0-missing-inv"].append(f"{cname}:{inv}")
+                unresolved.add((cname, inv))
+        w = meta.get("witness")
+        if w and meta.get("kind") in WITNESS_KINDS and corpus.visible_decl(main_mod, w) == (None, None):
+            violations.append(
+                f"R0 {cname}: witness '{w}' does not resolve from main '{main_mod}'"
+            )
+            census["R0-missing-witness"].append(f"{cname}:{w}")
+    reached_live = set()
+    for _cname, meta in manifest.items():
+        if meta and meta.get("main") in corpus.mod_decls:
+            for m in corpus.reachable_modules(meta["main"]):
+                if m in corpus.mod_file and not is_calib_module(m):
+                    reached_live.add(m)
+    for m in sorted(set(corpus.mod_file) - reached_live):
+        if not is_calib_module(m):
+            census["R0-unwired-live-module"].append(m)
 
     # ---- index witness checks: (live modules reached, witness var read-set)
     witnesses = []
@@ -312,8 +362,7 @@ def main():
             continue
         main_mod = meta["main"]
         if main_mod not in corpus.mod_decls:
-            violations.append(f"P6 {cname}: main module {main_mod} not found in IR")
-            continue
+            continue  # R0 already reported wired-but-missing
         if not is_calib_module(main_mod):
             continue  # live-file mains are their own model
         reach = corpus.reachable_modules(main_mod)
@@ -339,11 +388,15 @@ def main():
         if not meta or meta.get("kind") not in HOLDS_KINDS:
             continue
         main_mod = meta["main"]
+        if main_mod not in corpus.mod_decls:
+            continue  # R0 already reported wired-but-missing
         exempts = meta.get("vacuityExempt") or {}
         for cls in {e.get("class") for e in exempts.values() if isinstance(e, dict)}:
             if cls not in EXEMPT_CLASSES:
                 violations.append(f"P6 {cname}: unknown vacuityExempt class '{cls}'")
         for inv in meta.get("invariants") or []:
+            if (cname, inv) in unresolved:
+                continue  # R0 reported it; a P1-tautology label would mislead
             for lmod, leaf in corpus.conj_leaves(main_mod, inv):
                 reads = corpus.var_readset(lmod, leaf)
                 ex = exempts.get(leaf) or exempts.get(inv)
@@ -387,10 +440,18 @@ def main():
                             f"P4 {cname}: var '{vmod}.{var}' (read by '{leaf}') has no non-identity assignment reachable from {vmod}.step — writerless latch")
                         census["P4-writerless"].append(f"{vmod}.{var}")
 
-        # P6: unused exemptions
-        for k in exempts:
-            if not any((cname, k) == u for u in exemptions_used) and f"{cname}:{k}" not in [x.split(" — ")[0] for xs in census.values() for x in xs if isinstance(x, str)]:
-                pass  # tolerated: exemption may cover a leaf twinned later; census notes below
+        # P6: unused exemptions are ERRORS (merged_bug_090 — the old
+        # body computed its condition then executed an unconditional
+        # `pass`, so a stale exemption on a since-twinned leaf survived
+        # silently and would re-engage to bypass P1 if the twin rots).
+        # Keyed on exemptions_used ALONE: the old census-prefix
+        # conjunct hid exactly the re-twinned case.
+        for k in sorted(exempts):
+            if (cname, k) not in exemptions_used:
+                violations.append(
+                    f"P6 {cname}: unused vacuityExempt entry '{k}' — the leaf is twinned (or gone); remove the exemption"
+                )
+                census["P6-unused-exempt"].append(f"{cname}:{k}")
 
     # ---- P5: latch integrity
     for lmod, latches in sorted(corpus.latch_directives.items()):
@@ -445,6 +506,229 @@ def main():
     for (wname, _, _, wlive, _) in witnesses:
         paired = sorted({h for m in wlive for h in holds_by_livemod.get(m, [])})
         census["P3-paired" if paired else "P3-unpaired"].append(wname)
+
+    return violations, census
+
+
+def selftest():
+    """Banner (b): one planted RED per rule arm, plus a green corpus.
+
+    Each scenario writes a tiny .qnt corpus, parses it with the SAME
+    `quint parse` the live gate uses (no hand-built IR — the canary
+    pins the shape; the self-test rides the real parser), and asserts
+    the exact violation set. An arm that cannot fail its fixture is
+    dead code and fails the gate HERE, not silently in production."""
+    import shutil
+    import subprocess
+    import tempfile
+
+    if shutil.which("quint") is None:
+        fail("self-test needs `quint` on PATH (the derivation provides it)")
+
+    def build(tmp, files):
+        models = Path(tmp) / "models"
+        ir = Path(tmp) / "ir"
+        (models / "calibration").mkdir(parents=True)
+        ir.mkdir()
+        # Write the WHOLE corpus before parsing any file: `from`-path
+        # imports resolve at parse time, and calibration/ sorts before
+        # the live files it imports.
+        for rel, text in sorted(files.items()):
+            p = models / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(text)
+        for rel in sorted(files):
+            out = ir / (rel.replace("/", "__") + ".json")
+            r = subprocess.run(
+                ["quint", "parse", "--out", str(out), str(models / rel)],
+                capture_output=True,
+                text=True,
+            )
+            if r.returncode != 0:
+                # `--out` mode swallows diagnostics (and still writes a
+                # partial IR file — fail-open by itself); re-run without
+                # it to harvest the real error text.
+                diag = subprocess.run(
+                    ["quint", "parse", str(models / rel)],
+                    capture_output=True,
+                    text=True,
+                )
+                fail(f"self-test: quint parse failed on fixture {rel}:\n{diag.stdout}\n{diag.stderr}")
+        return Corpus(ir, models)
+
+    def expect(tag, files, manifest, expected_prefixes):
+        with tempfile.TemporaryDirectory() as tmp:
+            corpus = build(tmp, files)
+            violations, census = run_policy(manifest, corpus)
+        unmatched = list(expected_prefixes)
+        extra = []
+        for v in violations:
+            for i, pre in enumerate(unmatched):
+                if v.startswith(pre):
+                    unmatched.pop(i)
+                    break
+            else:
+                extra.append(v)
+        if unmatched or extra:
+            fail(
+                f"self-test[{tag}]: expectation mismatch\n"
+                f"  missing: {unmatched}\n  extra: {extra}\n  got: {violations}"
+            )
+        return census
+
+    live_a = (
+        "module liveA {\n  var x: int\n  action init = x' = 0\n"
+        "  action step = x' = x + 1\n  val invX = x >= 0\n  val tauto = true\n}\n"
+    )
+    live_b = (
+        "module liveB {\n  var y: int\n  action init = y' = 0\n"
+        "  action step = y' = y\n  val invY = y >= 0\n}\n"
+    )
+    live_l = (
+        "// quint-policy-latches: lx, ly\n"
+        "module liveL {\n  var lx: int\n  var ly: int\n"
+        "  action init = all { lx' = 0, ly' = 0 }\n"
+        "  action step = all { lx' = lx + 1, ly' = ly }\n}\n"
+    )
+    live_w = (
+        "module liveW {\n  var v: int\n  action init = v' = 0\n"
+        "  action step = any { v' = v + 1, v' = v }\n"
+        "  val invV = v >= 0\n  val wviol = v < 0\n}\n"
+    )
+
+    files = {
+        "live_a.qnt": live_a,
+        "live_b.qnt": live_b,
+        "live_l.qnt": live_l,
+        "live_w.qnt": live_w,
+        "calibration/calib_frozen.qnt": (
+            "module calibFrozen {\n  var z: int\n  action init = z' = 0\n"
+            "  action step = z' = z + 1\n  val w = z > 100\n}\n"
+        ),
+        # NB: QUALIFIED import (no `.*`) — that is the legal quint shape
+        # the def-flip cheat uses: the namespace stays separate so the
+        # redeclaration parses, while the IR import edge still gives the
+        # calibration "reaches a live module" credit.
+        "calibration/calib_shadow.qnt": ('module calibShadow {\n  import liveA from "../live_a"\n  val invX = false\n}\n'),
+        "calibration/calib_lw.qnt": ('module calibLW {\n  import liveL.* from "../live_l"\n  action attack = lx\' = 42\n}\n'),
+    }
+    manifest = {
+        "tautoCheck": {"kind": "holds", "main": "liveA", "invariants": ["tauto"]},
+        "untwCheck": {"kind": "holds", "main": "liveB", "invariants": ["invY"]},
+        "frozenW": {"kind": "witness", "main": "calibFrozen", "witness": "w"},
+        "shadowW": {"kind": "witness", "main": "calibShadow", "witness": "invX"},
+        "bogusCheck": {
+            "kind": "holds",
+            "main": "liveA",
+            "invariants": ["invX"],
+            "vacuityExempt": {"invX": {"class": "bogus", "reason": "planted"}},
+        },
+        "holdsW": {
+            "kind": "holds",
+            "main": "liveW",
+            "invariants": ["invV"],
+            "vacuityExempt": {"invV": {"class": "boundsOK", "reason": "planted stale exemption"}},
+        },
+        "witnessW": {"kind": "witness", "main": "liveW", "witness": "wviol"},
+        "ghostCheck": {"kind": "holds", "main": "noSuchModule", "invariants": ["x"]},
+        "badInvCheck": {"kind": "holds", "main": "liveA", "invariants": ["noSuchInv"]},
+    }
+    census = expect(
+        "arms",
+        files,
+        manifest,
+        [
+            "P1 tautoCheck: invariant leaf 'tauto'",
+            "P1 untwCheck: invariant leaf 'invY'",
+            "P4 untwCheck: var 'liveB.y'",
+            "P2 frozenW: calibration main 'calibFrozen' imports NO live model",
+            "P2 shadowW: calibration 'calibShadow' shadows live non-action declaration 'invX'",
+            "P6 bogusCheck: unknown vacuityExempt class 'bogus'",
+            "P1 bogusCheck: invariant leaf 'invX'",
+            "P6 bogusCheck: unused vacuityExempt entry 'invX'",
+            "P6 holdsW: unused vacuityExempt entry 'invV'",
+            "P5 liveL: declared latch 'ly' fails P4",
+            "P5 calibLW: calibration action non-identity-assigns latch 'liveL.lx'",
+            "R0 ghostCheck: main module 'noSuchModule' not found",
+            "R0 badInvCheck: invariant 'noSuchInv' does not resolve",
+        ],
+    )
+    if not census.get("P6-unused-exempt"):
+        fail("self-test[arms]: P6-unused-exempt census bucket empty")
+
+    # FATAL ambiguity arm (bug_094): two reachable modules declare one
+    # name — the resolver must refuse rather than coin-flip. Captured
+    # red (pre-fix): the same corpus flipped between `violations: 0`
+    # and `violations: 1` across PYTHONHASHSEED values.
+    amb_files = {
+        "amb_a.qnt": (
+            "module ambA {\n  var va: int\n  action init = va' = 0\n"
+            "  action step = va' = va + 1\n  val dup = va >= 0\n}\n"
+        ),
+        "amb_b.qnt": "module ambB {\n  val dup = true\n}\n",
+        "amb_main.qnt": (
+            'module ambMain {\n  import ambA from "./amb_a"\n  import ambB from "./amb_b"\n  var q: int\n'
+            "  action init = q' = 0\n  action step = q' = q + 1\n}\n"
+        ),
+    }
+    amb_manifest = {"ambCheck": {"kind": "holds", "main": "ambMain", "invariants": ["dup"]}}
+    with tempfile.TemporaryDirectory() as tmp:
+        corpus = build(tmp, amb_files)
+        import contextlib
+        import io
+
+        captured = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(captured):
+                run_policy(amb_manifest, corpus)
+        except SystemExit as e:
+            if e.code != 2:
+                fail(f"self-test[ambiguity]: expected exit 2, got {e.code}")
+            if "ambiguous name 'dup'" not in captured.getvalue():
+                fail(f"self-test[ambiguity]: FATAL fired without naming the collision:\n{captured.getvalue()}")
+        else:
+            fail("self-test[ambiguity]: ambiguous declaration did not FATAL — the seed-flip hole is back (bug_094)")
+
+    # GREEN corpus: twinned invariant, live writer, clean calibration —
+    # the repaired arms must not fire on a healthy corpus.
+    green_files = {
+        "live_w.qnt": live_w,
+        "calibration/calib_run.qnt": ('module calibRun {\n  import liveW.* from "../live_w"\n  action go = v\' = v + 1\n}\n'),
+    }
+    green_manifest = {
+        "holdsW": {"kind": "holds", "main": "liveW", "invariants": ["invV"]},
+        "witnessW": {"kind": "witness", "main": "liveW", "witness": "wviol"},
+        "runW": {"kind": "run", "main": "calibRun"},
+    }
+    expect("green", green_files, green_manifest, [])
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--manifest")
+    ap.add_argument("--ir-dir")
+    ap.add_argument("--models-dir")
+    ap.add_argument("--census-only", action="store_true")
+    ap.add_argument("--assume-latches", default="", help="module:var,var;module:var — provisional P5 domain for census")
+    ap.add_argument(
+        "--self-test",
+        action="store_true",
+        help="drive planted corpora through every rule arm (one red per arm + a green corpus) and exit",
+    )
+    args = ap.parse_args()
+
+    if args.self_test:
+        selftest()
+        print("quint-policy: self-test OK — every rule arm demonstrated its red and the green corpus passed")
+        return
+    if not (args.manifest and args.ir_dir and args.models_dir):
+        fail("--manifest/--ir-dir/--models-dir are required outside --self-test")
+
+    ir_dir, models_dir = Path(args.ir_dir), Path(args.models_dir)
+    canary(ir_dir)
+    manifest = json.loads(Path(args.manifest).read_text())
+    corpus = Corpus(ir_dir, models_dir)
+    violations, census = run_policy(manifest, corpus, args.assume_latches)
 
     # ---- census print (P6, the owner burn-down artifact)
     print("== quint-policy census ==")
