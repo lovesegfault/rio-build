@@ -683,6 +683,10 @@ pub async fn run(
     // An accounting position, not a cache — survives the §4(a)2
     // labels-cache deletion and is private to this loop.
     let mut cursors: HashMap<String, f64> = HashMap::new();
+    // bug_150: per-class node-seconds whose append FAILED — the cursor
+    // already advanced, so this map is the only carrier of those
+    // windows until a flush delivers them (consume-on-ack).
+    let mut unshipped: HashMap<String, f64> = HashMap::new();
 
     let mut flush = tokio::time::interval(Duration::from_secs(EXPOSURE_FLUSH_SECS));
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -727,10 +731,13 @@ pub async fn run(
                             }
                             fb.retain(|_, (_, seen)| now - *seen < HW_FALLBACK_TTL_SECS);
                         }
-                        for (hw, secs) in
-                            flush_spot_exposure(&mut cursors, &list.items, &config, now_epoch())
-                        {
-                            report_exposure(&mut admin, hw, secs).await;
+                        // r[impl ctrl.informer.exposure-recredit]
+                        let fresh =
+                            flush_spot_exposure(&mut cursors, &list.items, &config, now_epoch());
+                        for (hw, secs) in merge_exposure_slices(&mut unshipped, fresh) {
+                            let delivered =
+                                report_exposure(&mut admin, hw.clone(), secs).await;
+                            settle_exposure_slice(&mut unshipped, hw, secs, delivered);
                         }
                     }
                     Err(e) => {
@@ -938,13 +945,15 @@ pub async fn run_spot_interrupt_watcher(
     }
 }
 
-/// Append `kind='exposure'` node-seconds for one `hw_class`.
-/// Best-effort: a failed/timed-out RPC drops one denominator sample
-/// (λ reads slightly high until the next flush lands). Bounded by
+/// Append `kind='exposure'` node-seconds for one `hw_class`. Returns
+/// whether the append was acknowledged — the CALLER owns the slice
+/// until then (bug_150: exposure evidence is consumed on ack, not on
+/// send; a failed append re-credits the slice to the next flush, so
+/// nothing is lost — λ samples arrive late, not reduced). Bounded by
 /// [`admin_call`]'s timeout so a hung scheduler can't wedge the Node-
 /// informer's flush loop (every caller is inside that loop).
-async fn report_exposure(admin: &mut AdminClient, hw_class: String, secs: f64) {
-    if let Err(e) = admin_call(admin.append_interrupt_sample(
+async fn report_exposure(admin: &mut AdminClient, hw_class: String, secs: f64) -> bool {
+    match admin_call(admin.append_interrupt_sample(
         rio_proto::types::AppendInterruptSampleRequest {
             hw_class,
             kind: "exposure".into(),
@@ -956,7 +965,52 @@ async fn report_exposure(admin: &mut AdminClient, hw_class: String, secs: f64) {
     ))
     .await
     {
-        warn!(error = %e, "spot-exposure: append failed");
+        Ok(_) => true,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "spot-exposure: append failed; slice re-credited to the next flush"
+            );
+            false
+        }
+    }
+}
+
+/// Merge the previous flushes' un-shipped exposure slices into this
+/// flush's fresh banks: one entry per `hw_class`, summed. Draining the
+/// pending map FIRST means a class with retained seconds but no fresh
+/// slice this round (its nodes deleted mid-outage) still retries.
+fn merge_exposure_slices(
+    unshipped: &mut HashMap<String, f64>,
+    fresh: Vec<(String, f64)>,
+) -> Vec<(String, f64)> {
+    let mut to_ship: HashMap<String, f64> = std::mem::take(unshipped);
+    for (hw, secs) in fresh {
+        *to_ship.entry(hw).or_default() += secs;
+    }
+    to_ship.into_iter().collect()
+}
+
+// r[impl ctrl.informer.exposure-recredit]
+/// Settle one shipped slice: a failed append re-credits the WHOLE
+/// slice to the next flush. The cursor already advanced when the
+/// slice was banked, so this pending map is the ONLY carrier of the
+/// failed window — dropping it here is permanent denominator loss
+/// (the pre-fix shape: warn-only, fleet x window node-seconds gone
+/// per failed flush, undisclosed). Mirrors the LIST-failure arm's
+/// evidence-preservation discipline and the sibling interrupt leg's
+/// counted chokepoint: between them, no exit of the exposure leg
+/// loses evidence silently. Shutdown forfeits at most one pending
+/// window — the same accepted bias class as the absent-node cursor
+/// drop.
+fn settle_exposure_slice(
+    unshipped: &mut HashMap<String, f64>,
+    hw: String,
+    secs: f64,
+    delivered: bool,
+) {
+    if !delivered {
+        *unshipped.entry(hw).or_default() += secs;
     }
 }
 
@@ -982,6 +1036,48 @@ fn annotation_target(pod: &Pod) -> Option<(String, String, String)> {
 
 #[cfg(test)]
 mod tests {
+    // r[verify ctrl.informer.exposure-recredit]
+    /// bug_150: a failed exposure append re-credits the slice; the
+    /// next flush ships the merged total — across an outage spanning
+    /// N windows, total banked exposure is conserved. (Recorded red
+    /// on the pre-fix shape via strawman reversal of the settle law:
+    /// the second flush shipped 60.0, not 120.0 — the failed window
+    /// was consumed by the cursor advance and never re-banked.)
+    #[test]
+    fn failed_exposure_slice_recredits_to_next_flush() {
+        let mut unshipped: HashMap<String, f64> = HashMap::new();
+        // Flush 1: fresh 60s for m6id; append FAILS.
+        let ship1 = merge_exposure_slices(&mut unshipped, vec![("m6id".into(), 60.0)]);
+        assert_eq!(ship1, vec![("m6id".to_string(), 60.0)]);
+        for (hw, secs) in ship1 {
+            settle_exposure_slice(&mut unshipped, hw, secs, false);
+        }
+        // Flush 2: fresh 60s again; the merged slice is the WHOLE
+        // outage window plus the new one.
+        let ship2 = merge_exposure_slices(&mut unshipped, vec![("m6id".into(), 60.0)]);
+        assert_eq!(
+            ship2,
+            vec![("m6id".to_string(), 120.0)],
+            "the failed window must be re-credited, not consumed"
+        );
+        for (hw, secs) in ship2 {
+            settle_exposure_slice(&mut unshipped, hw, secs, true);
+        }
+        assert!(unshipped.is_empty(), "delivered slices leave no residue");
+    }
+
+    // r[verify ctrl.informer.exposure-recredit]
+    /// A retained class with NO fresh slice this round (its nodes were
+    /// deleted mid-outage) still retries — draining the pending map
+    /// first makes the retry independent of fresh production.
+    #[test]
+    fn retained_class_without_fresh_slice_still_retries() {
+        let mut unshipped: HashMap<String, f64> = HashMap::new();
+        settle_exposure_slice(&mut unshipped, "m6id".into(), 45.0, false);
+        let ship = merge_exposure_slices(&mut unshipped, vec![]);
+        assert_eq!(ship, vec![("m6id".to_string(), 45.0)]);
+        assert!(unshipped.is_empty(), "drained into the ship set");
+    }
 
     // r[verify ctrl.informer.interrupt-sample-conservation+2]
     /// bug_363's resolution table: present-node labels are

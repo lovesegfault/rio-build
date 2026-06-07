@@ -667,6 +667,24 @@ Every uncounted drop under-reports the spot-reclaim rate exactly while spot
 is being reclaimed --- the anti-conservative direction for the SLA solver's
 capacity-type decision.
 
+#r("ctrl.informer.exposure-recredit")[
+  The λ-denominator exposure leg of `AppendInterruptSample` MUST consume
+  its evidence only on append acknowledgement: a banked node-seconds
+  slice whose append RPC fails MUST be re-credited, whole, to the next
+  flush (the cursor advanced when the slice was banked, so the pending
+  carrier is the only remaining copy of that window). A retained class
+  with no fresh slice in a later round MUST still retry. The only
+  accepted forfeitures are the absent-node cursor drop (at most one
+  flush period per deleted node) and process shutdown (at most one
+  pending window) --- a scheduler outage spanning any number of flush
+  windows MUST NOT reduce total banked exposure.
+]
+The pre-fix shape advanced every cursor before delivery and handled append
+failure with a warning alone: each failed flush permanently lost
+`fleet x window` node-seconds of denominator, biasing λ high precisely
+during scheduler rollouts --- while the numerator leg of the same RPC counted
+its identical failure through the typed-drop chokepoint.
+
 #info(title: [Note])[
   The controller does NOT hold permissions for `NetworkPolicies` or
   `ConfigMaps`. NetworkPolicies are deployed as static manifests via the Helm
