@@ -18,8 +18,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use rio_evidence_kernel::outcome::{
-    FailureDisposition, SubstituteFailureClass, TenantAttemptEvidence, TenantAttemptsVerdict,
-    classify_substitute_failure, fold_tenant_attempts,
+    LoopControl, SubstituteFailureClass, TenantAttemptCells, TenantAttemptsVerdict,
 };
 use rio_proto::types::{MaterializationOutcome, materialization_outcome};
 
@@ -384,7 +383,7 @@ async fn execute_job_inner(
             // A's charging failure aborted the walk before serving
             // tenant B was tried).
             let mut hit: Option<Box<rio_proto::validated::ValidatedPathInfo>> = None;
-            let mut cells: Vec<TenantAttemptEvidence> = Vec::with_capacity(tenants.len());
+            let mut cells = TenantAttemptCells::new();
             // Per-cell (label, detail) for the outcome message,
             // index-aligned with `cells`.
             let mut cell_msgs: Vec<(&'static str, String)> = Vec::with_capacity(tenants.len());
@@ -401,7 +400,7 @@ async fn execute_job_inner(
                     Ok(None) => {
                         // Clean miss under this tenant; the next tenant
                         // may still serve it.
-                        cells.push(TenantAttemptEvidence::CleanMiss);
+                        cells.record_clean_miss();
                         cell_msgs.push(("", String::new()));
                     }
                     Err(e) => {
@@ -410,24 +409,29 @@ async fn execute_job_inner(
                         // future SubstituteError variant fails this
                         // match AND the class table).
                         let class = crate::substitute::substitute_error_evidence(&e).0;
-                        match classify_substitute_failure(class) {
-                            FailureDisposition::RetryUncharged => {
-                                let (label, retry_after) = match &e {
-                                    SubstituteError::RateLimited { retry_after } => {
-                                        ("rate_limited", *retry_after)
-                                    }
-                                    _ => ("raced", None),
-                                };
-                                cells.push(TenantAttemptEvidence::Transient { retry_after });
-                                cell_msgs.push((label, format!("substitution of {path}: {e}")));
+                        let (label, retry_after) = match &e {
+                            SubstituteError::RateLimited { retry_after } => {
+                                ("rate_limited", *retry_after)
                             }
-                            FailureDisposition::ChargeInfra => {
-                                cells.push(TenantAttemptEvidence::Charge { class });
-                                cell_msgs.push((
-                                    "",
-                                    format!("substitution of {path} failed ({class:?}): {e}"),
-                                ));
-                            }
+                            SubstituteError::Raced => ("raced", None),
+                            _ => ("", None),
+                        };
+                        let msg = if label.is_empty() {
+                            format!("substitution of {path} failed ({class:?}): {e}")
+                        } else {
+                            format!("substitution of {path}: {e}")
+                        };
+                        cell_msgs.push((label, msg));
+                        // merged_bug_188: the kernel chokepoint owns
+                        // the loop-control decision — a Raced verdict
+                        // aborts the TENANT axis too (the placeholder
+                        // slot is path-keyed; further tenants would
+                        // race the same held slot, and a sibling's
+                        // charging failure must not dominate the
+                        // uncharged race in the fold).
+                        match cells.record_failure(class, retry_after) {
+                            LoopControl::Continue => {}
+                            LoopControl::AbortRaced => break,
                         }
                     }
                 }
@@ -462,7 +466,7 @@ async fn execute_job_inner(
                         }
                     }
                 }
-                None => match fold_tenant_attempts(&cells) {
+                None => match cells.fold() {
                     TenantAttemptsVerdict::ChargeInfra { idx } => {
                         // ≥1 tenant produced charging evidence and no
                         // tenant served: the charge ladder (and park
@@ -499,13 +503,12 @@ async fn execute_job_inner(
                         // probe loop rides the SAME cells + fold — no
                         // in-loop returns on any tenant axis
                         // (merged_bug_133).
-                        let mut probe_cells: Vec<TenantAttemptEvidence> =
-                            Vec::with_capacity(tenants.len());
+                        let mut probe_cells = TenantAttemptCells::new();
                         let mut probe_msgs: Vec<String> = Vec::with_capacity(tenants.len());
                         for &tenant_id in &tenants {
                             match probe_miss(ctx, tenant_id, &path).await {
                                 MissProbe::Confirmed => {
-                                    probe_cells.push(TenantAttemptEvidence::CleanMiss);
+                                    probe_cells.record_clean_miss();
                                     probe_msgs.push(String::new());
                                 }
                                 MissProbe::Failed {
@@ -519,25 +522,22 @@ async fn execute_job_inner(
                                     // per leg (a 429'd probe defers
                                     // uncharged; a 5xx'd probe charges
                                     // exactly like a 5xx'd GET).
-                                    match classify_substitute_failure(class) {
-                                        FailureDisposition::RetryUncharged => {
-                                            probe_cells.push(TenantAttemptEvidence::Transient {
-                                                retry_after,
-                                            });
-                                        }
-                                        FailureDisposition::ChargeInfra => {
-                                            probe_cells
-                                                .push(TenantAttemptEvidence::Charge { class });
-                                        }
-                                    }
+                                    // merged_bug_188: and the SAME
+                                    // loop control — a raced probe
+                                    // aborts the tenant sweep (the
+                                    // slot is path-keyed).
                                     probe_msgs.push(format!(
                                         "substitution of {path} hit infrastructure trouble: \
                                          {detail}"
                                     ));
+                                    match probe_cells.record_failure(class, retry_after) {
+                                        LoopControl::Continue => {}
+                                        LoopControl::AbortRaced => break,
+                                    }
                                 }
                             }
                         }
-                        match fold_tenant_attempts(&probe_cells) {
+                        match probe_cells.fold() {
                             TenantAttemptsVerdict::ChargeInfra { idx } => {
                                 return infra_failure(probe_msgs[idx].clone());
                             }
@@ -1580,7 +1580,7 @@ mod tests {
         );
     }
 
-    // r[verify store.materialize.tenant-fold]
+    // r[verify store.materialize.tenant-fold+2]
     /// merged_bug_133 red: the recorded (hint) tenant's upstream is
     /// DEAD (every request 500s → charging class), a SECOND
     /// interested tenant's upstream SERVES the path. The hint tenant
@@ -1658,6 +1658,82 @@ mod tests {
             1,
             "the wanted path was ingested under the serving tenant"
         );
+    }
+
+    // r[verify store.materialize.tenant-fold+2]
+    /// merged_bug_188: a placeholder race is PATH-keyed (tenant-
+    /// independent) — once one tenant's attempt answers Raced, the
+    /// remaining tenants would race the same held slot, and a sibling
+    /// tenant's pre-claim charging failure (narinfo 500s before the
+    /// claim) must not convert the uncharged race into a job-fatal
+    /// charge via the fold's Charge-dominates precedence. The tenant
+    /// loop aborts on Raced (Transient cell recorded first, so the
+    /// uncharged deferral survives the fold).
+    #[tokio::test]
+    async fn raced_first_tenant_defers_uncharged_despite_charging_sibling() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let raced_tenant = seed_tenant(&db.pool, "m188-raced-a").await;
+        let charge_tenant = seed_tenant(&db.pool, "m188-charge-b").await;
+
+        let path = store_path(27, "m188-raced-slot");
+        let (nar, _) = rio_test_support::fixtures::make_nar(b"m188 raced slot");
+        // Tenant A (the hint, consulted FIRST): healthy upstream, so
+        // its attempt reaches the placeholder claim — which answers
+        // Concurrent (young 'uploading' manifest) → Raced.
+        let healthy = spawn_multi_upstream(vec![(path.clone(), nar, vec![])], "cache.m188a").await;
+        wire_upstream(&db.pool, raced_tenant, &healthy).await;
+        // Tenant B: all-500 upstream → pre-claim charging class.
+        let dead = spawn_status_upstream(axum::http::StatusCode::INTERNAL_SERVER_ERROR).await;
+        wire_upstream(&db.pool, charge_tenant, &dead).await;
+
+        // The path-keyed placeholder held by a concurrent uploader.
+        let sp = StorePath::parse(&path).unwrap();
+        let hash = sp.sha256_digest();
+        crate::metadata::insert_manifest_uploading(&db.pool, &hash, &path, &[])
+            .await
+            .unwrap();
+
+        let seeded = seed_job(
+            &db.pool,
+            "m188-raced-drv",
+            &[("out", path.as_str())],
+            Some(raced_tenant),
+            Some(raced_tenant),
+            &[],
+        )
+        .await;
+        let live_build = Uuid::new_v4();
+        sqlx::query("INSERT INTO builds (build_id, tenant_id, status) VALUES ($1, $2, 'active')")
+            .bind(live_build)
+            .bind(charge_tenant)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO build_derivations (build_id, derivation_id) VALUES ($1, $2)")
+            .bind(live_build)
+            .bind(seeded.derivation_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO build_wanted_outputs (build_id, derivation_id, wanted_output_names) \
+             VALUES ($1, $2, '{}')",
+        )
+        .bind(live_build)
+        .bind(seeded.derivation_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let ctx = make_ctx(db.pool.clone());
+        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        let retry = outcome_retry_later(&outcome).unwrap_or_else(|| {
+            panic!(
+                "expected uncharged RetryLater (the race defers; the sibling's \
+                 charging failure must not dominate a path-keyed race), got {outcome:?}"
+            )
+        });
+        assert_eq!(retry.class, "raced");
     }
 
     // r[verify store.materialize.executor+5]

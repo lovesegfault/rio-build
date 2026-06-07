@@ -4957,7 +4957,7 @@ rec {
     # walk-fold reachability witness keeps the plane non-vacuous.
     # r[verify store.materialize.local-visibility]
     # r[verify store.materialize.probe-polarity]
-    # r[verify store.materialize.tenant-fold]
+    # r[verify store.materialize.tenant-fold+2]
     # r[verify sched.materialize.reprobe-per-path]
     quint-materialization-holds-walk-fold = mkQuintSimHoldsCheck {
       name = "materialization-holds-walk-fold";

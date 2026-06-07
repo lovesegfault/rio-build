@@ -1215,14 +1215,17 @@ to classify, not upstream politeness --- treating it as transient would let
 a chronically slow upstream defer jobs forever without ever surfacing as
 infrastructure evidence.
 
-#r("store.materialize.tenant-fold")[
+#r("store.materialize.tenant-fold+2")[
   The executor's per-tenant iteration over a path (both the substitution
-  attempt loop and the miss-confirmation probe loop) MUST only accumulate
-  per-tenant evidence cells --- a serving hit may break the iteration, but
-  every failure disposition MUST exit through a pure post-loop fold evaluated
-  only after EVERY resolved tenant has been consulted, with precedence
-  charge > transient > all-clean-miss. No tenant-axis loop may return a
-  job-level outcome from inside its body.
+  attempt loop and the miss-confirmation probe loop) MUST record evidence
+  only through the kernel's tenant-cell chokepoint and MUST obey its loop
+  control: a serving hit may break the iteration, a `Raced` verdict aborts
+  it (the placeholder slot is path-keyed --- the raced cell is recorded
+  first, so the uncharged deferral survives), and every other failure
+  disposition MUST leave the iteration running until EVERY resolved tenant
+  has been consulted. All failure dispositions MUST exit through the pure
+  post-loop fold, with precedence charge > transient > all-clean-miss. No
+  tenant-axis loop may return a job-level outcome from inside its body.
 ]
 This is the structural form of the owner-Q2 contract ("a job fails only when
 NO interested tenant can obtain"): the tenant resolve order is deterministic

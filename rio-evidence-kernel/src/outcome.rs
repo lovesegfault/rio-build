@@ -295,9 +295,12 @@ pub fn fold_substitute_loop(cells: SubstituteLoopCells) -> SubstituteLoopVerdict
 
 /// One consulted tenant's recorded attempt evidence (merged_bug_133,
 /// mirroring [`SubstituteLoopCells`] one level up: per-tenant instead
-/// of per-upstream). The executor's tenant loop ONLY pushes cells —
-/// a hit breaks, everything else is recorded and folded after EVERY
-/// tenant has been consulted.
+/// of per-upstream). The executor's tenant loops record ONLY through
+/// [`TenantAttemptCells::record_failure`] (merged_bug_188) — a hit
+/// breaks, everything else is recorded and folded after every
+/// consulted tenant, and a `Raced` verdict aborts the loop (the
+/// placeholder slot is path-keyed, so remaining tenants would race
+/// the same held slot).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TenantAttemptEvidence {
     /// The tenant's attempt failed with a charging class
@@ -316,6 +319,80 @@ pub enum TenantAttemptEvidence {
     /// Clean miss under this tenant's upstream view (every upstream
     /// answered hit-or-404).
     CleanMiss,
+}
+
+/// merged_bug_188: the tenant axis's recording chokepoint, mirroring
+/// [`SubstituteLoopCells::record`] one level up. The tenant loop's
+/// failure recording routes through [`Self::record_failure`], whose
+/// [`LoopControl`] return is `#[must_use]` — dropping `AbortRaced` at
+/// the tenant axis is as unwritable as it already is at the upstream
+/// axis. `Raced` IS recorded as a `Transient` cell BEFORE aborting,
+/// so the uncharged deferral survives the fold: the placeholder slot
+/// is path-keyed (tenant-independent), consulting further tenants
+/// burns doomed attempts against the held slot, and a sibling
+/// tenant's pre-claim charging failure would otherwise convert the
+/// uncharged race into a job-fatal charge via the fold's
+/// Charge-dominates precedence.
+#[derive(Debug, Clone, Default)]
+pub struct TenantAttemptCells {
+    cells: Vec<TenantAttemptEvidence>,
+}
+
+impl TenantAttemptCells {
+    /// Empty cells: no tenant consulted yet.
+    pub const fn new() -> Self {
+        Self { cells: Vec::new() }
+    }
+
+    /// Record a clean miss under one tenant (every upstream answered
+    /// hit-or-404).
+    pub fn record_clean_miss(&mut self) {
+        self.cells.push(TenantAttemptEvidence::CleanMiss);
+    }
+
+    /// THE failure-recording chokepoint — total over the class
+    /// alphabet via [`classify_substitute_failure`] (no catch-all: a
+    /// new class fails the kernel truth table, not this routing).
+    pub fn record_failure(
+        &mut self,
+        class: SubstituteFailureClass,
+        retry_after: Option<core::time::Duration>,
+    ) -> LoopControl {
+        match classify_substitute_failure(class) {
+            FailureDisposition::RetryUncharged => {
+                self.cells
+                    .push(TenantAttemptEvidence::Transient { retry_after });
+                if matches!(class, SubstituteFailureClass::Raced) {
+                    return LoopControl::AbortRaced;
+                }
+            }
+            FailureDisposition::ChargeInfra => {
+                self.cells.push(TenantAttemptEvidence::Charge { class });
+            }
+        }
+        LoopControl::Continue
+    }
+
+    /// The recorded cells, index-aligned with the caller's per-cell
+    /// detail messages (one cell per consulted tenant).
+    pub fn cells(&self) -> &[TenantAttemptEvidence] {
+        &self.cells
+    }
+
+    /// Number of recorded cells.
+    pub fn len(&self) -> usize {
+        self.cells.len()
+    }
+
+    /// No cells recorded.
+    pub fn is_empty(&self) -> bool {
+        self.cells.is_empty()
+    }
+
+    /// Fold the recorded cells ([`fold_tenant_attempts`]).
+    pub fn fold(&self) -> TenantAttemptsVerdict {
+        fold_tenant_attempts(&self.cells)
+    }
 }
 
 /// The post-loop verdict over every consulted tenant's evidence.
@@ -350,7 +427,7 @@ pub enum TenantAttemptsVerdict {
 /// (recorded strikes, capacity, integrity) outranks back-off advice
 /// (matching [`fold_substitute_loop`]'s ordering one level down),
 /// and the miss lane requires a clean miss under EVERY tenant.
-// r[impl store.materialize.tenant-fold]
+// r[impl store.materialize.tenant-fold+2]
 pub fn fold_tenant_attempts(cells: &[TenantAttemptEvidence]) -> TenantAttemptsVerdict {
     let mut first_charge: Option<usize> = None;
     let mut best_transient: Option<(usize, Option<core::time::Duration>)> = None;
@@ -392,6 +469,53 @@ pub fn fold_tenant_attempts(cells: &[TenantAttemptEvidence]) -> TenantAttemptsVe
 mod tests {
     use super::*;
     use crate::routing::ReprobeAnswer;
+
+    /// merged_bug_188: `TenantAttemptCells` routing — `Raced` records
+    /// the uncharged Transient cell FIRST and then aborts the tenant
+    /// axis; `RateLimited` records and continues; charging classes
+    /// record and continue; an already-recorded charge still
+    /// dominates the fold (the abort prevents only FUTURE doomed
+    /// consults, never erases evidence).
+    #[test]
+    fn tenant_cells_record_routing() {
+        use core::time::Duration;
+        let mut cells = TenantAttemptCells::new();
+        assert_eq!(
+            cells.record_failure(
+                SubstituteFailureClass::RateLimited,
+                Some(Duration::from_secs(7))
+            ),
+            LoopControl::Continue
+        );
+        assert_eq!(
+            cells.record_failure(SubstituteFailureClass::Fetch, None),
+            LoopControl::Continue
+        );
+        assert_eq!(cells.len(), 2);
+
+        let mut raced = TenantAttemptCells::new();
+        assert_eq!(
+            raced.record_failure(SubstituteFailureClass::Raced, None),
+            LoopControl::AbortRaced
+        );
+        assert_eq!(
+            raced.cells(),
+            &[TenantAttemptEvidence::Transient { retry_after: None }],
+            "Raced records the uncharged cell BEFORE aborting"
+        );
+        assert!(
+            matches!(raced.fold(), TenantAttemptsVerdict::RetryTransient { .. }),
+            "the aborted sweep folds to the uncharged deferral"
+        );
+
+        let mut pre = TenantAttemptCells::new();
+        let _ = pre.record_failure(SubstituteFailureClass::Fetch, None);
+        let _ = pre.record_failure(SubstituteFailureClass::Raced, None);
+        assert!(
+            matches!(pre.fold(), TenantAttemptsVerdict::ChargeInfra { .. }),
+            "an already-recorded charge still dominates the fold"
+        );
+    }
 
     /// bug_081 + merged_bug_044: the post-loop fold's precedence over
     /// the recorded cells, including the error axis the pre-fix
@@ -506,7 +630,7 @@ mod tests {
         }
     }
 
-    // r[verify store.materialize.tenant-fold]
+    // r[verify store.materialize.tenant-fold+2]
     /// merged_bug_133: the tenant fold's precedence (charge >
     /// transient > all-clean-miss), idx selection, and max-advice
     /// semantics.
