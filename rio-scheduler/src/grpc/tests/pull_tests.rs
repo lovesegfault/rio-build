@@ -1768,3 +1768,70 @@ async fn report_outcome_credential_matrix() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+// r[verify sched.materialize.job+2]
+/// bug_168 (round 3): the pull-rejection reason label classifies from
+/// the ACTUAL credential failure, not the status code. A shape-valid
+/// store-service token signed with the WRONG service key (the
+/// store-fleet HMAC rotation-skew trace) is a verification failure and
+/// must be counted `service_verification_failed` — pre-fix the
+/// PermissionDenied blanket counted it `kind_unauthorized`,
+/// mis-narrating key skew as a kind-authorization bug during the only
+/// window where the operator needs the true signal.
+#[tokio::test]
+async fn pull_rejection_reason_classifies_verification_failure() -> anyhow::Result<()> {
+    use rio_auth::hmac::HmacKey;
+    use rio_proto::ExecutorService;
+    let recorder = rio_test_support::metrics::CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let (_db, mut grpc, _handle, _actor_task) = setup_grpc().await;
+    let executor_key = std::sync::Arc::new(HmacKey::from_key(
+        b"executor-key-32-bytes-long!!!!!!".to_vec(),
+    ));
+    let service_key = std::sync::Arc::new(HmacKey::from_key(
+        b"service-key-32-bytes-long-here!!".to_vec(),
+    ));
+    // The skewed key: what the store fleet signs with after a rotation
+    // the scheduler has not yet picked up.
+    let rotated_key = std::sync::Arc::new(HmacKey::from_key(
+        b"rotated-away-key-32-bytes-long!!".to_vec(),
+    ));
+    grpc.hmac_key = Some(executor_key);
+    grpc.service_verifier = Some(service_key);
+    let skewed_token = store_service_token_bound(&rotated_key, "rio-store", "store-replica-0");
+
+    let mut req = Request::new(rio_proto::types::PullAssignmentRequest {
+        executor_token: String::new(),
+        intent_id: "drv-rotation-skew".into(),
+        kind: rio_proto::types::AttemptKind::Materialization.into(),
+        executor_instance: "store-replica-0".into(),
+        resume_exec_id: String::new(),
+        claim_nonce: String::new(),
+        confirm_only: false,
+    });
+    req.metadata_mut().insert(
+        rio_common::grpc::SERVICE_TOKEN_HEADER,
+        skewed_token.parse()?,
+    );
+    let err = grpc
+        .pull_assignment(req)
+        .await
+        .expect_err("a wrong-key service token must be rejected");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        recorder.get(
+            "rio_scheduler_pull_rejected_total{reason=service_verification_failed,rpc=pull_assignment}"
+        ),
+        1,
+        "verification failure must carry its own reason label; keys seen: {:?}",
+        recorder.all_keys()
+    );
+    assert_eq!(
+        recorder
+            .get("rio_scheduler_pull_rejected_total{reason=kind_unauthorized,rpc=pull_assignment}"),
+        0,
+        "rotation skew must not be narrated as a kind-authorization rejection"
+    );
+    Ok(())
+}

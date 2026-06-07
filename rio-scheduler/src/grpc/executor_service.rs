@@ -174,7 +174,7 @@ impl SchedulerGrpc {
         &self,
         req: &tonic::Request<T>,
         body_token: &str,
-    ) -> Result<StoreServiceAuth, Status> {
+    ) -> Result<StoreServiceAuth, CredentialRejection> {
         // Full dev mode → open (the flag gate answers; flag-off that is
         // the empty list / NotYetReady / ack-and-ignore).
         if self.hmac_key.is_none() && self.service_verifier.is_none() {
@@ -192,31 +192,49 @@ impl SchedulerGrpc {
             // No service credential presented in an authenticated
             // deployment → the same closed answer the executor-token
             // unaries give credential-less calls.
-            return Err(Status::unauthenticated(
-                "materialization operations require x-rio-service-token \
-                 (the store-service credential)",
+            return Err(CredentialRejection::counted(
+                RejectReason::Unauthenticated,
+                Status::unauthenticated(
+                    "materialization operations require x-rio-service-token \
+                     (the store-service credential)",
+                ),
             ));
         };
         // r[impl sched.executor.input-bounds+2]
-        rio_common::grpc::check_bound("service token bytes", token.len(), MAX_EXECUTOR_TOKEN_LEN)?;
+        rio_common::grpc::check_bound("service token bytes", token.len(), MAX_EXECUTOR_TOKEN_LEN)
+            .map_err(CredentialRejection::shape)?;
         let Some(verifier) = &self.service_verifier else {
             // Half-configured deployment (executor HMAC without a
             // service key): the presented credential cannot be
-            // verified → closed.
-            return Err(Status::permission_denied(
-                "a store-service credential was presented but the scheduler has \
-                 no service-HMAC verifier configured",
+            // verified → closed. A verification failure, not a kind
+            // failure — the credential's kind was never established.
+            return Err(CredentialRejection::counted(
+                RejectReason::ServiceVerificationFailed,
+                Status::permission_denied(
+                    "a store-service credential was presented but the scheduler has \
+                     no service-HMAC verifier configured",
+                ),
             ));
         };
         let claims: rio_auth::hmac::ServiceClaims = verifier.verify(&token).map_err(|e| {
-            Status::permission_denied(format!("store-service token verification failed: {e}"))
+            // THE rotation-skew trace: a shape-valid token signed with
+            // a key this scheduler does not hold.
+            CredentialRejection::counted(
+                RejectReason::ServiceVerificationFailed,
+                Status::permission_denied(format!("store-service token verification failed: {e}")),
+            )
         })?;
         if !MATERIALIZATION_SERVICE_CALLERS.contains(&claims.caller.as_str()) {
-            return Err(Status::permission_denied(format!(
-                "service-token caller {:?} does not authorize materialization \
-                 operations (allowed: {MATERIALIZATION_SERVICE_CALLERS:?})",
-                claims.caller
-            )));
+            // A VERIFIED credential of the wrong kind — the one
+            // store-service arm that genuinely is kind_unauthorized.
+            return Err(CredentialRejection::counted(
+                RejectReason::KindUnauthorized,
+                Status::permission_denied(format!(
+                    "service-token caller {:?} does not authorize materialization \
+                     operations (allowed: {MATERIALIZATION_SERVICE_CALLERS:?})",
+                    claims.caller
+                )),
+            ));
         }
         Ok(StoreServiceAuth::Authorized {
             instance: claims.instance,
@@ -249,25 +267,31 @@ impl SchedulerGrpc {
         req: &tonic::Request<T>,
         body_token: &str,
         request_instance: Option<&str>,
-    ) -> Result<StoreServiceAuth, Status> {
+    ) -> Result<StoreServiceAuth, CredentialRejection> {
         let auth = self.require_store_service(req, body_token)?;
         match &auth {
             StoreServiceAuth::DevMode => Ok(auth),
             StoreServiceAuth::Authorized { instance } => {
                 let Some(claimed) = instance else {
-                    return Err(Status::permission_denied(
-                        "the store-service token does not carry the instance claim \
-                         (materialization operations require an instance-bound \
-                         credential since Phase B)",
+                    return Err(CredentialRejection::counted(
+                        RejectReason::InstanceUnbound,
+                        Status::permission_denied(
+                            "the store-service token does not carry the instance claim \
+                             (materialization operations require an instance-bound \
+                             credential since Phase B)",
+                        ),
                     ));
                 };
                 if let Some(requested) = request_instance
                     && claimed != requested
                 {
-                    return Err(Status::permission_denied(format!(
-                        "instance claim mismatch: the store-service token is bound to \
-                         {claimed:?} but the request asserts executor_instance {requested:?}"
-                    )));
+                    return Err(CredentialRejection::counted(
+                        RejectReason::InstanceUnbound,
+                        Status::permission_denied(format!(
+                            "instance claim mismatch: the store-service token is bound to \
+                             {claimed:?} but the request asserts executor_instance {requested:?}"
+                        )),
+                    ));
                 }
                 Ok(auth)
             }
@@ -348,31 +372,44 @@ impl SchedulerGrpc {
         &self,
         kind: PayloadCredentialKind<'_>,
         req: &Request<T>,
-    ) -> Result<ResolvedCredential, Status> {
+    ) -> Result<ResolvedCredential, CredentialRejection> {
         match kind {
             PayloadCredentialKind::Build { body_token } => {
                 match self.require_executor(req) {
                     Ok(claims) => Ok(ResolvedCredential::Executor(claims)),
                     Err(metadata_err) => {
                         if body_token.is_empty() {
-                            return Err(metadata_err);
+                            // Missing/unverifiable executor credential
+                            // (require_executor only mints
+                            // Unauthenticated statuses).
+                            return Err(CredentialRejection::counted(
+                                RejectReason::Unauthenticated,
+                                metadata_err,
+                            ));
                         }
                         // r[impl sched.executor.input-bounds+2]
                         rio_common::grpc::check_bound(
                             "executor_token bytes",
                             body_token.len(),
                             MAX_EXECUTOR_TOKEN_LEN,
-                        )?;
+                        )
+                        .map_err(CredentialRejection::shape)?;
                         let Some(key) = &self.hmac_key else {
                             // require_executor only fails when a key is
                             // configured; unreachable, but stay closed.
-                            return Err(metadata_err);
+                            return Err(CredentialRejection::counted(
+                                RejectReason::Unauthenticated,
+                                metadata_err,
+                            ));
                         };
                         let claims: rio_auth::hmac::ExecutorClaims =
                             key.verify(body_token).map_err(|e| {
-                                Status::unauthenticated(format!(
-                                    "executor_token verification failed: {e}"
-                                ))
+                                CredentialRejection::counted(
+                                    RejectReason::Unauthenticated,
+                                    Status::unauthenticated(format!(
+                                        "executor_token verification failed: {e}"
+                                    )),
+                                )
                             })?;
                         Ok(ResolvedCredential::Executor(Some(claims)))
                     }
@@ -392,9 +429,15 @@ impl SchedulerGrpc {
                     .verified_executor_claims(req, executor_body_token)
                     .is_some()
                 {
-                    return Err(Status::permission_denied(
-                        "executor tokens do not authorize materialization operations \
-                         (a store-service credential is required)",
+                    // A VERIFIED executor credential on a
+                    // materialization surface — a genuine kind
+                    // rejection.
+                    return Err(CredentialRejection::counted(
+                        RejectReason::KindUnauthorized,
+                        Status::permission_denied(
+                            "executor tokens do not authorize materialization operations \
+                             (a store-service credential is required)",
+                        ),
                     ));
                 }
                 self.require_store_service_instance_bound(req, service_body_token, request_instance)
@@ -402,9 +445,12 @@ impl SchedulerGrpc {
             }
             PayloadCredentialKind::MaterializationDisplayOnly => {
                 if self.verified_executor_claims(req, "").is_some() {
-                    return Err(Status::permission_denied(
-                        "executor tokens do not authorize materialization progress reports \
-                         (a store-service credential is required)",
+                    return Err(CredentialRejection::counted(
+                        RejectReason::KindUnauthorized,
+                        Status::permission_denied(
+                            "executor tokens do not authorize materialization progress reports \
+                             (a store-service credential is required)",
+                        ),
                     ));
                 }
                 self.require_store_service(req, "")
@@ -451,6 +497,78 @@ pub(super) enum ResolvedCredential {
     /// `credential_for` as that single site), so the chokepoint
     /// surfaces it now rather than re-plumbing later.
     StoreService(#[allow(dead_code)] StoreServiceAuth),
+}
+
+/// Why a credential was rejected — the `pull_rejected_total` reason
+/// label, classified at the site that KNOWS the failure, never
+/// re-derived from the status code (bug_168: every store-service
+/// failure surfaces as `PermissionDenied`, so the status-code blanket
+/// labeled all five non-kind failures `kind_unauthorized` and the
+/// store-fleet HMAC rotation-skew trace mis-narrated as a
+/// kind-authorization bug).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RejectReason {
+    /// No credential presented, or an executor token that failed
+    /// verification (the per-intent mint family).
+    Unauthenticated,
+    /// A VERIFIED credential whose kind does not authorize the payload
+    /// class: an executor token on a materialization surface, or a
+    /// validly-signed service token from a non-store caller.
+    KindUnauthorized,
+    /// A service token was presented but could not be verified: no
+    /// service verifier configured (half-configured deployment), or
+    /// service-HMAC verification failed — a sustained rate here is
+    /// the store-fleet key rotation-skew trace.
+    ServiceVerificationFailed,
+    /// A verified store-service credential without the Phase-B
+    /// instance binding: instance-less token on a state-effecting
+    /// surface, or claim/request instance mismatch.
+    InstanceUnbound,
+}
+
+impl RejectReason {
+    pub(super) fn as_label(self) -> &'static str {
+        match self {
+            Self::Unauthenticated => "unauthenticated",
+            Self::KindUnauthorized => "kind_unauthorized",
+            Self::ServiceVerificationFailed => "service_verification_failed",
+            Self::InstanceUnbound => "instance_unbound",
+        }
+    }
+}
+
+/// A credential rejection: the wire [`Status`] plus its counting
+/// classification, produced together at the rejecting site so the
+/// label sites cannot re-derive (and mis-derive) the reason.
+/// `reason: None` is a request-shape violation (oversized token
+/// bytes) — surfaced to the caller but NOT counted, consistent with
+/// this file's other uncounted `InvalidArgument` validations.
+#[derive(Debug)]
+pub(super) struct CredentialRejection {
+    pub(super) status: Status,
+    pub(super) reason: Option<RejectReason>,
+}
+
+impl CredentialRejection {
+    fn counted(reason: RejectReason, status: Status) -> Self {
+        Self {
+            status,
+            reason: Some(reason),
+        }
+    }
+
+    fn shape(status: Status) -> Self {
+        Self {
+            status,
+            reason: None,
+        }
+    }
+}
+
+impl From<CredentialRejection> for Status {
+    fn from(rej: CredentialRejection) -> Status {
+        rej.status
+    }
 }
 
 #[tonic::async_trait]
@@ -531,18 +649,19 @@ impl ExecutorService for SchedulerGrpc {
             // pulling identity is the composite (intent, replica) pair
             // the kernel arbitrates on, so there is no auth_intent.
             Ok(ResolvedCredential::StoreService(_)) => None,
-            Err(e) => {
-                metrics::counter!(
-                    "rio_scheduler_pull_rejected_total",
-                    "rpc" => "pull_assignment",
-                    "reason" => if e.code() == tonic::Code::PermissionDenied {
-                        "kind_unauthorized"
-                    } else {
-                        "unauthenticated"
-                    }
-                )
-                .increment(1);
-                return Err(e);
+            Err(rej) => {
+                // bug_168: the reason travels WITH the rejection from
+                // the site that knows the failure; shape violations
+                // (reason: None) surface uncounted.
+                if let Some(reason) = rej.reason {
+                    metrics::counter!(
+                        "rio_scheduler_pull_rejected_total",
+                        "rpc" => "pull_assignment",
+                        "reason" => reason.as_label()
+                    )
+                    .increment(1);
+                }
+                return Err(rej.into());
             }
         };
         let auth_intent = auth_claims.as_ref().map(|c| c.intent_id.clone());
@@ -726,18 +845,18 @@ impl ExecutorService for SchedulerGrpc {
             // Authorized store replica (or full dev mode): fleet-level
             // credential, no per-intent binding.
             Ok(ResolvedCredential::StoreService(_)) => None,
-            Err(e) => {
-                metrics::counter!(
-                    "rio_scheduler_pull_rejected_total",
-                    "rpc" => "report_outcome",
-                    "reason" => if e.code() == tonic::Code::PermissionDenied {
-                        "kind_unauthorized"
-                    } else {
-                        "unauthenticated"
-                    }
-                )
-                .increment(1);
-                return Err(e);
+            Err(rej) => {
+                // bug_168: classified at the rejecting site, consumed
+                // here; shape violations (reason: None) uncounted.
+                if let Some(reason) = rej.reason {
+                    metrics::counter!(
+                        "rio_scheduler_pull_rejected_total",
+                        "rpc" => "report_outcome",
+                        "reason" => reason.as_label()
+                    )
+                    .increment(1);
+                }
+                return Err(rej.into());
             }
         };
         let req = request.into_inner();
