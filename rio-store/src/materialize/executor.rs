@@ -809,41 +809,31 @@ async fn live_wanted_paths(
     ctx: &ExecutorContext,
     claimed: &ClaimedJob,
 ) -> Result<Vec<String>, sqlx::Error> {
-    let rows: Vec<(Vec<String>, Vec<String>, Vec<String>)> = sqlx::query_as(
-        "SELECT d.output_names, d.expected_output_paths, i.wanted_output_names \
-           FROM derivations d \
-           JOIN live_wanted_interest i USING (derivation_id) \
-          WHERE d.drv_hash = $1",
-    )
-    .bind(&claimed.drv_hash)
-    .fetch_all(&ctx.pool)
-    .await?;
+    let rows: Vec<(Vec<String>, Vec<String>, Vec<String>)> =
+        sqlx::query_as(rio_migrations::sql::LIVE_WANTED_NAME_ROWS_BY_DRV_SQL)
+            .bind(&claimed.drv_hash)
+            .fetch_all(&ctx.pool)
+            .await?;
 
-    let Some((output_names, expected_paths, _)) = rows.first() else {
-        return Ok(Vec::new());
+    // Name-level fold: THE one fold body (merged_bug_059 — the
+    // scheduler's in-memory view and SQL twin route through the same
+    // function, so the width definition cannot fork at the fold).
+    let mut paths: Vec<String> = match rows.first() {
+        None => Vec::new(),
+        Some((output_names, expected_paths, _)) => {
+            let union = rio_common::wanted_outputs::saturating_wanted_union(
+                rows.iter().map(|(_, _, wanted)| wanted.as_slice()),
+            );
+            let all = matches!(&union, Some(v) if v.is_empty());
+            let names = union.unwrap_or_default();
+            output_names
+                .iter()
+                .zip(expected_paths.iter())
+                .filter(|(name, path)| (all || names.contains(*name)) && !path.is_empty())
+                .map(|(_, path)| path.clone())
+                .collect()
+        }
     };
-
-    // Union the live builds' wanted names; any '{}' saturates to all.
-    let mut all = false;
-    let mut union: Vec<&str> = Vec::new();
-    for (_, _, wanted) in &rows {
-        if wanted.is_empty() {
-            all = true;
-            break;
-        }
-        for name in wanted {
-            if !union.contains(&name.as_str()) {
-                union.push(name);
-            }
-        }
-    }
-
-    let mut paths: Vec<String> = output_names
-        .iter()
-        .zip(expected_paths.iter())
-        .filter(|(name, path)| (all || union.contains(&name.as_str())) && !path.is_empty())
-        .map(|(_, path)| path.clone())
-        .collect();
 
     // r[impl sched.merge.stale-substitutable+3]
     // Realized-path carrier (migration 082, the floating-CA
@@ -853,9 +843,15 @@ async fn live_wanted_paths(
     // (an immutable content-addressed snapshot; the wanted NAME set
     // above stays live). The scheduler-side consumption coverage reads
     // the same column, so seed set and coverage agree by construction.
-    // Unconditional since bug_233's parse-don't-validate: every
-    // ClaimedJob carries a real job_id, so the carrier read can never
-    // be silently skipped for a carried job.
+    // bug_027: the union is UNCONDITIONAL — hoisted ABOVE every return
+    // path (the pre-fix zero-live-rows early return skipped it, so a
+    // carried job whose interest vanished mid-claim reported
+    // InfraFailure here while the scheduler's consumption leg, which
+    // unions the carrier BEFORE its LiveWanted width check, computed
+    // non-zero width and charged the park budget for the race
+    // merged_bug_194 closed uncharged). bug_233's
+    // parse-don't-validate keeps the read itself total: every
+    // ClaimedJob carries a real job_id.
     let carried: Option<Vec<String>> = sqlx::query_scalar(
         "SELECT carried_realized_paths FROM materialization_jobs \
           WHERE job_id = $1",
@@ -1722,6 +1718,60 @@ mod tests {
         );
     }
 
+    // r[verify sched.merge.stale-substitutable+3]
+    /// bug_027: the carrier union is UNCONDITIONAL — a carried job
+    /// whose live interest vanished mid-claim still resolves its
+    /// carried realized paths, agreeing with the scheduler's
+    /// consumption leg (materialize.rs unions the carrier BEFORE its
+    /// width check). Pre-fix, the zero-live-rows early return skipped
+    /// the carrier read entirely — the store reported
+    /// InfraFailure("no-verifiable-wanted-paths") where the scheduler
+    /// computed non-zero width, and the divergence charged the
+    /// materialization park budget for the exact race merged_bug_194
+    /// closed uncharged.
+    #[tokio::test]
+    async fn carried_paths_survive_interest_vanishing() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "mat-carrier").await;
+        let carried = store_path(9, "mat-carried");
+        let seeded = seed_job(
+            &db.pool,
+            "mat-carrier-drv",
+            &[("out", carried.as_str())],
+            Some(tenant),
+            Some(tenant),
+            &["out"],
+        )
+        .await;
+        // The migration-082 carrier on the job row (stale_reset origin).
+        sqlx::query(
+            "UPDATE materialization_jobs SET carried_realized_paths = $1 \
+              WHERE job_id = $2",
+        )
+        .bind(vec![carried.clone()])
+        .bind(seeded.job_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        // Interest vanishes: the only interested build goes terminal.
+        sqlx::query("UPDATE builds SET status = 'succeeded' WHERE build_id = $1")
+            .bind(seeded.build_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let ctx = make_ctx(db.pool.clone());
+        let paths = live_wanted_paths(&ctx, &seeded.claimed).await.unwrap();
+        assert_eq!(
+            paths,
+            vec![carried.clone()],
+            "zero live interest must still surface the carried realized \
+             paths (the scheduler's consumption leg unions the carrier \
+             unconditionally — the two width definitions may not fork)"
+        );
+    }
+
+    // r[verify store.materialize.tenant-fold]
     // r[verify store.materialize.tenant-fold+2]
     /// merged_bug_133 red: the recorded (hint) tenant's upstream is
     /// DEAD (every request 500s → charging class), a SECOND

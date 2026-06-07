@@ -9,9 +9,13 @@
 //! caller's transaction (the merge tx), which already carries the
 //! merge fence — one fence per transaction, no second floor read.
 //!
-//! The effective-wanted union is computed by ONE query helper here and
-//! nowhere else — the '{}'-means-all saturation convention (the 062
-//! convention) lives in exactly one place.
+//! The effective-wanted union's SQL-side home is the ONE query helper
+//! here; the '{}'-means-all saturation FOLD itself lives in
+//! rio_common::wanted_outputs::saturating_wanted_union (the 062
+//! convention), shared with the in-memory `effective_wanted`
+//! (state/derivation.rs) and the store executor's `live_wanted_paths`
+//! (merged_bug_059 round 3: the three bodies route through one fold;
+//! the 64-sequence battery below pins SQL == fold).
 // r[impl sched.materialize.job+2]
 
 use sqlx::PgConnection;
@@ -140,36 +144,30 @@ impl SchedulerDb {
         if rows.is_empty() {
             return Ok(None);
         }
-        // Saturating union: any '{}' contribution saturates to "all".
         // merged_bug_059: ALL rows are scanned before the saturated
         // answer is returned, so the DQ-2 saturation note is a
         // function of the row SET, not of unspecified PG heap order —
         // every legacy defaulted row is noted even when an explicit
         // '{}' row happens to be fetched first.
-        let mut union: Vec<String> = Vec::new();
-        let mut saturated = false;
-        for (build_id, names, saturated_default) in rows {
-            if names.is_empty() {
-                if saturated_default {
-                    crate::state::note_width_event(crate::state::WidthEvent::SaturatedToDeclared {
-                        build_id,
-                    });
-                }
-                saturated = true;
-                continue;
-            }
-            if !saturated {
-                for n in names {
-                    if !union.contains(&n) {
-                        union.push(n);
-                    }
-                }
+        for (build_id, names, saturated_default) in &rows {
+            if names.is_empty() && *saturated_default {
+                crate::state::note_width_event(crate::state::WidthEvent::SaturatedToDeclared {
+                    build_id: *build_id,
+                });
             }
         }
-        if saturated {
-            return Ok(Some(Vec::new()));
-        }
-        Ok(Some(union))
+        // The fold: THE one body (round 3 — rio-common's
+        // saturating_wanted_union, shared with the in-memory
+        // effective_wanted and the store executor; the 64-sequence
+        // battery below pins SQL == fold). rows is non-empty here, so
+        // None is unreachable; Some(vec![]) = any '{}' contribution
+        // saturated.
+        Ok(Some(
+            rio_common::wanted_outputs::saturating_wanted_union(
+                rows.iter().map(|(_, names, _)| names.as_slice()),
+            )
+            .unwrap_or_default(),
+        ))
     }
 
     /// Gap-filling backfill write (T-D2.3 step 5 — the B4 backfill's

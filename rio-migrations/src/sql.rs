@@ -25,6 +25,28 @@ pub const PIN_MATERIALIZED_UPSERT_SQL: &str = "INSERT INTO scheduler_live_pins (
      ON CONFLICT (store_path_hash, drv_hash, pin_kind) DO UPDATE \
          SET job_id = EXCLUDED.job_id";
 
+/// The live-wanted name rows for one derivation, by drv_hash
+/// (bug_027 / merged_bug_059): the store executor's
+/// `live_wanted_paths` runs THIS text; the scheduler's
+/// `effective_wanted_union` (db/wanted.rs) reads the same
+/// `live_wanted_interest` view with its note-bearing projection. The
+/// un-forkable width definition is the triple this const anchors:
+/// (a) the live predicate — the `live_wanted_interest` view, defined
+/// once in the migrations; (b) the name fold —
+/// `rio_common::wanted_outputs::saturating_wanted_union`, one body
+/// for every consumer; (c) the carrier union — UNCONDITIONAL in both
+/// consumption legs (the store's walk read and the scheduler's
+/// consumption coverage), so a carried job whose live interest
+/// vanished mid-claim computes the SAME width on both sides.
+///
+/// Binds: `$1 text` drv_hash. Row: (output_names,
+/// expected_output_paths, wanted_output_names) — one row per live
+/// interested build.
+pub const LIVE_WANTED_NAME_ROWS_BY_DRV_SQL: &str = "SELECT d.output_names, d.expected_output_paths, i.wanted_output_names \
+       FROM derivations d \
+       JOIN live_wanted_interest i USING (derivation_id) \
+      WHERE d.drv_hash = $1";
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -113,6 +113,38 @@ pub fn verifiable_wanted_paths<'a>(
 /// the gateway's multi-root DAG dedup, and (in SQL) the PG upsert's
 /// union-on-conflict — all three must agree or one root's demand is
 /// silently dropped.
+/// Fold MANY wanted contributions through the saturating union — THE
+/// one fold body behind every effective-wanted computation
+/// (merged_bug_059, round 3). Three consumers route through it: the
+/// scheduler's in-memory `effective_wanted` (state/derivation.rs),
+/// the scheduler's SQL-row fold (`effective_wanted_union`,
+/// db/wanted.rs — its 64-sequence battery pins SQL == this fold), and
+/// the store executor's `live_wanted_paths`
+/// (rio-store/src/materialize/executor.rs). A fourth open-coded body
+/// is the drift class this exists to delete.
+///
+/// `None` = no contributions at all (callers pick their conservative
+/// branch); `Some(vec![])` = saturated to all-declared (any empty
+/// contribution); `Some(names)` = the union (sorted/deduped once a
+/// union actually folds; a single contribution is returned verbatim).
+pub fn saturating_wanted_union<'a, I>(contributions: I) -> Option<Vec<String>>
+where
+    I: IntoIterator<Item = &'a [String]>,
+{
+    let mut acc: Option<Vec<String>> = None;
+    for c in contributions {
+        match &mut acc {
+            None => acc = Some(c.to_vec()),
+            Some(dst) => union_wanted_saturating(dst, c),
+        }
+        if matches!(&acc, Some(v) if v.is_empty()) {
+            // all ∪ X = all — saturation is absorbing; stop early.
+            return Some(Vec::new());
+        }
+    }
+    acc
+}
+
 pub fn union_wanted_saturating(dst: &mut Vec<String>, src: &[String]) {
     if dst.is_empty() || src.is_empty() {
         dst.clear(); // all ∪ anything = all

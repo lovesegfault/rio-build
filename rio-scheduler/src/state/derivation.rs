@@ -2045,34 +2045,45 @@ pub fn effective_wanted(
 ) -> Option<Vec<String>> {
     use super::BuildStateExt as _;
 
-    // None = no live contribution folded yet. Folding starts from the
-    // first live contribution (cloned) rather than an empty accumulator:
-    // an empty Vec is the "all wanted" sentinel and would saturate the
-    // union from the start.
-    let mut effective: Option<Vec<String>> = None;
-    for build_id in &state.interested_builds {
-        let live = builds
-            .get(build_id)
-            .is_some_and(|b| !b.state().is_terminal());
-        if !live {
-            continue;
-        }
-        // The conservative-absent arm: a live interested build with an
-        // unknown contribution saturates the union to all-declared
-        // (MAXIMAL width — never under-counted, never the stored
-        // union). Observable via counter + rate-limited warn.
-        let Some(contribution) = state.wanted_by_build.get(build_id) else {
-            note_width_event(WidthEvent::SaturatedToDeclared {
-                build_id: *build_id,
-            });
-            return Some(Vec::new());
-        };
-        match &mut effective {
-            None => effective = Some(contribution.clone()),
-            Some(acc) => union_wanted_saturating(acc, contribution),
+    // Sorted live set: WHICH builds ride the rate-limited DQ-2 warn is
+    // a function of the build SET, never of HashSet iteration order
+    // (merged_bug_059 round 3 — the in-memory twin matches the SQL
+    // body's set-wise determinism).
+    let mut live: Vec<Uuid> = state
+        .interested_builds
+        .iter()
+        .filter(|b| builds.get(b).is_some_and(|bi| !bi.state().is_terminal()))
+        .copied()
+        .collect();
+    live.sort_unstable();
+
+    let mut saturated = false;
+    let mut contributions: Vec<&[String]> = Vec::with_capacity(live.len());
+    for build_id in &live {
+        match state.wanted_by_build.get(build_id) {
+            Some(contribution) => contributions.push(contribution.as_slice()),
+            None => {
+                // The conservative-absent arm: a live interested build
+                // with an unknown contribution saturates the union to
+                // all-declared (MAXIMAL width — never under-counted,
+                // never the stored union). merged_bug_059: the scan
+                // covers ALL live builds before returning, so EVERY
+                // unknown contribution is noted — the counter
+                // magnitude agrees with the SQL twin (k, not 1).
+                note_width_event(WidthEvent::SaturatedToDeclared {
+                    build_id: *build_id,
+                });
+                saturated = true;
+            }
         }
     }
-    effective
+    if saturated {
+        return Some(Vec::new());
+    }
+    // The fold: THE one body (rio-common; shared with the store
+    // executor's live_wanted_paths and pinned SQL-equal by the
+    // db/wanted.rs battery). None = no live contributions.
+    rio_common::wanted_outputs::saturating_wanted_union(contributions)
 }
 
 /// The two width-observability event classes (bug_282). The event
@@ -2292,6 +2303,67 @@ mod tests {
             wanted_paths(&s, &["out".into(), "nonexistent".into()]),
             vec!["/nix/store/aaaa-glibc"]
         );
+    }
+
+    /// merged_bug_059 (round 3): the conservative-absent saturation is
+    /// SET-WISE — every live build with an unknown contribution is
+    /// noted before the saturated answer returns, in sorted build-id
+    /// order. Pre-fix the in-memory fold early-returned at the FIRST
+    /// unknown contribution (HashSet iteration order), so the DQ-2
+    /// counter magnitude diverged from the SQL twin
+    /// (`effective_wanted_union` scans all rows; 1 vs k notes) and
+    /// WHICH build_id rode the rate-limited warn was nondeterministic
+    /// across restarts.
+    #[test]
+    fn effective_wanted_notes_every_unknown_contribution() -> anyhow::Result<()> {
+        use std::collections::HashMap;
+
+        use metrics_util::debugging::DebuggingRecorder;
+
+        use super::super::{BuildInfo, BuildOptions, PriorityClass};
+
+        let rec = DebuggingRecorder::new();
+        let snap = rec.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&rec);
+
+        let mk_build = |bid| {
+            BuildInfo::new_pending(
+                bid,
+                None,
+                PriorityClass::Scheduled,
+                false,
+                BuildOptions::default(),
+                HashSet::new(),
+            )
+        };
+        let unknown_a = Uuid::new_v4();
+        let unknown_b = Uuid::new_v4();
+        let known = Uuid::new_v4();
+        let mut builds: HashMap<Uuid, BuildInfo> = HashMap::new();
+        for bid in [unknown_a, unknown_b, known] {
+            builds.insert(bid, mk_build(bid));
+        }
+
+        let mut s = DerivationState::try_from_node(&dummy_node())?;
+        s.interested_builds = [unknown_a, unknown_b, known].into();
+        s.wanted_by_build = [(known, vec!["out".to_string()])].into();
+
+        assert_eq!(
+            effective_wanted(&s, &builds),
+            Some(vec![]),
+            "any live unknown contribution saturates to all-declared"
+        );
+        let counters = crate::sla::metrics::counter_map(&snap);
+        assert_eq!(
+            counters
+                .get("rio_scheduler_wanted_width_saturated_total")
+                .copied()
+                .unwrap_or(0),
+            2,
+            "BOTH live unknown-contribution builds are noted (set-wise, \
+             like the SQL twin) — not just the first in hash order"
+        );
+        Ok(())
     }
 
     /// `effective_wanted` — the wanted set scoped to LIVE interested
