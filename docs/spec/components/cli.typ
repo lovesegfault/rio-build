@@ -129,6 +129,23 @@ per-message progress drains without a whole-call deadline.
   disconnected mid-scan). I-040 diagnostic.
 ]
 
+#r("cli.stream.drain-bound")[
+  The shared CLI drain law (`drain_until_done`) MUST treat the server's
+  terminal sentinel as end-of-stream by construction --- the loop stops at
+  the sentinel and never polls again, so a post-sentinel transport error
+  (replica restart after sealing, RST before trailers) cannot fail a
+  complete audit --- and MUST bound per-message inactivity at 120 s,
+  converting the half-open-connection truncation class (peer death without
+  FIN/RST on the keepalive-free eager CLI channel) into a nonzero PARTIAL
+  exit instead of an unbounded hang.
+]
+Interactive follow streams (`rio-cli logs`) stay outside this law: an
+hour-quiet build log is legitimate idle there (the streaming chain's
+1 h silence tolerance), and `logs.rs` remains the documented exit-0
+disclosure exception. The 120 s figure matches the CLI's `RPC_TIMEOUT`
+budget; `VerifyChunks` emits a progress frame per batch, so one bound
+covers every batch shape.
+
 #r("cli.cmd.sla")[
   `rio-cli sla {override|list|clear|reset|status|explain|export-corpus|import-corpus}`
   calls the ADR-023 `AdminService.*SlaOverride` / `ResetSlaModel` /
