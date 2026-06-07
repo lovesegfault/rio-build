@@ -1113,50 +1113,26 @@ in
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../xtask/src)
           ];
         };
-        nativeBuildInputs = [ pkgs.ripgrep ];
+        nativeBuildInputs = [ pkgs.python3 ];
+        scanScript = ../nix/string_interior_spaces.py;
       }
       ''
-        set +o pipefail
-        scan() {
-          local dir=$1 fail=0
-          while IFS= read -r hit; do
-            local file=''${hit%%:*} rest=''${hit#*:}
-            local line=''${rest%%:*} text=''${rest#*:}
-            # Carve-out 1: comment lines (trim starts with //) may
-            # draw ASCII tables and aligned columns.
-            local t=''${text#"''${text%%[![:space:]]*}"}
-            [[ $t == //* ]] && continue
-            # Carve-out 2: runs after a literal \n escape are the
-            # indentation of a multi-line template (format fixtures,
-            # YAML snippets) — collapse them, then re-test.
-            local collapsed
-            collapsed=$(sed -E 's/\\n +/\\n /g' <<<"$text")
-            if grep -qE '"[^"]*[^ "] {8,}[^ "][^"]*"' <<<"$collapsed"; then
-              echo "$file:$line: interior space run inside a string literal" >&2
-              fail=1
-            fi
-          done < <(rg -n '"[^"]*[^ "] {8,}[^ "][^"]*"' "$dir" || true)
-          if [[ $fail -ne 0 ]]; then
-            echo "FAIL: ≥8-space interior runs inside .rs string literals —" >&2
-            echo "a collapsed backslash continuation (merged_bug_016)." >&2
-            echo "Re-join with single spaces or keep the \` \\\\\` continuation." >&2
-          fi
-          [[ $fail -eq 0 ]]
-        }
-        # Self-test: planted red must FAIL, clean fixture must PASS.
-        mkdir -p "$TMPDIR/red" "$TMPDIR/green"
-        printf '%s\n' 'let m = "garbled continuation          left inside";' > "$TMPDIR/red/a.rs"
-        {
-          printf '%s\n' '// comment table:   col1          col2'
-          printf '%s\n' 'let y = "rules:\n        - alert: x";'
-          printf '%s\n' 'let z = "single spaced help";'
-        } > "$TMPDIR/green/b.rs"
-        if scan "$TMPDIR/red" 2>/dev/null; then
-          echo "SELF-TEST FAIL: the planted-red fixture passed" >&2
-          exit 1
-        fi
-        scan "$TMPDIR/green" || { echo "SELF-TEST FAIL: the clean fixture failed" >&2; exit 1; }
-        scan "$src"
+        # bughunt-3 S1 (merged_bug_193): lexer-exact string spans —
+        # the scanner blanks comments and tracks raw/non-raw literal
+        # boundaries, so quote parity is structural. Arm A: single-line
+        # 8+ interior runs (minus \n-template indents). Arm B:
+        # mid-string `\<LF>` continuation mixed with a BARE newline
+        # (a prose join that lost a backslash); SQL bare-newline style
+        # and the leading-`"\` fixture idiom stay exempt. Per-arm
+        # planted red+green self-tests run in the script before the
+        # real scan may gate (banner (b)).
+        python3 "$scanScript" "$src" \
+          rio-auth/src rio-authz-kernel/src rio-builder/src rio-cli/src \
+          rio-common/src rio-controller/src rio-crds/src rio-dashboard/src \
+          rio-evidence-kernel/src rio-gateway/src rio-lease/src \
+          rio-log-kernel/src rio-migrations/src rio-nix/src rio-proto/src \
+          rio-retry-kernel/src rio-scheduler/src rio-store/src \
+          rio-test-support/src xtask/src
         touch $out
       '';
 
@@ -1744,9 +1720,37 @@ in
         # array (one quoted path per line) — extract from the array,
         # and fail LOUDLY if the shape drifts (an empty extraction
         # would make this subset check vacuously green).
-        pdf=$(grep -oE '^  "[^"]+\.typ",' $typSrc/book-pdf.typ | sed 's/^  "//;s/",$//')
+        # merged_bug_193: the extraction requires the exact
+        # two-space-indent + trailing-comma line shape, so a valid but
+        # non-conforming entry (e.g. a comma-free last element) was
+        # silently DROPPED while the loud-fail only covered the
+        # all-lines-drifted case. Cross-check the extracted count
+        # against the RAW quoted-.typ count inside the array span —
+        # any deviating line is now a hard error, not a silent skip.
+        chapters_extract() {
+          grep -oE '^  "[^"]+\.typ",' "$1" | sed 's/^  "//;s/",$//'
+        }
+        chapters_raw_count() {
+          sed -n '/^#let chapters = (/,/^)/p' "$1" | grep -cE '"[^"]+\.typ"'
+        }
+        # Planted red (banner (b)): a comma-free last entry must be a
+        # loud mismatch, never a silent drop.
+        plant="$TMPDIR/book-pdf-planted.typ"
+        printf '%s\n' '#let chapters = (' '  "a.typ",' '  "b.typ"' ')' > "$plant"
+        if [[ "$(chapters_extract "$plant" | grep -c . || true)" -eq "$(chapters_raw_count "$plant")" ]]; then
+          echo "SELF-TEST FAIL: comma-free chapter entry not detected by the count cross-check" >&2
+          exit 1
+        fi
+        pdf=$(chapters_extract $typSrc/book-pdf.typ)
         if [[ -z "$pdf" ]]; then
           echo "FAIL: no chapters extracted from book-pdf.typ's chapters array — the stitch shape changed; update this extraction WITH it" >&2
+          fail=1
+        fi
+        raw_n=$(chapters_raw_count $typSrc/book-pdf.typ)
+        got_n=$(printf '%s\n' "$pdf" | grep -c . || true)
+        if [[ "$raw_n" -ne "$got_n" ]]; then
+          echo "FAIL: book-pdf.typ chapters array carries $raw_n quoted .typ entries but the subset extraction matched $got_n —" >&2
+          echo "      a line deviates from the '  \"…\",' shape (comma-free last entry?); fix the array line or this extraction WITH it" >&2
           fail=1
         fi
         html=$(grep -oE '#chapter\("[^"]+\.typ"' $typSrc/book.typ | sed 's/#chapter("//;s/"//')
@@ -1849,25 +1853,48 @@ in
         # Self-allowlist: misc-checks.nix only (this file names the
         # tokens to deny them).
         deny_concept='\bBuildExecution\b|\bCancelSignal\b|\bHeartbeatRequests?\b|\bHeartbeatResponses?\b|Heartbeat.{0,2}(RPC|unary)|\b[Rr]eady[- ]queues?\b|\bready_queue\b|terminationGracePeriodSeconds: 7200|blocks until its single in-flight build|Baked-in beats runtime envsubst|Forward-compat.*lands in P[0-9]|\(no series\).*never fires'
-        concept_escape='legacy|stream-era|removed|retired|deleted|no longer|was the|never sent|pre-pull|historical|replaced|gone from'
+        # merged_bug_081: every escape token WORD-BOUND — the old
+        # unanchored vocabulary legalized live narration via substrings
+        # ("unremoved", "pre-pulling") and via unrelated matches in the
+        # composite grep stream.
+        concept_escape='\blegacy\b|\bstream-era\b|\bremoved\b|\bretired\b|\bdeleted\b|\bno longer\b|\bwas the\b|\bnever sent\b|\bpre-pull\b|\bhistorical(ly)?\b|\breplaced\b|\bgone from\b'
         concept_scan() {
-          local dir=$1 label=$2 hits
-          hits=$(grep -rn -E "$deny_concept" "$dir" \
-            | grep -viE "$concept_escape" \
-            | grep -v 'misc-checks\.nix' || true)
+          local dir=$1 label=$2 hits="" hit content
+          # merged_bug_081 arm fixes: (1) the self-allowlist is a
+          # filename --exclude on the INITIAL grep — the old
+          # `grep -v misc-checks.nix` matched in CONTENT, exempting any
+          # prose that merely cited this lint file; (2) the escape
+          # filter runs on the CONTENT FIELD ONLY — the old pipeline
+          # filtered grep's composite path:line:content stream, so an
+          # escape word in a file PATH exempted the whole file.
+          while IFS= read -r hit; do
+            [[ -z $hit ]] && continue
+            content=''${hit#*:}
+            content=''${content#*:}
+            if ! grep -qiE "$concept_escape" <<<"$content"; then
+              hits+="$hit"$'\n'
+            fi
+          done < <(grep -rn --exclude=misc-checks.nix -E "$deny_concept" "$dir" || true)
           if [[ -n "$hits" ]]; then
             echo "FAIL: retired concept narrated as live in $label —" >&2
             echo "add a same-line retirement qualifier ($concept_escape)" >&2
             echo "or rewrite to the live mechanism:" >&2
-            echo "$hits" >&2
+            printf '%s' "$hits" >&2
             fail=1
           fi
         }
-        # Self-test before the real scans: planted red MUST trip,
-        # qualified green MUST pass (pipefail-safe: both run under if).
-        mkdir -p "$TMPDIR/c1red" "$TMPDIR/c1green"
+        # Self-test before the real scans (banner (b): one red per
+        # filter arm): planted red MUST trip; qualified green MUST
+        # pass; an escape word in a file PATH must NOT exempt
+        # (merged_bug_081 arm 1); content citing misc-checks.nix must
+        # NOT exempt (arm 2); an escape-token SUBSTRING must NOT
+        # exempt (arm 3, word-bounding).
+        mkdir -p "$TMPDIR/c1red" "$TMPDIR/c1green" "$TMPDIR/c1path/removed-docs" "$TMPDIR/c1cite" "$TMPDIR/c1substr"
         echo 'the scheduler routes work over the BuildExecution stream' > "$TMPDIR/c1red/doc.typ"
         echo 'the removed BuildExecution stream routed work (stream-era)' > "$TMPDIR/c1green/doc.typ"
+        echo 'the scheduler routes work over the BuildExecution stream' > "$TMPDIR/c1path/removed-docs/doc.typ"
+        echo 'the BuildExecution stream is checked by misc-checks.nix today' > "$TMPDIR/c1cite/doc.typ"
+        echo 'an unremoved BuildExecution stream still routes work' > "$TMPDIR/c1substr/doc.typ"
         prevfail=$fail
         fail=0
         concept_scan "$TMPDIR/c1red" "self-test" 2>/dev/null
@@ -1879,6 +1906,24 @@ in
         concept_scan "$TMPDIR/c1green" "self-test"
         if [[ $fail -ne 0 ]]; then
           echo "SELF-TEST FAIL: concept tier flagged the qualified fixture" >&2
+          exit 1
+        fi
+        fail=0
+        concept_scan "$TMPDIR/c1path" "self-test" 2>/dev/null
+        if [[ $fail -eq 0 ]]; then
+          echo "SELF-TEST FAIL: an escape word in the file PATH exempted a live-narration line (merged_bug_081 arm 1)" >&2
+          exit 1
+        fi
+        fail=0
+        concept_scan "$TMPDIR/c1cite" "self-test" 2>/dev/null
+        if [[ $fail -eq 0 ]]; then
+          echo "SELF-TEST FAIL: content citing misc-checks.nix exempted a live-narration line (merged_bug_081 arm 2)" >&2
+          exit 1
+        fi
+        fail=0
+        concept_scan "$TMPDIR/c1substr" "self-test" 2>/dev/null
+        if [[ $fail -eq 0 ]]; then
+          echo "SELF-TEST FAIL: an escape-token substring (unremoved) exempted a live-narration line (merged_bug_081 arm 3)" >&2
           exit 1
         fi
         fail=$prevfail
