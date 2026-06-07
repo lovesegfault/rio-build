@@ -2059,7 +2059,6 @@ mod tests {
         );
     }
 
-    // r[verify store.materialize.tenant-fold]
     // r[verify store.materialize.tenant-fold+2]
     /// merged_bug_133 red: the recorded (hint) tenant's upstream is
     /// DEAD (every request 500s → charging class), a SECOND
