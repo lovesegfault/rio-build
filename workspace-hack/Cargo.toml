@@ -79,8 +79,10 @@ pkcs8 = { version = "0.11", default-features = false, features = ["encryption", 
 portable-atomic = { version = "1", features = ["require-cas"] }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
 primeorder = { version = "0.14.0-rc.9", default-features = false, features = ["alloc", "basepoint-table"] }
+proc-macro2 = { version = "1" }
 prost = { version = "0.14" }
 quanta = { version = "0.12" }
+quote = { version = "1" }
 rand-274715c4dabd11b0 = { package = "rand", version = "0.9" }
 rand-93f6ce9d446188ac = { package = "rand", version = "0.10" }
 rand_chacha = { version = "0.9", default-features = false, features = ["std"] }
@@ -114,6 +116,7 @@ ssh-cipher = { version = "0.3.0-rc.9", default-features = false, features = ["ae
 ssh-encoding = { version = "0.3.0-rc.9", default-features = false, features = ["bigint", "bytes", "ctutils", "digest", "pem"] }
 ssh-key = { version = "0.7.0-rc.10", features = ["ed25519", "encryption", "p256", "p384", "p521", "ppk", "rsa", "sha1"] }
 subtle = { version = "2", features = ["const-generics"] }
+syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
 thiserror = { version = "2" }
 tokio = { version = "1", features = ["full", "test-util"] }
@@ -196,8 +199,10 @@ pkcs8 = { version = "0.11", default-features = false, features = ["encryption", 
 portable-atomic = { version = "1", features = ["require-cas"] }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
 primeorder = { version = "0.14.0-rc.9", default-features = false, features = ["alloc", "basepoint-table"] }
+proc-macro2 = { version = "1" }
 prost = { version = "0.14" }
 quanta = { version = "0.12" }
+quote = { version = "1" }
 rand-274715c4dabd11b0 = { package = "rand", version = "0.9" }
 rand-93f6ce9d446188ac = { package = "rand", version = "0.10" }
 rand_chacha = { version = "0.9", default-features = false, features = ["std"] }

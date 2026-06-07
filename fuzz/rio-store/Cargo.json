@@ -19836,12 +19836,20 @@
           "packageId": "primeorder 0.14.0-rc.9"
         },
         {
+          "name": "proc-macro2",
+          "packageId": "proc-macro2"
+        },
+        {
           "name": "prost",
           "packageId": "prost"
         },
         {
           "name": "quanta",
           "packageId": "quanta"
+        },
+        {
+          "name": "quote",
+          "packageId": "quote"
         },
         {
           "name": "rand",
@@ -19980,6 +19988,10 @@
         {
           "name": "subtle",
           "packageId": "subtle"
+        },
+        {
+          "name": "syn",
+          "packageId": "syn"
         },
         {
           "name": "sync_wrapper",
@@ -20403,12 +20415,20 @@
           "packageId": "primeorder 0.14.0-rc.9"
         },
         {
+          "name": "proc-macro2",
+          "packageId": "proc-macro2"
+        },
+        {
           "name": "prost",
           "packageId": "prost"
         },
         {
           "name": "quanta",
           "packageId": "quanta"
+        },
+        {
+          "name": "quote",
+          "packageId": "quote"
         },
         {
           "name": "rand",

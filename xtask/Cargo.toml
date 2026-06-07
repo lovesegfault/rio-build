@@ -78,6 +78,14 @@ ed25519-dalek.workspace = true
 ssh-key = { workspace = true, features = ["ed25519", "rand_core"] }
 rand.workspace = true
 
+# Structural Rust parsing for `lint retention-truth` (merged_bug_021):
+# the sweeper-evidence corpus is the cfg(test)-pruned AST rendered back
+# to tokens — comments and test modules cannot count as production
+# deletion statements by construction.
+syn.workspace = true
+quote.workspace = true
+proc-macro2.workspace = true
+
 # UI
 console.workspace = true
 inquire.workspace = true

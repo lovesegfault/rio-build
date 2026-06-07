@@ -400,6 +400,13 @@ itf = "0.4"
 regex = "1"
 heck = "0.5"
 scopeguard = "1"
+# Structural Rust parsing for merge-gating lints (bughunt-3 S1,
+# merged_bug_021): the retention-truth corpus is cut by AST —
+# cfg(test) items pruned, comments dropped by construction — never by
+# line regex over raw source ("parse, don't grep").
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
 
 # --- xtask (dev tooling) ---
 xshell = "0.2"

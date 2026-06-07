@@ -604,10 +604,11 @@ fn retention_truth() -> Result<()> {
 }
 
 /// The non-test corpus for sweeper-symbol resolution: production `.rs`
-/// of the PG-touching crates, `/tests/` directories skipped, each file
-/// cut at its `#[cfg(test)] mod tests` (newline-separated) marker (the canonical
-/// test-module split — the same boundary the source pins use) and
-/// normalized via [`normalize_decl_text`].
+/// of the PG-touching crates, structurally cut (merged_bug_021 — the
+/// old corpus split on the literal `#[cfg(test)]\nmod tests` marker
+/// and kept comments, so a cfg(test)-gated `mbt_tests.rs` entered
+/// whole and a `// DELETE FROM …` comment counted as production
+/// deletion evidence). Per file: [`corpus_text`].
 fn retention_corpus(root: &Path) -> Result<Vec<(std::path::PathBuf, String)>> {
     const CRATES: &[&str] = &[
         "rio-store",
@@ -619,6 +620,8 @@ fn retention_corpus(root: &Path) -> Result<Vec<(std::path::PathBuf, String)>> {
         "rio-common",
     ];
     let mut corpus = Vec::new();
+    let mut files = 0usize;
+    let mut skipped = 0usize;
     for krate in CRATES {
         let dir = root.join(krate).join("src");
         if !dir.exists() {
@@ -628,18 +631,127 @@ fn retention_corpus(root: &Path) -> Result<Vec<(std::path::PathBuf, String)>> {
             if path.components().any(|c| c.as_os_str() == "tests") {
                 return Ok(());
             }
+            files += 1;
             let raw =
                 fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-            let head = raw
-                .split("#[cfg(test)]\nmod tests")
-                .next()
-                .unwrap_or("")
-                .to_owned();
-            corpus.push((path.to_owned(), normalize_decl_text(&head)));
+            match corpus_text(path, &raw)
+                .with_context(|| format!("retention corpus: {}", path.display()))?
+            {
+                Some(norm) => corpus.push((path.to_owned(), norm)),
+                None => skipped += 1,
+            }
             Ok(())
         })?;
     }
+    tracing::info!(
+        files,
+        skipped_test_files = skipped,
+        corpus_files = corpus.len(),
+        "retention corpus (AST-cut, comment-free)"
+    );
     Ok(corpus)
+}
+
+/// One file's corpus contribution: `None` for cfg(test)-included
+/// module files (the `tests.rs` / `*_tests.rs` naming convention —
+/// from inside such a file the gate in the parent is invisible);
+/// otherwise the syn-parsed item tree with every `#[cfg(test)]`-gated
+/// item pruned (recursively: inline mods and impl items too), rendered
+/// back to tokens — comments cannot survive a token render — and
+/// normalized for statement grepping.
+fn corpus_text(path: &Path, raw: &str) -> Result<Option<String>> {
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if name == "tests.rs" || name.ends_with("_tests.rs") {
+        return Ok(None);
+    }
+    let file: syn::File = syn::parse_file(raw).context("syn parse")?;
+    let mut items = file.items;
+    prune_cfg_test_items(&mut items);
+    let rendered = items
+        .iter()
+        .map(|i| quote::quote!(#i).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    // Floor: nothing cfg(test)-gated may remain in the corpus — if the
+    // prune logic ever rots, fail the lint loudly instead of silently
+    // re-admitting test statements as production evidence.
+    ensure!(
+        !rendered.contains("cfg (test") && !rendered.contains("cfg(test"),
+        "cfg(test) item survived the corpus prune"
+    );
+    Ok(Some(normalize_decl_text(&rendered)))
+}
+
+/// Recursively drop items gated behind `#[cfg(test)]` (or any `cfg`
+/// whose argument tokens mention the bare `test` ident — `cfg(any(test,
+/// …))` prunes too; `cfg(feature = "test-utils")` does not, since
+/// `"test-utils"` is a literal, not an ident).
+fn prune_cfg_test_items(items: &mut Vec<syn::Item>) {
+    items.retain(|i| !item_attrs(i).is_some_and(is_cfg_test_attrs));
+    for item in items {
+        match item {
+            syn::Item::Mod(m) => {
+                if let Some((_, inner)) = &mut m.content {
+                    prune_cfg_test_items(inner);
+                }
+            }
+            syn::Item::Impl(im) => {
+                im.items
+                    .retain(|ii| !impl_item_attrs(ii).is_some_and(is_cfg_test_attrs));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn item_attrs(i: &syn::Item) -> Option<&[syn::Attribute]> {
+    use syn::Item::*;
+    Some(match i {
+        Const(x) => &x.attrs,
+        Enum(x) => &x.attrs,
+        ExternCrate(x) => &x.attrs,
+        Fn(x) => &x.attrs,
+        ForeignMod(x) => &x.attrs,
+        Impl(x) => &x.attrs,
+        Macro(x) => &x.attrs,
+        Mod(x) => &x.attrs,
+        Static(x) => &x.attrs,
+        Struct(x) => &x.attrs,
+        Trait(x) => &x.attrs,
+        TraitAlias(x) => &x.attrs,
+        Type(x) => &x.attrs,
+        Union(x) => &x.attrs,
+        Use(x) => &x.attrs,
+        _ => return None,
+    })
+}
+
+fn impl_item_attrs(i: &syn::ImplItem) -> Option<&[syn::Attribute]> {
+    use syn::ImplItem::*;
+    Some(match i {
+        Const(x) => &x.attrs,
+        Fn(x) => &x.attrs,
+        Type(x) => &x.attrs,
+        Macro(x) => &x.attrs,
+        _ => return None,
+    })
+}
+
+fn is_cfg_test_attrs(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|a| {
+        a.path().is_ident("cfg")
+            && a.parse_args::<proc_macro2::TokenStream>()
+                .map(|ts| tokens_mention_test_ident(ts))
+                .unwrap_or(false)
+    })
+}
+
+fn tokens_mention_test_ident(ts: proc_macro2::TokenStream) -> bool {
+    ts.into_iter().any(|tt| match tt {
+        proc_macro2::TokenTree::Ident(id) => id == "test",
+        proc_macro2::TokenTree::Group(g) => tokens_mention_test_ident(g.stream()),
+        _ => false,
+    })
 }
 
 /// Collapse Rust string-literal line continuations (`\` at EOL) and
@@ -699,10 +811,9 @@ fn check_swept_by(
     symbol: &str,
     corpus: &[(std::path::PathBuf, String)],
 ) -> Result<()> {
-    let decl_pats = [format!("fn {symbol}("), format!("fn {symbol}<")];
     let defs: Vec<_> = corpus
         .iter()
-        .filter(|(_, norm)| decl_pats.iter().any(|p| norm.contains(p.as_str())))
+        .filter(|(_, norm)| defines_fn(norm, symbol))
         .collect();
     ensure!(
         !defs.is_empty(),
@@ -719,22 +830,88 @@ fn check_swept_by(
     Ok(())
 }
 
-/// The normalized migration text carries `REFERENCES {parent}` (word
-/// boundary or `(`) followed by `ON DELETE CASCADE` within the clause
-/// window. `ON DELETE RESTRICT` does NOT satisfy — the phantom class.
-fn cascade_clause_ok(norm: &str, parent: &str) -> bool {
-    let pat = format!("REFERENCES {parent}");
+/// `fn {symbol}` followed (over optional whitespace) by `(` or `<` —
+/// tolerant of token-render spacing (`fn retention_sweep (pool …`),
+/// strict on the symbol's word boundary.
+fn defines_fn(norm: &str, symbol: &str) -> bool {
+    let pat = format!("fn {symbol}");
     let mut from = 0;
     while let Some(i) = norm[from..].find(&pat) {
+        let end = from + i + pat.len();
+        let rest = norm[end..].trim_start();
+        if rest.starts_with('(') || rest.starts_with('<') {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+/// The CHILD table's own `CREATE/ALTER TABLE {table}` statement must
+/// carry `REFERENCES {parent}` whose FK clause (up to the next
+/// top-level `,` / end of statement) says `ON DELETE CASCADE`
+/// (merged_bug_021 — the old scan never bound the child table at all:
+/// a flat 220-char window from ANY `REFERENCES {parent}` in the file
+/// let a NEIGHBORING table's CASCADE satisfy a RESTRICT parent ref).
+fn cascade_clause_ok(norm: &str, table: &str, parent: &str) -> bool {
+    for prefix in [
+        format!("CREATE TABLE {table}"),
+        format!("CREATE TABLE IF NOT EXISTS {table}"),
+        format!("ALTER TABLE {table}"),
+        format!("ALTER TABLE ONLY {table}"),
+    ] {
+        let mut from = 0;
+        while let Some(i) = norm[from..].find(&prefix) {
+            let at = from + i;
+            let bend = at + prefix.len();
+            let bounded = norm
+                .as_bytes()
+                .get(bend)
+                .is_none_or(|b| !(b.is_ascii_alphanumeric() || *b == b'_'));
+            let stmt_end = norm[at..].find(';').map_or(norm.len(), |e| at + e);
+            if bounded && stmt_fk_cascade(&norm[at..stmt_end], parent) {
+                return true;
+            }
+            from = bend;
+        }
+    }
+    false
+}
+
+/// Within ONE statement: `REFERENCES {parent}` whose FK clause — the
+/// span from the match to the next comma at paren depth 0 (or the
+/// closing paren of the column list / end of statement) — contains
+/// `ON DELETE CASCADE`. `ON DELETE RESTRICT` does NOT satisfy — the
+/// phantom class.
+fn stmt_fk_cascade(stmt: &str, parent: &str) -> bool {
+    let pat = format!("REFERENCES {parent}");
+    let mut from = 0;
+    while let Some(i) = stmt[from..].find(&pat) {
         let at = from + i;
         let end = at + pat.len();
-        let bounded = norm
+        let bounded = stmt
             .as_bytes()
             .get(end)
             .is_none_or(|b| !(b.is_ascii_alphanumeric() || *b == b'_'));
         if bounded {
-            let tail = &norm[at..norm.len().min(at + 220)];
-            if tail.contains("ON DELETE CASCADE") {
+            let bytes = stmt.as_bytes();
+            let mut depth = 0i32;
+            let mut j = end;
+            while j < bytes.len() {
+                match bytes[j] {
+                    b'(' => depth += 1,
+                    b')' => {
+                        if depth == 0 {
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    b',' if depth == 0 => break,
+                    _ => {}
+                }
+                j += 1;
+            }
+            if stmt[end..j].contains("ON DELETE CASCADE") {
                 return true;
             }
         }
@@ -749,8 +926,8 @@ fn check_cascade(table: &str, parent: &str, migration: &str, root: &Path) -> Res
     let text = fs::read_to_string(&path)
         .with_context(|| format!("CascadeFrom migration for `{table}`: {}", path.display()))?;
     ensure!(
-        cascade_clause_ok(&normalize_decl_text(&text), parent),
-        "{migration} carries no `REFERENCES {parent} … ON DELETE CASCADE` clause (missing or RESTRICT — the phantom-cascade class)"
+        cascade_clause_ok(&normalize_decl_text(&text), table, parent),
+        "{migration}: `{table}`'s own CREATE/ALTER statement carries no `REFERENCES {parent} … ON DELETE CASCADE` FK clause (missing or RESTRICT — the phantom-cascade class)"
     );
     Ok(())
 }
@@ -854,13 +1031,86 @@ mod tests {
             "ALTER TABLE tenant_keys\n  ADD CONSTRAINT k FOREIGN KEY (tenant_id)\n  \
              REFERENCES tenants(tenant_id)\n  ON DELETE CASCADE;",
         );
-        assert!(cascade_clause_ok(&cascade, "tenants"));
+        assert!(cascade_clause_ok(&cascade, "tenant_keys", "tenants"));
         let restrict = normalize_decl_text(
-            "FOREIGN KEY (drv_hash, output_name) REFERENCES \
-             realisations(drv_hash, output_name) ON DELETE RESTRICT",
+            "CREATE TABLE realisation_refs (\n  drv_hash bytea,\n  \
+             FOREIGN KEY (drv_hash) REFERENCES \
+             realisations(drv_hash) ON DELETE RESTRICT\n);",
         );
-        assert!(!cascade_clause_ok(&restrict, "realisations"));
-        assert!(!cascade_clause_ok(&cascade, "tenant"));
+        assert!(!cascade_clause_ok(
+            &restrict,
+            "realisation_refs",
+            "realisations"
+        ));
+        assert!(!cascade_clause_ok(&cascade, "tenant_keys", "tenant"));
+    }
+
+    /// merged_bug_021 red (statement scoping): a NEIGHBORING table's
+    /// CASCADE on the same parent must not satisfy the child's claim —
+    /// pre-fix, a flat 220-char window from ANY `REFERENCES parent` in
+    /// the file accepted exactly this; the child table name was never
+    /// consulted at all.
+    #[test]
+    fn cascade_neighbor_fk_cannot_satisfy_child_claim() {
+        let two_tables = normalize_decl_text(
+            "CREATE TABLE other_refs (x uuid REFERENCES parent_t(id) ON DELETE CASCADE);\n\
+             CREATE TABLE child_refs (y uuid REFERENCES parent_t(id) ON DELETE RESTRICT);",
+        );
+        assert!(cascade_clause_ok(&two_tables, "other_refs", "parent_t"));
+        assert!(!cascade_clause_ok(&two_tables, "child_refs", "parent_t"));
+        // Two FKs in ONE statement: the sibling column's CASCADE on a
+        // different parent must not leak into this parent's clause.
+        let two_fks = normalize_decl_text(
+            "CREATE TABLE child2 (a uuid REFERENCES p1(id) ON DELETE RESTRICT, \
+             b uuid REFERENCES p2(id) ON DELETE CASCADE);",
+        );
+        assert!(!cascade_clause_ok(&two_fks, "child2", "p1"));
+        assert!(cascade_clause_ok(&two_fks, "child2", "p2"));
+    }
+
+    /// merged_bug_021 reds (corpus cut): comments and cfg(test) items —
+    /// under ANY mod name, at item or impl-item level — cannot count as
+    /// production deletion evidence; cfg(test)-included module FILES
+    /// are skipped whole; string literals survive the token render.
+    #[test]
+    fn corpus_drops_comments_and_test_items() {
+        let p = std::path::Path::new("fake/prod.rs");
+        let norm = corpus_text(
+            p,
+            "// fn reap_widgets() runs DELETE FROM widgets nightly\npub fn live() {}\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!norm.contains("DELETE FROM widgets"), "{norm}");
+        let norm = corpus_text(
+            p,
+            "pub fn live() {}\n#[cfg(test)]\nmod harness {\n    const Q: &str = \"DELETE FROM widgets\";\n}\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!norm.contains("DELETE FROM widgets"), "{norm}");
+        let norm = corpus_text(
+            p,
+            "struct S;\nimpl S {\n    #[cfg(test)]\n    fn t(&self) { let _ = \"DELETE FROM widgets\"; }\n    fn live(&self) {}\n}\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!norm.contains("DELETE FROM widgets"), "{norm}");
+        let norm = corpus_text(p, "pub fn sweep() { let _ = \"DELETE FROM widgets\"; }\n")
+            .unwrap()
+            .unwrap();
+        assert!(norm.contains("DELETE FROM widgets"), "{norm}");
+        assert!(defines_fn(&norm, "sweep"));
+        assert!(
+            corpus_text(std::path::Path::new("fake/mbt_tests.rs"), "pub fn x() {}")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            corpus_text(std::path::Path::new("fake/tests.rs"), "pub fn x() {}")
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// `Lint::all()` must list every enum variant, or `xtask lint`
