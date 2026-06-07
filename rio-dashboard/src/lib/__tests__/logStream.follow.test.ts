@@ -46,7 +46,7 @@ afterEach(() => {
 });
 
 describe('createLogStream follow mode', () => {
-  // r[verify dash.stream.log-tail+4]
+  // r[verify dash.stream.log-tail+5]
   /// merged_bug_254's recorded red: a NEVER-ENDING quiet stream on a
   /// terminal build. The pre-fix `for await` parked inside the
   /// iterator — `done` stayed false forever (the red observed exactly
@@ -103,7 +103,73 @@ describe('createLogStream follow mode', () => {
     s.destroy();
   });
 
-  // r[verify dash.stream.log-tail+4]
+  // r[verify dash.stream.log-tail+5]
+  /// merged_bug_063's recorded red (scenario A): exec A serves lines,
+  /// then the worker dies; the reconnect carries A's watermark, the
+  /// store resolves latest=exec-b (sealed shorter) and filters every
+  /// line server-side — the only message is a 0-line final stamped
+  /// exec-b whose stale cursor arithmetic claims complete. Pre-fix the
+  /// tab finished with B's entire log swallowed (done=true, no b rows,
+  /// no re-open at 0). The switch now resets the served-complete claim
+  /// and re-opens at sinceLine 0 in the new numbering.
+  it('retry_log_recovered_after_stale_filtered_reconnect: switch on a filtered view re-opens at line 0', async () => {
+    const requests: { sinceLine: bigint }[] = [];
+    tailLog
+      .mockImplementationOnce(async function* (req: { sinceLine: bigint }) {
+        requests.push(req);
+        yield { ...chunk(['a0', 'a1']), execId: 'exec-a' };
+        throw new ConnectError('worker died', Code.Unavailable);
+      })
+      .mockImplementationOnce(async function* (req: { sinceLine: bigint }) {
+        requests.push(req);
+        // Latest resolved to exec-b; everything below the stale
+        // watermark was filtered server-side: a 0-line final whose
+        // first_line_number is the server's own (stale) cursor claim.
+        yield {
+          ...chunk([], { isComplete: true, firstLineNumber: 2n }),
+          execId: 'exec-b',
+        };
+      })
+      .mockImplementationOnce(async function* (req: { sinceLine: bigint }) {
+        requests.push(req);
+        yield { ...chunk(['b0', 'b1'], { isComplete: true }), execId: 'exec-b' };
+      });
+    const s = createLogStream('/nix/store/x.drv');
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(s.done).toBe(true);
+    expect(
+      s.rows.filter((r) => r.kind === 'line').map((r) => r.text),
+    ).toEqual(['a0', 'a1', 'b0', 'b1']);
+    expect(s.rows.some((r) => r.kind === 'execSwitch')).toBe(true);
+    // The post-switch re-open went back to line 0 in the NEW numbering
+    // — a sinceLine is only ever sent for the exec it was minted in.
+    expect(requests.length).toBe(3);
+    expect(requests[2].sinceLine).toBe(0n);
+    s.destroy();
+  });
+
+  // r[verify dash.stream.log-tail+5]
+  /// merged_bug_063's law half: the in-loop isComplete exit skipped the
+  /// terminal && servedComplete conjunct of the mirrored tail_next law —
+  /// a complete-but-FAILED attempt on a non-terminal derivation must
+  /// re-open and follow the retry (the gateway relay's behavior). The
+  /// pre-fix arm finished the tab on the failed attempt's log.
+  it('complete_final_on_nonterminal_drv_reopens: exec-level completion does not end a live follow', async () => {
+    let opens = 0;
+    tailLog.mockImplementation(async function* () {
+      opens += 1;
+      yield { ...chunk(['a0'], { isComplete: true }), execId: 'exec-a' };
+    });
+    const s = createLogStream('/nix/store/x.drv', '', {
+      isTerminal: () => false,
+    });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(s.done).toBe(false);
+    expect(opens).toBeGreaterThan(1);
+    s.destroy();
+  });
+
+  // r[verify dash.stream.log-tail+5]
   /// merged_bug_002's recorded red: a retry on another worker restarts
   /// numbering at zero. Pre-fix the new execution's chunk was
   /// indistinguishable from a resent duplicate (`skip`) — the red
@@ -135,7 +201,7 @@ describe('createLogStream follow mode', () => {
     s.destroy();
   });
 
-  // r[verify dash.stream.log-tail+4]
+  // r[verify dash.stream.log-tail+5]
   /// merged_bug_164's reader half (recorded red: pre-fix the
   /// `x-rio-log-unservable` refusal classified as transportErr and the
   /// loop re-dialed — tailLog call count climbed past 1). A
@@ -283,11 +349,32 @@ describe('createLogStream follow mode', () => {
     s.destroy();
   });
 
-  it('isComplete_exits_immediately: the final complete chunk ends the stream with no further opens', async () => {
+  /// merged_bug_063 updated this contract: is_complete is a
+  /// per-EXECUTION predicate, so a complete final ends the stream
+  /// immediately only when the derivation-level conjunct holds — the
+  /// oracle says terminal, or no oracle was supplied (the store's
+  /// exec-level claim is then the best available stand-in, the legacy
+  /// contract). The non-terminal-oracle case now RE-OPENS to follow
+  /// the retry (`complete_final_on_nonterminal_drv_reopens` above).
+  it('isComplete_exits_immediately: the final complete chunk ends a terminal stream with no further opens', async () => {
     tailLog.mockImplementation(async function* () {
       yield chunk(['l0', 'l1'], { isComplete: true });
     });
-    const s = createLogStream(undefined, '', { isTerminal: () => false });
+    const s = createLogStream(undefined, '', { isTerminal: () => true });
+    await flush();
+    expect(s.done).toBe(true);
+    expect(s.incomplete).toBe(false);
+    await vi.advanceTimersByTimeAsync(5_000);
+    await flush();
+    expect(tailLog).toHaveBeenCalledTimes(1);
+    s.destroy();
+  });
+
+  it('isComplete_exits_immediately_without_oracle: the legacy no-closure contract is preserved', async () => {
+    tailLog.mockImplementation(async function* () {
+      yield chunk(['l0', 'l1'], { isComplete: true });
+    });
+    const s = createLogStream(undefined, '');
     await flush();
     expect(s.done).toBe(true);
     expect(s.incomplete).toBe(false);

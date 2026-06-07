@@ -153,7 +153,7 @@ describe('tailNext', () => {
     }
   });
 
-  // r[verify dash.stream.log-tail+4]
+  // r[verify dash.stream.log-tail+5]
   it('permanentErr exits every cell — the store said never, retry cannot heal it', () => {
     for (const terminal of [false, true]) {
       for (const graceExpired of [false, true]) {

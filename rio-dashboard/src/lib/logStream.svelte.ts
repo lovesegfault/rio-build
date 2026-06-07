@@ -38,7 +38,7 @@ import {
 export type { BannerView, StreamPhase } from './lineCursor';
 export { bannerFor } from './lineCursor';
 
-// r[impl dash.stream.log-tail+4]
+// r[impl dash.stream.log-tail+5]
 // r[impl dash.log.cap]
 // r[impl dash.log.virtualize]
 // (Virtualization itself lives in LogViewer.svelte — windowed slice over
@@ -154,9 +154,15 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 // one over the focused node's status + the build state). It feeds the
 // tail_next exit law: a non-terminal stream re-opens forever (bounded
 // only by unmount destroy()), a terminal one drains within the
-// armed-once grace. Defaulting to `() => false` keeps callers without
-// the closure streaming until the store's `is_complete` — which exits
-// immediately regardless of terminality.
+// armed-once grace — and a store-stamped completion on a NON-terminal
+// derivation re-opens to follow the retry (merged_bug_063: is_complete
+// is a per-EXECUTION predicate; the derivation may run again).
+//
+// Callers WITHOUT the closure have no terminality oracle: for them the
+// store's own exec-level completion claim stands in for the law's
+// terminal input (the best available knowledge — exit on is_complete,
+// the documented legacy contract). With an oracle present the law is
+// exact and the fallback never engages.
 export function createLogStream(
   drvPath?: string,
   execId = '',
@@ -171,6 +177,7 @@ export function createLogStream(
   let gapCount = $state(0);
   let authRequired = $state(false);
   let phase = $state<StreamPhase>({ kind: 'streaming' });
+  const hasOracle = opts?.isTerminal !== undefined;
   const isTerminal = opts?.isTerminal ?? (() => false);
   const ctrl = new AbortController();
 
@@ -197,11 +204,24 @@ export function createLogStream(
     // The served-stream cursor: the next line number we have not yet
     // rendered. Reconnects re-open at this watermark; the shared
     // visitChunk step dedups any resent overlap and names any jump.
+    // THE RECONNECT CONTRACT (merged_bug_063): a nonzero watermark is
+    // only ever sent for the execution it was minted in — an execution
+    // switch resets it to 0 before any re-open, because the store
+    // filters `since_line` inside the RESOLVED execution's numbering
+    // and a stale watermark silently swallows the new execution's log
+    // server-side.
     let cursor = 0n;
-    // The store's own claim that everything durable was served, read
-    // from EVERY message (empty finals included) — `tail_next`'s
-    // served_complete input.
+    // The store's own claim that everything durable was served —
+    // `tail_next`'s served_complete input. PER-EXECUTION: adopted only
+    // from chunks consumed in the cursor's own numbering, and RESET on
+    // an execution switch (merged_bug_063: a stale claim minted against
+    // the old numbering must never finish the new execution's tab).
     let servedComplete = false;
+    // The law's terminal input. Without an oracle, the store's own
+    // exec-level completion claim is the best available stand-in
+    // (legacy contract: exit on is_complete); with one, the law is
+    // exact and a completed-but-failed attempt follows the retry.
+    const effTerminal = () => isTerminal() || (!hasOracle && servedComplete);
     // Armed once, at the first post-terminal exit decision. `null`
     // until armed; epoch ms after.
     let graceDeadline: number | null = null;
@@ -234,6 +254,13 @@ export function createLogStream(
       const chainAbort = () => attempt.abort();
       ctrl.signal.addEventListener('abort', chainAbort, { once: true });
       let graceCutoff = false;
+      // merged_bug_063: an execution switch whose first sighted message
+      // starts past line 0 means the new execution's head was filtered
+      // SERVER-SIDE against the stale watermark — this attempt's view
+      // is unrecoverable. The flag routes the deliberate cut through
+      // the same naturalEnd path as the grace cutoff; the next open
+      // goes out at the freshly reset sinceLine 0.
+      let execSwitched = false;
       try {
         const stream = logs.tailLog(
           {
@@ -277,7 +304,7 @@ export function createLogStream(
           // chatty stream arms the clock as promptly as a quiet one —
           // and an already-expired deadline cuts the attempt
           // deterministically, with no race for traffic to win.
-          if (isTerminal() && graceDeadline === null) {
+          if (effTerminal() && graceDeadline === null) {
             graceDeadline = Date.now() + GRACE_MS;
           }
           if (graceDeadline !== null && Date.now() >= graceDeadline) {
@@ -343,10 +370,13 @@ export function createLogStream(
           const chunk = r.value;
           receivedThisAttempt = true;
           everReceived = true;
-          servedComplete = chunk.isComplete;
           // The execution axis FIRST (merged_bug_002): an empty
           // chunk-side id matches anything (pre-exec-stamping
           // servers), and the first stamped id adopts silently.
+          // NOTE the completion claim is adopted AFTER the keyed visit
+          // resolves (merged_bug_063): a final stamped by a DIFFERENT
+          // execution carries a claim minted against the old numbering
+          // — it must never finish this tab.
           let keysMatch =
             chunk.execId === '' || lastExecId === '' || chunk.execId === lastExecId;
           if (lastExecId === '' && chunk.execId !== '') {
@@ -365,12 +395,29 @@ export function createLogStream(
               // A retry on another worker: numbering restarted. An
               // explicit switch row — never a seamless splice or a
               // silent swallow — then the cursor lives in the new
-              // execution's numbering.
+              // execution's numbering, and the OLD execution's
+              // completion claim is dead (merged_bug_063).
               push(execSwitchRow(chunk.execId));
               cursor = 0n;
               lastExecId = chunk.execId;
-              keysMatch = true;
-              continue keyed_visit;
+              servedComplete = false;
+              if (chunk.firstLineNumber === 0n && chunk.lines.length > 0) {
+                // The switching chunk IS the new execution's head:
+                // nothing was filtered server-side. Recover in-stream
+                // by re-visiting the same chunk against the fresh
+                // floor.
+                keysMatch = true;
+                continue keyed_visit;
+              }
+              // The switching message starts past zero (or is a
+              // zero-line final): the span [0, firstLineNumber) was
+              // filtered SERVER-SIDE against the stale watermark and
+              // cannot arrive on this attempt. Cut it; the re-open
+              // goes out at the reset watermark — a sinceLine is only
+              // ever sent for the execution it was minted in.
+              execSwitched = true;
+              attempt.abort();
+              break stream_loop;
             }
             const visit = keyed.visit;
             // r[impl dash.stream.reopen-pacing]
@@ -413,15 +460,23 @@ export function createLogStream(
             }
             break;
           }
+          // Adopt the completion claim only for a chunk consumed in
+          // the cursor's own numbering (merged_bug_063) — the switch
+          // arm above either re-floored before this point or cut the
+          // attempt entirely.
+          servedComplete = chunk.isComplete;
           applyCap();
           if (chunk.isComplete) {
-            // The store stamps is_complete on the final chunk when the
-            // execution is terminal AND the manifest contiguously covers
-            // the log. Everything servable was served: exit immediately,
-            // no grace needed.
-            phase = { kind: 'complete' };
-            done = true;
-            return;
+            // The store stamps is_complete when the EXECUTION is
+            // terminal and the manifest contiguously covers its log —
+            // a per-execution predicate, not the derivation's end
+            // (merged_bug_063). End the attempt and decide on the
+            // shared tail_next path like every other stream end: with
+            // the derivation terminal (or no oracle) this exits
+            // complete exactly as before; with a live oracle saying
+            // non-terminal it RE-OPENS and follows the retry, the
+            // gateway relay's behavior.
+            break stream_loop;
           }
         }
         if (ctrl.signal.aborted) {
@@ -448,11 +503,12 @@ export function createLogStream(
           done = true;
           return;
         }
-        if (graceCutoff) {
-          // The grace clock cut a quiet open stream: decide on the
-          // SAME path as a natural end — tail_next sees
-          // graceExpired=true and exits, flagging incompleteness
-          // exactly like every other exit (merged_bug_254).
+        if (graceCutoff || execSwitched) {
+          // The grace clock cut a quiet open stream, or the switch arm
+          // cut a server-filtered view (merged_bug_063): decide on the
+          // SAME path as a natural end — the grace case exits via
+          // graceExpired, the switch case re-opens at the reset
+          // watermark (servedComplete was reset with the cursor).
           cause = 'naturalEnd';
         } else {
           lastErr = e instanceof Error ? e : new Error(String(e));
@@ -486,7 +542,7 @@ export function createLogStream(
       } finally {
         ctrl.signal.removeEventListener('abort', chainAbort);
       }
-      const terminal = isTerminal();
+      const terminal = effTerminal();
       if (terminal && graceDeadline === null) {
         graceDeadline = Date.now() + GRACE_MS;
       }

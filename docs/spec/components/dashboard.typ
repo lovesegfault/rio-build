@@ -214,23 +214,37 @@ stack can't give you.
   nodes (`GetBuildGraphResponse.truncated`).
 ]
 
-#r("dash.stream.log-tail+4")[
+#r("dash.stream.log-tail+5")[
   `LogService.TailLog` server-stream consumption MUST use
   `TextDecoder('utf-8', {fatal: false})` --- build output can contain non-UTF-8
   bytes (compiler locale garbage). Lossy decode to `U+FFFD`, never throw. nginx
   `proxy_buffering off` is required or the stream buffers entirely before
   reaching the browser. The follow loop MUST drive the stream iterator
-  manually, racing each pending message against a one-second terminality
-  tick, so the armed-once grace clock runs and finalizes MID-STREAM
-  through the same exit law as every stream end (a never-ending quiet
-  stream on a terminal build must not hold the tab in "streaming"
-  forever); each attempt carries its own abort controller chained to the
-  consumer's. Chunks MUST be visited through the execution-keyed step:
-  a chunk from a different execution than the cursor's is an explicit
-  execution-switch row and a cursor reset --- never a silent swallow as
-  a "duplicate" of the old numbering, never a seamless splice. A status
+  manually, and the armed-once grace deadline MUST join every race as an
+  ABSOLUTE timer --- message traffic cannot starve enforcement; the
+  one-second terminality tick exists only to wake a QUIET stream's loop
+  for the terminal re-check (a never-ending stream on a terminal build,
+  chatty or quiet, must not hold the tab in "streaming" forever); each
+  attempt carries its own abort controller chained to the consumer's.
+  Chunks MUST be visited through the execution-keyed step: a chunk from
+  a different execution than the cursor's is an explicit
+  execution-switch row, a cursor reset, AND a reset of the
+  served-complete claim (a completion minted against the old numbering
+  never finishes the new execution's tab) --- never a silent swallow as
+  a "duplicate" of the old numbering, never a seamless splice. A
+  switching message that starts past line zero means the new
+  execution's head was filtered server-side against the stale
+  watermark: the attempt MUST be cut and re-opened at `sinceLine` 0 ---
+  a `sinceLine` is only ever sent for the execution it was minted in.
+  EVERY exit, including a store-stamped completion, decides through the
+  mirrored `tail_next` law: completion is a per-execution predicate, so
+  with a live oracle saying the derivation is non-terminal the stream
+  re-opens to follow the retry (the gateway relay's behavior); without
+  an oracle the exec-level claim stands in for terminality. A status
   the store typed permanently unservable exits terminally (no re-dial)
-  and surfaces the incomplete banner.
+  and surfaces the incomplete banner; the auth-required terminal
+  renders the sign-in notice through the exhaustive phase law, never
+  the raw transport error or the truncation diagnosis.
 ]
 
 #r("dash.stream.idle-timeout+3")[

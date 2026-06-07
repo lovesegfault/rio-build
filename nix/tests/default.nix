@@ -1352,7 +1352,7 @@ in
   # the pre-registry tip: the hand-written egress lacked the
   # scheduler:9001 edge entirely, so every SPA scheduler RPC was
   # dropped under enforcement).
-  # r[verify dash.stream.log-tail+4]
+  # r[verify dash.stream.log-tail+5]
   #   live-tail-via-nginx subtest (4c): a line ingested AFTER the
   #   follow:true TailLog stream opened reaches the open connection
   #   through nginx — the incremental-delivery half of the rule's
