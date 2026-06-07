@@ -43,6 +43,8 @@ module leaseCalib096ResponseAnchor {
     MAX_SUSPENDS = 1,
     MAX_SHUTDOWNS = 0,
     MAX_DROPS = 0,
+    MAX_FOREIGN_BUMPS = 0,
+    OBS_KEY_RV = false,
     BLIND_HOLDER_BOUND = 0
   ).* from "../leaderElection"
 
@@ -72,9 +74,13 @@ module leaseCalib096ResponseAnchor {
     // arriving is a completed round; suspend and dropped-write are
     // never co-enabled, and MAX_DROPS = 0 here freezes all four).
     unconfirmed' = unconfirmed.put(n, NoUnconf),
-    lastFetchedRv' = lastFetchedRv,
+    lastFetchedKey' = lastFetchedKey,
     drops' = drops,
-    blindHolderFor' = bhNext(lease, leading, alive, unconfirmed.put(n, NoUnconf), lastFetchedRv, blindHolderFor, false),
+    foreignBumps' = foreignBumps,
+    lastFetchedContent' = lastFetchedContent,
+    evidenceFabricated' = evidenceFabricated,
+    evidenceConsumed' = evidenceConsumed,
+    blindHolderFor' = bhNext(lease, leading, alive, unconfirmed.put(n, NoUnconf), lastFetchedKey, blindHolderFor, false),
   }
 
   action calibRenewReadOkAny = {

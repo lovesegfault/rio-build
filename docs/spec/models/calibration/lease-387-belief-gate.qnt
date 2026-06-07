@@ -44,6 +44,8 @@ module leaseCalib387BeliefGate {
     MAX_SUSPENDS = 0,
     MAX_SHUTDOWNS = 1,
     MAX_DROPS = 0,
+    MAX_FOREIGN_BUMPS = 0,
+    OBS_KEY_RV = false,
     BLIND_HOLDER_BOUND = 0
   ).* from "../leaderElection"
 
@@ -62,7 +64,7 @@ module leaseCalib387BeliefGate {
       fenceThenExit' = (fenceThenExit or
         (held.get(n) and not(leading.get(n)) and lease.holder == Held(n))),
       lease' = if (releases)
-                 { holder: NoHolder, rv: lease.rv + 1, gen: lease.gen }
+                 { holder: NoHolder, rv: lease.rv + 1, content: lease.content + 1, gen: lease.gen }
                else lease,
       alive' = alive.put(n, false),
       exited' = exited.put(n, true),
@@ -84,12 +86,16 @@ module leaseCalib387BeliefGate {
       // process takes its in-memory ledger and cursor with it;
       // MAX_DROPS = 0 here freezes all four).
       unconfirmed' = unconfirmed.put(n, NoUnconf),
-      lastFetchedRv' = lastFetchedRv.put(n, -1),
+      lastFetchedKey' = lastFetchedKey.put(n, -1),
       drops' = drops,
+    foreignBumps' = foreignBumps,
+    lastFetchedContent' = lastFetchedContent,
+    evidenceFabricated' = evidenceFabricated,
+    evidenceConsumed' = evidenceConsumed,
       blindHolderFor' = bhNext(
-        if (releases) { holder: NoHolder, rv: lease.rv + 1, gen: lease.gen } else lease,
+        if (releases) { holder: NoHolder, rv: lease.rv + 1, content: lease.content + 1, gen: lease.gen } else lease,
         leading.put(n, false), alive.put(n, false),
-        unconfirmed.put(n, NoUnconf), lastFetchedRv,
+        unconfirmed.put(n, NoUnconf), lastFetchedKey,
         blindHolderFor, false),
     }
   }

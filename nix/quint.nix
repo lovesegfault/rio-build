@@ -1440,6 +1440,61 @@ rec {
       step = "midBandStep";
     };
 
+    # The foreign-rv-writer regime (bughunt3-wave S6b merged_bug_180):
+    # the mid-band world PLUS a non-protocol Lease mutator (bumpRv —
+    # annotation patches that move metadata.resourceVersion without
+    # touching the holder-authored spec content) and the discarded
+    # flavor of the transmitted-abandoned write (renewSendLost — the
+    # client cannot distinguish committed from discarded, so the model
+    # explores both). The observed record and the evidence cursor key
+    # on CONTENT (production decide()/last_fetched_renew_time):
+    # noFabricatedEvidence is the headline — own-commit evidence is
+    # never consumed from churn the protocol did not author — and the
+    # full base invariant set re-verifies with the new fault biting
+    # the CAS guard (foreign writes 409 in-flight protocol PUTs).
+    # The paired pin is quint-lease-calib-180-rv-keyed.
+    # r[verify sched.lease.cancelled-write+2]
+    # r[verify sched.lease.k8s-lease+2]
+    quint-leader-election-foreign-rv = mkQuintCheck {
+      name = "leader-election-foreign-rv";
+      # Measured (tttt duty, gating backend): TLC-exhaustive
+      # 151,134,113 generated / 35,746,806 distinct / depth 41 in
+      # 2m29s at 192 workers — the 1800s default is ~12x headroom.
+      # quint-policy P1 exemption (bughunt-2 slot 11; §5-Q13): same
+      # untwinned base leaf as the six sibling regimes.
+      vacuityExempt = {
+        atMostOneCASWinner = {
+          class = "pre-r2-untwinned";
+          reason = "the falsifier needs an apiserver-fault twin (duplicate resourceVersion admission) — a new fault axis priced in the Q13 burn-down headline list";
+        };
+      };
+      spec = "leaderElection";
+      main = "leaderElectionForeignRv";
+      step = "foreignRvStep";
+      invariants = [
+        "boundsOK"
+        "clockSkewBound"
+        "atMostOneCASWinner"
+        "loopInterval"
+        "boundedDualLeadership"
+        "staleLeaderHasStaleGeneration"
+        "neverDual"
+        "noFabricatedEvidence"
+      ];
+    };
+
+    # Non-vacuity witness: own-commit evidence is actually consumed in
+    # a trace of the foreign-rv space — the noFabricatedEvidence
+    # verdict above is about a space where the evidence machinery and
+    # the fault both fire.
+    quint-leader-election-witness-foreign-evidence = mkQuintWitnessCheck {
+      name = "leader-election-witness-foreign-evidence";
+      spec = "leaderElection";
+      main = "leaderElectionForeignRv";
+      witness = "noEvidenceUnderForeignBumps";
+      step = "foreignRvStep";
+    };
+
     # Deterministic named-run replay (livelockBrokenRun: two dropped
     # writes, belief sustained on own-commit evidence alone, each
     # stamp at the ledger anchor, no leaderless window, no dual).
@@ -1564,6 +1619,23 @@ rec {
       spec = "calibration/lease-303-blind-timeout";
       main = "leaseCalib303BlindTimeout";
       witness = "blindHolderBounded";
+      step = "calibStep";
+      extraSpecs = [ "leaderElection" ];
+    };
+
+    # merged_bug_180 pre-fix (bughunt3-wave S6b): RV-KEYED identity —
+    # OBS_KEY_RV restores the pre-fix keying (observed record and
+    # evidence cursor on raw resourceVersion). A transmitted write is
+    # LOST (renewSendLost: no protocol content moves) while a foreign
+    # bumpRv moves the rv past the cursor; the rv-keyed evidence rule
+    # consumes the ledger from churn the protocol never authored.
+    # noFabricatedEvidence falls — the laundering the content keying
+    # exists to prevent.
+    quint-lease-calib-180-rv-keyed = mkQuintWitnessCheck {
+      name = "lease-calib-180-rv-keyed";
+      spec = "calibration/lease-180-rv-keyed";
+      main = "leaseCalib180RvKeyed";
+      witness = "noFabricatedEvidence";
       step = "calibStep";
       extraSpecs = [ "leaderElection" ];
     };

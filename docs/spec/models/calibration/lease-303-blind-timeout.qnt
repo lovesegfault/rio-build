@@ -56,6 +56,8 @@ module leaseCalib303BlindTimeout {
     MAX_SUSPENDS = 0,
     MAX_SHUTDOWNS = 0,
     MAX_DROPS = 2,
+    MAX_FOREIGN_BUMPS = 0,
+    OBS_KEY_RV = false,
     BLIND_HOLDER_BOUND = 8
   ).* from "../leaderElection"
 
@@ -80,9 +82,13 @@ module leaseCalib303BlindTimeout {
     suspends' = suspends, shutdowns' = shutdowns,
     releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
     suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
-    unconfirmed' = unconfirmed, lastFetchedRv' = lastFetchedRv,
+    unconfirmed' = unconfirmed, lastFetchedKey' = lastFetchedKey,
     drops' = drops,
-    blindHolderFor' = bhNext(lease, leading, alive, unconfirmed, lastFetchedRv, blindHolderFor, true),
+    foreignBumps' = foreignBumps,
+    lastFetchedContent' = lastFetchedContent,
+    evidenceFabricated' = evidenceFabricated,
+    evidenceConsumed' = evidenceConsumed,
+    blindHolderFor' = bhNext(lease, leading, alive, unconfirmed, lastFetchedKey, blindHolderFor, true),
   }
   action calibTickAny = {
     nondet n = NODES.oneOf()
@@ -101,8 +107,8 @@ module leaseCalib303BlindTimeout {
     obs' = obs.put(n,
       if (lease.holder == NoHolder) NoObs
       else if (lease.holder == Held(n)) obs.get(n)
-      else if (hasObs(n) and obsRvOf(n) == lease.rv) obs.get(n)
-      else Observed({ rv: lease.rv, since: clocks.get(n) })),
+      else if (hasObs(n) and obsKeyOf(n) == leaseKey(lease)) obs.get(n)
+      else Observed({ key: leaseKey(lease), since: clocks.get(n) })),
     clocks' = clocks, lease' = lease, alive' = alive, leading' = leading,
     fence' = fence, gen' = gen, genHW' = genHW, genHWHolder' = genHWHolder,
     acquiredAt' = acquiredAt,
@@ -120,12 +126,16 @@ module leaseCalib303BlindTimeout {
     unconfirmed' =
       if (lease.holder == Held(n)) unconfirmed
       else unconfirmed.put(n, NoUnconf),
-    lastFetchedRv' =
-      if (lease.holder == Held(n)) lastFetchedRv
-      else if (lease.holder == NoHolder) lastFetchedRv.put(n, -1)
-      else lastFetchedRv.put(n, lease.rv),
+    lastFetchedKey' =
+      if (lease.holder == Held(n)) lastFetchedKey
+      else if (lease.holder == NoHolder) lastFetchedKey.put(n, -1)
+      else lastFetchedKey.put(n, leaseKey(lease)),
     drops' = drops,
-    blindHolderFor' = bhNext(lease, leading, alive, unconfirmed, lastFetchedRv, blindHolderFor, false),
+    foreignBumps' = foreignBumps,
+    lastFetchedContent' = lastFetchedContent,
+    evidenceFabricated' = evidenceFabricated,
+    evidenceConsumed' = evidenceConsumed,
+    blindHolderFor' = bhNext(lease, leading, alive, unconfirmed, lastFetchedKey, blindHolderFor, false),
   }
   action calibGetAny = {
     nondet n = NODES.oneOf()

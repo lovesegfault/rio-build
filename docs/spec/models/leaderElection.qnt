@@ -1,4 +1,5 @@
 // -*- mode: Bluespec; -*-
+// quint-policy-latches: evidenceFabricated, evidenceConsumed
 //
 // Phase-1 model of rio-lease's apiserver-CAS leader election protocol:
 // per-node monotonic clocks with bounded skew, the observed-record
@@ -212,13 +213,20 @@ module leaderElection {
   /// The Lease object as the apiserver stores it: holder, resourceVersion,
   /// leaseTransitions (the `gen` field -- the transition count, NOT a
   /// node's in-memory generation).
-  type LeaseRec = { holder: Holder, rv: int, gen: int }
+  /// `rv` mirrors metadata.resourceVersion: bumped by EVERY write,
+  /// protocol or foreign — it stays the CAS guard. `content` mirrors
+  /// the holder-authored spec content (holderIdentity + renewTime
+  /// bytes, abstracted to a counter): bumped by protocol writes only.
+  /// The observed record and the evidence cursor key on `content`
+  /// (production decide()/last_fetched_renew_time); a foreign bumpRv
+  /// moves `rv` alone.
+  type LeaseRec = { holder: Holder, rv: int, content: int, gen: int }
   /// A node's last GET'd copy of the lease (TLA+ snap[n], NULL when the
   /// node has no snapshot in hand / the snapshot was spent).
   type SnapState = | NoSnap | Snap(LeaseRec)
   /// A node's observed-record staleness clock (TLA+ obs[n]): the rv it is
   /// watching and the local-clock instant it started watching.
-  type ObsState = | NoObs | Observed({ rv: int, since: int })
+  type ObsState = | NoObs | Observed({ key: int, since: int })
   /// An in-flight renew round-trip whose apiserver write committed at
   /// SEND but whose response has not been read yet (the loop parked on
   /// the await). `anchor` is the attempt-start instant on the node's
@@ -291,6 +299,18 @@ module leaderElection {
   /// Distinct from MAX_SUSPENDS' split renew: there the response
   /// arrives late (renewReadOk); here it never arrives at all.
   const MAX_DROPS: int
+  /// Foreign non-protocol Lease writers (annotation/label patches by
+  /// other tooling): each bumpRv bumps the apiserver resourceVersion
+  /// WITHOUT touching the holder-authored spec content. 0 disables the
+  /// action entirely (the pre-existing regimes' transition relations
+  /// and state spaces are unchanged; re-measured at the introducing
+  /// commit). merged_bug_180's fault axis.
+  const MAX_FOREIGN_BUMPS: int
+  /// Calibration hook for the merged_bug_180 twin: key the observed
+  /// record and the evidence cursor on the raw resourceVersion (the
+  /// pre-fix production code) instead of the holder-authored content.
+  /// false everywhere except the lease-180-rv-keyed falsify twin.
+  const OBS_KEY_RV: bool
   /// The blind-holder-window bound (global ticks) blindHolderBounded
   /// asserts in dropped-write regimes; bind 0 wherever MAX_DROPS = 0
   /// (the ghost is frozen there). The value is a calibrated
@@ -406,7 +426,7 @@ module leaderElection {
   /// (production last_fetched_rv; -1 = none). Updates are gated on
   /// MAX_DROPS > 0 so the four pre-existing regimes' state spaces
   /// stay byte-identical (re-measured at the introducing commit).
-  var lastFetchedRv: Node -> int
+  var lastFetchedKey: Node -> int
   /// Ghost: global ticks accumulated while SOME alive node is the
   /// EVIDENCE-STARVED BLIND HOLDER -- the lease names it, it has
   /// stopped believing (fenced), and own-commit evidence of its
@@ -422,6 +442,28 @@ module leaderElection {
   var blindHolderFor: int
   /// Dropped writes so far.
   var drops: int
+  /// Foreign non-protocol writes so far. Frozen 0 at
+  /// MAX_FOREIGN_BUMPS = 0 (the action is disabled).
+  var foreignBumps: int
+  /// Ghost cursor: the lease CONTENT at this node's last completed
+  /// fetch (-1 = none) — the ground truth the fabrication latch is
+  /// judged against, independent of what the evidence cursor keys on.
+  /// Updated only at MAX_FOREIGN_BUMPS > 0 (frozen all -1 otherwise:
+  /// without foreign writers content and rv never diverge and the
+  /// latch below is identically false — byte-identical pre-existing
+  /// regimes).
+  var lastFetchedContent: Node -> int
+  /// History latch (writer: fetchObservesOwnCommit): own-commit
+  /// evidence was consumed while the holder-authored CONTENT had NOT
+  /// moved past this node's last completed fetch — the consumed
+  /// "evidence" was foreign rv churn, not a committed write of ours
+  /// (merged_bug_180's fabrication). Frozen at MAX_FOREIGN_BUMPS = 0.
+  var evidenceFabricated: bool
+  /// History latch (writer: fetchObservesOwnCommit): own-commit
+  /// evidence was consumed at least once while foreign bumps were
+  /// enabled — the non-vacuity witness for the foreign-rv regime.
+  /// Frozen at MAX_FOREIGN_BUMPS = 0.
+  var evidenceConsumed: bool
 
   // --- 4. accessor / guard helpers --------------------------------------
   // The TLA+ reads snap[n].rv directly after guarding snap[n] /= NULL;
@@ -434,7 +476,13 @@ module leaderElection {
   def snapRvOf(n: Node): int = match snap.get(n) { | NoSnap => -1 | Snap(l) => l.rv }
   def snapHolderOf(n: Node): Holder = match snap.get(n) { | NoSnap => NoHolder | Snap(l) => l.holder }
   def hasObs(n: Node): bool = obs.get(n) != NoObs
-  def obsRvOf(n: Node): int = match obs.get(n) { | NoObs => -1 | Observed(o) => o.rv }
+  def obsKeyOf(n: Node): int = match obs.get(n) { | NoObs => -1 | Observed(o) => o.key }
+  def snapContentOf(n: Node): int = match snap.get(n) { | NoSnap => -1 | Snap(l) => l.content }
+  /// The observation/evidence identity key (`sched.lease.k8s-lease` /
+  /// `sched.lease.cancelled-write`): the holder-authored content in
+  /// production; the raw rv only under the lease-180-rv-keyed twin.
+  def leaseKey(l: LeaseRec): int = if (OBS_KEY_RV) l.rv else l.content
+  def snapKeyOf(n: Node): int = if (OBS_KEY_RV) snapRvOf(n) else snapContentOf(n)
   def obsSinceOf(n: Node): int = match obs.get(n) { | NoObs => -1 | Observed(o) => o.since }
   def hasPending(n: Node): bool = pending.get(n) != NoPending
   def anchorOf(n: Node): int = match pending.get(n) { | NoPending => -1 | PendingRead(p) => p.anchor }
@@ -447,7 +495,7 @@ module leaderElection {
   def evidenceEnabled(n: Node): bool = and {
     unconfirmed.get(n) != NoUnconf,
     lease.holder == Held(n),
-    lease.rv != lastFetchedRv.get(n),
+    leaseKey(lease) != lastFetchedKey.get(n),
   }
   /// The blindHolderFor ghost's single transition rule, applied in
   /// every action's frame with that action's POST values (the
@@ -463,7 +511,7 @@ module leaderElection {
       not(ld.get(m)),
       lz.holder == Held(m),
       uc.get(m) != NoUnconf,
-      lz.rv != cf.get(m),
+      (if (OBS_KEY_RV) lz.rv else lz.content) != cf.get(m),
     }))
       (if (isTick) cur + 1 else cur)
     else 0
@@ -609,6 +657,21 @@ module leaderElection {
   /// committed-but-cancelled PUTs re-anchor every standby's staleness
   /// clock while the blind ex-holder cannot re-anchor its own belief.
   val blindHolderBounded = blindHolderFor <= BLIND_HOLDER_BOUND
+
+  /// merged_bug_180: own-commit evidence is never fabricated from
+  /// foreign rv churn — whenever the evidence action consumes the
+  /// ledger, the holder-authored CONTENT actually moved past the
+  /// node's last completed fetch (i.e. a write of OURS committed).
+  /// Holds in the foreignRv regime exactly because the evidence
+  /// cursor keys on content; the lease-180-rv-keyed falsify twin
+  /// restores the pre-fix rv keying and violates this.
+  val noFabricatedEvidence = not(evidenceFabricated)
+
+  /// Witness (expect-violation in the foreignRv regime): own-commit
+  /// evidence is actually consumed in a trace where foreign bumps are
+  /// enabled — the noFabricatedEvidence verdict there is about a
+  /// space where both the evidence machinery and the fault fire.
+  val noEvidenceUnderForeignBumps = not(evidenceConsumed)
 
   /// Witness (expect-violation in the droppedWrite regime): a
   /// transmitted write actually drops -- the blindHolderBounded and
@@ -987,9 +1050,13 @@ module leaderElection {
     suspends' = suspends, shutdowns' = shutdowns,
     releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
     suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
-    unconfirmed' = unconfirmed, lastFetchedRv' = lastFetchedRv,
+    unconfirmed' = unconfirmed, lastFetchedKey' = lastFetchedKey,
     drops' = drops,
-    blindHolderFor' = bhNext(lease, leading, alive, unconfirmed, lastFetchedRv, blindHolderFor, true),
+    foreignBumps' = foreignBumps,
+    lastFetchedContent' = lastFetchedContent,
+    evidenceFabricated' = evidenceFabricated,
+    evidenceConsumed' = evidenceConsumed,
+    blindHolderFor' = bhNext(lease, leading, alive, unconfirmed, lastFetchedKey, blindHolderFor, true),
   }
 
   /// GET the lease. The obs[n] update follows decide_pure()'s
@@ -1039,8 +1106,8 @@ module leaderElection {
     obs' = obs.put(n,
       if (lease.holder == NoHolder) NoObs
       else if (lease.holder == Held(n)) obs.get(n)
-      else if (hasObs(n) and obsRvOf(n) == lease.rv) obs.get(n)
-      else Observed({ rv: lease.rv, since: clocks.get(n) })),
+      else if (hasObs(n) and obsKeyOf(n) == leaseKey(lease)) obs.get(n)
+      else Observed({ key: leaseKey(lease), since: clocks.get(n) })),
     clocks' = clocks, lease' = lease, alive' = alive, leading' = leading,
     fence' = fence, gen' = gen, genHW' = genHW, genHWHolder' = genHWHolder,
     acquiredAt' = acquiredAt,
@@ -1071,16 +1138,26 @@ module leaderElection {
     // Cursor per the same arm (404/empty resets the baseline --
     // production's create path); gated for byte-identical
     // pre-existing regimes.
-    lastFetchedRv' =
-      if (MAX_DROPS == 0) lastFetchedRv
-      else if (lease.holder == Held(n)) lastFetchedRv
-      else if (lease.holder == NoHolder) lastFetchedRv.put(n, -1)
-      else lastFetchedRv.put(n, lease.rv),
+    lastFetchedKey' =
+      if (MAX_DROPS == 0) lastFetchedKey
+      else if (lease.holder == Held(n)) lastFetchedKey
+      else if (lease.holder == NoHolder) lastFetchedKey.put(n, -1)
+      else lastFetchedKey.put(n, leaseKey(lease)),
     drops' = drops,
+    foreignBumps' = foreignBumps,
+    // Ghost content cursor mirrors the key cursor's branches (frozen
+    // without foreign writers — content never diverges from rv there).
+    lastFetchedContent' =
+      if (MAX_FOREIGN_BUMPS == 0) lastFetchedContent
+      else if (lease.holder == Held(n)) lastFetchedContent
+      else if (lease.holder == NoHolder) lastFetchedContent.put(n, -1)
+      else lastFetchedContent.put(n, lease.content),
+    evidenceFabricated' = evidenceFabricated,
+    evidenceConsumed' = evidenceConsumed,
     // The blind condition is invariant under a bare GET: the entry
     // only clears when the holder is foreign (that node's blind term
     // was already false), and no other coordinate moves.
-    blindHolderFor' = bhNext(lease, leading, alive, unconfirmed, lastFetchedRv, blindHolderFor, false),
+    blindHolderFor' = bhNext(lease, leading, alive, unconfirmed, lastFetchedKey, blindHolderFor, false),
   }
 
   /// The write-ahead claim INSERT succeeds: the PG floor advances to the
@@ -1216,7 +1293,7 @@ module leaderElection {
           snapHolderOf(n) != NoHolder,
           snapHolderOf(n) != Held(n),
           hasObs(n),
-          obsRvOf(n) == snapRvOf(n),
+          obsKeyOf(n) == snapKeyOf(n),
           clocks.get(n) - obsSinceOf(n) > STEAL_AFTER,
         },
       },
@@ -1230,7 +1307,7 @@ module leaderElection {
       // clocks. The rv bound is in casOk.
       lease.gen < MAX_GEN,
       seeded <= MAX_GEN,
-      lease' = { holder: Held(n), rv: snapRvOf(n) + 1, gen: lease.gen + 1 },
+      lease' = { holder: Held(n), rv: snapRvOf(n) + 1, content: lease.content + 1, gen: lease.gen + 1 },
       leading' = leading.put(n, true),
       gen' = gen.put(n, seeded),
       casRace' = casRaceAfterPut(n),
@@ -1274,10 +1351,16 @@ module leaderElection {
       // answered wholesale; the cursor takes the post-PUT rv (gated
       // for byte-identical pre-existing regimes).
       unconfirmed' = unconfirmed.put(n, NoUnconf),
-      lastFetchedRv' =
-        if (MAX_DROPS == 0) lastFetchedRv
-        else lastFetchedRv.put(n, snapRvOf(n) + 1),
+      lastFetchedKey' =
+        if (MAX_DROPS == 0) lastFetchedKey
+        else lastFetchedKey.put(n, snapKeyOf(n) + 1),
       drops' = drops,
+      foreignBumps' = foreignBumps,
+      lastFetchedContent' =
+        if (MAX_FOREIGN_BUMPS == 0) lastFetchedContent
+        else lastFetchedContent.put(n, snapContentOf(n) + 1),
+      evidenceFabricated' = evidenceFabricated,
+      evidenceConsumed' = evidenceConsumed,
       blindHolderFor' = 0,  // the thief is the holder AND a believer post-state
       // The claim disjunction: the INSERT into the claims ledger either
       // lands (claimOk -- the floor advances when seeded exceeds it; on
@@ -1414,7 +1497,7 @@ module leaderElection {
       // steady-state renew computes no new generation and must not be
       // disabled at the ceiling.
       isEdge implies (seeded <= MAX_GEN),
-      lease' = { ...lease, rv: snapRvOf(n) + 1 },
+      lease' = { ...lease, rv: snapRvOf(n) + 1, content: lease.content + 1 },
       leading' = leading.put(n, true),
       gen' = gen.put(n, if (isEdge) seeded else gen.get(n)),
       casRace' = casRaceAfterPut(n),
@@ -1441,10 +1524,16 @@ module leaderElection {
       // the cursor takes the post-PUT rv (gated for byte-identical
       // pre-existing regimes).
       unconfirmed' = unconfirmed.put(n, NoUnconf),
-      lastFetchedRv' =
-        if (MAX_DROPS == 0) lastFetchedRv
-        else lastFetchedRv.put(n, snapRvOf(n) + 1),
+      lastFetchedKey' =
+        if (MAX_DROPS == 0) lastFetchedKey
+        else lastFetchedKey.put(n, snapKeyOf(n) + 1),
       drops' = drops,
+      foreignBumps' = foreignBumps,
+      lastFetchedContent' =
+        if (MAX_FOREIGN_BUMPS == 0) lastFetchedContent
+        else lastFetchedContent.put(n, snapContentOf(n) + 1),
+      evidenceFabricated' = evidenceFabricated,
+      evidenceConsumed' = evidenceConsumed,
       blindHolderFor' = 0,  // the renewer is the holder AND a believer post-state
       // The same claim disjunction as steal's, restricted to the edge
       // branch via claimTarget -- a steady-state renew never claims, so
@@ -1491,11 +1580,17 @@ module leaderElection {
     // the GET half's rv (gated for byte-identical pre-existing
     // regimes).
     unconfirmed' = unconfirmed.put(n, NoUnconf),
-    lastFetchedRv' =
-      if (MAX_DROPS == 0) lastFetchedRv
-      else lastFetchedRv.put(n, snapRvOf(n)),
+    lastFetchedKey' =
+      if (MAX_DROPS == 0) lastFetchedKey
+      else lastFetchedKey.put(n, snapKeyOf(n)),
     drops' = drops,
-    blindHolderFor' = bhNext(lease, leading.put(n, false), alive, unconfirmed.put(n, NoUnconf), lastFetchedRv, blindHolderFor, false),
+    foreignBumps' = foreignBumps,
+    lastFetchedContent' =
+      if (MAX_FOREIGN_BUMPS == 0) lastFetchedContent
+      else lastFetchedContent.put(n, snapContentOf(n)),
+    evidenceFabricated' = evidenceFabricated,
+    evidenceConsumed' = evidenceConsumed,
+    blindHolderFor' = bhNext(lease, leading.put(n, false), alive, unconfirmed.put(n, NoUnconf), lastFetchedKey, blindHolderFor, false),
   }
 
   /// maybe_self_fence(): a Leading node that has not had a successful
@@ -1526,9 +1621,13 @@ module leaderElection {
     suspends' = suspends, shutdowns' = shutdowns,
     releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
     suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
-    unconfirmed' = unconfirmed, lastFetchedRv' = lastFetchedRv,
+    unconfirmed' = unconfirmed, lastFetchedKey' = lastFetchedKey,
     drops' = drops,
-    blindHolderFor' = bhNext(lease, leading.put(n, false), alive, unconfirmed, lastFetchedRv, blindHolderFor, false),
+    foreignBumps' = foreignBumps,
+    lastFetchedContent' = lastFetchedContent,
+    evidenceFabricated' = evidenceFabricated,
+    evidenceConsumed' = evidenceConsumed,
+    blindHolderFor' = bhNext(lease, leading.put(n, false), alive, unconfirmed, lastFetchedKey, blindHolderFor, false),
   }
 
   /// Pod crash. Loses ALL in-memory state: the belief, the snapshot, the
@@ -1566,9 +1665,13 @@ module leaderElection {
     // (which is why evidence can never fire post-crash at the reset
     // generation -- the entry died with the incarnation).
     unconfirmed' = unconfirmed.put(n, NoUnconf),
-    lastFetchedRv' = lastFetchedRv.put(n, -1),
+    lastFetchedKey' = lastFetchedKey.put(n, -1),
     drops' = drops,
-    blindHolderFor' = bhNext(lease, leading.put(n, false), alive.put(n, false), unconfirmed.put(n, NoUnconf), lastFetchedRv, blindHolderFor, false),
+    foreignBumps' = foreignBumps,
+    lastFetchedContent' = lastFetchedContent,
+    evidenceFabricated' = evidenceFabricated,
+    evidenceConsumed' = evidenceConsumed,
+    blindHolderFor' = bhNext(lease, leading.put(n, false), alive.put(n, false), unconfirmed.put(n, NoUnconf), lastFetchedKey, blindHolderFor, false),
   }
 
   /// Pod restart. The recovered process has no observation (its first
@@ -1595,9 +1698,13 @@ module leaderElection {
     suspends' = suspends, shutdowns' = shutdowns,
     releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
     suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
-    unconfirmed' = unconfirmed, lastFetchedRv' = lastFetchedRv,
+    unconfirmed' = unconfirmed, lastFetchedKey' = lastFetchedKey,
     drops' = drops,
-    blindHolderFor' = bhNext(lease, leading, alive.put(n, true), unconfirmed, lastFetchedRv, blindHolderFor, false),
+    foreignBumps' = foreignBumps,
+    lastFetchedContent' = lastFetchedContent,
+    evidenceFabricated' = evidenceFabricated,
+    evidenceConsumed' = evidenceConsumed,
+    blindHolderFor' = bhNext(lease, leading, alive.put(n, true), unconfirmed, lastFetchedKey, blindHolderFor, false),
   }
 
   /// Suspend fault, send half: a steady-state renew whose PUT commits
@@ -1618,7 +1725,7 @@ module leaderElection {
     hasSnap(n),
     snapHolderOf(n) == Held(n),
     casOk(n),
-    lease' = { ...lease, rv: snapRvOf(n) + 1 },
+    lease' = { ...lease, rv: snapRvOf(n) + 1, content: lease.content + 1 },
     snap' = snap.put(n, NoSnap),
     pending' = pending.put(n, PendingRead({ anchor: clocks.get(n) })),
     suspends' = suspends + 1,
@@ -1636,8 +1743,12 @@ module leaderElection {
     suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
     // The round is unresolved (the response is parked): ledger and
     // cursor wait for renewReadOk's resolution.
-    unconfirmed' = unconfirmed, lastFetchedRv' = lastFetchedRv,
+    unconfirmed' = unconfirmed, lastFetchedKey' = lastFetchedKey,
     drops' = drops,
+    foreignBumps' = foreignBumps,
+    lastFetchedContent' = lastFetchedContent,
+    evidenceFabricated' = evidenceFabricated,
+    evidenceConsumed' = evidenceConsumed,
     blindHolderFor' = 0,  // the holder is a believer; no other node is named
   }
 
@@ -1675,9 +1786,13 @@ module leaderElection {
     // pending record deliberately does not carry the PUT-time rv
     // (adding it would change the suspend regime's state space).
     unconfirmed' = unconfirmed.put(n, NoUnconf),
-    lastFetchedRv' = lastFetchedRv,
+    lastFetchedKey' = lastFetchedKey,
     drops' = drops,
-    blindHolderFor' = bhNext(lease, leading, alive, unconfirmed.put(n, NoUnconf), lastFetchedRv, blindHolderFor, false),
+    foreignBumps' = foreignBumps,
+    lastFetchedContent' = lastFetchedContent,
+    evidenceFabricated' = evidenceFabricated,
+    evidenceConsumed' = evidenceConsumed,
+    blindHolderFor' = bhNext(lease, leading, alive, unconfirmed.put(n, NoUnconf), lastFetchedKey, blindHolderFor, false),
   }
 
   /// The dropped-write fault (merged_bug_303): a renew-shaped PUT
@@ -1703,21 +1818,81 @@ module leaderElection {
     hasSnap(n),
     snapHolderOf(n) == Held(n),
     casOk(n),
-    lease' = { ...lease, rv: snapRvOf(n) + 1 },
+    lease' = { ...lease, rv: snapRvOf(n) + 1, content: lease.content + 1 },
     snap' = snap.put(n, NoSnap),
     unconfirmed' = unconfirmed.put(n,
       if (unconfirmed.get(n) == NoUnconf) Unconf({ anchor: clocks.get(n) })
       else unconfirmed.get(n)),
-    lastFetchedRv' = lastFetchedRv.put(n, snapRvOf(n)),
+    lastFetchedKey' = lastFetchedKey.put(n, snapKeyOf(n)),
     drops' = drops + 1,
+    foreignBumps' = foreignBumps,
+    lastFetchedContent' =
+      if (MAX_FOREIGN_BUMPS == 0) lastFetchedContent
+      else lastFetchedContent.put(n, snapContentOf(n)),
+    evidenceFabricated' = evidenceFabricated,
+    evidenceConsumed' = evidenceConsumed,
     casRace' = casRaceAfterPut(n),
     held' = held,
     blindHolderFor' = bhNext(
-      { ...lease, rv: snapRvOf(n) + 1 }, leading, alive,
+      { ...lease, rv: snapRvOf(n) + 1, content: lease.content + 1 }, leading, alive,
       unconfirmed.put(n,
         if (unconfirmed.get(n) == NoUnconf) Unconf({ anchor: clocks.get(n) })
         else unconfirmed.get(n)),
-      lastFetchedRv.put(n, snapRvOf(n)),
+      lastFetchedKey.put(n, snapKeyOf(n)),
+      blindHolderFor, false),
+    fence' = fence, clocks' = clocks, alive' = alive, leading' = leading,
+    obs' = obs, gen' = gen, genHW' = genHW, genHWHolder' = genHWHolder,
+    acquiredAt' = acquiredAt, deletes' = deletes,
+    delVictims' = delVictims, claimFailures' = claimFailures,
+    restores' = restores, stealRetained' = stealRetained,
+    stealBumpedForeignTie' = stealBumpedForeignTie,
+    renewBumpedAboveEntry' = renewBumpedAboveEntry,
+    pending' = pending, exited' = exited,
+    suspends' = suspends, shutdowns' = shutdowns,
+    releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
+    suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
+  }
+
+  /// The dropped-write fault's DISCARDED flavor (bughunt3-wave S6b
+  /// merged_bug_180): a renew-shaped PUT transmitted and abandoned
+  /// like renewSendDropped — same client-side view, same ledger mint,
+  /// same cursor advance — whose apiserver write NEVER applied (the
+  /// connection died before the request was processed). "Cancelled is
+  /// not discarded" means the client cannot distinguish the two: the
+  /// model explores BOTH resolutions of every transmitted-abandoned
+  /// write. The holder-authored content does NOT move here — which is
+  /// exactly why rv-keyed evidence is laundering when a foreign bump
+  /// moves the rv anyway (the lease-180-rv-keyed twin's engine).
+  /// Gated on the foreign-bump axis (this flavor ships with it) so
+  /// the pre-existing droppedWrite regime's state space is untouched
+  /// — re-measured byte-identical at the introducing commit.
+  action renewSendLost(n: Node): bool = all {
+    MAX_FOREIGN_BUMPS > 0,
+    drops < MAX_DROPS,
+    alive.get(n),
+    pending.get(n) == NoPending,
+    hasSnap(n),
+    snapHolderOf(n) == Held(n),
+    casOk(n),
+    lease' = lease,
+    snap' = snap.put(n, NoSnap),
+    unconfirmed' = unconfirmed.put(n,
+      if (unconfirmed.get(n) == NoUnconf) Unconf({ anchor: clocks.get(n) })
+      else unconfirmed.get(n)),
+    lastFetchedKey' = lastFetchedKey.put(n, snapKeyOf(n)),
+    drops' = drops + 1,
+    foreignBumps' = foreignBumps,
+    lastFetchedContent' = lastFetchedContent.put(n, snapContentOf(n)),
+    evidenceFabricated' = evidenceFabricated,
+    evidenceConsumed' = evidenceConsumed,
+    casRace' = casRace,
+    held' = held,
+    blindHolderFor' = bhNext(
+      lease, leading, alive,
+      unconfirmed.put(n,
+        if (unconfirmed.get(n) == NoUnconf) Unconf({ anchor: clocks.get(n) })
+        else unconfirmed.get(n)),
+      lastFetchedKey.put(n, snapKeyOf(n)),
       blindHolderFor, false),
     fence' = fence, clocks' = clocks, alive' = alive, leading' = leading,
     obs' = obs, gen' = gen, genHW' = genHW, genHWHolder' = genHWHolder,
@@ -1759,10 +1934,37 @@ module leaderElection {
     pending.get(n) == NoPending,
     evidenceEnabled(n),
     fence' = fence.put(n, unconfAnchorOf(n)),
-    leading' = leading.put(n, true),
+    // One action = one production loop pass (rio-lease lib.rs evidence
+    // arm): the evidence stamp restores belief AND the fence still
+    // arbitrates in the SAME pass — a ledger anchor already past
+    // FENCE_AFTER re-fences before the pass ends, so belief never
+    // outlives the discipline loopInterval states. Caught by TLC on
+    // the foreign-rv regime: a LOST write's eldest-kept anchor consumed
+    // via a LATER committing write's evidence re-believed 7 ticks stale.
+    leading' = leading.put(n, clocks.get(n) - unconfAnchorOf(n) <= FENCE_AFTER),
     gen' = gen.put(n, if (gen.get(n) > lease.gen + 1) gen.get(n) else lease.gen + 1),
     unconfirmed' = unconfirmed.put(n, NoUnconf),
-    lastFetchedRv' = lastFetchedRv.put(n, lease.rv),
+    lastFetchedKey' = lastFetchedKey.put(n, leaseKey(lease)),
+    // merged_bug_180 ground truth, judged on CONTENT regardless of
+    // what the evidence cursor keys on: consuming "evidence" while the
+    // holder-authored content never moved past this node's last
+    // completed fetch means the consumed signal was foreign rv churn.
+    evidenceFabricated' = or {
+      evidenceFabricated,
+      MAX_FOREIGN_BUMPS > 0 and lease.content == lastFetchedContent.get(n),
+    },
+    // Live latch (quint-policy P4): the consumption event is THIS
+    // action's firing; evidenceEnabled(n) is its own state-dependent
+    // enabling condition (true at every firing), so the latch carries
+    // a real state-reading writer instead of a const toggle.
+    evidenceConsumed' = or {
+      evidenceConsumed,
+      MAX_FOREIGN_BUMPS > 0 and evidenceEnabled(n),
+    },
+    lastFetchedContent' =
+      if (MAX_FOREIGN_BUMPS == 0) lastFetchedContent
+      else lastFetchedContent.put(n, lease.content),
+    foreignBumps' = foreignBumps,
     snap' = snap.put(n, Snap(lease)),
     held' = trackHeld(held, n, true),
     blindHolderFor' = 0,  // the holder re-believes; its entry is consumed
@@ -1777,6 +1979,39 @@ module leaderElection {
     suspends' = suspends, shutdowns' = shutdowns,
     releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
     suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
+  }
+
+  /// Foreign non-protocol Lease write (merged_bug_180's fault axis): a
+  /// third-party annotation/label patch bumps metadata.resourceVersion
+  /// while the holder-authored spec content is untouched. Invalidates
+  /// in-flight protocol snapshots exactly like any other write (the
+  /// CAS guard keys on rv), but MUST move neither the observed-record
+  /// clock nor the evidence cursor — both key on content.
+  action bumpRv = all {
+    MAX_FOREIGN_BUMPS > 0,
+    foreignBumps < MAX_FOREIGN_BUMPS,
+    lease.rv < MAX_RV,
+    lease' = { ...lease, rv: lease.rv + 1 },
+    foreignBumps' = foreignBumps + 1,
+    clocks' = clocks, alive' = alive, leading' = leading,
+    snap' = snap, obs' = obs, fence' = fence, gen' = gen,
+    genHW' = genHW, genHWHolder' = genHWHolder,
+    acquiredAt' = acquiredAt, casRace' = casRace, deletes' = deletes,
+    delVictims' = delVictims, claimFailures' = claimFailures,
+    restores' = restores, stealRetained' = stealRetained,
+    stealBumpedForeignTie' = stealBumpedForeignTie,
+    renewBumpedAboveEntry' = renewBumpedAboveEntry,
+    pending' = pending, held' = held, exited' = exited,
+    suspends' = suspends, shutdowns' = shutdowns,
+    releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
+    suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
+    unconfirmed' = unconfirmed,
+    lastFetchedKey' = lastFetchedKey,
+    lastFetchedContent' = lastFetchedContent,
+    evidenceFabricated' = evidenceFabricated,
+    evidenceConsumed' = evidenceConsumed,
+    drops' = drops,
+    blindHolderFor' = bhNext({ ...lease, rv: lease.rv + 1 }, leading, alive, unconfirmed, lastFetchedKey, blindHolderFor, false),
   }
 
   /// Shutdown fault: SIGTERM. The loop breaks and runs the release
@@ -1819,7 +2054,7 @@ module leaderElection {
     fenceThenExit' = (fenceThenExit or
       (held.get(n) and not(leading.get(n)) and lease.holder == Held(n))),
     lease' = if (releases)
-               { holder: NoHolder, rv: lease.rv + 1, gen: lease.gen }
+               { holder: NoHolder, rv: lease.rv + 1, content: lease.content + 1, gen: lease.gen }
              else lease,
     alive' = alive.put(n, false),
     exited' = exited.put(n, true),
@@ -1840,12 +2075,16 @@ module leaderElection {
     // The exiting process takes its in-memory ledger and cursor with
     // it (terminal: exited nodes never act again).
     unconfirmed' = unconfirmed.put(n, NoUnconf),
-    lastFetchedRv' = lastFetchedRv.put(n, -1),
+    lastFetchedKey' = lastFetchedKey.put(n, -1),
     drops' = drops,
+    foreignBumps' = foreignBumps,
+    lastFetchedContent' = lastFetchedContent,
+    evidenceFabricated' = evidenceFabricated,
+    evidenceConsumed' = evidenceConsumed,
     blindHolderFor' = bhNext(
-      if (releases) { holder: NoHolder, rv: lease.rv + 1, gen: lease.gen } else lease,
+      if (releases) { holder: NoHolder, rv: lease.rv + 1, content: lease.content + 1, gen: lease.gen } else lease,
       leading.put(n, false), alive.put(n, false),
-      unconfirmed.put(n, NoUnconf), lastFetchedRv,
+      unconfirmed.put(n, NoUnconf), lastFetchedKey,
       blindHolderFor, false),
     }
   }
@@ -1888,7 +2127,7 @@ module leaderElection {
     deletes < MAX_DELETES,
     lease.holder != NoHolder,
     lease.rv < MAX_RV,
-    lease' = { holder: NoHolder, rv: lease.rv + 1, gen: 0 },
+    lease' = { holder: NoHolder, rv: lease.rv + 1, content: lease.content + 1, gen: 0 },
     deletes' = deletes + 1,
     delVictims' = match lease.holder {
       | NoHolder => delVictims
@@ -1906,8 +2145,12 @@ module leaderElection {
     suspends' = suspends, shutdowns' = shutdowns,
     releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
     suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
-    unconfirmed' = unconfirmed, lastFetchedRv' = lastFetchedRv,
+    unconfirmed' = unconfirmed, lastFetchedKey' = lastFetchedKey,
     drops' = drops,
+    foreignBumps' = foreignBumps,
+    lastFetchedContent' = lastFetchedContent,
+    evidenceFabricated' = evidenceFabricated,
+    evidenceConsumed' = evidenceConsumed,
     blindHolderFor' = 0,  // recreated empty: nobody is named holder
   }
 
@@ -1941,9 +2184,13 @@ module leaderElection {
     suspends' = suspends, shutdowns' = shutdowns,
     releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
     suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
-    unconfirmed' = unconfirmed, lastFetchedRv' = lastFetchedRv,
+    unconfirmed' = unconfirmed, lastFetchedKey' = lastFetchedKey,
     drops' = drops,
-    blindHolderFor' = bhNext(lease, leading, alive, unconfirmed, lastFetchedRv, blindHolderFor, false),
+    foreignBumps' = foreignBumps,
+    lastFetchedContent' = lastFetchedContent,
+    evidenceFabricated' = evidenceFabricated,
+    evidenceConsumed' = evidenceConsumed,
+    blindHolderFor' = bhNext(lease, leading, alive, unconfirmed, lastFetchedKey, blindHolderFor, false),
   }
 
   // --- 7. init ----------------------------------------------------------
@@ -1953,7 +2200,7 @@ module leaderElection {
   /// holder.
   action init = all {
     clocks' = NODES.mapBy(n => 0),
-    lease' = { holder: NoHolder, rv: 0, gen: 0 },
+    lease' = { holder: NoHolder, rv: 0, content: 0, gen: 0 },
     alive' = NODES.mapBy(n => true),
     leading' = NODES.mapBy(n => false),
     snap' = NODES.mapBy(n => NoSnap),
@@ -1980,9 +2227,13 @@ module leaderElection {
     suspendStraddled' = false,
     fenceThenExit' = false,
     unconfirmed' = NODES.mapBy(n => NoUnconf),
-    lastFetchedRv' = NODES.mapBy(n => -1),
+    lastFetchedKey' = NODES.mapBy(n => -1),
     blindHolderFor' = 0,
     drops' = 0,
+    foreignBumps' = 0,
+    lastFetchedContent' = NODES.mapBy(_ => -1),
+    evidenceFabricated' = false,
+    evidenceConsumed' = false,
   }
 
   // --- 8. step ----------------------------------------------------------
@@ -2071,6 +2322,10 @@ module leaderElection {
     nondet n = NODES.oneOf()
     renewSendDropped(n)
   }
+  action renewSendLostAny = {
+    nondet n = NODES.oneOf()
+    renewSendLost(n)
+  }
   /// One node's fetch observes its own committed-but-unconfirmed
   /// write (dropped-write fault's evidence rule).
   action fetchObservesOwnCommitAny = {
@@ -2101,6 +2356,11 @@ module leaderElection {
     // commit).
     renewSendDroppedAny,
     fetchObservesOwnCommitAny,
+    // Fault-gated (disabled at MAX_FOREIGN_BUMPS = 0 -- same
+    // discipline; pre-existing regimes re-measured byte-identical at
+    // the introducing commit).
+    renewSendLostAny,
+    bumpRv,
   }
 }
 
@@ -2206,6 +2466,8 @@ module leaderElectionBase {
     MAX_SUSPENDS = 0,
     MAX_SHUTDOWNS = 0,
     MAX_DROPS = 0,
+    MAX_FOREIGN_BUMPS = 0,
+    OBS_KEY_RV = false,
     BLIND_HOLDER_BOUND = 0
   ).*
 
@@ -2404,6 +2666,8 @@ module leaderElectionDeletion {
     MAX_SUSPENDS = 0,
     MAX_SHUTDOWNS = 0,
     MAX_DROPS = 0,
+    MAX_FOREIGN_BUMPS = 0,
+    OBS_KEY_RV = false,
     BLIND_HOLDER_BOUND = 0
   ).*
 }
@@ -2494,6 +2758,8 @@ module leaderElectionAsymmetric {
     MAX_SUSPENDS = 0,
     MAX_SHUTDOWNS = 0,
     MAX_DROPS = 0,
+    MAX_FOREIGN_BUMPS = 0,
+    OBS_KEY_RV = false,
     BLIND_HOLDER_BOUND = 0
   ).*
 }
@@ -2583,6 +2849,8 @@ module leaderElectionPgFaults {
     MAX_SUSPENDS = 0,
     MAX_SHUTDOWNS = 0,
     MAX_DROPS = 0,
+    MAX_FOREIGN_BUMPS = 0,
+    OBS_KEY_RV = false,
     BLIND_HOLDER_BOUND = 0
   ).*
 }
@@ -2630,6 +2898,8 @@ module leaderElectionSuspend {
     MAX_SUSPENDS = 1,
     MAX_SHUTDOWNS = 0,
     MAX_DROPS = 0,
+    MAX_FOREIGN_BUMPS = 0,
+    OBS_KEY_RV = false,
     BLIND_HOLDER_BOUND = 0
   ).*
 
@@ -2692,6 +2962,8 @@ module leaderElectionShutdown {
     MAX_SUSPENDS = 0,
     MAX_SHUTDOWNS = 1,
     MAX_DROPS = 0,
+    MAX_FOREIGN_BUMPS = 0,
+    OBS_KEY_RV = false,
     BLIND_HOLDER_BOUND = 0
   ).*
 
@@ -2790,6 +3062,8 @@ module leaderElectionDroppedWrite {
     MAX_SUSPENDS = 0,
     MAX_SHUTDOWNS = 0,
     MAX_DROPS = 2,
+    MAX_FOREIGN_BUMPS = 0,
+    OBS_KEY_RV = false,
     BLIND_HOLDER_BOUND = 8
   ).*
 
@@ -2805,6 +3079,11 @@ module leaderElectionDroppedWrite {
     selfFenceAny,
     renewSendDroppedAny,
     fetchObservesOwnCommitAny,
+    // Fault-gated (disabled at MAX_FOREIGN_BUMPS = 0 -- same
+    // discipline; pre-existing regimes re-measured byte-identical at
+    // the introducing commit).
+    renewSendLostAny,
+    bumpRv,
   }
 
   // --- deterministic protocol runs ---------------------------------------
@@ -2838,4 +3117,57 @@ module leaderElectionDroppedWrite {
         drops == 2,
         not(dual),
       })
+}
+
+// =========================================================================
+// The foreign-rv-writer fault regime (bughunt3-wave S6b
+// merged_bug_180): the mid-band world of droppedWrite PLUS a foreign
+// non-protocol Lease mutator (bumpRv: annotation/label patches that
+// bump metadata.resourceVersion without touching the holder-authored
+// spec content). The observed record and the evidence cursor key on
+// CONTENT (the fix), so:
+//   - the staleness clock keeps aging under foreign churn (a dead
+//     leader is stolen on schedule — the steal guard's content
+//     identity);
+//   - own-commit evidence requires a CONTENT move (no fabrication
+//     from foreign churn — noFabricatedEvidence, this regime's
+//     headline);
+// while the CAS guard still keys on rv, so foreign writes ALSO
+// adversarially 409 in-flight protocol PUTs.
+// The paired pin is quint-lease-calib-180-rv-keyed (OBS_KEY_RV
+// restores the pre-fix keying; noFabricatedEvidence must fall).
+module leaderElectionForeignRv {
+  import leaderElection(
+    NODES = Set("n1", "n2"),
+    FENCE_AFTER = 2,
+    STEAL_AFTER = 5,
+    RENEW = 1,
+    MAX_SKEW = 1,
+    MAX_TIME = 10,
+    MAX_GEN = 4,
+    MAX_RV = 8,
+    MAX_DELETES = 0,
+    MAX_CLAIM_FAILURES = 0,
+    MAX_RESTORES = 0,
+    MAX_SUSPENDS = 0,
+    MAX_SHUTDOWNS = 0,
+    MAX_DROPS = 2,
+    MAX_FOREIGN_BUMPS = 2,
+    OBS_KEY_RV = false,
+    BLIND_HOLDER_BOUND = 8
+  ).*
+
+  /// The mid-band step plus the foreign mutator (same fault economy
+  /// as midBandStep — see leaderElectionDroppedWrite).
+  action foreignRvStep = any {
+    tickAny,
+    apiGetAny,
+    stealAny,
+    conflictAny,
+    selfFenceAny,
+    renewSendDroppedAny,
+    renewSendLostAny,
+    fetchObservesOwnCommitAny,
+    bumpRv,
+  }
 }
