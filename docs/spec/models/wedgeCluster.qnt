@@ -61,7 +61,12 @@
 //     depth 4 (suppression freezes marked; retained anchors mass-mark).
 //
 // Budgets: ≤3 nodes × 2 drvs × small clock — every check converges in
-// seconds at 2M/15; the main regime is TLC-exhaustive.
+// seconds at 2M/15; the main regime is TLC-exhaustive with the
+// episode ghosts FROZEN (TRACK_EPISODE_GHOSTS = false), and the latch
+// laws run TLC-exhaustively in wedgeClusterLatch with the ghosts live
+// at one-notch-shrunk bounds (the ghost tick-domain product does not
+// converge at the main bounds — measured >1.02B states at the 1800s
+// budget kill; see the parameter ladder at TRACK_EPISODE_GHOSTS).
 
 module wedgeCluster {
   // --- bounds & knobs ------------------------------------------------------
@@ -80,6 +85,20 @@ module wedgeCluster {
   // the trailing edge and sub-threshold participants' anchors pair
   // with any later blip.
   const ENABLE_EPISODE_LATCH: bool
+  // Parameter ladder (state-space control): the two episode ghosts
+  // (watermark, expiredSince) multiply the exhaustive space by the
+  // tick-domain product of every open expiry run — wiring them
+  // always-on into the production regime blew wedge-cluster-main from
+  // 206M generated / 1.19M distinct / ~6min to >1.02B generated /
+  // >11.3M distinct with a still-growing frontier at the 1800s budget
+  // kill (bughunt-3 S7 landing gate, status 124). The ghosts only
+  // carry information for the episode-latch laws, so they are gated
+  // behind this const: regimes that do not check the latch laws
+  // freeze them at their init values (zero state cost; the admission
+  // gate passes through, since every run-start > -1) and the latch
+  // laws run exhaustively in the dedicated wedgeClusterLatch regime
+  // below, at bounds where the ghost product converges.
+  const TRACK_EPISODE_GHOSTS: bool
 
   val NODES = Set("n0", "n1", "n2")
   val DRVS = Set("d0", "d1")
@@ -239,11 +258,14 @@ module wedgeCluster {
       of_: if (systemic) population else 0,
       wedged: if (skip) Set() else survivors,
       skip: skip, episodeAnchors: episodeAnchors,
-      // Ghost watermark: ALWAYS latched on a Systemic verdict (both
-      // regimes), so the invariant is non-vacuous in the twin; only
-      // the ADMISSION gate is behind ENABLE_EPISODE_LATCH.
-      watermark: if (systemic) now else watermark,
-      expiredSince: newExpiredSince,
+      // Ghost watermark: latched on a Systemic verdict wherever the
+      // ghosts are tracked, so the latch laws are non-vacuous in the
+      // twin; only the ADMISSION gate is behind ENABLE_EPISODE_LATCH,
+      // and both ghosts freeze at their init values (zero state cost)
+      // when TRACK_EPISODE_GHOSTS is off — see the parameter ladder
+      // at the const.
+      watermark: if (TRACK_EPISODE_GHOSTS) (if (systemic) now else watermark) else -1,
+      expiredSince: if (TRACK_EPISODE_GHOSTS) newExpiredSince else Map(),
     }
 
   action tick = {
@@ -366,14 +388,39 @@ module wedgeCluster {
 }
 
 // Production-shaped fixed regime: all repairs on. TLC-exhaustive at
-// these bounds.
+// these bounds with the episode ghosts FROZEN — the admission gate
+// passes through here, and noRemarkFromLatchedEpisode is checked in
+// wedgeClusterLatch instead (wiring the ghosts live at these bounds
+// blew past the 1800s budget at >1.02B generated states — bughunt-3
+// S7 landing-gate red; see the parameter ladder at
+// TRACK_EPISODE_GHOSTS).
 module wedgeClusterMain {
   import wedgeCluster(
     MAX_TIME = 5, WINDOW = 3, MIN_DISTINCT = 2,
     ENABLE_POPULATIONS = true,
     ENABLE_FULL_EPILOGUE = true,
     ENABLE_EPISODE_LATCH = true,
-    ENABLE_EVICTION = true
+    ENABLE_EVICTION = true,
+    TRACK_EPISODE_GHOSTS = false
+  ).*
+}
+
+// Episode-latch regime: the ghosts run LIVE (admission gating + the
+// noRemarkFromLatchedEpisode law) at bounds where the ghost
+// tick-domain product converges exhaustively — MAX_TIME/WINDOW shrink
+// one notch from the main regime. The latch scenarios (build evidence
+// → systemic episode → gated continuation → re-verdict) need 4 ticks
+// and a 2-tick window; the systemic-arm reachability witness below
+// guards these bounds against silent vacuation. Measured numbers live
+// at the quint-wedge-cluster-latch check comment in nix/quint.nix.
+module wedgeClusterLatch {
+  import wedgeCluster(
+    MAX_TIME = 4, WINDOW = 2, MIN_DISTINCT = 2,
+    ENABLE_POPULATIONS = true,
+    ENABLE_FULL_EPILOGUE = true,
+    ENABLE_EPISODE_LATCH = true,
+    ENABLE_EVICTION = true,
+    TRACK_EPISODE_GHOSTS = true
   ).*
 }
 
@@ -386,6 +433,7 @@ module wedgeClusterNoEviction {
     ENABLE_POPULATIONS = true,
     ENABLE_FULL_EPILOGUE = true,
     ENABLE_EPISODE_LATCH = true,
-    ENABLE_EVICTION = false
+    ENABLE_EVICTION = false,
+    TRACK_EPISODE_GHOSTS = false
   ).*
 }

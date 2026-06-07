@@ -34,6 +34,7 @@ module wedgeCalib009SplitPopulation {
     ENABLE_POPULATIONS = false,
     ENABLE_FULL_EPILOGUE = true,
     ENABLE_EVICTION = true,
-  ENABLE_EPISODE_LATCH = false
+  ENABLE_EPISODE_LATCH = false,
+    TRACK_EPISODE_GHOSTS = false
   ).* from "../wedgeCluster"
 }

@@ -6034,13 +6034,19 @@ rec {
     # ── wedgeCluster: the OA2 wedge-clustering verdict after the
     # bughunt-2 slot-5 rework (merged_bug_009 commensurable populations
     # + RPC-failure skip, merged_bug_176 sealed single-exit epilogue,
-    # the required eviction argument). The main regime is
-    # TLC-EXHAUSTIVE at these bounds (≤3 nodes × 2 drvs: 206,302,021
-    # states generated / 1,186,107 distinct / 0 on queue, ~5min, no
-    # violation) — the four laws hold over the FULL bounded space, not
-    # a sampled slice. Every law is paired with a falsify twin below
-    # (no vacuous-invariant debt; boundsOK is the standard
-    # bounds-only exemption).
+    # the required eviction argument) and the bughunt-3 S7 episode
+    # latch (merged_bug_163). The main regime is TLC-EXHAUSTIVE at
+    # these bounds with the episode ghosts FROZEN (≤3 nodes × 2 drvs:
+    # 165,381,913 states generated / 983,929 distinct / 0 on queue,
+    # ~5min at workers=auto, no violation) — the four round-2 laws
+    # hold over the FULL bounded space, not a sampled slice. The latch
+    # law (noRemarkFromLatchedEpisode) needs the ghosts LIVE, whose
+    # tick-domain product does NOT converge at these bounds (>1.02B
+    # generated, frontier still growing at the 1800s kill — the S7
+    # landing-gate red): it runs TLC-exhaustively in
+    # quint-wedge-cluster-latch below at one-notch-shrunk bounds. Every
+    # law is paired with a falsify twin below (no vacuous-invariant
+    # debt; boundsOK is the standard bounds-only exemption).
     # r[verify ctrl.nodeclaim.wedge-two-axis+3]
     quint-wedge-cluster-main = mkQuintCheck {
       name = "wedge-cluster-main";
@@ -6052,8 +6058,31 @@ rec {
         "noPerNodeFromSuppressedEvidence"
         "reapedImpliesEvicted"
         "markedIncrementsOnlyOnEdges"
+      ];
+    };
+
+    # The episode-latch regime: ghosts live (admission gating + the
+    # latch law) at MAX_TIME=4/WINDOW=2, where the ghost product
+    # converges: TLC-exhaustive 205,660,559 states generated /
+    # 3,807,560 distinct / depth 9 / 0 on queue, 5min57s at
+    # workers=auto — budget 1800s ≈ 5× measured. The
+    # latch-witness-systemic check below pins the systemic arm
+    # reachable at these shrunk bounds, so the latch law cannot go
+    # silently vacuous.
+    # r[verify ctrl.nodeclaim.wedge-two-axis+3]
+    quint-wedge-cluster-latch = mkQuintCheck {
+      name = "wedge-cluster-latch";
+      spec = "wedgeCluster";
+      main = "wedgeClusterLatch";
+      invariants = [
+        "boundsOK"
+        "affectedLeOf"
+        "noPerNodeFromSuppressedEvidence"
+        "reapedImpliesEvicted"
+        "markedIncrementsOnlyOnEdges"
         "noRemarkFromLatchedEpisode"
       ];
+      modelTimeoutSec = 1800;
     };
 
     # Falsify twin (live-import, calibration/): the as-built split
@@ -6097,8 +6126,9 @@ rec {
     # episode handling — wedged-only drain, no suppression watermark —
     # lets the trailing-edge laggard re-anchor from the SAME still-open
     # attempts and a sub-threshold participant's surviving anchor pair
-    # with a later blip (merged_bug_163; solo-verified [violation] in
-    # ~150ms at 50000x12).
+    # with a later blip (merged_bug_163; TLC first-violation at
+    # 1,203,834 generated / 46,017 distinct). Runs with
+    # TRACK_EPISODE_GHOSTS = true — the ghosts carry the violation.
     # r[verify ctrl.nodeclaim.wedge-two-axis+3]
     quint-wedge-cluster-calib-partial-drain = mkQuintWitnessCheck {
       name = "wedge-cluster-calib-partial-drain";
@@ -6126,6 +6156,17 @@ rec {
       name = "wedge-cluster-witness-systemic";
       spec = "wedgeCluster";
       main = "wedgeClusterMain";
+      witness = "systemicReachableW";
+    };
+    # Same witness on the latch regime's shrunk bounds: the systemic
+    # arm (and with it the latch law's guard) stays reachable at
+    # MAX_TIME=4/WINDOW=2 — the bounds-shrink cannot silently vacuate
+    # noRemarkFromLatchedEpisode ([violation] at 111,634 generated /
+    # 4,920 distinct).
+    quint-wedge-cluster-latch-witness-systemic = mkQuintWitnessCheck {
+      name = "wedge-cluster-latch-witness-systemic";
+      spec = "wedgeCluster";
+      main = "wedgeClusterLatch";
       witness = "systemicReachableW";
     };
     quint-wedge-cluster-witness-per-node = mkQuintWitnessCheck {

@@ -34,6 +34,7 @@ module wedgeCalib176EarlyReturn {
     ENABLE_EVICTION = true,
     // Pre-round-3 as-built: no episode latch either (the axis under
     // test here is the epilogue; the latch twin is wedge-163).
-    ENABLE_EPISODE_LATCH = false
+    ENABLE_EPISODE_LATCH = false,
+    TRACK_EPISODE_GHOSTS = false
   ).* from "../wedgeCluster"
 }

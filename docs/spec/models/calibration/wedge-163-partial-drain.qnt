@@ -29,6 +29,9 @@ module wedgeCalib163PartialDrain {
     ENABLE_POPULATIONS = true,
     ENABLE_FULL_EPILOGUE = true,
     ENABLE_EVICTION = true,
-    ENABLE_EPISODE_LATCH = false
+    ENABLE_EPISODE_LATCH = false,
+    // The latch twin needs the ghosts LIVE: watermark/expiredSince
+    // carry the violation (see TRACK_EPISODE_GHOSTS in the model).
+    TRACK_EPISODE_GHOSTS = true
   ).* from "../wedgeCluster"
 }
