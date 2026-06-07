@@ -231,28 +231,8 @@ async fn execute_job_inner(
     // (`SubstProgressFn` is `dyn Fn + 'static`, so the per-path
     // closures own Arc handles, cloned per path.)
     let progress = MonotoneProgress::new(on_progress);
-    // ── 1. Tenant re-resolution (AS-4, live-interest-first; PLURAL
-    //    per merged_bug_028 / owner Q2: any interested tenant's
-    //    upstreams may serve, the job fails only when none can) ──────
-    let tenants = match resolve_tenants(ctx, claimed).await {
-        Ok(t) if t.is_empty() => {
-            // The AS-4 posture: no resolvable tenant context is an
-            // infrastructure condition (upstream selection is
-            // impossible), NEVER an Unobtainable verdict and never a
-            // silent skip.
-            return infra_failure(format!(
-                "no-tenant-context: no live interested build carries a tenant \
-                 for {} (recorded hint: {:?})",
-                claimed.drv_hash, claimed.tenant_hint
-            ));
-        }
-        Ok(t) => t,
-        Err(e) => {
-            return infra_failure(format!("tenant resolution query failed: {e}"));
-        }
-    };
 
-    // ── 2–4. Walk loop with final-verification re-read ───────────────
+    // ── 1–4. Walk loop with final-verification re-read ───────────────
     // bug_115: the per-job trusted-set memo for the local-visibility
     // probe (two PG queries per tenant, amortized across the walk).
     let mut trust_cache = TrustedSetCache::default();
@@ -282,6 +262,35 @@ async fn execute_job_inner(
     let mut first_iteration = true;
 
     loop {
+        // bug_041: ONE freshness authority per iteration — the tenant
+        // set and the wanted set are re-read TOGETHER from the same
+        // live-interest relation (AS-4, live-interest-first; PLURAL
+        // per merged_bug_028 / owner Q2: any interested tenant's
+        // upstreams may serve, the job fails only when none can).
+        // Pre-fix the tenants were snapshotted once before the loop,
+        // so seeds arriving from a mid-walk interest shift were
+        // probed under the DEPARTED tenant set and compiled to
+        // Unobtainable without the live tenant's upstreams ever being
+        // consulted — two views of one live relation at different
+        // ages.
+        let tenants = match resolve_tenants(ctx, claimed).await {
+            Ok(t) if t.is_empty() => {
+                // The AS-4 posture: no resolvable tenant context is an
+                // infrastructure condition (upstream selection is
+                // impossible), NEVER an Unobtainable verdict and never
+                // a silent skip. Mid-walk this is interest vanishing
+                // entirely — the scheduler re-arms.
+                return infra_failure(format!(
+                    "no-tenant-context: no live interested build carries a tenant \
+                     for {} (recorded hint: {:?})",
+                    claimed.drv_hash, claimed.tenant_hint
+                ));
+            }
+            Ok(t) => t,
+            Err(e) => {
+                return infra_failure(format!("tenant resolution query failed: {e}"));
+            }
+        };
         // The live wanted read: first iteration = the at-claim read;
         // subsequent iterations = the final verification passes
         // (design §2.2 item 3: never snapshot at creation).
@@ -1123,6 +1132,97 @@ mod tests {
         }
     }
 
+    /// bug_041: a multi-path upstream whose NAR route GATES — the first
+    /// NAR request signals `hit_tx` and then waits for `release` —
+    /// so a test can deterministically mutate live interest WHILE the
+    /// walk is mid-fetch (the seam between iteration 1's ingest and
+    /// iteration 2's wanted re-read).
+    async fn spawn_gated_upstream(
+        paths: Vec<(String, Vec<u8>, Vec<String>)>,
+        key_name: &str,
+    ) -> (
+        FakeUpstream,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        use axum::{Router, routing::get};
+        use base64::Engine;
+        use sha2::Digest;
+
+        let seed = [0x43u8; 32];
+        let signer = Signer::from_seed(key_name, &seed);
+        let pubkey = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
+        let trusted_key = format!(
+            "{key_name}:{}",
+            base64::engine::general_purpose::STANDARD.encode(pubkey.as_bytes())
+        );
+        let (hit_tx, hit_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+
+        let mut app = Router::new().route(
+            "/nix-cache-info",
+            get(|| async { "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n" }),
+        );
+        for (path, nar, refs) in paths {
+            let nar_hash: [u8; 32] = sha2::Sha256::digest(&nar).into();
+            let nar_hash_str = format!(
+                "sha256:{}",
+                rio_nix::store_path::nixbase32::encode(&nar_hash)
+            );
+            let fp = fingerprint(&path, &nar_hash, nar.len() as u64, &refs);
+            let sig = signer.sign(&fp);
+            let sp = StorePath::parse(&path).unwrap();
+            let hash_part = sp.hash_part();
+            let ref_basenames: Vec<&str> = refs
+                .iter()
+                .map(|r| r.strip_prefix("/nix/store/").unwrap_or(r))
+                .collect();
+            let narinfo = format!(
+                "StorePath: {path}\n\
+                 URL: nar/{hash_part}.nar\n\
+                 Compression: none\n\
+                 NarHash: {nar_hash_str}\n\
+                 NarSize: {}\n\
+                 References: {}\n\
+                 Sig: {sig}\n",
+                nar.len(),
+                ref_basenames.join(" ")
+            );
+            let tx = hit_tx.clone();
+            let rel = std::sync::Arc::clone(&release);
+            app = app
+                .route(
+                    &format!("/{hash_part}.narinfo"),
+                    get(move || async move { narinfo }),
+                )
+                .route(
+                    &format!("/nar/{hash_part}.nar"),
+                    get(move || async move {
+                        let _ = tx.send(());
+                        rel.notified().await;
+                        nar
+                    }),
+                );
+        }
+
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (
+            FakeUpstream {
+                url: format!("http://{addr}"),
+                trusted_key,
+                _task: task,
+            },
+            hit_rx,
+            release,
+        )
+    }
+
     /// merged_bug_016: a multi-path upstream with a kill switch — once
     /// `gone` is set, EVERY route answers 404 (the upstream evicted
     /// the path between the dispatch-time HEAD probe and the
@@ -1716,6 +1816,113 @@ mod tests {
             1,
             "the wanted path was fetched under the live tenant"
         );
+    }
+
+    // r[verify store.materialize.executor+5]
+    /// bug_041 red: the walk re-reads live wanted EVERY iteration but
+    /// pre-fix snapshotted the tenant set ONCE — seeds arriving from a
+    /// mid-walk interest shift were probed under the DEPARTED tenant
+    /// set, and with the old tenant's upstreams unable to serve them
+    /// the path compiled to Unobtainable without the actually-live
+    /// tenant's upstreams ever being consulted (violating owner-Q2:
+    /// "the job fails only when NO interested tenant can obtain").
+    ///
+    /// Choreography: tenant A's gated upstream serves P and BLOCKS the
+    /// NAR fetch; while blocked, A's build goes terminal and tenant
+    /// B's build arrives wanting {P, Q}; the gate releases; iteration
+    /// 2's wanted re-read finds the new seed Q — which only B's
+    /// upstream serves.
+    #[tokio::test]
+    async fn mid_walk_interest_shift_probes_under_live_tenants() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant_a = seed_tenant(&db.pool, "mat-shift-a").await;
+        let tenant_b = seed_tenant(&db.pool, "mat-shift-b").await;
+
+        let path_p = store_path(11, "mat-shift-p");
+        let path_q = store_path(12, "mat-shift-q");
+        let (nar_p, _) = rio_test_support::fixtures::make_nar(b"shift contents p");
+        let (nar_q, _) = rio_test_support::fixtures::make_nar(b"shift contents q");
+
+        // Tenant A: gated upstream serving ONLY P.
+        let (up_a, mut hit_rx, release) =
+            spawn_gated_upstream(vec![(path_p.clone(), nar_p, vec![])], "cache.shift-a").await;
+        wire_upstream(&db.pool, tenant_a, &up_a).await;
+        // Tenant B: serves ONLY Q (the post-shift seed).
+        let up_b =
+            spawn_multi_upstream(vec![(path_q.clone(), nar_q, vec![])], "cache.shift-b").await;
+        wire_upstream(&db.pool, tenant_b, &up_b).await;
+
+        // Build A wants only "out" (P). The drv declares out=P, doc=Q.
+        let seeded = seed_job(
+            &db.pool,
+            "mat-shift-drv",
+            &[("out", path_p.as_str()), ("doc", path_q.as_str())],
+            Some(tenant_a),
+            Some(tenant_a),
+            &["out"],
+        )
+        .await;
+
+        let ctx = make_ctx(db.pool.clone());
+        let claimed = seeded.claimed.clone();
+        let walk = tokio::spawn(async move { execute_job(&ctx, &claimed).await });
+
+        // Deterministic seam: the walk is INSIDE iteration 1's NAR
+        // fetch of P when the gate reports the hit.
+        tokio::time::timeout(std::time::Duration::from_secs(30), hit_rx.recv())
+            .await
+            .expect("the walk reached tenant A's gated NAR fetch")
+            .expect("gate signal");
+
+        // The shift: A's build terminal; B's build live, wanting BOTH
+        // outputs ({} = all declared).
+        sqlx::query("UPDATE builds SET status = 'succeeded' WHERE build_id = $1")
+            .bind(seeded.build_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let build_b = Uuid::new_v4();
+        sqlx::query("INSERT INTO builds (build_id, tenant_id, status) VALUES ($1, $2, 'active')")
+            .bind(build_b)
+            .bind(tenant_b)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO build_derivations (build_id, derivation_id) VALUES ($1, $2)")
+            .bind(build_b)
+            .bind(seeded.derivation_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO build_wanted_outputs (build_id, derivation_id, wanted_output_names) \
+             VALUES ($1, $2, '{}')",
+        )
+        .bind(build_b)
+        .bind(seeded.derivation_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        release.notify_waiters();
+        let outcome = walk.await.unwrap();
+
+        let success = outcome_success(&outcome).unwrap_or_else(|| {
+            panic!(
+                "expected Success — iteration 2's new seed must be probed \
+                 under the LIVE tenant set (B serves Q), got {outcome:?}"
+            )
+        });
+        let mut got: Vec<String> = success
+            .ingested_paths
+            .iter()
+            .chain(success.verified_paths.iter())
+            .cloned()
+            .collect();
+        got.sort();
+        let mut want = vec![path_p.clone(), path_q.clone()];
+        want.sort();
+        assert_eq!(got, want, "both P (under A) and Q (under B) covered");
     }
 
     // r[verify sched.merge.stale-substitutable+3]
