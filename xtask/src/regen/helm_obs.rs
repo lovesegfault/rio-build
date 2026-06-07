@@ -49,7 +49,11 @@ pub async fn run() -> Result<()> {
         // and the rewrite recurses into nested `panels` arrays
         // (collapsed Grafana rows nest their children) — a marker the
         // walk cannot reach is a hard error, not a silent skip.
-        let markers = count_rio_metric_markers(&v);
+        // merged_bug_056: the count reads through rio_metric_marker,
+        // so a present-but-non-string marker errors HERE instead of
+        // being counted-but-unrewritable.
+        let markers = count_rio_metric_markers(&v)
+            .with_context(|| format!("marker census in {}", p.display()))?;
         let mut changed = false;
         let mut visited = 0usize;
         if let Some(panels) = v.get_mut("panels").and_then(Value::as_array_mut) {
@@ -78,6 +82,23 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
+/// THE marker-extraction predicate (merged_bug_056): `Ok(None)` when
+/// the key is absent, `Ok(Some(name))` for a string marker, and a hard
+/// error for a present-but-non-string value. Census, walk, and rewrite
+/// all read markers through THIS function, so the three sites cannot
+/// disagree on what a marker is — pre-fix the census counted by key
+/// presence and the walk by `get().is_some()` while the rewrite
+/// silently `Ok(false)`-skipped non-string values, re-opening the
+/// silent description-rot lane one axis over (value type instead of
+/// reachability).
+fn rio_metric_marker(obj: &Value) -> Result<Option<&str>> {
+    match obj.get("rioMetric") {
+        None => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s)),
+        Some(other) => bail!("rioMetric marker must be a string metric name, got: {other}"),
+    }
+}
+
 /// Recurse one panel AND its nested `panels` array (collapsed rows),
 /// applying the marker rewrite to every level (merged_bug_098 — the
 /// old walk was top-level only, so markers inside collapsed rows were
@@ -88,7 +109,7 @@ fn rewrite_panel_tree(
     visited: &mut usize,
 ) -> Result<bool> {
     let mut changed = rewrite_panel_description(panel, help)?;
-    if panel.get("rioMetric").is_some() {
+    if rio_metric_marker(panel)?.is_some() {
         *visited += 1;
     }
     if let Some(children) = panel.get_mut("panels").and_then(Value::as_array_mut) {
@@ -102,16 +123,28 @@ fn rewrite_panel_tree(
 }
 
 /// Count every `rioMetric` key anywhere in the document tree — the
-/// census the walk is asserted against.
-fn count_rio_metric_markers(v: &Value) -> usize {
-    match v {
+/// census the walk is asserted against. Reads through
+/// [`rio_metric_marker`], so a non-string marker is a hard error here
+/// too, never a count the rewrite cannot act on.
+fn count_rio_metric_markers(v: &Value) -> Result<usize> {
+    Ok(match v {
         Value::Object(m) => {
-            let own = usize::from(m.contains_key("rioMetric"));
-            own + m.values().map(count_rio_metric_markers).sum::<usize>()
+            let own = usize::from(rio_metric_marker(v)?.is_some());
+            own + m
+                .values()
+                .map(count_rio_metric_markers)
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .sum::<usize>()
         }
-        Value::Array(a) => a.iter().map(count_rio_metric_markers).sum(),
+        Value::Array(a) => a
+            .iter()
+            .map(count_rio_metric_markers)
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .sum(),
         _ => 0,
-    }
+    })
 }
 
 /// Apply the marker-keyed description rewrite to one panel. Returns
@@ -120,11 +153,7 @@ fn rewrite_panel_description(
     panel: &mut Value,
     help: &std::collections::BTreeMap<String, String>,
 ) -> Result<bool> {
-    let Some(name) = panel
-        .get("rioMetric")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-    else {
+    let Some(name) = rio_metric_marker(panel)?.map(str::to_owned) else {
         return Ok(false);
     };
     let Some(h) = help.get(&name) else {
@@ -196,10 +225,27 @@ mod tests {
         assert_eq!(row["panels"][0]["description"], "Canonical help.");
 
         let doc = json!({"panels": [row]});
-        assert_eq!(count_rio_metric_markers(&doc), 1);
+        assert_eq!(count_rio_metric_markers(&doc).unwrap(), 1);
         // A marker the panel walk cannot reach (outside panels[]) is
         // visible to the census — the caller's ensure! catches it.
         let stray = json!({"templating": {"rioMetric": "rio_x_y"}, "panels": []});
-        assert_eq!(count_rio_metric_markers(&stray), 1);
+        assert_eq!(count_rio_metric_markers(&stray).unwrap(), 1);
+    }
+
+    /// merged_bug_056 red: a present-but-non-string marker is a hard
+    /// error at EVERY reader — census, walk, and rewrite — never a
+    /// counted-but-silently-skipped panel (pre-fix the rewrite
+    /// returned Ok(false) for it while census and walk both counted
+    /// it, so the visited==markers gate passed with no rewrite and no
+    /// error).
+    #[test]
+    fn non_string_marker_is_a_hard_error_everywhere() {
+        let help = std::collections::BTreeMap::from([("rio_x_y".to_owned(), "H.".to_owned())]);
+        let mut bad = json!({"rioMetric": 42, "description": "stale"});
+        assert!(rewrite_panel_description(&mut bad, &help).is_err());
+        let mut visited = 0;
+        assert!(rewrite_panel_tree(&mut bad, &help, &mut visited).is_err());
+        let doc = json!({"panels": [{"rioMetric": 42}]});
+        assert!(count_rio_metric_markers(&doc).is_err());
     }
 }
