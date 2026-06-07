@@ -14,10 +14,7 @@ use std::collections::HashSet;
 use tonic::Status;
 use tracing::{debug, warn};
 
-use rio_evidence_kernel::visibility::{VisibilityVerdict, visibility_verdict};
 use rio_proto::validated::ValidatedPathInfo;
-
-use rio_common::grpc::StatusExt;
 
 #[cfg(test)]
 use crate::metadata::{self};
@@ -156,137 +153,24 @@ impl StoreServiceImpl {
         tenant_id: Option<uuid::Uuid>,
         present: &[String],
     ) -> Result<VisibleSet, Status> {
-        // Anonymous → unfiltered (r[store.tenant.narinfo-filter]).
-        if tenant_id.is_none() || present.is_empty() {
-            return Ok(VisibleSet {
-                set: present.iter().cloned().collect(),
-            });
-        }
-        let tid = tenant_id.unwrap();
-
-        // I-217: per-path (owned, any_built) in one round-trip. Pre-fix
-        // this was "any path with ≥1 row → visible to ALL", leaking
-        // every tenant's outputs. Now: owned → visible; any_built &&
-        // !owned → hidden; neither → sig-verify.
-        use sha2::{Digest, Sha256};
-        let hashes: Vec<Vec<u8>> = present
-            .iter()
-            .map(|p| Sha256::digest(p.as_bytes()).to_vec())
-            .collect();
-        #[derive(sqlx::FromRow)]
-        struct OwnBuilt {
-            h: Vec<u8>,
-            owned: bool,
-        }
-        let rows: Vec<OwnBuilt> = sqlx::query_as(
-            "SELECT pt.store_path_hash AS h, \
-                    bool_or(pt.tenant_id = $2) AS owned \
-             FROM path_tenants pt \
-             JOIN UNNEST($1::bytea[]) AS k(h) ON pt.store_path_hash = k.h \
-             GROUP BY pt.store_path_hash",
-        )
-        .bind(&hashes)
-        .bind(tid)
-        .fetch_all(&self.pool)
-        .await
-        .status_internal("sig_visibility_gate_batch: path_tenants")?;
-        let owned_hashes: HashSet<Vec<u8>> = rows
-            .iter()
-            .filter(|r| r.owned)
-            .map(|r| r.h.clone())
-            .collect();
-        let built_not_owned: HashSet<Vec<u8>> =
-            rows.into_iter().filter(|r| !r.owned).map(|r| r.h).collect();
-
-        let mut visible: HashSet<String> = HashSet::with_capacity(present.len());
-        let mut subst_only: Vec<String> = Vec::new();
-        for (p, h) in present.iter().zip(&hashes) {
-            // r[impl gw.jwt.anon-drv-lookup]
-            // .drv files are build inputs, not tenant-owned outputs —
-            // exempt per the same policy as the single-path gate above
-            // (mirrors gateway-side `jwt_unless_drv`). Without this,
-            // `wopQueryValidPaths` reports a .drv missing while
-            // `wopIsValidPath` reports it valid for the same path/JWT.
-            let owned = owned_hashes.contains(h);
-            let any_built = owned || built_not_owned.contains(h);
-            if p.ends_with(".drv") {
-                visible.insert(p.clone());
-            } else if !owned && !any_built {
-                // Substitution-only: the signature cell is needed —
-                // deferred to the batched narinfo fetch below.
-                subst_only.push(p.clone());
-            } else {
-                // bug_115: the verdict comes from the kernel's I-217
-                // table (sig_trusted=false is sound here — K4 proves
-                // the verdict ignores it once owned || any_built).
-                match visibility_verdict(owned, any_built, false) {
-                    VisibilityVerdict::Visible => {
-                        visible.insert(p.clone());
-                    }
-                    VisibilityVerdict::Hidden => {}
-                }
-            }
-        }
-        if subst_only.is_empty() {
-            return Ok(VisibleSet { set: visible });
-        }
-
-        // Substitution-only subset: fetch (path, signatures, nar_hash,
-        // nar_size, references) in one round-trip and verify each
-        // against the same trusted set as the single-path gate.
+        // bug_061: the body lives in `crate::visibility::visible_subset`
+        // — the SAME projection / `.drv` exemption / signature cell /
+        // malformed-row disposition as the single-path body, so the two
+        // deciders cannot drift (`r[store.visibility.one-body]`; the
+        // pre-fix open-coded copy here silently HID malformed rows the
+        // single-path read errors on). This method is the gRPC-side
+        // adapter: Status mapping + the VisibleSet mint.
         let mut cache = crate::visibility::TrustedSetCache::default();
-        let trusted =
-            crate::visibility::trusted_set(&self.pool, self.signer.as_deref(), tid, &mut cache)
-                .await
-                .map_err(|e| metadata_status("sig_visibility_gate_batch: trusted set", e))?;
-        if trusted.is_empty() {
-            // Tenant trusts nothing → all substitution-only paths hidden.
-            return Ok(VisibleSet { set: visible });
-        }
-
-        // narinfo carries everything fingerprint() needs. One ANY()
-        // round-trip; paths absent from narinfo (race) are hidden
-        // (same as the single-path gate's NotFound).
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            store_path: String,
-            nar_hash: Vec<u8>,
-            nar_size: i64,
-            references: Vec<String>,
-            signatures: Vec<String>,
-        }
-        let rows: Vec<Row> = sqlx::query_as(
-            "SELECT store_path, nar_hash, nar_size, \"references\", signatures \
-             FROM narinfo WHERE store_path = ANY($1)",
+        let set = crate::visibility::visible_subset(
+            &self.pool,
+            self.signer.as_deref(),
+            tenant_id,
+            present,
+            &mut cache,
         )
-        .bind(&subst_only)
-        .fetch_all(&self.pool)
         .await
-        .status_internal("sig_visibility_gate_batch: narinfo")?;
-
-        for r in rows {
-            let Ok(nar_hash): Result<[u8; 32], _> = r.nar_hash.as_slice().try_into() else {
-                // Malformed row — hide (defensive; query_path_info would
-                // MalformedRow on it).
-                continue;
-            };
-            let fp = rio_nix::narinfo::fingerprint(
-                &r.store_path,
-                &nar_hash,
-                r.nar_size as u64,
-                &r.references,
-            );
-            // bug_115: same kernel table, substitution-only cell.
-            let sig_trusted =
-                crate::signing::any_sig_trusted(&r.signatures, &trusted, &fp).is_some();
-            match visibility_verdict(false, false, sig_trusted) {
-                VisibilityVerdict::Visible => {
-                    visible.insert(r.store_path);
-                }
-                VisibilityVerdict::Hidden => {}
-            }
-        }
-        Ok(VisibleSet { set: visible })
+        .map_err(|e| metadata_status("sig_visibility_gate_batch", e))?;
+        Ok(VisibleSet { set })
     }
 
     /// Sync signing given a pre-resolved `Signer`. No DB hit.
@@ -937,7 +821,84 @@ mod tests {
         );
     }
 
+    // r[verify store.visibility.one-body]
+    /// bug_061: ONE malformed-row disposition. A narinfo row whose
+    /// nar_hash is not 32 bytes fails the single-path read with
+    /// `MetadataError::MalformedRow` (→ Internal at the RPC), so the
+    /// batch gate must surface the SAME row as an error — not silently
+    /// hide it (pre-fix: `continue` → the path was reported "missing",
+    /// so the same corrupt row answered Internal on one RPC and
+    /// "missing" on the other, and the corruption signal was laundered
+    /// into re-substitution churn).
+    #[tokio::test]
+    async fn malformed_row_same_disposition_single_and_batch() {
+        use crate::test_helpers::seed_tenant;
+        use rio_test_support::TestDb;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let sub = Arc::new(Substituter::new(db.pool.clone(), None));
+        let svc = StoreServiceImpl::new(db.pool.clone()).with_substituter(sub);
+
+        let tid = seed_tenant(&db.pool, "malformed-row").await;
+        // Tenant trusts SOME key so the substitution-only subset
+        // reaches the sig cell (a tenant with an empty trusted set
+        // short-circuits to hidden before reading narinfo).
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            "https://cache.example",
+            50,
+            &["key-X:aaaa".into()],
+            crate::metadata::SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        // Seed a complete substitution-only path, then corrupt its
+        // nar_hash to a wrong-length value (row-level corruption — PG
+        // has no CHECK constraint on the column).
+        let path = test_store_path("malformed-row-p");
+        let (nar, nar_hash) = rio_test_support::fixtures::make_nar(b"mal");
+        let info = make_path_info(&path, &nar, nar_hash);
+        let path_hash = info.store_path.sha256_digest();
+        let claim = metadata::insert_manifest_uploading(&db.pool, &path_hash, &path, &[])
+            .await
+            .unwrap()
+            .unwrap();
+        let mut stored = info.clone();
+        stored.store_path_hash = path_hash.to_vec();
+        stored.signatures = vec!["key-X:bogus".into()];
+        metadata::complete_manifest_inline(&db.pool, &stored, claim, nar.into())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE narinfo SET nar_hash = $1 WHERE store_path = $2")
+            .bind(&[0u8, 1, 2][..])
+            .bind(&path)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Single-path disposition: the read errors (MalformedRow).
+        let single = metadata::query_path_info(&db.pool, &path).await;
+        assert!(
+            matches!(single, Err(crate::error::MetadataError::MalformedRow(_))),
+            "single-path read must error MalformedRow on the corrupt row, got {single:?}"
+        );
+
+        // THE law: the batch gate surfaces the SAME row as an error.
+        // Pre-fix it returned Ok with the path hidden.
+        let batch = svc
+            .sig_visibility_gate_batch(Some(tid), std::slice::from_ref(&path))
+            .await;
+        assert!(
+            batch.is_err(),
+            "batch gate must surface the malformed row as an error \
+             (one disposition with the single-path read); got Ok(hidden)"
+        );
+    }
+
     // r[verify store.substitute.find-missing-gated]
+    // r[verify store.visibility.one-body]
     /// Batch gate result must equal N× single-path gate. Same fixture
     /// as `sig_visibility_gate_cross_tenant`.
     #[tokio::test]

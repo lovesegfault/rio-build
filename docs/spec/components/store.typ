@@ -894,6 +894,22 @@ content-addressed output mappings independently of narinfo signatures.
   construction).
 ]
 
+#r("store.visibility.one-body")[
+  Every tenant-visibility decision — the single-path read gates and the
+  `FindMissingPaths` batch gate — MUST evaluate through the one
+  `crate::visibility` body: one `(owned, any_built)` projection, one `.drv`
+  exemption test, one signature cell, and ONE malformed-row disposition (a
+  narinfo row that fails DB-egress validation surfaces as an error on every
+  entrypoint, never as "hidden"). A second open-coded evaluation of the
+  visibility policy outside that body is a defect even when its verdicts
+  currently agree.
+]
+
+The disposition clause is the load-bearing half: a corrupt row that is
+silently hidden answers "missing" on the batch RPC while the single-path RPC
+answers Internal for the same row — corruption laundered into
+re-substitution churn instead of an operator signal.
+
 #r("store.substitute.probe-bounded+4")[
   `check_available` (the HEAD-only probe feeding
   `FindMissingPathsResponse.substitutable_paths`) MUST bound its upstream load.

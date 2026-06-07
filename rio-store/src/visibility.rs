@@ -1,10 +1,16 @@
 //! Tenant sig-visibility: the ONE body behind every visibility decision
-//! (bug_115).
+//! (bug_115; batch entrypoint unified by bug_061 —
+//! `r[store.visibility.one-body]`).
 //!
 //! Factored out of `grpc/sign.rs::sig_visibility_gate` so the
 //! materialization walk's local-presence probe and the gRPC read gates
-//! decide visibility through the SAME code path. The verdict itself —
-//! the I-217 table over `(owned, any_built, sig_trusted)` — lives in
+//! — single-path AND batch (`FindMissingPaths`) — decide visibility
+//! through the SAME code path: one `(owned, any_built)` projection
+//! ([`own_built_projection`]), one `.drv` exemption ([`drv_exempt`]),
+//! one signature cell ([`sig_cell`]), one malformed-row disposition
+//! (DB-egress validation errors propagate on every entrypoint). The
+//! verdict itself — the I-217 table over
+//! `(owned, any_built, sig_trusted)` — lives in
 //! [`rio_evidence_kernel::visibility::visibility_verdict`] (kani-swept,
 //! K4); this module owns the PG/projection work that feeds it and the
 //! [`TenantVisible`] witness that proves a caller consulted it.
@@ -28,7 +34,7 @@
 //! Both short-circuit BEFORE the kernel table — they are policy about
 //! whether visibility applies, not visibility cells.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use rio_evidence_kernel::visibility::{VisibilityVerdict, visibility_verdict};
@@ -38,6 +44,76 @@ use uuid::Uuid;
 use crate::error::MetadataError;
 use crate::metadata;
 use crate::signing::TenantSigner;
+
+/// The `.drv` exemption test shared by BOTH visibility entrypoints:
+/// parsed [`rio_nix::store_path::StorePath::is_derivation`] semantics
+/// (the name component ends in `.drv`). An unparseable request string
+/// is NOT exempt — it cannot name a derivation the store knows, and it
+/// can never correspond to a complete narinfo row (paths are validated
+/// at ingest). Pre-bug_061 the batch gate tested the RAW string's
+/// suffix while the single-path gate tested the parsed name; for every
+/// path that can actually be locally present the two agree, but the
+/// policy now exists exactly once.
+pub(crate) fn drv_exempt(path: &str) -> bool {
+    rio_nix::store_path::StorePath::parse(path)
+        .map(|sp| sp.is_derivation())
+        .unwrap_or(false)
+}
+
+/// The ONE `(owned, any_built)` projection both visibility entrypoints
+/// read (bug_061): per input hash — does `tid` own it, and has ANY
+/// tenant built it. A hash with zero `path_tenants` rows
+/// (substitution-only, or the fresh-PutPath window) is absent from the
+/// returned map.
+async fn own_built_projection(
+    pool: &sqlx::PgPool,
+    tid: Uuid,
+    hashes: &[Vec<u8>],
+) -> Result<HashMap<Vec<u8>, (bool, bool)>, sqlx::Error> {
+    if hashes.is_empty() {
+        return Ok(HashMap::new());
+    }
+    #[derive(sqlx::FromRow)]
+    struct OwnBuilt {
+        h: Vec<u8>,
+        owned: bool,
+    }
+    let rows: Vec<OwnBuilt> = sqlx::query_as(
+        "SELECT pt.store_path_hash AS h, \
+                bool_or(pt.tenant_id = $2) AS owned \
+         FROM path_tenants pt \
+         JOIN UNNEST($1::bytea[]) AS k(h) ON pt.store_path_hash = k.h \
+         GROUP BY pt.store_path_hash",
+    )
+    .bind(hashes)
+    .bind(tid)
+    .fetch_all(pool)
+    .await?;
+    // A returned group has ≥1 row by construction → any_built = true.
+    Ok(rows.into_iter().map(|r| (r.h, (r.owned, true))).collect())
+}
+
+/// The ONE signature cell both visibility entrypoints evaluate for a
+/// substitution-only row (bug_061): does any stored signature verify
+/// against `trusted` over the row's fingerprint. An empty trusted set
+/// is `false` (tenant trusts no keys → any substituted path is
+/// invisible).
+fn sig_cell(info: &ValidatedPathInfo, trusted: &[String]) -> bool {
+    if trusted.is_empty() {
+        return false;
+    }
+    let fp = rio_nix::narinfo::fingerprint(
+        info.store_path.as_str(),
+        &info.nar_hash,
+        info.nar_size,
+        &info
+            .references
+            .iter()
+            .map(|r| r.to_string())
+            .collect::<Vec<_>>(),
+    );
+    crate::signing::any_sig_trusted(&info.signatures, trusted, &fp).is_some()
+}
 
 /// Witness: this path passed the tenant sig-visibility verdict for one
 /// interested tenant. Sole mint: [`visible_to_tenant`]'s Visible arm.
@@ -122,46 +198,20 @@ pub(crate) async fn visible_to_tenant(
         return Ok(Some(TenantVisible(())));
     }
 
-    let path_hash = info.store_path.sha256_digest();
-
-    // Two facts in one round-trip: does this tenant own it, and has
-    // ANY tenant ever built it? (`path_tenants` is populated at
-    // build-completion by the scheduler; the Substituter does not
-    // populate it — zero rows ⇒ substitution-only or the fresh-PutPath
-    // window.)
-    let (owned, any_built): (bool, bool) = sqlx::query_as(
-        "SELECT \
-           bool_or(tenant_id = $2), \
-           count(*) > 0 \
-         FROM path_tenants WHERE store_path_hash = $1",
-    )
-    .bind(path_hash.as_slice())
-    .bind(tid)
-    .fetch_one(pool)
-    .await
-    .map(|(o, a): (Option<bool>, bool)| (o.unwrap_or(false), a))?;
+    // The shared projection (bug_061: the SAME query the batch
+    // entrypoint runs — `path_tenants` is populated at build-completion
+    // by the scheduler; the Substituter does not populate it — zero
+    // rows ⇒ substitution-only or the fresh-PutPath window).
+    let hashes = vec![info.store_path.sha256_digest().to_vec()];
+    let own_built = own_built_projection(pool, tid, &hashes).await?;
+    let (owned, any_built) = own_built.get(&hashes[0]).copied().unwrap_or((false, false));
 
     // Lazy signature cell: only substitution-only rows need it (K4
-    // proves the verdict ignores it otherwise).
+    // proves the verdict ignores it otherwise). The cell itself is the
+    // shared [`sig_cell`] — empty trusted set ⇒ false.
     let sig_trusted = if !owned && !any_built {
         let trusted = trusted_set(pool, signer, tid, cache).await?;
-        if trusted.is_empty() {
-            // Tenant trusts no keys AND no signer configured → any
-            // substituted path is invisible.
-            false
-        } else {
-            let fp = rio_nix::narinfo::fingerprint(
-                info.store_path.as_str(),
-                &info.nar_hash,
-                info.nar_size,
-                &info
-                    .references
-                    .iter()
-                    .map(|r| r.to_string())
-                    .collect::<Vec<_>>(),
-            );
-            crate::signing::any_sig_trusted(&info.signatures, &trusted, &fp).is_some()
-        }
+        sig_cell(info, &trusted)
     } else {
         false
     };
@@ -170,4 +220,102 @@ pub(crate) async fn visible_to_tenant(
         VisibilityVerdict::Visible => Some(TenantVisible(())),
         VisibilityVerdict::Hidden => None,
     })
+}
+
+/// Batch entrypoint of the ONE visibility body (bug_061): given the
+/// locally-present subset of a `FindMissingPaths` request, return the
+/// subset visible to `tenant_id`. Anonymous (`None`) is unfiltered
+/// (`r[store.tenant.narinfo-filter]`); `.drv` paths are exempt
+/// ([`drv_exempt`] — same policy as the single-path body); built
+/// paths take the kernel verdict over the shared
+/// [`own_built_projection`]; substitution-only paths evaluate the
+/// shared [`sig_cell`] over rows fetched through
+/// [`metadata::query_path_info_batch`] — which validates rows at DB
+/// egress, so a malformed row surfaces as
+/// [`MetadataError::MalformedRow`] on this path EXACTLY as it does on
+/// the single-path read (ONE disposition; the pre-fix batch silently
+/// hid the row, answering "missing" where the single-path RPC answered
+/// Internal). Rows with no complete manifest are hidden — the
+/// single-path flow's callers hit NotFound at `query_path_info` before
+/// the gate runs, so the entrypoints agree there too.
+///
+/// ≤3 PG round-trips regardless of `present.len()` (one projection
+/// GROUP BY, one batched narinfo fetch, trusted set via
+/// [`trusted_set`]'s two queries) — the I-110 batching contract.
+// r[impl store.visibility.one-body]
+// r[impl store.substitute.tenant-sig-visibility+2]
+pub(crate) async fn visible_subset(
+    pool: &sqlx::PgPool,
+    signer: Option<&TenantSigner>,
+    tenant_id: Option<Uuid>,
+    present: &[String],
+    cache: &mut TrustedSetCache,
+) -> Result<HashSet<String>, MetadataError> {
+    let Some(tid) = tenant_id else {
+        // Anonymous → unfiltered (r[store.tenant.narinfo-filter]).
+        return Ok(present.iter().cloned().collect());
+    };
+    if present.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    use sha2::Digest;
+    let hashes: Vec<Vec<u8>> = present
+        .iter()
+        .map(|p| sha2::Sha256::digest(p.as_bytes()).to_vec())
+        .collect();
+    let own_built = own_built_projection(pool, tid, &hashes).await?;
+
+    let mut visible: HashSet<String> = HashSet::with_capacity(present.len());
+    let mut subst_only: Vec<String> = Vec::new();
+    for (p, h) in present.iter().zip(&hashes) {
+        // r[impl gw.jwt.anon-drv-lookup]
+        // .drv files are build inputs, not tenant-owned outputs —
+        // exempt per the same (now shared) policy as the single-path
+        // body. Without this, `wopQueryValidPaths` reports a .drv
+        // missing while `wopIsValidPath` reports it valid for the same
+        // path/JWT.
+        if drv_exempt(p) {
+            visible.insert(p.clone());
+            continue;
+        }
+        match own_built.get(h) {
+            Some(&(owned, any_built)) => {
+                // The kernel's I-217 table (sig_trusted=false is sound
+                // here — K4 proves the verdict ignores it once
+                // owned || any_built).
+                if matches!(
+                    visibility_verdict(owned, any_built, false),
+                    VisibilityVerdict::Visible
+                ) {
+                    visible.insert(p.clone());
+                }
+            }
+            None => subst_only.push(p.clone()),
+        }
+    }
+    if subst_only.is_empty() {
+        return Ok(visible);
+    }
+
+    let trusted = trusted_set(pool, signer, tid, cache).await?;
+    if trusted.is_empty() {
+        // Tenant trusts nothing → all substitution-only paths hidden.
+        return Ok(visible);
+    }
+    for (_path, info) in metadata::query_path_info_batch(pool, &subst_only).await? {
+        let Some(info) = info else {
+            // No complete manifest — hidden (single-path agreement;
+            // see the doc comment).
+            continue;
+        };
+        let sig_trusted = sig_cell(&info, &trusted);
+        if matches!(
+            visibility_verdict(false, false, sig_trusted),
+            VisibilityVerdict::Visible
+        ) {
+            visible.insert(info.store_path.to_string());
+        }
+    }
+    Ok(visible)
 }
