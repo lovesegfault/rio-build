@@ -345,11 +345,23 @@ pub fn decide(
     observed: &mut Option<Observed>,
     our_id: &str,
     steal_after: Duration,
-    now: Instant,
+    sent_at: Instant,
+    confirmed_at: Instant,
 ) -> Decision {
     // ── Project production data → predicate inputs ──────────────────
     // The projection is the only place `Instant` and `String` appear.
     // `decide_pure()` is the verified core; this is the I/O-shaped shim.
+    //
+    // Two-clock anchor discipline (`sched.lease.k8s-lease`): staleness
+    // is MEASURED against `sent_at` (the GET's send instant — the
+    // earliest bound on when this read's no-write evidence was
+    // confirmed) while a fresh observation is STAMPED at `confirmed_at`
+    // (the response instant — the latest bound on when the observed
+    // state existed). Both directions UNDERSTATE the confirmed no-write
+    // span, the conservative direction for steals. Taking the two
+    // instants as separate parameters is the mechanism: a caller cannot
+    // re-introduce the request-anchored stamp without visibly collapsing
+    // the pair.
     let holder_kind = match holder {
         None => HolderKind::Empty,
         Some("") => HolderKind::Empty,
@@ -362,7 +374,7 @@ pub fn decide(
     let matched_observation_age_ms = observed
         .as_ref()
         .filter(|o| o.resource_version == resource_version)
-        .map(|o| now.duration_since(o.at).as_millis() as u64);
+        .map(|o| sent_at.duration_since(o.at).as_millis() as u64);
     let steal_after_ms = steal_after.as_millis() as u64;
 
     let (decision, update) = decide_pure(holder_kind, matched_observation_age_ms, steal_after_ms);
@@ -374,7 +386,7 @@ pub fn decide(
         ObservedUpdate::StartObserving => {
             *observed = Some(Observed {
                 resource_version: resource_version.to_string(),
-                at: now,
+                at: confirmed_at,
             });
         }
     }
@@ -533,18 +545,27 @@ impl LeaderElection {
     /// unconfirmed-write ledger accounts for
     /// (`sched.lease.cancelled-write`).
     ///
-    /// `now` is the instant `decide()` measures observation staleness
-    /// against; the composition passes `Instant::now()`, the model-based
-    /// tests inject their mock clock.
+    /// `sent_at` is the GET's send instant — the clock `decide()`
+    /// measures observation staleness against; the composition passes
+    /// `Instant::now()`, the model-based tests inject their mock clock.
+    /// The response instant is derived as `sent_at` plus the GET's
+    /// real elapsed latency, so an injected mock clock keeps a coherent
+    /// timeline (latency ≈ 0 against an in-process mock) while
+    /// production observations are stamped at the instant the fetched
+    /// state was actually confirmed (`sched.lease.k8s-lease`'s
+    /// two-clock anchor discipline; the `decide()` doc has the
+    /// conservatism argument).
     pub(crate) async fn fetch_and_decide(
         &mut self,
-        now: Instant,
+        sent_at: Instant,
     ) -> Result<FetchOutcome, kube::Error> {
         // 1. GET. 404 → no lease exists; the act phase POSTs one.
+        let fetch_started = Instant::now();
         let lease = match self.api.get_opt(&self.lease_name).await? {
             Some(l) => l,
             None => return Ok(FetchOutcome::Create),
         };
+        let confirmed_at = sent_at + fetch_started.elapsed();
 
         // 2. Decide. resource_version is always set on objects
         // that came from the apiserver (unwrap_or_default is
@@ -564,7 +585,8 @@ impl LeaderElection {
             &mut self.observed,
             &self.holder_id,
             self.steal_after,
-            now,
+            sent_at,
+            confirmed_at,
         );
 
         Ok(FetchOutcome::Decided {
@@ -756,7 +778,15 @@ mod tests {
     #[test]
     fn we_hold_it_renews() {
         let mut o = None;
-        let d = decide(Some("us"), "42", &mut o, "us", TTL, Instant::now());
+        let d = decide(
+            Some("us"),
+            "42",
+            &mut o,
+            "us",
+            TTL,
+            Instant::now(),
+            Instant::now(),
+        );
         assert_eq!(d, Decision::Renew);
         assert_eq!(o, None, "renew doesn't touch observed");
     }
@@ -766,7 +796,7 @@ mod tests {
     fn fresh_observation_is_standby() {
         let mut o = None;
         let now = Instant::now();
-        let d = decide(Some("other"), "42", &mut o, "us", TTL, now);
+        let d = decide(Some("other"), "42", &mut o, "us", TTL, now, now);
         assert_eq!(d, Decision::Standby);
         assert_eq!(o, obs("42", now));
     }
@@ -783,6 +813,7 @@ mod tests {
             &mut o,
             "us",
             TTL,
+            t0 + Duration::from_secs(5),
             t0 + Duration::from_secs(5),
         );
         assert_eq!(d, Decision::Standby);
@@ -803,6 +834,7 @@ mod tests {
             "us",
             TTL,
             t0 + Duration::from_secs(20),
+            t0 + Duration::from_secs(20),
         );
         assert_eq!(d, Decision::Steal);
     }
@@ -819,9 +851,53 @@ mod tests {
         let t0 = Instant::now();
         let mut o = obs("42", t0);
         let t1 = t0 + Duration::from_secs(20);
-        let d = decide(Some("other"), "43", &mut o, "us", TTL, t1);
+        let d = decide(Some("other"), "43", &mut o, "us", TTL, t1, t1);
         assert_eq!(d, Decision::Standby, "rv moved → leader alive → reset");
         assert_eq!(o, obs("43", t1));
+    }
+
+    /// Two-clock anchor discipline (`sched.lease.k8s-lease`): a fresh
+    /// observation is STAMPED at the response instant (`confirmed_at`),
+    /// not the request's send instant — the observed state is only
+    /// known to have existed by the time the response arrived, and
+    /// stamping earlier backdates the staleness anchor by one GET
+    /// latency, letting a standby pass `age > steal_after` up to that
+    /// latency BEFORE the no-write window is truly confirmed (the
+    /// anti-conservative direction; the margin derivation budgets
+    /// 1.5s per side, which a request-anchored stamp silently spends).
+    /// Staleness is still MEASURED against the deciding read's send
+    /// instant — the earliest bound on when its same-rv evidence held.
+    #[test]
+    fn observation_stamp_anchors_at_the_response_instant() {
+        let t0 = Instant::now();
+        let fetch_latency = Duration::from_millis(1500);
+        // First sighting: GET sent at t0, response (and rv
+        // confirmation) at t0 + 1.5s. The observation must carry the
+        // response instant.
+        let mut o = None;
+        let d = decide(
+            Some("other"),
+            "42",
+            &mut o,
+            "us",
+            TTL,
+            t0,
+            t0 + fetch_latency,
+        );
+        assert_eq!(d, Decision::Standby);
+
+        // Deciding read sent at t0 + TTL + 1s (zero latency this time):
+        // measured against the RESPONSE-anchored stamp the same-rv
+        // window is TTL - 0.5s — not yet stale. A request-anchored
+        // stamp would claim TTL + 1s and steal 1.5s early.
+        let t_decide = t0 + TTL + Duration::from_secs(1);
+        let d = decide(Some("other"), "42", &mut o, "us", TTL, t_decide, t_decide);
+        assert_eq!(
+            d,
+            Decision::Standby,
+            "the confirmed no-write window is TTL - 0.5s, short of the threshold — \
+             a request-anchored stamp overstates it by the fetch latency"
+        );
     }
 
     /// holder_identity: None (graceful step_down) → steal
@@ -829,7 +905,15 @@ mod tests {
     #[test]
     fn empty_holder_steals_immediately() {
         let mut o = obs("42", Instant::now());
-        let d = decide(None, "42", &mut o, "us", TTL, Instant::now());
+        let d = decide(
+            None,
+            "42",
+            &mut o,
+            "us",
+            TTL,
+            Instant::now(),
+            Instant::now(),
+        );
         assert_eq!(d, Decision::Steal);
         assert_eq!(o, None, "cleared — no one to observe");
     }
@@ -839,7 +923,15 @@ mod tests {
     #[test]
     fn empty_string_holder_steals_immediately() {
         let mut o = None;
-        let d = decide(Some(""), "42", &mut o, "us", TTL, Instant::now());
+        let d = decide(
+            Some(""),
+            "42",
+            &mut o,
+            "us",
+            TTL,
+            Instant::now(),
+            Instant::now(),
+        );
         assert_eq!(d, Decision::Steal);
     }
 

@@ -392,6 +392,10 @@ impl MbtSystem {
                     &mut h.election.observed,
                     &our_id,
                     STEAL_AFTER,
+                    // The MBT re-evaluates the projection at a single
+                    // model instant: send and confirm collapse (the
+                    // model's GET is atomic at its step grain).
+                    now,
                     now,
                 );
                 FetchOutcome::Decided { decision, lease }

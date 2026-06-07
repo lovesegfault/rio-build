@@ -158,9 +158,17 @@ const _: () = assert!(
 
 /// The asymmetry margin between the leader's self-fence deadline and the
 /// follower's steal threshold. The two deadlines are anchored at
-/// different moments (the leader stamps `last_successful_renew` when its
-/// renew RESPONSE arrives; the follower stamps `obs.at` when it OBSERVES
-/// the rv change), so without a margin the follower's deadline can land
+/// different moments, and BOTH sides carry their conservative-direction
+/// premise as code: the leader's blind window is stamped from a
+/// [`RenewAnchor`] minted BEFORE the attempt's await (anchor ≤ send ≤
+/// commit — the window is never shorter than the model's), and the
+/// follower's observed record follows the two-clock anchor discipline
+/// in `election::decide()` — a fresh observation is STAMPED at the
+/// GET's response instant while staleness is MEASURED against the
+/// deciding GET's send instant, so the no-write span the steal acts on
+/// is UNDERSTATED at both ends (a request-anchored stamp would
+/// silently spend the 1.5s-per-side skew budget below on fetch
+/// latency). Without a margin the follower's deadline can land
 /// first with zero clock skew. The formal model
 /// (`docs/spec/models/leaderElection.qnt`, the `leaderElectionAsymmetric`
 /// regime) proves NeverDual —
