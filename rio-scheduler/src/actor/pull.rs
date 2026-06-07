@@ -250,6 +250,10 @@ impl DagActor {
     /// Handle one `PullAssignment` (the actor turn). Computes the
     /// admission via [`admit_pull`], executes the decision, and replies.
     #[allow(clippy::too_many_arguments)]
+    // The pull's wire surface is the argument list (one field per
+    // PullAssignmentRequest input); bundling into a struct would just
+    // restate the proto. Grew to 8 with confirm_only (merged_bug_083).
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn handle_pull_assignment(
         &mut self,
         intent_id: String,
@@ -276,6 +280,7 @@ impl DagActor {
     }
 
     // r[impl sched.executor.pull-transaction+2]
+    #[allow(clippy::too_many_arguments)] // mirrors handle_pull_assignment's wire surface
     async fn pull_assignment_inner(
         &mut self,
         intent_id: &str,

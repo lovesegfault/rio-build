@@ -250,7 +250,11 @@ const RESUME_LEDGER_CAP: usize = 32;
 impl ResumeLedger {
     /// Record a claim attempt BEFORE its pull rides the wire (upsert
     /// by job: a re-claim re-mints, and exactly one nonce per job is
-    /// ever live on this worker).
+    /// ever live on this worker). TEST-ONLY since merged_bug_096:
+    /// production fresh mints go through [`Self::begin_fresh_claim`]
+    /// (the mint authority); tests use this raw insert to seed
+    /// pre-existing entries.
+    #[cfg(test)]
     fn note_pull(&mut self, entry: ResumeEntry) {
         self.entries.retain(|e| e.job_id != entry.job_id);
         if self.entries.len() >= RESUME_LEDGER_CAP
