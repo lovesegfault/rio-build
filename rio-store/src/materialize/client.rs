@@ -259,6 +259,12 @@ enum PullAnswer {
     /// may have committed server-side — exactly the window the
     /// resume ledger exists for.
     Unanswered,
+    /// ANSWERED with a permanent rejection (bug_119: the same
+    /// `is_fatal_rejection` set the report leg gives up on — auth /
+    /// invalid-argument / unimplemented). The scheduler answered, so
+    /// no mint can be pending behind it: never filed as a lost
+    /// response, and the callers resolve the ledger entry.
+    Rejected,
 }
 
 /// Issue one bounded `PullAssignment` and classify the outcome.
@@ -292,6 +298,18 @@ async fn pull_once<T: MaterializeTransport>(
                 PullAnswer::NotYetReady
             }
         },
+        // bug_119: the ONE rpc-error classification chokepoint, shared
+        // with the report leg (`report_until_acked`) and mirroring the
+        // builder pull loop — an ANSWERED permanent refusal is typed
+        // Rejected, never laundered into the lost-response lane.
+        BoundedOutcome::Resolved(Err(status)) if is_fatal_rejection(status.code()) => {
+            warn!(drv_hash = %drv_hash,
+                  code = ?status.code(), msg = status.message(),
+                  "materialization claim permanently refused (credential/request \
+                   fault); dropping the claim — no mint is pending behind an \
+                   answered refusal");
+            PullAnswer::Rejected
+        }
         BoundedOutcome::Resolved(Err(status)) => {
             warn!(drv_hash = %drv_hash,
                   code = ?status.code(), msg = status.message(),
@@ -425,6 +443,12 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             // pass until Gone or delivery; capacity bounds the total.
             PullAnswer::NotYetReady => {}
             PullAnswer::Unanswered => {}
+            // bug_119: ANSWERED permanent refusal — the credential was
+            // judged and refused (auth misconfig, malformed request);
+            // nothing is pending behind it. Entry resolves, per the
+            // ledger contract (entries leave on every answered
+            // outcome).
+            PullAnswer::Rejected => ledger.resolve(entry.job_id),
         }
     }
     // bug_385: the listing window is DECOUPLED from the claim budget.
@@ -562,8 +586,11 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             // ANSWERED refusals on a FRESH claim: the scheduler did
             // not mint for us — drop the nonce (unlike the resume
             // pass, where NotYetReady may shadow our own held
-            // attempt through a stale view).
-            PullAnswer::Gone | PullAnswer::NotYetReady => ledger.resolve(job_id),
+            // attempt through a stale view). Rejected (bug_119) is the
+            // permanent-refusal shape of the same answered class.
+            PullAnswer::Gone | PullAnswer::NotYetReady | PullAnswer::Rejected => {
+                ledger.resolve(job_id)
+            }
             // The answer never arrived: the entry STAYS — the next
             // pass resumes it directly with the nonce.
             PullAnswer::Unanswered => {}
@@ -1176,6 +1203,74 @@ mod tests {
         );
         assert_eq!(t.list_calls, 1);
         assert_eq!(t.pull_calls, 2);
+    }
+
+    /// bug_119: an ANSWERED permanent rejection (auth misconfig) is not
+    /// a lost response. `pull_once` classifies it through the same
+    /// `is_fatal_rejection` chokepoint the report leg uses, and BOTH
+    /// claim passes resolve the ledger entry (the rule-4b contract:
+    /// entries leave on every ANSWERED outcome). Pre-fix the entry was
+    /// immortal: every pass burned a doomed resume pull plus a doomed
+    /// fresh claim per job while the warn mis-narrated the credential
+    /// refusal as a resumable lost response.
+    #[tokio::test]
+    async fn answered_permanent_rejection_resolves_ledger_entry() {
+        // Fresh-claim half: the claim's nonce must not outlive the
+        // answered refusal.
+        let d = descriptor(119);
+        let mut ledger = ResumeLedger::default();
+        let mut t = MockTransport::new(
+            vec![Ok(listing(vec![d.clone()]))],
+            vec![Err(tonic::Status::permission_denied(
+                "service token rejected",
+            ))],
+            vec![],
+        );
+        let claimed = poll_and_claim(
+            &mut t,
+            &instance("store-replica-0"),
+            1,
+            &mut ledger,
+            &mut ListFailureLatch::default(),
+            &token(),
+        )
+        .await;
+        assert!(claimed.is_empty());
+        assert!(
+            ledger.is_empty(),
+            "an answered refusal is not a lost response — no immortal entry"
+        );
+
+        // Resume half: a held entry whose resume pull is REFUSED with a
+        // permanent answer resolves too (the scheduler answered; no
+        // mint can be pending behind an Unauthenticated refusal).
+        let mut ledger = ResumeLedger::default();
+        ledger.note_pull(ResumeEntry {
+            job_id: Uuid::now_v7(),
+            drv_hash: "drv-fatal".into(),
+            tenant_hint: None,
+            origin: "pruned".into(),
+            nonce: Uuid::new_v4(),
+        });
+        let mut t = MockTransport::new(
+            vec![Ok(listing(vec![]))],
+            vec![Err(tonic::Status::unauthenticated("token expired"))],
+            vec![],
+        );
+        let claimed = poll_and_claim(
+            &mut t,
+            &instance("store-replica-0"),
+            1,
+            &mut ledger,
+            &mut ListFailureLatch::default(),
+            &token(),
+        )
+        .await;
+        assert!(claimed.is_empty());
+        assert!(
+            ledger.is_empty(),
+            "resume credential permanently refused — entry resolves"
+        );
     }
 
     /// merged_bug_026 (the resume half): a nonce-presenting resume pull
