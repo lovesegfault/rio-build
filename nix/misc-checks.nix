@@ -665,25 +665,68 @@ in
     }
     # Syntax check: njs js_import/js_set wiring is easy to get wrong
     # and vm-dashboard-k3s is the only other place nginx parses this.
-    # The conf now carries ENVSUBST PLACEHOLDERS for the upstream
-    # FQDNs (generated from files/dashboard-upstreams.json; the image
-    # entrypoint substitutes at pod start) — run the SAME substitution
-    # the entrypoint performs, with the env defaulted to a resolvable
-    # address, so the guard checks the runtime artifact, not the
-    # template. /dev/std{err,out} → TMPDIR (a remote build sandbox may
-    # not provide /dev/std*). Everything else is checked verbatim.
+    # The conf carries ENVSUBST PLACEHOLDERS for the upstream FQDNs
+    # (generated from files/dashboard-upstreams.json; the image
+    # entrypoint substitutes at pod start). The guard's env
+    # assignments AND its envsubst var list are DERIVED from the same
+    # dashboardUpstreams expression the entrypoint uses
+    # (docker.nix: dashboardGuardEnv / dashboardEnvsubstVars) — the
+    # substitution is structurally the entrypoint's, never a
+    # hand-mirrored twin (merged_bug_160: the old literal lists made a
+    # third registry record fail CI blaming the entrypoint list, the
+    # one list that was derived and correct). /dev/std{err,out} →
+    # TMPDIR (a remote build sandbox may not provide /dev/std*).
     mkdir -p $TMPDIR/logs
-    RIO_SCHEDULER_FQDN=127.0.0.1 RIO_STORE_FQDN=127.0.0.1 \
-      ${pkgs.gettext}/bin/envsubst '$RIO_SCHEDULER_FQDN $RIO_STORE_FQDN' \
+
+    # Self-test (no fail-open enforcement): the leftover-placeholder
+    # tripwire must fire on a planted conf whose placeholder the
+    # registry list does NOT cover before the real conf may pass.
+    printf 'upstream bogus { server ''${RIO_BOGUS_FQDN}:1; }\n' > $TMPDIR/planted.conf
+    env ${dockerImages.dashboardGuardEnv} \
+      ${pkgs.gettext}/bin/envsubst '${dockerImages.dashboardEnvsubstVars}' \
+      < $TMPDIR/planted.conf > $TMPDIR/planted-subst.conf
+    grep -F '{RIO_' $TMPDIR/planted-subst.conf >/dev/null || {
+      echo "FAIL: planted out-of-registry placeholder was NOT detected — the conf-guard tripwire is fail-open" >&2
+      exit 1
+    }
+
+    env ${dockerImages.dashboardGuardEnv} \
+      ${pkgs.gettext}/bin/envsubst '${dockerImages.dashboardEnvsubstVars}' \
       < ${dockerImages.dashboardNginxConf} > $TMPDIR/nginx-subst.conf
     if grep -F '{RIO_' $TMPDIR/nginx-subst.conf; then
-      echo "FAIL: unsubstituted upstream placeholder survived envsubst — keep the entrypoint var list in sync with dashboard-upstreams.json" >&2
+      echo "FAIL: the conf references an upstream env var the registry does not define —" >&2
+      echo "      add the record to dashboard-upstreams.json (the conf, env wiring, and" >&2
+      echo "      both policy sides derive from it); hand-edited placeholders cannot ship" >&2
       exit 1
     fi
     sed -e "s#/dev/stderr#$TMPDIR/logs/error.log#" \
         -e "s#/dev/stdout#$TMPDIR/logs/access.log#" \
       $TMPDIR/nginx-subst.conf > $TMPDIR/nginx.conf
     ${dockerImages.dashboardNginx}/bin/nginx -t -p $TMPDIR -c $TMPDIR/nginx.conf
+
+    # ns-parity arm (merged_bug_160 second half): docker.nix's
+    # dashboardNsDefaults are a CHECKED mirror of values.yaml
+    # namespaces.{system,store}.name — nix cannot parse YAML, so the
+    # literals stay, and THIS comparator turns silent drift into a red.
+    # Self-test first: a perturbed copy must fail the comparator.
+    ns_json='${builtins.toJSON dockerImages.dashboardNsDefaults}'
+    v_sys=$(${pkgs.yq-go}/bin/yq '.namespaces.system.name' ${../infra/helm/rio-build/values.yaml})
+    v_sto=$(${pkgs.yq-go}/bin/yq '.namespaces.store.name' ${../infra/helm/rio-build/values.yaml})
+    ns_check() {
+      j_sys=$(echo "$1" | ${pkgs.jq}/bin/jq -r .system)
+      j_sto=$(echo "$1" | ${pkgs.jq}/bin/jq -r .store)
+      [ "$j_sys" = "$v_sys" ] && [ "$j_sto" = "$v_sto" ]
+    }
+    if ns_check "$(echo "$ns_json" | ${pkgs.jq}/bin/jq '.system="rio-wrong"')"; then
+      echo "FAIL: ns-parity comparator accepted a perturbed copy — fail-open" >&2
+      exit 1
+    fi
+    ns_check "$ns_json" || {
+      echo "FAIL: docker.nix dashboardNsDefaults drifted from values.yaml" >&2
+      echo "      namespaces.{system,store}.name ($ns_json vs $v_sys/$v_sto) —" >&2
+      echo "      update docker.nix's checked mirror to match values.yaml" >&2
+      exit 1
+    }
     touch $out
   '';
 

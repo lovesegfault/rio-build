@@ -384,12 +384,24 @@ let
   # values.yaml namespaces.{system,store}.name; overrides flow through
   # dashboard.yaml's env, which substitutes the live names at pod
   # start). Bare `docker run` and the conf-guard get these defaults.
+  # CHECKED MIRROR (merged_bug_160): nix cannot parse values.yaml, so
+  # these literals stay — but dashboard-nginx-conf-guard asserts they
+  # equal values.yaml namespaces.{system,store}.name, so a renamed
+  # namespace fails CI instead of silently baking stale defaults.
   dashboardNsDefaults = {
     system = "rio-system";
     store = "rio-store";
   };
   dashboardUpstreamDefault =
     u: "${u.service}.${dashboardNsDefaults.${u.namespaceRef}}.svc.cluster.local";
+  # THE envsubst var list and guard env assignments — derived from the
+  # registry ONCE and consumed by both the entrypoint and the
+  # conf-guard (merged_bug_160: the guard used to hand-mirror these
+  # two lists under a comment claiming it ran "the SAME substitution";
+  # a third registry record then failed CI blaming the entrypoint
+  # list — the one list that was registry-derived and correct).
+  dashboardEnvsubstVars = lib.concatMapStringsSep " " (u: "$" + u.env) dashboardUpstreams;
+  dashboardGuardEnv = lib.concatMapStringsSep " " (u: "${u.env}=127.0.0.1") dashboardUpstreams;
   # ''${ENV} stays literal in the conf — the ENTRYPOINT substitutes it
   # (envsubst with an explicit var list, protecting nginx-native $vars).
   dashboardUpstreamBlocks = lib.concatMapStringsSep "\n" (u: ''
@@ -414,9 +426,7 @@ let
     ${lib.concatMapStringsSep "\n" (u: ''
       export ${u.env}="''${${u.env}:-${dashboardUpstreamDefault u}}"
     '') dashboardUpstreams}
-    ${pkgs.gettext}/bin/envsubst '${
-      lib.concatMapStringsSep " " (u: "$" + u.env) dashboardUpstreams
-    }' <${dashboardNginxConf} >/tmp/nginx.conf
+    ${pkgs.gettext}/bin/envsubst '${dashboardEnvsubstVars}' <${dashboardNginxConf} >/tmp/nginx.conf
     exec ${dashboardNginx}/bin/nginx -c /tmp/nginx.conf
   '';
 
@@ -473,7 +483,15 @@ rec {
     ++ map (m: "/rio.store.LogService/${m}") dashboardReadonlyStoreLogs;
 
   # Exported for checks.dashboard-nginx-conf-guard (misc-checks.nix).
-  inherit dashboardNginxConf dashboardNginx;
+  # The guard DERIVES its env assignments + envsubst list + ns-parity
+  # facts from these — never hand-mirrors them (merged_bug_160).
+  inherit
+    dashboardNginxConf
+    dashboardNginx
+    dashboardEnvsubstVars
+    dashboardGuardEnv
+    dashboardNsDefaults
+    ;
 
   gateway = mkImage {
     name = "gateway";
