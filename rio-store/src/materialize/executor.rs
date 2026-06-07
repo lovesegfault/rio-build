@@ -10,7 +10,7 @@
 //! contract), so this module owns closure completeness.
 // r[impl store.materialize.executor+5]
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use sqlx::PgPool;
@@ -239,6 +239,11 @@ async fn execute_job_inner(
     let mut visited: HashSet<String> = HashSet::new();
     let mut ingested: Vec<String> = Vec::new();
     let mut verified: Vec<String> = Vec::new();
+    // bug_139 / signed Q2: the per-path verified-tenant sets — filled
+    // at the local-present arm (the witness's full set) and the
+    // substitute-hit arm (serving tenant + post-ingest re-check);
+    // carried to the scheduler on the Success wire.
+    let mut verified_tenants_by_path: HashMap<String, Vec<Uuid>> = HashMap::new();
     // merged_bug_193: wanted-miss vs closure-reference-miss are
     // DIFFERENT verdicts at the consumer (a covered root over a
     // punctured closure must never complete) — track the cell per
@@ -357,7 +362,7 @@ async fn execute_job_inner(
                     // frontier from the LOCAL row's references — the
                     // closure-completeness obligation holds without
                     // touching any upstream.
-                    let _vis: TenantVisible = visible;
+                    verified_tenants_by_path.insert(path.clone(), visible.tenants().to_vec());
                     if let Err(e) = pin_materialized_path(ctx, claimed, &path).await {
                         return infra_failure(format!("pin-at-ingest failed for {path}: {e}"));
                     }
@@ -397,7 +402,9 @@ async fn execute_job_inner(
             // later tenant of its chance to serve (pre-fix: tenant
             // A's charging failure aborted the walk before serving
             // tenant B was tried).
-            let mut hit: Option<Box<rio_proto::validated::ValidatedPathInfo>> = None;
+            // Signed Q2: the hit carries its SERVING tenant; S6a's
+            // kernel recorder owns the failure cells.
+            let mut hit: Option<(Uuid, Box<rio_proto::validated::ValidatedPathInfo>)> = None;
             let mut cells = TenantAttemptCells::new();
             // Per-cell (label, detail) for the outcome message,
             // index-aligned with `cells`.
@@ -409,7 +416,7 @@ async fn execute_job_inner(
                     .await
                 {
                     Ok(Some(path_info)) => {
-                        hit = Some(Box::new(path_info));
+                        hit = Some((tenant_id, Box::new(path_info)));
                         break;
                     }
                     Ok(None) => {
@@ -452,7 +459,7 @@ async fn execute_job_inner(
                 }
             }
             match hit {
-                Some(path_info) => {
+                Some((serving_tenant, path_info)) => {
                     // r[impl sched.materialize.pinning]
                     // Pin-at-ingest (design §5.1): the pin lands BEFORE
                     // the path can appear in any Success report. A pin
@@ -464,6 +471,39 @@ async fn execute_job_inner(
                         return infra_failure(format!("pin-at-ingest failed for {path}: {e}"));
                     }
                     ingested.push(path.clone());
+                    // Signed Q2: the serving tenant's own-upstream hit
+                    // verifies the path for THAT tenant; the remaining
+                    // interested tenants are re-checked against the
+                    // now-local row (their trust view may accept the
+                    // persisted upstream sigs) — verified-for, never
+                    // assumed-for.
+                    {
+                        let mut vt: Vec<Uuid> = vec![serving_tenant];
+                        if tenants.len() > 1
+                            && let Ok(Some(local)) =
+                                crate::metadata::query_path_info(&ctx.pool, &path).await
+                        {
+                            let signer = ctx.substituter.tenant_signer();
+                            for &other in tenants.iter().filter(|t| **t != serving_tenant) {
+                                if let Ok(Some(v)) = visible_to_tenant(
+                                    &ctx.pool,
+                                    signer,
+                                    Some(other),
+                                    &local,
+                                    &mut trust_cache,
+                                )
+                                .await
+                                {
+                                    for t in v.tenants() {
+                                        if !vt.contains(t) {
+                                            vt.push(*t);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        verified_tenants_by_path.insert(path.clone(), vt);
+                    }
                     // BC-4: the path is fully processed — fold its NAR
                     // size into the cumulative total and fire the
                     // final per-path tick (done == expected for the
@@ -627,11 +667,25 @@ async fn execute_job_inner(
             verified = verified.len(),
             "materialization job complete (closure walked, pinned, coverage held)"
         );
+        // Signed Q2: per-path verified-tenant sets ride the wire — the
+        // scheduler stamps ownership by intersection, never widening.
+        let verified_tenants: Vec<materialization_outcome::success::PathTenants> = ingested
+            .iter()
+            .chain(verified.iter())
+            .map(|p| materialization_outcome::success::PathTenants {
+                store_path: p.clone(),
+                verified_tenant_ids: verified_tenants_by_path
+                    .get(p)
+                    .map(|ts| ts.iter().map(|t| t.to_string()).collect())
+                    .unwrap_or_default(),
+            })
+            .collect();
         MaterializationOutcome {
             outcome: Some(materialization_outcome::Outcome::Success(
                 materialization_outcome::Success {
                     ingested_paths: ingested,
                     verified_paths: verified,
+                    verified_tenants,
                 },
             )),
         }
@@ -717,6 +771,21 @@ enum LocalPresence {
 /// The walk's local-presence probe. The error PROPAGATES (bug_042):
 /// a PG blip is infrastructure trouble, never evidence of absence.
 ///
+/// ── SIGNED 2026-06-07 (owner, bughunt-3 fix-wave sec.5-S Q2) ──
+/// Per-tenant verified stamping: materialization Success evidence is
+/// stamped ONLY for tenants whose view validated each path — the
+/// walk's visibility witness ([`TenantVisible`], a set-carrier) or an
+/// own-upstream substitute hit plus the post-ingest re-check under
+/// the remaining interested tenants. The verified-tenant sets travel
+/// on the wire (`MaterializationOutcome.Success.verified_tenants`,
+/// build_types.proto field 3, R10 — S5 reviewer-of-record) and the
+/// scheduler's stamp funnel (`StampProvenance::WalkVerified`)
+/// INTERSECTS them with the attributed tenants. Unverified interested
+/// tenants keep their interest open for the next walk. All six
+/// scheduler stamp-producer sites route through the typed witness; a
+/// witness-less stamp does not compile.
+/// ──────────────────────────────────────────────────────────────────
+///
 /// bug_115: a physically-present row is servable only if the
 /// sig-visibility verdict (the SAME body as the gRPC read gates —
 /// [`crate::visibility::visible_to_tenant`]) passes for at least one
@@ -738,12 +807,24 @@ async fn probe_local(
         return Ok(LocalPresence::Absent(LocalMiss(())));
     };
     let signer = ctx.substituter.tenant_signer();
+    // bug_139 / signed Q2: consult EVERY interested tenant and carry
+    // the full visible set in the witness — the pre-fix first-visible
+    // break minted an existence witness that downstream stamping
+    // widened to all-tenant ownership (the exists-gate/forall-stamp
+    // laundering).
+    let mut witness: Option<TenantVisible> = None;
     for &tid in tenants {
         if let Some(visible) =
             visible_to_tenant(&ctx.pool, signer, Some(tid), &info, trust_cache).await?
         {
-            return Ok(LocalPresence::Present(visible, Box::new(info)));
+            match &mut witness {
+                None => witness = Some(visible),
+                Some(w) => w.merge(visible),
+            }
         }
+    }
+    if let Some(visible) = witness {
+        return Ok(LocalPresence::Present(visible, Box::new(info)));
     }
     debug!(
         path = %store_path,

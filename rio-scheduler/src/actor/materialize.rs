@@ -625,12 +625,14 @@ impl DagActor {
         let Some(db_id) = state.db_id else {
             return false;
         };
-        // Tenant: any live interested build's tenant (substitution is
-        // content-addressed, so whose upstream config we use is
-        // irrelevant to the result — the same derivation
-        // probe_substitute_auth uses). NULL = no tenant context; the
-        // executor re-resolves at execution time (design §2.2 item 3 /
-        // PDQ-8).
+        // Tenant: any live interested build's tenant — a HINT only
+        // (bug_139: upstream config AND sig trust are per-tenant, so
+        // whose view a probe runs under is NOT irrelevant to the
+        // result; ownership stamping is therefore witness-gated via
+        // StampProvenance and the executor re-resolves the FULL live
+        // tenant set per walk iteration). NULL = no tenant context;
+        // the executor re-resolves at execution time (design §2.2
+        // item 3 / PDQ-8).
         let tenant: Option<Uuid> = state
             .interested_builds
             .iter()
@@ -1281,6 +1283,24 @@ impl DagActor {
                 // Complete vs ReArm (the CE-17 class). The close runs
                 // through the ack-law chokepoint: Fenced acks inert
                 // (deposed believer, signed Q20), Failed NACKs.
+                // Signed Q2: parse the wire's per-path verified-tenant
+                // sets ONCE (sha256(path) -> tenant uuids); malformed
+                // uuids are dropped (stamping is conservative).
+                let walk_verified: std::collections::HashMap<Vec<u8>, Vec<Uuid>> = {
+                    use sha2::Digest;
+                    s.verified_tenants
+                        .iter()
+                        .map(|pt| {
+                            (
+                                sha2::Sha256::digest(pt.store_path.as_bytes()).to_vec(),
+                                pt.verified_tenant_ids
+                                    .iter()
+                                    .filter_map(|t| t.parse::<Uuid>().ok())
+                                    .collect::<Vec<Uuid>>(),
+                            )
+                        })
+                        .collect()
+                };
                 match self
                     .close_for_consumption(exec_id, &drv_hash, None, serving_generation)
                     .await
@@ -1309,6 +1329,7 @@ impl DagActor {
                                     &carried_paths,
                                     serving_generation,
                                     close,
+                                    walk_verified,
                                 )
                                 .await)
                         } else {
@@ -1457,6 +1478,12 @@ impl DagActor {
                             &carried_paths,
                             serving_generation,
                             close,
+                            // Signed Q2: the Unobtainable wire carries
+                            // no per-path verified-tenant sets — the
+                            // moot completion stamps NOTHING; interest
+                            // stays open and a later walk's Success
+                            // (which does carry sets) stamps lawfully.
+                            std::collections::HashMap::new(),
                         )
                         .await
                     }
@@ -1745,6 +1772,7 @@ impl DagActor {
         carried_paths: &[String],
         serving_generation: crate::db::ServingGeneration,
         close: SettledClose,
+        walk_verified: std::collections::HashMap<Vec<u8>, Vec<Uuid>>,
     ) -> MatAck {
         let SettledClose(()) = close;
         let d = match job_id {
@@ -1771,8 +1799,16 @@ impl DagActor {
                     {
                         state.output_paths = carried_paths.to_vec();
                     }
-                    self.complete_ready_from_store_batch(std::slice::from_ref(drv_hash))
-                        .await;
+                    // Signed Q2: the walk's per-path verified-tenant
+                    // sets came over the wire — ownership stamps
+                    // INTERSECT them (a path is stamped only for
+                    // tenants whose view validated it; absent entries
+                    // stamp nothing).
+                    self.complete_ready_from_store_batch(
+                        std::slice::from_ref(drv_hash),
+                        &crate::db::live_pins::StampProvenance::WalkVerified(walk_verified),
+                    )
+                    .await;
                 }
             }
             // Deposed believer: mutate nothing the successor owns.

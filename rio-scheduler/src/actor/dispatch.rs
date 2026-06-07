@@ -338,7 +338,15 @@ impl DagActor {
             // else: a wanted output is confirmed missing upstream and
             // not substitutable — leave Ready (dispatches from source).
         }
-        self.complete_ready_from_store_batch(&locally_present).await;
+        // Signed Q2: every stamped tenant's OWN visibility-gated probe
+        // answered present (batch_probe_cached_ready asks once per
+        // live tenant and folds — merged_bug_028) — the all-tenant
+        // stamp is lawful here.
+        self.complete_ready_from_store_batch(
+            &locally_present,
+            &crate::db::live_pins::StampProvenance::AllTenantProbe,
+        )
+        .await;
         // The probe-partition creation site — the standalone fenced
         // helper, no enclosing transaction (design §2.1 row 3).
         for drv_hash in &to_create_job {
@@ -637,7 +645,11 @@ impl DagActor {
     /// stall on warm-restart of a large closure.
     // pub(super): also called by the materialization consumption handler
     // (the Success/moot-covered arms complete through this same chokepoint).
-    pub(super) async fn complete_ready_from_store_batch(&mut self, hashes: &[DrvHash]) {
+    pub(super) async fn complete_ready_from_store_batch(
+        &mut self,
+        hashes: &[DrvHash],
+        provenance: &crate::db::live_pins::StampProvenance,
+    ) {
         if hashes.is_empty() {
             return;
         }
@@ -688,7 +700,8 @@ impl DagActor {
         let ok_refs: Vec<&str> = ok_hashes.iter().map(|h| h.as_str()).collect();
         self.persist_status_batch(&ok_refs, DerivationStatus::Completed)
             .await;
-        self.upsert_path_tenants_for_batch(&ok_hashes).await;
+        self.upsert_path_tenants_for_batch(&ok_hashes, provenance)
+            .await;
 
         // Batched promote: dedup find_newly_ready across all completed
         // hashes, transition in-mem, then one

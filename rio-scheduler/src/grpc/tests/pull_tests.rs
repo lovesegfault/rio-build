@@ -492,6 +492,7 @@ fn mat_success_outcome() -> rio_proto::types::MaterializationOutcome {
             rio_proto::types::materialization_outcome::Success {
                 ingested_paths: vec![],
                 verified_paths: vec![],
+                verified_tenants: vec![],
             },
         )),
     }
@@ -1207,6 +1208,7 @@ async fn flag_on_materialization_lifecycle_through_grpc() -> anyhow::Result<()> 
                 rio_proto::types::materialization_outcome::Success {
                     ingested_paths: vec![out.clone()],
                     verified_paths: vec![],
+                    verified_tenants: vec![],
                 },
             )),
         }),

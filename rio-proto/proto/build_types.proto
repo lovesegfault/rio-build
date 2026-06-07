@@ -596,6 +596,21 @@ message MaterializationOutcome {
     repeated string ingested_paths = 1;
     // Paths verified already-present (and pinned).
     repeated string verified_paths = 2;
+    // Q2 (bughunt-3 sec.5-S, 2026-06-07): per-path tenant sets whose
+    // VIEW validated the path — the walk's visibility witness or an
+    // own-upstream substitute hit (plus the post-ingest re-check
+    // under the remaining interested tenants). The scheduler stamps
+    // path_tenants ownership by INTERSECTING these sets with the
+    // attributed tenants (StampProvenance::WalkVerified) — Success
+    // evidence is per-tenant, never widened at the stamp site
+    // (the exists-gate/forall-stamp laundering this field closes).
+    // Absent entries (old executors) stamp NOTHING for that path —
+    // conservative under upgrade skew.
+    message PathTenants {
+      string store_path = 1;
+      repeated string verified_tenant_ids = 2;
+    }
+    repeated PathTenants verified_tenants = 3;
   }
   message Unobtainable {
     // LIVE-WANTED paths confirmed absent upstream after the full

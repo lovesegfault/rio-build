@@ -646,7 +646,11 @@ impl DagActor {
     /// Single-node only — for N>1 inside an actor loop use
     /// [`upsert_path_tenants_for_batch`](Self::upsert_path_tenants_for_batch)
     /// (per-node sequential awaits here are an I-139 actor-stall).
-    pub(super) async fn upsert_path_tenants_for(&self, drv_hash: &DrvHash) {
+    pub(super) async fn upsert_path_tenants_for(
+        &self,
+        drv_hash: &DrvHash,
+        provenance: &crate::db::live_pins::StampProvenance,
+    ) {
         let Some(state) = self.dag.node(drv_hash) else {
             return;
         };
@@ -660,7 +664,7 @@ impl DagActor {
         }
         if let Err(e) = self
             .db
-            .upsert_path_tenants(&state.output_paths, &tenant_ids)
+            .upsert_path_tenants(&state.output_paths, &tenant_ids, provenance)
             .await
         {
             warn!(
@@ -681,8 +685,11 @@ impl DagActor {
     /// for tfc's 5298-node merge → ~20s of head-of-line blocking.
     ///
     /// [`upsert_path_tenants_for`]: Self::upsert_path_tenants_for
-    pub(super) async fn upsert_path_tenants_for_batch(&self, drv_hashes: &[DrvHash]) {
-        use sha2::Digest;
+    pub(super) async fn upsert_path_tenants_for_batch(
+        &self,
+        drv_hashes: &[DrvHash],
+        provenance: &crate::db::live_pins::StampProvenance,
+    ) {
         let mut hashes: Vec<Vec<u8>> = Vec::new();
         let mut tids: Vec<Uuid> = Vec::new();
         for drv_hash in drv_hashes {
@@ -700,18 +707,18 @@ impl DagActor {
             if tenant_ids.is_empty() {
                 continue;
             }
-            for p in &state.output_paths {
-                let h = sha2::Sha256::digest(p.as_bytes()).to_vec();
-                for t in &tenant_ids {
-                    hashes.push(h.clone());
-                    tids.push(*t);
-                }
-            }
+            // Signed Q2: the lawful pairs derive from the witness —
+            // THE one body shared with the single-drv wrapper.
+            provenance.lawful_pairs(&state.output_paths, &tenant_ids, &mut hashes, &mut tids);
         }
         if hashes.is_empty() {
             return;
         }
-        if let Err(e) = self.db.upsert_path_tenants_raw(&hashes, &tids).await {
+        if let Err(e) = self
+            .db
+            .upsert_path_tenants_raw(&hashes, &tids, provenance)
+            .await
+        {
             warn!(
                 ?e,
                 drvs = drv_hashes.len(),
@@ -1509,7 +1516,13 @@ impl DagActor {
         );
 
         // r[impl sched.gc.path-tenants-upsert]
-        self.upsert_path_tenants_for(drv_hash).await;
+        // Signed Q2: worker-built — locally produced bytes; all
+        // interested tenants lawful.
+        self.upsert_path_tenants_for(
+            drv_hash,
+            &crate::db::live_pins::StampProvenance::BuiltLocally,
+        )
+        .await;
 
         // Update ancestor priorities: this node is now terminal, so it
         // no longer contributes to its parents' max-child-priority.
@@ -1943,8 +1956,18 @@ impl DagActor {
             // Skipped nodes' output_paths (from the prior build's
             // realization, stamped above) need tenant attribution —
             // the build's tenant wants them retained, same as if the
-            // node had actually built them.
-            self.upsert_path_tenants_for_batch(&skipped).await;
+            // node had actually built them. Signed Q2 provenance:
+            // BuiltLocally — the realisation row proves the bytes were
+            // produced by a prior build in THIS cluster; the cutoff's
+            // FindMissingPaths verify is ANONYMOUS (no tenant header;
+            // only missing_paths is consumed — physical presence, not
+            // a per-tenant view), so it could never authorize a
+            // ProbedBy stamp.
+            self.upsert_path_tenants_for_batch(
+                &skipped,
+                &crate::db::live_pins::StampProvenance::BuiltLocally,
+            )
+            .await;
             let skipped_refs: Vec<&str> = skipped.iter().map(|h| h.as_str()).collect();
             self.persist_status_batch(&skipped_refs, DerivationStatus::Skipped)
                 .await;

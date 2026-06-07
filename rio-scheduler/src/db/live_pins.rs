@@ -11,6 +11,80 @@ use uuid::Uuid;
 use super::{SchedulerDb, terminal_status_sql};
 use crate::state::DrvHash;
 
+/// The stamp-authority witness (bug_139 / signed Q2 2026-06-07):
+/// every `path_tenants` ownership write names the EVIDENCE CLASS that
+/// authorizes it, and the funnel derives the lawful (path, tenant)
+/// pairs FROM the witness — a witness-less stamp does not compile,
+/// and a one-tenant verdict cannot be widened into all-tenant
+/// ownership at any call site. Six producer sites, four classes:
+///
+/// * walk Success → [`WalkVerified`](Self::WalkVerified) (the wire's
+///   per-path verified-tenant sets; stamps INTERSECT);
+/// * worker-built / recovery-orphan completion →
+///   [`BuiltLocally`](Self::BuiltLocally) (locally produced bytes —
+///   all interested tenants lawful, signed under Q2);
+/// * the dispatch locally-present lane →
+///   [`AllTenantProbe`](Self::AllTenantProbe) (every stamped tenant's
+///   own visibility-gated probe answered present);
+/// * merge-time cache hits / CA-cutoff →
+///   [`ProbedBy`](Self::ProbedBy) (single-evidence probe — stamps
+///   ONLY the probing tenant).
+#[derive(Debug)]
+pub(crate) enum StampProvenance {
+    /// Per-path wire-carried verified-tenant sets, keyed by
+    /// sha256(store_path).
+    WalkVerified(std::collections::HashMap<Vec<u8>, Vec<Uuid>>),
+    /// Locally produced bytes: worker-built or recovery-adopted.
+    BuiltLocally,
+    /// Every stamped tenant's own visibility-gated FindMissingPaths
+    /// answered present.
+    AllTenantProbe,
+    /// Single-tenant probe evidence (merge-time JWT probe): stamps
+    /// only this tenant.
+    ProbedBy(Uuid),
+}
+
+impl StampProvenance {
+    /// Derive the lawful (path_hash, tenant) ownership pairs for one
+    /// derivation's paths under this witness — THE one body
+    /// (signed Q2); both the single-drv and the batched wrappers
+    /// route through it.
+    pub(crate) fn lawful_pairs(
+        &self,
+        output_paths: &[String],
+        attributed: &[Uuid],
+        hashes: &mut Vec<Vec<u8>>,
+        tids: &mut Vec<Uuid>,
+    ) {
+        use sha2::Digest;
+        for p in output_paths {
+            let h = sha2::Sha256::digest(p.as_bytes()).to_vec();
+            match self {
+                StampProvenance::BuiltLocally | StampProvenance::AllTenantProbe => {
+                    for t in attributed {
+                        hashes.push(h.clone());
+                        tids.push(*t);
+                    }
+                }
+                StampProvenance::ProbedBy(probe_tenant) => {
+                    if attributed.contains(probe_tenant) {
+                        hashes.push(h.clone());
+                        tids.push(*probe_tenant);
+                    }
+                }
+                StampProvenance::WalkVerified(verified) => {
+                    if let Some(vts) = verified.get(h.as_slice()) {
+                        for t in attributed.iter().filter(|t| vts.contains(t)) {
+                            hashes.push(h.clone());
+                            tids.push(*t);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl SchedulerDb {
     /// Pin a batch of store paths as live-build inputs for a drv.
     /// SHA-256 each path for store_path_hash (matches narinfo keying).
@@ -68,24 +142,20 @@ impl SchedulerDb {
         &self,
         output_paths: &[String],
         tenant_ids: &[Uuid],
+        provenance: &StampProvenance,
     ) -> Result<u64, sqlx::Error> {
         if output_paths.is_empty() || tenant_ids.is_empty() {
             return Ok(0);
         }
-        use sha2::Digest;
-        // Cartesian product: every path × every tenant. Parallel arrays
-        // for UNNEST (same length by construction).
-        let n = output_paths.len() * tenant_ids.len();
-        let mut hashes: Vec<Vec<u8>> = Vec::with_capacity(n);
-        let mut tids: Vec<Uuid> = Vec::with_capacity(n);
-        for p in output_paths {
-            let h = sha2::Sha256::digest(p.as_bytes()).to_vec();
-            for t in tenant_ids {
-                hashes.push(h.clone());
-                tids.push(*t);
-            }
-        }
-        self.upsert_path_tenants_raw(&hashes, &tids).await
+        // The pair set is DERIVED from the provenance (signed Q2): the
+        // witness decides which (path, tenant) ownership rows are
+        // lawful — a caller cannot widen a one-tenant verdict into the
+        // attributed cartesian.
+        let mut hashes: Vec<Vec<u8>> = Vec::new();
+        let mut tids: Vec<Uuid> = Vec::new();
+        provenance.lawful_pairs(output_paths, tenant_ids, &mut hashes, &mut tids);
+        self.upsert_path_tenants_raw(&hashes, &tids, provenance)
+            .await
     }
 
     /// Pre-flattened variant of [`upsert_path_tenants`]: caller has
@@ -100,8 +170,27 @@ impl SchedulerDb {
         &self,
         hashes: &[Vec<u8>],
         tids: &[Uuid],
+        provenance: &StampProvenance,
     ) -> Result<u64, sqlx::Error> {
         debug_assert_eq!(hashes.len(), tids.len());
+        // Belt-and-braces at the final funnel (signed Q2): the pairs
+        // must be consistent with the witness even when a caller
+        // pre-flattened them.
+        if let StampProvenance::ProbedBy(probe_tenant) = provenance {
+            debug_assert!(
+                tids.iter().all(|t| t == probe_tenant),
+                "ProbedBy stamps carry exactly the probing tenant"
+            );
+        }
+        if let StampProvenance::WalkVerified(verified) = provenance {
+            debug_assert!(
+                hashes
+                    .iter()
+                    .zip(tids.iter())
+                    .all(|(h, t)| verified.get(h.as_slice()).is_some_and(|v| v.contains(t))),
+                "WalkVerified stamps are within the wire-carried sets"
+            );
+        }
         if hashes.is_empty() {
             return Ok(0);
         }

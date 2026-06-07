@@ -115,13 +115,35 @@ fn sig_cell(info: &ValidatedPathInfo, trusted: &[String]) -> bool {
     crate::signing::any_sig_trusted(&info.signatures, trusted, &fp).is_some()
 }
 
-/// Witness: this path passed the tenant sig-visibility verdict for one
-/// interested tenant. Sole mint: [`visible_to_tenant`]'s Visible arm.
-/// `LocalPresence::Present` requires one — the walk cannot treat a
-/// local row as servable without having consulted the gate.
+/// Witness: this path passed the tenant sig-visibility verdict — and
+/// CARRIES the tenants it passed for (bug_139 / signed Q2: the
+/// quantifier travels with the evidence; a consumer cannot widen a
+/// one-tenant verdict into all-tenant ownership because the set is
+/// part of the witness). Sole mints: [`visible_to_tenant`]'s Visible
+/// arms (the consulted tenant's singleton set — empty only in
+/// anonymous/single-tenant mode, where no per-tenant ownership
+/// exists to stamp) and [`merge`](Self::merge). `LocalPresence::Present`
+/// requires one — the walk cannot treat a local row as servable
+/// without having consulted the gate.
 #[must_use]
 #[derive(Debug)]
-pub(crate) struct TenantVisible(());
+pub(crate) struct TenantVisible(Vec<Uuid>);
+
+impl TenantVisible {
+    /// The tenants whose view validated this path (non-empty).
+    pub(crate) fn tenants(&self) -> &[Uuid] {
+        &self.0
+    }
+
+    /// Union two witnesses (both are mints, so the union is one).
+    pub(crate) fn merge(&mut self, other: TenantVisible) {
+        for t in other.0 {
+            if !self.0.contains(&t) {
+                self.0.push(t);
+            }
+        }
+    }
+}
 
 /// Per-job memo of `tenant → trusted-key entries` (bug_115: the
 /// trusted set costs two PG queries; a closure walk consults it for
@@ -188,14 +210,14 @@ pub(crate) async fn visible_to_tenant(
 ) -> Result<Option<TenantVisible>, MetadataError> {
     let Some(tid) = tenant_id else {
         // Anonymous → unfiltered (r[store.tenant.narinfo-filter]).
-        return Ok(Some(TenantVisible(())));
+        return Ok(Some(TenantVisible(tenant_id.into_iter().collect())));
     };
     // r[impl gw.jwt.anon-drv-lookup]
     // .drv files are build INPUTS, not tenant-owned outputs — exempt
     // from tenant-scoped visibility (store-side mirror of the gateway's
     // `jwt_unless_drv`).
     if info.store_path.is_derivation() {
-        return Ok(Some(TenantVisible(())));
+        return Ok(Some(TenantVisible(tenant_id.into_iter().collect())));
     }
 
     // The shared projection (bug_061: the SAME query the batch
@@ -217,7 +239,7 @@ pub(crate) async fn visible_to_tenant(
     };
 
     Ok(match visibility_verdict(owned, any_built, sig_trusted) {
-        VisibilityVerdict::Visible => Some(TenantVisible(())),
+        VisibilityVerdict::Visible => Some(TenantVisible(tenant_id.into_iter().collect())),
         VisibilityVerdict::Hidden => None,
     })
 }

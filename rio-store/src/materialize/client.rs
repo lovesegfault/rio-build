@@ -1976,6 +1976,7 @@ mod tests {
                 rio_proto::types::materialization_outcome::Success {
                     ingested_paths: vec!["/nix/store/aaa-one".into()],
                     verified_paths: vec![],
+                    verified_tenants: vec![],
                 },
             )),
         };
@@ -2437,6 +2438,7 @@ mod tests {
                 rio_proto::types::materialization_outcome::Success {
                     ingested_paths: vec!["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-one".into()],
                     verified_paths: vec![],
+                    verified_tenants: vec![],
                 },
             )),
         };

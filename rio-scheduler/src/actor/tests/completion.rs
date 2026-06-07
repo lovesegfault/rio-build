@@ -2506,10 +2506,19 @@ async fn test_completion_path_tenants_dedup_idempotent() -> TestResult {
     ];
     let tenants = vec![tenant_a, tenant_b];
 
-    let first = sched_db.upsert_path_tenants(&paths, &tenants).await?;
+    // Signed Q2: the direct-call battery exercises the BuiltLocally
+    // class (locally produced bytes — the all-attributed cartesian is
+    // lawful); witness-gated classes are pinned by
+    // walk_success_stamps_only_wire_verified_tenants.
+    let prov = crate::db::live_pins::StampProvenance::BuiltLocally;
+    let first = sched_db
+        .upsert_path_tenants(&paths, &tenants, &prov)
+        .await?;
     assert_eq!(first, 6, "3 paths × 2 tenants = 6 rows inserted");
 
-    let second = sched_db.upsert_path_tenants(&paths, &tenants).await?;
+    let second = sched_db
+        .upsert_path_tenants(&paths, &tenants, &prov)
+        .await?;
     assert_eq!(
         second, 0,
         "re-call with same inputs → 0 new rows (ON CONFLICT DO NOTHING)"

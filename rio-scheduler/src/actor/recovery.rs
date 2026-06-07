@@ -2120,7 +2120,11 @@ impl DagActor {
         // never fired → no tenant attribution → GC
         // under-retains. output_paths was just set above (= the
         // kernel-verified present wanted set).
-        self.upsert_path_tenants_for(drv_hash).await;
+        self.upsert_path_tenants_for(
+            drv_hash,
+            &crate::db::live_pins::StampProvenance::BuiltLocally,
+        )
+        .await;
         // r[impl sched.merge.exec-correlation+8]
         // Same gap as path-tenants above: `handle_success_completion`
         // never fired for this drv, so the terminal chokepoint

@@ -294,7 +294,7 @@ pub(crate) async fn merge_dag_req(
 /// helpers ([`seed_default_tenant`]); tests that need DISTINCT
 /// tenants keep seeding their own.
 pub(crate) const DEFAULT_TEST_TENANT: Uuid =
-    Uuid::from_u128(0xD0FA_17DE_0000_4000_8000_00000000D0FA);
+    Uuid::from_u128(0xD0FA_17DE_0000_4000_8000_0000_0000_D0FA);
 
 /// Idempotently seed [`DEFAULT_TEST_TENANT`]. Called by every async
 /// setup helper that owns a pool; safe to call repeatedly.

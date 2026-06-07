@@ -26,7 +26,7 @@ pub(crate) use builds::BuildTerminalRow;
 mod derivations;
 mod executions;
 mod history;
-mod live_pins;
+pub(crate) mod live_pins;
 pub(crate) mod materialization;
 pub(crate) mod open_attempts;
 mod recovery;

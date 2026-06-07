@@ -1497,19 +1497,137 @@ async fn cancellation_closes_open_attempt_charge_free() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.gc.path-tenants-upsert]
+/// Signed Q2 (bug_139): walk-Success ownership stamps INTERSECT the
+/// wire-carried per-path verified-tenant sets — a Success whose walk
+/// verified a path under tenant A only must NOT stamp tenant B's
+/// ownership, even though B is attributed (interested). B's interest
+/// stays open; a later walk that verifies under B stamps lawfully.
+///
+/// Strawman red (intersection reversed to the attributed cartesian —
+/// the pre-Q2 shape): `rows == [A, B]` where the law demands `[A]`.
+#[tokio::test]
+async fn walk_success_stamps_only_wire_verified_tenants() -> TestResult {
+    use rio_auth::hmac::HmacSigner;
+    use sha2::Digest;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let (handle, _actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |_cfg, p| {
+            p.service_signer = Some(std::sync::Arc::new(HmacSigner::from_key(
+                b"mock-store-harness-service-key32".to_vec(),
+            )));
+        });
+    let tenant_a = rio_store::test_helpers::seed_tenant(&db.pool, "q2-stamp-a").await;
+    let tenant_b = rio_store::test_helpers::seed_tenant(&db.pool, "q2-stamp-b").await;
+
+    let out = test_store_path("q2-stamp-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut node = make_node("q2stamp");
+    node.expected_output_paths = vec![out.clone()];
+    node.wanted_output_names = vec!["out".into()];
+
+    // Two builds, two tenants, one node: both attributed.
+    for tenant in [tenant_a, tenant_b] {
+        let mut n = make_node("q2stamp");
+        n.expected_output_paths = vec![out.clone()];
+        n.wanted_output_names = vec!["out".into()];
+        merge_dag_req(
+            &handle,
+            MergeDagRequest {
+                build_id: Uuid::new_v4(),
+                tenant_id: Some(tenant),
+                priority_class: PriorityClass::Scheduled,
+                nodes: vec![n],
+                edges: vec![],
+                options: BuildOptions::default(),
+                keep_going: false,
+                traceparent: String::new(),
+                jti: None,
+                jwt_token: Some("harness-tenant-jwt".into()),
+            },
+        )
+        .await?;
+    }
+    barrier(&handle).await;
+
+    let assignment = match claim_materialization(&handle, "q2stamp", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+
+    // The walk verified the path under tenant A ONLY.
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        "q2stamp",
+        mat_success_outcome_verified(
+            vec![out.clone()],
+            vec![],
+            vec![(out.clone(), vec![tenant_a])],
+        ),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("success report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    let out_hash = sha2::Sha256::digest(out.as_bytes()).to_vec();
+    let mut rows: Vec<Uuid> =
+        sqlx::query_scalar("SELECT tenant_id FROM path_tenants WHERE store_path_hash = $1")
+            .bind(&out_hash)
+            .fetch_all(&db.pool)
+            .await?;
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![tenant_a],
+        "ownership stamps must INTERSECT the wire-verified sets: tenant B \
+         is attributed but its view never validated the path"
+    );
+    Ok(())
+}
+
 // ── T-6.2: the Phase A flag-on smoke battery (the dormancy proof's
 //    "dormant ≠ vestigial" half) ─────────────────────────────────────────
 
 /// A materialization Success outcome covering `ingested` + `verified`.
+///
+/// Signed Q2: carries NO per-path verified-tenant sets — consumption
+/// stamps nothing into `path_tenants` (the conservative wire shape).
+/// Tests pinning the stamping law use
+/// [`mat_success_outcome_verified`].
 fn mat_success_outcome(
     ingested: Vec<String>,
     verified: Vec<String>,
+) -> rio_proto::types::MaterializationOutcome {
+    mat_success_outcome_verified(ingested, verified, vec![])
+}
+
+/// [`mat_success_outcome`] with explicit per-path verified-tenant
+/// sets (the signed-Q2 wire: `(store_path, verified tenants)`).
+fn mat_success_outcome_verified(
+    ingested: Vec<String>,
+    verified: Vec<String>,
+    verified_tenants: Vec<(String, Vec<Uuid>)>,
 ) -> rio_proto::types::MaterializationOutcome {
     rio_proto::types::MaterializationOutcome {
         outcome: Some(rio_proto::types::materialization_outcome::Outcome::Success(
             rio_proto::types::materialization_outcome::Success {
                 ingested_paths: ingested,
                 verified_paths: verified,
+                verified_tenants: verified_tenants
+                    .into_iter()
+                    .map(|(p, ts)| {
+                        rio_proto::types::materialization_outcome::success::PathTenants {
+                            store_path: p,
+                            verified_tenant_ids: ts.iter().map(|t| t.to_string()).collect(),
+                        }
+                    })
+                    .collect(),
             },
         )),
     }

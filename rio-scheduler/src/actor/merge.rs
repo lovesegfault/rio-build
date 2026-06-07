@@ -1101,7 +1101,22 @@ impl DagActor {
                           "failed to persist cache-hit Completed status batch");
                 }
             }
-            self.upsert_path_tenants_for_batch(&completed_batch).await;
+            // Signed Q2: the merge-time probe rode the SUBMITTING
+            // build's JWT (single-tenant evidence) — stamps ONLY that
+            // tenant; a tenant-less submission's probe verifies for no
+            // one (nothing stamped; other interested tenants keep
+            // their interest open).
+            if let Some(probe_tenant) = self
+                .builds
+                .get(std::borrow::Borrow::borrow(&build_id))
+                .and_then(|b| b.tenant_id)
+            {
+                self.upsert_path_tenants_for_batch(
+                    &completed_batch,
+                    &crate::db::live_pins::StampProvenance::ProbedBy(probe_tenant),
+                )
+                .await;
+            }
         }
         // Fan-out: collect other builds interested in re-probe-
         // completed nodes + emit DerivationCached to each. Caller
@@ -1312,8 +1327,16 @@ impl DagActor {
         if cached > 0 {
             metrics::counter!("rio_scheduler_cache_hits_total", "source" => "existing")
                 .increment(u64::from(cached));
-            self.upsert_path_tenants_for_batch(&preexisting_completed)
+            // Signed Q2: same single-JWT evidence class as
+            // apply_cached_hits — ProbedBy(submitting tenant) only.
+            if let Some(probe_tenant) = self.builds.get(&ingest.build_id).and_then(|b| b.tenant_id)
+            {
+                self.upsert_path_tenants_for_batch(
+                    &preexisting_completed,
+                    &crate::db::live_pins::StampProvenance::ProbedBy(probe_tenant),
+                )
                 .await;
+            }
         }
         (cached, first_failed)
     }
