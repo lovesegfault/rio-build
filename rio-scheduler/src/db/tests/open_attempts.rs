@@ -379,3 +379,56 @@ async fn recently_closed_window_is_build_lane_only() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// bug_184 + merged_bug_108: the typed skew-predicate view. The
+/// backed check is (drv, holder) pair-keyed — a foreign executor's
+/// open attempt backs NOTHING for another holder — and the wedge
+/// conjunction is kind-aware: an open BUILD attempt on the drv
+/// (documented-legitimate coexistence, bug_266) defeats the wedge.
+#[test]
+fn open_attempt_view_is_pair_keyed_and_kind_aware() {
+    use crate::db::open_attempts::{OpenAttemptRow, OpenAttemptsByKind};
+    fn row(drv: &str, executor: &str, kind: &str) -> OpenAttemptRow {
+        use crate::db::open_attempts::OpenAttemptRow;
+        OpenAttemptRow {
+            derivation_id: Uuid::now_v7(),
+            drv_hash: drv.into(),
+            drv_path: format!("/nix/store/{drv}.drv"),
+            exec_id: Uuid::now_v7(),
+            executor_id: executor.into(),
+            system: "x86_64-linux".into(),
+            is_fixed_output: false,
+            source_node: None,
+            generation: 1,
+            assigned_at_epoch_secs: 0.0,
+            age_secs: 0.0,
+            deadline_secs: Some(600.0),
+            attempt_kind: kind.into(),
+        }
+    }
+    let opens = OpenAttemptsByKind {
+        build: vec![row("drv-coexist", "builder-0", "build")],
+        materialization: vec![row("drv-claimed", "store-a", "materialization")],
+    };
+    let view = opens.view();
+
+    // Pair-keyed backing (bug_184): only the holder's own attempt backs.
+    assert!(view.backs_claim("drv-claimed", "store-a"));
+    assert!(
+        !view.backs_claim("drv-claimed", "store-b"),
+        "a FOREIGN open attempt must not back another holder's claim"
+    );
+
+    // Kind-aware wedge conjunction (merged_bug_108), in the exact
+    // form the sweep evaluates: dispatched && !mat && !build.
+    let wedged = |drv: &str| !view.materialization_open(drv) && !view.build_open(drv);
+    assert!(
+        !wedged("drv-coexist"),
+        "an open BUILD attempt is legitimate coexistence, never a wedge"
+    );
+    assert!(!wedged("drv-claimed"), "an open MAT attempt is not a wedge");
+    assert!(
+        wedged("drv-orphan"),
+        "no attempt of either kind = wedge candidate"
+    );
+}

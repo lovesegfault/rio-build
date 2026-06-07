@@ -477,10 +477,8 @@ impl DagActor {
         }
         let pending = std::mem::take(&mut self.pending_carriers);
         for (drv_hash, carried) in pending {
-            let alive = self
-                .dag
-                .node(&drv_hash)
-                .is_some_and(|s| !s.status().is_terminal());
+            let status = self.dag.node(&drv_hash).map(|s| s.status());
+            let alive = status.is_some_and(|s| !s.is_terminal());
             if !alive {
                 metrics::counter!("rio_scheduler_materialization_carrier_dropped_total")
                     .increment(1);
@@ -489,6 +487,21 @@ impl DagActor {
                     "carried realized paths dropped: node terminal/gone before \
                      the stale-reset job row applied"
                 );
+                continue;
+            }
+            // merged_bug_108: while the node is dispatched
+            // (Assigned/Running — a build attempt is out), creating
+            // the Pending job would seed exactly the legitimate
+            // coexistence the skew sweep must not page on, and no
+            // admission path consumes it until the build settles.
+            // Keep the carrier stashed; retry once the node leaves
+            // the dispatched states (requeue or terminal).
+            if matches!(
+                status,
+                Some(crate::state::DerivationStatus::Assigned)
+                    | Some(crate::state::DerivationStatus::Running)
+            ) {
+                self.pending_carriers.push((drv_hash, carried));
                 continue;
             }
             let carried_opt = (!carried.is_empty()).then(|| carried.clone());
@@ -856,18 +869,21 @@ impl DagActor {
         // recoverable skew into debug-build crashes.
         let ghosts: Vec<(crate::state::DrvHash, crate::state::ExecutorId)> = {
             use crate::state::DerivationStatus::{Assigned, Running};
-            let mat_open: std::collections::HashSet<&str> = opens
-                .materialization
-                .iter()
-                .map(|a| a.drv_hash.as_str())
-                .collect();
+            // Typed pair/kind view (bug_184 + merged_bug_108): the
+            // backed check is (drv, holder)-keyed and the wedge
+            // predicate is kind-aware by construction.
+            let view = opens.view();
             let mut ghosts = Vec::new();
             let mut first_strikes: Vec<crate::state::DrvHash> = Vec::new();
             let mut cleared_strikes: Vec<crate::state::DrvHash> = Vec::new();
             for (drv_hash, entry) in self.materialization_jobs.iter() {
                 match entry.holder() {
                     Some(holder) => {
-                        if mat_open.contains(drv_hash.as_str()) {
+                        // bug_184: backed = an open attempt by THIS
+                        // holder. A foreign executor's open attempt
+                        // neither masks the ghost nor clears the
+                        // strike.
+                        if view.backs_claim(drv_hash.as_str(), holder.as_str()) {
                             // Backed claim: reset any stale strike.
                             if entry.strike_armed() {
                                 cleared_strikes.push(drv_hash.clone());
@@ -881,11 +897,16 @@ impl DagActor {
                         }
                     }
                     None => {
+                        // merged_bug_108: a Pending job under an open
+                        // BUILD attempt is documented-legitimate
+                        // coexistence (bug_266) — the wedge requires
+                        // BOTH kinds absent.
                         let wedged = self
                             .dag
                             .node(drv_hash.as_str())
                             .is_some_and(|s| matches!(s.status(), Assigned | Running))
-                            && !mat_open.contains(drv_hash.as_str());
+                            && !view.materialization_open(drv_hash.as_str())
+                            && !view.build_open(drv_hash.as_str());
                         if wedged {
                             metrics::counter!(
                                 "rio_scheduler_materialization_view_node_skew_total",

@@ -545,6 +545,66 @@ pub(crate) struct OpenAttemptsByKind {
     pub materialization: Vec<OpenAttemptRow>,
 }
 
+impl OpenAttemptsByKind {
+    /// The typed skew-predicate view (bug_184 + merged_bug_108).
+    pub(crate) fn view(&self) -> OpenAttemptView<'_> {
+        OpenAttemptView {
+            mat_pairs: self
+                .materialization
+                .iter()
+                .map(|a| (a.drv_hash.as_str(), a.executor_id.as_str()))
+                .collect(),
+            mat_drvs: self
+                .materialization
+                .iter()
+                .map(|a| a.drv_hash.as_str())
+                .collect(),
+            build_drvs: self.build.iter().map(|a| a.drv_hash.as_str()).collect(),
+        }
+    }
+}
+
+/// Typed view over the open attempts for the sweep's skew/wedge
+/// predicates (bug_184 + merged_bug_108).
+///
+/// Claims are keyed by the FULL `(drv_hash, executor_id)` pair — a
+/// drv-only "is this claim backed" test does not typecheck against
+/// [`Self::backs_claim`] — and the two attempt KINDS are separate
+/// lookups, so a kind-blind wedge predicate cannot be written by
+/// reaching for "the" open set (build-attempt coexistence with a
+/// materialization job is documented-legitimate, bug_266).
+pub(crate) struct OpenAttemptView<'a> {
+    mat_pairs: std::collections::HashSet<(&'a str, &'a str)>,
+    mat_drvs: std::collections::HashSet<&'a str>,
+    build_drvs: std::collections::HashSet<&'a str>,
+}
+
+impl OpenAttemptView<'_> {
+    /// The claim `(drv, holder)` is backed by an open MATERIALIZATION
+    /// attempt of the SAME holder. bug_184: a foreign executor's open
+    /// attempt (reachable via the fresh-INSERT-below-floor fence
+    /// residual) must not mask another executor's ghost nor clear its
+    /// armed strike.
+    pub(crate) fn backs_claim(&self, drv_hash: &str, holder: &str) -> bool {
+        self.mat_pairs.contains(&(drv_hash, holder))
+    }
+
+    /// Any open materialization attempt on the drv — the unclaimed
+    /// (`None`-holder) split-release check is deliberately drv-keyed:
+    /// an attempt by ANY executor proves the job is not wedged.
+    pub(crate) fn materialization_open(&self, drv_hash: &str) -> bool {
+        self.mat_drvs.contains(drv_hash)
+    }
+
+    /// Any open BUILD attempt on the drv. merged_bug_108: wedge
+    /// predicates MUST consult this — a Pending job under an open
+    /// build attempt (the stale-reset lane creates jobs while a build
+    /// attempt is open) is legitimate coexistence, not a wedge.
+    pub(crate) fn build_open(&self, drv_hash: &str) -> bool {
+        self.build_drvs.contains(drv_hash)
+    }
+}
+
 impl SchedulerDb {
     /// Recovery view-rebuild load (Phase B, T-4.3): every unresolved
     /// materialization job plus the holder of its open MATERIALIZATION

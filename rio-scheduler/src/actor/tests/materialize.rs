@@ -9085,3 +9085,77 @@ async fn delivery_echoes_minted_job_binding() -> TestResult {
     );
     Ok(())
 }
+
+/// bug_184: a FOREIGN executor's open materialization attempt must
+/// not mask another executor's claimed-no-attempt ghost. The backed
+/// check is pair-keyed (drv, holder) — pre-fix it keyed on drv_hash
+/// alone, so executor A's open attempt (the fresh-INSERT-below-floor
+/// fence residual shape) both masked executor B's ghost AND cleared
+/// its armed strike every sweep, deferring the self-heal a full
+/// establishment window plus two sweeps.
+// r[verify sched.materialize.claim-coherence]
+#[tokio::test]
+async fn foreign_open_attempt_does_not_mask_anothers_ghost() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let out = test_store_path("maton-foreign-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut n = make_node("maton-foreign");
+    n.expected_output_paths = vec![out.clone()];
+    let build_id = Uuid::new_v4();
+    let _ev = merge_dag(&handle, build_id, vec![n], vec![], false).await?;
+    barrier(&handle).await;
+
+    // Executor B claims; its assignment dies out-of-band (the ghost
+    // seed, same crash-window shape as the sibling test above).
+    let assignment =
+        match claim_materialization(&handle, "maton-foreign", "store-replica-b-w0").await {
+            Ok(PullOutcome::Deliver(a)) => *a,
+            other => panic!("claim must deliver, got {other:?}"),
+        };
+    let _exec_id: Uuid = assignment.exec_id.parse()?;
+    let closed = sqlx::query(
+        "UPDATE assignments SET status = 'completed', completed_at = now()
+         WHERE status IN ('pending', 'acknowledged')",
+    )
+    .execute(&db.pool)
+    .await?
+    .rows_affected();
+    assert_eq!(closed, 1, "the seed closes exactly B's open assignment");
+
+    // FOREIGN open materialization attempt by executor A on the SAME
+    // drv (raw seed — the fence-residual shape: durable rows the
+    // in-memory view never minted).
+    let foreign_exec = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO drv_executions \
+             (exec_id, drv_hash, executor_id, started_at, deadline_secs, attempt_kind) \
+         VALUES ($1, $2, 'store-replica-a-w0', now(), 600, 'materialization')",
+    )
+    .bind(foreign_exec)
+    .bind(format!("{:0>32}", "matonforeign"))
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO assignments (derivation_id, builder_id, generation, status, exec_id) \
+         SELECT derivation_id, 'store-replica-a-w0', 1, 'pending', $1 \
+         FROM derivations WHERE drv_hash = 'maton-foreign'",
+    )
+    .bind(foreign_exec)
+    .execute(&db.pool)
+    .await?;
+
+    // Two sweeps: B's claim is unbacked BY B both times (A's foreign
+    // attempt must not count), so the strike arms then the repair
+    // releases B's claim.
+    tick(&handle).await?;
+    tick(&handle).await?;
+    let redelivered = claim_materialization(&handle, "maton-foreign", "store-replica-c-w0").await;
+    assert!(
+        matches!(redelivered, Ok(PullOutcome::Deliver(_))),
+        "after two unbacked-by-holder sweeps the ghost must be repaired and \
+         re-claimable (pre-fix red: the foreign drv-keyed match masked the \
+         ghost forever), got {redelivered:?}"
+    );
+    Ok(())
+}
