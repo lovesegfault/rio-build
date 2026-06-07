@@ -1,21 +1,33 @@
-//! The read path's loss ledger: data-loss is counted per HOLE
-//! IDENTITY, divergence per event — and this module is the only place
-//! either counter is touched.
+//! The read path's anomaly ledger: BOTH read-path anomaly counters —
+//! data-loss and divergence — count per ANOMALY IDENTITY
+//! `(family, exec_id, s3_key)`, and this module is the only place
+//! either is touched.
 //!
 //! merged_bug_164: `rio_store_log_read_data_loss_total` is an
 //! alert-on-ANY-increment counter (its PrometheusRule pages), but the
 //! read path used to increment it per VISIT — every re-read of one
 //! already-known missing object re-paged, and recoverable
 //! divergence-grade events (an overlong object whose claimed lines all
-//! served) fed the same pager. The chokepoint split:
+//! served) fed the same pager.
 //!
-//! - [`note_hole`] — the SOLE increment site for the loss counter,
-//!   deduplicated by `(exec_id, s3_key)` in a bounded per-process
-//!   ledger: one hole = one page, no matter how many readers hit it.
-//! - [`note_divergence`] — the warn-severity
-//!   `rio_store_log_read_divergence_total{kind}` family for
-//!   served-anyway divergence (`overlong`, `short_object_covered`),
-//!   excluded from the critical alert by NAME.
+//! bug_206: the divergence family then repeated the same defect one
+//! alert over — `note_divergence` counted per reader visit while the
+//! wave-2 `RioLogReadDivergence` alert (`sum(increase(..[1h])) > 10`)
+//! reads it as incidence, so ONE benign divergent chunk watched
+//! ≥11×/hour kept the warning firing for the chunk's TTL, and the
+//! counter could not distinguish 1 chunk × 1000 visits from 1000
+//! chunks × 1 visit. The chokepoint is now ONE identity-keyed ledger
+//! for every read-path anomaly counter (the kind/reason stays a metric
+//! label; the FAMILY is part of the ledger key, so a hole and a
+//! divergence on the same object are distinct anomalies):
+//!
+//! - [`note_hole`] — the SOLE increment site for the loss counter:
+//!   one hole = one page, no matter how many readers hit it.
+//! - [`note_divergence`] — the SOLE increment site for the
+//!   warn-severity `rio_store_log_read_divergence_total{kind}` family
+//!   (`overlong`, `short_object_covered`, `missing_object_covered`),
+//!   excluded from the critical alert by NAME: one divergent object =
+//!   one trend tick.
 //!
 //! The `log-cap-status-chokepoint` misc-check pins the loss counter's
 //! name to this file (plus the describe/seed sites in `lib.rs`), so a
@@ -49,16 +61,25 @@ fn ledger() -> &'static Mutex<Ledger> {
     LEDGER.get_or_init(|| Mutex::new(Ledger::default()))
 }
 
+/// The anomaly family — part of the ledger KEY (bug_206): a hole and
+/// a divergence on the same object are distinct anomalies; deduping
+/// one must never suppress the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum AnomalyFamily {
+    Loss,
+    Divergence,
+}
+
 #[derive(Default)]
 struct Ledger {
-    seen: HashSet<(Uuid, String)>,
-    order: VecDeque<(Uuid, String)>,
+    seen: HashSet<(AnomalyFamily, Uuid, String)>,
+    order: VecDeque<(AnomalyFamily, Uuid, String)>,
 }
 
 impl Ledger {
     /// Insert; true iff this is the key's first sighting.
-    fn first_sighting(&mut self, exec_id: Uuid, s3_key: &str) -> bool {
-        if self.seen.contains(&(exec_id, s3_key.to_owned())) {
+    fn first_sighting(&mut self, family: AnomalyFamily, exec_id: Uuid, s3_key: &str) -> bool {
+        if self.seen.contains(&(family, exec_id, s3_key.to_owned())) {
             return false;
         }
         if self.order.len() >= LEDGER_CAP
@@ -66,13 +87,13 @@ impl Ledger {
         {
             self.seen.remove(&evicted);
         }
-        self.seen.insert((exec_id, s3_key.to_owned()));
-        self.order.push_back((exec_id, s3_key.to_owned()));
+        self.seen.insert((family, exec_id, s3_key.to_owned()));
+        self.order.push_back((family, exec_id, s3_key.to_owned()));
         true
     }
 }
 
-// r[impl store.log.loss-event-identity]
+// r[impl store.log.loss-event-identity+1]
 /// Record an unrecoverable hole in a stored build log. Increments
 /// `rio_store_log_read_data_loss_total{reason}` exactly once per
 /// `(exec_id, s3_key)` per process — the counter's contract is one
@@ -86,7 +107,7 @@ pub(super) fn note_hole(exec_id: Uuid, s3_key: &str, reason: &'static str) -> bo
     let first = ledger()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .first_sighting(exec_id, s3_key);
+        .first_sighting(AnomalyFamily::Loss, exec_id, s3_key);
     if first {
         metrics::counter!(
             "rio_store_log_read_data_loss_total",
@@ -97,18 +118,30 @@ pub(super) fn note_hole(exec_id: Uuid, s3_key: &str, reason: &'static str) -> bo
     first
 }
 
-// r[impl store.log.loss-event-identity]
+// r[impl store.log.loss-event-identity+1]
 /// Record a served-anyway divergence between a chunk's manifest row
-/// and its object: warn-severity, per EVENT (no dedup — the volume is
-/// the signal), and excluded from the critical loss alert by name.
+/// and its object: warn-severity, ONCE per divergent-object identity
+/// `(exec_id, s3_key)` per process (bug_206 — the trend alert reads
+/// this counter as incidence; a persistent divergent chunk re-visited
+/// by every traversal must not re-tick it), excluded from the
+/// critical loss alert by name. The kind stays a label; the ledger
+/// key carries the family, so a later HOLE on the same object still
+/// pages. Returns whether this call was the first sighting.
 /// `kind` MUST be a member of [`crate::LOG_READ_DIVERGENCE_KINDS`]
-/// (`overlong`, `short_object_covered`).
-pub(super) fn note_divergence(kind: &'static str) {
-    metrics::counter!(
-        "rio_store_log_read_divergence_total",
-        "kind" => kind
-    )
-    .increment(1);
+/// (`overlong`, `short_object_covered`, `missing_object_covered`).
+pub(super) fn note_divergence(exec_id: Uuid, s3_key: &str, kind: &'static str) -> bool {
+    let first = ledger()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .first_sighting(AnomalyFamily::Divergence, exec_id, s3_key);
+    if first {
+        metrics::counter!(
+            "rio_store_log_read_divergence_total",
+            "kind" => kind
+        )
+        .increment(1);
+    }
+    first
 }
 
 /// The typed unservable kinds — the closed vocabulary of
@@ -194,6 +227,38 @@ mod tests {
         assert!(note_hole(Uuid::now_v7(), &k1, "missing_object"));
     }
 
+    /// bug_206 RED-FIRST: a persistent divergent chunk re-visited by
+    /// every TailLog traversal must count ONCE per divergent object
+    /// identity, not once per visit — the RioLogReadDivergence alert
+    /// (sum(increase(..[1h])) > 10) reads the counter as incidence.
+    #[test]
+    fn divergence_identity_counted_once() {
+        let rec = rio_test_support::metrics::CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let exec = Uuid::now_v7();
+        let ns = Uuid::now_v7();
+        let k = format!("logs/{ns}/d1");
+        note_divergence(exec, &k, "overlong");
+        note_divergence(exec, &k, "overlong");
+        assert_eq!(
+            rec.get("rio_store_log_read_divergence_total{kind=overlong}"),
+            1,
+            "one divergent object, many visits, ONE increment"
+        );
+        // A different object under the same exec is a new sighting.
+        note_divergence(exec, &format!("logs/{ns}/d2"), "overlong");
+        assert_eq!(
+            rec.get("rio_store_log_read_divergence_total{kind=overlong}"),
+            2
+        );
+        // Family separation: a HOLE on the already-diverged object is
+        // a DISTINCT anomaly and still pages.
+        assert!(
+            note_hole(exec, &k, "missing_object"),
+            "hole and divergence on one object are different anomalies"
+        );
+    }
+
     /// The ledger bound: eviction is FIFO and bounded, so the dedup
     /// degrades (oldest forgotten) rather than growing without bound.
     ///
@@ -207,15 +272,15 @@ mod tests {
         let mut ledger = Ledger::default();
         let exec = Uuid::now_v7();
         let first_key = "logs/bound-0".to_owned();
-        assert!(ledger.first_sighting(exec, &first_key));
+        assert!(ledger.first_sighting(AnomalyFamily::Loss, exec, &first_key));
         for i in 1..=LEDGER_CAP {
-            ledger.first_sighting(exec, &format!("logs/bound-{i}"));
+            ledger.first_sighting(AnomalyFamily::Loss, exec, &format!("logs/bound-{i}"));
         }
         // first_key was evicted by the CAP+1'th insert: re-noting it is
         // a "first" sighting again (and that re-insert evicts bound-1,
         // the then-oldest).
-        assert!(ledger.first_sighting(exec, &first_key));
+        assert!(ledger.first_sighting(AnomalyFamily::Loss, exec, &first_key));
         // Eviction is EXACT FIFO: bound-2 survived both evictions.
-        assert!(!ledger.first_sighting(exec, "logs/bound-2"));
+        assert!(!ledger.first_sighting(AnomalyFamily::Loss, exec, "logs/bound-2"));
     }
 }

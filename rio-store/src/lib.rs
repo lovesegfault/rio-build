@@ -611,15 +611,18 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_store_log_read_divergence_total",
-        "Manifest-row/object divergence the read path served across, by \
-         kind: overlong (the object holds more lines than its row \
-         claims; the unclaimed excess is discarded, every claimed line \
-         serves), short_object_covered (the object holds fewer lines \
-         than its row claims but remaining rows cover the span; every \
-         claimed line serves). Warn-severity trend signal — deliberately \
-         excluded from the page-on-any-increment loss alert; sustained \
-         growth means the cutter/manifest write path is producing \
-         inconsistent pairs."
+        "Manifest-row/object divergence the read path served across, \
+         counted ONCE per divergent-object identity (exec_id, s3_key) \
+         per process (bug_206 — the trend alert reads this as \
+         incidence, never per read visit), by kind: overlong (the \
+         object holds more lines than its row claims; the unclaimed \
+         excess is discarded, every claimed line serves), \
+         short_object_covered (fewer lines than claimed but remaining \
+         rows cover the span), missing_object_covered (object gone but \
+         served prefix + remaining rows cover the span). Warn-severity \
+         trend signal — deliberately excluded from the \
+         page-on-any-increment loss alert; sustained growth means the \
+         cutter/manifest write path is producing inconsistent pairs."
     );
     describe_counter!(
         "rio_store_log_tail_proxied_total",
@@ -734,7 +737,8 @@ pub const LOG_READ_LOSS_REASONS: &[&str] = &["missing_object", "short_object"];
 /// Log read-path served-anyway divergence kinds (logs/loss.rs
 /// `note_divergence`).
 #[cfg(feature = "server")]
-pub const LOG_READ_DIVERGENCE_KINDS: &[&str] = &["overlong", "short_object_covered"];
+pub const LOG_READ_DIVERGENCE_KINDS: &[&str] =
+    &["overlong", "short_object_covered", "missing_object_covered"];
 
 /// GC chunk-collect cycle outcomes.
 #[cfg(feature = "server")]

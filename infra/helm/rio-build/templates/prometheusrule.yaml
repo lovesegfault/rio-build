@@ -678,11 +678,12 @@ spec:
           annotations:
             summary: rio-store build-log manifest/object divergence trend
             description: >-
-              TailLog reads observed {{`{{ $value | humanize }}`}}
-              manifest/object divergence event(s) in the last hour
-              (kind label: overlong / short_object_covered). Lines all
-              served; investigate the cutter and manifest write path
-              for inconsistent row/object pairs.
+              TailLog reads sighted {{`{{ $value | humanize }}`}}
+              newly divergent chunk object(s) in the last hour, counted
+              once per (exec_id, s3_key) identity (kind label: overlong
+              / short_object_covered / missing_object_covered). Lines
+              all served; investigate the cutter and manifest write
+              path for inconsistent row/object pairs.
 
         # refcount-formal Wave A1: the chunk collector's mark phase is
         # fail-closed -- ANY existing manifest whose chunk_list fails

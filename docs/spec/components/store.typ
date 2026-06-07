@@ -2024,15 +2024,20 @@ would commit and the read side then materialized as 4.19M allocations ---
 a ~33x resident amplification the byte bound never saw, reachable through
 a wire admission path whose decode cap (256 MiB) dwarfed the chunk it fed.
 
-#r("store.log.loss-event-identity")[
-  The read path's unrecoverable-loss counter is incremented in exactly one
-  module, once per hole identity (execution, object key) per process ---
-  never per read visit --- and only for holes: a manifest row that no
-  longer stands when its object is found missing (the sweep race) MUST be
-  a clean skip, and a divergence every claimed line still serves across
-  (overlong object, covered short) MUST feed the warn-severity divergence
-  family instead. The loss alert pages on any increment; the increment
-  therefore carries the page's meaning.
+#r("store.log.loss-event-identity+1")[
+  Every read-path anomaly counter is incremented in exactly one module,
+  once per anomaly identity (family, execution, object key) per process
+  --- never per read visit. For the unrecoverable-loss family: a manifest
+  row that no longer stands when its object is found missing (the sweep
+  race) MUST be a clean skip, and a divergence every claimed line still
+  serves across (overlong object, covered short or missing object) MUST
+  feed the warn-severity divergence family instead. The divergence family
+  counts once per divergent-object identity with the kind as a label ---
+  its trend alert reads the counter as incidence, so a persistent
+  divergent object re-visited by every traversal MUST NOT re-tick it. The
+  family is part of the ledger key: a hole and a divergence on the same
+  object are distinct anomalies. The loss alert pages on any increment;
+  the increment therefore carries the page's meaning.
 ]
 The pre-fix read path incremented the page-on-any-increment loss counter
 once per VISIT (N readers of one missing object = N pages), and routed

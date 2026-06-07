@@ -278,7 +278,7 @@ pub async fn read_chunk(
                         "TailLog: missing chunk object fully covered by served \
                          prefix + remaining rows (clean skip)"
                     );
-                    super::loss::note_divergence("missing_object_covered");
+                    super::loss::note_divergence(chunk.exec_id, &key, "missing_object_covered");
                     return Ok(Vec::new());
                 }
                 rio_log_kernel::ShortObjectPolicy::UnservableHole => {
@@ -393,7 +393,11 @@ pub async fn read_chunk(
                     // unrecoverable holes. The error! above carries
                     // the corruption-grade signal; the warn-severity
                     // family carries the trend.
-                    super::loss::note_divergence("short_object_covered");
+                    super::loss::note_divergence(
+                        chunk.exec_id,
+                        &chunk.s3_key,
+                        "short_object_covered",
+                    );
                 }
                 rio_log_kernel::ShortObjectPolicy::UnservableHole => {
                     return Err(super::loss::refuse_permanent(
@@ -422,7 +426,7 @@ pub async fn read_chunk(
             // reroute red: pre-fix this fed the page-on-any-increment
             // loss counter once per visit): every line the row claims
             // serves normally; only the unclaimed excess is discarded.
-            super::loss::note_divergence("overlong");
+            super::loss::note_divergence(chunk.exec_id, &chunk.s3_key, "overlong");
         }
         None => {}
     }
@@ -736,7 +740,7 @@ mod tests {
             .sum()
     }
 
-    // r[verify store.log.loss-event-identity]
+    // r[verify store.log.loss-event-identity+1]
     /// merged_bug_164 trio leg 1 (recorded red: pre-fix delta was 1 —
     /// the overlong arm fed the page-on-any-increment loss counter):
     /// an overlong object serves every claimed line; the loss counter
@@ -769,7 +773,7 @@ mod tests {
         );
     }
 
-    // r[verify store.log.loss-event-identity]
+    // r[verify store.log.loss-event-identity+1]
     /// merged_bug_164 trio leg 2 (recorded red: pre-fix this was
     /// Err("missing chunk object (data loss)") + a counter increment):
     /// object gone AND row gone = the sweep deleted the chunk between
@@ -802,7 +806,7 @@ mod tests {
         assert_eq!(cursor.next_line(), 0);
     }
 
-    // r[verify store.log.loss-event-identity]
+    // r[verify store.log.loss-event-identity+1]
     /// merged_bug_164 trio leg 3 (recorded red: pre-fix N re-reads of
     /// one missing object incremented N times — delta was 3): a hole
     /// is counted once per identity, however many readers hit it. The
