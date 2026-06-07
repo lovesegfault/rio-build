@@ -422,7 +422,7 @@ impl DagActor {
                     Some(exec_id)
                 );
                 let assignment = self
-                    .build_assignment_proto(&drv_hash, &pulling_identity)
+                    .build_assignment_proto(&drv_hash, &pulling_identity, kind)
                     .await
                     .ok_or_else(|| {
                         PullRejection::Internal("derivation vanished during re-pull".into())
@@ -673,7 +673,7 @@ impl DagActor {
         }
 
         let assignment = self
-            .build_assignment_proto(drv_hash, pulling_identity)
+            .build_assignment_proto(drv_hash, pulling_identity, kind)
             .await
             .ok_or_else(|| {
                 PullRejection::Internal("derivation vanished while building the payload".into())

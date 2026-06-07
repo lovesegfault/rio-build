@@ -9022,3 +9022,53 @@ async fn bogus_wanted_names_never_complete_vacuously() -> TestResult {
     );
     Ok(())
 }
+
+/// merged_bug_026 (producer half): every materialization delivery —
+/// the fresh mint AND the held-attempt re-delivery — echoes the job it
+/// was minted under (`WorkAssignment.job_id`, the producer-asserted
+/// binding the client keys identity by). The kernel's Pending arm can
+/// answer a stale nonce-presenting pull with the SUCCESSOR job's
+/// delivery, so the binding must ride the wire, not be reconstructed
+/// from the puller's ledger.
+#[tokio::test]
+async fn delivery_echoes_minted_job_binding() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let out = test_store_path("mat-jobbind-out");
+    let mut n = make_node("mat-jobbind");
+    n.expected_output_paths = vec![out.clone()];
+    n.wanted_output_names = vec!["out".into()];
+    merge_dag(&handle, Uuid::new_v4(), vec![n], vec![], false).await?;
+    barrier(&handle).await;
+    store.state.substitutable.write().unwrap().push(out.clone());
+    tick(&handle).await?;
+
+    let jobs = list_materialization_jobs(&handle, 16).await;
+    assert_eq!(jobs.len(), 1, "exactly one job listed, got {jobs:?}");
+    let minted_job = jobs[0].job_id;
+
+    // Fresh mint (the mint_and_deliver path).
+    let assignment = match claim_materialization(&handle, "mat-jobbind", "store-bind-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the first claim must deliver, got {other:?}"),
+    };
+    assert_eq!(
+        assignment.job_id,
+        minted_job.to_string(),
+        "the fresh mint echoes the job it was minted under"
+    );
+
+    // Held-attempt re-delivery (the DeliverExisting path, resume token).
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    let redelivered =
+        match resume_materialization(&handle, "mat-jobbind", "store-bind-0", exec_id).await {
+            Ok(PullOutcome::Deliver(a)) => *a,
+            other => panic!("the resume re-pull must re-deliver, got {other:?}"),
+        };
+    assert_eq!(
+        redelivered.job_id,
+        minted_job.to_string(),
+        "the re-delivery echoes the same job binding"
+    );
+    Ok(())
+}

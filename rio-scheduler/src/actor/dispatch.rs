@@ -801,7 +801,23 @@ impl DagActor {
         &mut self,
         drv_hash: &DrvHash,
         executor_id: &ExecutorId,
+        attempt_kind: rio_evidence_kernel::pull::PullKind,
     ) -> Option<rio_proto::types::WorkAssignment> {
+        // merged_bug_026: the PRODUCER asserts the attempt↔job binding.
+        // A materialization delivery names the job it is minted/held
+        // under (the current job-view entry for the drv — the same
+        // source the kernel's admission consulted, so delivery and
+        // admission cannot disagree on which job this is); a
+        // build-kind payload has no materialization job and sends
+        // empty (the proto's documented absent state).
+        let materialization_job = match attempt_kind {
+            rio_evidence_kernel::pull::PullKind::Materialization => self
+                .materialization_jobs
+                .hydrated()
+                .and_then(|view| view.get(drv_hash))
+                .map(|entry| entry.job_id),
+            rio_evidence_kernel::pull::PullKind::Build => None,
+        };
         // CA input resolution: rewrite placeholder paths in
         // env/args/builder to realized output paths before
         // dispatch. Fires when gateway set needs_resolve (ADR-018
@@ -948,6 +964,14 @@ impl DagActor {
             // proto-build — the actor is single-threaded so that can't
             // happen, but the field is non-Option in the proto.
             exec_id: state.exec_id.map(|u| u.to_string()).unwrap_or_default(),
+            // merged_bug_026: the producer-asserted job binding (see
+            // the resolution at the top of this fn). Empty for builds
+            // and for a materialization whose view entry vanished
+            // mid-delivery (the client then falls back to its own
+            // identity — the pre-field behavior).
+            job_id: materialization_job
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
         })
     }
 

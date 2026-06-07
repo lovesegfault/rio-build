@@ -115,6 +115,7 @@ string executor_token = 1;
 string failed_derivation = 13;
 string failed_derivation = 2;
 string intent_id = 2;
+string job_id = 14;
 string job_id = 1;
 string origin = 4;
 string output_name = 1;

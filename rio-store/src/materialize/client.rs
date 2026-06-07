@@ -89,6 +89,77 @@ pub struct ClaimedJob {
     pub drv_path: String,
 }
 
+/// The client-side identity a pull was issued under: the listing
+/// descriptor (fresh claims) or the resume-ledger entry (nonce
+/// resumes). [`ClaimedJob::bind`] joins it with the delivered
+/// assignment — the only place the two views meet.
+struct ExpectedJob {
+    job_id: Uuid,
+    drv_hash: String,
+    tenant_hint: Option<Uuid>,
+    origin: String,
+}
+
+impl ClaimedJob {
+    /// merged_bug_026 — the ONE binding site joining a delivered
+    /// assignment with the client-side identity view the pull was
+    /// issued under. The kernel's Pending arm can lawfully answer a
+    /// nonce-presenting pull with a delivery minted for the job's
+    /// SUCCESSOR, so the assignment's wire-echoed `job_id` (the
+    /// producer-asserted binding) is authoritative whenever present:
+    ///
+    /// - wire == expected: the normal case — keep the recorded hints.
+    /// - wire != expected: REBIND — key by the wire job; the entry's
+    ///   tenant_hint/origin belong to a different job and are dropped
+    ///   (hint `None` is the documented "no recorded context" state;
+    ///   execution re-resolves against live interest, PDQ-8).
+    /// - wire empty (pre-field scheduler / build-kind payload) or
+    ///   unparseable (producer bug — logged loudly): fall back to the
+    ///   expected identity, the pre-field behavior.
+    fn bind(expected: ExpectedJob, assignment: &rio_proto::types::WorkAssignment) -> Self {
+        let (job_id, tenant_hint, origin) = match assignment.job_id.as_str() {
+            "" => (expected.job_id, expected.tenant_hint, expected.origin),
+            wire => match Uuid::parse_str(wire) {
+                Ok(wire_job) if wire_job == expected.job_id => {
+                    (expected.job_id, expected.tenant_hint, expected.origin)
+                }
+                Ok(wire_job) => {
+                    info!(
+                        expected_job = %expected.job_id, wire_job = %wire_job,
+                        drv_path = %assignment.drv_path,
+                        "delivery rebound to the wire-echoed job (successor \
+                         delivered through the Pending arm); stale hints dropped"
+                    );
+                    (wire_job, None, REBOUND_ORIGIN.to_owned())
+                }
+                Err(err) => {
+                    warn!(
+                        job_id = %assignment.job_id, %err,
+                        "malformed wire job_id on a delivered assignment \
+                         (scheduler-side bug); keying by the client-side identity"
+                    );
+                    (expected.job_id, expected.tenant_hint, expected.origin)
+                }
+            },
+        };
+        ClaimedJob {
+            job_id,
+            drv_hash: expected.drv_hash,
+            tenant_hint,
+            origin,
+            exec_id: assignment.exec_id.clone(),
+            drv_path: assignment.drv_path.clone(),
+        }
+    }
+}
+
+/// Origin sentinel stamped when a delivery's wire-echoed job binding
+/// (`WorkAssignment.job_id`, merged_bug_026) names a DIFFERENT job
+/// than the client-side identity the pull was issued under: the
+/// successor job's true origin is unknown client-side, and carrying
+/// the stale entry's origin would mis-attribute the execution.
+pub const REBOUND_ORIGIN: &str = "resume_rebound";
+
 // r[impl sched.materialize.claim-resume]
 /// bug_251 (rule-4b, SIGNED 2026-06-04) — the bounded per-worker
 /// resume ledger, the client half of the lost-response credential.
@@ -338,14 +409,15 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
                 info!(drv_hash = %entry.drv_hash, exec_id = %assignment.exec_id,
                       "lost-response claim resumed via nonce (rule-4b)");
                 ledger.resolve(entry.job_id);
-                claimed.push(ClaimedJob {
-                    job_id: entry.job_id,
-                    drv_hash: entry.drv_hash,
-                    tenant_hint: entry.tenant_hint,
-                    origin: entry.origin,
-                    exec_id: assignment.exec_id,
-                    drv_path: assignment.drv_path,
-                });
+                claimed.push(ClaimedJob::bind(
+                    ExpectedJob {
+                        job_id: entry.job_id,
+                        drv_hash: entry.drv_hash,
+                        tenant_hint: entry.tenant_hint,
+                        origin: entry.origin,
+                    },
+                    &assignment,
+                ));
             }
             // Authoritative: the job resolved without us.
             PullAnswer::Gone => ledger.resolve(entry.job_id),
@@ -473,14 +545,19 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             PullAnswer::Shutdown => return claimed,
             PullAnswer::Deliver(assignment) => {
                 ledger.resolve(job_id);
-                claimed.push(ClaimedJob {
-                    job_id,
-                    drv_hash: descriptor.drv_hash,
-                    tenant_hint: Uuid::parse_str(&descriptor.tenant_id).ok(),
-                    origin: descriptor.origin,
-                    exec_id: assignment.exec_id,
-                    drv_path: assignment.drv_path,
-                });
+                // merged_bug_026 (fresh-claim sibling site): the same
+                // Pending-arm race exists between list and claim — the
+                // listed job can resolve and a successor mint answer
+                // this pull. The wire binding is authoritative here too.
+                claimed.push(ClaimedJob::bind(
+                    ExpectedJob {
+                        job_id,
+                        drv_hash: descriptor.drv_hash,
+                        tenant_hint: Uuid::parse_str(&descriptor.tenant_id).ok(),
+                        origin: descriptor.origin,
+                    },
+                    &assignment,
+                ));
             }
             // ANSWERED refusals on a FRESH claim: the scheduler did
             // not mint for us — drop the nonce (unlike the resume
@@ -1030,6 +1107,21 @@ mod tests {
         }
     }
 
+    /// [`deliver`] with the merged_bug_026 producer-asserted job
+    /// binding (`WorkAssignment.job_id`) populated.
+    fn deliver_for_job(exec_id: &str, drv_path: &str, job_id: Uuid) -> PullAssignmentResponse {
+        PullAssignmentResponse {
+            outcome: Some(pull_assignment_response::Outcome::Assignment(
+                rio_proto::types::WorkAssignment {
+                    drv_path: drv_path.to_string(),
+                    exec_id: exec_id.to_string(),
+                    job_id: job_id.to_string(),
+                    ..Default::default()
+                },
+            )),
+        }
+    }
+
     fn gone() -> PullAssignmentResponse {
         PullAssignmentResponse {
             outcome: Some(pull_assignment_response::Outcome::Gone(
@@ -1084,6 +1176,135 @@ mod tests {
         );
         assert_eq!(t.list_calls, 1);
         assert_eq!(t.pull_calls, 2);
+    }
+
+    /// merged_bug_026 (the resume half): a nonce-presenting resume pull
+    /// can be answered through the kernel's nonce-blind Pending arm
+    /// with a delivery minted for the job's SUCCESSOR. The assignment
+    /// echoes the job it was minted under (`WorkAssignment.job_id`, the
+    /// producer-asserted binding) and the client keys the claimed job
+    /// by the WIRE value — the stale ledger entry's hints (recorded for
+    /// a different job) are dropped on the rebind.
+    #[tokio::test]
+    async fn resume_deliver_binds_wire_job_identity() {
+        let stale_job = Uuid::now_v7();
+        let successor_job = Uuid::now_v7();
+        let mut ledger = ResumeLedger::default();
+        ledger.note_pull(ResumeEntry {
+            job_id: stale_job,
+            drv_hash: "drv-rebind".into(),
+            tenant_hint: Some(Uuid::now_v7()),
+            origin: "pruned".into(),
+            nonce: Uuid::new_v4(),
+        });
+        let mut t = MockTransport::new(
+            vec![Ok(listing(vec![]))],
+            vec![Ok(deliver_for_job(
+                "exec-succ",
+                "/nix/store/ccc-rebind.drv",
+                successor_job,
+            ))],
+            vec![],
+        );
+        let claimed = poll_and_claim(
+            &mut t,
+            &instance("store-replica-0"),
+            1,
+            &mut ledger,
+            &mut ListFailureLatch::default(),
+            &token(),
+        )
+        .await;
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(
+            claimed[0].job_id, successor_job,
+            "the wire-echoed job binding wins over the stale ledger entry"
+        );
+        assert_eq!(
+            claimed[0].tenant_hint, None,
+            "a different job's recorded hint is stale — dropped on rebind"
+        );
+        assert_eq!(
+            claimed[0].origin, REBOUND_ORIGIN,
+            "origin is the rebind sentinel, not the stale entry's"
+        );
+        assert!(
+            ledger.is_empty(),
+            "the nonce was ANSWERED (with a successor delivery) — entry resolves"
+        );
+    }
+
+    /// merged_bug_026 (skew + agreement halves): an EMPTY wire job_id
+    /// (pre-field scheduler / build-kind payload) falls back to the
+    /// client-side identity — the pre-field behavior — and an AGREEING
+    /// wire echo keeps the entry's recorded hints.
+    #[tokio::test]
+    async fn wire_job_identity_fallback_and_agreement() {
+        // Skew half: empty wire field → ledger entry id + hints kept.
+        let job = Uuid::now_v7();
+        let tenant = Uuid::now_v7();
+        let mut ledger = ResumeLedger::default();
+        ledger.note_pull(ResumeEntry {
+            job_id: job,
+            drv_hash: "drv-skew".into(),
+            tenant_hint: Some(tenant),
+            origin: "pruned".into(),
+            nonce: Uuid::new_v4(),
+        });
+        let mut t = MockTransport::new(
+            vec![Ok(listing(vec![]))],
+            vec![Ok(deliver("exec-skew", "/nix/store/ddd-skew.drv"))],
+            vec![],
+        );
+        let claimed = poll_and_claim(
+            &mut t,
+            &instance("store-replica-0"),
+            1,
+            &mut ledger,
+            &mut ListFailureLatch::default(),
+            &token(),
+        )
+        .await;
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(
+            claimed[0].job_id, job,
+            "empty wire field: ledger identity holds"
+        );
+        assert_eq!(
+            claimed[0].tenant_hint,
+            Some(tenant),
+            "hints kept on the pre-field path"
+        );
+        assert_eq!(claimed[0].origin, "pruned");
+
+        // Agreement half (fresh-claim sibling site): the wire echoes
+        // the SAME job the descriptor listed → descriptor hints kept.
+        let d = descriptor(26);
+        let listed_job = Uuid::parse_str(&d.job_id).expect("descriptor mints a uuid");
+        let mut t = MockTransport::new(
+            vec![Ok(listing(vec![d.clone()]))],
+            vec![Ok(deliver_for_job(
+                "exec-agree",
+                "/nix/store/eee-agree.drv",
+                listed_job,
+            ))],
+            vec![],
+        );
+        let claimed = poll_and_claim(
+            &mut t,
+            &instance("store-replica-0"),
+            1,
+            &mut ResumeLedger::default(),
+            &mut ListFailureLatch::default(),
+            &token(),
+        )
+        .await;
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].job_id, listed_job);
+        assert_eq!(
+            claimed[0].origin, d.origin,
+            "agreeing echo keeps descriptor hints"
+        );
     }
 
     /// bug_385 (the head-starvation fix): a refused head — Gone, the

@@ -412,6 +412,19 @@ message WorkAssignment {
   // string). Echoed by the worker in the log header (display-only, not
   // load-bearing). Keys logs/{drv_hash}/{exec_id}.log.zst.
   string exec_id = 13;
+  // NEW (additive, bughunt-3 — merged_bug_026): the materialization
+  // job this assignment was minted under (`materialization_jobs.job_id`,
+  // UUID string). The PRODUCER asserts the attempt↔job binding: a
+  // nonce-presenting resume pull can be answered through the kernel's
+  // nonce-blind Pending arm with a delivery for the job's SUCCESSOR, so
+  // a client that re-keys identity from its own stale resume ledger
+  // executes the new job under the old job id (mis-keying the
+  // carried_realized_paths read and the pin upserts). Consumers MUST
+  // prefer this field whenever non-empty. Empty == absent (proto3
+  // string): build-kind assignments (no materialization job) and
+  // pre-field schedulers — the client then falls back to its ledger
+  // entry, the pre-field behavior. Deploy order: any (additive).
+  string job_id = 14;
 }
 
 // Build configuration options propagated from the client.

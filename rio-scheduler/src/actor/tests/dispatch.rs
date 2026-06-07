@@ -1588,7 +1588,11 @@ async fn work_assignment_carries_sla_cores() {
     // would deliver.
     actor.dag.node_mut("fitted").unwrap().sched.last_intent = Some(intent);
     let assignment = actor
-        .build_assignment_proto(&"fitted".into(), &"fitted".into())
+        .build_assignment_proto(
+            &"fitted".into(),
+            &"fitted".into(),
+            rio_evidence_kernel::pull::PullKind::Build,
+        )
         .await
         .expect("payload for an injected Ready node");
     assert_eq!(

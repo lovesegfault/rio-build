@@ -30,7 +30,17 @@ async fn pull(
 /// Unwrap a Deliver outcome.
 fn expect_deliver(outcome: Result<PullOutcome, PullRejection>) -> rio_proto::types::WorkAssignment {
     match outcome {
-        Ok(PullOutcome::Deliver(a)) => *a,
+        Ok(PullOutcome::Deliver(a)) => {
+            // merged_bug_026 sibling: BUILD-kind payloads have no
+            // materialization job — the wire binding stays empty (the
+            // proto's documented absent state). Every build-pull test
+            // routing through this helper pins it.
+            assert_eq!(
+                a.job_id, "",
+                "a build-kind delivery must not carry a materialization job binding"
+            );
+            *a
+        }
         other => panic!("expected Deliver, got {other:?}"),
     }
 }
