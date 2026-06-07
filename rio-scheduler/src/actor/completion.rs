@@ -1,4 +1,28 @@
 //! Completion handling: worker reports build done → update DAG, cascade, emit events.
+/// merged_bug_013 keystone: record one flagged sighting and return the
+/// number of DISTINCT CONTROLLER-AUTHORITATIVE node bindings inside
+/// the corroboration window. The sightings map is keyed by NODE
+/// (non-optional `String`), so an unattributed report — a pull
+/// attempt with no controller binding yet — STRUCTURALLY cannot mint
+/// a distinct-node count: there is no `None` bucket to pair with the
+/// same node's later attributed sighting (the pre-fix
+/// `HashMap<Option<String>, _>` counted exactly that mixed
+/// `None`+`Some` pair as 2 "distinct nodes" and self-corroborated
+/// into the uncharged Paced lane). Binding-less evidence rides ONLY
+/// the scheduler's own store-health leg, never the node count.
+// r[impl sched.retry.store-degraded-uncharged+3]
+pub(super) fn note_store_degraded_sighting(
+    sightings: &mut std::collections::HashMap<String, std::time::Instant>,
+    node: Option<String>,
+    now: std::time::Instant,
+    window: std::time::Duration,
+) -> usize {
+    if let Some(node) = node {
+        sightings.insert(node, now);
+    }
+    sightings.retain(|_, t| now.duration_since(*t) <= window);
+    sightings.len()
+}
 // r[impl sched.completion.idempotent]
 // r[impl sched.critical-path.incremental]
 
@@ -2929,10 +2953,12 @@ impl DagActor {
         }
         let now = Instant::now();
         let node = self.pull_attempt_source_node(drv_hash);
-        self.store_degraded_sightings.insert(node, now);
-        self.store_degraded_sightings
-            .retain(|_, t| now.duration_since(*t) <= STORE_DEGRADED_CORROBORATION_WINDOW);
-        let distinct_nodes = self.store_degraded_sightings.len();
+        let distinct_nodes = note_store_degraded_sighting(
+            &mut self.store_degraded_sightings,
+            node,
+            now,
+            STORE_DEGRADED_CORROBORATION_WINDOW,
+        );
         let store_health_leg = self
             .last_store_rpc_failure
             .is_some_and(|t| now.duration_since(t) <= STORE_DEGRADED_CORROBORATION_WINDOW);

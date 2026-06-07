@@ -340,14 +340,19 @@ pub struct DagActor {
     /// backstop sweep re-drives it.
     pub(crate) attempt_record_retries: HashMap<DrvHash, u32>,
 
-    /// bughunt-2 slot 3 C2 (merged_bug_032): corroboration evidence for
-    /// worker-supplied `store_degraded` flags — most-recent flagged
-    /// report per CONTROLLER-AUTHORITATIVE node binding (AD2c: the
-    /// worker cannot forge its corroboration identity; reports with no
-    /// binding share the `None` bucket and cannot self-corroborate).
+    /// bughunt-2 slot 3 C2 (merged_bug_032), re-keyed round 3
+    /// (merged_bug_013): corroboration evidence for worker-supplied
+    /// `store_degraded` flags — most-recent flagged report per
+    /// CONTROLLER-AUTHORITATIVE node binding (AD2c: the worker cannot
+    /// forge its corroboration identity). Keyed by NODE, non-optional:
+    /// a binding-less report is NOT inserted at all — the pre-fix
+    /// `Option<String>` key let one node's pre-binding `None` sighting
+    /// plus its later attributed `Some` sighting count as 2 "distinct
+    /// nodes" and self-corroborate into the uncharged Paced lane.
+    /// Binding-less evidence rides only the store-health leg.
     /// In-memory only: forgotten on failover, self-healing (the gate
     /// re-corroborates within one window).
-    pub(crate) store_degraded_sightings: HashMap<Option<String>, Instant>,
+    pub(crate) store_degraded_sightings: HashMap<String, Instant>,
     /// The scheduler-side store-health OR-leg: the last time one of the
     /// scheduler's OWN store RPCs (the dispatch-time FindMissingPaths
     /// probes) failed or timed out. Covers the fleet-of-one case where

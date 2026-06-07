@@ -1,4 +1,59 @@
 //! Completion handling: retry/poison thresholds, dep-chain release, duplicate idempotence.
+/// merged_bug_013 (round 3): the corroboration set is keyed by NODE —
+/// non-optional — so an unattributed sighting (a flagged report whose
+/// pull attempt has no controller-authoritative binding yet) cannot
+/// mint a distinct-node count. Pre-fix the map was keyed
+/// `Option<String>`: one node's pre-binding `None` sighting plus its
+/// later attributed `Some` sighting counted as 2 "distinct nodes" and
+/// self-corroborated into the uncharged Paced lane.
+// r[verify sched.retry.store-degraded-uncharged+3]
+#[test]
+fn store_degraded_mixed_unattributed_then_attributed_is_one_node() {
+    use crate::actor::completion::note_store_degraded_sighting;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+    let w = Duration::from_secs(600);
+    let mut sightings: HashMap<String, Instant> = HashMap::new();
+    let t0 = Instant::now();
+    // Pre-binding flagged report: unattributed — NOT inserted.
+    assert_eq!(note_store_degraded_sighting(&mut sightings, None, t0, w), 0);
+    // The same node, now controller-bound: ONE distinct node.
+    assert_eq!(
+        note_store_degraded_sighting(&mut sightings, Some("n1".into()), t0, w),
+        1,
+        "the mixed None+Some pair must collapse to one distinct node"
+    );
+    // Further unattributed reports still cannot self-corroborate.
+    assert_eq!(note_store_degraded_sighting(&mut sightings, None, t0, w), 1);
+    // Corroboration requires a SECOND controller-bound node.
+    assert_eq!(
+        note_store_degraded_sighting(&mut sightings, Some("n2".into()), t0, w),
+        2
+    );
+}
+
+/// merged_bug_013 companion: sightings age out of the corroboration
+/// window — the count is evidence-fresh, not cumulative.
+#[test]
+fn store_degraded_sightings_expire_outside_window() {
+    use crate::actor::completion::note_store_degraded_sighting;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+    let w = Duration::from_secs(600);
+    let mut sightings: HashMap<String, Instant> = HashMap::new();
+    let t0 = Instant::now();
+    assert_eq!(
+        note_store_degraded_sighting(&mut sightings, Some("n1".into()), t0, w),
+        1
+    );
+    // 601s later, n1's sighting is stale: a fresh n2 stands alone.
+    let t1 = t0 + Duration::from_secs(601);
+    assert_eq!(
+        note_store_degraded_sighting(&mut sightings, Some("n2".into()), t1, w),
+        1,
+        "stale sightings must not corroborate"
+    );
+}
 // r[verify sched.completion.idempotent]
 // r[verify sched.state.transitions]
 // r[verify sched.state.terminal-idempotent+2]
