@@ -2401,9 +2401,12 @@ fn width_events_route_to_their_own_counters() {
     let snap = rec.snapshotter();
     {
         let _g = metrics::set_default_local_recorder(&rec);
+        let settled = crate::actor::materialize::SettledClose::test_witness();
         crate::state::note_width_event(crate::state::WidthEvent::NoVerifiableSet {
             exec_id: Uuid::new_v4(),
+            settled: &settled,
         });
+        drop(settled);
     }
     let counters = counter_map(&snap);
     assert_eq!(

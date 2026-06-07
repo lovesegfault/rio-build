@@ -273,7 +273,18 @@ pub(crate) use rio_evidence_kernel::settle::{
 /// drops the witness fails `--deny warnings`; an arm that never closes
 /// has no witness to spend and therefore cannot mint a [`MatAck`].
 #[must_use = "a settled close must be spent on exactly one companion (bug_182)"]
-pub(super) struct SettledClose(());
+#[derive(Debug)]
+pub(crate) struct SettledClose(());
+
+impl SettledClose {
+    /// Test-only witness mint for unit tests of settled-gated
+    /// observability (bug_086) — production construction stays
+    /// exclusively inside [`DagActor::close_for_consumption`].
+    #[cfg(test)]
+    pub(crate) fn test_witness() -> Self {
+        SettledClose(())
+    }
+}
 
 /// Proof that one materialization report was CONSUMED to the point
 /// where acknowledging the store is lawful (`sched.materialize.ack-law`):
@@ -1241,14 +1252,6 @@ impl DagActor {
         // mint's Running state (the ReArm posture; the next claim or
         // the zero-interest closer settles it).
         let Some(live_wanted_paths) = LiveWanted::new(wanted_union) else {
-            // bug_282: this is the width-ZERO event class — its own
-            // counter and warn latch; it can no longer masquerade as
-            // (or suppress the warn of) the DQ-2 saturation event.
-            crate::state::note_width_event(crate::state::WidthEvent::NoVerifiableSet { exec_id });
-            warn!(
-                %exec_id, drv_hash = %drv_hash,
-                "no verifiable live-wanted path set; closing uncharged and deferring"
-            );
             // bug_182 zero-width reshape: this arm used to release the
             // claim with the assignment still OPEN and ack — the open
             // attempt then hid the job from every listing (anti-join)
@@ -1261,16 +1264,33 @@ impl DagActor {
                 .close_for_consumption(exec_id, &drv_hash, None, serving_generation)
                 .await
             {
-                CloseOutcome::Settled(close) => Ok(self
-                    .companion_release(
-                        &drv_hash,
-                        &executor,
-                        Some(std::time::Duration::from_secs(
-                            RETRY_LATER_DEFAULT_DEFER_SECS,
-                        )),
-                        close,
-                    )
-                    .await),
+                CloseOutcome::Settled(close) => {
+                    // bug_282: the width-ZERO event class — its own
+                    // counter and warn latch. bug_086: counted ONLY
+                    // from the settled close (the witness is demanded
+                    // by the event constructor): a Deferred close is
+                    // the successor leader's event, and a NotDurable
+                    // NACK redelivers the SAME outcome — neither may
+                    // tick a consumption counter.
+                    crate::state::note_width_event(crate::state::WidthEvent::NoVerifiableSet {
+                        exec_id,
+                        settled: &close,
+                    });
+                    warn!(
+                        %exec_id, drv_hash = %drv_hash,
+                        "no verifiable live-wanted path set; closed uncharged and deferred"
+                    );
+                    Ok(self
+                        .companion_release(
+                            &drv_hash,
+                            &executor,
+                            Some(std::time::Duration::from_secs(
+                                RETRY_LATER_DEFAULT_DEFER_SECS,
+                            )),
+                            close,
+                        )
+                        .await)
+                }
                 CloseOutcome::Deferred(ack) => Ok(ack),
                 CloseOutcome::NotDurable => Err(super::pull::PullRejection::ConsumptionNotDurable),
             };

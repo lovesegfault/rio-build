@@ -2092,7 +2092,7 @@ pub fn effective_wanted(
 /// itself as "saturated to all-declared" under a nil build id — is
 /// unrepresentable at the type.
 #[derive(Debug)]
-pub enum WidthEvent {
+pub(crate) enum WidthEvent<'a> {
     /// DQ-2: the conservative-absent arm fired — a live build's wanted
     /// contributions are unknown and the effective width degraded to
     /// ALL-DECLARED (maximal).
@@ -2103,10 +2103,21 @@ pub enum WidthEvent {
     /// merged_bug_194 witness: a materialization re-arm found NO
     /// verifiable wanted set (width ZERO — empty set or empty-string
     /// paths), the opposite end of the width axis.
+    ///
+    /// bug_086: this is a CONSUMPTION event — constructing it DEMANDS
+    /// the settled-close witness, so counting on a Deferred (deposed
+    /// believer — the successor counts) or NotDurable (NACK — the
+    /// store redelivers the same outcome for up to its 600s budget)
+    /// close does not typecheck. Pre-fix the note fired before
+    /// `close_for_consumption`, counting once per DELIVERY instead of
+    /// once per settled close, contradicting the HELP ("closed
+    /// uncharged and deferred").
     NoVerifiableSet {
         /// The reporting attempt's exec id (no build is implicated —
         /// the condition is per-attempt).
         exec_id: Uuid,
+        /// The settled-close witness (bug_086).
+        settled: &'a crate::actor::materialize::SettledClose,
     },
 }
 
@@ -2131,7 +2142,7 @@ fn width_warn_due(latch: &std::sync::atomic::AtomicI64) -> bool {
 /// and per-variant rate-limited warns. Counter always; warn
 /// rate-limited (either arm can fire per classification pass).
 // r[impl obs.metric.scheduler]
-pub fn note_width_event(event: WidthEvent) {
+pub(crate) fn note_width_event(event: WidthEvent<'_>) {
     use std::sync::atomic::AtomicI64;
     match event {
         WidthEvent::SaturatedToDeclared { build_id } => {
@@ -2146,7 +2157,8 @@ pub fn note_width_event(event: WidthEvent) {
                 );
             }
         }
-        WidthEvent::NoVerifiableSet { exec_id } => {
+        WidthEvent::NoVerifiableSet { exec_id, settled } => {
+            let _ = settled; // the witness's value IS its type
             metrics::counter!("rio_scheduler_materialization_no_verifiable_wanted_total")
                 .increment(1);
             static LAST_WARN_EPOCH: AtomicI64 = AtomicI64::new(0);

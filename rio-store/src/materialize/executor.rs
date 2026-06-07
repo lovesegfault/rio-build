@@ -125,11 +125,6 @@ impl CountedOutcome {
     pub(crate) fn into_outcome(self) -> MaterializationOutcome {
         self.outcome
     }
-
-    /// The counted outcome, for callers that only inspect it.
-    pub(crate) fn outcome(&self) -> &MaterializationOutcome {
-        &self.outcome
-    }
 }
 
 /// The outcome-label alphabet of

@@ -16,9 +16,9 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use rio_proto::types::{
-    ListMaterializationJobsRequest, ListMaterializationJobsResponse, MaterializationOutcome,
-    PullAssignmentRequest, PullAssignmentResponse, ReportMaterializationProgressRequest,
-    ReportOutcomeRequest, pull_assignment_response,
+    ListMaterializationJobsRequest, ListMaterializationJobsResponse, PullAssignmentRequest,
+    PullAssignmentResponse, ReportMaterializationProgressRequest, ReportOutcomeRequest,
+    pull_assignment_response,
 };
 
 /// `ServiceClaims.caller` this executor presents — the kind-attested
@@ -1140,6 +1140,7 @@ impl MaterializeTransport for SchedulerTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rio_proto::types::MaterializationOutcome;
 
     /// merged_bug_243: poll_and_claim takes &Dns1123Label — tests mint
     /// theirs through the one sanitizer (valid raws pass through, so

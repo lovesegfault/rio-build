@@ -7462,6 +7462,64 @@ async fn consumption_coverage_saturates_on_missing_relation_rows() -> TestResult
 // the view entry is what makes the armed action level-triggered
 // instead of stranding the pending row invisibly.
 
+// r[verify obs.metric.scheduler]
+/// bug_086: the zero-width event (NoVerifiableSet) is a CONSUMPTION
+/// event — pre-fix the note + warn fired BEFORE close_for_consumption,
+/// so a deposed believer's Deferred close counted the event the
+/// successor counts again, and a NotDurable NACK (store-redelivered
+/// same outcome, up to 600s) counted once per delivery attempt —
+/// contradicting the HELP ("closed uncharged and deferred").
+///
+/// The non-settled legs are now UNREPRESENTABLE rather than tested:
+/// constructing `WidthEvent::NoVerifiableSet` demands the
+/// `&SettledClose` witness, which only `close_for_consumption`'s
+/// settled arm produces (compile-level red — the pre-fix call site,
+/// note-before-close, does not typecheck; driving the Deferred leg
+/// end-to-end is blocked by upstream report guards, verified
+/// empirically). This test pins the settled path end-to-end: the arm
+/// fires through the production handler and counts exactly once.
+#[tokio::test]
+async fn zero_width_event_counts_only_on_settled_close() -> TestResult {
+    let rec = rio_test_support::metrics::CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&rec);
+
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let counter = || rec.get("rio_scheduler_materialization_no_verifiable_wanted_total{}");
+
+    let out1 = test_store_path("zw-settled-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(out1.clone());
+    let mut n1 = make_node("zw-settled");
+    n1.expected_output_paths = vec![out1.clone()];
+    // The zero-width shape: live interest WANTS an output name the
+    // node never declares — the wanted union resolves to no
+    // verifiable path (LiveWanted::new -> None), with the build alive
+    // and the leader serving, so the close SETTLES.
+    n1.wanted_output_names = vec!["name-the-node-never-declares".into()];
+    let b1 = Uuid::new_v4();
+    let _ev = merge_dag(&handle, b1, vec![n1], vec![], false).await?;
+    barrier(&handle).await;
+    let a1 = match claim_materialization(&handle, "zw-settled", "store-replica-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("claim must deliver, got {other:?}"),
+    };
+    report_materialization_outcome(
+        &handle,
+        a1.exec_id.parse()?,
+        "zw-settled",
+        mat_success_outcome(vec![], vec![]),
+    )
+    .await
+    .expect("settled zero-width close acks");
+    barrier(&handle).await;
+    assert_eq!(counter(), 1, "the settled zero-width close counts ONCE");
+    Ok(())
+}
+
 // r[verify sched.materialize.view-settlement]
 /// A deposed believer's zero-interest cancel is refused by the fence —
 /// and the view entry SURVIVES the refusal, so the cancel re-attempts
