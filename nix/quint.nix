@@ -7020,6 +7020,9 @@ rec {
     # r[verify sched.materialize.ack-law]
     # r[verify sched.materialize.claim-coherence]
     # r[verify sched.materialize.claim-resume]
+    # bughunt-3 S5: +3 claim-plane laws (ledger-as-mint-authority,
+    # answered-refusal disposition, confirm-only no-mint). Tier-1
+    # re-measured: 22 distinct states (was 18), <1s exhaustive.
     quint-open-attempts = mkQuintCheck {
       name = "open-attempts";
       spec = "openAttempts";
@@ -7030,6 +7033,9 @@ rec {
         "ackImpliesSettledOrArmed"
         "claimedImpliesOpenAttempt"
         "noFaultNeverCharged"
+        "noCredentialClobber"
+        "noRefusalFiledAsLost"
+        "confirmNeverMints"
       ];
     };
 
@@ -7188,6 +7194,36 @@ rec {
       step = "calibStep";
       modelTimeoutSec = 120;
       witness = "noFaultNeverCharged";
+    };
+    # bughunt-3 S5 twins (rule-4b client-loop repairs): every new
+    # claim-plane invariant has its falsifier (P1). Measured <1.1s
+    # each (34/34/30 distinct states); budget 120s.
+    quint-openattempts-calib-clobbered-credential = mkQuintWitnessCheck {
+      name = "openattempts-calib-clobbered-credential";
+      spec = "calibration/openattempts-clobbered-credential";
+      extraSpecs = [ "openAttempts" ];
+      main = "openAttemptsClobberedCredential";
+      step = "calibStep";
+      modelTimeoutSec = 120;
+      witness = "noCredentialClobber";
+    };
+    quint-openattempts-calib-refusal-as-lost = mkQuintWitnessCheck {
+      name = "openattempts-calib-refusal-as-lost";
+      spec = "calibration/openattempts-refusal-as-lost";
+      extraSpecs = [ "openAttempts" ];
+      main = "openAttemptsRefusalAsLost";
+      step = "calibStep";
+      modelTimeoutSec = 120;
+      witness = "noRefusalFiledAsLost";
+    };
+    quint-openattempts-calib-minting-confirm = mkQuintWitnessCheck {
+      name = "openattempts-calib-minting-confirm";
+      spec = "calibration/openattempts-minting-confirm";
+      extraSpecs = [ "openAttempts" ];
+      main = "openAttemptsMintingConfirm";
+      step = "calibStep";
+      modelTimeoutSec = 120;
+      witness = "confirmNeverMints";
     };
   };
 

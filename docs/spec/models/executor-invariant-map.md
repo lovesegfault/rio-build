@@ -2739,6 +2739,21 @@ Option-equality trap is centralized in the kernel's
 before any bughunt2 worktree branched; transcribed here by the
 materialize-disposition-coherence workstream per R14 — that round's
 directive is the recorded authorization).**
+
+*Amendment note, 2026-06-07 (bughunt-3 S5, recorded at this anchor
+per R3): four repairs to the close's own client loop — answered
+permanent refusals resolve the ledger entry (bug_119: no immortal
+entries; the lost-response lane is reserved for unanswered pulls);
+the ledger is the sole fresh-mint authority (merged_bug_096: a live
+credential is never clobbered, and fresh-claim NotYetReady KEEPS the
+credential — the post-mint TOCTOU arm answers NotYetReady after
+persisting the nonce); the claim pass is single-exit (bug_116) and
+budgeted by potential mints (bug_099). None alters the signed
+re-delivery clause above; the signed residual is STRENGTHENED — the
+charged establishment window is now reachable only by real crashes,
+no longer by the loop's own credential destruction. Modeled as three
+claim-plane laws in openAttempts.qnt (noCredentialClobber,
+noRefusalFiledAsLost, confirmNeverMints), each with a falsify twin.*
 Pinned: `check_materialization_redelivery_requires_credential`
 (REPLACES — widens — `check_materialization_redelivery_requires_resume_token`
 over the (resume ∨ nonce) domain; CBMC, both directions, the

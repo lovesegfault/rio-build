@@ -1,5 +1,5 @@
 // -*- mode: Bluespec; -*-
-// quint-policy-latches: driverLost, ackedUnsettled, ghostClaim, chargedNoFault
+// quint-policy-latches: driverLost, ackedUnsettled, ghostClaim, chargedNoFault, credentialClobbered, refusalFiledAsLost, confirmMinted
 //
 // openAttempts — one derivation's open pull-mode attempt, RE-STATED
 // over the claim/settlement laws of the materialize-disposition wave
@@ -50,9 +50,23 @@
 //   openattempts-ack-on-failed-close -> ackImpliesSettledOrArmed
 //   openattempts-no-fallback-release -> claimedImpliesOpenAttempt
 //   openattempts-nonceless-mint    -> noFaultNeverCharged
+//   openattempts-clobbered-credential -> noCredentialClobber
+//   openattempts-refusal-as-lost   -> noRefusalFiledAsLost
+//   openattempts-minting-confirm   -> confirmNeverMints
 //
-// Tier-1 budget: 3 (node) × 4 (attempt) × 2^5 (booleans) × 2^4
-// (latches) = 6,144 reachable upper bound; TLC exhausts in seconds.
+// bughunt-3 S5 (the rule-4b client-loop repairs): three more laws on
+// the claim plane, each seated like the four above —
+//   - the fresh pass is mint-gated by the ledger (merged_bug_096): a
+//     live credential is never clobbered by a second mint for the
+//     same job (`freshClaimSeat`);
+//   - an ANSWERED permanent refusal resolves the credential
+//     (bug_119): it is never filed as a lost response
+//     (`answeredRefusalSeat`);
+//   - a confirm-only probe is a READ (merged_bug_083): it can never
+//     mint (`confirmProbeSeat` — the scheduler screens DeliverNew).
+//
+// Tier-1 budget: 3 (node) × 4 (attempt) × 2^5 (booleans) × 2^7
+// (latches) = 49,152 reachable upper bound; TLC exhausts in seconds.
 
 module openAttempts {
   type NodeState = NWantedLive | NCancelled | NAbsent
@@ -76,6 +90,13 @@ module openAttempts {
   // --- latches (live-computed; see the header directive) -------------------
   // The failed cancel persist did not arm its driver (bug_357).
   var driverLost: bool
+  // A fresh mint replaced a LIVE credential (merged_bug_096's clobber).
+  var credentialClobbered: bool
+  // An answered permanent refusal left the credential live -- filed
+  // as a lost response (bug_119's immortal entry).
+  var refusalFiledAsLost: bool
+  // A confirm-only probe minted a fresh attempt (merged_bug_083).
+  var confirmMinted: bool
   // An ack was produced while the close was not settled (bug_182).
   var ackedUnsettled: bool
   // A close left the view claimed with no open attempt
@@ -96,6 +117,9 @@ module openAttempts {
     ackedUnsettled' = false,
     ghostClaim' = false,
     chargedNoFault' = false,
+    credentialClobbered' = false,
+    refusalFiledAsLost' = false,
+    confirmMinted' = false,
   }
 
   // --- oracle seats ----------------------------------------------------------
@@ -117,6 +141,9 @@ module openAttempts {
     driverLost' = driverLost,
     ackedUnsettled' = ackedUnsettled,
     chargedNoFault' = chargedNoFault,
+    credentialClobbered' = credentialClobbered,
+    refusalFiledAsLost' = refusalFiledAsLost,
+    confirmMinted' = confirmMinted,
   }
 
   /// Settled-close seat: one SETTLED attempt close (consumption Ok,
@@ -144,6 +171,9 @@ module openAttempts {
       chargedNoFault,
       charged and responseLost,
     },
+    credentialClobbered' = credentialClobbered,
+    refusalFiledAsLost' = refusalFiledAsLost,
+    confirmMinted' = confirmMinted,
     driverLost' = driverLost,
   }
 
@@ -158,6 +188,9 @@ module openAttempts {
     ackedUnsettled' = or { ackedUnsettled, acks },
     ghostClaim' = ghostClaim,
     chargedNoFault' = chargedNoFault,
+    credentialClobbered' = credentialClobbered,
+    refusalFiledAsLost' = refusalFiledAsLost,
+    confirmMinted' = confirmMinted,
     driverLost' = driverLost,
   }
 
@@ -175,6 +208,67 @@ module openAttempts {
     ackedUnsettled' = ackedUnsettled,
     ghostClaim' = ghostClaim,
     chargedNoFault' = chargedNoFault,
+    credentialClobbered' = credentialClobbered,
+    refusalFiledAsLost' = refusalFiledAsLost,
+    confirmMinted' = confirmMinted,
+  }
+
+  /// Fresh-claim seat (merged_bug_096): the fresh pass consults the
+  /// ledger BEFORE minting. `mintsOverLive` is the perturbable
+  /// decision -- the live client cannot take it (begin_fresh_claim
+  /// refuses while an entry is live; the skip falls out of the API).
+  /// The oracle: minting over a live credential is the clobber.
+  action freshClaimSeat(mintsOverLive: bool): bool = all {
+    credentialClobbered' = or { credentialClobbered, and { mintsOverLive, clientHoldsResume } },
+    // The skip is a read -- no state moves besides the latch truth.
+    attempt' = attempt,
+    viewClaimed' = viewClaimed,
+    clientHoldsResume' = clientHoldsResume,
+    responseLost' = responseLost,
+    ghostClaim' = ghostClaim,
+    driverLost' = driverLost,
+    ackedUnsettled' = ackedUnsettled,
+    chargedNoFault' = chargedNoFault,
+    refusalFiledAsLost' = refusalFiledAsLost,
+    confirmMinted' = confirmMinted,
+  }
+
+  /// Answered-refusal seat (bug_119): the scheduler ANSWERED with a
+  /// permanent rejection -- no mint exists behind it. `resolvesEntry`
+  /// is the decision; the live client resolves (the rejected arm
+  /// routes ledger.resolve). Filing the refusal as a lost response
+  /// (keeping the credential) is the immortal-entry defect.
+  action answeredRefusalSeat(resolvesEntry: bool): bool = all {
+    clientHoldsResume' = and { clientHoldsResume, not(resolvesEntry) },
+    responseLost' = and { responseLost, not(resolvesEntry) },
+    refusalFiledAsLost' = or { refusalFiledAsLost, and { clientHoldsResume, not(resolvesEntry) } },
+    attempt' = attempt,
+    viewClaimed' = viewClaimed,
+    ghostClaim' = ghostClaim,
+    driverLost' = driverLost,
+    ackedUnsettled' = ackedUnsettled,
+    chargedNoFault' = chargedNoFault,
+    credentialClobbered' = credentialClobbered,
+    confirmMinted' = confirmMinted,
+  }
+
+  /// Confirm-probe seat (merged_bug_083): the probe is a READ of the
+  /// puller's holdings. `mints` is the decision the wire
+  /// discriminator forbids (the scheduler screens DeliverNew to
+  /// NotYetReady on confirm_only); a minting confirm is the dying
+  /// pod's probe creating fresh work for itself.
+  action confirmProbeSeat(mints: bool): bool = all {
+    confirmMinted' = or { confirmMinted, and { mints, attempt != AOpen } },
+    attempt' = if (mints and attempt != AOpen) AOpen else attempt,
+    viewClaimed' = or { viewClaimed, and { mints, attempt != AOpen } },
+    clientHoldsResume' = clientHoldsResume,
+    responseLost' = responseLost,
+    ghostClaim' = ghostClaim,
+    driverLost' = driverLost,
+    ackedUnsettled' = ackedUnsettled,
+    chargedNoFault' = chargedNoFault,
+    credentialClobbered' = credentialClobbered,
+    refusalFiledAsLost' = refusalFiledAsLost,
   }
 
   // --- live actions ------------------------------------------------------------
@@ -222,6 +316,9 @@ module openAttempts {
     ackedUnsettled' = ackedUnsettled,
     ghostClaim' = ghostClaim,
     chargedNoFault' = chargedNoFault,
+    credentialClobbered' = credentialClobbered,
+    refusalFiledAsLost' = refusalFiledAsLost,
+    confirmMinted' = confirmMinted,
   }
 
   /// Consumption close settles and the companion runs (release on
@@ -310,6 +407,9 @@ module openAttempts {
       ackedUnsettled' = ackedUnsettled,
       ghostClaim' = ghostClaim,
       chargedNoFault' = chargedNoFault,
+      credentialClobbered' = credentialClobbered,
+      refusalFiledAsLost' = refusalFiledAsLost,
+      confirmMinted' = confirmMinted,
     },
   }
 
@@ -327,6 +427,9 @@ module openAttempts {
     ackedUnsettled' = ackedUnsettled,
     ghostClaim' = ghostClaim,
     chargedNoFault' = chargedNoFault,
+    credentialClobbered' = credentialClobbered,
+    refusalFiledAsLost' = refusalFiledAsLost,
+    confirmMinted' = confirmMinted,
   }
 
   /// Leadership loss + successor recovery. The outbox is
@@ -349,6 +452,9 @@ module openAttempts {
     ackedUnsettled' = ackedUnsettled,
     ghostClaim' = ghostClaim,
     chargedNoFault' = chargedNoFault,
+    credentialClobbered' = credentialClobbered,
+    refusalFiledAsLost' = refusalFiledAsLost,
+    confirmMinted' = confirmMinted,
   }
 
   /// The establishment sweep, post-fix: routed through the total
@@ -386,6 +492,35 @@ module openAttempts {
     },
   }
 
+  /// LIVE (merged_bug_096): the fresh pass over a live credential
+  /// SKIPS -- the ledger API refuses the second mint.
+  action freshClaimSkipsLive = all {
+    clientHoldsResume,
+    freshClaimSeat(false),
+    node' = node,
+    outbox' = outbox,
+    cancelDurable' = cancelDurable,
+  }
+
+  /// LIVE (bug_119): an answered permanent refusal resolves the
+  /// credential -- the entry leaves on the authoritative answer.
+  action claimRefusedAnswered = all {
+    clientHoldsResume,
+    answeredRefusalSeat(true),
+    node' = node,
+    outbox' = outbox,
+    cancelDurable' = cancelDurable,
+  }
+
+  /// LIVE (merged_bug_083): the confirm-only probe reads holdings and
+  /// never mints (the screen).
+  action confirmProbeReads = all {
+    confirmProbeSeat(false),
+    node' = node,
+    outbox' = outbox,
+    cancelDurable' = cancelDurable,
+  }
+
   action step = any {
     mintDelivered,
     mintResponseLost,
@@ -398,6 +533,9 @@ module openAttempts {
     flushErr,
     failover,
     sweepEstablish,
+    freshClaimSkipsLive,
+    claimRefusedAnswered,
+    confirmProbeReads,
   }
 
   // --- invariants ------------------------------------------------------------
@@ -432,11 +570,25 @@ module openAttempts {
   // charged — the credential redelivers it first.
   val noFaultNeverCharged = not(chargedNoFault)
 
+  // merged_bug_096: a live credential is never clobbered by a second
+  // mint for the same job -- the ledger is the mint authority.
+  val noCredentialClobber = not(credentialClobbered)
+
+  // bug_119: an answered permanent refusal is never filed as a lost
+  // response (no immortal ledger entries).
+  val noRefusalFiledAsLost = not(refusalFiledAsLost)
+
+  // merged_bug_083: a confirm-only probe never mints.
+  val confirmNeverMints = not(confirmMinted)
+
   val openAttemptsInvariants = all {
     cancelledNeverChargedAsCrash,
     notDriverLost,
     ackImpliesSettledOrArmed,
     claimedImpliesOpenAttempt,
     noFaultNeverCharged,
+    noCredentialClobber,
+    noRefusalFiledAsLost,
+    confirmNeverMints,
   }
 }
