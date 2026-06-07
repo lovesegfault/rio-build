@@ -140,19 +140,67 @@ EOF
 
 promtool test rules "$tests"
 
-# for:0m coverage assert — every rendered 0m/0s alert has a contract
-# case above. New 0m alerts fail HERE by name until they get one.
+# for:0m coverage assert — every rendered 0m/0s alert has a FIRING
+# contract case above (bug_191: the old grep over `alertname:` lines
+# counted must-NOT-fire cases — exp_alerts: [] — as coverage, so the
+# gate was fail-open for the next 0m alert added with only a
+# suppression case). Coverage now derives from the structured
+# predicate: only alert_rule_test entries with NON-EMPTY exp_alerts
+# count as firing coverage.
+firing_covered() {
+  yq -N '.tests[].alert_rule_test[] | select((.exp_alerts | length) > 0) | .alertname' "$1" | sort -u
+}
+
+# Planted self-test (banner (b)): a suppression-only case must NOT
+# count as firing coverage; a real firing case must.
+selftest_dir=$(mktemp -d)
+cat > "$selftest_dir/suppression-only.yaml" <<'SELFTEST'
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'x{pod="a"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: PlantedAlert
+        exp_alerts: []
+SELFTEST
+cat > "$selftest_dir/firing.yaml" <<'SELFTEST'
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'x{pod="a"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: PlantedAlert
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+SELFTEST
+if firing_covered "$selftest_dir/suppression-only.yaml" | grep -qx "PlantedAlert"; then
+  echo "SELF-TEST FAIL: a suppression-only case counted as firing coverage (bug_191)" >&2
+  exit 1
+fi
+if ! firing_covered "$selftest_dir/firing.yaml" | grep -qx "PlantedAlert"; then
+  echo "SELF-TEST FAIL: a real firing case did not count as coverage" >&2
+  exit 1
+fi
+rm -rf "$selftest_dir"
+
 zero_for=$(yq -N \
   '.groups[].rules[] | select((.for // "0m") == "0m" or .for == "0s") | .alert' \
   "$rules" | sort -u)
-covered=$(grep -E '^\s+alertname: ' "$tests" | awk '{print $2}' | sort -u)
+covered=$(firing_covered "$tests")
 fail=0
 while IFS= read -r a; do
   [ -z "$a" ] && continue
   if ! printf '%s\n' "$covered" | grep -qx "$a"; then
-    echo "FAIL: for:0m alert $a has no firing contract case in" >&2
+    echo "FAIL: for:0m alert $a has no FIRING contract case in" >&2
     echo "      nix/tests/helm/34-alert-contracts.sh (non-vacuity," >&2
-    echo "      §4-R-promtool) — add an input_series + alert_rule_test." >&2
+    echo "      §4-R-promtool) — add an input_series + alert_rule_test" >&2
+    echo "      with non-empty exp_alerts (a suppression-only case" >&2
+    echo "      does not count)." >&2
     fail=1
   fi
 done <<<"$zero_for"
