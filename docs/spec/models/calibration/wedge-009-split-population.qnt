@@ -33,6 +33,7 @@ module wedgeCalib009SplitPopulation {
     MIN_DISTINCT = 2,
     ENABLE_POPULATIONS = false,
     ENABLE_FULL_EPILOGUE = true,
-    ENABLE_EVICTION = true
+    ENABLE_EVICTION = true,
+  ENABLE_EPISODE_LATCH = false
   ).* from "../wedgeCluster"
 }

@@ -6052,6 +6052,7 @@ rec {
         "noPerNodeFromSuppressedEvidence"
         "reapedImpliesEvicted"
         "markedIncrementsOnlyOnEdges"
+        "noRemarkFromLatchedEpisode"
       ];
     };
 
@@ -6090,6 +6091,21 @@ rec {
       main = "wedgeCalib176EarlyReturn";
       extraSpecs = [ "wedgeCluster" ];
       witness = "noPerNodeFromSuppressedEvidence";
+    };
+
+    # Falsify twin (live-import, calibration/): the round-2 as-built
+    # episode handling — wedged-only drain, no suppression watermark —
+    # lets the trailing-edge laggard re-anchor from the SAME still-open
+    # attempts and a sub-threshold participant's surviving anchor pair
+    # with a later blip (merged_bug_163; solo-verified [violation] in
+    # ~150ms at 50000x12).
+    # r[verify ctrl.nodeclaim.wedge-two-axis+3]
+    quint-wedge-cluster-calib-partial-drain = mkQuintWitnessCheck {
+      name = "wedge-cluster-calib-partial-drain";
+      spec = "calibration/wedge-163-partial-drain";
+      main = "wedgeCalib163PartialDrain";
+      extraSpecs = [ "wedgeCluster" ];
+      witness = "noRemarkFromLatchedEpisode";
     };
 
     # Falsify twin (in-file): no eviction input — a reaped node's

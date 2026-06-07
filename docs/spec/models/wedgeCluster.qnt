@@ -71,6 +71,15 @@ module wedgeCluster {
   const ENABLE_POPULATIONS: bool
   const ENABLE_FULL_EPILOGUE: bool
   const ENABLE_EVICTION: bool
+  // Round-3 repair axis (merged_bug_163): on — the Systemic arm
+  // drains the WHOLE episode's evidence and evidence admission must
+  // beat the suppression watermark (an expired attempt contributes
+  // only when its expiry run began strictly after the last
+  // suppression); off (round-2 as-built) — wedged-only drain, no
+  // admission gate: the episode's still-open attempts re-anchor at
+  // the trailing edge and sub-threshold participants' anchors pair
+  // with any later blip.
+  const ENABLE_EPISODE_LATCH: bool
 
   val NODES = Set("n0", "n1", "n2")
   val DRVS = Set("d0", "d1")
@@ -96,6 +105,13 @@ module wedgeCluster {
   // Anchors that survived a suppressed episode: (node, drv, anchor).
   // Written by the same update that suppresses; drained anchors leave.
   var suppressedAnchors: Set[(str, str, int)]
+  // Ghost (always tracked, both regimes): the last Systemic verdict's
+  // tick — the suppression watermark. -1 = never suppressed.
+  var watermark: int
+  // Ghost (always tracked): per (node, drv) pair, the tick its
+  // CURRENT continuous expiry run began (a pair absent for a tick
+  // closed its attempt; a later re-appearance is a NEW expiry).
+  var expiredSince: (str, str) -> int
   // reachability evidence
   var sawSystemic: bool
   var sawPerNode: bool
@@ -148,6 +164,8 @@ module wedgeCluster {
     lastDelta' = 0,
     lastConsumedEvictions' = Set(),
     suppressedAnchors' = Set(),
+    watermark' = -1,
+    expiredSince' = Map(),
     sawSystemic' = false,
     sawPerNode' = false,
     sawReWedge' = false,
@@ -163,7 +181,8 @@ module wedgeCluster {
   def foldTick(expired: Set[(str, str)], healthy: Set[str], rpcFail: bool):
     { evidence: str -> (str -> int), marked: Set[str], delta: int,
       consumed: Set[str], systemic: bool, affected: int, of_: int,
-      wedged: Set[str], skip: bool, episodeAnchors: Set[(str, str, int)] } =
+      wedged: Set[str], skip: bool, episodeAnchors: Set[(str, str, int)],
+      watermark: int, expiredSince: (str, str) -> int } =
     val now = time + 1
     val consumed = if (ENABLE_EVICTION) pendingEvictions else Set()
     val evAfterEvict = evidence.keys().filter(n => not(consumed.contains(n))).mapBy(n => evidence.get(n))
@@ -172,7 +191,16 @@ module wedgeCluster {
     val skip = rpcFail and ENABLE_POPULATIONS
     val effExpired = if (rpcFail) Set() else expired
     val effHealthy = if (rpcFail) Set() else healthy
-    val evObserved = if (skip) evAfterEvict else pruned(observed(evAfterEvict, effExpired, now), now)
+    // Ghost: continuous expiry runs. An unobserved tick freezes the
+    // ghost (attempts did not close because we failed to look).
+    val newExpiredSince = if (rpcFail) expiredSince else
+      effExpired.mapBy(p => if (expiredSince.keys().contains(p)) expiredSince.get(p) else now)
+    // merged_bug_163 admission gate: an expiry run that began at or
+    // before the watermark belongs to a suppressed episode.
+    val admitted = if (ENABLE_EPISODE_LATCH)
+        effExpired.filter(p => newExpiredSince.get(p) > watermark)
+      else effExpired
+    val evObserved = if (skip) evAfterEvict else pruned(observed(evAfterEvict, admitted, now), now)
     val fleet = effHealthy.union(effExpired.map(p => p._1))
     val wedged = if (skip) Set() else wedgedOf(evObserved, now)
     val population = if (ENABLE_POPULATIONS) evObserved.keys().union(fleet).size() else fleet.size()
@@ -184,7 +212,10 @@ module wedgeCluster {
       // strictly more than half of the population
       2 * wedged.size() > population,
     }
-    val drained = if (systemic and ENABLE_FULL_EPILOGUE)
+    val drained = if (systemic and ENABLE_EPISODE_LATCH)
+        // Whole-episode drain: every node in the window.
+        Map()
+      else if (systemic and ENABLE_FULL_EPILOGUE)
         evObserved.keys().filter(n => not(wedged.contains(n))).mapBy(n => evObserved.get(n))
       else evObserved
     val survivors = if (systemic) Set() else wedged
@@ -208,6 +239,11 @@ module wedgeCluster {
       of_: if (systemic) population else 0,
       wedged: if (skip) Set() else survivors,
       skip: skip, episodeAnchors: episodeAnchors,
+      // Ghost watermark: ALWAYS latched on a Systemic verdict (both
+      // regimes), so the invariant is non-vacuous in the twin; only
+      // the ADMISSION gate is behind ENABLE_EPISODE_LATCH.
+      watermark: if (systemic) now else watermark,
+      expiredSince: newExpiredSince,
     }
 
   action tick = {
@@ -238,6 +274,8 @@ module wedgeCluster {
           nodeEvidence(r.evidence, a._1).keys().contains(a._2),
           nodeEvidence(r.evidence, a._1).get(a._2) == a._3,
         }),
+      watermark' = r.watermark,
+      expiredSince' = r.expiredSince,
       sawSystemic' = (sawSystemic or r.systemic),
       sawPerNode' = (sawPerNode or (not(r.systemic) and r.wedged.size() > 0)),
       sawReWedge' = (sawReWedge or (r.delta > 0 and markedIncrements > 0 and marked.size() == 0)),
@@ -260,6 +298,7 @@ module wedgeCluster {
     lastWedged' = lastWedged, lastDelta' = lastDelta,
     lastConsumedEvictions' = lastConsumedEvictions,
     suppressedAnchors' = suppressedAnchors,
+    watermark' = watermark, expiredSince' = expiredSince,
     sawSystemic' = sawSystemic, sawPerNode' = sawPerNode, sawReWedge' = sawReWedge,
   }
 
@@ -300,6 +339,22 @@ module wedgeCluster {
     lastDelta >= 0,
     marked == (if (lastSystemic) Set() else lastWedged.union(marked.intersect(lastWedged))),
   }
+  // merged_bug_163: a per-node verdict never marks a node whose
+  // qualifying evidence stems from a suppressed episode — every
+  // anchor of a wedged node maps to an expiry RUN that began strictly
+  // after the watermark. The latch makes this structural (admission
+  // gating + whole-episode drain); the round-2 as-built regime
+  // (latch off) violates it on both holes: the trailing-edge laggard
+  // (same still-open attempts re-anchor post-drain) and the
+  // sub-threshold participant (surviving episode anchor pairs with a
+  // later blip).
+  val noRemarkFromLatchedEpisode =
+    (not(lastSystemic) and watermark >= 0) implies
+      lastWedged.forall(n =>
+        nodeEvidence(evidence, n).keys().forall(d =>
+          expiredSince.keys().contains((n, d)) implies
+            expiredSince.get((n, d)) > watermark))
+
   val boundsOK = and {
     time >= 0, time <= MAX_TIME,
     markedIncrements >= 0,
@@ -317,6 +372,7 @@ module wedgeClusterMain {
     MAX_TIME = 5, WINDOW = 3, MIN_DISTINCT = 2,
     ENABLE_POPULATIONS = true,
     ENABLE_FULL_EPILOGUE = true,
+    ENABLE_EPISODE_LATCH = true,
     ENABLE_EVICTION = true
   ).*
 }
@@ -329,6 +385,7 @@ module wedgeClusterNoEviction {
     MAX_TIME = 5, WINDOW = 3, MIN_DISTINCT = 2,
     ENABLE_POPULATIONS = true,
     ENABLE_FULL_EPILOGUE = true,
+    ENABLE_EPISODE_LATCH = true,
     ENABLE_EVICTION = false
   ).*
 }
