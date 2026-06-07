@@ -36,6 +36,7 @@ pub(super) async fn setup_svc() -> (
     TestDb,
 ) {
     let db = TestDb::new(&crate::MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (actor, task) = setup_actor(db.pool.clone());
     let svc = AdminServiceImpl::new(
         db.pool.clone(),
@@ -212,6 +213,7 @@ async fn setup_svc_with_service_verifier() -> (
     let signer = rio_auth::hmac::HmacSigner::from_key(key.clone());
     let verifier = Arc::new(rio_auth::hmac::HmacVerifier::from_key(key));
     let db = TestDb::new(&crate::MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (actor, task) = setup_actor(db.pool.clone());
     let svc = AdminServiceImpl::new(
         db.pool.clone(),

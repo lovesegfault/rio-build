@@ -274,6 +274,7 @@ async fn test_merge_rollback_on_store_unavailable_no_orphan() -> TestResult {
 #[tokio::test]
 async fn test_ca_cache_hit_via_realisations() -> TestResult {
     let test_db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&test_db.pool).await;
     // No store client — exercises the I-048 fail-open: CA realisation
     // verify can't reach the store, so the realisation is trusted.
     // With a store client, the realized path would be verified
@@ -1904,6 +1905,7 @@ async fn test_handle_merge_dag_large_perf_bound() -> TestResult {
 #[tokio::test]
 async fn merge_hydrates_resource_floor_from_db() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |_, _| {});
 
     // Pre-seed: prior run promoted this FOD to floor.mem=8GiB, then

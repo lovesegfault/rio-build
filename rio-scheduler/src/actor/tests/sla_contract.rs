@@ -89,6 +89,7 @@ async fn refresh_cycle(actor: &mut DagActor) {
 #[tokio::test]
 async fn contract_selector_stability() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     // PG-derived hw table so `maybe_refresh_estimator` is a true no-op
     // on subsequent cycles. 3 distinct pods × 3 classes → `pod_ids=3`
     // (trusted); 1 tenant < `FLEET_MEDIAN_MIN_TENANTS` → factor gated
@@ -343,6 +344,7 @@ async fn contract_solve_cache_bounded_by_live_fits() {
     const CHURN: usize = 20;
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut cfg = test_hw_sla_config();
     cfg.max_keys_per_tenant = CAP;
     let mut actor = bare_actor_cfg(
@@ -429,6 +431,7 @@ async fn contract_solve_cache_bounded_by_live_fits() {
 async fn contract_ice_step_doubles_then_clears_on_registered() {
     use crate::sla::config::CapacityType;
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     actor.test_inject_ready("d0", Some("test-pkg"), "x86_64-linux", false);
 
@@ -501,6 +504,7 @@ async fn ack_observed_instance_types_folds_into_cost_table() {
     use rio_proto::types::ObservedInstanceType;
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
 
     let spot: crate::sla::config::Cell = ("mid-ebs-x86".into(), CapacityType::Spot);
@@ -558,6 +562,7 @@ async fn ack_bound_intents_populates_authoritative_binding() {
     use rio_proto::types::BoundIntent;
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     assert!(actor.authoritative_binding.is_empty());
 
@@ -637,6 +642,7 @@ async fn ack_binding_snapshot_presence_semantics() {
     use rio_proto::types::BoundIntent;
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     let bi = |id: &str, node: &str| BoundIntent {
         intent_id: id.into(),
@@ -677,6 +683,7 @@ async fn ack_observed_instance_types_gated_on_cost_was_leader() {
     use rio_proto::types::ObservedInstanceType;
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     let spot: crate::sla::config::Cell =
         ("mid-ebs-x86".into(), crate::sla::config::CapacityType::Spot);
@@ -719,6 +726,7 @@ async fn contract_ack_spawned_records_full_a_prime() {
     use crate::sla::config::{CapacityType, Cell};
     use rio_proto::types::{NodeSelectorRequirement, NodeSelectorTerm, SpawnIntent};
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
 
     let term = |h: &str, cap: &str| NodeSelectorTerm {
@@ -784,6 +792,7 @@ async fn contract_metrics_once_per_miss() {
     const LADDER: &str = "rio_scheduler_sla_hw_ladder_exhausted_total";
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
 
     let rec = DebuggingRecorder::new();
@@ -939,6 +948,7 @@ async fn contract_metrics_once_per_miss_hw_agnostic() {
     const INFEASIBLE: &str = "rio_scheduler_sla_infeasible_total";
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     // `test_sla_config()` with no hw-factor table seeded — the
     // `!hw.is_empty()` gate at solve_intent_for is false → hw-agnostic
     // intent_for path. Tier p90=1200.
@@ -1052,6 +1062,7 @@ async fn contract_infeasible_static_hints_independent() {
     use crate::sla::metrics::infeasible_counts;
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     // S=2000 > p90=1200 → solve_tier BestEffort → classify_ceiling =
     // SerialFloor. Shared by both drvs (same `(pname, system, tenant)`
     // → same `(mkh, ovr, fh)`).
@@ -1130,6 +1141,7 @@ async fn contract_infeasible_static_hints_independent() {
 #[tokio::test]
 async fn contract_h_explore_stable_across_inputs_gen_churn() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     // ε=1.0: every drv hits the explore branch — the seeded coin is
     // `hash(drv_hash)` only, so the SAME drv hits or misses
@@ -1261,6 +1273,7 @@ async fn contract_h_explore_schmitt_carries_prev_a() {
     use crate::sla::solve::{self, SolveFullResult};
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     // 2-hw_class fixture: h_main cheap (price 0.001) → unrestricted A =
     // {h_main}; h_exp dear (price 1.0) → ∉ A → ε_h pool = H\A = {h_exp}
@@ -1453,6 +1466,7 @@ async fn contract_h_explore_schmitt_across_ice_mask() {
     use std::cell::Cell as StdCell;
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     let h_main: String = "intel-8".into();
     let h_exp: String = "intel-6".into();
@@ -1680,6 +1694,7 @@ async fn contract_h_explore_schmitt_across_ice_mask() {
 #[tokio::test]
 async fn contract_dispatch_accepts_2row_postfilter_fit() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
 
     // Capped fit, p̄=8: ring had 5 samples at c∈{4,8,16,32,32} (pre-
@@ -1738,6 +1753,7 @@ async fn spawn_intent_carries_disk_headroom() {
     use crate::sla::types::RingNEff;
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
 
     // Fitted, n_eff=100 → headroom≈1.32 (tight: model is confident).
@@ -1796,6 +1812,7 @@ async fn spawn_intent_carries_disk_headroom() {
 #[tokio::test]
 async fn contract_pinned_explore_releases_on_infeasible() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     actor.sla_config.hw_explore_epsilon = 1.0;
     // S=2000 > p90=1200 → T(c)≥S ∀c → every cell rejected on serial
@@ -1856,6 +1873,7 @@ async fn contract_pinned_explore_releases_on_infeasible() {
 async fn contract_pinned_explore_covers_pool() {
     use crate::sla::config::{HwClassDef, NodeLabelMatch};
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     // Builders-only fixture: the `pool` precondition counts ALL
     // `cfg.hw_classes`, but a featureless drv never pins to fetcher
     // cells (∅-guard) — fetcher-* would inflate `want_pool` past what
@@ -1937,6 +1955,7 @@ async fn contract_pinned_explore_covers_pool() {
 async fn contract_pinned_explore_routes_around_ice() {
     use crate::sla::config::CapacityType;
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     actor.sla_config.hw_explore_epsilon = 1.0;
     actor.test_inject_ready("d-ice", Some("test-pkg"), "x86_64-linux", false);
@@ -2021,6 +2040,7 @@ async fn contract_pinned_explore_routes_around_ice() {
 #[tokio::test]
 async fn contract_pinned_explore_first_writer_independent() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mkh = crate::sla::solve::model_key_hash(&make_fit("test-pkg").key);
 
     // Two independent actors: each its own DagActor (own `dag` HashMap
@@ -2113,6 +2133,7 @@ async fn contract_interrupt_runaway_reachable() {
     use crate::sla::solve::InfeasibleReason;
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     actor.sla_config.hw_explore_epsilon = 0.0;
 
@@ -2195,6 +2216,7 @@ async fn contract_interrupt_runaway_reachable() {
 #[tokio::test]
 async fn contract_spawn_intents_order_deterministic_across_ties() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
 
     // Per-pname forced_cores so each drv solves to a DISTINCT `cores`
     // (override path → hw-agnostic `intent_for`; deterministic, no
@@ -2325,6 +2347,7 @@ async fn contract_spawn_intents_order_deterministic_across_ties() {
 #[tokio::test]
 async fn contract_forced_mem_only_override_is_hw_agnostic() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     // bare_actor_hw: hwCostSource=Static, 3 hw_classes, populated hw
     // table, fitted "test-pkg" (mem.p90=6GiB) — solve_full reachable.
@@ -2373,6 +2396,7 @@ async fn contract_bypass_capacity_no_arch_match_emits_empty() {
     use crate::sla::config::{ARCH_LABEL, NodeLabelMatch};
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     // Make every hw_class explicitly amd64 so the unmappable-system
     // case (riscv64-linux → system_to_k8s_arch=None) AND the
@@ -2427,6 +2451,7 @@ async fn contract_hw_cost_unknown_once_per_epoch() {
     const HW_COST_UNKNOWN: &str = "rio_scheduler_sla_hw_cost_unknown_total";
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     // Builders-only fixture: the precondition asserts
     // `cfg.hw_classes.len()==3` and the metric count derives from
     // `|h_all|`; a featureless drv never routes to fetcher cells
@@ -2477,6 +2502,7 @@ async fn contract_hw_cost_unknown_once_per_epoch() {
 #[tokio::test]
 async fn contract_bypass_capacity_oversized_cores_emits_hosting_class() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     // reference_hw_class=intel-6 with max_cores=32; intel-7/8 stay at
     // the global 64. `--cores=48` fits intel-7/8, not intel-6.
@@ -2538,6 +2564,7 @@ async fn contract_bypass_capacity_oversized_cores_emits_hosting_class() {
 #[tokio::test]
 async fn contract_bypass_capacity_oversized_no_class_hosts_emits_empty() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     actor.sla_config.reference_hw_class = "intel-6".into();
     // Every class capped at 32; global at 64. `--cores=48` fits global,
@@ -2581,6 +2608,7 @@ async fn contract_bypass_capacity_oversized_no_class_hosts_emits_empty() {
 #[tokio::test]
 async fn contract_chokepoint_preserves_term_name_alignment() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     actor.sla_config.reference_hw_class = "intel-6".into();
     // intel-6=32, intel-7=64, intel-8=64. cores=48 → intel-6 stripped.
@@ -2642,6 +2670,7 @@ async fn contract_chokepoint_preserves_term_name_alignment() {
 async fn contract_kvm_routes_via_provides_features() {
     use crate::sla::config::{HwClassDef, NodeLabelMatch};
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     // Add a metal hwClass with provides=[kvm]. The 3 intel-* classes
     // from bare_actor_hw have provides=[] (default).
@@ -2720,6 +2749,7 @@ async fn contract_kvm_routes_via_provides_features() {
 async fn bypass_none_arm_featured_intent_emits_cells() {
     use crate::sla::config::{ARCH_LABEL, HwClassDef, NodeLabelMatch};
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     actor.sla_config.hw_classes.insert(
         "metal-x86".into(),
@@ -2777,6 +2807,7 @@ async fn bypass_none_arm_featured_intent_emits_cells() {
 async fn bypass_none_arm_fod_with_features_routes_to_fetcher() {
     use crate::sla::config::{ARCH_LABEL, HwClassDef, NodeLabelMatch};
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     actor.sla_config.hw_classes.insert(
         "metal-x86".into(),
@@ -2850,6 +2881,7 @@ async fn bypass_none_arm_fod_with_features_routes_to_fetcher() {
 #[tokio::test]
 async fn unroutable_features_debounced_no_feature_label() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     seed_fit(&actor, "test-pkg");
     // No hwClass in `bare_actor_hw` provides "zz-unroutable" → `h_all`
@@ -2910,6 +2942,7 @@ async fn unroutable_features_debounced_no_feature_label() {
 #[tokio::test]
 async fn contract_fod_capacity_override_routes_to_fetcher() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     // Fetcher drv (`is_fod=true`) whose pname matches a `--capacity`
     // override. The runbook documents `rio-cli sla override <pname>
@@ -2971,6 +3004,7 @@ async fn contract_fod_capacity_override_routes_to_fetcher() {
 #[tokio::test]
 async fn contract_overcap_cores_override_still_routes_featured_intent() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     // Featured intent: FOD ⟹ `effective_features = [fetcher]` (§13e),
     // routes to `fetcher-*` only — same construction as the
@@ -3026,6 +3060,7 @@ async fn contract_overcap_cores_override_still_routes_featured_intent() {
 async fn bypass_cells_fod_routes_to_fetcher_regardless_of_cap() {
     use crate::sla::config::CapacityType;
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     actor.test_inject_ready("d-fod", Some("test-pkg"), "x86_64-linux", true);
 
@@ -3061,6 +3096,7 @@ async fn bypass_cells_fod_routes_to_fetcher_regardless_of_cap() {
 async fn bypass_cells_unhosted_cap_pin_drops_at_producer() {
     use crate::sla::config::CapacityType;
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     // Make the reference class od-only so `Spot ∉ capacity_types_for(h)`.
     actor.sla_config.reference_hw_class = "intel-6".into();
@@ -3113,6 +3149,7 @@ async fn bypass_cells_unhosted_cap_pin_drops_at_producer() {
 #[tokio::test]
 async fn fod_intent_routes_to_fetcher_cell() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     actor.test_inject_ready("fod-1", None, "x86_64-linux", true);
     let intents = actor.compute_spawn_intents(&Default::default()).intents;
@@ -3140,6 +3177,7 @@ async fn fod_intent_routes_to_fetcher_cell() {
 #[tokio::test]
 async fn fod_intent_with_fit_routes_to_fetcher_cell() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     // `bare_actor_hw` seeds a "test-pkg" Amdahl fit; the FOD shares it
     // (lookup is by `ModelKey {pname, system, tenant}`, not `is_fod`).
@@ -3168,6 +3206,7 @@ async fn fod_intent_with_fit_routes_to_fetcher_cell() {
 #[tokio::test]
 async fn builder_intent_does_not_route_to_fetcher_cell() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     actor.test_inject_ready("build-1", Some("test-pkg"), "x86_64-linux", false);
     let intents = actor.compute_spawn_intents(&Default::default()).intents;
@@ -3203,6 +3242,7 @@ async fn builder_intent_does_not_route_to_fetcher_cell() {
 #[tokio::test]
 async fn non_fod_with_declared_fetcher_strips_routing_tag() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     seed_fit(&actor, "test-pkg");
     // Non-FOD with `requiredSystemFeatures: ["fetcher"]` — a tenant
@@ -3252,6 +3292,7 @@ async fn non_fod_with_declared_fetcher_strips_routing_tag() {
 async fn bypass_cells_unhosted_cap_pin_warns_once() {
     use crate::sla::config::CapacityType;
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     actor.sla_config.reference_hw_class = "intel-6".into();
     actor
@@ -3295,6 +3336,7 @@ async fn bypass_cells_unhosted_cap_pin_warns_once() {
 #[tokio::test]
 async fn unroutable_features_warned_is_bounded() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let actor = bare_actor_hw(db.pool.clone());
     let cap = crate::actor::UNROUTABLE_FEATURES_WARNED_CAP;
     for i in 0..(2 * cap) {
@@ -3384,6 +3426,7 @@ fn bare_actor_per_intent_lead(pool: sqlx::PgPool, max_forecast_cores: u32) -> Da
 #[tokio::test]
 async fn forecast_lead_horizon_per_intent() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_per_intent_lead(db.pool.clone(), 2_000);
 
     // dep(Running, eta≈300) → q-shallow(Queued, featureless).
@@ -3431,6 +3474,7 @@ async fn forecast_lead_horizon_per_intent() {
 #[tokio::test]
 async fn forecast_kvm_intent_uses_metal_lead() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_per_intent_lead(db.pool.clone(), 2_000);
 
     // dep(Running, eta≈300) → q-kvm(Queued, requires kvm). r35: route
@@ -3470,6 +3514,7 @@ async fn forecast_kvm_intent_uses_metal_lead() {
 #[tokio::test]
 async fn forecast_budget_drop_metric() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     // probe.cpu=4 cores per intent. Cap=4 → admits ONE forecast intent.
     let mut actor = bare_actor_per_intent_lead(db.pool.clone(), 4);
 
@@ -3536,6 +3581,7 @@ async fn contract_first_pull_clears_ice_not_yet_ready_does_not() {
     use crate::sla::config::CapacityType;
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
 
     // Real merges (durable rows) so the fenced pull mint can commit:
@@ -3697,6 +3743,7 @@ async fn leader_lost_writes_cost_latch_false() {
     use std::sync::atomic::Ordering;
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     actor.cost_was_leader.store(true, Ordering::Relaxed);
 
@@ -3726,6 +3773,7 @@ async fn rebound_runs_cost_latch_lose_cell() {
     use std::sync::atomic::Ordering;
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     // The latch state of a leading tenure whose housekeeping already
     // reloaded (the steady state a rebound interrupts).
@@ -3755,6 +3803,7 @@ async fn rebound_runs_cost_latch_lose_cell() {
 #[tokio::test]
 async fn leader_edges_acquire_cells_fire() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let actor = bare_actor_hw(db.pool.clone());
 
     for edge in crate::observability::LEADER_EDGES {

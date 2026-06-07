@@ -910,6 +910,26 @@ silently hidden answers "missing" on the batch RPC while the single-path RPC
 answers Internal for the same row — corruption laundered into
 re-substitution churn instead of an operator signal.
 
+#r("store.substitute.unverifiable-token-rejects")[
+  A request that carries `x-rio-probe-tenant-id` while its
+  `x-rio-service-token` is absent, unverifiable (bad HMAC, expired, verifier
+  unset), or from a non-allowlisted caller MUST be rejected
+  `UNAUTHENTICATED` — never silently downgraded to an anonymous probe. The
+  store MUST echo `FindMissingPathsResponse.probe_ran_tenant_scoped` (true
+  iff a verified tenant scope was resolved AND a substituter is configured),
+  and the scheduler MUST derive its confirmed-missing authority from that
+  echo, never from having attached a probe header.
+]
+
+The silent downgrade was the wire-level capability-fault laundering
+(bughunt-3 merged_bug_003, owner-signed Q3): an anonymous probe answers
+missing-with-empty-substitutable, indistinguishable from "probed every
+upstream, all 404'd" — routine service-HMAC rotation skew folded to
+`ConfirmedMissing`, fail-fasting builds whose outputs sat in the upstream
+cache, and the anonymous pass-through re-opened the cross-tenant
+sig-visibility laundering the per-tenant probe partition exists to prevent.
+Identity honored, never identity attached.
+
 #r("store.substitute.probe-bounded+4")[
   `check_available` (the HEAD-only probe feeding
   `FindMissingPathsResponse.substitutable_paths`) MUST bound its upstream load.

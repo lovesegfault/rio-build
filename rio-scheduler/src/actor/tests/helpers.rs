@@ -116,6 +116,7 @@ pub(crate) async fn setup_ca_fixture_configured(
     configure: impl FnOnce(&mut DagActorConfig, &mut DagActorPlumbing),
 ) -> anyhow::Result<CaFixture> {
     let db = TestDb::new(&MIGRATOR).await;
+    seed_default_tenant(&db.pool).await;
     let (store, store_client, store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let (actor, actor_task) =
@@ -210,6 +211,7 @@ pub(crate) fn bare_actor_cfg(pool: sqlx::PgPool, cfg: DagActorConfig) -> DagActo
 /// Most callers: `let (_db, handle, _task) = setup().await;`
 pub(crate) async fn setup() -> (TestDb, ActorHandle, tokio::task::JoinHandle<()>) {
     let db = TestDb::new(&MIGRATOR).await;
+    seed_default_tenant(&db.pool).await;
     let (handle, task) = setup_actor(db.pool.clone());
     (db, handle, task)
 }
@@ -233,9 +235,23 @@ pub(crate) async fn setup_with_mock_store() -> anyhow::Result<(
     (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>),
 )> {
     let db = TestDb::new(&MIGRATOR).await;
+    seed_default_tenant(&db.pool).await;
     let (store, store_client, store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
-    let (handle, actor_task) = setup_actor_with_store(db.pool.clone(), Some(store_client));
+    // merged_bug_003 (Q3): tenant-scoped probing is the ONLY probing
+    // that reports substitutable paths — the store (real and mock
+    // alike) answers an anonymous probe with empty substitutable and
+    // echoes probe_ran_tenant_scoped=false, and the scheduler only
+    // attaches the probe header under service auth. The default
+    // harness therefore signs like a configured deployment; the
+    // pre-fix mock reported substitutable paths to anonymous probes,
+    // a wire state the real store never produces.
+    let (handle, actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |_cfg, p| {
+            p.service_signer = Some(std::sync::Arc::new(rio_auth::hmac::HmacSigner::from_key(
+                b"mock-store-harness-service-key32".to_vec(),
+            )));
+        });
     Ok((db, store, handle, (store_task, actor_task)))
 }
 
@@ -267,6 +283,32 @@ pub(crate) async fn merge_dag_req(
     Ok(reply_rx.await??.state)
 }
 
+/// The deterministic tenant every default-merge helper stamps on its
+/// builds (merged_bug_003 / Q3): tenanted builds are the ONLY builds
+/// the substitution lane serves — `tenant_upstreams` is per-tenant,
+/// the dispatch probe is scoped under service auth, and the store
+/// reports substitutable paths only to a verified scope. The pre-Q3
+/// harness merged tenant-less builds against a mock that answered
+/// anonymous probes with substitutable paths — a wire state the real
+/// store never produces. Seeded idempotently by the async setup
+/// helpers ([`seed_default_tenant`]); tests that need DISTINCT
+/// tenants keep seeding their own.
+pub(crate) const DEFAULT_TEST_TENANT: Uuid =
+    Uuid::from_u128(0xD0FA_17DE_0000_4000_8000_00000000D0FA);
+
+/// Idempotently seed [`DEFAULT_TEST_TENANT`]. Called by every async
+/// setup helper that owns a pool; safe to call repeatedly.
+pub(crate) async fn seed_default_tenant(pool: &sqlx::PgPool) {
+    sqlx::query(
+        "INSERT INTO tenants (tenant_id, tenant_name) VALUES ($1, 'harness-default-tenant') \
+         ON CONFLICT (tenant_id) DO NOTHING",
+    )
+    .bind(DEFAULT_TEST_TENANT)
+    .execute(pool)
+    .await
+    .expect("seed_default_tenant INSERT failed");
+}
+
 /// Merge a single-node DAG and return the event receiver.
 ///
 /// `drv_path` is auto-generated from `tag` via [`test_drv_path`].
@@ -281,7 +323,7 @@ pub(crate) async fn merge_single_node(
         .send_unchecked(ActorCommand::MergeDag {
             req: MergeDagRequest {
                 build_id,
-                tenant_id: None,
+                tenant_id: Some(DEFAULT_TEST_TENANT),
                 priority_class,
                 nodes: vec![make_node(tag)],
                 edges: vec![],
@@ -289,7 +331,7 @@ pub(crate) async fn merge_single_node(
                 keep_going: false,
                 traceparent: String::new(),
                 jti: None,
-                jwt_token: None,
+                jwt_token: Some("harness-tenant-jwt".into()),
             },
             reply: reply_tx,
         })
@@ -297,8 +339,9 @@ pub(crate) async fn merge_single_node(
     Ok(reply_rx.await??.state)
 }
 
-/// Merge a multi-node DAG with default options (tenant=None,
-/// priority=Scheduled, options=default). Generalization of [`merge_single_node`].
+/// Merge a multi-node DAG with default options
+/// (tenant=[`DEFAULT_TEST_TENANT`], priority=Scheduled,
+/// options=default). Generalization of [`merge_single_node`].
 /// Returns the broadcast receiver for build events.
 pub(crate) async fn merge_dag(
     handle: &ActorHandle,
@@ -312,7 +355,7 @@ pub(crate) async fn merge_dag(
         .send_unchecked(ActorCommand::MergeDag {
             req: MergeDagRequest {
                 build_id,
-                tenant_id: None,
+                tenant_id: Some(DEFAULT_TEST_TENANT),
                 priority_class: PriorityClass::Scheduled,
                 nodes,
                 edges,
@@ -320,7 +363,7 @@ pub(crate) async fn merge_dag(
                 keep_going,
                 traceparent: String::new(),
                 jti: None,
-                jwt_token: None,
+                jwt_token: Some("harness-tenant-jwt".into()),
             },
             reply: reply_tx,
         })
@@ -780,6 +823,7 @@ pub(crate) fn bare_actor_hw_builders_only(pool: sqlx::PgPool) -> DagActor {
 pub(crate) async fn setup_with_big_ceilings() -> (TestDb, ActorHandle, tokio::task::JoinHandle<()>)
 {
     let db = TestDb::new(&MIGRATOR).await;
+    seed_default_tenant(&db.pool).await;
     let (handle, task) =
         setup_actor_configured(db.pool.clone(), None, |c, _| c.sla = test_sla_config());
     (db, handle, task)
@@ -878,6 +922,7 @@ impl RecoveryFixture {
         Fut: Future<Output = anyhow::Result<()>>,
     {
         let db = TestDb::new(&MIGRATOR).await;
+        crate::actor::tests::seed_default_tenant(&db.pool).await;
         // Phase 1: first "leader" writes state.
         {
             let phase1_configure = configure.clone();
@@ -1359,6 +1404,7 @@ pub(crate) async fn setup_pull_ca_fixture_configured(
     configure: impl FnOnce(&mut DagActorConfig, &mut DagActorPlumbing),
 ) -> anyhow::Result<PullCaFixture> {
     let db = TestDb::new(&MIGRATOR).await;
+    seed_default_tenant(&db.pool).await;
     let (store, store_client, store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let (actor, actor_task) =
@@ -1392,6 +1438,7 @@ pub(crate) async fn setup_pull_ca_fixture_configured(
 #[tokio::test]
 async fn test_actor_starts_and_stops() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (handle, task) = setup_actor(db.pool.clone());
     // Query should succeed (actor is running). Also acts as a barrier.
     let roots = handle
@@ -1409,6 +1456,7 @@ async fn test_actor_starts_and_stops() -> TestResult {
 #[tokio::test]
 async fn test_actor_is_alive_detection() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (handle, task) = setup_actor(db.pool.clone());
 
     // Actor should be alive after spawn. is_alive() is just !tx.is_closed()

@@ -1236,6 +1236,7 @@ async fn claimed_no_attempt_ghost_repaired_after_two_sweeps() -> TestResult {
 async fn reprobe_confirmed_missing_requires_all_tenants() -> TestResult {
     use rio_auth::hmac::HmacSigner;
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let service_key = b"test-028b-settle-service-key-32-b".to_vec();
@@ -2182,6 +2183,7 @@ async fn flag_on_unmarked_leaf_confirmed_missing_releases_to_from_source() -> Te
     use rio_auth::hmac::HmacSigner;
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     // Service signer + a real tenant: the consumption re-probe can only
@@ -2305,6 +2307,106 @@ async fn flag_on_unmarked_leaf_confirmed_missing_releases_to_from_source() -> Te
         matches!(pull, Ok(PullOutcome::Deliver(_))),
         "after the from-source release a builder pull must mint (the build \
          attempt proceeds from source), got {pull:?}"
+    );
+    Ok(())
+}
+
+// r[verify store.substitute.unverifiable-token-rejects]
+/// merged_bug_003 (Q3): `can_confirm` derives from the store's
+/// `probe_ran_tenant_scoped` ECHO, never from the scheduler having
+/// attached a probe header. The mock simulates the pre-Q3 silent
+/// downgrade (header ignored, no upstream probe, empty
+/// substitutable/indeterminate — wire-identical to confirmed 404s —
+/// echo false): the settlement re-probe must treat every missing path
+/// as NON-confirmable and re-arm, never resolve from-source off a
+/// tenant-blind answer. Pre-fix `can_confirm = !probe.is_empty()`
+/// (sender intent) confirmed the miss and resolved the job
+/// from_source.
+#[tokio::test]
+async fn reprobe_scope_dropped_echo_never_confirms_missing() -> TestResult {
+    use rio_auth::hmac::HmacSigner;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let (store, store_client, store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let service_key = b"test-m003-echo-service-key-32-byt".to_vec();
+    let (handle, actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |_cfg, p| {
+            p.service_signer = Some(Arc::new(HmacSigner::from_key(service_key)));
+        });
+    let _tasks = (store_task, actor_task);
+    let tenant = rio_store::test_helpers::seed_tenant(&db.pool, "m003-tenant").await;
+
+    // A childless leaf; the probe blip creates the job (same shape as
+    // the unmarked-leaf settlement test above).
+    let out = test_store_path("m003-leaf-out");
+    let mut leaf = make_node("m003-leaf");
+    leaf.expected_output_paths = vec![out.clone()];
+    leaf.wanted_output_names = vec!["out".into()];
+    merge_dag_req(
+        &handle,
+        MergeDagRequest {
+            build_id: Uuid::new_v4(),
+            tenant_id: Some(tenant),
+            priority_class: PriorityClass::Scheduled,
+            nodes: vec![leaf],
+            edges: vec![],
+            options: BuildOptions::default(),
+            keep_going: false,
+            traceparent: String::new(),
+            jti: None,
+            jwt_token: None,
+        },
+    )
+    .await?;
+    barrier(&handle).await;
+    store.state.substitutable.write().unwrap().push(out.clone());
+    tick(&handle).await?;
+    barrier(&handle).await;
+    let (jobs, _) = sdb(&db.pool).count_materialization_rows().await?;
+    assert_eq!(jobs, 1, "precondition: the probe blip created one job");
+
+    let assignment = match claim_materialization(&handle, "m003-leaf", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+
+    // The store loses its ability to honor tenant scope (HMAC
+    // rotation skew at the store boundary): every subsequent
+    // FindMissingPaths ignores the header, runs no upstream probe,
+    // and echoes probe_ran_tenant_scoped=false.
+    store
+        .faults
+        .drop_tenant_scope
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        "m003-leaf",
+        mat_unobtainable_outcome(
+            vec![out.clone()],
+            vec![],
+            "upstream 404 on the wanted output",
+        ),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("unobtainable report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    // THE Q3 ASSERTION: a scope-dropped probe answer must never
+    // anchor a from-source resolution (B3: identity honored, not
+    // identity attached). The claim releases and the job re-arms for
+    // a replica whose probe CAN be honored.
+    let job_state: String = sqlx::query_scalar("SELECT state FROM materialization_jobs")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_ne!(
+        job_state, "resolved_from_source",
+        "a tenant-blind (echo=false) probe answer must not confirm missing — \
+         the job must re-arm, not resolve from-source"
     );
     Ok(())
 }
@@ -2658,6 +2760,7 @@ async fn flag_on_queued_node_accepts_materialization_claim() -> TestResult {
 #[tokio::test]
 async fn flag_on_queued_mint_crash_between_commit_and_transition_recovers() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, _store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
 
@@ -3385,6 +3488,7 @@ async fn pruned_origin_pending_evidence_resolves_from_source() -> TestResult {
 #[tokio::test]
 async fn resolved_pruned_job_does_not_fail_fast_later_remerge() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, _store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
 
@@ -3683,6 +3787,7 @@ async fn pins_survive_while_any_interest_live() -> TestResult {
 #[tokio::test]
 async fn flag_on_era_pins_release_after_revert() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, _store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let tag = "pin-revert";
@@ -3779,6 +3884,7 @@ async fn flag_on_era_pins_release_after_revert() -> TestResult {
 #[tokio::test]
 async fn recovery_sweep_releases_orphaned_materialization_pins() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
 
     // Seed the orphan shape directly in PG (the crash window's residue):
     // a terminal build + wanted row + resolved job + materialization pins.
@@ -3882,6 +3988,7 @@ async fn flag_on_every_job_state_has_armed_action() -> TestResult {
     // lands on top of any prior charge parks the job; backoff base 1 s
     // (exp doubling) keeps the parked window short but observable.
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let (handle, actor_task) =
@@ -4261,6 +4368,7 @@ async fn flag_on_every_job_state_has_armed_action() -> TestResult {
 #[tokio::test]
 async fn flag_on_recovery_rebuilds_job_view_and_jobs_survive() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, _store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
 
@@ -4789,6 +4897,7 @@ async fn flag_on_builder_pull_refused_while_job_unresolved() -> TestResult {
     use rio_auth::hmac::HmacSigner;
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, _store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let service_key = b"test-t44-service-key-32-bytes!!!!".to_vec();
@@ -4816,7 +4925,7 @@ async fn flag_on_builder_pull_refused_while_job_unresolved() -> TestResult {
             keep_going: false,
             traceparent: String::new(),
             jti: None,
-            jwt_token: None,
+            jwt_token: Some("harness-tenant-jwt".into()),
         },
     )
     .await?;
@@ -4904,7 +5013,7 @@ async fn flag_on_builder_pull_refused_while_job_unresolved() -> TestResult {
             keep_going: false,
             traceparent: String::new(),
             jti: None,
-            jwt_token: None,
+            jwt_token: Some("harness-tenant-jwt".into()),
         },
     )
     .await?;
@@ -4949,7 +5058,7 @@ async fn flag_on_builder_pull_refused_while_job_unresolved() -> TestResult {
             keep_going: false,
             traceparent: String::new(),
             jti: None,
-            jwt_token: None,
+            jwt_token: Some("harness-tenant-jwt".into()),
         },
     )
     .await?;
@@ -5049,6 +5158,7 @@ async fn flag_on_genuine_unobtainable_fail_fasts_with_resubmit_error() -> TestRe
     use rio_auth::hmac::HmacSigner;
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, _store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let service_key = b"test-t44-failfast-key-32-bytes!!!".to_vec();
@@ -5085,7 +5195,7 @@ async fn flag_on_genuine_unobtainable_fail_fasts_with_resubmit_error() -> TestRe
             keep_going: false,
             traceparent: String::new(),
             jti: None,
-            jwt_token: None,
+            jwt_token: Some("harness-tenant-jwt".into()),
         },
     )
     .await?;
@@ -5240,6 +5350,7 @@ async fn flag_on_success_coverage_ignores_unwanted_outputs() -> TestResult {
 #[tokio::test]
 async fn flag_on_probe_job_backfills_wanted_relation_for_flag_off_era_builds() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, _store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let tenant = rio_store::test_helpers::seed_tenant(&db.pool, "fp4b-tenant").await;
@@ -5267,7 +5378,7 @@ async fn flag_on_probe_job_backfills_wanted_relation_for_flag_off_era_builds() -
                 keep_going: false,
                 traceparent: String::new(),
                 jti: None,
-                jwt_token: None,
+                jwt_token: Some("harness-tenant-jwt".into()),
             },
         )
         .await?;
@@ -5298,6 +5409,9 @@ async fn flag_on_probe_job_backfills_wanted_relation_for_flag_off_era_builds() -
     let (handle, _task) =
         setup_actor_configured(db.pool.clone(), Some(store_client), move |_cfg, p| {
             p.leader = phase2_leader;
+            p.service_signer = Some(std::sync::Arc::new(rio_auth::hmac::HmacSigner::from_key(
+                b"mock-store-harness-service-key32".to_vec(),
+            )));
         });
     handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
     barrier(&handle).await;
@@ -5426,10 +5540,14 @@ async fn parked_job_stalled_gauge_and_reevaluation() -> TestResult {
     // max_attempts=1 → one worker infra report parks; backoff 1 h so
     // park expiry never interferes with the re-evaluation assertions.
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let (handle, actor_task) =
-        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, _| {
+        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, p| {
+            p.service_signer = Some(std::sync::Arc::new(rio_auth::hmac::HmacSigner::from_key(
+                b"mock-store-harness-service-key32".to_vec(),
+            )));
             cfg.materialization.max_attempts = 1;
             cfg.materialization.park_backoff_base_secs = 3600;
             cfg.materialization.park_backoff_cap_secs = 3600;
@@ -5712,6 +5830,7 @@ async fn conversion_strictness_requires_worker_charges_to_exhaust() -> TestResul
     let _guard = metrics::set_default_local_recorder(&rec);
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let (handle, actor_task) =
@@ -5794,6 +5913,7 @@ async fn conversion_strictness_converts_when_worker_charges_alone_exhaust() -> T
     let _guard = metrics::set_default_local_recorder(&rec);
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let (handle, actor_task) =
@@ -5853,6 +5973,7 @@ async fn conversion_strictness_converts_when_worker_charges_alone_exhaust() -> T
 #[tokio::test]
 async fn conversion_strictness_dwell_defers_then_converts() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let (handle, actor_task) =
@@ -5916,6 +6037,7 @@ async fn conversion_strictness_dwell_defers_then_converts() -> TestResult {
 #[tokio::test]
 async fn conversion_strictness_dwell_survives_failover() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let configure = |cfg: &mut crate::actor::config::DagActorConfig| {
         cfg.materialization.max_attempts = 1;
         cfg.materialization.park_backoff_base_secs = 3600;
@@ -6155,6 +6277,7 @@ async fn routing_reads_origin_not_column() -> TestResult {
     use rio_auth::hmac::HmacSigner;
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, _store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let service_key = b"test-d21-origin-key-32-bytes!!!!".to_vec();
@@ -6188,7 +6311,7 @@ async fn routing_reads_origin_not_column() -> TestResult {
             keep_going: false,
             traceparent: String::new(),
             jti: None,
-            jwt_token: None,
+            jwt_token: Some("harness-tenant-jwt".into()),
         },
     )
     .await?;
@@ -6264,7 +6387,7 @@ async fn routing_reads_origin_not_column() -> TestResult {
             keep_going: false,
             traceparent: String::new(),
             jti: None,
-            jwt_token: None,
+            jwt_token: Some("harness-tenant-jwt".into()),
         },
     )
     .await?;
@@ -6334,6 +6457,7 @@ async fn unobtainable_on_upgraded_dedup_job_fail_fasts() -> TestResult {
     let _guard = metrics::set_default_local_recorder(&rec);
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, _store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let service_key = b"test-d21-dedup-key-32-bytes!!!!!".to_vec();
@@ -6366,7 +6490,7 @@ async fn unobtainable_on_upgraded_dedup_job_fail_fasts() -> TestResult {
             keep_going: false,
             traceparent: String::new(),
             jti: None,
-            jwt_token: None,
+            jwt_token: Some("harness-tenant-jwt".into()),
         },
     )
     .await?;
@@ -6393,7 +6517,7 @@ async fn unobtainable_on_upgraded_dedup_job_fail_fasts() -> TestResult {
             keep_going: false,
             traceparent: String::new(),
             jti: None,
-            jwt_token: None,
+            jwt_token: Some("harness-tenant-jwt".into()),
         },
     )
     .await?;
@@ -6484,6 +6608,7 @@ async fn dedup_upgrade_preserves_parked_armament() -> TestResult {
     // max_attempts=1 → one infra report parks; backoff 1 h so the park
     // cannot expire under the assertions.
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let (handle, actor_task) =
@@ -6635,6 +6760,7 @@ async fn routing_evidence_survives_inmemory_truncation() -> TestResult {
     use rio_auth::hmac::HmacSigner;
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, _store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let service_key = b"test-d22-trunc-key-32-bytes!!!!!".to_vec();
@@ -6729,6 +6855,7 @@ async fn routing_evidence_survives_inmemory_truncation() -> TestResult {
 #[tokio::test]
 async fn park_reevaluation_resolves_on_durable_vouch() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let (handle, actor_task) =
@@ -6804,6 +6931,7 @@ async fn classify_durable_evidence_ignores_dead_voucher() -> TestResult {
     use rio_auth::hmac::HmacSigner;
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, _store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let service_key = b"test-d22-dead-key-32-bytes!!!!!!".to_vec();
@@ -6973,6 +7101,7 @@ where
     Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     {
         let (handle, task) = setup_actor_configured(db.pool.clone(), None, |_cfg, _| {});
         seed(handle, db.pool.clone()).await?;
@@ -7813,6 +7942,7 @@ async fn requeued_dep_racing_claim_returns_to_queued() -> TestResult {
 #[tokio::test]
 async fn establishment_only_charges_park_at_max_attempts() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let (handle, actor_task) =
@@ -7894,6 +8024,7 @@ async fn establishment_only_charges_park_at_max_attempts() -> TestResult {
 #[tokio::test]
 async fn second_job_budget_window_starts_fresh() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let (handle, actor_task) =
@@ -8321,6 +8452,7 @@ async fn failed_fenced_job_create_retries_via_stash() -> TestResult {
 #[tracing_test::traced_test]
 async fn recovery_fails_when_job_view_load_fails() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, _store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
 
@@ -8515,6 +8647,7 @@ async fn backstop_refeeds_untracked_rows_and_cancels_moot() -> TestResult {
 #[tracing_test::traced_test]
 async fn flag_on_parked_jobs_leave_substituting_bucket() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, _store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, _| {
@@ -8602,6 +8735,7 @@ async fn flag_on_parked_jobs_leave_substituting_bucket() -> TestResult {
 #[tokio::test]
 async fn one_shot_fresh_for_second_job() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let (handle, actor_task) =
@@ -8693,6 +8827,7 @@ async fn one_shot_fresh_for_second_job() -> TestResult {
 #[tokio::test]
 async fn failover_preserves_job_budget_window() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, _store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
 
@@ -8787,6 +8922,7 @@ async fn failover_preserves_job_budget_window() -> TestResult {
 #[tokio::test]
 async fn parked_childless_leaf_non_pruned_converts() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let (handle, actor_task) =
@@ -8855,6 +8991,7 @@ async fn parked_childless_leaf_non_pruned_converts() -> TestResult {
 #[tokio::test]
 async fn parked_pruned_childless_stays_parked() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let (handle, actor_task) =
@@ -8914,6 +9051,7 @@ async fn parked_pruned_childless_stays_parked() -> TestResult {
 #[tokio::test]
 async fn parked_holed_stays_parked() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let (handle, actor_task) =
@@ -8983,11 +9121,24 @@ async fn parked_holed_stays_parked() -> TestResult {
 /// verifiable set re-arms instead.
 #[tokio::test]
 async fn bogus_wanted_names_never_complete_vacuously() -> TestResult {
+    use rio_auth::hmac::HmacSigner;
+
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    // merged_bug_003 (Q3): the dispatch probe that creates this test's
+    // cache_opportunity job only runs tenant-scoped under service
+    // auth; an anonymous probe gets no substitutable answer (the
+    // pre-fix mock's anonymous fiction is gone). Sign like a
+    // configured deployment — the vacuity law under test is
+    // orthogonal to probe auth.
     let (handle, actor_task) =
-        setup_actor_configured(db.pool.clone(), Some(store_client), |_, _| {});
+        setup_actor_configured(db.pool.clone(), Some(store_client), |_cfg, p| {
+            p.service_signer = Some(std::sync::Arc::new(HmacSigner::from_key(
+                b"mock-store-harness-service-key32".to_vec(),
+            )));
+        });
     let _tasks = (store_task, actor_task);
 
     let out = test_store_path("a4bogus-out");

@@ -2287,7 +2287,6 @@ impl DagActor {
                 return None;
             }
             let probe = self.probe_service_meta_for(Some(tenant));
-            let can_confirm = !probe.is_empty();
             let mut req = tonic::Request::new(rio_proto::types::FindMissingPathsRequest {
                 store_paths: live_wanted.to_vec(),
             });
@@ -2297,7 +2296,9 @@ impl DagActor {
                 }
             }
             // ANY tenant's RPC failure poisons the whole answer (B3:
-            // a partial view must not confirm).
+            // a partial view must not confirm). A store that REJECTS
+            // the probe (UNAUTHENTICATED under the Q3 law — rotated
+            // service HMAC) lands here too: conservative ReArm.
             let resp = tokio::time::timeout(
                 budget.attempt_bound(self.grpc_timeout),
                 store.clone().find_missing_paths(req),
@@ -2306,6 +2307,16 @@ impl DagActor {
             .ok()?
             .ok()?
             .into_inner();
+            // merged_bug_003 (Q3): confirmed-missing authority derives
+            // from the store's ECHO — the probe actually ran tenant-
+            // scoped — never from `!probe.is_empty()` (the scheduler's
+            // belief about its own request). A pre-Q3 store that
+            // silently downgraded to anonymous answered missing with
+            // empty substitutable/indeterminate, wire-identical to
+            // confirmed 404s; the echo (absent = false on old stores)
+            // makes that answer non-confirming: conservative, never
+            // fail-fast.
+            let can_confirm = resp.probe_ran_tenant_scoped;
             let missing: std::collections::HashSet<String> =
                 resp.missing_paths.into_iter().collect();
             let substitutable: std::collections::HashSet<String> =

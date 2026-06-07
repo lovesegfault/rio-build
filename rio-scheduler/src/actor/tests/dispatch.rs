@@ -382,13 +382,36 @@ async fn maybe_resolve_ca_ia_derivation_passthrough() -> TestResult {
 #[tokio::test]
 async fn dispatch_time_substitutable_routes_to_job(#[case] is_fod: bool) -> TestResult {
     let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+    // merged_bug_003 (Q3): the cache-opportunity lane exists only for
+    // TENANTED builds — upstreams are per-tenant (`tenant_upstreams`),
+    // the dispatch probe asks per live tenant under service auth, and
+    // the store reports substitutable paths only to a verified scope.
+    // (The pre-Q3 mock answered an anonymous probe with substitutable
+    // paths — a wire state the real store never produces; this test
+    // passed against that fiction with a tenant-less build.)
+    let tenant = rio_store::test_helpers::seed_tenant(&db.pool, "dispatch-sub-tenant").await;
     let out = test_store_path("dispatch-sub-out");
     let mut n = make_node("dispatch-sub-drv");
     n.is_fixed_output = is_fod;
     n.system = "aarch64-linux".into();
     n.expected_output_paths = vec![out.clone()];
     let build_id = Uuid::new_v4();
-    let _ev_rx = merge_dag(&handle, build_id, vec![n], vec![], false).await?;
+    merge_dag_req(
+        &handle,
+        MergeDagRequest {
+            build_id,
+            tenant_id: Some(tenant),
+            priority_class: PriorityClass::Scheduled,
+            nodes: vec![n],
+            edges: vec![],
+            options: BuildOptions::default(),
+            keep_going: false,
+            traceparent: String::new(),
+            jti: None,
+            jwt_token: None,
+        },
+    )
+    .await?;
     barrier(&handle).await;
     // Merge-time saw nothing (substitutable not yet seeded) → node
     // stays Ready, stamped probed_generation=1. Seed; the next Tick
@@ -441,6 +464,7 @@ async fn dispatch_time_substitutable_routes_to_job(#[case] is_fod: bool) -> Test
 async fn probe_batch_partitions_by_tenant() -> TestResult {
     use rio_auth::hmac::HmacSigner;
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let service_key = b"test-028a-dispatch-service-key-32".to_vec();
@@ -642,6 +666,7 @@ async fn cgroup_oom_doubles_mem_floor(
     #[case] tag: &str,
 ) -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
         // Zero backoff so the retry redispatches on the next Tick.
         c.retry_policy = crate::RetryPolicy {
@@ -708,6 +733,7 @@ async fn cgroup_oom_doubles_mem_floor(
 #[tokio::test]
 async fn spawn_intents_excludes_unprobed_ready() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (_store, store_client, _store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let mut actor = DagActor::new(
@@ -766,6 +792,7 @@ async fn spawn_intents_excludes_unprobed_ready() -> TestResult {
 #[tokio::test]
 async fn spawn_intents_excludes_job_pending_nodes() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
 
     let mut actor = bare_actor_cfg(
         db.pool.clone(),
@@ -829,6 +856,7 @@ async fn spawn_intents_excludes_job_pending_nodes() -> TestResult {
 async fn spawn_intent_from_sla_estimator() {
     use crate::sla::{solve, types::*};
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_sla(db.pool.clone());
     // Seed a single tier so the test exercises the Feasible path the way
     // a configured deploy would (empty ladder → solve_tier BestEffort at
@@ -935,6 +963,7 @@ async fn ice_mask_is_read_time() {
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     const LADDER: &str = "rio_scheduler_sla_hw_ladder_exhausted_total";
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     actor.test_inject_ready("d", Some("test-pkg"), "x86_64-linux", false);
 
@@ -1046,6 +1075,7 @@ async fn ice_step_doubles_across_mark_without_clear() {
     use crate::sla::config::CapacityType;
     use rio_proto::types::{NodeSelectorRequirement, NodeSelectorTerm, SpawnIntent};
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     let cell: crate::sla::config::Cell = ("intel-6".into(), CapacityType::Spot);
 
@@ -1214,6 +1244,7 @@ async fn pull_mint_ice_clear_only_at_single_cell() -> TestResult {
 #[tokio::test]
 async fn epsilon_h_draws_outside_a() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     // Builders-only fixture: this test compares `in_a` (drv-routable
     // classes) against `h_all = cfg.hw_classes`. Featureless drvs
     // never route to fetcher cells (∅-guard), so fetcher-* in `h_all`
@@ -1375,6 +1406,7 @@ async fn epsilon_h_draws_outside_a() {
 #[tokio::test]
 async fn spawn_intent_node_affinity_from_solve_full() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
 
     actor.test_inject_ready("fitted", Some("test-pkg"), "x86_64-linux", false);
@@ -1441,6 +1473,7 @@ async fn spawn_intent_node_affinity_from_solve_full() {
 #[tokio::test]
 async fn solve_full_gate_skips_kvm_serial_and_override() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     // Re-seed under pname "pkg" (bare_actor_hw seeds "test-pkg").
     seed_fit(&actor, "pkg");
@@ -1537,6 +1570,7 @@ async fn solve_full_gate_skips_kvm_serial_and_override() {
 async fn work_assignment_carries_sla_cores() {
     use crate::sla::types::*;
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_sla(db.pool.clone());
     // Same Amdahl fit as `spawn_intent_from_sla_estimator` → c*≈1.95 → 2.
     actor.sla_estimator.seed(FittedParams {
@@ -1613,6 +1647,7 @@ async fn work_assignment_carries_sla_cores() {
 async fn solve_intent_deadline_denormalized_to_slowest_hw() {
     use crate::sla::{hw, types::*};
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_sla(db.pool.clone());
     // probe deadline 1s so the `c.max(probe_deadline)` floor doesn't
     // mask the computed value.
@@ -1827,6 +1862,7 @@ async fn batch_probe_tail_never_per_drv_fmp() -> TestResult {
 async fn solve_cache_evicted_with_lru() {
     use crate::sla::solve::model_key_hash;
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut cfg = test_hw_sla_config();
     cfg.max_keys_per_tenant = 3;
     let mut actor = bare_actor_cfg(
@@ -1899,6 +1935,7 @@ async fn solve_cache_evicted_with_lru() {
 async fn inputs_gen_stable_across_noop_refresh() -> TestResult {
     use crate::sla::solve::SolveInputs;
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let sdb = SchedulerDb::new(db.pool.clone());
     let est = crate::sla::SlaEstimator::for_test(&test_hw_sla_config());
     let mut cost = crate::sla::cost::CostTable::default();
@@ -2021,6 +2058,7 @@ async fn inputs_gen_stable_across_noop_refresh() -> TestResult {
 async fn compute_spawn_intents_carries_ice_masked_cells() -> TestResult {
     use crate::sla::config::CapacityType;
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let actor = bare_actor_sla(db.pool.clone());
     actor
         .ice
@@ -2057,6 +2095,7 @@ async fn test_terminal_build_frozen_on_dispatch_store_hit() -> TestResult {
     // Setup: mock store. B1's broadcast receiver is held for the whole
     // test so every event B1's watchers would see is observable.
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, _store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let (handle, _actor_task) =
@@ -2263,6 +2302,7 @@ async fn test_terminal_build_frozen_on_dispatch_store_hit() -> TestResult {
 #[tokio::test]
 async fn transient_retry_not_redispatched_inside_backoff() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
         // A real, short window: base 2s, no jitter — long enough that
         // the immediate re-pull is deterministically inside it, short
@@ -2322,6 +2362,7 @@ async fn transient_retry_not_redispatched_inside_backoff() -> TestResult {
 #[tokio::test]
 async fn spawn_intents_exclude_backoff_window() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_cfg(
         db.pool.clone(),
         DagActorConfig {
@@ -2375,6 +2416,7 @@ async fn spawn_intents_exclude_backoff_window() -> TestResult {
 #[tokio::test]
 async fn queued_by_system_equal_across_both_rpcs_under_backoff() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor(db.pool.clone());
     actor.test_inject_ready("129-backoff", None, "x86_64-linux", false);
     if let Some(state) = actor.dag.node_mut("129-backoff") {

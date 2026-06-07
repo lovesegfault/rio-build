@@ -297,9 +297,27 @@ async fn test_upsert_at_merge_preexisting_completed() -> TestResult {
 async fn test_upsert_skips_no_tenant() -> TestResult {
     let (db, handle, _task) = setup().await;
 
-    // No tenant_id on the build (None = single-tenant mode).
+    // No tenant_id on the build (None = single-tenant mode). The
+    // default merge helpers stamp DEFAULT_TEST_TENANT (merged_bug_003
+    // harness reality), so this test — whose premise IS the absent
+    // tenant — merges inline without one.
     let build_id = Uuid::new_v4();
-    let _ev = merge_single_node(&handle, build_id, "nt-drv", PriorityClass::Scheduled).await?;
+    let _ev = merge_dag_req(
+        &handle,
+        MergeDagRequest {
+            build_id,
+            tenant_id: None,
+            priority_class: PriorityClass::Scheduled,
+            nodes: vec![make_node("nt-drv")],
+            edges: vec![],
+            options: Default::default(),
+            keep_going: false,
+            traceparent: String::new(),
+            jti: None,
+            jwt_token: None,
+        },
+    )
+    .await?;
     pull_complete_success(&handle, "nt-drv", &test_store_path("nt-out")).await?;
     barrier(&handle).await;
 

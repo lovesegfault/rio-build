@@ -29,7 +29,9 @@ pub(super) async fn put_test_path(
 #[tokio::test]
 async fn test_scheduler_cache_check_skips_build() -> TestResult {
     let sched_db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&sched_db.pool).await;
     let store_db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&store_db.pool).await;
 
     // Start in-process store and pre-populate the expected output path.
     let (mut store_client, _store_server) = setup_inproc_store(store_db.pool.clone()).await?;
@@ -155,6 +157,7 @@ async fn test_cyclic_merge_does_not_leak_in_memory_state() -> TestResult {
 #[tokio::test]
 async fn test_backpressure_hysteresis() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let scheduler_db = SchedulerDb::new(db.pool.clone());
     let mut actor = DagActor::new(
         scheduler_db,

@@ -477,26 +477,63 @@ impl StoreServiceImpl {
     ///    assert tenant context without opening an unauthenticated
     ///    self-select gap.
     ///
-    /// `None` when neither path applies; downstream skips tenant-scoped
-    /// behaviour (substitution probe, tenant-visibility filtering).
-    fn request_tenant_id<T>(&self, request: &Request<T>) -> Option<uuid::Uuid> {
+    /// `Ok(None)` ONLY when no tenant context was REQUESTED (no JWT,
+    /// no probe header): downstream runs anonymous by design.
+    ///
+    /// merged_bug_003 (owner-signed Q3, bughunt-3): a probe header
+    /// that IS present while its service token is absent,
+    /// unverifiable (expiry/HMAC/verifier unset), not allowlisted, or
+    /// the header unparseable, REJECTS `UNAUTHENTICATED` — never the
+    /// silent anonymous downgrade. The downgrade ran the probe
+    /// tenant-blind and answered missing-with-empty-substitutable,
+    /// wire-identical to confirmed 404s: routine HMAC-rotation skew
+    /// folded to ConfirmedMissing → terminal FailFast of substitutable
+    /// builds, and the anonymous pass-through re-opened the
+    /// cross-tenant sig-visibility laundering the per-tenant probe
+    /// partition exists to prevent (capability fault answering in the
+    /// honest path's type — hazard (eeee)'s RPC-boundary form). The
+    /// scheduler's probe call maps this refusal to conservative
+    /// ReArm.
+    ///
+    /// ── SIGNED 2026-06-07 (owner, bughunt-3 fix-wave §5-S Q3) ──
+    /// A present-but-unverifiable service token at the store boundary
+    /// is an UNAUTHENTICATED refusal — fail closed; an ABSENT token
+    /// stays anonymous as today. The refusal is an uncharged
+    /// capability fault, never evidence. `FindMissingPathsResponse`
+    /// gains `probe_ran_tenant_scoped` (types.proto field 4) so
+    /// `can_confirm` derives from the response, never sender intent
+    /// (both halves: posture + structure). Leading alternative (b)
+    /// (report-all-indeterminate on verification failure) was
+    /// REJECTED: quieter under rotation skew but leaves `can_confirm`
+    /// sender-derived. ─────────────────────────────────────────────
+    fn request_tenant_id<T>(&self, request: &Request<T>) -> Result<Option<uuid::Uuid>, Status> {
         if let Some(jwt) = request
             .extensions()
             .get::<rio_auth::jwt::TenantClaims>()
             .map(|c| c.sub)
         {
-            return Some(jwt);
+            return Ok(Some(jwt));
         }
         // r[impl sched.dispatch.fod-substitute+3]
-        if self.verified_service_caller(request).is_some()
-            && let Some(hdr) = request
-                .metadata()
-                .get(rio_proto::PROBE_TENANT_ID_HEADER)
-                .and_then(|v| v.to_str().ok())
-        {
-            return hdr.parse().ok();
+        let Some(hdr) = request
+            .metadata()
+            .get(rio_proto::PROBE_TENANT_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+        else {
+            // No tenant context requested — anonymous by design.
+            return Ok(None);
+        };
+        // r[impl store.substitute.unverifiable-token-rejects]
+        if self.verified_service_caller(request).is_none() {
+            return Err(Status::unauthenticated(
+                "x-rio-probe-tenant-id present but the service token is \
+                 absent, unverifiable, or not allowlisted — refusing the \
+                 tenant-blind downgrade (rotated service HMAC?)",
+            ));
         }
-        None
+        hdr.parse().map(Some).map_err(|_| {
+            Status::unauthenticated("x-rio-probe-tenant-id present but not a valid UUID")
+        })
     }
 
     // r[impl store.api.batch-query+2]
@@ -943,12 +980,48 @@ mod tests {
             }
             r
         };
-        // No service-token → ignored.
-        assert_eq!(svc.request_tenant_id(&mk(None)), None);
+        // merged_bug_003 (Q3): a PRESENT probe header with a missing
+        // token REJECTS — the pre-fix assertion here was
+        // `assert_eq!(..., None)` ("No service-token → ignored"),
+        // i.e. the silent tenant-blind downgrade, codified.
+        assert!(
+            svc.request_tenant_id(&mk(None))
+                .is_err_and(|s| s.code() == tonic::Code::Unauthenticated),
+            "probe header without a service token must reject, not downgrade"
+        );
         // Allowlisted caller → honoured.
-        assert_eq!(svc.request_tenant_id(&mk(Some("rio-scheduler"))), Some(tid));
-        // Non-allowlisted caller → ignored.
-        assert_eq!(svc.request_tenant_id(&mk(Some("rogue"))), None);
+        assert_eq!(
+            svc.request_tenant_id(&mk(Some("rio-scheduler"))).unwrap(),
+            Some(tid)
+        );
+        // Non-allowlisted caller: the token VERIFIED but its caller
+        // cannot assert tenant context — reject (pre-fix: silent
+        // anonymous, the same laundering one rung up).
+        assert!(
+            svc.request_tenant_id(&mk(Some("rogue")))
+                .is_err_and(|s| s.code() == tonic::Code::Unauthenticated),
+            "non-allowlisted caller must reject, not downgrade"
+        );
+        // A garbage (unverifiable) token with the probe header
+        // rejects — HMAC-rotation skew shows up loud, never as
+        // confirmed 404s.
+        let mut garbage = Request::new(());
+        garbage.metadata_mut().insert(
+            rio_proto::PROBE_TENANT_ID_HEADER,
+            tid.to_string().parse().unwrap(),
+        );
+        garbage.metadata_mut().insert(
+            rio_proto::SERVICE_TOKEN_HEADER,
+            "not-a-real-token".parse().unwrap(),
+        );
+        assert!(
+            svc.request_tenant_id(&garbage)
+                .is_err_and(|s| s.code() == tonic::Code::Unauthenticated),
+            "an unverifiable token must reject, not downgrade"
+        );
+        // ABSENT probe header + absent token: anonymous by design —
+        // no tenant context was requested.
+        assert_eq!(svc.request_tenant_id(&Request::new(())).unwrap(), None);
     }
 
     /// `AppendHwPerfSample` is one-row-per-`(hw_class, pod_id)`: a

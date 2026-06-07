@@ -1087,10 +1087,15 @@ async fn flag_on_materialization_lifecycle_through_grpc() -> anyhow::Result<()> 
     // The flag-on actor + MockStore (the probe target the job-creation
     // gate consults).
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, _store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let (handle, _actor_task) =
-        setup_actor_configured(db.pool.clone(), Some(store_client), |_cfg, _| {});
+        setup_actor_configured(db.pool.clone(), Some(store_client), |_cfg, p| {
+            p.service_signer = Some(std::sync::Arc::new(rio_auth::hmac::HmacSigner::from_key(
+                b"mock-store-harness-service-key32".to_vec(),
+            )));
+        });
 
     // The production auth posture: BOTH key families, distinct keys.
     let executor_key = std::sync::Arc::new(HmacKey::from_key(
@@ -1259,10 +1264,15 @@ async fn flag_on_progress_relay_reaches_build_events() -> anyhow::Result<()> {
     // Flag-on actor + MockStore + db-backed SchedulerGrpc (the relay
     // needs the exec_id → attempt lookup).
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (store, store_client, _store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let (handle, _actor_task) =
-        setup_actor_configured(db.pool.clone(), Some(store_client), |_cfg, _| {});
+        setup_actor_configured(db.pool.clone(), Some(store_client), |_cfg, p| {
+            p.service_signer = Some(std::sync::Arc::new(rio_auth::hmac::HmacSigner::from_key(
+                b"mock-store-harness-service-key32".to_vec(),
+            )));
+        });
 
     let executor_key = std::sync::Arc::new(HmacKey::from_key(
         b"executor-key-32-bytes-long!!!!!!".to_vec(),

@@ -235,6 +235,14 @@ message FindMissingPathsResponse {
   // builder. Disjoint from substitutable_paths; both are subsets of
   // missing_paths.
   repeated string indeterminate_paths = 3;
+  // merged_bug_003 (bughunt-3 Q3): true iff the upstream probe ran under
+  // a VERIFIED tenant scope (resolved tenant + configured substituter).
+  // The scheduler derives its confirmed-missing authority (can_confirm)
+  // from THIS echo, never from having attached a probe header —
+  // identity HONORED, not identity attached. False (or a pre-upgrade
+  // store omitting the field) makes every missing path non-confirmable:
+  // conservative, never fail-fast. Additive: old clients ignore it.
+  bool probe_ran_tenant_scoped = 4;
 }
 
 // (Retired: SubstitutePathRequest/SubstitutePathResponse/

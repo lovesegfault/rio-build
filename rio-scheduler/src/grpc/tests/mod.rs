@@ -37,6 +37,7 @@ pub(super) async fn setup_grpc() -> (
     tokio::task::JoinHandle<()>,
 ) {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (handle, task) = setup_actor(db.pool.clone());
     let grpc = SchedulerGrpc::new_for_tests(handle.clone());
     (db, grpc, handle, task)
@@ -51,6 +52,7 @@ pub(super) async fn setup_grpc_with_pool() -> (
     tokio::task::JoinHandle<()>,
 ) {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (handle, task) = setup_actor(db.pool.clone());
     let grpc = SchedulerGrpc::new_for_tests_with_pool(handle.clone(), db.pool.clone());
     (db, grpc, handle, task)

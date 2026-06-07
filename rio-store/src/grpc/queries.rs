@@ -116,7 +116,7 @@ impl StoreServiceImpl {
         request: Request<QueryPathInfoRequest>,
     ) -> Result<Response<PathInfo>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        let tenant_id = self.request_tenant_id(&request);
+        let tenant_id = self.request_tenant_id(&request)?;
         let req = request.into_inner();
 
         validate_store_path(&req.store_path)?;
@@ -263,7 +263,7 @@ impl StoreServiceImpl {
         // 2s slack vs scheduler's 90s `MERGE_FMP_TIMEOUT` if the
         // budget is computed AFTER them.
         let entry = tokio::time::Instant::now();
-        let tenant_id = self.request_tenant_id(&request);
+        let tenant_id = self.request_tenant_id(&request)?;
         let req = request.into_inner();
 
         self.validate_path_batch(&req.store_paths)?;
@@ -329,6 +329,19 @@ impl StoreServiceImpl {
             _ => (Vec::new(), Vec::new()),
         };
 
+        // merged_bug_003 (Q3): the echo is the probe's AUTHORITY
+        // CLASS — true iff a verified tenant scope was resolved AND a
+        // substituter exists to probe with. The `_` arm above (no
+        // substituter / anonymous) reports missing with EMPTY
+        // substitutable/indeterminate — wire-identical to confirmed
+        // 404s — so without this bit a scope-less answer was
+        // indistinguishable from "probed every upstream, all 404'd".
+        // The scheduler derives can_confirm from THIS, never from
+        // having attached a probe header. (A failed check_available
+        // still echoes true: its all-indeterminate answer already
+        // blocks confirmation path-wise.)
+        let probe_ran_tenant_scoped = matches!((&self.substituter, tenant_id), (Some(_), Some(_)));
+
         debug!(
             n_requested = req.store_paths.len(),
             n_missing = missing.len(),
@@ -336,6 +349,7 @@ impl StoreServiceImpl {
             n_indeterminate = indeterminate.len(),
             tenant_id = ?tenant_id,
             substituter = self.substituter.is_some(),
+            probe_ran_tenant_scoped,
             "FindMissingPaths"
         );
 
@@ -343,6 +357,7 @@ impl StoreServiceImpl {
             missing_paths: missing,
             substitutable_paths: substitutable,
             indeterminate_paths: indeterminate,
+            probe_ran_tenant_scoped,
         }))
     }
 
@@ -353,7 +368,7 @@ impl StoreServiceImpl {
         request: Request<QueryPathFromHashPartRequest>,
     ) -> Result<Response<PathInfo>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        let tenant_id = self.request_tenant_id(&request);
+        let tenant_id = self.request_tenant_id(&request)?;
         let req = request.into_inner();
 
         // Validate BEFORE touching PG. The hash-part flows into a LIKE
@@ -410,7 +425,7 @@ impl StoreServiceImpl {
         request: Request<AddSignaturesRequest>,
     ) -> Result<Response<AddSignaturesResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        let tenant_id = self.request_tenant_id(&request);
+        let tenant_id = self.request_tenant_id(&request)?;
         let req = request.into_inner();
 
         validate_store_path(&req.store_path)?;

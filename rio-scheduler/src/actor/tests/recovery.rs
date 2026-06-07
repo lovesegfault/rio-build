@@ -295,6 +295,7 @@ async fn test_recovery_transitive_failed_dep_persisted() -> TestResult {
 #[tokio::test]
 async fn test_recovery_failure_steps_down_never_serves() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
 
     // Keep a clone of the LeaderState so the completion is observable
     // from the test (same pattern as test_recovery_toctou_on_lease_flap
@@ -378,6 +379,7 @@ async fn test_recovery_floor_unreadable_unconfirmed_is_discarded() -> TestResult
     rec.install().expect("install global debugging recorder");
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     // Saturated-regime entry generation: completing here without the
     // confirmation is exactly the deposed-but-unaware leapfrog the
     // confirmation exists to prevent.
@@ -483,6 +485,7 @@ async fn test_recovery_floor_unreadable_confirms_and_completes_unclaimed() -> Te
     rec.install().expect("install global debugging recorder");
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let generation = Arc::new(AtomicU64::new(2));
     let leader = crate::lease::LeaderState::from_parts(
         Arc::clone(&generation),
@@ -1021,6 +1024,7 @@ async fn saturated_floor_recovery_evidence_writes_land() -> TestResult {
 #[tokio::test]
 async fn test_recovery_same_holder_reclaim_retains_generation() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     // Our own claim from the previous recovery run of this same epoch.
     sqlx::query(
         "INSERT INTO leader_generation_claims (generation, holder_id) VALUES (5, 'pod-us')",
@@ -1069,6 +1073,7 @@ async fn test_recovery_same_holder_reclaim_retains_generation() -> TestResult {
 #[tokio::test]
 async fn test_recovery_other_holder_at_our_generation_bumps() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     // Another replica claimed generation 5 first.
     sqlx::query(
         "INSERT INTO leader_generation_claims (generation, holder_id) VALUES (5, 'pod-other')",
@@ -1124,6 +1129,7 @@ async fn test_recovery_other_holder_at_our_generation_bumps() -> TestResult {
 #[tokio::test]
 async fn test_recovery_assignments_only_floor_at_our_generation_bumps() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     // Pre-claim-ledger history: an assignment at exactly the entry
     // generation, claims ledger empty. Terminal status + parseable
     // drv_path so recovery neither loads the row nor logs a skip (the
@@ -1187,6 +1193,7 @@ async fn test_recovery_assignments_only_floor_at_our_generation_bumps() -> TestR
 #[tokio::test]
 async fn test_recovery_assignment_and_own_claim_at_our_generation_retains() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (drv_id,): (Uuid,) = sqlx::query_as(
         "INSERT INTO derivations (drv_hash, drv_path, system, status) \
          VALUES ('z-own-claim', $1, 'x86_64-linux', 'completed') RETURNING derivation_id",
@@ -1246,6 +1253,7 @@ async fn test_recovery_assignment_and_own_claim_at_our_generation_retains() -> T
 #[tokio::test]
 async fn test_recovery_unconfirmed_bump_above_live_holder_is_discarded() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     // The dead prior term's claim and the LIVE successor's claim.
     sqlx::query(
         "INSERT INTO leader_generation_claims (generation, holder_id) \
@@ -1312,6 +1320,7 @@ async fn test_recovery_unconfirmed_bump_above_live_holder_is_discarded() -> Test
 #[tokio::test]
 async fn test_recovery_confirmed_bump_seeds_and_completes() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     // Only a dead predecessor's claim sits at our entry generation.
     sqlx::query(
         "INSERT INTO leader_generation_claims (generation, holder_id) \
@@ -1393,6 +1402,7 @@ async fn test_recovery_confirmed_bump_seeds_and_completes() -> TestResult {
 #[tokio::test]
 async fn test_recovery_load_failure_claims_then_steps_down() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     // Saturated regime: a dead predecessor's claim row far above the
     // lease-derived entry generation (2).
     sqlx::query(
@@ -1484,6 +1494,7 @@ async fn test_recovery_load_failure_claims_then_steps_down() -> TestResult {
 #[tokio::test]
 async fn test_recovery_load_failure_unconfirmed_bump_is_discarded() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     // Saturated regime, same fixture as the confirmed-direction test:
     // a dead predecessor's claim row far above the entry generation (2).
     sqlx::query(
@@ -1564,6 +1575,7 @@ async fn test_recovery_load_failure_unconfirmed_bump_is_discarded() -> TestResul
 #[tokio::test]
 async fn test_recovery_unconfirmed_gap_retain_below_entry_is_discarded() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     // The last claimed generation is 4; generation 5 (a crashed,
     // never-claimed predecessor) and our entry 6 left no durable trace.
     sqlx::query(
@@ -1636,6 +1648,7 @@ async fn test_recovery_unconfirmed_gap_retain_below_entry_is_discarded() -> Test
 #[tokio::test]
 async fn test_recovery_gap_retain_with_confirmation_completes() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     sqlx::query(
         "INSERT INTO leader_generation_claims (generation, holder_id) VALUES (4, 'old-term')",
     )
@@ -1694,6 +1707,7 @@ async fn test_recovery_gap_retain_with_confirmation_completes() -> TestResult {
 #[tokio::test]
 async fn test_recovery_adjacent_floor_retain_completes_without_confirmation() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     sqlx::query(
         "INSERT INTO leader_generation_claims (generation, holder_id) \
          VALUES (4, 'old-term'), (5, 'pod-live')",
@@ -1757,6 +1771,7 @@ async fn test_recovery_adjacent_floor_retain_completes_without_confirmation() ->
 #[tokio::test]
 async fn test_recovery_claims_lease_derived_generation_on_empty_floor() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     // No assignments, no claims: the PG floor is NULL.
 
     // gen_at_entry = 7: the generation at recovery entry. In the story
@@ -2011,6 +2026,7 @@ async fn test_recovery_toctou_on_lease_flap(
     #[case] expect_recovery_complete: bool,
 ) -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let generation = Arc::new(AtomicU64::new(2));
     // Entry generation 2 over an empty PG floor: the floor cannot vouch
     // for it, so the no-bump case completes only under a post-claim
@@ -2079,6 +2095,7 @@ async fn test_discarded_recovery_increments_recovery_total_once() -> TestResult 
     rec.install().expect("install global debugging recorder");
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let generation = Arc::new(AtomicU64::new(2));
     let leader = crate::lease::LeaderState::from_parts(
         Arc::clone(&generation),
@@ -2178,6 +2195,7 @@ async fn test_recovery_toctou_saturated_generation_flaps(
     #[case] expect_recovery_complete: bool,
 ) -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     // Saturated regime: a previous term seeded generation 13 from the
     // PG floor while the recreated Lease counts transitions from ~0.
     let leader = crate::lease::LeaderState::from_parts(
@@ -2246,6 +2264,7 @@ async fn test_recovery_toctou_saturated_generation_flaps(
 #[tokio::test]
 async fn test_recovery_toctou_rebound_mid_recovery_discards_then_rerun_completes() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     // Saturated regime, same fixture as the saturated-flaps test: the
     // rebound's generation fetch_max is a no-op against 13 and only the
     // recorded transition count moves.
@@ -2329,6 +2348,7 @@ async fn test_recovery_toctou_rebound_mid_recovery_discards_then_rerun_completes
 #[tokio::test]
 async fn test_false_alarm_lost_then_acquired_in_order_ends_recovered() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     // Leading at generation 2 (transitions=1), recovery already complete
     // — the steady state a false alarm interrupts.
     let leader = crate::lease::LeaderState::from_parts(
@@ -2850,6 +2870,7 @@ async fn test_failover_unflagged_parent_with_other_builds_cancelled_child_dispat
 #[tokio::test]
 async fn test_leader_lost_invalidates_kept_recovery_completion() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     // Leading at transition count 5 with a completed recovery — the
     // state an in-flight same-epoch keep starts from. The claims floor
     // is empty, so the green leg's re-recovery claims and then waits
@@ -3153,6 +3174,7 @@ async fn test_recovery_heals_corrupted_ready() -> TestResult {
 #[tracing_test::traced_test]
 async fn recovered_stale_build_times_out_on_first_tick() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
 
     // Phase 1: a leader merges a build with a 60s build_timeout.
     let build_id = Uuid::new_v4();
@@ -3232,6 +3254,7 @@ async fn recovered_stale_build_times_out_on_first_tick() -> TestResult {
 #[tokio::test]
 async fn failed_recovery_ticks_never_close_predecessor_attempts() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
 
     // Predecessor tenure: a live open attempt, durably minted.
     {

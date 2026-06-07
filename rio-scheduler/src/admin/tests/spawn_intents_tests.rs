@@ -18,6 +18,7 @@ async fn test_get_spawn_intents_reports_ready() -> anyhow::Result<()> {
     use crate::actor::tests::{make_node, merge_dag, setup_actor_configured, test_sla_config};
 
     let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (actor, task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
         c.sla = test_sla_config();
     });
@@ -83,6 +84,7 @@ async fn test_mint_executor_tokens_signs_per_intent() -> anyhow::Result<()> {
     use rio_auth::hmac::{ExecutorClaims, HmacSigner, HmacVerifier};
 
     let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let key = b"test-mint-hmac-key-32-bytes!!!!!".to_vec();
     let (actor, task) = setup_actor_configured(db.pool.clone(), None, {
         let key = key.clone();

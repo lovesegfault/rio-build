@@ -1131,6 +1131,7 @@ async fn test_transient_failure_max_retries_poisons() -> TestResult {
 #[tokio::test]
 async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let names = ["tiny", "small", "medium", "large", "xlarge"];
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
         c.retry_policy = crate::RetryPolicy {
@@ -1282,6 +1283,7 @@ async fn test_distinct_transient_poison_matrix(
     #[case] expected_status: DerivationStatus,
 ) -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
         c.retry_policy.max_retries = 10;
     });
@@ -1415,6 +1417,7 @@ async fn test_infrastructure_failure_does_not_count_toward_poison() -> TestResul
 #[tokio::test]
 async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
         // 2 retries → walks tiny→small, small→medium, then terminal on 3rd TimedOut.
         c.retry_policy = crate::RetryPolicy {
@@ -1787,6 +1790,7 @@ async fn i127_batch_concurrent_putpath_exempt() -> TestResult {
 #[tokio::test]
 async fn exempt_infra_cap_terminates_leaked_lock() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
         c.retry_policy.max_exempt_infra_retries = 5;
     });
@@ -1860,6 +1864,7 @@ async fn exempt_infra_cap_terminates_leaked_lock() -> TestResult {
 #[tokio::test]
 async fn test_same_worker_poison_threshold_flat_mode() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
         c.poison = PoisonConfig {
             threshold: 3,
@@ -2746,6 +2751,7 @@ async fn test_cascade_emits_failed_per_node() -> TestResult {
 #[tokio::test]
 async fn test_poison_via_max_retries_emits_failed_event() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
         c.retry_policy.max_retries = 0; // first transient → poison
         c.retry_policy.backoff_base_secs = 0.0;
@@ -2967,6 +2973,7 @@ async fn test_infra_retry_cap_uniform_across_reasons(
 ) -> TestResult {
     const MAX: u32 = 3;
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
         c.retry_policy.max_infra_retries = MAX;
     });
@@ -3136,6 +3143,7 @@ async fn exec_correlation_skips_terminal_builds() -> TestResult {
     use crate::state::{BuildInfo, BuildState};
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
 
     // One drv, two builds. B1 finished and already recorded X1; B2 is
     // still active and NULL.
@@ -3488,6 +3496,7 @@ async fn terminal_with_zero_line_count_writes_null() -> TestResult {
 #[tokio::test]
 async fn second_terminal_does_not_overwrite() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = DagActor::new(
         SchedulerDb::new(db.pool.clone()),
         DagActorConfig::default(),
@@ -3853,6 +3862,7 @@ async fn attempt_ledger_e3_permanent_row() -> TestResult {
 #[tokio::test]
 async fn attempt_ledger_e4_timeout_rows() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
         c.retry_policy = crate::RetryPolicy {
             max_timeout_retries: 1,
@@ -4040,6 +4050,7 @@ async fn phase1b_e3_permanent_statuses_poison_identically() -> TestResult {
 #[tokio::test]
 async fn phase1b_e4_timeout_verdicts_unchanged() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
         c.retry_policy = crate::RetryPolicy {
             max_timeout_retries: 1,
@@ -4166,6 +4177,7 @@ async fn phase1b_e2_worker_only_infra_battery_counters_and_rows_agree() -> TestR
 #[tokio::test]
 async fn phase1b_e1_transient_threshold_non_distinct_mode_poisons() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
         c.poison = crate::state::PoisonConfig {
             threshold: 2,
@@ -4492,6 +4504,7 @@ async fn test_store_degraded_run_bound_charges_thirteenth_report() -> TestResult
 #[tokio::test]
 async fn test_redelivered_completion_keeps_store_degraded_flag() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |_, p| {
         p.fail_next_attempt_append = true;
     });

@@ -147,6 +147,14 @@ pub struct MockStoreFaults {
     /// If true, find_missing_paths returns Unavailable. For scheduler
     /// cache-check error-path tests.
     pub fail_find_missing: Arc<AtomicBool>,
+    /// merged_bug_003: if true, find_missing_paths behaves like the
+    /// pre-Q3 store under service-token verification failure — it
+    /// IGNORES the probe-tenant header (no upstream probe runs:
+    /// substitutable/indeterminate come back empty, wire-identical to
+    /// confirmed 404s) and echoes `probe_ran_tenant_scoped = false`.
+    /// For scheduler tests proving the echo (not sender intent) gates
+    /// confirmed-missing.
+    pub drop_tenant_scope: Arc<AtomicBool>,
     /// If true, query_path_info returns Unavailable. For worker input-fetch
     /// error-path tests (distinguishing real gRPC errors from NotFound).
     pub fail_query_path_info: Arc<AtomicBool>,
@@ -866,7 +874,7 @@ impl StoreService for MockStore {
         request: Request<types::FindMissingPathsRequest>,
     ) -> Result<Response<types::FindMissingPathsResponse>, Status> {
         self.calls.find_missing_calls.fetch_add(1, Ordering::SeqCst);
-        let probe_tenant = request
+        let mut probe_tenant = request
             .metadata()
             .get(rio_proto::PROBE_TENANT_ID_HEADER)
             .and_then(|v| v.to_str().ok())
@@ -879,6 +887,23 @@ impl StoreService for MockStore {
         if self.faults.fail_find_missing.load(Ordering::SeqCst) {
             return Err(Status::unavailable("mock: injected find_missing failure"));
         }
+        // merged_bug_003: the real store resolves tenant scope from
+        // EITHER the gateway-forwarded JWT (merge-time probes, I-202)
+        // or the service-token-gated probe header (dispatch/settlement
+        // probes). The mock's proxy for "verified scope" is header
+        // presence on either channel. `drop_tenant_scope` simulates
+        // the pre-Q3 downgrade: both channels ignored, no upstream
+        // probe runs, echo false — wire-identical to confirmed 404s
+        // (empty substitutable/indeterminate) except for the echo.
+        let jwt_scoped = request
+            .metadata()
+            .get(rio_proto::TENANT_TOKEN_HEADER)
+            .is_some();
+        if self.faults.drop_tenant_scope.load(Ordering::SeqCst) {
+            probe_tenant = None;
+        }
+        let scoped = (probe_tenant.is_some() || jwt_scoped)
+            && !self.faults.drop_tenant_scope.load(Ordering::SeqCst);
         let requested = request.into_inner().store_paths;
         for p in &requested {
             let _ = rio_nix::store_path::StorePath::parse(p)
@@ -906,22 +931,32 @@ impl StoreService for MockStore {
         // requested-and-missing AND seeded as substitutable. A seeded
         // path not in this request's missing set stays out (the real
         // store only checks upstream for paths it doesn't have).
-        let subs = self.state.substitutable.read().unwrap();
-        let ind = self.state.indeterminate.read().unwrap();
-        let substitutable: Vec<String> = missing
-            .iter()
-            .filter(|p| subs.contains(p) && !ind.contains(p) && !forced.contains(p))
-            .cloned()
-            .collect();
-        let indeterminate: Vec<String> = missing
-            .iter()
-            .filter(|p| ind.contains(p) && !forced.contains(p))
-            .cloned()
-            .collect();
+        // merged_bug_003: a scope-less request runs NO upstream probe
+        // — empty substitutable/indeterminate, exactly the wire shape
+        // the real store produces for anonymous callers.
+        let (substitutable, indeterminate) = if scoped {
+            let subs = self.state.substitutable.read().unwrap();
+            let ind = self.state.indeterminate.read().unwrap();
+            (
+                missing
+                    .iter()
+                    .filter(|p| subs.contains(p) && !ind.contains(p) && !forced.contains(p))
+                    .cloned()
+                    .collect(),
+                missing
+                    .iter()
+                    .filter(|p| ind.contains(p) && !forced.contains(p))
+                    .cloned()
+                    .collect(),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
         Ok(Response::new(types::FindMissingPathsResponse {
             missing_paths: missing,
             substitutable_paths: substitutable,
             indeterminate_paths: indeterminate,
+            probe_ran_tenant_scoped: scoped,
         }))
     }
 

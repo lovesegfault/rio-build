@@ -19,6 +19,7 @@ use tracing_test::traced_test;
 #[tokio::test]
 async fn get_interested_builds_is_sorted() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor(db.pool.clone());
     actor.test_inject_ready("h", None, "x86_64-linux", false);
 
@@ -99,6 +100,7 @@ async fn test_not_leader_does_not_set_gauges() -> TestResult {
     let _guard = metrics::set_default_local_recorder(&recorder);
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (handle, _task) = spawn_actor_with_flags(db.pool.clone(), false, true);
 
     // Merge a DAG so there's something to count. Standby DOES merge
@@ -151,6 +153,7 @@ async fn test_ex_leader_housekeeping_is_noop_after_lose() -> TestResult {
     let _guard = metrics::set_default_local_recorder(&recorder);
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (handle, _task, leader) = spawn_actor_with_leader(db.pool.clone(), true, true);
 
     // Merge a build while we ARE leader. Hold event_rx so the
@@ -259,6 +262,7 @@ async fn leader_lost_zeroes_open_attempts_gauge() -> TestResult {
     let _guard = metrics::set_default_local_recorder(&recorder);
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (handle, _task, leader) = spawn_actor_with_leader(db.pool.clone(), true, true);
 
     // Merge + pull-mint one attempt: the durable open-attempt view is
@@ -311,6 +315,7 @@ async fn leader_lost_resets_every_leader_gauge() -> TestResult {
     let _guard = metrics::set_default_local_recorder(&recorder);
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (handle, _task, leader) = spawn_actor_with_leader(db.pool.clone(), true, true);
 
     // Sentinel-set every member through its typed accessor (7.0 is
@@ -364,6 +369,7 @@ async fn test_hmac_signer_produces_verifiable_token() -> TestResult {
     use rio_auth::hmac::{HmacSigner, HmacVerifier};
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
 
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |_, p| {
@@ -432,6 +438,7 @@ async fn test_hmac_assignment_carries_tenant() -> TestResult {
     use rio_auth::hmac::{HmacSigner, HmacVerifier};
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let test_key = b"test-phase2-tenant-key-32-bytes!".to_vec();
 
     // Tenant must exist (builds.tenant_id FK, migration 009). The
@@ -487,6 +494,7 @@ async fn test_hmac_timeout_clamps_to_seven_days() -> TestResult {
     use rio_auth::hmac::{HmacSigner, HmacVerifier};
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let test_key = b"test-clamp-key-at-least-32-bytes!!".to_vec();
 
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |_, p| {
@@ -703,6 +711,7 @@ async fn test_backpressure_hysteresis() -> TestResult {
     // tokio runtime. The method doesn't query — SchedulerDb::new
     // just stores the pool.
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor(db.pool.clone());
     let reader = actor.backpressure_flag();
 
@@ -764,6 +773,7 @@ fn req_features(f: Option<&[&str]>) -> SpawnIntentsRequest {
 #[tokio::test]
 async fn spawn_intents_feature_filter() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_sla(db.pool.clone());
 
     // 3 Ready derivations:
@@ -837,6 +847,7 @@ async fn spawn_intents_feature_filter() {
 #[tokio::test]
 async fn spawn_intents_kvm_pool_excludes_featureless_work() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_sla(db.pool.clone());
 
     // Single Ready derivation, required_features = ∅ (e.g., hello).
@@ -875,6 +886,7 @@ async fn spawn_intents_kvm_pool_excludes_featureless_work() {
 #[tokio::test]
 async fn spawn_intents_soft_features_strip() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_cfg(
         db.pool.clone(),
         DagActorConfig {
@@ -931,6 +943,7 @@ async fn spawn_intents_soft_features_strip() {
 #[tokio::test]
 async fn soft_feature_strip_only() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_cfg(
         db.pool.clone(),
         DagActorConfig {
@@ -1000,6 +1013,7 @@ async fn soft_feature_strip_only() {
 #[tokio::test]
 async fn apply_soft_features_re_derives_effective_features() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_cfg(
         db.pool.clone(),
         DagActorConfig {
@@ -1041,6 +1055,7 @@ async fn apply_soft_features_re_derives_effective_features() {
 #[tokio::test]
 async fn solve_intent_for_clamps_at_resource_floor() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     // `bare_actor_sla`: realistic ceilings (256 GiB > 32 GiB floor). The
     // chokepoint applies `.max(floor).min(ceil)`; `bump_floor_or_count`
     // caps floor at ceil so the order is sound, but `test_default()`'s
@@ -1081,6 +1096,7 @@ async fn solve_intent_for_clamps_at_resource_floor() {
 async fn solve_intent_for_clamps_at_ceil() {
     use crate::sla::types::*;
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_sla(db.pool.clone());
     let max_mem = actor.sla_ceilings.max_mem;
     let max_disk = actor.sla_ceilings.max_disk;
@@ -1226,6 +1242,7 @@ async fn solve_intent_for_clamps_at_ceil() {
 async fn solve_intent_for_probe_fit_uses_probe_deadline() {
     use crate::sla::types::*;
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_sla(db.pool.clone());
     actor.sla_estimator.seed(FittedParams {
         key: ModelKey {
@@ -1282,6 +1299,7 @@ async fn solve_intent_for_probe_fit_uses_probe_deadline() {
 async fn solve_intent_for_subsecond_fit_floored_at_probe_deadline() {
     use crate::sla::types::*;
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_sla(db.pool.clone());
     actor.sla_estimator.seed(FittedParams {
         key: ModelKey {
@@ -1338,6 +1356,7 @@ async fn solve_intent_for_subsecond_fit_floored_at_probe_deadline() {
 async fn solve_intent_for_feature_probe_deadline() {
     use crate::sla::config;
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut cfg = test_sla_config();
     cfg.feature_probes.insert(
         "kvm".into(),
@@ -1371,6 +1390,7 @@ async fn solve_intent_for_feature_probe_deadline() {
 #[tokio::test]
 async fn cluster_snapshot_queued_by_system_sums_to_scalar() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor(db.pool.clone());
 
     // 3 Ready x86_64, 1 Ready aarch64. test_inject_ready puts the
@@ -1406,6 +1426,7 @@ async fn cluster_snapshot_queued_by_system_sums_to_scalar() {
 #[tokio::test]
 async fn snapshot_counts_substituting() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor(db.pool.clone());
 
     // 3 Ready nodes with pending unclaimed jobs, 1 plain Ready,
@@ -1453,6 +1474,7 @@ async fn snapshot_counts_substituting() {
 async fn spawn_intents_kind_and_system_filter() {
     use rio_proto::types::ExecutorKind;
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_sla(db.pool.clone());
 
     actor.test_inject_ready("build-x86", None, "x86_64-linux", false);
@@ -1527,6 +1549,7 @@ async fn spawn_intents_kind_and_system_filter() {
 #[tokio::test]
 async fn compute_spawn_intents_priority_sorted() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor(db.pool.clone());
     actor.test_inject_ready("lo", Some("p"), "x86_64-linux", false);
     actor.test_inject_ready("hi", Some("p"), "x86_64-linux", false);
@@ -1582,6 +1605,7 @@ fn bare_actor_forecast(pool: sqlx::PgPool, max_lead: f64, max_forecast_cores: u3
 #[tokio::test]
 async fn forecast_frontier_one_layer_only() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_forecast(db.pool.clone(), 45.0, 2_000);
 
     // DAG: a(Running, T=100, elapsed=70 → eta=30) → b(Queued) → c(Queued)
@@ -1645,6 +1669,7 @@ async fn forecast_frontier_one_layer_only() {
 #[tokio::test]
 async fn eta_is_remaining_not_total() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_forecast(db.pool.clone(), 200.0, 2_000);
 
     // a: T=100, elapsed=40 → eta=60. b: max-across-deps with c
@@ -1690,6 +1715,7 @@ async fn eta_is_remaining_not_total() {
 #[tokio::test]
 async fn forecast_tenant_ceiling_subtracts_ready_first() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     // probe.cpu=4 → every unfitted intent is 4 cores. cap=10 cores.
     let mut actor = bare_actor_forecast(db.pool.clone(), 200.0, 10);
 
@@ -1761,6 +1787,7 @@ async fn forecast_tenant_ceiling_subtracts_ready_first() {
 #[tokio::test]
 async fn forecast_budget_deterministic() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
 
     // Build the SAME 3-drv forecast frontier twice with different
     // insertion orders. `iter_nodes()` is HashMap-backed → order is
@@ -1816,6 +1843,7 @@ async fn forecast_budget_deterministic() {
 #[tokio::test]
 async fn forecast_disabled_on_empty_lead_time_seed() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_sla(db.pool.clone()); // lead_time_seed = {}
 
     actor.test_inject_at("a", "x86_64-linux", DerivationStatus::Running);
@@ -1841,6 +1869,7 @@ async fn forecast_disabled_on_empty_lead_time_seed() {
 #[tokio::test]
 async fn forecast_overdue_dep_is_not_ready() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_forecast(db.pool.clone(), 200.0, 2_000);
 
     // a: T=50, elapsed=80 → eta clamped to 0.0 (overdue). b depends
@@ -1965,6 +1994,7 @@ async fn test_mailbox_depth_gauge_set_per_command() -> TestResult {
     let _guard = metrics::set_default_local_recorder(&recorder);
 
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let (handle, _task) = setup_actor(db.pool.clone());
 
     handle.send_unchecked(ActorCommand::Tick).await?;
@@ -1991,6 +2021,7 @@ async fn test_mailbox_depth_gauge_set_per_command() -> TestResult {
 #[tokio::test]
 async fn clear_persisted_state_clears_per_generation_maps() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor(db.pool.clone());
 
     actor.authoritative_binding.insert(
@@ -2071,6 +2102,7 @@ async fn display_only_events_route_to_log_ring() {
 #[tokio::test]
 async fn watch_build_missing_returns_not_found_for_tenant() {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let actor = bare_actor(db.pool.clone());
     let missing = Uuid::new_v4();
     let tenant = Some(Uuid::new_v4());
@@ -2103,6 +2135,7 @@ async fn watch_build_missing_returns_not_found_for_tenant() {
 async fn build_options_merge_zero_cores_is_all() {
     use crate::state::BuildInfo;
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor(db.pool.clone());
     actor.test_inject_ready("h", None, "x86_64-linux", false);
 
@@ -2181,6 +2214,7 @@ async fn build_options_merge_zero_cores_is_all() {
 #[tokio::test]
 async fn test_attempt_ledger_gc_tick_leader_sweeps_standby_noops() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
 
     // Seed one derivation with [old pre-reset attempt, old reset,
     // fresh attempt].

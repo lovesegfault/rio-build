@@ -200,6 +200,7 @@ async fn get_build_graph_subgraph_scoping() -> anyhow::Result<()> {
 #[tokio::test]
 async fn get_build_graph_truncation() -> anyhow::Result<()> {
     let db = TestDb::new(&crate::MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let pool = &db.pool;
 
     let build = seed_build(pool).await?;
@@ -243,6 +244,7 @@ async fn get_build_graph_truncation() -> anyhow::Result<()> {
 #[tokio::test]
 async fn get_build_graph_truncated_no_dangling_edges() -> anyhow::Result<()> {
     let db = TestDb::new(&crate::MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
     let pool = &db.pool;
 
     let build = seed_build(pool).await?;

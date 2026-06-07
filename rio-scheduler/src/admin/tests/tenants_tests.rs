@@ -11,9 +11,16 @@ use super::*;
 async fn test_create_and_list_tenants() -> anyhow::Result<()> {
     let (svc, _actor, _task, db) = setup_svc_default().await;
 
-    // Initially empty.
+    // Initially empty — modulo the harness default tenant every
+    // actor-test setup seeds (merged_bug_003: builds must be tenanted
+    // for the substitution lane to exist at all).
     let resp = svc.list_tenants(Request::new(())).await?.into_inner();
-    assert!(resp.tenants.is_empty());
+    let non_harness = |ts: &[rio_proto::types::TenantInfo]| {
+        ts.iter()
+            .filter(|t| t.tenant_name != "harness-default-tenant")
+            .count()
+    };
+    assert_eq!(non_harness(&resp.tenants), 0);
 
     // Create a tenant.
     let created = svc
@@ -38,8 +45,11 @@ async fn test_create_and_list_tenants() -> anyhow::Result<()> {
 
     // List shows it.
     let resp = svc.list_tenants(Request::new(())).await?.into_inner();
-    assert_eq!(resp.tenants.len(), 1);
-    assert_eq!(resp.tenants[0].tenant_name, "team-alpha");
+    assert_eq!(non_harness(&resp.tenants), 1);
+    assert!(
+        resp.tenants.iter().any(|t| t.tenant_name == "team-alpha"),
+        "created tenant must appear in the list"
+    );
 
     // Duplicate name → AlreadyExists.
     let dup = svc

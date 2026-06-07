@@ -24,6 +24,7 @@ bool created = 1;
 bool done = 4;
 bool dry_run = 1;
 bool is_complete = 4;
+bool probe_ran_tenant_scoped = 4;
 bool ultimate = 8;
 bytes data = 1;
 bytes digest = 1;

@@ -772,6 +772,7 @@ async fn cancel_running_drv_records_exec_correlation(
     #[case] from_status: DerivationStatus,
 ) -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
 
     // Seed the rows record_exec_correlation's UPDATE targets — same
     // pattern as exec_correlation_falls_back_to_buffer_exec_id.
