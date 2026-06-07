@@ -459,8 +459,13 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_store_putpath_stale_reclaimed_total",
         "Stale 'uploading' placeholders reclaimed on the PutPath hot path \
-         (I-207). Nonzero expected under fetcher churn; sustained high \
-         suggests under-sized fetcher pods (see I-208)."
+         (I-207), labeled by reason: heartbeat = dead-owner DELETE + \
+         re-insert (resets stall evidence); stall_abort = the owner \
+         aborted its own wedged upload and released the claim in place; \
+         stall_reclaim = a competing claimant took over a frozen \
+         mid-upload claim in place (stall_count += 1). Nonzero expected \
+         under fetcher churn; sustained high suggests under-sized \
+         fetcher pods (see I-208)."
     );
     describe_counter!(
         "rio_store_substitute_probe_cache_hits_total",

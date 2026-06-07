@@ -560,23 +560,32 @@ mod tests {
     use super::*;
 
     /// bug_265 parity: the const alphabet IS the label alphabet — every
-    /// member appears in the canonical HELP text of both metric
+    /// member appears in the canonical HELP text of BOTH metric
     /// families (lib.rs describe_counter, which docs/gen/metrics.json
     /// is generated from), and the array is duplicate-free. The emit
     /// sites reference the named members, so reachable-reason
-    /// membership is structural.
+    /// membership is structural. merged_bug_189: the putpath window is
+    /// anchored too — the hooks indirection parametrizes the metric
+    /// NAME, so every reason is reachable under either family and both
+    /// HELPs must document the full alphabet (pre-fix, putpath carried
+    /// reason=heartbeat its HELP never mentioned).
     #[test]
     fn stale_reclaim_reason_alphabet_matches_help() {
         let lib = include_str!("lib.rs");
-        let sub_help_start = lib
-            .find("rio_store_substitute_stale_reclaimed_total")
-            .expect("substitute HELP present");
-        let help = &lib[sub_help_start..sub_help_start + 700];
-        for reason in STALE_RECLAIM_REASONS {
-            assert!(
-                help.contains(reason),
-                "substitute stale-reclaim HELP must name reason '{reason}'"
-            );
+        for family in [
+            "rio_store_substitute_stale_reclaimed_total",
+            "rio_store_putpath_stale_reclaimed_total",
+        ] {
+            let start = lib
+                .find(family)
+                .unwrap_or_else(|| panic!("{family} HELP present"));
+            let help = &lib[start..start + 700];
+            for reason in STALE_RECLAIM_REASONS {
+                assert!(
+                    help.contains(reason),
+                    "{family} HELP must name reason '{reason}'"
+                );
+            }
         }
         let mut sorted = STALE_RECLAIM_REASONS.to_vec();
         sorted.sort_unstable();
