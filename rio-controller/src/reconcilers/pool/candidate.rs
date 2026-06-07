@@ -202,8 +202,8 @@ pub(crate) fn no_eligible_source(intent: &SpawnIntent, candidates: &[CandidateNo
 pub(crate) const NO_ELIGIBLE_SOURCE_PERSIST_TICKS: u32 = 3;
 
 /// One streak-map update for one gated tick. Returns the new streak
-/// and whether this tick should report. [`PoolStreaks::step_and_prune`]
-/// is the only caller in the reconcile path.
+/// and whether this tick should report. [`PoolStreaks::step`] is the
+/// only caller in the reconcile path.
 pub(crate) fn exhausted_streak_step(prev: Option<u32>) -> (u32, bool) {
     let streak = prev.unwrap_or(0).saturating_add(1);
     (streak, streak >= NO_ELIGIBLE_SOURCE_PERSIST_TICKS)
@@ -215,6 +215,20 @@ pub(crate) fn exhausted_streak_step(prev: Option<u32>) -> (u32, bool) {
 /// the expiry replaces that accident with a law.
 pub(crate) const POOL_STREAK_ORPHAN_EXPIRY_SECS: u64 = 120;
 
+/// Witness that [`PoolStreaks::begin_tick`] ran for this pool THIS
+/// reconcile (bug_069). [`PoolStreaks::step`] consumes it, so stepping
+/// a streak without the per-reconcile sequence bump (and the
+/// non-adjacent-entry prune that rides it) does not typecheck — and a
+/// reconcile that mints the witness but never reaches the gate fold
+/// simply drops it, leaving the sequence gap that resets the streak on
+/// the next observation. Fields are private: the only constructor is
+/// `begin_tick`.
+#[must_use = "the streak tick must reach the gate fold's step (or be dropped) — never stored"]
+pub struct StreakTick {
+    pool: String,
+    seq: u64,
+}
+
 /// merged_bug_117: pool-keyed exhaustion streaks. The retired shape was
 /// a pool-SHARED `HashMap<intent, u32>` whose per-pool reconcile did
 /// `retain(|id| this_pools_gated.contains(id))` — pool B's tick wiped
@@ -223,41 +237,91 @@ pub(crate) const POOL_STREAK_ORPHAN_EXPIRY_SECS: u64 = 120;
 /// gated in two overlapping pools double-stepped per wall-clock tick
 /// (premature report after 2 ticks of per-pool observation).
 ///
-/// The key is `(pool, intent)` and there is exactly ONE mutating
-/// method: [`Self::step_and_prune`], scoped to one pool's tick — a
-/// cross-pool wipe is INEXPRESSIBLE through the API.
+/// bug_069: consecutiveness is a property of the DATA, not of fold
+/// reachability. Every pool reconcile mints a [`StreakTick`] (a
+/// monotone per-pool sequence) via [`Self::begin_tick`]; a streak
+/// entry continues only when it was stepped in the IMMEDIATELY
+/// PRECEDING sequence — older entries are pruned at `begin_tick`, so a
+/// reconcile whose gate fold is skipped (zero headroom, no
+/// exclusion-carrying intents, node LIST failure) structurally breaks
+/// every streak of that pool. The retired shape coupled both prune and
+/// step to a conditionally-reached fold: a streak frozen at 2 by a
+/// skipped tick fired the irreversible poison on a single
+/// re-observation hours later (and the own-pool exemption from the
+/// orphan expiry made the window indefinite in single-pool configs).
+///
+/// The key is `(pool, intent)`; the mutators are `begin_tick` (prune)
+/// and `step` (advance), both scoped to one pool's tick — a cross-pool
+/// wipe remains INEXPRESSIBLE through the API.
 #[derive(Debug, Default)]
-pub struct PoolStreaks(std::collections::HashMap<(String, String), (u32, std::time::Instant)>);
+pub struct PoolStreaks {
+    /// `(pool, intent) → (streak, last-stepped sequence, last touch)`.
+    entries: std::collections::HashMap<(String, String), (u32, u64, std::time::Instant)>,
+    /// Per-pool reconcile sequence, bumped once per `begin_tick`.
+    pool_seq: std::collections::HashMap<String, u64>,
+}
 
 impl PoolStreaks {
     // r[impl ctrl.pool.no-eligible-persist+2]
-    /// Fold one pool's gated tick: prune THIS pool's entries that left
-    /// the gated set, expire ORPHANED entries (any pool, untouched for
-    /// `POOL_STREAK_ORPHAN_EXPIRY_SECS` — a removed pool never ticks
-    /// again), step each gated intent's streak, and return the intent
-    /// ids whose exhaustion persisted `NO_ELIGIBLE_SOURCE_PERSIST_TICKS`
-    /// consecutive ticks OF THIS POOL (overlapping pools count their
-    /// OWN observations; an already-reported streak keeps reporting
-    /// harmlessly — duplicate reports are server-side no-ops).
-    pub fn step_and_prune(
-        &mut self,
-        pool: &str,
-        gated_ids: &std::collections::HashSet<&str>,
-        now: std::time::Instant,
-    ) -> Vec<String> {
-        self.0.retain(|(p, id), (_, touched)| {
+    /// Begin one pool reconcile: bump the pool's sequence, prune THIS
+    /// pool's non-adjacent entries (their streak was broken by a
+    /// reconcile that never stepped them), expire ORPHANED entries
+    /// (other pools, untouched for `POOL_STREAK_ORPHAN_EXPIRY_SECS` —
+    /// a removed pool never ticks again), and mint the witness the
+    /// gate fold must present to step.
+    pub fn begin_tick(&mut self, pool: &str, now: std::time::Instant) -> StreakTick {
+        let seq = {
+            let s = self.pool_seq.entry(pool.to_owned()).or_insert(0);
+            *s += 1;
+            *s
+        };
+        self.entries.retain(|(p, _), (_, last_seq, touched)| {
             if p == pool {
-                gated_ids.contains(id.as_str())
+                // Adjacent = stepped in the immediately preceding
+                // sequence of THIS pool. Anything older is a broken
+                // streak — dead, whatever its count.
+                *last_seq + 1 == seq
             } else {
                 now.saturating_duration_since(*touched).as_secs() < POOL_STREAK_ORPHAN_EXPIRY_SECS
             }
         });
+        StreakTick {
+            pool: pool.to_owned(),
+            seq,
+        }
+    }
+
+    // r[impl ctrl.pool.no-eligible-persist+2]
+    /// Fold one pool's gated tick: prune THIS pool's entries that left
+    /// the gated set, step each gated intent's streak, and return the
+    /// intent ids whose exhaustion persisted
+    /// `NO_ELIGIBLE_SOURCE_PERSIST_TICKS` consecutive reconcile ticks
+    /// OF THIS POOL (overlapping pools count their OWN observations;
+    /// an already-reported streak keeps reporting harmlessly —
+    /// duplicate reports are server-side no-ops). Consumes the
+    /// [`StreakTick`]: one step per reconcile, and no step without
+    /// `begin_tick`'s adjacency prune.
+    pub fn step(
+        &mut self,
+        tick: StreakTick,
+        gated_ids: &std::collections::HashSet<&str>,
+        now: std::time::Instant,
+    ) -> Vec<String> {
+        let StreakTick { pool, seq } = tick;
+        self.entries
+            .retain(|(p, id), _| p != &pool || gated_ids.contains(id.as_str()));
         let mut report = Vec::new();
         for id in gated_ids {
-            let key = (pool.to_owned(), (*id).to_owned());
-            let prev = self.0.get(&key).map(|(s, _)| *s);
+            let key = (pool.clone(), (*id).to_owned());
+            // Survivors of `begin_tick`'s prune are exactly the
+            // entries stepped in the previous sequence; anything else
+            // restarts from zero.
+            let prev = self
+                .entries
+                .get(&key)
+                .and_then(|(s, last_seq, _)| (*last_seq + 1 == seq).then_some(*s));
             let (streak, fire) = exhausted_streak_step(prev);
-            self.0.insert(key, (streak, now));
+            self.entries.insert(key, (streak, seq, now));
             if fire {
                 report.push((*id).to_owned());
             }
@@ -630,6 +694,18 @@ mod proptests {
         }
     }
 
+    /// One OBSERVED pool tick under the bug_069 witness API:
+    /// begin (unconditional prune) + step (gate fold reached).
+    fn observed_tick(
+        s: &mut PoolStreaks,
+        pool: &str,
+        gated: &std::collections::HashSet<&str>,
+        t: std::time::Instant,
+    ) -> Vec<String> {
+        let tick = s.begin_tick(pool, t);
+        s.step(tick, gated, t)
+    }
+
     // r[verify ctrl.pool.no-eligible-persist+2]
     /// merged_bug_117 law 1 (recorded red: the retired pool-shared map's
     /// `retain(|id| gated_B.contains(id))` wiped pool A's streaks every
@@ -643,12 +719,12 @@ mod proptests {
         let a_gated: std::collections::HashSet<&str> = ["drv-a"].into();
         let b_gated: std::collections::HashSet<&str> = ["drv-b"].into();
         // A and B alternate; A's third own tick must report.
-        assert!(s.step_and_prune("pool-a", &a_gated, t).is_empty());
-        assert!(s.step_and_prune("pool-b", &b_gated, t).is_empty());
-        assert!(s.step_and_prune("pool-a", &a_gated, t).is_empty());
-        assert!(s.step_and_prune("pool-b", &b_gated, t).is_empty());
+        assert!(observed_tick(&mut s, "pool-a", &a_gated, t).is_empty());
+        assert!(observed_tick(&mut s, "pool-b", &b_gated, t).is_empty());
+        assert!(observed_tick(&mut s, "pool-a", &a_gated, t).is_empty());
+        assert!(observed_tick(&mut s, "pool-b", &b_gated, t).is_empty());
         assert_eq!(
-            s.step_and_prune("pool-a", &a_gated, t),
+            observed_tick(&mut s, "pool-a", &a_gated, t),
             vec!["drv-a".to_string()],
             "pool A's third consecutive own observation must report"
         );
@@ -667,16 +743,16 @@ mod proptests {
         // Two wall-clock rounds of both pools: 4 steps total, but no
         // single pool has seen 3 yet.
         for _ in 0..2 {
-            assert!(s.step_and_prune("pool-a", &gated, t).is_empty());
-            assert!(s.step_and_prune("pool-b", &gated, t).is_empty());
+            assert!(observed_tick(&mut s, "pool-a", &gated, t).is_empty());
+            assert!(observed_tick(&mut s, "pool-b", &gated, t).is_empty());
         }
         // Each pool's own third observation reports independently.
         assert_eq!(
-            s.step_and_prune("pool-a", &gated, t),
+            observed_tick(&mut s, "pool-a", &gated, t),
             vec!["drv-x".to_string()]
         );
         assert_eq!(
-            s.step_and_prune("pool-b", &gated, t),
+            observed_tick(&mut s, "pool-b", &gated, t),
             vec!["drv-x".to_string()]
         );
     }
@@ -693,15 +769,74 @@ mod proptests {
         let t0 = std::time::Instant::now();
         let gated: std::collections::HashSet<&str> = ["drv-a"].into();
         let other: std::collections::HashSet<&str> = ["drv-b"].into();
-        assert!(s.step_and_prune("pool-a", &gated, t0).is_empty());
-        assert!(s.step_and_prune("pool-a", &gated, t0).is_empty()); // streak 2
+        assert!(observed_tick(&mut s, "pool-a", &gated, t0).is_empty());
+        assert!(observed_tick(&mut s, "pool-a", &gated, t0).is_empty()); // streak 2
         // pool-a removed from config; only pool-b ticks, past the expiry.
         let late = t0 + std::time::Duration::from_secs(POOL_STREAK_ORPHAN_EXPIRY_SECS + 1);
-        assert!(s.step_and_prune("pool-b", &other, late).is_empty());
+        assert!(observed_tick(&mut s, "pool-b", &other, late).is_empty());
         // pool-a re-added: its old streak expired, so this is tick 1, not 3.
         assert!(
-            s.step_and_prune("pool-a", &gated, late).is_empty(),
+            observed_tick(&mut s, "pool-a", &gated, late).is_empty(),
             "an expired orphan streak must restart, not resume at 3"
+        );
+    }
+
+    // r[verify ctrl.pool.no-eligible-persist+2]
+    /// bug_069 (recorded red on the retired fold-coupled shape:
+    /// `non-consecutive observations fired the irreversible poison:
+    /// ["drv-x"]`): a reconcile whose gate fold is skipped — zero
+    /// headroom, no exclusion-carrying intents, node LIST failure —
+    /// mints the tick witness but never steps, and the sequence gap
+    /// MUST break the streak. The contract is N CONSECUTIVE observed
+    /// ticks; an unobserved tick is not a persisted one.
+    #[test]
+    fn skipped_fold_tick_breaks_the_streak() {
+        let mut s = PoolStreaks::default();
+        let gated: std::collections::HashSet<&str> = ["drv-x"].into();
+        let t = std::time::Instant::now();
+        assert!(observed_tick(&mut s, "pool-a", &gated, t).is_empty()); // observed 1
+        assert!(observed_tick(&mut s, "pool-a", &gated, t).is_empty()); // observed 2
+        // Reconcile 3: the gate fold is skipped — the witness is
+        // minted (top of reconcile, unconditional) and dropped.
+        drop(s.begin_tick("pool-a", t));
+        let fired = observed_tick(&mut s, "pool-a", &gated, t); // observed again
+        assert!(
+            fired.is_empty(),
+            "non-consecutive observations fired the irreversible poison: {fired:?}"
+        );
+    }
+
+    // r[verify ctrl.pool.no-eligible-persist+2]
+    /// bug_069, single-pool flavor: the retired shape exempted own-pool
+    /// entries from the orphan expiry, so with no second pool the
+    /// frozen streak persisted INDEFINITELY — one isolated blip hours
+    /// later completed the poison. Adjacency makes the gap length
+    /// irrelevant: any number of skipped reconciles resets the count.
+    #[test]
+    fn single_pool_frozen_streak_never_resumes() {
+        let mut s = PoolStreaks::default();
+        let gated: std::collections::HashSet<&str> = ["drv-x"].into();
+        let t = std::time::Instant::now();
+        assert!(observed_tick(&mut s, "pool-a", &gated, t).is_empty());
+        assert!(observed_tick(&mut s, "pool-a", &gated, t).is_empty()); // streak 2
+        // Hours of reconciles where the fold never runs (pool at
+        // ceiling, nothing carries exclusions) — same Instant is fine:
+        // the law is sequence adjacency, not wall-clock age.
+        for _ in 0..360 {
+            drop(s.begin_tick("pool-a", t));
+        }
+        // One isolated re-observation must start over, not fire.
+        assert!(
+            observed_tick(&mut s, "pool-a", &gated, t).is_empty(),
+            "an isolated observation after a frozen streak must not poison"
+        );
+        // And two more CONSECUTIVE observations do fire — the gate
+        // still works when exhaustion genuinely persists.
+        assert!(observed_tick(&mut s, "pool-a", &gated, t).is_empty());
+        assert_eq!(
+            observed_tick(&mut s, "pool-a", &gated, t),
+            vec!["drv-x".to_string()],
+            "three genuinely consecutive observations must still report"
         );
     }
 

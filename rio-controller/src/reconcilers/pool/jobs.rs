@@ -460,6 +460,21 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     })?;
     let ceiling = pool.spec.max_concurrent.map(|c| c as i32);
 
+    // bug_069: the exhaustion-streak tick begins UNCONDITIONALLY at
+    // the top of every reconcile — before headroom, existing-name
+    // filtering, the lazy node LIST, or any early error can skip the
+    // gate fold. `begin_tick` bumps this pool's sequence and prunes
+    // entries not stepped in the immediately preceding sequence, so a
+    // reconcile that never reaches the AD2 gate structurally breaks
+    // every streak (the contract is N CONSECUTIVE observed ticks; an
+    // unobserved tick is not a persisted one). The witness is consumed
+    // by the gate fold's `step`; dropping it (gate not evaluated this
+    // tick) is exactly the streak-breaking outcome.
+    let streak_tick = ctx
+        .exhausted_streak
+        .lock()
+        .begin_tick(&name, std::time::Instant::now());
+
     // ---- Poll spawn intents ----
     // One GetSpawnIntents RPC per reconcile per pool. If the scheduler
     // is unreachable: log + treat as queued=0 + requeue. Next tick
@@ -661,9 +676,14 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
                     // longer wipe pool A's persistence count, and an
                     // intent gated in two overlapping pools counts each
                     // pool's own 3 observations before the irreversible
-                    // poison_and_cascade.
-                    let fire = ctx.exhausted_streak.lock().step_and_prune(
-                        &name,
+                    // poison_and_cascade. The `streak_tick` witness
+                    // minted at the top of this reconcile is consumed
+                    // here (bug_069): a step without the unconditional
+                    // begin-tick prune does not typecheck, and a
+                    // reconcile that never reaches this fold drops the
+                    // witness — breaking the streak by sequence gap.
+                    let fire = ctx.exhausted_streak.lock().step(
+                        streak_tick,
                         &gated_ids,
                         std::time::Instant::now(),
                     );
