@@ -983,16 +983,25 @@ pkgs.testers.runNixOSTest {
         # sub_path was substituted under tenant A (sig: test-cache-1).
         # Zero path_tenants rows (substitution doesn't populate it —
         # only build-completion does). C trusts ONLY 'wrong-key' →
-        # sig_visibility_gate fails → NotFound.
+        # sig_visibility_gate fails locally; the substitution leg then
+        # consults C's OWN upstream, which serves a narinfo signed by
+        # test-cache-1 — PRESENT but unverifiable against C's
+        # trusted_keys. merged_bug_005 types that as a refusal
+        # (FailedPrecondition: configuration feedback about C's key
+        # set), never NotFound — the old NotFound expectation here
+        # pinned the silent miss-laundering. C still cannot obtain the
+        # path; tenant D below (no upstream) pins the unchanged
+        # clean-miss NotFound side of the boundary.
         rc, out = query_path_info(jwt_c, sub_path)
         assert rc != 0, (
-            f"tenant C (untrusted key) should get NotFound for "
-            f"A-substituted {sub_path}, got rc=0:\n{out}"
+            f"tenant C (untrusted key) must not obtain A-substituted "
+            f"{sub_path}, got rc=0:\n{out}"
         )
-        assert "NotFound" in out or "not found" in out.lower(), (
-            f"expected NotFound status:\n{out}"
+        assert "FailedPrecondition" in out, (
+            f"expected FailedPrecondition (present-but-untrusted is a "
+            f"typed refusal, not a miss):\n{out}"
         )
-        print(f"cross-tenant gate PASS: C blocked from {sub_path}")
+        print(f"cross-tenant gate PASS: C refused for {sub_path}")
 
         # Positive control: B DOES trust test-cache-1 → visible.
         # Same path, different tenant context — if this also fails,
@@ -1032,7 +1041,9 @@ pkgs.testers.runNixOSTest {
             f"BatchGetManifest: end-user tenant token should be "
             f"rejected:\n{out}"
         )
-        # GetPath: same gate as QueryPathInfo → NotFound.
+        # GetPath: same gate + same substitution leg as QueryPathInfo
+        # → the same typed FailedPrecondition refusal (merged_bug_005:
+        # C's upstream serves the narinfo, C's keys can't verify it).
         rc, out = ${gatewayHost}.execute(
             f"${grpcurl} -plaintext -max-time 30 "
             f"-protoset ${protoset}/rio.protoset "
@@ -1040,8 +1051,8 @@ pkgs.testers.runNixOSTest {
             f'-d \'{{"store_path":"{sub_path}"}}\' '
             "localhost:9002 rio.store.StoreService/GetPath 2>&1"
         )
-        assert rc != 0 and ("NotFound" in out or "not found" in out.lower()), (
-            f"GetPath: tenant C should get NotFound:\n{out}"
+        assert rc != 0 and "FailedPrecondition" in out, (
+            f"GetPath: tenant C should get the typed refusal:\n{out}"
         )
         print("cross-tenant gate PASS: all read RPCs gated for C")
 

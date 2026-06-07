@@ -583,11 +583,14 @@ in
   # r[verify store.substitute.tenant-sig-visibility+2]
   # r[verify store.substitute.find-missing-gated]
   # r[verify store.api.batch-manifest+2]
-  #   substitute-cross-tenant-gate: tenant C (untrusted key) → NotFound
-  #   on A-substituted path via QueryPathInfo/GetPath/FindMissingPaths;
-  #   PermissionDenied via BatchGetManifest (builder-internal). Tenant
-  #   B (trusts same key) → visible. Dynamic re-trust proves per-request
-  #   trusted_keys read.
+  #   substitute-cross-tenant-gate: tenant C (untrusted key) → the
+  #   typed FailedPrecondition refusal via QueryPathInfo/GetPath
+  #   (merged_bug_005: C's own upstream serves the narinfo but C's
+  #   keys can't verify it — present-but-untrusted is never a silent
+  #   miss); still reported missing via FindMissingPaths (sig-blind
+  #   HEAD leg, no refusal there); PermissionDenied via
+  #   BatchGetManifest (builder-internal). Tenant B (trusts same key)
+  #   → visible. Dynamic re-trust proves per-request trusted_keys read.
   # r[verify store.tenant.narinfo-filter]
   #   built-path-cross-tenant-gate: I-217 — gate hides A's BUILT path
   #   from non-owners. D (no upstream) → NotFound. B (has upstream) →
