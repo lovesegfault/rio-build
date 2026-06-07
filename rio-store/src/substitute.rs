@@ -318,6 +318,28 @@ enum UpstreamOutcome {
     Raced,
 }
 
+/// The two capabilities a substitution leg needs, gated in ONE place
+/// with ONE ordering ([`Substituter::capability_gate`],
+/// merged_bug_030): upstream configuration first, HTTP client second.
+/// Both legs (`try_substitute_inner`'s singleflight body and
+/// `check_available`) consume this — the per-class congruence law
+/// (`r[store.materialize.probe-polarity]`) holds at the capability
+/// tier by construction because the ordering exists exactly once.
+enum CapabilityGate<'a> {
+    /// Tenant has no upstreams configured: a clean no-op on both legs
+    /// (attempt: definitive miss; probe: empty result).
+    NoUpstreams,
+    /// Upstreams ARE configured but the replica has no HTTP client:
+    /// a capability fault on both legs (attempt: uncached
+    /// `Err(Fetch)`; probe: all-indeterminate).
+    Clientless,
+    /// Both capabilities present.
+    Ready {
+        http: &'a reqwest::Client,
+        upstreams: Vec<Upstream>,
+    },
+}
+
 /// Result of one HEAD probe across the tenant's upstreams. Only `Hit`
 /// and `Miss` are cached; `Indeterminate` (network error / 5xx on every
 /// non-hit base) and `RateLimited` are left uncached so the next call
@@ -590,6 +612,36 @@ impl Substituter {
             .await
     }
 
+    /// The shared capability gate both substitution legs consult
+    /// BEFORE any upstream work (merged_bug_030). The ordering law
+    /// lives HERE, exactly once: a tenant with NO upstreams is a clean
+    /// no-op on both legs (nothing to consult — "no upstream has it"
+    /// is truthful), checked FIRST; a missing HTTP client with
+    /// upstreams configured is a capability fault on both legs (the
+    /// work cannot run, so nothing may be confirmed — hazard eeee),
+    /// checked SECOND. Pre-fix the two legs ordered the checks
+    /// oppositely: `try_substitute_inner` was upstreams-first while
+    /// `check_available` was client-first, so an upstream-less tenant
+    /// on a clientless replica answered CleanMiss on the attempt leg
+    /// but all-indeterminate on the probe leg → `Failed{Fetch}` →
+    /// ChargeInfra — infra-charging and parking jobs that should
+    /// settle confirmed-miss (and converting the Ready queue into
+    /// park-charging jobs replica-wide, since dispatch treats
+    /// indeterminate optimistically while every claim can only err).
+    async fn capability_gate(
+        &self,
+        tenant_id: Uuid,
+    ) -> Result<CapabilityGate<'_>, SubstituteError> {
+        let upstreams = metadata::upstreams::list_for_tenant(&self.pool, tenant_id).await?;
+        if upstreams.is_empty() {
+            return Ok(CapabilityGate::NoUpstreams);
+        }
+        match &self.http {
+            Some(http) => Ok(CapabilityGate::Ready { http, upstreams }),
+            None => Ok(CapabilityGate::Clientless),
+        }
+    }
+
     /// Shared singleflight body for `try_substitute` /
     /// `try_substitute_with_progress`. moka's `try_get_with`: if
     /// another caller is already computing this key, we wait and share
@@ -618,67 +670,72 @@ impl Substituter {
             .inflight
             .try_get_with(key, async {
                 was_leader.store(true, std::sync::atomic::Ordering::Relaxed);
-                // Cheap no-work checks BEFORE the admission permit. A
-                // tenant with no upstreams (the common case) must get
-                // an immediate `Ok(None)`, not queue behind saturated
-                // substituters for up to SUBSTITUTE_ADMISSION_WAIT.
-                // `list_for_tenant` is one indexed PG read; far cheaper
-                // than the permit's potential 25 s queue.
-                let upstreams = metadata::upstreams::list_for_tenant(&self.pool, tenant_id).await?;
-                if upstreams.is_empty() {
-                    // Correct behaviour for a tenant with no upstreams
-                    // configured — but it MUST be countable. Every
-                    // skip in the substitution pipeline degrades to
-                    // "build it from source" at the scheduler, and a
-                    // skip that leaves no trace is indistinguishable
-                    // from "the upstream really doesn't have it"
-                    // (2026-05-23: hours of builder CPU compiling
-                    // cache.nixos.org-cached paths because every
-                    // no-op branch was silent). debug! not warn! —
-                    // an upstream-less tenant hits this on every
-                    // cache miss; the counter is the alertable
-                    // signal, the log line is for when you're
-                    // already looking. Counted once per singleflight
-                    // leader, same granularity as `result=hit|miss`.
-                    debug!(
-                        tenant = %tenant_id,
-                        path = store_path,
-                        "substitute skipped: tenant has no upstreams configured"
-                    );
-                    metrics::counter!(
-                        "rio_store_substitute_skipped_total",
-                        "reason" => "no_upstreams"
-                    )
-                    .increment(1);
-                    return Ok(None);
-                }
-                let Some(http) = &self.http else {
-                    // Upstreams ARE configured but the reqwest client
-                    // failed to build at startup: the walk cannot run,
-                    // so it cannot confirm ANYTHING — least of all a
-                    // miss. `Ok(None)` here laundered the capability
-                    // fault into a definitive NotFound — the
-                    // merged_bug_044 class at the capability
-                    // chokepoint, invisible until all-errored stopped
-                    // mapping to NotFound and the verdicts diverged.
-                    // Err is UNCACHED (same law as the all-errored
-                    // fold: nothing was consulted, nothing may be
-                    // remembered). The construction site warned once;
-                    // the counter stays the alertable signal.
-                    debug!(
-                        tenant = %tenant_id,
-                        path = store_path,
-                        "substitute failed: no HTTP client (reqwest client build failed at startup)"
-                    );
-                    metrics::counter!(
-                        "rio_store_substitute_skipped_total",
-                        "reason" => "no_http_client"
-                    )
-                    .increment(1);
-                    return Err(SubstituteError::Fetch(
-                        "upstream substitution unavailable: HTTP client failed to build at startup"
-                            .to_string(),
-                    ));
+                // Capability gate BEFORE the admission permit
+                // (merged_bug_030: ONE ordering for both legs —
+                // upstreams first, client second). A tenant with no
+                // upstreams (the common case) must get an immediate
+                // `Ok(None)`, not queue behind saturated substituters
+                // for up to SUBSTITUTE_ADMISSION_WAIT —
+                // `list_for_tenant` is one indexed PG read, far
+                // cheaper than the permit's potential 25 s queue.
+                let (http, upstreams) = match self.capability_gate(tenant_id).await? {
+                    CapabilityGate::NoUpstreams => {
+                        // Correct behaviour for a tenant with no
+                        // upstreams configured — but it MUST be
+                        // countable. Every skip in the substitution
+                        // pipeline degrades to "build it from source"
+                        // at the scheduler, and a skip that leaves no
+                        // trace is indistinguishable from "the
+                        // upstream really doesn't have it"
+                        // (2026-05-23: hours of builder CPU compiling
+                        // cache.nixos.org-cached paths because every
+                        // no-op branch was silent). debug! not warn! —
+                        // an upstream-less tenant hits this on every
+                        // cache miss; the counter is the alertable
+                        // signal. Counted once per singleflight
+                        // leader, same granularity as
+                        // `result=hit|miss`.
+                        debug!(
+                            tenant = %tenant_id,
+                            path = store_path,
+                            "substitute skipped: tenant has no upstreams configured"
+                        );
+                        metrics::counter!(
+                            "rio_store_substitute_skipped_total",
+                            "reason" => "no_upstreams"
+                        )
+                        .increment(1);
+                        return Ok(None);
+                    }
+                    CapabilityGate::Clientless => {
+                        // Upstreams ARE configured but the reqwest
+                        // client failed to build at startup: the walk
+                        // cannot run, so it cannot confirm ANYTHING —
+                        // least of all a miss. `Ok(None)` here
+                        // laundered the capability fault into a
+                        // definitive NotFound — the merged_bug_044
+                        // class at the capability chokepoint. Err is
+                        // UNCACHED (same law as the all-errored fold:
+                        // nothing was consulted, nothing may be
+                        // remembered). The construction site warned
+                        // once; the counter stays the alertable
+                        // signal.
+                        debug!(
+                            tenant = %tenant_id,
+                            path = store_path,
+                            "substitute failed: no HTTP client (reqwest client build failed at startup)"
+                        );
+                        metrics::counter!(
+                            "rio_store_substitute_skipped_total",
+                            "reason" => "no_http_client"
+                        )
+                        .increment(1);
+                        return Err(SubstituteError::Fetch(
+                            "upstream substitution unavailable: HTTP client failed to build at startup"
+                                .to_string(),
+                        ));
+                    }
+                    CapabilityGate::Ready { http, upstreams } => (http, upstreams),
                 };
                 // r[impl store.substitute.admission+2]
                 // Leader-only permit: this init future runs ONCE per
@@ -1514,25 +1571,39 @@ impl Substituter {
         use futures_util::StreamExt;
 
         let started = std::time::Instant::now();
-        let Some(http) = &self.http else {
-            // No client = the probe cannot classify ANY path. The old
-            // `default()` answer put every path in "confirmed miss"
-            // (in neither hits nor indeterminate) — the same
-            // capability-fault laundering as the try_substitute arm.
-            // All-indeterminate keeps the scheduler optimistic per the
-            // probe-polarity law.
-            return Ok(CheckAvailableResult {
-                indeterminate: paths.to_vec(),
-                ..CheckAvailableResult::default()
-            });
+        // Capability gate — the SAME helper (and therefore the SAME
+        // check ordering: upstreams first, client second) as the
+        // attempt leg (merged_bug_030; pre-fix this leg tested the
+        // client first, so an upstream-less tenant on a clientless
+        // replica got all-indeterminate here while the attempt leg
+        // answered CleanMiss — Failed{Fetch} → ChargeInfra for jobs
+        // that should settle confirmed-miss).
+        let (http, upstreams) = match self.capability_gate(tenant_id).await? {
+            CapabilityGate::NoUpstreams => {
+                // Nothing to consult — the clean no-op, congruent with
+                // the attempt leg's Ok(None).
+                return Ok(CheckAvailableResult::default());
+            }
+            CapabilityGate::Clientless => {
+                // Upstreams configured, no client: the probe cannot
+                // classify ANY path. The old `default()` answer put
+                // every path in "confirmed miss" (in neither hits nor
+                // indeterminate) — capability-fault laundering.
+                // All-indeterminate keeps the scheduler optimistic per
+                // the probe-polarity law.
+                return Ok(CheckAvailableResult {
+                    indeterminate: paths.to_vec(),
+                    ..CheckAvailableResult::default()
+                });
+            }
+            CapabilityGate::Ready { http, upstreams } => (http, upstreams),
         };
-        let upstreams = metadata::upstreams::list_for_tenant(&self.pool, tenant_id).await?;
         debug!(
             n_upstreams = upstreams.len(),
             n_paths = paths.len(),
             "check_available"
         );
-        if upstreams.is_empty() || paths.is_empty() {
+        if paths.is_empty() {
             return Ok(CheckAvailableResult::default());
         }
 
@@ -3107,6 +3178,50 @@ mod tests {
              keys={:?}",
             rec.all_keys()
         );
+    }
+
+    /// merged_bug_030: the capability gate's ordering law is shared by
+    /// BOTH legs — upstreams-empty FIRST, clientless SECOND. An
+    /// upstream-less tenant on a clientless replica is a clean no-op
+    /// on the attempt leg (`Ok(None)`); the probe leg must agree
+    /// (empty result — nothing to consult), NOT all-indeterminate
+    /// (which the executor's probe fold charges as Fetch). Pre-fix,
+    /// `check_available` tested the client before the upstream list —
+    /// opposite of `try_substitute_inner` — so the same
+    /// (tenant, replica) state answered CleanMiss on one leg and
+    /// Failed{Fetch}→ChargeInfra on the other, parking jobs that
+    /// should settle confirmed-miss.
+    #[tokio::test]
+    async fn check_available_clientless_without_upstreams_is_clean_empty() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "probe-no-upstreams-no-http").await;
+        // NO upstreams configured; clientless replica.
+        let mut sub = test_substituter(db.pool.clone());
+        sub.http = None;
+        let (path, _) = make_path();
+
+        // Attempt leg: clean no-op (upstreams-first — established).
+        let attempt = sub.try_substitute(tid, &path).await;
+        assert!(
+            matches!(attempt, Ok(None)),
+            "attempt leg: upstream-less tenant is a clean miss even \
+             clientless, got {attempt:?}"
+        );
+
+        // Probe leg MUST agree: empty result, not all-indeterminate.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let probe = sub
+            .check_available(tid, std::slice::from_ref(&path), deadline)
+            .await
+            .unwrap();
+        assert!(
+            probe.indeterminate.is_empty(),
+            "probe leg must agree with the attempt leg's clean no-op \
+             for an upstream-less tenant on a clientless replica; got \
+             indeterminate={:?}",
+            probe.indeterminate
+        );
+        assert!(probe.hits.is_empty() && probe.rate_limited.is_empty());
     }
 
     // r[verify store.substitute.probe-429-retry+3]
