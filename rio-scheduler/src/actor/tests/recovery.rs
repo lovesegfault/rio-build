@@ -291,7 +291,7 @@ async fn test_recovery_transitive_failed_dep_persisted() -> TestResult {
 /// floored load-failure path is pinned by
 /// `test_recovery_load_failure_claims_then_steps_down`.
 // r[verify sched.recovery.gate-dispatch]
-// r[verify sched.recovery.step-down]
+// r[verify sched.recovery.step-down+2]
 #[tokio::test]
 async fn test_recovery_failure_steps_down_never_serves() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -336,12 +336,16 @@ async fn test_recovery_failure_steps_down_never_serves() -> TestResult {
          an empty-but-serving leader destroys recovered state)"
     );
     assert!(
-        leader.step_down_requested(),
+        leader.step_down_pending(),
         "a failed-recovery tenure requests a cooperative step-down"
     );
     assert!(
-        !leader.step_down_requested(),
-        "the request is consume-once (the loop-tick swap)"
+        leader.take_step_down_request(leader.acquired_transitions()),
+        "the request serves against the tenure that issued it"
+    );
+    assert!(
+        !leader.step_down_pending(),
+        "the request is consume-once (the loop-tick take)"
     );
     assert_eq!(
         leader.generation(),
@@ -1398,7 +1402,7 @@ async fn test_recovery_confirmed_bump_seeds_and_completes() -> TestResult {
 /// already moved).
 // r[verify sched.lease.generation-claim+2]
 // r[verify sched.recovery.bump-confirm+3]
-// r[verify sched.recovery.step-down]
+// r[verify sched.recovery.step-down+2]
 #[tokio::test]
 async fn test_recovery_load_failure_claims_then_steps_down() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -1459,7 +1463,7 @@ async fn test_recovery_load_failure_claims_then_steps_down() -> TestResult {
          (sched.recovery.step-down)"
     );
     assert!(
-        leader.step_down_requested(),
+        leader.step_down_pending(),
         "the failed tenure requests a cooperative step-down"
     );
     assert_eq!(

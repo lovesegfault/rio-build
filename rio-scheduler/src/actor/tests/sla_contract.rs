@@ -3758,7 +3758,7 @@ async fn leader_lost_writes_cost_latch_false() {
 }
 
 /// The paired-hook table is total: every edge has BOTH cells written
-// r[verify sched.lease.rebound+3]
+// r[verify sched.lease.rebound+4]
 /// merged_bug_212: a REBOUND transition (holder change observed late on
 /// a still-leading round) must run the Compound lose cells — the cost
 /// latch in particular — before its re-acquire effects. Pre-fix the

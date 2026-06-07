@@ -479,17 +479,27 @@ pub struct LeaderState {
     /// `Instant` is 16B; reads are on a slow admin path,
     /// acquire/lose are rare.
     became_leader_at: Arc<parking_lot::RwLock<Option<Instant>>>,
-    /// Cooperative step-down request (`sched.recovery.step-down`):
-    /// set by a consumer that cannot serve its tenure (failed
-    /// recovery), consumed (swap-false) by the lease loop at its next
-    /// tick, which then releases the lease and fires the full
-    /// lose-edge effects before resuming candidacy on the following
-    /// tick. In deployments with no lease loop (`always_leader`) the
-    /// request is a recorded dead letter — there is no healthy peer a
-    /// step-down could yield to; the operator signal is the
-    /// recovery-failure counter/alert.
-    step_down: Arc<AtomicBool>,
+    /// Cooperative step-down request (`sched.recovery.step-down`),
+    /// tenure-stamped: holds the `acquired_transitions` value of the
+    /// tenure that issued the request, or [`STEP_DOWN_NONE`] when no
+    /// request is pending. The lease loop consumes it at its next
+    /// BELIEVING tick and only when the stamp still names the current
+    /// tenure — a request from an ended tenure is dropped, never served
+    /// against its successor (the `recovery_completed_for` pattern: a
+    /// cross-task leadership signal carries the tenure that issued it).
+    /// A tick on which this replica does not believe it leads leaves
+    /// the request armed. In deployments with no lease loop
+    /// (`always_leader`) the request is a recorded dead letter — there
+    /// is no healthy peer a step-down could yield to; the operator
+    /// signal is the recovery-failure counter/alert.
+    step_down_for: Arc<AtomicU64>,
 }
+
+/// Sentinel for "no step-down request pending" in
+/// [`LeaderState::step_down_for`]. `u64::MAX` can never collide with a
+/// real tenure: `acquired_transitions` derives from the Lease's
+/// `leaseTransitions`, an `i32` clamped at 0 — bounded far below.
+const STEP_DOWN_NONE: u64 = u64::MAX;
 
 impl Default for LeaderState {
     /// Non-K8s/test default: leader immediately, generation = 1,
@@ -664,26 +674,68 @@ impl LeaderState {
         self.generation.fetch_max(target, Ordering::Release)
     }
 
-    /// Request a cooperative step-down (`sched.recovery.step-down`):
-    /// sets an internal flag consumed at the next election-loop tick.
-    /// The loop releases the lease (holder-guarded, bounded by the
-    /// renew deadline), runs the full lose-edge effects
-    /// (`on_lose` + the consumer hook + leader-marks reconciliation),
-    /// then resumes candidacy on the following tick. The durable
-    /// generation claim is NOT released — an unserved claim is a
-    /// documented harmless over-claim (the floor only grows). With no
-    /// lease loop (`always_leader` deployments) the request is a dead
-    /// letter: the tenure stays incomplete and the operator signal is
-    /// the caller's failure counter.
-    pub fn request_step_down(&self) {
-        self.step_down.store(true, Ordering::Release);
+    /// Request a cooperative step-down (`sched.recovery.step-down`)
+    /// on behalf of the tenure identified by `for_transitions` — the
+    /// `acquired_transitions` value the requesting consumer recorded
+    /// at its tenure's entry. The loop serves the request at its next
+    /// believing tick IF that tenure is still current: it releases the
+    /// lease (holder-guarded, bounded by the renew deadline), runs the
+    /// full lose-edge effects (`on_lose` + the consumer hook +
+    /// leader-marks reconciliation), then resumes candidacy on the
+    /// following tick. A request whose tenure has ended by service
+    /// time is dropped — its issuer no longer exists and the successor
+    /// tenure never asked to step down. The durable generation claim
+    /// is NOT released — an unserved claim is a documented harmless
+    /// over-claim (the floor only grows). With no lease loop
+    /// (`always_leader` deployments) the request is a dead letter: the
+    /// tenure stays incomplete and the operator signal is the caller's
+    /// failure counter.
+    pub fn request_step_down(&self, for_transitions: u64) {
+        self.step_down_for.store(for_transitions, Ordering::Release);
     }
 
-    /// Consume a pending step-down request (the loop-tick check):
-    /// returns `true` at most once per request. Acquire/swap-false so
-    /// a request is never double-served and never lost.
-    pub fn step_down_requested(&self) -> bool {
-        self.step_down.swap(false, Ordering::AcqRel)
+    /// Consume a pending step-down request at a believing loop tick.
+    /// Returns `true` — serve the step-down — only when the pending
+    /// request's tenure stamp equals `current_tenure`. A stale stamp
+    /// (its tenure ended; a rebound or re-acquire installed a
+    /// successor) is cleared and dropped with a warning. `false` with
+    /// no request pending is the steady state. Never called on a
+    /// disbelieving tick — the caller guards on belief FIRST, so a
+    /// self-fence at the tick top leaves the request armed for the
+    /// next believing tick ("never lost" for the tenure that asked).
+    pub fn take_step_down_request(&self, current_tenure: u64) -> bool {
+        let pending = self.step_down_for.load(Ordering::Acquire);
+        if pending == STEP_DOWN_NONE {
+            return false;
+        }
+        // compare_exchange, not swap: a racing re-request for a newer
+        // tenure must never be clobbered by this consume.
+        if self
+            .step_down_for
+            .compare_exchange(pending, STEP_DOWN_NONE, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            // A racer replaced the request between load and consume;
+            // the next tick re-evaluates the fresh one.
+            return false;
+        }
+        if pending == current_tenure {
+            return true;
+        }
+        warn!(
+            requested_for = pending,
+            current_tenure,
+            "dropping a stale step-down request — the tenure that issued it has ended \
+             and its successor never asked to step down"
+        );
+        false
+    }
+
+    /// Is a step-down request pending (non-consuming)? Observability
+    /// and tests only — the loop consumes through
+    /// [`take_step_down_request`](Self::take_step_down_request).
+    pub fn step_down_pending(&self) -> bool {
+        self.step_down_for.load(Ordering::Acquire) != STEP_DOWN_NONE
     }
 
     /// Construct from pre-existing shared Arcs plus the initial
@@ -716,7 +768,7 @@ impl LeaderState {
             renew_rounds_started: Arc::new(AtomicU64::new(0)),
             last_leading_round: Arc::new(AtomicU64::new(0)),
             became_leader_at: Arc::new(parking_lot::RwLock::new(became_leader_at)),
-            step_down: Arc::new(AtomicBool::new(false)),
+            step_down_for: Arc::new(AtomicU64::new(STEP_DOWN_NONE)),
         }
     }
 
@@ -742,7 +794,7 @@ impl LeaderState {
             // forever (which the controller treats as "young leader,
             // fail-closed").
             became_leader_at: Arc::new(parking_lot::RwLock::new(Some(Instant::now()))),
-            step_down: Arc::new(AtomicBool::new(false)),
+            step_down_for: Arc::new(AtomicU64::new(STEP_DOWN_NONE)),
         }
     }
 
@@ -763,7 +815,7 @@ impl LeaderState {
             renew_rounds_started: Arc::new(AtomicU64::new(0)),
             last_leading_round: Arc::new(AtomicU64::new(0)),
             became_leader_at: Arc::new(parking_lot::RwLock::new(None)),
-            step_down: Arc::new(AtomicBool::new(false)),
+            step_down_for: Arc::new(AtomicU64::new(STEP_DOWN_NONE)),
         }
     }
 
@@ -897,7 +949,7 @@ impl LeaderState {
     /// on the recorded one — is undetectable here by construction; that
     /// residual is priced at the recovery gate's entry-snapshot comment
     /// in rio-scheduler.
-    // r[impl sched.lease.rebound+3]
+    // r[impl sched.lease.rebound+4]
     // r[impl sched.lease.generation-fence+3]
     pub fn on_rebound(&self, lease_transitions: u64) -> u64 {
         self.recovery_completed_for
@@ -1015,6 +1067,65 @@ pub async fn run_lease_loop<H: LeaseHooks>(
 /// across host suspend); paused-clock tests pass a tokio-Instant-anchored
 /// closure so the measurement follows the virtual clock; the fence-jump
 /// test adds a controlled offset to simulate suspend.
+/// THE observe-completed-read body for a held lease while believing
+/// (`sched.lease.rebound`): every consumer of completed-read facts that
+/// keeps believing routes through here — the Leading renew round AND
+/// the own-commit evidence arm — so the transitions-vs-recorded rebound
+/// comparison is structurally fused to recording the believed-held
+/// observation. A consumer cannot record one without running the other:
+/// this function is the only API that does either, which is what makes
+/// "a sibling consumer of the same facts skipped the rebound law"
+/// unwritable rather than merely reviewed-for.
+///
+/// The rebound rationale (hoisted from the Completed arm, where it
+/// applies identically): steady state is `observed_transitions ==
+/// recorded` — renews never bump the count, and a foreign holder still
+/// present at the next successful round resolves through the lose edge
+/// instead — so an unequal value here means a holder change (foreign
+/// term + vacate, or delete/recreate) landed entirely inside our
+/// observation gap. Synthesize the missing transition: re-derive local
+/// state and re-fire the rebound hook so the consumer re-runs recovery
+/// against the post-term state. Deliberately NO `on_lose()`: a
+/// synthesized lose would force a pointless wipe of state the
+/// immediately-following re-recovery rebuilds, while `on_rebound`'s own
+/// `recovery_complete` clear already gates dispatch during the
+/// re-recovery. The leader MARKS, by contrast, MUST be re-dirtied: a
+/// moved count means a foreign term ran to completion inside the gap,
+/// and a foreign holder's reconcile GUARANTEES a sweep stripped our
+/// label and zeroed our cost. The count-coincidence ABA (the observed
+/// value lands back exactly on the recorded one) remains the accepted
+/// residual, bounded for the marks half by the periodic verify
+/// (`sched.lease.marks-verify`). Equal counts stay a silent no-op (a
+/// log every 5s would be noisy).
+// r[impl sched.lease.rebound+4]
+fn observe_held_while_believing<H: LeaseHooks>(
+    state: &LeaderState,
+    standing: &mut LeaseStanding,
+    marks_dirty: &DirtyGen,
+    hooks: &H,
+    holder_id: &str,
+    observed_transitions: u64,
+) {
+    let recorded = state.acquired_transitions();
+    if observed_transitions != recorded {
+        // The rebound re-dirty: a guaranteed-foreign-sweep falsifier
+        // handled at its edge; the verify pass bounds the rest.
+        marks_dirty.mark();
+        let new_gen = state.on_rebound(observed_transitions);
+        warn!(
+            recorded,
+            observed = observed_transitions,
+            generation = new_gen,
+            holder = %holder_id,
+            "lease transition count moved while still leading — \
+             unobserved holder change inside our observation gap; \
+             re-running recovery"
+        );
+        hooks.on_rebound();
+    }
+    standing.on_observed(true);
+}
+
 pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
     client: kube::Client,
     cfg: LeaseConfig,
@@ -1126,12 +1237,18 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
             hooks.on_lose();
         }
 
-        // r[impl sched.recovery.step-down]
+        // r[impl sched.recovery.step-down+2]
         // Cooperative step-down: a
         // consumer that cannot serve its tenure (failed recovery)
-        // requested a local demotion; consume it here — at most one
-        // service per request — and only act while still believing
-        // (a lose/self-fence that landed first already ran the edge).
+        // requested a local demotion. Belief is evaluated FIRST and the
+        // request is consumed only inside a believing tick — a
+        // lose/self-fence that landed at the tick top leaves the
+        // request ARMED for the next believing tick instead of eating
+        // it (the false-alarm fence + same-epoch re-acquire pair must
+        // not lose the request). Consumption is tenure-keyed:
+        // `take_step_down_request` serves the request only when its
+        // stamp names the CURRENT tenure and drops a stale one — a
+        // rebound/re-acquire successor never asked to step down.
         // The release is holder-guarded and 409/404-tolerant like the
         // shutdown release; on success the round observably resolved
         // not-leading (standing.on_observed(false)); on failure the
@@ -1140,7 +1257,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
         // releases. Either way the full lose-edge effects run
         // (state, hook, marks) and the NEXT tick resumes candidacy —
         // try_acquire_or_renew steals/acquires normally.
-        if state.step_down_requested() && standing.believes() {
+        if standing.believes() && state.take_step_down_request(state.acquired_transitions()) {
             warn!(
                 holder = %cfg.holder_id,
                 "cooperative step-down requested (tenure cannot serve); releasing the lease"
@@ -1266,6 +1383,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                         // recovery-completion gate lets the loop keep
                         // renewing regardless.
                         hooks.on_acquire();
+                        standing.on_observed(true);
                     }
                     (None, true) => {
                         // ---- Lose transition ----
@@ -1302,75 +1420,29 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                         // reconcile arm after the edge match patches
                         // this tick.
                         marks_dirty.mark();
+                        standing.on_observed(false);
                     }
                     (Some(transitions), true) => {
                         // ---- Still leading ----
-                        // Steady state is transitions == the count
-                        // recorded at our last acquire edge or rebound:
-                        // renews never bump the count, and a foreign
-                        // holder still present at our next successful
-                        // round resolves through the lose edge instead —
-                        // so an unequal value here means a holder change
-                        // (foreign term + vacate, or delete/recreate)
-                        // landed entirely inside our observation gap.
-                        // Synthesize the missing transition: re-derive
-                        // local state and re-fire the acquire hook so
-                        // the consumer re-runs recovery against the
-                        // post-term state. Deliberately NO on_lose():
-                        // a synthesized lose would force a pointless
-                        // wipe of state the immediately-following
-                        // re-recovery rebuilds and (if the full lose
-                        // edge were synthesized) an is_leader=false
-                        // blip, while adding nothing to dispatch
-                        // gating — on_rebound's own recovery_complete
-                        // clear already gates dispatch during the
-                        // re-recovery. Hook delivery is ordered
-                        // (sched.lease.hook-order), so skipping the
-                        // lose is about avoiding wasted work, not a
-                        // reordering hazard. The leader MARKS, by
-                        // contrast, MUST be re-dirtied: a moved
-                        // transition count means a foreign term ran to
-                        // completion inside our observation gap, and a
-                        // foreign holder's reconcile GUARANTEES a sweep
-                        // stripped our label and zeroed our cost — the
-                        // polarity we *want* is unchanged, but the
-                        // stored marks are gone. Re-dirtying costs one
-                        // no-op PATCH in the (unreachable-in-practice)
-                        // case the marks survived. The count-
-                        // coincidence ABA (the observed value lands
-                        // back exactly on the recorded one) remains the
-                        // accepted residual — see the recovery gate's
-                        // entry-snapshot comment in rio-scheduler; for
-                        // the marks half it is additionally bounded by
-                        // the periodic verify (sched.lease.marks-
-                        // verify). Equal counts stay a silent no-op (a
-                        // log every 5s would be noisy).
-                        // r[impl sched.lease.rebound+3]
-                        let recorded = state.acquired_transitions();
-                        if transitions != recorded {
-                            // The rebound re-dirty: a guaranteed-
-                            // foreign-sweep falsifier handled at its
-                            // edge; the verify pass bounds the rest.
-                            marks_dirty.mark();
-                            let new_gen = state.on_rebound(transitions);
-                            warn!(
-                                recorded,
-                                observed = transitions,
-                                generation = new_gen,
-                                holder = %cfg.holder_id,
-                                "lease transition count moved while still leading — \
-                                 unobserved holder change inside our observation gap; \
-                                 re-running recovery"
-                            );
-                            hooks.on_rebound();
-                        }
+                        // THE observe-completed-read body: the rebound
+                        // comparison and the believed-held observation
+                        // are one fused operation (see the funnel's doc
+                        // for the full rationale).
+                        observe_held_while_believing(
+                            &state,
+                            &mut standing,
+                            &marks_dirty,
+                            &hooks,
+                            &cfg.holder_id,
+                            transitions,
+                        );
                     }
                     // Steady state: still standby while someone else
                     // holds. No log — 5s interval would be noisy.
-                    (None, false) => {}
+                    (None, false) => {
+                        standing.on_observed(false);
+                    }
                 }
-
-                standing.on_observed(now_leading);
                 // r[impl sched.recovery.bump-confirm+3]
                 // Confirm AFTER the edge-detection match: when an
                 // acquire edge and a confirmation land in the same
@@ -1496,10 +1568,34 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                             );
                             marks_dirty.mark();
                             hooks.on_acquire();
+                            // Counts as a Leading observation: the read
+                            // is apiserver-authoritative about the hold.
+                            // The rebound comparison is vacuous on this
+                            // leg — on_acquire just recorded the fetched
+                            // count.
+                            standing.on_observed(true);
+                        } else {
+                            // Still believing: this is a completed read
+                            // of a lease we hold — the SAME facts the
+                            // Leading renew round consumes, so it routes
+                            // through the SAME observe-completed-read
+                            // body. A foreign term that completed inside
+                            // the observation gap (moved count) rebounds
+                            // here exactly as it would on a Completed
+                            // round; pre-fix this leg skipped the
+                            // comparison and the term was never repaired
+                            // (no round Completes in the reads-complete/
+                            // acts-fail regime, and the evidence
+                            // re-stamps defeat the self-fence).
+                            observe_held_while_believing(
+                                &state,
+                                &mut standing,
+                                &marks_dirty,
+                                &hooks,
+                                &cfg.holder_id,
+                                f.transitions,
+                            );
                         }
-                        // Counts as a Leading observation: the read is
-                        // apiserver-authoritative about the hold.
-                        standing.on_observed(true);
                     }
                     last_fetched_rv = Some(f.resource_version.clone());
                 } else {
@@ -1937,7 +2033,7 @@ mod dirty_gen_proofs {
 
     const MAX_EVENTS: usize = 8;
 
-    /// r[verify sched.lease.rebound+3]
+    /// r[verify sched.lease.rebound+4]
     /// For every event sequence (mark / snapshot / clear-through-last-
     /// snapshot), after any clear: if a mark happened after the
     /// snapshot that clear used, the flag is still dirty.
@@ -2779,7 +2875,7 @@ mod tests {
     /// in-flight recovery result is still valid — that is the recovery
     /// gate's documented keep case, preserved by keying on the epoch
     /// rather than a session counter.
-    // r[verify sched.lease.rebound+3]
+    // r[verify sched.lease.rebound+4]
     #[test]
     fn stale_completion_does_not_override_rebound_clear() {
         let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
@@ -2866,7 +2962,7 @@ mod tests {
     /// generation via `fetch_max` (a no-op in the saturated regime),
     /// clears `recovery_complete` so recovery re-runs, refreshes
     /// `leader_for()`, and never touches `is_leader`.
-    // r[verify sched.lease.rebound+3]
+    // r[verify sched.lease.rebound+4]
     #[test]
     fn on_rebound_records_count_and_reruns_recovery() {
         let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
@@ -3497,7 +3593,7 @@ mod tests {
     /// site this test stands in for is the rebound arm's re-dirty in
     /// `run_lease_loop_with_client` (the `transitions != recorded`
     /// branch).
-    // r[verify sched.lease.rebound+3]
+    // r[verify sched.lease.rebound+4]
     // r[verify sched.lease.deletion-cost+3]
     #[tokio::test]
     async fn rebound_redirty_survives_inflight_reconcile_clear() {
@@ -3660,6 +3756,99 @@ mod tests {
         shutdown.cancel();
         // Graceful-release leg: answer its GET with a 404 so the loop
         // exits cleanly (no lease to release).
+        if let Some(req) = park.try_next().await {
+            req.respond_status(404, "NotFound", "gone");
+        }
+        loop_task.await.expect("lease loop exits");
+    }
+
+    /// The own-commit evidence arm consumes the SAME completed-read
+    /// facts as the Leading renew round — including the transition
+    /// count — so its still-believing leg must run the SAME rebound
+    /// law (`sched.lease.rebound`): a foreign term that completed
+    /// entirely inside the observation gap (moved count, holder back
+    /// to us) re-derives the generation, clears recovery_complete, and
+    /// fires the rebound hook. Pre-fix the leg only stamped the blind
+    /// clock and recorded the observation: in the reads-complete/
+    /// acts-fail regime the evidence re-stamps defeated the self-fence
+    /// and no round ever Completed, so the foreign term was NEVER
+    /// repaired — recovery_complete stayed true against PG state the
+    /// term mutated, indefinitely.
+    // r[verify sched.lease.rebound+4]
+    #[tokio::test(start_paused = true)]
+    async fn evidence_arm_rebounds_on_moved_count_while_believing() {
+        let (client, mut park) = RequestPark::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        // Healthy acquire round at transitions=3.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 10));
+        let put = park.next().await;
+        put.respond_ok(park_lease_json(Some("us"), 3, 11));
+        settle().await;
+        assert!(state.is_leader(), "healthy round acquires");
+        let gen_at_acquire = state.generation();
+        // Settle the init-dirty marks reconcile so the parked queue
+        // carries lease traffic only.
+        let patch = park.next().await;
+        patch.respond_ok(pod_ok("us"));
+        settle().await;
+
+        // Mid-band round A: read completes (content unchanged), the
+        // write is abandoned — the unconfirmed-write ledger is minted.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 11));
+        let put = park.next().await;
+        drop(put);
+        settle().await;
+
+        // Mid-band round B: the read completes with the rv moved AND
+        // the transition count moved — a foreign term ran to completion
+        // entirely inside our observation gap and the lease came back
+        // to us. The evidence arm consumes the ledger (we stay leader)
+        // and its believing leg MUST rebound.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 9, 12));
+        let put = park.next().await;
+        drop(put);
+        settle().await;
+
+        assert!(state.is_leader(), "evidence keeps the leader leading");
+        assert_eq!(
+            hooks.rebounds.lock().expect("rebounds").len(),
+            1,
+            "the evidence arm's believing leg must run the rebound law on a moved count"
+        );
+        assert_eq!(
+            state.generation(),
+            gen_at_acquire + 6,
+            "the rebound re-derives the generation from the moved count (3 -> 9)"
+        );
+        assert!(
+            !state.recovery_complete(),
+            "the rebound clears recovery_complete so recovery re-runs against post-term state"
+        );
+
+        shutdown.cancel();
         if let Some(req) = park.try_next().await {
             req.respond_status(404, "NotFound", "gone");
         }
@@ -4164,7 +4353,7 @@ mod tests {
     /// hook delivered) — and the FOLLOWING tick resumes candidacy and
     /// re-acquires. Pre-fix there was no such API: a broken tenure
     /// held the lease until a real lose/fence, serving nothing.
-    // r[verify sched.recovery.step-down]
+    // r[verify sched.recovery.step-down+2]
     #[tokio::test(start_paused = true)]
     async fn step_down_consumed_within_one_tick_then_candidacy_resumes() {
         let (client, _mock) = MockApiServer::new();
@@ -4200,9 +4389,10 @@ mod tests {
         assert!(observer.is_leader(), "leading after the first tick");
 
         // The consumer (e.g. a failed recovery) requests a step-down
-        // mid-tenure. Nothing happens until the next tick — the
-        // request is a flag, not a reentrant call.
-        observer.request_step_down();
+        // mid-tenure, stamped with the tenure it serves. Nothing
+        // happens until the next tick — the request is a stamped cell,
+        // not a reentrant call.
+        observer.request_step_down(observer.acquired_transitions());
         assert!(observer.is_leader(), "request alone demotes nothing");
 
         // +5s tick: the request is consumed — release + full
@@ -4217,8 +4407,8 @@ mod tests {
         );
         assert!(!observer.is_leader(), "leader state cleared on step-down");
         assert!(
-            !observer.step_down_requested(),
-            "consume-once: the loop's swap leaves no residue"
+            !observer.step_down_pending(),
+            "consume-once: the loop's take leaves no residue"
         );
 
         // +10s tick: candidacy resumed — the loop re-acquires the
@@ -4231,6 +4421,174 @@ mod tests {
             "candidacy resumes on the following tick (re-acquire)"
         );
         assert!(observer.is_leader(), "leading again after re-acquire");
+
+        shutdown.cancel();
+        loop_task.await.expect("lease loop task exits cleanly");
+    }
+
+    /// A step-down request carries the tenure that issued it and is
+    /// dropped — never served — once that tenure has ended. Pre-fix the
+    /// request was a bare flag: a tenure-N failure request lingered and
+    /// demoted the healthy successor tenure N+1 that a rebound had just
+    /// installed (the request's issuer no longer exists; the successor
+    /// never asked to step down).
+    // r[verify sched.recovery.step-down+2]
+    #[tokio::test(start_paused = true)]
+    async fn stale_tenure_step_down_request_cannot_demote_a_rebounded_tenure() {
+        let (client, mock) = MockApiServer::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let observer = state.clone();
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state,
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        // t=0: acquire via the create path — tenure = transitions 0.
+        settle().await;
+        assert!(observer.is_leader(), "t=0 acquire");
+        let tenure_at_entry = observer.acquired_transitions();
+
+        // A foreign term completes entirely inside the observation gap:
+        // the lease comes back to us with the transition count bumped.
+        // The next tick rebounds to the successor tenure.
+        let rv: u64 = mock
+            .resource_version()
+            .expect("lease exists")
+            .parse()
+            .expect("numeric rv");
+        mock.seed(serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "rio-sched", "namespace": "default",
+                          "resourceVersion": (rv + 1).to_string() },
+            "spec": { "holderIdentity": "us", "leaseTransitions": 7 },
+        }));
+        tokio::time::advance(RENEW_INTERVAL).await;
+        settle().await;
+        assert_eq!(
+            hooks.rebounds.lock().expect("rebounds").len(),
+            1,
+            "the moved count rebounds to the successor tenure"
+        );
+
+        // The DEAD tenure's failed recovery requests a step-down — for
+        // the tenure it was serving, which has since ended.
+        observer.request_step_down(tenure_at_entry);
+
+        // The request must be dropped, not served against the healthy
+        // successor.
+        tokio::time::advance(RENEW_INTERVAL).await;
+        settle().await;
+        assert!(
+            observer.is_leader(),
+            "a stale-tenure step-down request must not demote the healthy successor tenure"
+        );
+        assert_eq!(
+            hooks.loses.lock().expect("loses").len(),
+            0,
+            "no lose-edge runs for a dropped stale request"
+        );
+        assert!(
+            !observer.step_down_pending(),
+            "the stale request is cleared, not left to linger"
+        );
+
+        shutdown.cancel();
+        loop_task.await.expect("lease loop task exits cleanly");
+    }
+
+    /// A pending step-down request survives a tick on which this
+    /// replica does not believe it leads, and is served at the next
+    /// believing tick of the SAME tenure. Pre-fix the loop's guard
+    /// consumed the flag before evaluating belief: a self-fence false
+    /// alarm at the tick top (local only — no apiserver write) silently
+    /// ate the request, the same-epoch re-acquire restored belief, and
+    /// the lease was never released — contradicting the accessor's
+    /// "never lost" contract.
+    // r[verify sched.recovery.step-down+2]
+    #[tokio::test(start_paused = true)]
+    async fn step_down_request_survives_a_self_fence_and_serves_after_reacquire() {
+        let (client, mock) = MockApiServer::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let observer = state.clone();
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let jump_ms = Arc::new(AtomicU64::new(0));
+        let fence_now = {
+            let a = Instant::now();
+            let jump_ms = jump_ms.clone();
+            move || a.elapsed() + Duration::from_millis(jump_ms.load(Ordering::SeqCst))
+        };
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state,
+            hooks.clone(),
+            shutdown.clone(),
+            fence_now,
+        ));
+
+        // t=0: acquire (create path, tenure 0).
+        settle().await;
+        assert!(observer.is_leader(), "t=0 acquire");
+
+        // The tenure's recovery fails and requests the step-down...
+        observer.request_step_down(observer.acquired_transitions());
+
+        // ...but before the next tick a fence-clock jump (false alarm:
+        // local only, the apiserver is healthy throughout) fences at the
+        // tick top. The same tick's renew succeeds and re-acquires the
+        // SAME tenure. The pending request must survive the disbelieving
+        // window.
+        jump_ms.store(12_000, Ordering::SeqCst);
+        tokio::time::advance(RENEW_INTERVAL).await;
+        settle().await;
+        assert_eq!(
+            hooks.loses.lock().expect("loses").len(),
+            1,
+            "the false-alarm fence runs its lose edge"
+        );
+        assert_eq!(
+            hooks.acquires.lock().expect("acquires").len(),
+            2,
+            "the same tick's successful renew re-acquires (same-epoch re-claim)"
+        );
+
+        // Next believing tick: the surviving request is served — lease
+        // released, full lose-edge effects.
+        tokio::time::advance(RENEW_INTERVAL).await;
+        settle().await;
+        assert_eq!(
+            mock.holder(),
+            None,
+            "the surviving step-down request releases the lease at the next believing tick"
+        );
+        assert_eq!(
+            hooks.loses.lock().expect("loses").len(),
+            2,
+            "the step-down service runs its own lose edge"
+        );
 
         shutdown.cancel();
         loop_task.await.expect("lease loop task exits cleanly");
@@ -4326,7 +4684,7 @@ mod tests {
     /// arm stored nothing ("leadership polarity is unchanged") and the
     /// label stayed missing until the next leadership transition — a
     /// dashboard outage with no bound.
-    // r[verify sched.lease.rebound+3]
+    // r[verify sched.lease.rebound+4]
     #[tokio::test(start_paused = true)]
     async fn rebound_marks_leader_marks_dirty() {
         let (client, mock) = MockApiServer::new();
@@ -5000,7 +5358,7 @@ mod tests {
     /// value is equally undetectable — that count coincidence is the
     /// accepted residual (see the recovery gate's entry-snapshot comment
     /// in rio-scheduler).
-    // r[verify sched.lease.rebound+3]
+    // r[verify sched.lease.rebound+4]
     #[tokio::test(start_paused = true)]
     async fn still_leading_rounds_rebound_on_moved_transition_count() {
         let (client, mock) = MockApiServer::new();

@@ -1062,7 +1062,7 @@ impl DagActor {
     /// a build while half-recovered (the DAG would be inconsistent).
     /// MergeDag from a standby-period SubmitBuild would queue in the
     /// mpsc channel and get processed after.
-    // r[impl sched.lease.rebound+3]
+    // r[impl sched.lease.rebound+4]
     /// Handle `LeaderRebound`: a holder change observed late on a
     /// still-leading round (`sched.lease.rebound`). The rebound is a
     /// compressed lose→acquire pair whose standby interval was never
@@ -1849,7 +1849,7 @@ impl DagActor {
 
         let recovered = match result {
             Err(e) => {
-                // r[impl sched.recovery.step-down]
+                // r[impl sched.recovery.step-down+2]
                 // DAG load failed: this tenure NEVER serves. The old
                 // doctrine completed here with an empty DAG ("degrade,
                 // don't block") — a zombie that answered pulls from
@@ -1881,7 +1881,7 @@ impl DagActor {
                 );
                 self.clear_persisted_state();
                 metrics::counter!("rio_scheduler_recovery_step_down_total").increment(1);
-                self.leader.request_step_down();
+                self.leader.request_step_down(transitions_at_entry);
                 return;
             }
             Ok(witness) => witness,
@@ -1912,7 +1912,7 @@ impl DagActor {
     /// no-op — kept unconditional so there is exactly one seed call
     /// site. Synchronous throughout — the no-awaits-before-
     /// `set_recovery_complete()` INVARIANT at the gen re-check holds.
-    // r[impl sched.recovery.step-down]
+    // r[impl sched.recovery.step-down+2]
     fn complete_tenure(
         &mut self,
         _recovered: RecoveredDag,

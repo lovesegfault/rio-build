@@ -1612,7 +1612,7 @@ rec {
     # rebound delivery skips the lose cell and must falsify).
     # Measured: exhaustive TLC <1s at the wired constants (transcript
     # authoritative) — the default 1800s budget is >1800x headroom.
-    # r[verify sched.lease.rebound+3]
+    # r[verify sched.lease.rebound+4]
     quint-cost-latch = mkQuintCheck {
       name = "cost-latch";
       spec = "costLatch";
@@ -5694,7 +5694,7 @@ rec {
     # r[verify sched.lease.fence-statement-guard]
     # r[verify sched.grpc.fence-retryable]
     # r[verify sched.lease.tenure-stamp-type]
-    # r[verify sched.recovery.step-down]
+    # r[verify sched.recovery.step-down+2]
     # r[verify sched.attempt.cancel-close-driven+1]
     quint-fenced-writes = mkQuintCheck {
       name = "fenced-writes";

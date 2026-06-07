@@ -2587,15 +2587,22 @@ deadline. Non-K8s single-scheduler deployments construct their leader state
 with recovery already complete and never run the lease loop, so no
 confirmation is ever required there.
 
-#r("sched.recovery.step-down")[
+#r("sched.recovery.step-down+2")[
   A tenure whose state recovery fails MUST NOT be completed: the replica
   MUST NOT mark recovery complete, MUST NOT treat its in-memory DAG as
   authoritative, and MUST request a cooperative lease step-down so a healthy
-  replica can acquire. The lease loop MUST consume the step-down request at
-  its next tick, releasing the lease (holder-guarded, bounded by the renew
-  deadline) and firing the full lose-edge effects --- leader-state clear,
-  consumer on-lose hook, leader-marks reconciliation --- before resuming
-  candidacy on the following tick. The durable generation claim recorded for
+  replica can acquire. The step-down request MUST carry the tenure that
+  issued it (its `acquired_transitions` stamp), and the lease loop MUST
+  serve it at its next BELIEVING tick and only while that tenure is still
+  current: service releases the lease (holder-guarded, bounded by the renew
+  deadline) and fires the full lose-edge effects --- leader-state clear,
+  consumer on-lose hook, leader-marks reconciliation --- before candidacy
+  resumes on the following tick. A tick on which the replica does not
+  believe it leads MUST leave the request armed (a self-fence false alarm
+  followed by a same-epoch re-acquire must not lose it), and a request
+  whose tenure has ended by service time MUST be dropped, never served
+  against the successor tenure --- the successor never asked to step down.
+  The durable generation claim recorded for
   the failed tenure is NOT released: the floor only grows, and an unserved
   claim is a harmless over-claim. Failed recoveries MUST be operator-visible
   --- the recovery-failure outcome alertable and every step-down counted.
@@ -3899,15 +3906,21 @@ complete, so the ordering is trivially satisfied there.
   logs a warning and observed-record expiry is the fallback.
 ]
 
-#r("sched.lease.rebound+3")[
-  A renew round that resolves Leading while this replica already believes it
-  leads, but whose observed `leaseTransitions` count differs from the count
+#r("sched.lease.rebound+4")[
+  ANY completed read of a lease this replica holds, observed while it
+  already believes it leads --- a renew round that resolves Leading, or the
+  own-commit evidence consumer on an abandoned write --- whose observed
+  `leaseTransitions` count differs from the count
   recorded at this replica's most recent acquire edge or rebound, MUST be
   treated as a late-observed holder change: the lease loop MUST re-record the
   observed count, re-derive the generation from it via `fetch_max`, clear
   `recovery_complete`, and fire the dedicated rebound hook (`on_rebound`) so
   the consumer runs its declared rebound effects and recovery re-runs against
   the post-change state; `is_leader` MUST NOT be cleared by this transition.
+  Every believing consumer of held-lease read facts MUST route through one
+  shared observe-completed-read body that fuses the comparison to the
+  observation --- a consumer that records the observation without the
+  comparison has no API to call.
   The rebound hook is a REQUIRED member of the hooks contract (no default),
   and each consumer-side leadership-edge effect MUST declare its rebound
   policy explicitly: Compound (lose cell then acquire cell --- the default

@@ -1076,6 +1076,75 @@ in
         touch $out
       '';
 
+  # merged_bug_075: cross-task leadership signals in rio-lease carry the
+  # tenure that issued them (epoch-stamped AtomicU64 — the
+  # recovery_completed_for / step_down_for pattern). A bare AtomicBool
+  # across an acquire/rebound edge is the banned shape: it cannot tell a
+  # request from tenure N apart from one for tenure N+1, which is how a
+  # stale step-down demoted a healthy rebounded successor. The ban is a
+  # MECHANISM, not a comment: every AtomicBool token in the two lease
+  # source files must match the explicit allowlist (the import line, the
+  # is_leader belief flag consumed through the generation protocol, the
+  # marks single-flight in_flight slot — a task mutex, not a leadership
+  # signal — and comment prose). A new bare flag fails this check; a new
+  # legitimate use extends the allowlist in a visible diff.
+  lease-signal-tenure-stamped =
+    pkgs.runCommand "rio-lease-signal-tenure-stamped"
+      {
+        src = pkgs.lib.fileset.toSource {
+          root = ../.;
+          fileset = pkgs.lib.fileset.unions [
+            ../rio-lease/src/lib.rs
+            ../rio-lease/src/election.rs
+          ];
+        };
+        nativeBuildInputs = [ pkgs.ripgrep ];
+      }
+      ''
+        set +o pipefail
+        scan() {
+          local dir=$1
+          local hits
+          # Allowlist: the import line; comment prose; is_leader (the
+          # belief flag consumed through the generation protocol);
+          # in_flight + its SlotRelease drop guard (the marks
+          # single-flight slot — a task mutex, not a leadership signal).
+          hits=$(rg -n 'AtomicBool' "$dir" \
+            | rg -v '^[^:]+:[0-9]+:\s*//' \
+            | rg -v '^[^:]+:[0-9]+:use ' \
+            | rg -v 'is_leader' \
+            | rg -v 'in_flight' \
+            | rg -v 'SlotRelease' \
+            || true)
+          if [[ -n "$hits" ]]; then
+            echo "FAIL: bare AtomicBool in rio-lease outside the allowlist —" >&2
+            echo "cross-task leadership signals must be tenure-stamped AtomicU64" >&2
+            echo "(the recovery_completed_for / step_down_for pattern); a task-local" >&2
+            echo "flag needs an allowlisted identifier or an allowlist extension:" >&2
+            echo "$hits" >&2
+            return 1
+          fi
+        }
+        # Self-test: the planted red (a bare leadership flag) must FAIL;
+        # the green fixture (every allowlisted shape) must PASS — only
+        # then is the scanner trusted on the real tree.
+        mkdir -p "$TMPDIR/red" "$TMPDIR/green"
+        printf '    step_down: Arc<AtomicBool>,\n' > "$TMPDIR/red/lib.rs"
+        {
+          printf 'use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};\n'
+          printf '    is_leader: Arc<AtomicBool>,\n'
+          printf '    let marks_patch_in_flight = Arc::new(AtomicBool::new(false));\n'
+          printf '    // prose mention of AtomicBool in a comment\n'
+        } > "$TMPDIR/green/lib.rs"
+        if scan "$TMPDIR/red" 2>/dev/null; then
+          echo "SELF-TEST FAIL: the planted bare-flag fixture passed" >&2
+          exit 1
+        fi
+        scan "$TMPDIR/green" || { echo "SELF-TEST FAIL: the clean fixture failed" >&2; exit 1; }
+        scan "$src/rio-lease/src"
+        touch $out
+      '';
+
   # merged_bug_016: a backslash-continued string literal re-joined onto
   # one line keeps the continuation's alignment spaces INSIDE the
   # literal — error messages, log lines, SQL, and metric HELP then carry
