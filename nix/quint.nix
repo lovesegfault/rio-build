@@ -3220,6 +3220,68 @@ rec {
       witness = "backlogLeTrueEligible";
     };
 
+    # ── gcDrainPass: the collect pass's COMPLETION law (round 3,
+    # bug_174 + bug_137 + merged_bug_170 — the PassDisposition type:
+    # only CompleteFullScan anchors the cycle; a resumed pass keeps the
+    # decremented backlog because keys at or below its resume point
+    # were never scanned by it). DEDICATED regime per the S7 precedent:
+    # the cursor/disposition axis must not multiply the commit-basis
+    # regime's state space. Measured (TLC exhaustive, MAX_CHUNKS=4,
+    # workers=4): 41,427 generated / 4,260 distinct, [ok] in <1s — the
+    # default 1800s budget is ~1800x the measurement.
+    # r[verify store.gc.completion-witness]
+    quint-gc-drain-pass = mkQuintCheck {
+      name = "gc-drain-pass";
+      spec = "gcCollectState";
+      main = "gcDrainPassMain";
+      invariants = [
+        "zeroAnchorTruthful"
+        "anchoredByFullScanOnly"
+      ];
+    };
+
+    # bug_174's counterexample choreography against the REAL wiring:
+    # reap, cap, below-cursor re-eligibility, resume, drain the tail —
+    # the resumed completion mints DCompleteResumed, anchors nothing,
+    # and the below-cursor eligible survives for the next full pass.
+    # r[verify store.gc.completion-witness]
+    quint-gc-drain-pass-runs = mkQuintRunCheck {
+      name = "gc-drain-pass-runs";
+      spec = "gcCollectState";
+      main = "gcDrainPassMain";
+    };
+
+    # A resumed completion sitting above below-resume-point eligibles
+    # is reachable in the main regime (the twin's falsification below
+    # only means something if the live regime explores that shape).
+    # Measured: [violation] in <1s, TLC exhaustive.
+    quint-gc-drain-pass-witness-resumed-below = mkQuintWitnessCheck {
+      name = "gc-drain-pass-witness-resumed-below";
+      spec = "gcCollectState";
+      main = "gcDrainPassMain";
+      witness = "noResumedCompletionWithBelowEligibles";
+    };
+
+    # CALIBRATION (expect-violation): the pre-fix wiring — a resumed
+    # completion also anchors, from the keys IT scanned. The
+    # truthfulness law falsifies (zero-backlog anchor over unseen
+    # below-cursor eligibles). Measured: [violation] in <1s, TLC.
+    quint-gc-drain-pass-calib-resume-anchors-zero = mkQuintWitnessCheck {
+      name = "gc-drain-pass-calib-resume-anchors-zero";
+      spec = "gcCollectState";
+      main = "gcDrainPassCalibResumeAnchors";
+      witness = "zeroAnchorTruthful";
+    };
+
+    # CALIBRATION (expect-violation): same twin, the minter law — the
+    # anchor minted by a non-full scan. Measured: [violation] in <1s.
+    quint-gc-drain-pass-calib-resume-anchors-minter = mkQuintWitnessCheck {
+      name = "gc-drain-pass-calib-resume-anchors-minter";
+      spec = "gcCollectState";
+      main = "gcDrainPassCalibResumeAnchors";
+      witness = "anchoredByFullScanOnly";
+    };
+
     # ── gcCoordination: the cluster-scoped collect cadence and gauge
     # publication over the durable gc_collect_state row (bughunt wave
     # D1, bug_174 + merged_bug_211; migration 090). Two replicas, a

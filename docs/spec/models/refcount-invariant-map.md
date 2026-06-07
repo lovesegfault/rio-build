@@ -2460,3 +2460,46 @@ defaults on the integration tree:
    resurrect-vs-reap order is carried by the atomic actions plus the
    `deletedAge: 0` reset on BOTH the resurrect arm and the sweep
    stamp.
+
+## Drain-pass completion plane (round 3) — `gcDrainPass` in `gcCollectState.qnt`
+
+The collect pass's COMPLETION law (bug_174 + bug_137 + merged_bug_170;
+code: `PassDisposition` in `rio-store/src/gc/collect.rs` — only
+`CompleteFullScan` anchors the cycle's backlog-0 claim/reap credit; a
+resumed pass keeps the decremented backlog because keys at or below
+its resume point were never scanned by it). Modeled as a DEDICATED
+module in `gcCollectState.qnt` per the S7/TRACK_EPISODE_GHOSTS
+precedent: the cursor/disposition axis must not multiply the
+commit-basis regime's exhaustive state space.
+
+| Check | Backend / scope | Verdict |
+|---|---|---|
+| `quint-gc-drain-pass` (`zeroAnchorTruthful`, `anchoredByFullScanOnly`) | TLC exhaustive, MAX_CHUNKS=4, workers=4 — 41,427 generated / 4,260 distinct | `[ok]` <1 s (budget 1800 s ≈ 1800×) |
+| `quint-gc-drain-pass-witness-resumed-below` (`noResumedCompletionWithBelowEligibles`) | TLC exhaustive, same regime | `[violation]` <1 s (reachable — non-vacuous) |
+| `quint-gc-drain-pass-calib-resume-anchors-zero` (twin, truthfulness law) | TLC exhaustive, `CALIB_RESUME_ANCHORS = true` | `[violation]` <1 s |
+| `quint-gc-drain-pass-calib-resume-anchors-minter` (twin, minter law) | TLC exhaustive, same twin | `[violation]` <1 s |
+| `quint-gc-drain-pass-runs` (`resumedCompletionKeepsBacklogRun`) | rust simulator (`quint test`), 10,000 samples | pass |
+
+The twin is the live-import shape (the same `gcDrainPass` module
+instantiated with `CALIB_RESUME_ANCHORS = true` — the pre-fix wiring
+where a resumed completion also anchors, computing its backlog claim
+from the keys IT scanned): bug_174's understated-backlog
+counterexample, machine-checked from both sides.
+
+### Sibling-plane dispositions (round-3 formal obligations)
+
+- **`chunkCollect.qnt` reap plane — n/a with reason.** Its header
+  already dispositions the per-cycle victim cap and the cross-cycle
+  keyset cursor OUT of the interleaving model (design §4.6 v4: a
+  capped stop is a finish before the eligible set is exhausted,
+  exercised by `cappedCycleResumeRun` rather than by new model state).
+  The resume/anchor axis belongs to the cycle-state plane and lands
+  there (`gcDrainPass` above) — adding cursor state here would
+  re-introduce exactly the dimension §4.6 v4 excluded.
+- **`gcCoordination` cadence plane — n/a with reason.** Cycles are
+  atomic stamped events under the advisory lock; reap-error ordering
+  sits below that granularity. NOTE: round-3 C1 (`fdabd2fa5`) made
+  tail errors NON-poisoning (`run_post_drain_tail` has no error
+  channel — a tail failure cannot un-commit the cycle), so the
+  atomic-stamped-event abstraction is now MORE faithful to the code
+  than before the fix, not less.

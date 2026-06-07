@@ -289,3 +289,290 @@ module gcCollectStateCalibSimBasis {
     CALIB_COMMIT_SIM_BASIS = true
   ).*
 }
+
+// ===========================================================================
+// DRAIN-PASS PLANE (round 3, bug_174 + bug_137 + merged_bug_170): the
+// collect pass's COMPLETION law. A pass walks the chunk keyspace in
+// key order reaping eligibles; a budget cap persists the cursor and a
+// later pass RESUMES from it. In code the law is a TYPE:
+// `PassDisposition` (CompleteFullScan | CompleteResumed | Capped) —
+// only CompleteFullScan anchors the cycle (backlog-0 claim / reap
+// credit); a resumed pass keeps the decremented backlog because keys
+// at or below its resume point were never scanned by it, so it cannot
+// testify about them (bug_174's understated-backlog counterexample:
+// a resumed pass anchoring 0 while below-cursor eligibles exist).
+//
+// DEDICATED module (S7/TRACK_EPISODE_GHOSTS precedent): the axis adds
+// cursor/disposition state that must NOT multiply gcCollectState's
+// exhaustive commit-basis regime — it gets its own small regime
+// instead of riding always-on in the existing one.
+// ===========================================================================
+module gcDrainPass {
+  /// Chunk keyspace: 1..MAX_CHUNKS, scanned in key order.
+  const MAX_CHUNKS: int
+
+  /// CALIBRATION ONLY (`gcDrainPassCalibResumeAnchors`): the pre-fix
+  /// wiring — a RESUMED completion also anchors, computing the backlog
+  /// claim from the keys IT scanned (above its resume point), blind to
+  /// below-cursor eligibles. Both completion laws falsify.
+  const CALIB_RESUME_ANCHORS: bool
+
+  val CHUNKS = 1.to(MAX_CHUNKS)
+
+  /// Eligible-to-reap chunks (the cycle mark's product, as writers
+  /// move references between and during passes).
+  var eligible: Set[int]
+
+  /// The persisted scan position: keys <= cursor have been covered by
+  /// the pass chain since the last full-scan open.
+  var cursor: int
+
+  /// The open pass's resume point: keys <= passStart were NOT scanned
+  /// by THIS pass (0 for a full scan).
+  var passStart: int
+
+  /// A pass is open.
+  var scanning: bool
+
+  type Origin = | FullScan | Resumed
+  var origin: Origin
+
+  /// The last pass-ending event's typed disposition (PassDisposition).
+  type Disposition = | DNone | DCompleteFull | DCompleteResumed | DCapped
+  var lastPass: Disposition
+
+  /// The cycle anchor: the durable "collection complete, backlog B"
+  /// claim, stamped with whether a full scan minted it.
+  var anchored: { has: bool, backlog: int, byFull: bool }
+
+  /// Eligibility moved since the anchor was minted (post-mint writer
+  /// activity belongs to the NEXT cycle — the truthfulness law is
+  /// judged on the mint-clean window, like the commit-basis model's
+  /// post-commit guard).
+  var dirtySinceMint: bool
+
+  action init = all {
+    nondet e = powerset(CHUNKS).oneOf()
+    eligible' = e,
+    cursor' = 0,
+    passStart' = 0,
+    scanning' = false,
+    origin' = FullScan,
+    lastPass' = DNone,
+    anchored' = { has: false, backlog: 0, byFull: false },
+    dirtySinceMint' = false,
+  }
+
+  /// A writer drops a chunk's last reference (it becomes eligible) or
+  /// re-references it — between passes or mid-pass, above or below the
+  /// cursor. Below-cursor insertions are how a resumed pass comes to
+  /// sit above unseen eligibles.
+  action mutateEligibility = all {
+    nondet h = CHUNKS.oneOf()
+    nondet on = Set(true, false).oneOf()
+    eligible' = if (on) eligible.union(Set(h)) else eligible.exclude(Set(h)),
+    cursor' = cursor,
+    passStart' = passStart,
+    scanning' = scanning,
+    origin' = origin,
+    lastPass' = lastPass,
+    anchored' = anchored,
+    dirtySinceMint' = true,
+  }
+
+  /// Open a fresh full-keyspace pass.
+  action openFull = all {
+    not(scanning),
+    scanning' = true,
+    cursor' = 0,
+    passStart' = 0,
+    origin' = FullScan,
+    eligible' = eligible,
+    lastPass' = lastPass,
+    anchored' = anchored,
+    dirtySinceMint' = dirtySinceMint,
+  }
+
+  /// Resume from the persisted cap cursor: keys <= cursor stay
+  /// unscanned by this pass.
+  action openResumed = all {
+    not(scanning),
+    lastPass == DCapped,
+    cursor > 0,
+    cursor < MAX_CHUNKS,
+    scanning' = true,
+    cursor' = cursor,
+    passStart' = cursor,
+    origin' = Resumed,
+    eligible' = eligible,
+    lastPass' = lastPass,
+    anchored' = anchored,
+    dirtySinceMint' = dirtySinceMint,
+  }
+
+  /// Scan the next key; reap it if eligible.
+  action scanNext = all {
+    scanning,
+    cursor < MAX_CHUNKS,
+    cursor' = cursor + 1,
+    eligible' = eligible.exclude(Set(cursor + 1)),
+    passStart' = passStart,
+    scanning' = scanning,
+    origin' = origin,
+    lastPass' = lastPass,
+    anchored' = anchored,
+    dirtySinceMint' = dirtySinceMint,
+  }
+
+  /// Budget cap mid-scan: persist the cursor, mint DCapped.
+  action cap = all {
+    scanning,
+    cursor < MAX_CHUNKS,
+    scanning' = false,
+    lastPass' = DCapped,
+    cursor' = cursor,
+    passStart' = passStart,
+    origin' = origin,
+    eligible' = eligible,
+    anchored' = anchored,
+    dirtySinceMint' = dirtySinceMint,
+  }
+
+  /// The pass covered the keyspace tail: mint the typed disposition.
+  /// REAL wiring: only the full scan anchors (a resumed completion
+  /// keeps the decremented backlog and the cycle stays unanchored —
+  /// the next full pass earns the anchor). CALIB wiring: the resumed
+  /// completion also anchors, from the keys it saw.
+  action complete = all {
+    scanning,
+    cursor == MAX_CHUNKS,
+    scanning' = false,
+    lastPass' = if (origin == FullScan) DCompleteFull else DCompleteResumed,
+    anchored' =
+      if (origin == FullScan) {
+        { has: true, backlog: eligible.size(), byFull: true }
+      } else if (CALIB_RESUME_ANCHORS) {
+        { has: true, backlog: eligible.filter(h => h > passStart).size(), byFull: false }
+      } else {
+        anchored
+      },
+    dirtySinceMint' =
+      if (origin == FullScan or CALIB_RESUME_ANCHORS) false else dirtySinceMint,
+    cursor' = cursor,
+    passStart' = passStart,
+    origin' = origin,
+    eligible' = eligible,
+  }
+
+  action step = any {
+    mutateEligibility,
+    openFull,
+    openResumed,
+    scanNext,
+    cap,
+    complete,
+  }
+
+  // --- invariants (store.gc.completion-witness) ---------------------------
+
+  /// A mint-clean zero-backlog anchor means the keyspace is truly
+  /// drained. The calibration twin falsifies it: a resumed pass
+  /// anchors 0 while below-resume-point eligibles exist unseen.
+  val zeroAnchorTruthful = or {
+    not(anchored.has),
+    dirtySinceMint,
+    anchored.backlog > 0,
+    eligible == Set(),
+  }
+
+  /// The anchor is mintable ONLY by a full-keyspace scan — the typed
+  /// PassDisposition law (CompleteResumed carries no anchor authority).
+  val anchoredByFullScanOnly = or {
+    not(anchored.has),
+    anchored.byFull,
+  }
+
+  /// Non-vacuity witness (must VIOLATE in the main regime): a resumed
+  /// completion sitting above below-resume-point eligibles is
+  /// reachable — the twin's falsification only means something if the
+  /// live regime explores exactly that shape.
+  val noResumedCompletionWithBelowEligibles = not(and {
+    lastPass == DCompleteResumed,
+    eligible.filter(h => h <= passStart).size() > 0,
+  })
+}
+
+// ===========================================================================
+// DRAIN-PASS MAIN REGIME: real wiring, both completion laws hold.
+// ===========================================================================
+module gcDrainPassMain {
+  import gcDrainPass(
+    MAX_CHUNKS = 4,
+    CALIB_RESUME_ANCHORS = false
+  ).*
+
+  /// bug_174's counterexample choreography, against the REAL wiring:
+  /// reap 1, cap at 1, chunk 1 re-becomes eligible BELOW the cursor,
+  /// resume from 1, drain the tail — the resumed completion mints
+  /// DCompleteResumed, does NOT anchor, and the below-cursor eligible
+  /// survives for the next full pass.
+  run resumedCompletionKeepsBacklogRun =
+    init
+      .then(all {
+        eligible' = Set(1, 2),
+        cursor' = 0,
+        passStart' = 0,
+        scanning' = false,
+        origin' = FullScan,
+        lastPass' = DNone,
+        anchored' = { has: false, backlog: 0, byFull: false },
+        dirtySinceMint' = false,
+      })
+      .then(openFull)
+      .then(scanNext) // key 1 reaped
+      .then(cap) // budget cap at cursor 1
+      .expect(all {
+        lastPass == DCapped,
+        eligible == Set(2),
+      })
+      .then(all {
+        // the writer drops chunk 1's reference again: eligible BELOW
+        // the persisted cursor.
+        eligible' = eligible.union(Set(1)),
+        cursor' = cursor,
+        passStart' = passStart,
+        scanning' = scanning,
+        origin' = origin,
+        lastPass' = lastPass,
+        anchored' = anchored,
+        dirtySinceMint' = true,
+      })
+      .then(openResumed)
+      .then(scanNext) // key 2 reaped
+      .then(scanNext) // key 3
+      .then(scanNext) // key 4
+      .then(complete)
+      .expect(all {
+        lastPass == DCompleteResumed,
+        // the resumed completion anchored NOTHING...
+        not(anchored.has),
+        // ...and the below-cursor eligible survives for the next full
+        // pass (the decremented backlog is kept, never zeroed).
+        eligible == Set(1),
+        zeroAnchorTruthful,
+        anchoredByFullScanOnly,
+      })
+}
+
+// ===========================================================================
+// DRAIN-PASS CALIBRATION TWIN (expect-violation): the resumed
+// completion also anchors, from the keys it scanned — both completion
+// laws falsify (zero-anchor-over-unseen-eligibles, anchor minted by a
+// non-full scan).
+// ===========================================================================
+module gcDrainPassCalibResumeAnchors {
+  import gcDrainPass(
+    MAX_CHUNKS = 4,
+    CALIB_RESUME_ANCHORS = true
+  ).*
+}
