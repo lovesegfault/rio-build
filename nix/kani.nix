@@ -350,13 +350,13 @@ in
   #     reset emptied the view and flipped parked verdicts back to
   #     Claimable: merged_bug_011's resurrection class).
   # r[verify sched.retry.transient-budget+2]
-  # r[verify sched.retry.attempts-bounded+4]
+  # r[verify sched.retry.attempts-bounded+5]
   # r[verify sched.retry.exempt-infra-cap]
   # r[verify sched.retry.per-executor-budget+4]
   # r[verify sched.dispatch.fleet-exhaust+5]
   # r[verify sched.state.poisoned-ttl]
   # r[verify sched.db.attempts-gc]
-  # r[verify sched.attempt.worker-abort-bounded]
+  # r[verify sched.attempt.worker-abort-bounded+2]
   kani-rio-retry-kernel = mkKaniCheck {
     name = "rio-retry-kernel";
     crate = crateBuildKani.members.rio-retry-kernel;
@@ -364,8 +364,11 @@ in
     # B2's check_exec_row_sweep_guards (store.log.sweep-ownership) +
     # A3's check_materialization_counters_window (the per-job budget window) +
     # B1-s2's check_store_degraded_uncharged_requeue (the pacing class
-    # charges nothing — sched.retry.store-degraded-uncharged).
-    expectedHarnesses = 16;
+    # charges nothing — sched.retry.store-degraded-uncharged) +
+    # bug_098's check_bounded_uncharged_union_composition (the
+    # bounded-uncharged classes compose over the UNION trailing run:
+    # membership totality + pigeonhole; signed bughunt-3 §5 Q1).
+    expectedHarnesses = 17;
   };
 
   # rio-evidence-kernel: the scheduler's closure-evidence decision kernel

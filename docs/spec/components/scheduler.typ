@@ -507,26 +507,32 @@ the only one among the failure classes (infra, timeout, disconnect, and
 backstop requeues are immediate) --- the asymmetry is recorded in the
 invariant map as a Phase-1 policy decision, not specified away here.
 
-#r("sched.retry.store-degraded-uncharged+2")[
+#r("sched.retry.store-degraded-uncharged+3")[
   An infrastructure failure carrying the builder's
   `BuildResult.store_degraded` flag
   (#rref("builder.outcome.store-degraded")) MUST be ADMITTED before it
   is believed: admission requires corroboration --- at least two
   distinct controller-authoritative node bindings flagging within the
   corroboration window (600 s), or the scheduler's own store RPCs
-  failing inside that window --- AND a consecutive store-degraded run
-  strictly below the kernel bound `STORE_DEGRADED_FREE_RUN` (12). An
-  admitted report MUST be recorded with the dedicated `store_degraded`
-  outcome class and MUST be uncharged: the fold advances no
-  transient/infra/timeout/poison counter, records no `failed_builders`
-  exclusion, and never produces a poison verdict from such rows; the
-  verdict MUST be a requeue paced by the derivation backoff curve
-  computed from the consecutive run of store-degraded rows
-  (`backoff_until = at + backoff(run)`, run reset by any other folded
-  event). A NON-admitted report (uncorroborated, or at the run bound)
-  MUST be charged as plain infrastructure --- the flag is
-  worker-supplied evidence and cannot mint unbounded uncharged
-  requeues.
+  failing inside that window --- AND a store-degraded count strictly
+  below the kernel bound `STORE_DEGRADED_FREE_RUN` (12) within the
+  trailing bounded-uncharged run: the run is the trailing sequence of
+  `BOUNDED_UNCHARGED`-registry rows (the union of the uncharged
+  classes), so a sibling bounded-uncharged row --- the worker-abort
+  free close --- EXTENDS the run without advancing this count, and
+  only a build-lane row outside the union (a charged classification,
+  a controller row, a reset) breaks it. An admitted report MUST be
+  recorded with the dedicated `store_degraded` outcome class and MUST
+  be uncharged: the fold advances no transient/infra/timeout/poison
+  counter, records no `failed_builders` exclusion, and never produces
+  a poison verdict from such rows; the verdict MUST be a requeue paced
+  by the derivation backoff curve computed from the store-degraded
+  count within that same trailing bounded-uncharged run
+  (`backoff_until = at + backoff(count)`, reset by any folded event
+  outside the union). A NON-admitted report (uncorroborated, or at
+  the count bound) MUST be charged as plain infrastructure --- the
+  flag is worker-supplied evidence and cannot mint unbounded uncharged
+  requeues, alone or composed with the sibling uncharged class.
 ] The class is attributable to the STORE, not to the build or the node:
 charging any per-derivation or per-executor budget would convert a long
 store outage into poison verdicts and fleet-wide exclusion churn — the
@@ -535,7 +541,7 @@ collapse traded away (see the builder spec's retired-block note). The
 pacing bound (#rref("sched.retry.attempts-bounded+4")'s carve-out) is
 the breaker's own evidence threshold compounded with the backoff cap.
 
-#r("sched.retry.attempts-bounded+4")[
+#r("sched.retry.attempts-bounded+5")[
   Every failure-driven retry loop MUST be bounded: every counted attempt
   charges at least one of the named budgets --- the per-cycle transient
   count (`max_retries`), the non-exempt infrastructure count
@@ -550,12 +556,14 @@ the breaker's own evidence threshold compounded with the backoff cap.
   `store_degraded` attempt
   (#rref("sched.retry.store-degraded-uncharged")) charges no count
   budget BY DESIGN and is bounded by pacing --- the backoff curve over
-  its consecutive run, capped at `backoff_max_secs` --- while the
-  consecutive run stays strictly below `STORE_DEGRADED_FREE_RUN` (12)
-  and the outage is corroborated; past the bound, or uncorroborated,
-  the report falls through CHARGED into the non-exempt infrastructure
-  budget, so even this carve-out drains a finite budget and terminates
-  in an operator-visible poison.
+  its count within the trailing bounded-uncharged run, capped at
+  `backoff_max_secs` --- while that count stays strictly below
+  `STORE_DEGRADED_FREE_RUN` (12) and the outage is corroborated; the
+  count is taken over the `BOUNDED_UNCHARGED` union run, so
+  interleaving the sibling uncharged class cannot reset it. Past the
+  bound, or uncorroborated, the report falls through CHARGED into the
+  non-exempt infrastructure budget, so even this carve-out drains a
+  finite budget and terminates in an operator-visible poison.
 ]
 // SIGNED 2026-06-04 (owner, bughunt-2 fix-wave §5-S Q5): two-layer
 // close for merged_bug_032 — unconditional kernel run bound
@@ -567,6 +575,22 @@ the breaker's own evidence threshold compounded with the backoff cap.
 // consts, not config (no BLESS); the attempts-bounded carve-out above
 // is re-worded accordingly (+4) with this signature as the
 // counter-signed authorization.
+//
+// AMENDED 2026-06-07 (owner, bughunt-3 fix-wave §5 Q1): the
+// 'consecutive run' wording this signature authorized is superseded —
+// bug_098 showed the per-class break rule lets the two
+// bounded-uncharged classes mutually reset each other's runs
+// (strict alternation of worker-abort and store-degraded rows kept
+// both runs ≤ 1 forever, reproducing the unbounded uncharged mint
+// both bounds exist to close). The run is now the BOUNDED_UNCHARGED
+// union trailing run with PER-CLASS counts: any registry row extends
+// every scan; each class trips on its own count; charged/controller/
+// reset rows still reset everything. Both consts keep this
+// signature's values (12, 3). Re-worded accordingly: this rule body
+// and carve-out (sched.retry.store-degraded-uncharged,
+// sched.retry.attempts-bounded) and sched.attempt.worker-abort-bounded
+// — versions bumped at this amendment. The round-3 SIGNED block lives
+// at the BOUNDED_UNCHARGED registry doc in rio-retry-kernel/src/lib.rs.
 The budget values are configuration (`[retry]` / `[poison]` tables above),
 not normative numbers. The two clauses that bite: an attempt charged to no
 budget is an unbounded retry loop (the 9,748-redispatch incident, the
@@ -3035,24 +3059,30 @@ closure. Pod-initiated aborts of still-wanted work are platform terminations
 them as infrastructure failures would burn the infra budget on disruptions
 the design accepts as charge-free.
 
-#r("sched.attempt.worker-abort-bounded")[
+#r("sched.attempt.worker-abort-bounded+2")[
   The worker-abort charge-free admission MUST be ledger-bounded: a worker
   `ReportOutcome{Cancelled}` for a still-wanted open build attempt is
-  admitted charge-free only while the attempt history's trailing run of
-  consecutive build-lane worker-abort closures is strictly below
+  admitted charge-free only while the worker-abort count within the
+  attempt history's trailing bounded-uncharged run is strictly below
   `WORKER_ABORT_FREE_CLOSES` (3); a report arriving at or past the bound
   MUST be consumed as a charged infrastructure failure through the
   existing unsolicited-Cancelled classification, advancing the exclusion
   and poison budgets. Materialization-lane rows MUST neither extend nor
-  break the run (the kind partition); any other build-lane row breaks it.
+  break the run (the kind partition); a sibling bounded-uncharged row
+  (any other `BOUNDED_UNCHARGED`-registry class --- the store-degraded
+  paced write) EXTENDS the run without advancing this count; any other
+  build-lane row breaks it.
 ]
 The worker supplies the `Cancelled` discriminator, so trusting it
 unboundedly mints unlimited uncharged requeues (a compromised or looping
 builder pins its derivation forever without ever advancing exclusion or
 poison --- bug_279's class). The bound preserves the AD5 posture for every
-plausible disruption burst --- three consecutive platform terminations with
-nothing else happening to the lane --- while making the loop finite; the
-run resets on any genuine classification, reset, or controller observation.
+plausible disruption burst --- three platform terminations within one
+bounded-uncharged run --- while making the loop finite; the run resets on
+any genuine classification, reset, or controller observation, and the
+per-class count composes with the sibling uncharged class instead of
+being reset by it (bug_098: alternating the two classes is bounded by
+the SUM of the per-class headrooms, never unbounded).
 
 #r("sched.attempt.establishment-window+5")[
   The establishment sweep MUST visit every open attempt (active assignment ⋈

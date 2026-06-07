@@ -420,7 +420,7 @@ module retryPolicy {
   const MAX_TIME: int
   /// Ceiling on physical attempts (action precondition on dispatch).
   const MAX_ATTEMPTS: int
-  /// The bound the boundedness clause of sched.retry.attempts-bounded+4
+  /// The bound the boundedness clause of sched.retry.attempts-bounded+5
   /// justifies for the regime's enabled alphabet (only consulted by
   /// attemptsBoundedGlobal). Post-collapse this is a HOLD bound in the
   /// crash regime: budget-justified charges plus the bounded
@@ -461,7 +461,7 @@ module retryPolicy {
   const ENABLE_STORE_DEGRADED: bool
 
   // Scaled budget (the production values are configuration, not
-  // normative numbers -- sched.retry.attempts-bounded+4). The scaling
+  // normative numbers -- sched.retry.attempts-bounded+5). The scaling
   // keeps every cap reachable in a small state space; the witnesses
   // prove each scaled cap is still reached.
   pure val MAX_RETRIES = 2          // RetryPolicy.max_retries
@@ -725,14 +725,17 @@ module retryPolicy {
   /// invariants to the post-failover state.
   var justFailedOver: bool
 
-  /// Bughunt wave A2 (bug_279): the TRAILING run of build-lane
-  /// worker-abort free-close rows — admit_worker_abort's counted
-  /// prefix (rio-retry-kernel/src/lib.rs: Attempt + Disconnected +
-  /// Worker, build lane only). Every other build-lane row append
-  /// resets it (the kernel's run break); materialization actions skip
-  /// it (matLeavesBuildUntouched — the lane discipline). The uncharged
+  /// Bughunt wave A2 (bug_279), composed per bug_098 (signed
+  /// bughunt-3 §5 Q1): the worker-abort COUNT within the trailing
+  /// bounded-uncharged UNION run — admit_worker_abort's counted
+  /// class (rio-retry-kernel/src/lib.rs: Attempt + Disconnected +
+  /// Worker, build lane only). A sibling BOUNDED_UNCHARGED row (the
+  /// store-degraded paced close) EXTENDS the run without advancing
+  /// this count; any build-lane row outside the union (charged,
+  /// controller, reset) resets it; materialization actions skip it
+  /// (matLeavesBuildUntouched — the lane discipline). The uncharged
   /// worker-abort close (pullWorkerAbort) is admitted only strictly
-  /// below the bound, so the run never exceeds it.
+  /// below the bound, so the count never exceeds it.
   var freeCloseRun: int
 
   // --- 5. derived state ---------------------------------------------------
@@ -741,13 +744,15 @@ module retryPolicy {
   /// keep in lockstep with the kernel constant.
   pure val WORKER_ABORT_FREE_CLOSES: int = 3
 
-  /// Bughunt-2 slot 3 (m032/merged_bug_032): the trailing run of
-  /// consecutive uncharged store-degraded closes. Mirrors the kernel's
-  /// admit_store_degraded suffix walk: a store-degraded row extends it,
-  /// any other Build-kind row (charged reports, uncharged worker-abort
-  /// rows, establishment) breaks it, history resets zero it, and it
-  /// survives failover (the rows are durable; recovery recomputes the
-  /// same suffix).
+  /// Bughunt-2 slot 3 (m032/merged_bug_032), composed per bug_098:
+  /// the store-degraded COUNT within the trailing bounded-uncharged
+  /// UNION run. Mirrors the kernel's admit_store_degraded union walk:
+  /// a store-degraded row advances it, a sibling bounded-uncharged
+  /// row (the worker-abort free close) EXTENDS the run without
+  /// advancing it, any Build-kind row outside the union (charged
+  /// reports, establishment) breaks it, history resets zero it, and
+  /// it survives failover (the rows are durable; recovery recomputes
+  /// the same suffix).
   var storeDegradedRun: int
 
   /// Mirror of rio-retry-kernel's STORE_DEGRADED_FREE_RUN (12 in
@@ -869,7 +874,7 @@ module retryPolicy {
     dStatus == DCancelled implies specVerdict == VCancel,
   }
 
-  /// sched.retry.attempts-bounded+4, the per-event clauses: a single
+  /// sched.retry.attempts-bounded+5, the per-event clauses: a single
   /// accounting observation never charges the same budget twice, and the
   /// charge-or-terminal discipline is total over the post-collapse event
   /// alphabet (the Stage-B clause-coverage audit's narrowing is closed):
@@ -891,7 +896,7 @@ module retryPolicy {
     (last.kind == OE5) implies not(last.chargedAny),
   }
 
-  /// sched.retry.attempts-bounded+4, the boundedness clause: the number
+  /// sched.retry.attempts-bounded+5, the boundedness clause: the number
   /// of physical attempts is bounded by what the enabled budgets
   /// justify (ATTEMPT_BOUND is a regime constant). Post-collapse this
   /// HOLDS in the crash regime: every crash is established and charged
@@ -1112,6 +1117,31 @@ module retryPolicy {
   /// liveness direction: sustained outage DOES eventually charge — the
   /// bound is a gate, not a dead arm).
   val canChargePastBound = not(last.kind == OStoreDegradedCharged)
+
+  /// bug_098 (signed bughunt-3 §5 Q1) — the COMPOSITION law: the
+  /// bounded-uncharged classes share one trailing union run, each
+  /// class's count is gated by its own bound within it, so the total
+  /// uncharged mint inside a run is bounded by the SUM of the bounds.
+  /// Pre-fix, each class's row reset the OTHER class's run, both
+  /// gates idled at <= 1 under alternation, and the mint was
+  /// unbounded — the exact class both signed bounds exist to close.
+  /// Maintained by the per-class admission guards over the
+  /// union-preserving run updates (pullWorkerAbort/pullStoreDegraded
+  /// extend each other's scans instead of zeroing them). Falsify
+  /// twin: the retry-098-guard-vacuous calibration (guards vacuous,
+  /// runs as union observers) violates this.
+  // r[verify sched.retry.store-degraded-uncharged+3]
+  // r[verify sched.attempt.worker-abort-bounded+2]
+  val unionMintBounded =
+    freeCloseRun + storeDegradedRun
+      <= WORKER_ABORT_FREE_CLOSES + STORE_DEGRADED_FREE_RUN
+  /// Violated when BOTH per-class counts are simultaneously >= 2 —
+  /// reachable ONLY under the union law (the pre-fix mutual reset
+  /// kept at most one count above zero at any instant). Non-vacuity
+  /// for unionMintBounded's composed regime: the model genuinely
+  /// explores interleaved uncharged classes, not just pure runs.
+  val canReachComposedRuns =
+    not(freeCloseRun >= 2 and storeDegradedRun >= 2)
   /// Violated when a leader failover happens with a non-empty,
   /// under-budget recovered history (the failover-budget contention is
   /// reachable).
@@ -1999,7 +2029,7 @@ module retryPolicy {
   /// classes (the fall-through).
   // Mirrors: rio-retry-kernel admit_worker_abort (lib.rs) consumed by
   //          the report intake's witness-first AD5 arm
-  //          (r[impl sched.attempt.worker-abort-bounded] sites).
+  //          (r[impl sched.attempt.worker-abort-bounded+2] sites).
   action pullWorkerAbort(n: str): bool = all {
     attempt == Running(n),
     dStatus == DRunning,
@@ -2008,7 +2038,12 @@ module retryPolicy {
     dStatus' = DReady,
     execs' = execs.put(n, { ...execs.get(n), runningOurs: false }),
     freeCloseRun' = freeCloseRun + 1,
-    storeDegradedRun' = 0,
+    // bug_098 (union law, signed bughunt-3 §5 Q1): the sibling
+    // bounded-uncharged count survives — a worker-abort row EXTENDS
+    // the bounded-uncharged run instead of resetting the
+    // store-degraded count, exactly as is_bounded_uncharged_row
+    // derives membership from BOUNDED_UNCHARGED in the kernel.
+    storeDegradedRun' = storeDegradedRun,
     // charge-free: no fold event, no counter movement, no backoff.
     spec' = spec, specVerdict' = specVerdict, live' = live,
     pg' = pg, last' = noObs,
@@ -2032,9 +2067,10 @@ module retryPolicy {
   /// The curve arithmetic itself (the kernel's fold-local
   /// store_degraded_run) is below this model's untimed-backoff floor,
   /// exactly as the establishment window's timing is. A store-degraded
-  /// row DOES intervene in the ledger suffix, so the worker-abort
-  /// trailing run resets (admit_worker_abort counts consecutive worker
-  /// aborts only).
+  /// row is itself a BOUNDED_UNCHARGED-registry row, so it EXTENDS
+  /// the trailing bounded-uncharged run without advancing the
+  /// worker-abort count (bug_098's union law: the two uncharged
+  /// classes compose instead of mutually resetting).
   // Mirrors: rio-retry-kernel decide()'s store-degraded fold arm
   //          (r[impl sched.retry.store-degraded-uncharged]) behind the
   //          scheduler intake's floor-bump skip.
@@ -2051,8 +2087,11 @@ module retryPolicy {
     attempt' = NoAttempt,
     dStatus' = DReady,
     execs' = execs.put(n, { ...execs.get(n), runningOurs: false }),
-    // a non-abort row breaks the worker-abort trailing run
-    freeCloseRun' = 0,
+    // bug_098 (union law): a sibling bounded-uncharged row EXTENDS
+    // the worker-abort scan instead of breaking it — only rows
+    // outside the BOUNDED_UNCHARGED union (charged, controller,
+    // reset) break the run.
+    freeCloseRun' = freeCloseRun,
     storeDegradedRun' = storeDegradedRun + 1,
     // pacing, not charges: no fold event, nothing moves.
     spec' = spec, specVerdict' = specVerdict, live' = live,

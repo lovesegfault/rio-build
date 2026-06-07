@@ -4566,7 +4566,7 @@ rec {
     # ------------------------------------------------------------------
     # B1 bounded-await-transport (bughunt wave, bug_408): the
     # store-degraded paced-requeue class
-    # (sched.retry.store-degraded-uncharged; the attempts-bounded+3
+    # (sched.retry.store-degraded-uncharged; the attempts-bounded+5
     # pacing carve-out). The contract triple — never a poison input,
     # never a budget draw, never an exclusion key — holds exhaustively
     # with the action enabled; every other regime binds
@@ -4576,7 +4576,7 @@ rec {
     # reports to Poisoned); the reachability pin is
     # correlatedStoreOutageRun (the fleet-correlated outage).
     # ------------------------------------------------------------------
-    # r[verify sched.retry.store-degraded-uncharged+2]
+    # r[verify sched.retry.store-degraded-uncharged+3]
     quint-retry-policy-pull-store-degraded = mkQuintCheck {
       name = "retry-policy-pull-store-degraded";
       # quint-policy P1 exemptions (bughunt-2 slot 11; §5-Q13 — the
@@ -4613,6 +4613,13 @@ rec {
         "storeDegradedNeverPoisons"
         "storeDegradedDrawsNoBudget"
         "storeDegradedMintsNoExclusion"
+        # bug_098 (signed bughunt-3 §5 Q1): the bounded-uncharged
+        # classes COMPOSE — the union mint within one trailing
+        # bounded-uncharged run is bounded by the sum of the per-class
+        # bounds. Falsify twin: retry-098-guard-vacuous (below);
+        # reachability: the composed-runs witness (below).
+        # r[verify sched.attempt.worker-abort-bounded+2]
+        "unionMintBounded"
         # Bughunt-2 slot 3 (m032): the uncharged store-degraded run
         # never exceeds the kernel bound (admit_store_degraded's gate;
         # falsify twin: the retry-032-unbounded-degraded calibration;
@@ -4667,6 +4674,39 @@ rec {
       extraSpecs = [ "retryPolicy" ];
       step = "calibStep";
       witness = "boundedStoreDegradedRun";
+    };
+
+    # bug_098 non-vacuity: BOTH per-class counts simultaneously >= 2 is
+    # reachable — the union law genuinely composes the classes (the
+    # pre-fix mutual reset made this state unreachable, which is why
+    # per-class checks could never see the composition hole).
+    # r[verify sched.retry.store-degraded-uncharged+3]
+    # r[verify sched.attempt.worker-abort-bounded+2]
+    quint-retry-policy-pull-witness-composed-runs = mkQuintWitnessCheck {
+      name = "retry-policy-pull-witness-composed-runs";
+      spec = "retryPolicy";
+      main = "retryPolicyPullStoreDegraded";
+      step = "pullStep";
+      witness = "canReachComposedRuns";
+    };
+
+    # bug_098 falsify twin (signed bughunt-3 §5 Q1): the guard-vacuous
+    # pre-fix admissions — each class's close reset the other's run, so
+    # along every composed schedule the per-class guards were
+    # identically true; modeled guard-free with the runs as union
+    # observers (abstraction disclosed in the calibration header; the
+    # pure same-class corner is owned by retry-032 and the kernel
+    # decision tables). unionMintBounded MUST violate: seven uncharged
+    # closes in one bounded-uncharged run.
+    # r[verify sched.retry.store-degraded-uncharged+3]
+    # r[verify sched.attempt.worker-abort-bounded+2]
+    quint-retry-policy-pull-calib-098-guard-vacuous = mkQuintWitnessCheck {
+      name = "retry-policy-pull-calib-098-guard-vacuous";
+      spec = "calibration/retry-098-guard-vacuous";
+      main = "retryCalibGuardVacuous";
+      extraSpecs = [ "retryPolicy" ];
+      step = "calibStep";
+      witness = "unionMintBounded";
     };
 
     # ------------------------------------------------------------------

@@ -1071,7 +1071,7 @@ impl DagActor {
                         ) && s.exec_id == Some(exec_id)
                     });
                 if abort_of_still_wanted {
-                    // r[impl sched.attempt.worker-abort-bounded]
+                    // r[impl sched.attempt.worker-abort-bounded+2]
                     // bug_279: the charge-free admission is LEDGER-
                     // BOUNDED — the worker-supplied Cancelled
                     // discriminator is trusted only while the trailing

@@ -679,7 +679,8 @@ db_str_enum! {
         /// open at completion or tripped during the build). Pure
         /// pacing in the fold (`sched.retry.store-degraded-uncharged`):
         /// no count budget, no exclusion key, never poison — only the
-        /// derivation backoff advances from the consecutive run.
+        /// derivation backoff advances from the count within the
+        /// trailing bounded-uncharged run.
         StoreDegraded = "store_degraded",
     }
     parse_err(_s) = &'static str:

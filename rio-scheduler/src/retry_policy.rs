@@ -127,13 +127,14 @@ pub(crate) fn decide(history: &[AttemptRecord], budget: &Budget, now: AbsTime) -
     }
 }
 
-// r[impl sched.attempt.worker-abort-bounded]
+// r[impl sched.attempt.worker-abort-bounded+2]
 /// Admit one worker-abort report (`BuildResultStatus::Cancelled` for a
 /// still-wanted open build attempt) against the in-memory attempt
-/// history: the kernel counts the trailing run of build-lane
-/// worker-abort closures and admits the charge-free close only below
-/// [`rio_retry_kernel::WORKER_ABORT_FREE_CLOSES`]. Same projection shim
-/// shape as [`decide`].
+/// history: the kernel counts the worker-abort closures within the
+/// trailing bounded-uncharged UNION run (bug_098 — sibling uncharged
+/// rows extend the run, never reset it) and admits the charge-free
+/// close only below [`rio_retry_kernel::WORKER_ABORT_FREE_CLOSES`].
+/// Same projection shim shape as [`decide`].
 pub(crate) fn admit_worker_abort(
     history: &[AttemptRecord],
 ) -> rio_retry_kernel::WorkerAbortAdmission {
@@ -142,13 +143,15 @@ pub(crate) fn admit_worker_abort(
     rio_retry_kernel::admit_worker_abort(&rows, rio_retry_kernel::WORKER_ABORT_FREE_CLOSES)
 }
 
-// r[impl sched.retry.store-degraded-uncharged+2]
+// r[impl sched.retry.store-degraded-uncharged+3]
 /// Admit one corroborated store-degraded report against the in-memory
-/// attempt history: the kernel counts the trailing run of build-lane
-/// store-degraded pacing rows and admits the uncharged paced requeue
-/// only below [`rio_retry_kernel::STORE_DEGRADED_FREE_RUN`]; at the
-/// bound the report falls through to the CHARGED infra path
-/// (merged_bug_032). Same projection shim shape as [`decide`].
+/// attempt history: the kernel counts the store-degraded pacing rows
+/// within the trailing bounded-uncharged UNION run (bug_098 — sibling
+/// uncharged rows extend the run, never reset it) and admits the
+/// uncharged paced requeue only below
+/// [`rio_retry_kernel::STORE_DEGRADED_FREE_RUN`]; at the bound the
+/// report falls through to the CHARGED infra path (merged_bug_032).
+/// Same projection shim shape as [`decide`].
 pub(crate) fn admit_store_degraded(
     history: &[AttemptRecord],
 ) -> rio_retry_kernel::WorkerAbortAdmission {
@@ -301,7 +304,7 @@ pub(crate) fn classify(event: &ObservedFailure<'_>, floor: FloorOutcomeView) -> 
 }
 
 // r[verify sched.retry.transient-budget+2]
-// r[verify sched.retry.attempts-bounded+4]
+// r[verify sched.retry.attempts-bounded+5]
 // r[verify sched.retry.counters-refine-history+2]
 #[cfg(test)]
 mod tests {
@@ -802,10 +805,10 @@ mod tests {
         rec(class, ReportingParty::Worker, executor, at)
     }
 
-    // r[verify sched.retry.store-degraded-uncharged+2]
+    // r[verify sched.retry.store-degraded-uncharged+3]
     /// bug_408 fold battery: N store-degraded rows ⇒ Requeue, every
     /// count counter zero, exclusion empty, never Poison; the backoff
-    /// deadline follows the curve over the consecutive run
+    /// deadline follows the curve over the store-degraded count
     /// (base·multᵃ capped), computed from the LAST row's timestamp.
     #[test]
     fn store_degraded_battery_uncharged_paced_requeue() {
@@ -827,7 +830,8 @@ mod tests {
         assert_eq!(d.backoff_until, Some(1_110 + 300));
     }
 
-    /// The consecutive run resets on any other folded event: the
+    /// The run resets on any folded event OUTSIDE the
+    /// bounded-uncharged union (a charged row): the
     /// degraded row AFTER a transient charge restarts the curve at
     /// `base` (the pacing is per-outage, not per-derivation-lifetime).
     #[test]
@@ -846,6 +850,32 @@ mod tests {
         // ...and the post-break degraded row paced from base again,
         // exceeding the transient's own (count-1=0 ⇒ base) deadline.
         assert_eq!(d.backoff_until, Some(1_030 + 5));
+    }
+
+    /// The pacing curve survives a SIBLING bounded-uncharged row
+    /// (bug_098, the union law): a worker-abort free close between two
+    /// store-degraded rows extends the bounded-uncharged run, so the
+    /// second degraded row paces at run 1 (base·mult), not back at
+    /// base — the curve escalates across the interleaving exactly as
+    /// the admission counts across it. A CHARGED row still resets
+    /// (the sibling test above).
+    // r[verify sched.retry.store-degraded-uncharged+3]
+    #[test]
+    fn store_degraded_pacing_survives_uncharged_sibling() {
+        let b = Budget::default(); // base 5, mult 2, cap 300
+        let history = vec![
+            worker_rec(OutcomeClass::StoreDegraded, "w1", 1_000), // run 0: +5
+            worker_rec(OutcomeClass::Disconnected, "w1", 1_010),  // sibling: extends
+            worker_rec(OutcomeClass::StoreDegraded, "w1", 1_020), // run 1: +10
+        ];
+        let d = decide(&history, &b, 1_021);
+        // The sibling free close charged nothing...
+        assert_eq!(d.counters.count, 0);
+        assert_eq!(d.counters.infra_count, 0);
+        // ...and the post-sibling degraded row paced at the ESCALATED
+        // curve point (run 1 ⇒ +10 from its own timestamp), not reset
+        // to base.
+        assert_eq!(d.backoff_until, Some(1_020 + 10));
     }
 
     /// Classify maps the flagged event to the dedicated class with no

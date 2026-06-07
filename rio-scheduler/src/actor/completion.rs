@@ -60,7 +60,8 @@ pub(super) enum StoreDegradedDisposition {
     Paced,
     /// Flagged but uncorroborated — charged as plain infrastructure.
     Uncorroborated,
-    /// Flagged and corroborated, but the consecutive uncharged run hit
+    /// Flagged and corroborated, but the store-degraded count within
+    /// the trailing bounded-uncharged run hit
     /// `STORE_DEGRADED_FREE_RUN`: charged fallthrough into the counted
     /// infra budget (merged_bug_032's operator-visible poison path).
     RunBound,
@@ -3082,7 +3083,7 @@ impl DagActor {
         // The exemption predicate (promoted-or-CONCURRENT_PUTPATH) lives
         // in `classify()` — the single append-time classifier — so the
         // row's class is what the fold charges.
-        // r[impl sched.retry.store-degraded-uncharged+2]
+        // r[impl sched.retry.store-degraded-uncharged+3]
         // bug_408: the flagged report classifies as the dedicated
         // pacing class — the kernel fold advances only the derivation
         // backoff (no count budget, no exclusion, never poison), so
@@ -3262,10 +3263,11 @@ impl DagActor {
                           "infrastructure failure: reset_to_ready failed, skipping");
                     return FailureHandling::Handled;
                 }
-                // r[impl sched.retry.store-degraded-uncharged+2]
+                // r[impl sched.retry.store-degraded-uncharged+3]
                 // bug_408: the flagged class is the ONE infra shape
                 // that does NOT requeue immediately — the fold computed
-                // the pacing deadline from the consecutive run; write
+                // the pacing deadline from the count within the trailing
+                // bounded-uncharged run; write
                 // it through the live backoff carve-out (the refresh
                 // above deliberately preserves the actor-managed value,
                 // same convention as the transient site). Epoch→Instant

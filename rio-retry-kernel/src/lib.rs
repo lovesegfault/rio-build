@@ -747,7 +747,7 @@ pub fn exhausts_fleet<Id: Ord>(failed_builders: &IdSet<Id>, fleet: &FleetView<Id
 
 // r[impl sched.retry.counters-refine-history+2]
 // r[impl sched.retry.transient-budget+2]
-// r[impl sched.retry.attempts-bounded+4]
+// r[impl sched.retry.attempts-bounded+5]
 // r[impl sched.retry.verdict-channel-invariant]
 /// Fold an observed failure-event history into the ten retry counters and
 /// the budget verdict.
@@ -1213,7 +1213,8 @@ pub enum OutcomeClass {
     /// the STORE, not the build or the node: the fold treats these
     /// rows as pure pacing (`sched.retry.store-degraded-uncharged`) —
     /// no count budget, no exclusion key, never poison; only
-    /// `backoff_until` advances, from the consecutive run. There is
+    /// `backoff_until` advances, from the count within the trailing
+    /// bounded-uncharged run. There is
     /// deliberately NO `AttemptEvent` for this class: the charging
     /// alphabet cannot represent it, so a future `apply()` arm cannot
     /// charge it by accident.
@@ -1538,11 +1539,14 @@ pub fn decide<Id: Ord + Clone>(
     let fleet = FleetView::default();
     let mut counters = initial;
     let mut verdict = Verdict::Requeue;
-    // r[impl sched.retry.store-degraded-uncharged+2]
-    // bug_408: the consecutive run of store-degraded rows. Pure
-    // pacing — drives ONLY the backoff curve; reset by any other
-    // folded event. Fold-local by design: not one of the ten
-    // RetryState counters, never persisted.
+    // r[impl sched.retry.store-degraded-uncharged+3]
+    // bug_408: the store-degraded count within the trailing
+    // bounded-uncharged run. Pure pacing — drives ONLY the backoff
+    // curve; reset by any folded event OUTSIDE the bounded-uncharged
+    // union (bug_098: a sibling uncharged row — the worker-abort free
+    // close — extends the run without resetting the curve, the same
+    // union law the admissions scan). Fold-local by design: not one
+    // of the ten RetryState counters, never persisted.
     let mut store_degraded_run: u32 = 0;
     for row in history {
         // The kind partition (design §2.5): materialization-kind rows
@@ -1574,7 +1578,9 @@ pub fn decide<Id: Ord + Clone>(
             continue;
         }
         if let Some(ev) = row_to_event(row) {
-            store_degraded_run = 0;
+            if !is_bounded_uncharged_row(row) {
+                store_degraded_run = 0;
+            }
             verdict = apply(&mut counters, &ev, budget, &fleet);
         }
     }
@@ -1889,7 +1895,7 @@ pub fn sweep_eligible<Id>(
 /// How a worker-reported abort (`BuildResultStatus::Cancelled` for a
 /// still-wanted open build attempt — the AD5 SIGTERM-abort report) is
 /// admitted, given the attempt history.
-// r[impl sched.attempt.worker-abort-bounded]
+// r[impl sched.attempt.worker-abort-bounded+2]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerAbortAdmission {
     /// Below the bound: close the attempt charge-free and requeue (the
@@ -1902,49 +1908,38 @@ pub enum WorkerAbortAdmission {
     ChargedFallthrough,
 }
 
-/// How many CONSECUTIVE worker-abort closures are admitted charge-free
-/// before the next one is charged. Platform terminations (preemption,
-/// scale-down, controller deletes) legitimately produce short runs;
-/// a worker looping `pull → Cancelled` produces an unbounded one —
-/// bug_279's uncharged-requeue mint. Three free closes absorb any
-/// plausible disruption burst while keeping the loop finite.
+/// How many worker-abort closures WITHIN ONE trailing
+/// bounded-uncharged run (see [`BOUNDED_UNCHARGED`]) are admitted
+/// charge-free before the next one is charged. Platform terminations
+/// (preemption, scale-down, controller deletes) legitimately produce
+/// short runs; a worker looping `pull → Cancelled` produces an
+/// unbounded one — bug_279's uncharged-requeue mint. Three free closes
+/// absorb any plausible disruption burst while keeping the loop
+/// finite; interleaving the sibling uncharged class does not stretch
+/// it (bug_098 — the union composition).
 pub const WORKER_ABORT_FREE_CLOSES: u32 = 3;
 
 /// Admit one worker-abort report against the attempt history: count
-/// the TRAILING run of build-lane free-close rows
-/// (`Attempt ∧ Disconnected ∧ Worker` — exactly the row the uncharged
-/// close appends; pull-mode's only worker-party `Disconnected` writer)
-/// and admit `Uncharged` only while the run is strictly below `bound`.
+/// the worker-abort rows (`Attempt ∧ Disconnected ∧ Worker` — exactly
+/// the row the uncharged close appends; pull-mode's only worker-party
+/// `Disconnected` writer) within the TRAILING bounded-uncharged union
+/// run (bug_098, signed bughunt-3 §5 Q1) and admit `Uncharged` only
+/// while that per-class count is strictly below `bound`.
 ///
 /// Lane discipline (the kind partition): MATERIALIZATION-lane rows
 /// neither extend nor break the run — they are skipped exactly as
 /// [`decide`]'s fold skips them, so a store replica's interleaved
 /// charges cannot launder a worker's abort loop back under the bound.
-/// Any OTHER build-lane row (a charged classification, a controller
-/// row, a reset) breaks the run: the loop signature is consecutive
-/// worker aborts with nothing else happening to the lane.
-// r[impl sched.attempt.worker-abort-bounded]
+/// A SIBLING bounded-uncharged row (any other [`BOUNDED_UNCHARGED`]
+/// class) EXTENDS the run without advancing this class's count — the
+/// two uncharged mints compose instead of mutually resetting. Any
+/// build-lane row OUTSIDE the union (a charged classification, a
+/// controller row, a reset) breaks the run: the loop signature is a
+/// run of uncharged worker reports with nothing charged happening to
+/// the lane.
+// r[impl sched.attempt.worker-abort-bounded+2]
 pub fn admit_worker_abort<Id>(rows: &[LedgerRow<Id>], bound: u32) -> WorkerAbortAdmission {
-    let mut run: u32 = 0;
-    let mut i = rows.len();
-    while i > 0 {
-        i -= 1;
-        let r = &rows[i];
-        if r.kind != AttemptKind::Build {
-            continue;
-        }
-        let is_free_close = r.event_kind == AttemptEventKind::Attempt
-            && r.outcome_class == OutcomeClass::Disconnected
-            && r.reporting_party == ReportingParty::Worker;
-        if !is_free_close {
-            break;
-        }
-        run += 1;
-        if run >= bound {
-            return WorkerAbortAdmission::ChargedFallthrough;
-        }
-    }
-    WorkerAbortAdmission::Uncharged
+    admit_bounded_uncharged(rows, OutcomeClass::Disconnected, bound)
 }
 
 /// How many CONSECUTIVE store-degraded reports are admitted into the
@@ -1957,57 +1952,123 @@ pub fn admit_worker_abort<Id>(rows: &[LedgerRow<Id>], bound: u32) -> WorkerAbort
 /// the landed 11-report pacing test, whose assertions survive); a real
 /// store outage longer than that falls through into the counted infra
 /// budget and becomes operator-visible poison ~10 attempts later —
-/// never instant. Signed: bughunt-2 §5-S Q5 (2026-06-04).
-// r[impl sched.retry.store-degraded-uncharged+2]
+/// never instant. The run is the class's count within the trailing
+/// bounded-uncharged UNION run (see [`BOUNDED_UNCHARGED`]): sibling
+/// uncharged rows extend the scan without advancing this count.
+/// Signed: bughunt-2 §5-S Q5 (2026-06-04, the bound and its value);
+/// bughunt-3 §5 Q1 (2026-06-07, the union-run composition).
+// r[impl sched.retry.store-degraded-uncharged+3]
 pub const STORE_DEGRADED_FREE_RUN: u32 = 12;
 
 /// The single source of truth for UNCHARGED outcome classes and their
-/// consecutive-run bounds. Every class whose fold treatment is
+/// per-class run bounds. Every class whose fold treatment is
 /// charge-free pacing MUST appear here with a finite bound — the
 /// `uncharged_classes_are_bounded_or_marked` disposition lint forces
 /// every `OutcomeClass` variant (present and future) to declare which
 /// bucket it lives in, so an unbounded uncharged class cannot be
 /// introduced by review miss again.
+///
+/// COMPOSITION (bug_098): the bounds compose over the UNION trailing
+/// run. [`is_bounded_uncharged_row`] derives run membership from this
+/// registry, so any registry row EXTENDS every class's run scan
+/// (never breaks it) and each class trips on its OWN count within the
+/// shared run; only a build-lane row outside the union (charged,
+/// controller, reset) breaks the run. Strict alternation of registry
+/// classes therefore reaches `ChargedFallthrough` within
+/// `Σ(bound_c − 1) + 1` admissions (pigeonhole) instead of minting
+/// unbounded uncharged requeues by mutually resetting per-class runs.
+///
+// SIGNED 2026-06-07 (owner, bughunt-3 fix-wave §5 Q1): union
+// trailing-run composition for the bounded-uncharged classes — the
+// run-breaker predicate derives from BOUNDED_UNCHARGED itself; any
+// uncharged registry row extends every uncharged-run scan; each
+// class's count is bounded by its own signed const within the shared
+// run (STORE_DEGRADED_FREE_RUN = 12, WORKER_ABORT_FREE_CLOSES = 3 —
+// the bughunt-2 §5-S Q5 values, unchanged); charged/controller/reset
+// rows reset everything. Amends the bughunt-2 §5-S Q5 'consecutive
+// run' wording — the dated amendment note at the round-2 anchor
+// (docs/spec/components/scheduler.typ, sched.retry rules) records the
+// supersession; this signature is the counter-signed authorization.
 pub const BOUNDED_UNCHARGED: &[(OutcomeClass, u32)] = &[
     (OutcomeClass::Disconnected, WORKER_ABORT_FREE_CLOSES),
     (OutcomeClass::StoreDegraded, STORE_DEGRADED_FREE_RUN),
 ];
 
 /// Admit one store-degraded report against the attempt history: count
-/// the TRAILING run of build-lane store-degraded pacing rows
-/// (`Attempt ∧ StoreDegraded ∧ Worker` — exactly the row the uncharged
-/// paced write appends) and admit `Uncharged` only while the run is
+/// the store-degraded pacing rows (`Attempt ∧ StoreDegraded ∧ Worker`
+/// — exactly the row the uncharged paced write appends) within the
+/// TRAILING bounded-uncharged union run (bug_098, signed bughunt-3 §5
+/// Q1) and admit `Uncharged` only while that per-class count is
 /// strictly below `bound`; at the bound the report falls through to
 /// the CHARGED infra path (counted budget → operator-visible poison),
 /// mirroring [`admit_worker_abort`]'s discipline.
 ///
 /// Lane discipline (the kind partition): MATERIALIZATION-lane rows are
-/// skipped exactly as [`decide`]'s fold skips them; any OTHER
-/// build-lane row (a charged classification, a reset, a worker abort)
-/// breaks the run — the unbounded-mint signature is consecutive
-/// flagged reports with nothing else happening to the lane.
-// r[impl sched.retry.store-degraded-uncharged+2]
+/// skipped exactly as [`decide`]'s fold skips them. A SIBLING
+/// bounded-uncharged row (any other [`BOUNDED_UNCHARGED`] class)
+/// EXTENDS the run without advancing this class's count. Any
+/// build-lane row OUTSIDE the union (a charged classification, a
+/// controller row, a reset) breaks the run — the unbounded-mint
+/// signature is a run of uncharged flagged reports with nothing
+/// charged happening to the lane.
+// r[impl sched.retry.store-degraded-uncharged+3]
 pub fn admit_store_degraded<Id>(rows: &[LedgerRow<Id>], bound: u32) -> WorkerAbortAdmission {
-    let mut run: u32 = 0;
-    let mut i = rows.len();
-    while i > 0 {
-        i -= 1;
-        let r = &rows[i];
+    admit_bounded_uncharged(rows, OutcomeClass::StoreDegraded, bound)
+}
+
+/// Membership predicate for the trailing bounded-uncharged UNION run,
+/// derived from [`BOUNDED_UNCHARGED`] itself: a build-lane,
+/// worker-reported `Attempt` row whose outcome class appears in the
+/// registry — exactly the row template every uncharged close/paced
+/// write appends. Deriving the predicate from the registry is the
+/// composition law's keystone (bug_098): a future bounded-uncharged
+/// class joins the union — and therefore EXTENDS every existing
+/// class's run scan instead of breaking it — by construction, with no
+/// per-admission edit to forget.
+// r[impl sched.retry.store-degraded-uncharged+3]
+// r[impl sched.attempt.worker-abort-bounded+2]
+pub fn is_bounded_uncharged_row<Id>(r: &LedgerRow<Id>) -> bool {
+    r.kind == AttemptKind::Build
+        && r.event_kind == AttemptEventKind::Attempt
+        && r.reporting_party == ReportingParty::Worker
+        && BOUNDED_UNCHARGED.iter().any(|(c, _)| *c == r.outcome_class)
+}
+
+/// Count `class` rows within the trailing bounded-uncharged union run:
+/// one reverse scan; materialization-lane rows are skipped (the kind
+/// partition); the scan stops at the first build-lane row outside the
+/// union (charged/controller/reset — the run breakers); sibling
+/// bounded-uncharged rows extend the scan without advancing the count.
+pub fn trailing_uncharged_class_count<Id>(rows: &[LedgerRow<Id>], class: OutcomeClass) -> u32 {
+    let mut count: u32 = 0;
+    for r in rows.iter().rev() {
         if r.kind != AttemptKind::Build {
             continue;
         }
-        let is_paced = r.event_kind == AttemptEventKind::Attempt
-            && r.outcome_class == OutcomeClass::StoreDegraded
-            && r.reporting_party == ReportingParty::Worker;
-        if !is_paced {
+        if !is_bounded_uncharged_row(r) {
             break;
         }
-        run += 1;
-        if run >= bound {
-            return WorkerAbortAdmission::ChargedFallthrough;
+        if r.outcome_class == class {
+            count += 1;
         }
     }
-    WorkerAbortAdmission::Uncharged
+    count
+}
+
+/// The shared admission: `Uncharged` while `class`'s count within the
+/// trailing bounded-uncharged union run is strictly below `bound`;
+/// `ChargedFallthrough` at the bound. Both public admissions delegate
+/// here, so the run-membership semantics cannot fork per class again.
+fn admit_bounded_uncharged<Id>(
+    rows: &[LedgerRow<Id>],
+    class: OutcomeClass,
+    bound: u32,
+) -> WorkerAbortAdmission {
+    if trailing_uncharged_class_count(rows, class) >= bound {
+        WorkerAbortAdmission::ChargedFallthrough
+    } else {
+        WorkerAbortAdmission::Uncharged
+    }
 }
 
 /// Sweep eligibility of one `drv_executions` lifecycle ROW (not a
@@ -2183,7 +2244,7 @@ pub fn classify(event: &ObservedFailure<'_>, floor: FloorOutcomeView) -> Outcome
         ObservedFailure::ControllerDeadlineExceeded => OutcomeClass::Timeout,
         ObservedFailure::BackstopTimeout => OutcomeClass::Backstop,
         ObservedFailure::UnreportedCrash => OutcomeClass::ExecutorCrash,
-        // r[impl sched.retry.store-degraded-uncharged+2]
+        // r[impl sched.retry.store-degraded-uncharged+3]
         ObservedFailure::WorkerStoreDegraded => OutcomeClass::StoreDegraded,
     }
 }
@@ -2282,7 +2343,7 @@ mod tests {
             /// Routing/dispatch verdict marker — fold no-op.
             VerdictMarker,
             /// Uncharged pacing class — MUST carry a finite
-            /// consecutive-run bound in `BOUNDED_UNCHARGED`.
+            /// per-class union-run bound in `BOUNDED_UNCHARGED`.
             BoundedUncharged,
         }
 
@@ -2359,7 +2420,7 @@ mod tests {
 
     /// `admit_worker_abort` decision table (bug_279): the trailing
     /// build-lane free-close run, the lane skip, and the run breakers.
-    // r[verify sched.attempt.worker-abort-bounded]
+    // r[verify sched.attempt.worker-abort-bounded+2]
     #[test]
     fn worker_abort_admission_table() {
         use WorkerAbortAdmission::{ChargedFallthrough, Uncharged};
@@ -2398,7 +2459,8 @@ mod tests {
             ChargedFallthrough
         );
         // run-broken-by-controller-row: a trailing controller
-        // Disconnected breaks the run (consecutive WORKER aborts only).
+        // Disconnected breaks the run (worker-party rows only; a
+        // controller row sits outside the bounded-uncharged union).
         assert_eq!(
             admit_worker_abort(&[free(1), free(2), free(3), controller_disc(4)], bound),
             Uncharged
@@ -2425,6 +2487,133 @@ mod tests {
         };
         assert_eq!(
             admit_worker_abort(&[free(1), free(2), reset, free(4)], bound),
+            Uncharged
+        );
+    }
+
+    /// bug_098 (round 3): the bounded-uncharged classes must COMPOSE.
+    /// Simulate the mint loop — each `Uncharged` admission appends
+    /// exactly the row its uncharged close writes — strictly
+    /// alternating the two registry classes. Pigeonhole over the union
+    /// run: once the trailing bounded-uncharged run holds
+    /// `WORKER_ABORT_FREE_CLOSES` worker-abort rows OR
+    /// `STORE_DEGRADED_FREE_RUN` store-degraded rows, the next
+    /// admission of that class MUST be `ChargedFallthrough`, so the
+    /// total uncharged mint within one run is strictly bounded by
+    /// `(WORKER_ABORT_FREE_CLOSES - 1) + (STORE_DEGRADED_FREE_RUN - 1) + 1`
+    /// admissions. Pre-fix, each class's row broke the OTHER class's
+    /// trailing run, both runs idled at <= 1, and the loop below ran
+    /// to exhaustion without a single charged fallthrough — the
+    /// unbounded uncharged-requeue mint both signed bounds exist to
+    /// close.
+    // r[verify sched.retry.store-degraded-uncharged+3]
+    // r[verify sched.attempt.worker-abort-bounded+2]
+    #[test]
+    fn bounded_uncharged_classes_compose_under_alternation() {
+        use WorkerAbortAdmission::{ChargedFallthrough, Uncharged};
+        let row = |class: OutcomeClass, at: u64| LedgerRow::<u8> {
+            event_kind: AttemptEventKind::Attempt,
+            outcome_class: class,
+            executor: None,
+            reporting_party: ReportingParty::Worker,
+            floor_promoted: false,
+            floor_at_cap: false,
+            resubmit_cycle: 0,
+            at,
+            kind: AttemptKind::Build,
+        };
+        let ceiling = (WORKER_ABORT_FREE_CLOSES - 1) + (STORE_DEGRADED_FREE_RUN - 1) + 1;
+        let mut rows: Vec<LedgerRow<u8>> = Vec::new();
+        for i in 0..(2 * ceiling as u64) {
+            let (class, admit) = if i % 2 == 0 {
+                (
+                    OutcomeClass::Disconnected,
+                    admit_worker_abort(&rows, WORKER_ABORT_FREE_CLOSES),
+                )
+            } else {
+                (
+                    OutcomeClass::StoreDegraded,
+                    admit_store_degraded(&rows, STORE_DEGRADED_FREE_RUN),
+                )
+            };
+            match admit {
+                ChargedFallthrough => {
+                    assert!(
+                        (rows.len() as u32) < ceiling,
+                        "composed bound tripped only after {} uncharged closes \
+                         (pigeonhole ceiling {})",
+                        rows.len(),
+                        ceiling
+                    );
+                    return;
+                }
+                Uncharged => rows.push(row(class, i)),
+            }
+        }
+        panic!(
+            "strict alternation minted {} uncharged closes without ever \
+             reaching ChargedFallthrough - the bounded-uncharged classes \
+             do not compose (bug_098)",
+            rows.len()
+        );
+    }
+
+    /// The union-run extension table (bug_098): a sibling
+    /// bounded-uncharged row EXTENDS the trailing run without advancing
+    /// the other class's count; only rows outside the union (charged,
+    /// controller, reset) break it.
+    // r[verify sched.retry.store-degraded-uncharged+3]
+    // r[verify sched.attempt.worker-abort-bounded+2]
+    #[test]
+    fn bounded_uncharged_union_extension_table() {
+        use WorkerAbortAdmission::{ChargedFallthrough, Uncharged};
+        let abort = |at: u64| LedgerRow::<u8> {
+            event_kind: AttemptEventKind::Attempt,
+            outcome_class: OutcomeClass::Disconnected,
+            executor: None,
+            reporting_party: ReportingParty::Worker,
+            floor_promoted: false,
+            floor_at_cap: false,
+            resubmit_cycle: 0,
+            at,
+            kind: AttemptKind::Build,
+        };
+        let degraded = |at: u64| LedgerRow {
+            outcome_class: OutcomeClass::StoreDegraded,
+            ..abort(at)
+        };
+        let bound = WORKER_ABORT_FREE_CLOSES; // 3
+
+        // Sibling store-degraded rows interleave: the worker-abort
+        // count within the union run still reaches its own bound.
+        assert_eq!(
+            admit_worker_abort(
+                &[abort(1), degraded(2), abort(3), degraded(4), abort(5)],
+                bound
+            ),
+            ChargedFallthrough,
+            "siblings must extend, not break, the union run"
+        );
+        // ... and the same history admits a store-degraded report
+        // uncharged: its OWN count (2) is far below its bound (12).
+        assert_eq!(
+            admit_store_degraded(
+                &[abort(1), degraded(2), abort(3), degraded(4), abort(5)],
+                STORE_DEGRADED_FREE_RUN
+            ),
+            Uncharged
+        );
+        // A charged build row still breaks the union run for BOTH.
+        let infra = |at: u64| LedgerRow {
+            outcome_class: OutcomeClass::Infra,
+            ..abort(at)
+        };
+        assert_eq!(
+            admit_worker_abort(&[abort(1), abort(2), abort(3), infra(4), abort(5)], bound),
+            Uncharged
+        );
+        assert_eq!(
+            admit_store_degraded(&[degraded(1), degraded(2), infra(3), degraded(4)], 2),
             Uncharged
         );
     }
@@ -3385,7 +3574,7 @@ mod proofs {
     /// the four messages (52 bytes) plus the 28-byte marker; without an
     /// explicit bound CBMC keeps unwinding the search/compare loops far
     /// past anything the concrete messages can reach.
-    // r[verify sched.retry.store-degraded-uncharged+2]
+    // r[verify sched.retry.store-degraded-uncharged+3]
     /// bug_408: a history whose ATTEMPT rows are all build-lane
     /// store-degraded (reset rows and materialization-kind rows may
     /// interleave freely) charges nothing — every count counter zero,
@@ -3774,45 +3963,60 @@ mod proofs {
         );
     }
 
-    /// sched.attempt.worker-abort-bounded (bug_279): for EVERY bounded
-    /// history, `admit_worker_abort` answers `Uncharged` iff the
-    /// trailing build-lane free-close run is strictly below the bound
-    /// (the spec-side recount below is a forward scan — a structurally
-    /// different fold from the production reverse-break loop); and the
-    /// uncharged close the admission authorizes (appending exactly the
-    /// free-close row pull-mode writes) STRICTLY grows that run — so
-    /// consecutive uncharged admissions are bounded at
-    /// `WORKER_ABORT_FREE_CLOSES` by induction.
-    // r[verify sched.attempt.worker-abort-bounded]
+    /// Spec-side recount for the bounded-uncharged UNION law (bug_098,
+    /// signed bughunt-3 §5 Q1): a forward scan — structurally different
+    /// from the production reverse-break loop — that counts `class`
+    /// rows within the trailing union run. Union membership is the
+    /// LITERAL two-class enumeration (the registry's contents are
+    /// pinned by `uncharged_classes_are_bounded_or_marked` in
+    /// `mod tests`), kept independent of [`is_bounded_uncharged_row`]
+    /// so the oracle cannot inherit a production bug.
+    #[cfg(kani)]
+    fn trailing_union_count(rows: &[LedgerRow<u8>], class: OutcomeClass) -> u32 {
+        let mut count: u32 = 0;
+        let mut i = 0;
+        while i < rows.len() {
+            let r = &rows[i];
+            if r.kind == AttemptKind::Build {
+                let in_union = r.event_kind == AttemptEventKind::Attempt
+                    && r.reporting_party == ReportingParty::Worker
+                    && (r.outcome_class == OutcomeClass::Disconnected
+                        || r.outcome_class == OutcomeClass::StoreDegraded);
+                if in_union {
+                    if r.outcome_class == class {
+                        count += 1;
+                    }
+                } else {
+                    count = 0;
+                }
+            }
+            i += 1;
+        }
+        count
+    }
+
+    /// sched.attempt.worker-abort-bounded (bug_279; union composition
+    /// bug_098): for EVERY bounded history, `admit_worker_abort`
+    /// answers `Uncharged` iff the worker-abort count within the
+    /// trailing bounded-uncharged UNION run is strictly below the
+    /// bound; the uncharged close the admission authorizes STRICTLY
+    /// grows that count; and appending the SIBLING uncharged row (the
+    /// store-degraded paced write) PRESERVES it — extends the run,
+    /// never resets it. The three lemmas give boundedness by
+    /// induction even under adversarial interleaving of the registry
+    /// classes — the composition case the pre-fix per-class break
+    /// rule falsified.
+    // r[verify sched.attempt.worker-abort-bounded+2]
     #[kani::proof]
     #[kani::unwind(7)]
     fn check_worker_abort_bounded() {
         const MAX: usize = 4;
-
-        /// Forward-scan recount: reset on any non-free build-lane row,
-        /// skip materialization-lane rows.
-        fn trailing_free_run(rows: &[LedgerRow<u8>]) -> u32 {
-            let mut run: u32 = 0;
-            let mut i = 0;
-            while i < rows.len() {
-                let r = &rows[i];
-                if r.kind == AttemptKind::Build {
-                    let is_free = r.event_kind == AttemptEventKind::Attempt
-                        && r.outcome_class == OutcomeClass::Disconnected
-                        && r.reporting_party == ReportingParty::Worker;
-                    run = if is_free { run + 1 } else { 0 };
-                }
-                i += 1;
-            }
-            run
-        }
-
         let (mut rows, n) = any_history::<MAX>();
         kani::assume(n < MAX); // room for the appended close
 
         let admit = admit_worker_abort(&rows[..n], WORKER_ABORT_FREE_CLOSES);
-        let run = trailing_free_run(&rows[..n]);
-        assert!((admit == WorkerAbortAdmission::Uncharged) == (run < WORKER_ABORT_FREE_CLOSES));
+        let count = trailing_union_count(&rows[..n], OutcomeClass::Disconnected);
+        assert!((admit == WorkerAbortAdmission::Uncharged) == (count < WORKER_ABORT_FREE_CLOSES));
 
         // Growth lemma: the authorized close appends a free-close row
         // (arbitrary time/cycle/floor metadata — only the four
@@ -3822,18 +4026,25 @@ mod proofs {
         rows[n].event_kind = AttemptEventKind::Attempt;
         rows[n].outcome_class = OutcomeClass::Disconnected;
         rows[n].reporting_party = ReportingParty::Worker;
-        assert!(trailing_free_run(&rows[..n + 1]) == run + 1);
+        assert!(trailing_union_count(&rows[..n + 1], OutcomeClass::Disconnected) == count + 1);
+
+        // Composition lemma (bug_098): the sibling paced write
+        // preserves this class's count — the run extends instead of
+        // resetting.
+        rows[n].outcome_class = OutcomeClass::StoreDegraded;
+        assert!(trailing_union_count(&rows[..n + 1], OutcomeClass::Disconnected) == count);
     }
 
-    /// sched.retry.store-degraded-uncharged (merged_bug_032): for EVERY
-    /// bounded history, `admit_store_degraded` answers `Uncharged` iff
-    /// the trailing build-lane store-degraded run is strictly below the
-    /// bound (forward-scan recount vs the production reverse-break
-    /// loop); and the paced write the admission authorizes STRICTLY
-    /// grows that run — so consecutive uncharged store-degraded
-    /// admissions are bounded at `STORE_DEGRADED_FREE_RUN` by
-    /// induction, closing the worker-supplied unbounded-mint.
-    // r[verify sched.retry.store-degraded-uncharged+2]
+    /// sched.retry.store-degraded-uncharged (merged_bug_032; union
+    /// composition bug_098): for EVERY bounded history,
+    /// `admit_store_degraded` answers `Uncharged` iff the
+    /// store-degraded count within the trailing bounded-uncharged
+    /// UNION run is strictly below the bound; the authorized paced
+    /// write STRICTLY grows that count; and the sibling worker-abort
+    /// close PRESERVES it. Boundedness by induction under adversarial
+    /// interleaving — the worker-supplied unbounded mint stays closed
+    /// when the classes compose.
+    // r[verify sched.retry.store-degraded-uncharged+3]
     #[kani::proof]
     #[kani::unwind(7)]
     fn check_store_degraded_admission_bounded() {
@@ -3844,30 +4055,12 @@ mod proofs {
         let bound: u32 = kani::any();
         kani::assume(bound >= 1 && bound <= 3);
 
-        /// Forward-scan recount: reset on any non-paced build-lane
-        /// row, skip materialization-lane rows.
-        fn trailing_paced_run(rows: &[LedgerRow<u8>]) -> u32 {
-            let mut run: u32 = 0;
-            let mut i = 0;
-            while i < rows.len() {
-                let r = &rows[i];
-                if r.kind == AttemptKind::Build {
-                    let is_paced = r.event_kind == AttemptEventKind::Attempt
-                        && r.outcome_class == OutcomeClass::StoreDegraded
-                        && r.reporting_party == ReportingParty::Worker;
-                    run = if is_paced { run + 1 } else { 0 };
-                }
-                i += 1;
-            }
-            run
-        }
-
         let (mut rows, n) = any_history::<MAX>();
         kani::assume(n < MAX); // room for the appended paced row
 
         let admit = admit_store_degraded(&rows[..n], bound);
-        let run = trailing_paced_run(&rows[..n]);
-        assert!((admit == WorkerAbortAdmission::Uncharged) == (run < bound));
+        let count = trailing_union_count(&rows[..n], OutcomeClass::StoreDegraded);
+        assert!((admit == WorkerAbortAdmission::Uncharged) == (count < bound));
 
         // Growth lemma: the authorized paced write appends exactly the
         // four pinned discriminants.
@@ -3875,7 +4068,72 @@ mod proofs {
         rows[n].event_kind = AttemptEventKind::Attempt;
         rows[n].outcome_class = OutcomeClass::StoreDegraded;
         rows[n].reporting_party = ReportingParty::Worker;
-        assert!(trailing_paced_run(&rows[..n + 1]) == run + 1);
+        assert!(trailing_union_count(&rows[..n + 1], OutcomeClass::StoreDegraded) == count + 1);
+
+        // Composition lemma (bug_098): the sibling free close
+        // preserves this class's count.
+        rows[n].outcome_class = OutcomeClass::Disconnected;
+        assert!(trailing_union_count(&rows[..n + 1], OutcomeClass::StoreDegraded) == count);
+    }
+
+    /// bug_098 pigeonhole (signed bughunt-3 §5 Q1): within ONE trailing
+    /// bounded-uncharged union run, the total uncharged mint is
+    /// strictly bounded — whenever BOTH admissions answer `Uncharged`,
+    /// the union run's length is at most
+    /// `(bound_abort − 1) + (bound_degraded − 1)`, because the run is
+    /// EXACTLY the two per-class counts (membership totality) and each
+    /// count sits strictly below its own bound. Strict alternation —
+    /// or ANY adversarial interleaving — therefore reaches
+    /// `ChargedFallthrough` in bounded admissions; the pre-fix mutual
+    /// reset made this length unbounded.
+    // r[verify sched.retry.store-degraded-uncharged+3]
+    // r[verify sched.attempt.worker-abort-bounded+2]
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn check_bounded_uncharged_union_composition() {
+        const MAX: usize = 4;
+
+        /// Length of the trailing union run (forward scan, all
+        /// membership classes counted together).
+        fn trailing_union_len(rows: &[LedgerRow<u8>]) -> u32 {
+            let mut len: u32 = 0;
+            let mut i = 0;
+            while i < rows.len() {
+                let r = &rows[i];
+                if r.kind == AttemptKind::Build {
+                    let in_union = r.event_kind == AttemptEventKind::Attempt
+                        && r.reporting_party == ReportingParty::Worker
+                        && (r.outcome_class == OutcomeClass::Disconnected
+                            || r.outcome_class == OutcomeClass::StoreDegraded);
+                    len = if in_union { len + 1 } else { 0 };
+                }
+                i += 1;
+            }
+            len
+        }
+
+        let bound_abort: u32 = kani::any();
+        let bound_degraded: u32 = kani::any();
+        kani::assume(bound_abort >= 1 && bound_abort <= 3);
+        kani::assume(bound_degraded >= 1 && bound_degraded <= 3);
+
+        let (rows, n) = any_history::<MAX>();
+
+        // Membership totality: the union run decomposes exactly into
+        // the two per-class counts — no third population exists.
+        let abort_count = trailing_union_count(&rows[..n], OutcomeClass::Disconnected);
+        let degraded_count = trailing_union_count(&rows[..n], OutcomeClass::StoreDegraded);
+        assert!(trailing_union_len(&rows[..n]) == abort_count + degraded_count);
+
+        // Pigeonhole: both admissions uncharged ⇒ the run (and with it
+        // the uncharged mint it represents) is strictly bounded by the
+        // sum of the per-class headrooms.
+        let both_uncharged = admit_worker_abort(&rows[..n], bound_abort)
+            == WorkerAbortAdmission::Uncharged
+            && admit_store_degraded(&rows[..n], bound_degraded) == WorkerAbortAdmission::Uncharged;
+        if both_uncharged {
+            assert!(trailing_union_len(&rows[..n]) <= (bound_abort - 1) + (bound_degraded - 1));
+        }
     }
 
     // r[verify store.log.sweep-ownership+1]

@@ -1723,7 +1723,7 @@ async fn attempt_outcome_pull_pod_report_with_job_name_still_closes_attempt() ->
     Ok(())
 }
 
-// r[verify sched.attempt.worker-abort-bounded]
+// r[verify sched.attempt.worker-abort-bounded+2]
 /// bug_279 (A2): the AD5 worker-abort uncharged close is LEDGER-BOUNDED.
 /// Three consecutive worker-abort closures on the same derivation are
 /// charge-free (the as-built AD5 posture); the FOURTH — arriving with a
