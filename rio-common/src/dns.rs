@@ -72,25 +72,42 @@ impl Dns1123Label {
     /// ≤ `DNS1123_MAX_LEN - reserved`, leaving `reserved` chars of
     /// suffix budget for [`Self::with_worker`].
     ///
-    /// - A raw that is already a valid label within the budget passes
-    ///   through unchanged.
-    /// - A raw that must be ALTERED (case-folded, invalid bytes
-    ///   replaced, or truncated to fit the budget) gets a 4-hex
-    ///   deterministic FNV-1a salt of the raw appended — injectivity
-    ///   stays good enough that two replicas folding to one base
-    ///   cannot share an identity, and the same raw maps to the same
-    ///   identity across restarts (re-claims resume as the same
-    ///   identity).
-    /// - An empty/garbage raw falls back to `{fallback_stem}-{salt}`
-    ///   with a per-process RANDOM salt and a loud warning: two
-    ///   unidentifiable replicas must still not collide.
+    /// Output-space law (merged_bug_127): every machine-salted label
+    /// ends in `-{8 lowercase hex}`, and the pass-through arm REFUSES
+    /// raws of that shape (they route through the salted arm instead).
+    /// The two output namespaces are therefore structurally disjoint —
+    /// a pass-through identity can never equal a salted identity, by
+    /// construction, not by probability.
     ///
-    /// `reserved` is clamped so at least one identity char survives.
+    /// - A raw that is already a valid label within the budget passes
+    ///   through unchanged — unless it is salt-shaped (above).
+    /// - A raw that must be ALTERED (case-folded, invalid bytes
+    ///   replaced, truncated to fit the budget, or salt-shaped) gets
+    ///   an 8-hex deterministic FNV-1a salt of the FULL raw appended.
+    ///   Within the salted arm, a collision between two distinct raws
+    ///   sharing the truncated stem requires a 32-bit FNV-1a
+    ///   collision (~2⁻³² per pair) — the previous 16-bit salt made
+    ///   that ~2⁻¹⁶ and DETERMINISTIC forever for an unlucky pair of
+    ///   release names (no randomness to escape on restart).
+    /// - An empty/garbage raw falls back to `{fallback_stem}-{salt}`
+    ///   with a per-process RANDOM 8-hex salt and a loud warning: two
+    ///   unidentifiable replicas must still not collide (the fallback
+    ///   emits the salted SHAPE, so it shares the salted namespace).
+    ///
+    /// `reserved` is clamped so at least one identity char survives
+    /// next to the salt footprint.
+    ///
+    /// Deploy boundary (recorded trade, extends the merged_bug_243
+    /// note): widening the salt and refusing salt-shaped pass-throughs
+    /// shifts the affected identities ONCE at rollout; the scheduler's
+    /// establishment sweep absorbs the orphaned claims of the old
+    /// identities, exactly as for the original truncation change.
     // r[impl store.materialize.worker-identity]
     pub fn sanitize(raw: &str, reserved: usize, fallback_stem: &str) -> Dns1123Label {
-        // 5 = the salt suffix's own footprint ("-xxxx"), kept inside
-        // the budget when the altered arm fires.
-        let budget = DNS1123_MAX_LEN.saturating_sub(reserved).max(6);
+        // 9 = the salt suffix's own footprint ("-xxxxxxxx"), kept
+        // inside the budget when the altered arm fires; floor keeps
+        // one stem char beside it.
+        let budget = DNS1123_MAX_LEN.saturating_sub(reserved).max(10);
         let mut out: String = raw
             .chars()
             .map(|c| match c {
@@ -112,18 +129,31 @@ impl Dns1123Label {
                 raw,
                 "no usable identity in raw hostname; using a random-salted dev identity"
             );
-            return Dns1123Label(format!("{fallback_stem}-{:04x}", nonce & 0xffff));
+            return Dns1123Label(format!("{fallback_stem}-{:08x}", nonce & 0xffff_ffff));
         }
-        if out == raw {
+        if out == raw && !Self::is_salt_shaped(&out) {
             return Dns1123Label(out);
         }
-        // Sanitization altered the raw (including budget truncation):
-        // disambiguate with the deterministic salt so distinct raws
-        // cannot fold to one label. Base re-trimmed to keep the salt
-        // inside the budget.
-        out.truncate(budget - 5);
+        // Sanitization altered the raw (including budget truncation),
+        // or the raw wears the salted arm's own shape: disambiguate
+        // with the deterministic salt so distinct raws cannot fold to
+        // one label and the output namespaces stay disjoint. Base
+        // re-trimmed to keep the salt inside the budget.
+        out.truncate(budget - 9);
         let out = out.trim_matches('-');
-        Dns1123Label(format!("{out}-{:04x}", fnv1a_64(raw) & 0xffff))
+        Dns1123Label(format!("{out}-{:08x}", fnv1a_64(raw) & 0xffff_ffff))
+    }
+
+    /// The salted arm's output shape: a final `-` segment of exactly
+    /// 8 lowercase hex chars. Pass-through refuses this shape so the
+    /// two output namespaces cannot overlap.
+    fn is_salt_shaped(s: &str) -> bool {
+        s.rsplit_once('-').is_some_and(|(_, seg)| {
+            seg.len() == 8
+                && seg
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
     }
 
     /// The ONE composition operation: the per-worker wire identity
@@ -246,16 +276,81 @@ mod tests {
             raw.as_str(),
             "must be altered to fit the budget"
         );
-        assert!(label.as_str().ends_with(&format!("-{:04x}", {
-            // the salt is over the RAW, pinned here so a refactor that
-            // salts the truncation instead breaks loudly
+        assert!(label.as_str().ends_with(&format!("-{:08x}", {
+            // the salt is over the RAW at full 32-bit width, pinned
+            // here so a refactor that salts the truncation instead —
+            // or quietly narrows the salt again (merged_bug_127) —
+            // breaks loudly
             let mut h: u64 = 0xcbf2_9ce4_8422_2325;
             for byte in raw.bytes() {
                 h ^= u64::from(byte);
                 h = h.wrapping_mul(0x0000_0100_0000_01b3);
             }
-            h & 0xffff
+            h & 0xffff_ffff
         })));
+    }
+
+    /// merged_bug_127 surface 1: pairwise distinctness over the
+    /// shared-prefix population the module exists to serve (long Helm
+    /// release pod names whose distinguishing ordinal sits past the
+    /// truncation point). The pinned pair was brute-forced to collide
+    /// in the OLD 16-bit salt (both `0x0d3e`) while their 32-bit salts
+    /// differ. RED (pre-fix): both raws produced the IDENTICAL label
+    /// `aaa…a-0d3e` — two replicas deterministically merged into one
+    /// scheduler identity on every restart, forever, with no
+    /// randomness to escape.
+    #[test]
+    fn shared_prefix_pair_stays_distinct() {
+        let stem = "a".repeat(60);
+        let raw_a = format!("{stem}498");
+        let raw_b = format!("{stem}784");
+        let s = |raw: &str| Dns1123Label::sanitize(raw, WORKER_SUFFIX_RESERVED, "rio-store-dev");
+        let a = s(&raw_a);
+        let b = s(&raw_b);
+        assert_ne!(
+            a, b,
+            "shared-prefix raws with colliding 16-bit salts must stay \
+             distinct under the 32-bit salt"
+        );
+        assert!(is_dns1123_label(a.as_str()));
+        assert!(is_dns1123_label(b.as_str()));
+        assert_eq!(a, s(&raw_a), "deterministic across restarts");
+        // And the worker compositions stay distinct too — the value
+        // the scheduler actually keys on.
+        assert_ne!(a.with_worker(0), b.with_worker(0));
+    }
+
+    /// merged_bug_127 surface 2: the salted and pass-through output
+    /// spaces are structurally disjoint. A valid in-budget raw wearing
+    /// the salted arm's own shape (`{stem}-{8hex}`) must NOT pass
+    /// through verbatim — pre-fix it did, so a literal pod name could
+    /// occupy the exact identity a different replica's altered raw
+    /// salts onto. RED (pre-fix): `sanitize(x) == x` for
+    /// `x = "rio-store-deadbeef"`-class raws.
+    #[test]
+    fn salted_shape_never_passes_through() {
+        let raw = "rio-store-0badcafe"; // valid label, salt-shaped tail
+        let s = |raw: &str| Dns1123Label::sanitize(raw, WORKER_SUFFIX_RESERVED, "rio-store-dev");
+        let label = s(raw);
+        assert_ne!(
+            label.as_str(),
+            raw,
+            "salt-shaped raws must be re-salted, not passed through"
+        );
+        assert!(
+            Dns1123Label::is_salt_shaped(label.as_str()),
+            "re-salted output stays in the salted namespace: {label}"
+        );
+        assert_eq!(label, s(raw), "deterministic across restarts");
+        // Non-salt-shaped tails keep passing through untouched: 5-char
+        // k8s ReplicaSet-style suffixes and short hex don't match.
+        for ok in ["rio-store-7f3a", "rio-store-abc12", "rio-store-w0"] {
+            assert_eq!(
+                s(ok).as_str(),
+                ok,
+                "non-salt-shaped raw {ok} passes through"
+            );
+        }
     }
 
     proptest! {
@@ -283,6 +378,31 @@ mod tests {
                 let again = Dns1123Label::sanitize(&raw, WORKER_SUFFIX_RESERVED, "rio-store-dev")
                     .with_worker(n);
                 prop_assert_eq!(composed, again);
+            }
+        }
+
+        /// merged_bug_127 namespace-disjointness LAW over arbitrary
+        /// raws: an output either equals its raw (pass-through, never
+        /// salt-shaped) or ends in the 8-hex salt segment (altered or
+        /// fallback) — there is no third shape, so the two namespaces
+        /// partition the output space and cross-arm collisions are
+        /// unrepresentable.
+        #[test]
+        fn output_namespaces_are_disjoint(raw in ".{0,100}") {
+            let label = Dns1123Label::sanitize(&raw, WORKER_SUFFIX_RESERVED, "rio-store-dev");
+            if label.as_str() == raw {
+                prop_assert!(
+                    !Dns1123Label::is_salt_shaped(label.as_str()),
+                    "pass-through output wears the salted shape: {:?}",
+                    label.as_str()
+                );
+            } else {
+                prop_assert!(
+                    Dns1123Label::is_salt_shaped(label.as_str()),
+                    "altered output missing the salt segment: {:?} from {:?}",
+                    label.as_str(),
+                    raw
+                );
             }
         }
     }
