@@ -484,7 +484,14 @@ async fn test_query_missing_reports_will_build() -> anyhow::Result<()> {
 /// just uploaded it, so substitution never fires.
 #[tokio::test]
 async fn test_query_missing_reports_will_substitute() -> anyhow::Result<()> {
-    let mut h = GatewaySession::new_with_handshake().await?;
+    // The session carries a JWT so the FindMissingPaths probe rides
+    // x-rio-tenant-token (the merge-time channel, I-202). Since
+    // merged_bug_003 the store — and the mock mirroring it — answers
+    // scope-less probes with EMPTY substitutable: an anonymous session
+    // is told to build what a tenant-scoped one could fetch. The
+    // substitutable partition asserted below therefore requires the
+    // production posture: a verified, tenant-visible probe.
+    let mut h = GatewaySession::new_with_jwt_handshake("test-jwt-query-missing").await?;
 
     // Two .drvs seeded with ATerm content so resolve_derivation works.
     // sub.drv's output is substitutable (upstream cache has it);
