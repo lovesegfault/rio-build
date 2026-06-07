@@ -1161,8 +1161,8 @@ enum EventSource {
     NeedsReattach,
 }
 
-/// Bounds consecutive re-attach cycles, resetting ONLY on organic
-/// build events.
+/// Bounds consecutive re-attach cycles, resetting only on organic
+/// build events or on evidenced recovery.
 ///
 /// "Organic" = an event produced by build progress itself (started,
 /// progress, derivation, phase, substitute-progress, inputs-resolved,
@@ -1173,11 +1173,27 @@ enum EventSource {
 /// event made `MAX_RECONNECT` vacuous for exactly that storm
 /// (counter: 0 → 1 → snapshot resets → 0 → … forever, at zero
 /// backoff).
-// r[impl gw.resync.reattach-budget]
+///
+/// "Evidenced recovery" = the dying stream held `Live` longer than
+/// [`Self::LIVE_TENURE_RESET`] (bug_068): a long single-derivation
+/// compile emits no organic event for hours (progress is
+/// state-change-driven; logs ride the store-side `LogTailSet`), so
+/// without a tenure reset the per-build budget becomes a lifetime
+/// counter and failover #2 of a quiet build exhausts mid-recovery.
+/// Storms never accrue tenure — they cycle death→snapshot in
+/// seconds — so the storm bound above is preserved.
+// r[impl gw.resync.reattach-budget+2]
 #[derive(Default)]
 struct ReattachBudget {
-    /// Consecutive re-attach cycles since the last organic event.
+    /// Consecutive re-attach cycles since the last organic event or
+    /// evidenced recovery.
     attempts: u32,
+    /// When the stream last (re-)entered `Live`. Armed by
+    /// [`Self::note_live_entered`], consumed by
+    /// [`Self::note_reattach`]: a tenure that outlasted
+    /// [`Self::LIVE_TENURE_RESET`] proves the previous outage ended,
+    /// so its charges do not bleed into the new one.
+    live_since: Option<std::time::Instant>,
 }
 
 impl ReattachBudget {
@@ -1211,10 +1227,46 @@ impl ReattachBudget {
         }
     }
 
+    /// Live tenure past which a stream death opens a NEW outage
+    /// rather than continuing the previous one. Storms cycle
+    /// death→snapshot→death within seconds (the resync path is
+    /// zero-backoff inside [`Self::ZERO_BACKOFF_STREAK`] and capped
+    /// at 16s by `RECONNECT_BACKOFF` past it), so they never reach
+    /// this; a genuine recovery holds `Live` for minutes. ~4× the
+    /// backoff cap.
+    const LIVE_TENURE_RESET: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// The watch (re-)entered `Live`: arm the tenure clock that
+    /// [`Self::note_reattach`] consults at the stream's death.
+    fn note_live_entered(&mut self) {
+        self.live_since = Some(std::time::Instant::now());
+    }
+
+    /// Test hook: pretend `Live` was entered `by` ago.
+    #[cfg(test)]
+    fn backdate_live_since_for_test(&mut self, by: std::time::Duration) {
+        if let Some(t) = self.live_since.as_mut() {
+            *t = t.checked_sub(by).expect("backdated Instant underflow");
+        }
+    }
+
     /// Charge one re-attach cycle (stream death, loss signal, or a
     /// failed `WatchBuild`/snapshot read). Returns the cycle number
     /// for logging.
+    ///
+    /// Consumes the armed `Live` tenure first: a dying stream that
+    /// stayed `Live` past [`Self::LIVE_TENURE_RESET`] is recovery
+    /// evidence — the charges that bought it belong to a previous,
+    /// finished outage, so this cycle starts a fresh budget
+    /// (bug_068). `take()` so one `Live` entry arms exactly one
+    /// potential reset: repeated failures inside `NeedsReattach`
+    /// keep charging the same outage.
     fn note_reattach(&mut self) -> u32 {
+        if let Some(since) = self.live_since.take()
+            && since.elapsed() >= Self::LIVE_TENURE_RESET
+        {
+            self.attempts = 0;
+        }
         self.attempts += 1;
         self.attempts
     }
@@ -1459,7 +1511,9 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     // any stream death or loss signal drops the stream (moving to
     // `NeedsReattach`) and only a successful WatchBuild whose first
     // message is the snapshot re-enters `Live`. The re-attach budget
-    // resets ONLY on organic events — see `ReattachBudget`.
+    // resets only on organic events or evidenced recovery (`Live`
+    // tenure at the next death) — see `ReattachBudget`.
+    budget.note_live_entered();
     let mut source = EventSource::Live(Box::new(event_stream));
     // The most recent stream error, reported to the caller when the
     // re-attach budget is exhausted (re-attach failures themselves are
@@ -1617,7 +1671,10 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                                 // A snapshot is connection machinery, not an
                                 // organic event: the budget is NOT reset here.
                                 // It resets on the first organic event the new
-                                // stream yields (inside process_build_events).
+                                // stream yields (inside process_build_events)
+                                // or, retroactively, by this stream's Live
+                                // tenure when it next dies (`note_reattach` —
+                                // evidenced recovery, bug_068).
                                 match apply_snapshot(stderr, &mut act, &mut tails, snap).await? {
                                     Some(outcome) => break Ok(outcome),
                                     None => {
@@ -1662,7 +1719,10 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                     }
                 };
                 match reattached {
-                    Some(stream) => source = EventSource::Live(Box::new(stream)),
+                    Some(stream) => {
+                        budget.note_live_entered();
+                        source = EventSource::Live(Box::new(stream));
+                    }
                     None => {
                         // The cycle failed before any stream existed:
                         // charge the budget and pace the next attempt.
@@ -3508,7 +3568,7 @@ mod tests {
     // snapshot-cycles — the storm refreshes its own cap forever.
     // Probe applied + reverted, see commit body.
 
-    // r[verify gw.resync.reattach-budget]
+    // r[verify gw.resync.reattach-budget+2]
     /// A snapshot-then-resync storm consumes the budget: snapshots do
     /// NOT reset it, so MAX_RECONNECT cycles exhaust the watch instead
     /// of looping forever at zero backoff.
@@ -3536,7 +3596,7 @@ mod tests {
         );
     }
 
-    // r[verify gw.resync.reattach-budget]
+    // r[verify gw.resync.reattach-budget+2]
     /// Organic events — and ONLY organic events — reset the budget.
     /// Exhaustive over the event alphabet so a new variant must be
     /// classified here as well as in `note_event` itself.
@@ -3572,6 +3632,55 @@ mod tests {
             budget.note_event(ev);
             assert_eq!(budget.attempts, 2, "machinery event must NOT reset: {ev:?}");
         }
+    }
+
+    // r[verify gw.resync.reattach-budget+2]
+    /// Two time-separated failovers: charges from a fully-recovered
+    /// failover must not bleed into the next outage's budget. A dying
+    /// stream whose `Live` tenure outlasted the backoff cap is
+    /// recovery evidence — the next death opens a FRESH outage at
+    /// attempt 1 (bug_068: pre-fix the budget was a lifetime counter
+    /// across organic-quiet windows, so failover #2 of a long quiet
+    /// compile exhausted mid-recovery).
+    #[test]
+    fn second_failover_after_long_live_tenure_gets_a_fresh_budget() {
+        let mut budget = super::ReattachBudget::default();
+        // Failover #1: stream death + four failed WatchBuild opens.
+        for _ in 0..5 {
+            budget.note_reattach();
+        }
+        // Re-attach succeeds; Live re-entered; an hour of healthy
+        // stream with zero organic events (single-derivation compile
+        // phase — logs ride the independent LogTailSet).
+        budget.note_live_entered();
+        budget.backdate_live_since_for_test(std::time::Duration::from_secs(3600));
+        // Failover #2: the first charge of a NEW outage.
+        let attempt = budget.note_reattach();
+        assert_eq!(
+            attempt, 1,
+            "a failover after evidenced recovery (long Live tenure) must get a fresh budget"
+        );
+    }
+
+    // r[verify gw.resync.reattach-budget+2]
+    /// The merged_bug_056 storm bound survives the tenure reset: a
+    /// storm cycles death→snapshot→Live in seconds, never accruing
+    /// the Live tenure that evidences recovery, so its budget still
+    /// exhausts.
+    #[test]
+    fn storm_with_short_live_tenure_still_exhausts() {
+        let mut budget = super::ReattachBudget::default();
+        for cycle in 0..=super::MAX_RECONNECT {
+            assert!(!budget.exhausted(), "exhausted early at cycle {cycle}");
+            // Each cycle re-enters Live for only an instant before
+            // the next loss signal.
+            budget.note_live_entered();
+            budget.note_reattach();
+        }
+        assert!(
+            budget.exhausted(),
+            "short-tenure storm cycles must still exhaust"
+        );
     }
 
     // r[verify gw.resync.loss-signal+1]

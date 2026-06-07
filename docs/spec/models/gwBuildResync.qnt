@@ -21,7 +21,12 @@
 //       budget, and only the owed snapshot's apply reconciles the
 //       display and re-enters the live regime;
 //     - the re-attach budget (resyncStreak) resets ONLY on organic
-//       delivered events — never on the snapshot apply. The oracle
+//       delivered events — never on the snapshot apply. (The code
+//       adds one further lawful reset OUTSIDE this model's frame:
+//       evidenced recovery, a wall-clock Live tenure exceeding the
+//       backoff cap at the next death — bug_068, pinned by unit
+//       tests at build.rs. This model has no wall clock; within its
+//       frame the only-organic claim stands.) The oracle
 //       seat cyclesSinceOrganic counts the same cycles from the live
 //       actions; the invariant pins the gateway's counter to it, so a
 //       "reset on snapshot" implementation diverges immediately;
@@ -279,7 +284,9 @@ module gwBuildResync {
   // (reattachFailed) or succeed and owe the snapshot (reattachOk), and
   // only the snapshot apply reconciles and re-enters the live regime.
   // The budget charges per cycle and resets ONLY on organic receipts —
-  // snapshotApply keeps it (the fix pivot).
+  // snapshotApply keeps it (the fix pivot). The code's second lawful
+  // reset (evidenced recovery via wall-clock Live tenure, bug_068) is
+  // outside this model's frame — see the header note.
 
   /// The gateway reads ResyncRequired off the live stream: the stream
   /// is dead from here, the display checkpoint is taken.

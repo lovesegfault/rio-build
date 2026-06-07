@@ -2041,16 +2041,24 @@ zero-backoff hot loop --- the pre-fix reset-on-any-event made
 #(refs.const)("MAX_RECONNECT") vacuous for exactly that storm, because the
 snapshot each cycle delivered refreshed the cap.
 
-#r("gw.resync.reattach-budget")[
+#r("gw.resync.reattach-budget+2")[
   The gateway MUST bound consecutive `WatchBuild` re-attach cycles with a
-  budget that resets ONLY on organic build events; `snapshot` and
-  `resync_required` events MUST NOT reset it; when the budget exceeds
-  `MAX_RECONNECT` the watch MUST fail to the client.
+  budget that resets only on organic build events or on evidenced recovery
+  --- a dying stream whose `Live` tenure exceeded the re-attach backoff
+  cap; `snapshot` and `resync_required` events MUST NOT reset it; when the
+  budget exceeds `MAX_RECONNECT` within one outage the watch MUST fail to
+  the client.
 ]
 "Organic" is the same classification #rref("gw.reconnect.backoff") uses:
 events produced by build progress itself. The classification is exhaustive
 in code (`ReattachBudget::note_event` matches every `BuildEvent` variant),
 so a new event variant cannot silently default into either class.
+"Evidenced recovery" closes the opposite polarity: a long quiet compile
+emits no organic event for hours (progress is state-change-driven; logs
+ride the store-side tail), so without a tenure reset the per-build budget
+is a lifetime counter and a later routine failover exhausts it
+mid-recovery. Storms never accrue tenure --- the storm bound above is
+unchanged.
 
 #r("gw.resync.snapshot-owed")[
   After a loss signal or stream death the gateway MUST stop consuming the
