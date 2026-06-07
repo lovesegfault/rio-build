@@ -153,6 +153,43 @@ impl ClaimedJob {
     }
 }
 
+/// bug_116 — the accrued-claims accumulator. `poll_and_claim` returns
+/// ITS OWN accumulator (constructed exactly once at entry): every exit
+/// arm — including the three listing-failure arms that previously
+/// returned a fresh empty vec, discarding assignments the resume pass
+/// had already claimed and ledger-resolved — returns the same set, so
+/// the discard is structurally unwritable rather than
+/// convention-protected (`return Vec::new()` no longer typechecks
+/// against the return type).
+#[must_use = "claimed assignments must be executed or aborted — dropping them strands open attempts"]
+pub struct ClaimedSet(Vec<ClaimedJob>);
+
+impl ClaimedSet {
+    /// The ONE construction site, called at `poll_and_claim` entry.
+    fn begin() -> Self {
+        ClaimedSet(Vec::new())
+    }
+
+    fn push(&mut self, job: ClaimedJob) {
+        self.0.push(job);
+    }
+}
+
+impl std::ops::Deref for ClaimedSet {
+    type Target = [ClaimedJob];
+    fn deref(&self) -> &[ClaimedJob] {
+        &self.0
+    }
+}
+
+impl IntoIterator for ClaimedSet {
+    type Item = ClaimedJob;
+    type IntoIter = std::vec::IntoIter<ClaimedJob>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
 /// Origin sentinel stamped when a delivery's wire-echoed job binding
 /// (`WorkAssignment.job_id`, merged_bug_026) names a DIFFERENT job
 /// than the client-side identity the pull was issued under: the
@@ -395,11 +432,14 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
     ledger: &mut ResumeLedger,
     list_health: &mut ListFailureLatch,
     shutdown: &rio_common::signal::Token,
-) -> Vec<ClaimedJob> {
+) -> ClaimedSet {
+    // The accumulator is constructed ONCE; every exit below returns it
+    // (bug_116 — the listing-failure arms can no longer fabricate an
+    // empty result over accrued claims).
+    let mut claimed = ClaimedSet::begin();
     if available_slots == 0 {
-        return Vec::new();
+        return claimed;
     }
-    let mut claimed = Vec::new();
 
     // bug_251: the RESUME pass runs FIRST — unanswered claims from
     // prior passes are existing obligations (the scheduler may hold an
@@ -473,6 +513,11 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
     // (merged_bug_189): a black-holed leader connection becomes a
     // skipped pass instead of a parked claim loop, and SIGTERM ends
     // the pass promptly.
+    // Budget already consumed by the resume pass → the listing RPC is
+    // pure cost (the claim loop below could not claim anything).
+    if claimed.len() >= available_slots {
+        return claimed;
+    }
     let listed = match bounded(
         shutdown,
         DEFAULT_GRPC_TIMEOUT,
@@ -480,7 +525,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
     )
     .await
     {
-        BoundedOutcome::Shutdown => return Vec::new(),
+        BoundedOutcome::Shutdown => return claimed,
         BoundedOutcome::TimedOut { after } => {
             debug!(
                 after_secs = after.as_secs(),
@@ -488,7 +533,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             );
             list_health.note_failure("timed out (no answer)");
             transport.note_timeout();
-            return Vec::new();
+            return claimed;
         }
         BoundedOutcome::Resolved(Ok(resp)) => {
             list_health.note_success();
@@ -498,7 +543,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             debug!(code = ?status.code(), msg = status.message(),
                    "ListMaterializationJobs failed; empty poll pass");
             list_health.note_failure(&format!("{:?}: {}", status.code(), status.message()));
-            return Vec::new();
+            return claimed;
         }
     };
 
@@ -1203,6 +1248,49 @@ mod tests {
         );
         assert_eq!(t.list_calls, 1);
         assert_eq!(t.pull_calls, 2);
+    }
+
+    /// bug_116: assignments the RESUME pass already claimed (and
+    /// ledger-resolved) survive a failed listing. Pre-fix the three
+    /// listing failure arms returned a fresh empty vec — the
+    /// re-delivered attempt was then executed by nobody and
+    /// unrecoverable by construction (nonce destroyed, claimed
+    /// attempts never re-list, credential-less re-pulls answer
+    /// NotYetReady), stranding it until the establishment sweep closed
+    /// it CHARGED. The trigger is correlated: resume entries exist
+    /// precisely because the same store→scheduler edge is flaky.
+    #[tokio::test]
+    async fn listing_failure_returns_accrued_resume_claims() {
+        let mut ledger = ResumeLedger::default();
+        ledger.note_pull(ResumeEntry {
+            job_id: Uuid::now_v7(),
+            drv_hash: "drv-keep".into(),
+            tenant_hint: None,
+            origin: "pruned".into(),
+            nonce: Uuid::new_v4(),
+        });
+        let mut t = MockTransport::new(
+            // The listing fails AFTER the resume pass delivered.
+            vec![Err(tonic::Status::unavailable("leader rolling"))],
+            vec![Ok(deliver("exec-keep", "/nix/store/fff-keep.drv"))],
+            vec![],
+        );
+        let claimed = poll_and_claim(
+            &mut t,
+            &instance("store-replica-0"),
+            2,
+            &mut ledger,
+            &mut ListFailureLatch::default(),
+            &token(),
+        )
+        .await;
+        assert_eq!(
+            claimed.len(),
+            1,
+            "the resume-claimed assignment survives a failed listing"
+        );
+        assert_eq!(claimed[0].exec_id, "exec-keep");
+        assert!(ledger.is_empty(), "the delivered entry stays resolved");
     }
 
     /// bug_119: an ANSWERED permanent rejection (auth misconfig) is not
@@ -2042,7 +2130,7 @@ mod tests {
         // poll passes. Without reconnect-on-UNAVAILABLE the transport
         // reuses the pinned connection forever and every pass stays
         // empty.
-        let mut claimed = Vec::new();
+        let mut claimed = ClaimedSet::begin();
         for _ in 0..5 {
             claimed = poll_and_claim(
                 &mut transport,
