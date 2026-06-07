@@ -120,30 +120,51 @@ mod tests {
     /// `note_hole`'s return value is the structural pin — the metric
     /// increment is gated on it, and the misc-check pins the counter
     /// name to this module so no other increment path exists.
+    ///
+    /// merged_bug_084: this is the ONE thin test allowed on the
+    /// process-global wrapper; its keys are uuid-namespaced so no
+    /// other test body can collide with them, and the heavy
+    /// flood/eviction coverage lives on a LOCAL `Ledger` below —
+    /// pre-fix, `ledger_bounded_fifo`'s 8193-key flood through the
+    /// same global could evict these keys between adjacent asserts
+    /// under same-process parallel runners (plain `cargo test`).
     #[test]
     fn hole_identity_counted_once() {
         let exec = Uuid::now_v7();
-        assert!(note_hole(exec, "logs/k1", "missing_object"));
-        assert!(!note_hole(exec, "logs/k1", "missing_object"));
-        assert!(!note_hole(exec, "logs/k1", "missing_object"));
+        let ns = Uuid::now_v7();
+        let k1 = format!("logs/{ns}/k1");
+        let k2 = format!("logs/{ns}/k2");
+        assert!(note_hole(exec, &k1, "missing_object"));
+        assert!(!note_hole(exec, &k1, "missing_object"));
+        assert!(!note_hole(exec, &k1, "missing_object"));
         // A different key under the same exec is a different hole.
-        assert!(note_hole(exec, "logs/k2", "short_object"));
+        assert!(note_hole(exec, &k2, "short_object"));
         // Same key under a different exec is a different hole.
-        assert!(note_hole(Uuid::now_v7(), "logs/k1", "missing_object"));
+        assert!(note_hole(Uuid::now_v7(), &k1, "missing_object"));
     }
 
     /// The ledger bound: eviction is FIFO and bounded, so the dedup
     /// degrades (oldest forgotten) rather than growing without bound.
+    ///
+    /// merged_bug_084: runs on a LOCALLY constructed `Ledger`, not the
+    /// process-global one — the 8193-key flood must not be able to
+    /// evict a sibling test's keys mid-assert, and FIFO-order
+    /// exactness must not depend on which test inserted first.
+    /// Globals are never shared between parallel test bodies.
     #[test]
     fn ledger_bounded_fifo() {
+        let mut ledger = Ledger::default();
         let exec = Uuid::now_v7();
         let first_key = "logs/bound-0".to_owned();
-        assert!(note_hole(exec, &first_key, "missing_object"));
+        assert!(ledger.first_sighting(exec, &first_key));
         for i in 1..=LEDGER_CAP {
-            note_hole(exec, &format!("logs/bound-{i}"), "missing_object");
+            ledger.first_sighting(exec, &format!("logs/bound-{i}"));
         }
         // first_key was evicted by the CAP+1'th insert: re-noting it is
-        // a "first" sighting again.
-        assert!(note_hole(exec, &first_key, "missing_object"));
+        // a "first" sighting again (and that re-insert evicts bound-1,
+        // the then-oldest).
+        assert!(ledger.first_sighting(exec, &first_key));
+        // Eviction is EXACT FIFO: bound-2 survived both evictions.
+        assert!(!ledger.first_sighting(exec, "logs/bound-2"));
     }
 }
