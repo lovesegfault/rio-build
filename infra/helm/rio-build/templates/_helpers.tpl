@@ -392,3 +392,24 @@ budgets (against one pod they block every drain).
 {{- $c := . -}}
 {{- if gt (int (ternary $c.autoscaling.minReplicas ($c.replicas | default 1) $c.autoscaling.enabled)) 1 -}}true{{- end -}}
 {{- end -}}
+
+{{/*
+rio.pgInClusterEgress — THE in-cluster bitnami postgres egress rule
+(toEndpoints), single-sourced (bug_185). The bitnami subchart deploys
+into the helm RELEASE namespace (system) — no namespaceOverride is
+set — so every consumer's egress allow must match that namespace.
+Pre-fix the controller's open-coded copy pointed at the STORE
+namespace and matched zero endpoints: under Cilium default-deny the
+controller's direct PG edge (nodeclaim_cell_state sketches, load-
+bearing at every leadership acquire) silently dropped. The namespace
+fact lives HERE and nowhere else; call sites keep their own
+postgresql.enabled guards.
+Usage: {{ include "rio.pgInClusterEgress" $ns | nindent 4 }}
+*/}}
+{{- define "rio.pgInClusterEgress" -}}
+- toEndpoints:
+    - matchLabels:
+        k8s:io.kubernetes.pod.namespace: {{ .system.name }}
+        k8s:app.kubernetes.io/name: postgresql
+  toPorts: [{ports: [{port: "5432", protocol: TCP}]}]
+{{- end -}}

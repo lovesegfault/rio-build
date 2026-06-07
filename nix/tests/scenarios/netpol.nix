@@ -383,6 +383,51 @@ pkgs.testers.runNixOSTest {
               "reachable from store netns (the materialization executor edge)")
 
     # ══════════════════════════════════════════════════════════════════
+    # netpol-controller-pg — controller → in-cluster postgres ALLOWED
+    # ══════════════════════════════════════════════════════════════════
+    # bug_185: rio-controller-egress's PG allow used to match the STORE
+    # namespace while the bitnami pod lives in rio-system (the release
+    # namespace) — zero endpoints matched, so under Cilium default-deny
+    # the controller's direct PG edge (nodeclaim_cell_state sketches,
+    # load-bearing at every leadership acquire via CellSketches::
+    # load_seeded) was silently dropped. The store→PG positive control
+    # above never exercised the controller's copy of the rule; this
+    # probe does. The rule is single-sourced via rio.pgInClusterEgress
+    # now — this is the runtime half of that close (the render half is
+    # helm-lint fragment 35). Reuses pg_ip from the store subtest.
+    with subtest("netpol-controller-pg: controller → postgres:5432 allowed"):
+        ctrl_pod = kubectl(
+            "get pod -l app.kubernetes.io/name=rio-controller "
+            "-o jsonpath='{.items[0].metadata.name}'",
+        ).strip()
+        assert ctrl_pod, "no rio-controller pod found in rio-system"
+        ctrl_node = kubectl(
+            f"get pod {ctrl_pod} -o jsonpath='{{.spec.nodeName}}'",
+        ).strip()
+        ctrl_vm = k3s_agent if ctrl_node == "k3s-agent" else k3s_server
+        ctrl_cid = ctrl_vm.succeed(
+            f"k3s crictl ps -q "
+            f"--label io.kubernetes.pod.name={ctrl_pod} | head -1"
+        ).strip()
+        assert ctrl_cid, f"no running container for {ctrl_pod}"
+        ctrl_pid = ctrl_vm.succeed(
+            f"k3s crictl inspect {ctrl_cid} | ${jq} -r .info.pid"
+        ).strip()
+        assert ctrl_pid and ctrl_pid != "0", f"bad pid for controller: {ctrl_pid!r}"
+        rc, out = ctrl_vm.execute(
+            f"nsenter -t {ctrl_pid} -n -- ${nc} -z -w5 {pg_ip} 5432"
+        )
+        assert rc == 0, (
+            f"nc -z from controller netns to postgres {pg_ip}:5432 FAILED "
+            f"(rc={rc}). rio-controller-egress must allow in-cluster PG in "
+            "the RELEASE namespace (rio.pgInClusterEgress) — a wrong-"
+            "namespace match means zero endpoints and a silent default-"
+            f"deny of the sketch-persistence edge.\n{out}"
+        )
+        print(f"netpol-controller-pg PASS: postgres {pg_ip}:5432 "
+              "reachable from controller netns")
+
+    # ══════════════════════════════════════════════════════════════════
     # netpol-cross-ns — D3a: Pool{kind=Builder} in fetcher ns airgapped
     # ══════════════════════════════════════════════════════════════════
     # D3a regression: with one Pool CRD, an operator can apply a

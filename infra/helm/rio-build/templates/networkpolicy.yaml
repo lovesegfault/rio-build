@@ -212,11 +212,10 @@ spec:
       toPorts: [{ports: [{port: "5432", protocol: TCP}]}]
     {{- end }}
     {{- if .Values.postgresql.enabled }}
-    - toEndpoints:
-        - matchLabels:
-            k8s:io.kubernetes.pod.namespace: {{ $ns.store.name }}
-            k8s:app.kubernetes.io/name: postgresql
-      toPorts: [{ports: [{port: "5432", protocol: TCP}]}]
+    # In-cluster postgres — single-sourced rule (bug_185: this copy
+    # used to point at the STORE namespace and matched zero endpoints,
+    # silently default-denying the controller's direct PG edge).
+    {{ include "rio.pgInClusterEgress" $ns | nindent 4 }}
     {{- end }}
 {{- if .Values.buildScheduler.enabled }}
 ---
@@ -413,13 +412,9 @@ spec:
             k8s:io.kubernetes.pod.namespace: {{ $ns.system.name }}
             k8s:app.kubernetes.io/name: rio-scheduler
       toPorts: [{ports: [{port: "9001", protocol: TCP}]}]
-    # In-cluster postgres (bitnami chart, VM tests / dev). Subchart
-    # deploys into the helm release namespace (system), not store.
-    - toEndpoints:
-        - matchLabels:
-            k8s:io.kubernetes.pod.namespace: {{ $ns.system.name }}
-            k8s:app.kubernetes.io/name: postgresql
-      toPorts: [{ports: [{port: "5432", protocol: TCP}]}]
+    # In-cluster postgres (bitnami chart, VM tests / dev) —
+    # single-sourced rule; the namespace fact lives in the helper.
+    {{ include "rio.pgInClusterEgress" $ns | nindent 4 }}
     # External postgres (RDS / CloudSQL) — outside the cluster, so
     # toCIDRSet matches as `world` subspace. rio is v6-only; the CIDR is
     # the deployment's VPC IPv6 block (or ULA range for self-hosted).
