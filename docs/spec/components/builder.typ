@@ -615,21 +615,30 @@ requirement and the display-only / no-pod-identity rationale live in
   to `0` means unlimited.
 ]
 
-#r("builder.log.loss-disclosure+2")[
-  Every log-upload abandonment MUST be disclosed through one chokepoint that
-  derives the loss from the abandonment reason: an upload that ends with
-  un-acked lines increments
+#r("builder.log.loss-disclosure+3")[
+  Every line handed to the log-upload data plane that is not durably stored
+  MUST be disclosed through one chokepoint that derives the loss from the
+  abandonment reason: an upload that ends with un-acked lines increments
   #(refs.metric)("rio_builder_log_drain_abandoned_total")`{reason}` and logs
   at `error!` if and only if the lines are durably lost --- the sole zero-loss
   reason is the store provably holding the complete `[0, final_line_count)`
-  log. A permanent store rejection arriving mid-stream MUST terminate the
+  log. The disclosure partition MUST be TOTAL over the produced population:
+  lines the uploader accepted disclose from the unwind guard (`panic`);
+  lines resident in the upload channel when its receiver dies disclose from
+  the receiver's own drop guard (`uploader_dead` --- they never reached the
+  uploader's accounting, so no ack can cover them and no progress snapshot
+  counts them); lines the channel refused --- including banner/footer
+  sends --- disclose through the producer-side ledger (`uploader_dead`).
+  A permanent store rejection arriving mid-stream MUST terminate the
   session loop (no reconnect can succeed against it), and a panic in the
-  upload task MUST disclose its un-acked lines during unwind, independent of
-  whether any caller awaits the task. Lines produced AFTER the upload task
-  has died MUST route through the same chokepoint (reason `uploader_dead`):
-  the producer-side sink MUST make an uncounted discard unrepresentable ---
-  once the upload channel is gone, the only way to drop a batch is the
-  ledger method whose teardown discloses the accumulated total.
+  upload task MUST disclose during unwind, independent of whether any
+  caller awaits the task. The producer-side sink MUST make an uncounted
+  discard unrepresentable --- once the upload channel is gone, the only way
+  to drop a batch is the ledger method whose teardown discloses the
+  accumulated total. Footer lines MUST be folded into the reported
+  `final_line_count` ONLY when their send succeeded: sealing lines that
+  exist nowhere makes the store's contiguous-coverage completeness
+  predicate permanently unsatisfiable with no disclosure.
 ]
 The reason vocabulary is the `x-rio-log-reject` metadata class the store
 attaches to permanent rejections (`cap`/`complete`/`superseded`) plus the

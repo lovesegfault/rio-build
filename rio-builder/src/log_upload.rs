@@ -175,7 +175,7 @@ fn lost_lines(reason: AbandonReason, unacked: u64) -> u64 {
     }
 }
 
-// r[impl builder.log.loss-disclosure+2]
+// r[impl builder.log.loss-disclosure+3]
 /// THE single disclosure site: the only place
 /// `rio_builder_log_drain_abandoned_total` is incremented.
 /// Counter ⟺ `lost_lines > 0`, by construction — a zero-loss abandon
@@ -204,7 +204,7 @@ fn disclose(reason: AbandonReason, unacked_lines: u64, last_acked_line: Option<u
     );
 }
 
-// r[impl builder.log.loss-disclosure+2]
+// r[impl builder.log.loss-disclosure+3]
 /// Producer-side entry (bug_241): the stderr loop's post-uploader-death
 /// discard total, routed through THE single `disclose` chokepoint as
 /// `reason="uploader_dead"`. The counting stays at one site; the
@@ -213,6 +213,47 @@ fn disclose(reason: AbandonReason, unacked_lines: u64, last_acked_line: Option<u
 /// these lines never reached the uploader, so no ack can cover them.
 pub(crate) fn disclose_uploader_dead(discarded_lines: u64) {
     disclose(AbandonReason::UploaderDead, discarded_lines, None);
+}
+
+// r[impl builder.log.loss-disclosure+3]
+/// merged_bug_009: the upload channel's receiving end, with a
+/// conservation drop guard. Batches the stderr loop successfully
+/// `send()`-ed but the task never `recv()`-ed are destroyed when the
+/// receiver drops mid-unwind — a third population covered by neither
+/// the `LossGuard` (lines the uploader ACCEPTED) nor the stderr
+/// loop's `DiscardLedger` (sends the channel REFUSED). The silent
+/// corner was fully-acked progress + queued batches: `disclose(
+/// Panicked, 0, ..)` took the zero-loss debug arm while up to 256
+/// batches died with the receiver. Drop drains the residue
+/// synchronously and routes it through the single disclose chokepoint
+/// as `uploader_dead` (these lines never reached the uploader's
+/// accounting; no ack can cover them). Every NORMAL exit leaves the
+/// channel empty — `recv()` yields all queued items before `None`,
+/// and `reject_permanently` drains explicitly — so the guard
+/// discloses zero there; field order in [`UploadTask`] is irrelevant
+/// because parameters drop after locals (the `LossGuard` always runs
+/// first, covering buffer-resident lines; this guard covers
+/// channel-resident ones — conservation:
+/// `produced = acked + buffer-unacked + channel-residue + refused`,
+/// every non-durable term disclosed).
+struct ResidueReceiver(mpsc::Receiver<BuildLogBatch>);
+
+impl ResidueReceiver {
+    async fn recv(&mut self) -> Option<BuildLogBatch> {
+        self.0.recv().await
+    }
+}
+
+impl Drop for ResidueReceiver {
+    fn drop(&mut self) {
+        let mut residue: u64 = 0;
+        while let Ok(b) = self.0.try_recv() {
+            residue = residue.saturating_add(b.lines.len() as u64);
+        }
+        if residue > 0 {
+            disclose_uploader_dead(residue);
+        }
+    }
 }
 
 /// Drop-guard that discloses a panic-shaped loss. Armed before the
@@ -356,7 +397,7 @@ impl LogUploader {
             },
             token,
             config,
-            input: rx,
+            input: ResidueReceiver(rx),
             input_open: true,
             buffer: VecDeque::new(),
             unacked_lines: 0,
@@ -477,7 +518,7 @@ struct UploadTask {
     token: String,
     config: LogUploaderConfig,
 
-    input: mpsc::Receiver<BuildLogBatch>,
+    input: ResidueReceiver,
     /// False once the input channel has yielded `None`.
     input_open: bool,
     /// Every accepted batch not yet covered by an ack, in line order.
@@ -853,7 +894,7 @@ impl UploadTask {
         }
     }
 
-    // r[impl builder.log.loss-disclosure+2]
+    // r[impl builder.log.loss-disclosure+3]
     /// Buffered lines strictly above the ack watermark — the
     /// DISCLOSURE view of the un-acked count (bug_144). Derived at
     /// every disclosure surface rather than cached, so it stays
@@ -1634,7 +1675,7 @@ mod tests {
         );
     }
 
-    // r[verify builder.log.loss-disclosure+2]
+    // r[verify builder.log.loss-disclosure+3]
     /// bug_144: a mid-frame ack — the store's line-granular
     /// `durable_through_line` landing INSIDE a buffered frame — must
     /// advance the watermark and shrink the disclosed loss to the
@@ -1695,7 +1736,7 @@ mod tests {
     //    builder.log.loss-disclosure)
     // ------------------------------------------------------------------
 
-    // r[verify builder.log.loss-disclosure+2]
+    // r[verify builder.log.loss-disclosure+3]
     /// merged_bug_360 (red-first): PERMISSION_DENIED with un-acked lines
     /// is durable loss — the superseding attempt produces ITS OWN log,
     /// not these lines. Pre-fix, `rejected: true` suppressed the
@@ -1735,7 +1776,7 @@ mod tests {
         );
     }
 
-    // r[verify builder.log.loss-disclosure+2]
+    // r[verify builder.log.loss-disclosure+3]
     /// merged_bug_360 (red-first): a panic in the upload task must
     /// disclose the un-acked lines. Pre-fix the counter fired only at
     /// `run()`'s normal exit, which a panicking task never reaches —
@@ -1791,7 +1832,50 @@ mod tests {
         );
     }
 
-    // r[verify builder.log.loss-disclosure+2]
+    // r[verify builder.log.loss-disclosure+3]
+    /// merged_bug_009 (channel-resident population): batches sent into
+    /// the upload channel but never received are destroyed when the
+    /// receiver drops mid-unwind — they are in NO progress snapshot
+    /// (never accepted) and NO discard ledger (never refused). The
+    /// receiver's own drop guard must disclose them. Recorded red
+    /// (strawman reversal of the drop guard): `channel residue must
+    /// disclose: 0` — the counter never fired while 8 lines died.
+    #[tokio::test]
+    async fn channel_residue_disclosed_on_receiver_drop() {
+        let rec = CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&rec);
+        let (tx, rx) = mpsc::channel::<BuildLogBatch>(8);
+        let rr = super::ResidueReceiver(rx);
+        tx.send(batch(0, 5)).await.unwrap();
+        tx.send(batch(5, 3)).await.unwrap();
+        drop(rr); // the unwind-equivalent: receiver dies with residue
+        assert_eq!(
+            rec.get("rio_builder_log_drain_abandoned_total{reason=uploader_dead}"),
+            1,
+            "channel residue must disclose: {}",
+            rec.get("rio_builder_log_drain_abandoned_total{reason=uploader_dead}")
+        );
+    }
+
+    // r[verify builder.log.loss-disclosure+3]
+    /// The conservation guard's zero arm: a receiver that drops with
+    /// an EMPTY channel (every normal exit — recv() yields all queued
+    /// items before None) discloses nothing.
+    #[tokio::test]
+    async fn empty_channel_receiver_drop_discloses_nothing() {
+        let rec = CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&rec);
+        let (tx, rx) = mpsc::channel::<BuildLogBatch>(8);
+        drop(tx);
+        drop(super::ResidueReceiver(rx));
+        assert_eq!(
+            rec.get("rio_builder_log_drain_abandoned_total{reason=uploader_dead}"),
+            0,
+            "normal exits must not phantom-disclose"
+        );
+    }
+
+    // r[verify builder.log.loss-disclosure+3]
     /// bug_248 (red-first): a permanent rejection arriving MID-STREAM
     /// (the cap tripping while the stream is open) must stop the
     /// session loop — pre-fix it was classified Reconnect and the
@@ -1841,7 +1925,7 @@ mod tests {
         );
     }
 
-    // r[verify builder.log.loss-disclosure+2]
+    // r[verify builder.log.loss-disclosure+3]
     /// Polarity guard: a `complete` rejection (the store provably holds
     /// the full `[0, final)` log) is the ONE zero-loss abandon — no
     /// counter, under any reason label.

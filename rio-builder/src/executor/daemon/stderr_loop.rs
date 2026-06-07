@@ -170,11 +170,14 @@ enum UploadSink<'a> {
 }
 
 /// Producer-side discard ledger for the post-uploader-death window
-/// (bug_241). Disjoint from the uploader's `LossGuard` by
-/// construction: the guard covers lines the uploader ACCEPTED at panic
-/// time; this ledger counts only lines the channel REFUSED — the
-/// bounced batch that detected the death seeds it, and everything
-/// produced afterwards accrues. Drop-armed: loop exit (normal or
+/// (bug_241). One of THREE disjoint loss populations (merged_bug_009):
+/// the uploader's `LossGuard` covers lines it ACCEPTED (buffer-resident
+/// at panic), `log_upload::ResidueReceiver` covers lines the channel
+/// holds when the receiver dies (sent-but-never-received), and this
+/// ledger counts only lines the channel REFUSED — the bounced batch
+/// that detected the death seeds it, and everything produced
+/// afterwards accrues. Together: `produced = acked + disclosed`,
+/// no population uncounted. Drop-armed: loop exit (normal or
 /// unwind) routes the accumulated total through `log_upload`'s single
 /// `disclose()` chokepoint as `reason="uploader_dead"`. The Drop body
 /// is sync and panic-free (counter + log only); a zero total is the
@@ -262,7 +265,7 @@ impl<'a> StderrLoop<'a> {
         }
     }
 
-    // r[impl builder.log.loss-disclosure+2]
+    // r[impl builder.log.loss-disclosure+3]
     /// Send a log batch to the per-build uploader. Never aborts the
     /// loop: a closed upload channel means the uploader task panicked,
     /// and a build is never failed because its log could not be
@@ -688,7 +691,7 @@ mod tests {
             .block_on(fut)
     }
 
-    // r[verify builder.log.loss-disclosure+2]
+    // r[verify builder.log.loss-disclosure+3]
     /// bug_241: lines produced AFTER the uploader dies must be
     /// disclosed through the loss chokepoint, not silently discarded.
     /// The pre-fix `upload_lost` early-return was one step upstream of

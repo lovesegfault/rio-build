@@ -1465,21 +1465,28 @@ pub fn sanitize_build_id(drv_path: &str) -> String {
 /// [`LogBatcher`] (which is created inside [`run_daemon_lifecycle`]
 /// and consumed by the stderr loop — not in scope at the call sites).
 ///
-/// Best-effort: a closed channel means the uploader task died
-/// (panicked); the build continues without log persistence. The banner
-/// is display-only; dropping it is harmless.
+/// Returns whether the batch entered the channel. A closed channel
+/// means the uploader task died (panicked); the build continues
+/// without log persistence, but the loss is NOT silent
+/// (merged_bug_009): the header is display-only, while FOOTER lines
+/// participate in the sealed `final_line_count` — the caller must not
+/// seal lines that exist nowhere, and either banner's death is
+/// disclosed through the single chokepoint as `uploader_dead` (the
+/// same population as every other refused send).
 ///
 /// `pub(crate)` because the banner footer is sent from
 /// `runtime::spawn_build_task` (after the daemon-transient retry loop —
 /// once per assignment) rather than from `execute_build` (once per
 /// attempt). See `execute_build`'s `first_line` param doc and bug_013.
+// r[impl builder.log.loss-disclosure+3]
 pub(crate) async fn send_banner_batch(
     upload_tx: &mpsc::Sender<rio_proto::types::BuildLogBatch>,
     drv_path: &str,
     executor_id: &str,
     first_line_number: u64,
     lines: Vec<Vec<u8>>,
-) {
+) -> bool {
+    let n = lines.len() as u64;
     let batch = rio_proto::types::BuildLogBatch {
         derivation_path: drv_path.to_owned(),
         executor_id: executor_id.to_owned(),
@@ -1487,11 +1494,15 @@ pub(crate) async fn send_banner_batch(
         lines,
     };
     if upload_tx.send(batch).await.is_err() {
-        tracing::debug!(
+        tracing::warn!(
             drv_path = %drv_path,
+            lines = n,
             "banner batch dropped: log upload channel closed (uploader task died)"
         );
+        crate::log_upload::disclose_uploader_dead(n);
+        return false;
     }
+    true
 }
 
 /// Map a [`run_daemon_lifecycle`] result to the banner footer's

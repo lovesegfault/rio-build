@@ -313,6 +313,22 @@ fn publish_hw_class(
     factor.map(|factor| (hw_class, factor))
 }
 
+// r[impl builder.log.loss-disclosure+3]
+/// merged_bug_009: the store's completeness predicate is "the manifest
+/// covers a contiguous [0, final_line_count)" — sealing footer lines
+/// that never entered the upload channel makes the seal PERMANENTLY
+/// unsatisfiable for the exec, with zero disclosure. The footer counts
+/// only when its send succeeded; a dead uploader leaves the count at
+/// the last line the batcher accounted for (and the failed send itself
+/// is disclosed by `send_banner_batch`).
+fn sealed_final_line_count(final_line_count: u64, footer_len: usize, sent: bool) -> u64 {
+    if sent {
+        final_line_count + footer_len as u64
+    } else {
+        final_line_count
+    }
+}
+
 /// Handle a WorkAssignment: spawn the build task and set up a
 /// panic-catcher.
 ///
@@ -595,13 +611,14 @@ pub async fn spawn_build_task(
         // Best-effort: the scheduler's cancel-path seal drops this
         // footer before it reaches the stored log — see
         // `terminal_log_epilogue`'s sequencing note in rio-scheduler.
-        // TODO: the runtime footer-send path (once-per-assignment,
-        // skipped-on-None, prev_line_count threading) has no unit test
+        // TODO: the runtime footer-send path's once-per-assignment /
+        // skipped-on-None / prev_line_count threading has no unit test
         // — `spawn_build_task` requires a full BuildContext + live gRPC
         // stream. Covered by `nextest-rio-builder` compilation +
         // existing VM scenarios; a `RIO_BUILDER_SCRIPT` VM test
         // asserting "exactly one rio: result line per exec_id" would
-        // close the gap.
+        // close the gap. (The seal-only-if-sent decision below IS
+        // unit-tested: `sealed_final_line_count`.)
         let report_line_count = if let Some(footer_result) = final_footer_result(
             last_footer_result.as_deref(),
             cancelled.load(std::sync::atomic::Ordering::Acquire),
@@ -616,8 +633,8 @@ pub async fn spawn_build_task(
             // high-water mark is the CompletionReport's
             // final_line_count (the store's completeness predicate is
             // "the manifest covers a contiguous [0, final_line_count)").
-            let after_footer = final_line_count + footer.len() as u64;
-            executor::send_banner_batch(
+            let footer_len = footer.len();
+            let sent = executor::send_banner_batch(
                 &upload_tx,
                 &drv_path,
                 &build_env.executor_id,
@@ -625,7 +642,7 @@ pub async fn spawn_build_task(
                 footer,
             )
             .await;
-            after_footer
+            sealed_final_line_count(final_line_count, footer_len, sent)
         } else {
             // No footer: either nothing was ever emitted
             // (final_line_count == 0, a pre-header setup failure → the
@@ -1268,6 +1285,29 @@ mod tests {
         assert!(
             cancelled.load(std::sync::atomic::Ordering::Acquire),
             "flag must stay set on ENOENT so the pre-cgroup poll can abort the build"
+        );
+    }
+}
+
+#[cfg(test)]
+mod seal_tests {
+    use super::sealed_final_line_count;
+
+    // r[verify builder.log.loss-disclosure+3]
+    /// merged_bug_009 (footer population): the footer is folded into
+    /// the sealed final_line_count ONLY when its send succeeded —
+    /// sealing lines that exist nowhere makes the store's
+    /// contiguous-coverage completeness predicate permanently
+    /// unsatisfiable. Recorded red (strawman: unconditional add, the
+    /// pre-fix shape): `left: 12 / right: 10` — two phantom footer
+    /// lines sealed after a failed send.
+    #[test]
+    fn footer_seals_only_when_sent() {
+        assert_eq!(sealed_final_line_count(10, 2, true), 12);
+        assert_eq!(
+            sealed_final_line_count(10, 2, false),
+            10,
+            "a dead uploader must not seal phantom footer lines"
         );
     }
 }
