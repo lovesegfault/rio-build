@@ -157,29 +157,29 @@ pub const DEFAULT_DAEMON_TIMEOUT: Duration = Duration::from_secs(7200);
 /// the `?` site.
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutorError {
-    #[error("overlay setup failed: {0}")]
     /// Overlayfs setup failed (mount, upper/work dir creation).
+    #[error("overlay setup failed: {0}")]
     Overlay(#[from] overlay::OverlayError),
-    #[error("overlay setup task panicked: {0}")]
     /// The blocking overlay-setup task panicked.
+    #[error("overlay setup task panicked: {0}")]
     OverlayTaskPanic(tokio::task::JoinError),
-    #[error("synthetic DB generation failed: {0}")]
     /// Synthetic Nix store SQLite generation failed.
+    #[error("synthetic DB generation failed: {0}")]
     SynthDb(#[from] sqlx::Error),
-    #[error("failed to write nix.conf: {0}")]
     /// Writing the per-build nix.conf failed.
+    #[error("failed to write nix.conf: {0}")]
     NixConf(#[source] std::io::Error),
-    #[error("daemon spawn failed: {0}")]
     /// Spawning the nix-daemon subprocess failed.
+    #[error("daemon spawn failed: {0}")]
     DaemonSpawn(std::io::Error),
-    #[error("daemon handshake failed: {0}")]
     /// The daemon wire-protocol handshake failed.
+    #[error("daemon handshake failed: {0}")]
     Handshake(#[from] rio_nix::protocol::handshake::HandshakeError),
-    #[error("daemon setup failed: {0}")]
     /// Post-handshake daemon setup (settings exchange) failed.
+    #[error("daemon setup failed: {0}")]
     DaemonSetup(String),
-    #[error("build failed: {0}")]
     /// The build itself failed (daemon reported failure).
+    #[error("build failed: {0}")]
     BuildFailed(String),
     /// The assignment's `.drv` content is malformed (UTF-8, ATerm parse,
     /// BasicDerivation conversion). Deterministic per-derivation: every
@@ -187,25 +187,25 @@ pub enum ExecutorError {
     /// Maps to `InputRejected` instead of `InfrastructureFailure`.
     #[error("invalid derivation: {0}")]
     InvalidDerivation(String),
-    #[error("upload failed: {0}")]
     /// Output upload to the store failed.
+    #[error("upload failed: {0}")]
     Upload(#[from] upload::UploadError),
-    #[error("gRPC error: {0}")]
     /// A gRPC call failed (store or scheduler).
+    #[error("gRPC error: {0}")]
     Grpc(#[from] tonic::Status),
-    #[error("input metadata fetch failed for {path}: {source}")]
     /// Input path metadata fetch failed.
+    #[error("input metadata fetch failed for {path}: {source}")]
     MetadataFetch {
         /// The store path whose metadata fetch failed.
         path: String,
         /// The failing gRPC status.
         source: tonic::Status,
     },
-    #[error("wire protocol error: {0}")]
     /// Daemon wire-protocol framing error.
+    #[error("wire protocol error: {0}")]
     Wire(#[from] rio_nix::protocol::wire::WireError),
-    #[error("cgroup resource tracking failed: {0}")]
     /// Per-build cgroup resource tracking failed.
+    #[error("cgroup resource tracking failed: {0}")]
     Cgroup(String),
     /// Pod-level cgroup `memory.events` `oom_kill` incremented during
     /// the build. The kernel killed a build process (cc1, ld, …) for
@@ -216,10 +216,10 @@ pub enum ExecutorError {
     /// `resource_floor` instead of marking it permanently failed.
     #[error("cgroup OOM during build; bumping resource floor")]
     CgroupOom,
+    /// The derivation's FOD-ness does not match this executor kind.
     #[error(
         "wrong executor kind: derivation is_fod={is_fod} but this executor is {executor_kind:?}"
     )]
-    /// The derivation's FOD-ness does not match this executor kind.
     WrongKind {
         /// Whether the derivation is fixed-output.
         is_fod: bool,

@@ -7,7 +7,7 @@ use std::{
     path::Path,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use heck::ToLowerCamelCase;
 use regex::Regex;
 use serde_json::json;
@@ -39,9 +39,20 @@ const METRICS_RE: &str = r#"(?s)describe_(counter|gauge|histogram)!\s*\(\s*"(rio
 /// the surrounding `"`s as the regex sees them). Handles `\"`, `\\`,
 /// `\n`, `\t`, and the rustfmt line-continuation `\<newline>`. Unknown
 /// escapes pass through verbatim.
+///
+/// merged_bug_100: rustc's `\<newline>` strips the newline AND the
+/// next line's leading whitespace run — the old arm dropped only the
+/// newline, so a flush continuation (`token_mismatch|\` + indented
+/// `kind_unauthorized`) scraped with the indent attached and the
+/// `split_whitespace` normalization fabricated a space the runtime
+/// HELP does not contain (shipped divergence in metrics.json /
+/// metric-help.json). This arm and `garbled_interior_run`'s
+/// continuation strip implement the SAME semantics; the
+/// `continuation_semantics_match_rustc` test pins both on one fixture
+/// so they cannot fork.
 fn unescape_rust_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut it = s.chars();
+    let mut it = s.chars().peekable();
     while let Some(c) = it.next() {
         if c != '\\' {
             out.push(c);
@@ -52,7 +63,13 @@ fn unescape_rust_str(s: &str) -> String {
             Some('\\') => out.push('\\'),
             Some('n') => out.push('\n'),
             Some('t') => out.push('\t'),
-            Some('\n') => {} // line-continuation: \<LF> → ∅
+            Some('\n') => {
+                // line-continuation: \<LF> plus the following
+                // space/tab run → ∅ (rustc semantics).
+                while matches!(it.peek(), Some(' ' | '\t')) {
+                    it.next();
+                }
+            }
             Some(o) => {
                 out.push('\\');
                 out.push(o);
@@ -497,6 +514,7 @@ fn errors() -> Result<serde_json::Value> {
     let collapse = |s: String| s.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut variants = Vec::new();
     let mut enums = Vec::new();
+    let mut census_failures = Vec::new();
     visit_rio_crates(&mut |crate_name, body| {
         for em in enum_re.captures_iter(body) {
             let enum_name = em[2].to_string();
@@ -505,7 +523,9 @@ fn errors() -> Result<serde_json::Value> {
                 "crate": crate_name,
                 "doc": strip_doc_prefix(&em[1]),
             }));
+            let mut scraped = 0usize;
             for vm in variant_re.captures_iter(&em[3]) {
+                scraped += 1;
                 let msg = vm
                     .get(2)
                     .map(|m| collapse(unescape_rust_str(m.as_str())))
@@ -518,8 +538,28 @@ fn errors() -> Result<serde_json::Value> {
                     "doc": strip_doc_prefix(&vm[1]),
                 }));
             }
+            // Census tripwire (merged_bug_029): every `#[error(` in the
+            // enum body must scrape to exactly one variant entry. A
+            // shape VARIANT_RE cannot see (doc comments between `)]`
+            // and the ident silently dropped 14 of ExecutorError's 17
+            // variants from the committed errors.json, with
+            // docs-data-fresh green because the wrong output was
+            // committed) is a hard regen failure here, never a silent
+            // shrink.
+            let raw = em[3].matches("#[error(").count();
+            if raw != scraped {
+                census_failures.push(format!(
+                    "{crate_name}::{enum_name}: {raw} `#[error(` attribute(s) but {scraped} scraped variant(s)"
+                ));
+            }
         }
     })?;
+    ensure!(
+        census_failures.is_empty(),
+        "errors.json census mismatch — VARIANT_RE missed variant shapes \
+         (doc comments between `#[error(...)]` and the variant ident?):\n  {}",
+        census_failures.join("\n  ")
+    );
     let key = |ks: &'static [&str]| {
         move |v: &serde_json::Value| -> Vec<String> {
             ks.iter()
@@ -1256,8 +1296,31 @@ spec:
     fn unescape_rust_str_handles_all_escapes() {
         assert_eq!(unescape_rust_str(r#"a \"q\" b"#), r#"a "q" b"#);
         assert_eq!(unescape_rust_str(r"a\\b"), r"a\b");
-        assert_eq!(unescape_rust_str("a \\\n  b"), "a   b"); // line-cont
+        // line-continuation: rustc eats the newline AND the next
+        // line's indent (merged_bug_100 — this assertion previously
+        // pinned the divergent `"a   b"`, indent kept).
+        assert_eq!(unescape_rust_str("a \\\n  b"), "a b");
         assert_eq!(unescape_rust_str(r"\{0}"), r"\{0}"); // unknown passes through
+    }
+
+    /// merged_bug_100: scraper and validator implement ONE
+    /// continuation rule (rustc's: `\<LF>` + following space/tab run →
+    /// ∅) — pinned on the same fixtures so they cannot fork.
+    #[test]
+    fn continuation_semantics_match_rustc() {
+        // The shipped divergence shape: a FLUSH join (no space before
+        // the backslash) must concatenate without a fabricated space —
+        // pre-fix the scraper kept the indent and `split_whitespace`
+        // minted `token_mismatch| kind_unauthorized` into metrics.json
+        // and the chart HELP while the runtime emits the joined form.
+        let flush = "token_mismatch|\\\n         kind_unauthorized";
+        assert_eq!(unescape_rust_str(flush), "token_mismatch|kind_unauthorized");
+        // House style: the joining space sits BEFORE the backslash.
+        assert_eq!(unescape_rust_str("a \\\n         b"), "a b");
+        // The validator's strip agrees: a continuation contributes
+        // nothing, so neither side sees an interior run.
+        assert!(!garbled_interior_run(flush));
+        assert!(!garbled_interior_run("a \\\n         b"));
     }
 
     #[test]
