@@ -576,16 +576,24 @@ async fn consolidate_only_prunes_own_reaps_before_detect() {
     );
 
     // Recovery: c-ice is gone from live — detect_vanished must NOT
-    // re-read the absence as Karpenter GC (no unfulfillable_cells).
+    // re-read the absence as Karpenter GC. bug_082 sibling: the
+    // GENUINE mark from the consolidate-tick ICE reap (record_reap at
+    // delete) is buffered across the outage and ships now — so the
+    // recovery ack carries EXACTLY ONE entry for the cell. A vanish
+    // misread would have added a second (the BTreeSet dedups by cell,
+    // so the structural assertion is: the mark is present, and it is
+    // the buffered reap mark, not a fresh detect_vanished product —
+    // pinned by inflight_created being empty since the reap tick).
     lab.r.admin = admin_client(lab.admin_channel.clone());
     lab.tick(10, full_tick_scenario(vec![], vec![], vec![]))
         .await;
     assert_eq!(lab.r.consecutive_bot_ticks, 0);
-    assert!(
-        lab.ack_calls()
-            .iter()
-            .all(|a| a.unfulfillable_cells.is_empty()),
-        "no spurious ICE mark for the controller's own reap"
+    let last = lab.ack_calls().last().cloned().expect("recovery ack");
+    assert_eq!(
+        last.unfulfillable_cells,
+        vec![cell().to_string()],
+        "the consolidate-tick reap's buffered mark ships once on recovery \
+         (no spurious vanish-misread duplicate, no dropped mark)"
     );
 }
 
@@ -1057,10 +1065,7 @@ async fn report_unfulfillable_always_ships_the_snapshot() {
 
     // The scale-to-zero shape: nothing ICE'd, nothing registered, no
     // observations, zero bound pods.
-    lab.r
-        .report_unfulfillable(&[], vec![])
-        .await
-        .expect("ack sent");
+    lab.r.report_unfulfillable(vec![]).await.expect("ack sent");
 
     let acks = lab.ack_calls();
     assert_eq!(acks.len(), 1, "the all-empty tick still Acks");
@@ -1076,14 +1081,11 @@ async fn report_unfulfillable_always_ships_the_snapshot() {
 
     // A bound pod travels inside the snapshot, not field 5.
     lab.r
-        .report_unfulfillable(
-            &[],
-            vec![rio_proto::types::BoundIntent {
-                intent_id: "drv-285".into(),
-                node_name: "node-1".into(),
-                deadline_secs: 0,
-            }],
-        )
+        .report_unfulfillable(vec![rio_proto::types::BoundIntent {
+            intent_id: "drv-285".into(),
+            node_name: "node-1".into(),
+            deadline_secs: 0,
+        }])
         .await
         .expect("ack sent");
     let acks = lab.ack_calls();
@@ -1185,7 +1187,7 @@ async fn idle_spell_survives_reload_err_loop() {
     );
 }
 
-// r[verify ctrl.nodeclaim.evidence-ack-latch]
+// r[verify ctrl.nodeclaim.evidence-ack-latch+1]
 /// merged_bug_045 (commit-on-Ack): buffered kube-only evidence
 /// survives an Ack failure and ships on the next successful Ack.
 /// Recorded red (pre-fix): the buffer was mem::take'n into the wire
@@ -1240,5 +1242,50 @@ async fn evidence_survives_ack_failure_until_committed() {
         acks[2].registered_cells.is_empty(),
         "committed evidence must not re-ship forever: {:?}",
         acks[2].registered_cells
+    );
+}
+
+/// bug_082: the ICE-mark plane (`unfulfillable_cells`) is consume-once
+/// at its producers (`record_reap` fires at claim delete;
+/// `detect_vanished` removes the tracking entry as it emits) — a
+/// failed `AckSpawnedIntents` must retain it for the next tick exactly
+/// like its sibling planes (registered_cells, observed_types). The
+/// pre-fix Err arm warned "buffered evidence retained" while the mark,
+/// built from the consumed parameter, was already gone.
+// r[verify ctrl.nodeclaim.evidence-ack-latch+1]
+#[tokio::test]
+async fn ice_mark_survives_ack_failure() {
+    let mut lab = Lab::new().await;
+    lab.admin.fail_next_ack.store(true, Ordering::SeqCst);
+
+    // Tick 1: a Launched=False/LaunchFailed claim is ICE-reaped
+    // (scripted DELETE) -> record_reap produces the mark -> the Ack
+    // carrying it FAILS (programmed).
+    lab.tick(
+        0,
+        full_tick_scenario(
+            vec![],
+            vec![nc_json_ice("c-ice", 0)],
+            vec![delete_scenario("/apis/karpenter.sh/v1/nodeclaims/c-ice")],
+        ),
+    )
+    .await;
+    let first = lab.ack_calls();
+    assert!(
+        first
+            .last()
+            .is_some_and(|a| a.unfulfillable_cells.contains(&cell().to_string())),
+        "tick-1 ack must carry the fresh mark (and fail): {first:?}"
+    );
+
+    // Tick 2: nothing new happens — the retained mark must ship again.
+    lab.tick(10, full_tick_scenario(vec![], vec![], vec![]))
+        .await;
+    let acks = lab.ack_calls();
+    let last = acks.last().expect("tick-2 ack");
+    assert!(
+        last.unfulfillable_cells.contains(&cell().to_string()),
+        "ICE mark dropped on Ack failure: tick-2 unfulfillable_cells = {:?}",
+        last.unfulfillable_cells
     );
 }

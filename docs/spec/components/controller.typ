@@ -1238,15 +1238,25 @@ fleet-wide learning.
   updating the map violates this rule.
 ]
 
-#r("ctrl.nodeclaim.evidence-ack-latch")[
-  Kube-only scheduler evidence (registered-cell ICE-clears, observed
-  instance types) MUST be delivered commit-on-Ack: the reconciler ships
-  the accumulated buffer BY READ and clears it ONLY when the
-  `AckSpawnedIntents` RPC returns success. An Ack failure or a
-  mid-tick abort MUST leave the buffer intact for the next tick (no
-  moved-out value may exist between the read and the commit). Duplicate
-  delivery after a successful-but-unobserved Ack is acceptable: ICE
-  clears and observed-type upserts are idempotent scheduler-side.
+#r("ctrl.nodeclaim.evidence-ack-latch+1")[
+  EVERY scheduler-evidence plane carried by `AckSpawnedIntents` —
+  registered-cell ICE-clears, observed instance types, AND ICE marks
+  (`unfulfillable_cells`) — MUST be delivered commit-on-Ack: the
+  request is built FROM the accumulated buffer (no evidence may reach
+  the request except through it), shipped BY READ, and the buffer is
+  cleared ONLY when the RPC returns success. An Ack failure or a
+  mid-tick abort MUST leave every plane intact for the next tick (no
+  moved-out value may exist between the read and the commit), and a
+  tick that cannot deliver at all (scheduler unreachable,
+  consolidate-only) MUST buffer its produced evidence rather than drop
+  it — the producers are consume-once, so a dropped plane is
+  unrecoverable. Buffered-but-unacked ICE marks MUST mask their cells
+  from the same controller's `cover_deficit` until acknowledged.
+  Duplicate delivery after a successful-but-unobserved Ack is
+  acceptable: ICE clears and observed-type upserts are idempotent
+  scheduler-side, and a re-delivered ICE mark advances the backoff
+  ladder at most one extra step — bounded, in the conservative
+  direction.
 ]
 
 #r("ctrl.nodeclaim.ice-mark-clear")[

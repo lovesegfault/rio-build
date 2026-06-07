@@ -84,10 +84,22 @@ pub(crate) struct PendingSchedulerEvidence {
     /// Per-cell instance types Karpenter resolved (CostTable feed).
     /// Deduped by full tuple on merge.
     pub(crate) observed_types: Vec<rio_proto::types::ObservedInstanceType>,
+    /// Cells whose NodeClaim was reaped for ICE (the ICE-mark signal,
+    /// bug_082). The producers are consume-once edges — `record_reap`
+    /// fires at the instant the claim is deleted, `detect_vanished`
+    /// removes its tracking entry in the same retain that emits — so a
+    /// mark that misses its Ack is gone forever unless it lives here.
+    /// Commit-on-Ack like the sibling planes; `BTreeSet` dedups within
+    /// a request (the scheduler ladder steps once per entry). A mark
+    /// re-delivered after an ambiguous Ack timeout advances the ladder
+    /// one extra step — strictly conservative against re-minting into
+    /// a cell that provably ICE'd, and strictly better than losing the
+    /// mark.
+    pub(crate) ice_cells: std::collections::BTreeSet<Cell>,
 }
 
 impl PendingSchedulerEvidence {
-    /// Merge another tick's evidence (dedup both planes).
+    /// Merge another tick's evidence (dedup all three planes).
     pub(crate) fn merge(&mut self, other: PendingSchedulerEvidence) {
         self.registered_cells.extend(other.registered_cells);
         for o in other.observed_types {
@@ -100,6 +112,7 @@ impl PendingSchedulerEvidence {
                 self.observed_types.push(o);
             }
         }
+        self.ice_cells.extend(other.ice_cells);
     }
 }
 
@@ -1215,6 +1228,11 @@ impl NodeClaimPoolReconciler {
         PendingSchedulerEvidence {
             registered_cells: registered.into_iter().collect(),
             observed_types: observed,
+            // The ICE-mark plane is produced by the reap path
+            // (`record_reap`/`detect_vanished`), not by kube-only
+            // observation — the reconcile bodies extend the buffer
+            // directly at the production site.
+            ice_cells: std::collections::BTreeSet::new(),
         }
     }
 
@@ -1514,8 +1532,19 @@ impl NodeClaimPoolReconciler {
             self.inflight_created.remove(name);
         }
         ice_cells.extend(health::detect_vanished(&mut self.inflight_created, &live));
+        // bug_082: ICE marks enter the commit-on-Ack buffer AT the
+        // production site — `report_unfulfillable` builds the request
+        // from the buffer, so a failed Ack retains them exactly like
+        // the sibling planes (the producers are consume-once; a
+        // dropped mark can never be re-observed).
+        self.pending_evidence.ice_cells.extend(ice_cells);
+        // Mask = the scheduler's acked view ∪ every buffered-but-
+        // unacked mark: a mark the scheduler has not (provably)
+        // received must still keep cover_deficit out of the cell —
+        // pre-fix only the local tick's cells masked, so the tick
+        // after a failed Ack re-minted into a cell that just ICE'd.
         let mut masked: Vec<String> = intents.ice_masked_cells.clone();
-        masked.extend(ice_cells.iter().map(Cell::to_string));
+        masked.extend(self.pending_evidence.ice_cells.iter().map(Cell::to_string));
 
         let cover = self.cover_deficit(&unplaced, &live, &masked).await?;
         debug!(created = cover.created.len(), "deficit cover");
@@ -1525,7 +1554,7 @@ impl NodeClaimPoolReconciler {
         // entry per bound builder pod) so the scheduler's
         // `authoritative_binding` map stays current without delta
         // tracking; cardinality is O(active builds).
-        self.report_unfulfillable(&ice_cells, pod_snapshot.bound_intent_protos())
+        self.report_unfulfillable(pod_snapshot.bound_intent_protos())
             .await?;
 
         // r42 bug_023: same gauge_universe as `emit_live_gauges` —
@@ -1625,14 +1654,19 @@ impl NodeClaimPoolReconciler {
         .await?;
         // No wedge evidence without the scheduler (the open-attempt
         // view is unreadable); local
-        // ICE-timeout detection still runs on `live`. The returned
-        // ice_cells are dropped — `report_unfulfillable` needs the
-        // scheduler reachable.
+        // ICE-timeout detection still runs on `live`. bug_082 sibling:
+        // the marks produced here are consume-once like everywhere
+        // else — they enter the commit-on-Ack buffer and ship on the
+        // next reconcile_once Ack (pre-fix they were dropped because
+        // "report_unfulfillable needs the scheduler reachable", which
+        // conflated DELIVERY being impossible this tick with the
+        // EVIDENCE being disposable).
         let outcome =
             health::reap_unhealthy(&self.nodeclaims, &live, &[], &self.sketches, &self.cfg, now)
                 .await?;
         let reaped = outcome.reaped_claims;
         self.pending_wedge_evictions.extend(outcome.reaped_nodes);
+        self.pending_evidence.ice_cells.extend(outcome.ice_cells);
         // r[impl ctrl.nodeclaim.inflight-conservation+2]
         // r[impl ctrl.nodeclaim.consolidate-only-degraded+3]
         // r40 bug_012: prune inflight_created against this tick's `live`
@@ -1641,12 +1675,12 @@ impl NodeClaimPoolReconciler {
         // doc-comment on `detect_vanished` ("the controller never deletes
         // its own in-flight claims") only holds if every code path that
         // deletes a tracked claim also removes it from `inflight_created`
-        // — `reconcile_once` did, `consolidate_only` did not. ICE cells
-        // are dropped (no scheduler to report to).
+        // — `reconcile_once` did, `consolidate_only` did not.
         for name in &reaped {
             self.inflight_created.remove(name);
         }
-        let _ = health::detect_vanished(&mut self.inflight_created, &live);
+        let vanished = health::detect_vanished(&mut self.inflight_created, &live);
+        self.pending_evidence.ice_cells.extend(vanished);
         // FFD-derived gauges (`ffd_unplaced_cores`, `ffd_placeable_intents`)
         // need scheduler intents; live-derived gauges read only `live` +
         // `now`, both available here. Without this call, a scheduler
@@ -2099,17 +2133,21 @@ impl NodeClaimPoolReconciler {
         Ok(CoverResult { created })
     }
 
-    /// Report this tick's ICE-hit cells (`unfulfillable_cells`) and
-    /// `Registered=True` edges (`registered_cells`) to the scheduler
-    /// via `AckSpawnedIntents`. The scheduler's ICE backoff ladder
-    /// marks/clears each. `spawned` is empty: the `Pool` reconciler
-    /// owns Job-creation acks (it creates the Jobs; this reconciler
-    /// only gates which intents are eligible via [`PlaceableGate`]).
-    /// RPC failure is warned + dropped (next tick retries; the
-    /// scheduler also has its first-heartbeat clear path).
+    /// Report the buffered ICE marks (`unfulfillable_cells`),
+    /// `Registered=True` edges (`registered_cells`) and observed
+    /// instance types to the scheduler via `AckSpawnedIntents`. The
+    /// scheduler's ICE backoff ladder marks/clears each. `spawned` is
+    /// empty: the `Pool` reconciler owns Job-creation acks (it creates
+    /// the Jobs; this reconciler only gates which intents are eligible
+    /// via [`PlaceableGate`]). bug_082: ALL evidence planes of this
+    /// request are built FROM `pending_evidence` — the function takes
+    /// no evidence parameters, so a plane that bypasses the
+    /// commit-on-Ack buffer cannot exist at this RPC. An Ack failure
+    /// retains every plane for the next tick (the marks' producers are
+    /// consume-once; "next tick retries" is only true for evidence
+    /// that lives in the buffer).
     async fn report_unfulfillable(
         &mut self,
-        ice_cells: &[Cell],
         bound_intents: Vec<rio_proto::types::BoundIntent>,
     ) -> anyhow::Result<()> {
         // C2/285: NO empty-tick suppression — this reconciler ALWAYS
@@ -2121,32 +2159,24 @@ impl NodeClaimPoolReconciler {
         // Ack per tick is the cost; the old all-empty early-return
         // suppressed exactly the tick that mattered.
         // r[impl ctrl.nodeclaim.ice-mark-clear]
-        // BTreeSet dedup: `health::reap_unhealthy`/`detect_vanished`
-        // push one entry per ICE'd CLAIM (up to 8/cell/tick); the
-        // scheduler loops `mark()` per entry so duplicates would jump
-        // step 0→7 (TTL 60s→600s) on a single transient dip. Same for
+        // BTreeSet dedup (now inherent — the buffer IS a set):
+        // `health::reap_unhealthy`/`detect_vanished` push one entry
+        // per ICE'd CLAIM (up to 8/cell/tick); the scheduler loops
+        // `mark()` per entry so duplicates would jump step 0→7 (TTL
+        // 60s→600s) on a single transient dip. Same for
         // `registered_cells` (1 per registered CLAIM → multiple
         // `clear()` calls is harmless but wasteful).
-        let dedup = |cs: &[Cell]| -> Vec<String> {
-            cs.iter()
-                .map(Cell::to_string)
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter()
-                .collect()
-        };
-        // merged_bug_045 (commit-on-Ack): the buffered evidence ships
-        // BY READ — the buffer is cleared ONLY in the Ack-Ok arm below.
-        // An Ack-Err or a mid-tick `?`-abort earlier in the tick leaves
-        // it intact for the next tick (duplicate delivery is idempotent:
-        // repeated ICE-clears are no-ops and observed-type upserts
-        // dedup server-side).
-        let registered_cells: Vec<Cell> = self
-            .pending_evidence
-            .registered_cells
-            .iter()
-            .cloned()
-            .collect();
-        let observed_types = self.pending_evidence.observed_types.clone();
+        //
+        // merged_bug_045 (commit-on-Ack) + bug_082 (all three planes):
+        // the buffered evidence ships BY READ — the buffer is cleared
+        // ONLY in the Ack-Ok arm below. An Ack-Err or a mid-tick
+        // `?`-abort earlier in the tick leaves it intact for the next
+        // tick. Duplicate delivery after a successful-but-unobserved
+        // Ack: ICE-clears are no-ops and observed-type upserts dedup
+        // server-side (idempotent); a re-delivered ICE MARK advances
+        // the backoff ladder one extra step — bounded, and in the
+        // conservative direction (away from re-minting into a cell
+        // that provably ICE'd).
         let req = AckSpawnedIntentsRequest {
             // The explicit per-tick snapshot (always present from this
             // reconciler; empty = clear). R9: the legacy field 5 is
@@ -2156,12 +2186,22 @@ impl NodeClaimPoolReconciler {
                 bound: bound_intents,
             }),
             spawned: vec![],
-            unfulfillable_cells: dedup(ice_cells),
-            registered_cells: dedup(&registered_cells),
-            observed_instance_types: observed_types,
+            unfulfillable_cells: self
+                .pending_evidence
+                .ice_cells
+                .iter()
+                .map(Cell::to_string)
+                .collect(),
+            registered_cells: self
+                .pending_evidence
+                .registered_cells
+                .iter()
+                .map(Cell::to_string)
+                .collect(),
+            observed_instance_types: self.pending_evidence.observed_types.clone(),
             bound_intents: vec![],
         };
-        // r[impl ctrl.nodeclaim.evidence-ack-latch]
+        // r[impl ctrl.nodeclaim.evidence-ack-latch+1]
         match admin_call(self.admin.clone().ack_spawned_intents(req)).await {
             Ok(_) => {
                 // The ONLY clear: the evidence provably reached the
@@ -2171,8 +2211,9 @@ impl NodeClaimPoolReconciler {
             Err(e) => {
                 warn!(
                     error = %e,
-                    "ack_spawned_intents (unfulfillable/registered) failed; \
-                     buffered evidence retained for the next tick"
+                    "ack_spawned_intents failed; all buffered evidence planes \
+                     (ICE marks, ICE clears, observed types) retained for the \
+                     next tick"
                 );
             }
         }

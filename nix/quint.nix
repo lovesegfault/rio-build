@@ -6214,7 +6214,7 @@ rec {
     };
     # r[verify ctrl.nodeclaim.evidence-buffered]
     # r[verify ctrl.nodeclaim.consolidate-only-degraded+3]
-    # r[verify ctrl.nodeclaim.evidence-ack-latch]
+    # r[verify ctrl.nodeclaim.evidence-ack-latch+1]
     quint-nodeclaim-clear-buffer = mkQuintCheck {
       name = "nodeclaim-clear-buffer";
       # quint-policy P1 exemption (bughunt-2 slot 11; the §5-Q13 census
@@ -6251,7 +6251,7 @@ rec {
     # RPC loses the batch on exactly the delivering tick's ack failure
     # (the retired 007 map residual, demonstrated as a model
     # violation; rust-sim seed 0x603e2a44398a939e).
-    # r[verify ctrl.nodeclaim.evidence-ack-latch]
+    # r[verify ctrl.nodeclaim.evidence-ack-latch+1]
     quint-nodeclaim-falsify-ack-latch-asbuilt = mkQuintWitnessCheck {
       name = "nodeclaim-falsify-ack-latch-asbuilt";
       spec = "nodeclaimLifecycle";
