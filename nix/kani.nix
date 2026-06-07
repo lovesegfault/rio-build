@@ -524,6 +524,12 @@ in
     # check_substitute_failure_truth_table), and the e2e pair
     # (HEAD-429 red + upstream_5xx green) pins both polarity halves —
     # a separate harness would re-prove the table against itself.
-    expectedHarnesses = 28;
+    # 28 → 29: + check_content_binding_axis_totality (content.rs —
+    # merged_bug_114's agreement law as the kernel's ONE body; the
+    # AlreadyComplete arm routes through it; agreement iff ALL three
+    # axes equal over the bounded domain, so a dropped axis flips the
+    # proof red. Bughunt-3 S3 formal obligation: "mismatch ⇒ never
+    # Hit").
+    expectedHarnesses = 29;
   };
 }

@@ -79,6 +79,7 @@
 //!   present and has a non-empty all-produced child set
 //!   (`check_vouched_iff_nonempty_all_produced`).
 
+pub mod content;
 pub mod establish;
 pub mod outcome;
 pub mod pull;

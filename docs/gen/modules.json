@@ -565,6 +565,11 @@
   ],
   "rio-evidence-kernel": [
     {
+      "path": "content.rs",
+      "depth": 0,
+      "doc": "Content-binding agreement law for already-complete substitution"
+    },
+    {
       "path": "establish.rs",
       "depth": 0,
       "doc": "Total establishment decision kernel (§4.R2: ONE function, one home)."

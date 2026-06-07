@@ -1190,10 +1190,21 @@ impl Substituter {
                     stored.references.iter().map(ToString::to_string).collect();
                 let claimed_refs: std::collections::BTreeSet<String> =
                     info.references.iter().map(ToString::to_string).collect();
-                if stored.nar_hash != expected_hash
-                    || stored.nar_size != ni.nar_size
-                    || stored_refs != claimed_refs
-                {
+                // The agreement decision is the kernel's ONE body
+                // (axis totality kani-proven there — a dropped axis
+                // flips the proof red, not just the unit test).
+                if !rio_evidence_kernel::content::already_complete_agrees(
+                    &rio_evidence_kernel::content::ContentFacts {
+                        nar_hash: stored.nar_hash,
+                        nar_size: stored.nar_size,
+                        references: stored_refs,
+                    },
+                    &rio_evidence_kernel::content::ContentFacts {
+                        nar_hash: expected_hash,
+                        nar_size: ni.nar_size,
+                        references: claimed_refs,
+                    },
+                ) {
                     warn!(
                         upstream = %upstream.url,
                         path = store_path,
