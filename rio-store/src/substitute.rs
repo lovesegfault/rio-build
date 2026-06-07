@@ -259,6 +259,19 @@ pub enum SubstituteError {
     /// complete_manifest, chunked S3 upload / chunk-row upsert).
     #[error("ingest failed: {0}")]
     Ingest(String),
+
+    /// merged_bug_005: every non-serving upstream that HAD the path
+    /// answered present-but-untrusted (no sig verified against its
+    /// `trusted_keys`) and nothing served, stalled, 429'd, or
+    /// errored. Returned as `Err` so moka does NOT cache it — keys
+    /// can be fixed; pinning the refusal as a miss would hide the
+    /// repair for the TTL window. The materialization executor
+    /// settles it as Unobtainable-with-cause, UNCHARGED.
+    #[error(
+        "upstream narinfo present but no signature verified against \
+         trusted_keys (rotated or mistyped key?)"
+    )]
+    UntrustedPresent,
 }
 
 impl From<metadata::MetadataError> for SubstituteError {
@@ -294,6 +307,7 @@ pub(crate) fn substitute_error_evidence(
         | SubstituteError::SizeMismatch { .. }
         | SubstituteError::TooLarge { .. } => (C::Integrity, None),
         SubstituteError::Ingest(_) => (C::Ingest, None),
+        SubstituteError::UntrustedPresent => (C::Untrusted, None),
     }
 }
 
@@ -308,8 +322,16 @@ enum UpstreamOutcome {
     /// appended). Boxed: `ValidatedPathInfo` is ~300B and the
     /// `Miss`/`Raced` arms are zero-sized.
     Hit(Box<ValidatedPathInfo>),
-    /// narinfo 404 or sig didn't verify — this upstream doesn't have it.
+    /// narinfo 404 — this upstream doesn't have it.
     Miss,
+    /// merged_bug_005: narinfo PRESENT and identity-correct, but no
+    /// signature verified against this upstream's `trusted_keys`. A
+    /// deterministic trust refusal — recorded as its own evidence
+    /// cell so neither leg can read it as a miss ("as good as 404"
+    /// laundered key-rotation skew into the cacheable miss lane,
+    /// where the sig-blind HEAD confirmation re-found the path and
+    /// charged infrastructure forever) or as a hit.
+    UntrustedPresent,
     /// `claim_placeholder` returned `Concurrent` — another replica or
     /// closure-walk holds the slot. Mapped to `Err(Raced)` in
     /// `do_substitute` so moka does not cache it; caller's retry
@@ -859,6 +881,28 @@ impl Substituter {
                     )
                     .increment(1);
                 }
+                Ok(UpstreamOutcome::UntrustedPresent) => {
+                    // merged_bug_005: present-but-untrusted — record
+                    // the trust-refusal cell and FAIL OVER (another
+                    // upstream may hold a verifiable copy). The fold
+                    // below surfaces the refusal only if nothing
+                    // serves and nothing outranks it.
+                    metrics::counter!(
+                        "rio_store_substitute_total",
+                        "result" => "untrusted",
+                        "tenant" => tenant_label.clone()
+                    )
+                    .increment(1);
+                    match cells.record(
+                        rio_evidence_kernel::outcome::SubstituteFailureClass::Untrusted,
+                        None,
+                    ) {
+                        rio_evidence_kernel::outcome::LoopControl::AbortRaced => {
+                            unreachable!("Untrusted records Continue")
+                        }
+                        rio_evidence_kernel::outcome::LoopControl::Continue => {}
+                    }
+                }
                 Ok(UpstreamOutcome::Raced) => {
                     // Another uploader holds the placeholder. STOP —
                     // remaining upstreams would race the same slot.
@@ -952,6 +996,13 @@ impl Substituter {
                      not a definitive miss"
                 )))
             }
+            rio_evidence_kernel::outcome::SubstituteLoopVerdict::UntrustedPresent => {
+                // merged_bug_005: the path IS present upstream — a
+                // typed, UNCACHED trust refusal, never the cacheable
+                // miss the sig-blind HEAD confirmation would then
+                // contradict into an infrastructure charge.
+                Err(SubstituteError::UntrustedPresent)
+            }
             rio_evidence_kernel::outcome::SubstituteLoopVerdict::CleanMiss => Ok(None),
         }
     }
@@ -1028,15 +1079,18 @@ impl Substituter {
         }
 
         // Sig gate: MUST verify against this upstream's trusted_keys.
-        // Reject on None — an upstream we don't have a trust anchor
-        // for is as good as 404.
+        // merged_bug_005: a present-but-unverifiable narinfo is a
+        // typed TRUST REFUSAL, never a miss — folding it into the
+        // cacheable miss lane sent the sig-blind HEAD confirmation
+        // chasing a "present but not ingested" charge forever on a
+        // rotated/mistyped trusted_keys entry.
         let Some(trusted_key) = ni.verify_sig(&upstream.trusted_keys) else {
             warn!(
                 upstream = %upstream.url,
                 path = store_path,
                 "narinfo signature did not verify against upstream.trusted_keys"
             );
-            return Ok(UpstreamOutcome::Miss);
+            return Ok(UpstreamOutcome::UntrustedPresent);
         };
         debug!(upstream = %upstream.url, trusted_key, "narinfo signature verified");
 
@@ -3578,8 +3632,16 @@ mod tests {
         .unwrap();
 
         let sub = test_substituter(db.pool.clone());
-        let got = sub.try_substitute(tid, &path).await.unwrap();
-        assert!(got.is_none(), "sig verification failed → treat as miss");
+        // merged_bug_005: a present-but-unverifiable narinfo is a
+        // TYPED TRUST REFUSAL, not a miss. (This test previously
+        // asserted `got.is_none()` — "as good as 404" — which was the
+        // laundering itself: the cacheable miss sent the sig-blind
+        // HEAD confirmation into a permanent infra charge.)
+        let got = sub.try_substitute(tid, &path).await;
+        assert!(
+            matches!(got, Err(SubstituteError::UntrustedPresent)),
+            "sig verification failed → typed uncached trust refusal, got {got:?}"
+        );
     }
 
     #[tokio::test]

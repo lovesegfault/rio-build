@@ -1392,6 +1392,13 @@
       "crate": "rio-store",
       "msg": "upstream {what} exceeds {limit}-byte cap",
       "doc": "An upstream-supplied body exceeded a size cap (narinfo, `/nix-cache-info`, declared `NarSize`, or decompressed NAR). `tenant_upstreams` rows are tenant-supplied; one tenant's hostile upstream must not OOM the process-global substituter."
+    },
+    {
+      "enum": "SubstituteError",
+      "name": "UntrustedPresent",
+      "crate": "rio-store",
+      "msg": "upstream narinfo present but no signature verified against trusted_keys (rotated or mistyped key?)",
+      "doc": "merged_bug_005: every non-serving upstream that HAD the path answered present-but-untrusted (no sig verified against its `trusted_keys`) and nothing served, stalled, 429'd, or errored. Returned as `Err` so moka does NOT cache it — keys can be fixed; pinning the refusal as a miss would hide the repair for the TTL window. The materialization executor settles it as Unobtainable-with-cause, UNCHARGED."
     }
   ],
   "enums": [

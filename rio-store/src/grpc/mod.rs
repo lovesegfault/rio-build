@@ -624,6 +624,14 @@ pub(super) fn substitute_status(e: SubstituteError) -> Status {
         // demoted to build-from-source.
         SubstituteError::RateLimited { .. } => Status::unavailable("upstream rate-limited; retry"),
         SubstituteError::Admission(a) => a.into(),
+        // merged_bug_005: present-but-untrusted is a typed refusal —
+        // `FailedPrecondition` (the tenant's trusted_keys don't match
+        // what the upstream serves; fixable by configuration, not by
+        // retry). Never `NotFound`: the path IS present upstream, and
+        // a miss answer here would re-launder the refusal one RPC up.
+        SubstituteError::UntrustedPresent => Status::failed_precondition(
+            "upstream narinfo present but no signature verified against trusted_keys",
+        ),
         SubstituteError::HashMismatch { .. }
         | SubstituteError::SizeMismatch { .. }
         | SubstituteError::NarInfo(_)

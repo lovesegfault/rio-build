@@ -48,6 +48,13 @@ pub enum SubstituteFailureClass {
     Integrity,
     /// Local ingest failure (metadata write-ahead, chunk upload).
     Ingest,
+    /// merged_bug_005: narinfo PRESENT and identity-correct, but no
+    /// signature verified against the tenant's `trusted_keys` for the
+    /// serving upstream. Deterministic until keys or content change —
+    /// neither a miss (the path IS present) nor infrastructure
+    /// trouble (nothing is broken on our side): a typed trust
+    /// refusal, settled uncharged.
+    Untrusted,
 }
 
 /// What the scheduler-facing outcome of a classified failure is.
@@ -61,6 +68,11 @@ pub enum FailureDisposition {
     /// Report `InfraFailure`: the charge ladder (and therefore the
     /// park budget) must see this.
     ChargeInfra,
+    /// merged_bug_005: present-but-untrusted is a typed trust refusal
+    /// — settle toward `Unobtainable` with a trust cause, UNCHARGED
+    /// (the park budget must never see a deterministic key-rotation
+    /// refusal), and never fold it into the cacheable miss lane.
+    TrustRefusal,
 }
 
 /// The total classification table (no catch-all: adding a
@@ -76,6 +88,7 @@ pub fn classify_substitute_failure(class: SubstituteFailureClass) -> FailureDisp
         | SubstituteFailureClass::Fetch
         | SubstituteFailureClass::Integrity
         | SubstituteFailureClass::Ingest => FailureDisposition::ChargeInfra,
+        SubstituteFailureClass::Untrusted => FailureDisposition::TrustRefusal,
     }
 }
 
@@ -193,6 +206,7 @@ pub struct SubstituteLoopCells {
     any_stall: Option<core::time::Duration>,
     any_429: Option<Option<core::time::Duration>>,
     any_errored: bool,
+    any_untrusted: bool,
 }
 
 impl SubstituteLoopCells {
@@ -202,6 +216,7 @@ impl SubstituteLoopCells {
             any_stall: None,
             any_429: None,
             any_errored: false,
+            any_untrusted: false,
         }
     }
 
@@ -237,6 +252,7 @@ impl SubstituteLoopCells {
             | SubstituteFailureClass::Fetch
             | SubstituteFailureClass::Integrity
             | SubstituteFailureClass::Ingest => self.any_errored = true,
+            SubstituteFailureClass::Untrusted => self.any_untrusted = true,
         }
         LoopControl::Continue
     }
@@ -272,6 +288,15 @@ pub enum SubstituteLoopVerdict {
     /// the next attempt re-asks — caching this as a miss poisons the
     /// `(tenant, path)` slot for the TTL window (merged_bug_044).
     Errored,
+    /// merged_bug_005: ≥1 upstream answered present-but-untrusted
+    /// (narinfo there, identity OK, no sig verified against
+    /// `trusted_keys`) and none served, stalled, 429'd, or errored.
+    /// NEVER folds to `CleanMiss` — "as good as 404" laundered a
+    /// deterministic trust refusal into the cacheable miss lane,
+    /// where the sig-blind HEAD confirmation re-found the path and
+    /// charged infrastructure forever. The caller surfaces a typed,
+    /// UNCACHED trust refusal instead.
+    UntrustedPresent,
 }
 
 /// bug_081's pure post-loop fold over merged_bug_044's evidence
@@ -285,11 +310,22 @@ pub enum SubstituteLoopVerdict {
 // r[impl store.substitute.stall-abort+2]
 // r[impl store.substitute.loop-evidence-total]
 pub fn fold_substitute_loop(cells: SubstituteLoopCells) -> SubstituteLoopVerdict {
-    match (cells.any_stall, cells.any_429, cells.any_errored) {
-        (Some(window), _, _) => SubstituteLoopVerdict::Stalled { window },
-        (None, Some(retry_after), _) => SubstituteLoopVerdict::RateLimited { retry_after },
-        (None, None, true) => SubstituteLoopVerdict::Errored,
-        (None, None, false) => SubstituteLoopVerdict::CleanMiss,
+    match (
+        cells.any_stall,
+        cells.any_429,
+        cells.any_errored,
+        cells.any_untrusted,
+    ) {
+        (Some(window), _, _, _) => SubstituteLoopVerdict::Stalled { window },
+        (None, Some(retry_after), _, _) => SubstituteLoopVerdict::RateLimited { retry_after },
+        // An errored upstream outranks a trust refusal: the error is
+        // possibly transient (a retry may serve through that
+        // upstream), while the refusal is deterministic — surfacing
+        // the refusal would prematurely settle a path an errored
+        // upstream might still serve.
+        (None, None, true, _) => SubstituteLoopVerdict::Errored,
+        (None, None, false, true) => SubstituteLoopVerdict::UntrustedPresent,
+        (None, None, false, false) => SubstituteLoopVerdict::CleanMiss,
     }
 }
 
@@ -319,6 +355,12 @@ pub enum TenantAttemptEvidence {
     /// Clean miss under this tenant's upstream view (every upstream
     /// answered hit-or-404).
     CleanMiss,
+    /// merged_bug_005: this tenant's view found the path PRESENT on
+    /// ≥1 upstream but no signature verified against that upstream's
+    /// `trusted_keys` (and no upstream served, stalled, 429'd, or
+    /// errored). A deterministic trust refusal — never a miss, never
+    /// infrastructure.
+    UntrustedPresent,
 }
 
 /// merged_bug_188: the tenant axis's recording chokepoint, mirroring
@@ -369,6 +411,14 @@ impl TenantAttemptCells {
             FailureDisposition::ChargeInfra => {
                 self.cells.push(TenantAttemptEvidence::Charge { class });
             }
+            FailureDisposition::TrustRefusal => {
+                // merged_bug_005: present-but-untrusted under this
+                // tenant's view — its own cell; the fold settles it
+                // toward Unobtainable-with-cause only if no tenant
+                // serves, charges, or defers. The next tenant may
+                // still trust the sigs, so the sweep continues.
+                self.cells.push(TenantAttemptEvidence::UntrustedPresent);
+            }
         }
         LoopControl::Continue
     }
@@ -413,6 +463,18 @@ pub enum TenantAttemptsVerdict {
         /// Largest `Retry-After` advice across the transient cells.
         max: Option<core::time::Duration>,
     },
+    /// merged_bug_005: no charge, no transient, but ≥1 tenant
+    /// answered present-but-untrusted (rest clean-missed). The job
+    /// settles **Unobtainable-with-cause, UNCHARGED** — the from-
+    /// source settlement names the trust refusal instead of parking
+    /// the job through the charge ladder, and the sig-blind HEAD
+    /// confirmation is skipped (the path IS present; a HEAD 200
+    /// proves nothing about trust).
+    UntrustedPresent {
+        /// Index of the first `UntrustedPresent` cell (the caller's
+        /// cause message names that tenant's refusal).
+        idx: usize,
+    },
     /// Every consulted tenant cleanly missed (vacuously true for an
     /// empty set — the caller's no-tenant shape has its own arms).
     AllCleanMiss,
@@ -431,6 +493,7 @@ pub enum TenantAttemptsVerdict {
 pub fn fold_tenant_attempts(cells: &[TenantAttemptEvidence]) -> TenantAttemptsVerdict {
     let mut first_charge: Option<usize> = None;
     let mut best_transient: Option<(usize, Option<core::time::Duration>)> = None;
+    let mut first_untrusted: Option<usize> = None;
     let mut i = 0;
     while i < cells.len() {
         match cells[i] {
@@ -454,14 +517,26 @@ pub fn fold_tenant_attempts(cells: &[TenantAttemptEvidence]) -> TenantAttemptsVe
                     None => (i, retry_after),
                 });
             }
+            TenantAttemptEvidence::UntrustedPresent => {
+                if first_untrusted.is_none() {
+                    first_untrusted = Some(i);
+                }
+            }
             TenantAttemptEvidence::CleanMiss => {}
         }
         i += 1;
     }
-    match (first_charge, best_transient) {
-        (Some(idx), _) => TenantAttemptsVerdict::ChargeInfra { idx },
-        (None, Some((idx, max))) => TenantAttemptsVerdict::RetryTransient { idx, max },
-        (None, None) => TenantAttemptsVerdict::AllCleanMiss,
+    // Precedence `ChargeInfra > RetryTransient > UntrustedPresent >
+    // AllCleanMiss`: charging evidence must reach the ladder;
+    // a transient tenant may still SERVE on retry (so back-off
+    // outranks settling on another tenant's deterministic refusal);
+    // the refusal outranks only the clean miss — it must never be
+    // laundered into the cacheable/probe-confirmed miss lane.
+    match (first_charge, best_transient, first_untrusted) {
+        (Some(idx), _, _) => TenantAttemptsVerdict::ChargeInfra { idx },
+        (None, Some((idx, max)), _) => TenantAttemptsVerdict::RetryTransient { idx, max },
+        (None, None, Some(idx)) => TenantAttemptsVerdict::UntrustedPresent { idx },
+        (None, None, None) => TenantAttemptsVerdict::AllCleanMiss,
     }
 }
 
@@ -610,6 +685,26 @@ mod tests {
                 retry_after: Some(Duration::from_secs(9))
             }
         );
+
+        // merged_bug_005: present-but-untrusted NEVER folds to the
+        // cacheable CleanMiss — the laundering lane is dead.
+        let mut untrusted = SubstituteLoopCells::new();
+        assert_eq!(
+            untrusted.record(SubstituteFailureClass::Untrusted, None),
+            LoopControl::Continue
+        );
+        assert_eq!(
+            fold_substitute_loop(untrusted),
+            SubstituteLoopVerdict::UntrustedPresent
+        );
+        // An errored sibling upstream outranks the refusal (a retry
+        // may serve through it); untrusted + miss stays untrusted.
+        let mut untrusted_err = untrusted;
+        let _ = untrusted_err.record(SubstituteFailureClass::Fetch, None);
+        assert_eq!(
+            fold_substitute_loop(untrusted_err),
+            SubstituteLoopVerdict::Errored
+        );
     }
 
     /// The full table, row by row (merged_bug_178's enumeration pin).
@@ -625,6 +720,7 @@ mod tests {
             (Fetch, ChargeInfra),
             (Integrity, ChargeInfra),
             (Ingest, ChargeInfra),
+            (Untrusted, TrustRefusal),
         ] {
             assert_eq!(classify_substitute_failure(class), want, "{class:?}");
         }
@@ -681,6 +777,28 @@ mod tests {
         assert_eq!(
             fold_tenant_attempts(&[E::Transient { retry_after: None }, E::CleanMiss]),
             V::RetryTransient { idx: 0, max: None }
+        );
+
+        // merged_bug_005: the trust lane. Untrusted + clean misses →
+        // UntrustedPresent (idx = first refusal), NEVER AllCleanMiss
+        // (the laundering verdict the sig-blind HEAD then "confirmed"
+        // into a charge). Charge and transient both outrank it.
+        assert_eq!(
+            fold_tenant_attempts(&[E::CleanMiss, E::UntrustedPresent, E::UntrustedPresent]),
+            V::UntrustedPresent { idx: 1 }
+        );
+        assert_eq!(
+            fold_tenant_attempts(&[
+                E::UntrustedPresent,
+                E::Charge {
+                    class: SubstituteFailureClass::Fetch
+                }
+            ]),
+            V::ChargeInfra { idx: 1 }
+        );
+        assert_eq!(
+            fold_tenant_attempts(&[E::UntrustedPresent, E::Transient { retry_after: None }]),
+            V::RetryTransient { idx: 1, max: None }
         );
     }
 
@@ -790,7 +908,8 @@ mod proofs {
             3 => SubstituteFailureClass::AdmissionSaturated,
             4 => SubstituteFailureClass::Fetch,
             5 => SubstituteFailureClass::Integrity,
-            _ => SubstituteFailureClass::Ingest,
+            6 => SubstituteFailureClass::Ingest,
+            _ => SubstituteFailureClass::Untrusted,
         };
         let disposition = classify_substitute_failure(class);
         let transient = matches!(
@@ -798,6 +917,10 @@ mod proofs {
             SubstituteFailureClass::Raced | SubstituteFailureClass::RateLimited
         );
         assert_eq!(disposition == FailureDisposition::RetryUncharged, transient);
+        // merged_bug_005: the trust lane is exactly the Untrusted
+        // class — never charged, never retried-uncharged.
+        let refusal = matches!(class, SubstituteFailureClass::Untrusted);
+        assert_eq!(disposition == FailureDisposition::TrustRefusal, refusal);
     }
 
     /// K1 (merged_bug_044): the loop cells are total over the class
@@ -819,7 +942,8 @@ mod proofs {
             3 => SubstituteFailureClass::AdmissionSaturated,
             4 => SubstituteFailureClass::Fetch,
             5 => SubstituteFailureClass::Integrity,
-            _ => SubstituteFailureClass::Ingest,
+            6 => SubstituteFailureClass::Ingest,
+            _ => SubstituteFailureClass::Untrusted,
         };
         let advice_of = |has: bool, secs: u32| {
             if has {
@@ -839,6 +963,7 @@ mod proofs {
         let mut want_stall: Option<core::time::Duration> = None;
         let mut want_429: Option<Option<core::time::Duration>> = None;
         let mut want_err = false;
+        let mut want_untrusted = false;
         let mut aborted = false;
         let mut i = 0;
         while i < classes.len() {
@@ -880,22 +1005,32 @@ mod proofs {
                     assert_eq!(control, LoopControl::Continue);
                     want_err = true;
                 }
+                SubstituteFailureClass::Untrusted => {
+                    assert_eq!(control, LoopControl::Continue);
+                    want_untrusted = true;
+                }
             }
             i += 1;
         }
         let _ = aborted;
 
         let verdict = fold_substitute_loop(cells);
-        match (want_stall, want_429, want_err) {
-            (Some(w), _, _) => assert_eq!(verdict, SubstituteLoopVerdict::Stalled { window: w }),
-            (None, Some(ra), _) => {
+        match (want_stall, want_429, want_err, want_untrusted) {
+            (Some(w), _, _, _) => assert_eq!(verdict, SubstituteLoopVerdict::Stalled { window: w }),
+            (None, Some(ra), _, _) => {
                 assert_eq!(
                     verdict,
                     SubstituteLoopVerdict::RateLimited { retry_after: ra }
                 )
             }
-            (None, None, true) => assert_eq!(verdict, SubstituteLoopVerdict::Errored),
-            (None, None, false) => assert_eq!(verdict, SubstituteLoopVerdict::CleanMiss),
+            (None, None, true, _) => assert_eq!(verdict, SubstituteLoopVerdict::Errored),
+            (None, None, false, true) => {
+                // merged_bug_005: the trust axis is below the error
+                // axis and above the miss — present-but-untrusted
+                // NEVER folds to the cacheable CleanMiss.
+                assert_eq!(verdict, SubstituteLoopVerdict::UntrustedPresent)
+            }
+            (None, None, false, false) => assert_eq!(verdict, SubstituteLoopVerdict::CleanMiss),
         }
     }
 
@@ -928,7 +1063,7 @@ mod proofs {
     /// names a cell in the given order for the caller's message).
     #[kani::proof]
     fn check_fold_tenant_attempts_permutation_and_precedence() {
-        let mk = |sel: u8, has_advice: bool, secs: u8| match sel % 3 {
+        let mk = |sel: u8, has_advice: bool, secs: u8| match sel % 4 {
             0 => TenantAttemptEvidence::Charge {
                 // The verdict is class-blind by construction; one
                 // charging class stands for all (the class only rides
@@ -942,6 +1077,7 @@ mod proofs {
                     None
                 },
             },
+            2 => TenantAttemptEvidence::UntrustedPresent,
             _ => TenantAttemptEvidence::CleanMiss,
         };
         let a = [
@@ -966,19 +1102,26 @@ mod proofs {
                 TenantAttemptsVerdict::RetryTransient { max: ma, .. },
                 TenantAttemptsVerdict::RetryTransient { max: mb, .. },
             ) => assert_eq!(ma, mb),
+            (
+                TenantAttemptsVerdict::UntrustedPresent { .. },
+                TenantAttemptsVerdict::UntrustedPresent { .. },
+            ) => {}
             (TenantAttemptsVerdict::AllCleanMiss, TenantAttemptsVerdict::AllCleanMiss) => {}
             _ => panic!("verdict class must be permutation-invariant"),
         }
 
         // Charge-precedence + lane totality against an independent
-        // scan of the cells.
+        // scan of the cells (merged_bug_005: the trust lane sits
+        // between transient and clean-miss).
         let mut any_charge = false;
         let mut any_transient = false;
+        let mut any_untrusted = false;
         let mut k = 0;
         while k < a.len() {
             match a[k] {
                 TenantAttemptEvidence::Charge { .. } => any_charge = true,
                 TenantAttemptEvidence::Transient { .. } => any_transient = true,
+                TenantAttemptEvidence::UntrustedPresent => any_untrusted = true,
                 TenantAttemptEvidence::CleanMiss => {}
             }
             k += 1;
@@ -992,7 +1135,13 @@ mod proofs {
                 assert!(!any_charge && any_transient);
                 assert!(matches!(a[idx], TenantAttemptEvidence::Transient { .. }));
             }
-            TenantAttemptsVerdict::AllCleanMiss => assert!(!any_charge && !any_transient),
+            TenantAttemptsVerdict::UntrustedPresent { idx } => {
+                assert!(!any_charge && !any_transient && any_untrusted);
+                assert!(matches!(a[idx], TenantAttemptEvidence::UntrustedPresent));
+            }
+            TenantAttemptsVerdict::AllCleanMiss => {
+                assert!(!any_charge && !any_transient && !any_untrusted)
+            }
         }
     }
 

@@ -265,6 +265,12 @@ async fn execute_job_inner(
     // frontier entry.
     let mut missing_wanted: Vec<String> = Vec::new();
     let mut missing_references: Vec<String> = Vec::new();
+    // merged_bug_005: paths refused on TRUST (present upstream, no
+    // verifiable signature under any interested tenant). They ride
+    // the same missing cells (the settlement is still Unobtainable —
+    // from-source), but the cause string must name the refusal so an
+    // operator fixes trusted_keys instead of chasing a phantom miss.
+    let mut trust_refused: Vec<String> = Vec::new();
     // BC-4 cumulative progress accounting: bytes of fully-processed
     // paths. The per-path fetch callback adds the in-flight path's
     // streamed bytes on top of `completed_bytes`, with the declared
@@ -493,6 +499,28 @@ async fn execute_job_inner(
                             )),
                         };
                     }
+                    TenantAttemptsVerdict::UntrustedPresent { idx } => {
+                        // merged_bug_005: ≥1 tenant found the path
+                        // present-but-untrusted and the rest cleanly
+                        // missed. Settle toward Unobtainable WITHOUT
+                        // the HEAD confirmation — the path IS present
+                        // upstream; a sig-blind HEAD 200 proves
+                        // nothing about trust and pre-fix converted
+                        // this exact state into a permanent
+                        // "present but not ingested" infra charge.
+                        // The local-miss witness still anchors the
+                        // verdict (the path is not locally servable).
+                        let _witness: LocalMiss = local_witness;
+                        let (_, detail) = &cell_msgs[idx];
+                        warn!(path = %path, detail = %detail,
+                              "path present upstream but signature-untrusted; \
+                               settling unobtainable (uncharged)");
+                        trust_refused.push(path.clone());
+                        match cell {
+                            PathCell::Wanted => missing_wanted.push(path.clone()),
+                            PathCell::Reference => missing_references.push(path.clone()),
+                        }
+                    }
                     TenantAttemptsVerdict::AllCleanMiss => {
                         // Every tenant cleanly missed. The miss verdict
                         // additionally requires the HEAD-probe to
@@ -558,6 +586,15 @@ async fn execute_job_inner(
                                     )),
                                 };
                             }
+                            TenantAttemptsVerdict::UntrustedPresent { .. } => {
+                                // Unreachable while the HEAD probe is
+                                // sig-blind; a future sig-aware probe's
+                                // refusal settles like the attempt
+                                // leg's — fall through to the
+                                // confirmed-absent settlement with the
+                                // trust cause recorded.
+                                trust_refused.push(path.clone());
+                            }
                             TenantAttemptsVerdict::AllCleanMiss => {}
                         }
                         let _witness: LocalMiss = local_witness;
@@ -603,15 +640,26 @@ async fn execute_job_inner(
             covered = covered.len(),
             "materialization job unobtainable (confirmed-absent paths)"
         );
+        let mut cause = format!(
+            "{} wanted / {} reference path(s) confirmed absent at every \
+             configured upstream",
+            missing_wanted.len(),
+            missing_references.len()
+        );
+        if !trust_refused.is_empty() {
+            // merged_bug_005: the refusal is actionable configuration
+            // feedback — name it instead of letting it read as a
+            // generic miss.
+            cause.push_str(&format!(
+                "; {} of them present upstream but no narinfo signature \
+                 verified against trusted_keys (rotated or mistyped key?)",
+                trust_refused.len()
+            ));
+        }
         MaterializationOutcome {
             outcome: Some(materialization_outcome::Outcome::Unobtainable(
                 materialization_outcome::Unobtainable {
-                    cause: format!(
-                        "{} wanted / {} reference path(s) confirmed absent at every \
-                         configured upstream",
-                        missing_wanted.len(),
-                        missing_references.len()
-                    ),
+                    cause,
                     missing_paths: missing_wanted,
                     verified_paths: covered,
                     missing_reference_paths: missing_references,
@@ -1781,6 +1829,71 @@ mod tests {
         assert!(
             !unobtainable.cause.is_empty(),
             "the cause string is populated"
+        );
+    }
+
+    /// merged_bug_005: a path that is PRESENT upstream but whose
+    /// narinfo signature fails the tenant's `trusted_keys` (rotated /
+    /// mistyped entry) must settle **Unobtainable** — the uncharged
+    /// from-source settlement — with a cause naming the trust
+    /// refusal. Pre-fix the sig-refusal folded to `CleanMiss`
+    /// ("as good as 404"), the sig-blind HEAD confirmation then saw
+    /// the path present, and every claim charged InfraFailure
+    /// ("present but not ingested") — parking the job at
+    /// max_attempts forever instead of settling.
+    #[tokio::test]
+    async fn sig_untrusted_present_settles_unobtainable() {
+        use base64::Engine;
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "mat-untrusted").await;
+
+        let path = store_path(33, "mat-untrusted");
+        let (nar, _) = rio_test_support::fixtures::make_nar(b"untrusted");
+        // The upstream signs with one key; the tenant trusts the SAME
+        // key name with a DIFFERENT public key (the rotated-key shape).
+        let upstream =
+            spawn_multi_upstream(vec![(path.clone(), nar, vec![])], "cache.rotated").await;
+        let wrong_pub = ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]).verifying_key();
+        let wrong_key = format!(
+            "cache.rotated:{}",
+            base64::engine::general_purpose::STANDARD.encode(wrong_pub.as_bytes())
+        );
+        metadata::upstreams::insert(
+            &db.pool,
+            tenant,
+            &upstream.url,
+            50,
+            std::slice::from_ref(&wrong_key),
+            SigMode::Keep,
+        )
+        .await
+        .expect("upstream wired with rotated trusted key");
+
+        let seeded = seed_job(
+            &db.pool,
+            "mat-untrusted-drv",
+            &[("out", path.as_str())],
+            Some(tenant),
+            Some(tenant),
+            &[],
+        )
+        .await;
+
+        let ctx = make_ctx(db.pool.clone());
+        let outcome = execute_job(&ctx, &seeded.claimed).await;
+
+        let unobtainable = outcome_unobtainable(&outcome).unwrap_or_else(|| {
+            panic!("present-but-untrusted must settle Unobtainable (uncharged), got {outcome:?}")
+        });
+        assert_eq!(
+            unobtainable.missing_paths,
+            vec![path.clone()],
+            "the trust-refused path rides the missing-wanted cell"
+        );
+        assert!(
+            unobtainable.cause.contains("signature"),
+            "the cause names the trust refusal, not a generic miss: {}",
+            unobtainable.cause
         );
     }
 
