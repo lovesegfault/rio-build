@@ -1,5 +1,5 @@
 // -*- mode: Bluespec; -*-
-// quint-policy-latches: covLiveOnlyAll, failoverDroppedJobs, staleJobWriteApplied, dupJob, requeueReadyJustifiedAll, abortChargeFree, reprobeCongruentAll, probeUnchargedOn429All, anyTenantHitServesAll, localServeVisibleAll, walkFoldSeen
+// quint-policy-latches: covLiveOnlyAll, failoverDroppedJobs, staleJobWriteApplied, dupJob, requeueReadyJustifiedAll, abortChargeFree, reprobeCongruentAll, probeUnchargedOn429All, anyTenantHitServesAll, localServeVisibleAll, walkFoldSeen, stampLawAll, stampFoldSeen
 //
 // Substitution-replacement model (Phase C-prime, re-targeted to the
 // post-deletion system at Phase D-prime T-D7.2): the store-owned
@@ -608,6 +608,53 @@ module materializationJob {
   /// proves this flips, so the four latches are never vacuous there.
   var walkFoldSeen: bool
 
+  // --- 4b. bughunt-3 S3 stamp sub-plane (bug_139 / signed Q2) ---------------
+  //
+  // The path_tenants ownership-stamp law: stamped ⊆ verified-per-
+  // tenant, derived FROM the producer's evidence witness — the model
+  // image of rio-scheduler/src/db/live_pins.rs `StampProvenance::
+  // lawful_pairs` (THE one derivation body; signed Q2 2026-06-07).
+  // Same two-step oracle shape as the walk sub-plane: `stampObserve`
+  // arms one producer's evidence; the seat (`stampApply`) recomputes
+  // the law from the ARMED evidence against the caller's decided
+  // pair set. The live `stampFold` derives the pairs lawfully; the
+  // mat-139 calibration derives them the PRE-FIX way (∃-gate behind a
+  // ∀-stamp: the attributed × outputs cartesian) through the SAME
+  // seat (P5).
+
+  /// The producer's evidence class — the four `StampProvenance`
+  /// arms.
+  type StampProv = PWalkVerified | PBuiltLocally | PAllTenantProbe | PProbedBy
+
+  /// One stamp event's evidence: the witness class, the wire-carried
+  /// per-(tenant, output) verified pairs (WalkVerified only), the
+  /// probing tenant (ProbedBy only), the attributed tenants, and the
+  /// derivation's output paths.
+  type StampEvidence = {
+    provenance: StampProv,
+    verified: Set[(str, str)],
+    prober: str,
+    attributed: Set[str],
+    outputs: Set[str],
+  }
+
+  pure val emptyStampEv: StampEvidence = {
+    provenance: PWalkVerified, verified: Set(),
+    prober: "tA", attributed: Set(), outputs: Set(),
+  }
+
+  /// The armed stamp evidence (the oracle the seat's law reads).
+  var stampEv: StampEvidence
+  /// A stamp event is armed (observe ran; the fold has not consumed it).
+  var stampArmed: bool
+  /// Every stamp decision's pair set was within the lawful pairs
+  /// derived from the armed evidence (bug_139 — the ∃-gate/∀-stamp
+  /// cartesian is the violation shape).
+  var stampLawAll: bool
+  /// Reachability marker (hazard-www vacuity guard) for the stamp
+  /// sub-plane.
+  var stampFoldSeen: bool
+
   // --- 5. derived state -------------------------------------------------------
 
   /// In-memory interest (the DAG's interested_builds x liveness):
@@ -806,6 +853,10 @@ module materializationJob {
   val hitUnderAnyTenantOrderSucceeds = anyTenantHitServesAll
   /// bug_115 (slot 10): every local-row serve was visibility-gated.
   val verifiedPathsVisibleToInterest = localServeVisibleAll
+  /// bug_139 (bughunt-3 S3, signed Q2): every path_tenants ownership
+  /// stamp stayed within the pairs its evidence witness lawfully
+  /// derives — the quantifier travels WITH the evidence.
+  val stampedOnlyVerifiedTenants = stampLawAll
 
   /// A2 kind-partition (bughunt wave, merged_bug_146 / the 307 wedge
   /// mirror): a Claimed job view always has the open MATERIALIZATION
@@ -1025,6 +1076,10 @@ module materializationJob {
   /// the walk regime — expect VIOLATION there; vacuously holds in
   /// regimes with ENABLE_WALK_FOLD = false.
   val noWalkFoldEvaluated = not(walkFoldSeen)
+  /// Bughunt-3 S3 vacuity guard (hazard www): a stamp gets decided
+  /// under the walk regime — expect VIOLATION there; vacuously holds
+  /// in regimes with ENABLE_WALK_FOLD = false.
+  val noStampFoldEvaluated = not(stampFoldSeen)
   // Each canReach* is encoded as no* = not(<interesting state>); the
   // check passes only when the checker VIOLATES it.
 
@@ -1221,8 +1276,9 @@ module materializationJob {
     everContrib' = everContrib,
     leafReevalReleased' = leafReevalReleased,
   }
-  /// Slot-10 walk-plane vars unchanged (the machine branches' frame).
-  action walkUnchanged = all {
+  /// Slot-10 walk sub-plane vars unchanged (cells + latches): the
+  /// stamp sub-plane's actions frame their sibling through this.
+  action walkSubPlaneUnchanged = all {
     walkCells' = walkCells,
     cellsArmed' = cellsArmed,
     reprobeCongruentAll' = reprobeCongruentAll,
@@ -1231,14 +1287,31 @@ module materializationJob {
     localServeVisibleAll' = localServeVisibleAll,
     walkFoldSeen' = walkFoldSeen,
   }
+  /// Bughunt-3 stamp sub-plane vars unchanged: the walk sub-plane's
+  /// actions (and the machine branches, via `walkUnchanged`) frame
+  /// their sibling through this.
+  action stampSubPlaneUnchanged = all {
+    stampEv' = stampEv,
+    stampArmed' = stampArmed,
+    stampLawAll' = stampLawAll,
+    stampFoldSeen' = stampFoldSeen,
+  }
+  /// The WHOLE walk plane (both sub-planes) unchanged — the machine
+  /// branches' frame; every deterministic run steps the machine under
+  /// this.
+  action walkUnchanged = all {
+    walkSubPlaneUnchanged,
+    stampSubPlaneUnchanged,
+  }
   /// Walk latches unchanged (the observe step's frame — observing
-  /// cells decides nothing).
+  /// cells decides nothing; the stamp sub-plane is framed too).
   action walkLatchesUnchanged = all {
     reprobeCongruentAll' = reprobeCongruentAll,
     probeUnchargedOn429All' = probeUnchargedOn429All,
     anyTenantHitServesAll' = anyTenantHitServesAll,
     localServeVisibleAll' = localServeVisibleAll,
     walkFoldSeen' = walkFoldSeen,
+    stampSubPlaneUnchanged,
   }
   /// Job-core vars unchanged.
   action jobCoreUnchanged = all {
@@ -2539,6 +2612,10 @@ module materializationJob {
     anyTenantHitServesAll' = true,
     localServeVisibleAll' = true,
     walkFoldSeen' = false,
+    stampEv' = emptyStampEv,
+    stampArmed' = false,
+    stampLawAll' = true,
+    stampFoldSeen' = false,
   }
 
   // --- 8b. slot-10 walk-fold seat + callers ----------------------------------
@@ -2644,6 +2721,7 @@ module materializationJob {
     walkFoldSeen' = true,
     cellsArmed' = false,
     walkCells' = emptyCells,
+    stampSubPlaneUnchanged,
     // merged_bug_133: a serving tenant is never starved by the fold.
     anyTenantHitServesAll' = and {
       anyTenantHitServesAll,
@@ -2680,6 +2758,99 @@ module materializationJob {
       armedConfirmedMissing,
       and { walkCells.charging != Set(), walkCells.served == Set() }
     ),
+  }
+
+  // --- 8c. bughunt-3 S3 stamp seat + callers ---------------------------------
+
+  /// The lawful (tenant, output) ownership pairs derived from the
+  /// ARMED evidence — the model image of `StampProvenance::
+  /// lawful_pairs` (live_pins.rs, THE one body, signed Q2):
+  /// WalkVerified intersects the wire pairs with the attributed
+  /// tenants; BuiltLocally / AllTenantProbe lawfully cover the
+  /// attributed cartesian (locally produced bytes / every tenant's
+  /// own probe answered); ProbedBy stamps only the probing tenant,
+  /// and only if attributed.
+  def lawfulStampPairs: Set[(str, str)] =
+    match stampEv.provenance {
+      | PWalkVerified => stampEv.verified.filter(p =>
+          and { stampEv.attributed.contains(p._1), stampEv.outputs.contains(p._2) })
+      | PBuiltLocally => tuples(stampEv.attributed, stampEv.outputs)
+      | PAllTenantProbe => tuples(stampEv.attributed, stampEv.outputs)
+      | PProbedBy =>
+          if (stampEv.attributed.contains(stampEv.prober))
+            tuples(Set(stampEv.prober), stampEv.outputs)
+          else Set()
+    }
+
+  /// Curated producer-evidence matrices (the discriminating shapes;
+  /// mirrors WALK_MATRICES). The first is the bug_139 defining case:
+  /// the wire verified ONE (tenant, output) pair while two tenants
+  /// are attributed over two outputs — the pre-fix cartesian stamp
+  /// exceeds the lawful set by three pairs.
+  pure val STAMP_MATRICES: Set[StampEvidence] = Set(
+    // ∃-gate / ∀-stamp discriminator: verified ⊊ attributed × outputs.
+    { provenance: PWalkVerified, verified: Set(("tA", "o1")),
+      prober: "tA", attributed: Set("tA", "tB"), outputs: Set("o1", "o2") },
+    // Everything verified — lawful == cartesian (boundary case).
+    { provenance: PWalkVerified,
+      verified: Set(("tA", "o1"), ("tA", "o2"), ("tB", "o1"), ("tB", "o2")),
+      prober: "tA", attributed: Set("tA", "tB"), outputs: Set("o1", "o2") },
+    // Conservative-under-skew: no wire sets — stamp NOTHING.
+    { provenance: PWalkVerified, verified: Set(),
+      prober: "tA", attributed: Set("tA", "tB"), outputs: Set("o1") },
+    // Locally produced bytes: the attributed cartesian is lawful.
+    { provenance: PBuiltLocally, verified: Set(),
+      prober: "tA", attributed: Set("tA", "tB"), outputs: Set("o1") },
+    // Every stamped tenant's own probe answered present.
+    { provenance: PAllTenantProbe, verified: Set(),
+      prober: "tB", attributed: Set("tB"), outputs: Set("o2") },
+    // Single-evidence probe: only the prober, only if attributed.
+    { provenance: PProbedBy, verified: Set(),
+      prober: "tA", attributed: Set("tA", "tB"), outputs: Set("o1", "o2") },
+    // Prober NOT attributed: nothing is lawful.
+    { provenance: PProbedBy, verified: Set(),
+      prober: "tB", attributed: Set("tA"), outputs: Set("o1") }
+  )
+
+  /// Arm one producer's stamp evidence (parameterized so the run pins
+  /// and the calibration can arm literal evidence).
+  action stampObserve(ev: StampEvidence): bool = all {
+    ENABLE_WALK_FOLD,
+    not(stampArmed),
+    stampEv' = ev,
+    stampArmed' = true,
+    stampLawAll' = stampLawAll,
+    stampFoldSeen' = stampFoldSeen,
+    walkSubPlaneUnchanged,
+  }
+
+  /// One curated evidence arming.
+  action stampObserveAny = {
+    nondet ev = STAMP_MATRICES.oneOf()
+    stampObserve(ev)
+  }
+
+  /// Stamp seat (§8a discipline): the caller passes its DECIDED pair
+  /// set; the seat recomputes the law from the ARMED evidence (live
+  /// state, P4) and accumulates the latch. Consumes the armed event.
+  action stampApply(decidedPairs: Set[(str, str)]): bool = all {
+    stampArmed,
+    stampFoldSeen' = true,
+    stampArmed' = false,
+    stampEv' = emptyStampEv,
+    // bug_139: every stamped pair is within the witness's lawful set.
+    stampLawAll' = and {
+      stampLawAll,
+      decidedPairs.subseteq(lawfulStampPairs),
+    },
+    walkSubPlaneUnchanged,
+  }
+
+  /// The LIVE stamp: pairs derived lawfully from the armed evidence
+  /// (the production funnel — `upsert_path_tenants` derives the pair
+  /// set FROM the provenance witness).
+  action stampFold = all {
+    stampApply(lawfulStampPairs),
   }
 
   // --- 10. step --------------------------------------------------------------------
@@ -2737,6 +2908,8 @@ module materializationJob {
       },
       all { walkObserveAny, machineFrame },
       all { walkFold, machineFrame },
+      all { stampObserveAny, machineFrame },
+      all { stampFold, machineFrame },
     }
   }
 
@@ -2766,6 +2939,30 @@ module materializationJob {
         probeUnchargedOn429All,
         anyTenantHitServesAll,
         localServeVisibleAll,
+      })
+  }
+
+  /// Bughunt-3 S3: the bug_139 defining evidence — the wire verified
+  /// exactly (tA, o1) while two tenants are attributed over two
+  /// outputs. The LIVE stamp derives the lawful singleton and the
+  /// law holds; the pre-fix ∃-gate/∀-stamp cartesian (the mat-139
+  /// calibration re-finds it) stamps all four pairs and falsifies.
+  /// Runs under the walk regime.
+  run stampLawWalkVerifiedRun = {
+    init
+      .then(all {
+        stampObserve({
+          provenance: PWalkVerified, verified: Set(("tA", "o1")),
+          prober: "tA", attributed: Set("tA", "tB"),
+          outputs: Set("o1", "o2"),
+        }),
+        machineFrame,
+      })
+      .then(all { stampFold, machineFrame })
+      .expect(and {
+        stampFoldSeen,
+        not(stampArmed),
+        stampLawAll,
       })
   }
 

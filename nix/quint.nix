@@ -182,6 +182,10 @@ let
     "rateLimitedProbeDrawsNoBudget"
     "hitUnderAnyTenantOrderSucceeds"
     "verifiedPathsVisibleToInterest"
+    # Bughunt-3 S3 (bug_139, signed Q2): stamped ⊆ verified-per-tenant,
+    # derived from the StampProvenance witness. Calibration pair:
+    # quint-materialization-calib-139-existsgate-forallstamp.
+    "stampedOnlyVerifiedTenants"
   ];
 
   # The leader-election model as its own single-file store path (the
@@ -4974,7 +4978,7 @@ rec {
       name = "materialization-runs-walk-fold";
       spec = "materializationJob";
       main = "materializationJobWalkFold";
-      match = "walkFoldComplementaryCoverageRun";
+      match = "walkFoldComplementaryCoverageRun|stampLawWalkVerifiedRun";
     };
 
     # Non-vacuity witnesses (rust simulator; expect-violation). Every
@@ -5639,6 +5643,28 @@ rec {
       spec = "materializationJob";
       main = "materializationJobWalkFold";
       witness = "noWalkFoldEvaluated";
+    };
+    # Bughunt-3 S3 (bug_139, signed Q2): the ∃-gate/∀-stamp cartesian
+    # exceeds the witness-derived lawful pairs — the pre-fix shape,
+    # re-derived through the SAME stampApply seat (P5). Measured
+    # [violation] in 774ms at 400000×12 (rust backend).
+    quint-materialization-calib-139-existsgate-forallstamp = mkQuintWitnessCheck {
+      name = "materialization-calib-139-existsgate-forallstamp";
+      spec = "calibration/mat-139-existsgate-forallstamp";
+      main = "matCalibExistsgateForallstamp";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "stampedOnlyVerifiedTenants";
+    };
+    # The stamp sub-plane's hazard-www vacuity guard: a stamp IS
+    # decided under the composed step, so stampLawAll is exercised,
+    # never vacuous. Measured [violation] in 1258ms at 400000×12
+    # (rust backend).
+    quint-materialization-witness-stamp-fold-reachable = mkQuintWitnessCheck {
+      name = "materialization-witness-stamp-fold-reachable";
+      spec = "materializationJob";
+      main = "materializationJobWalkFold";
+      witness = "noStampFoldEvaluated";
     };
 
     # ------------------------------------------------------------------
