@@ -220,45 +220,85 @@ mod tests {
     /// merged_bug_223: cancelling `try_acquire` at ANY await point —
     /// including mid-probe after PG granted the lock server-side —
     /// must never return a lock-holding connection to the pool. Sweep
-    /// cancellation points with stepped timeouts, then prove the lock
-    /// is acquirable and no advisory lock leaked.
+    /// cancellation points with stepped timeouts, then prove
+    /// STRUCTURALLY that no holder survived: the pg_locks population
+    /// settles to zero and the lock is acquirable with exactly one
+    /// hold showing.
+    ///
+    /// The defect this guards: a cancelled acquire RETURNING a
+    /// lock-holding connection to the pool — a permanent holder no
+    /// retry can clear. NOT the defect: transient `None` answers
+    /// mid-sweep, which only mean a PREVIOUS iteration's cancelled
+    /// future detached its connection and PostgreSQL has not finished
+    /// closing it (the release is asynchronous by design). The old
+    /// test panicked on that transient ("lock contended in a
+    /// single-test database") — a wall-clock assumption that the
+    /// async close outruns the next loop iteration. Three CI strikes
+    /// under full-gate parallel load (round-2 S10, round-3 S5 gate,
+    /// round-3 S6a dev-run) catalogued it; per the structural > retry
+    /// > widen strategy the assertion now counts OBSERVED STATES:
+    /// transients are counted (not fatal), and the invariant — zero
+    /// holders once the connections finish dying — is asserted
+    /// against pg_locks, which a pooled (leaked) holder would fail
+    /// forever, not just under load.
     #[tokio::test]
     async fn cancelled_acquire_never_pools_the_lock() {
         let db = TestDb::new(&crate::MIGRATOR).await;
+        let mut transient_contention = 0u32;
         for k in 0..30u64 {
             let fut = PgSessionLock::try_acquire(&db.pool, TEST_LOCK_ID);
             // Stepped deadline: 0..~1.5ms cancels across the acquire
             // and probe awaits; longer steps complete normally.
             match tokio::time::timeout(std::time::Duration::from_micros(k * 50), fut).await {
                 Ok(Ok(Some(l))) => l.release().await.unwrap(),
-                Ok(Ok(None)) => panic!("lock contended in a single-test database"),
+                // A dying (detached) session from an earlier cancelled
+                // iteration still holds the lock server-side: counted,
+                // verified released below.
+                Ok(Ok(None)) => transient_contention += 1,
                 Ok(Err(e)) => panic!("acquire error: {e}"),
                 Err(_) => { /* cancelled mid-flight — the case under test */ }
             }
         }
-        // After the sweep: the lock must be acquirable (no leaked
-        // holder on a pooled connection) and exactly our hold shows.
-        let mut held = None;
-        for _ in 0..100 {
-            if let Some(l) = PgSessionLock::try_acquire(&db.pool, TEST_LOCK_ID)
-                .await
-                .unwrap()
-            {
-                held = Some(l);
+
+        // Structural settle: every cancelled future's connection was
+        // detached (closed), so the advisory-lock population for this
+        // id MUST reach zero — a holder that NEVER leaves pg_locks is
+        // a lock-holding connection in the pool, the exact leak under
+        // test. Bounded retries of a state observation, no wall-clock
+        // assumption about HOW FAST the close lands.
+        let count_holders = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM pg_locks WHERE locktype = 'advisory' \
+                   AND objid = ($1::bigint & x'FFFFFFFF'::bigint)::oid",
+            )
+            .bind(TEST_LOCK_ID)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+        };
+        let mut settled = false;
+        for _ in 0..200 {
+            if count_holders().await == 0 {
+                settled = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        let held = held.expect("lock must be acquirable after cancellation sweep");
-        let advisory: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = ($1::bigint & x'FFFFFFFF'::bigint)::oid",
-        )
-        .bind(TEST_LOCK_ID)
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
+        assert!(
+            settled,
+            "advisory holders never settled to zero: a cancelled acquire \
+             left a lock-holding connection alive (the pooled-holder leak); \
+             transient_contention={transient_contention}"
+        );
+
+        // And the lock is acquirable with exactly our hold showing.
+        let held = PgSessionLock::try_acquire(&db.pool, TEST_LOCK_ID)
+            .await
+            .unwrap()
+            .expect("lock must be acquirable once the holders settled");
         assert_eq!(
-            advisory, 1,
+            count_holders().await,
+            1,
             "exactly the live hold — no leaked advisory locks"
         );
         held.release().await.unwrap();
