@@ -6041,7 +6041,7 @@ rec {
     # a sampled slice. Every law is paired with a falsify twin below
     # (no vacuous-invariant debt; boundsOK is the standard
     # bounds-only exemption).
-    # r[verify ctrl.nodeclaim.wedge-two-axis+2]
+    # r[verify ctrl.nodeclaim.wedge-two-axis+3]
     quint-wedge-cluster-main = mkQuintCheck {
       name = "wedge-cluster-main";
       spec = "wedgeCluster";
@@ -6059,7 +6059,7 @@ rec {
     # populations — retained-evidence wedged nodes over the THIS-TICK
     # fleet — emit Systemic{affected: 2, of: 1} within 2 ticks
     # (merged_bug_009; solo-verified [violation] in ~3s).
-    # r[verify ctrl.nodeclaim.wedge-two-axis+2]
+    # r[verify ctrl.nodeclaim.wedge-two-axis+3]
     quint-wedge-cluster-calib-split-population = mkQuintWitnessCheck {
       name = "wedge-cluster-calib-split-population";
       spec = "calibration/wedge-009-split-population";
@@ -6072,7 +6072,7 @@ rec {
     # return past the Systemic epilogue freezes the marked set against
     # a verdict whose survivor set is empty (merged_bug_176;
     # solo-verified [violation] in ~4s).
-    # r[verify ctrl.nodeclaim.wedge-two-axis+2]
+    # r[verify ctrl.nodeclaim.wedge-two-axis+3]
     quint-wedge-cluster-calib-early-return = mkQuintWitnessCheck {
       name = "wedge-cluster-calib-early-return";
       spec = "calibration/wedge-176-early-return";
@@ -6083,7 +6083,7 @@ rec {
     # Same twin, second law: the undrained episode's surviving anchors
     # later build a per-node verdict a suppression already explained
     # (solo-verified [violation] in ~7s).
-    # r[verify ctrl.nodeclaim.wedge-two-axis+2]
+    # r[verify ctrl.nodeclaim.wedge-two-axis+3]
     quint-wedge-cluster-calib-suppressed-evidence = mkQuintWitnessCheck {
       name = "wedge-cluster-calib-suppressed-evidence";
       spec = "calibration/wedge-176-early-return";
@@ -6096,7 +6096,7 @@ rec {
     # pre-reap anchors survive the next update and keep feeding the
     # Dead arm (the REQUIRED-argument rationale; solo-verified
     # [violation] in ~5s).
-    # r[verify ctrl.nodeclaim.wedge-two-axis+2]
+    # r[verify ctrl.nodeclaim.wedge-two-axis+3]
     quint-wedge-cluster-falsify-no-eviction = mkQuintWitnessCheck {
       name = "wedge-cluster-falsify-no-eviction";
       spec = "wedgeCluster";

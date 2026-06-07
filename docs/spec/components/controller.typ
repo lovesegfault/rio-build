@@ -1368,7 +1368,7 @@ scheduler's cost table when the outage ends.
   marked from data the controller did not observe).
 ]
 
-#r("ctrl.nodeclaim.wedge-two-axis+2")[
+#r("ctrl.nodeclaim.wedge-two-axis+3")[
   The wedge clustering's verdict MUST be two-axis over COMMENSURABLE
   populations: the systemic numerator (nodes past the cluster threshold)
   and denominator MUST derive from the same window state --- the
@@ -1379,19 +1379,27 @@ scheduler's cost table when the outage ends.
   --- the reconciler MUST mark no node, MUST increment the suppression
   counter
   (#(refs.metric)("rio_controller_wedge_systemic_suppressed_total")), MUST
-  drain the suppressed nodes' window evidence (an undiminished episode
-  re-suppresses on fresh anchors; a genuinely stuck node re-detects from
-  two fresh post-episode expiries), and MUST re-derive the marked set ---
-  every verdict, systemic or per-node, runs the full epilogue through one
-  sealed exit. Only a per-node (non-systemic) verdict may feed the `Dead`
-  arm. A tick whose open-attempt view RPC failed MUST skip observation
-  AND verdict (retained evidence neither marks nor suppresses). Backing
-  nodes the controller reaped MUST be evicted from the window before the
-  next verdict (reap feedback is a required input, not optional). The
-  wedge observation grace plus two reconcile ticks MUST fit inside the
-  scheduler's establishment report slack, enforced from one shared
-  constant on both sides (controller compile-time, scheduler
-  config-load).
+  drain the WHOLE episode's window evidence (every node in the windowed
+  population, not only the wedged subset --- a sub-threshold
+  participant's episode anchor must not survive as half of a future
+  pair), MUST latch the suppression watermark, and MUST re-derive the
+  marked set --- every verdict runs its full epilogue through one sealed
+  exit whose token is constructible only inside that exit. Evidence
+  admission MUST beat the watermark: an expired attempt contributes only
+  when its expiry instant is strictly newer than the last suppression,
+  so the episode's still-open attempts cannot re-anchor at the trailing
+  edge and a genuinely stuck node re-detects from
+  `WEDGE_CLUSTER_MIN_DISTINCT_DRVS` fresh POST-episode expiries. Only a
+  per-node (non-systemic) verdict may feed the `Dead` arm. A tick whose
+  open-attempt view RPC failed MUST produce the distinct UNOBSERVED
+  verdict: retained evidence neither marks nor suppresses, and the
+  marked set is not re-derived (an observation blip must not
+  double-count later transitions). Backing nodes the controller reaped
+  MUST be evicted from the window before the next verdict (reap
+  feedback is a required input, not optional). The wedge observation
+  grace plus two reconcile ticks MUST fit inside the scheduler's
+  establishment report slack, enforced from one shared constant on both
+  sides (controller compile-time, scheduler config-load).
 ]
 
 This is the OA2 successor to the retired heartbeat-fed scheduler-side

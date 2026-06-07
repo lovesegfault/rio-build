@@ -1482,7 +1482,7 @@ impl NodeClaimPoolReconciler {
                 None
             }
         };
-        // r[impl ctrl.nodeclaim.wedge-two-axis+2]
+        // r[impl ctrl.nodeclaim.wedge-two-axis+3]
         // Only per-node verdicts may feed the Dead arm; a systemic
         // pattern marks nothing (the warn + suppression counter fired
         // inside the sealed single-exit verdict). Last tick's reaps are
@@ -1495,6 +1495,13 @@ impl NodeClaimPoolReconciler {
                     affected,
                     of, "wedge verdict systemic; Dead arm receives no wedge input this tick"
                 );
+                Vec::new()
+            }
+            // bug_151: the unobserved tick is its own verdict — no
+            // marking from stale data, no suppression accounting, and
+            // structurally distinct from "zero nodes wedged".
+            wedge::WedgeVerdict::Unobserved(_) => {
+                debug!("wedge view unobserved this tick; Dead arm receives no wedge input");
                 Vec::new()
             }
         };
