@@ -667,18 +667,41 @@ fn corpus_text(path: &Path, raw: &str) -> Result<Option<String>> {
     let file: syn::File = syn::parse_file(raw).context("syn parse")?;
     let mut items = file.items;
     prune_cfg_test_items(&mut items);
+    // Statement-level `#[cfg(test)]` (a test-only call inside a
+    // production fn body — gc/mark_scan_bench.rs, logs/chunks.rs) is
+    // pruned by a full visit_mut walk over every block; the corpus
+    // floor below remains the tripwire for any shape this misses.
+    {
+        use syn::visit_mut::VisitMut;
+        let mut pruner = CfgTestStmtPrune;
+        for item in &mut items {
+            pruner.visit_item_mut(item);
+        }
+    }
+    // Doc comments are `#[doc = "…"]` ATTRIBUTES in the token stream —
+    // they survive a token render, so without this strip `/// DELETE
+    // FROM x` would still count as deletion evidence and prose
+    // mentioning cfg(test) would trip the corpus floor (the gate's
+    // first run caught exactly that on gc/mark_scan_bench.rs).
     let rendered = items
         .iter()
-        .map(|i| quote::quote!(#i).to_string())
+        .map(|i| strip_doc_attrs(quote::quote!(#i)).to_string())
         .collect::<Vec<_>>()
         .join("\n");
     // Floor: nothing cfg(test)-gated may remain in the corpus — if the
     // prune logic ever rots, fail the lint loudly instead of silently
     // re-admitting test statements as production evidence.
-    ensure!(
-        !rendered.contains("cfg (test") && !rendered.contains("cfg(test"),
-        "cfg(test) item survived the corpus prune"
-    );
+    if let Some(at) = rendered
+        .find("cfg (test")
+        .or_else(|| rendered.find("cfg(test"))
+    {
+        let lo = at.saturating_sub(80);
+        let hi = rendered.len().min(at + 80);
+        anyhow::bail!(
+            "cfg(test) item survived the corpus prune near: …{}…",
+            &rendered[lo..hi]
+        );
+    }
     Ok(Some(normalize_decl_text(&rendered)))
 }
 
@@ -737,13 +760,149 @@ fn impl_item_attrs(i: &syn::ImplItem) -> Option<&[syn::Attribute]> {
     })
 }
 
+struct CfgTestStmtPrune;
+
+impl syn::visit_mut::VisitMut for CfgTestStmtPrune {
+    fn visit_block_mut(&mut self, block: &mut syn::Block) {
+        block.stmts.retain(|s| !stmt_is_cfg_test(s));
+        syn::visit_mut::visit_block_mut(self, block);
+    }
+
+    fn visit_item_enum_mut(&mut self, e: &mut syn::ItemEnum) {
+        e.variants = std::mem::take(&mut e.variants)
+            .into_iter()
+            .filter(|v| !is_cfg_test_attrs(&v.attrs))
+            .collect();
+        syn::visit_mut::visit_item_enum_mut(self, e);
+    }
+
+    fn visit_expr_match_mut(&mut self, m: &mut syn::ExprMatch) {
+        m.arms.retain(|a| !is_cfg_test_attrs(&a.attrs));
+        syn::visit_mut::visit_expr_match_mut(self, m);
+    }
+
+    fn visit_expr_struct_mut(&mut self, e: &mut syn::ExprStruct) {
+        e.fields = std::mem::take(&mut e.fields)
+            .into_iter()
+            .filter(|fv| !is_cfg_test_attrs(&fv.attrs))
+            .collect();
+        syn::visit_mut::visit_expr_struct_mut(self, e);
+    }
+
+    fn visit_pat_struct_mut(&mut self, e: &mut syn::PatStruct) {
+        e.fields = std::mem::take(&mut e.fields)
+            .into_iter()
+            .filter(|fp| !is_cfg_test_attrs(&fp.attrs))
+            .collect();
+        syn::visit_mut::visit_pat_struct_mut(self, e);
+    }
+
+    fn visit_fields_named_mut(&mut self, f: &mut syn::FieldsNamed) {
+        f.named = std::mem::take(&mut f.named)
+            .into_iter()
+            .filter(|fl| !is_cfg_test_attrs(&fl.attrs))
+            .collect();
+        syn::visit_mut::visit_fields_named_mut(self, f);
+    }
+
+    fn visit_item_trait_mut(&mut self, t: &mut syn::ItemTrait) {
+        t.items
+            .retain(|ti| !trait_item_attrs(ti).is_some_and(is_cfg_test_attrs));
+        syn::visit_mut::visit_item_trait_mut(self, t);
+    }
+}
+
+fn trait_item_attrs(i: &syn::TraitItem) -> Option<&[syn::Attribute]> {
+    use syn::TraitItem::*;
+    Some(match i {
+        Const(x) => &x.attrs,
+        Fn(x) => &x.attrs,
+        Type(x) => &x.attrs,
+        Macro(x) => &x.attrs,
+        _ => return None,
+    })
+}
+
+fn stmt_is_cfg_test(s: &syn::Stmt) -> bool {
+    match s {
+        syn::Stmt::Local(l) => is_cfg_test_attrs(&l.attrs),
+        syn::Stmt::Item(i) => item_attrs(i).is_some_and(is_cfg_test_attrs),
+        syn::Stmt::Expr(e, _) => expr_attrs(e).is_some_and(is_cfg_test_attrs),
+        syn::Stmt::Macro(m) => is_cfg_test_attrs(&m.attrs),
+    }
+}
+
+fn expr_attrs(e: &syn::Expr) -> Option<&[syn::Attribute]> {
+    use syn::Expr::*;
+    Some(match e {
+        Array(x) => &x.attrs,
+        Assign(x) => &x.attrs,
+        Async(x) => &x.attrs,
+        Await(x) => &x.attrs,
+        Binary(x) => &x.attrs,
+        Block(x) => &x.attrs,
+        Call(x) => &x.attrs,
+        Cast(x) => &x.attrs,
+        Field(x) => &x.attrs,
+        ForLoop(x) => &x.attrs,
+        If(x) => &x.attrs,
+        Index(x) => &x.attrs,
+        Let(x) => &x.attrs,
+        Loop(x) => &x.attrs,
+        Macro(x) => &x.attrs,
+        Match(x) => &x.attrs,
+        MethodCall(x) => &x.attrs,
+        Paren(x) => &x.attrs,
+        Path(x) => &x.attrs,
+        Range(x) => &x.attrs,
+        Reference(x) => &x.attrs,
+        Return(x) => &x.attrs,
+        Try(x) => &x.attrs,
+        TryBlock(x) => &x.attrs,
+        Tuple(x) => &x.attrs,
+        Unary(x) => &x.attrs,
+        Unsafe(x) => &x.attrs,
+        While(x) => &x.attrs,
+        _ => return None,
+    })
+}
+
 fn is_cfg_test_attrs(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|a| {
         a.path().is_ident("cfg")
             && a.parse_args::<proc_macro2::TokenStream>()
-                .map(|ts| tokens_mention_test_ident(ts))
+                .map(tokens_mention_test_ident)
                 .unwrap_or(false)
     })
+}
+
+/// Drop every `#[doc = …]` attribute group (recursively, so impl/mod
+/// bodies are covered) — doc text is commentary, never production
+/// deletion evidence.
+fn strip_doc_attrs(ts: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+    let mut out: Vec<proc_macro2::TokenTree> = Vec::new();
+    let mut iter = ts.into_iter().peekable();
+    while let Some(tt) = iter.next() {
+        if let proc_macro2::TokenTree::Punct(p) = &tt
+            && p.as_char() == '#'
+            && let Some(proc_macro2::TokenTree::Group(g)) = iter.peek()
+            && g.delimiter() == proc_macro2::Delimiter::Bracket
+            && matches!(
+                g.stream().into_iter().next(),
+                Some(proc_macro2::TokenTree::Ident(id)) if id == "doc"
+            )
+        {
+            iter.next(); // drop the [doc = …] group with its `#`
+            continue;
+        }
+        out.push(match tt {
+            proc_macro2::TokenTree::Group(g) => proc_macro2::TokenTree::Group(
+                proc_macro2::Group::new(g.delimiter(), strip_doc_attrs(g.stream())),
+            ),
+            other => other,
+        });
+    }
+    out.into_iter().collect()
 }
 
 fn tokens_mention_test_ident(ts: proc_macro2::TokenStream) -> bool {
@@ -1111,6 +1270,50 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// Gate-red shapes (first full-gate run caught all five): doc
+    /// comments are #[doc] ATTRIBUTES and survive a token render, and
+    /// cfg(test) gates appear on statements, enum variants, match
+    /// arms, struct-literal fields, and destructuring-pattern fields —
+    /// every one must be pruned (or doc-stripped), and the corpus
+    /// floor is the tripwire for any shape still missing.
+    #[test]
+    fn corpus_prunes_every_cfg_test_position_and_doc_text() {
+        let p = std::path::Path::new("fake/prod.rs");
+        // Doc text is never evidence (and prose mentioning cfg(test)
+        // must not trip the floor).
+        let norm = corpus_text(
+            p,
+            "/// uses the cfg(test) override; runs DELETE FROM widgets\npub fn live() {}\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!norm.contains("DELETE FROM widgets"), "{norm}");
+        // Statement-level cfg(test) inside a production fn body.
+        let norm = corpus_text(
+            p,
+            "pub fn live() {\n    #[cfg(test)]\n    recorder(\"DELETE FROM widgets\");\n    real();\n}\nfn real() {}\nfn recorder(_s: &str) {}\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!norm.contains("DELETE FROM widgets"), "{norm}");
+        // Enum variant + match arm.
+        let norm = corpus_text(
+            p,
+            "pub enum E {\n    Live,\n    #[cfg(test)]\n    T(&'static str),\n}\npub fn f(e: E) {\n    match e {\n        E::Live => {}\n        #[cfg(test)]\n        E::T(q) => { let _ = (q, \"DELETE FROM widgets\"); }\n    }\n}\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!norm.contains("DELETE FROM widgets"), "{norm}");
+        // Struct-literal field value + destructuring-pattern field.
+        let norm = corpus_text(
+            p,
+            "pub struct S {\n    a: u8,\n    #[cfg(test)]\n    q: &'static str,\n}\npub fn f() -> S {\n    S { a: 1, #[cfg(test)] q: \"DELETE FROM widgets\" }\n}\npub fn g(s: S) {\n    let S { a: _, #[cfg(test)] q: _ } = s;\n}\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!norm.contains("DELETE FROM widgets"), "{norm}");
     }
 
     /// `Lint::all()` must list every enum variant, or `xtask lint`
