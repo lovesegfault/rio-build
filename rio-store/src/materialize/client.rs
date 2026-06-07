@@ -547,12 +547,20 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
         }
     };
 
+    // bug_099: the walk's budget counts POTENTIAL server-side mints —
+    // every nonce issued whose outcome the scheduler has not answered.
+    // An ANSWERED refusal (Gone / NotYetReady / Rejected) refunds the
+    // slot (the scheduler affirmatively did not mint — bug_385's
+    // in-pass skip stays free); an UNANSWERED pull keeps it consumed
+    // (the mint may have committed server-side, bound to this worker).
+    // Pre-fix, a mailbox brownout let a 1-slot worker mint a nonce per
+    // listed descriptor (16+ open attempts the resume lane drains at
+    // one per pass).
+    let mut outstanding_mints = 0usize;
     for descriptor in listed {
-        // The claim budget: stop once `available_slots` claims
-        // SUCCEEDED — refusals (Gone/NotYetReady/timeout) do not
-        // consume slots, they just advance past the head (bug_385's
-        // in-pass skip).
-        if claimed.len() >= available_slots {
+        // The claim budget: delivered claims plus unanswered potential
+        // mints.
+        if claimed.len() + outstanding_mints >= available_slots {
             break;
         }
         // bug_233 (parse-don't-validate): refuse the claim BEFORE the
@@ -588,6 +596,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             origin: descriptor.origin.clone(),
             nonce,
         });
+        outstanding_mints += 1;
         let req = PullAssignmentRequest {
             // No executor token: the store's credential is the
             // service token in metadata (the kind-attested credential).
@@ -613,6 +622,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             // caller can abort/report those attempts under the grace.
             PullAnswer::Shutdown => return claimed,
             PullAnswer::Deliver(assignment) => {
+                outstanding_mints -= 1;
                 ledger.resolve(job_id);
                 // merged_bug_026 (fresh-claim sibling site): the same
                 // Pending-arm race exists between list and claim — the
@@ -634,6 +644,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             // attempt through a stale view). Rejected (bug_119) is the
             // permanent-refusal shape of the same answered class.
             PullAnswer::Gone | PullAnswer::NotYetReady | PullAnswer::Rejected => {
+                outstanding_mints -= 1;
                 ledger.resolve(job_id)
             }
             // The answer never arrived: the entry STAYS — the next
@@ -1248,6 +1259,43 @@ mod tests {
         );
         assert_eq!(t.list_calls, 1);
         assert_eq!(t.pull_calls, 2);
+    }
+
+    /// bug_099: the fresh-claim walk is budgeted by ISSUED claims
+    /// (potential server-side mints, counted at nonce-mint time), not
+    /// delivered claims. Pre-fix, Unanswered was a free skip over the
+    /// full LISTING_WINDOW (16+): under a scheduler-mailbox brownout a
+    /// 1-slot worker minted a nonce per descriptor — up to 16 open
+    /// attempts committed server-side and bound to this worker, gone
+    /// from every other worker's listing, while the resume lane drains
+    /// at most available_slots per pass.
+    #[tokio::test(start_paused = true)]
+    async fn unanswered_pulls_consume_the_mint_budget() {
+        let descriptors = vec![descriptor(991), descriptor(992), descriptor(993)];
+        let mut ledger = ResumeLedger::default();
+        let mut t = MockTransport::new(vec![Ok(listing(descriptors))], vec![], vec![]);
+        t.hang_next_pulls = 8;
+        let claimed = poll_and_claim(
+            &mut t,
+            &instance("store-replica-0"),
+            1,
+            &mut ledger,
+            &mut ListFailureLatch::default(),
+            &token(),
+        )
+        .await;
+        assert!(claimed.is_empty());
+        assert_eq!(
+            ledger.len(),
+            1,
+            "one slot = one potential mint per pass; an unanswered pull \
+             consumes the budget instead of skipping to mint again"
+        );
+        assert_eq!(
+            t.pull_calls, 1,
+            "the walk stops at the budget — no further pulls (and no \
+             further nonces) ride the wire this pass"
+        );
     }
 
     /// bug_116: assignments the RESUME pass already claimed (and
