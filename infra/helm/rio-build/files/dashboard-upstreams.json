@@ -1,6 +1,6 @@
 [
   {
-    "_comment": "Dashboard east-west upstream registry (bug_238/bug_403): ONE record per backend the dashboard nginx dials. Three generated consumers — docker.nix renders the nginx upstream blocks (envsubst placeholders, env defaults below), networkpolicy.yaml ranges this file twice — the dashboard-egress edges AND a standalone dashboard-to-<component> ingress CNP per record (an upstream cannot exist without its policy pair, by construction; bug_221), and dashboard.yaml sets each env from .Values.namespaces so chart overrides reach the baked image. Add a backend HERE; the conf, both policy sides, and the env wiring follow.",
+    "_comment": "Dashboard east-west upstream registry (bug_238/bug_403): ONE record per backend the dashboard nginx dials, uniquely keyed by `name` (the nginx upstream block id AND the ingress-CNP identity, DNS-1123-mapped; `component` is only the pod label and MAY repeat across records — bug_019). Three generated consumers — docker.nix renders the nginx upstream blocks (envsubst placeholders, env defaults below), networkpolicy.yaml ranges this file twice — the dashboard-egress edges AND a standalone dashboard-to-<name> ingress CNP per record (an upstream cannot exist without its policy pair, by construction; bug_221), and dashboard.yaml sets each env from .Values.namespaces so chart overrides reach the baked image. Add a backend HERE; the conf, both policy sides, and the env wiring follow.",
     "name": "rio_scheduler",
     "component": "rio-scheduler",
     "service": "rio-scheduler-leader",

@@ -526,10 +526,18 @@ spec:
 # default-deny-ingress-except-dashboard the moment this CNP selects
 # it (pre-agreed; the registry is for dashboard upstreams, which are
 # all policied rio components).
+#
+# Resource identity is keyed on the registry's UNIQUE field (`name`,
+# DNS-1123-mapped), never on `component`: two records may share a
+# component (a second port/service on one backend), and a
+# component-keyed name rendered two CNPs with identical
+# kind/name/namespace — helm refuses the duplicate, or last-wins
+# silently drops the first record's ingress allow under
+# `template | apply` (bug_019).
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata:
-  name: dashboard-to-{{ .component }}
+  name: dashboard-to-{{ .name | replace "_" "-" }}
   namespace: {{ index $.Values.namespaces .namespaceRef "name" }}
   labels:
     app.kubernetes.io/part-of: rio-build
