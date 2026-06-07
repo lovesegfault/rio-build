@@ -171,7 +171,7 @@ impl LineCursor {
 /// object PUT succeeds): it is surfaced as an `Internal` error naming
 /// the key so the operator can find the hole, never silently skipped —
 /// a silent skip would present a gapped log as complete.
-// r[impl store.log.read-divergence+1]
+// r[impl store.log.read-divergence+2]
 pub async fn read_chunk(
     store: &dyn LogChunkStore,
     manifest: Option<&PgPool>,
@@ -209,17 +209,17 @@ pub async fn read_chunk(
             bound = rio_log_kernel::MAX_CHUNK_LINES_ABS,
             "TailLog: manifest row claims more lines than any decodable chunk can hold"
         );
-        let mut status = Status::internal(format!(
-            "TailLog: manifest row claims {} lines, past the {}-line absolute bound (corrupt row): {}",
-            chunk.line_count,
-            rio_log_kernel::MAX_CHUNK_LINES_ABS,
-            chunk.s3_key
+        return Err(super::loss::refuse_permanent(
+            chunk.exec_id,
+            &chunk.s3_key,
+            super::loss::UnservableKind::OversizedChunk,
+            format!(
+                "TailLog: manifest row claims {} lines, past the {}-line absolute bound (corrupt row): {}",
+                chunk.line_count,
+                rio_log_kernel::MAX_CHUNK_LINES_ABS,
+                chunk.s3_key
+            ),
         ));
-        status.metadata_mut().insert(
-            rio_proto::LOG_UNSERVABLE_METADATA_KEY,
-            tonic::metadata::MetadataValue::from_static("oversized_chunk"),
-        );
-        return Err(status);
     }
 
     let blob = match store.get(&chunk.s3_key).await {
@@ -253,19 +253,53 @@ pub async fn read_chunk(
                     return Ok(Vec::new());
                 }
             }
-            // The row stands and the object is gone: an unrecoverable
-            // hole. error! so the operator has a signal beyond the
-            // client-visible Status; the counter goes through the loss
-            // ledger so N readers (or re-reads) of one hole page once.
-            error!(
-                s3_key = %key,
-                exec_id = %chunk.exec_id,
-                "TailLog: manifest references a missing chunk object (data loss)"
-            );
-            super::loss::note_hole(chunk.exec_id, &key, "missing_object");
-            return Err(Status::internal(format!(
-                "TailLog: manifest references a missing chunk object (data loss): {key}"
-            )));
+            // The row stands and the object is gone. merged_bug_066:
+            // this is the DEGENERATE full-span short — the whole
+            // claimed range is missing — and it rides the same
+            // coverage policy as the short-object arm: a span the
+            // served-prefix cursor plus the remaining rows cover is a
+            // disclosed divergence (the covering rows serve), only an
+            // uncoverable span is the unrecoverable hole.
+            let span_until = chunk.first_line.saturating_add(chunk.line_count);
+            let rows: Vec<(u64, u64)> = remaining
+                .iter()
+                .map(|r| (r.first_line, r.line_count))
+                .collect();
+            match rio_log_kernel::short_object_policy(
+                cursor.next_line,
+                chunk.first_line,
+                span_until,
+                &rows,
+            ) {
+                rio_log_kernel::ShortObjectPolicy::ServeClamped => {
+                    warn!(
+                        s3_key = %key,
+                        exec_id = %chunk.exec_id,
+                        "TailLog: missing chunk object fully covered by served \
+                         prefix + remaining rows (clean skip)"
+                    );
+                    super::loss::note_divergence("missing_object_covered");
+                    return Ok(Vec::new());
+                }
+                rio_log_kernel::ShortObjectPolicy::UnservableHole => {
+                    // error! so the operator has a signal beyond the
+                    // client-visible Status; the ledger dedupes the
+                    // page (N readers of one hole page once).
+                    error!(
+                        s3_key = %key,
+                        exec_id = %chunk.exec_id,
+                        "TailLog: manifest references a missing chunk object (data loss)"
+                    );
+                    return Err(super::loss::refuse_permanent(
+                        chunk.exec_id,
+                        &key,
+                        super::loss::UnservableKind::MissingObject,
+                        format!(
+                            "TailLog: manifest references a missing chunk object (data loss): {key}"
+                        ),
+                    ));
+                }
+            }
         }
         Err(other) => {
             warn!(key = %chunk.s3_key, error = %other, "TailLog: chunk fetch failed");
@@ -273,11 +307,19 @@ pub async fn read_chunk(
         }
     };
     let lines = decompress_lines(&blob).map_err(|e| {
-        warn!(key = %chunk.s3_key, error = %e, "TailLog: chunk decode failed");
-        Status::internal(format!(
-            "TailLog: stored chunk is not decodable (corruption): {}",
-            chunk.s3_key
-        ))
+        // merged_bug_066: identically-forever like its siblings —
+        // typed permanent + ledgered, never a bare internal the
+        // gateway re-dials at reopen cadence forever.
+        error!(key = %chunk.s3_key, error = %e, "TailLog: chunk decode failed (corruption)");
+        super::loss::refuse_permanent(
+            chunk.exec_id,
+            &chunk.s3_key,
+            super::loss::UnservableKind::UndecodableChunk,
+            format!(
+                "TailLog: stored chunk is not decodable (corruption): {}",
+                chunk.s3_key
+            ),
+        )
     })?;
 
     // The dedup proper, with the manifest/object clamp: the kernel
@@ -336,7 +378,12 @@ pub async fn read_chunk(
                 .iter()
                 .map(|r| (r.first_line, r.line_count))
                 .collect();
-            match rio_log_kernel::short_object_policy(missing_from, missing_until, &rows) {
+            match rio_log_kernel::short_object_policy(
+                cursor.next_line,
+                missing_from,
+                missing_until,
+                &rows,
+            ) {
                 rio_log_kernel::ShortObjectPolicy::ServeClamped => {
                     // A covered short is a DIVERGENCE disclosure, not
                     // data loss: every claimed line still serves (from
@@ -349,17 +396,16 @@ pub async fn read_chunk(
                     super::loss::note_divergence("short_object_covered");
                 }
                 rio_log_kernel::ShortObjectPolicy::UnservableHole => {
-                    super::loss::note_hole(chunk.exec_id, &chunk.s3_key, "short_object");
-                    let mut status = Status::internal(format!(
-                        "TailLog: chunk object holds fewer lines than its manifest row \
-                         (data loss, lines {missing_from}..{missing_until} missing): {}",
-                        chunk.s3_key
+                    return Err(super::loss::refuse_permanent(
+                        chunk.exec_id,
+                        &chunk.s3_key,
+                        super::loss::UnservableKind::ShortObject,
+                        format!(
+                            "TailLog: chunk object holds fewer lines than its manifest row \
+                             (data loss, lines {missing_from}..{missing_until} missing): {}",
+                            chunk.s3_key
+                        ),
                     ));
-                    status.metadata_mut().insert(
-                        rio_proto::LOG_UNSERVABLE_METADATA_KEY,
-                        tonic::metadata::MetadataValue::from_static("short_object"),
-                    );
-                    return Err(status);
                 }
             }
         }
@@ -1040,7 +1086,7 @@ mod tests {
     /// are discarded — they would otherwise be served as garbage under
     /// the NEXT chunk's line numbers — and the next chunk's genuine
     /// lines must not be suppressed by an over-advanced watermark.
-    // r[verify store.log.read-divergence+1]
+    // r[verify store.log.read-divergence+2]
     #[tokio::test]
     async fn over_length_object_clamps_and_preserves_next_chunk() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -1071,7 +1117,7 @@ mod tests {
     /// An under-length object (holds fewer lines than its manifest row
     /// claims) is data loss with NotFound parity: an `Internal` error
     /// naming the key, never a silently shorter stream.
-    // r[verify store.log.read-divergence+1]
+    // r[verify store.log.read-divergence+2]
     #[tokio::test]
     async fn short_object_is_data_loss_error() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -1118,6 +1164,171 @@ mod tests {
         assert!(
             err.message().contains(&key),
             "the error must name the missing key for the operator: {err:?}"
+        );
+    }
+
+    /// merged_bug_001: a short object whose missing-span PREFIX was
+    /// already served to THIS reader by an earlier overlapping-session
+    /// chunk (the cursor proves it; the covering row sorts BEFORE the
+    /// current chunk and is structurally invisible to the
+    /// remaining-rows coverage walk) is fully servable — the policy
+    /// must clamp by the served-prefix cursor before consulting
+    /// coverage, not page a false critical hole.
+    // r[verify store.log.read-divergence+2]
+    #[tokio::test]
+    async fn short_object_prefix_served_by_cursor_serves_fully() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let store = MemoryLogChunkStore::default();
+        let exec = Uuid::now_v7();
+        let sess_a = Uuid::now_v7();
+        seed_execution(&db.pool, exec, Some("succeeded"), Some(15)).await;
+        // Session A: one full chunk serving [0,12) — the reader's
+        // cursor lands at 12.
+        let content_a = lines("a", 0, 12);
+        seed_chunk(&db.pool, &store, exec, sess_a, 0, 0, &line_refs(&content_a)).await;
+        // Session B: row claims [5,15) but its object holds [5,8) —
+        // missing [8,15); the cursor already proves [8,12).
+        let sess_b = Uuid::now_v7();
+        let content_b = lines("b", 5, 3);
+        let key_b = seed_chunk(&db.pool, &store, exec, sess_b, 0, 5, &line_refs(&content_b)).await;
+        sqlx::query("UPDATE drv_log_chunks SET line_count = 10 WHERE s3_key = $1")
+            .bind(&key_b)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        // Session A continues: [12,15) — covers the cursor-clamped
+        // remainder of B's missing span.
+        let content_c = lines("c", 12, 3);
+        seed_chunk(
+            &db.pool,
+            &store,
+            exec,
+            sess_a,
+            1,
+            12,
+            &line_refs(&content_c),
+        )
+        .await;
+
+        let refs = read_manifest_range(&db.pool, exec, 0).await.unwrap();
+        let got = stream_chunks(&store, &refs, 0)
+            .await
+            .expect("the prefix-overlap topology is fully servable — no wedge, no page");
+        let nums: Vec<u64> = got.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            nums,
+            (0..15).collect::<Vec<u64>>(),
+            "all fifteen lines, exactly once"
+        );
+    }
+
+    /// merged_bug_066: the missing-object refusal is identically-
+    /// forever, so it must carry `LOG_UNSERVABLE_METADATA_KEY` — a
+    /// bare `Status::internal` is classified TransportErr by the
+    /// gateway, which reopens at backoff cadence for the build's
+    /// lifetime (the 1 Hz-wedge class bug_233 closed for the
+    /// short-object sibling arm).
+    // r[verify store.log.read-divergence+2]
+    #[tokio::test]
+    async fn missing_object_refusal_is_typed_permanent() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let store = MemoryLogChunkStore::default();
+        let exec = Uuid::now_v7();
+        let sess = Uuid::now_v7();
+        let content = lines("a", 0, 10);
+        let key = seed_chunk(&db.pool, &store, exec, sess, 0, 0, &line_refs(&content)).await;
+        store
+            .delete_batch(std::slice::from_ref(&key))
+            .await
+            .unwrap();
+
+        let refs = read_manifest_range(&db.pool, exec, 0).await.unwrap();
+        let err = stream_chunks(&store, &refs, 0)
+            .await
+            .expect_err("an uncovered missing object is data loss");
+        assert_eq!(
+            err.metadata()
+                .get(rio_proto::LOG_UNSERVABLE_METADATA_KEY)
+                .map(|v| v.to_str().unwrap_or("")),
+            Some("missing_object"),
+            "the refusal must be TYPED permanent so the reader exit law stops re-dialing: {err:?}"
+        );
+    }
+
+    /// merged_bug_066: a missing object whose ENTIRE claimed span is
+    /// covered (cursor-served prefix + remaining rows) is the
+    /// degenerate full-span short — a covered divergence, never a
+    /// hole: the walk skips clean and the covering rows serve.
+    // r[verify store.log.read-divergence+2]
+    #[tokio::test]
+    async fn missing_object_with_cover_skips_clean() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let store = MemoryLogChunkStore::default();
+        let exec = Uuid::now_v7();
+        let sess_a = Uuid::now_v7();
+        seed_execution(&db.pool, exec, Some("succeeded"), Some(12)).await;
+        // Session A serves [0,12) in two rows.
+        let content_a = lines("a", 0, 6);
+        seed_chunk(&db.pool, &store, exec, sess_a, 0, 0, &line_refs(&content_a)).await;
+        let content_b = lines("a", 6, 6);
+        seed_chunk(&db.pool, &store, exec, sess_a, 1, 6, &line_refs(&content_b)).await;
+        // Session B: row claims [2,10) — fully inside A's coverage —
+        // and its object is GONE.
+        let sess_b = Uuid::now_v7();
+        let content_dup = lines("b", 2, 8);
+        let key_b = seed_chunk(
+            &db.pool,
+            &store,
+            exec,
+            sess_b,
+            0,
+            2,
+            &line_refs(&content_dup),
+        )
+        .await;
+        store
+            .delete_batch(std::slice::from_ref(&key_b))
+            .await
+            .unwrap();
+
+        let refs = read_manifest_range(&db.pool, exec, 0).await.unwrap();
+        let got = stream_chunks(&store, &refs, 0)
+            .await
+            .expect("a fully-covered missing object is a clean skip, not a hole");
+        let nums: Vec<u64> = got.iter().map(|(n, _)| *n).collect();
+        assert_eq!(nums, (0..12).collect::<Vec<u64>>(), "all lines served once");
+    }
+
+    /// merged_bug_066: the undecodable-chunk refusal is identically-
+    /// forever too — typed permanent + ledgered (`note_hole`), like
+    /// every permanent-refusal arm.
+    // r[verify store.log.read-divergence+2]
+    #[tokio::test]
+    async fn undecodable_chunk_is_typed_permanent() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let store = MemoryLogChunkStore::default();
+        let exec = Uuid::now_v7();
+        let sess = Uuid::now_v7();
+        let content = lines("a", 0, 10);
+        let key = seed_chunk(&db.pool, &store, exec, sess, 0, 0, &line_refs(&content)).await;
+        // Replace the object with garbage (delete first: put has
+        // If-None-Match semantics).
+        store
+            .delete_batch(std::slice::from_ref(&key))
+            .await
+            .unwrap();
+        store.put(&key, vec![0xff; 32]).await.unwrap();
+
+        let refs = read_manifest_range(&db.pool, exec, 0).await.unwrap();
+        let err = stream_chunks(&store, &refs, 0)
+            .await
+            .expect_err("a corrupt chunk is unservable");
+        assert_eq!(
+            err.metadata()
+                .get(rio_proto::LOG_UNSERVABLE_METADATA_KEY)
+                .map(|v| v.to_str().unwrap_or("")),
+            Some("undecodable_chunk"),
+            "the decode refusal must be TYPED permanent: {err:?}"
         );
     }
 

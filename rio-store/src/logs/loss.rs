@@ -111,6 +111,57 @@ pub(super) fn note_divergence(kind: &'static str) {
     .increment(1);
 }
 
+/// The typed unservable kinds — the closed vocabulary of
+/// identically-forever refusals (`LOG_UNSERVABLE_METADATA_KEY`
+/// values). One enum, so an arm cannot invent an untyped refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UnservableKind {
+    /// Manifest row claims more lines than any decodable chunk holds.
+    OversizedChunk,
+    /// Manifest row stands but the chunk object is gone, and no
+    /// cursor/row coverage serves the span.
+    MissingObject,
+    /// Chunk object holds fewer lines than its row claims, and no
+    /// cursor/row coverage serves the missing span.
+    ShortObject,
+    /// Chunk object exists but does not decode (corruption).
+    UndecodableChunk,
+}
+
+impl UnservableKind {
+    pub(super) const fn as_static(self) -> &'static str {
+        match self {
+            UnservableKind::OversizedChunk => "oversized_chunk",
+            UnservableKind::MissingObject => "missing_object",
+            UnservableKind::ShortObject => "short_object",
+            UnservableKind::UndecodableChunk => "undecodable_chunk",
+        }
+    }
+}
+
+/// THE permanent-refusal constructor (merged_bug_066): every
+/// identically-forever refusal in the read path routes here, so a
+/// permanent refusal CANNOT ship without its typed marker (the
+/// gateway's reader exit law keys on `LOG_UNSERVABLE_METADATA_KEY` —
+/// a bare `Status::internal` classifies TransportErr and wedges the
+/// reader at reopen cadence for the build's lifetime) nor without its
+/// hole-ledger entry (one hole = one page, N readers or re-reads
+/// notwithstanding).
+pub(super) fn refuse_permanent(
+    exec_id: Uuid,
+    s3_key: &str,
+    kind: UnservableKind,
+    detail: String,
+) -> tonic::Status {
+    note_hole(exec_id, s3_key, kind.as_static());
+    let mut status = tonic::Status::internal(detail);
+    status.metadata_mut().insert(
+        rio_proto::LOG_UNSERVABLE_METADATA_KEY,
+        tonic::metadata::MetadataValue::from_static(kind.as_static()),
+    );
+    status
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

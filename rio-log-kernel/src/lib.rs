@@ -485,7 +485,7 @@ pub struct ObjectVisit {
         }
     }
 }))]
-// r[impl store.log.read-divergence+1]
+// r[impl store.log.read-divergence+2]
 pub fn visit_object(
     next_line: u64,
     first_line: u64,
@@ -536,17 +536,32 @@ pub enum ShortObjectPolicy {
 }
 
 /// Decide the [`ShortObjectPolicy`] for a missing span
-/// `[missing_from, missing_until)` given the REMAINING manifest rows
-/// (`(first_line, line_count)`, ordered by `first_line` — the manifest
-/// read order). Coverage may be stitched from several overlapping
-/// rows.
-// r[impl store.log.read-divergence+1]
+/// `[missing_from, missing_until)` given the reader's served-prefix
+/// cursor and the REMAINING manifest rows (`(first_line,
+/// line_count)`, ordered by `first_line` — the manifest read order).
+/// Coverage may be stitched from several overlapping rows.
+///
+/// merged_bug_001: the cursor is an EXPLICIT parameter so the kani
+/// oracle and every test are forced to quantify over the
+/// served-prefix axis. Lines below `cursor_next_line` were already
+/// yielded to THIS reader by earlier (overlapping-session) chunks —
+/// the covering row sorts BEFORE the current chunk and is
+/// structurally invisible to the remaining-rows walk, so without the
+/// clamp a fully-servable prefix-overlap topology pages a false
+/// critical hole.
+// r[impl store.log.read-divergence+2]
 pub fn short_object_policy(
+    cursor_next_line: u64,
     missing_from: u64,
     missing_until: u64,
     remaining: &[(u64, u64)],
 ) -> ShortObjectPolicy {
-    let mut covered_to = missing_from;
+    // Served-prefix clamp: the cursor is proof of service.
+    let needed_from = missing_from.max(cursor_next_line);
+    if needed_from >= missing_until {
+        return ShortObjectPolicy::ServeClamped;
+    }
+    let mut covered_to = needed_from;
     for &(first, count) in remaining {
         if covered_to >= missing_until {
             break;
@@ -1161,17 +1176,26 @@ mod proofs {
         let missing_from: u64 = kani::any();
         let missing_until: u64 = kani::any();
         kani::assume(missing_from < missing_until && missing_until <= B);
+        // merged_bug_001: the served-prefix axis, quantified.
+        let cursor: u64 = kani::any();
+        kani::assume(cursor <= B);
         let rows: [(u64, u64); 3] = kani::any();
         kani::assume(rows.iter().all(|&(f, c)| f <= B && c <= B));
         kani::assume(rows[0].0 <= rows[1].0 && rows[1].0 <= rows[2].0);
 
-        let verdict = short_object_policy(missing_from, missing_until, &rows);
+        let verdict = short_object_policy(cursor, missing_from, missing_until, &rows);
 
-        // Independent oracle: every missing line individually covered,
-        // with rows usable only while the prefix has no gap (the
-        // ordered-walk semantics the policy documents).
+        // Independent oracle: every missing line NOT already served
+        // (below the cursor) individually covered, with rows usable
+        // only while the prefix has no gap (the ordered-walk
+        // semantics the policy documents).
+        let needed_from = if cursor > missing_from {
+            cursor
+        } else {
+            missing_from
+        };
         let mut all_covered = true;
-        let mut line = missing_from;
+        let mut line = needed_from;
         while line < missing_until {
             let mut hit = false;
             let mut frontier_ok = true;
@@ -1179,7 +1203,7 @@ mod proofs {
                 if !frontier_ok {
                     break;
                 }
-                if f > line && f > missing_from {
+                if f > line && f > needed_from {
                     // A row starting past this line cannot help it,
                     // and ordered input means no later row can either.
                     frontier_ok = f <= line;
@@ -1617,22 +1641,35 @@ mod tests {
     fn short_object_policy_coverage_stitching() {
         use ShortObjectPolicy::*;
         // One covering row.
-        assert_eq!(short_object_policy(5, 10, &[(5, 5)]), ServeClamped);
+        assert_eq!(short_object_policy(0, 5, 10, &[(5, 5)]), ServeClamped);
         // Stitched from two overlapping rows.
-        assert_eq!(short_object_policy(5, 10, &[(3, 4), (6, 4)]), ServeClamped);
+        assert_eq!(
+            short_object_policy(0, 5, 10, &[(3, 4), (6, 4)]),
+            ServeClamped
+        );
         // Covering row starts below the span.
-        assert_eq!(short_object_policy(5, 10, &[(0, 12)]), ServeClamped);
+        assert_eq!(short_object_policy(0, 5, 10, &[(0, 12)]), ServeClamped);
         // Gap in the stitch: [7,8) uncovered.
         assert_eq!(
-            short_object_policy(5, 10, &[(5, 2), (8, 2)]),
+            short_object_policy(0, 5, 10, &[(5, 2), (8, 2)]),
             UnservableHole
         );
         // Nothing at all.
-        assert_eq!(short_object_policy(5, 10, &[]), UnservableHole);
+        assert_eq!(short_object_policy(0, 5, 10, &[]), UnservableHole);
         // Row past the span can't help (ordered-walk break).
-        assert_eq!(short_object_policy(5, 10, &[(11, 5)]), UnservableHole);
+        assert_eq!(short_object_policy(0, 5, 10, &[(11, 5)]), UnservableHole);
         // Empty rows are no-ops.
-        assert_eq!(short_object_policy(5, 10, &[(5, 0), (5, 5)]), ServeClamped);
+        assert_eq!(
+            short_object_policy(0, 5, 10, &[(5, 0), (5, 5)]),
+            ServeClamped
+        );
+        // merged_bug_001: the served-prefix axis. The cursor proves
+        // [5,12) served; the remaining row covers [12,15).
+        assert_eq!(short_object_policy(12, 8, 15, &[(12, 3)]), ServeClamped);
+        // Cursor covers the WHOLE span: no coverage rows needed.
+        assert_eq!(short_object_policy(15, 8, 15, &[]), ServeClamped);
+        // Cursor below the span: no help.
+        assert_eq!(short_object_policy(3, 8, 15, &[(12, 3)]), UnservableHole);
     }
 
     #[test]

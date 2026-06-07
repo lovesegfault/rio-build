@@ -2113,20 +2113,26 @@ client's output while the final message advertised a clean cursor past it.
 A drop now costs one recovery pass (a manifest read and possibly chunk
 GETs) instead of lines.
 
-#r("store.log.read-divergence+1")[
+#r("store.log.read-divergence+2")[
   A chunk's served range and post-visit watermark MUST be bounded by the
   smaller of the manifest row's claim and the object's actual line count,
   and any disagreement between the two MUST be classified and disclosed: a
   long object serves the claimed range only, the unclaimed excess
   discarded and counted. A short object (object holds fewer lines than
-  the row claims) MUST be decided by COVERAGE, not arm order: when the
-  remaining manifest rows cover the missing span, the clamped lines are
-  served and the covering rows supply the rest; when no row covers it,
-  the read fails as a TYPED-permanent error (the unservable-hole gRPC
-  metadata key) naming the chunk key --- never a silently shorter
-  stream, and never an untyped error a reader re-dials forever. The
-  manifest claim is the single authoritative bound at every decision
-  point of the read path.
+  the row claims) and a missing object whose manifest row still stands
+  MUST be decided by COVERAGE, not arm order: the missing span is first
+  clamped by the reader's served-prefix cursor (lines already yielded by
+  earlier overlapping-session chunks are proof of service), and when the
+  cursor plus the remaining manifest rows cover the span, the servable
+  lines are served and the covering rows supply the rest; when no
+  coverage exists, the read fails through the single permanent-refusal
+  constructor as a TYPED-permanent error (the unservable-hole gRPC
+  metadata key) naming the chunk key, with the hole ledgered --- never a
+  silently shorter stream, and never an untyped error a reader re-dials
+  forever. Every identically-forever refusal arm (oversized row, missing
+  object, short object, undecodable chunk) MUST route through that
+  constructor. The manifest claim is the single authoritative bound at
+  every decision point of the read path.
 ]
 
 The two divergence directions have different blast radii: an over-length

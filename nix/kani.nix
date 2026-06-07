@@ -229,7 +229,7 @@ in
   # r[verify store.log.ingest-bounds]
   # r[verify store.log.completeness-gate]
   # r[verify store.log.tail-grace-drain+2]
-  # r[verify store.log.read-divergence]
+  # r[verify store.log.read-divergence+2]
   kani-rio-log-kernel = mkKaniCheck {
     name = "rio-log-kernel";
     crate = crateBuildKani.members.rio-log-kernel;
