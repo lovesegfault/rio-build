@@ -37,9 +37,13 @@ pub(super) struct CompletionStamp {
 ///
 /// One boolean per store-coupled failure lane. Deliberately NO
 /// `Default` impl: every construction site must name every lane, so a
-/// future store-coupled lane (e.g. a substitute-fetch path) fails to
-/// compile at each stamp site until its evidence is wired — the lane
-/// set can never silently lag the failure surface.
+/// future store-coupled lane (e.g. a narinfo/substitute-fetch path)
+/// fails to compile at each stamp site until its evidence is wired —
+/// the lane set can never silently lag the failure surface. The
+/// error-shaped lanes are folded by [`fold_error_evidence`], which is
+/// exhaustive over `ExecutorError` for the same reason (bug_159: the
+/// lane-set chokepoint shipped while the already-live metadata-fetch
+/// failure surface stayed outside it).
 pub(super) struct StoreEvidenceSet {
     /// bug_408 lane: the FUSE breaker open at completion, or its
     /// monotonic trip count rose during the build (the during-the-build
@@ -49,16 +53,22 @@ pub(super) struct StoreEvidenceSet {
     /// transport-unreachable store (`upload::is_store_unreachable` —
     /// `UploadExhausted` ending in `Unavailable`/`DeadlineExceeded`).
     pub upload_transport: bool,
+    /// bug_159 lane: the input-metadata fetch — the first store call
+    /// of every build (`fetch_drv_from_store`,
+    /// `compute_input_closure`) — failed `Unavailable`/
+    /// `DeadlineExceeded`. `NotFound`/`Internal` are per-input
+    /// verdicts, not store degradation, and stay charged.
+    pub metadata_fetch: bool,
 }
 
 impl StoreEvidenceSet {
     /// Any lane saw store-degraded evidence.
     pub(super) fn any(&self) -> bool {
-        self.fuse_breaker || self.upload_transport
+        self.fuse_breaker || self.upload_transport || self.metadata_fetch
     }
 }
 
-// r[impl builder.outcome.store-degraded+1]
+// r[impl builder.outcome.store-degraded+2]
 /// bug_408 + bug_286: stamp `store_degraded` onto an assembled
 /// `ProtoBuildResult` iff the status is `InfrastructureFailure`. The
 /// single chokepoint all three assembly paths (ok/err/panic) route
@@ -100,6 +110,54 @@ pub(super) fn ok_completion(r: ExecutionResult, mut stamp: CompletionStamp) -> C
     }
 }
 
+/// bug_159: fold an `ExecutorError` into its store-evidence lane.
+///
+/// Exhaustive on purpose — every variant names its lane or names NO
+/// lane explicitly, so a new store-coupled error variant fails to
+/// compile here until its evidence is classified, instead of
+/// silently defaulting into a charged WorkerInfra failure (the
+/// single-variant `if let` this replaces did exactly that to
+/// `MetadataFetch`).
+fn fold_error_evidence(e: &ExecutorError, evidence: &mut StoreEvidenceSet) {
+    use crate::executor::ExecutorError as E;
+    match e {
+        // Upload lane (bug_286): transport-unreachable store at
+        // output upload.
+        E::Upload(upload_err) => {
+            evidence.upload_transport |= crate::upload::is_store_unreachable(upload_err);
+        }
+        // Metadata-fetch lane (bug_159): unreachable/timing-out store
+        // at the input-metadata fetch. Per-input verdicts
+        // (`NotFound`, `Internal`, …) are NOT degradation.
+        E::MetadataFetch { source, .. } => {
+            evidence.metadata_fetch |= matches!(
+                source.code(),
+                tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+            );
+        }
+        // Explicitly laneless: `Grpc` carries mixed store/scheduler
+        // provenance with no call-site attribution — the attributed
+        // store-call shape is `MetadataFetch`/`Upload`; everything
+        // else is build content, daemon-local, node-local, or
+        // control flow.
+        E::Overlay(_)
+        | E::OverlayTaskPanic(_)
+        | E::SynthDb(_)
+        | E::NixConf(_)
+        | E::DaemonSpawn(_)
+        | E::Handshake(_)
+        | E::DaemonSetup(_)
+        | E::BuildFailed(_)
+        | E::InvalidDerivation(_)
+        | E::Grpc(_)
+        | E::Wire(_)
+        | E::Cgroup(_)
+        | E::CgroupOom
+        | E::WrongKind { .. }
+        | E::Cancelled => {}
+    }
+}
+
 /// Map an `ExecutorError` to a `CompletionReport`.
 ///
 /// `was_cancelled` is read from the build's cancel flag BEFORE deciding
@@ -131,12 +189,10 @@ pub(super) fn err_completion(
     peak_memory_bytes: u64,
     peak_cpu_cores: f64,
 ) -> CompletionReport {
-    // bug_286: an upload error that propagated as ExecutorError (instead
-    // of the collect_outputs mapped arm) carries the same upload-lane
-    // evidence — classify it here so both error shapes converge.
-    if let ExecutorError::Upload(upload_err) = e {
-        stamp.store_evidence.upload_transport |= crate::upload::is_store_unreachable(upload_err);
-    }
+    // bug_286 + bug_159: fold the error's store evidence through the
+    // exhaustive classifier so both error shapes converge and no
+    // variant can sit outside the lane set.
+    fold_error_evidence(e, &mut stamp.store_evidence);
     let status = if was_cancelled {
         tracing::info!(drv_path = %drv_path, "build cancelled (cgroup.kill)");
         BuildResultStatus::Cancelled
@@ -310,6 +366,7 @@ mod tests {
             store_evidence: StoreEvidenceSet {
                 fuse_breaker: false,
                 upload_transport: false,
+                metadata_fetch: false,
             },
         }
     }
@@ -319,6 +376,7 @@ mod tests {
             store_evidence: StoreEvidenceSet {
                 fuse_breaker: true,
                 upload_transport: false,
+                metadata_fetch: false,
             },
             ..stamp()
         }
@@ -360,6 +418,7 @@ mod tests {
             store_evidence: StoreEvidenceSet {
                 fuse_breaker: false,
                 upload_transport: true,
+                metadata_fetch: false,
             },
             ..stamp()
         };
@@ -377,7 +436,7 @@ mod tests {
         }
     }
 
-    // r[verify builder.outcome.store-degraded+1]
+    // r[verify builder.outcome.store-degraded+2]
     /// The stamp chokepoint marks `store_degraded` iff the status is
     /// `InfrastructureFailure` AND the breaker verdict was set: a
     /// transient (build-ran) failure with an open breaker stays false
@@ -568,5 +627,72 @@ mod tests {
         // Not cancelled: passthrough.
         assert_eq!(final_footer_result(Some("ok"), false), Some("ok"));
         assert_eq!(final_footer_result(None, false), None);
+    }
+
+    /// bug_159: a store outage at the input-metadata fetch — the
+    /// first store call of every build — must ride the uncharged
+    /// store-degraded class like the fuse and upload lanes, not
+    /// convert into charged WorkerInfra retries/node-exclusions/
+    /// poison.
+    #[test]
+    fn metadata_fetch_outage_stamps_store_degraded() {
+        let ctors: [fn(&str) -> tonic::Status; 2] = [
+            |m| tonic::Status::unavailable(m),
+            |m| tonic::Status::deadline_exceeded(m),
+        ];
+        for code_ctor in ctors {
+            let report = err_completion(
+                &crate::executor::ExecutorError::MetadataFetch {
+                    path: "/nix/store/aaaa-input".into(),
+                    source: code_ctor("store rolling"),
+                },
+                "/nix/store/bbbb-thing.drv".into(),
+                "tok".into(),
+                false,
+                stamp(),
+                0,
+                0.0,
+            );
+            let result = report.result.expect("err_completion always sets result");
+            assert_eq!(
+                result.status,
+                i32::from(BuildResultStatus::InfrastructureFailure),
+                "metadata-fetch outage is an infra failure"
+            );
+            assert!(
+                result.store_degraded,
+                "metadata-fetch Unavailable/DeadlineExceeded must carry the store-degraded refinement"
+            );
+        }
+    }
+
+    /// bug_159 counter-case: per-input store VERDICTS (NotFound,
+    /// Internal) at the metadata fetch are not store degradation —
+    /// they stay charged.
+    #[test]
+    fn metadata_fetch_verdicts_stay_charged() {
+        let ctors: [fn(&str) -> tonic::Status; 2] = [
+            |m| tonic::Status::not_found(m),
+            |m| tonic::Status::internal(m),
+        ];
+        for code_ctor in ctors {
+            let report = err_completion(
+                &crate::executor::ExecutorError::MetadataFetch {
+                    path: "/nix/store/aaaa-input".into(),
+                    source: code_ctor("missing"),
+                },
+                "/nix/store/bbbb-thing.drv".into(),
+                "tok".into(),
+                false,
+                stamp(),
+                0,
+                0.0,
+            );
+            let result = report.result.expect("err_completion always sets result");
+            assert!(
+                !result.store_degraded,
+                "per-input verdicts must NOT ride the store-degraded class"
+            );
+        }
     }
 }

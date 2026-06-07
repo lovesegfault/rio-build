@@ -218,6 +218,10 @@ impl BuildSpawnContext {
                 // evidence — this seed covers nothing today but keeps
                 // the lane named at the constructor).
                 upload_transport,
+                // bug_159: metadata-fetch evidence rides the error
+                // (`fold_error_evidence` in the assembly fns) — the
+                // ambient stamp has none.
+                metadata_fetch: false,
             },
         }
     }
@@ -748,9 +752,11 @@ pub async fn spawn_build_task(
                             fuse_breaker: panic_circuit.is_open()
                                 || panic_circuit.trip_count() > circuit_trips_at_spawn,
                             // Panic = the build task died before any
-                            // upload outcome existed; no upload-lane
-                            // evidence is observable on this path.
+                            // upload or metadata-fetch outcome
+                            // existed; no error-lane evidence is
+                            // observable on this path.
                             upload_transport: false,
+                            metadata_fetch: false,
                         },
                     },
                 ),
