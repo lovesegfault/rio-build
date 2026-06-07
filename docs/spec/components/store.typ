@@ -1290,13 +1290,19 @@ tenant turned an obtainable path into InfraFailure. Charging evidence still
 outranks back-off advice at the fold (matching the per-upstream loop's
 ordering one level down), and the transient lane still closes uncharged.
 
-#r("store.materialize.progress-monotone")[
+#r("store.materialize.progress-monotone+1")[
   Every materialization progress emission MUST route through a
-  job-level monotone adapter that owns the high-water mark and is the
-  ONLY constructor of per-path progress callbacks: emitted
-  `bytes_done` MUST be non-decreasing across the job and
-  `bytes_done <= bytes_expected` MUST hold at every call, for every
-  candidate sequence including within-path retry resets.
+  job-level adapter that owns the COMMITTED progress floor and is the
+  ONLY constructor of per-path progress callbacks. The floor is
+  mutated ONLY by the success-witness commit of a fully-processed
+  path; per-path streaming emissions are provisional --- clamped to
+  the committed floor (never below completed work) but structurally
+  unable to raise it, so bytes streamed by an attempt that later
+  fails leave no trace on job-level state and the final report equals
+  the closure's true byte total. `bytes_done <= bytes_expected` MUST
+  hold at every call; emitted `bytes_done` MUST never drop below the
+  committed floor (display MAY step back from a failed attempt's
+  provisional peak --- the truthful reading).
 ]
 The per-fetch byte counter is local to each download attempt, so a stall
 failover to the next upstream (or a per-tenant retry) restarts it at

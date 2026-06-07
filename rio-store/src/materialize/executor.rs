@@ -172,72 +172,91 @@ pub(crate) fn outcome_label(outcome: Option<&materialization_outcome::Outcome>) 
     }
 }
 
-/// The pure clamp law behind `MonotoneProgress` (bug_159): given
-/// the previous job-level high-water mark and an absolute candidate
-/// report, the emitted pair is `done = max(high_water, done)`,
-/// `expected = max(expected, done)` — emitted `done` never regresses
-/// and `done <= expected` holds at every call, over ARBITRARY
-/// candidate sequences (within-path retry resets are just smaller
-/// candidates). Proptest-swept below.
+/// The pure clamp law behind `MonotoneProgress` (bug_159 + bug_087):
+/// given the job's COMMITTED floor and an absolute candidate report,
+/// the emitted pair is `done = max(floor, done)`,
+/// `expected = max(expected, done)` — emitted `done` never drops
+/// below completed work and `done <= expected` holds at every call.
+/// Provisional emissions may step back relative to a FAILED attempt's
+/// earlier peak (truthful display; the dead bytes were never
+/// committed); monotonicity is guaranteed relative to the committed
+/// floor, which only [`MonotoneProgress::commit`] raises.
+/// Proptest-swept below.
 fn clamp_progress(high_water: u64, done: u64, expected: u64) -> (u64, u64) {
     let emit_done = high_water.max(done);
     let emit_expected = expected.max(emit_done);
     (emit_done, emit_expected)
 }
 
-/// bug_159: the job-level monotone progress adapter — the ONLY
-/// constructor of per-path progress callbacks (the raw job callback is
-/// moved in and private, so an unclamped emission site is
-/// unwritable). Owns the job's high-water mark and routes EVERY
-/// emission (per-path streaming, path-completed ticks) through
-/// [`clamp_progress`].
+/// bug_159 + bug_087: the job-level monotone progress adapter — the
+/// ONLY constructor of per-path progress callbacks (the raw job
+/// callback is moved in and private, so an unclamped emission site is
+/// unwritable). Owns the job's COMMITTED floor and routes every
+/// emission through [`clamp_progress`].
 ///
-/// Why: the documented contract on [`execute_job_with_progress`] is
-/// "monotone non-decreasing in `bytes_done`, `bytes_done <=
-/// bytes_expected` at every call" — but the per-fetch byte counter is
-/// local to each `fetch_nar` attempt, so a stall failover to the next
-/// upstream (substitute.rs "download stalled, trying next") or a
-/// per-tenant retry restarted `done` at 0 and the pre-fix adapter
-/// forwarded `base + done` raw: `bytes_done` regressed below an
-/// already-reported value. Monotonicity now lives at the type that
-/// owns the contract, not as discipline at each call site.
-// r[impl store.materialize.progress-monotone]
+/// Two emission classes, one law (bug_087): the job-level floor is
+/// mutated ONLY by [`Self::commit`] — the success witness, called
+/// when a path is fully processed — while per-path streaming
+/// emissions are PROVISIONAL: clamped against the committed floor
+/// (never below it) but unable to raise it. Pre-fix, `emit`
+/// fetch_max'ed every provisional candidate into the job-wide
+/// high-water, so a large partial stream from an attempt that later
+/// FAILED permanently floored the job: `clamp_progress` dragged
+/// `expected` up to the inflated `done`, and the final BC-4 report
+/// showed `done == expected` above the closure's true byte total.
+/// Display may step back after a failed attempt (truthful); the
+/// committed floor never regresses.
+// r[impl store.materialize.progress-monotone+1]
 struct MonotoneProgress<F: Fn(u64, u64, &str) + Send + Sync + 'static> {
     on_progress: std::sync::Arc<F>,
-    /// Job-level emitted-`done` high-water mark. Atomic because the
-    /// per-path callbacks are `Fn + Send + Sync` by the substituter's
-    /// callback contract; `fetch_max` keeps clamp-and-store one
-    /// operation.
-    high_water: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Job-level COMMITTED floor: bytes of fully-processed paths.
+    /// Atomic because the per-path callbacks are `Fn + Send + Sync`
+    /// by the substituter's callback contract.
+    committed_floor: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl<F: Fn(u64, u64, &str) + Send + Sync + 'static> MonotoneProgress<F> {
     fn new(on_progress: F) -> Self {
         MonotoneProgress {
             on_progress: std::sync::Arc::new(on_progress),
-            high_water: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            committed_floor: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
-    /// Clamp an ABSOLUTE candidate report and emit it.
-    fn emit(&self, done: u64, expected: u64, uri: &str) {
+    /// The SUCCESS WITNESS (bug_087): fold a fully-processed prefix
+    /// into the job floor and emit the completed tick. The only
+    /// mutation site of job-level progress state.
+    fn commit(&self, completed_total: u64, uri: &str) {
         let prev = self
-            .high_water
-            .fetch_max(done, std::sync::atomic::Ordering::SeqCst);
-        let (d, e) = clamp_progress(prev, done, expected);
+            .committed_floor
+            .fetch_max(completed_total, std::sync::atomic::Ordering::SeqCst);
+        let (d, e) = clamp_progress(prev, completed_total, completed_total);
+        (self.on_progress)(d, e, uri);
+    }
+
+    /// A PROVISIONAL emission: clamped to the committed floor
+    /// (display never drops below completed work) but structurally
+    /// unable to raise it — a failed attempt's streamed bytes leave
+    /// no trace on job-level state.
+    fn emit_provisional(&self, done: u64, expected: u64, uri: &str) {
+        let floor = self
+            .committed_floor
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let (d, e) = clamp_progress(floor, done, expected);
         (self.on_progress)(d, e, uri);
     }
 
     /// The per-path callback for a path starting at cumulative `base`
     /// bytes (merged_bug_195: `done`/`expected` arrive RELATIVE to the
-    /// in-flight path). The only way to build one.
+    /// in-flight path). The only way to build one — and it is
+    /// provisional by construction: per-path streaming cannot commit.
     fn per_path(&self, base: u64) -> impl Fn(u64, u64, &str) + Send + Sync + 'static {
         let this = MonotoneProgress {
             on_progress: std::sync::Arc::clone(&self.on_progress),
-            high_water: std::sync::Arc::clone(&self.high_water),
+            committed_floor: std::sync::Arc::clone(&self.committed_floor),
         };
         move |done: u64, expected: u64, uri: &str| {
-            this.emit(
+            this.emit_provisional(
                 base.saturating_add(done),
                 base.saturating_add(expected),
                 uri,
@@ -395,7 +414,9 @@ async fn execute_job_inner(
                     }
                     verified.push(path.clone());
                     completed_bytes = completed_bytes.saturating_add(info.nar_size);
-                    progress.emit(completed_bytes, completed_bytes, "");
+                    // bug_087: a fully-processed path is the success
+                    // witness — committed into the job floor.
+                    progress.commit(completed_bytes, "");
                     for reference in &info.references {
                         let r = reference.as_str().to_string();
                         if r != path && !visited.contains(&r) {
@@ -538,7 +559,9 @@ async fn execute_job_inner(
                     // gateway omits the "from <uri>" suffix when the
                     // field is empty.
                     completed_bytes = completed_bytes.saturating_add(path_info.nar_size);
-                    progress.emit(completed_bytes, completed_bytes, "");
+                    // bug_087: success witness — commit, not a
+                    // provisional emission.
+                    progress.commit(completed_bytes, "");
                     // Extend the frontier with the narinfo references —
                     // the closure-completeness obligation.
                     for reference in &path_info.references {
@@ -3397,15 +3420,17 @@ mod tests {
 
     // ── bug_159: monotone progress ────────────────────────────────────
 
-    // r[verify store.materialize.progress-monotone]
+    // r[verify store.materialize.progress-monotone+1]
     /// bug_159: the stall-failover regression trace. Path A completes
     /// at 100 cumulative; path B (base 100) streams to 120 relative,
     /// the download stalls, and the failover attempt restarts the
-    /// per-fetch counter at 0 — the pre-fix adapter forwarded
-    /// base+done raw and bytes_done regressed below the
-    /// already-reported value. RED (strawman: clamp bypassed, raw
-    /// forward): the emitted sequence carried (110, 210) after
-    /// (220, 300) — assert_eq! sequence mismatch at the reset event.
+    /// per-fetch counter at 0. bug_159's original defect: the raw
+    /// forward regressed below the COMMITTED 100. bug_087 narrows the
+    /// guarantee to exactly that floor: provisional emissions clamp
+    /// at committed work (110 = 100 + 10 streamed is truthful display
+    /// after the reset — it may step back from a dead attempt's
+    /// provisional peak, which was never committed), and only
+    /// `commit` raises the floor.
     #[test]
     fn monotone_progress_clamps_stall_failover_resets() {
         use std::sync::{Arc, Mutex};
@@ -3415,44 +3440,100 @@ mod tests {
             sink.lock().unwrap().push((d, e));
         });
 
-        progress.emit(100, 100, ""); // path A fully processed
+        progress.commit(100, ""); // path A fully processed
         let cb = progress.per_path(100); // path B starts at base=100
         cb(120, 200, "u1"); // attempt 1 streams 120 of 200
         cb(10, 200, "u2"); // stall failover: counter RESET to 10
         cb(180, 200, "u2"); // attempt 2 catches up past the mark
-        progress.emit(300, 300, ""); // path B fully processed
+        progress.commit(300, ""); // path B fully processed
 
         let events = got.lock().unwrap().clone();
         assert_eq!(
             events,
-            vec![(100, 100), (220, 300), (220, 300), (280, 300), (300, 300)],
-            "reset clamps at the high-water; catch-up resumes"
+            vec![(100, 100), (220, 300), (110, 300), (280, 300), (300, 300)],
+            "provisional resets clamp at the COMMITTED floor (truthful \
+             display), never below it; commits raise the floor"
         );
-        let mut last = 0u64;
-        for (d, e) in events {
-            assert!(d >= last, "emitted done regressed: {d} after {last}");
+        let floor_then = [0u64, 100, 100, 100, 100];
+        for ((d, e), floor) in events.iter().zip(floor_then) {
+            assert!(
+                *d >= floor,
+                "emitted done {d} below committed floor {floor}"
+            );
             assert!(d <= e, "done {d} > expected {e}");
-            last = d;
         }
+        assert_eq!(
+            *got.lock().unwrap().last().unwrap(),
+            (300, 300),
+            "the final tick is the true cumulative total"
+        );
+    }
+
+    /// bug_087 RED-FIRST: bytes streamed by a FAILED attempt must not
+    /// floor the job. A 5 GB partial stream that dies mid-fetch, then
+    /// a smaller successful path: the final report must equal the
+    /// TRUE total (the success), not the dead attempt's peak — the
+    /// pre-fix adapter fetch_max'ed every provisional candidate into
+    /// the job-wide high-water, so clamp dragged `expected` up to the
+    /// inflated `done` and the final BC-4 report showed
+    /// done == expected ABOVE the closure's true byte total.
+    // r[verify store.materialize.progress-monotone+1]
+    #[test]
+    fn failed_attempt_bytes_never_floor_the_job() {
+        let emitted: std::sync::Arc<std::sync::Mutex<Vec<(u64, u64)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&emitted);
+        let progress = MonotoneProgress::new(move |d, e, _u: &str| {
+            sink.lock().unwrap().push((d, e));
+        });
+
+        // Attempt 1: a large partial stream through the per-path
+        // adapter... then the fetch FAILS (no success commit).
+        let p1 = progress.per_path(0);
+        p1(1_000_000, 5_000_000_000, "https://big");
+        p1(4_999_999_999, 5_000_000_000, "https://big");
+        drop(p1);
+
+        // Attempt 2 (a different, smaller path) succeeds: the path's
+        // bytes are committed into the job floor.
+        progress.commit(1_200, "");
+
+        let last = *emitted.lock().unwrap().last().unwrap();
+        assert_eq!(
+            last,
+            (1_200, 1_200),
+            "the final tick is the TRUE total — a failed attempt's \
+             provisional bytes must not survive as the job floor"
+        );
     }
 
     proptest::proptest! {
-        // r[verify store.materialize.progress-monotone]
-        /// The pure clamp law over ARBITRARY candidate sequences
-        /// (within-path resets are just smaller candidates): emitted
-        /// done is non-decreasing and done <= expected at every step.
+        // r[verify store.materialize.progress-monotone+1]
+        /// The pure clamp law over ARBITRARY interleavings of
+        /// provisional candidates and floor commits (bug_087): every
+        /// emission is >= the committed floor at that moment, done <=
+        /// expected at every step, and the floor itself never
+        /// regresses.
         #[test]
-        fn clamp_progress_monotone_over_arbitrary_traces(
-            events in proptest::collection::vec((0u64..1_000_000, 0u64..1_000_000), 1..100)
+        fn clamp_progress_respects_committed_floor_over_arbitrary_traces(
+            events in proptest::collection::vec(
+                (proptest::bool::ANY, 0u64..1_000_000, 0u64..1_000_000),
+                1..100
+            )
         ) {
-            let mut hw = 0u64;
-            let mut last = 0u64;
-            for (done, expected) in events {
-                let (d, e) = clamp_progress(hw, done, expected);
-                hw = hw.max(d);
-                proptest::prop_assert!(d >= last, "regressed: {} after {}", d, last);
-                proptest::prop_assert!(d <= e, "done {} > expected {}", d, e);
-                last = d;
+            let mut floor = 0u64;
+            for (is_commit, done, expected) in events {
+                if is_commit {
+                    let prev = floor;
+                    floor = floor.max(done);
+                    let (d, e) = clamp_progress(prev, done, done);
+                    proptest::prop_assert!(d >= prev && d <= e);
+                    proptest::prop_assert!(floor >= prev, "floor regressed");
+                } else {
+                    let (d, e) = clamp_progress(floor, done, expected);
+                    proptest::prop_assert!(d >= floor, "emitted below floor: {} < {}", d, floor);
+                    proptest::prop_assert!(d <= e, "done {} > expected {}", d, e);
+                }
             }
         }
     }
