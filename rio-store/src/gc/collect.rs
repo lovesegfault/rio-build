@@ -181,34 +181,48 @@ pub(crate) const MARK_EXPANSION_SQL: &str = "CREATE TEMP TABLE live_chunks AS \
 /// format version byte; both fixed by `rio_store::manifest`.
 ///
 /// Shared with `gc::mark_scan_bench` (gate (b)).
-pub(crate) fn mark_validation_sql() -> String {
+/// THE statement builder over the corruption population
+/// (merged_bug_170): one body owns the malformed-`chunk_list`
+/// predicate AND the shadow-exclusion splice, so every statement over
+/// that population (the validation count, the offenders listing)
+/// shares the same `WHERE` by construction. Pre-fix the offenders
+/// query carried its own un-excluded copy: with ≥10 excluded corrupt
+/// manifests sorting earlier, `ORDER BY … LIMIT 10` could crowd out
+/// the real survivor and point the operator at manifests the
+/// simulated sweep deletes anyway — the count and the hashes came
+/// from different populations.
+fn corruption_population_sql(select: &str, shadow_excluded: bool, tail: &str) -> String {
     format!(
-        "SELECT COUNT(*) \
+        "SELECT {select} \
            FROM manifest_data md \
            JOIN manifests m USING (store_path_hash) \
           WHERE (octet_length(md.chunk_list) < 1 \
              OR substring(md.chunk_list FROM 1 FOR 1) <> '\\x01'::bytea \
              OR (octet_length(md.chunk_list) - 1) % 36 <> 0 \
-             OR (octet_length(md.chunk_list) - 1) / 36 > {})",
-        crate::manifest::MAX_CHUNKS
+             OR (octet_length(md.chunk_list) - 1) / 36 > {max}) \
+          {exclusion} {tail}",
+        max = crate::manifest::MAX_CHUNKS,
+        exclusion = if shadow_excluded {
+            SHADOW_SWEPT_EXCLUSION_AND
+        } else {
+            ""
+        },
     )
+}
+
+pub(crate) fn mark_validation_sql(shadow_excluded: bool) -> String {
+    corruption_population_sql("COUNT(*)", shadow_excluded, "")
 }
 
 /// The offending `store_path_hash`es behind a failed validation pass —
 /// fetched only on the abort path (the happy path never pays for it),
 /// hex-encoded for the error log and the runbook's lookup query.
-fn mark_validation_offenders_sql() -> String {
-    format!(
-        "SELECT encode(md.store_path_hash, 'hex') \
-           FROM manifest_data md \
-           JOIN manifests m USING (store_path_hash) \
-          WHERE octet_length(md.chunk_list) < 1 \
-             OR substring(md.chunk_list FROM 1 FOR 1) <> '\\x01'::bytea \
-             OR (octet_length(md.chunk_list) - 1) % 36 <> 0 \
-             OR (octet_length(md.chunk_list) - 1) / 36 > {} \
-          ORDER BY md.store_path_hash \
-          LIMIT 10",
-        crate::manifest::MAX_CHUNKS
+/// Same population as [`mark_validation_sql`] by construction.
+fn mark_validation_offenders_sql(shadow_excluded: bool) -> String {
+    corruption_population_sql(
+        "encode(md.store_path_hash, 'hex')",
+        shadow_excluded,
+        "ORDER BY md.store_path_hash LIMIT 10",
     )
 }
 
@@ -448,15 +462,13 @@ pub(crate) struct CollectReport {
     /// True when the cycle stopped at [`COLLECT_CYCLE_VICTIM_CAP`]
     /// with backlog remaining. Always false in shadow mode.
     pub(crate) cap_reached: bool,
-    /// Keyset cursor at the stop point (None when the pass completed
-    /// or in shadow mode).
-    pub(crate) cursor_at_stop: Option<Vec<u8>>,
-    /// True when the live arm exhausted the eligible set at this
-    /// cycle\'s snapshot (the durable backlog re-anchors at 0 and the
-    /// tombstone reap runs). Always false in shadow mode.
-    pub(crate) pass_complete: bool,
-    /// Tombstone rows hard-deleted by the post-pass reap
-    /// (merged_bug_336). Nonzero only when `pass_complete`.
+    /// What the live drain proved about the keyspace (bug_174) — the
+    /// ONE completion authority; `None` in shadow mode and on the
+    /// parse-failure abort. The legacy `pass_complete`/`cursor_at_stop`
+    /// views are derived accessors so they can never disagree with it.
+    pub(crate) disposition: Option<PassDisposition>,
+    /// Tombstone rows hard-deleted by the post-drain reap
+    /// (merged_bug_336). Nonzero only on a full-scan completion.
     pub(crate) chunks_reaped: u64,
     /// Wall-clock of the cycle (snapshot through report/collect).
     pub(crate) cycle_seconds: f64,
@@ -466,6 +478,65 @@ pub(crate) struct CollectReport {
     /// fields above stay simulated for dry runs (bug_199); this field
     /// is what may touch `gc_collect_state` (bug_226).
     pub(crate) durable: Option<DurableObservation>,
+}
+
+impl CollectReport {
+    /// Derived view: did the live drain complete (full-scan OR
+    /// resumed-remainder)? Shadow/abort arms answer false.
+    pub(crate) fn pass_complete(&self) -> bool {
+        self.disposition
+            .as_ref()
+            .is_some_and(PassDisposition::pass_complete)
+    }
+
+    /// Derived view: the resume cursor a capped stop persists.
+    pub(crate) fn cursor_at_stop(&self) -> Option<&[u8]> {
+        self.disposition
+            .as_ref()
+            .and_then(PassDisposition::cursor_at_stop)
+    }
+}
+
+/// What the live drain proved about the keyspace — the ONLY authority
+/// [`super::state::CycleCommit::Live`] accepts for the cursor/backlog
+/// decision (bug_174). `CompleteFullScan` is constructible only from
+/// an UNRESUMED pass that exhausted the candidate scan: a
+/// cursor-resumed drain that exhausts the remainder proves nothing
+/// about `[0, cursor)` under this cycle's mark (grace runs from
+/// `GREATEST(created_at, last_referenced_at)`, so chunks below the
+/// persisted cursor become eligible between cycles), so it resets the
+/// cursor but can never anchor the durable backlog estimate at zero —
+/// and the tombstone reap, strictly gated on a proven-drained
+/// keyspace, does not run on it.
+// r[impl store.gc.completion-witness]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PassDisposition {
+    /// An unresumed pass scanned the full keyspace under this mark.
+    CompleteFullScan,
+    /// A cursor-resumed pass exhausted `[cursor, top]` — completion of
+    /// the REMAINDER, not of the keyspace.
+    CompleteResumed,
+    /// Stopped at the victim cap; the cursor persists for resumption.
+    Capped { cursor_at_stop: Vec<u8> },
+}
+
+impl PassDisposition {
+    pub(crate) fn pass_complete(&self) -> bool {
+        !matches!(self, PassDisposition::Capped { .. })
+    }
+
+    pub(crate) fn cursor_at_stop(&self) -> Option<&[u8]> {
+        match self {
+            PassDisposition::Capped { cursor_at_stop } => Some(cursor_at_stop.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// May this disposition anchor the durable backlog estimate at
+    /// zero? True ONLY for the full-keyspace scan.
+    pub(crate) fn anchors_backlog_zero(&self) -> bool {
+        matches!(self, PassDisposition::CompleteFullScan)
+    }
 }
 
 /// Test-only failure injection for the per-batch isolation tests: when
@@ -610,19 +681,20 @@ pub(crate) async fn collect_cycle(
     // --- Mark (i): fail-closed validation pass ---
     // Shadow: a corrupt manifest the simulated sweep removes must not
     // abort a dry run it would not abort live — the exclusion applies
-    // to the validation exactly as it applies to the expansion.
-    let validation_sql = match simulated_swept {
-        Some(_) => format!("{} {}", mark_validation_sql(), SHADOW_SWEPT_EXCLUSION_AND),
-        None => mark_validation_sql(),
-    };
-    let malformed: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(validation_sql))
-        .fetch_one(&mut *tx)
-        .await?;
+    // to the validation exactly as it applies to the expansion, and
+    // (merged_bug_170) to the offenders listing: count and hashes come
+    // from the SAME population by construction (one statement builder).
+    let shadow_excluded = simulated_swept.is_some();
+    let malformed: i64 =
+        sqlx::query_scalar(sqlx::AssertSqlSafe(mark_validation_sql(shadow_excluded)))
+            .fetch_one(&mut *tx)
+            .await?;
     if malformed > 0 {
-        let offenders: Vec<String> =
-            sqlx::query_scalar(sqlx::AssertSqlSafe(mark_validation_offenders_sql()))
-                .fetch_all(&mut *tx)
-                .await?;
+        let offenders: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            mark_validation_offenders_sql(shadow_excluded),
+        ))
+        .fetch_all(&mut *tx)
+        .await?;
         error!(
             malformed,
             offenders = %offenders.join(","),
@@ -647,8 +719,7 @@ pub(crate) async fn collect_cycle(
             s3_keys_enqueued: 0,
             batches_run: 0,
             cap_reached: false,
-            cursor_at_stop: None,
-            pass_complete: false,
+            disposition: None,
             chunks_reaped: 0,
             cycle_seconds: cycle_started.elapsed().as_secs_f64(),
             durable: None,
@@ -782,6 +853,13 @@ pub(crate) async fn collect_cycle(
             would_collect, cycle_seconds, "chunk-collect shadow cycle complete"
         );
 
+        // merged_bug_170: the session is CLEAN here (every shadow temp
+        // table was ON COMMIT DROP and the commit above ended the
+        // transaction), so the connection goes back to the pool — the
+        // pre-fix return dropped it (detach + close), burning a pooled
+        // connection on every dry-run cycle.
+        conn.release_to_pool();
+
         return Ok(CollectReport {
             outcome: CollectOutcome::Ok,
             mark_set_size: mark_set_size as u64,
@@ -792,8 +870,7 @@ pub(crate) async fn collect_cycle(
             s3_keys_enqueued: 0,
             batches_run: 0,
             cap_reached: false,
-            cursor_at_stop: None,
-            pass_complete: false,
+            disposition: None,
             chunks_reaped: 0,
             cycle_seconds,
             durable: Some(durable),
@@ -806,6 +883,7 @@ pub(crate) async fn collect_cycle(
     // not reach the cleanup detaches (closes) the connection — the
     // temp table dies with the session instead of leaking into the
     // shared pool.
+    let resumed = resume_cursor.is_some();
     let mut cursor: Vec<u8> = resume_cursor.unwrap_or_default();
     let mut victims_collected: u64 = 0;
     let mut victim_bytes: u64 = 0;
@@ -893,53 +971,39 @@ pub(crate) async fn collect_cycle(
         }
     }
 
-    // Cursor bookkeeping: a capped stop reports the resume point for
-    // the caller's durable CycleCommit (gc_collect_state.cursor); a
-    // completed pass reports None — the next cycle starts from the
-    // top of the keyspace. (A lost cursor is never a correctness
+    // Completion bookkeeping (bug_174): the disposition is the ONE
+    // authority — `CompleteFullScan` only from an unresumed pass, so a
+    // cursor-resumed drain that exhausts the remainder commits a
+    // cursor reset WITHOUT anchoring the backlog at zero (chunks below
+    // the resume point that became eligible between cycles were never
+    // scanned under this mark). A lost cursor is never a correctness
     // problem — the candidate scan's `deleted = FALSE` conjunct skips
-    // already-collected rows.)
-    let cursor_at_stop = if cap_reached { Some(cursor) } else { None };
-
-    // --- Post-pass tombstone reap (merged_bug_336) ---
-    // Only after a COMPLETE pass: a capped cycle still has collect
-    // work outstanding, and the reap is strictly lower priority than
-    // the drain it trails. Each batch is its own implicit transaction
-    // on the cycle connection.
-    let mut chunks_reaped: u64 = 0;
-    if pass_complete {
-        loop {
-            let remaining = REAP_CYCLE_CAP.saturating_sub(chunks_reaped);
-            if remaining == 0 {
-                break;
-            }
-            let limit = COLLECT_BATCH_LIMIT.min(remaining) as i64;
-            let reaped = sqlx::query(REAP_BATCH_DELETE_SQL.as_str())
-                .bind(grace_secs)
-                .bind(limit)
-                .execute(&mut **conn.conn())
-                .await?
-                .rows_affected();
-            if reaped == 0 {
-                break;
-            }
-            metrics::counter!("rio_store_gc_chunks_reaped_total").increment(reaped);
-            chunks_reaped += reaped;
+    // already-collected rows.
+    let disposition = if cap_reached {
+        PassDisposition::Capped {
+            cursor_at_stop: cursor,
         }
-    }
+    } else if resumed {
+        PassDisposition::CompleteResumed
+    } else {
+        debug_assert!(pass_complete, "uncapped live loop exits only on completion");
+        PassDisposition::CompleteFullScan
+    };
 
-    // Cleanup: drop the mark product in-session, then hand the (clean)
-    // connection back to the pool. Any failure or cancellation before
-    // this point detaches via SessionConn\'s Drop — the temp table dies
-    // with the session, never in the shared pool.
-    sqlx::query("DROP TABLE IF EXISTS live_chunks")
-        .execute(&mut **conn.conn())
-        .await?;
-    conn.release_to_pool();
+    // --- Post-drain tail (bug_137): reap + cleanup, error-contained
+    // by SIGNATURE — the tail fn has no error channel, so a reap or
+    // cleanup failure structurally cannot un-commit an already-drained
+    // cycle (the pre-fix `?`s propagated AFTER every batch had
+    // committed; the caller's Err arm skipped `commit_cycle`,
+    // `last_live_cycle_at` stayed unstamped, and a persistent reap
+    // failure re-ran the full mark expansion up to 24x/day against the
+    // documented once-per-24h bound while the backlog estimate never
+    // decremented).
+    let chunks_reaped = run_post_drain_tail(conn, &disposition, grace_secs).await;
 
     // Backlog visibility (P15) is durable now: the caller\'s
-    // CycleCommit decrements the row estimate (pass-complete ⇒ 0) and
-    // every replica\'s publisher converges on it.
+    // CycleCommit decrements the row estimate (full-scan completion ⇒
+    // re-anchor at 0) and every replica\'s publisher converges on it.
     if cap_reached {
         metrics::counter!("rio_store_gc_collect_cycles_capped_total").increment(1);
     }
@@ -970,12 +1034,112 @@ pub(crate) async fn collect_cycle(
         s3_keys_enqueued,
         batches_run,
         cap_reached,
-        cursor_at_stop,
-        pass_complete,
+        disposition: Some(disposition),
         chunks_reaped,
         cycle_seconds,
         durable: Some(durable),
     })
+}
+
+/// Test-only injection: fail the next post-drain reap statement
+/// (cleared on trip). Proves a tail failure cannot un-commit the
+/// drained cycle (bug_137).
+#[cfg(test)]
+pub(crate) static REAP_FAIL_INJECT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The post-drain tail (bug_137): tombstone reap + mark-table cleanup,
+/// strictly lower priority than the drain they trail. NO ERROR
+/// CHANNEL — the signature returns the reap count and consumes the
+/// session, so a failure here is structurally unable to fail the
+/// cycle: reap errors warn + count and stop reaping; a cleanup error
+/// detaches the session (the temp table dies with it, never in the
+/// shared pool). The reap runs ONLY on a full-keyspace completion: a
+/// resumed completion proved nothing about `[0, cursor)`, and a
+/// capped pass still has collect work outstanding.
+// r[impl store.gc.completion-witness]
+async fn run_post_drain_tail(
+    mut conn: super::lock::SessionConn,
+    disposition: &PassDisposition,
+    grace_secs: i64,
+) -> u64 {
+    let mut chunks_reaped: u64 = 0;
+    if disposition.anchors_backlog_zero() {
+        loop {
+            let remaining = REAP_CYCLE_CAP.saturating_sub(chunks_reaped);
+            if remaining == 0 {
+                break;
+            }
+            let limit = COLLECT_BATCH_LIMIT.min(remaining) as i64;
+            #[cfg(test)]
+            let injected: Result<sqlx::postgres::PgQueryResult, sqlx::Error> =
+                if REAP_FAIL_INJECT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    Err(sqlx::Error::Protocol(
+                        "chunk-collect: injected reap failure (test only)".into(),
+                    ))
+                } else {
+                    sqlx::query(REAP_BATCH_DELETE_SQL.as_str())
+                        .bind(grace_secs)
+                        .bind(limit)
+                        .execute(&mut **conn.conn())
+                        .await
+                };
+            #[cfg(not(test))]
+            let injected = sqlx::query(REAP_BATCH_DELETE_SQL.as_str())
+                .bind(grace_secs)
+                .bind(limit)
+                .execute(&mut **conn.conn())
+                .await;
+            match injected {
+                Ok(r) => {
+                    let reaped = r.rows_affected();
+                    if reaped == 0 {
+                        break;
+                    }
+                    metrics::counter!("rio_store_gc_chunks_reaped_total").increment(reaped);
+                    chunks_reaped += reaped;
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        chunks_reaped,
+                        "post-drain tombstone reap failed (the drained cycle still \
+                         commits; the next full-scan completion retries the reap)"
+                    );
+                    metrics::counter!(
+                        "rio_store_gc_collect_tail_errors_total",
+                        "stage" => "reap"
+                    )
+                    .increment(1);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Cleanup: drop the mark product in-session, then hand the (clean)
+    // connection back to the pool. On failure the session is detached
+    // instead — the temp table dies with it, never in the shared pool.
+    match sqlx::query("DROP TABLE IF EXISTS live_chunks")
+        .execute(&mut **conn.conn())
+        .await
+    {
+        Ok(_) => conn.release_to_pool(),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "mark-table cleanup failed; detaching the cycle session \
+                 (the temp table dies with the session)"
+            );
+            metrics::counter!(
+                "rio_store_gc_collect_tail_errors_total",
+                "stage" => "cleanup"
+            )
+            .increment(1);
+            drop(conn);
+        }
+    }
+    chunks_reaped
 }
 
 /// Run one backstop CHECK (bug_174): consult the DURABLE row for
@@ -1023,9 +1187,11 @@ pub(crate) async fn collect_backstop_once(
                     // cycle; every replica\'s next hourly check sees it.
                     lease
                         .commit_cycle(super::state::CycleCommit::Live {
-                            cursor_at_stop: report.cursor_at_stop.clone(),
+                            disposition: report
+                                .disposition
+                                .clone()
+                                .expect("live Ok report carries a disposition"),
                             victims_collected: report.victims_collected,
-                            pass_complete: report.pass_complete,
                             observation: report.durable.expect("Ok cycle carries an observation"),
                         })
                         .await?;
@@ -1221,7 +1387,7 @@ mod tests {
         assert_eq!(report.victims_collected, 0);
         assert_eq!(report.batches_run, 0);
         assert!(!report.cap_reached);
-        assert!(report.cursor_at_stop.is_none());
+        assert!(report.cursor_at_stop().is_none());
 
         // merged_bug_211: gauges no longer move on the cycle — the
         // caller commits the observation to gc_collect_state and EVERY
@@ -1306,7 +1472,7 @@ mod tests {
 
         // SQL expansion via the shipped statements.
         let mut conn = db.pool.acquire().await.unwrap();
-        let malformed: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(mark_validation_sql()))
+        let malformed: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(mark_validation_sql(false)))
             .fetch_one(&mut *conn)
             .await
             .unwrap();
@@ -2215,7 +2381,7 @@ mod tests {
         let report = collect_cycle(&db.pool, Some(&backend), grace, CollectMode::Live, None)
             .await
             .expect("live cycle");
-        assert!(report.pass_complete, "clean keyspace ⇒ pass completes");
+        assert!(report.pass_complete(), "clean keyspace ⇒ pass completes");
         assert_eq!(
             report.chunks_reaped, 1,
             "exactly the drained aged tombstone"
@@ -2373,7 +2539,7 @@ mod tests {
         assert_eq!(report.victim_bytes, 4096);
         assert_eq!(report.s3_keys_enqueued, 1);
         assert!(!report.cap_reached);
-        assert!(report.cursor_at_stop.is_none(), "pass completed");
+        assert!(report.cursor_at_stop().is_none(), "pass completed");
 
         let (deleted, uploaded_cleared): (bool, bool) = sqlx::query_as(
             "SELECT deleted, uploaded_at IS NULL FROM chunks WHERE blake3_hash = $1",
@@ -2666,7 +2832,7 @@ mod tests {
         assert_eq!(report.victims_collected, u64::from(n), "all collected");
         assert_eq!(report.batches_run, 2, "one full batch + one short batch");
         assert!(!report.cap_reached);
-        assert!(report.cursor_at_stop.is_none(), "pass completed");
+        assert!(report.cursor_at_stop().is_none(), "pass completed");
         let deleted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE deleted")
             .fetch_one(&db.pool)
             .await
@@ -2833,14 +2999,16 @@ mod tests {
             COLLECT_CYCLE_VICTIM_CAP.div_ceil(COLLECT_BATCH_LIMIT)
         );
         assert!(
-            first.cursor_at_stop.is_some(),
+            first.cursor_at_stop().is_some(),
             "cursor reported at the cap stop"
         );
         lease_a
             .commit_cycle(super::super::state::CycleCommit::Live {
-                cursor_at_stop: first.cursor_at_stop.clone(),
+                disposition: first
+                    .disposition
+                    .clone()
+                    .expect("live Ok report carries a disposition"),
                 victims_collected: first.victims_collected,
-                pass_complete: first.pass_complete,
                 observation: first.durable.expect("Ok cycle carries an observation"),
             })
             .await
@@ -2878,7 +3046,11 @@ mod tests {
             cursor_b.is_some(),
             "replica B resumes from the durable stop point"
         );
-        assert_eq!(cursor_b, first.cursor_at_stop, "round-trip exact");
+        assert_eq!(
+            cursor_b.as_deref(),
+            first.cursor_at_stop(),
+            "round-trip exact"
+        );
         let second = collect_cycle(
             &db.pool,
             Some(&backend),
@@ -2894,12 +3066,14 @@ mod tests {
             u64::from(n) - COLLECT_CYCLE_VICTIM_CAP,
             "the resume cycle collects exactly the remainder (no re-collection)"
         );
-        assert!(second.cursor_at_stop.is_none(), "pass completed");
+        assert!(second.cursor_at_stop().is_none(), "pass completed");
         lease_b
             .commit_cycle(super::super::state::CycleCommit::Live {
-                cursor_at_stop: None,
+                disposition: second
+                    .disposition
+                    .clone()
+                    .expect("live Ok report carries a disposition"),
                 victims_collected: second.victims_collected,
-                pass_complete: second.pass_complete,
                 observation: second.durable.expect("Ok cycle carries an observation"),
             })
             .await
@@ -3106,5 +3280,282 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(alive, 1, "resurrected row must survive the reap");
+    }
+
+    /// bug_174 (recorded red, pre-fix): a cursor-RESUMED pass that
+    /// exhausts the remainder set `pass_complete = true`, which (a)
+    /// re-anchored the durable backlog estimate at 0 and (b) ran the
+    /// tombstone reap — both on a cycle that never scanned
+    /// `[0, cursor)` under its mark. Post-fix the typed
+    /// `PassDisposition::CompleteResumed` resets the cursor, KEEPS the
+    /// decremented estimate, and skips the reap; only an unresumed
+    /// full-keyspace scan anchors zero.
+    // r[verify store.gc.completion-witness]
+    #[tokio::test]
+    async fn resumed_completion_keeps_decremented_backlog_and_skips_reap() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        reset_collector_state(&db.pool).await;
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
+        let grace = super::super::sweep::CHUNK_GRACE_SECS;
+
+        // Eligible chunks straddling the resume cursor: `low` is below
+        // it (skipped by the resumed scan), `high` above (drained).
+        let low = ChunkSeed::new(0x10)
+            .age_secs(grace + 100)
+            .uploaded()
+            .seed(&db.pool)
+            .await;
+        let _high = ChunkSeed::new(0xF0)
+            .age_secs(grace + 100)
+            .uploaded()
+            .seed(&db.pool)
+            .await;
+        // A drained, aged tombstone a (false) completion would reap.
+        let tombstone = ChunkSeed::new(0x20).uploaded().seed(&db.pool).await;
+        sqlx::query(
+            "UPDATE chunks SET deleted = TRUE, \
+             deleted_at = now() - make_interval(secs => $2) \
+             WHERE blake3_hash = $1",
+        )
+        .bind(&tombstone[..])
+        .bind((grace + 100) as f64)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // Durable state: a mid-keyspace resume cursor and a known
+        // backlog estimate; no live stamp, so the backstop is due.
+        sqlx::query(
+            "UPDATE gc_collect_state SET cursor = $1, backlog_estimate = 7 \
+             WHERE singleton",
+        )
+        .bind(vec![0x80u8; 32])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let report = collect_backstop_once(&db.pool, Some(&backend), grace)
+            .await
+            .expect("backstop")
+            .expect("due ⇒ the cycle ran");
+
+        assert_eq!(report.victims_collected, 1, "drained the remainder (high)");
+        assert!(
+            matches!(report.disposition, Some(PassDisposition::CompleteResumed)),
+            "resumed pass exhausting the remainder is CompleteResumed, got {:?}",
+            report.disposition
+        );
+        assert!(report.pass_complete(), "derived view: the drain completed");
+        assert_eq!(
+            report.chunks_reaped, 0,
+            "a resumed completion proves nothing about [0, cursor) and must not reap"
+        );
+
+        let state = super::super::state::read_state_unlocked(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(state.cursor, None, "completion resets the cursor");
+        assert_eq!(
+            state.backlog_estimate,
+            Some(6),
+            "decremented (7 - 1 victim), never the zero anchor"
+        );
+
+        // The skipped-below-cursor chunk and the tombstone both survive.
+        let still_there: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM chunks WHERE blake3_hash = $1 AND deleted = FALSE",
+        )
+        .bind(&low[..])
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(still_there, 1, "below-cursor chunk was not scanned");
+        let tomb: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE blake3_hash = $1")
+            .bind(&tombstone[..])
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(tomb, 1, "tombstone not reaped on a resumed completion");
+
+        // And the NEXT (unresumed) cycle anchors zero + reaps: the
+        // full-scan completion is the only zero/reap authority.
+        sqlx::query("UPDATE gc_collect_state SET last_live_cycle_at = NULL WHERE singleton")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let second = collect_backstop_once(&db.pool, Some(&backend), grace)
+            .await
+            .expect("backstop")
+            .expect("due again");
+        assert!(matches!(
+            second.disposition,
+            Some(PassDisposition::CompleteFullScan)
+        ));
+        assert_eq!(second.victims_collected, 1, "low drained from the top");
+        assert_eq!(second.chunks_reaped, 1, "full scan reaps the tombstone");
+        let state = super::super::state::read_state_unlocked(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(state.backlog_estimate, Some(0), "full scan anchors zero");
+    }
+
+    /// bug_137 (strawman-disclosed red: the injection hook lands WITH
+    /// the containment; reverting `run_post_drain_tail` to `?`
+    /// propagation turns this red — outcome=error, stamp missing): a
+    /// post-drain tail failure must not un-commit the drained cycle.
+    // r[verify store.gc.completion-witness]
+    #[tokio::test]
+    async fn tail_failure_cannot_uncommit_the_drained_cycle() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        reset_collector_state(&db.pool).await;
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let grace = super::super::sweep::CHUNK_GRACE_SECS;
+
+        // A reapable tombstone so the reap loop runs and trips the
+        // injected failure.
+        let tombstone = ChunkSeed::new(0x33).uploaded().seed(&db.pool).await;
+        sqlx::query(
+            "UPDATE chunks SET deleted = TRUE, \
+             deleted_at = now() - make_interval(secs => $2) \
+             WHERE blake3_hash = $1",
+        )
+        .bind(&tombstone[..])
+        .bind((grace + 100) as f64)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        REAP_FAIL_INJECT.store(true, std::sync::atomic::Ordering::SeqCst);
+        let report = collect_backstop_once(&db.pool, Some(&backend), grace)
+            .await
+            .expect("the cycle must NOT propagate the tail failure")
+            .expect("due ⇒ the cycle ran");
+
+        assert!(matches!(report.outcome, CollectOutcome::Ok));
+        assert_eq!(report.chunks_reaped, 0, "the reap failed and was contained");
+        assert_eq!(
+            rec.get("rio_store_gc_collect_tail_errors_total{stage=reap}"),
+            1
+        );
+        assert_eq!(rec.get("rio_store_gc_collect_cycles_total{outcome=ok}"), 1);
+        assert_eq!(
+            rec.get("rio_store_gc_collect_cycles_total{outcome=error}"),
+            0
+        );
+
+        // THE point: the durable stamp landed despite the tail failure
+        // — the cadence bound holds and the backstop is no longer due.
+        let stamped: bool =
+            sqlx::query_scalar("SELECT last_live_cycle_at IS NOT NULL FROM gc_collect_state")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(stamped, "the drained cycle committed its stamp");
+        assert!(
+            collect_backstop_once(&db.pool, Some(&backend), grace)
+                .await
+                .unwrap()
+                .is_none(),
+            "not due again — no 24x/day re-mark"
+        );
+    }
+
+    /// merged_bug_170 (a): the offenders listing and the validation
+    /// count come from ONE statement builder, so the shadow exclusion
+    /// applies to both — count and hashes describe the same
+    /// population. (Strawman-disclosed red: reverting the offenders
+    /// query to the un-excluded form lists the excluded manifest and
+    /// breaks the count/listing agreement.)
+    #[tokio::test]
+    async fn offender_listing_shares_the_shadow_exclusion() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        // Two corrupt manifests: `inside` will be in the simulated
+        // sweep's exclusion set, `outside` is the real survivor.
+        let inside =
+            seed_chunked_manifest(&db.pool, "/nix/store/m170-inside", "complete", b"").await;
+        let outside =
+            seed_chunked_manifest(&db.pool, "/nix/store/m170-outside", "complete", b"").await;
+
+        let mut tx = db.pool.begin().await.unwrap();
+        sqlx::query(
+            "CREATE TEMP TABLE shadow_swept (store_path_hash BYTEA PRIMARY KEY) ON COMMIT DROP",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO shadow_swept VALUES ($1)")
+            .bind(&inside)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(mark_validation_sql(true)))
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        let offenders: Vec<String> =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(mark_validation_offenders_sql(true)))
+                .fetch_all(&mut *tx)
+                .await
+                .unwrap();
+        assert_eq!(count, 1, "validation count excludes the swept manifest");
+        assert_eq!(
+            offenders,
+            vec![hex::encode(&outside)],
+            "offenders list the SAME population as the count"
+        );
+        // Un-excluded form: both corrupt manifests, for contrast.
+        let all: Vec<String> =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(mark_validation_offenders_sql(false)))
+                .fetch_all(&mut *tx)
+                .await
+                .unwrap();
+        assert_eq!(all.len(), 2);
+        drop(tx);
+    }
+
+    /// merged_bug_170 (b): the shadow-arm success return releases the
+    /// CLEAN session back to the pool instead of detaching (closing)
+    /// it on every dry-run cycle. (Strawman-disclosed red: reverting
+    /// the `release_to_pool` drops the pool size by one per shadow
+    /// cycle.)
+    #[tokio::test]
+    async fn shadow_cycle_releases_the_clean_session() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        // Warm exactly one pooled connection and settle.
+        {
+            let c = db.pool.acquire().await.unwrap();
+            drop(c);
+        }
+        let size_before = db.pool.size();
+        let report = collect_cycle(
+            &db.pool,
+            None,
+            super::super::sweep::CHUNK_GRACE_SECS,
+            CollectMode::Shadow {
+                simulated_swept: vec![],
+            },
+            None,
+        )
+        .await
+        .expect("shadow cycle");
+        assert!(matches!(report.outcome, CollectOutcome::Ok));
+        // Settle: a detached connection closes asynchronously; poll
+        // briefly so a pre-fix run reliably shows the shrink.
+        let mut size_after = db.pool.size();
+        for _ in 0..20 {
+            size_after = db.pool.size();
+            if size_after == size_before {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            size_after, size_before,
+            "the clean shadow session goes back to the pool, not detached"
+        );
+        assert!(db.pool.num_idle() >= 1, "the released connection is idle");
     }
 }

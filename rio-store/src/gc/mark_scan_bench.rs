@@ -702,7 +702,7 @@ async fn run_mark_scan_server_side(
     let spill_before = db_temp_bytes(&mut conn).await;
 
     // Fail-closed validation pass; see server_validate_sql.
-    let validate_sql = server_validate_sql();
+    let validate_sql = server_validate_sql(false);
 
     let plan = explain_lines(&mut conn, SERVER_MARK_SQL).await;
     if print_plan {
@@ -1279,7 +1279,7 @@ async fn run_collect_phase(
 
     // ---- Mark (timed) ----
     let t0 = Instant::now();
-    let malformed: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(server_validate_sql()))
+    let malformed: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(server_validate_sql(false)))
         .fetch_one(&mut *conn)
         .await
         .expect("validation pass");

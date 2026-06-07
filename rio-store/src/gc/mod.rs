@@ -362,9 +362,11 @@ pub async fn run_gc(
                     } else {
                         lease
                             .commit_cycle(state::CycleCommit::Live {
-                                cursor_at_stop: report.cursor_at_stop.clone(),
+                                disposition: report
+                                    .disposition
+                                    .clone()
+                                    .expect("live Ok report carries a disposition"),
                                 victims_collected: report.victims_collected,
-                                pass_complete: report.pass_complete,
                                 observation: report
                                     .durable
                                     .expect("Ok cycle carries an observation"),
@@ -387,8 +389,9 @@ pub async fn run_gc(
                 s3_keys_enqueued = report.s3_keys_enqueued,
                 batches_run = report.batches_run,
                 cap_reached = report.cap_reached,
+                pass_complete = report.pass_complete(),
                 chunks_reaped = report.chunks_reaped,
-                cursor_at_stop = ?report.cursor_at_stop.as_deref().map(hex::encode),
+                cursor_at_stop = ?report.cursor_at_stop().map(hex::encode),
                 cycle_seconds = report.cycle_seconds,
                 "GC: collect phase 3 complete"
             );

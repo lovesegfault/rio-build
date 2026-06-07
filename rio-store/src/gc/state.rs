@@ -68,13 +68,16 @@ pub(crate) async fn read_state_unlocked(pool: &PgPool) -> Result<GcCollectState,
 /// What a finished cycle commits to the durable row.
 pub(crate) enum CycleCommit {
     /// A live (deleting) cycle: stamps `last_live_cycle_at`, persists
-    /// the stop cursor, decrements the backlog estimate (floor 0;
-    /// `pass_complete` re-anchors it at 0 — nothing eligible remained
-    /// at this cycle's snapshot).
+    /// the stop cursor, decrements the backlog estimate (floor 0).
+    /// The cursor/backlog decision is taken from the typed
+    /// [`super::collect::PassDisposition`] (bug_174): only a
+    /// FULL-KEYSPACE completion re-anchors the estimate at 0; a
+    /// cursor-resumed completion resets the cursor but keeps the
+    /// decremented estimate (chunks below the resume point that became
+    /// eligible between cycles were never scanned under this mark).
     Live {
-        cursor_at_stop: Option<Vec<u8>>,
+        disposition: super::collect::PassDisposition,
         victims_collected: u64,
-        pass_complete: bool,
         /// Real-basis observation — only [`super::collect`]'s
         /// real-basis arm can mint one (bug_226).
         observation: super::collect::DurableObservation,
@@ -136,11 +139,11 @@ impl GcCycleLease {
     pub(crate) async fn commit_cycle(mut self, commit: CycleCommit) -> Result<(), sqlx::Error> {
         match commit {
             CycleCommit::Live {
-                cursor_at_stop,
+                disposition,
                 victims_collected,
-                pass_complete,
                 observation,
             } => {
+                // r[impl store.gc.completion-witness]
                 sqlx::query(
                     "UPDATE gc_collect_state SET \
                        cycle_epoch = cycle_epoch + 1, \
@@ -154,8 +157,8 @@ impl GcCycleLease {
                        updated_at = now() \
                      WHERE singleton",
                 )
-                .bind(if pass_complete { None } else { cursor_at_stop })
-                .bind(pass_complete)
+                .bind(disposition.cursor_at_stop().map(<[u8]>::to_vec))
+                .bind(disposition.anchors_backlog_zero())
                 .bind(victims_collected as i64)
                 .bind(observation.mark_set_size())
                 .execute(&mut **self.lock.conn())

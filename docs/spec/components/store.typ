@@ -1536,6 +1536,23 @@ products and both falsify.
   `sum()`.
 ]
 
+#r("store.gc.completion-witness")[
+  Completion of a live collect pass is a typed property of having scanned
+  the FULL keyspace under this cycle's mark: only an unresumed pass that
+  exhausts the candidate scan may anchor the durable backlog estimate at
+  zero or run the post-drain tombstone reap. A cursor-resumed pass that
+  exhausts the remainder resets the cursor but MUST keep the decremented
+  backlog estimate, and the post-drain tail work (tombstone reap, mark
+  cleanup) MUST NOT be able to fail the already-drained cycle's commit ---
+  tail failures are contained (warn + counter) and retried on the next
+  full-scan completion.
+]
+
+The disposition is one enum (`PassDisposition`) constructed at a single
+site from the resume state and the scan exit; the durable commit and the
+reap gate consume it rather than re-deriving booleans --- a resumed partial
+scan asserting completion is unrepresentable (bug_174, bug_137).
+
 #r("store.gc.shutdown-abort")[
   `sweep` checks the shutdown token between batches (NOT mid-transaction --- a
   partial batch ROLLBACKs cleanly via tx drop). On cancellation it returns

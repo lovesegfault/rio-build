@@ -442,13 +442,25 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_store_gc_chunks_reaped_total",
-        "Tombstone chunk rows hard-DELETEd by the post-pass reap (091, \
+        "Tombstone chunk rows hard-DELETEd by the post-drain reap (091, \
          merged_bug_336): soft-deleted at least the grace term ago AND \
          fully drained (no pending_s3_deletes row). Runs only after a \
-         COMPLETE collect pass; the resurrect upsert NULLs deleted_at so \
-         a re-referenced chunk is never reap-eligible. Sustained zero \
+         FULL-KEYSPACE collect completion (bug_174 — a cursor-resumed \
+         completion proves nothing about the skipped prefix and does \
+         not reap); the resurrect upsert NULLs deleted_at so a \
+         re-referenced chunk is never reap-eligible. Sustained zero \
          with a growing deleted-row count means the drain is stuck \
          (check rio_store_s3_deletes_stuck)."
+    );
+    describe_counter!(
+        "rio_store_gc_collect_tail_errors_total",
+        "Post-drain tail failures of the collect cycle, labeled by stage \
+         (reap = the tombstone reap batch; cleanup = the mark temp-table \
+         drop). The drained cycle still COMMITS its stamp/cursor/backlog \
+         (bug_137 — pre-fix a tail error un-committed the cycle and \
+         re-ran the full mark expansion up to 24x/day); the tail retries \
+         on the next full-scan completion. Sustained increments mean the \
+         reap statement or the cycle session is unhealthy."
     );
     describe_counter!(
         "rio_store_substitute_integrity_failures_total",
