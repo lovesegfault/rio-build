@@ -72,6 +72,17 @@ pub fn wanted_subset<'a>(
 /// fall back to all declared paths, or treat the node as unavailable.
 /// Falling through to a from-source build / the full merge is always
 /// safe; a false "complete" is not.
+/// SATURATION over the placeholder dimension (bug_141): if ANY
+/// wanted-matched expected path is a floating-CA `""` placeholder, the
+/// whole answer is `None` — never a silently shrunken `Some(subset)`.
+/// A completeness predicate quantifying over a shrunken set would
+/// verify a strict subset and call it total (VerifiedAllWantedPresent
+/// → AdoptCompleted over unverified outputs). Every producer today
+/// keeps `expected_output_paths` uniform per drv (all concrete or all
+/// placeholder), so this arm is behavior-neutral for reachable inputs
+/// — the guard makes the documented None-on-unverifiable contract
+/// hold by construction instead of resting on that unstated
+/// cross-crate invariant.
 // r[impl sched.merge.wanted-outputs+3]
 pub fn verifiable_wanted_paths<'a>(
     output_names: &'a [String],
@@ -80,9 +91,8 @@ pub fn verifiable_wanted_paths<'a>(
 ) -> Option<Vec<&'a str>> {
     let paths: Vec<&str> = wanted_subset(output_names, expected_output_paths, wanted_output_names)
         .map(String::as_str)
-        .filter(|p| !p.is_empty())
         .collect();
-    (!paths.is_empty()).then_some(paths)
+    (!paths.is_empty() && paths.iter().all(|p| !p.is_empty())).then_some(paths)
 }
 
 /// Union `src` into `dst`, saturating on the empty (= "all declared
@@ -168,11 +178,26 @@ mod tests {
             let paths: Vec<String> =
                 paths.into_iter().map(Option::unwrap_or_default).collect();
             let got = verifiable_wanted_paths(&names, &paths, &wanted);
-            if let Some(v) = got {
+            if let Some(ref v) = got {
                 proptest::prop_assert!(!v.is_empty(), "Some(empty) is forbidden");
                 proptest::prop_assert!(
                     v.iter().all(|p| !p.is_empty()),
                     "empty-string paths must be filtered"
+                );
+            }
+            // bug_098-wave round 3 (bug_141): the guard saturates over
+            // the placeholder dimension — if ANY wanted-matched
+            // expected path is an unverifiable "" placeholder, the
+            // answer is None (conservative branch), never a silently
+            // SHRUNKEN Some(subset) that a completeness predicate
+            // would quantify over as if it were total.
+            let any_placeholder =
+                wanted_subset(&names, &paths, &wanted).any(|p| p.is_empty());
+            if any_placeholder {
+                proptest::prop_assert!(
+                    got.is_none(),
+                    "a wanted-matched placeholder must saturate the guard to None, \
+                     got {got:?}"
                 );
             }
         }
