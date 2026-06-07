@@ -2023,7 +2023,7 @@ pub use rio_common::wanted_outputs::{
 /// SATURATES the union to maximal width. Never a narrower
 /// stale snapshot, never a vacuous set; divergence from the exact union is strictly in
 /// the widening direction. The degradation is observable:
-/// [`note_width_event`]'s `SaturatedToDeclared` arm (counter +
+/// `note_width_event`'s `SaturatedToDeclared` arm (counter +
 /// rate-limited warn).
 ///
 /// Returns `None` only when the node has zero live interested builds
