@@ -3698,9 +3698,10 @@ model assumes) so no constant moves without the others.
   defense-in-depth.
   `reassign_derivations` --- the requeue tail that can poison a derivation
   and run the terminal log epilogue --- is individually leader-gated at its
-  own chokepoint (the stream-era `ExecutorConnected`/`Disconnected`/
-  `DrainExecutor`/`Heartbeat`/`ReportExecutorTermination`/`ForwardPhase` arms
-  it used to ride behind are deleted with their commands).
+  own chokepoint (the stream-era arms it used to ride behind ---
+  `ExecutorConnected`/`Disconnected`, plus the
+  deleted `DrainExecutor`/`Heartbeat`/`ReportExecutorTermination`/`ForwardPhase` ---
+  are deleted with their commands).
 ]
 The build-event stream itself has no PG write path to gate: build events
 are broadcast-only (the `build_event_log` mirror, its persister, and its

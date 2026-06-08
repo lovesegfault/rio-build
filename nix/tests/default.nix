@@ -1040,8 +1040,8 @@ in
   # r[verify ctrl.drain.disruption-target+4]
   #   preempt arm: patching DisruptionTarget=True on a pull-mode pod
   #   makes the controller synthesize the preempted report and
-  #   foreground-delete the owning Job (report-then-delete, no
-  #   DrainExecutor hop); pod+Job gone and the attempt closed at the
+  #   foreground-delete the owning Job (report-then-delete; the
+  #   retired DrainExecutor hop plays no part); pod+Job gone and the attempt closed at the
   #   report fold within 90s — never the establishment sweep — the
   #   preempted exec charged exactly once with a non-success
   #   disruption class, and the requeued drv still delivers. cancel
@@ -1329,7 +1329,7 @@ in
   #   WatchBuild / live log tail. ~6min (k3s bring-up + Cilium
   #   Gateway reconcile). No separate Envoy Gateway operator —
   #   Cilium's embedded envoy handles the GRPCRoute.
-  # r[verify dash.auth.method-gate+4]
+  # r[verify dash.auth.method-gate+5]
   #   The fixture doesn't set dashboard.enableMutatingMethods so the
   #   rio-scheduler-mutating HTTPRoute is absent — `kubectl get
   #   httproute rio-scheduler-mutating` fails. Proves the helm-template

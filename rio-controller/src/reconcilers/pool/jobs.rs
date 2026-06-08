@@ -2,7 +2,8 @@
 //!
 //!   1. Each `apply()` tick polls `GetSpawnIntents` (filtered by
 //!      `{kind, systems, features}`) via the same `ctx.admin` client
-//!      the finalizer uses for DrainExecutor.
+//!      the finalizer uses for report synthesis (its stream-era
+//!      DrainExecutor hop is retired).
 //!   2. If the scheduler returned intents and active Jobs for this
 //!      pool < `spec.maxConcurrent`, spawn one Job per intent (up to
 //!      the ceiling).

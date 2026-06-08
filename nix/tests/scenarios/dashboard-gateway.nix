@@ -14,7 +14,7 @@
 # trailers as a separate LENGTH-PREFIXED-MESSAGE with flag=0x80 per the
 # gRPC-Web spec (browsers can't read HTTP/2 trailers).
 #
-# Method-gate (r[verify dash.auth.method-gate+4]) is asserted at the
+# Method-gate (r[verify dash.auth.method-gate+5]) is asserted at the
 # routing layer: the rio-scheduler-mutating HTTPRoute MUST NOT exist
 # (helm fail-closed → operator never reconciles a path to ClearPoison).
 #

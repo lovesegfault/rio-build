@@ -3,9 +3,10 @@
 //! The operator/controller surface: `ClusterStatus`, `ListExecutors`
 //! (open-attempt backed), `ListOpenAttempts`, `ListBuilds`,
 //! `ClearPoison`, `ListTenants`, `CreateTenant`, `GetBuildGraph`,
-//! `GetSpawnIntents`, `TriggerGC`, the SLA family. The stream-era
-//! `DrainExecutor`, `DebugListExecutors` and `ReportExecutorTermination`
-//! RPCs were removed by the proto sweep (cordon + cancel/Job-delete,
+//! `GetSpawnIntents`, `TriggerGC`, the SLA family. The removed
+//! stream-era `DrainExecutor`, `DebugListExecutors` and
+//! `ReportExecutorTermination` RPCs left with the proto sweep
+//! (cordon + cancel/Job-delete,
 //! `ListOpenAttempts` + the Job census, and `ReportAttemptOutcome` are
 //! the successors).
 //!

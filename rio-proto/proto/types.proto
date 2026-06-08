@@ -28,7 +28,7 @@ enum BuildResultStatus {
   BUILD_RESULT_STATUS_LOG_LIMIT_EXCEEDED = 8;
   BUILD_RESULT_STATUS_OUTPUT_REJECTED = 9;
   BUILD_RESULT_STATUS_INFRASTRUCTURE_FAILURE = 10; // Executor infra issue (not build)
-  BUILD_RESULT_STATUS_CANCELLED = 11;      // Explicit cancel (CancelBuild RPC or DrainExecutor force)
+  BUILD_RESULT_STATUS_CANCELLED = 11;      // Explicit cancel (CancelBuild RPC; the removed DrainExecutor force was a second source)
   BUILD_RESULT_STATUS_TIMED_OUT = 12;      // Configured timeout exceeded; scheduler treats as permanent-no-reassign
   BUILD_RESULT_STATUS_NOT_DETERMINISTIC = 13; // nix-daemon --check / repeat-build mismatch (reproducibility triage)
   BUILD_RESULT_STATUS_INPUT_REJECTED = 14; // nix-daemon rejected .drv inputs (distinct from OutputRejected post-build hash mismatch)

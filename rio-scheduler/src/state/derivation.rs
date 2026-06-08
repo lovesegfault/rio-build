@@ -188,8 +188,9 @@ db_str_enum! {
         /// never complete in the current build. Terminal (like Poisoned).
         /// Maps to Nix BuildStatus::DependencyFailed=10.
         DependencyFailed = "dependency_failed",
-        /// Explicitly cancelled via CancelBuild (all interested builds cancelled)
-        /// or DrainExecutor(force). Terminal but distinct from Poisoned: no
+        /// Explicitly cancelled via CancelBuild (all interested builds
+        /// cancelled; the removed DrainExecutor(force) was a second
+        /// source). Terminal but distinct from Poisoned: no
         /// implication of build defect, just scheduler/operator decision.
         /// No TTL reset — a cancelled build stays cancelled; retry means
         /// re-submitting. Worker's cgroup.kill SIGKILLs the daemon tree,
@@ -391,8 +392,8 @@ impl DerivationStatus {
             (Self::Failed, Self::Queued) => true,
             // Cancel: from any in-flight state. CancelBuild cancels
             // sole-interest derivations (the controller's Job deletion
-            // aborts the pods); DrainExecutor(force) cancels all a
-            // worker's in-flight.
+            // aborts the pods); the removed DrainExecutor(force) once
+            // cancelled all a worker's in-flight.
             // Both require the derivation to be Assigned or Running —
             // if it's still Queued/Ready (not dispatched yet), just
             // remove build interest instead (handle_cancel_build's

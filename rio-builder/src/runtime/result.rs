@@ -166,8 +166,9 @@ fn fold_error_evidence(e: &ExecutorError, evidence: &mut StoreEvidenceSet) {
 /// the time the result is observed the flag is set. Three buckets:
 ///
 /// - `was_cancelled` → `Cancelled`. Expected outcome of any cancel
-///   source: `CancelBuild`, the scheduler's backstop timeout, or
-///   `DrainExecutor(force)`. Not an error — info-logged. Scheduler's
+///   source: `CancelBuild` or the scheduler's backstop timeout (the
+///   removed stream-era `DrainExecutor(force)` was a third). Not an
+///   error — info-logged. Scheduler's
 ///   completion handler treats `Cancelled` as a no-op (by the time the
 ///   report arrives it has already moved the derivation on — to
 ///   `Cancelled` on the cancel path, back to `Ready` on the

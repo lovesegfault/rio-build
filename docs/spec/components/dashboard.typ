@@ -184,14 +184,13 @@ stack can't give you.
   CRDs.
 ]
 
-#r("dash.auth.method-gate+4")[
+#r("dash.auth.method-gate+5")[
   The `GRPCRoute` splits `AdminService` methods by impact: read-only methods
   (`ClusterStatus`, `ListExecutors`, `ListPoisoned`, `ListBuilds`,
   `ListTenants`, `GetBuildGraph`, `GetSpawnIntents`) route unconditionally, as
   does the read-only store-backed `LogService/TailLog` route (a separate
   `HTTPRoute` whose `backendRef` is `rio-store`); mutating methods
-  (`ClearPoison`, `DrainExecutor`,
-  `CreateTenant`, `TriggerGC`) route only when `dashboard.enableMutatingMethods`
+  (`ClearPoison`, `CreateTenant`, `TriggerGC`) route only when `dashboard.enableMutatingMethods`
   is true (default false). Until dashboard-native authz lands, mutating
   operations go through `rio-cli` over a `kubectl port-forward`. CORS
   `allowOrigins` defaults to the in-cluster nginx Service hostname, not
@@ -322,7 +321,7 @@ lower floor there; the dashboard tab has neither bound.
   `AdminService.ClearPoison({derivationHash})` after a `confirm()` and pushes a
   toast --- `cleared=false` (race with a successful retry) is an info toast,
   not an error. No optimistic mutation; the next 5s graph poll picks up the
-  `poisoned→queued` transition. Subject to #rref("dash.auth.method-gate+2")
+  `poisoned→queued` transition. Subject to #rref("dash.auth.method-gate+5")
   (mutating method).
 ]
 

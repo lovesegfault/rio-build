@@ -3,7 +3,7 @@
 //! Shared fixtures (`setup_svc`, `setup_svc_default`)
 //! live here and are `pub(super)` for the per-domain submodules. Tests
 //! for handlers that remain inline in `admin/mod.rs` post-P0383
-//! (`ClusterStatus`, `DrainExecutor`, `ClearPoison`, `admin_rpcs_are_wired`
+//! (`ClusterStatus`, `ClearPoison`, `admin_rpcs_are_wired`
 //! smoke test) stay in this file — everything else mirrors the
 //! `admin/{gc,tenants,builds,workers,graph,sizeclass}.rs` submodule
 //! seams.
@@ -1056,10 +1056,6 @@ async fn cluster_status_actor_dead_returns_unavailable() -> anyhow::Result<()> {
     assert!(status.message().contains("actor"));
     Ok(())
 }
-
-// -----------------------------------------------------------------------
-// DrainExecutor
-// -----------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // ClearPoison happy path

@@ -1209,8 +1209,8 @@ dashboard:
   resources:
     requests: {cpu: 50m, memory: 64Mi}
     limits: {memory: 128Mi}
-  # ── Method-level authz (r[dash.auth.method-gate+4]) ───────────────────
-  # Expose ClearPoison/DrainExecutor/CreateTenant/TriggerGC via the
+  # ── Method-level authz (r[dash.auth.method-gate+5]) ───────────────────
+  # Expose ClearPoison/CreateTenant/TriggerGC via the
   # dashboard gateway. Default false — the GRPCRoute for mutating
   # methods is NOT rendered, so envoy returns 404 on those paths.
   # Use rio-cli with the service-HMAC key for admin operations until

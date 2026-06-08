@@ -144,9 +144,9 @@ async fn main() -> anyhow::Result<()> {
     if service_signer.is_some() {
         info!("service-token signing enabled (dispatch-time substitution probe)");
     }
-    // Same key, verifier role: AdminService gates controller-only
-    // mutating RPCs (AppendInterruptSample, DrainExecutor) on
-    // x-rio-service-token. HmacSigner == HmacVerifier (type alias);
+    // Same key, verifier role: AdminService gates the controller-only
+    // mutating RPC (AppendInterruptSample) on x-rio-service-token
+    // (the removed DrainExecutor rode the same gate in its day). HmacSigner == HmacVerifier (type alias);
     // re-load to get an independently-owned Arc for AdminServiceImpl.
     let service_verifier = rio_auth::hmac::HmacVerifier::load(cfg.service_hmac_key_path.as_deref())
         .map_err(|e| anyhow::anyhow!("service HMAC key load: {e}"))?

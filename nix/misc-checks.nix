@@ -1933,7 +1933,7 @@ in
         # tripped its own author three times exactly that way.
         # Self-allowlist: misc-checks.nix only (this file names the
         # tokens to deny them).
-        deny_concept='\bBuildExecution\b|\bCancelSignal\b|\bHeartbeatRequests?\b|\bHeartbeatResponses?\b|Heartbeat.{0,2}(RPC|unary)|\b[Rr]eady[- ]queues?\b|\bready_queue\b|terminationGracePeriodSeconds: 7200|blocks until its single in-flight build|Baked-in beats runtime envsubst|Forward-compat.*lands in P[0-9]|lands in P[0-9].*No Data|prox(y|ies|ying).{0,60}(Cilium|Envoy) Gateway|\(no series\).*never fires'
+        deny_concept='\bBuildExecution\b|\bCancelSignal\b|\bHeartbeatRequests?\b|\bHeartbeatResponses?\b|Heartbeat.{0,2}(RPC|unary)|\b[Rr]eady[- ]queues?\b|\bready_queue\b|\bDrainExecutor\b|terminationGracePeriodSeconds: 7200|blocks until its single in-flight build|Baked-in beats runtime envsubst|Forward-compat.*lands in P[0-9]|lands in P[0-9].*No Data|prox(y|ies|ying).{0,60}(Cilium|Envoy) Gateway|\(no series\).*never fires'
         # merged_bug_081: every escape token WORD-BOUND — the old
         # unanchored vocabulary legalized live narration via substrings
         # ("unremoved", "pre-pulling") and via unrelated matches in the
@@ -1976,6 +1976,9 @@ in
         echo 'metric lands in P0539d; shows No Data until then' > "$TMPDIR/c1red/panel.json"
         # merged_bug_076 token: the retired nginx->Gateway east-west hop.
         echo 'nginx proxies gRPC-Web POSTs to the Envoy Gateway listener' > "$TMPDIR/c1red/hop.nix"
+        # merged_bug_006 token: the removed DrainExecutor RPC.
+        echo 'operators drain a worker via the DrainExecutor RPC' > "$TMPDIR/c1red/drain.rs"
+        echo 'the removed DrainExecutor RPC once drained workers' > "$TMPDIR/c1green/drain.rs"
         echo 'the removed BuildExecution stream routed work (stream-era)' > "$TMPDIR/c1green/doc.typ"
         echo 'historical note: this text said it lands in P0539d; shows No Data — removed' > "$TMPDIR/c1green/panel.json"
         echo 'nginx no longer proxies to the Cilium Gateway listener (registry-direct now)' > "$TMPDIR/c1green/hop.nix"
@@ -2343,7 +2346,7 @@ in
 
   # nginx allow-list (docker.nix dashboardReadonlyMethods) MUST equal
   # the Cilium Gateway rio-scheduler-readonly HTTPRoute's Exact paths.
-  # Both implement r[dash.auth.method-gate+4]; before this check the
+  # Both implement r[dash.auth.method-gate+5]; before this check the
   # nginx side was a deny-list that fail-OPENED 10 mutating RPCs.
   # Diffing the two closes the drift class — adding an RPC to either
   # side without the other fails CI.
@@ -2390,7 +2393,7 @@ in
         diff $TMPDIR/nginx-side $TMPDIR/gateway-side || {
           echo "FAIL: nginx readonly allow-list (docker.nix dashboardReadonly{Admin,Scheduler,StoreLogs})" >&2
           echo "      diverged from the readonly HTTPRoutes (dashboard-gateway.yaml)." >&2
-          echo "      Both implement r[dash.auth.method-gate+4] — keep them in sync." >&2
+          echo "      Both implement r[dash.auth.method-gate+5] — keep them in sync." >&2
           exit 1
         }
         touch $out

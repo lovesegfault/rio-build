@@ -78,7 +78,7 @@ per-message progress drains without a whole-call deadline.
   [Force-cancel an active build (operator override)],
 
   [`drain-executor`],
-  [`AdminService.DrainExecutor`],
+  [the removed `AdminService.DrainExecutor`],
   [Retired no-op --- surfaces the scheduler's error naming the successor
     procedures (cordon + exclusion / cancel + Job delete / pool pause)],
 

@@ -881,8 +881,8 @@ status and the consumer of the scheduler's ledger-backed open-attempt view.
 The controller has no stream-mode call sites left: the 1d controller cleanup
 removed the `ListExecutors` busy consultation, the `DrainExecutor` preemption
 hop, and the executor-id prefix correlation; the legacy
-`ReportExecutorTermination` and `DrainExecutor` RPCs leave the proto with the
-1d sweep.
+`ReportExecutorTermination` and `DrainExecutor` RPCs (both removed) left the
+proto with the 1d sweep (whole-message deletions; see admin_types.proto).
 
 #r("ctrl.report.attempt-outcome")[
   The controller MUST fold a pull-mode attempt's pod/Job terminal status to
