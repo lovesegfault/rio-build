@@ -211,9 +211,11 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_scheduler_resource_floor_bumps_total",
         "resource_floor doublings on explicit resource-exhaustion signals (D4, labeled \
-         reason=oom_killed|disk_pressure|cgroup_oom|timeout|deadline_exceeded). Reactive \
-         upsize: a derivation that OOMs at mem=N retries at mem=2N. Frequent firing for \
-         one pname = raise [sla].probe defaults."
+         reason=cgroup_oom|timeout; timeout covers DeadlineExceeded too. The stream-era \
+         oom_killed/disk_pressure/deadline_exceeded label arms were retired with the \
+         heuristic promote paths - bump_resource_floor's two callers are the alphabet. \
+         Reactive upsize: a derivation that OOMs at mem=N retries at mem=2N. Frequent \
+         firing for one pname = raise [sla].probe defaults."
     );
     describe_counter!(
         "rio_scheduler_poison_fleet_exhausted_total",

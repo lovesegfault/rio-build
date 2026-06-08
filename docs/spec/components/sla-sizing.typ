@@ -946,7 +946,7 @@ Per-decision: `sla_estimate` is `#[instrument]`-ed and emits a DEBUG span with `
 Metrics (per #cross-link("/spec/system/observability.typ")[observability spec] `rio_scheduler_` convention):
 - #(refs.metric)("rio_scheduler_sla_prediction_ratio")`{dim=wall|mem}` — histogram of `actual / predicted`. Sustained skew off 1.0 is the *model-drift* alert; this is the "silently wrong" signal.
 - #(refs.metric)("rio_scheduler_sla_residual_multimodal_total")`{tenant}` — incremented when Hartigan's dip test (a unimodality test @hartigan1985) yields $p < 0.05$ on log-residuals (often an upstream cache-hit/miss split, not something the model should fit). Exception-path only; pname identity is in the span.
-- #(refs.metric)("rio_scheduler_resource_floor_bumps_total")`{reason=oom|enospc}` — penalty-bump retries; `sla_prediction_ratio` is blind to censored samples so this is the under-provisioning signal.
+- #(refs.metric)("rio_scheduler_resource_floor_bumps_total")`{reason=cgroup_oom}` — penalty-bump retries (`timeout` is the only other live label arm); `sla_prediction_ratio` is blind to censored samples so this is the under-provisioning signal.
 - #(refs.metric)("rio_scheduler_sla_envelope_result_total")`{tier, result=hit|miss, constraint}` — the SLO outcome the operator's dashboard is built on.
 - #(refs.metric)("rio_scheduler_sla_infeasible_total")`{tenant, reason=serial_floor|mem_ceiling|disk_ceiling|core_ceiling|interrupt_runaway|capacity_exhausted}`
 - #(_sla-diag-counters.map(n => (refs.metric)(n)).join(", "))`{tenant}`; #(refs.metric)("rio_controller_ddsketch_seed_fallback_total")`{h,cap}`; #(refs.metric)("rio_scheduler_sla_hw_ladder_exhausted_total")`{tenant,exit}`

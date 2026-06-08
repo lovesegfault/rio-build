@@ -965,8 +965,12 @@ impl DagActor {
     /// paid for an oversized pod.
     ///
     /// `reason_label`: emitted as a label on the metric + the log
-    /// line so operators can tell `oom_killed` from `disk_pressure`
-    /// from `cgroup_oom` from `timeout` in dashboards.
+    /// line so operators can tell `cgroup_oom` from `timeout` in
+    /// dashboards. Those two are the WHOLE live alphabet (the
+    /// `oom_killed`/`disk_pressure` arms were retired with the
+    /// over-broad heuristic above; `timeout` covers
+    /// `DeadlineExceeded` too) - keep the lib.rs HELP in lockstep
+    /// when adding a caller.
     pub(super) async fn bump_resource_floor(
         &mut self,
         drv_hash: &DrvHash,

@@ -1183,7 +1183,7 @@ cache contract real for the first time.
   scanner's 15-minute sweep. The
   #(refs.metric)("rio_store_putpath_stale_reclaimed_total") counter tracks
   reclaim events; sustained high alongside
-  #(refs.metric)("rio_scheduler_resource_floor_bumps_total")`{kind="fod"}`
+  #(refs.metric)("rio_scheduler_resource_floor_bumps_total")`{reason=cgroup_oom}`
   indicates under-sized fetcher pods (I-207/I-208).
 ]
 
