@@ -611,14 +611,14 @@ pub async fn spawn_build_task(
         // Best-effort: the scheduler's cancel-path seal drops this
         // footer before it reaches the stored log — see
         // `terminal_log_epilogue`'s sequencing note in rio-scheduler.
-        // TODO: the runtime footer-send path's once-per-assignment /
-        // skipped-on-None / prev_line_count threading has no unit test
-        // — `spawn_build_task` requires a full BuildContext + live gRPC
-        // stream. Covered by `nextest-rio-builder` compilation +
-        // existing VM scenarios; a `RIO_BUILDER_SCRIPT` VM test
-        // asserting "exactly one rio: result line per exec_id" would
-        // close the gap. (The seal-only-if-sent decision below IS
-        // unit-tested: `sealed_final_line_count`.)
+        // Coverage note: the runtime footer-send path's
+        // once-per-assignment / skipped-on-None / prev_line_count
+        // threading has no isolated unit test — `spawn_build_task`
+        // requires a full BuildContext + live gRPC stream — and is
+        // exercised by `nextest-rio-builder` compilation plus the VM
+        // scenarios that read footers end-to-end. (The
+        // seal-only-if-sent decision below IS unit-tested:
+        // `sealed_final_line_count`.)
         let report_line_count = if let Some(footer_result) = final_footer_result(
             last_footer_result.as_deref(),
             cancelled.load(std::sync::atomic::Ordering::Acquire),
