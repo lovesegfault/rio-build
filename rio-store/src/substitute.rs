@@ -416,10 +416,15 @@ pub struct Substituter {
     pool: PgPool,
     chunk_backend: Option<Arc<dyn ChunkBackend>>,
     /// `None` if `reqwest::Client::builder().build()` failed (nix
-    /// sandbox: no CA bundle → rustls-native-certs errors). In that
-    /// case substitution is a no-op — every `try_substitute` returns
-    /// `None` and every `check_available` returns `[]`. Production
-    /// always has a CA bundle; only the sandboxed test run hits this.
+    /// sandbox: no CA bundle → rustls-native-certs errors). The
+    /// consequences are per-arm via [`CapabilityGate`] (the ONE
+    /// ordering, merged_bug_030/044 — see its enum doc, the
+    /// authority): NO upstreams configured → clean no-op (`Ok(None)` /
+    /// `[]`); upstreams configured but clientless → a capability
+    /// fault, NOT a miss — attempts return an UNCACHED `Err(Fetch)`
+    /// counted under `skipped_total{reason=no_http_client}`, probes
+    /// answer all-indeterminate. Production always has a CA bundle;
+    /// only the sandboxed test run hits this.
     http: Option<reqwest::Client>,
     /// The signer for `sig_mode = add|replace`. `None` means those
     /// modes fall back to `keep` behavior (we can't sign without a
@@ -790,12 +795,15 @@ impl Substituter {
                 // as upstream failure. Admission and Stalled each have
                 // their own dedicated counter
                 // (stale_reclaimed_total{reason="stall_abort"}).
-                // `Fetch` is skipped too (merged_bug_044): the only
-                // Fetch that escapes `do_substitute` is the fold's
-                // all-errored verdict, already counted ONCE at the
-                // fold (merged_bug_091) — counting the escape again
-                // would double-bill the attempt. `UntrustedPresent`
-                // likewise carries its own fold label.
+                // `Fetch` is skipped too (merged_bug_044): exactly TWO
+                // producers reach this match and both are pre-counted —
+                // the fold's all-errored verdict out of `do_substitute`
+                // (counted ONCE at the fold, merged_bug_091) and the
+                // capability gate's Clientless arm above (counted under
+                // skipped_total{reason=no_http_client} before it
+                // returns) — counting either again would double-bill
+                // the attempt. `UntrustedPresent` likewise carries its
+                // own fold label.
                 if !matches!(
                     *e,
                     SubstituteError::Raced
