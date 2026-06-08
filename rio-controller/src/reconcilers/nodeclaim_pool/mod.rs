@@ -1198,11 +1198,14 @@ impl NodeClaimPoolReconciler {
     /// censored half — `observe_idle_to_busy` needs uncensored
     /// idle→busy edges.
     ///
-    /// Returns `(registered_cells, observed_types)` from
-    /// [`CellSketches::observe_registered`]. `reconcile_once` consumes
-    /// them; `consolidate_only` discards them (the scheduler is
-    /// unreachable, so there is nothing to act on — same shape as the
-    /// existing `ice_cells` discard).
+    /// Returns [`PendingSchedulerEvidence`] — and EVERY caller merges
+    /// it into `pending_evidence` (`reconcile_once`,
+    /// `consolidate_only`, and the pre-threshold ⊥-tick arm alike;
+    /// merged_bug_007): the scheduler being unreachable defers
+    /// delivery, it does not forfeit evidence. The consume-once
+    /// contract lives on the type's `#[must_use]` message — buffered
+    /// until cleared on Ack-Ok — so call-site comments reference it
+    /// instead of restating drain semantics.
     fn kube_only_observations(
         &mut self,
         live: &[ffd::LiveNode],
@@ -1284,9 +1287,11 @@ impl NodeClaimPoolReconciler {
             // Without it, `prev_idle` stays un-pruned across unobserved
             // busy periods (a stale entry conflates two idle spells)
             // and Registered edges age past the 3×TICK recency gate
-            // (boot sample + ICE-clear lost permanently). Returns are
-            // discarded: `registered_cells`/`observed_types` need the
-            // scheduler (same shape as `consolidate_only`'s discard).
+            // (boot sample + ICE-clear lost permanently). The returned
+            // evidence is merged into `pending_evidence` (merged_bug_007
+            // — same as `consolidate_only`) and drains on the next
+            // successful Ack; the consume-once contract is the
+            // `#[must_use]` on `PendingSchedulerEvidence`.
             // NO reap/create/ack/publish before the threshold — growth
             // and destructive actions stay threshold-gated; cost is the
             // two consolidate-only LISTs on ≤4 ticks per outage, both
