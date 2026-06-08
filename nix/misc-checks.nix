@@ -1926,7 +1926,7 @@ in
         # tripped its own author three times exactly that way.
         # Self-allowlist: misc-checks.nix only (this file names the
         # tokens to deny them).
-        deny_concept='\bBuildExecution\b|\bCancelSignal\b|\bHeartbeatRequests?\b|\bHeartbeatResponses?\b|Heartbeat.{0,2}(RPC|unary)|\b[Rr]eady[- ]queues?\b|\bready_queue\b|terminationGracePeriodSeconds: 7200|blocks until its single in-flight build|Baked-in beats runtime envsubst|Forward-compat.*lands in P[0-9]|lands in P[0-9].*No Data|\(no series\).*never fires'
+        deny_concept='\bBuildExecution\b|\bCancelSignal\b|\bHeartbeatRequests?\b|\bHeartbeatResponses?\b|Heartbeat.{0,2}(RPC|unary)|\b[Rr]eady[- ]queues?\b|\bready_queue\b|terminationGracePeriodSeconds: 7200|blocks until its single in-flight build|Baked-in beats runtime envsubst|Forward-compat.*lands in P[0-9]|lands in P[0-9].*No Data|prox(y|ies|ying).{0,60}(Cilium|Envoy) Gateway|\(no series\).*never fires'
         # merged_bug_081: every escape token WORD-BOUND — the old
         # unanchored vocabulary legalized live narration via substrings
         # ("unremoved", "pre-pulling") and via unrelated matches in the
@@ -1967,8 +1967,11 @@ in
         echo 'the scheduler routes work over the BuildExecution stream' > "$TMPDIR/c1red/doc.typ"
         # bug_048 token: the panel-description deferral class.
         echo 'metric lands in P0539d; shows No Data until then' > "$TMPDIR/c1red/panel.json"
+        # merged_bug_076 token: the retired nginx->Gateway east-west hop.
+        echo 'nginx proxies gRPC-Web POSTs to the Envoy Gateway listener' > "$TMPDIR/c1red/hop.nix"
         echo 'the removed BuildExecution stream routed work (stream-era)' > "$TMPDIR/c1green/doc.typ"
         echo 'historical note: this text said it lands in P0539d; shows No Data — removed' > "$TMPDIR/c1green/panel.json"
+        echo 'nginx no longer proxies to the Cilium Gateway listener (registry-direct now)' > "$TMPDIR/c1green/hop.nix"
         echo 'the scheduler routes work over the BuildExecution stream' > "$TMPDIR/c1path/removed-docs/doc.typ"
         echo 'the BuildExecution stream is checked by misc-checks.nix today' > "$TMPDIR/c1cite/doc.typ"
         echo 'an unremoved BuildExecution stream still routes work' > "$TMPDIR/c1substr/doc.typ"

@@ -90,9 +90,11 @@ spec:
               readOnly: true
           # / (index.html) is served from the baked-in SPA bundle. If
           # nginx is up, the SPA is servable — no backend dep to
-          # readiness-gate on (Cilium Gateway being down means gRPC
-          # calls fail in-browser, but the static app still loads and
-          # shows its own error state).
+          # readiness-gate on (a registry backend being down means its
+          # gRPC-Web calls fail in-browser — nginx dials
+          # rio-scheduler-leader/rio-store directly per
+          # dashboard-upstreams.json — but the static app still loads
+          # and shows its own error state).
           readinessProbe:
             httpGet:
               path: /

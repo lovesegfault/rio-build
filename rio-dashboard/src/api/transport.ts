@@ -18,8 +18,12 @@
 // framing and 415 at GrpcWebLayer.
 //
 // baseUrl '/' — one build artifact serves both environments:
-//   * prod: nginx proxies /rio.admin.AdminService/* → the Cilium Gateway
-//     listener. See infra/helm/rio-build/templates/dashboard-*.yaml.
+//   * prod: nginx dials the backends DIRECTLY from the upstream
+//     registry (rio-scheduler-leader:9001 / rio-store:9002 per
+//     infra/helm/rio-build/files/dashboard-upstreams.json; both serve
+//     gRPC-Web natively via tonic-web). The Cilium Gateway is
+//     north-south only — in-cluster traffic structurally cannot reach
+//     its ClusterIP (selectorless Service). See dashboard-nginx.conf.
 //   * dev: vite.config.ts server.proxy forwards the same prefix to a
 //     localhost port-forward.
 // No VITE_* env var plumbing, no per-env rebuild.

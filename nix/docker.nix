@@ -710,9 +710,11 @@ rec {
     };
 }
 # ── Dashboard: nginx + SPA static bundle ───────────────────────────────
-# No rio binary — just nginx serving the Svelte dist/ and proxying
-# /rio.* gRPC-Web POSTs to the Envoy Gateway Service. Can't use mkImage
-# (that's built around a rio-* binary Entrypoint).
+# No rio binary — just nginx serving the Svelte dist/ and forwarding
+# /rio.* gRPC-Web POSTs straight to the registry backends
+# (rio-scheduler-leader:9001 / rio-store:9002, dashboard-upstreams.json;
+# both speak gRPC-Web natively — no Gateway hop east-west). Can't use
+# mkImage (that's built around a rio-* binary Entrypoint).
 #
 # optionalAttrs: the coverage-mode mkDockerImages call site doesn't
 # pass rioDashboard (nginx+static has no LLVM instrumentation). The
@@ -737,7 +739,7 @@ rec {
       # Entrypoint (not Cmd): the envsubst wrapper is the contract —
       # pods must not bypass the env substitution.
       Entrypoint = [ "${dashboardEntrypoint}" ];
-      Labels = mkLabels "rio-dashboard — Svelte SPA + gRPC-Web proxy to Envoy Gateway";
+      Labels = mkLabels "rio-dashboard — Svelte SPA + nginx gRPC-Web forwarder to the registry backends";
       ExposedPorts."8080/tcp" = { };
     };
     # /tmp: pid + temp_path directives (readOnlyRootFilesystem in the
