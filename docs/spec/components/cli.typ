@@ -120,13 +120,16 @@ per-message progress drains without a whole-call deadline.
   scheduler's orphan-watcher sweep is the automatic counterpart.
 ]
 
-#r("cli.cmd.verify-chunks")[
+#r("cli.cmd.verify-chunks+2")[
   `rio-cli verify-chunks [--batch-size N]` server-streams
   `StoreAdminService.VerifyChunks`. Missing chunk hashes go to *stdout* (one
   hex BLAKE3 per line --- pipeable into `xargs aws s3api head-object`);
   progress goes to *stderr* so `verify-chunks | tee missing.txt` captures
-  hashes while progress scrolls. Warns on stream-closed-without-`done` (store
-  disconnected mid-scan). I-040 diagnostic.
+  hashes while progress scrolls. A stream that closes without the `done`
+  sentinel is a TRUNCATED audit and MUST exit nonzero (never a warning ---
+  a partial missing-hash list that exits 0 reads as "the rest of the store
+  is clean", and the operator acts on absence; the shared drain law
+  #rref("cli.stream.drain-bound") owns the mechanics). I-040 diagnostic.
 ]
 
 #r("cli.stream.drain-bound")[

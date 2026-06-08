@@ -20,7 +20,7 @@ pub(crate) struct Args {
     batch_size: u32,
 }
 
-// r[impl cli.cmd.verify-chunks]
+// r[impl cli.cmd.verify-chunks+2]
 pub(crate) async fn run(client: &mut StoreAdminClient, a: Args) -> anyhow::Result<()> {
     let mut stream = rio_common::grpc::with_timeout(
         "VerifyChunks",
