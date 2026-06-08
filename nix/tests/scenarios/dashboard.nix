@@ -302,12 +302,25 @@ in
   #   1. seed a running execution (the log-service scenario's rows)
   #   2. start a long-lived AppendLog session: grpcurl reads a FIFO; a
   #      backgrounded writer sends header+batch1 then parks on a flag
-  #      file, holding the session open
+  #      file, holding the session open. While parked it emits an empty
+  #      keepalive batch every ~5s: the store aborts a session whose
+  #      buffer is empty (the 60s periodic cut empties it) with no
+  #      inbound for INBOUND_IDLE_BOUND (60s), so a mute parked writer
+  #      gives the whole choreography a hidden ~60-75s deadline from
+  #      batch 1 to flag-touch — under full-gate host load the gates
+  #      below burned that budget and the lone session lost its lease
+  #      before batch 2 was sent (3 recorded gate strikes; the
+  #      post-open grep then times out with nothing left to deliver).
+  #      accept() skips the numbering checks for empty batches — the
+  #      protocol's keepalive shape, explicitly non-cut-masking.
   #   3. open TailLog{follow:true} THROUGH nginx into a capture file —
   #      the snapshot serves batch 1 (proves attach while live)
   #   4. touch the flag → the writer sends batch 2 on the SAME session
   #      → the live fan-out delivers it to the ALREADY-OPEN stream
   #      (the load-bearing post-open assertion)
+  # Both lease gates below poll log_ingest_sessions freshness — the
+  # exact predicate the read path's lookup_live routes on (heartbeat
+  # within SESSION_STALE_AFTER = 30s): structural DB state, not logs.
   with subtest("live tail via nginx: post-open lines reach the open stream"):
       psql_k8s(k3s_server,
           "INSERT INTO derivations "
@@ -360,19 +373,42 @@ in
           "-d @ localhost:19510 rio.store.LogService/AppendLog "
           "< /tmp/dash-live.fifo > /tmp/dash-live-acks.log 2>&1) "
           "& echo $! > /tmp/dash-grpcurl.pid; "
+          # The parked loop's empty keepalive batches (see the
+          # choreography comment): ~5s nominal cadence vs the 60s
+          # inbound-idle bound — an order of magnitude of headroom for
+          # load-dilated sleep loops.
           "(exec 3>/tmp/dash-live.fifo; cat /tmp/dash-b1.json >&3; "
-          "until [ -f /tmp/dash-live.go2 ]; do sleep 0.5; done; "
+          "i=0; until [ -f /tmp/dash-live.go2 ]; do "
+          "sleep 0.5; i=$((i+1)); "
+          "if [ $((i % 10)) -eq 0 ]; then echo '{\"batch\":{}}' >&3; fi; "
+          "done; "
           "cat /tmp/dash-b2.json >&3; exec 3>&-) "
           "</dev/null >/tmp/dash-writer.log 2>&1 "
           "& echo $! > /tmp/dash-writer.pid"
       )
 
-      # Gate the follow-open on the session being LIVE: a one-shot
-      # TailLog (direct, the long-lived store port-forward) must serve
-      # batch 1 from the ingest buffer first. A follow stream opened
-      # before the session exists ends immediately by contract (the
-      # client re-opens) — the gate removes that race rather than
-      # looping the curl.
+      # Structural gate: the ingest-session lease row, fresh. This is
+      # the signal the read path itself routes on (lookup_live serves
+      # the live view only for heartbeat_at within 30s) — until it
+      # holds, no reader anywhere can see the live session. 180s: the
+      # recorded strike showed the ingest chain (port-forward + grpcurl
+      # + store accept) taking >150s to land batch 1 under full-gate
+      # load — budget for that tail, not the ~1s typical.
+      lease_fresh = (
+          "k3s kubectl -n ${ns} exec rio-postgresql-0 -- "
+          "env PGPASSWORD=rio psql -h 127.0.0.1 -U rio rio -qtAc "
+          "\"SELECT 1 FROM log_ingest_sessions "
+          "WHERE exec_id='${liveExecId}' "
+          "AND heartbeat_at > now() - interval '30 seconds'\" "
+          "| grep -qx 1"
+      )
+      k3s_server.wait_until_succeeds(lease_fresh, timeout=180)
+
+      # Data gate, after the lease gate: a one-shot TailLog (direct,
+      # the long-lived store port-forward) must serve batch 1 first. A
+      # follow stream opened before the session exists ends immediately
+      # by contract (the client re-opens) — the gate removes that race
+      # rather than looping the curl.
       b64_line1 = "ZGFzaC1saXZlLTAwMDAx"  # b64("dash-live-00001")
       # timeout budget: the one-shot rides a port-forward that can land
       # on the NON-owning replica; the cross-replica tail proxy degrades
@@ -411,6 +447,17 @@ in
           k3s_server.wait_until_succeeds(
               "grep -aq dash-live-00001 /tmp/livetail.bin", timeout=90
           )
+          # The post-open assertion's precondition, made structural:
+          # the session that must carry batch 2 is STILL leased. Under
+          # full-gate host load the lone ingest session used to lose
+          # its lease here (inbound-idle abort once the 60s cut emptied
+          # the buffer) and the grep below struck three gates as an
+          # unnamed 90s timeout. With the writer's keepalives the lease
+          # only goes stale if the chain (writer → FIFO → grpcurl →
+          # port-forward → store driver) actually died — fail loud and
+          # named here instead. 60s = two staleness windows of psql/
+          # exec slack under load.
+          k3s_server.wait_until_succeeds(lease_fresh, timeout=60)
           # Batch 2, sent on the SAME open session AFTER the stream
           # opened: the live fan-out must deliver it to the open
           # connection — the incremental flush through nginx that
