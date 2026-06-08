@@ -18,7 +18,10 @@ pub(super) enum ReadyClass {
     Substituting,
     /// Unresolved unclaimed job that is not claimable right now
     /// (parked or deferred): store pacing — counted in NEITHER bucket
-    /// (bug_252; visible via the stalled gauge).
+    /// (bug_252). Only the PARKED half is visible via the stalled
+    /// gauge; a DEFERRED job (defer_until, bounded <=300s) is counted
+    /// in no gauge for that window (m032 — the accepted blind spot,
+    /// stated in the substituting_derivations HELP).
     ParkedPacing,
     /// Builder-queue demand: counted in `queued_by_system` on both
     /// surfaces, whatever the retry-backoff state.
@@ -326,11 +329,13 @@ impl DagActor {
                     // node carrying an unresolved, unclaimed
                     // materialization job is substitution backlog, not
                     // builder-queue backlog; a parked/deferred job is
-                    // pacing (bug_252 — NEITHER bucket, visible via
-                    // rio_scheduler_materialization_stalled); everything
-                    // else is builder demand. `compute_spawn_intents`
-                    // reads the SAME classification, so the two
-                    // `queued_by_system` aggregates cannot diverge.
+                    // pacing (bug_252 — NEITHER bucket; parked stays
+                    // visible via rio_scheduler_materialization_stalled,
+                    // deferred is gauge-invisible for its <=300s window
+                    // per the HELP); everything else is builder demand.
+                    // `compute_spawn_intents` reads the SAME
+                    // classification, so the two `queued_by_system`
+                    // aggregates cannot diverge.
                     match self.classify_ready_node(drv_hash, bucket_now) {
                         ReadyClass::Substituting => substituting_derivations += 1,
                         ReadyClass::ParkedPacing => {}

@@ -1082,11 +1082,14 @@ impl DagActor {
     }
 
     /// Whether the node carries a job the store could claim RIGHT NOW
-    /// (unclaimed AND not parked) — the KEDA "substituting backlog"
-    /// question (bug_252): parked jobs are pacing, not claimable
-    /// demand, so they must not hold store replicas up; they stay
-    /// visible via `rio_scheduler_materialization_stalled` and the
-    /// parked-inclusive exclusion predicate above.
+    /// (unclaimed, not parked, not deferred — `claimability()`'s three
+    /// axes) — the KEDA "substituting backlog" question (bug_252):
+    /// non-claimable jobs are pacing, not claimable demand, so they
+    /// must not hold store replicas up. Parked jobs stay visible via
+    /// `rio_scheduler_materialization_stalled`; a deferred job
+    /// (`defer_until`, bounded <=300s) is counted in neither gauge for
+    /// that window (m032 — stated in the substituting_derivations
+    /// HELP).
     ///
     /// Unavailable view → `false` (an honest zero: the gauge advertises
     /// claimable work to autoscalers; advertising unverifiable work

@@ -37,9 +37,12 @@ message ClusterStatusResponse {
   // so an aarch64 pool doesn't scale on x86_64 backlog (I-107). Empty
   // map from old schedulers → controller falls back to the scalar.
   map<string, uint32> queued_by_system = 11;
-  // Count of derivations carrying an unresolved, unclaimed
-  // materialization job (upstream fetch pending or in flight;
-  // wire-stable field name). Feeds r[ctrl.scaler.signal-substituting].
+  // Count of derivations carrying a CLAIMABLE materialization job
+  // (unclaimed, not parked, not deferred - the scheduler's
+  // claimability() axes; wire-stable field name). Parked jobs ride
+  // rio_scheduler_materialization_stalled instead; deferred jobs
+  // (bounded <=300s) appear in neither count for that window. Feeds
+  // r[ctrl.scaler.signal-substituting].
   uint32 substituting_derivations = 12;
 }
 
