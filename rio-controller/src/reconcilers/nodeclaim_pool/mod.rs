@@ -1468,7 +1468,7 @@ impl NodeClaimPoolReconciler {
         // is marked from stale data (the retired empty-view path ran
         // the verdict over an empty fleet, mass-marking every
         // retained-evidence node right after a systemic episode).
-        // r[impl ctrl.nodeclaim.wedge-cluster+1]
+        // r[impl ctrl.nodeclaim.wedge-cluster+2]
         let open_attempts = match admin_call(
             self.admin
                 .clone()

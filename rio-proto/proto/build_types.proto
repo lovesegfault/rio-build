@@ -543,8 +543,9 @@ message PullAssignmentResponse {
   oneof outcome {
     // Deps Ready and the open attempt is bound to this pod: the
     // existing dispatch payload, identical on every re-pull while the
-    // attempt is open. `WorkAssignment.generation` is observability
-    // only on this path — the generation fence is transaction-side.
+    // attempt is open. The payload carries no generation (the removed
+    // `WorkAssignment.generation` is reserved as field 7) — the
+    // generation fence is transaction-side.
     WorkAssignment assignment = 1;
     Gone gone = 2;
     NotYetReady not_yet_ready = 3;

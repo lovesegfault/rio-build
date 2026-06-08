@@ -1347,7 +1347,7 @@ scheduler's cost table when the outage ends.
   restarted every tick, so idle consolidation never fired).
 ]
 
-#r("ctrl.nodeclaim.wedge-cluster+1")[
+#r("ctrl.nodeclaim.wedge-cluster+2")[
   On every full reconcile tick the NodeClaim-pool reconciler MUST compute a
   per-node clustering of pull-mode attempt-deadline expiries from the
   open-attempt ledger view (`AdminService.ListOpenAttempts`): an open
@@ -1360,12 +1360,13 @@ scheduler's cost table when the outage ends.
   window at the derivation's FIRST observation --- a stuck-open attempt
   re-observed every tick does not slide the window. A node accumulating
   evidence for at least 2 distinct derivations inside the 30-minute window
-  MUST be treated as Dead-equivalent: unioned with the scheduler-reported
-  `dead_nodes` and consumed by the unhealthy reap's `Dead` arm under the same
-  per-tick dead-reap cap. One derivation expiring repeatedly MUST NOT mark a
-  node by itself; an open-attempt RPC failure MUST only skip that tick's
-  observation (previously accumulated evidence is retained, and no node is
-  marked from data the controller did not observe).
+  MUST be treated as Dead-equivalent: fed to the unhealthy reap's `Dead` arm
+  --- the sole `Dead` input since the 1d sweep removed `GetSpawnIntents.dead_nodes`
+  --- under the same per-tick dead-reap cap. One
+  derivation expiring repeatedly MUST NOT mark a node by itself; an
+  open-attempt RPC failure MUST only skip that tick's observation (previously
+  accumulated evidence is retained, and no node is marked from data the
+  controller did not observe).
 ]
 
 #r("ctrl.nodeclaim.wedge-two-axis+3")[
@@ -1409,8 +1410,8 @@ softlockup, D-state runtime) is visible only as its builds running out their
 attempt deadlines without any report. The clustering reads only ledger facts
 plus the spawn-ack node binding, so it survived the session-machinery
 deletion and is now the only node-wedge signal: the scheduler-side detector
-is gone and `GetSpawnIntents.dead_nodes` is always empty (the field stays in
-the proto, and the union arm stays a no-op, until the 1d sweep). The
+is gone and `GetSpawnIntents.dead_nodes` is removed outright (field 3 is
+reserved in the proto; the union arm went with it in the 1d sweep). The
 #(refs.metric)("rio_controller_node_wedge_marked_total") counter records each
 not-wedged→wedged transition and
 #(refs.metric)("rio_controller_wedge_systemic_suppressed_total") each tick the

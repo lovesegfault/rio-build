@@ -1674,6 +1674,13 @@ in
             ../.cargo
           ];
         };
+        # merged_bug_201: the reserved-proto-field prose tier reads the
+        # `reserved "name"` declarations as its truth source — a field
+        # removal fails docs-lint until every spec citation is re-swept.
+        protoSrc = pkgs.lib.fileset.toSource {
+          root = ../rio-proto/proto;
+          fileset = pkgs.lib.fileset.fileFilter (f: f.hasExt "proto") ../rio-proto/proto;
+        };
         # Directories #src()/refs.gh paths reference. Fileset (not bare
         # unfilteredRoot) so docs-lint's hash doesn't depend on
         # Cargo.lock / fuzz corpora / target/. If a future #src()
@@ -2009,6 +2016,56 @@ in
         fail=$prevfail
         concept_scan "$typSrc" "docs"
         concept_scan "$crossSrc" "non-doc sources"
+        # merged_bug_201: spec prose must not cite a `Message.field`
+        # whose field name is RESERVED in the .proto files unless the
+        # same line carries a retirement qualifier — so a field-removal
+        # sweep fails docs-lint until every spec citation is re-swept.
+        # Dotted CamelCase-prefixed citations only (`Foo.bar_baz`): the
+        # bare names (generation, factor, ack, ...) are ordinary words,
+        # and ALL-CAPS prefixes (SQL `EXCLUDED.generation`) are not
+        # proto messages.
+        reserved_rx=$(grep -rhoE 'reserved "[a-z_]+"' "$protoSrc" \
+          | sed 's/reserved "//;s/"//' | sort -u | paste -sd'|')
+        reserved_scan() {
+          local dir=$1 label=$2 hits="" hit content
+          [[ -z $reserved_rx ]] && return 0
+          while IFS= read -r hit; do
+            [[ -z $hit ]] && continue
+            content=''${hit#*:}
+            content=''${content#*:}
+            if ! grep -qiE "$concept_escape" <<<"$content"; then
+              hits+="$hit"$'\n'
+            fi
+          done < <(grep -rn -E "\b[A-Z][a-z][A-Za-z]*\.($reserved_rx)\b" "$dir" || true)
+          if [[ -n "$hits" ]]; then
+            echo "FAIL: prose in $label cites a RESERVED proto field as live —" >&2
+            echo "add a same-line retirement qualifier ($concept_escape) or re-sweep the site:" >&2
+            printf '%s' "$hits" >&2
+            fail=1
+          fi
+        }
+        # R7: one red fixture per arm — planted red trips, qualified
+        # green passes (uses the first reserved name so the fixture
+        # auto-tracks the alphabet).
+        first_reserved=''${reserved_rx%%|*}
+        mkdir -p "$TMPDIR/r2red" "$TMPDIR/r2green"
+        echo "the scheduler still reports SomeMessage.$first_reserved every tick" > "$TMPDIR/r2red/doc.typ"
+        echo "the removed SomeMessage.$first_reserved field is reserved in the proto" > "$TMPDIR/r2green/doc.typ"
+        prevfail=$fail
+        fail=0
+        reserved_scan "$TMPDIR/r2red" "self-test" 2>/dev/null
+        if [[ $fail -eq 0 ]]; then
+          echo "SELF-TEST FAIL: reserved-field tier missed the planted red" >&2
+          exit 1
+        fi
+        fail=0
+        reserved_scan "$TMPDIR/r2green" "self-test"
+        if [[ $fail -ne 0 ]]; then
+          echo "SELF-TEST FAIL: reserved-field tier flagged the qualified fixture" >&2
+          exit 1
+        fi
+        fail=$prevfail
+        reserved_scan "$typSrc" "spec docs"
         # DEFAULT_GC_GRACE_HOURS literal-value tripwire — the const is
         # in gen/consts.json so prose must derive. Broad over $typSrc;
         # NARROW over $crossSrc (only the doc-comment shapes that

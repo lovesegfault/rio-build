@@ -300,7 +300,7 @@ impl WedgeTracker {
     ///   controller deleted since the previous tick — their evidence
     ///   and marked entries are dead, and must not re-feed the Dead
     ///   arm or inflate the systemic populations).
-    // r[impl ctrl.nodeclaim.wedge-cluster+1]
+    // r[impl ctrl.nodeclaim.wedge-cluster+2]
     // r[impl ctrl.nodeclaim.wedge-two-axis+3]
     pub(super) fn update(
         &mut self,
@@ -455,9 +455,10 @@ mod tests {
 
     /// Two attempts for distinct derivations expired on the same node
     /// inside the window → that node (and only it) is Dead-equivalent,
-    /// and `classify` consumes the union exactly as it consumes
-    /// scheduler-reported `dead_nodes` today.
-    // r[verify ctrl.nodeclaim.wedge-cluster+1]
+    /// and `classify` consumes it as the SOLE Dead input (the removed
+    /// `dead_nodes` field — reserved in the proto since the 1d sweep —
+    /// fed the same arm in its day; see the module header).
+    // r[verify ctrl.nodeclaim.wedge-cluster+2]
     #[test]
     fn two_expired_drvs_on_one_node_mark_it_dead_equivalent() {
         let mut tracker = WedgeTracker::default();
@@ -509,7 +510,7 @@ mod tests {
 
     /// One derivation expiring (even repeatedly observed) never marks a
     /// node, and healthy pulls contribute nothing.
-    // r[verify ctrl.nodeclaim.wedge-cluster+1]
+    // r[verify ctrl.nodeclaim.wedge-cluster+2]
     #[test]
     fn single_expired_drv_or_healthy_pulls_do_not_mark() {
         let mut tracker = WedgeTracker::default();
@@ -530,7 +531,7 @@ mod tests {
     /// Evidence ages out of the 30-minute window: two expiries observed
     /// far apart never coexist inside one window, so the node is not
     /// marked; once both are inside the window it is.
-    // r[verify ctrl.nodeclaim.wedge-cluster+1]
+    // r[verify ctrl.nodeclaim.wedge-cluster+2]
     #[test]
     fn evidence_outside_the_window_does_not_count() {
         let mut tracker = WedgeTracker::default();
@@ -556,7 +557,7 @@ mod tests {
     }
 
     /// Attempts with an unknown deadline (0) are never evidence.
-    // r[verify ctrl.nodeclaim.wedge-cluster+1]
+    // r[verify ctrl.nodeclaim.wedge-cluster+2]
     #[test]
     fn unknown_deadline_is_not_evidence() {
         let mut tracker = WedgeTracker::default();

@@ -935,15 +935,18 @@ registration, draining, degraded, or connecting state left to report.
 `sched.admin.hung-node-detector`. The scheduler-side hung-node detector
 aggregated stale *heartbeats* per node (≥`max(2, ⌈0.5·occupancy⌉)` busy
 executors across ≥2 tenants, keyed by the controller-authoritative
-`AckSpawnedIntents.bound_intents` binding) and reported the result as
-`GetSpawnIntents.dead_nodes`. There are no heartbeats and no scheduler-side
-per-pod liveness state left to aggregate: the field is now always empty (it
-stays in the proto until the 1d sweep), and node-wedge detection moved to the
-controller --- #rref("ctrl.nodeclaim.wedge-cluster") clusters expired
-open attempts by their controller-authoritative source node, with the same
-two-tenant floor, the per-tick reap cap, and a fail-closed skip when the
-open-attempt view cannot be read. `nodeclaim_pool::reap_unhealthy` consumes
-that signal as `ReapReason::Dead` exactly as it consumed `dead_nodes`.
+`AckSpawnedIntents.bound_intents` binding) and reported the result as the
+removed `GetSpawnIntents.dead_nodes`. There are no heartbeats and no
+scheduler-side per-pod liveness state left to aggregate: the 1d sweep deleted
+the field outright (field 3 is reserved in the proto), and node-wedge
+detection moved to the controller ---
+#rref("ctrl.nodeclaim.wedge-cluster") clusters expired
+open attempts by their controller-authoritative source node, with a
+two-derivation floor (tenant-blind --- the successor drops the retired
+detector's tenant axis), the per-tick reap cap, and a fail-closed skip when
+the open-attempt view cannot be read. `nodeclaim_pool::reap_unhealthy`
+consumes that signal as `ReapReason::Dead` exactly as it consumed the
+removed `dead_nodes`.
 
 #r("sched.snapshot.binding-presence")[
   `AckSpawnedIntents.binding_snapshot` is presence-preserving: when the
@@ -2975,8 +2978,9 @@ project that row set (#rref("sched.admin.list-open-attempts"),
   `exec_id` without writing anything.
 ]
 The fence is transaction-side (the worker-side generation latch has no
-distribution channel without the stream); `WorkAssignment.generation` stays
-on the wire as observability only. The two-believer pull race (two open
+distribution channel without the stream); the payload carries no generation
+at all --- `WorkAssignment.generation` was removed outright, field 7
+reserved. The two-believer pull race (two open
 attempts, double charge for one pod death) is closed at the same place the
 work-binding authority lives.
 
@@ -3809,9 +3813,9 @@ generation from heartbeat replies and reject older `WorkAssignment`s, and the
 previously memo'd "optional future hardening" (a PG-side generation guard on
 the writes) is now the implemented mechanism for exactly the writes that bind
 work and consume outcomes --- the worker-side latch retired with the stream
-(its `WorkAssignment.generation` field stays on the wire as observability
-only), and what a worker could once latch is replaced by what the durable
-floor covers.
+(its `WorkAssignment.generation` field was removed with it; field 7 is
+reserved in the proto), and what a worker could once latch is replaced by
+what the durable floor covers.
 
 #r("sched.lease.generation-claim+2")[
   Before completing recovery and ungating dispatch, a newly-acquired leader
