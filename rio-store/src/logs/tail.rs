@@ -227,10 +227,14 @@ pub async fn read_chunk(
         Err(LogChunkError::NotFound { key }) => {
             // A missing object is data loss ONLY while its manifest row
             // still stands (the row is written after the PUT succeeds).
-            // The sweep deletes object-then-row, so a reader holding a
+            // The sweep deletes row-then-object (sweep.rs's "Ordering
+            // is load-bearing" paragraph — the authority; the inverse
+            // would leave rows pointing at deleted objects, which THIS
+            // path would misread as loss), so a reader holding a
             // manifest snapshot from before the sweep can observe
-            // object-gone/row-gone: a benign race, not a hole — the
-            // next manifest read no longer lists the chunk, and the
+            // object-gone with its snapshot row stale: a benign race,
+            // not a hole — the LIVE row is already gone, the next
+            // manifest read no longer lists the chunk, and the
             // completeness fold reflects whatever rows remain. Re-check
             // the row before declaring loss (merged_bug_164's
             // sweep-race leg).
@@ -332,8 +336,11 @@ pub async fn read_chunk(
     //   excess discarded — served, those lines would carry the NEXT
     //   chunk's line numbers (garbage attribution) and the advanced
     //   watermark would suppress that chunk's genuine lines. Disclosed
-    //   via the data-loss counter and a warn; the lines that ARE
-    //   claimed serve normally.
+    //   via the warn-severity DIVERGENCE counter
+    //   (`note_divergence("overlong")` in the LongObject arm below —
+    //   NOT the loss counter; merged_bug_164 rerouted it, and
+    //   `overlong_object_does_not_feed_loss_counter` pins that no
+    //   loss page fires). The lines that ARE claimed serve normally.
     // - A SHORT object (holds fewer lines than the row claims) is data
     //   loss with `NotFound` parity: the manifest promised lines that
     //   exist in no object. `Internal` naming the key, never a
