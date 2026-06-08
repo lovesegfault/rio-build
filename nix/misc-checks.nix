@@ -1663,6 +1663,11 @@ in
                 "tfvars"
                 "txt"
                 "tpl"
+                # bug_048: dashboard panel descriptions (.json) carry the
+                # same operator-facing prose drift surface as the yaml —
+                # the "lands in P0539d; No Data expected" class lived
+                # exactly here, invisible to every scan.
+                "json"
               ]
             ) ../infra)
             ../.github
@@ -1921,7 +1926,7 @@ in
         # tripped its own author three times exactly that way.
         # Self-allowlist: misc-checks.nix only (this file names the
         # tokens to deny them).
-        deny_concept='\bBuildExecution\b|\bCancelSignal\b|\bHeartbeatRequests?\b|\bHeartbeatResponses?\b|Heartbeat.{0,2}(RPC|unary)|\b[Rr]eady[- ]queues?\b|\bready_queue\b|terminationGracePeriodSeconds: 7200|blocks until its single in-flight build|Baked-in beats runtime envsubst|Forward-compat.*lands in P[0-9]|\(no series\).*never fires'
+        deny_concept='\bBuildExecution\b|\bCancelSignal\b|\bHeartbeatRequests?\b|\bHeartbeatResponses?\b|Heartbeat.{0,2}(RPC|unary)|\b[Rr]eady[- ]queues?\b|\bready_queue\b|terminationGracePeriodSeconds: 7200|blocks until its single in-flight build|Baked-in beats runtime envsubst|Forward-compat.*lands in P[0-9]|lands in P[0-9].*No Data|\(no series\).*never fires'
         # merged_bug_081: every escape token WORD-BOUND — the old
         # unanchored vocabulary legalized live narration via substrings
         # ("unremoved", "pre-pulling") and via unrelated matches in the
@@ -1960,7 +1965,10 @@ in
         # exempt (arm 3, word-bounding).
         mkdir -p "$TMPDIR/c1red" "$TMPDIR/c1green" "$TMPDIR/c1path/removed-docs" "$TMPDIR/c1cite" "$TMPDIR/c1substr"
         echo 'the scheduler routes work over the BuildExecution stream' > "$TMPDIR/c1red/doc.typ"
+        # bug_048 token: the panel-description deferral class.
+        echo 'metric lands in P0539d; shows No Data until then' > "$TMPDIR/c1red/panel.json"
         echo 'the removed BuildExecution stream routed work (stream-era)' > "$TMPDIR/c1green/doc.typ"
+        echo 'historical note: this text said it lands in P0539d; shows No Data — removed' > "$TMPDIR/c1green/panel.json"
         echo 'the scheduler routes work over the BuildExecution stream' > "$TMPDIR/c1path/removed-docs/doc.typ"
         echo 'the BuildExecution stream is checked by misc-checks.nix today' > "$TMPDIR/c1cite/doc.typ"
         echo 'an unremoved BuildExecution stream still routes work' > "$TMPDIR/c1substr/doc.typ"
