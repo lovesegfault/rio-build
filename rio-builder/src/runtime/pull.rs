@@ -729,15 +729,85 @@ async fn resolve_maybe_minted<T: PullTransport>(
     }
 }
 
+/// Every way `run_pull` ends, as data (merged_bug_011 keystone 1,
+/// builder half): the closed exit alphabet. A future "nothing held"
+/// answer arm cannot license exit 0 without adding a variant here and
+/// deciding its license in [`finish`] — the exhaustive match is the
+/// machine witness for "every exit path decided its exit code".
+#[derive(Debug)]
+enum ExitDisposition {
+    /// The scheduler answered `Gone`: nothing wanted, exit 0
+    /// charge-free. Sound because the scheduler durably fences every
+    /// keyed Gone BEFORE answering (`sched.executor.confirm-fence`) —
+    /// a straggler pull after this exit is screened, never minted.
+    GoneAnswered,
+    /// Only `NotYetReady` for the idle bound with a clean send
+    /// history: exit 0 charge-free (the OA6 bounded idle exit).
+    IdleClean,
+    /// Shutdown while waiting with a provably-unminted send history:
+    /// exit 0, zero further RPCs (the named fourth exit-0 case).
+    ShutdownClean,
+    /// A maybe-minted history was resolved clean by the confirm
+    /// protocol (nothing held, or the synthesized Cancelled report
+    /// was acked): exit 0.
+    ConfirmResolvedClean,
+    /// The build ran and its `CompletionReport` was acknowledged:
+    /// exit 0 — the scheduler committed the attempt row before
+    /// answering.
+    ReportAcked,
+    /// The exit-0 license could not be established (unresolved
+    /// confirm, unacked report, internal wiring failure): exit
+    /// nonzero so the Job goes Failed and the establishment sweep
+    /// reaps the open attempt against a Failed pod, never a lying
+    /// `Succeeded` one.
+    Unresolved(String),
+    /// The scheduler permanently rejected the pull
+    /// (identity/auth/unimplemented/invalid): exit nonzero promptly
+    /// instead of holding the node for the full
+    /// `activeDeadlineSeconds`.
+    Rejected(tonic::Status),
+}
+
+/// THE one exit chokepoint of [`run_pull`]: teardown, then the
+/// per-variant exit-code decision. House policy (machine-checked by
+/// the commit-body grep, re-assertable any time): zero `return
+/// Ok(())` / `bail!` in `run_pull` outside this function — every exit
+/// names its [`ExitDisposition`] variant.
+fn finish(rt: BuilderRuntime, disposition: ExitDisposition) -> anyhow::Result<()> {
+    run_teardown(rt);
+    match disposition {
+        // The five licensed clean exits — each variant's license
+        // rationale lives on the variant doc; a new variant lands
+        // RED here until this match decides it.
+        ExitDisposition::GoneAnswered
+        | ExitDisposition::IdleClean
+        | ExitDisposition::ShutdownClean
+        | ExitDisposition::ConfirmResolvedClean
+        | ExitDisposition::ReportAcked => Ok(()),
+        ExitDisposition::Unresolved(why) => Err(anyhow::anyhow!(why)),
+        ExitDisposition::Rejected(status) => Err(anyhow::anyhow!(
+            "PullAssignment permanently rejected ({:?}): {}",
+            status.code(),
+            status.message()
+        )),
+    }
+}
+
 /// The pull lifecycle: pull → build (existing machinery) → report →
-/// exit. The builder runtime's only delivery path.
+/// exit. The builder runtime's only delivery path; every exit routes
+/// through [`finish`].
 // r[impl builder.pull.exit-codes+1]
 // r[impl sched.executor.one-shot+2]
 pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !rt.intent_id.is_empty(),
-        "the pull runtime requires RIO_INTENT_ID (the controller injects it at Job spawn)"
-    );
+    if rt.intent_id.is_empty() {
+        return finish(
+            rt,
+            ExitDisposition::Unresolved(
+                "the pull runtime requires RIO_INTENT_ID (the controller injects it at Job spawn)"
+                    .into(),
+            ),
+        );
+    }
     let executor_token = rt.executor_token.clone();
     let mut transport = AuthedPullTransport {
         client: rt.scheduler_client.clone(),
@@ -755,8 +825,7 @@ pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
     let assignment = match outcome {
         PullPhaseOutcome::Gone => {
             info!(intent_id = %rt.intent_id, "derivation no longer wanted (Gone); exiting 0");
-            run_teardown(rt);
-            return Ok(());
+            return finish(rt, ExitDisposition::GoneAnswered);
         }
         PullPhaseOutcome::IdleExit {
             maybe_minted: false,
@@ -766,8 +835,7 @@ pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
                 idle_secs = rt.idle_timeout.as_secs(),
                 "only NotYetReady for the idle bound; exiting 0 (charge-free)"
             );
-            run_teardown(rt);
-            return Ok(());
+            return finish(rt, ExitDisposition::IdleClean);
         }
         PullPhaseOutcome::IdleExit { maybe_minted: true } => {
             // merged_bug_083: an exit-0 with unconfirmed sends in the
@@ -785,23 +853,25 @@ pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
                 ConfirmRegime::Idle,
             )
             .await;
-            run_teardown(rt);
-            if resolved {
-                return Ok(());
-            }
-            anyhow::bail!(
-                "idle-exit confirm could not resolve the maybe-minted state; exiting nonzero \
-                 so the establishment sweep reaps against a Failed pod"
+            return finish(
+                rt,
+                if resolved {
+                    ExitDisposition::ConfirmResolvedClean
+                } else {
+                    ExitDisposition::Unresolved(
+                        "idle-exit confirm could not resolve the maybe-minted state; exiting \
+                         nonzero so the establishment sweep reaps against a Failed pod"
+                            .into(),
+                    )
+                },
             );
         }
         PullPhaseOutcome::Shutdown {
             maybe_minted: false,
         } => {
-            // Provably nothing minted: the named fourth exit-0 case
-            // (builder.pull.exit-codes+1) — zero further RPCs.
+            // Provably nothing minted (builder.pull.exit-codes+1).
             info!(intent_id = %rt.intent_id, "shutdown while waiting for work; exiting 0");
-            run_teardown(rt);
-            return Ok(());
+            return finish(rt, ExitDisposition::ShutdownClean);
         }
         PullPhaseOutcome::Shutdown { maybe_minted: true } => {
             let resolved = resolve_maybe_minted(
@@ -812,12 +882,17 @@ pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
                 ConfirmRegime::Shutdown,
             )
             .await;
-            run_teardown(rt);
-            if resolved {
-                return Ok(());
-            }
-            anyhow::bail!(
-                "shutdown with a maybe-minted pull left unresolved; exiting nonzero so the Job goes Failed (the establishment sweep reaps the attempt)"
+            return finish(
+                rt,
+                if resolved {
+                    ExitDisposition::ConfirmResolvedClean
+                } else {
+                    ExitDisposition::Unresolved(
+                        "shutdown with a maybe-minted pull left unresolved; exiting nonzero so \
+                         the Job goes Failed (the establishment sweep reaps the attempt)"
+                            .into(),
+                    )
+                },
             );
         }
         PullPhaseOutcome::Rejected {
@@ -845,12 +920,7 @@ pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
                 .await;
                 info!(resolved, "rejected-exit maybe-minted resolution attempted");
             }
-            run_teardown(rt);
-            anyhow::bail!(
-                "PullAssignment permanently rejected ({:?}): {}",
-                status.code(),
-                status.message()
-            );
+            return finish(rt, ExitDisposition::Rejected(status));
         }
         PullPhaseOutcome::Assigned(a) => a,
     };
@@ -869,8 +939,14 @@ pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
     let drv_path = assignment.drv_path.clone();
     let Some(guard) = rt.slot.try_claim(&assignment.drv_path) else {
         // Unreachable in practice (one pull per process, fresh slot);
-        // fail loudly rather than build twice.
-        anyhow::bail!("build slot unexpectedly busy at first pull");
+        // fail loudly rather than build twice. (Routing through
+        // finish adds an orderly teardown this documented-unreachable
+        // arm previously skipped — disclosed micro-delta; the exit
+        // code is unchanged.)
+        return finish(
+            rt,
+            ExitDisposition::Unresolved("build slot unexpectedly busy at first pull".into()),
+        );
     };
     spawn_build_task(*assignment, guard, &rt.build_ctx).await;
 
@@ -882,7 +958,13 @@ pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
     let Some(completion) = completion else {
         // Cannot happen while build_ctx holds a sender; treat as a
         // builder bug and let the pod-terminal path classify it.
-        anyhow::bail!("completion channel closed before the build reported");
+        // (Same teardown micro-delta as the slot arm above.)
+        return finish(
+            rt,
+            ExitDisposition::Unresolved(
+                "completion channel closed before the build reported".into(),
+            ),
+        );
     };
 
     let acked = report_until_acked(
@@ -894,15 +976,19 @@ pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
     )
     .await;
     rt.ready.store(false, Ordering::Relaxed);
-    run_teardown(rt);
     if acked {
         info!(exec_id = %exec_id, "outcome reported and acknowledged; exiting 0");
-        Ok(())
+        finish(rt, ExitDisposition::ReportAcked)
     } else {
         // Nonzero exit → Job goes Failed → the controller's
         // pod-terminal path reports it; the scheduler's establishment
         // sweep is the final backstop.
-        anyhow::bail!("ReportOutcome was never acknowledged; exiting nonzero")
+        finish(
+            rt,
+            ExitDisposition::Unresolved(
+                "ReportOutcome was never acknowledged; exiting nonzero".into(),
+            ),
+        )
     }
 }
 
