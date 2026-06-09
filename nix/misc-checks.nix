@@ -1211,6 +1211,38 @@ in
         touch $out
       '';
 
+  # R13 fixture-provenance lint (bughunt-5 WO-S8-11): machine witnesses
+  # are minted through production constructors — test fixtures may NOT
+  # hand-roll wire/identity shapes the producing crate cannot emit.
+  # Four NARROW arms from the round-5 corpus (executor_id overrides,
+  # exposure-uid inputs, literal ObjectMeta uids, direct
+  # handle_completion calls); the closed `r13-allow(<lane>)` sanction
+  # grammar (refusal-probe | frozen-legacy | opaque-consumer) is the
+  # ONLY pressure valve — arms never weaken. Selftests (one planted
+  # red + green per arm, plus the UNSANCTIONED-lane red) run before
+  # the real scan may gate; the shared exact lexer's selftest gates
+  # first (token-accurate matching: comments cannot fire arms).
+  fixture-provenance =
+    pkgs.runCommand "rio-fixture-provenance"
+      {
+        src = pkgs.lib.fileset.toSource {
+          root = ../.;
+          fileset = pkgs.lib.fileset.unions [
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-controller/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-scheduler/src)
+          ];
+        };
+        nativeBuildInputs = [ pkgs.python3 ];
+        scanScript = ../nix/fixture_provenance.py;
+        sharedLexer = ../nix/rust_strip.py;
+      }
+      ''
+        cp "$sharedLexer" rust_strip.py
+        cp "$scanScript" fixture_provenance.py
+        python3 fixture_provenance.py "$src"
+        touch $out
+      '';
+
   transport-unary-ban =
     pkgs.runCommand "rio-transport-unary-ban"
       {

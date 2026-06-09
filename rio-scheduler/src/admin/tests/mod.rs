@@ -140,6 +140,10 @@ async fn append_interrupt_sample_idempotent_on_event_uid() {
         hw_class: "aws-8-nvme-hi".into(),
         kind: "exposure".into(),
         value: 60.0,
+        // The scheduler consumes event_uid as an opaque dedup key BY
+        // DESIGN (it cannot link the controller's typed constructor);
+        // this legacy fixture pins the opaque-key contract.
+        // r13-allow(opaque-consumer): opaque-key contract fixture
         event_uid: Some("exposure:aws-8-nvme-hi:1767225600".into()),
     };
     svc.append_interrupt_sample(Request::new(keyed.clone()))
