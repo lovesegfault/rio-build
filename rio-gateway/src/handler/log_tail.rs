@@ -373,6 +373,22 @@ impl PendingGapCell {
         self.0.as_ref().map(|p| p.gap_from)
     }
 
+    /// The pending hole's withheld-start (`gap_until`) — the
+    /// divergent-backfill discriminant (merged_bug_020): a fresh
+    /// sighting beginning below it carries lines that HEAL part of
+    /// the recorded hole.
+    fn pending_until(&self) -> Option<u64> {
+        self.0.as_ref().map(|p| p.gap_until)
+    }
+
+    /// Divergent-backfill consume (merged_bug_020): the taken pending
+    /// goes to [`reconcile_backfill`], whose contract relays every
+    /// withheld line or proves it a duplicate of relayed coverage —
+    /// the cell's no-destruction law holds through this path too.
+    fn take_for_backfill(&mut self) -> Option<PendingGap> {
+        self.0.take()
+    }
+
     fn classify(&self, gap_from: u64, gap_until: u64) -> Sighting {
         match &self.0 {
             None => Sighting::First,
@@ -850,15 +866,57 @@ async fn drive_stream(
                         } => {
                             match pending_gap.classify(gap_from, gap_until) {
                                 Sighting::Divergent => {
-                                    // The store's view changed across
-                                    // the re-open. The old withheld
-                                    // lines may be the only copy of
-                                    // their span anywhere: flush them
-                                    // (marker + lines), then re-visit
-                                    // this chunk against the advanced
-                                    // floor — the fresh split's true
-                                    // residual (possibly none) falls
-                                    // out of the re-examination.
+                                    // merged_bug_020: when the fresh
+                                    // sighting begins INSIDE the
+                                    // pending hole (partial backfill),
+                                    // it carries lines that HEAL part
+                                    // of the recorded span — flushing
+                                    // the old pending first would
+                                    // advance the floor past them and
+                                    // the re-visit would skip them.
+                                    // Reconcile BEFORE any floor
+                                    // advancement: residual marker,
+                                    // healing lines, trimmed withheld.
+                                    if let Some(pending_until) =
+                                        pending_gap.pending_until()
+                                        && first < pending_until
+                                    {
+                                        let pending = pending_gap
+                                            .take_for_backfill()
+                                            .expect("pending_until implies pending");
+                                        let fresh = slice_chunk(
+                                            chunk,
+                                            derivation_path,
+                                            yield_from,
+                                            yield_until,
+                                        );
+                                        if !reconcile_backfill(
+                                            pending,
+                                            fresh,
+                                            gap_from,
+                                            next_line,
+                                            out_tx,
+                                            last_relayed,
+                                            accepted_gap_floor,
+                                        )
+                                        .await
+                                        {
+                                            return DriveEnd::OutputClosed;
+                                        }
+                                        break;
+                                    }
+                                    // The fresh sighting begins at or
+                                    // past the withheld start: no
+                                    // healing lines exist below the
+                                    // flush's floor advance. The old
+                                    // withheld lines may be the only
+                                    // copy of their span anywhere:
+                                    // flush them (marker + lines),
+                                    // then re-visit this chunk against
+                                    // the advanced floor — the fresh
+                                    // split's true residual (possibly
+                                    // none) falls out of the
+                                    // re-examination.
                                     if !flush_pending_gap(
                                         pending_gap,
                                         out_tx,
@@ -1046,6 +1104,106 @@ async fn flush_pending_gap(
             return false;
         }
         *last_relayed = Some(advanced);
+    }
+    true
+}
+
+/// merged_bug_020: the divergent-backfill reconcile. The fresh
+/// divergent chunk begins INSIDE the pending hole
+/// (`fresh.first < pending.gap_until`): flushing the old pending
+/// FIRST would advance the floor past the healing lines, and the
+/// re-visit would skip them above it — fetched content silently
+/// destroyed by the disclosure choreography itself. Reconcile BEFORE
+/// any floor advancement, in line order:
+///
+/// 1. residual prefix marker `[gap_from, fresh.first)` — both store
+///    views agree the span is missing and the one-retry budget is
+///    spent;
+/// 2. the fresh healing slice (every line the store just served);
+/// 3. the withheld continuation trimmed of the fresh coverage — or,
+///    when the fresh stopped short of the withheld start, the second
+///    residual marker `[fresh_next, pending.gap_until)` and then the
+///    whole withheld.
+///
+/// Every fresh/withheld line is relayed exactly once or proven a
+/// duplicate of relayed coverage; destruction has no path (the
+/// PendingGapCell law, extended over this consume). Returns false iff
+/// the output channel closed.
+async fn reconcile_backfill(
+    pending: PendingGap,
+    fresh: TaggedLogChunk,
+    gap_from: u64,
+    fresh_next: u64,
+    out_tx: &mpsc::Sender<TaggedLogChunk>,
+    last_relayed: &mut Option<u64>,
+    accepted_gap_floor: &mut Option<u64>,
+) -> bool {
+    let fresh_first = fresh.first_line_number;
+    // 1. Residual prefix hole, if any survives the marker dedup.
+    if fresh_first > gap_from && accepted_gap_floor.is_none_or(|f| gap_from >= f) {
+        *accepted_gap_floor = Some(fresh_first);
+        let marker = gap_marker(gap_from, fresh_first);
+        if out_tx
+            .send(TaggedLogChunk {
+                derivation_path: fresh.derivation_path.clone(),
+                first_line_number: gap_from,
+                lines: vec![marker],
+            })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+    // 2. The healing lines themselves — BEFORE any floor advancement
+    // could hide them.
+    let derivation_path = fresh.derivation_path.clone();
+    if !fresh.lines.is_empty() {
+        if out_tx.send(fresh).await.is_err() {
+            return false;
+        }
+        *last_relayed = Some(fresh_next.saturating_sub(1));
+    }
+    if fresh_next >= pending.gap_until {
+        // 3a. The fresh serve covered the rest of the hole and
+        // possibly a withheld prefix: relay the non-duplicate suffix.
+        let skip = usize::try_from(fresh_next - pending.gap_until).unwrap_or(usize::MAX);
+        if skip < pending.withheld.lines.len() {
+            let suffix = TaggedLogChunk {
+                derivation_path,
+                first_line_number: fresh_next,
+                lines: pending.withheld.lines[skip..].to_vec(),
+            };
+            if out_tx.send(suffix).await.is_err() {
+                return false;
+            }
+            *last_relayed = Some(pending.next_line.saturating_sub(1));
+        }
+    } else {
+        // 3b. The fresh stopped short of the withheld start: a second
+        // residual hole remains. Disclose it, then flush the withheld
+        // whole — the retry budget for this hole is spent.
+        if accepted_gap_floor.is_none_or(|f| fresh_next >= f) {
+            *accepted_gap_floor = Some(pending.gap_until);
+            let marker = gap_marker(fresh_next, pending.gap_until);
+            if out_tx
+                .send(TaggedLogChunk {
+                    derivation_path,
+                    first_line_number: fresh_next,
+                    lines: vec![marker],
+                })
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
+        if !pending.withheld.lines.is_empty() {
+            if out_tx.send(pending.withheld).await.is_err() {
+                return false;
+            }
+            *last_relayed = Some(pending.next_line.saturating_sub(1));
+        }
     }
     true
 }
@@ -1907,6 +2065,109 @@ mod tests {
             rest.iter().any(|(n, _)| *n == 34),
             "the divergent chunk's residual still relays: {rest:?}"
         );
+        h.set.abort_all();
+    }
+
+    // r[verify store.log.tail-grace-drain+2]
+    /// RED (merged_bug_020): the divergent second sighting begins
+    /// INSIDE the pending hole (partial backfill — fresh@12 against
+    /// pending [10,20) with withheld [20,25)). Pre-fix, the Divergent
+    /// arm flushed the OLD pending FIRST (full-span marker 10-19,
+    /// floor advanced to 25) and only THEN re-visited the fresh chunk
+    /// — wholly below the advanced floor, so the healed lines 12-19
+    /// were silently skipped (`timed out after 7 of 15 lines`; the
+    /// marker also over-claimed a span the store had just served).
+    /// The reconcile now runs BEFORE any floor advancement: residual
+    /// marker 10-11, the healing lines 12-24, withheld proven
+    /// duplicate.
+    #[tokio::test]
+    async fn divergent_backfill_relays_healed_lines_before_floor_advance() {
+        let mut h = harness().await;
+        // Stream 1: prefix [0,10) then jump to [20,25) -> withhold.
+        h.mock
+            .push_script(vec![chunk(0, 10), chunk(20, 5)], SessionEnd::Close);
+        // Stream 2 (the one re-open chance): the store's view now
+        // starts INSIDE the old hole and covers through the withheld
+        // span: [12,25).
+        h.mock.push_script(vec![chunk(12, 13)], SessionEnd::Close);
+        h.set.on_started(DRV, EXEC_A);
+
+        let prefix = recv_lines(&mut h.out_rx, 10).await;
+        assert_eq!(prefix[9].0, 9, "prefix intact");
+
+        h.set.on_terminal(DRV);
+
+        // marker 10-11 + lines 12..25 = 14 entries.
+        let rest = recv_lines(&mut h.out_rx, 14).await;
+        assert_eq!(
+            rest[0],
+            (
+                10,
+                "*** rio: lines 10-11 missing (durable log gap) ***".to_string()
+            ),
+            "the marker covers only the residual prefix, not healed content: {rest:?}"
+        );
+        assert!(
+            rest.iter().any(|(n, _)| *n == 12),
+            "the healing lines inside the old hole must relay: {rest:?}"
+        );
+        assert!(
+            rest.iter().any(|(n, _)| *n == 24),
+            "the tail relays once (withheld proven duplicate): {rest:?}"
+        );
+        let line_12_count = rest.iter().filter(|(n, _)| *n == 12).count();
+        let line_20_count = rest.iter().filter(|(n, _)| *n == 20).count();
+        assert_eq!(line_12_count, 1, "no double relay: {rest:?}");
+        assert_eq!(
+            line_20_count, 1,
+            "withheld overlap trimmed, not re-sent: {rest:?}"
+        );
+        h.set.abort_all();
+    }
+
+    // r[verify store.log.tail-grace-drain+2]
+    /// merged_bug_020 short-backfill leg: the fresh divergent chunk
+    /// heals only [12,16) of the pending [10,20) — it stops SHORT of
+    /// the withheld start. Order owed: residual marker 10-11, healing
+    /// lines 12-15, second residual marker 16-19, withheld 20-24.
+    /// Every fetched line relays; both residual holes get exactly one
+    /// marker each.
+    #[tokio::test]
+    async fn divergent_short_backfill_marks_both_residual_holes() {
+        let mut h = harness().await;
+        h.mock
+            .push_script(vec![chunk(0, 10), chunk(20, 5)], SessionEnd::Close);
+        // Fresh covers [12,16): inside the hole, short of the withheld.
+        h.mock.push_script(vec![chunk(12, 4)], SessionEnd::Close);
+        h.set.on_started(DRV, EXEC_A);
+
+        let prefix = recv_lines(&mut h.out_rx, 10).await;
+        assert_eq!(prefix[9].0, 9, "prefix intact");
+
+        h.set.on_terminal(DRV);
+
+        // marker + 4 lines + marker + 5 lines = 11 entries.
+        let rest = recv_lines(&mut h.out_rx, 11).await;
+        assert_eq!(
+            rest[0],
+            (
+                10,
+                "*** rio: lines 10-11 missing (durable log gap) ***".to_string()
+            ),
+            "first residual marker: {rest:?}"
+        );
+        assert_eq!(rest[1].0, 12, "healing lines follow: {rest:?}");
+        assert_eq!(rest[4].0, 15);
+        assert_eq!(
+            rest[5],
+            (
+                16,
+                "*** rio: lines 16-19 missing (durable log gap) ***".to_string()
+            ),
+            "second residual marker between fresh end and withheld: {rest:?}"
+        );
+        assert_eq!(rest[6].0, 20, "withheld flushes after its marker: {rest:?}");
+        assert_eq!(rest[10].0, 24);
         h.set.abort_all();
     }
 
