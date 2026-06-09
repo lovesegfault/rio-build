@@ -110,7 +110,18 @@ pub fn run(args: FuzzArgs) -> Result<()> {
     };
 
     let sh = shell()?;
-    sh.change_dir(repo_root().join(&picked.dir));
+    let dir = repo_root().join(&picked.dir);
+    sh.change_dir(&dir);
     let (name, extra) = (&picked.name, &args.extra);
-    crate::sh::run_interactive(cmd!(sh, "cargo fuzz run {name} {extra...}"))
+    // --fuzz-dir: cargo-fuzz locates the fuzz project by walking up
+    // from cwd to the first manifest WITHOUT `package.metadata`
+    // `cargo-fuzz = true` and expecting `fuzz/Cargo.toml` under it.
+    // The top-level fuzz/<crate>/ workspaces have no parent package
+    // between them and the virtual workspace root, so that walk lands
+    // on the repo root and dies on the nonexistent <root>/fuzz/
+    // Cargo.toml. Anchor the fuzz dir explicitly instead.
+    crate::sh::run_interactive(cmd!(
+        sh,
+        "cargo fuzz run --fuzz-dir {dir} {name} {extra...}"
+    ))
 }

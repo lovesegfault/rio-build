@@ -59,7 +59,52 @@ let
     # Cargo tools
     cargo-edit
     cargo-expand
-    cargo-fuzz # works in default (nightly) shell; errors on stable
+    # cargo-fuzz, wrapped — works in default (nightly) shell; errors on
+    # stable. Stock discovery walks up from $PWD to the first manifest
+    # WITHOUT `package.metadata.cargo-fuzz = true` and expects
+    # `fuzz/Cargo.toml` under THAT dir. The per-crate fuzz workspaces
+    # (fuzz/<crate>/) have no parent package between them and the
+    # virtual workspace root, so the walk lands on the repo root and
+    # dies on the nonexistent <root>/fuzz/Cargo.toml. When the nearest
+    # ancestor manifest IS a cargo-fuzz manifest, anchor the invocation
+    # there via --fuzz-dir so the documented `cd fuzz/<crate> && cargo
+    # fuzz run <target>` flow works. Everything else (explicit
+    # --fuzz-dir, standard crate/fuzz layouts, init/help) passes
+    # through untouched.
+    (writeShellScriptBin "cargo-fuzz" ''
+      set -euo pipefail
+      real=${pkgs.cargo-fuzz}/bin/cargo-fuzz
+      for arg in "$@"; do
+        case "$arg" in
+          --fuzz-dir | --fuzz-dir=*) exec "$real" "$@" ;;
+        esac
+      done
+      dir=$PWD
+      fuzz_dir=
+      while :; do
+        if [ -f "$dir/Cargo.toml" ]; then
+          if grep -Eqs '^[[:space:]]*cargo-fuzz[[:space:]]*=[[:space:]]*true' "$dir/Cargo.toml"; then
+            fuzz_dir=$dir
+          fi
+          break
+        fi
+        [ "$dir" = / ] && break
+        dir=$(dirname "$dir")
+      done
+      if [ -n "$fuzz_dir" ] && [ "''${1-}" = fuzz ] && [ "$#" -ge 2 ]; then
+        sub=$2
+        shift 2
+        case "$sub" in
+          add | build | check | cmin | coverage | fmt | list | run | tmin)
+            exec "$real" fuzz "$sub" --fuzz-dir "$fuzz_dir" "$@"
+            ;;
+          *)
+            exec "$real" fuzz "$sub" "$@"
+            ;;
+        esac
+      fi
+      exec "$real" "$@"
+    '')
     cargo-hakari # workspace-hack regen — `cargo xtask regen hakari`
     cargo-mutants # dev-only mutation testing — see `cargo xtask mutants` / `.#mutants`
     cargo-nextest
