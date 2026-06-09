@@ -203,6 +203,7 @@ prost-types = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-stream = { workspace = true, features = ["net"] }
 aws-smithy-mocks = { workspace = true }
+aws-smithy-runtime-api = { workspace = true }
 aws-sdk-s3 = { workspace = true, features = ["test-util"] }
 proptest = { workspace = true }
 # substitute.rs tests spin an in-process axum server as a fake upstream

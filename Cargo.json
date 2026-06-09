@@ -20997,6 +20997,10 @@
           "packageId": "aws-smithy-mocks"
         },
         {
+          "name": "aws-smithy-runtime-api",
+          "packageId": "aws-smithy-runtime-api"
+        },
+        {
           "name": "axum",
           "packageId": "axum"
         },

@@ -101,6 +101,75 @@ pub const fn admin_verify_worst_emission_gap() -> Duration {
     Duration::from_secs(ADMIN_VERIFY_WORST_WAVE.as_secs() * waves as u64)
 }
 
+/// A liveness wave budget — the `BoundedOp` half of the cadence
+/// contract (bug_108). Mintable ONLY from the liveness consts (the
+/// constructors below are the sole public mints), so the cadence
+/// claim's const and its runtime enforcement site are one value: an
+/// I/O wave that ignores the budget has no bare future left to await
+/// at a conforming call site, and a budget minted from an unrelated
+/// literal cannot typecheck as `WaveBudget`.
+///
+/// `ADMIN_VERIFY_WORST_WAVE` was previously an UNENFORCED engineering
+/// estimate consumed only by const arithmetic
+/// ([`admin_verify_worst_emission_gap`]): with no `TimeoutConfig` on
+/// the shared S3 client (see `rio_common::s3::default_client`'s doc),
+/// an established-then-black-holed connection awaited response
+/// headers forever, the never-completing FIRST attempt defeated the
+/// SDK retry layer, and one dead HEAD false-failed a healthy audit at
+/// the client's 120 s inactivity bound with no resume cursor. The
+/// combinator upgrades the const from estimate to enforced bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaveBudget(Duration);
+
+/// The admin-verify wave budget: one `ADMIN_VERIFY_HEAD_CONCURRENCY`-
+/// wide `HeadObject` wave must complete inside
+/// [`ADMIN_VERIFY_WORST_WAVE`] — the same const the emission-gap
+/// arithmetic above already prices.
+#[must_use]
+pub const fn admin_verify_wave_budget() -> WaveBudget {
+    WaveBudget(ADMIN_VERIFY_WORST_WAVE)
+}
+
+/// Typed elapse of a [`WaveBudget`]-bounded operation. Carries the
+/// budget so callers (and tests) can assert WHICH liveness const was
+/// enforced; flows through `anyhow` into the existing admin
+/// classification (the non-auth arm → `Status::unavailable`).
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "operation exceeded its liveness wave budget ({budget:?}) — the peer is \
+     presumed black-holed (established but silent); see \
+     rio_common::liveness::WaveBudget"
+)]
+pub struct WaveBudgetExceeded {
+    /// The enforced budget (the liveness const the mint wrapped).
+    pub budget: Duration,
+}
+
+impl WaveBudget {
+    /// The bounded-op combinator: run `fut` under this budget, mapping
+    /// elapse to the typed [`WaveBudgetExceeded`]. The future is
+    /// dropped on elapse (in-flight SDK attempts are cancelled).
+    ///
+    /// # Errors
+    /// [`WaveBudgetExceeded`] when `fut` does not complete inside the
+    /// budget.
+    pub async fn run<T>(
+        self,
+        fut: impl std::future::Future<Output = T>,
+    ) -> Result<T, WaveBudgetExceeded> {
+        tokio::time::timeout(self.0, fut)
+            .await
+            .map_err(|_| WaveBudgetExceeded { budget: self.0 })
+    }
+
+    /// The wrapped duration (for logs/assertions; the mint sites are
+    /// the liveness constructors only).
+    #[must_use]
+    pub const fn duration(self) -> Duration {
+        self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,7 +215,12 @@ mod tests {
     /// breaks the relation — a bigger emission sub-batch, a smaller
     /// client bound, a slower assumed wave — fails the workspace
     /// suite rather than shipping a contract the two crates no
-    /// longer agree on.
+    /// longer agree on. The arithmetic is still true AND now
+    /// enforced: `ADMIN_VERIFY_WORST_WAVE` is no longer an estimate —
+    /// the store's exists_batch runs every HeadObject wave under
+    /// [`WaveBudget::run`] (bug_108), and the paused-clock behavioral
+    /// test there (`black_holed_head_fails_typed_within_the_wave_budget`)
+    /// is the wiring witness this const-math test cannot be.
     #[test]
     fn verify_emission_gap_is_inside_the_client_bound() {
         let gap = admin_verify_worst_emission_gap();

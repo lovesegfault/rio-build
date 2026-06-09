@@ -379,6 +379,11 @@ rstest = { version = "0.26", default-features = false }
 tempfile = "3"
 tracing-test = "0.2"
 aws-smithy-mocks = "0.2"
+# Dev-only (rio-store bug_108 wave-budget test): implement a black-holed
+# HttpClient — an established-then-silent connection — to prove the typed
+# WaveBudget elapse. The trait + connector types live here; aws-sdk-s3
+# re-exports only HttpClient/SharedHttpClient.
+aws-smithy-runtime-api = { version = "1", features = ["client", "http-1x"] }
 # Dev-only across the workspace: Router::oneshot (ServiceExt) for axum
 # handler tests + rio-test-support's in-proc duplex transport. tonic/kube
 # pull tower transitively for prod, but no rio-* crate depends on it

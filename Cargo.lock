@@ -6530,6 +6530,7 @@ dependencies = [
  "async-trait",
  "aws-sdk-s3",
  "aws-smithy-mocks",
+ "aws-smithy-runtime-api",
  "axum",
  "base64 0.22.1",
  "blake3",

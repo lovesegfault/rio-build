@@ -45,6 +45,19 @@ pub const DEFAULT_S3_MAX_ATTEMPTS: u32 = 10;
 ///    `DispatchFailure`. We have no untrusted-server streaming here
 ///    (chunks are tiny, pre-buffered; logs are pre-compressed), so
 ///    the protection is pure downside.
+///
+/// 3. NO `TimeoutConfig` — per-operation deadlines are the CALLER's
+///    explicit duty (bug_108). The SDK default is connect-timeout
+///    only: an established-then-black-holed connection awaits
+///    response headers forever, and the never-completing FIRST
+///    attempt defeats the retry layer above. Every caller with a
+///    liveness law therefore brings its OWN typed bound — the
+///    `rio_common::liveness::WaveBudget` combinator is the standing
+///    vehicle (exists_batch's HeadObject waves are the exemplar). A
+///    client-wide `operation_attempt_timeout` needs an op-size census
+///    across every caller (chunk puts, log batches, GetObject) under
+///    load before it can be sized — recorded as open question Q-108,
+///    deliberately NOT set here.
 pub async fn default_client(max_attempts: u32) -> aws_sdk_s3::Client {
     let cfg = aws_config::from_env()
         .retry_config(RetryConfig::standard().with_max_attempts(max_attempts))

@@ -566,6 +566,15 @@ impl ChunkBackend for S3ChunkBackend {
         // inactivity bound. Widening or narrowing the fan-out here
         // re-derives the contract automatically.
         const CONCURRENCY: usize = rio_common::liveness::ADMIN_VERIFY_HEAD_CONCURRENCY;
+        // bug_108: EVERY wave runs under the typed liveness budget —
+        // the same ADMIN_VERIFY_WORST_WAVE const the emission-gap
+        // arithmetic prices, now enforced at the await. A black-holed
+        // connection (established, then silent; the shared client has
+        // no TimeoutConfig, see rio_common::s3::default_client) elapses
+        // into the typed WaveBudgetExceeded, which flows through the
+        // admin classification into Status::unavailable, instead of
+        // hanging the audit past the CLI's 120 s inactivity bound.
+        let budget = rio_common::liveness::admin_verify_wave_budget();
         let mut results = Vec::with_capacity(hashes.len());
 
         for batch in hashes.chunks(CONCURRENCY) {
@@ -603,7 +612,9 @@ impl ChunkBackend for S3ChunkBackend {
             // we collect all results then propagate via the final collect().
             // This means a batch with one failing chunk still waits for the
             // other 15; slightly wasteful but simpler than early-abort.
-            for r in futures_util::future::join_all(futs).await {
+            // The whole wave is bounded by the liveness budget: there
+            // is no bare join_all left to call (bug_108).
+            for r in budget.run(futures_util::future::join_all(futs)).await? {
                 results.push(r?);
             }
         }
@@ -1071,5 +1082,71 @@ mod tests {
         let result = backend.exists_batch(&[HASH_A, HASH_B, HASH_C]).await?;
         assert_eq!(result, vec![true, false, true]);
         Ok(())
+    }
+
+    /// bug_108 red: a black-holed connection — established, then
+    /// silent forever — must fail TYPED within the liveness wave
+    /// budget, not hang past the client's 120 s inactivity bound.
+    /// The client is the production constructor over a test connector
+    /// (production wire shapes, no hand-rolled backend stub): a
+    /// custom HttpClient whose connector future never resolves is
+    /// exactly the established-then-black-holed peer, and with no
+    /// TimeoutConfig the SDK's never-completing FIRST attempt defeats
+    /// its own retry layer.
+    #[tokio::test(start_paused = true)]
+    async fn black_holed_head_fails_typed_within_the_wave_budget() {
+        use aws_smithy_runtime_api::client::http::{
+            HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings,
+            SharedHttpConnector,
+        };
+        use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
+        use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
+
+        #[derive(Debug, Clone)]
+        struct BlackHole;
+        impl HttpConnector for BlackHole {
+            fn call(&self, _request: HttpRequest) -> HttpConnectorFuture {
+                HttpConnectorFuture::new(std::future::pending())
+            }
+        }
+        impl HttpClient for BlackHole {
+            fn http_connector(
+                &self,
+                _settings: &HttpConnectorSettings,
+                _components: &RuntimeComponents,
+            ) -> SharedHttpConnector {
+                SharedHttpConnector::new(self.clone())
+            }
+        }
+
+        let cfg = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::for_tests())
+            .http_client(BlackHole)
+            .build();
+        let backend = make_s3_backend(Client::from_conf(cfg));
+
+        let budget = rio_common::liveness::admin_verify_wave_budget();
+        let outer = budget.duration() * 2;
+        match tokio::time::timeout(outer, backend.exists_batch(&[HASH_A])).await {
+            Err(_elapsed) => panic!(
+                "exists_batch hung past 2x the wave budget against a black-holed \
+                 connection — the liveness const is unenforced (no BoundedOp wiring)"
+            ),
+            Ok(Ok(_)) => panic!("a black-holed HEAD cannot succeed"),
+            Ok(Err(e)) => {
+                // The wiring assertion: the typed elapse carries the
+                // const budget the mint wrapped.
+                let exceeded = e
+                    .downcast_ref::<rio_common::liveness::WaveBudgetExceeded>()
+                    .unwrap_or_else(|| panic!("expected the typed WaveBudgetExceeded, got: {e:#}"));
+                assert_eq!(
+                    exceeded.budget,
+                    rio_common::liveness::ADMIN_VERIFY_WORST_WAVE,
+                    "the elapse must carry the liveness const it enforced"
+                );
+            }
+        }
     }
 }
