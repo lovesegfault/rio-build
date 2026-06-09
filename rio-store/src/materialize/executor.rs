@@ -22,7 +22,7 @@ use rio_evidence_kernel::outcome::{
 };
 use rio_proto::types::{MaterializationOutcome, materialization_outcome};
 
-use crate::substitute::{SubstituteError, Substituter};
+use crate::substitute::Substituter;
 use crate::visibility::{TenantVisible, TrustedSetCache, visible_to_tenant};
 
 use super::client::ClaimedJob;

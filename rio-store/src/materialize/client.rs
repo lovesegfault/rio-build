@@ -214,14 +214,14 @@ pub const REBOUND_ORIGIN: &str = "resume_rebound";
 ///
 /// Entries leave on every AUTHORITATIVE answer (Assignment — we hold
 /// the job; Gone — resolved/absent; Rejected — answered permanent
-/// refusal, no mint behind it) and on capacity eviction (oldest
-/// first). `NotYetReady` KEEPS the entry on BOTH passes
+/// refusal, no mint behind it); capacity REFUSES new mints instead
+/// of evicting (merged_bug_072). `NotYetReady` KEEPS the entry on BOTH passes
 /// (merged_bug_096): the job may be parked, raced to another replica
 /// (their resolution answers Gone later), seen through a mid-recovery
 /// stale view — or OUR OWN committed mint answered through the
 /// scheduler's post-mint TOCTOU arm, which says NotYetReady after
 /// persisting this worker's nonce. The retry costs one bounded RPC
-/// per pass. An evicted or
+/// per pass. A
 /// process-lost entry settles through the charged establishment
 /// window — the SIGNED residual (rule-4b): real crashes still pay,
 /// lost responses no longer do.
@@ -242,9 +242,10 @@ struct ResumeEntry {
     nonce: Uuid,
 }
 
-/// Ledger capacity. Eviction is loud and settles via the
-/// establishment window; 32 unanswered claims on ONE worker already
-/// signals a scheduler-side outage the establishment sweep owns.
+/// Ledger capacity. At cap the mint authority REFUSES fresh mints
+/// (merged_bug_072 — live credentials are never evicted); 32
+/// unanswered claims on ONE worker already signals a scheduler-side
+/// outage the establishment sweep owns.
 const RESUME_LEDGER_CAP: usize = 32;
 
 impl ResumeLedger {
@@ -257,12 +258,12 @@ impl ResumeLedger {
     #[cfg(test)]
     fn note_pull(&mut self, entry: ResumeEntry) {
         self.entries.retain(|e| e.job_id != entry.job_id);
-        if self.entries.len() >= RESUME_LEDGER_CAP
-            && let Some(evicted) = self.entries.pop_front()
-        {
-            warn!(drv_hash = %evicted.drv_hash, job_id = %evicted.job_id,
-                  "resume ledger full; evicted entry settles via the establishment window");
-        }
+        // merged_bug_072: eviction is gone from the production API;
+        // test seeding stays within capacity by construction.
+        assert!(
+            self.entries.len() < RESUME_LEDGER_CAP,
+            "test seeded past RESUME_LEDGER_CAP"
+        );
         self.entries.push_back(entry);
     }
 
@@ -287,13 +288,21 @@ impl ResumeLedger {
         if self.entries.iter().any(|e| e.job_id == job_id) {
             return None;
         }
-        let nonce = Uuid::new_v4();
-        if self.entries.len() >= RESUME_LEDGER_CAP
-            && let Some(evicted) = self.entries.pop_front()
-        {
-            warn!(drv_hash = %evicted.drv_hash, job_id = %evicted.job_id,
-                  "resume ledger full; evicted entry settles via the establishment window");
+        // merged_bug_072: at capacity the mint authority REFUSES —
+        // every live entry is a possibly-committed rule-4b credential
+        // (the only proof of a server-side mint bound to this
+        // worker); evicting one to fund a NEW speculative mint
+        // forfeited a possibly-committed attempt to the charged
+        // establishment window. 32 unanswered claims on one worker
+        // already signals a scheduler-side outage the establishment
+        // sweep owns.
+        if self.entries.len() >= RESUME_LEDGER_CAP {
+            warn!(job_id = %job_id,
+                  "resume ledger at capacity; fresh mint refused (live \
+                   credentials are never evicted)");
+            return None;
         }
+        let nonce = Uuid::new_v4();
         self.entries.push_back(fill(nonce));
         Some(MintedClaim { nonce })
     }
@@ -610,11 +619,25 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
     // Pre-fix, a mailbox brownout let a 1-slot worker mint a nonce per
     // listed descriptor (16+ open attempts the resume lane drains at
     // one per pass).
-    let mut outstanding_mints = 0usize;
+    // merged_bug_072: the budget is DERIVED from the ledger
+    // population — entries are created at mint and leave on every
+    // authoritative answer, so `ledger.len()` IS the outstanding-mint
+    // count, across passes as well as within one. The pre-fix
+    // per-pass counter reset to 0 each pass, making prior-pass
+    // Unanswered entries invisible: a list-ok/pull-lost brownout
+    // minted one fresh nonce per pass up to RESUME_LEDGER_CAP (32x a
+    // 1-slot worker), each eviction then forfeiting a live rule-4b
+    // credential. No parallel counter exists to desync (banner a).
     for descriptor in listed {
         // The claim budget: delivered claims plus unanswered potential
-        // mints.
-        if claimed.len() + outstanding_mints >= available_slots {
+        // mints (the surviving ledger population).
+        if claimed.len() + ledger.len() >= available_slots {
+            debug!(
+                claimed = claimed.len(),
+                outstanding = ledger.len(),
+                slots = available_slots,
+                "claim budget consumed by outstanding mints; fresh pass ends"
+            );
             break;
         }
         // bug_233 (parse-don't-validate): refuse the claim BEFORE the
@@ -654,7 +677,6 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
         }) else {
             continue;
         };
-        outstanding_mints += 1;
         let req = PullAssignmentRequest {
             // No executor token: the store's credential is the
             // service token in metadata (the kind-attested credential).
@@ -681,7 +703,6 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             // caller can abort/report those attempts under the grace.
             PullAnswer::Shutdown => return claimed,
             PullAnswer::Deliver(assignment) => {
-                outstanding_mints -= 1;
                 ledger.resolve(job_id);
                 // merged_bug_026 (fresh-claim sibling site): the same
                 // Pending-arm race exists between list and claim — the
@@ -701,10 +722,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             // the credential: Gone (job settled without us) and
             // Rejected (bug_119 — answered permanent refusal; the
             // gates run before any mint).
-            PullAnswer::Gone | PullAnswer::Rejected => {
-                outstanding_mints -= 1;
-                ledger.resolve(job_id)
-            }
+            PullAnswer::Gone | PullAnswer::Rejected => ledger.resolve(job_id),
             // merged_bug_096: NotYetReady is NOT proof of no-mint —
             // the scheduler's post-mint TOCTOU arm answers it AFTER
             // the durable mint committed with this nonce. The
@@ -713,9 +731,12 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             // PASS budget refunds — the possibly-minted attempt is
             // ledger-tracked now, and starving the walk behind a
             // raced head would undo bug_385's in-pass skip.
-            PullAnswer::NotYetReady => {
-                outstanding_mints -= 1;
-            }
+            // merged_bug_072: the credential survives in the ledger
+            // and therefore KEEPS consuming budget — the possibly-
+            // minted attempt holds a slot until answered (the
+            // pre-fix per-pass refund let the next pass mint over
+            // it).
+            PullAnswer::NotYetReady => {}
             // The answer never arrived: the entry STAYS — the next
             // pass resumes it directly with the nonce.
             PullAnswer::Unanswered => {}
@@ -1243,6 +1264,90 @@ mod tests {
         ) -> Result<(), tonic::Status> {
             Ok(())
         }
+    }
+
+    /// merged_bug_072 RED 1: the fresh-claim budget must derive from
+    /// the LEDGER population (outstanding = unanswered nonces), not a
+    /// per-pass counter that resets — in a list-ok/pull-lost brownout
+    /// a 1-slot worker must NOT mint a fresh nonce per pass.
+    #[tokio::test(start_paused = true)]
+    async fn brownout_mints_at_most_slot_budget_across_passes() {
+        let job_a = descriptor(1);
+        let job_b = descriptor(2);
+        let mut t = MockTransport::new(
+            vec![
+                Ok(ListMaterializationJobsResponse {
+                    jobs: vec![job_a.clone()],
+                }),
+                Ok(ListMaterializationJobsResponse {
+                    jobs: vec![job_b.clone()],
+                }),
+            ],
+            vec![],
+            vec![],
+        );
+        t.hang_next_pulls = 99;
+        let mut ledger = ResumeLedger::default();
+        let mut latch = ListFailureLatch::default();
+        let tok = token();
+        let inst = instance("brownout-w");
+        // Pass 1: fresh mint for A rides the wire; the answer is lost.
+        let c1 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &tok).await;
+        assert!(c1.is_empty());
+        assert_eq!(ledger.len(), 1, "pass 1 minted A (unanswered)");
+        // Pass 2: A's unanswered mint still consumes the only slot —
+        // the fresh pass must not mint B (pre-fix: outstanding_mints
+        // reset to 0 each pass, so every pass minted one more nonce,
+        // accumulating to RESUME_LEDGER_CAP = 32x capacity).
+        let c2 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &tok).await;
+        assert!(c2.is_empty());
+        assert_eq!(
+            ledger.len(),
+            1,
+            "the 1-slot budget is consumed by A's outstanding mint; B \
+             must not be minted"
+        );
+    }
+
+    /// merged_bug_072 RED 2: at capacity, begin_fresh_claim REFUSES
+    /// (returns None) — it must never evict the OLDEST live rule-4b
+    /// credential to fund a new speculative mint.
+    #[test]
+    fn fresh_claim_refuses_at_cap_never_evicts() {
+        let mut ledger = ResumeLedger::default();
+        let first_job = Uuid::now_v7();
+        let fill = |job: Uuid| {
+            move |nonce: Uuid| ResumeEntry {
+                job_id: job,
+                drv_hash: format!("drv-{job}"),
+                tenant_hint: None,
+                origin: "cache_opportunity".into(),
+                nonce,
+            }
+        };
+        assert!(
+            ledger
+                .begin_fresh_claim(first_job, fill(first_job))
+                .is_some()
+        );
+        for _ in 1..RESUME_LEDGER_CAP {
+            let j = Uuid::now_v7();
+            assert!(ledger.begin_fresh_claim(j, fill(j)).is_some());
+        }
+        assert_eq!(ledger.len(), RESUME_LEDGER_CAP);
+        // The 33rd mint: REFUSE, never evict.
+        let extra = Uuid::now_v7();
+        let got = ledger.begin_fresh_claim(extra, fill(extra));
+        assert!(
+            got.is_none(),
+            "at cap the mint authority must refuse (got a minted claim — \
+             pre-fix this evicted the oldest live credential)"
+        );
+        assert_eq!(ledger.len(), RESUME_LEDGER_CAP);
+        assert!(
+            ledger.snapshot().iter().any(|e| e.job_id == first_job),
+            "the oldest credential must survive the refused mint"
+        );
     }
 
     fn token() -> rio_common::signal::Token {
@@ -2649,9 +2754,13 @@ mod tests {
         .await;
         assert!(ledger.is_empty(), "Gone is authoritative");
 
-        // Capacity: the 33rd entry evicts the oldest.
+        // Capacity (merged_bug_072 re-aim): the mint authority
+        // REFUSES at cap — eviction is gone (a live entry is a
+        // possibly-committed rule-4b credential; the dedicated
+        // fresh_claim_refuses_at_cap_never_evicts test pins the
+        // refusal + oldest-survives properties).
         let mut full = ResumeLedger::default();
-        for i in 0..(RESUME_LEDGER_CAP + 1) {
+        for i in 0..RESUME_LEDGER_CAP {
             full.note_pull(ResumeEntry {
                 job_id: Uuid::now_v7(),
                 drv_hash: format!("drv-cap-{i}"),
@@ -2660,6 +2769,19 @@ mod tests {
                 nonce: Uuid::new_v4(),
             });
         }
+        assert_eq!(full.len(), RESUME_LEDGER_CAP);
+        let extra = Uuid::now_v7();
+        assert!(
+            full.begin_fresh_claim(extra, |nonce| ResumeEntry {
+                job_id: extra,
+                drv_hash: "drv-cap-extra".into(),
+                tenant_hint: None,
+                origin: "cache_opportunity".into(),
+                nonce,
+            })
+            .is_none(),
+            "at cap the mint authority refuses"
+        );
         assert_eq!(full.len(), RESUME_LEDGER_CAP);
     }
 
