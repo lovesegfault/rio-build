@@ -925,18 +925,27 @@ impl DagActor {
             let mut wedge_first_strikes: Vec<crate::state::DrvHash> = Vec::new();
             let mut wedge_cleared_strikes: Vec<crate::state::DrvHash> = Vec::new();
             for (drv_hash, entry) in self.materialization_jobs.iter() {
-                match entry.holder() {
-                    Some(holder) => {
+                // merged_bug_014: the sweep matches the EPISODE — each
+                // strike is readable only in the arm that can act on
+                // it, and a strike observed in a prior episode is
+                // unrepresentable (every claim mutator replaces the
+                // episode wholesale), so the two-strike repairs below
+                // fire only on two FRESH consecutive observations.
+                match entry.episode() {
+                    crate::actor::materialize::ClaimEpisode::Held {
+                        holder,
+                        unbacked_strike,
+                    } => {
                         // bug_184: backed = an open attempt by THIS
                         // holder. A foreign executor's open attempt
                         // neither masks the ghost nor clears the
                         // strike.
                         if view.backs_claim(drv_hash.as_str(), holder.as_str()) {
                             // Backed claim: reset any stale strike.
-                            if entry.strike_armed() {
+                            if *unbacked_strike {
                                 cleared_strikes.push(drv_hash.clone());
                             }
-                        } else if entry.strike_armed() {
+                        } else if *unbacked_strike {
                             // Second consecutive unbacked observation:
                             // the claimed-no-attempt ghost.
                             ghosts.push((drv_hash.clone(), holder.clone()));
@@ -944,7 +953,7 @@ impl DagActor {
                             first_strikes.push(drv_hash.clone());
                         }
                     }
-                    None => {
+                    crate::actor::materialize::ClaimEpisode::Unclaimed { wedge_strike } => {
                         // merged_bug_108: a Pending job under an open
                         // BUILD attempt is documented-legitimate
                         // coexistence (bug_266) — the wedge requires
@@ -980,11 +989,11 @@ impl DagActor {
                             .is_some_and(|s| matches!(s.status(), Assigned | Running))
                             && !view.materialization_open(drv_hash.as_str())
                             && !view.build_open(drv_hash.as_str());
-                        if wedged && entry.wedge_strike_armed() {
+                        if wedged && *wedge_strike {
                             wedge_repairs.push(drv_hash.clone());
                         } else if wedged {
                             wedge_first_strikes.push(drv_hash.clone());
-                        } else if entry.wedge_strike_armed() {
+                        } else if *wedge_strike {
                             wedge_cleared_strikes.push(drv_hash.clone());
                         }
                     }

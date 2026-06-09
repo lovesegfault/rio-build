@@ -2598,3 +2598,83 @@ async fn split_release_wedge_repairs_on_second_sweep() -> TestResult {
     );
     Ok(())
 }
+
+/// merged_bug_014: the wedge strike must NOT survive a claim
+/// interlude. The two-strike repair is insurance against the
+/// documented ONE-PASS snapshot race (a benign mint between the rows
+/// snapshot and the view iteration) — two FRESH CONSECUTIVE wedged
+/// observations, not two observations separated by a whole claim
+/// episode. Pre-fix, only the sweep wrote the wedge strike (the claim
+/// mutators reset just the sibling ghost strike), so a strike armed
+/// before a claim froze across mint+release and the FIRST
+/// post-interlude wedged sweep fired the uncharged requeue against a
+/// node whose claim episode just legitimately ended — with the false
+/// "two sweeps" warn and a spurious skew tick. Strikes here are armed
+/// only by RUNNING the real sweep; the interlude transitions through
+/// the production claim mutators (never strike setters).
+#[tokio::test]
+async fn wedge_strike_does_not_survive_claim_interlude() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor(db.pool.clone());
+    actor.test_inject_ready_row(crate::db::RecoveryDerivationRow::test_default(
+        "interlude-drv",
+        "x86_64-linux",
+    ));
+    actor
+        .dag
+        .node_mut("interlude-drv")
+        .expect("just injected")
+        .set_status_for_test(DerivationStatus::Assigned);
+    actor.materialization_jobs.insert(
+        DrvHash::from("interlude-drv"),
+        crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+    );
+    let authority = actor.dag_authority().expect("always-leader test actor");
+
+    // Sweep 1: wedged observation arms the strike (no repair).
+    actor.tick_sweep_open_pull_attempts(&authority).await;
+    assert_eq!(
+        actor.dag.node("interlude-drv").unwrap().status(),
+        DerivationStatus::Assigned,
+        "first wedged observation must not repair"
+    );
+
+    // The interlude: a claim episode opens and closes through the
+    // production transitions.
+    let holder = crate::state::ExecutorId::from("store-itl-w0");
+    {
+        let entry = actor
+            .materialization_jobs
+            .get_mut(&DrvHash::from("interlude-drv"))
+            .expect("entry inserted above");
+        entry.mint_claim(holder.clone());
+        assert_eq!(
+            entry.release_claim_if_held(&holder),
+            crate::actor::materialize::ClaimRelease::Released,
+        );
+    }
+
+    // Sweep 2: the FIRST wedged observation of the FRESH post-claim
+    // episode. A repair here acts on stale cross-episode evidence.
+    actor.tick_sweep_open_pull_attempts(&authority).await;
+    let status = actor.dag.node("interlude-drv").unwrap().status();
+    assert_eq!(
+        status,
+        DerivationStatus::Assigned,
+        "left: repair fired (requeue + \"two sweeps\" warn + skew tick) \
+         after ONE post-interlude wedged sweep / right: no repair — a \
+         fresh episode requires two FRESH consecutive wedged observations \
+         (got {status:?})"
+    );
+
+    // Sweep 3: the second FRESH consecutive wedged observation — the
+    // repair lane itself is intact and fires now.
+    actor.tick_sweep_open_pull_attempts(&authority).await;
+    assert_eq!(
+        actor.dag.node("interlude-drv").unwrap().status(),
+        DerivationStatus::Ready,
+        "two fresh consecutive wedged sweeps must still repair"
+    );
+    Ok(())
+}

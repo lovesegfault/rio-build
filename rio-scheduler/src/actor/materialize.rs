@@ -62,33 +62,14 @@ pub(crate) struct JobViewEntry {
     /// (bug_170): armament state is read ONLY through
     /// [`Self::claimability`] — no consumer hand-derives "claimable".
     parked_until: Option<std::time::Instant>,
-    /// `Some(identity)` while an open materialization attempt exists.
-    /// PRIVATE (bug_170): mutated only by [`Self::mint_claim`] /
-    /// [`Self::release_claim_if_held`] / the in-module companions, so
-    /// every release is a compare-and-clear on the holder.
-    claimed_by: Option<ExecutorId>,
-    /// Ghost-strike flag (merged_bug_055 C, the inverse tripwire): set
-    /// when a housekeeping sweep observed this entry CLAIMED with no
-    /// open materialization assignment in the same snapshot; a SECOND
-    /// consecutive such observation is the claimed-no-attempt ghost
-    /// and triggers the uncharged release repair. Cleared whenever the
-    /// claim is observed backed or re-minted. This is the one-sweep
-    /// insurance the spec sketched as a `claimed_at` age guard, made
-    /// structural (clock-free): a claim minted between the sweep's
-    /// row snapshot and the view iteration gets one full sweep to
-    /// appear in the next snapshot before it can ever be called a
-    /// ghost. In-memory only (never recovered as set — recovery
-    /// rebuilds from rows, so a recovered claim starts at zero
-    /// strikes by construction).
-    claimed_unbacked_strike: bool,
-    /// Two-strike flag for the OTHER skew polarity (merged_bug_285,
-    /// split_release): a pending-unclaimed entry whose node read
-    /// Assigned/Running with no open assignment last sweep. Same
-    /// one-sweep insurance as `claimed_unbacked_strike` (the wedge
-    /// predicate mixes the live DAG with the stale opens snapshot);
-    /// the second consecutive observation triggers the uncharged
-    /// requeue repair instead of a counter-only tick.
-    split_release_strike: bool,
+    /// The claim episode (merged_bug_014): the claim holder and the
+    /// episode-scoped skew-tripwire strike in ONE value, replaced
+    /// WHOLESALE at every claim transition. PRIVATE (bug_170): mutated
+    /// only by [`Self::mint_claim`] / [`Self::release_claim_if_held`]
+    /// / the in-module companions, so every release is a
+    /// compare-and-clear on the holder — and every strike dies with
+    /// the episode it was observed in (see [`ClaimEpisode`]).
+    episode: ClaimEpisode,
     /// Realized-path carrier (migration 082, the floating-CA
     /// stale-reset lane) — display copy for the claim-intake
     /// SUBSTITUTING event; the executor and the consumption coverage
@@ -156,6 +137,48 @@ pub(crate) enum ClaimRelease {
     Unclaimed,
 }
 
+/// The claim episode (merged_bug_014): every per-claim-episode
+/// observation flag lives WITH the episode it was observed in, and the
+/// whole value is replaced WHOLESALE at every claim transition — so a
+/// strike structurally cannot outlive its episode. The two skew
+/// tripwires are per-arm fields BY CONSTRUCTION: the claimed-no-attempt
+/// ghost strike (merged_bug_055 C) exists only while `Held`, and the
+/// split-release wedge strike (merged_bug_285) exists only while
+/// `Unclaimed` — the cross-episode strike survival that voided the
+/// two-strike insurance (a wedge strike armed before a claim firing
+/// the repair on the FIRST post-release wedged sweep) is
+/// unrepresentable. Both strikes are the one-sweep insurance for the
+/// documented snapshot race (a mint/attempt between the sweep's row
+/// snapshot and the view iteration gets one full sweep to appear),
+/// made structural and clock-free. In-memory only (never recovered as
+/// set — recovery rebuilds from rows, so a recovered episode starts at
+/// zero strikes by construction). The same pattern as the signed
+/// episode-scoped-evidence resolution: evidence survives only
+/// non-transitions, wiped wholesale at real edges.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClaimEpisode {
+    /// An open materialization attempt holds the job.
+    Held {
+        /// The claiming identity (compare-and-clear key).
+        holder: ExecutorId,
+        /// Ghost tripwire: a sweep observed this claim UNBACKED (no
+        /// open materialization assignment in the same snapshot); a
+        /// second consecutive such observation is the
+        /// claimed-no-attempt ghost and triggers the uncharged
+        /// release repair.
+        unbacked_strike: bool,
+    },
+    /// No open attempt holds the job.
+    Unclaimed {
+        /// Split-release tripwire: a sweep observed the node
+        /// Assigned/Running with NO open assignment of either kind
+        /// while this entry sat pending-unclaimed; a second
+        /// consecutive such observation triggers the uncharged
+        /// requeue repair.
+        wedge_strike: bool,
+    },
+}
+
 impl JobViewEntry {
     /// A fresh unclaimed, unparked, undeferred entry — the creation
     /// feed's shape (and the only construction tests get, so a
@@ -164,9 +187,9 @@ impl JobViewEntry {
         Self {
             job_id,
             parked_until: None,
-            claimed_by: None,
-            claimed_unbacked_strike: false,
-            split_release_strike: false,
+            episode: ClaimEpisode::Unclaimed {
+                wedge_strike: false,
+            },
             carried_realized_paths,
             parked_at: None,
             defer_until: None,
@@ -176,7 +199,7 @@ impl JobViewEntry {
     /// THE armament classification (see [`Claimability`]).
     // r[impl sched.materialize.claimability-projection]
     pub(super) fn claimability(&self, now: std::time::Instant) -> Claimability {
-        if self.claimed_by.is_some() {
+        if matches!(self.episode, ClaimEpisode::Held { .. }) {
             Claimability::Claimed
         } else if self.parked_until.is_some_and(|until| until > now) {
             Claimability::Parked
@@ -187,33 +210,55 @@ impl JobViewEntry {
         }
     }
 
-    /// The claim holder, for identity comparison (`held_by_puller`)
-    /// and the housekeeping tripwire. Read-only: armament DECISIONS go
-    /// through [`Self::claimability`].
+    /// The claim holder, for identity comparison (`held_by_puller`).
+    /// Read-only: armament DECISIONS go through
+    /// [`Self::claimability`]; the housekeeping tripwires match the
+    /// full [`Self::episode`].
     pub(super) fn holder(&self) -> Option<&ExecutorId> {
-        self.claimed_by.as_ref()
+        match &self.episode {
+            ClaimEpisode::Held { holder, .. } => Some(holder),
+            ClaimEpisode::Unclaimed { .. } => None,
+        }
     }
 
-    /// Mint the claim to `holder` (the pull mint, post-commit). Resets
-    /// the ghost strike: a fresh mint is a backed claim by definition.
+    /// The claim episode, for the housekeeping sweep's per-arm
+    /// tripwire match (merged_bug_014): the sweep matches the episode
+    /// itself, so each strike is structurally readable only in the arm
+    /// that can act on it.
+    pub(super) fn episode(&self) -> &ClaimEpisode {
+        &self.episode
+    }
+
+    /// Mint the claim to `holder` (the pull mint, post-commit): a
+    /// fresh `Held` episode, WHOLESALE (merged_bug_014) — the new
+    /// claim is backed by definition (zero ghost strikes) and any
+    /// wedge strike from the prior unclaimed episode dies with that
+    /// episode.
     pub(super) fn mint_claim(&mut self, holder: ExecutorId) {
-        self.claimed_by = Some(holder);
-        self.claimed_unbacked_strike = false;
+        self.episode = ClaimEpisode::Held {
+            holder,
+            unbacked_strike: false,
+        };
     }
 
     /// Compare-and-clear the claim on behalf of `expected` (bug_170:
-    /// `release_claim` names its holder). Clears the ghost strike with
-    /// the claim; a holder mismatch clears NOTHING.
+    /// `release_claim` names its holder). The Released arm replaces
+    /// the episode WHOLESALE (merged_bug_014): the ghost strike dies
+    /// with the held episode and the fresh unclaimed episode starts at
+    /// zero wedge strikes — a post-release wedged sweep must observe
+    /// two FRESH consecutive races before it may repair. A holder
+    /// mismatch replaces NOTHING.
     // r[impl sched.materialize.claim-coherence]
     pub(super) fn release_claim_if_held(&mut self, expected: &ExecutorId) -> ClaimRelease {
-        match &self.claimed_by {
-            Some(holder) if holder == expected => {
-                self.claimed_by = None;
-                self.claimed_unbacked_strike = false;
+        match &self.episode {
+            ClaimEpisode::Held { holder, .. } if holder == expected => {
+                self.episode = ClaimEpisode::Unclaimed {
+                    wedge_strike: false,
+                };
                 ClaimRelease::Released
             }
-            Some(_) => ClaimRelease::StaleHolder,
-            None => ClaimRelease::Unclaimed,
+            ClaimEpisode::Held { .. } => ClaimRelease::StaleHolder,
+            ClaimEpisode::Unclaimed { .. } => ClaimRelease::Unclaimed,
         }
     }
 
@@ -245,10 +290,12 @@ impl JobViewEntry {
     /// Unconditional claim clear — the no-named-executor fallback of
     /// the park companions ONLY (no production lane reaches it today;
     /// every release that can race a fresh mint goes through
-    /// [`Self::release_claim_if_held`]).
+    /// [`Self::release_claim_if_held`]). Replaces the episode
+    /// WHOLESALE like every transition (merged_bug_014).
     fn clear_claim_unconditional(&mut self) {
-        self.claimed_by = None;
-        self.claimed_unbacked_strike = false;
+        self.episode = ClaimEpisode::Unclaimed {
+            wedge_strike: false,
+        };
     }
 
     /// Enter park: backoff expiry + the PD-20 dwell anchor (migration
@@ -281,25 +328,31 @@ impl JobViewEntry {
         DagActor::entry_from_recovered_row(row)
     }
 
-    /// The two-strike ghost flag (merged_bug_055 C), housekeeping's
-    /// read half.
-    pub(super) fn strike_armed(&self) -> bool {
-        self.claimed_unbacked_strike
-    }
-
-    /// Arm/clear the two-strike ghost flag (housekeeping's write half).
+    /// Arm/clear the two-strike ghost flag (merged_bug_055 C),
+    /// housekeeping's write half. Episode-arm scoped (merged_bug_014):
+    /// writable ONLY while `Held` — an unclaimed entry has no claim to
+    /// call a ghost, so the write is a structural no-op there (the
+    /// sweep matches the episode and only reaches this in the Held
+    /// arm). The read half is the sweep's episode match.
     pub(super) fn set_strike(&mut self, armed: bool) {
-        self.claimed_unbacked_strike = armed;
+        if let ClaimEpisode::Held {
+            unbacked_strike, ..
+        } = &mut self.episode
+        {
+            *unbacked_strike = armed;
+        }
     }
 
-    /// The split-release wedge strike (merged_bug_285), read half.
-    pub(super) fn wedge_strike_armed(&self) -> bool {
-        self.split_release_strike
-    }
-
-    /// Arm/clear the split-release wedge strike (write half).
+    /// Arm/clear the split-release wedge strike (merged_bug_285),
+    /// housekeeping's write half. Episode-arm scoped (merged_bug_014):
+    /// writable ONLY while `Unclaimed` — a held entry's node is
+    /// expected Assigned/Running, so there is no wedge to track and
+    /// the write is a structural no-op there. The read half is the
+    /// sweep's episode match.
     pub(super) fn set_wedge_strike(&mut self, armed: bool) {
-        self.split_release_strike = armed;
+        if let ClaimEpisode::Unclaimed { wedge_strike } = &mut self.episode {
+            *wedge_strike = armed;
+        }
     }
 }
 
@@ -859,9 +912,18 @@ impl DagActor {
                 .map(rio_common::clamped::ClampedSecs::from_f64)
                 .filter(|c| !c.is_zero())
                 .map(|c| std::time::Instant::now() + c.duration()),
-            claimed_by: row.claimed_by.map(crate::state::ExecutorId::from),
-            claimed_unbacked_strike: false,
-            split_release_strike: false,
+            // A recovered episode starts at zero strikes by
+            // construction (merged_bug_014: strikes are episode-scoped
+            // in-memory observations — rows carry none).
+            episode: match row.claimed_by {
+                Some(holder) => ClaimEpisode::Held {
+                    holder: crate::state::ExecutorId::from(holder),
+                    unbacked_strike: false,
+                },
+                None => ClaimEpisode::Unclaimed {
+                    wedge_strike: false,
+                },
+            },
             carried_realized_paths: row.carried_realized_paths,
             parked_at: row
                 .park_began_secs_ago
@@ -2635,7 +2697,7 @@ impl DagActor {
             .materialization_jobs
             .iter()
             .filter(|(_, e)| {
-                e.claimed_by.is_none() && e.parked_until.is_some_and(|until| until > now)
+                e.holder().is_none() && e.parked_until.is_some_and(|until| until > now)
             })
             .map(|(h, e)| (h.clone(), e.job_id))
             .collect();
