@@ -169,8 +169,17 @@ pub(super) enum PullPhaseOutcome {
     /// The scheduler rejected the pull with a permanent,
     /// non-retryable status (identity/auth rejection, unimplemented
     /// RPC, invalid request): exit nonzero promptly instead of holding
-    /// the node for the full `activeDeadlineSeconds`.
-    Rejected(tonic::Status),
+    /// the node for the full `activeDeadlineSeconds`. `maybe_minted`
+    /// (merged_bug_145): the rejection answers THIS request only — an
+    /// EARLIER abandoned send may still have minted; the caller makes
+    /// one best-effort resolution pass before the nonzero exit (the
+    /// exit code is the rejection's regardless — resolution only
+    /// narrows the orphan window the establishment sweep would
+    /// otherwise carry).
+    Rejected {
+        status: tonic::Status,
+        maybe_minted: bool,
+    },
 }
 
 /// Permanent, non-retryable rejection codes: a mis-bound or
@@ -381,7 +390,13 @@ pub(super) async fn pull_until_resolved<T: PullTransport>(
                 EffectfulOutcome::Resolved(Err(status)) if is_fatal_rejection(status.code()) => {
                     tracing::error!(code = ?status.code(), msg = status.message(),
                     "PullAssignment permanently rejected; exiting instead of holding the node");
-                    return PullPhaseOutcome::Rejected(status);
+                    // merged_bug_145: the rejection answered THIS
+                    // request; earlier abandoned sends keep their
+                    // wire-effect latch.
+                    return PullPhaseOutcome::Rejected {
+                        status,
+                        maybe_minted: !evidence.may_exit_zero(),
+                    };
                 }
                 EffectfulOutcome::Resolved(Err(status)) => {
                     warn!(code = ?status.code(), msg = status.message(),
@@ -588,24 +603,48 @@ async fn build_phase_with_abort(
     }
 }
 
-/// merged_bug_270: resolve a maybe-minted shutdown before the process
+/// The deadline regime a maybe-minted confirm runs under
+/// (merged_bug_145): the confirm's patience is a function of WHY the
+/// process is exiting, not a constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfirmRegime {
+    /// Idle exit: the pod is healthy and in no hurry — the confirm
+    /// rides [`RETRY_ENVELOPE`] across transient blips (up to
+    /// [`IDLE_CONFIRM_ATTEMPTS`] pulls) so leader churn cannot
+    /// convert a charge-free idle exit into a Failed Job. A SIGTERM
+    /// during the pacing collapses the remaining budget to one final
+    /// attempt (the shutdown semantics take over).
+    Idle,
+    /// SIGTERM: exactly ONE confirm pull bounded by
+    /// `SIGTERM_FINAL_ATTEMPT` — the grace window is burning.
+    Shutdown,
+}
+
+/// Confirm pulls the Idle regime may spend (first + retries). The
+/// envelope pacing between them is `RETRY_ENVELOPE` — the same curve
+/// the live pull loop rides.
+const IDLE_CONFIRM_ATTEMPTS: u32 = 3;
+
+/// merged_bug_270: resolve a maybe-minted state before the process
 /// may exit 0.
 ///
-/// Exactly ONE confirm pull, bounded by `SIGTERM_FINAL_ATTEMPT` (plain
-/// timeout — the shutdown token has already fired). Pull idempotency
-/// makes the answer authoritative:
+/// Confirm pulls bounded by `SIGTERM_FINAL_ATTEMPT` each, attempt
+/// count and pacing per [`ConfirmRegime`] (merged_bug_145: the
+/// pre-regime single shot applied the dying-pod budget to healthy
+/// idle exits). Pull idempotency makes the answer authoritative:
 /// - `NotYetReady`/`Gone`: nothing is held for this pod → clean (the
 ///   timed-out request either never minted or was already released).
+///   The scheduler durably FENCES this answer (migration 097): a
+///   late abandoned pull can no longer mint after it.
 /// - `Assignment`: the abandoned pull DID mint. The build never
 ///   started; synthesize a `Cancelled` completion and push it through
-///   [`report_until_acked`] (under a fired shutdown that is the single
-///   bounded best-effort attempt). Acked → clean; the scheduler closes
+///   [`report_until_acked`]. Acked → clean; the scheduler closes
 ///   the attempt charge-free (AD5 semantics, bounded scheduler-side by
 ///   the worker-abort admission).
-/// - Timeout / transport error / empty outcome: UNRESOLVED → the
-///   caller exits nonzero so the Job goes Failed and the establishment
-///   sweep reaps the open attempt against a Failed pod, not a lying
-///   `Succeeded` one.
+/// - Timeout / transport error / empty outcome (after the regime's
+///   attempts): UNRESOLVED → the caller exits nonzero so the Job goes
+///   Failed and the establishment sweep reaps the open attempt
+///   against a Failed pod, not a lying `Succeeded` one.
 ///
 /// Returns true iff the maybe-minted state was resolved clean.
 async fn resolve_maybe_minted<T: PullTransport>(
@@ -613,28 +652,46 @@ async fn resolve_maybe_minted<T: PullTransport>(
     intent_id: &str,
     executor_token: &str,
     shutdown: &rio_common::signal::Token,
+    regime: ConfirmRegime,
 ) -> bool {
-    let req = PullAssignmentRequest {
-        executor_token: executor_token.to_owned(),
-        intent_id: intent_id.to_owned(),
-        // merged_bug_083 residual (3): the confirm probe is a READ —
-        // the wire discriminator screens the DeliverNew admission, so
-        // the probe itself can never mint fresh work for a dying or
-        // idle-exiting pod (pre-field it could: kernel
-        // `Ready => DeliverNew`).
-        confirm_only: true,
-        ..Default::default()
+    let budget = match regime {
+        ConfirmRegime::Idle => IDLE_CONFIRM_ATTEMPTS,
+        ConfirmRegime::Shutdown => 1,
     };
-    let resp = match tokio::time::timeout(SIGTERM_FINAL_ATTEMPT, transport.pull(req)).await {
-        Ok(Ok(resp)) => resp,
-        Ok(Err(status)) => {
-            warn!(code = ?status.code(), msg = status.message(),
-                "maybe-minted confirm pull failed; exiting nonzero");
+    let mut attempt: u32 = 0;
+    let resp = loop {
+        attempt += 1;
+        let req = PullAssignmentRequest {
+            executor_token: executor_token.to_owned(),
+            intent_id: intent_id.to_owned(),
+            // merged_bug_083 residual (3): the confirm probe is a READ —
+            // the wire discriminator screens the DeliverNew admission, so
+            // the probe itself can never mint fresh work for a dying or
+            // idle-exiting pod (pre-field it could: kernel
+            // `Ready => DeliverNew`).
+            confirm_only: true,
+            ..Default::default()
+        };
+        let failure = match tokio::time::timeout(SIGTERM_FINAL_ATTEMPT, transport.pull(req)).await {
+            Ok(Ok(resp)) => break resp,
+            Ok(Err(status)) => format!("failed: {:?} {}", status.code(), status.message()),
+            Err(_elapsed) => "unanswered".to_owned(),
+        };
+        if attempt >= budget {
+            warn!(%failure, attempt, "maybe-minted confirm pull exhausted; exiting nonzero");
             return false;
         }
-        Err(_elapsed) => {
-            warn!("maybe-minted confirm pull unanswered; exiting nonzero");
-            return false;
+        // Idle pacing: ride the envelope; a SIGTERM mid-pace hands the
+        // last attempt to the shutdown semantics immediately.
+        warn!(%failure, attempt, "maybe-minted confirm pull failed; retrying under the idle envelope");
+        tokio::select! {
+            _ = tokio::time::sleep(RETRY_ENVELOPE.duration(attempt - 1)) => {}
+            _ = shutdown.cancelled() => {
+                if attempt + 1 < budget {
+                    // One final attempt, then the regime is spent.
+                    attempt = budget - 1;
+                }
+            }
         }
     };
     match resp.outcome {
@@ -663,6 +720,9 @@ async fn resolve_maybe_minted<T: PullTransport>(
             report_until_acked(transport, &a.exec_id, report, PULL_GRACE.report(), shutdown).await
         }
         None => {
+            // Version skew, not a transient: the RPC was ANSWERED with
+            // an oneof this build cannot decode — the regime's retries
+            // would re-fetch the same skew.
             warn!("maybe-minted confirm pull returned an empty outcome; exiting nonzero");
             false
         }
@@ -717,9 +777,14 @@ pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
                 intent_id = %rt.intent_id,
                 "idle bound reached with unconfirmed sends; confirming before exit"
             );
-            let resolved =
-                resolve_maybe_minted(&mut transport, &rt.intent_id, &executor_token, &rt.shutdown)
-                    .await;
+            let resolved = resolve_maybe_minted(
+                &mut transport,
+                &rt.intent_id,
+                &executor_token,
+                &rt.shutdown,
+                ConfirmRegime::Idle,
+            )
+            .await;
             run_teardown(rt);
             if resolved {
                 return Ok(());
@@ -739,9 +804,14 @@ pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
             return Ok(());
         }
         PullPhaseOutcome::Shutdown { maybe_minted: true } => {
-            let resolved =
-                resolve_maybe_minted(&mut transport, &rt.intent_id, &executor_token, &rt.shutdown)
-                    .await;
+            let resolved = resolve_maybe_minted(
+                &mut transport,
+                &rt.intent_id,
+                &executor_token,
+                &rt.shutdown,
+                ConfirmRegime::Shutdown,
+            )
+            .await;
             run_teardown(rt);
             if resolved {
                 return Ok(());
@@ -750,12 +820,31 @@ pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
                 "shutdown with a maybe-minted pull left unresolved; exiting nonzero so the Job goes Failed (the establishment sweep reaps the attempt)"
             );
         }
-        PullPhaseOutcome::Rejected(status) => {
-            // Permanent rejection: nothing was started and nothing is
-            // owed; exit nonzero promptly so the Job goes Failed and
-            // the pod-terminal path (charge-free, no attempt row)
-            // surfaces the misconfiguration instead of the node idling
-            // until activeDeadlineSeconds.
+        PullPhaseOutcome::Rejected {
+            status,
+            maybe_minted,
+        } => {
+            // Permanent rejection: exit nonzero promptly so the Job
+            // goes Failed and the pod-terminal path (charge-free, no
+            // attempt row) surfaces the misconfiguration instead of
+            // the node idling until activeDeadlineSeconds.
+            // merged_bug_145: an EARLIER abandoned send may have
+            // minted — one best-effort resolution narrows the orphan
+            // window (an InvalidArgument rejection does not predict
+            // the confirm's fate; an auth rejection makes it fail
+            // fast). The exit stays nonzero either way: the rejection
+            // is the exit cause.
+            if maybe_minted {
+                let resolved = resolve_maybe_minted(
+                    &mut transport,
+                    &rt.intent_id,
+                    &executor_token,
+                    &rt.shutdown,
+                    ConfirmRegime::Shutdown,
+                )
+                .await;
+                info!(resolved, "rejected-exit maybe-minted resolution attempted");
+            }
             run_teardown(rt);
             anyhow::bail!(
                 "PullAssignment permanently rejected ({:?}): {}",
@@ -1132,6 +1221,83 @@ mod tests {
         );
     }
 
+    /// merged_bug_145 (banner a): every PullPhaseOutcome variant
+    /// names its mint evidence — the exhaustive match (no wildcard)
+    /// is the machine witness: a future variant cannot compile
+    /// without taking a position on whether an unconfirmed send may
+    /// be behind it.
+    fn mint_evidence(o: &PullPhaseOutcome) -> Option<bool> {
+        match o {
+            // The mint itself rides the variant — the build phase
+            // consumes it.
+            PullPhaseOutcome::Assigned(_) => None,
+            // Authoritative not-wanted answer for the intent: any
+            // straggler mint reports into a Gone consumption.
+            PullPhaseOutcome::Gone => None,
+            PullPhaseOutcome::IdleExit { maybe_minted }
+            | PullPhaseOutcome::Shutdown { maybe_minted }
+            | PullPhaseOutcome::Rejected { maybe_minted, .. } => Some(*maybe_minted),
+        }
+    }
+
+    /// merged_bug_145: a fatal rejection after an earlier abandoned
+    /// (timed-out) send carries maybe_minted=true — pre-fix the
+    /// variant could not express it (compile-level red, the
+    /// result.rs:447 precedent) and the orphan waited for the
+    /// establishment sweep.
+    #[tokio::test(start_paused = true)]
+    async fn rejection_after_abandoned_send_carries_evidence() {
+        let shutdown = token();
+        // First pull times out (the send is abandoned mid-flight);
+        // the second is permanently rejected.
+        let mut t = ScriptedTransport::new(
+            vec![
+                Err(tonic::Status::deadline_exceeded("pull timed out")),
+                Err(tonic::Status::permission_denied("token mismatch")),
+            ],
+            vec![],
+        );
+        let outcome =
+            pull_until_resolved(&mut t, "intent", "tok", Duration::from_secs(300), &shutdown).await;
+        match &outcome {
+            PullPhaseOutcome::Rejected {
+                status,
+                maybe_minted,
+            } => {
+                assert_eq!(status.code(), tonic::Code::PermissionDenied);
+                assert!(
+                    *maybe_minted,
+                    "the abandoned first send must keep its wire-effect latch"
+                );
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        assert_eq!(mint_evidence(&outcome), Some(true));
+    }
+
+    /// merged_bug_145 (bughunt-4): the IDLE-EXIT confirm rides the
+    /// retry envelope — the pod is healthy and in no hurry; a single
+    /// transient blip (leader churn) must not convert a charge-free
+    /// idle exit into a Failed Job. (The SIGTERM regime keeps its
+    /// single bounded attempt.)
+    #[tokio::test(start_paused = true)]
+    async fn idle_confirm_retries_transient_failure() {
+        let shutdown = token(); // NOT fired: idle exit, healthy pod.
+        let mut t = ScriptedTransport::new(
+            vec![
+                Err(tonic::Status::unavailable("leader churn")),
+                Ok(not_yet_ready_resp(5)),
+            ],
+            vec![],
+        );
+        assert!(
+            resolve_maybe_minted(&mut t, "i", "tok", &shutdown, ConfirmRegime::Idle).await,
+            "a healthy idle-exiting pod must ride the retry envelope over a \
+             transient confirm blip"
+        );
+        assert_eq!((t.pull_calls, t.report_calls), (2, 0));
+    }
+
     /// resolve_shutdown: confirm answers map to the law — NotYetReady →
     /// clean; minted Assignment → synthesized Cancelled acked → clean;
     /// confirm failure → unresolved (nonzero at the caller).
@@ -1143,21 +1309,25 @@ mod tests {
         shutdown.cancel();
         // NotYetReady → clean, exactly one RPC.
         let mut t = ScriptedTransport::new(vec![Ok(not_yet_ready_resp(5))], vec![]);
-        assert!(resolve_maybe_minted(&mut t, "i", "tok", &shutdown).await);
+        assert!(resolve_maybe_minted(&mut t, "i", "tok", &shutdown, ConfirmRegime::Shutdown).await);
         assert_eq!((t.pull_calls, t.report_calls), (1, 0));
         // Minted → synthesized Cancelled, acked → clean.
         let mut t = ScriptedTransport::new(vec![Ok(assignment_resp("exec-9"))], vec![Ok(())]);
-        assert!(resolve_maybe_minted(&mut t, "i", "tok", &shutdown).await);
+        assert!(resolve_maybe_minted(&mut t, "i", "tok", &shutdown, ConfirmRegime::Shutdown).await);
         assert_eq!((t.pull_calls, t.report_calls), (1, 1));
         // Confirm pull errors → unresolved.
         let mut t = ScriptedTransport::new(vec![Err(tonic::Status::unavailable("gone"))], vec![]);
-        assert!(!resolve_maybe_minted(&mut t, "i", "tok", &shutdown).await);
+        assert!(
+            !resolve_maybe_minted(&mut t, "i", "tok", &shutdown, ConfirmRegime::Shutdown).await
+        );
         // Minted but the report is never acked → unresolved.
         let mut t = ScriptedTransport::new(
             vec![Ok(assignment_resp("exec-9"))],
             vec![Err(tonic::Status::unavailable("no leader"))],
         );
-        assert!(!resolve_maybe_minted(&mut t, "i", "tok", &shutdown).await);
+        assert!(
+            !resolve_maybe_minted(&mut t, "i", "tok", &shutdown, ConfirmRegime::Shutdown).await
+        );
     }
 
     /// (b) `Gone` resolves immediately: exit 0 without building, no
@@ -1303,7 +1473,7 @@ mod tests {
             let shutdown = token();
             let outcome = pull_until_resolved(&mut t, "intent-a", "tok", IDLE, &shutdown).await;
             match outcome {
-                PullPhaseOutcome::Rejected(s) => assert_eq!(s.code(), code),
+                PullPhaseOutcome::Rejected { status: s, .. } => assert_eq!(s.code(), code),
                 other => panic!("expected Rejected for {code:?}, got {other:?}"),
             }
             assert_eq!(
