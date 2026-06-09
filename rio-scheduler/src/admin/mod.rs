@@ -141,6 +141,26 @@ pub struct AdminServiceImpl {
     cost_table: Arc<parking_lot::RwLock<crate::sla::cost::CostTable>>,
 }
 
+/// merged_bug_001: HELP for the absorb counter, COLOCATED with its
+/// only emit site (the `append_interrupt_sample` rows_affected check
+/// below) so the counter and its HELP cannot drift apart. Fired from
+/// `rio_scheduler::describe_metrics` (the boot-time registration the
+/// `metrics_registered` census enforces — every emitted/spec'd name
+/// must be reachable from that fn) and re-affirmed in
+/// [`AdminServiceImpl::new`] (idempotent; binds whatever recorder is
+/// live at service construction, which in main.rs is strictly after
+/// `bootstrap` installs the production exporter).
+pub(crate) fn describe_admin_metrics() {
+    metrics::describe_counter!(
+        "rio_scheduler_interrupt_samples_absorbed_total",
+        "AppendInterruptSample inserts absorbed by the M_047 ON CONFLICT \
+         dedup, by kind. Expected: commit-but-timeout redeliveries and \
+         rollout-overlap duplicates of the same logical (cluster, class, \
+         window). A sustained rate without scheduler/controller restarts \
+         indicates an identity collision — investigate uid minting."
+    );
+}
+
 impl AdminServiceImpl {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -155,21 +175,11 @@ impl AdminServiceImpl {
         service_verifier: Option<Arc<rio_auth::hmac::HmacVerifier>>,
         cost_table: Arc<parking_lot::RwLock<crate::sla::cost::CostTable>>,
     ) -> Self {
-        // merged_bug_001: colocated with the only emit site (the
-        // AppendInterruptSample rows_affected check below) so the
-        // counter and its HELP cannot drift apart. `new` runs in
-        // main.rs strictly AFTER `bootstrap` installs the production
-        // exporter, so this binds to the live recorder; the docs-data
-        // regen scrapes describe_*! workspace-wide regardless of
-        // location.
-        metrics::describe_counter!(
-            "rio_scheduler_interrupt_samples_absorbed_total",
-            "AppendInterruptSample inserts absorbed by the M_047 ON CONFLICT \
-             dedup, by kind. Expected: commit-but-timeout redeliveries and \
-             rollout-overlap duplicates of the same logical (cluster, class, \
-             window). A sustained rate without scheduler/controller restarts \
-             indicates an identity collision — investigate uid minting."
-        );
+        // merged_bug_001: re-affirm the colocated describe (see
+        // `describe_admin_metrics` above) on whatever recorder is
+        // live at construction — idempotent; the canonical
+        // registration fires from `describe_metrics` at bootstrap.
+        describe_admin_metrics();
         Self {
             pool,
             actor,

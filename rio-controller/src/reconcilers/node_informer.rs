@@ -769,9 +769,9 @@ async fn node_hw_class(nodes: &Api<Node>, config: &HwClassConfig, name: &str) ->
 /// that flush — cursors are untouched, so the next successful flush
 /// banks the full delta since the last successful one (nothing lost,
 /// nothing double-counted; λ samples arrive late, not wrong). A
-/// non-advancing flush window ([`WindowGate::admit`] → `None`) is the
-/// same posture: banking deferred, cursors untouched, nothing
-/// forfeited.
+/// non-advancing flush window (`WindowGate::admit` → `None`; the gate
+/// is module-private) is the same posture: banking deferred, cursors
+/// untouched, nothing forfeited.
 pub async fn run(
     client: Client,
     config: HwClassConfig,
