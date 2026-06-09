@@ -17,6 +17,7 @@ import {
   visitChunkKeyed,
   visitChunk,
   type ChunkVisit,
+  type TailResolution,
   type TailStopCause,
 } from '../lineCursor';
 
@@ -116,23 +117,34 @@ describe('visitChunk', () => {
 });
 
 describe('tailNext', () => {
-  it('matches the rio-log-kernel tail_next decision table', () => {
+  it('matches the rio-log-kernel tail_next decision table (plus the dashboard mode axis)', () => {
     // Exit cells: every grace_expired row, plus exactly
-    // (naturalEnd, terminal, !grace_expired, served_complete).
+    // (naturalEnd, !grace_expired, served_complete, terminal ∨ pinned).
+    // The mode axis is dashboard-only (bug_348, same precedent as
+    // authRequired): a PINNED stream's stamped completion is terminal
+    // by construction — re-opening resends the pinned execId and can
+    // never resolve a retry. The table is exhaustive over all five
+    // inputs so the law stays total by inspection.
     const causes: TailStopCause[] = ['naturalEnd', 'transportErr', 'openFailed'];
+    const modes: TailResolution[] = ['latest', 'pinned'];
     for (const cause of causes) {
-      for (const terminal of [false, true]) {
-        for (const graceExpired of [false, true]) {
-          for (const servedComplete of [false, true]) {
-            const got = tailNext(cause, terminal, graceExpired, servedComplete);
-            const want =
-              graceExpired || (cause === 'naturalEnd' && terminal && servedComplete)
-                ? 'exit'
-                : 'reopen';
-            expect(
-              got,
-              `tailNext(${cause}, ${terminal}, ${graceExpired}, ${servedComplete})`,
-            ).toBe(want);
+      for (const mode of modes) {
+        for (const terminal of [false, true]) {
+          for (const graceExpired of [false, true]) {
+            for (const servedComplete of [false, true]) {
+              const got = tailNext(cause, mode, terminal, graceExpired, servedComplete);
+              const want =
+                graceExpired ||
+                (cause === 'naturalEnd' &&
+                  servedComplete &&
+                  (terminal || mode === 'pinned'))
+                  ? 'exit'
+                  : 'reopen';
+              expect(
+                got,
+                `tailNext(${cause}, ${mode}, ${terminal}, ${graceExpired}, ${servedComplete})`,
+              ).toBe(want);
+            }
           }
         }
       }
@@ -141,27 +153,31 @@ describe('tailNext', () => {
 
   // r[verify store.log.consumer-registry]
   it('authRequired exits every cell — auth deny does not heal by retry', () => {
-    for (const terminal of [false, true]) {
-      for (const graceExpired of [false, true]) {
-        for (const servedComplete of [false, true]) {
-          expect(
-            tailNext('authRequired', terminal, graceExpired, servedComplete),
-            `tailNext(authRequired, ${terminal}, ${graceExpired}, ${servedComplete})`,
-          ).toBe('exit');
+    for (const mode of ['latest', 'pinned'] as const) {
+      for (const terminal of [false, true]) {
+        for (const graceExpired of [false, true]) {
+          for (const servedComplete of [false, true]) {
+            expect(
+              tailNext('authRequired', mode, terminal, graceExpired, servedComplete),
+              `tailNext(authRequired, ${mode}, ${terminal}, ${graceExpired}, ${servedComplete})`,
+            ).toBe('exit');
+          }
         }
       }
     }
   });
 
-  // r[verify dash.stream.log-tail+5]
+  // r[verify dash.stream.log-tail+6]
   it('permanentErr exits every cell — the store said never, retry cannot heal it', () => {
-    for (const terminal of [false, true]) {
-      for (const graceExpired of [false, true]) {
-        for (const servedComplete of [false, true]) {
-          expect(
-            tailNext('permanentErr', terminal, graceExpired, servedComplete),
-            `tailNext(permanentErr, ${terminal}, ${graceExpired}, ${servedComplete})`,
-          ).toBe('exit');
+    for (const mode of ['latest', 'pinned'] as const) {
+      for (const terminal of [false, true]) {
+        for (const graceExpired of [false, true]) {
+          for (const servedComplete of [false, true]) {
+            expect(
+              tailNext('permanentErr', mode, terminal, graceExpired, servedComplete),
+              `tailNext(permanentErr, ${mode}, ${terminal}, ${graceExpired}, ${servedComplete})`,
+            ).toBe('exit');
+          }
         }
       }
     }

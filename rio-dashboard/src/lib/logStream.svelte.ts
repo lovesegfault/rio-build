@@ -32,13 +32,14 @@ import {
   tailNext,
   visitChunkKeyed,
   type StreamPhase,
+  type TailResolution,
   type TailStopCause,
 } from './lineCursor';
 
 export type { BannerView, StreamPhase } from './lineCursor';
 export { bannerFor } from './lineCursor';
 
-// r[impl dash.stream.log-tail+5]
+// r[impl dash.stream.log-tail+6]
 // r[impl dash.log.cap]
 // r[impl dash.log.virtualize]
 // (Virtualization itself lives in LogViewer.svelte — windowed slice over
@@ -179,6 +180,11 @@ export function createLogStream(
   let phase = $state<StreamPhase>({ kind: 'streaming' });
   const hasOracle = opts?.isTerminal !== undefined;
   const isTerminal = opts?.isTerminal ?? (() => false);
+  // The exit law's resolution-mode input (bug_348): a non-empty execId
+  // PINS the stream to one execution — every re-open resends it, so a
+  // retry is structurally unobservable and a stamped completion is
+  // terminal by construction regardless of the derivation oracle.
+  const mode: TailResolution = execId !== '' ? 'pinned' : 'latest';
   const ctrl = new AbortController();
 
   function push(row: LogRow) {
@@ -547,7 +553,7 @@ export function createLogStream(
         graceDeadline = Date.now() + GRACE_MS;
       }
       const graceExpired = graceDeadline !== null && Date.now() >= graceDeadline;
-      if (tailNext(cause, terminal, graceExpired, servedComplete) === 'exit') {
+      if (tailNext(cause, mode, terminal, graceExpired, servedComplete) === 'exit') {
         // r[impl obs.log.incomplete-surfaced+2]
         // Exit with the store never having stamped completion: the
         // missing tail is usually the build error itself — flag it so

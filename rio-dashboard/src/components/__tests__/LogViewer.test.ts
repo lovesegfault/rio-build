@@ -35,7 +35,7 @@ describe('LogViewer', () => {
     createLogStream.mockReset();
   });
 
-  // r[verify dash.stream.log-tail+5]
+  // r[verify dash.stream.log-tail+6]
   /// bug_065's recorded red: the lib classified PermissionDenied as the
   /// terminal authRequired state and PROMISED the sign-in notice, but no
   /// component ever read the flag — a jwt-enabled deployment rendered

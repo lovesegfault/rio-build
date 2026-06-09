@@ -106,18 +106,34 @@ export type TailStopCause =
 
 export type TailVerdict = 'reopen' | 'exit';
 
-/// The relay exit law, mirrored from `rio_log_kernel::tail_next`:
-/// **exit iff the grace budget is spent, the stream ended naturally
-/// with the derivation terminal and the served log complete, the store
-/// demanded credentials (`authRequired`), or the store typed the
+/// HOW the stream resolves its execution — a law input, dashboard-only
+/// (no kernel mirror, same precedent as `authRequired`): the gateway
+/// relay always follows per-derivation, but the dashboard can PIN one
+/// execution (`execId !== ''` on the request). A pinned stream
+/// structurally cannot observe a retry — every re-open resends the
+/// pinned id — so "re-open to follow the retry" is not a transition
+/// the pinned configuration has (bug_348: the pre-fix law looped a
+/// pinned stream against a dead execution's stamped completion at the
+/// pacer cap forever).
+export type TailResolution = 'pinned' | 'latest';
+
+/// The relay exit law, mirrored from `rio_log_kernel::tail_next` and
+/// extended by the dashboard-only resolution-mode input (documented on
+/// [`TailResolution`]): **exit iff the grace budget is spent, the
+/// stream ended naturally with the served log complete and either the
+/// derivation terminal or the stream pinned to one execution, the
+/// store demanded credentials (`authRequired`), or the store typed the
 /// failure permanent (`permanentErr`).** Every other shape re-opens.
 /// "Give up with grace unspent and the log incomplete" is
 /// unrepresentable — except by the store's own deny or its own
 /// "never", neither of which any amount of reconnecting heals
 /// (r[impl store.log.consumer-registry]: the terminal auth state is
-/// the KeylessOnly posture's mandated surface).
+/// the KeylessOnly posture's mandated surface). A PINNED stream's
+/// stamped completion is terminal by construction: there is no newer
+/// execution a re-open could resolve (bug_348).
 export function tailNext(
   cause: TailStopCause,
+  mode: TailResolution,
   terminal: boolean,
   graceExpired: boolean,
   servedComplete: boolean,
@@ -125,7 +141,9 @@ export function tailNext(
   if (graceExpired) return 'exit';
   switch (cause) {
     case 'naturalEnd':
-      return terminal && servedComplete ? 'exit' : 'reopen';
+      return servedComplete && (terminal || mode === 'pinned')
+        ? 'exit'
+        : 'reopen';
     case 'transportErr':
     case 'openFailed':
       return 'reopen';

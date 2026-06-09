@@ -46,7 +46,7 @@ afterEach(() => {
 });
 
 describe('createLogStream follow mode', () => {
-  // r[verify dash.stream.log-tail+5]
+  // r[verify dash.stream.log-tail+6]
   /// merged_bug_254's recorded red: a NEVER-ENDING quiet stream on a
   /// terminal build. The pre-fix `for await` parked inside the
   /// iterator — `done` stayed false forever (the red observed exactly
@@ -71,7 +71,7 @@ describe('createLogStream follow mode', () => {
     s.destroy();
   });
 
-  // r[verify dash.stream.log-tail+5]
+  // r[verify dash.stream.log-tail+6]
   /// bug_145's recorded red: the post-terminal grace armed and fired
   /// ONLY in the tick branch, and the tick was a relative 1 s timer
   /// recreated every race iteration — a stream delivering >1 msg/sec
@@ -103,7 +103,7 @@ describe('createLogStream follow mode', () => {
     s.destroy();
   });
 
-  // r[verify dash.stream.log-tail+5]
+  // r[verify dash.stream.log-tail+6]
   /// merged_bug_063's recorded red (scenario A): exec A serves lines,
   /// then the worker dies; the reconnect carries A's watermark, the
   /// store resolves latest=exec-b (sealed shorter) and filters every
@@ -148,7 +148,7 @@ describe('createLogStream follow mode', () => {
     s.destroy();
   });
 
-  // r[verify dash.stream.log-tail+5]
+  // r[verify dash.stream.log-tail+6]
   /// merged_bug_063's law half: the in-loop isComplete exit skipped the
   /// terminal && servedComplete conjunct of the mirrored tail_next law —
   /// a complete-but-FAILED attempt on a non-terminal derivation must
@@ -169,7 +169,7 @@ describe('createLogStream follow mode', () => {
     s.destroy();
   });
 
-  // r[verify dash.stream.log-tail+5]
+  // r[verify dash.stream.log-tail+6]
   /// merged_bug_002's recorded red: a retry on another worker restarts
   /// numbering at zero. Pre-fix the new execution's chunk was
   /// indistinguishable from a resent duplicate (`skip`) — the red
@@ -201,7 +201,7 @@ describe('createLogStream follow mode', () => {
     s.destroy();
   });
 
-  // r[verify dash.stream.log-tail+5]
+  // r[verify dash.stream.log-tail+6]
   /// merged_bug_164's reader half (recorded red: pre-fix the
   /// `x-rio-log-unservable` refusal classified as transportErr and the
   /// loop re-dialed — tailLog call count climbed past 1). A
@@ -523,4 +523,31 @@ describe('authRequired terminal state', () => {
     expect(tailLog).toHaveBeenCalledTimes(1);
     s.destroy();
   });
+
+  // r[verify dash.stream.log-tail+6]
+  /// bug_348's recorded red: a PINNED stream (non-empty execId) can
+  /// structurally never observe a retry — every re-open resends the
+  /// pinned id — yet the exit law treated a store-stamped completion
+  /// on a non-terminal oracle as "follow the retry". The pre-fix loop
+  /// re-dialed skip→isComplete→reopen at the pacer cap forever
+  /// (done=false, opens climbing), a streaming spinner over a provably
+  /// complete log. The resolution mode is now a law input: pinned +
+  /// servedComplete is terminal by construction.
+  it('pinned_complete_exits_despite_nonterminal_oracle: a pinned stream cannot follow a retry', async () => {
+    let opens = 0;
+    tailLog.mockImplementation(async function* () {
+      opens += 1;
+      yield { ...chunk(['a0'], { isComplete: true }), execId: 'exec-a' };
+    });
+    const s = createLogStream('/nix/store/x.drv', 'exec-a', {
+      isTerminal: () => false,
+    });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(s.done).toBe(true);
+    expect(opens).toBe(1);
+    expect(s.incomplete).toBe(false);
+    expect(s.phase).toEqual({ kind: 'complete' });
+    s.destroy();
+  });
+
 });

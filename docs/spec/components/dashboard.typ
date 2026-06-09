@@ -213,7 +213,7 @@ stack can't give you.
   nodes (`GetBuildGraphResponse.truncated`).
 ]
 
-#r("dash.stream.log-tail+5")[
+#r("dash.stream.log-tail+6")[
   `LogService.TailLog` server-stream consumption MUST use
   `TextDecoder('utf-8', {fatal: false})` --- build output can contain non-UTF-8
   bytes (compiler locale garbage). Lossy decode to `U+FFFD`, never throw. nginx
@@ -236,10 +236,15 @@ stack can't give you.
   watermark: the attempt MUST be cut and re-opened at `sinceLine` 0 ---
   a `sinceLine` is only ever sent for the execution it was minted in.
   EVERY exit, including a store-stamped completion, decides through the
-  mirrored `tail_next` law: completion is a per-execution predicate, so
-  with a live oracle saying the derivation is non-terminal the stream
-  re-opens to follow the retry (the gateway relay's behavior); without
-  an oracle the exec-level claim stands in for terminality. A status
+  mirrored `tail_next` law, whose dashboard-side inputs include the
+  RESOLUTION MODE: completion is a per-execution predicate, so with a
+  live oracle saying the derivation is non-terminal a LATEST-resolved
+  stream re-opens to follow the retry (the gateway relay's behavior) ---
+  but a PINNED stream (non-empty `exec_id` on the request) structurally
+  cannot observe a retry, every re-open resends the pinned id, so its
+  stamped completion is terminal by construction regardless of the
+  oracle; without an oracle the exec-level claim stands in for
+  terminality. A status
   the store typed permanently unservable exits terminally (no re-dial)
   and surfaces the incomplete banner; the auth-required terminal
   renders the sign-in notice through the exhaustive phase law, never
