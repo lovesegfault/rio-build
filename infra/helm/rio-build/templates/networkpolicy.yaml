@@ -203,20 +203,15 @@ spec:
             k8s:io.kubernetes.pod.namespace: {{ $ns.store.name }}
             k8s:app.kubernetes.io/name: rio-store
       toPorts: [{ports: [{port: "9002", protocol: TCP}]}]
-    {{- if .Values.global.postgresCidr }}
     # nodeclaim_pool reconciler persists HdrHistogram lead-time +
     # idle-gap sketches to PG (`nodeclaim_cell_state`, migration 059).
     # Mirrors the scheduler/store toCIDR rule.
-    - toCIDR:
-        - {{ .Values.global.postgresCidr | quote }}
-      toPorts: [{ports: [{port: "5432", protocol: TCP}]}]
-    {{- end }}
-    {{- if .Values.postgresql.enabled }}
+    {{ include "rio.pgExternalEgress" $ | nindent 4 }}
     # In-cluster postgres — single-sourced rule (bug_185: this copy
     # used to point at the STORE namespace and matched zero endpoints,
-    # silently default-denying the controller's direct PG edge).
-    {{ include "rio.pgInClusterEgress" $ns | nindent 4 }}
-    {{- end }}
+    # silently default-denying the controller's direct PG edge). The
+    # enabled guard lives in the helper (bug_171).
+    {{ include "rio.pgInClusterEgress" $ | nindent 4 }}
 {{- if .Values.buildScheduler.enabled }}
 ---
 # kube-build-scheduler second kube-scheduler egress: DNS + kube-apiserver
@@ -413,14 +408,14 @@ spec:
             k8s:app.kubernetes.io/name: rio-scheduler
       toPorts: [{ports: [{port: "9001", protocol: TCP}]}]
     # In-cluster postgres (bitnami chart, VM tests / dev) —
-    # single-sourced rule; the namespace fact lives in the helper.
-    {{ include "rio.pgInClusterEgress" $ns | nindent 4 }}
-    # External postgres (RDS / CloudSQL) — outside the cluster, so
-    # toCIDRSet matches as `world` subspace. rio is v6-only; the CIDR is
-    # the deployment's VPC IPv6 block (or ULA range for self-hosted).
-    - toCIDRSet:
-        - {cidr: {{ .Values.global.postgresCidr | quote }}}
-      toPorts: [{ports: [{port: "5432", protocol: TCP}]}]
+    # single-sourced rule; the namespace fact AND the enabled guard
+    # live in the helper (bug_171).
+    {{ include "rio.pgInClusterEgress" $ | nindent 4 }}
+    # External postgres (RDS / CloudSQL) — single-sourced rule; the
+    # CIDR fact and its blankable-value guard live in the helper
+    # (bug_063: this open-coded copy rendered an empty cidr entry when
+    # the value was blanked, failing Cilium CRD validation).
+    {{ include "rio.pgExternalEgress" $ | nindent 4 }}
     {{- with .Values.networkPolicy.storeS3Cidr }}
     # S3 VPC endpoint CIDR — store writes chunks directly.
     - toCIDR: [{{ . | quote }}]

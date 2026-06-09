@@ -41,9 +41,9 @@ pg_ns_violations() {
 priv=$TMPDIR/chart-185-red
 rm -rf "$priv"
 cp -r . "$priv"
-sed -i 's/k8s:io.kubernetes.pod.namespace: {{ .system.name }}/k8s:io.kubernetes.pod.namespace: {{ .store.name }}/' \
+sed -i 's/k8s:io.kubernetes.pod.namespace: {{ .Values.namespaces.system.name }}/k8s:io.kubernetes.pod.namespace: {{ .Values.namespaces.store.name }}/' \
   "$priv/templates/_helpers.tpl"
-grep -q '{{ .store.name }}' "$priv/templates/_helpers.tpl" || {
+grep -q '{{ .Values.namespaces.store.name }}' "$priv/templates/_helpers.tpl" || {
   echo "FAIL: planted-red sed did not take — helper shape changed; update this fixture" >&2
   exit 1
 }
@@ -78,3 +78,55 @@ for cnp in rio-controller-egress store-egress; do
     exit 1
   }
 done
+
+# ── bug_063/bug_171: BOTH PG-egress optionality decisions live INSIDE
+# the shared helpers — the agreement law is asserted over renders, so
+# a future open-coded copy that re-forks a guard fails here.
+#
+# (a) blanked external CIDR renders ZERO external rules and no invalid
+#     empty CIDR (bug_063 pre-fix: the store emitted {cidr: ""}, which
+#     fails Cilium CRD validation — failed upgrade, or store left
+#     under default-deny).
+out=$TMPDIR/pg-blank-cidr.yaml
+helm template rio . --set global.image.tag=test --set global.postgresCidr="" >"$out"
+if grep -E '^[[:space:]]*-?[[:space:]]*\{?cidr: ""' "$out" | grep -qv '#'; then
+  echo "FAIL: blanked global.postgresCidr renders an invalid empty CIDR (bug_063):" >&2
+  grep -nE '^[[:space:]]*-?[[:space:]]*\{?cidr: ""' "$out" | grep -v '#' | head >&2
+  exit 1
+fi
+# (b) postgresql disabled renders ZERO in-cluster PG endpoint rules in
+#     EVERY consumer (bug_171 pre-fix: only the controller call site
+#     was guarded; the helper doc claimed both were).
+out=$TMPDIR/pg-disabled.yaml
+helm template rio . --set global.image.tag=test --set postgresql.enabled=false >"$out"
+# NB: count-then-filter — a trailing bare `$n` in yq v4 emits once per
+# DOCUMENT even when the preceding pipe matched nothing (observed:
+# ingress-only policies listed as violations); the array form below
+# only names policies whose real match count is > 0.
+stray=$(yq -N 'select(.kind=="CiliumNetworkPolicy")
+       | [.metadata.name, ([.spec.egress[]? | .toEndpoints[]? | .matchLabels."k8s:app.kubernetes.io/name" // ""] | map(select(. == "postgresql")) | length)]
+       | select(.[1] > 0) | .[0]' "$out")
+test -z "$stray" || {
+  echo "FAIL: postgresql.enabled=false still renders in-cluster PG egress (bug_171):" >&2
+  echo "$stray" >&2
+  exit 1
+}
+# (c) the external-PG rule renders IDENTICALLY in both consumers when
+#     the CIDR is set (single-source proof — the rule body has exactly
+#     one producer).
+out=$TMPDIR/pg-external.yaml
+helm template rio . --set global.image.tag=test >"$out"
+# JSON output: comment-free and key-normalized — yq's YAML output
+# round-trips call-site comments onto the extracted node, which would
+# make byte-equality depend on prose.
+ctl=$(yq -N -o=json 'select(.metadata.name=="rio-controller-egress") | .spec.egress[]? | select(.toCIDRSet != null)' "$out")
+sto=$(yq -N -o=json 'select(.metadata.name=="store-egress") | .spec.egress[]? | select(.toCIDRSet != null)' "$out")
+test -n "$ctl" || {
+  echo "FAIL: controller renders no external-PG toCIDRSet rule (single-source regression)" >&2
+  exit 1
+}
+test "$ctl" = "$sto" || {
+  echo "FAIL: external-PG egress differs between controller and store (the rule must have ONE producer):" >&2
+  printf 'controller:\n%s\nstore:\n%s\n' "$ctl" "$sto" >&2
+  exit 1
+}

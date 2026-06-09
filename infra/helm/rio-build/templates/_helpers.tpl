@@ -402,14 +402,39 @@ Pre-fix the controller's open-coded copy pointed at the STORE
 namespace and matched zero endpoints: under Cilium default-deny the
 controller's direct PG edge (nodeclaim_cell_state sketches, load-
 bearing at every leadership acquire) silently dropped. The namespace
-fact lives HERE and nowhere else; call sites keep their own
-postgresql.enabled guards.
-Usage: {{ include "rio.pgInClusterEgress" $ns | nindent 4 }}
+fact lives HERE and nowhere else — and so does the
+postgresql.enabled guard (bug_171: the doc used to claim "call sites
+keep their own guards" while only one of two call sites did; the
+optionality decision now has one producer, so the claim is true by
+construction). Takes the ROOT context.
+Usage: {{ include "rio.pgInClusterEgress" $ | nindent 4 }}
 */}}
 {{- define "rio.pgInClusterEgress" -}}
+{{- if .Values.postgresql.enabled }}
 - toEndpoints:
     - matchLabels:
-        k8s:io.kubernetes.pod.namespace: {{ .system.name }}
+        k8s:io.kubernetes.pod.namespace: {{ .Values.namespaces.system.name }}
         k8s:app.kubernetes.io/name: postgresql
   toPorts: [{ports: [{port: "5432", protocol: TCP}]}]
+{{- end }}
+{{- end -}}
+
+{{/*
+rio.pgExternalEgress — THE external postgres (RDS / CloudSQL) egress
+rule, single-sourced (bug_063). Outside the cluster, so toCIDRSet
+matches as `world` subspace; rio is v6-only — the CIDR is the
+deployment's VPC IPv6 block (or ULA range for self-hosted). The
+global.postgresCidr OPTIONALITY lives here: pre-fix the store's
+open-coded copy rendered unconditionally, so blanking the value (pure
+in-cluster PG deployments) emitted `{cidr: ""}` — rejected by
+Cilium's CRD validation: a failed upgrade, or the store left under
+default-deny. Takes the ROOT context.
+Usage: {{ include "rio.pgExternalEgress" $ | nindent 4 }}
+*/}}
+{{- define "rio.pgExternalEgress" -}}
+{{- if .Values.global.postgresCidr }}
+- toCIDRSet:
+    - {cidr: {{ .Values.global.postgresCidr | quote }}}
+  toPorts: [{ports: [{port: "5432", protocol: TCP}]}]
+{{- end }}
 {{- end -}}
