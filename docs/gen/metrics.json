@@ -765,7 +765,7 @@
       {
         "name": "rio_scheduler_exec_rows_gc_deleted_total",
         "kind": "counter",
-        "help": "drv_executions lifecycle rows deleted by the execution-row GC (store.log.sweep-ownership second deleter): terminal, no active assignment, referenced by no drv_attempts row, older than exec_retention_days. The store's log TTL sweep never deletes these."
+        "help": "drv_executions lifecycle rows deleted by the execution-row GC (store.log.sweep-ownership second deleter): terminal, no active assignment, referenced by no drv_attempts row, no surviving drv_log_chunks rows, no LIVE log_ingest_sessions row, and older than exec_retention_days — the SQL twin of rio_retry_kernel::exec_row_sweep_eligible. The store's log TTL sweep never deletes these."
       },
       {
         "name": "rio_scheduler_features_stripped_total",
@@ -913,7 +913,7 @@
       {
         "name": "rio_scheduler_resource_floor_bumps_total",
         "kind": "counter",
-        "help": "resource_floor doublings on explicit resource-exhaustion signals (D4, labeled reason=cgroup_oom|timeout; timeout covers DeadlineExceeded too. The stream-era oom_killed/disk_pressure/deadline_exceeded label arms were retired with the heuristic promote paths - bump_resource_floor's two callers are the alphabet. Reactive upsize: a derivation that OOMs at mem=N retries at mem=2N. Frequent firing for one pname = raise [sla].probe defaults."
+        "help": "resource_floor doublings on explicit resource-exhaustion signals (D4, labeled reason=cgroup_oom|timeout; timeout covers DeadlineExceeded too). The stream-era oom_killed/disk_pressure/deadline_exceeded label arms were retired with the heuristic promote paths — bump_resource_floor's two callers are the alphabet. Reactive upsize: a derivation that OOMs at mem=N retries at mem=2N. Frequent firing for one pname = raise [sla].probe defaults."
       },
       {
         "name": "rio_scheduler_sla_als_round_cap_hit_total",
@@ -1340,7 +1340,7 @@
       {
         "name": "rio_store_putpath_stale_reclaimed_total",
         "kind": "counter",
-        "help": "Stale 'uploading' placeholders reclaimed on the PutPath hot path (I-207), labeled by reason: heartbeat = dead-owner DELETE + re-insert (resets stall evidence); stall_abort = the owner aborted its own wedged upload and released the claim in place; stall_reclaim = a competing claimant took over a frozen mid-upload claim in place (stall_count += 1). Nonzero expected under fetcher churn; sustained high suggests under-sized fetcher pods (see I-208)."
+        "help": "Stale 'uploading' placeholders reclaimed on the PutPath hot path (I-207), labeled by reason — reachable alphabet for THIS family: heartbeat ONLY (dead-owner DELETE + re-insert). The stall arms are substitute-family-only (rio_store_substitute_stale_reclaimed_total): stall_abort's lone emit hardcodes the substitute hooks, and stall_reclaim needs the download-stall params PutPath structurally passes as None (no narinfo size, no progress evidence). Nonzero expected under fetcher churn; sustained high suggests under-sized fetcher pods (see I-208)."
       },
       {
         "name": "rio_store_s3_deletes_pending",

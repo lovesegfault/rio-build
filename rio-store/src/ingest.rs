@@ -559,34 +559,53 @@ pub async fn abort_placeholder(pool: &PgPool, store_path_hash: &[u8], claim: Uui
 mod tests {
     use super::*;
 
-    /// bug_265 parity: the const alphabet IS the label alphabet — every
-    /// member appears in the canonical HELP text of BOTH metric
-    /// families (lib.rs describe_counter, which docs/gen/metrics.json
-    /// is generated from), and the array is duplicate-free. The emit
-    /// sites reference the named members, so reachable-reason
-    /// membership is structural. merged_bug_189: the putpath window is
-    /// anchored too — the hooks indirection parametrizes the metric
-    /// NAME, so every reason is reachable under either family and both
-    /// HELPs must document the full alphabet (pre-fix, putpath carried
-    /// reason=heartbeat its HELP never mentioned).
+    /// bug_265 parity, re-keyed per-family (merged_bug_138): the const
+    /// alphabet is the UNION; each family's HELP documents its
+    /// REACHABLE subset. heartbeat is reachable for both families (the
+    /// ingest.rs emits go through the hooks indirection). The stall
+    /// pair is substitute-only twice over: stall_abort's lone emit
+    /// hardcodes SUBSTITUTE_HOOKS (substitute.rs), and stall_reclaim
+    /// requires SubstituteClaimParams that PutPath structurally passes
+    /// as None (pinned by stall_reclaim_skips_putpath_claim). The
+    /// putpath HELP must carry that routing note instead of
+    /// overclaiming upload-stall semantics it cannot emit (the pre-fix
+    /// HELP narrated stall_abort/stall_reclaim as live putpath arms).
     #[test]
     fn stale_reclaim_reason_alphabet_matches_help() {
         let lib = include_str!("lib.rs");
-        for family in [
-            "rio_store_substitute_stale_reclaimed_total",
-            "rio_store_putpath_stale_reclaimed_total",
-        ] {
+        let families: [(&str, &[&str]); 2] = [
+            (
+                "rio_store_substitute_stale_reclaimed_total",
+                &STALE_RECLAIM_REASONS,
+            ),
+            (
+                "rio_store_putpath_stale_reclaimed_total",
+                &[STALE_RECLAIM_HEARTBEAT],
+            ),
+        ];
+        for (family, reachable) in families {
             let start = lib
                 .find(family)
                 .unwrap_or_else(|| panic!("{family} HELP present"));
             let help = &lib[start..start + 700];
-            for reason in STALE_RECLAIM_REASONS {
+            for reason in reachable {
                 assert!(
                     help.contains(reason),
-                    "{family} HELP must name reason '{reason}'"
+                    "{family} HELP must name reachable reason '{reason}'"
                 );
             }
         }
+        // The putpath HELP must state WHY its alphabet is
+        // heartbeat-only (the stall pair routes to the substitute
+        // family), not silently omit the other reasons.
+        let start = lib
+            .find("rio_store_putpath_stale_reclaimed_total")
+            .expect("putpath HELP present");
+        let help = &lib[start..start + 700];
+        assert!(
+            help.contains("substitute-family-only"),
+            "putpath HELP must state the stall arms are substitute-family-only"
+        );
         let mut sorted = STALE_RECLAIM_REASONS.to_vec();
         sorted.sort_unstable();
         sorted.dedup();

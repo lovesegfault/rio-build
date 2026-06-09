@@ -493,12 +493,13 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_store_putpath_stale_reclaimed_total",
         "Stale 'uploading' placeholders reclaimed on the PutPath hot path \
-         (I-207), labeled by reason: heartbeat = dead-owner DELETE + \
-         re-insert (resets stall evidence); stall_abort = the owner \
-         aborted its own wedged upload and released the claim in place; \
-         stall_reclaim = a competing claimant took over a frozen \
-         mid-upload claim in place (stall_count += 1). Nonzero expected \
-         under fetcher churn; sustained high suggests under-sized \
+         (I-207), labeled by reason — reachable alphabet for THIS family: \
+         heartbeat ONLY (dead-owner DELETE + re-insert). The stall arms \
+         are substitute-family-only (rio_store_substitute_stale_reclaimed_total): \
+         stall_abort's lone emit hardcodes the substitute hooks, and \
+         stall_reclaim needs the download-stall params PutPath structurally \
+         passes as None (no narinfo size, no progress evidence). Nonzero \
+         expected under fetcher churn; sustained high suggests under-sized \
          fetcher pods (see I-208)."
     );
     describe_counter!(

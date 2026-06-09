@@ -205,8 +205,11 @@ pub fn describe_metrics() {
         "rio_scheduler_exec_rows_gc_deleted_total",
         "drv_executions lifecycle rows deleted by the execution-row GC \
          (store.log.sweep-ownership second deleter): terminal, no active \
-         assignment, referenced by no drv_attempts row, older than \
-         exec_retention_days. The store's log TTL sweep never deletes these."
+         assignment, referenced by no drv_attempts row, no surviving \
+         drv_log_chunks rows, no LIVE log_ingest_sessions row, and older \
+         than exec_retention_days — the SQL twin of \
+         rio_retry_kernel::exec_row_sweep_eligible. The store's log TTL \
+         sweep never deletes these."
     );
     describe_counter!(
         "rio_scheduler_confirm_fences_gc_deleted_total",
@@ -216,12 +219,13 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_scheduler_resource_floor_bumps_total",
-        "resource_floor doublings on explicit resource-exhaustion signals (D4, labeled \
-         reason=cgroup_oom|timeout; timeout covers DeadlineExceeded too. The stream-era \
-         oom_killed/disk_pressure/deadline_exceeded label arms were retired with the \
-         heuristic promote paths - bump_resource_floor's two callers are the alphabet. \
-         Reactive upsize: a derivation that OOMs at mem=N retries at mem=2N. Frequent \
-         firing for one pname = raise [sla].probe defaults."
+        "resource_floor doublings on explicit resource-exhaustion signals (D4, \
+         labeled reason=cgroup_oom|timeout; timeout covers DeadlineExceeded too). \
+         The stream-era oom_killed/disk_pressure/deadline_exceeded label arms were \
+         retired with the heuristic promote paths — bump_resource_floor's two \
+         callers are the alphabet. Reactive upsize: a derivation that OOMs at \
+         mem=N retries at mem=2N. Frequent firing for one pname = raise \
+         [sla].probe defaults."
     );
     describe_counter!(
         "rio_scheduler_poison_fleet_exhausted_total",
