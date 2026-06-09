@@ -354,6 +354,11 @@
       "doc": "Shared size and resource limits across rio-build components."
     },
     {
+      "path": "liveness.rs",
+      "depth": 0,
+      "doc": "The bilateral log-ingest liveness contract (merged_bug_335 / §5-S"
+    },
+    {
       "path": "newtype.rs",
       "depth": 0,
       "doc": "Declarative `newtype!` macro for unit-safe scalar wrappers."
