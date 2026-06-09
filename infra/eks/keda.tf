@@ -15,7 +15,13 @@
 # helm_release here for the same reason as external-secrets: one
 # `tofu apply`, terraform owns the lifecycle. Version hardcoded (not
 # nix/pins.toml) — same as kube-prometheus-stack/external-secrets: not
-# exercised by VM tests, so no nix↔tofu pin to keep in sync.
+# exercised by VM tests, so no nix↔tofu pin to keep in sync. The pin
+# IS coupled to pins.toml [cluster].kubernetes_version, just not
+# mechanically: KEDA supports a 3-minor k8s window (2.20.x = 1.33-1.35,
+# the first train supporting our 1.35 control plane; 2.19 topped out
+# at 1.34). Re-check https://keda.sh/docs/<ver>/operate/cluster/ on
+# every kubernetes_version bump, same as the chart-version comment in
+# monitoring.tf.
 
 resource "helm_release" "keda" {
   name             = "keda"
@@ -23,7 +29,7 @@ resource "helm_release" "keda" {
   create_namespace = true
   repository       = "https://kedacore.github.io/charts"
   chart            = "keda"
-  version          = "2.19.0"
+  version          = "2.20.1"
 
   set = [
     # hostNetwork: EKS managed API server can't route to overlay pod IPs
