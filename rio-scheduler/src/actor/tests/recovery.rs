@@ -340,7 +340,7 @@ async fn test_recovery_failure_steps_down_never_serves() -> TestResult {
         "a failed-recovery tenure requests a cooperative step-down"
     );
     assert!(
-        leader.take_step_down_request(leader.acquired_transitions()),
+        leader.take_step_down_request(leader.acquired_instance()),
         "the request serves against the tenure that issued it"
     );
     assert!(

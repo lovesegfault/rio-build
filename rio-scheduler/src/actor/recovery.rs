@@ -1231,6 +1231,14 @@ impl DagActor {
         // that narrower shape is the accepted exposure.
         let gen_at_entry = self.leader.generation();
         let transitions_at_entry = self.leader.acquired_transitions();
+        // The tenure-instance stamp for a possible cooperative
+        // step-down request: unlike the transition count (which a
+        // same-epoch re-acquire legitimately repeats — the TOCTOU gate
+        // below WANTS that equality), the instance is never reused, so
+        // a step-down filed by THIS recovery can never demote a
+        // successor tenure that re-acquired at the same count
+        // (merged_bug_128).
+        let instance_at_entry = self.leader.acquired_instance();
 
         // --- Fetch PG generation high-water mark (independent step) ---
         // Read BEFORE recover_from_pg (together with the claim loop
@@ -1881,7 +1889,7 @@ impl DagActor {
                 );
                 self.clear_persisted_state();
                 metrics::counter!("rio_scheduler_recovery_step_down_total").increment(1);
-                self.leader.request_step_down(transitions_at_entry);
+                self.leader.request_step_down(instance_at_entry);
                 return;
             }
             Ok(witness) => witness,

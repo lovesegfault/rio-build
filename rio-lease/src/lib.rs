@@ -488,25 +488,40 @@ pub struct LeaderState {
     /// acquire/lose are rare.
     became_leader_at: Arc<parking_lot::RwLock<Option<Instant>>>,
     /// Cooperative step-down request (`sched.recovery.step-down`),
-    /// tenure-stamped: holds the `acquired_transitions` value of the
-    /// tenure that issued the request, or [`STEP_DOWN_NONE`] when no
-    /// request is pending. The lease loop consumes it at its next
-    /// BELIEVING tick and only when the stamp still names the current
-    /// tenure — a request from an ended tenure is dropped, never served
-    /// against its successor (the `recovery_completed_for` pattern: a
-    /// cross-task leadership signal carries the tenure that issued it).
-    /// A tick on which this replica does not believe it leads leaves
-    /// the request armed. In deployments with no lease loop
-    /// (`always_leader`) the request is a recorded dead letter — there
-    /// is no healthy peer a step-down could yield to; the operator
-    /// signal is the recovery-failure counter/alert.
+    /// stamped with the TENURE INSTANCE that issued it
+    /// ([`acquired_instance`](Self::acquired_instance)), or
+    /// [`STEP_DOWN_NONE`] when no request is pending. The lease loop
+    /// consumes it at its next BELIEVING tick and only when the stamp
+    /// still names the current instance — a request from an ended
+    /// instance is dropped, never served against its successor. The
+    /// stamp is the monotone per-acquire counter, NOT the lease
+    /// transition count: the documented-frequent false-alarm-fence +
+    /// same-epoch re-acquire pair re-acquires at the SAME transition
+    /// count, and a count-keyed stamp would let recovery #1's stale
+    /// demotion fire against a successor whose recovery #2 succeeded
+    /// (merged_bug_128). Every acquire/rebound additionally CLEARS a
+    /// pending request — a new instance starts clean; a failing re-run
+    /// re-requests under its own instance. A tick on which this
+    /// replica does not believe it leads leaves the request armed. In
+    /// deployments with no lease loop (`always_leader`) the request is
+    /// a recorded dead letter — there is no healthy peer a step-down
+    /// could yield to; the operator signal is the recovery-failure
+    /// counter/alert.
     step_down_for: Arc<AtomicU64>,
+    /// Monotone tenure-instance counter: bumped by every
+    /// [`on_acquire`](Self::on_acquire) and
+    /// [`on_rebound`](Self::on_rebound). Unlike `acquired_transitions`
+    /// (the lease's holder-change count, which a same-epoch re-acquire
+    /// legitimately repeats), an instance value is never reused — it
+    /// identifies one local tenure instance, which is what
+    /// tenure-scoped requests must bind to.
+    acquire_instance: Arc<AtomicU64>,
 }
 
 /// Sentinel for "no step-down request pending" in
 /// [`LeaderState::step_down_for`]. `u64::MAX` can never collide with a
-/// real tenure: `acquired_transitions` derives from the Lease's
-/// `leaseTransitions`, an `i32` clamped at 0 — bounded far below.
+/// real instance: the per-acquire counter starts at 0 and bumps once
+/// per acquire/rebound — bounded far below over any process lifetime.
 const STEP_DOWN_NONE: u64 = u64::MAX;
 
 impl Default for LeaderState {
@@ -683,41 +698,57 @@ impl LeaderState {
     }
 
     /// Request a cooperative step-down (`sched.recovery.step-down`)
-    /// on behalf of the tenure identified by `for_transitions` — the
-    /// `acquired_transitions` value the requesting consumer recorded
-    /// at its tenure's entry. The loop serves the request at its next
-    /// believing tick IF that tenure is still current: it releases the
-    /// lease (holder-guarded, bounded by the renew deadline), runs the
-    /// full lose-edge effects (`on_lose` + the consumer hook +
-    /// leader-marks reconciliation), then resumes candidacy on the
-    /// following tick. A request whose tenure has ended by service
-    /// time is dropped — its issuer no longer exists and the successor
-    /// tenure never asked to step down. The durable generation claim
-    /// is NOT released — an unserved claim is a documented harmless
-    /// over-claim (the floor only grows). With no lease loop
-    /// (`always_leader` deployments) the request is a dead letter: the
-    /// tenure stays incomplete and the operator signal is the caller's
-    /// failure counter.
-    pub fn request_step_down(&self, for_transitions: u64) {
-        self.step_down_for.store(for_transitions, Ordering::Release);
+    /// on behalf of the tenure INSTANCE identified by `for_instance` —
+    /// the [`acquired_instance`](Self::acquired_instance) value the
+    /// requesting consumer recorded at its tenure's entry. The loop
+    /// serves the request at its next believing tick IF that instance
+    /// is still current: it releases the lease (holder-guarded,
+    /// bounded by the renew deadline), runs the full lose-edge effects
+    /// (`on_lose` + the consumer hook + leader-marks reconciliation),
+    /// then resumes candidacy on the following tick. A request whose
+    /// instance has ended by service time is dropped — its issuer no
+    /// longer exists and the successor instance never asked to step
+    /// down; the same-count re-acquire is an ended instance too
+    /// (merged_bug_128). The durable generation claim is NOT released
+    /// — an unserved claim is a documented harmless over-claim (the
+    /// floor only grows). With no lease loop (`always_leader`
+    /// deployments) the request is a dead letter: the tenure stays
+    /// incomplete and the operator signal is the caller's failure
+    /// counter.
+    pub fn request_step_down(&self, for_instance: u64) {
+        self.step_down_for.store(for_instance, Ordering::Release);
+    }
+
+    /// The current tenure-instance value. Consumers that may later
+    /// request a tenure-scoped action
+    /// ([`request_step_down`](Self::request_step_down)) record this at
+    /// tenure entry; the loop compares against it at service time.
+    /// Monotone and never reused — a false-alarm fence followed by a
+    /// same-epoch re-acquire yields a NEW instance at the SAME
+    /// `acquired_transitions` count.
+    pub fn acquired_instance(&self) -> u64 {
+        self.acquire_instance.load(Ordering::SeqCst)
     }
 
     /// Consume a pending step-down request at a believing loop tick.
     /// Returns `true` — serve the step-down — only when the pending
-    /// request's tenure stamp equals `current_tenure`. A stale stamp
-    /// (its tenure ended; a rebound or re-acquire installed a
-    /// successor) is cleared and dropped with a warning. `false` with
-    /// no request pending is the steady state. Never called on a
-    /// disbelieving tick — the caller guards on belief FIRST, so a
-    /// self-fence at the tick top leaves the request armed for the
-    /// next believing tick ("never lost" for the tenure that asked).
-    pub fn take_step_down_request(&self, current_tenure: u64) -> bool {
+    /// request's instance stamp equals `current_instance`. A stale
+    /// stamp (its instance ended; an acquire or rebound installed a
+    /// successor — including the same-count re-acquire) is cleared and
+    /// dropped with a warning; acquire/rebound additionally clear the
+    /// slot eagerly, so this stale-drop arm is the backstop for a
+    /// request racing the edge. `false` with no request pending is the
+    /// steady state. Never called on a disbelieving tick — the caller
+    /// guards on belief FIRST, so a self-fence at the tick top leaves
+    /// the request armed for the next believing tick of the SAME
+    /// instance (a re-acquire starts clean instead).
+    pub fn take_step_down_request(&self, current_instance: u64) -> bool {
         let pending = self.step_down_for.load(Ordering::Acquire);
         if pending == STEP_DOWN_NONE {
             return false;
         }
         // compare_exchange, not swap: a racing re-request for a newer
-        // tenure must never be clobbered by this consume.
+        // instance must never be clobbered by this consume.
         if self
             .step_down_for
             .compare_exchange(pending, STEP_DOWN_NONE, Ordering::AcqRel, Ordering::Acquire)
@@ -727,14 +758,15 @@ impl LeaderState {
             // the next tick re-evaluates the fresh one.
             return false;
         }
-        if pending == current_tenure {
+        if pending == current_instance {
             return true;
         }
         warn!(
-            requested_for = pending,
-            current_tenure,
-            "dropping a stale step-down request — the tenure that issued it has ended \
-             and its successor never asked to step down"
+            requested_for_instance = pending,
+            current_instance,
+            "dropping a stale step-down request — the tenure instance that issued it \
+             has ended (a later acquire or rebound installed a successor, possibly at \
+             the same lease transition count) and the successor never asked to step down"
         );
         false
     }
@@ -777,6 +809,7 @@ impl LeaderState {
             last_leading_round: Arc::new(AtomicU64::new(0)),
             became_leader_at: Arc::new(parking_lot::RwLock::new(became_leader_at)),
             step_down_for: Arc::new(AtomicU64::new(STEP_DOWN_NONE)),
+            acquire_instance: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -803,6 +836,7 @@ impl LeaderState {
             // fail-closed").
             became_leader_at: Arc::new(parking_lot::RwLock::new(Some(Instant::now()))),
             step_down_for: Arc::new(AtomicU64::new(STEP_DOWN_NONE)),
+            acquire_instance: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -824,6 +858,7 @@ impl LeaderState {
             last_leading_round: Arc::new(AtomicU64::new(0)),
             became_leader_at: Arc::new(parking_lot::RwLock::new(None)),
             step_down_for: Arc::new(AtomicU64::new(STEP_DOWN_NONE)),
+            acquire_instance: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -898,6 +933,14 @@ impl LeaderState {
         // generation fetch_max above is a no-op.
         self.acquired_transitions
             .store(lease_transitions, Ordering::SeqCst);
+        // A new tenure INSTANCE begins: bump the never-reused instance
+        // counter and clear any pending step-down — the request's
+        // issuer ended with the previous instance, and a recovery that
+        // fails again under this one re-requests with the new stamp
+        // (merged_bug_128: the same-count re-acquire must not inherit
+        // its failed predecessor's demotion).
+        self.acquire_instance.fetch_add(1, Ordering::SeqCst);
+        self.step_down_for.store(STEP_DOWN_NONE, Ordering::SeqCst);
         self.is_leader.store(true, Ordering::SeqCst);
         // AFTER is_leader=true: a reader seeing `leader_for().is_some()`
         // also sees is_leader=true (RwLock acquire/release pairs with
@@ -964,6 +1007,11 @@ impl LeaderState {
             .store(RECOVERY_NOT_COMPLETE, Ordering::SeqCst);
         self.acquired_transitions
             .store(lease_transitions, Ordering::SeqCst);
+        // Same instance discipline as on_acquire: a rebound installs a
+        // successor tenure instance, so a step-down filed by the
+        // pre-rebound instance must not demote it (merged_bug_128).
+        self.acquire_instance.fetch_add(1, Ordering::SeqCst);
+        self.step_down_for.store(STEP_DOWN_NONE, Ordering::SeqCst);
         let target = lease_transitions.saturating_add(1);
         let new_gen = self
             .generation
@@ -1290,12 +1338,16 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
         // requested a local demotion. Belief is evaluated FIRST and the
         // request is consumed only inside a believing tick — a
         // lose/self-fence that landed at the tick top leaves the
-        // request ARMED for the next believing tick instead of eating
-        // it (the false-alarm fence + same-epoch re-acquire pair must
-        // not lose the request). Consumption is tenure-keyed:
+        // request armed for the next believing tick of the SAME tenure
+        // instance. Consumption is INSTANCE-keyed (merged_bug_128):
         // `take_step_down_request` serves the request only when its
-        // stamp names the CURRENT tenure and drops a stale one — a
-        // rebound/re-acquire successor never asked to step down.
+        // stamp names the current per-acquire instance and drops a
+        // stale one — and on_acquire/on_rebound clear the slot
+        // outright, so a false-alarm fence followed by a same-count
+        // re-acquire starts its successor instance CLEAN. A recovery
+        // that fails again under the successor re-requests with the
+        // new stamp; recovery #1's demotion can never fire against a
+        // successor whose recovery #2 succeeded.
         // The release is holder-guarded and 409/404-tolerant like the
         // shutdown release; on success the round observably resolved
         // not-leading (standing.on_observed(false)); on failure the
@@ -1304,7 +1356,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
         // releases. Either way the full lose-edge effects run
         // (state, hook, marks) and the NEXT tick resumes candidacy —
         // try_acquire_or_renew steals/acquires normally.
-        if standing.believes() && state.take_step_down_request(state.acquired_transitions()) {
+        if standing.believes() && state.take_step_down_request(state.acquired_instance()) {
             warn!(
                 holder = %cfg.holder_id,
                 "cooperative step-down requested (tenure cannot serve); releasing the lease"
@@ -5182,7 +5234,7 @@ mod tests {
         // mid-tenure, stamped with the tenure it serves. Nothing
         // happens until the next tick — the request is a stamped cell,
         // not a reentrant call.
-        observer.request_step_down(observer.acquired_transitions());
+        observer.request_step_down(observer.acquired_instance());
         assert!(observer.is_leader(), "request alone demotes nothing");
 
         // +5s tick: the request is consumed — release + full
@@ -5302,17 +5354,19 @@ mod tests {
         loop_task.await.expect("lease loop task exits cleanly");
     }
 
-    /// A pending step-down request survives a tick on which this
-    /// replica does not believe it leads, and is served at the next
-    /// believing tick of the SAME tenure. Pre-fix the loop's guard
-    /// consumed the flag before evaluating belief: a self-fence false
-    /// alarm at the tick top (local only — no apiserver write) silently
-    /// ate the request, the same-epoch re-acquire restored belief, and
-    /// the lease was never released — contradicting the accessor's
-    /// "never lost" contract.
+    /// merged_bug_128: a false-alarm fence followed by a same-epoch
+    /// re-acquire installs a NEW tenure INSTANCE at the SAME transition
+    /// count — and the re-acquire clears the failed predecessor's
+    /// step-down request. The successor's recovery re-runs; if IT
+    /// fails, it re-requests under its own instance and THAT serves.
+    /// (This test previously pinned the retired count-keyed law — the
+    /// request "surviving" the pair and demoting the successor — which
+    /// is exactly the stale demotion the instance stamp exists to
+    /// drop: recovery #1's failure must not fire against a successor
+    /// whose recovery #2 succeeded.)
     // r[verify sched.recovery.step-down+2]
     #[tokio::test(start_paused = true)]
-    async fn step_down_request_survives_a_self_fence_and_serves_after_reacquire() {
+    async fn same_epoch_reacquire_drops_the_stale_request_and_a_fresh_one_serves() {
         let (client, mock) = MockApiServer::new();
         let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
         let observer = state.clone();
@@ -5344,13 +5398,13 @@ mod tests {
         assert!(observer.is_leader(), "t=0 acquire");
 
         // The tenure's recovery fails and requests the step-down...
-        observer.request_step_down(observer.acquired_transitions());
+        observer.request_step_down(observer.acquired_instance());
 
         // ...but before the next tick a fence-clock jump (false alarm:
         // local only, the apiserver is healthy throughout) fences at the
-        // tick top. The same tick's renew succeeds and re-acquires the
-        // SAME tenure. The pending request must survive the disbelieving
-        // window.
+        // tick top. The same tick's renew succeeds and re-acquires at
+        // the SAME transition count — a NEW tenure instance, which
+        // clears the failed predecessor's request.
         jump_ms.store(12_000, Ordering::SeqCst);
         tokio::time::advance(RENEW_INTERVAL).await;
         settle().await;
@@ -5364,24 +5418,97 @@ mod tests {
             2,
             "the same tick's successful renew re-acquires (same-epoch re-claim)"
         );
+        assert!(
+            !observer.step_down_pending(),
+            "the re-acquire cleared the failed predecessor's request — the \
+             successor instance starts clean"
+        );
 
-        // Next believing tick: the surviving request is served — lease
-        // released, full lose-edge effects.
+        // Next believing tick: NOTHING serves — the successor tenure
+        // never asked to step down (its recovery may well succeed).
+        tokio::time::advance(RENEW_INTERVAL).await;
+        settle().await;
+        assert_eq!(
+            mock.holder(),
+            Some("us".to_string()),
+            "the stale request must not release the successor's lease \
+             (recovery #1's demotion firing against a successor whose \
+             recovery #2 succeeded is the merged_bug_128 failover)"
+        );
+        assert_eq!(
+            hooks.loses.lock().expect("loses").len(),
+            1,
+            "no second lose edge — the stale demotion is gone"
+        );
+
+        // The successor's OWN recovery fails too: it re-requests under
+        // its own instance, and that request serves normally.
+        observer.request_step_down(observer.acquired_instance());
         tokio::time::advance(RENEW_INTERVAL).await;
         settle().await;
         assert_eq!(
             mock.holder(),
             None,
-            "the surviving step-down request releases the lease at the next believing tick"
+            "a request filed by the CURRENT instance serves at the next believing tick"
         );
         assert_eq!(
             hooks.loses.lock().expect("loses").len(),
             2,
-            "the step-down service runs its own lose edge"
+            "the served step-down runs its own lose edge"
         );
 
         shutdown.cancel();
         loop_task.await.expect("lease loop task exits cleanly");
+    }
+
+    /// merged_bug_128 unit pair, defense (a): the acquire/rebound edges
+    /// CLEAR a pending request — a new instance starts clean.
+    #[test]
+    fn acquire_and_rebound_clear_a_pending_step_down() {
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        state.on_acquire(7);
+        state.request_step_down(state.acquired_instance());
+        assert!(state.step_down_pending());
+        // False-alarm fence + same-count re-acquire.
+        state.on_lose();
+        state.on_acquire(7);
+        assert!(
+            !state.step_down_pending(),
+            "the same-count re-acquire installs a new instance and clears the request"
+        );
+        // Rebound clears too.
+        state.request_step_down(state.acquired_instance());
+        state.on_rebound(9);
+        assert!(
+            !state.step_down_pending(),
+            "a rebound installs a successor instance and clears the request"
+        );
+    }
+
+    /// merged_bug_128 unit pair, defense (b): a stale stamp filed AFTER
+    /// the successor's edge (racing the clear) is dropped by the
+    /// instance comparison — the monotone counter never repeats, so the
+    /// same-count collision that defeated the transition-count stamp is
+    /// unrepresentable.
+    #[test]
+    fn stale_instance_stamp_is_dropped_even_at_the_same_transition_count() {
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        state.on_acquire(7);
+        let stale_instance = state.acquired_instance();
+        state.on_lose();
+        state.on_acquire(7); // same count, NEW instance
+        // The racer files with the instance it recorded at ITS entry —
+        // after the successor's clear ran.
+        state.request_step_down(stale_instance);
+        assert!(
+            !state.take_step_down_request(state.acquired_instance()),
+            "a stale instance stamp must not serve against the successor, \
+             even though the transition count is identical"
+        );
+        assert!(
+            !state.step_down_pending(),
+            "the stale request is consumed-and-dropped, not left armed"
+        );
     }
 
     /// The suspend-blindness regression the boottime fence clock fixes:
