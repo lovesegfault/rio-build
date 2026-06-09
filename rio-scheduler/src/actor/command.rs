@@ -14,6 +14,7 @@ use crate::state::{BuildOptions, DrvHash, ExecutorId, PriorityClass};
 #[cfg(test)]
 use super::handle::DebugDerivationInfo;
 
+// r[impl sched.sla.ack-validate-then-commit]
 /// Why an `AckSpawnedIntents` payload was NOT applied
 /// (merged_bug_005 — ack means applied under leadership; bug_094 —
 /// validate-then-commit: every refusal is computed by
@@ -25,7 +26,6 @@ use super::handle::DebugDerivationInfo;
 /// controller never observed is a no-op by construction
 /// (merged_bug_008: cell events carry producer evidence epochs and
 /// the ladder no-ops `epoch <= last_applied[cell]`).
-// r[impl sched.sla.ack-validate-then-commit]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AckApplyError {
     /// Deposed between the gRPC-layer leader check and the actor

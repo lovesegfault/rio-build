@@ -314,6 +314,11 @@
       "doc": "Exponential backoff with jitter, and a shutdown-aware retry loop."
     },
     {
+      "path": "cell_wire.rs",
+      "depth": 0,
+      "doc": "Single-sourced `\"h:cap[@epoch]\"` cell-event wire grammar."
+    },
+    {
       "path": "clamped.rs",
       "depth": 0,
       "doc": "One clamped constructor for externally-sourced seconds → `Duration`"

@@ -1435,6 +1435,11 @@
       "doc": "Errors from upload operations. NAR serialization happens inside the retry loop (each retry is a fresh disk read), so NAR errors surface as `UploadExhausted` wrapping a `tonic::Status::internal(\"NAR serialization failed...\")`."
     },
     {
+      "name": "CellDecodeError",
+      "crate": "rio-common",
+      "doc": "Why a cell-event string failed to decode. Carried into typed refusals (the scheduler's ack apply plan) so an undecodable entry is a loud producer-skew signal, never a silent drop (bug_094)."
+    },
+    {
       "name": "NameError",
       "crate": "rio-common",
       "doc": "Construction-time rejection. The `Display` impl's message is what callers map to `Status::invalid_argument`."
@@ -1507,7 +1512,7 @@
     {
       "name": "AckApplyError",
       "crate": "rio-scheduler",
-      "doc": "Why an `AckSpawnedIntents` payload was NOT applied (merged_bug_005 — ack means applied under leadership). Mapped to a gRPC error by the admin layer; the controller's commit-on-Ack buffer survives an erring Ack and redelivers, which is idempotent on every plane (clears are removes, observed types upsert, marks refresh-not-step)."
+      "doc": "Why an `AckSpawnedIntents` payload was NOT applied (merged_bug_005 — ack means applied under leadership; bug_094 — validate-then-commit: every refusal is computed by `AckApplyPlan::validate` BEFORE the first state mutation, so an erring Ack means NO plane landed). Mapped to a gRPC error by the admin layer; the controller's commit-on-Ack buffer survives an erring Ack and redelivers the whole buffer — safe, because an erring Ack applied nothing, and redelivery after an Ok the controller never observed is a no-op by construction (merged_bug_008: cell events carry producer evidence epochs and the ladder no-ops `epoch <= last_applied[cell]`)."
     },
     {
       "name": "ActorError",
