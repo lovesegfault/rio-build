@@ -1045,40 +1045,41 @@ async fn bot_streak_frozen_across_acquire_resets_on_success() {
 /// R9 wedge (retain-safe class): expiry evidence fed through the real
 /// tick survives the acquire edge and still drives a Dead reap one
 /// tick later; `tick_counter` advances on every leader tick.
+///
+/// merged_bug_024 restructure: the node's claim is REGISTERED from
+/// tick 1 — the admission authority refuses (and tombstones)
+/// fleet-absent attribution, so the retired shape of this test
+/// (evidence admitted while NO claim existed, claim materializing
+/// later) is now inadmissible-by-law, not retained-by-luck. The R9
+/// property pinned is sharper: HALF the wedge pair predates the
+/// acquire edge, so the tick-2 reap proves the pre-acquire anchor was
+/// retained (without retention, one in-window anchor cannot reap).
 // r[verify ctrl.nodeclaim.lease-edge-polarity+4]
 #[tokio::test]
 async fn wedge_evidence_survives_acquire() {
     let mut lab = Lab::new().await;
-    lab.set_open_attempts(vec![
-        OpenAttempt {
-            intent_id: "drv-a".into(),
-            source_node: "node-c-w".into(),
-            deadline_secs: 60,
-            assigned_at_age_secs: 120,
-            attempt_kind: rio_proto::types::AttemptKind::Build as i32,
-            ..Default::default()
-        },
-        OpenAttempt {
-            intent_id: "drv-b".into(),
-            source_node: "node-c-w".into(),
-            deadline_secs: 60,
-            assigned_at_age_secs: 120,
-            attempt_kind: rio_proto::types::AttemptKind::Build as i32,
-            ..Default::default()
-        },
-    ]);
+    let attempt = |intent: &str| OpenAttempt {
+        intent_id: intent.into(),
+        source_node: "node-c-w".into(),
+        deadline_secs: 60,
+        assigned_at_age_secs: 120,
+        attempt_kind: rio_proto::types::AttemptKind::Build as i32,
+        ..Default::default()
+    };
+    let claim = nc_json("c-w", 0, Some(1));
+    lab.set_open_attempts(vec![attempt("drv-a")]);
     let tc0 = lab.r.tick_counter;
-    // Tick 1: evidence observed (no claim on the node yet).
-    lab.tick(0, full_tick_scenario(vec![], vec![], vec![]))
+    // Tick 1: the claim is registered; ONE expiry anchors (below the
+    // cluster threshold — no reap yet).
+    lab.tick(0, full_tick_scenario(vec![], vec![claim.clone()], vec![]))
         .await;
 
-    // Acquire edge; ledger view now empty — retention must carry.
+    // Acquire edge; the second distinct derivation expires after it.
     lab.r.hooks.on_acquire();
-    lab.set_open_attempts(vec![]);
+    lab.set_open_attempts(vec![attempt("drv-a"), attempt("drv-b")]);
 
-    // Tick 2: a registered claim materializes on the wedged node →
-    // classify(Dead) from RETAINED evidence → scripted DELETE.
-    let claim = nc_json("c-w", 0, Some(1)); // stale edge: record-only
+    // Tick 2: the pair completes → classify(Dead) from evidence whose
+    // FIRST anchor predates the acquire → scripted DELETE.
     lab.tick(
         30,
         full_tick_scenario(

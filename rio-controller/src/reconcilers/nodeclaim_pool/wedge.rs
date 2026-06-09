@@ -244,6 +244,89 @@ struct Suppression {
     max_expiry_pg: u64,
 }
 
+/// merged_bug_024: the per-tick admission authority — the ONE
+/// definition of node-conclusiveness evidence admission may consult.
+/// Both conclusiveness legs are fixed at construction: eviction
+/// tombstones (controller reaps, absence-sweep evictions, and prior
+/// ghost refusals — window-TTL'd in `prune`) and fleet-absence (not in
+/// the tick's registered NodeClaim fleet). The absence sweep in
+/// `update` derives its evict-and-tombstone decision from the SAME
+/// [`AdmissionAuthority::fleet_absent`] predicate the gate composes,
+/// so the sweep and the admission gate cannot diverge on which
+/// conclusiveness sources exist; a future source is added here and
+/// nowhere else.
+///
+/// The retired shape derived the sweep from `evidence.keys()` only
+/// and gated `observe` on tombstones only — a Karpenter-GC'd node
+/// with NO prior evidence (never in `evidence`, never
+/// controller-reaped) was admitted on its first post-expiry tick and
+/// counted in wedged/breadth/population, violating the documented
+/// absence law below and `ctrl.nodeclaim.wedge-cluster`'s
+/// fleet-absence clause. Ghosts cannot be destructively reaped
+/// (`health::classify` emits Dead only for registered claims), but
+/// two wedged ghosts on a small fleet minted a false
+/// `Systemic{2, of: 3}` whose drain+latch+dwell then blacked out
+/// GENUINE per-node verdicts — undone by nothing.
+struct AdmissionAuthority<'a> {
+    /// Eviction tombstones at tick start (node → eviction instant).
+    tombstoned: &'a HashMap<String, f64>,
+    /// The tick's registered NodeClaim fleet.
+    registered: &'a HashSet<String>,
+}
+
+/// One admission ruling. The ghost arm is distinct so the caller can
+/// mint the spec's "tombstoned for one window" tombstone exactly once
+/// per absence episode: a refused node that is ALREADY tombstoned
+/// must not refresh its own tombstone (a self-perpetuating tombstone
+/// would keep a re-registered same-named node undetectable forever —
+/// the merged_bug_060 over-suppress inversion).
+enum Admission {
+    /// Both legs pass: the node may accumulate evidence.
+    Admissible,
+    /// Refused by a live tombstone (tombstone leg has precedence).
+    RefusedTombstoned,
+    /// Refused by fleet-absence with no live tombstone — a ghost on
+    /// its first refusal. The caller tombstones it, so a same-named
+    /// NodeClaim that re-registers inside the window cannot inherit
+    /// the dead incarnation's still-open attempts as evidence
+    /// (under-detect ≤ one window, the module's documented safe
+    /// direction).
+    RefusedGhost,
+}
+
+impl<'a> AdmissionAuthority<'a> {
+    /// Constructed once per tick in [`WedgeTracker::update`] after
+    /// reap feedback and the absence sweep folded into the
+    /// tombstones, before any observation.
+    fn for_tick(tombstoned: &'a HashMap<String, f64>, registered: &'a HashSet<String>) -> Self {
+        Self {
+            tombstoned,
+            registered,
+        }
+    }
+
+    /// The fleet-absence conclusiveness leg — the absence sweep's
+    /// predicate. An associated fn (not a method) because the sweep
+    /// runs BEFORE the authority can borrow the tombstone map it is
+    /// about to mutate; both call sites name this one definition.
+    fn fleet_absent(registered: &HashSet<String>, node: &str) -> bool {
+        !registered.contains(node)
+    }
+
+    /// The admission ruling `observe` consumes — the only
+    /// admissibility source (composition of both legs, tombstone leg
+    /// first).
+    fn admit(&self, node: &str) -> Admission {
+        if self.tombstoned.contains_key(node) {
+            Admission::RefusedTombstoned
+        } else if Self::fleet_absent(self.registered, node) {
+            Admission::RefusedGhost
+        } else {
+            Admission::Admissible
+        }
+    }
+}
+
 /// Per-node deadline-expiry evidence with window pruning. One instance
 /// lives on the NodeClaim-pool reconciler; `update` is called once per
 /// tick with that tick's open-attempt view (or `None` when the view
@@ -474,10 +557,14 @@ impl WedgeTracker {
         // fleet (deleted out-of-band, Karpenter GC) is evicted exactly
         // like a reaped one — its evidence cannot mark a node that is
         // gone, and it must not inflate the verdict populations.
+        // merged_bug_024: the sweep's "absent" is the SAME
+        // fleet-absence predicate the admission authority composes —
+        // the sweep covers evidence-bearing absentees, the gate
+        // refuses (and tombstones) ghosts that never had evidence.
         let absent: Vec<String> = self
             .evidence
             .keys()
-            .filter(|n| !registered.contains(*n))
+            .filter(|n| AdmissionAuthority::fleet_absent(registered, n))
             .cloned()
             .collect();
         for node in absent {
@@ -494,7 +581,7 @@ impl WedgeTracker {
             // drain `marked` and double-count later transitions).
             return seal::finalize(self, None, now_secs);
         };
-        self.observe(open_attempts, now_secs);
+        self.observe(open_attempts, registered, now_secs);
         self.prune(now_secs);
         let populations = WedgePopulations::from_window(&self.evidence, registered, now_secs);
         seal::finalize(self, Some(populations), now_secs)
@@ -506,14 +593,32 @@ impl WedgeTracker {
     /// pair anchors at its first observation. (The systemic-guard
     /// denominator is the REGISTERED fleet — §5-S Q2 — not the view's
     /// attributed nodes, so nothing is returned here.)
-    fn observe(&mut self, open_attempts: &[OpenAttempt], now_secs: f64) {
+    ///
+    /// merged_bug_024: node-conclusiveness is consumed ONLY through
+    /// the per-tick [`AdmissionAuthority`] (tombstones ∪
+    /// fleet-absence). A ledger-attributed attempt on a never-seen
+    /// fleet-absent node (Karpenter-GC'd before its first
+    /// observation) is refused AND tombstoned on first refusal — the
+    /// spec's "tombstoned for one window" — instead of admitted into
+    /// the verdict populations.
+    fn observe(
+        &mut self,
+        open_attempts: &[OpenAttempt],
+        registered: &HashSet<String>,
+        now_secs: f64,
+    ) {
+        let authority = AdmissionAuthority::for_tick(&self.evicted, registered);
+        let mut refused_ghosts: Vec<String> = Vec::new();
         for a in open_attempts {
             if a.attempt_kind != rio_proto::types::AttemptKind::Build as i32 {
                 // Materialization (store fetch): the stamped node is the
                 // stale builder binding — never pod-on-node evidence.
-                // UNSPECIFIED (rolling-skew producer) is skipped too:
-                // under-detecting for the skew window is the safe
-                // direction.
+                // UNSPECIFIED is skipped too: a fail-closed posture for
+                // a destructive Dead-reap — deliberately DIFFERENT from
+                // pool/job.rs's MintedPullIdentity, which reads
+                // UNSPECIFIED as Build per the pinned proto posture (a
+                // report is charge-accounting, a reap is destruction;
+                // RULED S2-OQ4, neither site "fixes" the other).
                 continue;
             }
             if a.source_node.is_empty() {
@@ -522,12 +627,20 @@ impl WedgeTracker {
                 // says nothing about node breadth).
                 continue;
             }
-            if self.evicted.contains_key(&a.source_node) {
+            match authority.admit(&a.source_node) {
                 // merged_bug_017: an evicted node's still-open attempts
                 // are inadmissible. Eviction is an admission source
                 // consumed here, not a state wipe the next observation
                 // undoes.
-                continue;
+                Admission::RefusedTombstoned => continue,
+                // merged_bug_024: first refusal of a fleet-absent
+                // ghost — queue its tombstone (applied after the loop;
+                // the authority borrows the tombstone map).
+                Admission::RefusedGhost => {
+                    refused_ghosts.push(a.source_node.clone());
+                    continue;
+                }
+                Admission::Admissible => {}
             }
             if a.deadline_secs == 0 {
                 // Deadline unknown to the scheduler — can't call it expired.
@@ -590,6 +703,15 @@ impl WedgeTracker {
                     anchor: now_secs,
                     expiry_pg,
                 });
+        }
+        // merged_bug_024: mint the ghosts' tombstones (one per absence
+        // episode — `or_insert` dedups within the tick; across ticks
+        // the `RefusedGhost` arm only fires while NO tombstone lives,
+        // so an expired tombstone re-mints but a live one never
+        // self-refreshes). The window TTL in `prune` is the same
+        // one-window law as every other tombstone.
+        for node in refused_ghosts {
+            self.evicted.entry(node).or_insert(now_secs);
         }
     }
 
@@ -1003,6 +1125,81 @@ mod tests {
         );
     }
 
+    /// merged_bug_024: a Karpenter-GC'd node with NO prior evidence
+    /// (never controller-reaped, never in `evidence`) must be refused
+    /// by the admission authority's fleet-absence leg and tombstoned
+    /// on first refusal — never admitted into wedged/breadth/
+    /// population. Recorded red on the pre-authority code: tick 1
+    /// returned `Systemic{2, of: 3}` (two wedged ghosts + one
+    /// registered node), whose whole-episode drain + watermark latch
+    /// then blocked n1's genuine first expiry from ever pairing — a
+    /// verdict blackout undone by nothing.
+    // r[verify ctrl.nodeclaim.wedge-cluster+3]
+    #[test]
+    fn ghost_nodes_cannot_inflate_verdict_populations() {
+        /// PG-frame production posture (Q1): `assigned_at_epoch_secs`
+        /// set, age consistent with `now`.
+        fn pg_expired(intent: &str, node: &str, assigned_pg: u64, now: f64) -> OpenAttempt {
+            OpenAttempt {
+                assigned_at_epoch_secs: assigned_pg,
+                assigned_at_age_secs: (now as u64) - assigned_pg,
+                ..expired(intent, node, 0)
+            }
+        }
+        let mut t = WedgeTracker::default();
+        let reg = fleet(&["node-1"]);
+        // Tick 1 at 10_000: two ghosts (deleted out-of-band before any
+        // observation) each carry 2 distinct expired drvs; node-1's
+        // genuine pair is still building (first expiry only). All rows
+        // are well past deadline(100) + grace(30).
+        let view1 = vec![
+            pg_expired("ga1", "ghost-1", 9_800, 10_000.0),
+            pg_expired("ga2", "ghost-1", 9_800, 10_000.0),
+            pg_expired("gb1", "ghost-2", 9_800, 10_000.0),
+            pg_expired("gb2", "ghost-2", 9_800, 10_000.0),
+            pg_expired("n1a", "node-1", 9_820, 10_000.0),
+        ];
+        match t.update(Some(&view1), &no_reaps(), &reg, 10_000.0) {
+            WedgeVerdict::Systemic { affected, of, .. } => {
+                panic!("ghosts minted a false systemic verdict ({affected}/{of})")
+            }
+            WedgeVerdict::NodeWedged(nodes, _) => assert!(
+                nodes.is_empty(),
+                "one genuine expiry must not mark; ghosts must not mark: {nodes:?}"
+            ),
+            WedgeVerdict::Unobserved(_) => panic!("observed tick yielded Unobserved"),
+        }
+        // First refusal minted the ghosts' tombstones (the literal
+        // "tombstoned for one window" conformance), and no episode
+        // was drained: no suppression watermark latched.
+        assert!(
+            t.evicted.contains_key("ghost-1") && t.evicted.contains_key("ghost-2"),
+            "ghost refusal must mint eviction tombstones: {:?}",
+            t.evicted
+        );
+        assert!(
+            t.last_suppression.is_none(),
+            "no episode existed; nothing may latch"
+        );
+        // Tick 2: node-1's second derivation expires (fresh attempt,
+        // PG-frame). The genuine pair must mark — the recorded red's
+        // counterfactual was a drained episode + latch blocking
+        // exactly this admission.
+        let view2 = vec![
+            pg_expired("n1a", "node-1", 9_820, 10_010.0),
+            pg_expired("n1b", "node-1", 9_879, 10_010.0),
+            // The ghosts' still-open attempts re-present and stay
+            // refused on the tombstone leg.
+            pg_expired("ga1", "ghost-1", 9_800, 10_010.0),
+        ];
+        match t.update(Some(&view2), &no_reaps(), &reg, 10_010.0) {
+            WedgeVerdict::NodeWedged(nodes, _) => {
+                assert_eq!(nodes, vec!["node-1".to_string()])
+            }
+            other => panic!("genuine pair must mark on tick 2, got {other:?}"),
+        }
+    }
+
     /// Evidence ages out of the 30-minute window: two expiries observed
     /// far apart never coexist inside one window, so the node is not
     /// marked; once both are inside the window it is.
@@ -1196,7 +1393,14 @@ mod proptests {
     use super::*;
 
     const DRVS: [&str; 3] = ["d0", "d1", "d2"];
-    const NODES: [&str; 4] = ["", "n0", "n1", "n2"];
+    /// Attribution universe: "" (unattributable), three REGISTERED
+    /// nodes, and one ghost (merged_bug_024: ledger-attributed but
+    /// outside the registered fleet — refused + tombstoned by the
+    /// admission authority, never evidence).
+    const NODES: [&str; 5] = ["", "n0", "n1", "n2", "g0"];
+    /// The registered NodeClaim fleet (constant across a trajectory);
+    /// `g0` is deliberately outside it.
+    const REGISTERED: [&str; 3] = ["n0", "n1", "n2"];
 
     /// One trajectory tick: the observed view (None = RPC failure),
     /// plus the backing nodes reaped since the last tick.
@@ -1235,7 +1439,11 @@ mod proptests {
                 1 => Just(None),
             ],
             proptest::collection::btree_set(
-                proptest::sample::select(&NODES[1..]).prop_map(str::to_owned),
+                // Reap feedback covers registered claims only (the
+                // controller cannot reap a ghost's NodeClaim — it has
+                // none); ghost conclusiveness flows through the
+                // admission authority's fleet-absence leg instead.
+                proptest::sample::select(&REGISTERED[..]).prop_map(str::to_owned),
                 0..=2,
             ),
         )
@@ -1286,6 +1494,14 @@ mod proptests {
                 {
                     continue;
                 }
+                // merged_bug_024 admission law (independent set
+                // algebra): evidence requires registered ∧
+                // not-tombstoned; a fleet-absent refusal with no live
+                // tombstone mints one (once per absence episode).
+                if !REGISTERED.contains(&a.source_node.as_str()) {
+                    self.evicted.entry(a.source_node.clone()).or_insert(now);
+                    continue;
+                }
                 fleet.insert(a.source_node.clone());
                 if a.deadline_secs == 0
                     || a.assigned_at_age_secs <= a.deadline_secs + WEDGE_DEADLINE_GRACE_SECS
@@ -1320,9 +1536,9 @@ mod proptests {
                 .collect();
             let evidence_nodes: BTreeSet<&str> =
                 self.anchors.keys().map(|(n, _)| n.as_str()).collect();
-            // Q2: registered-fleet denominator (the oracle's fleet is
-            // every named node, constant across the trajectory).
-            let registered: BTreeSet<&str> = NODES[1..].iter().copied().collect();
+            // Q2: registered-fleet denominator (constant across the
+            // trajectory; the ghost is outside it by construction).
+            let registered: BTreeSet<&str> = REGISTERED.iter().copied().collect();
             let population = evidence_nodes
                 .iter()
                 .copied()
@@ -1433,7 +1649,7 @@ mod proptests {
             for (i, tick) in ticks.iter().enumerate() {
                 let now = t0 + (i as f64) * 10.0;
                 let registered: HashSet<String> =
-                    NODES[1..].iter().map(|s| s.to_string()).collect();
+                    REGISTERED.iter().map(|s| s.to_string()).collect();
                 let verdict = tracker.update(tick.view.as_deref(), &tick.reaped, &registered, now);
                 match (oracle.step(tick, now), verdict) {
                     (Expect::Skipped, WedgeVerdict::Unobserved(_)) => {}
@@ -1467,26 +1683,34 @@ mod proptests {
     /// Kani substitute (rio-controller is [[bin]]-ineligible for the
     /// kani driver — recorded none-sensible-for-kani per the bug_363
     /// precedent): EXHAUSTIVE single-tick verdict check over the full
-    /// 8-node bitmask universe at the real constants. Every subset of
-    /// nodes carries 2 expired drvs (wedge-qualifying), every disjoint
-    /// subset is healthy fleet — all 3^8 (node ∈ {qualifying, healthy,
-    /// absent}) combinations, affected ≤ of asserted on every systemic
-    /// verdict and the verdict matching the closed-form expectation.
+    /// 8-node universe at the real constants — all 4^8 (node ∈
+    /// {absent, healthy, qualifying, ghost-qualifying}) combinations
+    /// (merged_bug_024 extended the 3^8 universe with the ghost
+    /// state: a node OUTSIDE the registered fleet whose view rows
+    /// carry 2 expired drvs). Closed-form expectation: ghosts are
+    /// excluded from wedged, breadth AND population (the registered
+    /// universe shrinks by the ghost count); affected ≤ of on every
+    /// systemic verdict; every refused ghost is tombstoned.
     #[test]
     fn wedge_populations_exhaustive_bounded() {
         let nodes: Vec<String> = (0..8).map(|i| format!("n{i}")).collect();
         let mut checked = 0u32;
-        // 3^8 assignments: 0 = absent, 1 = healthy-only, 2 = qualifying.
-        for mask in 0..3u32.pow(8) {
+        // 4^8 assignments: 0 = absent (registered, no view rows),
+        // 1 = healthy-only, 2 = qualifying, 3 = ghost-qualifying
+        // (NOT registered, 2 expired drvs in the view).
+        for mask in 0..4u32.pow(8) {
             let mut view: Vec<OpenAttempt> = Vec::new();
             let mut expect_wedged: Vec<String> = Vec::new();
-            let mut population: BTreeSet<&str> = BTreeSet::new();
+            let mut ghosts: Vec<String> = Vec::new();
+            let mut registered: HashSet<String> = HashSet::new();
             let mut m = mask;
             for n in &nodes {
-                let state = m % 3;
-                m /= 3;
+                let state = m % 4;
+                m /= 4;
                 match state {
-                    0 => {}
+                    0 => {
+                        registered.insert(n.clone());
+                    }
                     1 => {
                         view.push(OpenAttempt {
                             intent_id: "h".into(),
@@ -1496,9 +1720,9 @@ mod proptests {
                             assigned_at_age_secs: 10,
                             ..Default::default()
                         });
-                        population.insert(n.as_str());
+                        registered.insert(n.clone());
                     }
-                    _ => {
+                    s => {
                         for d in ["da", "db"] {
                             view.push(OpenAttempt {
                                 intent_id: d.into(),
@@ -1509,23 +1733,23 @@ mod proptests {
                                 ..Default::default()
                             });
                         }
-                        expect_wedged.push(n.clone());
-                        population.insert(n.as_str());
+                        if s == 2 {
+                            expect_wedged.push(n.clone());
+                            registered.insert(n.clone());
+                        } else {
+                            ghosts.push(n.clone());
+                        }
                     }
                 }
             }
             expect_wedged.sort();
-            // Q2: the denominator is the REGISTERED fleet (all eight
-            // nodes, regardless of which appear in the view) united
-            // with the evidence nodes — here always 8. Breadth equals
-            // the qualifying count (only state-2 nodes contribute
-            // evidence), so the breadth law coincides with the ratio
-            // law in this single-tick universe.
-            let _ = population;
+            // Q2 + merged_bug_024 closed form: population = registered
+            // fleet ∪ evidence nodes = the registered fleet (ghosts
+            // never enter evidence); breadth = the qualifying count.
+            let population = registered.len();
             let systemic = expect_wedged.len() >= 2
-                && (expect_wedged.len() as f64 / nodes.len() as f64) > WEDGE_SYSTEMIC_FRACTION;
+                && (expect_wedged.len() as f64 / population as f64) > WEDGE_SYSTEMIC_FRACTION;
             let mut tracker = WedgeTracker::default();
-            let registered: HashSet<String> = nodes.iter().cloned().collect();
             let verdict = tracker.update(
                 Some(&view),
                 &std::collections::BTreeSet::new(),
@@ -1542,7 +1766,7 @@ mod proptests {
                     assert!(systemic, "mask {mask}: unexpected systemic");
                     assert!(affected <= of, "mask {mask}: {affected}/{of}");
                     assert_eq!(affected, expect_wedged.len(), "mask {mask}");
-                    assert_eq!(of, nodes.len(), "mask {mask}");
+                    assert_eq!(of, population, "mask {mask}");
                     assert_eq!(breadth, expect_wedged.len(), "mask {mask}");
                 }
                 WedgeVerdict::NodeWedged(found, _) => {
@@ -1553,9 +1777,19 @@ mod proptests {
                     panic!("mask {mask}: observed view yielded Unobserved")
                 }
             }
+            for g in &ghosts {
+                assert!(
+                    tracker.evicted.contains_key(g),
+                    "mask {mask}: refused ghost {g} must be tombstoned"
+                );
+                assert!(
+                    !tracker.evidence.contains_key(g),
+                    "mask {mask}: ghost {g} must hold no evidence"
+                );
+            }
             checked += 1;
         }
-        assert_eq!(checked, 3u32.pow(8), "full universe covered");
+        assert_eq!(checked, 4u32.pow(8), "full universe covered");
     }
 }
 

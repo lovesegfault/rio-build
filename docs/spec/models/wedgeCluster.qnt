@@ -116,8 +116,28 @@ module wedgeCluster {
   const ENABLE_TRAJECTORY: bool
   const DWELL_TICKS: int
   const BREADTH_MIN: int
+  // merged_bug_024 (round-5): the ghost-admission axis. The two
+  // consts follow the TRACK_EPISODE_GHOSTS parameter ladder:
+  //   TRACK_GHOST_NODES — on: the attribution universe gains one
+  //     GHOST node ("g0") OUTSIDE the registered fleet (a node
+  //     Karpenter-GC'd before its first observation can still appear
+  //     as an open attempt's source_node); off: the universe is the
+  //     registered NODES exactly — zero state cost, byte-identical
+  //     spaces for every pre-round-5 regime.
+  //   ENABLE_ADMISSION — on (the repair): evidence admission consumes
+  //     fleet-membership through the per-tick admission authority —
+  //     a fleet-absent attribution is refused, so evidence, breadth
+  //     and the verdict populations stay within the registered
+  //     universe; off (as-built): a ghost is admitted on its first
+  //     expiry tick and counted in wedged/breadth/population, minting
+  //     false Systemics over a denominator larger than the fleet.
+  const TRACK_GHOST_NODES: bool
+  const ENABLE_ADMISSION: bool
 
   val NODES = Set("n0", "n1", "n2")
+  val GHOSTS = if (TRACK_GHOST_NODES) Set("g0") else Set()
+  // The attribution universe: every node an open attempt can name.
+  val ATTRIB_NODES = NODES.union(GHOSTS)
   val DRVS = Set("d0", "d1")
 
   // --- state ----------------------------------------------------------------
@@ -244,13 +264,22 @@ module wedgeCluster {
     // ghost (attempts did not close because we failed to look).
     val newExpiredSince = if (rpcFail) expiredSince else
       effExpired.mapBy(p => if (expiredSince.keys().contains(p)) expiredSince.get(p) else now)
+    // merged_bug_024 admission authority (fleet-absence leg): a
+    // fleet-absent attribution is refused BEFORE the watermark gate —
+    // the same gate order as the Rust (authority, then watermark).
+    val fleetAdmitted = if (ENABLE_ADMISSION)
+        effExpired.filter(p => NODES.contains(p._1))
+      else effExpired
     // merged_bug_163 admission gate: an expiry run that began at or
     // before the watermark belongs to a suppressed episode.
     val admitted = if (ENABLE_EPISODE_LATCH)
-        effExpired.filter(p => newExpiredSince.get(p) > watermark)
-      else effExpired
+        fleetAdmitted.filter(p => newExpiredSince.get(p) > watermark)
+      else fleetAdmitted
     val evObserved = if (skip) evAfterEvict else pruned(observed(evAfterEvict, admitted, now), now)
-    val fleet = effHealthy.union(effExpired.map(p => p._1))
+    // Under the authority the verdict populations stay within the
+    // registered universe (refused ghosts contribute neither evidence
+    // nor fleet); as-built the ghost names leak into both.
+    val fleet = effHealthy.union(fleetAdmitted.map(p => p._1))
     val wedged = if (skip) Set() else wedgedOf(evObserved, now)
     // merged_bug_034: under the trajectory axis the denominator is
     // the REGISTERED fleet (the model universe), never the per-tick
@@ -332,7 +361,10 @@ module wedgeCluster {
     }
 
   action tick = {
-    nondet expired = tuples(NODES, DRVS).powerset().oneOf()
+    // Expiries draw from the ATTRIBUTION universe (ghosts included
+    // when tracked); healthy attribution stays registered-only — a
+    // ghost's signal is exactly its still-open expired attempts.
+    nondet expired = tuples(ATTRIB_NODES, DRVS).powerset().oneOf()
     nondet healthy = NODES.powerset().oneOf()
     nondet rpcFail = Set(true, false).oneOf()
     val r = foldTick(expired, healthy, rpcFail)
@@ -466,6 +498,22 @@ module wedgeCluster {
           expiredSince.keys().contains((n, d)) implies
             expiredSince.get((n, d)) > watermark))
 
+  // merged_bug_024: evidence stays within the registered universe —
+  // the admission authority's fleet-absence leg refuses ghost
+  // attribution, so no fleet-absent node can accumulate anchors. The
+  // as-built (admission off) violates this on a ghost's first
+  // observed expiry tick.
+  val evidenceWithinRegistered =
+    evidence.keys().forall(n => NODES.contains(n))
+  // merged_bug_024: the fleet-denominator law over the registered
+  // universe — a Systemic verdict's denominator never exceeds the
+  // registered fleet (ghosts cannot inflate it; with the lull guard
+  // it can still be smaller in non-trajectory regimes). The as-built
+  // violates this when admitted ghosts both wedge and pad the
+  // population.
+  val systemicOfWithinRegisteredUniverse =
+    lastSystemic implies (lastOf <= NODES.size())
+
   val boundsOK = and {
     time >= 0, time <= MAX_TIME,
     markedIncrements >= 0,
@@ -496,7 +544,9 @@ module wedgeClusterMain {
     TRACK_EPISODE_GHOSTS = false,
     ENABLE_TRAJECTORY = false,
     DWELL_TICKS = 1,
-    BREADTH_MIN = 2
+    BREADTH_MIN = 2,
+    TRACK_GHOST_NODES = false,
+    ENABLE_ADMISSION = true
   ).*
 }
 
@@ -518,7 +568,9 @@ module wedgeClusterLatch {
     TRACK_EPISODE_GHOSTS = true,
     ENABLE_TRAJECTORY = false,
     DWELL_TICKS = 1,
-    BREADTH_MIN = 2
+    BREADTH_MIN = 2,
+    TRACK_GHOST_NODES = false,
+    ENABLE_ADMISSION = true
   ).*
 }
 
@@ -535,7 +587,9 @@ module wedgeClusterNoEviction {
     TRACK_EPISODE_GHOSTS = false,
     ENABLE_TRAJECTORY = false,
     DWELL_TICKS = 1,
-    BREADTH_MIN = 2
+    BREADTH_MIN = 2,
+    TRACK_GHOST_NODES = false,
+    ENABLE_ADMISSION = true
   ).*
 }
 
@@ -557,7 +611,9 @@ module wedgeClusterTrajectory {
     TRACK_EPISODE_GHOSTS = false,
     ENABLE_TRAJECTORY = true,
     DWELL_TICKS = 1,
-    BREADTH_MIN = 2
+    BREADTH_MIN = 2,
+    TRACK_GHOST_NODES = false,
+    ENABLE_ADMISSION = true
   ).*
 }
 
@@ -578,6 +634,33 @@ module wedgeClusterEpilogue {
     TRACK_EPISODE_GHOSTS = false,
     ENABLE_TRAJECTORY = false,
     DWELL_TICKS = 1,
-    BREADTH_MIN = 2
+    BREADTH_MIN = 2,
+    TRACK_GHOST_NODES = false,
+    ENABLE_ADMISSION = true
+  ).*
+}
+
+// merged_bug_024 (round-5): the ghost-admission regime --- the ghost
+// node is live in the attribution universe and the admission
+// authority's fleet-absence leg is ON. evidenceWithinRegistered and
+// systemicOfWithinRegisteredUniverse carry the repair's content here;
+// the as-built twin (calibration/wedge-024-ghost-admission) violates
+// both at these exact bounds. Ghost-free regimes above are
+// byte-identical to their pre-round-5 spaces (TRACK_GHOST_NODES=false
+// keeps ATTRIB_NODES = NODES; the admission filter is an identity
+// over registered-only pairs).
+module wedgeClusterAdmission {
+  import wedgeCluster(
+    MAX_TIME = 4, WINDOW = 2, MIN_DISTINCT = 2,
+    ENABLE_POPULATIONS = true,
+    ENABLE_FULL_EPILOGUE = true,
+    ENABLE_EPISODE_LATCH = true,
+    ENABLE_EVICTION = true,
+    TRACK_EPISODE_GHOSTS = false,
+    ENABLE_TRAJECTORY = false,
+    DWELL_TICKS = 1,
+    BREADTH_MIN = 2,
+    TRACK_GHOST_NODES = true,
+    ENABLE_ADMISSION = true
   ).*
 }

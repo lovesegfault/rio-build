@@ -6731,6 +6731,53 @@ rec {
       witness = "reapedImpliesEvicted";
     };
 
+    # merged_bug_024 (round-5): the ghost-admission regime — the ghost
+    # node live in the attribution universe, the admission authority's
+    # fleet-absence leg ON. Both admission laws TLC-EXHAUSTIVE at
+    # MAX_TIME=4/WINDOW=2: 85,729,167 states generated / 138,722
+    # distinct / 0 on queue, 5m27s at workers=auto — budget 1800s
+    # ≈ 5.5× measured. Ghost-free regimes above are byte-identical
+    # to their pre-round-5 spaces (TRACK_GHOST_NODES=false keeps the
+    # nondet domain unchanged; the admission filter is an identity over
+    # registered-only pairs).
+    # r[verify ctrl.nodeclaim.wedge-cluster+3]
+    quint-wedge-cluster-admission = mkQuintCheck {
+      name = "wedge-cluster-admission";
+      spec = "wedgeCluster";
+      main = "wedgeClusterAdmission";
+      invariants = [
+        "boundsOK"
+        "affectedLeOf"
+        "evidenceWithinRegistered"
+        "systemicOfWithinRegisteredUniverse"
+      ];
+    };
+    # Falsify twin (live-import, calibration/): the as-built admission
+    # gate never consulted fleet membership — a ghost's first
+    # post-expiry tick lands its anchors in evidence ([violation] at
+    # 5,117 generated / 229 distinct, ~3s).
+    # r[verify ctrl.nodeclaim.wedge-cluster+3]
+    quint-wedge-cluster-calib-ghost-evidence = mkQuintWitnessCheck {
+      name = "wedge-cluster-calib-ghost-evidence";
+      spec = "calibration/wedge-024-ghost-admission";
+      main = "wedgeCalib024GhostAdmission";
+      extraSpecs = [ "wedgeCluster" ];
+      witness = "evidenceWithinRegistered";
+    };
+    # Same twin, second law: admitted ghosts both wedge and pad the
+    # systemic denominator past the registered universe (the
+    # false-Systemic shape whose drain+latch blacks out genuine
+    # per-node verdicts; [violation] at 772,164 generated / 8,765
+    # distinct, ~21s).
+    # r[verify ctrl.nodeclaim.wedge-cluster+3]
+    quint-wedge-cluster-calib-ghost-denominator = mkQuintWitnessCheck {
+      name = "wedge-cluster-calib-ghost-denominator";
+      spec = "calibration/wedge-024-ghost-admission";
+      main = "wedgeCalib024GhostAdmission";
+      extraSpecs = [ "wedgeCluster" ];
+      witness = "systemicOfWithinRegisteredUniverse";
+    };
+
     # Reachability witnesses on the main regime: both verdict arms
     # actually fire at these bounds (anti-vacuity for the four laws).
     quint-wedge-cluster-witness-systemic = mkQuintWitnessCheck {

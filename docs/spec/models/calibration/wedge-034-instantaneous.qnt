@@ -29,6 +29,8 @@ module wedgeCalib034Instantaneous {
     TRACK_EPISODE_GHOSTS = false,
     ENABLE_TRAJECTORY = false,
     DWELL_TICKS = 1,
-    BREADTH_MIN = 2
+    BREADTH_MIN = 2,
+    TRACK_GHOST_NODES = false,
+    ENABLE_ADMISSION = true
   ).* from "../wedgeCluster"
 }
