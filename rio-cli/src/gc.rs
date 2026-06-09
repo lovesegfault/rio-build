@@ -102,14 +102,18 @@ pub(crate) async fn run(client: &mut AdminClient, a: Args) -> anyhow::Result<()>
     // chunk-collect cycle failed or was suspended, exit nonzero: an
     // operator script that ran a destructive maintenance command must
     // not read scroll-text to learn half of it failed. The
-    // success-with-suffix variants ("; collect-state commit LOST",
-    // "; durable observation WITHHELD") are degraded BOOKKEEPING on a
-    // completed collection — disclosed in the printed line, exit 0.
+    // success-with-suffix variants (commit-bookkeeping LOST /
+    // INDETERMINATE, observation WITHHELD) are degraded BOOKKEEPING on
+    // a completed collection — disclosed in the printed line, exit 0.
+    // merged_bug_052: the contract's executable home is
+    // `rio_common::classify` (`GcPhase3Outcome` + the shared
+    // failure-frame prefix constants the store renders through) — the
+    // predicate below is the SAME code the store-side totality test
+    // asserts, so a store-side reword is a test-time failure on both
+    // sides, never a silent exit-0.
     if let Some(p) = &last {
         let render = p.current_path.as_str();
-        if render.starts_with("chunk collect SUSPENDED:")
-            || render.starts_with("chunk collect FAILED:")
-        {
+        if rio_common::classify::gc_render_is_chunk_collect_failure(render) {
             return Err(anyhow!(
                 "TriggerGC: the sweep completed but the chunk-collect cycle did not: {render}"
             ));
@@ -247,11 +251,27 @@ mod tests {
     /// The failure-bearing sentinel posture (S6b decision): the
     /// store's own SUSPENDED/FAILED phase-3 renders exit nonzero;
     /// success and degraded-bookkeeping renders exit 0.
+    ///
+    /// merged_bug_052: drives the REAL predicate (`run` executes
+    /// `classify::gc_render_is_chunk_collect_failure`, not a local
+    /// re-statement), and the failing fixtures mint their failure
+    /// frames from the producing vocabulary's own constants — rio-cli
+    /// cannot link rio-store, so the shared const IS the production
+    /// constructor for the prefix (Q1 witness provenance; the retired
+    /// shape compared the matcher's literals against the test's own
+    /// re-typed copies, which stayed green through a store reword).
     #[test]
     fn failure_sentinel_posture() {
+        use rio_common::classify::{
+            GC_CHUNK_COLLECT_FAILED_PREFIX, GC_CHUNK_COLLECT_SUSPENDED_PREFIX,
+            gc_render_is_chunk_collect_failure,
+        };
         let failing = [
-            "chunk collect SUSPENDED: unparseable chunk_list aborted the cycle fail-closed",
-            "chunk collect FAILED: db timeout; prior batches committed",
+            format!(
+                "{GC_CHUNK_COLLECT_SUSPENDED_PREFIX} unparseable chunk_list aborted the \
+                 cycle fail-closed"
+            ),
+            format!("{GC_CHUNK_COLLECT_FAILED_PREFIX} db timeout; prior batches committed"),
         ];
         let passing = [
             "complete: 3 paths deleted, 2 chunks, 2 S3 keys enqueued, 9 bytes freed, 0 resurrected",
@@ -260,17 +280,15 @@ mod tests {
             "already running (concurrent GC in progress)",
             "",
         ];
-        for render in failing {
+        for render in &failing {
             assert!(
-                render.starts_with("chunk collect SUSPENDED:")
-                    || render.starts_with("chunk collect FAILED:"),
+                gc_render_is_chunk_collect_failure(render),
                 "posture must catch: {render}"
             );
         }
         for render in passing {
             assert!(
-                !(render.starts_with("chunk collect SUSPENDED:")
-                    || render.starts_with("chunk collect FAILED:")),
+                !gc_render_is_chunk_collect_failure(render),
                 "posture must pass: {render}"
             );
         }

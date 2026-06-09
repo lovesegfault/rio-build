@@ -153,3 +153,152 @@ mod label_tests {
         }
     }
 }
+
+// ---------------------------------------------------------------
+// merged_bug_052 (S7, bughunt-5): the gc phase-3 outcome contract.
+// THE one executable home of the rio-store -> rio-cli exit-posture
+// contract for `rio-cli gc`. The retired shape was the failure-frame
+// prefixes hand-mirrored as free text on both sides of the wire
+// (producer format! in rio-store/src/gc/mod.rs, matcher literals in
+// rio-cli/src/gc.rs) tied only by a comment: a store-side reword kept
+// both test suites green while a failed destructive collect cycle
+// exited 0. rio-cli does not depend on rio-store, so this frozen R7
+// module — a dependency of both — is the contract's only shared home.
+// [GEN-SET] prefix-literal census: docs/gen/sweeps/bughunt5-s7.md.
+// ---------------------------------------------------------------
+
+/// Crate-neutral closure set of the gc phase-3 (chunk-collect cycle)
+/// outcome alphabet rendered into the terminal `GcProgress.current_path`
+/// frame (the store's `Phase3Render` mirror; the exhaustive `From` impl
+/// lives next to that enum, the [`AttemptTerminalKind`] precedent). A
+/// new variant cannot compile without taking an exit-posture position
+/// in [`Self::failure_prefix`] and joining [`Self::ALL`] (the pin test
+/// counts membership through an exhaustive index match).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GcPhase3Outcome {
+    /// The cycle drained and its durable commit landed.
+    Committed,
+    /// The cycle drained but the durable commit provably did not land
+    /// (degraded bookkeeping on a completed collection — exit 0).
+    CommitLost,
+    /// Dry run whose durable observation was withheld (degraded
+    /// bookkeeping — exit 0).
+    PreviewOnly,
+    /// Fail-closed suspension: ALL chunk collection is suspended.
+    Suspended,
+    /// The cycle failed mid-drain; partial destructive work may
+    /// already be committed.
+    Failed,
+}
+
+/// Failure-frame prefix for a fail-closed suspension, colon included —
+/// the byte sequence the store renders and the CLI exit posture keys
+/// on. A reword is a one-site edit here, never a silent divergence.
+pub const GC_CHUNK_COLLECT_SUSPENDED_PREFIX: &str = "chunk collect SUSPENDED:";
+/// Failure-frame prefix for a mid-drain cycle failure, colon included.
+pub const GC_CHUNK_COLLECT_FAILED_PREFIX: &str = "chunk collect FAILED:";
+
+impl GcPhase3Outcome {
+    /// Every variant exactly once (pinned by
+    /// `gc_failure_prefix_alphabet_pinned`); the executable predicate
+    /// below derives from this set, so an outcome absent here cannot
+    /// silently fall out of the exit posture.
+    pub const ALL: [GcPhase3Outcome; 5] = [
+        GcPhase3Outcome::Committed,
+        GcPhase3Outcome::CommitLost,
+        GcPhase3Outcome::PreviewOnly,
+        GcPhase3Outcome::Suspended,
+        GcPhase3Outcome::Failed,
+    ];
+
+    /// The exit-posture table: a failure-bearing outcome names its
+    /// rendered prefix; every non-failure variant is NAMED in the
+    /// `None` arm (no wildcard — a new variant must take a position
+    /// here or the build breaks).
+    pub const fn failure_prefix(self) -> Option<&'static str> {
+        match self {
+            GcPhase3Outcome::Suspended => Some(GC_CHUNK_COLLECT_SUSPENDED_PREFIX),
+            GcPhase3Outcome::Failed => Some(GC_CHUNK_COLLECT_FAILED_PREFIX),
+            GcPhase3Outcome::Committed
+            | GcPhase3Outcome::CommitLost
+            | GcPhase3Outcome::PreviewOnly => None,
+        }
+    }
+}
+
+/// THE one executable exit-posture source for `rio-cli gc` (S6b
+/// decision provenance lives at the CLI call site): true iff the
+/// terminal frame's render begins with a failure-frame prefix.
+/// Derived by iterating [`GcPhase3Outcome::ALL`] so the predicate and
+/// the posture table cannot disagree.
+pub fn gc_render_is_chunk_collect_failure(render: &str) -> bool {
+    GcPhase3Outcome::ALL
+        .iter()
+        .filter_map(|o| o.failure_prefix())
+        .any(|prefix| render.starts_with(prefix))
+}
+
+#[cfg(test)]
+mod gc_phase3_tests {
+    use super::*;
+
+    /// merged_bug_052: pin the failure-frame alphabet byte-exact,
+    /// colon included — the colon was exactly the half the retired
+    /// store-side asserts dropped (`starts_with("chunk collect
+    /// SUSPENDED")` stayed green through a reword that broke the CLI
+    /// matcher). Membership is counted through an exhaustive index
+    /// match, so a new variant cannot ship without joining ALL and
+    /// this table.
+    #[test]
+    fn gc_failure_prefix_alphabet_pinned() {
+        // Closure-set census: every variant appears in ALL exactly once.
+        fn index(o: GcPhase3Outcome) -> usize {
+            match o {
+                GcPhase3Outcome::Committed => 0,
+                GcPhase3Outcome::CommitLost => 1,
+                GcPhase3Outcome::PreviewOnly => 2,
+                GcPhase3Outcome::Suspended => 3,
+                GcPhase3Outcome::Failed => 4,
+            }
+        }
+        let mut seen = [0u8; GcPhase3Outcome::ALL.len()];
+        for o in GcPhase3Outcome::ALL {
+            seen[index(o)] += 1;
+        }
+        assert_eq!(seen, [1; GcPhase3Outcome::ALL.len()], "ALL is the alphabet");
+
+        // The posture table, byte-exact.
+        let table = [
+            (GcPhase3Outcome::Committed, None),
+            (GcPhase3Outcome::CommitLost, None),
+            (GcPhase3Outcome::PreviewOnly, None),
+            (GcPhase3Outcome::Suspended, Some("chunk collect SUSPENDED:")),
+            (GcPhase3Outcome::Failed, Some("chunk collect FAILED:")),
+        ];
+        for (outcome, want) in table {
+            assert_eq!(outcome.failure_prefix(), want, "outcome={outcome:?}");
+        }
+
+        // Colon-included: a prefix that loses its colon re-opens the
+        // weak-assert hole.
+        for o in GcPhase3Outcome::ALL {
+            if let Some(p) = o.failure_prefix() {
+                assert!(p.ends_with(':'), "prefix must keep the colon: {p:?}");
+                assert!(
+                    gc_render_is_chunk_collect_failure(&format!("{p} details")),
+                    "the predicate accepts its own alphabet"
+                );
+            }
+        }
+
+        // Non-failure shapes pass.
+        for render in [
+            "complete: 3 paths deleted",
+            "dry run: would delete 3 paths",
+            "already running (concurrent GC in progress)",
+            "",
+        ] {
+            assert!(!gc_render_is_chunk_collect_failure(render));
+        }
+    }
+}

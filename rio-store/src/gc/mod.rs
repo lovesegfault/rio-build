@@ -180,6 +180,7 @@ pub(crate) const GRACE_HOURS_CAP: u32 = 24 * 365;
 /// "complete:" string by construction, so a fail-closed suspension or
 /// a mid-drain DB failure is never rendered as "0 chunks" (which
 /// reads as "nothing to collect" on a destructive subsystem).
+#[derive(Debug)]
 enum Phase3Render {
     /// The cycle drained and its durable commit landed.
     Committed,
@@ -194,6 +195,26 @@ enum Phase3Render {
     /// The cycle failed against PostgreSQL mid-drain; prior batches'
     /// soft-deletes/enqueues are already committed.
     Failed(String),
+}
+
+/// merged_bug_052: the crate-neutral outcome mirror BOTH suites assert
+/// through ([`rio_common::classify::GcPhase3Outcome`] — the
+/// `AttemptTerminalKind` precedent: the exhaustive `From` lives next
+/// to the mirrored enum). [`render_phase3`] renders THROUGH the shared
+/// prefix constants and the CLI matches THROUGH the shared predicate,
+/// so a reword is a one-site const edit, never a silent exit-0 on a
+/// failed destructive collect.
+impl From<&Phase3Render> for rio_common::classify::GcPhase3Outcome {
+    fn from(render: &Phase3Render) -> Self {
+        use rio_common::classify::GcPhase3Outcome as O;
+        match render {
+            Phase3Render::Committed => O::Committed,
+            Phase3Render::CommitLost => O::CommitLost,
+            Phase3Render::PreviewOnly => O::PreviewOnly,
+            Phase3Render::Suspended => O::Suspended,
+            Phase3Render::Failed(_) => O::Failed,
+        }
+    }
 }
 
 /// Returns `Ok(None)` when another GC holds [`GC_LOCK_ID`] — the
@@ -493,16 +514,39 @@ pub async fn run_gc(
     // resurrections surface in the `current_path` summary string
     // (proto has no `paths_resurrected` field — adding one is a
     // cross-crate change deferred to keep this fix store-local).
-    // merged_bug_148: the string is built by an EXHAUSTIVE match over
-    // the typed phase-3 render — no failure arm can produce the
-    // "complete:"/"dry run:" success summary by construction. The
-    // failure-frame prefixes ("chunk collect SUSPENDED:",
-    // "chunk collect FAILED:") are the S6b consumer contract (CLI gc
-    // rendering); is_complete stays true on every arm — the stream's
-    // end-sentinel semantics are unchanged, exit posture is the
-    // consumer's decision.
+    let current_path = render_phase3(&phase3, params.dry_run, &stats);
+    let _ = progress_tx
+        .send(Ok(GcProgress {
+            paths_scanned: found_unreachable,
+            paths_collected: stats.paths_deleted,
+            bytes_freed: stats.bytes_freed,
+            is_complete: true,
+            current_path,
+        }))
+        .await;
+
+    Ok(Some(stats))
+}
+
+/// Build the terminal frame's `current_path` from the typed phase-3
+/// render (pure extraction of run_gc's final-send builder so the
+/// posture-totality test can drive every variant).
+///
+/// merged_bug_148: an EXHAUSTIVE match over [`Phase3Render`] — no
+/// failure arm can produce the "complete:"/"dry run:" success summary
+/// by construction. The failure frames open with the SHARED prefix
+/// constants ([`rio_common::classify::GC_CHUNK_COLLECT_SUSPENDED_PREFIX`]
+/// / [`rio_common::classify::GC_CHUNK_COLLECT_FAILED_PREFIX`]) — the
+/// S6b consumer contract (`rio-cli gc` keys its exit posture on them
+/// through `classify::gc_render_is_chunk_collect_failure`;
+/// merged_bug_052: the contract is the shared constants, never
+/// re-typed literals). `is_complete` stays true on every arm — the
+/// stream's end-sentinel semantics are unchanged, exit posture is the
+/// consumer's decision.
+fn render_phase3(phase3: &Phase3Render, dry_run: bool, stats: &GcStats) -> String {
+    use rio_common::classify::{GC_CHUNK_COLLECT_FAILED_PREFIX, GC_CHUNK_COLLECT_SUSPENDED_PREFIX};
     let success_summary = || {
-        if params.dry_run {
+        if dry_run {
             format!(
                 "dry run: would delete {} paths, {} chunks, free {} bytes, {} resurrected",
                 stats.paths_deleted,
@@ -521,7 +565,7 @@ pub async fn run_gc(
             )
         }
     };
-    let current_path = match &phase3 {
+    match phase3 {
         Phase3Render::Committed => success_summary(),
         Phase3Render::CommitLost => format!(
             "{}; collect-state commit LOST (cadence stamp not updated; see server logs)",
@@ -533,38 +577,27 @@ pub async fn run_gc(
             success_summary()
         ),
         Phase3Render::Suspended => format!(
-            "chunk collect SUSPENDED: unparseable chunk_list aborted the cycle fail-closed; \
-             {} paths {}; chunk stats unavailable until the manifest is repaired, deleted, \
-             or quarantined",
+            "{GC_CHUNK_COLLECT_SUSPENDED_PREFIX} unparseable chunk_list aborted the cycle \
+             fail-closed; {} paths {}; chunk stats unavailable until the manifest is \
+             repaired, deleted, or quarantined",
             stats.paths_deleted,
-            if params.dry_run {
+            if dry_run {
                 "would be deleted"
             } else {
                 "deleted"
             },
         ),
         Phase3Render::Failed(e) => format!(
-            "chunk collect FAILED: {e}; {} paths {}; partial chunk work may already be \
-             committed (see server logs)",
+            "{GC_CHUNK_COLLECT_FAILED_PREFIX} {e}; {} paths {}; partial chunk work may \
+             already be committed (see server logs)",
             stats.paths_deleted,
-            if params.dry_run {
+            if dry_run {
                 "would be deleted"
             } else {
                 "deleted"
             },
         ),
-    };
-    let _ = progress_tx
-        .send(Ok(GcProgress {
-            paths_scanned: found_unreachable,
-            paths_collected: stats.paths_deleted,
-            bytes_freed: stats.bytes_freed,
-            is_complete: true,
-            current_path,
-        }))
-        .await;
-
-    Ok(Some(stats))
+    }
 }
 
 /// Enqueue S3 keys for soft-deleted chunks to `pending_s3_deletes` in
@@ -839,8 +872,10 @@ mod tests {
         let last = last.expect("final frame");
         assert!(last.is_complete, "the stream still ends (sentinel kept)");
         assert!(
-            last.current_path.starts_with("chunk collect SUSPENDED"),
-            "the operator surface reports the suspension, got: {}",
+            last.current_path
+                .starts_with(rio_common::classify::GC_CHUNK_COLLECT_SUSPENDED_PREFIX),
+            "the operator surface reports the suspension (shared colon-included \
+             prefix — merged_bug_052), got: {}",
             last.current_path
         );
     }
@@ -889,10 +924,66 @@ mod tests {
         let last = last.expect("final frame");
         assert!(last.is_complete);
         assert!(
-            last.current_path.starts_with("chunk collect FAILED"),
-            "a mid-drain failure is disclosed, got: {}",
+            last.current_path
+                .starts_with(rio_common::classify::GC_CHUNK_COLLECT_FAILED_PREFIX),
+            "a mid-drain failure is disclosed (shared colon-included prefix — \
+             merged_bug_052), got: {}",
             last.current_path
         );
+    }
+
+    /// merged_bug_052 machine witness (banner (a)): the store's render
+    /// alphabet and the CLI's exit posture agree, asserted THROUGH the
+    /// shared predicate — `gc_render_is_chunk_collect_failure` is
+    /// byte-for-byte what the CLI executes. Every [`Phase3Render`]
+    /// variant is constructed via a no-wildcard table (a new variant
+    /// fails this match at compile time), rendered through the REAL
+    /// builder, and its posture must equal its crate-neutral mirror's
+    /// `failure_prefix().is_some()`. The retired shape — store asserts
+    /// on a colon-free prefix, CLI asserts on its own re-typed
+    /// literals — let a store-side reword exit 0 on a failed
+    /// destructive collect while both suites stayed green.
+    #[test]
+    fn phase3_render_posture_total() {
+        use rio_common::classify::{GcPhase3Outcome, gc_render_is_chunk_collect_failure};
+
+        // No-wildcard construction table: every variant named once.
+        let variants = [
+            Phase3Render::Committed,
+            Phase3Render::CommitLost,
+            Phase3Render::PreviewOnly,
+            Phase3Render::Suspended,
+            Phase3Render::Failed("db timeout".into()),
+        ];
+        // The table is total: a new variant breaks this match.
+        for v in &variants {
+            match v {
+                Phase3Render::Committed
+                | Phase3Render::CommitLost
+                | Phase3Render::PreviewOnly
+                | Phase3Render::Suspended
+                | Phase3Render::Failed(_) => {}
+            }
+        }
+
+        let stats = GcStats {
+            paths_deleted: 3,
+            chunks_deleted: 2,
+            s3_keys_enqueued: 2,
+            bytes_freed: 9,
+            paths_resurrected: 0,
+        };
+        for v in &variants {
+            for dry_run in [false, true] {
+                let render = render_phase3(v, dry_run, &stats);
+                let outcome = GcPhase3Outcome::from(v);
+                assert_eq!(
+                    gc_render_is_chunk_collect_failure(&render),
+                    outcome.failure_prefix().is_some(),
+                    "render/exit-posture divergence for {v:?} (dry_run={dry_run}): {render:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
