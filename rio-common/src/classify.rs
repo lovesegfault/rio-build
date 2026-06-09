@@ -125,7 +125,7 @@ pub fn attempt_terminal_reason_label(kind: AttemptTerminalKind) -> &'static str 
 }
 
 #[cfg(test)]
-mod tests {
+mod label_tests {
     use super::*;
 
     /// The canonical strings are load-bearing (persisted rows join on
