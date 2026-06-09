@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM build_samples WHERE completed_at < now() - $1 * interval '1 day'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Float8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f83609bc302c6ac619a02e23e0d339dd7cff7ee686971510b55c38e01f7643bd"
+}
