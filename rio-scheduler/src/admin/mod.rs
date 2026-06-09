@@ -155,6 +155,21 @@ impl AdminServiceImpl {
         service_verifier: Option<Arc<rio_auth::hmac::HmacVerifier>>,
         cost_table: Arc<parking_lot::RwLock<crate::sla::cost::CostTable>>,
     ) -> Self {
+        // merged_bug_001: colocated with the only emit site (the
+        // AppendInterruptSample rows_affected check below) so the
+        // counter and its HELP cannot drift apart. `new` runs in
+        // main.rs strictly AFTER `bootstrap` installs the production
+        // exporter, so this binds to the live recorder; the docs-data
+        // regen scrapes describe_*! workspace-wide regardless of
+        // location.
+        metrics::describe_counter!(
+            "rio_scheduler_interrupt_samples_absorbed_total",
+            "AppendInterruptSample inserts absorbed by the M_047 ON CONFLICT \
+             dedup, by kind. Expected: commit-but-timeout redeliveries and \
+             rollout-overlap duplicates of the same logical (cluster, class, \
+             window). A sustained rate without scheduler/controller restarts \
+             indicates an identity collision — investigate uid minting."
+        );
         Self {
             pool,
             actor,
@@ -1237,13 +1252,25 @@ impl AdminService for AdminServiceImpl {
     /// relist/reconnect/controller-restart. `ON CONFLICT (event_uid)
     /// WHERE event_uid IS NOT NULL DO NOTHING` (partial unique index,
     /// M_047) deduplicates `kind='interrupt'` rows so λ's numerator
-    /// doesn't inflate. merged_bug_002: exposure rows now ride the
-    /// SAME absorb — the controller keys each (class, window) slice
-    /// `exposure:{hw}:{window_epoch}` and carries the uid verbatim
-    /// across retries, so a commit-but-timeout redelivery no longer
-    /// double-banks the denominator. A NULL uid remains unconstrained
-    /// (the legacy wire arm: pre-upgrade controllers during rolling
-    /// skew — read-side back-compat only).
+    /// doesn't inflate. merged_bug_002: exposure rows ride the SAME
+    /// absorb — the uid is an OPAQUE controller-minted idempotency
+    /// key, carried verbatim across retries, and cluster-scoped since
+    /// merged_bug_001 (`exposure:{cluster}:{hw}:{window-slot}`, the
+    /// window grid-aligned and monotonically gated controller-side):
+    /// this server never parses uids — it dedups byte-equality
+    /// through the index, exactly the contract the legacy fixture in
+    /// `tests/mod.rs` pins — but the index is table-GLOBAL in the
+    /// shared-PG topology (ADR-023 §2.13), so the key's cluster axis
+    /// is what keeps sibling clusters from absorbing each other's
+    /// rows. merged_bug_001: the absorb edge is COUNTED
+    /// (`rio_scheduler_interrupt_samples_absorbed_total{kind}` on
+    /// `rows_affected == 0`) — Ok is ambiguous between "inserted" and
+    /// "already banked" on the wire (response stays `()`), and the
+    /// controller deliberately maps both to delivered; the counter is
+    /// the only witness separating designed redelivery dedup from an
+    /// identity collision. A NULL uid remains unconstrained (the
+    /// legacy wire arm: pre-upgrade controllers during rolling skew —
+    /// read-side back-compat only).
     #[instrument(skip(self, request), fields(rpc = "AppendInterruptSample"))]
     async fn append_interrupt_sample(
         &self,
@@ -1278,7 +1305,7 @@ impl AdminService for AdminServiceImpl {
                 rio_common::limits::MAX_HW_CLASS_LEN
             )));
         }
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO interrupt_samples (cluster, hw_class, kind, value, event_uid) \
              VALUES ($1, $2, $3, $4, $5) \
              ON CONFLICT (event_uid) WHERE event_uid IS NOT NULL DO NOTHING",
@@ -1291,7 +1318,124 @@ impl AdminService for AdminServiceImpl {
         .execute(&self.pool)
         .await
         .map_err(|e| Status::internal(format!("append_interrupt_sample: {e}")))?;
+        // merged_bug_001: read the absorb back. rows_affected == 0 ⇔
+        // the ON CONFLICT arm swallowed a duplicate event_uid — the
+        // DESIGNED at-most-once outcome for commit-but-timeout
+        // redeliveries and rollout-overlap co-run twins of the same
+        // logical (cluster, class, window), but an identity collision
+        // (a uid minted without an axis) takes the SAME edge and was
+        // previously indistinguishable from a fresh insert at every
+        // layer. Count it and disclose the key so a sustained rate is
+        // diagnosable; the RPC stays Ok (the controller's
+        // Ok→delivered mapping is sound under the typed uid format).
+        if result.rows_affected() == 0 {
+            tracing::info!(
+                uid = r.event_uid.as_deref().unwrap_or(""),
+                cluster = %self.cluster,
+                kind = %r.kind,
+                "interrupt sample absorbed by the event-uid dedup (already banked)"
+            );
+            metrics::counter!(
+                "rio_scheduler_interrupt_samples_absorbed_total",
+                "kind" => r.kind.clone()
+            )
+            .increment(1);
+        }
         Ok(Response::new(()))
+    }
+}
+
+/// merged_bug_001 (R4): the M_047 absorb edge is OBSERVED, not
+/// silent. Inline (not in `admin/tests/`) so the absorb counter, its
+/// describe, and its red live beside the INSERT they instrument.
+#[cfg(test)]
+mod absorb_tests {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use tonic::Request;
+
+    use super::tests::setup_svc_default;
+    use rio_proto::AdminService;
+    use rio_proto::types::AppendInterruptSampleRequest;
+
+    /// merged_bug_001 red R4: redelivering an already-committed
+    /// event_uid returns Ok (the designed absorb) AND ticks
+    /// `rio_scheduler_interrupt_samples_absorbed_total{kind}` — the
+    /// pre-fix handler discarded the `PgQueryResult`, so an absorbed
+    /// conflict was indistinguishable from a fresh insert at every
+    /// layer (the controller maps Ok→delivered; a cross-cluster or
+    /// double-banked collision vanished without a trace). Recorded
+    /// red (pre-fix): `panic: absorbed conflict uncounted (no
+    /// rio_scheduler_interrupt_samples_absorbed_total series)`.
+    ///
+    /// The uid is hand-minted scheduler-side BY DESIGN: `EventUid` is
+    /// deliberately module-scoped in the controller's
+    /// node_informer.rs and the scheduler cannot link it — this
+    /// fixture pins the OPAQUE-key contract (the scheduler never
+    /// parses uids, it only dedups byte-equality through M_047).
+    #[tokio::test]
+    async fn absorbed_conflict_is_counted_not_silent() {
+        let (svc, _actor, _task, db) = setup_svc_default().await;
+
+        let rec = DebuggingRecorder::new();
+        let _g = ::metrics::set_default_local_recorder(&rec);
+
+        let absorbed = |rec: &DebuggingRecorder| {
+            rec.snapshotter()
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find_map(|(k, _, _, v)| {
+                    let key = k.key();
+                    (key.name() == "rio_scheduler_interrupt_samples_absorbed_total"
+                        && key
+                            .labels()
+                            .any(|l| l.key() == "kind" && l.value() == "exposure"))
+                    .then_some(v)
+                })
+        };
+
+        // r13-allow(opaque-consumer): the controller-minted exposure
+        // uid shape, hand-rolled here because the producing
+        // constructor (EventUid) is module-scoped in rio-controller
+        // by design — the scheduler consumes the key OPAQUELY.
+        let slice = AppendInterruptSampleRequest {
+            hw_class: "mid-ebs-x86".into(),
+            kind: "exposure".into(),
+            value: 60.0,
+            event_uid: Some("exposure:prod-east:mid-ebs-x86:1767225600".into()),
+        };
+
+        // First delivery: fresh insert — one row, NO absorb tick.
+        svc.append_interrupt_sample(Request::new(slice.clone()))
+            .await
+            .expect("first append Ok");
+        assert!(
+            absorbed(&rec).is_none(),
+            "a fresh insert must not tick the absorb counter"
+        );
+
+        // Redelivery (commit-but-timeout / rollout-overlap twin):
+        // still Ok, still ONE row — and the absorb is COUNTED.
+        svc.append_interrupt_sample(Request::new(slice))
+            .await
+            .expect("redelivery Ok (absorbed, not an error)");
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM interrupt_samples \
+             WHERE event_uid = 'exposure:prod-east:mid-ebs-x86:1767225600'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, 1, "the absorb deduped to one row");
+        match absorbed(&rec) {
+            Some(DebugValue::Counter(n)) => {
+                assert_eq!(n, 1, "exactly one absorbed conflict counted");
+            }
+            _ => panic!(
+                "absorbed conflict uncounted (no \
+                 rio_scheduler_interrupt_samples_absorbed_total series)"
+            ),
+        }
     }
 }
 
