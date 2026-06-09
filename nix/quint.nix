@@ -3220,6 +3220,71 @@ rec {
       witness = "backlogLeTrueEligible";
     };
 
+    # ── gcCadence: the backstop's ATTEMPT-CADENCE and COMMIT-GATES-OK
+    # laws (bughunt-4 S4: bug_284 + merged_bug_218,
+    # store.gc.collect-cadence+2). DEDICATED regime per the gcDrainPass
+    # precedent: the time axis must not multiply the other gc regimes.
+    # Measured (TLC exhaustive, INTERVAL=4 / MAX_TIME=12, workers=auto):
+    # 4,347 generated / 1,926 distinct, [ok] in ~1s — the default 1800s
+    # budget is >1000x the measurement.
+    # r[verify store.gc.collect-cadence+2]
+    quint-gc-cadence = mkQuintCheck {
+      name = "gc-cadence";
+      spec = "gcCadence";
+      main = "gcCadenceMain";
+      invariants = [
+        "attemptCadenceBounded"
+        "okTicksRequireCommit"
+      ];
+    };
+
+    # The bug_284 red, deterministically: two checks inside one
+    # interval run exactly ONE heavy cycle (the second is throttled by
+    # the attempt stamp) and the success stamp stays unwritten.
+    # r[verify store.gc.collect-cadence+2]
+    quint-gc-cadence-runs = mkQuintRunCheck {
+      name = "gc-cadence-runs";
+      spec = "gcCadence";
+      main = "gcCadenceMain";
+    };
+
+    # Non-vacuity witnesses (must VIOLATE in the main regime): the
+    # fail-closed abort arm and the lost-commit arm are both reachable
+    # — the two laws police paths the regime actually explores.
+    quint-gc-cadence-witness-abort = mkQuintWitnessCheck {
+      name = "gc-cadence-witness-abort";
+      spec = "gcCadence";
+      main = "gcCadenceMain";
+      witness = "noAbortedAttempt";
+    };
+    quint-gc-cadence-witness-lost-commit = mkQuintWitnessCheck {
+      name = "gc-cadence-witness-lost-commit";
+      spec = "gcCadence";
+      main = "gcCadenceMain";
+      witness = "noLostCommit";
+    };
+
+    # CALIBRATION (expect-violation): the pre-fix due predicate —
+    # success-stamp staleness only, no attempt gate. A persistent
+    # fail-closed abort re-runs the heavy cycle on every check tick;
+    # the cadence law falsifies.
+    quint-gc-cadence-calib-hourly-retry = mkQuintWitnessCheck {
+      name = "gc-cadence-calib-hourly-retry";
+      spec = "gcCadence";
+      main = "gcCadenceCalibHourlyRetry";
+      witness = "attemptCadenceBounded";
+    };
+
+    # CALIBRATION (expect-violation): the pre-fix tick placement — ok
+    # ticked when the cycle drains, before the commit lands; the
+    # commit-gates-ok law falsifies on the first lost commit.
+    quint-gc-cadence-calib-tick-before-commit = mkQuintWitnessCheck {
+      name = "gc-cadence-calib-tick-before-commit";
+      spec = "gcCadence";
+      main = "gcCadenceCalibTickBeforeCommit";
+      witness = "okTicksRequireCommit";
+    };
+
     # ── gcDrainPass: the collect pass's COMPLETION law (round 3,
     # bug_174 + bug_137 + merged_bug_170 — the PassDisposition type:
     # only CompleteFullScan anchors the cycle; a resumed pass keeps the
