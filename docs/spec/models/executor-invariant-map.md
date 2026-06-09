@@ -2754,6 +2754,33 @@ charged establishment window is now reachable only by real crashes,
 no longer by the loop's own credential destruction. Modeled as three
 claim-plane laws in openAttempts.qnt (noCredentialClobber,
 noRefusalFiledAsLost, confirmNeverMints), each with a falsify twin.*
+
+*Amendment note, 2026-06-08 (bughunt-4 S5a, recorded at this anchor
+per the same R3 precedent): the bug_119 disposition above is NARROWED
+on the resume arm (merged_bug_074) — only MINT-DISPROVING refusals
+(InvalidArgument/Unimplemented: the request shape can never mint)
+resolve the ledger entry; auth-layer codes
+(PermissionDenied/Unauthenticated — the scheduler's rotation-skew
+trace, emitted without consulting attempt state) file as Unanswered,
+because a RESUME entry exists precisely where the ORIGINAL unanswered
+pull may have committed a mint and the auth answer judges only the
+presentation. The fresh arm is unchanged (its gates run pre-mint, so
+either flavor disproves a mint there). This restores the 2026-06-07
+note's own claim — the charged establishment window stays "reachable
+only by real crashes, not by the loop's own credential destruction" —
+which the recorded bug_119 letter violated exactly during fleet HMAC
+rotations. Companion budget repair (merged_bug_072): the fresh-claim
+budget derives from the surviving ledger population
+(claimed + ledger.len() >= slots) and the mint authority REFUSES at
+capacity — eviction of live rule-4b credentials is gone. The SIGNED
+re-delivery clause above is unaltered;
+`sched.materialize.claim-resume`'s text is untouched (no tracey bump
+arises). Modeled in openAttempts.qnt: `answeredRefusalSeat` and
+`noRefusalFiledAsLost` re-scoped to the mint-disproving reading with
+the existing refusal-as-lost twin re-measured; NEW `authRefusalSeat`
++ live `claimRefusedAuthSkew` with the rotation-skew twin targeting
+`noFaultNeverCharged`; NEW `openAttemptsBudget` module
+(`outstandingBounded`) with the per-pass-overmint twin.*
 Pinned: `check_materialization_redelivery_requires_credential`
 (REPLACES — widens — `check_materialization_redelivery_requires_resume_token`
 over the (resume ∨ nonce) domain; CBMC, both directions, the

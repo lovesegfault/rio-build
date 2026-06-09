@@ -213,8 +213,11 @@ pub const REBOUND_ORIGIN: &str = "resume_rebound";
 /// re-delivers and the worker recovers the assignment.
 ///
 /// Entries leave on every AUTHORITATIVE answer (Assignment — we hold
-/// the job; Gone — resolved/absent; Rejected — answered permanent
-/// refusal, no mint behind it); capacity REFUSES new mints instead
+/// the job; Gone — resolved/absent; Rejected — MINT-DISPROVING
+/// refusal (InvalidArgument/Unimplemented), no mint behind it;
+/// auth-layer rejections file as Unanswered — merged_bug_074: the
+/// rotation-skew codes judge the presentation, not the mint);
+/// capacity REFUSES new mints instead
 /// of evicting (merged_bug_072). `NotYetReady` KEEPS the entry on BOTH passes
 /// (merged_bug_096): the job may be parked, raced to another replica
 /// (their resolution answers Gone later), seen through a mid-recovery
@@ -356,12 +359,24 @@ enum PullAnswer {
     /// may have committed server-side — exactly the window the
     /// resume ledger exists for.
     Unanswered,
-    /// ANSWERED with a permanent rejection (bug_119: the same
-    /// `is_fatal_rejection` set the report leg gives up on — auth /
-    /// invalid-argument / unimplemented). The scheduler answered, so
-    /// no mint can be pending behind it: never filed as a lost
-    /// response, and the callers resolve the ledger entry.
-    Rejected,
+    /// ANSWERED with a MINT-DISPROVING rejection (merged_bug_074
+    /// narrowing of bug_119: InvalidArgument / Unimplemented — the
+    /// request shape itself can never mint, on this pull or the
+    /// original one). The scheduler answered AND the answer disproves
+    /// a pending mint: never filed as a lost response, and the
+    /// callers resolve the ledger entry.
+    RejectedDisproving,
+    /// ANSWERED with an AUTH-LAYER rejection (PermissionDenied /
+    /// Unauthenticated — the codes the scheduler's credential layer
+    /// emits for transient HMAC rotation skew, without consulting
+    /// attempt state). The rejection judges the credential
+    /// PRESENTATION, not the mint: on a RESUME presentation the
+    /// original unanswered pull may still have committed a mint, so
+    /// the resume arm KEEPS the entry (Unanswered disposition — one
+    /// bounded RPC per pass, self-resolving via Gone/delivery once
+    /// the skew clears); the FRESH arm resolves (its gates run
+    /// pre-mint, so nothing can be pending behind the refusal).
+    RejectedAuth,
 }
 
 /// Issue one bounded `PullAssignment` and classify the outcome.
@@ -395,17 +410,41 @@ async fn pull_once<T: MaterializeTransport>(
                 PullAnswer::NotYetReady
             }
         },
-        // bug_119: the ONE rpc-error classification chokepoint, shared
-        // with the report leg (`report_until_acked`) and mirroring the
-        // builder pull loop — an ANSWERED permanent refusal is typed
-        // Rejected, never laundered into the lost-response lane.
-        BoundedOutcome::Resolved(Err(status)) if is_fatal_rejection(status.code()) => {
+        // bug_119 + merged_bug_074: the ONE rpc-error classification
+        // chokepoint — an ANSWERED refusal is typed by WHAT IT
+        // DISPROVES, never laundered into the lost-response lane.
+        // InvalidArgument/Unimplemented disprove a mint (the request
+        // shape can never mint); PermissionDenied/Unauthenticated
+        // judge only the credential presentation (the scheduler's
+        // rotation-skew trace) and disprove nothing about a mint the
+        // ORIGINAL pull may have committed. The two sets partition
+        // is_fatal_rejection exactly, so the report leg's give-up
+        // semantics are untouched.
+        BoundedOutcome::Resolved(Err(status))
+            if matches!(
+                status.code(),
+                tonic::Code::InvalidArgument | tonic::Code::Unimplemented
+            ) =>
+        {
             warn!(drv_hash = %drv_hash,
                   code = ?status.code(), msg = status.message(),
-                  "materialization claim permanently refused (credential/request \
-                   fault); dropping the claim — no mint is pending behind an \
-                   answered refusal");
-            PullAnswer::Rejected
+                  "materialization claim refused with a mint-disproving \
+                   rejection; dropping the claim — no mint can be pending \
+                   behind it");
+            PullAnswer::RejectedDisproving
+        }
+        BoundedOutcome::Resolved(Err(status))
+            if matches!(
+                status.code(),
+                tonic::Code::PermissionDenied | tonic::Code::Unauthenticated
+            ) =>
+        {
+            warn!(drv_hash = %drv_hash,
+                  code = ?status.code(), msg = status.message(),
+                  "materialization claim refused at the auth layer \
+                   (rotation skew?); the rejection judges the presentation, \
+                   not the mint");
+            PullAnswer::RejectedAuth
         }
         BoundedOutcome::Resolved(Err(status)) => {
             warn!(drv_hash = %drv_hash,
@@ -546,12 +585,18 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             // pass until Gone or delivery; capacity bounds the total.
             PullAnswer::NotYetReady => {}
             PullAnswer::Unanswered => {}
-            // bug_119: ANSWERED permanent refusal — the credential was
-            // judged and refused (auth misconfig, malformed request);
-            // nothing is pending behind it. Entry resolves, per the
-            // ledger contract (entries leave on every answered
-            // outcome).
-            PullAnswer::Rejected => ledger.resolve(entry.job_id),
+            // bug_119 (narrowed by merged_bug_074): a MINT-DISPROVING
+            // refusal resolves the entry — the request shape can
+            // never mint, so nothing is pending behind it.
+            PullAnswer::RejectedDisproving => ledger.resolve(entry.job_id),
+            // merged_bug_074: an auth-layer refusal judges the
+            // PRESENTATION (rotation skew), not the mint the ORIGINAL
+            // unanswered pull may have committed — the entry is the
+            // only rule-4b recovery credential for that mint, so it
+            // SURVIVES (Unanswered disposition: one bounded RPC per
+            // pass; Gone or delivery resolves it once the skew
+            // clears).
+            PullAnswer::RejectedAuth => {}
         }
     }
     // bug_385: the listing window is DECOUPLED from the claim budget.
@@ -719,10 +764,14 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
                 ));
             }
             // AUTHORITATIVE no-mint answers on a FRESH claim resolve
-            // the credential: Gone (job settled without us) and
-            // Rejected (bug_119 — answered permanent refusal; the
-            // gates run before any mint).
-            PullAnswer::Gone | PullAnswer::Rejected => ledger.resolve(job_id),
+            // the credential: Gone (job settled without us) and BOTH
+            // rejection flavors (bug_119 / merged_bug_074 — the fresh
+            // pull's gates run before any mint, so even an auth-layer
+            // refusal disproves a mint HERE: this very pull was the
+            // only one that could have minted).
+            PullAnswer::Gone | PullAnswer::RejectedDisproving | PullAnswer::RejectedAuth => {
+                ledger.resolve(job_id)
+            }
             // merged_bug_096: NotYetReady is NOT proof of no-mint —
             // the scheduler's post-mint TOCTOU arm answers it AFTER
             // the durable mint committed with this nonce. The
@@ -1350,6 +1399,70 @@ mod tests {
         );
     }
 
+    /// merged_bug_074 RED: an auth-layer rejection of a RESUME
+    /// presentation (PermissionDenied — the scheduler's HMAC
+    /// rotation-skew trace) judges the CREDENTIAL PRESENTATION, not
+    /// the mint state: the ledger entry exists precisely because the
+    /// original unanswered pull may have committed a mint, so the
+    /// entry must SURVIVE the skew and the post-skew resume must
+    /// recover the assignment. Pre-fix is_fatal_rejection folded
+    /// auth codes into Rejected → ledger.resolve: the only rule-4b
+    /// recovery credential evaporated exactly during fleet rotations
+    /// and the attempt settled CHARGED through the establishment
+    /// window.
+    #[tokio::test(start_paused = true)]
+    async fn auth_rejection_keeps_resume_credential_through_skew() {
+        let job = descriptor(7);
+        let mut t = MockTransport::new(
+            vec![
+                Ok(ListMaterializationJobsResponse {
+                    jobs: vec![job.clone()],
+                }),
+                Ok(ListMaterializationJobsResponse { jobs: vec![] }),
+                Ok(ListMaterializationJobsResponse { jobs: vec![] }),
+            ],
+            vec![
+                // Pass 2's resume presentation: rotation skew.
+                Err(tonic::Status::permission_denied(
+                    "service token verified against no active key (rotation-skew trace)",
+                )),
+                // Pass 3's resume presentation: skew over, the
+                // scheduler re-delivers the committed mint.
+                Ok(deliver_for_job(
+                    "exec-skew-recovered",
+                    "/nix/store/skew-drv",
+                    Uuid::nil(),
+                )),
+            ],
+            vec![],
+        );
+        t.hang_next_pulls = 1; // pass 1's fresh mint: answer lost
+        let mut ledger = ResumeLedger::default();
+        let mut latch = ListFailureLatch::default();
+        let tok = token();
+        let inst = instance("skew-w");
+        let c1 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &tok).await;
+        assert!(c1.is_empty());
+        assert_eq!(ledger.len(), 1, "pass 1: unanswered mint recorded");
+        // Pass 2: the resume presentation hits rotation skew.
+        let c2 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &tok).await;
+        assert!(c2.is_empty());
+        assert_eq!(
+            ledger.len(),
+            1,
+            "an auth-layer rejection judges the presentation, not the \
+             mint — the credential must survive rotation skew"
+        );
+        // Pass 3: skew over — the credential recovers the assignment.
+        let c3 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &tok).await;
+        assert_eq!(
+            c3.len(),
+            1,
+            "post-skew resume re-delivers the committed mint"
+        );
+        assert!(ledger.is_empty(), "delivery resolves the entry");
+    }
+
     fn token() -> rio_common::signal::Token {
         rio_common::signal::Token::new()
     }
@@ -1683,9 +1796,14 @@ mod tests {
             "an answered refusal is not a lost response — no immortal entry"
         );
 
-        // Resume half: a held entry whose resume pull is REFUSED with a
-        // permanent answer resolves too (the scheduler answered; no
-        // mint can be pending behind an Unauthenticated refusal).
+        // Resume half (merged_bug_074 narrowing of the bug_119
+        // letter): a held entry whose resume pull is REFUSED with a
+        // MINT-DISPROVING answer (InvalidArgument/Unimplemented — the
+        // request shape can never mint) resolves. Auth-layer codes no
+        // longer resolve the RESUME arm — they judge the credential
+        // presentation, not the mint the original unanswered pull may
+        // have committed; their survival is pinned by
+        // auth_rejection_keeps_resume_credential_through_skew.
         let mut ledger = ResumeLedger::default();
         ledger.note_pull(ResumeEntry {
             job_id: Uuid::now_v7(),
@@ -1696,7 +1814,9 @@ mod tests {
         });
         let mut t = MockTransport::new(
             vec![Ok(listing(vec![]))],
-            vec![Err(tonic::Status::unauthenticated("token expired"))],
+            vec![Err(tonic::Status::invalid_argument(
+                "malformed claim request",
+            ))],
             vec![],
         );
         let claimed = poll_and_claim(
@@ -1711,7 +1831,8 @@ mod tests {
         assert!(claimed.is_empty());
         assert!(
             ledger.is_empty(),
-            "resume credential permanently refused — entry resolves"
+            "resume credential refused with a mint-disproving answer — \
+             entry resolves"
         );
     }
 
