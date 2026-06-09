@@ -476,19 +476,12 @@ async fn execute_job_inner(
                         // the kernel truth table — no catch-all (a
                         // future SubstituteError variant fails this
                         // match AND the class table).
-                        let class = crate::substitute::substitute_error_evidence(&e).0;
-                        let (label, retry_after) = match &e {
-                            SubstituteError::RateLimited { retry_after } => {
-                                ("rate_limited", *retry_after)
-                            }
-                            SubstituteError::Raced => ("raced", None),
-                            _ => ("", None),
-                        };
-                        let msg = if label.is_empty() {
-                            format!("substitution of {path} failed ({class:?}): {e}")
-                        } else {
-                            format!("substitution of {path}: {e}")
-                        };
+                        // bug_194: class + advice from the canonical
+                        // table; label + message from the ONE shared
+                        // chokepoint (the probe leg consumes the same
+                        // fn — wording cannot drift per leg).
+                        let (class, retry_after) = crate::substitute::substitute_error_evidence(&e);
+                        let (label, msg) = substitute_cell_message(&path, class, &e);
                         cell_msgs.push((label, msg));
                         // merged_bug_188: the kernel chokepoint owns
                         // the loop-control decision — a Raced verdict
@@ -673,10 +666,12 @@ async fn execute_job_inner(
                                     // loop control — a raced probe
                                     // aborts the tenant sweep (the
                                     // slot is path-keyed).
-                                    probe_msgs.push(format!(
-                                        "substitution of {path} hit infrastructure trouble: \
-                                         {detail}"
-                                    ));
+                                    // bug_194: the same chokepoint as
+                                    // the attempt leg — a 429'd probe
+                                    // narrates rate-limiting, not
+                                    // infrastructure trouble.
+                                    probe_msgs
+                                        .push(substitute_cell_message(&path, class, &detail).1);
                                     match probe_cells.record_failure(class, retry_after) {
                                         LoopControl::Continue => {}
                                         LoopControl::AbortRaced => break,
@@ -1099,6 +1094,31 @@ async fn pin_materialized_path(
 /// infrastructure failing to classify, not upstream politeness
 /// (rationale recorded in the substitution-replacement invariant
 /// map).
+/// bug_194: THE class→(label, message) chokepoint shared by the
+/// attempt and probe legs. Transient classes (rate-limited / raced)
+/// get NEUTRAL text plus their label — their deferral is uncharged
+/// and the scheduler logs the detail verbatim, so "infrastructure
+/// trouble" wording on a 429 narrated a contradiction against
+/// class="rate_limited". Charging classes keep the infrastructure
+/// framing (the charge ladder sees them). One derivation site: a leg
+/// cannot drift its wording from the class again — the attempt leg's
+/// shape (formerly inline at the tenant loop) is the source.
+fn substitute_cell_message(
+    path: &str,
+    class: rio_evidence_kernel::outcome::SubstituteFailureClass,
+    detail: impl core::fmt::Display,
+) -> (&'static str, String) {
+    use rio_evidence_kernel::outcome::SubstituteFailureClass as C;
+    match class {
+        C::RateLimited => ("rate_limited", format!("substitution of {path}: {detail}")),
+        C::Raced => ("raced", format!("substitution of {path}: {detail}")),
+        _ => (
+            "",
+            format!("substitution of {path} hit infrastructure trouble ({class:?}): {detail}"),
+        ),
+    }
+}
+
 enum MissProbe {
     /// This tenant's upstreams definitively answered "not present".
     Confirmed,
@@ -3049,6 +3069,15 @@ mod tests {
         assert_eq!(
             retry.retry_after_secs, 300,
             "the upstream's Retry-After advice rides the report"
+        );
+        // bug_194: the deferral's DETAIL must agree with its class —
+        // a rate-limited probe narrated as "infrastructure trouble"
+        // is the scheduler logging a contradiction verbatim.
+        assert!(
+            !retry.detail.contains("infrastructure trouble"),
+            "a rate-limited probe deferral must not narrate \
+             infrastructure trouble (bug_194); detail={:?}",
+            retry.detail
         );
     }
 
