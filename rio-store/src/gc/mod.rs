@@ -173,6 +173,29 @@ pub(crate) const GRACE_HOURS_CAP: u32 = 24 * 365;
 /// Returns `Err(Status)` on pool-acquire/lock-query/mark/sweep failure.
 /// Callers forward this into the progress stream as a terminal Err.
 ///
+/// What run_gc phase 3 (the chunk-collect cycle) is allowed to tell
+/// the operator (merged_bug_148). Minted exactly once per phase-3
+/// arm and consumed by an EXHAUSTIVE match building the final
+/// `GcProgress.current_path`: no failure arm can reach the
+/// "complete:" string by construction, so a fail-closed suspension or
+/// a mid-drain DB failure is never rendered as "0 chunks" (which
+/// reads as "nothing to collect" on a destructive subsystem).
+enum Phase3Render {
+    /// The cycle drained and its durable commit landed.
+    Committed,
+    /// The cycle drained but the gc_collect_state commit was lost
+    /// (merged_bug_218) — stats are real, the cadence stamp is not.
+    CommitLost,
+    /// Dry run whose durable observation was withheld (corrupt
+    /// manifest inside the simulated-swept set, merged_bug_147).
+    PreviewOnly,
+    /// Fail-closed ParseFailure: ALL chunk collection is suspended.
+    Suspended,
+    /// The cycle failed against PostgreSQL mid-drain; prior batches'
+    /// soft-deletes/enqueues are already committed.
+    Failed(String),
+}
+
 /// Returns `Ok(None)` when another GC holds [`GC_LOCK_ID`] — the
 /// "already running" terminal progress message is sent, but this
 /// isn't an error.
@@ -314,6 +337,9 @@ pub async fn run_gc(
     } else {
         collect::CollectMode::Live
     };
+    // merged_bug_148: every phase-3 arm mints exactly one render; the
+    // final progress send consumes it by exhaustive match.
+    let phase3: Phase3Render;
     // bug_284: a live phase 3 is an ATTEMPT — stamp it before the
     // cycle so the backstop's throttle conjunct sees operator-
     // triggered heavy scans too. Warn-only: an operator GC must not
@@ -363,7 +389,10 @@ pub async fn run_gc(
             // commit is commit_failed, never ok.
             let record_commit =
                 |committed: Result<state::CycleCommitted, sqlx::Error>| match committed {
-                    Ok(w) => w.record_ok_outcome(),
+                    Ok(w) => {
+                        w.record_ok_outcome();
+                        Phase3Render::Committed
+                    }
                     Err(e) => {
                         metrics::counter!(
                             "rio_store_gc_collect_cycles_total",
@@ -375,9 +404,10 @@ pub async fn run_gc(
                             "GC: collect commit lost (stamp/cursor/backlog \
                              not updated; lock freed via session close)"
                         );
+                        Phase3Render::CommitLost
                     }
                 };
-            match report.outcome {
+            phase3 = match report.outcome {
                 collect::CollectOutcome::Ok => {
                     if params.dry_run {
                         match report.durable {
@@ -400,6 +430,7 @@ pub async fn run_gc(
                                 if let Err(e) = lease.release().await {
                                     warn!(error = %e, "GC: lease release failed (lock freed via session close)");
                                 }
+                                Phase3Render::PreviewOnly
                             }
                         }
                     } else {
@@ -416,15 +447,16 @@ pub async fn run_gc(
                                         .expect("live Ok cycle carries an observation"),
                                 })
                                 .await,
-                        );
+                        )
                     }
                 }
                 collect::CollectOutcome::ParseFailure => {
                     if let Err(e) = lease.release().await {
                         warn!(error = %e, "GC: lease release failed (lock freed via session close)");
                     }
+                    Phase3Render::Suspended
                 }
-            }
+            };
             info!(
                 outcome = ?report.outcome,
                 dry_run = params.dry_run,
@@ -452,6 +484,7 @@ pub async fn run_gc(
             if let Err(e2) = lease.release().await {
                 warn!(error = %e2, "GC: lease release after failed cycle (lock freed via session close)");
             }
+            phase3 = Phase3Render::Failed(e.to_string());
         }
     }
 
@@ -460,30 +493,74 @@ pub async fn run_gc(
     // resurrections surface in the `current_path` summary string
     // (proto has no `paths_resurrected` field — adding one is a
     // cross-crate change deferred to keep this fix store-local).
+    // merged_bug_148: the string is built by an EXHAUSTIVE match over
+    // the typed phase-3 render — no failure arm can produce the
+    // "complete:"/"dry run:" success summary by construction. The
+    // failure-frame prefixes ("chunk collect SUSPENDED:",
+    // "chunk collect FAILED:") are the S6b consumer contract (CLI gc
+    // rendering); is_complete stays true on every arm — the stream's
+    // end-sentinel semantics are unchanged, exit posture is the
+    // consumer's decision.
+    let success_summary = || {
+        if params.dry_run {
+            format!(
+                "dry run: would delete {} paths, {} chunks, free {} bytes, {} resurrected",
+                stats.paths_deleted,
+                stats.chunks_deleted,
+                stats.bytes_freed,
+                stats.paths_resurrected
+            )
+        } else {
+            format!(
+                "complete: {} paths deleted, {} chunks, {} S3 keys enqueued, {} bytes freed, {} resurrected",
+                stats.paths_deleted,
+                stats.chunks_deleted,
+                stats.s3_keys_enqueued,
+                stats.bytes_freed,
+                stats.paths_resurrected
+            )
+        }
+    };
+    let current_path = match &phase3 {
+        Phase3Render::Committed => success_summary(),
+        Phase3Render::CommitLost => format!(
+            "{}; collect-state commit LOST (cadence stamp not updated; see server logs)",
+            success_summary()
+        ),
+        Phase3Render::PreviewOnly => format!(
+            "{}; chunk-collect durable observation WITHHELD \
+             (corrupt manifest in the simulated-swept set)",
+            success_summary()
+        ),
+        Phase3Render::Suspended => format!(
+            "chunk collect SUSPENDED: unparseable chunk_list aborted the cycle fail-closed; \
+             {} paths {}; chunk stats unavailable until the manifest is repaired, deleted, \
+             or quarantined",
+            stats.paths_deleted,
+            if params.dry_run {
+                "would be deleted"
+            } else {
+                "deleted"
+            },
+        ),
+        Phase3Render::Failed(e) => format!(
+            "chunk collect FAILED: {e}; {} paths {}; partial chunk work may already be \
+             committed (see server logs)",
+            stats.paths_deleted,
+            if params.dry_run {
+                "would be deleted"
+            } else {
+                "deleted"
+            },
+        ),
+    };
     let _ = progress_tx
         .send(Ok(GcProgress {
             paths_scanned: found_unreachable,
             paths_collected: stats.paths_deleted,
             bytes_freed: stats.bytes_freed,
             is_complete: true,
-            current_path: if params.dry_run {
-                format!(
-                    "dry run: would delete {} paths, {} chunks, free {} bytes, {} resurrected",
-                    stats.paths_deleted,
-                    stats.chunks_deleted,
-                    stats.bytes_freed,
-                    stats.paths_resurrected
-                )
-            } else {
-                format!(
-                    "complete: {} paths deleted, {} chunks, {} S3 keys enqueued, {} bytes freed, {} resurrected",
-                    stats.paths_deleted,
-                    stats.chunks_deleted,
-                    stats.s3_keys_enqueued,
-                    stats.bytes_freed,
-                    stats.paths_resurrected
-                )
-            },
+            current_path,
         }))
         .await;
 
@@ -709,6 +786,115 @@ mod tests {
     /// `run_gc` in a unit test — so this pins the contract on a
     /// non-resurrecting run and asserts the summary string carries
     /// the resurrected count (the second half of the fix).
+    /// merged_bug_148: phase-3 failure arms must reach the operator.
+    /// Pre-fix a ParseFailure cycle fell through to the unconditional
+    /// final send: "complete: ... 0 chunks, 0 S3 keys enqueued, 0
+    /// bytes freed" -- indistinguishable from "no collectible chunks"
+    /// -- while ALL chunk collection was suspended; the operator best
+    /// positioned to repair the manifest walked away.
+    #[tokio::test]
+    async fn run_gc_parse_failure_reports_suspension_to_operator() {
+        use crate::test_helpers::ChunkSeed;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let _c = ChunkSeed::new(0xD0).uploaded().seed(&db.pool).await;
+        crate::test_helpers::StoreSeed::path("suspend-src")
+            .with_manifest_status("complete")
+            .seed(&db.pool)
+            .await;
+        let h: Vec<u8> = sqlx::query_scalar("SELECT store_path_hash FROM manifests LIMIT 1")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO manifest_data (store_path_hash, chunk_list) VALUES ($1, $2) \
+             ON CONFLICT (store_path_hash) DO UPDATE SET chunk_list = EXCLUDED.chunk_list",
+        )
+        .bind(&h)
+        .bind(vec![0xFFu8; 7]) // corrupt: wrong version byte + misaligned
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::channel(64);
+        run_gc(
+            &db.pool,
+            None,
+            GcParams {
+                dry_run: false,
+                grace_hours: 2,
+                extra_roots: vec![],
+            },
+            tx,
+            &rio_common::signal::Token::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let mut last = None;
+        while let Some(m) = rx.recv().await {
+            last = Some(m.unwrap());
+        }
+        let last = last.expect("final frame");
+        assert!(last.is_complete, "the stream still ends (sentinel kept)");
+        assert!(
+            last.current_path.starts_with("chunk collect SUSPENDED"),
+            "the operator surface reports the suspension, got: {}",
+            last.current_path
+        );
+    }
+
+    /// merged_bug_148 Err half: a mid-drain DB failure after committed
+    /// batches must not summarize as "0 chunks" -- destructive work
+    /// already committed.
+    #[tokio::test]
+    async fn run_gc_collect_db_failure_reports_failed_to_operator() {
+        use crate::test_helpers::ChunkSeed;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        for i in 0..3u8 {
+            let h = ChunkSeed::new(0xD8 + i).uploaded().seed(&db.pool).await;
+            sqlx::query(
+                "UPDATE chunks SET created_at = now() - interval '90 days', \
+                 last_referenced_at = now() - interval '90 days' WHERE blake3_hash = $1",
+            )
+            .bind(&h[..])
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+
+        collect::COLLECT_FAIL_AFTER_BATCHES.store(1, std::sync::atomic::Ordering::SeqCst);
+        let (tx, mut rx) = mpsc::channel(64);
+        run_gc(
+            &db.pool,
+            None,
+            GcParams {
+                dry_run: false,
+                grace_hours: 2,
+                extra_roots: vec![],
+            },
+            tx,
+            &rio_common::signal::Token::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let mut last = None;
+        while let Some(m) = rx.recv().await {
+            last = Some(m.unwrap());
+        }
+        let last = last.expect("final frame");
+        assert!(last.is_complete);
+        assert!(
+            last.current_path.starts_with("chunk collect FAILED"),
+            "a mid-drain failure is disclosed, got: {}",
+            last.current_path
+        );
+    }
+
     #[tokio::test]
     async fn run_gc_final_paths_scanned_monotone() {
         use crate::test_helpers::StoreSeed;
