@@ -16,7 +16,7 @@
 //! zero (a fresh/empty value — conservative for TTL-style consumers),
 //! +inf/absurd → one year.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// A `Duration` built from an untrusted f64 seconds value through the
 /// one total constructor. Cannot panic.
@@ -57,6 +57,35 @@ pub fn clamped_duration_secs(secs: f64) -> Duration {
     ClampedSecs::from_f64(secs).duration()
 }
 
+/// Total constructor for ABSOLUTE epoch seconds → `SystemTime`: the
+/// EPOCH-domain twin of [`ClampedSecs`] (the AGE/interval clamp).
+///
+/// The two domains need two constructors because the age clamp's
+/// 1-year absurdity ceiling is *meaningless* for absolute timestamps —
+/// routing an epoch through it relocates every real timestamp to 1971
+/// (the bughunt-4 sibling sweep found exactly that distortion at two
+/// sites, after the controller sketch precedent had already named it).
+/// Pick by domain:
+///
+/// - seconds **since** something (age, interval, backoff, TTL) →
+///   [`ClampedSecs`] / [`clamped_duration_secs`],
+/// - seconds **at** something (`EXTRACT(EPOCH FROM <timestamptz>)`,
+///   wire-carried epoch stamps) → this function.
+///
+/// Poisoned input (NaN / negative / ±inf / past-`SystemTime`-range) →
+/// `None`. The caller picks the refusal shape: optional wire fields
+/// stay absent; mandatory states warn and reset to `UNIX_EPOCH` (the
+/// sketch re-warm precedent — recoverable where the panic was not).
+pub fn epoch_secs(secs: f64) -> Option<SystemTime> {
+    // The ONE sanctioned `try_from_secs_f64` call in the workspace
+    // (clippy `disallowed-methods` routes every other site here):
+    // totality is the point — Err on NaN/negative/non-finite/overflow
+    // — and NO ceiling, because the domain is absolute.
+    #[allow(clippy::disallowed_methods)]
+    let d = Duration::try_from_secs_f64(secs).ok()?;
+    SystemTime::UNIX_EPOCH.checked_add(d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,5 +111,34 @@ mod tests {
         }
         assert!(ClampedSecs::from_f64(f64::NAN).is_zero());
         assert!(!ClampedSecs::from_f64(1.0).is_zero());
+    }
+
+    /// The EPOCH constructor: total over the adversarial alphabet and
+    /// — the property the AGE clamp cannot give — undistorted on real
+    /// timestamps. The first assertion documents the defect class this
+    /// kills: a 2023 epoch through the age clamp lands at the 1-year
+    /// ceiling (1971).
+    #[test]
+    fn epoch_constructor_is_total_and_undistorted() {
+        let real_epoch = 1.7e9; // 2023-11-14T22:13:20Z
+        let through_age_clamp = SystemTime::UNIX_EPOCH + clamped_duration_secs(real_epoch);
+        assert_eq!(
+            through_age_clamp,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(ClampedSecs::MAX_SECS as u64),
+            "the age clamp relocates real epochs to 1971 — epoch sites use epoch_secs"
+        );
+        assert_eq!(
+            epoch_secs(real_epoch),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            "epoch_secs must carry the real timestamp undistorted"
+        );
+        assert_eq!(epoch_secs(0.0), Some(SystemTime::UNIX_EPOCH));
+        for poisoned in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 1.9e19] {
+            assert_eq!(
+                epoch_secs(poisoned),
+                None,
+                "poisoned epoch {poisoned} must refuse, not panic or fabricate"
+            );
+        }
     }
 }

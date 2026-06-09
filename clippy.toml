@@ -29,4 +29,11 @@ disallowed-methods = [
   # rio_common::clamped::ClampedSecs::from_f64 (total: NaN/neg→0,
   # +inf/absurd→1yr). Route every f64-seconds→Duration through it.
   { path = "std::time::Duration::from_secs_f64", reason = "panics on +inf/NaN/negative; use rio_common::clamped::ClampedSecs::from_f64 / clamped_duration_secs (merged_bug_262)" },
+
+  # bughunt-4 sibling sweep: inline try_from_secs_f64 at call sites is the
+  # whack-a-mole shape -- and feeding an ABSOLUTE epoch through the AGE
+  # clamp relocates it to 1971. Two constructors, picked by domain:
+  # ages/intervals -> ClampedSecs; absolute epochs -> clamped::epoch_secs
+  # (the only sanctioned try_from call site).
+  { path = "std::time::Duration::try_from_secs_f64", reason = "route absolute epochs through rio_common::clamped::epoch_secs (the one sanctioned site); ages through ClampedSecs" },
 ]

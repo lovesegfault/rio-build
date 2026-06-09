@@ -603,10 +603,19 @@ impl CostTable {
                 cores: cores.max(0) as u32,
                 mem_bytes: mem_bytes.max(0) as u64,
                 price_per_vcpu_hr: seed_price(cap),
-                // merged_bug_262: .max(0.0) passes +inf -> panic in
-                // the leader hydrate task instead of its Err-retry arm.
-                last_observed: SystemTime::UNIX_EPOCH
-                    + rio_common::clamped::clamped_duration_secs(at),
+                // `last_observed` is an ABSOLUTE epoch: the EPOCH-domain
+                // constructor carries it undistorted (the age clamp's
+                // 1-year ceiling relocated every real stamp to 1971) and
+                // refuses poisoned rows totally. A refused stamp resets
+                // to UNIX_EPOCH (the sketch re-warm precedent): the cell
+                // reads as maximally stale, which only re-observes it.
+                last_observed: rio_common::clamped::epoch_secs(at).unwrap_or_else(|| {
+                    tracing::warn!(
+                        epoch_secs = at,
+                        "poisoned last_observed epoch; resetting to UNIX_EPOCH"
+                    );
+                    SystemTime::UNIX_EPOCH
+                }),
             });
         }
         for m in t.cells.values_mut() {

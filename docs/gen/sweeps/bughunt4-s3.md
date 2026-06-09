@@ -98,3 +98,24 @@ drifted set is a failed sweep, not a stale doc.
     metadata/inline.rs, rio-controller sketch.rs epoch (ABSOLUTE epoch: total
     try_from_secs_f64 + warn/reset, not the 1yr age clamp). Planted-red verified:
     a raw call anywhere fails clippy -D warnings with the merged_bug_262 reason.
+
+## C9b — epoch-vs-age domain census (sibling sweep of the C9 constructor)
+
+Generated: `grep -rn 'clamped_duration_secs\|ClampedSecs::from_f64\|clamped::epoch_secs\|try_from_secs_f64' --include='*.rs' rio-* | grep -v 'rio-common/src/clamped.rs'` — every f64-seconds time construction in the workspace, classified by domain. The machine witness is the clippy `disallowed-methods` pair (from_secs_f64 AND try_from_secs_f64): an unclassified site cannot compile.
+
+| site | fed expression | domain | constructor |
+|---|---|---|---|
+| rio-scheduler/src/actor/materialize.rs:859 | `park_remaining_secs` (PG `EXTRACT(EPOCH FROM parked_until - now())`) | AGE (remaining interval) | `ClampedSecs::from_f64` |
+| rio-scheduler/src/state/recovered_instant.rs:60 | `age_secs` (recovery age) | AGE | `clamped_duration_secs` |
+| rio-scheduler/src/state/recovered_instant.rs:94 | `thirty_hours` (test interval) | AGE | `clamped_duration_secs` |
+| rio-scheduler/src/state/executor.rs:153 | `backoff_base_secs` (config interval) | AGE | `clamped_duration_secs` |
+| rio-scheduler/src/state/executor.rs:158 | `backoff_max_secs` (config interval) | AGE | `clamped_duration_secs` |
+| rio-builder/src/fixture.rs:103 | `o.wall_secs` (wall-clock duration) | AGE | `clamped_duration_secs` |
+| rio-scheduler/src/sla/cost.rs:948 | `max_lead_time_secs` (interval) | AGE | `clamped_duration_secs` |
+| rio-store/src/metadata/inline.rs:326 | `EXTRACT(EPOCH FROM (now() - updated_at))` (age) | AGE | `clamped_duration_secs` |
+| rio-common/src/backoff.rs:143 | `safe` (backoff interval) | AGE | `clamped_duration_secs` |
+| rio-scheduler/src/sla/cost.rs:612 | `EXTRACT(EPOCH FROM last_observed)` (timestamptz) | **EPOCH** | `clamped::epoch_secs` (was age-clamped — **defect, fixed**) |
+| rio-scheduler/src/admin/executors.rs:88 | `assigned_at_epoch_secs` (`EXTRACT(EPOCH FROM a.assigned_at)`) | **EPOCH** | `clamped::epoch_secs` (was age-clamped — **defect, fixed**) |
+| rio-controller/src/reconcilers/nodeclaim_pool/sketch.rs:568 | `sketch_epoch_secs` (timestamptz) | **EPOCH** | `clamped::epoch_secs` (was inline `try_from_secs_f64` — migrated to the funnel) |
+
+Zero epoch-domain feeds of the age clamp remain; zero inline `try_from_secs_f64` sites remain (the ban admits only `clamped::epoch_secs`).

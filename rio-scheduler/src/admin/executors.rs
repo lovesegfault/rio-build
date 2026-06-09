@@ -11,7 +11,7 @@
 //! same view; this RPC stays so existing CLI/dashboard/controller
 //! callers keep a working endpoint until the 1d proto sweep.
 
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use rio_common::grpc::StatusExt;
 use rio_proto::types::{ExecutorInfo, ListExecutorsResponse};
@@ -79,13 +79,13 @@ fn row_to_proto(r: OpenAttemptRow) -> ExecutorInfo {
     // liveness is the Job/pod phase plus attempt age (the OA5
     // successor view + the OA2 wedge alert); consumers render plain
     // relative age.
-    // merged_bug_262: the checked_add guard was vacuous -- raw
-    // from_secs_f64 panics on +inf BEFORE checked_add can refuse.
-    let attempt_opened = SystemTime::UNIX_EPOCH
-        .checked_add(rio_common::clamped::clamped_duration_secs(
-            r.assigned_at_epoch_secs,
-        ))
-        .map(prost_types::Timestamp::from);
+    // `assigned_at` is an ABSOLUTE epoch: the EPOCH-domain constructor
+    // carries it undistorted (the age clamp's 1-year ceiling relocated
+    // every real stamp to 1971) and refuses poisoned values totally —
+    // the field is optional on the wire, so a refused epoch is simply
+    // absent rather than a fabricated 1970.
+    let attempt_opened =
+        rio_common::clamped::epoch_secs(r.assigned_at_epoch_secs).map(prost_types::Timestamp::from);
     ExecutorInfo {
         executor_id: r.executor_id,
         // The system the attempt's derivation targets — what the pod
@@ -97,5 +97,57 @@ fn row_to_proto(r: OpenAttemptRow) -> ExecutorInfo {
         resources: None,
         attempt_opened,
         kind: crate::state::kind_for_drv(r.is_fixed_output) as i32,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::open_attempts::OpenAttemptRow;
+    use uuid::Uuid;
+
+    fn row(assigned_at_epoch_secs: f64) -> OpenAttemptRow {
+        OpenAttemptRow {
+            derivation_id: Uuid::nil(),
+            drv_hash: "h".into(),
+            drv_path: "/nix/store/h-x.drv".into(),
+            exec_id: Uuid::nil(),
+            executor_id: "exec-1".into(),
+            system: "x86_64-linux".into(),
+            is_fixed_output: false,
+            source_node: None,
+            generation: 1,
+            assigned_at_epoch_secs,
+            age_secs: 1.0,
+            deadline_secs: None,
+            attempt_kind: "build".into(),
+        }
+    }
+
+    /// `assigned_at` is an ABSOLUTE epoch: a real 2023 timestamp must
+    /// survive the proto round-trip undistorted (the age clamp's
+    /// 1-year ceiling relocated every real attempt-open stamp to 1971).
+    #[test]
+    fn attempt_opened_carries_the_real_epoch() {
+        let info = row_to_proto(row(1_700_000_000.0));
+        let ts = info.attempt_opened.expect("finite epoch must be present");
+        assert_eq!(
+            ts.seconds, 1_700_000_000,
+            "absolute epoch distorted (31536000 = the age-clamp ceiling, 1971)"
+        );
+    }
+
+    /// Poisoned epochs refuse (absent optional field) — never panic,
+    /// never a fabricated 1970/1971 stamp.
+    #[test]
+    fn attempt_opened_refuses_poisoned_epochs() {
+        for poisoned in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -5.0] {
+            let info = row_to_proto(row(poisoned));
+            assert!(
+                info.attempt_opened.is_none(),
+                "poisoned epoch {poisoned} must be absent, got {:?}",
+                info.attempt_opened
+            );
+        }
     }
 }
