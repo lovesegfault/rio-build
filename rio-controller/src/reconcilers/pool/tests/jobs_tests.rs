@@ -967,8 +967,12 @@ fn synthesized_report_decision_pull_only() {
     let job = running_job_for_intent("rio-builder-p-pull1", "drv-pull-1");
 
     // (a) Covered by an open pull-mode attempt → one request, keyed by
-    // the attempt's exec_id, carrying the AD2c node attribution.
-    let attempts = vec![pull_attempt("drv-pull-1", "exec-1", "node-a")];
+    // the attempt's exec_id, carrying the AD2c node attribution. The
+    // attempt's executor is the Job's own pod (merged_bug_298: the
+    // constructor binds owner identity, not just intent).
+    let mut owned = pull_attempt("drv-pull-1", "exec-1", "node-a");
+    owned.executor_id = "rio-builder-p-pull1-a1b2c".into();
+    let attempts = vec![owned];
     let req = synthesized_report_for_job(&job, AttemptTerminalReason::Reaped, &attempts)
         .expect("open pull attempt → synthesize");
     assert_eq!(req.exec_id, "exec-1");
@@ -999,6 +1003,26 @@ fn synthesized_report_decision_pull_only() {
 }
 
 // r[verify ctrl.job.synthesize-on-delete]
+/// merged_bug_298 red: two Jobs cover one intent (cross-pool respawn).
+/// Deleting pool B's Job must bind pool B's OWN attempt — never close
+/// pool A's healthy one (charge-free verdict against the wrong
+/// executor).
+#[test]
+fn synthesized_report_binds_owner_not_just_intent() {
+    let job_b = running_job_for_intent("rio-builder-b-x", "drv-shared-1");
+    let mut a = pull_attempt("drv-shared-1", "exec-a", "node-1");
+    a.executor_id = "rio-builder-a-y-7k2fq".into(); // pool A's pod
+    let mut b = pull_attempt("drv-shared-1", "exec-b", "node-2");
+    b.executor_id = "rio-builder-b-x-9mz4h".into(); // pool B's pod
+    let req = synthesized_report_for_job(&job_b, AttemptTerminalReason::Reaped, &[a, b])
+        .expect("pool B's own attempt is open");
+    assert_eq!(
+        req.exec_id, "exec-b",
+        "the synthesized verdict must bind the deleting Job's own attempt"
+    );
+}
+
+// r[verify ctrl.job.synthesize-on-delete]
 /// Deleting a Job that still has an open pull-mode attempt synthesizes
 /// the `ReportAttemptOutcome` (observed via the OA1 histogram sample
 /// the helper records only after the report is ACKED) and still issues
@@ -1015,7 +1039,10 @@ async fn delete_job_synthesizes_report_for_open_pull_attempt() {
     let jobs_api: Api<Job> = Api::namespaced(client, "rio");
 
     let covered = running_job_for_intent("rio-builder-p-pull1", "drv-pull-1");
-    let attempts = vec![pull_attempt("drv-pull-1", "exec-1", "node-a")];
+    // merged_bug_298: the attempt's executor is the Job's own pod.
+    let mut owned = pull_attempt("drv-pull-1", "exec-1", "node-a");
+    owned.executor_id = "rio-builder-p-pull1-a1b2c".into();
+    let attempts = vec![owned];
 
     let guard = verifier.run(vec![delete_scenario("rio-builder-p-pull1")]);
     delete_job_with_synthesized_report(

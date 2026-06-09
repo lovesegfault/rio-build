@@ -221,6 +221,13 @@ pub(super) async fn preempt_disrupted_pod(
             p.job_name.clone().unwrap_or_else(|| p.pod_name.clone()),
             rio_proto::types::AttemptTerminalReason::Preempted,
             &resp.into_inner().attempts,
+            // merged_bug_298: the watcher owns exactly the disrupted
+            // pod (executor_id) on its known node — a same-intent
+            // attempt elsewhere is not ours to close.
+            super::job::AttemptOwner::Pod {
+                pod: &p.pod_name,
+                node: &p.node_name,
+            },
         ),
         Err(e) => {
             warn!(

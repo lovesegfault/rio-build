@@ -562,32 +562,69 @@ pub(super) fn synthesized_report_for_job(
     reason: rio_proto::types::AttemptTerminalReason,
     open_attempts: &[rio_proto::types::OpenAttempt],
 ) -> Option<rio_proto::types::ReportAttemptOutcomeRequest> {
+    let job_name = job.metadata.name.clone().unwrap_or_default();
     synthesized_report_for_intent(
         job_intent_id(job),
-        job.metadata.name.clone().unwrap_or_default(),
+        job_name.clone(),
         reason,
         open_attempts,
+        AttemptOwner::Job(&job_name),
     )
 }
 
+/// merged_bug_298: the owner identity a synthesized verdict must bind.
+/// The retired resolution matched by `intent_id` alone over the
+/// cluster-wide `ListOpenAttempts` view — pool B's reap (or a
+/// disruption event) could close pool A's healthy attempt with a
+/// charge-free verdict against the wrong executor. There is no
+/// constructor without an owner, so an unowned attempt is unmatchable
+/// by construction.
+pub(super) enum AttemptOwner<'a> {
+    /// Job-delete arms: a pull-mode attempt's `executor_id` is the k8s
+    /// pod name, and a Job's pods carry the Job name as a dash-joined
+    /// prefix with a dashless random suffix.
+    Job(&'a str),
+    /// The disruption watcher targets one pod on one known node.
+    Pod { pod: &'a str, node: &'a str },
+}
+
+impl AttemptOwner<'_> {
+    fn owns(&self, a: &rio_proto::types::OpenAttempt) -> bool {
+        match self {
+            // `{job}-{suffix}` with a dashless suffix: "metal" owns
+            // "metal-7k2fq" but not "metal-big-7k2fq" (a sibling Job's
+            // pod), and never bare "metal".
+            AttemptOwner::Job(job) => a.executor_id.strip_prefix(job).is_some_and(|rest| {
+                rest.len() > 1 && rest.starts_with('-') && !rest[1..].contains('-')
+            }),
+            AttemptOwner::Pod { pod, node } => {
+                a.executor_id == *pod
+                    || (!node.is_empty() && !a.source_node.is_empty() && a.source_node == *node)
+            }
+        }
+    }
+}
+
 // r[impl ctrl.drain.disruption-target+4]
-/// The shared synthesized-verdict constructor (merged_bug_135): a
-/// controller-synthesized terminal report exists ONLY when an open
-/// attempt exists for the intent, and is keyed by THAT attempt's
-/// `exec_id` — the scheduler refuses exec_id-less synthesized
-/// verdicts, so a caller with no open attempt sends nothing (the Job
-/// delete still proceeds; the establishment sweep classifies any
-/// attempt that appears later). One constructor means the disruption
-/// watcher and every Job-delete arm speak the same identity rule.
+/// The shared synthesized-verdict constructor (merged_bug_135,
+/// owner-bound per merged_bug_298): a controller-synthesized terminal
+/// report exists ONLY when an open attempt exists for the intent AND
+/// the caller owns it, and is keyed by THAT attempt's `exec_id` — the
+/// scheduler refuses exec_id-less synthesized verdicts, so a caller
+/// with no owned open attempt sends nothing (the Job delete still
+/// proceeds; the establishment sweep classifies any attempt that
+/// appears later). One constructor means the disruption watcher and
+/// every Job-delete arm speak the same identity rule.
 pub(super) fn synthesized_report_for_intent(
     intent: Option<&str>,
     job_name: String,
     reason: rio_proto::types::AttemptTerminalReason,
     open_attempts: &[rio_proto::types::OpenAttempt],
+    owner: AttemptOwner<'_>,
 ) -> Option<rio_proto::types::ReportAttemptOutcomeRequest> {
     let attempt = open_attempts
         .iter()
-        .find(|a| intent.is_some_and(|i| !i.is_empty() && a.intent_id == i))?;
+        .find(|a| intent.is_some_and(|i| !i.is_empty() && a.intent_id == i) && owner.owns(a))?;
     Some(rio_proto::types::ReportAttemptOutcomeRequest {
         resubmit_cycle: 0,
         intent_id: attempt.intent_id.clone(),
