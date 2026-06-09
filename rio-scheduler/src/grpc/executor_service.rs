@@ -563,11 +563,25 @@ impl CredentialRejection {
             reason: None,
         }
     }
-}
 
-impl From<CredentialRejection> for Status {
-    fn from(rej: CredentialRejection) -> Status {
-        rej.status
+    /// THE consuming path (merged_bug_049): tick
+    /// `rio_scheduler_pull_rejected_total{rpc, reason}` and convert to
+    /// the wire status in one step. The `From<CredentialRejection> for
+    /// Status` impl is deliberately DELETED -- a bare `?` that would
+    /// silently drop the classified reason no longer typechecks, so
+    /// the compiler enumerates every consumer (the machine witness for
+    /// "all credential_for consumers count"). Shape violations
+    /// (reason: None) surface uncounted, as before.
+    fn into_status_counted(self, rpc: &'static str) -> Status {
+        if let Some(reason) = self.reason {
+            metrics::counter!(
+                "rio_scheduler_pull_rejected_total",
+                "rpc" => rpc,
+                "reason" => reason.as_label()
+            )
+            .increment(1);
+        }
+        self.status
     }
 }
 
@@ -651,17 +665,9 @@ impl ExecutorService for SchedulerGrpc {
             Ok(ResolvedCredential::StoreService(_)) => None,
             Err(rej) => {
                 // bug_168: the reason travels WITH the rejection from
-                // the site that knows the failure; shape violations
-                // (reason: None) surface uncounted.
-                if let Some(reason) = rej.reason {
-                    metrics::counter!(
-                        "rio_scheduler_pull_rejected_total",
-                        "rpc" => "pull_assignment",
-                        "reason" => reason.as_label()
-                    )
-                    .increment(1);
-                }
-                return Err(rej.into());
+                // the site that knows the failure; merged_bug_049: the
+                // tick+convert is one chokepoint call.
+                return Err(rej.into_status_counted("pull_assignment"));
             }
         };
         let auth_intent = auth_claims.as_ref().map(|c| c.intent_id.clone());
@@ -847,16 +853,8 @@ impl ExecutorService for SchedulerGrpc {
             Ok(ResolvedCredential::StoreService(_)) => None,
             Err(rej) => {
                 // bug_168: classified at the rejecting site, consumed
-                // here; shape violations (reason: None) uncounted.
-                if let Some(reason) = rej.reason {
-                    metrics::counter!(
-                        "rio_scheduler_pull_rejected_total",
-                        "rpc" => "report_outcome",
-                        "reason" => reason.as_label()
-                    )
-                    .increment(1);
-                }
-                return Err(rej.into());
+                // here; merged_bug_049: tick+convert in one call.
+                return Err(rej.into_status_counted("report_outcome"));
             }
         };
         let req = request.into_inner();
@@ -1018,7 +1016,8 @@ impl ExecutorService for SchedulerGrpc {
                 request_instance: None,
             },
             &request,
-        )?;
+        )
+        .map_err(|rej| rej.into_status_counted("list_materialization_jobs"))?;
         let req = request.into_inner();
 
         // send_unchecked: the store polls on an interval; a dropped
@@ -1090,7 +1089,8 @@ impl ExecutorService for SchedulerGrpc {
         // the metadata header is the only carrier. Full dev mode passes
         // through to the relay below.
         // r[impl sched.materialize.job+2]
-        self.credential_for(PayloadCredentialKind::MaterializationDisplayOnly, &request)?;
+        self.credential_for(PayloadCredentialKind::MaterializationDisplayOnly, &request)
+            .map_err(|rej| rej.into_status_counted("report_materialization_progress"))?;
         let req = request.into_inner();
         // A malformed exec_id is a caller bug worth surfacing even
         // though the payload itself is droppable.

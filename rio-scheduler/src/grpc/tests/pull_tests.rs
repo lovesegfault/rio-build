@@ -1835,3 +1835,87 @@ async fn pull_rejection_reason_classifies_verification_failure() -> anyhow::Resu
     );
     Ok(())
 }
+
+// r[verify sched.materialize.job+2]
+/// merged_bug_049 (round 4): only 2 of the 4 `credential_for`
+/// consumers counted rejections — the listing/progress sites routed a
+/// bare `?` through `From<CredentialRejection> for Status`, which
+/// kept the status and silently dropped the classified reason. During
+/// a store-fleet service-HMAC rotation skew the store's poll loop
+/// dies at the UNCOUNTED listing every pass, so the counted
+/// pull_assignment/report_outcome surfaces are never reached:
+/// materialization halts fleet-wide while the HELP-advertised
+/// rotation-skew trace stays flat. The From impl is DELETED (compile
+/// red: 4 sites stopped typechecking — the compiler-generated
+/// consumer census) and every consumer routes through
+/// `into_status_counted(rpc)`.
+#[tokio::test]
+async fn listing_and_progress_rejections_tick_their_rpc_labels() -> anyhow::Result<()> {
+    use rio_auth::hmac::HmacKey;
+    use rio_proto::ExecutorService;
+    let recorder = rio_test_support::metrics::CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let (_db, mut grpc, _handle, _actor_task) = setup_grpc().await;
+    let service_key = std::sync::Arc::new(HmacKey::from_key(
+        b"service-key-32-bytes-long-here!!".to_vec(),
+    ));
+    let rotated_key = std::sync::Arc::new(HmacKey::from_key(
+        b"rotated-away-key-32-bytes-long!!".to_vec(),
+    ));
+    grpc.hmac_key = Some(std::sync::Arc::new(HmacKey::from_key(
+        b"executor-key-32-bytes-long!!!!!!".to_vec(),
+    )));
+    grpc.service_verifier = Some(service_key);
+    let skewed_token = store_service_token_bound(&rotated_key, "rio-store", "store-replica-0");
+
+    // The listing: the store poll loop's FIRST call each pass — the
+    // uncounted hole pre-fix.
+    let mut req = Request::new(rio_proto::types::ListMaterializationJobsRequest {
+        service_token: String::new(),
+        limit: 16,
+    });
+    req.metadata_mut().insert(
+        rio_common::grpc::SERVICE_TOKEN_HEADER,
+        skewed_token.parse()?,
+    );
+    let err = grpc
+        .list_materialization_jobs(req)
+        .await
+        .expect_err("a wrong-key service token must be rejected");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        recorder.get(
+            "rio_scheduler_pull_rejected_total{reason=service_verification_failed,rpc=list_materialization_jobs}"
+        ),
+        1,
+        "the listing rejection must tick its own rpc label; keys: {:?}",
+        recorder.all_keys()
+    );
+
+    // The progress surface: same skewed credential.
+    let mut req = Request::new(rio_proto::types::ReportMaterializationProgressRequest {
+        exec_id: uuid::Uuid::now_v7().to_string(),
+        bytes_done: 0,
+        bytes_expected: 0,
+        upstream_uri: String::new(),
+    });
+    req.metadata_mut().insert(
+        rio_common::grpc::SERVICE_TOKEN_HEADER,
+        skewed_token.parse()?,
+    );
+    let err = grpc
+        .report_materialization_progress(req)
+        .await
+        .expect_err("a wrong-key service token must be rejected");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        recorder.get(
+            "rio_scheduler_pull_rejected_total{reason=service_verification_failed,rpc=report_materialization_progress}"
+        ),
+        1,
+        "the progress rejection must tick its own rpc label; keys: {:?}",
+        recorder.all_keys()
+    );
+    Ok(())
+}

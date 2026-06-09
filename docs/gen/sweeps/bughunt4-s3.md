@@ -43,3 +43,14 @@ drifted set is a failed sweep, not a stale doc.
 
     Every arm that HAS a report consumes its count; the reportless arms stamp
     None by design (never falsely claim completeness).
+
+## merged_bug_049 — all four credential_for consumers (compiler-generated)
+
+    $ # deleting `impl From<CredentialRejection> for Status` made the set a compile error list:
+    error[E0277] executor_service.rs:660   pull_assignment            (was counted; now chokepoint)
+    error[E0277] executor_service.rs:855   report_outcome             (was counted; now chokepoint)
+    error[E0277] executor_service.rs:1017  list_materialization_jobs  (was a bare `?` reason-drop)
+    error[E0277] executor_service.rs:1089  report_materialization_progress (was a bare `?` reason-drop)
+
+    The only consuming path is CredentialRejection::into_status_counted(rpc);
+    a fifth consumer cannot compile without going through it.

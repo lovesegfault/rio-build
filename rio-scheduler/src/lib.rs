@@ -292,7 +292,8 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_scheduler_pull_rejected_total",
         "Pull-mode unaries rejected (labels: rpc = \
-         pull_assignment|report_outcome, reason = unauthenticated|token_mismatch|\
+         pull_assignment|report_outcome|list_materialization_jobs|\
+         report_materialization_progress, reason = unauthenticated|token_mismatch|\
          kind_unauthorized — a VERIFIED credential whose kind does not \
          authorize the payload class (an executor token on a materialization \
          surface, a non-store service caller, or an executor kind not allowed \
