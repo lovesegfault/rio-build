@@ -299,8 +299,10 @@ pub fn describe_metrics() {
         "rio_store_gc_collect_backlog_chunks",
         "Estimate of eligible-but-not-yet-collected chunks (drain visibility \
          for the capped collect). Shadow mode: equals would-collect. Live \
-         mode: decremented by each cycle's collected count and re-anchored \
-         when a pass completes."
+         mode: decremented by each cycle's collected count, re-anchored at \
+         0 when a full pass completes, and SEEDED from the cycle's \
+         unmarked-rows count when no anchor exists yet (bug_306: the gauge \
+         is live from the first cycle; 0 before any cycle has run)."
     );
     describe_histogram!(
         "rio_store_gc_collect_cycle_seconds",

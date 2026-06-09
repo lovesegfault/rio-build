@@ -409,15 +409,17 @@ pub(crate) enum CollectOutcome {
 pub(crate) struct DurableObservation {
     mark_set_size: i64,
     would_collect: i64,
+    unmarked_backlog_seed: i64,
 }
 
 impl DurableObservation {
     /// Mint from the exclusion-free computation. NOT pub(crate): only
     /// collect_cycle's real-basis arm can call this.
-    fn from_real_basis(mark_set_size: i64, would_collect: i64) -> Self {
+    fn from_real_basis(mark_set_size: i64, would_collect: i64, unmarked_backlog_seed: i64) -> Self {
         Self {
             mark_set_size,
             would_collect,
+            unmarked_backlog_seed,
         }
     }
 
@@ -430,6 +432,18 @@ impl DurableObservation {
     /// and the Live commit does not consume it).
     pub(crate) fn would_collect(&self) -> i64 {
         self.would_collect
+    }
+
+    /// Coarse backlog seed: not-deleted rows MINUS the real mark, on
+    /// the cycle snapshot (bug_306). An overestimate of the eligible
+    /// set (within-grace unmarked rows are counted; they age in), used
+    /// by [`super::state::CycleCommit::Live`] ONLY to establish an
+    /// absent anchor -- an existing anchor (a dry run's precise
+    /// would-collect, or a prior seed under decrement) is never
+    /// overwritten. Non-optional BY TYPE: every constructor produces a
+    /// seed, so the total-anchor obligation has no NULL path.
+    pub(crate) fn unmarked_backlog_seed(&self) -> i64 {
+        self.unmarked_backlog_seed
     }
 }
 
@@ -804,6 +818,15 @@ pub(crate) async fn collect_cycle(
     // exclusion-free product on the same REPEATABLE READ snapshot
     // (2x mark cost, operator dry runs only) and count against it.
     // With an empty exclusion the product above IS the real basis.
+    // bug_306: the seed term every arm shares -- one COUNT on the
+    // cycle snapshot (index/seq scan over not-deleted rows, once per
+    // cycle at the daily cadence; the shadow report and the mark
+    // expansion are both heavier).
+    let not_deleted_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE deleted = FALSE")
+            .fetch_one(&mut *tx)
+            .await?;
+
     let durable = match simulated_swept {
         Some(swept) if !swept.is_empty() => {
             let real_expansion =
@@ -824,14 +847,26 @@ pub(crate) async fn collect_cycle(
             .bind(&cutoff)
             .fetch_one(&mut *tx)
             .await?;
-            DurableObservation::from_real_basis(real_mark, real_would)
+            DurableObservation::from_real_basis(
+                real_mark,
+                real_would,
+                (not_deleted_rows - real_mark).max(0),
+            )
         }
         // Standalone shadow observation: no exclusion was applied —
         // the preview numbers ARE the real basis.
-        Some(_) => DurableObservation::from_real_basis(mark_set_size, would_collect),
+        Some(_) => DurableObservation::from_real_basis(
+            mark_set_size,
+            would_collect,
+            (not_deleted_rows - mark_set_size).max(0),
+        ),
         // Live: the mark is exclusion-free by construction; the live
         // arm never computes a would-collect count.
-        None => DurableObservation::from_real_basis(mark_set_size, 0),
+        None => DurableObservation::from_real_basis(
+            mark_set_size,
+            0,
+            (not_deleted_rows - mark_set_size).max(0),
+        ),
     };
 
     // Commit ends the cycle's snapshot. In shadow mode the temp table
@@ -2405,6 +2440,49 @@ mod tests {
         assert!(
             remaining.contains(&resurrected.to_vec()),
             "resurrected row never reaped"
+        );
+    }
+
+    /// bug_306: live-only operation must anchor the backlog estimate.
+    /// Pre-fix the Live commit's `NULL THEN NULL` arm meant only a
+    /// dry-run (Shadow) commit could ever establish the anchor, so on
+    /// a cluster that never dry-runs, `rio_store_gc_collect_backlog_chunks`
+    /// read the boot 0 through an entire multi-day capped drain while
+    /// cycles_capped ticked -- the contradictory pair the gauge exists
+    /// to resolve. Every CycleCommit now carries an unmarked-rows seed
+    /// (non-optional on DurableObservation: the anchor obligation is
+    /// total by type) and the Live CASE seeds it when no anchor exists.
+    #[tokio::test]
+    async fn capped_live_cycle_seeds_backlog_anchor() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        reset_collector_state(&db.pool).await;
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
+
+        // Backlog larger than the cap; NO shadow cycle ever runs.
+        let n = (COLLECT_CYCLE_VICTIM_CAP + 10) as u16;
+        seed_collectable_chunks(&db.pool, n, 100).await;
+
+        // The production path: the backstop runs the live cycle and
+        // commits it (last_live_cycle_at is NULL, so it is due).
+        let report = collect_backstop_once(
+            &db.pool,
+            Some(&backend),
+            super::super::sweep::CHUNK_GRACE_SECS,
+        )
+        .await
+        .expect("backstop cycle")
+        .expect("due -> a cycle ran");
+        assert!(report.cap_reached, "the cycle stops at the cap");
+
+        let row = super::super::state::read_state_unlocked(&db.pool)
+            .await
+            .unwrap();
+        let anchored = row
+            .backlog_estimate
+            .expect("a capped live cycle anchors a backlog estimate (bug_306)");
+        assert!(
+            anchored > 0,
+            "the anchor reflects the unmarked remainder, got {anchored}"
         );
     }
 

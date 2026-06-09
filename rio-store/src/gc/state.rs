@@ -68,8 +68,12 @@ pub(crate) async fn read_state_unlocked(pool: &PgPool) -> Result<GcCollectState,
 /// What a finished cycle commits to the durable row.
 pub(crate) enum CycleCommit {
     /// A live (deleting) cycle: stamps `last_live_cycle_at`, persists
-    /// the stop cursor, decrements the backlog estimate (floor 0).
-    /// The cursor/backlog decision is taken from the typed
+    /// the stop cursor, decrements the backlog estimate (floor 0) --
+    /// or, when NO anchor exists yet, establishes one from the
+    /// observation's unmarked-rows seed minus this cycle's victims
+    /// (bug_306: live-only operation must not leave the drain gauge on
+    /// its boot zero for the whole capped drain). The cursor/backlog
+    /// decision is taken from the typed
     /// [`super::collect::PassDisposition`] (bug_174): only a
     /// FULL-KEYSPACE completion re-anchors the estimate at 0; a
     /// cursor-resumed completion resets the cursor but keeps the
@@ -151,7 +155,7 @@ impl GcCycleLease {
                        cursor = $1, \
                        backlog_estimate = CASE \
                          WHEN $2 THEN 0 \
-                         WHEN backlog_estimate IS NULL THEN NULL \
+                         WHEN backlog_estimate IS NULL THEN GREATEST($5 - $3, 0) \
                          ELSE GREATEST(backlog_estimate - $3, 0) END, \
                        last_mark_set_size = $4, \
                        updated_at = now() \
@@ -161,6 +165,7 @@ impl GcCycleLease {
                 .bind(disposition.anchors_backlog_zero())
                 .bind(victims_collected as i64)
                 .bind(observation.mark_set_size())
+                .bind(observation.unmarked_backlog_seed())
                 .execute(&mut **self.lock.conn())
                 .await?;
             }
