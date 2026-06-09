@@ -38,7 +38,7 @@
     // Live terminality closure (BuildDrawer passes one over the build
     // state + the focused node's status). Feeds the stream's tail_next
     // exit law: a non-terminal stream re-opens forever; a terminal one
-    // drains within the armed-once grace.
+    // drains within the quiet-time grace (serves re-arm it).
     isTerminal = undefined,
     // @internal test-only hook: jsdom layout is all-zeros so the
     // scroll-derived viewport range can't be exercised. A test stubs

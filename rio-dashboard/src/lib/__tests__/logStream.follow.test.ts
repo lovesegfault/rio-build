@@ -2,8 +2,8 @@
 // the stream must request follow:true, render forward jumps as explicit
 // gap rows, dedup resent prefixes through the shared cursor, reconnect
 // at the watermark when a stream ends early, and exit only by the
-// tail_next law (isComplete immediately; otherwise terminal + armed-once
-// grace). Uses fake timers — the reconnect loop sleeps through
+// tail_next law (isComplete immediately; otherwise terminal + the
+// quiet-time grace -- productive serves re-arm it, merged_bug_035). Uses fake timers — the reconnect loop sleeps through
 // setTimeout and reads Date.now(), both faked.
 import { Code, ConnectError } from '@connectrpc/connect';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -72,34 +72,33 @@ describe('createLogStream follow mode', () => {
   });
 
   // r[verify dash.stream.log-tail+6]
-  /// bug_145's recorded red: the post-terminal grace armed and fired
-  /// ONLY in the tick branch, and the tick was a relative 1 s timer
-  /// recreated every race iteration — a stream delivering >1 msg/sec
-  /// won every race, so the grace never armed or enforced and a
-  /// terminal build whose builder kept spewing streamed forever. The
-  /// armed deadline is now an ABSOLUTE race participant (the gateway's
-  /// sleep_until shape), immune to message traffic.
-  it('chatty_terminal_stream_exits_at_grace: >1 msg/sec cannot starve the grace clock', async () => {
+  /// bug_145's absolute-timer discipline, RE-AIMED by merged_bug_035:
+  /// the original test pinned "a chatty terminal stream exits at +5 s"
+  /// — but the grace is now a QUIET-TIME budget, so productive serves
+  /// legitimately re-arm it and a terminal build's long drain streams
+  /// to the end (the skip_flood_still_expires test below carries the
+  /// starvation-immunity duty bug_145 cared about: unproductive >1
+  /// msg/sec traffic still cannot outrun the absolute deadline). This
+  /// test pins the inverted polarity: continuous PRODUCTIVE serves on
+  /// a terminal build keep the stream alive — the drain is never cut
+  /// mid-transfer by a clock that pre-dates it.
+  it('chatty_productive_terminal_stream_keeps_draining: serves re-arm the quiet-time budget', async () => {
     let line = 0;
     tailLog.mockImplementation(async function* () {
       for (;;) {
         yield chunk([`l${line}`], { firstLineNumber: BigInt(line) });
         line += 1;
-        // 200 ms between chunks — five times faster than the 1 s tick,
-        // so the tick loses every Promise.race.
+        // 200 ms between chunks — five times faster than the 1 s tick.
         await new Promise((r) => setTimeout(r, 200));
       }
     });
     const s = createLogStream('/nix/store/x.drv', '', {
       isTerminal: () => true,
     });
-    // Terminal from t0: the grace must arm immediately and enforce at
-    // +5 s regardless of traffic. Ride to +20 s — pre-fix the loop is
-    // still streaming here (the red observed done=false forever).
     await vi.advanceTimersByTimeAsync(20_000);
-    expect(s.done).toBe(true);
-    expect(s.incomplete).toBe(true);
-    expect(s.rows.length).toBeGreaterThan(0);
+    // Still draining at +20 s: every serve re-armed the window.
+    expect(s.done).toBe(false);
+    expect(s.rows.length).toBeGreaterThan(50);
     s.destroy();
   });
 
@@ -327,7 +326,7 @@ describe('createLogStream follow mode', () => {
     s.destroy();
   });
 
-  it('terminal_and_incomplete_exits_after_grace: armed-once grace bounds the drain, exit flags incomplete', async () => {
+  it('terminal_and_incomplete_exits_after_grace: quiet grace bounds the stall, exit flags incomplete', async () => {
     tailLog.mockImplementation(async function* () {
       yield chunk(['l0']);
       // Natural end, never complete: the final lines never reached the
@@ -610,6 +609,55 @@ describe('authRequired terminal state', () => {
     expect(
       s.rows.filter((r) => r.kind === 'line').map((r) => r.text),
     ).toEqual(['a0', 'b0', 'b1', 'b2']);
+    s.destroy();
+  });
+
+
+  // r[verify dash.stream.log-tail+6]
+  /// merged_bug_035's recorded red: for a build already terminal when
+  /// the tab opens, the grace armed at the first loop head and never
+  /// extended on productive serves -- the ENTIRE historical drain had
+  /// to finish inside 5s or the head check cut it mid-transfer with a
+  /// false "incomplete" banner, deterministically on every refresh.
+  /// The grace is a QUIET-TIME budget: productive serves re-arm it.
+  it('historical_drain_rearms_grace: a terminal drain longer than one window completes', async () => {
+    tailLog.mockImplementation(async function* () {
+      for (let i = 0; i < 7; i++) {
+        yield chunk([`l${i}`], { firstLineNumber: BigInt(i) });
+        await new Promise((r) => setTimeout(r, 1_500));
+      }
+      yield chunk([], { isComplete: true, firstLineNumber: 7n });
+    });
+    const s = createLogStream('/nix/store/x.drv', '', {
+      isTerminal: () => true,
+    });
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(s.done).toBe(true);
+    expect(s.incomplete).toBe(false);
+    expect(s.rows.filter((r) => r.kind === 'line')).toHaveLength(7);
+    s.destroy();
+  });
+
+  // r[verify dash.stream.log-tail+6]
+  /// merged_bug_035's negative control (the starvation polarity that
+  /// MUST keep expiring): a flood of unproductive chunks -- resends of
+  /// already-served lines, the `skip` verdict -- never re-arms the
+  /// window. Only serves extend; noise still expires on schedule.
+  it('skip_flood_still_expires: unproductive traffic cannot extend the grace', async () => {
+    tailLog.mockImplementation(async function* () {
+      yield chunk(['l0']);
+      for (;;) {
+        // The same chunk, resent forever: every visit is `skip`.
+        yield chunk(['l0']);
+        await new Promise((r) => setTimeout(r, 200));
+      }
+    });
+    const s = createLogStream('/nix/store/x.drv', '', {
+      isTerminal: () => true,
+    });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(s.done).toBe(true);
+    expect(s.incomplete).toBe(true);
     s.destroy();
   });
 

@@ -219,8 +219,13 @@ stack can't give you.
   bytes (compiler locale garbage). Lossy decode to `U+FFFD`, never throw. nginx
   `proxy_buffering off` is required or the stream buffers entirely before
   reaching the browser. The follow loop MUST drive the stream iterator
-  manually, and the armed-once grace deadline MUST join every race as an
-  ABSOLUTE timer --- message traffic cannot starve enforcement; the
+  manually, and the post-terminal grace deadline MUST join every race as
+  an ABSOLUTE timer --- unproductive traffic cannot starve enforcement.
+  The grace is a QUIET-TIME budget, not a transfer cap: every productive
+  serve re-arms it (a terminal build's historical drain completes however
+  long it takes), while keep-alives and resent chunks never extend it,
+  and a re-open whose remaining grace cannot fund a drain attempt
+  finalizes at the decision point instead of waking at the deadline; the
   one-second terminality tick exists only to wake a QUIET stream's loop
   for the terminal re-check (a never-ending stream on a terminal build,
   chatty or quiet, must not hold the tab in "streaming" forever); each

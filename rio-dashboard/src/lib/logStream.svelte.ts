@@ -66,11 +66,24 @@ const DROP_ROWS = 10_000;
 
 // Reconnect-loop budget: re-open pacing delegated to ReopenPacer
 // (lineCursor.ts) — the ladder resets ONLY on productive chunk
-// verdicts (serve/gapThenServe), never on bare receipt — plus an
-// armed-once post-terminal grace window: once the derivation is
-// terminal we keep draining for GRACE_MS and then stop, flagging the
-// log incomplete if the store never stamped completion.
+// verdicts (serve/gapThenServe), never on bare receipt — plus a
+// post-terminal grace window. The grace is a QUIET-TIME budget
+// (merged_bug_035): it bounds how long a terminal stream may sit
+// unproductive, not the total transfer — every productive serve
+// re-arms it; keep-alives and resent chunks (the `skip` verdict)
+// never extend it, so a flood of unproductive traffic still expires
+// on schedule. Expiry flags the log incomplete if the store never
+// stamped completion.
 const GRACE_MS = 5_000;
+
+// merged_bug_035: a re-open whose remaining grace cannot fund a real
+// drain attempt is structurally futile — setTimeout never fires early,
+// so a sleep capped AT the deadline wakes exactly at it and the next
+// attempt is head-cut before a single message is read (one wasted
+// TailLog RPC, then "incomplete"). The margin is one open round-trip
+// plus first-chunk budget: with less than this remaining, finalize at
+// the decision point instead of re-opening.
+const DRAIN_MARGIN_MS = 1_000;
 
 // merged_bug_254: how often an OPEN, quiet stream re-checks
 // terminality. The pre-fix `for await` parked the loop inside the
@@ -155,7 +168,8 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 // one over the focused node's status + the build state). It feeds the
 // tail_next exit law: a non-terminal stream re-opens forever (bounded
 // only by unmount destroy()), a terminal one drains within the
-// armed-once grace — and a store-stamped completion on a NON-terminal
+// quiet-time grace (productive serves re-arm it, merged_bug_035) — and
+// a store-stamped completion on a NON-terminal
 // derivation re-opens to follow the retry (merged_bug_063: is_complete
 // is a per-EXECUTION predicate; the derivation may run again).
 //
@@ -249,7 +263,7 @@ export function createLogStream(
     // silence holds the stream open (the infra chain is provisioned for
     // it; see the rule). The 1 s tick below observes TERMINALITY, not
     // idleness: it never closes a stream on silence alone, it lets the
-    // armed-once grace clock run mid-stream (merged_bug_254).
+    // post-terminal grace clock run mid-stream (merged_bug_254).
     for (;;) {
       let cause: TailStopCause;
       let receivedThisAttempt = false;
@@ -472,6 +486,13 @@ export function createLogStream(
               default:
                 assertNever(visit);
             }
+            if (visit.kind !== 'skip' && graceDeadline !== null) {
+              // merged_bug_035: the post-terminal grace bounds QUIET
+              // time, not total transfer — every productive verdict
+              // re-arms the window. `skip` (keep-alive / fully-resent)
+              // never extends: unproductive floods expire on schedule.
+              graceDeadline = Date.now() + GRACE_MS;
+            }
             break;
           }
           // Adopt the completion claim only for a chunk consumed in
@@ -556,27 +577,22 @@ export function createLogStream(
       } finally {
         ctrl.signal.removeEventListener('abort', chainAbort);
       }
-      const terminal = effTerminal();
-      if (terminal && graceDeadline === null) {
-        graceDeadline = Date.now() + GRACE_MS;
-      }
-      const graceExpired = graceDeadline !== null && Date.now() >= graceDeadline;
-      const decision = tailNext(cause, mode, terminal, graceExpired, servedComplete);
-      if (decision.kind === 'exit') {
-        // r[impl obs.log.incomplete-surfaced+2]
-        // Exit with the store never having stamped completion: the
-        // missing tail is usually the build error itself — flag it so
-        // the viewer renders the banner instead of pretending the log
-        // ended cleanly. A hard-down store with nothing rendered also
-        // surfaces the last transport error.
+      // r[impl obs.log.incomplete-surfaced+2]
+      // The single exit epilogue: every law-decided exit (and the
+      // structurally-futile-reopen finalize below) lands here. Exit
+      // with the store never having stamped completion flags the
+      // banner — the missing tail is usually the build error itself.
+      // A hard-down store with nothing rendered also surfaces the
+      // last transport error.
+      const finishExit = (exitCause: TailStopCause): void => {
         incomplete = !servedComplete;
-        if (cause === 'authRequired') {
+        if (exitCause === 'authRequired') {
           // The terminal auth-required surface: the viewer renders the
           // sign-in notice, not the incomplete-log banner heuristics.
           authRequired = true;
           err = lastErr;
           phase = { kind: 'authRequired', err: lastErr };
-        } else if (cause === 'permanentErr') {
+        } else if (exitCause === 'permanentErr') {
           // A typed-permanent hole: the incomplete banner tells the
           // truth (some lines can never be served) and the error rides
           // along for the detail line.
@@ -591,18 +607,40 @@ export function createLogStream(
             : { kind: 'incomplete', err: null };
         }
         done = true;
+      };
+      const terminal = effTerminal();
+      if (terminal && graceDeadline === null) {
+        graceDeadline = Date.now() + GRACE_MS;
+      }
+      const graceExpired = graceDeadline !== null && Date.now() >= graceDeadline;
+      const decision = tailNext(cause, mode, terminal, graceExpired, servedComplete);
+      if (decision.kind === 'exit') {
+        finishExit(cause);
+        return;
+      }
+      if (graceDeadline !== null && graceDeadline - Date.now() <= DRAIN_MARGIN_MS) {
+        // merged_bug_035: the law said re-open, but the remaining
+        // grace cannot fund a drain attempt — the sleep would wake at
+        // the deadline and the next open would be head-cut before a
+        // single message. Finalize at the decision point: same exit
+        // the law would reach one wasted RPC later. (The claim is NOT
+        // consumed — no retry is being followed.)
+        finishExit(cause);
         return;
       }
       // The law's next-state: following past a stamped completion
       // consumed the claim (merged_bug_029) — the re-open must not
       // carry a dead execution's word into the retry's tab.
       servedComplete = decision.servedComplete;
-      // Re-open after the pacer's delay, capped at the remaining grace
-      // so the last drain attempt lands before the deadline rather
-      // than sleeping through it.
+      // Re-open after the pacer's delay, capped so the next drain
+      // attempt lands a full margin BEFORE the deadline rather than
+      // sleeping into it (merged_bug_035).
       let delay = pacer.nextDelayMs();
       if (graceDeadline !== null) {
-        delay = Math.min(delay, Math.max(0, graceDeadline - Date.now()));
+        delay = Math.min(
+          delay,
+          Math.max(0, graceDeadline - Date.now() - DRAIN_MARGIN_MS),
+        );
       }
       await sleep(delay, ctrl.signal);
       if (ctrl.signal.aborted) {
