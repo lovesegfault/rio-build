@@ -467,11 +467,15 @@ def run_policy(manifest, corpus, assume_latches=""):
                 continue
             if lmod not in corpus.reachable_modules(cmod):
                 continue
-            roots = [n for n, d in decls.items() if d.get("qualifier") == "action"]
-            writes = corpus.assigns_reachable(cmod, roots)
+            # bug_281: runs carry inline anonymous actions (init.then(all
+            # { latch' = ... })) — a root set of qualifier=="action" alone
+            # left every run-shaped calibration outside the P5 gate, a
+            # fail-open arm in a lint documented fail-closed. Both
+            # declaration shapes are walked; opting a shape out is now an
+            # explicit edit here, not an accident of the root set.
+            roots = [n for n, d in decls.items() if d.get("qualifier") in ("action", "run")]
             for var in sorted(set(latches)):
-                hits = [t for (t, ident) in writes if t == var and not ident]
-                # only count assigns in the calibration's OWN actions
+                # only count assigns in the calibration's OWN declarations
                 own_writes = []
                 for n in roots:
                     d = decls[n]
@@ -493,7 +497,7 @@ def run_policy(manifest, corpus, assume_latches=""):
                     walk(d.get("expr"))
                     own_writes.extend(acc)
                 if any(t == var and not ident for (t, ident) in own_writes):
-                    violations.append(f"P5 {cmod}: calibration action non-identity-assigns latch '{lmod}.{var}' (oracle must live in the shared live module)")
+                    violations.append(f"P5 {cmod}: calibration declaration non-identity-assigns latch '{lmod}.{var}' (oracle must live in the shared live module)")
                     census["P5-calib-latch-write"].append(f"{cmod}:{var}")
 
     # ---- P3 pairing census (no enforcement beyond reporting)
@@ -611,6 +615,13 @@ def selftest():
         # calibration "reaches a live module" credit.
         "calibration/calib_shadow.qnt": ('module calibShadow {\n  import liveA from "../live_a"\n  val invX = false\n}\n'),
         "calibration/calib_lw.qnt": ('module calibLW {\n  import liveL.* from "../live_l"\n  action attack = lx\' = 42\n}\n'),
+        # bug_281 red: the SAME attack carried by a `run` declaration's
+        # inline anonymous action — the pre-fix root set (qualifier ==
+        # "action" only) let this shape assign a declared latch unseen.
+        "calibration/calib_lwrun.qnt": (
+            'module calibLWRun {\n  import liveL.* from "../live_l"\n'
+            "  run attackRun = init.then(all { lx' = 42, ly' = ly })\n}\n"
+        ),
     }
     manifest = {
         "tautoCheck": {"kind": "holds", "main": "liveA", "invariants": ["tauto"]},
@@ -648,7 +659,8 @@ def selftest():
             "P6 bogusCheck: unused vacuityExempt entry 'invX'",
             "P6 holdsW: unused vacuityExempt entry 'invV'",
             "P5 liveL: declared latch 'ly' fails P4",
-            "P5 calibLW: calibration action non-identity-assigns latch 'liveL.lx'",
+            "P5 calibLW: calibration declaration non-identity-assigns latch 'liveL.lx'",
+            "P5 calibLWRun: calibration declaration non-identity-assigns latch 'liveL.lx'",
             "R0 ghostCheck: main module 'noSuchModule' not found",
             "R0 badInvCheck: invariant 'noSuchInv' does not resolve",
         ],
