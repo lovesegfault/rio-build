@@ -359,46 +359,64 @@ pub async fn run_gc(
             // parse-failure abort is NOT a cycle: no stamp, the lock
             // is simply released (fail-closed; retention stays
             // visibly stalled until the manifest is repaired).
+            // merged_bug_218: ok rides the commit witness; a lost
+            // commit is commit_failed, never ok.
+            let record_commit =
+                |committed: Result<state::CycleCommitted, sqlx::Error>| match committed {
+                    Ok(w) => w.record_ok_outcome(),
+                    Err(e) => {
+                        metrics::counter!(
+                            "rio_store_gc_collect_cycles_total",
+                            "outcome" => "commit_failed"
+                        )
+                        .increment(1);
+                        warn!(
+                            error = %e,
+                            "GC: collect commit lost (stamp/cursor/backlog \
+                             not updated; lock freed via session close)"
+                        );
+                    }
+                };
             match report.outcome {
                 collect::CollectOutcome::Ok => {
-                    let committed = if params.dry_run {
-                        lease
-                            .commit_cycle(state::CycleCommit::Shadow {
-                                observation: report
-                                    .durable
-                                    .expect("Ok cycle carries an observation"),
-                            })
-                            .await
-                    } else {
-                        lease
-                            .commit_cycle(state::CycleCommit::Live {
-                                disposition: report
-                                    .disposition
-                                    .clone()
-                                    .expect("live Ok report carries a disposition"),
-                                victims_collected: report.victims_collected,
-                                observation: report
-                                    .durable
-                                    .expect("Ok cycle carries an observation"),
-                            })
-                            .await
-                    };
-                    // merged_bug_218: ok rides the commit witness; a
-                    // lost commit is commit_failed, never ok.
-                    match committed {
-                        Ok(w) => w.record_ok_outcome(),
-                        Err(e) => {
-                            metrics::counter!(
-                                "rio_store_gc_collect_cycles_total",
-                                "outcome" => "commit_failed"
-                            )
-                            .increment(1);
-                            warn!(
-                                error = %e,
-                                "GC: collect commit lost (stamp/cursor/backlog \
-                                 not updated; lock freed via session close)"
-                            );
+                    if params.dry_run {
+                        match report.durable {
+                            Some(observation) => record_commit(
+                                lease
+                                    .commit_cycle(state::CycleCommit::Shadow { observation })
+                                    .await,
+                            ),
+                            None => {
+                                // merged_bug_147: the real-basis
+                                // validation found corruption inside
+                                // the simulated-swept set — the dry
+                                // run stays preview-only. Nothing
+                                // committed, so NO outcome tick (ok
+                                // means "the durable commit landed").
+                                warn!(
+                                    "GC: durable observation withheld (corrupt manifest \
+                                     in the simulated-swept set); gc_collect_state untouched"
+                                );
+                                if let Err(e) = lease.release().await {
+                                    warn!(error = %e, "GC: lease release failed (lock freed via session close)");
+                                }
+                            }
                         }
+                    } else {
+                        record_commit(
+                            lease
+                                .commit_cycle(state::CycleCommit::Live {
+                                    disposition: report
+                                        .disposition
+                                        .clone()
+                                        .expect("live Ok report carries a disposition"),
+                                    victims_collected: report.victims_collected,
+                                    observation: report
+                                        .durable
+                                        .expect("live Ok cycle carries an observation"),
+                                })
+                                .await,
+                        );
                     }
                 }
                 collect::CollectOutcome::ParseFailure => {

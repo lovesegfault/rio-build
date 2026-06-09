@@ -218,6 +218,89 @@ pub(crate) fn mark_validation_sql(shadow_excluded: bool) -> String {
 /// fetched only on the abort path (the happy path never pays for it),
 /// hex-encoded for the error log and the runbook's lookup query.
 /// Same population as [`mark_validation_sql`] by construction.
+/// Validation + expansion as ONE unit (merged_bug_147). The mark
+/// expansion is total on arbitrary bytes (it floors a misaligned
+/// length and slices garbage "hashes"), so expanding a population the
+/// fail-closed validation did not cover turns corrupt input into
+/// phantom mark entries. The expansion SQL is therefore PRIVATE to
+/// [`ValidatedMark`], whose only mint site is
+/// [`MarkStatements::validate`] over the SAME `shadow_excluded`
+/// parameter: an expansion whose population was not first validated
+/// under the identical exclusion does not typecheck.
+struct MarkStatements {
+    shadow_excluded: bool,
+}
+
+/// Outcome of the fail-closed validation pass.
+enum MarkValidation {
+    Valid(ValidatedMark),
+    Malformed(i64),
+}
+
+impl MarkStatements {
+    fn for_population(shadow_excluded: bool) -> Self {
+        Self { shadow_excluded }
+    }
+
+    /// Run the fail-closed validation over exactly the population the
+    /// paired expansion will cover.
+    async fn validate(self, tx: &mut sqlx::PgConnection) -> Result<MarkValidation, sqlx::Error> {
+        let malformed: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(mark_validation_sql(
+            self.shadow_excluded,
+        )))
+        .fetch_one(&mut *tx)
+        .await?;
+        Ok(if malformed > 0 {
+            MarkValidation::Malformed(malformed)
+        } else {
+            MarkValidation::Valid(ValidatedMark {
+                shadow_excluded: self.shadow_excluded,
+            })
+        })
+    }
+}
+
+/// Proof that the population about to be expanded passed the
+/// fail-closed validation under the same exclusion parameter.
+struct ValidatedMark {
+    shadow_excluded: bool,
+}
+
+impl ValidatedMark {
+    /// Materialize the mark product — the ONLY route to the expansion
+    /// SQL. `on_commit_drop` scopes the temp table to the read
+    /// transaction (shadow arms); the live arm persists it for the
+    /// batch loop and drops it explicitly in the post-drain tail.
+    async fn create(
+        &self,
+        tx: &mut sqlx::PgConnection,
+        table: &str,
+        on_commit_drop: bool,
+    ) -> Result<(), sqlx::Error> {
+        let expansion_body = MARK_EXPANSION_SQL
+            .strip_prefix("CREATE TEMP TABLE live_chunks AS ")
+            .expect("MARK_EXPANSION_SQL starts with the live_chunks CTAS prefix");
+        let drop_clause = if on_commit_drop {
+            " ON COMMIT DROP"
+        } else {
+            ""
+        };
+        let exclusion = if self.shadow_excluded {
+            // The exclusion has no existing WHERE to extend (the
+            // shared constant is a pure join) — append one.
+            format!(" {SHADOW_SWEPT_EXCLUSION_WHERE}")
+        } else {
+            String::new()
+        };
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TEMP TABLE {table}{drop_clause} AS {expansion_body}{exclusion}"
+        )))
+        .execute(tx)
+        .await?;
+        Ok(())
+    }
+}
+
 fn mark_validation_offenders_sql(shadow_excluded: bool) -> String {
     corruption_population_sql(
         "encode(md.store_path_hash, 'hex')",
@@ -488,10 +571,13 @@ pub(crate) struct CollectReport {
     /// Wall-clock of the cycle (snapshot through report/collect).
     pub(crate) cycle_seconds: f64,
     /// The real-basis observation the caller commits durably
-    /// ([`super::state::CycleCommit`]). `None` only on a
-    /// parse-failure abort (which is never committed). The PREVIEW
-    /// fields above stay simulated for dry runs (bug_199); this field
-    /// is what may touch `gc_collect_state` (bug_226).
+    /// ([`super::state::CycleCommit`]). `None` on a parse-failure
+    /// abort, and on a dry run whose REAL-BASIS validation found
+    /// corruption inside the simulated-swept set (merged_bug_147: the
+    /// durable observation is withheld; the preview lane still
+    /// reports). The PREVIEW fields above stay simulated for dry runs
+    /// (bug_199); this field is what may touch `gc_collect_state`
+    /// (bug_226).
     pub(crate) durable: Option<DurableObservation>,
 }
 
@@ -701,73 +787,63 @@ pub(crate) async fn collect_cycle(
     // (merged_bug_170) to the offenders listing: count and hashes come
     // from the SAME population by construction (one statement builder).
     let shadow_excluded = simulated_swept.is_some();
-    let malformed: i64 =
-        sqlx::query_scalar(sqlx::AssertSqlSafe(mark_validation_sql(shadow_excluded)))
-            .fetch_one(&mut *tx)
+    let preview_mark = match MarkStatements::for_population(shadow_excluded)
+        .validate(&mut tx)
+        .await?
+    {
+        MarkValidation::Valid(vm) => vm,
+        MarkValidation::Malformed(malformed) => {
+            let offenders: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(
+                mark_validation_offenders_sql(shadow_excluded),
+            ))
+            .fetch_all(&mut *tx)
             .await?;
-    if malformed > 0 {
-        let offenders: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(
-            mark_validation_offenders_sql(shadow_excluded),
-        ))
-        .fetch_all(&mut *tx)
-        .await?;
-        error!(
-            malformed,
-            offenders = %offenders.join(","),
-            "chunk-collect: unparseable chunk_list, aborting the cycle (fail-closed); \
-             chunk collection is suspended until the manifest is repaired, deleted, or quarantined"
-        );
-        metrics::counter!("rio_store_gc_collect_parse_failures_total").increment(1);
-        metrics::counter!("rio_store_gc_collect_cycles_total", "outcome" => "parse_failure")
-            .increment(1);
-        // Dropping `tx` rolls the cycle transaction back; the abort
-        // wrote nothing and leaves nothing on the session. The live
-        // arm is fail-closed through this same return: no batch loop
-        // runs, so a cycle that observed a parse failure soft-deletes
-        // nothing.
-        return Ok(CollectReport {
-            outcome: CollectOutcome::ParseFailure,
-            mark_set_size: 0,
-            would_collect: 0,
-            would_collect_bytes: 0,
-            victims_collected: 0,
-            victim_bytes: 0,
-            s3_keys_enqueued: 0,
-            batches_run: 0,
-            cap_reached: false,
-            disposition: None,
-            chunks_reaped: 0,
-            cycle_seconds: cycle_started.elapsed().as_secs_f64(),
-            durable: None,
-        });
-    }
+            error!(
+                malformed,
+                offenders = %offenders.join(","),
+                "chunk-collect: unparseable chunk_list, aborting the cycle (fail-closed); \
+                 chunk collection is suspended until the manifest is repaired, deleted, or quarantined"
+            );
+            metrics::counter!("rio_store_gc_collect_parse_failures_total").increment(1);
+            metrics::counter!("rio_store_gc_collect_cycles_total", "outcome" => "parse_failure")
+                .increment(1);
+            // Dropping `tx` rolls the cycle transaction back; the abort
+            // wrote nothing and leaves nothing on the session. The live
+            // arm is fail-closed through this same return: no batch loop
+            // runs, so a cycle that observed a parse failure soft-deletes
+            // nothing.
+            return Ok(CollectReport {
+                outcome: CollectOutcome::ParseFailure,
+                mark_set_size: 0,
+                would_collect: 0,
+                would_collect_bytes: 0,
+                victims_collected: 0,
+                victim_bytes: 0,
+                s3_keys_enqueued: 0,
+                batches_run: 0,
+                cap_reached: false,
+                disposition: None,
+                chunks_reaped: 0,
+                cycle_seconds: cycle_started.elapsed().as_secs_f64(),
+                durable: None,
+            });
+        }
+    };
 
     // --- Mark (ii): server-side set-based expansion ---
-    // Shadow mode runs the shared statement with ON COMMIT DROP added,
-    // so the mark product cannot outlive the read transaction on any
-    // exit path. The live arm's batches anti-join against the table in
-    // their own transactions after this one commits, so it is created
-    // without the clause and dropped explicitly at the end of the
-    // cycle (with detach-on-error covering the window in between). The
-    // shared constant stays free of the clause: the bench's EXPLAIN
-    // plan-shape guard (gate (b)) runs it outside a transaction, where
-    // ON COMMIT DROP would drop the table at statement end.
-    // AssertSqlSafe: splices only the shared constant.
-    let expansion_body = MARK_EXPANSION_SQL
-        .strip_prefix("CREATE TEMP TABLE live_chunks AS ")
-        .expect("MARK_EXPANSION_SQL starts with the live_chunks CTAS prefix");
-    let expansion = match simulated_swept {
-        Some(_) => {
-            // The exclusion has no existing WHERE to extend (the
-            // shared constant is a pure join) — append one.
-            format!(
-                "CREATE TEMP TABLE live_chunks ON COMMIT DROP AS {expansion_body} {SHADOW_SWEPT_EXCLUSION_WHERE}"
-            )
-        }
-        None => format!("CREATE TEMP TABLE live_chunks AS {expansion_body}"),
-    };
-    sqlx::query(sqlx::AssertSqlSafe(expansion))
-        .execute(&mut *tx)
+    // Through the ValidatedMark ONLY (merged_bug_147): the expansion
+    // covers exactly the population the validation above passed.
+    // Shadow mode adds ON COMMIT DROP so the mark product cannot
+    // outlive the read transaction on any exit path; the live arm's
+    // batches anti-join against the table in their own transactions
+    // after this one commits, so it is created without the clause and
+    // dropped explicitly at the end of the cycle (with detach-on-error
+    // covering the window in between). The shared constant stays free
+    // of the clause: the bench's EXPLAIN plan-shape guard (gate (b))
+    // runs it outside a transaction, where ON COMMIT DROP would drop
+    // the table at statement end.
+    preview_mark
+        .create(&mut tx, "live_chunks", simulated_swept.is_some())
         .await?;
 
     // --- Prepare: unique index + stats on the mark product, so the
@@ -829,44 +905,74 @@ pub(crate) async fn collect_cycle(
 
     let durable = match simulated_swept {
         Some(swept) if !swept.is_empty() => {
-            let real_expansion =
-                format!("CREATE TEMP TABLE live_chunks_real ON COMMIT DROP AS {expansion_body}");
-            sqlx::query(sqlx::AssertSqlSafe(real_expansion))
-                .execute(&mut *tx)
-                .await?;
-            let real_mark: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM live_chunks_real")
-                .fetch_one(&mut *tx)
-                .await?;
-            let real_would: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM chunks c \
-                  WHERE c.deleted = FALSE \
-                    AND NOT EXISTS (SELECT 1 FROM live_chunks_real lc \
-                                     WHERE lc.blake3_hash = c.blake3_hash) \
-                    AND GREATEST(c.created_at, c.last_referenced_at) < $1::timestamptz",
-            )
-            .bind(&cutoff)
-            .fetch_one(&mut *tx)
-            .await?;
-            DurableObservation::from_real_basis(
-                real_mark,
-                real_would,
-                (not_deleted_rows - real_mark).max(0),
-            )
+            // The real basis covers ALL manifests — including the ones
+            // the preview validation deliberately excluded — so it
+            // gets its OWN fail-closed validation over the exclusion-
+            // free population (merged_bug_147). Corruption inside the
+            // simulated-swept set withholds the durable observation:
+            // the dry run stays preview-only, the durable row is
+            // untouched, and phantom hashes never reach
+            // gc_collect_state.
+            match MarkStatements::for_population(false)
+                .validate(&mut tx)
+                .await?
+            {
+                MarkValidation::Malformed(malformed) => {
+                    let offenders: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(
+                        mark_validation_offenders_sql(false),
+                    ))
+                    .fetch_all(&mut *tx)
+                    .await?;
+                    warn!(
+                        malformed,
+                        offenders = %offenders.join(","),
+                        "chunk-collect: corrupt chunk_list inside the simulated-swept \
+                         set; durable observation WITHHELD (preview-only dry run; the \
+                         live cycle over this data will abort fail-closed until the \
+                         manifest is repaired)"
+                    );
+                    None
+                }
+                MarkValidation::Valid(real_mark_stmt) => {
+                    real_mark_stmt
+                        .create(&mut tx, "live_chunks_real", true)
+                        .await?;
+                    let real_mark: i64 =
+                        sqlx::query_scalar("SELECT COUNT(*) FROM live_chunks_real")
+                            .fetch_one(&mut *tx)
+                            .await?;
+                    let real_would: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM chunks c \
+                          WHERE c.deleted = FALSE \
+                            AND NOT EXISTS (SELECT 1 FROM live_chunks_real lc \
+                                             WHERE lc.blake3_hash = c.blake3_hash) \
+                            AND GREATEST(c.created_at, c.last_referenced_at) < $1::timestamptz",
+                    )
+                    .bind(&cutoff)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    Some(DurableObservation::from_real_basis(
+                        real_mark,
+                        real_would,
+                        (not_deleted_rows - real_mark).max(0),
+                    ))
+                }
+            }
         }
         // Standalone shadow observation: no exclusion was applied —
         // the preview numbers ARE the real basis.
-        Some(_) => DurableObservation::from_real_basis(
+        Some(_) => Some(DurableObservation::from_real_basis(
             mark_set_size,
             would_collect,
             (not_deleted_rows - mark_set_size).max(0),
-        ),
+        )),
         // Live: the mark is exclusion-free by construction; the live
         // arm never computes a would-collect count.
-        None => DurableObservation::from_real_basis(
+        None => Some(DurableObservation::from_real_basis(
             mark_set_size,
             0,
             (not_deleted_rows - mark_set_size).max(0),
-        ),
+        )),
     };
 
     // Commit ends the cycle's snapshot. In shadow mode the temp table
@@ -911,7 +1017,7 @@ pub(crate) async fn collect_cycle(
             disposition: None,
             chunks_reaped: 0,
             cycle_seconds,
-            durable: Some(durable),
+            durable,
         });
     }
 
@@ -1076,7 +1182,7 @@ pub(crate) async fn collect_cycle(
         disposition: Some(disposition),
         chunks_reaped,
         cycle_seconds,
-        durable: Some(durable),
+        durable,
     })
 }
 
@@ -2198,6 +2304,54 @@ mod tests {
             ok.outcome,
             CollectOutcome::Ok,
             "a corrupt manifest the sweep removes cannot abort the dry run"
+        );
+    }
+
+    /// merged_bug_147: the real-basis expansion (dry runs with a
+    /// non-empty simulated sweep) covers ALL manifests -- including
+    /// the corrupt one the preview validation deliberately excluded.
+    /// MARK_EXPANSION_SQL is total on arbitrary bytes (it floors a
+    /// misaligned length and slices garbage 32-byte "hashes"), so the
+    /// pre-fix code committed a DurableObservation built over phantom
+    /// hashes: live-count wrong, real referenced chunks counted as
+    /// collectible. The expansion is now obtainable only through
+    /// ValidatedMark (validation and expansion paired in one builder,
+    /// parameterized identically); when the exclusion-free validation
+    /// finds corruption, the durable observation is WITHHELD -- the
+    /// dry run stays preview-only and the durable row is untouched.
+    #[tokio::test]
+    async fn dry_run_with_corrupt_swept_manifest_withholds_durable() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        reset_collector_state(&db.pool).await;
+        let c = ChunkSeed::new(0xF8).uploaded().seed(&db.pool).await;
+        seed_chunked_manifest(&db.pool, "corrupt-real", "complete", &make_chunk_list(&[c])).await;
+        let h: Vec<u8> = sqlx::query_scalar("SELECT store_path_hash FROM manifests LIMIT 1")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE manifest_data SET chunk_list = $2 WHERE store_path_hash = $1")
+            .bind(&h)
+            .bind(vec![0xFFu8; 7])
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let report = collect_cycle(
+            &db.pool,
+            None,
+            super::super::sweep::CHUNK_GRACE_SECS,
+            CollectMode::Shadow {
+                simulated_swept: vec![h],
+            },
+            None,
+        )
+        .await
+        .expect("cycle runs");
+        assert_eq!(report.outcome, CollectOutcome::Ok, "preview still served");
+        assert!(
+            report.durable.is_none(),
+            "corrupt manifest inside simulated_swept: the durable \
+             observation is withheld, never built over phantom hashes"
         );
     }
 
