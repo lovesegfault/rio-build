@@ -575,6 +575,23 @@ behavior-relevant drift, no rule-version drift, so Stage A stands.
   placeable-gate producer guarantee, and the global / per-class /
   per-tick cover budgets over the hw-class config mirror. Four
   regimes: base / fault-rpc / fault-lease / fault-karpenter.
+- **Model I — `iceEvidenceAck.qnt`** (bughunt-5 slot 5): the
+  cross-component ICE evidence/ack pipeline at two cells — the
+  per-cell ordered evidence buffer + epoch mint (controller), the
+  lossy ack channel (delivered-Ok / Ok-lost / refused /
+  late-duplicate), and the scheduler ladder with the per-cell
+  `last_applied` epoch gate + the §13a local clear. Discharges the
+  "Scheduler ICE ladder (peer)" contract Model N assumes away. Holds
+  (exhaustive TLC, `iceEvidenceAckBase`): `errImpliesNoMutation`
+  (`sched.sla.ack-validate-then-commit`), `redeliveryIdempotent`,
+  `clearThenMarkRealizesReset`, `healthyCellNeedsNewEvidence`
+  (`ctrl.nodeclaim.evidence-ack-latch+3` /
+  `ctrl.nodeclaim.ice-mark-clear+2`). Falsify twins
+  (`calibration/ice-*.qnt`): `ice-apply-before-refuse` (the as-built
+  apply-then-CostGateClosed order), `ice-no-epoch-gate`
+  (merged_bug_008's pin/climb/re-mask axes — wired twice, once per
+  paired invariant), `ice-latest-wins-eviction` (merged_bug_003's
+  evicting buffer).
 
 Checks live in `nix/quint.nix` (`quint-spawn-coherence-*`,
 `quint-nodeclaim-*`): one exhaustive TLC check per regime and one

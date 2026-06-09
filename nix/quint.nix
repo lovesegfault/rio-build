@@ -7033,6 +7033,98 @@ rec {
     };
 
     # ------------------------------------------------------------------
+    # ICE evidence/ack pipeline (bughunt-5 slot 5: bug_094 +
+    # merged_bug_134/008/003) — the cross-component contract
+    # nodeclaimLifecycle.qnt assumes away ("Scheduler ICE ladder
+    # (peer)"): controller per-cell ordered evidence buffer + epoch
+    # mint, lossy ack channel (Ok / Ok-lost / refused /
+    # late-duplicate), scheduler ladder + per-cell epoch gate + the
+    # §13a local clear (docs/spec/models/iceEvidenceAck.qnt). The
+    # holds check is EXHAUSTIVE (tlc; the reconciler tick-atomicity
+    # guard keeps the space small — ~2s measured); each holds
+    # invariant has its falsify twin at the matching sim budget
+    # (maxSamples sized 25/p from the recorded traces-to-first-hit;
+    # measurements in the introducing commit).
+    # ------------------------------------------------------------------
+
+    # r[verify sched.sla.ack-validate-then-commit]
+    # r[verify ctrl.nodeclaim.evidence-ack-latch+3]
+    # r[verify ctrl.nodeclaim.ice-mark-clear+2]
+    quint-ice-evidence-ack = mkQuintCheck {
+      name = "ice-evidence-ack";
+      spec = "iceEvidenceAck";
+      main = "iceEvidenceAckBase";
+      invariants = [
+        "errImpliesNoMutation"
+        "redeliveryIdempotent"
+        "clearThenMarkRealizesReset"
+        "healthyCellNeedsNewEvidence"
+      ];
+    };
+
+    # merged_bug_008 headline axis FALSIFY half (+ bug_094 ordering):
+    # the as-built apply-then-CostGateClosed order — planes mutate,
+    # then the refusal answers; the retained-buffer redelivery
+    # re-applies every tick.
+    # r[verify sched.sla.ack-validate-then-commit]
+    quint-ice-falsify-apply-before-refuse = mkQuintSimWitnessCheck {
+      name = "ice-falsify-apply-before-refuse";
+      spec = "calibration/ice-apply-before-refuse";
+      main = "iceCalibApplyBeforeRefuse";
+      extraSpecs = [ "iceEvidenceAck" ];
+      step = "calibStep";
+      witness = "errImpliesNoMutation";
+      maxSamples = 1000000;
+      maxSteps = 16;
+    };
+
+    # merged_bug_008 redelivery axes FALSIFY half: no epoch gate —
+    # stale marks re-stamp (pinned mask), post-expiry redelivery
+    # climbs (phantom failure), late duplicates re-apply.
+    # r[verify ctrl.nodeclaim.evidence-ack-latch+3]
+    quint-ice-falsify-no-epoch-gate = mkQuintSimWitnessCheck {
+      name = "ice-falsify-no-epoch-gate";
+      spec = "calibration/ice-no-epoch-gate";
+      main = "iceCalibNoEpochGate";
+      extraSpecs = [ "iceEvidenceAck" ];
+      step = "calibStep";
+      witness = "redeliveryIdempotent";
+      maxSamples = 1000000;
+      maxSteps = 16;
+    };
+
+    # merged_bug_008 axis-3 FALSIFY half on the same no-gate main: a
+    # redelivered retained mark after the §13a local clear re-masks
+    # the proven-healthy cell (the inverted clear; P1 pairing for the
+    # fourth holds invariant).
+    # r[verify ctrl.nodeclaim.evidence-ack-latch+3]
+    quint-ice-falsify-remask-after-clear = mkQuintSimWitnessCheck {
+      name = "ice-falsify-remask-after-clear";
+      spec = "calibration/ice-no-epoch-gate";
+      main = "iceCalibNoEpochGate";
+      extraSpecs = [ "iceEvidenceAck" ];
+      step = "calibStep";
+      witness = "healthyCellNeedsNewEvidence";
+      maxSamples = 1000000;
+      maxSteps = 16;
+    };
+
+    # merged_bug_003 FALSIFY half: latest-wins eviction — a newer
+    # mark destroys the buffered clear; the mark-only request climbs
+    # from the stale rung instead of reset-then-step-0.
+    # r[verify ctrl.nodeclaim.ice-mark-clear+2]
+    quint-ice-falsify-latest-wins-eviction = mkQuintSimWitnessCheck {
+      name = "ice-falsify-latest-wins-eviction";
+      spec = "calibration/ice-latest-wins-eviction";
+      main = "iceCalibLatestWinsEviction";
+      extraSpecs = [ "iceEvidenceAck" ];
+      step = "calibStep";
+      witness = "clearThenMarkRealizesReset";
+      maxSamples = 1000000;
+      maxSteps = 16;
+    };
+
+    # ------------------------------------------------------------------
     # Gateway connection/session lifecycle campaign (gw-session-formal,
     # round-2 Track B), Phase 0 Stage C: the rio-gateway accept → auth →
     # channel open → exec admission → protocol session → teardown
