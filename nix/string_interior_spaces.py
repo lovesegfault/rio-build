@@ -112,6 +112,27 @@ def _raw_prefix_len(text: str, i: int) -> int:
     return 0
 
 
+def _continued(body: str, idx: int) -> bool:
+    """True iff the newline at `idx` is a true `\\`-continuation.
+
+    bug_347: escape parity. The run of consecutive backslashes
+    immediately before the newline decides it — ODD means the last
+    backslash escapes the newline (continuation); EVEN means the run is
+    escaped-backslash pairs and the newline is BARE (the garbled-output
+    shape this lint exists to catch). The lexer half was already
+    parity-correct (j += 2 on escapes); these re-scans were the blind
+    arm. Returns the run start via parity only; callers needing the
+    leading-idiom distinction check `_run_start(body, idx) == 0`."""
+    return (idx - _run_start(body, idx)) % 2 == 1
+
+
+def _run_start(body: str, idx: int) -> int:
+    k = idx
+    while k > 0 and body[k - 1] == "\\":
+        k -= 1
+    return k
+
+
 def scan_text(rel: str, text: str) -> list[str]:
     _, spans = lex(text)
     hits = []
@@ -125,20 +146,31 @@ def scan_text(rel: str, text: str) -> list[str]:
             # carries a BARE newline too. Pure bare-newline literals
             # are the intentional multi-line house style for SQL (68
             # legitimate instances at the census tree); a continuation
-            # at offset 0 is the `"\` fixture idiom (suppress the
-            # leading newline of embedded config/CLI text — 9
-            # legitimate instances); pure continuation literals have
-            # no bare newline to flag. Only the mix remains: a prose
-            # join that lost one of its backslashes.
-            if not is_raw and body.find("\\\n", 1) != -1:
+            # whose backslash RUN starts at offset 0 is the `"\`
+            # fixture idiom (suppress the leading newline of embedded
+            # config/CLI text — 9 legitimate instances); pure
+            # continuation literals have no bare newline to flag. Only
+            # the mix remains: a prose join that lost one of its
+            # backslashes. Both scans share `_continued` (escape
+            # parity, bug_347) — a `\\`+newline is an escaped
+            # backslash and a BARE newline, never a continuation.
+            if not is_raw:
+                has_mid_continuation = False
                 idx = 0
                 while (idx := body.find("\n", idx)) != -1:
-                    if idx == 0 or body[idx - 1] != "\\":
-                        hits.append(
-                            f"{rel}:{line}: bare newline inside a `\\`-continued string (dropped `\\` continuation)"
-                        )
+                    if idx > 0 and _continued(body, idx) and _run_start(body, idx) > 0:
+                        has_mid_continuation = True
                         break
                     idx += 1
+                if has_mid_continuation:
+                    idx = 0
+                    while (idx := body.find("\n", idx)) != -1:
+                        if idx == 0 or not _continued(body, idx):
+                            hits.append(
+                                f"{rel}:{line}: bare newline inside a `\\`-continued string (dropped `\\` continuation)"
+                            )
+                            break
+                        idx += 1
             continue
         # arm A: single-line interior run, minus `\n`-template indents.
         if RUN.search(ESCAPED_NL_INDENT.sub("\\\\n ", body)):
@@ -153,6 +185,12 @@ def selftest() -> str | None:
     red_b = 'let m = "joined \\\n          properly\n          but this line lost its backslash";\n'
     if not scan_text("p.rs", red_b):
         return "arm B planted red did not fire (mixed continuation + bare newline)"
+    # bug_347 red: `\\` before newline is an ESCAPED backslash + BARE
+    # newline (even parity) — the pre-fix single-char lookbehind read
+    # it as a continuation and passed the literal clean.
+    red_c = 'let m = "joined \\\n          truly\\\\\n          escaped backslash then bare newline";\n'
+    if not scan_text("p.rs", red_c):
+        return "arm B escape-parity red did not fire (`\\\\` before newline mis-read as continuation)"
     green = (
         "// comment table:   col1          col2\n"
         'let y = "rules:\\n        - alert: x";\n'
