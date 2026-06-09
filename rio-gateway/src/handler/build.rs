@@ -1784,21 +1784,30 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
         active_build_ids.remove(&build_id);
     }
 
-    // Build terminus for the live tail: relay any log chunks that have
-    // already reached the gateway (the per-derivation drain grace may
-    // still be delivering a failed build's final lines), then
-    // hard-cancel the subscription tasks. Non-blocking — the user is
-    // about to receive their BuildResult and a bounded wait here would
-    // delay it; lines that have not yet crossed the store→gateway hop
-    // are dropped (they remain durable and readable via `rio-cli
-    // logs`). Skipped on a Wire error for the same reason as the
-    // activity drain below: the client is gone.
+    // Build terminus for the live tail (merged_bug_111 ordering):
+    // hard-cancel the subscription tasks FIRST, bound-join so every
+    // aborted task's PendingGapCell Drop-disclosure (gap marker +
+    // withheld lines) lands in the channel, THEN relay everything
+    // that reached the gateway. The pre-fix order drained before
+    // aborting, so Drop-flushed chunks were stranded in a channel
+    // nobody would read again. The join is bounded: an aborted task
+    // resolves at its next yield point (typically <1 ms); the bound
+    // only caps a pathological scheduler stall, and lines that still
+    // miss the window remain durable and readable via `rio-cli logs`.
+    // The relay is skipped on a Wire error for the same reason as the
+    // activity drain below: the client is gone (the disclosure then
+    // dies with the dropped channel — the law's vacuous case).
+    let tail_handles = tails.abort_all();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        futures_util::future::join_all(tail_handles),
+    )
+    .await;
     if !matches!(outcome, Err(StreamProcessError::Wire(_))) {
         while let Ok(chunk) = log_rx.try_recv() {
             let _ = relay_log_batch(stderr, &act, chunk.into_batch()).await;
         }
     }
-    tails.abort_all();
 
     // Best-effort terminal drain: a Wire error means the client is
     // gone (write would BrokenPipe), and the writer may already be

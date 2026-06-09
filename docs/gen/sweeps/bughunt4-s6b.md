@@ -62,3 +62,27 @@ reconcile-before-advance; else flush-then-revisit) is the chokepoint:
 the only path that previously advanced over fetched content
 (`flush_pending_gap` then re-visit of a backfilling chunk) is
 unreachable for backfills by construction.
+
+## Gateway tail-handle abort census (merged_bug_111)
+
+The floor (the forward-looking claim): `PendingGapCell::Drop`
+try_send-discloses marker + withheld on EVERY cancellation — any
+abort site, today's or future, that destroys a `run_tail` future with
+a recorded pending reaches the same Drop. The census below witnesses
+today's sites; the Drop carries the universal sentence.
+
+Command:
+
+    grep -rn "\.abort()\|abort_all()" rio-gateway/src/handler/log_tail.rs rio-gateway/src/handler/build.rs
+
+Output (2026-06-09, non-test sites classified):
+
+| site | classification |
+|---|---|
+| `log_tail.rs:223` re-dispatch replace | aborts the OLD exec's task; its Drop discloses into the LIVE out_tx (event loop still draining) |
+| `log_tail.rs:277` `abort_all` body | the one place `JoinHandle::abort` runs for the set; returns the handles so the terminus can bound-join |
+| `log_tail.rs:297` `LogTailSet::Drop` | merged_bug_130 chokepoint (session early-exit/error/panic paths); cannot await the join — disclosure lands iff a consumer survives (the law's vacuous case otherwise) |
+| `build.rs:1800` build terminus | abort → bounded join (250 ms) → drain `log_rx`, in THAT order — Drop-flushed chunks land before the final relay drain (the pre-fix order stranded them) |
+
+All remaining matches are end-of-test harness cleanup calls in
+`log_tail.rs::tests`.
