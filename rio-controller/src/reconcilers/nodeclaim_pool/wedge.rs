@@ -45,10 +45,18 @@
 //! heartbeat detector and its `dead_nodes` field are gone), so the
 //! existing `ReapReason::Dead` arm
 //! — including its per-tick `dead_reap_cap` blast-radius bound — is the
-//! single consumer. Evidence is event-shaped and in-memory only: a
-//! restart under-detects for at most one window (safe direction, same
-//! as the heartbeat detector), and an open-attempt RPC failure merely
-//! skips one tick's observation without dropping prior evidence.
+//! single consumer. Evidence is event-shaped and in-memory only. A
+//! restart loses accumulated evidence (under-detects until it
+//! re-accumulates, at most one window) — but it ALSO loses the
+//! suppression watermark and eviction tombstones, so a restart during
+//! or just after a systemic episode can OVER-detect: the episode's
+//! still-open attempts re-present and re-anchor as if fresh, and the
+//! per-node verdicts they mint roll Dead-reaps the latch existed to
+//! suppress (merged_bug_060 corrected this doc — the old text claimed
+//! the under-detect direction for restarts unconditionally). The
+//! `dead_reap_cap` blast-radius bound is the backstop for that
+//! window. An open-attempt RPC failure merely skips one tick's
+//! observation without dropping prior evidence.
 
 use std::collections::{HashMap, HashSet};
 
@@ -470,10 +478,16 @@ impl WedgeTracker {
                     .saturating_sub(a.deadline_secs.saturating_add(WEDGE_DEADLINE_GRACE_SECS));
                 (now_secs - over as f64).max(0.0) as u64
             };
-            if self
-                .last_suppression
-                .is_some_and(|w| expiry_pg <= w.max_expiry_pg)
-            {
+            // merged_bug_060: the gate itself expires after one
+            // window — a protective latch cannot outlive the episode
+            // it suppresses. Without the TTL an episode attempt that
+            // never closes (a genuinely wedged node is exactly the
+            // node whose attempts never close) was blocked FOREVER:
+            // the node became permanently undetectable, a NodeClaim
+            // leak in the over-suppress direction.
+            if self.last_suppression.is_some_and(|w| {
+                expiry_pg <= w.max_expiry_pg && now_secs - w.set_at <= WEDGE_CLUSTER_WINDOW_SECS
+            }) {
                 continue;
             }
             self.evidence
@@ -505,6 +519,12 @@ impl WedgeTracker {
         self.evidence.retain(|_, per_node| !per_node.is_empty());
         self.evicted
             .retain(|_, t| now_secs - *t <= WEDGE_CLUSTER_WINDOW_SECS);
+        if self
+            .last_suppression
+            .is_some_and(|w| now_secs - w.set_at > WEDGE_CLUSTER_WINDOW_SECS)
+        {
+            self.last_suppression = None;
+        }
     }
 }
 
@@ -1050,7 +1070,10 @@ mod proptests {
                 // over the raw trajectory, independent of the impl.
                 let over = a.assigned_at_age_secs - (a.deadline_secs + WEDGE_DEADLINE_GRACE_SECS);
                 let expiry = now - over as f64;
-                if self.watermark.is_some_and(|w| expiry <= w) {
+                if self
+                    .watermark
+                    .is_some_and(|w| expiry <= w && now - w <= WEDGE_CLUSTER_WINDOW_SECS)
+                {
                     continue;
                 }
                 self.anchors
@@ -1135,9 +1158,14 @@ mod proptests {
                 let true_age = (now as u64) - assigned_pg;
                 let rows: Vec<OpenAttempt> = [("a1", "n1"), ("a2", "n1")]
                     .iter().map(|(i, n)| mk(i, n, true_age.saturating_sub(*j))).collect();
+                let in_window = now - t0 <= WEDGE_CLUSTER_WINDOW_SECS;
                 match t.update(Some(&rows), &std::collections::BTreeSet::new(), &registered, now) {
                     WedgeVerdict::NodeWedged(nodes, _) => prop_assert!(
-                        nodes.is_empty(),
+                        // Within the watermark window: never admitted,
+                        // for any jitter. Past it: merged_bug_060's
+                        // TTL law applies — a still-wedged participant
+                        // MAY re-detect (pinned by the unit test).
+                        !in_window || nodes.is_empty(),
                         "suppressed expiry re-admitted at tick {} (jitter {}): {:?}", k, j, nodes
                     ),
                     WedgeVerdict::Systemic { .. } | WedgeVerdict::Unobserved(_) => {}
@@ -1591,6 +1619,48 @@ mod episode_latch_tests {
                 nodes.is_empty(),
                 "a single fresh expiry completed a pair with suppressed-episode \
                  evidence: {nodes:?}"
+            ),
+            other => panic!("unexpected verdict {other:?}"),
+        }
+    }
+
+    /// merged_bug_060: the suppression watermark is a PROTECTIVE
+    /// latch — it cannot outlive the episode it suppresses. An
+    /// episode attempt that never closes (a genuinely wedged node is
+    /// exactly the node whose attempts never close) was blocked
+    /// forever by the un-TTL'd watermark: the node became permanently
+    /// undetectable — a NodeClaim leak in the over-suppress direction,
+    /// inverting the module's documented safe-failure direction.
+    // r[verify ctrl.nodeclaim.wedge-two-axis+3]
+    #[test]
+    fn post_window_participant_re_detects() {
+        let mut t = WedgeTracker::default();
+        let storm: Vec<OpenAttempt> = (0..4)
+            .flat_map(|n| {
+                vec![
+                    expired_at(&format!("d{n}x"), &format!("node-{n}"), 5),
+                    expired_at(&format!("d{n}y"), &format!("node-{n}"), 5),
+                ]
+            })
+            .collect();
+        assert!(matches!(
+            t.update(Some(&storm), &no_reaps(), &all_nodes(), 10_000.0),
+            WedgeVerdict::Systemic { .. }
+        ));
+        // One full window later the episode is over, every other node
+        // healed — but node-1's SAME two attempts are still open and
+        // expired (the wedge signature: nothing on that node reports).
+        let late = 10_000.0 + WEDGE_CLUSTER_WINDOW_SECS + 10.0;
+        let still_open = vec![
+            expired_at("d1x", "node-1", 5 + (WEDGE_CLUSTER_WINDOW_SECS as u64) + 10),
+            expired_at("d1y", "node-1", 5 + (WEDGE_CLUSTER_WINDOW_SECS as u64) + 10),
+        ];
+        let v = t.update(Some(&still_open), &no_reaps(), &all_nodes(), late);
+        match v {
+            WedgeVerdict::NodeWedged(nodes, _) => assert_eq!(
+                nodes,
+                vec!["node-1".to_string()],
+                "a post-window still-wedged participant must re-detect"
             ),
             other => panic!("unexpected verdict {other:?}"),
         }
