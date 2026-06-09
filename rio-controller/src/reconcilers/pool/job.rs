@@ -780,15 +780,18 @@ pub(super) async fn delete_job_with_synthesized_report(
                 // OA1: the synthesized path closes the terminal→report
                 // interval at the moment of deletion (the controller is
                 // the initiator, so the interval is ~0 by construction).
-                // Sampled once per Job name so a delete that fails and
-                // retries next tick doesn't re-record.
-                if first_terminal_report_sample(
-                    &mut ctx.terminal_report_sampled.lock(),
-                    job_name,
-                    epoch_now_secs(),
-                    epoch_now_secs(),
-                )
-                .is_some()
+                // Sampled once per Job OBJECT (bug_089: the uid, never
+                // the reusable name) so a delete that fails and retries
+                // next tick doesn't re-record, while a same-named
+                // replacement samples fresh.
+                if let Some(uid) = ObjectUid::from_meta(&job.metadata)
+                    && first_terminal_report_sample(
+                        &mut ctx.terminal_report_sampled.lock(),
+                        uid,
+                        epoch_now_secs(),
+                        epoch_now_secs(),
+                    )
+                    .is_some()
                 {
                     metrics::histogram!(
                         "rio_controller_job_terminal_report_seconds",
@@ -1654,27 +1657,60 @@ pub(super) fn report_intent_id_for_job(job: &Job) -> String {
     job_intent_id(job).unwrap_or_default().to_owned()
 }
 
-/// How long a sampled Pod/Job name stays in `Ctx::terminal_report_sampled`
-/// before pruning: 2× the Job TTL, by which point the object is no
-/// longer listable so the entry can never suppress a legitimate new
-/// sample.
+/// How long a sampled object's entry stays in
+/// `Ctx::terminal_report_sampled` before pruning. The TTL is a
+/// boundedness bound only; correctness — one sample per terminal
+/// OBJECT — is carried by the [`ObjectUid`] key: a same-named
+/// replacement is a new uid and samples fresh, and pruning can
+/// re-admit only the same uid, which would have to remain listable
+/// and re-reportable 1200 s after its first acked sample — no
+/// reporting path satisfies that (Job TTL deletes the Job and its pod
+/// at 600 s; reap paths delete earlier; the deadline-killed pod that
+/// outlives them re-lists with reason `Error`, which
+/// `report_terminated_pods` filters).
 const TERMINAL_REPORT_SAMPLED_TTL: Duration = Duration::from_secs(2 * JOB_TTL_SECS as u64);
 
+/// bug_089: the OA1 sample gate's dedup identity — the apiserver-
+/// minted `metadata.uid`, NEVER the reusable deterministic Pod/Job
+/// name. Job names are deterministic per intent and
+/// `reap_stale_for_intents` background-deletes terminal Jobs early
+/// precisely so a same-named replacement can spawn: the retired
+/// name-keyed gate silently suppressed the replacement object's
+/// legitimate first sample for up to the TTL window. The sole
+/// constructor takes `&ObjectMeta`, so a name-keyed call no longer
+/// typechecks.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ObjectUid(String);
+
+impl ObjectUid {
+    /// `None` ⟺ uid absent. The production apiserver always sets it;
+    /// an absent uid means the object was constructed in memory.
+    /// Callers skip sampling on `None` — fail-closed: an
+    /// unidentifiable object cannot be deduped, and a skipped sample
+    /// is observability noise, never suppression.
+    pub(super) fn from_meta(meta: &ObjectMeta) -> Option<ObjectUid> {
+        meta.uid.clone().filter(|u| !u.is_empty()).map(ObjectUid)
+    }
+}
+
 /// OA1 interval-(i) sample gate: returns the latency sample (seconds,
-/// clamped at zero against apiserver/controller clock skew) for `key`
-/// exactly once per controller process; later calls for the same key
-/// return `None`. See `Ctx::terminal_report_sampled` for why the
-/// TTL-window re-reports must not be re-sampled.
+/// clamped at zero against apiserver/controller clock skew) for the
+/// OBJECT `key` exactly once per controller process; later calls for
+/// the same uid return `None`. A failed delete retried next tick
+/// re-presents the SAME uid and stays deduped; a same-named
+/// replacement object is a NEW uid and samples fresh. See
+/// `Ctx::terminal_report_sampled` and [`TERMINAL_REPORT_SAMPLED_TTL`]
+/// for the prune's (boundedness-only) role.
 pub(super) fn first_terminal_report_sample(
-    seen: &mut HashMap<String, Instant>,
-    key: &str,
+    seen: &mut HashMap<ObjectUid, Instant>,
+    key: ObjectUid,
     terminal_epoch_secs: f64,
     now_epoch_secs: f64,
 ) -> Option<f64> {
-    if seen.contains_key(key) {
+    if seen.contains_key(&key) {
         return None;
     }
-    seen.insert(key.to_owned(), Instant::now());
+    seen.insert(key, Instant::now());
     Some((now_epoch_secs - terminal_epoch_secs).max(0.0))
 }
 
@@ -1805,13 +1841,15 @@ pub(super) async fn report_terminated_pods(ctx: &Ctx, ns: &str, pool: &str) {
         {
             Ok(_) => {
                 // OA1 interval (i): Pod terminal-condition timestamp →
-                // report acked, sampled once per Pod (the same Pod is
-                // re-reported every tick for the TTL window — see
-                // `Ctx::terminal_report_sampled`).
+                // report acked, sampled once per Pod OBJECT (the same
+                // Pod is re-reported every tick for the TTL window —
+                // see `Ctx::terminal_report_sampled`; bug_089: keyed
+                // by uid so a same-named successor samples fresh).
                 if let Some(terminal) = pod_terminal_epoch_secs(pod)
+                    && let Some(uid) = ObjectUid::from_meta(&pod.metadata)
                     && let Some(latency) = first_terminal_report_sample(
                         &mut ctx.terminal_report_sampled.lock(),
-                        name,
+                        uid,
                         terminal,
                         epoch_now_secs(),
                     )
@@ -1898,12 +1936,14 @@ pub(super) async fn report_deadline_exceeded_jobs(ctx: &Ctx, jobs: &[Job]) {
         {
             Ok(_) => {
                 // OA1 interval (i): the Job's Failed/DeadlineExceeded
-                // condition transition → report acked, sampled once per
-                // Job (see `Ctx::terminal_report_sampled`).
+                // condition transition → report acked, sampled once
+                // per Job OBJECT (see `Ctx::terminal_report_sampled`;
+                // bug_089: keyed by uid, not the reusable name).
                 if let Some(terminal) = job_deadline_exceeded_epoch_secs(job)
+                    && let Some(uid) = ObjectUid::from_meta(&job.metadata)
                     && let Some(latency) = first_terminal_report_sample(
                         &mut ctx.terminal_report_sampled.lock(),
-                        name,
+                        uid,
                         terminal,
                         epoch_now_secs(),
                     )
@@ -2081,24 +2121,52 @@ mod tests {
         assert!(job_deadline_exceeded_epoch_secs(&deadline_job).is_some());
         assert!(job_deadline_exceeded_epoch_secs(&Job::default()).is_none());
 
-        // The sample gate: first ack for a key yields the latency,
-        // re-reports of the same key do not re-sample, a different key
-        // does, and clock skew clamps at zero (never a negative sample).
+        // The sample gate: first ack for an OBJECT yields the latency,
+        // re-reports of the same uid do not re-sample, a different uid
+        // does, and clock skew clamps at zero (never a negative
+        // sample). Uids are minted through `ObjectMeta` (the apiserver
+        // shape — bug_089: the gate key is the object identity, never
+        // the reusable name).
+        let uid = |u: &str| {
+            ObjectUid::from_meta(&ObjectMeta {
+                uid: Some(u.to_owned()),
+                ..Default::default()
+            })
+            .expect("uid set")
+        };
         let mut seen = HashMap::new();
         assert_eq!(
-            first_terminal_report_sample(&mut seen, "pod-a", 100.0, 130.0),
+            first_terminal_report_sample(
+                &mut seen,
+                uid("00000000-0000-4000-8000-00000000000a"),
+                100.0,
+                130.0
+            ),
             Some(30.0)
         );
         assert_eq!(
-            first_terminal_report_sample(&mut seen, "pod-a", 100.0, 140.0),
+            first_terminal_report_sample(
+                &mut seen,
+                uid("00000000-0000-4000-8000-00000000000a"),
+                100.0,
+                140.0
+            ),
             None,
             "TTL-window re-report must not re-sample"
         );
         assert_eq!(
-            first_terminal_report_sample(&mut seen, "pod-b", 200.0, 190.0),
+            first_terminal_report_sample(
+                &mut seen,
+                uid("00000000-0000-4000-8000-00000000000b"),
+                200.0,
+                190.0
+            ),
             Some(0.0),
             "clock skew clamps at zero"
         );
+        // An in-memory object without a uid mints no key at all —
+        // the call sites skip sampling (fail-closed, never suppression).
+        assert!(ObjectUid::from_meta(&ObjectMeta::default()).is_none());
 
         // Label values match the scheduler-side termination_reason
         // strings for the reasons that reach the wire.

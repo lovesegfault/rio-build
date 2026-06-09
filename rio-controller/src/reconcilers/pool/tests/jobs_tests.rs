@@ -893,10 +893,26 @@ async fn reap_stale_for_intents_reaps_orphan_pending() {
 // Synthesize-on-delete (ctrl.job.synthesize-on-delete)
 // ───────────────────────────────────────────────────────────────────
 
+/// A fresh apiserver-shaped object uid (RFC-4122 v4 layout — the only
+/// shape the apiserver emits; `metadata.uid` is set on EVERY object it
+/// serves). Counter-suffixed so every mint is distinct, exactly like a
+/// replacement object under a reused deterministic name. Witness
+/// provenance (R13): fixtures mint uids through this helper, never
+/// literal `"uid-1"` strings.
+fn apiserver_uid() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("00000000-0000-4000-8000-{n:012x}")
+}
+
 /// A Running Job carrying the `rio.build/intent-id` pod-template
-/// annotation, as `build_job` spawns it.
+/// annotation, as `build_job` spawns it and the apiserver returns it
+/// (uid populated — a LIST/watch never serves a uid-less object; each
+/// call mints a fresh uid, exactly like a same-named replacement).
 fn running_job_for_intent(name: &str, intent_id: &str) -> Job {
     let mut j = pending_job(name, 1, 600);
+    j.metadata.uid = Some(apiserver_uid());
     j.spec = Some(JobSpec {
         template: PodTemplateSpec {
             metadata: Some(ObjectMeta {
@@ -1258,6 +1274,112 @@ async fn delete_job_report_failure_does_not_block_delete() {
     .await
     .expect("delete proceeds despite the failed report");
     guard.verified().await;
+}
+
+/// bug_089 red: the OA1 terminal-report sample gate must key on the
+/// apiserver OBJECT (metadata.uid), never the reusable deterministic
+/// Job name. `reap_stale_for_intents` background-deletes terminal Jobs
+/// early precisely so a same-named replacement spawns; a name-keyed
+/// gate silently suppresses the replacement object's legitimate first
+/// sample for up to the 1200 s TTL window. Two same-named Jobs with
+/// distinct uids (each minted fresh by the fixture, exactly as the
+/// apiserver does for a replacement) must each sample once.
+///
+/// Sample count is asserted as gate-map cardinality plus the histogram
+/// touch-set: the call site records into the OA1 histogram exactly
+/// when the gate admits, and the shared CountingRecorder captures
+/// histograms as a touch-set only (no per-record counts), so the map
+/// IS the per-sample witness.
+#[tokio::test]
+async fn terminal_sample_gate_keys_on_object_uid_not_name() {
+    let recorder = rio_test_support::metrics::CountingRecorder::default();
+    let _g = metrics::set_default_local_recorder(&recorder);
+
+    let (client, verifier) = ApiServerVerifier::new();
+    let (ctx, _mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
+    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+
+    // Two GENERATIONS of the same deterministic Job name: the fixture
+    // mints a fresh uid per call — job2 is the replacement object the
+    // early reap makes possible.
+    let job1 = running_job_for_intent("rio-builder-p-rep1", "drv-rep-1");
+    let job2 = running_job_for_intent("rio-builder-p-rep1", "drv-rep-1");
+    assert_ne!(
+        job1.metadata.uid, job2.metadata.uid,
+        "fixture mints fresh uids"
+    );
+    let attempts = vec![pull_attempt("drv-rep-1", "exec-1", "node-a")];
+
+    let guard = verifier.run(vec![
+        delete_scenario("rio-builder-p-rep1"),
+        delete_scenario("rio-builder-p-rep1"),
+    ]);
+    for job in [&job1, &job2] {
+        delete_job_with_synthesized_report(
+            &jobs_api,
+            &ctx,
+            job,
+            "rio-builder-p-rep1",
+            &DeleteParams::foreground(),
+            AttemptTerminalReason::Reaped,
+            &attempts,
+        )
+        .await
+        .expect("delete succeeds");
+    }
+    guard.verified().await;
+
+    assert!(
+        recorder.histogram_touched("rio_controller_job_terminal_report_seconds"),
+        "the synthesize→ack→OA1-sample path must have run"
+    );
+    let sampled = ctx.terminal_report_sampled.lock().len();
+    assert_eq!(
+        sampled, 2,
+        "histogram sampled once for a replacement object with a fresh uid"
+    );
+}
+
+/// bug_089 companion pin: the SAME object presented twice (a failed
+/// delete retried next tick re-presents the SAME uid) still dedupes to
+/// exactly one sample — the uid re-key must not break the retry-path
+/// dedup the gate exists for.
+#[tokio::test]
+async fn terminal_sample_gate_still_dedupes_same_object() {
+    let recorder = rio_test_support::metrics::CountingRecorder::default();
+    let _g = metrics::set_default_local_recorder(&recorder);
+
+    let (client, verifier) = ApiServerVerifier::new();
+    let (ctx, _mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
+    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+
+    let job = running_job_for_intent("rio-builder-p-rep2", "drv-rep-2");
+    let attempts = vec![pull_attempt("drv-rep-2", "exec-2", "node-b")];
+
+    let guard = verifier.run(vec![
+        delete_scenario("rio-builder-p-rep2"),
+        delete_scenario("rio-builder-p-rep2"),
+    ]);
+    for _ in 0..2 {
+        delete_job_with_synthesized_report(
+            &jobs_api,
+            &ctx,
+            &job,
+            "rio-builder-p-rep2",
+            &DeleteParams::foreground(),
+            AttemptTerminalReason::Reaped,
+            &attempts,
+        )
+        .await
+        .expect("delete succeeds");
+    }
+    guard.verified().await;
+
+    assert_eq!(
+        ctx.terminal_report_sampled.lock().len(),
+        1,
+        "the same object (same uid) must sample exactly once"
+    );
 }
 
 // r[verify ctrl.ephemeral.reap-orphan-running+5]

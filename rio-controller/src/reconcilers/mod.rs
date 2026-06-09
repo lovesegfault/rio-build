@@ -178,20 +178,24 @@ pub struct Ctx {
     /// instance shared with `node_informer::run` and the
     /// nodeclaim_pool reconciler.
     pub hw_config: node_informer::HwClassConfig,
-    /// Pod/Job names whose first acked pod-terminal report has
-    /// already been sampled into
-    /// `rio_controller_job_terminal_report_seconds` (the OA1
+    /// Apiserver object uids (Pods/Jobs — `pool/job::ObjectUid`)
+    /// whose first acked pod-terminal report has already been sampled
+    /// into `rio_controller_job_terminal_report_seconds` (the OA1
     /// interval-(i) instrument), with the insertion instant for
     /// pruning. The report path re-reports the same terminal object
     /// every tick for the Job TTL window (the scheduler dedups
     /// server-side); without this gate the histogram would re-sample
     /// the same terminal event every tick and measure the TTL window
-    /// instead of the terminal→first-acked-report latency. In-process
-    /// only (a controller restart may re-sample an object once —
-    /// acceptable observability noise, never a behavior change).
-    /// Pruned in `pool/job::report_terminated_pods` once entries
-    /// outlive the TTL window.
-    pub terminal_report_sampled: Mutex<HashMap<String, Instant>>,
+    /// instead of the terminal→first-acked-report latency. Keyed by
+    /// uid, never the deterministic Pod/Job name (bug_089: the early
+    /// reap exists precisely so a same-named replacement spawns — a
+    /// name key suppressed the replacement's legitimate first
+    /// sample). In-process only (a controller restart may re-sample
+    /// an object once — acceptable observability noise, never a
+    /// behavior change). Pruned in `pool/job::report_terminated_pods`
+    /// once entries outlive the TTL window (a boundedness bound only;
+    /// see `TERMINAL_REPORT_SAMPLED_TTL`).
+    pub terminal_report_sampled: Mutex<HashMap<pool::job::ObjectUid, Instant>>,
     /// `intent_id` → consecutive ticks the AD2 spawn gate observed
     /// fleet exhaustion for that intent (`pool/jobs` gate block). The
     /// NoEligibleSource report — the verdict that POISONS the
