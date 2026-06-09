@@ -1542,22 +1542,27 @@ products and both falsify.
   `sum()`.
 ]
 
-#r("store.gc.completion-witness")[
+#r("store.gc.completion-witness+2")[
   Completion of a live collect pass is a typed property of having scanned
   the FULL keyspace under this cycle's mark: only an unresumed pass that
   exhausts the candidate scan may anchor the durable backlog estimate at
-  zero or run the post-drain tombstone reap. A cursor-resumed pass that
-  exhausts the remainder resets the cursor but MUST keep the decremented
-  backlog estimate, and the post-drain tail work (tombstone reap, mark
-  cleanup) MUST NOT be able to fail the already-drained cycle's commit ---
-  tail failures are contained (warn + counter) and retried on the next
-  full-scan completion.
+  zero. A cursor-resumed pass that exhausts the remainder resets the
+  cursor but MUST keep the decremented backlog estimate. The post-drain
+  tombstone reap is NOT disposition-gated: its qual is entirely row-local
+  (soft-deleted at least the grace term ago, fully drained), so it MUST
+  run on every live cycle, bounded by a per-cycle reap cap --- coupling it
+  to the full-scan proof starves reaping permanently when daily
+  eligible-garbage production exceeds the victim cap (bug_193). The
+  post-drain tail work (tombstone reap, mark cleanup) MUST NOT be able to
+  fail the already-drained cycle's commit --- tail failures are contained
+  (warn + counter) and retried on the next live cycle.
 ]
 
 The disposition is one enum (`PassDisposition`) constructed at a single
-site from the resume state and the scan exit; the durable commit and the
-reap gate consume it rather than re-deriving booleans --- a resumed partial
-scan asserting completion is unrepresentable (bug_174, bug_137).
+site from the resume state and the scan exit; the durable commit consumes
+it rather than re-deriving booleans --- a resumed partial scan asserting
+completion is unrepresentable (bug_174, bug_137); the reap consults no
+disposition at all (bug_193).
 
 #r("store.gc.shutdown-abort")[
   `sweep` checks the shutdown token between batches (NOT mid-transaction --- a

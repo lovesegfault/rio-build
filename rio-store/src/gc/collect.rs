@@ -468,7 +468,8 @@ pub(crate) struct CollectReport {
     /// views are derived accessors so they can never disagree with it.
     pub(crate) disposition: Option<PassDisposition>,
     /// Tombstone rows hard-deleted by the post-drain reap
-    /// (merged_bug_336). Nonzero only on a full-scan completion.
+    /// (merged_bug_336): drained, grace-aged tombstones, reaped on
+    /// every live cycle bounded by [`REAP_CYCLE_CAP`] (bug_193).
     pub(crate) chunks_reaped: u64,
     /// Wall-clock of the cycle (snapshot through report/collect).
     pub(crate) cycle_seconds: f64,
@@ -505,10 +506,11 @@ impl CollectReport {
 /// about `[0, cursor)` under this cycle's mark (grace runs from
 /// `GREATEST(created_at, last_referenced_at)`, so chunks below the
 /// persisted cursor become eligible between cycles), so it resets the
-/// cursor but can never anchor the durable backlog estimate at zero —
-/// and the tombstone reap, strictly gated on a proven-drained
-/// keyspace, does not run on it.
-// r[impl store.gc.completion-witness]
+/// cursor but can never anchor the durable backlog estimate at zero.
+/// The tombstone reap is NOT disposition-gated (bug_193): its qual is
+/// row-local, so it runs on every live cycle regardless of what the
+/// scan proved.
+// r[impl store.gc.completion-witness+2]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PassDisposition {
     /// An unresumed pass scanned the full keyspace under this mark.
@@ -999,7 +1001,7 @@ pub(crate) async fn collect_cycle(
     // failure re-ran the full mark expansion up to 24x/day against the
     // documented once-per-24h bound while the backlog estimate never
     // decremented).
-    let chunks_reaped = run_post_drain_tail(conn, &disposition, grace_secs).await;
+    let chunks_reaped = run_post_drain_tail(conn, grace_secs).await;
 
     // Backlog visibility (P15) is durable now: the caller\'s
     // CycleCommit decrements the row estimate (full-scan completion ⇒
@@ -1054,65 +1056,66 @@ pub(crate) static REAP_FAIL_INJECT: std::sync::atomic::AtomicBool =
 /// session, so a failure here is structurally unable to fail the
 /// cycle: reap errors warn + count and stop reaping; a cleanup error
 /// detaches the session (the temp table dies with it, never in the
-/// shared pool). The reap runs ONLY on a full-keyspace completion: a
-/// resumed completion proved nothing about `[0, cursor)`, and a
-/// capped pass still has collect work outstanding.
-// r[impl store.gc.completion-witness]
-async fn run_post_drain_tail(
-    mut conn: super::lock::SessionConn,
-    disposition: &PassDisposition,
-    grace_secs: i64,
-) -> u64 {
+/// shared pool). The reap runs on EVERY live cycle, bounded by
+/// [`REAP_CYCLE_CAP`] (bug_193): its DELETE qual is entirely
+/// row-local — `deleted AND deleted_at < now() - grace AND NOT
+/// EXISTS pending_s3_deletes` — so no scan-completion fact enters
+/// the decision; gating it on the full-scan proof starved the reap
+/// permanently under cap saturation (`CompleteFullScan` unreachable
+/// while daily eligible-garbage production exceeds the victim cap)
+/// and tombstones accumulated without bound. The full-scan proof
+/// remains the backlog anchor's gate and only that
+/// ([`PassDisposition::anchors_backlog_zero`]).
+// r[impl store.gc.completion-witness+2]
+async fn run_post_drain_tail(mut conn: super::lock::SessionConn, grace_secs: i64) -> u64 {
     let mut chunks_reaped: u64 = 0;
-    if disposition.anchors_backlog_zero() {
-        loop {
-            let remaining = REAP_CYCLE_CAP.saturating_sub(chunks_reaped);
-            if remaining == 0 {
-                break;
-            }
-            let limit = COLLECT_BATCH_LIMIT.min(remaining) as i64;
-            #[cfg(test)]
-            let injected: Result<sqlx::postgres::PgQueryResult, sqlx::Error> =
-                if REAP_FAIL_INJECT.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                    Err(sqlx::Error::Protocol(
-                        "chunk-collect: injected reap failure (test only)".into(),
-                    ))
-                } else {
-                    sqlx::query(REAP_BATCH_DELETE_SQL.as_str())
-                        .bind(grace_secs)
-                        .bind(limit)
-                        .execute(&mut **conn.conn())
-                        .await
-                };
-            #[cfg(not(test))]
-            let injected = sqlx::query(REAP_BATCH_DELETE_SQL.as_str())
-                .bind(grace_secs)
-                .bind(limit)
-                .execute(&mut **conn.conn())
-                .await;
-            match injected {
-                Ok(r) => {
-                    let reaped = r.rows_affected();
-                    if reaped == 0 {
-                        break;
-                    }
-                    metrics::counter!("rio_store_gc_chunks_reaped_total").increment(reaped);
-                    chunks_reaped += reaped;
-                }
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        chunks_reaped,
-                        "post-drain tombstone reap failed (the drained cycle still \
-                         commits; the next full-scan completion retries the reap)"
-                    );
-                    metrics::counter!(
-                        "rio_store_gc_collect_tail_errors_total",
-                        "stage" => "reap"
-                    )
-                    .increment(1);
+    loop {
+        let remaining = REAP_CYCLE_CAP.saturating_sub(chunks_reaped);
+        if remaining == 0 {
+            break;
+        }
+        let limit = COLLECT_BATCH_LIMIT.min(remaining) as i64;
+        #[cfg(test)]
+        let injected: Result<sqlx::postgres::PgQueryResult, sqlx::Error> =
+            if REAP_FAIL_INJECT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                Err(sqlx::Error::Protocol(
+                    "chunk-collect: injected reap failure (test only)".into(),
+                ))
+            } else {
+                sqlx::query(REAP_BATCH_DELETE_SQL.as_str())
+                    .bind(grace_secs)
+                    .bind(limit)
+                    .execute(&mut **conn.conn())
+                    .await
+            };
+        #[cfg(not(test))]
+        let injected = sqlx::query(REAP_BATCH_DELETE_SQL.as_str())
+            .bind(grace_secs)
+            .bind(limit)
+            .execute(&mut **conn.conn())
+            .await;
+        match injected {
+            Ok(r) => {
+                let reaped = r.rows_affected();
+                if reaped == 0 {
                     break;
                 }
+                metrics::counter!("rio_store_gc_chunks_reaped_total").increment(reaped);
+                chunks_reaped += reaped;
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    chunks_reaped,
+                    "post-drain tombstone reap failed (the drained cycle still \
+                     commits; the next live cycle retries the reap)"
+                );
+                metrics::counter!(
+                    "rio_store_gc_collect_tail_errors_total",
+                    "stage" => "reap"
+                )
+                .increment(1);
+                break;
             }
         }
     }
@@ -2405,6 +2408,81 @@ mod tests {
         );
     }
 
+    /// bug_193: the tombstone reap's qual is entirely row-local
+    /// (deleted + aged past grace + drained), so it MUST run on every
+    /// live cycle bounded by REAP_CYCLE_CAP — a capped or
+    /// cursor-resumed cycle reaps exactly like a full scan. Pre-fix
+    /// the reap was gated on `anchors_backlog_zero()` (full scan
+    /// only): under cap saturation `CompleteFullScan` is unreachable
+    /// and tombstones accumulate without bound while
+    /// `rio_store_gc_chunks_reaped_total` flatlines.
+    #[tokio::test]
+    async fn capped_and_resumed_cycles_reap_row_local_tombstones() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        reset_collector_state(&db.pool).await;
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
+        let grace = super::super::sweep::CHUNK_GRACE_SECS;
+
+        let seed_reapable = |pool: sqlx::PgPool, tag: u8| async move {
+            let h = ChunkSeed::new(tag).uploaded().seed(&pool).await;
+            sqlx::query(
+                "UPDATE chunks SET deleted = TRUE, \
+                 deleted_at = now() - make_interval(secs => $2) \
+                 WHERE blake3_hash = $1",
+            )
+            .bind(&h[..])
+            .bind((grace + 100) as f64)
+            .execute(&pool)
+            .await
+            .unwrap();
+            h
+        };
+
+        // A backlog larger than the cap, so cycle 1 stops Capped.
+        let n = (COLLECT_CYCLE_VICTIM_CAP + 10) as u16;
+        seed_collectable_chunks(&db.pool, n, 100).await;
+        let reapable_1 = seed_reapable(db.pool.clone(), 0xF1).await;
+
+        // Cycle 1: unresumed, caps — and still reaps the row-local
+        // eligible tombstone.
+        let report = collect_cycle(&db.pool, Some(&backend), grace, CollectMode::Live, None)
+            .await
+            .expect("capped cycle");
+        assert!(report.cap_reached, "cycle 1 stops at the cap");
+        assert_eq!(
+            report.chunks_reaped, 1,
+            "a CAPPED cycle reaps the drained aged tombstone (row-local qual)"
+        );
+
+        // Cycle 2: cursor-resumed completion — also reaps.
+        let reapable_2 = seed_reapable(db.pool.clone(), 0xF2).await;
+        let report2 = collect_cycle(
+            &db.pool,
+            Some(&backend),
+            grace,
+            CollectMode::Live,
+            report.cursor_at_stop().map(<[u8]>::to_vec),
+        )
+        .await
+        .expect("resumed cycle");
+        assert_eq!(
+            report2.disposition,
+            Some(PassDisposition::CompleteResumed),
+            "cycle 2 exhausts the remainder from the cursor"
+        );
+        assert_eq!(
+            report2.chunks_reaped, 1,
+            "a RESUMED completion reaps the drained aged tombstone"
+        );
+
+        let remaining: Vec<Vec<u8>> = sqlx::query_scalar("SELECT blake3_hash FROM chunks")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+        assert!(!remaining.contains(&reapable_1.to_vec()));
+        assert!(!remaining.contains(&reapable_2.to_vec()));
+    }
+
     /// A cycle that fails against PostgreSQL is counted by its caller
     /// under outcome="error" (the parse-failure abort keeps its own
     /// outcome), so DB-error cycles are visible immediately instead of
@@ -3290,7 +3368,7 @@ mod tests {
     /// `PassDisposition::CompleteResumed` resets the cursor, KEEPS the
     /// decremented estimate, and skips the reap; only an unresumed
     /// full-keyspace scan anchors zero.
-    // r[verify store.gc.completion-witness]
+    // r[verify store.gc.completion-witness+2]
     #[tokio::test]
     async fn resumed_completion_keeps_decremented_backlog_and_skips_reap() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -3403,7 +3481,7 @@ mod tests {
     /// the containment; reverting `run_post_drain_tail` to `?`
     /// propagation turns this red — outcome=error, stamp missing): a
     /// post-drain tail failure must not un-commit the drained cycle.
-    // r[verify store.gc.completion-witness]
+    // r[verify store.gc.completion-witness+2]
     #[tokio::test]
     async fn tail_failure_cannot_uncommit_the_drained_cycle() {
         let db = TestDb::new(&crate::MIGRATOR).await;

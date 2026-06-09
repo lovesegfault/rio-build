@@ -452,13 +452,13 @@ pub fn describe_metrics() {
         "rio_store_gc_chunks_reaped_total",
         "Tombstone chunk rows hard-DELETEd by the post-drain reap (091, \
          merged_bug_336): soft-deleted at least the grace term ago AND \
-         fully drained (no pending_s3_deletes row). Runs only after a \
-         FULL-KEYSPACE collect completion (bug_174 — a cursor-resumed \
-         completion proves nothing about the skipped prefix and does \
-         not reap); the resurrect upsert NULLs deleted_at so a \
-         re-referenced chunk is never reap-eligible. Sustained zero \
-         with a growing deleted-row count means the drain is stuck \
-         (check rio_store_s3_deletes_stuck)."
+         fully drained (no pending_s3_deletes row). The qual is entirely \
+         row-local, so the reap runs on EVERY live collect cycle, bounded \
+         per cycle (bug_193 — gating it on a full-keyspace completion \
+         starved reaping permanently under cap saturation); the resurrect \
+         upsert NULLs deleted_at so a re-referenced chunk is never \
+         reap-eligible. Sustained zero with a growing deleted-row count \
+         means the drain is stuck (check rio_store_s3_deletes_stuck)."
     );
     describe_counter!(
         "rio_store_gc_collect_tail_errors_total",
@@ -467,7 +467,7 @@ pub fn describe_metrics() {
          drop). The drained cycle still COMMITS its stamp/cursor/backlog \
          (bug_137 — pre-fix a tail error un-committed the cycle and \
          re-ran the full mark expansion up to 24x/day); the tail retries \
-         on the next full-scan completion. Sustained increments mean the \
+         on the next live cycle. Sustained increments mean the \
          reap statement or the cycle session is unhealthy."
     );
     describe_counter!(

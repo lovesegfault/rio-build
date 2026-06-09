@@ -3229,7 +3229,7 @@ rec {
     # regime's state space. Measured (TLC exhaustive, MAX_CHUNKS=4,
     # workers=4): 41,427 generated / 4,260 distinct, [ok] in <1s — the
     # default 1800s budget is ~1800x the measurement.
-    # r[verify store.gc.completion-witness]
+    # r[verify store.gc.completion-witness+2]
     quint-gc-drain-pass = mkQuintCheck {
       name = "gc-drain-pass";
       spec = "gcCollectState";
@@ -3244,7 +3244,7 @@ rec {
     # reap, cap, below-cursor re-eligibility, resume, drain the tail —
     # the resumed completion mints DCompleteResumed, anchors nothing,
     # and the below-cursor eligible survives for the next full pass.
-    # r[verify store.gc.completion-witness]
+    # r[verify store.gc.completion-witness+2]
     quint-gc-drain-pass-runs = mkQuintRunCheck {
       name = "gc-drain-pass-runs";
       spec = "gcCollectState";

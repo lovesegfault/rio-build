@@ -143,7 +143,7 @@ impl GcCycleLease {
                 victims_collected,
                 observation,
             } => {
-                // r[impl store.gc.completion-witness]
+                // r[impl store.gc.completion-witness+2]
                 sqlx::query(
                     "UPDATE gc_collect_state SET \
                        cycle_epoch = cycle_epoch + 1, \
