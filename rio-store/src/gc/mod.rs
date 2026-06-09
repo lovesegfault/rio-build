@@ -203,7 +203,7 @@ pub async fn run_gc(
     // only on an IDLE pool; a busy pool can keep a pooled connection
     // alive indefinitely).
     // r[impl store.gc.serialize-lock]
-    let Some(lease) = state::GcCycleLease::try_acquire(pool).await.map_err(|e| {
+    let Some(mut lease) = state::GcCycleLease::try_acquire(pool).await.map_err(|e| {
         warn!(error = %e, "GC: cycle lease acquire failed");
         Status::internal(format!("cycle lease: {e}"))
     })?
@@ -314,6 +314,16 @@ pub async fn run_gc(
     } else {
         collect::CollectMode::Live
     };
+    // bug_284: a live phase 3 is an ATTEMPT — stamp it before the
+    // cycle so the backstop's throttle conjunct sees operator-
+    // triggered heavy scans too. Warn-only: an operator GC must not
+    // abort over cadence bookkeeping (the sweep already committed);
+    // dry runs never stamp (a dry run must not defer live cadence).
+    if !params.dry_run {
+        if let Err(e) = lease.stamp_attempt().await {
+            warn!(error = %e, "GC: collect attempt stamp failed (cadence bookkeeping only)");
+        }
+    }
     let resume_cursor = lease.state.cursor.clone();
     match collect::collect_cycle(
         pool,

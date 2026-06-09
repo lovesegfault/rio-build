@@ -1203,10 +1203,17 @@ pub(crate) async fn collect_backstop_once(
         return Ok(None);
     };
     if !lease.backstop_due(COLLECT_BACKSTOP_INTERVAL).await? {
-        // Lost the pre-check race to a cycle that just committed.
+        // Lost the pre-check race to a cycle that just committed (or
+        // to a recent ATTEMPT — bug_284's throttle conjunct).
         lease.release().await?;
         return Ok(None);
     }
+
+    // bug_284: stamp the attempt BEFORE the cycle runs, so every
+    // outcome arm (Ok, ParseFailure, Err) inherits the throttle — a
+    // persistent fail-closed abort re-runs the heavy validation scan
+    // once per backstop interval, not once per hourly check.
+    lease.stamp_attempt().await?;
 
     let resume_cursor = lease.state.cursor.clone();
     match collect_cycle(
@@ -1317,7 +1324,7 @@ mod tests {
         sqlx::query(
             "UPDATE gc_collect_state SET cycle_epoch = 0, last_live_cycle_at = NULL, \
              cursor = NULL, backlog_estimate = NULL, last_mark_set_size = NULL, \
-             last_would_collect = NULL WHERE singleton",
+             last_would_collect = NULL, last_attempt_at = NULL WHERE singleton",
         )
         .execute(pool)
         .await
@@ -2261,9 +2268,13 @@ mod tests {
             "exactly one cycle cluster-wide"
         );
 
-        // Backdate the stamp past the interval ⇒ due again.
+        // Backdate BOTH stamps past the interval ⇒ due again
+        // (bug_284: the due predicate is success-stale AND
+        // attempt-stale; a cluster interval-old on both runs).
         sqlx::query(
-            "UPDATE gc_collect_state SET last_live_cycle_at = now() - make_interval(secs => $1) \
+            "UPDATE gc_collect_state SET \
+               last_live_cycle_at = now() - make_interval(secs => $1), \
+               last_attempt_at   = now() - make_interval(secs => $1) \
              WHERE singleton",
         )
         .bind(COLLECT_BACKSTOP_INTERVAL.as_secs() as f64 + 5.0)
@@ -2441,6 +2452,61 @@ mod tests {
             remaining.contains(&resurrected.to_vec()),
             "resurrected row never reaped"
         );
+    }
+
+    /// bug_284: a persistent fail-closed abort (corrupt chunk_list)
+    /// must not re-run the heavy validation scan on every backstop
+    /// CHECK tick. The attempt stamp is written before the cycle, so
+    /// two due-checks inside one backstop interval run exactly ONE
+    /// cycle; pre-fix the due predicate keyed only on
+    /// last_live_cycle_at (never stamped by an abort), so every
+    /// hourly check re-ran the aborted cycle: 24 heavy scans/day
+    /// against the documented once-per-24h cadence, until a human
+    /// repaired the manifest.
+    #[tokio::test]
+    async fn backstop_throttles_repeat_attempts_after_parse_failure() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        reset_collector_state(&db.pool).await;
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+
+        // One manifest with a corrupt chunk_list: every cycle aborts
+        // fail-closed and commits nothing.
+        seed_chunked_manifest(&db.pool, "corrupt-attempt", "complete", &[0xFFu8; 7]).await;
+
+        let first = collect_backstop_once(&db.pool, None, super::super::sweep::CHUNK_GRACE_SECS)
+            .await
+            .expect("first check runs")
+            .expect("due -> a cycle ran");
+        assert_eq!(first.outcome, CollectOutcome::ParseFailure);
+
+        // Second check, still inside the backstop interval: the
+        // attempt stamp throttles it -- no second heavy cycle.
+        let second = collect_backstop_once(&db.pool, None, super::super::sweep::CHUNK_GRACE_SECS)
+            .await
+            .expect("second check runs");
+        assert!(
+            second.is_none(),
+            "an attempt inside the interval is throttled (got a second cycle)"
+        );
+        assert_eq!(
+            rec.get("rio_store_gc_collect_cycles_total{outcome=parse_failure}"),
+            1,
+            "two due-checks inside the interval run exactly ONE cycle"
+        );
+
+        // The abort did NOT masquerade as a live cycle: the success
+        // stamp stays NULL (the stalled alert's signal), only the
+        // attempt stamp moved.
+        let (live_null, attempt_set): (bool, bool) = sqlx::query_as(
+            "SELECT last_live_cycle_at IS NULL, last_attempt_at IS NOT NULL \
+             FROM gc_collect_state WHERE singleton",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(live_null, "ParseFailure never stamps the live cadence");
+        assert!(attempt_set, "the attempt stamp is durable");
     }
 
     /// bug_306: live-only operation must anchor the backlog estimate.

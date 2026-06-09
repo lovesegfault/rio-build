@@ -2227,6 +2227,27 @@ pub const M_095: () = ();
 /// credential and the reset-clear contract.
 pub const M_096: () = ();
 
+/// `100_gc_collect_last_attempt.sql` — bug_284 (bughunt-4 S4; R11
+/// escalation in the wave-log, number 100 chosen clear of the 097-099
+/// reservations).
+///
+/// `gc_collect_state.last_attempt_at TIMESTAMPTZ NULL`: the live
+/// collect ATTEMPT stamp, written under the GC cycle lease immediately
+/// before every live cycle runs (backstop and run_gc phase 3 alike),
+/// regardless of how the cycle ends. The backstop due-predicate
+/// requires BOTH `last_live_cycle_at` staleness (the success cadence;
+/// unchanged, still what the stalled alert keys on) AND
+/// `last_attempt_at` staleness — so a cycle that aborts without
+/// committing (the fail-closed ParseFailure on a corrupt chunk_list,
+/// or a mid-cycle DB error) cannot be re-attempted faster than the
+/// documented once-per-interval heavy-cycle cadence. Pre-fix the
+/// hourly backstop check re-ran the full 4GB-work_mem validation scan
+/// 24x/day for as long as a single corrupt manifest persisted — a
+/// condition the fail-closed design expects to wait for a HUMAN.
+/// Shadow (dry-run) cycles do NOT stamp it: a dry run must never defer
+/// the live collection cadence.
+pub const M_100: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

@@ -40,11 +40,20 @@ const SELECT_STATE: &str = "SELECT cycle_epoch, cursor, \
                                    backlog_estimate, last_mark_set_size, last_would_collect \
                               FROM gc_collect_state WHERE singleton";
 
-/// `$1` = interval seconds (float). TRUE when no live cycle has ever
-/// run or the last one is at least the interval old — evaluated on
-/// the DB clock (no cross-replica clock enters the cadence decision).
-const BACKSTOP_DUE_SQL: &str = "SELECT last_live_cycle_at IS NULL \
-        OR (now() - last_live_cycle_at) >= make_interval(secs => $1) \
+/// `$1` = interval seconds (float). TRUE when (a) no live cycle has
+/// ever run or the last one is at least the interval old, AND (b) no
+/// live cycle has been ATTEMPTED inside the interval (bug_284:
+/// migration 100). (a) is the success cadence — the stalled alert
+/// keys on it; (b) is the attempt throttle — a cycle that aborts
+/// without committing (fail-closed ParseFailure, mid-cycle DB error)
+/// cannot be re-attempted faster than the documented heavy-cycle
+/// cadence, because the attempt stamp is written BEFORE the cycle
+/// runs and no outcome arm can un-write it. Evaluated on the DB clock
+/// (no cross-replica clock enters the cadence decision).
+const BACKSTOP_DUE_SQL: &str = "SELECT (last_live_cycle_at IS NULL \
+        OR (now() - last_live_cycle_at) >= make_interval(secs => $1)) \
+       AND (last_attempt_at IS NULL \
+        OR (now() - last_attempt_at) >= make_interval(secs => $1)) \
    FROM gc_collect_state WHERE singleton";
 
 /// The backstop's cheap pre-check, WITHOUT the lock (a stale read can
@@ -132,6 +141,23 @@ impl GcCycleLease {
             .bind(interval.as_secs_f64())
             .fetch_one(&mut **self.lock.conn())
             .await
+    }
+
+    /// Stamp the live-cycle ATTEMPT (bug_284), through the lock
+    /// session, BEFORE the cycle runs: every outcome arm — Ok,
+    /// ParseFailure, Err, even a panic — inherits the stamp, so the
+    /// "no outcome arm can produce a faster-than-documented retry
+    /// cadence" quantifier is witnessed by sequencing, not by per-arm
+    /// bookkeeping. Shadow (dry-run) cycles MUST NOT call this: a dry
+    /// run never defers the live collection cadence.
+    pub(crate) async fn stamp_attempt(&mut self) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE gc_collect_state SET last_attempt_at = now(), updated_at = now() \
+             WHERE singleton",
+        )
+        .execute(&mut **self.lock.conn())
+        .await?;
+        Ok(())
     }
 
     // r[impl store.gc.collect-cadence]
