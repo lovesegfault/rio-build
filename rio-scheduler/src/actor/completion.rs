@@ -10,7 +10,7 @@
 /// `None`+`Some` pair as 2 "distinct nodes" and self-corroborated
 /// into the uncharged Paced lane). Binding-less evidence rides ONLY
 /// the scheduler's own store-health leg, never the node count.
-// r[impl sched.retry.store-degraded-uncharged+3]
+// r[impl sched.retry.store-degraded-uncharged+4]
 pub(super) fn note_store_degraded_sighting(
     sightings: &mut std::collections::HashMap<String, std::time::Instant>,
     node: Option<String>,
@@ -3166,7 +3166,7 @@ impl DagActor {
         // The exemption predicate (promoted-or-CONCURRENT_PUTPATH) lives
         // in `classify()` — the single append-time classifier — so the
         // row's class is what the fold charges.
-        // r[impl sched.retry.store-degraded-uncharged+3]
+        // r[impl sched.retry.store-degraded-uncharged+4]
         // bug_408: the flagged report classifies as the dedicated
         // pacing class — the kernel fold advances only the derivation
         // backoff (no count budget, no exclusion, never poison), so
@@ -3357,7 +3357,7 @@ impl DagActor {
                           "infrastructure failure: reset_to_ready failed, skipping");
                     return FailureHandling::Handled;
                 }
-                // r[impl sched.retry.store-degraded-uncharged+3]
+                // r[impl sched.retry.store-degraded-uncharged+4]
                 // bug_408: the flagged class is the ONE infra shape
                 // that does NOT requeue immediately — the fold computed
                 // the pacing deadline from the count within the trailing

@@ -1539,7 +1539,7 @@ pub fn decide<Id: Ord + Clone>(
     let fleet = FleetView::default();
     let mut counters = initial;
     let mut verdict = Verdict::Requeue;
-    // r[impl sched.retry.store-degraded-uncharged+3]
+    // r[impl sched.retry.store-degraded-uncharged+4]
     // bug_408: the store-degraded count within the trailing
     // bounded-uncharged run. Pure pacing — drives ONLY the backoff
     // curve; reset by any folded event OUTSIDE the bounded-uncharged
@@ -1555,32 +1555,39 @@ pub fn decide<Id: Ord + Clone>(
         // thresholds, never contribute an exclusion key, and never
         // reset anything. They are folded by `materialization_decide`
         // instead.
-        if row.kind == AttemptKind::Materialization {
-            continue;
-        }
-        // bug_408: store-degraded rows are pacing, not charges. No
-        // `AttemptEvent` exists for the class (`row_to_event` answers
-        // `None`), so `apply()` structurally cannot charge it; the
-        // verdict stays whatever the charged history decided, and only
-        // the backoff advances — wait out the outage at the curve's
-        // cap (`sched.retry.attempts-bounded+4`'s pacing carve-out).
-        if row.event_kind == AttemptEventKind::Attempt
-            && row.outcome_class == OutcomeClass::StoreDegraded
-        {
-            let until = row
-                .at
-                .saturating_add(budget.backoff_secs(store_degraded_run));
-            counters.backoff_until = Some(match counters.backoff_until {
-                Some(b) if b > until => b,
-                _ => until,
-            });
-            store_degraded_run = store_degraded_run.saturating_add(1);
-            continue;
+        // bug_182: ONE run law for the pacing fold and the admission
+        // scan — `run_step` (derived from the BOUNDED_UNCHARGED
+        // registry) decides skip/pace/extend/break BEFORE the event
+        // mapping, so rows that fold to no event (Cascade,
+        // FleetExhaust, controller-reported rows) still break the run
+        // exactly as the admission scan sees them.
+        match run_step(row, OutcomeClass::StoreDegraded) {
+            // The kind partition (design §2.5): materialization-kind
+            // rows are invisible to every build budget — folded by
+            // `materialization_decide` instead.
+            RunStep::LaneSkip => continue,
+            // bug_408: store-degraded rows are pacing, not charges.
+            // No `AttemptEvent` exists for the class (`row_to_event`
+            // answers `None`), so `apply()` structurally cannot
+            // charge it; only the backoff advances — wait out the
+            // outage at the curve's cap
+            // (`sched.retry.attempts-bounded+5`'s pacing carve-out).
+            RunStep::Pace => {
+                let until = row
+                    .at
+                    .saturating_add(budget.backoff_secs(store_degraded_run));
+                counters.backoff_until = Some(match counters.backoff_until {
+                    Some(b) if b > until => b,
+                    _ => until,
+                });
+                store_degraded_run = store_degraded_run.saturating_add(1);
+                continue;
+            }
+            // A sibling bounded-uncharged row extends the run.
+            RunStep::Extend => {}
+            RunStep::Break => store_degraded_run = 0,
         }
         if let Some(ev) = row_to_event(row) {
-            if !is_bounded_uncharged_row(row) {
-                store_degraded_run = 0;
-            }
             verdict = apply(&mut counters, &ev, budget, &fleet);
         }
     }
@@ -1957,7 +1964,7 @@ pub fn admit_worker_abort<Id>(rows: &[LedgerRow<Id>], bound: u32) -> WorkerAbort
 /// uncharged rows extend the scan without advancing this count.
 /// Signed: bughunt-2 §5-S Q5 (2026-06-04, the bound and its value);
 /// bughunt-3 §5 Q1 (2026-06-07, the union-run composition).
-// r[impl sched.retry.store-degraded-uncharged+3]
+// r[impl sched.retry.store-degraded-uncharged+4]
 pub const STORE_DEGRADED_FREE_RUN: u32 = 12;
 
 /// The single source of truth for UNCHARGED outcome classes and their
@@ -2011,7 +2018,7 @@ pub const BOUNDED_UNCHARGED: &[(OutcomeClass, u32)] = &[
 /// controller row, a reset) breaks the run — the unbounded-mint
 /// signature is a run of uncharged flagged reports with nothing
 /// charged happening to the lane.
-// r[impl sched.retry.store-degraded-uncharged+3]
+// r[impl sched.retry.store-degraded-uncharged+4]
 pub fn admit_store_degraded<Id>(rows: &[LedgerRow<Id>], bound: u32) -> WorkerAbortAdmission {
     admit_bounded_uncharged(rows, OutcomeClass::StoreDegraded, bound)
 }
@@ -2025,13 +2032,61 @@ pub fn admit_store_degraded<Id>(rows: &[LedgerRow<Id>], bound: u32) -> WorkerAbo
 /// class joins the union — and therefore EXTENDS every existing
 /// class's run scan instead of breaking it — by construction, with no
 /// per-admission edit to forget.
-// r[impl sched.retry.store-degraded-uncharged+3]
+// r[impl sched.retry.store-degraded-uncharged+4]
 // r[impl sched.attempt.worker-abort-bounded+2]
 pub fn is_bounded_uncharged_row<Id>(r: &LedgerRow<Id>) -> bool {
     r.kind == AttemptKind::Build
         && r.event_kind == AttemptEventKind::Attempt
         && r.reporting_party == ReportingParty::Worker
         && BOUNDED_UNCHARGED.iter().any(|(c, _)| *c == r.outcome_class)
+}
+
+/// One step of the bounded-uncharged RUN LAW, classified for BOTH
+/// consumers (bug_182, bughunt-4): [`decide`]'s pacing fold and the
+/// admission scan ([`trailing_uncharged_class_count`]) consume THIS
+/// single classifier, so the run semantics structurally cannot fork
+/// again. Pre-fix the fold's reset was gated on
+/// `row_to_event().is_some()` — Cascade/`FleetExhaust` rows (folded
+/// to no event) broke the admission scan but not the pacing run, so
+/// a post-break store-degraded report was admitted fresh while paced
+/// at the dead run's cap. The signed union-run law (round-3 §5-S Q1)
+/// names ONE run; this is it.
+// r[impl sched.retry.store-degraded-uncharged+4]
+// r[impl sched.attempt.worker-abort-bounded+2]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunStep {
+    /// Not a build-lane row (the kind partition): invisible to the
+    /// run — neither extends nor breaks it.
+    LaneSkip,
+    /// The paced class's own row inside the union template: advances
+    /// that class's count (and the pacing curve).
+    Pace,
+    /// A SIBLING bounded-uncharged row: extends the run without
+    /// advancing the paced class's count.
+    Extend,
+    /// A build-lane row outside the union template — charged
+    /// classifications, controller rows (Cascade/FleetExhaust
+    /// included, folded or not), resets: breaks the run.
+    Break,
+}
+
+/// Classify one ledger row against the run law for `paced_class`.
+/// Derived from [`is_bounded_uncharged_row`] (and through it from the
+/// [`BOUNDED_UNCHARGED`] registry), so a future uncharged class joins
+/// BOTH consumers' run semantics by construction.
+// r[impl sched.retry.store-degraded-uncharged+4]
+pub fn run_step<Id>(r: &LedgerRow<Id>, paced_class: OutcomeClass) -> RunStep {
+    if r.kind != AttemptKind::Build {
+        return RunStep::LaneSkip;
+    }
+    if !is_bounded_uncharged_row(r) {
+        return RunStep::Break;
+    }
+    if r.outcome_class == paced_class {
+        RunStep::Pace
+    } else {
+        RunStep::Extend
+    }
 }
 
 /// Count `class` rows within the trailing bounded-uncharged union run:
@@ -2042,14 +2097,13 @@ pub fn is_bounded_uncharged_row<Id>(r: &LedgerRow<Id>) -> bool {
 pub fn trailing_uncharged_class_count<Id>(rows: &[LedgerRow<Id>], class: OutcomeClass) -> u32 {
     let mut count: u32 = 0;
     for r in rows.iter().rev() {
-        if r.kind != AttemptKind::Build {
-            continue;
-        }
-        if !is_bounded_uncharged_row(r) {
-            break;
-        }
-        if r.outcome_class == class {
-            count += 1;
+        // bug_182: the same classifier the pacing fold consumes — the
+        // run semantics have exactly one executable source.
+        match run_step(r, class) {
+            RunStep::LaneSkip => continue,
+            RunStep::Break => break,
+            RunStep::Pace => count += 1,
+            RunStep::Extend => {}
         }
     }
     count
@@ -2269,7 +2323,7 @@ pub fn classify(event: &ObservedFailure<'_>, floor: FloorOutcomeView) -> Outcome
         ObservedFailure::ControllerDeadlineExceeded => OutcomeClass::Timeout,
         ObservedFailure::BackstopTimeout => OutcomeClass::Backstop,
         ObservedFailure::UnreportedCrash => OutcomeClass::ExecutorCrash,
-        // r[impl sched.retry.store-degraded-uncharged+3]
+        // r[impl sched.retry.store-degraded-uncharged+4]
         ObservedFailure::WorkerStoreDegraded => OutcomeClass::StoreDegraded,
     }
 }
@@ -2531,7 +2585,7 @@ mod tests {
     /// to exhaustion without a single charged fallthrough — the
     /// unbounded uncharged-requeue mint both signed bounds exist to
     /// close.
-    // r[verify sched.retry.store-degraded-uncharged+3]
+    // r[verify sched.retry.store-degraded-uncharged+4]
     // r[verify sched.attempt.worker-abort-bounded+2]
     #[test]
     fn bounded_uncharged_classes_compose_under_alternation() {
@@ -2587,7 +2641,7 @@ mod tests {
     /// bounded-uncharged row EXTENDS the trailing run without advancing
     /// the other class's count; only rows outside the union (charged,
     /// controller, reset) break it.
-    // r[verify sched.retry.store-degraded-uncharged+3]
+    // r[verify sched.retry.store-degraded-uncharged+4]
     // r[verify sched.attempt.worker-abort-bounded+2]
     #[test]
     fn bounded_uncharged_union_extension_table() {
@@ -2640,6 +2694,56 @@ mod tests {
         assert_eq!(
             admit_store_degraded(&[degraded(1), degraded(2), infra(3), degraded(4)], 2),
             Uncharged
+        );
+    }
+
+    /// bug_182 (bughunt-4): the fold's pacing run and the admission
+    /// scan consume ONE run classifier — a Cascade row (folded to no
+    /// event by `row_to_event`) breaks the run for BOTH. Pre-fix the
+    /// reset lived inside `row_to_event().is_some()`, so Cascade/
+    /// FleetExhaust rows broke the admission scan but not the fold:
+    /// the post-break SD report was admitted fresh but paced at the
+    /// old run's cap.
+    // r[verify sched.retry.store-degraded-uncharged+4]
+    #[test]
+    fn cascade_breaks_pacing_run_and_admission_alike() {
+        let budget = Budget::default();
+        let sd = |at: u64| LedgerRow {
+            event_kind: AttemptEventKind::Attempt,
+            outcome_class: OutcomeClass::StoreDegraded,
+            executor: Some("w1"),
+            reporting_party: ReportingParty::Worker,
+            floor_promoted: false,
+            floor_at_cap: false,
+            resubmit_cycle: 0,
+            at,
+            kind: AttemptKind::Build,
+        };
+        let cascade = |at: u64| LedgerRow {
+            outcome_class: OutcomeClass::Cascade,
+            reporting_party: ReportingParty::Controller,
+            executor: None,
+            ..sd(at)
+        };
+        let mut history: Vec<LedgerRow<&str>> = (0..11).map(|i| sd(i)).collect();
+        history.push(cascade(100));
+        history.push(sd(10_000));
+
+        // The admission scan sees the trailing run broken at the
+        // Cascade row: exactly ONE store-degraded row counts.
+        assert_eq!(
+            trailing_uncharged_class_count(&history, OutcomeClass::StoreDegraded),
+            1
+        );
+
+        // The fold must agree: the post-break row paces FRESH —
+        // backoff_secs(0), not the pre-break run's cap.
+        let d = decide(&history, &budget, 10_001);
+        assert_eq!(
+            d.backoff_until,
+            Some(10_000 + budget.backoff_secs(0)),
+            "the post-Cascade store-degraded row must pace a fresh run \
+             (one run law for fold and admission)"
         );
     }
 
@@ -3599,7 +3703,7 @@ mod proofs {
     /// the four messages (52 bytes) plus the 28-byte marker; without an
     /// explicit bound CBMC keeps unwinding the search/compare loops far
     /// past anything the concrete messages can reach.
-    // r[verify sched.retry.store-degraded-uncharged+3]
+    // r[verify sched.retry.store-degraded-uncharged+4]
     /// bug_408: a history whose ATTEMPT rows are all build-lane
     /// store-degraded (reset rows and materialization-kind rows may
     /// interleave freely) charges nothing — every count counter zero,
@@ -4069,7 +4173,7 @@ mod proofs {
     /// close PRESERVES it. Boundedness by induction under adversarial
     /// interleaving — the worker-supplied unbounded mint stays closed
     /// when the classes compose.
-    // r[verify sched.retry.store-degraded-uncharged+3]
+    // r[verify sched.retry.store-degraded-uncharged+4]
     #[kani::proof]
     #[kani::unwind(7)]
     fn check_store_degraded_admission_bounded() {
@@ -4111,8 +4215,46 @@ mod proofs {
     /// or ANY adversarial interleaving — therefore reaches
     /// `ChargedFallthrough` in bounded admissions; the pre-fix mutual
     /// reset made this length unbounded.
-    // r[verify sched.retry.store-degraded-uncharged+3]
+    // r[verify sched.retry.store-degraded-uncharged+4]
     // r[verify sched.attempt.worker-abort-bounded+2]
+    /// bug_182 (bughunt-4 S5b): the run law has ONE executable source.
+    /// Over the FULL generated row alphabet, [`run_step`]'s partition
+    /// maps exactly onto the registry predicate both consumers used to
+    /// reach separately: LaneSkip ⟺ non-build kind; Break ⟺ build-lane
+    /// row outside the union (INCLUDING rows the fold maps to no
+    /// event — Cascade/FleetExhaust, the pre-fix hole); Pace/Extend
+    /// partition union membership by the paced class. Any future
+    /// divergence between the pacing fold and the admission scan is
+    /// therefore a compile-time impossibility (both call `run_step`)
+    /// and this proof pins the classifier itself to the registry.
+    // r[verify sched.retry.store-degraded-uncharged+4]
+    #[kani::proof]
+    fn check_run_step_registry_consistency() {
+        let r = any_row(8);
+        let paced = OutcomeClass::StoreDegraded;
+        let step = run_step(&r, paced);
+        assert!((step == RunStep::LaneSkip) == (r.kind != AttemptKind::Build));
+        if r.kind == AttemptKind::Build {
+            let member = is_bounded_uncharged_row(&r);
+            assert!((step == RunStep::Break) == !member);
+            if member {
+                assert!((step == RunStep::Pace) == (r.outcome_class == paced));
+                assert!((step == RunStep::Extend) == (r.outcome_class != paced));
+            }
+            // The exact bug_182 hole, pinned: a build-lane row that
+            // folds to NO event and sits outside the union (Cascade,
+            // FleetExhaust, controller-reported classes) MUST break.
+            if row_to_event(&r).is_none() && !member {
+                assert!(step == RunStep::Break);
+            }
+        }
+        // Reachability covers: every arm of the partition is live.
+        kani::cover!(step == RunStep::LaneSkip);
+        kani::cover!(step == RunStep::Pace);
+        kani::cover!(step == RunStep::Extend);
+        kani::cover!(step == RunStep::Break);
+    }
+
     #[kani::proof]
     #[kani::unwind(7)]
     fn check_bounded_uncharged_union_composition() {

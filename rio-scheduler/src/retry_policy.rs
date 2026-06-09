@@ -143,7 +143,7 @@ pub(crate) fn admit_worker_abort(
     rio_retry_kernel::admit_worker_abort(&rows, rio_retry_kernel::WORKER_ABORT_FREE_CLOSES)
 }
 
-// r[impl sched.retry.store-degraded-uncharged+3]
+// r[impl sched.retry.store-degraded-uncharged+4]
 /// Admit one corroborated store-degraded report against the in-memory
 /// attempt history: the kernel counts the store-degraded pacing rows
 /// within the trailing bounded-uncharged UNION run (bug_098 — sibling
@@ -805,7 +805,7 @@ mod tests {
         rec(class, ReportingParty::Worker, executor, at)
     }
 
-    // r[verify sched.retry.store-degraded-uncharged+3]
+    // r[verify sched.retry.store-degraded-uncharged+4]
     /// bug_408 fold battery: N store-degraded rows ⇒ Requeue, every
     /// count counter zero, exclusion empty, never Poison; the backoff
     /// deadline follows the curve over the store-degraded count
@@ -859,7 +859,7 @@ mod tests {
     /// base — the curve escalates across the interleaving exactly as
     /// the admission counts across it. A CHARGED row still resets
     /// (the sibling test above).
-    // r[verify sched.retry.store-degraded-uncharged+3]
+    // r[verify sched.retry.store-degraded-uncharged+4]
     #[test]
     fn store_degraded_pacing_survives_uncharged_sibling() {
         let b = Budget::default(); // base 5, mult 2, cap 300

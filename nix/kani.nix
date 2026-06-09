@@ -368,7 +368,7 @@ in
     # bug_098's check_bounded_uncharged_union_composition (the
     # bounded-uncharged classes compose over the UNION trailing run:
     # membership totality + pigeonhole; signed bughunt-3 §5 Q1).
-    expectedHarnesses = 17;
+    expectedHarnesses = 18;
   };
 
   # rio-evidence-kernel: the scheduler's closure-evidence decision kernel

@@ -507,7 +507,7 @@ the only one among the failure classes (infra, timeout, disconnect, and
 backstop requeues are immediate) --- the asymmetry is recorded in the
 invariant map as a Phase-1 policy decision, not specified away here.
 
-#r("sched.retry.store-degraded-uncharged+3")[
+#r("sched.retry.store-degraded-uncharged+4")[
   An infrastructure failure carrying the builder's
   `BuildResult.store_degraded` flag
   (#rref("builder.outcome.store-degraded")) MUST be ADMITTED before it
@@ -528,8 +528,9 @@ invariant map as a Phase-1 policy decision, not specified away here.
   a poison verdict from such rows; the verdict MUST be a requeue paced
   by the derivation backoff curve computed from the store-degraded
   count within that same trailing bounded-uncharged run
-  (`backoff_until = at + backoff(count)`, reset by any folded event
-  outside the union). A NON-admitted report (uncorroborated, or at
+  (`backoff_until = at + backoff(count)`, reset by any build-lane row
+  outside the union --- folded to an event or not --- so the pacing
+  fold and the admission scan consume ONE run law). A NON-admitted report (uncorroborated, or at
   the count bound) MUST be charged as plain infrastructure --- the
   flag is worker-supplied evidence and cannot mint unbounded uncharged
   requeues, alone or composed with the sibling uncharged class.
@@ -591,6 +592,18 @@ the breaker's own evidence threshold compounded with the backoff cap.
 // sched.retry.attempts-bounded) and sched.attempt.worker-abort-bounded
 // — versions bumped at this amendment. The round-3 SIGNED block lives
 // at the BOUNDED_UNCHARGED registry doc in rio-retry-kernel/src/lib.rs.
+//
+// AMENDED 2026-06-09 (bughunt-4 S5b, recorded at this anchor per the
+// same precedent): bug_182 — the pacing clause's "reset by any folded
+// event outside the union" wording forked the run law the body's own
+// run definition states ("only a build-lane row outside the union
+// breaks it"): rows folded to NO event (Cascade, FleetExhaust,
+// controller-reported rows) broke the admission scan but not the
+// pacing fold, so a post-break store-degraded report was admitted
+// fresh while paced at the dead run's cap. The clause is re-worded to
+// the body's run definition and the kernel now derives BOTH consumers
+// from one classifier (`run_step`, rio-retry-kernel). No const, bound,
+// or admission semantics change; rule bumped +3 -> +4.
 The budget values are configuration (`[retry]` / `[poison]` tables above),
 not normative numbers. The two clauses that bite: an attempt charged to no
 budget is an unbounded retry loop (the 9,748-redispatch incident, the

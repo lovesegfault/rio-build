@@ -1130,7 +1130,7 @@ module retryPolicy {
   /// extend each other's scans instead of zeroing them). Falsify
   /// twin: the retry-098-guard-vacuous calibration (guards vacuous,
   /// runs as union observers) violates this.
-  // r[verify sched.retry.store-degraded-uncharged+3]
+  // r[verify sched.retry.store-degraded-uncharged+4]
   // r[verify sched.attempt.worker-abort-bounded+2]
   val unionMintBounded =
     freeCloseRun + storeDegradedRun

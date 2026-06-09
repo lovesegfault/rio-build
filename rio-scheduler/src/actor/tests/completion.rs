@@ -6,7 +6,7 @@
 /// `Option<String>`: one node's pre-binding `None` sighting plus its
 /// later attributed `Some` sighting counted as 2 "distinct nodes" and
 /// self-corroborated into the uncharged Paced lane.
-// r[verify sched.retry.store-degraded-uncharged+3]
+// r[verify sched.retry.store-degraded-uncharged+4]
 #[test]
 fn store_degraded_mixed_unattributed_then_attributed_is_one_node() {
     use crate::actor::completion::note_store_degraded_sighting;
@@ -1529,7 +1529,7 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.retry.store-degraded-uncharged+3]
+// r[verify sched.retry.store-degraded-uncharged+4]
 /// bug_408: an infra failure carrying the builder's `store_degraded`
 /// flag is UNCHARGED — driven past `max_infra_retries` (10) it never
 /// poisons, never advances `infra_count`, never excludes the node;

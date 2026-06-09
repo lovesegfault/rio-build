@@ -4988,7 +4988,7 @@ rec {
     # reports to Poisoned); the reachability pin is
     # correlatedStoreOutageRun (the fleet-correlated outage).
     # ------------------------------------------------------------------
-    # r[verify sched.retry.store-degraded-uncharged+3]
+    # r[verify sched.retry.store-degraded-uncharged+4]
     quint-retry-policy-pull-store-degraded = mkQuintCheck {
       name = "retry-policy-pull-store-degraded";
       # quint-policy P1 exemptions (bughunt-2 slot 11; §5-Q13 — the
@@ -5092,7 +5092,7 @@ rec {
     # reachable — the union law genuinely composes the classes (the
     # pre-fix mutual reset made this state unreachable, which is why
     # per-class checks could never see the composition hole).
-    # r[verify sched.retry.store-degraded-uncharged+3]
+    # r[verify sched.retry.store-degraded-uncharged+4]
     # r[verify sched.attempt.worker-abort-bounded+2]
     quint-retry-policy-pull-witness-composed-runs = mkQuintWitnessCheck {
       name = "retry-policy-pull-witness-composed-runs";
@@ -5110,7 +5110,7 @@ rec {
     # pure same-class corner is owned by retry-032 and the kernel
     # decision tables). unionMintBounded MUST violate: seven uncharged
     # closes in one bounded-uncharged run.
-    # r[verify sched.retry.store-degraded-uncharged+3]
+    # r[verify sched.retry.store-degraded-uncharged+4]
     # r[verify sched.attempt.worker-abort-bounded+2]
     quint-retry-policy-pull-calib-098-guard-vacuous = mkQuintWitnessCheck {
       name = "retry-policy-pull-calib-098-guard-vacuous";
