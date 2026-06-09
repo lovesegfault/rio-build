@@ -472,3 +472,152 @@ async fn test_read_error_cancels_active_builds() -> anyhow::Result<()> {
     sched_handle.abort();
     Ok(())
 }
+
+// r[verify gw.conn.cancel-on-disconnect+3]
+/// RED (bug_319): `writer.flush().await?` after a successful opcode
+/// was a SEVENTH Err-propagating session exit with no
+/// `cancel_active_builds` — directly under a totality comment that
+/// said "ALL six exits". A response-flush failure (client dropped
+/// right as the opcode completed) leaked the active build until the
+/// scheduler's orphan backstop. The typed `SessionExit` makes the
+/// chokepoint total: the inner loop cannot return without a variant,
+/// and every variant cancels.
+///
+/// Mechanics: scripted reader serves the 1.35 handshake + one
+/// `wopSetOptions`, then parks. The gated writer counts flushes —
+/// the 1.35 handshake flushes 3× (magic+version, version-string,
+/// STDERR_LAST), the SetOptions handler's `finish()` is #4, and the
+/// post-opcode session flush is #5: exactly that one fails.
+#[tokio::test(flavor = "current_thread")]
+async fn test_post_opcode_flush_error_cancels_active_builds() -> anyhow::Result<()> {
+    use rio_gateway::handler::SessionContext;
+    use rio_gateway::session::run_protocol_loop;
+    use rio_test_support::grpc::spawn_mock_store;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    common::init_test_logging();
+
+    let (_store, store_addr, store_handle) = spawn_mock_store().await?;
+    let (sched, sched_addr, sched_handle) = spawn_mock_scheduler().await?;
+    let store_client = rio_proto::client::connect_single(&store_addr.to_string()).await?;
+    let log_client: rio_proto::LogServiceClient<_> =
+        rio_proto::client::connect_single(&store_addr.to_string()).await?;
+    let scheduler_client = rio_proto::client::connect_single(&sched_addr.to_string()).await?;
+
+    let mut ctx = SessionContext::new(
+        store_client,
+        log_client,
+        scheduler_client,
+        None,
+        rio_gateway::handler::SessionJwt::none(),
+        None,
+        rio_gateway::TenantLimiter::disabled(),
+        rio_gateway::QuotaCache::new(),
+    );
+    ctx.active_build_ids
+        .insert("leaked-on-flush-err".to_string());
+
+    /// Reader that yields `bytes`, then parks (Pending) — the loop
+    /// must exit via the flush error, never via this reader.
+    struct ThenPark {
+        bytes: Vec<u8>,
+    }
+    impl AsyncRead for ThenPark {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.bytes.is_empty() {
+                return Poll::Pending;
+            }
+            let n = buf.remaining().min(self.bytes.len());
+            buf.put_slice(&self.bytes[..n]);
+            self.bytes.drain(..n);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Writer that swallows bytes and fails exactly the `fail_at`-th
+    /// successful-or-failing flush (1-indexed).
+    struct FlushFailsAt {
+        flushes: usize,
+        fail_at: usize,
+    }
+    impl AsyncWrite for FlushFailsAt {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.flushes += 1;
+            if self.flushes == self.fail_at {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "simulated client drop at response flush",
+                )));
+            }
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    // Handshake (1.35: no features exchange, no obsolete reads
+    // beyond the fixed pair) + one complete wopSetOptions.
+    let mut bytes = Vec::new();
+    wire::write_u64(&mut bytes, WORKER_MAGIC_1).await?;
+    wire::write_u64(&mut bytes, 0x123).await?; // 1.35
+    wire::write_u64(&mut bytes, 0).await?; // cpu_affinity
+    wire::write_u64(&mut bytes, 0).await?; // reserve_space
+    wire::write_u64(&mut bytes, 19).await?; // wopSetOptions
+    for _ in 0..12 {
+        wire::write_u64(&mut bytes, 0).await?; // the fixed option fields
+    }
+    wire::write_u64(&mut bytes, 0).await?; // overrides: empty pairs
+
+    let mut reader = ThenPark { bytes };
+    let mut writer = FlushFailsAt {
+        flushes: 0,
+        fail_at: 5,
+    };
+    let shutdown = rio_common::signal::Token::new();
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        run_protocol_loop(&mut reader, &mut writer, &mut ctx, shutdown.child_token()),
+    )
+    .await
+    .expect("the flush error must exit the loop, not hang on the parked reader");
+
+    assert!(
+        result.is_err(),
+        "a response-flush failure propagates as Err"
+    );
+
+    // THE assertion. Pre-fix: 0 cancels (the bare `?` skipped the
+    // cancel contract). Post-fix: exactly one, attributed to the
+    // client going away.
+    let cancels = sched.cancel_calls.read().unwrap().clone();
+    assert_eq!(
+        cancels.len(),
+        1,
+        "a post-opcode flush failure with non-empty active_build_ids must \
+         send CancelBuild; got: {cancels:?}"
+    );
+    assert_eq!(cancels[0].0, "leaked-on-flush-err");
+    assert_eq!(cancels[0].1, "client_disconnect");
+
+    store_handle.abort();
+    sched_handle.abort();
+    Ok(())
+}

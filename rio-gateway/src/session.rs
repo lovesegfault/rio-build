@@ -21,9 +21,14 @@ use crate::ratelimit::TenantLimiter;
 
 /// Best-effort cancel of all builds tracked in `active_build_ids`.
 ///
-/// Called from three session-exit paths, all converging here so
-/// `r[gw.conn.cancel-on-disconnect]` holds regardless of which wins the
-/// race on TCP RST:
+/// Called from EXACTLY ONE place — the typed-exit chokepoint in
+/// [`run_protocol_loop`] (bug_319) — so
+/// `r[gw.conn.cancel-on-disconnect]` holds on EVERY path out of the
+/// protocol loop by construction, not by per-arm enumeration. The
+/// historical exit shapes (each now a [`SessionExit`] variant; the
+/// chokepoint also covers idle-timeout, the post-opcode flush
+/// failure that falsified the old 'ALL six exits' enumeration, and
+/// the handshake-phase ends):
 ///
 /// 1. **Between-opcode EOF** — client sent clean EOF while we waited for
 ///    the next opcode; `wire::read_u64` returns `UnexpectedEof`.
@@ -197,20 +202,111 @@ where
     run_protocol_loop(reader, writer, &mut ctx, shutdown).await
 }
 
+/// Every way out of the protocol loop, typed (bug_319).
+///
+/// The inner loop returns THIS — not `anyhow::Result` — so a bare `?`
+/// does not typecheck inside it: a NEW exit path must mint (or reuse)
+/// a variant, and the single chokepoint in [`run_protocol_loop`] maps
+/// every variant to its cancel-on-disconnect obligation through an
+/// exhaustive match. The pre-fix shape enumerated cancel calls
+/// per-arm and documented "ALL six exits" — while the post-opcode
+/// `writer.flush().await?` was a SEVENTH, leaking active builds on a
+/// response-flush failure. The 'all exits cancel' sentence is now
+/// carried by the compiler, not by a comment.
+enum SessionExit {
+    /// Clean pre-build end: pre-handshake shutdown, handshake
+    /// timeout, or a delivered version rejection. The build map is
+    /// empty by construction on these paths; the chokepoint sweep
+    /// still runs (defense-in-depth, no-op on an empty map).
+    Clean,
+    /// The handshake phase ended in an error the caller must see
+    /// (protocol garbage, or the version-rejection write itself
+    /// failed).
+    HandshakeFailed(anyhow::Error),
+    /// russh channel-close / graceful-shutdown token observed.
+    ChannelClose,
+    /// No opcode arrived inside the idle bound.
+    IdleTimeout,
+    /// Clean client EOF between opcodes.
+    ClientEof,
+    /// Opcode-read wire error (ConnectionReset, malformed wire, ...).
+    ReadError(anyhow::Error),
+    /// `handle_opcode` returned `Err` (typically `BrokenPipe` on a
+    /// response write mid-build).
+    HandlerError(anyhow::Error),
+    /// The post-opcode response flush failed — bug_319's seventh
+    /// exit, previously a bare `?` with no cancel.
+    FlushError(std::io::Error),
+}
+
 /// Handshake + opcode loop. [`run_protocol`] constructs a fresh
 /// [`SessionContext`] and delegates here; tests that need a pre-seeded
 /// context (e.g. non-empty `active_build_ids` to exercise a cancel path)
 /// build the context themselves and call this directly. Both entry points
 /// run IDENTICAL code from this line on — the split exists purely so the
-/// four exit-path cancel contracts can be regression-tested without
+/// exit-path cancel contracts can be regression-tested without
 /// having to drive a full build opcode into the exact state that leaves
 /// a build_id in the map between opcodes.
+///
+/// THE cancel chokepoint (bug_319): the typed inner loop cannot
+/// return without choosing a [`SessionExit`] variant, and this
+/// function's exhaustive match runs `cancel_active_builds` on every
+/// one of them — an exit path that skips the cancel contract does
+/// not typecheck.
+// r[impl gw.conn.cancel-on-disconnect+3]
 pub async fn run_protocol_loop<R, W>(
     reader: &mut R,
     writer: &mut W,
     ctx: &mut SessionContext,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin,
+{
+    let exit = protocol_loop_inner(reader, writer, ctx, &shutdown).await;
+    let reason = match &exit {
+        SessionExit::ChannelClose => "channel_close",
+        SessionExit::IdleTimeout => "idle_timeout",
+        // `biased` selects prefer the token arm when both are Ready on
+        // the SAME poll, but ChannelSession::Drop fires cancel() then
+        // breaks the pipe — if those land between the token-poll and
+        // the handler's synchronous BrokenPipe within ONE poll cycle,
+        // the handler-Err exit carries a stale attribution. Re-check
+        // here so the reason string stays accurate regardless of which
+        // arm raced ahead.
+        SessionExit::HandlerError(_) if shutdown.is_cancelled() => "channel_close",
+        SessionExit::Clean
+        | SessionExit::HandshakeFailed(_)
+        | SessionExit::ClientEof
+        | SessionExit::ReadError(_)
+        | SessionExit::HandlerError(_)
+        | SessionExit::FlushError(_) => "client_disconnect",
+    };
+    // Unconditional: cheap on an empty map, and the Clean/handshake
+    // variants are exactly the defense-in-depth sweeps the old
+    // per-arm shape could not express.
+    cancel_active_builds(ctx, reason).await;
+    match exit {
+        SessionExit::Clean
+        | SessionExit::ChannelClose
+        | SessionExit::IdleTimeout
+        | SessionExit::ClientEof => Ok(()),
+        SessionExit::HandshakeFailed(e)
+        | SessionExit::ReadError(e)
+        | SessionExit::HandlerError(e) => Err(e),
+        SessionExit::FlushError(e) => Err(e.into()),
+    }
+}
+
+/// The protocol loop body. Returns [`SessionExit`] — see its doc for
+/// why a bare `?` out of here is unrepresentable.
+async fn protocol_loop_inner<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    ctx: &mut SessionContext,
+    shutdown: &CancellationToken,
+) -> SessionExit
 where
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin,
@@ -225,7 +321,7 @@ where
         biased;
         () = shutdown.cancelled() => {
             debug!("channel closed before handshake (graceful shutdown signal)");
-            return Ok(());
+            return SessionExit::Clean;
         }
         r = tokio::time::timeout(
             handshake_timeout,
@@ -237,7 +333,7 @@ where
         Err(_elapsed) => {
             metrics::counter!("rio_gateway_handshakes_total", "result" => "timeout").increment(1);
             warn!(timeout = ?handshake_timeout, "handshake timeout: no WORKER_MAGIC_1 received");
-            return Ok(());
+            return SessionExit::Clean;
         }
     };
     match handshake_result {
@@ -267,18 +363,23 @@ where
                 "rejecting client: protocol version too old"
             );
             let mut stderr = StderrWriter::new(&mut *writer);
-            stderr
+            if let Err(e) = stderr
                 .error(&StderrError::simple(
                     "rio-gateway",
                     format!("rio-gateway requires Nix protocol version 1.35+, client sent {client_major}.{client_minor}"),
                 ))
-                .await?;
-            return Ok(());
+                .await
+            {
+                // The rejection could not be delivered — the caller
+                // sees the error; the build map is empty either way.
+                return SessionExit::HandshakeFailed(e.into());
+            }
+            return SessionExit::Clean;
         }
         Err(e) => {
             metrics::counter!("rio_gateway_handshakes_total", "result" => "failure").increment(1);
             warn!(error = %e, "handshake failed");
-            return Err(anyhow::anyhow!("handshake failed: {e}"));
+            return SessionExit::HandshakeFailed(anyhow::anyhow!("handshake failed: {e}"));
         }
     }
 
@@ -300,8 +401,7 @@ where
             biased;
             () = shutdown.cancelled() => {
                 debug!("channel closed (graceful shutdown signal)");
-                cancel_active_builds(ctx, "channel_close").await;
-                return Ok(());
+                return SessionExit::ChannelClose;
             }
             r = tokio::time::timeout(OPCODE_IDLE_TIMEOUT, wire::read_u64(reader)) => r,
         };
@@ -326,8 +426,7 @@ where
                 // remove on completion), but this is the defense-in-depth
                 // for future handler changes that leave entries between
                 // opcodes. Cheap when empty (one .keys() on empty map).
-                cancel_active_builds(ctx, "idle_timeout").await;
-                return Ok(());
+                return SessionExit::IdleTimeout;
             }
             Ok(Err(wire::WireError::Io(e))) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 // Between-opcode disconnect: client sent EOF while we were
@@ -335,8 +434,7 @@ where
                 // is usually empty here (handlers remove on completion) —
                 // this catches abnormal handler exits that left an entry.
                 debug!("client disconnected (EOF)");
-                cancel_active_builds(ctx, "client_disconnect").await;
-                return Ok(());
+                return SessionExit::ClientEof;
             }
             Ok(Err(e)) => {
                 // Non-EOF read error (ConnectionReset, malformed wire,
@@ -346,8 +444,7 @@ where
                 // paths, not five.
                 metrics::counter!("rio_gateway_errors_total", "type" => "wire_read").increment(1);
                 error!(error = %e, "error reading opcode");
-                cancel_active_builds(ctx, "client_disconnect").await;
-                return Err(e.into());
+                return SessionExit::ReadError(e.into());
             }
         };
 
@@ -365,8 +462,7 @@ where
             biased;
             () = shutdown.cancelled() => {
                 debug!("shutdown signal during handle_opcode");
-                cancel_active_builds(ctx, "channel_close").await;
-                return Ok(());
+                return SessionExit::ChannelClose;
             }
             r = handler::handle_opcode(opcode, reader, writer, ctx) => r,
         };
@@ -375,28 +471,19 @@ where
             // on a response write (client dropped during wopBuildDerivation
             // or wopBuildPathsWithResults). The build handler leaves the
             // build_id in active_build_ids on StreamProcessError::Wire
-            // (see handler/build.rs) specifically so we can cancel here.
-            //
-            // Without this, the ? propagated straight out and the EOF arm
-            // above was never reached — it only catches opcode-READ errors,
-            // not handler-execution errors. P0331.
-            //
-            // `biased` above prefers the token arm when both are Ready on
-            // the SAME poll, but ChannelSession::Drop fires cancel() then
-            // breaks the pipe — if those land between the token-poll and
-            // the handler's synchronous BrokenPipe within ONE poll cycle,
-            // the Err arm fires with the token already cancelled. Re-check
-            // here so the reason string stays accurate regardless of which
-            // arm raced ahead.
-            let reason = if shutdown.is_cancelled() {
-                "channel_close"
-            } else {
-                "client_disconnect"
-            };
-            cancel_active_builds(ctx, reason).await;
-            return Err(e);
+            // (see handler/build.rs) specifically so the chokepoint can
+            // cancel. The channel_close-vs-client_disconnect attribution
+            // re-check lives at the chokepoint (P0331 lineage).
+            return SessionExit::HandlerError(e);
         }
 
-        writer.flush().await?;
+        // bug_319: this flush was the SEVENTH Err-propagating exit —
+        // a bare `?` past a totality comment that said "ALL six". The
+        // typed exit routes it through the same chokepoint as every
+        // other path; a response-flush failure now cancels the
+        // client's active builds like any other disconnect.
+        if let Err(e) = writer.flush().await {
+            return SessionExit::FlushError(e);
+        }
     }
 }
