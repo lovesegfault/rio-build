@@ -32,6 +32,7 @@
 
 mod consolidate;
 mod cover;
+mod evidence;
 pub(crate) mod ffd;
 mod health;
 #[cfg(test)]
@@ -69,52 +70,7 @@ pub use ffd::{
 };
 pub use sketch::{CapacityType, Cell, CellSketches, CellState};
 
-/// Scheduler-bound evidence from kube-only observation
-/// (merged_bug_007). The producer edges are consume-once, so a value
-/// of this type must never be dropped — `#[must_use]` turns the old
-/// `let _ =` discard into a deny-warnings error; ticks that cannot
-/// ship it merge it into the reconciler's buffer instead.
-#[must_use = "kube-only evidence is consume-once: merge it into pending_evidence (shipped from the buffer, cleared only on Ack-Ok)"]
-#[derive(Debug, Default)]
-pub(crate) struct PendingSchedulerEvidence {
-    /// Cells whose NodeClaim reached `Registered=True` (the ICE-clear
-    /// signal). `BTreeSet`: dedup across merged ticks + deterministic
-    /// wire order.
-    pub(crate) registered_cells: std::collections::BTreeSet<Cell>,
-    /// Per-cell instance types Karpenter resolved (CostTable feed).
-    /// Deduped by full tuple on merge.
-    pub(crate) observed_types: Vec<rio_proto::types::ObservedInstanceType>,
-    /// Cells whose NodeClaim was reaped for ICE (the ICE-mark signal,
-    /// bug_082). The producers are consume-once edges — `record_reap`
-    /// fires at the instant the claim is deleted, `detect_vanished`
-    /// removes its tracking entry in the same retain that emits — so a
-    /// mark that misses its Ack is gone forever unless it lives here.
-    /// Commit-on-Ack like the sibling planes; `BTreeSet` dedups within
-    /// a request (the scheduler ladder steps once per entry). A mark
-    /// re-delivered after an ambiguous Ack timeout advances the ladder
-    /// one extra step — strictly conservative against re-minting into
-    /// a cell that provably ICE'd, and strictly better than losing the
-    /// mark.
-    pub(crate) ice_cells: std::collections::BTreeSet<Cell>,
-}
-
-impl PendingSchedulerEvidence {
-    /// Merge another tick's evidence (dedup all three planes).
-    pub(crate) fn merge(&mut self, other: PendingSchedulerEvidence) {
-        self.registered_cells.extend(other.registered_cells);
-        for o in other.observed_types {
-            if !self.observed_types.iter().any(|e| {
-                e.cell == o.cell
-                    && e.instance_type == o.instance_type
-                    && e.cores == o.cores
-                    && e.mem_bytes == o.mem_bytes
-            }) {
-                self.observed_types.push(o);
-            }
-        }
-        self.ice_cells.extend(other.ice_cells);
-    }
-}
+pub(crate) use evidence::PendingSchedulerEvidence;
 
 /// Reconcile interval. Matches the Pool reconciler's `GetSpawnIntents`
 /// poll cadence so the scheduler's `compute_spawn_intents` snapshot is
@@ -666,11 +622,12 @@ impl Default for NodeClaimPoolConfig {
 /// flags the run loop checks at the top of each tick.
 #[derive(Clone, Default)]
 pub struct ControllerLeaseHooks {
-    /// Set on `on_acquire`; run loop reloads `CellSketches` from PG
-    /// and clears `recorded_boot`/`prev_idle`/`inflight_created` so a
-    /// long-running standby that wins the lease doesn't `persist()`
-    /// stale startup-time sketches over the previous leader's
-    /// accumulated samples.
+    /// Set on `on_acquire`; run loop clears the tenure-keyed state
+    /// (`prev_idle`/`pending_evidence`/`inflight_created` on the
+    /// edge, `recorded_boot` on the reload-Ok arm) and reloads
+    /// `CellSketches` from PG so a long-running standby that wins the
+    /// lease doesn't `persist()` stale startup-time sketches over the
+    /// previous leader's accumulated samples.
     ///
     /// bug_346: a monotone ACQUISITION EPOCH, not a boolean — each
     /// `on_acquire` increments it. The reconciler tracks two cursors
@@ -707,8 +664,9 @@ impl rio_lease::LeaseHooks for ControllerLeaseHooks {
         // flag disarms the PlaceableGate (the pre-term tenure's stale
         // `queued` set must not `reap_excess_pending` the post-term
         // world), and the epoch bump re-fires the acquire edge actions
-        // (sketch reload, `prev_idle` clear, `pending_evidence` reset)
-        // exactly once — the foreign term may have moved PG and
+        // (sketch reload, `prev_idle`/`pending_evidence`/
+        // `inflight_created` clears) exactly once — the foreign term
+        // may have moved PG and
         // cluster state under us. Order is irrelevant here (the run
         // loop reads both flags at the same tick top); each is its own
         // atomic.
@@ -782,12 +740,14 @@ pub struct NodeClaimPoolReconciler {
     /// previous tenure could mask a genuinely ICE'd cell).
     pending_evidence: PendingSchedulerEvidence,
     /// bug_346: last acquisition epoch whose EDGE actions ran (the
-    /// amplify-class `prev_idle` clear + the `pending_evidence`
-    /// reset). Compared against `hooks.acquire_epoch` once per tick;
-    /// fires exactly once per acquisition.
+    /// amplify-class `prev_idle` clear, the `pending_evidence` reset,
+    /// and the `inflight_created` clear — merged_bug_004: every
+    /// tenure-keyed buffer clear rides the edge, once per
+    /// acquisition). Compared against `hooks.acquire_epoch` once per
+    /// tick; fires exactly once per acquisition.
     edge_seen_epoch: u64,
     /// bug_346: last acquisition epoch whose PG reload SUCCEEDED
-    /// (the suppress-class clears + sketch swap ride the Ok arm).
+    /// (the `recorded_boot` re-arm + sketch swap ride the Ok arm).
     /// `persist()` stays gated while this lags the epoch
     /// (latch-on-Ok-only, unchanged).
     reloaded_epoch: u64,
@@ -843,11 +803,17 @@ pub struct NodeClaimPoolReconciler {
     /// path that deletes/forgets a tracked claim without showing up
     /// here is exactly the bug_012/bug_020 shape):
     /// 1. `cover_deficit` `extend()`s the names it `create()`d.
-    /// 2. `clear()` on the lease-acquire Ok arm (suppress polarity —
-    ///    see the per-field table at the acquire match). There is NO
-    ///    config-reload clear call site (corrected 2026-06-02; the
-    ///    list previously named "the config-hash gate" — a design-era
-    ///    label that never matched the code).
+    /// 2. `clear()` on the ACQUISITION EDGE, once per tenure
+    ///    (merged_bug_004 moved it out of the reload-Ok arm: an
+    ///    Ok-arm clear destroyed tracking for claims created during
+    ///    the reload-Err retry window — their vanish then never
+    ///    emitted an ICE mark. Previous-tenure entries are dropped at
+    ///    the edge because an interim leader's deliberate reaps are
+    ///    indistinguishable from Karpenter GC standby-side — suppress
+    ///    polarity, see the per-field table at the acquire match).
+    ///    There is NO config-reload clear call site (corrected
+    ///    2026-06-02; the list previously named "the config-hash
+    ///    gate" — a design-era label that never matched the code).
     /// 3. [`health::detect_vanished`] retains in-flight, drops
     ///    registered/terminating/vanished — runs in BOTH
     ///    `reconcile_once` and `consolidate_only`.
@@ -855,7 +821,7 @@ pub struct NodeClaimPoolReconciler {
     ///    `delete()`d; both callers `remove()` them BEFORE
     ///    `detect_vanished` so the controller's own reaps aren't
     ///    misread as Karpenter GC.
-    // r[impl ctrl.nodeclaim.inflight-conservation+2]
+    // r[impl ctrl.nodeclaim.inflight-conservation+3]
     inflight_created: HashMap<String, Cell>,
     /// Count of consecutive ticks where `GetSpawnIntents` returned ⊥
     /// (RPC error). Saturates at `u8::MAX`; reset on first success.
@@ -1101,8 +1067,8 @@ impl NodeClaimPoolReconciler {
         // pre-lapse timestamp over-reaps. Clearing here makes the
         // `Err` arm under-reap by one cycle (the documented SAFE
         // direction) instead of unboundedly over-reaping.
-        // r[impl ctrl.nodeclaim.lease-edge-polarity+3]
-        // r[impl ctrl.nodeclaim.acquire-edge-token]
+        // r[impl ctrl.nodeclaim.lease-edge-polarity+4]
+        // r[impl ctrl.nodeclaim.acquire-edge-token+1]
         let epoch = self
             .hooks
             .acquire_epoch
@@ -1113,8 +1079,23 @@ impl NodeClaimPoolReconciler {
             // disabled idle consolidation for the whole PG outage:
             // every idle clock restarted every tick, so reap_idle
             // never saw a spell older than one tick).
+            //
+            // merged_bug_004: the edge — not the reload-Ok arm — owns
+            // every TENURE-keyed latched-buffer clear (one clear site
+            // per buffer). The clears below destroy previous-tenure
+            // state exactly once; anything accumulated AFTER this
+            // point — including during a reload-Err retry window,
+            // when `reconcile_once` runs degraded and both buffers
+            // legitimately fill (reap/vanish ICE marks, cover_deficit
+            // tracking) — is current-tenure and survives the eventual
+            // reload-Ok. The pre-fix Ok-arm copies of these clears
+            // could only ever destroy CURRENT-tenure state: the edge
+            // block runs first against the same `epoch` read, so by
+            // the time the Ok arm executed, previous-tenure state was
+            // already gone.
             self.prev_idle.clear();
             self.pending_evidence = PendingSchedulerEvidence::default();
+            self.inflight_created.clear();
             self.edge_seen_epoch = epoch;
         }
         if self.reloaded_epoch != epoch {
@@ -1124,19 +1105,30 @@ impl NodeClaimPoolReconciler {
                 Ok(s) => {
                     self.sketches = s;
                     self.recorded_boot.clear();
-                    self.inflight_created.clear();
-                    // suppress polarity (see the table below):
-                    // buffered evidence from a previous tenure could
-                    // ship a stale ICE-clear.
-                    self.pending_evidence = PendingSchedulerEvidence::default();
                     // `prev_extra_cells` is intentionally NOT cleared
                     // here (r41 bug_025). Per-field stale-state
                     // polarity on the lease-acquire edge:
                     //
                     //   - `recorded_boot`   suppress  → cleared in Ok arm
-                    //     (stale entry skips a record; lost sample)
-                    //   - `inflight_created` suppress → cleared in Ok arm
-                    //     (stale entry → spurious ICE-mask)
+                    //     (stale entry skips a record; lost sample).
+                    //     Ok-arm placement is correct for THIS field
+                    //     only: the clear re-arms edge DETECTION (the
+                    //     fresh sketches decide what re-edges), and a
+                    //     wrongly-destroyed entry re-creates itself on
+                    //     the next observation — bounded by the
+                    //     `observe_registered` recency gate, not lost
+                    //     evidence (contrast the two latched buffers
+                    //     below, whose producers are consume-once).
+                    //   - `inflight_created` suppress → cleared on the
+                    //     ACQUISITION EDGE, once per tenure
+                    //     (merged_bug_004; previously here in the Ok
+                    //     arm, which destroyed tracking for claims
+                    //     cover_deficit created during the reload-Err
+                    //     retry window — their later vanish then never
+                    //     emitted an ICE mark. A stale PREVIOUS-tenure
+                    //     entry → spurious ICE-mask: the interim
+                    //     leader's deliberate reaps would be misread
+                    //     as Karpenter GC — so the edge clears it).
                     //   - `prev_idle`       AMPLIFY   → cleared BEFORE the
                     //     match (stale entry inflates idle → over-reap;
                     //     r43 merged_bug_016)
@@ -1147,10 +1139,16 @@ impl NodeClaimPoolReconciler {
                     //   - `prev_unplaced_extras` CLEANUP → never cleared
                     //     (stale entry → one trailing zero-write for
                     //     `ffd_unplaced_cores`; r43 bug_026)
-                    //   - `pending_evidence` suppress → cleared above
-                    //     (a stale buffered ICE-clear from a previous
-                    //     tenure could mask a genuinely ICE'd cell;
-                    //     merged_bug_007)
+                    //   - `pending_evidence` suppress → cleared on the
+                    //     ACQUISITION EDGE (a stale buffered ICE-clear
+                    //     from a previous tenure could mask a genuinely
+                    //     ICE'd cell; merged_bug_007). merged_bug_004:
+                    //     the edge clear and the Ack-Ok consume are the
+                    //     ONLY two clear sites — a second Ok-arm clear
+                    //     here destroyed current-tenure consume-once
+                    //     evidence (ICE marks, registered-edge clears,
+                    //     observed types) buffered during reload-Err
+                    //     degraded ticks.
                     //
                     // When adding a field that holds in-memory edge
                     // state, classify its polarity here and put the
@@ -1228,15 +1226,15 @@ impl NodeClaimPoolReconciler {
                 .observe_registered(live, &mut self.recorded_boot, now);
         self.sketches
             .maybe_rotate_all(now_sys, Duration::from_secs(self.cfg.sketch_halflife_secs));
-        PendingSchedulerEvidence {
-            registered_cells: registered.into_iter().collect(),
-            observed_types: observed,
-            // The ICE-mark plane is produced by the reap path
-            // (`record_reap`/`detect_vanished`), not by kube-only
-            // observation — the reconcile bodies extend the buffer
-            // directly at the production site.
-            ice_cells: std::collections::BTreeSet::new(),
-        }
+        let mut ev = PendingSchedulerEvidence::default();
+        // The ICE-mark plane is produced by the reap path
+        // (`record_reap`/`detect_vanished`), not by kube-only
+        // observation — the reconcile bodies buffer marks at the
+        // production site via `buffer_marks` (the supersession
+        // chokepoint; merged_bug_005).
+        ev.buffer_clears(registered);
+        ev.buffer_observed_types(observed);
+        ev
     }
 
     /// One tick: poll → FFD sim → cover deficit → reap → persist.
@@ -1554,7 +1552,7 @@ impl NodeClaimPoolReconciler {
         // All reap reasons feed the wedge eviction stash (consumed by
         // the NEXT tick's update — reaps run after this tick's verdict).
         self.pending_wedge_evictions.extend(reaped_nodes);
-        // r[impl ctrl.nodeclaim.inflight-conservation+2]
+        // r[impl ctrl.nodeclaim.inflight-conservation+3]
         // r40 bug_020: drop the controller's own reaps from inflight_created
         // BEFORE detect_vanished scans, so they're not misread as Karpenter
         // GC on the next tick. (reap_idle only reaps registered claims —
@@ -1569,14 +1567,19 @@ impl NodeClaimPoolReconciler {
         // from the buffer, so a failed Ack retains them exactly like
         // the sibling planes (the producers are consume-once; a
         // dropped mark can never be re-observed).
-        self.pending_evidence.ice_cells.extend(ice_cells);
+        self.pending_evidence.buffer_marks(ice_cells);
         // Mask = the scheduler's acked view ∪ every buffered-but-
         // unacked mark: a mark the scheduler has not (provably)
         // received must still keep cover_deficit out of the cell —
         // pre-fix only the local tick's cells masked, so the tick
         // after a failed Ack re-minted into a cell that just ICE'd.
         let mut masked: Vec<String> = intents.ice_masked_cells.clone();
-        masked.extend(self.pending_evidence.ice_cells.iter().map(Cell::to_string));
+        masked.extend(
+            self.pending_evidence
+                .ice_cells()
+                .iter()
+                .map(Cell::to_string),
+        );
 
         let cover = self.cover_deficit(&unplaced, &live, &masked).await?;
         debug!(created = cover.created.len(), "deficit cover");
@@ -1704,8 +1707,8 @@ impl NodeClaimPoolReconciler {
                 .await?;
         let reaped = outcome.reaped_claims;
         self.pending_wedge_evictions.extend(outcome.reaped_nodes);
-        self.pending_evidence.ice_cells.extend(outcome.ice_cells);
-        // r[impl ctrl.nodeclaim.inflight-conservation+2]
+        self.pending_evidence.buffer_marks(outcome.ice_cells);
+        // r[impl ctrl.nodeclaim.inflight-conservation+3]
         // r[impl ctrl.nodeclaim.consolidate-only-degraded+3]
         // r40 bug_012: prune inflight_created against this tick's `live`
         // so the controller's own reaps below aren't later misread by
@@ -1718,7 +1721,7 @@ impl NodeClaimPoolReconciler {
             self.inflight_created.remove(name);
         }
         let vanished = health::detect_vanished(&mut self.inflight_created, &live);
-        self.pending_evidence.ice_cells.extend(vanished);
+        self.pending_evidence.buffer_marks(vanished);
         // FFD-derived gauges (`ffd_unplaced_cores`, `ffd_placeable_intents`)
         // need scheduler intents; live-derived gauges read only `live` +
         // `now`, both available here. Without this call, a scheduler
@@ -2196,25 +2199,33 @@ impl NodeClaimPoolReconciler {
         // idle window (and mis-attributes the next re-dispatch). One
         // Ack per tick is the cost; the old all-empty early-return
         // suppressed exactly the tick that mattered.
-        // r[impl ctrl.nodeclaim.ice-mark-clear]
-        // BTreeSet dedup (now inherent — the buffer IS a set):
+        // r[impl ctrl.nodeclaim.ice-mark-clear+1]
+        // BTreeSet dedup (inherent — the buffer IS a set):
         // `health::reap_unhealthy`/`detect_vanished` push one entry
-        // per ICE'd CLAIM (up to 8/cell/tick); the scheduler loops
-        // `mark()` per entry so duplicates would jump step 0→7 (TTL
-        // 60s→600s) on a single transient dip. Same for
-        // `registered_cells` (1 per registered CLAIM → multiple
-        // `clear()` calls is harmless but wasteful).
+        // per ICE'd CLAIM (up to 8/cell/tick); the set collapses them
+        // to one wire entry per cell. Same for `registered_cells` (1
+        // per registered CLAIM). merged_bug_005: the buffer's
+        // supersession law additionally guarantees a request never
+        // carries one cell in BOTH planes — see
+        // `evidence::PendingSchedulerEvidence`.
         //
         // merged_bug_045 (commit-on-Ack) + bug_082 (all three planes):
         // the buffered evidence ships BY READ — the buffer is cleared
         // ONLY in the Ack-Ok arm below. An Ack-Err or a mid-tick
         // `?`-abort earlier in the tick leaves it intact for the next
         // tick. Duplicate delivery after a successful-but-unobserved
-        // Ack: ICE-clears are no-ops and observed-type upserts dedup
-        // server-side (idempotent); a re-delivered ICE MARK advances
-        // the backoff ladder one extra step — bounded, and in the
-        // conservative direction (away from re-minting into a cell
-        // that provably ICE'd).
+        // Ack is idempotent on EVERY plane (merged_bug_005): ICE
+        // clears are no-ops, observed-type upserts dedup server-side,
+        // and a re-delivered ICE mark REFRESHES the masked window
+        // without stepping the backoff ladder while the mask is
+        // unexpired (`IceBackoff::mark` refresh-not-step — a retried
+        // Ack is not a new failure; pre-fix each redelivery climbed
+        // one rung, so a ~10s retry loop pinned the cell at
+        // max_lead_time off a single incident). And since
+        // merged_bug_005 the Ack itself means APPLIED UNDER
+        // LEADERSHIP, not enqueued: the scheduler answers after the
+        // actor applies (deposed/closed-gate drops answer an error →
+        // the buffer is retained here and redelivered).
         let req = AckSpawnedIntentsRequest {
             // The explicit per-tick snapshot (always present from this
             // reconciler; empty = clear). R9: the legacy field 5 is
@@ -2226,20 +2237,20 @@ impl NodeClaimPoolReconciler {
             spawned: vec![],
             unfulfillable_cells: self
                 .pending_evidence
-                .ice_cells
+                .ice_cells()
                 .iter()
                 .map(Cell::to_string)
                 .collect(),
             registered_cells: self
                 .pending_evidence
-                .registered_cells
+                .registered_cells()
                 .iter()
                 .map(Cell::to_string)
                 .collect(),
-            observed_instance_types: self.pending_evidence.observed_types.clone(),
+            observed_instance_types: self.pending_evidence.observed_types().to_vec(),
             bound_intents: vec![],
         };
-        // r[impl ctrl.nodeclaim.evidence-ack-latch+1]
+        // r[impl ctrl.nodeclaim.evidence-ack-latch+2]
         match admin_call(self.admin.clone().ack_spawned_intents(req)).await {
             Ok(_) => {
                 // The ONLY clear: the evidence provably reached the
@@ -3025,7 +3036,7 @@ mod tests {
     /// run loop's `load()` sees the lease loop's clone's `fetch_add`.
     /// `Clone` (LeaseHooks bound) so it can be passed to both
     /// `run_lease_loop` and `NodeClaimPoolReconciler::new`.
-    // r[verify ctrl.nodeclaim.acquire-edge-token]
+    // r[verify ctrl.nodeclaim.acquire-edge-token+1]
     #[test]
     fn lease_hooks_flags_propagate_via_clone() {
         use std::sync::atomic::Ordering::SeqCst;
@@ -3044,7 +3055,7 @@ mod tests {
     /// succeeds (persist gated); a re-acquire mid-Err-loop is a NEW
     /// epoch (re-fires once). There is no boolean to wrongly consume
     /// on Err or wrongly re-read on every tick.
-    // r[verify ctrl.nodeclaim.acquire-edge-token]
+    // r[verify ctrl.nodeclaim.acquire-edge-token+1]
     #[test]
     fn acquire_epoch_token_semantics() {
         use std::sync::atomic::Ordering::SeqCst;

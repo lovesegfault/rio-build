@@ -175,6 +175,17 @@ pub fn describe_metrics() {
          node-already-deleted case, so drops should be rare)."
     );
     describe_counter!(
+        "rio_controller_spot_exposure_dropped_seconds_total",
+        "Spot-exposure node-seconds forfeited without reaching the scheduler (labeled by \
+         reason: no_hw_class | absent_node | shutdown; incremented by whole seconds). The \
+         denominator twin of rio_controller_spot_interrupt_dropped_total — together they \
+         close the exposure leg's conservation identity: every observed node-second is \
+         banked, pending, or counted here (merged_bug_070). Every drop under-counts λ's \
+         denominator → λ reads HIGH → the solver under-prefers spot (the conservative \
+         direction) — sustained non-zero no_hw_class means label/config drift; sustained \
+         absent_node means LIST-failure streaks are eating deleted nodes' residuals."
+    );
+    describe_counter!(
         "rio_controller_ephemeral_jobs_reaped_total",
         "Excess Pending ephemeral Jobs deleted (labeled by pool). \
          Non-zero rate = queued dropped after spawn (user cancel, gateway disconnect); \

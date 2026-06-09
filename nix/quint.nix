@@ -4341,12 +4341,14 @@ rec {
 
     # Lease faults: lose/acquire edges, PG reload failures and the
     # controller restart — the per-field lease-edge polarity table (the
-    # unconditional prev_idle clear, the Ok-arm-only suppress clears,
-    # the reload latch gating persist) and the producer-side gate
-    # guarantee (unarmed on loss before the consumer's next tick).
-    # r[verify ctrl.nodeclaim.lease-edge-polarity+3]
+    # unconditional prev_idle clear, the edge-owned latched-buffer
+    # clears with the recorded_boot re-arm staying on the Ok arm
+    # [merged_bug_004], the reload latch gating persist) and the
+    # producer-side gate guarantee (unarmed on loss before the
+    # consumer's next tick).
+    # r[verify ctrl.nodeclaim.lease-edge-polarity+4]
     # r[verify ctrl.nodeclaim.placeable-gate+5]
-    # r[verify ctrl.nodeclaim.ice-mark-clear]
+    # r[verify ctrl.nodeclaim.ice-mark-clear+1]
     quint-nodeclaim-lifecycle-fault-lease = mkQuintCheck {
       name = "nodeclaim-lifecycle-fault-lease";
       # quint-policy P1 exemption (bughunt-2 slot 11; the §5-Q13 census
@@ -4379,8 +4381,8 @@ rec {
     # controller's own reaps are removed from inflight_created before
     # detect_vanished, so an ICE mark is only ever emitted for a claim
     # that genuinely vanished or launch-failed).
-    # r[verify ctrl.nodeclaim.inflight-conservation+2]
-    # r[verify ctrl.nodeclaim.ice-mark-clear]
+    # r[verify ctrl.nodeclaim.inflight-conservation+3]
+    # r[verify ctrl.nodeclaim.ice-mark-clear+1]
     quint-nodeclaim-lifecycle-fault-karpenter = mkQuintCheck {
       name = "nodeclaim-lifecycle-fault-karpenter";
       # quint-policy P1 exemption (bughunt-2 slot 11; the §5-Q13 census
@@ -6819,15 +6821,15 @@ rec {
     # C2/346 (area G): the lease-acquire edge is an epoch token — the
     # amplify-class prev_idle clear fires once per acquisition, never
     # once per reload-Err tick.
-    # r[verify ctrl.nodeclaim.acquire-edge-token]
+    # r[verify ctrl.nodeclaim.acquire-edge-token+1]
     quint-nodeclaim-falsify-epoch-asbuilt = mkQuintWitnessCheck {
       name = "nodeclaim-falsify-epoch-asbuilt";
       spec = "nodeclaimLifecycle";
       main = "nodeclaimLifecycleEpochAsBuilt";
       witness = "idleSpellSurvivesReloadErr";
     };
-    # r[verify ctrl.nodeclaim.acquire-edge-token]
-    # r[verify ctrl.nodeclaim.lease-edge-polarity+3]
+    # r[verify ctrl.nodeclaim.acquire-edge-token+1]
+    # r[verify ctrl.nodeclaim.lease-edge-polarity+4]
     quint-nodeclaim-epoch = mkQuintCheck {
       name = "nodeclaim-epoch";
       # quint-policy P1 exemption (bughunt-2 slot 11; the §5-Q13 census
@@ -6874,7 +6876,7 @@ rec {
     };
     # r[verify ctrl.nodeclaim.evidence-buffered]
     # r[verify ctrl.nodeclaim.consolidate-only-degraded+3]
-    # r[verify ctrl.nodeclaim.evidence-ack-latch+1]
+    # r[verify ctrl.nodeclaim.evidence-ack-latch+2]
     quint-nodeclaim-clear-buffer = mkQuintCheck {
       name = "nodeclaim-clear-buffer";
       # quint-policy P1 exemption (bughunt-2 slot 11; the §5-Q13 census
@@ -6911,7 +6913,7 @@ rec {
     # RPC loses the batch on exactly the delivering tick's ack failure
     # (the retired 007 map residual, demonstrated as a model
     # violation; rust-sim seed 0x603e2a44398a939e).
-    # r[verify ctrl.nodeclaim.evidence-ack-latch+1]
+    # r[verify ctrl.nodeclaim.evidence-ack-latch+2]
     quint-nodeclaim-falsify-ack-latch-asbuilt = mkQuintWitnessCheck {
       name = "nodeclaim-falsify-ack-latch-asbuilt";
       spec = "nodeclaimLifecycle";

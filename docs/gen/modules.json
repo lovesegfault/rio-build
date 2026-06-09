@@ -486,6 +486,11 @@
       "doc": "§13b deficit cover."
     },
     {
+      "path": "reconcilers/nodeclaim_pool/evidence.rs",
+      "depth": 2,
+      "doc": "Commit-on-Ack evidence buffer for scheduler-bound kube"
+    },
+    {
       "path": "reconcilers/nodeclaim_pool/ffd.rs",
       "depth": 2,
       "doc": "First-Fit-Decreasing bin-packing simulation."

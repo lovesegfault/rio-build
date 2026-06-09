@@ -402,7 +402,7 @@ async fn seed_previous_leader(db: &TestDb) -> usize {
 /// `inflight_created` entry would still be tracked (its claim is live
 /// and in-flight, so nothing else drops it); the cleared
 /// `recorded_boot` re-edges the FRESH registration into a sample.
-// r[verify ctrl.nodeclaim.lease-edge-polarity+3]
+// r[verify ctrl.nodeclaim.lease-edge-polarity+4]
 #[tokio::test]
 async fn acquire_ok_clears_prev_idle_and_suppress_fields() {
     let mut lab = Lab::new().await;
@@ -442,7 +442,8 @@ async fn acquire_ok_clears_prev_idle_and_suppress_fields() {
     );
     assert!(
         !lab.r.inflight_created.contains_key("n9"),
-        "suppress: cleared on Ok (live in-flight claim no longer tracked)"
+        "suppress: cleared on the ACQUISITION EDGE (merged_bug_004 — \
+         the pre-acquire entry is previous-tenure tracking)"
     );
     assert!(!lab.r.reload_pending(), "latch dropped on Ok");
     assert_eq!(
@@ -467,13 +468,19 @@ async fn acquire_ok_clears_prev_idle_and_suppress_fields() {
 }
 
 /// R1 acquire-Err arm (r43 merged_bug_016, the m1CalibAcquireClearOkOnly
-/// shape): `prev_idle` STILL clears; the suppress fields are retained;
-/// the latch holds (persist stays gated). Live claims make it
+/// shape): `prev_idle` STILL clears; `recorded_boot` is retained (its
+/// re-arm rides the Ok arm with the sketch swap — atomic edge); the
+/// latch holds (persist stays gated). merged_bug_004: the latched
+/// buffers (`inflight_created`, `pending_evidence`) clear on the
+/// ACQUISITION EDGE regardless of the reload outcome — their
+/// pre-acquire content is previous-tenure state (an interim leader's
+/// deliberate reaps must not read as Karpenter GC), and the edge,
+/// not the Ok arm, is the one clear site. Live claims make it
 /// non-vacuous: n1 is FRESH-registered and already in `recorded_boot`
 /// — a wrongful Err-arm clear would re-edge it into a sample + an
-/// ICE-clear ack; n9 is live in-flight — a wrongful clear would
-/// untrack it for good (nothing re-adds an untracked live claim).
-// r[verify ctrl.nodeclaim.lease-edge-polarity+3]
+/// ICE-clear ack; n9 is live in-flight and tracked pre-acquire — the
+/// edge unconditionally drops that previous-tenure entry.
+// r[verify ctrl.nodeclaim.lease-edge-polarity+4]
 #[tokio::test]
 async fn acquire_err_still_clears_prev_idle_keeps_suppress() {
     let mut lab = Lab::new().await;
@@ -513,16 +520,139 @@ async fn acquire_err_still_clears_prev_idle_keeps_suppress() {
         "no ICE-clear shipped (retained recorded_boot suppressed the edge)"
     );
     assert!(
-        lab.r.inflight_created.contains_key("n9"),
-        "suppress: retained on Err"
+        !lab.r.inflight_created.contains_key("n9"),
+        "latched buffer: cleared on the acquisition edge even when the \
+         reload Errs (merged_bug_004 — previous-tenure tracking is \
+         dropped exactly once, at the edge)"
     );
     assert!(lab.r.reload_pending(), "latch held for retry");
+}
+
+/// merged_bug_004 red: evidence buffered during the reload-Err retry
+/// window is CURRENT-tenure, consume-once state — the eventual
+/// reload-Ok must not destroy it. The edge fires on tick 1 (clears the
+/// previous tenure's buffers exactly once); the reload Errs and
+/// `reconcile_once` runs degraded, during which an ICE mark enters
+/// `pending_evidence` and `cover_deficit` tracks a fresh claim in
+/// `inflight_created`. Tick 2's reload-Ok must leave both intact:
+/// pre-fix the Ok arm re-cleared both against the SAME epoch read the
+/// edge already consumed — `left: tick-2 ack ships
+/// unfulfillable_cells == []` (the mark destroyed before
+/// `report_unfulfillable` could read it) and the degraded-window
+/// claim untracked for good; `right: the ack carries the mark` (it
+/// provably reached the scheduler; Ack-Ok then legitimately consumes
+/// the buffer) and the claim stays tracked.
+// r[verify ctrl.nodeclaim.lease-edge-polarity+4]
+// r[verify ctrl.nodeclaim.inflight-conservation+3]
+#[tokio::test]
+async fn reload_ok_preserves_evidence_buffered_during_err_window() {
+    let mut lab = Lab::new().await;
+    lab.r.hooks.on_acquire();
+    lab.r.pg = lab.closed_pool().await;
+
+    // Tick 1: edge actions fire (previous tenure cleared once); the
+    // reload Errs; the latch holds.
+    lab.tick(600, full_tick_scenario(vec![], vec![], vec![]))
+        .await;
+    assert!(lab.r.reload_pending(), "precondition: Err window open");
+
+    // Degraded-window production (what reap_unhealthy/detect_vanished
+    // and cover_deficit do on Err-window ticks): an ICE mark enters
+    // the commit-on-Ack buffer; a freshly created claim is tracked.
+    lab.r.pending_evidence.buffer_marks([cell()]);
+    lab.r.inflight_created.insert("n-degraded".into(), cell());
+
+    // Tick 2: PG recovered → reload Ok. The claim created during the
+    // window is live and in-flight, so detect_vanished KEEPs it.
+    lab.r.pg = lab.db.pool.clone();
+    lab.tick(
+        610,
+        full_tick_scenario(vec![], vec![nc_json("n-degraded", 600, None)], vec![]),
+    )
+    .await;
+
+    assert!(!lab.r.reload_pending(), "latch cleared on Ok");
+    let last = lab.ack_calls().pop().expect("tick 2 acked");
+    assert_eq!(
+        last.unfulfillable_cells,
+        vec![cell().to_string()],
+        "the Err-window ICE mark SURVIVED the reload-Ok and shipped on \
+         the first healthy Ack (pre-fix: the Ok-arm clear destroyed it \
+         and the ack went out empty)"
+    );
+    assert!(
+        lab.r.pending_evidence.ice_cells().is_empty(),
+        "Ack-Ok is the one legitimate consume of the shipped mark"
+    );
+    assert!(
+        lab.r.inflight_created.contains_key("n-degraded"),
+        "current-tenure tracking born in the Err window survives the \
+         reload-Ok (pre-fix: untracked for good — its vanish would \
+         never have emitted an ICE mark)"
+    );
+}
+
+/// merged_bug_005 red (ordering-inversion, end-to-end): an ICE mark
+/// buffered behind a failed Ack must be SUPERSEDED by a strictly
+/// newer `Registered=True` edge for the same cell — the cell provably
+/// delivered capacity after the failure the mark recorded. `left:`
+/// the retried Ack carried the cell in BOTH planes and the
+/// scheduler's fixed clears-then-marks apply order re-masked the
+/// healthy cell; `right:` the buffer holds only the newest polarity,
+/// so the Ack ships the clear alone.
+// r[verify ctrl.nodeclaim.evidence-ack-latch+2]
+// r[verify ctrl.nodeclaim.ice-mark-clear+1]
+#[tokio::test]
+async fn newer_registration_supersedes_buffered_mark_end_to_end() {
+    let mut lab = Lab::new().await;
+
+    // Tick 1: c-ice carries Launched=False/LaunchFailed → ICE reap
+    // (scripted DELETE) → the mark enters the buffer; the Ack fails →
+    // the mark is retained (commit-on-Ack).
+    lab.admin
+        .fail_next_ack
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    lab.tick(
+        600,
+        full_tick_scenario(
+            vec![],
+            vec![nc_json_ice("c-ice", 0)],
+            vec![delete_scenario("/apis/karpenter.sh/v1/nodeclaims/c-ice")],
+        ),
+    )
+    .await;
+    let acks = lab.ack_calls();
+    assert!(
+        acks[0].unfulfillable_cells.contains(&cell().to_string()),
+        "tick 1 carried the mark to the wire (and the Ack failed)"
+    );
+
+    // Tick 2: a sibling claim in the SAME cell reaches Registered=True
+    // inside the recency window — the consume-once success edge,
+    // strictly newer than the buffered mark.
+    lab.tick(
+        610,
+        full_tick_scenario(vec![], vec![nc_json("c-new", 600, Some(605))], vec![]),
+    )
+    .await;
+    let acks = lab.ack_calls();
+    let last = acks.last().expect("tick 2 acked");
+    assert!(
+        last.registered_cells.contains(&cell().to_string()),
+        "the newer registration ships its clear"
+    );
+    assert!(
+        last.unfulfillable_cells.is_empty(),
+        "the stale mark was superseded — shipping both planes for one \
+         cell would re-mask the healthy cell server-side (the fixed \
+         clears-then-marks tie-break): {last:?}"
+    );
 }
 
 /// R2 recency gate: a stale (>3×TICK) Registered edge after the
 /// acquire clear is recorded WITHOUT a sample and WITHOUT an ICE-clear
 /// on the wire (noMassClearAfterFailover / m34CalibNoRecencyGate).
-// r[verify ctrl.nodeclaim.ice-mark-clear]
+// r[verify ctrl.nodeclaim.ice-mark-clear+1]
 #[tokio::test]
 async fn post_acquire_stale_registration_records_without_clear_or_sample() {
     let mut lab = Lab::new().await;
@@ -550,7 +680,7 @@ async fn post_acquire_stale_registration_records_without_clear_or_sample() {
 /// controller's own stuck-reap is pruned from `inflight_created`
 /// BEFORE detect_vanished, so the recovery tick ships no spurious
 /// ICE mark for it.
-// r[verify ctrl.nodeclaim.inflight-conservation+2]
+// r[verify ctrl.nodeclaim.inflight-conservation+3]
 #[tokio::test]
 async fn consolidate_only_prunes_own_reaps_before_detect() {
     let mut lab = Lab::new().await;
@@ -600,7 +730,7 @@ async fn consolidate_only_prunes_own_reaps_before_detect() {
 /// R3 conservation, vanish arm (r40 bug_020): a tracked claim absent
 /// from live (Karpenter GC) marks its cell; a tracked claim still
 /// in-flight stays tracked.
-// r[verify ctrl.nodeclaim.inflight-conservation+2]
+// r[verify ctrl.nodeclaim.inflight-conservation+3]
 #[tokio::test]
 async fn vanish_is_marked_own_reap_is_not() {
     let mut lab = Lab::new().await;
@@ -637,7 +767,7 @@ async fn vanish_is_marked_own_reap_is_not() {
 /// R4 reload latch: a closed-pool acquire gates persist (PG rows
 /// byte-unchanged through a degraded tick), the Ok retry reloads and
 /// un-gates, and a later sample-bearing tick persists again.
-// r[verify ctrl.nodeclaim.lease-edge-polarity+3]
+// r[verify ctrl.nodeclaim.lease-edge-polarity+4]
 #[tokio::test]
 async fn reload_err_gates_persist_and_retries_next_tick() {
     let mut lab = Lab::new().await;
@@ -672,7 +802,7 @@ async fn reload_err_gates_persist_and_retries_next_tick() {
 /// (the trailing zero-write happens — observed via a local
 /// DebuggingRecorder), are consumed exactly once, and the next tick
 /// writes nothing for the vanished cell.
-// r[verify ctrl.nodeclaim.lease-edge-polarity+3]
+// r[verify ctrl.nodeclaim.lease-edge-polarity+4]
 #[test]
 fn acquire_keeps_cleanup_sets_one_trailing_write_then_drop() {
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
@@ -762,7 +892,7 @@ async fn loss_unarms_gate_same_tick() {
 
 /// R7 standby: a standby tick has no effects and freezes every
 /// counter/field (empty verifier + closed pool prove "no traffic").
-// r[verify ctrl.nodeclaim.lease-edge-polarity+3]
+// r[verify ctrl.nodeclaim.lease-edge-polarity+4]
 #[tokio::test]
 async fn standby_tick_no_effect_and_frozen_counters() {
     let mut lab = Lab::new().await;
@@ -827,7 +957,7 @@ async fn bot_streak_frozen_across_acquire_resets_on_success() {
 /// R9 wedge (retain-safe class): expiry evidence fed through the real
 /// tick survives the acquire edge and still drives a Dead reap one
 /// tick later; `tick_counter` advances on every leader tick.
-// r[verify ctrl.nodeclaim.lease-edge-polarity+3]
+// r[verify ctrl.nodeclaim.lease-edge-polarity+4]
 #[tokio::test]
 async fn wedge_evidence_survives_acquire() {
     let mut lab = Lab::new().await;
@@ -1140,7 +1270,7 @@ async fn bot_tick_registered_edge_survives_to_recovery_ack() {
 #[tokio::test]
 async fn pending_evidence_cleared_on_acquire_edge() {
     let mut lab = Lab::new().await;
-    lab.r.pending_evidence.registered_cells.insert(cell());
+    lab.r.pending_evidence.buffer_clears([cell()]);
     lab.r.hooks.on_acquire();
     lab.tick(600, full_tick_scenario(vec![], vec![], vec![]))
         .await;
@@ -1153,7 +1283,7 @@ async fn pending_evidence_cleared_on_acquire_edge() {
     );
 }
 
-// r[verify ctrl.nodeclaim.acquire-edge-token]
+// r[verify ctrl.nodeclaim.acquire-edge-token+1]
 /// bug_346's recorded red, kept as the regression pin: an idle spell
 /// seeded during a reload-Err loop must SURVIVE subsequent Err ticks —
 /// pre-fix the boolean latch re-ran `prev_idle.clear()` every tick of
@@ -1187,7 +1317,7 @@ async fn idle_spell_survives_reload_err_loop() {
     );
 }
 
-// r[verify ctrl.nodeclaim.evidence-ack-latch+1]
+// r[verify ctrl.nodeclaim.evidence-ack-latch+2]
 /// merged_bug_045 (commit-on-Ack): buffered kube-only evidence
 /// survives an Ack failure and ships on the next successful Ack.
 /// Recorded red (pre-fix): the buffer was mem::take'n into the wire
@@ -1252,7 +1382,7 @@ async fn evidence_survives_ack_failure_until_committed() {
 /// like its sibling planes (registered_cells, observed_types). The
 /// pre-fix Err arm warned "buffered evidence retained" while the mark,
 /// built from the consumed parameter, was already gone.
-// r[verify ctrl.nodeclaim.evidence-ack-latch+1]
+// r[verify ctrl.nodeclaim.evidence-ack-latch+2]
 #[tokio::test]
 async fn ice_mark_survives_ack_failure() {
     let mut lab = Lab::new().await;

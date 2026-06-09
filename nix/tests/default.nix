@@ -1157,6 +1157,25 @@ in
           # runaway tick can't request more than the KWOK fixture
           # synthesizes. Colon in `vmtest:spot` cell key needs YAML
           # key-quoting.
+          #
+          # leadTimeSeed = 120 (NOT kwok's ~5s nominal boot): the seed
+          # feeds health::classify's unregistered-reap grace
+          # (`2 x seed`), and the grace must STRICTLY DOMINATE the
+          # scenario's registration-wait budget or the reaper races
+          # the waits under load. With the old 5.0 the grace was 10s
+          # while KWOK's Stage reconcile can stall past it under
+          # full-gate builder load: the controller (correctly, per its
+          # predicate — same-frame `age > 2 x seed` arithmetic) reaped
+          # the unregistered claim, the BootTimeout reap ICE-masked
+          # vmtest:spot, cover_deficit minted nothing for the mask
+          # TTL, and the scenario's 60s Registered-wait timed out
+          # staring at `items: []` (the vm-sla-sizing-kwok strike-1
+          # flake). Dominance: grace 2 x 120 = 240s > 90 (creation
+          # wait) + 60 (Registered wait) + 10 (tick) = 160s worst
+          # case, so the reap structurally cannot fire while either
+          # wait runs. The scenario is explicitly timing-insensitive
+          # ("asserts CREATED + PROGRESSED + metric pipeline, not
+          # specific timings"), so nothing else reads the seed.
           (pkgs.writeText "kwok-nodeclaim-pool.yaml" ''
             scheduler:
               sla:
@@ -1175,7 +1194,8 @@ in
                 referenceHwClass: vmtest
                 leadTimeSeed:
             ${nullKeys "      " prodCells}
-                  "vmtest:spot": 5.0
+                  "vmtest:spot": 120.0
+                  "vmtest:od": 120.0
           '')
         ];
     };

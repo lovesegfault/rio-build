@@ -672,23 +672,46 @@ Every uncounted drop under-reports the spot-reclaim rate exactly while spot
 is being reclaimed --- the anti-conservative direction for the SLA solver's
 capacity-type decision.
 
-#r("ctrl.informer.exposure-recredit")[
+#r("ctrl.informer.exposure-recredit+1")[
   The λ-denominator exposure leg of `AppendInterruptSample` MUST consume
-  its evidence only on append acknowledgement: a banked node-seconds
-  slice whose append RPC fails MUST be re-credited, whole, to the next
-  flush (the cursor advanced when the slice was banked, so the pending
-  carrier is the only remaining copy of that window). A retained class
-  with no fresh slice in a later round MUST still retry. The only
-  accepted forfeitures are the absent-node cursor drop (at most one
-  flush period per deleted node) and process shutdown (at most one
-  pending window) --- a scheduler outage spanning any number of flush
-  windows MUST NOT reduce total banked exposure.
+  its evidence only on append acknowledgement, and every shipment MUST
+  carry a deterministic per-(class, window) idempotency key
+  (`exposure:{hw}:{window-epoch}`, constrained by the same partial
+  unique index as the interrupt leg's Event uids) so an ambiguous
+  failure --- server committed, client timed out --- redelivers into the
+  `ON CONFLICT` absorb instead of double-banking the denominator. A
+  banked slice whose append RPC fails MUST be re-credited whole and
+  IDENTICAL (uid and value; windows are never merged --- a merged value
+  under an already-committed key would be absorbed and the fresh
+  seconds lost) to the next flush, and a retained class with no fresh
+  slice in a later round MUST still retry. Every node-second that
+  leaves a cursor MUST exit through exactly one of BANK (append
+  acknowledged), PENDING (the retained queue), or a COUNTED drop on
+  #(refs.metric)("rio_controller_spot_exposure_dropped_seconds_total")`{reason}`;
+  the counted forfeitures are exactly: `no_hw_class` (a spot node
+  matching no configured class --- the cursor advances by design, no
+  retro-bank), `absent_node` (a node deleted between flushes forfeits
+  its final partial slice --- one flush period in the common case,
+  growing with the gap across LIST-failure streaks), and `shutdown`
+  (the pending queue is process memory; shutdown forfeits the WHOLE
+  backlog, one counted drop per slice --- there is no single-window
+  bound). A LIST failure forfeits nothing (cursors untouched); a
+  scheduler outage spanning any number of flush windows MUST NOT
+  reduce total banked exposure; and a process (re)start MUST seed each
+  cursor at `max(creationTimestamp, process boot)` so a restart cannot
+  re-bank windows the previous incarnation already shipped (the
+  pre-boot residual is forfeited toward the conservative direction ---
+  λ reads marginally high).
 ]
 The pre-fix shape advanced every cursor before delivery and handled append
 failure with a warning alone: each failed flush permanently lost
 `fleet x window` node-seconds of denominator, biasing λ high precisely
 during scheduler rollouts --- while the numerator leg of the same RPC counted
-its identical failure through the typed-drop chokepoint.
+its identical failure through the typed-drop chokepoint. The first fix
+round (bug_150) re-credited failed slices but left the retry un-keyed
+(quadratic double-banking under commit-but-timeout brownouts,
+merged_bug_002) and claimed two bounded forfeitures while the
+implementation had five unbounded-or-uncounted ones (merged_bug_070).
 
 #info(title: [Note])[
   The controller does NOT hold permissions for `NetworkPolicies` or
@@ -1205,14 +1228,23 @@ defines no store CR.) The controller's `/scale` patches use field-manager
   is the raw scheduler count and needs no FFD gate to be authoritative.
 ]
 
-#r("ctrl.nodeclaim.lease-edge-polarity+3")[
+#r("ctrl.nodeclaim.lease-edge-polarity+4")[
   Every cross-tick in-memory field of the NodeClaim-pool reconciler is
   classified by its stale-state polarity, and its clear-or-keep MUST sit on
   the matching lease edge. The classes and the per-field classification:
   *suppress* (a stale entry suppresses a later observation or signal) ---
-  `recorded_boot`, `inflight_created`, and `pending_evidence` (a stale
-  buffered ICE-clear from a previous tenure could mask a genuinely ICE'd
-  cell), cleared on the lease-acquire edge in the reload `Ok` arm only; *amplify* (a stale entry amplifies a
+  split by recoverability: `recorded_boot` is cleared in the reload `Ok`
+  arm only (its clear re-arms edge DETECTION against the freshly reloaded
+  sketches, and a wrongly-cleared entry re-creates itself on the next
+  observation, bounded by the `observe_registered` recency gate), while
+  the two latched evidence buffers --- `inflight_created` and
+  `pending_evidence` (a stale buffered ICE-clear from a previous tenure
+  could mask a genuinely ICE'd cell) --- are cleared on the ACQUISITION
+  EDGE, exactly once per tenure and never in the reload `Ok` arm: their
+  producers are consume-once, so an `Ok`-arm clear destroys current-tenure
+  evidence accumulated during a reload-`Err` retry window (degraded ticks
+  legitimately fill both buffers), which is unrecoverable; *amplify* (a
+  stale entry amplifies a
   destructive action) --- `prev_idle`, cleared unconditionally on the
   lease-acquire edge BEFORE the PG reload attempt, so even a failed reload
   cannot leave a pre-acquire idle timestamp in place and the idle basis is
@@ -1245,13 +1277,20 @@ cleanup-class field cleared too eagerly orphans a paging gauge series at its
 last value; a stale sketch persisted over the previous leader's rows resets
 fleet-wide learning.
 
-#r("ctrl.nodeclaim.inflight-conservation+2")[
+#r("ctrl.nodeclaim.inflight-conservation+3")[
   `inflight_created` tracks every NodeClaim `cover_deficit` created until it
   is observed `Registered`, observed terminating, deleted by this
   controller, or detected vanished --- and each tracked claim MUST resolve
-  to exactly one of those outcomes. Its mutators are exactly: extending with
-  the names created this tick; clearing on the lease-acquire reload `Ok`
-  arm; `detect_vanished`'s
+  to exactly one of those outcomes within its tenure. Its mutators are
+  exactly: extending with
+  the names created this tick; clearing on the ACQUISITION EDGE, exactly
+  once per tenure (never in the reload `Ok` arm: an `Ok`-arm clear
+  destroys tracking for claims created during the reload-`Err` retry
+  window, silently cancelling their vanish detection; previous-tenure
+  entries are dropped at the edge because an interim leader's deliberate
+  reaps are indistinguishable from Karpenter GC standby-side --- a
+  retained stale entry would emit a spurious ICE mark on a healthy
+  cell); `detect_vanished`'s
   retain rules (drop registered/terminating/absent, KEEP still-in-flight),
   which MUST run on consolidate-only ticks as well as full ticks; and
   removal of the names this controller itself reaped, which MUST happen
@@ -1261,7 +1300,7 @@ fleet-wide learning.
   updating the map violates this rule.
 ]
 
-#r("ctrl.nodeclaim.evidence-ack-latch+1")[
+#r("ctrl.nodeclaim.evidence-ack-latch+2")[
   EVERY scheduler-evidence plane carried by `AckSpawnedIntents` —
   registered-cell ICE-clears, observed instance types, AND ICE marks
   (`unfulfillable_cells`) — MUST be delivered commit-on-Ack: the
@@ -1274,19 +1313,32 @@ fleet-wide learning.
   consolidate-only) MUST buffer its produced evidence rather than drop
   it — the producers are consume-once, so a dropped plane is
   unrecoverable. Buffered-but-unacked ICE marks MUST mask their cells
-  from the same controller's `cover_deficit` until acknowledged.
-  Duplicate delivery after a successful-but-unobserved Ack is
-  acceptable: ICE clears and observed-type upserts are idempotent
-  scheduler-side, and a re-delivered ICE mark advances the backoff
-  ladder at most one extra step — bounded, in the conservative
-  direction.
+  from the same controller's `cover_deficit` until acknowledged. The
+  scheduler MUST answer the Ack only after the leader-gated apply —
+  ack means APPLIED UNDER LEADERSHIP, never enqueued: a deposed drain
+  or a plane the apply cannot land yet (the observed-types cost-table
+  gate) MUST err the RPC so the buffer is retained and redelivered.
+  Redelivery after a successful-but-unobserved Ack MUST be idempotent
+  on every plane: ICE clears and observed-type upserts are idempotent
+  scheduler-side, and a re-delivered ICE mark REFRESHES the masked
+  window without stepping the backoff ladder while the mask is
+  unexpired (refresh-not-step — a retried Ack is not a new failure;
+  the ladder climbs only across post-expiry failures). The buffer
+  MUST enforce per-cell latest-wins supersession across the mark and
+  clear planes — a request may never carry one cell in both — because
+  only the producer knows the temporal order the wire shapes destroy.
 ]
 
-#r("ctrl.nodeclaim.ice-mark-clear")[
+#r("ctrl.nodeclaim.ice-mark-clear+1")[
   ICE mark and clear signals sent via `AckSpawnedIntents` MUST be sound:
   `unfulfillable_cells` (marks) are deduplicated to at most one entry per
-  cell per tick (the scheduler's backoff ladder steps once per entry,
-  #rref("sched.sla.hw-class.ice-mask")), and a mark is emitted only for a
+  cell per tick (the scheduler's backoff ladder climbs once per DISTINCT
+  post-expiry failure --- a redelivered or duplicate mark refreshes the
+  masked window at the same rung,
+  #rref("sched.sla.hw-class.ice-mask")), a request never carries one cell
+  in both planes (per-cell latest-wins supersession at the buffer,
+  #rref("ctrl.nodeclaim.evidence-ack-latch")), and a mark is emitted only
+  for a
   cell whose claim launch-failed, timed out unregistered, or vanished to
   Karpenter GC --- never for a claim this controller itself reaped
   (#rref("ctrl.nodeclaim.inflight-conservation")). `registered_cells`
@@ -1338,11 +1390,12 @@ The buffer also closes the pre-existing ≥5-tick loss: observed instance
 types recorded across a long consolidate-only stretch now reach the
 scheduler's cost table when the outage ends.
 
-#r("ctrl.nodeclaim.acquire-edge-token")[
+#r("ctrl.nodeclaim.acquire-edge-token+1")[
   Lease-acquire edge state MUST be tracked as a monotone acquisition epoch
   (incremented by `on_acquire`), with the reconciler holding two cursors:
   `edge_seen_epoch` (edge actions --- the amplify-class `prev_idle` clear
-  and the `pending_evidence` reset --- fire exactly once per acquisition,
+  and the `pending_evidence` and `inflight_created` resets --- fire
+  exactly once per acquisition,
   never once per retry tick) and `reloaded_epoch` (advanced only on a
   successful PG sketch reload; `persist()` is gated while it lags ---
   latch-on-Ok-only, unchanged). A re-acquisition during a reload-error loop

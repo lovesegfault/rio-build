@@ -517,6 +517,17 @@ module nodeclaimLifecycle {
       val clearIdleNow =
         if (ENABLE_EPOCH_MACHINERY and ENABLE_ACQUIRE_EPOCH) not(edgeClearDone)
         else reloadPending
+      // merged_bug_004: inflight tracking is tenure state — fixed law
+      // (epoch machinery on): cleared on the acquisition edge with the
+      // other suppress-polarity buffers, exactly once per acquisition,
+      // NEVER on the reload-Ok arm (the Ok-arm clear destroyed
+      // tracking for claims created during the Err-retry window, so
+      // their vanish never emitted an ICE mark). As-built (pre-epoch)
+      // law retained for the machinery-off instances: cleared on
+      // loadOk.
+      val clearInflightNow =
+        if (ENABLE_EPOCH_MACHINERY and ENABLE_ACQUIRE_EPOCH) not(edgeClearDone)
+        else loadOk
       val idleTrackedNow =
         CLAIMS.filter(k => aged.get(k).pIdle != INotTracked).size() > 0
       // The latch: a re-clear — the edge actions already ran for this
@@ -529,7 +540,7 @@ module nodeclaimLifecycle {
       val afterLatch = CLAIMS.mapBy(k =>
         { ...aged.get(k),
           pIdle: if (clearIdleNow) INotTracked else aged.get(k).pIdle,
-          inflightTracked: if (loadOk) false else aged.get(k).inflightTracked })
+          inflightTracked: if (clearInflightNow) false else aged.get(k).inflightTracked })
       val reloadStillPending = reloadPending and not(loadOk)
       // Kube-only observations (shared with reconcile_once and
       // consolidate_only — the whole point of the fix).
@@ -603,6 +614,17 @@ module nodeclaimLifecycle {
       val clearIdleNow =
         if (ENABLE_EPOCH_MACHINERY and ENABLE_ACQUIRE_EPOCH) not(edgeClearDone)
         else reloadPending
+      // merged_bug_004: inflight tracking is tenure state — fixed law
+      // (epoch machinery on): cleared on the acquisition edge with the
+      // other suppress-polarity buffers, exactly once per acquisition,
+      // NEVER on the reload-Ok arm (the Ok-arm clear destroyed
+      // tracking for claims created during the Err-retry window, so
+      // their vanish never emitted an ICE mark). As-built (pre-epoch)
+      // law retained for the machinery-off instances: cleared on
+      // loadOk.
+      val clearInflightNow =
+        if (ENABLE_EPOCH_MACHINERY and ENABLE_ACQUIRE_EPOCH) not(edgeClearDone)
+        else loadOk
       val idleTrackedNow =
         CLAIMS.filter(k => aged.get(k).pIdle != INotTracked).size() > 0
       // The latch: a re-clear — the edge actions already ran for this
@@ -615,7 +637,7 @@ module nodeclaimLifecycle {
       val afterLatch = CLAIMS.mapBy(k =>
         { ...aged.get(k),
           pIdle: if (clearIdleNow) INotTracked else aged.get(k).pIdle,
-          inflightTracked: if (loadOk) false else aged.get(k).inflightTracked })
+          inflightTracked: if (clearInflightNow) false else aged.get(k).inflightTracked })
       val reloadStillPending = reloadPending and not(loadOk)
       // Kube-only observations (r43 bug_023: shared with reconcile_once).
       val observed = CLAIMS.mapBy(k => observeIdleToBusy(afterLatch.get(k)))
@@ -719,6 +741,17 @@ module nodeclaimLifecycle {
       val clearIdleNow =
         if (ENABLE_EPOCH_MACHINERY and ENABLE_ACQUIRE_EPOCH) not(edgeClearDone)
         else reloadPending
+      // merged_bug_004: inflight tracking is tenure state — fixed law
+      // (epoch machinery on): cleared on the acquisition edge with the
+      // other suppress-polarity buffers, exactly once per acquisition,
+      // NEVER on the reload-Ok arm (the Ok-arm clear destroyed
+      // tracking for claims created during the Err-retry window, so
+      // their vanish never emitted an ICE mark). As-built (pre-epoch)
+      // law retained for the machinery-off instances: cleared on
+      // loadOk.
+      val clearInflightNow =
+        if (ENABLE_EPOCH_MACHINERY and ENABLE_ACQUIRE_EPOCH) not(edgeClearDone)
+        else loadOk
       val idleTrackedNow =
         CLAIMS.filter(k => aged.get(k).pIdle != INotTracked).size() > 0
       // The latch: a re-clear — the edge actions already ran for this
@@ -731,7 +764,7 @@ module nodeclaimLifecycle {
       val afterLatch = CLAIMS.mapBy(k =>
         { ...aged.get(k),
           pIdle: if (clearIdleNow) INotTracked else aged.get(k).pIdle,
-          inflightTracked: if (loadOk) false else aged.get(k).inflightTracked })
+          inflightTracked: if (clearInflightNow) false else aged.get(k).inflightTracked })
       val reloadStillPending = reloadPending and not(loadOk)
       val acquireWithInflight =
         reloadPending and CLAIMS.filter(k => claims.get(k).inflightTracked).size() > 0

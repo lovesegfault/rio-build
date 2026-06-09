@@ -437,6 +437,18 @@ impl HwClassConfig {
     }
 }
 
+/// One flush's full settlement (merged_bug_070): every node-second
+/// that leaves a cursor exits through exactly one of BANK (`banked`,
+/// headed for the append path), PENDING (the caller's retained
+/// queue), or a COUNTED drop (`drops` — recorded by the caller via
+/// [`record_exposure_drop`]). The pre-fix shape had two silent exits
+/// (match-None consumption, absent-node forfeiture) that the leg's
+/// own conservation claim said could not exist.
+struct ExposureFlush {
+    banked: Vec<(String, f64)>,
+    drops: Vec<(ExposureDropReason, f64)>,
+}
+
 /// One λ exposure flush over a fresh Node LIST: for every spot node
 /// matching a configured `$h`, bank `now − cursor` node-seconds
 /// against that `hw_class` and advance the cursor; drop cursors for
@@ -445,23 +457,33 @@ impl HwClassConfig {
 /// Cursor (M11) discipline — what makes a 60s LIST a safe replacement
 /// for the deleted Node watch + labels cache:
 ///
-/// - **Seed**: a node first seen here starts its cursor at
-///   `metadata.creationTimestamp`, so its pre-first-flush lifetime is
-///   banked exactly once. Controller restart re-seeds the same way →
-///   the first post-restart flush re-reports the pre-restart slice
-///   once (accepted bias, unchanged from the watch-cache behavior;
-///   the 24h EMA halflife dampens it).
+/// - **Seed** (merged_bug_070): a node first seen here starts its
+///   cursor at `max(creationTimestamp, boot_epoch)` — creation time
+///   for nodes born under this incarnation (pre-first-flush lifetime
+///   banked exactly once), process boot for nodes that predate it. A
+///   controller restart therefore CANNOT re-bank windows the previous
+///   incarnation already shipped (pre-fix it re-banked every
+///   surviving node's whole lifetime, un-keyed → denominator
+///   inflation, λ biased LOW — the anti-conservative direction). The
+///   pre-boot residual [last-shipped, boot] is forfeited to the
+///   conservative side (λ reads marginally high).
 /// - **No double-count**: the cursor advances to `now` on every flush
 ///   that sees the node, whether or not a `$h` matched, so
 ///   consecutive flushes bank disjoint slices and a late config load
-///   does NOT retro-bank the unmatched window.
+///   does NOT retro-bank the unmatched window. The unmatched window
+///   itself is a COUNTED `no_hw_class` drop (merged_bug_070 — it used
+///   to vanish without a trace).
 /// - **Absent node** (deleted between flushes): its cursor is dropped
-///   WITHOUT banking the final partial slice (≤ one flush period).
-///   This replaces the watch's Delete-arm residual flush — an
-///   accepted under-count; λ reads marginally high, the
-///   cost-conservative direction (the solver under-prefers spot;
-///   never the phantom-exposure over-count that biased it toward
-///   spot, bug `b81da271f`).
+///   without banking the final partial slice — a COUNTED
+///   `absent_node` drop (merged_bug_070). This replaces the watch's
+///   Delete-arm residual flush — an accepted under-count; λ reads
+///   marginally high, the cost-conservative direction (the solver
+///   under-prefers spot; never the phantom-exposure over-count that
+///   biased it toward spot, bug `b81da271f`). The forfeit is one
+///   flush period per node in the common case but grows with the gap
+///   since the last successful LIST (a node deleted during an
+///   N-window LIST-failure streak forfeits up to N windows) — the
+///   counter makes that tail visible instead of pretending a bound.
 /// - **Aggregated per hw_class** (one RPC per class per flush, not
 ///   per node): a 100-node spot fleet stays one `report_exposure`
 ///   await per class, preserving the bug_057 loop-starvation bound.
@@ -469,9 +491,11 @@ fn flush_spot_exposure(
     cursors: &mut HashMap<String, f64>,
     nodes: &[Node],
     config: &HwClassConfig,
+    boot_epoch: f64,
     now_epoch: f64,
-) -> Vec<(String, f64)> {
+) -> ExposureFlush {
     let mut by_hw: HashMap<String, f64> = HashMap::new();
+    let mut drops: Vec<(ExposureDropReason, f64)> = Vec::new();
     let mut seen: HashSet<&str> = HashSet::with_capacity(nodes.len());
     for node in nodes {
         let Some(name) = node.metadata.name.as_deref() else {
@@ -491,19 +515,41 @@ fn flush_spot_exposure(
             .creation_timestamp
             .as_ref()
             .map(|t| t.0.as_second() as f64);
-        // Cursor, else seed from creationTimestamp, else (no creation
-        // timestamp — synthetic objects only) start banking from now.
-        let last = cursors.get(name).copied().or(created).unwrap_or(now_epoch);
+        // Cursor, else seed at max(creationTimestamp, boot) (see the
+        // Seed bullet), else (no creation timestamp — synthetic
+        // objects only) start banking from now.
+        let last = cursors
+            .get(name)
+            .copied()
+            .or(created.map(|c| c.max(boot_epoch)))
+            .unwrap_or(now_epoch);
         let secs = (now_epoch - last).max(0.0);
         cursors.insert(name.to_string(), now_epoch);
-        if secs > 0.0
-            && let Some(hw) = config.match_node(labels)
-        {
-            *by_hw.entry(hw).or_default() += secs;
+        if secs > 0.0 {
+            match config.match_node(labels) {
+                Some(hw) => *by_hw.entry(hw).or_default() += secs,
+                // merged_bug_070(a): the cursor consumed this window
+                // (by design — no retro-bank) so the seconds MUST
+                // exit counted, not vanish.
+                None => drops.push((ExposureDropReason::NoHwClass, secs)),
+            }
+        }
+    }
+    // merged_bug_070(c): absent nodes forfeit their final partial
+    // slice — counted per node before the cursor drop.
+    for (name, last) in cursors.iter() {
+        if !seen.contains(name.as_str()) {
+            let secs = (now_epoch - last).max(0.0);
+            if secs > 0.0 {
+                drops.push((ExposureDropReason::AbsentNode, secs));
+            }
         }
     }
     cursors.retain(|name, _| seen.contains(name.as_str()));
-    by_hw.into_iter().collect()
+    ExposureFlush {
+        banked: by_hw.into_iter().collect(),
+        drops,
+    }
 }
 
 /// bug_363: `name → (hw_class, last_seen_epoch)` fallback map,
@@ -549,6 +595,59 @@ impl SampleDropReason {
             Self::AppendFailed => "append_failed",
         }
     }
+}
+
+/// merged_bug_070: why exposure node-seconds left a cursor without
+/// being banked or queued. The ONLY consumer is
+/// [`record_exposure_drop`] — a silent exit of the denominator leg is
+/// unrepresentable (the numerator leg got the same treatment in
+/// bug_363).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExposureDropReason {
+    /// A spot node's labels match no configured `[sla.hw_classes.$h]`
+    /// — the cursor advances by design (no retro-bank on late config
+    /// load), so the window is consumed and must exit counted.
+    NoHwClass,
+    /// Node deleted between flushes: its final partial slice is
+    /// forfeited with the cursor (the accepted under-count; grows
+    /// past one flush period only across LIST-failure streaks).
+    AbsentNode,
+    /// Process shutdown: the pending (un-acked) queue is process
+    /// memory with no drain — the WHOLE backlog is forfeited, one
+    /// counted drop per slice.
+    Shutdown,
+}
+
+impl ExposureDropReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NoHwClass => "no_hw_class",
+            Self::AbsentNode => "absent_node",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
+
+// r[impl ctrl.informer.exposure-recredit+1]
+/// merged_bug_070: the one chokepoint for forfeited exposure
+/// node-seconds — warn + counted
+/// (`rio_controller_spot_exposure_dropped_seconds_total{reason}`,
+/// incremented by whole seconds, sub-second residue rounds), the
+/// denominator twin of [`record_sample_drop`]. Together they make the
+/// leg's conservation identity total: every observed node-second is
+/// banked, pending, or counted here — the pre-fix silent exits
+/// (match-None consumption, absent-node forfeiture, whole-backlog
+/// shutdown loss) are unrepresentable.
+fn record_exposure_drop(reason: ExposureDropReason, secs: f64) {
+    warn!(
+        reason = reason.label(),
+        secs, "spot-exposure: node-seconds forfeited (λ denominator under-counted)"
+    );
+    metrics::counter!(
+        "rio_controller_spot_exposure_dropped_seconds_total",
+        "reason" => reason.label()
+    )
+    .increment(secs.round().max(0.0) as u64);
 }
 
 // r[impl ctrl.informer.interrupt-sample-conservation+2]
@@ -679,14 +778,25 @@ pub async fn run(
 ) {
     let nodes: Api<Node> = Api::all(client);
 
+    // merged_bug_070: process-boot epoch — the restart re-bank fence.
+    // Cursor seeds clamp to this so a restarted controller never
+    // re-banks windows its predecessor already shipped.
+    let boot_epoch = now_epoch();
+
     // M11: per-spot-node exposure cursor (`name → last-banked epoch`).
     // An accounting position, not a cache — survives the §4(a)2
     // labels-cache deletion and is private to this loop.
     let mut cursors: HashMap<String, f64> = HashMap::new();
-    // bug_150: per-class node-seconds whose append FAILED — the cursor
-    // already advanced, so this map is the only carrier of those
-    // windows until a flush delivers them (consume-on-ack).
-    let mut unshipped: HashMap<String, f64> = HashMap::new();
+    // bug_150 + merged_bug_002: per-(class, window) slices whose
+    // append has not been ACKNOWLEDGED — the cursor already advanced,
+    // so this queue is the only carrier of those windows until a
+    // flush delivers them (consume-on-ack). Each slice keeps its own
+    // deterministic `exposure:{hw}:{window}` uid across retries so a
+    // commit-but-timeout redelivery dedups server-side (`ON CONFLICT
+    // (event_uid)`, M_047) instead of double-banking λ's denominator;
+    // windows are NEVER merged (a merged value under an already-
+    // committed uid would be absorbed and the fresh half lost).
+    let mut unshipped: Vec<PendingExposure> = Vec::new();
 
     let mut flush = tokio::time::interval(Duration::from_secs(EXPOSURE_FLUSH_SECS));
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -708,6 +818,15 @@ pub async fn run(
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => {
+                // merged_bug_070(b): the pending queue is process
+                // memory — shutdown forfeits the WHOLE backlog (one
+                // window per failed flush per class; there is no
+                // single-window bound). Counted per slice so the loss
+                // is operator-visible and the spec's forfeiture
+                // enumeration stays honest.
+                for slice in unshipped.drain(..) {
+                    record_exposure_drop(ExposureDropReason::Shutdown, slice.secs);
+                }
                 debug!("Node informer: shutdown");
                 return;
             }
@@ -731,13 +850,21 @@ pub async fn run(
                             }
                             fb.retain(|_, (_, seen)| now - *seen < HW_FALLBACK_TTL_SECS);
                         }
-                        // r[impl ctrl.informer.exposure-recredit]
-                        let fresh =
-                            flush_spot_exposure(&mut cursors, &list.items, &config, now_epoch());
-                        for (hw, secs) in merge_exposure_slices(&mut unshipped, fresh) {
-                            let delivered =
-                                report_exposure(&mut admin, hw.clone(), secs).await;
-                            settle_exposure_slice(&mut unshipped, hw, secs, delivered);
+                        // r[impl ctrl.informer.exposure-recredit+1]
+                        let now = now_epoch();
+                        let flush_out = flush_spot_exposure(
+                            &mut cursors, &list.items, &config, boot_epoch, now,
+                        );
+                        for (reason, secs) in flush_out.drops {
+                            record_exposure_drop(reason, secs);
+                        }
+                        queue_exposure_slices(&mut unshipped, flush_out.banked, now);
+                        // Ship every pending slice independently —
+                        // retained windows retry alongside this
+                        // flush's fresh ones, each under its own uid.
+                        for slice in std::mem::take(&mut unshipped) {
+                            let delivered = report_exposure(&mut admin, &slice).await;
+                            settle_exposure_slice(&mut unshipped, slice, delivered);
                         }
                     }
                     Err(e) => {
@@ -945,22 +1072,33 @@ pub async fn run_spot_interrupt_watcher(
     }
 }
 
-/// Append `kind='exposure'` node-seconds for one `hw_class`. Returns
-/// whether the append was acknowledged — the CALLER owns the slice
-/// until then (bug_150: exposure evidence is consumed on ack, not on
-/// send; a failed append re-credits the slice to the next flush, so
-/// nothing is lost — λ samples arrive late, not reduced). Bounded by
-/// [`admin_call`]'s timeout so a hung scheduler can't wedge the Node-
-/// informer's flush loop (every caller is inside that loop).
-async fn report_exposure(admin: &mut AdminClient, hw_class: String, secs: f64) -> bool {
+/// Append `kind='exposure'` node-seconds for one pending slice.
+/// Returns whether the append was acknowledged — the CALLER owns the
+/// slice until then (bug_150: exposure evidence is consumed on ack,
+/// not on send; a failed append re-credits the slice to the next
+/// flush, so nothing is lost — λ samples arrive late, not reduced).
+/// merged_bug_002: the slice's deterministic uid rides every retry,
+/// so the AMBIGUOUS failure (server committed, client timed out —
+/// routine under exactly the brownouts the re-credit was built for)
+/// redelivers into `ON CONFLICT (event_uid) DO NOTHING` instead of
+/// double-banking: pre-fix the retry was un-keyed and a sustained
+/// commit-but-timeout brownout banked the denominator QUADRATICALLY
+/// (re-credit re-merged into ever-larger un-keyed appends), biasing λ
+/// LOW — the anti-conservative direction (solver over-prefers spot).
+/// Bounded by [`admin_call`]'s timeout so a hung scheduler can't
+/// wedge the Node-informer's flush loop (every caller is inside that
+/// loop).
+async fn report_exposure(admin: &mut AdminClient, slice: &PendingExposure) -> bool {
     match admin_call(admin.append_interrupt_sample(
         rio_proto::types::AppendInterruptSampleRequest {
-            hw_class,
+            hw_class: slice.hw.clone(),
             kind: "exposure".into(),
-            value: secs,
-            // Timer-driven, no K8s Event → NULL uid (unconstrained by
-            // the M_047 partial unique index).
-            event_uid: None,
+            value: slice.secs,
+            // merged_bug_002: deterministic per-(class, window) key —
+            // constrained by the M_047 partial unique index exactly
+            // like the interrupt leg's K8s Event uids (the
+            // `exposure:` prefix keeps the namespaces disjoint).
+            event_uid: Some(slice.uid.clone()),
         },
     ))
     .await
@@ -969,6 +1107,7 @@ async fn report_exposure(admin: &mut AdminClient, hw_class: String, secs: f64) -
         Err(e) => {
             warn!(
                 error = %e,
+                uid = %slice.uid,
                 "spot-exposure: append failed; slice re-credited to the next flush"
             );
             false
@@ -976,41 +1115,56 @@ async fn report_exposure(admin: &mut AdminClient, hw_class: String, secs: f64) -
     }
 }
 
-/// Merge the previous flushes' un-shipped exposure slices into this
-/// flush's fresh banks: one entry per `hw_class`, summed. Draining the
-/// pending map FIRST means a class with retained seconds but no fresh
-/// slice this round (its nodes deleted mid-outage) still retries.
-fn merge_exposure_slices(
-    unshipped: &mut HashMap<String, f64>,
-    fresh: Vec<(String, f64)>,
-) -> Vec<(String, f64)> {
-    let mut to_ship: HashMap<String, f64> = std::mem::take(unshipped);
-    for (hw, secs) in fresh {
-        *to_ship.entry(hw).or_default() += secs;
-    }
-    to_ship.into_iter().collect()
+/// One un-acknowledged exposure shipment: a single `(hw_class,
+/// window)` slice with its deterministic idempotency key
+/// (merged_bug_002).
+#[derive(Debug, Clone, PartialEq)]
+struct PendingExposure {
+    hw: String,
+    /// `exposure:{hw}:{window_epoch}` — deterministic per (class,
+    /// flush window), carried VERBATIM across retries. Deterministic
+    /// (not minted-per-send) so the redelivery of a slice whose first
+    /// append committed-but-timed-out collides with its own committed
+    /// row.
+    uid: String,
+    secs: f64,
 }
 
-// r[impl ctrl.informer.exposure-recredit]
-/// Settle one shipped slice: a failed append re-credits the WHOLE
-/// slice to the next flush. The cursor already advanced when the
-/// slice was banked, so this pending map is the ONLY carrier of the
-/// failed window — dropping it here is permanent denominator loss
+/// Queue this flush's fresh per-class slices as individually-keyed
+/// shipments (merged_bug_002). Slices are NEVER merged across windows
+/// — the uid keys an exact committed value server-side, so merging
+/// would change the value under an already-committed key and the `ON
+/// CONFLICT` absorb would silently drop the fresh half. A retained
+/// class with no fresh slice this round (its nodes deleted
+/// mid-outage) still retries: it simply stays queued.
+fn queue_exposure_slices(
+    unshipped: &mut Vec<PendingExposure>,
+    fresh: Vec<(String, f64)>,
+    window_epoch: f64,
+) {
+    for (hw, secs) in fresh {
+        let uid = format!("exposure:{hw}:{}", window_epoch as u64);
+        unshipped.push(PendingExposure { hw, uid, secs });
+    }
+}
+
+// r[impl ctrl.informer.exposure-recredit+1]
+/// Settle one shipped slice: a failed append re-credits the slice —
+/// uid and all — to the next flush. The cursor already advanced when
+/// the slice was banked, so this pending queue is the ONLY carrier of
+/// the failed window — dropping it here is permanent denominator loss
 /// (the pre-fix shape: warn-only, fleet x window node-seconds gone
-/// per failed flush, undisclosed). Mirrors the LIST-failure arm's
-/// evidence-preservation discipline and the sibling interrupt leg's
-/// counted chokepoint: between them, no exit of the exposure leg
-/// loses evidence silently. Shutdown forfeits at most one pending
-/// window — the same accepted bias class as the absent-node cursor
-/// drop.
+/// per failed flush, undisclosed). merged_bug_002: the retained slice
+/// keeps its EXACT identity (no re-mint, no merge), so however many
+/// times delivery is ambiguous, the server holds at most one row per
+/// (class, window).
 fn settle_exposure_slice(
-    unshipped: &mut HashMap<String, f64>,
-    hw: String,
-    secs: f64,
+    unshipped: &mut Vec<PendingExposure>,
+    slice: PendingExposure,
     delivered: bool,
 ) {
     if !delivered {
-        *unshipped.entry(hw).or_default() += secs;
+        unshipped.push(slice);
     }
 }
 
@@ -1036,47 +1190,90 @@ fn annotation_target(pod: &Pod) -> Option<(String, String, String)> {
 
 #[cfg(test)]
 mod tests {
-    // r[verify ctrl.informer.exposure-recredit]
-    /// bug_150: a failed exposure append re-credits the slice; the
-    /// next flush ships the merged total — across an outage spanning
-    /// N windows, total banked exposure is conserved. (Recorded red
-    /// on the pre-fix shape via strawman reversal of the settle law:
-    /// the second flush shipped 60.0, not 120.0 — the failed window
-    /// was consumed by the cursor advance and never re-banked.)
+    // r[verify ctrl.informer.exposure-recredit+1]
+    /// bug_150 + merged_bug_002: a failed exposure append re-credits
+    /// the slice; across an outage spanning N windows, total banked
+    /// exposure is conserved as N DISTINCT keyed slices — never a
+    /// merged sum (merging would change the value under window 1's
+    /// already-possibly-committed uid, and the server's `ON CONFLICT`
+    /// absorb would silently drop window 2's seconds). (Recorded red
+    /// on the bug_150 pre-fix shape via strawman reversal of the
+    /// settle law: the second flush shipped 60.0 total — the failed
+    /// window was consumed by the cursor advance and never re-banked.)
     #[test]
     fn failed_exposure_slice_recredits_to_next_flush() {
-        let mut unshipped: HashMap<String, f64> = HashMap::new();
-        // Flush 1: fresh 60s for m6id; append FAILS.
-        let ship1 = merge_exposure_slices(&mut unshipped, vec![("m6id".into(), 60.0)]);
-        assert_eq!(ship1, vec![("m6id".to_string(), 60.0)]);
-        for (hw, secs) in ship1 {
-            settle_exposure_slice(&mut unshipped, hw, secs, false);
+        let mut unshipped: Vec<PendingExposure> = Vec::new();
+        // Flush 1 (window 1000): fresh 60s for m6id; append FAILS.
+        queue_exposure_slices(&mut unshipped, vec![("m6id".into(), 60.0)], 1000.0);
+        let ship1 = std::mem::take(&mut unshipped);
+        assert_eq!(ship1.len(), 1);
+        assert_eq!((ship1[0].hw.as_str(), ship1[0].secs), ("m6id", 60.0));
+        for slice in ship1 {
+            settle_exposure_slice(&mut unshipped, slice, false);
         }
-        // Flush 2: fresh 60s again; the merged slice is the WHOLE
-        // outage window plus the new one.
-        let ship2 = merge_exposure_slices(&mut unshipped, vec![("m6id".into(), 60.0)]);
+        // Flush 2 (window 1060): fresh 60s again. BOTH windows ship —
+        // as two slices under their own uids, total conserved.
+        queue_exposure_slices(&mut unshipped, vec![("m6id".into(), 60.0)], 1060.0);
+        let ship2 = std::mem::take(&mut unshipped);
         assert_eq!(
-            ship2,
-            vec![("m6id".to_string(), 120.0)],
+            ship2.iter().map(|s| s.secs).sum::<f64>(),
+            120.0,
             "the failed window must be re-credited, not consumed"
         );
-        for (hw, secs) in ship2 {
-            settle_exposure_slice(&mut unshipped, hw, secs, true);
+        assert_eq!(ship2.len(), 2, "windows stay distinct slices, never merged");
+        assert_ne!(
+            ship2[0].uid, ship2[1].uid,
+            "each window keys its own committed row"
+        );
+        for slice in ship2 {
+            settle_exposure_slice(&mut unshipped, slice, true);
         }
         assert!(unshipped.is_empty(), "delivered slices leave no residue");
     }
 
-    // r[verify ctrl.informer.exposure-recredit]
+    // r[verify ctrl.informer.exposure-recredit+1]
     /// A retained class with NO fresh slice this round (its nodes were
-    /// deleted mid-outage) still retries — draining the pending map
-    /// first makes the retry independent of fresh production.
+    /// deleted mid-outage) still retries — retention is queue
+    /// membership, independent of fresh production.
     #[test]
     fn retained_class_without_fresh_slice_still_retries() {
-        let mut unshipped: HashMap<String, f64> = HashMap::new();
-        settle_exposure_slice(&mut unshipped, "m6id".into(), 45.0, false);
-        let ship = merge_exposure_slices(&mut unshipped, vec![]);
-        assert_eq!(ship, vec![("m6id".to_string(), 45.0)]);
-        assert!(unshipped.is_empty(), "drained into the ship set");
+        let mut unshipped: Vec<PendingExposure> = Vec::new();
+        queue_exposure_slices(&mut unshipped, vec![("m6id".into(), 45.0)], 500.0);
+        let first = unshipped.remove(0);
+        settle_exposure_slice(&mut unshipped, first, false);
+        // Next flush: NO fresh slices.
+        queue_exposure_slices(&mut unshipped, vec![], 560.0);
+        let ship = std::mem::take(&mut unshipped);
+        assert_eq!(ship.len(), 1);
+        assert_eq!((ship[0].hw.as_str(), ship[0].secs), ("m6id", 45.0));
+    }
+
+    // r[verify ctrl.informer.exposure-recredit+1]
+    /// merged_bug_002 red: the retry of a slice whose append
+    /// committed-but-timed-out MUST collide with its own committed row
+    /// — which requires the uid to be deterministic and carried
+    /// VERBATIM across settle. `left:` the pre-fix wire sent
+    /// `event_uid: None` on every attempt (each retry inserted a new
+    /// row; a 1-hour brownout at 60s windows over-counted the
+    /// denominator ~30×, λ biased LOW → solver over-prefers spot);
+    /// `right:` retry uid == original uid == `exposure:{hw}:{window}`.
+    #[test]
+    fn retried_slice_carries_identical_uid() {
+        let mut unshipped: Vec<PendingExposure> = Vec::new();
+        queue_exposure_slices(&mut unshipped, vec![("m6id".into(), 60.0)], 1700000000.0);
+        let original = unshipped[0].clone();
+        assert_eq!(
+            original.uid, "exposure:m6id:1700000000",
+            "deterministic per-(class, window) key"
+        );
+        // Ambiguous failure → settle retains; the retried slice is
+        // byte-identical (uid AND value).
+        let shipped = unshipped.remove(0);
+        settle_exposure_slice(&mut unshipped, shipped, false);
+        assert_eq!(
+            unshipped[0], original,
+            "retry must collide with its own committed row server-side"
+        );
     }
 
     // r[verify ctrl.informer.interrupt-sample-conservation+2]
@@ -1386,52 +1583,70 @@ mod tests {
 
         // First flush at t=1060: cursors seed from creationTimestamp →
         // a+b → 2×60=120s for intel-7, c → 40s.
-        let d = sorted(flush_spot_exposure(&mut cursors, &nodes, &cfg, 1060.0));
+        let d = sorted(flush_spot_exposure(&mut cursors, &nodes, &cfg, 0.0, 1060.0).banked);
         assert_eq!(d, vec![("intel-6".into(), 40.0), ("intel-7".into(), 120.0)]);
 
         // Second flush at t=1120 over the SAME LIST: deltas only (60s
         // each), not cumulative-from-created — the cursor advanced.
-        let d = sorted(flush_spot_exposure(&mut cursors, &nodes, &cfg, 1120.0));
+        let d = sorted(flush_spot_exposure(&mut cursors, &nodes, &cfg, 0.0, 1120.0).banked);
         assert_eq!(d, vec![("intel-6".into(), 60.0), ("intel-7".into(), 120.0)]);
 
         // On-demand node never grew a cursor.
         assert!(!cursors.contains_key("od"));
     }
 
+    // r[verify ctrl.informer.exposure-recredit+1]
     /// §4(a)2 gate (capacity-type / match gating): spot nodes whose
     /// labels match no configured `$h` advance their cursor WITHOUT
     /// banking — a late config load does not retro-bank the unmatched
-    /// window (same semantics as the deleted cache). Port of
-    /// `spot_exposure_gates_on_capacity_type`'s config-empty half.
+    /// window (same semantics as the deleted cache). merged_bug_070(a)
+    /// red: the consumed window MUST exit through the counted
+    /// chokepoint — `left:` pre-fix it vanished (cursor advanced,
+    /// nothing banked, nothing counted — a silent third forfeiture
+    /// the leg's own conservation claim denied); `right:` a
+    /// `no_hw_class` drop carries the 60 seconds.
     #[test]
-    fn flush_unmatched_window_is_dropped_not_retro_banked() {
+    fn flush_unmatched_window_is_dropped_counted_not_retro_banked() {
         let unloaded = HwClassConfig::default();
         let loaded = band_config();
         let mut cursors: HashMap<String, f64> = HashMap::new();
         let nodes = vec![spot_node("a", "7", 1000)];
 
         // Flush at t=1060 with config not yet loaded: nothing banked,
-        // but the cursor still advances to 1060.
-        let d = flush_spot_exposure(&mut cursors, &nodes, &unloaded, 1060.0);
-        assert!(d.is_empty(), "unmatched spot node banks nothing");
+        // the cursor still advances to 1060 — and the consumed window
+        // is COUNTED.
+        let out = flush_spot_exposure(&mut cursors, &nodes, &unloaded, 0.0, 1060.0);
+        assert!(out.banked.is_empty(), "unmatched spot node banks nothing");
         assert_eq!(cursors.get("a").copied(), Some(1060.0));
+        assert_eq!(
+            out.drops,
+            vec![(ExposureDropReason::NoHwClass, 60.0)],
+            "the consumed window exits counted, not silently"
+        );
 
         // Config loads; flush at t=1120 banks ONLY 1060..1120 — the
-        // unmatched 1000..1060 window is dropped, not retro-banked.
-        let d = flush_spot_exposure(&mut cursors, &nodes, &loaded, 1120.0);
-        assert_eq!(d, vec![("intel-7".into(), 60.0)]);
+        // unmatched 1000..1060 window stays dropped (no retro-bank),
+        // and nothing further drops.
+        let out = flush_spot_exposure(&mut cursors, &nodes, &loaded, 0.0, 1120.0);
+        assert_eq!(out.banked, vec![("intel-7".into(), 60.0)]);
+        assert!(out.drops.is_empty());
     }
 
+    // r[verify ctrl.informer.exposure-recredit+1]
     /// §4(a)2 gate (the recorded accepted under-count): a node absent
-    /// from the LIST has its cursor dropped WITHOUT banking the final
-    /// partial slice. This is the deleted watch cache's Delete-arm /
-    /// `prune_absent` residual flush, deliberately forfeited (≤ one
-    /// flush period per node, λ reads marginally high — the
-    /// cost-conservative direction). Successor of
-    /// `prune_absent_evicts_nodes_missing_from_relist`, with the
-    /// assertion inverted to match the recorded semantics change.
+    /// from the LIST has its cursor dropped without banking the final
+    /// partial slice — and merged_bug_070(c) red: the forfeited
+    /// residual MUST exit through the counted chokepoint, one
+    /// `absent_node` drop per departed node (`left:` pre-fix the
+    /// residual vanished uncounted — and under a LIST-failure streak
+    /// the forfeit grows past the doc's claimed one-window bound with
+    /// no trace; `right:` counted, bound honest). λ reads marginally
+    /// high — the cost-conservative direction (the solver
+    /// under-prefers spot; never the phantom-exposure over-count of
+    /// bug `b81da271f`). Successor of
+    /// `prune_absent_evicts_nodes_missing_from_relist`.
     #[test]
-    fn flush_drops_absent_node_cursors_without_banking() {
+    fn flush_drops_absent_node_cursors_counted() {
         let cfg = band_config();
         let mut cursors: HashMap<String, f64> = HashMap::new();
         let all = vec![
@@ -1443,18 +1658,27 @@ mod tests {
         ];
 
         // Flush at t=1060 sees everything; all cursors advance.
-        let _ = flush_spot_exposure(&mut cursors, &all, &cfg, 1060.0);
+        let _ = flush_spot_exposure(&mut cursors, &all, &cfg, 0.0, 1060.0);
         assert_eq!(cursors.len(), 4, "four spot nodes tracked");
 
         // b, b2, od deleted between flushes → the t=1090 LIST has only
-        // {a, c}. Their 1060..1090 residuals are forfeited (NOT in the
-        // output) and their cursors are dropped.
+        // {a, c}. Their 1060..1090 residuals are forfeited — COUNTED —
+        // and their cursors are dropped.
         let survivors = vec![spot_node("a", "7", 1000), spot_node("c", "6", 1020)];
-        let d = sorted(flush_spot_exposure(&mut cursors, &survivors, &cfg, 1090.0));
+        let out = flush_spot_exposure(&mut cursors, &survivors, &cfg, 0.0, 1090.0);
         assert_eq!(
-            d,
+            sorted(out.banked),
             vec![("intel-6".into(), 30.0), ("intel-7".into(), 30.0)],
-            "only survivors bank; absent nodes' residuals are forfeited"
+            "only survivors bank"
+        );
+        assert_eq!(
+            out.drops,
+            vec![
+                (ExposureDropReason::AbsentNode, 30.0),
+                (ExposureDropReason::AbsentNode, 30.0),
+            ],
+            "each departed node's residual exits counted (od never had \
+             a cursor — on-demand contributes nothing)"
         );
         assert_eq!(cursors.len(), 2);
         assert!(!cursors.contains_key("b"));
@@ -1463,8 +1687,78 @@ mod tests {
         // Next flush at t=1120: still only the survivors — no phantom
         // node-seconds from the departed nodes (the b81da271f hazard
         // the watch needed `prune_absent` for cannot exist here).
-        let d = sorted(flush_spot_exposure(&mut cursors, &survivors, &cfg, 1120.0));
-        assert_eq!(d, vec![("intel-6".into(), 30.0), ("intel-7".into(), 30.0)]);
+        let out = flush_spot_exposure(&mut cursors, &survivors, &cfg, 0.0, 1120.0);
+        assert_eq!(
+            sorted(out.banked),
+            vec![("intel-6".into(), 30.0), ("intel-7".into(), 30.0)]
+        );
+        assert!(out.drops.is_empty());
+    }
+
+    // r[verify ctrl.informer.exposure-recredit+1]
+    /// merged_bug_070(d) red: a controller RESTART must not re-bank
+    /// windows the previous incarnation already shipped. Cursor seeds
+    /// clamp to `max(creationTimestamp, boot_epoch)` — `left:` pre-fix
+    /// the seed was bare creationTimestamp, so the first post-restart
+    /// flush re-banked every surviving spot node's WHOLE lifetime
+    /// (un-keyed appends → denominator inflation → λ biased LOW → the
+    /// solver over-prefers spot, the exact polarity the absent-node
+    /// design note says the leg never takes); `right:` the
+    /// post-restart flush banks only [boot, now].
+    #[test]
+    fn flush_restart_seeds_at_boot_not_creation() {
+        let cfg = band_config();
+        // Fresh process (empty cursors = restart), node born at 1000,
+        // process boot at 2000, first flush at 2060.
+        let mut cursors: HashMap<String, f64> = HashMap::new();
+        let nodes = vec![spot_node("a", "7", 1000)];
+        let out = flush_spot_exposure(&mut cursors, &nodes, &cfg, 2000.0, 2060.0);
+        assert_eq!(
+            out.banked,
+            vec![("intel-7".into(), 60.0)],
+            "only the post-boot slice banks (pre-fix: 1060s — the \
+             node's whole lifetime re-banked on every restart)"
+        );
+        // A node born AFTER boot still seeds from creation (its
+        // pre-first-flush lifetime is this incarnation's to bank).
+        let mut cursors: HashMap<String, f64> = HashMap::new();
+        let young = vec![spot_node("y", "7", 2030)];
+        let out = flush_spot_exposure(&mut cursors, &young, &cfg, 2000.0, 2060.0);
+        assert_eq!(out.banked, vec![("intel-7".into(), 30.0)]);
+    }
+
+    // r[verify ctrl.informer.exposure-recredit+1]
+    /// merged_bug_070(b) red: shutdown forfeits the WHOLE pending
+    /// backlog — the spec's old "at most one pending window" bound was
+    /// false (each failed flush queues another window; the carrier is
+    /// process memory with no drain). `left:` two pending windows
+    /// vanished silently at shutdown while the doc claimed ≤1 could;
+    /// `right:` every queued slice exits through the counted
+    /// chokepoint (the run-loop shutdown arm drains
+    /// `unshipped` → `record_exposure_drop(Shutdown, …)` per slice),
+    /// and the spec enumerates the forfeiture honestly.
+    #[test]
+    fn shutdown_backlog_is_counted_per_slice() {
+        let mut unshipped: Vec<PendingExposure> = Vec::new();
+        // Two failed windows accumulate (the brownout shape).
+        queue_exposure_slices(&mut unshipped, vec![("m6id".into(), 60.0)], 1000.0);
+        queue_exposure_slices(&mut unshipped, vec![("m6id".into(), 60.0)], 1060.0);
+        assert_eq!(unshipped.len(), 2, "backlog: one slice per window");
+        // The shutdown arm's exact mapping: one counted drop per
+        // slice, seconds preserved.
+        let drops: Vec<(ExposureDropReason, f64)> = unshipped
+            .drain(..)
+            .map(|s| (ExposureDropReason::Shutdown, s.secs))
+            .collect();
+        assert_eq!(
+            drops,
+            vec![
+                (ExposureDropReason::Shutdown, 60.0),
+                (ExposureDropReason::Shutdown, 60.0),
+            ],
+            "the WHOLE backlog is forfeited and counted — not one window"
+        );
+        assert!(unshipped.is_empty());
     }
 
     /// A re-listed node (same LIST contents, later flush) must NOT
@@ -1476,11 +1770,11 @@ mod tests {
         let cfg = band_config();
         let mut cursors: HashMap<String, f64> = HashMap::new();
         let nodes = vec![spot_node("a", "7", 1000)];
-        let d = flush_spot_exposure(&mut cursors, &nodes, &cfg, 1060.0);
+        let d = flush_spot_exposure(&mut cursors, &nodes, &cfg, 0.0, 1060.0).banked;
         assert_eq!(d, vec![("intel-7".into(), 60.0)]);
         // Same node, fresh LIST objects (a relist): banks 30s, not 110s.
         let relisted = vec![spot_node("a", "7", 1000)];
-        let d = flush_spot_exposure(&mut cursors, &relisted, &cfg, 1090.0);
+        let d = flush_spot_exposure(&mut cursors, &relisted, &cfg, 0.0, 1090.0).banked;
         assert_eq!(d, vec![("intel-7".into(), 30.0)]);
     }
 
