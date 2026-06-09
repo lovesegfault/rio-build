@@ -4657,3 +4657,219 @@ module logServiceCalibProducerBlind {
     CALIB_PRODUCER_BLIND = true,
   ).*
 }
+
+// =========================================================================
+// bughunt-4 S6a: the bilateral ingest-liveness contract (merged_bug_335 /
+// #5-S Q1) and the attach-hello handshake (merged_bug_067).
+//
+// Self-contained plane — deliberately NOT an import of `logService`: the
+// base module's const frame is instantiated by every calibration module
+// above, so extending it would touch all of them for a dimension none of
+// them explores (the override-frame hazard). The two laws here compose
+// with the base model only through the session-open/aborted booleans,
+// which this plane owns outright.
+//
+// Small-int mirror of rio_common::liveness: period 2 x margin 2 < abort
+// 5 — the same strict relation the const pair's conformance test pins
+// (period x margin < abort), at model scale.
+// =========================================================================
+module logIngestLiveness {
+  // Whether the builder-side keepalive producer exists. true = the
+  // post-fix uploader (rio-builder log_upload.rs drive()'s keepalive
+  // arm); false = the pre-fix world the quiet-churn twin witnesses.
+  const PRODUCER_ENABLED: bool
+  // Whether the follow-attach emits the exec-stamped hello. false =
+  // the pre-fix silent attach the second twin witnesses.
+  const HELLO_ENABLED: bool
+
+  pure val UPLOADER_KEEPALIVE_PERIOD: int = 2
+  pure val KEEPALIVE_SAFETY_MARGIN: int = 2
+  pure val INBOUND_IDLE_ABORT: int = 5
+  pure val MAX_TICKS: int = 12
+
+  // --- the parked-session plane (Q1)
+  var inboundSilence: int   // store's view: ticks since last inbound frame
+  var sinceKeepalive: int   // producer's own period timer
+  var sessionOpen: bool
+  var idleAborted: bool
+  var ticks: int
+
+  // --- the attach plane (m067)
+  var servingExec: int      // 1, then 2 after the execution switch
+  var attached: bool
+  var helloExec: int        // exec stamp the attached observer holds; 0 = none
+  var fanoutSeen: bool
+
+  // The conformance relation the rio-common test enforces, restated at
+  // model scale so a future re-tuning of the mirror constants cannot
+  // silently break the regime this plane explores.
+  pure val mirrorConforms: bool =
+    UPLOADER_KEEPALIVE_PERIOD * KEEPALIVE_SAFETY_MARGIN < INBOUND_IDLE_ABORT
+
+  pure def keepaliveFires(sk: int): bool =
+    PRODUCER_ENABLED and (sk + 1 >= UPLOADER_KEEPALIVE_PERIOD)
+
+  action init = all {
+    inboundSilence' = 0,
+    sinceKeepalive' = 0,
+    sessionOpen' = true,
+    idleAborted' = false,
+    ticks' = 0,
+    servingExec' = 1,
+    attached' = false,
+    helloExec' = 0,
+    fanoutSeen' = false,
+  }
+
+  // One quiet tick on an open, empty-buffer session: time advances; the
+  // producer (when present) emits its empty keepalive batch when its
+  // period elapses — which IS inbound traffic at the store.
+  action quietTick = all {
+    ticks < MAX_TICKS,
+    sessionOpen,
+    not(idleAborted),
+    ticks' = ticks + 1,
+    sinceKeepalive' = if (keepaliveFires(sinceKeepalive)) 0 else sinceKeepalive + 1,
+    inboundSilence' = if (keepaliveFires(sinceKeepalive)) 0 else inboundSilence + 1,
+    sessionOpen' = sessionOpen,
+    idleAborted' = idleAborted,
+    servingExec' = servingExec,
+    attached' = attached,
+    helloExec' = helloExec,
+    fanoutSeen' = fanoutSeen,
+  }
+
+  // The store's enforcement arm: empty buffer + inbound silence at the
+  // bound => abort (the heartbeat-tick arm in service.rs).
+  action idleAbortFire = all {
+    sessionOpen,
+    not(idleAborted),
+    inboundSilence >= INBOUND_IDLE_ABORT,
+    idleAborted' = true,
+    sessionOpen' = false,
+    inboundSilence' = inboundSilence,
+    sinceKeepalive' = sinceKeepalive,
+    ticks' = ticks,
+    servingExec' = servingExec,
+    attached' = attached,
+    helloExec' = helloExec,
+    fanoutSeen' = fanoutSeen,
+  }
+
+  // The execution switch: a retry replaces the serving execution; any
+  // existing attachment is severed (its follow stream ended).
+  action execSwitch = all {
+    servingExec == 1,
+    servingExec' = 2,
+    attached' = false,
+    fanoutSeen' = false,
+    helloExec' = helloExec,
+    inboundSilence' = inboundSilence,
+    sinceKeepalive' = sinceKeepalive,
+    sessionOpen' = sessionOpen,
+    idleAborted' = idleAborted,
+    ticks' = ticks,
+  }
+
+  // A follow attach: with the hello, the observer learns the serving
+  // execution's identity AT attach time; without it (pre-fix), the
+  // observer keeps whatever stamp it last held — a reconnect across an
+  // exec switch shows the dead execution as streaming.
+  action followAttach = all {
+    not(attached),
+    attached' = true,
+    fanoutSeen' = false,
+    helloExec' = if (HELLO_ENABLED) servingExec else helloExec,
+    inboundSilence' = inboundSilence,
+    sinceKeepalive' = sinceKeepalive,
+    sessionOpen' = sessionOpen,
+    idleAborted' = idleAborted,
+    ticks' = ticks,
+    servingExec' = servingExec,
+  }
+
+  // Live fan-out delivery to an attached observer.
+  action fanoutDeliver = all {
+    attached,
+    fanoutSeen' = true,
+    attached' = attached,
+    helloExec' = helloExec,
+    inboundSilence' = inboundSilence,
+    sinceKeepalive' = sinceKeepalive,
+    sessionOpen' = sessionOpen,
+    idleAborted' = idleAborted,
+    ticks' = ticks,
+    servingExec' = servingExec,
+  }
+
+  action step = any {
+    quietTick,
+    idleAbortFire,
+    execSwitch,
+    followAttach,
+    fanoutDeliver,
+  }
+
+  // --- the laws ---
+
+  // Q1: a conformant producer is never idle-aborted — the conformance
+  // relation makes inboundSilence unable to reach the bound.
+  val conformantNeverIdleAborted = PRODUCER_ENABLED implies not(idleAborted)
+
+  // m067: an attached observer always holds the SERVING execution's
+  // stamp (the hello is what delivers it at attach time).
+  val attachAlwaysIdentified = attached implies (helloExec == servingExec)
+
+  // Fan-out is only ever observed by an observer the hello identified.
+  val helloPrecedesFanout = fanoutSeen implies (helloExec == servingExec)
+
+  // Exploration bounds.
+  val boundsOK = and {
+    ticks <= MAX_TICKS,
+    inboundSilence <= MAX_TICKS,
+    sinceKeepalive <= MAX_TICKS,
+    servingExec >= 1,
+    servingExec <= 2,
+  }
+
+  // --- twin witnesses (the "interesting thing never happens" vals the
+  // expect-violation checks run; a [violation] verdict is the proof the
+  // regime still reaches the defect) ---
+
+  // Pre-fix churn (PRODUCER_ENABLED = false): the quiet session is
+  // idle-aborted — this val is violated.
+  val quietSessionStaysOpen = not(idleAborted)
+
+  // Pre-fix silent attach (HELLO_ENABLED = false): an attach across the
+  // exec switch leaves the observer holding the OLD stamp — violated.
+  val observerNeverStale = attached implies (helloExec == servingExec)
+}
+
+// The live (post-fix) instance: both sides of the bilateral contract
+// present, the hello emitted. All four laws hold exhaustively.
+module logIngestLivenessLive {
+  import logIngestLiveness(
+    PRODUCER_ENABLED = true,
+    HELLO_ENABLED = true,
+  ).*
+}
+
+// CALIBRATION: the pre-fix producer-less world (merged_bug_335). The
+// store's enforcement exists but no keepalive producer does — the
+// quiet-build abort churn is reachable: quietSessionStaysOpen [violation].
+module logIngestCalibQuietChurn {
+  import logIngestLiveness(
+    PRODUCER_ENABLED = false,
+    HELLO_ENABLED = true,
+  ).*
+}
+
+// CALIBRATION: the pre-fix silent attach (merged_bug_067). No hello —
+// a follow attach across the execution switch leaves the observer
+// holding the dead execution's stamp: observerNeverStale [violation].
+module logIngestCalibSilentAttach {
+  import logIngestLiveness(
+    PRODUCER_ENABLED = true,
+    HELLO_ENABLED = false,
+  ).*
+}

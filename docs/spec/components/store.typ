@@ -2111,6 +2111,16 @@ PG forever. The empty-buffer gate makes the abort loss-free by
 construction; a non-empty buffer's liveness is owned by the cut path's
 bounded ack send.
 
+SIGNED 2026-06-08 (owner, bughunt-4 fix-wave #5-S Q1): the idle-abort
+law is bilateral. The builder uploader carries the producer side (an
+empty-batch keepalive every `UPLOADER_KEEPALIVE_PERIOD` while a session
+is open with an empty buffer); this rule's abort is the enforcement
+side; the shared const pair lives in `rio-common`'s liveness module
+with a conformance test proving period times margin strictly under the
+abort bound. The round-3 dashboard test writer's keepalive is RATIFIED
+as that client's own conformance duty under this law --- never removed.
+Clients that bypass the builder uploader are their own producers.
+
 #r("store.log.driver-bounded")[
   Every await the AppendLog driver performs on behalf of the builder
   (ack delivery, chunk cuts — in-loop, drain, and cleanup) MUST be

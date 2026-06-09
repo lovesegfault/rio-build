@@ -2579,6 +2579,57 @@ rec {
     };
 
     # ------------------------------------------------------------------
+    # bughunt-4 S6a: the bilateral ingest-liveness contract
+    # (merged_bug_335 / #5-S Q1) and the attach-hello handshake
+    # (merged_bug_067), on the self-contained logIngestLiveness plane —
+    # deliberately NOT a logService import (the base const frame is
+    # instantiated by every calibration module; extending it for a
+    # dimension none of them explores would touch all 26 frames). The
+    # small-int mirror keeps the real conformance relation
+    # (period x margin < abort: 2 x 2 < 5); the REAL const pair is
+    # enforced by rio-common's conformance test — the model's job is
+    # the law's shape, not the numbers. Measured 2026-06-09, tlc
+    # backend, full scope: live [ok] exhaustive 91 distinct/depth
+    # 16/822ms; quiet-churn [violation] 143 distinct/832ms;
+    # silent-attach [violation] 32 distinct/818ms — the 1800s default
+    # budget is three orders of magnitude of headroom.
+    # r[verify store.log.ingest-idle-abort+1]
+    # r[verify store.log.attach-hello]
+    quint-log-ingest-liveness = mkQuintCheck {
+      name = "log-ingest-liveness";
+      spec = "logService";
+      main = "logIngestLivenessLive";
+      invariants = [
+        "conformantNeverIdleAborted"
+        "attachAlwaysIdentified"
+        "helloPrecedesFanout"
+        "boundsOK"
+      ];
+    };
+
+    # CALIBRATION (expect-violation): the pre-fix producer-less world —
+    # the store's enforcement exists, no keepalive producer does, and
+    # the quiet-build abort churn is reachable (merged_bug_335's
+    # defect): quietSessionStaysOpen violates.
+    quint-log-ingest-calib-quiet-churn = mkQuintWitnessCheck {
+      name = "log-ingest-calib-quiet-churn";
+      spec = "logService";
+      main = "logIngestCalibQuietChurn";
+      witness = "quietSessionStaysOpen";
+    };
+
+    # CALIBRATION (expect-violation): the pre-fix silent attach — no
+    # hello, so a follow attach across the execution switch leaves the
+    # observer holding the dead execution's stamp (merged_bug_067's
+    # defect): observerNeverStale violates.
+    quint-log-ingest-calib-silent-attach = mkQuintWitnessCheck {
+      name = "log-ingest-calib-silent-attach";
+      spec = "logService";
+      main = "logIngestCalibSilentAttach";
+      witness = "observerNeverStale";
+    };
+
+    # ------------------------------------------------------------------
     # rio-scheduler's retry/poison/cascade machinery: the post-collapse
     # model (retry-formal Phase 1c). retryPolicy.qnt encodes the code as
     # it exists after the Phase-1b nine-site collapse -- every entry
