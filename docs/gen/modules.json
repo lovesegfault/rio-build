@@ -314,6 +314,11 @@
       "doc": "Exponential backoff with jitter, and a shutdown-aware retry loop."
     },
     {
+      "path": "clamped.rs",
+      "depth": 0,
+      "doc": "One clamped constructor for externally-sourced seconds → `Duration`"
+    },
+    {
       "path": "classify.rs",
       "depth": 0,
       "doc": "Shared outcome-classification vocabulary (bug_255, R7)."
@@ -357,6 +362,11 @@
       "path": "limits.rs",
       "depth": 0,
       "doc": "Shared size and resource limits across rio-build components."
+    },
+    {
+      "path": "liveness.rs",
+      "depth": 0,
+      "doc": "The bilateral log-ingest liveness contract (merged_bug_335 / §5-S"
     },
     {
       "path": "newtype.rs",
