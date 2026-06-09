@@ -1210,6 +1210,28 @@ enum CompletedLoseEvidence {
     ConflictDeferralExhausted,
 }
 
+/// The own-commit evidence baseline (`sched.lease.cancelled-write`):
+/// what the last COMPLETED read observed of the lease's holder-authored
+/// content. Three-state (merged_bug_164): a completed read that
+/// observed ABSENCE — the 404 before a Create — is a recorded
+/// observation, distinct from "no completed read yet". The old
+/// two-state `Option` conflated them, so the round that first proved a
+/// Create committed (holder=us after a witnessed 404) could never
+/// consume the ledger: absence→present-naming-us IS content movement
+/// (only our POST installs our holderIdentity; a racing creator's
+/// 409-winning lease carries theirs).
+enum ContentBaseline {
+    /// No completed read yet: loop start, or a Completed round on the
+    /// Create path (the POST left no read facts and Leading already
+    /// answered the ledger wholesale) — the next read re-baselines.
+    NoCompletedRead,
+    /// A completed read observed no lease object (404).
+    Absent,
+    /// A completed read observed a lease with these holder-authored
+    /// `renewTime` bytes (None when the field itself was absent).
+    Present { renew_time: Option<String> },
+}
+
 pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
     client: kube::Client,
     cfg: LeaseConfig,
@@ -1288,15 +1310,15 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
     // r[impl sched.lease.cancelled-write+2]
     // The cancelled-write ledger and its evidence cursor: `unconfirmed`
     // records the oldest transmitted-but-unanswered mutating act;
-    // `last_fetched_renew_time` is the holder-authored `renewTime`
-    // bytes of the last COMPLETED read (outer None = no completed-read
-    // baseline; the inner Option is the lease's own optional field) —
-    // the baseline a later read's content movement is judged against.
-    // Keyed on protocol-authored content, never on resourceVersion: a
-    // foreign metadata patch moves the rv without any write of OURS
-    // committing (merged_bug_180).
+    // `content_baseline` is what the last COMPLETED read observed of
+    // the holder-authored content — three-state, so a read that
+    // observed ABSENCE (the 404 before a Create) is a recorded
+    // baseline, distinct from "no completed read yet" (merged_bug_164;
+    // see ContentBaseline). Keyed on protocol-authored content, never
+    // on resourceVersion: a foreign metadata patch moves the rv
+    // without any write of OURS committing (merged_bug_180).
     let mut unconfirmed: Option<UnconfirmedPut> = None;
-    let mut last_fetched_renew_time: Option<Option<String>> = None;
+    let mut content_baseline = ContentBaseline::NoCompletedRead;
     // Q3 deferral flag: a believing renew 409 has been observed and its
     // resolution is owed to the NEXT completed read. Set only by the
     // deferral arm; cleared by every resolving arm (acquire, lose,
@@ -1423,7 +1445,16 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                 if !is_conflict {
                     unconfirmed = None;
                 }
-                last_fetched_renew_time = facts.map(|f| f.renew_time);
+                content_baseline = match facts {
+                    Some(f) => ContentBaseline::Present {
+                        renew_time: f.renew_time,
+                    },
+                    // Completed Create: the POST left no read facts,
+                    // and Leading just answered the ledger wholesale —
+                    // the next read re-baselines. (The pre-POST 404 is
+                    // stale the instant the Create succeeds.)
+                    None => ContentBaseline::NoCompletedRead,
+                };
                 // Conflict on renew = the CAS bounced; WHO holds is
                 // unknown until the next read (the deferral arm below).
                 // Conflict on steal = another standby raced us → we
@@ -1656,10 +1687,18 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                 // (merged_bug_180; the foreign-rv companion test pins
                 // this direction alongside the frozen-rv one).
                 if let Some(f) = &facts {
+                    // Content movement against the three-state baseline
+                    // (merged_bug_164): Present compares the bytes;
+                    // Absent→a lease naming us is our POST committing
+                    // (the outer holder_is_us carries the naming
+                    // requirement); NoCompletedRead can prove nothing.
+                    let content_moved = match &content_baseline {
+                        ContentBaseline::Present { renew_time: prev } => prev != &f.renew_time,
+                        ContentBaseline::Absent => true,
+                        ContentBaseline::NoCompletedRead => false,
+                    };
                     if f.holder_is_us
-                        && last_fetched_renew_time
-                            .as_ref()
-                            .is_some_and(|prev| prev != &f.renew_time)
+                        && content_moved
                         && let Some(led) = unconfirmed.take()
                     {
                         blind.stamp(led.anchor);
@@ -1734,11 +1773,16 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                             );
                         }
                     }
-                    last_fetched_renew_time = Some(f.renew_time.clone());
+                    content_baseline = ContentBaseline::Present {
+                        renew_time: f.renew_time.clone(),
+                    };
                 } else {
-                    // 404→Create round: no lease was fetched; the next
-                    // read starts a fresh content baseline.
-                    last_fetched_renew_time = None;
+                    // 404→Create round whose POST died unanswered: the
+                    // read OBSERVED absence — that is a baseline
+                    // observation (merged_bug_164), and it is exactly
+                    // what lets the next completed read prove the
+                    // Create committed (holder=us against Absent).
+                    content_baseline = ContentBaseline::Absent;
                 }
 
                 // Record THIS round's transmitted write as in doubt —
@@ -5509,6 +5553,103 @@ mod tests {
             !state.step_down_pending(),
             "the stale request is consumed-and-dropped, not left armed"
         );
+    }
+
+    /// merged_bug_164: a completed read that observed ABSENCE (the 404
+    /// before a Create) is a baseline observation, not a missing one.
+    /// The old two-state Option baseline nulled itself on the
+    /// 404→Create round while still minting the ledger entry — so the
+    /// round that first PROVED the Create committed (holder=us after a
+    /// witnessed 404) evaluated `None.is_some_and(..) == false` and the
+    /// conclusive own-commit evidence could never fire: belief entry
+    /// for a committed-but-unanswered POST was structurally
+    /// unreachable. Absence→present-naming-us IS content movement.
+    // r[verify sched.lease.cancelled-write+2]
+    #[tokio::test(start_paused = true)]
+    async fn committed_create_with_lost_response_is_own_commit_evidence() {
+        let (client, mut park) = RequestPark::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        // Round 1: the read witnesses ABSENCE (404), the loop POSTs a
+        // Create, and the response NEVER ARRIVES — the act deadline
+        // elapses (the parked request is held alive so the act times
+        // out instead of erroring; its eventual drop lands in an
+        // already-cancelled call). The ledger arms, and the baseline
+        // must record the observed absence.
+        let get = park.next().await;
+        assert!(get.path.contains("/leases/rio-sched"));
+        get.respond_status(404, "NotFound", "no lease yet");
+        let post_hold = park.next().await;
+        assert_eq!(
+            post_hold.method,
+            http::Method::POST,
+            "the 404 read routes to the Create act"
+        );
+        // Let the act deadline elapse — the POST "response" is lost.
+        tokio::time::advance(RENEW_PHASE_DEADLINE + Duration::from_millis(100)).await;
+        settle().await;
+        assert!(!state.is_leader(), "no response, no belief yet");
+
+        // Round 2: the read completes and the lease NAMES US — only
+        // our POST installs our holderIdentity (a racing creator's
+        // 409-winning lease would carry theirs). That is conclusive
+        // own-commit evidence against the Absent baseline; the renew
+        // PUT dying (timeout, same as the POST) changes nothing.
+        // The hoisted marks service (merged_bug_122) fires the
+        // init-dirty reconcile after round 1 — a non-Completed round —
+        // instead of waiting for a Completed one. Absorb it.
+        let init_marks = park.next().await;
+        assert!(
+            init_marks.path.contains("/pods/us"),
+            "init-dirty marks reconcile"
+        );
+        init_marks.respond_ok(pod_ok("us"));
+        let get = park.next().await;
+        assert!(get.path.contains("/leases/rio-sched"), "round 2 read phase");
+        get.respond_ok(park_lease_json(Some("us"), 0, 1));
+        let put_hold = park.next().await;
+        tokio::time::advance(RENEW_PHASE_DEADLINE + Duration::from_millis(100)).await;
+        settle().await;
+        drop(post_hold);
+        drop(put_hold);
+
+        assert!(
+            state.is_leader(),
+            "holder=us after a witnessed 404 proves the Create committed — \
+             the evidence must consume the ledger and take the acquire edge"
+        );
+        assert_eq!(
+            hooks.acquires.lock().expect("acquires lock").len(),
+            1,
+            "exactly one acquire edge, from the consumed Create evidence"
+        );
+
+        shutdown.cancel();
+        for _ in 0..3 {
+            if let Some(req) = park.try_next().await {
+                req.respond_status(404, "NotFound", "gone");
+            }
+        }
+        loop_task.await.expect("lease loop exits");
     }
 
     /// The suspend-blindness regression the boottime fence clock fixes:
