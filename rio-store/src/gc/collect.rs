@@ -404,14 +404,15 @@ const SHADOW_SWEPT_EXCLUSION_AND: &str = "AND NOT EXISTS \
 const SHADOW_SWEPT_EXCLUSION_WHERE: &str = "WHERE NOT EXISTS \
     (SELECT 1 FROM shadow_swept ss WHERE ss.store_path_hash = m.store_path_hash)";
 
-/// The post-pass tombstone reap (merged_bug_336): hard-delete chunk
-/// rows that are (a) soft-deleted at least the grace term ago —
-/// `deleted_at`, stamped by [`COLLECT_BATCH_UPDATE_SQL`], NULLed by
-/// the resurrect upsert — and (b) fully drained (no pending outbox
-/// row; the conjunct keeps the drain\'s resurrect-skip exact). Runs
-/// only after a COMPLETE pass (nothing eligible to collect remained),
-/// batched and capped like the collect loop. `$1` = grace seconds,
-/// `$2` = batch limit.
+/// The post-drain tombstone reap statement (merged_bug_336):
+/// hard-delete chunk rows that are (a) soft-deleted at least the
+/// grace term ago — `deleted_at`, stamped by
+/// [`COLLECT_BATCH_UPDATE_SQL`], NULLed by the resurrect upsert —
+/// and (b) fully drained (no pending outbox row; the conjunct keeps
+/// the drain's resurrect-skip exact). `$1` = grace seconds, `$2` =
+/// batch limit. This constant owns only the statement shape; cadence
+/// and gating are owned by [`run_post_drain_tail`] (every live cycle,
+/// bounded by [`REAP_CYCLE_CAP`]).
 pub(crate) static REAP_BATCH_DELETE_SQL: LazyLock<String> = LazyLock::new(|| {
     format!(
         "DELETE FROM chunks WHERE blake3_hash IN ( \
