@@ -30,5 +30,5 @@ module wedgeCalib034Instantaneous {
     ENABLE_TRAJECTORY = false,
     DWELL_TICKS = 1,
     BREADTH_MIN = 2
-  ).*
+  ).* from "../wedgeCluster"
 }
