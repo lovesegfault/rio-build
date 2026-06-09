@@ -47,7 +47,11 @@ module leaseCalib180RvKeyed {
     MAX_DROPS = 2,
     MAX_FOREIGN_BUMPS = 2,
     OBS_KEY_RV = true,
-    BLIND_HOLDER_BOUND = 8
+    BLIND_HOLDER_BOUND = 8,
+    HOLDER_EVIDENCE_LOSE = false,
+    CONFLICT_IMMEDIATE_LOSE = false,
+    MAX_STEP_DOWNS = 0,
+    STEP_DOWN_COUNT_KEYED = false
   ).* from "../leaderElection"
 
   /// Same fault economy as the live regime's foreignRvStep — the only

@@ -58,7 +58,11 @@ module leaseCalib303BlindTimeout {
     MAX_DROPS = 2,
     MAX_FOREIGN_BUMPS = 0,
     OBS_KEY_RV = false,
-    BLIND_HOLDER_BOUND = 8
+    BLIND_HOLDER_BOUND = 8,
+    HOLDER_EVIDENCE_LOSE = false,
+    CONFLICT_IMMEDIATE_LOSE = false,
+    MAX_STEP_DOWNS = 0,
+    STEP_DOWN_COUNT_KEYED = false
   ).* from "../leaderElection"
 
   /// PRE-FIX tick: no evidence-forcing cap (the loop owes no fetch it

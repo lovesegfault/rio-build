@@ -239,6 +239,11 @@ module leaderElection {
   /// completed round, wholesale) consumes it. anchor is the attempt
   /// instant on the node's clock -- anchor <= send <= commit.
   type UnconfState = | NoUnconf | Unconf({ anchor: int })
+  /// A pending cooperative step-down request: `stamp` is what the
+  /// serve comparison reads (transition count or instance, per
+  /// STEP_DOWN_COUNT_KEYED); `inst` is the TRUE per-acquire instance
+  /// that filed it -- the staleStepDownServed latch's ground truth.
+  type StepDownState = | NoStepDown | StepDownReq({ stamp: int, inst: int })
 
   // --- 2. constants (const = overridable per fault regime) --------------
   const NODES: Set[Node]
@@ -317,6 +322,35 @@ module leaderElection {
   /// measurement -- see the introducing commit and the droppedWrite
   /// module comment.
   const BLIND_HOLDER_BOUND: int
+  /// Gate for the holder-evidenced-lose plane (bughunt-4 S2, signed
+  /// Q3 / sched.lease.holder-evidenced-lose): when true, a believing
+  /// node's 409 defers one round instead of losing, the lose edge
+  /// demands holder evidence (loseObserved) or deferral exhaustion,
+  /// and the conflictDeferredV ghost tracks the pending deferral.
+  /// false in every pre-existing regime: their transition relations
+  /// and state spaces are unchanged (re-measured at the introducing
+  /// commit -- the trackHeld discipline).
+  const HOLDER_EVIDENCE_LOSE: bool
+  /// Calibration hook for the merged_bug_085 twin: restore the
+  /// pre-fix immediate-lose-on-first-409 inside the holder-evidence
+  /// world. The blindConflictLose latch (judged on the deferral
+  /// ground truth, independent of this toggle's behavior) fires only
+  /// under it. false everywhere except the
+  /// lease-085-blind-conflict-lose falsify twin.
+  const CONFLICT_IMMEDIATE_LOSE: bool
+  /// Cooperative step-down requests per trace (0 = the plane is
+  /// disabled and its vars are frozen -- pre-existing regimes
+  /// unchanged). The production sched.recovery.step-down request/
+  /// serve pair, added for the merged_bug_128 instance-epoch law.
+  const MAX_STEP_DOWNS: int
+  /// Calibration hook for the merged_bug_128 twin: stamp step-down
+  /// requests with the lease TRANSITION COUNT (the pre-fix
+  /// production code) instead of the per-acquire instance, and skip
+  /// the acquire-edge clear. The same-count re-acquire then serves a
+  /// stale demotion -- staleStepDownServed (judged on the true
+  /// filing instance, independent of the keying) fires. false
+  /// everywhere except the lease-128-count-keyed-stepdown twin.
+  const STEP_DOWN_COUNT_KEYED: bool
 
   /// acquiredAt sentinel: "never acquired" (the TLA+ acquiredAt[n] =
   /// NULL). -1 can never equal a real rv (>= 0), mirroring a model
@@ -464,6 +498,32 @@ module leaderElection {
   /// enabled — the non-vacuity witness for the foreign-rv regime.
   /// Frozen at MAX_FOREIGN_BUMPS = 0.
   var evidenceConsumed: bool
+  /// Q3 deferral ghost (production conflict_deferred): a believing
+  /// 409 was observed and its resolution is owed to the next
+  /// completed read. Frozen all-false at HOLDER_EVIDENCE_LOSE =
+  /// false.
+  var conflictDeferredV: Node -> bool
+  /// History latch: a believing node lost on a FIRST 409 with no
+  /// holder evidence and no exhausted deferral -- the pre-fix blind
+  /// lose. Writable only under CONFLICT_IMMEDIATE_LOSE (the twin
+  /// toggle); loseRequiresHolderEvidence is its negation.
+  var blindConflictLose: bool
+  /// Per-acquire tenure-instance counter (production
+  /// LeaderState::acquire_instance): bumped on every acquire edge,
+  /// never reused; reset by crash (the Arc dies with the process).
+  /// Frozen at MAX_STEP_DOWNS = 0.
+  var acquireInstV: Node -> int
+  /// Pending cooperative step-down request (production
+  /// step_down_for): the stamp the serve compares (count or instance
+  /// per STEP_DOWN_COUNT_KEYED) plus the TRUE filing instance (the
+  /// latch's ground truth). Frozen at MAX_STEP_DOWNS = 0.
+  var stepDownReqV: Node -> StepDownState
+  /// Step-down requests filed so far (0..MAX_STEP_DOWNS).
+  var stepDownsV: int
+  /// History latch: a step-down was SERVED by a tenure instance that
+  /// did not file it (the merged_bug_128 stale demotion). Judged on
+  /// the true filing instance, independent of the stamp keying.
+  var staleStepDownServed: bool
 
   // --- 4. accessor / guard helpers --------------------------------------
   // The TLA+ reads snap[n].rv directly after guarding snap[n] /= NULL;
@@ -672,6 +732,32 @@ module leaderElection {
   /// enabled — the noFabricatedEvidence verdict there is about a
   /// space where both the evidence machinery and the fault fire.
   val noEvidenceUnderForeignBumps = not(evidenceConsumed)
+
+  /// sched.lease.holder-evidenced-lose (bughunt-4 signed Q3): a
+  /// believing node's completed-round lose edge carries holder
+  /// evidence -- a read naming another holder (loseObserved) or an
+  /// exhausted one-round 409 deferral. The blind first-409 lose is
+  /// writable only by the CONFLICT_IMMEDIATE_LOSE twin toggle; in the
+  /// live world this latch is unreachable and the invariant holds.
+  /// Falsify twin: lease-085-blind-conflict-lose.
+  val loseRequiresHolderEvidence = not(blindConflictLose)
+  /// Reachability witness for the deferral plane (expect [violation]
+  /// in the holder-evidence regime): a believing 409 actually
+  /// deferred at least once -- the non-vacuity check for
+  /// loseRequiresHolderEvidence's world.
+  val noDeferredConflict = NODES.forall(n => not(conflictDeferredV.get(n)))
+
+  /// sched.recovery.step-down instance law (merged_bug_128): a
+  /// step-down is served only by the tenure instance that filed it.
+  /// The latch is judged on the TRUE filing instance, independent of
+  /// the stamp keying, so the COUNT_KEYED twin (transition-count
+  /// stamp + no acquire-edge clear, the pre-fix production code)
+  /// falsifies it through the fence -> same-epoch re-acquire -> stale
+  /// serve schedule. Falsify twin: lease-128-count-keyed-stepdown.
+  val noStaleStepDownServed = not(staleStepDownServed)
+  /// Reachability witness for the step-down plane (expect [violation]
+  /// in the step-down regime): a request was actually filed.
+  val noStepDownRequested = stepDownsV == 0
 
   /// Witness (expect-violation in the droppedWrite regime): a
   /// transmitted write actually drops -- the blindHolderBounded and
@@ -920,6 +1006,22 @@ module leaderElection {
         },
         // (4) deposed by a deletion; bounded by its own fence deadline
         delVictims.contains(stale),
+        // (5) mid-deferral (HOLDER_EVIDENCE_LOSE, bughunt-4 signed
+        // Q3): a believing 409 deferred one round -- the deferral IS
+        // the armed discovery mechanism. The deferred bounce does NOT
+        // re-stamp the fence (see conflict), so the deferred believer
+        // is still running down its PRE-409 fence budget: belief ends
+        // at the last non-deferred stamp + FENCE_AFTER -- the same
+        // deadline it had before the bounce -- unless a completed
+        // round resolves it sooner (loseObserved / a second 409
+        // exhausting it / an own-commit rv-mover, which also resets
+        // the thief's steal clock). The deferral changes WHICH edge
+        // runs, never how long belief may last; the disjunct exists
+        // because the deferred believer may hold no snapshot (the
+        // bounce spent it) while disjunct (1)'s near-deadline window
+        // has not yet opened. Unreachable (frozen all-false) in every
+        // regime with the gate off.
+        conflictDeferredV.get(stale),
       }),
     }))
 
@@ -1053,6 +1155,12 @@ module leaderElection {
     unconfirmed' = unconfirmed, lastFetchedKey' = lastFetchedKey,
     drops' = drops,
     foreignBumps' = foreignBumps,
+    conflictDeferredV' = conflictDeferredV,
+    blindConflictLose' = blindConflictLose,
+    acquireInstV' = acquireInstV,
+    stepDownReqV' = stepDownReqV,
+    stepDownsV' = stepDownsV,
+    staleStepDownServed' = staleStepDownServed,
     lastFetchedContent' = lastFetchedContent,
     evidenceFabricated' = evidenceFabricated,
     evidenceConsumed' = evidenceConsumed,
@@ -1145,6 +1253,12 @@ module leaderElection {
       else lastFetchedKey.put(n, leaseKey(lease)),
     drops' = drops,
     foreignBumps' = foreignBumps,
+    conflictDeferredV' = conflictDeferredV,
+    blindConflictLose' = blindConflictLose,
+    acquireInstV' = acquireInstV,
+    stepDownReqV' = stepDownReqV,
+    stepDownsV' = stepDownsV,
+    staleStepDownServed' = staleStepDownServed,
     // Ghost content cursor mirrors the key cursor's branches (frozen
     // without foreign writers — content never diverges from rv there).
     lastFetchedContent' =
@@ -1356,6 +1470,23 @@ module leaderElection {
         else lastFetchedKey.put(n, snapKeyOf(n) + 1),
       drops' = drops,
       foreignBumps' = foreignBumps,
+      // Acquire edge: a new tenure instance begins -- the per-acquire
+      // counter bumps and a pending step-down clears (production
+      // on_acquire; the COUNT_KEYED twin restores the pre-fix world
+      // with no clear). A resolved acquisition also clears a pending
+      // 409 deferral. All gated so disabled planes stay frozen.
+      conflictDeferredV' =
+        if (not(HOLDER_EVIDENCE_LOSE)) conflictDeferredV
+        else conflictDeferredV.put(n, false),
+      blindConflictLose' = blindConflictLose,
+      acquireInstV' =
+        if (MAX_STEP_DOWNS == 0) acquireInstV
+        else acquireInstV.put(n, acquireInstV.get(n) + 1),
+      stepDownReqV' =
+        if (MAX_STEP_DOWNS == 0 or STEP_DOWN_COUNT_KEYED) stepDownReqV
+        else stepDownReqV.put(n, NoStepDown),
+      stepDownsV' = stepDownsV,
+      staleStepDownServed' = staleStepDownServed,
       lastFetchedContent' =
         if (MAX_FOREIGN_BUMPS == 0) lastFetchedContent
         else lastFetchedContent.put(n, snapContentOf(n) + 1),
@@ -1529,6 +1660,22 @@ module leaderElection {
         else lastFetchedKey.put(n, snapKeyOf(n) + 1),
       drops' = drops,
       foreignBumps' = foreignBumps,
+      // A completed Leading round resolves any pending 409 deferral;
+      // on the acquire EDGE the tenure instance bumps and a pending
+      // step-down clears (production on_acquire -- the steady-state
+      // renew is not an edge and touches neither).
+      conflictDeferredV' =
+        if (not(HOLDER_EVIDENCE_LOSE)) conflictDeferredV
+        else conflictDeferredV.put(n, false),
+      blindConflictLose' = blindConflictLose,
+      acquireInstV' =
+        if (MAX_STEP_DOWNS == 0 or not(isEdge)) acquireInstV
+        else acquireInstV.put(n, acquireInstV.get(n) + 1),
+      stepDownReqV' =
+        if (MAX_STEP_DOWNS == 0 or STEP_DOWN_COUNT_KEYED or not(isEdge)) stepDownReqV
+        else stepDownReqV.put(n, NoStepDown),
+      stepDownsV' = stepDownsV,
+      staleStepDownServed' = staleStepDownServed,
       lastFetchedContent' =
         if (MAX_FOREIGN_BUMPS == 0) lastFetchedContent
         else lastFetchedContent.put(n, snapContentOf(n) + 1),
@@ -1553,11 +1700,119 @@ module leaderElection {
   /// stole between our GET and PUT. Production distinguishes
   /// 409-on-renew (lose) from 409-on-steal (never led); both end up
   /// not-leading, both reset fence -- the model collapses them.
-  action conflict(n: Node): bool = all {
+  action conflict(n: Node): bool = {
+    // The believing first-409 deferral (HOLDER_EVIDENCE_LOSE, signed
+    // Q3): the 409 proves only rv movement -- the mover may be this
+    // node's own dropped-then-committed write or a foreign bumpRv --
+    // so a believing node's FIRST 409 keeps belief, the hold, and the
+    // ledger, and owes its resolution to the next completed read
+    // (loseObserved / renewLease / a second 409 exhausting it).
+    val defers = and {
+      HOLDER_EVIDENCE_LOSE,
+      not(CONFLICT_IMMEDIATE_LOSE),
+      leading.get(n),
+      not(conflictDeferredV.get(n)),
+    }
+    // The pre-fix blind lose, restorable only by the twin toggle: a
+    // believing FIRST 409 running the lose edge with neither holder
+    // evidence nor an exhausted deferral. The latch is judged on the
+    // deferral ground truth, independent of the toggle's behavior.
+    val blindLose = and {
+      HOLDER_EVIDENCE_LOSE,
+      CONFLICT_IMMEDIATE_LOSE,
+      leading.get(n),
+      not(conflictDeferredV.get(n)),
+    }
+    all {
+      alive.get(n),
+      pending.get(n) == NoPending,
+      hasSnap(n),
+      lease.rv != snapRvOf(n),
+      // A DEFERRED 409 does NOT re-stamp the fence: the deferral runs
+      // on the pre-409 blind budget. A stamped deferral would extend
+      // belief with the lease content frozen -- decoupled from the
+      // content writes that reset a standby's steal clock -- and this
+      // regime's checker produces the dual-belief counterexample
+      // (victim defers near its fence deadline, believes past the
+      // standby's steal). Production mirrors this: the loop computes
+      // will_defer BEFORE the blind stamp. Resolved 409s stamp as
+      // before (belief ends or continues under a fresh content
+      // write).
+      fence' = if (defers) fence else fence.put(n, clocks.get(n)),
+      leading' = if (defers) leading else leading.put(n, false),
+      snap' = snap.put(n, NoSnap),
+      clocks' = clocks, lease' = lease, alive' = alive, obs' = obs,
+      gen' = gen, genHW' = genHW, genHWHolder' = genHWHolder,
+      acquiredAt' = acquiredAt,
+      casRace' = casRace, deletes' = deletes, delVictims' = delVictims,
+      claimFailures' = claimFailures, restores' = restores,
+      stealRetained' = stealRetained,
+      stealBumpedForeignTie' = stealBumpedForeignTie,
+      renewBumpedAboveEntry' = renewBumpedAboveEntry,
+      // A resolved 409 is a completed round resolving not-leading:
+      // the hold clears (production's on_observed_not_leading). A
+      // DEFERRED 409 keeps the hold -- no transition happened.
+      pending' = pending,
+      held' = if (defers) held else trackHeld(held, n, false),
+      exited' = exited,
+      suspends' = suspends, shutdowns' = shutdowns,
+      releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
+      suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
+      // Under the holder-evidence law a 409 NEVER answers the
+      // unconfirmed question (the pre-move GET cannot say whether the
+      // rv-mover was ours): the ledger survives every Conflict, which
+      // is exactly what lets the next completed read consume it as
+      // own-commit evidence. The legacy worlds (gate off, or the twin
+      // restoring the pre-fix) clear it wholesale, as production did.
+      unconfirmed' =
+        if (HOLDER_EVIDENCE_LOSE and not(CONFLICT_IMMEDIATE_LOSE)) unconfirmed
+        else unconfirmed.put(n, NoUnconf),
+      lastFetchedKey' =
+        if (MAX_DROPS == 0) lastFetchedKey
+        else lastFetchedKey.put(n, snapKeyOf(n)),
+      drops' = drops,
+      foreignBumps' = foreignBumps,
+      conflictDeferredV' =
+        if (not(HOLDER_EVIDENCE_LOSE)) conflictDeferredV
+        else conflictDeferredV.put(n, defers),
+      blindConflictLose' = (blindConflictLose or blindLose),
+      acquireInstV' = acquireInstV,
+      stepDownReqV' = stepDownReqV,
+      stepDownsV' = stepDownsV,
+      staleStepDownServed' = staleStepDownServed,
+      lastFetchedContent' =
+        if (MAX_FOREIGN_BUMPS == 0) lastFetchedContent
+        else lastFetchedContent.put(n, snapContentOf(n)),
+      evidenceFabricated' = evidenceFabricated,
+      evidenceConsumed' = evidenceConsumed,
+      blindHolderFor' = bhNext(
+        lease,
+        if (defers) leading else leading.put(n, false),
+        alive,
+        if (HOLDER_EVIDENCE_LOSE and not(CONFLICT_IMMEDIATE_LOSE)) unconfirmed
+        else unconfirmed.put(n, NoUnconf),
+        lastFetchedKey,
+        blindHolderFor,
+        false
+      ),
+    }
+  }
+
+  /// The holder-evidenced lose (HOLDER_EVIDENCE_LOSE only; the gate
+  /// keeps pre-existing regimes' transition relations unchanged): a
+  /// believing node's completed read names ANOTHER holder -- the
+  /// production Completed(Standby) resolution while believing, i.e.
+  /// the lose edge WITH the evidence the signed Q3 law demands. Also
+  /// the resolution path for a pending 409 deferral whose rv-mover
+  /// was a genuine steal.
+  action loseObserved(n: Node): bool = all {
+    HOLDER_EVIDENCE_LOSE,
     alive.get(n),
     pending.get(n) == NoPending,
     hasSnap(n),
-    lease.rv != snapRvOf(n),
+    leading.get(n),
+    snapHolderOf(n) != Held(n),
+    snapHolderOf(n) != NoHolder,
     fence' = fence.put(n, clocks.get(n)),
     leading' = leading.put(n, false),
     snap' = snap.put(n, NoSnap),
@@ -1569,28 +1824,132 @@ module leaderElection {
     stealRetained' = stealRetained,
     stealBumpedForeignTie' = stealBumpedForeignTie,
     renewBumpedAboveEntry' = renewBumpedAboveEntry,
-    // 409 = a completed round resolving not-leading: the hold clears
-    // (production's on_observed(false)).
     pending' = pending, held' = trackHeld(held, n, false), exited' = exited,
     suspends' = suspends, shutdowns' = shutdowns,
     releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
     suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
-    // A 409 is a completed round (the apiserver answered): the
-    // unconfirmed question is answered wholesale; the cursor takes
-    // the GET half's rv (gated for byte-identical pre-existing
-    // regimes).
+    // A Standby resolution answers the ledger wholesale (production:
+    // only the non-Conflict Completed arms clear it).
     unconfirmed' = unconfirmed.put(n, NoUnconf),
     lastFetchedKey' =
       if (MAX_DROPS == 0) lastFetchedKey
       else lastFetchedKey.put(n, snapKeyOf(n)),
     drops' = drops,
     foreignBumps' = foreignBumps,
+    conflictDeferredV' = conflictDeferredV.put(n, false),
+    blindConflictLose' = blindConflictLose,
+    acquireInstV' = acquireInstV,
+    stepDownReqV' = stepDownReqV,
+    stepDownsV' = stepDownsV,
+    staleStepDownServed' = staleStepDownServed,
     lastFetchedContent' =
       if (MAX_FOREIGN_BUMPS == 0) lastFetchedContent
       else lastFetchedContent.put(n, snapContentOf(n)),
     evidenceFabricated' = evidenceFabricated,
     evidenceConsumed' = evidenceConsumed,
     blindHolderFor' = bhNext(lease, leading.put(n, false), alive, unconfirmed.put(n, NoUnconf), lastFetchedKey, blindHolderFor, false),
+  }
+
+
+  /// File a cooperative step-down request (MAX_STEP_DOWNS > 0 only):
+  /// the production actor's failed-recovery path
+  /// (sched.recovery.step-down). The stamp is what the serve compares
+  /// -- the per-acquire instance, or the generation-derived count
+  /// under the COUNT_KEYED twin (gen is fetch_max-derived from the
+  /// lease transition count, so a same-epoch re-acquire repeats it
+  /// exactly as production acquired_transitions did). `inst` records
+  /// the TRUE filing instance regardless: the latch's ground truth.
+  action requestStepDown(n: Node): bool = all {
+    MAX_STEP_DOWNS > 0,
+    stepDownsV < MAX_STEP_DOWNS,
+    alive.get(n),
+    leading.get(n),
+    stepDownReqV.get(n) == NoStepDown,
+    stepDownReqV' = stepDownReqV.put(n, StepDownReq({
+      stamp: if (STEP_DOWN_COUNT_KEYED) gen.get(n) else acquireInstV.get(n),
+      inst: acquireInstV.get(n),
+    })),
+    stepDownsV' = stepDownsV + 1,
+    clocks' = clocks, lease' = lease, alive' = alive, leading' = leading,
+    snap' = snap, obs' = obs, fence' = fence, gen' = gen, genHW' = genHW,
+    genHWHolder' = genHWHolder, acquiredAt' = acquiredAt,
+    casRace' = casRace, deletes' = deletes, delVictims' = delVictims,
+    claimFailures' = claimFailures, restores' = restores,
+    stealRetained' = stealRetained,
+    stealBumpedForeignTie' = stealBumpedForeignTie,
+    renewBumpedAboveEntry' = renewBumpedAboveEntry,
+    pending' = pending, held' = held, exited' = exited,
+    suspends' = suspends, shutdowns' = shutdowns,
+    releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
+    suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
+    unconfirmed' = unconfirmed, lastFetchedKey' = lastFetchedKey,
+    drops' = drops, foreignBumps' = foreignBumps,
+    conflictDeferredV' = conflictDeferredV,
+    blindConflictLose' = blindConflictLose,
+    acquireInstV' = acquireInstV,
+    staleStepDownServed' = staleStepDownServed,
+    lastFetchedContent' = lastFetchedContent,
+    evidenceFabricated' = evidenceFabricated,
+    evidenceConsumed' = evidenceConsumed,
+    blindHolderFor' = blindHolderFor,
+  }
+
+  /// Serve a pending step-down at a believing tick (MAX_STEP_DOWNS >
+  /// 0 only): the production loop's holder-guarded release + full
+  /// lose edge. The serve guard compares the request's STAMP against
+  /// the current tenure identity (instance, or generation under the
+  /// COUNT_KEYED twin); the staleStepDownServed latch is judged on
+  /// the TRUE filing instance, independent of the keying -- it fires
+  /// exactly when a tenure instance is demoted by a request it never
+  /// filed (the merged_bug_128 failover).
+  action serveStepDown(n: Node): bool = all {
+    MAX_STEP_DOWNS > 0,
+    alive.get(n),
+    leading.get(n),
+    lease.holder == Held(n),
+    // Scope bound, same shape as every other lease writer: the
+    // release is an rv (and content) bump.
+    lease.rv < MAX_RV,
+    match stepDownReqV.get(n) {
+      | NoStepDown => false
+      | StepDownReq(r) =>
+        r.stamp == (if (STEP_DOWN_COUNT_KEYED) gen.get(n) else acquireInstV.get(n))
+    },
+    lease' = { ...lease, holder: NoHolder, rv: lease.rv + 1, content: lease.content + 1 },
+    leading' = leading.put(n, false),
+    fence' = fence.put(n, clocks.get(n)),
+    held' = trackHeld(held, n, false),
+    stepDownReqV' = stepDownReqV.put(n, NoStepDown),
+    staleStepDownServed' = (staleStepDownServed or
+      match stepDownReqV.get(n) {
+        | NoStepDown => false
+        | StepDownReq(r) => r.inst != acquireInstV.get(n)
+      }),
+    clocks' = clocks, alive' = alive, snap' = snap, obs' = obs,
+    gen' = gen, genHW' = genHW, genHWHolder' = genHWHolder,
+    acquiredAt' = acquiredAt, casRace' = casRace, deletes' = deletes,
+    delVictims' = delVictims, claimFailures' = claimFailures,
+    restores' = restores, stealRetained' = stealRetained,
+    stealBumpedForeignTie' = stealBumpedForeignTie,
+    renewBumpedAboveEntry' = renewBumpedAboveEntry,
+    pending' = pending, exited' = exited,
+    suspends' = suspends, shutdowns' = shutdowns,
+    releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
+    suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
+    unconfirmed' = unconfirmed, lastFetchedKey' = lastFetchedKey,
+    drops' = drops, foreignBumps' = foreignBumps,
+    conflictDeferredV' = conflictDeferredV,
+    blindConflictLose' = blindConflictLose,
+    acquireInstV' = acquireInstV,
+    stepDownsV' = stepDownsV,
+    lastFetchedContent' = lastFetchedContent,
+    evidenceFabricated' = evidenceFabricated,
+    evidenceConsumed' = evidenceConsumed,
+    blindHolderFor' = bhNext(
+      { ...lease, holder: NoHolder, rv: lease.rv + 1, content: lease.content + 1 },
+      leading.put(n, false), alive, unconfirmed, lastFetchedKey,
+      blindHolderFor, false
+    ),
   }
 
   /// maybe_self_fence(): a Leading node that has not had a successful
@@ -1624,6 +1983,12 @@ module leaderElection {
     unconfirmed' = unconfirmed, lastFetchedKey' = lastFetchedKey,
     drops' = drops,
     foreignBumps' = foreignBumps,
+    conflictDeferredV' = conflictDeferredV,
+    blindConflictLose' = blindConflictLose,
+    acquireInstV' = acquireInstV,
+    stepDownReqV' = stepDownReqV,
+    stepDownsV' = stepDownsV,
+    staleStepDownServed' = staleStepDownServed,
     lastFetchedContent' = lastFetchedContent,
     evidenceFabricated' = evidenceFabricated,
     evidenceConsumed' = evidenceConsumed,
@@ -1668,6 +2033,16 @@ module leaderElection {
     lastFetchedKey' = lastFetchedKey.put(n, -1),
     drops' = drops,
     foreignBumps' = foreignBumps,
+    // In-memory plane state dies with the process: the deferral flag,
+    // the per-acquire instance counter (the Arc), and any pending
+    // step-down request reset. Value-identical no-ops when the planes
+    // are disabled (the vars are frozen at their defaults).
+    conflictDeferredV' = conflictDeferredV.put(n, false),
+    blindConflictLose' = blindConflictLose,
+    acquireInstV' = acquireInstV.put(n, 0),
+    stepDownReqV' = stepDownReqV.put(n, NoStepDown),
+    stepDownsV' = stepDownsV,
+    staleStepDownServed' = staleStepDownServed,
     lastFetchedContent' = lastFetchedContent,
     evidenceFabricated' = evidenceFabricated,
     evidenceConsumed' = evidenceConsumed,
@@ -1701,6 +2076,12 @@ module leaderElection {
     unconfirmed' = unconfirmed, lastFetchedKey' = lastFetchedKey,
     drops' = drops,
     foreignBumps' = foreignBumps,
+    conflictDeferredV' = conflictDeferredV,
+    blindConflictLose' = blindConflictLose,
+    acquireInstV' = acquireInstV,
+    stepDownReqV' = stepDownReqV,
+    stepDownsV' = stepDownsV,
+    staleStepDownServed' = staleStepDownServed,
     lastFetchedContent' = lastFetchedContent,
     evidenceFabricated' = evidenceFabricated,
     evidenceConsumed' = evidenceConsumed,
@@ -1746,6 +2127,12 @@ module leaderElection {
     unconfirmed' = unconfirmed, lastFetchedKey' = lastFetchedKey,
     drops' = drops,
     foreignBumps' = foreignBumps,
+    conflictDeferredV' = conflictDeferredV,
+    blindConflictLose' = blindConflictLose,
+    acquireInstV' = acquireInstV,
+    stepDownReqV' = stepDownReqV,
+    stepDownsV' = stepDownsV,
+    staleStepDownServed' = staleStepDownServed,
     lastFetchedContent' = lastFetchedContent,
     evidenceFabricated' = evidenceFabricated,
     evidenceConsumed' = evidenceConsumed,
@@ -1789,6 +2176,12 @@ module leaderElection {
     lastFetchedKey' = lastFetchedKey,
     drops' = drops,
     foreignBumps' = foreignBumps,
+    conflictDeferredV' = conflictDeferredV,
+    blindConflictLose' = blindConflictLose,
+    acquireInstV' = acquireInstV,
+    stepDownReqV' = stepDownReqV,
+    stepDownsV' = stepDownsV,
+    staleStepDownServed' = staleStepDownServed,
     lastFetchedContent' = lastFetchedContent,
     evidenceFabricated' = evidenceFabricated,
     evidenceConsumed' = evidenceConsumed,
@@ -1826,6 +2219,12 @@ module leaderElection {
     lastFetchedKey' = lastFetchedKey.put(n, snapKeyOf(n)),
     drops' = drops + 1,
     foreignBumps' = foreignBumps,
+    conflictDeferredV' = conflictDeferredV,
+    blindConflictLose' = blindConflictLose,
+    acquireInstV' = acquireInstV,
+    stepDownReqV' = stepDownReqV,
+    stepDownsV' = stepDownsV,
+    staleStepDownServed' = staleStepDownServed,
     lastFetchedContent' =
       if (MAX_FOREIGN_BUMPS == 0) lastFetchedContent
       else lastFetchedContent.put(n, snapContentOf(n)),
@@ -1882,6 +2281,12 @@ module leaderElection {
     lastFetchedKey' = lastFetchedKey.put(n, snapKeyOf(n)),
     drops' = drops + 1,
     foreignBumps' = foreignBumps,
+    conflictDeferredV' = conflictDeferredV,
+    blindConflictLose' = blindConflictLose,
+    acquireInstV' = acquireInstV,
+    stepDownReqV' = stepDownReqV,
+    stepDownsV' = stepDownsV,
+    staleStepDownServed' = staleStepDownServed,
     lastFetchedContent' = lastFetchedContent.put(n, snapContentOf(n)),
     evidenceFabricated' = evidenceFabricated,
     evidenceConsumed' = evidenceConsumed,
@@ -1965,6 +2370,12 @@ module leaderElection {
       if (MAX_FOREIGN_BUMPS == 0) lastFetchedContent
       else lastFetchedContent.put(n, lease.content),
     foreignBumps' = foreignBumps,
+    conflictDeferredV' = conflictDeferredV,
+    blindConflictLose' = blindConflictLose,
+    acquireInstV' = acquireInstV,
+    stepDownReqV' = stepDownReqV,
+    stepDownsV' = stepDownsV,
+    staleStepDownServed' = staleStepDownServed,
     snap' = snap.put(n, Snap(lease)),
     held' = trackHeld(held, n, true),
     blindHolderFor' = 0,  // the holder re-believes; its entry is consumed
@@ -1993,6 +2404,12 @@ module leaderElection {
     lease.rv < MAX_RV,
     lease' = { ...lease, rv: lease.rv + 1 },
     foreignBumps' = foreignBumps + 1,
+    conflictDeferredV' = conflictDeferredV,
+    blindConflictLose' = blindConflictLose,
+    acquireInstV' = acquireInstV,
+    stepDownReqV' = stepDownReqV,
+    stepDownsV' = stepDownsV,
+    staleStepDownServed' = staleStepDownServed,
     clocks' = clocks, alive' = alive, leading' = leading,
     snap' = snap, obs' = obs, fence' = fence, gen' = gen,
     genHW' = genHW, genHWHolder' = genHWHolder,
@@ -2078,6 +2495,12 @@ module leaderElection {
     lastFetchedKey' = lastFetchedKey.put(n, -1),
     drops' = drops,
     foreignBumps' = foreignBumps,
+    conflictDeferredV' = conflictDeferredV,
+    blindConflictLose' = blindConflictLose,
+    acquireInstV' = acquireInstV,
+    stepDownReqV' = stepDownReqV,
+    stepDownsV' = stepDownsV,
+    staleStepDownServed' = staleStepDownServed,
     lastFetchedContent' = lastFetchedContent,
     evidenceFabricated' = evidenceFabricated,
     evidenceConsumed' = evidenceConsumed,
@@ -2148,6 +2571,12 @@ module leaderElection {
     unconfirmed' = unconfirmed, lastFetchedKey' = lastFetchedKey,
     drops' = drops,
     foreignBumps' = foreignBumps,
+    conflictDeferredV' = conflictDeferredV,
+    blindConflictLose' = blindConflictLose,
+    acquireInstV' = acquireInstV,
+    stepDownReqV' = stepDownReqV,
+    stepDownsV' = stepDownsV,
+    staleStepDownServed' = staleStepDownServed,
     lastFetchedContent' = lastFetchedContent,
     evidenceFabricated' = evidenceFabricated,
     evidenceConsumed' = evidenceConsumed,
@@ -2187,6 +2616,12 @@ module leaderElection {
     unconfirmed' = unconfirmed, lastFetchedKey' = lastFetchedKey,
     drops' = drops,
     foreignBumps' = foreignBumps,
+    conflictDeferredV' = conflictDeferredV,
+    blindConflictLose' = blindConflictLose,
+    acquireInstV' = acquireInstV,
+    stepDownReqV' = stepDownReqV,
+    stepDownsV' = stepDownsV,
+    staleStepDownServed' = staleStepDownServed,
     lastFetchedContent' = lastFetchedContent,
     evidenceFabricated' = evidenceFabricated,
     evidenceConsumed' = evidenceConsumed,
@@ -2234,6 +2669,12 @@ module leaderElection {
     lastFetchedContent' = NODES.mapBy(_ => -1),
     evidenceFabricated' = false,
     evidenceConsumed' = false,
+    conflictDeferredV' = NODES.mapBy(_ => false),
+    blindConflictLose' = false,
+    acquireInstV' = NODES.mapBy(_ => 0),
+    stepDownReqV' = NODES.mapBy(_ => NoStepDown),
+    stepDownsV' = 0,
+    staleStepDownServed' = false,
   }
 
   // --- 8. step ----------------------------------------------------------
@@ -2282,6 +2723,18 @@ module leaderElection {
     renewLease(n)
   }
   /// One node's PUT 409s against a stale snapshot.
+  action loseObservedAny = {
+    nondet n = NODES.oneOf()
+    loseObserved(n)
+  }
+  action requestStepDownAny = {
+    nondet n = NODES.oneOf()
+    requestStepDown(n)
+  }
+  action serveStepDownAny = {
+    nondet n = NODES.oneOf()
+    serveStepDown(n)
+  }
   action conflictAny = {
     nondet n = NODES.oneOf()
     conflict(n)
@@ -2361,6 +2814,13 @@ module leaderElection {
     // the introducing commit).
     renewSendLostAny,
     bumpRv,
+    // Fault/plane-gated (disabled at HOLDER_EVIDENCE_LOSE = false /
+    // MAX_STEP_DOWNS = 0 -- same discipline as the entries above;
+    // pre-existing regimes' state spaces re-measured byte-identical
+    // at the introducing commit).
+    loseObservedAny,
+    requestStepDownAny,
+    serveStepDownAny,
   }
 }
 
@@ -2468,7 +2928,11 @@ module leaderElectionBase {
     MAX_DROPS = 0,
     MAX_FOREIGN_BUMPS = 0,
     OBS_KEY_RV = false,
-    BLIND_HOLDER_BOUND = 0
+    BLIND_HOLDER_BOUND = 0,
+    HOLDER_EVIDENCE_LOSE = false,
+    CONFLICT_IMMEDIATE_LOSE = false,
+    MAX_STEP_DOWNS = 0,
+    STEP_DOWN_COUNT_KEYED = false
   ).*
 
   // --- deterministic protocol runs ---------------------------------------
@@ -2668,7 +3132,11 @@ module leaderElectionDeletion {
     MAX_DROPS = 0,
     MAX_FOREIGN_BUMPS = 0,
     OBS_KEY_RV = false,
-    BLIND_HOLDER_BOUND = 0
+    BLIND_HOLDER_BOUND = 0,
+    HOLDER_EVIDENCE_LOSE = false,
+    CONFLICT_IMMEDIATE_LOSE = false,
+    MAX_STEP_DOWNS = 0,
+    STEP_DOWN_COUNT_KEYED = false
   ).*
 }
 
@@ -2760,7 +3228,11 @@ module leaderElectionAsymmetric {
     MAX_DROPS = 0,
     MAX_FOREIGN_BUMPS = 0,
     OBS_KEY_RV = false,
-    BLIND_HOLDER_BOUND = 0
+    BLIND_HOLDER_BOUND = 0,
+    HOLDER_EVIDENCE_LOSE = false,
+    CONFLICT_IMMEDIATE_LOSE = false,
+    MAX_STEP_DOWNS = 0,
+    STEP_DOWN_COUNT_KEYED = false
   ).*
 }
 
@@ -2851,7 +3323,11 @@ module leaderElectionPgFaults {
     MAX_DROPS = 0,
     MAX_FOREIGN_BUMPS = 0,
     OBS_KEY_RV = false,
-    BLIND_HOLDER_BOUND = 0
+    BLIND_HOLDER_BOUND = 0,
+    HOLDER_EVIDENCE_LOSE = false,
+    CONFLICT_IMMEDIATE_LOSE = false,
+    MAX_STEP_DOWNS = 0,
+    STEP_DOWN_COUNT_KEYED = false
   ).*
 }
 
@@ -2900,7 +3376,11 @@ module leaderElectionSuspend {
     MAX_DROPS = 0,
     MAX_FOREIGN_BUMPS = 0,
     OBS_KEY_RV = false,
-    BLIND_HOLDER_BOUND = 0
+    BLIND_HOLDER_BOUND = 0,
+    HOLDER_EVIDENCE_LOSE = false,
+    CONFLICT_IMMEDIATE_LOSE = false,
+    MAX_STEP_DOWNS = 0,
+    STEP_DOWN_COUNT_KEYED = false
   ).*
 
   /// The suspend-straddle scenario, end to end: n1 acquires, its next
@@ -2964,7 +3444,11 @@ module leaderElectionShutdown {
     MAX_DROPS = 0,
     MAX_FOREIGN_BUMPS = 0,
     OBS_KEY_RV = false,
-    BLIND_HOLDER_BOUND = 0
+    BLIND_HOLDER_BOUND = 0,
+    HOLDER_EVIDENCE_LOSE = false,
+    CONFLICT_IMMEDIATE_LOSE = false,
+    MAX_STEP_DOWNS = 0,
+    STEP_DOWN_COUNT_KEYED = false
   ).*
 
   /// Fence-then-SIGTERM releases: n1 acquires, goes blind past its
@@ -3064,7 +3548,11 @@ module leaderElectionDroppedWrite {
     MAX_DROPS = 2,
     MAX_FOREIGN_BUMPS = 0,
     OBS_KEY_RV = false,
-    BLIND_HOLDER_BOUND = 8
+    BLIND_HOLDER_BOUND = 8,
+    HOLDER_EVIDENCE_LOSE = false,
+    CONFLICT_IMMEDIATE_LOSE = false,
+    MAX_STEP_DOWNS = 0,
+    STEP_DOWN_COUNT_KEYED = false
   ).*
 
   /// The mid-band step: no complete renew rounds (the regime's
@@ -3154,7 +3642,11 @@ module leaderElectionForeignRv {
     MAX_DROPS = 2,
     MAX_FOREIGN_BUMPS = 2,
     OBS_KEY_RV = false,
-    BLIND_HOLDER_BOUND = 8
+    BLIND_HOLDER_BOUND = 8,
+    HOLDER_EVIDENCE_LOSE = false,
+    CONFLICT_IMMEDIATE_LOSE = false,
+    MAX_STEP_DOWNS = 0,
+    STEP_DOWN_COUNT_KEYED = false
   ).*
 
   /// The mid-band step plus the foreign mutator (same fault economy
@@ -3169,5 +3661,126 @@ module leaderElectionForeignRv {
     renewSendLostAny,
     fetchObservesOwnCommitAny,
     bumpRv,
+  }
+}
+
+// =========================================================================
+// The holder-evidenced-lose regime (bughunt-4 S2, signed Q3): the
+// foreign-rv fault economy with BOTH non-lose rv-movers live -- own
+// dropped-then-committed writes (MAX_DROPS) and foreign metadata
+// patches (MAX_FOREIGN_BUMPS) -- and the deferral law enabled. The
+// operative properties: loseRequiresHolderEvidence (the blind-lose
+// latch never fires in this world -- only the twin's toggle can write
+// it), plus the inherited safety set (the deferral must not erode
+// neverDual's separation argument: a deferred believer keeps belief at
+// most one extra completed round, and FENCE/STEAL = 2/5 leaves the
+// margin the production constants' derivation requires).
+// Non-vacuity: noDeferredConflict is the reachability witness (expect
+// [violation] -- a believing 409 actually defers here); the
+// renewLease/loseObserved resolutions are exercised by the same
+// schedules that reach the deferral.
+// STATE-SPACE BASELINE: measurements live in the check transcript and
+// the introducing commit message (this module's first wiring), per the
+// house convention above.
+module leaderElectionHolderEvidence {
+  import leaderElection(
+    NODES = Set("n1", "n2"),
+    FENCE_AFTER = 2,
+    STEAL_AFTER = 5,
+    RENEW = 1,
+    MAX_SKEW = 1,
+    MAX_TIME = 10,
+    MAX_GEN = 4,
+    MAX_RV = 8,
+    MAX_DELETES = 0,
+    MAX_CLAIM_FAILURES = 0,
+    MAX_RESTORES = 0,
+    MAX_SUSPENDS = 0,
+    MAX_SHUTDOWNS = 0,
+    // ONE dropped-commit (vs the foreign-rv sibling's 2): the
+    // deferral law's fault menu needs one zombie (the own-commit
+    // rv-mover and its evidence path) plus two foreign patches (a
+    // deferral and an exhaustion without any holder change). The
+    // double-drop interplay -- two unconfirmed writes, the
+    // oldest-anchor ledger law -- is the droppedWrite regime's
+    // domain and stays at MAX_DROPS = 2 there. At 2 drops this
+    // regime exceeded 720M generated states without exhausting
+    // (measured before the trim); at 1 drop it is exhaustively
+    // checkable inside a wired gate budget.
+    MAX_DROPS = 1,
+    MAX_FOREIGN_BUMPS = 2,
+    OBS_KEY_RV = false,
+    BLIND_HOLDER_BOUND = 8,
+    HOLDER_EVIDENCE_LOSE = true,
+    CONFLICT_IMMEDIATE_LOSE = false,
+    MAX_STEP_DOWNS = 0,
+    STEP_DOWN_COUNT_KEYED = false
+  ).*
+
+  /// foreignRvStep plus the holder-evidenced resolution path.
+  action holderEvidenceStep = any {
+    tickAny,
+    apiGetAny,
+    stealAny,
+    renewLeaseAny,
+    conflictAny,
+    loseObservedAny,
+    selfFenceAny,
+    renewSendDroppedAny,
+    renewSendLostAny,
+    fetchObservesOwnCommitAny,
+    bumpRv,
+  }
+}
+
+// =========================================================================
+// The cooperative step-down regime (bughunt-4 S2, merged_bug_128): the
+// base fault economy plus the request/serve pair, instance-keyed (the
+// production law). The operative property: noStaleStepDownServed -- a
+// step-down is served only by the tenure instance that filed it; the
+// false-alarm fence -> same-epoch re-acquire pair clears a stale
+// request instead of inheriting it. The COUNT_KEYED twin restores the
+// transition-count stamp + no-clear world and falsifies it.
+// Non-vacuity: noStepDownRequested is the reachability witness (expect
+// [violation] -- requests are actually filed); legitimate same-
+// instance serves are reachable (the request->serve pair with no
+// intervening edge), so the law is exercised, not vacuously held.
+module leaderElectionStepDown {
+  import leaderElection(
+    NODES = Set("n1", "n2"),
+    FENCE_AFTER = 3,
+    STEAL_AFTER = 3,
+    RENEW = 1,
+    MAX_SKEW = 1,
+    MAX_TIME = 8,
+    MAX_GEN = 4,
+    MAX_RV = 8,
+    MAX_DELETES = 0,
+    MAX_CLAIM_FAILURES = 0,
+    MAX_RESTORES = 0,
+    MAX_SUSPENDS = 0,
+    MAX_SHUTDOWNS = 0,
+    MAX_DROPS = 0,
+    MAX_FOREIGN_BUMPS = 0,
+    OBS_KEY_RV = false,
+    BLIND_HOLDER_BOUND = 0,
+    HOLDER_EVIDENCE_LOSE = false,
+    CONFLICT_IMMEDIATE_LOSE = false,
+    MAX_STEP_DOWNS = 2,
+    STEP_DOWN_COUNT_KEYED = false
+  ).*
+
+  /// The base step plus the step-down pair.
+  action stepDownStep = any {
+    tickAny,
+    apiGetAny,
+    stealAny,
+    renewLeaseAny,
+    conflictAny,
+    selfFenceAny,
+    crashAny,
+    recoverAny,
+    requestStepDownAny,
+    serveStepDownAny,
   }
 }

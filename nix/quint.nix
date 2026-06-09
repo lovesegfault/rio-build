@@ -1504,6 +1504,129 @@ rec {
       main = "leaderElectionDroppedWrite";
     };
 
+    # The holder-evidence regime (bughunt-4 S2 merged_bug_085, signed
+    # Q3): the foreign-rv world PLUS the deferral law for the
+    # believing renew 409 — the ambiguous CAS bounce defers ONE round
+    # (keeping belief AND the unconfirmed-write ledger) instead of
+    # running the lose edge blind, and the lose fires only on typed
+    # holder evidence (a completed read naming another holder, or the
+    # deferral exhausted by a second consecutive bounce). The deferred
+    # bounce does NOT re-stamp the fence: a stamped deferral would
+    # extend belief with the lease content frozen — decoupled from the
+    # content writes that reset a standby's steal clock — and THIS
+    # regime's checker found exactly that dual (victim defers near its
+    # fence deadline, believes past the standby's steal) when the
+    # first cut stamped. Production computes will_defer before the
+    # blind stamp for the same reason. Headline:
+    # loseRequiresHolderEvidence — no believing first 409 ever runs
+    # the lose edge. neverDual re-verifies under the asymmetric
+    # margin; boundedDualLeadership prices the new mid-deferral dual
+    # shape (the deferral resolves or fences on the PRE-409 budget).
+    # The paired pin is quint-lease-calib-085-blind-conflict-lose
+    # (the immediate-lose world falsifies the headline).
+    # Measured (tttt duty, gating backend): TLC-exhaustive
+    # 968,119,453 generated / 220,855,702 distinct / depth 47 in
+    # 15m17s at 24 workers — the 3600s budget is ~3.9x headroom at
+    # that worker count; raise only with a new measured run. (At the
+    # foreign-rv sibling's MAX_DROPS = 2 the space exceeded 720M
+    # generated WITHOUT exhausting — the regime's module comment
+    # records the scope trim and what the droppedWrite regime keeps.)
+    # r[verify sched.lease.holder-evidenced-lose]
+    quint-leader-election-holder-evidence = mkQuintCheck {
+      name = "leader-election-holder-evidence";
+      # quint-policy P1 exemption (bughunt-2 slot 11; §5-Q13): same
+      # untwinned base leaf as the sibling regimes.
+      vacuityExempt = {
+        atMostOneCASWinner = {
+          class = "pre-r2-untwinned";
+          reason = "the falsifier needs an apiserver-fault twin (duplicate resourceVersion admission) — a new fault axis priced in the Q13 burn-down headline list";
+        };
+      };
+      spec = "leaderElection";
+      main = "leaderElectionHolderEvidence";
+      step = "holderEvidenceStep";
+      modelTimeoutSec = 3600;
+      invariants = [
+        "boundsOK"
+        "clockSkewBound"
+        "atMostOneCASWinner"
+        "loopInterval"
+        "boundedDualLeadership"
+        "staleLeaderHasStaleGeneration"
+        "neverDual"
+        "noFabricatedEvidence"
+        "blindHolderBounded"
+        "loseRequiresHolderEvidence"
+      ];
+    };
+
+    # Non-vacuity witness: a believing 409 actually DEFERS in the
+    # explored space — the loseRequiresHolderEvidence verdict above is
+    # about a space where the deferral law fires, not one where no
+    # conflict ever lands on a believer.
+    quint-leader-election-witness-deferred-conflict = mkQuintWitnessCheck {
+      name = "leader-election-witness-deferred-conflict";
+      spec = "leaderElection";
+      main = "leaderElectionHolderEvidence";
+      witness = "noDeferredConflict";
+      step = "holderEvidenceStep";
+    };
+
+    # The cooperative step-down regime (bughunt-4 S2 merged_bug_128):
+    # the pg-faults fault economy (crash/recover) plus the
+    # request/serve pair, instance-keyed per the production law — a
+    # step-down request is stamped with the per-acquire INSTANCE that
+    # filed it, the acquire/rebound edges clear any pending request,
+    # and a serve demands the stamp match the CURRENT instance.
+    # Headline: noStaleStepDownServed — recovery #1's demotion never
+    # fires against the re-acquired tenure that superseded it (the
+    # same-count ABA: a false-alarm fence + same-epoch re-acquire
+    # REPEATS the transition count, which is why the count was the
+    # wrong key). The paired pin is
+    # quint-lease-calib-128-count-keyed-stepdown (the count-keyed +
+    # no-clear world falsifies it).
+    # Measured (tttt duty, gating backend): TLC-exhaustive
+    # 582,741,343 generated / 94,208,853 distinct / depth 45 in 7m22s
+    # at 24 workers — the 3600s budget is ~8x headroom at that worker
+    # count; raise only with a new measured run.
+    # r[verify sched.recovery.step-down+3]
+    quint-leader-election-step-down = mkQuintCheck {
+      name = "leader-election-step-down";
+      modelTimeoutSec = 3600;
+      # quint-policy P1 exemption (bughunt-2 slot 11; §5-Q13): same
+      # untwinned base leaf as the sibling regimes.
+      vacuityExempt = {
+        atMostOneCASWinner = {
+          class = "pre-r2-untwinned";
+          reason = "the falsifier needs an apiserver-fault twin (duplicate resourceVersion admission) — a new fault axis priced in the Q13 burn-down headline list";
+        };
+      };
+      spec = "leaderElection";
+      main = "leaderElectionStepDown";
+      step = "stepDownStep";
+      invariants = [
+        "boundsOK"
+        "clockSkewBound"
+        "atMostOneCASWinner"
+        "loopInterval"
+        "boundedDualLeadership"
+        "staleLeaderHasStaleGeneration"
+        "noStaleStepDownServed"
+      ];
+    };
+
+    # Non-vacuity witness: step-down requests are actually FILED (and
+    # therefore serveable) in the explored space — the
+    # noStaleStepDownServed verdict above is about a space where the
+    # request/serve machinery runs.
+    quint-leader-election-witness-step-down-requested = mkQuintWitnessCheck {
+      name = "leader-election-witness-step-down-requested";
+      spec = "leaderElection";
+      main = "leaderElectionStepDown";
+      witness = "noStepDownRequested";
+      step = "stepDownStep";
+    };
+
     # The leader-marks reconciliation model (bughunt-wave F1
     # merged_bug_138; DirtyGen rework bughunt2-wave slot 8 bug_181):
     # the deletion-cost/label machinery as a level-triggered protocol —
@@ -1636,6 +1759,41 @@ rec {
       spec = "calibration/lease-180-rv-keyed";
       main = "leaseCalib180RvKeyed";
       witness = "noFabricatedEvidence";
+      step = "calibStep";
+      extraSpecs = [ "leaderElection" ];
+    };
+
+    # merged_bug_085 pre-fix (bughunt-4 S2, signed Q3): IMMEDIATE LOSE
+    # on the believing renew 409 — CONFLICT_IMMEDIATE_LOSE restores
+    # the lose-on-first-409 arm inside the holder-evidence world. Any
+    # rv movement between the holder's GET and PUT (a foreign bumpRv,
+    # or its own dropped-then-committed write surfacing) bounces the
+    # CAS and the believing FIRST 409 runs the full lose edge with
+    # neither holder evidence nor an exhausted deferral;
+    # loseRequiresHolderEvidence falls. The blind failover (and the
+    # ledger wipe that rode on it) the deferral law exists to prevent.
+    quint-lease-calib-085-blind-conflict-lose = mkQuintWitnessCheck {
+      name = "lease-calib-085-blind-conflict-lose";
+      spec = "calibration/lease-085-blind-conflict-lose";
+      main = "leaseCalib085BlindConflictLose";
+      witness = "loseRequiresHolderEvidence";
+      step = "calibStep";
+      extraSpecs = [ "leaderElection" ];
+    };
+
+    # merged_bug_128 pre-fix (bughunt-4 S2): COUNT-KEYED step-down —
+    # STEP_DOWN_COUNT_KEYED stamps requests with the generation-
+    # derived transition count (which a false-alarm fence +
+    # same-epoch re-acquire legitimately REPEATS) and skips the
+    # acquire-edge clear. A request filed by tenure instance 1 serves
+    # against instance 2 at the same count; noStaleStepDownServed
+    # falls. The same-count ABA the per-acquire instance stamp
+    # exists to prevent.
+    quint-lease-calib-128-count-keyed-stepdown = mkQuintWitnessCheck {
+      name = "lease-calib-128-count-keyed-stepdown";
+      spec = "calibration/lease-128-count-keyed-stepdown";
+      main = "leaseCalib128CountKeyedStepDown";
+      witness = "noStaleStepDownServed";
       step = "calibStep";
       extraSpecs = [ "leaderElection" ];
     };
