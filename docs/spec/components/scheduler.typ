@@ -1810,7 +1810,8 @@ clock.
   name): the count of derivations carrying a CLAIMABLE materialization job
   --- unclaimed, not parked, not deferred:
   #rref("sched.materialize.claimability-projection")'s three axes. Parked
-  jobs MUST remain visible via `rio_scheduler_materialization_stalled`;
+  jobs MUST remain visible via
+  #(refs.metric)("rio_scheduler_materialization_stalled");
   deferred jobs (`defer_until` --- the bounded <=300s re-probe window) are
   counted in NEITHER gauge for that window. The snapshot match over
   `DerivationStatus` MUST be exhaustive so future status additions are

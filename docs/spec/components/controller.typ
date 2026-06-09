@@ -1008,7 +1008,8 @@ completions the closed-edge inference allowed.
   (#rref("sched.admin.snapshot-substituting")); claimable backlog is thereby
   visible to the predictive signal before any store replica claims the work.
   Parked and deferred jobs are pacing, not demand: they leave the bucket
-  (parked stay visible via `rio_scheduler_materialization_stalled`; deferred
+  (parked stay visible via
+  #(refs.metric)("rio_scheduler_materialization_stalled"); deferred
   sit in neither gauge for their bounded <=300s window), so a park/defer-heavy
   cascade reads near-zero here BY DESIGN --- the store cannot make a parked
   job progress, and holding capacity for it would defeat the pacing.

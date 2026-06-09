@@ -92,8 +92,8 @@ per-message progress drains without a whole-call deadline.
   [Tenant CRUD],
 )
 
-There is no `drain-executor` subcommand: it was removed together with
-`AdminService.DrainExecutor` (the executor-lifecycle proto sweep). When you
+There is no `drain-executor` subcommand: the removed `AdminService.DrainExecutor`
+RPC was deleted outright by the executor-lifecycle proto sweep. When you
 reach for a drain, the successor procedures are cordon + exclusion, cancel +
 Job delete, or pool pause.
 
