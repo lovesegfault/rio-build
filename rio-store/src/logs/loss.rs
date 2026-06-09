@@ -46,11 +46,18 @@ use std::sync::OnceLock;
 
 use uuid::Uuid;
 
-/// Bound on remembered hole identities. At 64 bytes per entry this is
-/// ~512 KiB worst case; eviction is FIFO (oldest first sighting
-/// forgotten first), so a pathological key churn degrades toward the
-/// old per-visit behavior rather than growing without bound.
-const LEDGER_CAP: usize = 8192;
+/// Per-family bounds on remembered anomaly identities
+/// (merged_bug_336): when a dedup key gains an axis, capacity
+/// restates per axis value -- one shared FIFO let a divergence
+/// identity flood evict noted Loss holes, so the pager re-fired on
+/// known holes mid-flood. Loss holes are rare and page-bearing (a
+/// small budget is plenty); divergence is the high-churn warn family
+/// and keeps the original bound. Eviction is FIFO INSIDE the family
+/// (oldest first sighting forgotten first), so pathological churn in
+/// one family degrades only that family toward per-visit behavior.
+/// Worst case ~64 bytes/entry: ~64 KiB + ~512 KiB.
+const LOSS_LEDGER_CAP: usize = 1024;
+const DIVERGENCE_LEDGER_CAP: usize = 8192;
 
 /// The process-global hole ledger. A `OnceLock<Mutex<..>>` rather than
 /// a field threaded through the serve stack: the dedup is a
@@ -70,26 +77,48 @@ enum AnomalyFamily {
     Divergence,
 }
 
+/// One family's bounded identity set: cap + FIFO inside the family.
 #[derive(Default)]
-struct Ledger {
-    seen: HashSet<(AnomalyFamily, Uuid, String)>,
-    order: VecDeque<(AnomalyFamily, Uuid, String)>,
+struct Partition {
+    seen: HashSet<(Uuid, String)>,
+    order: VecDeque<(Uuid, String)>,
 }
 
-impl Ledger {
-    /// Insert; true iff this is the key's first sighting.
-    fn first_sighting(&mut self, family: AnomalyFamily, exec_id: Uuid, s3_key: &str) -> bool {
-        if self.seen.contains(&(family, exec_id, s3_key.to_owned())) {
+impl Partition {
+    fn first_sighting(&mut self, cap: usize, exec_id: Uuid, s3_key: &str) -> bool {
+        if self.seen.contains(&(exec_id, s3_key.to_owned())) {
             return false;
         }
-        if self.order.len() >= LEDGER_CAP
+        if self.order.len() >= cap
             && let Some(evicted) = self.order.pop_front()
         {
             self.seen.remove(&evicted);
         }
-        self.seen.insert((family, exec_id, s3_key.to_owned()));
-        self.order.push_back((family, exec_id, s3_key.to_owned()));
+        self.seen.insert((exec_id, s3_key.to_owned()));
+        self.order.push_back((exec_id, s3_key.to_owned()));
         true
+    }
+}
+
+#[derive(Default)]
+struct Ledger {
+    loss: Partition,
+    divergence: Partition,
+}
+
+impl Ledger {
+    /// Insert; true iff this is the key's first sighting in its
+    /// family. The match is exhaustive over [`AnomalyFamily`]: a new
+    /// family does not compile until it declares its own partition
+    /// and cap -- capacity cannot silently be shared again.
+    fn first_sighting(&mut self, family: AnomalyFamily, exec_id: Uuid, s3_key: &str) -> bool {
+        match family {
+            AnomalyFamily::Loss => self.loss.first_sighting(LOSS_LEDGER_CAP, exec_id, s3_key),
+            AnomalyFamily::Divergence => {
+                self.divergence
+                    .first_sighting(DIVERGENCE_LEDGER_CAP, exec_id, s3_key)
+            }
+        }
     }
 }
 
@@ -337,7 +366,7 @@ mod tests {
         let exec = Uuid::now_v7();
         let first_key = "logs/bound-0".to_owned();
         assert!(ledger.first_sighting(AnomalyFamily::Loss, exec, &first_key));
-        for i in 1..=LEDGER_CAP {
+        for i in 1..=LOSS_LEDGER_CAP {
             ledger.first_sighting(AnomalyFamily::Loss, exec, &format!("logs/bound-{i}"));
         }
         // first_key was evicted by the CAP+1'th insert: re-noting it is
@@ -346,5 +375,27 @@ mod tests {
         assert!(ledger.first_sighting(AnomalyFamily::Loss, exec, &first_key));
         // Eviction is EXACT FIFO: bound-2 survived both evictions.
         assert!(!ledger.first_sighting(AnomalyFamily::Loss, exec, "logs/bound-2"));
+    }
+
+    /// merged_bug_336 (red-first): the family is part of the ledger
+    /// KEY but capacity is per-family too -- a divergence identity
+    /// flood must not evict Loss entries. Pre-fix the single shared
+    /// 8192 FIFO let 8193 divergence sightings push a noted hole out,
+    /// so the pager re-fired on a known hole mid-flood.
+    #[test]
+    fn divergence_flood_does_not_evict_loss_entries() {
+        let mut ledger = Ledger::default();
+        let exec = Uuid::now_v7();
+        // Note one hole, then flood divergences past the shared cap.
+        assert!(ledger.first_sighting(AnomalyFamily::Loss, exec, "logs/the-hole"));
+        for i in 0..=DIVERGENCE_LEDGER_CAP {
+            ledger.first_sighting(AnomalyFamily::Divergence, exec, &format!("logs/div-{i}"));
+        }
+        assert!(
+            !ledger.first_sighting(AnomalyFamily::Loss, exec, "logs/the-hole"),
+            "a divergence flood evicted a noted hole -- the pager would re-fire"
+        );
+        // And the flood evicts within its own family (FIFO preserved).
+        assert!(ledger.first_sighting(AnomalyFamily::Divergence, exec, "logs/div-0"));
     }
 }
