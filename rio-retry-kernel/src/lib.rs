@@ -2094,13 +2094,19 @@ fn admit_bounded_uncharged<Id>(
 ///   victims through this row). The ordering is data-structural: it
 ///   holds under ANY retention configuration, not just
 ///   `exec_retention_days >= log_retention_days`.
-/// - `!has_live_ingest_session`: a registered `log_ingest_sessions`
-///   row means the execution is still producing artifacts; the
-///   lifecycle row anchors the routing registry.
+/// - `session`: the `log_ingest_sessions` observation. ONLY
+///   [`IngestSessionObservation::Live`] vetoes — a LIVE session means
+///   the execution is still producing artifacts and the row anchors
+///   the live routing registry. A STALE row is a dead replica's
+///   leftover: it routes nothing (`lookup_live` ignores it), anchors
+///   no in-flight buffer, and must not pin the exec row (bug_234 —
+///   the abstract bool this replaced let the SQL twin drift to an
+///   existence check, structurally invisible to this proof).
 /// - `aged_out`: past `exec_retention_days` (the SQL twin binds the
 ///   configured value).
 ///
-/// The SQL twin is `gc_exec_rows` in rio-scheduler `db/attempts.rs`;
+/// The SQL twin is `gc_exec_rows` in rio-scheduler `db/attempts.rs`
+/// (liveness per `rio_migrations::sql::SESSION_STALE_AFTER_SECS`);
 /// its DB tests pin all six conjuncts against real rows.
 // r[impl store.log.sweep-ownership+1]
 pub fn exec_row_sweep_eligible(
@@ -2108,15 +2114,34 @@ pub fn exec_row_sweep_eligible(
     has_active_assignment: bool,
     referenced_by_ledger: bool,
     has_log_chunks: bool,
-    has_live_ingest_session: bool,
+    session: IngestSessionObservation,
     aged_out: bool,
 ) -> bool {
     terminal
         && !has_active_assignment
         && !referenced_by_ledger
         && !has_log_chunks
-        && !has_live_ingest_session
+        && session != IngestSessionObservation::Live
         && aged_out
+}
+
+/// What the sweep observed in `log_ingest_sessions` for the victim's
+/// `exec_id` — the typed alphabet behind `exec_row_sweep_eligible`'s
+/// conjunct 5. Three states, not a bool: the existence/liveness
+/// distinction IS the bug_234 defect surface, so the kernel carries it
+/// explicitly and the proof sweeps all three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestSessionObservation {
+    /// No row at all.
+    Absent,
+    /// A row with a fresh heartbeat (younger than the shared staleness
+    /// bound): the execution is still producing artifacts. The ONLY
+    /// vetoing state.
+    Live,
+    /// A row whose heartbeat is past the staleness bound: a dead
+    /// replica's leftover. Routes nothing, anchors nothing, does not
+    /// veto.
+    Stale,
 }
 
 /// The floor-bump outcome as [`classify`] consumes it — a leaf-local
@@ -4140,31 +4165,61 @@ mod proofs {
     /// [`exec_row_sweep_eligible`] is exactly the six-conjunct guard:
     /// eligibility implies every safety conjunct (terminal, no active
     /// assignment, no ledger reference, no surviving log chunks, no
-    /// live ingest session, aged out), and any single violated conjunct
+    /// LIVE ingest session, aged out), and any single violated conjunct
     /// vetoes — the second deleter of execution rows can never weaken
     /// to a disjunction or drop a guard without this harness failing.
-    /// `kani::cover!` proves the predicate is satisfiable: a harness
-    /// over an unsatisfiable conjunction would certify vacuously.
+    ///
+    /// The session axis sweeps the FULL three-state alphabet (bug_234:
+    /// the abstract bool let the SQL drift to an existence check,
+    /// invisible to the old proof) with one `kani::cover!` per variant
+    /// — a constructor that silently excluded a variant would fail the
+    /// reachability cover, the round-3 pick-table lesson. Stale must
+    /// NOT veto (covered eligible), Live must veto (asserted), Absent
+    /// behaves as before.
     #[kani::proof]
     fn check_exec_row_sweep_guards() {
         let terminal: bool = kani::any();
         let active: bool = kani::any();
         let referenced: bool = kani::any();
         let chunks: bool = kani::any();
-        let session: bool = kani::any();
+        let session = match kani::any::<u8>() {
+            0 => IngestSessionObservation::Absent,
+            1 => IngestSessionObservation::Live,
+            _ => IngestSessionObservation::Stale,
+        };
         let aged: bool = kani::any();
+
+        kani::cover!(
+            session == IngestSessionObservation::Absent,
+            "Absent reachable"
+        );
+        kani::cover!(session == IngestSessionObservation::Live, "Live reachable");
+        kani::cover!(
+            session == IngestSessionObservation::Stale,
+            "Stale reachable"
+        );
 
         let eligible = exec_row_sweep_eligible(terminal, active, referenced, chunks, session, aged);
         kani::cover!(eligible, "the sweep predicate is satisfiable");
+        kani::cover!(
+            eligible && session == IngestSessionObservation::Stale,
+            "a stale (dead-replica) row does not pin the exec row"
+        );
         if eligible {
             assert!(terminal);
             assert!(!active);
             assert!(!referenced);
             assert!(!chunks);
-            assert!(!session);
+            assert!(session != IngestSessionObservation::Live);
             assert!(aged);
         }
-        if !terminal || active || referenced || chunks || session || !aged {
+        if !terminal
+            || active
+            || referenced
+            || chunks
+            || session == IngestSessionObservation::Live
+            || !aged
+        {
             assert!(!eligible);
         }
     }

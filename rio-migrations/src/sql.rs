@@ -47,6 +47,32 @@ pub const LIVE_WANTED_NAME_ROWS_BY_DRV_SQL: &str = "SELECT d.output_names, d.exp
        JOIN live_wanted_interest i USING (derivation_id) \
       WHERE d.drv_hash = $1";
 
+/// THE definition of `log_ingest_sessions` liveness (bug_234): a
+/// session is LIVE iff its heartbeat is younger than this. Every
+/// consumer derives from here — the store's `lookup_live` routing
+/// read, `acquire`'s steal arm (staleness = `NOT` this predicate),
+/// the store's stale-session reap, and the scheduler's
+/// `gc_exec_rows` conjunct 5. Before this const, the scheduler's
+/// conjunct checked bare row EXISTENCE while every doc promised
+/// liveness: an uncleanly-died stream's leftover row pinned its exec
+/// row for the full `log_retention` (30 d) regardless of the
+/// operator's `exec_retention_days`.
+///
+/// The store's heartbeat refresh interval is half of this (one missed
+/// heartbeat survives, two do not) — `HEARTBEAT_INTERVAL` in
+/// `rio-store::logs::sessions` asserts the ratio at compile time.
+pub const SESSION_STALE_AFTER_SECS: f64 = 30.0;
+
+/// SQL predicate fragment: the named `heartbeat_at` column is LIVE.
+/// `hb` is the (qualified) column reference; `bind` the parameter
+/// carrying [`SESSION_STALE_AFTER_SECS`] (a `make_interval` bind, so
+/// the query text cannot drift from the const). Staleness is `NOT
+/// (...)` of this — complementary by construction, never a second
+/// hand-written comparison.
+pub fn live_ingest_session_sql(hb: &str, bind: &str) -> String {
+    format!("{hb} > now() - make_interval(secs => {bind})")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

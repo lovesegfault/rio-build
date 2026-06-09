@@ -667,6 +667,13 @@ pub fn describe_metrics() {
          fails; the difference is orphaned objects bounded by the S3 \
          lifecycle rule on logs/."
     );
+    describe_counter!(
+        "rio_store_log_sweep_stale_sessions_reaped_total",
+        "log_ingest_sessions rows reaped after their owner died \
+         uncleanly (heartbeat stale past the reap grace). Convergence \
+         hygiene: liveness consumers already ignore stale rows, this \
+         only bounds dead-row accumulation."
+    );
     describe_gauge!(
         "rio_store_log_active_ingest_sessions",
         "AppendLog streams currently open on this replica. Each holds a \

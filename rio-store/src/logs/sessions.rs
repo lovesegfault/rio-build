@@ -49,7 +49,22 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
 /// A session whose heartbeat is older than this is dead: its lease is
 /// stealable by [`acquire`] and it is invisible to [`lookup_live`].
-pub const SESSION_STALE_AFTER: Duration = Duration::from_secs(30);
+///
+/// Derived from THE shared definition
+/// ([`rio_migrations::sql::SESSION_STALE_AFTER_SECS`]) — the
+/// scheduler's `gc_exec_rows` conjunct 5 and the store's stale-session
+/// reap consume the same constant, so "live" cannot mean different
+/// ages to different consumers (bug_234).
+pub const SESSION_STALE_AFTER: Duration =
+    Duration::from_secs(rio_migrations::sql::SESSION_STALE_AFTER_SECS as u64);
+
+// One missed heartbeat survives, two do not — the lease math every
+// doc in this module quotes. Compile-time so the shared const cannot
+// drift away from the refresh cadence.
+const _: () = assert!(
+    HEARTBEAT_INTERVAL.as_secs() * 2 == SESSION_STALE_AFTER.as_secs(),
+    "HEARTBEAT_INTERVAL must be half of SESSION_STALE_AFTER"
+);
 
 /// A live ingest session, as seen by a `TailLog` reader deciding where
 /// the in-memory tail of an execution's log lives.
@@ -107,26 +122,33 @@ pub async fn acquire(
     session_id: Uuid,
     replica_pod: &str,
 ) -> Result<Acquire, sqlx::Error> {
-    let won: Option<(Uuid,)> = sqlx::query_as(
-        r"
-        INSERT INTO log_ingest_sessions (exec_id, session_id, replica_pod)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (exec_id) DO UPDATE SET
-            session_id   = EXCLUDED.session_id,
-            replica_pod  = EXCLUDED.replica_pod,
-            started_at   = now(),
-            heartbeat_at = now()
-        WHERE log_ingest_sessions.heartbeat_at < now() - make_interval(secs => $4)
-           OR log_ingest_sessions.replica_pod = EXCLUDED.replica_pod
-        RETURNING session_id
-        ",
-    )
-    .bind(exec_id)
-    .bind(session_id)
-    .bind(replica_pod)
-    .bind(SESSION_STALE_AFTER.as_secs_f64())
-    .fetch_optional(pool)
-    .await?;
+    // Staleness is NOT(live) of the ONE shared predicate — never a
+    // second hand-written comparison (bug_234: complementary by
+    // construction, including the exact-equality boundary).
+    let steal_sql = format!(
+        "INSERT INTO log_ingest_sessions (exec_id, session_id, replica_pod) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (exec_id) DO UPDATE SET \
+             session_id   = EXCLUDED.session_id, \
+             replica_pod  = EXCLUDED.replica_pod, \
+             started_at   = now(), \
+             heartbeat_at = now() \
+         WHERE NOT ({live}) \
+            OR log_ingest_sessions.replica_pod = EXCLUDED.replica_pod \
+         RETURNING session_id",
+        live =
+            rio_migrations::sql::live_ingest_session_sql("log_ingest_sessions.heartbeat_at", "$4")
+    );
+    // AssertSqlSafe: composed exclusively from const fragments
+    // (rio-migrations) and literal bind placeholders — no runtime data
+    // enters the text.
+    let won: Option<(Uuid,)> = sqlx::query_as(sqlx::AssertSqlSafe(steal_sql))
+        .bind(exec_id)
+        .bind(session_id)
+        .bind(replica_pod)
+        .bind(SESSION_STALE_AFTER.as_secs_f64())
+        .fetch_optional(pool)
+        .await?;
 
     if won.is_some() {
         return Ok(Acquire::Acquired);
@@ -193,14 +215,17 @@ pub async fn release(pool: &PgPool, exec_id: Uuid, session_id: Uuid) -> Result<(
 /// it held is gone). `TailLog` readers fall back to a history-only read
 /// in both cases; the distinction does not matter to them.
 pub async fn lookup_live(pool: &PgPool, exec_id: Uuid) -> Result<Option<LiveSession>, sqlx::Error> {
-    let row: Option<(Uuid, String)> = sqlx::query_as(
+    let live_sql = format!(
         "SELECT session_id, replica_pod FROM log_ingest_sessions \
-         WHERE exec_id = $1 AND heartbeat_at > now() - make_interval(secs => $2)",
-    )
-    .bind(exec_id)
-    .bind(SESSION_STALE_AFTER.as_secs_f64())
-    .fetch_optional(pool)
-    .await?;
+         WHERE exec_id = $1 AND {live}",
+        live = rio_migrations::sql::live_ingest_session_sql("heartbeat_at", "$2")
+    );
+    // AssertSqlSafe: const-fragment composition, no runtime data.
+    let row: Option<(Uuid, String)> = sqlx::query_as(sqlx::AssertSqlSafe(live_sql))
+        .bind(exec_id)
+        .bind(SESSION_STALE_AFTER.as_secs_f64())
+        .fetch_optional(pool)
+        .await?;
     Ok(row.map(|(session_id, replica_pod)| LiveSession {
         session_id,
         replica_pod,

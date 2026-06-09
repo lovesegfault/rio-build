@@ -198,6 +198,7 @@
     "rio_store_log_read_divergence_total",
     "rio_store_log_sweep_chunks_deleted_total",
     "rio_store_log_sweep_objects_deleted_total",
+    "rio_store_log_sweep_stale_sessions_reaped_total",
     "rio_store_log_tail_dropped_total",
     "rio_store_log_tail_fanout_recovered_total",
     "rio_store_log_tail_proxied_total",
@@ -1242,6 +1243,11 @@
         "name": "rio_store_log_sweep_objects_deleted_total",
         "kind": "counter",
         "help": "Chunk objects deleted from the backend by the build-log TTL sweep. Lags ..._chunks_deleted_total when a backend delete fails; the difference is orphaned objects bounded by the S3 lifecycle rule on logs/."
+      },
+      {
+        "name": "rio_store_log_sweep_stale_sessions_reaped_total",
+        "kind": "counter",
+        "help": "log_ingest_sessions rows reaped after their owner died uncleanly (heartbeat stale past the reap grace). Convergence hygiene: liveness consumers already ignore stale rows, this only bounds dead-row accumulation."
       },
       {
         "name": "rio_store_log_tail_dropped_total",

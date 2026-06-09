@@ -119,3 +119,19 @@ Generated: `grep -rn 'clamped_duration_secs\|ClampedSecs::from_f64\|clamped::epo
 | rio-controller/src/reconcilers/nodeclaim_pool/sketch.rs:568 | `sketch_epoch_secs` (timestamptz) | **EPOCH** | `clamped::epoch_secs` (was inline `try_from_secs_f64` — migrated to the funnel) |
 
 Zero epoch-domain feeds of the age clamp remain; zero inline `try_from_secs_f64` sites remain (the ban admits only `clamped::epoch_secs`).
+
+## C10 — session-liveness consumer census (bug_234)
+
+Generated: `grep -rn 'heartbeat_at\|SESSION_STALE_AFTER\|IngestSessionObservation\|live_ingest_session_sql' --include='*.rs' rio-* | grep -v test` — every consumer of ingest-session liveness, all deriving from the ONE rio-migrations definition.
+
+| consumer | role | derivation |
+|---|---|---|
+| rio-migrations/src/sql.rs:64 | THE definition (`SESSION_STALE_AFTER_SECS` + `live_ingest_session_sql`) | source of truth |
+| rio-store sessions.rs:140 (`acquire` steal arm) | staleness = `NOT (live)` | shared fragment, $4 bind |
+| rio-store sessions.rs:221 (`lookup_live`) | routing read: live only | shared fragment, $2 bind |
+| rio-store sessions.rs:58 (`SESSION_STALE_AFTER`) | crate-local const | derived from the shared const + compile-time heartbeat-ratio assert |
+| rio-store sweep.rs:187 (`sweep_stale_sessions`) | dead-row reap at 10× grace | shared fragment, $1 bind |
+| rio-scheduler db/attempts.rs:651 (`gc_exec_rows` conjunct 5) | liveness veto (was existence — the defect) | shared fragment + shared const |
+| rio-retry-kernel `IngestSessionObservation` | the typed 3-state alphabet behind conjunct 5; only `Live` vetoes | full-alphabet kani sweep, 5/5 covers |
+
+Every comparison against `heartbeat_at` in the workspace routes through `live_ingest_session_sql`; zero hand-written copies remain.

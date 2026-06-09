@@ -161,6 +161,39 @@ pub async fn sweep_expired_logs(
     Ok(stats)
 }
 
+/// Grace before a dead session row is reaped outright: 10× the
+/// staleness bound (300 s). Generous on purpose — liveness consumers
+/// (`lookup_live`, the scheduler's `gc_exec_rows` conjunct 5) already
+/// ignore stale rows at [`super::sessions::SESSION_STALE_AFTER`], so
+/// this reap is pure convergence hygiene: existence converges to
+/// liveness instead of dead rows dangling until the 30-day log TTL
+/// (bug_234 — mirroring the predicate alone would leave them forever).
+/// The wide margin keeps the reap structurally incapable of racing a
+/// live session's heartbeat cadence.
+pub const SESSION_REAP_GRACE_SECS: f64 = rio_migrations::sql::SESSION_STALE_AFTER_SECS * 10.0;
+
+/// Reap `log_ingest_sessions` rows whose owner died uncleanly: rows
+/// stale past [`SESSION_REAP_GRACE_SECS`]. Returns the reap count.
+///
+/// Runs on the same periodic task as [`sweep_expired_logs`] — the
+/// hourly cadence is fine because nothing *waits* on this deletion
+/// (every liveness consumer already ignores stale rows); it only
+/// bounds dead-row accumulation.
+pub async fn sweep_stale_sessions(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    // Staleness is NOT(live) of the ONE shared predicate (bug_234),
+    // with the grace substituted for the staleness bound.
+    let sql = format!(
+        "DELETE FROM log_ingest_sessions WHERE NOT ({live})",
+        live = rio_migrations::sql::live_ingest_session_sql("heartbeat_at", "$1")
+    );
+    // AssertSqlSafe: const-fragment composition, no runtime data.
+    let result = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(SESSION_REAP_GRACE_SECS)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 /// Spawn the hourly sweep task. Mirrors
 /// [`crate::gc::orphan::spawn_scanner`]: a panic is logged and
 /// the store keeps serving (degraded GC, not down); shutdown cancels the
@@ -187,6 +220,19 @@ pub fn spawn_log_sweep(
                 Ok(_) => {}
                 Err(e) => {
                     warn!(error = %e, "log TTL sweep failed (will retry next interval)");
+                }
+            }
+            // Dead-session convergence (bug_234): reap rows whose
+            // owner died uncleanly, independent of the 30-day log TTL.
+            match sweep_stale_sessions(&pool).await {
+                Ok(0) => {}
+                Ok(reaped) => {
+                    info!(reaped, "log TTL sweep: reaped stale ingest sessions");
+                    metrics::counter!("rio_store_log_sweep_stale_sessions_reaped_total")
+                        .increment(reaped);
+                }
+                Err(e) => {
+                    warn!(error = %e, "stale-session reap failed (will retry next interval)");
                 }
             }
         }
@@ -351,6 +397,44 @@ mod tests {
         for key in &fresh_keys {
             assert!(store.get(key).await.is_ok(), "fresh object {key} kept");
         }
+    }
+
+    /// bug_234: the stale-session reap deletes rows whose owner died
+    /// uncleanly (heartbeat past the grace) and ONLY those — a live
+    /// session and a stale-but-within-grace session both survive (the
+    /// latter is already invisible to every liveness consumer; the
+    /// grace exists so this reap can never race a heartbeat).
+    #[tokio::test]
+    async fn stale_session_reap_respects_grace() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        for (pod, hb_age_secs) in [
+            ("store-live", 0.0),
+            ("store-stale-in-grace", 120.0),
+            ("store-dead", SESSION_REAP_GRACE_SECS + 100.0),
+        ] {
+            sqlx::query(
+                "INSERT INTO log_ingest_sessions \
+                     (exec_id, session_id, replica_pod, heartbeat_at) \
+                 VALUES ($1, $2, $3, now() - make_interval(secs => $4))",
+            )
+            .bind(Uuid::now_v7())
+            .bind(Uuid::now_v7())
+            .bind(pod)
+            .bind(hb_age_secs)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+
+        let reaped = sweep_stale_sessions(&db.pool).await.unwrap();
+        assert_eq!(reaped, 1, "only the past-grace row is reaped");
+
+        let survivors: Vec<String> =
+            sqlx::query_scalar("SELECT replica_pod FROM log_ingest_sessions ORDER BY replica_pod")
+                .fetch_all(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(survivors, vec!["store-live", "store-stale-in-grace"]);
     }
 
     /// An empty table is a no-op pass, not a panic or an error.

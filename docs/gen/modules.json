@@ -314,6 +314,11 @@
       "doc": "Exponential backoff with jitter, and a shutdown-aware retry loop."
     },
     {
+      "path": "clamped.rs",
+      "depth": 0,
+      "doc": "One clamped constructor for externally-sourced seconds → `Duration`"
+    },
+    {
       "path": "config.rs",
       "depth": 0,
       "doc": "Layered configuration: compiled defaults → TOML file → `RIO_*` env → CLI flags."

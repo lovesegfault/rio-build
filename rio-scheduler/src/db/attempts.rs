@@ -607,7 +607,10 @@ impl SchedulerDb {
     ///    forever — the store's TTL sweep selects victims through this
     ///    row; data-structural, holds under ANY retention config),
     /// 5. with **no live `log_ingest_sessions` row** (still producing
-    ///    artifacts; the row anchors the routing registry),
+    ///    artifacts; the row anchors the routing registry). LIVE per
+    ///    THE shared definition (`rio_migrations::sql` — bug_234): a
+    ///    stale row is a dead replica's leftover, routes nothing, and
+    ///    does not pin,
     /// 6. and **older than `retention_secs`**.
     ///
     /// One statement, one MVCC snapshot, for the same stability
@@ -620,7 +623,15 @@ impl SchedulerDb {
         retention_secs: f64,
         limit: i64,
     ) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query(
+        // Conjunct 5 is the LIVENESS predicate, not bare existence
+        // (bug_234): a stale row is a dead replica's leftover — it
+        // routes nothing (`lookup_live` ignores it) and anchors no
+        // in-flight artifacts, so it must not pin the exec row for the
+        // remaining `log_retention − exec_retention` days. Predicate
+        // text and staleness constant are THE shared definitions from
+        // rio-migrations — this query cannot drift from the store's
+        // reads.
+        let sql = format!(
             "DELETE FROM drv_executions e \
              WHERE e.exec_id IN ( \
                  SELECT v.exec_id FROM drv_executions v \
@@ -634,14 +645,19 @@ impl SchedulerDb {
                    AND NOT EXISTS (SELECT 1 FROM drv_log_chunks c \
                                    WHERE c.exec_id = v.exec_id) \
                    AND NOT EXISTS (SELECT 1 FROM log_ingest_sessions s \
-                                   WHERE s.exec_id = v.exec_id) \
+                                   WHERE s.exec_id = v.exec_id \
+                                     AND {live}) \
                  LIMIT $2)",
-        )
-        .bind(retention_secs)
-        .bind(limit)
-        .bind(rio_migrations::schema::EXEC_STATUS_TERMINAL)
-        .execute(&self.pool)
-        .await?;
+            live = rio_migrations::sql::live_ingest_session_sql("s.heartbeat_at", "$4")
+        );
+        // AssertSqlSafe: const-fragment composition, no runtime data.
+        let result = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(retention_secs)
+            .bind(limit)
+            .bind(rio_migrations::schema::EXEC_STATUS_TERMINAL)
+            .bind(rio_migrations::sql::SESSION_STALE_AFTER_SECS)
+            .execute(&self.pool)
+            .await?;
         Ok(result.rows_affected())
     }
 

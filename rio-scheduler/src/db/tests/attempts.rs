@@ -1391,6 +1391,63 @@ async fn test_gc_exec_rows_waits_for_log_artifacts() -> anyhow::Result<()> {
     Ok(())
 }
 
+// r[verify store.log.sweep-ownership+1]
+/// bug_234: conjunct 5 is a LIVENESS check, not an existence check —
+/// the doc, the kernel twin (`has_live_ingest_session`), and the
+/// sessions module's own staleness law all promise it. A session row
+/// whose heartbeat is older than `SESSION_STALE_AFTER` is a dead
+/// replica's leftover (`lookup_live` already ignores it; it routes
+/// nothing): it must NOT pin the exec row for the remaining
+/// `log_retention − exec_retention` days. A LIVE session still vetoes.
+#[tokio::test]
+async fn test_gc_exec_rows_ignores_stale_ingest_sessions() -> anyhow::Result<()> {
+    let (_test_db, db, _drv_id) = setup("exec-gc-stale-session").await?;
+
+    let exec_live = Uuid::now_v7(); // terminal, aged, LIVE session → pinned
+    let exec_stale = Uuid::now_v7(); // terminal, aged, STALE session → victim
+
+    insert_aged_execution(&db.pool, exec_live, Some("succeeded"), 60.0).await?;
+    insert_aged_execution(&db.pool, exec_stale, Some("failed"), 60.0).await?;
+
+    sqlx::query(
+        "INSERT INTO log_ingest_sessions (exec_id, session_id, replica_pod) \
+         VALUES ($1, $2, 'store-0')",
+    )
+    .bind(exec_live)
+    .bind(Uuid::now_v7())
+    .execute(&db.pool)
+    .await?;
+    // The uncleanly-died shape: the row exists, the heartbeat is 120s
+    // old (4× SESSION_STALE_AFTER) — the replica crashed mid-stream.
+    sqlx::query(
+        "INSERT INTO log_ingest_sessions (exec_id, session_id, replica_pod, heartbeat_at) \
+         VALUES ($1, $2, 'store-1', now() - interval '120 seconds')",
+    )
+    .bind(exec_stale)
+    .bind(Uuid::now_v7())
+    .execute(&db.pool)
+    .await?;
+
+    let deleted = db.gc_exec_rows(30.0, 1000).await?;
+    assert_eq!(
+        deleted, 1,
+        "a stale (dead-replica) session row must not pin the exec row"
+    );
+
+    let survivors: Vec<Uuid> = sqlx::query_scalar("SELECT exec_id FROM drv_executions")
+        .fetch_all(&db.pool)
+        .await?;
+    assert!(
+        survivors.contains(&exec_live),
+        "a LIVE ingest session still vetoes the sweep"
+    );
+    assert!(
+        !survivors.contains(&exec_stale),
+        "the stale-session exec row is collected at exec retention"
+    );
+    Ok(())
+}
+
 // r[verify sched.db.exec-stamp-on-close]
 /// bug_047: closing an assignment MUST stamp its execution row's
 /// terminal status in the same statement — otherwise the lifecycle row
