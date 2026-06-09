@@ -1923,3 +1923,87 @@ async fn listing_and_progress_rejections_tick_their_rpc_labels() -> anyhow::Resu
     );
     Ok(())
 }
+
+// ── Fence-key provenance (merged_bug_078) ──
+
+// r[verify sched.executor.confirm-fence]
+/// merged_bug_078: the confirm-fence key must be the SHA-256 of
+/// exactly the carrier bytes that VERIFIED — never of whichever
+/// carrier happened to be present. The attack cell: garbage
+/// `x-rio-executor-token` metadata + a valid signed body token
+/// authenticates as the BODY identity (`credential_for`'s Build arm
+/// catches any `require_executor` error and falls back to the body),
+/// so keying the fence on the unverified metadata bytes lets an
+/// untrusted worker de-key its own fence write (and dodge the
+/// DeliverNew screen) while staying authenticated.
+///
+/// Driven through the production chokepoint into the durable row: a
+/// confirm-only pull for an absent drv answers `Gone`, whose
+/// write-ahead fences the answering token — the row's key IS the
+/// value the actor received on the command conduit, asserted one hop
+/// deeper than a stubbed actor would.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fence_key_follows_the_verified_carrier() -> anyhow::Result<()> {
+    use rio_auth::hmac::{ExecutorClaims, HmacKey};
+    use sha2::Digest as _;
+    let (db, mut grpc, _handle, _actor_task) = setup_grpc().await;
+    let key = std::sync::Arc::new(HmacKey::from_key(
+        b"test-key-32-bytes-long-here!!!!!".to_vec(),
+    ));
+    grpc.hmac_key = Some(std::sync::Arc::clone(&key));
+    let router = tonic::transport::Server::builder().add_service(ExecutorServiceServer::new(grpc));
+    let (addr, _server) = rio_test_support::grpc::spawn_grpc_server(router).await;
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))?
+        .connect()
+        .await?;
+    let mut client = ExecutorServiceClient::new(channel);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let body_token = key.sign(&ExecutorClaims {
+        intent_id: "intent-fencekey".into(),
+        kind: rio_proto::types::ExecutorKind::Builder as i32,
+        expiry_unix: now + 600,
+    });
+    let garbage_metadata = "not-a-valid-token-but-present";
+
+    // Unverifiable metadata + valid body: authenticates as the body
+    // identity; the absent drv answers Gone; confirm_only fences the
+    // exit-0 license ahead of the answer.
+    let mut req = tonic::Request::new(rio_proto::types::PullAssignmentRequest {
+        executor_token: body_token.clone(),
+        intent_id: "intent-fencekey".into(),
+        confirm_only: true,
+        ..Default::default()
+    });
+    req.metadata_mut()
+        .insert(rio_proto::EXECUTOR_TOKEN_HEADER, garbage_metadata.parse()?);
+    let resp = client
+        .pull_assignment(req)
+        .await
+        .expect("body-authenticated confirm pull is served")
+        .into_inner();
+    assert!(
+        matches!(
+            resp.outcome,
+            Some(rio_proto::types::pull_assignment_response::Outcome::Gone(_))
+        ),
+        "absent drv answers the confirm probe Gone, got {resp:?}"
+    );
+
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT executor_token_sha256, intent_id FROM executor_confirm_fences")
+            .fetch_optional(&db.pool)
+            .await?;
+    let (fence_key, intent) = row.expect("the confirm Gone must write exactly one fence row");
+    assert_eq!(intent, "intent-fencekey");
+    assert_eq!(
+        fence_key,
+        hex::encode(sha2::Sha256::digest(body_token.as_bytes())),
+        "the fence key must hash the carrier that VERIFIED (the body token), \
+         not whichever carrier was merely present (garbage metadata hashes to {})",
+        hex::encode(sha2::Sha256::digest(garbage_metadata.as_bytes()))
+    );
+    Ok(())
+}

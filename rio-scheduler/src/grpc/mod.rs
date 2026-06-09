@@ -267,7 +267,8 @@ impl SchedulerGrpc {
 
     // r[impl sec.executor.identity-token+3]
     /// Extract and verify `x-rio-executor-token`, returning the full
-    /// HMAC-attested [`ExecutorClaims`]. Mirrors
+    /// HMAC-attested identity ([`VerifiedExecutor`] — claims + the
+    /// fence key minted from the bytes that verified). Mirrors
     /// [`Self::require_tenant`] for the worker-facing service: when an
     /// HMAC key is configured, a missing or invalid token is
     /// `Unauthenticated`; when no key is configured (dev mode),
@@ -283,7 +284,7 @@ impl SchedulerGrpc {
     pub(super) fn require_executor<T>(
         &self,
         req: &Request<T>,
-    ) -> Result<Option<ExecutorClaims>, Status> {
+    ) -> Result<Option<VerifiedExecutor>, Status> {
         let Some(key) = &self.hmac_key else {
             return Ok(None);
         };
@@ -300,8 +301,59 @@ impl SchedulerGrpc {
         let claims: ExecutorClaims = key.verify(token).map_err(|e| {
             Status::unauthenticated(format!("x-rio-executor-token verification failed: {e}"))
         })?;
-        Ok(Some(claims))
+        // r[impl sched.executor.confirm-fence]
+        // Verification-success site 1 of 2: the fence key is minted
+        // from EXACTLY the bytes the HMAC check just accepted.
+        Ok(Some(VerifiedExecutor {
+            claims,
+            fence_key: ConfirmFenceKey::from_verified_carrier(token.as_bytes()),
+        }))
     }
+}
+
+/// The confirm-fence key: SHA-256 hex of EXACTLY the carrier bytes
+/// that verified (merged_bug_078). Provenance type — the field is
+/// private and the only constructor is [`ConfirmFenceKey::from_verified_carrier`],
+/// called at the two verification-success sites
+/// ([`SchedulerGrpc::require_executor`]'s metadata arm and
+/// `credential_for`'s body-verification arm), so a handler cannot
+/// re-derive a key from raw request carriers: garbage metadata + a
+/// valid body token now keys on the BODY hash — the carrier that
+/// authenticated — closing the de-key-the-fence / dodge-the-screen
+/// cell. Disclosed boundary: the `ActorCommand::PullAssignment.
+/// executor_token_sha256` conduit is a plain `Option<String>`
+/// ([`ConfirmFenceKey::into_wire`]) — raw carriers exist ONLY at the
+/// gRPC layer, so verifier-only minting covers every derivation site
+/// and the actor receives hash-or-nothing.
+pub(crate) struct ConfirmFenceKey(String);
+
+impl ConfirmFenceKey {
+    /// Mint from the carrier bytes that JUST verified. Deliberately
+    /// `pub(in crate::grpc)`: only the credential layer (the one
+    /// layer that sees raw carriers) can construct a key, and only
+    /// at its verification-success sites.
+    pub(in crate::grpc) fn from_verified_carrier(bytes: &[u8]) -> Self {
+        use sha2::Digest as _;
+        Self(hex::encode(sha2::Sha256::digest(bytes)))
+    }
+
+    /// Surrender the hex hash for the actor command conduit (the
+    /// disclosed `Option<String>` boundary). Consuming `self` keeps
+    /// the one-key-one-command shape explicit.
+    pub(in crate::grpc) fn into_wire(self) -> String {
+        self.0
+    }
+}
+
+/// The one value coupling executor identity and fence key
+/// (merged_bug_078's keystone): both halves come from the SAME
+/// verification event, so they cannot diverge again — there is no
+/// way to authenticate on one carrier and fence on another.
+pub(crate) struct VerifiedExecutor {
+    /// The HMAC-attested claims (intent binding + kind).
+    pub(in crate::grpc) claims: ExecutorClaims,
+    /// The fence key minted from the bytes that verified.
+    pub(in crate::grpc) fence_key: ConfirmFenceKey,
 }
 
 /// Resolve a tenant name to its UUID, mapping errors to gRPC `Status`.

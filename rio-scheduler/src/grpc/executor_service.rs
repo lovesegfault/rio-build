@@ -411,7 +411,19 @@ impl SchedulerGrpc {
                                     )),
                                 )
                             })?;
-                        Ok(ResolvedCredential::Executor(Some(claims)))
+                        // r[impl sched.executor.confirm-fence]
+                        // Verification-success site 2 of 2: the fence
+                        // key hashes the BODY bytes — the carrier that
+                        // authenticated — never the unverifiable
+                        // metadata that routed us here.
+                        Ok(ResolvedCredential::Executor(Some(
+                            super::VerifiedExecutor {
+                                claims,
+                                fence_key: super::ConfirmFenceKey::from_verified_carrier(
+                                    body_token.as_bytes(),
+                                ),
+                            },
+                        )))
                     }
                 }
             }
@@ -485,11 +497,12 @@ pub(super) enum PayloadCredentialKind<'a> {
 }
 
 /// What [`SchedulerGrpc::credential_for`] resolves.
-#[derive(Debug)]
 pub(super) enum ResolvedCredential {
-    /// Build family: the HMAC-attested executor claims
-    /// (`None` = dev mode, no key configured).
-    Executor(Option<rio_auth::hmac::ExecutorClaims>),
+    /// Build family: the verified executor identity — claims AND the
+    /// fence key minted from the bytes that verified, one value
+    /// (merged_bug_078: they cannot diverge). `None` = dev mode, no
+    /// key configured: nothing verified, nothing keyed.
+    Executor(Option<super::VerifiedExecutor>),
     /// Materialization family: the store-service gate's outcome.
     /// The carried auth (DevMode vs the verified instance claim) is
     /// not consumed by today's handlers — it is the landing site for
@@ -657,8 +670,8 @@ impl ExecutorService for SchedulerGrpc {
                 body_token: request.get_ref().executor_token.as_str(),
             }
         };
-        let auth_claims = match self.credential_for(credential_kind, &request) {
-            Ok(ResolvedCredential::Executor(claims)) => claims,
+        let verified = match self.credential_for(credential_kind, &request) {
+            Ok(ResolvedCredential::Executor(verified)) => verified,
             // The store credential is fleet-level, not per-intent: the
             // pulling identity is the composite (intent, replica) pair
             // the kernel arbitrates on, so there is no auth_intent.
@@ -670,25 +683,19 @@ impl ExecutorService for SchedulerGrpc {
                 return Err(rej.into_status_counted("pull_assignment"));
             }
         };
-        let auth_intent = auth_claims.as_ref().map(|c| c.intent_id.clone());
-        // merged_bug_145: the confirm-fence key — SHA-256 of the raw
-        // executor token, computed HERE (the only layer that sees the
-        // raw credential; the actor and PG handle hashes only).
-        // Metadata carrier wins when both are present — the same
-        // precedence require_executor's verification applies. None
-        // (no token anywhere = dev mode) skips the fence entirely.
-        let executor_token_sha256 = {
-            use sha2::Digest as _;
-            let raw: Option<&[u8]> = request
-                .metadata()
-                .get("x-rio-executor-token")
-                .map(|v| v.as_bytes())
-                .or_else(|| {
-                    let body = request.get_ref().executor_token.as_bytes();
-                    (!body.is_empty()).then_some(body)
-                });
-            raw.map(|bytes| hex::encode(sha2::Sha256::digest(bytes)))
-        };
+        // r[impl sched.executor.confirm-fence]
+        // merged_bug_078: the confirm-fence key arrives WITH the
+        // verified identity, minted by the credential layer from
+        // exactly the bytes that verified ([`super::VerifiedExecutor`]
+        // — the handler has no other key source; the old independent
+        // present-carrier hash block is deleted). `None` = dev mode:
+        // nothing verified, nothing keyed (`FenceLane::Unfenced` — the
+        // identity-disabled deployment class; this also narrows the
+        // keyless-scheduler + token-bearing-builder misdeployment cell
+        // from keyed-on-unverified-bytes to Unfenced).
+        let (auth_intent, executor_token_sha256) = verified
+            .map(|v| (v.claims.intent_id, v.fence_key.into_wire()))
+            .unzip();
         // merged_bug_145 defense-in-depth: with an HMAC key configured,
         // a token-less pull cannot reach the actor — require_executor
         // already rejects it Unauthenticated; this arm keeps the
@@ -880,7 +887,7 @@ impl ExecutorService for SchedulerGrpc {
             PayloadCredentialKind::Build { body_token: "" }
         };
         let auth_intent = match self.credential_for(credential_kind, &request) {
-            Ok(ResolvedCredential::Executor(claims)) => claims.map(|c| c.intent_id),
+            Ok(ResolvedCredential::Executor(verified)) => verified.map(|v| v.claims.intent_id),
             // Authorized store replica (or full dev mode): fleet-level
             // credential, no per-intent binding.
             Ok(ResolvedCredential::StoreService(_)) => None,

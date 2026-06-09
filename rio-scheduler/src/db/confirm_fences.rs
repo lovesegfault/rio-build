@@ -10,6 +10,13 @@
 //! against a `Succeeded` Job (invisible to the establishment sweep,
 //! which reaps against FAILED pods).
 //!
+//! Key provenance (merged_bug_078): the hash these functions accept is
+//! minted ONLY by the gRPC credential layer's `ConfirmFenceKey` — the
+//! SHA-256 of exactly the carrier bytes that VERIFIED, never of
+//! whichever carrier was merely present — and reaches the actor
+//! through the hash-or-nothing command conduit. No other layer sees
+//! raw token bytes, so no other derivation site exists.
+//!
 //! Scope note (disclosed at the work order): the fence covers the
 //! nothing-held confirm path. The minted-confirm path (the confirm
 //! answers Assignment → the builder reports Cancelled → exits 0) is

@@ -3041,6 +3041,24 @@ stale-intent reap deletes the terminal Job for a still-wanted intent every
 tick), and delivering while an attempt is open elsewhere would re-point the
 active assignment away from the executor actually building it.
 
+#r("sched.executor.confirm-fence")[
+  On the keyed build lane (an HMAC-verified executor credential), every
+  `PullAssignment` answer that licenses the builder's exit 0 --- `Gone`,
+  live or confirm-only, and the confirm-only `NotYetReady` --- MUST have
+  the confirm-fence row durable BEFORE the reply is sent (write-ahead; a
+  failed fence write withholds the license with a retryable rejection),
+  `DeliverNew` MUST screen against the fence before minting, and the
+  fence key MUST derive only from the carrier bytes the credential layer
+  verified --- never from an unverified present carrier.
+]
+The fence is what makes a licensed clean exit terminal for the token: a
+straggler pull (still in the mailbox or network, or re-sent after a
+content-addressed resubmit re-readies the same drv) finds the fence and is
+screened to `Gone` instead of minting an attempt no sweep can see. Keying on
+unverified carrier bytes would let an untrusted worker de-key its own fence
+write (garbage metadata + a valid body token authenticates as the body
+identity) and dodge the screen.
+
 #r("sched.executor.report-idempotent")[
   `ReportOutcome(exec_id, CompletionReport)` MUST be idempotent by
   `exec_id`: the first report for an open attempt runs the existing
