@@ -1,8 +1,9 @@
 {{- if and .Values.store.enabled .Values.store.autoscaling.enabled }}
 {{- $a := .Values.store.autoscaling -}}
-# r[impl infra.store.autoscaling+3] (documentary — .yaml is not tracey-
+# r[impl infra.store.autoscaling+4] (documentary — .yaml is not tracey-
 # scanned; the scannable anchors are xtask deploy.rs and the helm-lint
-# fragment 26-store-scaling.sh asserts this render)
+# fragment 26-store-scaling.sh asserts this render; the fallback
+# absence half is asserted by fragment 38-gateway-fallback.sh)
 #
 # KEDA ScaledObject for rio-store — the SINGLE owner of the store
 # Deployment's replica count (the store ComponentScaler CR is gone;

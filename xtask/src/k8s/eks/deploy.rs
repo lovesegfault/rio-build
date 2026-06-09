@@ -335,7 +335,7 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             // I-054: JWT enables per-tenant upstream substitution
             // (cache.nixos.org). Keypair minted/read by jwt_keypair().
             //
-            // r[impl infra.store.autoscaling+3]
+            // r[impl infra.store.autoscaling+4]
             // Store replica count: owned by the chart-default KEDA
             // ScaledObject (store.autoscaling.enabled=true; backlog/
             // builders/CPU triggers — the I-128 fixed-8 era and the

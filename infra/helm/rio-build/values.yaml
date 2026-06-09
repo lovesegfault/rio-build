@@ -942,6 +942,37 @@ gateway:
     # = the OOM backstop) — capacity is added long before the gateway
     # starts rejecting exec requests.
     targetSessionsPerPod: 1024
+    # Scaler-outage posture (KEDA spec.fallback). The sessions trigger
+    # is this ScaledObject's ONLY trigger, so without fallback a
+    # prometheus outage leaves the HPA with zero healthy scalers,
+    # frozen at whatever count the outage caught — refused sessions if
+    # it coincides with a surge. After failureThreshold consecutive
+    # scaler failures (~a minute-plus at the HPA's ~15s
+    # external-metrics cadence: rides out a prometheus pod restart,
+    # catches a real outage) KEDA feeds the HPA
+    # replicas × targetSessionsPerPod, i.e. desired = replicas.
+    #
+    # Blind-at-ceiling: replicas defaults to maxReplicas above. While
+    # KEDA cannot see demand it assumes the demand the fleet is sized
+    # for (8 × 1024 target sessions; hard cap 8 × max_sessions 4096).
+    # The cost asymmetry decides it: 8 gateway pods request a total of
+    # 2 vCPU / 4 Gi (resources block below), while a blind floor
+    # during a surge refuses build sessions — the SLA-relevant
+    # direction. Recovery needs no knob: real metrics resume and the
+    # 1800s scale-down stabilization drains the excess at 1 pod/600s.
+    # Change this together with maxReplicas (helm-lint fragment 38
+    # pins the defaults equal) or justify the gap here.
+    #
+    # The STORE ScaledObject deliberately carries no fallback: KEDA
+    # fallback never applies to cpu/memory triggers, so the store's
+    # cpu trigger keeps feeding the HPA real utilization through a
+    # prometheus outage — that is its designed degraded mode, and a
+    # fallback stanza would instead pin the two prometheus triggers at
+    # a load-blind floor (HPA takes the max across triggers) at
+    # 16-CPU/8-Gi per pod.
+    fallback:
+      failureThreshold: 3
+      replicas: 8
     # In-cluster prometheus the KEDA scaler queries. Default matches
     # the reference deploy (kube-prometheus-stack release in the
     # `monitoring` namespace, infra/eks/monitoring.tf).

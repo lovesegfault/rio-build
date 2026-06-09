@@ -1,5 +1,10 @@
 {{- if and .Values.gateway.enabled .Values.gateway.autoscaling.enabled }}
 {{- $a := .Values.gateway.autoscaling -}}
+# r[impl infra.store.autoscaling+4] (documentary — .yaml is not
+# tracey-scanned; the scannable anchor is xtask deploy.rs and the
+# helm-lint fragment 38-gateway-fallback.sh asserts this render's
+# fallback half)
+#
 # KEDA ScaledObject for rio-gateway. In the chart (not terraform) so
 # `helm rollback` takes scaling config with the rest; gated on
 # gateway.autoscaling.enabled because the keda.sh CRDs don't exist
@@ -46,6 +51,22 @@ spec:
     name: rio-gateway
   minReplicaCount: {{ $a.minReplicas }}
   maxReplicaCount: {{ $a.maxReplicas }}
+  # Scaler-outage posture: the sessions trigger below is this SO's
+  # ONLY trigger, so fallback pins the HPA at a deliberate serving
+  # capacity after failureThreshold consecutive scaler failures
+  # instead of freezing it at whatever count the outage caught
+  # (sizing rationale: values.yaml gateway.autoscaling.fallback).
+  # Engages on scaler ERROR only (prometheus unreachable/5xx): an
+  # EMPTY query result (gauge absent — e.g. no scheduler/gateway
+  # scrape) is NOT an error under the prometheus scaler's
+  # ignoreNullValues=true default and scales toward the floor; KEDA's
+  # keda_scaler_empty_upstream_responses_total self-metric is the
+  # signal for that case. The store ScaledObject deliberately has no
+  # fallback — its cpu trigger (exempt from fallback by KEDA
+  # semantics) is the degraded-mode corrective there.
+  fallback:
+    failureThreshold: {{ $a.fallback.failureThreshold }}
+    replicas: {{ $a.fallback.replicas }}
   advanced:
     horizontalPodAutoscalerConfig:
       behavior:

@@ -1,9 +1,10 @@
 # Store scaling surface (decision 5): one-replica-per-node placement +
 # the KEDA ScaledObject as the SINGLE owner of the store replica count.
 #
-# r[verify infra.store.autoscaling+3] (documentary — .sh is not
+# r[verify infra.store.autoscaling+4] (documentary — .sh is not
 # tracey-scanned; this fragment is the merge-gate render proof of the
-# rule's chart half)
+# rule's chart half; the scaler-outage fallback half is fragment
+# 38-gateway-fallback.sh)
 #
 # rio-store's three load classes (substitution ingest, builder
 # read-serving, builder upload ingest) all share the pod's NIC, NAR

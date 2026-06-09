@@ -97,7 +97,7 @@ The EKS reference deployment (`infra/eks/`) uses Karpenter: the `executors` mana
 
 == Store autoscaling
 
-#r("infra.store.autoscaling+3")[
+#r("infra.store.autoscaling+4")[
   The rio-store Deployment's replica count MUST have exactly one writer ---
   the KEDA ScaledObject (`templates/store-scaledobject.yaml`): when
   `store.autoscaling.enabled` the chart MUST NOT render a static
@@ -112,7 +112,19 @@ The EKS reference deployment (`infra/eks/`) uses Karpenter: the `executors` mana
   utilization (reactive corrective); every prometheus trigger MUST
   render through the unit-checking helper (`rio.promTrigger` ×
   `files/metric-units.json` --- a metric/knob unit mismatch MUST fail
-  the render). Scale-up unstabilized, scale-down damped (1800 s window,
+  the render). Scaler-outage posture: the store ScaledObject MUST NOT
+  set `spec.fallback` --- KEDA fallback never applies to cpu/memory
+  triggers, so the cpu trigger keeps feeding the HPA real utilization
+  through a prometheus outage (the designed degraded mode), while a
+  fallback stanza would pin the prometheus triggers at a load-blind
+  replica floor the cpu corrective cannot undercut (the HPA takes the
+  max across triggers); the gateway ScaledObject, whose sessions
+  trigger is its ONLY trigger, MUST set `spec.fallback`
+  (`gateway.autoscaling.fallback.{failureThreshold, replicas}`,
+  default 3 consecutive failures / replicas = the autoscaling
+  ceiling) so an outage pins the gateway at the demand the fleet is
+  sized for instead of freezing the HPA at whatever count the outage
+  caught. Scale-up unstabilized, scale-down damped (1800 s window,
   max(25 %, 1 pod) / 600 s); floor 2 with a values-configurable ceiling
   (default 173, overridden on every EKS deploy by the pg preflight's
   derivation from the MEASURED Aurora `max_connections`) that MUST be
@@ -152,6 +164,24 @@ paths; render-time unit-checked via `files/metric-units.json` ---
 warm-phase capture. The
 no-KEDA profiles (`values/vmtest-full.yaml`, `values/dev.yaml`) set
 `store.autoscaling.enabled=false` and render the static `store.replicas`.
+
+The fallback asymmetry is a cost asymmetry. Gateway pods request
+250 mCPU / 512 MiB --- blind-at-ceiling costs \~2 vCPU / 4 GiB
+fleet-wide while it lasts, and once metrics resume the 1800 s
+scale-down damping drains the excess at 1 pod / 600 s with no
+operator action; a blind *floor* during a session surge refuses
+builds, the SLA-relevant direction. Store pods request 16 CPU /
+8 GiB (a pinned floor is genuinely expensive) and keep a live
+reactive signal regardless, so the same posture would be both costly
+and redundant there. `failureThreshold: 3` is a minute-plus of
+consecutive failures at the HPA's \~15 s external-metrics cadence ---
+long enough to ride out a kube-prometheus-stack pod reschedule, short
+against a real outage. Fallback engages on scaler *error* only
+(prometheus unreachable / 5xx): an empty query result (absent gauge)
+is not an error under the prometheus scaler's `ignoreNullValues`
+default and scales toward the floor --- KEDA's
+`keda_scaler_empty_upstream_responses_total` self-metric is the
+signal for that distinct failure.
 
 = Key Configuration
 
