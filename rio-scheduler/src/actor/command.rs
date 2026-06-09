@@ -180,8 +180,13 @@ pub enum ActorCommand {
         /// the confirm-exit fence key, computed at the gRPC boundary
         /// (the only layer that sees the raw credential; the actor
         /// stores/compares hashes only). `None` when the request
-        /// carried no token (dev mode) — fail-open, no fence
-        /// interaction (the pre-fence wire shape, bounded skew).
+        /// carried no token: the IDENTITY-DISABLED deployment class
+        /// (dev mode / keyless VM fixtures), routed to
+        /// `FenceLane::Unfenced` — no key domain exists by
+        /// construction, NOT a fail-open: production cannot reach it
+        /// (the credential layer rejects token-less pulls
+        /// Unauthenticated before the actor, with a second
+        /// fail-closed arm at gRPC dispatch).
         executor_token_sha256: Option<String>,
         /// merged_bug_083: confirm-only pull
         /// (`PullAssignmentRequest.confirm_only`) — a READ of the
