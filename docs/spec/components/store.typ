@@ -2145,6 +2145,23 @@ a non-owned execution.
   granularity) and the client MUST skip them.
 ]
 
+#r("store.log.attach-hello")[
+  A `follow`-mode `TailLog` attach MUST emit one zero-line, non-final,
+  exec-stamped chunk between the replayed history and the live
+  subscription, so the attaching client observes the serving
+  execution's identity immediately even when nothing at or past its
+  cursor exists yet.
+]
+
+The hello is what makes a follow-the-retry reconnect detect an execution
+switch on a quiet stream: a reader carrying the previous execution's longer
+cursor attaches above the new execution's watermark, history replays
+nothing, and without the hello the first signal would be the builder's next
+batch --- a dead-quiet fresh execution indistinguishable from a live stream
+on the old one. Zero-line chunks are already protocol-tolerated ("clients
+must tolerate and skip them"), so the hello is invisible to consumers that
+do not key on it.
+
 Store deploys, replica crashes, and ingest-lease handoffs all close follow
 streams that a new ingest session immediately replaces; the server does not
 chase the new session across replicas, so the client owns re-subscription.

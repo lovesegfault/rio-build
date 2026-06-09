@@ -1580,6 +1580,28 @@ async fn serve_tail(
         return Ok(());
     }
 
+    // r[impl store.log.attach-hello]
+    // The attach handshake (merged_bug_067): one zero-line, non-final,
+    // exec-stamped hello chunk between the replayed history and the
+    // live subscription. A reconnecting follower whose cursor sits
+    // beyond everything this execution holds (the follow-the-retry
+    // shape: the previous execution's log was longer) would otherwise
+    // see total silence -- phases 1-2 emit nothing and the
+    // subscription says nothing until the builder's next batch -- so a
+    // dead-quiet fresh execution was indistinguishable from a live
+    // stream on the old one. The client's exec-keyed visit fires its
+    // execution switch off this one chunk. Zero-line chunks are
+    // protocol-tolerated by every consumer (store.proto: "clients must
+    // tolerate and skip them").
+    let _ = tx
+        .send(Ok(TailLogChunk {
+            exec_id: exec_str.clone(),
+            lines: Vec::new(),
+            first_line_number: cursor.next_line(),
+            is_complete: false,
+        }))
+        .await;
+
     // The subscription: every batch accepted after the snapshot, until
     // the ingest session ends (the sender side of `rx` is dropped when
     // the `IngestShared` it lives in is dropped, i.e. when the
@@ -2732,6 +2754,13 @@ mod tests {
         assert_eq!(first.first_line_number, 0);
         assert_eq!(first.lines, vec![b"before the subscriber".to_vec()]);
 
+        // The attach hello (merged_bug_067) sits between the snapshot
+        // and the live phase: zero lines, non-final, exec-stamped.
+        // Clients tolerate-and-skip zero-line chunks by protocol
+        // contract; this test does the same to reach the live line.
+        let hello = tail.message().await.expect("hello").expect("present");
+        assert!(hello.lines.is_empty() && !hello.is_complete);
+
         // Lines accepted after the subscription arrive live.
         tx.send(batch_msg(1, &["after the subscriber"]))
             .await
@@ -2749,6 +2778,49 @@ mod tests {
             saw_end = true;
         }
         assert!(saw_end, "the follow stream ends with a final-state message");
+    }
+
+    // r[verify store.log.attach-hello]
+    /// merged_bug_067 (red-first): a follow attach whose since_line is
+    /// beyond everything stored AND buffered (a follow-the-retry
+    /// reconnect carrying the previous execution's cursor) must
+    /// immediately receive a zero-line, non-final, exec-stamped hello
+    /// chunk -- the client's exec-keyed visit is what detects the
+    /// execution switch. Pre-fix the stream stayed silent until the
+    /// next accepted batch, so a dead-quiet fresh execution was
+    /// indistinguishable from a live stream on the previous one.
+    #[tokio::test]
+    async fn follow_attach_beyond_watermark_gets_exec_stamped_hello() {
+        let mut h = harness().await;
+        let exec = seed_assignment(&h.db.pool, "builder-0").await;
+        let tok = token("builder-0", DRV);
+
+        let (tx, _acks) = open_append(&mut h.client, &tok, vec![header_msg(exec)])
+            .await
+            .expect("open");
+        tx.send(batch_msg(0, &["one line"])).await.unwrap();
+        wait_for(|| {
+            h.active
+                .get(&exec)
+                .map(|s| !lock_shared(&s.shared).snapshot().is_empty())
+                .unwrap_or(false)
+        })
+        .await;
+
+        // Attach with a cursor far beyond this execution's watermark.
+        let mut req = tail_req(exec, true);
+        req.since_line = 10_000;
+        let mut tail = h.client.tail_log(req).await.expect("tail").into_inner();
+
+        let hello = tokio::time::timeout(std::time::Duration::from_secs(5), tail.message())
+            .await
+            .expect("the attach hello must arrive immediately, not on the next batch")
+            .expect("stream open")
+            .expect("present");
+        assert_eq!(hello.lines, Vec::<Vec<u8>>::new(), "hello carries no lines");
+        assert!(!hello.is_complete, "hello is not a final chunk");
+        assert_eq!(hello.exec_id, exec.to_string(), "hello is exec-stamped");
+        drop(tx);
     }
 
     // r[verify store.log.tail-reconnect]
@@ -3077,6 +3149,14 @@ mod tests {
         let first = tail.message().await.expect("proxied").expect("present");
         assert_eq!(first.first_line_number, 0);
         assert_eq!(first.lines, vec![b"only in A's live buffer".to_vec()]);
+        // The owning replica's attach hello (merged_bug_067) is relayed
+        // verbatim; skip it per the zero-line tolerate-and-skip contract.
+        let hello = tail
+            .message()
+            .await
+            .expect("relayed hello")
+            .expect("present");
+        assert!(hello.lines.is_empty() && !hello.is_complete);
 
         // Lines accepted by A after the subscription flow through live.
         tx.send(batch_msg(1, &["live through the proxy"]))
@@ -3301,6 +3381,10 @@ mod tests {
             .into_inner();
         let first = tail.message().await.expect("snapshot").expect("present");
         assert_eq!(first.first_line_number, 0);
+        // Skip the attach hello (merged_bug_067; tolerate-and-skip is
+        // the protocol contract for zero-line chunks).
+        let hello = tail.message().await.expect("hello").expect("present");
+        assert!(hello.lines.is_empty() && !hello.is_complete);
 
         // The worker jumps: line 5 next (lines 1..5 never transmitted).
         tx.send(batch_msg(5, &["line-5"])).await.unwrap();
