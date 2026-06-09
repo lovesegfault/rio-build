@@ -6337,14 +6337,14 @@ rec {
     # C2/077 (area A): the AD2 fleet-exhaust verdict fires only at the
     # third consecutive exhausted-and-wanted tick; a placeable tick
     # resets the streak.
-    # r[verify ctrl.pool.no-eligible-persist+2]
+    # r[verify ctrl.pool.no-eligible-persist+3]
     quint-spawn-coherence-falsify-exhaust-asbuilt = mkQuintWitnessCheck {
       name = "spawn-coherence-falsify-exhaust-asbuilt";
       spec = "spawnCoherence";
       main = "spawnCoherenceExhaustAsBuilt";
       witness = "noPoisonWhilePlaceable";
     };
-    # r[verify ctrl.pool.no-eligible-persist+2]
+    # r[verify ctrl.pool.no-eligible-persist+3]
     quint-spawn-coherence-exhaust-persist = mkQuintCheck {
       name = "spawn-coherence-exhaust-persist";
       spec = "spawnCoherence";
@@ -6430,14 +6430,14 @@ rec {
     # 0xa108dd26025cd507). Own-count law: an overlap intent
     # double-steps to the threshold on 2 own observations (rust-sim
     # seed 0xdf6e64671329a316).
-    # r[verify ctrl.pool.no-eligible-persist+2]
+    # r[verify ctrl.pool.no-eligible-persist+3]
     quint-spawn-coherence-falsify-multipool-wipe = mkQuintWitnessCheck {
       name = "spawn-coherence-falsify-multipool-wipe";
       spec = "spawnCoherence";
       main = "spawnCoherenceMultiPoolAsBuilt";
       witness = "persistentExhaustionEventuallyReports";
     };
-    # r[verify ctrl.pool.no-eligible-persist+2]
+    # r[verify ctrl.pool.no-eligible-persist+3]
     quint-spawn-coherence-falsify-multipool-own-count = mkQuintWitnessCheck {
       name = "spawn-coherence-falsify-multipool-own-count";
       spec = "spawnCoherence";
@@ -6448,7 +6448,7 @@ rec {
     # neither wipe nor advance A's streaks; the poison verdict counts
     # the observing pool's own 3 observations. canReachPoison keeps the
     # threshold path non-vacuous under the multi-pool alphabet.
-    # r[verify ctrl.pool.no-eligible-persist+2]
+    # r[verify ctrl.pool.no-eligible-persist+3]
     quint-spawn-coherence-multipool-hold = mkQuintCheck {
       name = "spawn-coherence-multipool-hold";
       spec = "spawnCoherence";

@@ -461,20 +461,19 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     })?;
     let ceiling = pool.spec.max_concurrent.map(|c| c as i32);
 
-    // bug_069: the exhaustion-streak tick begins UNCONDITIONALLY at
-    // the top of every reconcile — before headroom, existing-name
-    // filtering, the lazy node LIST, or any early error can skip the
-    // gate fold. `begin_tick` bumps this pool's sequence and prunes
-    // entries not stepped in the immediately preceding sequence, so a
-    // reconcile that never reaches the AD2 gate structurally breaks
-    // every streak (the contract is N CONSECUTIVE observed ticks; an
-    // unobserved tick is not a persisted one). The witness is consumed
-    // by the gate fold's `step`; dropping it (gate not evaluated this
-    // tick) is exactly the streak-breaking outcome.
-    let streak_tick = ctx
-        .exhausted_streak
-        .lock()
-        .begin_tick(&name, std::time::Instant::now());
+    // bug_069 (amended by merged_bug_073): the exhaustion-streak
+    // witness is minted UNCONDITIONALLY at the top of every reconcile
+    // and consumed by the gate fold's `step`. Minting no longer
+    // mutates: a reconcile that never reaches the AD2 gate drops the
+    // witness and the pool's streaks RETAIN WITHOUT STEPPING --- an
+    // unobserved tick is evidence in neither direction. The documented
+    // ~30s persistence is carried by the wall-clock floor inside
+    // `step`'s firing law, and observed recovery (a completed fold
+    // without the intent) is what breaks a streak. The key is
+    // namespace-qualified (same-named pools in two namespaces are
+    // distinct streak owners).
+    let streak_key = crate::reconcilers::pool::candidate::PoolKey::new(&ns, &name);
+    let streak_tick = ctx.exhausted_streak.lock().begin_tick(&streak_key);
 
     // ---- Poll spawn intents ----
     // One GetSpawnIntents RPC per reconcile per pool. If the scheduler
@@ -657,7 +656,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
                     to_spawn_intents
                         .into_iter()
                         .partition(|i| candidate::no_eligible_source(i, &candidates));
-                // r[impl ctrl.pool.no-eligible-persist+2]
+                // r[impl ctrl.pool.no-eligible-persist+3]
                 // Withhold the spawn from tick 1 (the Job would sit
                 // unschedulable behind its own anti-affinity) but only
                 // REPORT — i.e. poison — after the exhaustion persists
@@ -672,17 +671,16 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
                 let to_report: Vec<&SpawnIntent> = {
                     let gated_ids: HashSet<&str> =
                         gated.iter().map(|i| i.intent_id.as_str()).collect();
-                    // Pool-keyed (merged_bug_117): this fold can only
-                    // touch THIS pool's streaks — pool B's tick can no
-                    // longer wipe pool A's persistence count, and an
-                    // intent gated in two overlapping pools counts each
-                    // pool's own 3 observations before the irreversible
-                    // poison_and_cascade. The `streak_tick` witness
-                    // minted at the top of this reconcile is consumed
-                    // here (bug_069): a step without the unconditional
-                    // begin-tick prune does not typecheck, and a
-                    // reconcile that never reaches this fold drops the
-                    // witness — breaking the streak by sequence gap.
+                    // Pool-keyed (merged_bug_117) and namespace-
+                    // qualified (merged_bug_073): this fold can only
+                    // touch THIS pool's streaks. The `streak_tick`
+                    // witness minted at the top of this reconcile is
+                    // consumed here (bug_069): a step outside the
+                    // per-reconcile protocol does not typecheck. The
+                    // firing law is count AND wall-clock floor
+                    // (merged_bug_073); a reconcile that never reaches
+                    // this fold drops the witness and the streak
+                    // retains without stepping.
                     let fire = ctx.exhausted_streak.lock().step(
                         streak_tick,
                         &gated_ids,

@@ -334,22 +334,27 @@ two reads.
   field-sensitivity contract test fails).
 ]
 
-#r("ctrl.pool.no-eligible-persist+2")[
+#r("ctrl.pool.no-eligible-persist+3")[
   The AD2 `NoEligibleSource` REPORT --- the verdict that poisons the
   derivation scheduler-side --- MUST NOT fire on a single-tick exhaustion
-  observation: the gate withholds the spawn from the first gated tick,
-  and reports only after the exhaustion persists
-  `NO_ELIGIBLE_SOURCE_PERSIST_TICKS` consecutive reconcile ticks OF THE
-  OBSERVING POOL for that intent. Streak state MUST be keyed by
-  (pool, intent): one pool's tick MUST NOT clear or advance another
-  pool's streaks (an intent gated in overlapping pools counts each
-  pool's own observations before the irreversible report). A pool's
-  streak MUST reset when the intent leaves that pool's gated set (the
-  universe un-exhausted, the intent left the stream, or it fell outside
-  the spawn window); entries of a pool that stopped reconciling (removed
-  from config) MUST expire within a bounded orphan window rather than
-  live forever. A controller restart MAY restart streaks (delaying a
-  genuine poison by at most the persistence window).
+  observation NOR on a reconcile-count alone: the gate withholds the
+  spawn from the first gated tick, and reports only after the exhaustion
+  persists `NO_ELIGIBLE_SOURCE_PERSIST_TICKS` consecutive OBSERVED
+  reconcile ticks OF THE OBSERVING POOL for that intent AND
+  `NO_ELIGIBLE_SOURCE_PERSIST_FLOOR_SECS` of wall clock from the
+  streak's first observation (reconciles are event-driven; a Job-event
+  burst can deliver the count in under a second). Streak state MUST be
+  keyed by (namespace-qualified pool, intent): one pool's tick MUST NOT
+  clear or advance another pool's streaks, and same-named pools in
+  distinct namespaces are distinct streak owners. A reconcile whose gate
+  fold is skipped MUST retain streaks WITHOUT stepping them (an
+  unobserved tick is evidence in neither direction); a pool's streak
+  MUST reset when an OBSERVED fold's gated set no longer contains the
+  intent, and any entry unstepped for the bounded orphan window MUST
+  expire (stale evidence MUST NOT complete a poison) --- this covers
+  removed pools and frozen streaks alike. A controller restart MAY
+  restart streaks (delaying a genuine poison by at most the persistence
+  window).
 ]
 
 #r("ctrl.pool.ack-spawned-soundness")[
