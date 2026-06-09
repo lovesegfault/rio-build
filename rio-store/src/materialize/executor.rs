@@ -906,6 +906,10 @@ async fn execute_job_inner(
                 content_mismatched.len()
             ));
         }
+        // bug_084: BOTH wire refusal fields are minted by the ONE
+        // constructor below — the cause string above names the axes
+        // for humans; the typed pair is what the settlement consumes.
+        let (refusal, trust_refused_echo) = refusal_wire(&trust_refused, &content_mismatched);
         MaterializationOutcome {
             outcome: Some(materialization_outcome::Outcome::Unobtainable(
                 materialization_outcome::Unobtainable {
@@ -916,15 +920,42 @@ async fn execute_job_inner(
                         .paths()
                         .map(str::to_owned)
                         .collect(),
-                    // merged_bug_263: the refusal rides TYPED — the
-                    // cause string above already names it for humans;
-                    // this field is what the settlement consumes.
-                    trust_refused: !trust_refused.is_empty(),
-                    refusal: 0,
+                    trust_refused: trust_refused_echo,
+                    refusal,
                 },
             )),
         }
     }
+}
+
+/// The SOLE writer of the Unobtainable wire refusal pair (bug_084):
+/// field 6 (`refusal`, the closed [`UnobtainableRefusal`] alphabet)
+/// and field 5 (`trust_refused`, the decode-ignored coherence echo —
+/// SIGNED Q6, bughunt-5 §5-S 2026-06-09: --wipe rollout, no skew
+/// lane) derive together from the walk's two refusal cell-sets, so an
+/// incoherent pair (`refusal: CONTENT` with `trust_refused: true`,
+/// a shape the walk cannot observe) is unwritable — coherence by
+/// construction, never by review.
+///
+/// [`UnobtainableRefusal`]: rio_proto::types::UnobtainableRefusal
+fn refusal_wire(
+    trust_refused: &rio_evidence_kernel::outcome::GenStampedCells,
+    content_mismatched: &rio_evidence_kernel::outcome::GenStampedCells,
+) -> (i32, bool) {
+    use rio_proto::types::UnobtainableRefusal;
+    let refusal = match (!trust_refused.is_empty(), !content_mismatched.is_empty()) {
+        (false, false) => UnobtainableRefusal::Unspecified,
+        (true, false) => UnobtainableRefusal::Trust,
+        (false, true) => UnobtainableRefusal::Content,
+        (true, true) => UnobtainableRefusal::TrustAndContent,
+    };
+    (
+        refusal.into(),
+        matches!(
+            refusal,
+            UnobtainableRefusal::Trust | UnobtainableRefusal::TrustAndContent
+        ),
+    )
 }
 
 /// Which cell a frontier path belongs to (merged_bug_193): a
@@ -4111,5 +4142,56 @@ mod tests {
             1,
             "locally-served path is pinned at ingest"
         );
+    }
+
+    /// bug_084: the typed refusal verdict rides the wire on a PURE
+    /// content mismatch — `refusal == CONTENT` with the field-5 echo
+    /// `false`. Pre-fix this shape was INEXPRESSIBLE (no proto field;
+    /// the mismatch reached the scheduler only as cause prose folded
+    /// into `error_msg`), so the wire red is compile-level — the
+    /// merged_bug_263 precedent recorded at routing.rs. The cells are
+    /// the production walk cell type recorded through the production
+    /// `record` API; `refusal_wire` IS the production mint (the sole
+    /// writer of both fields at the Unobtainable literal).
+    #[test]
+    fn unobtainable_refusal_field_rides_content_mismatch() {
+        use rio_proto::types::UnobtainableRefusal;
+        let trust = rio_evidence_kernel::outcome::GenStampedCells::new();
+        let mut content = rio_evidence_kernel::outcome::GenStampedCells::new();
+        content.record("/nix/store/abc-x".into(), 0);
+        let (refusal, echo) = refusal_wire(&trust, &content);
+        assert_eq!(
+            refusal,
+            UnobtainableRefusal::Content as i32,
+            "a content disagreement must ride typed, not as cause prose"
+        );
+        assert!(!echo, "the trust echo is false for a pure content mismatch");
+    }
+
+    /// bug_084 coherence table: the ONE constructor derives BOTH wire
+    /// fields, so every (trust, content) cell maps to exactly one
+    /// coherent pair — the field-5 echo is true iff the refusal value
+    /// carries the trust axis (the incoherent shapes the walk cannot
+    /// observe are unwritable through this mint).
+    #[test]
+    fn refusal_wire_pair_is_coherent_across_all_cells() {
+        use rio_proto::types::UnobtainableRefusal as R;
+        let cell = |on: bool| {
+            let mut c = rio_evidence_kernel::outcome::GenStampedCells::new();
+            if on {
+                c.record("/nix/store/abc-x".into(), 0);
+            }
+            c
+        };
+        for (trust_on, content_on, want, want_echo) in [
+            (false, false, R::Unspecified, false),
+            (true, false, R::Trust, true),
+            (false, true, R::Content, false),
+            (true, true, R::TrustAndContent, true),
+        ] {
+            let (refusal, echo) = refusal_wire(&cell(trust_on), &cell(content_on));
+            assert_eq!(refusal, want as i32, "cell ({trust_on}, {content_on})");
+            assert_eq!(echo, want_echo, "echo at cell ({trust_on}, {content_on})");
+        }
     }
 }
