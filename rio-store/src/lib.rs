@@ -372,7 +372,11 @@ pub fn describe_metrics() {
          (present upstream, bytes disagree with the stored row — \
          merged_bug_046) | error (>=1 \
          upstream broke; not a definitive miss) — and tenant (UUID). \
-         Per-upstream debugging detail is in the debug!/warn! log lines \
+         Transient outcomes (raced / stalled / rate-limited / admission \
+         backpressure) emit NO result tick in this family: each has its \
+         own typed signal, and the attempt resolves on a later retry \
+         (merged_bug_016 carve-out). Per-upstream debugging detail is in \
+         the debug!/warn! log lines \
          (which carry upstream=<url>); the metric label is bounded by \
          tenant count, not by tenant-supplied URL."
     );

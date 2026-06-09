@@ -732,122 +732,56 @@ impl Substituter {
             .inflight
             .try_get_with(key, async {
                 was_leader.store(true, std::sync::atomic::Ordering::Relaxed);
-                // Capability gate BEFORE the admission permit
-                // (merged_bug_030: ONE ordering for both legs —
-                // upstreams first, client second). A tenant with no
-                // upstreams (the common case) must get an immediate
-                // `Ok(None)`, not queue behind saturated substituters
-                // for up to SUBSTITUTE_ADMISSION_WAIT —
-                // `list_for_tenant` is one indexed PG read, far
-                // cheaper than the permit's potential 25 s queue.
-                let (http, upstreams) = match self.capability_gate(tenant_id).await? {
-                    CapabilityGate::NoUpstreams => {
-                        // Correct behaviour for a tenant with no
-                        // upstreams configured — but it MUST be
-                        // countable. Every skip in the substitution
-                        // pipeline degrades to "build it from source"
-                        // at the scheduler, and a skip that leaves no
-                        // trace is indistinguishable from "the
-                        // upstream really doesn't have it"
-                        // (2026-05-23: hours of builder CPU compiling
-                        // cache.nixos.org-cached paths because every
-                        // no-op branch was silent). debug! not warn! —
-                        // an upstream-less tenant hits this on every
-                        // cache miss; the counter is the alertable
-                        // signal. Counted once per singleflight
-                        // leader, same granularity as
-                        // `result=hit|miss`.
-                        debug!(
-                            tenant = %tenant_id,
-                            path = store_path,
-                            "substitute skipped: tenant has no upstreams configured"
-                        );
+                // merged_bug_016: EVERY `result` tick happens inside
+                // THIS once-per-leader future — the machine witness
+                // for "exactly one result tick per singleflight
+                // leader" is structural (waiter-side accounting is
+                // unrepresentable: the only counter sites are the
+                // post-loop fold and the leader-exit arm below; the
+                // waiter map_err carries no metrics at all).
+                let r = self
+                    .substitute_leader(tenant_id, store_path, progress)
+                    .await;
+                if let Err(e) = &r {
+                    // The leader-exit tick for pre-loop/SETUP escapes
+                    // (StorePath::parse → NarInfo; capability-gate PG
+                    // failure → Ingest). The skip list mirrors the
+                    // fold's own-label and pre-counted classes:
+                    // transients (Raced/RateLimited/Admission/
+                    // Stalled) have their own signals; Fetch is
+                    // either the fold's Errored verdict (counted AT
+                    // the fold) or the Clientless capability fault
+                    // (counted under skipped_total before it
+                    // returns); UntrustedPresent/ContentMismatch
+                    // carry their own fold labels.
+                    if !matches!(
+                        e,
+                        SubstituteError::Raced
+                            | SubstituteError::RateLimited { .. }
+                            | SubstituteError::Admission(_)
+                            | SubstituteError::Stalled { .. }
+                            | SubstituteError::Fetch(_)
+                            | SubstituteError::UntrustedPresent
+                            | SubstituteError::ContentMismatch
+                    ) {
                         metrics::counter!(
-                            "rio_store_substitute_skipped_total",
-                            "reason" => "no_upstreams"
+                            "rio_store_substitute_total",
+                            "result" => "error",
+                            "tenant" => tenant_id.to_string()
                         )
                         .increment(1);
-                        return Ok(None);
                     }
-                    CapabilityGate::Clientless => {
-                        // Upstreams ARE configured but the reqwest
-                        // client failed to build at startup: the walk
-                        // cannot run, so it cannot confirm ANYTHING —
-                        // least of all a miss. `Ok(None)` here
-                        // laundered the capability fault into a
-                        // definitive NotFound — the merged_bug_044
-                        // class at the capability chokepoint. Err is
-                        // UNCACHED (same law as the all-errored fold:
-                        // nothing was consulted, nothing may be
-                        // remembered). The construction site warned
-                        // once; the counter stays the alertable
-                        // signal.
-                        debug!(
-                            tenant = %tenant_id,
-                            path = store_path,
-                            "substitute failed: no HTTP client (reqwest client build failed at startup)"
-                        );
-                        metrics::counter!(
-                            "rio_store_substitute_skipped_total",
-                            "reason" => "no_http_client"
-                        )
-                        .increment(1);
-                        return Err(SubstituteError::Fetch(
-                            "upstream substitution unavailable: HTTP client failed to build at startup"
-                                .to_string(),
-                        ));
-                    }
-                    CapabilityGate::Ready { http, upstreams } => (http, upstreams),
-                };
-                // r[impl store.substitute.admission+2]
-                // Leader-only permit: this init future runs ONCE per
-                // `(tenant, path)` per TTL window; coalesced waiters
-                // block on the moka future without entering this body,
-                // so they consume no permits.
-                let _permit = match &self.admission {
-                    Some(g) => Some(g.acquire_bounded().await?),
-                    None => None,
-                };
-                self.do_substitute(http, upstreams, tenant_id, store_path, progress)
-                    .await
-                    .map(|v| v.map(Arc::new))
+                }
+                r
             })
             .await
-            .map_err(|e: Arc<SubstituteError>| {
-                // `Raced`/`RateLimited`/`Admission`/`Stalled` are
-                // not-an-error transients (concurrent uploader /
-                // upstream 429 / local backpressure / owner-side stall
-                // abort); skip the error metric so they don't show up
-                // as upstream failure. Admission and Stalled each have
-                // their own dedicated counter
-                // (stale_reclaimed_total{reason="stall_abort"}).
-                // `Fetch` is skipped too (merged_bug_044): exactly TWO
-                // producers reach this match and both are pre-counted —
-                // the fold's all-errored verdict out of `do_substitute`
-                // (counted ONCE at the fold, merged_bug_091) and the
-                // capability gate's Clientless arm above (counted under
-                // skipped_total{reason=no_http_client} before it
-                // returns) — counting either again would double-bill
-                // the attempt. `UntrustedPresent` likewise carries its
-                // own fold label.
-                if !matches!(
-                    *e,
-                    SubstituteError::Raced
-                        | SubstituteError::RateLimited { .. }
-                        | SubstituteError::Admission(_)
-                        | SubstituteError::Stalled { .. }
-                        | SubstituteError::Fetch(_)
-                        | SubstituteError::UntrustedPresent
-                ) {
-                    metrics::counter!(
-                        "rio_store_substitute_total",
-                        "result" => "error",
-                        "tenant" => tenant_id.to_string()
-                    )
-                    .increment(1);
-                }
-                (*e).clone()
-            })?;
+            // merged_bug_016: NO metrics here — this closure runs once
+            // per COALESCED CALLER (moka hands every waiter the same
+            // Arc<SubstituteError>), which multiplied the error tick
+            // by the coalescing width and mislabeled local-DB trouble
+            // as upstream error exactly when coalescing and operator
+            // attention peaked. The unwrap is the only job left.
+            .map_err(|e: Arc<SubstituteError>| (*e).clone())?;
         let elapsed = singleflight_start.elapsed();
         if elapsed > std::time::Duration::from_secs(5) {
             tracing::warn!(
@@ -859,6 +793,98 @@ impl Substituter {
             );
         }
         Ok(cached.map(|arc| (*arc).clone()))
+    }
+
+    /// The once-per-leader body of `try_substitute`'s singleflight
+    /// (merged_bug_016): capability gate, admission permit, and the
+    /// upstream loop. Extracted so the leader-exit metric arm in the
+    /// init future observes EVERY escape — pre-loop and loop alike —
+    /// in leader context.
+    async fn substitute_leader(
+        &self,
+        tenant_id: Uuid,
+        store_path: &str,
+        progress: Option<&SubstProgressFn>,
+    ) -> Result<Option<Arc<ValidatedPathInfo>>, SubstituteError> {
+        // Capability gate BEFORE the admission permit
+        // (merged_bug_030: ONE ordering for both legs —
+        // upstreams first, client second). A tenant with no
+        // upstreams (the common case) must get an immediate
+        // `Ok(None)`, not queue behind saturated substituters
+        // for up to SUBSTITUTE_ADMISSION_WAIT —
+        // `list_for_tenant` is one indexed PG read, far
+        // cheaper than the permit's potential 25 s queue.
+        let (http, upstreams) = match self.capability_gate(tenant_id).await? {
+            CapabilityGate::NoUpstreams => {
+                // Correct behaviour for a tenant with no
+                // upstreams configured — but it MUST be
+                // countable. Every skip in the substitution
+                // pipeline degrades to "build it from source"
+                // at the scheduler, and a skip that leaves no
+                // trace is indistinguishable from "the
+                // upstream really doesn't have it"
+                // (2026-05-23: hours of builder CPU compiling
+                // cache.nixos.org-cached paths because every
+                // no-op branch was silent). debug! not warn! —
+                // an upstream-less tenant hits this on every
+                // cache miss; the counter is the alertable
+                // signal. Counted once per singleflight
+                // leader, same granularity as
+                // `result=hit|miss`.
+                debug!(
+                    tenant = %tenant_id,
+                    path = store_path,
+                    "substitute skipped: tenant has no upstreams configured"
+                );
+                metrics::counter!(
+                    "rio_store_substitute_skipped_total",
+                    "reason" => "no_upstreams"
+                )
+                .increment(1);
+                return Ok(None);
+            }
+            CapabilityGate::Clientless => {
+                // Upstreams ARE configured but the reqwest
+                // client failed to build at startup: the walk
+                // cannot run, so it cannot confirm ANYTHING —
+                // least of all a miss. `Ok(None)` here
+                // laundered the capability fault into a
+                // definitive NotFound — the merged_bug_044
+                // class at the capability chokepoint. Err is
+                // UNCACHED (same law as the all-errored fold:
+                // nothing was consulted, nothing may be
+                // remembered). The construction site warned
+                // once; the counter stays the alertable
+                // signal.
+                debug!(
+                    tenant = %tenant_id,
+                    path = store_path,
+                    "substitute failed: no HTTP client (reqwest client build failed at startup)"
+                );
+                metrics::counter!(
+                    "rio_store_substitute_skipped_total",
+                    "reason" => "no_http_client"
+                )
+                .increment(1);
+                return Err(SubstituteError::Fetch(
+                    "upstream substitution unavailable: HTTP client failed to build at startup"
+                        .to_string(),
+                ));
+            }
+            CapabilityGate::Ready { http, upstreams } => (http, upstreams),
+        };
+        // r[impl store.substitute.admission+2]
+        // Leader-only permit: this init future runs ONCE per
+        // `(tenant, path)` per TTL window; coalesced waiters
+        // block on the moka future without entering this body,
+        // so they consume no permits.
+        let _permit = match &self.admission {
+            Some(g) => Some(g.acquire_bounded().await?),
+            None => None,
+        };
+        self.do_substitute(http, upstreams, tenant_id, store_path, progress)
+            .await
+            .map(|v| v.map(Arc::new))
     }
 
     /// One full fetch cycle — the singleflight body. `http` and
@@ -5041,6 +5067,59 @@ mod tests {
 
     /// bug_357: dedup via `AlreadyComplete` — pre-ingested path skips
     /// the NAR download (narinfo IS fetched, NAR is NOT).
+    /// merged_bug_016: result ticks are emitted INSIDE the
+    /// singleflight leader — a pre-loop escape (bad store path →
+    /// NarInfo) under coalescing ticks result="error" exactly ONCE,
+    /// never once per coalesced caller (moka hands every waiter the
+    /// same Arc<SubstituteError>; the pre-fix waiter-side map_err
+    /// multiplied the tick by the coalescing width and mislabeled
+    /// local trouble as upstream error exactly when operator
+    /// attention peaked).
+    #[tokio::test]
+    async fn result_error_ticks_once_per_leader_under_coalescing() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "coalesce-tick").await;
+        // Upstreams configured so the capability gate passes and the
+        // leader reaches the parse (the pre-loop escape under test).
+        let unused = rio_test_support::fixtures::test_store_path("coalesce-tick-unused");
+        let upstream = spawn_fake_upstream(&unused, b"x".to_vec(), "coalesce-key").await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &upstream.url,
+            50,
+            std::slice::from_ref(&upstream.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+        let sub = test_substituter(db.pool.clone());
+        let recorder = rio_test_support::metrics::CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        // Invalid store path: StorePath::parse fails inside the
+        // leader's do_substitute, before any upstream contact.
+        let bad_path = "not-a-store-path";
+        let (r1, r2, r3) = tokio::join!(
+            sub.try_substitute(tid, bad_path),
+            sub.try_substitute(tid, bad_path),
+            sub.try_substitute(tid, bad_path)
+        );
+        assert!(r1.is_err() && r2.is_err() && r3.is_err());
+        let error_ticks: u64 = recorder
+            .all_keys()
+            .iter()
+            .filter(|k| k.starts_with("rio_store_substitute_total") && k.contains("result=error"))
+            .map(|k| recorder.get(k))
+            .sum();
+        assert_eq!(
+            error_ticks,
+            1,
+            "exactly one result=error tick per singleflight leader \
+             (3 coalesced callers); keys={:?}",
+            recorder.all_keys()
+        );
+    }
+
     #[tokio::test]
     async fn dedup_via_already_complete_no_redownload() {
         use rio_test_support::metrics::CountingRecorder;
