@@ -1128,7 +1128,7 @@ async fn test_transient_failure_max_retries_poisons() -> TestResult {
 /// `ReportAttemptOutcome` classification fill, which never
 /// promotes).
 // r[verify sched.retry.promotion-exempt+3]
-// r[verify sched.sla.reactive-floor+3]
+// r[verify sched.sla.reactive-floor+4]
 #[tokio::test]
 async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -1427,29 +1427,48 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
         };
     });
 
-    // D4: bump_floor_or_count reads est_deadline_secs as the doubling
-    // base; class is irrelevant. Each rung is one pull attempt + a
-    // TimedOut report through the report intake.
+    // D4: bump_floor_or_count reads the MINTED intent's deadline as
+    // the doubling base (live_040: each pull mint stamps the solve
+    // onto last_intent — the freshness law overwrites any seed, so
+    // the ladder is asserted relative to the OBSERVED minted base).
+    // Each rung is one pull attempt + a TimedOut report through the
+    // report intake.
     let build_id = Uuid::new_v4();
     let drv_hash = "i200-timeout";
     let _ev = merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
-    handle
-        .debug_seed_sched_hint(drv_hash, None, None, Some(300), None)
-        .await?;
 
-    // ── Retry 1: TimedOut → floor.deadline=600, status=Ready ──────
-    pull_complete_failure(
+    // ── Retry 1: TimedOut → floor.deadline = 2×minted, status=Ready ──
+    let exec = open_pull_exec(&handle, drv_hash).await;
+    let d0 = expect_drv(&handle, drv_hash)
+        .await
+        .sched
+        .last_intent
+        .as_ref()
+        .expect("the mint stamps the solve (live_040)")
+        .deadline_secs;
+    assert!(
+        d0 > 0 && d0 * 4 < 86_400,
+        "ladder headroom under the 24h cap"
+    );
+    pull_report_exec(
         &handle,
+        exec,
         drv_hash,
-        rio_proto::types::BuildResultStatus::TimedOut,
-        "build exceeded daemon_timeout_secs",
+        pull_payload(rio_proto::types::BuildResult {
+            status: rio_proto::types::BuildResultStatus::TimedOut.into(),
+            error_msg: "build exceeded daemon_timeout_secs".into(),
+            ..Default::default()
+        }),
     )
     .await?;
 
     let info = expect_drv(&handle, drv_hash).await;
+    let floor1 = info.sched.resource_floor.deadline_secs;
     assert_eq!(
-        info.sched.resource_floor.deadline_secs, 600,
-        "I-200: TimedOut → deadline floor doubled (300→600)"
+        floor1,
+        d0 * 2,
+        "I-200: TimedOut → deadline floor doubled from the minted base ({d0}→{})",
+        d0 * 2
     );
     assert!(
         matches!(
@@ -1477,22 +1496,33 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
         "TimedOut is not per-worker — failed_builders stays empty"
     );
 
-    // ── Retry 2: TimedOut on small → floor doubled again, Ready ────
-    // Re-seed to keep the doubling base under test control (mirrors
-    // the original re-seed; on the pull path no dispatch-time re-solve
-    // overwrites it, so the explicit seed is the single source).
-    handle
-        .debug_seed_sched_hint(drv_hash, None, None, Some(600), None)
-        .await?;
-    pull_complete_failure(
+    // ── Retry 2: TimedOut → floor doubles from max(floor, minted) ──
+    let exec = open_pull_exec(&handle, drv_hash).await;
+    let d1 = expect_drv(&handle, drv_hash)
+        .await
+        .sched
+        .last_intent
+        .as_ref()
+        .expect("re-mint re-stamps")
+        .deadline_secs;
+    pull_report_exec(
         &handle,
+        exec,
         drv_hash,
-        rio_proto::types::BuildResultStatus::TimedOut,
-        "build exceeded daemon_timeout_secs",
+        pull_payload(rio_proto::types::BuildResult {
+            status: rio_proto::types::BuildResultStatus::TimedOut.into(),
+            error_msg: "build exceeded daemon_timeout_secs".into(),
+            ..Default::default()
+        }),
     )
     .await?;
     let info = expect_drv(&handle, drv_hash).await;
-    assert_eq!(info.sched.resource_floor.deadline_secs, 1200);
+    let floor2 = info.sched.resource_floor.deadline_secs;
+    assert_eq!(
+        floor2,
+        floor1.max(d1) * 2,
+        "second rung doubles from max(floor, minted base)"
+    );
     assert!(
         matches!(
             info.status,
@@ -1506,14 +1536,23 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
     // ── Cap exhausted: 3rd TimedOut on medium → terminal Cancelled ──
     // Floor still promoted (promote happens before cap check) so an
     // explicit resubmit would start higher.
-    handle
-        .debug_seed_sched_hint(drv_hash, None, None, Some(1200), None)
-        .await?;
-    pull_complete_failure(
+    let exec = open_pull_exec(&handle, drv_hash).await;
+    let d2 = expect_drv(&handle, drv_hash)
+        .await
+        .sched
+        .last_intent
+        .as_ref()
+        .expect("re-mint re-stamps")
+        .deadline_secs;
+    pull_report_exec(
         &handle,
+        exec,
         drv_hash,
-        rio_proto::types::BuildResultStatus::TimedOut,
-        "build exceeded daemon_timeout_secs",
+        pull_payload(rio_proto::types::BuildResult {
+            status: rio_proto::types::BuildResultStatus::TimedOut.into(),
+            error_msg: "build exceeded daemon_timeout_secs".into(),
+            ..Default::default()
+        }),
     )
     .await?;
     let info = expect_drv(&handle, drv_hash).await;
@@ -1524,7 +1563,8 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
         info.status
     );
     assert_eq!(
-        info.sched.resource_floor.deadline_secs, 2400,
+        info.sched.resource_floor.deadline_secs,
+        floor2.max(d2) * 2,
         "bump ran on terminal path too (so explicit resubmit starts higher)"
     );
     Ok(())

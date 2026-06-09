@@ -218,7 +218,7 @@ $ "headroom"(n_"eff") = 1.25 + 0.7 / sqrt(n_"eff") $
 
 The $1 slash sqrt(n_"eff")$ term tracks the standard error of the fitted percentile — parameter uncertainty, which shrinks as $sqrt(n)$ — and the 1.25 floor covers irreducible run-to-run noise. Coverage of $1.25 times M_"p90"$ is $Phi(z_0.9 + ln 1.25 slash sigma_M)$, where the $z_0.9$ term is the p90 fit's own quantile (@fig-headroom-cov): $>=$ p99 when $sigma_M <= 0.12$, $tilde.op$ p97 at $sigma_M = 0.4$. Memory residuals are plausibly tighter than duration's $sigma in [0.1, 0.4]$, since peak RSS is near-deterministic for a fixed input set.
 
-#memo[Neither the duration-residual $sigma$ range $[0.1, 0.4]$ used throughout this document nor the $sigma_M$ range is *measured*. The duration range is an assumption pending live `build_samples` data; gate (d) in §Implementation Phasing is the empirical check. The 1.25 floor is provisional pending the same data, and the OOM-reactive penalty-bump (§Exploration, last paragraph; spec marker `r[sched.sla.reactive-floor+3]`) is the safety net if it proves too low.]
+#memo[Neither the duration-residual $sigma$ range $[0.1, 0.4]$ used throughout this document nor the $sigma_M$ range is *measured*. The duration range is an assumption pending live `build_samples` data; gate (d) in §Implementation Phasing is the empirical check. The 1.25 floor is provisional pending the same data, and the OOM-reactive penalty-bump (§Exploration, last paragraph; spec marker `r[sched.sla.reactive-floor+4]`) is the safety net if it proves too low.]
 
 Autopilot's evaluation @rzadca2020[§4.3] suggests that aggressive learned limits cut slack but raise @oom rate; widening the margin while the fit is young pays a small cost premium for stability.
 
@@ -1144,7 +1144,7 @@ The fit, percentile evaluator, and bisection solve are pure functions covered by
 Requirements without a natural home in the design prose above (wire-level
 and operational invariants).
 
-#r("sched.sla.reactive-floor+3")[
+#r("sched.sla.reactive-floor+4")[
   `SchedHint.resource_floor: ResourceFloor { mem_bytes, disk_bytes, deadline_secs }`
   (default zeros) is the per-dimension reactive floor for cold-start safety.
   An explicit worker-reported resource-exhaustion signal (`CgroupOom` --- the
@@ -1154,8 +1154,9 @@ and operational invariants).
   for deadline), increment `infra_count` (or `timeout_count` for deadline)
   and return `promoted=false`; otherwise set the dimension to
   `min(max(floor, last_intent) * 2, ceiling)` and return `promoted=true`.
-  `last_intent` is `state.sched.last_intent.{mem,disk,deadline}_*`
-  snapshotted at dispatch time. `solve_intent_for` MUST clamp its solved
+  `last_intent` is `state.sched.last_intent.{mem,disk,deadline}_*`,
+  stamped by the pull mint (the mint is the dispatch decision; the
+  stream-era dispatch writer is gone --- live_040). `solve_intent_for` MUST clamp its solved
   (mem, disk) at `resource_floor` before returning, and MUST clamp
   (cores, mem, disk) at `Ceilings.max_{cores,mem,disk}`. Persisted as
   `derivations.floor_*` (`M_044`) so failover doesn't reset to zero. No

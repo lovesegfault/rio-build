@@ -2162,3 +2162,101 @@ async fn confirm_only_pull_never_mints() -> TestResult {
     assert_eq!(first.exec_id, repull.exec_id, "pod B stays unfenced");
     Ok(())
 }
+
+// ── live_040: the mint-time solve stamp ─────────────────────────────
+
+/// live_040: `WorkAssignment.assigned_{cores,mem,disk}` were
+/// permanently None in production — the only `last_intent` writer was
+/// deleted with the stream placement/dispatch layer (20ddb2230), so
+/// the D4 OOM floor doubled from base 0 (structurally dead), §13b
+/// spawn-ahead read no ETA, SLA misprediction scoring never moved,
+/// `cpu_limit_cores` collapsed to cgroup-only, and the builder banner
+/// rendered `?c/?GiB/?GiB`. The mint is the dispatch decision in the
+/// pull architecture: the solve already computed for the deadline is
+/// now stamped onto `last_intent` in the same mint, and the delivered
+/// assignment carries it.
+///
+/// World built through production constructors ONLY (the bug_077
+/// lesson): intent merged, attempt minted via the real pull — no
+/// fixture writes `last_intent` directly.
+#[tokio::test]
+async fn mint_stamps_last_intent_and_assignment_carries_it() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+    let _ev = merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "mint-stamp",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    let assignment = expect_deliver(pull(&handle, "mint-stamp", Some("mint-stamp")).await);
+    let info = expect_drv(&handle, "mint-stamp").await;
+    let intent = info.sched.last_intent.as_ref();
+    assert!(
+        intent.is_some(),
+        "the mint must stamp the mint-time solve onto last_intent \
+         (pre-fix: None — no writer existed after the dispatch-layer deletion)"
+    );
+    let intent = intent.unwrap();
+    assert_eq!(
+        assignment.assigned_cores,
+        Some(intent.cores),
+        "the delivered assignment must carry the stamped solve's cores"
+    );
+    assert_eq!(assignment.assigned_mem_bytes, Some(intent.mem_bytes));
+    assert_eq!(assignment.assigned_disk_bytes, Some(intent.disk_bytes));
+    Ok(())
+}
+
+/// live_040 companion: the D4 OOM floor doubles FROM the minted
+/// intent. Pre-fix `bump_floor_or_count`'s base was
+/// `max(floor=0, last_intent=None→0) = 0` on every first OOM, so the
+/// reactive floor never escalated from a cold start — the worker
+/// looped at probe size until the retry budget poisoned it. Driven
+/// through the production completion path: minted attempt, then the
+/// worker's CgroupOom infrastructure report.
+#[tokio::test]
+async fn oom_floor_doubles_from_minted_intent() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+    let _ev = merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "oom-floor",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    let _assignment = expect_deliver(pull(&handle, "oom-floor", Some("oom-floor")).await);
+    let minted_mem = expect_drv(&handle, "oom-floor")
+        .await
+        .sched
+        .last_intent
+        .as_ref()
+        .map(|i| i.mem_bytes)
+        .unwrap_or(0);
+
+    // The worker's OOM report (the cgroup-kill marker routes the
+    // completion through the resource-exhaustion classification).
+    pull_report(
+        &handle,
+        "oom-floor",
+        pull_payload(rio_proto::types::BuildResult {
+            status: rio_proto::types::BuildResultStatus::InfrastructureFailure.into(),
+            error_msg: format!("{} (memory.peak 4Gi)", rio_proto::CGROUP_OOM_MSG),
+            ..Default::default()
+        }),
+    )
+    .await?;
+
+    let floor = expect_drv(&handle, "oom-floor")
+        .await
+        .sched
+        .resource_floor
+        .mem_bytes;
+    assert!(
+        floor > 0 && floor >= minted_mem,
+        "the OOM bump must double from the minted intent's mem, not no-op from \
+         base 0 (pre-fix: last_intent=None → base=0 → next=0 → floor unchanged); \
+         floor={floor}, minted_mem={minted_mem}"
+    );
+    Ok(())
+}

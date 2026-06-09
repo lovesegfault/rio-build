@@ -751,6 +751,25 @@ impl DagActor {
             .path_for_hash(drv_hash)
             .map(rio_nix::store_path::drv_log_hash)
             .unwrap_or_default();
+        // live_040: THE mint-time solve, computed once and consumed by
+        // BOTH the deadline reconciliation (the bug_106 max() below)
+        // and the last_intent stamp after the durable mint commits.
+        // The mint IS the dispatch decision in the pull architecture —
+        // with the stream dispatch pass gone, this is the one writer
+        // feeding every last_intent consumer (D4 floor doubling base,
+        // §13b running-dep ETA, SLA misprediction scoring,
+        // cpu_limit_cores min, the delivered assignment's sizing
+        // triple). Build lane only: a materialization claim runs under
+        // its own deadline and sizes nothing.
+        let minted_solve: Option<crate::state::SolvedIntent> = match kind {
+            rio_evidence_kernel::pull::PullKind::Build => {
+                let (hw, cost, inputs_gen) = self.solve_inputs();
+                self.dag
+                    .node(drv_hash)
+                    .map(|state| self.solve_intent_for(state, &hw, &cost, inputs_gen))
+            }
+            rio_evidence_kernel::pull::PullKind::Materialization => None,
+        };
         // THE one kind match (A2.3): every kind-divergent decision of
         // this mint is selected here; the body below consumes profile
         // fields only. The work class is keyed on the request's claimed
@@ -770,23 +789,19 @@ impl DagActor {
                 // is open: the max of the CARRIED rendered deadline
                 // (`BoundIntent.deadline_secs` — the same solve
                 // `activeDeadlineSeconds` was rendered from; bug_106)
-                // and the mint-time re-solve. The solve is NOT stamped
-                // onto the node: with the stream dispatch pass gone
-                // there is no dispatch-time intent writer, and the
-                // pull-path conventions (recorded with the unit-corpus
-                // re-point) treat the explicit per-test/operator seed
-                // as the only source for `last_intent`-derived
-                // baselines.
+                // and the mint-time re-solve (`minted_solve` above).
+                // live_040: that same solve IS stamped onto
+                // `last_intent` once the durable mint commits — the
+                // mint is the dispatch decision, and the stamp is the
+                // ONE writer feeding every last_intent consumer (the
+                // pre-fix "no dispatch-time intent writer" world left
+                // the D4 floor, §13b ETA, SLA scoring, and the
+                // assignment sizing triple permanently dark; the
+                // debug.rs operator seed is a second writer with
+                // documented precedence — the mint overwrites it on
+                // the next pull, the intended freshness law).
                 deadline_secs: {
-                    let resolved = {
-                        let (hw, cost, inputs_gen) = self.solve_inputs();
-                        self.dag.node(drv_hash).map(|state| {
-                            f64::from(
-                                self.solve_intent_for(state, &hw, &cost, inputs_gen)
-                                    .deadline_secs,
-                            )
-                        })
-                    };
+                    let resolved = minted_solve.as_ref().map(|i| f64::from(i.deadline_secs));
                     let carried = self
                         .authoritative_binding
                         .get(drv_hash)
@@ -934,6 +949,12 @@ impl DagActor {
             state.retry.backoff_until = None;
             state.assigned_executor = Some(pulling_identity.clone());
             state.exec_id = Some(exec_id);
+            // live_040: stamp the mint-time solve (computed above,
+            // build lane only) — BEFORE build_assignment_proto reads
+            // it for the assignment's sizing triple.
+            if let Some(solve) = minted_solve {
+                state.sched.last_intent = Some(solve);
+            }
             // rule-4b: mirror the persisted nonce (cleared in lockstep
             // with exec_id at every clear site).
             state.claim_nonce = claim_nonce;

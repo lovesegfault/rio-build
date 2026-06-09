@@ -39,7 +39,7 @@ pub struct FloorOutcome {
     pub at_cap: bool,
 }
 
-// r[impl sched.sla.reactive-floor+3]
+// r[impl sched.sla.reactive-floor+4]
 // r[impl sched.retry.promotion-exempt+3]
 /// Double the relevant `resource_floor` dimension on an explicit
 /// resource-exhaustion signal, or — if already at the cap — report
@@ -48,10 +48,11 @@ pub struct FloorOutcome {
 /// increments after its cap check so at-cap and non-floor failures
 /// poison at the same attempt number.
 ///
-/// The doubling base is `state.sched.last_intent` — snapshotted at
-/// dispatch time. The `max(floor, last)` form means a stale floor
-/// (lower than what was actually dispatched) doesn't under-double; if
-/// both are zero (cold start, never dispatched), the helper returns
+/// The doubling base is `state.sched.last_intent` — stamped by the
+/// pull mint (live_040: the mint is the dispatch decision). The
+/// `max(floor, last)` form means a stale floor (lower than what was
+/// actually minted) doesn't under-double; if both are zero (cold
+/// start, never minted), the helper returns
 /// `{promoted:false, at_cap:false}` — the caller's unconditional
 /// post-check increment bounds this (I-200).
 pub fn bump_floor_or_count(
@@ -246,9 +247,15 @@ mod tests {
 
     #[test]
     fn cold_start_zero_base_is_noop_not_promote() {
-        // last_intent=None, floor=0 → base=0 → next=0 → unchanged.
-        // {promoted:false, at_cap:false} → caller's retry budget
-        // bounds it instead of looping at floor=0.
+        // The COLD-START CORNER (live_040 re-scope): pre-first-mint is
+        // still a real state — recovery hydrates nodes without
+        // last_intent, and an OOM arriving before any mint has no
+        // baseline to double from. last_intent=None, floor=0 → base=0
+        // → next=0 → unchanged; {promoted:false, at_cap:false} →
+        // caller's retry budget bounds it instead of looping at
+        // floor=0. (This is the corner, NOT the steady state: the
+        // mint stamps last_intent, so every post-mint OOM doubles —
+        // see oom_floor_doubles_from_minted_intent.)
         let mut s = st();
         let o = bump_floor_or_count(&mut s, TerminationReason::OomKilled, &CEIL);
         assert!(!o.promoted && !o.at_cap);

@@ -996,7 +996,7 @@ impl DagActor {
             .collect()
     }
 
-    // r[impl sched.sla.reactive-floor+3]
+    // r[impl sched.sla.reactive-floor+4]
     /// Double the relevant `resource_floor` dimension for `drv_hash`
     /// (D4). Thin wrapper around `floor::bump_floor_or_count` that
     /// handles the dag-node lookup, metric, log, and best-effort PG
@@ -1013,7 +1013,7 @@ impl DagActor {
     /// DeadlineExceeded) retired with that RPC; the pod-terminal
     /// `ReportAttemptOutcome` second installment deliberately does not
     /// promote (no durable first-report dedup exists for it) — the
-    /// `sched.sla.reactive-floor+3` re-derivation records the accepted
+    /// `sched.sla.reactive-floor+4` re-derivation records the accepted
     /// residual.
     ///
     /// NOT called from bare disconnect / `TransientFailure` /

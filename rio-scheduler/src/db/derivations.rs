@@ -305,7 +305,7 @@ impl SchedulerDb {
         Ok(FencedOutcome::Applied(updated))
     }
 
-    // r[impl sched.sla.reactive-floor+3]
+    // r[impl sched.sla.reactive-floor+4]
     // r[impl sched.evidence.durability+4]
     /// Persist a derivation's reactive `resource_floor` (D4, `M_044`),
     /// fenced and server-side monotone.

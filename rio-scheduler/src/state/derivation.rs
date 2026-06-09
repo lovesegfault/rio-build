@@ -920,7 +920,7 @@ pub struct CaState {
     pub output_unchanged: bool,
 }
 
-// r[impl sched.sla.reactive-floor+3]
+// r[impl sched.sla.reactive-floor+4]
 /// Per-dimension resource floor for the NEXT dispatch (D4).
 ///
 /// Reactive promotion: an explicit WORKER-REPORTED
@@ -1007,10 +1007,13 @@ pub struct SchedHint {
     /// `record_build_sample` reads `predicted` for actual-vs-predicted
     /// scoring.
     ///
-    /// Populated at DISPATCH time (`dispatch_ready`), not merge time —
-    /// the estimator refreshes on Tick, so a long-queued derivation
-    /// picks up fresh history. `None` = never dispatched (cold start /
-    /// recovery) — placement treats it as "any worker fits".
+    /// Populated at MINT time (`mint_and_deliver`, live_040) — the
+    /// pull mint is the dispatch decision, and the estimator refreshes
+    /// on Tick, so a long-queued derivation picks up fresh history at
+    /// its mint. `None` = never minted (cold start / recovery) — the
+    /// floor doubling and ETA consumers treat it as no-baseline. The
+    /// debug-command seed is a second writer with documented
+    /// precedence: the next mint overwrites it (the freshness law).
     /// In-memory only.
     pub last_intent: Option<SolvedIntent>,
     /// Estimated build duration (from Estimator). Set at merge time;
