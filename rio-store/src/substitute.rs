@@ -1035,11 +1035,18 @@ impl Substituter {
                             // integrity metric is emitted HERE (where
                             // the error is observable) — per-upstream
                             // errors never reach `grpc/mod.rs`.
-                            if matches!(
-                                other,
-                                SubstituteError::HashMismatch { .. }
-                                    | SubstituteError::SizeMismatch { .. }
-                            ) {
+                            // bug_240: class membership by CALLING the
+                            // canonical table, never by re-enumerating
+                            // variants — the pre-fix
+                            // `HashMismatch | SizeMismatch` matches!
+                            // silently excluded TooLarge (the
+                            // declared-NarSize over-cap lie, the
+                            // decompression bomb, oversized narinfo
+                            // bodies: the most clearly hostile events
+                            // this counter exists for).
+                            if substitute_error_evidence(other).0
+                                == rio_evidence_kernel::outcome::SubstituteFailureClass::Integrity
+                            {
                                 metrics::counter!(
                                     "rio_store_substitute_integrity_failures_total",
                                     "tenant" => tenant_label.clone()
@@ -5067,6 +5074,72 @@ mod tests {
 
     /// bug_357: dedup via `AlreadyComplete` — pre-ingested path skips
     /// the NAR download (narinfo IS fetched, NAR is NOT).
+    /// bug_240: the per-occurrence integrity counter derives class
+    /// membership by CALLING the canonical table
+    /// (`substitute_error_evidence(_).0 == Integrity`), never by
+    /// re-enumerating variants — the TooLarge class (declared-NarSize
+    /// over-cap lie, decompression bomb, oversized narinfo) is the
+    /// most clearly hostile event here and the pre-fix
+    /// `HashMismatch | SizeMismatch` matches! never ticked it.
+    #[tokio::test]
+    async fn integrity_counter_covers_toolarge_via_table() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "toolarge-tick").await;
+        let path = rio_test_support::fixtures::test_store_path("toolarge-victim");
+        let (nar, _nar_hash) = rio_test_support::fixtures::make_nar(b"toolarge-bytes");
+        let hash_part = StorePath::parse(&path).unwrap().hash_part().to_string();
+        // The upstream's narinfo LIES: NarSize over the decompressed
+        // cap — try_upstream errors TooLarge before any claim/fetch.
+        let lying = signed_narinfo_for(
+            &path,
+            &nar,
+            "cache.toolarge",
+            &hash_part,
+            Some(MAX_NAR_SIZE + 1),
+        );
+        let upstream = spawn_flex_upstream(
+            &path,
+            nar.clone(),
+            "cache.toolarge",
+            FlexCfg {
+                narinfo_override: Some(lying),
+                ..Default::default()
+            },
+        )
+        .await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &upstream.url,
+            50,
+            std::slice::from_ref(&upstream.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+        let sub = test_substituter(db.pool.clone());
+        let recorder = rio_test_support::metrics::CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let got = sub.try_substitute(tid, &path).await;
+        assert!(
+            got.is_err(),
+            "an over-cap NarSize lie must error, got {got:?}"
+        );
+        let ticks: u64 = recorder
+            .all_keys()
+            .iter()
+            .filter(|k| k.starts_with("rio_store_substitute_integrity_failures_total"))
+            .map(|k| recorder.get(k))
+            .sum();
+        assert_eq!(
+            ticks,
+            1,
+            "a TooLarge size-lie must tick the integrity counter (class \
+             Integrity per the canonical table); keys={:?}",
+            recorder.all_keys()
+        );
+    }
+
     /// merged_bug_016: result ticks are emitted INSIDE the
     /// singleflight leader — a pre-loop escape (bad store path →
     /// NarInfo) under coalescing ticks result="error" exactly ONCE,
