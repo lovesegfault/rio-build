@@ -1122,10 +1122,11 @@ async fn test_transient_failure_max_retries_poisons() -> TestResult {
 ///
 /// `TransientFailure` (build script exited nonzero) does NOT promote
 /// — that's a build-determinism signal. The previous test used
-/// TransientFailure to drive the ladder; under the controller-
-/// reports-reason design that's wrong. CgroupOom is the worker-
-/// reported sizing signal (pod-level OOMKilled is controller-
-/// reported via `ReportExecutorTermination`).
+/// TransientFailure to drive the ladder; under the worker-reported
+/// promotion design that's wrong. CgroupOom is the worker-reported
+/// sizing signal (pod-level OOMKilled arrives as the controller's
+/// `ReportAttemptOutcome` classification fill, which never
+/// promotes).
 // r[verify sched.retry.promotion-exempt+3]
 // r[verify sched.sla.reactive-floor+3]
 #[tokio::test]

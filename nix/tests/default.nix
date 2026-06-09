@@ -1231,7 +1231,7 @@ in
   # backlog. Set via the chart key (not extraEnv) so the values.yaml →
   # store.yaml templating is exercised.
   #
-  # r[verify obs.metric.scheduler-substituting]
+  # r[verify obs.metric.scheduler-substituting+2]
   #   cascade: the §2.6 substituting bucket (pending unclaimed jobs)
   #   reaches Prometheus — the backlog gauge rises while the cascade
   #   drains and returns to 0 after it; the scrape surface IS the
@@ -1354,7 +1354,7 @@ in
   #   rio-scheduler-mutating HTTPRoute is absent — `kubectl get
   #   httproute rio-scheduler-mutating` fails. Proves the helm-template
   #   fail-closed holds at runtime through the operator's reconcile.
-  # r[verify dash.journey.build-to-logs]
+  # r[verify dash.journey.build-to-logs+2]
   #   The LogViewer's log-read path (nginx → rio-store
   #   LogService/TailLog, the second upstream + cross-namespace Service)
   #   is asserted by the TailLog 0x80 trailer subtest in dashboard.nix:

@@ -1033,7 +1033,7 @@ impl DagActor {
         // rationale unchanged: leader-published series must collapse
         // on loss or sum() consumers (the store ScaledObject
         // triggers) double-count the fleet after every failover.
-        // r[impl obs.metric.scheduler-substituting]
+        // r[impl obs.metric.scheduler-substituting+2]
         // The cost-table latch member writes cost_was_leader=false —
         // THE lose-edge writer bug_310 was missing: without it an
         // A→B→A flap inside one 600s housekeeping tick skipped the

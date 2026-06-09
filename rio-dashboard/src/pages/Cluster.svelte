@@ -1,5 +1,5 @@
 <script lang="ts">
-  // r[impl dash.journey.build-to-logs]
+  // r[impl dash.journey.build-to-logs+2]
   // First step only: "load the page" prerequisite. The full
   // click-build → DAG → click-node → log-stream chain is closed by the
   // Builds list + Graph node-click + LogViewer plans; this page proves

@@ -742,10 +742,14 @@ pub struct ClusterSnapshot {
     /// `DerivationStatus::{Assigned|Running}` across the DAG. Workers
     /// currently occupied.
     pub running_derivations: u32,
-    /// Derivations carrying an unresolved, unclaimed materialization
-    /// job (wire-stable bucket name; the upstream fetch the store
-    /// executor has pending or in flight). Store-side load: published
-    /// as the `rio_scheduler_substituting_derivations` gauge each tick
+    /// Derivations carrying a CLAIMABLE materialization job —
+    /// unclaimed, not parked, not deferred: `claimability()`'s three
+    /// axes (wire-stable bucket name). Claimed (in-flight) fetches are
+    /// EXCLUDED — they left the bucket at claim time; parked jobs stay
+    /// visible via `rio_scheduler_materialization_stalled`, deferred
+    /// jobs sit in neither gauge for their bounded <=300s window.
+    /// Store-side claimable load: published as the
+    /// `rio_scheduler_substituting_derivations` gauge each tick
     /// (`obs.metric.scheduler-substituting` — the store ScaledObject's
     /// leading trigger) and counted in the ComponentScaler predictive
     /// signal (`ctrl.scaler.signal-substituting`) for any CR target.

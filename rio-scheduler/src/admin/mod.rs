@@ -446,8 +446,9 @@ impl AdminService for AdminServiceImpl {
         request: Request<rio_proto::types::ReportAttemptOutcomeRequest>,
     ) -> Result<Response<rio_proto::types::ReportAttemptOutcomeResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        // Same gate as ReportExecutorTermination: a forged terminal
-        // report from a compromised builder must not be able to touch
+        // Same service-caller posture the removed stream-era
+        // ReportExecutorTermination carried: a forged terminal report
+        // from a compromised builder must not be able to touch
         // attempt classification.
         self.ensure_service_caller(request.metadata(), &["rio-controller"])?;
         self.ensure_leader()?;

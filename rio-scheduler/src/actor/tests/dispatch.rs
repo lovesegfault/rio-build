@@ -2418,7 +2418,7 @@ async fn spawn_intents_exclude_backoff_window() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.admin.snapshot-substituting+3]
+// r[verify sched.admin.snapshot-substituting+4]
 /// bug_129: `ClusterStatus.queued_by_system` equals
 /// `GetSpawnIntents.queued_by_system` BY CONSTRUCTION (both surfaces
 /// read the one shared Ready-node classifier), INCLUDING the

@@ -1,4 +1,4 @@
-// r[impl dash.journey.build-to-logs]
+// r[impl dash.journey.build-to-logs+2]
 // Singleton LogService client — the build-log read path.
 //
 // Build logs live in rio-store (immutable zstd chunks + a PG manifest),

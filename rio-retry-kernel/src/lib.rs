@@ -541,19 +541,26 @@ pub enum AttemptEvent<Id> {
     /// Charges nothing; re-checks the poison threshold over failures
     /// recorded by other events.
     Disconnect { at: AbsTime, executor: Option<Id> },
-    /// E6 — controller `ReportExecutorTermination{OomKilled,
-    /// EvictedDiskPressure}`, correlated back to this derivation through
-    /// `recently_disconnected` (or the race-ahead live-executor lookup).
-    /// `promoted` / `at_cap` are `bump_resource_floor`'s outcome for the
-    /// reported dimension.
+    /// E6 — historically controller `ReportExecutorTermination{OomKilled,
+    /// EvictedDiskPressure}` correlated through `recently_disconnected`;
+    /// both the RPC and the correlation map are removed — the live
+    /// vehicle is the `ReportAttemptOutcome` idempotent column fill
+    /// (retryPolicy.qnt: pullAttemptOutcomeOom — charging semantics
+    /// UNCHANGED, only the dedup vehicle moved). `promoted` / `at_cap`
+    /// are the floor outcome for the reported dimension as the fold
+    /// models it (production fills never promote).
     ControllerTermination {
         at: AbsTime,
         executor: Option<Id>,
         promoted: bool,
         at_cap: bool,
     },
-    /// E7 — controller `ReportExecutorTermination{DeadlineExceeded}`,
-    /// prefix-matched back to this derivation.
+    /// E7 — historically controller
+    /// `ReportExecutorTermination{DeadlineExceeded}` prefix-matched back
+    /// to this derivation; RPC removed — the live vehicle is the
+    /// `report_deadline_exceeded_jobs` Job-condition read riding the
+    /// `ReportAttemptOutcome` fill (retryPolicy.qnt:
+    /// pullAttemptOutcomeDeadline — charging semantics UNCHANGED).
     ControllerDeadlineExceeded { at: AbsTime, executor: Option<Id> },
     /// E8 — the scheduler-side backstop timer: Running for longer than
     /// `max(est × 3, daemon_timeout + slack)` with no report.
@@ -1228,7 +1235,9 @@ pub enum OutcomeClass {
 pub enum ReportingParty {
     /// Worker `CompletionReport`.
     Worker,
-    /// Controller `ReportExecutorTermination`.
+    /// Controller-observed (live: the `ReportAttemptOutcome` fill and
+    /// synthesized closes; historic rows: the removed stream-era
+    /// `ReportExecutorTermination`).
     Controller,
     /// Scheduler-side observation (disconnect, backstop, sweep,
     /// dispatch-time verdict, TTL expiry).
@@ -2230,10 +2239,13 @@ pub enum ObservedFailure<'a> {
     /// E5 — stream disconnect / heartbeat timeout / force-drain released
     /// the execution; classification not yet established.
     Disconnect,
-    /// E6 — controller `ReportExecutorTermination{OomKilled,
-    /// EvictedDiskPressure}`.
+    /// E6 — controller-observed resource termination (historically
+    /// `ReportExecutorTermination{OomKilled, EvictedDiskPressure}`;
+    /// live vehicle: the `ReportAttemptOutcome` fill).
     ControllerResourceTermination,
-    /// E7 — controller `ReportExecutorTermination{DeadlineExceeded}`.
+    /// E7 — controller-observed deadline exceedance (historically
+    /// `ReportExecutorTermination{DeadlineExceeded}`; live vehicle:
+    /// the Job-condition read riding `ReportAttemptOutcome`).
     ControllerDeadlineExceeded,
     /// E8 — the scheduler-side backstop timer fired for a Running build
     /// with no report.

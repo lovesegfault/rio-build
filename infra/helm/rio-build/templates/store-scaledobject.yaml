@@ -93,13 +93,18 @@ spec:
     # divides the fleet-wide backlog by the current replica count, so
     # desiredReplicas = ceil(sum(backlog) / targetBacklogJobsPerReplica).
     # The gauge counts derivations with CLAIMABLE materialization jobs
-    # (unclaimed AND not parked) — durable PG-backed state published by
-    # the scheduler leader each tick (sum() collapses the leader-gated
-    # single series; a deposed leader's series is zeroed, not stale).
+    # (unclaimed, not parked, not deferred — claimability()'s three
+    # axes) — durable PG-backed state published by the scheduler leader
+    # each tick (sum() collapses the leader-gated single series; a
+    # deposed leader's series is zeroed, not stale).
     # Parked jobs leave the gauge (bug_252: a parked backlog must DRAIN
     # store replicas, not hold them — the park is pacing, and the store
     # cannot make a parked job progress); the parked population stays
-    # visible via rio_scheduler_materialization_stalled.
+    # visible via rio_scheduler_materialization_stalled. DEFERRED jobs
+    # (defer_until — the bounded <=300s re-probe window) sit in NEITHER
+    # gauge for that window: a defer-heavy cascade reads near-zero here
+    # by design, and the trigger scales back up when the window lapses
+    # and the jobs return to claimable.
     # Both prometheus triggers render through rio.promTrigger, which
     # unit-checks metric vs knob against files/metric-units.json and
     # fails the render on mismatch (bug_299).

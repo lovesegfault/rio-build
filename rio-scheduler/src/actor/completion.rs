@@ -3110,8 +3110,10 @@ impl DagActor {
         // restart) are NOT size-related — the previous over-broad
         // promote here is what made cmake go medium→large→xlarge in
         // live QA from a store-replica-restart with zero builds run.
-        // Pod-level OOMKilled (whole pod died) is reported by the
-        // controller via `ReportExecutorTermination` instead.
+        // Pod-level OOMKilled (whole pod died) arrives as the
+        // controller's `ReportAttemptOutcome` classification fill,
+        // which deliberately never promotes (sla-sizing.typ accepted
+        // residual).
         //
         // Substring match on the `ExecutorError::CgroupOom` Display
         // impl; both reference `rio_proto::CGROUP_OOM_MSG` so the

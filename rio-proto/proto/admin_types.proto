@@ -143,8 +143,11 @@ message BuildInfo {
 // Why a builder/fetcher Pod's container terminated. Populated by the
 // controller from k8s PodStatus (containerStatuses[].state.terminated.
 // reason for OOMKilled/Completed/Error; status.reason+message for
-// Evicted). The scheduler uses OomKilled / EvictedDiskPressure /
-// DeadlineExceeded to gate `resource_floor` bump.
+// Evicted). The controller sends OomKilled / EvictedDiskPressure over
+// ReportAttemptOutcome as the classification fill (never promotes a
+// floor); floor promotion consumes this vocabulary WORKER-side only
+// (OomKilled <- CgroupOom, DeadlineExceeded <- TimedOut; the disk arm
+// is parked -- no live producer).
 enum TerminationReason {
   // Wire-default: controller couldn't classify (no terminated state,
   // status not yet populated). Scheduler treats as no-op.

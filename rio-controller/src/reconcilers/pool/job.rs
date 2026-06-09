@@ -950,10 +950,15 @@ pub(super) async fn reap_orphan_running(
 /// disciplined; ≤ 10 s of skew stands as a deployment guarantee.
 /// Documented const, deliberately not config (config would drag the
 /// BLESS/docs-data schema obligations for a deployment invariant).
-/// A genuine cancel whose Job is younger than `closed_age + slack`
-/// (insta-cancel inside the window) is missed by AT MOST the slack and
-/// falls back to orphan-reap / `activeDeadlineSeconds` — the
-/// documented backstop pair.
+/// A genuine cancel whose close lands within the slack of Job
+/// creation (insta-cancel inside the window) NEVER binds — both
+/// `closed_age_secs` and the Job's age are live-recomputed, so the
+/// generation inequality is time-invariant for that close, not a
+/// delay: the missed CLASS is bounded by the slack window, and such
+/// closes are handled entirely by the backstop pair (orphan-reap /
+/// `activeDeadlineSeconds`, up to ~300s). The signed trade accepts
+/// that bounded miss to keep respawned same-name Jobs structurally
+/// unselectable.
 pub(super) const CANCEL_CLOSE_SKEW_SLACK_SECS: u64 = 10;
 
 /// A close bound to a Job it may tear down — the ONLY way the cancel
@@ -1401,7 +1406,10 @@ pub(super) fn pod_termination_reason(pod: &Pod) -> TerminationReason {
         // emptyDir-sizeLimit eviction (`emptyDirLimit` in kubelet's
         // eviction manager) says `Usage of EmptyDir volume "<name>"
         // exceeds the limit "<N>".` — neither of the above substrings.
-        // Match all three; all should bump the disk floor.
+        // Match all three; all classify as EvictedDiskPressure for
+        // the AD2c classification fill (the scheduler intake never
+        // promotes a floor from controller reports — sla-sizing.typ
+        // accepted residual; the floor's disk arm is parked).
         if msg.contains("DiskPressure")
             || msg.contains("ephemeral-storage")
             || msg.contains("ephemeral local storage")
@@ -1482,9 +1490,10 @@ pub(super) fn job_deadline_exceeded_epoch_secs(job: &Job) -> Option<f64> {
 /// unified wire vocabulary, so the planes cannot drift (the retired
 /// hand-mirrored match emitted `disk_pressure` against the scheduler's
 /// `evicted_disk_pressure`; equality joins returned nothing). Only the
-/// promoting reasons and DeadlineExceeded ever reach the metric (the
-/// report path filters the rest before the RPC) — the filtered arms
-/// keep the deliberate `other` collapse.
+/// reported classification-fill reasons (OomKilled /
+/// EvictedDiskPressure) and DeadlineExceeded ever reach the metric
+/// (the report path filters the rest before the RPC) — the filtered
+/// arms keep the deliberate `other` collapse.
 fn termination_reason_label(reason: TerminationReason) -> &'static str {
     match reason {
         TerminationReason::OomKilled
@@ -1562,10 +1571,13 @@ pub(super) fn first_terminal_report_sample(
     Some((now_epoch_secs - terminal_epoch_secs).max(0.0))
 }
 
-/// Report each terminated Pod's k8s reason to the scheduler so it can
-/// gate `resource_floor` promotion on actual OOMKilled/DiskPressure
-/// (not bare disconnect). Called from the Job-mode reconcilers' tick
-/// after the spawn/reap steps.
+/// Report each terminated Pod's k8s reason to the scheduler as the
+/// kube-authoritative CLASSIFICATION FILL (AD2c): the intake's only
+/// write is the reason-only second installment on an existing,
+/// still-unfilled classification row — it never inserts a row, never
+/// consumes budget, and never bumps a floor (floor promotion is
+/// worker-reported-only; sla-sizing.typ accepted residual). Called
+/// from the Job-mode reconcilers' tick after the spawn/reap steps.
 ///
 /// Lists Pods (not Jobs — JobStatus doesn't carry per-container
 /// termination reason) by `POOL_LABEL` selector. For each Pod with a
@@ -1573,16 +1585,17 @@ pub(super) fn first_terminal_report_sample(
 /// `AdminService.ReportAttemptOutcome(job_name = pod name, reason)`
 /// (the C4/C5 unification).
 ///
-/// Idempotent: the scheduler's `recently_disconnected` map dedups
-/// (first-report-wins, `remove()` on hit), so re-reporting the same
-/// Pod every ~10s tick during `JOB_TTL_SECS=600` is a no-op past the
-/// first. `Unknown` (Pod still running / status not populated) is
-/// skipped — next tick will see the terminated state.
+/// Idempotent: the fill targets an unfilled row exactly once, so
+/// re-reporting the same Pod every ~10s tick during
+/// `JOB_TTL_SECS=600` is a no-op past the first. `Unknown` (Pod still
+/// running / status not populated) is skipped — next tick will see
+/// the terminated state.
 ///
 /// Best-effort: list error or RPC error is logged at debug/warn and
-/// the reconcile continues. A missed report degrades to "one OOM
-/// doesn't promote"; the next OOM on the same drv will (floor is
-/// sticky). Never blocks the spawn/reap loop.
+/// the reconcile continues. A missed report degrades to "this
+/// attempt's classification stays establishment-sweep-classified" —
+/// nothing depends on the fill for liveness. Never blocks the
+/// spawn/reap loop.
 pub(super) async fn report_terminated_pods(ctx: &Ctx, ns: &str, pool: &str) {
     // OA1 sample-gate hygiene: drop entries for objects that can no
     // longer be listed (past the TTL window) so the map stays bounded.
@@ -1605,7 +1618,7 @@ pub(super) async fn report_terminated_pods(ctx: &Ctx, ns: &str, pool: &str) {
     // the scheduler side): pin the pod-terminal classification to the
     // open attempt's exec_id when one exists, so the kube-authoritative
     // node attribution keeps flowing into the establishment charge.
-    // One view read per tick, only when a promoting pod exists; on
+    // One view read per tick, only when a reportable pod exists; on
     // error the reports go intent-keyed (the scheduler then skips the
     // node fill — conservative, never wrong-attempt).
     let open_attempts: Vec<rio_proto::types::OpenAttempt> = if list.items.iter().any(|pod| {
@@ -1634,17 +1647,17 @@ pub(super) async fn report_terminated_pods(ctx: &Ctx, ns: &str, pool: &str) {
     };
     for pod in &list.items {
         let reason = pod_termination_reason(pod);
-        // Only the promoting reasons go over the wire. `Completed`/
-        // `Error`/`EvictedOther` are sent every tick for every TTL-
-        // window Job today; the scheduler's `reason_label` gate
-        // no-ops them anyway. `Error` IS observable for a deadline-
+        // Only the classification-fill reasons (OomKilled /
+        // EvictedDiskPressure) go over the wire. `Completed`/
+        // `Error`/`EvictedOther` would be sent every tick for every
+        // TTL-window Job; the scheduler's fill-once intake no-ops
+        // them anyway. `Error` IS observable for a deadline-
         // SIGKILL'd pod (restartPolicy:Never + backoffLimit:0 +
         // TGPS=7200 + job-tracking finalizer keep it listable for
-        // the full grace window) — sending it would consume the
-        // `recently_disconnected` entry the same-tick
-        // `report_deadline_exceeded_jobs` needs. The scheduler-side
-        // gate makes consume-then-noop unrepresentable; this filter
-        // eliminates the wasted RPCs.
+        // the full grace window) — reporting it here would race the
+        // same-tick `report_deadline_exceeded_jobs`, which owns the
+        // DeadlineExceeded classification from the Job condition.
+        // This filter eliminates the wasted RPCs and the race.
         if !matches!(
             reason,
             TerminationReason::OomKilled | TerminationReason::EvictedDiskPressure
@@ -1721,9 +1734,9 @@ pub(super) async fn report_terminated_pods(ctx: &Ctx, ns: &str, pool: &str) {
 /// `backoffLimit:0` + TGPS=7200 + the `job-tracking` finalizer, the
 /// SIGKILL'd pod IS listable (`deletionTimestamp` set,
 /// `containerStatuses[].state.terminated.reason="Error"`) for the
-/// full grace window — but `Error` is non-promoting, so
-/// [`report_terminated_pods`] skips it; this reads the Job condition
-/// instead.
+/// full grace window — but `Error` is not a classification-fill
+/// reason, so [`report_terminated_pods`] skips it; this reads the Job
+/// condition instead.
 pub(super) fn job_deadline_exceeded(job: &Job) -> bool {
     job.status
         .as_ref()

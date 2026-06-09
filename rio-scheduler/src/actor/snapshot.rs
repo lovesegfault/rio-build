@@ -251,7 +251,7 @@ impl DagActor {
     /// suppresses spawn-intent EMISSION only, never demand accounting
     /// — an in-backoff Ready node is still builder-queue demand on
     /// both surfaces.
-    // r[impl sched.admin.snapshot-substituting+3]
+    // r[impl sched.admin.snapshot-substituting+4]
     pub(super) fn classify_ready_node(
         &self,
         drv_hash: &str,
@@ -299,14 +299,17 @@ impl DagActor {
         // has_claimable_job "now"); per-node Instant::now() would let
         // a park expire mid-pass and double-count across buckets.
         let bucket_now = std::time::Instant::now();
-        // r[impl sched.admin.snapshot-substituting+3]
+        // r[impl sched.admin.snapshot-substituting+4]
         // Exhaustive over DerivationStatus so a future variant addition
         // is a compile-time break here, not a silently-zero autoscaler
         // input.
         //
-        // The substituting bucket is job-derived (§2.6): a node with an
-        // unresolved unclaimed materialization job is substitution
-        // backlog whatever its status.
+        // The substituting bucket is job-derived (§2.6): a node with a
+        // CLAIMABLE materialization job (unclaimed, not parked, not
+        // deferred — claimability()'s three axes) is substitution
+        // backlog whatever its DerivationStatus; parked/deferred jobs
+        // are pacing, not demand (ReadyClass::ParkedPacing — neither
+        // gauge).
         for (drv_hash, s) in self.dag.iter_nodes() {
             match s.status() {
                 DerivationStatus::Assigned | DerivationStatus::Running => {
@@ -326,9 +329,9 @@ impl DagActor {
                 DerivationStatus::Ready => {
                     // r[impl sched.materialize.job+2]
                     // §2.6 via THE shared classifier (bug_129): a Ready
-                    // node carrying an unresolved, unclaimed
-                    // materialization job is substitution backlog, not
-                    // builder-queue backlog; a parked/deferred job is
+                    // node carrying a CLAIMABLE materialization job
+                    // (unclaimed, unparked, undeferred) is substitution
+                    // backlog, not builder-queue backlog; a parked/deferred job is
                     // pacing (bug_252 — NEITHER bucket; parked stays
                     // visible via rio_scheduler_materialization_stalled,
                     // deferred is gauge-invisible for its <=300s window

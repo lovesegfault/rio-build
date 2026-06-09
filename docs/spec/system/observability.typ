@@ -257,14 +257,17 @@ since-retired caller used to invoke (`GetLoad` after the ComponentScaler
 CR removal) freezes at its last on-call value indefinitely --- the
 dashboard shows a stale constant, not an absence.
 
-#r("obs.metric.scheduler-substituting")[
+#r("obs.metric.scheduler-substituting+2")[
   The scheduler MUST publish
   #(refs.metric)("rio_scheduler_substituting_derivations") (gauge): the count
-  of derivations carrying an unresolved, unclaimed materialization job ---
-  the same quantity `ClusterStatus.substituting_derivations` reports
-  (#rref("sched.admin.snapshot-substituting")) --- set by the leader at every
-  housekeeping tick from the freshly computed cluster snapshot, and zeroed
-  once on leadership loss.
+  of derivations carrying a CLAIMABLE materialization job --- unclaimed, not
+  parked, not deferred --- the same quantity
+  `ClusterStatus.substituting_derivations` reports
+  (#rref("sched.admin.snapshot-substituting")); parked jobs stay visible via
+  #(refs.metric)("rio_scheduler_materialization_stalled") and deferred jobs
+  (the bounded <=300s re-probe window) sit in neither gauge for that window
+  --- set by the leader at every housekeeping tick from the freshly computed
+  cluster snapshot, and zeroed once on leadership loss.
 ]
 This gauge is the *leading* rio-store autoscaling signal
 (#rref("infra.store.autoscaling")): the backlog is known at merge time,

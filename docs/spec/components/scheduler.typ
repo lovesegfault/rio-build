@@ -1805,10 +1805,14 @@ clock.
   `any_co_owned_dep_terminally_failed` for its dependents.
 ]
 
-#r("sched.admin.snapshot-substituting+3")[
+#r("sched.admin.snapshot-substituting+4")[
   `ClusterStatus` MUST report `substituting_derivations` (wire-stable field
-  name): the count of derivations carrying an unresolved, unclaimed
-  materialization job, whatever their status. The snapshot match over
+  name): the count of derivations carrying a CLAIMABLE materialization job
+  --- unclaimed, not parked, not deferred:
+  #rref("sched.materialize.claimability-projection")'s three axes. Parked
+  jobs MUST remain visible via `rio_scheduler_materialization_stalled`;
+  deferred jobs (`defer_until` --- the bounded <=300s re-probe window) are
+  counted in NEITHER gauge for that window. The snapshot match over
   `DerivationStatus` MUST be exhaustive so future status additions are
   compile-time caught, not silently-zero. Job-counted derivations MUST be
   excluded from `queued_derivations` and `queued_by_system` --- the buckets

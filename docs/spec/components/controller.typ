@@ -872,8 +872,10 @@ Jobs is meaningless (eviction of a Job pod just reschedules the build via
 drain: the builder cgroup-kills the in-flight build, makes one bounded
 best-effort `ReportOutcome` attempt inside the AD5 grace
 (#rref("builder.shutdown.sigint+3")), and exits --- there is no
-scheduler-side drain step (`AdminService.DrainExecutor` is a retired no-op;
-the per-executor drain it set has no object), no registration to give back,
+scheduler-side drain step (`AdminService.DrainExecutor` was removed outright
+by the executor-lifecycle proto sweep --- a call today gets tonic's generic
+`UNIMPLEMENTED`, and the per-executor drain it used to set has no object), no
+registration to give back,
 and the requeue happens at the report fold or, failing that, the
 establishment sweep. A preStop hook would be redundant: K8s sends SIGTERM
 on pod termination regardless, and the signal handler implements the abort.
@@ -995,16 +997,21 @@ completions the closed-edge inference allowed.
   and limited to −1/tick. Reconcile interval: 10s.
 ]
 
-#r("ctrl.scaler.signal-substituting+4")[
+#r("ctrl.scaler.signal-substituting+5")[
   The predictive `builders` signal MUST include `substituting_derivations` at
   1:1 weight with `queued`/`running`, for ANY Deployment a ComponentScaler CR
-  targets. A substitution cascade with zero queued/running MUST NOT produce
-  `builders=0` --- that scales the target toward `min` exactly when
-  substitution load is the thing demanding capacity. The field's source is
-  the scheduler's substituting bucket: derivations with unresolved, unclaimed
-  materialization jobs (#rref("sched.admin.snapshot-substituting"));
-  pending-job backlog is thereby visible to the predictive signal before any
-  store replica claims the work.
+  targets. A substitution cascade with zero queued/running and a CLAIMABLE
+  backlog MUST NOT produce `builders=0` --- that scales the target toward
+  `min` exactly when substitution load is the thing demanding capacity. The
+  field's source is the scheduler's substituting bucket: derivations with
+  CLAIMABLE materialization jobs --- unclaimed, not parked, not deferred
+  (#rref("sched.admin.snapshot-substituting")); claimable backlog is thereby
+  visible to the predictive signal before any store replica claims the work.
+  Parked and deferred jobs are pacing, not demand: they leave the bucket
+  (parked stay visible via `rio_scheduler_materialization_stalled`; deferred
+  sit in neither gauge for their bounded <=300s window), so a park/defer-heavy
+  cascade reads near-zero here BY DESIGN --- the store cannot make a parked
+  job progress, and holding capacity for it would defeat the pacing.
 ]
 The store itself is no longer a ComponentScaler target: the chart defines no
 store CR, and the store Deployment's replica count is owned by the KEDA

@@ -179,7 +179,7 @@ impl DagActor {
         // the previous Arc (dropped). No-receiver is fine —
         // watch::Sender holds the value regardless.
         let snapshot = Arc::new(self.compute_cluster_snapshot());
-        // r[impl obs.metric.scheduler-substituting]
+        // r[impl obs.metric.scheduler-substituting+2]
         // The materialization backlog, scrapeable: the SAME quantity
         // `ClusterStatus.substituting_derivations` reports
         // (sched.admin.snapshot-substituting), published from the

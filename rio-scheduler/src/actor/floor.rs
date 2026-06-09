@@ -68,6 +68,23 @@ pub fn bump_floor_or_count(
             last.map_or(0, |i| i.mem_bytes),
             ceil.max_mem,
         ),
+        // PARKED BY DESIGN — no live producer reaches this arm: the
+        // only production callers of `bump_resource_floor` pass
+        // `OomKilled` (worker-reported CgroupOom) and
+        // `DeadlineExceeded` (worker-reported TimedOut). The
+        // controller's pod-terminal `EvictedDiskPressure`
+        // classification rides `ReportAttemptOutcome`, a
+        // classification fill that deliberately never promotes (no
+        // durable first-report dedup — sla-sizing.typ "Accepted
+        // residual"), and no worker-side disk-eviction signal exists
+        // (the kubelet evicts the pod wholesale). The disk floor
+        // dimension is therefore inert; the actual disk residual is
+        // the retry/establishment counters (retry-poison), not
+        // promotion. The arm stays: the wire variant exists, unit
+        // tests pin the doubling algebra, and this is the designed
+        // re-entry point if a worker-side disk signal ever ships
+        // (re-introduction needs the durable dedup the residual
+        // names).
         R::EvictedDiskPressure => bump_dim(
             &mut floor.disk_bytes,
             last.map_or(0, |i| i.disk_bytes),

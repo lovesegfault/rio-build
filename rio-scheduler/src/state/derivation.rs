@@ -695,7 +695,11 @@ db_str_enum! {
     pub enum ReportingParty {
         /// Worker `CompletionReport`.
         Worker = "worker",
-        /// Controller `ReportExecutorTermination`.
+        /// Controller-observed. Live producer: the unified
+        /// `ReportAttemptOutcome` second-installment classification
+        /// fill (`actor/pull.rs`) and the synthesized exec-pinned
+        /// closes. Historic rows: the removed stream-era
+        /// `ReportExecutorTermination`.
         Controller = "controller",
         /// Scheduler-side observation (disconnect, backstop, sweep,
         /// dispatch-time verdict, TTL expiry).
@@ -919,11 +923,15 @@ pub struct CaState {
 // r[impl sched.sla.reactive-floor+3]
 /// Per-dimension resource floor for the NEXT dispatch (D4).
 ///
-/// Reactive promotion: an explicit resource-exhaustion signal
-/// (controller-reported `OomKilled`/`EvictedDiskPressure`/
-/// `DeadlineExceeded`, worker-reported `CgroupOom`/`TimedOut`) calls
+/// Reactive promotion: an explicit WORKER-REPORTED
+/// resource-exhaustion signal (`CgroupOom` → `OomKilled`, `TimedOut`
+/// → `DeadlineExceeded` — the whole live alphabet) calls
 /// `actor::floor::bump_floor_or_count` which doubles the
-/// relevant dimension, capped at `Ceilings`. `solve_intent_for` clamps
+/// relevant dimension, capped at `Ceilings`. The disk dimension has
+/// NO live producer: the controller's pod-terminal
+/// `EvictedDiskPressure` classification is a fill that never promotes
+/// (see the parked arm in `actor/floor.rs` and sla-sizing.typ's
+/// accepted residual). `solve_intent_for` clamps
 /// its solved (mem, disk) at this floor before returning so the next
 /// SpawnIntent is at least as large.
 ///

@@ -126,7 +126,7 @@ async fn deposed_ack_spawned_intents_answers_not_leader() -> TestResult {
 }
 
 // r[verify obs.metric.scheduler-leader-gate+5]
-// r[verify obs.metric.scheduler-substituting]
+// r[verify obs.metric.scheduler-substituting+2]
 /// When is_leader=false, handle_tick must NOT set state gauges.
 /// Standby actor is warm (DAGs merge for takeover) but its counts are
 /// stale/zero. Publishing them creates a second Prometheus series that
@@ -183,7 +183,7 @@ async fn test_not_leader_does_not_set_gauges() -> TestResult {
 
 // r[verify sched.lease.standby-tick-noop+2]
 // r[verify obs.metric.scheduler-leader-gate+5]
-// r[verify obs.metric.scheduler-substituting]
+// r[verify obs.metric.scheduler-substituting+2]
 /// Was-leader → standby: `LeaderLost` clears in-memory state and zeros
 /// gauges; subsequent `Tick` early-returns so the orphan-watcher does
 /// NOT write `Cancelled` to PG for builds the new leader is running.
@@ -1338,8 +1338,8 @@ async fn solve_intent_for_probe_fit_uses_probe_deadline() {
 /// tiny `activeDeadlineSeconds` that kills the Job before pod startup
 /// completes. `q99×5` for a 0.5s build is ~3; the fix floors the
 /// fitted-path computation at `probe.deadline_secs` so the spawn-kill
-/// loop can't form (no heartbeat → no `recently_disconnected` → no
-/// `bump_floor_or_count`).
+/// loop can't form (the pod dies before any worker report, so nothing
+/// would ever promote the deadline floor out of the loop).
 #[tokio::test]
 async fn solve_intent_for_subsecond_fit_floored_at_probe_deadline() {
     use crate::sla::types::*;
@@ -1467,7 +1467,7 @@ async fn cluster_snapshot_queued_by_system_sums_to_scalar() {
 /// UNCLAIMED materialization job and is disjoint from queued/running:
 /// a Ready node with a pending job is substitution backlog (the
 /// ComponentScaler's store signal), not builder-queue backlog.
-// r[verify sched.admin.snapshot-substituting+3]
+// r[verify sched.admin.snapshot-substituting+4]
 #[tokio::test]
 async fn snapshot_counts_substituting() {
     let db = TestDb::new(&MIGRATOR).await;

@@ -1171,13 +1171,19 @@ no floor or budget (it is a classification fill, re-reported every controller
 tick), and a pod that dies before any worker report reaches the establishment
 sweep, which carries no resource signal --- so a pod-level resource kill no
 longer auto-promotes the floor. Accepted residual (executor-lifecycle 1d
-disposition): the worker-reported arms above remain the promotion source;
-repeated pod-level OOM/eviction loops surface through the retry/establishment
-counters and the SLA refit, and the operator levers are `rio-cli sla
-override` / the probe floor. If production data shows under-sizing loops that
-never trip a worker-reported signal, re-introducing a controller-reported
-promote needs a durable dedup (e.g. keyed to the attempt row's first
-classification) --- a design item, not a silent re-add.
+disposition, amended by the wave-4 narration sweep): the worker-reported
+arms remain the promotion source for MEM (`CgroupOom`) and DEADLINE
+(`TimedOut`) only --- DISK has NO surviving producer (no worker-side
+disk-eviction signal exists; the kubelet evicts the pod wholesale), so the
+disk floor dimension is parked-inert (`actor/floor.rs` annotates the arm)
+and the actual disk residual is the retry/establishment counters
+(retry-poison), not promotion. Repeated pod-level OOM/eviction loops surface
+through those counters and the SLA refit, and the operator levers are
+`rio-cli sla override` / the probe floor. If production data shows
+under-sizing loops that never trip a worker-reported signal, re-introducing
+a controller-reported promote needs a durable dedup (e.g. keyed to the
+attempt row's first classification) --- a design item, not a silent
+re-add.
 
 #r("sched.sla.cost-leader-edge-reload")[
   On a false→true leader edge, the cost-table poller MUST reload

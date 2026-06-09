@@ -1,5 +1,5 @@
 <script lang="ts">
-  // r[impl dash.journey.build-to-logs]
+  // r[impl dash.journey.build-to-logs+2]
   // Step 1 of the killer journey: "click build". This page renders the
   // paginated list and opens the detail drawer on row click. The Graph
   // tab inside the drawer (P0280) and the LogViewer it hosts (P0279)

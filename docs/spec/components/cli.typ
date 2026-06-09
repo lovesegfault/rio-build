@@ -77,11 +77,6 @@ per-message progress drains without a whole-call deadline.
   [`AdminService.CancelBuild`],
   [Force-cancel an active build (operator override)],
 
-  [`drain-executor`],
-  [the removed `AdminService.DrainExecutor`],
-  [Retired no-op --- surfaces the scheduler's error naming the successor
-    procedures (cordon + exclusion / cancel + Job delete / pool pause)],
-
   [`pool`], [k8s apiserver (no gRPC)], [`Pool` CR get/describe],
 
   [`verify-chunks`],
@@ -96,6 +91,11 @@ per-message progress drains without a whole-call deadline.
   [`AdminService.{CreateTenant,ListTenants}`],
   [Tenant CRUD],
 )
+
+There is no `drain-executor` subcommand: it was removed together with
+`AdminService.DrainExecutor` (the executor-lifecycle proto sweep). When you
+reach for a drain, the successor procedures are cordon + exclusion, cancel +
+Job delete, or pool pause.
 
 #r("cli.cmd.derivations")[
   `rio-cli derivations [BUILD_ID] [--all-active] [--status S] [--stuck]` calls

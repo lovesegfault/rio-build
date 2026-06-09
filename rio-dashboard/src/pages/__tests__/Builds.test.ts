@@ -1,4 +1,4 @@
-// r[verify dash.journey.build-to-logs]
+// r[verify dash.journey.build-to-logs+2]
 // Proves "click build → drawer opens" — step 1 of the killer journey.
 // Later plans (P0279 LogViewer, P0280 Graph) extend the same marker
 // with the node-click → log-stream legs.

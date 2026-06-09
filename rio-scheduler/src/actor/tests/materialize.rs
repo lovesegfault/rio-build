@@ -2553,15 +2553,17 @@ async fn reprobe_scope_dropped_echo_never_confirms_missing() -> TestResult {
 
 // ── T-1.1 (Phase B): §2.6 consumer re-sourcing — the snapshot buckets ──
 
-// r[verify sched.admin.snapshot-substituting+3]
-// r[verify ctrl.scaler.signal-substituting+4]
-/// §2.6 re-sourcing: pending (unclaimed) materialization jobs ARE the
-/// substituting bucket flag-on. A Ready or Queued node carrying an
-/// unresolved unclaimed job counts in `substituting_derivations` and is
-/// EXCLUDED from `queued_derivations`/`queued_by_system` (the buckets
-/// stay disjoint — builder autoscalers must not scale on work that will
-/// be materialized); a claimed job's node is Assigned/Running and counts
-/// in `running_derivations` by construction.
+// r[verify sched.admin.snapshot-substituting+4]
+// r[verify ctrl.scaler.signal-substituting+5]
+/// §2.6 re-sourcing: CLAIMABLE materialization jobs (unclaimed, not
+/// parked, not deferred) ARE the substituting bucket flag-on. A Ready
+/// or Queued node carrying a claimable job counts in
+/// `substituting_derivations` and is EXCLUDED from
+/// `queued_derivations`/`queued_by_system` (the buckets stay disjoint
+/// — builder autoscalers must not scale on work that will be
+/// materialized); parked/deferred jobs leave the gauge (pacing, not
+/// demand); a claimed job's node is Assigned/Running and counts in
+/// `running_derivations` by construction.
 #[tokio::test]
 async fn flag_on_pending_jobs_count_as_substituting_bucket() -> TestResult {
     let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
@@ -2645,7 +2647,7 @@ async fn flag_on_pending_jobs_count_as_substituting_bucket() -> TestResult {
     Ok(())
 }
 
-// r[verify obs.metric.scheduler-substituting]
+// r[verify obs.metric.scheduler-substituting+2]
 /// The materialization backlog is scrapeable: each housekeeping tick
 /// the leader publishes `rio_scheduler_substituting_derivations` with
 /// EXACTLY the snapshot's substituting bucket (the §2.6 job-derived
@@ -8004,7 +8006,7 @@ async fn materialization_mint_leaves_ice_mask_untouched() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.admin.snapshot-substituting+3]
+// r[verify sched.admin.snapshot-substituting+4]
 /// bug_217 (A2.4 typed split): the snapshot's EXECUTOR view counts
 /// builder pods only — a materialization-claimed node is store-side
 /// work holding no builder slot. Pre-fix `total/active_executors`

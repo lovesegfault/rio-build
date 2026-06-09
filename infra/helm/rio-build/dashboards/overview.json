@@ -101,7 +101,7 @@
       "id": 2,
       "type": "stat",
       "title": "Derivations in flight",
-      "description": "queued + running. Throughput numerator; sustained high with low running = dispatch stall. NOTE (substitution-replacement Phase B): derivations whose materialization job is pending/parked sit in the SUBSTITUTING bucket, which is excluded from queued — they are visible on the dispatch-flow dashboard's materialization panels and via rio-cli status (substituting_derivations), not here.",
+      "description": "queued + running. Throughput numerator; sustained high with low running = dispatch stall. NOTE (substitution-replacement Phase B): derivations carrying a CLAIMABLE materialization job (unclaimed, not parked, not deferred) sit in the SUBSTITUTING bucket, which is excluded from queued — they are visible on the dispatch-flow dashboard's materialization panels and via rio-cli status (substituting_derivations), not here. PARKED jobs are visible via rio_scheduler_materialization_stalled; DEFERRED jobs (the bounded <=300s re-probe window) appear in neither gauge for that window.",
       "gridPos": {
         "x": 4,
         "y": 0,

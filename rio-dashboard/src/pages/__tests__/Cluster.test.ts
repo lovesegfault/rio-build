@@ -1,4 +1,4 @@
-// r[verify dash.journey.build-to-logs]
+// r[verify dash.journey.build-to-logs+2]
 // Proves the Cluster page renders RPC results and surfaces transport
 // errors. The full click→DAG→node→stream journey is covered end-to-end
 // by later plans; this is the "page loads and talks to the scheduler"

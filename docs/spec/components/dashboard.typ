@@ -197,13 +197,18 @@ stack can't give you.
   wildcard.
 ]
 
-#r("dash.journey.build-to-logs")[
+#r("dash.journey.build-to-logs+2")[
   The killer journey: click build (Builds page) → drawer opens, DAG renders
   (Graph tab) → click running node (DrvNode) → log stream renders (Logs tab).
-  The nginx→Cilium Gateway→backend chain MUST support server-streaming
-  end-to-end for both backends (the scheduler for the DAG and build list,
-  rio-store for the log stream), verified by the `0x80` trailer-frame byte in
-  curl.
+  Both REAL chains MUST support server-streaming end-to-end, verified by the
+  `0x80` trailer-frame byte in curl: in-cluster, nginx dials each backend
+  DIRECTLY (the leader-only `rio-scheduler-leader` Service for the DAG and
+  build list, `rio-store` for the log stream --- both serve gRPC-Web natively
+  via `tonic-web`, no Gateway hop); north-south, browser → Cilium Gateway
+  LoadBalancer → backend. nginx MUST NOT route through the Gateway Service:
+  Cilium's L7 redirect fires only on the LoadBalancer IP, and the
+  selectorless Gateway Service has no Endpoints for in-cluster clients ---
+  such a request hangs.
 ]
 
 #r("dash.graph.degrade-threshold")[
