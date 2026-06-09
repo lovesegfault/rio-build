@@ -44,8 +44,14 @@ SANCTION = re.compile(r"bounded_open|with_timeout_status|with_timeout\(|transpor
 # `appendlog_drain_deadline_enforced_while_open_awaited` (rio-builder).
 ALLOW_FILES = {"rio-builder/src/log_upload.rs"}
 
+# CLASS TRAJECTORY (merged_bug_110, second repair of this byte-stripper
+# after merged_bug_072): if this scanner needs a THIRD structural
+# repair, stop patching — rebuild the strip/scan pipeline on a real
+# grammar (syn-driven extraction like xtask's retention corpus, or
+# tree-sitter). Two rounds of fail-open holes in hand-rolled lexing is
+# the recorded budget.
 CFG_TEST = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
-MOD_AFTER = re.compile(r"\s*(?:#\s*\[[^\]]*\]\s*)*(?:pub\s+)?mod\s+\w+\s*([;{])")
+MOD_AFTER = re.compile(r"\s*(?:#\s*\[[^\]]*\]\s*)*(?:pub\s*(?:\([^)]*\)\s*)?)?mod\s+\w+\s*([;{])")
 
 
 def snake(name: str) -> str:
@@ -128,7 +134,11 @@ def strip_noncode(text: str) -> str:
             i = min(j + 1, n)
         elif c == "'":
             # char literal vs lifetime: a lifetime is `'` + ident with
-            # no near closing quote.
+            # no near closing quote. merged_bug_110: the body is
+            # BLANKED (delimiters kept, like the string branch) — a
+            # surviving '{' or '}' would skew strip_cfg_test_mods'
+            # brace matching and let the blanker consume trailing
+            # PRODUCTION code (fail-open truncation evasion).
             if i + 2 < n and (text[i + 1] == "\\" or text[i + 2] == "'"):
                 j = i + 1
                 if text[j] == "\\":
@@ -137,6 +147,7 @@ def strip_noncode(text: str) -> str:
                         j += 1
                 else:
                     j += 1
+                blank(i + 1, j)
                 i = min(j + 1, n)
             else:
                 i += 1
@@ -250,6 +261,24 @@ def selftest(pat: re.Pattern, tokens: set[str]) -> str | None:
     in_string = preprocess(f'fn live() {{ let s = ".{t0}(\"; }}\n')
     if scan_lines("planted/in_string.rs", in_string, pat):
         return "a banned token inside a string literal fired"
+    # Arm 7 (merged_bug_110): a '{' CHAR LITERAL inside an inline
+    # cfg(test) mod must not skew the brace matcher into consuming the
+    # production open below the mod.
+    char_lit = preprocess(
+        "#[cfg(test)]\nmod tests {\n    fn t() { let c = '{'; }\n}\n"
+        f"fn live() {{\n    let s = client.{t0}(req);\n}}\n"
+    )
+    if not scan_lines("planted/char_lit.rs", char_lit, pat):
+        return "a '{' char literal in a test mod swallowed the production open below it (brace-skew truncation)"
+    # Arm 8 (merged_bug_110): an open inside a VISIBILITY-QUALIFIED
+    # inline cfg(test) mod (pub(crate)/pub(super)) is test code and
+    # must not fire.
+    pub_crate_mod = preprocess(
+        "fn live() {}\n#[cfg(test)]\npub(crate) mod tests {\n"
+        f"    fn t() {{ let s = client.{t0}(req); }}\n}}\n"
+    )
+    if scan_lines("planted/pub_crate_mod.rs", pub_crate_mod, pat):
+        return "an open inside a pub(crate) cfg(test) mod fired (MOD_AFTER visibility hole)"
     return None
 
 
@@ -273,7 +302,11 @@ def main() -> int:
             rel = str(f.relative_to(src_root))
             # Test code is out of scope: /tests/ submodule dirs and
             # test_helpers.rs are cfg(test)-compiled.
-            if "/tests/" in rel or rel.endswith("test_helpers.rs"):
+            # merged_bug_110: cfg(test)-gated module FILES match
+            # neither exclusion above — tests.rs / *_tests.rs (the
+            # naming convention backing `#[cfg(test)] mod tests;` /
+            # `mod mbt_tests;` declarations) are test code.
+            if "/tests/" in rel or rel.endswith("test_helpers.rs") or f.name == "tests.rs" or f.name.endswith("_tests.rs"):
                 continue
             scanned += 1
             fails.extend(scan_lines(rel, preprocess(f.read_text()), pat))
