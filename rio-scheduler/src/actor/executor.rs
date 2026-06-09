@@ -154,53 +154,60 @@ impl DagActor {
             return;
         }
         let mut affected: std::collections::HashSet<Uuid> = Default::default();
-        for drv_hash in drv_hashes {
-            // Re-read existing poison state so 3 prior REAL failures
-            // (recorded by handle_transient_failure) + this disconnect
-            // → poison instead of dispatching a 4th time. Disconnect
-            // itself never increments the count.
-            //
-            // E5, collapsed onto decide() (Phase 1b, T-1b.8): the
-            // threshold re-check folds the durable attempt suffix
-            // instead of reading the RAM
-            // counters; verdict-identical on every single-tenure history
-            // reachable today. Kept rather than deleted (decision P2,
-            // the narrowed b09c5b312-X6 disposition): the backstop's
-            // poison verdict no longer depends on this check since the
-            // E8 collapse decides at its own site, but it remains the
-            // requeue-time re-poison path and the post-failover
-            // backstop for a lost persist_poisoned write.
-            let should_poison = self.reassign_threshold_recheck(drv_hash).await;
-            if should_poison {
-                info!(drv_hash = %drv_hash, lost_worker = ?lost_worker,
-                      "reassign: poison threshold reached, poisoning instead of retry");
-                self.poison_and_cascade(
-                    drv_hash,
-                    "poison threshold reached on worker loss after prior failures",
-                    None,
-                    None,
-                )
-                .await;
-                continue;
-            }
-
-            // A requeue does NOT bump `resource_floor` — only the
-            // explicit OOM/disk-pressure classifications are sizing
-            // signals, and they promote at their own call sites.
-            let deps_completed = self.dag.all_deps_completed(drv_hash.as_str());
-            if let Some(state) = self.dag.node_mut(drv_hash) {
-                let released_to = match state.reset_after_attempt(kind, deps_completed) {
-                    Ok(to) => to,
-                    Err(e) => {
-                        warn!(
-                            drv_hash = %drv_hash, error = %e,
-                            "invalid state for reassignment, skipping"
-                        );
+        // bug_223: the ENTIRE requeue body — the poison-threshold
+        // prologue included — dispatches on the attempt kind at the
+        // top. The exhaustive match IS the machine witness for the
+        // kind-partition doctrine ("build rows are invisible to
+        // materialization decisions; materialization is never a
+        // poison"): the Materialization arm contains no poison path at
+        // all, so a build-budget `Poison(Threshold)` verdict
+        // structurally cannot reach a materialization release — there
+        // is no code path on which to mis-apply it.
+        match kind {
+            crate::state::AttemptKind::Build => {
+                for drv_hash in drv_hashes {
+                    // Re-read existing poison state so 3 prior REAL failures
+                    // (recorded by handle_transient_failure) + this disconnect
+                    // → poison instead of dispatching a 4th time. Disconnect
+                    // itself never increments the count.
+                    //
+                    // E5, collapsed onto decide() (Phase 1b, T-1b.8): the
+                    // threshold re-check folds the durable attempt suffix
+                    // instead of reading the RAM
+                    // counters; verdict-identical on every single-tenure history
+                    // reachable today. Kept rather than deleted (decision P2,
+                    // the narrowed b09c5b312-X6 disposition): the backstop's
+                    // poison verdict no longer depends on this check since the
+                    // E8 collapse decides at its own site, but it remains the
+                    // requeue-time re-poison path and the post-failover
+                    // backstop for a lost persist_poisoned write.
+                    let should_poison = self.reassign_threshold_recheck(drv_hash).await;
+                    if should_poison {
+                        info!(drv_hash = %drv_hash, lost_worker = ?lost_worker,
+                              "reassign: poison threshold reached, poisoning instead of retry");
+                        self.poison_and_cascade(
+                            drv_hash,
+                            "poison threshold reached on worker loss after prior failures",
+                            None,
+                            None,
+                        )
+                        .await;
                         continue;
                     }
-                };
-                self.persist_status(drv_hash, released_to, None).await;
-                affected.extend(self.get_interested_builds(drv_hash));
+                    self.requeue_reset_one(drv_hash, kind, &mut affected).await;
+                }
+            }
+            crate::state::AttemptKind::Materialization => {
+                // No poison prologue: a store-claim release never
+                // consults the BUILD budget (the suffix it would fold
+                // is build-kind by definition — materialization rows
+                // are invisible to it and vice versa), and the
+                // materialization lane's own budgets decide at their
+                // observation sites (materialization_decide), not at
+                // release time.
+                for drv_hash in drv_hashes {
+                    self.requeue_reset_one(drv_hash, kind, &mut affected).await;
+                }
             }
         }
         // Dashboard: running count dropped; assigned_executors lost
@@ -212,6 +219,34 @@ impl DagActor {
         // reset-to-Ready arm needs the explicit emit.
         for build_id in affected {
             self.emit_progress(build_id);
+        }
+    }
+
+    /// One derivation's kind-dispatched reset-and-persist (the shared
+    /// tail of both [`Self::requeue_after_attempt`] arms). A requeue
+    /// does NOT bump `resource_floor` — only the explicit
+    /// OOM/disk-pressure classifications are sizing signals, and they
+    /// promote at their own call sites.
+    async fn requeue_reset_one(
+        &mut self,
+        drv_hash: &DrvHash,
+        kind: crate::state::AttemptKind,
+        affected: &mut std::collections::HashSet<Uuid>,
+    ) {
+        let deps_completed = self.dag.all_deps_completed(drv_hash.as_str());
+        if let Some(state) = self.dag.node_mut(drv_hash) {
+            let released_to = match state.reset_after_attempt(kind, deps_completed) {
+                Ok(to) => to,
+                Err(e) => {
+                    warn!(
+                        drv_hash = %drv_hash, error = %e,
+                        "invalid state for reassignment, skipping"
+                    );
+                    return;
+                }
+            };
+            self.persist_status(drv_hash, released_to, None).await;
+            affected.extend(self.get_interested_builds(drv_hash));
         }
     }
 }

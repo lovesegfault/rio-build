@@ -272,3 +272,85 @@ async fn test_orphan_watcher_cancels_unwatched_build_on_tick() -> TestResult {
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Kinded requeue prologue (bug_223)
+// ---------------------------------------------------------------------------
+
+/// bug_223 red: a MATERIALIZATION release on a derivation whose BUILD
+/// attempt suffix sits at the poison threshold must reset, never
+/// poison — the kind-partition doctrine (build rows are invisible to
+/// materialization decisions; "materialization is never a poison").
+/// Pre-fix, `requeue_after_attempt` ran the build-budget poison
+/// recheck before consulting the kind, so a store-claim release
+/// (ghost repair, RetryLater re-claim, release_claim) on a drv with
+/// an at-threshold build history terminally poisoned a substitutable
+/// derivation and mis-narrated it as worker loss.
+#[tokio::test]
+async fn materialization_requeue_resets_at_build_poison_threshold() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let derivation_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO derivations (drv_hash, drv_path, pname, system, status) \
+         VALUES ($1, $2, 'pkg', 'x86_64-linux', 'assigned') \
+         RETURNING derivation_id",
+    )
+    .bind("mat-thresh-drv")
+    .bind(test_drv_path("mat-thresh-drv"))
+    .fetch_one(&db.pool)
+    .await?;
+
+    // Three real transient failures from distinct workers: the BUILD
+    // budget's Poison(Threshold) shape under the default policy.
+    let mut conn = db.pool.acquire().await?;
+    for worker in ["w1", "w2", "w3"] {
+        let mut row = crate::db::attempts::AttemptRow::new(
+            derivation_id,
+            crate::state::OutcomeClass::Transient,
+            crate::state::ReportingParty::Worker,
+            crate::state::AttemptKind::Build,
+        );
+        row.executor_id = Some(crate::state::ExecutorId::from(worker));
+        // Decision P12: the budget/exclusion fold keys distinct-worker
+        // counting on the controller-authoritative source node — a row
+        // without one charges flat counters but never the distinct set.
+        row.source_node = Some(format!("node-{worker}"));
+        crate::db::SchedulerDb::append_attempt(&mut conn, &row).await?;
+    }
+    drop(conn);
+
+    let mut actor = DagActor::new(
+        SchedulerDb::new(db.pool.clone()),
+        DagActorConfig::default(),
+        DagActorPlumbing::default(),
+    );
+    actor.test_inject_ready_row(crate::db::RecoveryDerivationRow {
+        derivation_id,
+        ..crate::db::RecoveryDerivationRow::test_default("mat-thresh-drv", "x86_64-linux")
+    });
+    actor
+        .dag
+        .node_mut("mat-thresh-drv")
+        .expect("just injected")
+        .set_status_for_test(DerivationStatus::Assigned);
+
+    actor
+        .requeue_after_attempt(
+            std::slice::from_ref(&DrvHash::from("mat-thresh-drv")),
+            crate::state::AttemptKind::Materialization,
+            Some(&crate::state::ExecutorId::from("store-1")),
+        )
+        .await;
+
+    let status = actor
+        .dag
+        .node("mat-thresh-drv")
+        .expect("node survives the requeue")
+        .status();
+    assert!(
+        !matches!(status, DerivationStatus::Poisoned),
+        "left: {status:?} / right: a reset status (kind partition: \
+         materialization is never a poison)"
+    );
+    Ok(())
+}
