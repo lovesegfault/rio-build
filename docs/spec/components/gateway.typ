@@ -1744,16 +1744,28 @@ failed → fell through to a build).
   relays in arrival order.
 ]
 
-#r("gw.activity.subst-progress")[
+#r("gw.activity.subst-progress+1")[
   For each `DerivationEventKind::SUBSTITUTING` the gateway emits an
-  `actSubstitute` (108) activity AND a child `actCopyPath` (100) activity
-  (`fields=[storePath, "", machineName]`), and increments the root `actBuilds`
-  `SetExpected{actCopyPath, N}` so nom shows an "X/Y copied" denominator.
-  `Event::SubstituteProgress` (display-only, routed via the log broadcast ring;
-  see #rref("store.substitute.progress-stream")) maps to
-  `STDERR_RESULT{copy_aid, resProgress, [bytes_done, bytes_expected, 0, 0]}` so
-  nom renders a per-derivation download bar. Both activities stop together
-  (child first) on the paired `CACHED`/`STARTED`/`COMPLETED`/`FAILED`.
+  `actSubstitute` (108) activity and increments the root `actBuilds`
+  `SetExpected{actCopyPath, N}` (the denominator semantics match stock
+  expected-substitutions-at-goal-creation, so nom shows an "X/Y copied"
+  denominator). The child `actCopyPath` (100) activity is DEFERRED: it starts
+  on the FIRST `Event::SubstituteProgress` tick carrying a non-empty
+  `upstream_uri`, with `fields=[storePath, upstream_uri, machineName]` — the
+  stock `copyStorePath` start-frame shape, `from` pinned to that first URI;
+  job-level commit ticks pass an empty URI and MUST NOT start the copy (a
+  zero-fetch materialization renders subst-only — nothing was downloaded).
+  Each `Event::SubstituteProgress` (display-only, routed via the log broadcast
+  ring; see #rref("store.substitute.progress-stream")) maps to
+  `STDERR_RESULT{aid, resProgress, [bytes_done, bytes_expected, 0, 0]}` on the
+  `actSubstitute` aid ALWAYS and on the copy child once started, so
+  direction-aware consumers see the download bar on either aid. The pair
+  stops through ONE close chokepoint (child first, iff started) on the paired
+  `CACHED`/`STARTED`/`COMPLETED`/`FAILED`; when the copy child is open with a
+  partial last-relayed bar, the close synthesizes the completing
+  `resProgress` (`done == expected`) on BOTH aids before the stops — the
+  terminal outcome is the completion proof — and a progress tick arriving
+  after the close is dropped with a debug line, never reordered.
 ]
 
 == STDERR_RESULT BuildEvent mapping

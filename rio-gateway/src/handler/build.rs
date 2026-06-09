@@ -209,14 +209,32 @@ async fn quota_check<W: AsyncWrite + Unpin>(
 /// `Started` arrived on the previous stream, and nom shows them as
 /// stuck forever.
 /// Paired activity IDs for one derivation's upstream substitute. The
-/// child `actCopyPath` carries `resProgress` (download bytes) so nom
-/// renders a bar; the parent `actSubstitute` is what nom shows in its
-/// "substituting" line. Both start on `Substituting` and stop together
-/// (child first) on the terminal `Cached`/`Started`/`Completed`/`Failed`.
-#[derive(Debug, Clone, Copy)]
+/// parent `actSubstitute` starts on `Substituting` and is what nom
+/// shows in its "substituting" line; the child `actCopyPath` is
+/// DEFERRED (live_043): it starts inside the progress relay on the
+/// FIRST tick carrying a NON-EMPTY `upstream_uri`, with `from` pinned
+/// to that URI — matching stock `store-api.cc copyStorePath`, where
+/// the activity is constructed when the copy from the chosen
+/// substituter begins. Job-level commit ticks pass `uri=""` (including
+/// locally-present paths), so a zero-fetch materialization never
+/// starts a copy — truthful display: nothing was downloaded. Both
+/// `resProgress` lanes ride every tick (subst always; copy once
+/// started), and the pair stops together (child first, iff started)
+/// on the terminal `Cached`/`Started`/`Completed`/`Failed` through
+/// the ONE close chokepoint (`stop_subst_pair`), which synthesizes
+/// the completing progress frame when the last-relayed bar is
+/// partial — the terminal outcome IS the completion proof.
+#[derive(Debug, Clone)]
 struct SubstAids {
     subst: u64,
-    copy: u64,
+    /// `None` ⇔ no sourced tick seen yet (or ever).
+    copy: Option<u64>,
+    /// Last-relayed `(done, expected)` — the close-synthesis input.
+    progress: Option<(u64, u64)>,
+    /// The path shown in activity text/fields (first output path or
+    /// the drv path) — the deferred copy START frame needs it after
+    /// `start_subst_display` returned.
+    out: String,
 }
 
 // r[impl gw.display.single-map]
@@ -230,7 +248,7 @@ struct SubstAids {
 /// the snapshot gone-reconcile and rendered stuck forever). One map
 /// with a family-valued entry makes every sweep total over THE key
 /// set.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum DrvDisplay {
     /// Per-drv `actBuild` activity ID (start/stop, and the attach point
     /// for `BuildLogLine`/`SetPhase` results).
@@ -239,7 +257,7 @@ enum DrvDisplay {
     /// `DerivationEventKind::Substituting` (or a kinded materialization
     /// snapshot entry), stopped by `Cached` (success) or `Started`
     /// (fetch failed → fell through to build).
-    /// r[gw.activity.subst-progress]
+    /// r[gw.activity.subst-progress+1]
     Subst(SubstAids),
 }
 
@@ -274,23 +292,56 @@ impl Default for BuildActivityState {
     }
 }
 
-/// Stop both halves of a [`SubstAids`] pair, child (`actCopyPath`)
-/// before parent (`actSubstitute`). Factored out of the four
-/// `relay_derivation_status` arms that close a substitute on terminal.
+/// THE close chokepoint for a [`SubstAids`] pair (live_043): child
+/// (`actCopyPath`, iff started) before parent (`actSubstitute`).
+/// Factored out of every arm that closes a substitute on terminal —
+/// including the terminal drain — so the display-close tolerance has
+/// ONE owner: when the copy child is STARTED and the last-relayed
+/// progress is partial (`done < expected`), the terminal outcome that
+/// triggered this close IS the completion proof (the system's
+/// documented recovery posture: the terminal Cached/Completed event
+/// covers any dropped tick), so a final completing `resProgress`
+/// (`done == expected`) is synthesized on BOTH aids before the stops.
+/// A pair with no started copy closes subst-only — truthful (no
+/// sourced byte was ever reported), never the broken empty bar.
 async fn stop_subst_pair<W: AsyncWrite + Unpin>(
     stderr: &mut StderrWriter<&mut W>,
     aids: SubstAids,
 ) -> Result<(), StreamProcessError> {
-    stderr.stop_activity(aids.copy).await?;
+    if let Some(copy) = aids.copy {
+        if let Some((done, expected)) = aids.progress
+            && done < expected
+        {
+            let fields = [
+                ResultField::Int(expected),
+                ResultField::Int(expected),
+                ResultField::Int(0),
+                ResultField::Int(0),
+            ];
+            stderr
+                .result(aids.subst, ResultType::Progress, &fields)
+                .await?;
+            stderr.result(copy, ResultType::Progress, &fields).await?;
+        }
+        stderr.stop_activity(copy).await?;
+    }
     stderr.stop_activity(aids.subst).await?;
     Ok(())
 }
 
 /// Start the substitute display family for one derivation: the
-/// `actSubstitute` activity, its `actCopyPath` child, the display-map
-/// entry, and the root's `SetExpected{actCopyPath}` bump. Shared by the
-/// live `Substituting` event arm and the snapshot reconcile's
-/// materialization-running arm — both render the same family.
+/// `actSubstitute` activity, the display-map entry, and the root's
+/// `SetExpected{actCopyPath}` bump. Shared by the live `Substituting`
+/// event arm and the snapshot reconcile's materialization-running arm
+/// — both render the same family. The `actCopyPath` child is NOT
+/// started here (live_043 deferred-start): it starts inside
+/// `relay_substitute_progress` on the first sourced tick, so its
+/// `from` field can carry the upstream URI the way stock
+/// `copyStorePath` does. The `SetExpected` bump STAYS here at
+/// Substituting time — denominator semantics match stock
+/// expected-substitutions-at-goal-creation, and the deferred start
+/// additionally removes the phantom done-copy on a
+/// fetch-failed→build fallback.
 ///
 /// `out` is the path shown in the activity text: the first output path
 /// when the event carries one, else the drv path (snapshot entries
@@ -319,32 +370,14 @@ async fn start_subst_display<W: AsyncWrite + Unpin>(
             ],
         )
         .await?;
-    // r[impl gw.activity.subst-progress]
-    // Child actCopyPath fields per upstream
-    // `store-api.cc copyStorePath`: [storePath, from, to].
-    // `to` is the cluster's stable identifier (same source as
-    // actBuild machineName); `from` is empty until the first
-    // SubstituteProgress arrives — nom renders the bar from
-    // resProgress alone, the from/to are cosmetic. The text
-    // says "fetching closure of" (not "copying path") because
-    // resProgress carries CLOSURE-aggregate bytes from
-    // `walk_substitute_closure`, not single-path bytes.
-    let copy = stderr
-        .start_activity(
-            ActivityType::CopyPath,
-            &format!("fetching closure of '{out}'"),
-            verbosity::INFO,
-            subst,
-            &[
-                ResultField::String(out.to_string()),
-                ResultField::String(String::new()),
-                ResultField::String(act.machine_name.clone()),
-            ],
-        )
-        .await?;
     act.display.insert(
         drv_path.to_string(),
-        DrvDisplay::Subst(SubstAids { subst, copy }),
+        DrvDisplay::Subst(SubstAids {
+            subst,
+            copy: None,
+            progress: None,
+            out: out.to_string(),
+        }),
     );
     // Bump the root's CopyPath expected so nom's "X/Y copied"
     // denominator tracks. Idempotent across reconnects: callers guard
@@ -450,7 +483,7 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
             // dispatch as a build. Close the dangling actSubstitute +
             // actCopyPath pair so nom doesn't show it stuck forever.
             if let Some(DrvDisplay::Subst(aids)) =
-                act.display.get(&drv_event.derivation_path).copied()
+                act.display.get(&drv_event.derivation_path).cloned()
             {
                 act.display.remove(&drv_event.derivation_path);
                 stop_subst_pair(stderr, aids).await?;
@@ -593,7 +626,7 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
             // alone (Cached never closes a build activity — preserved
             // from the two-map scheme).
             if let Some(DrvDisplay::Subst(aids)) =
-                act.display.get(&drv_event.derivation_path).copied()
+                act.display.get(&drv_event.derivation_path).cloned()
             {
                 act.display.remove(&drv_event.derivation_path);
                 stop_subst_pair(stderr, aids).await?;
@@ -631,9 +664,9 @@ async fn drain_unstopped_activities<W: AsyncWrite + Unpin>(
     for (drv, display) in act.display.drain() {
         match display {
             DrvDisplay::Subst(aids) => {
-                stderr.stop_activity(aids.copy).await?;
-                stderr.stop_activity(aids.subst).await?;
-                debug!(subst = aids.subst, copy = aids.copy, %drv,
+                let (subst, copy) = (aids.subst, aids.copy);
+                stop_subst_pair(stderr, aids).await?;
+                debug!(subst, ?copy, %drv,
                        "stop_activity sent (terminal drain, subst pair)");
             }
             DrvDisplay::Build(aid) => {
@@ -645,35 +678,87 @@ async fn drain_unstopped_activities<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-// r[impl gw.activity.subst-progress]
-/// Relay one `SubstituteProgress` event as `resProgress` on the drv's
-/// `actCopyPath` child. nom renders `[done/expected]` as a download bar.
-/// No-op if no `actSubstitute` pair is tracked for this drv (the
-/// `Substituting` state event was lost or arrived after this — both
-/// display-only races, harmless).
+/// Outcome of one progress relay — the straggler lane typed
+/// (live_043): a tick arriving for an already-closed (or never
+/// tracked) pair is TOLERATED — dropped with a counted debug naming
+/// drv + done/expected — never reordered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubstRelay {
+    /// Frames were emitted (and the copy child possibly started).
+    Relayed,
+    /// No pair tracked: the pair already closed (post-outcome
+    /// straggler) or `Substituting` was lost — display-only.
+    DroppedUntracked,
+}
+
+// r[impl gw.activity.subst-progress+1]
+/// THE substitute-progress relay chokepoint (live_043): one code path
+/// owns, per tick, (i) the DEFERRED `actCopyPath` start on the first
+/// NON-EMPTY `upstream_uri` (frame `[out, from=uri, to=machine]`, the
+/// stock `copyStorePath` shape — `from` is pinned to the FIRST URI;
+/// later upstream changes within the aggregate walk are accepted
+/// cosmetic loss), (ii) `resProgress` on the `actSubstitute` aid
+/// ALWAYS (direction-aware consumers keyed on the substitute activity
+/// see progress), and (iii) `resProgress` on the copy child iff
+/// started. nom renders `[done/expected]` as the download bar. A tick
+/// with no tracked pair is dropped-with-debug (the typed
+/// [`SubstRelay::DroppedUntracked`] lane).
 async fn relay_substitute_progress<W: AsyncWrite + Unpin>(
     stderr: &mut StderrWriter<&mut W>,
-    act: &BuildActivityState,
+    act: &mut BuildActivityState,
     p: types::SubstituteProgress,
-) -> Result<(), StreamProcessError> {
-    let Some(DrvDisplay::Subst(aids)) = act.display.get(&p.derivation_path).copied() else {
-        return Ok(());
+) -> Result<SubstRelay, StreamProcessError> {
+    let machine_name = act.machine_name.clone();
+    let Some(DrvDisplay::Subst(aids)) = act.display.get_mut(&p.derivation_path) else {
+        debug!(
+            drv = %p.derivation_path,
+            done = p.bytes_done,
+            expected = p.bytes_expected,
+            "substitute progress for an untracked or already-closed pair; dropped"
+        );
+        return Ok(SubstRelay::DroppedUntracked);
     };
+    // (i) Deferred copy start: first sourced tick only. Fields per
+    // upstream `store-api.cc copyStorePath`: [storePath, from, to];
+    // `to` is the cluster's stable identifier (same source as
+    // actBuild machineName). The text says "fetching closure of"
+    // (not "copying path") because resProgress carries
+    // CLOSURE-aggregate bytes from `walk_substitute_closure`, not
+    // single-path bytes.
+    if aids.copy.is_none() && !p.upstream_uri.is_empty() {
+        let copy = stderr
+            .start_activity(
+                ActivityType::CopyPath,
+                &format!("fetching closure of '{}'", aids.out),
+                verbosity::INFO,
+                aids.subst,
+                &[
+                    ResultField::String(aids.out.clone()),
+                    ResultField::String(p.upstream_uri.clone()),
+                    ResultField::String(machine_name),
+                ],
+            )
+            .await?;
+        aids.copy = Some(copy);
+    }
     // resProgress fields: [done, expected, running, failed]. The latter
-    // two are 0 — actCopyPath is single-transfer, not an aggregate.
+    // two are 0 — the pair is single-transfer, not an aggregate.
+    let fields = [
+        ResultField::Int(p.bytes_done),
+        ResultField::Int(p.bytes_expected),
+        ResultField::Int(0),
+        ResultField::Int(0),
+    ];
+    // (ii) The substitute aid always carries the progress.
     stderr
-        .result(
-            aids.copy,
-            ResultType::Progress,
-            &[
-                ResultField::Int(p.bytes_done),
-                ResultField::Int(p.bytes_expected),
-                ResultField::Int(0),
-                ResultField::Int(0),
-            ],
-        )
+        .result(aids.subst, ResultType::Progress, &fields)
         .await?;
-    Ok(())
+    // (iii) The copy child iff started.
+    if let Some(copy) = aids.copy {
+        stderr.result(copy, ResultType::Progress, &fields).await?;
+    }
+    aids.progress = Some((p.bytes_done, p.bytes_expected));
+    Ok(SubstRelay::Relayed)
 }
 
 /// The `resProgress` field array `[done, expected, running, failed]` —
@@ -882,7 +967,7 @@ async fn apply_snapshot<W: AsyncWrite + Unpin>(
     for (drv, (exec_id, kind)) in &running {
         match kind {
             types::AttemptKind::Materialization => {
-                if let Some(DrvDisplay::Build(aid)) = act.display.get(*drv).copied() {
+                if let Some(DrvDisplay::Build(aid)) = act.display.get(*drv).cloned() {
                     // Kind flip while detached (the build re-dispatched
                     // as a materialization): the old execution is dead —
                     // close the stale build display and its tail.
@@ -896,7 +981,7 @@ async fn apply_snapshot<W: AsyncWrite + Unpin>(
             }
             _ => {
                 tails.on_started(drv, exec_id);
-                if let Some(DrvDisplay::Subst(aids)) = act.display.get(*drv).copied() {
+                if let Some(DrvDisplay::Subst(aids)) = act.display.get(*drv).cloned() {
                     // Kind flip while detached (substitute fell through
                     // to a build): close the dangling subst pair.
                     act.display.remove(*drv);
@@ -1030,7 +1115,7 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
                 // Builder forwarded the daemon's SetPhase. Attach to the
                 // owning per-drv activity so nom shows the phase column.
                 if let Some(DrvDisplay::Build(aid)) =
-                    act.display.get(&phase.derivation_path).copied()
+                    act.display.get(&phase.derivation_path).cloned()
                 {
                     stderr
                         .result(
@@ -3002,7 +3087,7 @@ mod tests {
 
     fn subst_aids(act: &BuildActivityState, drv: &str) -> SubstAids {
         match act.display.get(drv) {
-            Some(DrvDisplay::Subst(aids)) => *aids,
+            Some(DrvDisplay::Subst(aids)) => aids.clone(),
             other => panic!("expected subst display for {drv}, got {other:?}"),
         }
     }
@@ -3246,6 +3331,326 @@ mod tests {
         wire::read_u64(r).await.unwrap()
     }
 
+    /// Field value captured by [`read_frames`] — the C7 helper:
+    /// `read_start_activity` discards string fields, but the
+    /// live_043 assertions need the copy START frame's `from` field.
+    #[derive(Debug, Clone, PartialEq)]
+    enum FVal {
+        Int(u64),
+        Str(String),
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum Frame {
+        Start {
+            aid: u64,
+            act_type: u64,
+            fields: Vec<FVal>,
+        },
+        Stop(u64),
+        Result {
+            aid: u64,
+            rtype: u64,
+            fields: Vec<FVal>,
+        },
+        Log(String),
+    }
+
+    /// Parse EVERY stderr frame in `buf` (start/stop/result/log) into
+    /// a structural list — order-robust assertions for the deferred
+    /// copy-start lifecycle.
+    async fn read_frames(buf: Vec<u8>) -> Vec<Frame> {
+        use rio_nix::protocol::stderr::STDERR_NEXT;
+        let mut r = std::io::Cursor::new(buf);
+        let mut frames = Vec::new();
+        loop {
+            let Ok(op) = wire::read_u64(&mut r).await else {
+                break;
+            };
+            match op {
+                x if x == STDERR_START_ACTIVITY => {
+                    let aid = wire::read_u64(&mut r).await.unwrap();
+                    let _level = wire::read_u64(&mut r).await.unwrap();
+                    let act_type = wire::read_u64(&mut r).await.unwrap();
+                    let _text = wire::read_string(&mut r).await.unwrap();
+                    let n = wire::read_u64(&mut r).await.unwrap();
+                    let mut fields = Vec::new();
+                    for _ in 0..n {
+                        match wire::read_u64(&mut r).await.unwrap() {
+                            0 => fields.push(FVal::Int(wire::read_u64(&mut r).await.unwrap())),
+                            1 => fields.push(FVal::Str(wire::read_string(&mut r).await.unwrap())),
+                            t => panic!("unknown field type {t}"),
+                        }
+                    }
+                    let _parent = wire::read_u64(&mut r).await.unwrap();
+                    frames.push(Frame::Start {
+                        aid,
+                        act_type,
+                        fields,
+                    });
+                }
+                x if x == STDERR_STOP_ACTIVITY => {
+                    frames.push(Frame::Stop(wire::read_u64(&mut r).await.unwrap()));
+                }
+                x if x == STDERR_RESULT => {
+                    let aid = wire::read_u64(&mut r).await.unwrap();
+                    let rtype = wire::read_u64(&mut r).await.unwrap();
+                    let n = wire::read_u64(&mut r).await.unwrap();
+                    let mut fields = Vec::new();
+                    for _ in 0..n {
+                        match wire::read_u64(&mut r).await.unwrap() {
+                            0 => fields.push(FVal::Int(wire::read_u64(&mut r).await.unwrap())),
+                            1 => fields.push(FVal::Str(wire::read_string(&mut r).await.unwrap())),
+                            t => panic!("unknown field type {t}"),
+                        }
+                    }
+                    frames.push(Frame::Result { aid, rtype, fields });
+                }
+                x if x == STDERR_NEXT => {
+                    frames.push(Frame::Log(wire::read_string(&mut r).await.unwrap()));
+                }
+                op => panic!("unexpected opcode {op}"),
+            }
+        }
+        frames
+    }
+
+    /// The copy child's aid, from its START frame (the pair may be
+    /// closed and gone from the display map by assertion time).
+    fn subst_copy_aid(frames: &[Frame]) -> u64 {
+        frames
+            .iter()
+            .find_map(|f| match f {
+                Frame::Start { aid, act_type, .. }
+                    if *act_type == ActivityType::CopyPath as u64 =>
+                {
+                    Some(*aid)
+                }
+                _ => None,
+            })
+            .expect("a copy START frame exists")
+    }
+
+    /// Count resProgress results on `aid`.
+    fn progress_results(frames: &[Frame], aid: u64) -> Vec<&Vec<FVal>> {
+        frames
+            .iter()
+            .filter_map(|f| match f {
+                Frame::Result {
+                    aid: a,
+                    rtype,
+                    fields,
+                } if *a == aid && *rtype == ResultType::Progress as u64 => Some(fields),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // r[verify gw.activity.subst-progress+1]
+    /// live_043 red #1: substitution progress must be representable in
+    /// consumers keyed on the SUBSTITUTE aid, not only the copy child.
+    #[tokio::test]
+    async fn substitute_progress_lands_on_both_aids() {
+        use types::DerivationEventKind::*;
+        let drv = "/nix/store/qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq-foo.drv";
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState::default();
+
+        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
+            .await
+            .unwrap();
+        let aids = subst_aids(&act, drv);
+
+        relay_substitute_progress(
+            &mut stderr,
+            &mut act,
+            types::SubstituteProgress {
+                derivation_path: drv.into(),
+                bytes_done: 7,
+                bytes_expected: 100,
+                upstream_uri: "https://cache.example".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let frames = read_frames(buf).await;
+        let on_subst = progress_results(&frames, aids.subst).len();
+        assert_eq!(
+            on_subst, 1,
+            "consumers keyed on the actSubstitute aid see zero progress              (the relay rides only the copy child)"
+        );
+    }
+
+    // r[verify gw.activity.subst-progress+1]
+    /// live_043 red #2: the copy activity's START frame must carry the
+    /// upstream source in its `from` field (stock copyStorePath
+    /// semantics: [storePath, from, to]) — the relay discarded
+    /// SubstituteProgress.upstream_uri and `from` stayed empty forever,
+    /// so direction-aware consumers rendered a download as a
+    /// local-to-local copy with no source.
+    #[tokio::test]
+    async fn copy_frame_carries_the_upstream_source() {
+        use types::DerivationEventKind::*;
+        let drv = "/nix/store/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr-foo.drv";
+        let uri = "https://cache.example";
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState::default();
+
+        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
+            .await
+            .unwrap();
+
+        relay_substitute_progress(
+            &mut stderr,
+            &mut act,
+            types::SubstituteProgress {
+                derivation_path: drv.into(),
+                bytes_done: 1,
+                bytes_expected: 2,
+                upstream_uri: uri.into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let frames = read_frames(buf).await;
+        let copy_start = frames
+            .iter()
+            .find_map(|f| match f {
+                Frame::Start {
+                    act_type, fields, ..
+                } if *act_type == ActivityType::CopyPath as u64 => Some(fields.clone()),
+                _ => None,
+            })
+            .expect("a copy START frame exists");
+        assert_eq!(
+            copy_start.get(1),
+            Some(&FVal::Str(uri.to_string())),
+            "the copy START frame's `from` field must carry the first              sourced tick's upstream URI (got {copy_start:?})"
+        );
+    }
+
+    // r[verify gw.activity.subst-progress+1]
+    /// live_043 companion green: a progress tick arriving AFTER the
+    /// pair closed (the post-outcome straggler — delivery is droppable
+    /// and reorderable end-to-end) is TOLERATED: no frames, the typed
+    /// dropped lane, one debug line. Never reordered, never resurrects
+    /// the pair.
+    #[tokio::test]
+    async fn straggler_after_close_is_a_counted_noop() {
+        use types::DerivationEventKind::*;
+        let drv = "/nix/store/tttttttttttttttttttttttttttttttt-foo.drv";
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState::default();
+
+        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
+            .await
+            .unwrap();
+        relay_substitute_progress(
+            &mut stderr,
+            &mut act,
+            types::SubstituteProgress {
+                derivation_path: drv.into(),
+                bytes_done: 5,
+                bytes_expected: 10,
+                upstream_uri: "https://cache.example".into(),
+            },
+        )
+        .await
+        .unwrap();
+        relay_derivation_status(&mut stderr, &mut act, ev(Cached, drv, &[]))
+            .await
+            .unwrap();
+        // The straggler: the final tick lost the race to the outcome.
+        // A fresh buffer isolates its (absence of) frames.
+        let mut buf2 = Vec::new();
+        let mut w2 = &mut buf2;
+        let mut stderr2 = StderrWriter::new(&mut w2);
+        let outcome = relay_substitute_progress(
+            &mut stderr2,
+            &mut act,
+            types::SubstituteProgress {
+                derivation_path: drv.into(),
+                bytes_done: 10,
+                bytes_expected: 10,
+                upstream_uri: "https://cache.example".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, SubstRelay::DroppedUntracked, "tolerated, typed");
+        assert!(
+            buf2.is_empty(),
+            "a post-close straggler emits NO frames (the pair is closed; \
+             the close synthesis already completed the bar)"
+        );
+        assert!(!act.display.contains_key(drv), "never resurrected");
+    }
+
+    // r[verify gw.activity.subst-progress+1]
+    /// live_043 red #3 (the FS-1 relocated binding red): a terminal
+    /// outcome closing a pair whose last-relayed progress is partial
+    /// must synthesize the completing resProgress on BOTH aids before
+    /// the stops — the terminal outcome IS the completion proof; the
+    /// live shape was a partially-filled (or empty) bar frozen at
+    /// whatever tick happened to win the race.
+    #[tokio::test]
+    async fn outcome_with_open_pair_renders_complete_progress() {
+        use types::DerivationEventKind::*;
+        let drv = "/nix/store/ssssssssssssssssssssssssssssssss-foo.drv";
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState::default();
+
+        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
+            .await
+            .unwrap();
+        let aids = subst_aids(&act, drv);
+
+        relay_substitute_progress(
+            &mut stderr,
+            &mut act,
+            types::SubstituteProgress {
+                derivation_path: drv.into(),
+                bytes_done: 10,
+                bytes_expected: 100,
+                upstream_uri: "https://cache.example".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // The closing outcome arrives with NO further tick (the final
+        // tick lost the race end-to-end).
+        relay_derivation_status(&mut stderr, &mut act, ev(Cached, drv, &[]))
+            .await
+            .unwrap();
+
+        let frames = read_frames(buf).await;
+        let copy = subst_copy_aid(&frames);
+        for aid in [aids.subst, copy] {
+            let completing = progress_results(&frames, aid)
+                .iter()
+                .any(|fields| fields.first() == Some(&FVal::Int(100)));
+            assert!(
+                completing,
+                "pair closed with `done < expected` and no completing                  resProgress on aid {aid} — the terminal outcome is the                  completion proof and must fill the bar (the live                  partial/empty-bar shape)"
+            );
+        }
+    }
+
     // r[verify gw.stderr.activity+2]
     /// Substituting → start_activity(actSubstitute, [out, ""]); Cached →
     /// stop_activity(same aid). A merge-time Cached (no preceding
@@ -3272,17 +3677,17 @@ mod tests {
             .unwrap();
         assert_eq!(subst_count(&act), 0, "Cached must remove subst aids");
 
-        // r[verify gw.activity.subst-progress]
-        // Wire: START(Substitute), START(CopyPath child), no SetExpected
-        // (builds_root None), then STOP(copy), STOP(subst).
+        // r[verify gw.activity.subst-progress+1]
+        // Wire (live_043 deferred-start): START(Substitute) only — no
+        // sourced tick arrived, so no copy child ever started (a
+        // zero-fetch/no-tick substitution closes subst-only, the
+        // truthful display) — then STOP(subst). No SetExpected
+        // (builds_root None).
+        assert_eq!(aids.copy, None, "no sourced tick => no copy child");
         let mut r = std::io::Cursor::new(buf);
         let (sa, st) = read_start_activity(&mut r).await;
         assert_eq!(sa, aids.subst);
         assert_eq!(st, ActivityType::Substitute as u64);
-        let (ca, ct) = read_start_activity(&mut r).await;
-        assert_eq!(ca, aids.copy);
-        assert_eq!(ct, ActivityType::CopyPath as u64);
-        assert_eq!(read_stop_activity(&mut r).await, aids.copy, "child first");
         assert_eq!(read_stop_activity(&mut r).await, aids.subst);
 
         // Merge-time Cached (no preceding Substituting) writes nothing.
@@ -3299,7 +3704,7 @@ mod tests {
         );
     }
 
-    // r[verify gw.activity.subst-progress]
+    // r[verify gw.activity.subst-progress+1]
     /// Substituting → SubstituteProgress → Cached: progress emits a
     /// `STDERR_RESULT{copy_aid, resProgress, [done, expected, 0, 0]}`
     /// frame between START(CopyPath) and STOP(copy). This is what nom
@@ -3317,11 +3722,10 @@ mod tests {
         relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
             .await
             .unwrap();
-        let aids = subst_aids(&act, drv);
 
-        relay_substitute_progress(
+        let relayed = relay_substitute_progress(
             &mut stderr,
-            &act,
+            &mut act,
             types::SubstituteProgress {
                 derivation_path: drv.into(),
                 bytes_done: 12_345_678,
@@ -3331,43 +3735,87 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(relayed, SubstRelay::Relayed);
+        // The sourced tick started the deferred copy child.
+        let aids = subst_aids(&act, drv);
+        let copy = aids.copy.expect("sourced tick starts the copy child");
 
         relay_derivation_status(&mut stderr, &mut act, ev(Cached, drv, &[]))
             .await
             .unwrap();
 
-        let mut r = std::io::Cursor::new(buf);
-        let (_, st) = read_start_activity(&mut r).await;
-        assert_eq!(st, ActivityType::Substitute as u64);
-        let (ca, ct) = read_start_activity(&mut r).await;
-        assert_eq!(ct, ActivityType::CopyPath as u64);
-        // STDERR_RESULT{aid, type, nfields, fields...}
-        assert_eq!(wire::read_u64(&mut r).await.unwrap(), STDERR_RESULT);
-        assert_eq!(wire::read_u64(&mut r).await.unwrap(), ca, "on copy aid");
-        assert_eq!(
-            wire::read_u64(&mut r).await.unwrap(),
-            ResultType::Progress as u64
-        );
-        assert_eq!(wire::read_u64(&mut r).await.unwrap(), 4);
-        assert_eq!(wire::read_u64(&mut r).await.unwrap(), 0); // type=int
-        assert_eq!(wire::read_u64(&mut r).await.unwrap(), 12_345_678);
-        assert_eq!(wire::read_u64(&mut r).await.unwrap(), 0);
-        assert_eq!(wire::read_u64(&mut r).await.unwrap(), 99_999_999);
-        // skip running, failed
-        for _ in 0..2 {
-            let _ = wire::read_u64(&mut r).await.unwrap();
-            let _ = wire::read_u64(&mut r).await.unwrap();
+        // Wire (live_043): START(subst) → [sourced tick] START(copy,
+        // from=uri) → resProgress(subst) → resProgress(copy) →
+        // [final tick already complete? no: done < expected, so the
+        // close synthesizes completion on both] → STOP(copy) →
+        // STOP(subst).
+        let frames = read_frames(buf).await;
+        let mut it = frames.iter();
+        assert!(matches!(
+            it.next(),
+            Some(Frame::Start { act_type, .. }) if *act_type == ActivityType::Substitute as u64
+        ));
+        match it.next() {
+            Some(Frame::Start {
+                aid,
+                act_type,
+                fields,
+            }) => {
+                assert_eq!(*aid, copy);
+                assert_eq!(*act_type, ActivityType::CopyPath as u64);
+                assert_eq!(
+                    fields.get(1),
+                    Some(&FVal::Str("https://cache.example.test".into())),
+                    "from = the first sourced tick's URI"
+                );
+            }
+            other => panic!("expected copy START, got {other:?}"),
         }
-        assert_eq!(read_stop_activity(&mut r).await, aids.copy);
-        assert_eq!(read_stop_activity(&mut r).await, aids.subst);
+        // The tick's progress, subst first then copy.
+        for aid in [aids.subst, copy] {
+            match it.next() {
+                Some(Frame::Result {
+                    aid: a,
+                    rtype,
+                    fields,
+                }) => {
+                    assert_eq!(*a, aid);
+                    assert_eq!(*rtype, ResultType::Progress as u64);
+                    assert_eq!(fields[0], FVal::Int(12_345_678));
+                    assert_eq!(fields[1], FVal::Int(99_999_999));
+                }
+                other => panic!("expected progress on {aid}, got {other:?}"),
+            }
+        }
+        // Close synthesis (done < expected at close): completing
+        // progress on both aids, then the stops, child first.
+        for aid in [aids.subst, copy] {
+            match it.next() {
+                Some(Frame::Result {
+                    aid: a,
+                    rtype,
+                    fields,
+                }) => {
+                    assert_eq!(*a, aid);
+                    assert_eq!(*rtype, ResultType::Progress as u64);
+                    assert_eq!(fields[0], FVal::Int(99_999_999), "done == expected");
+                    assert_eq!(fields[1], FVal::Int(99_999_999));
+                }
+                other => panic!("expected completing progress on {aid}, got {other:?}"),
+            }
+        }
+        assert_eq!(it.next(), Some(&Frame::Stop(copy)), "child first");
+        assert_eq!(it.next(), Some(&Frame::Stop(aids.subst)));
+        assert_eq!(it.next(), None);
 
-        // Progress for an untracked drv is a silent no-op.
+        // Progress for an untracked drv is a TOLERATED no-op: no
+        // frames, the typed dropped lane.
         let mut buf2 = Vec::new();
         let mut w2 = &mut buf2;
         let mut stderr2 = StderrWriter::new(&mut w2);
-        relay_substitute_progress(
+        let dropped = relay_substitute_progress(
             &mut stderr2,
-            &BuildActivityState::default(),
+            &mut BuildActivityState::default(),
             types::SubstituteProgress {
                 derivation_path: drv.into(),
                 bytes_done: 1,
@@ -3377,7 +3825,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(buf2.is_empty(), "no aids → no resProgress");
+        assert_eq!(dropped, SubstRelay::DroppedUntracked);
+        assert!(buf2.is_empty(), "no aids → no frames");
     }
 
     /// A failed substitute fetch reverts to Ready → eventually
@@ -3404,14 +3853,12 @@ mod tests {
         assert_eq!(subst_count(&act), 0, "Started must clear subst aids");
         let _ = build_aid(&act, drv); // Started must track the build display
 
-        // Wire order: START(Substitute), START(CopyPath), STOP(copy),
-        // STOP(subst), START(Build).
+        // Wire order (deferred-start: no sourced tick, no copy child):
+        // START(Substitute), STOP(subst), START(Build).
+        assert_eq!(aids.copy, None);
         let mut r = std::io::Cursor::new(buf);
         let (_, st) = read_start_activity(&mut r).await;
         assert_eq!(st, ActivityType::Substitute as u64);
-        let (_, ct) = read_start_activity(&mut r).await;
-        assert_eq!(ct, ActivityType::CopyPath as u64);
-        assert_eq!(read_stop_activity(&mut r).await, aids.copy);
         assert_eq!(read_stop_activity(&mut r).await, aids.subst);
         let (_, bt) = read_start_activity(&mut r).await;
         assert_eq!(bt, ActivityType::Build as u64);
@@ -3449,16 +3896,14 @@ mod tests {
         );
         assert_eq!(build_count(&act), 0, "drv was never Started");
 
-        // Wire order: START(Substitute), START(CopyPath), STOP(copy),
-        // STOP(subst), STDERR_NEXT(log). STOP must precede the failure
-        // log so nom clears the substituting line before printing the
-        // error.
+        // Wire order (deferred-start: no sourced tick, no copy
+        // child): START(Substitute), STOP(subst), STDERR_NEXT(log).
+        // STOP must precede the failure log so nom clears the
+        // substituting line before printing the error.
+        assert_eq!(aids.copy, None);
         let mut r = std::io::Cursor::new(buf);
         let (_, st) = read_start_activity(&mut r).await;
         assert_eq!(st, ActivityType::Substitute as u64);
-        let (_, ct) = read_start_activity(&mut r).await;
-        assert_eq!(ct, ActivityType::CopyPath as u64);
-        assert_eq!(read_stop_activity(&mut r).await, aids.copy);
         assert_eq!(read_stop_activity(&mut r).await, aids.subst);
 
         assert_eq!(wire::read_u64(&mut r).await.unwrap(), STDERR_NEXT);
@@ -3597,10 +4042,7 @@ mod tests {
         relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
             .await
             .unwrap();
-        let aids = match act.display.get(drv) {
-            Some(DrvDisplay::Subst(aids)) => *aids,
-            other => panic!("expected subst display, got {other:?}"),
-        };
+        let aids = subst_aids(&act, drv);
 
         let outcome = apply_snapshot(&mut stderr, &mut act, &mut tails, snap_running(&[]))
             .await
@@ -3611,21 +4053,21 @@ mod tests {
             "gone-reconcile must remove the substitution display entry"
         );
 
-        // Wire: START(subst), START(copy), then the root's activity from
-        // apply_snapshot, then STOP(copy), STOP(subst) from the reconcile.
+        // Wire (deferred-start: no sourced tick, subst-only pair):
+        // START(subst), then the root's activity from apply_snapshot,
+        // then STOP(subst) from the reconcile.
+        assert_eq!(aids.copy, None);
         let mut r = std::io::Cursor::new(buf);
         let (sa, _) = read_start_activity(&mut r).await;
-        let (ca, _) = read_start_activity(&mut r).await;
-        assert_eq!((sa, ca), (aids.subst, aids.copy));
+        assert_eq!(sa, aids.subst);
         let (_root, rt) = read_start_activity(&mut r).await;
         assert_eq!(rt, ActivityType::Builds as u64, "snapshot creates root");
-        // Root SetExpected result frame precedes the stops:
+        // Root SetExpected result frame precedes the stop:
         // aid + type + nfields + 2 int fields (type,value pairs).
         assert_eq!(wire::read_u64(&mut r).await.unwrap(), STDERR_RESULT);
         for _ in 0..3 + 2 * 2 {
             let _ = wire::read_u64(&mut r).await.unwrap();
         }
-        assert_eq!(read_stop_activity(&mut r).await, aids.copy, "child first");
         assert_eq!(read_stop_activity(&mut r).await, aids.subst);
     }
 
