@@ -289,17 +289,35 @@ async fn execute_job_inner(
     // DIFFERENT verdicts at the consumer (a covered root over a
     // punctured closure must never complete) — track the cell per
     // frontier entry.
-    let mut missing_wanted: Vec<String> = Vec::new();
-    let mut missing_references: Vec<String> = Vec::new();
+    // bug_266: every per-path verdict is GENERATION-STAMPED with the
+    // tenant-set generation it was reached under (kernel
+    // GenStampedCells — record() is the only writer, so an unstamped
+    // verdict is unrepresentable). When the live tenant set GROWS
+    // mid-walk, stale cells drain back into the frontier (the new
+    // tenant's upstreams get their owner-Q2 chance) and the outcome
+    // compiler REFUSES to fold cells older than the final generation.
+    let mut missing_wanted = rio_evidence_kernel::outcome::GenStampedCells::new();
+    let mut missing_references = rio_evidence_kernel::outcome::GenStampedCells::new();
     // merged_bug_005: paths refused on TRUST (present upstream, no
     // verifiable signature under any interested tenant). They ride
     // the same missing cells (the settlement is still Unobtainable —
     // from-source), but the cause string must name the refusal so an
     // operator fixes trusted_keys instead of chasing a phantom miss.
-    let mut trust_refused: Vec<String> = Vec::new();
+    let mut trust_refused = rio_evidence_kernel::outcome::GenStampedCells::new();
     // merged_bug_046: paths whose settle cause is the AlreadyComplete
     // content disagreement (mirrors trust_refused one axis over).
-    let mut content_mismatched: Vec<String> = Vec::new();
+    let mut content_mismatched = rio_evidence_kernel::outcome::GenStampedCells::new();
+    // bug_266: the tenant-set generation. Bumps when the freshly
+    // resolved set contains a member the previous resolve did not —
+    // ONLY growth re-opens verdicts (shrinkage cannot turn a miss
+    // into a hit; the departed tenant's evidence stands).
+    let mut tenant_generation: u64 = 0;
+    let mut last_tenants: std::collections::BTreeSet<Uuid> = std::collections::BTreeSet::new();
+    // Reference-cell paths drained by a growth re-enter the frontier
+    // directly (their parent edge was already walked; wanted-cell
+    // paths re-enter via the wanted re-read once cleared from
+    // `visited`).
+    let mut reseed_references: Vec<String> = Vec::new();
     // BC-4 cumulative progress accounting: bytes of fully-processed
     // paths. The per-path fetch callback adds the in-flight path's
     // streamed bytes on top of `completed_bytes`, with the declared
@@ -340,6 +358,42 @@ async fn execute_job_inner(
                 return infra_failure(format!("tenant resolution query failed: {e}"));
             }
         };
+        // bug_266: tenant-set growth detection. A grown set re-opens
+        // every verdict reached under an older generation: stale
+        // cells drain (all four registries), the drained paths leave
+        // `visited` (wanted ones re-seed via the wanted re-read;
+        // reference ones re-enter the frontier directly below).
+        {
+            let current: std::collections::BTreeSet<Uuid> = tenants.iter().copied().collect();
+            let grew = current.difference(&last_tenants).next().is_some();
+            if grew && !last_tenants.is_empty() {
+                tenant_generation += 1;
+                let stale_wanted = missing_wanted.drain_stale(tenant_generation);
+                let stale_refs = missing_references.drain_stale(tenant_generation);
+                let _ = trust_refused.drain_stale(tenant_generation);
+                let _ = content_mismatched.drain_stale(tenant_generation);
+                if !stale_wanted.is_empty() || !stale_refs.is_empty() {
+                    info!(
+                        drv_hash = %claimed.drv_hash,
+                        generation = tenant_generation,
+                        reopened_wanted = stale_wanted.len(),
+                        reopened_references = stale_refs.len(),
+                        "tenant set grew mid-walk; re-probing settled verdicts \
+                         under the live set (bug_266)"
+                    );
+                }
+                for p in &stale_wanted {
+                    visited.remove(p);
+                }
+                for p in stale_refs {
+                    visited.remove(&p);
+                    reseed_references.push(p);
+                }
+            } else if last_tenants.is_empty() {
+                // First resolve: generation 0 is the baseline.
+            }
+            last_tenants = current;
+        }
         // The live wanted read: first iteration = the at-claim read;
         // subsequent iterations = the final verification passes
         // (design §2.2 item 3: never snapshot at creation).
@@ -365,17 +419,25 @@ async fn execute_job_inner(
             .into_iter()
             .filter(|p| !visited.contains(p))
             .collect();
-        if new_seeds.is_empty() {
+        if new_seeds.is_empty() && reseed_references.is_empty() {
             // The final verification pass found no growth: coverage is
             // complete against execution-end live wanted.
             break;
         }
 
         // Frontier entries carry their CELL: live-wanted seeds vs
-        // narinfo reference extensions (merged_bug_193).
+        // narinfo reference extensions (merged_bug_193). bug_266:
+        // drained reference verdicts re-enter with their original
+        // cell — the consumer's covered-root-over-punctured-closure
+        // law keeps holding.
         let mut frontier: VecDeque<(String, PathCell)> = new_seeds
             .into_iter()
             .map(|p| (p, PathCell::Wanted))
+            .chain(
+                reseed_references
+                    .drain(..)
+                    .map(|p| (p, PathCell::Reference)),
+            )
             .collect();
         while let Some((path, cell)) = frontier.pop_front() {
             if !visited.insert(path.clone()) {
@@ -605,10 +667,14 @@ async fn execute_job_inner(
                         warn!(path = %path, detail = %detail,
                               "path present upstream but signature-untrusted; \
                                settling unobtainable (uncharged)");
-                        trust_refused.push(path.clone());
+                        trust_refused.record(path.clone(), tenant_generation);
                         match cell {
-                            PathCell::Wanted => missing_wanted.push(path.clone()),
-                            PathCell::Reference => missing_references.push(path.clone()),
+                            PathCell::Wanted => {
+                                missing_wanted.record(path.clone(), tenant_generation)
+                            }
+                            PathCell::Reference => {
+                                missing_references.record(path.clone(), tenant_generation)
+                            }
                         }
                     }
                     TenantAttemptsVerdict::ContentMismatch { idx } => {
@@ -627,10 +693,14 @@ async fn execute_job_inner(
                         warn!(path = %path, detail = %detail,
                               "path present upstream with disagreeing content; \
                                settling unobtainable (uncharged)");
-                        content_mismatched.push(path.clone());
+                        content_mismatched.record(path.clone(), tenant_generation);
                         match cell {
-                            PathCell::Wanted => missing_wanted.push(path.clone()),
-                            PathCell::Reference => missing_references.push(path.clone()),
+                            PathCell::Wanted => {
+                                missing_wanted.record(path.clone(), tenant_generation)
+                            }
+                            PathCell::Reference => {
+                                missing_references.record(path.clone(), tenant_generation)
+                            }
                         }
                     }
                     TenantAttemptsVerdict::AllCleanMiss => {
@@ -707,7 +777,7 @@ async fn execute_job_inner(
                                 // leg's — fall through to the
                                 // confirmed-absent settlement with the
                                 // trust cause recorded.
-                                trust_refused.push(path.clone());
+                                trust_refused.record(path.clone(), tenant_generation);
                             }
                             TenantAttemptsVerdict::ContentMismatch { .. } => {
                                 // Unreachable while the HEAD probe is
@@ -715,7 +785,7 @@ async fn execute_job_inner(
                                 // future content-aware probe's refusal
                                 // falls through with the cause
                                 // recorded, mirroring the trust arm.
-                                content_mismatched.push(path.clone());
+                                content_mismatched.record(path.clone(), tenant_generation);
                             }
                             TenantAttemptsVerdict::AllCleanMiss => {}
                         }
@@ -723,8 +793,12 @@ async fn execute_job_inner(
                         debug!(path = %path, cell = ?cell, tenants = tenants.len(),
                                "path confirmed absent under every interested tenant (and locally)");
                         match cell {
-                            PathCell::Wanted => missing_wanted.push(path.clone()),
-                            PathCell::Reference => missing_references.push(path.clone()),
+                            PathCell::Wanted => {
+                                missing_wanted.record(path.clone(), tenant_generation)
+                            }
+                            PathCell::Reference => {
+                                missing_references.record(path.clone(), tenant_generation)
+                            }
                         }
                     }
                 },
@@ -733,6 +807,28 @@ async fn execute_job_inner(
     }
 
     // ── 5. Outcome ────────────────────────────────────────────────────
+    // bug_266: the outcome compiler REFUSES to fold verdict cells
+    // older than the final tenant-set generation — the walk drains
+    // stale cells at every growth point, so a survivor is a missed
+    // drain (a walk bug): surface it as infrastructure failure (the
+    // scheduler re-arms), never as a verdict reached on evidence a
+    // live tenant was never asked about. The guard is the kernel's
+    // (kani: fold_guard accepts iff all-current — K6).
+    for (registry, name) in [
+        (&missing_wanted, "missing_wanted"),
+        (&missing_references, "missing_references"),
+        (&trust_refused, "trust_refused"),
+        (&content_mismatched, "content_mismatched"),
+    ] {
+        if let Err(stale) = registry.fold_guard(tenant_generation) {
+            return infra_failure(format!(
+                "stale verdict cell survived tenant-set growth in {name} \
+                 (cell generation {} vs final {}): walk bug — refusing to \
+                 fold (bug_266)",
+                stale.cell_generation, stale.final_generation
+            ));
+        }
+    }
     if missing_wanted.is_empty() && missing_references.is_empty() {
         info!(
             drv_hash = %claimed.drv_hash,
@@ -807,9 +903,12 @@ async fn execute_job_inner(
             outcome: Some(materialization_outcome::Outcome::Unobtainable(
                 materialization_outcome::Unobtainable {
                     cause,
-                    missing_paths: missing_wanted,
+                    missing_paths: missing_wanted.paths().map(str::to_owned).collect(),
                     verified_paths: covered,
-                    missing_reference_paths: missing_references,
+                    missing_reference_paths: missing_references
+                        .paths()
+                        .map(str::to_owned)
+                        .collect(),
                 },
             )),
         }
@@ -2110,6 +2209,118 @@ mod tests {
             .cloned()
             .collect();
         got.sort();
+        let mut want = vec![path_p.clone(), path_q.clone()];
+        want.sort();
+        assert_eq!(got, want, "both P (under A) and Q (under B) covered");
+    }
+
+    /// bug_266: a per-path verdict settled under an EARLIER, SMALLER
+    /// tenant set must be re-probed when the live tenant set GROWS
+    /// mid-walk — `new_seeds = wanted - visited` made verdicts
+    /// permanent within the walk, so a path that clean-missed under
+    /// {A} stayed Unobtainable even when B (whose upstream serves it)
+    /// joined before the walk compiled its outcome, violating
+    /// owner-Q2 one step removed from the bug_041 close.
+    ///
+    /// Choreography (the bug_041 seam, with the verdict SETTLING in
+    /// iteration 1): build A wants BOTH P and Q; A's gated upstream
+    /// serves only P and 404s Q, so Q settles missing-wanted under
+    /// generation 1 while P's NAR fetch is blocked; during the block,
+    /// A's build goes terminal and B's build (upstream serving Q)
+    /// arrives; the gate releases. Iteration 2 re-resolves tenants —
+    /// the GROWN set must drain Q's stale verdict back into the
+    /// frontier and probe it under B.
+    #[tokio::test]
+    async fn grown_tenant_set_reprobes_settled_verdicts() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant_a = seed_tenant(&db.pool, "mat-regrow-a").await;
+        let tenant_b = seed_tenant(&db.pool, "mat-regrow-b").await;
+
+        let path_p = store_path(13, "mat-regrow-p");
+        let path_q = store_path(14, "mat-regrow-q");
+        let (nar_p, _) = rio_test_support::fixtures::make_nar(b"regrow contents p");
+        let (nar_q, _) = rio_test_support::fixtures::make_nar(b"regrow contents q");
+
+        // Tenant A: gated upstream serving ONLY P (404s Q).
+        let (up_a, mut hit_rx, release) =
+            spawn_gated_upstream(vec![(path_p.clone(), nar_p, vec![])], "cache.regrow-a").await;
+        wire_upstream(&db.pool, tenant_a, &up_a).await;
+        // Tenant B: serves ONLY Q.
+        let up_b =
+            spawn_multi_upstream(vec![(path_q.clone(), nar_q, vec![])], "cache.regrow-b").await;
+        wire_upstream(&db.pool, tenant_b, &up_b).await;
+
+        // Build A wants BOTH outputs ({} = all declared): Q's verdict
+        // settles in iteration 1 under {A}.
+        let seeded = seed_job(
+            &db.pool,
+            "mat-regrow-drv",
+            &[("out", path_p.as_str()), ("doc", path_q.as_str())],
+            Some(tenant_a),
+            Some(tenant_a),
+            &[],
+        )
+        .await;
+
+        let ctx = make_ctx(db.pool.clone());
+        let claimed = seeded.claimed.clone();
+        let walk = tokio::spawn(async move { execute_job(&ctx, &claimed).await.into_outcome() });
+
+        // Deterministic seam: inside iteration 1's gated NAR fetch of
+        // P (Q's 404 verdict lands in this iteration either side of
+        // the gate — the tenant set was resolved before the gate).
+        tokio::time::timeout(std::time::Duration::from_secs(30), hit_rx.recv())
+            .await
+            .expect("the walk reached tenant A's gated NAR fetch")
+            .expect("gate signal");
+
+        // The growth: A terminal; B live, wanting all outputs.
+        sqlx::query("UPDATE builds SET status = 'succeeded' WHERE build_id = $1")
+            .bind(seeded.build_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let build_b = Uuid::new_v4();
+        sqlx::query("INSERT INTO builds (build_id, tenant_id, status) VALUES ($1, $2, 'active')")
+            .bind(build_b)
+            .bind(tenant_b)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO build_derivations (build_id, derivation_id) VALUES ($1, $2)")
+            .bind(build_b)
+            .bind(seeded.derivation_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO build_wanted_outputs (build_id, derivation_id, wanted_output_names) \
+             VALUES ($1, $2, '{}')",
+        )
+        .bind(build_b)
+        .bind(seeded.derivation_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        release.notify_waiters();
+        let outcome = walk.await.unwrap();
+
+        let success = outcome_success(&outcome).unwrap_or_else(|| {
+            panic!(
+                "expected Success — Q's generation-1 miss verdict must be \
+                 re-probed under the GROWN tenant set (B serves Q), got \
+                 {outcome:?}"
+            )
+        });
+        let mut got: Vec<String> = success
+            .ingested_paths
+            .iter()
+            .chain(success.verified_paths.iter())
+            .cloned()
+            .collect();
+        got.sort();
+        got.dedup();
         let mut want = vec![path_p.clone(), path_q.clone()];
         want.sort();
         assert_eq!(got, want, "both P (under A) and Q (under B) covered");
