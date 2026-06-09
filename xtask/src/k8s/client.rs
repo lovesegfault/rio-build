@@ -148,6 +148,32 @@ pub async fn get_secret_key(
         .and_then(|v| String::from_utf8(v.0).ok()))
 }
 
+/// Read one string key from a Secret, surfacing the RAW kube error.
+///
+/// Unlike [`get_secret_key`] (whose `get_opt` folds 404 into
+/// `Ok(None)`), an absent Secret comes back as
+/// `Err(kube::Error::Api(status))` with `status.is_not_found()` —
+/// and so does an absent NAMESPACE: the apiserver 404s both shapes
+/// with reason `NotFound`. Callers that must route "object absent"
+/// (expected on first install) differently from "apiserver
+/// unreachable" (must abort) match on the error; deploy's pg
+/// preflight gate is the consumer. `Ok(None)` means the Secret
+/// exists but lacks `key` (or the value isn't UTF-8).
+pub async fn probe_secret_key(
+    client: &Client,
+    ns: &str,
+    name: &str,
+    key: &str,
+) -> Result<Option<String>, kube::Error> {
+    let api: Api<Secret> = Api::namespaced(client.clone(), ns);
+    Ok(api
+        .get(name)
+        .await?
+        .data
+        .and_then(|d| d.get(key).cloned())
+        .and_then(|v| String::from_utf8(v.0).ok()))
+}
+
 /// LoadBalancer ingress hostname for the gateway Service. `Err` if the
 /// Service has no `.status.loadBalancer.ingress` yet (NLB still
 /// provisioning) — caller decides whether to wait or print a

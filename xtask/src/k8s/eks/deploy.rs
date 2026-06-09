@@ -132,6 +132,15 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
     // the MEASUREMENT. The chart's values.yaml default is only the
     // modeled fallback for chart-only consumers; EKS always deploys
     // the derived value. Bypass: --deploy-skip-pg-preflight.
+    //
+    // Gate: the measurement pod's hard dependencies (the rio-store
+    // namespace and the ESO-synced rio-postgres Secret it mounts) are
+    // created by/after the very helm install this preflight gates, so
+    // on a fresh or wiped cluster they CANNOT exist yet. Probe the
+    // Secret and classify: readable -> measure; NotFound shapes ->
+    // first-install degrade to the model (same path as
+    // --deploy-skip-pg-preflight, same loud warning); anything else
+    // (5xx, timeout, auth) -> abort. See classify_pg_preflight_gate.
     let store_ceiling = if skip_pg_preflight {
         let fallback = derive_store_ceiling(
             modeled_pg_max,
@@ -145,46 +154,45 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             "pg preflight SKIPPED (--deploy-skip-pg-preflight): store ceiling derived from the tf MODEL, not a live measurement"
         );
         fallback
-    } else if kube::get_secret_key(&client, NS_STORE, "rio-postgres", "url")
-        .await
-        .is_err()
-    {
-        // First install: the rio-store namespace / ESO-synced secret
-        // does not exist yet, so the measurement pod cannot run. Fall
-        // back to the model — the next deploy enforces the
-        // measurement.
-        let fallback = derive_store_ceiling(
-            modeled_pg_max,
-            NON_STORE_PG_BUDGET,
-            STORE_PG_MAX_CONNECTIONS_PER_REPLICA,
-            STORE_PG_HEADROOM,
-        );
-        warn!(
-            modeled_pg_max,
-            ceiling = fallback,
-            "pg preflight: rio-postgres secret not readable (first install?) — store ceiling derived from the tf MODEL; the next deploy enforces the live measurement"
-        );
-        fallback
     } else {
-        let measured =
-            ui::step("pg preflight", || pg_preflight_measure(&client, &ecr, tag)).await?;
-        if measured != modeled_pg_max {
-            anyhow::bail!(
-                "pg preflight: live max_connections={measured} but the tf model \
-                 (rds.tf aurora_pg_max_connections_by_max_acu + min-capacity cap) \
-                 says {modeled_pg_max}. Either the capacity change has not been \
-                 applied/rebooted yet (max_connections is a STATIC parameter — \
-                 it changes only after an instance reboot) or the rds.tf table \
-                 is wrong for this capacity. Fix the model or finish the resize; \
-                 do not hand-edit the ceiling."
-            );
+        let probe = kube::probe_secret_key(&client, NS_STORE, "rio-postgres", "url").await;
+        match classify_pg_preflight_gate(probe)? {
+            PgPreflightGate::DegradeFirstInstall => {
+                let fallback = derive_store_ceiling(
+                    modeled_pg_max,
+                    NON_STORE_PG_BUDGET,
+                    STORE_PG_MAX_CONNECTIONS_PER_REPLICA,
+                    STORE_PG_HEADROOM,
+                );
+                warn!(
+                    modeled_pg_max,
+                    ceiling = fallback,
+                    "pg preflight: rio-store/rio-postgres secret absent (first install or post-wipe) - store ceiling derived from the tf MODEL; the next deploy measures and enforces the live value"
+                );
+                fallback
+            }
+            PgPreflightGate::Measure => {
+                let measured =
+                    ui::step("pg preflight", || pg_preflight_measure(&client, &ecr, tag)).await?;
+                if measured != modeled_pg_max {
+                    anyhow::bail!(
+                        "pg preflight: live max_connections={measured} but the tf model \
+                         (rds.tf aurora_pg_max_connections_by_max_acu + min-capacity cap) \
+                         says {modeled_pg_max}. Either the capacity change has not been \
+                         applied/rebooted yet (max_connections is a STATIC parameter — \
+                         it changes only after an instance reboot) or the rds.tf table \
+                         is wrong for this capacity. Fix the model or finish the resize; \
+                         do not hand-edit the ceiling."
+                    );
+                }
+                derive_store_ceiling(
+                    measured,
+                    NON_STORE_PG_BUDGET,
+                    STORE_PG_MAX_CONNECTIONS_PER_REPLICA,
+                    STORE_PG_HEADROOM,
+                )
+            }
         }
-        derive_store_ceiling(
-            measured,
-            NON_STORE_PG_BUDGET,
-            STORE_PG_MAX_CONNECTIONS_PER_REPLICA,
-            STORE_PG_HEADROOM,
-        )
     };
     info!(store_ceiling, modeled_pg_max, "store autoscaling ceiling");
 
@@ -642,6 +650,65 @@ fn derive_store_ceiling(
     (usable / f64::from(per_replica)).floor() as u32
 }
 
+/// What the pg connection-budget preflight should do, decided from
+/// probing the ESO-synced `rio-store/rio-postgres` Secret — the
+/// measurement pod's hard dependency (its env is a secretKeyRef on
+/// that Secret, and its namespace is the Secret's namespace).
+#[derive(Debug, PartialEq, Eq)]
+enum PgPreflightGate {
+    /// Secret readable: namespace and credentials exist, so the
+    /// measurement pod can run. Measure live and enforce the model.
+    Measure,
+    /// First-install shape: the Secret, its `url` key, or the
+    /// rio-store namespace itself does not exist yet. All of them are
+    /// created by/after the helm install this preflight gates, so on
+    /// a fresh or wiped cluster the tf model is the only available
+    /// truth — degrade to it loudly; the next deploy measures live.
+    DegradeFirstInstall,
+}
+
+/// Classify the Secret probe into the preflight's gate decision.
+///
+/// Invariant (merged_bug_080 follow-up): the preflight must be
+/// runnable against ANY cluster state the deploy itself is legal
+/// against — fresh (no rio namespaces), partially torn down
+/// (rio-store gone, infra add-ons alive), or healthy. First-boot
+/// cannot 404: the measurement pod is only attempted after its
+/// Secret was actually READ, so its namespace existed.
+///
+/// Only the apiserver's NotFound shapes degrade —
+/// `secrets "rio-postgres" not found` and
+/// `namespaces "rio-store" not found` (the same `is_not_found`
+/// predicate kube-rs `get_opt` folds on). Every other error (5xx,
+/// timeout, auth) stays a hard failure so a flaky apiserver aborts
+/// the deploy instead of silently shipping a modeled ceiling.
+fn classify_pg_preflight_gate(
+    probe: Result<Option<String>, ::kube::Error>,
+) -> Result<PgPreflightGate> {
+    match probe {
+        Ok(Some(_)) => Ok(PgPreflightGate::Measure),
+        // Secret exists but the url key is missing/non-UTF-8: ESO
+        // half-sync; the gated deploy is what repairs it. Without
+        // credentials the measurement pod would only sit in
+        // CreateContainerConfigError until timeout.
+        Ok(None) => Ok(PgPreflightGate::DegradeFirstInstall),
+        // The apiserver's explicit NotFound (same predicate kube-rs
+        // get_opt folds on): `secrets "rio-postgres" not found` when
+        // only the Secret is missing, `namespaces "rio-store" not
+        // found` when the namespace itself is. Both are the
+        // first-install shape.
+        Err(::kube::Error::Api(st)) if st.is_not_found() => {
+            Ok(PgPreflightGate::DegradeFirstInstall)
+        }
+        Err(e) => Err(e).context(
+            "pg preflight: probing rio-store/rio-postgres failed with a \
+             non-NotFound error; aborting rather than silently deploying \
+             the modeled ceiling (rerun, or bypass deliberately with \
+             --deploy-skip-pg-preflight)",
+        ),
+    }
+}
+
 /// Spawn the one-shot `rio-store pg-preflight` pod in the store
 /// namespace (it inherits the store-egress CiliumNetworkPolicy via the
 /// rio-store name label) and parse its `max_connections=N` output.
@@ -745,5 +812,112 @@ mod ceiling_tests {
             2000
         );
         assert!(parse_pg_preflight_output("no luck").is_err());
+    }
+}
+
+#[cfg(test)]
+mod pg_gate_tests {
+    use super::*;
+    use ::kube::core::Status;
+
+    /// kube 3.x apiserver error shape: `Error::Api(Box<Status>)`.
+    fn api_err(message: &str, reason: &str, code: u16) -> ::kube::Error {
+        ::kube::Error::Api(Status::failure(message, reason).with_code(code).boxed())
+    }
+
+    /// The deploy-blocking first-boot failure, pinned: on a cluster
+    /// where the rio-store NAMESPACE does not exist (fresh, or wiped
+    /// while infra add-ons survive), the Secret probe 404s. That MUST
+    /// route to the first-install degrade — the shipped gate instead
+    /// measured, and the measurement pod's create then failed the
+    /// whole deploy with `namespaces "rio-store" not found`.
+    #[test]
+    fn gate_degrades_on_absent_namespace() {
+        let probe = Err(api_err(
+            r#"namespaces "rio-store" not found"#,
+            "NotFound",
+            404,
+        ));
+        assert_eq!(
+            classify_pg_preflight_gate(probe).unwrap(),
+            PgPreflightGate::DegradeFirstInstall
+        );
+    }
+
+    /// Namespace exists but the ESO-synced Secret hasn't landed (ESO
+    /// syncs only after the chart's ExternalSecret is installed):
+    /// same first-install shape, same degrade.
+    #[test]
+    fn gate_degrades_on_absent_secret() {
+        let probe = Err(api_err(
+            r#"secrets "rio-postgres" not found"#,
+            "NotFound",
+            404,
+        ));
+        assert_eq!(
+            classify_pg_preflight_gate(probe).unwrap(),
+            PgPreflightGate::DegradeFirstInstall
+        );
+    }
+
+    /// Secret synced but the `url` key is missing/non-UTF-8 (ESO
+    /// half-sync). Measuring is impossible without credentials, and
+    /// the deploy being gated is exactly what repairs the sync —
+    /// degrade, don't spawn a pod doomed to CreateContainerConfigError.
+    #[test]
+    fn gate_degrades_on_missing_key() {
+        assert_eq!(
+            classify_pg_preflight_gate(Ok(None)).unwrap(),
+            PgPreflightGate::DegradeFirstInstall
+        );
+    }
+
+    /// Healthy path unchanged: secret readable -> measure live.
+    #[test]
+    fn gate_measures_when_secret_readable() {
+        let probe = Ok(Some("postgres://rio:pw@db.example:5432/rio".into()));
+        assert_eq!(
+            classify_pg_preflight_gate(probe).unwrap(),
+            PgPreflightGate::Measure
+        );
+    }
+
+    /// Transient apiserver failures must ABORT the deploy, not
+    /// silently fall back to the modeled ceiling. The shipped gate
+    /// had this inverted (`.is_err()` -> degrade): a flaky apiserver
+    /// mid-deploy would have deployed a model-derived ceiling with
+    /// nothing but a "first install?" warning.
+    #[test]
+    fn gate_aborts_on_transient_api_errors() {
+        for (message, reason, code) in [
+            ("etcdserver: leader changed", "ServiceUnavailable", 503),
+            (
+                "an error on the server has prevented the request from succeeding",
+                "InternalError",
+                500,
+            ),
+            ("Unauthorized", "Unauthorized", 401),
+            (
+                "the server has received too many requests",
+                "TooManyRequests",
+                429,
+            ),
+        ] {
+            let err = classify_pg_preflight_gate(Err(api_err(message, reason, code)))
+                .expect_err(&format!("{reason} ({code}) must abort, not degrade"));
+            assert!(
+                err.to_string().contains("aborting"),
+                "{reason} ({code}) error must carry the abort context, got: {err:#}"
+            );
+        }
+    }
+
+    /// Non-API transport errors (connect timeout, TLS, DNS) likewise
+    /// abort — only the apiserver's explicit NotFound is "absent".
+    #[test]
+    fn gate_aborts_on_transport_error() {
+        let probe = Err(::kube::Error::Service("connect timeout".into()));
+        let err = classify_pg_preflight_gate(probe).expect_err("transport error must abort");
+        assert!(err.to_string().contains("aborting"), "got: {err:#}");
     }
 }
