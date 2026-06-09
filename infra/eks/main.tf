@@ -348,6 +348,7 @@ module "eks" {
     #    9445  ESO webhook                        secrets.tf
     #    9446  ESO metrics                        secrets.tf
     #    9447  ESO readyz                         secrets.tf
+    #    9448  metrics-server (serving)           metrics-server.tf
     #    9963  cilium-operator metrics            addons.tf (cilium)
     #   10260  prom-operator webhook              monitoring.tf
     #   10271  KEDA metrics-apiserver (http)      keda.tf
