@@ -218,9 +218,13 @@ const FENCE_MARGIN: Duration = Duration::from_secs(4);
 /// `pub` for the same reason as [`RENEW_INTERVAL`].
 pub const SELF_FENCE_AFTER: Duration = Duration::from_secs(11);
 
-/// A follower steals after observing the same resourceVersion for this
-/// long: LEASE_TTL + FENCE_MARGIN. Failover after a real leader death
-/// takes up to this long plus one renew interval.
+/// A follower steals after the lease's holder-authored content —
+/// `(holderIdentity, renewTime bytes)` — has been observed unchanged
+/// for this long: LEASE_TTL + FENCE_MARGIN. NOT resourceVersion-keyed:
+/// the apiserver bumps the rv on every write, so foreign metadata
+/// patches would reset an rv-keyed clock forever (merged_bug_180).
+/// Failover after a real leader death takes up to this long plus one
+/// renew interval.
 const STEAL_AFTER: Duration = Duration::from_secs(19);
 
 // The derivation and the NeverDual condition, enforced at compile time
@@ -1124,14 +1128,16 @@ pub async fn run_lease_loop<H: LeaseHooks>(
 /// closure so the measurement follows the virtual clock; the fence-jump
 /// test adds a controlled offset to simulate suspend.
 /// THE observe-completed-read body for a held lease while believing
-/// (`sched.lease.rebound`): every consumer of completed-read facts that
-/// keeps believing routes through here — the Leading renew round AND
-/// the own-commit evidence arm — so the transitions-vs-recorded rebound
-/// comparison is structurally fused to recording the believed-held
-/// observation. A consumer cannot record one without running the other:
-/// this function is the only API that does either, which is what makes
-/// "a sibling consumer of the same facts skipped the rebound law"
-/// unwritable rather than merely reviewed-for.
+/// (`sched.lease.rebound`): every consumer that records a believed-held
+/// observation routes through here — the Leading renew round, the
+/// own-commit evidence arm, and both acquire edges (whose just-recorded
+/// count makes the comparison a structural no-op) — so the
+/// transitions-vs-recorded rebound comparison is fused to recording the
+/// observation. The fusion is a MACHINE property, not a convention:
+/// `LeaseStanding::on_observed_held` demands the [`ObservedHeld`]
+/// witness and this function is its only production minting site, so
+/// "a sibling consumer of the same facts skipped the rebound law" does
+/// not typecheck (merged_bug_114).
 ///
 /// The rebound rationale (hoisted from the Completed arm, where it
 /// applies identically): steady state is `observed_transitions ==
@@ -1179,7 +1185,7 @@ fn observe_held_while_believing<H: LeaseHooks>(
         );
         hooks.on_rebound();
     }
-    standing.on_observed(true);
+    standing.on_observed_held(ObservedHeld(()));
 }
 
 /// Machine witness for the believing→not-believing lose edge on a
@@ -1372,7 +1378,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
         // successor whose recovery #2 succeeded.
         // The release is holder-guarded and 409/404-tolerant like the
         // shutdown release; on success the round observably resolved
-        // not-leading (standing.on_observed(false)); on failure the
+        // not-leading (standing.on_observed_not_leading()); on failure the
         // apiserver state is unknown — believe-clear only, hold kept
         // (the self-fence posture), so a later shutdown still
         // releases. Either way the full lose-edge effects run
@@ -1387,7 +1393,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
             match tokio::time::timeout(deadline, election.step_down()).await {
                 Ok(Ok(())) => {
                     info!("step-down: lease released; resuming candidacy next tick");
-                    standing.on_observed(false);
+                    standing.on_observed_not_leading();
                 }
                 Ok(Err(e)) => {
                     warn!(error = %e,
@@ -1518,7 +1524,21 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                         // recovery-completion gate lets the loop keep
                         // renewing regardless.
                         hooks.on_acquire();
-                        standing.on_observed(true);
+                        // Record the believed-held observation THROUGH
+                        // the funnel (merged_bug_114): on_acquire just
+                        // stored this count, so the rebound comparison
+                        // no-ops by construction — and a consumer that
+                        // skipped the funnel would not typecheck (the
+                        // ObservedHeld witness has no other minting
+                        // site).
+                        observe_held_while_believing(
+                            &state,
+                            &mut standing,
+                            &marks_dirty,
+                            &hooks,
+                            &cfg.holder_id,
+                            transitions,
+                        );
                         // An acquire resolves any pending deferral —
                         // a new belief episode starts clean.
                         conflict_deferred = false;
@@ -1589,7 +1609,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                                 // arm after the edge match patches this
                                 // tick.
                                 marks_dirty.mark();
-                                standing.on_observed(false);
+                                standing.on_observed_not_leading();
                                 conflict_deferred = false;
                             }
                             None => {
@@ -1638,7 +1658,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                     // leading, nothing to defer). No log — 5s interval
                     // would be noisy.
                     (None, false) => {
-                        standing.on_observed(false);
+                        standing.on_observed_not_leading();
                         conflict_deferred = false;
                     }
                 }
@@ -1739,17 +1759,26 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                             info!(
                                 generation = new_gen,
                                 holder = %cfg.holder_id,
-                                "own-commit evidence (holder=us, rv moved) restored \
+                                "own-commit evidence (holder=us, renewTime moved) restored \
                                  leadership belief after an abandoned write"
                             );
                             marks_dirty.mark();
                             hooks.on_acquire();
                             // Counts as a Leading observation: the read
                             // is apiserver-authoritative about the hold.
-                            // The rebound comparison is vacuous on this
-                            // leg — on_acquire just recorded the fetched
-                            // count.
-                            standing.on_observed(true);
+                            // Routed THROUGH the funnel (merged_bug_114)
+                            // — the rebound comparison no-ops on the
+                            // just-recorded count, and the ObservedHeld
+                            // witness keeps a funnel-skipping sibling
+                            // consumer untypeable.
+                            observe_held_while_believing(
+                                &state,
+                                &mut standing,
+                                &marks_dirty,
+                                &hooks,
+                                &cfg.holder_id,
+                                f.transitions,
+                            );
                         } else {
                             // Still believing: this is a completed read
                             // of a lease we hold — the SAME facts the
@@ -1986,6 +2015,18 @@ struct LeaseStanding {
     held_unsuperseded: bool,
 }
 
+/// Witness that a believed-held observation passed through THE
+/// observe-completed-read body (`observe_held_while_believing`) — the
+/// fused rebound-comparison + observation. The only production minting
+/// site is that function, which is what upgrades its doc's "a sibling
+/// consumer skipping the rebound law is unwritable" from convention to
+/// structure (merged_bug_114): `LeaseStanding::on_observed_held`
+/// demands this value, and a consumer that did not run the funnel has
+/// no way to construct it. (Tests and the kani standing proofs mint
+/// through a cfg-gated driver that delegates to the same production
+/// transitions.)
+struct ObservedHeld(());
+
 impl LeaseStanding {
     /// Loop start: never led, never held.
     fn new() -> Self {
@@ -2000,14 +2041,39 @@ impl LeaseStanding {
         self.believes
     }
 
-    /// A COMPLETED election round resolved with this leadership
-    /// polarity. Leading sets both facts; not-leading clears both —
-    /// including the stale hold of a fenced-then-superseded sequence,
-    /// which preserves the legitimate release skip (an observed
-    /// supersession means there is nothing of ours to release).
+    /// A COMPLETED round resolved BELIEVED-HELD. Demands the
+    /// [`ObservedHeld`] witness, minted only by
+    /// `observe_held_while_believing` — so recording a held
+    /// observation without running the fused rebound comparison does
+    /// not typecheck in production code (merged_bug_114; the funnel
+    /// doc carries the full claim).
+    fn on_observed_held(&mut self, _witness: ObservedHeld) {
+        self.believes = true;
+        self.held_unsuperseded = true;
+    }
+
+    /// A COMPLETED election round resolved not-leading: clears both
+    /// facts — including the stale hold of a fenced-then-superseded
+    /// sequence, which preserves the legitimate release skip (an
+    /// observed supersession means there is nothing of ours to
+    /// release).
+    fn on_observed_not_leading(&mut self) {
+        self.believes = false;
+        self.held_unsuperseded = false;
+    }
+
+    /// Test/proof driver: the production polarity pair as one call.
+    /// DELEGATES to the production methods (the kani standing proofs
+    /// and the unit tests exercise the real transitions, not a shim) —
+    /// the witness mint here is the cfg-gated escape hatch production
+    /// code does not have.
+    #[cfg(any(test, kani))]
     fn on_observed(&mut self, now_leading: bool) {
-        self.believes = now_leading;
-        self.held_unsuperseded = now_leading;
+        if now_leading {
+            self.on_observed_held(ObservedHeld(()));
+        } else {
+            self.on_observed_not_leading();
+        }
     }
 
     /// Local self-fence: stop believing. The apiserver state is

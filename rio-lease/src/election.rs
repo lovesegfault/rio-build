@@ -447,8 +447,11 @@ pub struct LeaderElection {
     /// Documentation for `kubectl describe lease` — NOT the threshold
     /// this replica acts on (that is `steal_after`).
     ttl: Duration,
-    /// How long the same resourceVersion must be observed unchanged
-    /// before this replica steals. Deliberately `2×FENCE_MARGIN` LATER
+    /// How long the same holder-authored spec content —
+    /// `(holderIdentity, renewTime bytes)`, never the resourceVersion
+    /// (merged_bug_180: foreign metadata patches move the rv without
+    /// any protocol write) — must be observed unchanged before this
+    /// replica steals. Deliberately `2×FENCE_MARGIN` LATER
     /// than the holder's own self-fence deadline (`SELF_FENCE_AFTER`,
     /// i.e. `LEASE_TTL − FENCE_MARGIN`) so the deposed holder has
     /// already stopped believing by the time anyone steals.
