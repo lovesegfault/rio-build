@@ -181,6 +181,10 @@ pub enum GcPhase3Outcome {
     /// The cycle drained but the durable commit provably did not land
     /// (degraded bookkeeping on a completed collection — exit 0).
     CommitLost,
+    /// The cycle drained but the commit outcome is unprovable either
+    /// way — it may or may not have landed (merged_bug_022; degraded
+    /// bookkeeping on a completed collection — exit 0).
+    CommitIndeterminate,
     /// Dry run whose durable observation was withheld (degraded
     /// bookkeeping — exit 0).
     PreviewOnly,
@@ -203,9 +207,10 @@ impl GcPhase3Outcome {
     /// `gc_failure_prefix_alphabet_pinned`); the executable predicate
     /// below derives from this set, so an outcome absent here cannot
     /// silently fall out of the exit posture.
-    pub const ALL: [GcPhase3Outcome; 5] = [
+    pub const ALL: [GcPhase3Outcome; 6] = [
         GcPhase3Outcome::Committed,
         GcPhase3Outcome::CommitLost,
+        GcPhase3Outcome::CommitIndeterminate,
         GcPhase3Outcome::PreviewOnly,
         GcPhase3Outcome::Suspended,
         GcPhase3Outcome::Failed,
@@ -221,6 +226,7 @@ impl GcPhase3Outcome {
             GcPhase3Outcome::Failed => Some(GC_CHUNK_COLLECT_FAILED_PREFIX),
             GcPhase3Outcome::Committed
             | GcPhase3Outcome::CommitLost
+            | GcPhase3Outcome::CommitIndeterminate
             | GcPhase3Outcome::PreviewOnly => None,
         }
     }
@@ -256,9 +262,10 @@ mod gc_phase3_tests {
             match o {
                 GcPhase3Outcome::Committed => 0,
                 GcPhase3Outcome::CommitLost => 1,
-                GcPhase3Outcome::PreviewOnly => 2,
-                GcPhase3Outcome::Suspended => 3,
-                GcPhase3Outcome::Failed => 4,
+                GcPhase3Outcome::CommitIndeterminate => 2,
+                GcPhase3Outcome::PreviewOnly => 3,
+                GcPhase3Outcome::Suspended => 4,
+                GcPhase3Outcome::Failed => 5,
             }
         }
         let mut seen = [0u8; GcPhase3Outcome::ALL.len()];
@@ -271,6 +278,7 @@ mod gc_phase3_tests {
         let table = [
             (GcPhase3Outcome::Committed, None),
             (GcPhase3Outcome::CommitLost, None),
+            (GcPhase3Outcome::CommitIndeterminate, None),
             (GcPhase3Outcome::PreviewOnly, None),
             (GcPhase3Outcome::Suspended, Some("chunk collect SUSPENDED:")),
             (GcPhase3Outcome::Failed, Some("chunk collect FAILED:")),

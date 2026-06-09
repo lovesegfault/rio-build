@@ -110,12 +110,16 @@ pub(crate) enum CycleCommit {
 }
 
 /// Proof that a cycle's durable commit LANDED (merged_bug_218). The
-/// only mint sites are [`GcCycleLease::commit_cycle`]'s success paths,
-/// so the `outcome="ok"` tick — [`CycleCommitted::record_ok_outcome`],
-/// its sole producer — structurally cannot run for a cycle whose
-/// stamp/cursor/backlog update was lost: metric attribution and the
-/// commit result cannot diverge. `#[must_use]`: dropping the witness
-/// without recording is a compile-time warning at every caller.
+/// only mint sites are [`GcCycleLease::commit_cycle`]'s success paths
+/// — and the witness is constructed AT THE DURABILITY POINT, in the
+/// expression observing the commit statement's success, BEFORE any
+/// further fallible await (merged_bug_022: post-commit cleanup is
+/// structurally unable to alter attribution) — so the `outcome="ok"`
+/// tick — [`CycleCommitted::record_ok_outcome`], its sole producer —
+/// structurally cannot run for a cycle whose stamp/cursor/backlog
+/// update was lost: metric attribution and the commit result cannot
+/// diverge. `#[must_use]`: dropping the witness without recording is
+/// a compile-time warning at every caller.
 #[must_use = "record_ok_outcome() — the ok tick rides the commit witness"]
 pub(crate) struct CycleCommitted(());
 
@@ -126,12 +130,228 @@ impl CycleCommitted {
     }
 }
 
-/// Test-only commit-failure injection: 0 = off, 1 = primary UPDATE
-/// (lock session) fails, 2 = primary AND the epoch-guarded retry fail.
-/// Cleared on consume.
+/// Closed result of one cycle commit (merged_bug_022, the Q1 closure
+/// set): both production callers consume it by EXHAUSTIVE match — a
+/// new arm cannot ship without each caller taking an attribution
+/// position (`ok` / `commit_failed` / `commit_indeterminate` tick and
+/// the operator render).
+#[must_use = "every arm carries an attribution decision the caller must take"]
+pub(crate) enum CycleCommitResult {
+    /// The durable commit LANDED — the witness was minted at the
+    /// durability point (or the cycle's own landed commit was
+    /// recognized by payload echo on the epoch-guarded retry).
+    Committed(CycleCommitted),
+    /// PROVEN not landed: a foreign winner sits at `expected_epoch+1`
+    /// with a payload that is not ours (had ours landed first, the
+    /// foreign commit would sit at `expected_epoch+2`). Carries the
+    /// primary error for the caller's disclosure.
+    NotCommitted(sqlx::Error),
+    /// Unprovable either way: the retry was refused/errored, the
+    /// diagnostic read failed, or the epoch advanced past `+1` —
+    /// the commit may or may not have landed. Carries the primary
+    /// error for the caller's disclosure.
+    Ambiguous(sqlx::Error),
+}
+
+#[cfg(test)]
+impl CycleCommitResult {
+    /// Test choreographies that REQUIRE a landed commit.
+    pub(crate) fn expect_committed(self, msg: &str) -> CycleCommitted {
+        match self {
+            Self::Committed(w) => w,
+            Self::NotCommitted(e) => panic!("{msg}: proven not committed: {e}"),
+            Self::Ambiguous(e) => panic!("{msg}: indeterminate: {e}"),
+        }
+    }
+}
+
+/// What the epoch-guarded retry proved (internal to the retry path;
+/// the caller-facing closure set is [`CycleCommitResult`];
+/// `pub(crate)` so the alphabet table in collect.rs can pin the
+/// classification rows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetryVerdict {
+    /// The guarded UPDATE applied (1 row): the retry landed the commit.
+    Applied,
+    /// 0 rows because the row already carries OUR write: the primary
+    /// applied and only its response was lost.
+    OwnCommitLanded,
+    /// 0 rows and the row at `expected+1` carries a foreign payload:
+    /// PROVEN lost.
+    ForeignWinner,
+    /// 0 rows and the row evidence proves nothing (epoch past `+1`,
+    /// or the impossible `== expected` after a 0-row guarded UPDATE).
+    Unprovable,
+}
+
+/// One diagnostic read of the singleton row for 0-row retry
+/// classification (merged_bug_022). Timestamp comparisons are computed
+/// DB-side (booleans out) — no timestamp crosses into process frame,
+/// so no cross-clock comparison exists (the merged_bug_017 class).
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub(crate) struct CommitProbe {
+    pub(crate) cycle_epoch: i64,
+    pub(crate) cursor: Option<Vec<u8>>,
+    pub(crate) backlog_estimate: Option<i64>,
+    pub(crate) last_mark_set_size: Option<i64>,
+    pub(crate) last_would_collect: Option<i64>,
+    /// `last_live_cycle_at IS NOT NULL`.
+    pub(crate) live_stamped: bool,
+    /// `last_attempt_at IS NULL OR last_live_cycle_at >= last_attempt_at`
+    /// (false when `last_live_cycle_at` is NULL and an attempt exists).
+    pub(crate) live_at_or_after_attempt: bool,
+}
+
+const COMMIT_PROBE_SQL: &str = "SELECT cycle_epoch, cursor, backlog_estimate, \
+       last_mark_set_size, last_would_collect, \
+       last_live_cycle_at IS NOT NULL AS live_stamped, \
+       (last_attempt_at IS NULL OR (last_live_cycle_at IS NOT NULL \
+          AND last_live_cycle_at >= last_attempt_at)) AS live_at_or_after_attempt \
+  FROM gc_collect_state WHERE singleton";
+
+/// The 0-row retry classification table (merged_bug_022) — pure and
+/// exhaustive; the alphabet test in collect.rs pins every row (the
+/// classify.rs/bug_178 style).
+///
+/// Echo fields are ONLY those whose committed value is a pure function
+/// of the [`CycleCommit`] (the SET lists in `execute_commit`):
+///
+/// - Live: `cursor == disposition.cursor_at_stop()` AND
+///   `last_mark_set_size == observation.mark_set_size()` AND
+///   `last_live_cycle_at IS NOT NULL` AND (`last_attempt_at IS NULL OR
+///   last_live_cycle_at >= last_attempt_at`). The temporal conjunct
+///   (DB-frame, computed in SQL) excludes foreign-SHADOW
+///   misrecognition: a shadow never writes `last_live_cycle_at`, and
+///   both live paths stamp the attempt BEFORE the cycle
+///   (`collect_backstop_once`, run_gc phase 3), so a pre-existing
+///   stale live stamp sits BEFORE our attempt stamp and fails the
+///   conjunct.
+/// - Shadow: `backlog_estimate == observation.would_collect()` AND
+///   `last_would_collect == observation.would_collect()` AND
+///   `last_mark_set_size == observation.mark_set_size()`.
+///
+/// DOCUMENTED BENIGN RESIDUAL: a byte-identical foreign LIVE commit
+/// landing inside the milliseconds retry window is recognized as ours
+/// — durable row state is identical by construction, so the only error
+/// is WHICH replica's ok ticks. Accepted in lieu of a per-attempt
+/// nonce column, which would require a new migration on the frozen
+/// `gc_collect_state` schema (rio-migrations is outside this plane;
+/// SIGNED Q2: zero DDL this wave). Modeled honestly as the
+/// `payloadCoincidence` nondet in `docs/spec/models/gcCadence.qnt`.
+pub(crate) fn classify_zero_row_retry(
+    commit: &CycleCommit,
+    expected_epoch: i64,
+    probe: &CommitProbe,
+) -> RetryVerdict {
+    if probe.cycle_epoch != expected_epoch + 1 {
+        // Past +1: ours MAY be one of several interleaved commits —
+        // unprovable. == expected: impossible after a 0-row guarded
+        // UPDATE (the guard would have matched); never invent proof
+        // from an impossible state. Below expected: corrupted/reset
+        // row — equally unprovable.
+        return RetryVerdict::Unprovable;
+    }
+    let echo_matched = match commit {
+        CycleCommit::Live {
+            disposition,
+            observation,
+            ..
+        } => {
+            probe.cursor.as_deref() == disposition.cursor_at_stop()
+                && probe.last_mark_set_size == Some(observation.mark_set_size())
+                && probe.live_stamped
+                && probe.live_at_or_after_attempt
+        }
+        CycleCommit::Shadow { observation } => {
+            probe.backlog_estimate == Some(observation.would_collect())
+                && probe.last_would_collect == Some(observation.would_collect())
+                && probe.last_mark_set_size == Some(observation.mark_set_size())
+        }
+    };
+    if echo_matched {
+        RetryVerdict::OwnCommitLanded
+    } else {
+        RetryVerdict::ForeignWinner
+    }
+}
+
+/// Test-only production-statement router (Q1 witness provenance): the
+/// foreign-winner red mints its foreign row through the SAME
+/// `execute_commit` statement production uses — never hand-rolled SQL.
+/// Routed via [`super::lock::SessionConn`] (the gc-wide acquire
+/// discipline).
+#[cfg(test)]
+pub(crate) async fn commit_foreign_for_test(
+    pool: &PgPool,
+    commit: &CycleCommit,
+) -> Result<u64, sqlx::Error> {
+    let mut conn = super::lock::SessionConn::acquire(pool).await?;
+    let rows = GcCycleLease::execute_commit(commit, None, &mut *conn.conn()).await?;
+    conn.release_to_pool();
+    Ok(rows)
+}
+
+/// Test-only commit-fault injection carrier; the protocol is the
+/// CLOSED [`CommitFaultMode`] alphabet (merged_bug_022 - the retired
+/// magic-u8 protocol could not express applied-but-response-lost, so
+/// the conflation it caused was untestable). Cleared on consume.
 #[cfg(test)]
 pub(crate) static COMMIT_FAIL_INJECT: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0);
+
+/// The commit-fault axis, CLOSED (Q1 closure set): explicit
+/// discriminants ride the existing [`COMMIT_FAIL_INJECT`] AtomicU8 and
+/// every consult site decodes by EXHAUSTIVE match - adding a mode
+/// cannot compile without each site taking a position.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitFaultMode {
+    /// No injection.
+    Off = 0,
+    /// The primary (lock-session) UPDATE is refused without executing.
+    PrimaryRefused = 1,
+    /// Primary refused AND the epoch-guarded retry refused.
+    PrimaryAndRetryRefused = 2,
+    /// The primary UPDATE EXECUTES (the row lands durably, through the
+    /// production statement) and then the response is lost - exactly
+    /// the applied-but-response-lost wire shape of a session killed
+    /// between apply and acknowledge.
+    AppliedResponseLost = 3,
+    /// The post-commit release is refused: the release call is skipped
+    /// and the lock dropped (drop detaches the connection, matching
+    /// the failed-release semantics; lock.rs stays untouched).
+    ReleaseRefused = 4,
+}
+
+#[cfg(test)]
+impl CommitFaultMode {
+    /// Arm the injection for the next [`GcCycleLease::commit_cycle`].
+    pub(crate) fn arm(self) {
+        COMMIT_FAIL_INJECT.store(self as u8, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn decode(v: u8) -> Self {
+        match v {
+            0 => Self::Off,
+            1 => Self::PrimaryRefused,
+            2 => Self::PrimaryAndRetryRefused,
+            3 => Self::AppliedResponseLost,
+            4 => Self::ReleaseRefused,
+            other => unreachable!("unknown CommitFaultMode discriminant {other}"),
+        }
+    }
+
+    /// Peek without clearing (the primary consult site; later sites
+    /// consume).
+    fn peek() -> Self {
+        Self::decode(COMMIT_FAIL_INJECT.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Consume: read and clear.
+    fn take() -> Self {
+        Self::decode(COMMIT_FAIL_INJECT.swap(0, std::sync::atomic::Ordering::SeqCst))
+    }
+}
 
 /// The held collect-cycle lease: the GC advisory lock plus the
 /// lock-snapshot of the durable state. While this value lives, this
@@ -189,35 +409,63 @@ impl GcCycleLease {
         Ok(())
     }
 
-    // r[impl store.gc.collect-cadence+2]
+    // r[impl store.gc.collect-cadence+3]
     /// Commit a finished cycle to the row (epoch+1, stamps), then
-    /// release the lock. The primary UPDATE rides the lock's session;
-    /// if that session died while it sat idle through the multi-minute
-    /// cycle (pgbouncer/NLB idle killers, a PG restart — the lock
-    /// connection does NOTHING during the cycle, merged_bug_218), the
-    /// commit is retried ONCE on a fresh pooled connection, guarded by
+    /// release the lock — three-valued (merged_bug_022): the caller
+    /// receives [`CycleCommitResult`] and matches it exhaustively.
+    ///
+    /// THE WITNESS IS MINTED AT THE DURABILITY POINT: [`CycleCommitted`]
+    /// is constructed in the expression observing the commit
+    /// statement's success, BEFORE the release — the release is
+    /// best-effort bookkeeping (lock.rs: a failed release detaches the
+    /// connection and PG frees the lock with the session; drop
+    /// detaches too), structurally unable to alter attribution.
+    ///
+    /// The primary UPDATE rides the lock's session; if that session
+    /// died while it sat idle through the multi-minute cycle
+    /// (pgbouncer/NLB idle killers, a PG restart — the lock connection
+    /// does NOTHING during the cycle, merged_bug_218), the commit is
+    /// retried ONCE on a fresh pooled connection, guarded by
     /// `cycle_epoch = <the epoch this lease read at acquire>`: the
     /// advisory lock was already freed with the dead session, so
-    /// another replica may have started — the guard makes a stale
-    /// late commit a no-op instead of a clobber. Success on either
-    /// path mints the [`CycleCommitted`] witness; total failure
-    /// returns the primary error and the caller ticks
-    /// `outcome="commit_failed"` — never "ok".
-    pub(crate) async fn commit_cycle(
-        mut self,
-        commit: CycleCommit,
-    ) -> Result<CycleCommitted, sqlx::Error> {
+    /// another replica may have started — the guard makes a stale late
+    /// commit a no-op instead of a clobber. A 0-row retry is then
+    /// classified on ROW EVIDENCE ([`classify_zero_row_retry`] — one
+    /// diagnostic read on the same fresh connection, no third
+    /// connection): in the applied-but-response-lost shape the row
+    /// sits at `expected+1` from OUR OWN UPDATE, so the guard
+    /// necessarily matches 0 rows — the retry must recognize its own
+    /// landed commit instead of unconditionally claiming a foreign
+    /// winner. Outcomes: own echo → `Committed`; foreign payload at
+    /// `expected+1` → `NotCommitted` (proven); anything else
+    /// (retry/diagnostic error, epoch past `+1`) → `Ambiguous`.
+    pub(crate) async fn commit_cycle(mut self, commit: CycleCommit) -> CycleCommitResult {
         let expected_epoch = self.state.cycle_epoch;
         let primary = {
             #[cfg(test)]
             {
-                use std::sync::atomic::Ordering;
-                if COMMIT_FAIL_INJECT.load(Ordering::SeqCst) >= 1 {
-                    Err(sqlx::Error::Protocol(
-                        "gc-collect: injected primary commit failure (test only)".into(),
-                    ))
-                } else {
-                    Self::execute_commit(&commit, None, &mut *self.lock.conn()).await
+                match CommitFaultMode::peek() {
+                    CommitFaultMode::Off | CommitFaultMode::ReleaseRefused => {
+                        Self::execute_commit(&commit, None, &mut *self.lock.conn()).await
+                    }
+                    CommitFaultMode::PrimaryRefused | CommitFaultMode::PrimaryAndRetryRefused => {
+                        Err(sqlx::Error::Protocol(
+                            "gc-collect: injected primary commit failure (test only)".into(),
+                        ))
+                    }
+                    // The applied-but-response-lost shape: the row
+                    // lands through the PRODUCTION statement, then the
+                    // acknowledgement is lost.
+                    CommitFaultMode::AppliedResponseLost => {
+                        match Self::execute_commit(&commit, None, &mut *self.lock.conn()).await {
+                            Ok(_) => Err(sqlx::Error::Protocol(
+                                "gc-collect: injected response loss after applied commit \
+                                 (test only)"
+                                    .into(),
+                            )),
+                            Err(e) => Err(e),
+                        }
+                    }
                 }
             }
             #[cfg(not(test))]
@@ -227,8 +475,43 @@ impl GcCycleLease {
         };
         match primary {
             Ok(_) => {
-                self.lock.release().await?;
-                Ok(CycleCommitted(()))
+                // THE DURABILITY POINT: the witness is minted by the
+                // expression observing execute_commit's Ok, before any
+                // further fallible await — the release below cannot
+                // alter attribution (merged_bug_022).
+                let witness = CycleCommitted(());
+                #[cfg(test)]
+                {
+                    match CommitFaultMode::take() {
+                        CommitFaultMode::ReleaseRefused => {
+                            // Skip the release and drop the lock: drop
+                            // detaches, matching the failed-release
+                            // semantics (lock.rs stays untouched).
+                            tracing::warn!(
+                                "gc-collect: post-commit lock release failed \
+                                 (injected; lock freed via session close)"
+                            );
+                            drop(self.lock);
+                            return CycleCommitResult::Committed(witness);
+                        }
+                        CommitFaultMode::Off
+                        | CommitFaultMode::PrimaryRefused
+                        | CommitFaultMode::PrimaryAndRetryRefused
+                        | CommitFaultMode::AppliedResponseLost => {}
+                    }
+                }
+                // Best-effort: a failed release detaches the
+                // connection and PG frees the lock with the session
+                // (lock.rs release error path; drop detaches too) —
+                // warn, never re-attribute a landed commit.
+                if let Err(e) = self.lock.release().await {
+                    tracing::warn!(
+                        error = %e,
+                        "gc-collect: post-commit lock release failed \
+                         (lock freed via session close; attribution unchanged)"
+                    );
+                }
+                CycleCommitResult::Committed(witness)
             }
             Err(primary_e) => {
                 tracing::warn!(
@@ -243,14 +526,21 @@ impl GcCycleLease {
                 let retry = {
                     #[cfg(test)]
                     {
-                        use std::sync::atomic::Ordering;
-                        if COMMIT_FAIL_INJECT.swap(0, Ordering::SeqCst) >= 2 {
-                            Err(sqlx::Error::Protocol(
+                        match CommitFaultMode::take() {
+                            CommitFaultMode::PrimaryAndRetryRefused => Err(sqlx::Error::Protocol(
                                 "gc-collect: injected retry commit failure (test only)".into(),
-                            ))
-                        } else {
-                            Self::retry_commit_on_fresh_conn(&self.pool, &commit, expected_epoch)
+                            )),
+                            CommitFaultMode::Off
+                            | CommitFaultMode::PrimaryRefused
+                            | CommitFaultMode::AppliedResponseLost
+                            | CommitFaultMode::ReleaseRefused => {
+                                Self::retry_commit_on_fresh_conn(
+                                    &self.pool,
+                                    &commit,
+                                    expected_epoch,
+                                )
                                 .await
+                            }
                         }
                     }
                     #[cfg(not(test))]
@@ -259,18 +549,24 @@ impl GcCycleLease {
                     }
                 };
                 match retry {
-                    Ok(1) => Ok(CycleCommitted(())),
-                    Ok(_) => {
-                        tracing::warn!(
-                            expected_epoch,
-                            "gc-collect: epoch-guarded commit retry no-oped \
-                             (another holder committed first); cycle stamp lost"
-                        );
-                        Err(primary_e)
+                    Ok(RetryVerdict::Applied) => CycleCommitResult::Committed(CycleCommitted(())),
+                    Ok(RetryVerdict::OwnCommitLanded) => {
+                        CycleCommitResult::Committed(CycleCommitted(()))
                     }
+                    Ok(RetryVerdict::ForeignWinner) => CycleCommitResult::NotCommitted(primary_e),
+                    Ok(RetryVerdict::Unprovable) => CycleCommitResult::Ambiguous(primary_e),
                     Err(retry_e) => {
-                        tracing::warn!(error = %retry_e, "gc-collect: commit retry failed");
-                        Err(primary_e)
+                        // The retry itself errored: the PRIMARY error
+                        // may have been post-apply (response lost), so
+                        // this is indeterminate — pre-fix it was
+                        // reported as definitively failed.
+                        tracing::warn!(
+                            error = %retry_e,
+                            expected_epoch,
+                            "gc-collect: commit retry failed; outcome indeterminate \
+                             (the primary error may have been post-apply)"
+                        );
+                        CycleCommitResult::Ambiguous(primary_e)
                     }
                 }
             }
@@ -279,20 +575,64 @@ impl GcCycleLease {
 
     /// The epoch-guarded retry on a FRESH connection, routed through
     /// [`super::lock::SessionConn`] (the gc-wide acquire discipline:
-    /// the guard test bans bare `pool.acquire` in gc code). The
-    /// statement is a single session-state-free UPDATE, so on success
-    /// the connection goes straight back to the pool; on failure the
-    /// drop detaches it -- a suspect connection never re-enters the
-    /// pool.
+    /// the guard test bans bare `pool.acquire` in gc code). On 0 rows
+    /// the SAME connection runs ONE diagnostic read
+    /// ([`COMMIT_PROBE_SQL`]) and the pure table
+    /// ([`classify_zero_row_retry`]) decides what the evidence proves
+    /// — no third connection. On success/classification the connection
+    /// goes back to the pool; on any error the drop detaches it — a
+    /// suspect connection never re-enters the pool.
     async fn retry_commit_on_fresh_conn(
         pool: &PgPool,
         commit: &CycleCommit,
         expected_epoch: i64,
-    ) -> Result<u64, sqlx::Error> {
+    ) -> Result<RetryVerdict, sqlx::Error> {
         let mut conn = super::lock::SessionConn::acquire(pool).await?;
         let rows = Self::execute_commit(commit, Some(expected_epoch), &mut *conn.conn()).await?;
+        if rows >= 1 {
+            conn.release_to_pool();
+            return Ok(RetryVerdict::Applied);
+        }
+        // 0 rows: classify on row evidence before deciding anything.
+        let probe: CommitProbe = sqlx::query_as(COMMIT_PROBE_SQL)
+            .fetch_one(&mut **conn.conn())
+            .await?;
         conn.release_to_pool();
-        Ok(rows)
+        let verdict = classify_zero_row_retry(commit, expected_epoch, &probe);
+        match verdict {
+            RetryVerdict::OwnCommitLanded => {
+                tracing::info!(
+                    expected_epoch,
+                    observed_epoch = probe.cycle_epoch,
+                    echo_matched = true,
+                    "gc-collect: epoch-guarded retry matched 0 rows because OUR \
+                     commit already landed (response lost); recognized by payload echo"
+                );
+            }
+            RetryVerdict::ForeignWinner => {
+                // The pre-fix unconditional claim survives ONLY here,
+                // now evidenced (epoch at expected+1, foreign payload).
+                tracing::warn!(
+                    expected_epoch,
+                    observed_epoch = probe.cycle_epoch,
+                    echo_matched = false,
+                    "gc-collect: another holder committed first; cycle stamp lost"
+                );
+            }
+            RetryVerdict::Unprovable => {
+                tracing::warn!(
+                    expected_epoch,
+                    observed_epoch = probe.cycle_epoch,
+                    echo_matched = false,
+                    "gc-collect: 0-row retry unclassifiable (epoch not at expected+1); \
+                     commit indeterminate"
+                );
+            }
+            RetryVerdict::Applied => {
+                unreachable!("classification never yields Applied")
+            }
+        }
+        Ok(verdict)
     }
 
     /// The one commit statement, parameterized by an optional epoch

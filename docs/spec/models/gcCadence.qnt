@@ -1,14 +1,16 @@
 // gcCadence.qnt — the backstop's ATTEMPT-CADENCE and COMMIT-GATES-OK
 // laws (bughunt-4 S4: bug_284 + merged_bug_218,
-// store.gc.collect-cadence+2; `rio-store/src/gc/{collect,state}.rs`
-// `stamp_attempt` / `CycleCommitted`).
-// quint-policy-latches: ranEarly
+// store.gc.collect-cadence+3; `rio-store/src/gc/{collect,state}.rs`
+// `stamp_attempt` / `CycleCommitted`), extended with the bughunt-5 S7
+// COMMIT-CLASSIFICATION axis (merged_bug_022: witness at the
+// durability point, three-valued attribution, own-commit recognition).
+// quint-policy-latches: ranEarly, falseLost
 
 // ===========================================================================
 // CADENCE + COMMIT-WITNESS LAWS (bughunt-4 S4: bug_284 + merged_bug_218,
-// store.gc.collect-cadence+2).
+// store.gc.collect-cadence+3).
 //
-// Two laws of the backstop loop:
+// Laws of the backstop loop:
 //
 //  1. ATTEMPT-CADENCE: heavy cycles are spaced at least INTERVAL apart
 //     for ALL outcome arms. The attempt stamp is written BEFORE the
@@ -22,7 +24,16 @@
 //     commit (the CycleCommitted witness). Pre-fix the tick ran inside
 //     the cycle, before commit_cycle: a lost commit (idle-killed lock
 //     session) left metrics green while stamp/cursor/backlog were
-//     gone.
+//     gone. Strengthened by the round-5 axis: a recognized
+//     response-lost commit and a coincidence-recognized foreign commit
+//     both tick ok only WITH a landed commit in the same step.
+//
+//  3. ATTRIBUTION-PARTITION + NO-FALSE-LOST (bughunt-5 S7,
+//     merged_bug_022): every drained cycle ticks exactly one of
+//     ok | commit_failed | commit_indeterminate, and commit_failed
+//     requires PROOF of loss - the as-built 0-row collapse ("another
+//     holder committed first", unconditional) and the post-commit
+//     release-? shape both reported durably-landed commits as lost.
 //
 // DEDICATED module (gcDrainPass precedent): the time/cadence axis must
 // not multiply the commit-basis or drain-pass regimes.
@@ -45,6 +56,26 @@ module gcCadence {
   /// regardless of) the commit landing.
   const CALIB_TICK_BEFORE_COMMIT: bool
 
+  /// Round-5 axis gate (merged_bug_022): enables the commit step's
+  /// full shape alphabet — response loss, foreign-live/foreign-shadow
+  /// interleave after lock-session death, payload coincidence — and
+  /// the three-valued attribution. Default-FALSE so the pre-extension
+  /// regimes stay state-space-identical (their new vars evolve as
+  /// pure functions of the legacy trajectory).
+  const COMMIT_CLASSIFY: bool
+
+  /// CALIBRATION ONLY (`gcCadenceCalibZeroRowsClaimsForeign`): the
+  /// as-built 0-row retry collapse — every 0-row or errored retry is
+  /// unconditionally attributed "another holder committed first"
+  /// (commit_failed), even when the row carries OUR OWN landed write.
+  const CALIB_ZERO_ROWS_FOREIGN: bool
+
+  /// CALIBRATION ONLY (`gcCadenceCalibReleaseFailsCommit`): the
+  /// as-built post-commit release-`?` shape — a landed commit whose
+  /// lock release fails is reported lost (the witness was minted
+  /// after the release instead of at the durability point).
+  const CALIB_RELEASE_FAILS: bool
+
   var time: int
   /// Success stamp: last COMMITTED live cycle (-1 = never). The
   /// stalled alert keys on this; aborts never write it.
@@ -64,11 +95,33 @@ module gcCadence {
   var aborts: int
   /// outcome="ok" ticks emitted.
   var okTicks: int
-  /// Durable commits that actually landed (cycle_epoch advances).
+  /// Durable commits that actually landed (cycle_epoch advances) —
+  /// OURS and foreign interleaves alike (the epoch counter).
   var committedEpochs: int
-  /// Lost commits (drained cycle, commit failed) — non-vacuity
+  /// OUR commits that did not land (ground truth) — non-vacuity
   /// observable.
   var lostCommits: int
+  /// Drained (non-abort) heavy cycles — the attribution domain.
+  var drainedCycles: int
+  /// outcome="commit_failed" ticks emitted (attribution, distinct
+  /// from the lostCommits ground truth).
+  var lostTicks: int
+  /// outcome="commit_indeterminate" ticks emitted.
+  var indeterminateTicks: int
+  /// Response-lost commits recognized as our own by payload echo —
+  /// non-vacuity observable for the recognition path.
+  var responseLostRecognized: int
+  /// Foreign winners PROVEN by row evidence (epoch at expected+1,
+  /// mismatched payload) — non-vacuity observable.
+  var provenForeign: int
+  /// ok ticks earned through the documented payload-coincidence
+  /// residual (byte-identical foreign LIVE commit recognized as ours;
+  /// globally sound — the foreign commit IS landed — misattributed
+  /// per-replica only).
+  var coincidenceOks: int
+  /// LATCH: a commit_failed tick fired for a cycle whose OWN commit
+  /// landed (the false-lost shape merged_bug_022 retires).
+  var falseLost: bool
 
   action init = all {
     time' = 0,
@@ -82,6 +135,13 @@ module gcCadence {
     okTicks' = 0,
     committedEpochs' = 0,
     lostCommits' = 0,
+    drainedCycles' = 0,
+    lostTicks' = 0,
+    indeterminateTicks' = 0,
+    responseLostRecognized' = 0,
+    provenForeign' = 0,
+    coincidenceOks' = 0,
+    falseLost' = false,
   }
 
   /// A check tick with nothing due (or no check): time advances.
@@ -97,6 +157,13 @@ module gcCadence {
     okTicks' = okTicks,
     committedEpochs' = committedEpochs,
     lostCommits' = lostCommits,
+    drainedCycles' = drainedCycles,
+    lostTicks' = lostTicks,
+    indeterminateTicks' = indeterminateTicks,
+    responseLostRecognized' = responseLostRecognized,
+    provenForeign' = provenForeign,
+    coincidenceOks' = coincidenceOks,
+    falseLost' = falseLost,
   }
 
   /// The human repairs the corrupt manifest.
@@ -112,6 +179,13 @@ module gcCadence {
     okTicks' = okTicks,
     committedEpochs' = committedEpochs,
     lostCommits' = lostCommits,
+    drainedCycles' = drainedCycles,
+    lostTicks' = lostTicks,
+    indeterminateTicks' = indeterminateTicks,
+    responseLostRecognized' = responseLostRecognized,
+    provenForeign' = provenForeign,
+    coincidenceOks' = coincidenceOks,
+    falseLost' = falseLost,
   }
 
   /// Corruption appears (an aborted upload lands a bad chunk_list).
@@ -127,6 +201,13 @@ module gcCadence {
     okTicks' = okTicks,
     committedEpochs' = committedEpochs,
     lostCommits' = lostCommits,
+    drainedCycles' = drainedCycles,
+    lostTicks' = lostTicks,
+    indeterminateTicks' = indeterminateTicks,
+    responseLostRecognized' = responseLostRecognized,
+    provenForeign' = provenForeign,
+    coincidenceOks' = coincidenceOks,
+    falseLost' = falseLost,
   }
 
   /// The due predicate. REAL: success-stale AND attempt-stale.
@@ -140,10 +221,69 @@ module gcCadence {
     },
   }
 
+  // --- the round-5 commit-step shape alphabet (COMMIT_CLASSIFY) -----------
+  //
+  // shape: 0 appliedClean (primary applied, response received)
+  //        1 appliedReleaseFails (applied; post-commit release fails)
+  //        2 appliedResponseLost (applied; response lost - session died)
+  //        3 notApplied (primary failed before applying)
+  // foreignArm (consulted for shapes 2 and 3 - the advisory lock died
+  //        with the session, another replica can commit before our
+  //        retry): 0 none, 1 live, 2 shadow
+  // coincide: the documented benign residual - a byte-identical
+  //        foreign LIVE commit whose payload echo matches ours
+  // retryWorks: for shape 3 with no foreign winner - does the
+  //        epoch-guarded retry apply (true) or error (false)?
+
+  /// Did OUR commit land (ground truth)?
+  pure def ourCommitLands(shape: int, foreignArm: int, retryWorks: bool): bool = or {
+    shape == 0,
+    shape == 1,
+    shape == 2,
+    and { shape == 3, foreignArm == 0, retryWorks },
+  }
+
+  /// Did a FOREIGN commit land in the retry window?
+  pure def foreignWins(shape: int, foreignArm: int): bool = and {
+    or { shape == 2, shape == 3 },
+    foreignArm != 0,
+  }
+
+  /// The attribution the code under the active calibration emits:
+  /// 0 = ok, 1 = commit_failed, 2 = commit_indeterminate.
+  /// Post-fix (both round-5 CALIB flags false) this is the
+  /// merged_bug_022 classifier: witness at the durability point
+  /// (shapes 0/1 -> ok), own-echo recognition (shape 2, no foreign ->
+  /// ok), interleaved epochs unprovable (shape 2 with foreign ->
+  /// indeterminate), retry-applied -> ok, retry-error ->
+  /// indeterminate, proven foreign -> commit_failed (coincidence
+  /// excepted - the documented residual).
+  def classifyAttribution(shape: int, foreignArm: int, coincide: bool, retryWorks: bool): int =
+    if (shape == 0) 0
+    else if (shape == 1) (if (CALIB_RELEASE_FAILS) 1 else 0)
+    else if (shape == 2) (
+      if (CALIB_ZERO_ROWS_FOREIGN) 1
+      else if (foreignArm == 0) 0
+      else 2
+    )
+    else (
+      if (foreignArm == 0) (
+        if (retryWorks) 0
+        else if (CALIB_ZERO_ROWS_FOREIGN) 1
+        else 2
+      )
+      else if (foreignArm == 1) (
+        if (CALIB_ZERO_ROWS_FOREIGN) 1
+        else if (coincide) 0
+        else 1
+      )
+      else 1
+    )
+
   /// A backstop check finds the cluster due and runs the heavy cycle.
   /// The attempt stamp is written FIRST (every arm inherits it); the
   /// outcome splits on corruption and, for drained cycles, on the
-  /// commit landing.
+  /// commit fate.
   action backstopFires = all {
     due(time),
     time < MAX_TIME,
@@ -166,20 +306,87 @@ module gcCadence {
       okTicks' = okTicks,
       committedEpochs' = committedEpochs,
       lostCommits' = lostCommits,
+      drainedCycles' = drainedCycles,
+      lostTicks' = lostTicks,
+      indeterminateTicks' = indeterminateTicks,
+      responseLostRecognized' = responseLostRecognized,
+      provenForeign' = provenForeign,
+      coincidenceOks' = coincidenceOks,
+      falseLost' = falseLost,
     } else all {
-      // Drained cycle: the commit lands or is lost (idle-killed lock
-      // session; the epoch-guarded retry also failed).
-      nondet commitLands = Set(true, false).oneOf()
-      all {
-        committedEpochs' = if (commitLands) committedEpochs + 1 else committedEpochs,
-        lastLive' = if (commitLands) time else lastLive,
-        lostCommits' = if (commitLands) lostCommits else lostCommits + 1,
-        okTicks' =
-          if (CALIB_TICK_BEFORE_COMMIT) okTicks + 1
-          else if (commitLands) okTicks + 1
-          else okTicks,
-      },
       aborts' = aborts,
+      drainedCycles' = drainedCycles + 1,
+      if (COMMIT_CLASSIFY) {
+        // Round-5 axis (merged_bug_022): the full commit-step shape
+        // alphabet. Unconsulted nondets for a shape are still picked
+        // (TLA+ style) but do not change the updates.
+        nondet shape = Set(0, 1, 2, 3).oneOf()
+        nondet foreignArm = Set(0, 1, 2).oneOf()
+        nondet coincide = Set(true, false).oneOf()
+        nondet retryWorks = Set(true, false).oneOf()
+        all {
+          committedEpochs' = committedEpochs
+            + (if (ourCommitLands(shape, foreignArm, retryWorks)) 1 else 0)
+            + (if (foreignWins(shape, foreignArm)) 1 else 0),
+          lastLive' = if (or {
+            ourCommitLands(shape, foreignArm, retryWorks),
+            and { foreignWins(shape, foreignArm), foreignArm == 1 },
+          }) time else lastLive,
+          lostCommits' = if (ourCommitLands(shape, foreignArm, retryWorks))
+            lostCommits else lostCommits + 1,
+          okTicks' = if (classifyAttribution(shape, foreignArm, coincide, retryWorks) == 0)
+            okTicks + 1 else okTicks,
+          lostTicks' = if (classifyAttribution(shape, foreignArm, coincide, retryWorks) == 1)
+            lostTicks + 1 else lostTicks,
+          indeterminateTicks' = if (classifyAttribution(shape, foreignArm, coincide, retryWorks) == 2)
+            indeterminateTicks + 1 else indeterminateTicks,
+          responseLostRecognized' = if (and {
+            shape == 2,
+            foreignArm == 0,
+            classifyAttribution(shape, foreignArm, coincide, retryWorks) == 0,
+          }) responseLostRecognized + 1 else responseLostRecognized,
+          provenForeign' = if (and {
+            shape == 3,
+            foreignArm != 0,
+            classifyAttribution(shape, foreignArm, coincide, retryWorks) == 1,
+          }) provenForeign + 1 else provenForeign,
+          coincidenceOks' = if (and {
+            shape == 3,
+            foreignArm == 1,
+            coincide,
+            classifyAttribution(shape, foreignArm, coincide, retryWorks) == 0,
+          }) coincidenceOks + 1 else coincidenceOks,
+          falseLost' = or {
+            falseLost,
+            and {
+              classifyAttribution(shape, foreignArm, coincide, retryWorks) == 1,
+              ourCommitLands(shape, foreignArm, retryWorks),
+            },
+          },
+        }
+      } else {
+        // Legacy lane (pre-round-5 regimes): binary commit fate; the
+        // round-5 vars evolve as PURE FUNCTIONS of the legacy
+        // trajectory, so the pre-extension regimes stay
+        // state-space-identical (the F16 byte-identity convention,
+        // bughunt4-fix-specs.md).
+        nondet commitLands = Set(true, false).oneOf()
+        all {
+          committedEpochs' = if (commitLands) committedEpochs + 1 else committedEpochs,
+          lastLive' = if (commitLands) time else lastLive,
+          lostCommits' = if (commitLands) lostCommits else lostCommits + 1,
+          okTicks' =
+            if (CALIB_TICK_BEFORE_COMMIT) okTicks + 1
+            else if (commitLands) okTicks + 1
+            else okTicks,
+          lostTicks' = if (commitLands) lostTicks else lostTicks + 1,
+          indeterminateTicks' = indeterminateTicks,
+          responseLostRecognized' = responseLostRecognized,
+          provenForeign' = provenForeign,
+          coincidenceOks' = coincidenceOks,
+          falseLost' = falseLost,
+        }
+      },
     },
   }
 
@@ -190,7 +397,7 @@ module gcCadence {
     backstopFires,
   }
 
-  // --- invariants (store.gc.collect-cadence+2) ----------------------------
+  // --- invariants (store.gc.collect-cadence+3) ----------------------------
 
   /// Heavy-cycle attempts are spaced at least INTERVAL apart, for ALL
   /// outcome arms. The hourly-retry twin falsifies it: with the
@@ -199,8 +406,24 @@ module gcCadence {
 
   /// outcome="ok" requires a landed commit: the tick count never
   /// exceeds the committed epoch count. The tick-before-commit twin
-  /// falsifies it on the first lost commit.
+  /// falsifies it on the first lost commit. Strengthened by the
+  /// round-5 axis: recognition oks and coincidence oks both pair with
+  /// a landed commit (ours and the foreign winner's, respectively) in
+  /// the same step.
   val okTicksRequireCommit = okTicks <= committedEpochs
+
+  /// merged_bug_022: every drained (non-abort) cycle ticks EXACTLY one
+  /// of ok | commit_failed | commit_indeterminate. The
+  /// tick-before-commit shape (ok early AND lost on the same cycle)
+  /// breaks the partition.
+  val attributionPartition = okTicks + lostTicks + indeterminateTicks == drainedCycles
+
+  /// merged_bug_022: commit_failed requires PROOF of loss — in any
+  /// trace free of the documented payload-coincidence residual, a
+  /// lost tick never fires for a cycle whose own commit landed. The
+  /// zero-rows-claims-foreign and release-fails-commit twins both
+  /// falsify it.
+  val noFalseLost = or { coincidenceOks > 0, not(falseLost) }
 
   /// Non-vacuity witness (must VIOLATE in the main regime): the
   /// fail-closed abort path is reachable — the cadence law is only
@@ -211,17 +434,33 @@ module gcCadence {
   /// lost-commit arm is reachable — the commit-gates-ok law is only
   /// meaningful if commits actually get lost.
   val noLostCommit = lostCommits == 0
+
+  /// Non-vacuity witness (must VIOLATE in the main regime): the
+  /// applied-but-response-lost RECOGNITION path is reachable — the
+  /// no-false-lost law is only meaningful if recognition actually
+  /// happens.
+  val noRecognizedResponseLost = responseLostRecognized == 0
+
+  /// Non-vacuity witness (must VIOLATE in the main regime): the
+  /// proven-foreign-winner path is reachable — commit_failed's
+  /// evidence requirement is only meaningful if foreign winners
+  /// actually occur.
+  val noProvenForeignWinner = provenForeign == 0
 }
 
 // ===========================================================================
-// CADENCE MAIN REGIME: real wiring, both laws hold.
+// CADENCE MAIN REGIME: real wiring (round-5 classifier ON), all laws
+// hold.
 // ===========================================================================
 module gcCadenceMain {
   import gcCadence(
     INTERVAL = 4,
     MAX_TIME = 12,
     CALIB_NO_ATTEMPT_GATE = false,
-    CALIB_TICK_BEFORE_COMMIT = false
+    CALIB_TICK_BEFORE_COMMIT = false,
+    COMMIT_CLASSIFY = true,
+    CALIB_ZERO_ROWS_FOREIGN = false,
+    CALIB_RELEASE_FAILS = false
   ).*
 
   /// The bug_284 red, deterministically: a corrupt store, two checks
@@ -241,6 +480,13 @@ module gcCadenceMain {
         okTicks' = 0,
         committedEpochs' = 0,
         lostCommits' = 0,
+        drainedCycles' = 0,
+        lostTicks' = 0,
+        indeterminateTicks' = 0,
+        responseLostRecognized' = 0,
+        provenForeign' = 0,
+        coincidenceOks' = 0,
+        falseLost' = false,
       })
       .then(backstopFires) // check 1: due (never attempted) -> heavy run, aborts
       .expect(all {
@@ -259,27 +505,74 @@ module gcCadenceMain {
 // ===========================================================================
 // CADENCE CALIBRATION TWIN (expect-violation): the pre-fix due
 // predicate — no attempt gate. A persistent abort re-runs on every
-// check tick; attemptCadenceBounded falsifies.
+// check tick; attemptCadenceBounded falsifies. Round-5 axis OFF:
+// state space identical to the pre-extension regime.
 // ===========================================================================
 module gcCadenceCalibHourlyRetry {
   import gcCadence(
     INTERVAL = 4,
     MAX_TIME = 12,
     CALIB_NO_ATTEMPT_GATE = true,
-    CALIB_TICK_BEFORE_COMMIT = false
+    CALIB_TICK_BEFORE_COMMIT = false,
+    COMMIT_CLASSIFY = false,
+    CALIB_ZERO_ROWS_FOREIGN = false,
+    CALIB_RELEASE_FAILS = false
   ).*
 }
 
 // ===========================================================================
 // COMMIT-WITNESS CALIBRATION TWIN (expect-violation): the pre-fix tick
 // placement — ok before the commit lands; okTicksRequireCommit
-// falsifies on the first lost commit.
+// falsifies on the first lost commit. Round-5 axis OFF: state space
+// identical to the pre-extension regime.
 // ===========================================================================
 module gcCadenceCalibTickBeforeCommit {
   import gcCadence(
     INTERVAL = 4,
     MAX_TIME = 12,
     CALIB_NO_ATTEMPT_GATE = false,
-    CALIB_TICK_BEFORE_COMMIT = true
+    CALIB_TICK_BEFORE_COMMIT = true,
+    COMMIT_CLASSIFY = false,
+    CALIB_ZERO_ROWS_FOREIGN = false,
+    CALIB_RELEASE_FAILS = false
+  ).*
+}
+
+// ===========================================================================
+// ZERO-ROWS-CLAIMS-FOREIGN CALIBRATION TWIN (expect-violation,
+// bughunt-5 S7): the as-built 0-row retry collapse — every 0-row or
+// errored retry unconditionally attributed "another holder committed
+// first" (commit_failed). An applied-but-response-lost commit (the
+// row carries OUR OWN write at expected+1) is reported lost;
+// noFalseLost falsifies. Same regime constants as the main regime.
+// ===========================================================================
+module gcCadenceCalibZeroRowsClaimsForeign {
+  import gcCadence(
+    INTERVAL = 4,
+    MAX_TIME = 12,
+    CALIB_NO_ATTEMPT_GATE = false,
+    CALIB_TICK_BEFORE_COMMIT = false,
+    COMMIT_CLASSIFY = true,
+    CALIB_ZERO_ROWS_FOREIGN = true,
+    CALIB_RELEASE_FAILS = false
+  ).*
+}
+
+// ===========================================================================
+// RELEASE-FAILS-COMMIT CALIBRATION TWIN (expect-violation, bughunt-5
+// S7): the as-built post-commit release-`?` shape — the witness was
+// minted AFTER the release instead of at the durability point, so a
+// landed commit whose lock release fails is reported lost;
+// noFalseLost falsifies. Same regime constants as the main regime.
+// ===========================================================================
+module gcCadenceCalibReleaseFailsCommit {
+  import gcCadence(
+    INTERVAL = 4,
+    MAX_TIME = 12,
+    CALIB_NO_ATTEMPT_GATE = false,
+    CALIB_TICK_BEFORE_COMMIT = false,
+    COMMIT_CLASSIFY = true,
+    CALIB_ZERO_ROWS_FOREIGN = false,
+    CALIB_RELEASE_FAILS = true
   ).*
 }

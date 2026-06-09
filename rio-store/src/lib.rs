@@ -314,20 +314,25 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_store_gc_collect_cycles_total",
         "Chunk-collect cycles by outcome (ok | parse_failure | commit_failed \
-         | error). ok ticks ONLY after the durable gc_collect_state commit \
-         lands (merged_bug_218: the tick rides the CycleCommitted witness, \
-         so metric attribution cannot diverge from the commit result); \
-         commit_failed = the cycle drained but its stamp/cursor/backlog \
-         update was lost (idle-killed lock session; one epoch-guarded retry \
-         on a fresh connection already failed). A cycle that stops at the \
-         per-cycle victim cap counts as ok; error = the cycle failed against \
-         PostgreSQL (counted by the caller: run_gc phase 3 or the backstop). \
-         Staleness of ok cycles (summed across replicas) drives the \
-         RioStoreGcCollectStalled alert. Cycles run as \
-         phase 3 of every GC run and from each replica's daily backstop \
-         timer, which arms one full interval after boot (pod boot never \
-         triggers a cycle) and skips its tick when another cycle holds the \
-         GC advisory lock."
+         | commit_indeterminate | error). ok ticks ONLY after the durable \
+         gc_collect_state commit lands (merged_bug_218: the tick rides the \
+         CycleCommitted witness, minted at the durability point per \
+         merged_bug_022, so metric attribution cannot diverge from the \
+         commit result; an applied-but-response-lost commit recognized by \
+         its own payload echo on the epoch-guarded retry is ok); \
+         commit_failed = the cycle drained and the commit is PROVEN not to \
+         have landed (a foreign winner sits at the guarded epoch+1 with a \
+         mismatched payload); commit_indeterminate = the cycle drained but \
+         neither leg could prove the outcome (retry refused/errored, or the \
+         epoch advanced past +1) -- the commit may or may not have landed. \
+         A cycle that stops at the per-cycle victim cap counts as ok; \
+         error = the cycle failed against PostgreSQL (counted by the \
+         caller: run_gc phase 3 or the backstop). Staleness of ok cycles \
+         (summed across replicas) drives the RioStoreGcCollectStalled \
+         alert. Cycles run as phase 3 of every GC run and from each \
+         replica's daily backstop timer, which arms one full interval \
+         after boot (pod boot never triggers a cycle) and skips its tick \
+         when another cycle holds the GC advisory lock."
     );
     describe_counter!(
         "rio_store_gc_collect_parse_failures_total",

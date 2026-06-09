@@ -3430,13 +3430,22 @@ rec {
     };
 
     # ── gcCadence: the backstop's ATTEMPT-CADENCE and COMMIT-GATES-OK
-    # laws (bughunt-4 S4: bug_284 + merged_bug_218,
-    # store.gc.collect-cadence+2). DEDICATED regime per the gcDrainPass
-    # precedent: the time axis must not multiply the other gc regimes.
-    # Measured (TLC exhaustive, INTERVAL=4 / MAX_TIME=12, workers=auto):
-    # 4,347 generated / 1,926 distinct, [ok] in ~1s — the default 1800s
-    # budget is >1000x the measurement.
-    # r[verify store.gc.collect-cadence+2]
+    # laws (bughunt-4 S4: bug_284 + merged_bug_218) plus the bughunt-5
+    # S7 COMMIT-CLASSIFICATION axis (merged_bug_022: witness at the
+    # durability point, three-valued attribution, own-commit
+    # recognition; store.gc.collect-cadence+3). DEDICATED regime per
+    # the gcDrainPass precedent: the time axis must not multiply the
+    # other gc regimes.
+    # Measured 2026-06-09 (TLC exhaustive, INTERVAL=4 / MAX_TIME=12,
+    # workers=4, axis ON): 74,869 generated / 12,506 distinct, [ok] in
+    # ~5s — the default 1800s budget is >300x the measurement.
+    # Byte-identity probe of the LEGACY lane (COMMIT_CLASSIFY=false,
+    # the pre-extension main bindings, F16 convention): 4,347
+    # generated / 1,926 distinct — EXACTLY the pre-extension record,
+    # so the two axis-off calibration regimes below are
+    # state-space-identical to their pre-extension selves (the round-5
+    # vars evolve as pure functions of the legacy trajectory).
+    # r[verify store.gc.collect-cadence+3]
     quint-gc-cadence = mkQuintCheck {
       name = "gc-cadence";
       spec = "gcCadence";
@@ -3444,13 +3453,15 @@ rec {
       invariants = [
         "attemptCadenceBounded"
         "okTicksRequireCommit"
+        "attributionPartition"
+        "noFalseLost"
       ];
     };
 
     # The bug_284 red, deterministically: two checks inside one
     # interval run exactly ONE heavy cycle (the second is throttled by
     # the attempt stamp) and the success stamp stays unwritten.
-    # r[verify store.gc.collect-cadence+2]
+    # r[verify store.gc.collect-cadence+3]
     quint-gc-cadence-runs = mkQuintRunCheck {
       name = "gc-cadence-runs";
       spec = "gcCadence";
@@ -3471,6 +3482,55 @@ rec {
       spec = "gcCadence";
       main = "gcCadenceMain";
       witness = "noLostCommit";
+    };
+
+    # Non-vacuity witnesses for the round-5 classification axis (must
+    # VIOLATE in the main regime): the applied-but-response-lost
+    # RECOGNITION trace and the proven-foreign-winner trace are both
+    # reachable — noFalseLost polices paths the regime actually
+    # explores. Measured: [violation] in <1s each, TLC.
+    # r[verify store.gc.collect-cadence+3]
+    quint-gc-cadence-witness-response-lost-recognized = mkQuintWitnessCheck {
+      name = "gc-cadence-witness-response-lost-recognized";
+      spec = "gcCadence";
+      main = "gcCadenceMain";
+      witness = "noRecognizedResponseLost";
+    };
+    # r[verify store.gc.collect-cadence+3]
+    quint-gc-cadence-witness-proven-foreign = mkQuintWitnessCheck {
+      name = "gc-cadence-witness-proven-foreign";
+      spec = "gcCadence";
+      main = "gcCadenceMain";
+      witness = "noProvenForeignWinner";
+    };
+
+    # CALIBRATION (expect-violation, merged_bug_022): the as-built
+    # 0-row retry collapse — every 0-row/errored retry unconditionally
+    # claims "another holder committed first", so an
+    # applied-but-response-lost commit (the row carries OUR OWN write
+    # at expected+1) is reported lost; noFalseLost falsifies. Same
+    # regime constants as the main regime. Measured: [violation] in
+    # <1s, TLC.
+    # r[verify store.gc.collect-cadence+3]
+    quint-gc-cadence-calib-zero-rows-foreign = mkQuintWitnessCheck {
+      name = "gc-cadence-calib-zero-rows-foreign";
+      spec = "gcCadence";
+      main = "gcCadenceCalibZeroRowsClaimsForeign";
+      witness = "noFalseLost";
+    };
+
+    # CALIBRATION (expect-violation, merged_bug_022): the as-built
+    # post-commit release-? shape — the witness minted AFTER the
+    # release instead of at the durability point, so a landed commit
+    # whose lock release fails is reported lost; noFalseLost
+    # falsifies. Same regime constants as the main regime. Measured:
+    # [violation] in <1s, TLC.
+    # r[verify store.gc.collect-cadence+3]
+    quint-gc-cadence-calib-release-fails = mkQuintWitnessCheck {
+      name = "gc-cadence-calib-release-fails";
+      spec = "gcCadence";
+      main = "gcCadenceCalibReleaseFailsCommit";
+      witness = "noFalseLost";
     };
 
     # CALIBRATION (expect-violation): the pre-fix due predicate —
@@ -3566,7 +3626,7 @@ rec {
     # onto one predicate); shadow commits stamp a fresh estimate
     # WITHOUT answering the cadence question; every replica publishes
     # its gauges from a 60s row read (spawn_gc_gauge_publisher).
-    # r[verify store.gc.collect-cadence+2]
+    # r[verify store.gc.collect-cadence+3]
     quint-gc-coordination-main = mkQuintCheck {
       name = "gc-coordination-main";
       spec = "chunkCollect";

@@ -184,9 +184,15 @@ pub(crate) const GRACE_HOURS_CAP: u32 = 24 * 365;
 enum Phase3Render {
     /// The cycle drained and its durable commit landed.
     Committed,
-    /// The cycle drained but the gc_collect_state commit was lost
-    /// (merged_bug_218) — stats are real, the cadence stamp is not.
+    /// The cycle drained but the gc_collect_state commit is PROVEN
+    /// lost — a foreign winner sits at expected+1 with a mismatched
+    /// payload (merged_bug_218; evidence discipline merged_bug_022) —
+    /// stats are real, the cadence stamp is not.
     CommitLost,
+    /// The cycle drained but neither commit leg could prove the
+    /// outcome (merged_bug_022): the commit may or may not have
+    /// landed. Degraded bookkeeping like CommitLost — exit 0.
+    CommitIndeterminate,
     /// Dry run whose durable observation was withheld (corrupt
     /// manifest inside the simulated-swept set, merged_bug_147).
     PreviewOnly,
@@ -210,6 +216,7 @@ impl From<&Phase3Render> for rio_common::classify::GcPhase3Outcome {
         match render {
             Phase3Render::Committed => O::Committed,
             Phase3Render::CommitLost => O::CommitLost,
+            Phase3Render::CommitIndeterminate => O::CommitIndeterminate,
             Phase3Render::PreviewOnly => O::PreviewOnly,
             Phase3Render::Suspended => O::Suspended,
             Phase3Render::Failed(_) => O::Failed,
@@ -406,28 +413,46 @@ pub async fn run_gc(
             // parse-failure abort is NOT a cycle: no stamp, the lock
             // is simply released (fail-closed; retention stays
             // visibly stalled until the manifest is repaired).
-            // merged_bug_218: ok rides the commit witness; a lost
-            // commit is commit_failed, never ok.
-            let record_commit =
-                |committed: Result<state::CycleCommitted, sqlx::Error>| match committed {
-                    Ok(w) => {
-                        w.record_ok_outcome();
-                        Phase3Render::Committed
-                    }
-                    Err(e) => {
-                        metrics::counter!(
-                            "rio_store_gc_collect_cycles_total",
-                            "outcome" => "commit_failed"
-                        )
-                        .increment(1);
-                        warn!(
-                            error = %e,
-                            "GC: collect commit lost (stamp/cursor/backlog \
-                             not updated; lock freed via session close)"
-                        );
-                        Phase3Render::CommitLost
-                    }
-                };
+            // merged_bug_218: ok rides the commit witness (minted at
+            // the durability point). merged_bug_022: the result is
+            // three-valued and consumed EXHAUSTIVELY — commit_failed
+            // means PROVEN lost (foreign winner), commit_indeterminate
+            // means unprovable either way; detailed retry evidence
+            // (expected/observed epoch, echo) is logged at the
+            // classification site in state.rs.
+            let record_commit = |committed: state::CycleCommitResult| match committed {
+                state::CycleCommitResult::Committed(w) => {
+                    w.record_ok_outcome();
+                    Phase3Render::Committed
+                }
+                state::CycleCommitResult::NotCommitted(e) => {
+                    metrics::counter!(
+                        "rio_store_gc_collect_cycles_total",
+                        "outcome" => "commit_failed"
+                    )
+                    .increment(1);
+                    warn!(
+                        error = %e,
+                        "GC: collect commit PROVEN lost to a foreign winner \
+                         (stamp/cursor/backlog not updated; lock freed via \
+                         session close)"
+                    );
+                    Phase3Render::CommitLost
+                }
+                state::CycleCommitResult::Ambiguous(e) => {
+                    metrics::counter!(
+                        "rio_store_gc_collect_cycles_total",
+                        "outcome" => "commit_indeterminate"
+                    )
+                    .increment(1);
+                    warn!(
+                        error = %e,
+                        "GC: collect commit INDETERMINATE (may or may not have \
+                         landed; see the retry classification logs)"
+                    );
+                    Phase3Render::CommitIndeterminate
+                }
+            };
             phase3 = match report.outcome {
                 collect::CollectOutcome::Ok => {
                     if params.dry_run {
@@ -569,6 +594,11 @@ fn render_phase3(phase3: &Phase3Render, dry_run: bool, stats: &GcStats) -> Strin
         Phase3Render::Committed => success_summary(),
         Phase3Render::CommitLost => format!(
             "{}; collect-state commit LOST (cadence stamp not updated; see server logs)",
+            success_summary()
+        ),
+        Phase3Render::CommitIndeterminate => format!(
+            "{}; collect-state commit INDETERMINATE (may or may not have landed; \
+             see server logs)",
             success_summary()
         ),
         Phase3Render::PreviewOnly => format!(
@@ -951,6 +981,7 @@ mod tests {
         let variants = [
             Phase3Render::Committed,
             Phase3Render::CommitLost,
+            Phase3Render::CommitIndeterminate,
             Phase3Render::PreviewOnly,
             Phase3Render::Suspended,
             Phase3Render::Failed("db timeout".into()),
@@ -960,6 +991,7 @@ mod tests {
             match v {
                 Phase3Render::Committed
                 | Phase3Render::CommitLost
+                | Phase3Render::CommitIndeterminate
                 | Phase3Render::PreviewOnly
                 | Phase3Render::Suspended
                 | Phase3Render::Failed(_) => {}

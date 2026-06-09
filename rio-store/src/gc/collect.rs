@@ -1297,7 +1297,7 @@ async fn run_post_drain_tail(mut conn: super::lock::SessionConn, grace_secs: i64
 /// pre-check race to one lease; the loser skips; the winner re-checks
 /// so a cycle that JUST committed is not repeated). Returns `Ok(None)`
 /// when not due or when another holder has the lease.
-// r[impl store.gc.collect-cadence+2]
+// r[impl store.gc.collect-cadence+3]
 pub(crate) async fn collect_backstop_once(
     pool: &PgPool,
     chunk_backend: Option<&Arc<dyn ChunkBackend>>,
@@ -1353,8 +1353,10 @@ pub(crate) async fn collect_backstop_once(
                         })
                         .await
                     {
-                        Ok(committed) => committed.record_ok_outcome(),
-                        Err(e) => {
+                        super::state::CycleCommitResult::Committed(committed) => {
+                            committed.record_ok_outcome()
+                        }
+                        super::state::CycleCommitResult::NotCommitted(e) => {
                             metrics::counter!(
                                 "rio_store_gc_collect_cycles_total",
                                 "outcome" => "commit_failed"
@@ -1362,8 +1364,23 @@ pub(crate) async fn collect_backstop_once(
                             .increment(1);
                             warn!(
                                 error = %e,
-                                "chunk-collect backstop: cycle drained but the \
-                                 commit was lost (stamp/cursor/backlog not updated)"
+                                "chunk-collect backstop: cycle drained but the commit \
+                                 was PROVEN lost to a foreign winner (stamp/cursor/\
+                                 backlog not updated; evidence in the retry \
+                                 classification logs)"
+                            );
+                        }
+                        super::state::CycleCommitResult::Ambiguous(e) => {
+                            metrics::counter!(
+                                "rio_store_gc_collect_cycles_total",
+                                "outcome" => "commit_indeterminate"
+                            )
+                            .increment(1);
+                            warn!(
+                                error = %e,
+                                "chunk-collect backstop: cycle drained but the commit \
+                                 outcome is INDETERMINATE (may or may not have landed; \
+                                 evidence in the retry classification logs)"
                             );
                         }
                     }
@@ -1574,7 +1591,7 @@ mod tests {
                 observation: report.durable.expect("Ok cycle carries an observation"),
             })
             .await
-            .unwrap()
+            .expect_committed("test choreography requires a landed commit")
             .record_ok_outcome();
         let row = super::super::state::read_state_unlocked(&db.pool)
             .await
@@ -2411,7 +2428,7 @@ mod tests {
             .unwrap();
     }
 
-    // r[verify store.gc.collect-cadence+2]
+    // r[verify store.gc.collect-cadence+3]
     /// bug_174: the backstop is CLUSTER-cadenced via the durable row.
     /// Two consecutive checks ⇒ the first runs a live cycle (never-ran
     /// cluster: last_live_cycle_at NULL = due) and stamps the row; the
@@ -2466,7 +2483,7 @@ mod tests {
         );
     }
 
-    // r[verify store.gc.collect-cadence+2]
+    // r[verify store.gc.collect-cadence+3]
     /// A live run_gc stamps the durable row, so the backstop\'s next
     /// check skips: GC-schedule runs and the backstop share ONE
     /// cluster cadence.
@@ -2630,57 +2647,6 @@ mod tests {
         );
     }
 
-    /// merged_bug_218: outcome="ok" must mean "the durable commit
-    /// landed". Pre-fix the ok tick ran inside collect_cycle BEFORE
-    /// commit_cycle; a commit failure (the lock connection sits idle
-    /// through the whole multi-minute cycle -- exactly what
-    /// pgbouncer/NLB idle killers sever) propagated to warn-only
-    /// handlers: metrics green, stamp/cursor/backlog lost, and the
-    /// next backstop re-ran the full mark expansion.
-    #[tokio::test]
-    async fn failing_commit_ticks_commit_failed_not_ok() {
-        let db = TestDb::new(&crate::MIGRATOR).await;
-        reset_collector_state(&db.pool).await;
-        let backend: Arc<dyn ChunkBackend> = mem_backend();
-        let rec = CountingRecorder::default();
-        let _g = metrics::set_default_local_recorder(&rec);
-
-        seed_collectable_chunks(&db.pool, 3, 100).await;
-
-        // Fail the primary commit AND the epoch-guarded retry.
-        super::super::state::COMMIT_FAIL_INJECT.store(2, std::sync::atomic::Ordering::SeqCst);
-        let report = collect_backstop_once(
-            &db.pool,
-            Some(&backend),
-            super::super::sweep::CHUNK_GRACE_SECS,
-        )
-        .await
-        .expect("backstop check runs")
-        .expect("due -> cycle ran");
-        assert_eq!(
-            report.outcome,
-            CollectOutcome::Ok,
-            "the cycle itself drained"
-        );
-
-        assert_eq!(
-            rec.get("rio_store_gc_collect_cycles_total{outcome=ok}"),
-            0,
-            "a cycle whose commit was lost must NOT tick ok"
-        );
-        assert_eq!(
-            rec.get("rio_store_gc_collect_cycles_total{outcome=commit_failed}"),
-            1,
-            "the lost commit is visible as commit_failed"
-        );
-        let live_null: bool =
-            sqlx::query_scalar("SELECT last_live_cycle_at IS NULL FROM gc_collect_state")
-                .fetch_one(&db.pool)
-                .await
-                .unwrap();
-        assert!(live_null, "no stamp landed (metrics agree with the row)");
-    }
-
     /// merged_bug_218 resilience half: when only the lock session is
     /// dead (the common idle-kill), the epoch-guarded retry on a fresh
     /// pooled connection lands the commit -- ok ticks, stamp present,
@@ -2696,7 +2662,7 @@ mod tests {
         seed_collectable_chunks(&db.pool, 3, 100).await;
 
         // Fail only the primary (lock-session) commit.
-        super::super::state::COMMIT_FAIL_INJECT.store(1, std::sync::atomic::Ordering::SeqCst);
+        super::super::state::CommitFaultMode::PrimaryRefused.arm();
         let _ = collect_backstop_once(
             &db.pool,
             Some(&backend),
@@ -2723,6 +2689,459 @@ mod tests {
         .unwrap();
         assert_eq!(epoch, 1, "exactly one committed cycle");
         assert!(live_set, "the stamp landed via the retry");
+    }
+
+    // r[verify store.gc.collect-cadence+3]
+    /// merged_bug_022 red 1 (WO-S7-2): a post-commit lock-release
+    /// failure must not alter attribution - execute_commit's Ok IS the
+    /// durability point; the release is bookkeeping on an already
+    /// landed commit (lock.rs:129-140: a failed release detaches the
+    /// connection and PG frees the lock with the session). Pre-fix the
+    /// success arm ran `self.lock.release().await?` AFTER the commit
+    /// landed, so a release failure reported a durably-committed cycle
+    /// as commit_failed.
+    #[tokio::test]
+    async fn gc_commit_release_failure_keeps_ok_attribution() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        reset_collector_state(&db.pool).await;
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        seed_collectable_chunks(&db.pool, 3, 100).await;
+
+        super::super::state::CommitFaultMode::ReleaseRefused.arm();
+        let _ = collect_backstop_once(
+            &db.pool,
+            Some(&backend),
+            super::super::sweep::CHUNK_GRACE_SECS,
+        )
+        .await
+        .expect("backstop check runs")
+        .expect("due -> cycle ran");
+
+        assert_eq!(
+            rec.get("rio_store_gc_collect_cycles_total{outcome=ok}"),
+            1,
+            "a landed commit is ok regardless of the post-commit release"
+        );
+        assert_eq!(
+            rec.get("rio_store_gc_collect_cycles_total{outcome=commit_failed}"),
+            0,
+            "a release failure is not a lost commit"
+        );
+        let (epoch, live_set): (i64, bool) = sqlx::query_as(
+            "SELECT cycle_epoch, last_live_cycle_at IS NOT NULL FROM gc_collect_state",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(epoch, 1, "exactly one committed cycle");
+        assert!(live_set, "the stamp is present (the commit landed)");
+    }
+
+    // r[verify store.gc.collect-cadence+3]
+    /// merged_bug_022 red 2 (WO-S7-2): applied-but-response-lost is
+    /// OUR commit. The injected shape EXECUTES the production commit
+    /// statement on the lock session (the row lands at expected+1 with
+    /// our payload) and then loses the response; the epoch-guarded
+    /// retry necessarily matches 0 rows. Pre-fix the 0-row arm
+    /// unconditionally claimed "another holder committed first" and
+    /// returned Err - the retry could not recognize its own landed
+    /// commit. Post-fix the diagnostic read classifies on row evidence
+    /// (own-payload echo) and recognition must not re-apply: the epoch
+    /// advances EXACTLY once.
+    #[tokio::test]
+    async fn gc_commit_response_lost_recognized_as_own() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        reset_collector_state(&db.pool).await;
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        seed_collectable_chunks(&db.pool, 3, 100).await;
+
+        super::super::state::CommitFaultMode::AppliedResponseLost.arm();
+        let _ = collect_backstop_once(
+            &db.pool,
+            Some(&backend),
+            super::super::sweep::CHUNK_GRACE_SECS,
+        )
+        .await
+        .expect("backstop check runs")
+        .expect("due -> cycle ran");
+
+        assert_eq!(
+            rec.get("rio_store_gc_collect_cycles_total{outcome=ok}"),
+            1,
+            "the landed commit is recognized as our own"
+        );
+        assert_eq!(
+            rec.get("rio_store_gc_collect_cycles_total{outcome=commit_failed}"),
+            0,
+            "no false foreign-winner claim"
+        );
+        assert_eq!(
+            rec.get("rio_store_gc_collect_cycles_total{outcome=commit_indeterminate}"),
+            0,
+            "own-payload echo is proof, not ambiguity"
+        );
+        let (epoch, live_set): (i64, bool) = sqlx::query_as(
+            "SELECT cycle_epoch, last_live_cycle_at IS NOT NULL FROM gc_collect_state",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(epoch, 1, "recognition must not re-apply the commit");
+        assert!(live_set, "the stamp is present");
+    }
+
+    // r[verify store.gc.collect-cadence+3]
+    /// merged_bug_022 red 3 (WO-S7-2): when neither leg can prove
+    /// whether the commit landed (primary refused, retry refused), the
+    /// outcome is INDETERMINATE - not the definitive commit_failed the
+    /// pre-fix collapse reported. Re-posture of the retired
+    /// `failing_commit_ticks_commit_failed_not_ok`: commit_failed now
+    /// means PROVEN not landed (foreign winner at expected+1 with a
+    /// mismatched payload); an unprovable outcome gets its own label.
+    #[tokio::test]
+    async fn gc_commit_unprovable_ticks_indeterminate() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        reset_collector_state(&db.pool).await;
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        seed_collectable_chunks(&db.pool, 3, 100).await;
+
+        super::super::state::CommitFaultMode::PrimaryAndRetryRefused.arm();
+        let report = collect_backstop_once(
+            &db.pool,
+            Some(&backend),
+            super::super::sweep::CHUNK_GRACE_SECS,
+        )
+        .await
+        .expect("backstop check runs")
+        .expect("due -> cycle ran");
+        assert_eq!(
+            report.outcome,
+            CollectOutcome::Ok,
+            "the cycle itself drained"
+        );
+
+        assert_eq!(
+            rec.get("rio_store_gc_collect_cycles_total{outcome=commit_indeterminate}"),
+            1,
+            "an unprovable commit is disclosed as indeterminate"
+        );
+        assert_eq!(
+            rec.get("rio_store_gc_collect_cycles_total{outcome=commit_failed}"),
+            0,
+            "commit_failed is reserved for PROVEN foreign winners"
+        );
+        assert_eq!(
+            rec.get("rio_store_gc_collect_cycles_total{outcome=ok}"),
+            0,
+            "no witness, no ok"
+        );
+        let live_null: bool =
+            sqlx::query_scalar("SELECT last_live_cycle_at IS NULL FROM gc_collect_state")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(live_null, "no stamp landed");
+    }
+
+    // r[verify store.gc.collect-cadence+3]
+    /// merged_bug_022 polarity guard (DISCLOSED, not a behavioral red:
+    /// pre-fix this shape also labeled commit_failed, by COLLAPSE
+    /// rather than proof — the value here is pinning the post-fix
+    /// partition so proven-foreign can never degrade to
+    /// indeterminate). PrimaryRefused plus a REAL foreign commit
+    /// minted through the production statement
+    /// (state::commit_foreign_for_test routes execute_commit — Q1
+    /// witness provenance, never hand-rolled SQL) at expected_epoch:
+    /// the foreign row sits at expected+1 with a foreign (shadow)
+    /// payload, our retry matches 0 rows, and the diagnostic read
+    /// PROVES the loss (a shadow never stamps last_live_cycle_at, so
+    /// the temporal echo conjunct fails).
+    ///
+    /// Drives the production consumption arm via commit_cycle's
+    /// result observed exactly as collect_backstop_once's match does;
+    /// the interleave (foreign commit between lease-read and retry)
+    /// is not expressible through the backstop entrypoint without
+    /// widening the fault alphabet beyond the production shapes.
+    #[tokio::test]
+    async fn gc_commit_foreign_winner_ticks_commit_failed() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        reset_collector_state(&db.pool).await;
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+        seed_collectable_chunks(&db.pool, 3, 100).await;
+
+        // Our lease reads expected_epoch = 0.
+        let mut lease = super::super::state::GcCycleLease::try_acquire(&db.pool)
+            .await
+            .unwrap()
+            .expect("lock free");
+        lease.stamp_attempt().await.unwrap();
+
+        // Our intended LIVE commit, minted by a real cycle.
+        let ours = collect_cycle(
+            &db.pool,
+            None,
+            super::super::sweep::CHUNK_GRACE_SECS,
+            CollectMode::Live,
+            None,
+        )
+        .await
+        .expect("live cycle");
+        assert_eq!(ours.outcome, CollectOutcome::Ok);
+
+        // The foreign winner lands FIRST (between our epoch read and
+        // our retry), through the production statement: a SHADOW
+        // commit whose payload is not ours.
+        let foreign = collect_cycle(
+            &db.pool,
+            None,
+            super::super::sweep::CHUNK_GRACE_SECS,
+            CollectMode::Shadow {
+                simulated_swept: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .expect("foreign shadow cycle");
+        let rows = super::super::state::commit_foreign_for_test(
+            &db.pool,
+            &super::super::state::CycleCommit::Shadow {
+                observation: foreign.durable.expect("Ok cycle carries an observation"),
+            },
+        )
+        .await
+        .expect("foreign commit lands");
+        assert_eq!(rows, 1, "the foreign commit applied (epoch 0 -> 1)");
+
+        // Our primary is refused; the epoch-guarded retry runs for
+        // real, matches 0 rows, and the diagnostic read proves the
+        // foreign winner.
+        super::super::state::CommitFaultMode::PrimaryRefused.arm();
+        let result = lease
+            .commit_cycle(super::super::state::CycleCommit::Live {
+                disposition: ours
+                    .disposition
+                    .clone()
+                    .expect("live Ok report carries a disposition"),
+                victims_collected: ours.victims_collected,
+                observation: ours.durable.expect("Ok cycle carries an observation"),
+            })
+            .await;
+
+        // The production consumption arms (same closure set as
+        // collect_backstop_once's exhaustive match).
+        match result {
+            super::super::state::CycleCommitResult::Committed(w) => w.record_ok_outcome(),
+            super::super::state::CycleCommitResult::NotCommitted(_) => {
+                metrics::counter!(
+                    "rio_store_gc_collect_cycles_total",
+                    "outcome" => "commit_failed"
+                )
+                .increment(1);
+            }
+            super::super::state::CycleCommitResult::Ambiguous(_) => {
+                metrics::counter!(
+                    "rio_store_gc_collect_cycles_total",
+                    "outcome" => "commit_indeterminate"
+                )
+                .increment(1);
+            }
+        }
+
+        assert_eq!(
+            rec.get("rio_store_gc_collect_cycles_total{outcome=commit_failed}"),
+            1,
+            "a proven foreign winner is commit_failed"
+        );
+        assert_eq!(
+            rec.get("rio_store_gc_collect_cycles_total{outcome=commit_indeterminate}"),
+            0,
+            "proof must not degrade to indeterminate"
+        );
+        assert_eq!(rec.get("rio_store_gc_collect_cycles_total{outcome=ok}"), 0);
+        let (epoch, live_null): (i64, bool) =
+            sqlx::query_as("SELECT cycle_epoch, last_live_cycle_at IS NULL FROM gc_collect_state")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(epoch, 1, "only the foreign commit landed");
+        assert!(
+            live_null,
+            "the foreign SHADOW never stamps the live cadence"
+        );
+    }
+
+    // r[verify store.gc.collect-cadence+3]
+    /// merged_bug_022: the 0-row retry classification table, pinned
+    /// row by row (the classify.rs/bug_178 alphabet style). The
+    /// CycleCommit payloads are minted by REAL cycles (production
+    /// constructors); the probe rows are the input alphabet under
+    /// test.
+    #[tokio::test]
+    async fn zero_row_retry_classification_alphabet() {
+        use super::super::state::{
+            CommitProbe, CycleCommit, RetryVerdict, classify_zero_row_retry,
+        };
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        reset_collector_state(&db.pool).await;
+        seed_collectable_chunks(&db.pool, 2, 100).await;
+
+        // Production-minted payloads: one live, one shadow.
+        let live_report = collect_cycle(
+            &db.pool,
+            None,
+            super::super::sweep::CHUNK_GRACE_SECS,
+            CollectMode::Live,
+            None,
+        )
+        .await
+        .expect("live cycle");
+        let live = CycleCommit::Live {
+            disposition: live_report
+                .disposition
+                .clone()
+                .expect("live Ok report carries a disposition"),
+            victims_collected: live_report.victims_collected,
+            observation: live_report
+                .durable
+                .expect("Ok cycle carries an observation"),
+        };
+        let mark_set = live_report.mark_set_size as i64;
+
+        let shadow_report = collect_cycle(
+            &db.pool,
+            None,
+            super::super::sweep::CHUNK_GRACE_SECS,
+            CollectMode::Shadow {
+                simulated_swept: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .expect("shadow cycle");
+        let would = shadow_report.would_collect as i64;
+        let shadow_mark = shadow_report.mark_set_size as i64;
+        let shadow = CycleCommit::Shadow {
+            observation: shadow_report
+                .durable
+                .expect("Ok cycle carries an observation"),
+        };
+
+        // The live full-scan pass commits cursor = NULL.
+        let own_live_echo = CommitProbe {
+            cycle_epoch: 1,
+            cursor: None,
+            backlog_estimate: Some(0),
+            last_mark_set_size: Some(mark_set),
+            last_would_collect: None,
+            live_stamped: true,
+            live_at_or_after_attempt: true,
+        };
+        let table: Vec<(&str, &CycleCommit, CommitProbe, RetryVerdict)> = vec![
+            (
+                "live own echo at expected+1 -> own commit landed",
+                &live,
+                own_live_echo.clone(),
+                RetryVerdict::OwnCommitLanded,
+            ),
+            (
+                "epoch == expected (impossible after a 0-row guarded UPDATE) -> unprovable",
+                &live,
+                CommitProbe {
+                    cycle_epoch: 0,
+                    ..own_live_echo.clone()
+                },
+                RetryVerdict::Unprovable,
+            ),
+            (
+                "epoch past expected+1 (interleaved commits) -> unprovable",
+                &live,
+                CommitProbe {
+                    cycle_epoch: 2,
+                    ..own_live_echo.clone()
+                },
+                RetryVerdict::Unprovable,
+            ),
+            (
+                "cursor mismatch at expected+1 -> proven foreign",
+                &live,
+                CommitProbe {
+                    cursor: Some(vec![0xAA; 32]),
+                    ..own_live_echo.clone()
+                },
+                RetryVerdict::ForeignWinner,
+            ),
+            (
+                "mark-set mismatch at expected+1 -> proven foreign",
+                &live,
+                CommitProbe {
+                    last_mark_set_size: Some(mark_set + 7),
+                    ..own_live_echo.clone()
+                },
+                RetryVerdict::ForeignWinner,
+            ),
+            (
+                "live stamp absent (foreign SHADOW won) -> proven foreign",
+                &live,
+                CommitProbe {
+                    live_stamped: false,
+                    live_at_or_after_attempt: false,
+                    ..own_live_echo.clone()
+                },
+                RetryVerdict::ForeignWinner,
+            ),
+            (
+                "stale live stamp BEFORE our attempt (foreign shadow over old row) -> proven foreign",
+                &live,
+                CommitProbe {
+                    live_at_or_after_attempt: false,
+                    ..own_live_echo.clone()
+                },
+                RetryVerdict::ForeignWinner,
+            ),
+            (
+                "shadow own echo at expected+1 -> own commit landed",
+                &shadow,
+                CommitProbe {
+                    cycle_epoch: 1,
+                    cursor: None,
+                    backlog_estimate: Some(would),
+                    last_mark_set_size: Some(shadow_mark),
+                    last_would_collect: Some(would),
+                    live_stamped: false,
+                    live_at_or_after_attempt: false,
+                },
+                RetryVerdict::OwnCommitLanded,
+            ),
+            (
+                "shadow would-collect mismatch -> proven foreign",
+                &shadow,
+                CommitProbe {
+                    cycle_epoch: 1,
+                    cursor: None,
+                    backlog_estimate: Some(would + 3),
+                    last_mark_set_size: Some(shadow_mark),
+                    last_would_collect: Some(would + 3),
+                    live_stamped: false,
+                    live_at_or_after_attempt: false,
+                },
+                RetryVerdict::ForeignWinner,
+            ),
+        ];
+        for (what, commit, probe, want) in table {
+            assert_eq!(
+                classify_zero_row_retry(commit, 0, &probe),
+                want,
+                "row: {what}"
+            );
+        }
     }
 
     /// bug_284: a persistent fail-closed abort (corrupt chunk_list)
@@ -3462,7 +3881,7 @@ mod tests {
                 observation: shadow.durable.expect("Ok cycle carries an observation"),
             })
             .await
-            .unwrap()
+            .expect_committed("test choreography requires a landed commit")
             .record_ok_outcome();
         let row = super::super::state::read_state_unlocked(&db.pool)
             .await
@@ -3511,7 +3930,7 @@ mod tests {
                 observation: first.durable.expect("Ok cycle carries an observation"),
             })
             .await
-            .unwrap()
+            .expect_committed("test choreography requires a landed commit")
             .record_ok_outcome();
         assert_eq!(rec.get("rio_store_gc_collect_cycles_capped_total{}"), 1);
         let deleted_after_first: i64 =
@@ -3577,7 +3996,7 @@ mod tests {
                 observation: second.durable.expect("Ok cycle carries an observation"),
             })
             .await
-            .unwrap()
+            .expect_committed("test choreography requires a landed commit")
             .record_ok_outcome();
         let deleted_total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE deleted")
             .fetch_one(&db.pool)

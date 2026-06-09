@@ -1529,7 +1529,7 @@ too large, and the backstop cadence paced against the counterfactual
 invariants; its calibration twin re-wires the commit to the simulated
 products and both falsify.
 
-#r("store.gc.collect-cadence+2")[
+#r("store.gc.collect-cadence+3")[
   The collect cycle's cadence, resume cursor, and gauge sources are CLUSTER
   state, durable in the `gc_collect_state` singleton row (migrations 090,
   100), never process state. The backstop MUST run a live cycle only when
@@ -1549,9 +1549,19 @@ products and both falsify.
   the lock's session; if that session died while idle through the cycle,
   the commit is retried ONCE on a fresh connection guarded by the epoch the
   lease read at acquire, so a stale late commit no-ops instead of
-  clobbering a successor's state (merged_bug_218), and the `outcome="ok"`
-  cycle metric ticks only on a landed commit (the `CycleCommitted`
-  witness). A dry-run (shadow) cycle commits its observation WITHOUT the
+  clobbering a successor's state (merged_bug_218). The commit outcome is
+  THREE-VALUED (merged_bug_022): the `CycleCommitted` witness MUST be
+  minted at the durability point --- in the expression observing the
+  commit statement's success, before any post-commit cleanup, so a failed
+  lock release cannot alter attribution --- and a zero-row guarded retry
+  MUST be classified on row evidence read on the same fresh connection: an
+  epoch at expected+1 whose payload echoes the intended write is the
+  cycle's OWN landed commit (applied-but-response-lost; `outcome="ok"`);
+  an epoch at expected+1 with a foreign payload is a PROVEN lost commit
+  (`outcome="commit_failed"`); anything else (retry or diagnostic error,
+  epoch past +1) is `outcome="commit_indeterminate"` --- the
+  `outcome="ok"` cycle metric ticks only on a landed commit (the
+  witness), and `commit_failed` only on proof of loss. A dry-run (shadow) cycle commits its observation WITHOUT the
   live or attempt stamps. Every replica publishes
   #(refs.metric)("rio_store_gc_collect_backlog_chunks"),
   #(refs.metric)("rio_store_gc_chunks_live"), and

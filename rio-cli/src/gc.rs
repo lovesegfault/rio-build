@@ -276,6 +276,7 @@ mod tests {
         let passing = [
             "complete: 3 paths deleted, 2 chunks, 2 S3 keys enqueued, 9 bytes freed, 0 resurrected",
             "complete: 3 paths deleted; collect-state commit LOST (stats real, cadence stamp not)",
+            "complete: 3 paths deleted; collect-state commit INDETERMINATE (may or may not have landed; see server logs)",
             "dry run: would delete 3 paths",
             "already running (concurrent GC in progress)",
             "",
