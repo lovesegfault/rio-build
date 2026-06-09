@@ -313,11 +313,14 @@ pub fn describe_metrics() {
          service_verification_failed rate is the store-fleet HMAC \
          rotation-skew trace; instance_unbound — a verified store credential \
          without the Phase-B instance binding (instance-less token or \
-         claim/request instance mismatch); consumption_not_durable — the \
-         report's consumption close failed to commit durably, the NACK rides \
-         UNAVAILABLE and the store's report redelivery re-presents the SAME \
-         outcome, so a sustained rate here is a PG brownout trace, not an \
-         identity fault). \
+         claim/request instance mismatch); consumption_not_durable — a \
+         required durable write did not land and the NACK rides UNAVAILABLE: \
+         on rpc=pull_assignment the confirm-fence write-ahead failed and the \
+         exit-0 license was withheld (the pod re-pulls or exits nonzero); on \
+         rpc=report_outcome the report's consumption close failed to commit \
+         and the store's report redelivery re-presents the SAME outcome. \
+         Both are PG-brownout traces, neither an identity fault — alert on \
+         the pair). \
          A sustained rate on the identity reasons means a pod fleet holds \
          mis-bound/expired executor tokens or a key rotation skew; an \
          occasional unauthenticated blip is the documented mint-skip race \

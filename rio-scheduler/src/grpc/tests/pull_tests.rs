@@ -2007,3 +2007,67 @@ async fn fence_key_follows_the_verified_carrier() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// merged_bug_013: the pull path's fence write-ahead NACK
+/// (`ConsumptionNotDurable`) must tick the brownout counter exactly
+/// like the report path's consumption NACK — pre-fix the rejection
+/// arm lumped it into the uncounted retryable group under prose
+/// claiming it "unreachable from the pull path" (falsified by the
+/// confirm-fence write-ahead, and further by the totalized live-Gone
+/// fence), so a PG brownout's pull-side NACK wave was invisible to
+/// the advertised alert.
+///
+/// The brownout is injected at the DB layer (the fence table
+/// vanishes); the request rides the production handler and the real
+/// actor — the counter is asserted through the real recorder, no
+/// synthetic pokes.
+#[tokio::test]
+async fn pull_assignment_fence_nack_ticks_the_brownout_counter() -> anyhow::Result<()> {
+    use rio_auth::hmac::{ExecutorClaims, HmacKey};
+    use rio_proto::ExecutorService;
+    let recorder = rio_test_support::metrics::CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let (db, mut grpc, _handle, _actor_task) = setup_grpc().await;
+    let key = std::sync::Arc::new(HmacKey::from_key(
+        b"test-key-32-bytes-long-here!!!!!".to_vec(),
+    ));
+    grpc.hmac_key = Some(std::sync::Arc::clone(&key));
+
+    // The PG brownout: the fence write-ahead cannot land.
+    sqlx::query("DROP TABLE executor_confirm_fences")
+        .execute(&db.pool)
+        .await?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let token = key.sign(&ExecutorClaims {
+        intent_id: "drv-brownout".into(),
+        kind: rio_proto::types::ExecutorKind::Builder as i32,
+        expiry_unix: now + 600,
+    });
+    let err = grpc
+        .pull_assignment(Request::new(rio_proto::types::PullAssignmentRequest {
+            executor_token: token,
+            intent_id: "drv-brownout".into(),
+            confirm_only: true,
+            ..Default::default()
+        }))
+        .await
+        .expect_err("a failed fence write-ahead withholds the exit-0 license");
+    assert_eq!(
+        err.code(),
+        tonic::Code::Unavailable,
+        "ConsumptionNotDurable rides the retryable NACK class"
+    );
+    assert_eq!(
+        recorder.get(
+            "rio_scheduler_pull_rejected_total{reason=consumption_not_durable,rpc=pull_assignment}"
+        ),
+        1,
+        "the pull-side fence NACK must be visible on the brownout trace; keys: {:?}",
+        recorder.all_keys()
+    );
+    Ok(())
+}

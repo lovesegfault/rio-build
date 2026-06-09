@@ -598,6 +598,50 @@ impl CredentialRejection {
     }
 }
 
+/// THE total per-variant rejection table (merged_bug_013): the
+/// counter decision for every [`crate::actor::PullRejection`] variant
+/// × rpc label, in one exhaustive match — then delegating status text
+/// to [`super::actor_guards::pull_rejection_to_status`] (status
+/// totality stays pinned there; a new variant breaks BOTH matches at
+/// compile time). Kills the falsified "ConsumptionNotDurable is
+/// unreachable from the pull path" prose: the confirm-fence
+/// write-ahead NACKs from `pull_assignment` (and, since the
+/// merged_bug_011 totalization, so does every keyed Gone's fence
+/// write), so the pull-side NACK wave belongs on the same brownout
+/// trace as the report side's. House policy (the merged_bug_049
+/// `into_status_counted` precedent, same file): zero bare
+/// `pull_rejection_to_status` calls remain in this file — every
+/// consumer routes here.
+fn rejection_counted(r: &crate::actor::PullRejection, rpc: &'static str) -> Status {
+    use crate::actor::PullRejection as R;
+    let reason: Option<&'static str> = match r {
+        // Identity fault: a pod fleet holding mis-bound/expired
+        // tokens — the alertable identity trace.
+        R::TokenMismatch => Some("token_mismatch"),
+        // A required durable write did not land (fence write-ahead on
+        // the pull path; consumption close on the report path): the
+        // PG-brownout trace.
+        R::ConsumptionNotDurable => Some("consumption_not_durable"),
+        // Deliberately UNCOUNTED row, not an omission: leader-churn
+        // noise — every failover produces a wave of these and the
+        // balanced channel re-routes; counting them would bury the
+        // identity/brownout signals this counter alerts on.
+        R::NotLeader | R::StaleGeneration => None,
+        // Deliberately UNCOUNTED row: internal-error alerting owns
+        // this class (the status carries the detail).
+        R::Internal(_) => None,
+    };
+    if let Some(reason) = reason {
+        metrics::counter!(
+            "rio_scheduler_pull_rejected_total",
+            "rpc" => rpc,
+            "reason" => reason
+        )
+        .increment(1);
+    }
+    super::actor_guards::pull_rejection_to_status(r)
+}
+
 #[tonic::async_trait]
 impl ExecutorService for SchedulerGrpc {
     // Pull-mode dispatch surface — the only work-delivery path.
@@ -820,29 +864,10 @@ impl ExecutorService for SchedulerGrpc {
                     retry_after_seconds: retry_after_secs,
                 })
             }
-            Err(
-                r @ (crate::actor::PullRejection::NotLeader
-                | crate::actor::PullRejection::StaleGeneration
-                | crate::actor::PullRejection::ConsumptionNotDurable),
-            ) => {
-                // Retryable class (the shared mapping).
-                // ConsumptionNotDurable is unreachable from the pull
-                // path (no consumption close runs in a pull) — wired
-                // for exhaustiveness with its retryable siblings.
-                return Err(super::actor_guards::pull_rejection_to_status(&r));
-            }
-            Err(r @ crate::actor::PullRejection::TokenMismatch) => {
-                metrics::counter!(
-                    "rio_scheduler_pull_rejected_total",
-                    "rpc" => "pull_assignment",
-                    "reason" => "token_mismatch"
-                )
-                .increment(1);
-                return Err(super::actor_guards::pull_rejection_to_status(&r));
-            }
-            Err(r @ crate::actor::PullRejection::Internal(_)) => {
-                return Err(super::actor_guards::pull_rejection_to_status(&r));
-            }
+            // Every rejection routes through the one per-variant
+            // table (merged_bug_013): counter decision + status in
+            // one chokepoint call.
+            Err(r) => return Err(rejection_counted(&r, "pull_assignment")),
         };
         Ok(Response::new(rio_proto::types::PullAssignmentResponse {
             outcome: Some(outcome),
@@ -988,35 +1013,12 @@ impl ExecutorService for SchedulerGrpc {
             .map_err(|_| Status::internal("actor dropped ReportOutcome reply"))?
         {
             Ok(()) => Ok(Response::new(rio_proto::types::ReportOutcomeResponse {})),
-            Err(
-                r @ (crate::actor::PullRejection::NotLeader
-                | crate::actor::PullRejection::StaleGeneration),
-            ) => Err(super::actor_guards::pull_rejection_to_status(&r)),
-            // bug_182: the consumption close did not become durable —
-            // the NACK rides UNAVAILABLE and the store's report
-            // redelivery (600 s) re-presents the SAME outcome. Counted
-            // so a PG brownout's NACK wave is visible.
-            Err(r @ crate::actor::PullRejection::ConsumptionNotDurable) => {
-                metrics::counter!(
-                    "rio_scheduler_pull_rejected_total",
-                    "rpc" => "report_outcome",
-                    "reason" => "consumption_not_durable"
-                )
-                .increment(1);
-                Err(super::actor_guards::pull_rejection_to_status(&r))
-            }
-            Err(r @ crate::actor::PullRejection::TokenMismatch) => {
-                metrics::counter!(
-                    "rio_scheduler_pull_rejected_total",
-                    "rpc" => "report_outcome",
-                    "reason" => "token_mismatch"
-                )
-                .increment(1);
-                Err(super::actor_guards::pull_rejection_to_status(&r))
-            }
-            Err(r @ crate::actor::PullRejection::Internal(_)) => {
-                Err(super::actor_guards::pull_rejection_to_status(&r))
-            }
+            // bug_182 NACKs (the consumption close did not become
+            // durable — the store's 600 s report redelivery
+            // re-presents the SAME outcome) and every other rejection
+            // route through the one per-variant table
+            // (merged_bug_013).
+            Err(r) => Err(rejection_counted(&r, "report_outcome")),
         }
     }
 
