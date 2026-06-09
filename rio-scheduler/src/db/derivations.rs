@@ -199,6 +199,7 @@ impl SchedulerDb {
         drv_hashes: &[&str],
         status: DerivationStatus,
         latched_exec_ids: &[uuid::Uuid],
+        latched_at_epoch: f64,
         serving_generation: ServingGeneration,
     ) -> Result<FencedOutcome, sqlx::Error> {
         if drv_hashes.is_empty() && latched_exec_ids.is_empty() {
@@ -213,12 +214,23 @@ impl SchedulerDb {
         } else {
             Some(
                 sqlx::query(
+                    // merged_bug_025: the wall-clock precedence
+                    // conjunct -- a row the world advanced AFTER the
+                    // latch (resubmitted drv: Running with a newer
+                    // updated_at) refuses the replay row-locally, even
+                    // when the in-memory re-derivation could not see
+                    // it. The timestamp form is PINNED over the
+                    // status-set form: the two diverge exactly on a
+                    // newer NON-terminal durable row, which the
+                    // status-set guard would have overwritten.
                     "UPDATE derivations \
                      SET status = $2, assigned_builder_id = NULL, updated_at = now() \
-                     WHERE drv_hash = ANY($1::text[])",
+                     WHERE drv_hash = ANY($1::text[]) \
+                       AND updated_at <= to_timestamp($3)",
                 )
                 .bind(drv_hashes)
                 .bind(status.as_str())
+                .bind(latched_at_epoch)
                 .execute(tx.conn())
                 .await?,
             )

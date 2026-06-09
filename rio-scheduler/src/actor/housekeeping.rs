@@ -713,22 +713,36 @@ impl DagActor {
     /// DAG before replay (we hold the `DagAuthority` witness):
     /// - KEEP a derivation whose node still carries the latched
     ///   status (present-equal: the latch is still the truth), or
-    ///   whose node left the DAG (absent: terminal cleanup reaps only
-    ///   in-memory-terminal nodes, so the latched terminal status IS
-    ///   the node's last truth and the close must still land);
+    ///   whose node left the DAG with a TERMINAL latched status
+    ///   (absent: terminal cleanup reaps only in-memory-terminal
+    ///   nodes, so a latched terminal status IS the node's last truth
+    ///   and the close must still land);
     /// - DROP a derivation whose node is present with a DIFFERENT
     ///   status (resubmit reset or advanced): replaying the latch
     ///   would regress newer state (merged_bug_011 — a stale
     ///   Cancelled batch rewrote a resubmitted build to cancelled and
-    ///   force-closed its fresh attempt).
+    ///   force-closed its fresh attempt);
+    /// - DROP a DAG-absent derivation whose latched status is
+    ///   NON-terminal (merged_bug_025: the outbox latches Ready/Queued
+    ///   batches too — for an absent node, a non-terminal latch is
+    ///   never "the last truth": the node either completed and was
+    ///   reaped, or was cancelled away; replaying would regress the
+    ///   durable row). The close-only flush below still runs for the
+    ///   batch's latched exec_ids.
     ///
     /// The replay goes through `replay_status_batch_guarded`, whose
     /// assignment close is scoped to the LATCHED exec_ids — never the
     /// derivation — so a successor attempt is untouchable by
-    /// construction. Leader-gated by `handle_tick`; the outbox is
+    /// construction, and whose UPDATE carries the wall-clock
+    /// precedence conjunct `updated_at <= to_timestamp(latched_at)`
+    /// (merged_bug_025): a row the world advanced AFTER the latch —
+    /// including a resubmitted drv sitting Running with a newer
+    /// `updated_at`, which a status-set guard would miss — refuses
+    /// the replay row-locally even when the in-memory re-derivation
+    /// could not see it. Leader-gated by `handle_tick`; the outbox is
     /// cleared on leadership loss in `clear_persisted_state`.
     // r[impl sched.attempt.cancel-close-driven+1]
-    async fn tick_flush_status_outbox(&mut self, _authority: &super::DagAuthority) {
+    pub(super) async fn tick_flush_status_outbox(&mut self, _authority: &super::DagAuthority) {
         while let Some(front) = self.status_outbox.front() {
             let age = front.enqueued_at.elapsed();
             if age > std::time::Duration::from_secs(300) {
@@ -749,7 +763,12 @@ impl DagActor {
                 .iter()
                 .map(String::as_str)
                 .partition(|h| match self.dag.node(h) {
-                    None => true,
+                    // merged_bug_025: an absent node KEEPs only a
+                    // TERMINAL latch — the outbox latches Ready/Queued
+                    // batches too, and for a reaped/cancelled-away
+                    // node a non-terminal latch is never the last
+                    // truth.
+                    None => batch.status.is_terminal(),
                     Some(s) => s.status() == batch.status,
                 });
             if !dropped.is_empty() {
@@ -771,6 +790,7 @@ impl DagActor {
                     &kept,
                     batch.status,
                     &batch.exec_ids,
+                    batch.latched_at_epoch,
                     self.serving_generation(),
                 )
                 .await

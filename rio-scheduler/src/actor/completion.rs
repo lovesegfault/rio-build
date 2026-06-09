@@ -562,6 +562,7 @@ impl DagActor {
                     status,
                     exec_ids,
                     enqueued_at: std::time::Instant::now(),
+                    latched_at_epoch: crate::db::attempts::epoch_now(),
                 });
                 metrics::gauge!("rio_scheduler_status_outbox_depth")
                     .set(self.status_outbox.len() as f64);

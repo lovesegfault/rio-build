@@ -2448,3 +2448,55 @@ fn width_events_route_to_their_own_counters() {
          this is the delta since the first read)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Status-outbox replay precedence (merged_bug_025)
+// ---------------------------------------------------------------------------
+
+/// merged_bug_025 red A: the status-outbox flush latches NON-terminal
+/// batches too (Ready from promote/dispatch, Queued from merge). The
+/// absent-node arm KEEPs every DAG-absent drv on the "the latched
+/// terminal status IS the node's last truth" justification — which
+/// only holds for terminal latches. A latched Ready batch that
+/// outlives the node's direct successful Completed persist and
+/// terminal-cleanup reap permanently regresses the durable row
+/// (completed -> ready): wrong admin surfaces, a retention/GC row
+/// leak, and a spurious ready node on the next recovery.
+#[tokio::test]
+async fn absent_node_nonterminal_latch_must_not_regress_durable_status() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    // The durable truth: the node completed and was reaped from the
+    // DAG by terminal cleanup.
+    sqlx::query(
+        "INSERT INTO derivations (drv_hash, drv_path, pname, system, status) \
+         VALUES ($1, $2, 'pkg', 'x86_64-linux', 'completed')",
+    )
+    .bind("outbox-regress")
+    .bind(test_drv_path("outbox-regress"))
+    .execute(&db.pool)
+    .await?;
+
+    let mut actor = bare_actor(db.pool.clone());
+    // A stale NON-terminal latch for the (now DAG-absent) node.
+    actor.status_outbox.push_back(crate::actor::StatusBatch {
+        drv_hashes: vec!["outbox-regress".into()],
+        status: DerivationStatus::Ready,
+        exec_ids: vec![],
+        enqueued_at: std::time::Instant::now(),
+        latched_at_epoch: crate::db::attempts::epoch_now(),
+    });
+    let authority = actor.dag_authority().expect("always-leader test actor");
+    actor.tick_flush_status_outbox(&authority).await;
+
+    let (status,): (String,) =
+        sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = 'outbox-regress'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        status, "completed",
+        "left: {status} / right: completed (an absent-node NON-terminal \
+         latch must be dropped, never replayed over newer durable truth)"
+    );
+    Ok(())
+}

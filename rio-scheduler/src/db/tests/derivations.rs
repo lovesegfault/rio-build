@@ -602,6 +602,7 @@ async fn replay_with_all_drvs_dropped_still_closes_latched_execs() -> anyhow::Re
             &[],
             DerivationStatus::Cancelled,
             &[exec],
+            crate::db::attempts::epoch_now(),
             ServingGeneration::stamp_from_claim(1),
         )
         .await?;
@@ -617,6 +618,60 @@ async fn replay_with_all_drvs_dropped_still_closes_latched_execs() -> anyhow::Re
     assert_eq!(
         status, "cancelled",
         "latched exec row must close even when every drv was dropped"
+    );
+    Ok(())
+}
+
+/// merged_bug_025 red B — the resubmitted-non-terminal cell that PINS
+/// the timestamp form of the precedence guard over the status-set
+/// form: a drv resubmitted AFTER the latch sits Running with a newer
+/// `updated_at`. The in-memory re-derivation cannot drop it when the
+/// node was also reaped from the DAG (terminal latch keeps it), so the
+/// SQL conjunct `updated_at <= to_timestamp(latched_at)` is the
+/// row-local refusal. A status-set guard ("only overwrite rows still
+/// in X") diverges exactly here -- Running is not in any latched
+/// status set the flusher could enumerate without re-deriving, and the
+/// absolute UPDATE would regress it to the stale terminal status.
+#[tokio::test]
+async fn replay_refuses_rows_updated_after_the_latch() -> anyhow::Result<()> {
+    use crate::state::DerivationStatus;
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    insert_test_derivation(&db, "post-latch-resubmit").await?;
+    // The world advanced after the latch: the resubmitted drv is
+    // Running, updated_at = now().
+    sqlx::query(
+        "UPDATE derivations SET status = 'running', updated_at = now() \
+         WHERE drv_hash = 'post-latch-resubmit'",
+    )
+    .execute(&test_db.pool)
+    .await?;
+
+    // The latch predates the resubmit by a minute.
+    let latched_at = crate::db::attempts::epoch_now() - 60.0;
+    let outcome = db
+        .replay_status_batch_guarded(
+            &["post-latch-resubmit"],
+            DerivationStatus::Cancelled,
+            &[],
+            latched_at,
+            ServingGeneration::stamp_from_claim(1),
+        )
+        .await?;
+    assert!(
+        matches!(outcome, FencedOutcome::Applied(0)),
+        "left: {outcome:?} / right: Applied(0) (a row updated after \
+         the latch refuses the replay)"
+    );
+    let (status,): (String,) =
+        sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = 'post-latch-resubmit'")
+            .fetch_one(&test_db.pool)
+            .await?;
+    assert_eq!(
+        status, "running",
+        "left: {status} / right: running (the stale Cancelled latch \
+         must not regress the resubmitted row)"
     );
     Ok(())
 }
