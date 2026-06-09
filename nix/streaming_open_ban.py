@@ -26,6 +26,7 @@ import pathlib
 import re
 import sys
 
+import rust_strip
 from google.protobuf import descriptor_pb2
 
 DAEMON_CRATES = [
@@ -44,12 +45,14 @@ SANCTION = re.compile(r"bounded_open|with_timeout_status|with_timeout\(|transpor
 # `appendlog_drain_deadline_enforced_while_open_awaited` (rio-builder).
 ALLOW_FILES = {"rio-builder/src/log_upload.rs"}
 
-# CLASS TRAJECTORY (merged_bug_110, second repair of this byte-stripper
-# after merged_bug_072): if this scanner needs a THIRD structural
-# repair, stop patching — rebuild the strip/scan pipeline on a real
-# grammar (syn-driven extraction like xtask's retention corpus, or
-# tree-sitter). Two rounds of fail-open holes in hand-rolled lexing is
-# the recorded budget.
+# CLASS TRAJECTORY — BUDGET SPENT (merged_bug_049, the third
+# structural hole after merged_bug_072 and merged_bug_110: the
+# escaped-quote char walk halted AT the `'` of `'\''`). Per the
+# recorded budget the strip pipeline is REBUILT on the shared exact
+# lexer nix/rust_strip.py — one grammar consumed by every policy
+# scanner, with its own span/blank selftest run before any arm-level
+# selftest may gate. Escape handling can now only be wrong, and
+# fixed, in one place.
 CFG_TEST = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
 MOD_AFTER = re.compile(r"\s*(?:#\s*\[[^\]]*\]\s*)*(?:pub\s*(?:\([^)]*\)\s*)?)?mod\s+\w+\s*([;{])")
 
@@ -74,102 +77,14 @@ def banned_tokens(fds_path: str) -> set[str]:
 
 
 def strip_noncode(text: str) -> str:
-    """Blank comments (line + nested block) and string-literal CONTENTS
-    (delimiters kept), preserving every byte position — newlines
-    survive, so downstream line numbers, sanction windows, and brace
-    matching all share the source's coordinates."""
-    out = list(text)
-    n = len(text)
-
-    def blank(a: int, b: int) -> None:
-        for k in range(a, min(b, n)):
-            if out[k] != "\n":
-                out[k] = " "
-
-    i = 0
-    while i < n:
-        c = text[i]
-        nxt = text[i + 1] if i + 1 < n else ""
-        if c == "/" and nxt == "/":
-            j = text.find("\n", i)
-            j = n if j == -1 else j
-            blank(i, j)
-            i = j
-        elif c == "/" and nxt == "*":
-            depth, j = 1, i + 2
-            while j < n and depth:
-                if text.startswith("/*", j):
-                    depth += 1
-                    j += 2
-                elif text.startswith("*/", j):
-                    depth -= 1
-                    j += 2
-                else:
-                    j += 1
-            blank(i, j)
-            i = j
-        elif (c in "rb" and _raw_prefix_len(text, i)) or (c == "b" and nxt == '"'):
-            plen = _raw_prefix_len(text, i)
-            if plen:
-                # r/br + hashes + " … " + hashes
-                hashes = plen - (2 if text[i] == "b" else 1) - 1
-                close = '"' + "#" * hashes
-                k = text.find(close, i + plen)
-                k = n if k == -1 else k + len(close)
-                blank(i + plen, k - len(close))
-                i = k
-            else:
-                # b"…" — fall through to plain-string logic at the quote
-                i += 1
-        elif c == '"':
-            j = i + 1
-            while j < n:
-                if text[j] == "\\":
-                    j += 2
-                    continue
-                if text[j] == '"':
-                    break
-                j += 1
-            blank(i + 1, j)
-            i = min(j + 1, n)
-        elif c == "'":
-            # char literal vs lifetime: a lifetime is `'` + ident with
-            # no near closing quote. merged_bug_110: the body is
-            # BLANKED (delimiters kept, like the string branch) — a
-            # surviving '{' or '}' would skew strip_cfg_test_mods'
-            # brace matching and let the blanker consume trailing
-            # PRODUCTION code (fail-open truncation evasion).
-            if i + 2 < n and (text[i + 1] == "\\" or text[i + 2] == "'"):
-                j = i + 1
-                if text[j] == "\\":
-                    j += 1
-                    while j < n and text[j] != "'":
-                        j += 1
-                else:
-                    j += 1
-                blank(i + 1, j)
-                i = min(j + 1, n)
-            else:
-                i += 1
-        else:
-            i += 1
-    return "".join(out)
-
-
-def _raw_prefix_len(text: str, i: int) -> int:
-    """Length of an r/br raw-string opener at i (`r"`, `r#"`, `br##"`,
-    …) or 0 if none."""
-    j = i
-    if text[j] == "b":
-        j += 1
-    if j >= len(text) or text[j] != "r":
-        return 0
-    j += 1
-    while j < len(text) and text[j] == "#":
-        j += 1
-    if j < len(text) and text[j] == '"':
-        return j - i + 1
-    return 0
+    """Blank comments (line + nested block), string-literal CONTENTS,
+    and char-literal bodies (delimiters kept), preserving every byte
+    position — newlines survive, so downstream line numbers, sanction
+    windows, and brace matching all share the source's coordinates.
+    Thin adapter over the shared exact lexer (merged_bug_049):
+    nix/rust_strip.py owns the token grammar."""
+    blanked, _spans = rust_strip.lex(text, blank_string_bodies=True)
+    return blanked
 
 
 def strip_cfg_test_mods(stripped: str) -> str:
@@ -279,6 +194,20 @@ def selftest(pat: re.Pattern, tokens: set[str]) -> str | None:
     )
     if scan_lines("planted/pub_crate_mod.rs", pub_crate_mod, pat):
         return "an open inside a pub(crate) cfg(test) mod fired (MOD_AFTER visibility hole)"
+    # Arm 9 (merged_bug_049): an ESCAPED-QUOTE char literal `'\''`
+    # inside an inline cfg(test) mod must not skew the brace matcher
+    # into consuming the production open below the mod. The corpus
+    # carries the trigger shape verbatim: rio-builder
+    # executor/outputs.rs `rest.split('\'')`.
+    escaped_quote = preprocess(
+        "#[cfg(test)]\nmod tests {\n    fn t() { let p = ('\\'','{'); }\n}\n"
+        f"fn live() {{\n    let s = client.{t0}(req);\n}}\n"
+    )
+    if not scan_lines("planted/escaped_quote.rs", escaped_quote, pat):
+        return (
+            "an escaped-quote char literal swallowed the production open "
+            "below it (brace-skew truncation)"
+        )
     return None
 
 
@@ -290,6 +219,10 @@ def main() -> int:
         return 1
     pat = re.compile(r"\.(" + "|".join(sorted(tokens)) + r")\s*\(")
 
+    shared_err = rust_strip.selftest()
+    if shared_err:
+        print(f"FAIL: rust-strip self-test — {shared_err}", file=sys.stderr)
+        return 1
     err = selftest(pat, tokens)
     if err:
         print(f"FAIL: streaming-open-ban self-test — {err}", file=sys.stderr)

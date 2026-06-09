@@ -6,22 +6,30 @@ continuations inside .rs string literals (merged_bug_016):
 
   arm A — a single-line literal carrying an 8+ interior space run
           that is not the indent of a legitimate `\\n` template;
-  arm B — (merged_bug_193) a NON-raw literal whose interior LITERAL
-          newline is followed by an 8+ space run: the backslash was
-          dropped but the newline kept. Raw strings are intentional
-          multi-line formatting and exempt.
+  arm B — (merged_bug_193) the MIXED-continuation heuristic: a
+          NON-raw literal that uses a backslash-newline continuation
+          MID-STRING (a prose join) while ALSO carrying a BARE
+          newline — a join that lost one of its backslashes. Pure
+          bare-newline literals are the intentional multi-line house
+          style (the selftest's green SQL fixture is the pinned
+          exemplar), leading-`"\` fixture idioms are exempt, and raw
+          strings are intentional multi-line formatting.
 
-Structure, not line regexes: a lexer pass blanks comments and records
-every string-literal span (raw vs non-raw), so quote parity is exact —
-the rg prototype of arm B drowned in closing-quote/comment false
-positives (309 files) because regex cannot know which `"` opens a
-string. Per-arm planted red+green self-tests run before the real scan
-may gate (banner (b)).
+Structure, not line regexes: the SHARED exact lexer (nix/rust_strip.py,
+merged_bug_049 — one grammar for every policy scanner) blanks comments
+and records every string-literal span (raw vs non-raw), so quote
+parity is exact — the rg prototype of arm B drowned in
+closing-quote/comment false positives (309 files) because regex cannot
+know which `"` opens a string. The shared lexer's own selftest runs
+before this scanner's per-arm planted red+green self-tests, and both
+run before the real scan may gate (banner (b)).
 """
 
 import pathlib
 import re
 import sys
+
+import rust_strip
 
 RUN = re.compile(r"\S {8,}\S")
 ESCAPED_NL_INDENT = re.compile(r"\\n +")
@@ -30,86 +38,10 @@ ESCAPED_NL_INDENT = re.compile(r"\\n +")
 def lex(text: str):
     """Returns (comment_blanked_text, spans) where spans are
     (start, end, is_raw) for every string literal body (delimiters
-    excluded). Positions index into the ORIGINAL text."""
-    out = list(text)
-    spans = []
-    n = len(text)
-
-    def blank(a: int, b: int) -> None:
-        for k in range(a, min(b, n)):
-            if out[k] != "\n":
-                out[k] = " "
-
-    i = 0
-    while i < n:
-        c = text[i]
-        nxt = text[i + 1] if i + 1 < n else ""
-        if c == "/" and nxt == "/":
-            j = text.find("\n", i)
-            j = n if j == -1 else j
-            blank(i, j)
-            i = j
-        elif c == "/" and nxt == "*":
-            depth, j = 1, i + 2
-            while j < n and depth:
-                if text.startswith("/*", j):
-                    depth += 1
-                    j += 2
-                elif text.startswith("*/", j):
-                    depth -= 1
-                    j += 2
-                else:
-                    j += 1
-            blank(i, j)
-            i = j
-        elif _raw_prefix_len(text, i):
-            plen = _raw_prefix_len(text, i)
-            hashes = plen - (2 if text[i] == "b" else 1) - 1
-            close = '"' + "#" * hashes
-            k = text.find(close, i + plen)
-            k = n if k == -1 else k
-            spans.append((i + plen, k, True))
-            i = min(k + len(close), n)
-        elif c == '"':
-            j = i + 1
-            while j < n:
-                if text[j] == "\\":
-                    j += 2
-                    continue
-                if text[j] == '"':
-                    break
-                j += 1
-            spans.append((i + 1, min(j, n), False))
-            i = min(j + 1, n)
-        elif c == "'":
-            if i + 2 < n and (text[i + 1] == "\\" or text[i + 2] == "'"):
-                j = i + 1
-                if text[j] == "\\":
-                    j += 1
-                    while j < n and text[j] != "'":
-                        j += 1
-                else:
-                    j += 1
-                i = min(j + 1, n)
-            else:
-                i += 1
-        else:
-            i += 1
-    return "".join(out), spans
-
-
-def _raw_prefix_len(text: str, i: int) -> int:
-    j = i
-    if j < len(text) and text[j] == "b":
-        j += 1
-    if j >= len(text) or text[j] != "r":
-        return 0
-    j += 1
-    while j < len(text) and text[j] == "#":
-        j += 1
-    if j < len(text) and text[j] == '"':
-        return j - i + 1
-    return 0
+    excluded). Positions index into the ORIGINAL text. Thin adapter
+    over the shared exact lexer (merged_bug_049): string bodies are
+    NOT blanked — this scanner reads their interiors via the spans."""
+    return rust_strip.lex(text, blank_string_bodies=False)
 
 
 def _continued(body: str, idx: int) -> bool:
@@ -191,6 +123,20 @@ def selftest() -> str | None:
     red_c = 'let m = "joined \\\n          truly\\\\\n          escaped backslash then bare newline";\n'
     if not scan_text("p.rs", red_c):
         return "arm B escape-parity red did not fire (`\\\\` before newline mis-read as continuation)"
+    # merged_bug_049 red: an escaped-quote char literal BEFORE a
+    # garbled string. Pre-fix the char walk halted AT the escaped
+    # quote of '\'' and the stray closer phantom-consumed the next
+    # tokens — the lexer opened a phantom string at the char body and
+    # the REAL literal (its opener eaten as the phantom's closer) was
+    # never spanned, so arm A scanned nothing. Hand-trace at the old
+    # walk, positions in `('\'','"')`: open at 1, backslash at 2,
+    # walk halts at the ESCAPED quote 3 (covers only the backslash);
+    # resume at 4 = the real closer, read as a fresh char-literal
+    # opener over `,`; the `'"'` opener at 7 then starts a phantom
+    # string whose closer is the garbled literal's opening quote.
+    red_d = "let g = ('\\'','\"'); let s = \"bad          run\";\n"
+    if not scan_text("p.rs", red_d):
+        return "escaped-quote red did not fire (arm A literal lost behind a phantom span)"
     green = (
         "// comment table:   col1          col2\n"
         'let y = "rules:\\n        - alert: x";\n'
@@ -206,6 +152,10 @@ def selftest() -> str | None:
 
 
 def main() -> int:
+    shared_err = rust_strip.selftest()
+    if shared_err:
+        print(f"FAIL: rust-strip self-test — {shared_err}", file=sys.stderr)
+        return 1
     err = selftest()
     if err:
         print(f"FAIL: string-interior-spaces self-test — {err}", file=sys.stderr)

@@ -1184,6 +1184,7 @@ in
         };
         nativeBuildInputs = [ pkgs.python3 ];
         scanScript = ../nix/string_interior_spaces.py;
+        sharedLexer = ../nix/rust_strip.py;
       }
       ''
         # bughunt-3 S1 (merged_bug_193): lexer-exact string spans —
@@ -1192,10 +1193,15 @@ in
         # 8+ interior runs (minus \n-template indents). Arm B:
         # mid-string `\<LF>` continuation mixed with a BARE newline
         # (a prose join that lost a backslash); SQL bare-newline style
-        # and the leading-`"\` fixture idiom stay exempt. Per-arm
-        # planted red+green self-tests run in the script before the
-        # real scan may gate (banner (b)).
-        python3 "$scanScript" "$src" \
+        # and the leading-`"\` fixture idiom stay exempt.
+        # merged_bug_049: the token grammar lives in the SHARED exact
+        # lexer (rust_strip.py), staged beside the scanner so `import
+        # rust_strip` resolves; its span/blank selftest plus the
+        # per-arm planted red+green self-tests run in the script
+        # before the real scan may gate (banner (b)).
+        cp "$sharedLexer" rust_strip.py
+        cp "$scanScript" string_interior_spaces.py
+        python3 string_interior_spaces.py "$src" \
           rio-auth/src rio-authz-kernel/src rio-builder/src rio-cli/src \
           rio-common/src rio-controller/src rio-crds/src rio-dashboard/src \
           rio-evidence-kernel/src rio-gateway/src rio-lease/src \
@@ -1359,8 +1365,13 @@ in
           --descriptor_set_out=fds.pb \
           $src/rio-proto/proto/*.proto
 
-        # 2. Decode + scan + negative self-test.
-        python3 ${../nix/streaming_open_ban.py} fds.pb $src
+        # 2. Decode + scan + negative self-test. merged_bug_049: the
+        # token grammar lives in the SHARED exact lexer
+        # (rust_strip.py), staged beside the scanner so `import
+        # rust_strip` resolves; its selftest gates first.
+        cp ${../nix/rust_strip.py} rust_strip.py
+        cp ${../nix/streaming_open_ban.py} streaming_open_ban.py
+        python3 streaming_open_ban.py fds.pb $src
         touch $out
       '';
 
