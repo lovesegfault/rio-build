@@ -1505,6 +1505,11 @@
       "doc": ""
     },
     {
+      "name": "AckApplyError",
+      "crate": "rio-scheduler",
+      "doc": "Why an `AckSpawnedIntents` payload was NOT applied (merged_bug_005 — ack means applied under leadership). Mapped to a gRPC error by the admin layer; the controller's commit-on-Ack buffer survives an erring Ack and redelivers, which is idempotent on every plane (clears are removes, observed types upsert, marks refresh-not-step)."
+    },
+    {
       "name": "ActorError",
       "crate": "rio-scheduler",
       "doc": "Errors from the actor."

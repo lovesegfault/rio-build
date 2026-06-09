@@ -14,6 +14,30 @@ use crate::state::{BuildOptions, DrvHash, ExecutorId, PriorityClass};
 #[cfg(test)]
 use super::handle::DebugDerivationInfo;
 
+/// Why an `AckSpawnedIntents` payload was NOT applied
+/// (merged_bug_005 — ack means applied under leadership). Mapped to a
+/// gRPC error by the admin layer; the controller's commit-on-Ack
+/// buffer survives an erring Ack and redelivers, which is idempotent
+/// on every plane (clears are removes, observed types upsert, marks
+/// refresh-not-step).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckApplyError {
+    /// Deposed between the gRPC-layer leader check and the actor
+    /// drain (`r[sched.lease.standby-drops-writes+3]`
+    /// defense-in-depth): the payload was dropped whole. Pre-fix the
+    /// gRPC layer had already answered OK on enqueue, so the
+    /// controller wiped consume-once evidence the standby never
+    /// applied.
+    NotLeader,
+    /// The observed-instance-types plane arrived while the cost
+    /// table's lease-acquire edge-reload gate was still closed
+    /// (acquire→reload window): applying would land on the pre-reload
+    /// table and be clobbered. The cell planes WERE applied
+    /// (idempotent on redelivery); the typed refusal makes the
+    /// controller retry the whole buffer until the gate opens.
+    CostGateClosed,
+}
+
 /// Request payload for [`ActorCommand::MergeDag`].
 #[derive(Debug)]
 pub struct MergeDagRequest {
@@ -219,9 +243,14 @@ pub enum ActorCommand {
     /// dashboard/CLI polls and headroom-gated intents the controller
     /// truncated don't false-mark `(band, cap)` ICE-infeasible.
     ///
-    /// `send_unchecked`: a dropped ack means the timer doesn't arm →
-    /// no false-ICE, just delayed detection until the next spawn —
-    /// acceptable under backpressure.
+    /// `send_unchecked` (backpressure bypass) + `reply`
+    /// (merged_bug_005): the gRPC layer answers the controller only
+    /// AFTER the leader-gated apply — ack means APPLIED UNDER
+    /// LEADERSHIP, never enqueued. A dropped command or a deposed
+    /// drain errs the RPC, so the controller's commit-on-Ack buffer
+    /// is retained and redelivered (idempotent on every plane:
+    /// clears are removes, observed types upsert, marks
+    /// refresh-not-step).
     AckSpawnedIntents {
         spawned: Vec<rio_proto::types::SpawnIntent>,
         /// §13b: cells the controller saw NodeClaim Launched=False /
@@ -253,6 +282,10 @@ pub enum ActorCommand {
         /// empty CLEARS: scale-to-zero); `None` = "this Ack carries no
         /// snapshot" (per-pool reconcilers, pre-upgrade controllers).
         binding_snapshot: Option<Vec<rio_proto::types::BoundIntent>>,
+        /// merged_bug_005: answered AFTER the leader-gated apply with
+        /// the apply outcome. `Err` leaves the controller's
+        /// commit-on-Ack buffer intact for redelivery.
+        reply: oneshot::Sender<Result<(), AckApplyError>>,
     },
 
     /// Periodic tick for housekeeping (timeouts, poison TTL expiry).

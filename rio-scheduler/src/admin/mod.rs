@@ -704,9 +704,21 @@ impl AdminService for AdminServiceImpl {
 
     /// Controller acked it created Jobs for these intents → arm the
     /// Pending-watch (ICE-backoff) timer for each band-targeted one.
-    /// Fire-and-forget: a dropped ack means delayed ICE detection,
-    /// not a false mark, so `send_unchecked` is correct under
-    /// backpressure.
+    ///
+    /// merged_bug_005 — ack means APPLIED UNDER LEADERSHIP, never
+    /// enqueued: the reply oneshot answers after the actor's
+    /// leader-gated apply, so "OK" here proves every evidence plane
+    /// landed. A deposed drain (`NotLeader`) or the observed-types
+    /// plane racing the cost-table edge reload (`CostGateClosed`)
+    /// errs the RPC instead — the controller's commit-on-Ack buffer
+    /// is retained and redelivered, which is idempotent on every
+    /// plane (clears are removes, observed types upsert, marks
+    /// refresh-not-step). Pre-fix the handler answered OK on
+    /// `send_unchecked` enqueue and the actor silently dropped the
+    /// payload when deposed — the controller then wiped consume-once
+    /// evidence that was never applied. `send_unchecked` (bypassing
+    /// backpressure) is still correct: the command is control-plane,
+    /// and a dropped command surfaces as a reply error, not silence.
     #[instrument(skip(self, request), fields(rpc = "AckSpawnedIntents"))]
     async fn ack_spawned_intents(
         &self,
@@ -720,8 +732,9 @@ impl AdminService for AdminServiceImpl {
         self.ensure_leader()?;
         self.check_actor_alive()?;
         let req = request.into_inner();
-        self.actor
-            .send_unchecked(ActorCommand::AckSpawnedIntents {
+        let applied = self
+            .actor
+            .query_unchecked(|reply| ActorCommand::AckSpawnedIntents {
                 spawned: req.spawned,
                 unfulfillable_cells: req.unfulfillable_cells,
                 registered_cells: req.registered_cells,
@@ -730,9 +743,18 @@ impl AdminService for AdminServiceImpl {
                 // C2/285: optional wrapper → presence-preserving
                 // Option (absent ≠ empty on this wire by design).
                 binding_snapshot: req.binding_snapshot.map(|s| s.bound),
+                reply,
             })
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        applied.map_err(|e| match e {
+            crate::actor::AckApplyError::NotLeader => Status::failed_precondition(
+                "not leader — evidence not applied; retry against the current leader",
+            ),
+            crate::actor::AckApplyError::CostGateClosed => Status::unavailable(
+                "cost table edge-reload pending — observed instance types not applied; retry",
+            ),
+        })?;
         Ok(Response::new(()))
     }
 
@@ -1214,8 +1236,13 @@ impl AdminService for AdminServiceImpl {
     /// relist/reconnect/controller-restart. `ON CONFLICT (event_uid)
     /// WHERE event_uid IS NOT NULL DO NOTHING` (partial unique index,
     /// M_047) deduplicates `kind='interrupt'` rows so λ's numerator
-    /// doesn't inflate; exposure rows pass `event_uid=None` and are
-    /// unconstrained.
+    /// doesn't inflate. merged_bug_002: exposure rows now ride the
+    /// SAME absorb — the controller keys each (class, window) slice
+    /// `exposure:{hw}:{window_epoch}` and carries the uid verbatim
+    /// across retries, so a commit-but-timeout redelivery no longer
+    /// double-banks the denominator. A NULL uid remains unconstrained
+    /// (the legacy wire arm: pre-upgrade controllers during rolling
+    /// skew — read-side back-compat only).
     #[instrument(skip(self, request), fields(rpc = "AppendInterruptSample"))]
     async fn append_interrupt_sample(
         &self,

@@ -912,6 +912,16 @@ impl DagActor {
     /// success signal is the first successful pull — see the mint's
     /// ICE-clear in `actor/pull.rs`.
     // r[impl sched.sla.hw-class.ice-mask]
+    /// merged_bug_005: returns the apply outcome the drain relays to
+    /// the gRPC layer — `Ok` only when EVERY plane landed. The one
+    /// partial arm (observed types vs the closed cost gate) errs
+    /// `CostGateClosed` AFTER applying the other planes: redelivery
+    /// is idempotent plane-wise (clears are removes, marks
+    /// refresh-not-step, snapshot rebuilds, observed types upsert),
+    /// so the controller retrying the whole buffer until the gate
+    /// opens is lossless — pre-fix the plane was silently dropped and
+    /// the consume-once observations died in the acquire→reload
+    /// window.
     pub(super) fn handle_ack_spawned_intents(
         &mut self,
         spawned: &[rio_proto::types::SpawnIntent],
@@ -920,7 +930,7 @@ impl DagActor {
         observed_instance_types: &[rio_proto::types::ObservedInstanceType],
         bound_intents: &[rio_proto::types::BoundIntent],
         binding_snapshot: Option<&[rio_proto::types::BoundIntent]>,
-    ) {
+    ) -> Result<(), super::command::AckApplyError> {
         // Kube-authoritative `intent_id (== drv_hash) → (spec.nodeName,
         // tenant)`. The nodeclaim_pool reconciler ships the FULL set
         // every tick as an EXPLICIT snapshot (`binding_snapshot`,
@@ -1009,6 +1019,13 @@ impl DagActor {
                     .insert(i.intent_id.as_str().into(), cells);
             }
         }
+        // merged_bug_005: the controller's evidence buffer enforces
+        // per-cell latest-wins supersession, so one request never
+        // carries a cell in BOTH planes — this fixed clears-then-marks
+        // order no longer decides ties (it used to resurrect a stale
+        // buffered mark over a strictly newer registration). Kept as
+        // written for pre-supersession controllers during rolling
+        // skew: mark-wins is the conservative tie-break.
         for s in registered_cells {
             if let Some(cell) = crate::sla::config::parse_cell(s) {
                 self.ice.clear(&cell);
@@ -1030,22 +1047,32 @@ impl DagActor {
         // until another NodeClaim of that type registers.
         // `handle_leader_acquired` notifies `interrupt_housekeeping`
         // so this gate is open within ~0s of lease win, not ≤600s.
-        if !observed_instance_types.is_empty()
-            && self
+        if !observed_instance_types.is_empty() {
+            if self
                 .cost_was_leader
                 .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            self.cost_table.write().observe_instance_types(
-                observed_instance_types.iter().filter_map(|o| {
-                    Some((
-                        crate::sla::config::parse_cell(&o.cell)?,
-                        o.instance_type.clone(),
-                        o.cores,
-                        o.mem_bytes,
-                    ))
-                }),
-            );
+            {
+                self.cost_table.write().observe_instance_types(
+                    observed_instance_types.iter().filter_map(|o| {
+                        Some((
+                            crate::sla::config::parse_cell(&o.cell)?,
+                            o.instance_type.clone(),
+                            o.cores,
+                            o.mem_bytes,
+                        ))
+                    }),
+                );
+            } else {
+                // merged_bug_005: the typed refusal replaces the
+                // silent drop — the gRPC layer errs the Ack and the
+                // controller redelivers until the edge reload opens
+                // the gate (~0s after lease win via the
+                // handle_leader_acquired notify; bounded by one
+                // interrupt_housekeeping cycle otherwise).
+                return Err(super::command::AckApplyError::CostGateClosed);
+            }
         }
+        Ok(())
     }
 
     /// One snapshot of the **shared solve inputs** + the derived

@@ -7937,6 +7937,7 @@ async fn materialization_mint_leaves_ice_mask_untouched() -> TestResult {
     // |A'| == 1 shape the build-pull clear targets.
     handle
         .send_unchecked(ActorCommand::AckSpawnedIntents {
+            reply: tokio::sync::oneshot::channel().0,
             spawned: vec![SpawnIntent {
                 intent_id: "mat091".into(),
                 hw_class_names: vec!["h-mat".into()],

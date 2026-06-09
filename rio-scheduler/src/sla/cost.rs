@@ -911,6 +911,26 @@ struct IceState {
     step: u32,
 }
 
+/// Pure ladder-step decision for [`IceBackoff::mark`]
+/// (merged_bug_005). `prev` is `Some((step, unexpired))` for an
+/// existing entry, `None` for a first mark. The table:
+///
+/// | prev                | next step | meaning                        |
+/// |---------------------|-----------|--------------------------------|
+/// | `None`              | 0         | first failure                  |
+/// | `Some((s, true))`   | `s`       | REDELIVERY — refresh, not step |
+/// | `Some((s, false))`  | `s + 1`   | consecutive failure post-expiry|
+///
+/// Extracted so the decision is clock-free unit-testable; the caller
+/// owns `Instant` sampling and the TTL arithmetic.
+fn next_mark_step(prev: Option<(u32, bool)>) -> u32 {
+    match prev {
+        None => 0,
+        Some((step, true)) => step,
+        Some((step, false)) => step.saturating_add(1),
+    }
+}
+
 /// In-process insufficient-capacity mask. A [`Cell`] reported
 /// `unfulfillable` by the controller (NodeClaim `Launched=False` or
 /// `Registered` timeout — ADR-023 §Capacity backoff) is masked
@@ -950,21 +970,37 @@ impl IceBackoff {
     }
 
     /// Mark `cell` infeasible. TTL is `min(60s · 2^step, max_lead_time)`;
-    /// `step` increments per consecutive mark and resets via
+    /// `step` climbs only across DISTINCT failures and resets via
     /// [`Self::clear`].
+    ///
+    /// merged_bug_005 — refresh-not-step while unexpired: a mark
+    /// arriving while the cell's mask is still live re-stamps the
+    /// window at the SAME rung instead of climbing. The controller
+    /// redelivers its whole evidence buffer every ~10s tick until an
+    /// Ack provably lands (commit-on-Ack), and "Ack failed
+    /// controller-side ∧ marks applied scheduler-side" is routine
+    /// (client timeout after server apply) — pre-fix each redelivery
+    /// climbed one rung, so a single incident with a flaky Ack path
+    /// pinned the cell at `max_lead_time` within 4-5 retries. A mark
+    /// arriving while masked cannot be a new failure anyway: the mask
+    /// keeps `cover_deficit` out of the cell, so no new claim was
+    /// minted there to fail (the residual case — a straggler claim
+    /// launched pre-mask failing late — under-steps once and climbs
+    /// on the next post-expiry failure; bounded, and the window still
+    /// refreshes). A mark AFTER expiry is a genuine consecutive
+    /// failure (a fresh claim was minted and failed) and climbs.
     pub fn mark(&self, cell: &Cell) {
         // Match-on-map then insert: see `is_masked` for the
-        // DashMap-guard-reentrance hazard.
-        let step = self
-            .cells
-            .get(cell)
-            .map(|s| s.step.saturating_add(1))
-            .unwrap_or(0);
+        // DashMap-guard-reentrance hazard (`.map` copies, guard drops
+        // before the insert below).
+        let now = Instant::now();
+        let prev = self.cells.get(cell).map(|s| (s.step, now < s.until));
+        let step = next_mark_step(prev);
         let ttl = (ICE_BASE_TTL * 2u32.saturating_pow(step)).min(self.max_lead_time);
         self.cells.insert(
             cell.clone(),
             IceState {
-                until: Instant::now() + ttl,
+                until: now + ttl,
                 step,
             },
         );
@@ -988,9 +1024,25 @@ impl IceBackoff {
         self.cells.get(cell).map(|s| s.step)
     }
 
+    /// Test-only: force `cell`'s mask to read as EXPIRED (step
+    /// retained) — lets ack-level contracts manufacture the
+    /// post-expiry consecutive-failure state without sleeping
+    /// (merged_bug_005: in-window re-marks refresh at the same rung;
+    /// only post-expiry marks climb).
+    #[cfg(test)]
+    pub(crate) fn force_expire(&self, cell: &Cell) {
+        let mut e = self
+            .cells
+            .get_mut(cell)
+            .expect("force_expire: cell never marked");
+        e.until = Instant::now()
+            .checked_sub(std::time::Duration::from_millis(1))
+            .unwrap_or_else(Instant::now);
+    }
+
     /// Whether `cell` is currently masked. Expired entries are NOT
-    /// reaped — the `step` must survive expiry so a re-mark doubles
-    /// (only `clear` on success resets).
+    /// reaped — the `step` must survive expiry so a post-expiry
+    /// re-mark doubles (only `clear` on success resets).
     pub fn is_masked(&self, cell: &Cell) -> bool {
         // `.map(|r| r.until)` copies the `Instant` and drops the `Ref`
         // guard BEFORE comparison. `get()` then `remove()` while the
@@ -2393,9 +2445,12 @@ mod tests {
         assert!(ice.is_masked(&cell));
         assert!(!ice.is_masked(&("h".into(), CapacityType::Od)));
         assert_eq!(ice.live(), 1);
-        // Backoff doubles per consecutive mark, capped at max_lead_time.
-        // step=0 → 60s. After another mark: step=1 → 120s.
+        // Backoff doubles per consecutive POST-EXPIRY mark (a fresh
+        // claim was minted after the mask lapsed and failed), capped
+        // at max_lead_time. step=0 → 60s; expired re-mark: step=1 →
+        // 120s.
         let u0 = ice.cells.get(&cell).unwrap().until;
+        ice.force_expire(&cell);
         ice.mark(&cell);
         let s1 = *ice.cells.get(&cell).unwrap();
         assert_eq!(s1.step, 1);
@@ -2406,6 +2461,7 @@ mod tests {
         );
         // step=10 would be 60·1024=61440s; clamped to 600s.
         for _ in 0..10 {
+            ice.force_expire(&cell);
             ice.mark(&cell);
         }
         let until = ice.cells.get(&cell).unwrap().until;
@@ -2420,10 +2476,64 @@ mod tests {
         assert_eq!(ice.cells.get(&cell).unwrap().step, 0);
     }
 
+    /// merged_bug_005 red: the controller redelivers its commit-on-Ack
+    /// evidence buffer every ~10s tick until an Ack provably lands, and
+    /// "Ack failed controller-side ∧ marks applied scheduler-side" is
+    /// routine (client timeout after server apply). A mark arriving
+    /// while the mask is still LIVE is that redelivery, not a new
+    /// failure — `left: step climbed 0→1→…→cap within one incident
+    /// (60s mask inflated to max_lead_time off ~4 retries)`; `right:
+    /// step stays 0 and the window refreshes`. The ladder still climbs
+    /// across genuine consecutive failures (post-expiry marks — see
+    /// `ice_mark_exponential_then_clear_resets`).
+    // r[verify ctrl.nodeclaim.evidence-ack-latch+2]
+    #[test]
+    fn ice_redelivered_mark_refreshes_without_stepping() {
+        let ice = IceBackoff::new(600.0);
+        let cell: Cell = ("h".into(), CapacityType::Spot);
+        ice.mark(&cell);
+        let first = *ice.cells.get(&cell).unwrap();
+        assert_eq!(first.step, 0);
+        // Five in-window redeliveries (the ~10s ack-retry loop).
+        for _ in 0..5 {
+            ice.mark(&cell);
+        }
+        let after = *ice.cells.get(&cell).unwrap();
+        assert_eq!(
+            after.step, 0,
+            "redelivery is not a new failure — the ladder must not climb"
+        );
+        assert!(
+            after.until >= first.until,
+            "the masked window refreshes at the same rung"
+        );
+        assert!(ice.is_masked(&cell));
+    }
+
+    /// The pure step-decision table behind `mark()` (clock-free half
+    /// of the merged_bug_005 law).
+    #[test]
+    fn next_mark_step_table() {
+        assert_eq!(next_mark_step(None), 0, "first failure");
+        assert_eq!(next_mark_step(Some((0, true))), 0, "redelivery holds");
+        assert_eq!(
+            next_mark_step(Some((3, true))),
+            3,
+            "redelivery holds (deep)"
+        );
+        assert_eq!(next_mark_step(Some((0, false))), 1, "post-expiry climbs");
+        assert_eq!(
+            next_mark_step(Some((u32::MAX, false))),
+            u32::MAX,
+            "saturating at the top"
+        );
+    }
+
     /// Regression: `mark()` reads the prior step then inserts; holding
     /// the `Ref` guard across the insert deadlocks (DashMap shard
     /// RwLock is non-reentrant). If reintroduced, this hangs and
-    /// nextest's per-test timeout catches it.
+    /// nextest's per-test timeout catches it. (Steps stay 0 — rapid
+    /// re-marks are in-window redeliveries under merged_bug_005.)
     #[test]
     fn ice_mark_re_mark_no_deadlock() {
         let ice = IceBackoff::default();
@@ -2431,7 +2541,7 @@ mod tests {
         for _ in 0..5 {
             ice.mark(&cell);
         }
-        assert_eq!(ice.cells.get(&cell).unwrap().step, 4);
+        assert_eq!(ice.cells.get(&cell).unwrap().step, 0);
     }
 
     /// Both spot+od configured for every class — pre-§13c default.

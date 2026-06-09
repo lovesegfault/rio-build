@@ -1186,6 +1186,9 @@ async fn pull_attempt_failure_stamps_source_node_and_excludes_node() -> TestResu
     // Controller-authoritative pod→node binding for the intent.
     handle
         .send_unchecked(ActorCommand::AckSpawnedIntents {
+            // merged_bug_005 reply: receiver intentionally dropped —
+            // these tests assert via actor state, not the ack path.
+            reply: tokio::sync::oneshot::channel().0,
             binding_snapshot: None,
             spawned: vec![],
             unfulfillable_cells: vec![],
@@ -1355,6 +1358,9 @@ async fn establishment_charge_falls_back_to_late_binding_ack() -> TestResult {
     // ever delivered — the establishment sweep is the only observer).
     handle
         .send_unchecked(ActorCommand::AckSpawnedIntents {
+            // merged_bug_005 reply: receiver intentionally dropped —
+            // these tests assert via actor state, not the ack path.
+            reply: tokio::sync::oneshot::channel().0,
             binding_snapshot: None,
             spawned: vec![],
             unfulfillable_cells: vec![],
@@ -1445,6 +1451,9 @@ async fn attempt_outcome_no_eligible_source_poisons_ready_drv() -> TestResult {
     // NoEligibleSource for a derivation with nothing excluded.
     handle
         .send_unchecked(ActorCommand::AckSpawnedIntents {
+            // merged_bug_005 reply: receiver intentionally dropped —
+            // these tests assert via actor state, not the ack path.
+            reply: tokio::sync::oneshot::channel().0,
             binding_snapshot: None,
             spawned: vec![],
             unfulfillable_cells: vec![],
@@ -1578,6 +1587,9 @@ async fn no_eligible_source_defers_on_fresh_acked_spawn() -> TestResult {
     // Establish a real failed builder so the exclusion guard passes.
     handle
         .send_unchecked(ActorCommand::AckSpawnedIntents {
+            // merged_bug_005 reply: receiver intentionally dropped —
+            // these tests assert via actor state, not the ack path.
+            reply: tokio::sync::oneshot::channel().0,
             binding_snapshot: None,
             spawned: vec![],
             unfulfillable_cells: vec![],
@@ -1606,6 +1618,7 @@ async fn no_eligible_source_defers_on_fresh_acked_spawn() -> TestResult {
     // The controller acks a fresh spawn for the SAME intent…
     handle
         .send_unchecked(ActorCommand::AckSpawnedIntents {
+            reply: tokio::sync::oneshot::channel().0,
             spawned: vec![rio_proto::types::SpawnIntent {
                 intent_id: "nes-g3".into(),
                 ..Default::default()
@@ -1658,6 +1671,9 @@ async fn mint_refuses_delivery_to_excluded_bound_node() -> TestResult {
     // Bind node-7, fail once on it → node-7 lands in the exclusion set.
     handle
         .send_unchecked(ActorCommand::AckSpawnedIntents {
+            // merged_bug_005 reply: receiver intentionally dropped —
+            // these tests assert via actor state, not the ack path.
+            reply: tokio::sync::oneshot::channel().0,
             binding_snapshot: None,
             spawned: vec![],
             unfulfillable_cells: vec![],
@@ -1713,6 +1729,9 @@ async fn no_eligible_source_with_stale_cycle_echo_acks_no_poison() -> TestResult
     // Real failed builder (the no-exclusions guard passes; cycles=0).
     handle
         .send_unchecked(ActorCommand::AckSpawnedIntents {
+            // merged_bug_005 reply: receiver intentionally dropped —
+            // these tests assert via actor state, not the ack path.
+            reply: tokio::sync::oneshot::channel().0,
             binding_snapshot: None,
             spawned: vec![],
             unfulfillable_cells: vec![],
@@ -1927,6 +1946,9 @@ async fn build_mint_floors_deadline_at_carried_rendered() -> TestResult {
     // — far above anything the unit-corpus re-solve produces.
     handle
         .send_unchecked(ActorCommand::AckSpawnedIntents {
+            // merged_bug_005 reply: receiver intentionally dropped —
+            // these tests assert via actor state, not the ack path.
+            reply: tokio::sync::oneshot::channel().0,
             binding_snapshot: None,
             spawned: vec![],
             unfulfillable_cells: vec![],

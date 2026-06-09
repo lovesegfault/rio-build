@@ -83,8 +83,10 @@ pub(super) async fn setup_svc_default() -> (
 /// relist double-counts into λ's numerator (`refresh_lambda` SUMs
 /// `kind='interrupt'` rows) → `solve_full` biases away from spot.
 ///
-/// Exposure rows pass `event_uid=None` and are unconstrained — the
-/// M_047 partial unique index only covers non-NULL uids.
+/// merged_bug_002: exposure rows are keyed `exposure:{hw}:{window}`
+/// controller-side and dedup through the SAME partial index; a NULL
+/// uid remains unconstrained (legacy wire arm — pre-upgrade
+/// controllers during rolling skew).
 #[tokio::test]
 async fn append_interrupt_sample_idempotent_on_event_uid() {
     let (svc, _actor, _task, db) = setup_svc_default().await;
@@ -129,11 +131,40 @@ async fn append_interrupt_sample_idempotent_on_event_uid() {
         .await
         .unwrap();
 
+    // merged_bug_002 (server half of the red): a keyed exposure slice
+    // redelivered after a commit-but-timeout collides with its own
+    // committed row. `left:` the pre-fix wire was un-keyed (the NULL
+    // arm above) — every retry inserted a fresh row and the
+    // denominator double-banked; `right:` same uid → one row.
+    let keyed = AppendInterruptSampleRequest {
+        hw_class: "aws-8-nvme-hi".into(),
+        kind: "exposure".into(),
+        value: 60.0,
+        event_uid: Some("exposure:aws-8-nvme-hi:1767225600".into()),
+    };
+    svc.append_interrupt_sample(Request::new(keyed.clone()))
+        .await
+        .unwrap();
+    svc.append_interrupt_sample(Request::new(keyed))
+        .await
+        .unwrap();
+    let keyed_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM interrupt_samples \
+         WHERE event_uid = 'exposure:aws-8-nvme-hi:1767225600'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(keyed_rows, 1, "keyed exposure redelivery absorbed");
+
     let total: i64 = sqlx::query_scalar("SELECT count(*) FROM interrupt_samples")
         .fetch_one(&db.pool)
         .await
         .unwrap();
-    assert_eq!(total, 4, "ev-abc(1) + ev-def(1) + 2×NULL exposure = 4 rows");
+    assert_eq!(
+        total, 5,
+        "ev-abc(1) + ev-def(1) + 2×NULL legacy exposure + 1 keyed = 5 rows"
+    );
 }
 
 /// Defense-in-depth input validation: lands regardless of the

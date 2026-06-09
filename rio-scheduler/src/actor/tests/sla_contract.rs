@@ -452,20 +452,31 @@ async fn contract_ice_step_doubles_then_clears_on_registered() {
     );
 
     let cell: crate::sla::config::Cell = ("intel-6".into(), CapacityType::Spot);
-    for _ in 0..3 {
-        actor.handle_ack_spawned_intents(
-            std::slice::from_ref(&intent),
-            &["intel-6:spot".into()],
-            &[],
-            &[],
-            &[],
-            None,
-        );
+    // Three DISTINCT failures: each ack lands post-expiry
+    // (merged_bug_005: in-window re-marks refresh at the same rung, so
+    // the climb is forced through `force_expire` — a spurious
+    // spawned-ack clear() would REMOVE the entry and reset the climb
+    // to 0, which is exactly what this pins against).
+    for i in 0..3 {
+        if i > 0 {
+            actor.ice.force_expire(&cell);
+        }
+        actor
+            .handle_ack_spawned_intents(
+                std::slice::from_ref(&intent),
+                &["intel-6:spot".into()],
+                &[],
+                &[],
+                &[],
+                None,
+            )
+            .expect("applied under leadership");
     }
     assert_eq!(
         actor.ice.step(&cell),
         Some(2),
-        "spawned-ack must NOT clear; backoff doubles across consecutive marks"
+        "spawned-ack must NOT clear; backoff doubles across consecutive \
+         post-expiry failures"
     );
     // Arm-on-ack: the spawned echo populates `dispatched_cells` with
     // the FULL `cells` vec recovered from the parallel
@@ -481,7 +492,9 @@ async fn contract_ice_step_doubles_then_clears_on_registered() {
         "spawned-ack arms dispatched_cells from the wire form"
     );
 
-    actor.handle_ack_spawned_intents(&[], &[], &["intel-6:spot".into()], &[], &[], None);
+    actor
+        .handle_ack_spawned_intents(&[], &[], &["intel-6:spot".into()], &[], &[], None)
+        .expect("applied under leadership");
     assert_eq!(
         actor.ice.step(&cell),
         None,
@@ -513,27 +526,29 @@ async fn ack_observed_instance_types_folds_into_cost_table() {
 
     // Controller's `Cell::to_string` form: `"h:spot"` / `"h:od"`
     // (sketch.rs:90 via `as_str()`).
-    actor.handle_ack_spawned_intents(
-        &[],
-        &[],
-        &[],
-        &[
-            ObservedInstanceType {
-                cell: "mid-ebs-x86:spot".into(),
-                instance_type: "c7i.8xlarge".into(),
-                cores: 32,
-                mem_bytes: 64 << 30,
-            },
-            ObservedInstanceType {
-                cell: "mid-ebs-x86:od".into(),
-                instance_type: "m7i.8xlarge".into(),
-                cores: 32,
-                mem_bytes: 128 << 30,
-            },
-        ],
-        &[],
-        None,
-    );
+    actor
+        .handle_ack_spawned_intents(
+            &[],
+            &[],
+            &[],
+            &[
+                ObservedInstanceType {
+                    cell: "mid-ebs-x86:spot".into(),
+                    instance_type: "c7i.8xlarge".into(),
+                    cores: 32,
+                    mem_bytes: 64 << 30,
+                },
+                ObservedInstanceType {
+                    cell: "mid-ebs-x86:od".into(),
+                    instance_type: "m7i.8xlarge".into(),
+                    cores: 32,
+                    mem_bytes: 128 << 30,
+                },
+            ],
+            &[],
+            None,
+        )
+        .expect("applied under leadership");
 
     let ct = actor.cost_table.read();
     assert_eq!(ct.menu(&spot).len(), 1);
@@ -574,17 +589,19 @@ async fn ack_bound_intents_populates_authoritative_binding() {
     let abc = crate::state::DrvHash::from("abc123");
     let def = crate::state::DrvHash::from("def456");
 
-    actor.handle_ack_spawned_intents(
-        &[],
-        &[],
-        &[],
-        &[],
-        &[
-            bi("abc123", "ip-10-0-1-5.ec2.internal"),
-            bi("def456", "ip-10-0-1-6.ec2.internal"),
-        ],
-        None,
-    );
+    actor
+        .handle_ack_spawned_intents(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[
+                bi("abc123", "ip-10-0-1-5.ec2.internal"),
+                bi("def456", "ip-10-0-1-6.ec2.internal"),
+            ],
+            None,
+        )
+        .expect("applied under leadership");
 
     assert_eq!(
         actor
@@ -607,14 +624,16 @@ async fn ack_bound_intents_populates_authoritative_binding() {
     // Wholesale-rebuild: second Ack omitting `def456` → that entry
     // dropped (the Ack IS the authoritative snapshot; deleted pods
     // disappear from the controller's per-tick pod snapshot).
-    actor.handle_ack_spawned_intents(
-        &[],
-        &[],
-        &[],
-        &[],
-        &[bi("abc123", "ip-10-0-1-5.ec2.internal")],
-        None,
-    );
+    actor
+        .handle_ack_spawned_intents(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[bi("abc123", "ip-10-0-1-5.ec2.internal")],
+            None,
+        )
+        .expect("applied under leadership");
     assert_eq!(actor.authoritative_binding.len(), 1);
     assert!(!actor.authoritative_binding.contains_key(&def));
     assert!(actor.authoritative_binding.contains_key(&abc));
@@ -622,7 +641,9 @@ async fn ack_bound_intents_populates_authoritative_binding() {
     // Empty `bound_intents` = "this Ack carries no binding snapshot"
     // (per-pool reconciler at pool/jobs.rs sends `vec![]`; the
     // nodeclaim_pool reconciler owns the stream) → map unchanged.
-    actor.handle_ack_spawned_intents(&[], &[], &[], &[], &[], None);
+    actor
+        .handle_ack_spawned_intents(&[], &[], &[], &[], &[], None)
+        .expect("applied under leadership");
     assert_eq!(
         actor.authoritative_binding.len(),
         1,
@@ -652,12 +673,16 @@ async fn ack_binding_snapshot_presence_semantics() {
     let abc = crate::state::DrvHash::from("abc285");
 
     // Some(non-empty) rebuilds.
-    actor.handle_ack_spawned_intents(&[], &[], &[], &[], &[], Some(&[bi("abc285", "node-1")]));
+    actor
+        .handle_ack_spawned_intents(&[], &[], &[], &[], &[], Some(&[bi("abc285", "node-1")]))
+        .expect("applied under leadership");
     assert_eq!(actor.authoritative_binding.len(), 1);
     assert!(actor.authoritative_binding.contains_key(&abc));
 
     // None leaves the map untouched (per-pool Ack shape).
-    actor.handle_ack_spawned_intents(&[], &[], &[], &[], &[], None);
+    actor
+        .handle_ack_spawned_intents(&[], &[], &[], &[], &[], None)
+        .expect("applied under leadership");
     assert_eq!(
         actor.authoritative_binding.len(),
         1,
@@ -665,7 +690,9 @@ async fn ack_binding_snapshot_presence_semantics() {
     );
 
     // Some(EMPTY) clears — scale-to-zero says so explicitly.
-    actor.handle_ack_spawned_intents(&[], &[], &[], &[], &[], Some(&[]));
+    actor
+        .handle_ack_spawned_intents(&[], &[], &[], &[], &[], Some(&[]))
+        .expect("applied under leadership");
     assert!(
         actor.authoritative_binding.is_empty(),
         "present-and-empty is load-bearing: zero bound pods clears the map"
@@ -695,22 +722,31 @@ async fn ack_observed_instance_types_gated_on_cost_was_leader() {
         mem_bytes: 64 << 30,
     }];
 
-    // Pre-reload (was_leader=false): write is dropped.
+    // Pre-reload (was_leader=false): the write must not land, and
+    // merged_bug_005 turned the silent drop into the typed refusal —
+    // the gRPC layer errs the Ack so the controller redelivers
+    // instead of wiping its consume-once buffer.
     actor
         .cost_was_leader
         .store(false, std::sync::atomic::Ordering::Relaxed);
-    actor.handle_ack_spawned_intents(&[], &[], &[], &observed, &[], None);
+    assert_eq!(
+        actor.handle_ack_spawned_intents(&[], &[], &[], &observed, &[], None),
+        Err(crate::actor::AckApplyError::CostGateClosed),
+        "closed gate must be a typed refusal, not a silent drop"
+    );
     assert!(
         actor.cost_table.read().menu(&spot).is_empty(),
         "observation must NOT land on pre-reload table"
     );
 
     // Post-reload (was_leader=true via interrupt_housekeeping's
-    // poller_tick_prelude Ok-arm): write applies.
+    // poller_tick_prelude Ok-arm): write applies — and the Ack is OK.
     actor
         .cost_was_leader
         .store(true, std::sync::atomic::Ordering::Relaxed);
-    actor.handle_ack_spawned_intents(&[], &[], &[], &observed, &[], None);
+    actor
+        .handle_ack_spawned_intents(&[], &[], &[], &observed, &[], None)
+        .expect("open gate applies fully");
     assert_eq!(actor.cost_table.read().menu(&spot).len(), 1);
 }
 
@@ -750,7 +786,9 @@ async fn contract_ack_spawned_records_full_a_prime() {
         ..Default::default()
     };
 
-    actor.handle_ack_spawned_intents(std::slice::from_ref(&intent), &[], &[], &[], &[], None);
+    actor
+        .handle_ack_spawned_intents(std::slice::from_ref(&intent), &[], &[], &[], &[], None)
+        .expect("applied under leadership");
 
     let got: std::collections::HashSet<Cell> = actor
         .dispatched_cells
@@ -3639,14 +3677,16 @@ async fn contract_first_pull_clears_ice_not_yet_ready_does_not() {
         CapacityType::parse(&cap).expect("known capacity type"),
     );
     let cell_str = format!("{}:{cap}", intent.hw_class_names[0]);
-    actor.handle_ack_spawned_intents(
-        std::slice::from_ref(&intent),
-        std::slice::from_ref(&cell_str),
-        &[],
-        &[],
-        &[],
-        None,
-    );
+    actor
+        .handle_ack_spawned_intents(
+            std::slice::from_ref(&intent),
+            std::slice::from_ref(&cell_str),
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .expect("applied under leadership");
     // Arm + mark the waiter's intent the same way (hand-built echo with
     // the same cell — the ack handler arms from the wire form alone).
     let waiter_intent = rio_proto::types::SpawnIntent {
@@ -3655,14 +3695,16 @@ async fn contract_first_pull_clears_ice_not_yet_ready_does_not() {
         node_affinity: intent.node_affinity.clone(),
         ..Default::default()
     };
-    actor.handle_ack_spawned_intents(
-        std::slice::from_ref(&waiter_intent),
-        &[],
-        &[],
-        &[],
-        &[],
-        None,
-    );
+    actor
+        .handle_ack_spawned_intents(
+            std::slice::from_ref(&waiter_intent),
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .expect("applied under leadership");
     assert!(actor.ice.is_masked(&cell), "precondition: cell ICE-masked");
     assert!(actor.dispatched_cells.contains_key("ice-pull-a"));
     assert!(actor.dispatched_cells.contains_key("ice-pull-b"));

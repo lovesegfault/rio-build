@@ -80,6 +80,51 @@ fn spawn_actor_with_flags(
     (h, t)
 }
 
+/// merged_bug_005 red (ack-on-enqueue axis): the `AckSpawnedIntents`
+/// reply is sent AFTER the leader-gated apply — a deposed drain
+/// answers `NotLeader`, so the gRPC layer errs the Ack and the
+/// controller's commit-on-Ack buffer survives to redeliver at the
+/// next leader. `left:` pre-fix the handler answered OK on
+/// `send_unchecked` enqueue while the standby dropped the payload
+/// whole (r[sched.lease.standby-drops-writes+3] defense-in-depth) —
+/// the controller then cleared consume-once evidence that was never
+/// applied. `right:` leader applies → `Ok`; deposed → typed refusal.
+// r[verify ctrl.nodeclaim.evidence-ack-latch+2]
+#[tokio::test]
+async fn deposed_ack_spawned_intents_answers_not_leader() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let (handle, _task, leader) = spawn_actor_with_leader(db.pool.clone(), true, true);
+
+    let empty_ack = |reply| ActorCommand::AckSpawnedIntents {
+        spawned: vec![],
+        unfulfillable_cells: vec![],
+        registered_cells: vec![],
+        observed_instance_types: vec![],
+        bound_intents: vec![],
+        binding_snapshot: None,
+        reply,
+    };
+
+    // Leader: the apply runs and the reply proves it.
+    let applied = handle.query_unchecked(empty_ack).await?;
+    assert_eq!(applied, Ok(()), "leader drain applies and acks");
+
+    // Depose (mirror the lease loop: atomics flip, then the command).
+    leader.on_lose();
+    handle.send_unchecked(ActorCommand::LeaderLost).await?;
+    barrier(&handle).await;
+
+    let applied = handle.query_unchecked(empty_ack).await?;
+    assert_eq!(
+        applied,
+        Err(crate::actor::AckApplyError::NotLeader),
+        "deposed drain must refuse — an OK here would make the \
+         controller wipe evidence the standby dropped"
+    );
+    Ok(())
+}
+
 // r[verify obs.metric.scheduler-leader-gate+5]
 // r[verify obs.metric.scheduler-substituting]
 /// When is_leader=false, handle_tick must NOT set state gauges.

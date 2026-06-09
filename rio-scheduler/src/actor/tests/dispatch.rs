@@ -1000,7 +1000,9 @@ async fn ice_mask_is_read_time() {
 
     // Mask one cell from A' via the controller's unfulfillable report.
     let masked: crate::sla::config::Cell = ("intel-6".into(), CapacityType::Spot);
-    actor.handle_ack_spawned_intents(&[], &["intel-6:spot".into()], &[], &[], &[], None);
+    actor
+        .handle_ack_spawned_intents(&[], &["intel-6:spot".into()], &[], &[], &[], None)
+        .expect("applied under leadership");
     assert!(actor.ice.is_masked(&masked));
 
     // ── poll 2: read-time mask, A\{masked}, not exhausted ──────────────
@@ -1101,27 +1103,39 @@ async fn ice_step_doubles_across_mark_without_clear() {
         ..Default::default()
     };
 
-    // Three ticks of {spawned for cell, unfulfillable=cell, no
-    // Registered signal}: step must climb 0→1→2. Old code: each tick
-    // cleared (from `spawned`) before marking → step stuck at 0.
-    for _ in 0..3 {
-        actor.handle_ack_spawned_intents(
-            std::slice::from_ref(&spawned),
-            &["intel-6:spot".into()],
-            &[],
-            &[],
-            &[],
-            None,
-        );
+    // Three DISTINCT failures of {spawned for cell, unfulfillable=cell,
+    // no Registered signal}: step must climb 0→1→2. Old bug_008: each
+    // tick cleared (from `spawned`) before marking → entry removed and
+    // re-minted at step 0 forever. merged_bug_005: in-window re-marks
+    // refresh at the same rung, so the climb is forced through
+    // `force_expire` — the climb reaching 2 still proves `spawned`
+    // never cleared (a clear would reset it).
+    for i in 0..3 {
+        if i > 0 {
+            actor.ice.force_expire(&cell);
+        }
+        actor
+            .handle_ack_spawned_intents(
+                std::slice::from_ref(&spawned),
+                &["intel-6:spot".into()],
+                &[],
+                &[],
+                &[],
+                None,
+            )
+            .expect("applied under leadership");
     }
     assert_eq!(
         actor.ice.step(&cell),
         Some(2),
-        "spawned-ack must NOT clear; backoff doubles across consecutive marks"
+        "spawned-ack must NOT clear; backoff doubles across consecutive \
+         post-expiry failures"
     );
 
     // `registered_cells` IS the success signal → resets.
-    actor.handle_ack_spawned_intents(&[], &[], &["intel-6:spot".into()], &[], &[], None);
+    actor
+        .handle_ack_spawned_intents(&[], &[], &["intel-6:spot".into()], &[], &[], None)
+        .expect("applied under leadership");
     assert_eq!(actor.ice.step(&cell), None, "registered_cells clears");
 }
 
@@ -1153,6 +1167,7 @@ async fn pull_mint_ice_clear_only_at_single_cell() -> TestResult {
     };
     let ack =
         |intent_id: &str, hw: &[&str], unfulfillable: &[&str]| ActorCommand::AckSpawnedIntents {
+            reply: tokio::sync::oneshot::channel().0,
             spawned: vec![SpawnIntent {
                 intent_id: intent_id.into(),
                 hw_class_names: hw.iter().map(|h| h.to_string()).collect(),

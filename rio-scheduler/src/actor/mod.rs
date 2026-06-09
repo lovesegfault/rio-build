@@ -1427,10 +1427,17 @@ impl DagActor {
                     observed_instance_types,
                     bound_intents,
                     binding_snapshot,
+                    reply,
                 } => {
                     // r[impl sched.lease.standby-drops-writes+3] —
-                    // ICE state is lease-holder only.
-                    if self.leader.is_leader() {
+                    // ICE state is lease-holder only. merged_bug_005:
+                    // the reply makes the defense-in-depth drop
+                    // VISIBLE — a deposed drain answers `NotLeader`
+                    // instead of letting the gRPC layer ack an
+                    // unapplied payload, so the controller's
+                    // commit-on-Ack buffer survives to redeliver at
+                    // the next leader.
+                    let applied = if self.leader.is_leader() {
                         self.handle_ack_spawned_intents(
                             &spawned,
                             &unfulfillable_cells,
@@ -1438,8 +1445,14 @@ impl DagActor {
                             &observed_instance_types,
                             &bound_intents,
                             binding_snapshot.as_deref(),
-                        );
-                    }
+                        )
+                    } else {
+                        Err(command::AckApplyError::NotLeader)
+                    };
+                    // Receiver gone = RPC already failed client-side;
+                    // nothing to report (the controller retains its
+                    // buffer either way).
+                    let _ = reply.send(applied);
                 }
                 ActorCommand::Tick => {
                     self.handle_tick().await;
