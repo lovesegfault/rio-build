@@ -1,29 +1,46 @@
-//! Shared server-stream draining law for CLI commands (bug_141).
+//! Shared server-stream draining law for CLI commands (bug_141,
+//! merged_bug_106: ONE chokepoint, composable policies).
 //!
 //! A server-streaming RPC that ends WITHOUT its terminal sentinel was
 //! truncated — scheduler restart, store disconnect, LB idle reap. For
 //! an audit command the distinction is the whole point: a truncated
 //! `verify-chunks` scan that exits 0 looks exactly like a complete
-//! scan that found nothing, and the operator acts on absence. The
-//! drain law makes "ended sans sentinel" an `Err` (nonzero exit) at
-//! every consumer that opts in.
+//! scan that found nothing, and the operator acts on absence. For a
+//! rendered stream (`logs`, `gc`) the truncation is surfaced on
+//! stderr instead and the exit stays 0 — but the OTHER two halves of
+//! the drain law still apply.
 //!
-//! Documented exceptions (deliberate exit-0 + stderr disclosure, NOT
-//! converted):
+//! The law has three independently composable parts
+//! ([`DrainPolicy`]); opting out of one half cannot drop the others:
 //!
-//! - `logs.rs` (TailLog): an incomplete LOG is a rendered state with
-//!   user-facing semantics (`is_complete=false` = build still running
-//!   / flush pending), not a command failure; the stderr completeness
-//!   notes carry the disclosure and `rio-cli logs` stays pipeline-safe
-//!   (exit 0 with whatever lines exist).
-//! - `gc.rs` (TriggerGC): the sweep may have completed store-side
-//!   after the progress relay died — the exit status cannot honestly
-//!   assert success OR failure, the command is idempolently re-runnable,
-//!   and the stderr warning names the ambiguity.
+//! 1. **Bounded silence** — every poll carries a per-message
+//!    inactivity bound, converting the half-open-connection class
+//!    (peer died without FIN/RST on the CLI's deliberately
+//!    keepalive-free channel) from an unbounded hang into a prompt
+//!    exit. Always on; no policy removes it.
+//! 2. **Sentinel seal** — the terminal sentinel IS the end, by
+//!    construction: the loop `break`s on it and never polls again, so
+//!    a post-sentinel transport error (replica restart after sealing,
+//!    RST before trailers) cannot fail a complete result (bug_163's
+//!    post-sentinel poll is unrepresentable here). Always on.
+//! 3. **Missing-sentinel posture** — what a clean end WITHOUT the
+//!    sentinel means is the one genuinely per-command decision:
+//!    [`MissingSentinel::Truncation`] (audit posture: `Err`, nonzero
+//!    exit) or [`MissingSentinel::DiscloseExitZero`] (rendered-stream
+//!    posture: `Ok(`[`DrainOutcome::EndedUnsealed`]`)`, and the
+//!    `#[must_use]` outcome forces the caller to render its own
+//!    disclosure).
+//!
+//! Every sentinel-bearing CLI server-stream routes through here —
+//! `verify-chunks` (audit), `logs` (rendered, bug_163), `gc`
+//! (rendered, merged_bug_106). The committed call-site census lives
+//! in `docs/gen/sweeps/bughunt4-s6b.md`; zero raw `.message()` drain
+//! loops remain outside this module.
 
 use anyhow::anyhow;
 
-/// Per-message inactivity bound for the drain law (merged_bug_085).
+/// Per-message inactivity bound for audit-posture drains
+/// (merged_bug_085, merged_bug_023).
 ///
 /// The CLI's store channel is `connect_channel` — eager,
 /// throughput-tuned, and DELIBERATELY keepalive-free (the eager-connect
@@ -32,16 +49,11 @@ use anyhow::anyhow;
 /// drop) therefore leaves a bare `next_message().await` pending until
 /// the kernel's 2h TCP keepalive notices — the exact truncation class
 /// the module doc covers, previously unbounded. The drain law owns the
-/// bound itself: every consumer that opts into sentinel semantics gets
-/// the hang-to-PARTIAL conversion with it.
+/// bound itself: every consumer gets the hang-to-PARTIAL conversion.
 ///
 /// 120s == the CLI's RPC_TIMEOUT budget: `VerifyChunks` emits a
 /// progress frame per batch, and one batch (a bounded PG scan + S3
 /// HeadObject sweep) comfortably fits even against a degraded S3.
-/// Interactive follow streams (`rio-cli logs`) are NOT drained through
-/// this law — an hour-quiet build log is legitimate idle there
-/// (dash.stream.idle-timeout), and logs.rs stays a documented
-/// exception.
 pub(crate) const STREAM_INACTIVITY_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(120);
 
@@ -58,37 +70,91 @@ impl<T> MessageStream<T> for tonic::Streaming<T> {
     }
 }
 
+/// What a clean end-of-stream WITHOUT the terminal sentinel means for
+/// this consumer — the one per-command axis of the drain law.
+pub(crate) enum MissingSentinel {
+    /// Audit posture: the results are PARTIAL and the exit code must
+    /// say so (`Err`).
+    Truncation,
+    /// Rendered-stream posture: the consumer surfaces the truncation
+    /// on stderr itself and the exit stays 0. The drain returns
+    /// [`DrainOutcome::EndedUnsealed`] — `#[must_use]`, so silently
+    /// ignoring the unsealed end does not compile past review.
+    DiscloseExitZero,
+}
+
+/// One consumer's composition of the drain law.
+pub(crate) struct DrainPolicy {
+    /// Human label for error messages (`"VerifyChunks"`, `"TailLog"`,
+    /// `"TriggerGC"`).
+    pub what: &'static str,
+    /// Per-message inactivity bound (half-open-connection
+    /// conversion). Every policy carries one; there is no way to
+    /// construct a drain without it.
+    pub inactivity: std::time::Duration,
+    /// Clean-end-without-sentinel posture.
+    pub missing_sentinel: MissingSentinel,
+}
+
+impl DrainPolicy {
+    /// The audit composition (bug_141 shape): standard bound,
+    /// missing sentinel is a truncation `Err`.
+    pub(crate) const fn audit(what: &'static str) -> Self {
+        Self {
+            what,
+            inactivity: STREAM_INACTIVITY_TIMEOUT,
+            missing_sentinel: MissingSentinel::Truncation,
+        }
+    }
+}
+
+/// How a policy-compliant drain ended. `#[must_use]` is part of the
+/// law: a `DiscloseExitZero` consumer cannot silently drop the
+/// unsealed case — it owes the stderr disclosure.
+#[must_use = "an EndedUnsealed drain owes the caller's stderr disclosure"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DrainOutcome {
+    /// The terminal sentinel arrived and sealed the stream; nothing
+    /// was polled after it.
+    Sealed,
+    /// The stream ended cleanly without the sentinel under
+    /// [`MissingSentinel::DiscloseExitZero`].
+    EndedUnsealed,
+}
+
 // r[impl cli.stream.drain-bound]
-/// Drain `stream`, requiring the server's terminal sentinel before the
-/// end of the stream. `on_item` sees every message (print progress,
-/// collect results); `is_done` recognizes the sentinel. A stream that
-/// ends without it returns `Err` — the caller's results are PARTIAL
-/// and the process exit code must say so.
+/// Drain `stream` under `policy`. `on_item` sees every message (print
+/// progress, collect results); `is_done` recognizes the terminal
+/// sentinel.
 ///
-/// Two terminality laws (merged_bug_085):
+/// The two always-on terminality laws (merged_bug_085):
 /// - The sentinel IS the end, by construction: the loop `break`s on it
 ///   and never polls again, so a post-sentinel transport error
 ///   (replica restart after sealing, RST before trailers) cannot fail
-///   a complete audit.
-/// - Silence is bounded: each poll carries
-///   [`STREAM_INACTIVITY_TIMEOUT`], converting the half-open
-///   connection class from an unbounded hang into a nonzero PARTIAL
-///   exit.
-pub(crate) async fn drain_until_done<T, S: MessageStream<T>>(
-    what: &str,
+///   a complete result.
+/// - Silence is bounded: each poll carries `policy.inactivity`,
+///   converting the half-open connection class from an unbounded hang
+///   into a prompt error.
+///
+/// Errors BEFORE the sentinel (transport status, inactivity timeout,
+/// `on_item` failure) are `Err` under every policy — only the
+/// clean-end-without-sentinel case is posture-dependent.
+pub(crate) async fn drain_with<T, S: MessageStream<T>>(
+    policy: &DrainPolicy,
     stream: &mut S,
     mut on_item: impl FnMut(&T) -> anyhow::Result<()>,
     is_done: impl Fn(&T) -> bool,
-) -> anyhow::Result<()> {
-    let mut done = false;
+) -> anyhow::Result<DrainOutcome> {
+    let what = policy.what;
+    let inactivity = policy.inactivity;
     loop {
-        let polled = tokio::time::timeout(STREAM_INACTIVITY_TIMEOUT, stream.next_message())
+        let polled = tokio::time::timeout(inactivity, stream.next_message())
             .await
             .map_err(|_| {
                 anyhow!(
-                    "{what}: no message for {STREAM_INACTIVITY_TIMEOUT:?} — the \
+                    "{what}: no message for {inactivity:?} — the \
                      connection is presumed half-open (peer died without \
-                     FIN/RST) and the scan was truncated; the results above \
+                     FIN/RST) and the stream was truncated; the results above \
                      are PARTIAL"
                 )
             })?;
@@ -99,21 +165,37 @@ pub(crate) async fn drain_until_done<T, S: MessageStream<T>>(
         };
         on_item(&msg)?;
         if is_done(&msg) {
-            done = true;
-            // Terminal by construction: the server sealed the scan;
+            // Terminal by construction: the server sealed the stream;
             // whatever the transport does after this is teardown
-            // noise, not evidence.
-            break;
+            // noise, not evidence. NO further poll happens (bug_163).
+            return Ok(DrainOutcome::Sealed);
         }
     }
-    if done {
-        Ok(())
-    } else {
-        Err(anyhow!(
+    match policy.missing_sentinel {
+        MissingSentinel::Truncation => Err(anyhow!(
             "{what}: stream ended without the terminal sentinel — the scan was \
              truncated (store or scheduler disconnected mid-stream) and the \
              results above are PARTIAL"
-        ))
+        )),
+        MissingSentinel::DiscloseExitZero => Ok(DrainOutcome::EndedUnsealed),
+    }
+}
+
+/// The audit-posture drain (bug_141 call sites). A stream that ends
+/// without the sentinel returns `Err` — the caller's results are
+/// PARTIAL and the process exit code must say so.
+pub(crate) async fn drain_until_done<T, S: MessageStream<T>>(
+    what: &'static str,
+    stream: &mut S,
+    on_item: impl FnMut(&T) -> anyhow::Result<()>,
+    is_done: impl Fn(&T) -> bool,
+) -> anyhow::Result<()> {
+    match drain_with(&DrainPolicy::audit(what), stream, on_item, is_done).await? {
+        DrainOutcome::Sealed => Ok(()),
+        // Unreachable: Truncation converts the unsealed end to Err
+        // above. The match is still total so a policy refactor cannot
+        // silently change the audit posture.
+        DrainOutcome::EndedUnsealed => Ok(()),
     }
 }
 
@@ -219,6 +301,76 @@ mod tests {
             .await
             .expect_err("unbounded silence is a truncation, not a wait");
         assert!(err.to_string().contains("PARTIAL"));
+        assert!(err.to_string().contains("no message for"));
+    }
+
+    // ── The composable-policy axis (merged_bug_106 / bug_163) ──────
+
+    // r[verify cli.stream.drain-bound]
+    /// RED (bug_163 shape, at the law level): under the
+    /// rendered-stream posture a post-sentinel transport error must
+    /// not fail the drain — the sentinel sealed it. Pre-fix, logs.rs
+    /// polled once more past `is_complete` and a post-seal RST exited
+    /// nonzero with the complete log already on stdout.
+    #[tokio::test]
+    async fn disclose_posture_sentinel_then_transport_error_is_sealed() {
+        let mut s = Scripted(VecDeque::from([
+            Ok(Some(1)),
+            Ok(Some(99)),
+            Err(tonic::Status::unavailable("LB reset after the final chunk")),
+        ]));
+        let policy = DrainPolicy {
+            what: "test",
+            inactivity: STREAM_INACTIVITY_TIMEOUT,
+            missing_sentinel: MissingSentinel::DiscloseExitZero,
+        };
+        let outcome = drain_with(&policy, &mut s, |_| Ok(()), |m| *m == 99)
+            .await
+            .expect("sealed before the error");
+        assert_eq!(outcome, DrainOutcome::Sealed);
+    }
+
+    /// The rendered-stream posture converts a clean unsealed end into
+    /// `Ok(EndedUnsealed)` — the caller renders the disclosure — but
+    /// does NOT swallow pre-sentinel errors: only the
+    /// clean-end-without-sentinel case is posture-dependent.
+    #[tokio::test]
+    async fn disclose_posture_clean_unsealed_end_is_ok_and_flagged() {
+        let mut s = Scripted(VecDeque::from([Ok(Some(1))]));
+        let policy = DrainPolicy {
+            what: "test",
+            inactivity: STREAM_INACTIVITY_TIMEOUT,
+            missing_sentinel: MissingSentinel::DiscloseExitZero,
+        };
+        let outcome = drain_with(&policy, &mut s, |_| Ok(()), |m| *m == 99)
+            .await
+            .expect("clean unsealed end is not an error under this posture");
+        assert_eq!(outcome, DrainOutcome::EndedUnsealed);
+
+        let mut s = Scripted(VecDeque::from([
+            Ok(Some(1)),
+            Err(tonic::Status::unavailable("mid-stream death")),
+        ]));
+        drain_with(&policy, &mut s, |_| Ok(()), |m| *m == 99)
+            .await
+            .expect_err("a PRE-sentinel transport error is an error under every posture");
+    }
+
+    /// The bound composes with the disclosure posture: opting out of
+    /// the truncation `Err` does not opt out of the half-open
+    /// conversion (the policy struct has no way to express a
+    /// bound-less drain).
+    #[tokio::test(start_paused = true)]
+    async fn disclose_posture_still_bounds_half_open_silence() {
+        let mut s = HalfOpen;
+        let policy = DrainPolicy {
+            what: "test",
+            inactivity: STREAM_INACTIVITY_TIMEOUT,
+            missing_sentinel: MissingSentinel::DiscloseExitZero,
+        };
+        let err = drain_with(&policy, &mut s, |_: &u32| Ok(()), |_| false)
+            .await
+            .expect_err("the inactivity bound is not optional");
         assert!(err.to_string().contains("no message for"));
     }
 }

@@ -18,6 +18,7 @@ use rio_proto::store::{TailLogChunk, TailLogRequest};
 
 use crate::LogsClient;
 use crate::RPC_TIMEOUT;
+use crate::stream_util::{self, DrainOutcome, DrainPolicy, MessageStream, MissingSentinel};
 
 #[derive(clap::Args, Clone)]
 pub(crate) struct Args {
@@ -85,35 +86,7 @@ pub(crate) async fn run(client: &mut LogsClient, a: Args) -> anyhow::Result<()> 
     // emit thousands.
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    // Track the terminal chunk's completeness. The store computes
-    // `is_complete` from the manifest (terminal execution +
-    // `final_line_count` reported + a contiguous [0, n) chunk range)
-    // and stamps it on the last chunk. A still-running build, a
-    // cancelled execution, or a log whose final lines never reached
-    // the store closes the stream with `is_complete=false`. The lines
-    // are still worth printing, but the missing tail is usually the
-    // build error itself — say so on stderr rather than letting a
-    // truncated log read as the whole thing. Stderr keeps stdout pure
-    // log bytes; exit stays 0 (an incomplete log is not a command
-    // failure). Initialized `true` so a zero-chunk clean close
-    // (unreachable today — every server path emits ≥1 chunk or an
-    // error) stays silent.
-    // r[impl obs.log.incomplete-surfaced+2]
-    let mut last_complete = true;
-    // The shared kernel cursor: dedups chunk-granularity resends (the
-    // store legally re-serves whole containing chunks) and names
-    // forward jumps instead of printing a seamless splice
-    // (merged_bug_306 CLI half).
-    let mut cursor = 0u64;
-    let mut gap_seen = false;
-    while let Some(chunk) = stream
-        .message()
-        .await
-        .map_err(|s| anyhow!("TailLog: stream: {} ({:?})", s.message(), s.code()))?
-    {
-        last_complete = chunk.is_complete;
-        emit_chunk(&mut out, &mut cursor, &mut gap_seen, &chunk)?;
-    }
+    let (last_complete, gap_seen) = drain_log_chunks(&mut out, &mut stream).await?;
     out.flush()?;
     // DOCUMENTED EXCEPTION to stream_util::drain_until_done (bug_141):
     // an incomplete LOG is a rendered state with user-facing semantics
@@ -134,6 +107,52 @@ pub(crate) async fn run(client: &mut LogsClient, a: Args) -> anyhow::Result<()> 
         eprintln!("(stored log has interior gaps — marked inline)");
     }
     Ok(())
+}
+
+// r[impl obs.log.incomplete-surfaced+2]
+/// Drain the non-follow `TailLog` stream through the shared drain law
+/// (bug_163) and return `(complete, gap_seen)`.
+///
+/// Completeness: the store computes `is_complete` from the manifest
+/// (terminal execution + `final_line_count` reported + a contiguous
+/// [0, n) chunk range) and stamps it ONLY in `send_final`, immediately
+/// followed by return — the stamp is terminal BY CONSTRUCTION, so the
+/// drain law's sentinel seal applies: the loop breaks on it and never
+/// polls again. Pre-fix, one more `message().await` ran past the
+/// sentinel, and a post-seal transport error (replica rolled, LB RST
+/// before trailers) exited nonzero with the provably complete log
+/// already on stdout — inverting the documented exit-0 pipeline
+/// contract.
+///
+/// Posture: `DiscloseExitZero` — a clean unsealed end means a
+/// still-running build, a cancelled execution, or a never-flushed
+/// tail; the lines are worth printing and the caller's stderr notes
+/// carry the disclosure (an incomplete LOG is a rendered state, not a
+/// command failure). The silence bound still applies: a non-follow
+/// replay streams stored chunks back-to-back, so minutes of silence
+/// is a dead peer (half-open store death), not a slow build.
+async fn drain_log_chunks<W: Write, S: MessageStream<TailLogChunk>>(
+    out: &mut W,
+    stream: &mut S,
+) -> anyhow::Result<(bool, bool)> {
+    // The shared kernel cursor: dedups chunk-granularity resends (the
+    // store legally re-serves whole containing chunks) and names
+    // forward jumps instead of printing a seamless splice
+    // (merged_bug_306 CLI half).
+    let mut cursor = 0u64;
+    let mut gap_seen = false;
+    let outcome = stream_util::drain_with(
+        &DrainPolicy {
+            what: "TailLog",
+            inactivity: stream_util::STREAM_INACTIVITY_TIMEOUT,
+            missing_sentinel: MissingSentinel::DiscloseExitZero,
+        },
+        stream,
+        |chunk| emit_chunk(out, &mut cursor, &mut gap_seen, chunk).map_err(Into::into),
+        |chunk| chunk.is_complete,
+    )
+    .await?;
+    Ok((matches!(outcome, DrainOutcome::Sealed), gap_seen))
 }
 
 /// Emit one chunk through the shared cursor: skip the already-printed
@@ -247,5 +266,77 @@ mod tests {
         let (out, gap) = drain(&[chunk(0, &["a"]), chunk(1, &[])]);
         assert_eq!(out, "a\n");
         assert!(!gap);
+    }
+
+    // ── The drain-law routing (bug_163) ────────────────────────────
+
+    struct Scripted(std::collections::VecDeque<Result<Option<TailLogChunk>, tonic::Status>>);
+
+    impl MessageStream<TailLogChunk> for Scripted {
+        async fn next_message(&mut self) -> Result<Option<TailLogChunk>, tonic::Status> {
+            self.0.pop_front().unwrap_or(Ok(None))
+        }
+    }
+
+    fn sealed(mut c: TailLogChunk) -> TailLogChunk {
+        c.is_complete = true;
+        c
+    }
+
+    // r[verify obs.log.incomplete-surfaced+2]
+    /// RED (bug_163): the non-follow drain polled once more past the
+    /// terminal-by-construction `is_complete` sentinel, so a post-seal
+    /// transport error (replica rolled, LB RST before trailers) exited
+    /// nonzero with the provably complete log already on stdout —
+    /// inverting the documented exit-0 pipeline contract. The drain
+    /// law's sentinel seal breaks on the stamp; the error is never
+    /// polled. Pre-fix: `Err("TailLog: stream: LB reset ...")`.
+    #[tokio::test]
+    async fn sentinel_then_transport_error_is_complete_and_ok() {
+        let mut out = Vec::new();
+        let mut s = Scripted(
+            [
+                Ok(Some(chunk(0, &["a"]))),
+                Ok(Some(sealed(chunk(1, &["b"])))),
+                Err(tonic::Status::unavailable("LB reset before trailers")),
+            ]
+            .into(),
+        );
+        let (complete, gap) = drain_log_chunks(&mut out, &mut s)
+            .await
+            .expect("post-seal transport noise is not a command failure");
+        assert!(complete, "the sentinel sealed the log as complete");
+        assert!(!gap);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "a\nb\n",
+            "the complete log reached stdout"
+        );
+    }
+
+    /// The exit-0 disclosure posture is preserved: a clean end without
+    /// the sentinel drains Ok (the caller's stderr note carries the
+    /// disclosure), and a PRE-sentinel transport error is still an
+    /// error — only the clean-unsealed-end case is posture-dependent.
+    #[tokio::test]
+    async fn unsealed_end_is_ok_and_incomplete() {
+        let mut out = Vec::new();
+        let mut s = Scripted([Ok(Some(chunk(0, &["a"])))].into());
+        let (complete, gap) = drain_log_chunks(&mut out, &mut s)
+            .await
+            .expect("an incomplete log is a rendered state, not a failure");
+        assert!(!complete);
+        assert!(!gap);
+
+        let mut s = Scripted(
+            [
+                Ok(Some(chunk(0, &["a"]))),
+                Err(tonic::Status::unavailable("mid-stream death")),
+            ]
+            .into(),
+        );
+        drain_log_chunks(&mut Vec::new(), &mut s)
+            .await
+            .expect_err("a pre-sentinel transport error still fails the drain");
     }
 }
