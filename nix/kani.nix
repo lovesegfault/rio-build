@@ -565,6 +565,29 @@ in
     # S4/S6a lands second re-derives the census from the driver's
     # "Complete - N" line and sets the cumulative.)
     # r[verify sched.executor.confirm-fence]
-    expectedHarnesses = 40;
+    # 40 → 44 (bughunt-5 S6a, bug_084): + the per-arm refusal-routing
+    # family (routing.rs `mod proofs`, on the set-free
+    # route_from_classes core — per-arm split per the K6 lesson, no
+    # symbolic collections, no lengths):
+    #   - check_refusal_content_settles_from_source /
+    #     check_refusal_trust_and_content_settles_from_source /
+    #     check_refusal_unrecognized_settles_from_source: each named
+    #     Refusal variant × the full bounded domain of every other
+    #     axis — refused ∧ anything missing ⟹ ResolveFromSource, with
+    #     kani::cover non-vacuity pins (from-source + the refusal-moot
+    #     complete/re-arm lanes reachable per harness).
+    #   - check_only_unrefused_settlements_rearm_or_failfast: the
+    #     architectural close as a proof — FailFast ⟹ Refusal::None
+    #     over the whole domain, and an arm-3 ReArm (anything missing)
+    #     ⟹ Refusal::None; covers pin both consequents reachable.
+    # Count-neutral riders: check_trust_refused_settles_from_source
+    # retargets Refusal::Trust; check_route_no_vacuous_complete,
+    # check_route_total_and_cells_reachable, and
+    # check_childless_leaf_non_pruned_never_failfast redraw their last
+    # axis over any_refusal().
+    # (C-1 cumulative: 38 → 40 → 44 — S4's fence-obligation pair then
+    # S6a's refusal-routing four; second-lander census re-derived from
+    # the kani driver's "Complete - N" summary line at this tip.)
+    expectedHarnesses = 44;
   };
 }

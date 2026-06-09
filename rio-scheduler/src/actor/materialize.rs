@@ -1225,12 +1225,35 @@ impl DagActor {
 // A4): rio-scheduler is a bin crate and the kani gate is lib-only —
 // the kernel sweep proves the cells; this module keeps the wiring.
 pub(crate) use rio_evidence_kernel::routing::{
-    LiveWanted, ReprobeAnswer, RoutingInputs, UnobtainableRouting, route_unobtainable,
+    LiveWanted, Refusal, ReprobeAnswer, RoutingInputs, UnobtainableRouting, route_unobtainable,
     success_covers_live_wanted,
 };
 
+/// THE decode chokepoint of the wire refusal (bug_084): raw
+/// `Unobtainable.refusal` (field 6) → the kernel's closed [`Refusal`]
+/// alphabet. MUST consume the RAW wire value via `try_from` — NEVER
+/// the prost accessor, whose unknown-value default (UNSPECIFIED)
+/// would launder a FUTURE refusal axis into the clean lane, repeating
+/// bug_084's shape at the next alphabet evolution. Decode law: a
+/// known nonzero value wins; 0/absent is `Refusal::None` (field 5,
+/// `trust_refused`, is NOT consulted — it is a decode-ignored
+/// coherence echo per SIGNED Q6, bughunt-5 §5-S 2026-06-09: --wipe
+/// rollout, no old-store skew lane); an unknown nonzero value is
+/// `Refusal::Unrecognized` — conservative refusal routing, kept for
+/// future-evolution robustness, not as a rollout hedge.
+pub(super) fn refusal_from_wire(refusal: i32) -> Refusal {
+    use rio_proto::types::UnobtainableRefusal as Wire;
+    match Wire::try_from(refusal) {
+        Ok(Wire::Unspecified) => Refusal::None,
+        Ok(Wire::Trust) => Refusal::Trust,
+        Ok(Wire::Content) => Refusal::Content,
+        Ok(Wire::TrustAndContent) => Refusal::TrustAndContent,
+        Err(_) => Refusal::Unrecognized,
+    }
+}
+
 impl DagActor {
-    // r[impl sched.materialize.routing+6]
+    // r[impl sched.materialize.routing+7]
     /// Consume one materialization outcome (the §2.4 consumption
     /// transaction). Reachable only flag-on in practice (no
     /// materialization attempt can exist otherwise) — but ALWAYS wired
@@ -1503,10 +1526,20 @@ impl DagActor {
                     });
                 let mut missing_references = u.missing_reference_paths.clone();
                 missing_references.extend(skew_references);
+                // bug_084: decode the typed refusal at THE chokepoint
+                // before any probe decision — the routing consumes the
+                // closed alphabet, not the raw wire value.
+                let refusal = refusal_from_wire(u.refusal);
                 // The arm-3 probe is needed exactly when arm 0 cannot
                 // apply (a live-wanted miss OR a confirmed closure
-                // hole) and the evidence is leaf/holed (arms 1/2
-                // decide without it).
+                // hole), the evidence is leaf/holed (arms 1/2 decide
+                // without it), AND no typed refusal rode the outcome
+                // (bug_084): under any refusal the presence-only FMP
+                // round-trip is doomed — it cannot answer the trust/
+                // content question the refusal already settled — and
+                // its failure path's bare re-arm below would re-meet
+                // the same refusal; the kernel's arm-3 refusal match
+                // owns the verdict without it.
                 let needs_probe = (missing_wanted
                     .iter()
                     .any(|p| live_wanted_paths.contains(p.as_str()))
@@ -1515,7 +1548,8 @@ impl DagActor {
                         durable_evidence,
                         rio_evidence_kernel::ClosureEvidence::ChildlessLeaf
                             | rio_evidence_kernel::ClosureEvidence::Holed
-                    );
+                    )
+                    && !refusal.is_refused();
                 let reprobe = if needs_probe {
                     match self
                         .reprobe_live_wanted_paths(&drv_hash, live_wanted_paths.paths())
@@ -1544,10 +1578,11 @@ impl DagActor {
                     prior_unobtainable_count: prior_unobtainable,
                     reprobe,
                     pruned_origin,
-                    // merged_bug_263: the typed trust refusal rides
-                    // the wire into the settlement (absent/old-store
-                    // decodes false = the pre-field routing).
-                    trust_refused: u.trust_refused,
+                    // bug_084 (supersedes the merged_bug_263 bool):
+                    // the typed refusal alphabet rides the wire into
+                    // the settlement through the one decode
+                    // chokepoint above.
+                    refusal,
                 });
                 // 3. Execute the routing — every arm spends the
                 //    settled-close witness on exactly one companion.
@@ -1769,7 +1804,7 @@ impl DagActor {
     /// channel without the decision no longer exists. Park backs off
     /// the job durably (and the node is requeued either way: claimable
     /// again / from-source dispatchable per the admission table).
-    // r[impl sched.materialize.routing+6]
+    // r[impl sched.materialize.routing+7]
     /// Settled-close companion #5 of 5 — it owns its OWN close (the
     /// charge row rides the close transaction), then runs the park
     /// verdict. Returns the ack witness plus whether the close
@@ -2520,7 +2555,7 @@ impl DagActor {
     /// mid-walk crash leaves outputs present but the closure
     /// incomplete) and never `executor_crash` (BC-2: the charge feeds
     /// the materialization budget and nothing else).
-    // r[impl sched.materialize.routing+6]
+    // r[impl sched.materialize.routing+7]
     pub(super) async fn establish_materialization_attempt(
         &mut self,
         attempt: &crate::db::open_attempts::OpenAttemptRow,
@@ -2563,7 +2598,7 @@ impl DagActor {
     }
 
     // r[impl obs.metric.materialization-stalled+2]
-    // r[impl sched.materialize.routing+6]
+    // r[impl sched.materialize.routing+7]
     /// PD-20 (design §2.5, Phase B T-6.1): the parked-job housekeeping
     /// arm. Every tick, flag-on, leader-only:
     ///

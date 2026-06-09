@@ -1471,7 +1471,7 @@ workers (ledger lost with the process) still settle through the charged
 establishment window --- the signed residual, now reachable only by real
 crashes. Build-kind re-delivery stays credential-less (as-built).
 
-#r("sched.materialize.routing+6")[
+#r("sched.materialize.routing+7")[
   A materialization outcome MUST be consumed in exactly one fenced transaction
   keyed by its exec_id, and that transaction MUST re-read live interest and the
   live effective wanted set before acting: a Success outcome completes the node
@@ -1496,15 +1496,22 @@ crashes. Build-kind re-delivery stays credential-less (as-built).
   answer set, any failed or indeterminate tenant view re-arms instead ---
   the job fails only when NO interested tenant can obtain), or after the
   per-job re-probe one-shot is spent --- the settlement arm. When the
-  outcome carries the typed trust-refusal marker
-  (`Unobtainable.trust_refused`: at least one unobtained path was present
-  upstream but refused by signature policy), the settlement MUST consume
-  it typed, end-to-end: an Obtainable re-probe answer MUST NOT license a
-  re-arm (the HEAD re-probe is sig-blind --- it confirms the presence that
-  was never in question) and the verdict MUST NOT be the fail-fast even
-  for a pruned origin (the resubmit-directing error sends the user into
-  the same refusal, unbounded) --- a trust-refused settlement with
-  anything missing resolves from-source. Otherwise the settlement MUST
+  outcome carries a typed refusal (`Unobtainable.refusal`, the CLOSED
+  `UnobtainableRefusal` alphabet: trust --- present upstream but refused
+  by signature policy; content --- present upstream but claiming bytes
+  that disagree with the stored row; both; or an unrecognized wire value
+  --- a future axis that MUST decode from the raw value, never through
+  an accessor that defaults unknowns to the clean lane, and MUST route
+  conservatively as a refusal), the settlement MUST consume the alphabet
+  typed, end-to-end and match it exhaustively: an Obtainable re-probe
+  answer MUST NOT license a re-arm (the re-probe is a presence-blind
+  HEAD --- it confirms the presence that was never in question, not
+  trust and not content agreement; the consumption does not issue the
+  doomed probe round-trip at all) and the verdict MUST NOT be the
+  fail-fast even for a pruned origin (the resubmit-directing error sends
+  the user into the same deterministic refusal, unbounded) --- a refused
+  settlement with anything missing resolves from-source, whatever the
+  refusal axis. Otherwise the settlement MUST
   discriminate on the job's pruned origin (`origin = 'pruned'`, set at pruned
   creation or by the pruned-wins dedup upgrade and read from the job row at
   decision time): a PRUNED-origin job fail-fasts every live
