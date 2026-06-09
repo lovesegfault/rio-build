@@ -320,12 +320,24 @@ pub(crate) async fn visible_subset(
         return Ok(visible);
     }
 
+    // bug_189: the DB-egress fetch runs BEFORE any trust verdict —
+    // `query_path_info_batch` validates rows at egress, so a corrupt
+    // row surfaces `MalformedRow` for a trust-nothing tenant EXACTLY
+    // as it does for a trusting one (one disposition with the
+    // single-path lane). The binding is the validated-row witness
+    // every branch below must consume; the empty-trust optimization
+    // may skip the sig cell, never the egress check. (Pre-fix the
+    // empty-trust early return preceded the fetch, answering the
+    // corrupt row "missing" on the batch lane while the single lane
+    // surfaced Internal.)
+    let rows = metadata::query_path_info_batch(pool, &subst_only).await?;
     let trusted = trusted_set(pool, signer, tid, cache).await?;
     if trusted.is_empty() {
-        // Tenant trusts nothing → all substitution-only paths hidden.
+        // Tenant trusts nothing → all substitution-only paths hidden
+        // (the rows above were still validated).
         return Ok(visible);
     }
-    for (_path, info) in metadata::query_path_info_batch(pool, &subst_only).await? {
+    for (_path, info) in rows {
         let Some(info) = info else {
             // No complete manifest — hidden (single-path agreement;
             // see the doc comment).

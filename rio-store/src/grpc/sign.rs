@@ -895,6 +895,24 @@ mod tests {
             "batch gate must surface the malformed row as an error \
              (one disposition with the single-path read); got Ok(hidden)"
         );
+
+        // bug_189: the SAME law for a TRUST-NOTHING tenant — the
+        // empty-trust optimization may skip the sig cell, never the
+        // DB-egress validation. Pre-fix the early return preceded
+        // query_path_info_batch, so the corrupt row was answered
+        // "missing" on the batch lane while the single lane surfaced
+        // Internal — exactly the divergence the one-disposition doc
+        // claims was unified.
+        let tid_nothing = seed_tenant(&db.pool, "malformed-row-trustless").await;
+        let batch_trustless = svc
+            .sig_visibility_gate_batch(Some(tid_nothing), std::slice::from_ref(&path))
+            .await;
+        assert!(
+            batch_trustless.is_err(),
+            "batch gate must surface the malformed row as an error for a \
+             trust-nothing tenant too (validation precedes every verdict, \
+             bug_189); got Ok(hidden)"
+        );
     }
 
     // r[verify store.substitute.find-missing-gated]
