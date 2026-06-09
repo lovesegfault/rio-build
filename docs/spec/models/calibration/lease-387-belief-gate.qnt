@@ -89,6 +89,14 @@ module leaseCalib387BeliefGate {
       // New-var frames mirroring the live shutdown (the exiting
       // process takes its in-memory ledger and cursor with it;
       // MAX_DROPS = 0 here freezes all four).
+      // bughunt-4 S2 planes, frozen here (HOLDER_EVIDENCE_LOSE = false,
+      // MAX_STEP_DOWNS = 0 in this pin's import):
+      conflictDeferredV' = conflictDeferredV,
+      blindConflictLose' = blindConflictLose,
+      acquireInstV' = acquireInstV,
+      stepDownReqV' = stepDownReqV,
+      stepDownsV' = stepDownsV,
+      staleStepDownServed' = staleStepDownServed,
       unconfirmed' = unconfirmed.put(n, NoUnconf),
       lastFetchedKey' = lastFetchedKey.put(n, -1),
       drops' = drops,

@@ -86,6 +86,14 @@ module leaseCalib303BlindTimeout {
     suspends' = suspends, shutdowns' = shutdowns,
     releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
     suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
+    // bughunt-4 S2 planes, frozen here (HOLDER_EVIDENCE_LOSE = false,
+    // MAX_STEP_DOWNS = 0 in this pin's import):
+    conflictDeferredV' = conflictDeferredV,
+    blindConflictLose' = blindConflictLose,
+    acquireInstV' = acquireInstV,
+    stepDownReqV' = stepDownReqV,
+    stepDownsV' = stepDownsV,
+    staleStepDownServed' = staleStepDownServed,
     unconfirmed' = unconfirmed, lastFetchedKey' = lastFetchedKey,
     drops' = drops,
     foreignBumps' = foreignBumps,
@@ -127,6 +135,14 @@ module leaseCalib303BlindTimeout {
     suspends' = suspends, shutdowns' = shutdowns,
     releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
     suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
+    // bughunt-4 S2 planes, frozen here (HOLDER_EVIDENCE_LOSE = false,
+    // MAX_STEP_DOWNS = 0 in this pin's import):
+    conflictDeferredV' = conflictDeferredV,
+    blindConflictLose' = blindConflictLose,
+    acquireInstV' = acquireInstV,
+    stepDownReqV' = stepDownReqV,
+    stepDownsV' = stepDownsV,
+    staleStepDownServed' = staleStepDownServed,
     unconfirmed' =
       if (lease.holder == Held(n)) unconfirmed
       else unconfirmed.put(n, NoUnconf),

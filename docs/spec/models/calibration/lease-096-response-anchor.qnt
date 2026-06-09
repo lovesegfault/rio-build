@@ -77,6 +77,14 @@ module leaseCalib096ResponseAnchor {
     // New-var frames mirroring the live renewReadOk (the parked read
     // arriving is a completed round; suspend and dropped-write are
     // never co-enabled, and MAX_DROPS = 0 here freezes all four).
+    // bughunt-4 S2 planes, frozen here (HOLDER_EVIDENCE_LOSE = false,
+    // MAX_STEP_DOWNS = 0 in this pin's import):
+    conflictDeferredV' = conflictDeferredV,
+    blindConflictLose' = blindConflictLose,
+    acquireInstV' = acquireInstV,
+    stepDownReqV' = stepDownReqV,
+    stepDownsV' = stepDownsV,
+    staleStepDownServed' = staleStepDownServed,
     unconfirmed' = unconfirmed.put(n, NoUnconf),
     lastFetchedKey' = lastFetchedKey,
     drops' = drops,
