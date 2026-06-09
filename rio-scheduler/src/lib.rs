@@ -209,6 +209,12 @@ pub fn describe_metrics() {
          exec_retention_days. The store's log TTL sweep never deletes these."
     );
     describe_counter!(
+        "rio_scheduler_confirm_fences_gc_deleted_total",
+        "executor_confirm_fences rows deleted by the housekeeping TTL rider \
+         (merged_bug_145): confirm-exit fence rows older than 24h — any \
+         straggler pull has long since timed out"
+    );
+    describe_counter!(
         "rio_scheduler_resource_floor_bumps_total",
         "resource_floor doublings on explicit resource-exhaustion signals (D4, labeled \
          reason=cgroup_oom|timeout; timeout covers DeadlineExceeded too. The stream-era \

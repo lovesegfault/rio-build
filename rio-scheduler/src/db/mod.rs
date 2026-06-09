@@ -23,6 +23,7 @@ pub(crate) mod attempts;
 mod batch;
 mod builds;
 pub(crate) use builds::BuildTerminalRow;
+pub(crate) mod confirm_fences;
 mod derivations;
 mod executions;
 mod history;

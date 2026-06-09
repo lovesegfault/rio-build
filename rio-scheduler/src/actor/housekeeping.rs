@@ -633,6 +633,29 @@ impl DagActor {
                 warn!(error = %e, "execution-row GC sweep failed; retrying next interval");
             }
         }
+
+        // merged_bug_145: the confirm-fence TTL rider — same cadence,
+        // after the ledger passes. Fences are garbage once any
+        // straggler pull has long since timed out (24h is orders of
+        // magnitude past every client deadline); one row per
+        // confirm-exited pod, so volume tracks pod churn.
+        match self
+            .db
+            .gc_confirm_fences(
+                crate::db::confirm_fences::CONFIRM_FENCE_GC_SECS,
+                ATTEMPTS_GC_BATCH,
+            )
+            .await
+        {
+            Ok(0) => {}
+            Ok(n) => {
+                debug!(deleted = n, "GC'd expired confirm-fence rows");
+                metrics::counter!("rio_scheduler_confirm_fences_gc_deleted_total").increment(n);
+            }
+            Err(e) => {
+                warn!(error = %e, "confirm-fence GC sweep failed; retrying next interval");
+            }
+        }
     }
 
     /// D1/A6 (merged_bug_163): reap RESOLVED materialization jobs past the

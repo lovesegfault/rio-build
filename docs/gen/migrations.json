@@ -94,6 +94,7 @@
     "094_establishment_clusters",
     "095_drop_derivations_tenant_id",
     "096_assignments_claim_nonce",
+    "097_executor_confirm_fences",
     "100_gc_collect_last_attempt"
   ]
 }

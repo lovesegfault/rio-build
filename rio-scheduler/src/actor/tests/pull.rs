@@ -6,10 +6,14 @@ use super::*;
 use crate::actor::pull::{PullOutcome, PullRejection};
 
 /// Send one `PullAssignment` through the actor and return the reply.
-async fn pull(
+/// `pod`: which pod's executor token this pull presents — the fence
+/// key (merged_bug_145). One production pod = one token = one tag;
+/// tests modeling a pod succession use distinct tags.
+async fn pull_as(
     handle: &ActorHandle,
     intent_id: &str,
     auth_intent: Option<&str>,
+    pod: &str,
 ) -> Result<PullOutcome, PullRejection> {
     handle
         .query_unchecked(|reply| ActorCommand::PullAssignment {
@@ -22,18 +26,31 @@ async fn pull(
             resume_exec_id: None,
             claim_nonce: None,
             confirm_only: false,
+            executor_token_sha256: Some(format!("tokhash-{pod}-{intent_id}")),
             reply,
         })
         .await
         .expect("actor alive")
 }
 
-/// [`pull`] with the merged_bug_083 confirm-only discriminator: a
-/// READ of the puller's holdings -- never a mint.
-async fn confirm_pull(
+/// [`pull_as`] for the single-pod common case.
+async fn pull(
     handle: &ActorHandle,
     intent_id: &str,
     auth_intent: Option<&str>,
+) -> Result<PullOutcome, PullRejection> {
+    pull_as(handle, intent_id, auth_intent, "pod-a").await
+}
+
+/// [`pull_as`] with the merged_bug_083 confirm-only discriminator: a
+/// read of the puller's holdings that, when answered "nothing held",
+/// becomes the pod's exit-0 license and fences its token
+/// (merged_bug_145) -- never a mint.
+async fn confirm_pull_as(
+    handle: &ActorHandle,
+    intent_id: &str,
+    auth_intent: Option<&str>,
+    pod: &str,
 ) -> Result<PullOutcome, PullRejection> {
     handle
         .query_unchecked(|reply| ActorCommand::PullAssignment {
@@ -44,10 +61,20 @@ async fn confirm_pull(
             resume_exec_id: None,
             claim_nonce: None,
             confirm_only: true,
+            executor_token_sha256: Some(format!("tokhash-{pod}-{intent_id}")),
             reply,
         })
         .await
         .expect("actor alive")
+}
+
+/// [`confirm_pull_as`] for the single-pod common case.
+async fn confirm_pull(
+    handle: &ActorHandle,
+    intent_id: &str,
+    auth_intent: Option<&str>,
+) -> Result<PullOutcome, PullRejection> {
+    confirm_pull_as(handle, intent_id, auth_intent, "pod-a").await
 }
 
 /// Unwrap a Deliver outcome.
@@ -91,6 +118,43 @@ async fn row_counts(pool: &sqlx::PgPool, drv_hash: &str) -> (i64, i64) {
     .await
     .expect("executions count");
     (assignments, executions)
+}
+
+/// merged_bug_145 (bughunt-4 S5b): the confirm-exit fence. A
+/// confirm-only pull answered "nothing held" (NotYetReady) is the
+/// builder's exit-0 license — the Job goes Succeeded. A LATE abandoned
+/// pull (timed out client-side, still in the mailbox) arriving AFTER
+/// that answer must NOT mint: the pod is gone, and an open attempt
+/// against a Succeeded Job is invisible to the establishment sweep
+/// (which reaps against FAILED pods). The durable fence (migration
+/// 097, keyed by the executor-token hash) screens the late DeliverNew
+/// to Gone.
+#[tokio::test]
+async fn pull_confirm_exit_fences_late_pull() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+    let _ev = merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "pull-fence",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+
+    // The pod's runtime confirm-exits: nothing was ever held.
+    let confirmed = confirm_pull(&handle, "pull-fence", Some("pull-fence")).await;
+    assert!(
+        matches!(confirmed, Ok(PullOutcome::NotYetReady { .. })),
+        "confirm with nothing held answers NotYetReady, got {confirmed:?}"
+    );
+
+    // The abandoned earlier pull lands AFTER the exit-0 license.
+    let late = pull(&handle, "pull-fence", Some("pull-fence")).await;
+    assert!(
+        matches!(late, Ok(PullOutcome::Gone)),
+        "a post-confirm pull from the same executor token must be \
+         fenced to Gone, never minted, got {late:?}"
+    );
+    Ok(())
 }
 
 // r[verify sched.executor.pull-transaction+2]
@@ -1973,23 +2037,37 @@ async fn confirm_only_pull_never_mints() -> TestResult {
     .await?;
 
     // Confirm probe on a Ready (mintable) node: screened, no mint.
-    let outcome = confirm_pull(&handle, "confirm-ro", Some("confirm-ro")).await;
+    // The nothing-held answer fences POD A's token (merged_bug_145:
+    // the confirm is the exit-0 license, not a pure read) — the
+    // intent itself stays mintable for the successor pod.
+    let outcome = confirm_pull_as(&handle, "confirm-ro", Some("confirm-ro"), "pod-a").await;
     assert!(
         matches!(outcome, Ok(PullOutcome::NotYetReady { .. })),
         "confirm-only on a Ready node must screen the mint, got {outcome:?}"
     );
     let (assignments, execs) = row_counts(&db.pool, "confirm-ro").await;
-    assert_eq!((assignments, execs), (0, 0), "the probe wrote nothing");
+    assert_eq!(
+        (assignments, execs),
+        (0, 0),
+        "the probe wrote no attempt rows"
+    );
 
-    // A real claiming pull mints; the confirm probe then RE-DELIVERS
-    // the held attempt (DeliverExisting passes the screen).
-    let first = expect_deliver(pull(&handle, "confirm-ro", Some("confirm-ro")).await);
-    let confirmed = expect_deliver(confirm_pull(&handle, "confirm-ro", Some("confirm-ro")).await);
+    // The successor pod (fresh token — the controller respawn shape)
+    // claims and mints; ITS confirm probe then RE-DELIVERS the held
+    // attempt (DeliverExisting passes the screen, and a held-attempt
+    // confirm answer writes NO fence).
+    let first = expect_deliver(pull_as(&handle, "confirm-ro", Some("confirm-ro"), "pod-b").await);
+    let confirmed =
+        expect_deliver(confirm_pull_as(&handle, "confirm-ro", Some("confirm-ro"), "pod-b").await);
     assert_eq!(
         first.exec_id, confirmed.exec_id,
         "the confirm probe re-delivers the SAME open attempt, never a new one"
     );
     let (assignments, _execs) = row_counts(&db.pool, "confirm-ro").await;
     assert_eq!(assignments, 1, "still exactly one mint");
+    // A held-attempt confirm is NOT an exit-0 license: pod B's token
+    // is unfenced and its re-pull still re-delivers.
+    let repull = expect_deliver(pull_as(&handle, "confirm-ro", Some("confirm-ro"), "pod-b").await);
+    assert_eq!(first.exec_id, repull.exec_id, "pod B stays unfenced");
     Ok(())
 }

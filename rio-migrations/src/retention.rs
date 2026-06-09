@@ -169,6 +169,16 @@ pub const RETENTION_REGISTRY: &[(&str, RetentionPolicy)] = &[
         },
     ),
     (
+        "executor_confirm_fences",
+        RetentionPolicy::SweptBy {
+            symbol: "gc_confirm_fences",
+            note: "the attempt-ledger housekeeping tick's fence rider \
+                   (merged_bug_145): rows older than 24h — any straggler \
+                   pull has long since timed out; one row per \
+                   confirm-exited pod, so volume tracks pod churn",
+        },
+    ),
+    (
         "gc_collect_state",
         RetentionPolicy::KeepForever(
             "singleton row (CHECK (singleton)); the collector's durable state",

@@ -1131,6 +1131,11 @@
       "doc": "Build CRUD + status transitions — `builds` table."
     },
     {
+      "path": "db/confirm_fences.rs",
+      "depth": 1,
+      "doc": "The confirm-exit fence (merged_bug_145, migration 097)."
+    },
+    {
       "path": "db/derivations.rs",
       "depth": 1,
       "doc": "Per-derivation state + poison tracking — `derivations` table."

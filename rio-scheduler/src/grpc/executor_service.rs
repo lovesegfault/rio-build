@@ -671,6 +671,24 @@ impl ExecutorService for SchedulerGrpc {
             }
         };
         let auth_intent = auth_claims.as_ref().map(|c| c.intent_id.clone());
+        // merged_bug_145: the confirm-fence key — SHA-256 of the raw
+        // executor token, computed HERE (the only layer that sees the
+        // raw credential; the actor and PG handle hashes only).
+        // Metadata carrier wins when both are present — the same
+        // precedence require_executor's verification applies. None
+        // (no token anywhere = dev mode) skips the fence entirely.
+        let executor_token_sha256 = {
+            use sha2::Digest as _;
+            let raw: Option<&[u8]> = request
+                .metadata()
+                .get("x-rio-executor-token")
+                .map(|v| v.as_bytes())
+                .or_else(|| {
+                    let body = request.get_ref().executor_token.as_bytes();
+                    (!body.is_empty()).then_some(body)
+                });
+            raw.map(|bytes| hex::encode(sha2::Sha256::digest(bytes)))
+        };
         let req = request.into_inner();
         if req.intent_id.is_empty() {
             return Err(Status::invalid_argument("intent_id is required"));
@@ -758,6 +776,7 @@ impl ExecutorService for SchedulerGrpc {
                 resume_exec_id,
                 claim_nonce,
                 confirm_only: req.confirm_only,
+                executor_token_sha256,
                 reply: reply_tx,
             })
             .await

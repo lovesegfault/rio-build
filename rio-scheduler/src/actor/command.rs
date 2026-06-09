@@ -152,6 +152,13 @@ pub enum ActorCommand {
         /// the assignment at mint, compared by the kernel's
         /// re-delivery cell. Always `None` for build pulls.
         claim_nonce: Option<uuid::Uuid>,
+        /// merged_bug_145: SHA-256 hex of the raw executor token —
+        /// the confirm-exit fence key, computed at the gRPC boundary
+        /// (the only layer that sees the raw credential; the actor
+        /// stores/compares hashes only). `None` when the request
+        /// carried no token (dev mode) — fail-open, no fence
+        /// interaction (the pre-fence wire shape, bounded skew).
+        executor_token_sha256: Option<String>,
         /// merged_bug_083: confirm-only pull
         /// (`PullAssignmentRequest.confirm_only`) — a READ of the
         /// puller's holdings. The DeliverNew admission is screened to

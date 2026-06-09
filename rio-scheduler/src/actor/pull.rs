@@ -103,12 +103,14 @@ pub enum PullRejection {
     StaleGeneration,
     /// The HMAC-attested intent does not match the requested intent.
     TokenMismatch,
-    /// A consumption close did not become durable (bug_182, the NACK
-    /// law): the report is NOT consumed — the store's redelivery
-    /// re-presents the SAME outcome and the idempotent close retries.
-    /// Retryable (UNAVAILABLE): strictly better than acking a lost
-    /// close and letting the charged 'unreported' establishment settle
-    /// the attempt an hour later.
+    /// A required durable write did not land (the NACK law, bug_182's
+    /// consumption close; merged_bug_145's confirm fence): the caller
+    /// is NOT answered — the retry re-presents the SAME request and
+    /// the idempotent write retries. Retryable (UNAVAILABLE):
+    /// strictly better than acking a lost close (a charged
+    /// 'unreported' establishment an hour later) or licensing an
+    /// unfenced exit-0 (an invisible open attempt against a
+    /// Succeeded Job).
     ConsumptionNotDurable,
     /// Database failure while admitting or minting.
     Internal(String),
@@ -252,7 +254,8 @@ impl DagActor {
     #[allow(clippy::too_many_arguments)]
     // The pull's wire surface is the argument list (one field per
     // PullAssignmentRequest input); bundling into a struct would just
-    // restate the proto. Grew to 8 with confirm_only (merged_bug_083).
+    // restate the proto. Grew to 8 with confirm_only (merged_bug_083),
+    // 9 with the confirm-fence token hash (merged_bug_145).
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn handle_pull_assignment(
         &mut self,
@@ -263,6 +266,7 @@ impl DagActor {
         resume_exec_id: Option<Uuid>,
         claim_nonce: Option<Uuid>,
         confirm_only: bool,
+        executor_token_sha256: Option<String>,
         reply: oneshot::Sender<Result<PullOutcome, PullRejection>>,
     ) {
         let result = self
@@ -274,6 +278,7 @@ impl DagActor {
                 resume_exec_id,
                 claim_nonce,
                 confirm_only,
+                executor_token_sha256.as_deref(),
             )
             .await;
         let _ = reply.send(result);
@@ -290,6 +295,7 @@ impl DagActor {
         resume_exec_id: Option<Uuid>,
         claim_nonce: Option<Uuid>,
         confirm_only: bool,
+        executor_token_sha256: Option<&str>,
     ) -> Result<PullOutcome, PullRejection> {
         // Standby replicas answer nothing (the gRPC layer already
         // gates; this closes the in-flight-deposed window).
@@ -415,6 +421,29 @@ impl DagActor {
             decision
         };
 
+        // merged_bug_145: the confirm-exit fence's WRITE-AHEAD half. A
+        // confirm answered "nothing held" (NotYetReady/Gone) is the
+        // builder's exit-0 license — the Job goes Succeeded on it. The
+        // fence row must be durable BEFORE that license is issued, or
+        // a late abandoned pull (still in the mailbox/network) mints
+        // an open attempt against a Succeeded Job — invisible to the
+        // establishment sweep, which reaps against FAILED pods.
+        // Fail-closed: if the fence write fails, the license is NOT
+        // issued (retryable Internal; the builder's confirm regime
+        // retries or exits nonzero → Failed → the sweep reaps).
+        if confirm_only
+            && matches!(decision, PullDecision::NotYetReady | PullDecision::Gone)
+            && let Some(hash) = executor_token_sha256
+            && let Err(e) = self.db.insert_confirm_fence(hash, intent_id).await
+        {
+            warn!(intent_id = %intent_id, error = %e,
+                  "confirm fence write failed; withholding the exit-0 license");
+            // Retryable class: the builder's confirm regime re-attempts
+            // (Idle) or exits nonzero (Shutdown) — the pod never exits
+            // 0 on an unfenced confirm.
+            return Err(PullRejection::ConsumptionNotDurable);
+        }
+
         match decision {
             PullDecision::RejectToken => {
                 // r[impl sec.executor.identity-token+3]
@@ -461,6 +490,31 @@ impl DagActor {
                 Ok(PullOutcome::Deliver(Box::new(assignment)))
             }
             PullDecision::DeliverNew => {
+                // merged_bug_145: the confirm-exit fence's READ half.
+                // A fenced token already received its exit-0 license —
+                // the pod is gone (or exiting); minting would open an
+                // attempt no sweep can see. Screen to Gone (terminal
+                // for any straggler loop). Fail-closed on a read
+                // error: refusing a mint costs one NotYetReady retry;
+                // a false mint costs an invisible open attempt — and
+                // the mint transaction needs PG anyway.
+                if let Some(hash) = executor_token_sha256 {
+                    match self.db.confirm_fence_exists(hash).await {
+                        Ok(true) => {
+                            info!(intent_id = %intent_id,
+                                  "DeliverNew screened to Gone: executor token is confirm-fenced");
+                            return Ok(PullOutcome::Gone);
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            warn!(intent_id = %intent_id, error = %e,
+                                  "confirm fence read failed; withholding the mint");
+                            return Ok(PullOutcome::NotYetReady {
+                                retry_after_secs: NOT_YET_READY_RETRY_AFTER_SECS,
+                            });
+                        }
+                    }
+                }
                 self.mint_and_deliver(
                     &drv_hash,
                     &pulling_identity,

@@ -95,6 +95,7 @@
   "rio_scheduler_cache_hit_deferred_total": "Cache-hit derivations deferred to Queued because their inputDrvs are not yet Completed",
   "rio_scheduler_cache_hits_total": "Derivations served from cache (labeled by source: scheduler/reprobe/existing/dispatch)",
   "rio_scheduler_cleanup_dropped_total": "Terminal-build cleanup commands dropped due to channel backpressure; alert if rate > 0",
+  "rio_scheduler_confirm_fences_gc_deleted_total": "executor_confirm_fences rows deleted by the housekeeping TTL rider (merged_bug_145): confirm-exit fence rows older than 24h — any straggler pull has long since timed out",
   "rio_scheduler_critical_path_accuracy": "Predicted vs actual completion ratio (actual/estimated; 1.0=perfect, >1.0=underestimate)",
   "rio_scheduler_derivations_gc_deleted_total": "Orphan-terminal derivations rows deleted by the periodic Tick sweep (I-169.2)",
   "rio_scheduler_derivations_queued": "Ready derivations waiting for a worker (DAG-status count; the per-system split is queued_by_system on ClusterStatus/GetSpawnIntents)",

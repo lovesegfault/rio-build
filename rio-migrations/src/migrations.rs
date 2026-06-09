@@ -2227,6 +2227,36 @@ pub const M_095: () = ();
 /// credential and the reset-clear contract.
 pub const M_096: () = ();
 
+/// `097_executor_confirm_fences.sql` — merged_bug_145 (bughunt-4 S5b;
+/// R11 escalation in the wave-log, EXPLICIT orchestrator ACK; number
+/// 097 per the §1.6 reservation).
+///
+/// One row per confirm-exited executor pod: the scheduler INSERTs it
+/// when a `confirm_only` pull is answered "nothing held"
+/// (NotYetReady/Gone) — the durable half of the builder's exit-0
+/// license, written BEFORE the reply (write-ahead: no clean-exit
+/// answer without the fence on disk). Any LATER `DeliverNew`
+/// admission presenting the same executor token is screened to Gone:
+/// pre-fence, a late abandoned pull (timed out client-side, still in
+/// the actor mailbox or network) could mint an open attempt against a
+/// Job that had already exited 0 (`Succeeded`), which the
+/// establishment sweep — keyed to FAILED pods — would never reap.
+///
+/// Key: SHA-256 hex of the RAW executor token bytes, the finest pod
+/// discriminator the wire carries (the token is per-intent claims
+/// {intent_id, kind, expiry_unix}; a retry pod for the same intent
+/// mints a fresh token with a later expiry → different bytes → not
+/// fenced). Hash-only storage: the raw credential never lands in PG.
+/// Disclosed residual (accepted at ACK): two pods minted in the SAME
+/// second carry byte-identical tokens — indistinguishable on the wire
+/// even without the fence; the consequence is one bounded charge-free
+/// pod cycle (fenced pull answers Gone → pod exits 0 → controller
+/// respawns), never a wedge or a false mint. Fences are garbage after
+/// any straggler has long since timed out: the attempt-ledger
+/// housekeeping tick deletes rows older than 24h (CONFIRM_FENCE_GC
+/// in db/confirm_fences.rs).
+pub const M_097: () = ();
+
 /// `100_gc_collect_last_attempt.sql` — bug_284 (bughunt-4 S4; R11
 /// escalation in the wave-log, number 100 chosen clear of the 097-099
 /// reservations).
