@@ -55,6 +55,19 @@ pub struct Config {
     /// helm renders both from `sla.hwBenchMemFloor`. Env:
     /// `RIO_HW_BENCH_MEM_FLOOR`.
     pub hw_bench_mem_floor: u64,
+    /// Cluster identity axis for the node-informer's exposure uids
+    /// (merged_bug_001). `interrupt_samples` lives in the shared-PG
+    /// (global-DB) topology of ADR-023 §2.13 and M_047's partial
+    /// unique index on `event_uid` is table-GLOBAL, so every exposure
+    /// idempotency key MUST carry the cluster
+    /// (`exposure:{cluster}:{hw}:{window-slot}`) or two clusters'
+    /// informers silently absorb each other's λ-denominator windows.
+    /// MIRRORS the scheduler's `[sla].cluster`: helm renders BOTH from
+    /// the one values expression (`scheduler.sla.cluster`, falling
+    /// back to `karpenter.clusterName`, then `""`) into the two TOMLs
+    /// — never set them apart by hand. Empty = single-cluster default
+    /// (matches the scheduler's `DEFAULT ''` column).
+    pub cluster: String,
 }
 
 impl Default for Config {
@@ -76,6 +89,9 @@ impl Default for Config {
             // default_hw_bench_mem_floor`. STREAM triad's 3×4×LLC
             // working set tops out ~4.6 GiB on c7a.48xlarge.
             hw_bench_mem_floor: 8 * (1 << 30),
+            // Single-cluster default — mirrors the scheduler's
+            // `[sla].cluster` `DEFAULT ''`.
+            cluster: String::new(),
         }
     }
 }

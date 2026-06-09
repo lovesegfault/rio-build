@@ -902,6 +902,12 @@
         "type": "uint64",
         "default": "8589934592",
         "description": "ADR-023 §13a: pod `requests.memory` floor for the `rio.build/hw-bench-needed` gate (STREAM triad working-set safety)."
+      },
+      {
+        "key": "cluster",
+        "type": "string",
+        "default": "",
+        "description": "Cluster identity axis for the node-informer's exposure uids (merged_bug_001). `interrupt_samples` lives in the shared-PG (global-DB) topology of ADR-023 §2.13 and M_047's partial unique index on `event_uid` is table-GLOBAL, so every exposure idempotency key MUST carry the cluster (`exposure:{cluster}:{hw}:{window-slot}`) or two clusters' informers silently absorb each other's λ-denominator windows."
       }
     ]
   }

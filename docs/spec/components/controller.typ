@@ -672,14 +672,25 @@ Every uncounted drop under-reports the spot-reclaim rate exactly while spot
 is being reclaimed --- the anti-conservative direction for the SLA solver's
 capacity-type decision.
 
-#r("ctrl.informer.exposure-recredit+1")[
+#r("ctrl.informer.exposure-recredit+2")[
   The λ-denominator exposure leg of `AppendInterruptSample` MUST consume
   its evidence only on append acknowledgement, and every shipment MUST
-  carry a deterministic per-(class, window) idempotency key
-  (`exposure:{hw}:{window-epoch}`, constrained by the same partial
-  unique index as the interrupt leg's Event uids) so an ambiguous
+  carry a deterministic per-(cluster, class, window) idempotency key
+  (`exposure:{cluster}:{hw}:{window-slot}`, constrained by the same
+  partial unique index as the interrupt leg's Event uids) so an ambiguous
   failure --- server committed, client timed out --- redelivers into the
-  `ON CONFLICT` absorb instead of double-banking the denominator. A
+  `ON CONFLICT` absorb instead of double-banking the denominator. The
+  cluster axis is REQUIRED: the index is table-global in the shared-PG
+  topology (ADR-023 §2.13), so an axis-free key from two clusters'
+  informers collides and the absorb silently and permanently drops the
+  losing cluster's window. The window component MUST be grid-aligned
+  to the flush period (the slot START, a multiple of the flush
+  cadence) so concurrent same-cluster informers --- the rollout surge
+  twin --- converge on ONE row per logical window instead of
+  double-banking it, and window identity MUST be strictly monotone per
+  process (minted only through a gate that refuses a non-advancing
+  slot) so a clock step backward cannot re-mint an already-shipped
+  window under fresh seconds --- absorbed, counted delivered, lost. A
   banked slice whose append RPC fails MUST be re-credited whole and
   IDENTICAL (uid and value; windows are never merged --- a merged value
   under an already-committed key would be absorbed and the fresh
@@ -695,9 +706,12 @@ capacity-type decision.
   growing with the gap across LIST-failure streaks), and `shutdown`
   (the pending queue is process memory; shutdown forfeits the WHOLE
   backlog, one counted drop per slice --- there is no single-window
-  bound). A LIST failure forfeits nothing (cursors untouched); a
-  scheduler outage spanning any number of flush windows MUST NOT
-  reduce total banked exposure; and a process (re)start MUST seed each
+  bound). A LIST failure forfeits nothing (cursors untouched), and a
+  non-advancing flush window likewise forfeits nothing (banking
+  deferred, cursors untouched --- the next admitted window banks the
+  full delta); a scheduler outage spanning any number of flush windows
+  MUST NOT reduce total banked exposure; and a process (re)start MUST
+  seed each
   cursor at `max(creationTimestamp, process boot)` so a restart cannot
   re-bank windows the previous incarnation already shipped (the
   pre-boot residual is forfeited toward the conservative direction ---
@@ -712,6 +726,13 @@ round (bug_150) re-credited failed slices but left the retry un-keyed
 (quadratic double-banking under commit-but-timeout brownouts,
 merged_bug_002) and claimed two bounded forfeitures while the
 implementation had five unbounded-or-uncounted ones (merged_bug_070).
+The second round (merged_bug_002) keyed the retry deterministically but
+minted the key axis-free against the table-global index --- colliding
+across clusters, missing the same-cluster co-run collision it existed
+to absorb, and re-mintable under a backward clock step --- which
+merged_bug_001 closed with the typed, cluster-scoped, grid-aligned,
+monotonically-gated key this rule now requires (Q2-round5: the axis
+rides the uid FORMAT; M_047 stays frozen).
 
 #info(title: [Note])[
   The controller does NOT hold permissions for `NetworkPolicies` or

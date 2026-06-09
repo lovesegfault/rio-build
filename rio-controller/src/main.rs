@@ -233,6 +233,16 @@ async fn main() -> anyhow::Result<()> {
     // bug_363: the exposure flush maintains a name→hw_class fallback
     // the interrupt watcher consults when the interrupted node is
     // already gone (the common reclaim case).
+    // merged_bug_001: AT MOST ONE informer per cluster — exposure
+    // uids are keyed (cluster, class, window-slot), so a co-running
+    // twin of the SAME cluster converges on identical uids (the
+    // absorb dedups it), but the residual partial-window seam and
+    // interrupt-watcher duplication are closed by the chart's
+    // `strategy: Recreate` (controller.yaml) — the informer is
+    // deliberately NOT lease-gated. `cluster` is Config-borne
+    // (controller.toml), single-sourced by helm with the scheduler's
+    // `[sla].cluster`; this is the ONE read site.
+    let cluster = node_informer::ClusterId::new(&cfg.cluster);
     let hw_fallback: node_informer::HwClassFallback = Default::default();
     rio_common::task::spawn_monitored(
         "node-informer",
@@ -241,6 +251,7 @@ async fn main() -> anyhow::Result<()> {
             hw_config.clone(),
             admin.clone(),
             hw_fallback.clone(),
+            cluster,
             shutdown.clone(),
         ),
     );
@@ -275,7 +286,10 @@ async fn main() -> anyhow::Result<()> {
     //
     // No leader-gate: controller is single-replica (only the
     // nodeclaim_pool reconciler is lease-gated, for rolling-upgrade
-    // surge safety). If replicas>1 by misconfig, the store's
+    // surge safety; the node-informer additionally relies on the
+    // chart's `strategy: Recreate` so a rollout never co-runs two
+    // informers — merged_bug_001, see the informer-spawn comment
+    // above). If replicas>1 by misconfig, the store's
     // GC_LOCK_ID advisory lock serializes
     // concurrent TriggerGC calls (see gc_schedule module doc).
     if cfg.gc_interval_hours > 0 && !cfg.store.addr.is_empty() {
@@ -416,6 +430,7 @@ mod tests {
         "controller",
         r#"
         gc_interval_hours = 0
+        cluster = "prod-east"
 
         [nodeclaim_pool]
         max_fleet_cores = 64
@@ -429,6 +444,11 @@ mod tests {
         "#,
         |cfg: Config| {
             assert_eq!(cfg.gc_interval_hours, 0);
+            // merged_bug_001: the exposure-uid cluster axis loads from
+            // the helm-rendered TOML (same `cluster = …` key shape as
+            // the scheduler's `[sla].cluster` — one values expression
+            // feeds both binaries).
+            assert_eq!(cfg.cluster, "prod-east");
             // B16: nested map/seq fields load from TOML (NOT env — the
             // RIO_ env layer yields bare strings). This is the same shape
             // helm's rio-controller-config ConfigMap renders.
@@ -456,6 +476,9 @@ mod tests {
     rio_test_support::jail_defaults!("controller", "gc_interval_hours = 24", |cfg: Config| {
         assert!(cfg.scheduler.balance_host.is_none());
         assert_eq!(cfg.gc_interval_hours, 24);
+        // merged_bug_001: empty = the single-cluster default, matching
+        // the scheduler's `[sla].cluster` `DEFAULT ''`.
+        assert_eq!(cfg.cluster, "");
     });
 
     // -----------------------------------------------------------------------

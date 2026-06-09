@@ -628,7 +628,7 @@ impl ExposureDropReason {
     }
 }
 
-// r[impl ctrl.informer.exposure-recredit+1]
+// r[impl ctrl.informer.exposure-recredit+2]
 /// merged_bug_070: the one chokepoint for forfeited exposure
 /// node-seconds — warn + counted
 /// (`rio_controller_spot_exposure_dropped_seconds_total{reason}`,
@@ -768,12 +768,16 @@ async fn node_hw_class(nodes: &Api<Node>, config: &HwClassConfig, name: &str) ->
 /// are logged; the controller keeps reconciling. A failed LIST skips
 /// that flush — cursors are untouched, so the next successful flush
 /// banks the full delta since the last successful one (nothing lost,
-/// nothing double-counted; λ samples arrive late, not wrong).
+/// nothing double-counted; λ samples arrive late, not wrong). A
+/// non-advancing flush window ([`WindowGate::admit`] → `None`) is the
+/// same posture: banking deferred, cursors untouched, nothing
+/// forfeited.
 pub async fn run(
     client: Client,
     config: HwClassConfig,
     mut admin: AdminClient,
     fallback: HwClassFallback,
+    cluster: ClusterId,
     shutdown: rio_common::signal::Token,
 ) {
     let nodes: Api<Node> = Api::all(client);
@@ -787,16 +791,28 @@ pub async fn run(
     // An accounting position, not a cache — survives the §4(a)2
     // labels-cache deletion and is private to this loop.
     let mut cursors: HashMap<String, f64> = HashMap::new();
-    // bug_150 + merged_bug_002: per-(class, window) slices whose
-    // append has not been ACKNOWLEDGED — the cursor already advanced,
-    // so this queue is the only carrier of those windows until a
-    // flush delivers them (consume-on-ack). Each slice keeps its own
-    // deterministic `exposure:{hw}:{window}` uid across retries so a
-    // commit-but-timeout redelivery dedups server-side (`ON CONFLICT
-    // (event_uid)`, M_047) instead of double-banking λ's denominator;
-    // windows are NEVER merged (a merged value under an already-
-    // committed uid would be absorbed and the fresh half lost).
+    // bug_150 + merged_bug_002 + merged_bug_001: per-(class, window)
+    // slices whose append has not been ACKNOWLEDGED — the cursor
+    // already advanced, so this queue is the only carrier of those
+    // windows until a flush delivers them (consume-on-ack). Each
+    // slice keeps its own deterministic
+    // `exposure:{cluster}:{hw}:{window-slot}` [`EventUid`] across
+    // retries so a commit-but-timeout redelivery dedups server-side
+    // (`ON CONFLICT (event_uid)`, M_047) instead of double-banking
+    // λ's denominator; the cluster axis makes cross-cluster absorbs
+    // unconstructible in the shared-PG topology (ADR-023 §2.13), and
+    // the grid-aligned slot makes same-cluster co-run twins CONVERGE
+    // on one uid per logical window (the absorb becomes designed
+    // at-most-once, not silent loss); windows are NEVER merged (a
+    // merged value under an already-committed uid would be absorbed
+    // and the fresh half lost).
     let mut unshipped: Vec<PendingExposure> = Vec::new();
+
+    // merged_bug_001: per-process window gate — window identity is
+    // strictly monotone, so a clock step backward (or a same-slot
+    // double tick) defers banking instead of re-minting an already-
+    // shipped window under fresh seconds (absorbed → lost).
+    let mut gate = WindowGate::default();
 
     let mut flush = tokio::time::interval(Duration::from_secs(EXPOSURE_FLUSH_SECS));
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -850,15 +866,34 @@ pub async fn run(
                             }
                             fb.retain(|_, (_, seen)| now - *seen < HW_FALLBACK_TTL_SECS);
                         }
-                        // r[impl ctrl.informer.exposure-recredit+1]
+                        // r[impl ctrl.informer.exposure-recredit+2]
                         let now = now_epoch();
-                        let flush_out = flush_spot_exposure(
-                            &mut cursors, &list.items, &config, boot_epoch, now,
-                        );
-                        for (reason, secs) in flush_out.drops {
-                            record_exposure_drop(reason, secs);
+                        match gate.admit(now) {
+                            Some(window) => {
+                                let flush_out = flush_spot_exposure(
+                                    &mut cursors, &list.items, &config, boot_epoch, now,
+                                );
+                                for (reason, secs) in flush_out.drops {
+                                    record_exposure_drop(reason, secs);
+                                }
+                                queue_exposure_slices(
+                                    &mut unshipped, flush_out.banked, &cluster, window,
+                                );
+                            }
+                            // Banking deferred — LIST-failure-equivalent:
+                            // cursors untouched (the next admitted window
+                            // banks the full delta), the fallback refresh
+                            // above already ran, and the retained queue
+                            // below still ships. Nothing is forfeited; λ
+                            // samples arrive late, not reduced.
+                            None => {
+                                warn!(
+                                    now,
+                                    "exposure flush window has not advanced; \
+                                     banking deferred (cursors untouched)"
+                                );
+                            }
                         }
-                        queue_exposure_slices(&mut unshipped, flush_out.banked, now);
                         // Ship every pending slice independently —
                         // retained windows retry alongside this
                         // flush's fresh ones, each under its own uid.
@@ -1085,20 +1120,27 @@ pub async fn run_spot_interrupt_watcher(
 /// commit-but-timeout brownout banked the denominator QUADRATICALLY
 /// (re-credit re-merged into ever-larger un-keyed appends), biasing λ
 /// LOW — the anti-conservative direction (solver over-prefers spot).
-/// Bounded by [`admin_call`]'s timeout so a hung scheduler can't
-/// wedge the Node-informer's flush loop (every caller is inside that
-/// loop).
+/// merged_bug_001: the uid is cluster-scoped and grid-aligned
+/// ([`EventUid`]), so the server-side absorb can only ever mean "this
+/// logical (cluster, class, window) is already banked" — the Ok arm's
+/// delivered=true is SOUND (pre-fix, a cross-cluster collision or a
+/// re-minted backward-clock window was absorbed and reported
+/// delivered: silent permanent denominator loss; this queue is the
+/// only carrier). Bounded by [`admin_call`]'s timeout so a hung
+/// scheduler can't wedge the Node-informer's flush loop (every caller
+/// is inside that loop).
 async fn report_exposure(admin: &mut AdminClient, slice: &PendingExposure) -> bool {
     match admin_call(admin.append_interrupt_sample(
         rio_proto::types::AppendInterruptSampleRequest {
             hw_class: slice.hw.clone(),
             kind: "exposure".into(),
             value: slice.secs,
-            // merged_bug_002: deterministic per-(class, window) key —
-            // constrained by the M_047 partial unique index exactly
-            // like the interrupt leg's K8s Event uids (the
-            // `exposure:` prefix keeps the namespaces disjoint).
-            event_uid: Some(slice.uid.clone()),
+            // merged_bug_002 + merged_bug_001: deterministic
+            // per-(cluster, class, window) key — constrained by the
+            // M_047 partial unique index exactly like the interrupt
+            // leg's K8s Event uids (the `exposure:` prefix keeps the
+            // namespaces disjoint).
+            event_uid: Some(slice.uid.as_str().to_owned()),
         },
     ))
     .await
@@ -1115,40 +1157,177 @@ async fn report_exposure(admin: &mut AdminClient, slice: &PendingExposure) -> bo
     }
 }
 
+/// merged_bug_001 (Q2-round5): the cluster identity axis of every
+/// exposure uid. `interrupt_samples` is multi-cluster — the scheduler
+/// binds `[sla].cluster` per row and M_047's partial unique index is
+/// table-GLOBAL in the shared-PG topology (ADR-023 §2.13;
+/// db/history.rs "global-DB topology") — so an axis-free uid from two
+/// clusters' informers collides and the `ON CONFLICT DO NOTHING`
+/// absorb silently and permanently drops the second cluster's
+/// denominator window. Carrying the axis in the TYPE means omitting
+/// it is a compile error, not a review item.
+///
+/// Single normalizing constructor: trims; empty = the single-cluster
+/// default, matching the scheduler's `[sla].cluster` `DEFAULT ''`
+/// (043_sla_hardening). The value is Config-borne (`cluster` in
+/// controller.toml, rendered by helm from the SAME values expression
+/// as the scheduler's `[sla].cluster` — one source, two binaries).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterId(String);
+
+impl ClusterId {
+    /// Normalize: trim. Empty (post-trim) = single-cluster default.
+    pub fn new(raw: &str) -> Self {
+        Self(raw.trim().to_string())
+    }
+}
+
+/// merged_bug_001: one logical exposure window — the grid slot START
+/// (epoch seconds, always a multiple of [`EXPOSURE_FLUSH_SECS`]).
+/// Obtainable ONLY from [`WindowGate::admit`] (no public constructor),
+/// so every uid's window component is grid-aligned and strictly
+/// monotone BY CONSTRUCTION — a non-advancing window is
+/// unrepresentable, not checked per call site. Grid alignment is what
+/// makes two surge-overlapped informers of ONE cluster converge on
+/// IDENTICAL uids for the same wall window (their process-local flush
+/// instants differ; their slots do not), turning the co-run collision
+/// into the designed at-most-once absorb instead of double-banking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct WindowId(u64);
+
+impl WindowId {
+    /// Slot start in epoch seconds (digits-only in the rendered uid —
+    /// the parse-unambiguity anchor).
+    fn slot_secs(self) -> u64 {
+        self.0
+    }
+}
+
+/// merged_bug_001: per-process monotonic window admission. `admit`
+/// returns `Some` iff the computed grid slot STRICTLY exceeds the
+/// last admitted one (first admit always succeeds) — a clock step
+/// backward or a same-slot double tick yields `None` and the flush
+/// round defers banking (LIST-failure-equivalent: cursors untouched,
+/// nothing forfeited, λ samples arrive late not reduced). Pre-fix,
+/// window identity was raw `now_epoch()` seconds: a backward step
+/// re-minted an already-shipped second under fresh seconds, and the
+/// redelivery was absorbed by M_047 — counted as delivered, lost
+/// forever.
+#[derive(Debug, Default)]
+struct WindowGate {
+    last: Option<WindowId>,
+}
+
+impl WindowGate {
+    /// Admit `now_epoch` into a fresh window, or refuse (`None`) if
+    /// the grid slot has not strictly advanced. Non-finite or
+    /// negative epochs (the `now_epoch()` `unwrap_or(0.0)` arm) clamp
+    /// to slot 0 — admissible at most once, refused thereafter.
+    fn admit(&mut self, now_epoch: f64) -> Option<WindowId> {
+        let secs = if now_epoch.is_finite() && now_epoch > 0.0 {
+            now_epoch
+        } else {
+            0.0
+        };
+        let slot = WindowId((secs as u64 / EXPOSURE_FLUSH_SECS) * EXPOSURE_FLUSH_SECS);
+        match self.last {
+            Some(prev) if slot <= prev => None,
+            _ => {
+                self.last = Some(slot);
+                Some(slot)
+            }
+        }
+    }
+}
+
+/// merged_bug_001 (Q2-round5 SIGNED vehicle): the deterministic
+/// exposure idempotency key, rendered `exposure:{cluster}:{hw}:{slot}`
+/// — the cluster axis lives in the uid FORMAT, not in schema (M_047
+/// is checksum-frozen; no DDL). [`EventUid::new`] is the ONLY
+/// producer and demands every identity axis at construction; a
+/// `format!`-minted uid for the M_047-constrained column is
+/// untypecheckable ([`PendingExposure::uid`] is `EventUid`, not
+/// `String`).
+///
+/// Parse-unambiguity: `hw` is server-charset-gated `[a-z0-9-]`
+/// (`AppendInterruptSample` rejects anything else) and the slot is
+/// digits, so the rightmost two `:`-segments bind uniquely and the
+/// residual prefix is the cluster — a `:` in a cluster name stays
+/// unambiguous, and the empty single-cluster default renders
+/// `exposure::{hw}:{slot}`: visible, and disjoint from every
+/// non-empty cluster AND from the retired pre-cluster format
+/// `exposure:{hw}:{epoch}` (no dedup seam at the cut; the unshipped
+/// queue is process memory, so no pre-fix slice ever redelivers —
+/// old-format rows simply age out of the λ window).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EventUid(String);
+
+impl EventUid {
+    /// Mint the uid for one (cluster, class, window) slice. The only
+    /// uid producer — all three axes are demanded by type.
+    fn new(cluster: &ClusterId, hw: &str, window: WindowId) -> Self {
+        Self(format!(
+            "exposure:{}:{}:{}",
+            cluster.0,
+            hw,
+            window.slot_secs()
+        ))
+    }
+
+    /// Wire form for `AppendInterruptSampleRequest.event_uid`.
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for EventUid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// One un-acknowledged exposure shipment: a single `(hw_class,
 /// window)` slice with its deterministic idempotency key
-/// (merged_bug_002).
+/// (merged_bug_002, cluster-scoped + grid-aligned by merged_bug_001).
 #[derive(Debug, Clone, PartialEq)]
 struct PendingExposure {
     hw: String,
-    /// `exposure:{hw}:{window_epoch}` — deterministic per (class,
-    /// flush window), carried VERBATIM across retries. Deterministic
-    /// (not minted-per-send) so the redelivery of a slice whose first
-    /// append committed-but-timed-out collides with its own committed
-    /// row.
-    uid: String,
+    /// `exposure:{cluster}:{hw}:{window-slot}` — deterministic per
+    /// (cluster, class, window), carried VERBATIM across retries.
+    /// Deterministic (not minted-per-send) so the redelivery of a
+    /// slice whose first append committed-but-timed-out collides with
+    /// its own committed row — and ONLY with its own row: the cluster
+    /// axis scopes the key in the shared-PG topology, and the
+    /// grid-aligned slot makes same-cluster co-run twins collide BY
+    /// DESIGN (at-most-once per logical window).
+    uid: EventUid,
     secs: f64,
 }
 
 /// Queue this flush's fresh per-class slices as individually-keyed
-/// shipments (merged_bug_002). Slices are NEVER merged across windows
-/// — the uid keys an exact committed value server-side, so merging
-/// would change the value under an already-committed key and the `ON
-/// CONFLICT` absorb would silently drop the fresh half. A retained
-/// class with no fresh slice this round (its nodes deleted
-/// mid-outage) still retries: it simply stays queued.
+/// shipments (merged_bug_002). Every uid is minted through
+/// [`EventUid::new`] from a [`WindowGate`]-admitted window
+/// (merged_bug_001) — this is the SOLE mint site, and the typed
+/// constructor demands the cluster axis and the grid slot. Slices are
+/// NEVER merged across windows — the uid keys an exact committed
+/// value server-side, so merging would change the value under an
+/// already-committed key and the `ON CONFLICT` absorb would silently
+/// drop the fresh half. A retained class with no fresh slice this
+/// round (its nodes deleted mid-outage) still retries: it simply
+/// stays queued.
 fn queue_exposure_slices(
     unshipped: &mut Vec<PendingExposure>,
     fresh: Vec<(String, f64)>,
-    window_epoch: f64,
+    cluster: &ClusterId,
+    window: WindowId,
 ) {
     for (hw, secs) in fresh {
-        let uid = format!("exposure:{hw}:{}", window_epoch as u64);
+        let uid = EventUid::new(cluster, &hw, window);
         unshipped.push(PendingExposure { hw, uid, secs });
     }
 }
 
-// r[impl ctrl.informer.exposure-recredit+1]
+// r[impl ctrl.informer.exposure-recredit+2]
 /// Settle one shipped slice: a failed append re-credits the slice —
 /// uid and all — to the next flush. The cursor already advanced when
 /// the slice was banked, so this pending queue is the ONLY carrier of
@@ -1190,7 +1369,7 @@ fn annotation_target(pod: &Pod) -> Option<(String, String, String)> {
 
 #[cfg(test)]
 mod tests {
-    // r[verify ctrl.informer.exposure-recredit+1]
+    // r[verify ctrl.informer.exposure-recredit+2]
     /// bug_150 + merged_bug_002: a failed exposure append re-credits
     /// the slice; across an outage spanning N windows, total banked
     /// exposure is conserved as N DISTINCT keyed slices — never a
@@ -1202,18 +1381,22 @@ mod tests {
     /// window was consumed by the cursor advance and never re-banked.)
     #[test]
     fn failed_exposure_slice_recredits_to_next_flush() {
+        let cluster = ClusterId::new("prod-eu");
+        let mut gate = WindowGate::default();
         let mut unshipped: Vec<PendingExposure> = Vec::new();
-        // Flush 1 (window 1000): fresh 60s for m6id; append FAILS.
-        queue_exposure_slices(&mut unshipped, vec![("m6id".into(), 60.0)], 1000.0);
+        // Flush 1 (t=1000 → slot 960): fresh 60s for m6id; append FAILS.
+        let w1 = gate.admit(1000.0).expect("first admit");
+        queue_exposure_slices(&mut unshipped, vec![("m6id".into(), 60.0)], &cluster, w1);
         let ship1 = std::mem::take(&mut unshipped);
         assert_eq!(ship1.len(), 1);
         assert_eq!((ship1[0].hw.as_str(), ship1[0].secs), ("m6id", 60.0));
         for slice in ship1 {
             settle_exposure_slice(&mut unshipped, slice, false);
         }
-        // Flush 2 (window 1060): fresh 60s again. BOTH windows ship —
-        // as two slices under their own uids, total conserved.
-        queue_exposure_slices(&mut unshipped, vec![("m6id".into(), 60.0)], 1060.0);
+        // Flush 2 (t=1060 → slot 1020): fresh 60s again. BOTH windows
+        // ship — as two slices under their own uids, total conserved.
+        let w2 = gate.admit(1060.0).expect("next slot admits");
+        queue_exposure_slices(&mut unshipped, vec![("m6id".into(), 60.0)], &cluster, w2);
         let ship2 = std::mem::take(&mut unshipped);
         assert_eq!(
             ship2.iter().map(|s| s.secs).sum::<f64>(),
@@ -1231,24 +1414,28 @@ mod tests {
         assert!(unshipped.is_empty(), "delivered slices leave no residue");
     }
 
-    // r[verify ctrl.informer.exposure-recredit+1]
+    // r[verify ctrl.informer.exposure-recredit+2]
     /// A retained class with NO fresh slice this round (its nodes were
     /// deleted mid-outage) still retries — retention is queue
     /// membership, independent of fresh production.
     #[test]
     fn retained_class_without_fresh_slice_still_retries() {
+        let cluster = ClusterId::new("prod-eu");
+        let mut gate = WindowGate::default();
         let mut unshipped: Vec<PendingExposure> = Vec::new();
-        queue_exposure_slices(&mut unshipped, vec![("m6id".into(), 45.0)], 500.0);
+        let w1 = gate.admit(500.0).expect("first admit");
+        queue_exposure_slices(&mut unshipped, vec![("m6id".into(), 45.0)], &cluster, w1);
         let first = unshipped.remove(0);
         settle_exposure_slice(&mut unshipped, first, false);
         // Next flush: NO fresh slices.
-        queue_exposure_slices(&mut unshipped, vec![], 560.0);
+        let w2 = gate.admit(560.0).expect("next slot admits");
+        queue_exposure_slices(&mut unshipped, vec![], &cluster, w2);
         let ship = std::mem::take(&mut unshipped);
         assert_eq!(ship.len(), 1);
         assert_eq!((ship[0].hw.as_str(), ship[0].secs), ("m6id", 45.0));
     }
 
-    // r[verify ctrl.informer.exposure-recredit+1]
+    // r[verify ctrl.informer.exposure-recredit+2]
     /// merged_bug_002 red: the retry of a slice whose append
     /// committed-but-timed-out MUST collide with its own committed row
     /// — which requires the uid to be deterministic and carried
@@ -1256,15 +1443,21 @@ mod tests {
     /// `event_uid: None` on every attempt (each retry inserted a new
     /// row; a 1-hour brownout at 60s windows over-counted the
     /// denominator ~30×, λ biased LOW → solver over-prefers spot);
-    /// `right:` retry uid == original uid == `exposure:{hw}:{window}`.
+    /// `right:` retry uid == original uid (re-verified under
+    /// [`EventUid`] equality — merged_bug_001 made the key
+    /// cluster-scoped and grid-aligned, `exposure:{cluster}:{hw}:{slot}`).
     #[test]
     fn retried_slice_carries_identical_uid() {
+        let cluster = ClusterId::new("prod-eu");
+        let mut gate = WindowGate::default();
         let mut unshipped: Vec<PendingExposure> = Vec::new();
-        queue_exposure_slices(&mut unshipped, vec![("m6id".into(), 60.0)], 1700000000.0);
+        let w = gate.admit(1767225613.0).expect("first admit");
+        queue_exposure_slices(&mut unshipped, vec![("m6id".into(), 60.0)], &cluster, w);
         let original = unshipped[0].clone();
         assert_eq!(
-            original.uid, "exposure:m6id:1700000000",
-            "deterministic per-(class, window) key"
+            original.uid.as_str(),
+            "exposure:prod-eu:m6id:1767225600",
+            "deterministic per-(cluster, class, window) key"
         );
         // Ambiguous failure → settle retains; the retried slice is
         // byte-identical (uid AND value).
@@ -1274,6 +1467,192 @@ mod tests {
             unshipped[0], original,
             "retry must collide with its own committed row server-side"
         );
+    }
+
+    // r[verify ctrl.informer.exposure-recredit+2]
+    /// merged_bug_001 red R1: the uid carries the cluster axis and a
+    /// grid-aligned window slot. Two clusters, same hw + same instant
+    /// ⇒ uids DIFFER (cross-cluster absorbs unconstructible in the
+    /// shared-PG topology); one cluster, two gate instances (the
+    /// rollout surge twin) at different in-window instants ⇒ uids
+    /// IDENTICAL (co-run double-banking becomes the designed
+    /// at-most-once absorb). Recorded red against the pre-fix mint
+    /// (`exposure:{hw}:{epoch}` — no cluster axis, no convergence):
+    /// `left: "exposure:mid-ebs-x86:1767225613" /
+    ///  right: "exposure:mid-ebs-x86:1767225647"`.
+    #[test]
+    fn exposure_uid_is_cluster_scoped_and_grid_aligned() {
+        // Two clusters, same hw_class, same instant: DIFFERENT uids.
+        let east = ClusterId::new("prod-east");
+        let west = ClusterId::new("prod-west");
+        let mut gate_e = WindowGate::default();
+        let mut gate_w = WindowGate::default();
+        let we = gate_e.admit(1767225613.2).expect("first admit");
+        let ww = gate_w.admit(1767225613.2).expect("first admit");
+        let mut qe: Vec<PendingExposure> = Vec::new();
+        let mut qw: Vec<PendingExposure> = Vec::new();
+        queue_exposure_slices(&mut qe, vec![("mid-ebs-x86".into(), 60.0)], &east, we);
+        queue_exposure_slices(&mut qw, vec![("mid-ebs-x86".into(), 60.0)], &west, ww);
+        assert_ne!(
+            qe[0].uid, qw[0].uid,
+            "cluster axis must scope the dedup key (shared-PG topology)"
+        );
+        assert_eq!(
+            qe[0].uid.as_str(),
+            "exposure:prod-east:mid-ebs-x86:1767225600"
+        );
+        assert_eq!(
+            qw[0].uid.as_str(),
+            "exposure:prod-west:mid-ebs-x86:1767225600"
+        );
+
+        // Surge twin: ONE cluster, two processes (two gates), flushes
+        // at …+13.2 and …+47.9 of the same wall window: IDENTICAL.
+        let mut twin_a = WindowGate::default();
+        let mut twin_b = WindowGate::default();
+        let wa = twin_a.admit(1767225613.2).expect("first admit");
+        let wb = twin_b.admit(1767225647.9).expect("first admit");
+        let mut qa: Vec<PendingExposure> = Vec::new();
+        let mut qb: Vec<PendingExposure> = Vec::new();
+        queue_exposure_slices(&mut qa, vec![("mid-ebs-x86".into(), 60.0)], &east, wa);
+        queue_exposure_slices(&mut qb, vec![("mid-ebs-x86".into(), 47.9)], &east, wb);
+        assert_eq!(
+            qa[0].uid, qb[0].uid,
+            "same logical window must converge on one uid"
+        );
+
+        // The empty single-cluster default renders visibly and
+        // disjoint from every non-empty cluster.
+        let mut gate_d = WindowGate::default();
+        let wd = gate_d.admit(1767225613.2).expect("first admit");
+        let mut qd: Vec<PendingExposure> = Vec::new();
+        queue_exposure_slices(
+            &mut qd,
+            vec![("mid-ebs-x86".into(), 60.0)],
+            &ClusterId::new("  "),
+            wd,
+        );
+        assert_eq!(qd[0].uid.as_str(), "exposure::mid-ebs-x86:1767225600");
+    }
+
+    // r[verify ctrl.informer.exposure-recredit+2]
+    /// merged_bug_001 red R2: window identity is strictly monotone per
+    /// process — a clock step backward or a same-slot double tick is
+    /// REFUSED (banking deferred), never re-minted under fresh
+    /// seconds. Recorded red (characterization, against the pre-fix
+    /// mint — the old path constructed a fresh-seconds uid for a
+    /// non-advanced epoch, the absorb-loss precondition):
+    /// `left: 2 / right: 1` — "a non-advanced window must not mint a
+    /// fresh-seconds uid (the absorb-loss precondition is
+    /// constructible)".
+    #[test]
+    fn window_gate_refuses_non_advancing_windows() {
+        let mut gate = WindowGate::default();
+        assert_eq!(
+            gate.admit(1767225613.0).map(WindowId::slot_secs),
+            Some(1767225600),
+            "first admit lands on the grid slot start"
+        );
+        assert_eq!(
+            gate.admit(1767225608.0),
+            None,
+            "clock step backward (−5s) is refused"
+        );
+        assert_eq!(
+            gate.admit(1767225633.0),
+            None,
+            "same slot (+20s) is refused — co-run/double-tick dedup"
+        );
+        assert_eq!(
+            gate.admit(1767225660.0).map(WindowId::slot_secs),
+            Some(1767225660),
+            "the next grid slot admits"
+        );
+    }
+
+    // r[verify ctrl.informer.exposure-recredit+2]
+    /// merged_bug_001 red R3: a gate-deferred window forfeits NOTHING
+    /// — cursors untouched, zero drop ticks, the retained queue
+    /// intact (it still ships). Extends the conservation family
+    /// below: deferral is the LIST-failure posture, not a fourth
+    /// forfeiture.
+    #[test]
+    fn conservation_holds_across_deferred_window() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let cfg = band_config();
+        let cluster = ClusterId::new("prod-eu");
+        let mut gate = WindowGate::default();
+        let mut cursors: HashMap<String, f64> = HashMap::new();
+        let mut unshipped: Vec<PendingExposure> = Vec::new();
+        let nodes = vec![spot_node("a", "7", 1000)];
+
+        let rec = DebuggingRecorder::new();
+        let _g = ::metrics::set_default_local_recorder(&rec);
+
+        // Round 1 (t=1060 → slot 1020): banks one slice; its append
+        // fails → retained.
+        let w1 = gate.admit(1060.0).expect("first admit");
+        let out = flush_spot_exposure(&mut cursors, &nodes, &cfg, 0.0, 1060.0);
+        assert!(out.drops.is_empty());
+        queue_exposure_slices(&mut unshipped, out.banked, &cluster, w1);
+        assert_eq!(unshipped.len(), 1);
+        let slice = unshipped.remove(0);
+        settle_exposure_slice(&mut unshipped, slice, false);
+        let cursors_before = cursors.clone();
+        let queued_before = unshipped.clone();
+
+        // Round 2 fires in the SAME slot (t=1070 — double tick /
+        // backward step): the gate refuses, and the run() arm skips
+        // the whole banking leg — cursors untouched, the retained
+        // queue intact, and NOT ONE drop tick (deferral is pending,
+        // never forfeiture).
+        assert_eq!(gate.admit(1070.0), None, "same slot must defer banking");
+        assert_eq!(
+            cursors, cursors_before,
+            "deferred window leaves cursors untouched (next admitted \
+             window banks the full delta)"
+        );
+        assert_eq!(
+            unshipped, queued_before,
+            "retained queue intact across the deferral"
+        );
+        assert!(
+            rec.snapshotter().snapshot().into_vec().is_empty(),
+            "a deferred window forfeits nothing — zero drop ticks"
+        );
+    }
+
+    mod window_gate_props {
+        use proptest::prelude::*;
+
+        use super::super::{EXPOSURE_FLUSH_SECS, WindowGate};
+
+        proptest! {
+            /// Rp (merged_bug_001 formal disposition): the gate's two
+            /// laws under ARBITRARY clocks — NaN, ±inf, 0.0, negative,
+            /// backward steps, repeats: every ADMITTED `WindowId`
+            /// strictly increases and is ≡ 0 mod
+            /// `EXPOSURE_FLUSH_SECS`. (kani n/a — f64 floor-division
+            /// domain; this proptest + R2 pin the laws inside the
+            /// normal nextest gate.)
+            #[test]
+            fn window_gate_monotone_and_grid_under_arbitrary_epochs(
+                epochs in proptest::collection::vec(proptest::num::f64::ANY, 1..64)
+            ) {
+                let mut gate = WindowGate::default();
+                let mut last: Option<u64> = None;
+                for e in epochs {
+                    if let Some(w) = gate.admit(e) {
+                        let slot = w.slot_secs();
+                        prop_assert_eq!(slot % EXPOSURE_FLUSH_SECS, 0, "grid law");
+                        if let Some(prev) = last {
+                            prop_assert!(slot > prev, "monotone law: {} -> {}", prev, slot);
+                        }
+                        last = Some(slot);
+                    }
+                }
+            }
+        }
     }
 
     // r[verify ctrl.informer.interrupt-sample-conservation+2]
@@ -1595,7 +1974,7 @@ mod tests {
         assert!(!cursors.contains_key("od"));
     }
 
-    // r[verify ctrl.informer.exposure-recredit+1]
+    // r[verify ctrl.informer.exposure-recredit+2]
     /// §4(a)2 gate (capacity-type / match gating): spot nodes whose
     /// labels match no configured `$h` advance their cursor WITHOUT
     /// banking — a late config load does not retro-bank the unmatched
@@ -1632,7 +2011,7 @@ mod tests {
         assert!(out.drops.is_empty());
     }
 
-    // r[verify ctrl.informer.exposure-recredit+1]
+    // r[verify ctrl.informer.exposure-recredit+2]
     /// §4(a)2 gate (the recorded accepted under-count): a node absent
     /// from the LIST has its cursor dropped without banking the final
     /// partial slice — and merged_bug_070(c) red: the forfeited
@@ -1695,7 +2074,7 @@ mod tests {
         assert!(out.drops.is_empty());
     }
 
-    // r[verify ctrl.informer.exposure-recredit+1]
+    // r[verify ctrl.informer.exposure-recredit+2]
     /// merged_bug_070(d) red: a controller RESTART must not re-bank
     /// windows the previous incarnation already shipped. Cursor seeds
     /// clamp to `max(creationTimestamp, boot_epoch)` — `left:` pre-fix
@@ -1727,7 +2106,7 @@ mod tests {
         assert_eq!(out.banked, vec![("intel-7".into(), 30.0)]);
     }
 
-    // r[verify ctrl.informer.exposure-recredit+1]
+    // r[verify ctrl.informer.exposure-recredit+2]
     /// merged_bug_070(b) red: shutdown forfeits the WHOLE pending
     /// backlog — the spec's old "at most one pending window" bound was
     /// false (each failed flush queues another window; the carrier is
@@ -1739,10 +2118,14 @@ mod tests {
     /// and the spec enumerates the forfeiture honestly.
     #[test]
     fn shutdown_backlog_is_counted_per_slice() {
+        let cluster = ClusterId::new("prod-eu");
+        let mut gate = WindowGate::default();
         let mut unshipped: Vec<PendingExposure> = Vec::new();
         // Two failed windows accumulate (the brownout shape).
-        queue_exposure_slices(&mut unshipped, vec![("m6id".into(), 60.0)], 1000.0);
-        queue_exposure_slices(&mut unshipped, vec![("m6id".into(), 60.0)], 1060.0);
+        let w1 = gate.admit(1000.0).expect("first admit");
+        queue_exposure_slices(&mut unshipped, vec![("m6id".into(), 60.0)], &cluster, w1);
+        let w2 = gate.admit(1060.0).expect("next slot admits");
+        queue_exposure_slices(&mut unshipped, vec![("m6id".into(), 60.0)], &cluster, w2);
         assert_eq!(unshipped.len(), 2, "backlog: one slice per window");
         // The shutdown arm's exact mapping: one counted drop per
         // slice, seconds preserved.
