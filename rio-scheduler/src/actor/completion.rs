@@ -39,6 +39,48 @@ use crate::state::{
 
 use super::DagActor;
 
+/// The late-report (AckIgnore) lane's typed effect alphabet (bug_077,
+/// the closure set): what a report that FAILED kernel admission may
+/// still do. A future late-report side effect adds a variant here —
+/// never an ad-hoc statement in an AckIgnore arm. Computed by
+/// [`late_report_effect`] from the payload alone; applied by
+/// [`DagActor::apply_late_report_effect`].
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum LateReportEffect {
+    /// merged_bug_294 relocated to where late reports actually arrive
+    /// (bug_077): the cancelled execution's `final_line_count`
+    /// gap-fill. Correctness is backstopped by the stamp SQL's
+    /// equal-status COALESCE monotone guard — it fills ONLY a NULL
+    /// count on an already-cancelled-stamped row; a different verdict
+    /// matches zero rows — so firing on every Cancelled-status late
+    /// report is safe by construction (the SQL guard carries the
+    /// law).
+    FillCancelledCount {
+        /// The report's post-footer line count (> 0).
+        count: i64,
+    },
+    /// Acknowledge and write nothing (every other late report).
+    Nothing,
+}
+
+/// The one computation `(payload status, final_line_count)` →
+/// [`LateReportEffect`]. Pure; both AckIgnore lanes (the pull report
+/// intake and the un-admitted `ProcessCompletion` shim) route through
+/// it.
+pub(super) fn late_report_effect(
+    status: rio_proto::types::BuildResultStatus,
+    final_line_count: u64,
+) -> LateReportEffect {
+    let cancelled = status == rio_proto::types::BuildResultStatus::Cancelled;
+    match (
+        cancelled,
+        i64::try_from(final_line_count).ok().filter(|n| *n > 0),
+    ) {
+        (true, Some(count)) => LateReportEffect::FillCancelledCount { count },
+        (true, None) | (false, _) => LateReportEffect::Nothing,
+    }
+}
+
 /// Timeout for the CA cutoff-compare realisation lookup.
 ///
 /// `query_prior_realisation` is an indexed point-lookup on
@@ -1043,9 +1085,160 @@ impl DagActor {
     // ProcessCompletion
     // -----------------------------------------------------------------------
 
+    /// Apply one [`LateReportEffect`] (the AckIgnore lane's only
+    /// state-touching arm). The fill re-issues the terminal epilogue
+    /// with the SAME status — the stamp SQL's equal-status COALESCE
+    /// guard fills ONLY a NULL count on an already-cancelled-stamped
+    /// row (a different verdict matches zero rows), so this is
+    /// monotone-safe from any lane. Disclosed residual: a drv already
+    /// reaped from the DAG skips the epilogue (no exec to resolve) —
+    /// conservative direction, identical to the pre-fix behavior.
+    pub(super) fn apply_late_report_effect(
+        &mut self,
+        drv_hash: &DrvHash,
+        effect: LateReportEffect,
+    ) {
+        match effect {
+            LateReportEffect::FillCancelledCount { count } => {
+                let interested = self.get_interested_builds(drv_hash);
+                self.terminal_log_epilogue(drv_hash, "cancelled", &interested, Some(count));
+            }
+            LateReportEffect::Nothing => {}
+        }
+    }
+
+    /// The un-admitted completion intake (bug_077): every sender that
+    /// is NOT already behind a [`fold_report`] admission routes here —
+    /// the `ProcessCompletion` command arm (production: the
+    /// append-failure redelivery echo; tests: the stream-era helper
+    /// senders). The shim re-runs the SAME kernel admission law the
+    /// pull report intake uses, then dispatches: `Process` →
+    /// [`Self::handle_admitted_completion`] (the witness-taking body),
+    /// `AckIgnore` → the late-report lane ([`LateReportEffect`]).
+    ///
+    /// Admission inputs, by what the world provides:
+    /// - the DAG node names an open attempt (`exec_id`): the DURABLE
+    ///   attempt row carries the facts (`assignment_active`,
+    ///   recorded/terminal) — identical to the pull intake's fold; a
+    ///   resolvable-but-absent attempt (never-pulled/superseded exec)
+    ///   folds over honest `(false, false)` inputs;
+    /// - no attempt named (`exec_id == None`): the in-memory
+    ///   assignment view IS the assignment ledger (the stream-era
+    ///   `ProcessCompletion` worlds have no durable assignments) —
+    ///   `assignment_active := status ∈ {Assigned, Running}`, nothing
+    ///   classified.
+    ///
+    /// A DB read failure drops the redelivery (warn): the echo's
+    /// retry cap and the backstop sweep remain the safety net — the
+    /// same family as the give-up cell in
+    /// [`Self::requeue_failure_completion`].
     #[instrument(skip(self, result), fields(executor_id = %executor_id, drv_key = %drv_key))]
     pub(super) async fn handle_completion(
         &mut self,
+        executor_id: &ExecutorId,
+        // gRPC layer passes CompletionReport.drv_path; may be a drv_hash in tests.
+        drv_key: &str,
+        result: rio_proto::types::BuildResult,
+        (peak_memory_bytes, peak_cpu_cores): (u64, f64),
+        (node_name, hw_class): (Option<String>, Option<String>),
+        (final_resources, final_line_count): (Option<rio_proto::types::ResourceUsage>, u64),
+    ) {
+        use rio_evidence_kernel::pull::{ReportAdmission, fold_report};
+        // Two-key resolve (hash or path), read-only — the body keeps
+        // its own resolve for its internal flow.
+        let drv_hash: Option<DrvHash> = if self.dag.contains(drv_key) {
+            Some(drv_key.into())
+        } else {
+            self.dag.hash_for_path(drv_key).cloned()
+        };
+        let Some(drv_hash) = drv_hash else {
+            warn!(
+                executor_id = %executor_id,
+                key = drv_key,
+                "completion for unknown derivation, ignoring"
+            );
+            return;
+        };
+        let admission = match self.dag.node(&drv_hash).and_then(|s| s.exec_id) {
+            Some(exec_id) => match self.db.find_attempt_by_exec_id(exec_id).await {
+                Ok(Some(attempt)) => {
+                    let core = attempt.core();
+                    fold_report(
+                        core.assignment_active,
+                        core.attempt_recorded || core.attempt_terminal,
+                    )
+                }
+                // Never-pulled or superseded exec: no active
+                // assignment exists — honest fold inputs, AckIgnore
+                // by the kernel law.
+                Ok(None) => fold_report(false, false),
+                Err(e) => {
+                    warn!(
+                        drv_hash = %drv_hash, %exec_id, error = %e,
+                        "completion admission lookup failed; dropping the delivery \
+                         (the redelivery cap and the backstop sweep remain)"
+                    );
+                    return;
+                }
+            },
+            // No durable attempt named by the node: fold over the
+            // in-memory assignment view (see the method doc).
+            None => {
+                let in_memory_active = self.dag.node(&drv_hash).is_some_and(|s| {
+                    matches!(
+                        s.status(),
+                        DerivationStatus::Assigned | DerivationStatus::Running
+                    )
+                });
+                fold_report(in_memory_active, false)
+            }
+        };
+        match admission {
+            ReportAdmission::Process(admission) => {
+                self.handle_admitted_completion(
+                    admission,
+                    executor_id,
+                    drv_key,
+                    result,
+                    (peak_memory_bytes, peak_cpu_cores),
+                    (node_name, hw_class),
+                    (final_resources, final_line_count),
+                )
+                .await;
+            }
+            ReportAdmission::AckIgnore => {
+                debug!(
+                    drv_hash = %drv_hash,
+                    executor_id = %executor_id,
+                    "duplicate/late completion acknowledged-and-ignored (un-admitted intake)"
+                );
+                let status = rio_proto::types::BuildResultStatus::try_from(result.status)
+                    .unwrap_or(rio_proto::types::BuildResultStatus::Unspecified);
+                let effect = late_report_effect(status, final_line_count);
+                self.apply_late_report_effect(&drv_hash, effect);
+            }
+        }
+    }
+
+    /// The admitted completion body (bug_077): takes the kernel's
+    /// [`rio_evidence_kernel::pull::ProcessAdmission`] witness BY
+    /// VALUE (`#[must_use]`, non-Clone, fold-mint-only), so every arm
+    /// inside is provably behind the Process gate — logic intended
+    /// for late/closed-assignment reports cannot compile here and
+    /// lives on the [`LateReportEffect`] lane instead. The in-body
+    /// `Cancelled` arm STAYS: it is the degraded-window cell honestly
+    /// reachable via Process (durable close not yet landed, in-memory
+    /// already Cancelled); both arms call the same epilogue
+    /// chokepoint.
+    #[instrument(skip(self, result, _admission), fields(executor_id = %executor_id, drv_key = %drv_key))]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the admission witness rides ahead of the ProcessCompletion wire surface"
+    )]
+    pub(super) async fn handle_admitted_completion(
+        &mut self,
+        // Consumed by value: one admission admits one processing pass.
+        _admission: rio_evidence_kernel::pull::ProcessAdmission,
         executor_id: &ExecutorId,
         // gRPC layer passes CompletionReport.drv_path; may be a drv_hash in tests.
         drv_key: &str,
@@ -1209,21 +1402,18 @@ impl DagActor {
         // stamped by terminal_log_epilogue at cancel time -- with
         // final_line_count = None, because no report existed yet.
         //
-        // merged_bug_294: the report in hand carries the REAL
-        // post-footer count, and the terminal stamp is monotone --
-        // without consuming it here, every cancelled execution's
-        // fully-stored log reads incomplete forever (the store's
-        // completeness predicate never passes, the log never seals,
-        // the builder's zero-loss CompleteLog disposition cannot
-        // fire). Re-issue the epilogue with the SAME terminal status:
-        // the stamp SQL's COALESCE gap-fill accepts a late
-        // equal-status write and fills ONLY the NULL count.
+        // merged_bug_294 / bug_077: this in-body arm is the
+        // DEGRADED-WINDOW cell -- honestly reachable via Process only
+        // while the durable close has not yet landed but the
+        // in-memory state is already Cancelled (an outbox-latched
+        // cancel persist). The common production cell (durable close
+        // landed, report folds AckIgnore) rides the late-report lane
+        // instead; BOTH arms route the same typed effect through the
+        // same epilogue chokepoint, and the stamp SQL's equal-status
+        // COALESCE guard makes the double coverage idempotent.
         if current_status == DerivationStatus::Cancelled {
-            let report_line_count = i64::try_from(final_line_count).ok().filter(|n| *n > 0);
-            if report_line_count.is_some() {
-                let interested = self.get_interested_builds(drv_hash);
-                self.terminal_log_epilogue(drv_hash, "cancelled", &interested, report_line_count);
-            }
+            let effect = late_report_effect(wire_status, final_line_count);
+            self.apply_late_report_effect(drv_hash, effect);
             debug!(drv_hash = %drv_hash, executor_id = %executor_id,
                    "cancelled completion report (expected after a cancel)");
             return;

@@ -617,8 +617,11 @@ pub fn fence_obligation<ExecId>(
 /// fold ([`fold_report`]) — the report is the FIRST one for a
 /// still-open attempt. Constructible ONLY by `fold_report` (bug_134):
 /// the materialization consumption transaction REQUIRES this witness
-/// by value, so running consumption on a duplicate, late, or
-/// closed-assignment report no longer typechecks. Deliberately not
+/// by value, and so does the scheduler's build-completion body
+/// (`handle_admitted_completion`, bug_077) — running consumption or
+/// completion processing on a duplicate, late, or closed-assignment
+/// report no longer typechecks; late-report side effects live on the
+/// AckIgnore lanes' typed effect alphabet instead. Deliberately not
 /// `Clone`/`Copy`: one admission admits one processing pass.
 #[derive(Debug)]
 #[must_use = "an admitted report must be processed (or dropped at an intake-level ack arm)"]

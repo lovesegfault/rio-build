@@ -4559,55 +4559,50 @@ async fn test_redelivered_completion_keeps_store_degraded_flag() -> TestResult {
     Ok(())
 }
 
-/// merged_bug_294: a cancelled build's CompletionReport arrives AFTER
-/// the scheduler's cancel transition, carrying the real post-footer
-/// `final_line_count`. The cancel-time stamp passed None (no report
-/// existed yet) and the terminal stamp is monotone -- pre-fix this
-/// early return discarded the report's count, so the execution's
-/// fully-stored log read "incomplete" FOREVER: the store's
-/// completeness predicate (`sealed_final_line_count` NULL =>
-/// incomplete) never passed, the log never sealed, and the builder's
-/// zero-loss CompleteLog disposition could not fire.
+/// merged_bug_294 + bug_077: a cancelled build's CompletionReport
+/// arrives AFTER the scheduler's durable cancel close, carrying the
+/// real post-footer `final_line_count`. The cancel-time stamp passed
+/// None (no report existed yet) and the terminal stamp is monotone --
+/// without the fill, the execution's fully-stored log reads
+/// "incomplete" FOREVER (the store's completeness predicate never
+/// passes, the log never seals, the builder's zero-loss CompleteLog
+/// disposition cannot fire).
+///
+/// bug_077 (the witness-provenance rewrite): the previous regression
+/// test called `handle_completion` DIRECTLY on a hand-injected world,
+/// which hid that the production path never reached the in-body fill:
+/// a real cancel closes the assignment durably, so the pod's late
+/// report folds AckIgnore at the report intake (`fold_report`,
+/// kani-pinned: Process requires an ACTIVE assignment) and the
+/// gap-fill arm behind the Process gate was production-unreachable.
+/// This test constructs the world through production constructors
+/// ONLY -- attempt minted via the pull path, cancel via CancelBuild
+/// (the durable close lands), late report via the report intake --
+/// and asserts the fill happens on the LATE-REPORT (AckIgnore) lane.
+// r[verify sched.executor.report-idempotent]
 #[tokio::test]
-async fn cancelled_completion_report_fills_the_line_count() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    crate::actor::tests::seed_default_tenant(&db.pool).await;
-    let exec_id = uuid::Uuid::now_v7();
-    // The cancel-time stamp's outcome: status sealed, count NULL.
-    sqlx::query(
-        "INSERT INTO drv_executions (exec_id, drv_hash, executor_id, started_at, \
-                                     attempt_kind, status) \
-         VALUES ($1, 'cancel-count', 'w-cc', now(), 'build', 'cancelled')",
-    )
-    .bind(exec_id)
-    .execute(&db.pool)
-    .await?;
+async fn production_cancel_late_report_fills_the_line_count() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let build = Uuid::new_v4();
+    let _ev = merge_single_node(&handle, build, "cancel-count", PriorityClass::Scheduled).await?;
 
-    let mut actor = bare_actor(db.pool.clone());
-    actor.test_inject_ready_row(crate::db::RecoveryDerivationRow {
-        exec_id: Some(exec_id),
-        assigned_builder_id: Some("w-cc".into()),
-        ..crate::db::RecoveryDerivationRow::test_default("cancel-count", "x86_64-linux")
+    // The pod opens its attempt through the real mint.
+    let exec_id = open_pull_exec(&handle, "cancel-count").await;
+
+    // The user cancels; the durable close lands before the reply
+    // (assignment rows close in the terminal status persist) and the
+    // cancel-time epilogue stamps status='cancelled' with a NULL
+    // count.
+    cancel_build(&handle, build).await?;
+
+    // The pod's late Cancelled report arrives with the real
+    // post-footer count -- after the close, so it folds AckIgnore.
+    let mut payload = pull_payload(rio_proto::types::BuildResult {
+        status: rio_proto::types::BuildResultStatus::Cancelled.into(),
+        ..Default::default()
     });
-    actor
-        .dag
-        .node_mut("cancel-count")
-        .expect("just injected")
-        .set_status_for_test(DerivationStatus::Cancelled);
-
-    actor
-        .handle_completion(
-            &crate::state::ExecutorId::from("w-cc"),
-            "cancel-count",
-            rio_proto::types::BuildResult {
-                status: rio_proto::types::BuildResultStatus::Cancelled.into(),
-                ..Default::default()
-            },
-            (0, 0.0),
-            (None, None),
-            (None, 7),
-        )
-        .await;
+    payload.final_line_count = 7;
+    pull_report_exec(&handle, exec_id, "cancel-count", payload).await?;
 
     // The epilogue's stamp is a spawned best-effort write: poll.
     let mut count: Option<i64> = None;
@@ -4625,9 +4620,9 @@ async fn cancelled_completion_report_fills_the_line_count() -> TestResult {
     assert_eq!(
         count,
         Some(7),
-        "left: {count:?} / right: Some(7) (the cancelled report's count \
-         must fill the NULL via the COALESCE gap-fill -- incomplete-forever \
-         is the bug)"
+        "left: {count:?} / right: Some(7) (pre-fix: the AckIgnore lane swallowed \
+         the count -- the log reads incomplete forever; the fill must ride the \
+         late-report lane via the COALESCE equal-status gap-fill)"
     );
     Ok(())
 }

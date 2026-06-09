@@ -1296,9 +1296,19 @@ impl DagActor {
                     assignment_active = b.core.assignment_active,
                     "duplicate/late ReportOutcome acknowledged-and-ignored"
                 );
+                // bug_077: the late-report lane — the typed effect a
+                // non-admitted report may still have (the cancelled
+                // count gap-fill rides HERE, where late reports
+                // actually arrive; the SQL guard makes it safe).
+                let drv_hash = DrvHash::from(b.core.drv_hash.as_str());
+                let effect = super::completion::late_report_effect(
+                    payload.result.status(),
+                    payload.final_line_count,
+                );
+                self.apply_late_report_effect(&drv_hash, effect);
                 Ok(())
             }
-            ReportAdmission::Process(_admission) => {
+            ReportAdmission::Process(admission) => {
                 let executor_id = ExecutorId::from(b.core.executor_id.as_str());
                 // r[impl sched.attempt.synthesized-verdict+3]
                 // AD5 abort charge class: a pod reporting `Cancelled`
@@ -1374,7 +1384,8 @@ impl DagActor {
                 // drv is addressed by the attempt's own derivation (the
                 // exec_id is the key; the report's drv_path is not
                 // trusted to re-route it).
-                self.handle_completion(
+                self.handle_admitted_completion(
+                    admission,
                     &executor_id,
                     &b.core.drv_path,
                     payload.result,
