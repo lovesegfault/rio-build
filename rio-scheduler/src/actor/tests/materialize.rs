@@ -9486,3 +9486,61 @@ async fn foreign_open_attempt_does_not_mask_anothers_ghost() -> TestResult {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Defer rides the release disposition (bug_220)
+// ---------------------------------------------------------------------------
+
+/// bug_220 red: a stale executor's redelivered RetryLater settles
+/// through `companion_release` while a DIFFERENT executor holds a
+/// fresh claim. Pre-fix the companion stamped `defer_until`
+/// unconditionally BEFORE the holder-gated release, so the stale
+/// report defaced the fresh holder's job: when the fresh holder later
+/// released through a defer-less companion, the job sat invisibly
+/// Deferred (refused NotYetReady at admission, filtered from the
+/// listing, counted in neither gauge) for up to the clamped window.
+#[tokio::test]
+async fn stale_retrylater_redelivery_cannot_defer_a_fresh_holders_job() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor(db.pool.clone());
+    let drv = DrvHash::from("defer-stale-drv");
+    let mut entry = crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None);
+    entry.mint_claim(crate::state::ExecutorId::from("fresh-holder"));
+    actor.materialization_jobs.insert(drv.clone(), entry);
+
+    // Stale redelivery: settled close + 300s defer from the FORMER
+    // holder. The release is a compare-and-clear miss (StaleHolder).
+    let _ack = actor
+        .companion_release(
+            &drv,
+            &crate::state::ExecutorId::from("stale-holder"),
+            Some(std::time::Duration::from_secs(300)),
+            crate::actor::materialize::SettledClose::test_witness(),
+        )
+        .await;
+
+    // The fresh holder's own clean release (no defer).
+    let _ack = actor
+        .companion_release(
+            &drv,
+            &crate::state::ExecutorId::from("fresh-holder"),
+            None,
+            crate::actor::materialize::SettledClose::test_witness(),
+        )
+        .await;
+
+    let claimability = actor
+        .materialization_jobs
+        .get(&drv)
+        .expect("entry survives both releases")
+        .claimability(std::time::Instant::now());
+    assert!(
+        matches!(
+            claimability,
+            crate::actor::materialize::Claimability::ClaimableNow
+        ),
+        "left: {claimability:?} / right: ClaimableNow (a stale holder's \
+         redelivery must not deface the fresh claim's deferral axis)"
+    );
+    Ok(())
+}

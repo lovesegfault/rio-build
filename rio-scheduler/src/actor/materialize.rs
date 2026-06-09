@@ -208,6 +208,31 @@ impl JobViewEntry {
         }
     }
 
+    /// Compare-and-clear PLUS the deferral stamp in ONE
+    /// disposition-gated mutation (bug_220): the defer rides the
+    /// release disposition, so a stale holder's redelivered RetryLater
+    /// cannot deface a job a different executor now holds. `Released`
+    /// and `Unclaimed` stamp (the latter keeps idempotent redelivery
+    /// after the holder's own release working); `StaleHolder` stamps
+    /// NOTHING. This is the SINGLE production writer of `defer_until`
+    /// — the field is private and every other path only reads it
+    /// (`claimability`), so "a stale release cannot touch the deferral
+    /// plane" is structural, not reviewed.
+    // r[impl sched.materialize.claim-coherence]
+    pub(super) fn release_claim_deferring(
+        &mut self,
+        expected: &ExecutorId,
+        defer_until: Option<std::time::Instant>,
+    ) -> ClaimRelease {
+        let release = self.release_claim_if_held(expected);
+        if release != ClaimRelease::StaleHolder
+            && let Some(until) = defer_until
+        {
+            self.defer_until = Some(until);
+        }
+        release
+    }
+
     /// Unconditional claim clear — the no-named-executor fallback of
     /// the park companions ONLY (no production lane reaches it today;
     /// every release that can race a fresh mint goes through
@@ -1874,8 +1899,12 @@ impl DagActor {
 
     /// Settled-close companion #2 of 5: defer (optionally) and release
     /// the claim atomically — the ReArm / RetryLater / Aborted /
-    /// zero-width / coverage-miss composition.
-    async fn companion_release(
+    /// zero-width / coverage-miss composition. bug_220: the defer
+    /// stamp rides the release disposition inside the entry's single
+    /// combined mutation — a redelivered RetryLater from a FORMER
+    /// holder (reachable because `AlreadyResolved` counts as settled)
+    /// is a compare-and-clear miss and stamps nothing.
+    pub(super) async fn companion_release(
         &mut self,
         drv_hash: &DrvHash,
         executor: &ExecutorId,
@@ -1883,12 +1912,8 @@ impl DagActor {
         close: SettledClose,
     ) -> MatAck {
         let SettledClose(()) = close;
-        if let Some(d) = defer
-            && let Some(entry) = self.materialization_jobs.get_mut(drv_hash)
-        {
-            entry.defer_until = Some(std::time::Instant::now() + d);
-        }
-        self.release_claim(drv_hash, executor).await;
+        self.release_claim_with_defer(drv_hash, executor, defer)
+            .await;
         MatAck(())
     }
 
@@ -2186,8 +2211,23 @@ impl DagActor {
     /// attempt's Assigned/Running bookkeeping.
     // r[impl sched.materialize.claim-coherence]
     pub(super) async fn release_claim(&mut self, drv_hash: &DrvHash, executor: &ExecutorId) {
+        self.release_claim_with_defer(drv_hash, executor, None)
+            .await;
+    }
+
+    /// [`Self::release_claim`] with the optional deferral folded into
+    /// the SAME entry-level disposition-gated mutation (bug_220) — the
+    /// companion's RetryLater window stamps if and only if the
+    /// compare-and-clear did not miss.
+    async fn release_claim_with_defer(
+        &mut self,
+        drv_hash: &DrvHash,
+        executor: &ExecutorId,
+        defer: Option<std::time::Duration>,
+    ) {
+        let defer_until = defer.map(|d| std::time::Instant::now() + d);
         let release = match self.materialization_jobs.get_mut(drv_hash) {
-            Some(entry) => entry.release_claim_if_held(executor),
+            Some(entry) => entry.release_claim_deferring(executor, defer_until),
             // No view entry (resolved/wiped/unhydrated): nothing to
             // clear; the requeue below stays level-triggered — the
             // node bookkeeping is keyed on the durable attempt, not
