@@ -46,6 +46,7 @@ bool confirm_only = 7;
 bool is_fixed_output = 8;
 bool keep_going = 8;
 bool store_degraded = 7;
+bool trust_refused = 5;
 bytes drv_content = 2;
 bytes output_hash = 3;
 double peak_cpu_cores = 6;

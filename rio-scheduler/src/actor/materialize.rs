@@ -1230,7 +1230,7 @@ pub(crate) use rio_evidence_kernel::routing::{
 };
 
 impl DagActor {
-    // r[impl sched.materialize.routing+5]
+    // r[impl sched.materialize.routing+6]
     /// Consume one materialization outcome (the §2.4 consumption
     /// transaction). Reachable only flag-on in practice (no
     /// materialization attempt can exist otherwise) — but ALWAYS wired
@@ -1544,6 +1544,10 @@ impl DagActor {
                     prior_unobtainable_count: prior_unobtainable,
                     reprobe,
                     pruned_origin,
+                    // merged_bug_263: the typed trust refusal rides
+                    // the wire into the settlement (absent/old-store
+                    // decodes false = the pre-field routing).
+                    trust_refused: u.trust_refused,
                 });
                 // 3. Execute the routing — every arm spends the
                 //    settled-close witness on exactly one companion.
@@ -1765,7 +1769,7 @@ impl DagActor {
     /// channel without the decision no longer exists. Park backs off
     /// the job durably (and the node is requeued either way: claimable
     /// again / from-source dispatchable per the admission table).
-    // r[impl sched.materialize.routing+5]
+    // r[impl sched.materialize.routing+6]
     /// Settled-close companion #5 of 5 — it owns its OWN close (the
     /// charge row rides the close transaction), then runs the park
     /// verdict. Returns the ack witness plus whether the close
@@ -2516,7 +2520,7 @@ impl DagActor {
     /// mid-walk crash leaves outputs present but the closure
     /// incomplete) and never `executor_crash` (BC-2: the charge feeds
     /// the materialization budget and nothing else).
-    // r[impl sched.materialize.routing+5]
+    // r[impl sched.materialize.routing+6]
     pub(super) async fn establish_materialization_attempt(
         &mut self,
         attempt: &crate::db::open_attempts::OpenAttemptRow,
@@ -2559,7 +2563,7 @@ impl DagActor {
     }
 
     // r[impl obs.metric.materialization-stalled+2]
-    // r[impl sched.materialize.routing+5]
+    // r[impl sched.materialize.routing+6]
     /// PD-20 (design §2.5, Phase B T-6.1): the parked-job housekeeping
     /// arm. Every tick, flag-on, leader-only:
     ///

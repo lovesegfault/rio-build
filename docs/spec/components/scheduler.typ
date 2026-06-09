@@ -1471,7 +1471,7 @@ workers (ledger lost with the process) still settle through the charged
 establishment window --- the signed residual, now reachable only by real
 crashes. Build-kind re-delivery stays credential-less (as-built).
 
-#r("sched.materialize.routing+5")[
+#r("sched.materialize.routing+6")[
   A materialization outcome MUST be consumed in exactly one fenced transaction
   keyed by its exec_id, and that transaction MUST re-read live interest and the
   live effective wanted set before acting: a Success outcome completes the node
@@ -1495,7 +1495,16 @@ crashes. Build-kind re-delivery stays credential-less (as-built).
   confirmed-missing verdict is the all-tenant conjunction over a non-empty
   answer set, any failed or indeterminate tenant view re-arms instead ---
   the job fails only when NO interested tenant can obtain), or after the
-  per-job re-probe one-shot is spent --- the settlement arm, which MUST
+  per-job re-probe one-shot is spent --- the settlement arm. When the
+  outcome carries the typed trust-refusal marker
+  (`Unobtainable.trust_refused`: at least one unobtained path was present
+  upstream but refused by signature policy), the settlement MUST consume
+  it typed, end-to-end: an Obtainable re-probe answer MUST NOT license a
+  re-arm (the HEAD re-probe is sig-blind --- it confirms the presence that
+  was never in question) and the verdict MUST NOT be the fail-fast even
+  for a pruned origin (the resubmit-directing error sends the user into
+  the same refusal, unbounded) --- a trust-refused settlement with
+  anything missing resolves from-source. Otherwise the settlement MUST
   discriminate on the job's pruned origin (`origin = 'pruned'`, set at pruned
   creation or by the pruned-wins dedup upgrade and read from the job row at
   decision time): a PRUNED-origin job fail-fasts every live

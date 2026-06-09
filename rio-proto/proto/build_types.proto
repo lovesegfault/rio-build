@@ -629,6 +629,16 @@ message MaterializationOutcome {
     // old-store missing_paths entries outside expected∪carried∪live
     // into this cell (bounded skew, scheduler-before-store rollout).
     repeated string missing_reference_paths = 4;
+    // merged_bug_263: at least one unobtained path was PRESENT
+    // upstream but refused by signature policy (no narinfo signature
+    // verified against trusted_keys). Typed end-to-end so the
+    // settlement can consume it: the scheduler's re-probe is a
+    // sig-blind HEAD (presence, not trust) — under this flag an
+    // Obtainable re-probe answer never licenses a ReArm, and a
+    // pruned-origin job resolves from-source instead of fail-fasting
+    // into a resubmit loop that meets the same refusal. Absent (old
+    // store) decodes false — the pre-field routing, bounded skew.
+    bool trust_refused = 5;
   }
   message InfraFailure {
     // upstream 5xx/timeout/store-internal/no-tenant-context — nothing

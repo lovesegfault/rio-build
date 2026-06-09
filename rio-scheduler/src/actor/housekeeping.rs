@@ -1279,7 +1279,7 @@ impl DagActor {
                 // is materialization_infra (counts toward the
                 // materialization budget and toward NOTHING else),
                 // never executor_crash.
-                // r[impl sched.materialize.routing+5]
+                // r[impl sched.materialize.routing+6]
                 self.establish_materialization_attempt(attempt).await;
                 return;
             }

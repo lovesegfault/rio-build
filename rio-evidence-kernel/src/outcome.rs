@@ -228,7 +228,7 @@ pub struct TenantPathAnswers<'a> {
 /// failures never reach this fold — the caller maps them to its B3
 /// ReArm before folding (same posture as `route_unobtainable`'s
 /// `None` reprobe).
-// r[impl sched.materialize.routing+5]
+// r[impl sched.materialize.routing+6]
 // r[impl sched.materialize.reprobe-per-path]
 pub fn fold_path_reprobes(tenants: &[TenantPathAnswers<'_>]) -> crate::routing::ReprobeAnswer {
     use crate::routing::ReprobeAnswer;

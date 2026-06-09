@@ -1134,6 +1134,17 @@ impl Substituter {
                     "tenant" => tenant_id.to_string()
                 )
                 .increment(1);
+                // merged_bug_263 (mirrors merged_bug_016 one arm
+                // over): a cached HEAD positive answers PRESENCE, and
+                // presence is exactly the misleading half of a trust
+                // refusal — a charge-gating confirmation probe
+                // consulting the stale `true` would re-confirm the
+                // doomed path for the rest of the 1h TTL. The refusal
+                // contradicts the cached positive's USEFULNESS, so
+                // evict it; the next probe observes live state.
+                self.probe_cache
+                    .invalidate(&(tenant_id, store_path.to_string()))
+                    .await;
                 Err(SubstituteError::UntrustedPresent)
             }
             rio_evidence_kernel::outcome::SubstituteLoopVerdict::CleanMiss => {

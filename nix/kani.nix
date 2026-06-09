@@ -552,6 +552,6 @@ in
     # inverse breaks the build on a new variant, so a class can no
     # longer be silently excluded from any sweep (the round-3
     # pick-table lesson made structural).
-    expectedHarnesses = 37;
+    expectedHarnesses = 38;
   };
 }

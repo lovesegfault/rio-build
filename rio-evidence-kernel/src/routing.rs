@@ -102,9 +102,20 @@ pub struct RoutingInputs<'a> {
     /// instead — non-pruned nodes are never affected, whatever their
     /// evidence.
     pub pruned_origin: bool,
+    /// Whether the store's typed trust refusal rode the outcome
+    /// (merged_bug_263, proto `Unobtainable.trust_refused`): at least
+    /// one unobtained path was PRESENT upstream but refused by
+    /// signature policy (`UntrustedPresent` — no narinfo signature
+    /// verified against `trusted_keys`). The settlement consumes this
+    /// axis typed, end-to-end: an Obtainable re-probe answer is
+    /// sig-blind (HEAD sees presence, not trust) so it never licenses
+    /// a ReArm, and a pruned-origin fail-fast is never the verdict (a
+    /// resubmit meets the same refusal) — a trust-refused settlement
+    /// resolves from-source.
+    pub trust_refused: bool,
 }
 
-// r[impl sched.materialize.routing+5]
+// r[impl sched.materialize.routing+6]
 /// The four-arm routing core. PURE (no IO, no clocks); the FMP
 /// re-probe answer is an input.
 ///
@@ -130,6 +141,7 @@ pub fn route_unobtainable(inputs: &RoutingInputs<'_>) -> UnobtainableRouting {
         inputs.prior_unobtainable_count > 0,
         inputs.reprobe,
         inputs.pruned_origin,
+        inputs.trust_refused,
     )
 }
 
@@ -147,6 +159,7 @@ pub fn route_unobtainable(inputs: &RoutingInputs<'_>) -> UnobtainableRouting {
 /// reference miss the decision falls through to arms 1–3, where
 /// Vouched/Pending route from-source and the leaf/holed arm settles on
 /// the origin discriminator.
+#[allow(clippy::too_many_arguments)] // the set-free CBMC target restates the axes
 pub(crate) fn route_from_classes(
     missing_live: bool,
     refs_missing: bool,
@@ -155,6 +168,7 @@ pub(crate) fn route_from_classes(
     one_shot_spent: bool,
     reprobe: Option<ReprobeAnswer>,
     pruned_origin: bool,
+    trust_refused: bool,
 ) -> UnobtainableRouting {
     if !missing_live && !refs_missing {
         return if covered {
@@ -173,7 +187,14 @@ pub(crate) fn route_from_classes(
     // Arm 3 — leaf/holed evidence + live-wanted missing: the re-probe
     // gate.
     match reprobe {
-        Some(ReprobeAnswer::Obtainable) if !one_shot_spent => UnobtainableRouting::ReArm,
+        // merged_bug_263: the re-probe is a sig-blind HEAD — under a
+        // typed trust refusal its Obtainable answer confirms only the
+        // PRESENCE that was never in question; re-arming would burn
+        // the one-shot on a doomed re-attempt against the same
+        // refusal.
+        Some(ReprobeAnswer::Obtainable) if !one_shot_spent && !trust_refused => {
+            UnobtainableRouting::ReArm
+        }
         // Re-probe confirms missing, or the one-shot is spent. (A
         // missing probe is mapped to ReArm by the caller before this
         // core runs — see the doc above.)
@@ -188,7 +209,12 @@ pub(crate) fn route_from_classes(
         // broken by structure (childless) or holed — releases to
         // from-source dispatch instead; non-pruned nodes are never
         // affected, whatever their evidence.
-        _ if pruned_origin => UnobtainableRouting::FailFast,
+        // merged_bug_263: a trust-refused settlement never
+        // fail-fasts, pruned origin or not — the resubmit-directing
+        // error sends the user into the SAME refusal (an unbounded
+        // resubmit loop); from-source is the repair that bypasses the
+        // refused upstream artifact.
+        _ if pruned_origin && !trust_refused => UnobtainableRouting::FailFast,
         _ => UnobtainableRouting::ResolveFromSource,
     }
 }
@@ -196,7 +222,7 @@ pub(crate) fn route_from_classes(
 /// Success-consumption coverage check (the CE-17 closer): the live
 /// wanted set is covered by what the execution ingested or verified.
 /// The witness type makes the check non-vacuous by construction.
-// r[impl sched.materialize.routing+5]
+// r[impl sched.materialize.routing+6]
 pub fn success_covers_live_wanted(
     ingested_paths: &[String],
     verified_paths: &[String],
@@ -247,6 +273,7 @@ mod tests {
                 prior_unobtainable_count: 1,
                 reprobe: Some(ReprobeAnswer::ConfirmedMissing),
                 pruned_origin: true,
+                trust_refused: false,
             });
             assert_eq!(routing, UnobtainableRouting::FailFast);
             let routing = route_unobtainable(&RoutingInputs {
@@ -258,12 +285,69 @@ mod tests {
                 prior_unobtainable_count: 1,
                 reprobe: Some(ReprobeAnswer::ConfirmedMissing),
                 pruned_origin: false,
+                trust_refused: false,
             });
             assert_eq!(routing, UnobtainableRouting::ResolveFromSource);
         }
     }
 
     /// merged_bug_193 (kernel half): a confirmed REFERENCE miss can
+    /// merged_bug_263 (bughunt-4): a trust-refused settlement at the
+    /// leaf arm — the sig-blind Obtainable re-probe (HEAD sees the
+    /// path PRESENT; presence was never the question) must not burn
+    /// the one-shot on a ReArm doomed to the same refusal. Pre-fix
+    /// red is compile-level (the result.rs:447 precedent): the typed
+    /// refusal died at the proto boundary — neither
+    /// `Unobtainable.trust_refused` nor the `RoutingInputs` axis
+    /// existed, so the doomed ReArm was the only expressible shape.
+    #[test]
+    fn routing_trust_refused_skips_sig_blind_rearm() {
+        let routing = route_unobtainable(&RoutingInputs {
+            missing_paths: &["/nix/store/a".into()],
+            missing_references: &[],
+            verified_paths: &[],
+            live_wanted_paths: &lw(&["/nix/store/a"]),
+            durable_evidence: ClosureEvidence::ChildlessLeaf,
+            prior_unobtainable_count: 0,
+            reprobe: Some(ReprobeAnswer::Obtainable),
+            pruned_origin: false,
+            trust_refused: true,
+        });
+        // Old shape (trust axis unexpressed): ReArm — the doomed
+        // one-shot burn.
+        assert_eq!(routing, UnobtainableRouting::ResolveFromSource);
+    }
+
+    /// merged_bug_263: a PRUNED-origin trust-refused settlement never
+    /// fail-fasts — the resubmit-directing error would send the user
+    /// into the same refusal, unbounded; from-source bypasses the
+    /// refused upstream artifact.
+    #[test]
+    fn routing_trust_refused_pruned_resolves_from_source() {
+        for reprobe in [
+            Some(ReprobeAnswer::ConfirmedMissing),
+            Some(ReprobeAnswer::Obtainable),
+            None,
+        ] {
+            let routing = route_unobtainable(&RoutingInputs {
+                missing_paths: &["/nix/store/a".into()],
+                missing_references: &[],
+                verified_paths: &[],
+                live_wanted_paths: &lw(&["/nix/store/a"]),
+                durable_evidence: ClosureEvidence::Holed,
+                prior_unobtainable_count: 1,
+                reprobe,
+                pruned_origin: true,
+                trust_refused: true,
+            });
+            assert_eq!(
+                routing,
+                UnobtainableRouting::ResolveFromSource,
+                "reprobe={reprobe:?}"
+            );
+        }
+    }
+
     /// never take the moot-completion arm, even with every live-wanted
     /// root verified. Pre-fix the inputs could not express the
     /// distinction (`missing_paths` lumped both): the covered check
@@ -291,6 +375,7 @@ mod tests {
                 prior_unobtainable_count: 0,
                 reprobe: None,
                 pruned_origin: false,
+                trust_refused: false,
             });
             assert_ne!(routing, UnobtainableRouting::CompleteForLiveInterest);
             assert_eq!(routing, want);
@@ -306,6 +391,7 @@ mod tests {
             prior_unobtainable_count: 1,
             reprobe: Some(ReprobeAnswer::ConfirmedMissing),
             pruned_origin: true,
+            trust_refused: false,
         });
         assert_eq!(routing, UnobtainableRouting::FailFast);
         // And the no-hole twin still completes (the moot arm survives).
@@ -318,6 +404,7 @@ mod tests {
             prior_unobtainable_count: 0,
             reprobe: None,
             pruned_origin: false,
+            trust_refused: false,
         });
         assert_eq!(routing, UnobtainableRouting::CompleteForLiveInterest);
     }
@@ -364,6 +451,7 @@ mod proofs {
             kani::any(),
             any_reprobe(),
             kani::any(),
+            kani::any(),
         );
         if routing == UnobtainableRouting::CompleteForLiveInterest {
             assert!(covered && !missing_live && !refs_missing);
@@ -384,11 +472,42 @@ mod proofs {
             kani::any(),
             any_reprobe(),
             kani::any(),
+            kani::any(),
         );
         kani::cover!(routing == UnobtainableRouting::CompleteForLiveInterest);
         kani::cover!(routing == UnobtainableRouting::ReArm);
         kani::cover!(routing == UnobtainableRouting::ResolveFromSource);
         kani::cover!(routing == UnobtainableRouting::FailFast);
+    }
+
+    /// merged_bug_263 (bughunt-4): the trust-refusal settlement law,
+    /// over the FULL bounded input space — a typed trust refusal with
+    /// anything actually missing NEVER ReArms (the re-probe is
+    /// sig-blind) and NEVER FailFasts (a resubmit meets the same
+    /// refusal): every such settlement resolves from-source. Arm 0
+    /// (nothing missing) is the refusal-moot cell and keeps its
+    /// complete/re-arm semantics — covered by the reachability pins.
+    #[kani::proof]
+    fn check_trust_refused_settles_from_source() {
+        let missing_live: bool = kani::any();
+        let refs_missing: bool = kani::any();
+        let routing = route_from_classes(
+            missing_live,
+            refs_missing,
+            kani::any(),
+            any_evidence(),
+            kani::any(),
+            any_reprobe(),
+            kani::any(),
+            true,
+        );
+        if missing_live || refs_missing {
+            assert!(routing == UnobtainableRouting::ResolveFromSource);
+        }
+        kani::cover!(routing == UnobtainableRouting::ResolveFromSource);
+        // The refusal-moot cell stays live under the flag.
+        kani::cover!(routing == UnobtainableRouting::CompleteForLiveInterest);
+        kani::cover!(routing == UnobtainableRouting::ReArm);
     }
 
     /// Finding 11 / the B2 walk equivalence, generalized: a NON-PRUNED
@@ -406,6 +525,7 @@ mod proofs {
             kani::any(),
             any_reprobe(),
             false,
+            kani::any(),
         );
         assert!(routing != UnobtainableRouting::FailFast);
         kani::cover!(

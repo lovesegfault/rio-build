@@ -909,6 +909,10 @@ async fn execute_job_inner(
                         .paths()
                         .map(str::to_owned)
                         .collect(),
+                    // merged_bug_263: the refusal rides TYPED — the
+                    // cause string above already names it for humans;
+                    // this field is what the settlement consumes.
+                    trust_refused: !trust_refused.is_empty(),
                 },
             )),
         }
