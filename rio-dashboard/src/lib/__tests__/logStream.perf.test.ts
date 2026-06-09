@@ -174,4 +174,38 @@ describe('createLogStream perf', () => {
     expect(s.truncated).toBe(true);
     expect(s.rows.length).toBe(40_000);
   });
+
+  // r[verify dash.stream.log-tail+6]
+  /// bug_169's recorded red: applyCap spliced kind-blind -- gap marker
+  /// rows were destroyed while the monotone gapCount kept the "holes
+  /// are marked inline" banner true-in-name-only, and droppedLines
+  /// over-counted the markers as "earlier lines truncated". Both
+  /// counters now DERIVE from the rows they describe: gapCount counts
+  /// the gap rows present (eviction-coherent by construction);
+  /// droppedLines counts only kind==='line' from the spliced prefix.
+  it('cap_eviction_of_gap_row_derives_counters: a spliced marker cannot leave a stale count', async () => {
+    // Head chunk starts at line 10 -> one gap row [0,10), then 100
+    // lines (101 rows). 499 more serve-chunks of 100 reach 50_001
+    // rows -> one cap pass: excess 10_001 spliced = the gap row +
+    // 10_000 lines; the final isComplete chunk lands after.
+    tailLog.mockImplementation(async function* () {
+      yield chunk(100, 10n);
+      for (let i = 0; i < 499; i++) yield chunk(100, BigInt(110 + i * 100));
+      yield chunk(100, BigInt(110 + 499 * 100), true);
+    });
+
+    const s = createLogStream();
+    await flush(510);
+
+    expect(s.done).toBe(true);
+    expect(s.truncated).toBe(true);
+    // The gap marker fell in the spliced prefix: the derived count
+    // follows the rows (old: stale 1 with no marker rendered).
+    expect(s.rows.some((r) => r.kind === 'gap')).toBe(false);
+    expect(s.gapCount).toBe(0);
+    // Only LINE rows count as truncated lines (old: 10_001 counted
+    // the marker).
+    expect(s.droppedLines).toBe(10_000);
+  });
+
 });

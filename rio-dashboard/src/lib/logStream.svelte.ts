@@ -118,8 +118,12 @@ export type LogStream = {
   readonly truncated: boolean;
   readonly droppedLines: number;
   readonly incomplete: boolean;
-  /** Interior gaps observed (gap rows pushed). Drives the banner split:
-   * interior gaps vs missing tail are different failure stories. */
+  /** Interior gap marker rows PRESENT — $derived from the rows array
+   * (bug_169), so cap eviction cannot strand the count: the "holes are
+   * marked inline" banner is true by construction (an evicted marker's
+   * span lives inside the truncation banner's region instead). Drives
+   * the banner split: interior gaps vs missing tail are different
+   * failure stories. */
   readonly gapCount: number;
   /** The store demanded credentials the KeylessOnly dashboard does not
    * hold (terminal — never retried). The viewer renders the
@@ -184,12 +188,19 @@ export function createLogStream(
   opts?: { isTerminal?: () => boolean },
 ): LogStream {
   const rows = $state<LogRow[]>([]);
+  // bug_169: DERIVED from the rows it describes — a counter maintained
+  // beside the array desyncs the moment a third mutation site appears
+  // (applyCap's splice did exactly that to the pushed-gaps counter).
+  // O(rows) per recompute, lazily on read; the reduce touches only the
+  // monomorphic `kind` field (~0.5ms at the 50K cap).
+  const gapCount = $derived(
+    rows.reduce((n, r) => (r.kind === 'gap' ? n + 1 : n), 0),
+  );
   let done = $state(false);
   let err = $state<Error | null>(null);
   let truncated = $state(false);
   let droppedLines = $state(0);
   let incomplete = $state(false);
-  let gapCount = $state(0);
   let authRequired = $state(false);
   let phase = $state<StreamPhase>({ kind: 'streaming' });
   const hasOracle = opts?.isTerminal !== undefined;
@@ -214,9 +225,15 @@ export function createLogStream(
   function applyCap() {
     if (rows.length > MAX_ROWS) {
       const excess = rows.length - (MAX_ROWS - DROP_ROWS);
-      rows.splice(0, excess);
+      const spliced = rows.splice(0, excess);
       truncated = true;
-      droppedLines += excess;
+      // bug_169: the truncation banner says "earlier LINES truncated"
+      // — marker rows (gap/execSwitch) in the spliced prefix are not
+      // lines and must not inflate it. gapCount needs no bookkeeping
+      // here: it derives from the array this splice just mutated.
+      for (const r of spliced) {
+        if (r.kind === 'line') droppedLines += 1;
+      }
     }
   }
 
@@ -509,8 +526,8 @@ export function createLogStream(
                 // A span the store could not serve (dropped fan-out
                 // batch, hand-deleted chunk, swept manifest rows): an
                 // explicit gap row, then the chunk's lines. Never a
-                // seamless splice.
-                gapCount += 1;
+                // seamless splice. (gapCount derives from the pushed
+                // row — no counter to maintain, bug_169.)
                 push(gapRow(visit.gapFrom, visit.gapUntil));
                 for (let i = 0; i < chunk.lines.length; i++) {
                   push(lineRow(decoder.decode(chunk.lines[i])));
