@@ -2586,7 +2586,7 @@ mod tests {
     /// step stays 0 and the window refreshes`. The ladder still climbs
     /// across genuine consecutive failures (post-expiry marks — see
     /// `ice_mark_exponential_then_clear_resets`).
-    // r[verify ctrl.nodeclaim.evidence-ack-latch+2]
+    // r[verify ctrl.nodeclaim.evidence-ack-latch+3]
     #[test]
     fn ice_redelivered_mark_refreshes_without_stepping() {
         let ice = IceBackoff::new(600.0);
@@ -2667,7 +2667,7 @@ mod tests {
     /// refresh re-stamp extended the mask on every ~10s redelivery,
     /// pinning it for a whole gate-closed window)` / `right: until
     /// BIT-IDENTICAL, step unchanged, Ok`.
-    // r[verify ctrl.nodeclaim.evidence-ack-latch+2]
+    // r[verify ctrl.nodeclaim.evidence-ack-latch+3]
     #[test]
     fn ice_same_epoch_redelivery_is_total_noop() {
         let ice = IceBackoff::new(600.0);
@@ -2691,7 +2691,7 @@ mod tests {
     /// merged_bug_008 axis 2 red: a redelivery landing AFTER mask
     /// expiry is still the SAME observation — `left: step 0→1 (the
     /// ladder climbed on a non-failure)` / `right: step 0`.
-    // r[verify ctrl.nodeclaim.evidence-ack-latch+2]
+    // r[verify ctrl.nodeclaim.evidence-ack-latch+3]
     #[test]
     fn ice_post_expiry_same_epoch_does_not_climb() {
         let ice = IceBackoff::new(600.0);
@@ -2712,7 +2712,7 @@ mod tests {
     /// just-proven-healthy cell (and dispatch exclusion means no
     /// superseding clear can arrive — self-sustaining while acks time
     /// out)` / `right: unmasked`.
-    // r[verify ctrl.nodeclaim.evidence-ack-latch+2]
+    // r[verify ctrl.nodeclaim.evidence-ack-latch+3]
     #[test]
     fn ice_local_clear_then_redelivered_mark_stays_clear() {
         let ice = IceBackoff::new(600.0);
@@ -2738,7 +2738,7 @@ mod tests {
     /// after a newer one is a no-op — `left: re-stamp (the stale
     /// event refreshed the window)` / `right: no-op, until
     /// bit-identical`.
-    // r[verify ctrl.nodeclaim.evidence-ack-latch+2]
+    // r[verify ctrl.nodeclaim.evidence-ack-latch+3]
     #[test]
     fn ice_stale_reorder_noops() {
         let ice = IceBackoff::new(600.0);
@@ -2756,7 +2756,7 @@ mod tests {
     /// epoch'd history does not break the epoch-LESS lane — a legacy
     /// mark still refreshes-not-steps and leaves `last_applied`
     /// untouched, so a later epoch'd event still gates correctly.
-    // r[verify ctrl.nodeclaim.evidence-ack-latch+2]
+    // r[verify ctrl.nodeclaim.evidence-ack-latch+3]
     #[test]
     fn ice_legacy_event_keeps_pre_epoch_semantics_and_gate_state() {
         let ice = IceBackoff::new(600.0);

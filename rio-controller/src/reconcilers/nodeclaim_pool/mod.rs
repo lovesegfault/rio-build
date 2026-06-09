@@ -70,7 +70,7 @@ pub use ffd::{
 };
 pub use sketch::{CapacityType, Cell, CellSketches, CellState};
 
-pub(crate) use evidence::PendingSchedulerEvidence;
+pub(crate) use evidence::{PendingSchedulerEvidence, TickEvidence};
 
 /// Reconcile interval. Matches the Pool reconciler's `GetSpawnIntents`
 /// poll cadence so the scheduler's `compute_spawn_intents` snapshot is
@@ -1196,8 +1196,10 @@ impl NodeClaimPoolReconciler {
     /// censored half — `observe_idle_to_busy` needs uncensored
     /// idle→busy edges.
     ///
-    /// Returns [`PendingSchedulerEvidence`] — and EVERY caller merges
-    /// it into `pending_evidence` (`reconcile_once`,
+    /// Returns [`TickEvidence`] (un-epoch'd polarity sets — epochs
+    /// are minted at BUFFER entry by `merge`, because they identify
+    /// buffer events, the unit of redelivery) — and EVERY caller
+    /// merges it into `pending_evidence` (`reconcile_once`,
     /// `consolidate_only`, and the pre-threshold ⊥-tick arm alike;
     /// merged_bug_007): the scheduler being unreachable defers
     /// delivery, it does not forfeit evidence. The consume-once
@@ -1209,7 +1211,7 @@ impl NodeClaimPoolReconciler {
         live: &[ffd::LiveNode],
         now: f64,
         now_sys: std::time::SystemTime,
-    ) -> PendingSchedulerEvidence {
+    ) -> TickEvidence {
         // Uncensored idle→busy edges (see caller-ordering note above).
         consolidate::observe_idle_to_busy(live, &mut self.prev_idle, &mut self.sketches, now);
         // r[ctrl.nodeclaim.lead-time-ddsketch]: record boot times on
@@ -1226,12 +1228,12 @@ impl NodeClaimPoolReconciler {
                 .observe_registered(live, &mut self.recorded_boot, now);
         self.sketches
             .maybe_rotate_all(now_sys, Duration::from_secs(self.cfg.sketch_halflife_secs));
-        let mut ev = PendingSchedulerEvidence::default();
+        let mut ev = TickEvidence::default();
         // The ICE-mark plane is produced by the reap path
         // (`record_reap`/`detect_vanished`), not by kube-only
         // observation — the reconcile bodies buffer marks at the
-        // production site via `buffer_marks` (the supersession
-        // chokepoint; merged_bug_005).
+        // production site via `buffer_marks` (the ordered-evidence
+        // chokepoint; merged_bug_005/003).
         ev.buffer_clears(registered);
         ev.buffer_observed_types(observed);
         ev
@@ -1289,7 +1291,7 @@ impl NodeClaimPoolReconciler {
             // evidence is merged into `pending_evidence` (merged_bug_007
             // — same as `consolidate_only`) and drains on the next
             // successful Ack; the consume-once contract is the
-            // `#[must_use]` on `PendingSchedulerEvidence`.
+            // `#[must_use]` on `TickEvidence`.
             // NO reap/create/ack/publish before the threshold — growth
             // and destructive actions stay threshold-gated; cost is the
             // two consolidate-only LISTs on ≤4 ticks per outage, both
@@ -1574,12 +1576,7 @@ impl NodeClaimPoolReconciler {
         // pre-fix only the local tick's cells masked, so the tick
         // after a failed Ack re-minted into a cell that just ICE'd.
         let mut masked: Vec<String> = intents.ice_masked_cells.clone();
-        masked.extend(
-            self.pending_evidence
-                .ice_cells()
-                .iter()
-                .map(Cell::to_string),
-        );
+        masked.extend(self.pending_evidence.ice_cells().map(Cell::to_string));
 
         let cover = self.cover_deficit(&unplaced, &live, &masked).await?;
         debug!(created = cover.created.len(), "deficit cover");
@@ -2199,33 +2196,34 @@ impl NodeClaimPoolReconciler {
         // idle window (and mis-attributes the next re-dispatch). One
         // Ack per tick is the cost; the old all-empty early-return
         // suppressed exactly the tick that mattered.
-        // r[impl ctrl.nodeclaim.ice-mark-clear+1]
-        // BTreeSet dedup (inherent — the buffer IS a set):
+        // r[impl ctrl.nodeclaim.ice-mark-clear+2]
+        // Per-cell dedup (inherent — the buffer keys by cell):
         // `health::reap_unhealthy`/`detect_vanished` push one entry
-        // per ICE'd CLAIM (up to 8/cell/tick); the set collapses them
-        // to one wire entry per cell. Same for `registered_cells` (1
-        // per registered CLAIM). merged_bug_005: the buffer's
-        // supersession law additionally guarantees a request never
-        // carries one cell in BOTH planes — see
-        // `evidence::PendingSchedulerEvidence`.
+        // per ICE'd CLAIM (up to 8/cell/tick); the per-cell ordered
+        // evidence collapses them to one wire entry per cell per
+        // plane. merged_bug_003 (supersedes merged_bug_005's two-set
+        // law): a request MAY carry one cell in BOTH planes — exactly
+        // the `ClearThenMark` chronology (clear epoch < mark epoch),
+        // which the scheduler's fixed clears-then-marks apply order +
+        // epoch gate realize as reset-then-step-0. A newer clear
+        // still evicts a buffered mark (that direction is unchanged)
+        // — see `evidence::PendingSchedulerEvidence`.
         //
         // merged_bug_045 (commit-on-Ack) + bug_082 (all three planes):
         // the buffered evidence ships BY READ — the buffer is cleared
         // ONLY in the Ack-Ok arm below. An Ack-Err or a mid-tick
         // `?`-abort earlier in the tick leaves it intact for the next
         // tick. Duplicate delivery after a successful-but-unobserved
-        // Ack is idempotent on EVERY plane (merged_bug_005): ICE
-        // clears are no-ops, observed-type upserts dedup server-side,
-        // and a re-delivered ICE mark REFRESHES the masked window
-        // without stepping the backoff ladder while the mask is
-        // unexpired (`IceBackoff::mark` refresh-not-step — a retried
-        // Ack is not a new failure; pre-fix each redelivery climbed
-        // one rung, so a ~10s retry loop pinned the cell at
-        // max_lead_time off a single incident). And since
+        // Ack is a no-op BY CONSTRUCTION (merged_bug_008): every cell
+        // event carries this buffer's minted epoch (`"h:cap@epoch"`)
+        // and the scheduler applies an event iff
+        // `epoch > last_applied[cell]` — redelivery and reorder
+        // no-op; observed-type upserts dedup server-side. And since
         // merged_bug_005 the Ack itself means APPLIED UNDER
         // LEADERSHIP, not enqueued: the scheduler answers after the
-        // actor applies (deposed/closed-gate drops answer an error →
-        // the buffer is retained here and redelivered).
+        // actor applies — and per bug_094's validate-then-commit, an
+        // erring Ack (deposed, closed gate, undecodable entry) means
+        // NO plane landed, so retaining + redelivering here is exact.
         let req = AckSpawnedIntentsRequest {
             // The explicit per-tick snapshot (always present from this
             // reconciler; empty = clear). R9: the legacy field 5 is
@@ -2235,27 +2233,48 @@ impl NodeClaimPoolReconciler {
                 bound: bound_intents,
             }),
             spawned: vec![],
+            // Per-cell planes projection (merged_bug_003): each
+            // buffered cell ships per its `CellEvidence::planes()` —
+            // `Clear` → registered, `Mark` → unfulfillable,
+            // `ClearThenMark` → BOTH (clear epoch < mark epoch).
+            // Encoded via the shared `cell_wire` grammar with the
+            // minted epoch suffix (merged_bug_008).
             unfulfillable_cells: self
                 .pending_evidence
-                .ice_cells()
-                .iter()
-                .map(Cell::to_string)
+                .cell_events()
+                .filter_map(|(c, ev)| {
+                    let m = ev.planes().mark?;
+                    Some(rio_common::cell_wire::encode_cell_event(
+                        &c.0,
+                        c.1.into(),
+                        Some(m),
+                    ))
+                })
                 .collect(),
             registered_cells: self
                 .pending_evidence
-                .registered_cells()
-                .iter()
-                .map(Cell::to_string)
+                .cell_events()
+                .filter_map(|(c, ev)| {
+                    let cl = ev.planes().clear?;
+                    Some(rio_common::cell_wire::encode_cell_event(
+                        &c.0,
+                        c.1.into(),
+                        Some(cl),
+                    ))
+                })
                 .collect(),
             observed_instance_types: self.pending_evidence.observed_types().to_vec(),
             bound_intents: vec![],
         };
-        // r[impl ctrl.nodeclaim.evidence-ack-latch+2]
+        // r[impl ctrl.nodeclaim.evidence-ack-latch+3]
         match admin_call(self.admin.clone().ack_spawned_intents(req)).await {
             Ok(_) => {
                 // The ONLY clear: the evidence provably reached the
-                // scheduler.
-                self.pending_evidence = PendingSchedulerEvidence::default();
+                // scheduler. Planes reset, epoch mint RETAINED
+                // (merged_bug_008: a Default-reset would recycle
+                // epochs after an Ack and the scheduler would no-op
+                // genuine post-Ack events).
+                self.pending_evidence.drain_delivered();
             }
             Err(e) => {
                 warn!(

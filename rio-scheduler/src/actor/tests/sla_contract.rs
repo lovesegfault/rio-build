@@ -931,7 +931,7 @@ async fn ack_legacy_unarmed_echo_answers_ok_without_arm() {
 /// via `rio_common::cell_wire::encode_cell_event` — the same fn the
 /// controller's buffer mint calls; no hand-rolled "h:cap@e" literals.
 // r[verify sched.sla.ack-validate-then-commit]
-// r[verify ctrl.nodeclaim.evidence-ack-latch+2]
+// r[verify ctrl.nodeclaim.evidence-ack-latch+3]
 #[tokio::test]
 async fn ack_redelivered_epoch_mark_does_not_climb_post_expiry() {
     use crate::sla::config::CapacityType;
@@ -969,6 +969,57 @@ async fn ack_redelivered_epoch_mark_does_not_climb_post_expiry() {
         Some(1),
         "strictly newer post-expiry failure climbs the ladder"
     );
+}
+
+/// merged_bug_003 scheduler-side companion (green pin — the
+/// controller half is the red, lifecycle_tests.rs
+/// `clear_then_mark_ships_both_planes_with_ordered_epochs`): a
+/// request carrying one cell in BOTH planes — the `ClearThenMark`
+/// wire shape, clear epoch < mark epoch — realizes
+/// reset-then-step-0: the fixed clears-then-marks apply order resets
+/// the ladder, then the strictly-newer mark masks at the BASE TTL
+/// instead of climbing from the stale rung.
+// r[verify sched.sla.ack-validate-then-commit]
+// r[verify ctrl.nodeclaim.evidence-ack-latch+3]
+#[tokio::test]
+async fn ack_clear_then_mark_realizes_reset_then_step0() {
+    use crate::sla::config::CapacityType;
+    use rio_common::cell_wire::{EvidenceEpoch, WireCapacity, encode_cell_event};
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    let cell: crate::sla::config::Cell = ("intel-6".into(), CapacityType::Spot);
+    let mark = |e: u64| encode_cell_event("intel-6", WireCapacity::Spot, Some(EvidenceEpoch(e)));
+    let clear = |e: u64| encode_cell_event("intel-6", WireCapacity::Spot, Some(EvidenceEpoch(e)));
+
+    // Climb to rung 1 via two genuine post-expiry failures.
+    actor
+        .handle_ack_spawned_intents(&[], std::slice::from_ref(&mark(1)), &[], &[], &[], None)
+        .expect("applies");
+    actor.ice.force_expire(&cell);
+    actor
+        .handle_ack_spawned_intents(&[], std::slice::from_ref(&mark(2)), &[], &[], &[], None)
+        .expect("applies");
+    assert_eq!(actor.ice.step(&cell), Some(1), "precondition: rung 1");
+    actor.ice.force_expire(&cell);
+
+    // The ClearThenMark shape: BOTH planes, clear epoch < mark epoch.
+    actor
+        .handle_ack_spawned_intents(
+            &[],
+            std::slice::from_ref(&mark(11)),
+            std::slice::from_ref(&clear(10)),
+            &[],
+            &[],
+            None,
+        )
+        .expect("both planes apply");
+    assert_eq!(
+        actor.ice.step(&cell),
+        Some(0),
+        "reset-then-step-0 — never a climb from the stale rung"
+    );
+    assert!(actor.ice.is_masked(&cell), "masked at the base TTL");
 }
 
 /// **Ack records the FULL A'** (`r[sched.sla.hw-class.ice-mask]`): a

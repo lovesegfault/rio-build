@@ -1291,13 +1291,16 @@ impl AckApplyPlan {
                 }
             }
         }
-        // merged_bug_005: the controller's evidence buffer enforces
-        // per-cell latest-wins supersession, so one request never
-        // carries a cell in BOTH planes — this fixed clears-then-marks
-        // order no longer decides ties (it used to resurrect a stale
-        // buffered mark over a strictly newer registration). Kept as
-        // written for pre-supersession controllers during rolling
-        // skew: mark-wins is the conservative tie-break.
+        // merged_bug_003 (supersedes the merged_bug_005 two-set law):
+        // the controller buffers per-cell ORDERED evidence, so a
+        // request MAY carry one cell in BOTH planes — exactly the
+        // ClearThenMark chronology (clear epoch < mark epoch). This
+        // fixed clears-then-marks order is now LOAD-BEARING again: it
+        // realizes that chronology as reset-then-step-0. A stale
+        // buffered mark can no longer resurrect over a strictly newer
+        // registration (the buffer's clear-supersedes-mark direction
+        // is unchanged), and out-of-order/duplicate arrivals are
+        // killed by the epoch gate below, not by plane arithmetic.
         // merged_bug_008: each event applies through the per-cell
         // evidence-epoch gate — redelivery (`==`) and reorder (`<`)
         // are TOTAL no-ops, epoch-less entries take the legacy lane.

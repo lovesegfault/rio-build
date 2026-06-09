@@ -1351,45 +1351,62 @@ fleet-wide learning.
   updating the map violates this rule.
 ]
 
-#r("ctrl.nodeclaim.evidence-ack-latch+2")[
+#r("ctrl.nodeclaim.evidence-ack-latch+3")[
   EVERY scheduler-evidence plane carried by `AckSpawnedIntents` —
   registered-cell ICE-clears, observed instance types, AND ICE marks
   (`unfulfillable_cells`) — MUST be delivered commit-on-Ack: the
   request is built FROM the accumulated buffer (no evidence may reach
-  the request except through it), shipped BY READ, and the buffer is
-  cleared ONLY when the RPC returns success. An Ack failure or a
-  mid-tick abort MUST leave every plane intact for the next tick (no
-  moved-out value may exist between the read and the commit), and a
-  tick that cannot deliver at all (scheduler unreachable,
-  consolidate-only) MUST buffer its produced evidence rather than drop
-  it — the producers are consume-once, so a dropped plane is
-  unrecoverable. Buffered-but-unacked ICE marks MUST mask their cells
-  from the same controller's `cover_deficit` until acknowledged. The
-  scheduler MUST answer the Ack only after the leader-gated apply —
-  ack means APPLIED UNDER LEADERSHIP, never enqueued: a deposed drain
-  or a plane the apply cannot land yet (the observed-types cost-table
-  gate) MUST err the RPC so the buffer is retained and redelivered.
-  Redelivery after a successful-but-unobserved Ack MUST be idempotent
-  on every plane: ICE clears and observed-type upserts are idempotent
-  scheduler-side, and a re-delivered ICE mark REFRESHES the masked
-  window without stepping the backoff ladder while the mask is
-  unexpired (refresh-not-step — a retried Ack is not a new failure;
-  the ladder climbs only across post-expiry failures). The buffer
-  MUST enforce per-cell latest-wins supersession across the mark and
-  clear planes — a request may never carry one cell in both — because
-  only the producer knows the temporal order the wire shapes destroy.
+  the request except through it), shipped BY READ, and the buffer's
+  planes are cleared ONLY when the RPC returns success (the epoch
+  mint survives the clear). An Ack failure or a mid-tick abort MUST
+  leave every plane intact for the next tick (no moved-out value may
+  exist between the read and the commit), and a tick that cannot
+  deliver at all (scheduler unreachable, consolidate-only) MUST
+  buffer its produced evidence rather than drop it — the producers
+  are consume-once, so a dropped plane is unrecoverable.
+  Buffered-but-unacked ICE marks MUST mask their cells from the same
+  controller's `cover_deficit` until acknowledged (a retained
+  buffered clear never unmasks local cover). The scheduler MUST
+  answer the Ack only after the leader-gated apply — ack means
+  APPLIED UNDER LEADERSHIP, never enqueued — and an erring Ack MUST
+  imply that NO plane landed (validate-then-commit,
+  #rref("sched.sla.ack-validate-then-commit")): a deposed drain, a
+  closed cost-table gate, or an undecodable plane entry MUST err the
+  RPC with nothing applied so the buffer is retained and redelivered
+  whole. The buffer MUST hold per-cell ORDERED evidence with
+  producer-minted per-cell-monotonic epochs serialized onto the wire
+  (`"h:cap@epoch"`): a newer clear supersedes a buffered mark (the
+  cell provably delivered capacity after the failure), and a newer
+  mark RETAINS an older buffered clear as a clear-then-mark pair —
+  the request then carries that cell in BOTH planes with
+  clear-epoch < mark-epoch, and the scheduler MUST apply clears
+  before marks so the chronology lands as reset-then-step-0.
+  Redelivery after a successful-but-unobserved Ack MUST be a no-op by
+  construction: the scheduler applies a cell event iff its epoch is
+  strictly greater than the highest epoch applied for that cell
+  (redelivery and reorder are total no-ops answered Ok), and
+  epoch-less entries keep the pre-epoch semantics as a
+  decode-totality lane (refresh-not-step while masked; observed-type
+  upserts remain idempotent).
 ]
 
-#r("ctrl.nodeclaim.ice-mark-clear+1")[
+The lease-handoff residual is an accepted posture, documented at the
+mint: a clock-behind successor controller no-ops fresh events until
+its clock passes the prior leader's last mint — symmetric in kind and
+magnitude with the scheduler-side handoff posture (in-memory ladder +
+gate state, lease-holder only).
+
+#r("ctrl.nodeclaim.ice-mark-clear+2")[
   ICE mark and clear signals sent via `AckSpawnedIntents` MUST be sound:
   `unfulfillable_cells` (marks) are deduplicated to at most one entry per
   cell per tick (the scheduler's backoff ladder climbs once per DISTINCT
-  post-expiry failure --- a redelivered or duplicate mark refreshes the
-  masked window at the same rung,
-  #rref("sched.sla.hw-class.ice-mask")), a request never carries one cell
-  in both planes (per-cell latest-wins supersession at the buffer,
-  #rref("ctrl.nodeclaim.evidence-ack-latch")), and a mark is emitted only
-  for a
+  post-expiry failure --- a redelivered mark no-ops via the epoch gate,
+  and an epoch-less duplicate refreshes the masked window at the same
+  rung, #rref("sched.sla.hw-class.ice-mask")), a request carries one cell
+  in both planes ONLY as the ordered clear-then-mark pair with
+  clear-epoch < mark-epoch (per-cell ordered evidence at the buffer,
+  #rref("ctrl.nodeclaim.evidence-ack-latch") --- any other both-planes
+  shape is forbidden), and a mark is emitted only for a
   cell whose claim launch-failed, timed out unregistered, or vanished to
   Karpenter GC --- never for a claim this controller itself reaped
   (#rref("ctrl.nodeclaim.inflight-conservation")). `registered_cells`

@@ -72,6 +72,28 @@ fn cell() -> Cell {
     Cell("mid-ebs-x86".into(), CapacityType::Spot)
 }
 
+/// Decode one wire cell-event entry via the shared grammar
+/// (`rio_common::cell_wire`) and project the CELL identity — wire
+/// entries now carry the `@epoch` suffix (merged_bug_008), so tests
+/// match through the decoder instead of string equality (witness
+/// provenance: the same codec production consumes).
+fn wire_cell(s: &str) -> Cell {
+    let p = rio_common::cell_wire::decode_cell_event(s).expect("wire entry decodes");
+    Cell(p.hw_class, p.capacity.into())
+}
+
+/// Whether `plane` carries `c` (decoded — epoch-agnostic).
+fn carries(plane: &[String], c: &Cell) -> bool {
+    plane.iter().any(|s| wire_cell(s) == *c)
+}
+
+/// The minted epoch of one wire entry (None = legacy epoch-less).
+fn wire_epoch(s: &str) -> Option<rio_common::cell_wire::EvidenceEpoch> {
+    rio_common::cell_wire::decode_cell_event(s)
+        .expect("wire entry decodes")
+        .epoch
+}
+
 // ───────────────────────── JSON builders ─────────────────────────────
 
 /// NodeClaim list-item JSON. `registered`: `Some(transition_offset)` ⇒
@@ -462,7 +484,7 @@ async fn acquire_ok_clears_prev_idle_and_suppress_fields() {
     assert!(
         lab.ack_calls()
             .iter()
-            .any(|a| a.registered_cells.contains(&cell().to_string())),
+            .any(|a| carries(&a.registered_cells, &cell())),
         "fresh in-window edge ships its ICE-clear"
     );
 }
@@ -574,14 +596,17 @@ async fn reload_ok_preserves_evidence_buffered_during_err_window() {
     assert!(!lab.r.reload_pending(), "latch cleared on Ok");
     let last = lab.ack_calls().pop().expect("tick 2 acked");
     assert_eq!(
-        last.unfulfillable_cells,
-        vec![cell().to_string()],
+        last.unfulfillable_cells
+            .iter()
+            .map(|s| wire_cell(s))
+            .collect::<Vec<_>>(),
+        vec![cell()],
         "the Err-window ICE mark SURVIVED the reload-Ok and shipped on \
          the first healthy Ack (pre-fix: the Ok-arm clear destroyed it \
          and the ack went out empty)"
     );
     assert!(
-        lab.r.pending_evidence.ice_cells().is_empty(),
+        lab.r.pending_evidence.ice_cells().next().is_none(),
         "Ack-Ok is the one legitimate consume of the shipped mark"
     );
     assert!(
@@ -600,8 +625,8 @@ async fn reload_ok_preserves_evidence_buffered_during_err_window() {
 /// scheduler's fixed clears-then-marks apply order re-masked the
 /// healthy cell; `right:` the buffer holds only the newest polarity,
 /// so the Ack ships the clear alone.
-// r[verify ctrl.nodeclaim.evidence-ack-latch+2]
-// r[verify ctrl.nodeclaim.ice-mark-clear+1]
+// r[verify ctrl.nodeclaim.evidence-ack-latch+3]
+// r[verify ctrl.nodeclaim.ice-mark-clear+2]
 #[tokio::test]
 async fn newer_registration_supersedes_buffered_mark_end_to_end() {
     let mut lab = Lab::new().await;
@@ -623,7 +648,7 @@ async fn newer_registration_supersedes_buffered_mark_end_to_end() {
     .await;
     let acks = lab.ack_calls();
     assert!(
-        acks[0].unfulfillable_cells.contains(&cell().to_string()),
+        carries(&acks[0].unfulfillable_cells, &cell()),
         "tick 1 carried the mark to the wire (and the Ack failed)"
     );
 
@@ -638,21 +663,81 @@ async fn newer_registration_supersedes_buffered_mark_end_to_end() {
     let acks = lab.ack_calls();
     let last = acks.last().expect("tick 2 acked");
     assert!(
-        last.registered_cells.contains(&cell().to_string()),
+        carries(&last.registered_cells, &cell()),
         "the newer registration ships its clear"
     );
     assert!(
         last.unfulfillable_cells.is_empty(),
-        "the stale mark was superseded — shipping both planes for one \
-         cell would re-mask the healthy cell server-side (the fixed \
-         clears-then-marks tie-break): {last:?}"
+        "the stale mark was superseded — in THIS direction (clear \
+         newest) the mark is evicted, never shipped (merged_bug_005 \
+         law, unchanged by the ordered-evidence model): {last:?}"
+    );
+}
+
+/// merged_bug_003 red (end-to-end at the request boundary): same-tick
+/// clear-then-mark — a `Registered=True` edge buffered by the
+/// kube-only block, then an ICE reap of a sibling claim in the SAME
+/// cell later in the SAME tick (real production order: clears are
+/// buffered before the reap paths buffer marks). `left (pre-fix):
+/// buffer_marks did registered_cells.remove(&c) — the buffer shipped
+/// mark-only and the scheduler climbed from its stale rung (the
+/// consume-once reset destroyed)` / `right: the Ack carries the cell
+/// in BOTH planes with decoded clear epoch < mark epoch — the
+/// scheduler's fixed clears-then-marks order + epoch gate realize
+/// reset-then-step-0`.
+// r[verify ctrl.nodeclaim.evidence-ack-latch+3]
+// r[verify ctrl.nodeclaim.ice-mark-clear+2]
+#[tokio::test]
+async fn clear_then_mark_ships_both_planes_with_ordered_epochs() {
+    let mut lab = Lab::new().await;
+
+    // One tick: c-new reaches Registered=True inside the recency
+    // window (clear produced FIRST, by the kube-only block) AND c-ice
+    // is ICE-reaped (mark produced SECOND, by the reap path) — both
+    // in cell().
+    lab.tick(
+        610,
+        full_tick_scenario(
+            vec![],
+            vec![nc_json("c-new", 600, Some(605)), nc_json_ice("c-ice", 0)],
+            vec![delete_scenario("/apis/karpenter.sh/v1/nodeclaims/c-ice")],
+        ),
+    )
+    .await;
+
+    let acks = lab.ack_calls();
+    let last = acks.last().expect("tick acked");
+    assert!(
+        carries(&last.registered_cells, &cell()),
+        "the buffered clear SURVIVES the newer mark and ships \
+         (pre-fix: destroyed by registered_cells.remove): {last:?}"
+    );
+    assert!(
+        carries(&last.unfulfillable_cells, &cell()),
+        "the newer mark ships too: {last:?}"
+    );
+    let clear_e = last
+        .registered_cells
+        .iter()
+        .find(|s| wire_cell(s) == cell())
+        .and_then(|s| wire_epoch(s))
+        .expect("clear entry carries its minted epoch");
+    let mark_e = last
+        .unfulfillable_cells
+        .iter()
+        .find(|s| wire_cell(s) == cell())
+        .and_then(|s| wire_epoch(s))
+        .expect("mark entry carries its minted epoch");
+    assert!(
+        clear_e < mark_e,
+        "chronology on the wire: clear {clear_e} < mark {mark_e}"
     );
 }
 
 /// R2 recency gate: a stale (>3×TICK) Registered edge after the
 /// acquire clear is recorded WITHOUT a sample and WITHOUT an ICE-clear
 /// on the wire (noMassClearAfterFailover / m34CalibNoRecencyGate).
-// r[verify ctrl.nodeclaim.ice-mark-clear+1]
+// r[verify ctrl.nodeclaim.ice-mark-clear+2]
 #[tokio::test]
 async fn post_acquire_stale_registration_records_without_clear_or_sample() {
     let mut lab = Lab::new().await;
@@ -720,8 +805,11 @@ async fn consolidate_only_prunes_own_reaps_before_detect() {
     assert_eq!(lab.r.consecutive_bot_ticks, 0);
     let last = lab.ack_calls().last().cloned().expect("recovery ack");
     assert_eq!(
-        last.unfulfillable_cells,
-        vec![cell().to_string()],
+        last.unfulfillable_cells
+            .iter()
+            .map(|s| wire_cell(s))
+            .collect::<Vec<_>>(),
+        vec![cell()],
         "the consolidate-tick reap's buffered mark ships once on recovery \
          (no spurious vanish-misread duplicate, no dropped mark)"
     );
@@ -759,7 +847,7 @@ async fn vanish_is_marked_own_reap_is_not() {
     let acks = lab.ack_calls();
     assert!(
         acks.iter()
-            .any(|a| a.unfulfillable_cells.contains(&cell_gone.to_string())),
+            .any(|a| carries(&a.unfulfillable_cells, &cell_gone)),
         "vanish marked its cell on the wire; acks: {acks:?}"
     );
 }
@@ -1103,7 +1191,7 @@ async fn bot_tick_records_registered_edge_inside_window() {
     assert!(
         lab.ack_calls()
             .iter()
-            .any(|a| a.registered_cells.contains(&cell().to_string())),
+            .any(|a| carries(&a.registered_cells, &cell())),
         "the ⊥-tick edge's buffered ICE-clear ships on the recovery Ack \
          (pre-buffer this asserted all-empty: the discard was the pin)"
     );
@@ -1258,7 +1346,7 @@ async fn bot_tick_registered_edge_survives_to_recovery_ack() {
     assert!(
         lab.ack_calls()
             .iter()
-            .any(|a| a.registered_cells.contains(&cell().to_string())),
+            .any(|a| carries(&a.registered_cells, &cell())),
         "the ⊥-tick Registered edge's ICE-clear must survive to the recovery Ack"
     );
 }
@@ -1270,7 +1358,9 @@ async fn bot_tick_registered_edge_survives_to_recovery_ack() {
 #[tokio::test]
 async fn pending_evidence_cleared_on_acquire_edge() {
     let mut lab = Lab::new().await;
-    lab.r.pending_evidence.buffer_clears([cell()]);
+    let mut pre_tenure = TickEvidence::default();
+    pre_tenure.buffer_clears([cell()]);
+    lab.r.pending_evidence.merge(pre_tenure);
     lab.r.hooks.on_acquire();
     lab.tick(600, full_tick_scenario(vec![], vec![], vec![]))
         .await;
@@ -1317,7 +1407,7 @@ async fn idle_spell_survives_reload_err_loop() {
     );
 }
 
-// r[verify ctrl.nodeclaim.evidence-ack-latch+2]
+// r[verify ctrl.nodeclaim.evidence-ack-latch+3]
 /// merged_bug_045 (commit-on-Ack): buffered kube-only evidence
 /// survives an Ack failure and ships on the next successful Ack.
 /// Recorded red (pre-fix): the buffer was mem::take'n into the wire
@@ -1340,7 +1430,7 @@ async fn evidence_survives_ack_failure_until_committed() {
     let acks = lab.ack_calls();
     assert_eq!(acks.len(), 1, "tick 1 attempted exactly one Ack");
     assert!(
-        acks[0].registered_cells.contains(&cell().to_string()),
+        carries(&acks[0].registered_cells, &cell()),
         "the failed Ack carried the payload to the wire"
     );
 
@@ -1354,7 +1444,7 @@ async fn evidence_survives_ack_failure_until_committed() {
     let acks = lab.ack_calls();
     assert_eq!(acks.len(), 2, "tick 2 acked");
     assert!(
-        acks[1].registered_cells.contains(&cell().to_string()),
+        carries(&acks[1].registered_cells, &cell()),
         "evidence lost on Ack-Err: tick 2 must re-ship the buffered \
          ICE-clear (registered_cells: {:?})",
         acks[1].registered_cells
@@ -1382,7 +1472,7 @@ async fn evidence_survives_ack_failure_until_committed() {
 /// like its sibling planes (registered_cells, observed_types). The
 /// pre-fix Err arm warned "buffered evidence retained" while the mark,
 /// built from the consumed parameter, was already gone.
-// r[verify ctrl.nodeclaim.evidence-ack-latch+2]
+// r[verify ctrl.nodeclaim.evidence-ack-latch+3]
 #[tokio::test]
 async fn ice_mark_survives_ack_failure() {
     let mut lab = Lab::new().await;
@@ -1404,7 +1494,7 @@ async fn ice_mark_survives_ack_failure() {
     assert!(
         first
             .last()
-            .is_some_and(|a| a.unfulfillable_cells.contains(&cell().to_string())),
+            .is_some_and(|a| carries(&a.unfulfillable_cells, &cell())),
         "tick-1 ack must carry the fresh mark (and fail): {first:?}"
     );
 
@@ -1414,7 +1504,7 @@ async fn ice_mark_survives_ack_failure() {
     let acks = lab.ack_calls();
     let last = acks.last().expect("tick-2 ack");
     assert!(
-        last.unfulfillable_cells.contains(&cell().to_string()),
+        carries(&last.unfulfillable_cells, &cell()),
         "ICE mark dropped on Ack failure: tick-2 unfulfillable_cells = {:?}",
         last.unfulfillable_cells
     );

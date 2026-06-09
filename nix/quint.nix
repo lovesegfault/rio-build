@@ -4408,7 +4408,7 @@ rec {
     # consumer's next tick).
     # r[verify ctrl.nodeclaim.lease-edge-polarity+4]
     # r[verify ctrl.nodeclaim.placeable-gate+5]
-    # r[verify ctrl.nodeclaim.ice-mark-clear+1]
+    # r[verify ctrl.nodeclaim.ice-mark-clear+2]
     quint-nodeclaim-lifecycle-fault-lease = mkQuintCheck {
       name = "nodeclaim-lifecycle-fault-lease";
       # quint-policy P1 exemption (bughunt-2 slot 11; the §5-Q13 census
@@ -4442,7 +4442,7 @@ rec {
     # detect_vanished, so an ICE mark is only ever emitted for a claim
     # that genuinely vanished or launch-failed).
     # r[verify ctrl.nodeclaim.inflight-conservation+3]
-    # r[verify ctrl.nodeclaim.ice-mark-clear+1]
+    # r[verify ctrl.nodeclaim.ice-mark-clear+2]
     quint-nodeclaim-lifecycle-fault-karpenter = mkQuintCheck {
       name = "nodeclaim-lifecycle-fault-karpenter";
       # quint-policy P1 exemption (bughunt-2 slot 11; the §5-Q13 census
@@ -6936,7 +6936,7 @@ rec {
     };
     # r[verify ctrl.nodeclaim.evidence-buffered]
     # r[verify ctrl.nodeclaim.consolidate-only-degraded+3]
-    # r[verify ctrl.nodeclaim.evidence-ack-latch+2]
+    # r[verify ctrl.nodeclaim.evidence-ack-latch+3]
     quint-nodeclaim-clear-buffer = mkQuintCheck {
       name = "nodeclaim-clear-buffer";
       # quint-policy P1 exemption (bughunt-2 slot 11; the §5-Q13 census
@@ -6973,7 +6973,7 @@ rec {
     # RPC loses the batch on exactly the delivering tick's ack failure
     # (the retired 007 map residual, demonstrated as a model
     # violation; rust-sim seed 0x603e2a44398a939e).
-    # r[verify ctrl.nodeclaim.evidence-ack-latch+2]
+    # r[verify ctrl.nodeclaim.evidence-ack-latch+3]
     quint-nodeclaim-falsify-ack-latch-asbuilt = mkQuintWitnessCheck {
       name = "nodeclaim-falsify-ack-latch-asbuilt";
       spec = "nodeclaimLifecycle";

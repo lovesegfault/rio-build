@@ -165,7 +165,7 @@ do what the rule says it MUST; recorded in the contradiction table below.
 
 | Rule | Verdict | Audit finding |
 |---|---|---|
-| `ctrl.nodeclaim.ice-mark-clear` *(new)* | **COVERS** (the controller half) | Was a GAP. Mark dedup per cell per tick; marks only for launch-failed / timed-out-unregistered / vanished claims, never for the controller's own reaps (ties to F4 conservation); clears only for recency-gated Registered edges; mark-before-cover in the same tick. The clear-side ladder, heartbeat clear, and TTL are scheduler-side and carried by the cross-reference to `sched.sla.hw-class.ice-mask`, not restated. |
+| `ctrl.nodeclaim.ice-mark-clear` *(new)* | **COVERS** (the controller half) | Was a GAP. Mark dedup per cell per tick; marks only for launch-failed / timed-out-unregistered / vanished claims, never for the controller's own reaps (ties to F4 conservation); clears only for recency-gated Registered edges; mark-before-cover in the same tick. The clear-side ladder, heartbeat clear, and TTL are scheduler-side and carried by the cross-reference to `sched.sla.hw-class.ice-mask`, not restated. **Re-bumped `+2` (bughunt-5 slot 5, merged_bug_003):** the "never both planes" clause is REPLACED — a request carries one cell in both planes ONLY as the ordered clear-then-mark pair (`clear-epoch < mark-epoch`); any other both-planes shape stays forbidden. The buffer law moved from two mutually-evicting sets to per-cell ordered `CellEvidence` (the mark-evicts-clear direction was strictly lossy: it destroyed the consume-once `Registered=True` reset and the scheduler climbed from the stale rung). Executable counterpart: `iceEvidenceAck.qnt` (`clearThenMarkRealizesReset`) with the `ice-latest-wins-eviction` falsify twin re-introducing the evicting law. |
 | `ctrl.nodeclaim.inflight-conservation` *(new)* | **COVERS** (the no-mark-for-own-reap precondition) | The reap-names-before-detect ordering is what makes the mark sound. |
 
 #### `NoMassClearAfterFailover`
@@ -1780,6 +1780,24 @@ in 56 s on the CI builder — inside the per-check budget with margin.
   nodeclaimLifecycle axis re-scopes `clearSurvivesAckFailure` over
   delivering ticks; the axis-off twin reproduces this residual as a
   flagged violation.
+- **evidence-ack-latch reworded `+3` (bughunt-5 slot 5,
+  merged_bug_003/008 + bug_094):** three clauses rewritten — the
+  per-cell latest-wins supersession clause becomes the ordered-evidence
+  law (clear-then-mark RETAINED as the both-planes pair with
+  `clear-epoch < mark-epoch` and the clears-before-marks apply-order
+  requirement); the refresh-not-step redelivery clause becomes the
+  epoch no-op law (`epoch > last_applied[cell]` applies; `==`/`<`
+  no-op; epoch-less entries keep pre-epoch semantics as the
+  decode-totality lane); the err clause becomes err-implies-NOTHING-
+  applied (validate-then-commit, cross-ref
+  `sched.sla.ack-validate-then-commit`). The cross-component pipeline
+  the peer-contract bullets above assume away is now modeled:
+  `iceEvidenceAck.qnt` (holds: `errImpliesNoMutation`,
+  `redeliveryIdempotent`, `clearThenMarkRealizesReset`,
+  `healthyCellNeedsNewEvidence`) with falsify twins
+  `ice-apply-before-refuse` / `ice-no-epoch-gate` /
+  `ice-latest-wins-eviction` re-introducing the three as-built
+  defects.
 - **007/346 acquire-edge suppress:** the qnt models do not compose the
   buffer axis with the lease-fault axis (the suppress-clear on
   re-acquisition is therefore out of model); the Rust pins

@@ -89,7 +89,7 @@ fn spawn_actor_with_flags(
 /// whole (r[sched.lease.standby-drops-writes+3] defense-in-depth) —
 /// the controller then cleared consume-once evidence that was never
 /// applied. `right:` leader applies → `Ok`; deposed → typed refusal.
-// r[verify ctrl.nodeclaim.evidence-ack-latch+2]
+// r[verify ctrl.nodeclaim.evidence-ack-latch+3]
 #[tokio::test]
 async fn deposed_ack_spawned_intents_answers_not_leader() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;

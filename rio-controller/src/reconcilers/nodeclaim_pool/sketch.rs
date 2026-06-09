@@ -510,7 +510,7 @@ impl CellSketches {
                     mem_bytes: n.allocatable.1,
                 });
             }
-            // r[impl ctrl.nodeclaim.ice-mark-clear+1]
+            // r[impl ctrl.nodeclaim.ice-mark-clear+2]
             // Recency-gate: only RECENT registrations are reported as
             // ICE-clear evidence. With `recorded_boot` empty after
             // restart/lease-acquire, days-old nodes would otherwise
