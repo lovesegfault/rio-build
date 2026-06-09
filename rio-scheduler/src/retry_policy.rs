@@ -830,7 +830,7 @@ mod tests {
         assert_eq!(d.backoff_until, Some(1_110 + 300));
     }
 
-    /// The run resets on any folded event OUTSIDE the
+    /// The run resets on any build-lane row OUTSIDE the
     /// bounded-uncharged union (a charged row): the
     /// degraded row AFTER a transient charge restarts the curve at
     /// `base` (the pacing is per-outage, not per-derivation-lifetime).

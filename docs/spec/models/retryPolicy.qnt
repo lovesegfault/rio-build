@@ -1118,6 +1118,25 @@ module retryPolicy {
   /// bound is a gate, not a dead arm).
   val canChargePastBound = not(last.kind == OStoreDegradedCharged)
 
+  /// bug_182 (bughunt-4 S5b) — the ONE-RUN law's marker-row clause:
+  /// a fleet-exhaust MARKER row (the E9 spawn-gate verdict, appended
+  /// to the build lane, folded to NO event by row_to_event) is a
+  /// build-lane row OUTSIDE the bounded-uncharged union, so it BREAKS
+  /// the run for BOTH consumers — the pacing fold and the admission
+  /// scan. Pre-fix the kernel's fold reset was gated on
+  /// `row_to_event().is_some()`, so exactly these rows broke the
+  /// admission but not the pacing curve (post-break SD report:
+  /// admitted fresh, paced at the dead run's cap); the model mirrored
+  /// the fork (spawnGateExhaust kept both runs). Falsify twin: the
+  /// retry-182-forked-run calibration (the pre-fix keep) violates
+  /// this.
+  // r[verify sched.retry.store-degraded-uncharged+4]
+  val markerRowBreaksRuns =
+    last.kind == OE9Dispatch implies (storeDegradedRun == 0 and freeCloseRun == 0)
+  /// Violated when the spawn-gate exhaust marker actually lands (the
+  /// markerRowBreaksRuns antecedent is reachable in this regime).
+  val canReachSpawnGateExhaust = not(last.kind == OE9Dispatch)
+
   /// bug_098 (signed bughunt-3 §5 Q1) — the COMPOSITION law: the
   /// bounded-uncharged classes share one trailing union run, each
   /// class's count is gated by its own bound within it, so the total
@@ -2250,16 +2269,21 @@ module retryPolicy {
   /// derivation (the universe shrank under an existing exclusion set),
   /// so the controller reports NoEligibleSource instead of spawning an
   /// unschedulable Job and the scheduler maps it to the same
-  /// fleet-exhaust poison the dispatch-time backstop produced (no fold
-  /// event — the marker row is a fold no-op). The empty universe defers
-  /// instead (the action is disabled), per
-  /// sched.dispatch.fleet-exhaust+4's empty-fleet arm.
+  /// fleet-exhaust poison the dispatch-time backstop produced. The
+  /// E9 marker row folds to NO event (`row_to_event` answers None) —
+  /// but it is a build-lane row OUTSIDE the bounded-uncharged union,
+  /// so it BREAKS both pacing runs (bug_182, the one-run law: the
+  /// kernel's `run_step` answers Break for the fold AND the admission
+  /// scan; the pre-fix fold kept the curve across exactly these
+  /// rows). The empty universe defers instead (the action is
+  /// disabled), per sched.dispatch.fleet-exhaust+4's empty-fleet arm.
   // Mirrors: pool/jobs.rs spawn pass (excluded ⊇ spawnable ->
   //          ReportAttemptOutcome(NoEligibleSource)) -> actor/pull.rs
-  //          fleet-exhaust mapping (still-Ready only).
+  //          fleet-exhaust mapping (still-Ready only) -> the kernel
+  //          run_step Break arm (rio-retry-kernel/src/lib.rs).
   action spawnGateExhaust = all {
-    freeCloseRun' = freeCloseRun,
-    storeDegradedRun' = storeDegradedRun,
+    freeCloseRun' = 0,
+    storeDegradedRun' = 0,
     dStatus == DReady,
     backoffElapsed,
     attempt == NoAttempt,

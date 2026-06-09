@@ -5038,6 +5038,13 @@ rec {
         # witnesses keep the bound edge AND the charged fallthrough
         # reachable).
         "boundedStoreDegradedRun"
+        # bug_182 (bughunt-4 S5b): a fleet-exhaust MARKER row (folded
+        # to no event) still BREAKS the bounded-uncharged run for BOTH
+        # consumers — the one-run law's marker clause (run_step in the
+        # kernel). Falsify twin: retry-182-forked-run (below);
+        # reachability: the spawn-exhaust witness (below).
+        # r[verify sched.retry.store-degraded-uncharged+4]
+        "markerRowBreaksRuns"
       ];
     };
     quint-retry-policy-pull-runs-store-outage = mkQuintRunCheck {
@@ -5086,6 +5093,33 @@ rec {
       extraSpecs = [ "retryPolicy" ];
       step = "calibStep";
       witness = "boundedStoreDegradedRun";
+    };
+
+    # bug_182 falsify twin (bughunt-4 S5b): the pre-fix forked run —
+    # the fold's pacing reset gated on row_to_event().is_some(), so the
+    # E9 fleet-exhaust marker row (folded to no event) broke the
+    # admission scan but not the pacing curve. The calibration swaps
+    # the spawn-gate arm for the run-keeping pre-fix shape;
+    # markerRowBreaksRuns MUST violate (TLC, first-violation; no tracey
+    # markers on calibration checks).
+    quint-retry-policy-calib-182-forked-run = mkQuintWitnessCheck {
+      name = "retry-policy-calib-182-forked-run";
+      spec = "calibration/retry-182-forked-run";
+      main = "retryCalibForkedRun";
+      extraSpecs = [ "retryPolicy" ];
+      step = "calibStep";
+      witness = "markerRowBreaksRuns";
+    };
+    # bug_182 non-vacuity: the spawn-gate exhaust marker is reachable
+    # in the SD regime (the markerRowBreaksRuns antecedent has teeth —
+    # a regime where OE9Dispatch never lands would hold the implication
+    # vacuously).
+    quint-retry-policy-sd-witness-spawn-exhaust = mkQuintWitnessCheck {
+      name = "retry-policy-sd-witness-spawn-exhaust";
+      spec = "retryPolicy";
+      main = "retryPolicyPullStoreDegraded";
+      step = "pullStep";
+      witness = "canReachSpawnGateExhaust";
     };
 
     # bug_098 non-vacuity: BOTH per-class counts simultaneously >= 2 is
