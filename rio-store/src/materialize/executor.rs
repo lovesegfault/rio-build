@@ -297,6 +297,9 @@ async fn execute_job_inner(
     // from-source), but the cause string must name the refusal so an
     // operator fixes trusted_keys instead of chasing a phantom miss.
     let mut trust_refused: Vec<String> = Vec::new();
+    // merged_bug_046: paths whose settle cause is the AlreadyComplete
+    // content disagreement (mirrors trust_refused one axis over).
+    let mut content_mismatched: Vec<String> = Vec::new();
     // BC-4 cumulative progress accounting: bytes of fully-processed
     // paths. The per-path fetch callback adds the in-flight path's
     // streamed bytes on top of `completed_bytes`, with the declared
@@ -615,6 +618,28 @@ async fn execute_job_inner(
                             PathCell::Reference => missing_references.push(path.clone()),
                         }
                     }
+                    TenantAttemptsVerdict::ContentMismatch { idx } => {
+                        // merged_bug_046: ≥1 tenant hit the stored-row
+                        // content disagreement and the rest cleanly
+                        // missed. Settle toward Unobtainable WITHOUT
+                        // the HEAD confirmation — the path IS present
+                        // upstream with disagreeing bytes; a
+                        // content-blind HEAD 200 proves nothing and
+                        // pre-fix converted this exact state into a
+                        // per-retry "present but not ingested" infra
+                        // charge until the job parked. The local-miss
+                        // witness still anchors the verdict.
+                        let _witness: LocalMiss = local_witness;
+                        let (_, detail) = &cell_msgs[idx];
+                        warn!(path = %path, detail = %detail,
+                              "path present upstream with disagreeing content; \
+                               settling unobtainable (uncharged)");
+                        content_mismatched.push(path.clone());
+                        match cell {
+                            PathCell::Wanted => missing_wanted.push(path.clone()),
+                            PathCell::Reference => missing_references.push(path.clone()),
+                        }
+                    }
                     TenantAttemptsVerdict::AllCleanMiss => {
                         // Every tenant cleanly missed. The miss verdict
                         // additionally requires the HEAD-probe to
@@ -689,6 +714,14 @@ async fn execute_job_inner(
                                 // trust cause recorded.
                                 trust_refused.push(path.clone());
                             }
+                            TenantAttemptsVerdict::ContentMismatch { .. } => {
+                                // Unreachable while the HEAD probe is
+                                // content-blind (merged_bug_046); a
+                                // future content-aware probe's refusal
+                                // falls through with the cause
+                                // recorded, mirroring the trust arm.
+                                content_mismatched.push(path.clone());
+                            }
                             TenantAttemptsVerdict::AllCleanMiss => {}
                         }
                         let _witness: LocalMiss = local_witness;
@@ -762,6 +795,17 @@ async fn execute_job_inner(
                 "; {} of them present upstream but no narinfo signature \
                  verified against trusted_keys (rotated or mistyped key?)",
                 trust_refused.len()
+            ));
+        }
+        if !content_mismatched.is_empty() {
+            // merged_bug_046: the content disagreement is its own
+            // actionable cause — never folded into the trust wording
+            // (a key rotation will not fix disagreeing bytes).
+            cause.push_str(&format!(
+                "; {} of them present upstream but claiming different \
+                 bytes than the stored row (content disagreement at the \
+                 dedup arm)",
+                content_mismatched.len()
             ));
         }
         MaterializationOutcome {

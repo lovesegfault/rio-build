@@ -669,6 +669,15 @@ pub(super) fn substitute_status(e: SubstituteError) -> Status {
         SubstituteError::UntrustedPresent => Status::failed_precondition(
             "upstream narinfo present but no signature verified against trusted_keys",
         ),
+        // merged_bug_046: stored-row/upstream content disagreement is
+        // the same typed-refusal posture one axis over —
+        // `FailedPrecondition` (this upstream claims different bytes
+        // than the stored row; fixable by upstream content or
+        // configuration, not by retry). Never `NotFound`: a miss
+        // answer here would re-launder the refusal one RPC up.
+        SubstituteError::ContentMismatch => Status::failed_precondition(
+            "upstream narinfo claims different bytes than the stored row",
+        ),
         SubstituteError::HashMismatch { .. }
         | SubstituteError::SizeMismatch { .. }
         | SubstituteError::NarInfo(_)

@@ -272,6 +272,23 @@ pub enum SubstituteError {
          trusted_keys (rotated or mistyped key?)"
     )]
     UntrustedPresent,
+
+    /// merged_bug_046: every non-serving upstream that HAD the path
+    /// answered with a narinfo whose content DISAGREES with the
+    /// locally-stored row (the AlreadyComplete dedup arm's
+    /// nar_hash/nar_size/reference-set check) and nothing served,
+    /// stalled, 429'd, errored, or trust-refused. Returned as `Err`
+    /// so moka does NOT cache it — pinning the disagreement as a
+    /// definitive miss would let the content-blind HEAD confirmation
+    /// contradict it into a per-retry infrastructure charge (the
+    /// merged_bug_005 laundering loop, one axis over). The
+    /// materialization executor settles it Unobtainable-with-cause,
+    /// UNCHARGED, skipping the HEAD confirmation.
+    #[error(
+        "upstream narinfo names the path but claims different bytes \
+         than the stored row (nar_hash/nar_size/reference disagreement)"
+    )]
+    ContentMismatch,
 }
 
 impl From<metadata::MetadataError> for SubstituteError {
@@ -308,6 +325,7 @@ pub(crate) fn substitute_error_evidence(
         | SubstituteError::TooLarge { .. } => (C::Integrity, None),
         SubstituteError::Ingest(_) => (C::Ingest, None),
         SubstituteError::UntrustedPresent => (C::Untrusted, None),
+        SubstituteError::ContentMismatch => (C::ContentMismatch, None),
     }
 }
 
@@ -340,6 +358,14 @@ enum UpstreamOutcome {
     /// where the sig-blind HEAD confirmation re-found the path and
     /// charged infrastructure forever) or as a hit.
     UntrustedPresent,
+    /// merged_bug_046: narinfo PRESENT and identity-correct, but its
+    /// content claim (nar_hash/nar_size/references) DISAGREES with
+    /// the locally-stored row at the AlreadyComplete dedup arm. A
+    /// deterministic content refusal — recorded as its own evidence
+    /// cell (mirroring [`Self::UntrustedPresent`]) so neither leg can
+    /// read it as a miss or as a hit; the loop fails over (another
+    /// upstream may carry agreeing bytes).
+    ContentMismatch,
     /// `claim_placeholder` returned `Concurrent` — another replica or
     /// closure-walk holds the slot. Mapped to `Err(Raced)` in
     /// `do_substitute` so moka does not cache it; caller's retry
@@ -927,6 +953,22 @@ impl Substituter {
                         rio_evidence_kernel::outcome::LoopControl::Continue => {}
                     }
                 }
+                Ok(UpstreamOutcome::ContentMismatch) => {
+                    // merged_bug_046: stored-row disagreement — record
+                    // the content-refusal cell and FAIL OVER (another
+                    // upstream may carry agreeing bytes). The fold
+                    // below surfaces the refusal only if nothing
+                    // serves and nothing outranks it.
+                    match cells.record(
+                        rio_evidence_kernel::outcome::SubstituteFailureClass::ContentMismatch,
+                        None,
+                    ) {
+                        rio_evidence_kernel::outcome::LoopControl::AbortRaced => {
+                            unreachable!("ContentMismatch records Continue")
+                        }
+                        rio_evidence_kernel::outcome::LoopControl::Continue => {}
+                    }
+                }
                 Ok(UpstreamOutcome::Raced) => {
                     // Another uploader holds the placeholder. STOP —
                     // remaining upstreams would race the same slot.
@@ -1030,6 +1072,20 @@ impl Substituter {
                     "no upstream served {store_path} and at least one errored — \
                      not a definitive miss"
                 )))
+            }
+            rio_evidence_kernel::outcome::SubstituteLoopVerdict::ContentMismatch => {
+                // merged_bug_046: the path IS present upstream with
+                // disagreeing bytes — a typed, UNCACHED content
+                // refusal, never the cacheable miss the content-blind
+                // HEAD confirmation would then contradict into an
+                // infrastructure charge.
+                metrics::counter!(
+                    "rio_store_substitute_total",
+                    "result" => "content_mismatch",
+                    "tenant" => tenant_id.to_string()
+                )
+                .increment(1);
+                Err(SubstituteError::ContentMismatch)
             }
             rio_evidence_kernel::outcome::SubstituteLoopVerdict::UntrustedPresent => {
                 // merged_bug_005: the path IS present upstream — a
@@ -1258,15 +1314,18 @@ impl Substituter {
                         stored_nar_size = stored.nar_size,
                         claimed_nar_size = ni.nar_size,
                         "AlreadyComplete content mismatch: upstream narinfo \
-                         claims different bytes than the stored row — Miss \
-                         for this upstream (no signature appended)"
+                         claims different bytes than the stored row — typed \
+                         content refusal for this upstream (no signature \
+                         appended; merged_bug_046: never a miss, so the \
+                         content-blind HEAD confirmation cannot contradict \
+                         a cached CleanMiss into a per-retry charge)"
                     );
                     metrics::counter!(
                         "rio_store_substitute_integrity_failures_total",
                         "tenant" => tenant_id.to_string()
                     )
                     .increment(1);
-                    return Ok(UpstreamOutcome::Miss);
+                    return Ok(UpstreamOutcome::ContentMismatch);
                 }
                 // Compute sigs over the STORED row (its `nar_size` is
                 // what was actually ingested — now PROVEN equal to the
@@ -3466,12 +3525,20 @@ mod tests {
                 .await
                 .unwrap();
 
-        // THE law: content disagreement ⇒ Miss for this upstream.
+        // THE law (merged_bug_046 re-aim): content disagreement is a
+        // TYPED, UNCACHED refusal — never a Miss (the pre-fix Ok(None)
+        // folded to a cacheable CleanMiss that the content-blind HEAD
+        // confirmation then contradicted into a per-retry ChargeInfra
+        // loop until the job parked), and still never a cross-tenant
+        // Hit. Red captured against the old pin verbatim:
+        // "must be a Miss for that upstream (no cross-tenant Hit),
+        //  got Err(ContentMismatch)".
         let got = sub.try_substitute(tid, &path).await;
         assert!(
-            matches!(got, Ok(None)),
+            matches!(got, Err(SubstituteError::ContentMismatch)),
             "a narinfo whose content claim disagrees with the stored row \
-             must be a Miss for that upstream (no cross-tenant Hit), got {got:?}"
+             must be a typed content refusal (no cross-tenant Hit, no \
+             cacheable miss), got {got:?}"
         );
         let after: i32 =
             sqlx::query_scalar("SELECT cardinality(signatures) FROM narinfo WHERE store_path = $1")
@@ -5499,21 +5566,22 @@ mod tests {
         let sub_b = test_substituter(db.pool.clone()).with_signer(ts);
 
         // claim_placeholder → AlreadyComplete → CONTENT BINDING
-        // (merged_bug_114, r[store.substitute.content-binding]): the
-        // liar's NarSize disagrees with the stored row, so the law is
-        // now a MISS for that upstream — no Hit, no signature append.
-        // (Pre-fix this test asserted the weaker defense: the Hit was
-        // returned and the rio sig was computed over the STORED tuple
-        // rather than the liar's claim. The binding supersedes it —
-        // a content-disagreeing upstream gets nothing at all; the
-        // honest-claim sig path is covered by
+        // (merged_bug_114, r[store.substitute.content-binding]; typed
+        // by merged_bug_046): the liar's NarSize disagrees with the
+        // stored row, so the law is a TYPED CONTENT REFUSAL for that
+        // upstream — no Hit, no signature append, and no cacheable
+        // miss (the pre-m046 Ok(None) folded to CleanMiss, which the
+        // content-blind HEAD confirmation contradicted into a
+        // per-retry infrastructure charge; red captured on this pin:
+        // "called `Result::unwrap()` on an `Err` value:
+        //  ContentMismatch"). The honest-claim sig path is covered by
         // `already_complete_requires_content_agreement`'s positive
-        // control.)
-        let got = sub_b.try_substitute(tid_b, &path).await.unwrap();
+        // control.
+        let got = sub_b.try_substitute(tid_b, &path).await;
         assert!(
-            got.is_none(),
-            "a NarSize-disagreeing AlreadyComplete claim must be a Miss \
-             for that upstream (content binding), got {got:?}"
+            matches!(got, Err(SubstituteError::ContentMismatch)),
+            "a NarSize-disagreeing AlreadyComplete claim must be a typed \
+             content refusal for that upstream (content binding), got {got:?}"
         );
         // No NAR download on AlreadyComplete — binding runs pre-fetch.
         assert_eq!(

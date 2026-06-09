@@ -530,6 +530,18 @@ in
     # axes equal over the bounded domain, so a dropped axis flips the
     # proof red. Bughunt-3 S3 formal obligation: "mismatch ⇒ never
     # Hit").
-    expectedHarnesses = 29;
+    # 29 → 30 (bughunt-4 S5a, bug_266): +
+    # check_gen_stamped_fold_refusal (K6: the generation-stamp fold
+    # refusal — fold_guard accepts iff every verdict cell carries the
+    # final tenant-set generation, and drain_stale removes exactly
+    # the stale cells; concrete lengths ≤3, generations <3). The
+    # merged_bug_046 ContentMismatch class extension rides the
+    # EXISTING three substitute harnesses (truth table, loop cells,
+    # tenant fold), which now pick through class_of_index /
+    # SUBSTITUTE_FAILURE_CLASS_COUNT — the exhaustive class_index
+    # inverse breaks the build on a new variant, so a class can no
+    # longer be silently excluded from any sweep (the round-3
+    # pick-table lesson made structural).
+    expectedHarnesses = 30;
   };
 }

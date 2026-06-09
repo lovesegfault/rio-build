@@ -55,6 +55,18 @@ pub enum SubstituteFailureClass {
     /// trouble (nothing is broken on our side): a typed trust
     /// refusal, settled uncharged.
     Untrusted,
+    /// merged_bug_046: the upstream's narinfo names the path but
+    /// claims DIFFERENT bytes than the locally-stored row (nar_hash /
+    /// nar_size / reference-set disagreement at the AlreadyComplete
+    /// dedup arm). Deterministic stored-row/upstream disagreement —
+    /// this upstream does not have *this* path's bytes: never a miss
+    /// (folding it to the cacheable CleanMiss re-opened the
+    /// merged_bug_005 laundering loop one axis over — the sig/content-
+    /// blind HEAD confirmation re-found the path and charged
+    /// infrastructure every retry until park), never infrastructure
+    /// (nothing is broken on our side). Input-addressed paths from
+    /// non-reproducible rebuilds hit this legitimately.
+    ContentMismatch,
 }
 
 /// What the scheduler-facing outcome of a classified failure is.
@@ -73,6 +85,15 @@ pub enum FailureDisposition {
     /// (the park budget must never see a deterministic key-rotation
     /// refusal), and never fold it into the cacheable miss lane.
     TrustRefusal,
+    /// merged_bug_046: stored-row/upstream content disagreement is a
+    /// typed CONTENT refusal — settle toward `Unobtainable` with a
+    /// content cause, UNCHARGED, skipping the HEAD confirmation (the
+    /// path IS present upstream; a content-blind HEAD 200 proves
+    /// nothing about agreement and pre-fix converted this exact state
+    /// into a per-retry infrastructure charge). Distinct from
+    /// [`Self::TrustRefusal`] so the settle cause names the actual
+    /// disagreement instead of a key problem.
+    ContentRefusal,
 }
 
 /// The total classification table (no catch-all: adding a
@@ -89,6 +110,50 @@ pub fn classify_substitute_failure(class: SubstituteFailureClass) -> FailureDisp
         | SubstituteFailureClass::Integrity
         | SubstituteFailureClass::Ingest => FailureDisposition::ChargeInfra,
         SubstituteFailureClass::Untrusted => FailureDisposition::TrustRefusal,
+        SubstituteFailureClass::ContentMismatch => FailureDisposition::ContentRefusal,
+    }
+}
+
+/// The class alphabet's cardinality, structurally tied to the enum by
+/// [`class_index`] (no catch-all there): adding a variant breaks
+/// `class_index` at compile time, which forces this count — and every
+/// kani pick table built from it — to follow. The proofs' "swept over
+/// the entire alphabet" claim is machine-witnessed by this pair, not
+/// by reviewer memory (merged_bug_046 sweep duty; the round-3
+/// pick-table lesson).
+pub const SUBSTITUTE_FAILURE_CLASS_COUNT: u8 = 9;
+
+/// Exhaustive class→index map — the compile-time witness behind
+/// [`SUBSTITUTE_FAILURE_CLASS_COUNT`]. NO catch-all by design.
+pub const fn class_index(class: SubstituteFailureClass) -> u8 {
+    match class {
+        SubstituteFailureClass::Raced => 0,
+        SubstituteFailureClass::RateLimited => 1,
+        SubstituteFailureClass::Stalled => 2,
+        SubstituteFailureClass::AdmissionSaturated => 3,
+        SubstituteFailureClass::Fetch => 4,
+        SubstituteFailureClass::Integrity => 5,
+        SubstituteFailureClass::Ingest => 6,
+        SubstituteFailureClass::Untrusted => 7,
+        SubstituteFailureClass::ContentMismatch => 8,
+    }
+}
+
+/// Index→class, total over `0..SUBSTITUTE_FAILURE_CLASS_COUNT` (the
+/// kani pick tables route through THIS instead of ad-hoc `_ =>`
+/// catch-alls, so a new variant cannot be silently excluded from any
+/// proof: `class_index` breaks the build first).
+pub const fn class_of_index(sel: u8) -> SubstituteFailureClass {
+    match sel % SUBSTITUTE_FAILURE_CLASS_COUNT {
+        0 => SubstituteFailureClass::Raced,
+        1 => SubstituteFailureClass::RateLimited,
+        2 => SubstituteFailureClass::Stalled,
+        3 => SubstituteFailureClass::AdmissionSaturated,
+        4 => SubstituteFailureClass::Fetch,
+        5 => SubstituteFailureClass::Integrity,
+        6 => SubstituteFailureClass::Ingest,
+        7 => SubstituteFailureClass::Untrusted,
+        _ => SubstituteFailureClass::ContentMismatch,
     }
 }
 
@@ -207,6 +272,7 @@ pub struct SubstituteLoopCells {
     any_429: Option<Option<core::time::Duration>>,
     any_errored: bool,
     any_untrusted: bool,
+    any_content_mismatch: bool,
 }
 
 impl SubstituteLoopCells {
@@ -217,6 +283,7 @@ impl SubstituteLoopCells {
             any_429: None,
             any_errored: false,
             any_untrusted: false,
+            any_content_mismatch: false,
         }
     }
 
@@ -253,6 +320,7 @@ impl SubstituteLoopCells {
             | SubstituteFailureClass::Integrity
             | SubstituteFailureClass::Ingest => self.any_errored = true,
             SubstituteFailureClass::Untrusted => self.any_untrusted = true,
+            SubstituteFailureClass::ContentMismatch => self.any_content_mismatch = true,
         }
         LoopControl::Continue
     }
@@ -297,16 +365,28 @@ pub enum SubstituteLoopVerdict {
     /// charged infrastructure forever. The caller surfaces a typed,
     /// UNCACHED trust refusal instead.
     UntrustedPresent,
+    /// merged_bug_046: ≥1 upstream's narinfo disagreed with the
+    /// stored row's content at the AlreadyComplete dedup arm (and
+    /// none served, stalled, 429'd, errored, or trust-refused). The
+    /// same never-a-miss law as [`Self::UntrustedPresent`], one axis
+    /// over: the caller surfaces a typed, UNCACHED content refusal so
+    /// the content-blind HEAD confirmation can never contradict a
+    /// cached CleanMiss into a per-retry infrastructure charge.
+    ContentMismatch,
 }
 
 /// bug_081's pure post-loop fold over merged_bug_044's evidence
 /// cells: a failure on ONE upstream is upstream-local — the loop
 /// records it and fails over; only after every upstream has been
 /// tried does the recorded evidence pick the attempt outcome. Total
-/// over all three observation axes; precedence `Stalled >
-/// RateLimited > Errored > CleanMiss` (charging evidence outranks
-/// back-off advice outranks "something broke, don't cache" outranks
-/// a cacheable miss).
+/// over all five observation axes; precedence
+/// `Stalled, RateLimited, Errored, Untrusted, ContentMismatch, CleanMiss`
+/// in strictly decreasing rank: charging evidence outranks back-off
+/// advice, which outranks "something broke, don't cache", which
+/// outranks the deterministic refusals, which outrank a cacheable
+/// miss; the trust refusal outranks the content refusal because a
+/// key rotation is the likelier-repairable cause when both were
+/// observed.
 // r[impl store.substitute.stall-abort+2]
 // r[impl store.substitute.loop-evidence-total]
 pub fn fold_substitute_loop(cells: SubstituteLoopCells) -> SubstituteLoopVerdict {
@@ -315,17 +395,19 @@ pub fn fold_substitute_loop(cells: SubstituteLoopCells) -> SubstituteLoopVerdict
         cells.any_429,
         cells.any_errored,
         cells.any_untrusted,
+        cells.any_content_mismatch,
     ) {
-        (Some(window), _, _, _) => SubstituteLoopVerdict::Stalled { window },
-        (None, Some(retry_after), _, _) => SubstituteLoopVerdict::RateLimited { retry_after },
-        // An errored upstream outranks a trust refusal: the error is
-        // possibly transient (a retry may serve through that
-        // upstream), while the refusal is deterministic — surfacing
-        // the refusal would prematurely settle a path an errored
+        (Some(window), _, _, _, _) => SubstituteLoopVerdict::Stalled { window },
+        (None, Some(retry_after), _, _, _) => SubstituteLoopVerdict::RateLimited { retry_after },
+        // An errored upstream outranks the deterministic refusals:
+        // the error is possibly transient (a retry may serve through
+        // that upstream), while the refusals are deterministic —
+        // surfacing one would prematurely settle a path an errored
         // upstream might still serve.
-        (None, None, true, _) => SubstituteLoopVerdict::Errored,
-        (None, None, false, true) => SubstituteLoopVerdict::UntrustedPresent,
-        (None, None, false, false) => SubstituteLoopVerdict::CleanMiss,
+        (None, None, true, _, _) => SubstituteLoopVerdict::Errored,
+        (None, None, false, true, _) => SubstituteLoopVerdict::UntrustedPresent,
+        (None, None, false, false, true) => SubstituteLoopVerdict::ContentMismatch,
+        (None, None, false, false, false) => SubstituteLoopVerdict::CleanMiss,
     }
 }
 
@@ -361,6 +443,11 @@ pub enum TenantAttemptEvidence {
     /// errored). A deterministic trust refusal — never a miss, never
     /// infrastructure.
     UntrustedPresent,
+    /// merged_bug_046: this tenant's view hit the AlreadyComplete
+    /// content disagreement on ≥1 upstream (and nothing outranked
+    /// it). A deterministic content refusal — never a miss, never
+    /// infrastructure.
+    ContentMismatch,
 }
 
 /// merged_bug_188: the tenant axis's recording chokepoint, mirroring
@@ -419,6 +506,13 @@ impl TenantAttemptCells {
                 // still trust the sigs, so the sweep continues.
                 self.cells.push(TenantAttemptEvidence::UntrustedPresent);
             }
+            FailureDisposition::ContentRefusal => {
+                // merged_bug_046: stored-row/upstream disagreement
+                // under this tenant's view — its own cell, same
+                // sweep-continues posture (another tenant's upstream
+                // may carry agreeing bytes).
+                self.cells.push(TenantAttemptEvidence::ContentMismatch);
+            }
         }
         LoopControl::Continue
     }
@@ -475,6 +569,17 @@ pub enum TenantAttemptsVerdict {
         /// cause message names that tenant's refusal).
         idx: usize,
     },
+    /// merged_bug_046: no charge, no transient, no trust refusal,
+    /// but ≥1 tenant hit the AlreadyComplete content disagreement
+    /// (rest clean-missed). Settles **Unobtainable-with-cause,
+    /// UNCHARGED**, skipping the HEAD confirmation (the path IS
+    /// present upstream with disagreeing bytes; a content-blind HEAD
+    /// 200 proves nothing).
+    ContentMismatch {
+        /// Index of the first `ContentMismatch` cell (the caller's
+        /// cause message names that tenant's disagreement).
+        idx: usize,
+    },
     /// Every consulted tenant cleanly missed (vacuously true for an
     /// empty set — the caller's no-tenant shape has its own arms).
     AllCleanMiss,
@@ -494,6 +599,7 @@ pub fn fold_tenant_attempts(cells: &[TenantAttemptEvidence]) -> TenantAttemptsVe
     let mut first_charge: Option<usize> = None;
     let mut best_transient: Option<(usize, Option<core::time::Duration>)> = None;
     let mut first_untrusted: Option<usize> = None;
+    let mut first_content: Option<usize> = None;
     let mut i = 0;
     while i < cells.len() {
         match cells[i] {
@@ -522,21 +628,125 @@ pub fn fold_tenant_attempts(cells: &[TenantAttemptEvidence]) -> TenantAttemptsVe
                     first_untrusted = Some(i);
                 }
             }
+            TenantAttemptEvidence::ContentMismatch => {
+                if first_content.is_none() {
+                    first_content = Some(i);
+                }
+            }
             TenantAttemptEvidence::CleanMiss => {}
         }
         i += 1;
     }
     // Precedence `ChargeInfra > RetryTransient > UntrustedPresent >
-    // AllCleanMiss`: charging evidence must reach the ladder;
-    // a transient tenant may still SERVE on retry (so back-off
-    // outranks settling on another tenant's deterministic refusal);
-    // the refusal outranks only the clean miss — it must never be
-    // laundered into the cacheable/probe-confirmed miss lane.
-    match (first_charge, best_transient, first_untrusted) {
-        (Some(idx), _, _) => TenantAttemptsVerdict::ChargeInfra { idx },
-        (None, Some((idx, max)), _) => TenantAttemptsVerdict::RetryTransient { idx, max },
-        (None, None, Some(idx)) => TenantAttemptsVerdict::UntrustedPresent { idx },
-        (None, None, None) => TenantAttemptsVerdict::AllCleanMiss,
+    // ContentMismatch > AllCleanMiss`: charging evidence must reach
+    // the ladder; a transient tenant may still SERVE on retry (so
+    // back-off outranks settling on another tenant's deterministic
+    // refusal); the refusals outrank only the clean miss — neither
+    // may be laundered into the cacheable/probe-confirmed miss lane
+    // — and the trust refusal outranks the content refusal (the
+    // likelier-repairable cause, matching the loop fold one level
+    // down).
+    match (first_charge, best_transient, first_untrusted, first_content) {
+        (Some(idx), _, _, _) => TenantAttemptsVerdict::ChargeInfra { idx },
+        (None, Some((idx, max)), _, _) => TenantAttemptsVerdict::RetryTransient { idx, max },
+        (None, None, Some(idx), _) => TenantAttemptsVerdict::UntrustedPresent { idx },
+        (None, None, None, Some(idx)) => TenantAttemptsVerdict::ContentMismatch { idx },
+        (None, None, None, None) => TenantAttemptsVerdict::AllCleanMiss,
+    }
+}
+
+/// bug_266: a verdict cell that survived past the tenant-set
+/// generation it was reached under. Folding it would settle a job on
+/// evidence a since-joined tenant's upstreams were never asked about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaleVerdictCell {
+    /// The stale cell's generation.
+    pub cell_generation: u64,
+    /// The walk's final generation.
+    pub final_generation: u64,
+}
+
+/// bug_266: generation-stamped verdict cells. Every per-path verdict
+/// the closure walk settles (missing-wanted, missing-reference,
+/// trust-refused, content-mismatched) is recorded WITH the tenant-set
+/// generation it was reached under; when the live tenant set GROWS
+/// mid-walk, the stale cells are drained back into the frontier (the
+/// new tenant's upstreams get their owner-Q2 chance), and the outcome
+/// compiler REFUSES to fold any cell older than the final generation
+/// — a stale verdict surviving to the fold is a walk bug surfaced as
+/// infrastructure failure, never a wrong `Unobtainable`.
+///
+/// Fields are private; [`Self::record`] is the only writer, so a
+/// verdict without a generation is unrepresentable.
+#[derive(Debug, Clone, Default)]
+pub struct GenStampedCells {
+    cells: Vec<(String, u64)>,
+}
+
+impl GenStampedCells {
+    /// No verdicts recorded yet.
+    pub const fn new() -> Self {
+        Self { cells: Vec::new() }
+    }
+
+    /// Record one path's verdict under the CURRENT tenant-set
+    /// generation.
+    pub fn record(&mut self, path: String, generation: u64) {
+        self.cells.push((path, generation));
+    }
+
+    /// Tenant-set growth: remove every cell older than
+    /// `current_generation` and hand the paths back for re-probing
+    /// (the caller re-seeds the frontier and clears `visited`).
+    pub fn drain_stale(&mut self, current_generation: u64) -> Vec<String> {
+        let mut stale = Vec::new();
+        self.cells.retain(|(path, generation)| {
+            if *generation < current_generation {
+                stale.push(path.clone());
+                false
+            } else {
+                true
+            }
+        });
+        stale
+    }
+
+    /// The fold refusal (the outcome compiler's guard): `Ok(())` iff
+    /// every recorded cell carries the final generation. The walk
+    /// drains stale cells at every growth point, so a surviving
+    /// stale cell is a missed drain — refuse the fold.
+    pub fn fold_guard(&self, final_generation: u64) -> Result<(), StaleVerdictCell> {
+        let mut i = 0;
+        while i < self.cells.len() {
+            if self.cells[i].1 != final_generation {
+                return Err(StaleVerdictCell {
+                    cell_generation: self.cells[i].1,
+                    final_generation,
+                });
+            }
+            i += 1;
+        }
+        Ok(())
+    }
+
+    /// The recorded paths (fold order = record order).
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        self.cells.iter().map(|(p, _)| p.as_str())
+    }
+
+    /// Whether `path` currently holds a recorded verdict.
+    pub fn contains(&self, path: &str) -> bool {
+        self.cells.iter().any(|(p, _)| p == path)
+    }
+
+    /// Number of recorded verdicts.
+    pub fn len(&self) -> usize {
+        self.cells.len()
+    }
+
+    /// No recorded verdicts.
+    pub fn is_empty(&self) -> bool {
+        self.cells.is_empty()
     }
 }
 
@@ -721,9 +931,48 @@ mod tests {
             (Integrity, ChargeInfra),
             (Ingest, ChargeInfra),
             (Untrusted, TrustRefusal),
+            (ContentMismatch, ContentRefusal),
         ] {
             assert_eq!(classify_substitute_failure(class), want, "{class:?}");
         }
+        // merged_bug_046: the row list above is pinned to the
+        // alphabet's machine-witnessed cardinality — adding a variant
+        // breaks class_index at compile time AND this count, so the
+        // enumeration cannot silently under-cover.
+        for sel in 0..SUBSTITUTE_FAILURE_CLASS_COUNT {
+            assert_eq!(class_index(class_of_index(sel)), sel);
+        }
+    }
+
+    /// merged_bug_046: the loop fold's content axis — a recorded
+    /// ContentMismatch never folds to the cacheable CleanMiss, sits
+    /// below the trust refusal and above the miss, and is outranked
+    /// by every transient/charging axis.
+    #[test]
+    fn loop_fold_content_mismatch_precedence() {
+        // Alone: surfaces as the ContentMismatch verdict.
+        let mut cells = SubstituteLoopCells::new();
+        assert_eq!(
+            cells.record(SubstituteFailureClass::ContentMismatch, None),
+            LoopControl::Continue
+        );
+        assert_eq!(
+            fold_substitute_loop(cells),
+            SubstituteLoopVerdict::ContentMismatch
+        );
+        // Trust refusal outranks it.
+        let mut cells = SubstituteLoopCells::new();
+        let _ = cells.record(SubstituteFailureClass::ContentMismatch, None);
+        let _ = cells.record(SubstituteFailureClass::Untrusted, None);
+        assert_eq!(
+            fold_substitute_loop(cells),
+            SubstituteLoopVerdict::UntrustedPresent
+        );
+        // An errored upstream outranks both refusals.
+        let mut cells = SubstituteLoopCells::new();
+        let _ = cells.record(SubstituteFailureClass::ContentMismatch, None);
+        let _ = cells.record(SubstituteFailureClass::Fetch, None);
+        assert_eq!(fold_substitute_loop(cells), SubstituteLoopVerdict::Errored);
     }
 
     // r[verify store.materialize.tenant-fold+2]
@@ -901,16 +1150,16 @@ mod proofs {
     /// over the class alphabet by construction (no catch-all).
     #[kani::proof]
     fn check_substitute_failure_truth_table() {
-        let class = match kani::any::<u8>() {
-            0 => SubstituteFailureClass::Raced,
-            1 => SubstituteFailureClass::RateLimited,
-            2 => SubstituteFailureClass::Stalled,
-            3 => SubstituteFailureClass::AdmissionSaturated,
-            4 => SubstituteFailureClass::Fetch,
-            5 => SubstituteFailureClass::Integrity,
-            6 => SubstituteFailureClass::Ingest,
-            _ => SubstituteFailureClass::Untrusted,
-        };
+        // merged_bug_046 sweep duty: the pick routes through
+        // `class_of_index`, whose exhaustive inverse (`class_index`)
+        // breaks the build on a new variant — a class can no longer
+        // be silently excluded from this sweep (the round-3
+        // pick-table lesson, made structural).
+        let class = class_of_index(kani::any::<u8>());
+        // Round-trip: the index pair really is a bijection over the
+        // alphabet.
+        assert_eq!(class_index(class) < SUBSTITUTE_FAILURE_CLASS_COUNT, true);
+        assert_eq!(class_of_index(class_index(class)), class);
         let disposition = classify_substitute_failure(class);
         let transient = matches!(
             class,
@@ -921,6 +1170,10 @@ mod proofs {
         // class — never charged, never retried-uncharged.
         let refusal = matches!(class, SubstituteFailureClass::Untrusted);
         assert_eq!(disposition == FailureDisposition::TrustRefusal, refusal);
+        // merged_bug_046: the content lane is exactly the
+        // ContentMismatch class.
+        let content = matches!(class, SubstituteFailureClass::ContentMismatch);
+        assert_eq!(disposition == FailureDisposition::ContentRefusal, content);
     }
 
     /// K1 (merged_bug_044): the loop cells are total over the class
@@ -935,16 +1188,10 @@ mod proofs {
     /// and must yield `Errored`, never `CleanMiss`.
     #[kani::proof]
     fn check_substitute_loop_cells_total() {
-        let pick = |sel: u8| match sel {
-            0 => SubstituteFailureClass::Raced,
-            1 => SubstituteFailureClass::RateLimited,
-            2 => SubstituteFailureClass::Stalled,
-            3 => SubstituteFailureClass::AdmissionSaturated,
-            4 => SubstituteFailureClass::Fetch,
-            5 => SubstituteFailureClass::Integrity,
-            6 => SubstituteFailureClass::Ingest,
-            _ => SubstituteFailureClass::Untrusted,
-        };
+        // Routed through the machine-witnessed pick table
+        // (merged_bug_046): a new class variant breaks `class_index`
+        // before it can be silently excluded here.
+        let pick = class_of_index;
         let advice_of = |has: bool, secs: u32| {
             if has {
                 Some(core::time::Duration::from_secs(secs as u64))
@@ -964,6 +1211,7 @@ mod proofs {
         let mut want_429: Option<Option<core::time::Duration>> = None;
         let mut want_err = false;
         let mut want_untrusted = false;
+        let mut want_content = false;
         let mut aborted = false;
         let mut i = 0;
         while i < classes.len() {
@@ -1009,28 +1257,42 @@ mod proofs {
                     assert_eq!(control, LoopControl::Continue);
                     want_untrusted = true;
                 }
+                SubstituteFailureClass::ContentMismatch => {
+                    assert_eq!(control, LoopControl::Continue);
+                    want_content = true;
+                }
             }
             i += 1;
         }
         let _ = aborted;
 
         let verdict = fold_substitute_loop(cells);
-        match (want_stall, want_429, want_err, want_untrusted) {
-            (Some(w), _, _, _) => assert_eq!(verdict, SubstituteLoopVerdict::Stalled { window: w }),
-            (None, Some(ra), _, _) => {
+        match (want_stall, want_429, want_err, want_untrusted, want_content) {
+            (Some(w), _, _, _, _) => {
+                assert_eq!(verdict, SubstituteLoopVerdict::Stalled { window: w })
+            }
+            (None, Some(ra), _, _, _) => {
                 assert_eq!(
                     verdict,
                     SubstituteLoopVerdict::RateLimited { retry_after: ra }
                 )
             }
-            (None, None, true, _) => assert_eq!(verdict, SubstituteLoopVerdict::Errored),
-            (None, None, false, true) => {
+            (None, None, true, _, _) => assert_eq!(verdict, SubstituteLoopVerdict::Errored),
+            (None, None, false, true, _) => {
                 // merged_bug_005: the trust axis is below the error
                 // axis and above the miss — present-but-untrusted
                 // NEVER folds to the cacheable CleanMiss.
                 assert_eq!(verdict, SubstituteLoopVerdict::UntrustedPresent)
             }
-            (None, None, false, false) => assert_eq!(verdict, SubstituteLoopVerdict::CleanMiss),
+            (None, None, false, false, true) => {
+                // merged_bug_046: the content axis sits between the
+                // trust axis and the miss — a stored-row disagreement
+                // NEVER folds to the cacheable CleanMiss.
+                assert_eq!(verdict, SubstituteLoopVerdict::ContentMismatch)
+            }
+            (None, None, false, false, false) => {
+                assert_eq!(verdict, SubstituteLoopVerdict::CleanMiss)
+            }
         }
     }
 
@@ -1063,7 +1325,7 @@ mod proofs {
     /// names a cell in the given order for the caller's message).
     #[kani::proof]
     fn check_fold_tenant_attempts_permutation_and_precedence() {
-        let mk = |sel: u8, has_advice: bool, secs: u8| match sel % 4 {
+        let mk = |sel: u8, has_advice: bool, secs: u8| match sel % 5 {
             0 => TenantAttemptEvidence::Charge {
                 // The verdict is class-blind by construction; one
                 // charging class stands for all (the class only rides
@@ -1078,6 +1340,7 @@ mod proofs {
                 },
             },
             2 => TenantAttemptEvidence::UntrustedPresent,
+            3 => TenantAttemptEvidence::ContentMismatch,
             _ => TenantAttemptEvidence::CleanMiss,
         };
         let a = [
@@ -1106,6 +1369,10 @@ mod proofs {
                 TenantAttemptsVerdict::UntrustedPresent { .. },
                 TenantAttemptsVerdict::UntrustedPresent { .. },
             ) => {}
+            (
+                TenantAttemptsVerdict::ContentMismatch { .. },
+                TenantAttemptsVerdict::ContentMismatch { .. },
+            ) => {}
             (TenantAttemptsVerdict::AllCleanMiss, TenantAttemptsVerdict::AllCleanMiss) => {}
             _ => panic!("verdict class must be permutation-invariant"),
         }
@@ -1116,12 +1383,14 @@ mod proofs {
         let mut any_charge = false;
         let mut any_transient = false;
         let mut any_untrusted = false;
+        let mut any_content = false;
         let mut k = 0;
         while k < a.len() {
             match a[k] {
                 TenantAttemptEvidence::Charge { .. } => any_charge = true,
                 TenantAttemptEvidence::Transient { .. } => any_transient = true,
                 TenantAttemptEvidence::UntrustedPresent => any_untrusted = true,
+                TenantAttemptEvidence::ContentMismatch => any_content = true,
                 TenantAttemptEvidence::CleanMiss => {}
             }
             k += 1;
@@ -1139,10 +1408,83 @@ mod proofs {
                 assert!(!any_charge && !any_transient && any_untrusted);
                 assert!(matches!(a[idx], TenantAttemptEvidence::UntrustedPresent));
             }
+            TenantAttemptsVerdict::ContentMismatch { idx } => {
+                // merged_bug_046: the content lane sits between trust
+                // and clean-miss.
+                assert!(!any_charge && !any_transient && !any_untrusted && any_content);
+                assert!(matches!(a[idx], TenantAttemptEvidence::ContentMismatch));
+            }
             TenantAttemptsVerdict::AllCleanMiss => {
-                assert!(!any_charge && !any_transient && !any_untrusted)
+                assert!(!any_charge && !any_transient && !any_untrusted && !any_content)
             }
         }
+    }
+
+    /// K6 (bug_266): the generation-stamp fold refusal. Over every
+    /// ≤3-cell ledger with generations in 0..3 and any final
+    /// generation in 0..3: `fold_guard` accepts IFF every cell
+    /// carries the final generation, and `drain_stale(g)` removes
+    /// EXACTLY the cells older than `g` (the survivors then pass the
+    /// guard at `g` iff none is newer). Concrete lengths per the
+    /// CBMC fat-pointer lesson.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn check_gen_stamped_fold_refusal() {
+        let n: usize = kani::any();
+        kani::assume(n <= 3);
+        let gens: [u64; 3] = [kani::any(), kani::any(), kani::any()];
+        kani::assume(gens[0] < 3 && gens[1] < 3 && gens[2] < 3);
+        let final_gen: u64 = kani::any();
+        kani::assume(final_gen < 3);
+
+        let mut cells = GenStampedCells::new();
+        let mut i = 0;
+        while i < n {
+            cells.record(String::new(), gens[i]);
+            i += 1;
+        }
+        // Guard truth: accept iff all-current.
+        let mut all_current = true;
+        let mut j = 0;
+        while j < n {
+            if gens[j] != final_gen {
+                all_current = false;
+            }
+            j += 1;
+        }
+        assert_eq!(cells.fold_guard(final_gen).is_ok(), all_current);
+
+        // Drain totality: exactly the stale cells leave.
+        let mut expect_stale = 0usize;
+        let mut k = 0;
+        while k < n {
+            if gens[k] < final_gen {
+                expect_stale += 1;
+            }
+            k += 1;
+        }
+        let drained = cells.drain_stale(final_gen);
+        assert_eq!(drained.len(), expect_stale);
+        assert_eq!(cells.len(), n - expect_stale);
+        // Post-drain, no survivor is OLDER than final_gen; the guard
+        // then accepts iff none is NEWER either.
+        let mut any_newer = false;
+        for p in cells.paths() {
+            let _ = p;
+        }
+        let mut m = 0;
+        let mut survivors_checked = 0usize;
+        while m < n {
+            if gens[m] >= final_gen {
+                survivors_checked += 1;
+                if gens[m] > final_gen {
+                    any_newer = true;
+                }
+            }
+            m += 1;
+        }
+        assert_eq!(cells.len(), survivors_checked);
+        assert_eq!(cells.fold_guard(final_gen).is_ok(), !any_newer);
     }
 
     /// K3 (bug_299, superseding merged_bug_028's pre-projected

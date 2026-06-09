@@ -368,7 +368,9 @@ pub fn describe_metrics() {
          (merged_bug_091): exactly one result tick per singleflight \
          leader, from the post-loop fold — result = hit | miss (every \
          upstream answered hit-or-404 with zero hits) | untrusted \
-         (present upstream, no verifiable signature) | error (>=1 \
+         (present upstream, no verifiable signature) | content_mismatch \
+         (present upstream, bytes disagree with the stored row — \
+         merged_bug_046) | error (>=1 \
          upstream broke; not a definitive miss) — and tenant (UUID). \
          Per-upstream debugging detail is in the debug!/warn! log lines \
          (which carry upstream=<url>); the metric label is bounded by \

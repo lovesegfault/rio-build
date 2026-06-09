@@ -1332,6 +1332,13 @@
     },
     {
       "enum": "SubstituteError",
+      "name": "ContentMismatch",
+      "crate": "rio-store",
+      "msg": "upstream narinfo names the path but claims different bytes than the stored row (nar_hash/nar_size/reference disagreement)",
+      "doc": "merged_bug_046: every non-serving upstream that HAD the path answered with a narinfo whose content DISAGREES with the locally-stored row (the AlreadyComplete dedup arm's nar_hash/nar_size/reference-set check) and nothing served, stalled, 429'd, errored, or trust-refused. Returned as `Err` so moka does NOT cache it — pinning the disagreement as a definitive miss would let the content-blind HEAD confirmation contradict it into a per-retry infrastructure charge (the merged_bug_005 laundering loop, one axis over). The materialization executor settles it Unobtainable-with-cause, UNCHARGED, skipping the HEAD confirmation."
+    },
+    {
+      "enum": "SubstituteError",
       "name": "Fetch",
       "crate": "rio-store",
       "msg": "upstream fetch failed: {0}",
