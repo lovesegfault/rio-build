@@ -44,7 +44,10 @@ module ggCalibTerminatingPending {
     ENABLE_MULTI_POOL = false,
     ENABLE_STREAK_POOL_KEY = false,
     ENABLE_CANCEL_GENERATION = false,
-    ENABLE_RETRY_BACKOFF = false
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2
   ).* from "../spawnCoherence"
 
   /// PRE-FIX pending predicate: no deletionTimestamp filter.
@@ -238,6 +241,7 @@ module ggCalibTerminatingPending {
       seenOpen' = seenOpen,
       exhausted' = exhausted,
       streak' = streak,
+      streakWallAge' = streakWallAge,
       ownGatedTicks' = ownGatedTicks,
       jobPostdatesClose' = jobPostdatesClose,
       pendingClose' = pendingClose,

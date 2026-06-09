@@ -54,7 +54,10 @@ module controllerCalib113RespawnCancel {
     ENABLE_MULTI_POOL = false,
     ENABLE_STREAK_POOL_KEY = false,
     ENABLE_CANCEL_GENERATION = false,
-    ENABLE_RETRY_BACKOFF = false
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2
   ).* from "../spawnCoherence"
 
   /// The post-cancel mid-trace state (every var assigned; deltas from
@@ -77,6 +80,7 @@ module controllerCalib113RespawnCancel {
     seenOpen' = INTENTS.mapBy(i => false),
     exhausted' = INTENTS.mapBy(i => false),
     streak' = INTENTS.mapBy(i => 0),
+    streakWallAge' = INTENTS.mapBy(i => 0),
     ownGatedTicks' = INTENTS.mapBy(i => 0),
     jobPostdatesClose' = INTENTS.mapBy(i => false),   // old job gone
     pendingClose' = INTENTS.mapBy(i => false),
@@ -111,7 +115,10 @@ module controllerCalib113RespawnCancelHold {
     ENABLE_MULTI_POOL = false,
     ENABLE_STREAK_POOL_KEY = false,
     ENABLE_CANCEL_GENERATION = true,
-    ENABLE_RETRY_BACKOFF = false
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2
   ).* from "../spawnCoherence"
 
   action calibInit = all {
@@ -132,6 +139,7 @@ module controllerCalib113RespawnCancelHold {
     seenOpen' = INTENTS.mapBy(i => false),
     exhausted' = INTENTS.mapBy(i => false),
     streak' = INTENTS.mapBy(i => 0),
+    streakWallAge' = INTENTS.mapBy(i => 0),
     ownGatedTicks' = INTENTS.mapBy(i => 0),
     jobPostdatesClose' = INTENTS.mapBy(i => false),
     pendingClose' = INTENTS.mapBy(i => false),

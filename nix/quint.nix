@@ -6466,6 +6466,54 @@ rec {
       witness = "canReachPoison";
     };
 
+    # m073 cadence floor (bughunt-4 S1a): the poison verdict spans at
+    # least STREAK_FLOOR wall units from the streak's first gated
+    # observation — a sub-second reconcile burst can step the streak
+    # to the threshold but can never fire the verdict. The regime
+    # rides the exhaust-persist alphabet; the merged_bug_117
+    # own-count/wipe laws keep their own exhaustive regime
+    # (spawn-coherence-multipool-hold) — the MULTI_POOL x CADENCE
+    # product is TLC-infeasible (2,347,503,711 gen / 108,632,544
+    # distinct / queue growing at the 1800s kill), and the floor
+    # predicate is per-intent over the own-pool streak either way.
+    # Measured (TLC exhaustive, gating backend, yensid):
+    # 250,483,073 generated / 11,627,904 distinct / 0 queue in
+    # 118.6s — budget default 1800s = 15x headroom. The fold-skip
+    # edge is pinned to the floor-blind world (see the model's
+    # nondet comment: monotone-safe for the floor law; the twin
+    # exercises it).
+    # r[verify ctrl.pool.no-eligible-persist+3]
+    quint-spawn-coherence-streak-cadence = mkQuintCheck {
+      name = "spawn-coherence-streak-cadence";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceStreakCadence";
+      invariants = [
+        "poisonRespectsWallFloor"
+        "noPoisonWhilePlaceable"
+      ];
+    };
+    # canReachPoison keeps the threshold-past-the-floor path
+    # non-vacuous under the cadence alphabet (the verdict is reachable
+    # once the wall has advanced STREAK_FLOOR units past the streak's
+    # birth — enforcement delays it, never deletes it).
+    quint-spawn-coherence-witness-cadence-poison = mkQuintWitnessCheck {
+      name = "spawn-coherence-witness-cadence-poison";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceStreakCadence";
+      witness = "canReachPoison";
+    };
+    # m073 FALSIFY half: the as-built floor-blind verdict (clock
+    # tracked, not enforced) fires on a burst — VPoisonBurst latches
+    # and poisonRespectsWallFloor is violated.
+    # r[verify ctrl.pool.no-eligible-persist+3]
+    quint-spawn-coherence-calib-073-burst = mkQuintWitnessCheck {
+      name = "spawn-coherence-calib-073-burst";
+      spec = "calibration/controller-073-burst";
+      main = "controller073Burst";
+      extraSpecs = [ "spawnCoherence" ];
+      witness = "poisonRespectsWallFloor";
+    };
+
     # bug_113 FALSIFY half: cancel + fast re-submit respawns the
     # deterministic Job name inside the recently_closed window; the
     # cause-only law cancel-selects the fresh Job. Live-import calib

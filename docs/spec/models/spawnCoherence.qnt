@@ -202,6 +202,7 @@ module spawnCoherence {
     | VCancelPostCloseJob
     | VPoisonForeignCount
     | VForeignStreakWipe
+    | VPoisonBurst
     | VYoungLeaderReap
     | VStaleClose
 
@@ -293,6 +294,17 @@ module spawnCoherence {
   /// teardown, previously a contained residual). Ghost-framed:
   /// meaningful only under ENABLE_CANCEL_CAUSE.
   const ENABLE_CANCEL_GENERATION: bool
+  /// m073 cadence axis (bughunt-4 S1a): wall-clock floor under the
+  /// poison verdict. CADENCE turns on wall tracking, the fold-skip
+  /// edge (a reconcile pass that retains the pool without stepping
+  /// it) and the burst latch; ENFORCED adds the floor conjunct to the
+  /// verdict itself — split so the falsify twin can track the clock
+  /// without enforcing it (the as-built law).
+  const ENABLE_STREAK_CADENCE: bool
+  const STREAK_FLOOR_ENFORCED: bool
+  /// Wall units a streak must span before the verdict may fire (2 =
+  /// the 20s wall floor over the ~10s reconcile cadence, abstracted).
+  const STREAK_FLOOR: int
 
   pure val INTENTS: Set[IntentId] = Set("i1", "i2")
 
@@ -325,6 +337,9 @@ module spawnCoherence {
   /// NO_ELIGIBLE_SOURCE_PERSIST_TICKS clamp (the streak saturates at
   /// the poison threshold; higher counts are behaviorally identical).
   pure def clampStreak(n: int): int = if (n > 3) 3 else n
+  /// m073: the wall-age clamp (saturating at the floor — beyond it
+  /// the exact age is law-irrelevant; keeps the state space finite).
+  pure def clampAge(n: int): int = if (n > STREAK_FLOOR) STREAK_FLOOR else n
 
   /// Deterministic intent order — stands in for the scheduler's
   /// priority sort and the oldest-first tie-break.
@@ -382,6 +397,14 @@ module spawnCoherence {
   /// only by tick under the exact streak-increment condition;
   /// constant-zero off the exhaust axis.
   var ownGatedTicks: IntentId -> int
+  /// m073 cadence ghost (frozen off-axis — the TRACK_EPISODE_GHOSTS
+  /// precedent: all-constant unless ENABLE_STREAK_CADENCE, zero state
+  /// cost). Wall units elapsed since the streak's FIRST gated
+  /// observation, saturating at STREAK_FLOOR (beyond the floor the
+  /// exact age is law-irrelevant — the clamp keeps TLC finite). Born
+  /// 0 at the streak's birth tick, grows with the nondet wall
+  /// advance, reset with the streak.
+  var streakWallAge: IntentId -> int
   /// bug_113 ghost: the intent's current Job was created AFTER the
   /// window's close landed (birth-vs-close order of the live pair).
   /// Set by the spawn pass while a close is in the window; cleared
@@ -478,6 +501,13 @@ module spawnCoherence {
   /// of "persistent exhaustion eventually reports": given no foreign
   /// wipe, the 3-tick threshold delivers it).
   val persistentExhaustionEventuallyReports = not(violations.contains(VForeignStreakWipe))
+  /// m073 (bughunt-4 S1a): the poison verdict spans at least
+  /// STREAK_FLOOR wall units from the streak's first gated
+  /// observation — a sub-second reconcile burst (ticks without wall
+  /// advance) can never fire it. Falsified with CADENCE on and
+  /// ENFORCED off (the as-built floor-blind law); holds when the
+  /// verdict carries the floor conjunct.
+  val poisonRespectsWallFloor = not(violations.contains(VPoisonBurst))
   /// C2/221: a never-pulled Running Job (no executor entry) is never
   /// orphan-reaped while the serving leader is younger than the grace.
   /// Falsified with ENABLE_YOUNG_LEADER_REAP (the as-built gate-less
@@ -535,6 +565,21 @@ module spawnCoherence {
     nondet ackFails = boolChoices(ENABLE_RPC_FAULT).oneOf()
     nondet createFailsFor = (if (ENABLE_RPC_FAULT) INTENTS.powerset() else Set(Set())).oneOf()
     nondet useStalePoll = boolChoices(ENABLE_STALE_POLL).oneOf()
+    // m073 cadence: the wall may stand still across ticks (the burst)
+    // and a reconcile pass may RETAIN the pool without folding it (no
+    // step, no reset — the retain-without-step edge). Off-axis both
+    // collapse to today's tick (wall frozen, fold always runs). The
+    // fold-skip nondet is exercised only in the floor-BLIND world
+    // (the twin): with the floor enforced it is monotone-safe — a
+    // skipped fold freezes the streak while the age keeps growing,
+    // strictly weakening every poison precondition — so the HOLD
+    // regime pins it false to keep TLC inside budget (measured: the
+    // 4-way tick branching put the exhaust-persist x cadence product
+    // at 843M generated / 57M distinct / queue growing at the 1800s
+    // kill).
+    nondet wallAdv = (if (ENABLE_STREAK_CADENCE) Set(0, 1) else Set(0)).oneOf()
+    nondet foldSkip = boolChoices(
+      ENABLE_STREAK_CADENCE and not(STREAK_FLOOR_ENFORCED)).oneOf()
 
     // ---- 1. Intent poll (fail-open: ⊥ reads as empty) --------------
     // PD-7 (bbb607447): the served set excludes intents whose node
@@ -592,7 +637,9 @@ module spawnCoherence {
     // or immediately (the as-built law).
     val spawnCandidates = wantedCandidates.filter(i =>
       not(ENABLE_EXHAUST_POISON and exhausted.get(i)))
-    val streakAfter = INTENTS.mapBy(i =>
+    // m073: a fold-skip tick retains streak state untouched (no step,
+    // no reset) — sub-second re-reconciles must not advance the count.
+    val streakAfter = if (foldSkip) streak else INTENTS.mapBy(i =>
       if (ENABLE_EXHAUST_POISON and exhausted.get(i)
           and postGate.contains(i) and jobsAtList.get(i).phase == JAbsent)
         clampStreak(streak.get(i) + 1)
@@ -600,16 +647,36 @@ module spawnCoherence {
     // merged_bug_117 ghost: the same fold over the pool's OWN count —
     // identical condition, so under pool-keying streak == ownGatedTicks
     // by construction; a foreign double-step makes them diverge.
-    val ownObsAfter = INTENTS.mapBy(i =>
+    val ownObsAfter = if (foldSkip) ownGatedTicks else INTENTS.mapBy(i =>
       if (ENABLE_EXHAUST_POISON and exhausted.get(i)
           and postGate.contains(i) and jobsAtList.get(i).phase == JAbsent)
         clampStreak(ownGatedTicks.get(i) + 1)
       else 0)
-    val poisoned = INTENTS.filter(i =>
+    // m073: each live streak's wall age after this tick — born 0 at
+    // the streak's birth tick, advanced by the wall (whether or not
+    // the fold ran — a skipped fold does not stop the clock), reset
+    // with the streak, saturating at the floor. Frozen all-0 off-axis
+    // (streakAfter folds to 0 and wallAdv is pinned 0).
+    val streakWallAgeAfter =
+      if (foldSkip)
+        INTENTS.mapBy(i =>
+          if (streak.get(i) > 0) clampAge(streakWallAge.get(i) + wallAdv)
+          else 0)
+      else INTENTS.mapBy(i =>
+        if (streakAfter.get(i) == 0) 0
+        else if (streak.get(i) == 0) 0
+        else clampAge(streakWallAge.get(i) + wallAdv))
+    val poisonedBase = INTENTS.filter(i =>
       ENABLE_EXHAUST_POISON and exhausted.get(i)
       and postGate.contains(i) and jobsAtList.get(i).phase == JAbsent
       and (if (ENABLE_EXHAUST_PERSIST) streakAfter.get(i) >= 3
            else streakAfter.get(i) >= 1))
+    // m073: the verdict carries the wall floor — only when ENFORCED
+    // (the twin tracks the clock but keeps the as-built floor-blind
+    // verdict, so the burst latch below can demonstrate it).
+    val poisoned = poisonedBase.filter(i =>
+      not(STREAK_FLOOR_ENFORCED)
+      or streakWallAgeAfter.get(i) >= STREAK_FLOOR)
     val toSpawn = spawnCandidates.filter(i =>
       spawnCandidates.filter(o => idRank(o) < idRank(i)).size() < headroom)
     // The create's outcome depends on the slot's truth at create time:
@@ -753,6 +820,14 @@ module spawnCoherence {
     // double-step inflated the shared entry).
     val vPoisonForeign =
       poisoned.filter(i => ownObsAfter.get(i) < 3).size() > 0
+    // m073: a poison verdict on a streak younger than the wall floor
+    // (the reconcile-burst verdict). Under ENFORCED the floor conjunct
+    // above empties this set by construction — the enforcement IS the
+    // same predicate the latch tests (the machine witness).
+    val vPoisonBurst =
+      ENABLE_STREAK_CADENCE and
+      poisoned.filter(i =>
+        streakWallAgeAfter.get(i) < STREAK_FLOOR).size() > 0
     // I2 safety form: enabling conditions at tick start imply the delete
     // by tick end (orphan-pending and orphan-running arms).
     val orphanPendingDue = if (schedErr or postGate.size() == 0) Set() else
@@ -833,6 +908,7 @@ module spawnCoherence {
         .union(if (vCancelNonC) Set(VCancelNonCancelled) else Set())
         .union(if (vCancelPostClose) Set(VCancelPostCloseJob) else Set())
         .union(if (vPoisonForeign) Set(VPoisonForeignCount) else Set())
+        .union(if (vPoisonBurst) Set(VPoisonBurst) else Set())
         .union(if (vYoungReap) Set(VYoungLeaderReap) else Set())
 
     all {
@@ -857,6 +933,7 @@ module spawnCoherence {
       else seenOpen,
       streak' = streakAfter,
       ownGatedTicks' = ownObsAfter,
+      streakWallAge' = streakWallAgeAfter,
       // bug_113 birth-order ghost: a spawned Job postdates the close
       // currently in the window; a surviving Job keeps its bit while
       // it exists; a departed Job clears it.
@@ -890,6 +967,7 @@ module spawnCoherence {
     seenOpen' = seenOpen,
     exhausted' = exhausted,
     streak' = streak,
+    streakWallAge' = streakWallAge,
     ownGatedTicks' = ownGatedTicks,
     jobPostdatesClose' = jobPostdatesClose,
     pendingClose' = pendingClose,
@@ -1040,6 +1118,7 @@ module spawnCoherence {
     seenOpen' = seenOpen,
     exhausted' = exhausted,
     streak' = streak, ownGatedTicks' = ownGatedTicks, jobPostdatesClose' = jobPostdatesClose,
+    streakWallAge' = streakWallAge,
     pendingClose' = pendingClose,
     obsLive' = obsLive,
   }
@@ -1095,6 +1174,7 @@ module spawnCoherence {
     seenOpen' = seenOpen,
     exhausted' = exhausted,
     streak' = streak, ownGatedTicks' = ownGatedTicks, jobPostdatesClose' = jobPostdatesClose,
+    streakWallAge' = streakWallAge,
     pendingClose' = pendingClose,
     obsLive' = obsLive,
     inBackoff' = inBackoff,
@@ -1114,6 +1194,7 @@ module spawnCoherence {
     seenOpen' = seenOpen,
     exhausted' = exhausted,
     streak' = streak, ownGatedTicks' = ownGatedTicks, jobPostdatesClose' = jobPostdatesClose,
+    streakWallAge' = streakWallAge,
     pendingClose' = pendingClose,
     obsLive' = obsLive,
     inBackoff' = inBackoff,
@@ -1147,6 +1228,7 @@ module spawnCoherence {
     seenOpen' = seenOpen,
     exhausted' = exhausted,
     streak' = streak, ownGatedTicks' = ownGatedTicks, jobPostdatesClose' = jobPostdatesClose,
+    streakWallAge' = streakWallAge,
     pendingClose' = pendingClose,
     obsLive' = obsLive,
     inBackoff' = inBackoff,
@@ -1167,6 +1249,7 @@ module spawnCoherence {
     seenOpen' = seenOpen,
     exhausted' = exhausted,
     streak' = streak, ownGatedTicks' = ownGatedTicks, jobPostdatesClose' = jobPostdatesClose,
+    streakWallAge' = streakWallAge,
     pendingClose' = pendingClose,
     obsLive' = obsLive,
     inBackoff' = inBackoff,
@@ -1214,6 +1297,7 @@ module spawnCoherence {
     seenOpen' = seenOpen,
     exhausted' = exhausted,
     streak' = streak, ownGatedTicks' = ownGatedTicks, jobPostdatesClose' = jobPostdatesClose,
+    streakWallAge' = streakWallAge,
     pendingClose' = pendingClose,
     obsLive' = obsLive,
     inBackoff' = inBackoff,
@@ -1232,6 +1316,7 @@ module spawnCoherence {
     renderedFarDl' = renderedFarDl,
     closedCause' = closedCause, seenOpen' = seenOpen,
     streak' = streak, pendingClose' = pendingClose, obsLive' = obsLive,
+    streakWallAge' = streakWallAge,
     ownGatedTicks' = ownGatedTicks, jobPostdatesClose' = jobPostdatesClose,
     inBackoff' = inBackoff,
   }
@@ -1255,6 +1340,7 @@ module spawnCoherence {
     renderedFarDl' = renderedFarDl,
     seenOpen' = seenOpen, exhausted' = exhausted,
     streak' = streak, ownGatedTicks' = ownGatedTicks,
+    streakWallAge' = streakWallAge,
     pendingClose' = pendingClose,
     inBackoff' = inBackoff,
   }
@@ -1278,6 +1364,7 @@ module spawnCoherence {
     renderedFarDl' = renderedFarDl,
     seenOpen' = seenOpen, exhausted' = exhausted,
     streak' = streak, ownGatedTicks' = ownGatedTicks,
+    streakWallAge' = streakWallAge,
     pendingClose' = pendingClose,
     inBackoff' = inBackoff,
   }
@@ -1295,6 +1382,7 @@ module spawnCoherence {
     renderedFarDl' = renderedFarDl,
     seenOpen' = seenOpen, exhausted' = exhausted,
     streak' = streak, ownGatedTicks' = ownGatedTicks,
+    streakWallAge' = streakWallAge,
     pendingClose' = pendingClose, obsLive' = obsLive,
     inBackoff' = inBackoff,
   }
@@ -1314,6 +1402,7 @@ module spawnCoherence {
     renderedFarDl' = renderedFarDl,
     closedCause' = closedCause, seenOpen' = seenOpen,
     exhausted' = exhausted, streak' = streak, ownGatedTicks' = ownGatedTicks, jobPostdatesClose' = jobPostdatesClose,
+    streakWallAge' = streakWallAge,
     inBackoff' = inBackoff,
   }
 
@@ -1353,6 +1442,7 @@ module spawnCoherence {
     renderedFarDl' = renderedFarDl,
     closedCause' = closedCause, seenOpen' = seenOpen,
     exhausted' = exhausted, streak' = streak, ownGatedTicks' = ownGatedTicks, jobPostdatesClose' = jobPostdatesClose,
+    streakWallAge' = streakWallAge,
     inBackoff' = inBackoff,
   }
 
@@ -1374,6 +1464,7 @@ module spawnCoherence {
     seenOpen' = seenOpen,
     exhausted' = exhausted,
     streak' = streak, ownGatedTicks' = ownGatedTicks, jobPostdatesClose' = jobPostdatesClose,
+    streakWallAge' = streakWallAge,
     pendingClose' = pendingClose,
     obsLive' = obsLive,
   }
@@ -1393,6 +1484,7 @@ module spawnCoherence {
     seenOpen' = seenOpen,
     exhausted' = exhausted,
     streak' = streak, ownGatedTicks' = ownGatedTicks, jobPostdatesClose' = jobPostdatesClose,
+    streakWallAge' = streakWallAge,
     pendingClose' = pendingClose,
     obsLive' = obsLive,
   }
@@ -1418,6 +1510,7 @@ module spawnCoherence {
     exhausted' = INTENTS.mapBy(i => false),
     streak' = INTENTS.mapBy(i => 0),
     ownGatedTicks' = INTENTS.mapBy(i => 0),
+    streakWallAge' = INTENTS.mapBy(i => 0),
     jobPostdatesClose' = INTENTS.mapBy(i => false),
     pendingClose' = INTENTS.mapBy(i => false),
     obsLive' = INTENTS.mapBy(i => false),
@@ -1452,6 +1545,16 @@ module spawnCoherence {
           Set(VForeignStreakWipe)
         else Set()),
       ownGatedTicks' = ownGatedTicks,
+      // m073 cadence ghost: B's tick is not A's wall — no age
+      // advance. Under pool-keying B touches no streak, so the ages
+      // stand; under the as-built shared map the ages follow B's
+      // fold (a B-birth starts at 0, a B-reset clears).
+      streakWallAge' =
+        if (ENABLE_STREAK_POOL_KEY) streakWallAge
+        else INTENTS.mapBy(i =>
+          if (not(bGated.contains(i))) 0
+          else if (streak.get(i) == 0) 0
+          else streakWallAge.get(i)),
       jobPostdatesClose' = jobPostdatesClose,
       queued' = queued, intentFp' = intentFp, job' = job, execr' = execr,
       leaderOld' = leaderOld, gate' = gate, dispatched' = dispatched,
@@ -1529,7 +1632,10 @@ module spawnCoherenceBase {
     ENABLE_MULTI_POOL = false,
     ENABLE_STREAK_POOL_KEY = false,
     ENABLE_CANCEL_GENERATION = false,
-    ENABLE_RETRY_BACKOFF = false
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2
   ).*
 }
 
@@ -1555,7 +1661,10 @@ module spawnCoherenceFaultRpc {
     ENABLE_MULTI_POOL = false,
     ENABLE_STREAK_POOL_KEY = false,
     ENABLE_CANCEL_GENERATION = false,
-    ENABLE_RETRY_BACKOFF = false
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2
   ).*
 }
 
@@ -1582,7 +1691,10 @@ module spawnCoherenceFaultLease {
     ENABLE_MULTI_POOL = false,
     ENABLE_STREAK_POOL_KEY = false,
     ENABLE_CANCEL_GENERATION = false,
-    ENABLE_RETRY_BACKOFF = false
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2
   ).*
 }
 
@@ -1609,7 +1721,10 @@ module spawnCoherenceFaultStale {
     ENABLE_MULTI_POOL = false,
     ENABLE_STREAK_POOL_KEY = false,
     ENABLE_CANCEL_GENERATION = false,
-    ENABLE_RETRY_BACKOFF = false
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2
   ).*
 }
 
@@ -1636,7 +1751,10 @@ module spawnCoherenceCrdAbsent {
     ENABLE_MULTI_POOL = false,
     ENABLE_STREAK_POOL_KEY = false,
     ENABLE_CANCEL_GENERATION = false,
-    ENABLE_RETRY_BACKOFF = false
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2
   ).*
 }
 
@@ -1662,7 +1780,10 @@ module spawnCoherenceFetcher {
     ENABLE_MULTI_POOL = false,
     ENABLE_STREAK_POOL_KEY = false,
     ENABLE_CANCEL_GENERATION = false,
-    ENABLE_RETRY_BACKOFF = false
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2
   ).*
 }
 
@@ -1692,7 +1813,10 @@ module spawnCoherenceMatJobs {
     ENABLE_MULTI_POOL = false,
     ENABLE_STREAK_POOL_KEY = false,
     ENABLE_CANCEL_GENERATION = false,
-    ENABLE_RETRY_BACKOFF = false
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2
   ).*
 }
 
@@ -1723,7 +1847,10 @@ module spawnCoherenceRenderedDeadline {
     ENABLE_MULTI_POOL = false,
     ENABLE_STREAK_POOL_KEY = false,
     ENABLE_CANCEL_GENERATION = false,
-    ENABLE_RETRY_BACKOFF = false
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2
   ).*
 }
 
@@ -1750,7 +1877,10 @@ module spawnCoherenceExhaustAsBuilt {
     ENABLE_MULTI_POOL = false,
     ENABLE_STREAK_POOL_KEY = false,
     ENABLE_CANCEL_GENERATION = false,
-    ENABLE_RETRY_BACKOFF = false
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2
   ).*
 }
 
@@ -1778,7 +1908,10 @@ module spawnCoherenceExhaustPersist {
     ENABLE_MULTI_POOL = false,
     ENABLE_STREAK_POOL_KEY = false,
     ENABLE_CANCEL_GENERATION = false,
-    ENABLE_RETRY_BACKOFF = false
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2
   ).*
 }
 
@@ -1805,7 +1938,10 @@ module spawnCoherenceCancelAsBuilt {
     ENABLE_MULTI_POOL = false,
     ENABLE_STREAK_POOL_KEY = false,
     ENABLE_CANCEL_GENERATION = false,
-    ENABLE_RETRY_BACKOFF = false
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2
   ).*
 }
 
@@ -1832,7 +1968,10 @@ module spawnCoherenceCancelCause {
     ENABLE_MULTI_POOL = false,
     ENABLE_STREAK_POOL_KEY = false,
     ENABLE_CANCEL_GENERATION = false,
-    ENABLE_RETRY_BACKOFF = false
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2
   ).*
 }
 
@@ -1863,7 +2002,10 @@ module spawnCoherenceReapYoungLeader {
     ENABLE_MULTI_POOL = false,
     ENABLE_STREAK_POOL_KEY = false,
     ENABLE_CANCEL_GENERATION = false,
-    ENABLE_RETRY_BACKOFF = false
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2
   ).*
 }
 
@@ -1891,7 +2033,10 @@ module spawnCoherenceSynthCloseAsBuilt {
     ENABLE_MULTI_POOL = false,
     ENABLE_STREAK_POOL_KEY = false,
     ENABLE_CANCEL_GENERATION = false,
-    ENABLE_RETRY_BACKOFF = false
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2
   ).*
 }
 
@@ -1919,7 +2064,10 @@ module spawnCoherenceSynthClosePinned {
     ENABLE_MULTI_POOL = false,
     ENABLE_STREAK_POOL_KEY = false,
     ENABLE_CANCEL_GENERATION = false,
-    ENABLE_RETRY_BACKOFF = false
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2
   ).*
 }
 
@@ -1946,7 +2094,10 @@ module spawnCoherenceRetryBackoff {
     ENABLE_MULTI_POOL = false,
     ENABLE_STREAK_POOL_KEY = false,
     ENABLE_CANCEL_GENERATION = false,
-    ENABLE_RETRY_BACKOFF = true
+    ENABLE_RETRY_BACKOFF = true,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2
   ).*
 }
 
@@ -1976,7 +2127,10 @@ module spawnCoherenceMultiPoolAsBuilt {
     ENABLE_MULTI_POOL = true,
     ENABLE_STREAK_POOL_KEY = false,
     ENABLE_CANCEL_GENERATION = false,
-    ENABLE_RETRY_BACKOFF = false
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2
   ).*
 }
 
@@ -2004,7 +2158,10 @@ module spawnCoherenceMultiPool {
     ENABLE_MULTI_POOL = true,
     ENABLE_STREAK_POOL_KEY = true,
     ENABLE_CANCEL_GENERATION = false,
-    ENABLE_RETRY_BACKOFF = false
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2
   ).*
 }
 
@@ -2034,7 +2191,10 @@ module spawnCoherenceCancelGenAsBuilt {
     ENABLE_MULTI_POOL = false,
     ENABLE_STREAK_POOL_KEY = false,
     ENABLE_CANCEL_GENERATION = false,
-    ENABLE_RETRY_BACKOFF = false
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2
   ).*
 }
 
@@ -2061,6 +2221,51 @@ module spawnCoherenceCancelGeneration {
     ENABLE_MULTI_POOL = false,
     ENABLE_STREAK_POOL_KEY = false,
     ENABLE_CANCEL_GENERATION = true,
-    ENABLE_RETRY_BACKOFF = false
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2
+  ).*
+}
+
+/// m073 HOLD half (bughunt-4 S1a): the wall-clock cadence floor over
+/// the exhaust-persist alphabet — fold-skip retains and a wall that
+/// may stand still. The poison verdict carries the floor conjunct
+/// (STREAK_FLOOR_ENFORCED): a burst of reconcile ticks inside one
+/// wall instant can step the streak to the threshold but can never
+/// fire the verdict — poisonRespectsWallFloor holds. The
+/// merged_bug_117 own-count/wipe laws keep their OWN exhaustive
+/// regime (spawnCoherenceMultiPool): the MULTI_POOL x CADENCE product
+/// is TLC-infeasible (measured: 2,347,503,711 generated /
+/// 108,632,544 distinct / 38.6M queue still growing at the 1800s
+/// budget kill) and the floor law does not interact with pool keying
+/// — the verdict predicate is per-intent over the OWN-pool streak
+/// either way. The falsify twin (calibration/controller-073-burst.qnt)
+/// binds ENFORCED=false: the clock is tracked but the verdict stays
+/// floor-blind (the as-built law) — VPoisonBurst latches.
+module spawnCoherenceStreakCadence {
+  import spawnCoherence(
+    IS_BUILDER = true,
+    CRD_PRESENT = true,
+    CEILING = 1,
+    ENABLE_RPC_FAULT = false,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = false,
+    ENABLE_RENDERED_DEADLINE = false,
+    ENABLE_EXHAUST_POISON = true,
+    ENABLE_EXHAUST_PERSIST = true,
+    ENABLE_CANCEL_ASBUILT = false,
+    ENABLE_CANCEL_CAUSE = false,
+    ENABLE_YOUNG_LEADER_REAP = false,
+    ENABLE_SYNTH_CLOSE = false,
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_MULTI_POOL = false,
+    ENABLE_STREAK_POOL_KEY = false,
+    ENABLE_CANCEL_GENERATION = false,
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = true,
+    STREAK_FLOOR_ENFORCED = true,
+    STREAK_FLOOR = 2
   ).*
 }

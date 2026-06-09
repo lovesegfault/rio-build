@@ -1794,3 +1794,34 @@ in 56 s on the CI builder — inside the per-check budget with margin.
   (`mint_persists_dispatched_deadline_and_view_returns_it`) plus the
   `wedgeEvidence` proptest plane — NOT a VM subtest. Revisit only if
   the slack floor drops.
+
+## bughunt-4 S1a — m073 cadence axis + m298 disposition (2026-06-08)
+
+- **m073 wall-clock floor (Model J `ENABLE_STREAK_CADENCE` /
+  `STREAK_FLOOR_ENFORCED` / `STREAK_FLOOR`):** the poison verdict now
+  spans at least `STREAK_FLOOR` wall units from the streak's first
+  gated observation (`streakWallAge` is born 0 at the streak's birth
+  tick, grows with the nondet wall advance — which may stand still
+  across ticks, the burst — saturates at the floor to keep TLC
+  finite, and resets with the streak; a fold-skip tick retains the
+  streak without stepping it — the retain-without-step edge — while
+  the age keeps growing). HOLD: `poisonRespectsWallFloor` in
+  `spawnCoherenceStreakCadence` (full exhaustion alphabet: pool-keyed
+  streaks + second pool + cadence, the merged_bug_117 laws re-measured
+  there). FALSIFY: `calibration/controller-073-burst.qnt` binds
+  ENFORCED=false (clock tracked, verdict floor-blind — the as-built
+  law); a burst trace latches `VPoisonBurst`. The enforcement conjunct
+  and the latch test the SAME predicate — enforcement empties the
+  latch by construction (the machine witness). Ghost frozen off-axis
+  per the TRACK_EPISODE_GHOSTS precedent; `spawnCoherenceBase`
+  byte-identity re-measured at the gating backend (count recorded in
+  the introducing commit).
+- **m298 (synthesized-verdict executor binding) — n/a-with-reason:**
+  Model J keys Jobs by intent (`jobsAtList: IntentId -> record`, one
+  Job per intent); the m298 defect class — TWO Jobs for one intent
+  across a respawn boundary, the synthesized close resolved against
+  the wrong executor's attempt — is BELOW model granularity. The
+  binding is carried by the Rust chokepoint (`AttemptOwner` required
+  parameter: an owner-less synthesized close does not typecheck) and
+  its red-first pair (`left: "exec-a" / right: "exec-b"`). The work
+  order sanctions this disposition explicitly; no model change.

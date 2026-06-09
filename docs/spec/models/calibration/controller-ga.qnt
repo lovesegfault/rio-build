@@ -44,7 +44,10 @@ module gaCalibNoLiveRecheck {
     ENABLE_MULTI_POOL = false,
     ENABLE_STREAK_POOL_KEY = false,
     ENABLE_CANCEL_GENERATION = false,
-    ENABLE_RETRY_BACKOFF = false
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2
   ).* from "../spawnCoherence"
 
   /// The as-built tick with ONE change: the live pod-phase re-check is
@@ -230,6 +233,7 @@ module gaCalibNoLiveRecheck {
       seenOpen' = seenOpen,
       exhausted' = exhausted,
       streak' = streak,
+      streakWallAge' = streakWallAge,
       ownGatedTicks' = ownGatedTicks,
       jobPostdatesClose' = jobPostdatesClose,
       pendingClose' = pendingClose,
@@ -296,7 +300,10 @@ module gaCalibOrphanGateEmptyOk {
     ENABLE_MULTI_POOL = false,
     ENABLE_STREAK_POOL_KEY = false,
     ENABLE_CANCEL_GENERATION = false,
-    ENABLE_RETRY_BACKOFF = false
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2
   ).* from "../spawnCoherence"
 
   /// The as-built tick with ONE change: the orphan-reap decision uses a
@@ -488,6 +495,7 @@ module gaCalibOrphanGateEmptyOk {
       seenOpen' = seenOpen,
       exhausted' = exhausted,
       streak' = streak,
+      streakWallAge' = streakWallAge,
       ownGatedTicks' = ownGatedTicks,
       jobPostdatesClose' = jobPostdatesClose,
       pendingClose' = pendingClose,
@@ -554,7 +562,10 @@ module gaCalibCrdAbsentArmed {
     ENABLE_MULTI_POOL = false,
     ENABLE_STREAK_POOL_KEY = false,
     ENABLE_CANCEL_GENERATION = false,
-    ENABLE_RETRY_BACKOFF = false
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2
   ).* from "../spawnCoherence"
 
   /// PRE-FIX gate retain: the crd-absent arm arms the gate (pass-through
@@ -757,6 +768,7 @@ module gaCalibCrdAbsentArmed {
       seenOpen' = seenOpen,
       exhausted' = exhausted,
       streak' = streak,
+      streakWallAge' = streakWallAge,
       ownGatedTicks' = ownGatedTicks,
       jobPostdatesClose' = jobPostdatesClose,
       pendingClose' = pendingClose,

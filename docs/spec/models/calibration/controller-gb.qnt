@@ -39,7 +39,10 @@ module gbCalibAckAttempted {
     ENABLE_MULTI_POOL = false,
     ENABLE_STREAK_POOL_KEY = false,
     ENABLE_CANCEL_GENERATION = false,
-    ENABLE_RETRY_BACKOFF = false
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2
   ).* from "../spawnCoherence"
 
   /// The as-built tick with ONE change: the ack covers the attempted
@@ -224,6 +227,7 @@ module gbCalibAckAttempted {
       seenOpen' = seenOpen,
       exhausted' = exhausted,
       streak' = streak,
+      streakWallAge' = streakWallAge,
       ownGatedTicks' = ownGatedTicks,
       jobPostdatesClose' = jobPostdatesClose,
       pendingClose' = pendingClose,
@@ -291,7 +295,10 @@ module gbCalibAckOnlyNew {
     ENABLE_MULTI_POOL = false,
     ENABLE_STREAK_POOL_KEY = false,
     ENABLE_CANCEL_GENERATION = false,
-    ENABLE_RETRY_BACKOFF = false
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2
   ).* from "../spawnCoherence"
 
   /// The as-built tick with ONE change: only the spawned-this-tick set is
@@ -476,6 +483,7 @@ module gbCalibAckOnlyNew {
       seenOpen' = seenOpen,
       exhausted' = exhausted,
       streak' = streak,
+      streakWallAge' = streakWallAge,
       ownGatedTicks' = ownGatedTicks,
       jobPostdatesClose' = jobPostdatesClose,
       pendingClose' = pendingClose,

@@ -45,7 +45,10 @@ module ctrlCalib282BackoffIgnored {
     ENABLE_MULTI_POOL = false,
     ENABLE_STREAK_POOL_KEY = false,
     ENABLE_CANCEL_GENERATION = false,
-    ENABLE_RETRY_BACKOFF = true
+    ENABLE_RETRY_BACKOFF = true,
+    ENABLE_STREAK_CADENCE = false,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2
   ).* from "../spawnCoherence"
 
   /// PRE-FIX spawn edge: the backoff conjunct dropped (everything
