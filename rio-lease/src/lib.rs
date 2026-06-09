@@ -1134,6 +1134,34 @@ fn observe_held_while_believing<H: LeaseHooks>(
     standing.on_observed(true);
 }
 
+/// Machine witness for the believing→not-believing lose edge on a
+/// COMPLETED round (`sched.lease.holder-evidenced-lose`): the lose-edge
+/// body is reachable only through a value of this type, and the two
+/// constructors are the two evidence shapes the signed decision admits.
+/// A bare first 409 has NO constructor — its only arm is the one-round
+/// deferral, which runs no lose edge. (Self-fence and cooperative
+/// step-down are separate, non-completed-round edges with their own
+/// laws.)
+///
+/// SIGNED 2026-06-08 (owner, bughunt-4 fix-wave §5-S Q3): holder-
+/// evidenced lose — a 409 defers one round; the lose edge requires the
+/// next GET to name a DIFFERENT holder (typed evidence on the edge).
+/// Cost accepted: ~seconds of deferred step-down in true-loss cases,
+/// vs eliminating spurious DAG/outbox wipes on own-write races.
+/// Formal: leaderElection.qnt `loseRequiresHolderEvidence` invariant +
+/// falsify twin (lease-085-blind-conflict-lose).
+enum CompletedLoseEvidence {
+    /// A completed read resolved Standby: the apiserver named another
+    /// holder (or the observed record says the holder is fresh and it
+    /// is not us). Direct holder evidence.
+    AnotherHolderObserved,
+    /// Two consecutive believing rounds bounced our CAS: the one-round
+    /// deferral the signed decision grants is exhausted. Bounded
+    /// indirect evidence — retaining belief longer would erode the
+    /// NeverDual fence/steal separation.
+    ConflictDeferralExhausted,
+}
+
 pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
     client: kube::Client,
     cfg: LeaseConfig,
@@ -1221,6 +1249,12 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
     // committing (merged_bug_180).
     let mut unconfirmed: Option<UnconfirmedPut> = None;
     let mut last_fetched_renew_time: Option<Option<String>> = None;
+    // Q3 deferral flag: a believing renew 409 has been observed and its
+    // resolution is owed to the NEXT completed read. Set only by the
+    // deferral arm; cleared by every resolving arm (acquire, lose,
+    // still-leading observe, standby observe). One round deep by
+    // construction — a second consecutive believing 409 exhausts it.
+    let mut conflict_deferred = false;
     let mut interval = tokio::time::interval(RENEW_INTERVAL);
     // Skip: if one renewal is slow (apiserver busy), don't fire
     // twice immediately. SELF_FENCE_AFTER is 11s; we have slack.
@@ -1321,24 +1355,29 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
             election::RenewOutcome::Completed { result, facts } => {
                 // Successful round-trip (apiserver answered). Even
                 // Standby/Conflict restart the blind window — we KNOW
-                // the apiserver state, we just don't hold the lease.
+                // the apiserver answered, we just don't hold the lease.
                 // The clock tracks "am I blind", not "am I leader".
                 blind.stamp(attempt_anchor);
-                // A completed round answers the unconfirmed question
-                // wholesale: the fresh stamp supersedes the ledger's
-                // older anchor, and the apiserver state (whoever holds)
-                // is now known — there is nothing left in doubt.
-                unconfirmed = None;
+                let is_conflict = matches!(result, ElectionResult::Conflict);
+                // Leading/Standby answer the unconfirmed question
+                // wholesale: their facts describe the post-resolution
+                // state, so nothing of ours is left in doubt. A 409
+                // does NOT — it proves only that the rv moved between
+                // our GET and PUT, and the mover may be our own zombie
+                // commit from the cancelled-write ledger (or a foreign
+                // metadata patch). The ledger survives a Conflict so
+                // the NEXT completed read can consume it as own-commit
+                // evidence (sched.lease.holder-evidenced-lose).
+                if !is_conflict {
+                    unconfirmed = None;
+                }
                 last_fetched_renew_time = facts.map(|f| f.renew_time);
-                // Conflict on renew = someone stole since our GET
-                // → unambiguous lose. Conflict on steal = another
-                // standby raced us → we were never leading. Both
-                // map to now_leading=false; was_leading edge-
-                // detection below distinguishes the lose case.
-                //
-                // Leading carries the lease's transition count so the
-                // acquire arm can derive the generation from it;
-                // None ⇔ not leading.
+                // Conflict on renew = the CAS bounced; WHO holds is
+                // unknown until the next read (the deferral arm below).
+                // Conflict on steal = another standby raced us → we
+                // were never leading, nothing to defer. Leading carries
+                // the lease's transition count so the acquire arm can
+                // derive the generation from it; None ⇔ not leading.
                 let leading_transitions = match result {
                     ElectionResult::Leading { transitions } => Some(transitions),
                     ElectionResult::Standby | ElectionResult::Conflict => None,
@@ -1397,43 +1436,101 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                         // renewing regardless.
                         hooks.on_acquire();
                         standing.on_observed(true);
+                        // An acquire resolves any pending deferral —
+                        // a new belief episode starts clean.
+                        conflict_deferred = false;
                     }
                     (None, true) => {
-                        // ---- Lose transition ----
-                        // Someone else acquired (we couldn't renew in
-                        // time). Stop dispatching. The generation is
-                        // the NEW leader's concern — it derives its
-                        // own from the lease's transition count on
-                        // acquire. on_lose clears both is_leader and
-                        // recovery_complete (SeqCst): if we
-                        // re-acquire, recovery runs again — the
-                        // other replica's actions may have changed PG.
-                        state.on_lose();
-                        warn!(
-                            holder = %cfg.holder_id,
-                            "lost leadership (another replica acquired)"
-                        );
+                        // ---- Lose-or-defer ----
+                        // r[impl sched.lease.holder-evidenced-lose]
+                        // The lose edge demands a CompletedLoseEvidence
+                        // witness (see its doc + the SIGNED Q3 block):
+                        // a completed read naming another holder, or an
+                        // exhausted one-round 409 deferral. A bare
+                        // first 409 constructs neither — it defers.
+                        let evidence: Option<CompletedLoseEvidence> = if !is_conflict {
+                            // Standby resolution: the read named a
+                            // fresh foreign holder (or an empty/stale
+                            // one we chose not to steal) — direct
+                            // holder evidence either way: the lease
+                            // provably no longer resolves to us.
+                            Some(CompletedLoseEvidence::AnotherHolderObserved)
+                        } else if conflict_deferred {
+                            Some(CompletedLoseEvidence::ConflictDeferralExhausted)
+                        } else {
+                            None
+                        };
+                        match evidence {
+                            Some(evidence) => {
+                                // ---- Lose transition ----
+                                // Stop dispatching. The generation is
+                                // the NEW leader's concern — it derives
+                                // its own from the lease's transition
+                                // count on acquire. on_lose clears both
+                                // is_leader and recovery_complete
+                                // (SeqCst): if we re-acquire, recovery
+                                // runs again — the other replica's
+                                // actions may have changed PG.
+                                state.on_lose();
+                                match evidence {
+                                    CompletedLoseEvidence::AnotherHolderObserved => warn!(
+                                        holder = %cfg.holder_id,
+                                        "lost leadership (a completed read named another holder)"
+                                    ),
+                                    CompletedLoseEvidence::ConflictDeferralExhausted => warn!(
+                                        holder = %cfg.holder_id,
+                                        "lost leadership (two consecutive renew 409s — the \
+                                         one-round holder-evidence deferral is exhausted)"
+                                    ),
+                                }
 
-                        // r[impl sched.lease.standby-tick-noop+2]
-                        // Symmetric with on_acquire above: fire the
-                        // per-component on-lose hook (metrics + actor
-                        // notification). Same non-blocking constraint.
-                        // is_leader is already false (above) so the
-                        // consumer's tick early-returns regardless;
-                        // this just lets it drop stale state and zero
-                        // leader-only gauges.
-                        hooks.on_lose();
+                                // r[impl sched.lease.standby-tick-noop+2]
+                                // Symmetric with on_acquire above: fire
+                                // the per-component on-lose hook
+                                // (metrics + actor notification). Same
+                                // non-blocking constraint. is_leader is
+                                // already false (above) so the
+                                // consumer's tick early-returns
+                                // regardless; this just lets it drop
+                                // stale state and zero leader-only
+                                // gauges.
+                                hooks.on_lose();
 
-                        // The leader marks must be cleared — we're
-                        // standby now: K8s should prefer to kill us
-                        // over the new leader, and the leader-only
-                        // Service must stop routing to us (the
-                        // dashboard's RPCs would land here as
-                        // Trailers-Only Unavailable otherwise). The
-                        // reconcile arm after the edge match patches
-                        // this tick.
-                        marks_dirty.mark();
-                        standing.on_observed(false);
+                                // The leader marks must be cleared —
+                                // we're standby now: K8s should prefer
+                                // to kill us over the new leader, and
+                                // the leader-only Service must stop
+                                // routing to us (the dashboard's RPCs
+                                // would land here as Trailers-Only
+                                // Unavailable otherwise). The reconcile
+                                // arm after the edge match patches this
+                                // tick.
+                                marks_dirty.mark();
+                                standing.on_observed(false);
+                                conflict_deferred = false;
+                            }
+                            None => {
+                                // ---- One-round deferral ----
+                                // Belief, the hold, and the ledger all
+                                // survive: nothing is wiped on a CAS
+                                // bounce that may be our own write
+                                // committing. No hooks, no marks — no
+                                // transition happened. The NEXT
+                                // completed read resolves: holder=us →
+                                // ordinary renew (or own-commit
+                                // evidence on the act-failed path);
+                                // holder=other → lose WITH evidence;
+                                // another 409 → exhausted, lose.
+                                conflict_deferred = true;
+                                warn!(
+                                    holder = %cfg.holder_id,
+                                    "renew 409 while believing: rv moved but the holder is \
+                                     unknown — deferring the lose edge one round for holder \
+                                     evidence (own zombie commit and foreign metadata writes \
+                                     are non-lose rv-movers)"
+                                );
+                            }
+                        }
                     }
                     (Some(transitions), true) => {
                         // ---- Still leading ----
@@ -1449,11 +1546,17 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                             &cfg.holder_id,
                             transitions,
                         );
+                        // A still-leading resolution clears a pending
+                        // deferral — the 409's question is answered.
+                        conflict_deferred = false;
                     }
                     // Steady state: still standby while someone else
-                    // holds. No log — 5s interval would be noisy.
+                    // holds (or a 409 raced our steal — we were never
+                    // leading, nothing to defer). No log — 5s interval
+                    // would be noisy.
                     (None, false) => {
                         standing.on_observed(false);
+                        conflict_deferred = false;
                     }
                 }
                 // r[impl sched.recovery.bump-confirm+3]
@@ -3883,6 +3986,243 @@ mod tests {
         shutdown.cancel();
         if let Some(req) = park.try_next().await {
             req.respond_status(404, "NotFound", "gone");
+        }
+        loop_task.await.expect("lease loop exits");
+    }
+
+    /// Shared choreography for the Q3 holder-evidenced-lose tests:
+    /// healthy acquire (round 1), a transmitted-then-dropped renew that
+    /// arms the cancelled-write ledger (round 2), then a renew 409
+    /// (round 3) — the ambiguous CAS bounce whose rv-mover may be our
+    /// own round-2 zombie commit. Returns after the 409 response is
+    /// delivered and the loop has settled.
+    async fn drive_to_believing_409(park: &mut RequestPark, state: &LeaderState) {
+        // Round 1 (healthy): acquire.
+        let get = park.next().await;
+        assert!(get.path.contains("/leases/rio-sched"));
+        get.respond_ok(park_lease_json(Some("us"), 3, 10));
+        let put = park.next().await;
+        put.respond_ok(park_lease_json(Some("us"), 3, 11));
+        settle().await;
+        assert!(state.is_leader(), "healthy round acquires");
+        let patch = park.next().await;
+        assert!(patch.path.contains("/pods/us"), "marks reconcile PATCH");
+        patch.respond_ok(pod_ok("us"));
+        settle().await;
+
+        // Round 2 (zombie): the read completes, the renew PUT is
+        // transmitted and dropped — it may still commit server-side.
+        // The ledger arms at this round's anchor.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 11));
+        let put = park.next().await;
+        drop(put);
+        settle().await;
+        assert!(state.is_leader(), "an act failure alone never loses");
+
+        // Round 3 (the ambiguous 409): the GET still serves the
+        // pre-zombie view; the zombie commits inside the GET→PUT
+        // window, so the PUT bounces. The 409 proves rv movement —
+        // NOT a holder change.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 11));
+        let put = park.next().await;
+        put.respond_status(409, "Conflict", "the object has been modified");
+        settle().await;
+    }
+
+    /// Q3 (bughunt-4 §5-S, SIGNED): a renew 409 while believing is a
+    /// CAS bounce, not holder evidence — our own zombie commit from a
+    /// cancelled write (round 2 here) and a foreign metadata-only patch
+    /// both move the rv while we remain holder. The first believing 409
+    /// must DEFER one round instead of running the lose edge; the next
+    /// completed read naming us resolves the deferral as a renew. The
+    /// old immediate-lose wiped the DAG/outbox and bounced the leader
+    /// marks on what was provably our own write.
+    // r[verify sched.lease.holder-evidenced-lose]
+    #[tokio::test(start_paused = true)]
+    async fn believing_409_defers_for_holder_evidence_then_renews() {
+        let (client, mut park) = RequestPark::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        drive_to_believing_409(&mut park, &state).await;
+
+        // THE Q3 ASSERTION: the ambiguous 409 deferred — belief, the
+        // hold, and the ledger survive; no lose edge ran.
+        assert!(
+            state.is_leader(),
+            "a believing 409 with no holder evidence must defer, not lose \
+             (the rv-mover may be our own zombie commit)"
+        );
+        assert_eq!(
+            hooks.loses.lock().expect("loses lock").len(),
+            0,
+            "no lose edge may run on a bare CAS bounce"
+        );
+
+        // Round 4 (resolution): the next GET shows the zombie DID
+        // commit — rv and renewTime moved, holder is still us. The
+        // deferred round resolves as an ordinary renew.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 12));
+        let put = park.next().await;
+        put.respond_ok(park_lease_json(Some("us"), 3, 13));
+        settle().await;
+
+        assert!(state.is_leader(), "holder=us resolution renews");
+        assert_eq!(
+            hooks.loses.lock().expect("loses lock").len(),
+            0,
+            "deferred-renew: the spurious failover is gone"
+        );
+        assert_eq!(
+            hooks.acquires.lock().expect("acquires lock").len(),
+            1,
+            "belief was never dropped, so no second acquire edge fires"
+        );
+
+        shutdown.cancel();
+        if let Some(req) = park.try_next().await {
+            req.respond_status(404, "NotFound", "gone");
+        }
+        loop_task.await.expect("lease loop exits");
+    }
+
+    /// Q3 bound: the deferral is ONE round. A second consecutive
+    /// believing 409 exhausts it and runs the lose edge — that bound is
+    /// what keeps the NeverDual fence/steal separation intact (an
+    /// unbounded deferral under every-round CAS bounces would retain
+    /// belief past a standby's steal).
+    // r[verify sched.lease.holder-evidenced-lose]
+    #[tokio::test(start_paused = true)]
+    async fn second_consecutive_believing_409_loses_with_deferral_exhausted() {
+        let (client, mut park) = RequestPark::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        drive_to_believing_409(&mut park, &state).await;
+        assert!(
+            state.is_leader(),
+            "first believing 409 defers (red against the immediate-lose law)"
+        );
+
+        // Round 4: ANOTHER 409 — the deferral is exhausted; the lose
+        // edge runs with bounded evidence (two consecutive completed
+        // rounds bounced our CAS).
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 11));
+        let put = park.next().await;
+        put.respond_status(409, "Conflict", "the object has been modified");
+        settle().await;
+
+        assert!(
+            !state.is_leader(),
+            "the second consecutive believing 409 exhausts the deferral and loses"
+        );
+        assert_eq!(
+            hooks.loses.lock().expect("loses lock").len(),
+            1,
+            "exactly one lose edge, at deferral exhaustion"
+        );
+
+        shutdown.cancel();
+        for _ in 0..3 {
+            if let Some(req) = park.try_next().await {
+                req.respond_status(404, "NotFound", "gone");
+            }
+        }
+        loop_task.await.expect("lease loop exits");
+    }
+
+    /// Q3 evidence path: a deferred 409 whose next completed read names
+    /// a DIFFERENT holder loses WITH holder evidence — the typed lose
+    /// edge the signed decision demands.
+    // r[verify sched.lease.holder-evidenced-lose]
+    #[tokio::test(start_paused = true)]
+    async fn deferred_409_resolving_to_foreign_holder_loses_with_evidence() {
+        let (client, mut park) = RequestPark::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        drive_to_believing_409(&mut park, &state).await;
+        assert!(state.is_leader(), "first believing 409 defers");
+
+        // Round 4: the GET names another holder — the rv-mover was a
+        // genuine steal. The lose edge runs, with evidence.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("other"), 4, 12));
+        settle().await;
+
+        assert!(
+            !state.is_leader(),
+            "a completed read naming another holder is the evidence the lose edge requires"
+        );
+        assert_eq!(
+            hooks.loses.lock().expect("loses lock").len(),
+            1,
+            "exactly one lose edge, with holder evidence"
+        );
+
+        shutdown.cancel();
+        for _ in 0..3 {
+            if let Some(req) = park.try_next().await {
+                req.respond_status(404, "NotFound", "gone");
+            }
         }
         loop_task.await.expect("lease loop exits");
     }

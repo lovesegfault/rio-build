@@ -3571,8 +3571,13 @@ CREATE INDEX assignments_builder_idx ON assignments (builder_id, status);
   `kube::Api::replace()` (HTTP PUT) with `metadata.resourceVersion` from the
   preceding GET. The apiserver rejects with 409 Conflict if the lease changed
   between GET and PUT --- exactly one of N racing writers succeeds. A 409 on
-  renew is treated as an immediate lose transition (someone stole the lease
-  since our GET); a 409 on steal means another standby raced and won.
+  renew proves only that the resourceVersion moved --- the mover may be the
+  leader's own cancelled-then-committed write or a foreign metadata-only
+  patch --- so the loop defers one round and the next completed read resolves
+  it: holder still us → renew; another holder → lose with holder evidence; a
+  second consecutive 409 → lose with the deferral exhausted (the bound that
+  keeps the fence/steal separation intact). A 409 on steal means another
+  standby raced and won.
 - *Observed-record expiry:* A standby does not compare the lease's `renewTime`
   against its own wall clock (cross-node skew would make that unreliable).
   Instead, it records the holder-authored spec content --- `holderIdentity`
@@ -3956,8 +3961,9 @@ an acquire nor a lose edge ever fires locally; one `kubectl delete lease`
 during a renew-blind window shorter than the self-fence deadline suffices.
 While this replica holds continuously, only a holder change or a
 delete/recreate can move `leaseTransitions` (renews never write it), and a
-foreign holder still present at the next successful round resolves
-Standby/Conflict through the existing lose edge --- so an unequal count on a
+foreign holder still present at the next completed read resolves through the
+holder-evidenced lose edge (a Standby resolution, or a 409 whose one-round
+deferral expires against it) --- so an unequal count on a
 still-leading round is always a genuine discontinuity, and the cost of acting
 on one is a single recovery re-run with dispatch gated during it. The
 dedicated hook (rather than a re-fired acquire) is what lets consumers run
@@ -3980,6 +3986,24 @@ counters (#(refs.metric)("rio_scheduler_lease_rebound_total"),
 #(refs.metric)("rio_controller_lease_rebound_total"));
 #(refs.metric)("rio_scheduler_lease_acquired_total") counts acquire edges
 only.
+
+#r("sched.lease.holder-evidenced-lose")[
+  A renew 409 observed while this replica believes it leads MUST NOT run the
+  lose transition by itself: the 409 proves only resourceVersion movement,
+  whose mover may be this replica's own cancelled-then-committed write or a
+  foreign non-protocol patch. The loop MUST defer exactly one round, keeping
+  belief, the hold, and the cancelled-write ledger intact, and the completed-
+  round lose transition MUST require holder evidence: a completed read
+  resolving to another holder, or a second consecutive believing 409
+  exhausting the one-round deferral.
+]
+
+The one-round bound is what preserves the fence/steal separation: an
+unbounded deferral under every-round CAS bounces would retain belief past a
+standby's steal. The deferral applies to the *believing* renew path only ---
+a 409 racing a steal resolves as never-led, with nothing to defer. (Owner
+decision: bughunt-4 fix-wave §5-S Q3, signed 2026-06-08; the dated SIGNED
+block sits at the lose-edge arm in `rio-lease/src/lib.rs`.)
 
 #r("sched.lease.cancelled-write+2")[
   A lease write abandoned by a client-side deadline MUST be treated as

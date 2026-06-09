@@ -69,17 +69,21 @@ pub enum ElectionResult {
     /// elapsed yet. Steady state for a standby — no log.
     Standby,
     /// We tried to `replace()` and the apiserver returned 409.
-    /// Someone else mutated the lease between our GET and PUT.
+    /// Someone (or some write of OURS that we cancelled) mutated the
+    /// lease between our GET and PUT.
     ///
-    /// On a **renew** this means we lost leadership — someone stole
-    /// the lease since our GET. Unambiguous lose transition.
+    /// On a **renew** the 409 proves only that the rv moved — NOT that
+    /// the holder changed: our own zombie commit from the
+    /// cancelled-write ledger and a foreign metadata-only patch are
+    /// both non-lose rv-movers. The loop defers one round and lets the
+    /// next completed read resolve who holds
+    /// (`sched.lease.holder-evidenced-lose`).
     ///
     /// On a **steal** this means another standby raced us and won.
     /// We were never leading; next tick's GET reveals the winner.
     ///
-    /// Caller treats both as `now_leading = false`. The lose vs
-    /// never-led distinction is handled by `was_leading` edge
-    /// detection in the loop.
+    /// Caller treats both as `now_leading = false`; the believing
+    /// 409's defer-then-resolve is the loop's edge detection.
     Conflict,
 }
 
