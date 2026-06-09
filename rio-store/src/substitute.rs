@@ -1090,87 +1090,38 @@ impl Substituter {
         // has always claimed. Stalled/RateLimited stay uncounted in
         // this family (typed transients with their own signals), as
         // before.
-        match rio_evidence_kernel::outcome::fold_substitute_loop(cells) {
-            rio_evidence_kernel::outcome::SubstituteLoopVerdict::Stalled { window } => {
-                Err(SubstituteError::Stalled { window })
-            }
-            rio_evidence_kernel::outcome::SubstituteLoopVerdict::RateLimited { retry_after } => {
-                Err(SubstituteError::RateLimited { retry_after })
-            }
-            rio_evidence_kernel::outcome::SubstituteLoopVerdict::Errored => {
-                metrics::counter!(
-                    "rio_store_substitute_total",
-                    "result" => "error",
-                    "tenant" => tenant_id.to_string()
-                )
-                .increment(1);
-                Err(SubstituteError::Fetch(format!(
-                    "no upstream served {store_path} and at least one errored — \
-                     not a definitive miss"
-                )))
-            }
-            rio_evidence_kernel::outcome::SubstituteLoopVerdict::ContentMismatch => {
-                // merged_bug_046: the path IS present upstream with
-                // disagreeing bytes — a typed, UNCACHED content
-                // refusal, never the cacheable miss the content-blind
-                // HEAD confirmation would then contradict into an
-                // infrastructure charge.
-                metrics::counter!(
-                    "rio_store_substitute_total",
-                    "result" => "content_mismatch",
-                    "tenant" => tenant_id.to_string()
-                )
-                .increment(1);
-                Err(SubstituteError::ContentMismatch)
-            }
-            rio_evidence_kernel::outcome::SubstituteLoopVerdict::UntrustedPresent => {
-                // merged_bug_005: the path IS present upstream — a
-                // typed, UNCACHED trust refusal, never the cacheable
-                // miss the sig-blind HEAD confirmation would then
-                // contradict into an infrastructure charge.
-                metrics::counter!(
-                    "rio_store_substitute_total",
-                    "result" => "untrusted",
-                    "tenant" => tenant_id.to_string()
-                )
-                .increment(1);
-                // merged_bug_263 (mirrors merged_bug_016 one arm
-                // over): a cached HEAD positive answers PRESENCE, and
-                // presence is exactly the misleading half of a trust
-                // refusal — a charge-gating confirmation probe
-                // consulting the stale `true` would re-confirm the
-                // doomed path for the rest of the 1h TTL. The refusal
-                // contradicts the cached positive's USEFULNESS, so
-                // evict it; the next probe observes live state.
-                self.probe_cache
-                    .invalidate(&(tenant_id, store_path.to_string()))
-                    .await;
-                Err(SubstituteError::UntrustedPresent)
-            }
-            rio_evidence_kernel::outcome::SubstituteLoopVerdict::CleanMiss => {
-                metrics::counter!(
-                    "rio_store_substitute_total",
-                    "result" => "miss",
-                    "tenant" => tenant_id.to_string()
-                )
-                .increment(1);
-                // merged_bug_016: a fresh EVERY-upstream GET-404
-                // contradicts any cached HEAD positive for this
-                // (tenant, path) — evict it, so a charge-gating
-                // confirmation probe observes live state instead of
-                // a stale `true` for the rest of the 1h TTL
-                // ("present but not ingested" charged the park
-                // budget until the TTL lapsed). Aggregate granularity
-                // is load-bearing: ONE upstream's 404 does not
-                // contradict a positive another upstream produced;
-                // the CleanMiss fold — every upstream answered
-                // hit-or-404 with zero hits — does.
-                self.probe_cache
-                    .invalidate(&(tenant_id, store_path.to_string()))
-                    .await;
-                Ok(None)
-            }
+        // bug_085: ONE driver applies the per-variant effects record —
+        // tick if labeled, evict if the verdict contradicts a cached
+        // HEAD positive, return the outcome. The decisions live in
+        // `verdict_effects`' exhaustive constructor, so a new kernel
+        // verdict cannot ship without explicitly deciding its
+        // cache-eviction bit (the ContentMismatch arm shipped without
+        // one when the effects were copy-paste statements per arm).
+        let effects = verdict_effects(
+            rio_evidence_kernel::outcome::fold_substitute_loop(cells),
+            store_path,
+        );
+        if let Some(result) = effects.result_label {
+            metrics::counter!(
+                "rio_store_substitute_total",
+                "result" => result,
+                "tenant" => tenant_id.to_string()
+            )
+            .increment(1);
         }
+        if effects.evict_probe_positive {
+            // merged_bug_016/263/bug_085: the verdict contradicts any
+            // cached HEAD positive for this (tenant, path) — evict it,
+            // so a charge-gating confirmation probe observes live
+            // state instead of a stale `true` for the rest of the 1h
+            // TTL. Aggregate granularity is load-bearing: the eviction
+            // rides the FOLD verdict (every upstream answered), never
+            // one upstream's opinion.
+            self.probe_cache
+                .invalidate(&(tenant_id, store_path.to_string()))
+                .await;
+        }
+        effects.outcome.map(|()| None)
     }
 
     /// Steps 2-6 for one upstream.
@@ -2181,6 +2132,103 @@ pub struct CheckAvailableResult {
     /// surface merges this back into `indeterminate_paths` — same
     /// optimistic scheduler treatment, no proto change.
     pub rate_limited: Vec<(String, Option<Duration>)>,
+}
+
+/// The per-variant effects of one substitute-loop fold verdict
+/// (bug_085, effects as data): result-counter label, probe-cache
+/// eviction bit, and the attempt outcome — every field MANDATORY, so
+/// a new [`SubstituteLoopVerdict`] variant must decide all three at
+/// compile time instead of inheriting whatever the copy-paste arm it
+/// was cloned from happened to carry (exactly how the ContentMismatch
+/// arm shipped without its eviction).
+///
+/// [`SubstituteLoopVerdict`]: rio_evidence_kernel::outcome::SubstituteLoopVerdict
+struct VerdictEffects {
+    /// `rio_store_substitute_total{result=...}` tick, once per
+    /// singleflight leader (merged_bug_091). `None` = typed transient
+    /// with its own signals (Stalled/RateLimited stay uncounted in
+    /// this family, as always).
+    result_label: Option<&'static str>,
+    /// Evict the cached HEAD positive for this (tenant, path): the
+    /// verdict CONTRADICTS a cached `true` — either nothing has the
+    /// path (CleanMiss, merged_bug_016) or the path is present but
+    /// refused (UntrustedPresent, merged_bug_263; ContentMismatch,
+    /// bug_085 — presence is exactly the misleading half of a
+    /// refusal, and a charge-gating probe consulting the stale `true`
+    /// would re-confirm the doomed path for the rest of the 1h TTL).
+    /// Transients prove nothing about presence and keep the cache.
+    evict_probe_positive: bool,
+    /// The attempt outcome the caller returns (`Ok(())` maps to the
+    /// miss `Ok(None)` at the single driver).
+    outcome: Result<(), SubstituteError>,
+}
+
+/// The ONE exhaustive verdict→effects constructor (bug_085): every
+/// fold verdict states its full effect record here — no wildcard, no
+/// shared-tail defaults — and the single driver in `do_substitute`
+/// applies it. The verdict enum itself is kernel-owned
+/// (rio-evidence-kernel/src/outcome.rs) and untouched.
+fn verdict_effects(
+    verdict: rio_evidence_kernel::outcome::SubstituteLoopVerdict,
+    store_path: &str,
+) -> VerdictEffects {
+    use rio_evidence_kernel::outcome::SubstituteLoopVerdict as V;
+    match verdict {
+        // Typed transients: uncounted in the result family, NO
+        // eviction (a stall or a 429 proves nothing about presence —
+        // the cached positive may well be the truth); payloads ride
+        // the error.
+        V::Stalled { window } => VerdictEffects {
+            result_label: None,
+            evict_probe_positive: false,
+            outcome: Err(SubstituteError::Stalled { window }),
+        },
+        V::RateLimited { retry_after } => VerdictEffects {
+            result_label: None,
+            evict_probe_positive: false,
+            outcome: Err(SubstituteError::RateLimited { retry_after }),
+        },
+        // ≥1 upstream broke: surfaced as an UNCACHED Fetch error so
+        // the next attempt re-asks instead of trusting a poisoned
+        // miss; the cached positive is NOT contradicted (the errored
+        // upstream answered nothing).
+        V::Errored => VerdictEffects {
+            result_label: Some("error"),
+            evict_probe_positive: false,
+            outcome: Err(SubstituteError::Fetch(format!(
+                "no upstream served {store_path} and at least one errored — \
+                 not a definitive miss"
+            ))),
+        },
+        // merged_bug_046: present upstream with disagreeing bytes — a
+        // typed, UNCACHED content refusal, never the cacheable miss
+        // the content-blind HEAD confirmation would then contradict
+        // into an infrastructure charge. bug_085: and the refusal
+        // contradicts any cached HEAD positive's USEFULNESS — evict,
+        // like the sibling refusal arms (THE FIX).
+        V::ContentMismatch => VerdictEffects {
+            result_label: Some("content_mismatch"),
+            evict_probe_positive: true,
+            outcome: Err(SubstituteError::ContentMismatch),
+        },
+        // merged_bug_005: present upstream, no verifiable signature —
+        // a typed, UNCACHED trust refusal. merged_bug_263: evict the
+        // cached positive (presence is the misleading half).
+        V::UntrustedPresent => VerdictEffects {
+            result_label: Some("untrusted"),
+            evict_probe_positive: true,
+            outcome: Err(SubstituteError::UntrustedPresent),
+        },
+        // merged_bug_016: a fresh EVERY-upstream GET-404 contradicts
+        // any cached HEAD positive — evict so a charge-gating probe
+        // observes live state ("present but not ingested" charged the
+        // park budget until the TTL lapsed, pre-fix).
+        V::CleanMiss => VerdictEffects {
+            result_label: Some("miss"),
+            evict_probe_positive: true,
+            outcome: Ok(()),
+        },
+    }
 }
 
 /// HTTP statuses an upstream binary cache uses to signal "key not
@@ -3628,6 +3676,91 @@ mod tests {
         assert!(
             after2 > after,
             "the agreeing upstream's signature must be appended (got {after} -> {after2})"
+        );
+    }
+
+    /// bug_085: a content-mismatch refusal must EVICT the cached HEAD
+    /// positive for its (tenant, path) — the sibling refusal arms
+    /// (UntrustedPresent, merged_bug_263; CleanMiss, merged_bug_016)
+    /// both evict, and the arm's own rationale already argues it: a
+    /// cached positive answers PRESENCE, and presence is exactly the
+    /// misleading half of a content refusal — a charge-gating
+    /// confirmation probe consulting the stale `true` re-confirms the
+    /// doomed path for the rest of the 1h TTL. The cache is seeded by
+    /// a REAL prior HEAD-positive probe (`check_available` against
+    /// the live upstream) and the verdict is minted by the REAL
+    /// substitute loop over the stored-row disagreement — no
+    /// hand-rolled verdicts, no cache poking.
+    #[tokio::test]
+    async fn content_mismatch_evicts_cached_probe_positive() {
+        use rio_test_support::fixtures::make_path_info;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // The victim row: a legitimately-ingested complete path.
+        let path = rio_test_support::fixtures::test_store_path("victim-evict");
+        let (nar, nar_hash) = rio_test_support::fixtures::make_nar(b"victim-evict-secret");
+        let info = make_path_info(&path, &nar, nar_hash);
+        let path_hash = info.store_path.sha256_digest();
+        let claim = metadata::insert_manifest_uploading(&db.pool, &path_hash, &path, &[])
+            .await
+            .unwrap()
+            .unwrap();
+        let mut stored = info.clone();
+        stored.store_path_hash = path_hash.to_vec();
+        metadata::complete_manifest_inline(&db.pool, &stored, claim, nar.clone().into())
+            .await
+            .unwrap();
+
+        // The tenant trusts a fake upstream that self-signs a narinfo
+        // naming the victim path with a DIFFERENT NarHash.
+        let upstream =
+            spawn_fake_upstream(&path, b"forged-evict-bytes".to_vec(), "evict-key").await;
+        let tid = seed_tenant(&db.pool, "content-evict").await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &upstream.url,
+            50,
+            std::slice::from_ref(&upstream.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+        let sub = test_substituter(db.pool.clone());
+
+        // 1. A real prior HEAD-positive probe seeds the cache: the
+        //    upstream serves the (forged) narinfo, so the HEAD answers
+        //    present and check_available caches `true`.
+        let probed = sub
+            .check_available(tid, std::slice::from_ref(&path), far_deadline())
+            .await
+            .unwrap();
+        assert_eq!(
+            probed.hits,
+            vec![path.clone()],
+            "the seeding probe must answer hit (the upstream serves the narinfo)"
+        );
+        assert_eq!(
+            sub.probe_cache.get(&(tid, path.clone())).await,
+            Some(true),
+            "the HEAD positive must be cached before the refusal"
+        );
+
+        // 2. The substitute loop reaches the content-disagreement
+        //    verdict through the production cells + fold.
+        let got = sub.try_substitute(tid, &path).await;
+        assert!(
+            matches!(got, Err(SubstituteError::ContentMismatch)),
+            "the disagreeing claim must be the typed content refusal, got {got:?}"
+        );
+
+        // 3. THE pin: the cached positive is GONE.
+        assert_eq!(
+            sub.probe_cache.get(&(tid, path.clone())).await,
+            None,
+            "left: Some(true) / right: None — the stale HEAD positive must \
+             not survive the content refusal for the 1h TTL"
         );
     }
 
