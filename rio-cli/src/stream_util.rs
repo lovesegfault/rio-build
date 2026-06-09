@@ -51,11 +51,15 @@ use anyhow::anyhow;
 /// the module doc covers, previously unbounded. The drain law owns the
 /// bound itself: every consumer gets the hang-to-PARTIAL conversion.
 ///
-/// 120s == the CLI's RPC_TIMEOUT budget: `VerifyChunks` emits a
-/// progress frame per batch, and one batch (a bounded PG scan + S3
-/// HeadObject sweep) comfortably fits even against a degraded S3.
+/// The value IS the bilateral bound from `rio_common::liveness`
+/// (merged_bug_023): `VerifyChunks` emits a progress frame at least
+/// every `ADMIN_VERIFY_EMIT_EVERY` probes (producer-enforced emission
+/// sub-batches), and the conformance test in `rio_common::liveness`
+/// machine-binds the derived worst-case emission gap strictly inside
+/// this bound --- the client bound cites a verified producer contract,
+/// not an unverified estimate of "one batch fits".
 pub(crate) const STREAM_INACTIVITY_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(120);
+    rio_common::liveness::ADMIN_STREAM_INACTIVITY_TIMEOUT;
 
 /// One message-at-a-time pull from a server stream. Blanket-implemented
 /// for `tonic::Streaming`; test doubles implement it over a queue so

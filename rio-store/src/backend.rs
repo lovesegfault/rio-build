@@ -558,7 +558,14 @@ impl ChunkBackend for S3ChunkBackend {
         // Chunked into batches of 16, each batch awaited concurrently via
         // join_all. Simpler than pulling in futures-util just for buffered().
         // Output order preserved: chunks_of_16[i] maps to hashes[i*16..].
-        const CONCURRENCY: usize = 16;
+        //
+        // The wave width is the SHARED bilateral constant
+        // (merged_bug_023): rio_common::liveness derives the
+        // worst-case VerifyChunks emission gap from it, and the
+        // conformance test there binds that gap to the CLI's
+        // inactivity bound. Widening or narrowing the fan-out here
+        // re-derives the contract automatically.
+        const CONCURRENCY: usize = rio_common::liveness::ADMIN_VERIFY_HEAD_CONCURRENCY;
         let mut results = Vec::with_capacity(hashes.len());
 
         for batch in hashes.chunks(CONCURRENCY) {

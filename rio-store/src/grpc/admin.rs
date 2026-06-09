@@ -450,57 +450,76 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
                         }
                     })
                     .collect();
-                scanned += hashes.len() as u64;
 
-                let exists = match backend.exists_batch(&hashes).await {
-                    Ok(e) => e,
-                    Err(e) => {
-                        // Permanent auth (IRSA misconfigured, IAM
-                        // missing s3:HeadObject) → FailedPrecondition
-                        // so the operator sees a fix-the-config
-                        // signal instead of retrying. Everything else
-                        // → Unavailable (transient, stream the boundary
-                        // so the operator can resume from N).
-                        let status = if e
-                            .downcast_ref::<crate::backend::BackendAuthError>()
-                            .is_some()
-                        {
-                            Status::failed_precondition(
-                                "VerifyChunks: storage backend authentication failed; \
-                                 check S3 credentials/IAM permissions",
-                            )
-                        } else {
-                            Status::unavailable(format!(
-                                "VerifyChunks: backend exists_batch failed at \
-                                 scanned={scanned}: {e}"
-                            ))
-                        };
-                        let _ = tx.send(Err(status)).await;
+                // r[impl store.admin.verify-emission-cadence]
+                // The PRODUCER enforces the inter-frame cadence
+                // (merged_bug_023): each PG batch is probed in
+                // emission sub-batches of ADMIN_VERIFY_EMIT_EVERY
+                // hashes, with a progress frame after EACH — at most
+                // one sub-batch's HeadObject waves run between
+                // frames, so the client's inactivity bound
+                // (ADMIN_STREAM_INACTIVITY_TIMEOUT) is guaranteed
+                // inbound traffic inside its window; the two consts
+                // are bound by the conformance test in
+                // rio_common::liveness. Pre-fix, one frame per PG
+                // batch meant a max batch (5000 chunks = 313
+                // sequential 16-wide waves with no per-request
+                // timeout) legitimately outran the client's 120 s
+                // bound against a degraded S3, and the client killed
+                // healthy verifies as half-open.
+                for sub in hashes.chunks(rio_common::liveness::ADMIN_VERIFY_EMIT_EVERY) {
+                    scanned += sub.len() as u64;
+
+                    let exists = match backend.exists_batch(sub).await {
+                        Ok(e) => e,
+                        Err(e) => {
+                            // Permanent auth (IRSA misconfigured, IAM
+                            // missing s3:HeadObject) → FailedPrecondition
+                            // so the operator sees a fix-the-config
+                            // signal instead of retrying. Everything else
+                            // → Unavailable (transient, stream the boundary
+                            // so the operator can resume from N).
+                            let status = if e
+                                .downcast_ref::<crate::backend::BackendAuthError>()
+                                .is_some()
+                            {
+                                Status::failed_precondition(
+                                    "VerifyChunks: storage backend authentication failed; \
+                                     check S3 credentials/IAM permissions",
+                                )
+                            } else {
+                                Status::unavailable(format!(
+                                    "VerifyChunks: backend exists_batch failed at \
+                                     scanned={scanned}: {e}"
+                                ))
+                            };
+                            let _ = tx.send(Err(status)).await;
+                            return;
+                        }
+                    };
+
+                    let missing_hashes: Vec<Vec<u8>> = sub
+                        .iter()
+                        .zip(&exists)
+                        .filter(|&(_, &ok)| !ok)
+                        .map(|(h, _)| h.to_vec())
+                        .collect();
+                    missing += missing_hashes.len() as u64;
+
+                    if tx
+                        .send(Ok(VerifyChunksProgress {
+                            scanned,
+                            missing,
+                            missing_hashes,
+                            done: false,
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        // Client hung up — bail; no need to keep
+                        // HeadObject-ing.
                         return;
                     }
-                };
-
-                let missing_hashes: Vec<Vec<u8>> = hashes
-                    .iter()
-                    .zip(&exists)
-                    .filter(|&(_, &ok)| !ok)
-                    .map(|(h, _)| h.to_vec())
-                    .collect();
-                missing += missing_hashes.len() as u64;
-
-                if tx
-                    .send(Ok(VerifyChunksProgress {
-                        scanned,
-                        missing,
-                        missing_hashes,
-                        done: false,
-                    }))
-                    .await
-                    .is_err()
-                {
-                    // Client hung up — bail; no need to keep
-                    // HeadObject-ing.
-                    return;
                 }
             }
 
@@ -1181,6 +1200,65 @@ mod tests {
         assert!(
             !all_missing.contains(&h_inflight.to_vec()),
             "in-flight (uploaded_at=NULL) chunk not flagged"
+        );
+    }
+
+    // r[verify store.admin.verify-emission-cadence]
+    /// RED (merged_bug_023): one PG batch emitted ONE progress frame
+    /// after its whole HeadObject sweep — a max batch (5000 chunks =
+    /// 313 sequential 16-wide S3 waves with no per-request timeout)
+    /// legitimately exceeds the CLI's 120 s inactivity bound against a
+    /// degraded S3, so the client killed healthy verifies as
+    /// "half-open". The producer now enforces the cadence: at most
+    /// [`rio_common::liveness::ADMIN_VERIFY_EMIT_EVERY`] probes run
+    /// between frames, machine-bound to the client's window by the
+    /// conformance test in `rio_common::liveness`.
+    ///
+    /// 300 rows in ONE PG batch (batch_size=1000) must yield ≥2
+    /// non-final frames (pre-fix: exactly 1).
+    #[tokio::test]
+    async fn verify_chunks_emits_inside_the_client_window() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let backend: Arc<dyn crate::backend::ChunkBackend> = mem_backend();
+
+        // Bulk-seed 300 confirmed-uploaded chunks (distinct hashes;
+        // none present in the backend — all "missing", which is
+        // irrelevant to the cadence under test).
+        sqlx::query(
+            "INSERT INTO chunks (blake3_hash, size, created_at, uploaded_at) \
+             SELECT decode(lpad(to_hex(i), 64, '0'), 'hex'), 1, now(), now() \
+             FROM generate_series(1, 300) AS i",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let svc = StoreAdminServiceImpl::new(db.pool.clone(), Some(backend));
+        let resp = svc
+            .verify_chunks(Request::new(VerifyChunksRequest { batch_size: 1000 }))
+            .await
+            .unwrap();
+        let mut stream = resp.into_inner();
+
+        use tokio_stream::StreamExt;
+        let mut progress_frames = 0u32;
+        let mut last = None;
+        while let Some(p) = stream.next().await {
+            let p = p.expect("progress frame, not Err");
+            if !p.done {
+                progress_frames += 1;
+            }
+            last = Some(p);
+        }
+        let p = last.expect("final frame");
+        assert!(p.done);
+        assert_eq!(p.scanned, 300);
+        assert!(
+            progress_frames >= 2,
+            "300 probes in one PG batch must emit ≥2 frames \
+             (every {} probes — got {progress_frames}: the whole batch ran \
+             between frames and a degraded S3 starves the client bound)",
+            rio_common::liveness::ADMIN_VERIFY_EMIT_EVERY,
         );
     }
 

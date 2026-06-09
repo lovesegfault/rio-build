@@ -1698,6 +1698,21 @@ GC redesign must preserve.
   #rref("store.gc.shutdown-abort").
 ]
 
+#r("store.admin.verify-emission-cadence")[
+  `VerifyChunks` MUST emit a progress frame at least every
+  `ADMIN_VERIFY_EMIT_EVERY` chunk probes (`rio_common::liveness`): each PG
+  batch is probed in emission sub-batches of that size with a frame after
+  each, so the worst-case inter-frame gap is one sub-batch's `HeadObject`
+  waves and a client inactivity bound of
+  `ADMIN_STREAM_INACTIVITY_TIMEOUT` cannot fire on a healthy verify.
+]
+The producer-side cadence and the client-side bound are one bilateral
+contract: the conformance test in `rio_common::liveness` binds the derived
+worst-case emission gap strictly inside the client bound, so neither crate
+can drift the contract alone. Pre-cadence, one frame per PG batch meant a
+max batch (5000 chunks) legitimately outran the client's 120 s bound
+against a degraded S3 and the CLI killed healthy verifies as half-open.
+
 #r("store.admin.upstream-crud")[
   `StoreAdminService.{ListUpstreams, AddUpstream, RemoveUpstream}` manage
   `tenant_upstreams` rows over gRPC. `AddUpstream` validates `trusted_keys[]`

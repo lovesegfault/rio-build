@@ -56,6 +56,51 @@ pub const fn keepalive_conforms(period: Duration, margin: u32, abort: Duration) 
     period.as_nanos() * (margin as u128) < abort.as_nanos()
 }
 
+// ────────────────────────────────────────────────────────────────────
+// The bilateral VerifyChunks progress-cadence contract
+// (merged_bug_023, bughunt-4). Same shape as the AppendLog pair above:
+// a producer-side emission guarantee, a client-side bound that CITES
+// it, and a conformance test binding the two so neither crate can
+// drift the contract alone.
+// ────────────────────────────────────────────────────────────────────
+
+/// Producer cadence (rio-store `VerifyChunks`): at most this many
+/// chunk probes (S3 `HeadObject`s) run between two progress frames.
+/// The store slices each PG batch into emission sub-batches of this
+/// size — a max batch (5000 chunks) can no longer go frame-silent for
+/// its whole sequential HeadObject sweep.
+pub const ADMIN_VERIFY_EMIT_EVERY: usize = 256;
+
+/// Probe concurrency inside one HeadObject wave (the S3 backend's
+/// bounded fan-out). The backend asserts its local constant equals
+/// this one; the worst-case emission gap below divides by it.
+pub const ADMIN_VERIFY_HEAD_CONCURRENCY: usize = 16;
+
+/// Engineering worst case for ONE 16-wide HeadObject wave against a
+/// degraded S3 (SDK retries included). Deliberately pessimistic: the
+/// p99 healthy wave is tens of milliseconds.
+pub const ADMIN_VERIFY_WORST_WAVE: Duration = Duration::from_secs(5);
+
+/// Enforcement side (rio-cli): the per-message inactivity bound the
+/// CLI's drain law applies to admin audit streams. A producer that
+/// honors [`ADMIN_VERIFY_EMIT_EVERY`] emits well inside this window
+/// (conformance test below); a stream silent past it is presumed
+/// half-open (peer died without FIN/RST on the CLI's keepalive-free
+/// channel) and the drain exits PARTIAL instead of hanging on the
+/// kernel's ~2 h TCP keepalive.
+pub const ADMIN_STREAM_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Worst-case wall time between two `VerifyChunks` progress frames
+/// under the producer cadence: the waves in one emission sub-batch ×
+/// the worst-case wave. Exposed so the conformance test (and any
+/// future bound consumer) derives it instead of re-computing it.
+#[must_use]
+pub const fn admin_verify_worst_emission_gap() -> Duration {
+    let waves = ADMIN_VERIFY_EMIT_EVERY.div_ceil(ADMIN_VERIFY_HEAD_CONCURRENCY);
+    // Duration × usize is not const; build from secs.
+    Duration::from_secs(ADMIN_VERIFY_WORST_WAVE.as_secs() * waves as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,6 +137,38 @@ mod tests {
             Duration::from_secs(30),
             2,
             Duration::from_secs(60)
+        ));
+    }
+
+    /// The VerifyChunks bilateral contract's machine witness
+    /// (merged_bug_023): the producer's worst-case emission gap fits
+    /// strictly inside the client's inactivity bound. A change that
+    /// breaks the relation — a bigger emission sub-batch, a smaller
+    /// client bound, a slower assumed wave — fails the workspace
+    /// suite rather than shipping a contract the two crates no
+    /// longer agree on.
+    #[test]
+    fn verify_emission_gap_is_inside_the_client_bound() {
+        let gap = admin_verify_worst_emission_gap();
+        assert!(
+            keepalive_conforms(gap, 1, ADMIN_STREAM_INACTIVITY_TIMEOUT),
+            "worst emission gap ({gap:?}) must be < ADMIN_STREAM_INACTIVITY_TIMEOUT \
+             ({ADMIN_STREAM_INACTIVITY_TIMEOUT:?}) — the client would kill healthy \
+             max-batch verifies as half-open"
+        );
+        // Current values: 16 waves × 5 s = 80 s vs 120 s — 1.5×
+        // headroom over the engineering worst case.
+        assert_eq!(gap, Duration::from_secs(80), "recompute the headroom note");
+    }
+
+    /// Negative control: a cadence that fills the whole client window
+    /// is rejected by the predicate this contract relies on.
+    #[test]
+    fn verify_conformance_rejects_a_window_filling_gap() {
+        assert!(!keepalive_conforms(
+            ADMIN_STREAM_INACTIVITY_TIMEOUT,
+            1,
+            ADMIN_STREAM_INACTIVITY_TIMEOUT
         ));
     }
 }
