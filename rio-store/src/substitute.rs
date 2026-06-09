@@ -739,9 +739,12 @@ impl Substituter {
                 // unrepresentable: the only counter sites are the
                 // post-loop fold and the leader-exit arm below; the
                 // waiter map_err carries no metrics at all).
-                let r = self
-                    .substitute_leader(tenant_id, store_path, progress)
-                    .await;
+                // Box::pin: depth firewall — stable rustc's layout-query
+                // depth caps at this batch/leader boundary instead of
+                // compounding the substitute-pipeline nesting into every
+                // caller's async layout (one boxed allocation per
+                // singleflight leader).
+                let r = Box::pin(self.substitute_leader(tenant_id, store_path, progress)).await;
                 if let Err(e) = &r {
                     // The leader-exit tick for pre-loop/SETUP escapes
                     // (StorePath::parse → NarInfo; capability-gate PG
