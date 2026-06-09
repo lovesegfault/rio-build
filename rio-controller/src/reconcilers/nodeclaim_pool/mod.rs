@@ -1507,10 +1507,18 @@ impl NodeClaimPoolReconciler {
                 .update(open_attempts.as_deref(), &evictions, &registered_fleet, now)
             {
                 wedge::WedgeVerdict::NodeWedged(nodes, _) => nodes,
-                wedge::WedgeVerdict::Systemic { affected, of, .. } => {
+                wedge::WedgeVerdict::Systemic {
+                    affected,
+                    of,
+                    breadth,
+                    ..
+                } => {
                     debug!(
                         affected,
-                        of, "wedge verdict systemic; Dead arm receives no wedge input this tick"
+                        of,
+                        breadth,
+                        "wedge verdicts suppressed (ratio, breadth or dwell trajectory \
+                         axis); Dead arm receives no wedge input this tick"
                     );
                     Vec::new()
                 }
