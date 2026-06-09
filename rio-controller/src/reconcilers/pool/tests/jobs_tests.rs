@@ -913,14 +913,42 @@ fn running_job_for_intent(name: &str, intent_id: &str) -> Job {
     j
 }
 
-/// One open pull-mode attempt as the pull-filtered `ListOpenAttempts`
-/// view returns it (executor identity == the attested intent id).
+/// One open BUILD pull-mode attempt exactly as the production mint
+/// persists it and the pull-filtered `ListOpenAttempts` view returns
+/// it: `executor_id` IS the attested intent id (`ExecutorId::from(
+/// intent_id)`, pull.rs — the request carries no pod name) and the
+/// kind axis says Build. Witness provenance (R13): tests MUST mint
+/// attempts through this helper or [`materialization_attempt`] — a
+/// hand-rolled pod-shaped `executor_id` is a shape the scheduler
+/// cannot emit, classifies `Foreign`, and fails any owns()-asserting
+/// test by construction.
 fn pull_attempt(intent_id: &str, exec_id: &str, source_node: &str) -> OpenAttempt {
     OpenAttempt {
         intent_id: intent_id.into(),
         executor_id: intent_id.into(),
         exec_id: exec_id.into(),
         source_node: source_node.into(),
+        attempt_kind: rio_proto::types::AttemptKind::Build as i32,
+        ..Default::default()
+    }
+}
+
+/// One open MATERIALIZATION attempt as the production mint persists
+/// it: `executor_id == "{intent}@{instance}"` (the `(intent, replica)`
+/// pair — distinct per store replica) and kind MATERIALIZATION. For
+/// negative tests: a build-lifecycle verdict must never bind one.
+fn materialization_attempt(
+    intent_id: &str,
+    instance: &str,
+    exec_id: &str,
+    source_node: &str,
+) -> OpenAttempt {
+    OpenAttempt {
+        intent_id: intent_id.into(),
+        executor_id: format!("{intent_id}@{instance}"),
+        exec_id: exec_id.into(),
+        source_node: source_node.into(),
+        attempt_kind: rio_proto::types::AttemptKind::Materialization as i32,
         ..Default::default()
     }
 }
@@ -956,7 +984,7 @@ pub(super) async fn ctx_with_mock_admin(
     (super::test_ctx_with_admin(client, channel), mock, handle)
 }
 
-// r[verify ctrl.job.synthesize-on-delete]
+// r[verify ctrl.job.synthesize-on-delete+2]
 /// The pure synthesize decision: `Some` exactly when an open pull-mode
 /// attempt covers the Job (so a no-attempt delete attempts no RPC by
 /// construction), carrying the attempt's exec_id / intent and the
@@ -968,11 +996,10 @@ fn synthesized_report_decision_pull_only() {
 
     // (a) Covered by an open pull-mode attempt → one request, keyed by
     // the attempt's exec_id, carrying the AD2c node attribution. The
-    // attempt's executor is the Job's own pod (merged_bug_298: the
-    // constructor binds owner identity, not just intent).
-    let mut owned = pull_attempt("drv-pull-1", "exec-1", "node-a");
-    owned.executor_id = "rio-builder-p-pull1-a1b2c".into();
-    let attempts = vec![owned];
+    // attempt carries the executor identity the scheduler actually
+    // mints for a build pull: the attested intent id itself
+    // (`ExecutorId::from(intent_id)`, pull.rs — never a pod name).
+    let attempts = vec![pull_attempt("drv-pull-1", "exec-1", "node-a")];
     let req = synthesized_report_for_job(&job, AttemptTerminalReason::Reaped, &attempts)
         .expect("open pull attempt → synthesize");
     assert_eq!(req.exec_id, "exec-1");
@@ -1000,29 +1027,130 @@ fn synthesized_report_decision_pull_only() {
         .is_none(),
         "stream-dispatch Jobs are invisible to the pull-filtered view → no synthesis"
     );
-}
 
-// r[verify ctrl.job.synthesize-on-delete]
-/// merged_bug_298 red: two Jobs cover one intent (cross-pool respawn).
-/// Deleting pool B's Job must bind pool B's OWN attempt — never close
-/// pool A's healthy one (charge-free verdict against the wrong
-/// executor).
-#[test]
-fn synthesized_report_binds_owner_not_just_intent() {
-    let job_b = running_job_for_intent("rio-builder-b-x", "drv-shared-1");
-    let mut a = pull_attempt("drv-shared-1", "exec-a", "node-1");
-    a.executor_id = "rio-builder-a-y-7k2fq".into(); // pool A's pod
-    let mut b = pull_attempt("drv-shared-1", "exec-b", "node-2");
-    b.executor_id = "rio-builder-b-x-9mz4h".into(); // pool B's pod
-    let req = synthesized_report_for_job(&job_b, AttemptTerminalReason::Reaped, &[a, b])
-        .expect("pool B's own attempt is open");
-    assert_eq!(
-        req.exec_id, "exec-b",
-        "the synthesized verdict must bind the deleting Job's own attempt"
+    // (d) Negative pin: a Foreign-shaped attempt for the SAME intent is
+    // never owned. A pod-shaped executor_id is a shape the scheduler
+    // cannot mint (r13-allow(refusal-probe): deliberately unproducible
+    // input; the assertion IS the refusal) — the classifier maps it to
+    // `Foreign` and the synthesis must refuse to bind it.
+    let foreign = OpenAttempt {
+        intent_id: "drv-pull-1".into(),
+        executor_id: "rio-builder-p-pull1-a1b2c".into(),
+        exec_id: "exec-9".into(),
+        source_node: "node-a".into(),
+        attempt_kind: rio_proto::types::AttemptKind::Build as i32,
+        ..Default::default()
+    };
+    assert!(
+        synthesized_report_for_job(&job, AttemptTerminalReason::Reaped, &[foreign]).is_none(),
+        "a pod-shaped (unmintable) executor identity is Foreign → never owned"
     );
 }
 
-// r[verify ctrl.job.synthesize-on-delete]
+// r[verify ctrl.job.synthesize-on-delete+2]
+/// bug_071 (preserving merged_bug_298's INTENT — never close an
+/// attempt you don't own — under producible shapes): with the minted
+/// identity alphabet, a Job delete binds the BUILD pull attempt for
+/// its own intent and NEVER a materialization claim for the same
+/// intent (`{intent}@{instance}`, a store replica's attempt — closing
+/// it would charge the wrong executor class). The one-winner pull
+/// arbiter guarantees at most one open BUILD attempt per intent, so
+/// the m298 two-same-intent-build-attempts scenario is unconstructible
+/// scheduler-side.
+#[test]
+fn synthesized_report_binds_build_attempt_never_materialization() {
+    let job = running_job_for_intent("rio-builder-b-x", "drv-shared-1");
+    // Build pull + materialization claim for the SAME intent: the
+    // verdict binds the build attempt's exec_id.
+    let attempts = vec![
+        pull_attempt("drv-shared-1", "exec-build", "node-1"),
+        materialization_attempt("drv-shared-1", "store-1", "exec-mat", "node-2"),
+    ];
+    let req = synthesized_report_for_job(&job, AttemptTerminalReason::Reaped, &attempts)
+        .expect("the build pull attempt is open");
+    assert_eq!(
+        req.exec_id, "exec-build",
+        "the synthesized verdict must bind the build attempt, never the materialization claim"
+    );
+
+    // Materialization claim ONLY → None: a Job delete must not close a
+    // store replica's claim even when it is the only open attempt.
+    let only_mat = vec![materialization_attempt(
+        "drv-shared-1",
+        "store-1",
+        "exec-mat",
+        "node-2",
+    )];
+    assert!(
+        synthesized_report_for_job(&job, AttemptTerminalReason::Reaped, &only_mat).is_none(),
+        "a materialization claim alone must never be bound by a Job-delete verdict"
+    );
+}
+
+mod minted_identity_props {
+    use proptest::prelude::*;
+
+    use crate::reconcilers::pool::job::MintedPullIdentity;
+
+    /// Identity-ish strings over the production charset plus the '@'
+    /// separator and the chars pod names use — covers store paths,
+    /// `intent@instance` composites, pod shapes, and junk.
+    fn arb_id() -> impl Strategy<Value = String> {
+        proptest::string::string_regex("[a-z0-9./@-]{0,24}").expect("valid regex")
+    }
+
+    proptest! {
+        // r[verify ctrl.job.synthesize-on-delete+2]
+        /// bug_071 closure-set law: the classifier is TOTAL over
+        /// arbitrary (executor_id, intent_id, kind) triples and never
+        /// panics; `Build` holds ONLY under shape∧kind agreement;
+        /// `Materialization` ONLY under the `{intent}@{instance}`
+        /// shape with the matching kind; pod-shaped ids (a dash-joined
+        /// suffix on a non-intent prefix — unmintable) are always
+        /// `Foreign`, as is every unknown kind value (fail-closed for
+        /// future variants).
+        #[test]
+        fn minted_identity_total_and_foreign_on_unminted_shapes(
+            executor_id in arb_id(),
+            intent_id in arb_id(),
+            kind in proptest::num::i32::ANY,
+        ) {
+            use rio_proto::types::AttemptKind as K;
+            let got = MintedPullIdentity::classify(&executor_id, &intent_id, kind);
+            let build_kind = kind == K::Build as i32 || kind == K::Unspecified as i32;
+            let build_shape = !intent_id.is_empty() && executor_id == intent_id;
+            let mat_shape = !intent_id.is_empty()
+                && executor_id.strip_prefix(intent_id.as_str())
+                    .and_then(|r| r.strip_prefix('@'))
+                    .is_some_and(|i| !i.is_empty());
+            let expected = if build_shape && build_kind {
+                MintedPullIdentity::Build
+            } else if mat_shape && kind == K::Materialization as i32 {
+                MintedPullIdentity::Materialization
+            } else {
+                MintedPullIdentity::Foreign
+            };
+            prop_assert_eq!(got, expected);
+            // Unknown kind values never classify owned, whatever the
+            // shape (fail-closed: the mirror above forces Foreign there,
+            // so `expected` already pins it — this names the law).
+            if !build_kind && kind != K::Materialization as i32 {
+                prop_assert_eq!(got, MintedPullIdentity::Foreign);
+            }
+            // Pod-shaped ids (job-name prefix + dash + dashless suffix,
+            // prefix != intent) are Foreign under EVERY kind.
+            let pod_shaped = format!("rio-builder-p-{}", "a1b2c");
+            if pod_shaped != intent_id {
+                prop_assert_eq!(
+                    MintedPullIdentity::classify(&pod_shaped, &intent_id, kind),
+                    MintedPullIdentity::Foreign
+                );
+            }
+        }
+    }
+}
+
+// r[verify ctrl.job.synthesize-on-delete+2]
 /// Deleting a Job that still has an open pull-mode attempt synthesizes
 /// the `ReportAttemptOutcome` (observed via the OA1 histogram sample
 /// the helper records only after the report is ACKED) and still issues
@@ -1039,10 +1167,10 @@ async fn delete_job_synthesizes_report_for_open_pull_attempt() {
     let jobs_api: Api<Job> = Api::namespaced(client, "rio");
 
     let covered = running_job_for_intent("rio-builder-p-pull1", "drv-pull-1");
-    // merged_bug_298: the attempt's executor is the Job's own pod.
-    let mut owned = pull_attempt("drv-pull-1", "exec-1", "node-a");
-    owned.executor_id = "rio-builder-p-pull1-a1b2c".into();
-    let attempts = vec![owned];
+    // bug_071: the attempt carries the production-minted identity (the
+    // attested intent id) — the owner binding is the Build classifier,
+    // not a pod-name shape.
+    let attempts = vec![pull_attempt("drv-pull-1", "exec-1", "node-a")];
 
     let guard = verifier.run(vec![delete_scenario("rio-builder-p-pull1")]);
     delete_job_with_synthesized_report(
@@ -1064,7 +1192,7 @@ async fn delete_job_synthesizes_report_for_open_pull_attempt() {
     );
 }
 
-// r[verify ctrl.job.synthesize-on-delete]
+// r[verify ctrl.job.synthesize-on-delete+2]
 /// Deleting a Job with NO covering open pull-mode attempt (here: a
 /// stream Job mid-build — the pull-filtered view never lists stream
 /// attempts) attempts no `ReportAttemptOutcome` at all: with a working
@@ -1104,7 +1232,7 @@ async fn delete_job_without_open_attempt_attempts_no_rpc() {
     );
 }
 
-// r[verify ctrl.job.synthesize-on-delete]
+// r[verify ctrl.job.synthesize-on-delete+2]
 /// The synthesis is best-effort: with the admin channel dead, the
 /// foreground DELETE still goes out and the helper returns the delete
 /// result (the establishment sweep is the fallback classifier).

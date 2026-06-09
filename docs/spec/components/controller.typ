@@ -970,13 +970,16 @@ This is the C4/C5 unification: one idempotent unary replaces the
 terminated-pod report and the deadline-exceeded Job report for pull-mode
 attempts, with no re-report dedup window and no Job-name prefix matching.
 
-#r("ctrl.job.synthesize-on-delete")[
+#r("ctrl.job.synthesize-on-delete+2")[
   Whenever the controller deletes a Job that still has an open pull-mode
   attempt (cancel, preemption, or any reap path), it MUST synthesize the
   terminal `ReportAttemptOutcome` (reason cancelled / preempted / reaped as
   appropriate) for that attempt before or with the foreground deletion;
   deleting a Job with no open pull-mode attempt MUST NOT synthesize or send
-  anything.
+  anything. The synthesized verdict MUST bind only an attempt whose executor
+  identity is one the scheduler mints for the Job's own intent — the attested
+  intent for build pulls, `intent@instance` for materialization claims — and
+  MUST NOT bind build-lifecycle verdicts to materialization attempts.
 ]
 The deletion destroys the only Job/pod terminal status the unified report
 could otherwise fold; synthesizing keeps requeue at the next fold instead of

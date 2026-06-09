@@ -556,7 +556,7 @@ fn attempt_reason_label(reason: rio_proto::types::AttemptTerminalReason) -> &'st
 /// identity), carries the Job name and the attempt's intent id for the
 /// scheduler's resolution fallbacks, and forwards the attempt's
 /// `source_node` as the AD2c attribution when known.
-// r[impl ctrl.job.synthesize-on-delete]
+// r[impl ctrl.job.synthesize-on-delete+2]
 pub(super) fn synthesized_report_for_job(
     job: &Job,
     reason: rio_proto::types::AttemptTerminalReason,
@@ -565,11 +565,81 @@ pub(super) fn synthesized_report_for_job(
     let job_name = job.metadata.name.clone().unwrap_or_default();
     synthesized_report_for_intent(
         job_intent_id(job),
-        job_name.clone(),
+        job_name,
         reason,
         open_attempts,
-        AttemptOwner::Job(&job_name),
+        AttemptOwner::Job,
     )
+}
+
+/// bug_071: the closed classifier over the executor-identity shapes
+/// the scheduler ACTUALLY mints (pull.rs `pulling_identity`): a build
+/// pull binds to the attested intent itself
+/// (`ExecutorId::from(intent_id)` — the request carries no pod name
+/// the token could attest), a materialization claim binds to
+/// `{intent}@{instance}`. Nothing rewrites `drv_executions.
+/// executor_id` post-mint (only `source_node` is updated) and
+/// `open_attempt_row_to_proto` passes it through unchanged, so these
+/// two shapes are the COMPLETE production alphabet. The retired
+/// matcher demanded a `{job}-{dashless-suffix}` pod-name shape no mint
+/// ever produced — `strip_prefix` could never match and the
+/// synthesize-on-delete arm was production-unreachable.
+///
+/// Shape and the proto `attempt_kind` axis (the typed cross-crate
+/// contract merged_bug_146 shipped for consumers that synthesize
+/// build-lifecycle verdicts) are cross-checked: disagreement between
+/// them, and ANY unknown kind value, classifies `Foreign` = never
+/// owned — fail-closed for future variants. Kind comparisons are
+/// raw-i32 on purpose: prost's enum accessor folds unknown future
+/// kinds into the default, which would read them as Build; the raw
+/// compare keeps them Foreign.
+///
+/// `UNSPECIFIED` reads as Build, following the pinned proto posture
+/// (admin_types.proto: pre-alphabet rows are the as-built all-build
+/// fleet; the scheduler maps every pre-alphabet row to Build) — the
+/// old-scheduler arrival story is moot under the signed --wipe
+/// rollout (Q6, 2026-06-09); the lane stays because the classifier
+/// must be total over the kind alphabet. Deliberately DIFFERENT from
+/// wedge.rs's `observe`, which SKIPS UNSPECIFIED: the wedge consumer
+/// is a destructive Dead-reap where fail-closed means *skip*; this
+/// consumer is a report where the proto posture governs (RULED
+/// S2-OQ4, 2026-06-09 — do not "fix" either site to match the other).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MintedPullIdentity {
+    /// `executor_id == intent_id` and kind ∈ {BUILD, UNSPECIFIED}.
+    Build,
+    /// `executor_id == "{intent_id}@{instance}"` (non-empty instance)
+    /// and kind == MATERIALIZATION. '@' is outside the nix store-name
+    /// charset, so the parse is unambiguous.
+    Materialization,
+    /// Everything else — unknown kinds, shape/kind disagreement,
+    /// pod-name shapes (unmintable), empty ids. Never owned.
+    Foreign,
+}
+
+impl MintedPullIdentity {
+    /// Total over arbitrary `(executor_id, intent_id, kind)` triples;
+    /// never panics. Classification uses the attempt's OWN fields only.
+    pub(super) fn classify(executor_id: &str, intent_id: &str, kind: i32) -> Self {
+        use rio_proto::types::AttemptKind as K;
+        let build_kind = kind == K::Build as i32 || kind == K::Unspecified as i32;
+        if !intent_id.is_empty() && executor_id == intent_id && build_kind {
+            return MintedPullIdentity::Build;
+        }
+        let mat_shape = !intent_id.is_empty()
+            && executor_id
+                .strip_prefix(intent_id)
+                .and_then(|rest| rest.strip_prefix('@'))
+                .is_some_and(|instance| !instance.is_empty());
+        if mat_shape && kind == K::Materialization as i32 {
+            return MintedPullIdentity::Materialization;
+        }
+        MintedPullIdentity::Foreign
+    }
+
+    fn of(a: &rio_proto::types::OpenAttempt) -> Self {
+        Self::classify(&a.executor_id, &a.intent_id, a.attempt_kind)
+    }
 }
 
 /// merged_bug_298: the owner identity a synthesized verdict must bind.
@@ -579,27 +649,64 @@ pub(super) fn synthesized_report_for_job(
 /// charge-free verdict against the wrong executor. There is no
 /// constructor without an owner, so an unowned attempt is unmatchable
 /// by construction.
+///
+/// bug_071 residual, documented: with intent-bound identities
+/// (see [`MintedPullIdentity`]) cross-pool attribution of ONE build
+/// attempt is not expressible — the one-winner pull arbiter
+/// guarantees at most one open build attempt per intent, so the find's
+/// intent pin plus the Build classifier is the strongest binding the
+/// minted identity supports (the alternative was a synthesis that
+/// never fired). The residual is bounded by the structural guards at
+/// every call site: terminal/pending/selector-drift-only targets in
+/// `reap_stale_for_intents`, the live-pod recheck in
+/// `reap_excess_pending`, the busy bridge in the orphan reap, and the
+/// four-conjunct cancel binding (`ctrl.job.cancel-close-cause+2`).
 pub(super) enum AttemptOwner<'a> {
-    /// Job-delete arms: a pull-mode attempt's `executor_id` is the k8s
-    /// pod name, and a Job's pods carry the Job name as a dash-joined
-    /// prefix with a dashless random suffix.
-    Job(&'a str),
-    /// The disruption watcher targets one pod on one known node.
-    Pod { pod: &'a str, node: &'a str },
+    /// Job-delete arms: the attempt must be the build pull for the
+    /// Job's OWN intent — the find pins intent equality, the
+    /// classifier pins the minted shape and kind, and that is the
+    /// COMPLETE binding the minted identity supports (the retired
+    /// pod-name payload matched a shape no mint produces). Unit
+    /// variant on purpose: carrying the Job name back would invite a
+    /// matcher arm against it.
+    Job,
+    /// The disruption watcher targets one pod on one known node. The
+    /// binding is the Build classifier plus the controller-
+    /// authoritative `source_node`; the retired `executor_id == pod`
+    /// disjunct was production-vacuous (executor ids are never
+    /// pod-shaped) and is dropped. The kind/shape gate also prevents a
+    /// pool-pod preemption from closing a same-intent materialization
+    /// claim on the same node.
+    Pod {
+        /// The disrupted pod's name. Its matcher read died with the
+        /// production-vacuous `executor_id == pod` disjunct (bug_071);
+        /// the field stays as the watcher's call-site contract —
+        /// removing it edits `disruption.rs`, outside this change's
+        /// plane. `#[expect]` self-reports when a read returns.
+        #[expect(
+            dead_code,
+            reason = "binding role retired by bug_071; kept as the disruption call-site contract"
+        )]
+        pod: &'a str,
+        node: &'a str,
+    },
 }
 
 impl AttemptOwner<'_> {
     fn owns(&self, a: &rio_proto::types::OpenAttempt) -> bool {
         match self {
-            // `{job}-{suffix}` with a dashless suffix: "metal" owns
-            // "metal-7k2fq" but not "metal-big-7k2fq" (a sibling Job's
-            // pod), and never bare "metal".
-            AttemptOwner::Job(job) => a.executor_id.strip_prefix(job).is_some_and(|rest| {
-                rest.len() > 1 && rest.starts_with('-') && !rest[1..].contains('-')
-            }),
-            AttemptOwner::Pod { pod, node } => {
-                a.executor_id == *pod
-                    || (!node.is_empty() && !a.source_node.is_empty() && a.source_node == *node)
+            // A pool Job's pod can hold only the build-pull attempt
+            // for its OWN intent: the caller's find already pins
+            // intent equality, so ownership is exactly "this is the
+            // minted build identity". A materialization claim for the
+            // same intent (`{intent}@{instance}`) is NOT ours — a Job
+            // delete must never close a store replica's claim.
+            AttemptOwner::Job => MintedPullIdentity::of(a) == MintedPullIdentity::Build,
+            AttemptOwner::Pod { pod: _, node } => {
+                MintedPullIdentity::of(a) == MintedPullIdentity::Build
+                    && !node.is_empty()
+                    && !a.source_node.is_empty()
+                    && a.source_node == *node
             }
         }
     }
@@ -652,7 +759,7 @@ pub(super) fn synthesized_report_for_intent(
 /// rule). The delete error is returned unchanged so call sites keep
 /// their existing Ok/NotFound/Err handling (the deleted-object body is
 /// dropped — no current call site reads it).
-// r[impl ctrl.job.synthesize-on-delete]
+// r[impl ctrl.job.synthesize-on-delete+2]
 pub(super) async fn delete_job_with_synthesized_report(
     jobs_api: &Api<Job>,
     ctx: &Ctx,

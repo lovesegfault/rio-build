@@ -469,10 +469,16 @@ async fn disruption_open_attempt_sends_exec_pinned_report() {
 
     let (client, verifier) = ApiServerVerifier::new();
     let (ctx, mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
+    // bug_071: the production mint binds a build pull to the attested
+    // intent itself — executor_id IS the intent id, kind says Build.
+    // (The retired fixture's empty executor_id was unmintable; it
+    // survived only on the production-vacuous `source_node` disjunct.)
     mock.open_attempts.write().unwrap().attempts = vec![rio_proto::types::OpenAttempt {
         intent_id: "drv-disrupted".into(),
+        executor_id: "drv-disrupted".into(),
         exec_id: "exec-dis-1".into(),
         source_node: "node-3".into(),
+        attempt_kind: rio_proto::types::AttemptKind::Build as i32,
         ..Default::default()
     }];
     let mut admin = ctx.admin.clone();
