@@ -2053,7 +2053,7 @@ rec {
     # must falsify). Measured: exhaustive TLC ~3s / ~53k distinct
     # states (transcript authoritative) -- the default 1800s budget
     # is ~600x headroom.
-    # r[verify builder.log.loss-disclosure+4]
+    # r[verify builder.log.loss-disclosure+5]
     quint-log-service-producer = mkQuintCheck {
       name = "log-service-producer";
       spec = "logService";
@@ -2287,7 +2287,7 @@ rec {
 
     # An abandonment actually fires the disclosure counter — the
     # counted arm of the loss lattice is exercised.
-    # r[verify builder.log.loss-disclosure+4]
+    # r[verify builder.log.loss-disclosure+5]
     quint-log-service-witness-loss-counted = mkQuintWitnessCheck {
       name = "log-service-witness-loss-counted";
       spec = "logService";

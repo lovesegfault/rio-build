@@ -617,7 +617,7 @@ requirement and the display-only / no-pod-identity rationale live in
   to `0` means unlimited.
 ]
 
-#r("builder.log.loss-disclosure+4")[
+#r("builder.log.loss-disclosure+5")[
   Every line handed to the log-upload data plane that is not durably stored
   MUST be disclosed through one chokepoint that derives the loss from the
   abandonment reason: an upload that ends with un-acked lines increments
@@ -626,10 +626,19 @@ requirement and the display-only / no-pod-identity rationale live in
   reason is the store provably holding the complete `[0, final_line_count)`
   log. The disclosure partition MUST be TOTAL over the produced population:
   lines the uploader accepted disclose from the unwind guard (`panic`);
-  lines resident in the upload channel when its receiver dies disclose from
-  the receiver's own drop guard (`uploader_dead` --- they never reached the
+  lines resident in the upload channel disclose through the
+  recv-to-`None` exhaustion protocol on every NORMAL task exit --- the only
+  lossless teardown the channel offers, since a send permit granted before
+  `close()` can still deliver after it --- and the task MUST hold the
+  input-exhaustion witness before minting a terminal status; when the
+  receiver instead dies UNWINDING (the one path that cannot run the async
+  drain), the residue discloses from the receiver's own BEST-EFFORT drop
+  guard (`uploader_dead` --- they never reached the
   uploader's accounting, so no ack can cover them and no progress snapshot
-  counts them); lines the channel refused disclose producer-side as
+  counts them; the guard closes, lets cross-thread permits granted before
+  the close land within a bounded spin, and discloses what it drained ---
+  a permit delivery that outlives even that bounded window is the
+  unwind path's documented residual); lines the channel refused disclose producer-side as
   `uploader_dead`: inside the stderr loop through the discard-ledger sink
   (ONE accumulated total at teardown); banner/footer sends --- which run
   outside the stderr loop --- disclose directly at the send site through

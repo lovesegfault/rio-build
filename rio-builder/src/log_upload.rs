@@ -175,7 +175,7 @@ fn lost_lines(reason: AbandonReason, unacked: u64) -> u64 {
     }
 }
 
-// r[impl builder.log.loss-disclosure+4]
+// r[impl builder.log.loss-disclosure+5]
 /// THE single disclosure site: the only place
 /// `rio_builder_log_drain_abandoned_total` is incremented.
 /// Counter ⟺ `lost_lines > 0`, by construction — a zero-loss abandon
@@ -204,7 +204,7 @@ fn disclose(reason: AbandonReason, unacked_lines: u64, last_acked_line: Option<u
     );
 }
 
-// r[impl builder.log.loss-disclosure+4]
+// r[impl builder.log.loss-disclosure+5]
 /// Producer-side entry (bug_241): the stderr loop's post-uploader-death
 /// discard total, routed through THE single `disclose` chokepoint as
 /// `reason="uploader_dead"`. The counting stays at one site; the
@@ -215,7 +215,7 @@ pub(crate) fn disclose_uploader_dead(discarded_lines: u64) {
     disclose(AbandonReason::UploaderDead, discarded_lines, None);
 }
 
-// r[impl builder.log.loss-disclosure+4]
+// r[impl builder.log.loss-disclosure+5]
 /// merged_bug_009: the upload channel's receiving end, with a
 /// conservation drop guard. Batches the stderr loop successfully
 /// `send()`-ed but the task never `recv()`-ed are destroyed when the
@@ -244,21 +244,61 @@ impl ResidueReceiver {
     }
 }
 
+/// Bounded spin budget for the drop guard's cross-thread-permit
+/// window (merged_bug_010): a permit granted before `close()` is a
+/// store-into-the-queue away from landing — but the HOLDING thread
+/// may be descheduled under CPU contention, and `yield_now` alone
+/// does not hand it a core. Every 16th empty poll therefore sleeps
+/// 100us (a sleep releases the core; a yield only hints), bounding
+/// the worst case at ~12.8ms of unwind-path teardown — strictly
+/// bounded (Drop may run on a runtime worker; it must not park
+/// indefinitely), and instant in the common no-permit case
+/// (`Disconnected` breaks immediately).
+const RESIDUE_SPIN_BUDGET: u32 = 2048;
+const RESIDUE_SPIN_SLEEP_EVERY: u32 = 16;
+const RESIDUE_SPIN_SLEEP: Duration = Duration::from_micros(100);
+
 impl Drop for ResidueReceiver {
     fn drop(&mut self) {
-        // close() BEFORE draining (merged_bug_009): after close, no
-        // in-flight send can complete -- a reserve()d permit fails and
-        // the sender's bounce lands in the counted refusal path
-        // (UploadSink::Lost / the DiscardLedger), while everything that
-        // made it into the channel before the close is yielded by the
-        // drain below. Without the close there is a third outcome: a
-        // send that completes between a try_recv(Empty) observation and
-        // the receiver's actual drop returns Ok to the sender yet its
-        // batch dies here uncounted.
+        // Best-effort UNWIND backstop — explicitly NOT the lossless
+        // protocol (merged_bug_010). tokio's documented teardown
+        // semantics (bounded.rs) are the opposite of what this guard
+        // once claimed: a `reserve()`d permit that was GRANTED before
+        // `close()` can still deliver after it — "after calling
+        // close(), recv() must be called until None" is the only
+        // lossless teardown. The task's normal exits run exactly that
+        // protocol (the InputExhausted typestate every DrainStatus
+        // mint demands), so this guard is scoped to the UNWIND path,
+        // where no async drain can run:
+        //  - close() refuses NEW reserves — their bounce lands in the
+        //    counted refusal path (UploadSink::Lost / DiscardLedger);
+        //  - the bounded yield-spin below lets cross-thread permits
+        //    that were granted before the close land (try_recv
+        //    reports Empty, not Disconnected, while a permit is
+        //    outstanding — the spin covers exactly that window);
+        //  - everything drained discloses through the chokepoint.
+        // A permit-send that outlives even the spin budget dies
+        // uncounted: that bounded residual is what the rule text
+        // scopes this guard to (builder.log.loss-disclosure).
         self.0.close();
         let mut residue: u64 = 0;
-        while let Ok(b) = self.0.try_recv() {
-            residue = residue.saturating_add(b.lines.len() as u64);
+        let mut spin = RESIDUE_SPIN_BUDGET;
+        loop {
+            match self.0.try_recv() {
+                Ok(b) => residue = residue.saturating_add(b.lines.len() as u64),
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    if spin == 0 {
+                        break;
+                    }
+                    spin -= 1;
+                    if spin.is_multiple_of(RESIDUE_SPIN_SLEEP_EVERY) {
+                        std::thread::sleep(RESIDUE_SPIN_SLEEP);
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
         }
         if residue > 0 {
             disclose_uploader_dead(residue);
@@ -337,6 +377,46 @@ pub enum DrainStatus {
     },
 }
 
+/// Witness that THIS task's input channel was drained to `None` — the
+/// recv-to-`None` exhaustion protocol, the only lossless teardown the
+/// channel offers (merged_bug_010: a granted send permit can deliver
+/// AFTER `close()`, so only awaiting `None` proves no batch is in
+/// flight). Minted at exactly the two `recv() == None` observations
+/// (`accept(None)` and `reject_permanently`'s explicit drain); every
+/// normal-exit `DrainStatus` mint demands it, so an exit path that did
+/// not drain its input to `None` cannot construct a terminal status.
+/// `Copy`: input exhaustion is monotone — once observed, always true.
+#[derive(Clone, Copy)]
+struct InputExhausted(());
+
+impl DrainStatus {
+    /// Task-exit `Drained` mint — demands the input-exhaustion
+    /// witness: "every NORMAL exit leaves the channel empty" is a
+    /// typestate, not prose (merged_bug_010).
+    fn drained_after(_input: InputExhausted, final_acked_line: Option<u64>) -> Self {
+        DrainStatus::Drained { final_acked_line }
+    }
+
+    /// Task-exit `Abandoned` mint — same witness demand: abandons
+    /// (deadline, permanent rejection) also finish the recv-to-`None`
+    /// protocol before reporting (the deadline arms only at input
+    /// close; `reject_permanently` drains explicitly). The caller-side
+    /// panic/detach constructions do NOT route here: they make no
+    /// channel-empty claim (the unwind backstop owns that path).
+    fn abandoned_after(
+        _input: InputExhausted,
+        reason: AbandonReason,
+        last_acked_line: Option<u64>,
+        unacked_lines: u64,
+    ) -> Self {
+        DrainStatus::Abandoned {
+            last_acked_line,
+            unacked_lines,
+            reason,
+        }
+    }
+}
+
 /// Handle to a per-build `AppendLog` upload task. See the module doc.
 pub struct LogUploader {
     /// The uploader's own copy of the input sender. The input channel
@@ -408,7 +488,7 @@ impl LogUploader {
             token,
             config,
             input: ResidueReceiver(rx),
-            input_open: true,
+            input_exhausted: None,
             buffer: VecDeque::new(),
             unacked_lines: 0,
             last_acked_line: None,
@@ -498,10 +578,14 @@ enum SessionEnd {
     /// retryable status or ended with lines still un-acked). Reconnect
     /// and replay.
     Reconnect,
-    /// Everything accepted has been acked and the input is closed.
-    Drained,
-    /// The drain deadline expired with lines still un-acked.
-    DeadlineExpired,
+    /// Everything accepted has been acked and the input is closed —
+    /// carries the recv-to-`None` witness the `DrainStatus` mint
+    /// demands (merged_bug_010).
+    Drained(InputExhausted),
+    /// The drain deadline expired with lines still un-acked. The
+    /// deadline arms only when `accept(None)` observes the input
+    /// close, so the witness rides along structurally.
+    DeadlineExpired(InputExhausted),
     /// The store rejected the stream MID-FLIGHT with a permanent status
     /// (a cap trip, the completeness seal landing, a supersession).
     /// Reconnecting can never succeed — without this arm the uploader
@@ -530,7 +614,10 @@ struct UploadTask {
 
     input: ResidueReceiver,
     /// False once the input channel has yielded `None`.
-    input_open: bool,
+    /// `Some` once the input channel's `recv()` yielded `None` — the
+    /// witness every normal-exit `DrainStatus` mint demands
+    /// (merged_bug_010). `None` ⇔ the input is still open.
+    input_exhausted: Option<InputExhausted>,
     /// Every accepted batch not yet covered by an ack, in line order.
     /// Retransmitted in full on every reconnect.
     buffer: VecDeque<BuildLogBatch>,
@@ -575,14 +662,17 @@ impl UploadTask {
 
     async fn run_inner(&mut self) -> DrainStatus {
         loop {
-            // Exit conditions, checked between sessions.
-            if !self.input_open && self.buffer.is_empty() {
-                return DrainStatus::Drained {
-                    final_acked_line: self.last_acked_line,
-                };
+            // Exit conditions, checked between sessions. Both mints
+            // demand the input-exhaustion witness (merged_bug_010).
+            if let Some(input) = self.input_exhausted
+                && self.buffer.is_empty()
+            {
+                return DrainStatus::drained_after(input, self.last_acked_line);
             }
-            if self.deadline_expired() {
-                return self.abandoned();
+            if let Some(input) = self.input_exhausted
+                && self.deadline_expired()
+            {
+                return self.abandoned(input);
             }
 
             // Open a session. `open()` drains the input into the buffer
@@ -614,12 +704,10 @@ impl UploadTask {
 
             // Drive the session until it dies or drains.
             match self.drive(out, acks).await {
-                SessionEnd::Drained => {
-                    return DrainStatus::Drained {
-                        final_acked_line: self.last_acked_line,
-                    };
+                SessionEnd::Drained(input) => {
+                    return DrainStatus::drained_after(input, self.last_acked_line);
                 }
-                SessionEnd::DeadlineExpired => return self.abandoned(),
+                SessionEnd::DeadlineExpired(input) => return self.abandoned(input),
                 SessionEnd::PermanentReject(status) => {
                     tracing::warn!(
                         code = ?status.code(),
@@ -717,7 +805,7 @@ impl UploadTask {
             // transmitted and no more input is coming: the server runs its
             // final drain (cutting every remaining contiguous run) and acks
             // it, then ends the ack stream.
-            if !self.input_open && sent == self.buffer.len() && out.is_some() {
+            if self.input_exhausted.is_some() && sent == self.buffer.len() && out.is_some() {
                 out = None;
             }
 
@@ -730,8 +818,9 @@ impl UploadTask {
             // the deadline arm below is a pure waker.
             if let Some(d) = self.deadline
                 && Instant::now() >= d
+                && let Some(input) = self.input_exhausted
             {
-                return SessionEnd::DeadlineExpired;
+                return SessionEnd::DeadlineExpired(input);
             }
 
             let deadline = self.deadline_sleep();
@@ -747,8 +836,10 @@ impl UploadTask {
                     Ok(Some(ack)) => {
                         let popped = self.trim(ack.durable_through_line);
                         sent = sent.saturating_sub(popped);
-                        if !self.input_open && self.buffer.is_empty() {
-                            return SessionEnd::Drained;
+                        if let Some(input) = self.input_exhausted
+                            && self.buffer.is_empty()
+                        {
+                            return SessionEnd::Drained(input);
                         }
                     }
                     // The server ended the ack stream. If everything is
@@ -756,8 +847,10 @@ impl UploadTask {
                     // otherwise the server went away mid-stream and the
                     // un-acked tail must be replayed elsewhere.
                     Ok(None) => {
-                        if !self.input_open && self.buffer.is_empty() {
-                            return SessionEnd::Drained;
+                        if let Some(input) = self.input_exhausted
+                            && self.buffer.is_empty()
+                        {
+                            return SessionEnd::Drained(input);
                         }
                         return SessionEnd::Reconnect;
                     }
@@ -805,7 +898,7 @@ impl UploadTask {
                 // a torn-down receiver routes to Reconnect like any
                 // other send.
                 _ = keepalive.tick(),
-                    if out.is_some() && self.input_open && sent == self.buffer.len() =>
+                    if out.is_some() && self.input_exhausted.is_none() && sent == self.buffer.len() =>
                 {
                     match out.as_ref().expect("guarded by the if").try_reserve() {
                         Ok(permit) => permit.send(AppendLogRequest {
@@ -828,7 +921,7 @@ impl UploadTask {
                 // Accept new input. Always enabled while the input is open,
                 // even when the outbound is saturated — the buffer (not the
                 // outbound channel) is the backpressure absorber.
-                batch = self.input.recv(), if self.input_open => {
+                batch = self.input.recv(), if self.input_exhausted.is_none() => {
                     self.accept(batch);
                 }
 
@@ -870,7 +963,7 @@ impl UploadTask {
             let expiry = self.deadline_sleep();
             tokio::select! {
                 out = &mut fut => return Some(out),
-                batch = self.input.recv(), if self.input_open => self.accept(batch),
+                batch = self.input.recv(), if self.input_exhausted.is_none() => self.accept(batch),
                 _ = expiry, if self.deadline.is_some() => {}
             }
         }
@@ -900,7 +993,10 @@ impl UploadTask {
                 self.publish(false);
             }
             None => {
-                self.input_open = false;
+                // THE recv-to-None observation: mint the witness the
+                // normal-exit DrainStatus constructors demand
+                // (merged_bug_010), and arm the drain deadline.
+                self.input_exhausted = Some(InputExhausted(()));
                 self.deadline = Some(Instant::now() + self.config.drain_deadline);
             }
         }
@@ -967,7 +1063,7 @@ impl UploadTask {
         }
     }
 
-    // r[impl builder.log.loss-disclosure+4]
+    // r[impl builder.log.loss-disclosure+5]
     /// Buffered lines strictly above the ack watermark — the
     /// DISCLOSURE view of the un-acked count (bug_144). Derived at
     /// every disclosure surface rather than cached, so it stays
@@ -996,29 +1092,30 @@ impl UploadTask {
         self.buffer.clear();
         // `unacked_lines` deliberately keeps counting: the Abandoned status
         // reports how many lines were discarded.
-        while self.input_open {
-            let batch = self.input.recv().await;
-            match batch {
-                Some(b) => {
-                    self.unacked_lines += b.lines.len() as u64;
-                    self.publish(false);
-                }
-                None => self.input_open = false,
+        let input = loop {
+            match self.input_exhausted {
+                Some(input) => break input,
+                None => match self.input.recv().await {
+                    Some(b) => {
+                        self.unacked_lines += b.lines.len() as u64;
+                        self.publish(false);
+                    }
+                    // The second recv-to-None mint site: this drain IS
+                    // the exhaustion protocol for the rejection path.
+                    None => self.input_exhausted = Some(InputExhausted(())),
+                },
             }
-        }
-        DrainStatus::Abandoned {
-            last_acked_line: self.last_acked_line,
-            unacked_lines: self.unacked_lines,
-            reason,
-        }
+        };
+        DrainStatus::abandoned_after(input, reason, self.last_acked_line, self.unacked_lines)
     }
 
-    fn abandoned(&self) -> DrainStatus {
-        DrainStatus::Abandoned {
-            reason: AbandonReason::DeadlineExpired,
-            last_acked_line: self.last_acked_line,
-            unacked_lines: self.unacked_above_watermark(),
-        }
+    fn abandoned(&self, input: InputExhausted) -> DrainStatus {
+        DrainStatus::abandoned_after(
+            input,
+            AbandonReason::DeadlineExpired,
+            self.last_acked_line,
+            self.unacked_above_watermark(),
+        )
     }
 
     fn deadline_expired(&self) -> bool {
@@ -1796,7 +1893,7 @@ mod tests {
         );
     }
 
-    // r[verify builder.log.loss-disclosure+4]
+    // r[verify builder.log.loss-disclosure+5]
     /// bug_144: a mid-frame ack — the store's line-granular
     /// `durable_through_line` landing INSIDE a buffered frame — must
     /// advance the watermark and shrink the disclosed loss to the
@@ -1857,7 +1954,7 @@ mod tests {
     //    builder.log.loss-disclosure)
     // ------------------------------------------------------------------
 
-    // r[verify builder.log.loss-disclosure+4]
+    // r[verify builder.log.loss-disclosure+5]
     /// merged_bug_360 (red-first): PERMISSION_DENIED with un-acked lines
     /// is durable loss — the superseding attempt produces ITS OWN log,
     /// not these lines. Pre-fix, `rejected: true` suppressed the
@@ -1897,7 +1994,7 @@ mod tests {
         );
     }
 
-    // r[verify builder.log.loss-disclosure+4]
+    // r[verify builder.log.loss-disclosure+5]
     /// merged_bug_360 (red-first): a panic in the upload task must
     /// disclose the un-acked lines. Pre-fix the counter fired only at
     /// `run()`'s normal exit, which a panicking task never reaches —
@@ -1953,7 +2050,7 @@ mod tests {
         );
     }
 
-    // r[verify builder.log.loss-disclosure+4]
+    // r[verify builder.log.loss-disclosure+5]
     /// merged_bug_009 (channel-resident population): batches sent into
     /// the upload channel but never received are destroyed when the
     /// receiver drops mid-unwind — they are in NO progress snapshot
@@ -1978,7 +2075,7 @@ mod tests {
         );
     }
 
-    // r[verify builder.log.loss-disclosure+4]
+    // r[verify builder.log.loss-disclosure+5]
     /// merged_bug_009: the parked-sender-vs-drop race. Drop closes the
     /// channel BEFORE draining, so a send still parked when the
     /// receiver dies must resolve Err (the caller's counted bounce
@@ -2007,7 +2104,7 @@ mod tests {
         }
     }
 
-    // r[verify builder.log.loss-disclosure+4]
+    // r[verify builder.log.loss-disclosure+5]
     /// The conservation guard's zero arm: a receiver that drops with
     /// an EMPTY channel (every normal exit — recv() yields all queued
     /// items before None) discloses nothing.
@@ -2025,7 +2122,90 @@ mod tests {
         );
     }
 
-    // r[verify builder.log.loss-disclosure+4]
+    // r[verify builder.log.loss-disclosure+5]
+    /// merged_bug_010 red: a permit GRANTED before `close()` delivers
+    /// its batch after close — tokio's documented semantics
+    /// (bounded.rs: "Any outstanding Permit values will still be able
+    /// to send messages... after calling close(), recv() must be
+    /// called until None") are the OPPOSITE of the drop guard's
+    /// pre-fix claim ("after close, no in-flight send can complete").
+    /// A cross-thread send through the production reserve()/Permit
+    /// path that lands after the guard's drain pass dies in NO term
+    /// of the conservation law: the producer saw Ok (no bounce), the
+    /// uploader never accepted it (no panic guard), and the drop
+    /// guard's accounting already finished.
+    ///
+    /// 200 rounds; per round the producer thread reserves through the
+    /// production mpsc Sender, signals, parks one beat, then sends on
+    /// the granted permit while the main thread concurrently drops
+    /// the receiver. Conservation: a produced batch (reserve granted
+    /// => infallible Permit::send) must be disclosed by the guard;
+    /// a bounced reserve is the producer's counted path.
+    #[test]
+    fn granted_permit_vs_drop_conserves_every_line() {
+        let rec = CountingRecorder::default();
+        let mut disclosed_so_far = 0u64;
+        for round in 0..200 {
+            let (tx, rx) = mpsc::channel::<BuildLogBatch>(2);
+            let rr = super::ResidueReceiver(rx);
+            let (granted_tx, granted_rx) = std::sync::mpsc::channel::<()>();
+            let producer = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("mini runtime");
+                rt.block_on(async move {
+                    match tx.reserve().await {
+                        Ok(permit) => {
+                            // The permit is GRANTED. Tell the main
+                            // thread, give the receiver drop a beat
+                            // to start (the race under test), then
+                            // deliver — tokio guarantees this send
+                            // succeeds even after close().
+                            let _ = granted_tx.send(());
+                            for _ in 0..3 {
+                                std::thread::yield_now();
+                            }
+                            permit.send(batch(0, 2));
+                            true
+                        }
+                        Err(_) => false,
+                    }
+                })
+            });
+            // Drop the receiver concurrently with the granted
+            // permit's delivery (the unwind shape). The disclose
+            // chokepoint runs inside this drop, on this thread.
+            let produced = match granted_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(()) => {
+                    metrics::with_local_recorder(&rec, || drop(rr));
+                    true
+                }
+                Err(_) => {
+                    // reserve() bounced (it raced an already-closed
+                    // channel only if drop ran first — impossible
+                    // here, we have not dropped yet — or the thread
+                    // died); count the producer's verdict.
+                    metrics::with_local_recorder(&rec, || drop(rr));
+                    false
+                }
+            };
+            let produced = produced && producer.join().expect("producer thread");
+            let disclosed_now =
+                rec.get("rio_builder_log_drain_abandoned_total{reason=uploader_dead}");
+            if produced {
+                assert!(
+                    disclosed_now > disclosed_so_far,
+                    "round {round}: produced=2 lines, accounted=0 — the permit \
+                     was granted before close() and delivered after the drain; \
+                     the batch died in no term of the conservation law \
+                     (uploader_dead never fired)"
+                );
+            }
+            disclosed_so_far = disclosed_now;
+        }
+    }
+
+    // r[verify builder.log.loss-disclosure+5]
     /// bug_248 (red-first): a permanent rejection arriving MID-STREAM
     /// (the cap tripping while the stream is open) must stop the
     /// session loop — pre-fix it was classified Reconnect and the
@@ -2075,7 +2255,7 @@ mod tests {
         );
     }
 
-    // r[verify builder.log.loss-disclosure+4]
+    // r[verify builder.log.loss-disclosure+5]
     /// Polarity guard: a `complete` rejection (the store provably holds
     /// the full `[0, final)` log) is the ONE zero-loss abandon — no
     /// counter, under any reason label.

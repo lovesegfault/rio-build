@@ -265,7 +265,7 @@ impl<'a> StderrLoop<'a> {
         }
     }
 
-    // r[impl builder.log.loss-disclosure+4]
+    // r[impl builder.log.loss-disclosure+5]
     /// Send a log batch to the per-build uploader. Never aborts the
     /// loop: a closed upload channel means the uploader task panicked,
     /// and a build is never failed because its log could not be
@@ -705,7 +705,7 @@ mod tests {
             .block_on(fut)
     }
 
-    // r[verify builder.log.loss-disclosure+4]
+    // r[verify builder.log.loss-disclosure+5]
     /// bug_241: lines produced AFTER the uploader dies must be
     /// disclosed through the loss chokepoint, not silently discarded.
     /// The pre-fix `upload_lost` early-return was one step upstream of
