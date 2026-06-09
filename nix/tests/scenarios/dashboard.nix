@@ -357,6 +357,30 @@ in
           + "\"firstLineNumber\":\"2\"}}' > /tmp/dash-b2.json"
       )
 
+      # bug_309: the client wall-clock caps are DERIVED from the summed
+      # downstream gate budgets + slack, in ONE binding — a cap below
+      # the sum kills a healthy-but-slow run that stays inside every
+      # gate's own budget (the exact load regime those budgets were
+      # sized for), striking as the same unnamed timeout this
+      # choreography was restructured to eliminate (pre-fix:
+      # grpcurl -max-time 300 vs 480s of summed pre-batch-2 gates;
+      # curl --max-time 180 vs 240s of post-open gates). The finally
+      # block kills both processes, so generosity is free: the caps
+      # are leak insurance, never the pacing control. The SESSION's
+      # liveness is governed separately by the writer's ~5s keepalive
+      # cadence vs the store's 60s inbound-idle bound (see the
+      # choreography comment above) — wall-clock caps must only
+      # outlive the gates. Adding a gate to the choreography extends
+      # the caps automatically through these bindings.
+      lease_gate_1 = 180  # ingest chain to batch-1 lease (recorded >150s tail)
+      data_gate    = 150  # one-shot serve: cut interval + slack (see below)
+      open_grep    = 90   # snapshot phase serves batch 1
+      lease_gate_2 = 60   # two staleness windows of psql/exec slack
+      post_grep    = 90   # live fan-out delivers batch 2
+      cap_slack    = 120  # spawn/teardown + load-dilated sleep loops
+      appendlog_cap = lease_gate_1 + data_gate + open_grep + lease_gate_2 + post_grep + cap_slack
+      follow_cap    = open_grep + lease_gate_2 + post_grep + cap_slack
+
       # Long-lived store port-forward for the AppendLog session.
       pf_open("svc/rio-store", 19510, 9002, ns="${nsStore}", tag="pf-store-live")
       token = k3s_server.succeed("cat ${liveAssignmentToken}").strip()
@@ -367,7 +391,7 @@ in
           # Every backgrounded process FULLY redirects its fds — an
           # inherited test-driver backdoor descriptor breaks the
           # driver's channel ([Errno 9] Bad file descriptor).
-          "(${grpcurl} -plaintext -max-time 300 "
+          "(${grpcurl} -plaintext -max-time " + str(appendlog_cap) + " "
           "-protoset ${protoset}/rio.protoset "
           "-H 'x-rio-assignment-token: " + token + "' "
           "-d @ localhost:19510 rio.store.LogService/AppendLog "
@@ -402,7 +426,7 @@ in
           "AND heartbeat_at > now() - interval '30 seconds'\" "
           "| grep -qx 1"
       )
-      k3s_server.wait_until_succeeds(lease_fresh, timeout=180)
+      k3s_server.wait_until_succeeds(lease_fresh, timeout=lease_gate_1)
 
       # Data gate, after the lease gate: a one-shot TailLog (direct,
       # the long-lived store port-forward) must serve batch 1 first. A
@@ -425,7 +449,7 @@ in
           "-protoset ${protoset}/rio.protoset "
           "-d '{\"derivation\":\"${liveDrvFullPath}\",\"follow\":false}' "
           "localhost:19510 rio.store.LogService/TailLog "
-          "| grep -q " + b64_line1, timeout=150,
+          "| grep -q " + b64_line1, timeout=data_gate,
       )
 
       try:
@@ -434,7 +458,7 @@ in
           # raw gRPC-Web frames (line bytes appear verbatim inside DATA
           # frames).
           k3s_server.succeed(
-              "curl -sN --max-time 180 -X POST "
+              "curl -sN --max-time " + str(follow_cap) + " -X POST "
               "http://localhost:18081/rio.store.LogService/TailLog "
               "-H 'content-type: application/grpc-web+proto' "
               "-H 'x-grpc-web: 1' "
@@ -445,7 +469,7 @@ in
           # The snapshot phase serves batch 1 (already in the live
           # buffer): proves the stream attached to the live session.
           k3s_server.wait_until_succeeds(
-              "grep -aq dash-live-00001 /tmp/livetail.bin", timeout=90
+              "grep -aq dash-live-00001 /tmp/livetail.bin", timeout=open_grep
           )
           # The post-open assertion's precondition, made structural:
           # the session that must carry batch 2 is STILL leased. Under
@@ -457,14 +481,14 @@ in
           # port-forward → store driver) actually died — fail loud and
           # named here instead. 60s = two staleness windows of psql/
           # exec slack under load.
-          k3s_server.wait_until_succeeds(lease_fresh, timeout=60)
+          k3s_server.wait_until_succeeds(lease_fresh, timeout=lease_gate_2)
           # Batch 2, sent on the SAME open session AFTER the stream
           # opened: the live fan-out must deliver it to the open
           # connection — the incremental flush through nginx that
           # proxy_buffering off exists to allow.
           k3s_server.succeed("touch /tmp/dash-live.go2")
           k3s_server.wait_until_succeeds(
-              "grep -aq dash-live-00003 /tmp/livetail.bin", timeout=90
+              "grep -aq dash-live-00003 /tmp/livetail.bin", timeout=post_grep
           )
       except Exception:
           print("== DIAGNOSTIC: live-tail subtest ==")
