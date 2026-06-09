@@ -2590,21 +2590,26 @@ deadline. Non-K8s single-scheduler deployments construct their leader state
 with recovery already complete and never run the lease loop, so no
 confirmation is ever required there.
 
-#r("sched.recovery.step-down+2")[
+#r("sched.recovery.step-down+3")[
   A tenure whose state recovery fails MUST NOT be completed: the replica
   MUST NOT mark recovery complete, MUST NOT treat its in-memory DAG as
   authoritative, and MUST request a cooperative lease step-down so a healthy
-  replica can acquire. The step-down request MUST carry the tenure that
-  issued it (its `acquired_transitions` stamp), and the lease loop MUST
-  serve it at its next BELIEVING tick and only while that tenure is still
+  replica can acquire. The step-down request MUST carry the tenure INSTANCE
+  that issued it --- a monotone per-acquire stamp never reused across
+  re-acquires; the lease transition count is NOT a tenure-instance
+  identifier, because a self-fence false alarm followed by a same-epoch
+  re-acquire legitimately repeats it. The lease loop MUST serve the request
+  at its next BELIEVING tick and only while the issuing instance is still
   current: service releases the lease (holder-guarded, bounded by the renew
   deadline) and fires the full lose-edge effects --- leader-state clear,
   consumer on-lose hook, leader-marks reconciliation --- before candidacy
   resumes on the following tick. A tick on which the replica does not
-  believe it leads MUST leave the request armed (a self-fence false alarm
-  followed by a same-epoch re-acquire must not lose it), and a request
-  whose tenure has ended by service time MUST be dropped, never served
-  against the successor tenure --- the successor never asked to step down.
+  believe it leads MUST leave the request armed; the acquire and rebound
+  EDGES MUST clear any pending request --- a new tenure instance starts
+  clean, and a recovery that fails again under the successor re-files with
+  the successor's own stamp; and a request whose instance is no longer
+  current at service time MUST be dropped, never served against the
+  successor tenure --- the successor never asked to step down.
   The durable generation claim recorded for
   the failed tenure is NOT released: the floor only grows, and an unserved
   claim is a harmless over-claim. Failed recoveries MUST be operator-visible

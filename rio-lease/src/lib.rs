@@ -1360,7 +1360,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
             hooks.on_lose();
         }
 
-        // r[impl sched.recovery.step-down+2]
+        // r[impl sched.recovery.step-down+3]
         // Cooperative step-down: a
         // consumer that cannot serve its tenure (failed recovery)
         // requested a local demotion. Belief is evaluated FIRST and the
@@ -5456,7 +5456,7 @@ mod tests {
     /// hook delivered) — and the FOLLOWING tick resumes candidacy and
     /// re-acquires. Pre-fix there was no such API: a broken tenure
     /// held the lease until a real lose/fence, serving nothing.
-    // r[verify sched.recovery.step-down+2]
+    // r[verify sched.recovery.step-down+3]
     #[tokio::test(start_paused = true)]
     async fn step_down_consumed_within_one_tick_then_candidacy_resumes() {
         let (client, _mock) = MockApiServer::new();
@@ -5535,7 +5535,7 @@ mod tests {
     /// demoted the healthy successor tenure N+1 that a rebound had just
     /// installed (the request's issuer no longer exists; the successor
     /// never asked to step down).
-    // r[verify sched.recovery.step-down+2]
+    // r[verify sched.recovery.step-down+3]
     #[tokio::test(start_paused = true)]
     async fn stale_tenure_step_down_request_cannot_demote_a_rebounded_tenure() {
         let (client, mock) = MockApiServer::new();
@@ -5625,7 +5625,7 @@ mod tests {
     /// is exactly the stale demotion the instance stamp exists to
     /// drop: recovery #1's failure must not fire against a successor
     /// whose recovery #2 succeeded.)
-    // r[verify sched.recovery.step-down+2]
+    // r[verify sched.recovery.step-down+3]
     #[tokio::test(start_paused = true)]
     async fn same_epoch_reacquire_drops_the_stale_request_and_a_fresh_one_serves() {
         let (client, mock) = MockApiServer::new();

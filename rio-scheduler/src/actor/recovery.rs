@@ -1857,7 +1857,7 @@ impl DagActor {
 
         let recovered = match result {
             Err(e) => {
-                // r[impl sched.recovery.step-down+2]
+                // r[impl sched.recovery.step-down+3]
                 // DAG load failed: this tenure NEVER serves. The old
                 // doctrine completed here with an empty DAG ("degrade,
                 // don't block") — a zombie that answered pulls from
@@ -1920,7 +1920,7 @@ impl DagActor {
     /// no-op — kept unconditional so there is exactly one seed call
     /// site. Synchronous throughout — the no-awaits-before-
     /// `set_recovery_complete()` INVARIANT at the gen re-check holds.
-    // r[impl sched.recovery.step-down+2]
+    // r[impl sched.recovery.step-down+3]
     fn complete_tenure(
         &mut self,
         _recovered: RecoveredDag,

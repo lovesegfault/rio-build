@@ -291,7 +291,7 @@ async fn test_recovery_transitive_failed_dep_persisted() -> TestResult {
 /// floored load-failure path is pinned by
 /// `test_recovery_load_failure_claims_then_steps_down`.
 // r[verify sched.recovery.gate-dispatch]
-// r[verify sched.recovery.step-down+2]
+// r[verify sched.recovery.step-down+3]
 #[tokio::test]
 async fn test_recovery_failure_steps_down_never_serves() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -1402,7 +1402,7 @@ async fn test_recovery_confirmed_bump_seeds_and_completes() -> TestResult {
 /// already moved).
 // r[verify sched.lease.generation-claim+2]
 // r[verify sched.recovery.bump-confirm+3]
-// r[verify sched.recovery.step-down+2]
+// r[verify sched.recovery.step-down+3]
 #[tokio::test]
 async fn test_recovery_load_failure_claims_then_steps_down() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;

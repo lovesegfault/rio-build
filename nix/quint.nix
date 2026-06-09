@@ -5893,7 +5893,7 @@ rec {
     # r[verify sched.lease.fence-statement-guard]
     # r[verify sched.grpc.fence-retryable]
     # r[verify sched.lease.tenure-stamp-type]
-    # r[verify sched.recovery.step-down+2]
+    # r[verify sched.recovery.step-down+3]
     # r[verify sched.attempt.cancel-close-driven+1]
     quint-fenced-writes = mkQuintCheck {
       name = "fenced-writes";
