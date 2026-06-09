@@ -206,7 +206,7 @@ enum Phase3Render {
 /// merged_bug_052: the crate-neutral outcome mirror BOTH suites assert
 /// through ([`rio_common::classify::GcPhase3Outcome`] — the
 /// `AttemptTerminalKind` precedent: the exhaustive `From` lives next
-/// to the mirrored enum). [`render_phase3`] renders THROUGH the shared
+/// to the mirrored enum). `render_phase3` renders THROUGH the shared
 /// prefix constants and the CLI matches THROUGH the shared predicate,
 /// so a reword is a one-site const edit, never a silent exit-0 on a
 /// failed destructive collect.
