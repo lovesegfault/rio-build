@@ -68,7 +68,7 @@ impl StoreEvidenceSet {
     }
 }
 
-// r[impl builder.outcome.store-degraded+2]
+// r[impl builder.outcome.store-degraded+3]
 /// bug_408 + bug_286: stamp `store_degraded` onto an assembled
 /// `ProtoBuildResult` iff the status is `InfrastructureFailure`. The
 /// single chokepoint all three assembly paths (ok/err/panic) route
@@ -130,10 +130,11 @@ fn fold_error_evidence(e: &ExecutorError, evidence: &mut StoreEvidenceSet) {
         // at the input-metadata fetch. Per-input verdicts
         // (`NotFound`, `Internal`, …) are NOT degradation.
         E::MetadataFetch { source, .. } => {
-            evidence.metadata_fetch |= matches!(
-                source.code(),
-                tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
-            );
+            // bug_178: the shared store-unreachable alphabet — both
+            // lanes consume rio_common::classify so the alphabets
+            // cannot fork again (Unknown = mid-RPC peer death).
+            evidence.metadata_fetch |=
+                rio_common::classify::is_store_unreachable_code(source.code());
         }
         // Explicitly laneless: `Grpc` carries mixed store/scheduler
         // provenance with no call-site attribution — the attributed
@@ -397,6 +398,14 @@ mod tests {
         let cases = [
             (exhausted(tonic::Status::unavailable("conn refused")), true),
             (exhausted(tonic::Status::deadline_exceeded("hang")), true),
+            // bug_178: Unknown is the canonical mid-RPC peer-death code
+            // (h2 reset / TLS close mid-stream — rio_common::grpc's own
+            // alphabet doc); a store pod dying mid-upload is transport
+            // unreachability, not a verdict.
+            (
+                exhausted(tonic::Status::unknown("h2 reset mid-stream")),
+                true,
+            ),
             (
                 exhausted(tonic::Status::internal("NAR serialization")),
                 false,
@@ -438,7 +447,7 @@ mod tests {
         }
     }
 
-    // r[verify builder.outcome.store-degraded+2]
+    // r[verify builder.outcome.store-degraded+3]
     /// The stamp chokepoint marks `store_degraded` iff the status is
     /// `InfrastructureFailure` AND the breaker verdict was set: a
     /// transient (build-ran) failure with an open breaker stays false
@@ -638,9 +647,12 @@ mod tests {
     /// poison.
     #[test]
     fn metadata_fetch_outage_stamps_store_degraded() {
-        let ctors: [fn(&str) -> tonic::Status; 2] = [
+        let ctors: [fn(&str) -> tonic::Status; 3] = [
             |m| tonic::Status::unavailable(m),
             |m| tonic::Status::deadline_exceeded(m),
+            // bug_178: mid-RPC peer death (h2 reset) — the store pod
+            // dying mid-fetch is degradation evidence on this lane too.
+            |m| tonic::Status::unknown(m),
         ];
         for code_ctor in ctors {
             let report = err_completion(

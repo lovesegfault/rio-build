@@ -8,6 +8,7 @@
 
 pub mod backoff;
 pub mod clamped;
+pub mod classify;
 pub mod config;
 pub mod cors;
 pub mod dns;

@@ -81,10 +81,11 @@ pub fn is_store_unreachable(err: &UploadError) -> bool {
     matches!(
         err,
         UploadError::UploadExhausted { source, .. }
-            if matches!(
-                source.code(),
-                tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
-            )
+            // bug_178: the shared store-unreachable alphabet
+            // (rio_common::classify) — Unknown is mid-RPC peer death;
+            // open-coding the codes here forked the lane from the
+            // canonical alphabet.
+            if rio_common::classify::is_store_unreachable_code(source.code())
     )
 }
 

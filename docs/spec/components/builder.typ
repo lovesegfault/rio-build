@@ -347,18 +347,20 @@ fleet-amplification trade-off the heartbeat-era flag had absorbed. The
 successor restores the signal AT CLASSIFICATION instead of as capacity
 state (bug_408): the breaker's verdict rides the completion report.
 
-#r("builder.outcome.store-degraded+2")[
+#r("builder.outcome.store-degraded+3")[
   A `CompletionReport` whose status is `INFRASTRUCTURE_FAILURE` MUST carry
   `BuildResult.store_degraded = true` when any store-evidence lane saw
   the store degraded — the FUSE-breaker lane (breaker open at completion
   time or its monotonic trip count rose during the build), the
   upload-transport lane (the output upload exhausted its retries with a
-  final status of `UNAVAILABLE` or `DEADLINE_EXCEEDED`), or the
-  metadata-fetch lane (the input-metadata fetch failed `UNAVAILABLE` or
-  `DEADLINE_EXCEEDED`) — and MUST NOT carry the flag for any other
-  status or for an infra failure with no lane evidence; the lane fold
-  over the executor error alphabet MUST be exhaustive, every variant
-  naming its lane or named laneless.
+  final status of `UNAVAILABLE`, `UNKNOWN`, or `DEADLINE_EXCEEDED`), or
+  the metadata-fetch lane (the input-metadata fetch failed `UNAVAILABLE`,
+  `UNKNOWN`, or `DEADLINE_EXCEEDED`) — and MUST NOT carry the flag for
+  any other status or for an infra failure with no lane evidence; both
+  transport lanes MUST consume one shared store-unreachable code
+  predicate (the alphabet has exactly one executable source), and the
+  lane fold over the executor error alphabet MUST be exhaustive, every
+  variant naming its lane or named laneless.
 ] The during-the-build half of the FUSE lane (trip-count delta, not a
 point-in-time `is_open()`) is what catches the open-then-auto-closed
 window: the 30s auto-close beats most build durations, and a one-shot
