@@ -1569,58 +1569,6 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                 if now_leading {
                     state.confirm_leading_round(round);
                 }
-
-                // r[impl sched.lease.deletion-cost+3]
-                // Level-triggered leader-marks reconcile. Runs AFTER
-                // the edge detection so a transition on THIS tick
-                // patches the post-transition state (and the self-fence
-                // false-alarm pair — fence at the top of the tick, then
-                // a successful renew — never patches the label off).
-                // At most one leader-marks PATCH is in flight at a
-                // time; `marks_dirty` persists across skipped ticks and
-                // is cleared only by a completed patch whose written
-                // polarity still matches the current desire, so the
-                // first tick after a release retries with the
-                // then-current polarity. Steady state spawns nothing.
-                // Detached because the lease loop MUST NOT block on the
-                // pod PATCH (same constraint as the hooks); each
-                // attempt is bounded by the renew deadline so a wedged
-                // PATCH cannot hold the single-flight slot forever.
-                if let Some(task) = maybe_spawn_leader_marks(
-                    &pod_patch_client,
-                    &cfg,
-                    now_leading,
-                    &marks_dirty,
-                    &marks_patch_in_flight,
-                    renew_deadline,
-                ) {
-                    inflight_marks = Some(task);
-                }
-
-                // r[impl sched.lease.marks-verify]
-                // Bounded-cadence verification: every MARKS_VERIFY_EVERY
-                // rounds a clean-and-leading loop re-reads its OWN Pod
-                // and compares the stored marks against its leadership,
-                // re-dirtying on divergence — the level-triggered
-                // closure over falsifiers nobody enumerated (a foreign
-                // sweep racing a re-acquire, kubectl, a future actor).
-                // Shares the marks single-flight slot, so verify and
-                // reconcile never interleave; the dirty short-circuit
-                // inside the gate means a divergence found here is
-                // repaired by the ordinary reconcile on the NEXT
-                // round-trip.
-                if now_leading
-                    && round.is_multiple_of(MARKS_VERIFY_EVERY)
-                    && let Some(task) = maybe_spawn_verify_leader_marks(
-                        &pod_patch_client,
-                        &cfg,
-                        &marks_dirty,
-                        &marks_patch_in_flight,
-                        renew_deadline,
-                    )
-                {
-                    inflight_marks = Some(task);
-                }
             }
             election::RenewOutcome::FetchedActFailed {
                 facts,
@@ -1663,7 +1611,25 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                         && let Some(led) = unconfirmed.take()
                     {
                         blind.stamp(led.anchor);
-                        if !standing.believes() {
+                        // merged_bug_122: the stamp is unconditional
+                        // (the evidence is real and the ledger is
+                        // consumed) but the ACQUIRE is fence-gated. A
+                        // ledger anchor already past SELF_FENCE_AFTER
+                        // at consumption time makes the acquire
+                        // provably futile — the trailing
+                        // maybe_self_fence in this same arm would
+                        // re-fence it before the next await, churning
+                        // hooks/marks/recovery once per round of a
+                        // slow-commit brownout.
+                        let anchor_age = blind.blind_for(fence_now());
+                        if anchor_age > SELF_FENCE_AFTER {
+                            info!(
+                                ?anchor_age,
+                                "own-commit evidence consumed, but its anchor is already \
+                                 past the fence deadline — staying fenced (an acquire \
+                                 here would be re-fenced this same arm)"
+                            );
+                        } else if !standing.believes() {
                             // A self-fence inside the mid-band window
                             // already ran the lose edge; the evidence
                             // proves the apiserver still (or again)
@@ -1800,6 +1766,63 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                     hooks.on_lose();
                 }
             }
+        }
+
+        // r[impl sched.lease.deletion-cost+3]
+        // Level-triggered leader-marks reconcile — hoisted AFTER the
+        // whole outcome match (merged_bug_122) so EVERY arm services
+        // the dirt it minted this tick: the Completed edges, the
+        // tick-top and in-arm self-fences, and the evidence-acquire
+        // leg of the acts-fail arm — whose own doc names the regime
+        // where no round Completes, which is exactly why a spawn that
+        // lived only inside the Completed arm left that leg's dirt
+        // structurally unserviceable. Polarity reads the post-arm
+        // leadership state. A transition on THIS tick patches the
+        // post-transition state (and the self-fence false-alarm pair —
+        // fence at the top of the tick, then a successful renew —
+        // never patches the label off). At most one leader-marks PATCH
+        // is in flight at a time; `marks_dirty` persists across
+        // skipped ticks and is cleared only by a completed patch whose
+        // written polarity still matches the current desire, so the
+        // first tick after a release retries with the then-current
+        // polarity. Steady state spawns nothing. Detached because the
+        // lease loop MUST NOT block on the pod PATCH (same constraint
+        // as the hooks); each attempt is bounded by the renew deadline
+        // so a wedged PATCH cannot hold the single-flight slot
+        // forever.
+        let now_leading = state.is_leader();
+        if let Some(task) = maybe_spawn_leader_marks(
+            &pod_patch_client,
+            &cfg,
+            now_leading,
+            &marks_dirty,
+            &marks_patch_in_flight,
+            renew_deadline,
+        ) {
+            inflight_marks = Some(task);
+        }
+
+        // r[impl sched.lease.marks-verify]
+        // Bounded-cadence verification: every MARKS_VERIFY_EVERY
+        // rounds a clean-and-leading loop re-reads its OWN Pod and
+        // compares the stored marks against its leadership, re-dirtying
+        // on divergence — the level-triggered closure over falsifiers
+        // nobody enumerated (a foreign sweep racing a re-acquire,
+        // kubectl, a future actor). Shares the marks single-flight
+        // slot, so verify and reconcile never interleave; the dirty
+        // short-circuit inside the gate means a divergence found here
+        // is repaired by the ordinary reconcile on the NEXT round-trip.
+        if now_leading
+            && round.is_multiple_of(MARKS_VERIFY_EVERY)
+            && let Some(task) = maybe_spawn_verify_leader_marks(
+                &pod_patch_client,
+                &cfg,
+                &marks_dirty,
+                &marks_patch_in_flight,
+                renew_deadline,
+            )
+        {
+            inflight_marks = Some(task);
         }
     }
 
@@ -3863,7 +3886,20 @@ mod tests {
         // mid-band; the tick cadence stays exactly RENEW_INTERVAL
         // because the test never advances the clock by hand.
         for round in 0..12 {
-            let get = park.next().await;
+            // The hoisted marks machinery (merged_bug_122) services
+            // leading acts-fail rounds too: the bounded-cadence verify
+            // re-reads its own Pod every MARKS_VERIFY_EVERY rounds.
+            // Absorb that traffic so the lease choreography stays
+            // aligned — it is exactly the falsifier-closure coverage
+            // the hoist exists to extend to this regime.
+            let get = loop {
+                let req = park.next().await;
+                if req.path.contains("/pods/us") {
+                    req.respond_ok(pod_ok("us"));
+                    continue;
+                }
+                break req;
+            };
             assert!(
                 get.path.contains("/leases/rio-sched"),
                 "round {round}: read phase"
@@ -4217,6 +4253,208 @@ mod tests {
             1,
             "exactly one lose edge, with holder evidence"
         );
+
+        shutdown.cancel();
+        for _ in 0..3 {
+            if let Some(req) = park.try_next().await {
+                req.respond_status(404, "NotFound", "gone");
+            }
+        }
+        loop_task.await.expect("lease loop exits");
+    }
+
+    /// merged_bug_122 (acquire-before-fence): consuming own-commit
+    /// evidence whose ledger anchor is ALREADY past the self-fence
+    /// deadline must not take the acquire edge — the very next
+    /// statement block in the same arm would fence it again, a futile
+    /// acquire→instant-fence flap that churns hooks, marks, and
+    /// recovery every round of a slow-commit brownout. The stamp is
+    /// unconditional (the evidence is real); only the acquire is
+    /// fence-gated.
+    // r[verify sched.lease.cancelled-write+2]
+    // r[verify sched.lease.self-fence+2]
+    #[tokio::test(start_paused = true)]
+    async fn stale_anchor_evidence_consumption_stays_fenced() {
+        let (client, mut park) = RequestPark::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        // Round 1 (healthy): acquire; settle the marks PATCH.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 10));
+        let put = park.next().await;
+        put.respond_ok(park_lease_json(Some("us"), 3, 11));
+        settle().await;
+        let patch = park.next().await;
+        patch.respond_ok(pod_ok("us"));
+        settle().await;
+        assert!(state.is_leader());
+
+        // Round 2 (t=5s): the renew PUT is transmitted and dropped —
+        // the ledger arms at THIS anchor and keeps it (oldest-wins).
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 11));
+        let put = park.next().await;
+        drop(put);
+        settle().await;
+
+        // Rounds 3-4 (t=10s, 15s): same acts-fail shape, frozen
+        // content — nothing stamps, the round-2 anchor ages.
+        for _ in 0..2 {
+            let get = park.next().await;
+            get.respond_ok(park_lease_json(Some("us"), 3, 11));
+            let put = park.next().await;
+            drop(put);
+            settle().await;
+        }
+        // The blind window (anchored at round 2, t=5s) crosses
+        // SELF_FENCE_AFTER=11s at t=16s; the t=20s tick-top fences.
+        // Round 5 (t=20s): the round-2 zombie is finally visible —
+        // holder=us, renewTime moved. Evidence consumes the ledger at
+        // its 15s-old anchor.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 12));
+        let put = park.next().await;
+        drop(put);
+        settle().await;
+
+        assert!(
+            !state.is_leader(),
+            "a 15s-old anchor is past the fence deadline — the replica stays fenced"
+        );
+        assert_eq!(
+            hooks.acquires.lock().expect("acquires lock").len(),
+            1,
+            "consuming evidence with a stale anchor must NOT take the acquire \
+             edge (the same arm's trailing fence would instantly undo it — \
+             the acquire/instant-fence flap)"
+        );
+        assert_eq!(
+            hooks.loses.lock().expect("loses lock").len(),
+            1,
+            "exactly one lose edge (the legitimate fence) — no flap churn"
+        );
+
+        shutdown.cancel();
+        for _ in 0..3 {
+            if let Some(req) = park.try_next().await {
+                req.respond_status(404, "NotFound", "gone");
+            }
+        }
+        loop_task.await.expect("lease loop exits");
+    }
+
+    /// merged_bug_122 (marks half, the report's bug_230 leg): the
+    /// evidence-acquire leg mints `marks_dirty` but the leader-marks
+    /// spawns lived only inside the `Completed` arm — in the
+    /// reads-complete/acts-fail regime (where no round Completes, by
+    /// the arm's own doc) the dirt was structurally unserviceable.
+    /// The spawns are hoisted after the outcome match so EVERY arm
+    /// services the dirt it (or the tick-top fence) minted.
+    // r[verify sched.lease.deletion-cost+3]
+    #[tokio::test(start_paused = true)]
+    async fn evidence_acquire_services_marks_in_the_acts_fail_regime() {
+        let (client, mut park) = RequestPark::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        // Round 1 (healthy): acquire; settle the marks PATCH clean.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 10));
+        let put = park.next().await;
+        put.respond_ok(park_lease_json(Some("us"), 3, 11));
+        settle().await;
+        let patch = park.next().await;
+        patch.respond_ok(pod_ok("us"));
+        settle().await;
+
+        // Rounds 2-3 (t=5s, 10s): the READ phase dies — nothing
+        // stamps, nothing transmits, the blind window ages from the
+        // round-1 stamp.
+        for _ in 0..2 {
+            let get = park.next().await;
+            drop(get);
+            settle().await;
+        }
+
+        // t=15s tick top: blind=15s > 11s — the legitimate self-fence
+        // fires (and marks the strip dirt). Round 4 (same tick): the
+        // read completes again; the PUT is transmitted and dropped —
+        // the ledger arms at t=15s.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 11));
+        let put = park.next().await;
+        drop(put);
+        settle().await;
+        assert!(!state.is_leader(), "the fence fired before round 4");
+        // Absorb the fence's strip PATCH if the marks dirt is being
+        // serviced on non-Completed arms (the post-fix behavior).
+        if let Some(req) = park.try_next().await {
+            assert!(req.path.contains("/pods/us"));
+            req.respond_ok(pod_ok("us"));
+            settle().await;
+        }
+
+        // Round 5 (t=20s): the round-4 zombie committed — holder=us,
+        // renewTime moved. Evidence consumes at the t=15s anchor
+        // (5s old, inside the fence deadline) and re-acquires.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 12));
+        let put = park.next().await;
+        drop(put);
+        settle().await;
+
+        assert!(state.is_leader(), "fresh-anchor evidence re-acquires");
+        assert_eq!(hooks.acquires.lock().expect("acquires lock").len(), 2);
+
+        // THE marks assertion: the acquire minted label/cost dirt, and
+        // the acts-fail regime never Completes a round — the dirt must
+        // be serviced by THIS arm, this tick.
+        let marks = park.try_next().await;
+        assert!(
+            marks.as_ref().is_some_and(|r| r.path.contains("/pods/us")),
+            "the evidence-acquire round must service the marks dirt it \
+             minted (no Completed round will come in this regime)"
+        );
+        if let Some(req) = marks {
+            req.respond_ok(pod_ok("us"));
+        }
 
         shutdown.cancel();
         for _ in 0..3 {
