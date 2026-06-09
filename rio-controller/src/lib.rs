@@ -243,7 +243,8 @@ pub fn describe_metrics() {
          ≥2 nodes on the axis): axis=ratio — more than half the population \
          past the cluster threshold (the episode drains and the watermark \
          latches); axis=breadth — more than half bearing ≥1 in-window \
-         expiry (evidence retained while engaged); axis=dwell — a \
+         expiry (evidence retained while engaged, drained+latched when \
+         the episode closes at its release edge); axis=dwell — a \
          suppression watermark latched within the dwell window. \
          Incremented once per suppressed tick. Non-zero = run the \
          hung-node runbook's systemic triage; the Dead arm received no \

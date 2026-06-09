@@ -30,6 +30,7 @@ module wedgeCalib016SuppressedDrain {
     BREADTH_MIN = 2,
     TRACK_GHOST_NODES = false,
     ENABLE_ADMISSION = true,
-    ENABLE_SUPPRESSED_RETENTION = false
+    ENABLE_SUPPRESSED_RETENTION = false,
+    ENABLE_RELEASE_CLOSE = true
   ).* from "../wedgeCluster"
 }

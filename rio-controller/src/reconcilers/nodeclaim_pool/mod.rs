@@ -1487,7 +1487,7 @@ impl NodeClaimPoolReconciler {
                 None
             }
         };
-        // r[impl ctrl.nodeclaim.wedge-two-axis+4]
+        // r[impl ctrl.nodeclaim.wedge-two-axis+5]
         // Only per-node verdicts may feed the Dead arm; a systemic
         // pattern marks nothing (the warn + suppression counter fired
         // inside the sealed single-exit verdict). Last tick's reaps are

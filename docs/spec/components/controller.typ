@@ -1504,7 +1504,7 @@ scheduler's cost table when the outage ends.
   controller did not observe).
 ]
 
-#r("ctrl.nodeclaim.wedge-two-axis+4")[
+#r("ctrl.nodeclaim.wedge-two-axis+5")[
   The wedge clustering's verdict MUST be trajectory-gated over
   COMMENSURABLE, FLEET-DERIVED populations: the denominator is the
   registered NodeClaim fleet united with the evidence-bearing nodes ---
@@ -1514,24 +1514,38 @@ scheduler's cost table when the outage ends.
   themselves. Three suppression axes gate every per-node verdict, in
   precedence order: (1) RATIO --- when more than half of the population
   is past the cluster threshold and at least two nodes are affected, the
-  verdict is SYSTEMIC: the reconciler MUST mark no node, MUST increment
-  the suppression counter
-  (#(refs.metric)("rio_controller_wedge_systemic_suppressed_total")), MUST
+  verdict is SYSTEMIC: the reconciler MUST mark no node, MUST
   drain the WHOLE episode's window evidence (every node in the windowed
   population, not only the wedged subset --- a sub-threshold
   participant's episode anchor must not survive as half of a future
   pair), MUST latch the suppression watermark, and MUST re-derive the
   marked set; (2) BREADTH --- when more than half of the population
   bears at least one in-window expiry (at least two nodes), per-node
-  verdicts MUST be suppressed WITHOUT draining or latching (staggered
-  shared-cause onset: the evidence keeps accumulating until the ratio
-  law fires or the window ages it out --- serial per-node Dead-reaps
-  before the ratio trips are the failure mode this axis removes);
+  verdicts MUST be suppressed --- WITHOUT draining or latching while
+  the episode stays ENGAGED (staggered shared-cause onset: the
+  evidence keeps accumulating toward the ratio law --- serial per-node
+  Dead-reaps before the ratio trips are the failure mode this axis
+  removes), the marked transition-memory retained with it (a
+  suppressed tick that retains evidence MUST NOT re-derive the marked
+  set --- draining it re-counts one continuous wedge as a fresh
+  transition); a breadth episode that ends WITHOUT the ratio law
+  firing MUST close through the same drain + merge-latch + dwell
+  chokepoint at its release edge --- the merge-latch never lowers the
+  watermark, and evidence observed during an engaged episode MUST be
+  unable to mint a per-node verdict after release (the late-onset
+  node re-detects only from fresh post-watermark expiries after the
+  dwell, the same re-entry law as a ratio close);
   (3) DWELL --- for `WEDGE_VERDICT_DWELL_SECS` after a suppression
   watermark latches, per-node verdicts MUST remain suppressed (an
-  episode's trailing edge is not a sequence of fresh per-node wedges).
-  Every verdict runs its full epilogue through one sealed exit whose
-  token is constructible only inside that exit. Evidence admission MUST
+  episode's trailing edge is not a sequence of fresh per-node wedges);
+  a dwell release is a no-op (draining at dwell expiry would destroy
+  legitimate fresh post-watermark evidence). Every verdict runs its
+  full epilogue through one sealed exit whose token is constructible
+  only inside that exit, and every suppressed tick MUST increment the
+  suppression counter
+  (#(refs.metric)("rio_controller_wedge_systemic_suppressed_total"))
+  labeled by the engaging axis (ratio | breadth | dwell, highest
+  precedence labels the tick). Evidence admission MUST
   beat the watermark in a SINGLE clock frame: an expired attempt
   contributes only when its ledger-frame expiry instant
   (`assigned_at + deadline + grace`, from `assigned_at_epoch_secs`) is
@@ -1567,6 +1581,17 @@ scheduler's cost table when the outage ends.
 // its instantaneous-snapshot guard; the +3->+4 bump and the
 // wedge-cluster+2->+3 bump (admission-source eviction, dwell-gated
 // marking) ride the same commit with all markers re-stamped.
+//
+// 2026-06-09 (bughunt-5 fix-wave, riding the same Q2 signature): the
+// +4->+5 bump extends the trajectory law with the release-edge close
+// (a breadth episode that ends without the ratio law firing closes
+// through the same drain + merge-latch + dwell chokepoint --
+// merged_bug_023's silent third exit removed), the suppressed-tick
+// marked-retention (merged_bug_016), and the per-axis suppression
+// counter law (every suppressed tick increments, labeled ratio |
+// breadth | dwell -- SIGNED S1-OQ2: per-tick + axis). Same
+// fleet-derived denominator, same dwell direction; no behavioral
+// change to the ratio axis.
 
 
 This is the OA2 successor to the retired heartbeat-fed scheduler-side

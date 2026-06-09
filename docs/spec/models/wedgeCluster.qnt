@@ -147,6 +147,20 @@ module wedgeCluster {
   // wherever ENABLE_TRAJECTORY is off --- zero state cost; the
   // TRACK_EPISODE_GHOSTS parameter-ladder precedent).
   const ENABLE_SUPPRESSED_RETENTION: bool
+  // merged_bug_023 (round-5): the release-edge close. On (the
+  // repair): an engaged RETAINING episode (the breadth phase) that
+  // disengages on an observed tick CLOSES --- whole-window drain +
+  // watermark latch (where the episode ghosts are tracked) + marked
+  // drain --- so evidence observed during the engaged episode cannot
+  // mint a per-node verdict after release. Off (as-built): the
+  // release is a silent third exit --- the retained anchors survive
+  // disengagement and a late-onset node Dead-reaps from evidence the
+  // suppression itself attributed to a shared cause. The episode
+  // machinery (episodeState, the developing-tick suppressedAnchors
+  // feed, sawRelease) is gated behind ENABLE_TRAJECTORY --- frozen at
+  // init values in every non-trajectory regime (zero state cost; the
+  // TRACK_EPISODE_GHOSTS parameter-ladder precedent).
+  const ENABLE_RELEASE_CLOSE: bool
 
   val NODES = Set("n0", "n1", "n2")
   val GHOSTS = if (TRACK_GHOST_NODES) Set("g0") else Set()
@@ -203,6 +217,15 @@ module wedgeCluster {
   // non-evicted marked entry leave the set? (true = the as-built
   // drain; computed only on suppressed-no-drain ticks.)
   var lastShrankMarked: bool
+  // merged_bug_023: the engaged-episode phase as of the last observed
+  // tick. 0 = disengaged; 1 = engaged via a draining tick (ratio ---
+  // its release is a no-op, the window is already drained); 2 =
+  // engaged via a retaining tick (breadth/developing --- its release
+  // MUST close). Frozen 0 off-trajectory.
+  var episodeState: int
+  // merged_bug_023 reachability: a release edge was taken (frozen
+  // false off-trajectory).
+  var sawRelease: bool
 
   // --- helpers ---------------------------------------------------------------
   def inWindow(anchor: int, now: int): bool = now - anchor <= WINDOW
@@ -261,6 +284,8 @@ module wedgeCluster {
     lastSkip' = false,
     lastSuppressedNoDrain' = false,
     lastShrankMarked' = false,
+    episodeState' = 0,
+    sawRelease' = false,
   }
 
   // --- one reconcile tick: evict, observe (or skip), prune, finalize ----------
@@ -275,7 +300,8 @@ module wedgeCluster {
       consumed: Set[str], systemic: bool, affected: int, of_: int,
       wedged: Set[str], skip: bool, episodeAnchors: Set[(str, str, int)],
       watermark: int, expiredSince: (str, str) -> int,
-      pendingSince: int, suppressedNoDrain: bool, shrankMarked: bool } =
+      pendingSince: int, suppressedNoDrain: bool, shrankMarked: bool,
+      episodeState: int, releaseEdge: bool } =
     val now = time + 1
     val consumed = if (ENABLE_EVICTION) pendingEvictions else Set()
     val evAfterEvict = evidence.keys().filter(n => not(consumed.contains(n))).mapBy(n => evidence.get(n))
@@ -336,13 +362,33 @@ module wedgeCluster {
     // merged_bug_034: a developing episode (breadth at the bar while
     // the verdict has not fired) withholds per-node Dead verdicts.
     val developing = ENABLE_TRAJECTORY and breadth >= BREADTH_MIN
+    // merged_bug_023: the episode machine. Engagement = a systemic or
+    // developing observed tick; the release edge = engaged previously,
+    // observed now, disengaged now. Only a RETAINING episode (state 2)
+    // closes with effects; ratio episodes (state 1) already drained
+    // per-tick and release as a no-op.
+    val releaseEdge = and {
+      ENABLE_TRAJECTORY,
+      episodeState != 0,
+      not(skip),
+      not(systemic or developing),
+    }
+    val closeFires = releaseEdge and (episodeState == 2) and ENABLE_RELEASE_CLOSE
+    val newEpisodeState = if (not(ENABLE_TRAJECTORY)) 0
+      else if (skip) episodeState
+      else if (systemic) 1
+      else if (developing) 2
+      else 0
     val drained = if (systemic and ENABLE_EPISODE_LATCH)
         // Whole-episode drain: every node in the window.
         Map()
       else if (systemic and ENABLE_FULL_EPILOGUE)
         evObserved.keys().filter(n => not(wedged.contains(n))).mapBy(n => evObserved.get(n))
       else evObserved
-    val survivors = if (systemic or developing) Set() else wedged
+    // merged_bug_023: the close drains the WHOLE window at the
+    // release edge.
+    val drainedFinal = if (closeFires) Map() else drained
+    val survivors = if (systemic or developing or closeFires) Set() else wedged
     // merged_bug_016: a suppressed tick that retains evidence (the
     // developing breadth phase --- ratio did not fire) must retain
     // the marked transition-memory too.
@@ -358,6 +404,10 @@ module wedgeCluster {
         markedAfterEvict
       else if (suppressedNoDrain and ENABLE_SUPPRESSED_RETENTION)
         markedAfterEvict
+      else if (closeFires)
+        // The close drains the marked transition-memory (the same
+        // re-entry law as a ratio drain).
+        Set()
       else survivors
     // Computed only on suppressed-no-drain ticks (zero state cost
     // off-axis): did the tick drop a non-evicted marked entry?
@@ -373,14 +423,24 @@ module wedgeCluster {
     // provably-empty in every wired regime, leaving
     // noPerNodeFromSuppressedEvidence a tautology.
     val episodeAnchors = if (systemic)
-        drained.keys().fold(Set(), (acc, n) =>
-          acc.union(nodeEvidence(drained, n).keys().map(d => (n, d, nodeEvidence(drained, n).get(d)))))
+        drainedFinal.keys().fold(Set(), (acc, n) =>
+          acc.union(nodeEvidence(drainedFinal, n).keys().map(d => (n, d, nodeEvidence(drainedFinal, n).get(d)))))
+      else if (developing and not(skip))
+        // merged_bug_023: anchors observed during an ENGAGED
+        // retaining episode are episode-explained --- they enter the
+        // suppression-survivor set while they remain in evidence, so
+        // noPerNodeFromSuppressedEvidence carries the release-edge
+        // content: without the close they survive disengagement and
+        // can wholly mint a per-node verdict (the twin's violation);
+        // with it they are drained at the close and leave the set.
+        drainedFinal.keys().fold(Set(), (acc, n) =>
+          acc.union(nodeEvidence(drainedFinal, n).keys().map(d => (n, d, nodeEvidence(drainedFinal, n).get(d)))))
       else Set()
     {
-      evidence: drained, marked: newMarked, delta: delta,
-      consumed: consumed, systemic: systemic,
-      affected: if (systemic) wedged.size() else 0,
-      of_: if (systemic) population else 0,
+      evidence: drainedFinal, marked: newMarked, delta: delta,
+      consumed: consumed, systemic: systemic or closeFires,
+      affected: if (systemic or closeFires) wedged.size() else 0,
+      of_: if (systemic or closeFires) population else 0,
       wedged: if (skip) Set() else survivors,
       skip: skip, episodeAnchors: episodeAnchors,
       // Ghost watermark: latched on a Systemic verdict wherever the
@@ -389,11 +449,16 @@ module wedgeCluster {
       // and both ghosts freeze at their init values (zero state cost)
       // when TRACK_EPISODE_GHOSTS is off — see the parameter ladder
       // at the const.
-      watermark: if (TRACK_EPISODE_GHOSTS) (if (systemic) now else watermark) else -1,
+      // The close merge-latches the watermark where the episode
+      // ghosts are tracked (now >= any prior latch, so assignment IS
+      // the merge --- the gate never lowers).
+      watermark: if (TRACK_EPISODE_GHOSTS) (if (systemic or closeFires) now else watermark) else -1,
       expiredSince: if (TRACK_EPISODE_GHOSTS) newExpiredSince else Map(),
       pendingSince: newPendingSince,
       suppressedNoDrain: suppressedNoDrain,
       shrankMarked: shrankMarked,
+      episodeState: newEpisodeState,
+      releaseEdge: releaseEdge,
     }
 
   action tick = {
@@ -437,6 +502,8 @@ module wedgeCluster {
       lastSkip' = r.skip,
       lastSuppressedNoDrain' = r.suppressedNoDrain,
       lastShrankMarked' = r.shrankMarked,
+      episodeState' = r.episodeState,
+      sawRelease' = (sawRelease or r.releaseEdge),
     }
   }
 
@@ -460,6 +527,7 @@ module wedgeCluster {
     sawSystemic' = sawSystemic, sawPerNode' = sawPerNode, sawReWedge' = sawReWedge,
     sawSuppressed' = sawSuppressed, pendingSince' = pendingSince, lastSkip' = lastSkip,
     lastSuppressedNoDrain' = lastSuppressedNoDrain, lastShrankMarked' = lastShrankMarked,
+    episodeState' = episodeState, sawRelease' = sawRelease,
   }
 
   // (nn): the literal step alias — runs live in regime modules only.
@@ -571,6 +639,10 @@ module wedgeCluster {
 
   // --- witnesses (negated reachability; wired expect-violation) ---------------
   val systemicReachableW = not(sawSystemic)
+  // merged_bug_023 anti-vacuity: the release edge is reachable at the
+  // trajectory bounds (an engaged episode disengages on an observed
+  // tick).
+  val releaseEdgeReachableW = not(sawRelease)
   val perNodeReachableW = not(sawPerNode)
   // m288: the suppression-survivor set is actually populated in the
   // wired epilogue regime --- the tautology guard.
@@ -597,7 +669,8 @@ module wedgeClusterMain {
     BREADTH_MIN = 2,
     TRACK_GHOST_NODES = false,
     ENABLE_ADMISSION = true,
-    ENABLE_SUPPRESSED_RETENTION = true
+    ENABLE_SUPPRESSED_RETENTION = true,
+    ENABLE_RELEASE_CLOSE = true
   ).*
 }
 
@@ -622,7 +695,8 @@ module wedgeClusterLatch {
     BREADTH_MIN = 2,
     TRACK_GHOST_NODES = false,
     ENABLE_ADMISSION = true,
-    ENABLE_SUPPRESSED_RETENTION = true
+    ENABLE_SUPPRESSED_RETENTION = true,
+    ENABLE_RELEASE_CLOSE = true
   ).*
 }
 
@@ -642,7 +716,8 @@ module wedgeClusterNoEviction {
     BREADTH_MIN = 2,
     TRACK_GHOST_NODES = false,
     ENABLE_ADMISSION = true,
-    ENABLE_SUPPRESSED_RETENTION = true
+    ENABLE_SUPPRESSED_RETENTION = true,
+    ENABLE_RELEASE_CLOSE = true
   ).*
 }
 
@@ -667,7 +742,8 @@ module wedgeClusterTrajectory {
     BREADTH_MIN = 2,
     TRACK_GHOST_NODES = false,
     ENABLE_ADMISSION = true,
-    ENABLE_SUPPRESSED_RETENTION = true
+    ENABLE_SUPPRESSED_RETENTION = true,
+    ENABLE_RELEASE_CLOSE = true
   ).*
 }
 
@@ -691,7 +767,8 @@ module wedgeClusterEpilogue {
     BREADTH_MIN = 2,
     TRACK_GHOST_NODES = false,
     ENABLE_ADMISSION = true,
-    ENABLE_SUPPRESSED_RETENTION = true
+    ENABLE_SUPPRESSED_RETENTION = true,
+    ENABLE_RELEASE_CLOSE = true
   ).*
 }
 
@@ -717,6 +794,7 @@ module wedgeClusterAdmission {
     BREADTH_MIN = 2,
     TRACK_GHOST_NODES = true,
     ENABLE_ADMISSION = true,
-    ENABLE_SUPPRESSED_RETENTION = true
+    ENABLE_SUPPRESSED_RETENTION = true,
+    ENABLE_RELEASE_CLOSE = true
   ).*
 }

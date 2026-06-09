@@ -33,14 +33,19 @@ either a genuinely wedged node (the OA2 signature) or a systemic cause
 at once).
 
 The controller's automated clustering now applies this discrimination
-itself (#rref("ctrl.nodeclaim.wedge-two-axis")): when more than half of the
-attributed build fleet is past the expiry threshold in one tick it marks
-NOTHING and increments
-#(refs.metric)("rio_controller_wedge_systemic_suppressed_total") instead of
-rolling Dead-reaps across the fleet. A non-zero suppression counter is the
-automation telling you to run THIS runbook's systemic triage; per-node
-wedges keep flowing to the Dead arm without operator action. Evidence is
-also build-class only and anchored at first observation, so store-side
+itself (#rref("ctrl.nodeclaim.wedge-two-axis")): per-node Dead-reaps are
+gated on the FLEET-DERIVED population (registered NodeClaims united with
+the evidence-bearing nodes) along three suppression axes --- ratio (more
+than half past the cluster threshold: the episode drains and latches),
+breadth (more than half bearing any in-window expiry: evidence retained
+while the episode is engaged, drained and latched when it closes), and
+the post-episode dwell. Every suppressed tick increments
+#(refs.metric)("rio_controller_wedge_systemic_suppressed_total") labeled
+by the engaging `axis` instead of rolling Dead-reaps across the fleet. A
+non-zero suppression counter --- on ANY axis --- is the automation
+telling you to run THIS runbook's systemic triage; per-node wedges keep
+flowing to the Dead arm without operator action. Evidence is also
+build-class only and anchored at first observation, so store-side
 materialization fetches and one stuck derivation re-observed for hours no
 longer pollute the per-node signal.
 

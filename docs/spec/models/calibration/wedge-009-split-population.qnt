@@ -38,6 +38,7 @@ module wedgeCalib009SplitPopulation {
     TRACK_EPISODE_GHOSTS = false,    ENABLE_TRAJECTORY = false,    DWELL_TICKS = 1,    BREADTH_MIN = 2,
     TRACK_GHOST_NODES = false,
     ENABLE_ADMISSION = true,
-    ENABLE_SUPPRESSED_RETENTION = true
+    ENABLE_SUPPRESSED_RETENTION = true,
+    ENABLE_RELEASE_CLOSE = true
   ).* from "../wedgeCluster"
 }
