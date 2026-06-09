@@ -303,16 +303,23 @@ in
   #   2. start a long-lived AppendLog session: grpcurl reads a FIFO; a
   #      backgrounded writer sends header+batch1 then parks on a flag
   #      file, holding the session open. While parked it emits an empty
-  #      keepalive batch every ~5s: the store aborts a session whose
-  #      buffer is empty (the 60s periodic cut empties it) with no
-  #      inbound for INBOUND_IDLE_BOUND (60s), so a mute parked writer
-  #      gives the whole choreography a hidden ~60-75s deadline from
-  #      batch 1 to flag-touch — under full-gate host load the gates
-  #      below burned that budget and the lone session lost its lease
-  #      before batch 2 was sent (3 recorded gate strikes; the
-  #      post-open grep then times out with nothing left to deliver).
-  #      accept() skips the numbering checks for empty batches — the
-  #      protocol's keepalive shape, explicitly non-cut-masking.
+  #      keepalive batch every ~5s: this writer is its OWN producer
+  #      under the bilateral liveness law (rio_common::liveness /
+  #      store.log.ingest-idle-abort+1) — it deliberately bypasses the
+  #      builder uploader to control choreography, so the builder's
+  #      UPLOADER_KEEPALIVE_PERIOD producer is never in this write
+  #      path, and the ~5s cadence is this client's own conformance
+  #      duty (cadence well inside INBOUND_IDLE_ABORT, 60s). The store
+  #      aborts a session whose buffer is empty (the 60s periodic cut
+  #      empties it) with no inbound for INBOUND_IDLE_ABORT, so a mute
+  #      parked writer gives the whole choreography a hidden ~60-75s
+  #      deadline from batch 1 to flag-touch — under full-gate host
+  #      load the gates below burned that budget and the lone session
+  #      lost its lease before batch 2 was sent (3 recorded gate
+  #      strikes; the post-open grep then times out with nothing left
+  #      to deliver). accept() skips the numbering checks for empty
+  #      batches — the protocol's keepalive shape, explicitly
+  #      non-cut-masking.
   #   3. open TailLog{follow:true} THROUGH nginx into a capture file —
   #      the snapshot serves batch 1 (proves attach while live)
   #   4. touch the flag → the writer sends batch 2 on the SAME session
@@ -368,7 +375,8 @@ in
       # block kills both processes, so generosity is free: the caps
       # are leak insurance, never the pacing control. The SESSION's
       # liveness is governed separately by the writer's ~5s keepalive
-      # cadence vs the store's 60s inbound-idle bound (see the
+      # cadence vs the store's INBOUND_IDLE_ABORT (60s; the writer is
+      # its own producer under the bilateral law — see the
       # choreography comment above) — wall-clock caps must only
       # outlive the gates. Adding a gate to the choreography extends
       # the caps automatically through these bindings.
@@ -398,9 +406,10 @@ in
           "< /tmp/dash-live.fifo > /tmp/dash-live-acks.log 2>&1) "
           "& echo $! > /tmp/dash-grpcurl.pid; "
           # The parked loop's empty keepalive batches (see the
-          # choreography comment): ~5s nominal cadence vs the 60s
-          # inbound-idle bound — an order of magnitude of headroom for
-          # load-dilated sleep loops.
+          # choreography comment): ~5s nominal cadence vs
+          # INBOUND_IDLE_ABORT (60s) — an order of magnitude of
+          # headroom for load-dilated sleep loops, and this writer's
+          # own conformance duty under the bilateral liveness law.
           "(exec 3>/tmp/dash-live.fifo; cat /tmp/dash-b1.json >&3; "
           "i=0; until [ -f /tmp/dash-live.go2 ]; do "
           "sleep 0.5; i=$((i+1)); "

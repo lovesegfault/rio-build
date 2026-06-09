@@ -699,6 +699,19 @@ impl UploadTask {
         let mut out = Some(out);
         let mut sent: usize = 0;
 
+        // The bilateral liveness contract's producer side
+        // (merged_bug_335 / #5-S Q1, rio_common::liveness): while this
+        // session is open with nothing to transmit, emit an empty
+        // keepalive batch every UPLOADER_KEEPALIVE_PERIOD so the
+        // store's inbound_idle enforcement (period x margin < abort,
+        // conformance-tested in rio-common) never fires on a
+        // spec-normal quiet build. The ingest layer sanctions empty
+        // batches as non-cut-masking, so the keepalive carries
+        // liveness and nothing else.
+        let mut keepalive = tokio::time::interval(rio_common::liveness::UPLOADER_KEEPALIVE_PERIOD);
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        keepalive.tick().await; // arm one period out, not immediately
+
         loop {
             // Half-close the outbound once everything accepted has been
             // transmitted and no more input is coming: the server runs its
@@ -780,6 +793,35 @@ impl UploadTask {
                         // The request stream's receiver is gone: the server
                         // tore the stream down.
                         Err(_) => return SessionEnd::Reconnect,
+                    }
+                }
+
+                // Producer-side keepalive (merged_bug_335): only while
+                // the session is parked — outbound open, everything
+                // transmitted, input still open (a closed input heads
+                // to half-close, where the server's final drain owns
+                // the exchange). reserve() backpressure is impossible
+                // here by construction (nothing else is in flight), but
+                // a torn-down receiver routes to Reconnect like any
+                // other send.
+                _ = keepalive.tick(),
+                    if out.is_some() && self.input_open && sent == self.buffer.len() =>
+                {
+                    match out.as_ref().expect("guarded by the if").try_reserve() {
+                        Ok(permit) => permit.send(AppendLogRequest {
+                            msg: Some(Msg::Batch(BuildLogBatch {
+                                derivation_path: self.header.derivation_path.clone(),
+                                lines: Vec::new(),
+                                first_line_number: 0,
+                                executor_id: String::new(),
+                            })),
+                        }),
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            return SessionEnd::Reconnect;
+                        }
+                        // Full: real traffic is in flight after all —
+                        // it is the liveness evidence; skip this tick.
+                        Err(mpsc::error::TrySendError::Full(_)) => {}
                     }
                 }
 
@@ -1407,6 +1449,54 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("timed out waiting for: {what}");
+    }
+
+    // ------------------------------------------------------------------
+    // 0. The bilateral liveness contract's producer side (merged_bug_335)
+    // ------------------------------------------------------------------
+
+    /// A parked open session (input open, buffer drained) emits empty
+    /// keepalive batches every UPLOADER_KEEPALIVE_PERIOD, so the
+    /// store's inbound_idle enforcement never fires on a spec-normal
+    /// quiet build. `#[ignore]`: ~45 s of real time (the period is a
+    /// shared const, deliberately not a config knob). Run manually:
+    /// `cargo nextest run -p rio-builder -E 'test(parked_session)'
+    /// --run-ignored all`. RED RECORDED (2026-06-09, keepalive arm
+    /// absent): message_count stayed 2 (header + the one real batch)
+    /// across 45 s — the store would have aborted the session at 60 s
+    /// and the build's next line would pay a reconnect. GREEN: ≥2
+    /// empty keepalive batches inside 45 s, one session throughout.
+    #[tokio::test]
+    #[ignore = "~45s real time (UPLOADER_KEEPALIVE_PERIOD is a shared const); run with --run-ignored all"]
+    async fn parked_session_emits_keepalives() {
+        let h = harness().await;
+        let tx = h.uploader.sender();
+        tx.send(batch(0, 1)).await.unwrap();
+        wait_for("the open + the batch", || {
+            h.mock.session_count() == 1 && h.mock.session(0).message_count() == 2
+        })
+        .await;
+
+        // Park: nothing more to send, input stays open.
+        tokio::time::sleep(std::time::Duration::from_secs(45)).await;
+
+        assert_eq!(h.mock.session_count(), 1, "no reconnect while parked");
+        let session = h.mock.session(0);
+        let msgs = session.messages.lock().unwrap();
+        let keepalives = msgs
+            .iter()
+            .filter(|m| {
+                matches!(
+                    &m.msg,
+                    Some(Msg::Batch(b)) if b.lines.is_empty()
+                )
+            })
+            .count();
+        assert!(
+            keepalives >= 2,
+            "a 45 s park must produce at least two keepalive batches \
+             (UPLOADER_KEEPALIVE_PERIOD = 20 s, margin 2); saw {keepalives}"
+        );
     }
 
     // ------------------------------------------------------------------

@@ -2092,11 +2092,16 @@ told the builder to "reconnect and replay" with the same effect. The
 classifier on the builder side was correct all along; the server simply
 never spoke the class it listened for.
 
-#r("store.log.ingest-idle-abort")[
-  An AppendLog ingest driver whose buffer is empty and whose inbound
-  stream has been silent for at least four heartbeat intervals MUST
-  abort the stream (counted, `reason="inbound_idle"`) rather than
-  continue renewing the ingest lease.
+#r("store.log.ingest-idle-abort+1")[
+  The log-ingest liveness law is bilateral. An AppendLog client whose
+  session is open with an empty buffer MUST emit an empty keepalive
+  batch at least every `UPLOADER_KEEPALIVE_PERIOD`; an ingest driver
+  whose buffer is empty and whose inbound stream has been silent for
+  `INBOUND_IDLE_ABORT` (four heartbeat intervals) MUST abort the
+  stream (counted, `reason="inbound_idle"`) rather than continue
+  renewing the ingest lease. The two bounds live as one shared const
+  pair whose conformance relation (period times margin strictly less
+  than abort) is enforced by test.
 ]
 
 Lease renewal is thereby structurally coupled to observed stream

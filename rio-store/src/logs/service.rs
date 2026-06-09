@@ -131,12 +131,30 @@ const PROXY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 const PROXY_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Inbound-silence bound for an AppendLog driver with an EMPTY buffer:
-/// 4 × [`sessions::HEARTBEAT_INTERVAL`]. Past this the driver aborts
-/// (counted `reason="inbound_idle"`) instead of renewing the ingest
-/// lease forever on behalf of a builder that no longer exists. Lease
-/// renewal is thereby structurally coupled to observed stream
-/// liveness; an asserting test pins the 4× relationship.
-const INBOUND_IDLE_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+/// the enforcement side of the bilateral liveness contract
+/// ([`rio_common::liveness`]). Past this the driver aborts (counted
+/// `reason="inbound_idle"`) instead of renewing the ingest lease
+/// forever on behalf of a builder that no longer exists. The producer
+/// side -- the builder uploader's empty-batch keepalive every
+/// [`rio_common::liveness::UPLOADER_KEEPALIVE_PERIOD`] -- guarantees a
+/// conformant peer always shows inbound traffic inside this bound
+/// (the conformance test in rio-common is the relation's machine
+/// witness). Locally this is also pinned to
+/// 4 x [`sessions::HEARTBEAT_INTERVAL`] by an asserting test, so
+/// lease renewal stays structurally coupled to observed stream
+/// liveness.
+///
+/// SIGNED 2026-06-08 (owner, bughunt-4 fix-wave #5-S Q1): the
+/// inbound_idle abort law is bilateral -- the builder uploader gains
+/// an empty-batch keepalive producer (period << abort bound); this
+/// abort keeps its bound as the contract's enforcement side;
+/// conformance is proven by the shared const-pair test (period x
+/// margin < abort). The round-3 dashboard test writer's keepalive is
+/// RATIFIED as the law's client-side duty (its grpcurl writer is its
+/// own producer under the bilateral contract -- never removed; R12
+/// re-points its cadence comments and budget math at these consts;
+/// the structural ingest-session-lease gates stay).
+const INBOUND_IDLE_BOUND: std::time::Duration = rio_common::liveness::INBOUND_IDLE_ABORT;
 
 /// Turns the owning replica's self-identity (the
 /// `log_ingest_sessions.replica_pod` value it registered at
@@ -1147,7 +1165,11 @@ impl AppendDriver {
                     // An empty oneof: a client bug or a future field this
                     // version doesn't know. Ignore rather than abort —
                     // forward compatibility for a new request variant.
-                    Ok(Some(AppendLogRequest { msg: None })) => {}
+                    // It IS inbound traffic, though: liveness evidence
+                    // for the idle-abort law, same as any frame.
+                    Ok(Some(AppendLogRequest { msg: None })) => {
+                        last_inbound = tokio::time::Instant::now();
+                    }
                     // Clean half-close: the builder is done.
                     Ok(None) => return LoopExit::ClientFinished,
                     // Transport error: the builder is gone (or the
@@ -1191,16 +1213,19 @@ impl AppendDriver {
                     // ingest lease — an immortal driver pinned to a dead
                     // peer. With an EMPTY buffer and inbound silence past
                     // four heartbeats, abort: nothing buffered can be
-                    // lost, and the server h2 keepalive has had two full
-                    // PING windows to vouch for a live-but-quiet peer
-                    // (a live tonic connection answers PINGs at the
-                    // transport layer without sending batches — but a
-                    // half-open one is torn down, which surfaces here as
-                    // an inbound Err first; this arm is the backstop for
-                    // the in-between, lease-renewing zombie). The
+                    // lost, and a CONFORMANT peer cannot trip this arm —
+                    // the bilateral contract (rio_common::liveness)
+                    // obliges any client parked on an open, empty-buffer
+                    // session to emit keepalive batches well inside the
+                    // bound (the builder uploader's empty-batch arm; the
+                    // dashboard test's grpcurl writer is its own
+                    // producer). No transport-layer input reaches this
+                    // arm — h2 PINGs vouch for the CONNECTION, not the
+                    // stream's producer, which is exactly why the law
+                    // needs an application-layer producer side. The
                     // non-empty-buffer case is covered by the bounded
                     // ack send on the cut path, not this arm.
-                    // r[impl store.log.ingest-idle-abort]
+                    // r[impl store.log.ingest-idle-abort+1]
                     if self.session.buffer_is_empty()
                         && last_inbound.elapsed() >= INBOUND_IDLE_BOUND
                     {
@@ -2446,7 +2471,7 @@ mod tests {
     /// (2026-06-04, fix neutralized via `if false &&`): the await
     /// below outlived a 100 s timeout — the driver renewed the lease
     /// forever. GREEN: Aborted("no inbound traffic") at ~75 s.
-    // r[verify store.log.ingest-idle-abort]
+    // r[verify store.log.ingest-idle-abort+1]
     #[tokio::test]
     #[ignore = "60-75s real time (HEARTBEAT_INTERVAL is a const); run with --run-ignored all"]
     async fn idle_inbound_with_empty_buffer_aborts() {

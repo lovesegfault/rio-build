@@ -14,6 +14,7 @@ pub mod dns;
 pub mod grpc;
 pub mod k8s;
 pub mod limits;
+pub mod liveness;
 pub mod newtype;
 pub mod observability;
 #[cfg(feature = "aws")]
