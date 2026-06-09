@@ -4557,3 +4557,76 @@ async fn test_redelivered_completion_keeps_store_degraded_flag() -> TestResult {
     );
     Ok(())
 }
+
+/// merged_bug_294: a cancelled build's CompletionReport arrives AFTER
+/// the scheduler's cancel transition, carrying the real post-footer
+/// `final_line_count`. The cancel-time stamp passed None (no report
+/// existed yet) and the terminal stamp is monotone -- pre-fix this
+/// early return discarded the report's count, so the execution's
+/// fully-stored log read "incomplete" FOREVER: the store's
+/// completeness predicate (`sealed_final_line_count` NULL =>
+/// incomplete) never passed, the log never sealed, and the builder's
+/// zero-loss CompleteLog disposition could not fire.
+#[tokio::test]
+async fn cancelled_completion_report_fills_the_line_count() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let exec_id = uuid::Uuid::now_v7();
+    // The cancel-time stamp's outcome: status sealed, count NULL.
+    sqlx::query(
+        "INSERT INTO drv_executions (exec_id, drv_hash, executor_id, started_at, \
+                                     attempt_kind, status) \
+         VALUES ($1, 'cancel-count', 'w-cc', now(), 'build', 'cancelled')",
+    )
+    .bind(exec_id)
+    .execute(&db.pool)
+    .await?;
+
+    let mut actor = bare_actor(db.pool.clone());
+    actor.test_inject_ready_row(crate::db::RecoveryDerivationRow {
+        exec_id: Some(exec_id),
+        assigned_builder_id: Some("w-cc".into()),
+        ..crate::db::RecoveryDerivationRow::test_default("cancel-count", "x86_64-linux")
+    });
+    actor
+        .dag
+        .node_mut("cancel-count")
+        .expect("just injected")
+        .set_status_for_test(DerivationStatus::Cancelled);
+
+    actor
+        .handle_completion(
+            &crate::state::ExecutorId::from("w-cc"),
+            "cancel-count",
+            rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::Cancelled.into(),
+                ..Default::default()
+            },
+            (0, 0.0),
+            (None, None),
+            (None, 7),
+        )
+        .await;
+
+    // The epilogue's stamp is a spawned best-effort write: poll.
+    let mut count: Option<i64> = None;
+    for _ in 0..100 {
+        count =
+            sqlx::query_scalar("SELECT final_line_count FROM drv_executions WHERE exec_id = $1")
+                .bind(exec_id)
+                .fetch_one(&db.pool)
+                .await?;
+        if count.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        count,
+        Some(7),
+        "left: {count:?} / right: Some(7) (the cancelled report's count \
+         must fill the NULL via the COALESCE gap-fill -- incomplete-forever \
+         is the bug)"
+    );
+    Ok(())
+}

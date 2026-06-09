@@ -30,3 +30,16 @@ drifted set is a failed sweep, not a stale doc.
 
     Both arms of rio_scheduler_materialization_view_node_skew_total now carry
     strike + repair; no counter-only or assert-only tripwire arm remains.
+
+## merged_bug_294 — every terminal verdict arm's count disposition
+
+    $ grep -rn "terminal_log_epilogue(" rio-scheduler/src/actor --include="*.rs" | grep -v "fn terminal_log_epilogue"
+
+    build.rs:148        cancel transition   None (no report exists yet; the LATE-report arm below fills it)
+    recovery.rs:2136    recovery succeed    None (reportless trigger -- conservative, stays incomplete)
+    completion.rs:1208  cancelled LATE report  Some(count) when >0 (THIS close: COALESCE gap-fill)
+    completion.rs:1604  success             Some(count) (the report's count, as before)
+    completion.rs:2539  failure             Some(count) (report-bearing failures, the wave-1 close)
+
+    Every arm that HAS a report consumes its count; the reportless arms stamp
+    None by design (never falsely claim completeness).

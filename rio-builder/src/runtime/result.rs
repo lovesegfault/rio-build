@@ -289,10 +289,11 @@ pub(super) fn panic_completion(
 /// never ran a daemon and header-without-footer is the documented "build
 /// never started" signal — fabricating a footer would erase it.
 ///
-/// Best-effort, like the rest of the banner: on the scheduler-initiated
-/// cancel path the footer is dropped by the scheduler's cancel-path seal
-/// and never reaches the stored log (see `terminal_log_epilogue`'s
-/// sequencing note in rio-scheduler); it is still observable on the
+/// Best-effort, like the rest of the banner: there is no scheduler-side
+/// cancel seal -- the store's log gate never seals a NULL-count
+/// execution, so a footer the daemon emits IS stored, and the
+/// scheduler's late-report arm fills the terminal line count from the
+/// CompletionReport (merged_bug_294); it is equally observable on the
 /// force-drain/backstop cancel paths.
 pub(super) fn final_footer_result(
     last_footer_result: Option<&str>,

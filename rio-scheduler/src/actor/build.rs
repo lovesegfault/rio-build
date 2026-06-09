@@ -142,9 +142,10 @@ impl DagActor {
             // (dashboard shows the "approximate" banner for a log that
             // was streamed).
             // r[impl sched.merge.exec-correlation+8]
-            // No CompletionReport on the cancel path → final_line_count
-            // stays NULL → the row reads as incomplete (correct: a
-            // cancelled execution's log is truncated).
+            // No CompletionReport exists YET on the cancel path →
+            // final_line_count stamps NULL here; the executor's late
+            // Cancelled report fills it through the COALESCE gap-fill
+            // (merged_bug_294) so a fully-stored log can still seal.
             self.terminal_log_epilogue(drv_hash, "cancelled", &[build_id], None);
             transitioned.push(drv_hash.as_str());
         }

@@ -1189,9 +1189,24 @@ impl DagActor {
         // cancel (build.rs:cancel_build_derivations), so the executor's
         // Cancelled report finds the derivation already in this state.
         // Expected; capacity was freed above. The drv_executions row was
-        // already stamped by terminal_log_epilogue at cancel time.
-        // No further action.
+        // stamped by terminal_log_epilogue at cancel time -- with
+        // final_line_count = None, because no report existed yet.
+        //
+        // merged_bug_294: the report in hand carries the REAL
+        // post-footer count, and the terminal stamp is monotone --
+        // without consuming it here, every cancelled execution's
+        // fully-stored log reads incomplete forever (the store's
+        // completeness predicate never passes, the log never seals,
+        // the builder's zero-loss CompleteLog disposition cannot
+        // fire). Re-issue the epilogue with the SAME terminal status:
+        // the stamp SQL's COALESCE gap-fill accepts a late
+        // equal-status write and fills ONLY the NULL count.
         if current_status == DerivationStatus::Cancelled {
+            let report_line_count = i64::try_from(final_line_count).ok().filter(|n| *n > 0);
+            if report_line_count.is_some() {
+                let interested = self.get_interested_builds(drv_hash);
+                self.terminal_log_epilogue(drv_hash, "cancelled", &interested, report_line_count);
+            }
             debug!(drv_hash = %drv_hash, executor_id = %executor_id,
                    "cancelled completion report (expected after a cancel)");
             return;

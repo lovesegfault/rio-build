@@ -608,9 +608,10 @@ pub async fn spawn_build_task(
         // (`final_footer_result` — same flag read as `err_completion`
         // below, so on the Err arm the footer and the report agree; the
         // Ok arm is deliberately split, see `final_footer_result`'s doc).
-        // Best-effort: the scheduler's cancel-path seal drops this
-        // footer before it reaches the stored log — see
-        // `terminal_log_epilogue`'s sequencing note in rio-scheduler.
+        // Best-effort: no scheduler-side seal drops this footer -- the
+        // stored log keeps it, and the scheduler's cancelled-report
+        // arm fills the terminal line count from this report
+        // (merged_bug_294).
         // Coverage note: the runtime footer-send path's
         // once-per-assignment / skipped-on-None / prev_line_count
         // threading has no isolated unit test — `spawn_build_task`

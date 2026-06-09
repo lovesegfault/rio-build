@@ -466,11 +466,15 @@ impl DagActor {
         status: &'static str,
         interested_builds: &[Uuid],
         // `CompletionReport.final_line_count` for the terminal paths
-        // that have a report (success today; failure/cancel/recovery
-        // pass `None`). `None` ⇒ `drv_executions.final_line_count`
-        // stays NULL ⇒ the store's completeness predicate reads the
-        // execution as incomplete — the conservative direction (never
-        // falsely claim a log is complete).
+        // that have a report (success, report-bearing failures, and
+        // the cancelled LATE-report arm — merged_bug_294; the
+        // cancel-transition itself and recovery pass `None`). `None` ⇒
+        // `drv_executions.final_line_count` stays NULL ⇒ the store's
+        // completeness predicate reads the execution as incomplete —
+        // the conservative direction (never falsely claim a log is
+        // complete). The stamp's COALESCE accepts a later equal-status
+        // write, which is exactly how the cancelled report fills the
+        // cancel-time NULL.
         final_line_count: Option<i64>,
     ) -> Option<tokio::task::JoinHandle<()>> {
         let Some(state) = self.dag.node(drv_hash) else {
