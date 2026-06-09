@@ -2500,3 +2500,56 @@ async fn absent_node_nonterminal_latch_must_not_regress_durable_status() -> Test
     );
     Ok(())
 }
+
+/// merged_bug_285: the split-release wedge — node Assigned/Running,
+/// NO open assignment of either kind, job Pending-unclaimed (the
+/// crash/flip window between the fenced close commit and the dropped
+/// requeue companion). Recovery excludes Assigned/Running and the
+/// establishment sweep sees only open attempts, so pre-fix this state
+/// answered NotYetReady to every identity FOREVER (the arm counted a
+/// skew metric and debug-asserted, repairing nothing). The repair is
+/// two-strike (one-sweep insurance for the mint-mid-window race) and
+/// uncharged: sweep 1 arms, sweep 2 requeues the node to dep-derived
+/// status and the job returns to claimable.
+#[tokio::test]
+async fn split_release_wedge_repairs_on_second_sweep() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor(db.pool.clone());
+    actor.test_inject_ready_row(crate::db::RecoveryDerivationRow::test_default(
+        "wedge-drv",
+        "x86_64-linux",
+    ));
+    actor
+        .dag
+        .node_mut("wedge-drv")
+        .expect("just injected")
+        .set_status_for_test(DerivationStatus::Assigned);
+    actor.materialization_jobs.insert(
+        DrvHash::from("wedge-drv"),
+        crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+    );
+    let authority = actor.dag_authority().expect("always-leader test actor");
+
+    // Sweep 1: arms the strike only (one-sweep insurance — an attempt
+    // minted between the rows snapshot and the iteration must get one
+    // full sweep to appear).
+    actor.tick_sweep_open_pull_attempts(&authority).await;
+    assert_eq!(
+        actor.dag.node("wedge-drv").unwrap().status(),
+        DerivationStatus::Assigned,
+        "first wedged observation must not repair (one-sweep insurance)"
+    );
+
+    // Sweep 2: repairs — the node resets to its dep-derived status and
+    // the pending job is claimable again.
+    actor.tick_sweep_open_pull_attempts(&authority).await;
+    let status = actor.dag.node("wedge-drv").unwrap().status();
+    assert_eq!(
+        status,
+        DerivationStatus::Ready,
+        "left: {status:?} / right: Ready (second wedged sweep must \
+         requeue the stranded node uncharged)"
+    );
+    Ok(())
+}

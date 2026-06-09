@@ -81,6 +81,14 @@ pub(crate) struct JobViewEntry {
     /// rebuilds from rows, so a recovered claim starts at zero
     /// strikes by construction).
     claimed_unbacked_strike: bool,
+    /// Two-strike flag for the OTHER skew polarity (merged_bug_285,
+    /// split_release): a pending-unclaimed entry whose node read
+    /// Assigned/Running with no open assignment last sweep. Same
+    /// one-sweep insurance as `claimed_unbacked_strike` (the wedge
+    /// predicate mixes the live DAG with the stale opens snapshot);
+    /// the second consecutive observation triggers the uncharged
+    /// requeue repair instead of a counter-only tick.
+    split_release_strike: bool,
     /// Realized-path carrier (migration 082, the floating-CA
     /// stale-reset lane) — display copy for the claim-intake
     /// SUBSTITUTING event; the executor and the consumption coverage
@@ -158,6 +166,7 @@ impl JobViewEntry {
             parked_until: None,
             claimed_by: None,
             claimed_unbacked_strike: false,
+            split_release_strike: false,
             carried_realized_paths,
             parked_at: None,
             defer_until: None,
@@ -272,6 +281,16 @@ impl JobViewEntry {
     /// Arm/clear the two-strike ghost flag (housekeeping's write half).
     pub(super) fn set_strike(&mut self, armed: bool) {
         self.claimed_unbacked_strike = armed;
+    }
+
+    /// The split-release wedge strike (merged_bug_285), read half.
+    pub(super) fn wedge_strike_armed(&self) -> bool {
+        self.split_release_strike
+    }
+
+    /// Arm/clear the split-release wedge strike (write half).
+    pub(super) fn set_wedge_strike(&mut self, armed: bool) {
+        self.split_release_strike = armed;
     }
 }
 
@@ -826,6 +845,7 @@ impl DagActor {
                 .map(|secs| std::time::Instant::now() + std::time::Duration::from_secs_f64(secs)),
             claimed_by: row.claimed_by.map(crate::state::ExecutorId::from),
             claimed_unbacked_strike: false,
+            split_release_strike: false,
             carried_realized_paths: row.carried_realized_paths,
             parked_at: row
                 .park_began_secs_ago

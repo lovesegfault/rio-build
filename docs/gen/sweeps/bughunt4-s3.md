@@ -20,3 +20,13 @@ drifted set is a failed sweep, not a stale doc.
 
     persist_status_batch (fresh-write) remains the only OTHER status batch writer;
     fence_coverage.rs pins the production caller census.
+
+## merged_bug_285 — every skew-tripwire arm audited for the strike+repair shape
+
+    $ grep -rn 'polarity" =>' rio-scheduler/src/actor --include="*.rs"
+
+    rio-scheduler/src/actor/housekeeping.rs:1007  split_release       -> two-strike + uncharged requeue repair (THIS close)
+    rio-scheduler/src/actor/housekeeping.rs:1030  claimed_no_attempt  -> two-strike + uncharged release repair (merged_bug_055 C, pre-existing)
+
+    Both arms of rio_scheduler_materialization_view_node_skew_total now carry
+    strike + repair; no counter-only or assert-only tripwire arm remains.

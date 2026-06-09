@@ -864,9 +864,11 @@ impl DagActor {
         // whose node is still Assigned/Running with NO open
         // materialization assignment: `release_claim` should have
         // requeued the node in the same step that dropped the claim.
-        // Counted (and fatal under debug builds) so a re-introduced
-        // split release is observable instead of a silent
-        // NotYetReady-forever.
+        // Two-strike + LEVEL-TRIGGERED REPAIR (merged_bug_285, same
+        // shape as the inverse polarity below): counted at repair
+        // time, requeued uncharged — a re-introduced split release is
+        // observable AND self-healing instead of a silent
+        // NotYetReady-forever across failovers.
         //
         // polarity=claimed_no_attempt — the INVERSE ghost: a view
         // entry still CLAIMED while no open materialization assignment
@@ -887,6 +889,7 @@ impl DagActor {
         // (crash windows), not a pure code-regression shape — a fatal
         // assert would make the self-healing lane untestable and turn
         // recoverable skew into debug-build crashes.
+        let mut wedge_repairs: Vec<crate::state::DrvHash> = Vec::new();
         let ghosts: Vec<(crate::state::DrvHash, crate::state::ExecutorId)> = {
             use crate::state::DerivationStatus::{Assigned, Running};
             // Typed pair/kind view (bug_184 + merged_bug_108): the
@@ -896,6 +899,8 @@ impl DagActor {
             let mut ghosts = Vec::new();
             let mut first_strikes: Vec<crate::state::DrvHash> = Vec::new();
             let mut cleared_strikes: Vec<crate::state::DrvHash> = Vec::new();
+            let mut wedge_first_strikes: Vec<crate::state::DrvHash> = Vec::new();
+            let mut wedge_cleared_strikes: Vec<crate::state::DrvHash> = Vec::new();
             for (drv_hash, entry) in self.materialization_jobs.iter() {
                 match entry.holder() {
                     Some(holder) => {
@@ -921,24 +926,43 @@ impl DagActor {
                         // BUILD attempt is documented-legitimate
                         // coexistence (bug_266) — the wedge requires
                         // BOTH kinds absent.
+                        //
+                        // merged_bug_285: this predicate mixes the
+                        // LIVE DAG status with the STALE `opens`
+                        // snapshot — the same race window the
+                        // claimed-no-attempt polarity gets one-sweep
+                        // insurance for (an attempt minted between the
+                        // rows snapshot and this iteration reads
+                        // wedged for one pass). Two-strike shape,
+                        // mirroring the sibling arm. And the state has
+                        // LIVE runtime producers (a crash or
+                        // leadership flip between the fenced close
+                        // commit and the dropped requeue companion
+                        // strands the node Assigned with a closed
+                        // attempt; recovery excludes Assigned/Running
+                        // and the establishment sweep sees only open
+                        // attempts) — so the second strike REPAIRS
+                        // instead of asserting: the uncharged
+                        // level-triggered requeue resets the node to
+                        // its dep-derived status and the Pending job
+                        // becomes claimable again. No debug_assert BY
+                        // DECISION (the sibling arm's recorded
+                        // rationale): a repairable runtime condition
+                        // with live producers is not a code-regression
+                        // shape, and a fatal assert would make the
+                        // self-healing lane untestable.
                         let wedged = self
                             .dag
                             .node(drv_hash.as_str())
                             .is_some_and(|s| matches!(s.status(), Assigned | Running))
                             && !view.materialization_open(drv_hash.as_str())
                             && !view.build_open(drv_hash.as_str());
-                        if wedged {
-                            metrics::counter!(
-                                "rio_scheduler_materialization_view_node_skew_total",
-                                "polarity" => "split_release"
-                            )
-                            .increment(1);
-                            debug_assert!(
-                                false,
-                                "pending-unclaimed materialization job for {drv_hash} with \
-                                 node Assigned/Running and no open assignment \
-                                 (split-release wedge)"
-                            );
+                        if wedged && entry.wedge_strike_armed() {
+                            wedge_repairs.push(drv_hash.clone());
+                        } else if wedged {
+                            wedge_first_strikes.push(drv_hash.clone());
+                        } else if entry.wedge_strike_armed() {
+                            wedge_cleared_strikes.push(drv_hash.clone());
                         }
                     }
                 }
@@ -953,8 +977,52 @@ impl DagActor {
                     entry.set_strike(false);
                 }
             }
+            for drv_hash in wedge_first_strikes {
+                if let Some(entry) = self.materialization_jobs.get_mut(&drv_hash) {
+                    entry.set_wedge_strike(true);
+                }
+            }
+            for drv_hash in wedge_cleared_strikes {
+                if let Some(entry) = self.materialization_jobs.get_mut(&drv_hash) {
+                    entry.set_wedge_strike(false);
+                }
+            }
             ghosts
         };
+        // merged_bug_285: the split-release wedge repair — second
+        // consecutive wedged observation. Uncharged: no ledger row is
+        // appended (the close that stranded the node already charged
+        // or paced at its own site); the requeue resets the node to
+        // its dep-derived status through the SAME kinded chokepoint
+        // the consumption companions use (no executor to name — the
+        // claim is already gone; level-triggered like the ghost
+        // repair, so the whole producer family self-heals here).
+        // Folding the durable reset into the close transaction was
+        // evaluated and is not feasible at this site: the stranding
+        // close committed in a PRIOR tenure/turn — this sweep is the
+        // level-triggered backstop, not the closing path.
+        for drv_hash in wedge_repairs {
+            metrics::counter!(
+                "rio_scheduler_materialization_view_node_skew_total",
+                "polarity" => "split_release"
+            )
+            .increment(1);
+            warn!(
+                drv_hash = %drv_hash,
+                "split-release wedge (two sweeps): node Assigned/Running with no \
+                 open assignment and a pending-unclaimed job — requeueing \
+                 uncharged (the job returns to claimable)"
+            );
+            if let Some(entry) = self.materialization_jobs.get_mut(&drv_hash) {
+                entry.set_wedge_strike(false);
+            }
+            self.requeue_after_attempt(
+                std::slice::from_ref(&drv_hash),
+                crate::state::AttemptKind::Materialization,
+                None,
+            )
+            .await;
+        }
         // r[impl sched.materialize.claim-coherence]
         for (drv_hash, holder) in ghosts {
             metrics::counter!(
