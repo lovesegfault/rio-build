@@ -883,7 +883,8 @@ pub(crate) async fn collect_cycle(
     if simulated_swept.is_some() {
         let cycle_seconds = cycle_started.elapsed().as_secs_f64();
         metrics::histogram!("rio_store_gc_collect_cycle_seconds").record(cycle_seconds);
-        metrics::counter!("rio_store_gc_collect_cycles_total", "outcome" => "ok").increment(1);
+        // outcome="ok" rides the caller's CycleCommitted witness
+        // (merged_bug_218): a cycle is "ok" only once its commit lands.
 
         info!(
             mark_set_size,
@@ -1047,7 +1048,8 @@ pub(crate) async fn collect_cycle(
 
     let cycle_seconds = cycle_started.elapsed().as_secs_f64();
     metrics::histogram!("rio_store_gc_collect_cycle_seconds").record(cycle_seconds);
-    metrics::counter!("rio_store_gc_collect_cycles_total", "outcome" => "ok").increment(1);
+    // outcome="ok" rides the caller's CycleCommitted witness
+    // (merged_bug_218): a cycle is "ok" only once its commit lands.
 
     info!(
         mark_set_size,
@@ -1230,7 +1232,11 @@ pub(crate) async fn collect_backstop_once(
                 CollectOutcome::Ok => {
                     // Stamp the durable row: the cluster ran its live
                     // cycle; every replica\'s next hourly check sees it.
-                    lease
+                    // The ok tick rides the commit witness — a lost
+                    // commit ticks commit_failed, never ok
+                    // (merged_bug_218); the C3 attempt stamp already
+                    // throttles the re-run.
+                    match lease
                         .commit_cycle(super::state::CycleCommit::Live {
                             disposition: report
                                 .disposition
@@ -1239,7 +1245,22 @@ pub(crate) async fn collect_backstop_once(
                             victims_collected: report.victims_collected,
                             observation: report.durable.expect("Ok cycle carries an observation"),
                         })
-                        .await?;
+                        .await
+                    {
+                        Ok(committed) => committed.record_ok_outcome(),
+                        Err(e) => {
+                            metrics::counter!(
+                                "rio_store_gc_collect_cycles_total",
+                                "outcome" => "commit_failed"
+                            )
+                            .increment(1);
+                            warn!(
+                                error = %e,
+                                "chunk-collect backstop: cycle drained but the \
+                                 commit was lost (stamp/cursor/backlog not updated)"
+                            );
+                        }
+                    }
                 }
                 CollectOutcome::ParseFailure => {
                     // Fail-closed: an aborted cycle is NOT a live cycle
@@ -1447,7 +1468,8 @@ mod tests {
                 observation: report.durable.expect("Ok cycle carries an observation"),
             })
             .await
-            .unwrap();
+            .unwrap()
+            .record_ok_outcome();
         let row = super::super::state::read_state_unlocked(&db.pool)
             .await
             .unwrap();
@@ -2454,6 +2476,101 @@ mod tests {
         );
     }
 
+    /// merged_bug_218: outcome="ok" must mean "the durable commit
+    /// landed". Pre-fix the ok tick ran inside collect_cycle BEFORE
+    /// commit_cycle; a commit failure (the lock connection sits idle
+    /// through the whole multi-minute cycle -- exactly what
+    /// pgbouncer/NLB idle killers sever) propagated to warn-only
+    /// handlers: metrics green, stamp/cursor/backlog lost, and the
+    /// next backstop re-ran the full mark expansion.
+    #[tokio::test]
+    async fn failing_commit_ticks_commit_failed_not_ok() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        reset_collector_state(&db.pool).await;
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+
+        seed_collectable_chunks(&db.pool, 3, 100).await;
+
+        // Fail the primary commit AND the epoch-guarded retry.
+        super::super::state::COMMIT_FAIL_INJECT.store(2, std::sync::atomic::Ordering::SeqCst);
+        let report = collect_backstop_once(
+            &db.pool,
+            Some(&backend),
+            super::super::sweep::CHUNK_GRACE_SECS,
+        )
+        .await
+        .expect("backstop check runs")
+        .expect("due -> cycle ran");
+        assert_eq!(
+            report.outcome,
+            CollectOutcome::Ok,
+            "the cycle itself drained"
+        );
+
+        assert_eq!(
+            rec.get("rio_store_gc_collect_cycles_total{outcome=ok}"),
+            0,
+            "a cycle whose commit was lost must NOT tick ok"
+        );
+        assert_eq!(
+            rec.get("rio_store_gc_collect_cycles_total{outcome=commit_failed}"),
+            1,
+            "the lost commit is visible as commit_failed"
+        );
+        let live_null: bool =
+            sqlx::query_scalar("SELECT last_live_cycle_at IS NULL FROM gc_collect_state")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(live_null, "no stamp landed (metrics agree with the row)");
+    }
+
+    /// merged_bug_218 resilience half: when only the lock session is
+    /// dead (the common idle-kill), the epoch-guarded retry on a fresh
+    /// pooled connection lands the commit -- ok ticks, stamp present,
+    /// epoch advanced exactly once.
+    #[tokio::test]
+    async fn commit_retries_epoch_guarded_on_fresh_connection() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        reset_collector_state(&db.pool).await;
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+
+        seed_collectable_chunks(&db.pool, 3, 100).await;
+
+        // Fail only the primary (lock-session) commit.
+        super::super::state::COMMIT_FAIL_INJECT.store(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = collect_backstop_once(
+            &db.pool,
+            Some(&backend),
+            super::super::sweep::CHUNK_GRACE_SECS,
+        )
+        .await
+        .expect("backstop check runs")
+        .expect("due -> cycle ran");
+
+        assert_eq!(
+            rec.get("rio_store_gc_collect_cycles_total{outcome=ok}"),
+            1,
+            "the retried commit landed -> ok"
+        );
+        assert_eq!(
+            rec.get("rio_store_gc_collect_cycles_total{outcome=commit_failed}"),
+            0
+        );
+        let (epoch, live_set): (i64, bool) = sqlx::query_as(
+            "SELECT cycle_epoch, last_live_cycle_at IS NOT NULL FROM gc_collect_state",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(epoch, 1, "exactly one committed cycle");
+        assert!(live_set, "the stamp landed via the retry");
+    }
+
     /// bug_284: a persistent fail-closed abort (corrupt chunk_list)
     /// must not re-run the heavy validation scan on every backstop
     /// CHECK tick. The attempt stamp is written before the cycle, so
@@ -2789,7 +2906,12 @@ mod tests {
         assert_eq!(pending[0].0, leaked.to_vec());
         assert_eq!(rec.get("rio_store_gc_chunks_collected_total{}"), 1);
         assert_eq!(rec.get("rio_store_gc_s3_key_enqueued_total{}"), 1);
-        assert_eq!(rec.get("rio_store_gc_collect_cycles_total{outcome=ok}"), 1);
+        assert_eq!(
+            rec.get("rio_store_gc_collect_cycles_total{outcome=ok}"),
+            0,
+            "merged_bug_218: ok rides the caller's commit witness; a bare \
+             collect_cycle (no commit) ticks nothing"
+        );
         assert_eq!(
             rec.get("rio_store_gc_collect_cycles_capped_total{}"),
             0,
@@ -3186,7 +3308,8 @@ mod tests {
                 observation: shadow.durable.expect("Ok cycle carries an observation"),
             })
             .await
-            .unwrap();
+            .unwrap()
+            .record_ok_outcome();
         let row = super::super::state::read_state_unlocked(&db.pool)
             .await
             .unwrap();
@@ -3234,7 +3357,8 @@ mod tests {
                 observation: first.durable.expect("Ok cycle carries an observation"),
             })
             .await
-            .unwrap();
+            .unwrap()
+            .record_ok_outcome();
         assert_eq!(rec.get("rio_store_gc_collect_cycles_capped_total{}"), 1);
         let deleted_after_first: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE deleted")
@@ -3299,7 +3423,8 @@ mod tests {
                 observation: second.durable.expect("Ok cycle carries an observation"),
             })
             .await
-            .unwrap();
+            .unwrap()
+            .record_ok_outcome();
         let deleted_total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE deleted")
             .fetch_one(&db.pool)
             .await
@@ -3514,7 +3639,7 @@ mod tests {
     /// full-keyspace scan anchors zero.
     // r[verify store.gc.completion-witness+2]
     #[tokio::test]
-    async fn resumed_completion_keeps_decremented_backlog_and_skips_reap() {
+    async fn resumed_completion_keeps_decremented_backlog_and_reaps() {
         let db = TestDb::new(&crate::MIGRATOR).await;
         reset_collector_state(&db.pool).await;
         let backend: Arc<dyn ChunkBackend> = mem_backend();
@@ -3569,8 +3694,9 @@ mod tests {
         );
         assert!(report.pass_complete(), "derived view: the drain completed");
         assert_eq!(
-            report.chunks_reaped, 0,
-            "a resumed completion proves nothing about [0, cursor) and must not reap"
+            report.chunks_reaped, 1,
+            "bug_193: the reap is row-local, so a resumed completion reaps \
+             (the cursor proof gates only the backlog anchor)"
         );
 
         let state = super::super::state::read_state_unlocked(&db.pool)
@@ -3597,14 +3723,22 @@ mod tests {
             .fetch_one(&db.pool)
             .await
             .unwrap();
-        assert_eq!(tomb, 1, "tombstone not reaped on a resumed completion");
+        assert_eq!(
+            tomb, 0,
+            "tombstone reaped on the resumed completion (bug_193)"
+        );
 
-        // And the NEXT (unresumed) cycle anchors zero + reaps: the
-        // full-scan completion is the only zero/reap authority.
-        sqlx::query("UPDATE gc_collect_state SET last_live_cycle_at = NULL WHERE singleton")
-            .execute(&db.pool)
-            .await
-            .unwrap();
+        // And the NEXT (unresumed) cycle anchors zero: the full-scan
+        // completion remains the only ZERO-ANCHOR authority (the reap
+        // already ran -- nothing left for it here). Clear BOTH stamps
+        // (bug_284: the due predicate is also attempt-gated).
+        sqlx::query(
+            "UPDATE gc_collect_state SET last_live_cycle_at = NULL, \
+             last_attempt_at = NULL WHERE singleton",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
         let second = collect_backstop_once(&db.pool, Some(&backend), grace)
             .await
             .expect("backstop")
@@ -3614,7 +3748,10 @@ mod tests {
             Some(PassDisposition::CompleteFullScan)
         ));
         assert_eq!(second.victims_collected, 1, "low drained from the top");
-        assert_eq!(second.chunks_reaped, 1, "full scan reaps the tombstone");
+        assert_eq!(
+            second.chunks_reaped, 0,
+            "nothing left to reap (the resumed cycle already did, bug_193)"
+        );
         let state = super::super::state::read_state_unlocked(&db.pool)
             .await
             .unwrap();

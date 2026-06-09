@@ -319,10 +319,10 @@ pub async fn run_gc(
     // triggered heavy scans too. Warn-only: an operator GC must not
     // abort over cadence bookkeeping (the sweep already committed);
     // dry runs never stamp (a dry run must not defer live cadence).
-    if !params.dry_run {
-        if let Err(e) = lease.stamp_attempt().await {
-            warn!(error = %e, "GC: collect attempt stamp failed (cadence bookkeeping only)");
-        }
+    if !params.dry_run
+        && let Err(e) = lease.stamp_attempt().await
+    {
+        warn!(error = %e, "GC: collect attempt stamp failed (cadence bookkeeping only)");
     }
     let resume_cursor = lease.state.cursor.clone();
     match collect::collect_cycle(
@@ -359,9 +359,9 @@ pub async fn run_gc(
             // parse-failure abort is NOT a cycle: no stamp, the lock
             // is simply released (fail-closed; retention stays
             // visibly stalled until the manifest is repaired).
-            let lease_result = match report.outcome {
+            match report.outcome {
                 collect::CollectOutcome::Ok => {
-                    if params.dry_run {
+                    let committed = if params.dry_run {
                         lease
                             .commit_cycle(state::CycleCommit::Shadow {
                                 observation: report
@@ -382,12 +382,30 @@ pub async fn run_gc(
                                     .expect("Ok cycle carries an observation"),
                             })
                             .await
+                    };
+                    // merged_bug_218: ok rides the commit witness; a
+                    // lost commit is commit_failed, never ok.
+                    match committed {
+                        Ok(w) => w.record_ok_outcome(),
+                        Err(e) => {
+                            metrics::counter!(
+                                "rio_store_gc_collect_cycles_total",
+                                "outcome" => "commit_failed"
+                            )
+                            .increment(1);
+                            warn!(
+                                error = %e,
+                                "GC: collect commit lost (stamp/cursor/backlog \
+                                 not updated; lock freed via session close)"
+                            );
+                        }
                     }
                 }
-                collect::CollectOutcome::ParseFailure => lease.release().await,
-            };
-            if let Err(e) = lease_result {
-                warn!(error = %e, "GC: collect-state commit/release failed (lock freed via session close)");
+                collect::CollectOutcome::ParseFailure => {
+                    if let Err(e) = lease.release().await {
+                        warn!(error = %e, "GC: lease release failed (lock freed via session close)");
+                    }
+                }
             }
             info!(
                 outcome = ?report.outcome,

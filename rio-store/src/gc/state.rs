@@ -109,11 +109,36 @@ pub(crate) enum CycleCommit {
     },
 }
 
+/// Proof that a cycle's durable commit LANDED (merged_bug_218). The
+/// only mint sites are [`GcCycleLease::commit_cycle`]'s success paths,
+/// so the `outcome="ok"` tick — [`CycleCommitted::record_ok_outcome`],
+/// its sole producer — structurally cannot run for a cycle whose
+/// stamp/cursor/backlog update was lost: metric attribution and the
+/// commit result cannot diverge. `#[must_use]`: dropping the witness
+/// without recording is a compile-time warning at every caller.
+#[must_use = "record_ok_outcome() — the ok tick rides the commit witness"]
+pub(crate) struct CycleCommitted(());
+
+impl CycleCommitted {
+    /// The ONLY producer of `rio_store_gc_collect_cycles_total{outcome="ok"}`.
+    pub(crate) fn record_ok_outcome(self) {
+        metrics::counter!("rio_store_gc_collect_cycles_total", "outcome" => "ok").increment(1);
+    }
+}
+
+/// Test-only commit-failure injection: 0 = off, 1 = primary UPDATE
+/// (lock session) fails, 2 = primary AND the epoch-guarded retry fail.
+/// Cleared on consume.
+#[cfg(test)]
+pub(crate) static COMMIT_FAIL_INJECT: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
 /// The held collect-cycle lease: the GC advisory lock plus the
 /// lock-snapshot of the durable state. While this value lives, this
 /// replica is the cluster's collector.
 pub(crate) struct GcCycleLease {
     lock: PgSessionLock,
+    pool: PgPool,
     pub(crate) state: GcCollectState,
 }
 
@@ -127,7 +152,11 @@ impl GcCycleLease {
         let state: GcCollectState = sqlx::query_as(SELECT_STATE)
             .fetch_one(&mut **lock.conn())
             .await?;
-        Ok(Some(Self { lock, state }))
+        Ok(Some(Self {
+            lock,
+            pool: pool.clone(),
+            state,
+        }))
     }
 
     /// Is a backstop cycle due at `interval`? Evaluated through the
@@ -162,19 +191,129 @@ impl GcCycleLease {
 
     // r[impl store.gc.collect-cadence]
     /// Commit a finished cycle to the row (epoch+1, stamps), then
-    /// release the lock. Commit and unlock ride the SAME session: a
-    /// failure detaches the connection, freeing the lock with the
-    /// session and leaving the row at its previous epoch — the next
-    /// holder re-reads consistent state.
-    pub(crate) async fn commit_cycle(mut self, commit: CycleCommit) -> Result<(), sqlx::Error> {
-        match commit {
+    /// release the lock. The primary UPDATE rides the lock's session;
+    /// if that session died while it sat idle through the multi-minute
+    /// cycle (pgbouncer/NLB idle killers, a PG restart — the lock
+    /// connection does NOTHING during the cycle, merged_bug_218), the
+    /// commit is retried ONCE on a fresh pooled connection, guarded by
+    /// `cycle_epoch = <the epoch this lease read at acquire>`: the
+    /// advisory lock was already freed with the dead session, so
+    /// another replica may have started — the guard makes a stale
+    /// late commit a no-op instead of a clobber. Success on either
+    /// path mints the [`CycleCommitted`] witness; total failure
+    /// returns the primary error and the caller ticks
+    /// `outcome="commit_failed"` — never "ok".
+    pub(crate) async fn commit_cycle(
+        mut self,
+        commit: CycleCommit,
+    ) -> Result<CycleCommitted, sqlx::Error> {
+        let expected_epoch = self.state.cycle_epoch;
+        let primary = {
+            #[cfg(test)]
+            {
+                use std::sync::atomic::Ordering;
+                if COMMIT_FAIL_INJECT.load(Ordering::SeqCst) >= 1 {
+                    Err(sqlx::Error::Protocol(
+                        "gc-collect: injected primary commit failure (test only)".into(),
+                    ))
+                } else {
+                    Self::execute_commit(&commit, None, &mut *self.lock.conn()).await
+                }
+            }
+            #[cfg(not(test))]
+            {
+                Self::execute_commit(&commit, None, &mut *self.lock.conn()).await
+            }
+        };
+        match primary {
+            Ok(_) => {
+                self.lock.release().await?;
+                Ok(CycleCommitted(()))
+            }
+            Err(primary_e) => {
+                tracing::warn!(
+                    error = %primary_e,
+                    expected_epoch,
+                    "gc-collect: commit failed on the lock session; \
+                     retrying once, epoch-guarded, on a fresh connection"
+                );
+                // The lock session is suspect — detach it (the
+                // advisory lock dies with it; it may already be gone).
+                drop(self.lock);
+                let retry = {
+                    #[cfg(test)]
+                    {
+                        use std::sync::atomic::Ordering;
+                        if COMMIT_FAIL_INJECT.swap(0, Ordering::SeqCst) >= 2 {
+                            Err(sqlx::Error::Protocol(
+                                "gc-collect: injected retry commit failure (test only)".into(),
+                            ))
+                        } else {
+                            Self::retry_commit_on_fresh_conn(&self.pool, &commit, expected_epoch)
+                                .await
+                        }
+                    }
+                    #[cfg(not(test))]
+                    {
+                        Self::retry_commit_on_fresh_conn(&self.pool, &commit, expected_epoch).await
+                    }
+                };
+                match retry {
+                    Ok(1) => Ok(CycleCommitted(())),
+                    Ok(_) => {
+                        tracing::warn!(
+                            expected_epoch,
+                            "gc-collect: epoch-guarded commit retry no-oped \
+                             (another holder committed first); cycle stamp lost"
+                        );
+                        Err(primary_e)
+                    }
+                    Err(retry_e) => {
+                        tracing::warn!(error = %retry_e, "gc-collect: commit retry failed");
+                        Err(primary_e)
+                    }
+                }
+            }
+        }
+    }
+
+    /// The epoch-guarded retry on a FRESH connection, routed through
+    /// [`super::lock::SessionConn`] (the gc-wide acquire discipline:
+    /// the guard test bans bare `pool.acquire` in gc code). The
+    /// statement is a single session-state-free UPDATE, so on success
+    /// the connection goes straight back to the pool; on failure the
+    /// drop detaches it -- a suspect connection never re-enters the
+    /// pool.
+    async fn retry_commit_on_fresh_conn(
+        pool: &PgPool,
+        commit: &CycleCommit,
+        expected_epoch: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let mut conn = super::lock::SessionConn::acquire(pool).await?;
+        let rows = Self::execute_commit(commit, Some(expected_epoch), &mut *conn.conn()).await?;
+        conn.release_to_pool();
+        Ok(rows)
+    }
+
+    /// The one commit statement, parameterized by an optional epoch
+    /// guard (the retry path). Returns rows_affected.
+    async fn execute_commit(
+        commit: &CycleCommit,
+        epoch_guard: Option<i64>,
+        conn: &mut sqlx::PgConnection,
+    ) -> Result<u64, sqlx::Error> {
+        let res = match commit {
             CycleCommit::Live {
                 disposition,
                 victims_collected,
                 observation,
             } => {
+                let guard = match epoch_guard {
+                    Some(_) => " AND cycle_epoch = $6",
+                    None => "",
+                };
                 // r[impl store.gc.completion-witness+2]
-                sqlx::query(
+                let q = sqlx::query(sqlx::AssertSqlSafe(format!(
                     "UPDATE gc_collect_state SET \
                        cycle_epoch = cycle_epoch + 1, \
                        last_live_cycle_at = now(), \
@@ -185,33 +324,41 @@ impl GcCycleLease {
                          ELSE GREATEST(backlog_estimate - $3, 0) END, \
                        last_mark_set_size = $4, \
                        updated_at = now() \
-                     WHERE singleton",
-                )
+                     WHERE singleton{guard}"
+                )))
                 .bind(disposition.cursor_at_stop().map(<[u8]>::to_vec))
                 .bind(disposition.anchors_backlog_zero())
-                .bind(victims_collected as i64)
+                .bind(*victims_collected as i64)
                 .bind(observation.mark_set_size())
-                .bind(observation.unmarked_backlog_seed())
-                .execute(&mut **self.lock.conn())
-                .await?;
+                .bind(observation.unmarked_backlog_seed());
+                match epoch_guard {
+                    Some(e) => q.bind(e).execute(conn).await?,
+                    None => q.execute(conn).await?,
+                }
             }
             CycleCommit::Shadow { observation } => {
-                sqlx::query(
+                let guard = match epoch_guard {
+                    Some(_) => " AND cycle_epoch = $3",
+                    None => "",
+                };
+                let q = sqlx::query(sqlx::AssertSqlSafe(format!(
                     "UPDATE gc_collect_state SET \
                        cycle_epoch = cycle_epoch + 1, \
                        backlog_estimate = $1, \
                        last_would_collect = $1, \
                        last_mark_set_size = $2, \
                        updated_at = now() \
-                     WHERE singleton",
-                )
+                     WHERE singleton{guard}"
+                )))
                 .bind(observation.would_collect())
-                .bind(observation.mark_set_size())
-                .execute(&mut **self.lock.conn())
-                .await?;
+                .bind(observation.mark_set_size());
+                match epoch_guard {
+                    Some(e) => q.bind(e).execute(conn).await?,
+                    None => q.execute(conn).await?,
+                }
             }
-        }
-        self.lock.release().await
+        };
+        Ok(res.rows_affected())
     }
 
     /// Release without committing (the skip path: lease taken, cycle

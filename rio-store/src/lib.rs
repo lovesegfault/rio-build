@@ -313,11 +313,17 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_store_gc_collect_cycles_total",
-        "Chunk-collect cycles by outcome (ok | parse_failure | error). A \
-         cycle that stops at the per-cycle victim cap counts as ok; error = \
-         the cycle failed against PostgreSQL (counted by the caller: run_gc \
-         phase 3 or the backstop). Staleness of ok cycles (summed across \
-         replicas) drives the RioStoreGcCollectStalled alert. Cycles run as \
+        "Chunk-collect cycles by outcome (ok | parse_failure | commit_failed \
+         | error). ok ticks ONLY after the durable gc_collect_state commit \
+         lands (merged_bug_218: the tick rides the CycleCommitted witness, \
+         so metric attribution cannot diverge from the commit result); \
+         commit_failed = the cycle drained but its stamp/cursor/backlog \
+         update was lost (idle-killed lock session; one epoch-guarded retry \
+         on a fresh connection already failed). A cycle that stops at the \
+         per-cycle victim cap counts as ok; error = the cycle failed against \
+         PostgreSQL (counted by the caller: run_gc phase 3 or the backstop). \
+         Staleness of ok cycles (summed across replicas) drives the \
+         RioStoreGcCollectStalled alert. Cycles run as \
          phase 3 of every GC run and from each replica's daily backstop \
          timer, which arms one full interval after boot (pod boot never \
          triggers a cycle) and skips its tick when another cycle holds the \
