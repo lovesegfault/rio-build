@@ -16,7 +16,6 @@
 // predicate the latch tests, so enforcement empties the latch by
 // construction.
 //
-// quint-policy-latches: violations
 module controller073Burst {
   import spawnCoherence(
     IS_BUILDER = true,
