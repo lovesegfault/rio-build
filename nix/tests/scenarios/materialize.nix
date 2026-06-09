@@ -686,10 +686,32 @@ let
         assert build_status(park_build) == "active", (
             f"the park must never fail the build; got {build_status(park_build)!r}"
         )
+        # Structural budget law, not a raw row ceiling (bughunt-4
+        # strike 1: gate-load-slowed VMs widened the 8-worker race this
+        # subtest's own burn-loop comment concedes — a claim in flight
+        # when the third charge lands can mint a fourth row before the
+        # park is observed; infra=4 with a correct park). The law has
+        # three load-independent parts: the budget was consumed (>= 3
+        # charges — the park cannot fire early), the park stopped the
+        # bleeding (ZERO charges recorded after park_began_at), and
+        # nothing but infra rows were minted.
         builds_kind, infra, unobtainable = attempt_counts(park_drv)
-        assert builds_kind == 0 and unobtainable == 0 and infra == 3, (
-            f"park budget: expected exactly 3 materialization_infra rows and nothing else; "
+        assert builds_kind == 0 and unobtainable == 0 and infra >= 3, (
+            f"park budget: expected >= 3 materialization_infra rows and nothing else; "
             f"got build-kind={builds_kind} infra={infra} unobtainable={unobtainable}"
+        )
+        charged_after_park = psql(
+            ${gatewayHost},
+            "SELECT count(*) FROM drv_attempts a"
+            " JOIN derivations d USING (derivation_id)"
+            " JOIN materialization_jobs j ON j.drv_hash = d.drv_hash"
+            f" WHERE d.drv_hash = '{park_drv}'"
+            " AND a.outcome_class = 'materialization_infra'"
+            " AND a.recorded_at > j.park_began_at",
+        )
+        assert charged_after_park == "0", (
+            f"a parked job must stop charging: {charged_after_park} infra rows "
+            "recorded after park_began_at"
         )
 
         # Heal the upstream, let the park backoff expire, then trigger
