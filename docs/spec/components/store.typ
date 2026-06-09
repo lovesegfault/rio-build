@@ -1499,7 +1499,7 @@ safety-net scan. No full S3 enumeration needed.
   dry-run.
 ]
 
-#r("store.gc.observation-basis")[
+#r("store.gc.observation-basis+2")[
   The collect cycle's committed observation (the `gc_collect_state`
   singleton's live-count and backlog estimate) MUST anchor the REAL basis:
   what is live and what is eligible under NO exclusions, on the cycle's own
@@ -1511,8 +1511,14 @@ safety-net scan. No full S3 enumeration needed.
   `CycleCommit::{Shadow, Live}` accept nothing else --- committing a
   counterfactual mark-set size is unwritable. A shadow cycle with
   exclusions therefore materializes a second, exclusion-FREE mark product
-  on the same snapshot (2x cost, operator dry runs only); an
-  exclusion-free shadow reuses its preview as the real basis.
+  on the same snapshot (2x cost, operator dry runs only) --- and that
+  product gets its OWN fail-closed validation over the exclusion-free
+  population first: validation and expansion are paired in one builder
+  parameterized identically, so an expansion over an unvalidated
+  population does not typecheck, and corruption inside the
+  simulated-swept set WITHHOLDS the durable observation (the dry run
+  stays preview-only; merged_bug_147). An exclusion-free shadow reuses
+  its preview as the real basis.
 ]
 
 Pre-fix, the shadow commit wrote the preview's counts: every pacing and
@@ -1523,17 +1529,30 @@ too large, and the backstop cadence paced against the counterfactual
 invariants; its calibration twin re-wires the commit to the simulated
 products and both falsify.
 
-#r("store.gc.collect-cadence")[
+#r("store.gc.collect-cadence+2")[
   The collect cycle's cadence, resume cursor, and gauge sources are CLUSTER
-  state, durable in the `gc_collect_state` singleton row (migration 090),
-  never process state. The backstop MUST run a live cycle only when
-  `now() - last_live_cycle_at` is at least the backstop interval, evaluated
-  on the database clock against the durable stamp (double-checked under the
-  GC advisory lock); per-replica timers are cheap CHECK ticks --- N replicas
-  MUST NOT yield more than one live backstop cycle per interval. A live
-  cycle commits its stamp, stop cursor, and decremented backlog estimate in
-  one update through the lock's session; a dry-run (shadow) cycle commits
-  its observation WITHOUT the live stamp. Every replica publishes
+  state, durable in the `gc_collect_state` singleton row (migrations 090,
+  100), never process state. The backstop MUST run a live cycle only when
+  `now() - last_live_cycle_at` is at least the backstop interval AND
+  `now() - last_attempt_at` is at least the same interval, evaluated on the
+  database clock against the durable stamps (double-checked under the GC
+  advisory lock); the ATTEMPT stamp is written through the lock session
+  BEFORE the cycle runs --- backstop and live `run_gc` phase 3 alike, never
+  by a dry run --- so no outcome arm (success, fail-closed abort, database
+  error) can yield a faster-than-interval retry of the heavy cycle
+  (bug_284). `last_live_cycle_at` is stamped ONLY by a committed live
+  cycle; the stalled alert keys on it. Per-replica timers are cheap CHECK
+  ticks --- N replicas MUST NOT yield more than one live backstop cycle per
+  interval. A live cycle commits its stamp, stop cursor, and decremented
+  --- or, when no anchor exists, freshly seeded from the cycle's
+  unmarked-rows count (bug_306) --- backlog estimate in one update through
+  the lock's session; if that session died while idle through the cycle,
+  the commit is retried ONCE on a fresh connection guarded by the epoch the
+  lease read at acquire, so a stale late commit no-ops instead of
+  clobbering a successor's state (merged_bug_218), and the `outcome="ok"`
+  cycle metric ticks only on a landed commit (the `CycleCommitted`
+  witness). A dry-run (shadow) cycle commits its observation WITHOUT the
+  live or attempt stamps. Every replica publishes
   #(refs.metric)("rio_store_gc_collect_backlog_chunks"),
   #(refs.metric)("rio_store_gc_chunks_live"), and
   #(refs.metric)("rio_store_gc_chunks_would_collect") from a periodic read

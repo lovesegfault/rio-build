@@ -189,7 +189,7 @@ impl GcCycleLease {
         Ok(())
     }
 
-    // r[impl store.gc.collect-cadence]
+    // r[impl store.gc.collect-cadence+2]
     /// Commit a finished cycle to the row (epoch+1, stamps), then
     /// release the lock. The primary UPDATE rides the lock's session;
     /// if that session died while it sat idle through the multi-minute

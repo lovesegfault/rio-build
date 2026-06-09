@@ -3170,7 +3170,7 @@ rec {
     # value. The committed gc_collect_state row anchors the REAL basis
     # (live/backlog under NO exclusions at the commit snapshot); the
     # simulated preview (bug_199's lane) is reporting-only.
-    # r[verify store.gc.observation-basis]
+    # r[verify store.gc.observation-basis+2]
     quint-gc-collect-state = mkQuintCheck {
       name = "gc-collect-state";
       spec = "gcCollectState";
@@ -3184,7 +3184,7 @@ rec {
     # The operator dry-run anchor run: preview simulates, commit
     # anchors real — the composed mirror of collect.rs's
     # dry_run_commit_anchors_real_basis test.
-    # r[verify store.gc.observation-basis]
+    # r[verify store.gc.observation-basis+2]
     quint-gc-collect-state-runs = mkQuintRunCheck {
       name = "gc-collect-state-runs";
       spec = "gcCollectState";
@@ -3292,7 +3292,7 @@ rec {
     # onto one predicate); shadow commits stamp a fresh estimate
     # WITHOUT answering the cadence question; every replica publishes
     # its gauges from a 60s row read (spawn_gc_gauge_publisher).
-    # r[verify store.gc.collect-cadence]
+    # r[verify store.gc.collect-cadence+2]
     quint-gc-coordination-main = mkQuintCheck {
       name = "gc-coordination-main";
       spec = "chunkCollect";

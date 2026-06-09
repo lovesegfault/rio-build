@@ -480,7 +480,7 @@ pub(crate) enum CollectOutcome {
     ParseFailure,
 }
 
-// r[impl store.gc.observation-basis]
+// r[impl store.gc.observation-basis+2]
 /// The durable observation of one collect cycle — REAL basis only
 /// (bug_226). Private fields, module-private constructor: the sole
 /// mint site is the real-basis computation inside [`collect_cycle`],
@@ -1297,7 +1297,7 @@ async fn run_post_drain_tail(mut conn: super::lock::SessionConn, grace_secs: i64
 /// pre-check race to one lease; the loser skips; the winner re-checks
 /// so a cycle that JUST committed is not repeated). Returns `Ok(None)`
 /// when not due or when another holder has the lease.
-// r[impl store.gc.collect-cadence]
+// r[impl store.gc.collect-cadence+2]
 pub(crate) async fn collect_backstop_once(
     pool: &PgPool,
     chunk_backend: Option<&Arc<dyn ChunkBackend>>,
@@ -2204,7 +2204,7 @@ mod tests {
     /// simulated-swept: preview mark=1/would=2; durable mark=3/would=0.
     /// RED (recorded, pre-fix routing of the simulated numbers into
     /// the commit): durable carried 1/2 — the counterfactual.
-    // r[verify store.gc.observation-basis]
+    // r[verify store.gc.observation-basis+2]
     #[tokio::test]
     async fn dry_run_commit_anchors_real_basis() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -2411,7 +2411,7 @@ mod tests {
             .unwrap();
     }
 
-    // r[verify store.gc.collect-cadence]
+    // r[verify store.gc.collect-cadence+2]
     /// bug_174: the backstop is CLUSTER-cadenced via the durable row.
     /// Two consecutive checks ⇒ the first runs a live cycle (never-ran
     /// cluster: last_live_cycle_at NULL = due) and stamps the row; the
@@ -2466,7 +2466,7 @@ mod tests {
         );
     }
 
-    // r[verify store.gc.collect-cadence]
+    // r[verify store.gc.collect-cadence+2]
     /// A live run_gc stamps the durable row, so the backstop\'s next
     /// check skips: GC-schedule runs and the backstop share ONE
     /// cluster cadence.
