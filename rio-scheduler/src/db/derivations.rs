@@ -10,6 +10,60 @@ use super::{
 };
 use crate::state::{DerivationStatus, DrvHash, ExecutorId};
 
+/// PG-domain latch age (merged_bug_017): the precedence anchor of a
+/// status-outbox replay, constructible ONLY from the batch's MONOTONIC
+/// enqueue instant. There is deliberately NO constructor from
+/// `SystemTime`/epoch floats — the replay's precedence comparison must
+/// live entirely in the PG clock domain (`updated_at <= now() -
+/// make_interval(secs => age)`, both comparands PG-stamped), so
+/// binding ANY absolute timestamp (app epoch OR a pg-read instant)
+/// against the PG-stamped `updated_at` no longer typechecks. This is
+/// the repo's BACKSTOP_DUE_SQL discipline (rio-store/src/gc/state.rs:
+/// durations cross the clock boundary; instants never do) made a
+/// type. Residual error: ppm monotonic frequency drift over the
+/// latch→flush window plus microseconds of latch-to-enqueue skew —
+/// vs. the seconds-to-minutes of NTP epoch disagreement the old
+/// `to_timestamp(pod_epoch)` conjunct silently ate (PG-ahead: a fresh
+/// terminal latch zero-rowed and was popped as "flushed"; pod-ahead:
+/// the stale-overwrite window on the DAG-absent terminal-KEEP arm
+/// re-opened).
+pub(crate) struct LatchAge(f64);
+
+impl LatchAge {
+    /// The latch's age, measured monotonically from the batch's
+    /// enqueue instant (the latch and the enqueue are the same code
+    /// path: the failed persist latches and pushes in one step).
+    /// Recomputed per flush attempt, so a re-pushed batch keeps its
+    /// latch-pinned cut.
+    pub(crate) fn since_enqueue(enqueued_at: std::time::Instant) -> Self {
+        Self(enqueued_at.elapsed().as_secs_f64())
+    }
+
+    /// The age in seconds — the `make_interval(secs => $n)` bind.
+    fn secs(&self) -> f64 {
+        self.0
+    }
+}
+
+/// Outcome of one guarded status-batch replay (merged_bug_017): the
+/// rows the precedence conjunct allowed are a NAMED set, so a
+/// zero-row (or partial) guarded replay is a loud, attributable
+/// outcome the flusher warns/counts on — never an indistinguishable
+/// `Ok` count it does not consult. `FencedOutcome` stays untouched
+/// for every other fenced writer.
+#[derive(Debug)]
+pub(crate) enum StatusReplay {
+    /// Below the claims floor: nothing written; the caller re-pushes
+    /// (a deposed replica writes nothing).
+    Fenced,
+    /// The replay transaction committed. `replayed` names the drvs
+    /// whose rows the PG-domain precedence conjunct allowed — the
+    /// caller computes `refused = kept − replayed` and surfaces the
+    /// refusals (the durable row was newer; the refusal is the
+    /// precedence law's FINAL verdict, not a retry lane).
+    Applied { replayed: Vec<String> },
+}
+
 /// Map a terminal `DerivationStatus` to the `assignments.status` value
 /// the active row should transition to. `None` for non-terminal
 /// statuses (the assignment stays `pending` until re-dispatch
@@ -187,6 +241,11 @@ impl SchedulerDb {
     /// stayed open until they aged into ChargeExecutorCrash against a
     /// healthily-rebuilding derivation.
     ///
+    /// Returns the [`StatusReplay`] named set (merged_bug_017): the
+    /// caller computes `refused = kept − replayed` and surfaces every
+    /// row the precedence conjunct refused — a zero-row replay is a
+    /// loud outcome, never an unconsulted count.
+    ///
     /// Runtime-bound (not `query!`): `cargo xtask regen sqlx`
     /// self-builds this crate (the same posture as the other fenced
     /// writers added since).
@@ -199,41 +258,49 @@ impl SchedulerDb {
         drv_hashes: &[&str],
         status: DerivationStatus,
         latched_exec_ids: &[uuid::Uuid],
-        latched_at_epoch: f64,
+        latch_age: LatchAge,
         serving_generation: ServingGeneration,
-    ) -> Result<FencedOutcome, sqlx::Error> {
+    ) -> Result<StatusReplay, sqlx::Error> {
         if drv_hashes.is_empty() && latched_exec_ids.is_empty() {
-            return Ok(FencedOutcome::Applied(0));
+            return Ok(StatusReplay::Applied { replayed: vec![] });
         }
         let mut tx = match self.begin_fenced(serving_generation).await? {
-            FencedBegin::Fenced { .. } => return Ok(FencedOutcome::Fenced),
+            FencedBegin::Fenced { .. } => return Ok(StatusReplay::Fenced),
             FencedBegin::Open(ftx) => ftx,
         };
-        let result = if drv_hashes.is_empty() {
-            None
+        let replayed: Vec<String> = if drv_hashes.is_empty() {
+            vec![]
         } else {
-            Some(
-                sqlx::query(
-                    // merged_bug_025: the wall-clock precedence
-                    // conjunct -- a row the world advanced AFTER the
-                    // latch (resubmitted drv: Running with a newer
-                    // updated_at) refuses the replay row-locally, even
-                    // when the in-memory re-derivation could not see
-                    // it. The timestamp form is PINNED over the
-                    // status-set form: the two diverge exactly on a
-                    // newer NON-terminal durable row, which the
-                    // status-set guard would have overwritten.
-                    "UPDATE derivations \
-                     SET status = $2, assigned_builder_id = NULL, updated_at = now() \
-                     WHERE drv_hash = ANY($1::text[]) \
-                       AND updated_at <= to_timestamp($3)",
-                )
-                .bind(drv_hashes)
-                .bind(status.as_str())
-                .bind(latched_at_epoch)
-                .execute(tx.conn())
-                .await?,
+            // merged_bug_025: the precedence conjunct — a row the
+            // world advanced AFTER the latch (resubmitted drv:
+            // Running with a newer updated_at) refuses the replay
+            // row-locally, even when the in-memory re-derivation
+            // could not see it. The timestamp form is PINNED over the
+            // status-set form: the two diverge exactly on a newer
+            // NON-terminal durable row, which the status-set guard
+            // would have overwritten.
+            //
+            // merged_bug_017: BOTH comparands are PG-domain — the
+            // latch crosses the clock boundary as a monotonic AGE
+            // (`make_interval`), never as an absolute pod timestamp
+            // (`to_timestamp(epoch_now())` silently ate NTP skew:
+            // PG-ahead dropped fresh terminal latches as zero-row
+            // "flushed" pops; pod-ahead re-opened the stale-overwrite
+            // window this conjunct is the only defense against). The
+            // BACKSTOP_DUE_SQL discipline. RETURNING names the
+            // allowed rows so the caller can surface the refused set.
+            sqlx::query_scalar::<_, String>(
+                "UPDATE derivations \
+                 SET status = $2, assigned_builder_id = NULL, updated_at = now() \
+                 WHERE drv_hash = ANY($1::text[]) \
+                   AND updated_at <= now() - make_interval(secs => $3) \
+                 RETURNING drv_hash",
             )
+            .bind(drv_hashes)
+            .bind(status.as_str())
+            .bind(latch_age.secs())
+            .fetch_all(tx.conn())
+            .await?
         };
         if let Some(close) = terminal_assignment_status(status)
             && !latched_exec_ids.is_empty()
@@ -247,9 +314,8 @@ impl SchedulerDb {
                 .fetch_one(tx.conn())
                 .await?;
         }
-        let updated = result.map_or(0, |r| r.rows_affected());
         tx.commit().await?;
-        Ok(FencedOutcome::Applied(updated))
+        Ok(StatusReplay::Applied { replayed })
     }
 
     /// Batch variant of [`update_derivation_status`]: set the same

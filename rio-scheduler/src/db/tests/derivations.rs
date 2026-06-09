@@ -602,12 +602,12 @@ async fn replay_with_all_drvs_dropped_still_closes_latched_execs() -> anyhow::Re
             &[],
             DerivationStatus::Cancelled,
             &[exec],
-            crate::db::attempts::epoch_now(),
+            crate::db::LatchAge::since_enqueue(std::time::Instant::now()),
             ServingGeneration::stamp_from_claim(1),
         )
         .await?;
     assert!(
-        matches!(outcome, FencedOutcome::Applied(0)),
+        matches!(&outcome, crate::db::StatusReplay::Applied { replayed } if replayed.is_empty()),
         "no derivation row may be updated by an all-dropped batch, got {outcome:?}"
     );
 
@@ -627,11 +627,12 @@ async fn replay_with_all_drvs_dropped_still_closes_latched_execs() -> anyhow::Re
 /// form: a drv resubmitted AFTER the latch sits Running with a newer
 /// `updated_at`. The in-memory re-derivation cannot drop it when the
 /// node was also reaped from the DAG (terminal latch keeps it), so the
-/// SQL conjunct `updated_at <= to_timestamp(latched_at)` is the
-/// row-local refusal. A status-set guard ("only overwrite rows still
-/// in X") diverges exactly here -- Running is not in any latched
-/// status set the flusher could enumerate without re-deriving, and the
-/// absolute UPDATE would regress it to the stale terminal status.
+/// SQL conjunct `updated_at <= now() - make_interval(secs => age)` is
+/// the row-local refusal (PG-domain form, merged_bug_017). A
+/// status-set guard ("only overwrite rows still in X") diverges
+/// exactly here -- Running is not in any latched status set the
+/// flusher could enumerate without re-deriving, and the absolute
+/// UPDATE would regress it to the stale terminal status.
 #[tokio::test]
 async fn replay_refuses_rows_updated_after_the_latch() -> anyhow::Result<()> {
     use crate::state::DerivationStatus;
@@ -648,21 +649,24 @@ async fn replay_refuses_rows_updated_after_the_latch() -> anyhow::Result<()> {
     .execute(&test_db.pool)
     .await?;
 
-    // The latch predates the resubmit by a minute.
-    let latched_at = crate::db::attempts::epoch_now() - 60.0;
+    // The latch predates the resubmit by a minute (a 60s-aged
+    // monotonic enqueue anchor).
+    let latch_age = crate::db::LatchAge::since_enqueue(
+        std::time::Instant::now() - std::time::Duration::from_secs(60),
+    );
     let outcome = db
         .replay_status_batch_guarded(
             &["post-latch-resubmit"],
             DerivationStatus::Cancelled,
             &[],
-            latched_at,
+            latch_age,
             ServingGeneration::stamp_from_claim(1),
         )
         .await?;
     assert!(
-        matches!(outcome, FencedOutcome::Applied(0)),
-        "left: {outcome:?} / right: Applied(0) (a row updated after \
-         the latch refuses the replay)"
+        matches!(&outcome, crate::db::StatusReplay::Applied { replayed } if replayed.is_empty()),
+        "left: {outcome:?} / right: Applied {{ replayed: [] }} (a row \
+         updated after the latch refuses the replay)"
     );
     let (status,): (String,) =
         sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = 'post-latch-resubmit'")
@@ -673,5 +677,124 @@ async fn replay_refuses_rows_updated_after_the_latch() -> anyhow::Result<()> {
         "left: {status} / right: running (the stale Cancelled latch \
          must not regress the resubmitted row)"
     );
+    Ok(())
+}
+
+/// merged_bug_017 red R1: a fresh terminal latch must land whatever
+/// the POD clock reads — the precedence comparison must live entirely
+/// in the PG clock domain. Pre-fix the conjunct bound
+/// `latched_at_epoch = epoch_now()` (pod `SystemTime`) against
+/// `updated_at` stamped by PG `now()`: with PG ahead of the pod (the
+/// pod 1h behind), the row's PG stamp postdated the latch's pod
+/// stamp, the UPDATE zero-rowed, and the flusher's `Ok(_)` arm popped
+/// the batch with an info "batch flushed" — the terminal latch
+/// silently lost, the cancelled drv resurrecting from durable rows at
+/// recovery. Red recorded verbatim against the old f64 API
+/// (`epoch_now() - 3600.0`): `left: Applied(0) (terminal latch
+/// silently refused by clock skew) / right: Applied(1)`. Post-fix the
+/// latch anchor is the batch's MONOTONIC enqueue instant mapped into
+/// the PG domain at flush time (`updated_at <= now() -
+/// make_interval(secs => age)`) — the pod epoch is no longer an
+/// input, so the skew shape this red exercised is UNWRITABLE through
+/// the `LatchAge` parameter: this migrated form pins the fresh latch
+/// landing, with the skew immunity carried by the type.
+#[tokio::test]
+async fn replay_lands_under_pg_ahead_skew() -> anyhow::Result<()> {
+    use crate::state::DerivationStatus;
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    // Seed: PG stamps `updated_at = now()` at insert; the cancel is
+    // latched LOGICALLY AFTER that write (the batch enqueues now —
+    // whatever epoch the pod clock would have read at that moment).
+    insert_test_derivation(&db, "skew-cancel").await?;
+    let latch_age = crate::db::LatchAge::since_enqueue(std::time::Instant::now());
+
+    let outcome = db
+        .replay_status_batch_guarded(
+            &["skew-cancel"],
+            DerivationStatus::Cancelled,
+            &[],
+            latch_age,
+            ServingGeneration::stamp_from_claim(1),
+        )
+        .await?;
+    assert!(
+        matches!(
+            &outcome,
+            crate::db::StatusReplay::Applied { replayed } if replayed == &["skew-cancel".to_string()]
+        ),
+        "left: {outcome:?} (terminal latch silently refused by clock \
+         skew) / right: Applied {{ replayed: [\"skew-cancel\"] }} — a \
+         fresh latch must replay whatever the pod clock reads"
+    );
+    let (status,): (String,) =
+        sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = 'skew-cancel'")
+            .fetch_one(&test_db.pool)
+            .await?;
+    assert_eq!(
+        status, "cancelled",
+        "left: {status} / right: cancelled (the latched terminal status \
+         must land)"
+    );
+    Ok(())
+}
+
+/// merged_bug_017 red R2: a row the world advanced AFTER the latch
+/// must be refused row-locally AND the refusal must be a LOUD, named
+/// outcome — the caller needs the refused drv set to warn/count, not
+/// an `Ok(rows_affected)` shadow it never consults. Red recorded
+/// verbatim against the old API (no refusal surface existed — the
+/// only observable was the info "batch flushed"): `left: Applied(0)
+/// — an anonymous count; the refused drv set is inexpressible /
+/// right: a named replayed set the flusher can subtract from kept`.
+/// The actor-side rider in actor/tests/misc.rs pins the flusher's
+/// warn + counter emission and the batch-pop semantics.
+#[tokio::test]
+async fn advanced_row_refusal_is_returned_loud() -> anyhow::Result<()> {
+    use crate::state::DerivationStatus;
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    // The latch is 60s old; the row advanced (fresh PG write) after it.
+    insert_test_derivation(&db, "advanced-row").await?;
+    sqlx::query(
+        "UPDATE derivations SET status = 'running', updated_at = now() \
+         WHERE drv_hash = 'advanced-row'",
+    )
+    .execute(&test_db.pool)
+    .await?;
+    let latch_age = crate::db::LatchAge::since_enqueue(
+        std::time::Instant::now() - std::time::Duration::from_secs(60),
+    );
+
+    let outcome = db
+        .replay_status_batch_guarded(
+            &["advanced-row"],
+            DerivationStatus::Cancelled,
+            &[],
+            latch_age,
+            ServingGeneration::stamp_from_claim(1),
+        )
+        .await?;
+    // Row-local refusal: the advanced row is never regressed.
+    let (status,): (String,) =
+        sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = 'advanced-row'")
+            .fetch_one(&test_db.pool)
+            .await?;
+    assert_eq!(
+        status, "running",
+        "the advanced row must not be regressed by the stale latch"
+    );
+    // The refusal is NAMED: the kept drv is absent from the replayed
+    // set, so the caller computes refused = kept − replayed.
+    match outcome {
+        crate::db::StatusReplay::Applied { replayed } => assert!(
+            replayed.is_empty(),
+            "left: {replayed:?} / right: [] (the advanced row must be \
+             refused row-locally and absent from the named set)"
+        ),
+        other => panic!("unexpected outcome {other:?}"),
+    }
     Ok(())
 }

@@ -25,6 +25,7 @@ mod builds;
 pub(crate) use builds::BuildTerminalRow;
 pub(crate) mod confirm_fences;
 mod derivations;
+pub(crate) use derivations::{LatchAge, StatusReplay};
 mod executions;
 mod history;
 pub(crate) mod live_pins;

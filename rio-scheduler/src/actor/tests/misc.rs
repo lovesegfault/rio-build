@@ -2546,6 +2546,69 @@ async fn absent_node_nonterminal_latch_must_not_regress_durable_status() -> Test
     Ok(())
 }
 
+/// merged_bug_017 red R2, actor-side rider (the db half records the
+/// named-set red verbatim in db/tests/derivations.rs): a replay the
+/// precedence conjunct refuses row-locally must surface LOUDLY at the
+/// flusher — the named refusal warn — while the durable row stays
+/// unregressed and the batch still POPS (the refusal is the precedence
+/// law's FINAL verdict: the durable row is newer; re-pushing would
+/// retry forever against it). Pre-fix the only observable was the
+/// info "batch flushed". The companion counter
+/// (`rio_scheduler_status_outbox_replay_refused_total`) lands WITH its
+/// describe in the scheduler-HELP owner's pass (emission and describe
+/// must land together under the all_emitted_metrics_are_described
+/// census); its assertion line rides that landing.
+#[tokio::test]
+async fn refused_replay_pops_batch_and_stays_unregressed() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    // Durable truth: the node advanced (Running, fresh PG stamp)
+    // AFTER the latch below; it is DAG-absent so the terminal-KEEP
+    // arm keeps it in the batch and only the PG-domain conjunct can
+    // refuse it.
+    sqlx::query(
+        "INSERT INTO derivations (drv_hash, drv_path, pname, system, status) \
+         VALUES ($1, $2, 'pkg', 'x86_64-linux', 'running')",
+    )
+    .bind("outbox-refused")
+    .bind(test_drv_path("outbox-refused"))
+    .execute(&db.pool)
+    .await?;
+
+    let mut actor = bare_actor(db.pool.clone());
+    // A terminal latch 60s OLDER than the row's PG stamp (the
+    // monotonic enqueue anchor carries the age; the epoch field is
+    // diagnostic only).
+    actor.status_outbox.push_back(crate::actor::StatusBatch {
+        drv_hashes: vec!["outbox-refused".into()],
+        status: DerivationStatus::Cancelled,
+        exec_ids: vec![],
+        enqueued_at: std::time::Instant::now() - std::time::Duration::from_secs(60),
+        latched_at_epoch: crate::db::attempts::epoch_now() - 60.0,
+    });
+    let authority = actor.dag_authority().expect("always-leader test actor");
+    actor.tick_flush_status_outbox(&authority).await;
+
+    // The durable row stands.
+    let (status,): (String,) =
+        sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = 'outbox-refused'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        status, "running",
+        "left: {status} / right: running (the refused replay must not \
+         regress the newer durable row)"
+    );
+    // The batch popped — refusal is final, not a retry lane.
+    assert_eq!(
+        actor.status_outbox.len(),
+        0,
+        "the refused batch must pop (re-pushing would retry forever \
+         against the newer durable row)"
+    );
+    Ok(())
+}
+
 /// merged_bug_285: the split-release wedge — node Assigned/Running,
 /// NO open assignment of either kind, job Pending-unclaimed (the
 /// crash/flip window between the fenced close commit and the dropped

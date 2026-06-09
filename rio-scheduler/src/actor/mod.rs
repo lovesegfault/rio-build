@@ -260,12 +260,16 @@ pub(super) struct StatusBatch {
     /// touch it by construction (merged_bug_011).
     pub(super) exec_ids: Vec<Uuid>,
     pub(super) enqueued_at: std::time::Instant,
-    /// Wall-clock latch instant (epoch seconds — the same clock as
-    /// `derivations.updated_at`): the replay UPDATE's precedence
-    /// anchor (merged_bug_025). `updated_at <= to_timestamp($latched)`
-    /// refuses to overwrite any row the world advanced AFTER the
-    /// latch — a drv resubmitted post-latch is Running with a newer
-    /// `updated_at`, which a status-set guard would have regressed.
+    /// Wall-clock latch instant (epoch seconds, POD `SystemTime` —
+    /// NOT the clock that stamps `derivations.updated_at`, which is
+    /// PG `now()`). DIAGNOSTIC ONLY (merged_bug_017): logged in the
+    /// flusher's refusal warn for skew forensics, never compared
+    /// against any PG-stamped column. The replay's precedence anchor
+    /// (merged_bug_025) is the MONOTONIC `enqueued_at` above, mapped
+    /// into the PG domain at flush time as a latch AGE
+    /// (`db::LatchAge::since_enqueue` →
+    /// `updated_at <= now() - make_interval(secs => age)`), so the
+    /// comparison lives entirely in one clock domain.
     pub(super) latched_at_epoch: f64,
 }
 

@@ -756,14 +756,19 @@ impl DagActor {
     /// The replay goes through `replay_status_batch_guarded`, whose
     /// assignment close is scoped to the LATCHED exec_ids — never the
     /// derivation — so a successor attempt is untouchable by
-    /// construction, and whose UPDATE carries the wall-clock
-    /// precedence conjunct `updated_at <= to_timestamp(latched_at)`
-    /// (merged_bug_025): a row the world advanced AFTER the latch —
-    /// including a resubmitted drv sitting Running with a newer
-    /// `updated_at`, which a status-set guard would miss — refuses
-    /// the replay row-locally even when the in-memory re-derivation
-    /// could not see it. Leader-gated by `handle_tick`; the outbox is
-    /// cleared on leadership loss in `clear_persisted_state`.
+    /// construction, and whose UPDATE carries the PG-domain precedence
+    /// conjunct `updated_at <= now() - make_interval(secs =>
+    /// latch_age)` (merged_bug_025; clock domains merged_bug_017 — the
+    /// latch crosses the boundary as a monotonic age from the batch's
+    /// enqueue instant, never as a pod timestamp): a row the world
+    /// advanced AFTER the latch — including a resubmitted drv sitting
+    /// Running with a newer `updated_at`, which a status-set guard
+    /// would miss — refuses the replay row-locally even when the
+    /// in-memory re-derivation could not see it, and every refusal is
+    /// surfaced (named warn +
+    /// `rio_scheduler_status_outbox_replay_refused_total`).
+    /// Leader-gated by `handle_tick`; the outbox is cleared on
+    /// leadership loss in `clear_persisted_state`.
     // r[impl sched.attempt.cancel-close-driven+1]
     pub(super) async fn tick_flush_status_outbox(&mut self, _authority: &super::DagAuthority) {
         while let Some(front) = self.status_outbox.front() {
@@ -813,21 +818,62 @@ impl DagActor {
                     &kept,
                     batch.status,
                     &batch.exec_ids,
-                    batch.latched_at_epoch,
+                    // merged_bug_017: the latch crosses the clock
+                    // boundary as a monotonic AGE from the batch's
+                    // enqueue instant — recomputed per flush attempt
+                    // so a re-pushed batch keeps its latch-pinned
+                    // cut; no pod epoch ever reaches the conjunct.
+                    crate::db::LatchAge::since_enqueue(batch.enqueued_at),
                     self.serving_generation(),
                 )
                 .await
             {
-                Ok(crate::db::FencedOutcome::Fenced) => {
+                Ok(crate::db::StatusReplay::Fenced) => {
                     // Deposed mid-tick: keep the entry for visibility;
                     // LeaderLost clears the whole outbox momentarily.
                     self.note_fenced_evidence_write("status outbox flush");
                     self.status_outbox.push_front(batch);
                     break;
                 }
-                Ok(_) => {
+                Ok(crate::db::StatusReplay::Applied { replayed }) => {
+                    // merged_bug_017: a refused replay is a LOUD,
+                    // counted, named outcome. The batch still pops —
+                    // the refusal is the precedence law's FINAL
+                    // verdict (the durable row is newer than the
+                    // latch), distinct from the re-pushed Fenced/Err
+                    // arms above/below.
+                    let refused: Vec<&str> = kept
+                        .iter()
+                        .copied()
+                        .filter(|h| !replayed.iter().any(|r| r == h))
+                        .collect();
+                    if !refused.is_empty() {
+                        // The named warn is the refusal surface. Its
+                        // companion counter
+                        // (rio_scheduler_status_outbox_replay_refused_total)
+                        // is NOT ticked here BY CONSTRAINT: the
+                        // all_emitted_metrics_are_described census
+                        // requires emission and describe in one
+                        // landing, and describe_metrics() is the
+                        // scheduler-HELP owner's surface — both
+                        // halves land together in that pass (the
+                        // posted wave handoff carries the exact
+                        // increment + describe + test lines).
+                        warn!(
+                            refused = ?refused,
+                            status = ?batch.status,
+                            age_secs = batch.enqueued_at.elapsed().as_secs(),
+                            // DIAGNOSTIC ONLY (merged_bug_017): the
+                            // pod-clock mint stamp, logged for skew
+                            // forensics — never compared against any
+                            // PG-stamped column.
+                            latched_at_epoch = batch.latched_at_epoch,
+                            "status outbox: replay refused (durable rows advanced \
+                             past the latch; the newer rows stand)"
+                        );
+                    }
                     info!(
-                        count = kept.len(),
+                        count = replayed.len(),
                         status = ?batch.status,
                         remaining = self.status_outbox.len(),
                         "status outbox: batch flushed (latched attempt rows closed)"
