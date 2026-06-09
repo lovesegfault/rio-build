@@ -31,14 +31,19 @@
 //!   problem (its retries/establishments are handled by the retry
 //!   fold), not a node problem — same discrimination the manual
 //!   runbook query makes.
-//! - **Systemic guard** = when more than
-//!   [`WEDGE_SYSTEMIC_FRACTION`] of the attributed fleet is past the
-//!   cluster threshold in one tick the cause is shared
-//!   (scheduler/report-path outage, store brownout), not per-node
-//!   wedges: the verdict is [`WedgeVerdict::Systemic`], nothing is
-//!   marked, and the runbook's manual discrimination applies — the
-//!   automation refuses to roll Dead-reaps across the fleet at
-//!   `dead_reap_cap`.
+//! - **Trajectory guard** (§5-S Q2) = per-node Dead-reaps are gated on
+//!   the FLEET trajectory, never a per-tick snapshot: when more than
+//!   [`WEDGE_SYSTEMIC_FRACTION`] of the fleet-derived population
+//!   (registered NodeClaims ∪ evidence nodes) is past the cluster
+//!   threshold (ratio axis), OR bears any in-window expiry evidence
+//!   (breadth axis — staggered shared-cause onset suppresses BEFORE
+//!   the ratio trips instead of serially reaping each node as it
+//!   crosses), OR a suppression watermark latched within
+//!   [`WEDGE_VERDICT_DWELL_SECS`] (dwell axis — an episode's trailing
+//!   edge is not fresh per-node wedges), the verdict is
+//!   [`WedgeVerdict::Systemic`]: nothing is marked and the runbook's
+//!   manual discrimination applies — the automation refuses to roll
+//!   Dead-reaps across the fleet at `dead_reap_cap`.
 //!
 //! Clustered nodes are fed to [`super::health::reap_unhealthy`] as the
 //! Dead-node input (the only such signal — the scheduler's stream-era
@@ -83,12 +88,39 @@ pub(super) const WEDGE_CLUSTER_MIN_DISTINCT_DRVS: usize = 2;
 /// sweep removes them.
 pub(super) const WEDGE_DEADLINE_GRACE_SECS: u64 = 30;
 
-/// Fraction of the tick's attributed build fleet past the cluster
-/// threshold above which the verdict is systemic (shared cause), not
-/// per-node. Strictly-greater comparison; also requires at least two
-/// affected nodes (a two-node fleet with one wedge is 0.5, not
-/// systemic).
+/// Fraction of the REGISTERED NodeClaim fleet past a trajectory
+/// threshold above which per-node verdicts are suppressed (shared
+/// cause), not per-node wedges. Strictly-greater comparison; also
+/// requires at least two nodes on the axis (a two-node fleet with one
+/// wedge is 0.5, not systemic).
+///
+/// SIGNED 2026-06-08 (owner, bughunt-4 fix-wave §5-S Q2): the
+/// systemic guard is trajectory-aware over the FLEET-DERIVED
+/// denominator. The denominator is the registered NodeClaim fleet
+/// united with the evidence-bearing nodes — never the per-tick
+/// attributed survivor set (a traffic-lull denominator collapse
+/// minted `Systemic{2, of: 2}` from a healthy 8-node fleet, which the
+/// episode drain then made sticky). Two trajectory axes gate every
+/// Dead-reap: BREADTH (nodes with >=1 in-window expiry — staggered
+/// shared-cause onset suppresses per-node verdicts BEFORE the
+/// affected-ratio trips, instead of serially Dead-reaping each node
+/// as it crosses the threshold) and DWELL (after a suppression
+/// watermark latches, per-node verdicts stay disabled for
+/// [`WEDGE_VERDICT_DWELL_SECS`] — the trailing edge of an episode is
+/// not a sequence of fresh per-node wedges). No retroactive repair
+/// for nodes Dead-reaped under the retired instantaneous law —
+/// disclosed at signing.
 pub(super) const WEDGE_SYSTEMIC_FRACTION: f64 = 0.5;
+
+/// Post-watermark dwell before per-node verdicts re-enable
+/// (merged_bug_034 / §5-S Q2 dwell axis). Sized to outlast the
+/// trailing edge of a healing episode (report redelivery, sweep
+/// catch-up: tens of ticks) while staying well under the
+/// [`WEDGE_CLUSTER_WINDOW_SECS`] evidence window — a genuinely
+/// still-wedged node re-detects from fresh post-episode expiries
+/// after the dwell, one window before its episode evidence would
+/// have aged out anyway.
+pub(super) const WEDGE_VERDICT_DWELL_SECS: f64 = 300.0;
 
 // C2/077 gap 3, compile-time half: the wedge must be able to observe an
 // expired attempt for its grace plus two full reconcile ticks before
@@ -109,11 +141,15 @@ pub(super) enum WedgeVerdict {
     /// Nodes past the cluster threshold — the only permitted feed of
     /// `health::reap_unhealthy`'s Dead arm.
     NodeWedged(Vec<String>, Sealed),
-    /// More than [`WEDGE_SYSTEMIC_FRACTION`] of the windowed
-    /// population is past the threshold: shared cause, nothing marked.
+    /// Per-node verdicts suppressed: shared cause (the affected
+    /// ratio or the breadth trajectory axis exceeded
+    /// [`WEDGE_SYSTEMIC_FRACTION`] of the fleet-derived population)
+    /// or post-episode dwell. Nothing is marked; the trajectory
+    /// state rides the verdict (§5-S Q2).
     Systemic {
         affected: usize,
         of: usize,
+        breadth: usize,
         _sealed: Sealed,
     },
     /// The open-attempt view was unobserved this tick (RPC failure):
@@ -124,28 +160,31 @@ pub(super) enum WedgeVerdict {
     Unobserved(Sealed),
 }
 
-/// Commensurable verdict populations (merged_bug_009): the numerator
-/// and denominator of the systemic guard, paired by the ONLY
-/// constructor so `affected ≤ of` holds BY CONSTRUCTION —
-/// `wedged ⊆ evidence-nodes ⊆ population` where
-/// `population = evidence-nodes ∪ this-tick fleet`. The retired guard
-/// compared retained-evidence nodes against the this-tick fleet alone
-/// (incommensurable: `Systemic{affected: 2, of: 1}` was
-/// representable, and an empty fleet escaped the guard entirely —
-/// the mass-Dead-reap polarity after an observation outage).
+/// Commensurable verdict populations (merged_bug_009, re-based by
+/// merged_bug_034/Q2): numerator, denominator and breadth are paired
+/// by the ONLY constructor so `wedged ⊆ evidence-nodes ⊆ population`
+/// holds BY CONSTRUCTION, where `population = registered fleet ∪
+/// evidence-nodes`. The merged_bug_009 shape used the per-tick
+/// ATTRIBUTED fleet (view rows) as the denominator base: a traffic
+/// lull collapsed it to the expiring nodes themselves, minting a
+/// false `Systemic{2, of: 2}` on a healthy 8-node fleet — which the
+/// episode drain+latch then made sticky (permanent signal loss). The
+/// registered NodeClaim fleet does not collapse with traffic.
 struct WedgePopulations {
     /// Nodes past the cluster threshold (sorted, deduplicated).
     wedged: Vec<String>,
-    /// `|evidence-nodes ∪ fleet|` — every node the window knows about.
+    /// `|registered fleet ∪ evidence-nodes|` (Q2 denominator).
     population: usize,
+    /// Nodes with ≥1 in-window expiry — the staggered-onset axis.
+    breadth: usize,
 }
 
 impl WedgePopulations {
-    /// The only constructor: derive both populations from the SAME
-    /// window state.
+    /// The only constructor: derive all three populations from the
+    /// SAME window state + the tick's registered fleet.
     fn from_window(
         evidence: &HashMap<String, HashMap<String, Evidence>>,
-        fleet: &HashSet<String>,
+        registered: &HashSet<String>,
         now_secs: f64,
     ) -> Self {
         let mut wedged: Vec<String> = evidence
@@ -160,12 +199,24 @@ impl WedgePopulations {
             .map(|(node, _)| node.clone())
             .collect();
         wedged.sort();
+        let breadth = evidence
+            .iter()
+            .filter(|(_, per_node)| {
+                per_node
+                    .values()
+                    .any(|e| now_secs - e.anchor <= WEDGE_CLUSTER_WINDOW_SECS)
+            })
+            .count();
         let population = evidence
             .keys()
-            .chain(fleet.iter())
+            .chain(registered.iter())
             .collect::<HashSet<_>>()
             .len();
-        Self { wedged, population }
+        Self {
+            wedged,
+            population,
+            breadth,
+        }
     }
 }
 
@@ -251,8 +302,8 @@ pub(super) struct WedgeTracker {
 /// called that unrepresentable.)
 mod seal {
     use super::{
-        Suppression, WEDGE_CLUSTER_MIN_DISTINCT_DRVS, WEDGE_SYSTEMIC_FRACTION, WedgePopulations,
-        WedgeTracker, WedgeVerdict,
+        Suppression, WEDGE_CLUSTER_MIN_DISTINCT_DRVS, WEDGE_SYSTEMIC_FRACTION,
+        WEDGE_VERDICT_DWELL_SECS, WedgePopulations, WedgeTracker, WedgeVerdict,
     };
 
     /// Proof-of-origin token for [`WedgeVerdict`]: constructible only
@@ -285,18 +336,42 @@ mod seal {
         populations: Option<WedgePopulations>,
         now_secs: f64,
     ) -> WedgeVerdict {
-        let Some(WedgePopulations { wedged, population }) = populations else {
+        let Some(WedgePopulations {
+            wedged,
+            population,
+            breadth,
+        }) = populations
+        else {
             return WedgeVerdict::Unobserved(Sealed(()));
         };
         let affected = wedged.len();
+        // §5-S Q2 trajectory law, three suppression sources in
+        // precedence order:
+        // 1. affected ratio (the classic systemic guard, now over the
+        //    fleet-derived denominator) — drains + latches;
+        // 2. breadth (staggered shared-cause onset: most of the fleet
+        //    has SOME expiry evidence even though few crossed the
+        //    per-node threshold yet) — suppresses WITHOUT draining,
+        //    so the evidence keeps accumulating: either the ratio law
+        //    fires next (drain+latch) or the window ages it out;
+        // 3. dwell (a suppression watermark latched less than
+        //    WEDGE_VERDICT_DWELL_SECS ago) — the trailing edge of an
+        //    episode is not a sequence of fresh per-node wedges.
         let systemic =
             affected >= 2 && (affected as f64 / population as f64) > WEDGE_SYSTEMIC_FRACTION;
+        let breadth_suppressed =
+            breadth >= 2 && (breadth as f64 / population as f64) > WEDGE_SYSTEMIC_FRACTION;
+        let dwell_active = t
+            .last_suppression
+            .is_some_and(|w| now_secs - w.set_at <= WEDGE_VERDICT_DWELL_SECS);
+        let trajectory_suppressed = breadth_suppressed || (dwell_active && !wedged.is_empty());
         let survivors: Vec<String> = if systemic {
             metrics::counter!("rio_controller_wedge_systemic_suppressed_total").increment(1);
             tracing::warn!(
                 affected = wedged.len(),
                 of = population,
-                "wedge clustering suppressed: >{WEDGE_SYSTEMIC_FRACTION} of the windowed \
+                breadth,
+                "wedge clustering suppressed: >{WEDGE_SYSTEMIC_FRACTION} of the fleet-derived \
                  population is past the expiry threshold — systemic cause (report-path \
                  outage, store brownout), not per-node wedges; marking nothing, draining \
                  the WHOLE episode's evidence and latching the suppression watermark \
@@ -320,6 +395,18 @@ mod seal {
                 max_expiry_pg,
             });
             Vec::new()
+        } else if trajectory_suppressed {
+            tracing::warn!(
+                affected,
+                of = population,
+                breadth,
+                dwell_active,
+                "wedge per-node verdicts suppressed by the trajectory axes (§5-S Q2): \
+                 breadth-fraction systemic-in-formation or post-episode dwell — marking \
+                 nothing; evidence is retained (no drain) so a genuine cluster either \
+                 trips the ratio law or ages out of the window"
+            );
+            Vec::new()
         } else {
             for node in &wedged {
                 if t.marked.insert(node.clone()) {
@@ -338,12 +425,13 @@ mod seal {
         // or whose episode was drained — leave it, so a later re-wedge
         // counts as a new transition).
         t.marked.retain(|n| survivors.contains(n));
-        if systemic {
-            // `survivors` is empty on this arm; the verdict reports the
-            // pre-drain populations.
+        if systemic || trajectory_suppressed {
+            // `survivors` is empty on these arms; the verdict reports
+            // the pre-drain populations + the trajectory state.
             WedgeVerdict::Systemic {
                 affected,
                 of: population,
+                breadth,
                 _sealed: Sealed(()),
             }
         } else {
@@ -368,8 +456,8 @@ impl WedgeTracker {
     ///   controller deleted since the previous tick — their evidence
     ///   and marked entries are dead, and must not re-feed the Dead
     ///   arm or inflate the systemic populations).
-    // r[impl ctrl.nodeclaim.wedge-cluster+2]
-    // r[impl ctrl.nodeclaim.wedge-two-axis+3]
+    // r[impl ctrl.nodeclaim.wedge-cluster+3]
+    // r[impl ctrl.nodeclaim.wedge-two-axis+4]
     pub(super) fn update(
         &mut self,
         view: Option<&[OpenAttempt]>,
@@ -406,20 +494,19 @@ impl WedgeTracker {
             // drain `marked` and double-count later transitions).
             return seal::finalize(self, None, now_secs);
         };
-        let fleet = self.observe(open_attempts, now_secs);
+        self.observe(open_attempts, now_secs);
         self.prune(now_secs);
-        let populations = WedgePopulations::from_window(&self.evidence, &fleet, now_secs);
+        let populations = WedgePopulations::from_window(&self.evidence, registered, now_secs);
         seal::finalize(self, Some(populations), now_secs)
     }
 
     /// Fold one tick's open-attempt view into the evidence map. Only
     /// BUILD attempts past `deadline + grace` with a known deadline and
     /// a ledger node attribution contribute; each (node, derivation)
-    /// pair anchors at its first observation. Returns the tick's
-    /// attributed build fleet (distinct source nodes across healthy AND
-    /// expired attempts) — the systemic-guard denominator.
-    fn observe(&mut self, open_attempts: &[OpenAttempt], now_secs: f64) -> HashSet<String> {
-        let mut fleet: HashSet<String> = HashSet::new();
+    /// pair anchors at its first observation. (The systemic-guard
+    /// denominator is the REGISTERED fleet — §5-S Q2 — not the view's
+    /// attributed nodes, so nothing is returned here.)
+    fn observe(&mut self, open_attempts: &[OpenAttempt], now_secs: f64) {
         for a in open_attempts {
             if a.attempt_kind != rio_proto::types::AttemptKind::Build as i32 {
                 // Materialization (store fetch): the stamped node is the
@@ -437,12 +524,11 @@ impl WedgeTracker {
             }
             if self.evicted.contains_key(&a.source_node) {
                 // merged_bug_017: an evicted node's still-open attempts
-                // are inadmissible — not evidence, not fleet. Eviction
-                // is an admission source consumed here, not a state
-                // wipe the next observation undoes.
+                // are inadmissible. Eviction is an admission source
+                // consumed here, not a state wipe the next observation
+                // undoes.
                 continue;
             }
-            fleet.insert(a.source_node.clone());
             if a.deadline_secs == 0 {
                 // Deadline unknown to the scheduler — can't call it expired.
                 continue;
@@ -505,7 +591,6 @@ impl WedgeTracker {
                     expiry_pg,
                 });
         }
-        fleet
     }
 
     /// Drop evidence older than the window, nodes left without any,
@@ -593,7 +678,7 @@ mod tests {
     /// and `classify` consumes it as the SOLE Dead input (the removed
     /// `dead_nodes` field — reserved in the proto since the 1d sweep —
     /// fed the same arm in its day; see the module header).
-    // r[verify ctrl.nodeclaim.wedge-cluster+2]
+    // r[verify ctrl.nodeclaim.wedge-cluster+3]
     #[test]
     fn two_expired_drvs_on_one_node_mark_it_dead_equivalent() {
         let mut tracker = WedgeTracker::default();
@@ -605,7 +690,10 @@ mod tests {
                 healthy("drv-d", "node-3"),
             ]),
             &no_reaps(),
-            &fleet(&["node-1", "node-2", "node-3"]),
+            // Six registered nodes: breadth (2 evidence-bearing of 6)
+            // stays under the trajectory fraction, so the basic
+            // detection case still marks (Q2).
+            &fleet(&["node-1", "node-2", "node-3", "node-4", "node-5", "node-6"]),
             10_000.0,
         ));
         assert_eq!(wedged, vec!["node-1".to_string()]);
@@ -646,7 +734,7 @@ mod tests {
 
     /// One derivation expiring (even repeatedly observed) never marks a
     /// node, and healthy pulls contribute nothing.
-    // r[verify ctrl.nodeclaim.wedge-cluster+2]
+    // r[verify ctrl.nodeclaim.wedge-cluster+3]
     #[test]
     fn single_expired_drv_or_healthy_pulls_do_not_mark() {
         let mut tracker = WedgeTracker::default();
@@ -665,6 +753,140 @@ mod tests {
         }
     }
 
+    /// merged_bug_034 / §5-S Q2 red 1: staggered shared-cause onset.
+    /// Five of six nodes accumulate expiries one tick apart; under the
+    /// retired instantaneous guard each node was Dead-reaped SERIALLY
+    /// as it crossed the per-node threshold (affected=1 per tick — the
+    /// ratio never trips), rolling reaps across a fleet suffering a
+    /// shared cause. The breadth axis suppresses per-node verdicts
+    /// while most of the fleet bears evidence.
+    // r[verify ctrl.nodeclaim.wedge-two-axis+4]
+    #[test]
+    fn staggered_onset_does_not_serially_reap() {
+        let mut t = WedgeTracker::default();
+        let reg = fleet(&["node-1", "node-2", "node-3", "node-4", "node-5", "node-6"]);
+        // Tick 1: node-1 crosses the threshold (2 drvs); nodes 2-5
+        // each show their FIRST expiry (shared cause ramping up).
+        let view1 = vec![
+            expired("a1", "node-1", 5),
+            expired("a2", "node-1", 5),
+            expired("b1", "node-2", 5),
+            expired("c1", "node-3", 5),
+            expired("d1", "node-4", 5),
+            expired("e1", "node-5", 5),
+        ];
+        let v = t.update(Some(&view1), &no_reaps(), &reg, 10_000.0);
+        match v {
+            WedgeVerdict::NodeWedged(nodes, _) => assert!(
+                nodes.is_empty(),
+                "staggered onset Dead-reaped {nodes:?} before the ratio could trip"
+            ),
+            WedgeVerdict::Systemic { breadth, of, .. } => {
+                assert!(breadth >= 5 && of == 6, "breadth {breadth} of {of}");
+            }
+            WedgeVerdict::Unobserved(_) => panic!("observed tick yielded Unobserved"),
+        }
+    }
+
+    /// merged_bug_034 / §5-S Q2 red 2: traffic-lull denominator
+    /// collapse. Two genuinely wedged nodes in an otherwise-idle
+    /// EIGHT-node registered fleet: the retired guard's denominator
+    /// was the per-tick attributed view (the two expiring nodes
+    /// themselves), minting a false `Systemic{2, of: 2}` — which the
+    /// episode drain+latch then made sticky, permanently suppressing
+    /// the real per-node signal. The fleet-derived denominator keeps
+    /// the verdict per-node.
+    // r[verify ctrl.nodeclaim.wedge-two-axis+4]
+    #[test]
+    fn traffic_lull_does_not_mint_false_systemic() {
+        let mut t = WedgeTracker::default();
+        let reg = fleet(&[
+            "node-1", "node-2", "node-3", "node-4", "node-5", "node-6", "node-7", "node-8",
+        ]);
+        let view = vec![
+            expired("a1", "node-1", 5),
+            expired("a2", "node-1", 5),
+            expired("b1", "node-2", 5),
+            expired("b2", "node-2", 5),
+        ];
+        let v = t.update(Some(&view), &no_reaps(), &reg, 10_000.0);
+        match v {
+            WedgeVerdict::NodeWedged(nodes, _) => assert_eq!(
+                nodes,
+                vec!["node-1".to_string(), "node-2".to_string()],
+                "two wedged nodes in an idle 8-node fleet are per-node verdicts"
+            ),
+            WedgeVerdict::Systemic { affected, of, .. } => {
+                panic!("traffic lull minted a false systemic verdict ({affected}/{of})")
+            }
+            WedgeVerdict::Unobserved(_) => panic!("observed tick yielded Unobserved"),
+        }
+    }
+
+    /// §5-S Q2 dwell axis: after a ratio-systemic episode latches the
+    /// watermark, per-node verdicts stay disabled for
+    /// WEDGE_VERDICT_DWELL_SECS (the trailing edge of an episode is
+    /// not a sequence of fresh per-node wedges), then re-enable.
+    // r[verify ctrl.nodeclaim.wedge-two-axis+4]
+    #[test]
+    fn post_episode_dwell_gates_per_node_verdicts() {
+        let mut t = WedgeTracker::default();
+        let reg = fleet(&["node-1", "node-2", "node-3", "node-4", "node-5", "node-6"]);
+        // Ratio episode: 4 of 6 wedged.
+        let storm: Vec<OpenAttempt> = (1..=4)
+            .flat_map(|n| {
+                vec![
+                    expired(&format!("s{n}x"), &format!("node-{n}"), 5),
+                    expired(&format!("s{n}y"), &format!("node-{n}"), 5),
+                ]
+            })
+            .collect();
+        assert!(matches!(
+            t.update(Some(&storm), &no_reaps(), &reg, 10_000.0),
+            WedgeVerdict::Systemic { .. }
+        ));
+        // 60s later (inside the dwell): node-6 shows two FRESH
+        // expiries (assigned after the watermark — they admit), but
+        // per-node verdicts are still dwell-gated.
+        fn fresh(intent: &str, node: &str, assigned_pg: u64, now: f64) -> OpenAttempt {
+            OpenAttempt {
+                assigned_at_epoch_secs: assigned_pg,
+                assigned_at_age_secs: (now as u64) - assigned_pg,
+                ..expired(intent, node, 0)
+            }
+        }
+        let v = t.update(
+            Some(&[
+                fresh("f1", "node-6", 9_931, 10_065.0),
+                fresh("f2", "node-6", 9_931, 10_065.0),
+            ]),
+            &no_reaps(),
+            &reg,
+            10_065.0,
+        );
+        assert!(
+            matches!(v, WedgeVerdict::Systemic { .. }),
+            "per-node verdicts must stay dwell-gated 60s post-episode: {v:?}"
+        );
+        // Past the dwell: the same still-open fresh pair re-detects.
+        let late = 10_000.0 + WEDGE_VERDICT_DWELL_SECS + 10.0;
+        let v = t.update(
+            Some(&[
+                fresh("f1", "node-6", 9_931, late),
+                fresh("f2", "node-6", 9_931, late),
+            ]),
+            &no_reaps(),
+            &reg,
+            late,
+        );
+        match v {
+            WedgeVerdict::NodeWedged(nodes, _) => {
+                assert_eq!(nodes, vec!["node-6".to_string()])
+            }
+            other => panic!("post-dwell re-detect failed: {other:?}"),
+        }
+    }
+
     /// merged_bug_018: one physical expiry must compare identically
     /// against the suppression watermark every tick. The retired law
     /// reconstructed the expiry as `now − over` (PG-clock age vs the
@@ -674,7 +896,7 @@ mod tests {
     /// re-anchored — the trailing-edge reap the watermark exists to
     /// prevent. PG-frame admission (`assigned_at + deadline + grace`
     /// vs the episode's max PG-frame expiry) is jitter-free.
-    // r[verify ctrl.nodeclaim.wedge-two-axis+3]
+    // r[verify ctrl.nodeclaim.wedge-two-axis+4]
     #[test]
     fn pg_frame_admission_is_jitter_stable() {
         fn row(intent: &str, node: &str, assigned_pg: u64, age: u64) -> OpenAttempt {
@@ -737,7 +959,7 @@ mod tests {
     /// to close them); the one-shot `mem::take`-era wipe let `observe`
     /// re-anchor them the same tick, re-feeding the Dead arm with a
     /// node that no longer exists.
-    // r[verify ctrl.nodeclaim.wedge-cluster+2]
+    // r[verify ctrl.nodeclaim.wedge-cluster+3]
     #[test]
     fn reaped_node_still_open_attempts_are_inadmissible() {
         let mut tracker = WedgeTracker::default();
@@ -765,7 +987,7 @@ mod tests {
     /// fleet (deleted out-of-band, Karpenter GC) is evicted exactly
     /// like a reaped one — its evidence cannot mark and does not
     /// inflate the populations.
-    // r[verify ctrl.nodeclaim.wedge-cluster+2]
+    // r[verify ctrl.nodeclaim.wedge-cluster+3]
     #[test]
     fn fleet_absent_node_is_evicted_and_inadmissible() {
         let mut tracker = WedgeTracker::default();
@@ -784,7 +1006,7 @@ mod tests {
     /// Evidence ages out of the 30-minute window: two expiries observed
     /// far apart never coexist inside one window, so the node is not
     /// marked; once both are inside the window it is.
-    // r[verify ctrl.nodeclaim.wedge-cluster+2]
+    // r[verify ctrl.nodeclaim.wedge-cluster+3]
     #[test]
     fn evidence_outside_the_window_does_not_count() {
         let mut tracker = WedgeTracker::default();
@@ -821,7 +1043,7 @@ mod tests {
     }
 
     /// Attempts with an unknown deadline (0) are never evidence.
-    // r[verify ctrl.nodeclaim.wedge-cluster+2]
+    // r[verify ctrl.nodeclaim.wedge-cluster+3]
     #[test]
     fn unknown_deadline_is_not_evidence() {
         let mut tracker = WedgeTracker::default();
@@ -839,7 +1061,7 @@ mod tests {
     /// their deadline expiry says nothing about a *node* (the stamped
     /// source_node is the stale builder binding). They are never wedge
     /// evidence.
-    // r[verify ctrl.nodeclaim.wedge-two-axis+3]
+    // r[verify ctrl.nodeclaim.wedge-two-axis+4]
     #[test]
     fn materialization_attempts_are_never_wedge_evidence() {
         let mut tracker = WedgeTracker::default();
@@ -859,7 +1081,7 @@ mod tests {
     /// (empty source_node) is never evidence — the newest-pod-wins
     /// in-memory binding attributes an old attempt's expiry to the
     /// *replacement* pod's healthy node.
-    // r[verify ctrl.nodeclaim.wedge-two-axis+3]
+    // r[verify ctrl.nodeclaim.wedge-two-axis+4]
     #[test]
     fn empty_source_node_never_attributes() {
         let mut tracker = WedgeTracker::default();
@@ -879,7 +1101,7 @@ mod tests {
     /// plus a second derivation expiring at the very end, must not
     /// mark: the two expiries are hours apart even though both were
     /// "recently observed".
-    // r[verify ctrl.nodeclaim.wedge-two-axis+3]
+    // r[verify ctrl.nodeclaim.wedge-two-axis+4]
     #[test]
     fn evidence_window_anchors_at_first_observation() {
         let mut tracker = WedgeTracker::default();
@@ -924,7 +1146,7 @@ mod tests {
     /// expiries the cause is systemic (scheduler/report-path outage,
     /// store brownout), not per-node wedges — marking nothing beats
     /// rolling Dead-reaps across the fleet at dead_reap_cap.
-    // r[verify ctrl.nodeclaim.wedge-two-axis+3]
+    // r[verify ctrl.nodeclaim.wedge-two-axis+4]
     #[test]
     fn fleet_wide_expiry_is_systemic_and_marks_nothing() {
         let mut tracker = WedgeTracker::default();
@@ -964,7 +1186,7 @@ mod tests {
 /// from the raw trajectory alone: which (node, drv) anchors are live
 /// in each tick's window (first-observation anchored, eviction- and
 /// drain-aware), and from that the expected verdict populations.
-// r[verify ctrl.nodeclaim.wedge-two-axis+3]
+// r[verify ctrl.nodeclaim.wedge-two-axis+4]
 #[cfg(test)]
 mod proptests {
     use proptest::prelude::*;
@@ -1037,7 +1259,11 @@ mod proptests {
     enum Expect {
         Skipped,
         PerNode(Vec<String>),
-        Systemic { affected: usize, of: usize },
+        Systemic {
+            affected: usize,
+            of: usize,
+            breadth: usize,
+        },
     }
 
     impl Oracle {
@@ -1082,6 +1308,7 @@ mod proptests {
             }
             self.anchors
                 .retain(|_, t| now - *t <= WEDGE_CLUSTER_WINDOW_SECS);
+            let _ = fleet;
             let mut per_node: BTreeMap<&str, usize> = BTreeMap::new();
             for (node, _) in self.anchors.keys() {
                 *per_node.entry(node.as_str()).or_default() += 1;
@@ -1093,14 +1320,23 @@ mod proptests {
                 .collect();
             let evidence_nodes: BTreeSet<&str> =
                 self.anchors.keys().map(|(n, _)| n.as_str()).collect();
+            // Q2: registered-fleet denominator (the oracle's fleet is
+            // every named node, constant across the trajectory).
+            let registered: BTreeSet<&str> = NODES[1..].iter().copied().collect();
             let population = evidence_nodes
                 .iter()
                 .copied()
-                .chain(fleet.iter().map(String::as_str))
+                .chain(registered.iter().copied())
                 .collect::<BTreeSet<_>>()
                 .len();
+            let breadth = evidence_nodes.len();
             let systemic = wedged.len() >= 2
                 && (wedged.len() as f64 / population as f64) > WEDGE_SYSTEMIC_FRACTION;
+            let breadth_suppressed =
+                breadth >= 2 && (breadth as f64 / population as f64) > WEDGE_SYSTEMIC_FRACTION;
+            let dwell_active = self
+                .watermark
+                .is_some_and(|w| now - w <= WEDGE_VERDICT_DWELL_SECS);
             if systemic {
                 let affected = wedged.len();
                 // Whole-episode drain + latch (merged_bug_163).
@@ -1110,6 +1346,15 @@ mod proptests {
                 Expect::Systemic {
                     affected,
                     of: population,
+                    breadth,
+                }
+            } else if breadth_suppressed || (dwell_active && !wedged.is_empty()) {
+                // Trajectory suppression: NO drain, NO latch (Q2).
+                self.marked.clear();
+                Expect::Systemic {
+                    affected: wedged.len(),
+                    of: population,
+                    breadth,
                 }
             } else {
                 self.marked = wedged.iter().cloned().collect();
@@ -1198,9 +1443,10 @@ mod proptests {
                     (Expect::PerNode(exp), WedgeVerdict::NodeWedged(nodes, _)) => {
                         prop_assert_eq!(nodes, exp, "tick {}", i);
                     }
-                    (Expect::Systemic { affected, of }, WedgeVerdict::Systemic { affected: a, of: o, .. }) => {
+                    (Expect::Systemic { affected, of, breadth }, WedgeVerdict::Systemic { affected: a, of: o, breadth: b, .. }) => {
                         prop_assert_eq!(a, affected, "tick {}", i);
                         prop_assert_eq!(o, of, "tick {}", i);
+                        prop_assert_eq!(b, breadth, "tick {}", i);
                         prop_assert!(a <= o, "tick {i}: incommensurable {a}/{o}");
                     }
                     (Expect::PerNode(exp), v) => {
@@ -1208,7 +1454,7 @@ mod proptests {
                             "tick {i}: expected per-node {exp:?}, got {v:?}"
                         )));
                     }
-                    (Expect::Systemic { affected, of }, v) => {
+                    (Expect::Systemic { affected, of, .. }, v) => {
                         return Err(TestCaseError::fail(format!(
                             "tick {i}: expected systemic {affected}/{of}, got {v:?}"
                         )));
@@ -1269,10 +1515,17 @@ mod proptests {
                 }
             }
             expect_wedged.sort();
+            // Q2: the denominator is the REGISTERED fleet (all eight
+            // nodes, regardless of which appear in the view) united
+            // with the evidence nodes — here always 8. Breadth equals
+            // the qualifying count (only state-2 nodes contribute
+            // evidence), so the breadth law coincides with the ratio
+            // law in this single-tick universe.
+            let _ = population;
             let systemic = expect_wedged.len() >= 2
-                && (expect_wedged.len() as f64 / population.len() as f64) > WEDGE_SYSTEMIC_FRACTION;
+                && (expect_wedged.len() as f64 / nodes.len() as f64) > WEDGE_SYSTEMIC_FRACTION;
             let mut tracker = WedgeTracker::default();
-            let registered: HashSet<String> = NODES[1..].iter().map(|s| s.to_string()).collect();
+            let registered: HashSet<String> = nodes.iter().cloned().collect();
             let verdict = tracker.update(
                 Some(&view),
                 &std::collections::BTreeSet::new(),
@@ -1280,15 +1533,21 @@ mod proptests {
                 1_000_000.0,
             );
             match verdict {
-                WedgeVerdict::Systemic { affected, of, .. } => {
+                WedgeVerdict::Systemic {
+                    affected,
+                    of,
+                    breadth,
+                    ..
+                } => {
                     assert!(systemic, "mask {mask}: unexpected systemic");
                     assert!(affected <= of, "mask {mask}: {affected}/{of}");
                     assert_eq!(affected, expect_wedged.len(), "mask {mask}");
-                    assert_eq!(of, population.len(), "mask {mask}");
+                    assert_eq!(of, nodes.len(), "mask {mask}");
+                    assert_eq!(breadth, expect_wedged.len(), "mask {mask}");
                 }
-                WedgeVerdict::NodeWedged(nodes, _) => {
+                WedgeVerdict::NodeWedged(found, _) => {
                     assert!(!systemic, "mask {mask}: expected systemic");
-                    assert_eq!(nodes, expect_wedged, "mask {mask}");
+                    assert_eq!(found, expect_wedged, "mask {mask}");
                 }
                 WedgeVerdict::Unobserved(_) => {
                     panic!("mask {mask}: observed view yielded Unobserved")
@@ -1302,7 +1561,7 @@ mod proptests {
 
 /// merged_bug_009 + merged_bug_176 regression battery (the wave's
 /// recorded reds, now pinned green).
-// r[verify ctrl.nodeclaim.wedge-two-axis+3]
+// r[verify ctrl.nodeclaim.wedge-two-axis+4]
 #[cfg(test)]
 mod population_and_epilogue_tests {
     use super::*;
@@ -1599,7 +1858,12 @@ mod episode_latch_tests {
             expired_at("c1", "node-c", 5),
         ];
         assert!(matches!(
-            t.update(Some(&view), &no_reaps(), &all_nodes(), 10_000.0),
+            t.update(
+                Some(&view),
+                &no_reaps(),
+                &fleet(&["node-a", "node-b", "node-c"]),
+                10_000.0
+            ),
             WedgeVerdict::Systemic {
                 affected: 2,
                 of: 3,
@@ -1631,7 +1895,7 @@ mod episode_latch_tests {
     /// forever by the un-TTL'd watermark: the node became permanently
     /// undetectable — a NodeClaim leak in the over-suppress direction,
     /// inverting the module's documented safe-failure direction.
-    // r[verify ctrl.nodeclaim.wedge-two-axis+3]
+    // r[verify ctrl.nodeclaim.wedge-two-axis+4]
     #[test]
     fn post_window_participant_re_detects() {
         let mut t = WedgeTracker::default();

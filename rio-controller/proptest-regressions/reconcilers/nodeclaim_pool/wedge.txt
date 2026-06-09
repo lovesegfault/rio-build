@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 72c8a217d163f3f951c313f5a17694eeca5033497fcda4905f4d9bd288043774 # shrinks to jitters = [1], gap = 1
+cc a9389d5d96dce2241ca8eb69ee2750eb72406cccec88cafecfb9ffb60ad1492f # shrinks to ticks = [Tick { view: Some([OpenAttempt { intent_id: "d0", derivation: "", exec_id: "", executor_id: "", source_node: "n0", generation: 0, assigned_at_age_secs: 100, deadline_secs: 10, attempt_kind: Build, assigned_at_epoch_secs: 0 }, OpenAttempt { intent_id: "d0", derivation: "", exec_id: "", executor_id: "", source_node: "n1", generation: 0, assigned_at_age_secs: 100, deadline_secs: 10, attempt_kind: Build, assigned_at_epoch_secs: 0 }]), reaped: {} }, Tick { view: Some([]), reaped: {} }]

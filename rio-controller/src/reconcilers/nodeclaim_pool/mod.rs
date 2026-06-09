@@ -1473,7 +1473,7 @@ impl NodeClaimPoolReconciler {
         // is marked from stale data (the retired empty-view path ran
         // the verdict over an empty fleet, mass-marking every
         // retained-evidence node right after a systemic episode).
-        // r[impl ctrl.nodeclaim.wedge-cluster+2]
+        // r[impl ctrl.nodeclaim.wedge-cluster+3]
         let open_attempts = match admin_call(
             self.admin
                 .clone()
@@ -1487,7 +1487,7 @@ impl NodeClaimPoolReconciler {
                 None
             }
         };
-        // r[impl ctrl.nodeclaim.wedge-two-axis+3]
+        // r[impl ctrl.nodeclaim.wedge-two-axis+4]
         // Only per-node verdicts may feed the Dead arm; a systemic
         // pattern marks nothing (the warn + suppression counter fired
         // inside the sealed single-exit verdict). Last tick's reaps are

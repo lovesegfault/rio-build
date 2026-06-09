@@ -1347,7 +1347,7 @@ scheduler's cost table when the outage ends.
   restarted every tick, so idle consolidation never fired).
 ]
 
-#r("ctrl.nodeclaim.wedge-cluster+2")[
+#r("ctrl.nodeclaim.wedge-cluster+3")[
   On every full reconcile tick the NodeClaim-pool reconciler MUST compute a
   per-node clustering of pull-mode attempt-deadline expiries from the
   open-attempt ledger view (`AdminService.ListOpenAttempts`): an open
@@ -1356,11 +1356,20 @@ scheduler's cost table when the outage ends.
   ledger's `source_node` ONLY --- an attempt with no ledger node attribution,
   no known deadline, or a non-build work class contributes nothing (a
   materialization attempt is a store-side fetch whose stamped binding is the
-  stale builder pod). Each (node, derivation) evidence entry MUST anchor its
-  window at the derivation's FIRST observation --- a stuck-open attempt
-  re-observed every tick does not slide the window. A node accumulating
-  evidence for at least 2 distinct derivations inside the 30-minute window
-  MUST be treated as Dead-equivalent: fed to the unhealthy reap's `Dead` arm
+  stale builder pod). Evidence admission MUST treat eviction as an admission
+  source, not a state wipe: a node the controller reaped (any reap path,
+  idle included) or that is absent from the registered NodeClaim fleet is
+  tombstoned for one window --- its still-open attempts are inadmissible (a
+  reaped node's attempts re-present for several ticks before the
+  establishment sweep closes them, and re-anchoring them re-feeds the `Dead`
+  arm with a node that no longer exists). Each (node, derivation) evidence
+  entry MUST anchor its window at the derivation's FIRST observation --- a
+  stuck-open attempt re-observed every tick does not slide the window. A
+  node accumulating evidence for at least 2 distinct derivations inside the
+  30-minute window MUST be treated as Dead-equivalent --- SUBJECT to the
+  trajectory gates of `ctrl.nodeclaim.wedge-two-axis` (breadth and
+  post-episode dwell MAY suppress the per-node verdict) --- and fed to the
+  unhealthy reap's `Dead` arm
   --- the sole `Dead` input since the 1d sweep removed `GetSpawnIntents.dead_nodes`
   --- under the same per-tick dead-reap cap. One
   derivation expiring repeatedly MUST NOT mark a node by itself; an
@@ -1369,29 +1378,44 @@ scheduler's cost table when the outage ends.
   controller did not observe).
 ]
 
-#r("ctrl.nodeclaim.wedge-two-axis+3")[
-  The wedge clustering's verdict MUST be two-axis over COMMENSURABLE
-  populations: the systemic numerator (nodes past the cluster threshold)
-  and denominator MUST derive from the same window state --- the
-  denominator is the windowed population (evidence-bearing nodes united
-  with the tick's attributed build fleet), so `affected <= of` holds by
-  construction. When more than half of that population is past the
-  threshold and at least two nodes are affected, the verdict is SYSTEMIC
-  --- the reconciler MUST mark no node, MUST increment the suppression
-  counter
+#r("ctrl.nodeclaim.wedge-two-axis+4")[
+  The wedge clustering's verdict MUST be trajectory-gated over
+  COMMENSURABLE, FLEET-DERIVED populations: the denominator is the
+  registered NodeClaim fleet united with the evidence-bearing nodes ---
+  never the per-tick attributed view, whose traffic-lull collapse minted
+  false systemic verdicts --- so `affected <= of` holds by construction
+  and an idle fleet cannot shrink the denominator to the expiring nodes
+  themselves. Three suppression axes gate every per-node verdict, in
+  precedence order: (1) RATIO --- when more than half of the population
+  is past the cluster threshold and at least two nodes are affected, the
+  verdict is SYSTEMIC: the reconciler MUST mark no node, MUST increment
+  the suppression counter
   (#(refs.metric)("rio_controller_wedge_systemic_suppressed_total")), MUST
   drain the WHOLE episode's window evidence (every node in the windowed
   population, not only the wedged subset --- a sub-threshold
   participant's episode anchor must not survive as half of a future
   pair), MUST latch the suppression watermark, and MUST re-derive the
-  marked set --- every verdict runs its full epilogue through one sealed
-  exit whose token is constructible only inside that exit. Evidence
-  admission MUST beat the watermark: an expired attempt contributes only
-  when its expiry instant is strictly newer than the last suppression,
-  so the episode's still-open attempts cannot re-anchor at the trailing
-  edge and a genuinely stuck node re-detects from
-  `WEDGE_CLUSTER_MIN_DISTINCT_DRVS` fresh POST-episode expiries. Only a
-  per-node (non-systemic) verdict may feed the `Dead` arm. A tick whose
+  marked set; (2) BREADTH --- when more than half of the population
+  bears at least one in-window expiry (at least two nodes), per-node
+  verdicts MUST be suppressed WITHOUT draining or latching (staggered
+  shared-cause onset: the evidence keeps accumulating until the ratio
+  law fires or the window ages it out --- serial per-node Dead-reaps
+  before the ratio trips are the failure mode this axis removes);
+  (3) DWELL --- for `WEDGE_VERDICT_DWELL_SECS` after a suppression
+  watermark latches, per-node verdicts MUST remain suppressed (an
+  episode's trailing edge is not a sequence of fresh per-node wedges).
+  Every verdict runs its full epilogue through one sealed exit whose
+  token is constructible only inside that exit. Evidence admission MUST
+  beat the watermark in a SINGLE clock frame: an expired attempt
+  contributes only when its ledger-frame expiry instant
+  (`assigned_at + deadline + grace`, from `assigned_at_epoch_secs`) is
+  strictly newer than the drained episode's newest ledger-frame expiry
+  --- never a controller-frame reconstruction, whose per-tick jitter
+  flipped admission at the boundary --- and the watermark itself expires
+  after one window (a protective latch cannot outlive the episode it
+  suppresses: an episode attempt that never closes is exactly the
+  signature of a still-wedged node, which MUST re-detect after the
+  window). Only a per-node verdict may feed the `Dead` arm. A tick whose
   open-attempt view RPC failed MUST produce the distinct UNOBSERVED
   verdict: retained evidence neither marks nor suppresses, and the
   marked set is not re-derived (an observation blip must not
@@ -1402,6 +1426,22 @@ scheduler's cost table when the outage ends.
   establishment report slack, enforced from one shared constant on both
   sides (controller compile-time, scheduler config-load).
 ]
+
+// SIGNED 2026-06-08 (owner, bughunt-4 fix-wave, §5-S Q2 --- recorded at
+// both anchors per §1.5-2; the twin block sits at the systemic-guard
+// doc in nodeclaim_pool/wedge.rs): merged_bug_034's systemic guard is
+// trajectory-aware over the fleet-derived denominator. Denominator =
+// registered NodeClaim fleet (never the per-tick attributed survivor
+// set); breadth and dwell axes gate every Dead-reap; the model twin
+// demonstrates BOTH retired failure modes (serial reap under staggered
+// onset; false-systemic under a traffic lull, made sticky by the
+// episode drain). No retroactive repair for nodes Dead-reaped under
+// the retired instantaneous law --- disclosed at signing. This
+// signature supersedes the +3 body's attributed-fleet denominator and
+// its instantaneous-snapshot guard; the +3->+4 bump and the
+// wedge-cluster+2->+3 bump (admission-source eviction, dwell-gated
+// marking) ride the same commit with all markers re-stamped.
+
 
 This is the OA2 successor to the retired heartbeat-fed scheduler-side
 hung-node detector: pull-mode pods
