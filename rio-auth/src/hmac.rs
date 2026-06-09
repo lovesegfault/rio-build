@@ -222,10 +222,23 @@ impl HmacClaims for ServiceClaims {
 /// Signed with the SAME assignment-HMAC key as [`AssignmentClaims`]:
 /// both are scheduler-minted, scheduler-verified; the serde shape
 /// (`intent_id` vs `drv_hash`/`expected_outputs`) provides the
-/// cross-type isolation (`deny_unknown_fields`).
+/// cross-type isolation (the manual `Deserialize` below rejects
+/// unknown fields exactly like the old `deny_unknown_fields`).
+///
+/// # Per-spawn uniqueness (merged_bug_079)
+///
+/// The wire form carries a fourth field the struct does not: a
+/// `spawn` nonce (uuid-v4 hex), minted fresh by `Serialize` on EVERY
+/// serialization and required-then-discarded by `Deserialize`. The
+/// confirm fence (`executor_confirm_fences`, migration 097) keys
+/// durable rows on `sha256(token bytes)`; without the nonce, the
+/// target-anchored expiry (`now + deadline + eta + 300` with
+/// `eta = t − elapsed`) made re-mints across controller ticks
+/// byte-identical, so a replacement forecast pod inherited its
+/// predecessor's fence identity and was screened to `Gone` without
+/// ever building.
 // r[impl sec.executor.identity-token+3]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutorClaims {
     /// `SpawnIntent.intent_id` (= drv_hash) the token authorizes.
     /// Checked against `PullAssignmentRequest.intent_id` (and the
@@ -246,6 +259,59 @@ pub struct ExecutorClaims {
     /// pod outliving its `activeDeadlineSeconds` is a bug, so the
     /// token outliving the pod is fine.
     pub expiry_unix: u64,
+}
+
+/// Entropy-in-Serialize, contained and disclosed (RULED S4-OQ1): this
+/// impl emits the three claim fields PLUS a fresh `spawn` uuid-v4-hex
+/// nonce per call, so serializing the same value twice produces
+/// different bytes. Production serializes `ExecutorClaims` exactly
+/// once, inside [`HmacKey::sign`] ("the claims JSON is what's signed")
+/// — the nonce IS the per-spawn token identity the confirm fence keys
+/// on. Do NOT reuse this serialization for caching, equality,
+/// dedup keys, or any context expecting value-determinism;
+/// `PartialEq` on the struct (three fields, nonce excluded) is the
+/// value-equality surface.
+impl Serialize for ExecutorClaims {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = serializer.serialize_struct("ExecutorClaims", 4)?;
+        st.serialize_field("intent_id", &self.intent_id)?;
+        st.serialize_field("kind", &self.kind)?;
+        st.serialize_field("expiry_unix", &self.expiry_unix)?;
+        st.serialize_field("spawn", &uuid::Uuid::new_v4().as_simple().to_string())?;
+        st.end()
+    }
+}
+
+/// The decode half of the nonce law: all FOUR fields are REQUIRED —
+/// `spawn` is checked-then-discarded (the struct keeps three fields)
+/// and unknown fields are rejected, preserving the old
+/// `deny_unknown_fields` cross-type isolation. There is no
+/// optional-decode window for nonce-free (pre-fix) tokens: SIGNED Q6
+/// — the rollout model is `--wipe` (full teardown + redeploy), so no
+/// pre-fix token can ever reach this decoder; accepting the
+/// three-field shape would only ever accept a stale-world credential.
+impl<'de> Deserialize<'de> for ExecutorClaims {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ExecutorClaimsWire {
+            intent_id: String,
+            kind: i32,
+            expiry_unix: u64,
+            // Required (no default, no Option): a missing nonce is a
+            // decode error. Discarded — the nonce's only job is making
+            // the SIGNED BYTES unique per spawn.
+            #[expect(dead_code, reason = "required-then-discarded spawn nonce")]
+            spawn: String,
+        }
+        let wire = ExecutorClaimsWire::deserialize(deserializer)?;
+        Ok(Self {
+            intent_id: wire.intent_id,
+            kind: wire.kind,
+            expiry_unix: wire.expiry_unix,
+        })
+    }
 }
 
 impl HmacClaims for ExecutorClaims {
@@ -1209,5 +1275,82 @@ mod tests {
         // ...and it VERIFIES as the victim's instance-bound credential.
         let verified: ServiceClaims = key.verify(&token).expect("symmetric key verifies");
         assert_eq!(verified.instance.as_deref(), Some("victim-replica-0"));
+    }
+
+    fn executor_claims(expiry_offset_secs: i64) -> ExecutorClaims {
+        let now = crate::now_unix().expect("clock");
+        ExecutorClaims {
+            intent_id: "drv-abc123".into(),
+            kind: 0,
+            expiry_unix: ((now as i64) + expiry_offset_secs).max(0) as u64,
+        }
+    }
+
+    /// merged_bug_079: two mints over EQUAL claims must produce
+    /// byte-distinct tokens. The confirm fence keys durable rows on
+    /// `sha256(token bytes)` (`executor_confirm_fences`, 24h GC), so a
+    /// deterministic re-mint across controller ticks hands a
+    /// replacement forecast pod its predecessor's fence identity — the
+    /// DeliverNew screen answers the NEW pod `Gone` for an exit the OLD
+    /// pod declared, and the replacement never builds. Uniqueness is
+    /// minted at the token constructor (`HmacKey::sign` — the one
+    /// production serialization site), not at the call site: the
+    /// snapshot.rs mint literal stays untouched.
+    #[test]
+    fn executor_token_remint_is_byte_unique() {
+        let key = HmacKey::from_key(TEST_KEY.to_vec());
+        let claims = executor_claims(3600);
+        let t1 = key.sign(&claims);
+        let t2 = key.sign(&claims);
+        assert_ne!(
+            t1, t2,
+            "re-minting equal ExecutorClaims must never reproduce the same token bytes \
+             (the confirm fence keys on sha256(token))"
+        );
+    }
+
+    /// The spawn nonce is transport-only entropy: it must not leak into
+    /// the decoded claims (the struct keeps three fields; `PartialEq`
+    /// is over them) and a signed token must round-trip its semantic
+    /// content exactly.
+    #[test]
+    fn executor_token_roundtrip_preserves_claims() {
+        let key = HmacKey::from_key(TEST_KEY.to_vec());
+        let claims = executor_claims(3600);
+        let verified: ExecutorClaims = key.verify(&key.sign(&claims)).expect("fresh token");
+        assert_eq!(verified, claims);
+    }
+
+    /// SIGNED Q6 (--wipe rollout): the `spawn` nonce is REQUIRED at
+    /// decode in the same release that mints it — no optional-decode
+    /// window. A nonce-free claims JSON signed through the PRIOR serde
+    /// shape (the pre-fix three-field form) must be REJECTED at decode:
+    /// post-wipe no such token can exist, so accepting one would only
+    /// ever accept a forgery-shaped or stale-world credential.
+    #[test]
+    fn noncefree_token_rejected_at_decode() {
+        let key = HmacKey::from_key(TEST_KEY.to_vec());
+        // r13-allow(refusal-probe): asserts the typed refusal of a
+        // shape the producing constructor can no longer emit — the
+        // pre-fix three-field claims JSON, hand-assembled and signed
+        // with the real key precisely so the SIGNATURE passes and the
+        // decode layer is what rejects.
+        let noncefree = serde_json::json!({
+            "intent_id": "drv-abc123",
+            "kind": 0,
+            "expiry_unix": crate::now_unix().expect("clock") + 3600,
+        });
+        let claims_json = serde_json::to_vec(&noncefree).expect("serialize");
+        let mut mac = HmacSha256::new_from_slice(TEST_KEY).expect("any key length");
+        mac.update(&claims_json);
+        let tag = mac.finalize().into_bytes();
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let token = format!("{}.{}", b64.encode(&claims_json), b64.encode(tag));
+        let result = key.verify::<ExecutorClaims>(&token);
+        assert!(
+            matches!(result, Err(HmacError::Json(_))),
+            "a nonce-free executor token must be rejected at decode (Q6: no \
+             pre-fix token survives a --wipe rollout), got {result:?}"
+        );
     }
 }
