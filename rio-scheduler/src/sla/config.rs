@@ -533,6 +533,16 @@ impl ProbeShape {
 /// arch-match an `HwClassDef`'s labels against `SpawnIntent.system`.
 pub const ARCH_LABEL: &str = "kubernetes.io/arch";
 
+/// `karpenter.sh/capacity-type` — Karpenter's well-known capacity
+/// label. ONE const for both the producer
+/// (`solve::cells_to_selector_terms`, the affinity-term emit) and the
+/// consumer (the ack apply plan's arm-echo decode) so the two sides
+/// cannot drift (merged_bug_134: the literal was mirrored at both
+/// sites). The controller keeps its own consts for the NODE-label
+/// lane (`ffd::CAPACITY_TYPE_LABEL`, informer `LABEL_CAPACITY_TYPE`)
+/// — those read kubelet labels, not this wire echo.
+pub const LABEL_CAPACITY_TYPE: &str = "karpenter.sh/capacity-type";
+
 /// §13d (r30 mb_012): canonical bidirectional ∅-guard moved to
 /// `rio_common::k8s` so the controller's consumer-side backstop
 /// (`fallback_cell`, FFD `simulate` agnostic filter) shares the same

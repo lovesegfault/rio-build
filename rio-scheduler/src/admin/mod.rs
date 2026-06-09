@@ -789,6 +789,16 @@ impl AdminService for AdminServiceImpl {
                     plane.wire_field(),
                 ))
             }
+            crate::actor::AckApplyError::ArmEchoSkewed {
+                intent_id,
+                names,
+                terms,
+            } => Status::invalid_argument(format!(
+                "spawn-intent {intent_id} echo is length-skewed \
+                 (hw_class_names={names}, node_affinity={terms}) — no evidence \
+                 plane applied; refusing instead of zip-truncating the armed \
+                 cell set",
+            )),
         })?;
         Ok(Response::new(()))
     }

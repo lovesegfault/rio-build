@@ -1393,7 +1393,7 @@ pub fn cells_to_selector_terms(
                 })
                 .collect();
             match_expressions.push(NodeSelectorRequirement {
-                key: "karpenter.sh/capacity-type".into(),
+                key: crate::sla::config::LABEL_CAPACITY_TYPE.into(),
                 operator: "In".into(),
                 values: vec![cap.label().into()],
             });

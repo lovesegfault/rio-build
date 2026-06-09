@@ -821,6 +821,105 @@ async fn ack_undecodable_plane_entry_refuses_whole_request() {
     assert!(actor.ice.is_masked(&cell), "ice state byte-identical");
 }
 
+/// merged_bug_134 red: a length-skewed spawn-intent echo is REFUSED,
+/// never zip-truncated. The echo is the CONTROLLER'S (rolling skew /
+/// one-array filter in scope), and `Iterator::zip` silently truncates
+/// to the shorter array — a 2-cell arm truncated to 1 forges the
+/// exactly-one-cell proof the §13a first-pull ICE clear gates on
+/// (`let [cell] = cells.as_slice()`, actor/pull.rs), clearing the
+/// ladder for a cell the pod may never have scheduled on. `left: Ok ∧
+/// dispatched_cells armed with the forged single cell [c0] (the §13a
+/// clear gate would now pass)` / `right: Err(ArmEchoSkewed{names:2,
+/// terms:1}) ∧ dispatched_cells untouched`.
+///
+/// Witness provenance (Q1-1): the skewed fixture is a PRODUCTION
+/// intent built through `cells_to_selector_terms` (the
+/// paired-by-construction producer) with one `node_affinity` term
+/// dropped — the controller-side one-array-filter shape; no
+/// hand-rolled parallel arrays.
+// r[verify sched.sla.ack-validate-then-commit]
+#[tokio::test]
+async fn ack_skewed_arm_echo_refused_not_truncated() {
+    use crate::sla::config::CapacityType;
+    use rio_proto::types::SpawnIntent;
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+
+    let cfg = test_hw_sla_config();
+    let cells: Vec<crate::sla::config::Cell> = vec![
+        ("intel-6".into(), CapacityType::Spot),
+        ("intel-7".into(), CapacityType::Spot),
+    ];
+    let (terms, names) = crate::sla::solve::cells_to_selector_terms(&cells, &cfg.hw_classes);
+    assert_eq!((names.len(), terms.len()), (2, 2), "paired by construction");
+    let mut intent = SpawnIntent {
+        intent_id: "d-skew".into(),
+        hw_class_names: names,
+        node_affinity: terms,
+        ..Default::default()
+    };
+    intent.node_affinity.pop();
+
+    let r =
+        actor.handle_ack_spawned_intents(std::slice::from_ref(&intent), &[], &[], &[], &[], None);
+    assert_eq!(
+        r,
+        Err(crate::actor::AckApplyError::ArmEchoSkewed {
+            intent_id: "d-skew".into(),
+            names: 2,
+            terms: 1,
+        }),
+        "skewed echo must refuse, not truncate"
+    );
+    assert!(
+        actor.dispatched_cells.get("d-skew").is_none(),
+        "dispatched_cells untouched — no forged single-cell arm"
+    );
+}
+
+/// merged_bug_134 companion green: the legacy one-array-empty echo
+/// shape (`hw_class_names` empty, `node_affinity` non-empty) answers
+/// Ok with NO arm — `ArmDecode::LegacyUnarmed` is a typed no-arm
+/// totality lane, not a refusal (it cannot forge a cell set; pre-fix
+/// it already zip-truncated to no-arm; its rolling-skew rationale is
+/// MOOT per SIGNED Q6 --wipe rollout and the lane survives as decode
+/// totality). Pins the refusal to the FORGING skew shapes only.
+// r[verify sched.sla.ack-validate-then-commit]
+#[tokio::test]
+async fn ack_legacy_unarmed_echo_answers_ok_without_arm() {
+    use crate::sla::config::CapacityType;
+    use rio_proto::types::SpawnIntent;
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+
+    let cfg = test_hw_sla_config();
+    let cells: Vec<crate::sla::config::Cell> = vec![("intel-6".into(), CapacityType::Spot)];
+    let (terms, _names) = crate::sla::solve::cells_to_selector_terms(&cells, &cfg.hw_classes);
+    let intent = SpawnIntent {
+        intent_id: "d-legacy".into(),
+        hw_class_names: vec![],
+        node_affinity: terms,
+        ..Default::default()
+    };
+
+    actor
+        .handle_ack_spawned_intents(std::slice::from_ref(&intent), &[], &[], &[], &[], None)
+        .expect("legacy shape is a typed no-arm lane, not a refusal");
+    assert!(
+        actor.dispatched_cells.get("d-legacy").is_none(),
+        "no arm from the legacy lane"
+    );
+    // The spawn-ack witness still records (124(d) is arm-independent).
+    assert!(
+        actor
+            .acked_spawned
+            .contains_key(&crate::state::DrvHash::from("d-legacy")),
+        "spawn-ack witness recorded for the legacy shape"
+    );
+}
+
 /// **Ack records the FULL A'** (`r[sched.sla.hw-class.ice-mask]`): a
 /// `SpawnIntent` whose `node_affinity` is an OR over `|A'|>1` cells must
 /// arm `dispatched_cells` with the FULL parallel `(hw_class_names,

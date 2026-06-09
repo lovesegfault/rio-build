@@ -55,6 +55,25 @@ pub enum AckApplyError {
         /// whole string; for the arming plane, the capacity value).
         entry: String,
     },
+    /// merged_bug_134: a spawned intent's echoed parallel arrays
+    /// (`hw_class_names`, `node_affinity`) are structurally skewed —
+    /// both non-empty with unequal lengths, or an aligned term
+    /// missing its `karpenter.sh/capacity-type` requirement. Pre-fix
+    /// `Iterator::zip` silently truncated to the shorter array: a
+    /// 2-cell arm truncated to 1 forges the exactly-one-cell proof
+    /// the §13a first-pull ICE clear gates on (`let [cell] =
+    /// cells.as_slice()`), clearing the ladder for a cell the pod may
+    /// never have scheduled on. Only skew shapes that could forge a
+    /// DIFFERENT cell set refuse; the legacy one-side-empty shapes
+    /// cannot arm anything and stay typed no-arm lanes
+    /// (`ArmDecode::{Empty, LegacyUnarmed}` in the apply plan).
+    ArmEchoSkewed {
+        intent_id: String,
+        /// `hw_class_names.len()` of the skewed echo.
+        names: usize,
+        /// `node_affinity.len()` of the skewed echo.
+        terms: usize,
+    },
 }
 
 /// Closed alphabet of `AckSpawnedIntentsRequest` evidence planes —

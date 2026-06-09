@@ -971,8 +971,9 @@ pub(super) struct AckApplyPlan {
     /// Kube-authoritative binding rows; `None` = "this Ack carries no
     /// snapshot" (per-pool reconcilers; the legacy field-5 arm).
     binding: Option<Vec<PlannedBinding>>,
-    /// Arm-on-ack cell sets recovered from the spawned echo.
-    armed: Vec<(DrvHash, smallvec::SmallVec<[crate::sla::config::Cell; 4]>)>,
+    /// Arm-on-ack decodes of the spawned echo (merged_bug_134: the
+    /// typed pairing law, including the no-arm legacy lanes).
+    armed: Vec<(DrvHash, ArmDecode)>,
     /// ICE-clear cell events (`registered_cells`, wire field 3).
     clears: Vec<crate::sla::config::Cell>,
     /// ICE-mark cell events (`unfulfillable_cells`, wire field 2).
@@ -989,6 +990,91 @@ struct PlannedBinding {
     /// Wire `0` = absent (pre-upgrade controller): the mint falls
     /// back to its re-solve alone.
     deadline_secs: Option<u32>,
+}
+
+/// merged_bug_134: total decode of one spawned intent's echoed
+/// parallel `(hw_class_names, node_affinity)` arrays. The pre-fix
+/// `Iterator::zip` silently truncated to the shorter array — a 2-cell
+/// arm truncated to 1 forges the exactly-one-cell proof the §13a
+/// first-pull ICE clear gates on (`let [cell] = cells.as_slice()`,
+/// actor/pull.rs). The law:
+///
+/// | names     | terms     | decode                                  |
+/// |-----------|-----------|-----------------------------------------|
+/// | empty     | empty     | `Empty` (hw-agnostic intent, no arm)    |
+/// | exactly one side empty | `LegacyUnarmed` (no arm, NO refusal)   |
+/// | non-empty, equal len   | `Armed(cells)` or a typed refusal      |
+/// | non-empty, unequal len | `ArmEchoSkewed` refusal                |
+///
+/// Only skew shapes that could forge a DIFFERENT cell set refuse.
+/// `LegacyUnarmed` is the pre-field-14 echo shape (one array absent);
+/// it cannot arm anything — pre-fix it already zip-truncated to
+/// no-arm — so it stays a typed no-arm TOTALITY lane, not a refusal
+/// (its rolling-skew rationale is MOOT per SIGNED Q6, --wipe rollout;
+/// the lane survives as decode totality over the echo shapes). In the
+/// `Armed` lane every aligned term must carry the
+/// `karpenter.sh/capacity-type` requirement
+/// ([`crate::sla::config::LABEL_CAPACITY_TYPE`] — the same const the
+/// producer `cells_to_selector_terms` emits) with a non-empty value:
+/// a missing requirement or empty values is `ArmEchoSkewed`
+/// (structural pairing skew), a present value outside the shared
+/// alphabet is `PlaneEntryUndecodable{SpawnedArming}` (undecodable
+/// entry).
+pub(super) enum ArmDecode {
+    /// Both arrays empty — hw-agnostic intent, nothing to arm.
+    Empty,
+    /// Exactly one array empty — the legacy echo shape; no arm.
+    LegacyUnarmed,
+    /// Paired echo — arm `dispatched_cells` with the FULL set.
+    Armed(smallvec::SmallVec<[crate::sla::config::Cell; 4]>),
+}
+
+impl ArmDecode {
+    /// Total decode per the table above; refusals are typed, never
+    /// truncations.
+    fn decode(i: &rio_proto::types::SpawnIntent) -> Result<Self, super::command::AckApplyError> {
+        use super::command::{AckApplyError, AckPlane};
+        let (names, terms) = (i.hw_class_names.len(), i.node_affinity.len());
+        match (names, terms) {
+            (0, 0) => Ok(Self::Empty),
+            (0, _) | (_, 0) => Ok(Self::LegacyUnarmed),
+            (n, t) if n != t => Err(AckApplyError::ArmEchoSkewed {
+                intent_id: i.intent_id.clone(),
+                names: n,
+                terms: t,
+            }),
+            _ => {
+                let mut cells: smallvec::SmallVec<[crate::sla::config::Cell; 4]> =
+                    smallvec::SmallVec::with_capacity(names);
+                for (h, term) in i.hw_class_names.iter().zip(&i.node_affinity) {
+                    let cap_value = term
+                        .match_expressions
+                        .iter()
+                        .find(|r| r.key == crate::sla::config::LABEL_CAPACITY_TYPE)
+                        .and_then(|r| r.values.first());
+                    let Some(cap_value) = cap_value else {
+                        // Aligned term without the capacity
+                        // requirement: structural skew — the pair
+                        // cannot name a cell, so the echo could forge
+                        // a different cell set.
+                        return Err(AckApplyError::ArmEchoSkewed {
+                            intent_id: i.intent_id.clone(),
+                            names,
+                            terms,
+                        });
+                    };
+                    let Some(cap) = crate::sla::config::CapacityType::parse(cap_value) else {
+                        return Err(AckApplyError::PlaneEntryUndecodable {
+                            plane: AckPlane::SpawnedArming,
+                            entry: cap_value.clone(),
+                        });
+                    };
+                    cells.push((h.clone(), cap));
+                }
+                Ok(Self::Armed(cells))
+            }
+        }
+    }
 }
 
 impl AckApplyPlan {
@@ -1022,43 +1108,17 @@ impl AckApplyPlan {
             .collect();
         // Arm-on-ack: recover the FULL `cells` vec from the parallel
         // `(hw_class_names, node_affinity)` wire form
-        // (`cells_to_selector_terms` emits one term per cell). `cap`
-        // is the `karpenter.sh/capacity-type` requirement's value.
-        // hw-agnostic intents (empty `node_affinity`) skip — no cell
-        // to arm; a term without the capacity requirement skips its
-        // pair. A capacity VALUE outside the shared alphabet is a
-        // typed refusal — pre-fix `filter_map` silently dropped the
-        // pair, shrinking the armed set the §13a single-cell clear
-        // gate counts. Recording only `cells[0]` (bug_030) is the
-        // §1-of-N approximation: the pod's affinity is OR-of-A', so
-        // the first-pull consumer needs the whole set.
-        let mut armed: Vec<(DrvHash, smallvec::SmallVec<[crate::sla::config::Cell; 4]>)> =
-            Vec::new();
+        // (`cells_to_selector_terms` emits one term per cell) through
+        // the total [`ArmDecode`] law — merged_bug_134: the rolling
+        // skew the comment block in `commit` names is in-scope, so
+        // silent `zip` truncation of the CONTROLLER'S ECHO is a
+        // forgery lane, not a tolerance. Recording only `cells[0]`
+        // (bug_030) is the §1-of-N approximation: the pod's affinity
+        // is OR-of-A', so the first-pull consumer needs the whole
+        // set.
+        let mut armed: Vec<(DrvHash, ArmDecode)> = Vec::with_capacity(spawned.len());
         for i in spawned {
-            let mut cells: smallvec::SmallVec<[crate::sla::config::Cell; 4]> =
-                smallvec::SmallVec::new();
-            for (h, t) in i.hw_class_names.iter().zip(&i.node_affinity) {
-                let Some(req) = t
-                    .match_expressions
-                    .iter()
-                    .find(|r| r.key == "karpenter.sh/capacity-type")
-                else {
-                    continue;
-                };
-                let Some(cap) = req.values.first() else {
-                    continue;
-                };
-                let Some(cap) = crate::sla::config::CapacityType::parse(cap) else {
-                    return Err(AckApplyError::PlaneEntryUndecodable {
-                        plane: AckPlane::SpawnedArming,
-                        entry: cap.clone(),
-                    });
-                };
-                cells.push((h.clone(), cap));
-            }
-            if !cells.is_empty() {
-                armed.push((DrvHash::from(i.intent_id.as_str()), cells));
-            }
+            armed.push((DrvHash::from(i.intent_id.as_str()), ArmDecode::decode(i)?));
         }
         let marks = Self::decode_cell_plane(unfulfillable_cells, AckPlane::UnfulfillableCells)?;
         let clears = Self::decode_cell_plane(registered_cells, AckPlane::RegisteredCells)?;
@@ -1194,8 +1254,15 @@ impl AckApplyPlan {
                 );
             }
         }
-        for (id, cells) in armed {
-            actor.dispatched_cells.insert(id, cells);
+        // Exhaustive over the closed [`ArmDecode`] alphabet — a new
+        // echo-shape variant cannot fall through to a silent no-arm.
+        for (id, arm) in armed {
+            match arm {
+                ArmDecode::Empty | ArmDecode::LegacyUnarmed => {}
+                ArmDecode::Armed(cells) => {
+                    actor.dispatched_cells.insert(id, cells);
+                }
+            }
         }
         // merged_bug_005: the controller's evidence buffer enforces
         // per-cell latest-wins supersession, so one request never
