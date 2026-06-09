@@ -6505,8 +6505,10 @@ rec {
     # the required eviction argument) and the bughunt-3 S7 episode
     # latch (merged_bug_163). The main regime is TLC-EXHAUSTIVE at
     # these bounds with the episode ghosts FROZEN (≤3 nodes × 2 drvs:
-    # 165,381,913 states generated / 983,929 distinct / 0 on queue,
-    # ~5min at workers=auto, no violation) — the four round-2 laws
+    # 173,840,769 states generated / 1,024,082 distinct / 0 on queue,
+    # 8m11s at workers=auto, no violation; re-measured at the round-4
+    # m288 repair: the skip arm now RETAINS the marked set and the
+    # lastSkip exemption rides the counter law) — the four round-2 laws
     # hold over the FULL bounded space, not a sampled slice. The latch
     # law (noRemarkFromLatchedEpisode) needs the ghosts LIVE, whose
     # tick-domain product does NOT converge at these bounds (>1.02B
@@ -6531,9 +6533,10 @@ rec {
 
     # The episode-latch regime: ghosts live (admission gating + the
     # latch law) at MAX_TIME=4/WINDOW=2, where the ghost product
-    # converges: TLC-exhaustive 205,660,559 states generated /
-    # 3,807,560 distinct / depth 9 / 0 on queue, 5min57s at
-    # workers=auto — budget 1800s ≈ 5× measured. The
+    # converges: TLC-exhaustive 209,299,445 states generated /
+    # 3,835,651 distinct / 0 on queue, 7m29s at workers=auto
+    # (re-measured at the round-4 m288 repair; the skip-retain fix
+    # rides this regime too) — budget 1800s ≈ 4× measured. The
     # latch-witness-systemic check below pins the systemic arm
     # reachable at these shrunk bounds, so the latch law cannot go
     # silently vacuous.
@@ -6642,6 +6645,90 @@ rec {
       spec = "wedgeCluster";
       main = "wedgeClusterMain";
       witness = "perNodeReachableW";
+    };
+
+    # merged_bug_034 (Q2 SIGNED): the production trajectory regime —
+    # fleet denominator + breadth + dwell + per-node withholding. All
+    # seven laws TLC-EXHAUSTIVE at MAX_TIME=4/WINDOW=2: 8,707,543
+    # states generated / 44,111 distinct / 0 on queue, 23.4s at
+    # workers=auto — budget 1800s ≈ 75× measured. The dwell-gated
+    # systemic arm is reachability-pinned below ([violation] at
+    # 585,490 generated / 5,020 distinct, 3.7s).
+    # r[verify ctrl.nodeclaim.wedge-two-axis+4]
+    quint-wedge-cluster-trajectory = mkQuintCheck {
+      name = "wedge-cluster-trajectory";
+      spec = "wedgeCluster";
+      main = "wedgeClusterTrajectory";
+      invariants = [
+        "boundsOK"
+        "affectedLeOf"
+        "noPerNodeFromSuppressedEvidence"
+        "reapedImpliesEvicted"
+        "markedIncrementsOnlyOnEdges"
+        "systemicDenominatorIsFleet"
+        "noSerialReapInDevelopingEpisode"
+      ];
+      modelTimeoutSec = 1800;
+    };
+    # Anti-vacuation: the dwell-gated systemic arm actually fires at
+    # the trajectory bounds (raw-trip at t, hold through DWELL_TICKS).
+    quint-wedge-cluster-trajectory-witness-systemic = mkQuintWitnessCheck {
+      name = "wedge-cluster-trajectory-witness-systemic";
+      spec = "wedgeCluster";
+      main = "wedgeClusterTrajectory";
+      witness = "systemicReachableW";
+    };
+
+    # merged_bug_034 falsify twin: the retired instantaneous guard at
+    # the trajectory regime's exact bounds — both laws [violation]
+    # (the lull false-Systemic and the staggered serial reap).
+    # r[verify ctrl.nodeclaim.wedge-two-axis+4]
+    quint-wedge-cluster-calib-instantaneous-denominator = mkQuintWitnessCheck {
+      name = "wedge-cluster-calib-instantaneous-denominator";
+      spec = "calibration/wedge-034-instantaneous";
+      main = "wedgeCalib034Instantaneous";
+      extraSpecs = [ "wedgeCluster" ];
+      witness = "systemicDenominatorIsFleet";
+    };
+    # r[verify ctrl.nodeclaim.wedge-two-axis+4]
+    quint-wedge-cluster-calib-instantaneous-serial-reap = mkQuintWitnessCheck {
+      name = "wedge-cluster-calib-instantaneous-serial-reap";
+      spec = "calibration/wedge-034-instantaneous";
+      main = "wedgeCalib034Instantaneous";
+      extraSpecs = [ "wedgeCluster" ];
+      witness = "noSerialReapInDevelopingEpisode";
+    };
+
+    # m288: the epilogue regime (latch off, full epilogue on) — the
+    # non-vacuous home of noPerNodeFromSuppressedEvidence: bystander
+    # evidence survives the wedged-only drain, so the suppression-
+    # survivor set is reachably non-empty ([violation] at 164,692
+    # generated / 2,432 distinct, 3.0s — the witness below) and the
+    # law carries content. The latch regimes hold it trivially-but-
+    # truthfully (whole-episode drain leaves no survivors by design).
+    # TLC-EXHAUSTIVE: 242,502,085 states generated / 1,521,281
+    # distinct / 0 on queue, 10m06s at workers=auto — budget 1800s
+    # ≈ 3× measured.
+    # r[verify ctrl.nodeclaim.wedge-two-axis+4]
+    quint-wedge-cluster-epilogue = mkQuintCheck {
+      name = "wedge-cluster-epilogue";
+      spec = "wedgeCluster";
+      main = "wedgeClusterEpilogue";
+      invariants = [
+        "boundsOK"
+        "affectedLeOf"
+        "noPerNodeFromSuppressedEvidence"
+        "reapedImpliesEvicted"
+        "markedIncrementsOnlyOnEdges"
+      ];
+      modelTimeoutSec = 1800;
+    };
+    # The m288 tautology guard: suppressedAnchors goes non-empty.
+    quint-wedge-cluster-epilogue-witness-suppressed = mkQuintWitnessCheck {
+      name = "wedge-cluster-epilogue-witness-suppressed";
+      spec = "wedgeCluster";
+      main = "wedgeClusterEpilogue";
+      witness = "suppressedReachableW";
     };
 
     # C2/135 (area D): a synthesized close consumes only the attempt

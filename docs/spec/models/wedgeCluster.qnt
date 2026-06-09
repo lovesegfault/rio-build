@@ -99,6 +99,23 @@ module wedgeCluster {
   // laws run exhaustively in the dedicated wedgeClusterLatch regime
   // below, at bounds where the ghost product converges.
   const TRACK_EPISODE_GHOSTS: bool
+  // merged_bug_034 (Q2 SIGNED, round-4): the trajectory axis. Off ---
+  // the retired instantaneous guard (per-tick wedged/population
+  // ratio, no dwell; per-node verdicts fire while a multi-node
+  // episode is still forming). On --- the systemic denominator is the
+  // REGISTERED fleet (NODES is the model's registered set), the
+  // verdict additionally requires breadth (distinct evidence-bearing
+  // nodes inside the window) >= BREADTH_MIN and a dwell of
+  // DWELL_TICKS ticks of continuously-tripped raw condition, and
+  // per-node verdicts are WITHHELD while an episode is developing
+  // (breadth >= BREADTH_MIN) --- staggered shared-cause onset routes
+  // to the systemic arm instead of serial per-node Dead reaps.
+  // Off-axis the one trajectory state var (pendingSince) freezes at
+  // init (zero state cost; TRACK_EPISODE_GHOSTS parameter-ladder
+  // precedent).
+  const ENABLE_TRAJECTORY: bool
+  const DWELL_TICKS: int
+  const BREADTH_MIN: int
 
   val NODES = Set("n0", "n1", "n2")
   val DRVS = Set("d0", "d1")
@@ -135,6 +152,15 @@ module wedgeCluster {
   var sawSystemic: bool
   var sawPerNode: bool
   var sawReWedge: bool            // a node marked, unmarked, marked again
+  // m288: suppression-surviving anchors actually observed (the
+  // tautology guard for noPerNodeFromSuppressedEvidence).
+  var sawSuppressed: bool
+  // merged_bug_034 trajectory state (frozen -1 off-axis): the tick
+  // the CURRENT continuous raw-systemic run began; -1 = not tripped.
+  var pendingSince: int
+  // m288: whether the last verdict-bearing update was a skip (RPC
+  // failure) --- the restated counter law exempts unobserved ticks.
+  var lastSkip: bool
 
   // --- helpers ---------------------------------------------------------------
   def inWindow(anchor: int, now: int): bool = now - anchor <= WINDOW
@@ -188,6 +214,9 @@ module wedgeCluster {
     sawSystemic' = false,
     sawPerNode' = false,
     sawReWedge' = false,
+    sawSuppressed' = false,
+    pendingSince' = -1,
+    lastSkip' = false,
   }
 
   // --- one reconcile tick: evict, observe (or skip), prune, finalize ----------
@@ -201,7 +230,8 @@ module wedgeCluster {
     { evidence: str -> (str -> int), marked: Set[str], delta: int,
       consumed: Set[str], systemic: bool, affected: int, of_: int,
       wedged: Set[str], skip: bool, episodeAnchors: Set[(str, str, int)],
-      watermark: int, expiredSince: (str, str) -> int } =
+      watermark: int, expiredSince: (str, str) -> int,
+      pendingSince: int } =
     val now = time + 1
     val consumed = if (ENABLE_EVICTION) pendingEvictions else Set()
     val evAfterEvict = evidence.keys().filter(n => not(consumed.contains(n))).mapBy(n => evidence.get(n))
@@ -222,33 +252,65 @@ module wedgeCluster {
     val evObserved = if (skip) evAfterEvict else pruned(observed(evAfterEvict, admitted, now), now)
     val fleet = effHealthy.union(effExpired.map(p => p._1))
     val wedged = if (skip) Set() else wedgedOf(evObserved, now)
-    val population = if (ENABLE_POPULATIONS) evObserved.keys().union(fleet).size() else fleet.size()
-    val guardOk = if (ENABLE_POPULATIONS) true else fleet.size() > 0
-    val systemic = and {
+    // merged_bug_034: under the trajectory axis the denominator is
+    // the REGISTERED fleet (the model universe), never the per-tick
+    // survivor set a traffic lull can shrink.
+    val population = if (ENABLE_TRAJECTORY) NODES.size()
+      else if (ENABLE_POPULATIONS) evObserved.keys().union(fleet).size()
+      else fleet.size()
+    val guardOk = if (ENABLE_POPULATIONS or ENABLE_TRAJECTORY) true else fleet.size() > 0
+    // Breadth: distinct evidence-bearing nodes inside the window
+    // (evObserved is already window-pruned).
+    val breadth = evObserved.keys().size()
+    val rawSystemic = and {
       not(skip),
       wedged.size() >= 2,
       guardOk,
       // strictly more than half of the population
       2 * wedged.size() > population,
+      (not(ENABLE_TRAJECTORY)) or breadth >= BREADTH_MIN,
     }
+    // Dwell: the raw condition must hold DWELL_TICKS ticks before the
+    // verdict fires; a skip holds the run (we did not look), a calm
+    // observed tick resets it.
+    val newPendingSince = if (not(ENABLE_TRAJECTORY)) -1
+      else if (skip) pendingSince
+      else if (rawSystemic) (if (pendingSince >= 0) pendingSince else now)
+      else -1
+    val systemic = if (ENABLE_TRAJECTORY)
+        rawSystemic and newPendingSince >= 0 and now - newPendingSince >= DWELL_TICKS
+      else rawSystemic
+    // merged_bug_034: a developing episode (breadth at the bar while
+    // the verdict has not fired) withholds per-node Dead verdicts.
+    val developing = ENABLE_TRAJECTORY and breadth >= BREADTH_MIN
     val drained = if (systemic and ENABLE_EPISODE_LATCH)
         // Whole-episode drain: every node in the window.
         Map()
       else if (systemic and ENABLE_FULL_EPILOGUE)
         evObserved.keys().filter(n => not(wedged.contains(n))).mapBy(n => evObserved.get(n))
       else evObserved
-    val survivors = if (systemic) Set() else wedged
+    val survivors = if (systemic or developing) Set() else wedged
     // As-built early return: the Systemic arm skips BOTH the insert
-    // loop and the retain — marked freezes.
-    val newMarked = if (systemic and not(ENABLE_FULL_EPILOGUE))
+    // loop and the retain — marked freezes. m288: a SKIP tick retains
+    // the marked set unchanged (the retired encoding wiped it through
+    // the empty survivor set — mis-modeling the real fold, which the
+    // RPC failure never reaches).
+    val newMarked = if (skip)
+        markedAfterEvict
+      else if (systemic and not(ENABLE_FULL_EPILOGUE))
         markedAfterEvict
       else survivors
-    val delta = if (systemic and not(ENABLE_FULL_EPILOGUE))
+    val delta = if (skip or (systemic and not(ENABLE_FULL_EPILOGUE)))
         0
       else survivors.exclude(markedAfterEvict).size()
-    // Anchors surviving a suppression (per-(node,drv,anchor) identity).
+    // Anchors surviving a suppression (per-(node,drv,anchor)
+    // identity). m288: fold over the POST-DRAIN map's own keys --- the
+    // retired fold iterated WEDGED nodes over `drained`, which
+    // excludes them in the epilogue arm and is empty under the latch:
+    // provably-empty in every wired regime, leaving
+    // noPerNodeFromSuppressedEvidence a tautology.
     val episodeAnchors = if (systemic)
-        wedged.fold(Set(), (acc, n) =>
+        drained.keys().fold(Set(), (acc, n) =>
           acc.union(nodeEvidence(drained, n).keys().map(d => (n, d, nodeEvidence(drained, n).get(d)))))
       else Set()
     {
@@ -266,6 +328,7 @@ module wedgeCluster {
       // at the const.
       watermark: if (TRACK_EPISODE_GHOSTS) (if (systemic) now else watermark) else -1,
       expiredSince: if (TRACK_EPISODE_GHOSTS) newExpiredSince else Map(),
+      pendingSince: newPendingSince,
     }
 
   action tick = {
@@ -301,6 +364,9 @@ module wedgeCluster {
       sawSystemic' = (sawSystemic or r.systemic),
       sawPerNode' = (sawPerNode or (not(r.systemic) and r.wedged.size() > 0)),
       sawReWedge' = (sawReWedge or (r.delta > 0 and markedIncrements > 0 and marked.size() == 0)),
+      sawSuppressed' = (sawSuppressed or r.episodeAnchors.size() > 0),
+      pendingSince' = r.pendingSince,
+      lastSkip' = r.skip,
     }
   }
 
@@ -322,6 +388,7 @@ module wedgeCluster {
     suppressedAnchors' = suppressedAnchors,
     watermark' = watermark, expiredSince' = expiredSince,
     sawSystemic' = sawSystemic, sawPerNode' = sawPerNode, sawReWedge' = sawReWedge,
+    sawSuppressed' = sawSuppressed, pendingSince' = pendingSince, lastSkip' = lastSkip,
   }
 
   // (nn): the literal step alias — runs live in regime modules only.
@@ -359,8 +426,30 @@ module wedgeCluster {
   // tick and silently swallows the next genuine edge's increment.
   val markedIncrementsOnlyOnEdges = and {
     lastDelta >= 0,
-    marked == (if (lastSystemic) Set() else lastWedged.union(marked.intersect(lastWedged))),
+    // m288 restatement: an unobserved (skip) tick moves the counter
+    // by zero and retains the marked set; an observed tick's marked
+    // set equals the epilogue's survivor set.
+    lastSkip implies (lastDelta == 0),
+    (not(lastSkip)) implies
+      marked == (if (lastSystemic) Set() else lastWedged),
   }
+  // merged_bug_034 (Q2): the Systemic verdict's denominator is the
+  // registered fleet --- a traffic lull (shrunken instantaneous
+  // population) can never substitute for it. The instantaneous twin
+  // violates this within 3 ticks (lull false-systemic, of_ = 2 over a
+  // 3-node fleet).
+  val systemicDenominatorIsFleet =
+    lastSystemic implies (lastOf == NODES.size())
+  // merged_bug_034 (Q2): while a shared-cause episode is developing
+  // (>= BREADTH_MIN evidence-bearing nodes in the window), per-node
+  // Dead verdicts are withheld --- staggered onset cannot serially
+  // reap the fleet below the ratio bar. Post-verdict evidence equals
+  // the window's evidence-bearing set on every per-node arm, so the
+  // law needs no extra state; the instantaneous twin violates it on
+  // the staggered scenario.
+  val noSerialReapInDevelopingEpisode =
+    (not(lastSystemic)) implies
+      (lastWedged.size() == 0 or evidence.keys().size() < BREADTH_MIN)
   // merged_bug_163: a per-node verdict never marks a node whose
   // qualifying evidence stems from a suppressed episode — every
   // anchor of a wedged node maps to an expiry RUN that began strictly
@@ -385,6 +474,9 @@ module wedgeCluster {
   // --- witnesses (negated reachability; wired expect-violation) ---------------
   val systemicReachableW = not(sawSystemic)
   val perNodeReachableW = not(sawPerNode)
+  // m288: the suppression-survivor set is actually populated in the
+  // wired epilogue regime --- the tautology guard.
+  val suppressedReachableW = not(sawSuppressed)
 }
 
 // Production-shaped fixed regime: all repairs on. TLC-exhaustive at
@@ -401,7 +493,10 @@ module wedgeClusterMain {
     ENABLE_FULL_EPILOGUE = true,
     ENABLE_EPISODE_LATCH = true,
     ENABLE_EVICTION = true,
-    TRACK_EPISODE_GHOSTS = false
+    TRACK_EPISODE_GHOSTS = false,
+    ENABLE_TRAJECTORY = false,
+    DWELL_TICKS = 1,
+    BREADTH_MIN = 2
   ).*
 }
 
@@ -420,7 +515,10 @@ module wedgeClusterLatch {
     ENABLE_FULL_EPILOGUE = true,
     ENABLE_EPISODE_LATCH = true,
     ENABLE_EVICTION = true,
-    TRACK_EPISODE_GHOSTS = true
+    TRACK_EPISODE_GHOSTS = true,
+    ENABLE_TRAJECTORY = false,
+    DWELL_TICKS = 1,
+    BREADTH_MIN = 2
   ).*
 }
 
@@ -434,6 +532,52 @@ module wedgeClusterNoEviction {
     ENABLE_FULL_EPILOGUE = true,
     ENABLE_EPISODE_LATCH = true,
     ENABLE_EVICTION = false,
-    TRACK_EPISODE_GHOSTS = false
+    TRACK_EPISODE_GHOSTS = false,
+    ENABLE_TRAJECTORY = false,
+    DWELL_TICKS = 1,
+    BREADTH_MIN = 2
+  ).*
+}
+
+// merged_bug_034 (Q2): the production trajectory regime --- fleet
+// denominator + breadth + dwell live, per-node withholding during a
+// developing episode. One notch below the main bounds (the dwell run
+// state multiplies the space; measured numbers at the
+// quint-wedge-cluster-trajectory check in nix/quint.nix). The
+// systemic-arm witness guards these bounds against vacuation (the
+// dwell needs raw-trip at t, hold at t+1 --- MAX_TIME=4 leaves
+// headroom).
+module wedgeClusterTrajectory {
+  import wedgeCluster(
+    MAX_TIME = 4, WINDOW = 2, MIN_DISTINCT = 2,
+    ENABLE_POPULATIONS = true,
+    ENABLE_FULL_EPILOGUE = true,
+    ENABLE_EPISODE_LATCH = true,
+    ENABLE_EVICTION = true,
+    TRACK_EPISODE_GHOSTS = false,
+    ENABLE_TRAJECTORY = true,
+    DWELL_TICKS = 1,
+    BREADTH_MIN = 2
+  ).*
+}
+
+// m288: the epilogue regime --- the latch OFF, full epilogue ON: the
+// drain leaves bystander evidence, so suppressedAnchors is REACHABLY
+// non-empty (suppressedReachableW) and
+// noPerNodeFromSuppressedEvidence carries content instead of holding
+// over a provably-empty set. This is the law's non-vacuous home; the
+// latch regimes above hold it trivially-but-truthfully (whole-episode
+// drain leaves no survivors by design).
+module wedgeClusterEpilogue {
+  import wedgeCluster(
+    MAX_TIME = 5, WINDOW = 3, MIN_DISTINCT = 2,
+    ENABLE_POPULATIONS = true,
+    ENABLE_FULL_EPILOGUE = true,
+    ENABLE_EPISODE_LATCH = false,
+    ENABLE_EVICTION = true,
+    TRACK_EPISODE_GHOSTS = false,
+    ENABLE_TRAJECTORY = false,
+    DWELL_TICKS = 1,
+    BREADTH_MIN = 2
   ).*
 }
