@@ -141,7 +141,25 @@ resource "helm_release" "keda" {
 
   # aws_lbc dep: webhook-ordering only — see addons.tf aws_lbc.
   # cilium dep: CNI must be up or pods Pending → wait=true times out.
-  # No dep on kube_prometheus_stack: the prometheus trigger is a
-  # runtime query that retries, not an install-time CRD requirement.
-  depends_on = [helm_release.aws_lbc, helm_release.cilium]
+  # kube_prometheus_stack dep (merged_bug_086): enabling ANY
+  # monitoring.coreos.com object in a release's values IS an
+  # install-time CRD requirement on kube_prometheus_stack — the sole
+  # installer of the prometheus-operator CRDs. The two operator
+  # ServiceMonitor values above render a ServiceMonitor object
+  # unconditionally (KEDA 2.20.1 gates only on the values, no
+  # Capabilities guard), and without this edge terraform schedules
+  # the two releases concurrently on a fresh apply (identical parent
+  # sets): keda winning the race fails with "resource mapping not
+  # found ... kind ServiceMonitor". Hidden in steady-state upgrades
+  # (the CRD already exists); bites greenfield bring-up and xtask
+  # destroy/recreate. The PROMETHEUS TRIGGER half of the old comment
+  # stays true — that is a runtime query that retries — but rendered
+  # monitoring objects are not triggers. Next values-add: any new
+  # monitoring.coreos.com enable in ANY release carries this same
+  # edge (this comment is the in-file contract).
+  depends_on = [
+    helm_release.aws_lbc,
+    helm_release.cilium,
+    helm_release.kube_prometheus_stack,
+  ]
 }
