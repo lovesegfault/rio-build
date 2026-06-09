@@ -790,11 +790,13 @@ async fn ack_undecodable_plane_entry_refuses_whole_request() {
     actor.ice.mark(&cell);
     assert_eq!(actor.ice.step(&cell), Some(0), "precondition: masked");
 
-    // r13-allow(refusal-probe): "mid-ebs-x86:bogus" is deliberately a
-    // shape NO production constructor can emit — the controller's
-    // `Cell::Display` and the shared `encode_cell_event` only emit
-    // alphabet capacities. The test asserts the typed REFUSAL of the
-    // attack/skew shape, not a valid-shape behavior.
+    // "mid-ebs-x86:bogus" is deliberately a shape NO production
+    // constructor can emit — the controller's `Cell::Display` and the
+    // shared `encode_cell_event` only emit alphabet capacities. The
+    // test asserts the typed REFUSAL of the attack/skew shape, not a
+    // valid-shape behavior (R13 lane (i); tag line-local per the
+    // posted WO-S8-11 grammar).
+    // r13-allow(refusal-probe): asserts the typed refusal; shape deliberately unproducible
     let bogus = "mid-ebs-x86:bogus".to_string();
     let r = actor.handle_ack_spawned_intents(
         &[],
