@@ -249,10 +249,10 @@ enum SessionExit {
 /// a build_id in the map between opcodes.
 ///
 /// THE cancel chokepoint (bug_319): the typed inner loop cannot
-/// return without choosing a [`SessionExit`] variant, and this
-/// function's exhaustive match runs `cancel_active_builds` on every
-/// one of them — an exit path that skips the cancel contract does
-/// not typecheck.
+/// return without choosing a `SessionExit` variant (private enum —
+/// see its definition above), and this function's exhaustive match
+/// runs `cancel_active_builds` on every one of them — an exit path
+/// that skips the cancel contract does not typecheck.
 // r[impl gw.conn.cancel-on-disconnect+3]
 pub async fn run_protocol_loop<R, W>(
     reader: &mut R,
