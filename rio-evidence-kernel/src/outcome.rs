@@ -114,6 +114,24 @@ pub fn classify_substitute_failure(class: SubstituteFailureClass) -> FailureDisp
     }
 }
 
+/// The precedence TIER of a disposition — the single executable
+/// precedence source BOTH evidence folds consume (merged_bug_210,
+/// bughunt-4): charge-grade evidence (0) outranks back-off advice
+/// (1), which outranks the deterministic refusals (2, 3); absence
+/// (the clean miss) ranks last by construction (no disposition). The
+/// folds' verdict orderings are pinned to this table by the
+/// tier-monotonicity tests and the kani sweep — a fold ranking a
+/// back-off class above a charge class cannot survive either.
+// r[impl store.materialize.executor+5]
+pub const fn disposition_tier(d: FailureDisposition) -> u8 {
+    match d {
+        FailureDisposition::ChargeInfra => 0,
+        FailureDisposition::RetryUncharged => 1,
+        FailureDisposition::TrustRefusal => 2,
+        FailureDisposition::ContentRefusal => 3,
+    }
+}
+
 /// The class alphabet's cardinality, structurally tied to the enum by
 /// [`class_index`] (no catch-all there): adding a variant breaks
 /// `class_index` at compile time, which forces this count — and every
@@ -380,13 +398,17 @@ pub enum SubstituteLoopVerdict {
 /// records it and fails over; only after every upstream has been
 /// tried does the recorded evidence pick the attempt outcome. Total
 /// over all five observation axes; precedence
-/// `Stalled, RateLimited, Errored, Untrusted, ContentMismatch, CleanMiss`
-/// in strictly decreasing rank: charging evidence outranks back-off
-/// advice, which outranks "something broke, don't cache", which
-/// outranks the deterministic refusals, which outrank a cacheable
-/// miss; the trust refusal outranks the content refusal because a
-/// key rotation is the likelier-repairable cause when both were
-/// observed.
+/// `Stalled, Errored, RateLimited, Untrusted, ContentMismatch, CleanMiss`
+/// in strictly decreasing rank, ordered by [`disposition_tier`] over
+/// [`classify_substitute_failure`] (merged_bug_210): BOTH charge-grade
+/// cells (`Stalled` — which additionally carries the window evidence —
+/// then `Errored`) outrank the 429 back-off advice, which outranks
+/// the deterministic refusals, which outrank a cacheable miss; the
+/// trust refusal outranks the content refusal because a key rotation
+/// is the likelier-repairable cause when both were observed. Pre-fix
+/// the fold ranked `RateLimited` above `Errored` — one persistent 429
+/// sibling hid ChargeInfra evidence behind uncharged deferrals
+/// forever, the inversion the tier table now pins out.
 // r[impl store.substitute.stall-abort+2]
 // r[impl store.substitute.loop-evidence-total]
 pub fn fold_substitute_loop(cells: SubstituteLoopCells) -> SubstituteLoopVerdict {
@@ -398,13 +420,18 @@ pub fn fold_substitute_loop(cells: SubstituteLoopCells) -> SubstituteLoopVerdict
         cells.any_content_mismatch,
     ) {
         (Some(window), _, _, _, _) => SubstituteLoopVerdict::Stalled { window },
-        (None, Some(retry_after), _, _, _) => SubstituteLoopVerdict::RateLimited { retry_after },
-        // An errored upstream outranks the deterministic refusals:
-        // the error is possibly transient (a retry may serve through
-        // that upstream), while the refusals are deterministic —
-        // surfacing one would prematurely settle a path an errored
-        // upstream might still serve.
-        (None, None, true, _, _) => SubstituteLoopVerdict::Errored,
+        // merged_bug_210: charge tier before back-off tier — an
+        // errored upstream is ChargeInfra-grade evidence; ranking the
+        // 429 advice above it deferred uncharged forever. Within the
+        // charge tier Stalled wins (it carries the window evidence).
+        // An errored upstream still outranks the deterministic
+        // refusals: the error is possibly transient (a retry may
+        // serve through that upstream), while the refusals are
+        // deterministic.
+        (None, _, true, _, _) => SubstituteLoopVerdict::Errored,
+        (None, Some(retry_after), false, _, _) => {
+            SubstituteLoopVerdict::RateLimited { retry_after }
+        }
         (None, None, false, true, _) => SubstituteLoopVerdict::UntrustedPresent,
         (None, None, false, false, true) => SubstituteLoopVerdict::ContentMismatch,
         (None, None, false, false, false) => SubstituteLoopVerdict::CleanMiss,
@@ -802,6 +829,45 @@ mod tests {
         );
     }
 
+    /// merged_bug_210: BOTH folds' verdict orderings are pinned to
+    /// the single tier table ([`disposition_tier`] over
+    /// [`classify_substitute_failure`]) — the loop fold by K1's
+    /// min-tier law, the tenant fold by this table check. A future
+    /// reordering of either fold against the tiers red-fails here.
+    #[test]
+    fn fold_orders_match_disposition_tiers() {
+        use FailureDisposition as D;
+        // The tier table is strictly increasing across the four
+        // dispositions in fold precedence order.
+        assert!(disposition_tier(D::ChargeInfra) < disposition_tier(D::RetryUncharged));
+        assert!(disposition_tier(D::RetryUncharged) < disposition_tier(D::TrustRefusal));
+        assert!(disposition_tier(D::TrustRefusal) < disposition_tier(D::ContentRefusal));
+
+        // Tenant fold: a charge cell beats transient advice…
+        let charged = [
+            TenantAttemptEvidence::Transient {
+                retry_after: Some(core::time::Duration::from_secs(9)),
+            },
+            TenantAttemptEvidence::Charge {
+                class: SubstituteFailureClass::Fetch,
+            },
+        ];
+        assert!(matches!(
+            fold_tenant_attempts(&charged),
+            TenantAttemptsVerdict::ChargeInfra { .. }
+        ));
+        // …and transient advice beats the refusals — the same tier
+        // order the loop fold consumes.
+        let advised = [
+            TenantAttemptEvidence::UntrustedPresent,
+            TenantAttemptEvidence::Transient { retry_after: None },
+        ];
+        assert!(matches!(
+            fold_tenant_attempts(&advised),
+            TenantAttemptsVerdict::RetryTransient { .. }
+        ));
+    }
+
     /// bug_081 + merged_bug_044: the post-loop fold's precedence over
     /// the recorded cells, including the error axis the pre-fix
     /// 2-axis fold could not represent.
@@ -864,6 +930,21 @@ mod tests {
             SubstituteLoopVerdict::Stalled {
                 window: Duration::from_secs(180)
             }
+        );
+
+        // merged_bug_210 (bughunt-4): charge-grade evidence outranks
+        // back-off advice — one persistent 429 sibling must NOT hide
+        // ChargeInfra evidence behind uncharged deferrals forever.
+        let mut err_and_429 = SubstituteLoopCells::new();
+        let _ = err_and_429.record(
+            SubstituteFailureClass::RateLimited,
+            Some(Duration::from_secs(9)),
+        );
+        let _ = err_and_429.record(SubstituteFailureClass::Fetch, None);
+        assert_eq!(
+            fold_substitute_loop(err_and_429),
+            SubstituteLoopVerdict::Errored,
+            "an errored sibling (ChargeInfra grade) outranks 429 back-off advice"
         );
 
         // Raced aborts and records nothing.
@@ -1176,9 +1257,12 @@ mod proofs {
         assert_eq!(disposition == FailureDisposition::ContentRefusal, content);
     }
 
-    /// K1 (merged_bug_044): the loop cells are total over the class
-    /// alphabet and the fold's precedence is `Stalled > RateLimited >
-    /// Errored > CleanMiss`. Swept over every 2-record class sequence
+    /// K1 (merged_bug_044; precedence corrected by merged_bug_210):
+    /// the loop cells are total over the class alphabet and the
+    /// fold's precedence is `Stalled > Errored > RateLimited >
+    /// CleanMiss` — tier-ordered by [`disposition_tier`] over
+    /// [`classify_substitute_failure`], with the in-tier tie
+    /// (Stalled before Errored) pinned by the window evidence. Swept over every 2-record class sequence
     /// with symbolic advice: record routing (Raced aborts and writes
     /// nothing; Stalled/RateLimited keep MAX advice; the four error
     /// classes set the error cell), then the fold verdict is checked
@@ -1271,13 +1355,15 @@ mod proofs {
             (Some(w), _, _, _, _) => {
                 assert_eq!(verdict, SubstituteLoopVerdict::Stalled { window: w })
             }
-            (None, Some(ra), _, _, _) => {
+            // merged_bug_210: charge tier (Errored) before the 429
+            // back-off tier — the corrected precedence.
+            (None, _, true, _, _) => assert_eq!(verdict, SubstituteLoopVerdict::Errored),
+            (None, Some(ra), false, _, _) => {
                 assert_eq!(
                     verdict,
                     SubstituteLoopVerdict::RateLimited { retry_after: ra }
                 )
             }
-            (None, None, true, _, _) => assert_eq!(verdict, SubstituteLoopVerdict::Errored),
             (None, None, false, true, _) => {
                 // merged_bug_005: the trust axis is below the error
                 // axis and above the miss — present-but-untrusted
@@ -1294,6 +1380,63 @@ mod proofs {
                 assert_eq!(verdict, SubstituteLoopVerdict::CleanMiss)
             }
         }
+
+        // merged_bug_210 total-order law: the surfaced verdict's
+        // disposition tier is the MINIMUM tier among recorded cells —
+        // the fold can never surface back-off advice past
+        // charge-grade evidence, for ANY recorded combination. Tiers
+        // come from the single executable source
+        // ([`disposition_tier`] ∘ [`classify_substitute_failure`]).
+        let verdict_tier: u8 = match verdict {
+            SubstituteLoopVerdict::Stalled { .. } | SubstituteLoopVerdict::Errored => 0,
+            SubstituteLoopVerdict::RateLimited { .. } => 1,
+            SubstituteLoopVerdict::UntrustedPresent => 2,
+            SubstituteLoopVerdict::ContentMismatch => 3,
+            SubstituteLoopVerdict::CleanMiss => 4,
+        };
+        let mut min_tier: u8 = 4;
+        let observe = |t: u8, m: &mut u8| {
+            if t < *m {
+                *m = t;
+            }
+        };
+        if want_stall.is_some() {
+            observe(
+                disposition_tier(classify_substitute_failure(SubstituteFailureClass::Stalled)),
+                &mut min_tier,
+            );
+        }
+        if want_err {
+            observe(
+                disposition_tier(classify_substitute_failure(SubstituteFailureClass::Fetch)),
+                &mut min_tier,
+            );
+        }
+        if want_429.is_some() {
+            observe(
+                disposition_tier(classify_substitute_failure(
+                    SubstituteFailureClass::RateLimited,
+                )),
+                &mut min_tier,
+            );
+        }
+        if want_untrusted {
+            observe(
+                disposition_tier(classify_substitute_failure(
+                    SubstituteFailureClass::Untrusted,
+                )),
+                &mut min_tier,
+            );
+        }
+        if want_content {
+            observe(
+                disposition_tier(classify_substitute_failure(
+                    SubstituteFailureClass::ContentMismatch,
+                )),
+                &mut min_tier,
+            );
+        }
+        assert_eq!(verdict_tier, min_tier);
     }
 
     /// K1 falsify twin (merged_bug_044): the pre-fix 2-axis

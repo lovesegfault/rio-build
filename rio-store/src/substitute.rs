@@ -3835,10 +3835,12 @@ mod tests {
             match (any_stall, any_429, errored) {
                 (Some(w), _, _) => proptest::prop_assert_eq!(
                     got, SubstituteLoopVerdict::Stalled { window: w }),
-                (None, Some(ra), _) => proptest::prop_assert_eq!(
-                    got, SubstituteLoopVerdict::RateLimited { retry_after: ra }),
-                (None, None, true) => proptest::prop_assert_eq!(
+                // merged_bug_210: charge tier (Errored) outranks the
+                // 429 back-off tier — the corrected precedence.
+                (None, _, true) => proptest::prop_assert_eq!(
                     got, SubstituteLoopVerdict::Errored),
+                (None, Some(ra), false) => proptest::prop_assert_eq!(
+                    got, SubstituteLoopVerdict::RateLimited { retry_after: ra }),
                 (None, None, false) => proptest::prop_assert_eq!(
                     got, SubstituteLoopVerdict::CleanMiss),
             }
