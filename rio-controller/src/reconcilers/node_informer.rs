@@ -29,7 +29,7 @@
 //! up to T"), not a mirror of any apiserver state — it cannot be
 //! recomputed from a LIST and is owned by [`run`]'s flush loop.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -806,7 +806,14 @@ pub async fn run(
     // at-most-once, not silent loss); windows are NEVER merged (a
     // merged value under an already-committed uid would be absorbed
     // and the fresh half lost).
-    let mut unshipped: Vec<PendingExposure> = Vec::new();
+    //
+    // merged_bug_033: deliberately UNCAPPED. Memory is ~|H| slices
+    // per minute (tens of bytes each — one per configured hw_class
+    // per failed window), and a cap would mint a NEW forfeiture edge
+    // (a fourth drop reason) the spec's counted-forfeiture
+    // enumeration does not name. The drain is bounded per pass by
+    // [`ship_all`], never by dropping slices.
+    let mut unshipped: VecDeque<PendingExposure> = VecDeque::new();
 
     // merged_bug_001: per-process window gate — window identity is
     // strictly monotone, so a clock step backward (or a same-slot
@@ -897,10 +904,45 @@ pub async fn run(
                         // Ship every pending slice independently —
                         // retained windows retry alongside this
                         // flush's fresh ones, each under its own uid.
-                        for slice in std::mem::take(&mut unshipped) {
-                            let delivered = report_exposure(&mut admin, &slice).await;
-                            settle_exposure_slice(&mut unshipped, slice, delivered);
-                        }
+                        // The closure is the ONLY production ship
+                        // path (the former report_exposure body,
+                        // folded in so no shipment exists outside the
+                        // ship_all combinator): one
+                        // AppendInterruptSample per slice, `true` iff
+                        // acknowledged (bug_150 consume-on-ack; the
+                        // combinator owns the recredit law).
+                        // merged_bug_002 + merged_bug_001: the typed
+                        // uid rides every retry, so the AMBIGUOUS
+                        // failure (server committed, client timed
+                        // out) redelivers into the M_047 absorb
+                        // instead of double-banking — Ok⇒delivered is
+                        // sound. Bounded per-RPC by [`admin_call`]'s
+                        // timeout so a hung scheduler can't wedge the
+                        // flush loop.
+                        ship_all(&mut unshipped, |slice: &PendingExposure| {
+                            let mut admin = admin.clone();
+                            let uid = slice.uid.clone();
+                            let req = rio_proto::types::AppendInterruptSampleRequest {
+                                hw_class: slice.hw.clone(),
+                                kind: "exposure".into(),
+                                value: slice.secs,
+                                event_uid: Some(slice.uid.as_str().to_owned()),
+                            };
+                            async move {
+                                match admin_call(admin.append_interrupt_sample(req)).await {
+                                    Ok(_) => true,
+                                    Err(e) => {
+                                        warn!(
+                                            error = %e,
+                                            %uid,
+                                            "spot-exposure: append failed; slice re-credited to the next flush"
+                                        );
+                                        false
+                                    }
+                                }
+                            }
+                        })
+                        .await;
                     }
                     Err(e) => {
                         warn!(error = %e, "node LIST failed; exposure flush skipped this round");
@@ -1107,52 +1149,36 @@ pub async fn run_spot_interrupt_watcher(
     }
 }
 
-/// Append `kind='exposure'` node-seconds for one pending slice.
-/// Returns whether the append was acknowledged — the CALLER owns the
-/// slice until then (bug_150: exposure evidence is consumed on ack,
-/// not on send; a failed append re-credits the slice to the next
-/// flush, so nothing is lost — λ samples arrive late, not reduced).
-/// merged_bug_002: the slice's deterministic uid rides every retry,
-/// so the AMBIGUOUS failure (server committed, client timed out —
-/// routine under exactly the brownouts the re-credit was built for)
-/// redelivers into `ON CONFLICT (event_uid) DO NOTHING` instead of
-/// double-banking: pre-fix the retry was un-keyed and a sustained
-/// commit-but-timeout brownout banked the denominator QUADRATICALLY
-/// (re-credit re-merged into ever-larger un-keyed appends), biasing λ
-/// LOW — the anti-conservative direction (solver over-prefers spot).
-/// merged_bug_001: the uid is cluster-scoped and grid-aligned
-/// ([`EventUid`]), so the server-side absorb can only ever mean "this
-/// logical (cluster, class, window) is already banked" — the Ok arm's
-/// delivered=true is SOUND (pre-fix, a cross-cluster collision or a
-/// re-minted backward-clock window was absorbed and reported
-/// delivered: silent permanent denominator loss; this queue is the
-/// only carrier). Bounded by [`admin_call`]'s timeout so a hung
-/// scheduler can't wedge the Node-informer's flush loop (every caller
-/// is inside that loop).
-async fn report_exposure(admin: &mut AdminClient, slice: &PendingExposure) -> bool {
-    match admin_call(admin.append_interrupt_sample(
-        rio_proto::types::AppendInterruptSampleRequest {
-            hw_class: slice.hw.clone(),
-            kind: "exposure".into(),
-            value: slice.secs,
-            // merged_bug_002 + merged_bug_001: deterministic
-            // per-(cluster, class, window) key — constrained by the
-            // M_047 partial unique index exactly like the interrupt
-            // leg's K8s Event uids (the `exposure:` prefix keeps the
-            // namespaces disjoint).
-            event_uid: Some(slice.uid.as_str().to_owned()),
-        },
-    ))
-    .await
-    {
-        Ok(_) => true,
-        Err(e) => {
-            warn!(
-                error = %e,
-                uid = %slice.uid,
-                "spot-exposure: append failed; slice re-credited to the next flush"
-            );
-            false
+// r[impl ctrl.informer.exposure-recredit+2]
+/// merged_bug_033: drain the pending-exposure queue through ONE
+/// combinator — every shipment in this module rides `ship_all` (the
+/// production `ship` closure at the single [`run`] call site is the
+/// folded former `report_exposure` body; no ship path exists outside
+/// it). The recredit law lives HERE: a slice whose `ship` returns
+/// `false` (append not acknowledged — bug_150 consume-on-ack) is
+/// re-queued VERBATIM, uid and all, so however many times delivery is
+/// ambiguous the server holds at most one row per (cluster, class,
+/// window) — merged_bug_002: the retained slice keeps its EXACT
+/// identity (no re-mint, no merge); the cursor already advanced when
+/// the slice was banked, so this queue is the ONLY carrier of the
+/// failed window — dropping it here would be permanent denominator
+/// loss. One attempt per queued slice per pass.
+///
+/// `ship` returns its future by VALUE (`FnMut(&_) -> Fut`, not an
+/// async closure): the future owns everything it needs (the run()
+/// closure clones the client and builds the request eagerly), so the
+/// combinator awaits no slice-borrowing future — the lending shape
+/// trips rustc's HRTB Send check on the spawned informer future (the
+/// rust-lang/rust 102211 family; see `run_nodeclaim_pool`'s doc for
+/// the house precedent).
+async fn ship_all<Fut: Future<Output = bool>>(
+    unshipped: &mut VecDeque<PendingExposure>,
+    mut ship: impl FnMut(&PendingExposure) -> Fut,
+) {
+    for slice in std::mem::take(unshipped) {
+        let delivered = ship(&slice).await;
+        if !delivered {
+            unshipped.push_back(slice);
         }
     }
 }
@@ -1316,34 +1342,14 @@ struct PendingExposure {
 /// round (its nodes deleted mid-outage) still retries: it simply
 /// stays queued.
 fn queue_exposure_slices(
-    unshipped: &mut Vec<PendingExposure>,
+    unshipped: &mut VecDeque<PendingExposure>,
     fresh: Vec<(String, f64)>,
     cluster: &ClusterId,
     window: WindowId,
 ) {
     for (hw, secs) in fresh {
         let uid = EventUid::new(cluster, &hw, window);
-        unshipped.push(PendingExposure { hw, uid, secs });
-    }
-}
-
-// r[impl ctrl.informer.exposure-recredit+2]
-/// Settle one shipped slice: a failed append re-credits the slice —
-/// uid and all — to the next flush. The cursor already advanced when
-/// the slice was banked, so this pending queue is the ONLY carrier of
-/// the failed window — dropping it here is permanent denominator loss
-/// (the pre-fix shape: warn-only, fleet x window node-seconds gone
-/// per failed flush, undisclosed). merged_bug_002: the retained slice
-/// keeps its EXACT identity (no re-mint, no merge), so however many
-/// times delivery is ambiguous, the server holds at most one row per
-/// (class, window).
-fn settle_exposure_slice(
-    unshipped: &mut Vec<PendingExposure>,
-    slice: PendingExposure,
-    delivered: bool,
-) {
-    if !delivered {
-        unshipped.push(slice);
+        unshipped.push_back(PendingExposure { hw, uid, secs });
     }
 }
 
@@ -1379,38 +1385,47 @@ mod tests {
     /// on the bug_150 pre-fix shape via strawman reversal of the
     /// settle law: the second flush shipped 60.0 total — the failed
     /// window was consumed by the cursor advance and never re-banked.)
-    #[test]
-    fn failed_exposure_slice_recredits_to_next_flush() {
+    #[tokio::test]
+    async fn failed_exposure_slice_recredits_to_next_flush() {
         let cluster = ClusterId::new("prod-eu");
         let mut gate = WindowGate::default();
-        let mut unshipped: Vec<PendingExposure> = Vec::new();
-        // Flush 1 (t=1000 → slot 960): fresh 60s for m6id; append FAILS.
+        let mut unshipped: VecDeque<PendingExposure> = VecDeque::new();
+        // Flush 1 (t=1000 → slot 960): fresh 60s for m6id; the
+        // ship_all pass FAILS the append.
         let w1 = gate.admit(1000.0).expect("first admit");
         queue_exposure_slices(&mut unshipped, vec![("m6id".into(), 60.0)], &cluster, w1);
-        let ship1 = std::mem::take(&mut unshipped);
-        assert_eq!(ship1.len(), 1);
-        assert_eq!((ship1[0].hw.as_str(), ship1[0].secs), ("m6id", 60.0));
-        for slice in ship1 {
-            settle_exposure_slice(&mut unshipped, slice, false);
-        }
+        assert_eq!(unshipped.len(), 1);
+        assert_eq!(
+            (unshipped[0].hw.as_str(), unshipped[0].secs),
+            ("m6id", 60.0)
+        );
+        ship_all(&mut unshipped, |_| std::future::ready(false)).await;
+        assert_eq!(unshipped.len(), 1, "failed slice re-credited, not consumed");
         // Flush 2 (t=1060 → slot 1020): fresh 60s again. BOTH windows
         // ship — as two slices under their own uids, total conserved.
         let w2 = gate.admit(1060.0).expect("next slot admits");
         queue_exposure_slices(&mut unshipped, vec![("m6id".into(), 60.0)], &cluster, w2);
-        let ship2 = std::mem::take(&mut unshipped);
         assert_eq!(
-            ship2.iter().map(|s| s.secs).sum::<f64>(),
+            unshipped.iter().map(|s| s.secs).sum::<f64>(),
             120.0,
             "the failed window must be re-credited, not consumed"
         );
-        assert_eq!(ship2.len(), 2, "windows stay distinct slices, never merged");
+        assert_eq!(
+            unshipped.len(),
+            2,
+            "windows stay distinct slices, never merged"
+        );
         assert_ne!(
-            ship2[0].uid, ship2[1].uid,
+            unshipped[0].uid, unshipped[1].uid,
             "each window keys its own committed row"
         );
-        for slice in ship2 {
-            settle_exposure_slice(&mut unshipped, slice, true);
-        }
+        let mut shipped: Vec<f64> = Vec::new();
+        ship_all(&mut unshipped, |s: &PendingExposure| {
+            shipped.push(s.secs);
+            std::future::ready(true)
+        })
+        .await;
+        assert_eq!(shipped.iter().sum::<f64>(), 120.0, "both windows shipped");
         assert!(unshipped.is_empty(), "delivered slices leave no residue");
     }
 
@@ -1418,21 +1433,26 @@ mod tests {
     /// A retained class with NO fresh slice this round (its nodes were
     /// deleted mid-outage) still retries — retention is queue
     /// membership, independent of fresh production.
-    #[test]
-    fn retained_class_without_fresh_slice_still_retries() {
+    #[tokio::test]
+    async fn retained_class_without_fresh_slice_still_retries() {
         let cluster = ClusterId::new("prod-eu");
         let mut gate = WindowGate::default();
-        let mut unshipped: Vec<PendingExposure> = Vec::new();
+        let mut unshipped: VecDeque<PendingExposure> = VecDeque::new();
         let w1 = gate.admit(500.0).expect("first admit");
         queue_exposure_slices(&mut unshipped, vec![("m6id".into(), 45.0)], &cluster, w1);
-        let first = unshipped.remove(0);
-        settle_exposure_slice(&mut unshipped, first, false);
-        // Next flush: NO fresh slices.
+        ship_all(&mut unshipped, |_| std::future::ready(false)).await;
+        // Next flush: NO fresh slices — retention is queue
+        // membership, independent of fresh production.
         let w2 = gate.admit(560.0).expect("next slot admits");
         queue_exposure_slices(&mut unshipped, vec![], &cluster, w2);
-        let ship = std::mem::take(&mut unshipped);
-        assert_eq!(ship.len(), 1);
-        assert_eq!((ship[0].hw.as_str(), ship[0].secs), ("m6id", 45.0));
+        let mut attempted: Vec<(String, f64)> = Vec::new();
+        ship_all(&mut unshipped, |s: &PendingExposure| {
+            attempted.push((s.hw.clone(), s.secs));
+            std::future::ready(true)
+        })
+        .await;
+        assert_eq!(attempted, vec![("m6id".into(), 45.0)]);
+        assert!(unshipped.is_empty());
     }
 
     // r[verify ctrl.informer.exposure-recredit+2]
@@ -1446,11 +1466,11 @@ mod tests {
     /// `right:` retry uid == original uid (re-verified under
     /// [`EventUid`] equality — merged_bug_001 made the key
     /// cluster-scoped and grid-aligned, `exposure:{cluster}:{hw}:{slot}`).
-    #[test]
-    fn retried_slice_carries_identical_uid() {
+    #[tokio::test]
+    async fn retried_slice_carries_identical_uid() {
         let cluster = ClusterId::new("prod-eu");
         let mut gate = WindowGate::default();
-        let mut unshipped: Vec<PendingExposure> = Vec::new();
+        let mut unshipped: VecDeque<PendingExposure> = VecDeque::new();
         let w = gate.admit(1767225613.0).expect("first admit");
         queue_exposure_slices(&mut unshipped, vec![("m6id".into(), 60.0)], &cluster, w);
         let original = unshipped[0].clone();
@@ -1459,10 +1479,9 @@ mod tests {
             "exposure:prod-eu:m6id:1767225600",
             "deterministic per-(cluster, class, window) key"
         );
-        // Ambiguous failure → settle retains; the retried slice is
-        // byte-identical (uid AND value).
-        let shipped = unshipped.remove(0);
-        settle_exposure_slice(&mut unshipped, shipped, false);
+        // Ambiguous failure → the combinator's recredit law retains;
+        // the retried slice is byte-identical (uid AND value).
+        ship_all(&mut unshipped, |_| std::future::ready(false)).await;
         assert_eq!(
             unshipped[0], original,
             "retry must collide with its own committed row server-side"
@@ -1489,8 +1508,8 @@ mod tests {
         let mut gate_w = WindowGate::default();
         let we = gate_e.admit(1767225613.2).expect("first admit");
         let ww = gate_w.admit(1767225613.2).expect("first admit");
-        let mut qe: Vec<PendingExposure> = Vec::new();
-        let mut qw: Vec<PendingExposure> = Vec::new();
+        let mut qe: VecDeque<PendingExposure> = VecDeque::new();
+        let mut qw: VecDeque<PendingExposure> = VecDeque::new();
         queue_exposure_slices(&mut qe, vec![("mid-ebs-x86".into(), 60.0)], &east, we);
         queue_exposure_slices(&mut qw, vec![("mid-ebs-x86".into(), 60.0)], &west, ww);
         assert_ne!(
@@ -1512,8 +1531,8 @@ mod tests {
         let mut twin_b = WindowGate::default();
         let wa = twin_a.admit(1767225613.2).expect("first admit");
         let wb = twin_b.admit(1767225647.9).expect("first admit");
-        let mut qa: Vec<PendingExposure> = Vec::new();
-        let mut qb: Vec<PendingExposure> = Vec::new();
+        let mut qa: VecDeque<PendingExposure> = VecDeque::new();
+        let mut qb: VecDeque<PendingExposure> = VecDeque::new();
         queue_exposure_slices(&mut qa, vec![("mid-ebs-x86".into(), 60.0)], &east, wa);
         queue_exposure_slices(&mut qb, vec![("mid-ebs-x86".into(), 47.9)], &east, wb);
         assert_eq!(
@@ -1525,7 +1544,7 @@ mod tests {
         // disjoint from every non-empty cluster.
         let mut gate_d = WindowGate::default();
         let wd = gate_d.admit(1767225613.2).expect("first admit");
-        let mut qd: Vec<PendingExposure> = Vec::new();
+        let mut qd: VecDeque<PendingExposure> = VecDeque::new();
         queue_exposure_slices(
             &mut qd,
             vec![("mid-ebs-x86".into(), 60.0)],
@@ -1576,28 +1595,28 @@ mod tests {
     /// intact (it still ships). Extends the conservation family
     /// below: deferral is the LIST-failure posture, not a fourth
     /// forfeiture.
-    #[test]
-    fn conservation_holds_across_deferred_window() {
+    #[tokio::test]
+    async fn conservation_holds_across_deferred_window() {
         use metrics_util::debugging::DebuggingRecorder;
         let cfg = band_config();
         let cluster = ClusterId::new("prod-eu");
         let mut gate = WindowGate::default();
         let mut cursors: HashMap<String, f64> = HashMap::new();
-        let mut unshipped: Vec<PendingExposure> = Vec::new();
+        let mut unshipped: VecDeque<PendingExposure> = VecDeque::new();
         let nodes = vec![spot_node("a", "7", 1000)];
 
         let rec = DebuggingRecorder::new();
         let _g = ::metrics::set_default_local_recorder(&rec);
 
         // Round 1 (t=1060 → slot 1020): banks one slice; its append
-        // fails → retained.
+        // fails → retained (the combinator's recredit law).
         let w1 = gate.admit(1060.0).expect("first admit");
         let out = flush_spot_exposure(&mut cursors, &nodes, &cfg, 0.0, 1060.0);
         assert!(out.drops.is_empty());
         queue_exposure_slices(&mut unshipped, out.banked, &cluster, w1);
         assert_eq!(unshipped.len(), 1);
-        let slice = unshipped.remove(0);
-        settle_exposure_slice(&mut unshipped, slice, false);
+        ship_all(&mut unshipped, |_| std::future::ready(false)).await;
+        assert_eq!(unshipped.len(), 1, "failed slice retained");
         let cursors_before = cursors.clone();
         let queued_before = unshipped.clone();
 
@@ -2120,7 +2139,7 @@ mod tests {
     fn shutdown_backlog_is_counted_per_slice() {
         let cluster = ClusterId::new("prod-eu");
         let mut gate = WindowGate::default();
-        let mut unshipped: Vec<PendingExposure> = Vec::new();
+        let mut unshipped: VecDeque<PendingExposure> = VecDeque::new();
         // Two failed windows accumulate (the brownout shape).
         let w1 = gate.admit(1000.0).expect("first admit");
         queue_exposure_slices(&mut unshipped, vec![("m6id".into(), 60.0)], &cluster, w1);
