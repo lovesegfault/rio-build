@@ -302,15 +302,45 @@ export function createLogStream(
           isComplete: boolean;
         };
         const it: AsyncIterator<TailChunk> = stream[Symbol.asyncIterator]();
-        // The abort edge joins every race: a mock or proxy stream that
+        // An abort edge joins every race: a mock or proxy stream that
         // ignores its signal must not be able to hold the loop hostage
         // — destroy() and the grace cutoff resolve this promise even
         // when the transport never rejects.
-        const abortEdge = new Promise<{ kind: 'abort' }>((resolve) => {
-          attempt.signal.addEventListener('abort', () => resolve({ kind: 'abort' }), {
-            once: true,
+        //
+        // PER-ITERATION AND SELF-CLEANING (bug_277): the edge used to
+        // be created once per attempt — a promise that never settles
+        // on a healthy follow. Every race against it permanently
+        // appended a PromiseReaction (one per chunk, one per 1 s
+        // tick), retaining each iteration's result promise and closure
+        // graph: a multi-hour follow leaked ~86k reactions/day from
+        // the tick alone, bypassing the MAX_ROWS cap maintained for
+        // exactly this concern. Each iteration now builds a fresh edge
+        // and removes its listener once the race settles (mirroring
+        // sleep()'s finish), so a lost edge is garbage, not a ledger.
+        // (pendingNext is exempt by construction: the iterator
+        // contract forces reuse across lost races, but it settles on
+        // every message — at worst the keep-alive cadence — releasing
+        // its reactions.)
+        let abortListener: (() => void) | null = null;
+        const abortEdgeFor = (): Promise<{ kind: 'abort' }> => {
+          if (attempt.signal.aborted) {
+            // A listener added to an already-aborted signal never
+            // fires — resolve immediately instead.
+            return Promise.resolve({ kind: 'abort' as const });
+          }
+          return new Promise((resolve) => {
+            abortListener = () => resolve({ kind: 'abort' });
+            attempt.signal.addEventListener('abort', abortListener, {
+              once: true,
+            });
           });
-        });
+        };
+        const dropAbortEdge = (): void => {
+          if (abortListener !== null) {
+            attempt.signal.removeEventListener('abort', abortListener);
+            abortListener = null;
+          }
+        };
         // Wrapped ONCE and reused across lost races: an async iterator
         // must never have two concurrent next() calls in flight, and
         // re-wrapping per race would deepen the microtask chain.
@@ -349,7 +379,7 @@ export function createLogStream(
             | { kind: 'grace' }
           >[] = [
             nextMsg,
-            abortEdge,
+            abortEdgeFor(),
             sleep(TERMINAL_TICK_MS, tickCtrl.signal).then(() => ({
               kind: 'tick' as const,
             })),
@@ -364,6 +394,11 @@ export function createLogStream(
           }
           const winner = await Promise.race(edges);
           tickCtrl.abort();
+          // bug_277: settle-time cleanup — the losing abort edge's
+          // listener is removed so the edge promise (and every closure
+          // it retains) is collectible. The tick/grace sleeps clean
+          // themselves up via tickCtrl.abort() + sleep()'s finish.
+          dropAbortEdge();
           if (winner.kind === 'abort') {
             // Master destroy or grace cutoff; the shared post-stream
             // path sorts out which.

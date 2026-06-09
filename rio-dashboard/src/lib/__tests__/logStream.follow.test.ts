@@ -661,4 +661,46 @@ describe('authRequired terminal state', () => {
     s.destroy();
   });
 
+
+  // r[verify dash.stream.log-tail+6]
+  /// bug_277's recorded red: the abort edge was created ONCE per
+  /// attempt and never settles on a healthy follow -- yet every loop
+  /// iteration (one per chunk, one per 1s tick) raced it, permanently
+  /// appending a PromiseReaction to the pending promise (the classic
+  /// Promise.race leak; ~86k reactions/day from the tick alone on a
+  /// multi-hour follow). Proxy witness: no single promise instance may
+  /// be raced unboundedly -- per-iteration edges appear in exactly one
+  /// race and become collectible once it settles.
+  it('race_edges_are_per_iteration: no promise accumulates reactions across the follow loop', async () => {
+    const appearances = new Map<unknown, number>();
+    const realRace = Promise.race.bind(Promise);
+    const raceSpy = vi
+      .spyOn(Promise, 'race')
+      .mockImplementation((iterable: Iterable<unknown>) => {
+        const arr = [...iterable];
+        for (const e of arr) {
+          appearances.set(e, (appearances.get(e) ?? 0) + 1);
+        }
+        return realRace(arr);
+      });
+    try {
+      tailLog.mockImplementation(async function* () {
+        for (let i = 0; i < 30; i++) {
+          yield chunk([`l${i}`], { firstLineNumber: BigInt(i) });
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        await new Promise(() => {});
+      });
+      const s = createLogStream('/nix/store/x.drv', '', {
+        isTerminal: () => false,
+      });
+      await vi.advanceTimersByTimeAsync(4_000);
+      const max = Math.max(...appearances.values());
+      expect(max).toBeLessThanOrEqual(5);
+      s.destroy();
+    } finally {
+      raceSpy.mockRestore();
+    }
+  });
+
 });
