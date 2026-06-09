@@ -219,7 +219,7 @@ async fn pull_confirm_exit_fences_late_pull() -> TestResult {
     // The abandoned earlier pull lands AFTER the exit-0 license.
     let late = pull(&handle, "pull-fence", Some("pull-fence")).await;
     assert!(
-        matches!(late, Ok(PullOutcome::Gone)),
+        matches!(late, Ok(PullOutcome::Gone(_))),
         "a post-confirm pull from the same executor token must be \
          fenced to Gone, never minted, got {late:?}"
     );
@@ -261,7 +261,7 @@ async fn pull_double_pull_is_idempotent() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.executor.pull-gone]
+// r[verify sched.executor.pull-gone+1]
 /// (b) A pull for a completed drv returns Gone and writes nothing new.
 #[tokio::test]
 async fn pull_completed_drv_returns_gone() -> TestResult {
@@ -279,7 +279,7 @@ async fn pull_completed_drv_returns_gone() -> TestResult {
     let before = row_counts(&db.pool, "pull-b").await;
     let outcome = pull(&handle, "pull-b", Some("pull-b")).await;
     assert!(
-        matches!(outcome, Ok(PullOutcome::Gone)),
+        matches!(outcome, Ok(PullOutcome::Gone(_))),
         "completed drv must answer Gone, got {outcome:?}"
     );
     let after = row_counts(&db.pool, "pull-b").await;
@@ -287,7 +287,7 @@ async fn pull_completed_drv_returns_gone() -> TestResult {
 
     // A drv that was never submitted answers Gone too.
     let outcome = pull(&handle, "never-submitted", Some("never-submitted")).await;
-    assert!(matches!(outcome, Ok(PullOutcome::Gone)));
+    assert!(matches!(outcome, Ok(PullOutcome::Gone(_))));
     Ok(())
 }
 

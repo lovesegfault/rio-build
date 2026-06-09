@@ -433,7 +433,7 @@ in
   #     RejectStaleGeneration on a below-floor pull; nothing else is
   #     ever rejected.
   # r[verify sched.merge.substitute-topdown+13]
-  # r[verify sched.executor.pull-gone]
+  # r[verify sched.executor.pull-gone+1]
   # r[verify sched.executor.pull-not-ready+2]
   # r[verify sched.materialize.job+2]
   kani-rio-evidence-kernel = mkKaniCheck {
@@ -552,6 +552,19 @@ in
     # inverse breaks the build on a new variant, so a class can no
     # longer be silently excluded from any sweep (the round-3
     # pick-table lesson made structural).
-    expectedHarnesses = 38;
+    # 38 → 40: + the merged_bug_011 fence-obligation pair (pull.rs
+    # `mod fence_obligation_proofs`):
+    #   - check_fence_obligation_partition: totality + the exact
+    #     per-cell table over admission × confirm_only × lane (Gone
+    #     and confirm-screened NotYetReady on Keyed ⇒ WriteAhead;
+    #     DeliverNew on Keyed ⇒ ScreenRead; non-keyed lanes ⇒ None).
+    #   - check_licensing_answers_oblige_fencing: dominance — no
+    #     keyed answer that licenses builder exit-0 carries
+    #     FenceObligation::None.
+    # (C-1 delta rule: +2 over the base at this landing; whichever of
+    # S4/S6a lands second re-derives the census from the driver's
+    # "Complete - N" line and sets the cumulative.)
+    # r[verify sched.executor.confirm-fence]
+    expectedHarnesses = 40;
   };
 }

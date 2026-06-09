@@ -8785,7 +8785,7 @@ async fn backstop_refeeds_untracked_rows_and_cancels_moot() -> TestResult {
     // pre-refeed shape, NOT the desired end state).
     let pre = claim_materialization(&handle, "bk-live", "store-test-0").await;
     assert!(
-        matches!(pre, Ok(PullOutcome::Gone)),
+        matches!(pre, Ok(PullOutcome::Gone(_))),
         "precondition (the documented hole): an untracked row projects None → Gone; \
          got {pre:?}"
     );

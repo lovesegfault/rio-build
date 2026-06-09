@@ -525,6 +525,94 @@ pub fn display_class(kind: PullKind) -> DisplaySurface {
     }
 }
 
+/// Which fence lane one pull runs on — the scheduler's lane
+/// classification projected kind-only (the key bytes stay
+/// scheduler-side; this law needs only WHICH lane).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FenceLaneKind {
+    /// Build lane with a verified pod credential: the confirm-exit
+    /// fence governs this pull.
+    Keyed,
+    /// Build lane in an identity-disabled deployment (no HMAC key
+    /// anywhere): no key domain, no fence.
+    Unfenced,
+    /// Materialization lane: no confirm-exit protocol exists — the
+    /// `(intent, instance)` composite + the kernel's one-winner arm
+    /// arbitrate replica identity instead.
+    Materialization,
+}
+
+/// What the confirm-exit fence obliges BEFORE one admission decision
+/// is answered (merged_bug_011's law, lifted out of the scheduler's
+/// `confirm_only`-gated special case).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FenceObligation {
+    /// The answer licenses the builder's exit 0 ("nothing is or will
+    /// be held"): the fence row MUST be durable before the reply —
+    /// write failure withholds the answer (retryable NACK).
+    WriteAhead,
+    /// The answer would mint fresh work: the fence MUST be read
+    /// first — a fenced token's mint is screened to `Gone`.
+    ScreenRead,
+    /// No fence interaction: the answer neither licenses a clean
+    /// exit nor mints (re-delivery, plain NotYetReady, rejections),
+    /// or the lane has no key domain.
+    None,
+}
+
+// r[impl sched.executor.confirm-fence]
+/// The which-pulls-must-fence law: pure, total over the full
+/// `admission × confirm_only × lane` domain, kani-pinned
+/// (`check_fence_obligation_partition` /
+/// `check_licensing_answers_oblige_fencing`).
+///
+/// On the keyed build lane, every answer that licenses the builder's
+/// exit 0 obliges the write-ahead: `Gone` — live OR confirm (the
+/// pre-fix scheduler fenced only the `confirm_only` half, so the
+/// live-loop `Gone` licensed exit 0 with no row and a straggler pull
+/// could mint after a resubmit re-readied the drv) — and the
+/// confirm-screened `NotYetReady` (the confirm probe's nothing-held
+/// answer). `DeliverNew` obliges the screen read. Everything else,
+/// and every non-keyed lane, obliges nothing.
+///
+/// The admission passed in is the POST-SCREEN decision (the caller's
+/// confirm-only DeliverNew→NotYetReady downgrade runs first); the
+/// table still answers `ScreenRead` for a hypothetical unscreened
+/// confirm `DeliverNew` — fail-closed: reading the fence before a
+/// mint is never wrong.
+pub fn fence_obligation<ExecId>(
+    admission: &PullAdmission<ExecId>,
+    confirm_only: bool,
+    lane: FenceLaneKind,
+) -> FenceObligation {
+    match lane {
+        // No key domain: nothing to write, nothing to screen.
+        FenceLaneKind::Unfenced | FenceLaneKind::Materialization => FenceObligation::None,
+        FenceLaneKind::Keyed => match admission {
+            // Every Gone is the exit-0 license — fence it, live or
+            // confirm.
+            PullAdmission::Gone => FenceObligation::WriteAhead,
+            // The confirm probe's nothing-held answer is equally a
+            // license; a plain (live) NotYetReady licenses nothing —
+            // the pod keeps pulling.
+            PullAdmission::NotYetReady => {
+                if confirm_only {
+                    FenceObligation::WriteAhead
+                } else {
+                    FenceObligation::None
+                }
+            }
+            // A fresh mint must check for a declared exit first.
+            PullAdmission::DeliverNew => FenceObligation::ScreenRead,
+            // Re-delivery re-sends an attempt that already exists;
+            // rejections answer nothing.
+            PullAdmission::DeliverExisting { .. }
+            | PullAdmission::RejectToken
+            | PullAdmission::RejectStaleGeneration => FenceObligation::None,
+        },
+    }
+}
+
 /// Proof that one executor report passed the kind-uniform admission
 /// fold ([`fold_report`]) — the report is the FIRST one for a
 /// still-open attempt. Constructible ONLY by `fold_report` (bug_134):
@@ -651,7 +739,7 @@ pub fn redelivery_credential_ok<ExecId: PartialEq>(
 }
 
 // r[impl sched.materialize.job+2]
-// r[impl sched.executor.pull-gone]
+// r[impl sched.executor.pull-gone+1]
 // r[impl sched.executor.pull-not-ready+2]
 /// The kinded admission (design §2.3's table). Pure, total.
 ///
@@ -1400,6 +1488,91 @@ mod report_admission_proofs {
             ReportAdmission::AckIgnore => {
                 assert!(!assignment_active || attempt_already_classified);
             }
+        }
+    }
+}
+
+#[cfg(kani)]
+mod fence_obligation_proofs {
+    //! CBMC sweep of the which-pulls-must-fence law (merged_bug_011):
+    //! the full `admission × confirm_only × lane` domain is small
+    //! (6 × 2 × 3) — both harnesses enumerate it exhaustively.
+
+    use super::*;
+
+    fn any_admission() -> PullAdmission<u8> {
+        let sel: u8 = kani::any();
+        kani::assume(sel < 6);
+        match sel {
+            0 => PullAdmission::DeliverNew,
+            1 => PullAdmission::DeliverExisting {
+                exec_id: kani::any(),
+            },
+            2 => PullAdmission::Gone,
+            3 => PullAdmission::NotYetReady,
+            4 => PullAdmission::RejectToken,
+            _ => PullAdmission::RejectStaleGeneration,
+        }
+    }
+
+    fn any_lane() -> FenceLaneKind {
+        let sel: u8 = kani::any();
+        kani::assume(sel < 3);
+        match sel {
+            0 => FenceLaneKind::Keyed,
+            1 => FenceLaneKind::Unfenced,
+            _ => FenceLaneKind::Materialization,
+        }
+    }
+
+    // r[verify sched.executor.confirm-fence]
+    /// Totality + the exact per-cell table: Gone and confirm-screened
+    /// NotYetReady on Keyed ⇒ WriteAhead; DeliverNew on Keyed ⇒
+    /// ScreenRead; everything else — including BOTH non-keyed lanes
+    /// wholesale — ⇒ None.
+    #[kani::proof]
+    fn check_fence_obligation_partition() {
+        let admission = any_admission();
+        let confirm_only: bool = kani::any();
+        let lane = any_lane();
+        let obligation = fence_obligation(&admission, confirm_only, lane);
+        let expected = match (lane, &admission, confirm_only) {
+            (FenceLaneKind::Unfenced | FenceLaneKind::Materialization, _, _) => {
+                FenceObligation::None
+            }
+            (FenceLaneKind::Keyed, PullAdmission::Gone, _) => FenceObligation::WriteAhead,
+            (FenceLaneKind::Keyed, PullAdmission::NotYetReady, true) => FenceObligation::WriteAhead,
+            (FenceLaneKind::Keyed, PullAdmission::NotYetReady, false) => FenceObligation::None,
+            (FenceLaneKind::Keyed, PullAdmission::DeliverNew, _) => FenceObligation::ScreenRead,
+            (
+                FenceLaneKind::Keyed,
+                PullAdmission::DeliverExisting { .. }
+                | PullAdmission::RejectToken
+                | PullAdmission::RejectStaleGeneration,
+                _,
+            ) => FenceObligation::None,
+        };
+        assert_eq!(obligation, expected);
+    }
+
+    // r[verify sched.executor.confirm-fence]
+    /// Licensing-answer dominance: no keyed answer that licenses
+    /// builder exit-0 (`Gone` — live or confirm — or the confirm
+    /// `NotYetReady`) carries `FenceObligation::None`, and the keyed
+    /// mint admission always screens. The pre-fix shape (live Gone
+    /// fence-free) cannot reappear without this proof going red.
+    #[kani::proof]
+    fn check_licensing_answers_oblige_fencing() {
+        let admission = any_admission();
+        let confirm_only: bool = kani::any();
+        let obligation = fence_obligation(&admission, confirm_only, FenceLaneKind::Keyed);
+        let licenses_exit_zero = matches!(admission, PullAdmission::Gone)
+            || (confirm_only && matches!(admission, PullAdmission::NotYetReady));
+        if licenses_exit_zero {
+            assert_eq!(obligation, FenceObligation::WriteAhead);
+        }
+        if matches!(admission, PullAdmission::DeliverNew) {
+            assert_eq!(obligation, FenceObligation::ScreenRead);
         }
     }
 }

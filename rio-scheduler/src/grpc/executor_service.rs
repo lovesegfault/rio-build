@@ -809,7 +809,12 @@ impl ExecutorService for SchedulerGrpc {
         use rio_proto::types::pull_assignment_response::Outcome;
         let outcome = match outcome {
             Ok(crate::actor::PullOutcome::Deliver(assignment)) => Outcome::Assignment(*assignment),
-            Ok(crate::actor::PullOutcome::Gone) => Outcome::Gone(rio_proto::types::Gone {}),
+            // The license is spent here: the wire Gone carries no
+            // payload — the proof's job was making this answer
+            // unconstructible without the fence (merged_bug_011).
+            Ok(crate::actor::PullOutcome::Gone(_license)) => {
+                Outcome::Gone(rio_proto::types::Gone {})
+            }
             Ok(crate::actor::PullOutcome::NotYetReady { retry_after_secs }) => {
                 Outcome::NotYetReady(rio_proto::types::NotYetReady {
                     retry_after_seconds: retry_after_secs,

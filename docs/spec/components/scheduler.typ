@@ -3016,12 +3016,14 @@ reserved. The two-believer pull race (two open
 attempts, double charge for one pod death) is closed at the same place the
 work-binding authority lives.
 
-#r("sched.executor.pull-gone")[
-  `PullAssignment` MUST return `Gone` --- and MUST NOT write any state ---
-  when the derivation is no longer wanted by anyone: cancelled, substituted,
-  completed, skipped, failed permanently/poisoned, or absent from the DAG.
-  `Gone` is terminal for the pod: it exits 0, the Job completes, and nothing
-  is charged.
+#r("sched.executor.pull-gone+1")[
+  `PullAssignment` MUST return `Gone` when the derivation is no longer
+  wanted by anyone: cancelled, substituted, completed, skipped, failed
+  permanently/poisoned, or absent from the DAG. `Gone` MUST NOT write any
+  attempt or derivation state; on the keyed build lane the confirm-exit
+  fence row is the one permitted write and MUST be durable before the
+  answer (#rref("sched.executor.confirm-fence")). `Gone` is terminal for
+  the pod: it exits 0, the Job completes, and nothing is charged.
 ]
 
 #r("sched.executor.pull-not-ready+2")[

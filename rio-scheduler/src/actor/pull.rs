@@ -86,10 +86,37 @@ pub enum PullOutcome {
     /// while the attempt stays open).
     Deliver(Box<rio_proto::types::WorkAssignment>),
     /// The derivation is no longer wanted; the pod exits 0 charge-free.
-    Gone,
+    /// Carries the exit-0 license proof (merged_bug_011): a keyed Gone
+    /// is constructible only from a durable fence witness.
+    Gone(GoneLicense),
     /// Wanted but not currently deliverable to this pod; re-pull after
     /// the suggested delay.
     NotYetReady { retry_after_secs: u32 },
+}
+
+/// The exit-0 license a `Gone` answer carries (merged_bug_011,
+/// keystone 1): on the keyed build lane the license IS the durable
+/// fence witness — [`crate::db::confirm_fences::ConfirmFenceDurable`]
+/// is mintable only by the fence write/read, so a keyed Gone with no
+/// row on disk does not typecheck. The unfenced license takes the
+/// [`NonKeyedLane`] proof, mintable only at the lane-classification
+/// match where `FenceLane::Keyed` is structurally excluded — a Keyed
+/// lane has no path to a `NonKeyedLane` value, so the bypass is a
+/// compile error, not a runtime check (the debug_assert form was
+/// REJECTED per FS-5: debug_assert compiles out of release builds and
+/// is not a typecheck).
+#[derive(Debug)]
+pub enum GoneLicense {
+    /// The fence row for this token is durable (written ahead of this
+    /// answer, or read by the DeliverNew screen).
+    Fenced(crate::db::confirm_fences::ConfirmFenceDurable),
+    /// This pull runs on a lane with no fence key domain — proof of
+    /// non-keyed-ness, not an exemption.
+    ///
+    /// The proof is spent by EXISTING (constructibility is the
+    /// property; nothing downstream needs to re-read which lane —
+    /// `allow(dead_code)` records that deliberately).
+    Unfenced(#[allow(dead_code)] NonKeyedLane),
 }
 
 /// Why a `PullAssignment` was refused without an outcome.
@@ -184,7 +211,7 @@ pub(crate) struct PullInputs<'a> {
     pub attempt_nonce: Option<Uuid>,
 }
 
-// r[impl sched.executor.pull-gone]
+// r[impl sched.executor.pull-gone+1]
 // r[impl sched.executor.pull-not-ready+2]
 /// Decide one pull from already-loaded state. Projection shim over the
 /// CBMC-verified [`rio_evidence_kernel::pull::admit_pull`] (decision
@@ -210,24 +237,67 @@ enum FenceLane<'a> {
     /// Build lane with a pod credential: the confirm-exit fence
     /// governs this pull.
     Keyed(&'a str),
-    /// Build lane in an IDENTITY-DISABLED deployment (no HMAC key
-    /// configured anywhere — dev mode, the standalone/keyless VM
-    /// fixtures): there is no pod credential in the system, so the
-    /// fence has no key domain. The m145 threat model is the k8s Job
-    /// lifecycle (a Succeeded Job invisible to the establishment
-    /// sweep); an identity-disabled deployment opted out of executor
-    /// identity entirely. Production cannot reach this lane: with a
-    /// key configured the credential layer rejects token-less pulls
-    /// Unauthenticated before the actor, and the gRPC dispatch
-    /// carries a second fail-closed arm behind it (defense in
-    /// depth). First enforced as an unconditional refusal — the
-    /// 13-VM-check red proved the lane is a deployment CLASS, not
-    /// dead code.
+    /// A lane with no fence key domain, carrying its [`NonKeyedLane`]
+    /// proof (minted ONLY at the lane-classification match in
+    /// [`DagActor::pull_assignment_inner`] — the single site where
+    /// `FenceLane::Keyed` is structurally excluded).
+    NonKeyed(NonKeyedLane),
+}
+
+/// Proof that one pull runs on a lane with no fence key domain
+/// (merged_bug_011 / FS-5). The class is private and there is no pub
+/// constructor: the ONLY minting site is the
+/// `(kind, executor_token_sha256)` lane-classification match in
+/// [`DagActor::pull_assignment_inner`] — the match whose `Keyed` arm
+/// is structurally excluded from producing this value. A value of
+/// this type therefore IS the proof that the pull was classified
+/// non-keyed; [`GoneLicense::Unfenced`] consumes it, so an unfenced
+/// keyed `Gone` is a compile error, not a runtime check (the
+/// `debug_assert` form was REJECTED per FS-5 — it compiles out of
+/// release builds and is not a typecheck).
+///
+/// The two classes:
+///
+/// - `Unfenced` — build lane in an IDENTITY-DISABLED deployment (no
+///   HMAC key configured anywhere — dev mode, the standalone/keyless
+///   VM fixtures): there is no pod credential in the system, so the
+///   fence has no key domain. The m145 threat model is the k8s Job
+///   lifecycle (a Succeeded Job invisible to the establishment
+///   sweep); an identity-disabled deployment opted out of executor
+///   identity entirely. Production cannot reach this lane: with a
+///   key configured the credential layer rejects token-less pulls
+///   Unauthenticated before the actor, and the gRPC dispatch carries
+///   a second fail-closed arm behind it (defense in depth). First
+///   enforced as an unconditional refusal — the 13-VM-check red
+///   proved the lane is a deployment CLASS, not dead code.
+/// - `Materialization` — no confirm-exit protocol, no fence (the
+///   (intent, instance) composite + the kernel's one-winner arm
+///   arbitrate replica identity instead).
+#[derive(Debug, Clone, Copy)]
+pub struct NonKeyedLane(NonKeyedLaneClass);
+
+/// Which non-keyed lane a [`NonKeyedLane`] proof attests (private —
+/// see the wrapper's doc; consumers project through
+/// [`NonKeyedLane::kernel_kind`]).
+#[derive(Debug, Clone, Copy)]
+enum NonKeyedLaneClass {
+    /// Identity-disabled deployment class (see the wrapper doc).
     Unfenced,
-    /// Materialization lane: no confirm-exit protocol, no fence (the
-    /// (intent, instance) composite + the kernel's one-winner arm
-    /// arbitrate replica identity instead).
+    /// Materialization lane (see the wrapper doc).
     Materialization,
+}
+
+impl NonKeyedLane {
+    /// Project onto the kernel's lane alphabet for the
+    /// [`rio_evidence_kernel::pull::fence_obligation`] law.
+    fn kernel_kind(self) -> rio_evidence_kernel::pull::FenceLaneKind {
+        match self.0 {
+            NonKeyedLaneClass::Unfenced => rio_evidence_kernel::pull::FenceLaneKind::Unfenced,
+            NonKeyedLaneClass::Materialization => {
+                rio_evidence_kernel::pull::FenceLaneKind::Materialization
+            }
+        }
+    }
 }
 
 pub(crate) fn admit_pull(inputs: &PullInputs<'_>) -> PullDecision {
@@ -340,15 +410,23 @@ impl DagActor {
         // the unconditional-refusal first cut turned every keyless VM
         // scenario red — 13 checks — which is the machine evidence
         // this lane is a deployment class, not dead code).
+        // THE lane-classification match (merged_bug_011 / FS-5): the
+        // single site minting `NonKeyedLane` proofs — the `Keyed` arm
+        // structurally cannot produce one, so an unfenced keyed Gone
+        // cannot be assembled anywhere downstream.
         let fence_lane = match (kind, executor_token_sha256) {
             // Materialization lane: replica identity is the
             // (intent, instance) composite under fleet-level service
             // credentials; the confirm-exit protocol (and so the
             // fence) does not exist here — the store's client never
             // sends confirm_only (both call sites pass false).
-            (rio_evidence_kernel::pull::PullKind::Materialization, _) => FenceLane::Materialization,
+            (rio_evidence_kernel::pull::PullKind::Materialization, _) => {
+                FenceLane::NonKeyed(NonKeyedLane(NonKeyedLaneClass::Materialization))
+            }
             (rio_evidence_kernel::pull::PullKind::Build, Some(hash)) => FenceLane::Keyed(hash),
-            (rio_evidence_kernel::pull::PullKind::Build, None) => FenceLane::Unfenced,
+            (rio_evidence_kernel::pull::PullKind::Build, None) => {
+                FenceLane::NonKeyed(NonKeyedLane(NonKeyedLaneClass::Unfenced))
+            }
         };
         // Standby replicas answer nothing (the gRPC layer already
         // gates; this closes the in-flight-deposed window).
@@ -474,28 +552,70 @@ impl DagActor {
             decision
         };
 
-        // merged_bug_145: the confirm-exit fence's WRITE-AHEAD half. A
-        // confirm answered "nothing held" (NotYetReady/Gone) is the
-        // builder's exit-0 license — the Job goes Succeeded on it. The
-        // fence row must be durable BEFORE that license is issued, or
-        // a late abandoned pull (still in the mailbox/network) mints
-        // an open attempt against a Succeeded Job — invisible to the
-        // establishment sweep, which reaps against FAILED pods.
-        // Fail-closed: if the fence write fails, the license is NOT
-        // issued (retryable Internal; the builder's confirm regime
+        // r[impl sched.executor.confirm-fence]
+        // merged_bug_145 + merged_bug_011: the confirm-exit fence's
+        // WRITE-AHEAD half, now TOTAL over the kernel's
+        // which-pulls-must-fence law instead of gated on
+        // `confirm_only`. An answer that licenses the builder's
+        // exit 0 — EVERY keyed Gone (live or confirm; the pre-fix gate
+        // left the live-loop Gone unfenced, so a straggler pull could
+        // mint after a content-addressed resubmit re-readied the drv)
+        // and the confirm-only NotYetReady — must have the fence row
+        // durable BEFORE the reply, or a late abandoned pull (still in
+        // the mailbox/network) mints an open attempt against a
+        // Succeeded Job — invisible to the establishment sweep, which
+        // reaps against FAILED pods. Fail-closed: if the fence write
+        // fails, the license is NOT issued (retryable; the builder
         // retries or exits nonzero → Failed → the sweep reaps).
-        if confirm_only
-            && matches!(decision, PullDecision::NotYetReady | PullDecision::Gone)
-            && let FenceLane::Keyed(hash) = fence_lane
-            && let Err(e) = self.db.insert_confirm_fence(hash, intent_id).await
-        {
-            warn!(intent_id = %intent_id, error = %e,
-                  "confirm fence write failed; withholding the exit-0 license");
-            // Retryable class: the builder's confirm regime re-attempts
-            // (Idle) or exits nonzero (Shutdown) — the pod never exits
-            // 0 on an unfenced confirm.
-            return Err(PullRejection::ConsumptionNotDurable);
-        }
+        let obligation = match fence_lane {
+            FenceLane::Keyed(_) => rio_evidence_kernel::pull::fence_obligation(
+                &decision,
+                confirm_only,
+                rio_evidence_kernel::pull::FenceLaneKind::Keyed,
+            ),
+            FenceLane::NonKeyed(lane) => rio_evidence_kernel::pull::fence_obligation(
+                &decision,
+                confirm_only,
+                lane.kernel_kind(),
+            ),
+        };
+        let fence_witness: Option<crate::db::confirm_fences::ConfirmFenceDurable> =
+            match (obligation, fence_lane) {
+                (
+                    rio_evidence_kernel::pull::FenceObligation::WriteAhead,
+                    FenceLane::Keyed(hash),
+                ) => {
+                    match self.db.insert_confirm_fence(hash, intent_id).await {
+                        Ok(witness) => Some(witness),
+                        Err(e) => {
+                            warn!(intent_id = %intent_id, error = %e,
+                                  "fence write-ahead failed; withholding the exit-0 license");
+                            // Retryable class: the builder re-pulls
+                            // (live loop / Idle confirm) or exits
+                            // nonzero (Shutdown) — the pod never exits
+                            // 0 on an unfenced licensing answer.
+                            return Err(PullRejection::ConsumptionNotDurable);
+                        }
+                    }
+                }
+                // Kernel law (kani-pinned): WriteAhead is emitted only
+                // on the keyed lane — this cell is structurally dead;
+                // total and harmless (writes nothing, licenses
+                // nothing: the Gone arm below licenses non-keyed lanes
+                // through their own proof, never through a witness).
+                (
+                    rio_evidence_kernel::pull::FenceObligation::WriteAhead,
+                    FenceLane::NonKeyed(_),
+                ) => None,
+                // ScreenRead is consumed inside the DeliverNew arm
+                // (the read needs to interleave with the mint); None
+                // obliges nothing.
+                (
+                    rio_evidence_kernel::pull::FenceObligation::ScreenRead
+                    | rio_evidence_kernel::pull::FenceObligation::None,
+                    _,
+                ) => None,
+            };
 
         match decision {
             PullDecision::RejectToken => {
@@ -516,8 +636,27 @@ impl DagActor {
                 Err(PullRejection::StaleGeneration)
             }
             PullDecision::Gone => {
+                // r[impl sched.executor.pull-gone+1]
+                // The license: keyed lanes spend the write-ahead
+                // witness (the fence IS durable — the block above
+                // returned early otherwise); non-keyed lanes spend
+                // their classification proof. A keyed Gone with no
+                // witness is structurally dead by the kernel law
+                // (Gone on Keyed ⇒ WriteAhead, kani-pinned) — the arm
+                // refuses fail-closed rather than license unfenced.
+                let license = match (fence_lane, fence_witness) {
+                    (FenceLane::NonKeyed(lane), _) => GoneLicense::Unfenced(lane),
+                    (FenceLane::Keyed(_), Some(witness)) => GoneLicense::Fenced(witness),
+                    (FenceLane::Keyed(_), None) => {
+                        return Err(PullRejection::Internal(
+                            "keyed Gone reached the answer with no fence witness \
+                             (fence_obligation law violated)"
+                                .into(),
+                        ));
+                    }
+                };
                 debug!(intent_id = %intent_id, ?status, "pull answered Gone");
-                Ok(PullOutcome::Gone)
+                Ok(PullOutcome::Gone(license))
             }
             PullDecision::NotYetReady => {
                 debug!(intent_id = %intent_id, ?status, "pull answered NotYetReady");
@@ -543,22 +682,27 @@ impl DagActor {
                 Ok(PullOutcome::Deliver(Box::new(assignment)))
             }
             PullDecision::DeliverNew => {
-                // merged_bug_145: the confirm-exit fence's READ half.
-                // A fenced token already received its exit-0 license —
-                // the pod is gone (or exiting); minting would open an
-                // attempt no sweep can see. Screen to Gone (terminal
-                // for any straggler loop). Fail-closed on a read
-                // error: refusing a mint costs one NotYetReady retry;
-                // a false mint costs an invisible open attempt — and
-                // the mint transaction needs PG anyway.
+                // r[impl sched.executor.confirm-fence]
+                // merged_bug_145: the confirm-exit fence's READ half —
+                // the kernel law's ScreenRead obligation (DeliverNew
+                // on the keyed lane; the `if let Keyed` IS that
+                // conjunction). A fenced token already received its
+                // exit-0 license — the pod is gone (or exiting);
+                // minting would open an attempt no sweep can see.
+                // Screen to Gone (terminal for any straggler loop),
+                // licensed by the witness the read returned.
+                // Fail-closed on a read error: refusing a mint costs
+                // one NotYetReady retry; a false mint costs an
+                // invisible open attempt — and the mint transaction
+                // needs PG anyway.
                 if let FenceLane::Keyed(hash) = fence_lane {
                     match self.db.confirm_fence_exists(hash).await {
-                        Ok(true) => {
+                        Ok(Some(witness)) => {
                             info!(intent_id = %intent_id,
                                   "DeliverNew screened to Gone: executor token is confirm-fenced");
-                            return Ok(PullOutcome::Gone);
+                            return Ok(PullOutcome::Gone(GoneLicense::Fenced(witness)));
                         }
-                        Ok(false) => {}
+                        Ok(None) => {}
                         Err(e) => {
                             warn!(intent_id = %intent_id, error = %e,
                                   "confirm fence read failed; withholding the mint");

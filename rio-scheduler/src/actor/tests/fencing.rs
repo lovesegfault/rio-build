@@ -166,3 +166,137 @@ async fn live_leader_evidence_writes_are_never_fenced() -> TestResult {
     );
     Ok(())
 }
+
+// ── The confirm-exit fence, totalized over EVERY keyed licensing
+//    answer (merged_bug_011) ──────────────────────────────────────────
+
+use crate::actor::pull::{PullOutcome, PullRejection};
+
+/// One keyed build-lane `PullAssignment` (the merged_bug_145 tag
+/// convention: one production pod = one token = one tag).
+async fn keyed_pull(
+    handle: &ActorHandle,
+    intent_id: &str,
+    pod: &str,
+) -> Result<PullOutcome, PullRejection> {
+    handle
+        .query_unchecked(|reply| ActorCommand::PullAssignment {
+            intent_id: intent_id.into(),
+            auth_intent: Some(intent_id.into()),
+            kind: rio_evidence_kernel::pull::PullKind::Build,
+            executor_instance: None,
+            resume_exec_id: None,
+            claim_nonce: None,
+            confirm_only: false,
+            executor_token_sha256: Some(format!("tokhash-{pod}-{intent_id}")),
+            reply,
+        })
+        .await
+        .expect("actor alive")
+}
+
+// r[verify sched.executor.confirm-fence]
+// r[verify sched.executor.pull-gone+1]
+/// merged_bug_011 red 1: the LIVE-loop `Gone` (confirm_only=false) is
+/// the builder's exit-0 license exactly like the confirm `Gone` — the
+/// fence row must be durable BEFORE the answer. Pre-fix the write-ahead
+/// fired only on `confirm_only`, so the live Gone licensed exit 0 with
+/// no row and left the token unfenced.
+///
+/// World built through production constructors only (Q1): intent
+/// merged via MergeDag, terminal state via CancelBuild, the answer via
+/// the real pull path — no hand-seeded fence rows.
+#[tokio::test]
+async fn live_gone_writes_the_fence_before_answering() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let build = Uuid::new_v4();
+    let _ev =
+        merge_single_node(&handle, build, "fence-live-gone", PriorityClass::Scheduled).await?;
+    cancel_build(&handle, build).await?;
+
+    // The pod's first (and only) live pull: the drv is terminal — Gone.
+    let outcome = keyed_pull(&handle, "fence-live-gone", "pod-straggler").await;
+    assert!(
+        matches!(outcome, Ok(PullOutcome::Gone(_))),
+        "terminal drv answers the live pull Gone, got {outcome:?}"
+    );
+
+    // The exit-0 license must be on disk before that answer.
+    let fenced: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM executor_confirm_fences WHERE executor_token_sha256 = $1",
+    )
+    .bind("tokhash-pod-straggler-fence-live-gone")
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        fenced, 1,
+        "a keyed live-loop Gone must write the confirm fence before answering \
+         (pre-fix: only confirm_only Gone fenced; the live Gone licensed exit 0 row-free)"
+    );
+    Ok(())
+}
+
+// r[verify sched.executor.confirm-fence]
+/// merged_bug_011 red 2: the straggler chain. The token's live pull is
+/// answered Gone (pod exits 0, Job goes Succeeded); a resubmit
+/// re-readies the content-addressed drv (`intent_id == drv_hash`
+/// outlives the pod, and so does the claims token); the SAME token's
+/// straggler pull then admits `Ready ⇒ DeliverNew` — pre-fix the fence
+/// read finds nothing and `mint_and_deliver` opens an attempt no sweep
+/// can see (charged later as "unreported executor crash"); post-fix
+/// the screen finds the live-Gone fence and answers Gone.
+#[tokio::test]
+async fn straggler_after_live_gone_is_screened() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let build_a = Uuid::new_v4();
+    let _ev = merge_single_node(
+        &handle,
+        build_a,
+        "fence-straggler",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    cancel_build(&handle, build_a).await?;
+
+    // The pod's live pull is answered Gone — its exit-0 license.
+    let gone = keyed_pull(&handle, "fence-straggler", "pod-s").await;
+    assert!(
+        matches!(gone, Ok(PullOutcome::Gone(_))),
+        "terminal drv answers Gone, got {gone:?}"
+    );
+
+    // A resubmit re-readies the same drv under a new build (the
+    // resubmit-retry reset path).
+    let build_b = Uuid::new_v4();
+    let _ev = merge_single_node(
+        &handle,
+        build_b,
+        "fence-straggler",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+
+    // The straggler: the SAME token re-pulls (retry still in flight /
+    // re-sent). It must be screened to Gone — its exit was declared.
+    let straggler = keyed_pull(&handle, "fence-straggler", "pod-s").await;
+    assert!(
+        matches!(straggler, Ok(PullOutcome::Gone(_))),
+        "the fenced token's straggler pull must be screened to Gone, not minted, \
+         got {straggler:?}"
+    );
+
+    // And nothing was minted for it: zero open attempts.
+    let assignments: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM assignments a \
+         JOIN derivations d ON d.derivation_id = a.derivation_id \
+         WHERE d.drv_hash = 'fence-straggler'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        assignments, 0,
+        "the screened straggler must not open an attempt (pre-fix: DeliverNew minted \
+         against the re-readied drv — the invisible orphan)"
+    );
+    Ok(())
+}
