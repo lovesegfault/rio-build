@@ -98,6 +98,15 @@ pub fn describe_metrics() {
          error surfaced to the client (I-168)."
     );
     describe_counter!(
+        "rio_gateway_build_resync_rate_paced_total",
+        "Resync-signalled WatchBuild re-attaches paced by the wall-clock cycle-rate \
+         window (bug_160): the consecutive-streak bound stayed at zero because \
+         organic events kept arriving, but the cycle RATE exceeded RATE_MAX per \
+         window -- a durably-slow event consumer (or undersized broadcast buffer) \
+         was charging the scheduler one O(DAG) snapshot per cycle. Sustained \
+         growth means find the slow consumer, not the scheduler outage."
+    );
+    describe_counter!(
         "rio_gateway_log_tail_reconnects_total",
         "Build-log TailLog subscriptions re-opened against rio-store (labeled by \
          reason: open_failed = the TailLog RPC itself was rejected, the live \

@@ -60,6 +60,7 @@
     "rio_controller_spot_interrupt_dropped_total",
     "rio_controller_wedge_systemic_suppressed_total",
     "rio_gateway_auth_degraded_total",
+    "rio_gateway_build_resync_rate_paced_total",
     "rio_gateway_bytes_total",
     "rio_gateway_channels_active",
     "rio_gateway_connections_active",
@@ -537,6 +538,11 @@
         "name": "rio_gateway_auth_degraded_total",
         "kind": "counter",
         "help": "SSH auth accepted but tenant identity degraded to single-tenant mode (labeled by reason: interior_whitespace = authorized_keys comment has a space where a dash was intended; invalid_utf8 = comment bytes are not valid UTF-8 — rewrite the comment as plain UTF-8)"
+      },
+      {
+        "name": "rio_gateway_build_resync_rate_paced_total",
+        "kind": "counter",
+        "help": "Resync-signalled WatchBuild re-attaches paced by the wall-clock cycle-rate window (bug_160): the consecutive-streak bound stayed at zero because organic events kept arriving, but the cycle RATE exceeded RATE_MAX per window -- a durably-slow event consumer (or undersized broadcast buffer) was charging the scheduler one O(DAG) snapshot per cycle. Sustained growth means find the slow consumer, not the scheduler outage."
       },
       {
         "name": "rio_gateway_bytes_total",

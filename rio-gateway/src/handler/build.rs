@@ -1161,6 +1161,24 @@ enum EventSource {
     NeedsReattach,
 }
 
+/// Why (and whether) the next resync-signalled re-attach is paced —
+/// the two bounding axes of [`ReattachBudget`], typed so the call
+/// site handles each explicitly (bug_160).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResyncPacing {
+    /// Inside both bounds: re-attach immediately (the lagging-but-
+    /// healthy scheduler stays invisible to the client).
+    Immediate,
+    /// The consecutive non-organic streak exceeded
+    /// [`ReattachBudget::ZERO_BACKOFF_STREAK`] (merged_bug_056).
+    StreakPaced(std::time::Duration),
+    /// The wall-clock cycle rate exceeded
+    /// [`ReattachBudget::RATE_MAX`] per window (bug_160): organic
+    /// progress kept resetting the streak, but the rate says the
+    /// loop is churning O(DAG) snapshots.
+    RatePaced(std::time::Duration),
+}
+
 /// Bounds consecutive re-attach cycles, resetting only on organic
 /// build events or on evidenced recovery.
 ///
@@ -1183,6 +1201,10 @@ enum EventSource {
 /// Storms never accrue tenure — they cycle death→snapshot in
 /// seconds — so the storm bound above is preserved.
 // r[impl gw.resync.reattach-budget+2]
+// (bug_160: the budget is TWO-AXIS — the consecutive streak above,
+// and a wall-clock cycle-rate window organic events cannot reset.
+// The rule's prose reword rides the S8b narration slot per the
+// campaign's cross-slot row; the code axis lands here.)
 #[derive(Default)]
 struct ReattachBudget {
     /// Consecutive re-attach cycles since the last organic event or
@@ -1194,6 +1216,16 @@ struct ReattachBudget {
     /// [`Self::LIVE_TENURE_RESET`] proves the previous outage ended,
     /// so its charges do not bleed into the new one.
     live_since: Option<std::time::Instant>,
+    /// bug_160: re-attach cycle timestamps inside
+    /// [`Self::RATE_WINDOW`]. The streak axis (`attempts`) resets on
+    /// organic progress — correct for "is the scheduler serving us",
+    /// wrong as the ONLY bound: a durably-slow consumer of a chatty
+    /// build interleaves resync→snapshot→organic forever, riding
+    /// zero backoff while charging the scheduler one O(DAG) snapshot
+    /// per cycle. Timestamps have no reset API — `note_event` cannot
+    /// touch them; only the window's passage evicts — so the rate
+    /// axis survives exactly the interleave that defeats the streak.
+    recent: std::collections::VecDeque<std::time::Instant>,
 }
 
 impl ReattachBudget {
@@ -1250,6 +1282,15 @@ impl ReattachBudget {
         }
     }
 
+    /// Test hook: age every recorded cycle timestamp by `by` (drives
+    /// the rate window's eviction without real sleeps).
+    #[cfg(test)]
+    fn backdate_recent_for_test(&mut self, by: std::time::Duration) {
+        for t in &mut self.recent {
+            *t = t.checked_sub(by).expect("backdated Instant underflow");
+        }
+    }
+
     /// Charge one re-attach cycle (stream death, loss signal, or a
     /// failed `WatchBuild`/snapshot read). Returns the cycle number
     /// for logging.
@@ -1262,6 +1303,15 @@ impl ReattachBudget {
     /// potential reset: repeated failures inside `NeedsReattach`
     /// keep charging the same outage.
     fn note_reattach(&mut self) -> u32 {
+        let now = std::time::Instant::now();
+        while self
+            .recent
+            .front()
+            .is_some_and(|t| now.duration_since(*t) >= Self::RATE_WINDOW)
+        {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(now);
         if let Some(since) = self.live_since.take()
             && since.elapsed() >= Self::LIVE_TENURE_RESET
         {
@@ -1277,15 +1327,34 @@ impl ReattachBudget {
         self.attempts > MAX_RECONNECT
     }
 
-    /// Backoff before the next zero-backoff-eligible (resync-signalled)
-    /// re-attach: `None` (immediate) within the zero-backoff streak,
-    /// the standard ladder past it.
-    fn resync_backoff(&self) -> Option<std::time::Duration> {
-        if self.attempts <= Self::ZERO_BACKOFF_STREAK {
-            None
-        } else {
-            Some(RECONNECT_BACKOFF.duration(self.attempts - 1))
+    /// Wall-clock rate window for the second pacing axis (bug_160).
+    /// Sized to the ladder: RATE_MAX zero-backoff cycles per minute
+    /// is already one O(DAG) snapshot every ~10 s sustained — past
+    /// that the loop is churning, organic progress or not.
+    const RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Re-attach cycles per [`Self::RATE_WINDOW`] before the ladder
+    /// engages regardless of the consecutive streak.
+    const RATE_MAX: usize = 6;
+
+    /// Pacing decision for the next resync-signalled re-attach
+    /// (typed so the call site cannot collapse the two axes — the
+    /// rate axis owes the operator a warn + counter the streak axis
+    /// does not).
+    fn resync_pacing(&self) -> ResyncPacing {
+        if self.attempts > Self::ZERO_BACKOFF_STREAK {
+            return ResyncPacing::StreakPaced(RECONNECT_BACKOFF.duration(self.attempts - 1));
         }
+        let excess = self.recent.len().saturating_sub(Self::RATE_MAX);
+        if excess > 0 {
+            // The ladder climbs with the in-window excess: 1s, 2s,
+            // 4s, ... capped at 16s — each paced cycle still counts
+            // into the window, so a persistent interleave settles at
+            // the cap (~4 snapshots/min) instead of zero backoff.
+            let rung = u32::try_from(excess - 1).unwrap_or(u32::MAX);
+            return ResyncPacing::RatePaced(RECONNECT_BACKOFF.duration(rung));
+        }
+        ResyncPacing::Immediate
     }
 
     /// Backoff before the next failure-path re-attach (transport
@@ -1576,20 +1645,39 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                             // bounds the storm: snapshot + resync cycling
                             // forever now burns through MAX_RECONNECT
                             // instead of refreshing it.
-                            match budget.resync_backoff() {
-                                None => {
+                            match budget.resync_pacing() {
+                                ResyncPacing::Immediate => {
                                     tracing::debug!(
                                         %build_id,
                                         attempt,
                                         "scheduler signalled event loss (broadcast lag); resyncing via WatchBuild snapshot"
                                     );
                                 }
-                                Some(backoff) => {
+                                ResyncPacing::StreakPaced(backoff) => {
                                     tracing::warn!(
                                         %build_id,
                                         attempt,
                                         backoff_secs = backoff.as_secs(),
                                         "scheduler resync-signal streak with no organic events; pacing re-attach"
+                                    );
+                                    tokio::time::sleep(backoff).await;
+                                }
+                                ResyncPacing::RatePaced(backoff) => {
+                                    // bug_160: the interleaved storm —
+                                    // organic progress kept the streak
+                                    // at zero while the cycle RATE
+                                    // charged the scheduler one O(DAG)
+                                    // snapshot per loop. Operator
+                                    // signal: this is a slow CONSUMER
+                                    // (or an undersized broadcast
+                                    // buffer), not a scheduler outage.
+                                    metrics::counter!("rio_gateway_build_resync_rate_paced_total")
+                                        .increment(1);
+                                    tracing::warn!(
+                                        %build_id,
+                                        attempt,
+                                        backoff_secs = backoff.as_secs(),
+                                        "resync cycle rate exceeded the window bound despite organic progress; pacing re-attach"
                                     );
                                     tokio::time::sleep(backoff).await;
                                 }
@@ -3692,6 +3780,60 @@ mod tests {
         );
     }
 
+    // r[verify gw.resync.reattach-budget+2]
+    /// RED (bug_160): both resync bounds key on CONSECUTIVE
+    /// non-organic cycles — a durably-slow consumer of a CHATTY build
+    /// interleaves resync→snapshot→organic forever (organic progress
+    /// zeroes the streak every cycle), looping resync at zero backoff
+    /// while charging the scheduler one O(DAG) snapshot per cycle.
+    /// The wall-clock rate window is the axis the interleave cannot
+    /// reset: past RATE_MAX cycles per window, the ladder engages.
+    #[test]
+    fn interleaved_resync_storm_engages_the_ladder() {
+        use types::build_event::Event;
+        let mut budget = super::ReattachBudget::default();
+        let mut paced = false;
+        for _cycle in 0..12 {
+            budget.note_live_entered();
+            budget.note_reattach();
+            if let super::ResyncPacing::RatePaced(_) = budget.resync_pacing() {
+                paced = true;
+                break;
+            }
+            // The chatty build delivers an organic event inside the
+            // same cycle — the streak axis resets to zero.
+            budget.note_event(&Event::Progress(types::BuildProgress::default()));
+        }
+        assert!(
+            paced,
+            "12 resync cycles inside one rate window must engage the ladder \
+             even though organic events reset the consecutive streak"
+        );
+    }
+
+    // r[verify gw.resync.reattach-budget+2]
+    /// The rate axis' negative space (the sweep over both bounds): a
+    /// SLOW interleave — cycles spread wider than the window — never
+    /// engages the rate ladder, however many total cycles accrue. An
+    /// hour-long chatty build that genuinely reconnects once every
+    /// few minutes stays at zero backoff; only sustained churn pays.
+    #[test]
+    fn slow_interleave_outside_the_window_never_rate_paces() {
+        use types::build_event::Event;
+        let mut budget = super::ReattachBudget::default();
+        for _cycle in 0..40 {
+            budget.note_reattach();
+            assert_eq!(
+                budget.resync_pacing(),
+                super::ResyncPacing::Immediate,
+                "a cycle rate below RATE_MAX per window must stay immediate"
+            );
+            budget.note_event(&Event::Progress(types::BuildProgress::default()));
+            // The next cycle arrives after the window has rolled.
+            budget.backdate_recent_for_test(super::ReattachBudget::RATE_WINDOW);
+        }
+    }
+
     // r[verify gw.resync.loss-signal+1]
     /// The resync ladder: zero backoff within ZERO_BACKOFF_STREAK
     /// consecutive non-organic cycles, the standard ladder past it.
@@ -3701,12 +3843,16 @@ mod tests {
         let mut budget = super::ReattachBudget::default();
         for _ in 0..super::ReattachBudget::ZERO_BACKOFF_STREAK {
             budget.note_reattach();
-            assert_eq!(budget.resync_backoff(), None, "within streak: immediate");
+            assert_eq!(
+                budget.resync_pacing(),
+                super::ResyncPacing::Immediate,
+                "within streak: immediate"
+            );
         }
         budget.note_reattach(); // 4th
         assert_eq!(
-            budget.resync_backoff(),
-            Some(std::time::Duration::from_secs(8)),
+            budget.resync_pacing(),
+            super::ResyncPacing::StreakPaced(std::time::Duration::from_secs(8)),
             "4th cycle joins the ladder at its own rung (2^3)"
         );
         assert_eq!(
@@ -3714,11 +3860,14 @@ mod tests {
             std::time::Duration::from_secs(8),
             "failure path paces at the same rung"
         );
-        // An organic receipt restores zero-backoff resyncs.
+        // An organic receipt restores zero-backoff resyncs (the
+        // 5-cycle total stays inside the rate window's RATE_MAX, so
+        // the second axis stays quiet here — the interleave test
+        // covers its engagement).
         budget.note_event(&types::build_event::Event::Progress(
             types::BuildProgress::default(),
         ));
         budget.note_reattach();
-        assert_eq!(budget.resync_backoff(), None);
+        assert_eq!(budget.resync_pacing(), super::ResyncPacing::Immediate);
     }
 }
