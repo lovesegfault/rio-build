@@ -627,8 +627,15 @@ fn retention_corpus(root: &Path) -> Result<Vec<(std::path::PathBuf, String)>> {
         if !dir.exists() {
             continue;
         }
+        // merged_bug_086 arm 2: parent-cfg(test)-gated files are test
+        // code regardless of their name — the mod graph decides.
+        let gated = cfg_test_gated_files(&dir)?;
         walk_rs(&dir, &mut |path| {
             if path.components().any(|c| c.as_os_str() == "tests") {
+                return Ok(());
+            }
+            if gated.contains(path) {
+                skipped += 1;
                 return Ok(());
             }
             files += 1;
@@ -867,11 +874,156 @@ fn expr_attrs(e: &syn::Expr) -> Option<&[syn::Attribute]> {
     })
 }
 
+/// Files whose `mod` declaration chain passes through a
+/// cfg-test-gated declaration (merged_bug_086 arm 2: the old
+/// exclusion was the `tests.rs`/`*_tests.rs` NAMING convention, so
+/// parent-gated files like `test_helpers.rs`, `fixtures.rs`,
+/// `actor/debug.rs`, `gc/mark_scan_bench.rs` entered the corpus whole
+/// as fail-open deletion-evidence channels — from inside such a file
+/// the gate in the parent is invisible). The mod GRAPH, not the
+/// filename, decides: every file's `mod x;` declarations are
+/// syn-parsed (including declarations nested in inline mods, with
+/// gating inherited from enclosing inline mods), resolved per Rust
+/// 2018 module layout (`dir/x.rs` | `dir/x/mod.rs`, `#[path]`
+/// honored), and a file is gated iff EVERY declaration edge reaching
+/// it is gated (transitively). Undeclared files keep today's
+/// behavior: scanned.
+fn cfg_test_gated_files(src_dir: &Path) -> Result<std::collections::HashSet<std::path::PathBuf>> {
+    use std::collections::{HashMap, HashSet};
+    // child file -> [(edge_gated, declaring file)]
+    let mut edges: HashMap<std::path::PathBuf, Vec<(bool, std::path::PathBuf)>> = HashMap::new();
+    let mut all_files: Vec<std::path::PathBuf> = Vec::new();
+    walk_rs(src_dir, &mut |path| {
+        all_files.push(path.to_owned());
+        Ok(())
+    })?;
+    for path in &all_files {
+        let raw =
+            fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let Ok(file) = syn::parse_file(&raw) else {
+            continue; // unparseable files cannot contribute edges
+        };
+        // Effective child dir: mod.rs/lib.rs/main.rs resolve siblings
+        // in their own dir; any other file resolves in dir/<stem>/.
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let dir = path.parent().unwrap_or(src_dir).to_owned();
+        let eff_dir = if matches!(name, "mod.rs" | "lib.rs" | "main.rs") {
+            dir.clone()
+        } else {
+            dir.join(path.file_stem().and_then(|s| s.to_str()).unwrap_or(""))
+        };
+        fn collect(
+            items: &[syn::Item],
+            gated_ancestor: bool,
+            eff_dir: &Path,
+            file_dir: &Path,
+            declaring: &Path,
+            edges: &mut std::collections::HashMap<
+                std::path::PathBuf,
+                Vec<(bool, std::path::PathBuf)>,
+            >,
+        ) {
+            for item in items {
+                let syn::Item::Mod(m) = item else { continue };
+                let gated = gated_ancestor || is_cfg_test_attrs(&m.attrs);
+                match &m.content {
+                    Some((_, inner)) => {
+                        // inline mod: nested declarations resolve under
+                        // eff_dir/<mod name>/
+                        collect(
+                            inner,
+                            gated,
+                            &eff_dir.join(m.ident.to_string()),
+                            file_dir,
+                            declaring,
+                            edges,
+                        );
+                    }
+                    None => {
+                        // `mod x;` — #[path] overrides, relative to the
+                        // declaring file's directory.
+                        let path_attr = m.attrs.iter().find_map(|a| {
+                            if !a.path().is_ident("path") {
+                                return None;
+                            }
+                            match &a.meta {
+                                syn::Meta::NameValue(nv) => match &nv.value {
+                                    syn::Expr::Lit(syn::ExprLit {
+                                        lit: syn::Lit::Str(s),
+                                        ..
+                                    }) => Some(s.value()),
+                                    _ => None,
+                                },
+                                _ => None,
+                            }
+                        });
+                        let candidates: Vec<std::path::PathBuf> = if let Some(p) = path_attr {
+                            vec![file_dir.join(p)]
+                        } else {
+                            let n = m.ident.to_string();
+                            vec![
+                                eff_dir.join(format!("{n}.rs")),
+                                eff_dir.join(&n).join("mod.rs"),
+                            ]
+                        };
+                        for c in candidates {
+                            if c.exists() {
+                                edges
+                                    .entry(c)
+                                    .or_default()
+                                    .push((gated, declaring.to_owned()));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        collect(&file.items, false, &eff_dir, &dir, path, &mut edges);
+    }
+    // A file is gated iff it has >=1 edge and EVERY edge is gated OR
+    // leads from a gated declaring file (transitive; cycles resolve
+    // un-gated — conservative toward scanning).
+    fn gated(
+        f: &Path,
+        edges: &std::collections::HashMap<std::path::PathBuf, Vec<(bool, std::path::PathBuf)>>,
+        memo: &mut std::collections::HashMap<std::path::PathBuf, bool>,
+        visiting: &mut HashSet<std::path::PathBuf>,
+    ) -> bool {
+        if let Some(&g) = memo.get(f) {
+            return g;
+        }
+        if !visiting.insert(f.to_owned()) {
+            return false;
+        }
+        let g = match edges.get(f) {
+            None => false,
+            Some(es) => {
+                !es.is_empty()
+                    && es
+                        .iter()
+                        .all(|(eg, parent)| *eg || gated(parent, edges, memo, visiting))
+            }
+        };
+        visiting.remove(f);
+        memo.insert(f.to_owned(), g);
+        g
+    }
+    let mut memo = HashMap::new();
+    let mut out = HashSet::new();
+    for f in &all_files {
+        if gated(f, &edges, &mut memo, &mut HashSet::new()) {
+            out.insert(f.clone());
+        }
+    }
+    Ok(out)
+}
+
 fn is_cfg_test_attrs(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|a| {
         a.path().is_ident("cfg")
             && a.parse_args::<proc_macro2::TokenStream>()
-                .map(tokens_mention_test_ident)
+                .map(cfg_pred_gates_test)
                 .unwrap_or(false)
     })
 }
@@ -880,36 +1032,75 @@ fn is_cfg_test_attrs(attrs: &[syn::Attribute]) -> bool {
 /// bodies are covered) — doc text is commentary, never production
 /// deletion evidence.
 fn strip_doc_attrs(ts: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+    let tts: Vec<proc_macro2::TokenTree> = ts.into_iter().collect();
     let mut out: Vec<proc_macro2::TokenTree> = Vec::new();
-    let mut iter = ts.into_iter().peekable();
-    while let Some(tt) = iter.next() {
-        if let proc_macro2::TokenTree::Punct(p) = &tt
+    let mut i = 0;
+    while i < tts.len() {
+        if let proc_macro2::TokenTree::Punct(p) = &tts[i]
             && p.as_char() == '#'
-            && let Some(proc_macro2::TokenTree::Group(g)) = iter.peek()
-            && g.delimiter() == proc_macro2::Delimiter::Bracket
-            && matches!(
-                g.stream().into_iter().next(),
-                Some(proc_macro2::TokenTree::Ident(id)) if id == "doc"
-            )
         {
-            iter.next(); // drop the [doc = …] group with its `#`
-            continue;
+            // merged_bug_086 arm 3: inner attributes are `#![doc = …]`
+            // — peek past the optional `!` so `//!` module prose is
+            // stripped exactly like `///` item prose.
+            let mut j = i + 1;
+            if let Some(proc_macro2::TokenTree::Punct(q)) = tts.get(j)
+                && q.as_char() == '!'
+            {
+                j += 1;
+            }
+            if let Some(proc_macro2::TokenTree::Group(g)) = tts.get(j)
+                && g.delimiter() == proc_macro2::Delimiter::Bracket
+                && matches!(
+                    g.stream().into_iter().next(),
+                    Some(proc_macro2::TokenTree::Ident(id)) if id == "doc"
+                )
+            {
+                i = j + 1; // drop `#`, the optional `!`, and the [doc = …] group
+                continue;
+            }
         }
-        out.push(match tt {
+        out.push(match tts[i].clone() {
             proc_macro2::TokenTree::Group(g) => proc_macro2::TokenTree::Group(
                 proc_macro2::Group::new(g.delimiter(), strip_doc_attrs(g.stream())),
             ),
             other => other,
         });
+        i += 1;
     }
     out.into_iter().collect()
 }
 
-fn tokens_mention_test_ident(ts: proc_macro2::TokenStream) -> bool {
-    ts.into_iter().any(|tt| match tt {
-        proc_macro2::TokenTree::Ident(id) => id == "test",
-        proc_macro2::TokenTree::Group(g) => tokens_mention_test_ident(g.stream()),
-        _ => false,
+/// Evaluate a `cfg(...)` predicate for test-gating by its HEAD, not by
+/// token mention (merged_bug_086 arm 1: blind recursion classified
+/// `#[cfg(not(test))]` — production-ONLY code — as test-gated and
+/// pruned the live reap at gc/collect.rs from the corpus). Elements at
+/// one level are comma-separated; per element: a bare `test` ident
+/// gates; `not(..)` NEVER gates (its body compiles in production);
+/// `any(..)`/`all(..)` gate iff any inner element gates (recursing
+/// with the same head rules — `all(not(test), x)` is kept);
+/// `feature = "..."` and every other key never gate.
+fn cfg_pred_gates_test(ts: proc_macro2::TokenStream) -> bool {
+    let mut elems: Vec<Vec<proc_macro2::TokenTree>> = vec![Vec::new()];
+    for tt in ts {
+        if matches!(&tt, proc_macro2::TokenTree::Punct(p) if p.as_char() == ',') {
+            elems.push(Vec::new());
+        } else {
+            elems.last_mut().expect("non-empty").push(tt);
+        }
+    }
+    elems.into_iter().any(|e| {
+        let mut it = e.into_iter();
+        match it.next() {
+            Some(proc_macro2::TokenTree::Ident(id)) if id == "test" => true,
+            Some(proc_macro2::TokenTree::Ident(id)) if id == "not" => false,
+            Some(proc_macro2::TokenTree::Ident(id)) if id == "any" || id == "all" => {
+                match it.next() {
+                    Some(proc_macro2::TokenTree::Group(g)) => cfg_pred_gates_test(g.stream()),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
     })
 }
 
@@ -1114,6 +1305,96 @@ fn walk_rs(dir: &Path, f: &mut impl FnMut(&Path) -> Result<()>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// merged_bug_086 arm 1: `#[cfg(not(test))]` is PRODUCTION-only
+    /// code — the corpus must keep it (item- and statement-level),
+    /// while `#[cfg(test)]` / `#[cfg(any(test, …))]` still prune and
+    /// `#[cfg(all(not(test), …))]` is kept (production under the same
+    /// builds the sweeper runs in).
+    #[test]
+    fn cfg_not_test_survives_the_prune() {
+        let src = r##"
+            #[cfg(not(test))]
+            pub fn reap() { q("DELETE FROM widgets WHERE old"); }
+            pub fn body() {
+                #[cfg(not(test))]
+                let _x = q("DELETE FROM gizmos WHERE old");
+            }
+            #[cfg(test)]
+            mod t { pub fn f() { q("DELETE FROM hidden_t WHERE 1=1"); } }
+            #[cfg(any(test, feature = "test-utils"))]
+            pub fn g() { q("DELETE FROM hidden_any WHERE 1=1"); }
+            #[cfg(all(not(test), feature = "server"))]
+            pub fn h() { q("DELETE FROM kept_all WHERE 1=1"); }
+        "##;
+        let norm = corpus_text(std::path::Path::new("x.rs"), src)
+            .unwrap()
+            .unwrap();
+        assert!(contains_stmt(&norm, "DELETE FROM", "widgets"), "{norm}");
+        assert!(contains_stmt(&norm, "DELETE FROM", "gizmos"), "{norm}");
+        assert!(contains_stmt(&norm, "DELETE FROM", "kept_all"), "{norm}");
+        assert!(!contains_stmt(&norm, "DELETE FROM", "hidden_t"), "{norm}");
+        assert!(!contains_stmt(&norm, "DELETE FROM", "hidden_any"), "{norm}");
+    }
+
+    /// merged_bug_086 arm 3: inner `#![doc]` (`//!` prose) is
+    /// commentary, never production deletion evidence.
+    #[test]
+    fn inner_doc_attrs_are_stripped() {
+        let src = "pub mod m { //! DELETE FROM doc_table\n pub fn f() {} }";
+        let norm = corpus_text(std::path::Path::new("x.rs"), src)
+            .unwrap()
+            .unwrap();
+        assert!(!contains_stmt(&norm, "DELETE FROM", "doc_table"), "{norm}");
+    }
+
+    /// merged_bug_086 arm 2: a file included via a `#[cfg(test)] mod`
+    /// declaration (any gating shape, transitively) is test code even
+    /// though nothing inside the file says so — the mod graph, not the
+    /// filename, decides.
+    #[test]
+    fn parent_gated_mod_files_are_excluded() {
+        let td = tempfile::tempdir().unwrap();
+        let src = td.path();
+        std::fs::write(
+            src.join("lib.rs"),
+            "#[cfg(test)]\nmod helpers;\n#[cfg(any(test, feature = \"test-utils\"))]\npub mod fixtures;\nmod live;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("helpers.rs"),
+            "pub fn f() { q(\"DELETE FROM h1\"); }",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("fixtures.rs"),
+            "pub fn f() { q(\"DELETE FROM h2\"); }",
+        )
+        .unwrap();
+        std::fs::create_dir(src.join("live")).unwrap();
+        std::fs::write(
+            src.join("live").join("mod.rs"),
+            "#[cfg(test)]\nmod bench;\nmod real;\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("live").join("bench.rs"), "pub fn f() {}").unwrap();
+        std::fs::write(src.join("live").join("real.rs"), "pub fn f() {}").unwrap();
+        let gated = cfg_test_gated_files(src).unwrap();
+        assert!(gated.contains(&src.join("helpers.rs")), "{gated:?}");
+        assert!(gated.contains(&src.join("fixtures.rs")), "{gated:?}");
+        assert!(
+            gated.contains(&src.join("live").join("bench.rs")),
+            "{gated:?}"
+        );
+        assert!(
+            !gated.contains(&src.join("live").join("real.rs")),
+            "{gated:?}"
+        );
+        assert!(
+            !gated.contains(&src.join("live").join("mod.rs")),
+            "{gated:?}"
+        );
+    }
 
     /// The normalizer collapses Rust string-literal line continuations
     /// and whitespace runs — a table name split across a continuation
