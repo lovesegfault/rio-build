@@ -400,7 +400,8 @@ fn respawn_backoff(deaths: u32) -> std::time::Duration {
 /// bug_028 futility breaker: `respawn` records (one per (pool,
 /// intent) with at least one VERDICT-FREE Job death --- a terminal
 /// Job reaped for a still-wanted intent with no acked synthesized
-/// report) gate re-spawn behind [`respawn_backoff`]. Reset alphabet:
+/// report) gate re-spawn behind the `respawn_backoff` schedule.
+/// Reset alphabet:
 /// [`SpawnResolution`] (closed) + the orphan expiry; the per-cell
 /// retain law lives in [`Self::step`].
 #[derive(Debug, Default)]
