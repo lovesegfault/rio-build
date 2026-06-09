@@ -275,7 +275,7 @@ pub(super) fn orphan_reap_grace() -> Duration {
 /// pod-template annotation `build_job` stamps (the same value the pod
 /// reads via downward API as `RIO_INTENT_ID`). `None` for Jobs created
 /// before the annotation existed or outside the spawn path.
-fn job_intent_id(j: &Job) -> Option<&str> {
+pub(super) fn job_intent_id(j: &Job) -> Option<&str> {
     j.spec
         .as_ref()?
         .template
@@ -434,6 +434,7 @@ pub(super) fn select_excess_pending<'a>(
 /// at deletion instead of waiting for the establishment sweep.
 ///
 /// Returns the count actually deleted (for the reconcile summary log).
+#[allow(clippy::too_many_arguments)] // the build_job precedent: reconcile plumbing, not an API
 pub(super) async fn reap_excess_pending(
     jobs_api: &Api<Job>,
     pods_api: &Api<Pod>,
@@ -442,6 +443,7 @@ pub(super) async fn reap_excess_pending(
     queued: Option<u32>,
     ctx: &Ctx,
     pool: &str,
+    key: &super::candidate::PoolKey,
 ) -> u32 {
     let Some(queued) = queued else {
         debug!(
@@ -500,6 +502,7 @@ pub(super) async fn reap_excess_pending(
             &DeleteParams::foreground(),
             rio_proto::types::AttemptTerminalReason::Reaped,
             &open_attempts,
+            key,
         )
         .await
         {
@@ -742,6 +745,29 @@ pub(super) fn synthesized_report_for_intent(
     })
 }
 
+/// What the synthesize arm of [`delete_job_with_synthesized_report`]
+/// actually did — the closed verdict-presence alphabet the reap paths
+/// consume (bug_028 futility breaker: a terminal reap whose delete
+/// carried NO acked report is a VERDICT-FREE death; the same-named
+/// respawn would otherwise fire at reconcile cadence forever).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum SynthesizedDelete {
+    /// An open attempt covered the Job and the synthesized terminal
+    /// report was ACKED before the delete — the scheduler holds a
+    /// verdict for this intent.
+    ReportAcked {
+        /// The intent the acked verdict classified.
+        intent_id: String,
+    },
+    /// An open attempt covered the Job but the report RPC failed; the
+    /// establishment sweep is the fallback classifier — NO verdict
+    /// yet.
+    ReportFailed,
+    /// No open pull-mode attempt covered the Job — nothing was
+    /// synthesized (the never-pulled death shape); NO verdict.
+    NoOpenAttempt,
+}
+
 /// Delete one Job, synthesizing the terminal `ReportAttemptOutcome`
 /// first when (and only when) the Job still has an open pull-mode
 /// attempt. The deletion this performs destroys the only Job/pod
@@ -758,8 +784,15 @@ pub(super) fn synthesized_report_for_intent(
 /// never a lost or doubled charge, by the scheduler's idempotent-fill
 /// rule). The delete error is returned unchanged so call sites keep
 /// their existing Ok/NotFound/Err handling (the deleted-object body is
-/// dropped — no current call site reads it).
+/// dropped — no current call site reads it); the Ok payload reports
+/// what the synthesize arm did (see [`SynthesizedDelete`]).
+///
+/// An ACKED synthesized report is a named resolution for the bug_028
+/// futility breaker (`SpawnResolution::TerminalReport`): the record
+/// for `key` clears here, at the single chokepoint every controller
+/// Job-delete call site speaks through.
 // r[impl ctrl.job.synthesize-on-delete+2]
+#[allow(clippy::too_many_arguments)] // the build_job precedent: reconcile plumbing, not an API
 pub(super) async fn delete_job_with_synthesized_report(
     jobs_api: &Api<Job>,
     ctx: &Ctx,
@@ -768,11 +801,23 @@ pub(super) async fn delete_job_with_synthesized_report(
     params: &DeleteParams,
     reason: rio_proto::types::AttemptTerminalReason,
     open_attempts: &[rio_proto::types::OpenAttempt],
-) -> kube::Result<()> {
+    key: &super::candidate::PoolKey,
+) -> kube::Result<SynthesizedDelete> {
+    let mut synthesized = SynthesizedDelete::NoOpenAttempt;
     if let Some(request) = synthesized_report_for_job(job, reason, open_attempts) {
+        synthesized = SynthesizedDelete::ReportFailed;
         let exec_id = request.exec_id.clone();
+        let intent_id = request.intent_id.clone();
         match admin_call(ctx.admin.clone().report_attempt_outcome(request)).await {
             Ok(_) => {
+                synthesized = SynthesizedDelete::ReportAcked {
+                    intent_id: intent_id.clone(),
+                };
+                ctx.exhausted_streak.lock().note_resolution(
+                    key,
+                    &intent_id,
+                    super::candidate::SpawnResolution::TerminalReport,
+                );
                 info!(
                     job = %job_name, exec_id = %exec_id, reason = ?reason,
                     "synthesized ReportAttemptOutcome for open pull-mode attempt before Job deletion"
@@ -809,7 +854,7 @@ pub(super) async fn delete_job_with_synthesized_report(
             }
         }
     }
-    jobs_api.delete(job_name, params).await.map(|_| ())
+    jobs_api.delete(job_name, params).await.map(|_| synthesized)
 }
 
 /// Best-effort read of the open pull-mode attempt view for the
@@ -943,6 +988,7 @@ pub(super) async fn reap_orphan_running(
     reaped: &HashSet<String>,
     ctx: &Ctx,
     pool: &str,
+    key: &super::candidate::PoolKey,
 ) -> u32 {
     let grace = orphan_reap_grace();
     // Cheap pre-filter: any candidates at all? Avoids the RPC on the
@@ -1023,6 +1069,7 @@ pub(super) async fn reap_orphan_running(
             &DeleteParams::foreground(),
             rio_proto::types::AttemptTerminalReason::Reaped,
             &open_attempts,
+            key,
         )
         .await
         {
@@ -1186,6 +1233,7 @@ pub(super) async fn cancel_closed_attempt_jobs(
     jobs: &[Job],
     ctx: &Ctx,
     pool: &str,
+    key: &super::candidate::PoolKey,
 ) -> u32 {
     let active: Vec<&Job> = jobs
         .iter()
@@ -1212,6 +1260,25 @@ pub(super) async fn cancel_closed_attempt_jobs(
         }
     };
     let open_attempts = resp.attempts;
+    // bug_028 futility breaker reset lane: an open BUILD pull-mode
+    // attempt is the ledger's word that the pull ESTABLISHED — a
+    // named resolution for any verdict-free-respawn record this pool
+    // holds for the intent (a materialization claim is a store
+    // replica's attempt, not build progress, and never resets). This
+    // is the one per-tick view read the cancel arm already pays for;
+    // the noting is map-existing-only and cheap.
+    {
+        let mut streaks = ctx.exhausted_streak.lock();
+        for a in &open_attempts {
+            if MintedPullIdentity::of(a) == MintedPullIdentity::Build {
+                streaks.note_resolution(
+                    key,
+                    &a.intent_id,
+                    super::candidate::SpawnResolution::Established,
+                );
+            }
+        }
+    }
     let to_cancel: Vec<&Job> =
         select_closed_attempt_jobs(&active, &open_attempts, &resp.recently_closed);
     let mut cancelled = 0u32;
@@ -1225,6 +1292,7 @@ pub(super) async fn cancel_closed_attempt_jobs(
             &DeleteParams::foreground(),
             rio_proto::types::AttemptTerminalReason::Cancelled,
             &open_attempts,
+            key,
         )
         .await
         {
@@ -1739,7 +1807,12 @@ pub(super) fn first_terminal_report_sample(
 /// attempt's classification stays establishment-sweep-classified" —
 /// nothing depends on the fill for liveness. Never blocks the
 /// spawn/reap loop.
-pub(super) async fn report_terminated_pods(ctx: &Ctx, ns: &str, pool: &str) {
+pub(super) async fn report_terminated_pods(
+    ctx: &Ctx,
+    ns: &str,
+    pool: &str,
+    key: &super::candidate::PoolKey,
+) {
     // OA1 sample-gate hygiene: drop entries for objects that can no
     // longer be listed (past the TTL window) so the map stays bounded.
     ctx.terminal_report_sampled
@@ -1815,6 +1888,7 @@ pub(super) async fn report_terminated_pods(ctx: &Ctx, ns: &str, pool: &str) {
         // plus the pod's intent annotation and kube-authoritative node
         // (the AD2c attribution).
         let intent_id = report_intent_id_for_pod(pod);
+        let intent_id_for_breaker = intent_id.clone();
         let node_name = pod
             .spec
             .as_ref()
@@ -1840,6 +1914,15 @@ pub(super) async fn report_terminated_pods(ctx: &Ctx, ns: &str, pool: &str) {
         .await
         {
             Ok(_) => {
+                // bug_028 futility breaker reset lane: the acked
+                // pod-terminal classification fill is a verdict.
+                if !intent_id_for_breaker.is_empty() {
+                    ctx.exhausted_streak.lock().note_resolution(
+                        key,
+                        &intent_id_for_breaker,
+                        super::candidate::SpawnResolution::TerminalReport,
+                    );
+                }
                 // OA1 interval (i): Pod terminal-condition timestamp →
                 // report acked, sampled once per Pod OBJECT (the same
                 // Pod is re-reported every tick for the TTL window —
@@ -1909,7 +1992,11 @@ pub(super) fn job_deadline_exceeded(job: &Job) -> bool {
 /// effort: RPC error logged, reconcile continues. `JOB_TTL_SECS=600`
 /// keeps the Job observable for ~60 reconcile ticks.
 // r[impl ctrl.terminated.deadline-exceeded+3]
-pub(super) async fn report_deadline_exceeded_jobs(ctx: &Ctx, jobs: &[Job]) {
+pub(super) async fn report_deadline_exceeded_jobs(
+    ctx: &Ctx,
+    jobs: &[Job],
+    key: &super::candidate::PoolKey,
+) {
     let mut admin = ctx.admin.clone();
     for job in jobs {
         if !job_deadline_exceeded(job) {
@@ -1935,6 +2022,16 @@ pub(super) async fn report_deadline_exceeded_jobs(ctx: &Ctx, jobs: &[Job]) {
         .await
         {
             Ok(_) => {
+                // bug_028 futility breaker reset lane: the acked
+                // DeadlineExceeded fill is a verdict.
+                let intent_id = report_intent_id_for_job(job);
+                if !intent_id.is_empty() {
+                    ctx.exhausted_streak.lock().note_resolution(
+                        key,
+                        &intent_id,
+                        super::candidate::SpawnResolution::TerminalReport,
+                    );
+                }
                 // OA1 interval (i): the Job's Failed/DeadlineExceeded
                 // condition transition → report acked, sampled once
                 // per Job OBJECT (see `Ctx::terminal_report_sampled`;

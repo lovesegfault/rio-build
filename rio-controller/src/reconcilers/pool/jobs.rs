@@ -393,20 +393,22 @@ pub(super) async fn spawnable_nodes_for_pool(
 }
 
 /// Report one `NoEligibleSource` spawn-gate verdict per gated intent
-/// (instead of spawning an unschedulable Job). Returns how many reports
-/// were acked. Best-effort: an RPC error leaves the intent un-reported
-/// — it stays Ready scheduler-side and is re-evaluated next tick. A
-/// successfully acked report poisons the derivation scheduler-side
-/// (fleet-exhaust arm), so it leaves the intent stream and re-ticks
-/// send nothing further; a duplicate ack is a server-side no-op either
-/// way.
+/// (instead of spawning an unschedulable Job). Returns the ACKED
+/// intent ids (bug_028: the caller feeds them to the futility
+/// breaker's `NoEligibleSource` reset lane — an ack is a named
+/// resolution). Best-effort: an RPC error leaves the intent
+/// un-reported — it stays Ready scheduler-side and is re-evaluated
+/// next tick. A successfully acked report poisons the derivation
+/// scheduler-side (fleet-exhaust arm), so it leaves the intent stream
+/// and re-ticks send nothing further; a duplicate ack is a
+/// server-side no-op either way.
 // r[impl sched.dispatch.fleet-exhaust+5]
 pub(super) async fn report_no_eligible_source(
     ctx: &Ctx,
     pool: &str,
     gated: &[&SpawnIntent],
-) -> u32 {
-    let mut acked = 0u32;
+) -> Vec<String> {
+    let mut acked = Vec::new();
     for intent in gated {
         match admin_call(ctx.admin.clone().report_attempt_outcome(
             rio_proto::types::ReportAttemptOutcomeRequest {
@@ -431,7 +433,7 @@ pub(super) async fn report_no_eligible_source(
                     "every spawnable node is excluded for this intent; reported NoEligibleSource \
                      instead of spawning an unschedulable Job"
                 );
-                acked += 1;
+                acked.push(intent.intent_id.clone());
             }
             Err(e) => {
                 warn!(
@@ -443,6 +445,115 @@ pub(super) async fn report_no_eligible_source(
         }
     }
     acked
+}
+
+/// The AD2 gate's candidate universe for one tick (bug_028): the
+/// closed alphabet of fold-completion conditions. The node LIST stays
+/// lazy and async in the reconcile; this type carries its outcome
+/// into the synchronous fold so the fold itself is unit-testable.
+pub(super) enum GateUniverse {
+    /// The wanted set is empty — nothing to evaluate; the fold is
+    /// SKIPPED (witness dropped, streaks retain without stepping).
+    NoWanted,
+    /// No wanted intent carries exclusions: every wanted intent is
+    /// trivially un-gated and the fold COMPLETES without a node LIST
+    /// (observed un-exhaustion — this closes the retired sub-case
+    /// where dropped exclusions skipped the fold and never reset the
+    /// streak).
+    NoExclusions,
+    /// The lazy LIST succeeded: partition against these candidates.
+    Nodes(Vec<candidate::CandidateNode>),
+    /// The lazy LIST failed: cannot prove exhaustion — the fold is
+    /// SKIPPED (witness dropped) and spawn is fail-open.
+    ListFailed,
+}
+
+/// One completed (or skipped) AD2 gate evaluation (bug_028).
+pub(super) struct SpawnGateOutcome {
+    /// Intents allowed to spawn this tick, in the scheduler's priority
+    /// order, NOT yet headroom-truncated: gated intents and intents
+    /// inside their verdict-free-respawn backoff are removed (neither
+    /// burns a headroom slot).
+    pub(super) spawnable: Vec<SpawnIntent>,
+    /// Gated intents whose exhaustion satisfied the firing law this
+    /// fold (count + wall-clock floor) — the NoEligibleSource reports.
+    pub(super) to_report: Vec<SpawnIntent>,
+}
+
+// r[impl ctrl.pool.no-eligible-persist+4]
+/// The AD2 gate fold, extracted for unit-testability (bug_028): the
+/// partition runs over the FULL existing-names-filtered wanted set —
+/// never a headroom window — so exhaustion evaluation covers every
+/// wanted intent independent of the spawn window. Mints the
+/// [`candidate::Observation`] from the partition and consumes the
+/// [`candidate::StreakTick`] witness; pool-keyed (merged_bug_117) and
+/// namespace-qualified (merged_bug_073), so this fold can only touch
+/// THIS pool's streaks. On the skip arms (no wanted intents, LIST
+/// failure) the witness is dropped and streaks retain without
+/// stepping; the verdict-free-respawn backoff still gates spawn on
+/// EVERY arm (deaths are noted by the reap before the fold, so a
+/// freshly reaped intent is blocked the same tick its respawn would
+/// otherwise fire).
+pub(super) fn evaluate_spawn_gate(
+    wanted: Vec<SpawnIntent>,
+    universe: &GateUniverse,
+    streaks: &mut candidate::PoolStreaks,
+    tick: candidate::StreakTick,
+    key: &candidate::PoolKey,
+    now: std::time::Instant,
+) -> SpawnGateOutcome {
+    let (spawnable, to_report) = match universe {
+        GateUniverse::NoWanted | GateUniverse::ListFailed => {
+            // Fold skipped: drop the witness, retain streaks, spawn
+            // fail-open (ListFailed) or trivially nothing (NoWanted).
+            drop(tick);
+            (wanted, Vec::new())
+        }
+        GateUniverse::NoExclusions => {
+            // Trivially complete fold: every wanted intent evaluated
+            // and un-gated — streaks for them read observed recovery.
+            let obs = candidate::Observation::from_partition(&[], &wanted);
+            // An empty gated set cannot fire (reports are drawn from
+            // the observation's gated half) — drop the fire list.
+            let _ = streaks.step(tick, &obs, now);
+            (wanted, Vec::new())
+        }
+        GateUniverse::Nodes(candidates) => {
+            let (gated, spawnable): (Vec<SpawnIntent>, Vec<SpawnIntent>) = wanted
+                .into_iter()
+                .partition(|i| candidate::no_eligible_source(i, candidates));
+            // Withhold the spawn from tick 1 (the Job would sit
+            // unschedulable behind its own anti-affinity) but only
+            // REPORT — i.e. poison — after the exhaustion persists
+            // per the firing law (count + wall-clock floor): a
+            // single-tick universe blip (node restart, informer lag,
+            // autoscaler churn) must not poison a derivation. Streak
+            // entries whose intent was EVALUATED and is no longer
+            // gated are pruned (observed recovery); an already-acked
+            // report keeps its streak harmlessly until the poisoned
+            // drv leaves the intent stream (duplicate reports are
+            // server-side no-ops).
+            let obs = candidate::Observation::from_partition(&gated, &spawnable);
+            let fire = streaks.step(tick, &obs, now);
+            let to_report: Vec<SpawnIntent> = gated
+                .into_iter()
+                .filter(|intent| fire.iter().any(|f| f == &intent.intent_id))
+                .collect();
+            (spawnable, to_report)
+        }
+    };
+    // bug_028 futility breaker: a spawnable intent inside its
+    // verdict-free backoff window is withheld this tick (it does not
+    // burn a headroom slot; next tick re-checks). Applied on every
+    // arm — the records were stepped by the reap BEFORE this fold.
+    let spawnable = spawnable
+        .into_iter()
+        .filter(|i| !streaks.respawn_blocked(key, &i.intent_id, now))
+        .collect();
+    SpawnGateOutcome {
+        spawnable,
+        to_report,
+    }
 }
 
 pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
@@ -461,17 +572,20 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     })?;
     let ceiling = pool.spec.max_concurrent.map(|c| c as i32);
 
-    // bug_069 (amended by merged_bug_073): the exhaustion-streak
-    // witness is minted UNCONDITIONALLY at the top of every reconcile
-    // and consumed by the gate fold's `step`. Minting no longer
-    // mutates: a reconcile that never reaches the AD2 gate drops the
-    // witness and the pool's streaks RETAIN WITHOUT STEPPING --- an
-    // unobserved tick is evidence in neither direction. The documented
-    // ~30s persistence is carried by the wall-clock floor inside
-    // `step`'s firing law, and observed recovery (a completed fold
-    // without the intent) is what breaks a streak. The key is
-    // namespace-qualified (same-named pools in two namespaces are
-    // distinct streak owners).
+    // bug_069 (amended by merged_bug_073; prune re-keyed by bug_028):
+    // the exhaustion-streak witness is minted UNCONDITIONALLY at the
+    // top of every reconcile and consumed by the gate fold's `step`.
+    // Minting no longer mutates: a reconcile whose fold is skipped
+    // (no wanted intents, node LIST failure) drops the witness and
+    // the pool's streaks RETAIN WITHOUT STEPPING --- an unobserved
+    // tick is evidence in neither direction. The documented ~30s
+    // persistence is carried by the wall-clock floor inside `step`'s
+    // firing law, and observed recovery --- a completed fold that
+    // EVALUATED the intent and no longer gates it --- is what breaks a
+    // streak (the fold's `Observation` carries the evaluated set, so
+    // an intent the fold never looked at cannot read as recovered).
+    // The key is namespace-qualified (same-named pools in two
+    // namespaces are distinct streak owners).
     let streak_key = crate::reconcilers::pool::candidate::PoolKey::new(&ns, &name);
     let streak_tick = ctx.exhausted_streak.lock().begin_tick(&streak_key);
 
@@ -576,8 +690,16 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // → reap's `want.is_empty()` early-return fires → nothing freed →
     // headroom stays 0 forever. Reaping frees slots; it doesn't
     // consume headroom, so the cap doesn't apply.
-    let reaped =
-        reap_stale_for_intents(&jobs_api, &jobs.items, &intents, ctx, &name, pool.spec.kind).await;
+    let reaped = reap_stale_for_intents(
+        &jobs_api,
+        &jobs.items,
+        &intents,
+        ctx,
+        &name,
+        pool.spec.kind,
+        &streak_key,
+    )
+    .await;
     // Reaped active Jobs (selector-drifted / orphan Pending) free
     // slots THIS tick; terminal reaped Jobs weren't counted in
     // `census.active` so don't double-count.
@@ -619,15 +741,16 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         .filter(|n| !reaped.contains(n))
         .collect();
 
-    // Filter-existing BEFORE truncate: `headroom = ceiling - active`
-    // already accounts for still-Pending Jobs, but those Jobs' drvs
-    // (still Ready, not yet heartbeated) ALSO appear in `intents`. A
-    // positional `intents[..headroom]` slice spent slots on them then
-    // skipped them in `spawn_for_each` — new intents past index
-    // `headroom` were never considered even with free slots. Intents
-    // are scheduler-side priority-sorted, so `take(headroom)` over
-    // genuinely-new work drops lowest-priority, not HashMap-order.
-    let to_spawn_intents: Vec<SpawnIntent> = intents
+    // Filter-existing over the FULL intent set (bug_028: NO truncate
+    // here): `headroom = ceiling - active` already accounts for
+    // still-Pending Jobs, but those Jobs' drvs (still Ready, not yet
+    // heartbeated) ALSO appear in `intents`. The wanted set feeds the
+    // AD2 gate below, which must evaluate EVERY wanted intent — the
+    // retired take-before-gate shape derived the gated set from the
+    // headroom window, so a genuinely exhausted intent pushed past
+    // the cutoff by priority churn read as recovered and its streak
+    // never fired on a ceiling'd pool.
+    let wanted: Vec<SpawnIntent> = intents
         .iter()
         .filter(|i| {
             !existing_names.contains(&pod::job_name(
@@ -636,71 +759,63 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
                 &intent_suffix(&i.intent_id),
             ))
         })
-        .take(headroom)
         .cloned()
         .collect();
 
     // ---- AD2 spawn gate: excluded ⊇ spawnable ⇒ NoEligibleSource ----
-    // Evaluated only when an intent actually carries exclusions (the
-    // node list is lazy); a gated intent is reported instead of
-    // spawned, so no Job burns an activeDeadlineSeconds period sitting
-    // unschedulable behind its own anti-affinity. Fail-open on a
-    // failed node list: cannot prove exhaustion ⇒ spawn as today.
-    let to_spawn_intents: Vec<SpawnIntent> = if to_spawn_intents
-        .iter()
-        .any(|i| !i.excluded_nodes.is_empty())
-    {
+    // Partition the full wanted set BEFORE the headroom truncate
+    // (bug_028 — the order the verified spawnCoherence model always
+    // encoded): a gated intent is reported instead of spawned, so no
+    // Job burns an activeDeadlineSeconds period sitting unschedulable
+    // behind its own anti-affinity, gated intents no longer burn
+    // headroom slots, and exhaustion verdicts no longer stall behind
+    // a saturated ceiling (zero-headroom ticks observe). The node
+    // LIST stays lazy — its trigger widens from the window to the
+    // wanted set (cost disclosure, RULED S2-OQ3: still ≤1 LIST per
+    // reconcile) — and the fold-skip alphabet narrows to {no wanted
+    // intents, node LIST failure}: an exclusion-free wanted set
+    // completes the fold trivially (all un-gated — observed
+    // un-exhaustion) with no LIST at all. Fail-open on a failed node
+    // list: cannot prove exhaustion ⇒ spawn as today, witness
+    // dropped, streaks retain.
+    let universe = if wanted.is_empty() {
+        GateUniverse::NoWanted
+    } else if wanted.iter().any(|i| !i.excluded_nodes.is_empty()) {
         match spawnable_nodes_for_pool(&ctx.client, pool).await {
-            Some(candidates) => {
-                let (gated, spawnable_intents): (Vec<SpawnIntent>, Vec<SpawnIntent>) =
-                    to_spawn_intents
-                        .into_iter()
-                        .partition(|i| candidate::no_eligible_source(i, &candidates));
-                // r[impl ctrl.pool.no-eligible-persist+3]
-                // Withhold the spawn from tick 1 (the Job would sit
-                // unschedulable behind its own anti-affinity) but only
-                // REPORT — i.e. poison — after the exhaustion persists
-                // `NO_ELIGIBLE_SOURCE_PERSIST_TICKS` consecutive ticks:
-                // a single-tick universe blip (node restart, informer
-                // lag, autoscaler churn) must not poison a derivation.
-                // Streaks for intents no longer gated (left the set or
-                // universe un-exhausted) are pruned; an already-acked
-                // report keeps its streak harmlessly until the poisoned
-                // drv leaves the intent stream (duplicate reports are
-                // server-side no-ops).
-                let to_report: Vec<&SpawnIntent> = {
-                    let gated_ids: HashSet<&str> =
-                        gated.iter().map(|i| i.intent_id.as_str()).collect();
-                    // Pool-keyed (merged_bug_117) and namespace-
-                    // qualified (merged_bug_073): this fold can only
-                    // touch THIS pool's streaks. The `streak_tick`
-                    // witness minted at the top of this reconcile is
-                    // consumed here (bug_069): a step outside the
-                    // per-reconcile protocol does not typecheck. The
-                    // firing law is count AND wall-clock floor
-                    // (merged_bug_073); a reconcile that never reaches
-                    // this fold drops the witness and the streak
-                    // retains without stepping.
-                    let fire = ctx.exhausted_streak.lock().step(
-                        streak_tick,
-                        &gated_ids,
-                        std::time::Instant::now(),
-                    );
-                    gated
-                        .iter()
-                        .filter(|intent| fire.iter().any(|f| f == &intent.intent_id))
-                        .collect()
-                };
-                if !to_report.is_empty() {
-                    report_no_eligible_source(ctx, &name, &to_report).await;
-                }
-                spawnable_intents
-            }
-            None => to_spawn_intents,
+            Some(candidates) => GateUniverse::Nodes(candidates),
+            None => GateUniverse::ListFailed,
         }
     } else {
-        to_spawn_intents
+        GateUniverse::NoExclusions
     };
+    let outcome = evaluate_spawn_gate(
+        wanted,
+        &universe,
+        &mut ctx.exhausted_streak.lock(),
+        streak_tick,
+        &streak_key,
+        std::time::Instant::now(),
+    );
+    if !outcome.to_report.is_empty() {
+        let to_report: Vec<&SpawnIntent> = outcome.to_report.iter().collect();
+        let acked = report_no_eligible_source(ctx, &name, &to_report).await;
+        // bug_028 futility breaker reset lane: an ACKED poison verdict
+        // is a named resolution — the scheduler now holds the verdict,
+        // so the intent's verdict-free-respawn record (if any) clears.
+        let mut streaks = ctx.exhausted_streak.lock();
+        for intent_id in &acked {
+            streaks.note_resolution(
+                &streak_key,
+                intent_id,
+                candidate::SpawnResolution::NoEligibleSource,
+            );
+        }
+    }
+    // Headroom truncate AFTER the gate, over spawnable intents only.
+    // Intents are scheduler-side priority-sorted, so `take(headroom)`
+    // over genuinely-new spawnable work drops lowest-priority, not
+    // HashMap-order.
+    let to_spawn_intents: Vec<SpawnIntent> = outcome.spawnable.into_iter().take(headroom).collect();
 
     // r[impl sec.executor.identity-token+3]
     // Mint per-intent `RIO_EXECUTOR_TOKEN`s on a controller-only
@@ -845,6 +960,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         queued_known,
         ctx,
         &name,
+        &streak_key,
     )
     .await;
 
@@ -853,7 +969,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // self-exit and never disconnects, so the scheduler never
     // reassigns. After ORPHAN_REAP_GRACE (5min), any Running Job the
     // scheduler doesn't consider busy is deleted.
-    reap_orphan_running(&jobs_api, &jobs.items, &reaped, ctx, &name).await;
+    reap_orphan_running(&jobs_api, &jobs.items, &reaped, ctx, &name, &streak_key).await;
 
     // ---- AD5 cancel arm ----
     // A scheduler-side cancel/abort verdict closes the attempt; this
@@ -861,11 +977,11 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // pod's SIGTERM-abort fires now instead of at
     // activeDeadlineSeconds. Unconditional since the dispatch-mode
     // knob retired: every pool is a pull pool.
-    super::job::cancel_closed_attempt_jobs(&jobs_api, &jobs.items, ctx, &name).await;
+    super::job::cancel_closed_attempt_jobs(&jobs_api, &jobs.items, ctx, &name, &streak_key).await;
 
     // ---- Report terminations ----
-    report_terminated_pods(ctx, &ns, &name).await;
-    report_deadline_exceeded_jobs(ctx, &jobs.items).await;
+    report_terminated_pods(ctx, &ns, &name, &streak_key).await;
+    report_deadline_exceeded_jobs(ctx, &jobs.items, &streak_key).await;
 
     // ---- Status patch ----
     patch_job_pool_status(
@@ -964,6 +1080,17 @@ fn intent_suffix(intent_id: &str) -> String {
 /// synthesize arm is normally inert, but a stale Job whose pod pulled
 /// and crashed gets its open attempt closed at deletion instead of
 /// waiting for the establishment sweep.
+///
+/// bug_028 futility breaker: the TERMINAL arm is the verdict-free-
+/// death observation point — a terminal Job reaped for a still-wanted
+/// intent whose delete carried NO acked synthesized report means the
+/// scheduler holds no verdict and the same-named respawn would
+/// otherwise fire this very tick (the reap exists to clear the
+/// NameCollision window). The death is noted BEFORE the spawn pass
+/// runs, so the backoff gates the respawn immediately. The orphan-
+/// pending arm reaps UN-wanted intents (no respawn follows) and the
+/// selector-drift arm reaps never-ran Pending Jobs whose respawn is
+/// the INTENDED re-render — neither is a verdict-free death.
 pub(super) async fn reap_stale_for_intents(
     jobs_api: &Api<Job>,
     existing: &[Job],
@@ -971,6 +1098,7 @@ pub(super) async fn reap_stale_for_intents(
     ctx: &Ctx,
     pool: &str,
     kind: ExecutorKind,
+    key: &candidate::PoolKey,
 ) -> HashSet<String> {
     let mut reaped = HashSet::new();
     let want: HashMap<String, String> = intents
@@ -1037,14 +1165,35 @@ pub(super) async fn reap_stale_for_intents(
             &params,
             rio_proto::types::AttemptTerminalReason::Reaped,
             attempts,
+            key,
         )
         .await
         {
-            Ok(_) => {
+            Ok(synthesized) => {
                 info!(
                     pool, job = %jn, why,
                     "reaped stale Job blocking re-queued intent respawn"
                 );
+                // bug_028 futility breaker: a terminal reap of a
+                // still-wanted intent with no acked verdict is a
+                // VERDICT-FREE death — step its respawn record so the
+                // same-tick respawn meets the backoff floor. (An
+                // acked report already cleared the record inside the
+                // delete chokepoint — the TerminalReport lane.)
+                if why == "terminal"
+                    && !matches!(
+                        synthesized,
+                        super::job::SynthesizedDelete::ReportAcked { .. }
+                    )
+                    && let Some(intent_id) = super::job::job_intent_id(j)
+                    && !intent_id.is_empty()
+                {
+                    ctx.exhausted_streak.lock().note_verdict_free_death(
+                        key,
+                        intent_id,
+                        std::time::Instant::now(),
+                    );
+                }
                 reaped.insert(jn.to_owned());
             }
             Err(e) if e.is_not_found() => {

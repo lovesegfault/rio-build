@@ -276,6 +276,7 @@ async fn reap_excess_pending_deletes_oldest_and_counts() {
         Some(1),
         &ctx,
         "med-pool",
+        &pkey(),
     )
     .await;
     guard.verified().await;
@@ -419,6 +420,7 @@ async fn reap_stale_for_intents_selector_drift_and_terminal() {
         &ctx,
         "p",
         ExecutorKind::Builder,
+        &pkey(),
     )
     .await;
     guard.verified().await;
@@ -511,6 +513,7 @@ async fn reap_stale_at_ceiling_saturation() {
         &ctx,
         "p",
         ExecutorKind::Builder,
+        &pkey(),
     )
     .await;
     assert_eq!(reaped.len(), 2, "both drifted Pending reaped");
@@ -695,14 +698,24 @@ async fn reap_excess_pending_noop_when_covered_or_unknown() {
     let guard = verifier.run(vec![]);
     // pending=2, queued=2 → covered.
     assert_eq!(
-        reap_excess_pending(&jobs_api, &pods_api, &jobs, &none, Some(2), &ctx, "p").await,
+        reap_excess_pending(
+            &jobs_api,
+            &pods_api,
+            &jobs,
+            &none,
+            Some(2),
+            &ctx,
+            "p",
+            &pkey()
+        )
+        .await,
         0
     );
     // queued=None → fail-closed (scheduler unreachable; spawn treats
     // as 0 fail-open, reap MUST NOT — would nuke every Pending Job
     // on a scheduler restart).
     assert_eq!(
-        reap_excess_pending(&jobs_api, &pods_api, &jobs, &none, None, &ctx, "p").await,
+        reap_excess_pending(&jobs_api, &pods_api, &jobs, &none, None, &ctx, "p", &pkey()).await,
         0
     );
     guard.verified().await;
@@ -747,6 +760,7 @@ async fn reap_excess_pending_skips_live_running_pod() {
         Some(0),
         &ctx,
         "p",
+        &pkey(),
     )
     .await;
     guard.verified().await;
@@ -865,6 +879,7 @@ async fn reap_stale_for_intents_reaps_orphan_pending() {
         &ctx,
         "p",
         ExecutorKind::Builder,
+        &pkey(),
     )
     .await;
     assert_eq!(reaped, HashSet::from(["rio-builder-p-ccc".into()]));
@@ -883,6 +898,7 @@ async fn reap_stale_for_intents_reaps_orphan_pending() {
         &ctx2,
         "p",
         ExecutorKind::Builder,
+        &pkey(),
     )
     .await;
     assert!(reaped.is_empty(), "scheduler error → no orphan-reap");
@@ -967,6 +983,12 @@ fn materialization_attempt(
         attempt_kind: rio_proto::types::AttemptKind::Materialization as i32,
         ..Default::default()
     }
+}
+
+/// The streak/breaker pool key the test reconciles run under
+/// (namespace `rio`, pool `p` --- matching the fixtures).
+fn pkey() -> crate::reconcilers::pool::candidate::PoolKey {
+    crate::reconcilers::pool::candidate::PoolKey::new("rio", "p")
 }
 
 /// The expected one-foreground-DELETE scenario for `name`.
@@ -1197,6 +1219,7 @@ async fn delete_job_synthesizes_report_for_open_pull_attempt() {
         &DeleteParams::foreground(),
         AttemptTerminalReason::Reaped,
         &attempts,
+        &pkey(),
     )
     .await
     .expect("delete succeeds");
@@ -1237,6 +1260,7 @@ async fn delete_job_without_open_attempt_attempts_no_rpc() {
         &DeleteParams::foreground(),
         AttemptTerminalReason::Reaped,
         &attempts,
+        &pkey(),
     )
     .await
     .expect("delete succeeds");
@@ -1270,6 +1294,7 @@ async fn delete_job_report_failure_does_not_block_delete() {
         &DeleteParams::foreground(),
         AttemptTerminalReason::Reaped,
         &attempts,
+        &pkey(),
     )
     .await
     .expect("delete proceeds despite the failed report");
@@ -1323,6 +1348,7 @@ async fn terminal_sample_gate_keys_on_object_uid_not_name() {
             &DeleteParams::foreground(),
             AttemptTerminalReason::Reaped,
             &attempts,
+            &pkey(),
         )
         .await
         .expect("delete succeeds");
@@ -1369,6 +1395,7 @@ async fn terminal_sample_gate_still_dedupes_same_object() {
             &DeleteParams::foreground(),
             AttemptTerminalReason::Reaped,
             &attempts,
+            &pkey(),
         )
         .await
         .expect("delete succeeds");
@@ -1397,7 +1424,7 @@ async fn reap_orphan_running_fail_closed_on_view_error() {
 
     // Running (ready=1), 600 s old — past the 300 s orphan grace.
     let job = running_job_for_intent("rio-builder-p-orph1", "drv-orph-1");
-    let reaped = reap_orphan_running(&jobs_api, &[job], &HashSet::new(), &ctx, "p").await;
+    let reaped = reap_orphan_running(&jobs_api, &[job], &HashSet::new(), &ctx, "p", &pkey()).await;
     assert_eq!(
         reaped, 0,
         "unreadable open-attempt view → fail-closed → no orphan reap"
@@ -1427,7 +1454,7 @@ async fn reap_orphan_running_reaps_on_readable_view() {
 
     let job = running_job_for_intent("rio-builder-p-orph2", "drv-orph-2");
     let guard = verifier.run(vec![delete_scenario("rio-builder-p-orph2")]);
-    let reaped = reap_orphan_running(&jobs_api, &[job], &HashSet::new(), &ctx, "p").await;
+    let reaped = reap_orphan_running(&jobs_api, &[job], &HashSet::new(), &ctx, "p", &pkey()).await;
     guard.verified().await;
     assert_eq!(
         reaped, 1,
@@ -1493,7 +1520,7 @@ fn no_eligible_source_predicate() {
 }
 
 // r[verify sched.dispatch.fleet-exhaust+5]
-// r[verify ctrl.pool.no-eligible-persist+3]
+// r[verify ctrl.pool.no-eligible-persist+4]
 /// A gated intent produces exactly one acked `NoEligibleSource` report
 /// carrying the intent's `resubmit_cycle` echo (124(b): the scheduler
 /// ack-no-poisons a stale echo); the gated intent is the one removed
@@ -1526,10 +1553,12 @@ async fn gated_intent_reports_no_eligible_source_with_cycle_echo() {
         schedulable: true,
     }];
 
-    // The partition the reconcile applies: gated intents leave the
-    // spawn set (no Job is built for them), open ones stay.
-    let to_spawn = [gated_intent.clone(), open_intent.clone()];
-    let (gated, spawnable_intents): (Vec<&SpawnIntent>, Vec<&SpawnIntent>) = to_spawn
+    // The partition the reconcile applies (bug_028 order: over the
+    // FULL existing-names-filtered wanted set, BEFORE the headroom
+    // truncate): gated intents leave the spawn set (no Job is built
+    // for them, no headroom slot burned), open ones stay.
+    let wanted = [gated_intent.clone(), open_intent.clone()];
+    let (gated, spawnable_intents): (Vec<&SpawnIntent>, Vec<&SpawnIntent>) = wanted
         .iter()
         .partition(|i| no_eligible_source(i, &candidates));
     assert_eq!(gated.len(), 1);
@@ -1546,8 +1575,10 @@ async fn gated_intent_reports_no_eligible_source_with_cycle_echo() {
     // the (mock) scheduler, echoing the verdict's resubmit_cycle.
     let acked = report_no_eligible_source(&ctx, "p", &gated).await;
     assert_eq!(
-        acked, 1,
-        "exactly one NoEligibleSource report per gated intent"
+        acked,
+        vec!["drv-gated".to_owned()],
+        "exactly one NoEligibleSource report per gated intent, acked by id \
+         (bug_028: the acked ids feed the futility breaker reset lane)"
     );
     let calls = mock.outcome_calls.read().unwrap();
     assert_eq!(calls.len(), 1);
@@ -1555,6 +1586,203 @@ async fn gated_intent_reports_no_eligible_source_with_cycle_echo() {
     assert_eq!(
         calls[0].resubmit_cycle, 4,
         "the verdict echoes the cycle it was computed against"
+    );
+}
+
+// r[verify ctrl.pool.no-eligible-persist+4]
+/// bug_028: the AD2 gate evaluates ALL wanted intents, never just the
+/// headroom window --- an exhausted intent behind a full pool accrues
+/// its verdict instead of stalling behind the ceiling. Drives the
+/// extracted fold helper (`evaluate_spawn_gate`); the pre-fix red was
+/// recorded against the inline take-then-gate shape (the helper
+/// extraction is the disclosed strawman), verbatim:
+/// `the exhausted intent must be EVALUATED (appear in gated) even
+/// when headroom-truncated out of the spawn window; gated = []`.
+#[test]
+fn gate_evaluates_all_wanted_not_just_window() {
+    use crate::reconcilers::pool::candidate::{CandidateNode, PoolStreaks};
+    use crate::reconcilers::pool::jobs::{GateUniverse, evaluate_spawn_gate};
+
+    let hi = SpawnIntent {
+        intent_id: "drv-hi".into(),
+        ..Default::default()
+    };
+    let exhausted = SpawnIntent {
+        intent_id: "drv-exhausted".into(),
+        excluded_nodes: vec!["n1".into()],
+        ..Default::default()
+    };
+    let candidates = vec![CandidateNode {
+        name: "n1".into(),
+        labels: Default::default(),
+        schedulable: true,
+    }];
+    let mut streaks = PoolStreaks::default();
+    let key = pkey();
+    let t0 = std::time::Instant::now();
+
+    // Scheduler priority order: the unexcluded intent first. The
+    // ceiling-1 take(headroom) happens AFTER the gate in the
+    // reconcile; the helper takes the FULL wanted set by construction
+    // --- the window cannot reach the fold.
+    let universe = GateUniverse::Nodes(candidates);
+    let mut fired = Vec::new();
+    for n in 0..3u64 {
+        let now = t0 + std::time::Duration::from_secs(n * 10);
+        let tick = streaks.begin_tick(&key);
+        let outcome = evaluate_spawn_gate(
+            vec![hi.clone(), exhausted.clone()],
+            &universe,
+            &mut streaks,
+            tick,
+            &key,
+            now,
+        );
+        // The exhausted intent is EVALUATED and withheld every fold:
+        // it never appears spawnable (and so never burns a headroom
+        // slot), while the unexcluded intent always does.
+        assert_eq!(
+            outcome
+                .spawnable
+                .iter()
+                .map(|i| i.intent_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["drv-hi"],
+            "fold {n}: gated intent must be withheld, open intent spawnable"
+        );
+        fired = outcome.to_report;
+    }
+    // Third consecutive evaluated fold spanning the 20s floor: the
+    // verdict fires --- proof the gate evaluated the exhausted intent
+    // on every fold even though the spawn window only ever had room
+    // for the higher-priority one.
+    assert_eq!(
+        fired
+            .iter()
+            .map(|i| i.intent_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["drv-exhausted"],
+        "the exhausted intent's verdict must accrue across folds despite the window"
+    );
+}
+
+/// bug_028 futility breaker red: an intent whose Jobs die VERDICT-FREE
+/// every cycle (the live exhibit: 759 intents respawned 2-8x with zero
+/// NoEligibleSource verdicts over 41 min --- total builder failure
+/// converted to EC2 spend at reconcile cadence) must respawn on the
+/// exponential backoff schedule, not every tick. Paused-clock loop at
+/// the 10 s reconcile cadence; each spawn's Job dies verdict-free and
+/// the next tick's reap notes the death BEFORE the fold --- with
+/// evaluated-not-gated folds on EVERY tick in between (the backoff
+/// steady state, per FS-6: a drop-on-evaluated-not-gated wiring would
+/// clear the record each tick and fail this immediately). Recorded
+/// red (breaker neutered --- strawman, the gate cannot exist pre-fix):
+/// `left: 25 right: 5 --- verdict-free respawns must follow the
+/// exponential backoff schedule, not the reconcile cadence`.
+#[test]
+fn verdictless_respawn_backs_off_per_intent() {
+    use crate::reconcilers::pool::candidate::PoolStreaks;
+    use crate::reconcilers::pool::jobs::{GateUniverse, evaluate_spawn_gate};
+
+    let mut streaks = PoolStreaks::default();
+    let key = pkey();
+    let t0 = std::time::Instant::now();
+    let intent = SpawnIntent {
+        intent_id: "drv-loop".into(),
+        ..Default::default()
+    };
+
+    let mut spawns = 0u32;
+    let mut pending_death = false;
+    for n in 0..25u64 {
+        let now = t0 + std::time::Duration::from_secs(n * 10);
+        // The reap observes the prior tick's verdict-free death
+        // BEFORE the fold (reap_stale_for_intents runs first in the
+        // reconcile), so the backoff gates the same-tick respawn.
+        if pending_death {
+            streaks.note_verdict_free_death(&key, "drv-loop", now);
+            pending_death = false;
+        }
+        let tick = streaks.begin_tick(&key);
+        let outcome = evaluate_spawn_gate(
+            vec![intent.clone()],
+            &GateUniverse::NoExclusions,
+            &mut streaks,
+            tick,
+            &key,
+            now,
+        );
+        if !outcome.spawnable.is_empty() {
+            spawns += 1;
+            pending_death = true; // the spawned Job dies before the next tick
+        }
+    }
+    // Exponential schedule at base 10 s, cap 80 s: spawns at ticks
+    // 0, 2, 5, 10, 19 --- five over 25 ticks (vs 25 at cadence).
+    assert_eq!(
+        spawns, 5,
+        "verdict-free respawns must follow the exponential backoff schedule, \
+         not the reconcile cadence"
+    );
+}
+
+/// bug_028 futility breaker companion green: a NAMED resolution ---
+/// here the acked NoEligibleSource verdict lane the reconcile calls
+/// after `report_no_eligible_source` acks --- resets the backoff
+/// immediately; the breaker must never mask a real verdict lane.
+#[test]
+fn verdict_resets_respawn_backoff() {
+    use crate::reconcilers::pool::candidate::{PoolStreaks, SpawnResolution};
+    use crate::reconcilers::pool::jobs::{GateUniverse, evaluate_spawn_gate};
+
+    let mut streaks = PoolStreaks::default();
+    let key = pkey();
+    let t0 = std::time::Instant::now();
+    let intent = SpawnIntent {
+        intent_id: "drv-loop".into(),
+        ..Default::default()
+    };
+
+    // Three verdict-free deaths: the backoff floor is now 40 s.
+    for n in 0..3u64 {
+        streaks.note_verdict_free_death(&key, "drv-loop", t0 + std::time::Duration::from_secs(n));
+    }
+    let now = t0 + std::time::Duration::from_secs(10);
+    let tick = streaks.begin_tick(&key);
+    let blocked = evaluate_spawn_gate(
+        vec![intent.clone()],
+        &GateUniverse::NoExclusions,
+        &mut streaks,
+        tick,
+        &key,
+        now,
+    );
+    assert!(
+        blocked.spawnable.is_empty(),
+        "mid-backoff the intent must be withheld"
+    );
+
+    // The verdict lands (the same typed call the reconcile makes for
+    // each acked NoEligibleSource id): the record clears and the very
+    // next tick spawns at full cadence.
+    streaks.note_resolution(&key, "drv-loop", SpawnResolution::NoEligibleSource);
+    let tick = streaks.begin_tick(&key);
+    let unblocked = evaluate_spawn_gate(
+        vec![intent],
+        &GateUniverse::NoExclusions,
+        &mut streaks,
+        tick,
+        &key,
+        now + std::time::Duration::from_secs(10),
+    );
+    assert_eq!(
+        unblocked
+            .spawnable
+            .iter()
+            .map(|i| i.intent_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["drv-loop"],
+        "a named resolution must reset the backoff --- the breaker never masks a verdict lane"
     );
 }
 
@@ -1734,7 +1962,7 @@ async fn cancel_arm_deletes_job_on_cancelled_close() {
     }];
 
     let guard = verifier.run(vec![delete_scenario("rio-builder-p-edge1")]);
-    let cancelled = cancel_closed_attempt_jobs(&jobs_api, &[job], &ctx, "test-pool").await;
+    let cancelled = cancel_closed_attempt_jobs(&jobs_api, &[job], &ctx, "test-pool", &pkey()).await;
     guard.verified().await;
     assert_eq!(cancelled, 1, "exactly the cancelled-close Job is deleted");
 }
@@ -1752,7 +1980,7 @@ async fn cancel_arm_fail_closed_on_view_error() {
     let jobs_api: Api<Job> = Api::namespaced(client, "rio");
 
     let job = running_job_for_intent("rio-builder-p-fc1", "drv-fc");
-    let cancelled = cancel_closed_attempt_jobs(&jobs_api, &[job], &ctx, "test-pool").await;
+    let cancelled = cancel_closed_attempt_jobs(&jobs_api, &[job], &ctx, "test-pool", &pkey()).await;
     assert_eq!(cancelled, 0, "no decisions on a failed view read");
 }
 
@@ -1787,7 +2015,7 @@ async fn orphan_reap_skips_young_leader() {
 
     // Aged, uncovered Running Job; the mock leader is brand new.
     let job = running_job_for_intent("rio-builder-p-young1", "drv-young");
-    let reaped = reap_orphan_running(&jobs_api, &[job], &HashSet::new(), &ctx, "p").await;
+    let reaped = reap_orphan_running(&jobs_api, &[job], &HashSet::new(), &ctx, "p", &pkey()).await;
     assert_eq!(
         reaped, 0,
         "a leader younger than the orphan grace must not reap \

@@ -196,15 +196,22 @@ pub struct Ctx {
     /// once entries outlive the TTL window (a boundedness bound only;
     /// see `TERMINAL_REPORT_SAMPLED_TTL`).
     pub terminal_report_sampled: Mutex<HashMap<pool::job::ObjectUid, Instant>>,
-    /// `intent_id` → consecutive ticks the AD2 spawn gate observed
-    /// fleet exhaustion for that intent (`pool/jobs` gate block). The
-    /// NoEligibleSource report — the verdict that POISONS the
-    /// derivation scheduler-side — fires only at
+    /// `(pool, intent)` → consecutive OBSERVED ticks the AD2 spawn
+    /// gate found fleet exhaustion (`pool/jobs` gate block), plus the
+    /// per-intent verdict-free-respawn records (bug_028 futility
+    /// breaker). The NoEligibleSource report — the verdict that
+    /// POISONS the derivation scheduler-side — fires only at
     /// `pool::candidate::NO_ELIGIBLE_SOURCE_PERSIST_TICKS`; a
     /// single-tick exhaustion (node restart, informer lag) withholds
     /// the spawn but never poisons. In-process only: a controller
     /// restart restarts streaks (delays a genuine poison by ≤3 ticks —
-    /// accepted). Pruned when the intent leaves the gated set.
+    /// accepted). A streak entry is pruned only when a completed fold
+    /// EVALUATED the intent and its gated set no longer contains it
+    /// (observed recovery, carried by the fold's
+    /// `pool::candidate::Observation`) or when the entry goes
+    /// unstepped past the orphan expiry — an intent absent from a
+    /// fold's evaluated set (job-pending, absent from the stream)
+    /// retains without stepping (bug_028: absence is not evidence).
     pub exhausted_streak: Mutex<super::reconcilers::pool::candidate::PoolStreaks>,
 }
 

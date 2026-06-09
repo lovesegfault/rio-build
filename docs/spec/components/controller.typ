@@ -334,7 +334,7 @@ two reads.
   field-sensitivity contract test fails).
 ]
 
-#r("ctrl.pool.no-eligible-persist+3")[
+#r("ctrl.pool.no-eligible-persist+4")[
   The AD2 `NoEligibleSource` REPORT --- the verdict that poisons the
   derivation scheduler-side --- MUST NOT fire on a single-tick exhaustion
   observation NOR on a reconcile-count alone: the gate withholds the
@@ -346,15 +346,19 @@ two reads.
   burst can deliver the count in under a second). Streak state MUST be
   keyed by (namespace-qualified pool, intent): one pool's tick MUST NOT
   clear or advance another pool's streaks, and same-named pools in
-  distinct namespaces are distinct streak owners. A reconcile whose gate
-  fold is skipped MUST retain streaks WITHOUT stepping them (an
-  unobserved tick is evidence in neither direction); a pool's streak
-  MUST reset when an OBSERVED fold's gated set no longer contains the
-  intent, and any entry unstepped for the bounded orphan window MUST
-  expire (stale evidence MUST NOT complete a poison) --- this covers
-  removed pools and frozen streaks alike. A controller restart MAY
-  restart streaks (delaying a genuine poison by at most the persistence
-  window).
+  distinct namespaces are distinct streak owners. Exhaustion evaluation
+  MUST cover every wanted intent independent of the spawn window. A
+  reconcile whose gate fold is skipped MUST retain streaks WITHOUT
+  stepping them (an unobserved tick is evidence in neither direction);
+  a pool's streak MUST reset only when a completed fold EVALUATED the
+  intent and its gated set no longer contains it --- an intent absent
+  from a fold's evaluated set (headroom-truncated, job-pending, or
+  absent from the stream) is unobserved THIS fold and MUST retain
+  without stepping --- and any entry unstepped for the bounded orphan
+  window MUST expire (stale evidence MUST NOT complete a poison): this
+  covers removed pools and frozen streaks alike. A controller restart
+  MAY restart streaks (delaying a genuine poison by at most the
+  persistence window).
 ]
 
 #r("ctrl.pool.ack-spawned-soundness")[
