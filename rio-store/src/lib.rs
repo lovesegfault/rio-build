@@ -620,7 +620,10 @@ pub fn describe_metrics() {
          row that still stands but whose S3 object is gone; a row swept \
          between manifest read and GET is a benign race, not counted), \
          short_object (the object holds fewer lines than its row claims \
-         and no remaining row covers the missing span). Served-anyway \
+         and no remaining row covers the missing span), oversized_chunk \
+         (a manifest row claims more lines than any decodable chunk \
+         holds), undecodable_chunk (the object exists but does not \
+         decode). Served-anyway \
          divergence (overlong, covered-short) is the warn-severity \
          rio_store_log_read_divergence_total family instead. Alert on \
          ANY increment."
@@ -755,7 +758,7 @@ pub const PUTPATH_RETRY_REASONS: &[&str] = &[
 /// increment site). `overlong_object` left this alphabet when overlong
 /// became a served-anyway divergence kind (merged_bug_164).
 #[cfg(feature = "server")]
-pub const LOG_READ_LOSS_REASONS: &[&str] = &["missing_object", "short_object"];
+pub const LOG_READ_LOSS_REASONS: &[&str] = &logs::UnservableKind::ALL_REASONS;
 
 /// Log read-path served-anyway divergence kinds (logs/loss.rs
 /// `note_divergence`).

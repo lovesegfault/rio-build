@@ -1227,7 +1227,7 @@
       {
         "name": "rio_store_log_read_data_loss_total",
         "kind": "counter",
-        "help": "Unrecoverable holes in stored build logs, counted once per hole identity (exec_id, s3_key) per process — never per read visit — by reason: missing_object (a drv_log_chunks manifest row that still stands but whose S3 object is gone; a row swept between manifest read and GET is a benign race, not counted), short_object (the object holds fewer lines than its row claims and no remaining row covers the missing span). Served-anyway divergence (overlong, covered-short) is the warn-severity rio_store_log_read_divergence_total family instead. Alert on ANY increment."
+        "help": "Unrecoverable holes in stored build logs, counted once per hole identity (exec_id, s3_key) per process — never per read visit — by reason: missing_object (a drv_log_chunks manifest row that still stands but whose S3 object is gone; a row swept between manifest read and GET is a benign race, not counted), short_object (the object holds fewer lines than its row claims and no remaining row covers the missing span), oversized_chunk (a manifest row claims more lines than any decodable chunk holds), undecodable_chunk (the object exists but does not decode). Served-anyway divergence (overlong, covered-short) is the warn-severity rio_store_log_read_divergence_total family instead. Alert on ANY increment."
       },
       {
         "name": "rio_store_log_read_divergence_total",

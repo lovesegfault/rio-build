@@ -101,8 +101,10 @@ impl Ledger {
 /// was the first sighting (tests pin the dedup through this).
 ///
 /// `reason` MUST be a member of
-/// [`crate::LOG_READ_LOSS_REASONS`] (`missing_object`, `short_object`)
-/// — the parity test and the metric HELP enforce the alphabet.
+/// [`crate::LOG_READ_LOSS_REASONS`], which is derived from
+/// [`UnservableKind::ALL_REASONS`] (`oversized_chunk`,
+/// `missing_object`, `short_object`, `undecodable_chunk`) — the
+/// parity test and the metric HELP enforce the alphabet.
 pub(super) fn note_hole(exec_id: Uuid, s3_key: &str, reason: &'static str) -> bool {
     let first = ledger()
         .lock()
@@ -148,7 +150,7 @@ pub(super) fn note_divergence(exec_id: Uuid, s3_key: &str, kind: &'static str) -
 /// identically-forever refusals (`LOG_UNSERVABLE_METADATA_KEY`
 /// values). One enum, so an arm cannot invent an untyped refusal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum UnservableKind {
+pub(crate) enum UnservableKind {
     /// Manifest row claims more lines than any decodable chunk holds.
     OversizedChunk,
     /// Manifest row stands but the chunk object is gone, and no
@@ -162,6 +164,29 @@ pub(super) enum UnservableKind {
 }
 
 impl UnservableKind {
+    /// Every variant, in declaration order -- the single derivation
+    /// source for the seeded reason alphabet
+    /// ([`crate::LOG_READ_LOSS_REASONS`]) and the metric HELP. The
+    /// parity test's exhaustive match makes a new variant a compile
+    /// error until this array (and through it both surfaces) is
+    /// extended in the same change.
+    pub(crate) const ALL: [UnservableKind; 4] = [
+        UnservableKind::OversizedChunk,
+        UnservableKind::MissingObject,
+        UnservableKind::ShortObject,
+        UnservableKind::UndecodableChunk,
+    ];
+
+    /// The reason strings of [`Self::ALL`], in the same order -- what
+    /// [`crate::LOG_READ_LOSS_REASONS`] re-exports for seeding and the
+    /// alert parity test.
+    pub(crate) const ALL_REASONS: [&'static str; 4] = [
+        UnservableKind::OversizedChunk.as_static(),
+        UnservableKind::MissingObject.as_static(),
+        UnservableKind::ShortObject.as_static(),
+        UnservableKind::UndecodableChunk.as_static(),
+    ];
+
     pub(super) const fn as_static(self) -> &'static str {
         match self {
             UnservableKind::OversizedChunk => "oversized_chunk",
@@ -198,6 +223,45 @@ pub(super) fn refuse_permanent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// merged_bug_001: every reason `refuse_permanent` can route
+    /// through `note_hole` must be a member of the seeded alphabet
+    /// (`crate::LOG_READ_LOSS_REASONS`) -- an unseeded reason's series
+    /// is born at 1, `increase()` reads 0 over the boot window, and
+    /// the page-on-any-increment alert silently misses the first hole.
+    /// The exhaustive `idx` match makes adding a variant a compile
+    /// error until `ALL` (and through it the alphabet and the HELP)
+    /// is extended in the same change.
+    #[test]
+    fn every_unservable_kind_reason_is_seeded() {
+        fn idx(k: UnservableKind) -> usize {
+            match k {
+                UnservableKind::OversizedChunk => 0,
+                UnservableKind::MissingObject => 1,
+                UnservableKind::ShortObject => 2,
+                UnservableKind::UndecodableChunk => 3,
+            }
+        }
+        let mut seen = [false; UnservableKind::ALL.len()];
+        for k in UnservableKind::ALL {
+            seen[idx(k)] = true;
+            assert!(
+                crate::LOG_READ_LOSS_REASONS.contains(&k.as_static()),
+                "refuse_permanent routes reason {:?} through note_hole, but the \
+                 seeded alphabet (LOG_READ_LOSS_REASONS) does not seed it",
+                k.as_static()
+            );
+        }
+        assert!(
+            seen.iter().all(|s| *s),
+            "ALL must cover every variant exactly once"
+        );
+        assert_eq!(
+            crate::LOG_READ_LOSS_REASONS.len(),
+            UnservableKind::ALL.len(),
+            "the seeded alphabet must be exactly the enum's reasons"
+        );
+    }
 
     /// The hole-identity dedup (merged_bug_164's trio leg 3): N
     /// sightings of one `(exec_id, s3_key)` = one counter increment.
