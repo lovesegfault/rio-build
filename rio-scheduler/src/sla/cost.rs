@@ -1035,9 +1035,13 @@ impl IceBackoff {
             .cells
             .get_mut(cell)
             .expect("force_expire: cell never marked");
-        e.until = Instant::now()
-            .checked_sub(std::time::Duration::from_millis(1))
-            .unwrap_or_else(Instant::now);
+        // Anchoring `until` at the CURRENT instant expires the mask
+        // deterministically: every comparison is strict (`now <
+        // until`), so equality already reads as expired and any later
+        // sample is strictly past it. No Instant subtraction — the
+        // no-preboot-instant policy bans the checked_sub/now-fallback
+        // shape (a silent re-anchor hazard).
+        e.until = Instant::now();
     }
 
     /// Whether `cell` is currently masked. Expired entries are NOT
