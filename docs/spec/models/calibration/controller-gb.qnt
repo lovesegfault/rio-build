@@ -42,7 +42,8 @@ module gbCalibAckAttempted {
     ENABLE_RETRY_BACKOFF = false,
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
-    STREAK_FLOOR = 2
+    STREAK_FLOOR = 2,
+    WINDOW_COUPLED_FOLD = false
   ).* from "../spawnCoherence"
 
   /// The as-built tick with ONE change: the ack covers the attempted
@@ -298,7 +299,8 @@ module gbCalibAckOnlyNew {
     ENABLE_RETRY_BACKOFF = false,
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
-    STREAK_FLOOR = 2
+    STREAK_FLOOR = 2,
+    WINDOW_COUPLED_FOLD = false
   ).* from "../spawnCoherence"
 
   /// The as-built tick with ONE change: only the spawned-this-tick set is

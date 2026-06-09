@@ -47,7 +47,8 @@ module ggCalibTerminatingPending {
     ENABLE_RETRY_BACKOFF = false,
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
-    STREAK_FLOOR = 2
+    STREAK_FLOOR = 2,
+    WINDOW_COUPLED_FOLD = false
   ).* from "../spawnCoherence"
 
   /// PRE-FIX pending predicate: no deletionTimestamp filter.

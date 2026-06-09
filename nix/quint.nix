@@ -6576,6 +6576,29 @@ rec {
       witness = "poisonRespectsWallFloor";
     };
 
+    # bug_028 FALSIFY half (bughunt-5 S2): the as-built window-coupled
+    # streak prune — take(headroom) BEFORE the gate made the fold's
+    # evaluated set the spawn window, so a completing fold RESET the
+    # live streak of an exhausted-and-wanted intent pushed past the
+    # cutoff by priority churn (VForeignStreakWipe latches; the poison
+    # report is livelocked on a ceiling'd pool). The HOLD half is NOT
+    # a new regime: the fixed evaluated-relative law is what the
+    # exhaust-persist / multipool-hold / streak-cadence regimes
+    # already verify (the model's gate order was always
+    # pre-truncation); they stay green with WINDOW_COUPLED_FOLD bound
+    # false and state-space identical (round-4 §4.F16 discipline,
+    # bughunt4-fix-specs.md). Rust-sim discovery seed
+    # 0x2f3a83e7a2c962ea (952ms at ~112k traces/s) recorded in the
+    # introducing commit.
+    # r[verify ctrl.pool.no-eligible-persist+4]
+    quint-spawn-coherence-falsify-truncated-prune = mkQuintWitnessCheck {
+      name = "spawn-coherence-falsify-truncated-prune";
+      spec = "calibration/controller-028-truncated-prune";
+      main = "controller028TruncatedPrune";
+      extraSpecs = [ "spawnCoherence" ];
+      witness = "persistentExhaustionEventuallyReports";
+    };
+
     # bug_113 FALSIFY half: cancel + fast re-submit respawns the
     # deterministic Job name inside the recently_closed window; the
     # cause-only law cancel-selects the fresh Job. Live-import calib

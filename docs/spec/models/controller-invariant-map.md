@@ -1860,3 +1860,43 @@ in 56 s on the CI builder — inside the per-check budget with margin.
   parameter: an owner-less synthesized close does not typecheck) and
   its red-first pair (`left: "exec-a" / right: "exec-b"`). The work
   order sanctions this disposition explicitly; no model change.
+
+## bughunt-5 S2 — bug_028 window-coupled-fold axis (2026-06-09)
+
+- **bug_028 evaluated-relative prune (Model J `WINDOW_COUPLED_FOLD`,
+  default false; §4.F16 discipline per bughunt4-fix-specs.md):** the
+  as-built AD2 gate truncated with `take(headroom)` BEFORE the
+  partition, so the streak fold's evaluated set was the spawn WINDOW
+  and the prune read "absent from gated" as observed recovery — a
+  ceiling'd pool under priority churn livelocked the poison report.
+  The axis models the as-built law faithfully: window cut first
+  (`windowSet`), fold runs only when an in-window intent is exhausted
+  (`windowFoldRuns` — the lazy-LIST trigger), gated intents burn
+  window slots (`toSpawn` axis arm), reports drawn from the window
+  only (`poisonedBase` conjunct), and a completing fold RESETS
+  out-of-window live streaks — `VForeignStreakWipe` latches
+  (reset-without-observation, the same latch family as the m117
+  foreign wipe; `persistentExhaustionEventuallyReports` is its safety
+  form). FALSIFY: `calibration/controller-028-truncated-prune.qnt`
+  (`quint-spawn-coherence-falsify-truncated-prune`) — TLC violation
+  in 4,423 ms, 32,857 generated / 5,941 distinct (default 1800 s
+  budget, ~400x headroom); rust-sim discovery seed
+  0x2f3a83e7a2c962ea (952 ms at ~112k traces/s). HOLD: NO new regime
+  — the fixed evaluated-relative law (`Observation::from_partition`
+  prune input; gate over all wanted intents) is the law the existing
+  `exhaust-persist`, `multipool-hold`, and `streak-cadence` regimes
+  always encoded (the model's gate order was pre-truncation; the
+  implementation diverged and is rejoined). Byte-identity re-measure
+  with the axis bound false: `quint-spawn-coherence-streak-cadence`
+  = 250,483,073 generated / 11,627,904 distinct (EXACT match to the
+  banked baseline; 127.3 s vs banked 118.6 s wall — time varies,
+  states identical). All 21 in-file instance modules + 10 calibration
+  importers bind the const (hazard cc/x audit; every override module
+  typechecked solo per hazard ccccc — the axis adds NO state vars, so
+  override frames are untouched).
+- **Model S `noFabricatedCompletion` (executor map) — unaffected,
+  noted for checker honesty:** the model already assumes the
+  synthesize-on-delete binds the open attempt; bug_071's fix makes
+  the implementation actually REACH that binding under production
+  identity shapes (`MintedPullIdentity` classifier). No model change;
+  the m298 below-granularity disposition above stands.

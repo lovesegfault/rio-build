@@ -305,6 +305,21 @@ module spawnCoherence {
   /// Wall units a streak must span before the verdict may fire (2 =
   /// the 20s wall floor over the ~10s reconcile cadence, abstracted).
   const STREAK_FLOOR: int
+  /// bug_028 axis (bughunt-5 S2; default false per the round-4 SS4.F16
+  /// discipline, bughunt4-fix-specs.md --- every pre-existing regime
+  /// binds false and stays state-space identical): the AS-BUILT
+  /// window-coupled fold. True = the streak fold's evaluated set is
+  /// the post-truncate spawn WINDOW (take(headroom) before the gate):
+  /// the fold runs only when an in-window intent is exhausted, gated
+  /// intents burn window slots, the report can only name in-window
+  /// intents, and a live streak whose intent is exhausted-and-wanted
+  /// but OUT of the window is RESET by the completing fold --- the
+  /// reset-without-observation the VForeignStreakWipe latch records
+  /// (the safety form of "persistent exhaustion eventually reports").
+  /// False = the fixed law: the fold evaluates every wanted intent
+  /// (the order this model always encoded --- the implementation
+  /// diverged; the twin pins the divergence as a falsified law).
+  const WINDOW_COUPLED_FOLD: bool
 
   pure val INTENTS: Set[IntentId] = Set("i1", "i2")
 
@@ -637,21 +652,52 @@ module spawnCoherence {
     // or immediately (the as-built law).
     val spawnCandidates = wantedCandidates.filter(i =>
       not(ENABLE_EXHAUST_POISON and exhausted.get(i)))
+    // bug_028 axis: the as-built spawn WINDOW (take(headroom) BEFORE
+    // the gate) and its fold-completion condition (the lazy LIST runs
+    // only when an in-window intent carries exclusions). Pure derived
+    // vals --- zero state cost off-axis.
+    val windowSet = wantedCandidates.filter(i =>
+      wantedCandidates.filter(o => idRank(o) < idRank(i)).size() < headroom)
+    val windowFoldRuns = windowSet.filter(i =>
+      ENABLE_EXHAUST_POISON and exhausted.get(i)).size() > 0
     // m073: a fold-skip tick retains streak state untouched (no step,
     // no reset) — sub-second re-reconciles must not advance the count.
-    val streakAfter = if (foldSkip) streak else INTENTS.mapBy(i =>
-      if (ENABLE_EXHAUST_POISON and exhausted.get(i)
-          and postGate.contains(i) and jobsAtList.get(i).phase == JAbsent)
-        clampStreak(streak.get(i) + 1)
-      else 0)
+    val streakAfter =
+      if (foldSkip) streak
+      else if (WINDOW_COUPLED_FOLD)
+        // As-built: the fold's domain is the WINDOW; a no-exhausted-
+        // in-window tick skips the fold entirely (retain), and a
+        // completing fold resets everything outside its gated set ---
+        // including out-of-window live streaks (the bug_028 wipe).
+        (if (not(windowFoldRuns)) streak else INTENTS.mapBy(i =>
+          if (ENABLE_EXHAUST_POISON and exhausted.get(i)
+              and windowSet.contains(i) and jobsAtList.get(i).phase == JAbsent)
+            clampStreak(streak.get(i) + 1)
+          else 0))
+      else INTENTS.mapBy(i =>
+        if (ENABLE_EXHAUST_POISON and exhausted.get(i)
+            and postGate.contains(i) and jobsAtList.get(i).phase == JAbsent)
+          clampStreak(streak.get(i) + 1)
+        else 0)
     // merged_bug_117 ghost: the same fold over the pool's OWN count —
     // identical condition, so under pool-keying streak == ownGatedTicks
     // by construction; a foreign double-step makes them diverge.
-    val ownObsAfter = if (foldSkip) ownGatedTicks else INTENTS.mapBy(i =>
-      if (ENABLE_EXHAUST_POISON and exhausted.get(i)
-          and postGate.contains(i) and jobsAtList.get(i).phase == JAbsent)
-        clampStreak(ownGatedTicks.get(i) + 1)
-      else 0)
+    val ownObsAfter =
+      if (foldSkip) ownGatedTicks
+      else if (WINDOW_COUPLED_FOLD)
+        // Mirrors streakAfter's window law exactly (the ghost tracks
+        // the fold actually performed; its foreign-double-step role
+        // is meaningful only under ENABLE_MULTI_POOL).
+        (if (not(windowFoldRuns)) ownGatedTicks else INTENTS.mapBy(i =>
+          if (ENABLE_EXHAUST_POISON and exhausted.get(i)
+              and windowSet.contains(i) and jobsAtList.get(i).phase == JAbsent)
+            clampStreak(ownGatedTicks.get(i) + 1)
+          else 0))
+      else INTENTS.mapBy(i =>
+        if (ENABLE_EXHAUST_POISON and exhausted.get(i)
+            and postGate.contains(i) and jobsAtList.get(i).phase == JAbsent)
+          clampStreak(ownGatedTicks.get(i) + 1)
+        else 0)
     // m073: each live streak's wall age after this tick — born 0 at
     // the streak's birth tick, advanced by the wall (whether or not
     // the fold ran — a skipped fold does not stop the clock), reset
@@ -669,6 +715,9 @@ module spawnCoherence {
     val poisonedBase = INTENTS.filter(i =>
       ENABLE_EXHAUST_POISON and exhausted.get(i)
       and postGate.contains(i) and jobsAtList.get(i).phase == JAbsent
+      // bug_028 axis: as-built, the report is drawn from a COMPLETED
+      // fold's gated set --- in-window intents only.
+      and (not(WINDOW_COUPLED_FOLD) or (windowFoldRuns and windowSet.contains(i)))
       and (if (ENABLE_EXHAUST_PERSIST) streakAfter.get(i) >= 3
            else streakAfter.get(i) >= 1))
     // m073: the verdict carries the wall floor — only when ENFORCED
@@ -677,8 +726,13 @@ module spawnCoherence {
     val poisoned = poisonedBase.filter(i =>
       not(STREAK_FLOOR_ENFORCED)
       or streakWallAgeAfter.get(i) >= STREAK_FLOOR)
-    val toSpawn = spawnCandidates.filter(i =>
-      spawnCandidates.filter(o => idRank(o) < idRank(i)).size() < headroom)
+    val toSpawn =
+      if (WINDOW_COUPLED_FOLD)
+        // As-built: the window is cut FIRST, then gated intents are
+        // withheld --- a gated intent burns its slot.
+        windowSet.filter(i => not(ENABLE_EXHAUST_POISON and exhausted.get(i)))
+      else spawnCandidates.filter(i =>
+        spawnCandidates.filter(o => idRank(o) < idRank(i)).size() < headroom)
     // The create's outcome depends on the slot's truth at create time:
     // terminal-collision reaps were background deletes (object gone),
     // foreground deletes leave a Terminating object => 409.
@@ -820,6 +874,18 @@ module spawnCoherence {
     // double-step inflated the shared entry).
     val vPoisonForeign =
       poisoned.filter(i => ownObsAfter.get(i) < 3).size() > 0
+    // bug_028: a completing window-coupled fold RESET a live streak
+    // for an intent it never evaluated --- exhausted, wanted, job-
+    // absent (it would have stepped under the all-wanted law) but
+    // pushed out of the window. Reset-without-observation is the same
+    // latch family as the m117 foreign wipe: persistent exhaustion
+    // never reports.
+    val vWindowWipe =
+      WINDOW_COUPLED_FOLD and not(foldSkip) and windowFoldRuns and
+      INTENTS.filter(i =>
+        streak.get(i) > 0 and exhausted.get(i)
+        and postGate.contains(i) and jobsAtList.get(i).phase == JAbsent
+        and not(windowSet.contains(i))).size() > 0
     // m073: a poison verdict on a streak younger than the wall floor
     // (the reconcile-burst verdict). Under ENFORCED the floor conjunct
     // above empties this set by construction — the enforcement IS the
@@ -908,6 +974,7 @@ module spawnCoherence {
         .union(if (vCancelNonC) Set(VCancelNonCancelled) else Set())
         .union(if (vCancelPostClose) Set(VCancelPostCloseJob) else Set())
         .union(if (vPoisonForeign) Set(VPoisonForeignCount) else Set())
+        .union(if (vWindowWipe) Set(VForeignStreakWipe) else Set())
         .union(if (vPoisonBurst) Set(VPoisonBurst) else Set())
         .union(if (vYoungReap) Set(VYoungLeaderReap) else Set())
 
@@ -1635,7 +1702,8 @@ module spawnCoherenceBase {
     ENABLE_RETRY_BACKOFF = false,
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
-    STREAK_FLOOR = 2
+    STREAK_FLOOR = 2,
+    WINDOW_COUPLED_FOLD = false
   ).*
 }
 
@@ -1664,7 +1732,8 @@ module spawnCoherenceFaultRpc {
     ENABLE_RETRY_BACKOFF = false,
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
-    STREAK_FLOOR = 2
+    STREAK_FLOOR = 2,
+    WINDOW_COUPLED_FOLD = false
   ).*
 }
 
@@ -1694,7 +1763,8 @@ module spawnCoherenceFaultLease {
     ENABLE_RETRY_BACKOFF = false,
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
-    STREAK_FLOOR = 2
+    STREAK_FLOOR = 2,
+    WINDOW_COUPLED_FOLD = false
   ).*
 }
 
@@ -1724,7 +1794,8 @@ module spawnCoherenceFaultStale {
     ENABLE_RETRY_BACKOFF = false,
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
-    STREAK_FLOOR = 2
+    STREAK_FLOOR = 2,
+    WINDOW_COUPLED_FOLD = false
   ).*
 }
 
@@ -1754,7 +1825,8 @@ module spawnCoherenceCrdAbsent {
     ENABLE_RETRY_BACKOFF = false,
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
-    STREAK_FLOOR = 2
+    STREAK_FLOOR = 2,
+    WINDOW_COUPLED_FOLD = false
   ).*
 }
 
@@ -1783,7 +1855,8 @@ module spawnCoherenceFetcher {
     ENABLE_RETRY_BACKOFF = false,
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
-    STREAK_FLOOR = 2
+    STREAK_FLOOR = 2,
+    WINDOW_COUPLED_FOLD = false
   ).*
 }
 
@@ -1816,7 +1889,8 @@ module spawnCoherenceMatJobs {
     ENABLE_RETRY_BACKOFF = false,
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
-    STREAK_FLOOR = 2
+    STREAK_FLOOR = 2,
+    WINDOW_COUPLED_FOLD = false
   ).*
 }
 
@@ -1850,7 +1924,8 @@ module spawnCoherenceRenderedDeadline {
     ENABLE_RETRY_BACKOFF = false,
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
-    STREAK_FLOOR = 2
+    STREAK_FLOOR = 2,
+    WINDOW_COUPLED_FOLD = false
   ).*
 }
 
@@ -1880,7 +1955,8 @@ module spawnCoherenceExhaustAsBuilt {
     ENABLE_RETRY_BACKOFF = false,
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
-    STREAK_FLOOR = 2
+    STREAK_FLOOR = 2,
+    WINDOW_COUPLED_FOLD = false
   ).*
 }
 
@@ -1911,7 +1987,8 @@ module spawnCoherenceExhaustPersist {
     ENABLE_RETRY_BACKOFF = false,
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
-    STREAK_FLOOR = 2
+    STREAK_FLOOR = 2,
+    WINDOW_COUPLED_FOLD = false
   ).*
 }
 
@@ -1941,7 +2018,8 @@ module spawnCoherenceCancelAsBuilt {
     ENABLE_RETRY_BACKOFF = false,
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
-    STREAK_FLOOR = 2
+    STREAK_FLOOR = 2,
+    WINDOW_COUPLED_FOLD = false
   ).*
 }
 
@@ -1971,7 +2049,8 @@ module spawnCoherenceCancelCause {
     ENABLE_RETRY_BACKOFF = false,
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
-    STREAK_FLOOR = 2
+    STREAK_FLOOR = 2,
+    WINDOW_COUPLED_FOLD = false
   ).*
 }
 
@@ -2005,7 +2084,8 @@ module spawnCoherenceReapYoungLeader {
     ENABLE_RETRY_BACKOFF = false,
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
-    STREAK_FLOOR = 2
+    STREAK_FLOOR = 2,
+    WINDOW_COUPLED_FOLD = false
   ).*
 }
 
@@ -2036,7 +2116,8 @@ module spawnCoherenceSynthCloseAsBuilt {
     ENABLE_RETRY_BACKOFF = false,
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
-    STREAK_FLOOR = 2
+    STREAK_FLOOR = 2,
+    WINDOW_COUPLED_FOLD = false
   ).*
 }
 
@@ -2067,7 +2148,8 @@ module spawnCoherenceSynthClosePinned {
     ENABLE_RETRY_BACKOFF = false,
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
-    STREAK_FLOOR = 2
+    STREAK_FLOOR = 2,
+    WINDOW_COUPLED_FOLD = false
   ).*
 }
 
@@ -2097,7 +2179,8 @@ module spawnCoherenceRetryBackoff {
     ENABLE_RETRY_BACKOFF = true,
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
-    STREAK_FLOOR = 2
+    STREAK_FLOOR = 2,
+    WINDOW_COUPLED_FOLD = false
   ).*
 }
 
@@ -2130,7 +2213,8 @@ module spawnCoherenceMultiPoolAsBuilt {
     ENABLE_RETRY_BACKOFF = false,
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
-    STREAK_FLOOR = 2
+    STREAK_FLOOR = 2,
+    WINDOW_COUPLED_FOLD = false
   ).*
 }
 
@@ -2161,7 +2245,8 @@ module spawnCoherenceMultiPool {
     ENABLE_RETRY_BACKOFF = false,
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
-    STREAK_FLOOR = 2
+    STREAK_FLOOR = 2,
+    WINDOW_COUPLED_FOLD = false
   ).*
 }
 
@@ -2194,7 +2279,8 @@ module spawnCoherenceCancelGenAsBuilt {
     ENABLE_RETRY_BACKOFF = false,
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
-    STREAK_FLOOR = 2
+    STREAK_FLOOR = 2,
+    WINDOW_COUPLED_FOLD = false
   ).*
 }
 
@@ -2224,7 +2310,8 @@ module spawnCoherenceCancelGeneration {
     ENABLE_RETRY_BACKOFF = false,
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
-    STREAK_FLOOR = 2
+    STREAK_FLOOR = 2,
+    WINDOW_COUPLED_FOLD = false
   ).*
 }
 
@@ -2266,6 +2353,7 @@ module spawnCoherenceStreakCadence {
     ENABLE_RETRY_BACKOFF = false,
     ENABLE_STREAK_CADENCE = true,
     STREAK_FLOOR_ENFORCED = true,
-    STREAK_FLOOR = 2
+    STREAK_FLOOR = 2,
+    WINDOW_COUPLED_FOLD = false
   ).*
 }
