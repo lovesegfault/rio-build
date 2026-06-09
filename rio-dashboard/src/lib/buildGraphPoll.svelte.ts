@@ -16,18 +16,30 @@
 // frozen-snapshot configuration is unrepresentable: there is no second
 // status source to capture from.
 //
-// r[impl dash.graph.auto-stop]
-// The auto-stop law moves here with the poll: once every node settles
-// (and the view is complete — see the guards on the latch), the
-// interval stops; `onCleared` un-latches and restarts it, which is
-// exactly the contract ClearPoisonButton documents ("the next 5s poll
-// picks up the new status") — pre-fix the latch made that contract
-// unsatisfiable: the poll was permanently stopped on a settled build,
-// so the cleared node rendered poisoned until remount.
+// r[impl dash.graph.auto-stop+1]
+// The settle law lives here with the poll (merged_bug_043): once every
+// node settles (and the view is complete — see the guards on the
+// latch), the poll DOWNSHIFTS to the settled cadence
+// (SETTLED_POLL_MS) instead of stopping — liveness for out-of-band
+// clears (rio-cli, the admin RPC, another session) never depends on
+// in-process notification; a settled drawer discovers them within the
+// settled cadence and upshifts. `onCleared` still restores the live
+// cadence immediately, which is exactly the contract
+// ClearPoisonButton documents ("the next 5s poll picks up the new
+// status"). Every completion-side state write is fenced by the
+// dispatch generation (pollEpoch): a response dispatched before a
+// clear/destroy is discarded wholesale by the single `settle`
+// applier, so unfenced response-driven latching is unwritable.
 import { admin } from '../api/admin';
 import { TERMINAL } from './graphLayout';
 import type { RawEdge, RawNode } from './layoutCore';
-import { startPoll } from './poll';
+import { POLL_MS, startPoll } from './poll';
+
+/** Settled-state poll cadence (merged_bug_043): a drawer whose build
+ * fully settled keeps probing — slowly — so a ClearPoison from
+ * rio-cli/admin RPC/another session is discovered within this bound
+ * (12 → 2 RPC/min per settled drawer). */
+export const SETTLED_POLL_MS = 30_000;
 
 export type BuildGraphPoll = {
   /** Latest GetBuildGraph node set ($state.raw — wholesale replaced
@@ -62,53 +74,106 @@ export function createBuildGraphPoll(buildId: string): BuildGraphPoll {
   let error = $state<string | null>(null);
   let allTerminal = $state(false);
 
-  // Re-entrancy gate: the interval fires regardless of whether the
-  // last fetch finished — a slow network means overlapping calls, and
-  // concurrent responses can land out of order (last-write-wins on the
-  // state). The gate serializes the pipeline (same discipline the
-  // in-component poll had).
-  let inflight = false;
-  // Live until destroy(); the interval handle is null while stopped
-  // (settled) and re-minted by onCleared.
+  // Dispatch generation (merged_bug_043): captured when a fetch is
+  // dispatched, compared by the single `settle` applier when its
+  // response lands. `onCleared` and `destroy` bump it, so completions
+  // whose server read predates the clear are discarded wholesale —
+  // there is no unfenced write path for a response to re-latch
+  // through.
+  let pollEpoch = 0;
+  // Re-entrancy gate, epoch-keyed: a CURRENT-epoch fetch in flight
+  // serializes the pipeline (slow network, overlapping ticks), but a
+  // STALE in-flight fetch must not swallow the restart's immediate
+  // shot after a clear — its epoch differs, so a fresh dispatch
+  // proceeds.
+  let inflightEpoch: number | null = null;
   let destroyed = false;
+  // Live until destroy(); never null while alive — settling swaps the
+  // cadence instead of stopping (the downshift).
   let stop: (() => void) | null = null;
 
+  /** Swap the poll cadence. `immediate` fires one shot now (the
+   * onCleared contract); the settled downshift arms the interval
+   * only — the response that settled IS the current state. */
+  function startCadence(ms: number, immediate: boolean): void {
+    stop?.();
+    if (immediate) {
+      stop = startPoll(fetchNow, ms);
+    } else {
+      // Same loop shape as startPoll minus the leading shot; the
+      // document.hidden gate matches it (tab-switch quiesce).
+      const id = setInterval(() => {
+        if (document.hidden) return;
+        void fetchNow();
+      }, ms);
+      stop = () => clearInterval(id);
+    }
+  }
+
+  /** THE fenced applier (merged_bug_043): every completion-side state
+   * write — the latch AND nodes/edges/truncated/totalNodes/error —
+   * lands here, and only when the response's dispatch generation is
+   * still current. Cadence shifts ride the latch EDGES, so a steady
+   * settled state re-arms nothing. */
+  function settle(
+    epoch: number,
+    outcome: {
+      response?: Awaited<ReturnType<typeof admin.getBuildGraph>>;
+      error?: unknown;
+    },
+  ): void {
+    if (destroyed || epoch !== pollEpoch) return;
+    if (outcome.response === undefined) {
+      error = String(outcome.error);
+      loading = false;
+      return;
+    }
+    const r = outcome.response;
+    error = null;
+    // Terminal-settle check. `r.nodes.length > 0` guards the trivial
+    // every([])→true — an empty response (build not yet populated)
+    // must NOT settle. `!r.truncated` guards against settling on a
+    // partial view: insertion-order truncation means roots settle
+    // first while the tail may still run.
+    const settled =
+      !r.truncated &&
+      r.nodes.length > 0 &&
+      r.nodes.every((n: RawNode) => TERMINAL.has(n.status));
+    if (settled && !allTerminal) {
+      allTerminal = true;
+      // Downshift, don't stop: out-of-band clears are discovered
+      // within SETTLED_POLL_MS (no immediate shot — this response
+      // IS the settled state).
+      startCadence(SETTLED_POLL_MS, false);
+    } else if (!settled && allTerminal) {
+      // The settled probe found live work (an out-of-band clear):
+      // un-latch and restore the live cadence.
+      allTerminal = false;
+      startCadence(POLL_MS, false);
+    }
+    nodes = r.nodes;
+    edges = r.edges;
+    truncated = r.truncated;
+    totalNodes = r.totalNodes;
+    loading = false;
+  }
+
   async function fetchNow(): Promise<void> {
-    if (inflight || destroyed) return;
-    inflight = true;
+    if (destroyed) return;
+    const epoch = pollEpoch;
+    if (inflightEpoch === epoch) return;
+    inflightEpoch = epoch;
     try {
       let r;
       try {
         r = await admin.getBuildGraph({ buildId });
-        error = null;
       } catch (e) {
-        error = String(e);
-        loading = false;
+        settle(epoch, { error: e });
         return;
       }
-      // Terminal-settle check. `r.nodes.length > 0` guards the trivial
-      // every([])→true — an empty response (build not yet populated)
-      // must NOT stop polling. `!r.truncated` guards against settling
-      // on a partial view: insertion-order truncation means roots
-      // settle first while the tail may still run.
-      if (
-        !r.truncated &&
-        r.nodes.length > 0 &&
-        r.nodes.every((n: RawNode) => TERMINAL.has(n.status))
-      ) {
-        allTerminal = true;
-        // Stop the interval; the response that latched IS the final
-        // state. onCleared un-latches and restarts.
-        stop?.();
-        stop = null;
-      }
-      nodes = r.nodes;
-      edges = r.edges;
-      truncated = r.truncated;
-      totalNodes = r.totalNodes;
-      loading = false;
+      settle(epoch, { response: r });
     } finally {
-      inflight = false;
+      if (inflightEpoch === epoch) inflightEpoch = null;
     }
   }
 
@@ -142,15 +207,18 @@ export function createBuildGraphPoll(buildId: string): BuildGraphPoll {
     },
     onCleared() {
       if (destroyed) return;
+      // The clear invalidates every in-flight dispatch: a response
+      // whose server read predates it must not re-latch.
+      pollEpoch += 1;
       allTerminal = false;
-      if (stop === null) {
-        // startPoll fires immediately, then resumes the 5s cadence —
-        // the cleared node's queued status lands on the first shot.
-        stop = startPoll(fetchNow);
-      }
+      // Restore the live cadence with an immediate shot — the
+      // cleared node's queued status lands on the first poll
+      // (the ClearPoisonButton contract).
+      startCadence(POLL_MS, true);
     },
     destroy() {
       destroyed = true;
+      pollEpoch += 1;
       stop?.();
       stop = null;
     },

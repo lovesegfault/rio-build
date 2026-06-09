@@ -312,15 +312,25 @@ lower floor there; the dashboard tab has neither bound.
   builds.
 ]
 
-#r("dash.graph.auto-stop")[
-  The Graph tab's 5s `GetBuildGraph` poll MUST stop once every node is in a
-  terminal status (per `graphLayout.TERMINAL`, which mirrors `is_terminal()`
-  scheduler-side). The check is gated on `!truncated && nodes.length > 0` ---
+#r("dash.graph.auto-stop+1")[
+  The Graph tab's 5s `GetBuildGraph` poll MUST downshift to the settled
+  cadence (`SETTLED_POLL_MS`, 30s) once every node is in a terminal status
+  (per `graphLayout.TERMINAL`, which mirrors `is_terminal()`
+  scheduler-side) --- never stop outright: a `ClearPoison` issued out of
+  band (rio-cli, the admin RPC, another session) MUST be discovered within
+  the settled cadence and restore the live cadence, without depending on
+  in-process notification. The settle check is gated on
+  `!truncated && nodes.length > 0` ---
   an empty response (build not yet populated) and a truncated response
   (visible-terminal ≠ all-terminal under insertion-order truncation) MUST NOT
-  stop polling. The poll is also serialized by an `inflight` re-entrancy gate
+  settle the poll. Responses are applied only when their dispatch
+  generation is current: a clear or teardown invalidates every in-flight
+  fetch, so a response whose server read predates the clear MUST NOT
+  re-latch the settled state. The poll is also serialized by an
+  epoch-keyed `inflight` re-entrancy gate
   so a slow fetch + slow worker layout don't overlap and last-write-wins with
-  stale statuses.
+  stale statuses --- while a STALE in-flight fetch never swallows the
+  restart's immediate shot after a clear.
 ]
 
 #r("dash.executors.kind-filter")[

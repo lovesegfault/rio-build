@@ -1,13 +1,14 @@
-// r[verify dash.graph.auto-stop]
+// r[verify dash.graph.auto-stop+1]
 // The drawer-lifetime poll store (merged_bug_134): one reactive
 // node-status source feeding Graph's rendering AND the log stream's
 // terminality oracle. The poll-loop semantics moved here from
 // Graph.svelte (which unmounts on the Logs tab — exactly why the
 // oracle had been frozen at click time); the original component-level
-// battery (inflight gate, terminal stop, empty-response no-stop)
-// migrates with the code, plus the two laws the move exists for:
-// statusOf is LIVE in both directions, and onCleared restarts a
-// settled poll.
+// battery (inflight gate, terminal settle, empty-response no-stop)
+// migrates with the code, plus the laws the move exists for:
+// statusOf is LIVE in both directions, onCleared restarts a settled
+// poll, and (merged_bug_043) responses are epoch-fenced while settled
+// state downshifts to the slow cadence instead of stopping.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -69,7 +70,7 @@ describe('createBuildGraphPoll', () => {
     p.destroy();
   });
 
-  it('stops polling once every node is terminal', async () => {
+  it('downshifts to the settled cadence once every node is terminal', async () => {
     getBuildGraph
       .mockResolvedValueOnce(mkResp(['running', 'completed']))
       .mockResolvedValue(mkResp(['completed', 'skipped']));
@@ -84,8 +85,21 @@ describe('createBuildGraphPoll', () => {
     expect(p.allTerminal).toBe(true);
     const settled = getBuildGraph.mock.calls.length;
 
-    await vi.advanceTimersByTimeAsync(60_000);
+    // The live 5s cadence is gone: nothing fires before the settled
+    // interval elapses...
+    await vi.advanceTimersByTimeAsync(25_000);
+    await flush();
     expect(getBuildGraph).toHaveBeenCalledTimes(settled);
+    // ...and the settled cadence probes (still terminal: stays
+    // settled, 2 RPC/min instead of 12).
+    await vi.advanceTimersByTimeAsync(5000);
+    await flush();
+    expect(getBuildGraph).toHaveBeenCalledTimes(settled + 1);
+    expect(p.allTerminal).toBe(true);
+    await vi.advanceTimersByTimeAsync(30_000);
+    await flush();
+    expect(getBuildGraph).toHaveBeenCalledTimes(settled + 2);
+    expect(p.allTerminal).toBe(true);
     p.destroy();
   });
 
@@ -166,12 +180,13 @@ describe('createBuildGraphPoll', () => {
     await flush();
     expect(p.allTerminal).toBe(true);
     const settled = getBuildGraph.mock.calls.length;
-    // Settled: the interval is gone.
-    await vi.advanceTimersByTimeAsync(30_000);
+    // Settled: the live cadence is gone (the settled interval has
+    // not elapsed yet).
+    await vi.advanceTimersByTimeAsync(25_000);
     expect(getBuildGraph).toHaveBeenCalledTimes(settled);
 
-    // ClearPoison → immediate fetch (queued), polling resumes, then
-    // re-latches on the completed view.
+    // ClearPoison → immediate fetch (queued), polling resumes at the
+    // live cadence, then re-latches on the completed view.
     p.onCleared();
     await flush();
     expect(p.allTerminal).toBe(false);
@@ -180,8 +195,74 @@ describe('createBuildGraphPoll', () => {
     await flush();
     expect(p.allTerminal).toBe(true);
     const resettled = getBuildGraph.mock.calls.length;
-    await vi.advanceTimersByTimeAsync(30_000);
+    // Re-settled: quiet through the live cadence window again.
+    await vi.advanceTimersByTimeAsync(25_000);
     expect(getBuildGraph).toHaveBeenCalledTimes(resettled);
+    p.destroy();
+  });
+
+  it('stale_inflight_response_cannot_relatch_after_clear: a response whose server read predates the clear is discarded', async () => {
+    // merged_bug_043 red #1: the latch fired purely on response
+    // content with no generation fence, and onCleared never
+    // invalidated the in-flight fetch — a GetBuildGraph response
+    // whose server read predates the clear re-latched and stopped
+    // the poll on the stale snapshot.
+    let release!: (v: unknown) => void;
+    getBuildGraph
+      .mockImplementationOnce(() => new Promise((r) => (release = r)))
+      .mockResolvedValue(mkResp(['queued']));
+
+    const p = createBuildGraphPoll('b-8');
+    await flush();
+    expect(getBuildGraph).toHaveBeenCalledTimes(1);
+
+    // ClearPoison lands while the fetch is in flight: the clear
+    // invalidates everything dispatched before it.
+    p.onCleared();
+    await flush();
+
+    // The held (pre-clear) response resolves all-terminal — the
+    // server read it answers predates the clear.
+    release(mkResp(['poisoned']));
+    await flush();
+
+    expect(p.allTerminal).toBe(false);
+    // The poll is alive on the live cadence: the next tick fetches.
+    const before = getBuildGraph.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(5000);
+    await flush();
+    expect(getBuildGraph.mock.calls.length).toBeGreaterThan(before);
+    p.destroy();
+  });
+
+  it('out_of_band_clear_is_discovered_without_oncleared: a CLI/admin clear un-settles within the settled cadence', async () => {
+    // merged_bug_043 red #2: the only production onCleared wiring is
+    // the ClearPoisonButton chain — a clear from rio-cli, the admin
+    // RPC, or another session never un-latched, freezing the drawer
+    // on the poisoned snapshot until remount. Settled state must
+    // DOWNSHIFT (slow cadence), not stop: liveness for out-of-band
+    // clears cannot depend on in-process notification.
+    getBuildGraph
+      .mockResolvedValueOnce(mkResp(['poisoned']))
+      .mockResolvedValue(mkResp(['running']));
+
+    const p = createBuildGraphPoll('b-9');
+    await flush();
+    expect(p.allTerminal).toBe(true);
+    const settled = getBuildGraph.mock.calls.length;
+
+    // The out-of-band clear re-runs the node; NO onCleared fires in
+    // this tab. The settled cadence discovers it.
+    await vi.advanceTimersByTimeAsync(30_000);
+    await flush();
+    expect(getBuildGraph.mock.calls.length).toBeGreaterThan(settled);
+    expect(p.allTerminal).toBe(false);
+
+    // Discovery restores the live 5s cadence.
+    const upshifted = getBuildGraph.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(5000);
+    await flush();
+    expect(getBuildGraph.mock.calls.length).toBeGreaterThan(upshifted);
     p.destroy();
   });
 
