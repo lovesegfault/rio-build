@@ -1018,7 +1018,7 @@
     {
       "path": "actor/materialize.rs",
       "depth": 1,
-      "doc": "Materialization-job actor logic — the substitution mechanism"
+      "doc": "Materialization-job actor logic — the substitution mechanism."
     },
     {
       "path": "actor/merge.rs",

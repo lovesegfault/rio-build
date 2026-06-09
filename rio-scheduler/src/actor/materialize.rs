@@ -1,5 +1,5 @@
-//! Materialization-job actor logic — the substitution mechanism
-//! (unconditional since the substitution-replacement cutover).
+//! Materialization-job actor logic — the substitution mechanism.
+//! Unconditional since the substitution-replacement cutover.
 //! Design: substitution-replacement-design.md §2; spec:
 //! sched.materialize.{job,routing,pinning}.
 // r[impl sched.materialize.job+2]
@@ -892,9 +892,6 @@ impl DagActor {
         }
     }
 
-    /// Post-commit feed of the in-memory job view from the merge
-    /// transaction's created-jobs list. Called only AFTER the merge tx
-    /// committed (never inside it — a rolled-back merge must leave no
     /// Convert a durable pending-job row into its view entry (the
     /// recovery rebuild's per-row shape, shared by the dedup re-feed
     /// and the backstop sweep).
@@ -1005,6 +1002,9 @@ impl DagActor {
         }
     }
 
+    /// Post-commit feed of the in-memory job view from the merge
+    /// transaction's created-jobs list. Called only AFTER the merge tx
+    /// committed (never inside it — a rolled-back merge must leave no
     /// view entry), in the same post-commit phase that seeds states.
     ///
     /// `entry().or_insert()` (DQ-1 armament preservation, T-D2.1): the
