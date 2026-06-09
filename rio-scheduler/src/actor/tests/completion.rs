@@ -4630,3 +4630,96 @@ async fn cancelled_completion_report_fills_the_line_count() -> TestResult {
     );
     Ok(())
 }
+
+/// merged_bug_200: rio_scheduler_store_degraded_requeues_total ticked
+/// at CLASSIFICATION time -- before the claims-floor fence, the
+/// appending transaction, and the dag presence guard -- so the counter
+/// counted outcomes that never settled: a fenced drop ticked "paced"
+/// with no requeue, a failed appending tx ticked once per re-delivery
+/// (N ticks, one committed row -- exactly during PG brownouts), and a
+/// DAG-absent report ticked then early-returned. Same
+/// per-delivery-vs-settled shape as the bug_086 width-event close: the
+/// disposition now returns the label and the single POST-COMMIT site
+/// emits it.
+#[tokio::test]
+async fn store_degraded_counter_ticks_only_on_commit() -> TestResult {
+    let recorder = rio_test_support::metrics::CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let derivation_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO derivations (drv_hash, drv_path, pname, system, status) \
+         VALUES ($1, $2, 'pkg', 'x86_64-linux', 'assigned') \
+         RETURNING derivation_id",
+    )
+    .bind("settle-tick-drv")
+    .bind(test_drv_path("settle-tick-drv"))
+    .fetch_one(&db.pool)
+    .await?;
+
+    let mut actor = bare_actor(db.pool.clone());
+    actor.test_inject_ready_row(crate::db::RecoveryDerivationRow {
+        derivation_id,
+        ..crate::db::RecoveryDerivationRow::test_default("settle-tick-drv", "x86_64-linux")
+    });
+    actor
+        .dag
+        .node_mut("settle-tick-drv")
+        .expect("just injected")
+        .set_status_for_test(DerivationStatus::Assigned);
+    // Corroborate via the store-health leg.
+    actor.note_issued_store_rpc_failure("test-seed");
+
+    // Delivery 1: the appending transaction FAILS (RecordFailed, the
+    // report will be re-delivered). Nothing settled -- nothing ticks.
+    actor.fail_next_attempt_append = true;
+    let outcome = actor
+        .handle_infrastructure_failure(
+            &DrvHash::from("settle-tick-drv"),
+            &crate::state::ExecutorId::from("w-st"),
+            crate::actor::report_ctx::FailureReportCtx::infra(
+                None,
+                "FUSE EIO: store unreachable",
+                true,
+            ),
+        )
+        .await;
+    assert!(
+        matches!(
+            outcome,
+            crate::actor::completion::FailureHandling::RecordFailed
+        ),
+        "injection must fail the appending tx, got {outcome:?}"
+    );
+    let after_failed =
+        recorder.get("rio_scheduler_store_degraded_requeues_total{disposition=paced}");
+    assert_eq!(
+        after_failed, 0,
+        "left: {after_failed} / right: 0 (a failed appending tx settles \
+         nothing -- the disposition counter must not tick per delivery)"
+    );
+
+    // Delivery 2 (the re-delivery): commits -- exactly one tick.
+    let outcome = actor
+        .handle_infrastructure_failure(
+            &DrvHash::from("settle-tick-drv"),
+            &crate::state::ExecutorId::from("w-st"),
+            crate::actor::report_ctx::FailureReportCtx::infra(
+                None,
+                "FUSE EIO: store unreachable",
+                true,
+            ),
+        )
+        .await;
+    assert!(
+        matches!(outcome, crate::actor::completion::FailureHandling::Handled),
+        "re-delivery must commit, got {outcome:?}"
+    );
+    assert_eq!(
+        recorder.get("rio_scheduler_store_degraded_requeues_total{disposition=paced}"),
+        1,
+        "the committed re-delivery ticks exactly once"
+    );
+    Ok(())
+}

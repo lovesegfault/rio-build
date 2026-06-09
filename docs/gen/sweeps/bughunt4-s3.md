@@ -71,3 +71,14 @@ drifted set is a failed sweep, not a stale doc.
     assignment count outside it is ZERO (grep verified). BudgetExpired never
     reaches the writer: the policy match refuses it and the fan-out
     short-circuit never polls the RPC future.
+
+## merged_bug_200 — the other disposition counters at the same site
+
+    $ grep -n 'metrics::counter!' rio-scheduler/src/actor/completion.rs | head
+
+    Verified: rio_scheduler_store_degraded_requeues_total now emits ONLY in the
+    recorded_row post-commit block of handle_infrastructure_failure. The other
+    counters in the infra path (cache_check_failures at probe sites,
+    undeclared_built_output at the membership filter) count OBSERVATIONS by
+    design, not settlements -- their HELP text says so; no other settled-class
+    counter ticks pre-commit in this file.

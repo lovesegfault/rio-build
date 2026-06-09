@@ -91,6 +91,19 @@ pub(super) enum StoreDegradedDisposition {
     RunBound,
 }
 
+impl StoreDegradedDisposition {
+    /// The counter label for the settled emission site
+    /// (merged_bug_200); `NotDegraded` reports never tick.
+    fn as_label(self) -> Option<&'static str> {
+        match self {
+            StoreDegradedDisposition::NotDegraded => None,
+            StoreDegradedDisposition::Paced => Some("paced"),
+            StoreDegradedDisposition::Uncorroborated => Some("uncorroborated"),
+            StoreDegradedDisposition::RunBound => Some("run_bound"),
+        }
+    }
+}
+
 /// Total status→report-context classifier: the SOLE non-test producer
 /// of [`FailureReportCtx`]. Every failure arm of `handle_completion`'s
 /// routing match calls this instead of constructing the ctx inline, so
@@ -3023,17 +3036,14 @@ impl DagActor {
                 StoreDegradedDisposition::Paced
             }
         };
-        let label = match disposition {
-            StoreDegradedDisposition::Paced => "paced",
-            StoreDegradedDisposition::Uncorroborated => "uncorroborated",
-            StoreDegradedDisposition::RunBound => "run_bound",
-            StoreDegradedDisposition::NotDegraded => unreachable!("flagged"),
-        };
-        metrics::counter!(
-            "rio_scheduler_store_degraded_requeues_total",
-            "disposition" => label
-        )
-        .increment(1);
+        // merged_bug_200: NO tick here. The disposition is computed at
+        // classification time but the counter advertises SETTLED
+        // outcomes ("uncharged requeue" per the HELP) — the single
+        // emission site is the post-commit block in
+        // `handle_infrastructure_failure` (the settled-close witness
+        // pattern, same as the bug_086 width-event close): fenced
+        // drops, failed appending transactions (one report = N
+        // deliveries), and DAG-absent races never tick.
         disposition
     }
 
@@ -3264,6 +3274,17 @@ impl DagActor {
                 state.push_attempt_record(row.to_record());
             }
             self.refresh_retry_view(drv_hash);
+            // merged_bug_200: THE single emission site — the row
+            // committed, so the disposition settled. Fenced drops,
+            // failed appending transactions, and DAG-absent races all
+            // returned above without reaching this block.
+            if let Some(label) = degraded.as_label() {
+                metrics::counter!(
+                    "rio_scheduler_store_degraded_requeues_total",
+                    "disposition" => label
+                )
+                .increment(1);
+            }
         }
 
         match decision.verdict {
