@@ -6,6 +6,15 @@
        `define` must be at top level (not inside `if`). */}}
 {{- define "rio.controllerToml" -}}
 {{- with .Values.scheduler.sla -}}
+{{- /* merged_bug_001: the exposure-uid cluster axis. IDENTICAL values
+       expression as scheduler.yaml's `[sla].cluster` — ONE source
+       feeds both binaries, so the controller's uid scope and the
+       scheduler's λ-refresh `WHERE cluster = $1` can never drift.
+       Top-level scalar: MUST render before the [nodeclaim_pool]
+       table header. helm/39-cluster-axis-single-source.sh enforces
+       TOML-to-TOML parity; the checksum annotation below hashes the
+       rendered body, so a cluster change rolls the pod. */}}
+cluster = {{ (.cluster | default $.Values.karpenter.clusterName | default "") | quote }}
 [nodeclaim_pool]
 lease_name = {{ $.Values.karpenter.nodeclaimPool.leaseName | default "rio-controller-nodeclaim-pool" | quote }}
 {{- /* r40 bug_018: gate `schedulerName=kube-build-scheduler` stamping
@@ -68,6 +77,16 @@ spec:
   # not across processes. 30s reschedule gap during pod restart is
   # acceptable.
   replicas: 1
+  # merged_bug_001: replicas=1 alone does NOT prevent co-run — the
+  # default RollingUpdate strategy surges a second pod on every
+  # rollout, co-running two node-informers (and two interrupt
+  # watchers). The grid-aligned exposure uid makes the co-run
+  # dedup-convergent; Recreate closes the residual partial-window
+  # seam and the watcher duplication. Cost: exactly the 30s
+  # reschedule gap already accepted above.
+  # helm/39-cluster-axis-single-source.sh enforces.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "rio.selectorLabels" "rio-controller" | nindent 6 }}

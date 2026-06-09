@@ -1,0 +1,91 @@
+# Cluster-axis single source + controller Recreate (merged_bug_001).
+#
+# The controller's node-informer mints exposure idempotency uids keyed
+# `exposure:{cluster}:{hw}:{window-slot}` against the scheduler's
+# `interrupt_samples` table, whose M_047 partial unique index is
+# table-GLOBAL in the shared-PG topology (ADR-023 §2.13). Two
+# invariants keep that key sound, and both are render-time properties
+# of this chart:
+#
+# 1. SINGLE SOURCE: the controller-TOML `cluster` and the
+#    scheduler-TOML `[sla].cluster` MUST render from the one values
+#    expression (`scheduler.sla.cluster | default
+#    karpenter.clusterName | default ""`). A hand-mirrored literal
+#    that drifts splits the axis: the controller keys windows under
+#    one cluster while the scheduler's λ refresh filters on another —
+#    every exposure row silently invisible to the solver.
+# 2. RECREATE: replicas=1 with the default RollingUpdate strategy
+#    surge co-runs TWO informers on every rollout. The grid-aligned
+#    uid makes that co-run dedup-convergent, but Recreate closes the
+#    residual partial-window seam (whichever pod's slice commits first
+#    wins a slightly different secs value) and interrupt-watcher
+#    duplication. The cost is exactly the "30s reschedule gap during
+#    pod restart" the chart already documents as acceptable.
+
+out=$TMPDIR/cluster-axis.yaml
+helm template rio . --set global.image.tag=test >"$out"
+
+# Premise guard: the controller Deployment renders at chart defaults.
+dep=$(yq -N 'select(.kind=="Deployment" and .metadata.name=="rio-controller") | .metadata.name' "$out")
+test "$dep" = "rio-controller" || {
+  echo "FAIL: rio-controller Deployment did not render at chart defaults — assertions vacuous" >&2
+  exit 1
+}
+
+# (a) strategy MUST be Recreate.
+strategy=$(yq -N 'select(.kind=="Deployment" and .metadata.name=="rio-controller") | .spec.strategy.type' "$out")
+test "$strategy" = "Recreate" || {
+  echo "FAIL: controller strategy is $strategy (RollingUpdate default) — surge co-runs two informers" >&2
+  exit 1
+}
+
+# (b) TOML-to-TOML cluster parity under all three value paths. The
+# extractor reads the RENDERED TOMLs (the same bytes the binaries
+# load), not the values tree — a template typo cannot pass. `|| true`
+# inside the pipelines: grep's no-match exit must reach the DEDICATED
+# failure message below, not die silently in a `set -e` command
+# substitution (the stdenv-pipefail trap).
+toml_body() { # <configmap-name> <toml-key-file> <render-file>
+  yq -N "select(.kind==\"ConfigMap\" and .metadata.name==\"$1\") | .data.\"$2\"" "$3"
+}
+
+toml_cluster() { # <configmap-name> <toml-key-file> <render-file>
+  toml_body "$1" "$2" "$3" \
+    | { grep -E '^cluster = ' || true; } | head -1 | sed -E 's/^cluster = "(.*)"$/\1/'
+}
+
+assert_pair() { # <render-file> <expected> <label>
+  # Absence of the controller key is the dedicated failure (the
+  # merged_bug_001 deploy half: the axis never reaches the binary).
+  ctrl_line=$(toml_body rio-controller-config controller.toml "$1" | { grep -cE '^cluster = ' || true; })
+  test "$ctrl_line" = "1" || {
+    echo "FAIL: cluster absent from the rendered rio.controllerToml ($3)" >&2
+    exit 1
+  }
+  ctrl=$(toml_cluster rio-controller-config controller.toml "$1")
+  sched=$(toml_cluster rio-scheduler-config scheduler.toml "$1")
+  test "$ctrl" = "$2" || {
+    echo "FAIL: controller-TOML cluster '$ctrl' != expected '$2' ($3)" >&2
+    exit 1
+  }
+  test "$ctrl" = "$sched" || {
+    echo "FAIL: controller-TOML cluster '$ctrl' != scheduler-TOML cluster '$sched' ($3) — the axis MUST single-source" >&2
+    exit 1
+  }
+}
+
+# Explicit scheduler.sla.cluster wins on BOTH sides.
+exp=$TMPDIR/cluster-axis-explicit.yaml
+helm template rio . --set global.image.tag=test --set scheduler.sla.cluster=prod-east >"$exp"
+assert_pair "$exp" "prod-east" "explicit scheduler.sla.cluster"
+
+# karpenter.clusterName fallback feeds BOTH sides.
+fb=$TMPDIR/cluster-axis-fallback.yaml
+helm template rio . --set global.image.tag=test --set karpenter.clusterName=rio-eks-ci >"$fb"
+assert_pair "$fb" "rio-eks-ci" "karpenter.clusterName fallback"
+
+# Default-empty: both render "" (the single-cluster default, matching
+# the scheduler column's DEFAULT '').
+assert_pair "$out" "" "default-empty"
+
+echo "OK: controller strategy Recreate; cluster single-sourced (explicit/fallback/default) TOML-to-TOML"
