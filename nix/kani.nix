@@ -530,18 +530,28 @@ in
     # axes equal over the bounded domain, so a dropped axis flips the
     # proof red. Bughunt-3 S3 formal obligation: "mismatch ⇒ never
     # Hit").
-    # 29 → 30 (bughunt-4 S5a, bug_266): +
-    # check_gen_stamped_fold_refusal (K6: the generation-stamp fold
-    # refusal — fold_guard accepts iff every verdict cell carries the
-    # final tenant-set generation, and drain_stale removes exactly
-    # the stale cells; concrete lengths ≤3, generations <3). The
-    # merged_bug_046 ContentMismatch class extension rides the
-    # EXISTING three substitute harnesses (truth table, loop cells,
-    # tenant fold), which now pick through class_of_index /
+    # 29 → 37 (bughunt-4 S5a, bug_266): + the K6 generation-stamp
+    # fold-refusal family — fold_guard accepts iff every verdict cell
+    # carries the final tenant-set generation, drain_stale removes
+    # exactly the stale cells, survivors fold iff none is newer;
+    # generations <3 is the minimal domain distinguishing <, ==, >
+    # final. Two ladder rungs, both measured: the original single
+    # harness drove a SYMBOLIC length through Vec<(String,u64)>'s
+    # realloc/retain/clone machinery (no progress at 600 s ×2); the
+    # per-length combined split still ran past 600 s at N = 2 (the
+    # two fold_guard calls + retain in one equation), so lengths 0-1
+    # keep the combined body (check_gen_stamped_fold_refusal_len{0,1})
+    # and lengths 2-3 split per arm
+    # (check_gen_stamped_{guard_truth,drain_totality,post_drain_guard}_len{2,3})
+    # — seconds each. kani::cover pins refusal/accept/drain-some/
+    # drain-none/newer-survivor reachable. The merged_bug_046
+    # ContentMismatch class extension rides the EXISTING three
+    # substitute harnesses (truth table, loop cells, tenant fold),
+    # which now pick through class_of_index /
     # SUBSTITUTE_FAILURE_CLASS_COUNT — the exhaustive class_index
     # inverse breaks the build on a new variant, so a class can no
     # longer be silently excluded from any sweep (the round-3
     # pick-table lesson made structural).
-    expectedHarnesses = 30;
+    expectedHarnesses = 37;
   };
 }

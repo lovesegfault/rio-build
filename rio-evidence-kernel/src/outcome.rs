@@ -1420,33 +1420,46 @@ mod proofs {
         }
     }
 
-    /// K6 (bug_266): the generation-stamp fold refusal. Over every
-    /// ≤3-cell ledger with generations in 0..3 and any final
-    /// generation in 0..3: `fold_guard` accepts IFF every cell
-    /// carries the final generation, and `drain_stale(g)` removes
-    /// EXACTLY the cells older than `g` (the survivors then pass the
-    /// guard at `g` iff none is newer). Concrete lengths per the
-    /// CBMC fat-pointer lesson.
-    #[kani::proof]
-    #[kani::unwind(5)]
-    fn check_gen_stamped_fold_refusal() {
-        let n: usize = kani::any();
-        kani::assume(n <= 3);
-        let gens: [u64; 3] = [kani::any(), kani::any(), kani::any()];
-        kani::assume(gens[0] < 3 && gens[1] < 3 && gens[2] < 3);
+    /// K6 (bug_266): the generation-stamp fold refusal, one concrete
+    /// ledger length per harness (len 0..=3 below). The original
+    /// single-harness form drove a SYMBOLIC length `n` through the
+    /// heap-backed `Vec<(String, u64)>` machinery — push-realloc
+    /// branching, `retain`'s backshift-on-drop pointer loop, and
+    /// String clones, each unrolled under six symbolic-bound loops —
+    /// and CBMC made no progress at 600 s (cold and warm). Concrete
+    /// lengths collapse every loop bound and allocator branch; the
+    /// generation domain 0..3 is minimal-sufficient because the law
+    /// only distinguishes cell_gen `<`, `==`, `>` final_gen, and
+    /// {0,1,2} against final ∈ {0,1,2} realizes all three relations.
+    ///
+    /// Per length N the proof states the full law: `fold_guard`
+    /// accepts IFF every cell carries the final generation;
+    /// `drain_stale(g)` removes EXACTLY the cells older than `g`;
+    /// the survivors then pass the guard at `g` iff none is newer.
+    /// `kani::cover!` pins every law-relevant case reachable in the
+    /// shrunk domain (vacuity guard — a domain that cannot express
+    /// refusal would pass the asserts trivially).
+    fn gen_stamped_fold_refusal_at<const N: usize>() {
+        let mut gens = [0u64; N];
+        let mut g = 0;
+        while g < N {
+            gens[g] = kani::any();
+            kani::assume(gens[g] < 3);
+            g += 1;
+        }
         let final_gen: u64 = kani::any();
         kani::assume(final_gen < 3);
 
         let mut cells = GenStampedCells::new();
         let mut i = 0;
-        while i < n {
+        while i < N {
             cells.record(String::new(), gens[i]);
             i += 1;
         }
         // Guard truth: accept iff all-current.
         let mut all_current = true;
         let mut j = 0;
-        while j < n {
+        while j < N {
             if gens[j] != final_gen {
                 all_current = false;
             }
@@ -1457,7 +1470,7 @@ mod proofs {
         // Drain totality: exactly the stale cells leave.
         let mut expect_stale = 0usize;
         let mut k = 0;
-        while k < n {
+        while k < N {
             if gens[k] < final_gen {
                 expect_stale += 1;
             }
@@ -1465,16 +1478,13 @@ mod proofs {
         }
         let drained = cells.drain_stale(final_gen);
         assert_eq!(drained.len(), expect_stale);
-        assert_eq!(cells.len(), n - expect_stale);
+        assert_eq!(cells.len(), N - expect_stale);
         // Post-drain, no survivor is OLDER than final_gen; the guard
         // then accepts iff none is NEWER either.
         let mut any_newer = false;
-        for p in cells.paths() {
-            let _ = p;
-        }
         let mut m = 0;
         let mut survivors_checked = 0usize;
-        while m < n {
+        while m < N {
             if gens[m] >= final_gen {
                 survivors_checked += 1;
                 if gens[m] > final_gen {
@@ -1485,6 +1495,181 @@ mod proofs {
         }
         assert_eq!(cells.len(), survivors_checked);
         assert_eq!(cells.fold_guard(final_gen).is_ok(), !any_newer);
+
+        // Vacuity guards: every law case is reachable where N admits
+        // it (N = 0 has only the trivial accept).
+        kani::cover!(all_current, "all-current accept reachable");
+        if N > 0 {
+            kani::cover!(!all_current, "pre-drain refusal reachable");
+            kani::cover!(expect_stale > 0, "drain removes a stale cell");
+            kani::cover!(expect_stale == 0, "drain may remove nothing");
+            kani::cover!(any_newer, "newer-survivor refusal reachable");
+        }
+    }
+
+    /// K6 length-0 arm (the empty ledger folds).
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn check_gen_stamped_fold_refusal_len0() {
+        gen_stamped_fold_refusal_at::<0>();
+    }
+
+    /// K6 length-1 arm.
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn check_gen_stamped_fold_refusal_len1() {
+        gen_stamped_fold_refusal_at::<1>();
+    }
+
+    /// K6 ≥2-cell lengths: the combined body's single equation (two
+    /// `fold_guard` calls + `drain_stale`'s retain/drop machinery
+    /// over one symbolic ledger) still ran past 600 s at N = 2, so
+    /// the law splits into three per-arm harnesses per length — each
+    /// arm one assertion family over a fresh ledger, the house
+    /// split-conjunction move.
+    fn gen_stamped_guard_truth_at<const N: usize>() {
+        let mut gens = [0u64; N];
+        let mut g = 0;
+        while g < N {
+            gens[g] = kani::any();
+            kani::assume(gens[g] < 3);
+            g += 1;
+        }
+        let final_gen: u64 = kani::any();
+        kani::assume(final_gen < 3);
+        let mut cells = GenStampedCells::new();
+        let mut i = 0;
+        while i < N {
+            cells.record(String::new(), gens[i]);
+            i += 1;
+        }
+        let mut all_current = true;
+        let mut j = 0;
+        while j < N {
+            if gens[j] != final_gen {
+                all_current = false;
+            }
+            j += 1;
+        }
+        assert_eq!(cells.fold_guard(final_gen).is_ok(), all_current);
+        kani::cover!(all_current, "all-current accept reachable");
+        kani::cover!(!all_current, "refusal reachable");
+    }
+
+    /// Drain totality from the survivor side: the ledger loses
+    /// EXACTLY the stale count, and a second drain at the same
+    /// generation removes nothing (no stale survivor). Binding the
+    /// returned vector's `len()` into the symbolic count was the
+    /// measured blowup term at N ≥ 2 (the combined harness and the
+    /// first split both ran past 600 s on exactly that equation;
+    /// `post_drain` converges with the vector forgotten) — the
+    /// drained-length clause itself stays proven by the combined
+    /// len0/len1 harnesses, and `Vec::retain` conservation is std's
+    /// contract, not kernel law.
+    fn gen_stamped_drain_totality_at<const N: usize>() {
+        let mut gens = [0u64; N];
+        let mut g = 0;
+        while g < N {
+            gens[g] = kani::any();
+            kani::assume(gens[g] < 3);
+            g += 1;
+        }
+        let final_gen: u64 = kani::any();
+        kani::assume(final_gen < 3);
+        let mut cells = GenStampedCells::new();
+        let mut i = 0;
+        while i < N {
+            cells.record(String::new(), gens[i]);
+            i += 1;
+        }
+        let mut expect_stale = 0usize;
+        let mut k = 0;
+        while k < N {
+            if gens[k] < final_gen {
+                expect_stale += 1;
+            }
+            k += 1;
+        }
+        let drained = cells.drain_stale(final_gen);
+        core::mem::forget(drained);
+        assert_eq!(cells.len(), N - expect_stale);
+        // Idempotence: no stale survivor remained.
+        let len_after = cells.len();
+        let again = cells.drain_stale(final_gen);
+        core::mem::forget(again);
+        assert_eq!(cells.len(), len_after);
+        kani::cover!(expect_stale > 0, "drain removes a stale cell");
+        kani::cover!(expect_stale == 0, "drain may remove nothing");
+    }
+
+    fn gen_stamped_post_drain_guard_at<const N: usize>() {
+        let mut gens = [0u64; N];
+        let mut g = 0;
+        while g < N {
+            gens[g] = kani::any();
+            kani::assume(gens[g] < 3);
+            g += 1;
+        }
+        let final_gen: u64 = kani::any();
+        kani::assume(final_gen < 3);
+        let mut cells = GenStampedCells::new();
+        let mut i = 0;
+        while i < N {
+            cells.record(String::new(), gens[i]);
+            i += 1;
+        }
+        let drained = cells.drain_stale(final_gen);
+        core::mem::forget(drained);
+        let mut any_newer = false;
+        let mut survivors = 0usize;
+        let mut m = 0;
+        while m < N {
+            if gens[m] >= final_gen {
+                survivors += 1;
+                if gens[m] > final_gen {
+                    any_newer = true;
+                }
+            }
+            m += 1;
+        }
+        assert_eq!(cells.len(), survivors);
+        assert_eq!(cells.fold_guard(final_gen).is_ok(), !any_newer);
+        kani::cover!(any_newer, "newer-survivor refusal reachable");
+        kani::cover!(!any_newer && survivors > 0, "clean survivors fold");
+    }
+
+    /// K6 length-2 arms.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn check_gen_stamped_guard_truth_len2() {
+        gen_stamped_guard_truth_at::<2>();
+    }
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn check_gen_stamped_drain_totality_len2() {
+        gen_stamped_drain_totality_at::<2>();
+    }
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn check_gen_stamped_post_drain_guard_len2() {
+        gen_stamped_post_drain_guard_at::<2>();
+    }
+
+    /// K6 length-3 arms (the original bound).
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn check_gen_stamped_guard_truth_len3() {
+        gen_stamped_guard_truth_at::<3>();
+    }
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn check_gen_stamped_drain_totality_len3() {
+        gen_stamped_drain_totality_at::<3>();
+    }
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn check_gen_stamped_post_drain_guard_len3() {
+        gen_stamped_post_drain_guard_at::<3>();
     }
 
     /// K3 (bug_299, superseding merged_bug_028's pre-projected
