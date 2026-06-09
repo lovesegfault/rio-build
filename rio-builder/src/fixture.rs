@@ -22,7 +22,7 @@
 //! real build path runs. This is intentional — a fixture entry typo
 //! shows up as a real (slow) build in the VM test, which is loud.
 
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use rio_proto::types::{BuildResult as ProtoBuildResult, BuildResultStatus, ResourceUsage};
 use serde::Deserialize;
@@ -98,7 +98,9 @@ pub fn scripted_result(
     o: ScriptedOutcome,
 ) -> ExecutionResult {
     let stop = SystemTime::now();
-    let start = stop - Duration::from_secs_f64(o.wall_secs);
+    // merged_bug_262: scripted fixtures route through the total
+    // constructor like every other f64-seconds source.
+    let start = stop - rio_common::clamped::clamped_duration_secs(o.wall_secs);
     ExecutionResult {
         drv_path: drv_path.to_string(),
         result: ProtoBuildResult {

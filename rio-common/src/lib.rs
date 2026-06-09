@@ -7,6 +7,7 @@
 //! `*_TOKEN_HEADER` string constants in [`grpc`] remain here.
 
 pub mod backoff;
+pub mod clamped;
 pub mod config;
 pub mod cors;
 pub mod dns;

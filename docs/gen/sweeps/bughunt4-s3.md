@@ -82,3 +82,19 @@ drifted set is a failed sweep, not a stale doc.
     undeclared_built_output at the membership filter) count OBSERVATIONS by
     design, not settlements -- their HELP text says so; no other settled-class
     counter ticks pre-commit in this file.
+
+## merged_bug_262 — every f64-seconds -> Duration construction (ban-generated)
+
+    $ cargo clippy --workspace --all-targets   # with the clippy.toml disallowed-methods entry
+
+    The ban makes the sweep set compiler-generated: post-fix the workspace has
+    EXACTLY ONE #[allow(clippy::disallowed_methods)] for from_secs_f64 -- inside
+    rio_common::clamped::ClampedSecs::from_f64 (the total constructor). Converted
+    lanes: rio-scheduler actor/materialize.rs parked_until (the crash-loop lane),
+    sla/cost.rs CostTable::load + IceBackoff::new (+ sla.max_lead_time ensure! at
+    validate_shape), admin/executors.rs attempt_opened (vacuous checked_add),
+    state/executor.rs base+cap, state/recovered_instant.rs (the precedent absorbed),
+    rio-common backoff.rs jitter apply, rio-builder fixture.rs, rio-store
+    metadata/inline.rs, rio-controller sketch.rs epoch (ABSOLUTE epoch: total
+    try_from_secs_f64 + warn/reset, not the 1yr age clamp). Planted-red verified:
+    a raw call anywhere fails clippy -D warnings with the merged_bug_262 reason.

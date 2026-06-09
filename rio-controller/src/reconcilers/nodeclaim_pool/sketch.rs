@@ -559,7 +559,24 @@ impl CellSketches {
                 z_shadow: decode_or_empty(r.z_sketch_shadow.as_deref()),
                 boot_active: decode_or_empty(r.boot_sketch_active.as_deref()),
                 boot_shadow: decode_or_empty(r.boot_sketch_shadow.as_deref()),
-                epoch: SystemTime::UNIX_EPOCH + Duration::from_secs_f64(r.sketch_epoch_secs),
+                // merged_bug_262: a poisoned epoch row crash-looped
+                // the controller's epoch rebuild (fully unguarded raw
+                // from_secs_f64 panics on +inf/NaN/negative). This is
+                // an ABSOLUTE epoch, not an age, so the 1yr ClampedSecs
+                // ceiling does not apply -- try_from_secs_f64 is the
+                // total form: a poisoned value warns + resets to the
+                // UNIX epoch (the sketch re-warms from scratch,
+                // recoverable; the panic was not).
+                epoch: match std::time::Duration::try_from_secs_f64(r.sketch_epoch_secs) {
+                    Ok(d) => SystemTime::UNIX_EPOCH + d,
+                    Err(_) => {
+                        warn!(
+                            sketch_epoch_secs = r.sketch_epoch_secs,
+                            "poisoned sketch epoch; resetting to UNIX_EPOCH (sketch re-warms)"
+                        );
+                        SystemTime::UNIX_EPOCH
+                    }
+                },
                 lead_time_q: r.lead_time_q,
                 forecast_hit_ewma: 0.9,
                 idle_gap_events: serde_json::from_value(r.idle_gap_events).unwrap_or_else(|e| {

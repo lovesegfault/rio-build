@@ -140,7 +140,7 @@ impl Backoff {
         // `cap` field doc states this contract; the MAX_BACKOFF clamp
         // remains as the panic guard for misconfigured `cap = inf`.
         self.jitter
-            .apply(Duration::from_secs_f64(safe))
+            .apply(crate::clamped::clamped_duration_secs(safe))
             .min(MAX_BACKOFF)
     }
 }

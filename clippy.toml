@@ -20,4 +20,13 @@ disallowed-methods = [
   { path = "xshell::Cmd::run", reason = "bypasses MultiProgress; use sh::run / sh::run_sync / sh::run_interactive (xtask only — other crates may ignore)" },
   { path = "xshell::Cmd::read", reason = "bypasses MultiProgress; use sh::read / sh::run_read (xtask only — other crates may ignore)" },
   { path = "xshell::Cmd::output", reason = "bypasses MultiProgress; use sh::run_sync (xtask only — other crates may ignore)" },
+
+  # merged_bug_262 (bughunt-4): from_secs_f64 PANICS on +inf/NaN/negative,
+  # and PG EXTRACT(EPOCH)::float8 / TOML floats carry all three shapes
+  # ('infinity'::timestamptz is valid SQL; inf is valid TOML). Half-guards
+  # (.max(0.0), > 0.0) pass +inf into the panic — one poisoned row
+  # crash-looped leader recovery. The ONE sanctioned call site is
+  # rio_common::clamped::ClampedSecs::from_f64 (total: NaN/neg→0,
+  # +inf/absurd→1yr). Route every f64-seconds→Duration through it.
+  { path = "std::time::Duration::from_secs_f64", reason = "panics on +inf/NaN/negative; use rio_common::clamped::ClampedSecs::from_f64 / clamped_duration_secs (merged_bug_262)" },
 ]

@@ -52,11 +52,12 @@ impl RecoveredInstant {
     /// `from_poisoned_row` precedent: `-infinity::timestamp` must not
     /// panic `from_secs_f64`).
     pub fn from_age_secs(age_secs: f64) -> Self {
-        const MAX_AGE_SECS: f64 = 365.0 * 86400.0;
-        #[allow(clippy::manual_clamp)]
-        let clamped = age_secs.max(0.0).min(MAX_AGE_SECS);
+        // merged_bug_262: the precedent absorbed into its
+        // generalization -- the clamp semantics live in
+        // rio_common::clamped (NaN/neg -> 0, +inf/absurd -> 1yr,
+        // byte-identical to the old inline clamp).
         Self {
-            age_at_recovery: Duration::from_secs_f64(clamped),
+            age_at_recovery: rio_common::clamped::clamped_duration_secs(age_secs),
             recovered_at: Instant::now(),
         }
     }
@@ -90,7 +91,7 @@ mod tests {
         let thirty_hours = 30.0 * 3600.0;
         let r = RecoveredInstant::from_age_secs(thirty_hours);
         assert!(
-            r.elapsed() >= Duration::from_secs_f64(thirty_hours),
+            r.elapsed() >= rio_common::clamped::clamped_duration_secs(thirty_hours),
             "recovered elapsed must include the pre-recovery age"
         );
     }

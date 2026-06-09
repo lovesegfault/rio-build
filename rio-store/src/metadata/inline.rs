@@ -320,7 +320,10 @@ pub(crate) async fn manifest_uploading_age(
     .fetch_optional(pool)
     .await?;
 
-    Ok(secs.map(std::time::Duration::from_secs_f64))
+    // merged_bug_262: PG-derived seconds through the total
+    // constructor (NaN/neg -> 0, +inf -> 1yr) instead of the panicking
+    // raw call.
+    Ok(secs.map(rio_common::clamped::clamped_duration_secs))
 }
 
 /// Reclaim placeholder rows from a failed upload.

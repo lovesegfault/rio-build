@@ -272,6 +272,15 @@ impl JobViewEntry {
         self.defer_until = until;
     }
 
+    /// Test-visible wrapper over the recovery row conversion
+    /// (merged_bug_262 totality pin).
+    #[cfg(test)]
+    pub(super) fn from_recovered_row_for_test(
+        row: crate::db::open_attempts::RecoveredJobRow,
+    ) -> JobViewEntry {
+        DagActor::entry_from_recovered_row(row)
+    }
+
     /// The two-strike ghost flag (merged_bug_055 C), housekeeping's
     /// read half.
     pub(super) fn strike_armed(&self) -> bool {
@@ -839,10 +848,17 @@ impl DagActor {
     fn entry_from_recovered_row(row: crate::db::open_attempts::RecoveredJobRow) -> JobViewEntry {
         JobViewEntry {
             job_id: row.job_id,
+            // merged_bug_262: PG EXTRACT(EPOCH ...) can carry +inf
+            // ('infinity'::timestamptz) and the > 0.0 filter passes it
+            // — the clamped constructor is total where raw
+            // from_secs_f64 panics (one poisoned row crash-looped
+            // every leader candidate's recovery rebuild). The sibling
+            // parked_at lane below was already clamped.
             parked_until: row
                 .park_remaining_secs
-                .filter(|secs| *secs > 0.0)
-                .map(|secs| std::time::Instant::now() + std::time::Duration::from_secs_f64(secs)),
+                .map(rio_common::clamped::ClampedSecs::from_f64)
+                .filter(|c| !c.is_zero())
+                .map(|c| std::time::Instant::now() + c.duration()),
             claimed_by: row.claimed_by.map(crate::state::ExecutorId::from),
             claimed_unbacked_strike: false,
             split_release_strike: false,

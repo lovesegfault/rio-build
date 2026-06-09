@@ -79,8 +79,12 @@ fn row_to_proto(r: OpenAttemptRow) -> ExecutorInfo {
     // liveness is the Job/pod phase plus attempt age (the OA5
     // successor view + the OA2 wedge alert); consumers render plain
     // relative age.
+    // merged_bug_262: the checked_add guard was vacuous -- raw
+    // from_secs_f64 panics on +inf BEFORE checked_add can refuse.
     let attempt_opened = SystemTime::UNIX_EPOCH
-        .checked_add(Duration::from_secs_f64(r.assigned_at_epoch_secs.max(0.0)))
+        .checked_add(rio_common::clamped::clamped_duration_secs(
+            r.assigned_at_epoch_secs,
+        ))
         .map(prost_types::Timestamp::from);
     ExecutorInfo {
         executor_id: r.executor_id,

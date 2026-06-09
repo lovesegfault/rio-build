@@ -976,6 +976,16 @@ impl SlaConfig {
     /// [`Self::test_default`].
     // r[impl scheduler.sla.global.static-requires-some]
     pub fn validate_shape(&self) -> anyhow::Result<()> {
+        // merged_bug_262: `[sla] max_lead_time = inf` is valid TOML and
+        // previously panicked DagActor::new at boot (IceBackoff's raw
+        // from_secs_f64). The constructor now clamps, and this rejects
+        // the misconfiguration loudly at config load.
+        anyhow::ensure!(
+            self.max_lead_time.is_finite() && self.max_lead_time > 0.0,
+            "sla.max_lead_time must be finite and positive, got {} \
+         (non-finite values previously crash-looped the scheduler at boot)",
+            self.max_lead_time
+        );
         anyhow::ensure!(
             self.tiers.iter().any(|t| t.name == self.default_tier),
             "sla.default_tier {:?} not in sla.tiers (known: {:?})",

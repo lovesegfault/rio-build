@@ -9544,3 +9544,32 @@ async fn stale_retrylater_redelivery_cannot_defer_a_fresh_holders_job() -> TestR
     );
     Ok(())
 }
+
+/// merged_bug_262: `entry_from_recovered_row`'s parked_until lane piped
+/// PG-derived `park_remaining_secs` (EXTRACT(EPOCH ...)::float8 -- and
+/// 'infinity'::timestamptz is valid SQL) unclamped into
+/// `Duration::from_secs_f64`, whose contract PANICS on +inf; the
+/// `> 0.0` filter passes +inf straight through. One such row panicked
+/// the recovery job-view rebuild on EVERY leader candidate: a
+/// fleet-wide crash loop. The sibling parked_at lane in the same
+/// constructor was already clamped (RecoveredInstant::from_age_secs)
+/// for exactly this case.
+#[test]
+fn recovered_row_with_infinite_park_does_not_panic() {
+    let row = crate::db::open_attempts::RecoveredJobRow {
+        job_id: Uuid::new_v4(),
+        drv_hash: "inf-park".into(),
+        carried_realized_paths: None,
+        park_remaining_secs: Some(f64::INFINITY),
+        park_began_secs_ago: Some(f64::INFINITY),
+        claimed_by: None,
+    };
+    // Pre-fix: panics inside Duration::from_secs_f64 (+inf).
+    let entry = crate::actor::materialize::JobViewEntry::from_recovered_row_for_test(row);
+    // The clamp lands at the one-year ceiling: still parked, never a
+    // panic, and a bounded wait rather than an unreachable instant.
+    assert!(matches!(
+        entry.claimability(std::time::Instant::now()),
+        crate::actor::materialize::Claimability::Parked
+    ));
+}

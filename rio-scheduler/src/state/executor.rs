@@ -150,17 +150,12 @@ impl RetryPolicy {
     pub fn backoff_duration(&self, attempt: u32) -> std::time::Duration {
         use rio_common::backoff::{Backoff, Jitter};
         Backoff {
-            base: std::time::Duration::from_secs_f64(
-                self.backoff_base_secs.clamp(0.0, 365.0 * 86400.0),
-            ),
+            base: rio_common::clamped::clamped_duration_secs(self.backoff_base_secs),
             mult: self.backoff_multiplier,
-            cap: std::time::Duration::from_secs_f64(
-                // from_secs_f64 panics on inf/NaN; clamp here so a
-                // TOML `backoff_max_secs = "inf"` degrades to the
-                // shared 1yr ceiling instead of crashing config load.
-                #[allow(clippy::manual_clamp)]
-                self.backoff_max_secs.max(0.0).min(365.0 * 86400.0),
-            ),
+            // merged_bug_262: a TOML `backoff_max_secs = "inf"`
+            // degrades to the shared 1yr ceiling instead of crashing
+            // config load (the clamp lives in the one constructor).
+            cap: rio_common::clamped::clamped_duration_secs(self.backoff_max_secs),
             jitter: Jitter::Proportional(self.jitter_fraction),
         }
         .duration(attempt)

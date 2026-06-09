@@ -603,7 +603,10 @@ impl CostTable {
                 cores: cores.max(0) as u32,
                 mem_bytes: mem_bytes.max(0) as u64,
                 price_per_vcpu_hr: seed_price(cap),
-                last_observed: SystemTime::UNIX_EPOCH + Duration::from_secs_f64(at.max(0.0)),
+                // merged_bug_262: .max(0.0) passes +inf -> panic in
+                // the leader hydrate task instead of its Err-retry arm.
+                last_observed: SystemTime::UNIX_EPOCH
+                    + rio_common::clamped::clamped_duration_secs(at),
             });
         }
         for m in t.cells.values_mut() {
@@ -929,7 +932,11 @@ impl IceBackoff {
     pub fn new(max_lead_time_secs: f64) -> Self {
         Self {
             cells: DashMap::new(),
-            max_lead_time: Duration::from_secs_f64(max_lead_time_secs.max(1.0)),
+            // merged_bug_262: `[sla] max_lead_time = inf` is valid
+            // TOML; the raw constructor panicked DagActor::new at
+            // boot. Clamp (validation also rejects non-finite values
+            // at config load).
+            max_lead_time: rio_common::clamped::clamped_duration_secs(max_lead_time_secs.max(1.0)),
         }
     }
 
