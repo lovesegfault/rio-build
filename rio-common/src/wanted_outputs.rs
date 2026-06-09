@@ -39,6 +39,15 @@
 /// will-dispatch prediction operates on the proto type itself; every
 /// call site MUST share one implementation or the hit criterion drifts
 /// between prediction time, merge time, and dispatch time.
+///
+/// PRECONDITION (merged_bug_026): the two arrays must have EQUAL
+/// length — the zip truncates to the shorter side otherwise, which is
+/// exactly the silently-shrunken subset the completeness guard
+/// forbids. [`verifiable_wanted_paths`] (the single guard every
+/// completeness predicate routes through) enforces this with a
+/// None-on-skew precondition; direct iteration callers must hold the
+/// producer invariant (the gateway's `unzip` keeps the arrays paired
+/// by construction).
 // r[impl sched.merge.wanted-outputs+3]
 pub fn wanted_subset<'a>(
     output_names: &'a [String],
@@ -89,6 +98,17 @@ pub fn verifiable_wanted_paths<'a>(
     expected_output_paths: &'a [String],
     wanted_output_names: &'a [String],
 ) -> Option<Vec<&'a str>> {
+    // merged_bug_026 (bughunt-4): the parallel arrays must actually
+    // be parallel — on length skew the zip inside `wanted_subset`
+    // would silently truncate to the shorter array, and a
+    // completeness predicate would quantify over the truncation as if
+    // it were total (the same Some(shrunken-subset) laundering the
+    // placeholder saturation closes, one axis over). Skewed input is
+    // unverifiable input: answer None, callers take the conservative
+    // branch.
+    if output_names.len() != expected_output_paths.len() {
+        return None;
+    }
     let paths: Vec<&str> = wanted_subset(output_names, expected_output_paths, wanted_output_names)
         .map(String::as_str)
         .collect();
@@ -230,6 +250,19 @@ mod tests {
                     got.is_none(),
                     "a wanted-matched placeholder must saturate the guard to None, \
                      got {got:?}"
+                );
+            }
+            // merged_bug_026 (bughunt-4): parallel-array length skew
+            // is unverifiable input, never a silently shrunken subset
+            // — the zip would truncate to the shorter array and a
+            // completeness predicate would quantify over the
+            // truncation as if it were total (the same laundering
+            // shape as the placeholder dimension, one axis over).
+            if names.len() != paths.len() {
+                proptest::prop_assert!(
+                    got.is_none(),
+                    "length skew ({} names, {} paths) must answer None, got {got:?}",
+                    names.len(), paths.len()
                 );
             }
         }

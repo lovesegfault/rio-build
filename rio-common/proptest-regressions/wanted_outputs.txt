@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc eba318782674cb1e616a13b94fc9da56aaf3dc2990aa2be355278ba6095702ac # shrinks to names = ["a", "a"], paths = [None, Some("/nix/store/aaaa")], wanted = []
+cc 157c1c3b90ed64b6555738452d8ec17c80570205cce7228c3715c4d0bbee9ff0 # shrinks to names = ["a"], paths = [Some("/nix/store/aaaa"), None], wanted = []
