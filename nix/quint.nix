@@ -7790,9 +7790,16 @@ rec {
     # claimRefusedAuthSkew (a deliberate live frame -- the auth
     # refusal keeps the credential untouched; the rotation-skew twin
     # perturbs the seat and falsifies noFaultNeverCharged through the
-    # existing sweepEstablish charge path). Tier-1 re-measured: 22
-    # distinct states unchanged (the live skew action is a stutter),
-    # <1s exhaustive TLC.
+    # existing sweepEstablish charge path).
+    # bughunt-5 S4 (merged_bug_011): the FENCE plane -- goneAnswerSeat
+    # (write-ahead decision) + the mintApply mintAfterGone oracle +
+    # resubmitReready (the straggler chain's middle step); NEW
+    # invariant noMintAfterGoneAnswer (a Gone answer is terminal for
+    # the token: write-ahead + DeliverNew screen,
+    # sched.executor.confirm-fence). Tier-1 re-measured: 34 distinct
+    # states (was 22), <1s exhaustive TLC -- budget 120s is ~100x
+    # headroom.
+    # r[verify sched.executor.confirm-fence]
     quint-open-attempts = mkQuintCheck {
       name = "open-attempts";
       spec = "openAttempts";
@@ -7806,6 +7813,7 @@ rec {
         "noCredentialClobber"
         "noRefusalFiledAsLost"
         "confirmNeverMints"
+        "noMintAfterGoneAnswer"
       ];
     };
 
@@ -8038,6 +8046,22 @@ rec {
       step = "calibStep";
       modelTimeoutSec = 120;
       witness = "outstandingBounded";
+    };
+    # bughunt-5 S4 twin (merged_bug_011): the live-loop Gone answers
+    # WITHOUT the fence write (the as-built pre-fix confirm_only-gated
+    # arm) -- decision-only perturbation at goneAnswerSeat; the
+    # mintAfterGone latch truth comes from the mint seat's own oracle.
+    # Measured (TLC): [violation] 935ms / baseline [ok] 955ms;
+    # budget 120s.
+    # r[verify sched.executor.confirm-fence]
+    quint-openattempts-calib-unfenced-gone = mkQuintWitnessCheck {
+      name = "openattempts-calib-unfenced-gone";
+      spec = "calibration/openattempts-unfenced-gone";
+      extraSpecs = [ "openAttempts" ];
+      main = "openAttemptsUnfencedGone";
+      step = "calibStep";
+      modelTimeoutSec = 120;
+      witness = "noMintAfterGoneAnswer";
     };
   };
 

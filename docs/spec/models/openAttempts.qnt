@@ -1,5 +1,5 @@
 // -*- mode: Bluespec; -*-
-// quint-policy-latches: driverLost, ackedUnsettled, ghostClaim, chargedNoFault, credentialClobbered, refusalFiledAsLost, confirmMinted
+// quint-policy-latches: driverLost, ackedUnsettled, ghostClaim, chargedNoFault, credentialClobbered, refusalFiledAsLost, confirmMinted, mintAfterGone
 //
 // openAttempts — one derivation's open pull-mode attempt, RE-STATED
 // over the claim/settlement laws of the materialize-disposition wave
@@ -54,6 +54,7 @@
 //   openattempts-refusal-as-lost   -> noRefusalFiledAsLost
 //   openattempts-minting-confirm   -> confirmNeverMints
 //   openattempts-rotation-skew     -> noFaultNeverCharged
+//   openattempts-unfenced-gone     -> noMintAfterGoneAnswer
 //   (the merged_bug_072 budget law lives in openAttemptsBudget.qnt --
 //    its own file; see the wedge note there)
 //
@@ -71,8 +72,20 @@
 //   - a confirm-only probe is a READ (merged_bug_083): it can never
 //     mint (`confirmProbeSeat` — the scheduler screens DeliverNew).
 //
-// Tier-1 budget: 3 (node) × 4 (attempt) × 2^5 (booleans) × 2^7
-// (latches) = 49,152 reachable upper bound; TLC exhausts in seconds.
+// bughunt-5 S4 (merged_bug_011): the FENCE plane -- a Gone answer is
+// the token's exit-0 license and MUST be fence-written ahead of the
+// reply (sched.executor.confirm-fence); the DeliverNew screen refuses
+// mints for fenced tokens. goneAnswerSeat is the oracle seat (the
+// write-ahead decision); mintApply computes the mintAfterGone latch
+// live (a mint while the token holds a Gone license is the invisible
+// orphan); resubmitReready models the content-addressed resubmit that
+// re-readies the drv (the straggler chain's middle step). The
+// unfenced-gone twin perturbs exactly the live-loop write-ahead
+// decision (the as-built pre-fix arm).
+//
+// Tier-1 budget: 3 (node) × 4 (attempt) × 2^7 (booleans) × 2^8
+// (latches) = upper bound only; TLC exhausts in seconds (state count
+// re-measured at the quint-open-attempts entry comment).
 
 module openAttempts {
   type NodeState = NWantedLive | NCancelled | NAbsent
@@ -92,6 +105,11 @@ module openAttempts {
   // The mint's response never reached the store (the lost-response
   // no-fault lane; cleared by a successful redelivery).
   var responseLost: bool
+  // The fence plane (merged_bug_011):
+  // The confirm-fence row for this token is durable.
+  var goneFenced: bool
+  // A Gone answer was issued to this token (its exit-0 license).
+  var goneLicensed: bool
 
   // --- latches (live-computed; see the header directive) -------------------
   // The failed cancel persist did not arm its driver (bug_357).
@@ -111,6 +129,9 @@ module openAttempts {
   var ghostClaim: bool
   // A charge landed on a no-fault (lost-response) attempt (bug_251).
   var chargedNoFault: bool
+  // A mint opened AFTER this token's Gone answer (merged_bug_011's
+  // invisible orphan -- an attempt no sweep can see).
+  var mintAfterGone: bool
 
   action init = all {
     node' = NWantedLive,
@@ -120,6 +141,9 @@ module openAttempts {
     viewClaimed' = false,
     clientHoldsResume' = false,
     responseLost' = false,
+    goneFenced' = false,
+    goneLicensed' = false,
+    mintAfterGone' = false,
     driverLost' = false,
     ackedUnsettled' = false,
     ghostClaim' = false,
@@ -137,13 +161,42 @@ module openAttempts {
   /// Mint seat: deliver the claim. `credentialPersisted` is the
   /// bug_251 decision (the nonce persists in the mint's fenced
   /// transaction); `lost` marks the response as never reaching the
-  /// store.
+  /// store. merged_bug_011 oracle: a mint while this token already
+  /// holds a Gone license is the invisible orphan -- the latch is
+  /// computed HERE, at the only transition that can open it (the
+  /// callers' screen guard is what makes it unreachable live).
   action mintApply(credentialPersisted: bool, lost: bool): bool = all {
     attempt' = AOpen,
     viewClaimed' = true,
     clientHoldsResume' = credentialPersisted,
     responseLost' = lost,
+    mintAfterGone' = or { mintAfterGone, goneLicensed },
+    goneFenced' = goneFenced,
+    goneLicensed' = goneLicensed,
     // A fresh mint is backed by its open attempt: no ghost here.
+    ghostClaim' = ghostClaim,
+    driverLost' = driverLost,
+    ackedUnsettled' = ackedUnsettled,
+    chargedNoFault' = chargedNoFault,
+    credentialClobbered' = credentialClobbered,
+    refusalFiledAsLost' = refusalFiledAsLost,
+    confirmMinted' = confirmMinted,
+  }
+
+  /// Gone-answer seat (merged_bug_011): the scheduler answers this
+  /// token Gone -- its exit-0 license. `writesFence` is the
+  /// write-ahead decision: the live protocol fences EVERY keyed Gone
+  /// before the reply (the law is uniform across the live-loop and
+  /// confirm arms); the unfenced-gone twin flips it for the live
+  /// loop (the as-built pre-fix decision).
+  action goneAnswerSeat(writesFence: bool): bool = all {
+    goneLicensed' = true,
+    goneFenced' = or { goneFenced, writesFence },
+    attempt' = attempt,
+    viewClaimed' = viewClaimed,
+    clientHoldsResume' = clientHoldsResume,
+    responseLost' = responseLost,
+    mintAfterGone' = mintAfterGone,
     ghostClaim' = ghostClaim,
     driverLost' = driverLost,
     ackedUnsettled' = ackedUnsettled,
@@ -167,6 +220,9 @@ module openAttempts {
   /// parameter converts to a silently-disabled arm under quint→TLA —
   /// the constructor-reachability probes in the header guard this.)
   action closeSettledApply(charged: bool, releasesClaim: bool): bool = all {
+    goneFenced' = goneFenced,
+    goneLicensed' = goneLicensed,
+    mintAfterGone' = mintAfterGone,
     attempt' = if (charged) AClosedCharged else AClosedFree,
     viewClaimed' = (viewClaimed and not(releasesClaim)),
     ackedUnsettled' = ackedUnsettled,
@@ -190,6 +246,9 @@ module openAttempts {
   /// redelivery re-presents; the ack-on-failed-close twin flips it
   /// and the oracle latches ackedUnsettled.
   action closeFailedApply(acks: bool): bool = all {
+    goneFenced' = goneFenced,
+    goneLicensed' = goneLicensed,
+    mintAfterGone' = mintAfterGone,
     attempt' = attempt,
     viewClaimed' = viewClaimed,
     ackedUnsettled' = or { ackedUnsettled, acks },
@@ -208,6 +267,9 @@ module openAttempts {
   /// must arm the driver, not as a state implication whose consequent
   /// was constant.
   action cancelFailApply(latchesOutbox: bool): bool = all {
+    goneFenced' = goneFenced,
+    goneLicensed' = goneLicensed,
+    mintAfterGone' = mintAfterGone,
     node' = NCancelled,
     attempt' = attempt,
     outbox' = latchesOutbox,
@@ -226,6 +288,9 @@ module openAttempts {
   /// refuses while an entry is live; the skip falls out of the API).
   /// The oracle: minting over a live credential is the clobber.
   action freshClaimSeat(mintsOverLive: bool): bool = all {
+    goneFenced' = goneFenced,
+    goneLicensed' = goneLicensed,
+    mintAfterGone' = mintAfterGone,
     credentialClobbered' = or { credentialClobbered, and { mintsOverLive, clientHoldsResume } },
     // The skip is a read -- no state moves besides the latch truth.
     attempt' = attempt,
@@ -251,6 +316,9 @@ module openAttempts {
   /// rejections do NOT route here -- they have their own seat
   /// (`authRefusalSeat`) because they disprove nothing.
   action answeredRefusalSeat(resolvesEntry: bool): bool = all {
+    goneFenced' = goneFenced,
+    goneLicensed' = goneLicensed,
+    mintAfterGone' = mintAfterGone,
     clientHoldsResume' = and { clientHoldsResume, not(resolvesEntry) },
     responseLost' = and { responseLost, not(resolvesEntry) },
     refusalFiledAsLost' = or { refusalFiledAsLost, and { clientHoldsResume, not(resolvesEntry) } },
@@ -279,6 +347,9 @@ module openAttempts {
   /// noFaultNeverCharged through the EXISTING machinery -- no new
   /// latch needed.
   action authRefusalSeat(resolvesEntry: bool): bool = all {
+    goneFenced' = goneFenced,
+    goneLicensed' = goneLicensed,
+    mintAfterGone' = mintAfterGone,
     clientHoldsResume' = and { clientHoldsResume, not(resolvesEntry) },
     responseLost' = responseLost,
     refusalFiledAsLost' = refusalFiledAsLost,
@@ -298,6 +369,11 @@ module openAttempts {
   /// NotYetReady on confirm_only); a minting confirm is the dying
   /// pod's probe creating fresh work for itself.
   action confirmProbeSeat(mints: bool): bool = all {
+    goneFenced' = goneFenced,
+    goneLicensed' = goneLicensed,
+    // The probe's mint-perturbation (the minting-confirm twin) is
+    // equally a mint-after-license when one was issued.
+    mintAfterGone' = or { mintAfterGone, and { mints, attempt != AOpen, goneLicensed } },
     confirmMinted' = or { confirmMinted, and { mints, attempt != AOpen } },
     attempt' = if (mints and attempt != AOpen) AOpen else attempt,
     viewClaimed' = or { viewClaimed, and { mints, attempt != AOpen } },
@@ -319,6 +395,9 @@ module openAttempts {
     node == NWantedLive,
     attempt != AOpen,
     not(viewClaimed),
+    // The DeliverNew screen (sched.executor.confirm-fence): a fenced
+    // token's mint is refused -- its exit was declared.
+    not(goneFenced),
     mintApply(true, false),
     node' = node,
     outbox' = outbox,
@@ -332,6 +411,7 @@ module openAttempts {
     node == NWantedLive,
     attempt != AOpen,
     not(viewClaimed),
+    not(goneFenced),
     mintApply(true, true),
     node' = node,
     outbox' = outbox,
@@ -346,6 +426,10 @@ module openAttempts {
     responseLost,
     clientHoldsResume,
     responseLost' = false,
+    goneFenced' = goneFenced,
+    goneLicensed' = goneLicensed,
+    mintAfterGone' = mintAfterGone,
+
     node' = node,
     attempt' = attempt,
     outbox' = outbox,
@@ -436,6 +520,9 @@ module openAttempts {
     all {
       outbox,
       attempt != AOpen,
+    goneFenced' = goneFenced,
+    goneLicensed' = goneLicensed,
+    mintAfterGone' = mintAfterGone,
       attempt' = attempt,
       viewClaimed' = viewClaimed,
       node' = node,
@@ -456,6 +543,9 @@ module openAttempts {
   /// The flush fails this tick: the entry is pushed back (front).
   action flushErr = all {
     outbox,
+    goneFenced' = goneFenced,
+    goneLicensed' = goneLicensed,
+    mintAfterGone' = mintAfterGone,
     node' = node,
     attempt' = attempt,
     outbox' = outbox,
@@ -482,6 +572,11 @@ module openAttempts {
     node' = if (node == NCancelled and not(cancelDurable)) NWantedLive
             else if (node == NCancelled) NAbsent
             else node,
+    // The fence plane survives failover: the row is durable PG state
+    // and the license rides the TOKEN, not the tenure.
+    goneFenced' = goneFenced,
+    goneLicensed' = goneLicensed,
+    mintAfterGone' = mintAfterGone,
     attempt' = attempt,
     outbox' = false,
     cancelDurable' = cancelDurable,
@@ -576,6 +671,53 @@ module openAttempts {
     cancelDurable' = cancelDurable,
   }
 
+  /// LIVE (merged_bug_011): the scheduler answers this token's pull
+  /// Gone -- the node is terminal/absent and nothing is held -- and
+  /// fences the answer AHEAD of the reply (writesFence = true; the
+  /// law is uniform across the live-loop and confirm arms). The
+  /// unfenced-gone twin perturbs exactly this decision.
+  action goneAnswered = all {
+    node != NWantedLive,
+    attempt != AOpen,
+    goneAnswerSeat(true),
+    node' = node,
+    outbox' = outbox,
+    cancelDurable' = cancelDurable,
+  }
+
+  /// LIVE (merged_bug_011's straggler chain, middle step): a new
+  /// submission re-readies the content-addressed drv -- same
+  /// intent_id == drv_hash, fresh wantedness. The old cancel's
+  /// durability is the PREVIOUS lifecycle's fact and resets with it;
+  /// the fence plane is per-TOKEN and survives (which is exactly what
+  /// screens the straggler).
+  action resubmitReready = all {
+    node != NWantedLive,
+    attempt != AOpen,
+    node' = NWantedLive,
+    cancelDurable' = false,
+    // The prior lifecycle's cancel-driver dies with it: a latched
+    // outbox batch belongs to the cancel it was armed for, and the
+    // resubmit reset supersedes that close (without this, the stale
+    // flush would stamp the OLD cancel's durability onto the NEW
+    // lifecycle -- the TLC artifact trace this guard removes).
+    outbox' = false,
+    attempt' = attempt,
+    viewClaimed' = viewClaimed,
+    clientHoldsResume' = clientHoldsResume,
+    responseLost' = responseLost,
+    goneFenced' = goneFenced,
+    goneLicensed' = goneLicensed,
+    mintAfterGone' = mintAfterGone,
+    ghostClaim' = ghostClaim,
+    driverLost' = driverLost,
+    ackedUnsettled' = ackedUnsettled,
+    chargedNoFault' = chargedNoFault,
+    credentialClobbered' = credentialClobbered,
+    refusalFiledAsLost' = refusalFiledAsLost,
+    confirmMinted' = confirmMinted,
+  }
+
   action step = any {
     mintDelivered,
     mintResponseLost,
@@ -592,6 +734,8 @@ module openAttempts {
     claimRefusedAnswered,
     claimRefusedAuthSkew,
     confirmProbeReads,
+    goneAnswered,
+    resubmitReready,
   }
 
   // --- invariants ------------------------------------------------------------
@@ -639,6 +783,11 @@ module openAttempts {
   // merged_bug_083: a confirm-only probe never mints.
   val confirmNeverMints = not(confirmMinted)
 
+  // merged_bug_011: no mint ever opens after this token's Gone answer
+  // -- the exit-0 license is terminal for the token (write-ahead +
+  // DeliverNew screen; sched.executor.confirm-fence).
+  val noMintAfterGoneAnswer = not(mintAfterGone)
+
   val openAttemptsInvariants = all {
     cancelledNeverChargedAsCrash,
     notDriverLost,
@@ -648,5 +797,6 @@ module openAttempts {
     noCredentialClobber,
     noRefusalFiledAsLost,
     confirmNeverMints,
+    noMintAfterGoneAnswer,
   }
 }
