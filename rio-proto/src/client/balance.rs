@@ -14,6 +14,12 @@
 //! with the named service (e.g. `rio.scheduler.SchedulerService`),
 //! feed `Change::Insert` for SERVING and `Change::Remove` for
 //! NOT_SERVING. The balance channel only ever sees the leader.
+//!
+//! Nothing here may assume the scheduler's 2-replica shape: the SAME
+//! client balances the rio-store fleet, where EVERY replica is
+//! SERVING and KEDA scales the pod count well past any fixed buffer
+//! size. See `DISCOVERY_BUFFER` and [`BalancedChannel::new`] for
+//! the init-ordering consequence.
 
 // r[impl sched.grpc.leader-guard]
 // r[impl proto.client.balanced]
@@ -22,7 +28,8 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use futures_util::future::BoxFuture;
+use tokio::sync::{mpsc, watch};
 use tonic::transport::channel::Change;
 use tonic::transport::{Channel, Endpoint};
 use tonic_health::pb::health_check_response::ServingStatus;
@@ -32,6 +39,29 @@ use tracing::{debug, warn};
 /// Per-endpoint health probe timeout. A pod that takes >2s to
 /// answer Health/Check is as good as down for routing purposes.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Capacity of the discovery buffer between the probe loop and tonic's
+/// p2c balancer (`Channel::balance_channel`).
+///
+/// This is a flow-control window, NOT a fleet-size bound. tonic drains
+/// the buffer only when the `Channel` is polled by an RPC; whenever a
+/// tick's change set outruns the buffer, the probe loop parks mid-feed
+/// until the next RPC drains it. The store fleet KEDA-scales to a
+/// values-driven `maxReplicaCount` (three-digit today), so NO constant
+/// here can cover the fleet --- and nothing may treat "buffer accepted
+/// the change" as a readiness signal. [`BalancedChannel::new`] keys
+/// readiness off the discovery-side watch instead; this buffer only
+/// needs to swallow a typical steady-state tick (a handful of churn
+/// events) without parking. Beyond that it degrades to backpressure,
+/// never to deadlock.
+const DISCOVERY_BUFFER: usize = 32;
+
+/// Pluggable endpoint resolution for the probe loop: each call yields
+/// the current fleet (one `SocketAddr` per pod). Production is
+/// `tokio::net::lookup_host` over the headless Service name (see
+/// [`BalancedChannel::new`]); tests inject fixed fleets of arbitrary
+/// size without real DNS.
+type Resolver = Box<dyn FnMut() -> BoxFuture<'static, std::io::Result<Vec<SocketAddr>>> + Send>;
 
 /// Endpoint builder: wraps a pod IP in an `Endpoint`. Factored out
 /// because both the balance feed (Insert) and the health probe itself
@@ -100,36 +130,48 @@ async fn probe(addr: SocketAddr, ch: Channel, service: &str) -> bool {
     }
 }
 
-/// One probe cycle: resolve DNS, probe all endpoints, diff against
+/// One probe cycle: resolve endpoints, probe them all, diff against
 /// the live set, emit Change::Insert/Remove. Returns the new live
 /// set for the next cycle's diff.
 ///
 /// `probe_ch` caches one lazy `Channel` per resolved addr so the
 /// Health/Check RPC reuses an existing h2 connection instead of
-/// dialing fresh every tick. Addrs that disappear from DNS are
+/// dialing fresh every tick. Addrs that disappear from resolution are
 /// evicted; new addrs get a `connect_lazy()` channel (connects on
 /// first RPC, auto-reconnects on failure).
+///
+/// The cycle's SERVING count is published to `serving_seen` BEFORE
+/// any `tx.send`: the sends park when the discovery buffer is full
+/// and nothing polls the balanced channel yet (tonic only drains the
+/// buffer when an RPC polls the `Channel`), so anything waiting on
+/// "first probe cycle done" must key off this discovery-side signal,
+/// not off buffer acceptance. See [`BalancedChannel::new`].
 async fn tick(
     host: &str,
-    port: u16,
     service: &str,
     live: &HashSet<SocketAddr>,
     probe_ch: &mut HashMap<SocketAddr, Channel>,
+    resolve: &mut Resolver,
+    serving_seen: &watch::Sender<Option<usize>>,
     tx: &mpsc::Sender<Change<SocketAddr, Endpoint>>,
 ) -> HashSet<SocketAddr> {
-    // DNS resolve. For a headless Service, CoreDNS returns ALL pod
-    // IPs as AAAA records (TTL 5s by default; rio Services are
-    // SingleStack IPv6). `lookup_host` resolves via the system
-    // resolver --- no extra deps. The port argument is required
-    // by `ToSocketAddrs`; the returned SocketAddrs carry it.
-    // build_endpoint() brackets v6 addrs for the URI authority.
-    let resolved: HashSet<SocketAddr> = match tokio::net::lookup_host((host, port)).await {
-        Ok(addrs) => addrs.collect(),
+    // Resolve. For a headless Service, CoreDNS returns ALL pod IPs
+    // as AAAA records (TTL 5s by default; rio Services are
+    // SingleStack IPv6). The production resolver is `lookup_host`
+    // via the system resolver --- no extra deps; the returned
+    // SocketAddrs carry the configured port. build_endpoint()
+    // brackets v6 addrs for the URI authority.
+    let resolved: HashSet<SocketAddr> = match resolve().await {
+        Ok(addrs) => addrs.into_iter().collect(),
         Err(e) => {
             // DNS failure: keep the current live set unchanged.
             // Don't Remove everything --- a transient resolver
-            // hiccup shouldn't eject the leader.
+            // hiccup shouldn't eject the leader. Still publish the
+            // (unchanged) count: a first-cycle DNS failure must
+            // surface to BalancedChannel::new as "cycle done, zero
+            // serving" rather than leaving it waiting.
             warn!(%host, error = %e, "balance: DNS resolve failed; keeping current endpoints");
+            serving_seen.send_replace(Some(live.len()));
             return live.clone();
         }
     };
@@ -151,9 +193,9 @@ async fn tick(
         }
     }
 
-    // Probe all resolved addrs concurrently. Small set (2 pods
-    // typically), overhead is negligible; do it in parallel so
-    // a slow standby doesn't delay seeing the leader.
+    // Probe all resolved addrs concurrently. Bounded by the fleet
+    // size (2 scheduler pods; up to the KEDA cap for the store);
+    // do it in parallel so one slow pod doesn't delay the rest.
     let mut probes = Vec::with_capacity(resolved.len());
     for &addr in &resolved {
         let Some(ch) = probe_ch.get(&addr).cloned() else {
@@ -167,6 +209,10 @@ async fn tick(
         .into_iter()
         .filter_map(|(a, ok)| ok.then_some(a))
         .collect();
+
+    // Discovery is done --- publish before feeding the balancer (the
+    // sends below may park on a full buffer; see fn doc).
+    serving_seen.send_replace(Some(serving.len()));
 
     // Diff. Send Insert for new SERVING, Remove for no-longer-SERVING.
     // Order doesn't matter to p2c.
@@ -229,62 +275,125 @@ impl BalancedChannel {
     /// - `probe_interval`: how often to re-resolve + re-probe.
     ///   Should be ≤ CoreDNS TTL (5s default) or we miss flips.
     ///
-    /// Blocks until the first probe cycle completes. Errors only
-    /// if the first cycle finds ZERO serving endpoints --- the
-    /// balance channel would be empty, first RPC fails "no ready
-    /// endpoints," caller errors out of main anyway. Better to
-    /// fail here with a clear message.
+    /// Waits until the first probe cycle has *observed* the fleet,
+    /// then returns. Errors only if that first cycle finds ZERO
+    /// serving endpoints --- the balance channel would be empty,
+    /// first RPC fails "no ready endpoints," caller errors out of
+    /// main anyway (cold-start retry loops re-run construction).
+    /// Better to fail here with a clear message.
+    ///
+    /// Readiness is signaled from the DISCOVERY side (the probe
+    /// loop's watch), NOT from the discovery buffer draining: tonic
+    /// only drains `Change`s when the `Channel` is polled, and
+    /// nothing polls it until the caller issues its first RPC. A
+    /// fleet larger than `DISCOVERY_BUFFER` parks the probe feed
+    /// mid-tick until that first RPC drains it; construction still
+    /// completes, and the buffered endpoints are enough to route.
     pub async fn new(
         host: String,
         port: u16,
         health_service: String,
         probe_interval: Duration,
     ) -> anyhow::Result<Self> {
-        // Channel::balance_channel takes a buffer capacity for the
-        // discovery channel. We send at most 2×N changes per tick
-        // (N = pod count, typically 2). 32 is ample.
-        let (channel, tx) = Channel::balance_channel::<SocketAddr>(32);
-        let mut probe_ch = HashMap::new();
+        let resolver: Resolver = {
+            let host = host.clone();
+            Box::new(move || {
+                let host = host.clone();
+                Box::pin(async move {
+                    let addrs = tokio::net::lookup_host((host.as_str(), port)).await?;
+                    Ok(addrs.collect::<Vec<_>>())
+                })
+            })
+        };
+        Self::new_with_resolver(host, port, health_service, probe_interval, resolver).await
+    }
 
-        // First tick: blocking, so the channel has ≥1 endpoint
-        // before the caller makes an RPC.
-        let live = tick(
-            &host,
-            port,
-            &health_service,
-            &HashSet::new(),
-            &mut probe_ch,
-            &tx,
-        )
-        .await;
+    /// [`Self::new`] with resolution injected --- the seam that lets
+    /// tests present arbitrary fleet sizes without real DNS.
+    async fn new_with_resolver(
+        host: String,
+        port: u16,
+        health_service: String,
+        probe_interval: Duration,
+        mut resolve: Resolver,
+    ) -> anyhow::Result<Self> {
+        let (channel, tx) = Channel::balance_channel::<SocketAddr>(DISCOVERY_BUFFER);
+        // Discovery-side "cycle done" signal: `Some(n)` = the most
+        // recent completed probe cycle observed n SERVING endpoints.
+        let (serving_seen, mut first_cycle) = watch::channel(None::<usize>);
+
+        // Background probe loop --- INCLUDING the first cycle. The
+        // first cycle must NOT run inline here: with more SERVING
+        // endpoints than DISCOVERY_BUFFER, the discovery feed parks
+        // on a full buffer until an RPC polls the channel, and at
+        // construction time no RPC exists --- an inline first cycle
+        // deadlocks startup. (Seen live: a store fleet KEDA-scaled
+        // past the buffer wedged every builder pod at "balance:
+        // insert" #33, never reaching "balanced channel
+        // initialized".)
+        let task = tokio::spawn({
+            let host = host.clone();
+            let health_service = health_service.clone();
+            async move {
+                let mut live = HashSet::new();
+                let mut probe_ch = HashMap::new();
+                let mut interval = tokio::time::interval(probe_interval);
+                // A cycle can park on the buffer feed for as long as
+                // the caller goes without an RPC; don't burst-replay
+                // the missed ticks afterwards.
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    // First iteration fires immediately (tokio
+                    // interval semantics) --- that IS the first cycle.
+                    interval.tick().await;
+                    live = tick(
+                        &host,
+                        &health_service,
+                        &live,
+                        &mut probe_ch,
+                        &mut resolve,
+                        &serving_seen,
+                        &tx,
+                    )
+                    .await;
+                }
+            }
+        });
+        // Construct the guard BEFORE the first await so every early
+        // exit below (zero-endpoint bail, caller dropping this future
+        // mid-wait) aborts the probe task via Drop --- no leaked
+        // probe loop.
+        let guard = Self {
+            channel,
+            _task: task,
+        };
+
+        // Wait for the first cycle's DISCOVERY result. This is the
+        // readiness signal --- "first nonempty SERVING set observed"
+        // --- and it deliberately does not require the balancer to
+        // have accepted the corresponding Changes (tonic drains those
+        // only once the caller's first RPC polls the channel).
+        let first = match first_cycle.wait_for(Option::is_some).await {
+            // `unwrap_or` instead of unwrap/expect: the predicate
+            // guarantees Some, but degrading an impossible None to
+            // the zero-endpoint error beats a panic path.
+            Ok(seen) => (*seen).unwrap_or(0),
+            Err(_) => anyhow::bail!(
+                "balance: probe task exited before completing the first probe cycle \
+                 for {host}:{port} (service={health_service})"
+            ),
+        };
         anyhow::ensure!(
-            !live.is_empty(),
+            first > 0,
             "balance: no SERVING endpoints for {host}:{port} (service={health_service}); \
              either DNS returned nothing or all probes failed. \
              Check headless Service selector and that at least one pod is leader."
         );
         tracing::info!(
-            %host, port, endpoints = live.len(),
+            %host, port, endpoints = first,
             "balanced channel initialized"
         );
-
-        // Background probe loop. Runs until dropped.
-        let task = tokio::spawn(async move {
-            let mut live = live;
-            let mut probe_ch = probe_ch;
-            let mut interval = tokio::time::interval(probe_interval);
-            // First tick fires immediately; we already did one, skip.
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                live = tick(&host, port, &health_service, &live, &mut probe_ch, &tx).await;
-            }
-        });
-
-        Ok(Self {
-            channel,
-            _task: task,
-        })
+        Ok(guard)
     }
 
     /// [`Self::new`] with `health_service` taken from a
@@ -354,6 +463,112 @@ where
 mod tests {
     use super::*;
 
+    /// A [`Resolver`] that always yields the same fixed fleet.
+    fn fixed_resolver(addrs: Vec<SocketAddr>) -> Resolver {
+        Box::new(move || {
+            let addrs = addrs.clone();
+            Box::pin(async move { Ok(addrs) })
+        })
+    }
+
+    /// Spawn `n` real tonic health servers on ephemeral loopback
+    /// ports, all SERVING for `service`. Returns their addrs; the
+    /// server tasks (and their reporters) live for the test duration.
+    async fn spawn_serving_fleet(n: usize, service: &str) -> Vec<SocketAddr> {
+        let mut addrs = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (reporter, health_svc) = tonic_health::server::health_reporter();
+            reporter
+                .set_service_status(service, tonic_health::ServingStatus::Serving)
+                .await;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            addrs.push(listener.local_addr().unwrap());
+            let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+            tokio::spawn(async move {
+                // Keep the reporter alive for the server's lifetime so
+                // the SERVING entry can't be torn down mid-test.
+                let _reporter = reporter;
+                let _ = tonic::transport::Server::builder()
+                    .add_service(health_svc)
+                    .serve_with_incoming(incoming)
+                    .await;
+            });
+        }
+        addrs
+    }
+
+    /// Regression: a fleet larger than [`DISCOVERY_BUFFER`] must not
+    /// deadlock construction. tonic only drains the discovery buffer
+    /// when the `Channel` is polled, and at construction time NO RPC
+    /// exists to poll it --- so init must complete on the
+    /// discovery-side signal alone. Pre-fix, `BalancedChannel::new`
+    /// ran the first probe cycle inline and parked forever on Insert
+    /// #(DISCOVERY_BUFFER+1); a store fleet scaled past the buffer
+    /// wedged every consumer pod at startup, before "balanced channel
+    /// initialized".
+    #[tokio::test]
+    async fn init_completes_when_fleet_exceeds_discovery_buffer() {
+        let fleet = DISCOVERY_BUFFER + 1;
+        let addrs = spawn_serving_fleet(fleet, "test.Service").await;
+
+        let bc = tokio::time::timeout(
+            Duration::from_secs(15),
+            BalancedChannel::new_with_resolver(
+                "test-fleet".into(),
+                0,
+                "test.Service".into(),
+                Duration::from_secs(3),
+                fixed_resolver(addrs),
+            ),
+        )
+        .await
+        .expect(
+            "BalancedChannel construction deadlocked: init must not depend on \
+             the discovery buffer draining (nothing polls the channel before \
+             the first RPC)",
+        )
+        .expect("init failed against an all-SERVING fleet");
+
+        // The channel must be USABLE: the first RPC polls the
+        // Channel, which drains the parked discovery feed and routes
+        // to a real backend.
+        let mut hc = HealthClient::new(bc.channel());
+        let resp = tokio::time::timeout(
+            Duration::from_secs(15),
+            hc.check(HealthCheckRequest {
+                service: "test.Service".to_string(),
+            }),
+        )
+        .await
+        .expect("first RPC through the balanced channel hung")
+        .expect("health check through balanced channel failed");
+        assert_eq!(resp.into_inner().status(), ServingStatus::Serving);
+    }
+
+    /// First cycle with zero SERVING endpoints must ERROR (fast), not
+    /// wait --- cold-start retry loops (`connect_forever`) re-run
+    /// construction with backoff, and a clear error beats a hang.
+    #[tokio::test]
+    async fn init_errors_when_no_serving_endpoints() {
+        let r = tokio::time::timeout(
+            Duration::from_secs(15),
+            BalancedChannel::new_with_resolver(
+                "test-empty".into(),
+                0,
+                "test.Service".into(),
+                Duration::from_secs(3),
+                fixed_resolver(Vec::new()),
+            ),
+        )
+        .await
+        .expect("zero-endpoint init must fail fast, not hang");
+        let err = match r {
+            Ok(_) => panic!("zero SERVING endpoints must be a construction error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("no SERVING endpoints"), "{err}");
+    }
+
     /// Smoke: build_endpoint formats IPv4/v6 URIs correctly.
     #[test]
     fn build_endpoint_formats_uri() {
@@ -409,21 +624,25 @@ mod tests {
 
         // Balance discovery channel sink.
         let (tx, mut rx) = mpsc::channel(8);
+        let (seen, _seen_rx) = watch::channel(None);
         let mut probe_ch = HashMap::new();
+        let mut resolve = fixed_resolver(vec![addr]);
 
         // Tick 1: NOT_SERVING → empty live set, no Insert.
         let live = tick(
             "127.0.0.1",
-            addr.port(),
             "test.Service",
             &HashSet::new(),
             &mut probe_ch,
+            &mut resolve,
+            &seen,
             &tx,
         )
         .await;
         assert!(live.is_empty(), "NOT_SERVING should not be in live set");
         assert!(rx.try_recv().is_err(), "no Change should be emitted");
         assert_eq!(probe_ch.len(), 1, "probe channel cached after first tick");
+        assert_eq!(*seen.borrow(), Some(0), "cycle published zero serving");
 
         // Flip to SERVING.
         reporter
@@ -433,10 +652,11 @@ mod tests {
         // Tick 2: SERVING → Insert.
         let live = tick(
             "127.0.0.1",
-            addr.port(),
             "test.Service",
             &live,
             &mut probe_ch,
+            &mut resolve,
+            &seen,
             &tx,
         )
         .await;
@@ -445,6 +665,7 @@ mod tests {
             Change::Insert(a, _) => assert_eq!(a, addr),
             Change::Remove(_) => panic!("expected Insert, got Remove"),
         }
+        assert_eq!(*seen.borrow(), Some(1), "cycle published one serving");
 
         // Flip back to NOT_SERVING.
         reporter
@@ -454,10 +675,11 @@ mod tests {
         // Tick 3: Remove.
         let live = tick(
             "127.0.0.1",
-            addr.port(),
             "test.Service",
             &live,
             &mut probe_ch,
+            &mut resolve,
+            &seen,
             &tx,
         )
         .await;

@@ -632,8 +632,16 @@ per-binary connect blocks can't drift on where it's set.
 The scheduler runs `replicas=2`; only the leader serves RPCs (the standby
 returns `Unavailable` from leader-gated handlers). p2c only ejects on
 connection-level failure, so without the out-of-band health probe it would keep
-routing \~50% of calls to the standby. `BalancedChannel::new` blocks until the
-first probe cycle finds ≥1 `SERVING` endpoint. The TLS domain override
+routing \~50% of calls to the standby. `BalancedChannel::new` returns once the
+first probe cycle *observes* ≥1 `SERVING` endpoint (and errors on zero, so
+cold-start retry loops re-run it). That signal comes from the discovery side,
+not from the balancer accepting the changes: tonic drains the discovery buffer
+only when the channel is polled, and nothing polls it until the caller's first
+RPC --- so construction must never depend on pushing the whole fleet through
+the buffer. The same client balances the store fleet, which KEDA-scales far
+beyond the scheduler's 2 replicas; a fleet larger than the discovery buffer
+parks the probe feed mid-tick until the first RPC drains it, and init still
+completes. The TLS domain override
 (`ClientTlsConfig::domain_name`) decouples SAN verification from the connect
 URI so pod-IP connections verify against the Service-name cert. The h2
 keepalive (30s PING + 10s PONG timeout) is NOT optional: `Change::Remove` drops
