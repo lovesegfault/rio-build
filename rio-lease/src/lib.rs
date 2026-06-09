@@ -1433,12 +1433,34 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
             .await
         {
             election::RenewOutcome::Completed { result, facts } => {
-                // Successful round-trip (apiserver answered). Even
-                // Standby/Conflict restart the blind window — we KNOW
-                // the apiserver answered, we just don't hold the lease.
-                // The clock tracks "am I blind", not "am I leader".
-                blind.stamp(attempt_anchor);
                 let is_conflict = matches!(result, ElectionResult::Conflict);
+                // Will this round take the one-round 409 deferral
+                // (sched.lease.holder-evidenced-lose)? Computed BEFORE
+                // the stamp: a deferred round must NOT restart the
+                // blind window. The old law could stamp on every
+                // Completed round because every belief-EXTENDING stamp
+                // came coupled with a content write (which resets a
+                // standby's steal clock) or a lose (which ends the
+                // belief the stamp would extend); a stamped DEFERRAL
+                // breaks that coupling — it extends belief with the
+                // lease content frozen, and the leaderElection.qnt
+                // holder-evidence regime produces the dual-belief
+                // counterexample (a frozen-content victim whose
+                // completing 409 lands near its fence deadline keeps
+                // belief past the standby's steal). Deferring on the
+                // PRE-409 blind budget keeps the original
+                // fence-before-steal margin untouched: the deferral
+                // changes WHICH edge runs, never how long belief may
+                // last.
+                let will_defer = is_conflict && standing.believes() && !conflict_deferred;
+                if !will_defer {
+                    // Successful round-trip (apiserver answered). Even
+                    // Standby (and a RESOLVED Conflict) restart the
+                    // blind window — we KNOW the apiserver answered,
+                    // we just don't hold the lease. The clock tracks
+                    // "am I blind", not "am I leader".
+                    blind.stamp(attempt_anchor);
+                }
                 // Leading/Standby answer the unconfirmed question
                 // wholesale: their facts describe the post-resolution
                 // state, so nothing of ours is left in doubt. A 409
@@ -4189,11 +4211,17 @@ mod tests {
     }
 
     /// Shared choreography for the Q3 holder-evidenced-lose tests:
-    /// healthy acquire (round 1), a transmitted-then-dropped renew that
-    /// arms the cancelled-write ledger (round 2), then a renew 409
-    /// (round 3) — the ambiguous CAS bounce whose rv-mover may be our
-    /// own round-2 zombie commit. Returns after the 409 response is
-    /// delivered and the loop has settled.
+    /// two healthy rounds (acquire + renew, blind freshly stamped),
+    /// then a renew 409 (round 3) from a foreign metadata-only patch
+    /// landing in the GET→PUT window — an rv-mover that is NOT a
+    /// holder change. The deferral runs on the PRE-409 blind budget
+    /// (a deferred bounce does not stamp), so the round-2 stamp is
+    /// what keeps round 4's resolution inside the fence deadline.
+    /// The own-zombie rv-mover shape (act-failed round arming the
+    /// ledger) is pinned separately by
+    /// `zombie_ledger_survives_the_409_for_evidence_reacquire`.
+    /// Returns after the 409 response is delivered and the loop has
+    /// settled.
     async fn drive_to_believing_409(park: &mut RequestPark, state: &LeaderState) {
         // Round 1 (healthy): acquire.
         let get = park.next().await;
@@ -4208,22 +4236,21 @@ mod tests {
         patch.respond_ok(pod_ok("us"));
         settle().await;
 
-        // Round 2 (zombie): the read completes, the renew PUT is
-        // transmitted and dropped — it may still commit server-side.
-        // The ledger arms at this round's anchor.
+        // Round 2 (healthy): an ordinary renew — the blind window
+        // re-stamps at t=5s.
         let get = park.next().await;
         get.respond_ok(park_lease_json(Some("us"), 3, 11));
         let put = park.next().await;
-        drop(put);
+        put.respond_ok(park_lease_json(Some("us"), 3, 12));
         settle().await;
-        assert!(state.is_leader(), "an act failure alone never loses");
+        assert!(state.is_leader(), "steady-state renew keeps leading");
 
-        // Round 3 (the ambiguous 409): the GET still serves the
-        // pre-zombie view; the zombie commits inside the GET→PUT
-        // window, so the PUT bounces. The 409 proves rv movement —
-        // NOT a holder change.
+        // Round 3 (the ambiguous 409): a foreign metadata-only patch
+        // bumps the rv inside our GET→PUT window; the PUT bounces.
+        // The 409 proves rv movement — NOT a holder change (the
+        // holder-authored renewTime bytes are untouched).
         let get = park.next().await;
-        get.respond_ok(park_lease_json(Some("us"), 3, 11));
+        get.respond_ok(park_lease_json(Some("us"), 3, 12));
         let put = park.next().await;
         put.respond_status(409, "Conflict", "the object has been modified");
         settle().await;
@@ -4277,13 +4304,14 @@ mod tests {
             "no lose edge may run on a bare CAS bounce"
         );
 
-        // Round 4 (resolution): the next GET shows the zombie DID
-        // commit — rv and renewTime moved, holder is still us. The
-        // deferred round resolves as an ordinary renew.
+        // Round 4 (resolution, t=15s — inside the round-2 stamp's
+        // fence budget): the next GET shows the patched lease — rv
+        // moved, renewTime UNCHANGED, holder still us. The deferred
+        // round resolves as an ordinary renew.
         let get = park.next().await;
-        get.respond_ok(park_lease_json(Some("us"), 3, 12));
+        get.respond_ok(park_lease_json_rt(Some("us"), 3, 13, 12));
         let put = park.next().await;
-        put.respond_ok(park_lease_json(Some("us"), 3, 13));
+        put.respond_ok(park_lease_json(Some("us"), 3, 14));
         settle().await;
 
         assert!(state.is_leader(), "holder=us resolution renews");
@@ -4345,7 +4373,7 @@ mod tests {
         // edge runs with bounded evidence (two consecutive completed
         // rounds bounced our CAS).
         let get = park.next().await;
-        get.respond_ok(park_lease_json(Some("us"), 3, 11));
+        get.respond_ok(park_lease_json_rt(Some("us"), 3, 13, 12));
         let put = park.next().await;
         put.respond_status(409, "Conflict", "the object has been modified");
         settle().await;
@@ -4401,9 +4429,10 @@ mod tests {
         assert!(state.is_leader(), "first believing 409 defers");
 
         // Round 4: the GET names another holder — the rv-mover was a
-        // genuine steal. The lose edge runs, with evidence.
+        // genuine steal racing the patch. The lose edge runs, with
+        // evidence.
         let get = park.next().await;
-        get.respond_ok(park_lease_json(Some("other"), 4, 12));
+        get.respond_ok(park_lease_json(Some("other"), 4, 14));
         settle().await;
 
         assert!(
@@ -4420,6 +4449,128 @@ mod tests {
         for _ in 0..3 {
             if let Some(req) = park.try_next().await {
                 req.respond_status(404, "NotFound", "gone");
+            }
+        }
+        loop_task.await.expect("lease loop exits");
+    }
+
+    /// The own-zombie rv-mover half of Q3: a cancelled-then-committed
+    /// write 409s the NEXT round's PUT, and the old code's immediate
+    /// lose WIPED the unconfirmed-write ledger at that bounce — so the
+    /// later read that proved the zombie was ours (holder=us,
+    /// renewTime moved) had nothing to consume, and the replica
+    /// failed over on its own write. Under the deferral law the 409
+    /// runs NO lose edge and the ledger survives; the deferral does
+    /// not stamp, so the blind window (anchored at the last healthy
+    /// round) fences on its ORIGINAL schedule — the lose that
+    /// eventually happens is the fence law working, not a 409 edge —
+    /// and the surviving ledger's own-commit evidence re-acquires in
+    /// the same tick.
+    // r[verify sched.lease.holder-evidenced-lose]
+    // r[verify sched.lease.cancelled-write+2]
+    #[tokio::test(start_paused = true)]
+    async fn zombie_ledger_survives_the_409_for_evidence_reacquire() {
+        let (client, mut park) = RequestPark::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        // Round 1 (t=0, healthy): acquire; settle the marks PATCH.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 10));
+        let put = park.next().await;
+        put.respond_ok(park_lease_json(Some("us"), 3, 11));
+        settle().await;
+        assert!(state.is_leader(), "healthy round acquires");
+        let patch = park.next().await;
+        patch.respond_ok(pod_ok("us"));
+        settle().await;
+
+        // Round 2 (t=5s, the zombie): the renew PUT is transmitted
+        // and dropped — it may still commit server-side. The ledger
+        // arms at t=5s; nothing stamps the blind window.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 11));
+        let put = park.next().await;
+        drop(put);
+        settle().await;
+        assert!(state.is_leader(), "an act failure alone never loses");
+
+        // Round 3 (t=10s, the ambiguous 409): the GET serves the
+        // pre-zombie view; the zombie commits inside the GET→PUT
+        // window; the PUT bounces. THE Q3 ASSERTION: no lose edge at
+        // the bounce — and the ledger survives it (proven by round
+        // 4's consumption).
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 11));
+        let put = park.next().await;
+        put.respond_status(409, "Conflict", "the object has been modified");
+        settle().await;
+        assert!(
+            state.is_leader(),
+            "the 409 itself must not lose — the rv-mover may be our own zombie"
+        );
+        assert_eq!(
+            hooks.loses.lock().expect("loses lock").len(),
+            0,
+            "no lose edge at the bounce"
+        );
+
+        // Round 4 (t=15s): the deferral did NOT stamp, so the blind
+        // window is still anchored at round 1 — the tick-top fence
+        // fires on its original schedule (15s > 11s). Same tick, the
+        // GET shows the zombie committed (holder=us, renewTime moved)
+        // and the act fails again: the SURVIVING ledger's own-commit
+        // evidence consumes at the t=5s anchor (10s old, inside the
+        // acquire gate) and re-acquires. Old code: ledger wiped at
+        // round 3 → no evidence → stays fenced.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 12));
+        let put = park.next().await;
+        drop(put);
+        settle().await;
+
+        assert!(
+            state.is_leader(),
+            "the surviving ledger re-acquires via own-commit evidence \
+             (the wipe-at-409 is the merged_bug_085 defect)"
+        );
+        assert_eq!(
+            hooks.acquires.lock().expect("acquires lock").len(),
+            2,
+            "evidence re-acquire after the scheduled fence"
+        );
+        assert_eq!(
+            hooks.loses.lock().expect("loses lock").len(),
+            1,
+            "exactly one lose — the ORIGINAL-schedule fence, never a 409 edge"
+        );
+
+        shutdown.cancel();
+        for _ in 0..4 {
+            if let Some(req) = park.try_next().await {
+                if req.path.contains("/pods/us") {
+                    req.respond_ok(pod_ok("us"));
+                } else {
+                    req.respond_status(404, "NotFound", "gone");
+                }
             }
         }
         loop_task.await.expect("lease loop exits");

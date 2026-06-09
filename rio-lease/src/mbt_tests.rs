@@ -418,6 +418,17 @@ impl MbtSystem {
                 }
                 h.standing.on_observed(true);
             }
+            // NOTE: this arm mirrors the BASE-regime edge law
+            // (leaderElectionBase has HOLDER_EVIDENCE_LOSE = false, so
+            // a believing conflict loses immediately). The production
+            // LOOP refines the believing-409 edge above this layer --
+            // one deferred round, lose only on holder evidence
+            // (sched.lease.holder-evidenced-lose) -- and that law is
+            // modeled by leaderElectionHolderEvidence and pinned by
+            // the loop-level tokio tests; the deferral lives in loop
+            // state the election layer this driver exercises never
+            // sees. Do NOT "fix" this arm to defer: against the base
+            // module that would be a per-step diff, not fidelity.
             ElectionResult::Standby | ElectionResult::Conflict => {
                 if h.standing.believes() {
                     h.state.on_lose();
