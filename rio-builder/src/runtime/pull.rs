@@ -105,14 +105,31 @@ const _: () = assert!(
     2 * SIGTERM_FINAL_ATTEMPT.as_secs() <= rio_common::limits::PULL_MODE_TERMINATION_GRACE_SECS
 );
 
-/// merged_bug_083 — the wire-effect evidence, typed. The latch can be
-/// SET by any post-send uncertainty and CLEARED only by an operation
-/// that is authoritative about every send this process ever made:
-/// there is deliberately NO method that clears it on an interleaved
-/// per-request answer (`NotYetReady` to request N proves nothing
-/// about abandoned request N-1 — no requester-liveness gate exists on
-/// the durable mint), so the pre-fix bug shape (an answer laundering
-/// an earlier maybe-mint) is unrepresentable in the API.
+/// merged_bug_083 — the wire-effect evidence, typed. THE single truth
+/// site for the latch's set/clear alphabet (merged_bug_012 house
+/// rule, encoded here: use sites MAY only doc-link to this type doc,
+/// never restate the alphabet — a semantics change has exactly one
+/// place to edit):
+///
+/// - SET by any post-send uncertainty: a timed-out pull, a post-send
+///   shutdown abandonment, or a post-send transport error
+///   ([`MintEvidence::latch_send`]).
+/// - CLEARED only by a LOOP-TERMINATING answer: a delivered
+///   `Assignment` or `Gone`
+///   ([`MintEvidence::clear_loop_terminating`]). `NotYetReady`
+///   deliberately does NOT clear, and there is NO method that clears
+///   on an interleaved per-request answer (`NotYetReady` to request N
+///   proves nothing about abandoned request N-1 — no
+///   requester-liveness gate exists on the durable mint), so the
+///   pre-fix bug shape (an answer laundering an earlier maybe-mint)
+///   is unrepresentable in the API.
+///
+/// The Gone clear's "nothing is or will be held" claim is made
+/// literally true by the scheduler's durable confirm fence
+/// (merged_bug_011, `sched.executor.confirm-fence`): every keyed Gone
+/// is fence-written ahead of the reply and a straggler pull is
+/// screened, so clearing the whole send history on Gone is sound —
+/// not merely optimistic.
 #[derive(Debug, Default)]
 struct MintEvidence {
     unconfirmed_send: bool,
@@ -293,12 +310,9 @@ pub(super) async fn pull_until_resolved<T: PullTransport>(
     // whole cohorts through a 5-minute failover and exited them en
     // masse on the first post-recovery answer).
     let mut idle = IdleClock::default();
-    // merged_bug_270: sticky wire-effect latch. Set by any timed-out
-    // pull and by a shutdown that abandoned an in-flight (sent) pull;
-    // cleared by every protocol ANSWER (Assignment/Gone/NotYetReady —
-    // pull idempotency makes a later answer authoritative about held
-    // attempts). Transport errors and empty oneofs are not answers and
-    // leave the latch alone.
+    // The sticky wire-effect latch; the set/clear alphabet is
+    // documented at [`MintEvidence`] (the one truth site — use sites
+    // doc-link, never restate; merged_bug_012).
     let mut evidence = MintEvidence::default();
     loop {
         if shutdown.is_cancelled() {
