@@ -918,17 +918,29 @@ impl DagActor {
     /// merged_bug_005 + bug_094: returns the apply outcome the drain
     /// relays to the gRPC layer — `Ok` only when EVERY plane landed,
     /// and `Err` only when NO plane landed (validate-then-commit).
-    /// Every refusal — undecodable plane entry, closed cost gate — is
-    /// computed by [`AckApplyPlan::validate`] before the first state
-    /// mutation; [`AckApplyPlan::commit`] is infallible, so
-    /// error-after-mutate is unrepresentable by signature. The
-    /// controller's commit-on-Ack buffer survives an erring Ack and
-    /// redelivers the WHOLE buffer — safe, because an erring Ack
-    /// applied nothing. Pre-fix the observed-types arm erred
-    /// `CostGateClosed` AFTER applying the cell planes, and
+    /// Every refusal — undecodable plane entry, skewed arm echo,
+    /// closed cost gate — is computed by [`AckApplyPlan::validate`]
+    /// before the first state mutation; [`AckApplyPlan::commit`] is
+    /// infallible, so error-after-mutate is unrepresentable by
+    /// signature. The controller's commit-on-Ack buffer survives an
+    /// erring Ack and redelivers the WHOLE buffer — safe, because an
+    /// erring Ack applied nothing. Pre-fix the observed-types arm
+    /// erred `CostGateClosed` AFTER applying the cell planes, and
     /// unparseable entries were silently dropped while the Ack
     /// answered Ok — destroying the controller's consume-once
     /// evidence ("the ONLY clear" is Ack-Ok).
+    ///
+    /// merged_bug_008 — redelivery after a successful-but-unobserved
+    /// Ack (routine: client timeout after server apply) is a no-op by
+    /// construction, NOT by per-plane idempotence prose: cell events
+    /// carry the producer's evidence epoch (`"h:cap@epoch"`, the
+    /// shared `cell_wire` grammar) and the ladder applies an event
+    /// iff `epoch > last_applied[cell]` (`IceBackoff::apply_*_event`)
+    /// — `==` (redelivery) and `<` (reorder) are total no-ops
+    /// answered Ok, so the controller's buffer clears. Epoch-less
+    /// entries take the pre-epoch semantics exactly (decode-totality
+    /// lane; binding snapshots rebuild and observed types upsert,
+    /// idempotent as before).
     pub(super) fn handle_ack_spawned_intents(
         &mut self,
         spawned: &[rio_proto::types::SpawnIntent],
@@ -974,10 +986,19 @@ pub(super) struct AckApplyPlan {
     /// Arm-on-ack decodes of the spawned echo (merged_bug_134: the
     /// typed pairing law, including the no-arm legacy lanes).
     armed: Vec<(DrvHash, ArmDecode)>,
-    /// ICE-clear cell events (`registered_cells`, wire field 3).
-    clears: Vec<crate::sla::config::Cell>,
-    /// ICE-mark cell events (`unfulfillable_cells`, wire field 2).
-    marks: Vec<crate::sla::config::Cell>,
+    /// ICE-clear cell events (`registered_cells`, wire field 3) with
+    /// the producer's evidence epoch (merged_bug_008; `None` =
+    /// legacy epoch-less entry).
+    clears: Vec<(
+        crate::sla::config::Cell,
+        Option<rio_common::cell_wire::EvidenceEpoch>,
+    )>,
+    /// ICE-mark cell events (`unfulfillable_cells`, wire field 2),
+    /// epoch'd like `clears`.
+    marks: Vec<(
+        crate::sla::config::Cell,
+        Option<rio_common::cell_wire::EvidenceEpoch>,
+    )>,
     /// Cost-table observations (decoded `observed_instance_types`).
     observed: Vec<(crate::sla::config::Cell, String, u32, u64)>,
 }
@@ -1189,11 +1210,17 @@ impl AckApplyPlan {
     fn decode_cell_plane(
         entries: &[String],
         plane: super::command::AckPlane,
-    ) -> Result<Vec<crate::sla::config::Cell>, super::command::AckApplyError> {
+    ) -> Result<
+        Vec<(
+            crate::sla::config::Cell,
+            Option<rio_common::cell_wire::EvidenceEpoch>,
+        )>,
+        super::command::AckApplyError,
+    > {
         entries
             .iter()
             .map(|s| match rio_common::cell_wire::decode_cell_event(s) {
-                Ok(p) => Ok((p.hw_class, p.capacity.into())),
+                Ok(p) => Ok(((p.hw_class, p.capacity.into()), p.epoch)),
                 Err(_) => Err(super::command::AckApplyError::PlaneEntryUndecodable {
                     plane,
                     entry: s.clone(),
@@ -1271,11 +1298,14 @@ impl AckApplyPlan {
         // buffered mark over a strictly newer registration). Kept as
         // written for pre-supersession controllers during rolling
         // skew: mark-wins is the conservative tie-break.
-        for cell in clears {
-            actor.ice.clear(&cell);
+        // merged_bug_008: each event applies through the per-cell
+        // evidence-epoch gate — redelivery (`==`) and reorder (`<`)
+        // are TOTAL no-ops, epoch-less entries take the legacy lane.
+        for (cell, epoch) in clears {
+            actor.ice.apply_clear_event(&cell, epoch);
         }
-        for cell in marks {
-            actor.ice.mark(&cell);
+        for (cell, epoch) in marks {
+            actor.ice.apply_mark_event(&cell, epoch);
         }
         // Third writer to `cost_table` (after `fold_spot_poll`→price
         // and `interrupt_housekeeping`→λ/node_count). The shared

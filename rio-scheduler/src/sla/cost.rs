@@ -26,6 +26,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime};
 
 use dashmap::DashMap;
+use rio_common::cell_wire::EvidenceEpoch;
 use serde::{Deserialize, Serialize};
 
 use crate::db::SchedulerDb;
@@ -932,6 +933,38 @@ fn next_mark_step(prev: Option<(u32, bool)>) -> u32 {
     }
 }
 
+/// Outcome of the per-cell evidence-epoch gate (merged_bug_008): the
+/// pure decision over `(last_applied[cell], incoming)` that fronts
+/// every WIRE-lane ladder mutation. Closed alphabet — the apply entry
+/// points match it exhaustively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EpochGate {
+    /// Incoming event is epoch-less: today's exact pre-epoch
+    /// semantics; `last_applied` untouched (the lane stays as decode
+    /// totality over the string grammar).
+    Legacy,
+    /// Strictly newer (or first) epoch'd evidence: apply via the
+    /// UNCHANGED ladder table, then advance `last_applied` to the
+    /// carried epoch.
+    Apply(EvidenceEpoch),
+    /// Redelivery (`==`) or reorder (`<`): TOTAL no-op — no re-stamp,
+    /// no climb, no remove — answered Ok. Already-applied evidence is
+    /// delivered evidence, so the controller's buffer MUST clear.
+    NoOp,
+}
+
+/// The total gate law over `(Option<applied>, Option<incoming>)` —
+/// all four arms explicit (the `next_mark_step` table pattern;
+/// exhaustively unit-tabled in `epoch_gate_table`).
+fn epoch_gate(applied: Option<EvidenceEpoch>, incoming: Option<EvidenceEpoch>) -> EpochGate {
+    match (applied, incoming) {
+        (_, None) => EpochGate::Legacy,
+        (None, Some(e)) => EpochGate::Apply(e),
+        (Some(a), Some(e)) if e > a => EpochGate::Apply(e),
+        (Some(_), Some(_)) => EpochGate::NoOp,
+    }
+}
+
 /// In-process insufficient-capacity mask. A [`Cell`] reported
 /// `unfulfillable` by the controller (NodeClaim `Launched=False` or
 /// `Registered` timeout — ADR-023 §Capacity backoff) is masked
@@ -945,10 +978,23 @@ fn next_mark_step(prev: Option<(u32, bool)>) -> u32 {
 /// `inputs_gen`.
 ///
 /// In-memory, lease-holder only — a scheduler lease handoff costs at
-/// most one wasted NodeClaim round per masked cell.
+/// most one wasted NodeClaim round per masked cell; the handoff also
+/// wipes `last_applied`, so the worst case adds one spurious re-apply
+/// of in-flight redelivered evidence (the same pre-existing posture —
+/// see the WO-S5-3 residual disclosure in the introducing commit).
 #[derive(Debug)]
 pub struct IceBackoff {
     cells: DashMap<Cell, IceState>,
+    /// merged_bug_008: highest controller-minted evidence epoch
+    /// APPLIED per cell. The wire lane (`apply_mark_event` /
+    /// `apply_clear_event`) consults it through [`epoch_gate`];
+    /// the §13a local lane ([`Self::clear`]) deliberately does not —
+    /// and `clear()` RETAINS the entry, so a redelivered retained
+    /// mark after a local clear no-ops instead of re-masking the
+    /// just-proven-healthy cell (axis 3). Bounded by |H|×2 (one entry
+    /// per cell); in-memory, lease-holder-only — same posture as the
+    /// ladder above.
+    last_applied: DashMap<Cell, EvidenceEpoch>,
     max_lead_time: Duration,
 }
 
@@ -962,11 +1008,52 @@ impl IceBackoff {
     pub fn new(max_lead_time_secs: f64) -> Self {
         Self {
             cells: DashMap::new(),
+            last_applied: DashMap::new(),
             // merged_bug_262: `[sla] max_lead_time = inf` is valid
             // TOML; the raw constructor panicked DagActor::new at
             // boot. Clamp (validation also rejects non-finite values
             // at config load).
             max_lead_time: rio_common::clamped::clamped_duration_secs(max_lead_time_secs.max(1.0)),
+        }
+    }
+
+    /// WIRE-lane mark entry point (`AckSpawnedIntents`
+    /// `unfulfillable_cells`): the evidence-epoch gate in FRONT of
+    /// the unchanged ladder (merged_bug_008). `Some(e)` with
+    /// `e <= last_applied[cell]` is a TOTAL no-op (no re-stamp, no
+    /// climb) answered Ok — redelivery and reorder are no-ops by
+    /// construction; `e > last_applied` applies via [`Self::mark`]
+    /// (the ladder table is byte-identical — a genuinely-new
+    /// within-window mark still refreshes-not-steps per the straggler
+    /// analysis on `mark`) then advances `last_applied`. `None`
+    /// (legacy epoch-less entry) = today's semantics exactly,
+    /// `last_applied` untouched.
+    pub fn apply_mark_event(&self, cell: &Cell, epoch: Option<EvidenceEpoch>) {
+        // `.map(|e| *e)` copies and drops the `Ref` guard BEFORE the
+        // insert below (DashMap shard RwLock is non-reentrant — the
+        // `is_masked` hazard).
+        match epoch_gate(self.last_applied.get(cell).map(|e| *e), epoch) {
+            EpochGate::Legacy => self.mark(cell),
+            EpochGate::Apply(e) => {
+                self.mark(cell);
+                self.last_applied.insert(cell.clone(), e);
+            }
+            EpochGate::NoOp => {}
+        }
+    }
+
+    /// WIRE-lane clear entry point (`AckSpawnedIntents`
+    /// `registered_cells`). Same gate law as [`Self::apply_mark_event`];
+    /// the no-op arm keeps a stale/redelivered clear from re-running
+    /// the ladder reset out of order.
+    pub fn apply_clear_event(&self, cell: &Cell, epoch: Option<EvidenceEpoch>) {
+        match epoch_gate(self.last_applied.get(cell).map(|e| *e), epoch) {
+            EpochGate::Legacy => self.clear(cell),
+            EpochGate::Apply(e) => {
+                self.clear(cell);
+                self.last_applied.insert(cell.clone(), e);
+            }
+            EpochGate::NoOp => {}
         }
     }
 
@@ -1007,13 +1094,21 @@ impl IceBackoff {
         );
     }
 
-    /// Reset `cell`'s backoff (first success after a mark). Called via
-    /// `AckSpawnedIntents.registered_cells` (controller's NodeClaim
-    /// `Registered=True` edge — §13b) or on the first successful pull
-    /// for a pod spawned on `cell` (§13a interim path; a delivered
-    /// pull ⇒ pod scheduled ⇒ node existed). NEVER from `spawned`
-    /// (Pending ack) — that's the wrong edge and defeats backoff
-    /// doubling.
+    /// Reset `cell`'s backoff (first success after a mark). The §13a
+    /// LOCAL lane: called on the first successful pull for a pod
+    /// spawned on `cell` (a delivered pull ⇒ pod scheduled ⇒ node
+    /// existed), and by [`Self::apply_clear_event`]'s gate-passing
+    /// arms for the wire lane (`AckSpawnedIntents.registered_cells`,
+    /// the controller's NodeClaim `Registered=True` edge — §13b).
+    /// NEVER from `spawned` (Pending ack) — that's the wrong edge and
+    /// defeats backoff doubling.
+    ///
+    /// merged_bug_008 axis 3: removes the LADDER entry but RETAINS
+    /// `last_applied` — a redelivered retained mark whose epoch was
+    /// already applied then no-ops instead of minting a fresh 60s
+    /// mask over the just-proven-healthy cell (which dispatch would
+    /// exclude, so no superseding Registered=True clear could ever
+    /// arrive — the self-sustaining loop).
     pub fn clear(&self, cell: &Cell) {
         self.cells.remove(cell);
     }
@@ -2547,6 +2642,145 @@ mod tests {
             ice.mark(&cell);
         }
         assert_eq!(ice.cells.get(&cell).unwrap().step, 0);
+    }
+
+    /// The total epoch-gate law over `(Option<applied>,
+    /// Option<incoming>)` — all four arms explicit (merged_bug_008;
+    /// the `next_mark_step_table` pattern).
+    #[test]
+    fn epoch_gate_table() {
+        let e = EvidenceEpoch;
+        // Legacy lane: epoch-less incoming, whatever was applied.
+        assert_eq!(epoch_gate(None, None), EpochGate::Legacy);
+        assert_eq!(epoch_gate(Some(e(7)), None), EpochGate::Legacy);
+        // First epoch'd evidence for the cell applies.
+        assert_eq!(epoch_gate(None, Some(e(1))), EpochGate::Apply(e(1)));
+        // Strictly newer applies.
+        assert_eq!(epoch_gate(Some(e(1)), Some(e(2))), EpochGate::Apply(e(2)));
+        // Redelivery (==) and reorder (<) are total no-ops.
+        assert_eq!(epoch_gate(Some(e(2)), Some(e(2))), EpochGate::NoOp);
+        assert_eq!(epoch_gate(Some(e(2)), Some(e(1))), EpochGate::NoOp);
+    }
+
+    /// merged_bug_008 axis 1 red: identical-epoch redelivery must be
+    /// a TOTAL no-op — `left: until strictly grew (the pre-epoch
+    /// refresh re-stamp extended the mask on every ~10s redelivery,
+    /// pinning it for a whole gate-closed window)` / `right: until
+    /// BIT-IDENTICAL, step unchanged, Ok`.
+    // r[verify ctrl.nodeclaim.evidence-ack-latch+2]
+    #[test]
+    fn ice_same_epoch_redelivery_is_total_noop() {
+        let ice = IceBackoff::new(600.0);
+        let cell: Cell = ("h".into(), CapacityType::Spot);
+        ice.apply_mark_event(&cell, Some(EvidenceEpoch(5)));
+        let first = *ice.cells.get(&cell).unwrap();
+        assert_eq!(first.step, 0);
+        // Sleep-free determinism: any re-stamp would move `until`
+        // strictly later because mark() samples a fresh
+        // `Instant::now()`; bit-identity proves the no-op.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        ice.apply_mark_event(&cell, Some(EvidenceEpoch(5)));
+        let after = *ice.cells.get(&cell).unwrap();
+        assert_eq!(after.step, first.step, "step unchanged");
+        assert_eq!(
+            after.until, first.until,
+            "until BIT-IDENTICAL — no refresh re-stamp on redelivery"
+        );
+    }
+
+    /// merged_bug_008 axis 2 red: a redelivery landing AFTER mask
+    /// expiry is still the SAME observation — `left: step 0→1 (the
+    /// ladder climbed on a non-failure)` / `right: step 0`.
+    // r[verify ctrl.nodeclaim.evidence-ack-latch+2]
+    #[test]
+    fn ice_post_expiry_same_epoch_does_not_climb() {
+        let ice = IceBackoff::new(600.0);
+        let cell: Cell = ("h".into(), CapacityType::Spot);
+        ice.apply_mark_event(&cell, Some(EvidenceEpoch(5)));
+        ice.force_expire(&cell);
+        ice.apply_mark_event(&cell, Some(EvidenceEpoch(5)));
+        assert_eq!(
+            ice.cells.get(&cell).unwrap().step,
+            0,
+            "same-epoch redelivery must not climb the ladder, even post-expiry"
+        );
+    }
+
+    /// merged_bug_008 axis 3 red: the §13a local clear removes the
+    /// ladder entry but RETAINS `last_applied`, so a redelivered
+    /// retained mark no-ops — `left: fresh 60s mask over the
+    /// just-proven-healthy cell (and dispatch exclusion means no
+    /// superseding clear can arrive — self-sustaining while acks time
+    /// out)` / `right: unmasked`.
+    // r[verify ctrl.nodeclaim.evidence-ack-latch+2]
+    #[test]
+    fn ice_local_clear_then_redelivered_mark_stays_clear() {
+        let ice = IceBackoff::new(600.0);
+        let cell: Cell = ("h".into(), CapacityType::Spot);
+        ice.apply_mark_event(&cell, Some(EvidenceEpoch(5)));
+        assert!(ice.is_masked(&cell));
+        // The §13a first-pull clear (actor/pull.rs lane — local,
+        // ungated by design).
+        ice.clear(&cell);
+        assert!(!ice.is_masked(&cell));
+        // The controller redelivers its buffer (ack timed out after
+        // server apply): the retained mark's epoch was already
+        // applied.
+        ice.apply_mark_event(&cell, Some(EvidenceEpoch(5)));
+        assert!(
+            !ice.is_masked(&cell),
+            "redelivered already-applied mark must not re-mask the healthy cell"
+        );
+        assert_eq!(ice.step(&cell), None, "no ladder entry re-minted");
+    }
+
+    /// merged_bug_008 axis 4 red (reorder): a LATE older-epoch mark
+    /// after a newer one is a no-op — `left: re-stamp (the stale
+    /// event refreshed the window)` / `right: no-op, until
+    /// bit-identical`.
+    // r[verify ctrl.nodeclaim.evidence-ack-latch+2]
+    #[test]
+    fn ice_stale_reorder_noops() {
+        let ice = IceBackoff::new(600.0);
+        let cell: Cell = ("h".into(), CapacityType::Spot);
+        ice.apply_mark_event(&cell, Some(EvidenceEpoch(9)));
+        let first = *ice.cells.get(&cell).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        ice.apply_mark_event(&cell, Some(EvidenceEpoch(3)));
+        let after = *ice.cells.get(&cell).unwrap();
+        assert_eq!(after.until, first.until, "stale reorder must not re-stamp");
+        assert_eq!(after.step, first.step);
+    }
+
+    /// Legacy-lane pin (merged_bug_005 semantics preserved): an
+    /// epoch'd history does not break the epoch-LESS lane — a legacy
+    /// mark still refreshes-not-steps and leaves `last_applied`
+    /// untouched, so a later epoch'd event still gates correctly.
+    // r[verify ctrl.nodeclaim.evidence-ack-latch+2]
+    #[test]
+    fn ice_legacy_event_keeps_pre_epoch_semantics_and_gate_state() {
+        let ice = IceBackoff::new(600.0);
+        let cell: Cell = ("h".into(), CapacityType::Spot);
+        ice.apply_mark_event(&cell, Some(EvidenceEpoch(5)));
+        // Legacy epoch-less mark: refresh-not-step (in-window), gate
+        // state untouched.
+        ice.apply_mark_event(&cell, None);
+        assert_eq!(ice.cells.get(&cell).unwrap().step, 0);
+        assert_eq!(
+            ice.last_applied.get(&cell).map(|e| *e),
+            Some(EvidenceEpoch(5)),
+            "legacy lane must not advance last_applied"
+        );
+        // The gate still answers for epoch'd traffic.
+        ice.force_expire(&cell);
+        ice.apply_mark_event(&cell, Some(EvidenceEpoch(5)));
+        assert_eq!(ice.cells.get(&cell).unwrap().step, 0, "still gated");
+        ice.apply_mark_event(&cell, Some(EvidenceEpoch(6)));
+        assert_eq!(
+            ice.cells.get(&cell).unwrap().step,
+            1,
+            "strictly newer epoch applies and climbs post-expiry"
+        );
     }
 
     /// Both spot+od configured for every class — pre-§13c default.

@@ -920,6 +920,57 @@ async fn ack_legacy_unarmed_echo_answers_ok_without_arm() {
     );
 }
 
+/// merged_bug_008 plan-level red: epoch'd evidence through the FULL
+/// apply path (wire string → plan decode → epoch gate → ladder). A
+/// post-expiry redelivery of the SAME buffered event must not climb —
+/// `left: step 0→1 (every redelivery after expiry was a phantom
+/// consecutive failure)` / `right: step 0; only a strictly newer
+/// epoch climbs`.
+///
+/// Witness provenance (Q1-1): suffixed strings are minted exclusively
+/// via `rio_common::cell_wire::encode_cell_event` — the same fn the
+/// controller's buffer mint calls; no hand-rolled "h:cap@e" literals.
+// r[verify sched.sla.ack-validate-then-commit]
+// r[verify ctrl.nodeclaim.evidence-ack-latch+2]
+#[tokio::test]
+async fn ack_redelivered_epoch_mark_does_not_climb_post_expiry() {
+    use crate::sla::config::CapacityType;
+    use rio_common::cell_wire::{EvidenceEpoch, WireCapacity, encode_cell_event};
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    let cell: crate::sla::config::Cell = ("intel-6".into(), CapacityType::Spot);
+
+    let mark_e7 = encode_cell_event("intel-6", WireCapacity::Spot, Some(EvidenceEpoch(7)));
+    actor
+        .handle_ack_spawned_intents(&[], std::slice::from_ref(&mark_e7), &[], &[], &[], None)
+        .expect("first delivery applies");
+    assert_eq!(actor.ice.step(&cell), Some(0), "first failure at rung 0");
+
+    // Mask expires; the controller's ~10s ack-retry loop redelivers
+    // the SAME buffered event (client timeout after server apply).
+    actor.ice.force_expire(&cell);
+    actor
+        .handle_ack_spawned_intents(&[], std::slice::from_ref(&mark_e7), &[], &[], &[], None)
+        .expect("redelivery answers Ok — delivered evidence must clear the buffer");
+    assert_eq!(
+        actor.ice.step(&cell),
+        Some(0),
+        "post-expiry same-epoch redelivery is the SAME observation — no climb"
+    );
+
+    // A genuinely new failure (strictly newer epoch) climbs.
+    let mark_e8 = encode_cell_event("intel-6", WireCapacity::Spot, Some(EvidenceEpoch(8)));
+    actor
+        .handle_ack_spawned_intents(&[], std::slice::from_ref(&mark_e8), &[], &[], &[], None)
+        .expect("newer epoch applies");
+    assert_eq!(
+        actor.ice.step(&cell),
+        Some(1),
+        "strictly newer post-expiry failure climbs the ladder"
+    );
+}
+
 /// **Ack records the FULL A'** (`r[sched.sla.hw-class.ice-mask]`): a
 /// `SpawnIntent` whose `node_affinity` is an OR over `|A'|>1` cells must
 /// arm `dispatched_cells` with the FULL parallel `(hw_class_names,

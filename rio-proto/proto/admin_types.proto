@@ -648,17 +648,29 @@ message AckSpawnedIntentsRequest {
   // ignored — they don't enter the ICE ladder.
   repeated SpawnIntent spawned = 1;
   // §13b: cells where NodeClaim Launched=False or Registered timed
-  // out this tick. "h:cap" string. Scheduler marks each ICE-infeasible
-  // on a 60s→120s→… backoff ladder so subsequent `solve_intent_for`
-  // routes around the cell. Empty until controller A18 wires the
-  // NodeClaim watcher.
+  // out this tick. "h:cap[@epoch]" string (`rio_common::cell_wire`
+  // grammar — the single-sourced codec both sides consume).
+  // merged_bug_008: the optional `@<epoch>` suffix carries the
+  // controller's per-cell-monotonic evidence epoch (u64 millis,
+  // minted once per buffered evidence event, stable across
+  // redeliveries of that event); the scheduler applies a cell event
+  // iff `epoch > last_applied[cell]`, so redelivery and reorder are
+  // no-ops by construction. Epoch-less entries keep the pre-epoch
+  // semantics (decode-totality lane; emit + decode shipped together
+  // per the signed --wipe rollout, Q6). Scheduler marks each
+  // ICE-infeasible on a 60s→120s→… backoff ladder so subsequent
+  // `solve_intent_for` routes around the cell. Empty until controller
+  // A18 wires the NodeClaim watcher.
   repeated string unfulfillable_cells = 2;
   // §13b: cells where a NodeClaim reached `Registered=True` this
-  // tick — the SUCCESS edge that resets ICE backoff. "h:cap" string.
-  // Scheduler `ice.clear()`s each. Distinct from `spawned` (field 1),
-  // which is "Job-created OR still-Pending" — never a capacity-success
-  // signal (bug_008). Empty until controller A18 wires the NodeClaim
-  // watcher; interim clear path is first-heartbeat.
+  // tick — the SUCCESS edge that resets ICE backoff. "h:cap[@epoch]"
+  // string (same `cell_wire` grammar + epoch law as
+  // `unfulfillable_cells`, field 2). Scheduler applies each through
+  // the epoch gate onto `ice.clear()`. Distinct from `spawned`
+  // (field 1), which is "Job-created OR still-Pending" — never a
+  // capacity-success signal (bug_008). Empty until controller A18
+  // wires the NodeClaim watcher; interim clear path is
+  // first-heartbeat.
   repeated string registered_cells = 3;
   // §13a R24B7 (`r[sched.sla.cost-instance-type-feedback]`):
   // instance types Karpenter resolved for cells that registered this

@@ -21,7 +21,10 @@ use super::handle::DebugDerivationInfo;
 /// erring Ack means NO plane landed). Mapped to a gRPC error by the
 /// admin layer; the controller's commit-on-Ack buffer survives an
 /// erring Ack and redelivers the whole buffer — safe, because an
-/// erring Ack applied nothing.
+/// erring Ack applied nothing, and redelivery after an Ok the
+/// controller never observed is a no-op by construction
+/// (merged_bug_008: cell events carry producer evidence epochs and
+/// the ladder no-ops `epoch <= last_applied[cell]`).
 // r[impl sched.sla.ack-validate-then-commit]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AckApplyError {
