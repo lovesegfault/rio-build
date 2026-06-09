@@ -18,21 +18,21 @@
     {
       "path": "lib.rs",
       "depth": 0,
-      "doc": "Tenant JWT + assignment HMAC token sign/verify, and the gRPC"
+      "doc": "Tenant JWT + assignment HMAC token sign/verify, and the gRPC interceptor that wires them."
     }
   ],
   "rio-authz-kernel": [
     {
       "path": "lib.rs",
       "depth": 0,
-      "doc": "Pure authorization decision kernel for the store's per-method"
+      "doc": "Pure authorization decision kernel for the store's per-method credential-class layer."
     }
   ],
   "rio-builder": [
     {
       "path": "banner.rs",
       "depth": 0,
-      "doc": "Worker log banner: a `rio:`-prefixed header at the start of every"
+      "doc": "Worker log banner: a `rio:`-prefixed header at the start of every build log, and a footer after the build process exits."
     },
     {
       "path": "cgroup.rs",
@@ -42,7 +42,7 @@
     {
       "path": "config.rs",
       "depth": 0,
-      "doc": "Builder configuration: Config + CliArgs (two-struct split per"
+      "doc": "Builder configuration: Config + CliArgs (two-struct split per rio-common/src/config.rs) and system auto-detection."
     },
     {
       "path": "executor/",
@@ -107,7 +107,7 @@
     {
       "path": "fuse/circuit.rs",
       "depth": 1,
-      "doc": "FUSE fetch circuit breaker. **std::sync ONLY** — FUSE callbacks run on"
+      "doc": "FUSE fetch circuit breaker. **std::sync ONLY** — FUSE callbacks run on fuser's thread pool, NOT in a tokio context (see fetch.rs SYNC comment on `fetch_extract_insert`)."
     },
     {
       "path": "fuse/fetch/",
@@ -147,7 +147,7 @@
     {
       "path": "hw_class.rs",
       "depth": 0,
-      "doc": "Lazy `hw_class` resolver — reads the controller-stamped"
+      "doc": "Lazy `hw_class` resolver — reads the controller-stamped `rio.build/hw-class` annotation via downward-API VOLUME."
     },
     {
       "path": "lib.rs",
@@ -162,7 +162,7 @@
     {
       "path": "log_upload.rs",
       "depth": 0,
-      "doc": "Per-build `AppendLog` client: streams log batches to rio-store with an"
+      "doc": "Per-build `AppendLog` client: streams log batches to rio-store with an in-memory ack-trimmed retransmit buffer."
     },
     {
       "path": "main.rs",
@@ -187,7 +187,7 @@
     {
       "path": "runtime/idle.rs",
       "depth": 1,
-      "doc": "The idle clock: how long has the scheduler been *telling* this pod"
+      "doc": "The idle clock: how long has the scheduler been *telling* this pod \"wanted but not deliverable\"?"
     },
     {
       "path": "runtime/pull.rs",
@@ -202,7 +202,7 @@
     {
       "path": "runtime/setup.rs",
       "depth": 1,
-      "doc": "Cold-start wiring: identity, host-arch validation, cgroup init,"
+      "doc": "Cold-start wiring: identity, host-arch validation, cgroup init, upstream connect, FUSE mount, build context."
     },
     {
       "path": "runtime/slot.rs",
@@ -227,7 +227,7 @@
     {
       "path": "upload/common.rs",
       "depth": 1,
-      "doc": "Mechanics shared by [`single`](super::single) and [`batch`](super::batch):"
+      "doc": "Mechanics shared by [`single`](super::single) and [`batch`](super::batch): the streaming-tee sink, ref-scan pre-pass, trailer-mode `PathInfo` construction, assignment-token header, and retry/backpressure constants."
     },
     {
       "path": "upload/single.rs",
@@ -284,7 +284,7 @@
     {
       "path": "stream_util.rs",
       "depth": 0,
-      "doc": "Shared server-stream draining law for CLI commands (bug_141,"
+      "doc": "Shared server-stream draining law for CLI commands (bug_141, merged_bug_106: ONE chokepoint, composable policies)."
     },
     {
       "path": "tenants.rs",
@@ -321,12 +321,12 @@
     {
       "path": "clamped.rs",
       "depth": 0,
-      "doc": "One clamped constructor for externally-sourced seconds → `Duration`"
+      "doc": "One clamped constructor for externally-sourced seconds → `Duration` (bughunt-4 merged_bug_262)."
     },
     {
       "path": "classify.rs",
       "depth": 0,
-      "doc": "Shared classification predicates (R7, bughunt-4): every"
+      "doc": "Shared classification predicates (R7, bughunt-4): every classification law has exactly ONE executable source consumed by all surfaces, so sibling call sites cannot fork an alphabet (bug_178's class: two lanes open-coding `Unavailable | DeadlineExceeded` while the canonical transient alphabet documents `Unknown` as mid-RPC peer death)."
     },
     {
       "path": "config.rs",
@@ -341,7 +341,7 @@
     {
       "path": "dns.rs",
       "depth": 0,
-      "doc": "DNS-1123 label identity: ONE alphabet, ONE sanitizer, ONE composer"
+      "doc": "DNS-1123 label identity: ONE alphabet, ONE sanitizer, ONE composer (merged_bug_243; the merged_bug_158 identity discipline, made a type)."
     },
     {
       "path": "grpc.rs",
@@ -366,7 +366,7 @@
     {
       "path": "liveness.rs",
       "depth": 0,
-      "doc": "The bilateral log-ingest liveness contract (merged_bug_335 / §5-S"
+      "doc": "The bilateral log-ingest liveness contract (merged_bug_335 / §5-S Q1, bughunt-4)."
     },
     {
       "path": "newtype.rs",
@@ -376,7 +376,7 @@
     {
       "path": "observability.rs",
       "depth": 0,
-      "doc": "Observability setup: structured logging, Prometheus metrics, and optional"
+      "doc": "Observability setup: structured logging, Prometheus metrics, and optional OpenTelemetry OTLP trace export."
     },
     {
       "path": "s3.rs",
@@ -411,19 +411,19 @@
     {
       "path": "transport.rs",
       "depth": 0,
-      "doc": "Bounded, cancellable unary-RPC awaits — the transport discipline"
+      "doc": "Bounded, cancellable unary-RPC awaits — the transport discipline every pull/report/claim loop builds on."
     },
     {
       "path": "wanted_outputs.rs",
       "depth": 0,
-      "doc": "The wanted-output predicate family backing the demand-driven"
+      "doc": "The wanted-output predicate family backing the demand-driven cache-hit criterion."
     }
   ],
   "rio-controller": [
     {
       "path": "config.rs",
       "depth": 0,
-      "doc": "`rio-controller` binary configuration: layered-config-loaded `Config`"
+      "doc": "`rio-controller` binary configuration: layered-config-loaded `Config` struct, clap `CliArgs` overlay, and the `ValidateConfig` bounds checks."
     },
     {
       "path": "error.rs",
@@ -448,7 +448,7 @@
     {
       "path": "observability.rs",
       "depth": 0,
-      "doc": "Metric series ownership: boot-seeded alert series (merged_bug_236 —"
+      "doc": "Metric series ownership: boot-seeded alert series (merged_bug_236 — the rio-scheduler C3 pattern extended to the controller)."
     },
     {
       "path": "reconcilers/",
@@ -458,22 +458,22 @@
     {
       "path": "reconcilers/componentscaler/",
       "depth": 1,
-      "doc": "ComponentScaler reconciler: predictive store autoscaling with a"
+      "doc": "ComponentScaler reconciler: predictive store autoscaling with a learned `builders_per_replica` ratio."
     },
     {
       "path": "reconcilers/componentscaler/decide.rs",
       "depth": 2,
-      "doc": "ComponentScaler decision logic — pure functions over the"
+      "doc": "ComponentScaler decision logic — pure functions over the [`ComponentScalerSpec`]/[`ComponentScalerStatus`] state machine."
     },
     {
       "path": "reconcilers/gc_schedule.rs",
       "depth": 1,
-      "doc": "GC cron reconciler. Calls StoreAdminService.TriggerGC on an"
+      "doc": "GC cron reconciler."
     },
     {
       "path": "reconcilers/node_informer.rs",
       "depth": 1,
-      "doc": "Node-label → `hw_class` resolution and spot-exposure (λ\\[h\\])"
+      "doc": "Node-label → `hw_class` resolution and spot-exposure (λ\\[h\\]) accounting."
     },
     {
       "path": "reconcilers/nodeclaim_pool/",
@@ -493,7 +493,7 @@
     {
       "path": "reconcilers/nodeclaim_pool/evidence.rs",
       "depth": 2,
-      "doc": "Commit-on-Ack evidence buffer for scheduler-bound kube"
+      "doc": "Commit-on-Ack evidence buffer for scheduler-bound kube observations (merged_bug_007/bug_082), holding per-cell ORDERED evidence with producer-minted epochs (merged_bug_003/008 — this supersedes the merged_bug_005 two-set latest-wins model)."
     },
     {
       "path": "reconcilers/nodeclaim_pool/ffd.rs",
@@ -508,17 +508,17 @@
     {
       "path": "reconcilers/nodeclaim_pool/lifecycle_tests.rs",
       "depth": 2,
-      "doc": "Lifecycle-invariants suite: drives the REAL `tick()` /"
+      "doc": "Lifecycle-invariants suite: drives the REAL `tick()` / `reconcile_once` / `consolidate_only` bodies through lease-acquire, lease-loss, standby, ⊥-streak, and consolidate-only edges with an injected clock, asserting the per-field stale-state polarity table (`#r(\"ctrl.nodeclaim.lease-edge-polarity\")`, docs/spec/components/controller.typ)."
     },
     {
       "path": "reconcilers/nodeclaim_pool/pods.rs",
       "depth": 2,
-      "doc": "Per-tick Pod snapshot: `requested` sums + bound-intent index from"
+      "doc": "Per-tick Pod snapshot: `requested` sums + bound-intent index from one label-selected Pod LIST."
     },
     {
       "path": "reconcilers/nodeclaim_pool/sketch.rs",
       "depth": 2,
-      "doc": "Per-cell quantile-sketch state + PG persist (migration 059"
+      "doc": "Per-cell quantile-sketch state + PG persist (migration 059 `nodeclaim_cell_state`)."
     },
     {
       "path": "reconcilers/nodeclaim_pool/wedge.rs",
@@ -533,7 +533,7 @@
     {
       "path": "reconcilers/pool/candidate.rs",
       "depth": 2,
-      "doc": "The intent-decided candidate axis set — ONE projection consumed by"
+      "doc": "The intent-decided candidate axis set — ONE projection consumed by render, gate, and pack."
     },
     {
       "path": "reconcilers/pool/disruption.rs",
@@ -543,7 +543,7 @@
     {
       "path": "reconcilers/pool/job.rs",
       "depth": 2,
-      "doc": "Job-mode plumbing for the Pool reconciler: list Jobs by label,"
+      "doc": "Job-mode plumbing for the Pool reconciler: list Jobs by label, filter active, diff against demand, spawn deficit, reap excess, patch status."
     },
     {
       "path": "reconcilers/pool/jobs.rs",
@@ -570,7 +570,7 @@
     {
       "path": "componentscaler.rs",
       "depth": 0,
-      "doc": "ComponentScaler CRD: predictive replica autoscaling for rio's"
+      "doc": "ComponentScaler CRD: predictive replica autoscaling for rio's stateless control-plane Deployments (currently rio-store)."
     },
     {
       "path": "karpenter.rs",
@@ -592,7 +592,7 @@
     {
       "path": "content.rs",
       "depth": 0,
-      "doc": "Content-binding agreement law for already-complete substitution"
+      "doc": "Content-binding agreement law for already-complete substitution claims (merged_bug_114, round-3 HIGH)."
     },
     {
       "path": "establish.rs",
@@ -607,7 +607,7 @@
     {
       "path": "outcome.rs",
       "depth": 0,
-      "doc": "Substitute-failure classification — the dependency-free truth table"
+      "doc": "Substitute-failure classification — the dependency-free truth table behind the store executor's walk error arm (bughunt wave A4, merged_bug_178)."
     },
     {
       "path": "pull.rs",
@@ -617,7 +617,7 @@
     {
       "path": "routing.rs",
       "depth": 0,
-      "doc": "The four-arm Unobtainable consumption routing — PURE (no IO, no"
+      "doc": "The four-arm Unobtainable consumption routing — PURE (no IO, no clocks), lifted from `rio-scheduler/src/actor/materialize.rs` (bughunt wave, A4: rio-scheduler is a bin crate and the kani gate is lib-only; the decision surface lives here so the proofs sweep it)."
     },
     {
       "path": "settle.rs",
@@ -659,7 +659,7 @@
     {
       "path": "handler/log_tail.rs",
       "depth": 1,
-      "doc": "Per-derivation live-tail subscriptions to rio-store's"
+      "doc": "Per-derivation live-tail subscriptions to rio-store's `LogService.TailLog`."
     },
     {
       "path": "handler/opcodes_read.rs",
@@ -694,7 +694,7 @@
     {
       "path": "server/",
       "depth": 0,
-      "doc": "SSH server using `russh` that terminates connections and speaks the"
+      "doc": "SSH server using `russh` that terminates connections and speaks the Nix worker protocol on each session channel, delegating operations to gRPC store and scheduler services."
     },
     {
       "path": "server/connection.rs",
@@ -726,7 +726,7 @@
     {
       "path": "clock.rs",
       "depth": 0,
-      "doc": "The self-fence blind-time clock: suspend-aware time for the one"
+      "doc": "The self-fence blind-time clock: suspend-aware time for the one measurement in this crate that must keep counting while the host sleeps."
     },
     {
       "path": "election.rs",
@@ -741,7 +741,7 @@
     {
       "path": "mbt_tests.rs",
       "depth": 0,
-      "doc": "Model-based testing: replay traces generated from the leader-election"
+      "doc": "Model-based testing: replay traces generated from the leader-election Quint model (`docs/spec/models/leaderElection.qnt`) against the real election machinery, diffing the implementation's projected state against the model's after every step."
     }
   ],
   "rio-log-kernel": [
@@ -770,7 +770,7 @@
     {
       "path": "retention.rs",
       "depth": 0,
-      "doc": "The table-retention registry (bughunt wave D1, merged_bug_163;"
+      "doc": "The table-retention registry (bughunt wave D1, merged_bug_163; typed + symbol-validated in bughunt-2, merged_bug_001/142)."
     },
     {
       "path": "schema.rs",
@@ -904,7 +904,7 @@
     {
       "path": "client/",
       "depth": 0,
-      "doc": "gRPC client transport: channel construction, h2 tuning, and the"
+      "doc": "gRPC client transport: channel construction, h2 tuning, and the generic [`ProtoClient`] connect helpers."
     },
     {
       "path": "client/balance.rs",
@@ -934,7 +934,7 @@
     {
       "path": "status.rs",
       "depth": 0,
-      "doc": "Bidirectional mapping between the nix-daemon wire `BuildStatus`"
+      "doc": "Bidirectional mapping between the nix-daemon wire `BuildStatus` ([`rio_nix::protocol::build::BuildStatus`]) and the proto [`BuildResultStatus`]."
     },
     {
       "path": "validated.rs",
@@ -978,7 +978,7 @@
     {
       "path": "actor/config.rs",
       "depth": 1,
-      "doc": "[`DagActorConfig`] / [`DagActorPlumbing`]: grouped construction"
+      "doc": "[`DagActorConfig`] / [`DagActorPlumbing`]: grouped construction inputs for [`super::DagActor`]."
     },
     {
       "path": "actor/debug.rs",
@@ -988,7 +988,7 @@
     {
       "path": "actor/dispatch.rs",
       "depth": 1,
-      "doc": "Ready-set store short-circuit, plus the shared `WorkAssignment`"
+      "doc": "Ready-set store short-circuit, plus the shared `WorkAssignment` payload constructor the pull path uses."
     },
     {
       "path": "actor/event.rs",
@@ -1003,7 +1003,7 @@
     {
       "path": "actor/floor.rs",
       "depth": 1,
-      "doc": "D4 reactive resource floor: per-dimension doubling on explicit"
+      "doc": "D4 reactive resource floor: per-dimension doubling on explicit resource-exhaustion signals, capped at `Ceilings`, falling through to the relevant retry counter once capped."
     },
     {
       "path": "actor/handle.rs",
@@ -1013,7 +1013,7 @@
     {
       "path": "actor/housekeeping.rs",
       "depth": 1,
-      "doc": "Periodic Tick housekeeping: orphan-watcher sweep, poison-TTL"
+      "doc": "Periodic Tick housekeeping: orphan-watcher sweep, poison-TTL expiry, per-build timeouts, derivation-row GC, gauge publish, SLA estimator refresh, and the open pull-attempt establishment sweep — the single scheduler-side time-based repair the pull path keeps."
     },
     {
       "path": "actor/materialize.rs",
@@ -1028,7 +1028,7 @@
     {
       "path": "actor/pull.rs",
       "depth": 1,
-      "doc": "Pull-mode dispatch: the `PullAssignment` admission kernel and the"
+      "doc": "Pull-mode dispatch: the `PullAssignment` admission kernel and the actor-side pull transaction."
     },
     {
       "path": "actor/recovery.rs",
@@ -1043,7 +1043,7 @@
     {
       "path": "actor/snapshot.rs",
       "depth": 1,
-      "doc": "Read-only snapshot/inspect handlers on [`DagActor`]. All methods"
+      "doc": "Read-only snapshot/inspect handlers on [`DagActor`]."
     },
     {
       "path": "admin/",
@@ -1063,7 +1063,7 @@
     {
       "path": "admin/gc.rs",
       "depth": 1,
-      "doc": "`AdminService.TriggerGC` implementation + the store-size background"
+      "doc": "`AdminService.TriggerGC` implementation + the store-size background refresher that feeds `ClusterStatus.store_size_bytes`."
     },
     {
       "path": "admin/graph.rs",
@@ -1073,7 +1073,7 @@
     {
       "path": "admin/sla.rs",
       "depth": 1,
-      "doc": "`AdminService.{Set,List,Clear}SlaOverride` / `ResetSlaModel` /"
+      "doc": "`AdminService.{Set,List,Clear}SlaOverride` / `ResetSlaModel` / `SlaStatus` handler bodies."
     },
     {
       "path": "admin/spawn_intents.rs",
@@ -1088,7 +1088,7 @@
     {
       "path": "assignment.rs",
       "depth": 0,
-      "doc": "Approximate input closure shared by the pull mint and the GC"
+      "doc": "Approximate input closure shared by the pull mint and the GC live-pin path."
     },
     {
       "path": "ca/",
@@ -1103,7 +1103,7 @@
     {
       "path": "config.rs",
       "depth": 0,
-      "doc": "`rio-scheduler` binary configuration: layered-config-loaded `Config`"
+      "doc": "`rio-scheduler` binary configuration: layered-config-loaded `Config` struct, clap `CliArgs` overlay, and the `ValidateConfig` bounds checks."
     },
     {
       "path": "critical_path.rs",
@@ -1133,7 +1133,7 @@
     {
       "path": "db/batch.rs",
       "depth": 1,
-      "doc": "Batch operations for `persist_merge_to_db` — build-derivation mapping +"
+      "doc": "Batch operations for `persist_merge_to_db` — build-derivation mapping + UNNEST-based bulk inserts."
     },
     {
       "path": "db/builds.rs",
@@ -1168,7 +1168,7 @@
     {
       "path": "db/materialization.rs",
       "depth": 1,
-      "doc": "Materialization-job persistence (design §6 / §2.4, migration 078"
+      "doc": "Materialization-job persistence (design §6 / §2.4, migration 078 `materialization_jobs`)."
     },
     {
       "path": "db/open_attempts.rs",
@@ -1188,7 +1188,7 @@
     {
       "path": "db/wanted.rs",
       "depth": 1,
-      "doc": "Durable per-(build, derivation) wanted relation — the"
+      "doc": "Durable per-(build, derivation) wanted relation — the substitution-replacement campaign's AW4 successor (design §6, migration 078 `build_wanted_outputs`)."
     },
     {
       "path": "domain.rs",
@@ -1218,7 +1218,7 @@
     {
       "path": "lease_hooks.rs",
       "depth": 0,
-      "doc": "Scheduler-side [`LeaseHooks`](crate::lease::LeaseHooks) impl: ordered,"
+      "doc": "Scheduler-side [`LeaseHooks`](crate::lease::LeaseHooks) impl: ordered, non-blocking delivery of lease transitions to the DAG actor."
     },
     {
       "path": "lib.rs",
@@ -1233,7 +1233,7 @@
     {
       "path": "observability.rs",
       "depth": 0,
-      "doc": "Metric series ownership: declared registries replacing incidental"
+      "doc": "Metric series ownership: declared registries replacing incidental call sites."
     },
     {
       "path": "retry_policy.rs",
@@ -1258,12 +1258,12 @@
     {
       "path": "sla/catalog.rs",
       "depth": 1,
-      "doc": "ADR-023 §13c-2: catalog-derived per-hwClass `(max_cores, max_mem)`"
+      "doc": "ADR-023 §13c-2: catalog-derived per-hwClass `(max_cores, max_mem)` ceilings."
     },
     {
       "path": "sla/config.rs",
       "depth": 1,
-      "doc": "ADR-023 operator-facing SLA config: tier ladder, cold-start probe"
+      "doc": "ADR-023 operator-facing SLA config: tier ladder, cold-start probe shapes, hard ceilings."
     },
     {
       "path": "sla/cost.rs",
@@ -1303,7 +1303,7 @@
     {
       "path": "sla/metrics.rs",
       "depth": 1,
-      "doc": "ADR-023 SLA observability. `describe_all()` is wired into"
+      "doc": "ADR-023 SLA observability. `describe_all()` is wired into `rio_scheduler::describe_metrics()`."
     },
     {
       "path": "sla/override.rs",
@@ -1313,12 +1313,12 @@
     {
       "path": "sla/prior.rs",
       "depth": 1,
-      "doc": "ADR-023 §2.10 fleet-learned priors. A never-seen `ModelKey` gets a"
+      "doc": "ADR-023 §2.10 fleet-learned priors."
     },
     {
       "path": "sla/quantile.rs",
       "depth": 1,
-      "doc": "ADR-023 Algorithm 3: q-quantile of the geometric-lognormal mixture"
+      "doc": "ADR-023 Algorithm 3: q-quantile of the geometric-lognormal mixture `T_total = G·T·exp(ε)`, `G~Geom(p)` (attempts incl. success), `ε~N(0,σ²)`."
     },
     {
       "path": "sla/solve.rs",
@@ -1338,22 +1338,22 @@
     {
       "path": "state/build.rs",
       "depth": 1,
-      "doc": "Build request state machine: [`BuildState`] transitions and"
+      "doc": "Build request state machine: [`BuildState`] transitions and [`BuildInfo`] (per-SubmitBuild tracking)."
     },
     {
       "path": "state/db_str.rs",
       "depth": 1,
-      "doc": "`db_str_enum!` — generates `as_str`/`Display`/`FromStr`/`ALL`"
+      "doc": "`db_str_enum!` — generates `as_str`/`Display`/`FromStr`/`ALL` boilerplate for enums that round-trip through PG TEXT columns."
     },
     {
       "path": "state/derivation.rs",
       "depth": 1,
-      "doc": "Derivation state machine: [`DerivationStatus`] transitions and"
+      "doc": "Derivation state machine: [`DerivationStatus`] transitions and [`DerivationState`] (per-derivation DAG node)."
     },
     {
       "path": "state/executor.rs",
       "depth": 1,
-      "doc": "Executor-kind derivation ([`kind_for_drv`]) and [`RetryPolicy`]"
+      "doc": "Executor-kind derivation ([`kind_for_drv`]) and [`RetryPolicy`] (backoff configuration)."
     },
     {
       "path": "state/newtypes.rs",
@@ -1363,7 +1363,7 @@
     {
       "path": "state/recovered_instant.rs",
       "depth": 1,
-      "doc": "[`RecoveredInstant`] — a monotonic anchor that survives failover"
+      "doc": "[`RecoveredInstant`] — a monotonic anchor that survives failover arithmetic without the silent re-anchor (`merged_bug_300`)."
     }
   ],
   "rio-store": [
@@ -1375,7 +1375,7 @@
     {
       "path": "authz.rs",
       "depth": 0,
-      "doc": "Per-method credential-class table for every gRPC service bound on"
+      "doc": "Per-method credential-class table for every gRPC service bound on the store's single port (9002), enforced by a path-aware tower layer."
     },
     {
       "path": "backend.rs",
@@ -1420,7 +1420,7 @@
     {
       "path": "gc/lock.rs",
       "depth": 1,
-      "doc": "Session-affine PG connections and the GC advisory-lock capability"
+      "doc": "Session-affine PG connections and the GC advisory-lock capability (bug_213, bughunt wave D1)."
     },
     {
       "path": "gc/mark.rs",
@@ -1440,12 +1440,12 @@
     {
       "path": "gc/state.rs",
       "depth": 1,
-      "doc": "Durable, cluster-scoped chunk-collect state and the cycle lease"
+      "doc": "Durable, cluster-scoped chunk-collect state and the cycle lease (bug_174 + merged_bug_211, bughunt wave D1; migration 090)."
     },
     {
       "path": "gc/sweep.rs",
       "depth": 1,
-      "doc": "Sweep phase: delete unreachable paths (narinfo/manifests and their"
+      "doc": "Sweep phase: delete unreachable paths (narinfo/manifests and their path-level bookkeeping)."
     },
     {
       "path": "gc/tenant.rs",
@@ -1490,7 +1490,7 @@
     {
       "path": "grpc/queries.rs",
       "depth": 1,
-      "doc": "Read-side StoreService RPCs (QueryPathInfo, FindMissingPaths,"
+      "doc": "Read-side StoreService RPCs (QueryPathInfo, FindMissingPaths, AddSignatures, realisations, TenantQuota)."
     },
     {
       "path": "grpc/sign.rs",
@@ -1500,7 +1500,7 @@
     {
       "path": "ingest.rs",
       "depth": 0,
-      "doc": "Write-ahead NAR ingest core, shared by PutPath/PutPathBatch (gRPC)"
+      "doc": "Write-ahead NAR ingest core, shared by PutPath/PutPathBatch (gRPC) and `Substituter` (upstream binary-cache fetch)."
     },
     {
       "path": "lib.rs",
@@ -1530,22 +1530,22 @@
     {
       "path": "logs/loss.rs",
       "depth": 1,
-      "doc": "The read path's anomaly ledger: BOTH read-path anomaly counters —"
+      "doc": "The read path's anomaly ledger: BOTH read-path anomaly counters — data-loss and divergence — count per ANOMALY IDENTITY `(family, exec_id, s3_key)`, and this module is the only place either is touched."
     },
     {
       "path": "logs/mbt_tests.rs",
       "depth": 1,
-      "doc": "Model-based testing: replay traces generated from the LogService"
+      "doc": "Model-based testing: replay traces generated from the LogService Quint model (`docs/spec/models/logService.qnt`) against the real `rio-store/src/logs/` implementation, diffing the implementation's projected state against the model's after every step."
     },
     {
       "path": "logs/service.rs",
       "depth": 1,
-      "doc": "The `LogService` gRPC handlers: `AppendLog` (authenticated builder"
+      "doc": "The `LogService` gRPC handlers: `AppendLog` (authenticated builder ingest) and `TailLog` (read/follow for the gateway, dashboard, and CLI)."
     },
     {
       "path": "logs/sessions.rs",
       "depth": 1,
-      "doc": "The live-ingest session registry: a PG-backed lease over"
+      "doc": "The live-ingest session registry: a PG-backed lease over `log_ingest_sessions` granting one `AppendLog` stream per execution."
     },
     {
       "path": "logs/sweep.rs",
@@ -1570,17 +1570,17 @@
     {
       "path": "materialize/",
       "depth": 0,
-      "doc": "Store-side materialization executor (substitution-replacement"
+      "doc": "Store-side materialization executor (substitution-replacement design §2.2/§5)."
     },
     {
       "path": "materialize/client.rs",
       "depth": 1,
-      "doc": "The materialization executor's scheduler client: poll → fenced"
+      "doc": "The materialization executor's scheduler client: poll → fenced claim → report (substitution-replacement design §2.2 item 1)."
     },
     {
       "path": "materialize/executor.rs",
       "depth": 1,
-      "doc": "Per-job materialization execution: tenant re-resolution → live"
+      "doc": "Per-job materialization execution: tenant re-resolution → live wanted-set read → in-process reference-closure walk → pin-at-ingest → outcome (substitution-replacement design §2.2 items 2–4, §5.1)."
     },
     {
       "path": "metadata/",
@@ -1590,7 +1590,7 @@
     {
       "path": "metadata/chunked.rs",
       "depth": 1,
-      "doc": "Chunked write-ahead: large NARs split by FastCDC, chunks in S3,"
+      "doc": "Chunked write-ahead: large NARs split by FastCDC, chunks in S3, manifest_data holds the ordered (blake3, size) list."
     },
     {
       "path": "metadata/cluster_key_history.rs",
@@ -1605,7 +1605,7 @@
     {
       "path": "metadata/queries.rs",
       "depth": 1,
-      "doc": "Read-side queries: path info lookup, missing-path batch check, NAR"
+      "doc": "Read-side queries: path info lookup, missing-path batch check, NAR reassembly (`get_manifest`), and signature append."
     },
     {
       "path": "metadata/tenant_keys.rs",
@@ -1615,7 +1615,7 @@
     {
       "path": "metadata/upstreams.rs",
       "depth": 1,
-      "doc": "Per-tenant upstream binary-cache config (`tenant_upstreams` table,"
+      "doc": "Per-tenant upstream binary-cache config (`tenant_upstreams` table, migration 026)."
     },
     {
       "path": "realisations.rs",
@@ -1630,7 +1630,7 @@
     {
       "path": "substitute.rs",
       "depth": 0,
-      "doc": "Upstream binary-cache substitution: block-and-fetch narinfo + NAR"
+      "doc": "Upstream binary-cache substitution: block-and-fetch narinfo + NAR from a tenant's configured upstreams, ingest via the same CAS path as PutPath."
     },
     {
       "path": "test_helpers.rs",
@@ -1640,7 +1640,7 @@
     {
       "path": "visibility.rs",
       "depth": 0,
-      "doc": "Tenant sig-visibility: the ONE body behind every visibility decision"
+      "doc": "Tenant sig-visibility: the ONE body behind every visibility decision (bug_115; batch entrypoint unified by bug_061 — `r[store.visibility.one-body]`)."
     }
   ],
   "rio-test-support": [
@@ -1729,7 +1729,7 @@
     {
       "path": "git.rs",
       "depth": 0,
-      "doc": "Git helpers via gix. Used for the ECR image tag: short-SHA plus a"
+      "doc": "Git helpers via gix."
     },
     {
       "path": "helm.rs",
@@ -1739,7 +1739,7 @@
     {
       "path": "k8s/",
       "depth": 0,
-      "doc": "Unified k8s deploy. One command surface, provider flag selects"
+      "doc": "Unified k8s deploy."
     },
     {
       "path": "k8s/chaos.rs",
@@ -1749,7 +1749,7 @@
     {
       "path": "k8s/client.rs",
       "depth": 1,
-      "doc": "kube-rs client helpers shared by all `k8s::*` modules. Thin wrappers"
+      "doc": "kube-rs client helpers shared by all `k8s::*` modules."
     },
     {
       "path": "k8s/eks/",
@@ -1809,12 +1809,12 @@
     {
       "path": "k8s/phases.rs",
       "depth": 1,
-      "doc": "`up` phase DAG: declarative dependency table + concurrent ready-set"
+      "doc": "`up` phase DAG: declarative dependency table + concurrent ready-set executor."
     },
     {
       "path": "k8s/probe_boot.rs",
       "depth": 1,
-      "doc": "`xtask k8s probe-boot` — single-obs `leadTimeSeed` measurement +"
+      "doc": "`xtask k8s probe-boot` — single-obs `leadTimeSeed` measurement + Karpenter conformance check (ADR-023 §13b prerequisite)."
     },
     {
       "path": "k8s/provider.rs",
@@ -1834,32 +1834,32 @@
     {
       "path": "k8s/qa/lint.rs",
       "depth": 2,
-      "doc": "`qa --lint`: local config-shape asserts. No cluster required."
+      "doc": "`qa --lint`: local config-shape asserts."
     },
     {
       "path": "k8s/qa/scenarios/",
       "depth": 2,
-      "doc": "Scenario registry. One module per scenario; `ALL` is the manual slice"
+      "doc": "Scenario registry."
     },
     {
       "path": "k8s/qa/scenarios/common.rs",
       "depth": 3,
-      "doc": "Helpers shared across scenarios. Kept here (not on `QaCtx`) so the"
+      "doc": "Helpers shared across scenarios."
     },
     {
       "path": "k8s/qa/scenarios/i006_irsa_denied.rs",
       "depth": 3,
-      "doc": "I-006: IRSA trust-policy namespace mismatch → S3-chunked PutPath"
+      "doc": "I-006: IRSA trust-policy namespace mismatch → S3-chunked PutPath fails `AssumeRoleWithWebIdentity` denied."
     },
     {
       "path": "k8s/qa/scenarios/i011_builds_tenant_name.rs",
       "depth": 3,
-      "doc": "I-011: builds submitted with a tenant SSH key end up with NULL"
+      "doc": "I-011: builds submitted with a tenant SSH key end up with NULL `tenant_id` — SubmitBuild's tenant resolution silently dropped."
     },
     {
       "path": "k8s/qa/scenarios/i013_cancel_on_disconnect.rs",
       "depth": 3,
-      "doc": "I-013/I-036: SSH client disconnect → build cancels server-side"
+      "doc": "I-013/I-036: SSH client disconnect → build cancels server-side within 60s (not on next-dispatch)."
     },
     {
       "path": "k8s/qa/scenarios/i023_nodepool_arch.rs",
@@ -1869,22 +1869,22 @@
     {
       "path": "k8s/qa/scenarios/i024_restart_drains_fods.rs",
       "depth": 3,
-      "doc": "I-024/I-025: restart scheduler mid-build with pending FODs;"
+      "doc": "I-024/I-025: restart scheduler mid-build with pending FODs; `fod_queue_depth` (queued FODs) must drain to 0 within 60s of the new leader's recovery."
     },
     {
       "path": "k8s/qa/scenarios/i026_scheduler_health.rs",
       "depth": 3,
-      "doc": "I-026: scheduler grpc-health for `SchedulerService` stays NotServing"
+      "doc": "I-026: scheduler grpc-health for `SchedulerService` stays NotServing after leader acquisition."
     },
     {
       "path": "k8s/qa/scenarios/i032_relay_loop.rs",
       "depth": 3,
-      "doc": "I-032 (historical): the stream-era relay pump could silently drop"
+      "doc": "I-032 (historical): the stream-era relay pump could silently drop completion messages."
     },
     {
       "path": "k8s/qa/scenarios/i033_zombie_executors.rs",
       "depth": 3,
-      "doc": "I-033/I-048b: SIGKILL scheduler-leader, assert no zombie executors"
+      "doc": "I-033/I-048b: SIGKILL scheduler-leader, assert no zombie executors after recovery."
     },
     {
       "path": "k8s/qa/scenarios/i037_cordoned_control_plane.rs",
@@ -1894,12 +1894,12 @@
     {
       "path": "k8s/qa/scenarios/i039_store_kill_survives.rs",
       "depth": 3,
-      "doc": "I-039: store-pod restart mid-build must NOT kill the build with"
+      "doc": "I-039: store-pod restart mid-build must NOT kill the build with EIO."
     },
     {
       "path": "k8s/qa/scenarios/i040_chunk_verify.rs",
       "depth": 3,
-      "doc": "I-040: chunk lost from S3 while manifest claims complete —"
+      "doc": "I-040: chunk lost from S3 while manifest claims complete — `rio-cli verify-chunks` must detect it."
     },
     {
       "path": "k8s/qa/scenarios/i043_shared_input_enoent.rs",
@@ -1909,17 +1909,17 @@
     {
       "path": "k8s/qa/scenarios/i046_graceful_delete_settles.rs",
       "depth": 3,
-      "doc": "I-046/I-091 (re-pointed by bug_389): a GRACEFUL builder pod delete"
+      "doc": "I-046/I-091 (re-pointed by bug_389): a GRACEFUL builder pod delete must SETTLE the in-flight attempt — the scheduler closes the killed attempt (assignment leaves `pending`) within the window, via the pull-mode report path (`ReportOutcome`) or the establishment sweep, and the build is re-dispatchable."
     },
     {
       "path": "k8s/qa/scenarios/i047_missing_input_redispatch.rs",
       "depth": 3,
-      "doc": "I-047: deleting a completed dependency's narinfo must cause the"
+      "doc": "I-047: deleting a completed dependency's narinfo must cause the dependent build to RE-DISPATCH that dep, not fail with \"dependency does not exist\"."
     },
     {
       "path": "k8s/qa/scenarios/i048a_stale_realisation.rs",
       "depth": 3,
-      "doc": "I-048a: realisation row pointing at an absent narinfo must be"
+      "doc": "I-048a: realisation row pointing at an absent narinfo must be filtered (not used as a cache-hit)."
     },
     {
       "path": "k8s/qa/scenarios/i048c_blackhole_self_test.rs",
@@ -1934,12 +1934,12 @@
     {
       "path": "k8s/qa/scenarios/i050_metrics_reachable.rs",
       "depth": 3,
-      "doc": "I-050: scheduler `/metrics` port-forward target wrong → silent"
+      "doc": "I-050: scheduler `/metrics` port-forward target wrong → silent \"error sending request\" on every poll."
     },
     {
       "path": "k8s/qa/scenarios/i052_addmultiple_sequential.rs",
       "depth": 3,
-      "doc": "I-052: gateway's `wopAddMultipleToStore` processed entries"
+      "doc": "I-052: gateway's `wopAddMultipleToStore` processed entries sequentially inside the stream — read entry → `PutPath().await` → next."
     },
     {
       "path": "k8s/qa/scenarios/i056_stale_draining.rs",
@@ -1949,17 +1949,17 @@
     {
       "path": "k8s/qa/scenarios/i058_recovery_transitions.rs",
       "depth": 3,
-      "doc": "I-058: recovery never transitions Queued→Ready, recovered builds"
+      "doc": "I-058: recovery never transitions Queued→Ready, recovered builds freeze."
     },
     {
       "path": "k8s/qa/scenarios/i059_orphan_derivations.rs",
       "depth": 3,
-      "doc": "I-059: PG orphan derivations (no `build_derivations` link) MUST NOT"
+      "doc": "I-059: PG orphan derivations (no `build_derivations` link) MUST NOT be dispatched after recovery."
     },
     {
       "path": "k8s/qa/scenarios/i064_gateway_drain.rs",
       "depth": 3,
-      "doc": "I-064/I-175: gateway rollout-restart must NOT kill active SSH"
+      "doc": "I-064/I-175: gateway rollout-restart must NOT kill active SSH sessions before `sessionDrainSecs`."
     },
     {
       "path": "k8s/qa/scenarios/i078_narinfo_seqscan.rs",
@@ -1969,12 +1969,12 @@
     {
       "path": "k8s/qa/scenarios/i085_controller_ipfamilies.rs",
       "depth": 3,
-      "doc": "I-085: controller-generated headless Services hardcoded"
+      "doc": "I-085: controller-generated headless Services hardcoded `ipFamilies: [IPv6, IPv4]` → invalid on single-stack cluster."
     },
     {
       "path": "k8s/qa/scenarios/i086_reconcile_error_loud.rs",
       "depth": 3,
-      "doc": "I-086: a Pool reconcile failure must be LOUD — `WARN` log +"
+      "doc": "I-086: a Pool reconcile failure must be LOUD — `WARN` log + `rio_controller_reconcile_errors_total` increment, not silent."
     },
     {
       "path": "k8s/qa/scenarios/i095_ghost_dispatch.rs",
@@ -1994,12 +1994,12 @@
     {
       "path": "k8s/qa/scenarios/i109_authorized_keys_hot_reload.rs",
       "depth": 3,
-      "doc": "I-109: gateway hot-reloads `authorized_keys` Secret within ~70s"
+      "doc": "I-109: gateway hot-reloads `authorized_keys` Secret within ~70s (kubelet ~60s Secret refresh + gateway's 10s mtime poll), no restart required."
     },
     {
       "path": "k8s/qa/scenarios/i110_batch_rpc_scale.rs",
       "depth": 3,
-      "doc": "I-110: per-path store RPCs in builder closure-BFS hit a PG wall at"
+      "doc": "I-110: per-path store RPCs in builder closure-BFS hit a PG wall at scale."
     },
     {
       "path": "k8s/qa/scenarios/i114_liveness_kill.rs",
@@ -2009,22 +2009,22 @@
     {
       "path": "k8s/qa/scenarios/i115_temp_suffix_fastpath.rs",
       "depth": 3,
-      "doc": "I-115: nix-daemon's sandbox temp probes (`.chroot`/`.lock`/`.check`)"
+      "doc": "I-115: nix-daemon's sandbox temp probes (`.chroot`/`.lock`/`.check`) reach store GetPath instead of FUSE-side ENOENT fast-path."
     },
     {
       "path": "k8s/qa/scenarios/i116_idle_exit.rs",
       "depth": 3,
-      "doc": "I-116: idle ephemeral builders never exit (waited until"
+      "doc": "I-116: idle ephemeral builders never exit (waited until activeDeadlineSeconds=3600)."
     },
     {
       "path": "k8s/qa/scenarios/i126_do_not_disrupt.rs",
       "depth": 3,
-      "doc": "I-126: ephemeral builder/fetcher pods missing"
+      "doc": "I-126: ephemeral builder/fetcher pods missing `karpenter.sh/do-not-disrupt` → consolidation evicts mid-build."
     },
     {
       "path": "k8s/qa/scenarios/i156_histogram_buckets.rs",
       "depth": 3,
-      "doc": "I-156: histogram metrics missing `_bucket` series → p99 panels"
+      "doc": "I-156: histogram metrics missing `_bucket` series → p99 panels show \"No data\"."
     },
     {
       "path": "k8s/qa/scenarios/i163_mailbox_under_load.rs",
@@ -2044,7 +2044,7 @@
     {
       "path": "k8s/qa/scenarios/i181_kvm_featureless.rs",
       "depth": 3,
-      "doc": "I-181: featureless build counts toward feature-gated kvm pool"
+      "doc": "I-181: featureless build counts toward feature-gated kvm pool (∅ ⊆ [kvm,...] is vacuously true) → kvm-xlarge over-spawns at ~$5/hr per phantom."
     },
     {
       "path": "k8s/qa/scenarios/i183_pending_reaped.rs",
@@ -2054,12 +2054,12 @@
     {
       "path": "k8s/qa/scenarios/i201_stranded_chunks.rs",
       "depth": 3,
-      "doc": "I-201: stranded chunks — PG records a confirmed upload"
+      "doc": "I-201: stranded chunks — PG records a confirmed upload (`uploaded_at` set, row not deleted) but the S3 object is absent."
     },
     {
       "path": "k8s/qa/scenarios/i204_big_parallel_routing.rs",
       "depth": 3,
-      "doc": "I-204: `big-parallel`-only derivation routes exclusively to kvm"
+      "doc": "I-204: `big-parallel`-only derivation routes exclusively to kvm pool (the only pool advertising big-parallel) instead of general."
     },
     {
       "path": "k8s/qa/scenarios/i205_nodepool_schedulable.rs",
@@ -2089,7 +2089,7 @@
     {
       "path": "k8s/qa/scenarios/iso02_cross_tenant_same_drv.rs",
       "depth": 3,
-      "doc": "Cross-tenant: B builds A's drv → separate attribution, shared"
+      "doc": "Cross-tenant: B builds A's drv → separate attribution, shared result."
     },
     {
       "path": "k8s/qa/scenarios/iso03_cross_tenant_path_read.rs",
@@ -2119,12 +2119,12 @@
     {
       "path": "k8s/stress.rs",
       "depth": 1,
-      "doc": "`qa --load` implementation: fire N parallel `nix build --store"
+      "doc": "`qa --load` implementation: fire N parallel `nix build --store ssh-ng://…` clients through SSM tunnels and wait for them."
     },
     {
       "path": "k8s/wipe.rs",
       "depth": 1,
-      "doc": "`xtask k8s up --wipe` — reset the data plane to pristine state"
+      "doc": "`xtask k8s up --wipe` — reset the data plane to pristine state before the `up` pipeline runs."
     },
     {
       "path": "lint.rs",
@@ -2164,7 +2164,7 @@
     {
       "path": "regen/docs_data.rs",
       "depth": 1,
-      "doc": "Regenerate `docs/gen/*.json` — validated cross-reference data for the"
+      "doc": "Regenerate `docs/gen/*.json` — validated cross-reference data for the typst spec build (`docs/lib/refs.typ` asserts membership against these)."
     },
     {
       "path": "regen/fuzz_lock.rs",
@@ -2179,7 +2179,7 @@
     {
       "path": "regen/helm_obs.rs",
       "depth": 1,
-      "doc": "`xtask regen helm-obs` — render the canonical `describe_*!` HELP"
+      "doc": "`xtask regen helm-obs` — render the canonical `describe_*!` HELP strings into the operator chart (bug_330 / merged_bug_353 class: dashboard panel descriptions and PrometheusRule semantics sentences restated metric meaning by hand and drifted from the code)."
     },
     {
       "path": "regen/seccomp.rs",
@@ -2199,17 +2199,17 @@
     {
       "path": "sh.rs",
       "depth": 0,
-      "doc": "Shell-out helpers. Verbosity-aware command execution with"
+      "doc": "Shell-out helpers."
     },
     {
       "path": "ssh.rs",
       "depth": 0,
-      "doc": "SSH pubkey validation. Replaces `infra/lib/ssh-key.sh`."
+      "doc": "SSH pubkey validation."
     },
     {
       "path": "tofu.rs",
       "depth": 0,
-      "doc": "OpenTofu wrappers. All paths are relative to repo root."
+      "doc": "OpenTofu wrappers."
     },
     {
       "path": "ui.rs",

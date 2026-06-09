@@ -695,55 +695,98 @@ fn workspace_members() -> Result<Vec<String>> {
         .collect())
 }
 
+/// One module's operator-surface summary (merged_bug_005): the file's
+/// LEADING `//!` doc paragraph — consecutive `//!` lines from line 1,
+/// a blank `//!` ends the paragraph — cut at the first sentence
+/// boundary, then validated: a non-empty summary MUST end in terminal
+/// punctuation (`.`/`!`/`?`, optionally behind closing
+/// quotes/brackets), erroring with the offending path. Pre-fix the
+/// extractor took only the first PHYSICAL line, so wrapped first
+/// sentences shipped to docs/gen/modules.json as mid-sentence
+/// fragments ("Shared server-stream draining law for CLI commands
+/// (bug_141,"). Generated operator-surface text is validated
+/// structurally at this single emission chokepoint instead of by
+/// unwritten source-formatting convention: a future wrapped or
+/// unpunctuated source doc fails `cargo xtask regen docs-data` and
+/// the `docs-data-fresh` gate, naming its file.
+fn module_summary(p: &Path) -> Result<String> {
+    let Ok(body) = fs::read_to_string(p) else {
+        return Ok(String::new());
+    };
+    let mut para: Vec<&str> = Vec::new();
+    for line in body.lines() {
+        let Some(rest) = line.strip_prefix("//!") else {
+            break;
+        };
+        let content = rest.trim();
+        if content.is_empty() {
+            break;
+        }
+        para.push(content);
+    }
+    let summary = first_sentence(&para.join(" "));
+    if !summary.is_empty() && !ends_in_terminal_punctuation(&summary) {
+        anyhow::bail!(
+            "module summary for {} does not end in terminal punctuation: {summary:?} — \
+             end the leading `//!` paragraph's first sentence with `.`, `!` or `?` \
+             (it is operator-surface text in docs/gen/modules.json)",
+            p.display()
+        );
+    }
+    Ok(summary)
+}
+
+/// `[.!?]` optionally followed by closing quotes/brackets.
+fn ends_in_terminal_punctuation(s: &str) -> bool {
+    s.trim_end_matches(['"', '\'', '`', ')', ']', '}'])
+        .ends_with(['.', '!', '?'])
+}
+
+fn walk_modules(
+    dir: &Path,
+    prefix: &str,
+    depth: u8,
+    out: &mut Vec<serde_json::Value>,
+) -> Result<()> {
+    let mut entries: Vec<_> = fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
+    entries.sort_by_key(|e| e.file_name());
+    for e in entries {
+        let name = e
+            .file_name()
+            .into_string()
+            .map_err(|n| anyhow::anyhow!("non-utf8 src/ entry: {n:?}"))?;
+        if name == "tests" || name == "tests.rs" {
+            continue;
+        }
+        let rel = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if e.path().is_dir() {
+            let doc = module_summary(&e.path().join("mod.rs"))?;
+            out.push(json!({"path": format!("{rel}/"), "depth": depth, "doc": doc}));
+            if depth < 3 {
+                walk_modules(&e.path(), &rel, depth + 1, out)?;
+            }
+        } else if name.ends_with(".rs") && name != "mod.rs" {
+            out.push(json!({
+                "path": rel,
+                "depth": depth,
+                "doc": module_summary(&e.path())?,
+            }));
+        }
+    }
+    Ok(())
+}
+
 fn modules() -> Result<serde_json::Value> {
     // Recursive walk of each crate's src/ (depth ≤ 3, skip tests/),
-    // first-line `//!` doc per file or per <dir>/mod.rs.
+    // leading `//!` doc paragraph per file or per <dir>/mod.rs, cut at
+    // the first sentence (merged_bug_005 — see module_summary).
     // crate-structure.typ derives the per-crate module trees from this
     // (R4-m002 tls.rs + R5-m004 karpenter.rs + rio-common
     // k8s.rs/newtype.rs were hand-tree drift).
-    fn first_doc_line(p: &Path) -> String {
-        fs::read_to_string(p)
-            .ok()
-            .and_then(|b| {
-                b.lines()
-                    .next()
-                    .filter(|l| l.starts_with("//!"))
-                    .map(|l| l.trim_start_matches("//!").trim().to_string())
-            })
-            .unwrap_or_default()
-    }
-    fn walk(dir: &Path, prefix: &str, depth: u8, out: &mut Vec<serde_json::Value>) -> Result<()> {
-        let mut entries: Vec<_> = fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
-        entries.sort_by_key(|e| e.file_name());
-        for e in entries {
-            let name = e
-                .file_name()
-                .into_string()
-                .map_err(|n| anyhow::anyhow!("non-utf8 src/ entry: {n:?}"))?;
-            if name == "tests" || name == "tests.rs" {
-                continue;
-            }
-            let rel = if prefix.is_empty() {
-                name.clone()
-            } else {
-                format!("{prefix}/{name}")
-            };
-            if e.path().is_dir() {
-                let doc = first_doc_line(&e.path().join("mod.rs"));
-                out.push(json!({"path": format!("{rel}/"), "depth": depth, "doc": doc}));
-                if depth < 3 {
-                    walk(&e.path(), &rel, depth + 1, out)?;
-                }
-            } else if name.ends_with(".rs") && name != "mod.rs" {
-                out.push(json!({
-                    "path": rel,
-                    "depth": depth,
-                    "doc": first_doc_line(&e.path()),
-                }));
-            }
-        }
-        Ok(())
-    }
     let mut out = BTreeMap::<String, Vec<serde_json::Value>>::new();
     for m in workspace_members()? {
         let src = repo_root().join(&m).join("src");
@@ -751,7 +794,7 @@ fn modules() -> Result<serde_json::Value> {
             continue;
         }
         let mut entries = Vec::new();
-        walk(&src, "", 0, &mut entries)?;
+        walk_modules(&src, "", 0, &mut entries)?;
         out.insert(m, entries);
     }
     Ok(json!(out))
@@ -1182,6 +1225,61 @@ fn first_sentence(desc: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// merged_bug_005 red #1: the module-index summary must be the
+    /// FULL first sentence of the leading `//!` paragraph, not the
+    /// first physical line. Fixture = a real temp `.rs` file walked
+    /// by the production walk (the stream_util.rs shape verbatim —
+    /// the committed modules.json fragment was
+    /// "Shared server-stream draining law for CLI commands (bug_141,").
+    #[test]
+    fn module_summary_is_the_full_first_sentence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("stream_util.rs"),
+            "//! Shared server-stream draining law for CLI commands (bug_141,\n\
+             //! bug_178): every consumer of a server-streaming RPC drains to a\n\
+             //! terminal frame. Rationale prose continues here.\n\
+             fn x() {}\n",
+        )
+        .expect("write fixture");
+        let mut out = Vec::new();
+        super::walk_modules(dir.path(), "", 0, &mut out).expect("walk");
+        assert_eq!(
+            out[0]["doc"],
+            "Shared server-stream draining law for CLI commands (bug_141, \
+             bug_178): every consumer of a server-streaming RPC drains to a \
+             terminal frame.",
+            "the summary must be the full first sentence (paragraph-joined, \
+             sentence-cut), not the first physical line's mid-sentence fragment"
+        );
+    }
+
+    /// merged_bug_005 red #2: the regen MUST fail closed on a summary
+    /// with no terminal punctuation, naming the offending file —
+    /// generated operator-surface text is validated structurally, not
+    /// by unwritten convention.
+    #[test]
+    fn regen_rejects_unterminated_module_summary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("fragment.rs"),
+            "//! A leading doc paragraph that never terminates its sentence\n\
+             fn x() {}\n",
+        )
+        .expect("write fixture");
+        let mut out = Vec::new();
+        let err = super::walk_modules(dir.path(), "", 0, &mut out)
+            .expect_err("an unpunctuated summary must fail the regen");
+        assert!(
+            err.to_string().contains("fragment.rs"),
+            "the error names the offending path: {err:#}"
+        );
+        assert!(
+            err.to_string().contains("terminal punctuation"),
+            "the error names the rule: {err:#}"
+        );
+    }
+
     // Alert-rule scraper (merged_bug_001 mechanism): inline and
     // `expr: |` block forms, for/severity capture, rio_* token
     // extraction with histogram-suffix normalization.
