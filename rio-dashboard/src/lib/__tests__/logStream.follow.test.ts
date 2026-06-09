@@ -550,4 +550,67 @@ describe('authRequired terminal state', () => {
     s.destroy();
   });
 
+
+  // r[verify dash.stream.log-tail+6]
+  /// merged_bug_029's recorded red: servedComplete is per-execution,
+  /// but its only reset was the execSwitch arm -- which requires a
+  /// chunk stamped with the NEW execId to actually arrive. On the
+  /// follow-the-retry reopen (exec A's isComplete + non-terminal
+  /// oracle), A's completion claim survived; when exec B never
+  /// delivered a chunk, the grace-expiry exit computed
+  /// incomplete = !servedComplete = false and minted phase 'complete'
+  /// from the DEAD execution's claim. The decision to follow the retry
+  /// now structurally consumes the claim (tailNext returns the next
+  /// servedComplete state).
+  it('reopen_consumes_completion_claim: a dead exec claim cannot finish the retry tab', async () => {
+    let term = false;
+    tailLog
+      .mockImplementationOnce(async function* () {
+        yield { ...chunk(['a0'], { isComplete: true }), execId: 'exec-a' };
+      })
+      .mockImplementation(async function* () {
+        // exec B: manifest lags / store outage -- no chunk, ever.
+        await new Promise(() => {});
+      });
+    const s = createLogStream('/nix/store/x.drv', '', {
+      isTerminal: () => term,
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    // The derivation settles terminal AFTER the reopen decision.
+    term = true;
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(s.done).toBe(true);
+    expect(s.incomplete).toBe(true);
+    expect(s.phase).toEqual({ kind: 'incomplete', err: null });
+    s.destroy();
+  });
+
+  // r[verify dash.stream.log-tail+6]
+  /// merged_bug_014's defensive rider (R10, load-bearing once the
+  /// terminality oracle went live in merged_bug_134): an armed grace
+  /// deadline belongs to the OLD execution's world -- an execution
+  /// switch must re-derive it, or the new execution's drain is cut at
+  /// a deadline armed before the switch existed. Pre-rider red: b2
+  /// (arriving 6s after open, 2s past the stale deadline) was cut.
+  it('exec_switch_rearms_grace: the new execution gets a fresh grace window', async () => {
+    tailLog.mockImplementation(async function* () {
+      yield { ...chunk(['a0']), execId: 'exec-a' };
+      await new Promise((r) => setTimeout(r, 4_000));
+      // Retry on another worker; head at 0 -> in-stream recovery.
+      yield { ...chunk(['b0', 'b1']), execId: 'exec-b' };
+      await new Promise((r) => setTimeout(r, 2_000));
+      yield { ...chunk(['b2'], { firstLineNumber: 2n }), execId: 'exec-b' };
+      await new Promise(() => {});
+    });
+    const s = createLogStream('/nix/store/x.drv', '', {
+      isTerminal: () => true,
+    });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(s.done).toBe(true);
+    expect(
+      s.rows.filter((r) => r.kind === 'line').map((r) => r.text),
+    ).toEqual(['a0', 'b0', 'b1', 'b2']);
+    s.destroy();
+  });
+
 });

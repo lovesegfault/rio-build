@@ -133,17 +133,25 @@ describe('tailNext', () => {
           for (const graceExpired of [false, true]) {
             for (const servedComplete of [false, true]) {
               const got = tailNext(cause, mode, terminal, graceExpired, servedComplete);
+              // merged_bug_029: a naturalEnd re-open CONSUMES the
+              // completion claim (the next servedComplete is false);
+              // transport/open failures made no claim decision and
+              // pass it through.
               const want =
                 graceExpired ||
                 (cause === 'naturalEnd' &&
                   servedComplete &&
                   (terminal || mode === 'pinned'))
-                  ? 'exit'
-                  : 'reopen';
+                  ? { kind: 'exit' }
+                  : {
+                      kind: 'reopen',
+                      servedComplete:
+                        cause === 'naturalEnd' ? false : servedComplete,
+                    };
               expect(
                 got,
                 `tailNext(${cause}, ${mode}, ${terminal}, ${graceExpired}, ${servedComplete})`,
-              ).toBe(want);
+              ).toEqual(want);
             }
           }
         }
@@ -160,7 +168,7 @@ describe('tailNext', () => {
             expect(
               tailNext('authRequired', mode, terminal, graceExpired, servedComplete),
               `tailNext(authRequired, ${mode}, ${terminal}, ${graceExpired}, ${servedComplete})`,
-            ).toBe('exit');
+            ).toEqual({ kind: 'exit' });
           }
         }
       }
@@ -176,7 +184,7 @@ describe('tailNext', () => {
             expect(
               tailNext('permanentErr', mode, terminal, graceExpired, servedComplete),
               `tailNext(permanentErr, ${mode}, ${terminal}, ${graceExpired}, ${servedComplete})`,
-            ).toBe('exit');
+            ).toEqual({ kind: 'exit' });
           }
         }
       }

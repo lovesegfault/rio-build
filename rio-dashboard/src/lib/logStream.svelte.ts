@@ -407,6 +407,14 @@ export function createLogStream(
               cursor = 0n;
               lastExecId = chunk.execId;
               servedComplete = false;
+              // merged_bug_014's defensive rider (R10, load-bearing
+              // since the terminality oracle went live in
+              // merged_bug_134): an armed grace deadline belongs to
+              // the OLD execution's world — re-derive it, or the new
+              // execution's drain is cut at a deadline armed before
+              // the switch existed. The loop head re-arms a FRESH
+              // window from the live oracle.
+              graceDeadline = null;
               if (chunk.firstLineNumber === 0n && chunk.lines.length > 0) {
                 // The switching chunk IS the new execution's head:
                 // nothing was filtered server-side. Recover in-stream
@@ -553,7 +561,8 @@ export function createLogStream(
         graceDeadline = Date.now() + GRACE_MS;
       }
       const graceExpired = graceDeadline !== null && Date.now() >= graceDeadline;
-      if (tailNext(cause, mode, terminal, graceExpired, servedComplete) === 'exit') {
+      const decision = tailNext(cause, mode, terminal, graceExpired, servedComplete);
+      if (decision.kind === 'exit') {
         // r[impl obs.log.incomplete-surfaced+2]
         // Exit with the store never having stamped completion: the
         // missing tail is usually the build error itself — flag it so
@@ -584,6 +593,10 @@ export function createLogStream(
         done = true;
         return;
       }
+      // The law's next-state: following past a stamped completion
+      // consumed the claim (merged_bug_029) — the re-open must not
+      // carry a dead execution's word into the retry's tab.
+      servedComplete = decision.servedComplete;
       // Re-open after the pacer's delay, capped at the remaining grace
       // so the last drain attempt lands before the deadline rather
       // than sleeping through it.

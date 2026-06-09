@@ -106,6 +106,19 @@ export type TailStopCause =
 
 export type TailVerdict = 'reopen' | 'exit';
 
+/// The exit law's full decision: a verdict PLUS the next
+/// `servedComplete` state (merged_bug_029). Deciding to follow a retry
+/// past a stamped completion structurally CONSUMES the claim — the
+/// claim was minted by the execution being left behind, and if the
+/// retry never delivers a chunk the grace exit must not finish the tab
+/// "complete" off the dead execution's word. Returning the next state
+/// (instead of a bare verdict) makes forgetting the reset
+/// unrepresentable: the caller has nowhere else to get its next
+/// `servedComplete` from.
+export type TailDecision =
+  | { kind: 'exit' }
+  | { kind: 'reopen'; servedComplete: boolean };
+
 /// HOW the stream resolves its execution — a law input, dashboard-only
 /// (no kernel mirror, same precedent as `authRequired`): the gateway
 /// relay always follows per-derivation, but the dashboard can PIN one
@@ -137,19 +150,30 @@ export function tailNext(
   terminal: boolean,
   graceExpired: boolean,
   servedComplete: boolean,
-): TailVerdict {
-  if (graceExpired) return 'exit';
+): TailDecision {
+  if (graceExpired) return { kind: 'exit' };
   switch (cause) {
     case 'naturalEnd':
-      return servedComplete && (terminal || mode === 'pinned')
-        ? 'exit'
-        : 'reopen';
+      if (servedComplete && (terminal || mode === 'pinned')) {
+        return { kind: 'exit' };
+      }
+      // Following past a stamped completion CONSUMES the claim
+      // (merged_bug_029): the re-open chases a NEWER execution, and
+      // the old execution's claim must never finish the new tab when
+      // the retry never delivers a chunk. (servedComplete === false
+      // re-opens with nothing to consume — same next state.)
+      return { kind: 'reopen', servedComplete: false };
     case 'transportErr':
     case 'openFailed':
-      return 'reopen';
+      // No decision was made about the claim here — pass it through.
+      // (A held claim is unreachable on these causes today: the
+      // in-loop isComplete break routes every claim-bearing end
+      // through naturalEnd — but the law stays total over its inputs
+      // rather than encoding that reachability argument.)
+      return { kind: 'reopen', servedComplete };
     case 'authRequired':
     case 'permanentErr':
-      return 'exit';
+      return { kind: 'exit' };
     default:
       return assertNever(cause);
   }
