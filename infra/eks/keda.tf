@@ -113,6 +113,30 @@ resource "helm_release" "keda" {
       name  = "webhooks.healthProbePort"
       value = "10273"
     },
+    # Operator self-metrics: the scaler-health surface for our two
+    # ScaledObjects — keda_scaler_detail_errors_total (prometheus
+    # unreachable → the gateway SO's spec.fallback engages),
+    # keda_scaler_empty_upstream_responses_total (sum() over an absent
+    # series scales toward the floor with no error anywhere else), the
+    # 2.20 keda_scaler_http_* query outcome/latency metrics, and
+    # keda_scaler_active (correct for cpu triggers since 2.20). The
+    # store dashboard's scaling row reads these
+    # (infra/helm/rio-build/dashboards/store.json). serviceMonitor
+    # because kube-prometheus-stack watches ServiceMonitors
+    # cluster-wide (monitoring.tf sets
+    # serviceMonitorSelectorNilUsesHelmValues=false and namespace
+    # discovery is unrestricted). The operator pod is NOT hostNetwork
+    # (only the metrics-apiserver and webhooks above are), so its
+    # metrics port stays a pod-network containerPort (chart default
+    # 8080) — no row in the main.tf host-port allocation table.
+    {
+      name  = "prometheus.operator.enabled"
+      value = "true"
+    },
+    {
+      name  = "prometheus.operator.serviceMonitor.enabled"
+      value = "true"
+    },
   ]
 
   # aws_lbc dep: webhook-ordering only — see addons.tf aws_lbc.

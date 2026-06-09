@@ -809,6 +809,117 @@
           "sort": "none"
         }
       }
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "KEDA scaler health: errors, empty results, query outcomes",
+      "description": "KEDA operator self-metrics for both ScaledObjects' scalers (scraped via the keda chart's operator ServiceMonitor, infra/eks/keda.tf). Three failure shapes the loop panel above cannot distinguish: scaler errors (prometheus unreachable/5xx - sustained errors on rio-gateway engage its spec.fallback after 3 consecutive failures, the store rides its cpu trigger); empty query results (sum() over an ABSENT series, e.g. the scheduler gauge not scraped - under ignoreNullValues=true this scales toward the floor with no error recorded anywhere else, the exact blind spot of the desired-replicas panel); raw scaler HTTP outcomes by status code. Healthy: everything flat at zero except prom http 200.",
+      "gridPos": {
+        "x": 0,
+        "y": 53,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum by (scaledObject, scaler) (rate(keda_scaler_detail_errors_total{scaledObject=~\"rio-store|rio-gateway\"}[5m]))",
+          "legendFormat": "errors {{scaledObject}}/{{scaler}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (scaledResource) (rate(keda_scaler_empty_upstream_responses_total{scaledResource=~\"rio-store|rio-gateway\"}[5m]))",
+          "legendFormat": "empty result {{scaledResource}}",
+          "refId": "B"
+        },
+        {
+          "expr": "sum by (status_code) (rate(keda_scaler_http_requests_total{scaled_resource=~\"rio-store|rio-gateway\"}[5m]))",
+          "legendFormat": "prom http {{status_code}}",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "KEDA scaler activity and query latency",
+      "description": "keda_scaler_active per scaler (1 = active; emitted correctly for the cpu trigger since KEDA 2.20, kedacore/keda#4945) and the p99 of the operator's outbound scaler query duration (2.20 self-metric, operator-wide). A scaler stuck inactive while its signal is high, or p99 climbing toward the scaler HTTP timeout, means scaling decisions stall BEFORE any error counter on the left panel moves.",
+      "gridPos": {
+        "x": 12,
+        "y": 53,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "keda_scaler_active{scaledObject=~\"rio-store|rio-gateway\"}",
+          "legendFormat": "active {{scaledObject}}/{{scaler}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(keda_scaler_http_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "scaler query p99 (s)",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
     }
   ]
 }

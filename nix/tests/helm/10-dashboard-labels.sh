@@ -40,6 +40,10 @@ container_network_receive_bytes_total:namespace
 container_network_receive_bytes_total:pod
 container_network_transmit_bytes_total:namespace
 container_network_transmit_bytes_total:pod
+keda_scaler_active:scaledObject
+keda_scaler_detail_errors_total:scaledObject
+keda_scaler_empty_upstream_responses_total:scaledResource
+keda_scaler_http_requests_total:scaled_resource
 '
 # Provenance of the non-rio entries (Store-scaling row, decision 5):
 # `pod` on rio_store_*_bytes_total is the prometheus-operator target
@@ -49,6 +53,15 @@ container_network_transmit_bytes_total:pod
 # both shipped by the kube-prometheus-stack reference deploy
 # (infra/eks/monitoring.tf); `keda-hpa-rio-store` is KEDA's managed-HPA
 # naming convention for the rio-store ScaledObject.
+# keda_* are the KEDA operator's self-metrics (scraped via the keda
+# chart's operator ServiceMonitor, infra/eks/keda.tf). Label keys per
+# keda v2.20.1 pkg/metricscollector/prommetrics.go: the shared
+# metricLabels set carries camelCase `scaledObject`; the
+# empty-response counter (#7062) carries `scaledResource`; the 2.20
+# scaler HTTP metrics (#6600) carry snake_case `scaled_resource` —
+# three spellings of the same SO-name dimension, faithful to what the
+# operator emits. Values are the ScaledObject names (rio-store /
+# rio-gateway), set from config.ScalableObjectName.
 # (The rio_controller_component_scaler_* entries left with the
 # retired ComponentScaler dashboard.)
 
