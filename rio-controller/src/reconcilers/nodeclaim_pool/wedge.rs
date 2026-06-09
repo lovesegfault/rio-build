@@ -186,6 +186,22 @@ pub(super) struct WedgeTracker {
     /// trailing-edge reap) while sub-threshold participants' anchors
     /// pair with any later blip.
     last_suppression_secs: Option<f64>,
+    /// merged_bug_017: eviction tombstones — node → controller-frame
+    /// instant it was evicted (reaped by the controller, or absent
+    /// from the registered NodeClaim fleet). Eviction is an ADMISSION
+    /// source, not a state wipe: a reaped node's still-open attempts
+    /// re-present in the very next view (the establishment sweep takes
+    /// several ticks to close them), and the one-shot wipe let them
+    /// re-anchor the same tick — re-feeding the Dead arm with a node
+    /// that no longer exists. Membership blocks admission outright
+    /// (nothing new can be assigned to a deleted node, so every
+    /// still-open attempt predates the eviction by construction —
+    /// no cross-frame instant comparison needed). Tombstones live one
+    /// [`WEDGE_CLUSTER_WINDOW_SECS`] window — the same window law as
+    /// the suppression watermark — so a same-named node recreated
+    /// later can accumulate evidence again (under-detect ≤ one window,
+    /// the module's documented safe direction).
+    evicted: HashMap<String, f64>,
 }
 
 /// The verdict seal, CONFINED (bug_151): `Sealed` and the single
@@ -306,11 +322,28 @@ impl WedgeTracker {
         &mut self,
         view: Option<&[OpenAttempt]>,
         reaped_since_last: &std::collections::BTreeSet<String>,
+        registered: &HashSet<String>,
         now_secs: f64,
     ) -> WedgeVerdict {
         for node in reaped_since_last {
             self.evidence.remove(node);
             self.marked.remove(node);
+            self.evicted.insert(node.clone(), now_secs);
+        }
+        // merged_bug_017: a node absent from the registered NodeClaim
+        // fleet (deleted out-of-band, Karpenter GC) is evicted exactly
+        // like a reaped one — its evidence cannot mark a node that is
+        // gone, and it must not inflate the verdict populations.
+        let absent: Vec<String> = self
+            .evidence
+            .keys()
+            .filter(|n| !registered.contains(*n))
+            .cloned()
+            .collect();
+        for node in absent {
+            self.evidence.remove(&node);
+            self.marked.remove(&node);
+            self.evicted.insert(node, now_secs);
         }
         let Some(open_attempts) = view else {
             // bug_151: the unobserved tick routes through the SAME
@@ -348,6 +381,13 @@ impl WedgeTracker {
                 // Not ledger-attributable: never evidence against any
                 // node (and not fleet either — an unattributed attempt
                 // says nothing about node breadth).
+                continue;
+            }
+            if self.evicted.contains_key(&a.source_node) {
+                // merged_bug_017: an evicted node's still-open attempts
+                // are inadmissible — not evidence, not fleet. Eviction
+                // is an admission source consumed here, not a state
+                // wipe the next observation undoes.
                 continue;
             }
             fleet.insert(a.source_node.clone());
@@ -394,12 +434,17 @@ impl WedgeTracker {
         fleet
     }
 
-    /// Drop evidence older than the window and nodes left without any.
+    /// Drop evidence older than the window, nodes left without any,
+    /// and eviction tombstones past the window (one window law shared
+    /// with the suppression watermark: no admission gate outlives the
+    /// episode it suppresses).
     fn prune(&mut self, now_secs: f64) {
         for per_node in self.evidence.values_mut() {
             per_node.retain(|_, t| now_secs - *t <= WEDGE_CLUSTER_WINDOW_SECS);
         }
         self.evidence.retain(|_, per_node| !per_node.is_empty());
+        self.evicted
+            .retain(|_, t| now_secs - *t <= WEDGE_CLUSTER_WINDOW_SECS);
     }
 }
 
@@ -408,6 +453,11 @@ mod tests {
     use super::super::NodeClaimPoolConfig;
     fn no_reaps() -> std::collections::BTreeSet<String> {
         std::collections::BTreeSet::new()
+    }
+
+    /// The registered NodeClaim fleet for a tick (backing node names).
+    fn fleet(nodes: &[&str]) -> HashSet<String> {
+        nodes.iter().map(|s| s.to_string()).collect()
     }
 
     use super::super::ffd::tests::with_conds;
@@ -470,6 +520,7 @@ mod tests {
                 healthy("drv-d", "node-3"),
             ]),
             &no_reaps(),
+            &fleet(&["node-1", "node-2", "node-3"]),
             10_000.0,
         ));
         assert_eq!(wedged, vec!["node-1".to_string()]);
@@ -522,10 +573,61 @@ mod tests {
                     healthy("drv-b", "node-1"),
                 ]),
                 &no_reaps(),
+                &fleet(&["node-1"]),
                 10_000.0 + (tick as f64) * 10.0,
             ));
             assert!(wedged.is_empty(), "tick {tick}: {wedged:?}");
         }
+    }
+
+    /// merged_bug_017: reap eviction is an ADMISSION source, not a
+    /// state wipe. A reaped node's still-open attempts re-present in
+    /// the very next view (the establishment sweep takes several ticks
+    /// to close them); the one-shot `mem::take`-era wipe let `observe`
+    /// re-anchor them the same tick, re-feeding the Dead arm with a
+    /// node that no longer exists.
+    // r[verify ctrl.nodeclaim.wedge-cluster+2]
+    #[test]
+    fn reaped_node_still_open_attempts_are_inadmissible() {
+        let mut tracker = WedgeTracker::default();
+        let view = [expired("drv-a", "node-1", 5), expired("drv-b", "node-1", 5)];
+        let wedged = nodes(tracker.update(Some(&view), &no_reaps(), &fleet(&["node-1"]), 10_000.0));
+        assert_eq!(wedged, vec!["node-1".to_string()]);
+        // The controller reaps node-1; the SAME still-open attempts
+        // re-present next tick.
+        let reaps: std::collections::BTreeSet<String> = ["node-1".to_string()].into();
+        let verdict = tracker.update(Some(&view), &reaps, &fleet(&[]), 10_010.0);
+        assert!(
+            nodes(verdict).is_empty(),
+            "a reaped node's still-open attempts must be inadmissible, not re-anchored"
+        );
+        // ... and they stay inadmissible on later ticks while the
+        // tombstone lives (the reap feed only fires once).
+        let verdict = tracker.update(Some(&view), &no_reaps(), &fleet(&[]), 10_020.0);
+        assert!(
+            nodes(verdict).is_empty(),
+            "tombstone must outlive the one-shot reap feedback"
+        );
+    }
+
+    /// merged_bug_017: a node absent from the registered NodeClaim
+    /// fleet (deleted out-of-band, Karpenter GC) is evicted exactly
+    /// like a reaped one — its evidence cannot mark and does not
+    /// inflate the populations.
+    // r[verify ctrl.nodeclaim.wedge-cluster+2]
+    #[test]
+    fn fleet_absent_node_is_evicted_and_inadmissible() {
+        let mut tracker = WedgeTracker::default();
+        let view = [expired("drv-a", "node-1", 5), expired("drv-b", "node-1", 5)];
+        // node-1 was registered when its evidence accumulated...
+        let wedged = nodes(tracker.update(Some(&view), &no_reaps(), &fleet(&["node-1"]), 10_000.0));
+        assert_eq!(wedged, vec!["node-1".to_string()]);
+        // ...then vanished from the NodeClaim list between ticks.
+        let verdict = tracker.update(Some(&view), &no_reaps(), &fleet(&[]), 10_010.0);
+        assert!(
+            nodes(verdict).is_empty(),
+            "a fleet-absent node's evidence must be evicted and inadmissible"
+        );
     }
 
     /// Evidence ages out of the 30-minute window: two expiries observed
@@ -537,20 +639,31 @@ mod tests {
         let mut tracker = WedgeTracker::default();
         let t0 = 10_000.0;
         assert!(
-            nodes(tracker.update(Some(&[expired("drv-a", "node-1", 5)]), &no_reaps(), t0))
-                .is_empty()
+            nodes(tracker.update(
+                Some(&[expired("drv-a", "node-1", 5)]),
+                &no_reaps(),
+                &fleet(&["node-1"]),
+                t0
+            ))
+            .is_empty()
         );
         // Second distinct expiry observed after the first aged out.
         let late = t0 + WEDGE_CLUSTER_WINDOW_SECS + 1.0;
         assert!(
-            nodes(tracker.update(Some(&[expired("drv-b", "node-1", 5)]), &no_reaps(), late))
-                .is_empty(),
+            nodes(tracker.update(
+                Some(&[expired("drv-b", "node-1", 5)]),
+                &no_reaps(),
+                &fleet(&["node-1"]),
+                late
+            ))
+            .is_empty(),
             "the drv-a evidence aged out; one in-window expiry must not mark"
         );
         // Both inside one window → marked.
         let wedged = nodes(tracker.update(
             Some(&[expired("drv-a", "node-1", 5), expired("drv-b", "node-1", 5)]),
             &no_reaps(),
+            &fleet(&["node-1"]),
             late + 5.0,
         ));
         assert_eq!(wedged, vec!["node-1".to_string()]);
@@ -565,7 +678,10 @@ mod tests {
         a.deadline_secs = 0;
         let mut b = expired("drv-b", "node-1", 5);
         b.deadline_secs = 0;
-        assert!(nodes(tracker.update(Some(&[a, b]), &no_reaps(), 10_000.0)).is_empty());
+        assert!(
+            nodes(tracker.update(Some(&[a, b]), &no_reaps(), &fleet(&["node-1"]), 10_000.0))
+                .is_empty()
+        );
     }
 
     /// C2/222 leg 1: materialization attempts are store-side fetches —
@@ -580,7 +696,8 @@ mod tests {
         a.attempt_kind = rio_proto::types::AttemptKind::Materialization as i32;
         let mut b = expired("drv-b", "node-1", 5);
         b.attempt_kind = rio_proto::types::AttemptKind::Materialization as i32;
-        let wedged = nodes(tracker.update(Some(&[a, b]), &no_reaps(), 10_000.0));
+        let wedged =
+            nodes(tracker.update(Some(&[a, b]), &no_reaps(), &fleet(&["node-1"]), 10_000.0));
         assert!(
             wedged.is_empty(),
             "two expired MATERIALIZATION attempts on one node must not mark it: {wedged:?}"
@@ -599,7 +716,7 @@ mod tests {
         a.source_node = String::new();
         let mut b = expired("drv-b", "", 5);
         b.source_node = String::new();
-        let wedged = nodes(tracker.update(Some(&[a, b]), &no_reaps(), 10_000.0));
+        let wedged = nodes(tracker.update(Some(&[a, b]), &no_reaps(), &fleet(&[]), 10_000.0));
         assert!(
             wedged.is_empty(),
             "ledger-unattributable expiries must never mark any node: {wedged:?}"
@@ -620,8 +737,12 @@ mod tests {
         // the 1800s window.
         let mut t = t0;
         while t < t0 + WEDGE_CLUSTER_WINDOW_SECS + 600.0 {
-            let wedged =
-                nodes(tracker.update(Some(&[expired("drv-a", "node-1", 5)]), &no_reaps(), t));
+            let wedged = nodes(tracker.update(
+                Some(&[expired("drv-a", "node-1", 5)]),
+                &no_reaps(),
+                &fleet(&["node-1"]),
+                t,
+            ));
             assert!(wedged.is_empty(), "single drv must never mark: {wedged:?}");
             t += 600.0;
         }
@@ -629,6 +750,7 @@ mod tests {
         let wedged = tracker.update(
             Some(&[expired("drv-a", "node-1", 5), expired("drv-b", "node-1", 5)]),
             &no_reaps(),
+            &fleet(&["node-1"]),
             t,
         );
         let wedged = match wedged {
@@ -663,7 +785,12 @@ mod tests {
                 ]
             })
             .collect();
-        let verdict = tracker.update(Some(&view), &no_reaps(), 10_000.0);
+        let verdict = tracker.update(
+            Some(&view),
+            &no_reaps(),
+            &fleet(&["node-0", "node-1", "node-2", "node-3"]),
+            10_000.0,
+        );
         assert!(
             matches!(
                 verdict,
@@ -752,6 +879,8 @@ mod proptests {
         marked: BTreeSet<String>,
         /// merged_bug_163 mirror: the suppression watermark.
         watermark: Option<f64>,
+        /// merged_bug_017 mirror: eviction tombstones (node → instant).
+        evicted: BTreeMap<String, f64>,
     }
 
     enum Expect {
@@ -765,7 +894,10 @@ mod proptests {
             for n in &tick.reaped {
                 self.anchors.retain(|(node, _), _| node != n);
                 self.marked.remove(n);
+                self.evicted.insert(n.clone(), now);
             }
+            self.evicted
+                .retain(|_, t| now - *t <= WEDGE_CLUSTER_WINDOW_SECS);
             let Some(view) = &tick.view else {
                 return Expect::Skipped;
             };
@@ -773,6 +905,7 @@ mod proptests {
             for a in view {
                 if a.attempt_kind != rio_proto::types::AttemptKind::Build as i32
                     || a.source_node.is_empty()
+                    || self.evicted.contains_key(&a.source_node)
                 {
                     continue;
                 }
@@ -846,7 +979,9 @@ mod proptests {
             let t0 = 1_000_000.0;
             for (i, tick) in ticks.iter().enumerate() {
                 let now = t0 + (i as f64) * 10.0;
-                let verdict = tracker.update(tick.view.as_deref(), &tick.reaped, now);
+                let registered: HashSet<String> =
+                    NODES[1..].iter().map(|s| s.to_string()).collect();
+                let verdict = tracker.update(tick.view.as_deref(), &tick.reaped, &registered, now);
                 match (oracle.step(tick, now), verdict) {
                     (Expect::Skipped, WedgeVerdict::Unobserved(_)) => {}
                     (Expect::Skipped, v) => {
@@ -929,8 +1064,13 @@ mod proptests {
             let systemic = expect_wedged.len() >= 2
                 && (expect_wedged.len() as f64 / population.len() as f64) > WEDGE_SYSTEMIC_FRACTION;
             let mut tracker = WedgeTracker::default();
-            let verdict =
-                tracker.update(Some(&view), &std::collections::BTreeSet::new(), 1_000_000.0);
+            let registered: HashSet<String> = NODES[1..].iter().map(|s| s.to_string()).collect();
+            let verdict = tracker.update(
+                Some(&view),
+                &std::collections::BTreeSet::new(),
+                &registered,
+                1_000_000.0,
+            );
             match verdict {
                 WedgeVerdict::Systemic { affected, of, .. } => {
                     assert!(systemic, "mask {mask}: unexpected systemic");
@@ -962,6 +1102,11 @@ mod population_and_epilogue_tests {
         std::collections::BTreeSet::new()
     }
 
+    /// The registered NodeClaim fleet for a tick (backing node names).
+    fn fleet(nodes: &[&str]) -> HashSet<String> {
+        nodes.iter().map(|s| s.to_string()).collect()
+    }
+
     fn expired(intent: &str, node: &str) -> OpenAttempt {
         OpenAttempt {
             intent_id: intent.into(),
@@ -979,6 +1124,11 @@ mod population_and_epilogue_tests {
         }
     }
 
+    /// This module's full node universe — registered every tick.
+    fn all_nodes() -> HashSet<String> {
+        fleet(&["n0", "n1", "n2", "n3", "n4", "n5"])
+    }
+
     /// A systemic episode followed by an observation failure must not
     /// mass-mark from retained evidence (red: tick 2 returned
     /// NodeWedged(["n0","n1","n2","n3"]) — the mass-Dead-reap polarity).
@@ -994,12 +1144,12 @@ mod population_and_epilogue_tests {
             })
             .collect();
         assert!(matches!(
-            t.update(Some(&view), &no_reaps(), 1000.0),
+            t.update(Some(&view), &no_reaps(), &all_nodes(), 1000.0),
             WedgeVerdict::Systemic { .. }
         ));
         // tick 2: ListOpenAttempts failed -> mod.rs now passes None
         // (observation AND verdict skipped).
-        match t.update(None, &no_reaps(), 1010.0) {
+        match t.update(None, &no_reaps(), &all_nodes(), 1010.0) {
             WedgeVerdict::Unobserved(_) => {}
             v => panic!("observation-skipped tick must yield Unobserved, got {v:?}"),
         }
@@ -1020,13 +1170,18 @@ mod population_and_epilogue_tests {
             healthy("d", "n4"),
             healthy("e", "n5"),
         ];
-        let v1 = t.update(Some(&tick1), &no_reaps(), 1000.0);
+        let v1 = t.update(Some(&tick1), &no_reaps(), &all_nodes(), 1000.0);
         assert!(
             matches!(v1, WedgeVerdict::NodeWedged(..)),
             "2/5 is not systemic: {v1:?}"
         );
         // tick 2: only n3 reports; n1/n2 evidence retained in-window.
-        match t.update(Some(&[healthy("c", "n3")]), &no_reaps(), 1010.0) {
+        match t.update(
+            Some(&[healthy("c", "n3")]),
+            &no_reaps(),
+            &all_nodes(),
+            1010.0,
+        ) {
             WedgeVerdict::Systemic { affected, of, .. } => assert!(
                 affected <= of,
                 "incommensurable systemic verdict: affected={affected} of={of}"
@@ -1045,6 +1200,7 @@ mod population_and_epilogue_tests {
         let v = t.update(
             Some(&[expired("a1", "n1"), expired("a2", "n1"), healthy("c", "n3")]),
             &no_reaps(),
+            &all_nodes(),
             1000.0,
         );
         assert!(matches!(v, WedgeVerdict::NodeWedged(ref n, _) if n == &vec!["n1".to_string()]));
@@ -1055,7 +1211,7 @@ mod population_and_epilogue_tests {
         // window expired).
         let reaped: std::collections::BTreeSet<String> =
             std::iter::once("n1".to_string()).collect();
-        match t.update(Some(&[healthy("c", "n3")]), &reaped, 1010.0) {
+        match t.update(Some(&[healthy("c", "n3")]), &reaped, &all_nodes(), 1010.0) {
             WedgeVerdict::NodeWedged(nodes, _) => assert!(
                 nodes.is_empty(),
                 "reaped node still fed to the Dead arm from stale evidence: {nodes:?}"
@@ -1080,6 +1236,7 @@ mod population_and_epilogue_tests {
                 healthy("e", "n4"),
             ]),
             &no_reaps(),
+            &all_nodes(),
             1000.0,
         );
         assert!(matches!(v, WedgeVerdict::NodeWedged(ref n, _) if n == &vec!["n1".to_string()]));
@@ -1093,7 +1250,7 @@ mod population_and_epilogue_tests {
             })
             .collect();
         assert!(matches!(
-            t.update(Some(&view), &no_reaps(), 1010.0),
+            t.update(Some(&view), &no_reaps(), &all_nodes(), 1010.0),
             WedgeVerdict::Systemic { .. }
         ));
         // After the episode the marked set must have been re-derived -
@@ -1112,6 +1269,11 @@ mod population_and_epilogue_tests {
 mod verdict_confinement_tests {
     use super::*;
 
+    /// The registered NodeClaim fleet for a tick (backing node names).
+    fn fleet(nodes: &[&str]) -> HashSet<String> {
+        nodes.iter().map(|s| s.to_string()).collect()
+    }
+
     /// bug_151 (recorded red: pre-fix `update(None)` returned
     /// `NodeWedged([])` minted directly in the None arm — a verdict
     /// produced OUTSIDE the sealed exit, conflating "unobserved" with
@@ -1122,7 +1284,12 @@ mod verdict_confinement_tests {
     #[test]
     fn unobserved_tick_yields_a_distinct_verdict() {
         let mut t = WedgeTracker::default();
-        let v = t.update(None, &std::collections::BTreeSet::new(), 1000.0);
+        let v = t.update(
+            None,
+            &std::collections::BTreeSet::new(),
+            &fleet(&[]),
+            1000.0,
+        );
         assert!(
             matches!(v, WedgeVerdict::Unobserved(..)),
             "an RPC-failed tick must produce the Unobserved verdict, got {v:?}"
@@ -1153,10 +1320,20 @@ mod verdict_confinement_tests {
                 ..Default::default()
             },
         ];
-        let v = t.update(Some(&view), &std::collections::BTreeSet::new(), 1000.0);
+        let v = t.update(
+            Some(&view),
+            &std::collections::BTreeSet::new(),
+            &fleet(&["n1"]),
+            1000.0,
+        );
         assert!(matches!(v, WedgeVerdict::NodeWedged(ref n, _) if n == &vec!["n1".to_string()]));
         assert!(t.marked.contains("n1"));
-        let v = t.update(None, &std::collections::BTreeSet::new(), 1010.0);
+        let v = t.update(
+            None,
+            &std::collections::BTreeSet::new(),
+            &fleet(&["n1"]),
+            1010.0,
+        );
         assert!(matches!(v, WedgeVerdict::Unobserved(..)));
         assert!(
             t.marked.contains("n1"),
@@ -1171,6 +1348,18 @@ mod episode_latch_tests {
     fn no_reaps() -> std::collections::BTreeSet<String> {
         std::collections::BTreeSet::new()
     }
+
+    /// The registered NodeClaim fleet for a tick (backing node names).
+    fn fleet(nodes: &[&str]) -> HashSet<String> {
+        nodes.iter().map(|s| s.to_string()).collect()
+    }
+    /// This module's full node universe — registered every tick.
+    fn all_nodes() -> HashSet<String> {
+        fleet(&[
+            "node-a", "node-b", "node-c", "node-0", "node-1", "node-2", "node-3",
+        ])
+    }
+
     fn expired_at(intent: &str, node: &str, over_secs: u64) -> OpenAttempt {
         OpenAttempt {
             intent_id: intent.into(),
@@ -1202,7 +1391,7 @@ mod episode_latch_tests {
             expired_at("c1", "node-c", 5),
         ];
         assert!(matches!(
-            t.update(Some(&view), &no_reaps(), 10_000.0),
+            t.update(Some(&view), &no_reaps(), &all_nodes(), 10_000.0),
             WedgeVerdict::Systemic {
                 affected: 2,
                 of: 3,
@@ -1214,6 +1403,7 @@ mod episode_latch_tests {
         let v = t.update(
             Some(&[expired_at("c-new", "node-c", 2)]),
             &no_reaps(),
+            &all_nodes(),
             10_010.0,
         );
         match v {
@@ -1244,7 +1434,7 @@ mod episode_latch_tests {
             })
             .collect();
         assert!(matches!(
-            t.update(Some(&storm), &no_reaps(), 10_000.0),
+            t.update(Some(&storm), &no_reaps(), &all_nodes(), 10_000.0),
             WedgeVerdict::Systemic { .. }
         ));
         // Heal in arbitrary order: only node-1's SAME two attempts are
@@ -1254,7 +1444,7 @@ mod episode_latch_tests {
             expired_at("d1x", "node-1", 15),
             expired_at("d1y", "node-1", 15),
         ];
-        let v = t.update(Some(&laggard), &no_reaps(), 10_010.0);
+        let v = t.update(Some(&laggard), &no_reaps(), &all_nodes(), 10_010.0);
         match v {
             WedgeVerdict::NodeWedged(nodes, _) => assert!(
                 nodes.is_empty(),

@@ -320,12 +320,17 @@ pub struct ReapInputs<'a, F: Fn(&str, Option<&str>, &[String]) -> bool> {
 /// (`max(max_consolidation_time, na)` when set, else `2 × na`). Each
 /// reap records a censored `IdleGapEvent`. `Api::delete` 404 is ignored
 /// (already-gone race with Karpenter); other errors warn + skip.
+/// Returns the backing-node names of the claims it deleted, so the
+/// caller can feed them to the wedge tracker's eviction stash exactly
+/// like `reap_unhealthy`'s reaps (merged_bug_017: BOTH reap paths are
+/// admission-eviction sources; idle reaps previously bypassed the
+/// stash, leaving the reaped node's still-open attempts admissible).
 pub async fn reap_idle<F: Fn(&str, Option<&str>, &[String]) -> bool>(
     nodeclaims: &Api<NodeClaim>,
     live: &[LiveNode],
     sketches: &mut CellSketches,
     inputs: &ReapInputs<'_, F>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<String>> {
     let ReapInputs {
         placeable,
         all_cells,
@@ -336,6 +341,7 @@ pub async fn reap_idle<F: Fn(&str, Option<&str>, &[String]) -> bool>(
     } = inputs;
     let now_secs = *now_secs;
     let reserved: HashSet<&str> = placeable.iter().map(|(_, n, _)| n.as_str()).collect();
+    let mut reaped_backing: Vec<String> = Vec::new();
 
     // Phase 0: per-cell context, computed once per cell. r37 bug_006:
     // iterate all_cells so a cell with no idle/registered/unreserved
@@ -424,6 +430,9 @@ pub async fn reap_idle<F: Fn(&str, Option<&str>, &[String]) -> bool>(
         match nodeclaims.delete(&n.name, &DeleteParams::default()).await {
             Ok(_) => {
                 debug!(name = %n.name, %cell, idle, threshold, "reaped idle NodeClaim");
+                if let Some(bn) = n.node_name.clone() {
+                    reaped_backing.push(bn);
+                }
                 metrics::counter!(
                     "rio_controller_nodeclaim_reaped_total",
                     "reason" => "idle",
@@ -443,7 +452,7 @@ pub async fn reap_idle<F: Fn(&str, Option<&str>, &[String]) -> bool>(
             Err(e) => warn!(name = %n.name, error = %e, "idle NodeClaim delete failed; skipping"),
         }
     }
-    Ok(())
+    Ok(reaped_backing)
 }
 
 /// Edge-detect idle→busy transitions and record them as uncensored

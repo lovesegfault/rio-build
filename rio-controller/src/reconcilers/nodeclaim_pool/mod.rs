@@ -1491,25 +1491,37 @@ impl NodeClaimPoolReconciler {
         // Only per-node verdicts may feed the Dead arm; a systemic
         // pattern marks nothing (the warn + suppression counter fired
         // inside the sealed single-exit verdict). Last tick's reaps are
-        // the REQUIRED eviction feed — a reaped node's evidence is dead.
+        // the REQUIRED eviction feed — a reaped node's evidence is dead
+        // — and the registered backing fleet is the admission/absence
+        // authority (merged_bug_017): a node that left the NodeClaim
+        // list is evicted exactly like a reaped one.
         let evictions = std::mem::take(&mut self.pending_wedge_evictions);
-        let dead_input = match self.wedge.update(open_attempts.as_deref(), &evictions, now) {
-            wedge::WedgeVerdict::NodeWedged(nodes, _) => nodes,
-            wedge::WedgeVerdict::Systemic { affected, of, .. } => {
-                debug!(
-                    affected,
-                    of, "wedge verdict systemic; Dead arm receives no wedge input this tick"
-                );
-                Vec::new()
-            }
-            // bug_151: the unobserved tick is its own verdict — no
-            // marking from stale data, no suppression accounting, and
-            // structurally distinct from "zero nodes wedged".
-            wedge::WedgeVerdict::Unobserved(_) => {
-                debug!("wedge view unobserved this tick; Dead arm receives no wedge input");
-                Vec::new()
-            }
-        };
+        let registered_fleet: std::collections::HashSet<String> = live
+            .iter()
+            .filter(|n| n.registered)
+            .filter_map(|n| n.node_name.clone())
+            .collect();
+        let dead_input =
+            match self
+                .wedge
+                .update(open_attempts.as_deref(), &evictions, &registered_fleet, now)
+            {
+                wedge::WedgeVerdict::NodeWedged(nodes, _) => nodes,
+                wedge::WedgeVerdict::Systemic { affected, of, .. } => {
+                    debug!(
+                        affected,
+                        of, "wedge verdict systemic; Dead arm receives no wedge input this tick"
+                    );
+                    Vec::new()
+                }
+                // bug_151: the unobserved tick is its own verdict — no
+                // marking from stale data, no suppression accounting, and
+                // structurally distinct from "zero nodes wedged".
+                wedge::WedgeVerdict::Unobserved(_) => {
+                    debug!("wedge view unobserved this tick; Dead arm receives no wedge input");
+                    Vec::new()
+                }
+            };
 
         // Reap unhealthy/ICE BEFORE cover_deficit so cells that just
         // hit ICE this tick are masked in the same tick's cover (don't
@@ -1581,7 +1593,7 @@ impl NodeClaimPoolReconciler {
             live.iter().filter_map(|n| n.cell.clone()),
             &prev_extras_for_reap,
         );
-        consolidate::reap_idle(
+        let idle_reaped = consolidate::reap_idle(
             &self.nodeclaims,
             &live,
             &mut self.sketches,
@@ -1598,6 +1610,9 @@ impl NodeClaimPoolReconciler {
             },
         )
         .await?;
+        // merged_bug_017: idle reaps are eviction sources too — both
+        // reap paths feed the wedge stash (consumed next tick).
+        self.pending_wedge_evictions.extend(idle_reaped);
 
         if !self.reload_pending() {
             self.sketches.persist(&self.pg).await?;
@@ -1647,7 +1662,7 @@ impl NodeClaimPoolReconciler {
             live.iter().filter_map(|n| n.cell.clone()),
             &self.prev_extra_cells,
         );
-        consolidate::reap_idle(
+        let idle_reaped = consolidate::reap_idle(
             &self.nodeclaims,
             &live,
             &mut self.sketches,
@@ -1664,6 +1679,9 @@ impl NodeClaimPoolReconciler {
             },
         )
         .await?;
+        // merged_bug_017: idle reaps are eviction sources too — both
+        // reap paths feed the wedge stash (consumed next tick).
+        self.pending_wedge_evictions.extend(idle_reaped);
         // No wedge evidence without the scheduler (the open-attempt
         // view is unreadable); local
         // ICE-timeout detection still runs on `live`. bug_082 sibling:
