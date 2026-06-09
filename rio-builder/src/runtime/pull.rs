@@ -613,12 +613,63 @@ enum ConfirmRegime {
     /// [`IDLE_CONFIRM_ATTEMPTS`] pulls) so leader churn cannot
     /// convert a charge-free idle exit into a Failed Job. A SIGTERM
     /// during the pacing collapses the remaining budget to one final
-    /// attempt (the shutdown semantics take over).
+    /// attempt (the shutdown semantics take over) — which also keeps
+    /// the 600 s Idle REPORT budget safe under a late SIGTERM:
+    /// `report_until_acked` collapses to the single bounded SIGTERM
+    /// attempt the moment the token fires.
     Idle,
     /// SIGTERM: exactly ONE confirm pull bounded by
     /// `SIGTERM_FINAL_ATTEMPT` — the grace window is burning.
     Shutdown,
 }
+
+/// ALL phase budgets of the maybe-minted resolution protocol, as data
+/// per regime (bug_068): no phase inside the protocol references a
+/// raw grace/budget constant — a third regime or a third phase forces
+/// an exhaustive-match budget decision at compile time.
+struct ConfirmBudgets {
+    /// Confirm pulls the regime may spend (first + retries), paced by
+    /// [`RETRY_ENVELOPE`].
+    confirm_attempts: u32,
+    /// The budget for pushing the synthesized `Cancelled` report
+    /// through [`report_until_acked`] when the confirm answers
+    /// `Assignment`.
+    report_budget: Duration,
+}
+
+impl ConfirmRegime {
+    /// The regime's total budget table (bug_068: the pre-fix
+    /// resolution parameterized only the confirm attempt count and
+    /// hardcoded the SIGTERM report slice for BOTH regimes, so a
+    /// healthy idle exit's report died inside exactly the leader
+    /// churn that set its maybe-minted latch — rio-lease's
+    /// `STEAL_AFTER` alone exceeds the 15 s slice).
+    const fn budgets(self) -> ConfirmBudgets {
+        match self {
+            // Healthy pod, no deadline pressure: full attempt count,
+            // the same report patience a finished build gets.
+            ConfirmRegime::Idle => ConfirmBudgets {
+                confirm_attempts: IDLE_CONFIRM_ATTEMPTS,
+                report_budget: REPORT_RETRY_BUDGET,
+            },
+            // The grace window is burning: one confirm pull, the
+            // reserved report slice (see the grace-partition asserts
+            // at the top of the file).
+            ConfirmRegime::Shutdown => ConfirmBudgets {
+                confirm_attempts: 1,
+                report_budget: PULL_GRACE.report(),
+            },
+        }
+    }
+}
+
+// bug_068: the Shutdown row IS the grace partition — tying it to
+// PULL_GRACE.report() keeps the merged_bug_270/bug_377 asserts above
+// (`report slice covers the SIGTERM final attempt`, `confirm + report
+// fit inside termination grace`) sound for the regime table.
+const _: () = assert!(
+    ConfirmRegime::Shutdown.budgets().report_budget.as_secs() == PULL_GRACE.report().as_secs()
+);
 
 /// Confirm pulls the Idle regime may spend (first + retries). The
 /// envelope pacing between them is `RETRY_ENVELOPE` — the same curve
@@ -654,10 +705,12 @@ async fn resolve_maybe_minted<T: PullTransport>(
     shutdown: &rio_common::signal::Token,
     regime: ConfirmRegime,
 ) -> bool {
-    let budget = match regime {
-        ConfirmRegime::Idle => IDLE_CONFIRM_ATTEMPTS,
-        ConfirmRegime::Shutdown => 1,
-    };
+    // bug_068: the resolution protocol consumes ONLY the regime's
+    // budget table — no raw grace/budget const appears in the body.
+    // (`SIGTERM_FINAL_ATTEMPT` below is the shared per-RPC unary
+    // timeout, not a phase budget — considered and kept as-is.)
+    let budgets = regime.budgets();
+    let budget = budgets.confirm_attempts;
     let mut attempt: u32 = 0;
     let resp = loop {
         attempt += 1;
@@ -717,7 +770,14 @@ async fn resolve_maybe_minted<T: PullTransport>(
                 assignment_token: a.assignment_token.clone(),
                 ..Default::default()
             };
-            report_until_acked(transport, &a.exec_id, report, PULL_GRACE.report(), shutdown).await
+            report_until_acked(
+                transport,
+                &a.exec_id,
+                report,
+                budgets.report_budget,
+                shutdown,
+            )
+            .await
         }
         None => {
             // Version skew, not a transient: the RPC was ANSWERED with
@@ -1382,6 +1442,41 @@ mod tests {
              transient confirm blip"
         );
         assert_eq!((t.pull_calls, t.report_calls), (2, 0));
+    }
+
+    /// bug_068: the Idle regime's Assignment arm pushes the
+    /// synthesized Cancelled report through the regime's OWN report
+    /// budget — the healthy 600 s `REPORT_RETRY_BUDGET`, not the
+    /// burning-grace SIGTERM slice (15 s). The trigger is exactly the
+    /// leader churn that set the maybe_minted latch: rio-lease's
+    /// `STEAL_AFTER` alone exceeds 15 s, so the pre-fix Idle pod's
+    /// report died inside the failover it was idling through →
+    /// `IdleExit{maybe_minted:true}` bailed nonzero → Failed Job →
+    /// establishment-sweep charge, violating the Idle regime's own
+    /// "leader churn cannot convert a charge-free idle exit into a
+    /// Failed Job" guarantee.
+    ///
+    /// Ten unavailable answers ride the retry envelope (nominal 181 s
+    /// of virtual pacing — full jitter draws below 15 s across ten
+    /// delays are practically impossible, so the pre-fix budget
+    /// expires deterministically) before the ack lands; the healthy
+    /// budget never expires (jittered sum ≤ 181 s < 600 s).
+    // r[verify builder.pull.exit-codes+1]
+    #[tokio::test(start_paused = true)]
+    async fn idle_confirm_assignment_report_rides_the_full_report_budget() {
+        let shutdown = token(); // NOT fired: idle exit, healthy pod.
+        let mut reports: Vec<Result<(), tonic::Status>> = (0..10)
+            .map(|i| Err(tonic::Status::unavailable(format!("leader churn {i}"))))
+            .collect();
+        reports.push(Ok(()));
+        let mut t = ScriptedTransport::new(vec![Ok(assignment_resp("exec-idle"))], reports);
+        assert!(
+            resolve_maybe_minted(&mut t, "i", "tok", &shutdown, ConfirmRegime::Idle).await,
+            "a healthy idle-exiting pod's synthesized Cancelled report must ride the \
+             full healthy report budget across leader churn (pre-fix: the hardcoded \
+             15 s SIGTERM slice expired mid-churn and the pod exited nonzero)"
+        );
+        assert_eq!((t.pull_calls, t.report_calls), (1, 11));
     }
 
     /// resolve_shutdown: confirm answers map to the law — NotYetReady →
