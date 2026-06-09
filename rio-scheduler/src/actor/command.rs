@@ -15,12 +15,15 @@ use crate::state::{BuildOptions, DrvHash, ExecutorId, PriorityClass};
 use super::handle::DebugDerivationInfo;
 
 /// Why an `AckSpawnedIntents` payload was NOT applied
-/// (merged_bug_005 — ack means applied under leadership). Mapped to a
-/// gRPC error by the admin layer; the controller's commit-on-Ack
-/// buffer survives an erring Ack and redelivers, which is idempotent
-/// on every plane (clears are removes, observed types upsert, marks
-/// refresh-not-step).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// (merged_bug_005 — ack means applied under leadership; bug_094 —
+/// validate-then-commit: every refusal is computed by
+/// `AckApplyPlan::validate` BEFORE the first state mutation, so an
+/// erring Ack means NO plane landed). Mapped to a gRPC error by the
+/// admin layer; the controller's commit-on-Ack buffer survives an
+/// erring Ack and redelivers the whole buffer — safe, because an
+/// erring Ack applied nothing.
+// r[impl sched.sla.ack-validate-then-commit]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AckApplyError {
     /// Deposed between the gRPC-layer leader check and the actor
     /// drain (`r[sched.lease.standby-drops-writes+3]`
@@ -32,10 +35,57 @@ pub enum AckApplyError {
     /// The observed-instance-types plane arrived while the cost
     /// table's lease-acquire edge-reload gate was still closed
     /// (acquire→reload window): applying would land on the pre-reload
-    /// table and be clobbered. The cell planes WERE applied
-    /// (idempotent on redelivery); the typed refusal makes the
+    /// table and be clobbered. NOTHING was applied — the gate is
+    /// validated before the first mutation (merged_bug_008: pre-fix
+    /// the cell planes were applied first, so every gate-closed
+    /// redelivery re-applied them); the typed refusal makes the
     /// controller retry the whole buffer until the gate opens.
     CostGateClosed,
+    /// A plane entry failed the strict shared-grammar decode
+    /// (`rio_common::cell_wire`). The WHOLE request is refused before
+    /// any mutation — pre-fix the entry was silently dropped while
+    /// the Ack answered Ok, and the controller then destroyed its
+    /// consume-once buffer on Ack-Ok ("the ONLY clear"). The refusal
+    /// is a loud producer-skew signal: the controller warns and
+    /// redelivers its retained buffer.
+    PlaneEntryUndecodable {
+        plane: AckPlane,
+        /// The offending wire entry (for `unfulfillable_cells` /
+        /// `registered_cells` / `observed_instance_types[].cell`, the
+        /// whole string; for the arming plane, the capacity value).
+        entry: String,
+    },
+}
+
+/// Closed alphabet of `AckSpawnedIntentsRequest` evidence planes —
+/// the `plane` axis of [`AckApplyError::PlaneEntryUndecodable`]. A
+/// new wire plane extends this enum, and the exhaustive matches at
+/// the Status mapping (admin) and [`Self::wire_field`] stop
+/// compiling until it is named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckPlane {
+    /// `registered_cells` (wire field 3) — ICE-clear cell events.
+    RegisteredCells,
+    /// `unfulfillable_cells` (wire field 2) — ICE-mark cell events.
+    UnfulfillableCells,
+    /// `observed_instance_types[].cell` (wire field 4) — cost-table
+    /// observations.
+    ObservedTypes,
+    /// `spawned[].node_affinity` capacity requirements (wire field 1)
+    /// — the arm-on-ack echo.
+    SpawnedArming,
+}
+
+impl AckPlane {
+    /// Wire-field name for refusal messages (gRPC Status detail).
+    pub fn wire_field(self) -> &'static str {
+        match self {
+            Self::RegisteredCells => "registered_cells",
+            Self::UnfulfillableCells => "unfulfillable_cells",
+            Self::ObservedTypes => "observed_instance_types",
+            Self::SpawnedArming => "spawned.node_affinity",
+        }
+    }
 }
 
 /// Request payload for [`ActorCommand::MergeDag`].

@@ -915,16 +915,20 @@ impl DagActor {
     /// success signal is the first successful pull — see the mint's
     /// ICE-clear in `actor/pull.rs`.
     // r[impl sched.sla.hw-class.ice-mask]
-    /// merged_bug_005: returns the apply outcome the drain relays to
-    /// the gRPC layer — `Ok` only when EVERY plane landed. The one
-    /// partial arm (observed types vs the closed cost gate) errs
-    /// `CostGateClosed` AFTER applying the other planes: redelivery
-    /// is idempotent plane-wise (clears are removes, marks
-    /// refresh-not-step, snapshot rebuilds, observed types upsert),
-    /// so the controller retrying the whole buffer until the gate
-    /// opens is lossless — pre-fix the plane was silently dropped and
-    /// the consume-once observations died in the acquire→reload
-    /// window.
+    /// merged_bug_005 + bug_094: returns the apply outcome the drain
+    /// relays to the gRPC layer — `Ok` only when EVERY plane landed,
+    /// and `Err` only when NO plane landed (validate-then-commit).
+    /// Every refusal — undecodable plane entry, closed cost gate — is
+    /// computed by [`AckApplyPlan::validate`] before the first state
+    /// mutation; [`AckApplyPlan::commit`] is infallible, so
+    /// error-after-mutate is unrepresentable by signature. The
+    /// controller's commit-on-Ack buffer survives an erring Ack and
+    /// redelivers the WHOLE buffer — safe, because an erring Ack
+    /// applied nothing. Pre-fix the observed-types arm erred
+    /// `CostGateClosed` AFTER applying the cell planes, and
+    /// unparseable entries were silently dropped while the Ack
+    /// answered Ok — destroying the controller's consume-once
+    /// evidence ("the ONLY clear" is Ack-Ok).
     pub(super) fn handle_ack_spawned_intents(
         &mut self,
         spawned: &[rio_proto::types::SpawnIntent],
@@ -934,93 +938,264 @@ impl DagActor {
         bound_intents: &[rio_proto::types::BoundIntent],
         binding_snapshot: Option<&[rio_proto::types::BoundIntent]>,
     ) -> Result<(), super::command::AckApplyError> {
-        // Kube-authoritative `intent_id (== drv_hash) → (spec.nodeName,
-        // tenant)`. The nodeclaim_pool reconciler ships the FULL set
-        // every tick as an EXPLICIT snapshot (`binding_snapshot`,
-        // C2/285): `Some(set)` — even empty — wholesale-rebuilds
-        // (present-and-empty correctly CLEARS the map: the
-        // scale-to-zero tick has zero bound pods and says so); `None`
-        // = "this Ack carries no snapshot" (per-pool reconcilers, and
-        // pre-upgrade controllers on the legacy field-5 arm below) =
-        // no-op (mb_012/⛔2: an unconditional `mem::take` here would
-        // discard every captured `tenant` on every per-pool
-        // reconcile). The legacy arm keeps the OLD semantics —
-        // non-empty `bound_intents` rebuilds — for rolling skew (R9:
-        // read-side back-compat only, never dual-written).
-        //
-        // `tenant` is captured from the DAG when present, else carried
-        // forward from the existing entry — once DAG-absent the last
-        // DAG-present value sticks. A fall-through executor's
-        // spawn-drv leaves the DAG but the Ack keeps shipping its
-        // `intent_id` while the pod lives.
+        let plan = AckApplyPlan::validate(
+            spawned,
+            unfulfillable_cells,
+            registered_cells,
+            observed_instance_types,
+            bound_intents,
+            binding_snapshot,
+            self.cost_was_leader
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )?;
+        plan.commit(self);
+        Ok(())
+    }
+}
+
+/// One validated `AckSpawnedIntents` application (bug_094 —
+/// validate-then-commit). [`Self::validate`] computes EVERY refusal
+/// over the RAW wire planes; [`Self::commit`] applies the typed plan
+/// and is infallible by signature. The wire types stop here:
+/// `commit` receives only decoded cells, hashes, and rows, so a
+/// silent per-plane parse skip — or any new refusal arm landing
+/// after a mutation — is unwritable at this seam.
+///
+/// Banner-(a) witness: `commit` exhaustively destructures the plan
+/// (`let AckApplyPlan { .. } = self` with every field named), so a
+/// wire plane added to `validate` without a `commit` handler does
+/// not compile.
+pub(super) struct AckApplyPlan {
+    /// 124(d) spawn-ack witnesses (every spawned `intent_id`).
+    acked_spawned: Vec<DrvHash>,
+    /// Kube-authoritative binding rows; `None` = "this Ack carries no
+    /// snapshot" (per-pool reconcilers; the legacy field-5 arm).
+    binding: Option<Vec<PlannedBinding>>,
+    /// Arm-on-ack cell sets recovered from the spawned echo.
+    armed: Vec<(DrvHash, smallvec::SmallVec<[crate::sla::config::Cell; 4]>)>,
+    /// ICE-clear cell events (`registered_cells`, wire field 3).
+    clears: Vec<crate::sla::config::Cell>,
+    /// ICE-mark cell events (`unfulfillable_cells`, wire field 2).
+    marks: Vec<crate::sla::config::Cell>,
+    /// Cost-table observations (decoded `observed_instance_types`).
+    observed: Vec<(crate::sla::config::Cell, String, u32, u64)>,
+}
+
+/// One decoded `BoundIntent` row — the typed remnant of the wire
+/// type that crosses into [`AckApplyPlan::commit`].
+struct PlannedBinding {
+    intent: DrvHash,
+    node: String,
+    /// Wire `0` = absent (pre-upgrade controller): the mint falls
+    /// back to its re-solve alone.
+    deadline_secs: Option<u32>,
+}
+
+impl AckApplyPlan {
+    // r[impl sched.sla.ack-validate-then-commit]
+    /// Decode and refuse BEFORE any mutation exists. Planes validate
+    /// in wire-field order (`spawned` arming = 1,
+    /// `unfulfillable_cells` = 2, `registered_cells` = 3,
+    /// `observed_instance_types` = 4), then the cost gate; the first
+    /// failure refuses the WHOLE request. Whole-request refusal is
+    /// safe controller-side: the buffer is retained on Ack-Err and
+    /// buffered marks keep masking `cover_deficit` locally until
+    /// acked — the refusal is a loud, logged skew signal where the
+    /// pre-fix behavior was silent evidence destruction.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn validate(
+        spawned: &[rio_proto::types::SpawnIntent],
+        unfulfillable_cells: &[String],
+        registered_cells: &[String],
+        observed_instance_types: &[rio_proto::types::ObservedInstanceType],
+        bound_intents: &[rio_proto::types::BoundIntent],
+        binding_snapshot: Option<&[rio_proto::types::BoundIntent]>,
+        cost_gate_open: bool,
+    ) -> Result<Self, super::command::AckApplyError> {
+        use super::command::{AckApplyError, AckPlane};
         // 124(d): record the spawn-ack witness for EVERY spawned
-        // intent — a NoEligibleSource verdict landing within the defer
-        // window raced its own spawn. Opportunistic prune keeps the
-        // map bounded (entries older than 2× the window are dead: the
-        // defer read only consults the window).
-        if !spawned.is_empty() {
-            let now = crate::db::attempts::epoch_now();
-            for i in spawned {
-                self.acked_spawned
-                    .insert(DrvHash::from(i.intent_id.as_str()), now);
+        // intent — a NoEligibleSource verdict landing within the
+        // defer window raced its own spawn.
+        let acked_spawned: Vec<DrvHash> = spawned
+            .iter()
+            .map(|i| DrvHash::from(i.intent_id.as_str()))
+            .collect();
+        // Arm-on-ack: recover the FULL `cells` vec from the parallel
+        // `(hw_class_names, node_affinity)` wire form
+        // (`cells_to_selector_terms` emits one term per cell). `cap`
+        // is the `karpenter.sh/capacity-type` requirement's value.
+        // hw-agnostic intents (empty `node_affinity`) skip — no cell
+        // to arm; a term without the capacity requirement skips its
+        // pair. A capacity VALUE outside the shared alphabet is a
+        // typed refusal — pre-fix `filter_map` silently dropped the
+        // pair, shrinking the armed set the §13a single-cell clear
+        // gate counts. Recording only `cells[0]` (bug_030) is the
+        // §1-of-N approximation: the pod's affinity is OR-of-A', so
+        // the first-pull consumer needs the whole set.
+        let mut armed: Vec<(DrvHash, smallvec::SmallVec<[crate::sla::config::Cell; 4]>)> =
+            Vec::new();
+        for i in spawned {
+            let mut cells: smallvec::SmallVec<[crate::sla::config::Cell; 4]> =
+                smallvec::SmallVec::new();
+            for (h, t) in i.hw_class_names.iter().zip(&i.node_affinity) {
+                let Some(req) = t
+                    .match_expressions
+                    .iter()
+                    .find(|r| r.key == "karpenter.sh/capacity-type")
+                else {
+                    continue;
+                };
+                let Some(cap) = req.values.first() else {
+                    continue;
+                };
+                let Some(cap) = crate::sla::config::CapacityType::parse(cap) else {
+                    return Err(AckApplyError::PlaneEntryUndecodable {
+                        plane: AckPlane::SpawnedArming,
+                        entry: cap.clone(),
+                    });
+                };
+                cells.push((h.clone(), cap));
             }
-            self.acked_spawned
-                .retain(|_, t| now - *t < 2.0 * crate::actor::pull::ACKED_SPAWNED_DEFER_SECS);
+            if !cells.is_empty() {
+                armed.push((DrvHash::from(i.intent_id.as_str()), cells));
+            }
+        }
+        let marks = Self::decode_cell_plane(unfulfillable_cells, AckPlane::UnfulfillableCells)?;
+        let clears = Self::decode_cell_plane(registered_cells, AckPlane::RegisteredCells)?;
+        let mut observed = Vec::with_capacity(observed_instance_types.len());
+        for o in observed_instance_types {
+            match rio_common::cell_wire::decode_cell_event(&o.cell) {
+                Ok(p) => observed.push((
+                    (p.hw_class, p.capacity.into()),
+                    o.instance_type.clone(),
+                    o.cores,
+                    o.mem_bytes,
+                )),
+                Err(_) => {
+                    return Err(AckApplyError::PlaneEntryUndecodable {
+                        plane: AckPlane::ObservedTypes,
+                        entry: o.cell.clone(),
+                    });
+                }
+            }
         }
         // r[impl sched.snapshot.binding-presence]
-        let snapshot: Option<&[rio_proto::types::BoundIntent]> = match binding_snapshot {
+        // Plane selection: the nodeclaim_pool reconciler ships the
+        // FULL set every tick as an EXPLICIT snapshot
+        // (`binding_snapshot`, C2/285): `Some(set)` — even empty —
+        // wholesale-rebuilds (present-and-empty correctly CLEARS the
+        // map: the scale-to-zero tick has zero bound pods and says
+        // so); `None` = "this Ack carries no snapshot" (per-pool
+        // reconcilers, and pre-upgrade controllers on the legacy
+        // field-5 arm) = no-op (mb_012/⛔2: an unconditional
+        // `mem::take` would discard every captured `tenant` on every
+        // per-pool reconcile). The legacy arm keeps the OLD semantics
+        // — non-empty `bound_intents` rebuilds — for rolling skew
+        // (R9: read-side back-compat only, never dual-written).
+        let binding = match binding_snapshot {
             Some(snap) => Some(snap),
             None if !bound_intents.is_empty() => Some(bound_intents),
             None => None,
-        };
-        if let Some(snap) = snapshot {
-            let prev = std::mem::take(&mut self.authoritative_binding);
+        }
+        .map(|snap| {
+            snap.iter()
+                .map(|b| PlannedBinding {
+                    intent: DrvHash::from(b.intent_id.as_str()),
+                    node: b.node_name.clone(),
+                    deadline_secs: (b.deadline_secs > 0).then_some(b.deadline_secs),
+                })
+                .collect()
+        });
+        // The cost-table edge-reload gate, validated PRE-mutation
+        // (merged_bug_008's headline axis — pre-fix this refusal
+        // fired AFTER the cell planes were applied, so a gate-closed
+        // redelivery loop re-applied marks every ~10s tick).
+        if !observed.is_empty() && !cost_gate_open {
+            return Err(AckApplyError::CostGateClosed);
+        }
+        Ok(Self {
+            acked_spawned,
+            binding,
+            armed,
+            clears,
+            marks,
+            observed,
+        })
+    }
+
+    /// Strict decode of one string cell-event plane via the shared
+    /// grammar ([`rio_common::cell_wire`]). Any undecodable entry
+    /// refuses the plane's WHOLE request — there is no drop lane.
+    fn decode_cell_plane(
+        entries: &[String],
+        plane: super::command::AckPlane,
+    ) -> Result<Vec<crate::sla::config::Cell>, super::command::AckApplyError> {
+        entries
+            .iter()
+            .map(|s| match rio_common::cell_wire::decode_cell_event(s) {
+                Ok(p) => Ok((p.hw_class, p.capacity.into())),
+                Err(_) => Err(super::command::AckApplyError::PlaneEntryUndecodable {
+                    plane,
+                    entry: s.clone(),
+                }),
+            })
+            .collect()
+    }
+
+    // r[impl sched.sla.ack-validate-then-commit]
+    /// Apply the validated plan. Infallible by signature — every
+    /// refusal was computed in [`Self::validate`], so no arm here can
+    /// err after a sibling plane mutated. The destructure names every
+    /// field: a plane added to the plan without a commit handler is a
+    /// compile error, and `commit` has no access to the raw request
+    /// types (the wire stopped at `validate`).
+    pub(super) fn commit(self, actor: &mut DagActor) {
+        let AckApplyPlan {
+            acked_spawned,
+            binding,
+            armed,
+            clears,
+            marks,
+            observed,
+        } = self;
+        // 124(d): opportunistic prune keeps the map bounded (entries
+        // older than 2× the window are dead: the defer read only
+        // consults the window).
+        if !acked_spawned.is_empty() {
+            let now = crate::db::attempts::epoch_now();
+            for h in acked_spawned {
+                actor.acked_spawned.insert(h, now);
+            }
+            actor
+                .acked_spawned
+                .retain(|_, t| now - *t < 2.0 * crate::actor::pull::ACKED_SPAWNED_DEFER_SECS);
+        }
+        // Kube-authoritative `intent_id (== drv_hash) →
+        // (spec.nodeName, tenant)`. `tenant` is captured from the DAG
+        // when present, else carried forward from the existing entry
+        // — once DAG-absent the last DAG-present value sticks. A
+        // fall-through executor's spawn-drv leaves the DAG but the
+        // Ack keeps shipping its `intent_id` while the pod lives.
+        if let Some(snap) = binding {
+            let prev = std::mem::take(&mut actor.authoritative_binding);
             for b in snap {
-                let h: DrvHash = b.intent_id.as_str().into();
-                let tenant = self
+                let tenant = actor
                     .dag
-                    .node(&h)
-                    .and_then(|n| n.attributed_tenant(&self.builds))
-                    .or_else(|| prev.get(&h).and_then(|p| p.tenant));
-                self.authoritative_binding.insert(
-                    h,
+                    .node(&b.intent)
+                    .and_then(|n| n.attributed_tenant(&actor.builds))
+                    .or_else(|| prev.get(&b.intent).and_then(|p| p.tenant));
+                actor.authoritative_binding.insert(
+                    b.intent,
                     AuthBinding {
-                        node: b.node_name.clone(),
+                        node: b.node,
                         tenant,
-                        // Wire `0` = absent (pre-upgrade controller):
-                        // the mint falls back to its re-solve alone.
-                        deadline_secs: (b.deadline_secs > 0).then_some(b.deadline_secs),
+                        deadline_secs: b.deadline_secs,
                     },
                 );
             }
         }
-        // Arm-on-ack: recover the FULL `cells` vec from the parallel
-        // `(hw_class_names, node_affinity)` wire form
-        // (`cells_to_selector_terms` emits one term per cell). `cap` is
-        // the `karpenter.sh/capacity-type` requirement's value.
-        // hw-agnostic intents (empty `node_affinity`) skip — no cell
-        // to arm. Recording only `cells[0]` (bug_030) is the §1-of-N
-        // approximation: the pod's affinity is OR-of-A', so the
-        // first-pull consumer needs the whole set.
-        for i in spawned {
-            let cells: smallvec::SmallVec<[crate::sla::config::Cell; 4]> = i
-                .hw_class_names
-                .iter()
-                .zip(&i.node_affinity)
-                .filter_map(|(h, t)| {
-                    let cap = t
-                        .match_expressions
-                        .iter()
-                        .find(|r| r.key == "karpenter.sh/capacity-type")?
-                        .values
-                        .first()?;
-                    Some((h.clone(), crate::sla::config::CapacityType::parse(cap)?))
-                })
-                .collect();
-            if !cells.is_empty() {
-                self.dispatched_cells
-                    .insert(i.intent_id.as_str().into(), cells);
-            }
+        for (id, cells) in armed {
+            actor.dispatched_cells.insert(id, cells);
         }
         // merged_bug_005: the controller's evidence buffer enforces
         // per-cell latest-wins supersession, so one request never
@@ -1029,55 +1204,29 @@ impl DagActor {
         // buffered mark over a strictly newer registration). Kept as
         // written for pre-supersession controllers during rolling
         // skew: mark-wins is the conservative tie-break.
-        for s in registered_cells {
-            if let Some(cell) = crate::sla::config::parse_cell(s) {
-                self.ice.clear(&cell);
-            }
+        for cell in clears {
+            actor.ice.clear(&cell);
         }
-        for s in unfulfillable_cells {
-            if let Some(cell) = crate::sla::config::parse_cell(s) {
-                self.ice.mark(&cell);
-            }
+        for cell in marks {
+            actor.ice.mark(&cell);
         }
         // Third writer to `cost_table` (after `fold_spot_poll`→price
-        // and `interrupt_housekeeping`→λ/node_count). Gate on the
-        // shared edge-reload latch like `spot_price_poller` does:
-        // before `interrupt_housekeeping` has run the lease-acquire
+        // and `interrupt_housekeeping`→λ/node_count). The shared
+        // edge-reload latch was validated OPEN pre-mutation (the
+        // actor is single-threaded between validate and commit, so
+        // the gate cannot close in between); before
+        // `interrupt_housekeeping` has run the lease-acquire
         // `*cost.write() = CostTable::load(...)`, writes here would
-        // land on the pre-reload table and be clobbered. The
-        // controller's `observe_registered` is edge-detected +
-        // recency-gated, so a clobbered observation isn't re-sent
-        // until another NodeClaim of that type registers.
+        // land on the pre-reload table and be clobbered.
         // `handle_leader_acquired` notifies `interrupt_housekeeping`
-        // so this gate is open within ~0s of lease win, not ≤600s.
-        if !observed_instance_types.is_empty() {
-            if self
-                .cost_was_leader
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
-                self.cost_table.write().observe_instance_types(
-                    observed_instance_types.iter().filter_map(|o| {
-                        Some((
-                            crate::sla::config::parse_cell(&o.cell)?,
-                            o.instance_type.clone(),
-                            o.cores,
-                            o.mem_bytes,
-                        ))
-                    }),
-                );
-            } else {
-                // merged_bug_005: the typed refusal replaces the
-                // silent drop — the gRPC layer errs the Ack and the
-                // controller redelivers until the edge reload opens
-                // the gate (~0s after lease win via the
-                // handle_leader_acquired notify; bounded by one
-                // interrupt_housekeeping cycle otherwise).
-                return Err(super::command::AckApplyError::CostGateClosed);
-            }
+        // so the gate is open within ~0s of lease win, not ≤600s.
+        if !observed.is_empty() {
+            actor.cost_table.write().observe_instance_types(observed);
         }
-        Ok(())
     }
+}
 
+impl DagActor {
     /// One snapshot of the **shared solve inputs** + the derived
     /// `inputs_gen`. Both consumers — [`Self::compute_spawn_intents`]
     /// and `dispatch_ready` — call this ONCE at the top of their pass

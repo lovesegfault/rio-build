@@ -725,18 +725,34 @@ async fn ack_observed_instance_types_gated_on_cost_was_leader() {
     // Pre-reload (was_leader=false): the write must not land, and
     // merged_bug_005 turned the silent drop into the typed refusal —
     // the gRPC layer errs the Ack so the controller redelivers
-    // instead of wiping its consume-once buffer.
+    // instead of wiping its consume-once buffer. merged_bug_008: the
+    // refusal is computed BEFORE any plane applies — a mark riding
+    // the same refused request must NOT land (pre-fix it did, so
+    // every ~10s gate-closed redelivery re-applied the cell planes).
     actor
         .cost_was_leader
         .store(false, std::sync::atomic::Ordering::Relaxed);
     assert_eq!(
-        actor.handle_ack_spawned_intents(&[], &[], &[], &observed, &[], None),
+        actor.handle_ack_spawned_intents(
+            &[],
+            &["mid-ebs-x86:spot".into()],
+            &[],
+            &observed,
+            &[],
+            None
+        ),
         Err(crate::actor::AckApplyError::CostGateClosed),
         "closed gate must be a typed refusal, not a silent drop"
     );
     assert!(
         actor.cost_table.read().menu(&spot).is_empty(),
         "observation must NOT land on pre-reload table"
+    );
+    assert_eq!(
+        actor.ice.step(&spot),
+        None,
+        "err implies NO plane landed — the mark must not apply before \
+         the gate refusal (validate-then-commit)"
     );
 
     // Post-reload (was_leader=true via interrupt_housekeeping's
@@ -748,6 +764,61 @@ async fn ack_observed_instance_types_gated_on_cost_was_leader() {
         .handle_ack_spawned_intents(&[], &[], &[], &observed, &[], None)
         .expect("open gate applies fully");
     assert_eq!(actor.cost_table.read().menu(&spot).len(), 1);
+}
+
+/// bug_094 red: an undecodable entry in ANY plane refuses the WHOLE
+/// request before any mutation. Pre-fix all three string planes
+/// folded unparseable entries into success (`if let Some(cell) =
+/// parse_cell(s)` with no else arm; `filter_map(... parse_cell ?)`)
+/// and the fn returned `Ok(())` against its own "Ok only when EVERY
+/// plane landed" contract — on Ack-Ok the controller destroys its
+/// consume-once buffer ("the ONLY clear"), so the dropped entry was
+/// unrecoverable. `left: Ok(()) ∧ clear applied ∧ mark silently gone`
+/// / `right: Err(PlaneEntryUndecodable{UnfulfillableCells, ..}) ∧ ice
+/// state byte-identical (zero mutations)`.
+// r[verify sched.sla.ack-validate-then-commit]
+#[tokio::test]
+async fn ack_undecodable_plane_entry_refuses_whole_request() {
+    use crate::sla::config::CapacityType;
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+
+    // A masked cell whose valid clear rides the same request as the
+    // undecodable mark entry.
+    let cell: crate::sla::config::Cell = ("intel-6".into(), CapacityType::Spot);
+    actor.ice.mark(&cell);
+    assert_eq!(actor.ice.step(&cell), Some(0), "precondition: masked");
+
+    // r13-allow(refusal-probe): "mid-ebs-x86:bogus" is deliberately a
+    // shape NO production constructor can emit — the controller's
+    // `Cell::Display` and the shared `encode_cell_event` only emit
+    // alphabet capacities. The test asserts the typed REFUSAL of the
+    // attack/skew shape, not a valid-shape behavior.
+    let bogus = "mid-ebs-x86:bogus".to_string();
+    let r = actor.handle_ack_spawned_intents(
+        &[],
+        std::slice::from_ref(&bogus),
+        &["intel-6:spot".into()],
+        &[],
+        &[],
+        None,
+    );
+    assert_eq!(
+        r,
+        Err(crate::actor::AckApplyError::PlaneEntryUndecodable {
+            plane: crate::actor::AckPlane::UnfulfillableCells,
+            entry: bogus,
+        }),
+        "undecodable plane entry must be a typed refusal naming plane + entry"
+    );
+    assert_eq!(
+        actor.ice.step(&cell),
+        Some(0),
+        "zero mutations: the valid clear in the refused request must \
+         NOT have applied (err implies no plane landed)"
+    );
+    assert!(actor.ice.is_masked(&cell), "ice state byte-identical");
 }
 
 /// **Ack records the FULL A'** (`r[sched.sla.hw-class.ice-mask]`): a

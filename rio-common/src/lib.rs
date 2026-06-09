@@ -7,6 +7,7 @@
 //! `*_TOKEN_HEADER` string constants in [`grpc`] remain here.
 
 pub mod backoff;
+pub mod cell_wire;
 pub mod clamped;
 pub mod classify;
 pub mod config;

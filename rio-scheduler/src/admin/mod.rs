@@ -734,17 +734,19 @@ impl AdminService for AdminServiceImpl {
     /// merged_bug_005 — ack means APPLIED UNDER LEADERSHIP, never
     /// enqueued: the reply oneshot answers after the actor's
     /// leader-gated apply, so "OK" here proves every evidence plane
-    /// landed. A deposed drain (`NotLeader`) or the observed-types
-    /// plane racing the cost-table edge reload (`CostGateClosed`)
-    /// errs the RPC instead — the controller's commit-on-Ack buffer
-    /// is retained and redelivered, which is idempotent on every
-    /// plane (clears are removes, observed types upsert, marks
-    /// refresh-not-step). Pre-fix the handler answered OK on
-    /// `send_unchecked` enqueue and the actor silently dropped the
-    /// payload when deposed — the controller then wiped consume-once
-    /// evidence that was never applied. `send_unchecked` (bypassing
-    /// backpressure) is still correct: the command is control-plane,
-    /// and a dropped command surfaces as a reply error, not silence.
+    /// landed. bug_094 — and the apply is validate-then-commit, so
+    /// every error here proves NO plane landed: a deposed drain
+    /// (`NotLeader`), the observed-types plane racing the cost-table
+    /// edge reload (`CostGateClosed`), or an undecodable plane entry
+    /// (`PlaneEntryUndecodable` — pre-fix a silent drop) errs the RPC
+    /// with nothing applied, and the controller's commit-on-Ack
+    /// buffer is retained and redelivered whole. Pre-fix the handler
+    /// answered OK on `send_unchecked` enqueue and the actor silently
+    /// dropped the payload when deposed — the controller then wiped
+    /// consume-once evidence that was never applied. `send_unchecked`
+    /// (bypassing backpressure) is still correct: the command is
+    /// control-plane, and a dropped command surfaces as a reply
+    /// error, not silence.
     #[instrument(skip(self, request), fields(rpc = "AckSpawnedIntents"))]
     async fn ack_spawned_intents(
         &self,
@@ -778,8 +780,15 @@ impl AdminService for AdminServiceImpl {
                 "not leader — evidence not applied; retry against the current leader",
             ),
             crate::actor::AckApplyError::CostGateClosed => Status::unavailable(
-                "cost table edge-reload pending — observed instance types not applied; retry",
+                "cost table edge-reload pending — no evidence plane applied; retry",
             ),
+            crate::actor::AckApplyError::PlaneEntryUndecodable { plane, entry } => {
+                Status::invalid_argument(format!(
+                    "undecodable {} entry {entry:?} — no evidence plane applied; \
+                     the producer is emitting outside the shared cell-wire grammar",
+                    plane.wire_field(),
+                ))
+            }
         })?;
         Ok(Response::new(()))
     }

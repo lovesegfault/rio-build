@@ -59,23 +59,38 @@ pub enum CapacityType {
 
 impl CapacityType {
     /// PG/helm wire string. Matches migration 059's
-    /// `CHECK (capacity_type IN ('spot','od'))`.
+    /// `CHECK (capacity_type IN ('spot','od'))`. Pinned to the shared
+    /// [`rio_common::cell_wire`] alphabet (bug_094: this vocabulary
+    /// was open-coded here AND in the scheduler's `sla/config.rs`
+    /// with only same-crate round-trip tests guarding agreement).
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Spot => "spot",
-            Self::OnDemand => "od",
-        }
+        rio_common::cell_wire::WireCapacity::from(self).wire_str()
     }
 
-    /// Inverse of [`as_str`](Self::as_str). Also accepts the
-    /// scheduler's `cell_label()` form (`"on-demand"`) and the bare
-    /// Karpenter label form so [`Cell::parse`] round-trips
-    /// `ice_masked_cells` from `GetSpawnIntents`.
+    /// Inverse of [`as_str`](Self::as_str). Total decode over the
+    /// shared alphabet — also accepts the scheduler's `cell_label()`
+    /// form (`"on-demand"`) and the bare Karpenter label form so
+    /// [`Cell::parse`] round-trips `ice_masked_cells` from
+    /// `GetSpawnIntents`.
     pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "spot" => Some(Self::Spot),
-            "od" | "on-demand" => Some(Self::OnDemand),
-            _ => None,
+        rio_common::cell_wire::WireCapacity::parse(s).map(Self::from)
+    }
+}
+
+impl From<CapacityType> for rio_common::cell_wire::WireCapacity {
+    fn from(c: CapacityType) -> Self {
+        match c {
+            CapacityType::Spot => Self::Spot,
+            CapacityType::OnDemand => Self::OnDemand,
+        }
+    }
+}
+
+impl From<rio_common::cell_wire::WireCapacity> for CapacityType {
+    fn from(c: rio_common::cell_wire::WireCapacity) -> Self {
+        match c {
+            rio_common::cell_wire::WireCapacity::Spot => Self::Spot,
+            rio_common::cell_wire::WireCapacity::OnDemand => Self::OnDemand,
         }
     }
 }
@@ -88,16 +103,29 @@ pub struct Cell(pub String, pub CapacityType);
 
 impl Cell {
     /// Parse the `"h:cap"` wire form used by helm `sla.leadTimeSeed`
-    /// keys and `GetSpawnIntentsResponse.ice_masked_cells`.
+    /// keys and `GetSpawnIntentsResponse.ice_masked_cells`. Pinned to
+    /// the shared [`rio_common::cell_wire`] decoder; epoch-suffixed
+    /// cell EVENTS (`"h:cap@epoch"`) are rejected — these lanes carry
+    /// keys, not evidence events, and pre-pin the codec already
+    /// rejected `'@'` strings (the capacity token failed to parse).
     pub fn parse(s: &str) -> Option<Self> {
-        let (h, cap) = s.rsplit_once(':')?;
-        Some(Self(h.to_string(), CapacityType::parse(cap)?))
+        let p = rio_common::cell_wire::decode_cell_event(s).ok()?;
+        if p.epoch.is_some() {
+            return None;
+        }
+        Some(Self(p.hw_class, p.capacity.into()))
     }
 }
 
 impl std::fmt::Display for Cell {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.0, self.1.as_str())
+        // Canonical epoch-less wire form ("h:od") via the shared
+        // encoder — byte-identical to the pre-pin emission.
+        f.write_str(&rio_common::cell_wire::encode_cell_event(
+            &self.0,
+            self.1.into(),
+            None,
+        ))
     }
 }
 
@@ -692,6 +720,38 @@ mod tests {
             Some(CapacityType::OnDemand)
         );
         assert_eq!(CapacityType::parse(""), None);
+    }
+
+    /// bug_094 pin: `as_str` must emit exactly the shared
+    /// [`rio_common::cell_wire`] wire tokens — the same strings
+    /// migration 059's frozen `CHECK (capacity_type IN
+    /// ('spot','od'))` admits (the .sql is checksum-frozen, so its
+    /// side can never move; `cell_wire` owns the live side). Pre-pin
+    /// this vocabulary was open-coded here and in the scheduler with
+    /// no cross-crate witness.
+    #[test]
+    fn capacity_vocabulary_pinned_to_cell_wire() {
+        use rio_common::cell_wire::{CAPACITY_OD, CAPACITY_SPOT, WireCapacity};
+        assert_eq!(CapacityType::Spot.as_str(), CAPACITY_SPOT);
+        assert_eq!(CapacityType::OnDemand.as_str(), CAPACITY_OD);
+        // Decode agreement across the whole shared alphabet: the
+        // controller accepts a token iff `cell_wire` does, and they
+        // agree on which capacity it names.
+        for (tok, want) in [
+            (CAPACITY_SPOT, CapacityType::Spot),
+            (CAPACITY_OD, CapacityType::OnDemand),
+            (
+                rio_common::cell_wire::CAPACITY_ON_DEMAND,
+                CapacityType::OnDemand,
+            ),
+        ] {
+            assert_eq!(CapacityType::parse(tok), Some(want), "token {tok:?}");
+            assert_eq!(
+                WireCapacity::parse(tok).map(CapacityType::from),
+                Some(want),
+                "token {tok:?} through the shared enum"
+            );
+        }
     }
 
     #[test]

@@ -203,32 +203,60 @@ impl CapacityType {
     pub const ALL: [Self; 2] = [Self::Spot, Self::Od];
 
     /// `karpenter.sh/capacity-type` label value (the string Karpenter
-    /// reads on `nodeSelectorTerms`).
+    /// reads on `nodeSelectorTerms`). Pinned to the shared
+    /// [`rio_common::cell_wire`] alphabet (bug_094: this vocabulary
+    /// was open-coded here AND in the controller's `sketch.rs` with
+    /// only same-crate round-trip tests guarding agreement).
     pub fn label(self) -> &'static str {
-        match self {
-            Self::Spot => "spot",
-            Self::Od => "on-demand",
-        }
+        rio_common::cell_wire::WireCapacity::from(self).karpenter_label()
     }
 
+    /// Total decode over the shared capacity alphabet
+    /// (`"spot"` / `"od"` / `"on-demand"` — [`rio_common::cell_wire`]).
     pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "spot" => Some(Self::Spot),
-            "od" | "on-demand" => Some(Self::Od),
-            _ => None,
+        rio_common::cell_wire::WireCapacity::parse(s).map(Self::from)
+    }
+}
+
+impl From<CapacityType> for rio_common::cell_wire::WireCapacity {
+    fn from(c: CapacityType) -> Self {
+        match c {
+            CapacityType::Spot => Self::Spot,
+            CapacityType::Od => Self::OnDemand,
+        }
+    }
+}
+
+impl From<rio_common::cell_wire::WireCapacity> for CapacityType {
+    fn from(c: rio_common::cell_wire::WireCapacity) -> Self {
+        match c {
+            rio_common::cell_wire::WireCapacity::Spot => Self::Spot,
+            rio_common::cell_wire::WireCapacity::OnDemand => Self::Od,
         }
     }
 }
 
 /// `"h:cap"` ↔ `Cell` for the controller's `unfulfillable_cells` wire
-/// encoding and `sla_ema_state.key` strings.
+/// encoding and `sla_ema_state.key` strings. Pinned to the shared
+/// [`rio_common::cell_wire`] decoder; epoch-suffixed cell EVENTS
+/// (`"h:cap@epoch"`) are rejected here — this codec serves the
+/// epoch-less key lanes (price keys, `ice_masked_cells`,
+/// `sla_ema_state.key`), and pre-pin it already rejected `'@'`
+/// strings (the capacity token failed to parse). The ack apply plan
+/// decodes evidence-plane entries through
+/// [`rio_common::cell_wire::decode_cell_event`] directly, where the
+/// epoch is load-bearing.
 pub fn parse_cell(s: &str) -> Option<Cell> {
-    let (h, c) = s.rsplit_once(':')?;
-    Some((h.to_string(), CapacityType::parse(c)?))
+    let p = rio_common::cell_wire::decode_cell_event(s).ok()?;
+    if p.epoch.is_some() {
+        return None;
+    }
+    Some((p.hw_class, p.capacity.into()))
 }
 
 pub fn cell_label((h, c): &Cell) -> String {
-    format!("{h}:{}", c.label())
+    use rio_common::cell_wire::CELL_SEP;
+    format!("{h}{CELL_SEP}{}", c.label())
 }
 
 /// Operator-chosen hw-class identifier (key into
@@ -243,7 +271,7 @@ pub type Cell = (HwClassName, CapacityType);
 /// so the helm template / TOML can carry [`Cell`]-keyed tables without
 /// nested objects.
 mod cell_key_serde {
-    use super::{CapacityType, Cell};
+    use super::Cell;
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
 
@@ -251,14 +279,15 @@ mod cell_key_serde {
         m: &HashMap<Cell, f64>,
         s: S,
     ) -> Result<S::Ok, S::Error> {
+        // Canonical wire form via the shared alphabet (bug_094: this
+        // was the fourth open-coded copy of the vocabulary).
         let flat: HashMap<String, f64> = m
             .iter()
             .map(|((h, c), v)| {
-                let cap = match c {
-                    CapacityType::Spot => "spot",
-                    CapacityType::Od => "od",
-                };
-                (format!("{h}:{cap}"), *v)
+                (
+                    rio_common::cell_wire::encode_cell_event(h, (*c).into(), None),
+                    *v,
+                )
             })
             .collect();
         flat.serialize(s)
@@ -270,15 +299,15 @@ mod cell_key_serde {
         let flat = HashMap::<String, f64>::deserialize(d)?;
         flat.into_iter()
             .map(|(k, v)| {
-                let (h, c) = k
-                    .rsplit_once(':')
-                    .ok_or_else(|| serde::de::Error::custom("expected h:cap"))?;
-                let cap = match c {
-                    "spot" => CapacityType::Spot,
-                    "od" | "on-demand" => CapacityType::Od,
-                    _ => return Err(serde::de::Error::custom("cap must be spot|od")),
-                };
-                Ok(((h.to_string(), cap), v))
+                let p = rio_common::cell_wire::decode_cell_event(&k)
+                    .map_err(serde::de::Error::custom)?;
+                // Helm/TOML keys are epoch-less by grammar.
+                if p.epoch.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "cell key must be h:cap (no @epoch suffix)",
+                    ));
+                }
+                Ok(((p.hw_class, p.capacity.into()), v))
             })
             .collect()
     }
@@ -2699,5 +2728,34 @@ mod tests {
         assert!(json.contains(r#""h:spot":1.0"#), "{json}");
         let back: SlaConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.lead_time_seed, cfg.lead_time_seed);
+    }
+
+    /// bug_094 pin: the serde ATTRIBUTE literals on [`CapacityType`]
+    /// (`rename_all = "lowercase"`, `alias = "on-demand"`) cannot
+    /// reference consts, so this asserts their behavior agrees with
+    /// the shared [`rio_common::cell_wire`] alphabet — if either side
+    /// drifts, this names the law. The codec fns themselves
+    /// (`label`/`parse`/`parse_cell`/`cell_label`/`cell_key_serde`)
+    /// are pinned by construction (they call through `cell_wire`).
+    #[test]
+    fn capacity_serde_attrs_agree_with_cell_wire_alphabet() {
+        use rio_common::cell_wire::{CAPACITY_OD, CAPACITY_ON_DEMAND, CAPACITY_SPOT};
+        // rename_all = "lowercase" emits exactly the canonical wire
+        // tokens.
+        assert_eq!(
+            serde_json::to_string(&CapacityType::Spot).unwrap(),
+            format!("\"{CAPACITY_SPOT}\"")
+        );
+        assert_eq!(
+            serde_json::to_string(&CapacityType::Od).unwrap(),
+            format!("\"{CAPACITY_OD}\"")
+        );
+        // The attr-literal alias accepts the Karpenter label form —
+        // the same third token `WireCapacity::parse` accepts.
+        for tok in [CAPACITY_SPOT, CAPACITY_OD, CAPACITY_ON_DEMAND] {
+            let via_serde: CapacityType = serde_json::from_str(&format!("\"{tok}\"")).unwrap();
+            let via_alphabet = CapacityType::parse(tok).unwrap();
+            assert_eq!(via_serde, via_alphabet, "token {tok:?}");
+        }
     }
 }

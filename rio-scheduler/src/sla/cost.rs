@@ -700,10 +700,11 @@ impl CostTable {
                 )
                 .bind(&self.cluster)
                 .bind(h)
-                .bind(match cap {
-                    CapacityType::Spot => "spot",
-                    CapacityType::Od => "od",
-                })
+                .bind(
+                    // Shared alphabet (bug_094): migration 060's CHECK
+                    // pins ('spot','od'); cell_wire owns the live side.
+                    rio_common::cell_wire::WireCapacity::from(*cap).wire_str(),
+                )
                 .bind(&t.name)
                 .bind(i32::try_from(t.cores).unwrap_or(i32::MAX))
                 .bind(i64::try_from(t.mem_bytes).unwrap_or(i64::MAX))
