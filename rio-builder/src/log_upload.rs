@@ -175,7 +175,7 @@ fn lost_lines(reason: AbandonReason, unacked: u64) -> u64 {
     }
 }
 
-// r[impl builder.log.loss-disclosure+3]
+// r[impl builder.log.loss-disclosure+4]
 /// THE single disclosure site: the only place
 /// `rio_builder_log_drain_abandoned_total` is incremented.
 /// Counter ⟺ `lost_lines > 0`, by construction — a zero-loss abandon
@@ -204,7 +204,7 @@ fn disclose(reason: AbandonReason, unacked_lines: u64, last_acked_line: Option<u
     );
 }
 
-// r[impl builder.log.loss-disclosure+3]
+// r[impl builder.log.loss-disclosure+4]
 /// Producer-side entry (bug_241): the stderr loop's post-uploader-death
 /// discard total, routed through THE single `disclose` chokepoint as
 /// `reason="uploader_dead"`. The counting stays at one site; the
@@ -215,7 +215,7 @@ pub(crate) fn disclose_uploader_dead(discarded_lines: u64) {
     disclose(AbandonReason::UploaderDead, discarded_lines, None);
 }
 
-// r[impl builder.log.loss-disclosure+3]
+// r[impl builder.log.loss-disclosure+4]
 /// merged_bug_009: the upload channel's receiving end, with a
 /// conservation drop guard. Batches the stderr loop successfully
 /// `send()`-ed but the task never `recv()`-ed are destroyed when the
@@ -967,7 +967,7 @@ impl UploadTask {
         }
     }
 
-    // r[impl builder.log.loss-disclosure+3]
+    // r[impl builder.log.loss-disclosure+4]
     /// Buffered lines strictly above the ack watermark — the
     /// DISCLOSURE view of the un-acked count (bug_144). Derived at
     /// every disclosure surface rather than cached, so it stays
@@ -1796,7 +1796,7 @@ mod tests {
         );
     }
 
-    // r[verify builder.log.loss-disclosure+3]
+    // r[verify builder.log.loss-disclosure+4]
     /// bug_144: a mid-frame ack — the store's line-granular
     /// `durable_through_line` landing INSIDE a buffered frame — must
     /// advance the watermark and shrink the disclosed loss to the
@@ -1857,7 +1857,7 @@ mod tests {
     //    builder.log.loss-disclosure)
     // ------------------------------------------------------------------
 
-    // r[verify builder.log.loss-disclosure+3]
+    // r[verify builder.log.loss-disclosure+4]
     /// merged_bug_360 (red-first): PERMISSION_DENIED with un-acked lines
     /// is durable loss — the superseding attempt produces ITS OWN log,
     /// not these lines. Pre-fix, `rejected: true` suppressed the
@@ -1897,7 +1897,7 @@ mod tests {
         );
     }
 
-    // r[verify builder.log.loss-disclosure+3]
+    // r[verify builder.log.loss-disclosure+4]
     /// merged_bug_360 (red-first): a panic in the upload task must
     /// disclose the un-acked lines. Pre-fix the counter fired only at
     /// `run()`'s normal exit, which a panicking task never reaches —
@@ -1953,7 +1953,7 @@ mod tests {
         );
     }
 
-    // r[verify builder.log.loss-disclosure+3]
+    // r[verify builder.log.loss-disclosure+4]
     /// merged_bug_009 (channel-resident population): batches sent into
     /// the upload channel but never received are destroyed when the
     /// receiver drops mid-unwind — they are in NO progress snapshot
@@ -1978,7 +1978,7 @@ mod tests {
         );
     }
 
-    // r[verify builder.log.loss-disclosure+3]
+    // r[verify builder.log.loss-disclosure+4]
     /// merged_bug_009: the parked-sender-vs-drop race. Drop closes the
     /// channel BEFORE draining, so a send still parked when the
     /// receiver dies must resolve Err (the caller's counted bounce
@@ -2007,7 +2007,7 @@ mod tests {
         }
     }
 
-    // r[verify builder.log.loss-disclosure+3]
+    // r[verify builder.log.loss-disclosure+4]
     /// The conservation guard's zero arm: a receiver that drops with
     /// an EMPTY channel (every normal exit — recv() yields all queued
     /// items before None) discloses nothing.
@@ -2025,7 +2025,7 @@ mod tests {
         );
     }
 
-    // r[verify builder.log.loss-disclosure+3]
+    // r[verify builder.log.loss-disclosure+4]
     /// bug_248 (red-first): a permanent rejection arriving MID-STREAM
     /// (the cap tripping while the stream is open) must stop the
     /// session loop — pre-fix it was classified Reconnect and the
@@ -2075,7 +2075,7 @@ mod tests {
         );
     }
 
-    // r[verify builder.log.loss-disclosure+3]
+    // r[verify builder.log.loss-disclosure+4]
     /// Polarity guard: a `complete` rejection (the store provably holds
     /// the full `[0, final)` log) is the ONE zero-loss abandon — no
     /// counter, under any reason label.

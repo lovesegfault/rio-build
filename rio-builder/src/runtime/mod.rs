@@ -313,7 +313,7 @@ fn publish_hw_class(
     factor.map(|factor| (hw_class, factor))
 }
 
-// r[impl builder.log.loss-disclosure+3]
+// r[impl builder.log.loss-disclosure+4]
 /// merged_bug_009: the store's completeness predicate is "the manifest
 /// covers a contiguous [0, final_line_count)" — sealing footer lines
 /// that never entered the upload channel makes the seal PERMANENTLY
@@ -1294,7 +1294,7 @@ mod tests {
 mod seal_tests {
     use super::sealed_final_line_count;
 
-    // r[verify builder.log.loss-disclosure+3]
+    // r[verify builder.log.loss-disclosure+4]
     /// merged_bug_009 (footer population): the footer is folded into
     /// the sealed final_line_count ONLY when its send succeeded —
     /// sealing lines that exist nowhere makes the store's

@@ -617,7 +617,7 @@ requirement and the display-only / no-pod-identity rationale live in
   to `0` means unlimited.
 ]
 
-#r("builder.log.loss-disclosure+3")[
+#r("builder.log.loss-disclosure+4")[
   Every line handed to the log-upload data plane that is not durably stored
   MUST be disclosed through one chokepoint that derives the loss from the
   abandonment reason: an upload that ends with un-acked lines increments
@@ -629,15 +629,20 @@ requirement and the display-only / no-pod-identity rationale live in
   lines resident in the upload channel when its receiver dies disclose from
   the receiver's own drop guard (`uploader_dead` --- they never reached the
   uploader's accounting, so no ack can cover them and no progress snapshot
-  counts them); lines the channel refused --- including banner/footer
-  sends --- disclose through the producer-side ledger (`uploader_dead`).
-  A permanent store rejection arriving mid-stream MUST terminate the
-  session loop (no reconnect can succeed against it), and a panic in the
-  upload task MUST disclose during unwind, independent of whether any
-  caller awaits the task. The producer-side sink MUST make an uncounted
-  discard unrepresentable --- once the upload channel is gone, the only way
-  to drop a batch is the ledger method whose teardown discloses the
-  accumulated total. Footer lines MUST be folded into the reported
+  counts them); lines the channel refused disclose producer-side as
+  `uploader_dead`: inside the stderr loop through the discard-ledger sink
+  (ONE accumulated total at teardown); banner/footer sends --- which run
+  outside the stderr loop --- disclose directly at the send site through
+  the same chokepoint, one disclosure per bounced batch (an uploader death
+  may therefore mint several disclosure events; the law is per-line
+  conservation, not one-event-one-disclosure). A permanent store rejection
+  arriving mid-stream MUST terminate the session loop (no reconnect can
+  succeed against it), and a panic in the upload task MUST disclose during
+  unwind, independent of whether any caller awaits the task. The
+  stderr-loop producer-side sink MUST make an uncounted discard
+  unrepresentable --- once the upload channel is gone, the only way for the
+  stderr loop to drop a batch is the ledger method whose teardown discloses
+  the accumulated total. Footer lines MUST be folded into the reported
   `final_line_count` ONLY when their send succeeded: sealing lines that
   exist nowhere makes the store's contiguous-coverage completeness
   predicate permanently unsatisfiable with no disclosure.

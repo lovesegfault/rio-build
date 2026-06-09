@@ -3460,14 +3460,14 @@ mod tests {
 
     /// `http: None` (the reqwest client failed to build at startup —
     /// no CA bundle in the sandbox, or a future builder regression)
-    /// degrades EVERY substitution on this replica to `Ok(None)` =
-    /// build-from-source. Same incident class as the `no_upstreams`
-    /// branch two lines below it: a skip that leaves no trace is
+    /// USED to degrade every substitution on this replica to
+    /// `Ok(None)` = build-from-source — a skip that left no trace,
     /// indistinguishable from "the upstream really doesn't have it".
-    /// Counted AND surfaced per singleflight leader: with upstreams
-    /// configured, a clientless substituter is a hard, uncached error
-    /// — never a clean miss (the merged_bug_044 law at the capability
-    /// chokepoint). The `http` field is private and only ever `None`
+    /// Now counted AND surfaced per singleflight leader: with
+    /// upstreams configured, a clientless substituter is a hard,
+    /// uncached error — never a clean miss (the merged_bug_044 law,
+    /// ordered by the CapabilityGate; the `no_upstreams` arm is a
+    /// DIFFERENT class — a deliberately truthful clean no-op). The `http` field is private and only ever `None`
     /// when `Client::builder().build()` fails, so the test reaches
     /// into the field directly (the test module is a child of the
     /// defining module) rather than adding a test-only constructor to

@@ -1478,7 +1478,7 @@ pub fn sanitize_build_id(drv_path: &str) -> String {
 /// `runtime::spawn_build_task` (after the daemon-transient retry loop —
 /// once per assignment) rather than from `execute_build` (once per
 /// attempt). See `execute_build`'s `first_line` param doc and bug_013.
-// r[impl builder.log.loss-disclosure+3]
+// r[impl builder.log.loss-disclosure+4]
 pub(crate) async fn send_banner_batch(
     upload_tx: &mpsc::Sender<rio_proto::types::BuildLogBatch>,
     drv_path: &str,

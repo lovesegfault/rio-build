@@ -403,7 +403,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "workers"
+              "options": "open attempts"
             },
             "properties": [
               {

@@ -57,10 +57,12 @@
 //     "stuck" bit per in-flight claim; the dead_nodes arm is consumed
 //     input only and out of model (its protection is the §4(a)1 gate
 //     tests, not these invariants). Input-source note (executor 1c /
-//     OA2): the dead_nodes-shaped input is now the union of the
-//     scheduler-reported set (stream pools, until 1d) and the
-//     controller-side per-node deadline-expiry clustering over the
-//     open-attempt ledger view (nodeclaim_pool/wedge.rs). Still
+//     OA2, updated post-1d): the dead_nodes-shaped input is SOLELY
+//     the controller-side per-node deadline-expiry clustering over
+//     the open-attempt ledger view (nodeclaim_pool/wedge.rs) — the
+//     scheduler-reported set retired with the stream pools at the 1d
+//     sweep (the proto reserves field 3/"dead_nodes"; history: the
+//     input was the union of both until then). Still
 //     consumed input only — none of this model's checked invariants
 //     quantify over it; the clustering's protection is its own unit
 //     battery plus the same dead-reap cap the modeled reaps respect.

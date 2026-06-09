@@ -477,8 +477,12 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
                             // missing s3:HeadObject) → FailedPrecondition
                             // so the operator sees a fix-the-config
                             // signal instead of retrying. Everything else
-                            // → Unavailable (transient, stream the boundary
-                            // so the operator can resume from N).
+                            // → Unavailable (transient; the streamed
+                            // boundary says where it died, but there is
+                            // NO resume cursor on this RPC — the request
+                            // carries only batch_size and the keyset
+                            // cursor hard-starts empty, so recovery is a
+                            // full re-run from the start).
                             let status = if e
                                 .downcast_ref::<crate::backend::BackendAuthError>()
                                 .is_some()

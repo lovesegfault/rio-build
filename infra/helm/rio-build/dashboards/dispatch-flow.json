@@ -75,7 +75,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "workers active"
+              "options": "open attempts"
             },
             "properties": [
               {
