@@ -1325,12 +1325,12 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
     // without any write of OURS committing (merged_bug_180).
     let mut unconfirmed: Option<UnconfirmedPut> = None;
     let mut content_baseline = ContentBaseline::NoCompletedRead;
-    // Q3 deferral flag: a believing renew 409 has been observed and its
-    // resolution is owed to the NEXT completed read. Set only by the
-    // deferral arm; cleared by every resolving arm (acquire, lose,
-    // still-leading observe, standby observe). One round deep by
-    // construction — a second consecutive believing 409 exhausts it.
-    let mut conflict_deferred = false;
+    // The Q3 one-round 409 deferral lives INSIDE `standing` as an
+    // episode-scoped field (merged_bug_002): set/exhausted only by
+    // `on_believing_conflict`, cleared structurally by the episode
+    // transitions themselves (the funnel's `on_observed_held`,
+    // `on_observed_not_leading`, `on_self_fence`) — there is no
+    // loop-local to hand-clear, so a resolving arm cannot forget it.
     let mut interval = tokio::time::interval(RENEW_INTERVAL);
     // Skip: if one renewal is slow (apiserver busy), don't fire
     // twice immediately. SELF_FENCE_AFTER is 11s; we have slack.
@@ -1452,7 +1452,9 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                 // fence-before-steal margin untouched: the deferral
                 // changes WHICH edge runs, never how long belief may
                 // last.
-                let will_defer = is_conflict && standing.believes() && !conflict_deferred;
+                let conflict_resolution =
+                    (is_conflict && standing.believes()).then(|| standing.on_believing_conflict());
+                let will_defer = matches!(conflict_resolution, Some(ConflictResolution::Deferred));
                 if !will_defer {
                     // Successful round-trip (apiserver answered). Even
                     // Standby (and a RESOLVED Conflict) restart the
@@ -1562,8 +1564,8 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                             transitions,
                         );
                         // An acquire resolves any pending deferral —
-                        // a new belief episode starts clean.
-                        conflict_deferred = false;
+                        // the funnel's on_observed_held clears the
+                        // episode latch structurally.
                     }
                     (None, true) => {
                         // ---- Lose-or-defer ----
@@ -1580,7 +1582,8 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                             // holder evidence either way: the lease
                             // provably no longer resolves to us.
                             Some(CompletedLoseEvidence::AnotherHolderObserved)
-                        } else if conflict_deferred {
+                        } else if matches!(conflict_resolution, Some(ConflictResolution::Exhausted))
+                        {
                             Some(CompletedLoseEvidence::ConflictDeferralExhausted)
                         } else {
                             None
@@ -1631,8 +1634,10 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                                 // arm after the edge match patches this
                                 // tick.
                                 marks_dirty.mark();
+                                // Clears the episode latch too — an
+                                // exhausted deferral does not survive
+                                // its own lose edge.
                                 standing.on_observed_not_leading();
-                                conflict_deferred = false;
                             }
                             None => {
                                 // ---- One-round deferral ----
@@ -1640,13 +1645,15 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                                 // survive: nothing is wiped on a CAS
                                 // bounce that may be our own write
                                 // committing. No hooks, no marks — no
-                                // transition happened. The NEXT
-                                // completed read resolves: holder=us →
-                                // ordinary renew (or own-commit
-                                // evidence on the act-failed path);
-                                // holder=other → lose WITH evidence;
-                                // another 409 → exhausted, lose.
-                                conflict_deferred = true;
+                                // transition happened. The latch was
+                                // set by on_believing_conflict above.
+                                // The NEXT completed read resolves:
+                                // holder=us → ordinary renew (or
+                                // own-commit evidence on the act-failed
+                                // path — both run the funnel, which
+                                // clears); holder=other → lose WITH
+                                // evidence; another 409 → exhausted,
+                                // lose.
                                 warn!(
                                     holder = %cfg.holder_id,
                                     "renew 409 while believing: rv moved but the holder is \
@@ -1672,16 +1679,16 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                             transitions,
                         );
                         // A still-leading resolution clears a pending
-                        // deferral — the 409's question is answered.
-                        conflict_deferred = false;
+                        // deferral — the 409's question is answered
+                        // (the funnel's on_observed_held clears).
                     }
                     // Steady state: still standby while someone else
                     // holds (or a 409 raced our steal — we were never
-                    // leading, nothing to defer). No log — 5s interval
-                    // would be noisy.
+                    // leading, nothing to defer; on_observed_not_leading
+                    // clears the latch either way). No log — 5s
+                    // interval would be noisy.
                     (None, false) => {
                         standing.on_observed_not_leading();
-                        conflict_deferred = false;
                     }
                 }
                 // r[impl sched.recovery.bump-confirm+3]
@@ -2032,9 +2039,37 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
 ///   apiserver — exactly the case the shutdown release exists for
 ///   (fence during an outage, then SIGTERM: without the release the
 ///   successor waits out the full steal threshold).
+///
+/// Plus the episode-scoped Q3 deferral latch (merged_bug_002):
+///
+/// - **conflict_deferred** — "a believing renew 409 was observed and
+///   its resolution is owed to the next completed read". PRIVATE, with
+///   exactly one set path ([`Self::on_believing_conflict`], which also
+///   reports exhaustion) and zero hand-clears: every transition that
+///   resolves the 409's question or ends the belief episode —
+///   [`Self::on_observed_held`] (the funnel: acquire, still-leading,
+///   and BOTH act-failed resolving legs), [`Self::on_observed_not_leading`]
+///   (lose-with-evidence, standby, step-down), [`Self::on_self_fence`]
+///   (all fence sites) — clears it structurally. A future lose or
+///   resolve edge that skips `LeaseStanding` cannot observe or leak
+///   the latch; the hand-enumerated-clears shape (a loop-local cleared
+///   by some arms) is what let the act-failed resolutions and the
+///   fence lose edges leak it across belief episodes.
 struct LeaseStanding {
     believes: bool,
     held_unsuperseded: bool,
+    conflict_deferred: bool,
+}
+
+/// Verdict of [`LeaseStanding::on_believing_conflict`] — the only path
+/// that sets or exhausts the one-round 409 deferral. `Deferred` ⇔ this
+/// is the episode's FIRST unresolved believing 409 (the lose edge must
+/// not run); `Exhausted` ⇔ a previous deferral is still unresolved —
+/// two consecutive believing 409s — and the caller owes the evidenced
+/// lose edge (whose `on_observed_not_leading` then clears the latch).
+enum ConflictResolution {
+    Deferred,
+    Exhausted,
 }
 
 /// Witness that a believed-held observation passed through THE
@@ -2050,11 +2085,12 @@ struct LeaseStanding {
 struct ObservedHeld(());
 
 impl LeaseStanding {
-    /// Loop start: never led, never held.
+    /// Loop start: never led, never held, nothing deferred.
     fn new() -> Self {
         Self {
             believes: false,
             held_unsuperseded: false,
+            conflict_deferred: false,
         }
     }
 
@@ -2068,10 +2104,15 @@ impl LeaseStanding {
     /// `observe_held_while_believing` — so recording a held
     /// observation without running the fused rebound comparison does
     /// not typecheck in production code (merged_bug_114; the funnel
-    /// doc carries the full claim).
+    /// doc carries the full claim). Resolves a pending 409 deferral:
+    /// the funnel is the only minting site, so BOTH act-failed
+    /// resolving legs and both Completed believing arms clear the
+    /// latch structurally (merged_bug_002) — a completed read of a
+    /// lease we hold answers the deferred 409's question.
     fn on_observed_held(&mut self, _witness: ObservedHeld) {
         self.believes = true;
         self.held_unsuperseded = true;
+        self.conflict_deferred = false;
     }
 
     /// A COMPLETED election round resolved not-leading: clears both
@@ -2082,6 +2123,9 @@ impl LeaseStanding {
     fn on_observed_not_leading(&mut self) {
         self.believes = false;
         self.held_unsuperseded = false;
+        // Lose-with-evidence / standby / step-down: the episode ends
+        // (or never was) — nothing is deferred into the next one.
+        self.conflict_deferred = false;
     }
 
     /// Test/proof driver: the production polarity pair as one call.
@@ -2100,9 +2144,30 @@ impl LeaseStanding {
 
     /// Local self-fence: stop believing. The apiserver state is
     /// UNKNOWN — that is what fencing means — so the hold is untouched
-    /// (deliberately no API to clear it from this path).
+    /// (deliberately no API to clear it from this path). The deferral
+    /// latch IS cleared: the fence ends the belief episode, and a new
+    /// belief episode starts clean (merged_bug_002 — pre-fix the latch
+    /// leaked across the fence into the next episode's first 409).
     fn on_self_fence(&mut self) {
         self.believes = false;
+        self.conflict_deferred = false;
+    }
+
+    /// A believing renew 409: defer (first of the episode) or report
+    /// exhaustion (a previous deferral is still unresolved). The ONLY
+    /// set path for the latch — the lose-or-defer arm consumes the
+    /// verdict, so "which arms clear the latch" is not a question any
+    /// arm answers by hand: resolution and episode-end run through the
+    /// three transitions above. On `Exhausted` the latch stays set;
+    /// the evidenced lose edge that must follow clears it via
+    /// `on_observed_not_leading`.
+    fn on_believing_conflict(&mut self) -> ConflictResolution {
+        if self.conflict_deferred {
+            ConflictResolution::Exhausted
+        } else {
+            self.conflict_deferred = true;
+            ConflictResolution::Deferred
+        }
     }
 
     /// The shutdown release gate: release iff we acquired and never
@@ -2121,7 +2186,7 @@ impl LeaseStanding {
 /// bounded driver loop.
 #[cfg(kani)]
 mod lease_standing_proofs {
-    use super::LeaseStanding;
+    use super::{ConflictResolution, LeaseStanding};
 
     const MAX_EVENTS: usize = 8;
 
@@ -2189,6 +2254,55 @@ mod lease_standing_proofs {
             !standing.believes() || standing.should_release_on_shutdown(),
             "belief never exceeds the hold"
         );
+    }
+
+    /// r[verify sched.lease.holder-evidenced-lose]
+    /// The 409 deferral is episode-scoped (merged_bug_002): over every
+    /// bounded event sequence drawn from the standing alphabet
+    /// {ObservedHeld, ObservedNotLeading, SelfFence, BelievingConflict}
+    /// folded through the PRODUCTION transitions, `Exhausted` fires iff
+    /// the latch was set by an earlier `BelievingConflict` with NO
+    /// intervening resolving/lose transition — a resolving observation
+    /// or an episode-ending lose/fence structurally cannot leave a
+    /// stale latch behind.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn lease_standing_exhaustion_requires_unresolved_deferral() {
+        let events: [u8; MAX_EVENTS] = kani::any();
+
+        let mut standing = LeaseStanding::new();
+        // Ghost: an unresolved same-episode deferral precedes.
+        let mut ghost_deferred = false;
+        let mut i = 0;
+        while i < MAX_EVENTS {
+            kani::assume(events[i] < 4);
+            match events[i] {
+                0 => {
+                    standing.on_observed(true);
+                    ghost_deferred = false;
+                }
+                1 => {
+                    standing.on_observed(false);
+                    ghost_deferred = false;
+                }
+                2 => {
+                    standing.on_self_fence();
+                    ghost_deferred = false;
+                }
+                _ => {
+                    let exhausted = matches!(
+                        standing.on_believing_conflict(),
+                        ConflictResolution::Exhausted
+                    );
+                    assert!(
+                        exhausted == ghost_deferred,
+                        "Exhausted iff an unresolved same-episode deferral precedes"
+                    );
+                    ghost_deferred = true;
+                }
+            }
+            i += 1;
+        }
     }
 }
 
@@ -4449,6 +4563,250 @@ mod tests {
         for _ in 0..3 {
             if let Some(req) = park.try_next().await {
                 req.respond_status(404, "NotFound", "gone");
+            }
+        }
+        loop_task.await.expect("lease loop exits");
+    }
+
+    /// merged_bug_002 red #1: own-commit evidence on the ACT-FAILED
+    /// path resolves a pending deferral. The deferral arm's own
+    /// resolution table names "own-commit evidence on the act-failed
+    /// path" as a resolver, but pre-fix only the four `Completed`-arm
+    /// clears existed — the `FetchedActFailed` resolving legs (both
+    /// routed through `observe_held_while_believing`) left the latch
+    /// set, so a LATER believing 409 exhausted immediately with the
+    /// factually false "two consecutive renew 409s" warn: the
+    /// completed read between them answered the first 409's question.
+    ///
+    /// The fence clock is injected 4x slow: a pending deferral never
+    /// stamps the blind window, so under the production ratio the
+    /// tick-top fence always beats an act-failed resolution round —
+    /// the slow clock is the "rounds fast relative to the fence
+    /// budget" regime that makes the believing-observe leg reachable
+    /// (the wire shapes are untouched: production loop, park JSON).
+    // r[verify sched.lease.holder-evidenced-lose]
+    #[tokio::test(start_paused = true)]
+    async fn act_failed_own_commit_resolution_clears_the_deferral() {
+        let (client, mut park) = RequestPark::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                // 4x-slow fence clock: no self-fence interleaves (see
+                // the test doc); rounds stay 5s apart on tokio time.
+                let a = Instant::now();
+                move || a.elapsed() / 4
+            },
+        ));
+
+        // Round 1 (t=0, healthy): acquire; settle the marks PATCH.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 10));
+        let put = park.next().await;
+        put.respond_ok(park_lease_json(Some("us"), 3, 11));
+        settle().await;
+        assert!(state.is_leader(), "healthy round acquires");
+        let patch = park.next().await;
+        patch.respond_ok(pod_ok("us"));
+        settle().await;
+
+        // Round 2 (t=5s): act phase dies after a completed read — the
+        // cancelled-write ledger arms (put_transmitted=true), content
+        // baseline stays at renewTime 11.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 11));
+        let put = park.next().await;
+        drop(put);
+        settle().await;
+        assert!(state.is_leader(), "an act failure alone never loses");
+
+        // Round 3 (t=10s): the believing 409 — defers one round.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 11));
+        let put = park.next().await;
+        put.respond_status(409, "Conflict", "the object has been modified");
+        settle().await;
+        assert!(state.is_leader(), "first believing 409 defers");
+        assert_eq!(
+            hooks.loses.lock().expect("loses lock").len(),
+            0,
+            "no lose edge at the bounce"
+        );
+
+        // Round 4 (t=15s): act-failed round whose completed read shows
+        // holder=us with renewTime MOVED — the round-2 zombie
+        // committed. Own-commit evidence consumes the ledger and the
+        // believing-observe leg runs the funnel: the deferred 409's
+        // question is ANSWERED (the rv-mover was our own write).
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 12));
+        let put = park.next().await;
+        drop(put);
+        settle().await;
+        assert!(state.is_leader(), "own-commit resolution keeps leading");
+
+        // Round 5 (t=20s): ANOTHER believing 409. The completed read
+        // between the two 409s resolved the first deferral, so this is
+        // a FIRST 409 of a fresh question — it must defer, not exhaust.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 12));
+        let put = park.next().await;
+        put.respond_status(409, "Conflict", "the object has been modified");
+        settle().await;
+
+        assert!(
+            state.is_leader(),
+            "the act-failed own-commit resolution answered the first 409 — \
+             the second 409 is a FIRST 409 and must defer, not exhaust \
+             (the 409s were NOT consecutive)"
+        );
+        assert_eq!(
+            hooks.loses.lock().expect("loses lock").len(),
+            0,
+            "no lose edge: the deferral was resolved between the 409s"
+        );
+
+        shutdown.cancel();
+        for _ in 0..4 {
+            if let Some(req) = park.try_next().await {
+                if req.path.contains("/pods/us") {
+                    req.respond_ok(pod_ok("us"));
+                } else {
+                    req.respond_status(404, "NotFound", "gone");
+                }
+            }
+        }
+        loop_task.await.expect("lease loop exits");
+    }
+
+    /// merged_bug_002 red #2: the self-fence lose edge ends the belief
+    /// episode — the deferral latch must not leak into the NEXT one.
+    /// Pre-fix the fence cleared belief but not the loop-local latch,
+    /// so after an evidence re-acquire (a NEW belief episode) the next
+    /// believing 409 exhausted immediately from the OLD episode's
+    /// latch, violating the ":new belief episode starts clean" law.
+    // r[verify sched.lease.holder-evidenced-lose]
+    #[tokio::test(start_paused = true)]
+    async fn self_fence_resets_the_deferral_for_the_next_belief_episode() {
+        let (client, mut park) = RequestPark::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        // Round 1 (t=0, healthy): acquire; settle the marks PATCH.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 10));
+        let put = park.next().await;
+        put.respond_ok(park_lease_json(Some("us"), 3, 11));
+        settle().await;
+        assert!(state.is_leader(), "healthy round acquires");
+        let patch = park.next().await;
+        patch.respond_ok(pod_ok("us"));
+        settle().await;
+
+        // Round 2 (t=5s): believing 409 — defers; the deferral does
+        // not stamp, so the blind window keeps aging from t=0.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 11));
+        let put = park.next().await;
+        put.respond_status(409, "Conflict", "the object has been modified");
+        settle().await;
+        assert!(state.is_leader(), "first believing 409 defers");
+
+        // Round 3 (t=10s): act dies after a completed read — the
+        // ledger arms at t=10s (the fresh anchor the re-acquire needs).
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 11));
+        let put = park.next().await;
+        drop(put);
+        settle().await;
+
+        // Round 4 (t=15s): the blind window (anchored t=0) aged past
+        // SELF_FENCE_AFTER=11s — the tick-top fence runs the lose edge
+        // (belief episode ENDS). Same tick, the completed read shows
+        // holder=us with renewTime moved: the surviving ledger's
+        // own-commit evidence consumes at the t=10s anchor (5s old,
+        // inside the acquire gate) and the evidence-acquire leg
+        // re-enters belief — a NEW episode.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 12));
+        let put = park.next().await;
+        drop(put);
+        settle().await;
+        assert!(
+            state.is_leader(),
+            "evidence re-acquire after the scheduled fence (new episode)"
+        );
+        assert_eq!(
+            hooks.loses.lock().expect("loses lock").len(),
+            1,
+            "exactly one lose so far — the fence"
+        );
+        // The fence + re-acquire dirtied the marks; settle the PATCH
+        // so round 5's lease GET is the next parked request.
+        let patch = park.next().await;
+        assert!(patch.path.contains("/pods/us"), "marks reconcile PATCH");
+        patch.respond_ok(pod_ok("us"));
+        settle().await;
+
+        // Round 5 (t=20s): first believing 409 of the NEW episode
+        // (blind re-anchored t=10s, no fence at 10s) — the law demands
+        // a deferral; the OLD episode's latch must not exhaust it.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 12));
+        let put = park.next().await;
+        put.respond_status(409, "Conflict", "the object has been modified");
+        settle().await;
+
+        assert!(
+            state.is_leader(),
+            "the new belief episode starts clean — its first believing \
+             409 defers; an exhaustion here is the OLD episode's latch \
+             leaking across the fence lose edge"
+        );
+        assert_eq!(
+            hooks.loses.lock().expect("loses lock").len(),
+            1,
+            "only the fence lose — the new episode's first 409 defers"
+        );
+
+        shutdown.cancel();
+        for _ in 0..4 {
+            if let Some(req) = park.try_next().await {
+                if req.path.contains("/pods/us") {
+                    req.respond_ok(pod_ok("us"));
+                } else {
+                    req.respond_status(404, "NotFound", "gone");
+                }
             }
         }
         loop_task.await.expect("lease loop exits");

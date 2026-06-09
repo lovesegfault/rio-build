@@ -1525,12 +1525,16 @@ rec {
     # The paired pin is quint-lease-calib-085-blind-conflict-lose
     # (the immediate-lose world falsifies the headline).
     # Measured (tttt duty, gating backend): TLC-exhaustive
-    # 968,119,453 generated / 220,855,702 distinct / depth 47 in
-    # 15m17s at 24 workers — the 3600s budget is ~3.9x headroom at
-    # that worker count; raise only with a new measured run. (At the
-    # foreign-rv sibling's MAX_DROPS = 2 the space exceeded 720M
-    # generated WITHOUT exhausting — the regime's module comment
-    # records the scope trim and what the droppedWrite regime keeps.)
+    # 1,066,069,779 generated / 241,853,458 distinct / depth 47 in
+    # 21m38s under a concurrent sibling-regime run (re-measured at
+    # bughunt-5 S8: the merged_bug_002 deferral ghosts are LIVE in
+    # this gate-on regime, +10% states over the pre-change
+    # 968,119,453/220,855,702@15m17s) — the 3600s budget is ~2.8x
+    # headroom at the loaded measurement; raise only with a new
+    # measured run. (At the foreign-rv sibling's MAX_DROPS = 2 the
+    # space exceeded 720M generated WITHOUT exhausting — the regime's
+    # module comment records the scope trim and what the droppedWrite
+    # regime keeps.)
     # r[verify sched.lease.holder-evidenced-lose]
     quint-leader-election-holder-evidence = mkQuintCheck {
       name = "leader-election-holder-evidence";
@@ -1557,6 +1561,13 @@ rec {
         "noFabricatedEvidence"
         "blindHolderBounded"
         "loseRequiresHolderEvidence"
+        # merged_bug_002 twin: the exhausted-deferral lose fires only
+        # on genuinely consecutive believing 409s — no resolving
+        # action (own-commit fetch, self-fence, step-down) answered
+        # the deferral in between. [violation]-verified pre-fix
+        # (resolving actions kept the latch; quint run, 20k samples,
+        # seed 0xb002); green with the episode-scoped clears.
+        "noStaleExhaustedLose"
       ];
     };
 
@@ -1586,9 +1597,14 @@ rec {
     # quint-lease-calib-128-count-keyed-stepdown (the count-keyed +
     # no-clear world falsifies it).
     # Measured (tttt duty, gating backend): TLC-exhaustive
-    # 582,741,343 generated / 94,208,853 distinct / depth 45 in 7m22s
-    # at 24 workers — the 3600s budget is ~8x headroom at that worker
-    # count; raise only with a new measured run.
+    # 582,741,343 generated / 94,208,853 distinct / depth 46 in
+    # 11m42s under a concurrent sibling-regime run (7m22s solo at 24
+    # workers pre-bughunt5) — the 3600s budget is ~5x headroom at the
+    # loaded measurement; raise only with a new measured run.
+    # State counts BYTE-IDENTICAL to the pre-merged_bug_002 run: the
+    # HOLDER_EVIDENCE_LOSE guard idiom keeps this gate-off regime
+    # state-space-identical under the new deferral ghosts (verified by
+    # re-run, bughunt-5 S8).
     # r[verify sched.recovery.step-down+3]
     quint-leader-election-step-down = mkQuintCheck {
       name = "leader-election-step-down";

@@ -508,6 +508,23 @@ module leaderElection {
   /// lose. Writable only under CONFLICT_IMMEDIATE_LOSE (the twin
   /// toggle); loseRequiresHolderEvidence is its negation.
   var blindConflictLose: bool
+  /// Ghost (merged_bug_002): a resolving action -- own-commit fetch,
+  /// self-fence, cooperative step-down -- fired while this node's 409
+  /// deferral was pending: the deferral's question was answered or its
+  /// belief episode ended, so a LATER exhaustion from the same latch
+  /// is stale (the production "two consecutive renew 409s" warn on
+  /// 409s that were NOT consecutive). Reset by the conflict action (a
+  /// fresh deferral starts unresolved). Frozen all-false at
+  /// HOLDER_EVIDENCE_LOSE = false.
+  var deferralResolvedV: Node -> bool
+  /// History latch (writer: conflict's exhausted branch): a believing
+  /// 409 ran the exhausted-deferral lose edge although a resolving
+  /// action had fired since the deferral was set -- merged_bug_002's
+  /// spurious failover. The fix scopes the latch to the belief episode
+  /// (conflictDeferredV cleared by fetchObservesOwnCommit, selfFence,
+  /// serveStepDown), making this latch unreachable; its twin invariant
+  /// noStaleExhaustedLose is the regression pin.
+  var staleExhaustedLose: bool
   /// Per-acquire tenure-instance counter (production
   /// LeaderState::acquire_instance): bumped on every acquire edge,
   /// never reused; reset by crash (the Arc dies with the process).
@@ -746,6 +763,14 @@ module leaderElection {
   /// deferred at least once -- the non-vacuity check for
   /// loseRequiresHolderEvidence's world.
   val noDeferredConflict = NODES.forall(n => not(conflictDeferredV.get(n)))
+  /// merged_bug_002 twin: the exhausted-deferral lose edge fires only
+  /// when NOTHING resolved the deferral since it was set -- the 409s
+  /// were genuinely consecutive. Pre-fix (the resolving actions kept
+  /// the latch: own-commit fetch, self-fence, step-down) this VIOLATES
+  /// in the holder-evidence regime -- the production spurious-failover
+  /// trace; green once the clears scope the latch to the belief
+  /// episode. Falsify evidence recorded in the fixing commit.
+  val noStaleExhaustedLose = not(staleExhaustedLose)
 
   /// sched.recovery.step-down instance law (merged_bug_128): a
   /// step-down is served only by the tenure instance that filed it.
@@ -1156,6 +1181,8 @@ module leaderElection {
     drops' = drops,
     foreignBumps' = foreignBumps,
     conflictDeferredV' = conflictDeferredV,
+    deferralResolvedV' = deferralResolvedV,
+    staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
@@ -1254,6 +1281,8 @@ module leaderElection {
     drops' = drops,
     foreignBumps' = foreignBumps,
     conflictDeferredV' = conflictDeferredV,
+    deferralResolvedV' = deferralResolvedV,
+    staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
@@ -1478,6 +1507,8 @@ module leaderElection {
       conflictDeferredV' =
         if (not(HOLDER_EVIDENCE_LOSE)) conflictDeferredV
         else conflictDeferredV.put(n, false),
+      deferralResolvedV' = deferralResolvedV,
+      staleExhaustedLose' = staleExhaustedLose,
       blindConflictLose' = blindConflictLose,
       acquireInstV' =
         if (MAX_STEP_DOWNS == 0) acquireInstV
@@ -1667,6 +1698,8 @@ module leaderElection {
       conflictDeferredV' =
         if (not(HOLDER_EVIDENCE_LOSE)) conflictDeferredV
         else conflictDeferredV.put(n, false),
+      deferralResolvedV' = deferralResolvedV,
+      staleExhaustedLose' = staleExhaustedLose,
       blindConflictLose' = blindConflictLose,
       acquireInstV' =
         if (MAX_STEP_DOWNS == 0 or not(isEdge)) acquireInstV
@@ -1723,6 +1756,16 @@ module leaderElection {
       leading.get(n),
       not(conflictDeferredV.get(n)),
     }
+    // The exhausted-deferral lose edge: a believing 409 with the
+    // deferral latch still set (production's ConflictResolution::
+    // Exhausted). Judged stale -- merged_bug_002 -- when a resolving
+    // action fired since the deferral was set (deferralResolvedV).
+    val exhausts = and {
+      HOLDER_EVIDENCE_LOSE,
+      not(CONFLICT_IMMEDIATE_LOSE),
+      leading.get(n),
+      conflictDeferredV.get(n),
+    }
     all {
       alive.get(n),
       pending.get(n) == NoPending,
@@ -1776,6 +1819,16 @@ module leaderElection {
         if (not(HOLDER_EVIDENCE_LOSE)) conflictDeferredV
         else conflictDeferredV.put(n, defers),
       blindConflictLose' = (blindConflictLose or blindLose),
+      // A conflict either mints a FRESH deferral (nothing resolved it
+      // yet) or consumes/clears the latch -- either way the node's
+      // resolved-since ghost resets.
+      deferralResolvedV' =
+        if (not(HOLDER_EVIDENCE_LOSE)) deferralResolvedV
+        else deferralResolvedV.put(n, false),
+      // merged_bug_002's defect latch: exhaustion firing although a
+      // resolving action answered the deferral in between.
+      staleExhaustedLose' =
+        (staleExhaustedLose or (exhausts and deferralResolvedV.get(n))),
       acquireInstV' = acquireInstV,
       stepDownReqV' = stepDownReqV,
       stepDownsV' = stepDownsV,
@@ -1837,6 +1890,8 @@ module leaderElection {
     drops' = drops,
     foreignBumps' = foreignBumps,
     conflictDeferredV' = conflictDeferredV.put(n, false),
+    deferralResolvedV' = deferralResolvedV,
+    staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
@@ -1885,6 +1940,8 @@ module leaderElection {
     unconfirmed' = unconfirmed, lastFetchedKey' = lastFetchedKey,
     drops' = drops, foreignBumps' = foreignBumps,
     conflictDeferredV' = conflictDeferredV,
+    deferralResolvedV' = deferralResolvedV,
+    staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     acquireInstV' = acquireInstV,
     staleStepDownServed' = staleStepDownServed,
@@ -1938,7 +1995,20 @@ module leaderElection {
     suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
     unconfirmed' = unconfirmed, lastFetchedKey' = lastFetchedKey,
     drops' = drops, foreignBumps' = foreignBumps,
-    conflictDeferredV' = conflictDeferredV,
+    // A served step-down ends the belief episode (production routes
+    // through on_observed_not_leading / on_self_fence, both of which
+    // clear the episode latch -- merged_bug_002). Guard idiom keeps
+    // gate-off regimes state-space-identical.
+    conflictDeferredV' =
+      if (not(HOLDER_EVIDENCE_LOSE)) conflictDeferredV
+      else conflictDeferredV.put(n, false),
+    // -- and the resolved-since ghost records the resolution.
+    deferralResolvedV' =
+      if (not(HOLDER_EVIDENCE_LOSE)) deferralResolvedV
+      else deferralResolvedV.put(
+        n, (deferralResolvedV.get(n) or conflictDeferredV.get(n))
+      ),
+    staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     acquireInstV' = acquireInstV,
     stepDownsV' = stepDownsV,
@@ -1983,7 +2053,20 @@ module leaderElection {
     unconfirmed' = unconfirmed, lastFetchedKey' = lastFetchedKey,
     drops' = drops,
     foreignBumps' = foreignBumps,
-    conflictDeferredV' = conflictDeferredV,
+    // The self-fence ends the belief episode: production's
+    // on_self_fence clears the episode latch (merged_bug_002) -- a
+    // new belief episode starts clean. Guard idiom keeps gate-off
+    // regimes state-space-identical.
+    conflictDeferredV' =
+      if (not(HOLDER_EVIDENCE_LOSE)) conflictDeferredV
+      else conflictDeferredV.put(n, false),
+    // -- and the resolved-since ghost records the resolution.
+    deferralResolvedV' =
+      if (not(HOLDER_EVIDENCE_LOSE)) deferralResolvedV
+      else deferralResolvedV.put(
+        n, (deferralResolvedV.get(n) or conflictDeferredV.get(n))
+      ),
+    staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
@@ -2038,6 +2121,8 @@ module leaderElection {
     // step-down request reset. Value-identical no-ops when the planes
     // are disabled (the vars are frozen at their defaults).
     conflictDeferredV' = conflictDeferredV.put(n, false),
+    deferralResolvedV' = deferralResolvedV,
+    staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     acquireInstV' = acquireInstV.put(n, 0),
     stepDownReqV' = stepDownReqV.put(n, NoStepDown),
@@ -2077,6 +2162,8 @@ module leaderElection {
     drops' = drops,
     foreignBumps' = foreignBumps,
     conflictDeferredV' = conflictDeferredV,
+    deferralResolvedV' = deferralResolvedV,
+    staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
@@ -2128,6 +2215,8 @@ module leaderElection {
     drops' = drops,
     foreignBumps' = foreignBumps,
     conflictDeferredV' = conflictDeferredV,
+    deferralResolvedV' = deferralResolvedV,
+    staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
@@ -2177,6 +2266,8 @@ module leaderElection {
     drops' = drops,
     foreignBumps' = foreignBumps,
     conflictDeferredV' = conflictDeferredV,
+    deferralResolvedV' = deferralResolvedV,
+    staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
@@ -2220,6 +2311,8 @@ module leaderElection {
     drops' = drops + 1,
     foreignBumps' = foreignBumps,
     conflictDeferredV' = conflictDeferredV,
+    deferralResolvedV' = deferralResolvedV,
+    staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
@@ -2282,6 +2375,8 @@ module leaderElection {
     drops' = drops + 1,
     foreignBumps' = foreignBumps,
     conflictDeferredV' = conflictDeferredV,
+    deferralResolvedV' = deferralResolvedV,
+    staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
@@ -2370,7 +2465,21 @@ module leaderElection {
       if (MAX_FOREIGN_BUMPS == 0) lastFetchedContent
       else lastFetchedContent.put(n, lease.content),
     foreignBumps' = foreignBumps,
-    conflictDeferredV' = conflictDeferredV,
+    // Own-commit evidence is THE resolving completed read: both
+    // act-failed legs (evidence re-acquire and believing-observe)
+    // route through the production funnel, whose on_observed_held
+    // clears the episode latch (merged_bug_002) -- the deferred 409's
+    // question is answered. Guard idiom keeps gate-off regimes
+    // state-space-identical.
+    conflictDeferredV' =
+      if (not(HOLDER_EVIDENCE_LOSE)) conflictDeferredV
+      else conflictDeferredV.put(n, false),
+    deferralResolvedV' =
+      if (not(HOLDER_EVIDENCE_LOSE)) deferralResolvedV
+      else deferralResolvedV.put(
+        n, (deferralResolvedV.get(n) or conflictDeferredV.get(n))
+      ),
+    staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
@@ -2405,6 +2514,8 @@ module leaderElection {
     lease' = { ...lease, rv: lease.rv + 1 },
     foreignBumps' = foreignBumps + 1,
     conflictDeferredV' = conflictDeferredV,
+    deferralResolvedV' = deferralResolvedV,
+    staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
@@ -2496,6 +2607,8 @@ module leaderElection {
     drops' = drops,
     foreignBumps' = foreignBumps,
     conflictDeferredV' = conflictDeferredV,
+    deferralResolvedV' = deferralResolvedV,
+    staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
@@ -2572,6 +2685,8 @@ module leaderElection {
     drops' = drops,
     foreignBumps' = foreignBumps,
     conflictDeferredV' = conflictDeferredV,
+    deferralResolvedV' = deferralResolvedV,
+    staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
@@ -2617,6 +2732,8 @@ module leaderElection {
     drops' = drops,
     foreignBumps' = foreignBumps,
     conflictDeferredV' = conflictDeferredV,
+    deferralResolvedV' = deferralResolvedV,
+    staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,
@@ -2670,6 +2787,8 @@ module leaderElection {
     evidenceFabricated' = false,
     evidenceConsumed' = false,
     conflictDeferredV' = NODES.mapBy(_ => false),
+    deferralResolvedV' = NODES.mapBy(_ => false),
+    staleExhaustedLose' = false,
     blindConflictLose' = false,
     acquireInstV' = NODES.mapBy(_ => 0),
     stepDownReqV' = NODES.mapBy(_ => NoStepDown),

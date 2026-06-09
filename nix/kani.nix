@@ -161,12 +161,19 @@ in
   # rio-lease: lease/election state machine. One #[kani::proof_for_contract(decide_pure)]
   # harness verifies the four #[kani::ensures] iff-clauses on decide_pure() over
   # the full input domain. The contract case structure parallels the action
-  # partition in docs/spec/models/leaderElection.qnt.
+  # partition in docs/spec/models/leaderElection.qnt. Plus lib.rs:
+  # the lease_standing_proofs trio (fence-never-clears-held,
+  # release-gate-iff-acquired-unsuperseded, and the merged_bug_002
+  # episode-scoped 409 deferral: Exhausted fires iff an unresolved
+  # same-episode deferral precedes) and the DirtyGen
+  # mark-after-snapshot proof.
+  # Harness ledger: 4 -> 5 (bughunt-5 S8 added the deferral proof).
   # r[verify sched.lease.k8s-lease+2]
   # r[verify sched.lease.at-most-one-leader+3]
   kani-rio-lease = mkKaniCheck {
     name = "rio-lease";
     crate = crateBuildKani.members.rio-lease;
+    expectedHarnesses = 5;
   };
 
   # rio-log-kernel: the store's log-chunk decision kernels, extracted
