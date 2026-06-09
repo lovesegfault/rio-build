@@ -88,7 +88,13 @@
     <ClearPoisonButton
       derivationHash={drvHash}
       poisoned={data.status === 'poisoned'}
-      onCleared={() => (menuOpen = false)}
+      onCleared={() => {
+        menuOpen = false;
+        // merged_bug_134: un-latch + restart the drawer's poll so the
+        // cleared node's queued status actually arrives (the documented
+        // "next 5s poll picks up the new status" contract).
+        data.oncleared?.();
+      }}
     />
     {#if data.status !== 'poisoned'}
       <span class="ctx-empty">no actions</span>

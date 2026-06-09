@@ -18,6 +18,10 @@ export type DrvNodeData = {
   // Per-build observation of which execution this build watched. Empty
   // for Cached / never-ran terminals / non-terminal — see RawNode.
   execId: string;
+  // ClearPoison landed on this node: restart the drawer's settled poll
+  // (merged_bug_134). Threaded through node data because DrvNode mounts
+  // inside xyflow's node renderer — props can't reach it directly.
+  oncleared?: () => void;
 };
 
 // xyflow's Node generic needs Record<string, unknown>-compatible data;

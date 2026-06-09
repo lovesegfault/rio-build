@@ -1,10 +1,13 @@
 <script lang="ts">
-  // DAG visualization for a single build. Polls GetBuildGraph every 5s
-  // so node status-colours update as derivations transition; the poll
-  // does NOT re-layout unless the node set changed (a cheap count+edge
-  // signature check — re-running dagre on every poll would make running
-  // builds unwatchable). @xyflow/svelte handles pan/zoom; dagre assigns
-  // positions.
+  // DAG visualization for a single build. The DATA lives in the
+  // drawer-lifetime poll store (lib/buildGraphPoll.svelte.ts,
+  // merged_bug_134) — this component is the LAYOUT half only: it
+  // reacts to the store's node/edge sets, decides degraded-vs-flow,
+  // runs dagre (main thread or worker), and patches statuses in place
+  // when the structure is unchanged. Moving the poll out is what makes
+  // the terminality oracle live while the Logs tab has this component
+  // unmounted; it also means a tab flip back to Graph re-renders from
+  // current data instead of re-fetching from scratch.
   //
   // Threshold ladder:
   //   ≤500    main-thread dagre (sub-100ms)
@@ -12,14 +15,13 @@
   //   >2000   sortable table, no graph (dagre + xyflow both degrade)
   //
   // The server separately caps at 5000 (DASHBOARD_GRAPH_NODE_LIMIT);
-  // GetBuildGraphResponse.truncated signals that, and we degrade
-  // immediately regardless of the returned subset size.
+  // truncated signals that, and we degrade immediately regardless of
+  // the returned subset size.
   import { SvelteFlow, Background, Controls } from '@xyflow/svelte';
   import '@xyflow/svelte/dist/style.css';
-  import { admin } from '../api/admin';
+  import type { BuildGraphPoll } from '../lib/buildGraphPoll.svelte';
   import {
     DEGRADE_THRESHOLD,
-    TERMINAL,
     WORKER_THRESHOLD,
     layoutGraph,
     sortForTable,
@@ -30,7 +32,6 @@
     type RawEdge,
     type RawNode,
   } from '../lib/graphLayout';
-  import { startPoll } from '../lib/poll';
   import type {
     WorkerRequest,
     WorkerResponse,
@@ -47,16 +48,18 @@
   import type { Edge } from '@xyflow/svelte';
 
   let {
-    buildId,
+    poll,
     ondrvclick = undefined,
   }: {
-    buildId: string;
+    // THE single node-status source (merged_bug_134): rendering and
+    // the drawer's terminality oracle read the same store.
+    poll: BuildGraphPoll;
     // execId is the per-build observation of which execution this build
     // watched (`build_derivations.exec_id` via `GraphNode.exec_id`).
     // Empty for Cached / never-ran terminals / non-terminal — the log
     // fetch falls back to "latest exec" and labels itself approximate.
-    // status rides along so the drawer can seed the log stream's
-    // terminality closure from the clicked node.
+    // status rides along for callers that want the click-time value;
+    // the drawer's oracle reads poll.statusOf instead (live).
     ondrvclick?: (drvPath: string, execId: string, status: string) => void;
   } = $props();
 
@@ -73,13 +76,12 @@
   let edges = $state.raw<Edge[]>([]);
 
   let layout = $state<LayoutResult | null>(null);
-  let loading = $state(true);
-  let error = $state<string | null>(null);
 
-  // Structural signature of the last layout — if the next poll returns
-  // the same set of drv paths and edges, we patch node.data (status,
-  // executorId) in place instead of re-running dagre. Status colour
-  // updates should feel instant; a full relayout pauses interaction.
+  // Structural signature of the last layout — if the store's next poll
+  // delivers the same set of drv paths and edges, we patch node.data
+  // (status, executorId) in place instead of re-running dagre. Status
+  // colour updates should feel instant; a full relayout pauses
+  // interaction.
   let lastSig = '';
   function sigOf(gn: readonly RawNode[], ge: readonly RawEdge[]): string {
     return `${gn.length}|${ge.length}|${gn.map((n) => n.drvPath).join(',')}`;
@@ -97,36 +99,19 @@
     return worker;
   }
 
-  // Re-entrancy gate for fetchAndLayout. The 5s setInterval keeps
-  // firing regardless of whether the last poll finished — a slow
-  // network or a heavy dagre pass (1-3s in the worker for 1500+ nodes)
-  // means overlapping calls. Without the gate, both calls race through
-  // layoutInWorker: each installs its own {once:true}-style listener,
-  // the FIRST worker response fires the FIRST listener (promise N
-  // resolves correctly), the SECOND worker response fires the SECOND
-  // listener — promise N+1 resolves with response N+1. That's actually
-  // fine for the worker path in isolation, BUT the two fetches run
-  // concurrently: response N has stale statuses relative to N+1, and if
-  // N's fetch was slow but its layout was fast, N's assignment can land
-  // AFTER N+1's (last-write-wins on `layout =`, `nodes =`). The gate
-  // serializes the whole fetch→layout→assign pipeline — simpler than
-  // seq-number correlation, and we don't want concurrent layouts anyway
-  // (the poll is a single logical stream).
-  let inflight = false;
-
-  // r[impl dash.graph.auto-stop]
-  // Set once every node hits a terminal status (graphLayout.TERMINAL
-  // mirrors is_terminal() in the scheduler). A finished build's drawer
-  // can sit open indefinitely — no point polling GetBuildGraph every 5s
-  // when nothing can change. The $effect reads this reactively and
-  // tears down the interval; if the {#key buildId} wrapper remounts us
-  // for a different build, $state re-initializes to false and polling
-  // resumes for the new graph.
-  let allTerminal = $state(false);
+  // Re-entrancy gate for the layout pipeline. The store can deliver a
+  // new node set while a heavy dagre pass (1-3s in the worker for
+  // 1500+ nodes) is still running; concurrent layouts could resolve
+  // out-of-order (last-write-wins on `layout =`, `nodes =`). The gate
+  // serializes layout passes; `rerun` coalesces every set that arrived
+  // mid-pass into ONE trailing pass that re-reads the store's CURRENT
+  // data (never a stale captured set).
+  let layoutBusy = false;
+  let rerun = false;
 
   function layoutInWorker(
-    gn: RawNode[],
-    ge: RawEdge[],
+    gn: readonly RawNode[],
+    ge: readonly RawEdge[],
   ): Promise<LayoutResult> {
     return new Promise((resolve) => {
       const w = getWorker();
@@ -135,16 +120,28 @@
         if ('error' in ev.data) {
           // Worker crashed — fall back to synchronous. Slow is better
           // than blank.
-          resolve(layoutGraph(gn, ge));
+          resolve(layoutGraph([...gn], [...ge]));
           return;
         }
         const pos = new Map(Object.entries(ev.data.positions));
-        resolve({ degraded: false, ...toXyflow(gn, ge, pos) });
+        resolve({ degraded: false, ...toXyflow([...gn], [...ge], pos) });
       };
       w.addEventListener('message', onMsg);
-      const req: WorkerRequest = { nodes: gn, edges: ge };
+      const req: WorkerRequest = { nodes: [...gn], edges: [...ge] };
       w.postMessage(req);
     });
+  }
+
+  // Thread the store's onCleared into each node's data so DrvNode's
+  // ClearPoisonButton can restart a settled poll (merged_bug_134 —
+  // "the next 5s poll picks up the new status" was unsatisfiable when
+  // the allTerminal latch had permanently stopped the interval).
+  // patchStatuses preserves it via the data spread.
+  function withOncleared(ns: DrvNode[]): DrvNode[] {
+    return ns.map((n) => ({
+      ...n,
+      data: { ...n.data, oncleared: () => poll.onCleared() },
+    }));
   }
 
   // Patch-in-place: build a drvPath → status/executorId lookup from the
@@ -174,92 +171,74 @@
     });
   }
 
-  async function fetchAndLayout() {
-    if (inflight) return;
-    inflight = true;
-    let r;
-    try {
-      r = await admin.getBuildGraph({ buildId });
-      error = null;
-    } catch (e) {
-      error = String(e);
-      loading = false;
-      inflight = false;
+  async function relayoutOnce(): Promise<void> {
+    // Read FRESH from the store — a pass queued behind a slow layout
+    // must see the data that queued it, not a stale capture.
+    const gn = poll.nodes;
+    const ge = poll.edges;
+
+    // Server-side truncation trumps our own threshold — the subset we
+    // got back is arbitrary (first-5000 by insertion order, not
+    // topological), so laying it out would lie about the graph shape.
+    if (poll.truncated || gn.length > DEGRADE_THRESHOLD) {
+      layout = {
+        degraded: true,
+        reason: poll.truncated
+          ? `server truncated (${poll.totalNodes} total)`
+          : `${gn.length} nodes > ${DEGRADE_THRESHOLD}`,
+        nodes: sortForTable(gn),
+      };
       return;
     }
 
+    const sig = sigOf(gn, ge);
+    if (sig === lastSig && layout && !layout.degraded) {
+      patchStatuses(gn);
+      return;
+    }
+    lastSig = sig;
+
+    const result =
+      gn.length > WORKER_THRESHOLD
+        ? await layoutInWorker(gn, ge)
+        : layoutGraph([...gn], [...ge]);
+
+    layout = result;
+    if (!result.degraded) {
+      nodes = withOncleared(result.nodes);
+      edges = result.edges;
+    }
+  }
+
+  async function scheduleLayout(): Promise<void> {
+    if (layoutBusy) {
+      rerun = true;
+      return;
+    }
+    layoutBusy = true;
     try {
-      // Terminal-settle check. `r.nodes.length > 0` guards the trivial
-      // every([])→true — an empty response (build not yet populated, or
-      // ListWatcher race) must NOT stop polling. `!r.truncated` guards
-      // against stopping on a partial view: insertion-order truncation
-      // means roots settle first (normal DAG progress) while the tail
-      // may still be running. Keep polling when truncated.
-      if (!r.truncated && r.nodes.length > 0 && r.nodes.every((n) => TERMINAL.has(n.status))) {
-        allTerminal = true;
-      }
-
-      // Server-side truncation trumps our own threshold — the subset we
-      // got back is arbitrary (first-5000 by insertion order, not
-      // topological), so laying it out would lie about the graph shape.
-      if (r.truncated || r.nodes.length > DEGRADE_THRESHOLD) {
-        layout = {
-          degraded: true,
-          reason: r.truncated
-            ? `server truncated (${r.totalNodes} total)`
-            : `${r.nodes.length} nodes > ${DEGRADE_THRESHOLD}`,
-          nodes: sortForTable(r.nodes),
-        };
-        loading = false;
-        return;
-      }
-
-      const sig = sigOf(r.nodes, r.edges);
-      if (sig === lastSig && layout && !layout.degraded) {
-        patchStatuses(r.nodes);
-        loading = false;
-        return;
-      }
-      lastSig = sig;
-
-      const result =
-        r.nodes.length > WORKER_THRESHOLD
-          ? await layoutInWorker(r.nodes, r.edges)
-          : layoutGraph(r.nodes, r.edges);
-
-      layout = result;
-      if (!result.degraded) {
-        nodes = result.nodes;
-        edges = result.edges;
-      }
-      loading = false;
+      do {
+        rerun = false;
+        await relayoutOnce();
+      } while (rerun);
     } finally {
-      inflight = false;
+      layoutBusy = false;
     }
   }
 
   $effect(() => {
-    // Read buildId synchronously so the effect re-runs if BuildDrawer
-    // re-mounts us with a different build (it shouldn't — the {#key}
-    // wrapper tears this whole component down — but belt-and-braces).
-    void buildId;
-    // allTerminal is reactive: when fetchAndLayout flips it true the
-    // effect re-runs, the old interval is cleared by the teardown
-    // closure, and this branch declines to start a new one. One last
-    // fetchAndLayout fires — harmless, the inflight gate or the
-    // sig-match short-circuits it.
-    if (allTerminal) {
-      fetchAndLayout();
-      return;
-    }
-    return startPoll(fetchAndLayout);
+    // Track the store's reactive surfaces; the layout pass re-reads
+    // them fresh inside relayoutOnce.
+    void poll.nodes;
+    void poll.edges;
+    void poll.truncated;
+    if (poll.loading && poll.nodes.length === 0) return;
+    void scheduleLayout();
   });
 
-  // Worker lifecycle split into its own effect so the allTerminal flip
-  // above doesn't tear down an in-use worker — the worker should
-  // survive until component unmount (or buildId change, which the
-  // {#key} wrapper turns into an unmount anyway). Svelte effects with
-  // no reactive dependencies run once on mount and teardown on unmount.
+  // Worker lifecycle in its own effect: no reactive dependencies, so
+  // it runs once on mount and tears down on unmount (or buildId
+  // change, which the {#key} wrapper turns into an unmount anyway).
   $effect(() => {
     return () => {
       worker?.terminate();
@@ -268,11 +247,11 @@
   });
 </script>
 
-{#if error}
-  <div role="alert" class="err">graph fetch failed: {error}</div>
-{:else if loading}
+{#if poll.error}
+  <div role="alert" class="err">graph fetch failed: {poll.error}</div>
+{:else if layout === null}
   <div class="loading">loading graph…</div>
-{:else if layout?.degraded}
+{:else if layout.degraded}
   <div class="degraded" data-testid="graph-degraded">
     <p class="reason">
       Graph too large for interactive view: {layout.reason}. Showing sortable
@@ -302,7 +281,7 @@
       </tbody>
     </table>
   </div>
-{:else if layout}
+{:else}
   <div class="flow" data-testid="graph-flow">
     <SvelteFlow
       bind:nodes

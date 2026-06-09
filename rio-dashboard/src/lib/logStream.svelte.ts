@@ -366,6 +366,17 @@ export function createLogStream(
           r: IteratorResult<TailChunk>;
         }> | null = null;
         stream_loop: for (;;) {
+          // merged_bug_134: the oracle is LIVE in both directions —
+          // ClearPoison flips a settled derivation back to
+          // non-terminal. An armed deadline then belongs to a world
+          // that no longer holds: un-arm it (a later terminal flip
+          // re-arms a FRESH window). Without this, the stale clock
+          // cuts the resumed follow at a grace minted for the
+          // poisoned state. Self-clearing race edge; the m014 rider's
+          // execSwitch re-derive is the same law at the other input.
+          if (!effTerminal() && graceDeadline !== null) {
+            graceDeadline = null;
+          }
           // bug_145: arm AND enforce at the loop head, before racing.
           // The head runs after every message and every tick, so a
           // chatty stream arms the clock as promptly as a quiet one —
@@ -661,6 +672,12 @@ export function createLogStream(
         done = true;
       };
       const terminal = effTerminal();
+      if (!terminal && graceDeadline !== null) {
+        // Same self-clearing edge as the loop head (merged_bug_134):
+        // an attempt that ends after the oracle retreated must not
+        // exit on a deadline minted for the old terminal world.
+        graceDeadline = null;
+      }
       if (terminal && graceDeadline === null) {
         graceDeadline = Date.now() + GRACE_MS;
       }

@@ -570,6 +570,7 @@ describe('authRequired terminal state', () => {
       .mockImplementation(async function* () {
         // exec B: manifest lags / store outage -- no chunk, ever.
         await new Promise(() => {});
+        yield chunk([]); // unreachable -- satisfies require-yield
       });
     const s = createLogStream('/nix/store/x.drv', '', {
       isTerminal: () => term,
@@ -701,6 +702,37 @@ describe('authRequired terminal state', () => {
     } finally {
       raceSpy.mockRestore();
     }
+  });
+
+
+  // r[verify dash.stream.log-tail+6]
+  /// merged_bug_134's stream half: with a LIVE terminality oracle the
+  /// edges must self-clear in BOTH directions. The armed direction
+  /// already worked (the 1s tick observes a terminal flip); the
+  /// RETREAT did not -- after ClearPoison flips the oracle back to
+  /// non-terminal, the stale armed deadline kept counting and cut the
+  /// resumed follow at a grace that belonged to the poisoned world.
+  /// Pre-fix red: done=true at ~5s with the +6s line never served.
+  it('oracle_retreat_unarms_grace: ClearPoison resumes following past the stale deadline', async () => {
+    let term = true;
+    tailLog.mockImplementation(async function* () {
+      yield chunk(['l0']);
+      await new Promise((r) => setTimeout(r, 6_000));
+      yield chunk(['l1'], { firstLineNumber: 1n });
+      await new Promise(() => {});
+    });
+    const s = createLogStream('/nix/store/x.drv', '', {
+      isTerminal: () => term,
+    });
+    await vi.advanceTimersByTimeAsync(3_000);
+    // ClearPoison: the derivation is live again.
+    term = false;
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(s.done).toBe(false);
+    expect(
+      s.rows.filter((r) => r.kind === 'line').map((r) => r.text),
+    ).toEqual(['l0', 'l1']);
+    s.destroy();
   });
 
 });

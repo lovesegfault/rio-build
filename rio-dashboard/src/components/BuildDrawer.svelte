@@ -1,6 +1,10 @@
 <script lang="ts">
   import type { BuildInfo } from '../api/types';
   import { progress, fmtTsAbs } from '../lib/buildInfo';
+  import {
+    createBuildGraphPoll,
+    type BuildGraphPoll,
+  } from '../lib/buildGraphPoll.svelte';
   import { TERMINAL } from '../lib/graphLayout';
   import Graph from './Graph.svelte';
   import BuildStatePill from './BuildStatePill.svelte';
@@ -18,6 +22,20 @@
 
   let activeTab = $state<'logs' | 'graph'>('logs');
 
+  // THE node-status source (merged_bug_134): one drawer-lifetime
+  // GetBuildGraph poll feeding Graph's rendering AND the log stream's
+  // terminality oracle. The poll must outlive Graph.svelte — that
+  // component unmounts whenever the Logs tab is active, which is
+  // precisely when the oracle is load-bearing. Recreated (and the old
+  // one destroyed) if the parent re-points the drawer at a different
+  // build without remounting it.
+  let poll = $state<BuildGraphPoll | null>(null);
+  $effect(() => {
+    const p = createBuildGraphPoll(build.buildId);
+    poll = p;
+    return () => p.destroy();
+  });
+
   // DrvNode click in the Graph tab focuses that derivation in the Logs
   // tab. Keeping the state here (not in Graph.svelte) so switching
   // between tabs doesn't lose the selection — Graph re-mounts on every
@@ -28,26 +46,32 @@
   // captured at click time so the log fetch can pin the EXACT execution
   // rather than fall back to "latest." Empty for Cached / never-ran
   // terminals / non-terminal — LogViewer renders an "approximate"
-  // banner for those.
+  // banner for those. (Pinning by click-time capture is correct: the
+  // {#key} below remounts LogViewer when the pin changes.)
   let focusedDrv = $state<string | undefined>(undefined);
   let focusedExecId = $state<string>('');
-  // The focused node's status, captured at click time alongside
-  // drv/execId. Snapshot semantics are fine: the {#key} below remounts
-  // LogViewer on focus change, and a node that was terminal at click
-  // stays terminal (TERMINAL is absorbing).
-  let focusedStatus = $state<string | undefined>(undefined);
+
+  // The focused node's status, DERIVED LIVE from the poll
+  // (merged_bug_134 — never a click-time snapshot). The pre-fix
+  // capture froze the terminality oracle in both directions: a node
+  // clicked while running never read terminal after completing
+  // mid-build (the stream re-dialed at the pacer cap, tab stuck
+  // "streaming"), and a poisoned-at-click node stayed "terminal" after
+  // ClearPoison (the stream exited incomplete instead of following the
+  // retry).
+  const focusedStatus = $derived(poll?.statusOf(focusedDrv));
 
   // BuildInfo.state wire values (BuildStatePill.STATE_META): 3 =
   // succeeded, 4 = failed, 5 = cancelled — the build-level terminal
   // set. A terminal build implies no derivation will print again even
-  // when the focused node's own status was captured pre-terminal.
+  // when the focused node's own status reads pre-terminal.
   const buildTerminal = $derived(
     build.state === 3 || build.state === 4 || build.state === 5,
   );
   // Live terminality closure for the log stream's tail_next exit law:
   // reads the reactive build state at call time (the drawer's `build`
-  // prop refreshes with the list poll), plus the focused node's
-  // captured status. Whole-build view: build state alone.
+  // prop refreshes with the list poll), plus the focused node's LIVE
+  // status from the graph poll. Whole-build view: build state alone.
   const isTerminal = () =>
     buildTerminal ||
     (focusedStatus !== undefined && TERMINAL.has(focusedStatus));
@@ -137,18 +161,19 @@
       {#key `${build.buildId}:${focusedDrv ?? ''}:${focusedExecId}`}
         <LogViewer drvPath={focusedDrv} execId={focusedExecId} {isTerminal} />
       {/key}
-    {:else}
-      <!-- Keyed on buildId for the same reason as LogViewer: Graph's
-           $effect kicks off a poll + (possibly) a WebWorker, and we
-           want both torn down cleanly if the drawer re-opens on a
-           different build rather than inheriting the old interval. -->
+    {:else if poll}
+      <!-- Keyed on buildId so a build switch tears down Graph's layout
+           state + WebWorker cleanly. The POLL is not Graph's anymore
+           (merged_bug_134): it lives drawer-wide above, so the
+           terminality oracle stays live while the Logs tab is active.
+           The click no longer captures status — the oracle derives it
+           from the poll. -->
       {#key build.buildId}
         <Graph
-          buildId={build.buildId}
-          ondrvclick={(drv, execId, status) => {
+          {poll}
+          ondrvclick={(drv, execId) => {
             focusedDrv = drv;
             focusedExecId = execId;
-            focusedStatus = status;
             activeTab = 'logs';
           }}
         />
