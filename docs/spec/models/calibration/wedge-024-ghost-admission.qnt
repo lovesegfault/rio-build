@@ -28,6 +28,7 @@ module wedgeCalib024GhostAdmission {
     DWELL_TICKS = 1,
     BREADTH_MIN = 2,
     TRACK_GHOST_NODES = true,
-    ENABLE_ADMISSION = false
+    ENABLE_ADMISSION = false,
+    ENABLE_SUPPRESSED_RETENTION = true
   ).* from "../wedgeCluster"
 }

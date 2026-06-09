@@ -237,12 +237,17 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_controller_wedge_systemic_suppressed_total",
-        "Ticks the OA2 wedge clustering refused to mark anything because \
-         more than half of the attributed build fleet (and >=2 nodes) was \
-         past the expiry threshold - a systemic cause (report-path outage, \
-         store brownout), not per-node wedges. Non-zero = run the hung-node \
-         runbook's systemic triage; the Dead arm received no wedge input \
-         those ticks."
+        "Ticks the OA2 wedge clustering suppressed per-node verdicts, by \
+         engaging `axis` (highest precedence labels the tick). Populations \
+         are FLEET-DERIVED (registered NodeClaims ∪ evidence-bearing nodes; \
+         ≥2 nodes on the axis): axis=ratio — more than half the population \
+         past the cluster threshold (the episode drains and the watermark \
+         latches); axis=breadth — more than half bearing ≥1 in-window \
+         expiry (evidence retained while engaged); axis=dwell — a \
+         suppression watermark latched within the dwell window. \
+         Incremented once per suppressed tick. Non-zero = run the \
+         hung-node runbook's systemic triage; the Dead arm received no \
+         wedge input those ticks."
     );
     describe_counter!(
         "rio_controller_nodeclaim_intent_dropped_total",
@@ -397,4 +402,52 @@ pub fn describe_metrics() {
          off so a stale standby-startup snapshot doesn't overwrite the previous leader's \
          PG rows. Stuck at 1 = PG unreachable from controller; reconcile runs degraded."
     );
+}
+
+/// bug_061 / merged_bug_035 (Q1 closure): the published HELP alphabets
+/// are pinned to the SAME shared consts the record sites consume —
+/// never restated literals (the `stale_reclaim_reason_alphabet_matches_help`
+/// precedent in rio-store). A new `SuppressionAxis` variant or a new
+/// live synthesized reason fails HERE until its HELP decision lands,
+/// and retired phrasings are asserted absent.
+#[cfg(test)]
+mod metric_help_tests {
+    use crate::reconcilers::nodeclaim_pool::wedge::SuppressionAxis;
+
+    /// The HELP window after a family name — generous enough to cover
+    /// the longest description, short enough not to bleed into the
+    /// next family.
+    fn help_window<'a>(lib: &'a str, family: &str) -> &'a str {
+        let start = lib
+            .find(family)
+            .unwrap_or_else(|| panic!("{family} HELP present in describe_metrics"));
+        &lib[start..(start + 1100).min(lib.len())]
+    }
+
+    #[test]
+    fn metric_help_alphabets_match_record_sites() {
+        let lib = include_str!("lib.rs");
+
+        // Wedge suppression family: every closed-alphabet axis label
+        // must be named — the labels come from the SAME
+        // SuppressionAxis the seal executor ticks.
+        let suppressed = "rio_controller_wedge_systemic_suppressed_total";
+        let help = help_window(lib, suppressed);
+        for axis in SuppressionAxis::ALL {
+            assert!(
+                help.contains(axis.label()),
+                "{suppressed} HELP must name suppression axis '{}'",
+                axis.label()
+            );
+        }
+        // The retired denominator phrasing (the SIGNED Q2 block at
+        // wedge.rs names it as the retired defect) must not survive
+        // anywhere in this crate's HELP source. Joined at runtime so
+        // this test's own source cannot satisfy the search.
+        let retired = ["attributed", "build", "fleet"].join(" ");
+        assert!(
+            !lib.contains(&retired),
+            "the retired denominator phrasing '{retired}' must not survive in lib.rs"
+        );
+    }
 }

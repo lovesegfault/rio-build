@@ -34,6 +34,7 @@ module wedgeCalib163PartialDrain {
     // carry the violation (see TRACK_EPISODE_GHOSTS in the model).
     TRACK_EPISODE_GHOSTS = true,    ENABLE_TRAJECTORY = false,    DWELL_TICKS = 1,    BREADTH_MIN = 2,
     TRACK_GHOST_NODES = false,
-    ENABLE_ADMISSION = true
+    ENABLE_ADMISSION = true,
+    ENABLE_SUPPRESSED_RETENTION = true
   ).* from "../wedgeCluster"
 }

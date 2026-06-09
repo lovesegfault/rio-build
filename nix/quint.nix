@@ -6682,7 +6682,8 @@ rec {
     # Falsify twin (live-import, calibration/): the as-built early
     # return past the Systemic epilogue freezes the marked set against
     # a verdict whose survivor set is empty (merged_bug_176;
-    # solo-verified [violation] in ~4s).
+    # [violation] at 172,796 generated / 3,953 distinct, ~7s —
+    # re-verified at the round-5 retention restatement).
     # r[verify ctrl.nodeclaim.wedge-two-axis+4]
     quint-wedge-cluster-calib-early-return = mkQuintWitnessCheck {
       name = "wedge-cluster-calib-early-return";
@@ -6693,7 +6694,8 @@ rec {
     };
     # Same twin, second law: the undrained episode's surviving anchors
     # later build a per-node verdict a suppression already explained
-    # (solo-verified [violation] in ~7s).
+    # ([violation] at 474,362 generated / 8,939 distinct, ~10s —
+    # re-verified at the round-5 retention restatement).
     # r[verify ctrl.nodeclaim.wedge-two-axis+4]
     quint-wedge-cluster-calib-suppressed-evidence = mkQuintWitnessCheck {
       name = "wedge-cluster-calib-suppressed-evidence";
@@ -6805,12 +6807,18 @@ rec {
     };
 
     # merged_bug_034 (Q2 SIGNED): the production trajectory regime —
-    # fleet denominator + breadth + dwell + per-node withholding. All
-    # seven laws TLC-EXHAUSTIVE at MAX_TIME=4/WINDOW=2: 8,707,543
-    # states generated / 44,111 distinct / 0 on queue, 23.4s at
-    # workers=auto — budget 1800s ≈ 75× measured. The dwell-gated
-    # systemic arm is reachability-pinned below ([violation] at
-    # 585,490 generated / 5,020 distinct, 3.7s).
+    # fleet denominator + breadth + dwell + per-node withholding,
+    # PLUS (round-5, merged_bug_016) the suppressed-retention law:
+    # developing-episode ticks retain the marked transition-memory.
+    # All eight laws TLC-EXHAUSTIVE at MAX_TIME=4/WINDOW=2:
+    # 10,031,131 states generated / 58,763 distinct / 0 on queue, 96s
+    # at workers=auto under an 8-way parallel sweep — budget 1800s
+    # ≈ 18× measured (the retention restatement + its two
+    # tick-computed carrier vars grew the space from 8.7M/44,111; the
+    # carriers are constant false off-trajectory, so the other
+    # regimes' spaces are byte-identical to their recorded
+    # baselines). The dwell-gated systemic arm is
+    # reachability-pinned below.
     # r[verify ctrl.nodeclaim.wedge-two-axis+4]
     quint-wedge-cluster-trajectory = mkQuintCheck {
       name = "wedge-cluster-trajectory";
@@ -6824,8 +6832,25 @@ rec {
         "markedIncrementsOnlyOnEdges"
         "systemicDenominatorIsFleet"
         "noSerialReapInDevelopingEpisode"
+        "suppressedTickRetainsMarked"
       ];
       modelTimeoutSec = 1800;
+    };
+
+    # merged_bug_016 falsify twin (round-5): the as-built drain on
+    # suppressed ticks — the developing-episode tick fed an empty
+    # survivor set into the shared marked.retain tail, so one
+    # continuous wedge re-counted (and re-warned) after every
+    # suppressed phase. [violation] of suppressedTickRetainsMarked at
+    # the trajectory regime's exact bounds (125,827 generated / 1,990
+    # distinct, ~6s).
+    # r[verify ctrl.nodeclaim.wedge-two-axis+4]
+    quint-wedge-cluster-calib-suppressed-drain = mkQuintWitnessCheck {
+      name = "wedge-cluster-calib-suppressed-drain";
+      spec = "calibration/wedge-016-suppressed-drain";
+      main = "wedgeCalib016SuppressedDrain";
+      extraSpecs = [ "wedgeCluster" ];
+      witness = "suppressedTickRetainsMarked";
     };
     # Anti-vacuation: the dwell-gated systemic arm actually fires at
     # the trajectory bounds (raw-trip at t, hold through DWELL_TICKS).

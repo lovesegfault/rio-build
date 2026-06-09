@@ -133,6 +133,20 @@ module wedgeCluster {
   //     false Systemics over a denominator larger than the fleet.
   const TRACK_GHOST_NODES: bool
   const ENABLE_ADMISSION: bool
+  // merged_bug_016 (round-5): the suppressed-retention axis. On (the
+  // repair): a suppressed-without-drain tick (the engaged breadth
+  // phase under ENABLE_TRAJECTORY) RETAINS the marked
+  // transition-memory --- the per-arm effects record states
+  // marked-retention explicitly instead of feeding an empty survivor
+  // set into a shared retain tail. Off (as-built): the developing
+  // tick drains marked, so ONE continuous wedge re-counts (and
+  // re-warns) on the first post-suppression tick --- the
+  // once-per-transition contract breaks with no not-wedged interval.
+  // The two carrier vars (lastSuppressedNoDrain, lastShrankMarked)
+  // are computed ONLY on suppressed-no-drain ticks (constant false
+  // wherever ENABLE_TRAJECTORY is off --- zero state cost; the
+  // TRACK_EPISODE_GHOSTS parameter-ladder precedent).
+  const ENABLE_SUPPRESSED_RETENTION: bool
 
   val NODES = Set("n0", "n1", "n2")
   val GHOSTS = if (TRACK_GHOST_NODES) Set("g0") else Set()
@@ -181,6 +195,14 @@ module wedgeCluster {
   // m288: whether the last verdict-bearing update was a skip (RPC
   // failure) --- the restated counter law exempts unobserved ticks.
   var lastSkip: bool
+  // merged_bug_016: the last observed tick was suppressed WITHOUT a
+  // drain (developing episode, ratio not fired) --- the retention
+  // law's guard.
+  var lastSuppressedNoDrain: bool
+  // merged_bug_016: on that suppressed-no-drain tick, did any
+  // non-evicted marked entry leave the set? (true = the as-built
+  // drain; computed only on suppressed-no-drain ticks.)
+  var lastShrankMarked: bool
 
   // --- helpers ---------------------------------------------------------------
   def inWindow(anchor: int, now: int): bool = now - anchor <= WINDOW
@@ -237,6 +259,8 @@ module wedgeCluster {
     sawSuppressed' = false,
     pendingSince' = -1,
     lastSkip' = false,
+    lastSuppressedNoDrain' = false,
+    lastShrankMarked' = false,
   }
 
   // --- one reconcile tick: evict, observe (or skip), prune, finalize ----------
@@ -251,7 +275,7 @@ module wedgeCluster {
       consumed: Set[str], systemic: bool, affected: int, of_: int,
       wedged: Set[str], skip: bool, episodeAnchors: Set[(str, str, int)],
       watermark: int, expiredSince: (str, str) -> int,
-      pendingSince: int } =
+      pendingSince: int, suppressedNoDrain: bool, shrankMarked: bool } =
     val now = time + 1
     val consumed = if (ENABLE_EVICTION) pendingEvictions else Set()
     val evAfterEvict = evidence.keys().filter(n => not(consumed.contains(n))).mapBy(n => evidence.get(n))
@@ -319,6 +343,10 @@ module wedgeCluster {
         evObserved.keys().filter(n => not(wedged.contains(n))).mapBy(n => evObserved.get(n))
       else evObserved
     val survivors = if (systemic or developing) Set() else wedged
+    // merged_bug_016: a suppressed tick that retains evidence (the
+    // developing breadth phase --- ratio did not fire) must retain
+    // the marked transition-memory too.
+    val suppressedNoDrain = developing and not(systemic) and not(skip)
     // As-built early return: the Systemic arm skips BOTH the insert
     // loop and the retain — marked freezes. m288: a SKIP tick retains
     // the marked set unchanged (the retired encoding wiped it through
@@ -328,7 +356,13 @@ module wedgeCluster {
         markedAfterEvict
       else if (systemic and not(ENABLE_FULL_EPILOGUE))
         markedAfterEvict
+      else if (suppressedNoDrain and ENABLE_SUPPRESSED_RETENTION)
+        markedAfterEvict
       else survivors
+    // Computed only on suppressed-no-drain ticks (zero state cost
+    // off-axis): did the tick drop a non-evicted marked entry?
+    val shrankMarked = suppressedNoDrain and
+      markedAfterEvict.exists(n => not(newMarked.contains(n)))
     val delta = if (skip or (systemic and not(ENABLE_FULL_EPILOGUE)))
         0
       else survivors.exclude(markedAfterEvict).size()
@@ -358,6 +392,8 @@ module wedgeCluster {
       watermark: if (TRACK_EPISODE_GHOSTS) (if (systemic) now else watermark) else -1,
       expiredSince: if (TRACK_EPISODE_GHOSTS) newExpiredSince else Map(),
       pendingSince: newPendingSince,
+      suppressedNoDrain: suppressedNoDrain,
+      shrankMarked: shrankMarked,
     }
 
   action tick = {
@@ -399,6 +435,8 @@ module wedgeCluster {
       sawSuppressed' = (sawSuppressed or r.episodeAnchors.size() > 0),
       pendingSince' = r.pendingSince,
       lastSkip' = r.skip,
+      lastSuppressedNoDrain' = r.suppressedNoDrain,
+      lastShrankMarked' = r.shrankMarked,
     }
   }
 
@@ -421,6 +459,7 @@ module wedgeCluster {
     watermark' = watermark, expiredSince' = expiredSince,
     sawSystemic' = sawSystemic, sawPerNode' = sawPerNode, sawReWedge' = sawReWedge,
     sawSuppressed' = sawSuppressed, pendingSince' = pendingSince, lastSkip' = lastSkip,
+    lastSuppressedNoDrain' = lastSuppressedNoDrain, lastShrankMarked' = lastShrankMarked,
   }
 
   // (nn): the literal step alias — runs live in regime modules only.
@@ -460,10 +499,21 @@ module wedgeCluster {
     lastDelta >= 0,
     // m288 restatement: an unobserved (skip) tick moves the counter
     // by zero and retains the marked set; an observed tick's marked
-    // set equals the epilogue's survivor set.
+    // set equals the epilogue's survivor set --- EXCEPT the
+    // suppressed-no-drain tick, whose per-variant effects RETAIN the
+    // set (merged_bug_016; the retention law below carries that arm).
     lastSkip implies (lastDelta == 0),
-    (not(lastSkip)) implies
+    (not(lastSkip) and not(lastSuppressedNoDrain)) implies
       marked == (if (lastSystemic) Set() else lastWedged),
+  }
+  // merged_bug_016: the retention law --- a suppressed-without-drain
+  // tick moves the transition counter by zero and drops no
+  // non-evicted marked entry. The as-built shared survivors tail
+  // (ENABLE_SUPPRESSED_RETENTION off) violates the second conjunct on
+  // the first developing tick after a per-node mark.
+  val suppressedTickRetainsMarked = lastSuppressedNoDrain implies and {
+    lastDelta == 0,
+    not(lastShrankMarked),
   }
   // merged_bug_034 (Q2): the Systemic verdict's denominator is the
   // registered fleet --- a traffic lull (shrunken instantaneous
@@ -546,7 +596,8 @@ module wedgeClusterMain {
     DWELL_TICKS = 1,
     BREADTH_MIN = 2,
     TRACK_GHOST_NODES = false,
-    ENABLE_ADMISSION = true
+    ENABLE_ADMISSION = true,
+    ENABLE_SUPPRESSED_RETENTION = true
   ).*
 }
 
@@ -570,7 +621,8 @@ module wedgeClusterLatch {
     DWELL_TICKS = 1,
     BREADTH_MIN = 2,
     TRACK_GHOST_NODES = false,
-    ENABLE_ADMISSION = true
+    ENABLE_ADMISSION = true,
+    ENABLE_SUPPRESSED_RETENTION = true
   ).*
 }
 
@@ -589,7 +641,8 @@ module wedgeClusterNoEviction {
     DWELL_TICKS = 1,
     BREADTH_MIN = 2,
     TRACK_GHOST_NODES = false,
-    ENABLE_ADMISSION = true
+    ENABLE_ADMISSION = true,
+    ENABLE_SUPPRESSED_RETENTION = true
   ).*
 }
 
@@ -613,7 +666,8 @@ module wedgeClusterTrajectory {
     DWELL_TICKS = 1,
     BREADTH_MIN = 2,
     TRACK_GHOST_NODES = false,
-    ENABLE_ADMISSION = true
+    ENABLE_ADMISSION = true,
+    ENABLE_SUPPRESSED_RETENTION = true
   ).*
 }
 
@@ -636,7 +690,8 @@ module wedgeClusterEpilogue {
     DWELL_TICKS = 1,
     BREADTH_MIN = 2,
     TRACK_GHOST_NODES = false,
-    ENABLE_ADMISSION = true
+    ENABLE_ADMISSION = true,
+    ENABLE_SUPPRESSED_RETENTION = true
   ).*
 }
 
@@ -661,6 +716,7 @@ module wedgeClusterAdmission {
     DWELL_TICKS = 1,
     BREADTH_MIN = 2,
     TRACK_GHOST_NODES = true,
-    ENABLE_ADMISSION = true
+    ENABLE_ADMISSION = true,
+    ENABLE_SUPPRESSED_RETENTION = true
   ).*
 }

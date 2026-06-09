@@ -39,7 +39,7 @@ mod health;
 mod lifecycle_tests;
 mod pods;
 pub mod sketch;
-mod wedge;
+pub(crate) mod wedge;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -1511,12 +1511,14 @@ impl NodeClaimPoolReconciler {
                     affected,
                     of,
                     breadth,
+                    axis,
                     ..
                 } => {
                     debug!(
                         affected,
                         of,
                         breadth,
+                        axis = axis.label(),
                         "wedge verdicts suppressed (ratio, breadth or dwell trajectory \
                          axis); Dead arm receives no wedge input this tick"
                     );

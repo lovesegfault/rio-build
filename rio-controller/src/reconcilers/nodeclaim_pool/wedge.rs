@@ -134,6 +134,54 @@ const _: () = assert!(
 
 pub(super) use seal::Sealed;
 
+/// The closed suppression-axis alphabet (merged_bug_016/bug_061;
+/// SIGNED S1-OQ2: the suppression counter is per-tick with an `axis`
+/// label). Precedence ratio > breadth > dwell — the
+/// highest-precedence ENGAGING source labels the tick. The
+/// [`SuppressionAxis::label`] strings are THE alphabet the lib.rs
+/// HELP containment test (`metric_help_alphabets_match_record_sites`)
+/// consumes — shared consts, never restated literals. A new axis is
+/// a non-exhaustive-match compile error at the per-arm effects in
+/// `seal` and a failing containment test until its HELP clause
+/// lands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SuppressionAxis {
+    /// More than half of the fleet-derived population (≥2 nodes)
+    /// past the cluster threshold — drains + latches per engaged
+    /// tick.
+    Ratio,
+    /// More than half of the population (≥2 nodes) bearing ≥1
+    /// in-window expiry — suppresses while retaining evidence.
+    Breadth,
+    /// A suppression watermark latched within
+    /// [`WEDGE_VERDICT_DWELL_SECS`] — the episode's trailing edge is
+    /// not fresh per-node wedges.
+    Dwell,
+}
+
+impl SuppressionAxis {
+    /// Every axis — the containment test iterates this so a new
+    /// variant fails the HELP assertion, not a reviewer's memory.
+    /// Test-only consumer BY DESIGN (the lib.rs containment test);
+    /// production code matches the closed enum exhaustively instead
+    /// of iterating it.
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) const ALL: [SuppressionAxis; 3] = [
+        SuppressionAxis::Ratio,
+        SuppressionAxis::Breadth,
+        SuppressionAxis::Dwell,
+    ];
+
+    /// The Prometheus `axis` label value.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            SuppressionAxis::Ratio => "ratio",
+            SuppressionAxis::Breadth => "breadth",
+            SuppressionAxis::Dwell => "dwell",
+        }
+    }
+}
+
 /// One tick's wedge verdict: per-node Dead-equivalents, a systemic
 /// pattern that marks nothing, or an unobserved tick.
 #[derive(Debug)]
@@ -145,11 +193,15 @@ pub(super) enum WedgeVerdict {
     /// ratio or the breadth trajectory axis exceeded
     /// [`WEDGE_SYSTEMIC_FRACTION`] of the fleet-derived population)
     /// or post-episode dwell. Nothing is marked; the trajectory
-    /// state rides the verdict (§5-S Q2).
+    /// state AND the engaging axis ride the verdict (§5-S Q2 +
+    /// SIGNED S1-OQ2).
     Systemic {
         affected: usize,
         of: usize,
         breadth: usize,
+        /// The highest-precedence engaging suppression source — the
+        /// same value that labeled this tick's counter increment.
+        axis: SuppressionAxis,
         _sealed: Sealed,
     },
     /// The open-attempt view was unobserved this tick (RPC failure):
@@ -385,8 +437,9 @@ pub(super) struct WedgeTracker {
 /// called that unrepresentable.)
 mod seal {
     use super::{
-        Suppression, WEDGE_CLUSTER_MIN_DISTINCT_DRVS, WEDGE_SYSTEMIC_FRACTION,
-        WEDGE_VERDICT_DWELL_SECS, WedgePopulations, WedgeTracker, WedgeVerdict,
+        Suppression, SuppressionAxis, WEDGE_CLUSTER_MIN_DISTINCT_DRVS, WEDGE_CLUSTER_WINDOW_SECS,
+        WEDGE_SYSTEMIC_FRACTION, WEDGE_VERDICT_DWELL_SECS, WedgePopulations, WedgeTracker,
+        WedgeVerdict,
     };
 
     /// Proof-of-origin token for [`WedgeVerdict`]: constructible only
@@ -395,23 +448,180 @@ mod seal {
     #[derive(Debug)]
     pub(in crate::reconcilers::nodeclaim_pool) struct Sealed(());
 
-    /// The single verdict exit: every arm runs its full epilogue.
+    /// What happens to the evidence window this tick.
+    enum EvidenceDisposition {
+        /// Drain the WHOLE window — every node in it, not just the
+        /// wedged subset (merged_bug_163: a sub-threshold
+        /// participant's episode anchor must not survive as half of
+        /// a future pair).
+        DrainWindow,
+        /// Keep the window untouched.
+        Retain,
+    }
+
+    /// What happens to the suppression watermark this tick.
+    enum WatermarkDisposition {
+        /// Latch at the max of any LIVE watermark and the drained
+        /// evidence's maximum ledger-frame expiry — the gate never
+        /// lowers — and refresh `set_at` so the dwell runs from this
+        /// latch (merged_bug_018: both sides PG-frame).
+        MergeLatch,
+        /// Keep as-is.
+        Keep,
+    }
+
+    /// What happens to the marked transition-memory this tick.
+    enum MarkedDisposition {
+        /// `marked` becomes exactly this set: transition-gated
+        /// inserts (counter + warn inside the applier) plus removal
+        /// of everything else — a node that fell under the threshold
+        /// or whose episode drained leaves, so a later re-wedge
+        /// counts as a NEW transition.
+        ReplaceWith(Vec<String>),
+        /// Keep as-is. A suppressed tick that retains evidence MUST
+        /// retain the transition memory too (merged_bug_016: the
+        /// retired shared `survivors` tail drained `marked` on every
+        /// breadth/dwell-suppressed tick, so ONE continuous wedge
+        /// re-counted `rio_controller_node_wedge_marked_total` and
+        /// re-fired the Dead-equivalent warn after every suppressed
+        /// phase, violating the once-per-transition contract).
+        Retain,
+    }
+
+    /// merged_bug_016 (R14): the TOTAL per-arm epilogue effects
+    /// record. Every populated verdict arm constructs one — all four
+    /// fields mandatory — so an arm that retains evidence must STATE
+    /// its marked-retention and its counter decision; drain-on-retain
+    /// and silent counter gaps cease to typecheck as shared-tail
+    /// defaults. Applied by [`apply`], the only mutation site for
+    /// `evidence` / `last_suppression` / `marked` / both counters.
+    struct ArmEffects {
+        evidence: EvidenceDisposition,
+        watermark: WatermarkDisposition,
+        marked: MarkedDisposition,
+        /// `Some(axis)` increments
+        /// `rio_controller_wedge_systemic_suppressed_total{axis}` —
+        /// the observability tick is PART of the typed closure set
+        /// (bug_061: the breadth/dwell arms previously withheld both
+        /// the Dead-arm input AND the counter, blinding the
+        /// runbook's "non-zero = systemic triage" tripwire exactly
+        /// while the automation was suppressing).
+        suppressed_tick: Option<SuppressionAxis>,
+    }
+
+    impl SuppressionAxis {
+        /// Per-variant ENGAGED-TICK effects — exhaustive over the
+        /// closed alphabet: a new axis fails to compile here until
+        /// its effects are declared.
+        fn engage_tick_effects(self) -> ArmEffects {
+            match self {
+                // Ratio: drain + latch are PER-ENGAGED-TICK effects
+                // (spec-mandated re-derivation — a post-episode
+                // re-wedge IS a new transition).
+                SuppressionAxis::Ratio => ArmEffects {
+                    evidence: EvidenceDisposition::DrainWindow,
+                    watermark: WatermarkDisposition::MergeLatch,
+                    marked: MarkedDisposition::ReplaceWith(Vec::new()),
+                    suppressed_tick: Some(SuppressionAxis::Ratio),
+                },
+                // Breadth: retain everything while engaged — the
+                // evidence keeps accumulating toward the ratio law.
+                SuppressionAxis::Breadth => ArmEffects {
+                    evidence: EvidenceDisposition::Retain,
+                    watermark: WatermarkDisposition::Keep,
+                    marked: MarkedDisposition::Retain,
+                    suppressed_tick: Some(SuppressionAxis::Breadth),
+                },
+                // Dwell: retain — fresh post-watermark evidence is
+                // building toward the post-dwell re-detect.
+                SuppressionAxis::Dwell => ArmEffects {
+                    evidence: EvidenceDisposition::Retain,
+                    watermark: WatermarkDisposition::Keep,
+                    marked: MarkedDisposition::Retain,
+                    suppressed_tick: Some(SuppressionAxis::Dwell),
+                },
+            }
+        }
+    }
+
+    /// The single effects applier: the ONLY place `evidence`,
+    /// `last_suppression`, `marked` and the two wedge counters
+    /// mutate. Field order is load-bearing: the drain computes the
+    /// episode's max ledger-frame expiry BEFORE clearing, and the
+    /// merge-latch consumes it.
+    fn apply(t: &mut WedgeTracker, effects: ArmEffects, now_secs: f64) {
+        let drained_max: Option<u64> = match effects.evidence {
+            EvidenceDisposition::DrainWindow => {
+                let max = t
+                    .evidence
+                    .values()
+                    .flat_map(|per| per.values())
+                    .map(|e| e.expiry_pg)
+                    .max();
+                t.evidence.clear();
+                max
+            }
+            EvidenceDisposition::Retain => None,
+        };
+        match effects.watermark {
+            WatermarkDisposition::MergeLatch => {
+                // Merge law: max of any live (in-TTL) watermark and
+                // the drained episode's newest PG-frame expiry — the
+                // admission gate never lowers; `set_at` refreshes so
+                // the dwell runs from this latch.
+                let live = t
+                    .last_suppression
+                    .filter(|w| now_secs - w.set_at <= WEDGE_CLUSTER_WINDOW_SECS)
+                    .map(|w| w.max_expiry_pg)
+                    .unwrap_or(0);
+                t.last_suppression = Some(Suppression {
+                    set_at: now_secs,
+                    max_expiry_pg: live.max(drained_max.unwrap_or(0)),
+                });
+            }
+            WatermarkDisposition::Keep => {}
+        }
+        match effects.marked {
+            MarkedDisposition::ReplaceWith(nodes) => {
+                for node in &nodes {
+                    if t.marked.insert(node.clone()) {
+                        metrics::counter!("rio_controller_node_wedge_marked_total").increment(1);
+                        tracing::warn!(
+                            node = %node,
+                            "node marked Dead-equivalent: ≥{WEDGE_CLUSTER_MIN_DISTINCT_DRVS} distinct \
+                             derivations' pull attempts expired on it inside the window (OA2 clustering)"
+                        );
+                    }
+                }
+                t.marked.retain(|n| nodes.contains(n));
+            }
+            MarkedDisposition::Retain => {}
+        }
+        if let Some(axis) = effects.suppressed_tick {
+            // SIGNED S1-OQ2: per-tick, labeled by the engaging axis.
+            metrics::counter!(
+                "rio_controller_wedge_systemic_suppressed_total",
+                "axis" => axis.label()
+            )
+            .increment(1);
+        }
+    }
+
+    /// The single verdict exit: every arm constructs its TOTAL
+    /// [`ArmEffects`] record, executed by [`apply`].
     ///
     /// - `None` (unobserved tick, bug_151): a distinct
     ///   [`WedgeVerdict::Unobserved`] — retained evidence neither
     ///   marks nor suppresses, and `marked` is NOT re-derived (an RPC
     ///   blip draining it would double-count the next transitions).
-    /// - Systemic (merged_bug_163): suppression counter + warn +
-    ///   WHOLE-EPISODE evidence drain (every node in the window, not
-    ///   just the wedged subset — a sub-threshold participant's
-    ///   episode anchor must not survive as half of a future pair) +
-    ///   the suppression watermark `observe` gates admission on (the
-    ///   still-open attempts of the episode re-present every tick;
-    ///   their expiries predate the watermark, so they cannot
-    ///   re-anchor — a genuinely stuck node re-detects from
+    /// - Engaged (Some axis, precedence ratio > breadth > dwell):
+    ///   the axis's per-variant engage-tick effects — ratio drains
+    ///   the WHOLE episode + merge-latches the watermark `observe`
+    ///   gates admission on (a genuinely stuck node re-detects from
     ///   [`WEDGE_CLUSTER_MIN_DISTINCT_DRVS`] fresh POST-episode
-    ///   expiries, the §5-Q21 direction now extended to the whole
-    ///   population) + marked-set re-derivation.
+    ///   expiries, the §5-Q21 direction); breadth/dwell retain. The
+    ///   suppression counter ticks on EVERY engaged tick, labeled by
+    ///   the axis.
     /// - NodeWedged: transition-gated counter + marked-set
     ///   re-derivation.
     pub(super) fn finalize(
@@ -447,78 +657,65 @@ mod seal {
         let dwell_active = t
             .last_suppression
             .is_some_and(|w| now_secs - w.set_at <= WEDGE_VERDICT_DWELL_SECS);
-        let trajectory_suppressed = breadth_suppressed || (dwell_active && !wedged.is_empty());
-        let survivors: Vec<String> = if systemic {
-            metrics::counter!("rio_controller_wedge_systemic_suppressed_total").increment(1);
-            tracing::warn!(
-                affected = wedged.len(),
-                of = population,
-                breadth,
-                "wedge clustering suppressed: >{WEDGE_SYSTEMIC_FRACTION} of the fleet-derived \
-                 population is past the expiry threshold — systemic cause (report-path \
-                 outage, store brownout), not per-node wedges; marking nothing, draining \
-                 the WHOLE episode's evidence and latching the suppression watermark \
-                 (see the hung-node runbook's systemic discrimination)"
-            );
-            // merged_bug_163: drain the whole episode and latch it.
-            // merged_bug_018: the watermark is the episode's maximum
-            // LEDGER-frame expiry — the admission gate compares
-            // like-framed instants, so one physical expiry cannot
-            // flip across ticks with the reconstruction jitter.
-            let max_expiry_pg = t
-                .evidence
-                .values()
-                .flat_map(|per| per.values())
-                .map(|e| e.expiry_pg)
-                .max()
-                .unwrap_or(0);
-            t.evidence.clear();
-            t.last_suppression = Some(Suppression {
-                set_at: now_secs,
-                max_expiry_pg,
-            });
-            Vec::new()
-        } else if trajectory_suppressed {
-            tracing::warn!(
-                affected,
-                of = population,
-                breadth,
-                dwell_active,
-                "wedge per-node verdicts suppressed by the trajectory axes (§5-S Q2): \
-                 breadth-fraction systemic-in-formation or post-episode dwell — marking \
-                 nothing; evidence is retained (no drain) so a genuine cluster either \
-                 trips the ratio law or ages out of the window"
-            );
-            Vec::new()
+        let engaging: Option<SuppressionAxis> = if systemic {
+            Some(SuppressionAxis::Ratio)
+        } else if breadth_suppressed {
+            Some(SuppressionAxis::Breadth)
+        } else if dwell_active && !wedged.is_empty() {
+            Some(SuppressionAxis::Dwell)
         } else {
-            for node in &wedged {
-                if t.marked.insert(node.clone()) {
-                    metrics::counter!("rio_controller_node_wedge_marked_total").increment(1);
-                    tracing::warn!(
-                        node = %node,
-                        "node marked Dead-equivalent: ≥{WEDGE_CLUSTER_MIN_DISTINCT_DRVS} distinct \
-                         derivations' pull attempts expired on it inside the window (OA2 clustering)"
-                    );
+            None
+        };
+        match engaging {
+            Some(axis) => {
+                match axis {
+                    SuppressionAxis::Ratio => tracing::warn!(
+                        affected,
+                        of = population,
+                        breadth,
+                        "wedge clustering suppressed: >{WEDGE_SYSTEMIC_FRACTION} of the \
+                         fleet-derived population is past the expiry threshold — systemic \
+                         cause (report-path outage, store brownout), not per-node wedges; \
+                         marking nothing, draining the WHOLE episode's evidence and \
+                         latching the suppression watermark (see the hung-node runbook's \
+                         systemic discrimination)"
+                    ),
+                    SuppressionAxis::Breadth | SuppressionAxis::Dwell => tracing::warn!(
+                        affected,
+                        of = population,
+                        breadth,
+                        axis = axis.label(),
+                        "wedge per-node verdicts suppressed by the trajectory axes (§5-S \
+                         Q2): breadth-fraction systemic-in-formation or post-episode \
+                         dwell — marking nothing; evidence is retained (no drain) so a \
+                         genuine cluster either trips the ratio law or ages out of the \
+                         window"
+                    ),
+                }
+                apply(t, axis.engage_tick_effects(), now_secs);
+                // The verdict reports the pre-drain populations + the
+                // engaging axis.
+                WedgeVerdict::Systemic {
+                    affected,
+                    of: population,
+                    breadth,
+                    axis,
+                    _sealed: Sealed(()),
                 }
             }
-            wedged
-        };
-        // Shared epilogue tail: `marked` tracks exactly the
-        // currently-wedged set (nodes that fell under the threshold —
-        // or whose episode was drained — leave it, so a later re-wedge
-        // counts as a new transition).
-        t.marked.retain(|n| survivors.contains(n));
-        if systemic || trajectory_suppressed {
-            // `survivors` is empty on these arms; the verdict reports
-            // the pre-drain populations + the trajectory state.
-            WedgeVerdict::Systemic {
-                affected,
-                of: population,
-                breadth,
-                _sealed: Sealed(()),
+            None => {
+                apply(
+                    t,
+                    ArmEffects {
+                        evidence: EvidenceDisposition::Retain,
+                        watermark: WatermarkDisposition::Keep,
+                        marked: MarkedDisposition::ReplaceWith(wedged.clone()),
+                        suppressed_tick: None,
+                    },
+                    now_secs,
+                );
+                WedgeVerdict::NodeWedged(wedged, Sealed(()))
             }
-        } else {
-            WedgeVerdict::NodeWedged(survivors, Sealed(()))
         }
     }
 }
@@ -1565,8 +1762,10 @@ mod proptests {
                     breadth,
                 }
             } else if breadth_suppressed || (dwell_active && !wedged.is_empty()) {
-                // Trajectory suppression: NO drain, NO latch (Q2).
-                self.marked.clear();
+                // Trajectory suppression: NO drain, NO latch — and
+                // the marked transition-memory is RETAINED
+                // (merged_bug_016: draining it made the next per-node
+                // tick re-count a continuous wedge).
                 Expect::Systemic {
                     affected: wedged.len(),
                     of: population,
@@ -1676,6 +1875,17 @@ mod proptests {
                         )));
                     }
                 }
+                // merged_bug_016 retention law: the tracker's marked
+                // transition-memory matches the oracle's set algebra
+                // on EVERY tick — suppressed ticks retain, ratio
+                // ticks drain, per-node ticks re-derive.
+                let tracker_marked: BTreeSet<String> = tracker.marked.iter().cloned().collect();
+                prop_assert_eq!(
+                    tracker_marked,
+                    oracle.marked.clone(),
+                    "tick {}: marked set diverged from the oracle",
+                    i
+                );
             }
         }
     }
@@ -1963,6 +2173,206 @@ mod population_and_epilogue_tests {
             "suppression epilogue must drain the marked set: {:?}",
             t.marked
         );
+    }
+}
+
+/// merged_bug_016 + bug_061 regression battery: the typed per-arm
+/// epilogue effects record — suppressed ticks RETAIN the marked
+/// transition-memory, and the suppression counter ticks on EVERY
+/// suppressed tick labeled by the engaging axis. Witnesses per Q1:
+/// DebuggingRecorder over the production counter names, sequences
+/// driven only through `update()` with PG-frame production-shaped
+/// `OpenAttempt`s.
+// r[verify ctrl.nodeclaim.wedge-two-axis+4]
+#[cfg(test)]
+mod epilogue_effects_tests {
+    use super::*;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    fn no_reaps() -> std::collections::BTreeSet<String> {
+        std::collections::BTreeSet::new()
+    }
+    fn fleet(nodes: &[&str]) -> HashSet<String> {
+        nodes.iter().map(|s| s.to_string()).collect()
+    }
+    /// PG-frame production posture (Q1): epoch set, age consistent.
+    fn pg_expired(intent: &str, node: &str, assigned_pg: u64, now: f64) -> OpenAttempt {
+        OpenAttempt {
+            intent_id: intent.into(),
+            source_node: node.into(),
+            assigned_at_epoch_secs: assigned_pg,
+            assigned_at_age_secs: (now as u64) - assigned_pg,
+            deadline_secs: 100,
+            attempt_kind: rio_proto::types::AttemptKind::Build as i32,
+            ..Default::default()
+        }
+    }
+    /// Sum a counter's value across label sets, optionally requiring
+    /// an `axis` label value. Takes a materialized snapshot — the
+    /// DebuggingRecorder's `snapshot()` DRAINS counters (swap-to-0),
+    /// so a test must snapshot exactly once.
+    type SnapshotEntries = Vec<(
+        metrics_util::CompositeKey,
+        Option<metrics::Unit>,
+        Option<metrics::SharedString>,
+        DebugValue,
+    )>;
+    fn counter_value(entries: &SnapshotEntries, name: &str, axis: Option<&str>) -> u64 {
+        entries
+            .iter()
+            .filter(|(k, _, _, _)| k.key().name() == name)
+            .filter(|(k, _, _, _)| match axis {
+                Some(want) => k
+                    .key()
+                    .labels()
+                    .any(|l| l.key() == "axis" && l.value() == want),
+                None => true,
+            })
+            .map(|(_, _, _, v)| match v {
+                DebugValue::Counter(c) => *c,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// merged_bug_016 red 1: ONE continuous wedge (node-1's two
+    /// attempts never close) must count exactly one not-wedged→wedged
+    /// transition even when a breadth-suppressed phase interleaves.
+    /// The retired epilogue fed empty `survivors` into the shared
+    /// `marked.retain` on every suppressed tick, so node-1 re-counted
+    /// (and re-warned) when the phase ended. Recorded red on that
+    /// shape: counter read 2 (`left: 2, right: 1`). Deliberately
+    /// arm-agnostic about the post-suppression tick's verdict so the
+    /// episode-close chokepoint (merged_bug_023) does not invalidate
+    /// this pin — only the COUNTER is asserted there.
+    #[test]
+    fn continuous_wedge_does_not_recount_across_suppressed_phase() {
+        let recorder = DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            let mut t = WedgeTracker::default();
+            let reg = fleet(&["node-1", "node-2", "node-3", "node-4", "node-5", "node-6"]);
+            // t0: node-1's pair marks (assigned 9_865, deadline+grace
+            // 130 → expired since 9_995). Counter: 1.
+            let pair = |now: f64| {
+                vec![
+                    pg_expired("n1a", "node-1", 9_865, now),
+                    pg_expired("n1b", "node-1", 9_865, now),
+                ]
+            };
+            let v = t.update(Some(&pair(10_000.0)), &no_reaps(), &reg, 10_000.0);
+            assert!(
+                matches!(v, WedgeVerdict::NodeWedged(ref n, _) if n == &vec!["node-1".to_string()])
+            );
+            // t1: singleton expiries on nodes 2-6 engage breadth
+            // (6 of 6 evidence-bearing); node-1 still over threshold.
+            let mut view1 = pair(10_010.0);
+            for n in 2..=6 {
+                view1.push(pg_expired(
+                    &format!("s{n}"),
+                    &format!("node-{n}"),
+                    9_875,
+                    10_010.0,
+                ));
+            }
+            assert!(matches!(
+                t.update(Some(&view1), &no_reaps(), &reg, 10_010.0),
+                WedgeVerdict::Systemic { .. }
+            ));
+            // t2 = 11_810: node-1's t0 anchors age out (1810 > 1800)
+            // while the singletons' t1 anchors hold the window edge
+            // (1800 ≤ 1800) — still breadth-suppressed; the singleton
+            // ATTEMPTS closed (not in view), node-1's pair is still
+            // open.
+            assert!(matches!(
+                t.update(Some(&pair(11_810.0)), &no_reaps(), &reg, 11_810.0),
+                WedgeVerdict::Systemic { .. }
+            ));
+            // t3 = 11_815: the singletons' anchors age out; node-1's
+            // still-open pair re-anchors fresh. Whatever the verdict
+            // arm does here (per-node re-detect today; an episode
+            // close under the breadth-release law), the transition
+            // counter must NOT move — node-1 never stopped being the
+            // same continuous wedge.
+            let _ = t.update(Some(&pair(11_815.0)), &no_reaps(), &reg, 11_815.0);
+        });
+        let entries = snap.snapshot().into_vec();
+        assert_eq!(
+            counter_value(&entries, "rio_controller_node_wedge_marked_total", None),
+            1,
+            "one continuous wedge across a suppressed phase must count exactly one transition"
+        );
+    }
+
+    /// bug_061 / merged_bug_016 secondary red: EVERY suppressed tick
+    /// increments `rio_controller_wedge_systemic_suppressed_total`
+    /// labeled by the engaging axis. Recorded red on the retired
+    /// code: breadth and dwell ticks moved nothing (the counter
+    /// lived only in the ratio arm, unlabeled) — the runbook's
+    /// "non-zero = run the systemic triage" tripwire was blind
+    /// exactly while the automation was suppressing.
+    #[test]
+    fn suppressed_ticks_tick_the_suppression_counter_by_axis() {
+        let recorder = DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            let reg = fleet(&["node-1", "node-2", "node-3", "node-4", "node-5", "node-6"]);
+            // axis=breadth: singletons on 4 of 6 nodes (no node past
+            // the cluster threshold).
+            let mut t = WedgeTracker::default();
+            let view: Vec<OpenAttempt> = (1..=4)
+                .map(|n| pg_expired(&format!("b{n}"), &format!("node-{n}"), 9_865, 10_000.0))
+                .collect();
+            assert!(matches!(
+                t.update(Some(&view), &no_reaps(), &reg, 10_000.0),
+                WedgeVerdict::Systemic {
+                    axis: SuppressionAxis::Breadth,
+                    ..
+                }
+            ));
+            // axis=ratio: a fresh tracker; 4 of 6 nodes past the
+            // threshold.
+            let mut t = WedgeTracker::default();
+            let storm: Vec<OpenAttempt> = (1..=4)
+                .flat_map(|n| {
+                    vec![
+                        pg_expired(&format!("r{n}x"), &format!("node-{n}"), 9_865, 10_000.0),
+                        pg_expired(&format!("r{n}y"), &format!("node-{n}"), 9_865, 10_000.0),
+                    ]
+                })
+                .collect();
+            assert!(matches!(
+                t.update(Some(&storm), &no_reaps(), &reg, 10_000.0),
+                WedgeVerdict::Systemic {
+                    axis: SuppressionAxis::Ratio,
+                    ..
+                }
+            ));
+            // axis=dwell: 60s after the ratio latch, node-5 presents
+            // a FRESH post-watermark pair (admitted) — per-node
+            // verdicts stay dwell-gated.
+            let fresh: Vec<OpenAttempt> = vec![
+                pg_expired("d5x", "node-5", 9_931, 10_065.0),
+                pg_expired("d5y", "node-5", 9_931, 10_065.0),
+            ];
+            assert!(matches!(
+                t.update(Some(&fresh), &no_reaps(), &reg, 10_065.0),
+                WedgeVerdict::Systemic {
+                    axis: SuppressionAxis::Dwell,
+                    ..
+                }
+            ));
+        });
+        let suppressed = "rio_controller_wedge_systemic_suppressed_total";
+        let entries = snap.snapshot().into_vec();
+        for axis in SuppressionAxis::ALL {
+            assert_eq!(
+                counter_value(&entries, suppressed, Some(axis.label())),
+                1,
+                "exactly one {} suppressed tick must be counted",
+                axis.label()
+            );
+        }
     }
 }
 
