@@ -246,6 +246,16 @@ impl ResidueReceiver {
 
 impl Drop for ResidueReceiver {
     fn drop(&mut self) {
+        // close() BEFORE draining (merged_bug_009): after close, no
+        // in-flight send can complete -- a reserve()d permit fails and
+        // the sender's bounce lands in the counted refusal path
+        // (UploadSink::Lost / the DiscardLedger), while everything that
+        // made it into the channel before the close is yielded by the
+        // drain below. Without the close there is a third outcome: a
+        // send that completes between a try_recv(Empty) observation and
+        // the receiver's actual drop returns Ok to the sender yet its
+        // batch dies here uncounted.
+        self.0.close();
         let mut residue: u64 = 0;
         while let Ok(b) = self.0.try_recv() {
             residue = residue.saturating_add(b.lines.len() as u64);
@@ -1876,6 +1886,35 @@ mod tests {
             "channel residue must disclose: {}",
             rec.get("rio_builder_log_drain_abandoned_total{reason=uploader_dead}")
         );
+    }
+
+    // r[verify builder.log.loss-disclosure+3]
+    /// merged_bug_009: the parked-sender-vs-drop race. Drop closes the
+    /// channel BEFORE draining, so a send still parked when the
+    /// receiver dies must resolve Err (the caller's counted bounce
+    /// path) -- it can never return Ok against a receiver that has
+    /// already finished its accounting. Pre-fix, the freed slot during
+    /// the drain let a racing send land Ok after the drain had passed
+    /// it by: an uncounted destruction the conservation law forbids.
+    /// 200 rounds on the multi-thread runtime to exercise the window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parked_sender_vs_drop_never_loses_silently() {
+        for round in 0..200 {
+            let (tx, rx) = mpsc::channel::<BuildLogBatch>(1);
+            let rr = super::ResidueReceiver(rx);
+            // Fill the channel: this batch is part of the drained residue.
+            tx.send(batch(0, 2)).await.unwrap();
+            // Park a second send on the full channel.
+            let sender = tokio::spawn(async move { tx.send(batch(2, 3)).await.is_ok() });
+            tokio::task::yield_now().await;
+            drop(rr);
+            let sent_ok = sender.await.unwrap();
+            assert!(
+                !sent_ok,
+                "round {round}: a send parked at receiver-drop time returned Ok -- \
+                 its batch was destroyed after the drop's accounting finished"
+            );
+        }
     }
 
     // r[verify builder.log.loss-disclosure+3]
