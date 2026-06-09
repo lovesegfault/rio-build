@@ -110,6 +110,7 @@ pub fn destroy(dir: &str) -> Result<()> {
 }
 
 /// All tofu outputs from one `-json` read. See [`outputs`].
+#[derive(Debug)]
 pub struct Outputs(HashMap<String, String>);
 
 impl Outputs {
@@ -205,6 +206,21 @@ pub fn outputs(dir: &str) -> Result<Outputs> {
     let sh = shell()?;
     let raw = sh::read(cmd!(sh, "tofu -chdir={dir} output -no-color -json"))
         .context("tofu output -json failed — run `cargo xtask k8s -p eks up --provision` first?")?;
+    parse_outputs(&raw)
+}
+
+/// Parse `tofu output -no-color -json` into the string map [`Outputs`].
+///
+/// Every scalar (string, number, bool) is coerced to its string form —
+/// callers `.parse()` to the type they expect. Composite outputs
+/// (arrays/objects) are a HARD ERROR naming the key, never a silent
+/// drop: the pre-fix string-only `filter_map` made the numeric
+/// `pg_max_connections` / `log_retention_days` outputs invisible, so
+/// [`Outputs::get`] reported "missing or state empty — run --provision
+/// first?" against a state file that had them — sending the operator
+/// at the provisioning layer for a parsing bug. Missing-key errors are
+/// only trustworthy if present keys can never vanish in the parse.
+fn parse_outputs(raw: &str) -> Result<Outputs> {
     #[derive(serde::Deserialize)]
     struct Out {
         value: serde_json::Value,
@@ -213,11 +229,26 @@ pub fn outputs(dir: &str) -> Result<Outputs> {
         serde_json::from_str(raw.trim()).context("parse tofu output -json")?;
     let map = parsed
         .into_iter()
-        .filter_map(|(k, o)| match o.value {
-            serde_json::Value::String(s) => Some((k, s)),
-            _ => None,
+        .map(|(k, o)| {
+            let v = match o.value {
+                serde_json::Value::String(s) => s,
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                other => {
+                    let kind = match other {
+                        serde_json::Value::Array(_) => "array",
+                        serde_json::Value::Object(_) => "object",
+                        _ => "null",
+                    };
+                    bail!(
+                        "tofu output '{k}' is a non-scalar ({kind}) — xtask reads scalar \
+                         outputs only; flatten it in outputs.tf or add dedicated parsing"
+                    )
+                }
+            };
+            Ok((k, v))
         })
-        .collect();
+        .collect::<Result<HashMap<_, _>>>()?;
     Ok(Outputs(map))
 }
 
@@ -238,4 +269,41 @@ pub async fn state_bucket(cfg: &XtaskConfig, aws: &aws_config::SdkConfig) -> Res
     let ident = sts.get_caller_identity().send().await?;
     let account = ident.account().context("no AWS account ID")?.to_owned();
     resolve_bucket(cfg, || Ok(account))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Scalar outputs of every JSON type must be readable. Pre-fix,
+    /// `parse_outputs` kept only strings and silently dropped the
+    /// rest, so the numeric `pg_max_connections` / `log_retention_days`
+    /// outputs read as "missing or state empty" at deploy while
+    /// sitting right there in the state file.
+    #[test]
+    fn parse_outputs_reads_all_scalar_types() {
+        let raw = r#"{
+            "pg_max_connections": {"sensitive": false, "type": "number", "value": 2000},
+            "log_retention_days": {"value": 30},
+            "deletion_protection": {"value": true},
+            "cluster_name": {"value": "rio-eks"}
+        }"#;
+        let out = parse_outputs(raw).unwrap();
+        assert_eq!(out.get("pg_max_connections").unwrap(), "2000");
+        assert_eq!(out.get("log_retention_days").unwrap(), "30");
+        assert_eq!(out.get("deletion_protection").unwrap(), "true");
+        assert_eq!(out.get("cluster_name").unwrap(), "rio-eks");
+    }
+
+    /// A composite output must be a hard error naming the key — never
+    /// a silent drop. `Outputs::get`'s missing-key error has to mean
+    /// MISSING, or its "run --provision first?" hint sends the
+    /// operator at the wrong layer.
+    #[test]
+    fn parse_outputs_rejects_composites_naming_the_key() {
+        let raw = r#"{"private_subnet_ids": {"value": ["subnet-a", "subnet-b"]}}"#;
+        let err = parse_outputs(raw).unwrap_err().to_string();
+        assert!(err.contains("private_subnet_ids"), "got: {err}");
+        assert!(err.contains("array"), "got: {err}");
+    }
 }
