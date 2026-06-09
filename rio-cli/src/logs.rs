@@ -49,10 +49,10 @@ pub(crate) struct Args {
 pub(crate) async fn run(client: &mut LogsClient, a: Args) -> anyhow::Result<()> {
     // STREAMING — NOT via rpc() helper. The helper's whole-call
     // deadline is wrong for log tails (a build can run for an
-    // hour). Wrap just the initial call in the timeout — once the
-    // stream is open, per-message receives have no deadline (an
-    // active build may go minutes between log lines; that's not a
-    // hang, that's a slow build).
+    // hour); wrap just the initial call in the timeout. Per-message
+    // silence is bounded by the drain law below
+    // ([`drain_log_chunks`] — the policy site that owns the
+    // timeout-regime rationale).
     //
     // `follow: false` — one-shot drain of whatever is durably stored
     // (plus the live in-memory buffer if the execution is still
