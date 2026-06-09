@@ -279,7 +279,7 @@ pub fn describe_metrics() {
         "rio_controller_job_terminal_report_seconds",
         "OA1 interval (i): Pod/Job terminal-condition timestamp → \
          the pod-terminal ReportAttemptOutcome acked by the scheduler, by reason \
-         (oom_killed | disk_pressure | deadline_exceeded). Sampled once \
+         (oom_killed | evicted_disk_pressure | deadline_exceeded). Sampled once \
          per terminal Pod/Job per controller process at the first acked \
          report — the report path re-reports the same object every tick \
          for the Job TTL window (the scheduler dedups server-side), and \

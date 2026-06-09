@@ -1476,15 +1476,24 @@ pub(super) fn job_deadline_exceeded_epoch_secs(job: &Job) -> Option<f64> {
 }
 
 /// Prometheus `reason` label for the OA1 interval-(i) histogram. Same
-/// strings the scheduler's floor path persists as `termination_reason`,
-/// so the controller-side and scheduler-side series line up. Only the
+/// strings the scheduler's floor path persists as `termination_reason`
+/// — BY CONSTRUCTION since bug_255: the emitting arms route through
+/// `rio_common::classify::attempt_terminal_reason_label` via the
+/// unified wire vocabulary, so the planes cannot drift (the retired
+/// hand-mirrored match emitted `disk_pressure` against the scheduler's
+/// `evicted_disk_pressure`; equality joins returned nothing). Only the
 /// promoting reasons and DeadlineExceeded ever reach the metric (the
-/// report path filters the rest before the RPC).
+/// report path filters the rest before the RPC) — the filtered arms
+/// keep the deliberate `other` collapse.
 fn termination_reason_label(reason: TerminationReason) -> &'static str {
     match reason {
-        TerminationReason::OomKilled => "oom_killed",
-        TerminationReason::EvictedDiskPressure => "disk_pressure",
-        TerminationReason::DeadlineExceeded => "deadline_exceeded",
+        TerminationReason::OomKilled
+        | TerminationReason::EvictedDiskPressure
+        | TerminationReason::DeadlineExceeded => {
+            rio_common::classify::attempt_terminal_reason_label(
+                unified_attempt_reason(reason).into(),
+            )
+        }
         TerminationReason::EvictedOther
         | TerminationReason::Completed
         | TerminationReason::Error
@@ -1979,12 +1988,38 @@ mod tests {
         );
         assert_eq!(
             termination_reason_label(TerminationReason::EvictedDiskPressure),
-            "disk_pressure"
+            "evicted_disk_pressure"
         );
         assert_eq!(
             termination_reason_label(TerminationReason::DeadlineExceeded),
             "deadline_exceeded"
         );
+    }
+
+    /// bug_255 parity: the controller-side OA1 `reason` label and the
+    /// scheduler's persisted `termination_reason` label must be EQUAL
+    /// for every reason both planes emit (the documented "series line
+    /// up" contract — equality joins between the planes depend on it).
+    #[test]
+    fn termination_reason_label_parity_with_scheduler() {
+        use rio_common::classify::{AttemptTerminalKind, attempt_terminal_reason_label};
+        for (reason, kind) in [
+            (TerminationReason::OomKilled, AttemptTerminalKind::OomKilled),
+            (
+                TerminationReason::EvictedDiskPressure,
+                AttemptTerminalKind::EvictedDiskPressure,
+            ),
+            (
+                TerminationReason::DeadlineExceeded,
+                AttemptTerminalKind::DeadlineExceeded,
+            ),
+        ] {
+            assert_eq!(
+                termination_reason_label(reason),
+                attempt_terminal_reason_label(kind),
+                "the planes' series must line up for {reason:?}"
+            );
+        }
     }
 
     /// `pod_termination_reason` classification. Mirrors what k8s

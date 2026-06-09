@@ -1366,24 +1366,14 @@ pub struct AttemptIdentity {
 }
 
 /// Map the wire reason to the `termination_reason` label the second
-/// installment records.
+/// installment records. ONE mapping for both planes (bug_255): the
+/// vocabulary lives in `rio_common::classify`; the controller's OA1
+/// histogram routes through the same fn, so the planes' series line
+/// up by construction.
 pub(crate) fn attempt_terminal_reason_label(
     reason: rio_proto::types::AttemptTerminalReason,
 ) -> &'static str {
-    use rio_proto::types::AttemptTerminalReason as R;
-    match reason {
-        R::Unspecified => "unspecified",
-        R::OomKilled => "oom_killed",
-        R::EvictedDiskPressure => "evicted_disk_pressure",
-        R::EvictedOther => "evicted_other",
-        R::Completed => "pod_completed",
-        R::Error => "pod_error",
-        R::DeadlineExceeded => "deadline_exceeded",
-        R::Cancelled => "cancelled",
-        R::Preempted => "preempted",
-        R::Reaped => "reaped",
-        R::NoEligibleSource => "no_eligible_source",
-    }
+    rio_common::classify::attempt_terminal_reason_label(reason.into())
 }
 
 impl DagActor {

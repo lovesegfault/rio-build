@@ -416,7 +416,7 @@
       {
         "name": "rio_controller_job_terminal_report_seconds",
         "kind": "histogram",
-        "help": "OA1 interval (i): Pod/Job terminal-condition timestamp → the pod-terminal ReportAttemptOutcome acked by the scheduler, by reason (oom_killed | disk_pressure | deadline_exceeded). Sampled once per terminal Pod/Job per controller process at the first acked report — the report path re-reports the same object every tick for the Job TTL window (the scheduler dedups server-side), and re-sampling those would measure the TTL window instead of the report latency. This is the controller-report-slack baseline the executor-replacement establishment window is sized against (executor-lifecycle campaign, OA1)."
+        "help": "OA1 interval (i): Pod/Job terminal-condition timestamp → the pod-terminal ReportAttemptOutcome acked by the scheduler, by reason (oom_killed | evicted_disk_pressure | deadline_exceeded). Sampled once per terminal Pod/Job per controller process at the first acked report — the report path re-reports the same object every tick for the Job TTL window (the scheduler dedups server-side), and re-sampling those would measure the TTL window instead of the report latency. This is the controller-report-slack baseline the executor-replacement establishment window is sized against (executor-lifecycle campaign, OA1)."
       },
       {
         "name": "rio_controller_lease_acquired_total",

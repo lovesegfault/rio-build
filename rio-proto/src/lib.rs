@@ -210,3 +210,32 @@ pub use store::store_admin_service_client::StoreAdminServiceClient;
 pub use store::store_admin_service_server::{StoreAdminService, StoreAdminServiceServer};
 pub use store::store_service_client::StoreServiceClient;
 pub use store::store_service_server::{StoreService, StoreServiceServer};
+
+// ---------------------------------------------------------------------------
+// bug_255: the wire→classification bridge. rio-proto depends on
+// rio-common, so this exhaustive From is the machine witness that the
+// wire alphabet and the shared label vocabulary cannot drift: a new
+// AttemptTerminalReason variant fails THIS match at compile time, and
+// a new AttemptTerminalKind variant fails the label match in
+// rio_common::classify. Both planes' label emitters route through it.
+// ---------------------------------------------------------------------------
+
+impl From<types::AttemptTerminalReason> for rio_common::classify::AttemptTerminalKind {
+    fn from(reason: types::AttemptTerminalReason) -> Self {
+        use rio_common::classify::AttemptTerminalKind as K;
+        use types::AttemptTerminalReason as R;
+        match reason {
+            R::Unspecified => K::Unspecified,
+            R::OomKilled => K::OomKilled,
+            R::EvictedDiskPressure => K::EvictedDiskPressure,
+            R::EvictedOther => K::EvictedOther,
+            R::Completed => K::Completed,
+            R::Error => K::Error,
+            R::DeadlineExceeded => K::DeadlineExceeded,
+            R::Cancelled => K::Cancelled,
+            R::Preempted => K::Preempted,
+            R::Reaped => K::Reaped,
+            R::NoEligibleSource => K::NoEligibleSource,
+        }
+    }
+}

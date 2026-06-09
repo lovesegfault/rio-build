@@ -73,3 +73,83 @@ mod tests {
         }
     }
 }
+
+// ---------------------------------------------------------------
+// bug_255 (S1a): the attempt-terminal label vocabulary. One mapping
+// from the attempt-terminal alphabet to the Prometheus label strings
+// BOTH planes emit (scheduler termination_reason row + series labels;
+// controller OA1 report-interval histogram). The retired shape was two
+// hand-mirrored matches disagreeing on EvictedDiskPressure
+// (disk_pressure vs evicted_disk_pressure). [GEN-SET] consumer list +
+// command: see the module doc of the introducing commit / the sweeps
+// file docs/gen/sweeps/bughunt4-s3.md pattern.
+// ---------------------------------------------------------------
+
+/// Crate-neutral mirror of the wire `AttemptTerminalReason` alphabet
+/// (`rio-proto` depends on `rio-common`, so the proto enum cannot
+/// appear here; the exhaustive `From` impl lives next to the enum).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptTerminalKind {
+    Unspecified,
+    OomKilled,
+    EvictedDiskPressure,
+    EvictedOther,
+    Completed,
+    Error,
+    DeadlineExceeded,
+    Cancelled,
+    Preempted,
+    Reaped,
+    NoEligibleSource,
+}
+
+/// THE `termination_reason`/`reason` label vocabulary. The scheduler's
+/// persisted strings are canonical (durable rows + recorded HELP
+/// outlive a metrics-only rename), so the controller side adopted
+/// `evicted_disk_pressure` at the bug_255 close.
+pub fn attempt_terminal_reason_label(kind: AttemptTerminalKind) -> &'static str {
+    use AttemptTerminalKind as K;
+    match kind {
+        K::Unspecified => "unspecified",
+        K::OomKilled => "oom_killed",
+        K::EvictedDiskPressure => "evicted_disk_pressure",
+        K::EvictedOther => "evicted_other",
+        K::Completed => "pod_completed",
+        K::Error => "pod_error",
+        K::DeadlineExceeded => "deadline_exceeded",
+        K::Cancelled => "cancelled",
+        K::Preempted => "preempted",
+        K::Reaped => "reaped",
+        K::NoEligibleSource => "no_eligible_source",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The canonical strings are load-bearing (persisted rows join on
+    /// them); pin the full alphabet.
+    #[test]
+    fn label_alphabet_pinned() {
+        let all = [
+            (AttemptTerminalKind::Unspecified, "unspecified"),
+            (AttemptTerminalKind::OomKilled, "oom_killed"),
+            (
+                AttemptTerminalKind::EvictedDiskPressure,
+                "evicted_disk_pressure",
+            ),
+            (AttemptTerminalKind::EvictedOther, "evicted_other"),
+            (AttemptTerminalKind::Completed, "pod_completed"),
+            (AttemptTerminalKind::Error, "pod_error"),
+            (AttemptTerminalKind::DeadlineExceeded, "deadline_exceeded"),
+            (AttemptTerminalKind::Cancelled, "cancelled"),
+            (AttemptTerminalKind::Preempted, "preempted"),
+            (AttemptTerminalKind::Reaped, "reaped"),
+            (AttemptTerminalKind::NoEligibleSource, "no_eligible_source"),
+        ];
+        for (kind, label) in all {
+            assert_eq!(attempt_terminal_reason_label(kind), label);
+        }
+    }
+}
