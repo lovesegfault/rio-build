@@ -99,12 +99,15 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_gateway_build_resync_rate_paced_total",
-        "Resync-signalled WatchBuild re-attaches paced by the wall-clock cycle-rate \
-         window (bug_160): the consecutive-streak bound stayed at zero because \
-         organic events kept arriving, but the cycle RATE exceeded RATE_MAX per \
-         window -- a durably-slow event consumer (or undersized broadcast buffer) \
-         was charging the scheduler one O(DAG) snapshot per cycle. Sustained \
-         growth means find the slow consumer, not the scheduler outage."
+        "WatchBuild re-attach cycles paced by the wall-clock rate axis (token \
+         bucket: RATE_MAX cycles per RATE_WINDOW sustained), labeled by the \
+         death cause that charged the cycle (cause: resync_signal | transport \
+         | eof_without_terminal | reattach_cycle_failed). Every death arm pays \
+         this axis through the one next_backoff chokepoint (merged_bug_083); \
+         refill is time-based, so paced cycles cannot drain the evidence. \
+         Sustained growth means a durably-slow event consumer (or undersized \
+         broadcast buffer) charging the scheduler one O(DAG) snapshot per \
+         cycle -- find the slow consumer, not a scheduler outage."
     );
     describe_counter!(
         "rio_gateway_log_tail_reconnects_total",

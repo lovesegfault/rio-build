@@ -1161,22 +1161,62 @@ enum EventSource {
     NeedsReattach,
 }
 
-/// Why (and whether) the next resync-signalled re-attach is paced —
-/// the two bounding axes of [`ReattachBudget`], typed so the call
-/// site handles each explicitly (bug_160).
+/// The closed cause alphabet of [`ReattachBudget::next_backoff`]
+/// (merged_bug_083): every way a watch cycle can die is a variant
+/// here, and the chokepoint matches it exhaustively — a new death arm
+/// cannot compile without deciding its pacing posture at the
+/// chokepoint. Per-arm axis choice (the pre-fix bypass: the rate axis
+/// consulted only on the resync arm) is unwritable, because the arms
+/// no longer see an axis API at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResyncPacing {
-    /// Inside both bounds: re-attach immediately (the lagging-but-
-    /// healthy scheduler stays invisible to the client).
-    Immediate,
-    /// The consecutive non-organic streak exceeded
-    /// [`ReattachBudget::ZERO_BACKOFF_STREAK`] (merged_bug_056).
-    StreakPaced(std::time::Duration),
-    /// The wall-clock cycle rate exceeded
-    /// [`ReattachBudget::RATE_MAX`] per window (bug_160): organic
-    /// progress kept resetting the streak, but the rate says the
-    /// loop is churning O(DAG) snapshots.
-    RatePaced(std::time::Duration),
+enum BackoffCause {
+    /// Server-signalled watcher lag (`ResyncRequired`): the scheduler
+    /// is healthy, this watcher fell behind. Zero backoff inside the
+    /// consecutive non-organic streak; silent to the client.
+    ResyncSignal,
+    /// gRPC-level death of the live stream.
+    Transport,
+    /// The live stream ended without a terminal event (the scheduler
+    /// failover signature).
+    EofWithoutTerminal,
+    /// A `NeedsReattach` cycle failed before any stream existed
+    /// (`WatchBuild` open rejected, or no/garbled snapshot).
+    ReattachCycleFailed,
+}
+
+impl BackoffCause {
+    /// Label value for the rate-paced counter's `cause` label.
+    fn label(self) -> &'static str {
+        match self {
+            BackoffCause::ResyncSignal => "resync_signal",
+            BackoffCause::Transport => "transport",
+            BackoffCause::EofWithoutTerminal => "eof_without_terminal",
+            BackoffCause::ReattachCycleFailed => "reattach_cycle_failed",
+        }
+    }
+}
+
+/// Per-cycle effects record (the merged_bug_083 closure set), minted
+/// ONLY by [`ReattachBudget::next_backoff`]: the charge, the sleep,
+/// the exhaustion break verdict, and the rate-axis observability all
+/// travel together — an arm consumes the record wholesale and cannot
+/// take the pacing without the observability, or pick which axis to
+/// consult (the counter tick itself fires inside the chokepoint).
+struct PacingDecision {
+    /// Cycle number after this charge (for logs and the client line).
+    attempt: u32,
+    /// The consecutive-streak budget is spent: the loop MUST break
+    /// with its error. Exhaustion is streak-keyed only — the rate
+    /// axis paces, never fails (gw.resync.reattach-budget).
+    exhausted: bool,
+    /// Mandatory sleep before the next cycle: the MAX of the streak
+    /// ladder and the rate ladder — both bounds hold on every death
+    /// arm. Zero = immediate.
+    sleep: std::time::Duration,
+    /// The rate axis engaged (token-bucket deficit): the counter was
+    /// ticked with this decision's cause label; logs carry the slow-
+    /// consumer operator signal.
+    rate_paced: bool,
 }
 
 /// Bounds consecutive re-attach cycles, resetting only on organic
@@ -1202,10 +1242,10 @@ enum ResyncPacing {
 /// seconds — so the storm bound above is preserved.
 // r[impl gw.resync.reattach-budget+3]
 // (bug_160: the budget is TWO-AXIS — the consecutive streak above,
-// and a wall-clock cycle-rate window organic events cannot reset.
-// The rule's prose reword rides the S8b narration slot per the
-// campaign's cross-slot row; the code axis lands here.)
-#[derive(Default)]
+// and a wall-clock cycle-rate axis organic events cannot reset.
+// merged_bug_083: BOTH axes bound EVERY death arm through the single
+// next_backoff(cause) chokepoint, and the rate evidence is a token
+// bucket whose refill is independent of consumption.)
 struct ReattachBudget {
     /// Consecutive re-attach cycles since the last organic event or
     /// evidenced recovery.
@@ -1216,16 +1256,35 @@ struct ReattachBudget {
     /// [`Self::LIVE_TENURE_RESET`] proves the previous outage ended,
     /// so its charges do not bleed into the new one.
     live_since: Option<std::time::Instant>,
-    /// bug_160: re-attach cycle timestamps inside
-    /// [`Self::RATE_WINDOW`]. The streak axis (`attempts`) resets on
-    /// organic progress — correct for "is the scheduler serving us",
-    /// wrong as the ONLY bound: a durably-slow consumer of a chatty
-    /// build interleaves resync→snapshot→organic forever, riding
-    /// zero backoff while charging the scheduler one O(DAG) snapshot
-    /// per cycle. Timestamps have no reset API — `note_event` cannot
-    /// touch them; only the window's passage evicts — so the rate
-    /// axis survives exactly the interleave that defeats the streak.
-    recent: std::collections::VecDeque<std::time::Instant>,
+    /// Rate-axis token bucket (bug_160 evidence, merged_bug_083
+    /// mechanism): capacity [`Self::RATE_MAX`], refilled RATE_MAX per
+    /// fully elapsed [`Self::RATE_WINDOW`] (window-quantized), each
+    /// cycle consumes one. Negative = the deficit the ladder rung
+    /// derives from. The streak axis (`attempts`) resets on organic
+    /// progress — correct for "is the scheduler serving us", wrong as
+    /// the ONLY bound: a durably-slow consumer of a chatty build
+    /// interleaves death→snapshot→organic forever, riding zero
+    /// backoff while charging the scheduler one O(DAG) snapshot per
+    /// cycle. Refill is TIME-based and independent of consumption —
+    /// `note_event` cannot touch it, and (unlike the pre-fix eviction
+    /// window) paced cycles cannot evict the proof that pacing is
+    /// needed, so the paced fixed point is reachable.
+    rate_tokens: i64,
+    /// Start of the current refill window. `None` ⇔ the bucket is
+    /// full and no window is running; the next charge anchors it.
+    rate_window_started: Option<std::time::Instant>,
+}
+
+impl Default for ReattachBudget {
+    fn default() -> Self {
+        Self {
+            attempts: 0,
+            live_since: None,
+            // The bucket starts full: a fresh watch owes nothing.
+            rate_tokens: Self::RATE_MAX as i64,
+            rate_window_started: None,
+        }
+    }
 }
 
 impl ReattachBudget {
@@ -1282,18 +1341,20 @@ impl ReattachBudget {
         }
     }
 
-    /// Test hook: age every recorded cycle timestamp by `by` (drives
-    /// the rate window's eviction without real sleeps).
+    /// Test hook: age the rate bucket's refill window by `by` (drives
+    /// refill maturation without real sleeps — the simulated-clock
+    /// advance of the deterministic cadence tests).
     #[cfg(test)]
-    fn backdate_recent_for_test(&mut self, by: std::time::Duration) {
-        for t in &mut self.recent {
+    fn backdate_rate_window_for_test(&mut self, by: std::time::Duration) {
+        if let Some(t) = self.rate_window_started.as_mut() {
             *t = t.checked_sub(by).expect("backdated Instant underflow");
         }
     }
 
     /// Charge one re-attach cycle (stream death, loss signal, or a
     /// failed `WatchBuild`/snapshot read). Returns the cycle number
-    /// for logging.
+    /// for logging. Internal to [`Self::next_backoff`] — arms never
+    /// charge directly.
     ///
     /// Consumes the armed `Live` tenure first: a dying stream that
     /// stayed `Live` past [`Self::LIVE_TENURE_RESET`] is recovery
@@ -1302,16 +1363,33 @@ impl ReattachBudget {
     /// (bug_068). `take()` so one `Live` entry arms exactly one
     /// potential reset: repeated failures inside `NeedsReattach`
     /// keep charging the same outage.
+    ///
+    /// The rate bucket refills window-quantized: RATE_MAX tokens per
+    /// FULLY elapsed RATE_WINDOW since the window anchor, clamped at
+    /// capacity — so "beyond RATE_MAX cycles inside one RATE_WINDOW"
+    /// always runs the bucket into deficit, and sustained consumption
+    /// above RATE_MAX/RATE_WINDOW keeps it there regardless of how
+    /// the pacing spaces the cycles.
     fn note_reattach(&mut self) -> u32 {
         let now = std::time::Instant::now();
-        while self
-            .recent
-            .front()
-            .is_some_and(|t| now.duration_since(*t) >= Self::RATE_WINDOW)
-        {
-            self.recent.pop_front();
+        let capacity = Self::RATE_MAX as i64;
+        if let Some(start) = self.rate_window_started {
+            let windows = (now.saturating_duration_since(start).as_nanos()
+                / Self::RATE_WINDOW.as_nanos()) as u32;
+            if windows > 0 {
+                self.rate_tokens = (self.rate_tokens + i64::from(windows) * capacity).min(capacity);
+                self.rate_window_started = if self.rate_tokens == capacity {
+                    // Full again — the next charge re-anchors.
+                    None
+                } else {
+                    Some(start + Self::RATE_WINDOW * windows)
+                };
+            }
         }
-        self.recent.push_back(now);
+        if self.rate_window_started.is_none() {
+            self.rate_window_started = Some(now);
+        }
+        self.rate_tokens -= 1;
         if let Some(since) = self.live_since.take()
             && since.elapsed() >= Self::LIVE_TENURE_RESET
         {
@@ -1327,40 +1405,78 @@ impl ReattachBudget {
         self.attempts > MAX_RECONNECT
     }
 
-    /// Wall-clock rate window for the second pacing axis (bug_160).
-    /// Sized to the ladder: RATE_MAX zero-backoff cycles per minute
-    /// is already one O(DAG) snapshot every ~10 s sustained — past
-    /// that the loop is churning, organic progress or not.
+    /// Wall-clock refill window for the rate axis (bug_160). Sized to
+    /// the ladder: RATE_MAX zero-backoff cycles per minute is already
+    /// one O(DAG) snapshot every ~10 s sustained — past that the loop
+    /// is churning, organic progress or not.
     const RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
-    /// Re-attach cycles per [`Self::RATE_WINDOW`] before the ladder
-    /// engages regardless of the consecutive streak.
+    /// Token-bucket capacity AND refill amount per
+    /// [`Self::RATE_WINDOW`]: cycles beyond `RATE_MAX` inside one
+    /// refill window run the bucket into deficit and engage the
+    /// ladder regardless of the consecutive streak.
     const RATE_MAX: usize = 6;
 
-    /// Pacing decision for the next resync-signalled re-attach
-    /// (typed so the call site cannot collapse the two axes — the
-    /// rate axis owes the operator a warn + counter the streak axis
-    /// does not).
-    fn resync_pacing(&self) -> ResyncPacing {
-        if self.attempts > Self::ZERO_BACKOFF_STREAK {
-            return ResyncPacing::StreakPaced(RECONNECT_BACKOFF.duration(self.attempts - 1));
+    /// THE pacing chokepoint (merged_bug_083): every death arm
+    /// charges its cycle and obtains its whole effects record here —
+    /// there is no other pacing API for arms to consult, so a
+    /// per-arm axis choice cannot be written.
+    ///
+    /// Both axes bound every cause: the sleep is the MAX of the
+    /// streak ladder (zero inside `ZERO_BACKOFF_STREAK` for the
+    /// resync signal only — a lagging-but-healthy scheduler stays
+    /// invisible; every other death cause pays the ladder from its
+    /// first cycle) and the rate ladder (rung = bucket deficit − 1:
+    /// 1s, 2s, 4s, … capped at 16s). Refill is time-based, so under
+    /// sustained churn the deficit persists and the system settles at
+    /// the SUSTAINABLE fixed point — about RATE_MAX cycles per
+    /// RATE_WINDOW with the rung hovering at the 8–16s cap
+    /// neighborhood — instead of the pre-fix limit cycle, where each
+    /// paced cycle aged the eviction window that justified the
+    /// pacing and the loop burst back to zero backoff.
+    ///
+    /// Exhaustion stays STREAK-keyed: the rate axis paces, never
+    /// fails (gw.resync.reattach-budget — organic progress proves the
+    /// scheduler serves us).
+    fn next_backoff(&mut self, cause: BackoffCause) -> PacingDecision {
+        let attempt = self.note_reattach();
+        let exhausted = self.exhausted();
+        let streak_sleep = match cause {
+            BackoffCause::ResyncSignal => {
+                if self.attempts > Self::ZERO_BACKOFF_STREAK {
+                    RECONNECT_BACKOFF.duration(self.attempts - 1)
+                } else {
+                    std::time::Duration::ZERO
+                }
+            }
+            BackoffCause::Transport
+            | BackoffCause::EofWithoutTerminal
+            | BackoffCause::ReattachCycleFailed => {
+                RECONNECT_BACKOFF.duration(self.attempts.saturating_sub(1))
+            }
+        };
+        let deficit = u32::try_from(-self.rate_tokens).unwrap_or(0);
+        let rate_paced = deficit > 0;
+        let rate_sleep = if rate_paced {
+            RECONNECT_BACKOFF.duration(deficit - 1)
+        } else {
+            std::time::Duration::ZERO
+        };
+        if rate_paced {
+            // The observability tick is part of the decision, not a
+            // per-arm courtesy: it cannot be skipped by a new arm.
+            metrics::counter!(
+                "rio_gateway_build_resync_rate_paced_total",
+                "cause" => cause.label()
+            )
+            .increment(1);
         }
-        let excess = self.recent.len().saturating_sub(Self::RATE_MAX);
-        if excess > 0 {
-            // The ladder climbs with the in-window excess: 1s, 2s,
-            // 4s, ... capped at 16s — each paced cycle still counts
-            // into the window, so a persistent interleave settles at
-            // the cap (~4 snapshots/min) instead of zero backoff.
-            let rung = u32::try_from(excess - 1).unwrap_or(u32::MAX);
-            return ResyncPacing::RatePaced(RECONNECT_BACKOFF.duration(rung));
+        PacingDecision {
+            attempt,
+            exhausted,
+            sleep: streak_sleep.max(rate_sleep),
+            rate_paced,
         }
-        ResyncPacing::Immediate
-    }
-
-    /// Backoff before the next failure-path re-attach (transport
-    /// error, EOF, failed open): always the ladder.
-    fn failure_backoff(&self) -> std::time::Duration {
-        RECONNECT_BACKOFF.duration(self.attempts.saturating_sub(1))
     }
 }
 
@@ -1629,8 +1745,18 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                         | StreamProcessError::ResyncRequired),
                     ) => {
                         let resync = matches!(e, StreamProcessError::ResyncRequired);
-                        let attempt = budget.note_reattach();
-                        if budget.exhausted() {
+                        // merged_bug_083: the arm names its CAUSE and
+                        // consumes the chokepoint's effects record —
+                        // it has no axis API to pick from.
+                        let cause = if resync {
+                            BackoffCause::ResyncSignal
+                        } else if matches!(e, StreamProcessError::Transport(_)) {
+                            BackoffCause::Transport
+                        } else {
+                            BackoffCause::EofWithoutTerminal
+                        };
+                        let decision = budget.next_backoff(cause);
+                        if decision.exhausted {
                             break Err(e);
                         }
                         if resync {
@@ -1645,50 +1771,45 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                             // bounds the storm: snapshot + resync cycling
                             // forever now burns through MAX_RECONNECT
                             // instead of refreshing it.
-                            match budget.resync_pacing() {
-                                ResyncPacing::Immediate => {
-                                    tracing::debug!(
-                                        %build_id,
-                                        attempt,
-                                        "scheduler signalled event loss (broadcast lag); resyncing via WatchBuild snapshot"
-                                    );
-                                }
-                                ResyncPacing::StreakPaced(backoff) => {
-                                    tracing::warn!(
-                                        %build_id,
-                                        attempt,
-                                        backoff_secs = backoff.as_secs(),
-                                        "scheduler resync-signal streak with no organic events; pacing re-attach"
-                                    );
-                                    tokio::time::sleep(backoff).await;
-                                }
-                                ResyncPacing::RatePaced(backoff) => {
-                                    // bug_160: the interleaved storm —
-                                    // organic progress kept the streak
-                                    // at zero while the cycle RATE
-                                    // charged the scheduler one O(DAG)
-                                    // snapshot per loop. Operator
-                                    // signal: this is a slow CONSUMER
-                                    // (or an undersized broadcast
-                                    // buffer), not a scheduler outage.
-                                    metrics::counter!("rio_gateway_build_resync_rate_paced_total")
-                                        .increment(1);
-                                    tracing::warn!(
-                                        %build_id,
-                                        attempt,
-                                        backoff_secs = backoff.as_secs(),
-                                        "resync cycle rate exceeded the window bound despite organic progress; pacing re-attach"
-                                    );
-                                    tokio::time::sleep(backoff).await;
-                                }
+                            if decision.sleep.is_zero() {
+                                tracing::debug!(
+                                    %build_id,
+                                    attempt = decision.attempt,
+                                    "scheduler signalled event loss (broadcast lag); resyncing via WatchBuild snapshot"
+                                );
+                            } else if decision.rate_paced {
+                                // bug_160: the interleaved storm —
+                                // organic progress kept the streak at
+                                // zero while the cycle RATE charged
+                                // the scheduler one O(DAG) snapshot
+                                // per loop. Operator signal: this is
+                                // a slow CONSUMER (or an undersized
+                                // broadcast buffer), not a scheduler
+                                // outage. (The counter tick fired
+                                // inside next_backoff.)
+                                tracing::warn!(
+                                    %build_id,
+                                    attempt = decision.attempt,
+                                    backoff_secs = decision.sleep.as_secs(),
+                                    "resync cycle rate exceeded the window bound despite organic progress; pacing re-attach"
+                                );
+                                tokio::time::sleep(decision.sleep).await;
+                            } else {
+                                tracing::warn!(
+                                    %build_id,
+                                    attempt = decision.attempt,
+                                    backoff_secs = decision.sleep.as_secs(),
+                                    "scheduler resync-signal streak with no organic events; pacing re-attach"
+                                );
+                                tokio::time::sleep(decision.sleep).await;
                             }
                         } else {
-                            let backoff = budget.failure_backoff();
                             tracing::warn!(
                                 %build_id,
                                 error = %e,
-                                attempt,
-                                backoff_secs = backoff.as_secs(),
+                                attempt = decision.attempt,
+                                backoff_secs = decision.sleep.as_secs(),
+                                rate_paced = decision.rate_paced,
                                 "BuildEvent stream error; reconnecting via WatchBuild"
                             );
                             // Also surface to the client via STDERR — they see
@@ -1696,10 +1817,10 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                             let _ = stderr
                                 .log(&format!(
                                     "scheduler connection lost (attempt {}/{}); reconnecting...",
-                                    attempt, MAX_RECONNECT
+                                    decision.attempt, MAX_RECONNECT
                                 ))
                                 .await;
-                            tokio::time::sleep(backoff).await;
+                            tokio::time::sleep(decision.sleep).await;
                         }
                         last_stream_err = e;
                         source = EventSource::NeedsReattach;
@@ -1818,18 +1939,18 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                         // stream from before this cycle is long gone
                         // and CANNOT be re-entered (no Live to fall
                         // back to).
-                        let attempt = budget.note_reattach();
-                        if budget.exhausted() {
+                        let decision = budget.next_backoff(BackoffCause::ReattachCycleFailed);
+                        if decision.exhausted {
                             break Err(last_stream_err);
                         }
-                        let backoff = budget.failure_backoff();
                         tracing::debug!(
                             %build_id,
-                            attempt,
-                            backoff_secs = backoff.as_secs(),
+                            attempt = decision.attempt,
+                            backoff_secs = decision.sleep.as_secs(),
+                            rate_paced = decision.rate_paced,
                             "re-attach cycle failed; backing off"
                         );
-                        tokio::time::sleep(backoff).await;
+                        tokio::time::sleep(decision.sleep).await;
                     }
                 }
             }
@@ -3673,11 +3794,15 @@ mod tests {
     fn resync_storm_exhausts_the_budget() {
         let mut budget = super::ReattachBudget::default();
         for cycle in 0..=super::MAX_RECONNECT {
-            assert!(
-                !budget.exhausted(),
-                "budget exhausted early, at cycle {cycle}"
-            );
-            budget.note_reattach();
+            let d = budget.next_backoff(super::BackoffCause::ResyncSignal);
+            if cycle < super::MAX_RECONNECT {
+                assert!(!d.exhausted, "budget exhausted early, at cycle {cycle}");
+            } else {
+                assert!(
+                    d.exhausted,
+                    "MAX_RECONNECT+1 non-organic cycles must exhaust"
+                );
+            }
             // Every cycle serves the snapshot — connection machinery,
             // never a reset.
             budget.note_event(&types::build_event::Event::Snapshot(
@@ -3687,10 +3812,6 @@ mod tests {
                 types::ResyncRequired::default(),
             ));
         }
-        assert!(
-            budget.exhausted(),
-            "MAX_RECONNECT+1 non-organic cycles must exhaust"
-        );
     }
 
     // r[verify gw.resync.reattach-budget+3]
@@ -3743,18 +3864,21 @@ mod tests {
     fn second_failover_after_long_live_tenure_gets_a_fresh_budget() {
         let mut budget = super::ReattachBudget::default();
         // Failover #1: stream death + four failed WatchBuild opens.
-        for _ in 0..5 {
-            budget.note_reattach();
+        budget.next_backoff(super::BackoffCause::Transport);
+        for _ in 0..4 {
+            budget.next_backoff(super::BackoffCause::ReattachCycleFailed);
         }
         // Re-attach succeeds; Live re-entered; an hour of healthy
         // stream with zero organic events (single-derivation compile
-        // phase — logs ride the independent LogTailSet).
+        // phase — logs ride the independent LogTailSet). The rate
+        // bucket also fully refills across the hour.
         budget.note_live_entered();
         budget.backdate_live_since_for_test(std::time::Duration::from_secs(3600));
+        budget.backdate_rate_window_for_test(std::time::Duration::from_secs(3600));
         // Failover #2: the first charge of a NEW outage.
-        let attempt = budget.note_reattach();
+        let d = budget.next_backoff(super::BackoffCause::Transport);
         assert_eq!(
-            attempt, 1,
+            d.attempt, 1,
             "a failover after evidenced recovery (long Live tenure) must get a fresh budget"
         );
     }
@@ -3768,16 +3892,16 @@ mod tests {
     fn storm_with_short_live_tenure_still_exhausts() {
         let mut budget = super::ReattachBudget::default();
         for cycle in 0..=super::MAX_RECONNECT {
-            assert!(!budget.exhausted(), "exhausted early at cycle {cycle}");
             // Each cycle re-enters Live for only an instant before
             // the next loss signal.
             budget.note_live_entered();
-            budget.note_reattach();
+            let d = budget.next_backoff(super::BackoffCause::ResyncSignal);
+            if cycle < super::MAX_RECONNECT {
+                assert!(!d.exhausted, "exhausted early at cycle {cycle}");
+            } else {
+                assert!(d.exhausted, "short-tenure storm cycles must still exhaust");
+            }
         }
-        assert!(
-            budget.exhausted(),
-            "short-tenure storm cycles must still exhaust"
-        );
     }
 
     // r[verify gw.resync.reattach-budget+3]
@@ -3795,8 +3919,9 @@ mod tests {
         let mut paced = false;
         for _cycle in 0..12 {
             budget.note_live_entered();
-            budget.note_reattach();
-            if let super::ResyncPacing::RatePaced(_) = budget.resync_pacing() {
+            let d = budget.next_backoff(super::BackoffCause::ResyncSignal);
+            if d.rate_paced {
+                assert!(!d.sleep.is_zero(), "a rate-paced decision must sleep");
                 paced = true;
                 break;
             }
@@ -3822,15 +3947,91 @@ mod tests {
         use types::build_event::Event;
         let mut budget = super::ReattachBudget::default();
         for _cycle in 0..40 {
-            budget.note_reattach();
-            assert_eq!(
-                budget.resync_pacing(),
-                super::ResyncPacing::Immediate,
+            let d = budget.next_backoff(super::BackoffCause::ResyncSignal);
+            assert!(
+                d.sleep.is_zero() && !d.rate_paced,
                 "a cycle rate below RATE_MAX per window must stay immediate"
             );
             budget.note_event(&Event::Progress(types::BuildProgress::default()));
-            // The next cycle arrives after the window has rolled.
-            budget.backdate_recent_for_test(super::ReattachBudget::RATE_WINDOW);
+            // The next cycle arrives after the window has rolled (the
+            // bucket refills fully across the gap).
+            budget.backdate_rate_window_for_test(super::ReattachBudget::RATE_WINDOW);
+        }
+    }
+
+    // r[verify gw.resync.reattach-budget+3]
+    /// merged_bug_083 red #1: the rate axis must bound EVERY death
+    /// arm, not just the resync signal. Mirror of
+    /// `interleaved_resync_storm_engages_the_ladder`, charged through
+    /// the FAILURE cause: 12 transport cycles inside one rate window,
+    /// each followed by an organic `Progress` reset (the chatty
+    /// build). The law: past the rate bound the reconnect ladder
+    /// engages (sleep at least the first rung above zero-backoff)
+    /// regardless of which death cause charged the cycle.
+    #[test]
+    fn transport_interleave_storm_engages_the_rate_ladder() {
+        use types::build_event::Event;
+        let mut budget = super::ReattachBudget::default();
+        for cycle in 0..12u32 {
+            budget.note_live_entered();
+            let d = budget.next_backoff(super::BackoffCause::Transport);
+            if cycle == 11 {
+                assert!(
+                    d.sleep >= std::time::Duration::from_secs(2),
+                    "12 transport cycles inside one rate window must engage \
+                     the rate ladder even though organic events reset the \
+                     streak (failure-path sleep stuck at {:?}, want >= 2s \
+                     -- the rate axis is bypassed on the failure arm)",
+                    d.sleep
+                );
+                assert!(
+                    d.rate_paced,
+                    "the decision must carry the rate-axis tick (cause=transport)"
+                );
+            }
+            // The chatty build delivers an organic event inside the
+            // same cycle — the streak axis resets to zero.
+            budget.note_event(&Event::Progress(types::BuildProgress::default()));
+        }
+    }
+
+    // r[verify gw.resync.reattach-budget+3]
+    /// merged_bug_083 red #2: pacing must not drain its own evidence.
+    /// Sustained churn loop: charge, take the decision's sleep,
+    /// advance the simulated clock by exactly that sleep, repeat.
+    /// While the long-run cycle count exceeds what RATE_MAX per
+    /// RATE_WINDOW admits (burst capacity + elapsed refill), every
+    /// decision must stay paced — the pre-fix eviction window
+    /// self-drains under its own pacing and re-enters zero backoff
+    /// (the limit cycle).
+    #[test]
+    fn paced_cycles_cannot_drain_the_rate_evidence() {
+        use types::build_event::Event;
+        let mut budget = super::ReattachBudget::default();
+        let mut cycles: u64 = 0;
+        let mut elapsed = std::time::Duration::ZERO;
+        for _ in 0..40 {
+            let d = budget.next_backoff(super::BackoffCause::ResyncSignal);
+            cycles += 1;
+            // Admitted by the consts: one burst of RATE_MAX plus
+            // RATE_MAX per fully elapsed window since the burst.
+            let admitted = (super::ReattachBudget::RATE_MAX as u64)
+                * (1 + elapsed.as_secs() / super::ReattachBudget::RATE_WINDOW.as_secs());
+            if cycles > admitted {
+                assert!(
+                    d.sleep > std::time::Duration::ZERO,
+                    "cycle {cycles} at t={elapsed:?}: the long-run cycle rate \
+                     exceeds RATE_MAX per RATE_WINDOW (admitted {admitted}) yet \
+                     the decision is immediate — paced cycles evicted the rate \
+                     evidence (the limit-cycle re-entry)"
+                );
+            }
+            // Advance the simulated clock by exactly the sleep the
+            // decision demanded.
+            budget.backdate_rate_window_for_test(d.sleep);
+            elapsed += d.sleep;
+            // Organic progress keeps the streak axis at zero.
+            budget.note_event(&Event::Progress(types::BuildProgress::default()));
         }
     }
 
@@ -3842,21 +4043,25 @@ mod tests {
     fn resync_backoff_ladders_past_the_streak() {
         let mut budget = super::ReattachBudget::default();
         for _ in 0..super::ReattachBudget::ZERO_BACKOFF_STREAK {
-            budget.note_reattach();
-            assert_eq!(
-                budget.resync_pacing(),
-                super::ResyncPacing::Immediate,
-                "within streak: immediate"
-            );
+            let d = budget.next_backoff(super::BackoffCause::ResyncSignal);
+            assert!(d.sleep.is_zero(), "within streak: immediate");
         }
-        budget.note_reattach(); // 4th
+        let d = budget.next_backoff(super::BackoffCause::ResyncSignal); // 4th
         assert_eq!(
-            budget.resync_pacing(),
-            super::ResyncPacing::StreakPaced(std::time::Duration::from_secs(8)),
+            d.sleep,
+            std::time::Duration::from_secs(8),
             "4th cycle joins the ladder at its own rung (2^3)"
         );
+        assert!(!d.rate_paced, "4 cycles stay inside the rate capacity");
+        // The failure path pays the same rung at the same streak: a
+        // sibling budget driven to the same attempts count.
+        let mut sibling = super::ReattachBudget::default();
+        for _ in 0..super::ReattachBudget::ZERO_BACKOFF_STREAK {
+            sibling.next_backoff(super::BackoffCause::ResyncSignal);
+        }
+        let d = sibling.next_backoff(super::BackoffCause::Transport); // 4th
         assert_eq!(
-            budget.failure_backoff(),
+            d.sleep,
             std::time::Duration::from_secs(8),
             "failure path paces at the same rung"
         );
@@ -3867,7 +4072,7 @@ mod tests {
         budget.note_event(&types::build_event::Event::Progress(
             types::BuildProgress::default(),
         ));
-        budget.note_reattach();
-        assert_eq!(budget.resync_pacing(), super::ResyncPacing::Immediate);
+        let d = budget.next_backoff(super::BackoffCause::ResyncSignal);
+        assert!(d.sleep.is_zero() && !d.rate_paced);
     }
 }
