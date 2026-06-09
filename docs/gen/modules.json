@@ -321,11 +321,6 @@
     {
       "path": "classify.rs",
       "depth": 0,
-      "doc": "Shared outcome-classification vocabulary (bug_255, R7)."
-    },
-    {
-      "path": "classify.rs",
-      "depth": 0,
       "doc": "Shared classification predicates (R7, bughunt-4): every"
     },
     {
