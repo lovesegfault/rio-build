@@ -906,17 +906,30 @@ fn consts() -> Result<serde_json::Value> {
             "PULL_MODE_TERMINATION_GRACE_SECS",
             "rio-common/src/limits.rs",
         ),
+        // merged_bug_031: gw.resync.reattach-budget cites the live
+        // tenure reset by value; the rule's threshold must derive from
+        // the const (the +2 prose restated "the backoff cap" while the
+        // code reset at 60s — a 4x divergence on a MUST rule).
+        ("LIVE_TENURE_RESET", "rio-gateway/src/handler/build.rs"),
         // Add more as docs cite them. Threshold: cited at ≥2 prose
-        // sites, value is a plain integer literal.
+        // sites, value is a plain integer literal or
+        // Duration::from_secs(<integer>).
     ];
     let mut out = serde_json::Map::new();
     for (name, path) in TABLE {
         let body = fs::read_to_string(repo_root().join(path))?;
-        let re = Regex::new(&format!(r"const\s+{name}\s*:\s*\w+\s*=\s*(\d+)"))?;
-        let v: u64 = re
+        // Plain integer first, then the Duration::from_secs form —
+        // both anchored to the declaration so a rename/move fails the
+        // regen rather than silently dropping the derivation.
+        let plain = Regex::new(&format!(r"const\s+{name}\s*:\s*\w+\s*=\s*(\d+)"))?;
+        let secs = Regex::new(&format!(
+            r"const\s+{name}\s*:\s*[\w:\s]+?=\s*[\w:\s]*?Duration::from_secs\((\d+)\)"
+        ))?;
+        let cap = plain
             .captures(&body)
-            .with_context(|| format!("const {name} not found at {path}"))?[1]
-            .parse()?;
+            .or_else(|| secs.captures(&body))
+            .with_context(|| format!("const {name} not found at {path}"))?;
+        let v: u64 = cap[1].parse()?;
         out.insert((*name).into(), json!(v));
     }
     Ok(json!(out))

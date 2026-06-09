@@ -1200,7 +1200,7 @@ enum ResyncPacing {
 /// counter and failover #2 of a quiet build exhausts mid-recovery.
 /// Storms never accrue tenure — they cycle death→snapshot in
 /// seconds — so the storm bound above is preserved.
-// r[impl gw.resync.reattach-budget+2]
+// r[impl gw.resync.reattach-budget+3]
 // (bug_160: the budget is TWO-AXIS — the consecutive streak above,
 // and a wall-clock cycle-rate window organic events cannot reset.
 // The rule's prose reword rides the S8b narration slot per the
@@ -3665,7 +3665,7 @@ mod tests {
     // snapshot-cycles — the storm refreshes its own cap forever.
     // Probe applied + reverted, see commit body.
 
-    // r[verify gw.resync.reattach-budget+2]
+    // r[verify gw.resync.reattach-budget+3]
     /// A snapshot-then-resync storm consumes the budget: snapshots do
     /// NOT reset it, so MAX_RECONNECT cycles exhaust the watch instead
     /// of looping forever at zero backoff.
@@ -3693,7 +3693,7 @@ mod tests {
         );
     }
 
-    // r[verify gw.resync.reattach-budget+2]
+    // r[verify gw.resync.reattach-budget+3]
     /// Organic events — and ONLY organic events — reset the budget.
     /// Exhaustive over the event alphabet so a new variant must be
     /// classified here as well as in `note_event` itself.
@@ -3731,7 +3731,7 @@ mod tests {
         }
     }
 
-    // r[verify gw.resync.reattach-budget+2]
+    // r[verify gw.resync.reattach-budget+3]
     /// Two time-separated failovers: charges from a fully-recovered
     /// failover must not bleed into the next outage's budget. A dying
     /// stream whose `Live` tenure outlasted the backoff cap is
@@ -3759,7 +3759,7 @@ mod tests {
         );
     }
 
-    // r[verify gw.resync.reattach-budget+2]
+    // r[verify gw.resync.reattach-budget+3]
     /// The merged_bug_056 storm bound survives the tenure reset: a
     /// storm cycles death→snapshot→Live in seconds, never accruing
     /// the Live tenure that evidences recovery, so its budget still
@@ -3780,7 +3780,7 @@ mod tests {
         );
     }
 
-    // r[verify gw.resync.reattach-budget+2]
+    // r[verify gw.resync.reattach-budget+3]
     /// RED (bug_160): both resync bounds key on CONSECUTIVE
     /// non-organic cycles — a durably-slow consumer of a CHATTY build
     /// interleaves resync→snapshot→organic forever (organic progress
@@ -3811,7 +3811,7 @@ mod tests {
         );
     }
 
-    // r[verify gw.resync.reattach-budget+2]
+    // r[verify gw.resync.reattach-budget+3]
     /// The rate axis' negative space (the sweep over both bounds): a
     /// SLOW interleave — cycles spread wider than the window — never
     /// engages the rate ladder, however many total cycles accrue. An

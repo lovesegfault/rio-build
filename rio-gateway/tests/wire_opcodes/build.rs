@@ -2114,7 +2114,7 @@ async fn test_build_paths_reconnect_exhausted_returns_failure() -> anyhow::Resul
     Ok(())
 }
 
-// r[verify gw.resync.reattach-budget+2]
+// r[verify gw.resync.reattach-budget+3]
 // r[verify gw.resync.snapshot-owed]
 /// merged_bug_056: a scheduler stuck in a snapshot→resync storm (every
 /// re-attach serves the snapshot and then immediately signals loss

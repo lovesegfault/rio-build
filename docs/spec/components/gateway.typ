@@ -2041,13 +2041,20 @@ zero-backoff hot loop --- the pre-fix reset-on-any-event made
 #(refs.const)("MAX_RECONNECT") vacuous for exactly that storm, because the
 snapshot each cycle delivered refreshed the cap.
 
-#r("gw.resync.reattach-budget+2")[
+#r("gw.resync.reattach-budget+3")[
   The gateway MUST bound consecutive `WatchBuild` re-attach cycles with a
-  budget that resets only on organic build events or on evidenced recovery
-  --- a dying stream whose `Live` tenure exceeded the re-attach backoff
-  cap; `snapshot` and `resync_required` events MUST NOT reset it; when the
-  budget exceeds `MAX_RECONNECT` within one outage the watch MUST fail to
-  the client.
+  two-axis budget. The STREAK axis resets only on organic build events or
+  on evidenced recovery --- a dying stream whose `Live` tenure reached
+  `LIVE_TENURE_RESET` (#(refs.const)("LIVE_TENURE_RESET") s --- a margin
+  well above the re-attach backoff cap, so storm cycles
+  death→snapshot→death never accrue it); `snapshot` and `resync_required`
+  events MUST NOT reset it; when the streak exceeds `MAX_RECONNECT` within
+  one outage the watch MUST fail to the client. The RATE axis is
+  wall-clock and event-unresettable: re-attach cycles beyond
+  `RATE_MAX` inside one `RATE_WINDOW` MUST engage the reconnect ladder
+  (paced, never failed) even while organic events keep the streak at zero
+  --- organic progress proves the scheduler serves us, so a rate storm is
+  paced rather than failed, and exhaustion stays streak-keyed.
 ]
 "Organic" is the same classification #rref("gw.reconnect.backoff") uses:
 events produced by build progress itself. The classification is exhaustive

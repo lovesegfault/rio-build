@@ -75,16 +75,21 @@ pub async fn execute_job(ctx: &ExecutorContext, claimed: &ClaimedJob) -> Counted
 
 /// [`execute_job`] with a byte-progress callback (BC-4 / Phase B).
 ///
-/// `on_progress(bytes_done, bytes_expected, upstream_uri)` fires once
-/// per ingested/verified path with CUMULATIVE byte counts across the
-/// job's whole closure walk (the sum of processed paths' NAR sizes so
-/// far). Monotone non-decreasing in `bytes_done`, and
-/// `bytes_done <= bytes_expected` at every call — ENFORCED by
-/// `MonotoneProgress`, the only constructor of emission sites
-/// (bug_159: within-path retry resets used to regress the counter);
-/// the final call covers the whole closure. Display-only and
-/// droppable: the callback must be cheap and non-blocking (it runs on
-/// the walk); the caller forwards it to
+/// `on_progress(bytes_done, bytes_expected, upstream_uri)` streams
+/// CUMULATIVE byte counts across the job's whole closure walk —
+/// committed paths' NAR sizes plus the current path's streamed bytes
+/// (merged_bug_195: multiple calls per path during the body fetch).
+/// COMMITTED-FLOOR semantics, ENFORCED by `MonotoneProgress`, the
+/// only constructor of emission sites
+/// (`store.materialize.progress-monotone+1`): `done <= expected` at
+/// every call; `done` never drops below the committed floor, which
+/// only the per-path success witness raises; display MAY step back
+/// from a FAILED attempt's provisional peak (truthful display — the
+/// dead bytes were never committed; bug_159's within-path retry
+/// regression stays impossible relative to committed work). The
+/// final call covers the whole closure. Display-only and droppable:
+/// the callback must be cheap and non-blocking (it runs on the
+/// walk); the caller forwards it to
 /// `ReportMaterializationProgress` fire-and-forget.
 // r[impl store.materialize.executor+5]
 // r[impl obs.metric.store]
@@ -498,8 +503,10 @@ async fn execute_job_inner(
             // bug_159: minted by the adapter — the only constructor of
             // per-path callbacks; a stall-failover counter reset
             // (substitute.rs retries the next upstream with a fresh
-            // byte counter) clamps at the job high-water instead of
-            // regressing below an already-reported value.
+            // byte counter) clamps at the job's COMMITTED floor:
+            // never below completed work, though it MAY step back
+            // below a failed attempt's provisional peak (truthful
+            // display — store.materialize.progress-monotone+1).
             let per_path_progress = progress.per_path(completed_bytes);
             // merged_bug_028 / owner Q2 + merged_bug_133: try EVERY
             // interested tenant's upstream view until one serves the
