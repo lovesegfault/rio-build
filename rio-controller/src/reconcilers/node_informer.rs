@@ -854,8 +854,15 @@ pub async fn run(
                 return;
             }
             _ = flush.tick() => {
-                match nodes.list(&ListParams::default()).await {
-                    Ok(list) => {
+                // merged_bug_033 arm-await sweep: no select-arm await
+                // outlasts cancellation — the LIST races shutdown so
+                // a hung apiserver cannot pin the loop past SIGTERM.
+                match shutdown.run_until_cancelled(nodes.list(&ListParams::default())).await {
+                    // Cancelled mid-LIST: nothing banked, nothing
+                    // forfeited; the biased shutdown arm runs (and
+                    // discloses the backlog) on the next iteration.
+                    None => {}
+                    Some(Ok(list)) => {
                         // bug_363: refresh the interrupt watcher's
                         // hw_class fallback from the same LIST (every
                         // node's labels are in hand anyway); prune
@@ -919,38 +926,72 @@ pub async fn run(
                         // sound. Bounded per-RPC by [`admin_call`]'s
                         // timeout so a hung scheduler can't wedge the
                         // flush loop.
-                        ship_all(&mut unshipped, |slice: &PendingExposure| {
-                            let mut admin = admin.clone();
-                            let uid = slice.uid.clone();
-                            let req = rio_proto::types::AppendInterruptSampleRequest {
-                                hw_class: slice.hw.clone(),
-                                kind: "exposure".into(),
-                                value: slice.secs,
-                                event_uid: Some(slice.uid.as_str().to_owned()),
-                            };
-                            async move {
-                                match admin_call(admin.append_interrupt_sample(req)).await {
-                                    Ok(_) => true,
-                                    Err(e) => {
-                                        warn!(
-                                            error = %e,
-                                            %uid,
-                                            "spot-exposure: append failed; slice re-credited to the next flush"
-                                        );
-                                        false
+                        let pass = ship_all(
+                            &mut unshipped,
+                            &shutdown,
+                            EXPOSURE_SHIP_PASS_BUDGET,
+                            |slice: &PendingExposure| {
+                                let mut admin = admin.clone();
+                                let uid = slice.uid.clone();
+                                let req = rio_proto::types::AppendInterruptSampleRequest {
+                                    hw_class: slice.hw.clone(),
+                                    kind: "exposure".into(),
+                                    value: slice.secs,
+                                    event_uid: Some(slice.uid.as_str().to_owned()),
+                                };
+                                async move {
+                                    match admin_call(admin.append_interrupt_sample(req)).await {
+                                        Ok(_) => true,
+                                        Err(e) => {
+                                            warn!(
+                                                error = %e,
+                                                %uid,
+                                                "spot-exposure: append failed; slice re-credited to the next flush"
+                                            );
+                                            false
+                                        }
                                     }
                                 }
-                            }
-                        })
+                            },
+                        )
                         .await;
+                        // Closed exit alphabet — every variant's
+                        // effect is explicit here (no wildcard arm):
+                        // deferral and preemption keep slices
+                        // PENDING; only the shutdown arm below ever
+                        // forfeits (counted).
+                        match pass {
+                            ShipPass::Drained => {}
+                            ShipPass::BudgetExhausted { remaining } => {
+                                warn!(
+                                    remaining,
+                                    "exposure drain pass budget exhausted; \
+                                     remainder stays pending until the next flush \
+                                     (deferred, not dropped)"
+                                );
+                            }
+                            ShipPass::Cancelled { requeued_in_flight } => {
+                                debug!(
+                                    requeued_in_flight,
+                                    "exposure drain preempted by shutdown; the \
+                                     shutdown arm will disclose the backlog"
+                                );
+                            }
+                        }
                     }
-                    Err(e) => {
+                    Some(Err(e)) => {
                         warn!(error = %e, "node LIST failed; exposure flush skipped this round");
                     }
                 }
             }
             _ = hw_refresh.tick() => {
-                config.load(&mut admin).await;
+                // merged_bug_033 arm-await sweep: load is internally
+                // bounded (5 attempts, ≤ ~56s worst case) but still
+                // raced against shutdown so the refresh cannot delay
+                // the counted-disclosure arm past one backoff step.
+                if shutdown.run_until_cancelled(config.load(&mut admin)).await.is_none() {
+                    debug!("hw-class refresh preempted by shutdown");
+                }
             }
         }
     }
@@ -1149,12 +1190,55 @@ pub async fn run_spot_interrupt_watcher(
     }
 }
 
+/// merged_bug_033: wall-clock budget for one [`ship_all`] pass.
+/// Strictly less than the 60s flush period ([`EXPOSURE_FLUSH_SECS`])
+/// so the drain arm cedes the select loop every period even under
+/// saturation: worst-case arm occupancy ≈ budget + one in-flight
+/// `ADMIN_RPC_TIMEOUT` ≈ 35s. SIGTERM latency is bounded by the
+/// in-RPC `cancelled()` race inside the combinator (≈ instant), NOT
+/// by this budget. Preempting the in-flight append is the ambiguous
+/// commit-or-not case — `ship_all` re-queues the slice VERBATIM and
+/// the redelivery dedups under the keyed (cluster, class, window)
+/// identity (merged_bug_001), which is exactly what makes mid-RPC
+/// preemption safe.
+const EXPOSURE_SHIP_PASS_BUDGET: Duration = Duration::from_secs(30);
+
+/// merged_bug_033: the CLOSED exit alphabet of one [`ship_all`] drain
+/// pass. Every variant's effects are pinned by a dedicated test
+/// (`Drained`: queue empty; `BudgetExhausted`: remainder PENDING +
+/// zero drop ticks — deferral is not forfeiture; `Cancelled`:
+/// in-flight slice re-queued verbatim, the caller's next `select!`
+/// iteration reaches the counted-disclosure shutdown arm). A new exit
+/// cannot be added without the compiler demanding its effects at the
+/// caller's exhaustive match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShipPass {
+    /// Every queued slice was attempted and acknowledged.
+    Drained,
+    /// The per-pass budget expired; `remaining` slices stay QUEUED
+    /// (pending, never dropped) for the next flush's pass.
+    BudgetExhausted { remaining: usize },
+    /// Shutdown preempted the pass; the in-flight slice (ambiguous
+    /// commit-or-not) was re-queued verbatim — redelivery dedups
+    /// under the keyed identity.
+    Cancelled { requeued_in_flight: bool },
+}
+
 // r[impl ctrl.informer.exposure-recredit+2]
+// r[impl ctrl.informer.exposure-drain-budget]
 /// merged_bug_033: drain the pending-exposure queue through ONE
 /// combinator — every shipment in this module rides `ship_all` (the
 /// production `ship` closure at the single [`run`] call site is the
 /// folded former `report_exposure` body; no ship path exists outside
-/// it). The recredit law lives HERE: a slice whose `ship` returns
+/// it), and the combinator takes the CancellationToken and the
+/// per-pass budget BY CONSTRUCTION, so a select-arm body structurally
+/// cannot contain an unbounded sequential await chain: the budget is
+/// checked before every shipment (expiry → `BudgetExhausted`, the
+/// remainder stays queued), and the in-flight ship is raced against
+/// `shutdown.cancelled()` (`biased` — preemption re-queues the slice
+/// verbatim and returns `Cancelled`, so the caller's loop reaches the
+/// counted-disclosure shutdown arm within one RPC, at ANY backlog
+/// depth). The recredit law lives HERE: a slice whose `ship` returns
 /// `false` (append not acknowledged — bug_150 consume-on-ack) is
 /// re-queued VERBATIM, uid and all, so however many times delivery is
 /// ambiguous the server holds at most one row per (cluster, class,
@@ -1162,7 +1246,8 @@ pub async fn run_spot_interrupt_watcher(
 /// identity (no re-mint, no merge); the cursor already advanced when
 /// the slice was banked, so this queue is the ONLY carrier of the
 /// failed window — dropping it here would be permanent denominator
-/// loss. One attempt per queued slice per pass.
+/// loss. A budget-deferred or preemption-requeued slice remains
+/// PENDING, never a drop.
 ///
 /// `ship` returns its future by VALUE (`FnMut(&_) -> Fut`, not an
 /// async closure): the future owns everything it needs (the run()
@@ -1173,12 +1258,47 @@ pub async fn run_spot_interrupt_watcher(
 /// the house precedent).
 async fn ship_all<Fut: Future<Output = bool>>(
     unshipped: &mut VecDeque<PendingExposure>,
+    shutdown: &rio_common::signal::Token,
+    per_pass_budget: Duration,
     mut ship: impl FnMut(&PendingExposure) -> Fut,
-) {
-    for slice in std::mem::take(unshipped) {
-        let delivered = ship(&slice).await;
-        if !delivered {
-            unshipped.push_back(slice);
+) -> ShipPass {
+    let start = tokio::time::Instant::now();
+    loop {
+        // Budget check FIRST: an expired pass defers the WHOLE
+        // remainder (queued, pending — never dropped) to the next
+        // flush, so the arm cedes the select loop every period no
+        // matter how deep the backlog or how slow the scheduler.
+        if start.elapsed() >= per_pass_budget {
+            return ShipPass::BudgetExhausted {
+                remaining: unshipped.len(),
+            };
+        }
+        let Some(slice) = unshipped.pop_front() else {
+            return ShipPass::Drained;
+        };
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => {
+                // Preempting the in-flight append is the ambiguous
+                // commit-or-not case — re-queue VERBATIM (uid and
+                // all); the redelivery dedups under the keyed
+                // (cluster, class, window) identity. The caller's
+                // next select! iteration reaches the biased shutdown
+                // arm, whose per-slice counted forfeiture is the ONE
+                // sanctioned drop exit.
+                unshipped.push_back(slice);
+                return ShipPass::Cancelled {
+                    requeued_in_flight: true,
+                };
+            }
+            delivered = ship(&slice) => {
+                if !delivered {
+                    // The recredit law: retain VERBATIM for the next
+                    // attempt (within this pass's budget, or the next
+                    // flush's pass).
+                    unshipped.push_back(slice);
+                }
+            }
         }
     }
 }
@@ -1385,7 +1505,7 @@ mod tests {
     /// on the bug_150 pre-fix shape via strawman reversal of the
     /// settle law: the second flush shipped 60.0 total — the failed
     /// window was consumed by the cursor advance and never re-banked.)
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn failed_exposure_slice_recredits_to_next_flush() {
         let cluster = ClusterId::new("prod-eu");
         let mut gate = WindowGate::default();
@@ -1399,7 +1519,19 @@ mod tests {
             (unshipped[0].hw.as_str(), unshipped[0].secs),
             ("m6id", 60.0)
         );
-        ship_all(&mut unshipped, |_| std::future::ready(false)).await;
+        ship_all(
+            &mut unshipped,
+            &rio_common::signal::Token::new(),
+            // Paused clock: 5 virtual seconds per failed attempt
+            // against a 5s budget = exactly one attempt per slice
+            // (the recredit law, without budget-loop re-attempts).
+            Duration::from_secs(5),
+            |_| async {
+                tokio::time::advance(Duration::from_secs(5)).await;
+                false
+            },
+        )
+        .await;
         assert_eq!(unshipped.len(), 1, "failed slice re-credited, not consumed");
         // Flush 2 (t=1060 → slot 1020): fresh 60s again. BOTH windows
         // ship — as two slices under their own uids, total conserved.
@@ -1420,10 +1552,15 @@ mod tests {
             "each window keys its own committed row"
         );
         let mut shipped: Vec<f64> = Vec::new();
-        ship_all(&mut unshipped, |s: &PendingExposure| {
-            shipped.push(s.secs);
-            std::future::ready(true)
-        })
+        ship_all(
+            &mut unshipped,
+            &rio_common::signal::Token::new(),
+            EXPOSURE_SHIP_PASS_BUDGET,
+            |s: &PendingExposure| {
+                shipped.push(s.secs);
+                std::future::ready(true)
+            },
+        )
         .await;
         assert_eq!(shipped.iter().sum::<f64>(), 120.0, "both windows shipped");
         assert!(unshipped.is_empty(), "delivered slices leave no residue");
@@ -1433,23 +1570,40 @@ mod tests {
     /// A retained class with NO fresh slice this round (its nodes were
     /// deleted mid-outage) still retries — retention is queue
     /// membership, independent of fresh production.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn retained_class_without_fresh_slice_still_retries() {
         let cluster = ClusterId::new("prod-eu");
         let mut gate = WindowGate::default();
         let mut unshipped: VecDeque<PendingExposure> = VecDeque::new();
         let w1 = gate.admit(500.0).expect("first admit");
         queue_exposure_slices(&mut unshipped, vec![("m6id".into(), 45.0)], &cluster, w1);
-        ship_all(&mut unshipped, |_| std::future::ready(false)).await;
+        ship_all(
+            &mut unshipped,
+            &rio_common::signal::Token::new(),
+            // Paused clock: 5 virtual seconds per failed attempt
+            // against a 5s budget = exactly one attempt per slice
+            // (the recredit law, without budget-loop re-attempts).
+            Duration::from_secs(5),
+            |_| async {
+                tokio::time::advance(Duration::from_secs(5)).await;
+                false
+            },
+        )
+        .await;
         // Next flush: NO fresh slices — retention is queue
         // membership, independent of fresh production.
         let w2 = gate.admit(560.0).expect("next slot admits");
         queue_exposure_slices(&mut unshipped, vec![], &cluster, w2);
         let mut attempted: Vec<(String, f64)> = Vec::new();
-        ship_all(&mut unshipped, |s: &PendingExposure| {
-            attempted.push((s.hw.clone(), s.secs));
-            std::future::ready(true)
-        })
+        ship_all(
+            &mut unshipped,
+            &rio_common::signal::Token::new(),
+            EXPOSURE_SHIP_PASS_BUDGET,
+            |s: &PendingExposure| {
+                attempted.push((s.hw.clone(), s.secs));
+                std::future::ready(true)
+            },
+        )
         .await;
         assert_eq!(attempted, vec![("m6id".into(), 45.0)]);
         assert!(unshipped.is_empty());
@@ -1466,7 +1620,7 @@ mod tests {
     /// `right:` retry uid == original uid (re-verified under
     /// [`EventUid`] equality — merged_bug_001 made the key
     /// cluster-scoped and grid-aligned, `exposure:{cluster}:{hw}:{slot}`).
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn retried_slice_carries_identical_uid() {
         let cluster = ClusterId::new("prod-eu");
         let mut gate = WindowGate::default();
@@ -1481,7 +1635,19 @@ mod tests {
         );
         // Ambiguous failure → the combinator's recredit law retains;
         // the retried slice is byte-identical (uid AND value).
-        ship_all(&mut unshipped, |_| std::future::ready(false)).await;
+        ship_all(
+            &mut unshipped,
+            &rio_common::signal::Token::new(),
+            // Paused clock: 5 virtual seconds per failed attempt
+            // against a 5s budget = exactly one attempt per slice
+            // (the recredit law, without budget-loop re-attempts).
+            Duration::from_secs(5),
+            |_| async {
+                tokio::time::advance(Duration::from_secs(5)).await;
+                false
+            },
+        )
+        .await;
         assert_eq!(
             unshipped[0], original,
             "retry must collide with its own committed row server-side"
@@ -1595,7 +1761,7 @@ mod tests {
     /// intact (it still ships). Extends the conservation family
     /// below: deferral is the LIST-failure posture, not a fourth
     /// forfeiture.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn conservation_holds_across_deferred_window() {
         use metrics_util::debugging::DebuggingRecorder;
         let cfg = band_config();
@@ -1615,7 +1781,19 @@ mod tests {
         assert!(out.drops.is_empty());
         queue_exposure_slices(&mut unshipped, out.banked, &cluster, w1);
         assert_eq!(unshipped.len(), 1);
-        ship_all(&mut unshipped, |_| std::future::ready(false)).await;
+        ship_all(
+            &mut unshipped,
+            &rio_common::signal::Token::new(),
+            // Paused clock: 5 virtual seconds per failed attempt
+            // against a 5s budget = exactly one attempt per slice
+            // (the recredit law, without budget-loop re-attempts).
+            Duration::from_secs(5),
+            |_| async {
+                tokio::time::advance(Duration::from_secs(5)).await;
+                false
+            },
+        )
+        .await;
         assert_eq!(unshipped.len(), 1, "failed slice retained");
         let cursors_before = cursors.clone();
         let queued_before = unshipped.clone();
@@ -1638,6 +1816,182 @@ mod tests {
         assert!(
             rec.snapshotter().snapshot().into_vec().is_empty(),
             "a deferred window forfeits nothing — zero drop ticks"
+        );
+    }
+
+    /// Production-minted backlog for the ship_all tests: `n` windows
+    /// of one class, every uid through the gate + queue constructors
+    /// (witness provenance — no hand-rolled wire shapes).
+    fn minted_backlog(n: u64) -> VecDeque<PendingExposure> {
+        let cluster = ClusterId::new("prod-eu");
+        let mut gate = WindowGate::default();
+        let mut unshipped: VecDeque<PendingExposure> = VecDeque::new();
+        for i in 0..n {
+            let w = gate
+                .admit(1000.0 + 60.0 * i as f64)
+                .expect("each tick lands in a fresh slot");
+            queue_exposure_slices(&mut unshipped, vec![("m6id".into(), 60.0)], &cluster, w);
+        }
+        unshipped
+    }
+
+    // r[verify ctrl.informer.exposure-drain-budget]
+    /// merged_bug_033 red R6: a drain pass is bounded by the
+    /// wall-clock budget — the remainder DEFERS (stays queued, zero
+    /// drop ticks; deferral is not forfeiture). Recorded red at the
+    /// pre-budget extraction (the whole backlog shipped serially in
+    /// one arm body): `left: 10 / right: 3` — "budget 12s at
+    /// 5s/attempt = 3 attempts".
+    #[tokio::test(start_paused = true)]
+    async fn ship_all_stops_at_pass_budget_and_defers_remainder() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let mut unshipped = minted_backlog(10);
+        assert_eq!(unshipped.len(), 10);
+
+        let rec = DebuggingRecorder::new();
+        let _g = ::metrics::set_default_local_recorder(&rec);
+
+        let shutdown = rio_common::signal::Token::new();
+        let mut attempts = 0u32;
+        let pass = ship_all(&mut unshipped, &shutdown, Duration::from_secs(12), |_| {
+            attempts += 1;
+            async {
+                // Paused clock: each shipment costs 5 virtual
+                // seconds and fails (the stalled-scheduler
+                // shape).
+                tokio::time::advance(Duration::from_secs(5)).await;
+                false
+            }
+        })
+        .await;
+        assert_eq!(attempts, 3, "budget 12s at 5s/attempt = 3 attempts");
+        assert_eq!(
+            pass,
+            ShipPass::BudgetExhausted { remaining: 10 },
+            "the pass exits through the budget arm with the full backlog pending"
+        );
+        assert_eq!(
+            unshipped.len(),
+            10,
+            "deferral is not forfeiture: every slice still queued"
+        );
+        assert!(
+            rec.snapshotter().snapshot().into_vec().is_empty(),
+            "zero drop ticks — budget deferral is PENDING, never a drop"
+        );
+    }
+
+    // r[verify ctrl.informer.exposure-drain-budget]
+    /// merged_bug_033 red R7: shutdown preempts the IN-FLIGHT ship —
+    /// the combinator returns within one poll of cancellation, the
+    /// preempted slice re-queues under an IDENTICAL EventUid (the
+    /// WO-1 coupling: the aborted append is exactly the ambiguous
+    /// commit-or-not the deterministic uid redelivers into), and the
+    /// rest go unattempted. Recorded red at the pre-cancel
+    /// extraction: `Err(Elapsed(()))` — the combinator never returns
+    /// while a ship hangs.
+    #[tokio::test]
+    async fn ship_all_preempts_in_flight_ship_on_cancellation() {
+        let mut unshipped = minted_backlog(10);
+        let in_flight_uid = unshipped[1].uid.clone();
+
+        let shutdown = rio_common::signal::Token::new();
+        let token = shutdown.clone();
+        let mut calls = 0u32;
+        let pass = tokio::time::timeout(
+            Duration::from_secs(1),
+            ship_all(&mut unshipped, &shutdown, EXPOSURE_SHIP_PASS_BUDGET, |_| {
+                calls += 1;
+                let cancel_now = calls == 2;
+                let token = token.clone();
+                async move {
+                    if cancel_now {
+                        // Slice 2 hangs forever; shutdown fires
+                        // mid-flight.
+                        token.cancel();
+                        std::future::pending::<bool>().await
+                    } else {
+                        true
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("ship_all must return promptly under cancellation");
+        assert_eq!(
+            pass,
+            ShipPass::Cancelled {
+                requeued_in_flight: true
+            },
+            "preemption exits through the Cancelled arm"
+        );
+        assert_eq!(calls, 2, "slices after the preempted one are unattempted");
+        assert_eq!(
+            unshipped.len(),
+            9,
+            "slice 1 delivered; in-flight slice 2 re-queued; 3..10 untouched"
+        );
+        assert_eq!(
+            unshipped.back().expect("requeued slice").uid,
+            in_flight_uid,
+            "the in-flight slice re-queues under an IDENTICAL EventUid"
+        );
+    }
+
+    // r[verify ctrl.informer.exposure-recredit+2]
+    // r[verify ctrl.informer.exposure-drain-budget]
+    /// merged_bug_033 red R8: conservation across preemption — every
+    /// node-second entering a cancelled pass is either ACKED or still
+    /// QUEUED (the cancel-requeue is PENDING, not a drop; the counted
+    /// whole-backlog forfeiture belongs to the caller's shutdown arm
+    /// alone).
+    #[tokio::test]
+    async fn cancelled_pass_conserves_every_slice() {
+        let mut unshipped = minted_backlog(6);
+        let total_in: f64 = unshipped.iter().map(|s| s.secs).sum();
+
+        let shutdown = rio_common::signal::Token::new();
+        let token = shutdown.clone();
+        let mut calls = 0u32;
+        let mut acked = 0.0f64;
+        let pass = tokio::time::timeout(
+            Duration::from_secs(1),
+            ship_all(
+                &mut unshipped,
+                &shutdown,
+                EXPOSURE_SHIP_PASS_BUDGET,
+                |s: &PendingExposure| {
+                    calls += 1;
+                    let cancel_now = calls == 4;
+                    if !cancel_now {
+                        acked += s.secs;
+                    }
+                    let token = token.clone();
+                    async move {
+                        if cancel_now {
+                            token.cancel();
+                            std::future::pending::<bool>().await
+                        } else {
+                            true
+                        }
+                    }
+                },
+            ),
+        )
+        .await
+        .expect("conservation pass must return under cancellation");
+        assert_eq!(
+            pass,
+            ShipPass::Cancelled {
+                requeued_in_flight: true
+            }
+        );
+        let queued_after: f64 = unshipped.iter().map(|s| s.secs).sum();
+        assert_eq!(
+            total_in,
+            acked + queued_after,
+            "Σ in == Σ acked + Σ queued-after-Cancelled (nothing vanishes \
+             across preemption)"
         );
     }
 

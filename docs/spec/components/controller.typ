@@ -734,6 +734,28 @@ merged_bug_001 closed with the typed, cluster-scoped, grid-aligned,
 monotonically-gated key this rule now requires (Q2-round5: the axis
 rides the uid FORMAT; M_047 stays frozen).
 
+#r("ctrl.informer.exposure-drain-budget")[
+  The pending-queue exposure sweep MUST bound each drain pass by a
+  wall-clock budget and MUST be preemptible by shutdown both between
+  and during shipments (the in-flight append raced against
+  cancellation), so the shutdown arm's counted whole-backlog
+  forfeiture is reachable within the pod termination grace at ANY
+  backlog depth; a budget-deferred or preemption-requeued slice
+  remains PENDING --- never a drop.
+]
+Pre-fix, the flush arm shipped the ENTIRE unshipped backlog serially
+inside one `select!` arm body (each shipment riding a 5s admin-RPC
+timeout, the backlog uncapped by design, every failure re-queued).
+`select!` cannot preempt a running arm body, so under a live-but-stalled
+scheduler the sweep grew ~5s × backlog and the biased shutdown arm ---
+the ONLY site of the counted `shutdown` forfeiture --- went unpolled:
+SIGTERM mid-sweep ended in SIGKILL with ZERO disclosure of exactly the
+permanent denominator loss the recredit rule exists to make visible
+(merged_bug_033). Preempting an in-flight append is safe ONLY because
+of the keyed identity above: the aborted append is the ambiguous
+commit-or-not case, and the verbatim-requeued slice redelivers into the
+absorb.
+
 #info(title: [Note])[
   The controller does NOT hold permissions for `NetworkPolicies` or
   `ConfigMaps`. NetworkPolicies are deployed as static manifests via the Helm
