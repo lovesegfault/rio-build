@@ -14,9 +14,10 @@
 //!    storms the Service VIP for no benefit. Exponential backoff with
 //!    jitter spreads the herd.
 //!
-//! [`connect_with_retry`] fixes both: each sleep races against
-//! `shutdown.cancelled()`, and delays double (1s→2s→4s→8s→16s cap)
-//! with ±25% jitter.
+//! [`connect_with_retry`] fixes both: each sleep AND the in-flight
+//! attempt race against `shutdown.cancelled()` (a hung connect dies
+//! on SIGTERM instead of riding to SIGKILL), and delays double
+//! (1s→2s→4s→8s→16s cap) with ±25% jitter.
 
 use std::time::Duration;
 
@@ -54,11 +55,16 @@ const CONNECT_BACKOFF: Backoff = Backoff {
 ///
 /// # Shutdown
 ///
-/// Every sleep is `select!`-raced against `shutdown.cancelled()`. If
-/// the token fires during a sleep, returns [`RetryError::Cancelled`]
-/// immediately — no final attempt, no extra delay. The token is also
-/// checked before the first attempt, so a pre-cancelled token
-/// short-circuits without ever calling `op`.
+/// Every sleep AND the in-flight attempt itself are `select!`-raced
+/// against `shutdown.cancelled()`. If the token fires mid-sleep or
+/// mid-attempt, returns [`RetryError::Cancelled`] immediately — the
+/// hung attempt is dropped (dropping a connect future cancels it),
+/// no final attempt, no extra delay. A cold-start connect that wedges
+/// (e.g. balanced-channel init stuck on a dependency) therefore dies
+/// promptly on SIGTERM instead of riding out the pod's termination
+/// grace to SIGKILL. The token is also checked before the first
+/// attempt, so a pre-cancelled token short-circuits without ever
+/// calling `op`.
 ///
 /// # `max_tries`
 ///
@@ -165,6 +171,34 @@ mod tests {
             1,
             "no retry after cancellation"
         );
+    }
+
+    /// Shutdown during a HUNG attempt (op never resolves) returns
+    /// promptly. This is the cold-start wedge shape: a connect that
+    /// parks forever --- balanced-channel init stuck, black-holed
+    /// peer --- must die on SIGTERM instead of riding out the pod's
+    /// grace period to SIGKILL (exit 137).
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_during_inflight_attempt_returns_promptly() {
+        let token = CancellationToken::new();
+
+        let token2 = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            token2.cancel();
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_with_retry(
+                &token,
+                || async { std::future::pending::<Result<(), &str>>().await },
+                None,
+            ),
+        )
+        .await
+        .expect("connect_with_retry must observe shutdown during a hung attempt");
+        assert!(matches!(result, Err(RetryError::Cancelled)));
     }
 
     /// Pre-cancelled token short-circuits before the first attempt.

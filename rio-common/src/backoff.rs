@@ -172,11 +172,17 @@ impl<E: std::fmt::Display + std::fmt::Debug> std::error::Error for RetryError<E>
 /// Retry `op` up to `max_attempts` times with `policy` backoff between
 /// attempts.
 ///
-/// Each sleep is `select!`-raced against `shutdown.cancelled()`; the
-/// token is also checked before every attempt, so a pre-cancelled
-/// token short-circuits without calling `op`. `max_attempts` of
-/// [`u32::MAX`] is effectively infinite — exit happens via `Ok`,
-/// `Cancelled`, or `is_retryable` → `false`.
+/// Both the in-flight `op()` future and each backoff sleep are
+/// `select!`-raced against `shutdown.cancelled()` — cancellation
+/// mid-attempt DROPS the attempt (ops here are connect/RPC-shaped;
+/// dropping cancels them cleanly). An op that never resolves (wedged
+/// cold-start connect, black-holed peer) must not make the process
+/// SIGTERM-immune: racing only the sleep lets such a pod burn its
+/// whole termination grace and exit 137. The token is also checked
+/// before every attempt, so a pre-cancelled token short-circuits
+/// without calling `op`. `max_attempts` of [`u32::MAX`] is
+/// effectively infinite — exit happens via `Ok`, `Cancelled`, or
+/// `is_retryable` → `false`.
 ///
 /// `is_retryable(&e) == false` returns `Exhausted { last: e }`
 /// immediately (no sleep) — non-retryable errors should surface
@@ -199,7 +205,16 @@ pub async fn retry<T, E>(
         if shutdown.is_cancelled() {
             return Err(RetryError::Cancelled);
         }
-        match op().await {
+        // Race the attempt itself against shutdown, not just the
+        // inter-attempt sleep: a parked op would otherwise pin this
+        // loop until SIGKILL. `biased` so a fired token wins
+        // deterministically over a simultaneously-ready op.
+        let attempt_result = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return Err(RetryError::Cancelled),
+            r = op() => r,
+        };
+        match attempt_result {
             Ok(v) => return Ok(v),
             Err(e) => {
                 attempt += 1;
@@ -387,6 +402,43 @@ mod tests {
 
         assert!(matches!(r, Err(RetryError::Cancelled)));
         assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry after cancel");
+    }
+
+    /// SIGTERM while `op` itself is parked (not sleeping between
+    /// attempts) must return Cancelled promptly. Racing only the
+    /// backoff sleep makes an op that never resolves (wedged
+    /// cold-start connect, black-holed peer) SIGTERM-immune: the pod
+    /// burns its full termination grace and exits 137.
+    #[tokio::test(start_paused = true)]
+    async fn retry_cancelled_during_inflight_op() {
+        let token = Token::new();
+
+        // Cancel 10ms in --- mid-op (op never resolves). Spawn the
+        // canceller, not the retry future (HRTB-Send limitation, see
+        // retry_cancelled_during_sleep).
+        let t = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            t.cancel();
+        });
+
+        // Outer timeout converts "retry ignored the token" into a
+        // visible failure instead of a hung test. 5s of virtual time
+        // is 500x the cancel deadline.
+        let r = tokio::time::timeout(
+            Duration::from_secs(5),
+            retry(
+                &P,
+                u32::MAX,
+                &token,
+                |_: &&str| true,
+                |_, _| {},
+                || async { std::future::pending::<Result<(), &str>>().await },
+            ),
+        )
+        .await
+        .expect("retry must observe shutdown while op is in flight, not only between attempts");
+        assert!(matches!(r, Err(RetryError::Cancelled)));
     }
 
     #[tokio::test(start_paused = true)]
