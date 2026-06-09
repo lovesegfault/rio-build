@@ -698,6 +698,19 @@ impl UploadTask {
                 out = None;
             }
 
+            // Absolute top-of-iteration enforcement (bug_239 sweep): the
+            // biased select below prefers the ack arm, so an ack flood
+            // whose durable_through_line never advances (trim pops 0,
+            // the drain-completion check stays false) would starve a
+            // deadline expressed only as a select arm. Same law as the
+            // stderr loop: enforcement runs before any arm is polled;
+            // the deadline arm below is a pure waker.
+            if let Some(d) = self.deadline
+                && Instant::now() >= d
+            {
+                return SessionEnd::DeadlineExpired;
+            }
+
             let deadline = self.deadline_sleep();
             tokio::pin!(deadline);
 
@@ -767,9 +780,9 @@ impl UploadTask {
                     self.accept(batch);
                 }
 
-                _ = &mut deadline, if self.deadline.is_some() => {
-                    return SessionEnd::DeadlineExpired;
-                }
+                // Deadline WAKER: enforcement lives at the loop top
+                // (bug_239 sweep); this arm only wakes a parked loop.
+                _ = &mut deadline, if self.deadline.is_some() => {}
             }
         }
     }
@@ -790,6 +803,14 @@ impl UploadTask {
     {
         tokio::pin!(fut);
         loop {
+            // Absolute top-of-iteration enforcement (bug_239 sweep):
+            // a continuously-ready input arm must not delay the drain
+            // deadline; the expiry arm below is a pure waker.
+            if let Some(d) = self.deadline
+                && Instant::now() >= d
+            {
+                return None;
+            }
             // Re-created per iteration (the deadline_sleep pattern):
             // the deadline arms when accept(None) observes the input
             // close, which can happen INSIDE this loop — a snapshot at
@@ -798,7 +819,7 @@ impl UploadTask {
             tokio::select! {
                 out = &mut fut => return Some(out),
                 batch = self.input.recv(), if self.input_open => self.accept(batch),
-                _ = expiry, if self.deadline.is_some() => return None,
+                _ = expiry, if self.deadline.is_some() => {}
             }
         }
     }

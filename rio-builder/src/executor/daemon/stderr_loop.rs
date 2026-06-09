@@ -565,11 +565,52 @@ where
     flush_tick.tick().await;
 
     let outcome: LoopOutcome = loop {
+        // r[impl builder.silence.timeout-kill]
+        // Absolute top-of-iteration enforcement (bug_239): the biased
+        // select below prefers the message arm, so a sustained frame
+        // flood — SetPhase/Progress chatter that deliberately never
+        // resets last_output — keeps that arm always-ready and would
+        // starve any deadline expressed only as a select arm, without
+        // bound. Enforcement must not be a throughput race: these
+        // checks run unconditionally before any arm is polled, so an
+        // expired deadline fires on the next iteration no matter how
+        // busy the stream is. This is the ONLY enforcement site; the
+        // two sleep arms in the select below are pure WAKERS so a
+        // parked (quiet) loop re-enters it when a deadline passes.
+        // Breaking here reaches final_flush below, so the last ≤63
+        // buffered lines reach upload_tx on both deadline paths.
+        let now = Instant::now();
+        if now >= build_deadline {
+            tracing::warn!(
+                timeout_secs = build_timeout.as_secs(),
+                "build exceeded timeout; reporting TimedOut (no reassignment)"
+            );
+            break Ok(Some(BuildResult::failure(
+                BuildStatus::TimedOut,
+                format!(
+                    "build exceeded configured timeout of {}s",
+                    build_timeout.as_secs()
+                ),
+            )));
+        }
+        if max_silent_time > 0 && now >= state.last_output + state.silence {
+            tracing::warn!(
+                max_silent_time,
+                "build silent for maxSilentTime; reporting TimedOut (no reassignment)"
+            );
+            break Ok(Some(BuildResult::failure(
+                BuildStatus::TimedOut,
+                format!("no output for {max_silent_time}s (maxSilentTime)"),
+            )));
+        }
+
         tokio::select! {
             // `biased` prioritizes the message arm over the tick arm when
             // both are ready. Under heavy log spew we want to drain messages
             // before doing a tick-driven flush (the 64-line batch-full
-            // trigger in add_line already handles chatty builds).
+            // trigger in add_line already handles chatty builds). Deadline
+            // ENFORCEMENT does not live in this select — see the
+            // top-of-iteration checks above.
             biased;
 
             maybe = msg_rx.recv() => {
@@ -598,46 +639,19 @@ where
                 }
             }
 
-            // Silence deadline. biased; above ensures a pending message is
-            // always consumed (and resets last_output) before this arm can
-            // fire — a chatty build never triggers the silence kill. A
-            // fresh sleep_until future is created each iteration with the
-            // current last_output; when last_output is reset the NEXT
-            // iteration's deadline is pushed out. sleep_until with a past
-            // deadline fires immediately, which is what we want after a
-            // long msg_rx.recv() await where no output arrived.
+            // Silence WAKER. A fresh sleep_until future is created each
+            // iteration with the current last_output; when last_output
+            // is reset the NEXT iteration's waker is pushed out.
+            // sleep_until with a past deadline fires immediately, which
+            // re-enters the loop top where the enforcement check breaks.
             _ = tokio::time::sleep_until(state.last_output + state.silence),
                 if max_silent_time > 0
-            => {
-                tracing::warn!(
-                    max_silent_time,
-                    "build silent for maxSilentTime; reporting TimedOut (no reassignment)"
-                );
-                break Ok(Some(BuildResult::failure(
-                    BuildStatus::TimedOut,
-                    format!("no output for {max_silent_time}s (maxSilentTime)"),
-                )));
-            }
+            => {}
 
-            // Hard build deadline. biased; above means a pending message
-            // (or the silence arm) wins on the same iteration; this is
-            // the absolute backstop. Breaking out of the loop reaches
-            // final_flush below — symmetric with the silence arm so the
-            // last ≤63 buffered lines reach upload_tx instead of being
-            // dropped with the future (the previous outer-timeout shape).
-            _ = tokio::time::sleep_until(build_deadline) => {
-                tracing::warn!(
-                    timeout_secs = build_timeout.as_secs(),
-                    "build exceeded timeout; reporting TimedOut (no reassignment)"
-                );
-                break Ok(Some(BuildResult::failure(
-                    BuildStatus::TimedOut,
-                    format!(
-                        "build exceeded configured timeout of {}s",
-                        build_timeout.as_secs()
-                    ),
-                )));
-            }
+            // Build-deadline WAKER. The absolute backstop's enforcement
+            // lives at the loop top; this arm only guarantees a parked
+            // loop wakes when the hard deadline passes.
+            _ = tokio::time::sleep_until(build_deadline) => {}
         }
     };
 
@@ -751,7 +765,9 @@ mod tests {
 
     use rio_nix::protocol::build::write_build_result;
     use rio_nix::protocol::handshake::{PROTOCOL_VERSION, encode_version};
-    use rio_nix::protocol::stderr::{STDERR_READ, STDERR_WRITE, StderrError, StderrWriter};
+    use rio_nix::protocol::stderr::{
+        ResultType, STDERR_READ, STDERR_WRITE, StderrError, StderrWriter,
+    };
 
     /// Effectively-disabled build_timeout for tests that don't exercise
     /// the build-deadline arm. Far enough out that no
@@ -1315,6 +1331,159 @@ mod tests {
         let br = loop_handle.await?.expect("should complete Built");
         assert_eq!(br.status, BuildStatus::Built);
         Ok(())
+    }
+
+    /// r[verify builder.silence.timeout-kill]
+    /// bug_239: a pre-buffered `Result{104 SetPhase}` backlog (SetPhase
+    /// deliberately never resets `last_output`, and the biased select
+    /// prefers the always-ready message arm) must NOT be consumed past
+    /// an expired hard deadline. Enforcement is a top-of-iteration
+    /// check, not a select arm, so the loop exits on the first
+    /// iteration after expiry: the starvation witness is the number of
+    /// phase frames forwarded AFTER the deadline passed — exactly 0
+    /// with the fix; the whole remaining backlog without it.
+    #[tokio::test(start_paused = true)]
+    async fn test_phase_flood_cannot_starve_build_deadline() -> anyhow::Result<()> {
+        let phases_after_expiry = phase_backlog_consumed_after_expiry(
+            0,                      // silence disabled — isolate the build deadline
+            Duration::from_secs(5), // hard deadline
+            BuildStatus::TimedOut,
+            "5s",
+        )
+        .await?;
+        assert_eq!(
+            phases_after_expiry, 0,
+            "an expired build deadline must fire before any further 104 frame is consumed"
+        );
+        Ok(())
+    }
+
+    /// r[verify builder.silence.timeout-kill]
+    /// bug_239, silence leg: the same backlog must not be consumed past
+    /// an expired maxSilentTime either (SetPhase does not reset
+    /// `last_output` by contract).
+    #[tokio::test(start_paused = true)]
+    async fn test_phase_flood_cannot_starve_silence_deadline() -> anyhow::Result<()> {
+        let phases_after_expiry = phase_backlog_consumed_after_expiry(
+            5, // 5s silence kill
+            NO_BUILD_TIMEOUT,
+            BuildStatus::TimedOut,
+            "maxSilentTime",
+        )
+        .await?;
+        assert_eq!(
+            phases_after_expiry, 0,
+            "an expired silence deadline must fire before any further 104 frame is consumed"
+        );
+        Ok(())
+    }
+
+    /// Shared harness for the two bug_239 starvation tests. Pre-buffers
+    /// a large SetPhase backlog (the duplex + the 32-slot reader
+    /// channel keep the message arm continuously ready), advances time
+    /// past the deadline, lets the loop run to completion, and returns
+    /// how many phase frames the loop forwarded after expiry.
+    async fn phase_backlog_consumed_after_expiry(
+        max_silent_time: u64,
+        build_timeout: Duration,
+        want_status: BuildStatus,
+        want_msg: &str,
+    ) -> anyhow::Result<u64> {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // Big enough that the whole backlog fits the duplex buffer:
+        // a 104 frame is ~50 bytes; 800 frames ≈ 40 KiB.
+        const BACKLOG: usize = 800;
+        let (mut write_half, read_half) = tokio::io::duplex(256 * 1024);
+        let batcher = LogBatcher::new(
+            "/nix/store/test.drv".into(),
+            "test-worker".into(),
+            crate::log_stream::LogLimits::UNLIMITED,
+            0,
+        );
+        // Log capacity 1 + a drainer that yields between recvs: every
+        // phase forward parks the loop on log_tx.send for at least one
+        // scheduling round, which guarantees the reader task refills
+        // the 32-slot message channel before the loop's next select
+        // poll. That pins the adversarial interleaving the defect
+        // needs — the message arm is non-empty at EVERY poll — instead
+        // of leaving it to scheduler luck.
+        let (log_tx, mut log_rx) = mpsc::channel(1);
+        let (upload_tx, _upload_rx) = mpsc::channel(8);
+
+        // Count every BuildPhase forward.
+        let phases = Arc::new(AtomicU64::new(0));
+        let phases_in_drainer = Arc::clone(&phases);
+        let drainer = tokio::spawn(async move {
+            while let Some(msg) = log_rx.recv().await {
+                if matches!(msg, BuildTaskMessage::Phase(_)) {
+                    phases_in_drainer.fetch_add(1, Ordering::SeqCst);
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        // Pre-buffer the whole backlog BEFORE the loop starts: the
+        // reader task will keep its 32-slot channel topped up from the
+        // duplex, so the message arm is ready at every select poll for
+        // the entire backlog.
+        {
+            let mut w = StderrWriter::new(&mut write_half);
+            for _ in 0..BACKLOG {
+                w.result(
+                    0,
+                    ResultType::SetPhase,
+                    &[ResultField::String("buildPhase".into())],
+                )
+                .await?;
+            }
+        }
+
+        let loop_handle = tokio::spawn(async move {
+            read_build_stderr_loop(
+                read_half,
+                max_silent_time,
+                build_timeout,
+                PROTOCOL_VERSION,
+                batcher,
+                &log_tx,
+                &upload_tx,
+            )
+            .await
+            .0
+        });
+
+        // Let the loop chew a little of the backlog below the deadline.
+        drain_tasks().await;
+        assert!(
+            !loop_handle.is_finished(),
+            "loop must still be running before the deadline"
+        );
+
+        // Cross the deadline while most of the backlog is still queued,
+        // and snapshot the forward count at the expiry instant (the
+        // loop has not run since the advance — paused time only moves
+        // when we yield below).
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let consumed_at_expiry = phases.load(Ordering::SeqCst);
+        assert!(
+            (consumed_at_expiry as usize) < BACKLOG / 2,
+            "test setup: most of the backlog must still be pending at expiry \
+             (consumed {consumed_at_expiry} of {BACKLOG})"
+        );
+
+        // Let the loop run to completion.
+        let br = loop_handle.await?.expect("deadline exit is Ok(TimedOut)");
+        assert_eq!(br.status, want_status);
+        assert!(
+            br.error_msg.contains(want_msg),
+            "error_msg should name the cause: {}",
+            br.error_msg
+        );
+        drainer.abort();
+        let consumed_total = phases.load(Ordering::SeqCst);
+        Ok(consumed_total - consumed_at_expiry)
     }
 
     /// The final flush (inside the loop, after STDERR_LAST) must drain any
