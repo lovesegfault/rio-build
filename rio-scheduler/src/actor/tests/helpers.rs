@@ -1088,7 +1088,7 @@ pub(crate) async fn try_pull_attempt(
             resume_exec_id: None,
             claim_nonce: None,
             confirm_only: false,
-            executor_token_sha256: None,
+            executor_token_sha256: Some("tokhash-pod-a".into()),
             reply,
         })
         .await

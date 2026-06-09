@@ -689,6 +689,20 @@ impl ExecutorService for SchedulerGrpc {
                 });
             raw.map(|bytes| hex::encode(sha2::Sha256::digest(bytes)))
         };
+        // merged_bug_145 defense-in-depth: with an HMAC key configured,
+        // a token-less pull cannot reach the actor — require_executor
+        // already rejects it Unauthenticated; this arm keeps the
+        // invariant even if the credential layer regresses, so
+        // `executor_token_sha256 == None` at the actor PROVES the
+        // identity-disabled deployment class (FenceLane::Unfenced).
+        if self.hmac_key.is_some()
+            && executor_token_sha256.is_none()
+            && kind == rio_evidence_kernel::pull::PullKind::Build
+        {
+            return Err(Status::unauthenticated(
+                "executor token required (confirm-fence identity)",
+            ));
+        }
         let req = request.into_inner();
         if req.intent_id.is_empty() {
             return Err(Status::invalid_argument("intent_id is required"));

@@ -128,11 +128,15 @@ async fn materialization_pull_with_empty_instance_rejected() -> anyhow::Result<(
     );
 
     // The same request as a BUILD pull (kind unset) is admitted and
-    // answers Gone for the unknown intent — the as-built behavior,
-    // bit-identical (the new fields are ignored for builds).
+    // answers Gone for the unknown intent — the materialization
+    // fields are ignored for builds. The pull carries a token:
+    // merged_bug_145's fail-closed hoist refuses ADMISSION to
+    // token-less build pulls (no fence identity — the actor-level
+    // polarity tests pin that refusal), so the as-built Gone answer
+    // is asserted for a keyed pod, the production shape.
     let resp = grpc
         .pull_assignment(Request::new(rio_proto::types::PullAssignmentRequest {
-            executor_token: String::new(),
+            executor_token: "tok-grpc-build-pod".into(),
             intent_id: "drv-materialization-no-instance".into(),
             ..Default::default()
         }))

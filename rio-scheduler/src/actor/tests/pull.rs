@@ -120,6 +120,75 @@ async fn row_counts(pool: &sqlx::PgPool, drv_hash: &str) -> (i64, i64) {
     (assignments, executions)
 }
 
+/// merged_bug_145 lane typing (found by automated review of the
+/// chain, then corrected by the keyless-VM red): `None` at the actor
+/// means the IDENTITY-DISABLED deployment class — no pod credential
+/// exists anywhere, the fence has no key domain, and the m145 threat
+/// model (Succeeded k8s Jobs invisible to the establishment sweep)
+/// does not apply. The pull mints and the confirm licenses WITHOUT a
+/// fence row; key-configured deployments can never reach this lane
+/// (require_executor + the gRPC defense arm reject token-less pulls
+/// Unauthenticated before the actor).
+#[tokio::test]
+async fn pull_identity_disabled_lane_unfenced() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev = merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "fence-nokey",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+
+    // Identity-disabled mint: admitted, delivered.
+    let outcome = handle
+        .query_unchecked(|reply| ActorCommand::PullAssignment {
+            intent_id: "fence-nokey".into(),
+            auth_intent: Some("fence-nokey".into()),
+            kind: rio_evidence_kernel::pull::PullKind::Build,
+            executor_instance: None,
+            resume_exec_id: None,
+            claim_nonce: None,
+            confirm_only: false,
+            executor_token_sha256: None,
+            reply,
+        })
+        .await
+        .expect("actor alive");
+    assert!(
+        matches!(outcome, Ok(PullOutcome::Deliver(_))),
+        "identity-disabled deployments mint normally, got {outcome:?}"
+    );
+
+    // Identity-disabled confirm on the held attempt: re-delivers
+    // (DeliverExisting passes the screen), and no fence row is ever
+    // written in this deployment class.
+    let confirmed = handle
+        .query_unchecked(|reply| ActorCommand::PullAssignment {
+            intent_id: "fence-nokey".into(),
+            auth_intent: Some("fence-nokey".into()),
+            kind: rio_evidence_kernel::pull::PullKind::Build,
+            executor_instance: None,
+            resume_exec_id: None,
+            claim_nonce: None,
+            confirm_only: true,
+            executor_token_sha256: None,
+            reply,
+        })
+        .await
+        .expect("actor alive");
+    assert!(
+        matches!(confirmed, Ok(PullOutcome::Deliver(_))),
+        "held-attempt confirm re-delivers, got {confirmed:?}"
+    );
+    let fences: i64 = sqlx::query_scalar("SELECT count(*) FROM executor_confirm_fences")
+        .fetch_one(&db.pool)
+        .await
+        .expect("fence count");
+    assert_eq!(fences, 0, "the identity-disabled lane writes no fence rows");
+    Ok(())
+}
+
 /// merged_bug_145 (bughunt-4 S5b): the confirm-exit fence. A
 /// confirm-only pull answered "nothing held" (NotYetReady) is the
 /// builder's exit-0 license — the Job goes Succeeded. A LATE abandoned

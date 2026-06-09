@@ -201,6 +201,35 @@ pub(crate) struct PullInputs<'a> {
 /// wantedness/deliverability — including the advisory generation-fence
 /// half (`r[sched.lease.generation-fence+3]`) at the kernel's marked
 /// arms.
+/// The fence identity of one pull, decided exactly once at the entry
+/// of the decision path (merged_bug_145 fail-closed hoist): `Option`
+/// never reaches the fence enforcement sites — a build-lane pull
+/// either carries its token hash or was already refused above.
+#[derive(Clone, Copy)]
+enum FenceLane<'a> {
+    /// Build lane with a pod credential: the confirm-exit fence
+    /// governs this pull.
+    Keyed(&'a str),
+    /// Build lane in an IDENTITY-DISABLED deployment (no HMAC key
+    /// configured anywhere — dev mode, the standalone/keyless VM
+    /// fixtures): there is no pod credential in the system, so the
+    /// fence has no key domain. The m145 threat model is the k8s Job
+    /// lifecycle (a Succeeded Job invisible to the establishment
+    /// sweep); an identity-disabled deployment opted out of executor
+    /// identity entirely. Production cannot reach this lane: with a
+    /// key configured the credential layer rejects token-less pulls
+    /// Unauthenticated before the actor, and the gRPC dispatch
+    /// carries a second fail-closed arm behind it (defense in
+    /// depth). First enforced as an unconditional refusal — the
+    /// 13-VM-check red proved the lane is a deployment CLASS, not
+    /// dead code.
+    Unfenced,
+    /// Materialization lane: no confirm-exit protocol, no fence (the
+    /// (intent, instance) composite + the kernel's one-winner arm
+    /// arbitrate replica identity instead).
+    Materialization,
+}
+
 pub(crate) fn admit_pull(inputs: &PullInputs<'_>) -> PullDecision {
     rio_evidence_kernel::pull::admit_pull(
         rio_evidence_kernel::pull::PullRequest {
@@ -297,6 +326,30 @@ impl DagActor {
         confirm_only: bool,
         executor_token_sha256: Option<&str>,
     ) -> Result<PullOutcome, PullRejection> {
+        // merged_bug_145 fail-closed hoist (found by automated review
+        // of the chain): token ABSENCE is decided exactly ONCE, here —
+        // below this point the fence logic consumes a typed lane with
+        // no `None` to reach, so a future caller cannot reintroduce
+        // the bypass by guard omission. The fail-closed boundary for
+        // KEY-CONFIGURED deployments lives where the configuration is
+        // known: the credential layer rejects token-less build pulls
+        // Unauthenticated (grpc/mod.rs require_executor), and the
+        // gRPC dispatch carries a second rejection arm behind it —
+        // `None` reaching this actor therefore MEANS the
+        // identity-disabled deployment class (see FenceLane::Unfenced;
+        // the unconditional-refusal first cut turned every keyless VM
+        // scenario red — 13 checks — which is the machine evidence
+        // this lane is a deployment class, not dead code).
+        let fence_lane = match (kind, executor_token_sha256) {
+            // Materialization lane: replica identity is the
+            // (intent, instance) composite under fleet-level service
+            // credentials; the confirm-exit protocol (and so the
+            // fence) does not exist here — the store's client never
+            // sends confirm_only (both call sites pass false).
+            (rio_evidence_kernel::pull::PullKind::Materialization, _) => FenceLane::Materialization,
+            (rio_evidence_kernel::pull::PullKind::Build, Some(hash)) => FenceLane::Keyed(hash),
+            (rio_evidence_kernel::pull::PullKind::Build, None) => FenceLane::Unfenced,
+        };
         // Standby replicas answer nothing (the gRPC layer already
         // gates; this closes the in-flight-deposed window).
         if !self.leader.is_leader() {
@@ -433,7 +486,7 @@ impl DagActor {
         // retries or exits nonzero → Failed → the sweep reaps).
         if confirm_only
             && matches!(decision, PullDecision::NotYetReady | PullDecision::Gone)
-            && let Some(hash) = executor_token_sha256
+            && let FenceLane::Keyed(hash) = fence_lane
             && let Err(e) = self.db.insert_confirm_fence(hash, intent_id).await
         {
             warn!(intent_id = %intent_id, error = %e,
@@ -498,7 +551,7 @@ impl DagActor {
                 // error: refusing a mint costs one NotYetReady retry;
                 // a false mint costs an invisible open attempt — and
                 // the mint transaction needs PG anyway.
-                if let Some(hash) = executor_token_sha256 {
+                if let FenceLane::Keyed(hash) = fence_lane {
                     match self.db.confirm_fence_exists(hash).await {
                         Ok(true) => {
                             info!(intent_id = %intent_id,
