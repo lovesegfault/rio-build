@@ -1605,12 +1605,14 @@ impl DagActor {
                 }
                 Ok(Err(e)) => {
                     self.cache_breaker.record_failure();
+                    self.note_issued_store_rpc_failure("merge-stale-completed-verify");
                     warn!(error = %e, "stale-completed verify: store FindMissingPaths failed; \
                        treating pre-existing Completed as valid (fail-open)");
                     return HashSet::new();
                 }
                 Err(_) => {
                     self.cache_breaker.record_failure();
+                    self.note_issued_store_rpc_failure("merge-stale-completed-verify");
                     warn!(timeout = ?fmp_timeout,
                       "stale-completed verify: store FindMissingPaths timed out; \
                        treating pre-existing Completed as valid (fail-open)");
@@ -2599,11 +2601,13 @@ impl DagActor {
             {
                 Ok(Ok(r)) => Some(r.into_inner().missing_paths.into_iter().collect()),
                 Ok(Err(e)) => {
+                    self.note_issued_store_rpc_failure("merge-ca-realisation-verify");
                     warn!(error = %e, "CA realisation store-verify: FindMissingPaths failed; \
                           treating realisations as valid (fail-open)");
                     None
                 }
                 Err(_) => {
+                    self.note_issued_store_rpc_failure("merge-ca-realisation-verify");
                     warn!(timeout = ?self.grpc_timeout,
                           "CA realisation store-verify: FindMissingPaths timed out; \
                            treating realisations as valid (fail-open)");
@@ -2726,6 +2730,7 @@ impl DagActor {
             }
             Ok(Err(e)) => {
                 warn!(error = %e, "store FindMissingPaths failed");
+                self.note_issued_store_rpc_failure("merge-cache-check");
                 metrics::counter!("rio_scheduler_cache_check_failures_total").increment(1);
                 // record_failure() returns true if this trips the breaker
                 // open (or it was already open from a prior trip).
@@ -2742,6 +2747,7 @@ impl DagActor {
                     timeout = ?fmp_timeout,
                     "store FindMissingPaths timed out"
                 );
+                self.note_issued_store_rpc_failure("merge-cache-check");
                 metrics::counter!("rio_scheduler_cache_check_failures_total").increment(1);
                 if self.cache_breaker.record_failure() {
                     return Err(ActorError::StoreUnavailable);
@@ -2895,11 +2901,13 @@ impl DagActor {
             }
             Ok(Err(e)) => {
                 debug!(error = %e, "top-down FindMissingPaths failed; falling through");
+                self.note_issued_store_rpc_failure("merge-topdown");
                 self.cache_breaker.record_failure();
                 return None;
             }
             Err(_) => {
                 debug!(timeout = ?grpc_timeout, "top-down FindMissingPaths timed out; falling through");
+                self.note_issued_store_rpc_failure("merge-topdown");
                 self.cache_breaker.record_failure();
                 return None;
             }

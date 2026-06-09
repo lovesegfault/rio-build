@@ -922,10 +922,14 @@ impl DagActor {
             Ok(Ok(r)) => r.into_inner().missing_paths.into_iter().collect(),
             Ok(Err(e)) => {
                 debug!(error = %e, "CA cutoff verify: FindMissingPaths failed; skipping cascade");
+                // merged_bug_179: an issued FMP failure is
+                // store-health evidence on every surface.
+                self.note_issued_store_rpc_failure("ca-cutoff-verify");
                 return HashMap::new();
             }
             Err(_elapsed) => {
                 debug!("CA cutoff verify: FindMissingPaths timed out; skipping cascade");
+                self.note_issued_store_rpc_failure("ca-cutoff-verify");
                 return HashMap::new();
             }
         };

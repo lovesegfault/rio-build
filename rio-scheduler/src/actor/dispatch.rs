@@ -214,25 +214,28 @@ impl DagActor {
                         },
                     );
                 }
-                ProbeOutcome::Failed(e) => {
-                    debug!(?tenant, error = %e,
-                        "per-tenant Ready store-check FindMissingPaths failed; \
-                         that tenant's answers drop from this pass's fold");
-                    // merged_bug_032: the scheduler's own store RPC
-                    // failed — the store-health OR-leg of the
-                    // store-degraded corroboration gate.
-                    self.last_store_rpc_failure = Some(std::time::Instant::now());
-                }
-                ProbeOutcome::TimedOut => {
-                    debug!(?tenant, timeout = ?grpc_timeout,
-                        "per-tenant Ready store-check timed out (or the sweep \
-                         budget expired); that tenant's answers drop from this \
-                         pass's fold");
-                    // merged_bug_032: a timed-out probe is store-unhealth
-                    // evidence exactly like a Failed one — the budget-expiry
-                    // shape included (the budget is sized to the same
-                    // grpc_timeout the per-attempt clamp came from).
-                    self.last_store_rpc_failure = Some(std::time::Instant::now());
+                ref outcome => {
+                    match outcome {
+                        ProbeOutcome::Failed(e) => debug!(?tenant, error = %e,
+                            "per-tenant Ready store-check FindMissingPaths failed; \
+                             that tenant's answers drop from this pass's fold"),
+                        ProbeOutcome::TimedOut => debug!(?tenant, timeout = ?grpc_timeout,
+                            "per-tenant Ready store-check timed out; that tenant's \
+                             answers drop from this pass's fold"),
+                        ProbeOutcome::BudgetExpired => debug!(
+                            ?tenant,
+                            "per-tenant Ready store-check short-circuited by sweep \
+                             budget expiry (RPC never issued); no store-health \
+                             evidence (merged_bug_179)"
+                        ),
+                        ProbeOutcome::Answered(_) => unreachable!("matched above"),
+                    }
+                    // merged_bug_032 + merged_bug_179: the stamp
+                    // decision goes through THE policy match — only
+                    // ISSUED-RPC failures are store-health evidence.
+                    if is_store_health_evidence(outcome) {
+                        self.note_issued_store_rpc_failure("ready-check");
+                    }
                 }
             }
         }
@@ -1355,10 +1358,29 @@ pub(super) enum ProbeOutcome<R> {
     Answered(R),
     /// The store answered with an error.
     Failed(tonic::Status),
-    /// The per-attempt bound elapsed — or the sweep budget was already
-    /// expired when this probe's turn came (short-circuited without
-    /// issuing the RPC).
+    /// The per-attempt bound elapsed on an ISSUED RPC.
     TimedOut,
+    /// The sweep budget was already expired when this probe's turn
+    /// came: short-circuited WITHOUT issuing the RPC
+    /// (merged_bug_179). Never store-health evidence — under
+    /// multi-tenant load (ceil(T/8)*L > budget on a healthy store)
+    /// every pass would otherwise re-stamp the corroboration gate's
+    /// OR-leg and re-open the single-node store_degraded forgery
+    /// lane the merged_bug_032 gate exists to close.
+    BudgetExpired,
+}
+
+/// THE store-health-evidence policy over probe outcomes
+/// (merged_bug_179): exhaustive, so adding a variant forces the
+/// decision here — the machine witness that only outcomes of ISSUED
+/// store RPCs can stamp `last_store_rpc_failure`.
+pub(super) fn is_store_health_evidence<R>(outcome: &ProbeOutcome<R>) -> bool {
+    match outcome {
+        ProbeOutcome::Answered(_) => false,
+        ProbeOutcome::Failed(_) => true,
+        ProbeOutcome::TimedOut => true,
+        ProbeOutcome::BudgetExpired => false,
+    }
 }
 
 /// Fan probes out `buffer_unordered(min(T, MAX_PROBE_CONCURRENCY))`,
@@ -1374,6 +1396,22 @@ pub(super) enum ProbeOutcome<R> {
 /// futures and a paused clock; production passes the
 /// `find_missing_paths` call.
 // r[impl sched.dispatch.probe-budget]
+impl super::DagActor {
+    /// THE single writer of `last_store_rpc_failure` (merged_bug_179):
+    /// store-health evidence for the corroboration gate's OR-leg.
+    /// Callers are the ISSUED-RPC failure arms only — the
+    /// budget-expiry short-circuit (`ProbeOutcome::BudgetExpired`)
+    /// never reaches here, and `is_store_health_evidence` is the
+    /// exhaustive policy match.
+    pub(super) fn note_issued_store_rpc_failure(&mut self, surface: &'static str) {
+        tracing::debug!(
+            surface,
+            "issued store RPC failed: store-health evidence stamped"
+        );
+        self.last_store_rpc_failure = Some(std::time::Instant::now());
+    }
+}
+
 pub(super) async fn fan_out_probes<K, Req, R, F, Fut>(
     probes: Vec<(K, Req)>,
     budget: &rio_common::transport::AttemptBudget,
@@ -1390,7 +1428,8 @@ where
         let fut = probe(req);
         async move {
             if budget.expired() {
-                return (key, ProbeOutcome::TimedOut);
+                // Short-circuit: the RPC is never issued.
+                return (key, ProbeOutcome::BudgetExpired);
             }
             let bound = budget.attempt_bound(per_attempt_cap);
             match tokio::time::timeout(bound, fut).await {

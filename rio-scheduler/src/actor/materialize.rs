@@ -2418,14 +2418,30 @@ impl DagActor {
             // a partial view must not confirm). A store that REJECTS
             // the probe (UNAUTHENTICATED under the Q3 law — rotated
             // service HMAC) lands here too: conservative ReArm.
-            let resp = tokio::time::timeout(
+            let resp = match tokio::time::timeout(
                 budget.attempt_bound(self.grpc_timeout),
                 store.clone().find_missing_paths(req),
             )
             .await
-            .ok()?
-            .ok()?
-            .into_inner();
+            {
+                Ok(Ok(resp)) => resp.into_inner(),
+                Ok(Err(e)) => {
+                    // merged_bug_179: an issued FMP failure is
+                    // store-health evidence on this surface too — the
+                    // arm-3 settlement reprobe carries the same
+                    // probe-budget marker as the dispatch fold and
+                    // "poisons the answer exactly like a per-tenant
+                    // failure".
+                    self.note_issued_store_rpc_failure("settlement-reprobe");
+                    tracing::debug!(error = %e, "settlement reprobe: FindMissingPaths failed");
+                    return None;
+                }
+                Err(_elapsed) => {
+                    self.note_issued_store_rpc_failure("settlement-reprobe");
+                    tracing::debug!("settlement reprobe: FindMissingPaths timed out");
+                    return None;
+                }
+            };
             // merged_bug_003 (Q3): confirmed-missing authority derives
             // from the store's ECHO — the probe actually ran tenant-
             // scoped — never from `!probe.is_empty()` (the scheduler's

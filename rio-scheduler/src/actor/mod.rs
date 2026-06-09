@@ -364,6 +364,9 @@ pub struct DagActor {
     /// scheduler's OWN store RPCs (the dispatch-time FindMissingPaths
     /// probes) failed or timed out. Covers the fleet-of-one case where
     /// two distinct nodes can never be observed.
+    /// merged_bug_179: store-health evidence for the corroboration
+    /// gate. Written ONLY through `note_issued_store_rpc_failure` —
+    /// the issued-RPC chokepoint.
     pub(crate) last_store_rpc_failure: Option<Instant>,
     /// Retry policy.
     retry_policy: RetryPolicy,

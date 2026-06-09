@@ -2501,3 +2501,72 @@ async fn hung_tenant_sweep_is_bounded_by_one_timeout() {
         "the whole hung sweep costs exactly ONE grpc_timeout"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Budget expiry is not store-health evidence (merged_bug_179)
+// ---------------------------------------------------------------------------
+
+/// merged_bug_179: a sweep-budget expiry short-circuits the probe
+/// WITHOUT issuing the RPC -- pre-fix it returned `TimedOut`, and the
+/// fold stamped `last_store_rpc_failure` for it, so under multi-tenant
+/// load (ceil(T/8) * L > budget on a HEALTHY store) every dispatch
+/// pass re-stamped the corroboration gate's store-health OR-leg and
+/// permanently satisfied it -- re-opening the single-node
+/// store_degraded forgery lane the merged_bug_032 gate closes. The
+/// never-issued shape is now its own variant, the probe future is
+/// provably never polled, and the exhaustive evidence policy refuses
+/// it.
+#[tokio::test]
+async fn budget_expiry_short_circuit_is_not_store_health_evidence() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let issued = std::sync::Arc::new(AtomicBool::new(false));
+    let issued_probe = std::sync::Arc::clone(&issued);
+    // A budget that is already spent before any probe's turn comes.
+    let budget = rio_common::transport::AttemptBudget::new(std::time::Duration::ZERO);
+    let out = crate::actor::dispatch::fan_out_probes(
+        vec![("tenant-a", ())],
+        &budget,
+        std::time::Duration::from_secs(5),
+        move |_req: ()| {
+            // The flag sets when the RPC future is POLLED (a tonic
+            // call future is lazy; creation does not issue).
+            let polled = std::sync::Arc::clone(&issued_probe);
+            async move {
+                polled.store(true, Ordering::SeqCst);
+                Ok(tonic::Response::new(()))
+            }
+        },
+    )
+    .await;
+    assert!(
+        !issued.load(Ordering::SeqCst),
+        "an expired budget must short-circuit WITHOUT issuing the RPC"
+    );
+    let (_, outcome) = &out[0];
+    let evidence = crate::actor::dispatch::is_store_health_evidence(outcome);
+    assert!(
+        matches!(outcome, crate::actor::dispatch::ProbeOutcome::BudgetExpired),
+        "the never-issued shape must be its own variant, got evidence={evidence}"
+    );
+    assert!(
+        !evidence,
+        "left: degraded / right: healthy (a budget-expiry storm must \
+         NOT trip the store-degraded corroboration gate)"
+    );
+}
+
+/// The exhaustive evidence-policy witness: only ISSUED-RPC failures
+/// stamp. Adding a `ProbeOutcome` variant breaks this match (and the
+/// production one) at compile time.
+#[test]
+fn store_health_evidence_policy_is_issued_only() {
+    use crate::actor::dispatch::{ProbeOutcome, is_store_health_evidence};
+    assert!(!is_store_health_evidence::<()>(&ProbeOutcome::Answered(())));
+    assert!(is_store_health_evidence::<()>(&ProbeOutcome::Failed(
+        tonic::Status::internal("x")
+    )));
+    assert!(is_store_health_evidence::<()>(&ProbeOutcome::TimedOut));
+    assert!(!is_store_health_evidence::<()>(
+        &ProbeOutcome::BudgetExpired
+    ));
+}

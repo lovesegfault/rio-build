@@ -98,7 +98,7 @@ impl DagActor {
                 let _ = reply.send(self.handle_debug_trip_breaker(n));
             }
             DebugCmd::MarkStoreRpcFailure { reply } => {
-                self.last_store_rpc_failure = Some(std::time::Instant::now());
+                self.note_issued_store_rpc_failure("debug-cmd");
                 let _ = reply.send(());
             }
             DebugCmd::QueryAttemptHistory { drv_hash, reply } => {

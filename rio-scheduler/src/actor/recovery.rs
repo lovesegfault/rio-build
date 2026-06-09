@@ -2057,11 +2057,13 @@ impl DagActor {
             }
             Ok(Err(e)) => {
                 self.cache_breaker.record_failure();
+                self.note_issued_store_rpc_failure("recovery-reconcile");
                 warn!(error = %e, "reconcile: FindMissingPaths failed (no evidence either way)");
                 StoreProbe::Unavailable
             }
             Err(_) => {
                 self.cache_breaker.record_failure();
+                self.note_issued_store_rpc_failure("recovery-reconcile");
                 warn!(timeout = ?grpc_timeout,
                       "reconcile: FindMissingPaths timed out (no evidence either way)");
                 StoreProbe::Unavailable

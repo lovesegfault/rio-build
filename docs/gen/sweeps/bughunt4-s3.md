@@ -54,3 +54,20 @@ drifted set is a failed sweep, not a stale doc.
 
     The only consuming path is CredentialRejection::into_status_counted(rpc);
     a fifth consumer cannot compile without going through it.
+
+## merged_bug_179 — every last_store_rpc_failure stamp site
+
+    $ grep -rn "note_issued_store_rpc_failure(" rio-scheduler/src/actor --include="*.rs" | grep -v "fn note_issued"
+
+    dispatch.rs    ready-check fold        (policy-gated: is_store_health_evidence)
+    completion.rs  ca-cutoff-verify x2     (issued Err + issued timeout)
+    recovery.rs    recovery-reconcile x2
+    merge.rs       merge-stale-completed-verify x2, merge-ca-realisation-verify x2,
+                   merge-cache-check x2, merge-topdown x2
+    materialize.rs settlement-reprobe x2
+    debug.rs       debug-cmd (cfg(test) hook)
+
+    The field has ONE writer fn; the raw `last_store_rpc_failure = Some(..)`
+    assignment count outside it is ZERO (grep verified). BudgetExpired never
+    reaches the writer: the policy match refuses it and the fan-out
+    short-circuit never polls the RPC future.
