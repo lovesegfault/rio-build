@@ -1666,6 +1666,7 @@ fn mat_unobtainable_outcome(
                     cause: cause.into(),
                     missing_reference_paths: vec![],
                     trust_refused: false,
+                    refusal: 0,
                 },
             ),
         ),

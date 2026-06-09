@@ -588,6 +588,28 @@ enum AttemptKind {
   ATTEMPT_KIND_MATERIALIZATION = 2;
 }
 
+// The CLOSED deterministic-refusal alphabet of an Unobtainable outcome
+// (bug_084): which refusal axes the walk observed on paths that were
+// PRESENT upstream yet could not be taken. A refusal is deterministic
+// store-integrity feedback — a re-probe or resubmit meets the same
+// refusal — so the scheduler must never route it like a clean miss.
+// Decoders MUST consume the raw wire value (try_from), never an
+// accessor that defaults unknown values to UNSPECIFIED: a value outside
+// this list is a FUTURE refusal axis and routes conservatively as a
+// refusal (the kernel's Unrecognized lane), not as the clean lane.
+enum UnobtainableRefusal {
+  // No refusal axis observed: every unobtained path is a genuine miss.
+  UNOBTAINABLE_REFUSAL_UNSPECIFIED = 0;
+  // Present upstream but no narinfo signature verified against
+  // trusted_keys (merged_bug_263).
+  UNOBTAINABLE_REFUSAL_TRUST = 1;
+  // Present upstream but claiming different bytes than the stored row
+  // (merged_bug_046 — the dedup-arm content disagreement).
+  UNOBTAINABLE_REFUSAL_CONTENT = 2;
+  // Both axes observed across the walk's unobtained paths.
+  UNOBTAINABLE_REFUSAL_TRUST_AND_CONTENT = 3;
+}
+
 // Outcome payload for a materialization attempt (design §2.4's alphabet).
 // Carried by ReportOutcomeRequest.materialization_outcome; mutually
 // exclusive with `report` (a request carrying both is rejected).
@@ -629,16 +651,26 @@ message MaterializationOutcome {
     // old-store missing_paths entries outside expected∪carried∪live
     // into this cell (bounded skew, scheduler-before-store rollout).
     repeated string missing_reference_paths = 4;
-    // merged_bug_263: at least one unobtained path was PRESENT
-    // upstream but refused by signature policy (no narinfo signature
-    // verified against trusted_keys). Typed end-to-end so the
-    // settlement can consume it: the scheduler's re-probe is a
-    // sig-blind HEAD (presence, not trust) — under this flag an
+    // merged_bug_263, superseded by `refusal` (field 6): the trust
+    // half of the refusal alphabet as a bare bool. The mint still
+    // writes it COHERENTLY (it falls out of the one refusal_wire
+    // constructor at zero cost: true iff `refusal` carries the trust
+    // axis), but decoders IGNORE it — field 6 is the only consumed
+    // refusal carrier. No cross-release skew lane is kept for it
+    // (SIGNED Q6, bughunt-5 §5-S 2026-06-09: --wipe rollout — no old
+    // schedulers and no old stores exist post-deploy).
+    bool trust_refused = 5;
+    // bug_084: the typed refusal verdict (closed UnobtainableRefusal
+    // alphabet, top level). Typed end-to-end so the settlement can
+    // consume EVERY deterministic refusal axis, not just trust: the
+    // scheduler's re-probe is a presence-only HEAD (blind to both
+    // signature trust and content agreement) — under any refusal an
     // Obtainable re-probe answer never licenses a ReArm, and a
     // pruned-origin job resolves from-source instead of fail-fasting
-    // into a resubmit loop that meets the same refusal. Absent (old
-    // store) decodes false — the pre-field routing, bounded skew.
-    bool trust_refused = 5;
+    // into a resubmit loop that meets the same refusal. Not `optional`
+    // BY DESIGN: absent and explicit UNSPECIFIED share one decode path
+    // (no refusal axis observed).
+    UnobtainableRefusal refusal = 6;
   }
   message InfraFailure {
     // upstream 5xx/timeout/store-internal/no-tenant-context — nothing
