@@ -194,11 +194,15 @@ pub(crate) enum UnservableKind {
 
 impl UnservableKind {
     /// Every variant, in declaration order -- the single derivation
-    /// source for the seeded reason alphabet
-    /// ([`crate::LOG_READ_LOSS_REASONS`]) and the metric HELP. The
-    /// parity test's exhaustive match makes a new variant a compile
-    /// error until this array (and through it both surfaces) is
-    /// extended in the same change.
+    /// source for the seeded reason alphabet: [`Self::ALL_REASONS`]
+    /// derives from this array at const-eval time, and
+    /// [`crate::LOG_READ_LOSS_REASONS`] re-exports that derivation
+    /// into the alert seeding. The chain a new variant walks is all
+    /// compile-forced: the `as_static` match breaks first, the parity
+    /// test's exhaustive match breaks next, its coverage array's
+    /// indexing forces this array's extension, and `ALL_REASONS`
+    /// resizes itself. The one hand edit left is the metric HELP
+    /// prose.
     pub(crate) const ALL: [UnservableKind; 4] = [
         UnservableKind::OversizedChunk,
         UnservableKind::MissingObject,
@@ -206,15 +210,24 @@ impl UnservableKind {
         UnservableKind::UndecodableChunk,
     ];
 
-    /// The reason strings of [`Self::ALL`], in the same order -- what
-    /// [`crate::LOG_READ_LOSS_REASONS`] re-exports for seeding and the
-    /// alert parity test.
-    pub(crate) const ALL_REASONS: [&'static str; 4] = [
-        UnservableKind::OversizedChunk.as_static(),
-        UnservableKind::MissingObject.as_static(),
-        UnservableKind::ShortObject.as_static(),
-        UnservableKind::UndecodableChunk.as_static(),
-    ];
+    /// The reason strings of [`Self::ALL`], DERIVED from it at
+    /// const-eval time -- same order and same length by construction:
+    /// the array length and the loop bound are both `ALL.len()`, so
+    /// there is no second length to drift (a hand-sized mismatch
+    /// would be a const-eval out-of-bounds error). This is
+    /// what [`crate::LOG_READ_LOSS_REASONS`] re-exports for seeding
+    /// and the alert parity test, and it is the production consumer
+    /// that makes `ALL` part of the shipped derivation chain rather
+    /// than a test-only mirror.
+    pub(crate) const ALL_REASONS: [&'static str; UnservableKind::ALL.len()] = {
+        let mut out = [""; UnservableKind::ALL.len()];
+        let mut i = 0;
+        while i < UnservableKind::ALL.len() {
+            out[i] = UnservableKind::ALL[i].as_static();
+            i += 1;
+        }
+        out
+    };
 
     pub(super) const fn as_static(self) -> &'static str {
         match self {
