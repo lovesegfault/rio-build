@@ -53,14 +53,20 @@
 //   openattempts-clobbered-credential -> noCredentialClobber
 //   openattempts-refusal-as-lost   -> noRefusalFiledAsLost
 //   openattempts-minting-confirm   -> confirmNeverMints
+//   openattempts-rotation-skew     -> noFaultNeverCharged
+//   (the merged_bug_072 budget law lives in openAttemptsBudget.qnt --
+//    its own file; see the wedge note there)
 //
 // bughunt-3 S5 (the rule-4b client-loop repairs): three more laws on
 // the claim plane, each seated like the four above —
 //   - the fresh pass is mint-gated by the ledger (merged_bug_096): a
 //     live credential is never clobbered by a second mint for the
 //     same job (`freshClaimSeat`);
-//   - an ANSWERED permanent refusal resolves the credential
-//     (bug_119): it is never filed as a lost response
+//   - a MINT-DISPROVING refusal resolves the credential (bug_119,
+//     narrowed by bughunt-4 merged_bug_074: only InvalidArgument/
+//     Unimplemented -- the request shape can never mint; auth-layer
+//     codes judge the PRESENTATION and keep the entry via
+//     `authRefusalSeat`): it is never filed as a lost response
 //     (`answeredRefusalSeat`);
 //   - a confirm-only probe is a READ (merged_bug_083): it can never
 //     mint (`confirmProbeSeat` — the scheduler screens DeliverNew).
@@ -92,8 +98,9 @@ module openAttempts {
   var driverLost: bool
   // A fresh mint replaced a LIVE credential (merged_bug_096's clobber).
   var credentialClobbered: bool
-  // An answered permanent refusal left the credential live -- filed
-  // as a lost response (bug_119's immortal entry).
+  // A MINT-DISPROVING refusal left the credential live -- filed as
+  // a lost response (bug_119's immortal entry, scope narrowed to
+  // disproving refusals by merged_bug_074).
   var refusalFiledAsLost: bool
   // A confirm-only probe minted a fresh attempt (merged_bug_083).
   var confirmMinted: bool
@@ -233,15 +240,48 @@ module openAttempts {
     confirmMinted' = confirmMinted,
   }
 
-  /// Answered-refusal seat (bug_119): the scheduler ANSWERED with a
-  /// permanent rejection -- no mint exists behind it. `resolvesEntry`
-  /// is the decision; the live client resolves (the rejected arm
-  /// routes ledger.resolve). Filing the refusal as a lost response
-  /// (keeping the credential) is the immortal-entry defect.
+  /// Answered-refusal seat (bug_119, re-scoped to MINT-DISPROVING
+  /// refusals by merged_bug_074): the scheduler ANSWERED with a
+  /// rejection that disproves a mint (InvalidArgument/Unimplemented
+  /// -- the request shape can never mint, on this pull or the
+  /// original one). `resolvesEntry` is the decision; the live client
+  /// resolves (the RejectedDisproving arm routes ledger.resolve).
+  /// Filing a mint-disproving refusal as a lost response (keeping
+  /// the credential) is the immortal-entry defect. Auth-layer
+  /// rejections do NOT route here -- they have their own seat
+  /// (`authRefusalSeat`) because they disprove nothing.
   action answeredRefusalSeat(resolvesEntry: bool): bool = all {
     clientHoldsResume' = and { clientHoldsResume, not(resolvesEntry) },
     responseLost' = and { responseLost, not(resolvesEntry) },
     refusalFiledAsLost' = or { refusalFiledAsLost, and { clientHoldsResume, not(resolvesEntry) } },
+    attempt' = attempt,
+    viewClaimed' = viewClaimed,
+    ghostClaim' = ghostClaim,
+    driverLost' = driverLost,
+    ackedUnsettled' = ackedUnsettled,
+    chargedNoFault' = chargedNoFault,
+    credentialClobbered' = credentialClobbered,
+    confirmMinted' = confirmMinted,
+  }
+
+  /// Auth-refusal seat (merged_bug_074): the scheduler's CREDENTIAL
+  /// layer rejected the resume presentation (PermissionDenied /
+  /// Unauthenticated -- the rotation-skew trace, emitted without
+  /// consulting attempt state). The rejection judges the
+  /// PRESENTATION, not the mint the ORIGINAL unanswered pull may
+  /// have committed: the live client KEEPS the entry (Unanswered
+  /// disposition; `resolvesEntry = false`). `responseLost` is
+  /// deliberately UNTOUCHED either way -- destroying the credential
+  /// while the response stays lost is exactly what routes the
+  /// attempt into the charged establishment window
+  /// (`sweepEstablish`'s charged arm latches `chargedNoFault`), so
+  /// the rotation-skew twin that flips this decision falsifies
+  /// noFaultNeverCharged through the EXISTING machinery -- no new
+  /// latch needed.
+  action authRefusalSeat(resolvesEntry: bool): bool = all {
+    clientHoldsResume' = and { clientHoldsResume, not(resolvesEntry) },
+    responseLost' = responseLost,
+    refusalFiledAsLost' = refusalFiledAsLost,
     attempt' = attempt,
     viewClaimed' = viewClaimed,
     ghostClaim' = ghostClaim,
@@ -502,11 +542,26 @@ module openAttempts {
     cancelDurable' = cancelDurable,
   }
 
-  /// LIVE (bug_119): an answered permanent refusal resolves the
-  /// credential -- the entry leaves on the authoritative answer.
+  /// LIVE (bug_119, mint-disproving scope per merged_bug_074): a
+  /// refusal that disproves a mint resolves the credential -- the
+  /// entry leaves on the authoritative answer.
   action claimRefusedAnswered = all {
     clientHoldsResume,
     answeredRefusalSeat(true),
+    node' = node,
+    outbox' = outbox,
+    cancelDurable' = cancelDurable,
+  }
+
+  /// LIVE (merged_bug_074): an auth-layer refusal of the resume
+  /// presentation keeps the credential -- the entry survives
+  /// rotation skew untouched (a deliberate frame: the disposition IS
+  /// "nothing changes"; the rotation-skew twin perturbs the seat
+  /// decision to true and the charge path falsifies
+  /// noFaultNeverCharged).
+  action claimRefusedAuthSkew = all {
+    clientHoldsResume,
+    authRefusalSeat(false),
     node' = node,
     outbox' = outbox,
     cancelDurable' = cancelDurable,
@@ -535,6 +590,7 @@ module openAttempts {
     sweepEstablish,
     freshClaimSkipsLive,
     claimRefusedAnswered,
+    claimRefusedAuthSkew,
     confirmProbeReads,
   }
 
@@ -574,8 +630,10 @@ module openAttempts {
   // mint for the same job -- the ledger is the mint authority.
   val noCredentialClobber = not(credentialClobbered)
 
-  // bug_119: an answered permanent refusal is never filed as a lost
-  // response (no immortal ledger entries).
+  // bug_119 (mint-disproving scope, merged_bug_074): a refusal that
+  // DISPROVES a mint is never filed as a lost response (no immortal
+  // ledger entries). Auth-layer refusals are out of scope by design
+  // -- they keep the credential (see claimRefusedAuthSkew).
   val noRefusalFiledAsLost = not(refusalFiledAsLost)
 
   // merged_bug_083: a confirm-only probe never mints.

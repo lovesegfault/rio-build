@@ -7554,6 +7554,14 @@ rec {
     # bughunt-3 S5: +3 claim-plane laws (ledger-as-mint-authority,
     # answered-refusal disposition, confirm-only no-mint). Tier-1
     # re-measured: 22 distinct states (was 18), <1s exhaustive.
+    # bughunt-4 S5a (merged_bug_074): noRefusalFiledAsLost re-scoped
+    # to mint-disproving refusals; NEW authRefusalSeat +
+    # claimRefusedAuthSkew (a deliberate live frame -- the auth
+    # refusal keeps the credential untouched; the rotation-skew twin
+    # perturbs the seat and falsifies noFaultNeverCharged through the
+    # existing sweepEstablish charge path). Tier-1 re-measured: 22
+    # distinct states unchanged (the live skew action is a stutter),
+    # <1s exhaustive TLC.
     quint-open-attempts = mkQuintCheck {
       name = "open-attempts";
       spec = "openAttempts";
@@ -7568,6 +7576,26 @@ rec {
         "noRefusalFiledAsLost"
         "confirmNeverMints"
       ];
+    };
+
+    # bughunt-4 S5a (merged_bug_072): the ledger-derived mint-budget
+    # law -- a SEPARATE module in openAttempts.qnt (the claim plane's
+    # regimes stay byte-identical; the budget plane is two bounded
+    # counters). outstanding = surviving ledger population; the
+    # overmint twin gates on the pre-fix per-pass counter instead.
+    # The budget module lives in its OWN file (one module per file --
+    # the multi-module second-main shape proved fragile under
+    # concurrent apalache servers). BOTH counters saturate at
+    # POP_CAP: the first wiring left passMints unbounded and TLC ran
+    # to 23M+ distinct states without a verdict (the mint->resolve
+    # cycle re-enables the increment forever) -- the wedgeCluster
+    # ghost-bounding lesson applied to our own plane. Measured 971ms
+    # exhaustive TLC after saturation; budget 120s.
+    quint-open-attempts-budget = mkQuintCheck {
+      name = "open-attempts-budget";
+      spec = "openAttemptsBudget";
+      modelTimeoutSec = 120;
+      invariants = [ "outstandingBounded" ];
     };
 
     # Expect-violation calibrations: each freezes one as-shipped design
@@ -7755,6 +7783,30 @@ rec {
       step = "calibStep";
       modelTimeoutSec = 120;
       witness = "confirmNeverMints";
+    };
+    # bughunt-4 S5a twins (the merged_bug_072/074 client-loop
+    # repairs): decision-only perturbations through the new seats;
+    # P3 baselines pair with the live exhaustive checks above.
+    # Measured (TLC): rotation-skew [violation] 864ms / baseline [ok]
+    # 851ms; overmint [violation] 790ms / baseline [ok] 803ms;
+    # budget 120s.
+    quint-openattempts-calib-rotation-skew = mkQuintWitnessCheck {
+      name = "openattempts-calib-rotation-skew";
+      spec = "calibration/openattempts-rotation-skew";
+      extraSpecs = [ "openAttempts" ];
+      main = "openAttemptsRotationSkew";
+      step = "calibStep";
+      modelTimeoutSec = 120;
+      witness = "noFaultNeverCharged";
+    };
+    quint-openattempts-calib-overmint = mkQuintWitnessCheck {
+      name = "openattempts-calib-overmint";
+      spec = "calibration/openattempts-overmint";
+      extraSpecs = [ "openAttemptsBudget" ];
+      main = "openAttemptsOvermint";
+      step = "calibStep";
+      modelTimeoutSec = 120;
+      witness = "outstandingBounded";
     };
   };
 
