@@ -2725,7 +2725,7 @@ mod tests {
             executor: None,
             ..sd(at)
         };
-        let mut history: Vec<LedgerRow<&str>> = (0..11).map(|i| sd(i)).collect();
+        let mut history: Vec<LedgerRow<&str>> = (0..11).map(sd).collect();
         history.push(cascade(100));
         history.push(sd(10_000));
 
