@@ -136,7 +136,7 @@ impl WedgePopulations {
     /// The only constructor: derive both populations from the SAME
     /// window state.
     fn from_window(
-        evidence: &HashMap<String, HashMap<String, f64>>,
+        evidence: &HashMap<String, HashMap<String, Evidence>>,
         fleet: &HashSet<String>,
         now_secs: f64,
     ) -> Self {
@@ -145,7 +145,7 @@ impl WedgePopulations {
             .filter(|(_, per_node)| {
                 per_node
                     .values()
-                    .filter(|t| now_secs - **t <= WEDGE_CLUSTER_WINDOW_SECS)
+                    .filter(|e| now_secs - e.anchor <= WEDGE_CLUSTER_WINDOW_SECS)
                     .count()
                     >= WEDGE_CLUSTER_MIN_DISTINCT_DRVS
             })
@@ -161,6 +161,30 @@ impl WedgePopulations {
     }
 }
 
+/// One (node, derivation) evidence entry.
+#[derive(Clone, Copy, Debug)]
+struct Evidence {
+    /// Controller-frame first-observation instant — the window anchor.
+    anchor: f64,
+    /// The attempt's expiry instant in the ledger (PG) clock frame:
+    /// `assigned_at + deadline + grace`, exact and identical every
+    /// tick (merged_bug_018). Skew fallback (`assigned_at_epoch_secs
+    /// == 0`, an older scheduler): the controller-frame reconstruction
+    /// `now - over`, jitter-bounded to the rolling-skew window.
+    expiry_pg: u64,
+}
+
+/// The suppression watermark (merged_bug_163), single-frame
+/// (merged_bug_018): admission compares ledger-frame expiries against
+/// the maximum ledger-frame expiry the drained episode contained.
+/// `set_at` is controller-frame, used only for the TTL cadence —
+/// never compared against an expiry.
+#[derive(Clone, Copy, Debug)]
+struct Suppression {
+    set_at: f64,
+    max_expiry_pg: u64,
+}
+
 /// Per-node deadline-expiry evidence with window pruning. One instance
 /// lives on the NodeClaim-pool reconciler; `update` is called once per
 /// tick with that tick's open-attempt view (or `None` when the view
@@ -168,24 +192,30 @@ impl WedgePopulations {
 /// last call.
 #[derive(Default)]
 pub(super) struct WedgeTracker {
-    /// node → (derivation/intent id → epoch-secs the expiry was FIRST
-    /// observed — the window anchor). Entries age out of the window
-    /// even while the attempt stays open (re-anchoring fresh on the
-    /// next observation), so two expiries genuinely far apart never
-    /// cluster.
-    evidence: HashMap<String, HashMap<String, f64>>,
+    /// node → (derivation/intent id → evidence entry). The window
+    /// `anchor` is the controller-frame instant the expiry was FIRST
+    /// observed (clustering is about OUR observation cadence); entries
+    /// age out of the window even while the attempt stays open
+    /// (re-anchoring fresh on the next observation), so two expiries
+    /// genuinely far apart never cluster. `expiry_pg` is the attempt's
+    /// expiry instant in the LEDGER clock frame (merged_bug_018) —
+    /// the identity every admission gate compares against.
+    evidence: HashMap<String, HashMap<String, Evidence>>,
     /// Nodes currently past the cluster threshold — tracked so the
     /// `rio_controller_node_wedge_marked_total` counter increments once
     /// per not-wedged → wedged transition, not once per tick.
     marked: HashSet<String>,
     /// merged_bug_163: the episode latch. Set on every Systemic
     /// verdict; `observe` admits an expired attempt as evidence ONLY
-    /// when its expiry instant is strictly newer — the episode's
-    /// still-open attempts re-present every tick, and without the
-    /// gate they re-anchor fresh the tick after the drain (the
-    /// trailing-edge reap) while sub-threshold participants' anchors
-    /// pair with any later blip.
-    last_suppression_secs: Option<f64>,
+    /// when its expiry instant is strictly newer than every expiry the
+    /// drained episode contained — the episode's still-open attempts
+    /// re-present every tick, and without the gate they re-anchor
+    /// fresh the tick after the drain (the trailing-edge reap) while
+    /// sub-threshold participants' anchors pair with any later blip.
+    /// merged_bug_018: the comparison is PG-frame on BOTH sides
+    /// (`max_expiry_pg` vs the row's `expiry_pg`), never a
+    /// reconstructed controller-frame instant.
+    last_suppression: Option<Suppression>,
     /// merged_bug_017: eviction tombstones — node → controller-frame
     /// instant it was evicted (reaped by the controller, or absent
     /// from the registered NodeClaim fleet). Eviction is an ADMISSION
@@ -213,8 +243,8 @@ pub(super) struct WedgeTracker {
 /// called that unrepresentable.)
 mod seal {
     use super::{
-        WEDGE_CLUSTER_MIN_DISTINCT_DRVS, WEDGE_SYSTEMIC_FRACTION, WedgePopulations, WedgeTracker,
-        WedgeVerdict,
+        Suppression, WEDGE_CLUSTER_MIN_DISTINCT_DRVS, WEDGE_SYSTEMIC_FRACTION, WedgePopulations,
+        WedgeTracker, WedgeVerdict,
     };
 
     /// Proof-of-origin token for [`WedgeVerdict`]: constructible only
@@ -265,8 +295,22 @@ mod seal {
                  (see the hung-node runbook's systemic discrimination)"
             );
             // merged_bug_163: drain the whole episode and latch it.
+            // merged_bug_018: the watermark is the episode's maximum
+            // LEDGER-frame expiry — the admission gate compares
+            // like-framed instants, so one physical expiry cannot
+            // flip across ticks with the reconstruction jitter.
+            let max_expiry_pg = t
+                .evidence
+                .values()
+                .flat_map(|per| per.values())
+                .map(|e| e.expiry_pg)
+                .max()
+                .unwrap_or(0);
             t.evidence.clear();
-            t.last_suppression_secs = Some(now_secs);
+            t.last_suppression = Some(Suppression {
+                set_at: now_secs,
+                max_expiry_pg,
+            });
             Vec::new()
         } else {
             for node in &wedged {
@@ -400,22 +444,35 @@ impl WedgeTracker {
                 continue;
             }
             // merged_bug_163: evidence admission must beat the
-            // suppression watermark. The attempt's expiry instant is
-            // recoverable from its age: it crossed deadline+grace
-            // `over` seconds ago. An expiry at or before the last
-            // Systemic verdict belongs to the suppressed episode —
-            // the same still-open attempts must not re-anchor at the
-            // trailing edge, and a sub-threshold participant's
-            // episode expiry must not pair with a later blip. A
-            // genuinely NEW expiry (after the watermark) admits
-            // normally.
-            let over = a
-                .assigned_at_age_secs
-                .saturating_sub(a.deadline_secs.saturating_add(WEDGE_DEADLINE_GRACE_SECS));
-            let expiry_epoch = now_secs - over as f64;
+            // suppression watermark — an expiry at or before the
+            // drained episode's newest expiry belongs to that episode
+            // (the same still-open attempts must not re-anchor at the
+            // trailing edge, and a sub-threshold participant's episode
+            // expiry must not pair with a later blip); a genuinely NEW
+            // expiry admits normally.
+            // merged_bug_018: the expiry identity is single-frame —
+            // `assigned_at + deadline + grace`, all PG-clock — so one
+            // physical expiry compares identically every tick. The
+            // retired reconstruction (`now − over`) mixed the PG-clock
+            // age (mid-tick RPC, u64-floored) with the controller's
+            // tick-START instant: ±(preamble + flooring) of jitter,
+            // flipping admission at the watermark boundary. Skew
+            // fallback (older scheduler, epoch field absent → 0): the
+            // reconstruction, jitter-bounded to the rollout window
+            // (scheduler deploys first, the attempt_kind posture).
+            let expiry_pg = if a.assigned_at_epoch_secs > 0 {
+                a.assigned_at_epoch_secs
+                    .saturating_add(a.deadline_secs)
+                    .saturating_add(WEDGE_DEADLINE_GRACE_SECS)
+            } else {
+                let over = a
+                    .assigned_at_age_secs
+                    .saturating_sub(a.deadline_secs.saturating_add(WEDGE_DEADLINE_GRACE_SECS));
+                (now_secs - over as f64).max(0.0) as u64
+            };
             if self
-                .last_suppression_secs
-                .is_some_and(|w| expiry_epoch <= w)
+                .last_suppression
+                .is_some_and(|w| expiry_pg <= w.max_expiry_pg)
             {
                 continue;
             }
@@ -429,7 +486,10 @@ impl WedgeTracker {
                 // re-anchors fresh on the next observation — a
                 // derivation stuck for a full window AND a second
                 // expiry is the runbook's genuine signature.)
-                .or_insert(now_secs);
+                .or_insert(Evidence {
+                    anchor: now_secs,
+                    expiry_pg,
+                });
         }
         fleet
     }
@@ -440,7 +500,7 @@ impl WedgeTracker {
     /// episode it suppresses).
     fn prune(&mut self, now_secs: f64) {
         for per_node in self.evidence.values_mut() {
-            per_node.retain(|_, t| now_secs - *t <= WEDGE_CLUSTER_WINDOW_SECS);
+            per_node.retain(|_, e| now_secs - e.anchor <= WEDGE_CLUSTER_WINDOW_SECS);
         }
         self.evidence.retain(|_, per_node| !per_node.is_empty());
         self.evicted
@@ -476,6 +536,11 @@ mod tests {
             source_node: node.into(),
             generation: 1,
             assigned_at_age_secs: 100 + WEDGE_DEADLINE_GRACE_SECS + over_secs,
+            // Skew-fallback fixtures (epoch 0): the unit tests below
+            // pin the reconstruction path; the PG-frame path is pinned
+            // by `pg_frame_admission_is_jitter_stable` and the jitter
+            // proptest.
+            assigned_at_epoch_secs: 0,
             deadline_secs: 100,
             // The wedge consumes BUILD evidence only (C2/222);
             // UNSPECIFIED (skew) and MATERIALIZATION are skipped.
@@ -577,6 +642,72 @@ mod tests {
                 10_000.0 + (tick as f64) * 10.0,
             ));
             assert!(wedged.is_empty(), "tick {tick}: {wedged:?}");
+        }
+    }
+
+    /// merged_bug_018: one physical expiry must compare identically
+    /// against the suppression watermark every tick. The retired law
+    /// reconstructed the expiry as `now − over` (PG-clock age vs the
+    /// controller's tick-START clock): ±(RPC preamble + flooring) of
+    /// jitter, so a row expiring within jitter of the watermark
+    /// FLIPPED to "newer than the suppression" on a later tick and
+    /// re-anchored — the trailing-edge reap the watermark exists to
+    /// prevent. PG-frame admission (`assigned_at + deadline + grace`
+    /// vs the episode's max PG-frame expiry) is jitter-free.
+    // r[verify ctrl.nodeclaim.wedge-two-axis+3]
+    #[test]
+    fn pg_frame_admission_is_jitter_stable() {
+        fn row(intent: &str, node: &str, assigned_pg: u64, age: u64) -> OpenAttempt {
+            OpenAttempt {
+                assigned_at_epoch_secs: assigned_pg,
+                assigned_at_age_secs: age,
+                ..expired(intent, node, 0)
+            }
+        }
+        let mut t = WedgeTracker::default();
+        // Four rows, two nodes, all assigned at PG 9_869 with a 100s
+        // deadline → every expiry_pg = 9_869 + 100 + 30 = 9_999, one
+        // second before the systemic verdict at now = 10_000
+        // (true age there: 131 → over = 1).
+        let storm: Vec<OpenAttempt> = [
+            ("a1", "node-1"),
+            ("a2", "node-1"),
+            ("b1", "node-2"),
+            ("b2", "node-2"),
+        ]
+        .iter()
+        .map(|(i, n)| row(i, n, 9_869, 131))
+        .collect();
+        assert!(matches!(
+            t.update(
+                Some(&storm),
+                &no_reaps(),
+                &fleet(&["node-1", "node-2"]),
+                10_000.0
+            ),
+            WedgeVerdict::Systemic { .. }
+        ));
+        // Trailing tick at 10_005: the SAME still-open rows re-present.
+        // True age is 136, but the ledger computed it 2 s earlier in
+        // the RPC (age 134) while the controller stamps tick-start
+        // time — the retired reconstruction yields 10_005 − 3 =
+        // 10_002 > 10_000 and ADMITS the suppressed episode's rows.
+        let laggard: Vec<OpenAttempt> = [("a1", "node-1"), ("a2", "node-1")]
+            .iter()
+            .map(|(i, n)| row(i, n, 9_869, 134))
+            .collect();
+        let v = t.update(
+            Some(&laggard),
+            &no_reaps(),
+            &fleet(&["node-1", "node-2"]),
+            10_005.0,
+        );
+        match v {
+            WedgeVerdict::NodeWedged(nodes, _) => assert!(
+                nodes.is_empty(),
+                "one physical expiry flipped admission under reconstruction jitter: {nodes:?}"
+            ),
+            other => panic!("unexpected verdict {other:?}"),
         }
     }
 
@@ -965,6 +1096,55 @@ mod proptests {
     }
 
     proptest! {
+        /// merged_bug_018 ground-truth law: a row whose PG-frame
+        /// expiry is at or before the suppression watermark is NEVER
+        /// admitted, for any per-tick age jitter and any observation
+        /// instant — including window-crossing trailing ticks. (The
+        /// retired reconstruction admitted it whenever the jittered
+        /// `now − over` landed past the controller-frame watermark.)
+        #[test]
+        fn suppressed_pg_expiries_never_readmit_under_jitter(
+            jitters in proptest::collection::vec(0u64..=3, 1..=4),
+            gap in 1u64..=1900,
+        ) {
+            let assigned_pg = 9_869u64;
+            let deadline = 100u64;
+            let expiry_pg = assigned_pg + deadline + WEDGE_DEADLINE_GRACE_SECS;
+            let mk = |intent: &str, node: &str, age: u64| OpenAttempt {
+                intent_id: intent.to_owned(),
+                source_node: node.to_owned(),
+                attempt_kind: rio_proto::types::AttemptKind::Build as i32,
+                deadline_secs: deadline,
+                assigned_at_epoch_secs: assigned_pg,
+                assigned_at_age_secs: age,
+                ..Default::default()
+            };
+            let registered: HashSet<String> = ["n1", "n2"].iter().map(|s| s.to_string()).collect();
+            let mut t = WedgeTracker::default();
+            let t0 = (expiry_pg + 1) as f64;
+            let storm: Vec<OpenAttempt> = [("a1", "n1"), ("a2", "n1"), ("b1", "n2"), ("b2", "n2")]
+                .iter().map(|(i, n)| mk(i, n, (t0 as u64) - assigned_pg)).collect();
+            match t.update(Some(&storm), &std::collections::BTreeSet::new(), &registered, t0) {
+                WedgeVerdict::Systemic { .. } => {}
+                v => return Err(TestCaseError::fail(format!("expected systemic, got {v:?}"))),
+            }
+            // Trailing ticks: same physical rows, jittered ages, at
+            // arbitrary later instants (including past the window).
+            for (k, j) in jitters.iter().enumerate() {
+                let now = t0 + (gap as f64) * ((k + 1) as f64);
+                let true_age = (now as u64) - assigned_pg;
+                let rows: Vec<OpenAttempt> = [("a1", "n1"), ("a2", "n1")]
+                    .iter().map(|(i, n)| mk(i, n, true_age.saturating_sub(*j))).collect();
+                match t.update(Some(&rows), &std::collections::BTreeSet::new(), &registered, now) {
+                    WedgeVerdict::NodeWedged(nodes, _) => prop_assert!(
+                        nodes.is_empty(),
+                        "suppressed expiry re-admitted at tick {} (jitter {}): {:?}", k, j, nodes
+                    ),
+                    WedgeVerdict::Systemic { .. } | WedgeVerdict::Unobserved(_) => {}
+                }
+            }
+        }
+
         /// Trajectory law: over 2-5 ticks of arbitrary views, RPC
         /// failures and reaps, the tracker's verdicts match the
         /// set-algebra oracle tick for tick — populations

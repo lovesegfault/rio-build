@@ -269,6 +269,18 @@ message OpenAttempt {
   // as-built all-build fleet; the scheduler deploys before the
   // controller.
   rio.types.AttemptKind attempt_kind = 9;
+  // assignments.assigned_at as PG-clock epoch seconds (merged_bug_018):
+  // lets the wedge consumer compute the attempt's expiry instant
+  // (assigned_at + deadline + grace) entirely in the ledger's clock
+  // frame instead of reconstructing it from `assigned_at_age_secs`
+  // against the controller's tick-start clock — the reconstruction
+  // moved ±(RPC preamble + flooring) every tick, so one physical
+  // expiry flipped admission at the suppression-watermark boundary.
+  // 0 = unknown (an older scheduler): consumers fall back to the
+  // age reconstruction for at most the rolling-skew window (the
+  // scheduler deploys before the controller, same posture as
+  // attempt_kind).
+  uint64 assigned_at_epoch_secs = 10;
 }
 
 message ListOpenAttemptsResponse {

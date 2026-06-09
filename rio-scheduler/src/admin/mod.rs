@@ -1308,6 +1308,10 @@ pub(crate) fn open_attempt_row_to_proto(
         source_node: r.source_node.unwrap_or_default(),
         generation: r.generation.max(0) as u64,
         assigned_at_age_secs: r.age_secs.max(0.0) as u64,
+        // merged_bug_018: the same row instant, PG frame — the wedge
+        // consumer's single-frame admission basis (0 never occurs for
+        // a real row; the wire 0 means "older scheduler").
+        assigned_at_epoch_secs: r.assigned_at_epoch_secs.max(0.0) as u64,
         // The dispatched deadline persisted by the pull mint (074_execution_deadline).
         // 0 = unknown (pre-072 rows and NULLs) — the OA2 wedge
         // consumer skips 0. Enriched in the same change set as the

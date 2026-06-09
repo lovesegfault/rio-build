@@ -278,6 +278,7 @@ uint32 total_count = 2;
 uint32 total_derivations = 5;
 uint32 total_executors = 1;
 uint64 assigned_at_age_secs = 7;
+uint64 assigned_at_epoch_secs = 10;
 uint64 backoff_remaining_secs = 9;
 uint64 closed_age_secs = 4;
 uint64 deadline_secs = 8;
