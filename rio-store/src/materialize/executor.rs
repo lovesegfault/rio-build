@@ -23,7 +23,7 @@ use rio_evidence_kernel::outcome::{
 use rio_proto::types::{MaterializationOutcome, materialization_outcome};
 
 use crate::substitute::Substituter;
-use crate::visibility::{TenantVisible, TrustedSetCache, visible_to_tenant};
+use crate::visibility::{SharedTrustCache, TenantVisible, visible_to_tenant};
 
 use super::client::ClaimedJob;
 
@@ -312,12 +312,15 @@ async fn execute_job_inner(
     // ── 1–4. Walk loop with final-verification re-read ───────────────
     // bug_115: the per-job trusted-set memo for the local-visibility
     // probe (two PG queries per tenant, amortized across the walk).
-    // live_047/R-C: interior-mutable (tokio::Mutex) so concurrent path
-    // futures share the per-job memo — locks are held per visibility
-    // call (short PG reads; hits are map lookups); visibility.rs keeps
-    // its `&mut TrustedSetCache` signature untouched (the recorded
-    // divergence from the §2.2 prefill-and-share hypothesis).
-    let trust_cache = tokio::sync::Mutex::new(TrustedSetCache::default());
+    // bug_073: shared PER-OPERATION — `SharedTrustCache` locks
+    // internally around pure map ops (the guard never escapes and
+    // never spans an await; a cross-await hold is a COMPILE error —
+    // path futures are `Send` by the window's BoxFuture bound and the
+    // internal guard is `!Send`), with per-tenant single-flight loads
+    // so concurrent missing siblings coalesce on one load. The probe
+    // and the substitute-hit re-check share this one handle under one
+    // lock discipline; F sibling probes overlap freely.
+    let trust_cache = SharedTrustCache::default();
     let mut visited: HashSet<String> = HashSet::new();
     let mut ingested: Vec<String> = Vec::new();
     let mut verified: Vec<String> = Vec::new();
@@ -1146,7 +1149,7 @@ async fn resolve_path(
     ctx: &ExecutorContext,
     claimed: &ClaimedJob,
     tenants: &[Uuid],
-    trust_cache: &tokio::sync::Mutex<TrustedSetCache>,
+    trust_cache: &SharedTrustCache,
     path: String,
     cell: PathCell,
     progress_base: u64,
@@ -1160,10 +1163,9 @@ async fn resolve_path(
     // bug_042: the local-presence probe is a VERDICT input, so its
     // error is charging evidence (a PG blip is never absence).
     // bug_115/bug_139: Present requires the visibility witness.
-    let probed = {
-        let mut cache = trust_cache.lock().await;
-        probe_local(ctx, &path, tenants, &mut cache).await
-    };
+    // bug_073: no job-wide guard — sibling probes run concurrently;
+    // the cache locks internally per operation.
+    let probed = probe_local(ctx, &path, tenants, trust_cache).await;
     let local_witness = match probed {
         Ok(LocalPresence::Present(visible, info)) => {
             // r[impl sched.materialize.pinning]
@@ -1272,9 +1274,8 @@ async fn resolve_path(
             {
                 let signer = ctx.substituter.tenant_signer();
                 for &other in tenants.iter().filter(|t| **t != serving_tenant) {
-                    let mut cache = trust_cache.lock().await;
                     if let Ok(Some(v)) =
-                        visible_to_tenant(&ctx.pool, signer, Some(other), &local, &mut cache).await
+                        visible_to_tenant(&ctx.pool, signer, Some(other), &local, trust_cache).await
                     {
                         for t in v.tenants() {
                             if !vt.contains(t) {
@@ -1488,7 +1489,7 @@ async fn probe_local(
     ctx: &ExecutorContext,
     store_path: &str,
     tenants: &[Uuid],
-    trust_cache: &mut TrustedSetCache,
+    trust_cache: &SharedTrustCache,
 ) -> Result<LocalPresence, crate::metadata::MetadataError> {
     // Test-only rendezvous seam (see `ExecutorContext::probe_rendezvous`):
     // sized at F by the probe-concurrency red — completes only when F
@@ -4616,6 +4617,88 @@ mod tests {
             pin_count(&db.pool, "vis-trusted-drv", "materialization").await,
             1,
             "locally-served path is pinned at ingest"
+        );
+    }
+
+    // r[verify store.materialize.local-visibility]
+    /// R1-073 (bug_073, TRUE RED pre-fix): F probes of one job EXECUTE
+    /// CONCURRENTLY — W-073b, the strongest behavioral form of "the
+    /// probe phase parallelizes", independent of wall-clock. Four
+    /// locally-present substitution-only paths (trusted sig — the
+    /// cache-consulting arm), F = 4, probe rendezvous barrier sized 4:
+    /// the walk completes only if all four probes overlap in time.
+    ///
+    /// Pre-fix red: rendezvous never completes — siblings are excluded
+    /// by the job-wide trust-cache mutex while the first prober parks
+    /// inside it (probe phase serialized to width 1; the watchdog
+    /// fires). Post-fix: all four probes rendezvous; the walk
+    /// completes with all paths Served. (Watchdog 10 s — slack over
+    /// the book's 5 s for builder variance; the gate is structural:
+    /// pre-fix the rendezvous NEVER completes, so widening cannot
+    /// mask the red.)
+    #[tokio::test]
+    async fn probe_phase_admits_concurrent_paths() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "probe-conc").await;
+        let signer_k = Signer::from_seed("key-K", &[0x7Cu8; 32]);
+        // Upstream serves nothing but carries K in trusted_keys: the
+        // local rows are substitution-only and VISIBLE via the sig
+        // cell (the trusted-set-cache-consulting probe arm).
+        let upstream = spawn_status_upstream(axum::http::StatusCode::NOT_FOUND).await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tenant,
+            &upstream.url,
+            50,
+            &[signer_k.trusted_key_entry()],
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        let paths: Vec<String> = (0..4).map(|i| store_path(60 + i, "probe-conc")).collect();
+        for path in &paths {
+            let (nar, nar_hash) = rio_test_support::fixtures::make_nar(path.as_bytes());
+            let fp = fingerprint(path, &nar_hash, nar.len() as u64, &[]);
+            seed_local_manifest(&db.pool, path, vec![signer_k.sign(&fp)]).await;
+        }
+        let outputs: Vec<(String, &str)> = paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (format!("o{i}"), p.as_str()))
+            .collect();
+        let outputs_ref: Vec<(&str, &str)> =
+            outputs.iter().map(|(n, p)| (n.as_str(), *p)).collect();
+        let seeded = seed_job(
+            &db.pool,
+            "probe-conc-drv",
+            &outputs_ref,
+            Some(tenant),
+            Some(tenant),
+            &[],
+        )
+        .await;
+
+        let mut ctx = make_ctx(db.pool.clone()); // F = 4
+        ctx.probe_rendezvous = Some(std::sync::Arc::new(tokio::sync::Barrier::new(4)));
+        let job = tokio::spawn({
+            let claimed = seeded.claimed.clone();
+            async move { execute_job(&ctx, &claimed).await.into_outcome() }
+        });
+        let outcome = tokio::time::timeout(Duration::from_secs(10), job)
+            .await
+            .expect(
+                "rendezvous never completes — siblings excluded by the job-wide \
+                 trust-cache mutex while the first prober parks inside it \
+                 (probe phase serialized to width 1)",
+            )
+            .unwrap();
+        let success = outcome_success(&outcome)
+            .unwrap_or_else(|| panic!("expected Success via the local rows, got {outcome:?}"));
+        assert_eq!(
+            success.verified_paths.len(),
+            4,
+            "all four probes rendezvoused and every path was served locally"
         );
     }
 

@@ -145,19 +145,44 @@ impl TenantVisible {
     }
 }
 
-/// Per-job memo of `tenant → trusted-key entries` (bug_115: the
-/// trusted set costs two PG queries; a closure walk consults it for
-/// every locally-present path × interested tenant, so it is cached for
-/// the job's lifetime — key material changes do not need to land
-/// mid-walk).
+/// Shared per-job memo of `tenant → trusted-key entries` (bug_115
+/// economy: the trusted set costs two PG queries; a closure walk
+/// consults it for every locally-present path × interested tenant, so
+/// it is cached for the job's lifetime — key material changes do not
+/// land mid-walk).
+///
+/// bug_073 — the guard-scope law is a property of this TYPE, not of
+/// call-site discipline: the internal `std::sync::Mutex` wraps only
+/// pure map lookup/insert, is taken and released inside each method,
+/// and never escapes — so no caller can hold it across a foreign
+/// await. A reintroduced cross-await hold inside this module is a
+/// COMPILE ERROR in the walk: path futures are `Send` by the window's
+/// `BoxFuture` bound and `std::sync::MutexGuard` is `!Send`. Per-
+/// tenant loads single-flight through a `tokio::sync::OnceCell`
+/// (initialized OUTSIDE the map lock): F concurrent siblings missing
+/// the same tenant COALESCE on one load — exactly one trusted-set
+/// load per (job, tenant), and two paths of one job can never observe
+/// different trust sets across a mid-walk key rotation. A failed load
+/// leaves the cell empty (a PG blip never poisons the job's memo).
 #[derive(Default)]
-pub(crate) struct TrustedSetCache {
-    by_tenant: HashMap<Uuid, Arc<Vec<String>>>,
+pub(crate) struct SharedTrustCache {
+    by_tenant: std::sync::Mutex<HashMap<Uuid, TrustCell>>,
+    /// Test-only loader-invocation counter (the single-flight economy
+    /// witness: loads ≤ 1 per (job, tenant)).
+    #[cfg(test)]
+    pub(crate) loads: std::sync::atomic::AtomicUsize,
 }
+
+/// One tenant's single-flight trusted-set cell: cloned OUT of the map
+/// lock, initialized (2 PG queries) outside it.
+type TrustCell = Arc<tokio::sync::OnceCell<Arc<Vec<String>>>>;
 
 /// The requesting tenant's signature trust set: upstream
 /// `trusted_keys` ∪ cluster key (current + prior history) ∪ the
-/// tenant's own `tenant_keys` pubkeys. Memoized in `cache`.
+/// tenant's own `tenant_keys` pubkeys. Memoized in `cache`
+/// (per-operation locking + per-tenant single-flight — bug_073; the
+/// 2-query loader runs OUTSIDE the map lock, inside the tenant's
+/// cell).
 ///
 /// The cluster + tenant-own union covers the PutPath→scheduler timing
 /// window: `maybe_sign` signs with the cluster key OR (when
@@ -168,26 +193,39 @@ pub(crate) async fn trusted_set(
     pool: &sqlx::PgPool,
     signer: Option<&TenantSigner>,
     tid: Uuid,
-    cache: &mut TrustedSetCache,
+    cache: &SharedTrustCache,
 ) -> Result<Arc<Vec<String>>, MetadataError> {
-    if let Some(hit) = cache.by_tenant.get(&tid) {
-        return Ok(Arc::clone(hit));
-    }
-    let mut trusted = metadata::upstreams::tenant_trusted_keys(pool, tid).await?;
-    if let Some(ts) = signer {
-        trusted.push(ts.cluster().trusted_key_entry());
-        // r[impl store.key.rotation-cluster-history]
-        // Prior cluster keys: paths signed under a rotated-out key stay
-        // visible after CASCADE drops their path_tenants rows.
-        trusted.extend_from_slice(ts.prior_cluster_entries());
-    }
-    // r[impl store.tenant.sign-key]
-    // The tenant's OWN signing pubkey(s) — see the window note above.
-    let own = metadata::tenant_keys::trusted_key_entries(pool, tid).await?;
-    trusted.extend(own);
-    let entry = Arc::new(trusted);
-    cache.by_tenant.insert(tid, Arc::clone(&entry));
-    Ok(entry)
+    // Map op under the internal guard: lookup-or-insert the tenant's
+    // cell, guard released before ANY await (a hold across the loader
+    // would be `!Send` in the walk's path futures — compile-checked).
+    let cell = {
+        let mut map = cache
+            .by_tenant
+            .lock()
+            .expect("trust-cache map lock is never poisoned (no panics under it)");
+        Arc::clone(map.entry(tid).or_default())
+    };
+    cell.get_or_try_init(|| async {
+        #[cfg(test)]
+        cache
+            .loads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut trusted = metadata::upstreams::tenant_trusted_keys(pool, tid).await?;
+        if let Some(ts) = signer {
+            trusted.push(ts.cluster().trusted_key_entry());
+            // r[impl store.key.rotation-cluster-history]
+            // Prior cluster keys: paths signed under a rotated-out key stay
+            // visible after CASCADE drops their path_tenants rows.
+            trusted.extend_from_slice(ts.prior_cluster_entries());
+        }
+        // r[impl store.tenant.sign-key]
+        // The tenant's OWN signing pubkey(s) — see the window note above.
+        let own = metadata::tenant_keys::trusted_key_entries(pool, tid).await?;
+        trusted.extend(own);
+        Ok(Arc::new(trusted))
+    })
+    .await
+    .map(Arc::clone)
 }
 
 /// May `tenant_id` see `info`? `Ok(Some(_))` = visible (witness
@@ -206,7 +244,7 @@ pub(crate) async fn visible_to_tenant(
     signer: Option<&TenantSigner>,
     tenant_id: Option<Uuid>,
     info: &ValidatedPathInfo,
-    cache: &mut TrustedSetCache,
+    cache: &SharedTrustCache,
 ) -> Result<Option<TenantVisible>, MetadataError> {
     let Some(tid) = tenant_id else {
         // Anonymous → unfiltered (r[store.tenant.narinfo-filter]).
@@ -271,7 +309,7 @@ pub(crate) async fn visible_subset(
     signer: Option<&TenantSigner>,
     tenant_id: Option<Uuid>,
     present: &[String],
-    cache: &mut TrustedSetCache,
+    cache: &SharedTrustCache,
 ) -> Result<HashSet<String>, MetadataError> {
     let Some(tid) = tenant_id else {
         // Anonymous → unfiltered (r[store.tenant.narinfo-filter]).
@@ -352,4 +390,59 @@ pub(crate) async fn visible_subset(
         }
     }
     Ok(visible)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// R2-073 / W-073c — certifies: the memo's economy and consistency
+    /// survive the per-operation granularity change — exactly ONE
+    /// trusted-set load per (job, tenant) under F concurrent misses;
+    /// siblings COALESCE on the in-flight load and observe the same
+    /// set. GREEN-SIDE BY CONSTRUCTION (disclosed rationale, the
+    /// round-6 class): this pins the close's ADDED property, not the
+    /// defect — the single-flight cell does not exist pre-fix (the
+    /// job-wide mutex serialized the second caller into a map hit,
+    /// also count 1), and the defect itself is pinned by the
+    /// probe-rendezvous red in executor.rs
+    /// (`probe_phase_admits_concurrent_paths`).
+    #[tokio::test]
+    async fn trusted_set_loads_once_per_tenant_under_concurrent_misses() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let tenant = crate::test_helpers::seed_tenant(&db.pool, "trust-singleflight").await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tenant,
+            "http://127.0.0.1:1/unreachable-never-contacted",
+            50,
+            &["cache.sf:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()],
+            crate::metadata::upstreams::SigMode::Keep,
+        )
+        .await
+        .expect("upstream row seeded (trusted_set reads the table only)");
+
+        let cache = SharedTrustCache::default();
+        // F = 2 concurrent misses on the SAME tenant: both callers
+        // race to the cell; one runs the loader, the sibling awaits
+        // the in-flight init.
+        let (a, b) = tokio::join!(
+            trusted_set(&db.pool, None, tenant, &cache),
+            trusted_set(&db.pool, None, tenant, &cache),
+        );
+        let (a, b) = (a.expect("load a"), b.expect("load b"));
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "siblings coalesce on ONE memoized entry (same Arc)"
+        );
+        assert!(
+            a.iter().any(|k| k.starts_with("cache.sf:")),
+            "the loaded set carries the seeded upstream key"
+        );
+        assert_eq!(
+            cache.loads.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "exactly one loader run for two concurrent same-tenant misses"
+        );
+    }
 }

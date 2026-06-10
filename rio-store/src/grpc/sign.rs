@@ -120,13 +120,13 @@ impl StoreServiceImpl {
         // materialization walk's local-presence probe consults the
         // SAME gate. This method is the gRPC-side adapter: Status
         // mapping + the PathVisible mint.
-        let mut cache = crate::visibility::TrustedSetCache::default();
+        let cache = crate::visibility::SharedTrustCache::default();
         let visible = crate::visibility::visible_to_tenant(
             &self.pool,
             self.signer.as_deref(),
             tenant_id,
             info,
-            &mut cache,
+            &cache,
         )
         .await
         .map_err(|e| metadata_status("sig_visibility_gate", e))?;
@@ -160,13 +160,13 @@ impl StoreServiceImpl {
         // pre-fix open-coded copy here silently HID malformed rows the
         // single-path read errors on). This method is the gRPC-side
         // adapter: Status mapping + the VisibleSet mint.
-        let mut cache = crate::visibility::TrustedSetCache::default();
+        let cache = crate::visibility::SharedTrustCache::default();
         let set = crate::visibility::visible_subset(
             &self.pool,
             self.signer.as_deref(),
             tenant_id,
             present,
-            &mut cache,
+            &cache,
         )
         .await
         .map_err(|e| metadata_status("sig_visibility_gate_batch", e))?;
