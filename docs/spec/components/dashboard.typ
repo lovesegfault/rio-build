@@ -312,7 +312,7 @@ lower floor there; the dashboard tab has neither bound.
   builds.
 ]
 
-#r("dash.graph.auto-stop+1")[
+#r("dash.graph.auto-stop+2")[
   The Graph tab's 5s `GetBuildGraph` poll MUST downshift to the settled
   cadence (`SETTLED_POLL_MS`, 30s) once every node is in a terminal status
   (per `graphLayout.TERMINAL`, which mirrors `is_terminal()`
@@ -330,7 +330,22 @@ lower floor there; the dashboard tab has neither bound.
   epoch-keyed `inflight` re-entrancy gate
   so a slow fetch + slow worker layout don't overlap and last-write-wins with
   stale statuses --- while a STALE in-flight fetch never swallows the
-  restart's immediate shot after a clear.
+  restart's immediate shot after a clear. Every dispatch MUST carry a
+  per-request deadline (`GRAPH_FETCH_DEADLINE_MS`) that CANCELS the
+  in-flight request --- at the deadline and on drawer teardown ---
+  bounded independent of the polling cadence (`POLL_MS` < deadline <=
+  `SETTLED_POLL_MS`), so one black-holed unary can never freeze the
+  poll or the terminality oracle beyond the envelope. Latch
+  transitions MUST consume a closed evidence classification of the
+  fenced response (settled | live | empty | partial-terminal | failed)
+  as ONE total transition function over the latched x evidence
+  product: the latch is released ONLY on live-work evidence; empty,
+  truncated-terminal, or failed probes on a settled drawer retain the
+  latch, the retained graph, AND the settled cadence (an externally
+  purged build MUST NOT become an absorbing live-cadence storm); a
+  probe failure with retained data degrades --- a non-replacing
+  staleness surface --- while `error` is reserved for the never-loaded
+  state.
 ]
 
 #r("dash.executors.kind-filter")[

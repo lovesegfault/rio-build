@@ -1,4 +1,4 @@
-// r[verify dash.graph.auto-stop+1]
+// r[verify dash.graph.auto-stop+2]
 // The drawer-lifetime poll store (merged_bug_134): one reactive
 // node-status source feeding Graph's rendering AND the log stream's
 // terminality oracle. The poll-loop semantics moved here from
@@ -20,9 +20,13 @@ import {
 vi.mock('../../api/admin', () => ({ admin: adminMock }));
 
 import {
+  classifyResponse,
   createBuildGraphPoll,
+  EVIDENCE_ALL,
   GRAPH_FETCH_DEADLINE_MS,
+  nextTransition,
   SETTLED_POLL_MS,
+  type GraphEvidence,
 } from '../buildGraphPoll.svelte';
 import { POLL_MS } from '../poll';
 
@@ -374,5 +378,226 @@ describe('createBuildGraphPoll', () => {
     await flush();
     expect(getBuildGraph).toHaveBeenCalledTimes(3);
     p.destroy();
+  });
+
+  // ---- latch transitions over the evidence product (merged_bug_081) ----
+  //
+  // fd135a0ab typed the latch arm's guards but shipped the inverse
+  // edge bare (`!settled && allTerminal`): an empty response
+  // un-latched a settled drawer into absorbing 5s polling and wiped
+  // the retained graph; the perpetual settled poll also made any
+  // transient probe failure replace retained data with the error
+  // banner. The edge-set is now derived from the latched x evidence
+  // product - one total transition function, compiler-generated
+  // census.
+
+  it('settled_empty_response_keeps_latch_and_data', async () => {
+    // PROPOSITION: post-settle, absence is not evidence of live work
+    // - a settled drawer receiving an empty response (externally
+    // purged build) RETAINS the latch, the terminal graph, and the
+    // oracle's rows.
+    getBuildGraph
+      .mockResolvedValueOnce(mkResp(['completed']))
+      .mockResolvedValue(mkResp([]));
+
+    const p = createBuildGraphPoll('b-20');
+    await flush();
+    expect(p.allTerminal).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(SETTLED_POLL_MS);
+    await flush();
+    expect(p.allTerminal).toBe(true);
+    expect(p.nodes.length).toBe(1);
+    expect(p.statusOf(`/nix/store/${'a'.repeat(32)}-pkg-0.drv`)).toBe(
+      'completed',
+    );
+    p.destroy();
+  });
+
+  it('settled_cadence_survives_an_empty_probe', async () => {
+    // PROPOSITION: the (latched, empty) cell keeps the SETTLED
+    // cadence - an externally-purged build cannot become an absorbing
+    // 5s polling storm.
+    getBuildGraph
+      .mockResolvedValueOnce(mkResp(['completed']))
+      .mockResolvedValue(mkResp([]));
+
+    const p = createBuildGraphPoll('b-21');
+    await flush();
+    await vi.advanceTimersByTimeAsync(SETTLED_POLL_MS);
+    await flush();
+    const before = getBuildGraph.mock.calls.length;
+    // A live-cadence tick must NOT fire...
+    await vi.advanceTimersByTimeAsync(POLL_MS);
+    await flush();
+    expect(getBuildGraph.mock.calls.length).toBe(before);
+    // ...while the settled cadence still probes.
+    await vi.advanceTimersByTimeAsync(SETTLED_POLL_MS - POLL_MS);
+    await flush();
+    expect(getBuildGraph.mock.calls.length).toBe(before + 1);
+    p.destroy();
+  });
+
+  it('probe_failure_with_retained_data_degrades_instead_of_replacing', async () => {
+    // PROPOSITION: a probe failure on a drawer with retained data
+    // flags `degraded` (a non-replacing staleness surface) - `error`
+    // stays reserved for the never-loaded state, so Graph's
+    // error-first arm cannot replace a rendered terminal graph.
+    getBuildGraph
+      .mockResolvedValueOnce(mkResp(['completed']))
+      .mockRejectedValueOnce(new Error('boom'))
+      .mockResolvedValue(mkResp(['completed']));
+
+    const p = createBuildGraphPoll('b-22');
+    await flush();
+    expect(p.allTerminal).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(SETTLED_POLL_MS);
+    await flush();
+    expect(p.error).toBeNull();
+    expect(p.degraded).toBe('Error: boom');
+    expect(p.nodes.length).toBe(1);
+
+    // A subsequent success clears the staleness note.
+    await vi.advanceTimersByTimeAsync(SETTLED_POLL_MS);
+    await flush();
+    expect(p.degraded).toBeNull();
+    p.destroy();
+  });
+
+  it('latch_transition_is_total_over_the_evidence_product', async () => {
+    // PROPOSITION (R15 census): the latch transition is ONE total
+    // function over the latched x evidence product - every cell's
+    // four effects (latch/cadence/data/errorSurface) hold on the REAL
+    // store, with the cells generated from the alphabet
+    // (EVIDENCE_ALL), never hand-enumerated, and the evidence->fixture
+    // builder pinned against classifyResponse (anti-drift:
+    // classify(fixture(ev)) === ev).
+    const drv0 = `/nix/store/${'a'.repeat(32)}-pkg-0.drv`;
+
+    function fixtureFor(ev: GraphEvidence): {
+      response?: ReturnType<typeof mkResp>;
+      error?: unknown;
+    } {
+      switch (ev) {
+        case 'failed':
+          return { error: new Error('boom') };
+        case 'empty':
+          return { response: mkResp([]) };
+        case 'live':
+          return { response: mkResp(['running', 'completed']) };
+        case 'partial-terminal':
+          return { response: mkResp(['completed'], true) };
+        case 'settled':
+          return { response: mkResp(['completed', 'skipped']) };
+      }
+    }
+
+    // Soft-collect per effect so ONE run reports every divergent
+    // cell of the product, not just the first.
+    const failures: string[] = [];
+    function check(label: string, actual: unknown, expected: unknown): void {
+      if (!Object.is(actual, expected)) {
+        failures.push(`${label}: expected ${String(expected)}, got ${String(actual)}`);
+      }
+    }
+
+    for (const latched of [false, true]) {
+      for (const ev of EVIDENCE_ALL) {
+        const fixture = fixtureFor(ev);
+        // Anti-drift pin: the fixture really IS the evidence class.
+        expect(classifyResponse(fixture), `fixture drift at ${ev}`).toBe(ev);
+
+        const cell = nextTransition(latched, ev);
+        getBuildGraph.mockReset();
+        if (latched) {
+          getBuildGraph.mockResolvedValueOnce(mkResp(['completed']));
+        }
+        if (fixture.response !== undefined) {
+          getBuildGraph.mockResolvedValueOnce(fixture.response);
+        } else {
+          getBuildGraph.mockRejectedValueOnce(fixture.error);
+        }
+        getBuildGraph.mockResolvedValue(mkResp([]));
+
+        const p = createBuildGraphPoll(`b-cell-${latched}-${ev}`);
+        await flush();
+        const priorNodes = latched ? 1 : 0;
+        if (latched) {
+          expect(p.allTerminal).toBe(true);
+          // Deliver the evidence as the settled-cadence probe.
+          await vi.advanceTimersByTimeAsync(SETTLED_POLL_MS);
+          await flush();
+        }
+        const cellName = `(${latched}, ${ev})`;
+
+        // latch effect
+        const expectedLatched =
+          cell.latch === 'latch'
+            ? true
+            : cell.latch === 'unlatch'
+              ? false
+              : latched;
+        check(`latch at ${cellName}`, p.allTerminal, expectedLatched);
+
+        // data effect
+        const expectedNodes =
+          cell.data === 'apply'
+            ? (fixture.response?.nodes.length ?? priorNodes)
+            : priorNodes;
+        check(`data at ${cellName}`, p.nodes.length, expectedNodes);
+        if (cell.data === 'retain' && latched) {
+          check(`retention at ${cellName}`, p.statusOf(drv0), 'completed');
+        }
+
+        // errorSurface effect
+        if (cell.errorSurface === 'flag') {
+          if (expectedNodes === 0) {
+            check(`error flagged at ${cellName}`, p.error !== null, true);
+            check(`degraded null at ${cellName}`, p.degraded, null);
+          } else {
+            check(`degraded flagged at ${cellName}`, p.degraded !== null, true);
+            check(`error null at ${cellName}`, p.error, null);
+          }
+        } else {
+          check(`error at ${cellName}`, p.error, null);
+          check(`degraded at ${cellName}`, p.degraded, null);
+        }
+
+        // cadence effect: resolve 'keep' against the cell's start
+        // cadence, then observe which interval fires next.
+        const calls = getBuildGraph.mock.calls.length;
+        const effectiveCadence =
+          cell.cadence === 'keep'
+            ? latched
+              ? 'settled'
+              : 'live'
+            : cell.cadence;
+        await vi.advanceTimersByTimeAsync(POLL_MS);
+        await flush();
+        if (effectiveCadence === 'live') {
+          check(
+            `live cadence at ${cellName}`,
+            getBuildGraph.mock.calls.length,
+            calls + 1,
+          );
+        } else {
+          check(
+            `settled cadence quiet window at ${cellName}`,
+            getBuildGraph.mock.calls.length,
+            calls,
+          );
+          await vi.advanceTimersByTimeAsync(SETTLED_POLL_MS - POLL_MS);
+          await flush();
+          check(
+            `settled cadence probe at ${cellName}`,
+            getBuildGraph.mock.calls.length,
+            calls + 1,
+          );
+        }
+        p.destroy();
+      }
+    }
+    expect(failures).toEqual([]);
   });
 });

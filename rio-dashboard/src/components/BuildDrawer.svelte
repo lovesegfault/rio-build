@@ -146,6 +146,17 @@
     >
   </div>
 
+  {#if poll?.degraded}
+    <!-- Data-bearing probe failure (merged_bug_081): a one-line
+         staleness note that never REPLACES the retained graph or the
+         tab body. poll.error stays reserved for the never-loaded
+         state (Graph's banner arm). -->
+    <p class="degraded" data-testid="poll-degraded">
+      Live status probe failing ({poll.degraded}) — showing the last
+      loaded graph.
+    </p>
+  {/if}
+
   <div
     class="tab-body"
     role="tabpanel"
@@ -269,6 +280,11 @@
   .tabs button.active {
     border-bottom-color: #2563eb;
     font-weight: 500;
+  }
+  .degraded {
+    margin: 0.5rem 0 0;
+    font-size: 0.8125rem;
+    color: #92400e;
   }
   .tab-body {
     padding: 1rem 0;

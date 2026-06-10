@@ -8,15 +8,15 @@
 // mid-build (the stream re-dialed at the pacer cap with the tab stuck
 // "streaming" for the rest of the build), and a node clicked while
 // poisoned stayed "terminal" after ClearPoison (the stream exited
-// incomplete instead of following the retry, against
-// r[dash.stream.log-tail+6]).
+// incomplete instead of following the retry, against the log-tail
+// rule's retry-follow clause — dash.stream.log-tail).
 //
 // This store owns the poll for the drawer's whole lifetime, so the
 // SAME live data feeds Graph's rendering AND the oracle — the
 // frozen-snapshot configuration is unrepresentable: there is no second
 // status source to capture from.
 //
-// r[impl dash.graph.auto-stop+1]
+// r[impl dash.graph.auto-stop+2]
 // The settle law lives here with the poll (merged_bug_043): once every
 // node settles (and the view is complete — see the guards on the
 // latch), the poll DOWNSHIFTS to the settled cadence
@@ -59,6 +59,158 @@ export const SETTLED_POLL_MS = 30_000;
  * asserted in the test battery. */
 export const GRAPH_FETCH_DEADLINE_MS = 15_000;
 
+/** The closed evidence alphabet a fenced fetch outcome classifies
+ * into (merged_bug_081). Latch transitions consume EXACTLY this
+ * alphabet through `nextTransition` — the un-latch edge structurally
+ * cannot accept an input the latch edge excludes. */
+export type GraphEvidence =
+  | 'settled'
+  | 'live'
+  | 'empty'
+  | 'partial-terminal'
+  | 'failed';
+
+/** Machine-derived census (R15): `satisfies` rejects non-members of
+ * the alphabet; the identity-mapped pin below rejects omissions — a
+ * variant added to `GraphEvidence` without a row fails to compile,
+ * and a row's value must itself be a member of EVIDENCE_ALL. The
+ * compiler, not the author, certifies the census; the product test
+ * iterates these cells. */
+export const EVIDENCE_ALL = [
+  'settled',
+  'live',
+  'empty',
+  'partial-terminal',
+  'failed',
+] as const satisfies readonly GraphEvidence[];
+
+const EVIDENCE_PIN: Record<GraphEvidence, (typeof EVIDENCE_ALL)[number]> = {
+  settled: 'settled',
+  live: 'live',
+  empty: 'empty',
+  'partial-terminal': 'partial-terminal',
+  failed: 'failed',
+};
+void EVIDENCE_PIN;
+
+/** The structural slice of a fetch outcome the classifier reads
+ * (structural, not the branded wire Message type, so production
+ * responses and proto-shaped test fixtures both satisfy it). */
+export type GraphFetchOutcome = {
+  response?: {
+    readonly nodes: readonly RawNode[];
+    readonly truncated: boolean;
+  };
+  error?: unknown;
+};
+
+/** Classify a fenced fetch outcome into the closed evidence alphabet.
+ * Exhaustive decision tree, no wildcard:
+ * - `failed`: no response (transport error or deadline);
+ * - `empty`: zero nodes — a build not yet populated, or an externally
+ *   purged one (no in-tree path deletes builds rows for a merely
+ *   terminal build; manual admin cleanup does);
+ * - `live`: some visible node non-terminal;
+ * - `partial-terminal`: truncated view, all VISIBLE nodes terminal —
+ *   insertion-order truncation settles roots first, so visible
+ *   terminal says nothing about the tail;
+ * - `settled`: complete nonempty view, every node terminal. */
+export function classifyResponse(outcome: GraphFetchOutcome): GraphEvidence {
+  if (outcome.response === undefined) return 'failed';
+  const r = outcome.response;
+  if (r.nodes.length === 0) return 'empty';
+  if (!r.nodes.every((n) => TERMINAL.has(n.status))) return 'live';
+  return r.truncated ? 'partial-terminal' : 'settled';
+}
+
+/** Per-cell effects record (R14): every field mandatory, so a new
+ * evidence variant cannot compile without taking a position on all
+ * four effects. */
+export type CellEffects = {
+  latch: 'latch' | 'unlatch' | 'hold';
+  cadence: 'live' | 'settled' | 'keep';
+  data: 'apply' | 'retain';
+  errorSurface: 'clear' | 'flag';
+};
+
+function assertNever(x: never): never {
+  throw new Error(`unreachable evidence variant: ${String(x)}`);
+}
+
+/** THE latch transition law (merged_bug_081): one total function over
+ * the `latched x evidence` product. fd135a0ab typed the latch arm's
+ * guards but shipped the inverse edge bare (`!settled && allTerminal`)
+ * — an empty response un-latched a settled drawer into absorbing 5s
+ * polling (re-latching needs a NONEMPTY untruncated all-terminal
+ * view, which a purged build never serves again) and wiped the
+ * retained graph the oracle was reading; a truncated all-terminal
+ * probe fell through the same bare edge. Deriving the edge-set from
+ * the product makes a bare sibling edge unrepresentable: every cell
+ * takes a position on all four effects.
+ *
+ * The cells, from the evidence law — before settle, absence is the
+ * state; after settle, absence cannot retro-erase terminal evidence:
+ * - un-latch ONLY on `(latched, live)`: the out-of-band-clear
+ *   discovery, preserved.
+ * - `(latched, empty)`: hold + retain + keep — the absorbing hole
+ *   dies; retention keeps `statusOf` serving the oracle across
+ *   purges.
+ * - `(latched, partial-terminal | settled | failed)`: hold + keep
+ *   (the truncated probe no longer un-latches either — the second
+ *   input the bare edge wrongly accepted).
+ * - `(unlatched, settled)`: latch + settled cadence.
+ * - `(unlatched, empty | partial-terminal | live)`: apply on the live
+ *   cadence — empty pre-population is the truthful loading view (the
+ *   asymmetry against `(latched, empty)` IS the evidence law).
+ *
+ * RESPONSE evidence only: `onCleared`/`destroy` are command edges
+ * (user action / teardown) that bypass classification by design. */
+export function nextTransition(
+  latched: boolean,
+  ev: GraphEvidence,
+): CellEffects {
+  switch (ev) {
+    case 'settled':
+      return latched
+        ? { latch: 'hold', cadence: 'keep', data: 'apply', errorSurface: 'clear' }
+        : {
+            latch: 'latch',
+            cadence: 'settled',
+            data: 'apply',
+            errorSurface: 'clear',
+          };
+    case 'live':
+      return latched
+        ? {
+            latch: 'unlatch',
+            cadence: 'live',
+            data: 'apply',
+            errorSurface: 'clear',
+          }
+        : { latch: 'hold', cadence: 'keep', data: 'apply', errorSurface: 'clear' };
+    case 'empty':
+      return latched
+        ? {
+            latch: 'hold',
+            cadence: 'keep',
+            data: 'retain',
+            errorSurface: 'clear',
+          }
+        : { latch: 'hold', cadence: 'keep', data: 'apply', errorSurface: 'clear' };
+    case 'partial-terminal':
+      return { latch: 'hold', cadence: 'keep', data: 'apply', errorSurface: 'clear' };
+    case 'failed':
+      return {
+        latch: 'hold',
+        cadence: 'keep',
+        data: 'retain',
+        errorSurface: 'flag',
+      };
+    default:
+      return assertNever(ev);
+  }
+}
+
 export type BuildGraphPoll = {
   /** Latest GetBuildGraph node set ($state.raw — wholesale replaced
    * per poll; identity-swap reactivity is all consumers need). */
@@ -69,8 +221,20 @@ export type BuildGraphPoll = {
   readonly totalNodes: number;
   /** True until the first response (success or failure) lands. */
   readonly loading: boolean;
+  /** Never-loaded failure surface: set only while NO graph data is
+   * applied (`nodes` empty). Once data has applied, probe failures
+   * surface as `degraded` instead — Graph's error-first banner arm
+   * therefore truthfully means "nothing ever loaded" and can never
+   * replace a rendered graph. */
   readonly error: string | null;
-  /** Every node settled — the poll interval is stopped. */
+  /** Data-bearing failure (merged_bug_081): the latest probe failed
+   * but a previously applied graph is retained. Rendered as a
+   * non-replacing staleness note (BuildDrawer); cleared by any
+   * non-failed evidence. */
+  readonly degraded: string | null;
+  /** Every node settled — the poll is DOWNSHIFTED to the settled
+   * cadence (never stopped: out-of-band clears must be discovered,
+   * see the latch law). */
   readonly allTerminal: boolean;
   /** The focused node's LIVE status — the terminality oracle input.
    * Reads the reactive node set at call time, so closures over this
@@ -90,6 +254,7 @@ export function createBuildGraphPoll(buildId: string): BuildGraphPoll {
   let totalNodes = $state(0);
   let loading = $state(true);
   let error = $state<string | null>(null);
+  let degraded = $state<string | null>(null);
   let allTerminal = $state(false);
 
   // Dispatch generation (merged_bug_043): captured when a fetch is
@@ -136,10 +301,13 @@ export function createBuildGraphPoll(buildId: string): BuildGraphPoll {
   }
 
   /** THE fenced applier (merged_bug_043): every completion-side state
-   * write — the latch AND nodes/edges/truncated/totalNodes/error —
-   * lands here, and only when the response's dispatch generation is
-   * still current. Cadence shifts ride the latch EDGES, so a steady
-   * settled state re-arms nothing. */
+   * write — the latch AND nodes/edges/truncated/totalNodes/error/
+   * degraded — lands here, and only when the response's dispatch
+   * generation is still current. It holds NO decision logic of its
+   * own (merged_bug_081): the outcome is classified into the closed
+   * evidence alphabet and the cell's four effects are executed —
+   * cadence shifts ride the latch EDGES ('keep' cells re-arm
+   * nothing), so a steady settled state never resets its interval. */
   function settle(
     epoch: number,
     outcome: {
@@ -148,38 +316,46 @@ export function createBuildGraphPoll(buildId: string): BuildGraphPoll {
     },
   ): void {
     if (destroyed || epoch !== pollEpoch) return;
-    if (outcome.response === undefined) {
-      error = String(outcome.error);
-      loading = false;
-      return;
-    }
-    const r = outcome.response;
-    error = null;
-    // Terminal-settle check. `r.nodes.length > 0` guards the trivial
-    // every([])→true — an empty response (build not yet populated)
-    // must NOT settle. `!r.truncated` guards against settling on a
-    // partial view: insertion-order truncation means roots settle
-    // first while the tail may still run.
-    const settled =
-      !r.truncated &&
-      r.nodes.length > 0 &&
-      r.nodes.every((n: RawNode) => TERMINAL.has(n.status));
-    if (settled && !allTerminal) {
-      allTerminal = true;
+    const ev = classifyResponse(outcome);
+    const cell = nextTransition(allTerminal, ev);
+    if (cell.latch === 'latch') {
       // Downshift, don't stop: out-of-band clears are discovered
       // within SETTLED_POLL_MS (no immediate shot — this response
       // IS the settled state).
-      startCadence(SETTLED_POLL_MS, false);
-    } else if (!settled && allTerminal) {
+      allTerminal = true;
+    } else if (cell.latch === 'unlatch') {
       // The settled probe found live work (an out-of-band clear):
       // un-latch and restore the live cadence.
       allTerminal = false;
+    }
+    if (cell.cadence === 'settled') {
+      startCadence(SETTLED_POLL_MS, false);
+    } else if (cell.cadence === 'live') {
       startCadence(POLL_MS, false);
     }
-    nodes = r.nodes;
-    edges = r.edges;
-    truncated = r.truncated;
-    totalNodes = r.totalNodes;
+    if (cell.data === 'apply' && outcome.response !== undefined) {
+      // The response guard is structurally redundant (only non-failed
+      // cells apply, and non-failed evidence implies a response) but
+      // keeps the narrowing visible to the compiler.
+      const r = outcome.response;
+      nodes = r.nodes;
+      edges = r.edges;
+      truncated = r.truncated;
+      totalNodes = r.totalNodes;
+    }
+    if (cell.errorSurface === 'flag') {
+      // `error` is reserved for "nothing loaded" (Graph's banner arm
+      // replaces the canvas); data-bearing failures degrade without
+      // replacing the retained graph.
+      if (nodes.length === 0) {
+        error = String(outcome.error);
+      } else {
+        degraded = String(outcome.error);
+      }
+    } else {
+      error = null;
+      degraded = null;
+    }
     loading = false;
   }
 
@@ -252,6 +428,9 @@ export function createBuildGraphPoll(buildId: string): BuildGraphPoll {
     },
     get error() {
       return error;
+    },
+    get degraded() {
+      return degraded;
     },
     get allTerminal() {
       return allTerminal;

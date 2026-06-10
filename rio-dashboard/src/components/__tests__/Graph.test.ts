@@ -61,6 +61,9 @@ function stubPoll(
     totalNodes: nodes.length,
     loading: opts.loading ?? false,
     error: opts.error ?? null,
+    // Graph renders only `error` (never-loaded surface); `degraded`
+    // is BuildDrawer's staleness note (merged_bug_081) — inert here.
+    degraded: null,
     allTerminal: false,
     cleared: 0,
     statusOf(drvPath: string | undefined) {
