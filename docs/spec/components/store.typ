@@ -1312,6 +1312,52 @@ tenant turned an obtainable path into InfraFailure. Charging evidence still
 outranks back-off advice at the fold (matching the per-upstream loop's
 ordering one level down), and the transient lane still closes uncharged.
 
+#r("store.materialize.path-fold")[
+  The walk MUST resolve paths through a single-driver evidence model: one
+  driver task owns ALL job state (frontier, visited set, verdict-cell
+  registries, the committed progress floor, generation machinery, the abort
+  latch), and per-path resolution runs as an evidence-returning future that
+  never mutates job state and never returns a job-level outcome (the
+  per-tenant axis inside a path future keeps
+  #rref("store.materialize.tenant-fold") verbatim). The driver MUST spawn
+  path futures in frontier order into a window of at most `path_fanout` in
+  flight (visited marked at spawn; the closure-walk cap checked at spawn)
+  and apply completions in COMPLETION order: a served path commits the
+  floor, records its verified tenants, and extends the frontier; a settled
+  path records generation-stamped cells at the driver's current generation;
+  the first abort-grade completion latches the walk --- no further spawns,
+  the already-completed backlog is folded by the kernel disposition tier
+  (charge dominates transient; the transient tier carries the MAX
+  `retry_after` across completed transient abort-grades; each tier names
+  the lexicographically-first path as its wire representative, never
+  first-dequeued), non-abort backlog members are applied normally, and
+  in-flight siblings are cancelled by drop. The job outcome MUST be a
+  function of the completed-evidence multiset, never of arrival order
+  within it. The window MUST drain to empty before any tenant re-resolve,
+  so every cell recorded in one iteration carries that iteration's
+  generation. Path futures MUST emit progress only as droppable events on
+  the driver's completion stream --- the driver is the SOLE caller of the
+  progress adapter, so commits and provisional emissions form one total
+  order and emission forwarding stops at the job outcome.
+]
+The serial walk's "determinism" was a BFS-prefix artifact, not a semantic
+commitment --- but charge-vs-defer is park-budget-bearing, which is why the
+backlog fold (charge dominates within everything actually completed) is
+mandatory and first-dequeued-wins is rejected. Window membership at the
+latch is schedule-dependent within ≤ `path_fanout − 1` paths: a charge
+surfaces at the first attempt in which the charging path completes before
+any abort-grade sibling --- under a co-persistent FASTER transient the job
+defers uncharged for unboundedly many paced attempts (5--300 s per re-arm,
+never fed to the park budget), the same defended direction as the
+tenant-fold law one axis down ("a 429 wave must never park a healthy job");
+once the transient clears, the charge lands through the ladder. Cancelled
+siblings contribute zero cells and zero floor trace; their placeholder
+claims are reaped by the drop-guard, their budget reservations ride the
+hash bytes (#rref("store.put.nar-bytes-budget")), and coalesced
+singleflight waiters of a cancelled leader recover by re-running their own
+init futures (moka retry semantics --- a transient raced window during the
+guard reap is lawful).
+
 #r("store.materialize.progress-monotone+1")[
   Every materialization progress emission MUST route through a
   job-level adapter that owns the COMMITTED progress floor and is the

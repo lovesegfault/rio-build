@@ -183,6 +183,11 @@ pub fn spawn_materialization_executor(
         let ctx = executor::ExecutorContext {
             pool: pool.clone(),
             substituter: std::sync::Arc::clone(&substituter),
+            // live_047/R-C WO-R7-2 prelude: width 1 — the serial walk
+            // as the F=1 instance of the driver/window shape. The
+            // config lever (`materialization.path_fanout`) and the
+            // pod path-slot pool land with WO-R7-3.
+            path_fanout: 1,
         };
         let cfg_for_worker = cfg.clone();
         let instance_for_worker = worker_instance.clone();
@@ -642,6 +647,7 @@ mod tests {
         let ctx = executor::ExecutorContext {
             pool: db.pool.clone(),
             substituter,
+            path_fanout: 1,
         };
         tokio::time::timeout(
             Duration::from_secs(30),
@@ -825,6 +831,7 @@ mod tests {
         let ctx = executor::ExecutorContext {
             pool: db.pool.clone(),
             substituter,
+            path_fanout: 1,
         };
         // Pause the clock ONLY after the real-I/O setup (the ephemeral
         // PG pool's connect timeouts run on tokio time; pausing before

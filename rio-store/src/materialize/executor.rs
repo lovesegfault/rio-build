@@ -43,6 +43,12 @@ const MISS_PROBE_DEADLINE: Duration = Duration::from_secs(30);
 pub struct ExecutorContext {
     pub pool: PgPool,
     pub substituter: std::sync::Arc<Substituter>,
+    /// Per-job path-resolution window width F (live_047/R-C,
+    /// `store.materialize.path-fold`): at most this many path futures
+    /// in flight per walk. 1 = the serial walk as the F=1 instance of
+    /// the one code shape (the driver/window structure is identical;
+    /// only the width changes). Floored at 1 by the driver.
+    pub path_fanout: usize,
 }
 
 /// Execute one claimed materialization job end-to-end and produce the
@@ -189,10 +195,13 @@ fn clamp_progress(high_water: u64, done: u64, expected: u64) -> (u64, u64) {
 }
 
 /// bug_159 + bug_087: the job-level monotone progress adapter — the
-/// ONLY constructor of per-path progress callbacks (the raw job
-/// callback is moved in and private, so an unclamped emission site is
-/// unwritable). Owns the job's COMMITTED floor and routes every
-/// emission through [`clamp_progress`].
+/// raw job callback is moved in and private, so an unclamped emission
+/// site is unwritable. Owns the job's COMMITTED floor and routes every
+/// emission through [`clamp_progress`]. live_047/R-C (path-fold law
+/// 6): the DRIVER is the sole caller — path futures emit only EVENTS
+/// ([`ProgressTick`]) onto the driver's stream, so commits and
+/// provisional emissions form one total order (the type and clamp law
+/// are untouched; what moved is WHO calls it).
 ///
 /// Two emission classes, one law (bug_087): the job-level floor is
 /// mutated ONLY by [`Self::commit`] — the success witness, called
@@ -245,24 +254,6 @@ impl<F: Fn(u64, u64, &str) + Send + Sync + 'static> MonotoneProgress<F> {
         let (d, e) = clamp_progress(floor, done, expected);
         (self.on_progress)(d, e, uri);
     }
-
-    /// The per-path callback for a path starting at cumulative `base`
-    /// bytes (merged_bug_195: `done`/`expected` arrive RELATIVE to the
-    /// in-flight path). The only way to build one — and it is
-    /// provisional by construction: per-path streaming cannot commit.
-    fn per_path(&self, base: u64) -> impl Fn(u64, u64, &str) + Send + Sync + 'static {
-        let this = MonotoneProgress {
-            on_progress: std::sync::Arc::clone(&self.on_progress),
-            committed_floor: std::sync::Arc::clone(&self.committed_floor),
-        };
-        move |done: u64, expected: u64, uri: &str| {
-            this.emit_provisional(
-                base.saturating_add(done),
-                base.saturating_add(expected),
-                uri,
-            );
-        }
-    }
 }
 
 /// The walk body behind [`execute_job_with_progress`] (split so the
@@ -272,6 +263,7 @@ async fn execute_job_inner(
     claimed: &ClaimedJob,
     on_progress: impl Fn(u64, u64, &str) + Send + Sync + 'static,
 ) -> MaterializationOutcome {
+    use futures_util::StreamExt as _;
     // bug_159: every emission goes through the monotone adapter — the
     // raw callback is moved in, so an unclamped site is unwritable.
     // (`SubstProgressFn` is `dyn Fn + 'static`, so the per-path
@@ -281,7 +273,12 @@ async fn execute_job_inner(
     // ── 1–4. Walk loop with final-verification re-read ───────────────
     // bug_115: the per-job trusted-set memo for the local-visibility
     // probe (two PG queries per tenant, amortized across the walk).
-    let mut trust_cache = TrustedSetCache::default();
+    // live_047/R-C: interior-mutable (tokio::Mutex) so concurrent path
+    // futures share the per-job memo — locks are held per visibility
+    // call (short PG reads; hits are map lookups); visibility.rs keeps
+    // its `&mut TrustedSetCache` signature untouched (the recorded
+    // divergence from the §2.2 prefill-and-share hypothesis).
+    let trust_cache = tokio::sync::Mutex::new(TrustedSetCache::default());
     let mut visited: HashSet<String> = HashSet::new();
     let mut ingested: Vec<String> = Vec::new();
     let mut verified: Vec<String> = Vec::new();
@@ -444,372 +441,180 @@ async fn execute_job_inner(
                     .map(|p| (p, PathCell::Reference)),
             )
             .collect();
-        while let Some((path, cell)) = frontier.pop_front() {
-            if !visited.insert(path.clone()) {
-                continue;
-            }
-            if visited.len() > CLOSURE_WALK_CAP {
-                return infra_failure(format!(
-                    "closure walk exceeded {CLOSURE_WALK_CAP} paths \
-                     (hostile upstream reference chain?)"
-                ));
-            }
-            // bug_042: the local-presence probe is a VERDICT input, so
-            // its error PROPAGATES (the pre-fix `.ok().flatten()`
-            // mapped a PG blip to "absent" and dragged a locally-
-            // present path through upstream substitution — all-404
-            // upstreams then produced Unobtainable for a path we
-            // already have). `LocalMiss` is the only way to construct
-            // a `ConfirmedAbsent` verdict below: upstream absence
-            // alone is uncompilable as a missing-path verdict.
-            let local_witness = match probe_local(ctx, &path, &tenants, &mut trust_cache).await {
-                Ok(LocalPresence::Present(visible, info)) => {
-                    // Locally present AND visible to an interested
-                    // tenant (bug_115: physical presence alone is NOT
-                    // sufficient — the Present arm structurally
-                    // requires the visibility witness, so a gate-hidden
-                    // row can never be pinned/counted/extended from
-                    // here): pin it, count it verified, and extend the
-                    // frontier from the LOCAL row's references — the
-                    // closure-completeness obligation holds without
-                    // touching any upstream.
-                    verified_tenants_by_path.insert(path.clone(), visible.tenants().to_vec());
-                    if let Err(e) = pin_materialized_path(ctx, claimed, &path).await {
-                        return infra_failure(format!("pin-at-ingest failed for {path}: {e}"));
-                    }
-                    verified.push(path.clone());
-                    completed_bytes = completed_bytes.saturating_add(info.nar_size);
-                    // bug_087: a fully-processed path is the success
-                    // witness — committed into the job floor.
-                    progress.commit(completed_bytes, "");
-                    for reference in &info.references {
-                        let r = reference.as_str().to_string();
-                        if r != path && !visited.contains(&r) {
-                            frontier.push_back((r, PathCell::Reference));
+        // ── Path-axis evidence law (store.materialize.path-fold) ──
+        // ONE driver (this function) owns ALL job state; per-path
+        // resolution runs as evidence-returning futures in an
+        // F-bounded window, spawned in frontier order, applied in
+        // COMPLETION order. The window, the tick stream, and their
+        // borrows of this iteration's tenant set are PER-ITERATION
+        // locals, so the generation barrier (law 5) holds by
+        // construction — no path future is in flight across the
+        // tenant re-resolve; every cell recorded in iteration k
+        // carries generation g_k (bug_266's fold_guard holds with
+        // zero changes; barrier-by-construction is the structural
+        // form of the re-resolve assert).
+        let fanout = ctx.path_fanout.max(1);
+        let (tick_tx, mut tick_rx) =
+            tokio::sync::mpsc::channel::<ProgressTick>(PROGRESS_TICK_QUEUE);
+        let mut window: futures_util::stream::FuturesUnordered<
+            futures_util::future::BoxFuture<'_, PathResolution>,
+        > = futures_util::stream::FuturesUnordered::new();
+        // The abort latch (law 4): Some = stop spawning; the Vec is
+        // the completed abort-grade evidence the tier fold consumes.
+        let mut walk_abort: Option<Vec<AbortEvidence>> = None;
+
+        // The apply chokepoint: a TOTAL match over PathResolution
+        // (the variant-totality census — zero `_` arms), driver-side
+        // only; mutates exclusively driver-owned state.
+        macro_rules! apply_resolution {
+            ($res:expr) => {
+                match $res {
+                    PathResolution::Served {
+                        path,
+                        nar_size,
+                        references,
+                        verified_tenants: vt,
+                        ingested: was_ingested,
+                    } => {
+                        verified_tenants_by_path.insert(path.clone(), vt);
+                        if was_ingested {
+                            ingested.push(path);
+                        } else {
+                            verified.push(path);
+                        }
+                        // bug_087: completion-order commit (law 3) —
+                        // the success witness raises the committed
+                        // floor; driver-serial cumulative, fetch_max
+                        // underneath, adapter clamp law untouched.
+                        completed_bytes = completed_bytes.saturating_add(nar_size);
+                        progress.commit(completed_bytes, "");
+                        for r in references {
+                            if !visited.contains(&r) {
+                                frontier.push_back((r, PathCell::Reference));
+                            }
                         }
                     }
-                    continue;
-                }
-                Ok(LocalPresence::Absent(w)) => w,
-                Err(e) => {
-                    return infra_failure(format!("local presence probe failed for {path}: {e}"));
+                    PathResolution::Settled {
+                        path,
+                        cell,
+                        trust_refused: t,
+                        content_mismatched: c,
+                    } => {
+                        if t {
+                            trust_refused.record(path.clone(), tenant_generation);
+                        }
+                        if c {
+                            content_mismatched.record(path.clone(), tenant_generation);
+                        }
+                        match cell {
+                            PathCell::Wanted => missing_wanted.record(path, tenant_generation),
+                            PathCell::Reference => {
+                                missing_references.record(path, tenant_generation)
+                            }
+                        }
+                    }
+                    PathResolution::AbortGrade { path, grade } => {
+                        walk_abort
+                            .get_or_insert_with(Vec::new)
+                            .push(AbortEvidence { path, grade });
+                    }
                 }
             };
+        }
 
-            // merged_bug_195: per-path progress through the substitute
-            // body fetch — `expected` = completed + the declared
-            // NarSize (known before the body), `done` = completed +
-            // streamed-so-far, `uri` = the serving upstream.
-            // bug_159: minted by the adapter — the only constructor of
-            // per-path callbacks; a stall-failover counter reset
-            // (substitute.rs retries the next upstream with a fresh
-            // byte counter) clamps at the job's COMMITTED floor:
-            // never below completed work, though it MAY step back
-            // below a failed attempt's provisional peak (truthful
-            // display — store.materialize.progress-monotone+1).
-            let per_path_progress = progress.per_path(completed_bytes);
-            // merged_bug_028 / owner Q2 + merged_bug_133: try EVERY
-            // interested tenant's upstream view until one serves the
-            // path. The loop body ONLY pushes evidence cells (a hit
-            // breaks) — ALL failure dispositions exit at the kernel
-            // fold below, after every tenant has been consulted, so
-            // the deterministic resolve order can never starve a
-            // later tenant of its chance to serve (pre-fix: tenant
-            // A's charging failure aborted the walk before serving
-            // tenant B was tried).
-            // Signed Q2: the hit carries its SERVING tenant; S6a's
-            // kernel recorder owns the failure cells.
-            let mut hit: Option<(Uuid, Box<rio_proto::validated::ValidatedPathInfo>)> = None;
-            let mut cells = TenantAttemptCells::new();
-            // Per-cell (label, detail) for the outcome message,
-            // index-aligned with `cells`.
-            let mut cell_msgs: Vec<(&'static str, String)> = Vec::with_capacity(tenants.len());
-            for &tenant_id in &tenants {
-                match ctx
-                    .substituter
-                    .try_substitute_with_progress(tenant_id, &path, &per_path_progress)
-                    .await
-                {
-                    Ok(Some(path_info)) => {
-                        hit = Some((tenant_id, Box::new(path_info)));
+        'drive: loop {
+            if walk_abort.is_none() {
+                // Spawn phase (law 2): frontier order, ≤ F in flight,
+                // `visited` marked at spawn (pop→spawn is immediate),
+                // CLOSURE_WALK_CAP checked at spawn.
+                while window.len() < fanout {
+                    let Some((path, cell)) = frontier.pop_front() else {
+                        break;
+                    };
+                    if !visited.insert(path.clone()) {
+                        continue;
+                    }
+                    if visited.len() > CLOSURE_WALK_CAP {
+                        // Driver-synthesized charge evidence; enters
+                        // the same latch + tier fold as any abort.
+                        walk_abort.get_or_insert_with(Vec::new).push(AbortEvidence {
+                            path,
+                            grade: AbortDisposition::Charge {
+                                detail: format!(
+                                    "closure walk exceeded {CLOSURE_WALK_CAP} paths \
+                                     (hostile upstream reference chain?)"
+                                ),
+                            },
+                        });
                         break;
                     }
-                    Ok(None) => {
-                        // Clean miss under this tenant; the next tenant
-                        // may still serve it.
-                        cells.record_clean_miss();
-                        cell_msgs.push(("", String::new()));
-                    }
-                    Err(e) => {
-                        // merged_bug_178: total classification through
-                        // the kernel truth table — no catch-all (a
-                        // future SubstituteError variant fails this
-                        // match AND the class table).
-                        // bug_194: class + advice from the canonical
-                        // table; label + message from the ONE shared
-                        // chokepoint (the probe leg consumes the same
-                        // fn — wording cannot drift per leg).
-                        let (class, retry_after) = crate::substitute::substitute_error_evidence(&e);
-                        let (label, msg) = substitute_cell_message(&path, class, &e);
-                        cell_msgs.push((label, msg));
-                        // merged_bug_188: the kernel chokepoint owns
-                        // the loop-control decision — a Raced verdict
-                        // aborts the TENANT axis too (the placeholder
-                        // slot is path-keyed; further tenants would
-                        // race the same held slot, and a sibling's
-                        // charging failure must not dominate the
-                        // uncharged race in the fold).
-                        match cells.record_failure(class, retry_after) {
-                            LoopControl::Continue => {}
-                            LoopControl::AbortRaced => break,
-                        }
-                    }
+                    // Law 6: base = the cumulative floor at SPAWN —
+                    // the tick arithmetic of the old `per_path(base)`,
+                    // now applied future-side onto event payloads.
+                    let base = completed_bytes;
+                    window.push(Box::pin(resolve_path(
+                        ctx,
+                        claimed,
+                        &tenants,
+                        &trust_cache,
+                        path,
+                        cell,
+                        base,
+                        tick_tx.clone(),
+                    )));
                 }
             }
-            match hit {
-                Some((serving_tenant, path_info)) => {
-                    // r[impl sched.materialize.pinning]
-                    // Pin-at-ingest (design §5.1): the pin lands BEFORE
-                    // the path can appear in any Success report. A pin
-                    // failure is an infrastructure failure — reporting
-                    // Success for an unpinned path would re-open the
-                    // GC-after-vouch window (B2-strong) the pin exists
-                    // to close.
-                    if let Err(e) = pin_materialized_path(ctx, claimed, &path).await {
-                        return infra_failure(format!("pin-at-ingest failed for {path}: {e}"));
-                    }
-                    ingested.push(path.clone());
-                    // Signed Q2: the serving tenant's own-upstream hit
-                    // verifies the path for THAT tenant; the remaining
-                    // interested tenants are re-checked against the
-                    // now-local row (their trust view may accept the
-                    // persisted upstream sigs) — verified-for, never
-                    // assumed-for.
-                    {
-                        let mut vt: Vec<Uuid> = vec![serving_tenant];
-                        if tenants.len() > 1
-                            && let Ok(Some(local)) =
-                                crate::metadata::query_path_info(&ctx.pool, &path).await
-                        {
-                            let signer = ctx.substituter.tenant_signer();
-                            for &other in tenants.iter().filter(|t| **t != serving_tenant) {
-                                if let Ok(Some(v)) = visible_to_tenant(
-                                    &ctx.pool,
-                                    signer,
-                                    Some(other),
-                                    &local,
-                                    &mut trust_cache,
-                                )
-                                .await
-                                {
-                                    for t in v.tenants() {
-                                        if !vt.contains(t) {
-                                            vt.push(*t);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        verified_tenants_by_path.insert(path.clone(), vt);
-                    }
-                    // BC-4: the path is fully processed — fold its NAR
-                    // size into the cumulative total and fire the
-                    // final per-path tick (done == expected for the
-                    // completed prefix). Empty upstream URI: the
-                    // gateway omits the "from <uri>" suffix when the
-                    // field is empty.
-                    completed_bytes = completed_bytes.saturating_add(path_info.nar_size);
-                    // bug_087: success witness — commit, not a
-                    // provisional emission.
-                    progress.commit(completed_bytes, "");
-                    // Extend the frontier with the narinfo references —
-                    // the closure-completeness obligation.
-                    for reference in &path_info.references {
-                        let r = reference.as_str().to_string();
-                        if r != path && !visited.contains(&r) {
-                            frontier.push_back((r, PathCell::Reference));
-                        }
-                    }
+            if walk_abort.is_some() {
+                // Law 4: latched. Collect every ALREADY-COMPLETED
+                // sibling from the dequeue backlog (non-blocking
+                // polls — the batch-simultaneous family included),
+                // apply non-abort members normally, then cancel the
+                // in-flight rest by drop below.
+                use futures_util::FutureExt as _;
+                while let Some(Some(res)) = window.next().now_or_never() {
+                    apply_resolution!(res);
                 }
-                None => match cells.fold() {
-                    TenantAttemptsVerdict::ChargeInfra { idx } => {
-                        // ≥1 tenant produced charging evidence and no
-                        // tenant served: the charge ladder (and park
-                        // budget) must see it. The detail names the
-                        // first charging tenant's failure.
-                        return infra_failure(cell_msgs[idx].1.clone());
-                    }
-                    TenantAttemptsVerdict::RetryTransient { idx, max } => {
-                        // No charge; ≥1 transient: RetryLater so the
-                        // scheduler closes UNCHARGED and defers (a 429
-                        // wave must never park a healthy job). The
-                        // largest Retry-After across tenants rides the
-                        // report.
-                        let (label, detail) = &cell_msgs[idx];
-                        info!(path = %path, class = label,
-                              "transient substitute failure; reporting retry-later");
-                        return MaterializationOutcome {
-                            outcome: Some(materialization_outcome::Outcome::RetryLater(
-                                materialization_outcome::RetryLater {
-                                    detail: detail.clone(),
-                                    retry_after_secs: max.map(|d| d.as_secs()).unwrap_or(0),
-                                    class: (*label).to_string(),
-                                },
-                            )),
-                        };
-                    }
-                    TenantAttemptsVerdict::UntrustedPresent { idx } => {
-                        // merged_bug_005: ≥1 tenant found the path
-                        // present-but-untrusted and the rest cleanly
-                        // missed. Settle toward Unobtainable WITHOUT
-                        // the HEAD confirmation — the path IS present
-                        // upstream; a sig-blind HEAD 200 proves
-                        // nothing about trust and pre-fix converted
-                        // this exact state into a permanent
-                        // "present but not ingested" infra charge.
-                        // The local-miss witness still anchors the
-                        // verdict (the path is not locally servable).
-                        let _witness: LocalMiss = local_witness;
-                        let (_, detail) = &cell_msgs[idx];
-                        warn!(path = %path, detail = %detail,
-                              "path present upstream but signature-untrusted; \
-                               settling unobtainable (uncharged)");
-                        trust_refused.record(path.clone(), tenant_generation);
-                        match cell {
-                            PathCell::Wanted => {
-                                missing_wanted.record(path.clone(), tenant_generation)
-                            }
-                            PathCell::Reference => {
-                                missing_references.record(path.clone(), tenant_generation)
-                            }
-                        }
-                    }
-                    TenantAttemptsVerdict::ContentMismatch { idx } => {
-                        // merged_bug_046: ≥1 tenant hit the stored-row
-                        // content disagreement and the rest cleanly
-                        // missed. Settle toward Unobtainable WITHOUT
-                        // the HEAD confirmation — the path IS present
-                        // upstream with disagreeing bytes; a
-                        // content-blind HEAD 200 proves nothing and
-                        // pre-fix converted this exact state into a
-                        // per-retry "present but not ingested" infra
-                        // charge until the job parked. The local-miss
-                        // witness still anchors the verdict.
-                        let _witness: LocalMiss = local_witness;
-                        let (_, detail) = &cell_msgs[idx];
-                        warn!(path = %path, detail = %detail,
-                              "path present upstream with disagreeing content; \
-                               settling unobtainable (uncharged)");
-                        content_mismatched.record(path.clone(), tenant_generation);
-                        match cell {
-                            PathCell::Wanted => {
-                                missing_wanted.record(path.clone(), tenant_generation)
-                            }
-                            PathCell::Reference => {
-                                missing_references.record(path.clone(), tenant_generation)
-                            }
-                        }
-                    }
-                    TenantAttemptsVerdict::AllCleanMiss => {
-                        // Every tenant cleanly missed. The miss verdict
-                        // additionally requires the HEAD-probe to
-                        // confirm absence under EVERY tenant
-                        // (merged_bug_028: any indeterminate or probe
-                        // trouble → infra; the local-miss witness from
-                        // above completes the proof — bug_042). The
-                        // probe loop rides the SAME cells + fold — no
-                        // in-loop returns on any tenant axis
-                        // (merged_bug_133).
-                        let mut probe_cells = TenantAttemptCells::new();
-                        let mut probe_msgs: Vec<String> = Vec::with_capacity(tenants.len());
-                        for &tenant_id in &tenants {
-                            match probe_miss(ctx, tenant_id, &path).await {
-                                MissProbe::Confirmed => {
-                                    probe_cells.record_clean_miss();
-                                    probe_msgs.push(String::new());
-                                }
-                                MissProbe::Failed {
-                                    class,
-                                    retry_after,
-                                    detail,
-                                } => {
-                                    // bug_295: the probe leg rides the
-                                    // SAME truth table as the attempt
-                                    // leg — congruence per CLASS, not
-                                    // per leg (a 429'd probe defers
-                                    // uncharged; a 5xx'd probe charges
-                                    // exactly like a 5xx'd GET).
-                                    // merged_bug_188: and the SAME
-                                    // loop control — a raced probe
-                                    // aborts the tenant sweep (the
-                                    // slot is path-keyed).
-                                    // bug_194: the same chokepoint as
-                                    // the attempt leg — a 429'd probe
-                                    // narrates rate-limiting, not
-                                    // infrastructure trouble.
-                                    probe_msgs
-                                        .push(substitute_cell_message(&path, class, &detail).1);
-                                    match probe_cells.record_failure(class, retry_after) {
-                                        LoopControl::Continue => {}
-                                        LoopControl::AbortRaced => break,
-                                    }
-                                }
-                            }
-                        }
-                        match probe_cells.fold() {
-                            TenantAttemptsVerdict::ChargeInfra { idx } => {
-                                return infra_failure(probe_msgs[idx].clone());
-                            }
-                            TenantAttemptsVerdict::RetryTransient { idx, max } => {
-                                // No tenant charged; ≥1 probe was
-                                // rate-limited: close UNCHARGED and
-                                // defer (the probe-leg park-burning
-                                // harm case, bug_295).
-                                info!(path = %path, class = "rate_limited",
-                                      "transient probe failure; reporting retry-later");
-                                return MaterializationOutcome {
-                                    outcome: Some(materialization_outcome::Outcome::RetryLater(
-                                        materialization_outcome::RetryLater {
-                                            detail: probe_msgs[idx].clone(),
-                                            retry_after_secs: max.map(|d| d.as_secs()).unwrap_or(0),
-                                            class: "rate_limited".to_string(),
-                                        },
-                                    )),
-                                };
-                            }
-                            TenantAttemptsVerdict::UntrustedPresent { .. } => {
-                                // Unreachable while the HEAD probe is
-                                // sig-blind; a future sig-aware probe's
-                                // refusal settles like the attempt
-                                // leg's — fall through to the
-                                // confirmed-absent settlement with the
-                                // trust cause recorded.
-                                trust_refused.record(path.clone(), tenant_generation);
-                            }
-                            TenantAttemptsVerdict::ContentMismatch { .. } => {
-                                // Unreachable while the HEAD probe is
-                                // content-blind (merged_bug_046); a
-                                // future content-aware probe's refusal
-                                // falls through with the cause
-                                // recorded, mirroring the trust arm.
-                                content_mismatched.record(path.clone(), tenant_generation);
-                            }
-                            TenantAttemptsVerdict::AllCleanMiss => {}
-                        }
-                        let _witness: LocalMiss = local_witness;
-                        debug!(path = %path, cell = ?cell, tenants = tenants.len(),
-                               "path confirmed absent under every interested tenant (and locally)");
-                        match cell {
-                            PathCell::Wanted => {
-                                missing_wanted.record(path.clone(), tenant_generation)
-                            }
-                            PathCell::Reference => {
-                                missing_references.record(path.clone(), tenant_generation)
-                            }
-                        }
-                    }
-                },
+                break 'drive;
             }
+            if window.is_empty() {
+                // Frontier drained, nothing in flight: this
+                // iteration's walk is complete.
+                break 'drive;
+            }
+            tokio::select! {
+                Some(res) = window.next() => {
+                    apply_resolution!(res);
+                }
+                Some(tick) = tick_rx.recv() => {
+                    // Law 6: the driver is the SOLE on_progress
+                    // caller — commits and provisional emissions
+                    // form ONE total order, so the per-call floor
+                    // MUST of progress-monotone+1 is enforceable
+                    // trace-wide; the forward keeps the droppable/
+                    // non-blocking contract (ticks arrived try_send).
+                    progress.emit_provisional(tick.done, tick.expected, &tick.uri);
+                }
+            }
+        }
+        // E-4: the cancelled-sibling window is bounded by F − 1 (the
+        // abort itself completed out of a ≤ F window).
+        debug_assert!(
+            walk_abort.is_none() || window.len() <= fanout.saturating_sub(1),
+            "cancelled-sibling window exceeded F-1"
+        );
+        // Cancellation by drop (law 4): in-flight upstream bodies are
+        // torn down with their futures; placeholder drop-guards reap
+        // the claims (W-6a); budget reservations ride the hash bytes
+        // (WO-R7-1) so a cancelled sibling's budget frees only when
+        // its memory does; moka recovers coalesced waiters by RETRY
+        // with their own init futures (W-6b pins moka 0.12.15's
+        // EnclosingFutureAborted semantics — no adoption). Pending
+        // ticks die with the channel — no post-outcome zombie
+        // emissions (law 6).
+        drop(window);
+        drop(tick_tx);
+        if let Some(evidence) = walk_abort {
+            return fold_abort_evidence(&evidence);
         }
     }
 
@@ -967,6 +772,441 @@ fn refusal_wire(
 enum PathCell {
     Wanted,
     Reference,
+}
+
+// r[impl store.materialize.path-fold]
+/// The CLOSED per-path evidence object (path-fold law 1, live_047/R-C):
+/// a path future returns exactly one of these and NEVER mutates job
+/// state or returns a job-level outcome. The driver's apply is a total
+/// match over this alphabet (zero `_ =>` — the §5.1 variant-totality
+/// census; a new variant fails the build at the apply site).
+enum PathResolution {
+    /// Served: pinned (pin-at-ingest already ran inside the future —
+    /// I-5 holds before the driver can count it), persisted/visible;
+    /// the driver commits the floor, records the verified tenants, and
+    /// extends the frontier with `references` (already self-filtered).
+    Served {
+        path: String,
+        nar_size: u64,
+        references: Vec<String>,
+        verified_tenants: Vec<Uuid>,
+        /// true = substitute-hit (`ingested_paths`); false =
+        /// local-present (`verified_paths`).
+        ingested: bool,
+    },
+    /// Settled uncharged (the walk continues): the driver records the
+    /// generation-stamped cells — the missing cell per `cell`, plus
+    /// the trust/content cause registries when flagged.
+    Settled {
+        path: String,
+        cell: PathCell,
+        trust_refused: bool,
+        content_mismatched: bool,
+    },
+    /// Abort-grade: job-level disposition evidence. The driver latches
+    /// (no further spawns), folds the already-completed backlog by
+    /// tier, cancels in-flight siblings by drop, and compiles the job
+    /// outcome from the completed-evidence multiset.
+    AbortGrade {
+        path: String,
+        grade: AbortDisposition,
+    },
+}
+
+/// The two abort grades a path can complete with. Tier precedence is
+/// NOT defined here — [`AbortDisposition::tier`] maps through the
+/// kernel's [`disposition_tier`] table, the single executable
+/// precedence source both the tenant and upstream folds already
+/// consume (merged_bug_210; charge = 0 ≺ transient = 1).
+///
+/// [`disposition_tier`]: rio_evidence_kernel::outcome::disposition_tier
+enum AbortDisposition {
+    /// Charge-grade: reaches the charge ladder as InfraFailure.
+    Charge { detail: String },
+    /// Transient: closes UNCHARGED as RetryLater (a 429 wave must
+    /// never park a healthy job), carrying the wire class label and
+    /// the upstream's back-off advice.
+    Transient {
+        class: &'static str,
+        detail: String,
+        retry_after: Option<Duration>,
+    },
+}
+
+impl AbortDisposition {
+    /// Precedence tier via the kernel's single source.
+    fn tier(&self) -> u8 {
+        use rio_evidence_kernel::outcome::{FailureDisposition, disposition_tier};
+        match self {
+            AbortDisposition::Charge { .. } => disposition_tier(FailureDisposition::ChargeInfra),
+            AbortDisposition::Transient { .. } => {
+                disposition_tier(FailureDisposition::RetryUncharged)
+            }
+        }
+    }
+}
+
+/// One completed abort-grade resolution in the latch backlog.
+struct AbortEvidence {
+    path: String,
+    grade: AbortDisposition,
+}
+
+// r[impl store.materialize.path-fold]
+/// THE path-axis abort fold (path-fold law 4): the job outcome is a
+/// pure function of the completed abort-evidence MULTISET, never of
+/// arrival order within it — input-order invariant by construction
+/// (W-1a proptest-swept):
+///
+/// - winning tier = min [`AbortDisposition::tier`] (charge dominates
+///   transient — the kernel table, same source as the tenant fold);
+/// - the wire representative is the LEXICOGRAPHICALLY-FIRST path
+///   within the winning tier (never first-dequeued, so no
+///   schedule-dependent detail rides the wire);
+/// - the transient tier carries the MAX `retry_after` across ALL
+///   completed transient abort-grades (the tenant-fold
+///   max-across-tenants precedent one axis up).
+fn fold_abort_evidence(evidence: &[AbortEvidence]) -> MaterializationOutcome {
+    debug_assert!(!evidence.is_empty(), "fold over empty abort evidence");
+    let win_tier = evidence
+        .iter()
+        .map(|e| e.grade.tier())
+        .min()
+        .expect("nonempty");
+    let rep = evidence
+        .iter()
+        .filter(|e| e.grade.tier() == win_tier)
+        .min_by(|a, b| a.path.cmp(&b.path))
+        .expect("winning tier nonempty");
+    let max_retry = evidence
+        .iter()
+        .filter_map(|e| match &e.grade {
+            AbortDisposition::Transient { retry_after, .. } => *retry_after,
+            AbortDisposition::Charge { .. } => None,
+        })
+        .max();
+    match &rep.grade {
+        AbortDisposition::Charge { detail } => infra_failure(detail.clone()),
+        AbortDisposition::Transient { class, detail, .. } => MaterializationOutcome {
+            outcome: Some(materialization_outcome::Outcome::RetryLater(
+                materialization_outcome::RetryLater {
+                    detail: detail.clone(),
+                    retry_after_secs: max_retry.map(|d| d.as_secs()).unwrap_or(0),
+                    class: (*class).to_string(),
+                },
+            )),
+        },
+    }
+}
+
+/// A per-path progress EVENT (path-fold law 6): path futures never
+/// call the progress adapter — they `try_send` (droppable, the relay
+/// contract) base-adjusted ticks onto the driver's stream, and the
+/// DRIVER is the sole `on_progress` caller, so commits and provisional
+/// emissions form one total order and the per-call floor MUST of
+/// `store.materialize.progress-monotone+1` is enforceable trace-wide
+/// (post-outcome zombie emissions are impossible — forwarding stops at
+/// outcome).
+struct ProgressTick {
+    done: u64,
+    expected: u64,
+    uri: String,
+}
+
+/// Per-iteration tick-queue depth. Sized for display traffic (ticks
+/// are throttled to SUBSTITUTE_PROGRESS_INTERVAL_BYTES upstream);
+/// overflow drops the tick — progress is droppable by contract.
+const PROGRESS_TICK_QUEUE: usize = 64;
+
+// r[impl store.materialize.path-fold]
+/// Resolve ONE path against live state: the evidence-returning path
+/// future (path-fold law 1). The body is the serial walk's per-path
+/// block verbatim — local probe, the per-tenant substitute loop
+/// (tenant-fold law untouched: cells, `AbortRaced`, post-loop fold),
+/// the AllCleanMiss probe leg — with every in-loop job-level return
+/// replaced by a closed [`PathResolution`].
+#[allow(clippy::too_many_arguments)]
+async fn resolve_path(
+    ctx: &ExecutorContext,
+    claimed: &ClaimedJob,
+    tenants: &[Uuid],
+    trust_cache: &tokio::sync::Mutex<TrustedSetCache>,
+    path: String,
+    cell: PathCell,
+    progress_base: u64,
+    ticks: tokio::sync::mpsc::Sender<ProgressTick>,
+) -> PathResolution {
+    // bug_042: the local-presence probe is a VERDICT input, so its
+    // error is charging evidence (a PG blip is never absence).
+    // bug_115/bug_139: Present requires the visibility witness.
+    let probed = {
+        let mut cache = trust_cache.lock().await;
+        probe_local(ctx, &path, tenants, &mut cache).await
+    };
+    let local_witness = match probed {
+        Ok(LocalPresence::Present(visible, info)) => {
+            // r[impl sched.materialize.pinning]
+            // Pin-at-ingest BEFORE the Served evidence exists (I-5):
+            // the driver applies Served only with the pin landed.
+            if let Err(e) = pin_materialized_path(ctx, claimed, &path).await {
+                return PathResolution::AbortGrade {
+                    grade: AbortDisposition::Charge {
+                        detail: format!("pin-at-ingest failed for {path}: {e}"),
+                    },
+                    path,
+                };
+            }
+            let references = info
+                .references
+                .iter()
+                .map(|r| r.as_str().to_string())
+                .filter(|r| *r != path)
+                .collect();
+            return PathResolution::Served {
+                nar_size: info.nar_size,
+                verified_tenants: visible.tenants().to_vec(),
+                references,
+                ingested: false,
+                path,
+            };
+        }
+        Ok(LocalPresence::Absent(w)) => w,
+        Err(e) => {
+            return PathResolution::AbortGrade {
+                grade: AbortDisposition::Charge {
+                    detail: format!("local presence probe failed for {path}: {e}"),
+                },
+                path,
+            };
+        }
+    };
+
+    // merged_bug_195 + path-fold law 6: per-path progress through the
+    // substitute body fetch rides the driver's event stream. The tick
+    // is base-adjusted exactly like the old `per_path(base)` closure
+    // (base = the committed floor at SPAWN — concurrent siblings'
+    // ticks may understate the aggregate, the truthful direction);
+    // the driver's adapter clamp does the rest.
+    let per_path_progress = move |done: u64, expected: u64, uri: &str| {
+        let _ = ticks.try_send(ProgressTick {
+            done: progress_base.saturating_add(done),
+            expected: progress_base.saturating_add(expected),
+            uri: uri.to_string(),
+        });
+    };
+
+    // merged_bug_028 / owner Q2 + merged_bug_133: try EVERY interested
+    // tenant's upstream view until one serves the path. The loop body
+    // ONLY pushes evidence cells (a hit breaks) — ALL failure
+    // dispositions exit at the kernel fold below (tenant-fold law,
+    // verbatim inside the path future).
+    let mut hit: Option<(Uuid, Box<rio_proto::validated::ValidatedPathInfo>)> = None;
+    let mut cells = TenantAttemptCells::new();
+    let mut cell_msgs: Vec<(&'static str, String)> = Vec::with_capacity(tenants.len());
+    for &tenant_id in tenants {
+        match ctx
+            .substituter
+            .try_substitute_with_progress(tenant_id, &path, &per_path_progress)
+            .await
+        {
+            Ok(Some(path_info)) => {
+                hit = Some((tenant_id, Box::new(path_info)));
+                break;
+            }
+            Ok(None) => {
+                cells.record_clean_miss();
+                cell_msgs.push(("", String::new()));
+            }
+            Err(e) => {
+                // merged_bug_178/bug_194/merged_bug_188: total
+                // classification + the one message chokepoint + the
+                // kernel loop control (Raced aborts the tenant axis).
+                let (class, retry_after) = crate::substitute::substitute_error_evidence(&e);
+                let (label, msg) = substitute_cell_message(&path, class, &e);
+                cell_msgs.push((label, msg));
+                match cells.record_failure(class, retry_after) {
+                    LoopControl::Continue => {}
+                    LoopControl::AbortRaced => break,
+                }
+            }
+        }
+    }
+    match hit {
+        Some((serving_tenant, path_info)) => {
+            // r[impl sched.materialize.pinning]
+            // Pin-at-ingest (design §5.1) before Served evidence.
+            if let Err(e) = pin_materialized_path(ctx, claimed, &path).await {
+                return PathResolution::AbortGrade {
+                    grade: AbortDisposition::Charge {
+                        detail: format!("pin-at-ingest failed for {path}: {e}"),
+                    },
+                    path,
+                };
+            }
+            // Signed Q2: serving tenant verified; remaining interested
+            // tenants re-checked against the now-local row.
+            let mut vt: Vec<Uuid> = vec![serving_tenant];
+            if tenants.len() > 1
+                && let Ok(Some(local)) = crate::metadata::query_path_info(&ctx.pool, &path).await
+            {
+                let signer = ctx.substituter.tenant_signer();
+                for &other in tenants.iter().filter(|t| **t != serving_tenant) {
+                    let mut cache = trust_cache.lock().await;
+                    if let Ok(Some(v)) =
+                        visible_to_tenant(&ctx.pool, signer, Some(other), &local, &mut cache).await
+                    {
+                        for t in v.tenants() {
+                            if !vt.contains(t) {
+                                vt.push(*t);
+                            }
+                        }
+                    }
+                }
+            }
+            let references = path_info
+                .references
+                .iter()
+                .map(|r| r.as_str().to_string())
+                .filter(|r| *r != path)
+                .collect();
+            PathResolution::Served {
+                nar_size: path_info.nar_size,
+                verified_tenants: vt,
+                references,
+                ingested: true,
+                path,
+            }
+        }
+        None => match cells.fold() {
+            TenantAttemptsVerdict::ChargeInfra { idx } => PathResolution::AbortGrade {
+                grade: AbortDisposition::Charge {
+                    detail: cell_msgs[idx].1.clone(),
+                },
+                path,
+            },
+            TenantAttemptsVerdict::RetryTransient { idx, max } => {
+                let (label, detail) = &cell_msgs[idx];
+                info!(path = %path, class = label,
+                      "transient substitute failure; reporting retry-later");
+                PathResolution::AbortGrade {
+                    grade: AbortDisposition::Transient {
+                        class: label,
+                        detail: detail.clone(),
+                        retry_after: max,
+                    },
+                    path,
+                }
+            }
+            TenantAttemptsVerdict::UntrustedPresent { idx } => {
+                // merged_bug_005: present-but-untrusted settles
+                // uncharged WITHOUT the HEAD confirmation; the
+                // local-miss witness anchors the verdict.
+                let _witness: LocalMiss = local_witness;
+                let (_, detail) = &cell_msgs[idx];
+                warn!(path = %path, detail = %detail,
+                      "path present upstream but signature-untrusted; \
+                       settling unobtainable (uncharged)");
+                PathResolution::Settled {
+                    path,
+                    cell,
+                    trust_refused: true,
+                    content_mismatched: false,
+                }
+            }
+            TenantAttemptsVerdict::ContentMismatch { idx } => {
+                // merged_bug_046: stored-row content disagreement
+                // settles uncharged WITHOUT the HEAD confirmation.
+                let _witness: LocalMiss = local_witness;
+                let (_, detail) = &cell_msgs[idx];
+                warn!(path = %path, detail = %detail,
+                      "path present upstream with disagreeing content; \
+                       settling unobtainable (uncharged)");
+                PathResolution::Settled {
+                    path,
+                    cell,
+                    trust_refused: false,
+                    content_mismatched: true,
+                }
+            }
+            TenantAttemptsVerdict::AllCleanMiss => {
+                // merged_bug_028/bug_042: the miss verdict additionally
+                // requires HEAD-probe confirmation under EVERY tenant,
+                // riding the SAME cells + fold (merged_bug_133).
+                let mut probe_cells = TenantAttemptCells::new();
+                let mut probe_msgs: Vec<String> = Vec::with_capacity(tenants.len());
+                for &tenant_id in tenants {
+                    match probe_miss(ctx, tenant_id, &path).await {
+                        MissProbe::Confirmed => {
+                            probe_cells.record_clean_miss();
+                            probe_msgs.push(String::new());
+                        }
+                        MissProbe::Failed {
+                            class,
+                            retry_after,
+                            detail,
+                        } => {
+                            // bug_295/bug_194/merged_bug_188: class
+                            // congruence per CLASS, the shared message
+                            // chokepoint, the same loop control.
+                            probe_msgs.push(substitute_cell_message(&path, class, &detail).1);
+                            match probe_cells.record_failure(class, retry_after) {
+                                LoopControl::Continue => {}
+                                LoopControl::AbortRaced => break,
+                            }
+                        }
+                    }
+                }
+                let mut trust_flag = false;
+                let mut content_flag = false;
+                match probe_cells.fold() {
+                    TenantAttemptsVerdict::ChargeInfra { idx } => {
+                        return PathResolution::AbortGrade {
+                            grade: AbortDisposition::Charge {
+                                detail: probe_msgs[idx].clone(),
+                            },
+                            path,
+                        };
+                    }
+                    TenantAttemptsVerdict::RetryTransient { idx, max } => {
+                        // bug_295: probe-leg rate-limit waves close
+                        // UNCHARGED with the advice riding the deferral.
+                        info!(path = %path, class = "rate_limited",
+                              "transient probe failure; reporting retry-later");
+                        return PathResolution::AbortGrade {
+                            grade: AbortDisposition::Transient {
+                                class: "rate_limited",
+                                detail: probe_msgs[idx].clone(),
+                                retry_after: max,
+                            },
+                            path,
+                        };
+                    }
+                    TenantAttemptsVerdict::UntrustedPresent { .. } => {
+                        // Unreachable while the HEAD probe is sig-blind;
+                        // a future sig-aware probe's refusal settles
+                        // with the trust cause recorded.
+                        trust_flag = true;
+                    }
+                    TenantAttemptsVerdict::ContentMismatch { .. } => {
+                        // Unreachable while the HEAD probe is
+                        // content-blind (merged_bug_046); mirrors the
+                        // trust arm.
+                        content_flag = true;
+                    }
+                    TenantAttemptsVerdict::AllCleanMiss => {}
+                }
+                let _witness: LocalMiss = local_witness;
+                debug!(path = %path, cell = ?cell, tenants = tenants.len(),
+                       "path confirmed absent under every interested tenant (and locally)");
+                PathResolution::Settled {
+                    path,
+                    cell,
+                    trust_refused: trust_flag,
+                    content_mismatched: content_flag,
+                }
+            }
+        },
+    }
 }
 
 /// Witness that the LOCAL presence probe ran and answered "absent
@@ -1659,6 +1899,7 @@ mod tests {
                 Substituter::new(pool.clone(), None).with_http_client(sandbox_http()),
             ),
             pool,
+            path_fanout: 1,
         }
     }
 
@@ -2852,6 +3093,7 @@ mod tests {
                     .with_stall_window(std::time::Duration::from_secs(1)),
             ),
             pool: db.pool.clone(),
+            path_fanout: 1,
         };
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), async {
             execute_job(&ctx, &seeded.claimed).await.into_outcome()
@@ -3763,10 +4005,12 @@ mod tests {
         });
 
         progress.commit(100, ""); // path A fully processed
-        let cb = progress.per_path(100); // path B starts at base=100
-        cb(120, 200, "u1"); // attempt 1 streams 120 of 200
-        cb(10, 200, "u2"); // stall failover: counter RESET to 10
-        cb(180, 200, "u2"); // attempt 2 catches up past the mark
+        // Path B's ticks arrive base-adjusted (base = 100) as EVENTS
+        // on the driver's stream (path-fold law 6); the driver is the
+        // sole caller, forwarding them here as provisional emissions.
+        progress.emit_provisional(100 + 120, 100 + 200, "u1"); // attempt 1 streams 120 of 200
+        progress.emit_provisional(100 + 10, 100 + 200, "u2"); // stall failover: counter RESET to 10
+        progress.emit_provisional(100 + 180, 100 + 200, "u2"); // attempt 2 catches up past the mark
         progress.commit(300, ""); // path B fully processed
 
         let events = got.lock().unwrap().clone();
@@ -3809,12 +4053,11 @@ mod tests {
             sink.lock().unwrap().push((d, e));
         });
 
-        // Attempt 1: a large partial stream through the per-path
-        // adapter... then the fetch FAILS (no success commit).
-        let p1 = progress.per_path(0);
-        p1(1_000_000, 5_000_000_000, "https://big");
-        p1(4_999_999_999, 5_000_000_000, "https://big");
-        drop(p1);
+        // Attempt 1: a large partial stream's ticks forwarded by the
+        // driver (base = 0)... then the fetch FAILS (no success
+        // commit).
+        progress.emit_provisional(1_000_000, 5_000_000_000, "https://big");
+        progress.emit_provisional(4_999_999_999, 5_000_000_000, "https://big");
 
         // Attempt 2 (a different, smaller path) succeeds: the path's
         // bytes are committed into the job floor.
