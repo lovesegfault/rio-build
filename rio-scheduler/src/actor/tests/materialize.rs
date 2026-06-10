@@ -9932,3 +9932,86 @@ async fn member_join_grows_distinct_listed_jobs() -> TestResult {
     );
     Ok(())
 }
+
+// r[verify sched.materialize.listing-distribution]
+/// live_041 — the steal horizon, SERVER-side (RULED CF-3: no client
+/// steal lane exists): a member that misses its beat past
+/// LISTING_STEAL_HORIZON has its owner slice served to the surviving
+/// callers' normal listings; when it returns, the partition resumes.
+///
+/// Strawman disclosure (TI-4): the steal horizon does not exist
+/// pre-fix, so no pre-fix red is runnable for THIS lane — the
+/// pre-fix behavior is pinned by `rendezvous_listings_are_disjoint_
+/// and_cover`'s recorded identical-heads red (the WO-S3-2 commit-A
+/// protocol precedent). Aging is real-time (5.2 s sleep): load can
+/// only make the silent owner MORE stale, so the assertion direction
+/// cannot flake.
+#[tokio::test]
+async fn stale_owner_slice_enters_the_steal_horizon() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    seed_claimable_jobs(&handle, &store, "rdv-steal", 12).await?;
+
+    let m_a = worker_member("store-steal", 0);
+    let m_b = worker_member("store-steal", 1);
+    // Beat 0: both members announce; beat 1: fresh partition.
+    let _ = list_materialization_jobs_as(&handle, 64, &m_a).await;
+    let _ = list_materialization_jobs_as(&handle, 64, &m_b).await;
+    let slice_a: std::collections::HashSet<Uuid> = list_materialization_jobs_as(&handle, 64, &m_a)
+        .await
+        .iter()
+        .map(|j| j.job_id)
+        .collect();
+    let fresh_b: std::collections::HashSet<Uuid> = list_materialization_jobs_as(&handle, 64, &m_b)
+        .await
+        .iter()
+        .map(|j| j.job_id)
+        .collect();
+    assert!(
+        slice_a.is_disjoint(&fresh_b),
+        "precondition: fresh members are partitioned"
+    );
+    assert!(
+        !slice_a.is_empty(),
+        "precondition: A owns part of the head (12 jobs across 2 members)"
+    );
+
+    // A goes silent past the steal horizon (5 s + slack); B's NEXT
+    // normal listing — same RPC, no flag — includes A's unclaimed
+    // slice.
+    tokio::time::sleep(std::time::Duration::from_millis(5200)).await;
+    let stolen_b: std::collections::HashSet<Uuid> = list_materialization_jobs_as(&handle, 64, &m_b)
+        .await
+        .iter()
+        .map(|j| j.job_id)
+        .collect();
+    assert!(
+        stolen_b.is_superset(&slice_a),
+        "the stale owner's slice enters B's steal horizon (missing: {:?})",
+        slice_a.difference(&stolen_b).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        stolen_b.len(),
+        12,
+        "B's listing = own slice UNION the stale owner's slice = the whole head"
+    );
+
+    // A returns: its next listing re-registers the contact and the
+    // partition resumes — duplication is bounded by owner staleness
+    // (exactly-one-LISTING is deliberately NOT the law; the RESET is).
+    let returned_a: std::collections::HashSet<Uuid> =
+        list_materialization_jobs_as(&handle, 64, &m_a)
+            .await
+            .iter()
+            .map(|j| j.job_id)
+            .collect();
+    let post_b: std::collections::HashSet<Uuid> = list_materialization_jobs_as(&handle, 64, &m_b)
+        .await
+        .iter()
+        .map(|j| j.job_id)
+        .collect();
+    assert!(
+        returned_a.is_disjoint(&post_b),
+        "partition resumes once the owner returns"
+    );
+    Ok(())
+}

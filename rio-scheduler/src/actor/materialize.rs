@@ -47,14 +47,33 @@ impl JobDescriptor {
 pub(super) const RETRY_LATER_DEFAULT_DEFER_SECS: u64 = 5;
 pub(super) const RETRY_LATER_MAX_DEFER_SECS: u64 = 300;
 
+/// live_041 — the steal horizon (OQ-6b-2): a worker that has not
+/// listed within this window has missed its beat, and the jobs it
+/// OWNS under the rendezvous partition are served to every other
+/// caller until it returns (work stealing — duplication bounded by
+/// owner staleness, never asserted away; claims still arbitrate
+/// one-winner, and WO-S6b-1's standing refund + speculation bound
+/// make the contested losses cheap).
+///
+/// Calibration: the beat is the store worker's poll cadence —
+/// `poll_interval_secs` default 1 s, ±20 % jitter, so a healthy IDLE
+/// worker lists at least every ~1.2 s plus RPC/actor slack; 5 s is
+/// four missed beats. A worker mid-walk stops listing for the walk's
+/// duration and trips this ON PURPOSE: it cannot claim while
+/// executing (inline-serial, slots=1), so offering its unclaimed
+/// slice to idle workers is the intended stealing trigger. A
+/// deployment that raises the store's poll interval past this
+/// horizon degrades to broader, more-contested listings (the
+/// pre-live_041 shape) — never to unlisted jobs.
+pub(super) const LISTING_STEAL_HORIZON: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// live_041 — membership TTL (OQ-6b-1): a worker silent past this
 /// bound leaves the contact map entirely — the rendezvous partition
 /// re-keys over the survivors, permanently re-homing the departed
-/// worker's slice (scale-down leaves no residue). A silent worker
-/// still inside this bound keeps owning its slice; the steal horizon
-/// (the companion bound, calibrated against the store's poll beat)
-/// is what serves a missed-beat owner's jobs broadly in the interim —
-/// the degradation direction is always "served more broadly", never
+/// worker's slice (scale-down leaves no residue). Between
+/// [`LISTING_STEAL_HORIZON`] and this bound the silent worker still
+/// OWNS its slice but the steal horizon serves it broadly — the
+/// degradation direction is always "served more broadly", never
 /// "unlisted".
 pub(super) const LISTING_MEMBER_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -782,15 +801,19 @@ impl DagActor {
     /// the live store-worker membership: an identity-bearing caller
     /// (the verified `{pod}-w{n}` instance claim, threaded from the
     /// gRPC chokepoint) is recorded in the tenure-scoped
-    /// [`ListingContacts`] and served exactly the jobs whose
+    /// [`ListingContacts`] and served the jobs whose
     /// [`rendezvous_owner`] it is — disjoint slices by construction,
     /// so N workers advance N slices instead of all racing the same
     /// `ORDER BY created_at` head (the convoy: one winner, N−1 burned
-    /// passes, KEDA scale-out adding racers). The SQL `ORDER BY`
-    /// survives as fairness WITHIN a slice. An instance-less caller
-    /// (full dev mode) contributes no member and is served the
-    /// unpartitioned listing — with no identity-bearing callers the
-    /// behavior is byte-for-byte the pre-partition shape.
+    /// passes, KEDA scale-out adding racers) — UNION the steal
+    /// horizon: jobs whose owner has not listed within
+    /// [`LISTING_STEAL_HORIZON`] (computed at this same site from the
+    /// same membership map; no wire-visible segment distinction, no
+    /// client steal lane — RULED CF-3). The SQL `ORDER BY` survives
+    /// as fairness WITHIN a slice. An instance-less caller (full dev
+    /// mode) contributes no member and is served the unpartitioned
+    /// listing — with no identity-bearing callers the behavior is
+    /// byte-for-byte the pre-partition shape.
     // r[impl sched.materialize.job+2]
     // r[impl sched.materialize.claimability-projection]
     // r[impl sched.materialize.listing-distribution]
@@ -867,15 +890,17 @@ impl DagActor {
 
     // r[impl sched.materialize.listing-distribution]
     /// live_041 — whether THIS caller's listing carries the job: the
-    /// caller's owner slice, derived from the ONE
-    /// [`rendezvous_owner`] source. Instance-less callers and
-    /// memberships without a second live worker serve unpartitioned
-    /// (the dev-mode / solo-worker fallback — today's behavior).
+    /// caller's owner slice UNION the steal horizon, BOTH derived
+    /// from the ONE [`rendezvous_owner`] source and the same
+    /// membership snapshot (no second partition computation exists —
+    /// Q1). Instance-less callers and memberships without a second
+    /// live worker serve unpartitioned (the dev-mode / solo-worker
+    /// fallback — today's behavior).
     fn listing_serves(
         job_id: Uuid,
         caller: Option<&str>,
         members: &[(String, std::time::Instant)],
-        _now: std::time::Instant,
+        now: std::time::Instant,
     ) -> bool {
         let Some(me) = caller else {
             // Instance-less caller (full dev mode): no member, no
@@ -888,7 +913,22 @@ impl DagActor {
             return true;
         }
         match rendezvous_owner(job_id, members.iter().map(|(m, _)| m.as_str())) {
-            Some(owner) => owner == me,
+            Some(owner) if owner == me => true,
+            Some(owner) => {
+                // The steal horizon: the owner has missed its beat —
+                // its slice is served broadly until it returns (the
+                // caller is fresh by construction; the OWNER's age is
+                // what gates). The owner is always in the snapshot
+                // (rendezvous_owner picked it from there), so the
+                // lookup cannot miss; stay total and steal-open if it
+                // ever did (served-more-broadly is the safe
+                // direction).
+                members
+                    .iter()
+                    .find(|(m, _)| m == owner)
+                    .map(|(_, last)| now.duration_since(*last) > LISTING_STEAL_HORIZON)
+                    .unwrap_or(true)
+            }
             // Unreachable (the caller was just recorded), but total:
             // an empty membership serves unpartitioned.
             None => true,
