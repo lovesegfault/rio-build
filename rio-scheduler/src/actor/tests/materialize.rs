@@ -10534,3 +10534,151 @@ async fn snapshot_refreshes_once_per_ttl_and_on_creation_dirty() -> TestResult {
     );
     Ok(())
 }
+
+/// bug_095 — the intake-shield pin (R16): certifies the interleaving
+/// claim the companion-release docs now state — a REDELIVERED,
+/// already-classified RetryLater report reaches neither the deferral
+/// stamp (no second pacing window) nor the kind-blind requeue —
+/// through the production report path (real claim mint, real report
+/// intake, real redelivery; no companion called directly). The
+/// load-bearing shield is `fold_report`'s intake gate
+/// (rio-evidence-kernel): it AckIgnores any report for an inactive or
+/// already-classified attempt. Regression PIN, not a red — the shield
+/// holds today (disclosed; the DEFECT was the prose, quoted
+/// before/after in the commit body).
+#[tokio::test]
+async fn redelivered_retry_later_after_classification_is_inert() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let out = test_store_path("maton-redeliver-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut n = make_node("maton-redeliver");
+    n.expected_output_paths = vec![out.clone()];
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![n], vec![], false).await?;
+    barrier(&handle).await;
+
+    let outcome = handle
+        .query_unchecked(|reply| ActorCommand::PullAssignment {
+            intent_id: "maton-redeliver".into(),
+            auth_intent: Some("maton-redeliver".into()),
+            kind: rio_evidence_kernel::pull::PullKind::Materialization,
+            executor_instance: Some("store-replica-0-w0".into()),
+            claim_nonce: None,
+            confirm_only: false,
+            executor_token_sha256: None,
+            reply,
+            resume_exec_id: None,
+        })
+        .await
+        .expect("actor alive");
+    let assignment = match outcome {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+
+    let retry_later_payload = || crate::actor::pull::PullReportPayload {
+        result: rio_proto::types::BuildResult::default(),
+        peak_memory_bytes: 0,
+        peak_cpu_cores: 0.0,
+        node_name: None,
+        hw_class: None,
+        final_resources: None,
+        final_line_count: 0,
+        materialization_outcome: Some(rio_proto::types::MaterializationOutcome {
+            outcome: Some(
+                rio_proto::types::materialization_outcome::Outcome::RetryLater(
+                    rio_proto::types::materialization_outcome::RetryLater {
+                        detail: "upstream rate-limited".into(),
+                        retry_after_secs: 1,
+                        class: "rate_limited".into(),
+                    },
+                ),
+            ),
+        }),
+    };
+
+    // First delivery: classifies the attempt, stamps the 1 s deferral,
+    // releases + requeues (the legitimate former-holder stamp).
+    let first = handle
+        .query_unchecked(|reply| ActorCommand::ReportPullOutcome {
+            exec_id,
+            auth_intent: Some("maton-redeliver".into()),
+            payload: retry_later_payload(),
+            reply,
+        })
+        .await
+        .expect("actor alive");
+    assert!(first.is_ok(), "first report must consume: {first:?}");
+    barrier(&handle).await;
+    let drv = expect_drv(&handle, "maton-redeliver").await;
+    assert_eq!(drv.status, DerivationStatus::Ready, "requeued once");
+
+    // Let the pacing window LAPSE (the worker's 1 s hint is floored
+    // to RETRY_LATER_DEFAULT_DEFER_SECS = 5 s), then REDELIVER the
+    // identical report. If the redelivery re-ran the companion, it
+    // would stamp a SECOND 5 s window (admission would refuse below)
+    // and re-run the kind-blind requeue.
+    tokio::time::sleep(std::time::Duration::from_millis(5300)).await;
+    let second = handle
+        .query_unchecked(|reply| ActorCommand::ReportPullOutcome {
+            exec_id,
+            auth_intent: Some("maton-redeliver".into()),
+            payload: retry_later_payload(),
+            reply,
+        })
+        .await
+        .expect("actor alive");
+    assert!(
+        second.is_ok(),
+        "the redelivery must be ACK'd inert (idempotent), got {second:?}"
+    );
+    barrier(&handle).await;
+
+    // Zero charges either way (RetryLater is charge-free; the
+    // redelivery must not mint anything).
+    let charges: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM drv_attempts WHERE event_kind = 'attempt'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(charges, 0, "no ledger row from either delivery");
+
+    // Node untouched by the redelivery: still Ready, still claimable.
+    let drv = expect_drv(&handle, "maton-redeliver").await;
+    assert_eq!(
+        drv.status,
+        DerivationStatus::Ready,
+        "the redelivery ran no kind-blind reset"
+    );
+
+    // THE stamp probe: the deferral lapsed BEFORE the redelivery — if
+    // the redelivery had re-stamped defer_until, this claim would
+    // answer NotYetReady for another second. It must DELIVER a fresh
+    // attempt.
+    let reclaim = handle
+        .query_unchecked(|reply| ActorCommand::PullAssignment {
+            intent_id: "maton-redeliver".into(),
+            auth_intent: Some("maton-redeliver".into()),
+            kind: rio_evidence_kernel::pull::PullKind::Materialization,
+            executor_instance: Some("store-replica-1-w0".into()),
+            claim_nonce: None,
+            confirm_only: false,
+            executor_token_sha256: None,
+            reply,
+            resume_exec_id: None,
+        })
+        .await
+        .expect("actor alive");
+    let fresh = match reclaim {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!(
+            "the redelivery must NOT have re-stamped the pacing window \
+             (no second defer); claim after the lapse must deliver, got {other:?}"
+        ),
+    };
+    assert_ne!(
+        fresh.exec_id, assignment.exec_id,
+        "the post-lapse claim is a FRESH attempt, not the classified one"
+    );
+    Ok(())
+}

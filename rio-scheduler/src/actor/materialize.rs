@@ -2706,11 +2706,19 @@ impl DagActor {
 
     /// Settled-close companion #2 of 5: defer (optionally) and release
     /// the claim atomically — the ReArm / RetryLater / Aborted /
-    /// zero-width / coverage-miss composition. bug_220: the defer
-    /// stamp rides the release disposition inside the entry's single
-    /// combined mutation — a redelivered RetryLater from a FORMER
-    /// holder (reachable because `AlreadyResolved` counts as settled)
-    /// is a compare-and-clear miss and stamps nothing.
+    /// zero-width / coverage-miss composition. bug_220 + bug_095 (the
+    /// stamp law, righted): `StaleHolder` — a DIFFERENT live executor
+    /// holds a fresh claim — is the ONLY no-stamp/no-requeue arm;
+    /// `Released` AND `Unclaimed` (former holder / no view entry)
+    /// stamp and requeue BY DESIGN (idempotent redelivery after the
+    /// holder's own release + the level-triggered wedge repair,
+    /// merged_bug_015/307 — see `release_claim_deferring`'s arm
+    /// table). The reason a former holder's REDELIVERED classified
+    /// report cannot reach this code at all is the report-intake
+    /// shield, NOT this disposition: `fold_report`
+    /// (rio-evidence-kernel/src/pull.rs) AckIgnores any report for an
+    /// inactive or already-classified attempt — pinned end-to-end by
+    /// `redelivered_retry_later_after_classification_is_inert`.
     pub(super) async fn companion_release(
         &mut self,
         drv_hash: &DrvHash,
@@ -3023,9 +3031,15 @@ impl DagActor {
     }
 
     /// [`Self::release_claim`] with the optional deferral folded into
-    /// the SAME entry-level disposition-gated mutation (bug_220) — the
-    /// companion's RetryLater window stamps if and only if the
-    /// compare-and-clear did not miss.
+    /// the SAME entry-level disposition-gated mutation (bug_220 +
+    /// bug_095): the companion's RetryLater window stamps on every
+    /// disposition EXCEPT `StaleHolder` — `Unclaimed` (former holder /
+    /// no entry) deliberately stamps and falls through to the
+    /// level-triggered requeue (the merged_bug_015/307 wedge-repair
+    /// law); only a DIFFERENT live holder blocks the stamp.
+    /// Redeliveries of already-classified reports never reach here:
+    /// `fold_report`'s intake gate (rio-evidence-kernel) is the
+    /// load-bearing shield.
     async fn release_claim_with_defer(
         &mut self,
         drv_hash: &DrvHash,
