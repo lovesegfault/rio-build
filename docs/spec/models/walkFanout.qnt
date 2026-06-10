@@ -374,11 +374,11 @@ module walkFanout {
 /// prescription). SUCCESS-ONLY
 /// scope, stated per the val docs: the abort/cancel plane lives in the
 /// base main; the licensed step-back after a FAILED attempt is the
-/// Rust witness plane's W-012c. Commit frames are APPLY BOUNDARIES,
-/// not provisional emissions — their floor-only wire shape is the
-/// recorded out-of-scope cell (divergence (b)), so the provisional
-/// ghosts (provDone/provExpected/lastProvisionalDone) are written by
-/// the stream seat ONLY.
+/// Rust witness plane's W-012c. ALL emissions — stream ticks AND
+/// commit frames — are in the ghosts' quantification: commits emit
+/// the window aggregate (the e2e wire-monotone law; the floor-only
+/// commit shape was machine-refuted by the substitute-progress-e2e
+/// VM assertion at width > 1).
 module walkFanoutProgress {
   /// Declared sizes (narinfo NarSize): path 1 small, path 2 large.
   pure val SIZES = Map(1 -> 2, 2 -> 3)
@@ -476,23 +476,33 @@ module walkFanoutProgress {
   action streamTick = streamSeat(false)
 
   /// The success-witness commit (apply boundary): the floor absorbs
-  /// the path's full size and the path leaves the window. The commit
-  /// frame's floor-only wire shape is OUT of the provisional ghosts'
-  /// scope (divergence (b)) — no provisional var moves here.
+  /// the path's full size, the path leaves the window, and the frame
+  /// EMITS THROUGH THE FOLD — `(floor' + Σ streamed, floor' + Σ
+  /// declared)` over the post-retire window (the e2e wire-monotone
+  /// law: a floor-only frame regressed the wire at width > 1 — the
+  /// machine-refuted divergence (b); empty window ⇒ (floor', floor'),
+  /// the F = 1 shape). Commit frames are IN the emission ghosts'
+  /// quantification.
   action commitP = {
     nondet p = oneOf(inflightP.filter(q => streamedM.get(q) == SIZES.get(q)))
+    val inflight2 = inflightP.exclude(Set(p))
+    val floor2 = floorP + SIZES.get(p)
+    val sumStreamed2 = inflight2.fold(0, (acc, q) => acc + streamedM.get(q))
+    val sumDeclared2 = inflight2.fold(0, (acc, q) => acc + SIZES.get(q))
+    val emittedDone = floor2 + sumStreamed2
+    val emittedExpected = floor2 + sumDeclared2
     all {
-      inflightP' = inflightP.exclude(Set(p)),
-      floorP' = floorP + SIZES.get(p),
+      inflightP' = inflight2,
+      floorP' = floor2,
+      provDone' = emittedDone,
+      provExpected' = emittedExpected,
+      provValid' = true,
+      provOutstandingAtEmit' = (sumDeclared2 - sumStreamed2),
+      regressed' = (regressed or (provValid and (emittedDone < lastProvisionalDone))),
+      lastProvisionalDone' = emittedDone,
       pendingP' = pendingP,
       streamedM' = streamedM,
       baseM' = baseM,
-      provDone' = provDone,
-      provExpected' = provExpected,
-      provValid' = provValid,
-      provOutstandingAtEmit' = provOutstandingAtEmit,
-      lastProvisionalDone' = lastProvisionalDone,
-      regressed' = regressed,
     }
   }
 
@@ -520,11 +530,11 @@ module walkFanoutProgress {
   // ── holds (P7 single-proposition leaves; each owes a falsify lane
   // in calibration/walkfanout-progress-base-capture.qnt) ─────────────
 
-  /// merged_bug_012 / W-012a's model half: NO provisional emission
-  /// renders complete while the window holds outstanding declared
-  /// work — done == expected only when Σ streamed == Σ declared at
-  /// the emission instant (success-only trace scope; commit frames
-  /// are apply boundaries outside this quantification).
+  /// merged_bug_012 / W-012a's model half: NO emission (stream tick
+  /// OR commit frame) renders complete while the window holds
+  /// outstanding declared work — done == expected only when
+  /// Σ streamed == Σ declared at the emission instant (success-only
+  /// trace scope).
   val noFalseCompletion = or {
     not(provValid),
     provOutstandingAtEmit == 0,
@@ -532,9 +542,9 @@ module walkFanoutProgress {
   }
 
   /// merged_bug_012 / W-012b's model half (the oscillation leaf): the
-  /// provisional done sequence never regresses on a success-only
-  /// trace — cross-sibling interleave cannot move the wire pair
-  /// backwards (apply boundaries excluded by construction: commits
-  /// write no provisional ghost).
+  /// emitted done sequence — stream ticks AND commit frames — never
+  /// regresses on a success-only trace: cross-sibling interleave
+  /// cannot move the wire pair backwards and an apply boundary cannot
+  /// dip it (the e2e resProgress-monotone law).
   val emittedDoneNeverRegresses = not(regressed)
 }

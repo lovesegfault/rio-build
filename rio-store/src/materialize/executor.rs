@@ -270,13 +270,22 @@ impl<F: Fn(u64, u64, &str) + Send + Sync + 'static> MonotoneProgress<F> {
     }
 
     /// The SUCCESS WITNESS (bug_087): fold a fully-processed prefix
-    /// into the job floor and emit the completed tick. The only
-    /// mutation site of job-level progress state.
-    fn commit(&self, completed_total: u64, uri: &str) {
+    /// into the job floor and emit the commit frame. The only
+    /// mutation site of job-level progress state. merged_bug_012 (the
+    /// e2e wire-monotone law): the frame carries the WINDOW AGGREGATE
+    /// `(done, expected)` — `(floor' + Σ streamed, floor' + Σ
+    /// declared)` over the post-retire window — so a commit landing
+    /// while siblings still stream cannot regress the wire below the
+    /// prior provisional (the floor-only pair did exactly that at
+    /// width > 1: the committed sibling's streamed bytes left the
+    /// fold AND the bare floor dropped the survivors' bytes). With an
+    /// empty window the aggregate degenerates to `(floor', floor')` —
+    /// the F = 1 shape, byte-identical.
+    fn commit(&self, completed_total: u64, done: u64, expected: u64, uri: &str) {
         let prev = self
             .committed_floor
             .fetch_max(completed_total, std::sync::atomic::Ordering::SeqCst);
-        let (d, e) = clamp_progress(prev, completed_total, completed_total);
+        let (d, e) = clamp_progress(prev.max(completed_total), done, expected);
         (self.on_progress)(d, e, uri);
     }
 
@@ -585,7 +594,13 @@ async fn execute_job_inner(
                         // floor; driver-serial cumulative, fetch_max
                         // underneath, adapter clamp law untouched.
                         completed_bytes = completed_bytes.saturating_add(nar_size);
-                        progress.commit(completed_bytes, "");
+                        // merged_bug_012: the commit frame carries the
+                        // window aggregate — wire-monotone at any
+                        // width; (floor', floor') when the window is
+                        // empty (the F = 1 shape).
+                        let (commit_done, commit_expected) =
+                            window_progress.aggregate(completed_bytes);
+                        progress.commit(completed_bytes, commit_done, commit_expected, "");
                         // merged_bug_003: dedup at ENQUEUE — closure
                         // diamonds under pool contention admit the
                         // shared reference exactly once.
@@ -1111,6 +1126,22 @@ impl WindowProgress {
     /// AbortGrade). Subsequent ticks from it are ignored.
     fn retire(&mut self, path: &str) {
         self.in_flight.remove(path);
+    }
+
+    /// The fold's aggregate over the CURRENT window (no tick): the
+    /// commit-frame pair `(floor + Σ streamed, floor + Σ declared)`.
+    /// Empty window ⇒ `(floor, floor)` — the F = 1 commit shape.
+    fn aggregate(&self, floor: u64) -> (u64, u64) {
+        let (sum_streamed, sum_declared) = self
+            .in_flight
+            .values()
+            .fold((0u64, 0u64), |(s, d), (ps, pd)| {
+                (s.saturating_add(*ps), d.saturating_add(*pd))
+            });
+        (
+            floor.saturating_add(sum_streamed),
+            floor.saturating_add(sum_declared),
+        )
     }
 }
 
@@ -3985,28 +4016,22 @@ mod tests {
             evs.iter().any(|(_, _, u)| !u.is_empty()),
             "provisional ticks flowed"
         );
-        // W-012b over the PROVISIONAL subsequence: `done` is
+        // W-012b over the FULL emission sequence: `done` is
         // non-decreasing — cross-sibling oscillation is
-        // unrepresentable. Commit frames (uri == \"\") are APPLY
-        // BOUNDARIES, allowed steps by the law (they emit the
-        // floor-only pair — the recorded divergence (b): commit-frame
-        // shape is out of defect scope); the boundary's effect on the
-        // next provisional is sign-checked separately below.
+        // unrepresentable AND commit frames carry the window
+        // aggregate, so an apply boundary cannot dip the wire either
+        // (the e2e resProgress-monotone law the VM scenario pins;
+        // the earlier provisional-only weakening was refuted by that
+        // machine evidence and is RESTORED to the stronger form).
         let mut prev = 0u64;
-        for (i, (d, _, u)) in evs.iter().enumerate() {
-            if u.is_empty() {
-                continue;
-            }
+        for (i, (d, _, _)) in evs.iter().enumerate() {
             assert!(
                 *d >= prev,
-                "emitted done regressed at provisional frame {i}: {prev} -> {d} \
-                 (the cross-sibling oscillation cell; trace: {evs:?})"
+                "emitted done regressed at frame {i}: {prev} -> {d} \
+                 (the cross-sibling oscillation / commit-dip cell; trace: {evs:?})"
             );
             prev = *d;
         }
-        // Across an apply boundary the provisional aggregate never
-        // shrinks either (retire trades streamed-bytes for the
-        // committed nar size): the FULL provisional run is monotone.
         let (final_done, final_expected, _) = evs.last().expect("non-empty");
         assert_eq!(
             final_done, final_expected,
@@ -4780,14 +4805,14 @@ mod tests {
             sink.lock().unwrap().push((d, e));
         });
 
-        progress.commit(100, ""); // path A fully processed
+        progress.commit(100, 100, 100, ""); // path A fully processed (empty window)
         // Path B's ticks arrive base-adjusted (base = 100) as EVENTS
         // on the driver's stream (path-fold law 6); the driver is the
         // sole caller, forwarding them here as provisional emissions.
         progress.emit_provisional(100 + 120, 100 + 200, "u1"); // attempt 1 streams 120 of 200
         progress.emit_provisional(100 + 10, 100 + 200, "u2"); // stall failover: counter RESET to 10
         progress.emit_provisional(100 + 180, 100 + 200, "u2"); // attempt 2 catches up past the mark
-        progress.commit(300, ""); // path B fully processed
+        progress.commit(300, 300, 300, ""); // path B fully processed (empty window)
 
         let events = got.lock().unwrap().clone();
         assert_eq!(
@@ -4837,7 +4862,7 @@ mod tests {
 
         // Attempt 2 (a different, smaller path) succeeds: the path's
         // bytes are committed into the job floor.
-        progress.commit(1_200, "");
+        progress.commit(1_200, 1_200, 1_200, "");
 
         let last = *emitted.lock().unwrap().last().unwrap();
         assert_eq!(
