@@ -1449,9 +1449,17 @@ pub async fn spot_price_poller(
         // in steady-state: `fold_spot_poll` touches only `price`;
         // `interrupt_housekeeping` writes only `lambda`/`node_count`;
         // the actor's `handle_ack_spawned_intents` writes only `cells`.
-        // Edge-reload is owned by interrupt_housekeeping; both other
-        // writers gate on `was_leader` so the disjointness holds across
-        // the lease-acquire reload too.
+        // Edge-reload is owned by interrupt_housekeeping. THIS poller
+        // gates on `was_leader` (the check above); for how each OTHER
+        // writer stays reload-safe, see the merged_bug_046 narration
+        // on `handle_ack_spawned_intents` in actor/snapshot.rs — the
+        // Ack `cells` write applies UNCONDITIONALLY and survives the
+        // reload via `carry_catalog`'s union merge. `was_leader`-
+        // gating is NOT what makes a writer reload-safe (false for
+        // non-monotone fields, which the `*self = fresh` reload
+        // clobbers); per the edge-reload-ownership doc on
+        // `spot_price_poller`, never re-derive the writer/gate
+        // matrix here in prose.
         let cells = cost.read().cells.clone();
         let result = poll_spot_once(&ec2, &cells).await;
         let now = now_epoch();
