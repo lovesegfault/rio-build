@@ -1557,4 +1557,106 @@ mod bw8s1_budget {
         let _ = put_hold.await;
         Ok(())
     }
+
+    /// Batch holder driver: send output-0 metadata + chunk, return the
+    /// open tx so the test controls the rest of the stream.
+    pub fn batch_holder_stream(
+        info: rio_proto::types::PathInfo,
+        chunk1: Vec<u8>,
+    ) -> (
+        mpsc::Sender<rio_proto::types::PutPathBatchRequest>,
+        ReceiverStream<rio_proto::types::PutPathBatchRequest>,
+    ) {
+        use rio_proto::types::PutPathBatchRequest;
+        let mut info = info;
+        let (tx, rx) = mpsc::channel(8);
+        // Trailer-only mode: zero the metadata hash/size (the trailer
+        // itself is never sent -- the client stops).
+        info.nar_hash = Vec::new();
+        info.nar_size = 0;
+        tx.try_send(PutPathBatchRequest {
+            output_index: 0,
+            inner: Some(PutPathRequest {
+                msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
+                    info: Some(info),
+                })),
+            }),
+        })
+        .expect("fresh channel");
+        tx.try_send(PutPathBatchRequest {
+            output_index: 0,
+            inner: Some(PutPathRequest {
+                msg: Some(put_path_request::Msg::NarChunk(chunk1)),
+            }),
+        })
+        .expect("fresh channel");
+        (tx, ReceiverStream::new(rx))
+    }
+
+    // W8-F (R16 statement): batch-holder residency through the
+    // production batch stream path -- with it, the holder census has
+    // zero unenveloped rows and the slot theorem's quantifier domain
+    // is the complete census.
+    /// RED pre-fix (run at the WO-S1-1 tip a721c259d -- batch was the
+    /// one remaining unbounded holder): see the commit body for the
+    /// verbatim left/right transcript.
+    #[tokio::test]
+    async fn stopped_client_batch_releases_by_the_ingest_deadline() -> TestResult {
+        let db = TestDb::new(&MIGRATOR).await;
+        let budget_bytes = 64 * 1024usize;
+        let service = Svc::new(db.pool.clone())
+            .with_nar_budget(budget_bytes)
+            .with_nar_ingest_envelope(shrunk_cfg());
+        let budget = service.nar_bytes_budget().clone();
+        let (client, _server) = spawn_store_server(service).await?;
+
+        let nar: Vec<u8> = rio_test_support::fixtures::pseudo_random_bytes(19, 8192);
+        let info = make_path_info_for_nar(&test_store_path("bw8s1-r5"), &nar);
+        let (tx, rx) = batch_holder_stream(info.into(), nar.clone());
+        let mut put_client = client.clone();
+        let put = tokio::spawn(async move { put_client.put_path_batch(rx).await });
+        let wait = tokio::time::Instant::now() + Duration::from_secs(5);
+        while budget.available_permits() != budget_bytes - nar.len() {
+            assert!(
+                tokio::time::Instant::now() < wait,
+                "batch holder never acquired; available={}",
+                budget.available_permits()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Silence (stream open, tx alive). The ingest envelope
+        // (~2.5s shrunk) must abort the holder typed within 10x.
+        let res = tokio::time::timeout(Duration::from_secs(25), put).await;
+        let Ok(joined) = res else {
+            panic!(
+                "left: batch permits retained at 10x the ingest envelope \
+                 (stopped-but-connected batch client; available_permits == \
+                 {} of {budget_bytes}; cross-output held_permits has no \
+                 clock) / right: typed resource_exhausted abort; permits \
+                 restored <= bound",
+                budget.available_permits()
+            );
+        };
+        let status = joined
+            .unwrap()
+            .expect_err("stopped batch client must be aborted typed");
+        assert_eq!(
+            status.code(),
+            tonic::Code::ResourceExhausted,
+            "typed ingest-envelope abort expected, got {status:?}"
+        );
+        // Permits restored <= bound.
+        let restore = tokio::time::Instant::now() + Duration::from_secs(5);
+        while budget.available_permits() != budget_bytes {
+            assert!(
+                tokio::time::Instant::now() < restore,
+                "permits not restored: {} of {budget_bytes}",
+                budget.available_permits()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(tx);
+        Ok(())
+    }
 }

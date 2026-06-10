@@ -123,6 +123,15 @@ impl StoreServiceImpl {
             }};
         }
 
+        // The batch persist spans (phase-2 staging + phase-3 commit)
+        // run while the handler frame holds EVERY output's permits —
+        // the same Q-108 black-hole channel as `finalize_single`'s
+        // persist (rio-common's S3 client ships no TimeoutConfig).
+        // Each span gets its own envelope clock over the bytes the
+        // permits actually cover: per-output buffered length for a
+        // stage, the batch total for the commit.
+        let total_buffered: u64 = outputs.values().map(|a| a.nar_data.len() as u64).sum();
+
         // --- Phase 2: per-output validation + placeholder insert ---
         for (idx, accum) in outputs.iter_mut() {
             let ctx = format!("output {idx}");
@@ -179,21 +188,40 @@ impl StoreServiceImpl {
 
             info.store_path_hash = accum.store_path_hash.clone();
             let nar_data = std::mem::take(&mut accum.nar_data);
-            match self.stage_nar_for_batch(info, claim, nar_data).await {
-                Ok(p) => accum.staged = Some(p),
-                Err(e) => bail!(e),
+            let stage_env = crate::substitute::NarHoldEnvelope::for_declared(
+                nar_data.len() as u64,
+                self.nar_ingest_envelope.hold_stall_window,
+                self.nar_ingest_envelope.hold_floor_rate,
+            );
+            let staging = self.stage_nar_for_batch(info, claim, nar_data);
+            match tokio::time::timeout(stage_env.remaining(), staging).await {
+                Ok(Ok(p)) => accum.staged = Some(p),
+                Ok(Err(e)) => bail!(e),
+                Err(_) => bail!(Status::resource_exhausted(format!(
+                    "{ctx}: NAR-budget hold exceeded its staging envelope \
+                     ({:?}); permits released — retry",
+                    stage_env.hold_budget()
+                ))),
             }
         }
 
         let resolved_signer = self.resolve_batch_signer(auth.tenant_id).await;
 
         // --- Phase 3: ONE transaction, N completions, one commit ---
-        let created = match self
-            .commit_batch(&mut outputs, resolved_signer.as_ref())
-            .await
-        {
-            Ok(c) => c,
-            Err(e) => bail!(e),
+        let commit_env = crate::substitute::NarHoldEnvelope::for_declared(
+            total_buffered,
+            self.nar_ingest_envelope.hold_stall_window,
+            self.nar_ingest_envelope.hold_floor_rate,
+        );
+        let committing = self.commit_batch(&mut outputs, resolved_signer.as_ref());
+        let created = match tokio::time::timeout(commit_env.remaining(), committing).await {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => bail!(e),
+            Err(_) => bail!(Status::resource_exhausted(format!(
+                "PutPathBatch: NAR-budget hold exceeded its commit envelope \
+                 ({:?}); permits released — retry",
+                commit_env.hold_budget()
+            ))),
         };
 
         for g in placeholder_guards {
@@ -222,6 +250,18 @@ impl StoreServiceImpl {
         // need to fill it in order regardless of stream arrival order.
         let mut outputs: BTreeMap<u32, OutputAccum> = BTreeMap::new();
         let mut held_permits = Vec::new();
+        // Hold axis (merged_bug_021's batch sibling; WO-S1-2a — the
+        // one holder the WO-S1-1 census left unenveloped): once this
+        // handler HOLDS budget permits, its cross-output stream
+        // residency is bounded by the same typed ingest envelope as
+        // PutPath's (armed at the FIRST granted permit; untimed
+        // zero-holding backpressure before that). A stopped-but-
+        // connected batch client previously pinned every output's
+        // permits forever — batch claims are as watchdog-exempt as
+        // single-path ones. Expiry aborts typed (`ResourceExhausted`);
+        // phase-1 has no placeholders by design, so there is nothing
+        // to clean up.
+        let mut hold_envelope: Option<crate::substitute::NarHoldEnvelope> = None;
         // Cumulative charged permits across ALL outputs (NOT raw bytes
         // — `accumulate_chunk` floors each chunk at MIN_NAR_CHUNK_CHARGE,
         // so tracking raw bytes undercounts up to 256× and a tiny-chunk
@@ -234,7 +274,28 @@ impl StoreServiceImpl {
         // r[impl store.put.nar-bytes-budget+4]
         let mut total_charged: u64 = 0;
 
-        while let Some(msg) = stream.message().await? {
+        loop {
+            let read = stream.message();
+            let next = match &hold_envelope {
+                // Zero-holding: untimed backpressure (exempt).
+                None => read.await?,
+                // Holding: the stream read is under the envelope clock.
+                Some(env) => match tokio::time::timeout(env.remaining(), read).await {
+                    Ok(r) => r?,
+                    Err(_) => {
+                        return Err(Status::resource_exhausted(format!(
+                            "PutPathBatch: NAR-budget hold exceeded its ingest \
+                             envelope ({:?} for the {}-byte charged-permit cap); \
+                             permits released — retry",
+                            env.hold_budget(),
+                            env.bytes_basis()
+                        )));
+                    }
+                },
+            };
+            let Some(msg) = next else {
+                break;
+            };
             let idx = msg.output_index;
             // Bound output count. Checked on every message because the
             // highest index can arrive at any point in the stream.
@@ -293,6 +354,13 @@ impl StoreServiceImpl {
                         .accumulate_chunk(&mut accum.nar_data, &mut accum.hasher, &chunk, &ctx)
                         .await?;
                     held_permits.push(permit);
+                    // First grant: the hold begins — arm the envelope.
+                    if hold_envelope.is_none() {
+                        hold_envelope = Some(crate::substitute::NarHoldEnvelope::for_ingest_cap(
+                            self.nar_ingest_envelope.hold_stall_window,
+                            self.nar_ingest_envelope.hold_floor_rate,
+                        ));
+                    }
                 }
                 put_path_request::Msg::Trailer(t) => {
                     if accum.trailer.is_some() {
