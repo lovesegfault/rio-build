@@ -298,15 +298,35 @@ struct ResumeEntry {
     standing: SlotStanding,
 }
 
-/// bug_034 — the typed split of a ledger entry's two roles. The
-/// transition lattice is MONOTONE by construction: `Charged` is
-/// minted by [`ResumeLedger::begin_fresh_claim`] (the sole fresh-mint
-/// authority) and moves to `CredentialOnly` on the FIRST answered
-/// NotYetReady ([`ResumeLedger::note_answered_not_ready`], both
-/// lanes); nothing moves back — a later LOST response cannot
-/// re-charge (a storm requires fresh mints, which always charge).
-/// Authoritative answers (Deliver / Gone / mint-disproving rejection)
-/// remove the entry, ending both roles at once.
+/// bug_034 → merged_bug_014 — the typed split of a ledger entry's two
+/// roles, now OUTCOME-DERIVED: the standing follows the entry's LAST
+/// presentation outcome through the one transition law
+/// ([`standing_effect`]), because the kernel mints on ANY claiming
+/// presentation of a pending job (rio-evidence-kernel/src/pull.rs:
+/// the (Materialization, Pending{parked:false}) arm answers
+/// DeliverNew for Queued/Ready regardless of presented nonce; the
+/// scheduler's confirm screen gates only `confirm_only` probes
+/// before `mint_and_deliver` persists the mint). Therefore
+/// `Charged` ⇔ "the entry's last claiming presentation is
+/// unanswered", whichever lane presented:
+///
+///   - a fresh mint starts Charged (the mint authority stamps it);
+///   - an ANSWERED NotYetReady refunds (→ `CredentialOnly`) — the
+///     answer proves non-holdership for THIS presentation;
+///   - a claiming presentation left UNANSWERED (either lane)
+///     re-charges (→ `Charged`) — the scheduler may have committed a
+///     mint bound to this worker behind the lost response;
+///   - authoritative answers (Deliver / Gone / mint-disproving
+///     rejection) remove the entry, ending both roles at once.
+///
+/// The pre-fix "monotone, never back" axiom claimed a storm requires
+/// fresh mints "which always charge" — falsified by the kernel's own
+/// admission table: a CredentialOnly entry's lost RESUME response
+/// left a possibly-live mint with zero charge, and a 1-slot worker
+/// over-bound while the orphan aged into the charged establishment
+/// sweep. The anti-storm law survives in its true form: charges
+/// arise only from presentations, and presentations are pass-bounded
+/// ([`RESUME_PRESENTATIONS_PER_PASS`]).
 ///
 /// Recorded residual (Q4/TOCTOU): a `CredentialOnly` entry whose
 /// original pull DID mint server-side can later Deliver through the
@@ -463,14 +483,37 @@ impl ResumeLedger {
         charged * 2 >= self.entries.len()
     }
 
-    /// bug_034 — the FIRST answered NotYetReady refunds the slot:
-    /// `Charged` → `CredentialOnly`, never back (monotone — see
-    /// [`SlotStanding`]). Idempotent on an already-refunded entry; a
-    /// no-op when the job has no entry (cannot happen from the two
-    /// call sites, both of which hold a live entry by construction).
+    /// bug_034 / merged_bug_014 — an answered NotYetReady refunds the
+    /// slot: `Charged` → `CredentialOnly` (the answer proves
+    /// non-holdership for this presentation; the credential
+    /// survives). Idempotent on an already-refunded entry; a no-op
+    /// when the job has no entry.
     fn note_answered_not_ready(&mut self, job_id: Uuid) {
         if let Some(e) = self.entries.iter_mut().find(|e| e.job_id == job_id) {
             e.standing = SlotStanding::CredentialOnly;
+        }
+    }
+
+    /// merged_bug_014 — a claiming presentation left UNANSWERED
+    /// re-charges the slot: the scheduler may have committed a mint
+    /// bound to this worker behind the lost response (the kernel
+    /// mints on ANY claiming presentation of a pending job, whatever
+    /// nonce it carries). Idempotent on an already-Charged entry; a
+    /// no-op when the job has no entry.
+    fn note_unanswered_presentation(&mut self, job_id: Uuid) {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.job_id == job_id) {
+            e.standing = SlotStanding::Charged;
+        }
+    }
+
+    /// merged_bug_014 — apply one [`StandingEffect`] (the output of
+    /// the [`standing_effect`] transition law) to the entry.
+    fn apply_standing(&mut self, job_id: Uuid, effect: StandingEffect) {
+        match effect {
+            StandingEffect::Resolve => self.resolve(job_id),
+            StandingEffect::Refund => self.note_answered_not_ready(job_id),
+            StandingEffect::Recharge => self.note_unanswered_presentation(job_id),
+            StandingEffect::Keep => {}
         }
     }
 
@@ -579,6 +622,82 @@ enum PullAnswer {
     /// the skew clears); the FRESH arm resolves (its gates run
     /// pre-mint, so nothing can be pending behind the refusal).
     RejectedAuth,
+}
+
+/// merged_bug_014 — which lane issued a presentation (the standing
+/// law's second axis): a FRESH mint, a claiming RESUME of a live
+/// credential, or a non-minting confirm PROBE past full slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresentationLane {
+    Fresh,
+    ResumeClaiming,
+    // The companion commit wires the probe dispatch past full slots;
+    // the law and its table are total from the start (the table test
+    // already exercises the lane).
+    #[cfg_attr(not(test), expect(dead_code))]
+    Probe,
+}
+
+/// merged_bug_014 — what one presentation outcome does to the
+/// entry's standing/lifecycle (applied via
+/// [`ResumeLedger::apply_standing`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StandingEffect {
+    /// Authoritative settle: the entry leaves the ledger.
+    Resolve,
+    /// Answered non-holdership: `Charged` → `CredentialOnly`.
+    Refund,
+    /// A claiming presentation went unanswered: → `Charged`.
+    Recharge,
+    /// No standing movement (auth skew on a surviving credential,
+    /// shutdown, a probe's inconclusive outcomes).
+    Keep,
+}
+
+// r[impl sched.materialize.claim-resume]
+/// merged_bug_014 — THE standing-transition law: ONE total function
+/// over (presentation lane × [`PullAnswer`]) — the closure-set
+/// carrier (R14/R15: rustc's exhaustiveness is the census; a new
+/// answer variant or lane fails this build). Both claiming lanes and
+/// the probe lane dispatch through it; the per-arm rationale:
+///
+///   - `Deliver` resolves on claiming lanes (the claim IS the
+///     settle); on a PROBE it proves my mint is LIVE — stay
+///     `Charged`, the payload is DISCARDED (the probe is a standing
+///     oracle, never an execution source);
+///   - `Gone` resolves everywhere (the job settled without us);
+///   - `NotYetReady` refunds everywhere — screened (the confirm
+///     screen converting a would-be mint) or genuine, both prove
+///     non-holdership for this presentation;
+///   - `Unanswered` re-charges CLAIMING lanes (a mint may have
+///     committed behind the lost response); a probe's loss proves
+///     nothing either way (the screen blocks probe mints) — Keep;
+///   - `RejectedDisproving` resolves everywhere (the request shape
+///     can never mint — nothing is pending behind it);
+///   - `RejectedAuth` resolves only the FRESH lane (its gates run
+///     pre-mint, so THIS pull was the only one that could have
+///     minted — merged_bug_074); on resume/probe it judges the
+///     PRESENTATION, not the original mint — Keep;
+///   - `Shutdown` keeps (the pass is abandoned unobserved).
+fn standing_effect(lane: PresentationLane, answer: &PullAnswer) -> StandingEffect {
+    match (lane, answer) {
+        (PresentationLane::Fresh | PresentationLane::ResumeClaiming, PullAnswer::Deliver(_)) => {
+            StandingEffect::Resolve
+        }
+        (PresentationLane::Probe, PullAnswer::Deliver(_)) => StandingEffect::Keep,
+        (_, PullAnswer::Gone) => StandingEffect::Resolve,
+        (_, PullAnswer::NotYetReady) => StandingEffect::Refund,
+        (PresentationLane::Fresh | PresentationLane::ResumeClaiming, PullAnswer::Unanswered) => {
+            StandingEffect::Recharge
+        }
+        (PresentationLane::Probe, PullAnswer::Unanswered) => StandingEffect::Keep,
+        (_, PullAnswer::RejectedDisproving) => StandingEffect::Resolve,
+        (PresentationLane::Fresh, PullAnswer::RejectedAuth) => StandingEffect::Resolve,
+        (PresentationLane::ResumeClaiming | PresentationLane::Probe, PullAnswer::RejectedAuth) => {
+            StandingEffect::Keep
+        }
+        (_, PullAnswer::Shutdown) => StandingEffect::Keep,
+    }
 }
 
 /// Issue one bounded `PullAssignment` and classify the outcome.
@@ -957,45 +1076,39 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             // re-deliver); never a confirm probe.
             confirm_only: false,
         };
-        match pull_once(transport, shutdown, req, &entry.drv_hash).await {
-            PullAnswer::Shutdown => finish!(),
-            PullAnswer::Deliver(assignment) => {
-                info!(drv_hash = %entry.drv_hash, exec_id = %assignment.exec_id,
-                      "lost-response claim resumed via nonce (rule-4b)");
-                pass.deliveries += 1;
-                ledger.resolve(entry.job_id);
-                claimed.push(ClaimedJob::bind(
-                    ExpectedJob {
-                        job_id: entry.job_id,
-                        drv_hash: entry.drv_hash,
-                        tenant_hint: entry.tenant_hint,
-                        origin: entry.origin,
-                    },
-                    &assignment,
-                ));
-            }
-            // Authoritative: the job resolved without us.
-            PullAnswer::Gone => ledger.resolve(entry.job_id),
-            // Parked / raced / stale view: the entry keeps — one
-            // bounded RPC per pass until Gone or delivery; capacity
-            // bounds the total. bug_034: an ANSWER on the resume lane
-            // is the first answer a brownout-era Charged mint ever
-            // got — the slot refunds (Charged→CredentialOnly), the
-            // credential rides on.
-            PullAnswer::NotYetReady => ledger.note_answered_not_ready(entry.job_id),
-            PullAnswer::Unanswered => {}
-            // bug_119 (narrowed by merged_bug_074): a MINT-DISPROVING
-            // refusal resolves the entry — the request shape can
-            // never mint, so nothing is pending behind it.
-            PullAnswer::RejectedDisproving => ledger.resolve(entry.job_id),
-            // merged_bug_074: an auth-layer refusal judges the
-            // PRESENTATION (rotation skew), not the mint the ORIGINAL
-            // unanswered pull may have committed — the entry is the
-            // only rule-4b recovery credential for that mint, so it
-            // SURVIVES (Unanswered disposition: one bounded RPC per
-            // pass; Gone or delivery resolves it once the skew
-            // clears).
-            PullAnswer::RejectedAuth => {}
+        let answer = pull_once(transport, shutdown, req, &entry.drv_hash).await;
+        if matches!(answer, PullAnswer::Shutdown) {
+            finish!();
+        }
+        // merged_bug_014 — the ONE transition law settles the
+        // standing for every arm (per-arm rationale at
+        // [`standing_effect`]); the claiming-lane highlights:
+        //   Gone / RejectedDisproving resolve (authoritative);
+        //   NotYetReady refunds (bug_034 — the credential rides on:
+        //     parked / raced / stale view / the post-mint TOCTOU
+        //     arm; one bounded RPC per pass until Gone or delivery);
+        //   Unanswered RE-CHARGES (the lost response may hide a
+        //     committed mint — the refuted monotone axiom's edge);
+        //   RejectedAuth keeps (merged_bug_074: rotation skew judges
+        //     the presentation, not the original mint — the entry is
+        //     the only rule-4b recovery credential, so it survives).
+        ledger.apply_standing(
+            entry.job_id,
+            standing_effect(PresentationLane::ResumeClaiming, &answer),
+        );
+        if let PullAnswer::Deliver(assignment) = answer {
+            info!(drv_hash = %entry.drv_hash, exec_id = %assignment.exec_id,
+                  "lost-response claim resumed via nonce (rule-4b)");
+            pass.deliveries += 1;
+            claimed.push(ClaimedJob::bind(
+                ExpectedJob {
+                    job_id: entry.job_id,
+                    drv_hash: entry.drv_hash,
+                    tenant_hint: entry.tenant_hint,
+                    origin: entry.origin,
+                },
+                &assignment,
+            ));
         }
     }
     // bug_385: the listing window is DECOUPLED from the claim budget.
@@ -1220,52 +1333,44 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             }
             FutilityEvidence::Inconclusive => {}
         }
-        match answer {
-            // SIGTERM mid-pass: return what was already claimed so the
-            // caller can abort/report those attempts under the grace.
-            PullAnswer::Shutdown => finish!(),
-            PullAnswer::Deliver(assignment) => {
-                pass.deliveries += 1;
-                ledger.resolve(job_id);
-                // merged_bug_026 (fresh-claim sibling site): the same
-                // Pending-arm race exists between list and claim — the
-                // listed job can resolve and a successor mint answer
-                // this pull. The wire binding is authoritative here too.
-                claimed.push(ClaimedJob::bind(
-                    ExpectedJob {
-                        job_id,
-                        drv_hash: descriptor.drv_hash,
-                        tenant_hint: Uuid::parse_str(&descriptor.tenant_id).ok(),
-                        origin: descriptor.origin,
-                    },
-                    &assignment,
-                ));
-            }
-            // AUTHORITATIVE no-mint answers on a FRESH claim resolve
-            // the credential: Gone (job settled without us) and BOTH
-            // rejection flavors (bug_119 / merged_bug_074 — the fresh
-            // pull's gates run before any mint, so even an auth-layer
-            // refusal disproves a mint HERE: this very pull was the
-            // only one that could have minted).
-            PullAnswer::Gone | PullAnswer::RejectedDisproving | PullAnswer::RejectedAuth => {
-                ledger.resolve(job_id)
-            }
-            // merged_bug_096: NotYetReady is NOT proof of no-mint —
-            // the scheduler's post-mint TOCTOU arm answers it AFTER
-            // the durable mint committed with this nonce. The
-            // credential survives (one bounded resume RPC per pass
-            // until Gone or delivery; cap bounds the total) AND the
-            // PASS budget refunds (bug_034: the standing transition
-            // Charged→CredentialOnly IS the refund — under no
-            // refactor may this arm drop or revert the entry, the
-            // Q4/TOCTOU rider). Starving the walk behind a raced
-            // head would undo bug_385's in-pass skip; the FS-4
-            // speculation bound, not the charge, is what keeps the
-            // refunded pass from storming the ledger.
-            PullAnswer::NotYetReady => ledger.note_answered_not_ready(job_id),
-            // The answer never arrived: the entry STAYS — the next
-            // pass resumes it directly with the nonce.
-            PullAnswer::Unanswered => {}
+        // SIGTERM mid-pass: return what was already claimed so the
+        // caller can abort/report those attempts under the grace.
+        if matches!(answer, PullAnswer::Shutdown) {
+            finish!();
+        }
+        // merged_bug_014 — the ONE transition law settles the
+        // standing (per-arm rationale at [`standing_effect`]); the
+        // fresh-lane highlights:
+        //   Gone AND BOTH rejection flavors resolve (bug_119 /
+        //     merged_bug_074 — the fresh pull's gates run before any
+        //     mint, so even an auth-layer refusal disproves a mint
+        //     HERE: this very pull was the only one that could have
+        //     minted);
+        //   NotYetReady refunds, the credential survives
+        //     (merged_bug_096: the post-mint TOCTOU arm answers it
+        //     AFTER the durable mint committed with this nonce —
+        //     under no refactor may this transition drop or revert
+        //     the entry, the Q4/TOCTOU rider; the FS-4 speculation
+        //     bound, not the charge, keeps the refunded pass from
+        //     storming the ledger);
+        //   Unanswered keeps the mint Charged (the next pass resumes
+        //     it directly with the nonce).
+        ledger.apply_standing(job_id, standing_effect(PresentationLane::Fresh, &answer));
+        if let PullAnswer::Deliver(assignment) = answer {
+            pass.deliveries += 1;
+            // merged_bug_026 (fresh-claim sibling site): the same
+            // Pending-arm race exists between list and claim — the
+            // listed job can resolve and a successor mint answer
+            // this pull. The wire binding is authoritative here too.
+            claimed.push(ClaimedJob::bind(
+                ExpectedJob {
+                    job_id,
+                    drv_hash: descriptor.drv_hash,
+                    tenant_hint: Uuid::parse_str(&descriptor.tenant_id).ok(),
+                    origin: descriptor.origin,
+                },
+                &assignment,
+            ));
         }
     }
     // merged_bug_005 — the latch observes the completed pass (the
@@ -1723,6 +1828,9 @@ mod tests {
         /// never resolves) — with `start_paused` tokio time the
         /// bounded await elapses instantly, modeling a lost response.
         hang_next_pulls: u32,
+        /// merged_bug_014 R2: hang exactly the Nth pull (1-based; the
+        /// mixed answered-then-lost pass shape). 0 = disabled.
+        hang_at_pull: u32,
     }
 
     impl MockTransport {
@@ -1741,6 +1849,7 @@ mod tests {
                 seen_pull_requests: Vec::new(),
                 seen_list_limits: Vec::new(),
                 hang_next_pulls: 0,
+                hang_at_pull: 0,
             }
         }
     }
@@ -1765,6 +1874,10 @@ mod tests {
         ) -> Result<PullAssignmentResponse, tonic::Status> {
             self.pull_calls += 1;
             self.seen_pull_requests.push(req);
+            if self.hang_at_pull != 0 && self.pull_calls == self.hang_at_pull {
+                // Exactly this pull's answer is lost.
+                std::future::pending::<()>().await;
+            }
             if self.hang_next_pulls > 0 {
                 self.hang_next_pulls -= 1;
                 // Lost response: the request reached the wire (it is
@@ -2871,14 +2984,17 @@ mod tests {
         assert!(tie.cap_refusal_is_outage(), "16/16 tie: keep the warn");
     }
 
-    /// bug_034 — the standing transition is MONOTONE: a NotYetReady
-    /// answer refunds (Charged→CredentialOnly); a LATER lost response
-    /// on the resume lane does not re-charge. Pass 1: fresh mint for A
-    /// answers NotYetReady (refunded). Pass 2: A's resume pull is
-    /// LOST — the entry survives, still CredentialOnly, and the fresh
-    /// budget stays free (B claims).
+    /// merged_bug_014 — the OUTCOME-DERIVED standing (the bug_034
+    /// monotone-axiom pin, inverted with the law): pass 1's answered
+    /// NotYetReady refunds (the credential survives); pass 2's LOST
+    /// resume presentation RE-CHARGES — the kernel may have minted
+    /// behind the lost response, so the fresh budget is pinned and B
+    /// is NOT minted (pre-merged_bug_014 this very flow over-bound:
+    /// the lost resume left zero charge and B claimed alongside the
+    /// possibly-live orphan). The retired assertion lives in this
+    /// test's history; the rationale is in the introducing commit.
     #[tokio::test(start_paused = true)]
-    async fn lost_resume_response_does_not_recharge() {
+    async fn lost_resume_response_recharges_and_pins_the_budget() {
         let job_a = descriptor(1);
         let job_b = descriptor(2);
         let mut t = MockTransport::new(
@@ -2893,25 +3009,157 @@ mod tests {
         let mut latch = ListFailureLatch::default();
         let mut fut = ConversionFutilityLatch::default();
         let tok = token();
-        let inst = instance("monotone-w");
+        let inst = instance("recharge-pin-w");
         let c1 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
         assert!(c1.is_empty());
         assert_eq!(ledger.charged_len(), 0, "pass 1: answered → refunded");
 
-        // Pass 2: the resume pull for A is lost; B's fresh pull
-        // delivers.
+        // Pass 2: the resume pull for A is lost — the slot re-charges
+        // and the pass cannot mint B (the honest-beat gate withholds
+        // the listing outright once the budget is pinned mid-pass...
+        // here the re-charge lands DURING the resume lane, so the
+        // gate sees it before any listing).
         t.hang_next_pulls = 1;
         t.pulls = vec![Ok(deliver("exec-b", "/nix/store/bbb-two.drv"))].into();
         let c2 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
-        assert_eq!(
-            c2.len(),
-            1,
-            "a lost RESUME response cannot re-charge the refunded entry — \
-             the fresh budget stays free and B claims"
+        assert!(
+            c2.is_empty(),
+            "the lost resume re-charged the slot — B must NOT be minted \
+             over the possibly-live orphan"
         );
-        assert_eq!(c2[0].drv_hash, job_b.drv_hash);
         assert_eq!(ledger.len(), 1, "A's credential still rides");
-        assert_eq!(ledger.charged_len(), 0, "still CredentialOnly (monotone)");
+        assert_eq!(
+            ledger.charged_len(),
+            1,
+            "Charged again: the LAST claiming presentation is unanswered"
+        );
+    }
+
+    /// merged_bug_014 — THE transition table, total over
+    /// (lane × PullAnswer) by compiler census (R15): the alphabet
+    /// vector's completeness is FORCED — `pull_answer_variant_index`
+    /// is a wildcard-free match (a new variant fails the build), and
+    /// the bijection assertion below fails if the vector omits one.
+    /// Each row's expected effect is the law's reviewable table.
+    #[test]
+    fn standing_transition_total_over_pull_answers() {
+        const PULL_ANSWER_VARIANTS: usize = 7;
+        fn pull_answer_variant_index(a: &PullAnswer) -> usize {
+            match a {
+                PullAnswer::Deliver(_) => 0,
+                PullAnswer::Gone => 1,
+                PullAnswer::NotYetReady => 2,
+                PullAnswer::Shutdown => 3,
+                PullAnswer::Unanswered => 4,
+                PullAnswer::RejectedDisproving => 5,
+                PullAnswer::RejectedAuth => 6,
+            }
+        }
+        let alphabet: Vec<PullAnswer> = vec![
+            PullAnswer::Deliver(Box::default()),
+            PullAnswer::Gone,
+            PullAnswer::NotYetReady,
+            PullAnswer::Shutdown,
+            PullAnswer::Unanswered,
+            PullAnswer::RejectedDisproving,
+            PullAnswer::RejectedAuth,
+        ];
+        let mut seen = [false; PULL_ANSWER_VARIANTS];
+        for a in &alphabet {
+            seen[pull_answer_variant_index(a)] = true;
+        }
+        assert!(
+            seen.iter().all(|s| *s) && alphabet.len() == PULL_ANSWER_VARIANTS,
+            "the census vector must cover every PullAnswer variant exactly"
+        );
+
+        use PresentationLane as L;
+        use StandingEffect as E;
+        for a in &alphabet {
+            let idx = pull_answer_variant_index(a);
+            let expected: [(L, E); 3] = match idx {
+                // Deliver: settle on claiming lanes; a probe delivery
+                // proves the mint is live (Keep + discard).
+                0 => [
+                    (L::Fresh, E::Resolve),
+                    (L::ResumeClaiming, E::Resolve),
+                    (L::Probe, E::Keep),
+                ],
+                1 => [
+                    (L::Fresh, E::Resolve),
+                    (L::ResumeClaiming, E::Resolve),
+                    (L::Probe, E::Resolve),
+                ],
+                2 => [
+                    (L::Fresh, E::Refund),
+                    (L::ResumeClaiming, E::Refund),
+                    (L::Probe, E::Refund),
+                ],
+                3 => [
+                    (L::Fresh, E::Keep),
+                    (L::ResumeClaiming, E::Keep),
+                    (L::Probe, E::Keep),
+                ],
+                4 => [
+                    (L::Fresh, E::Recharge),
+                    (L::ResumeClaiming, E::Recharge),
+                    (L::Probe, E::Keep),
+                ],
+                5 => [
+                    (L::Fresh, E::Resolve),
+                    (L::ResumeClaiming, E::Resolve),
+                    (L::Probe, E::Resolve),
+                ],
+                6 => [
+                    (L::Fresh, E::Resolve),
+                    (L::ResumeClaiming, E::Keep),
+                    (L::Probe, E::Keep),
+                ],
+                _ => unreachable!("variant census bound above"),
+            };
+            for (lane, want) in expected {
+                assert_eq!(
+                    standing_effect(lane, a),
+                    want,
+                    "cell ({lane:?}, variant {idx})"
+                );
+            }
+        }
+    }
+
+    /// merged_bug_014 green pin: an auth-layer rejection of a RESUME
+    /// presentation leaves the standing UNTOUCHED — the rejection is
+    /// pre-mint by construction (merged_bug_074's law), so THIS
+    /// presentation provably did not mint: no re-charge, no refund,
+    /// the credential survives the skew.
+    #[tokio::test(start_paused = true)]
+    async fn rejected_auth_presentation_leaves_standing_untouched() {
+        let job_a = descriptor(1);
+        let mut t = MockTransport::new(
+            vec![Ok(listing(vec![job_a.clone()]))],
+            vec![
+                Ok(not_yet_ready()),
+                Err(tonic::Status::permission_denied("rotation skew")),
+            ],
+            vec![],
+        );
+        let mut ledger = ResumeLedger::default();
+        let mut latch = ListFailureLatch::default();
+        let mut fut = ConversionFutilityLatch::default();
+        let tok = token();
+        let inst = instance("skew-standing-w");
+        let p1 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+        assert!(p1.is_empty());
+        assert_eq!(ledger.charged_len(), 0, "answered: CredentialOnly");
+        let p2 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+        assert!(p2.is_empty());
+        assert_eq!(ledger.len(), 1, "the credential survives the skew");
+        assert_eq!(
+            ledger.charged_len(),
+            0,
+            "auth skew judges the presentation, not the mint: standing \
+             untouched (no re-charge)"
+        );
     }
 
     /// (d) The BC-1 wire obligation: every claim carries
@@ -3933,5 +4181,70 @@ mod tests {
                 "mirrored-constant sanity: horizon below TTL"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // merged_bug_014 — outcome-derived charge + bounded presentations
+    // -----------------------------------------------------------------
+
+    /// merged_bug_014 RED 1 (hole 1 — the resume-lane re-charge edge).
+    /// Proposition certified (R16): a claiming presentation left
+    /// UNANSWERED re-charges the slot — Charged derives from "the
+    /// entry's LAST claiming presentation is unanswered", regardless
+    /// of which lane presented (the kernel mints on ANY claiming
+    /// presentation of a pending job; the scheduler's confirm screen
+    /// gates only confirm probes). Pre-fix the monotone axiom left
+    /// the entry CredentialOnly with zero charge: a 1-slot worker
+    /// over-bound while a possibly-live orphan attempt existed, and
+    /// the orphan aged into the charged establishment sweep against a
+    /// healthy worker.
+    #[tokio::test(start_paused = true)]
+    async fn resume_unanswered_presentation_recharges_the_slot() {
+        let job_a = descriptor(1);
+        let job_b = descriptor(2);
+        let mut t = MockTransport::new(
+            vec![
+                Ok(listing(vec![job_a.clone()])),
+                Ok(listing(vec![job_b.clone()])),
+            ],
+            vec![
+                // Pass 1: A's fresh mint answers NotYetReady — the
+                // production CredentialOnly path (contest lost; the
+                // TOCTOU arm may still have minted server-side).
+                Ok(not_yet_ready()),
+                // Pass 2 (pre-fix only): B's fresh mint delivers — the
+                // over-bind this red exists to kill.
+                Ok(deliver("exec-overbind", "/nix/store/overbind.drv")),
+            ],
+            vec![],
+        );
+        let mut ledger = ResumeLedger::default();
+        let mut latch = ListFailureLatch::default();
+        let mut fut = ConversionFutilityLatch::default();
+        let tok = token();
+        let inst = instance("recharge-w");
+        let p1 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+        assert!(p1.is_empty());
+        assert_eq!(ledger.len(), 1, "A holds a credential");
+        assert_eq!(ledger.charged_len(), 0, "answered contest: refunded");
+
+        // Pass 2: A's resume presentation TIMES OUT (a mint may have
+        // committed server-side, bound to this worker).
+        t.hang_next_pulls = 1;
+        let p2 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+        assert_eq!(
+            ledger.charged_len(),
+            1,
+            "left: charged_len()==0 and the fresh lane mints another job \
+             this pass (over-bind at slots=1, orphan abandoned to the \
+             establishment sweep) / right: charged_len()==1, fresh lane \
+             blocked until the orphan answers"
+        );
+        assert!(
+            p2.is_empty(),
+            "the re-charged orphan pins the budget — no fresh claim may \
+             ride this pass (got {:?})",
+            p2.iter().map(|j| j.drv_hash.as_str()).collect::<Vec<_>>()
+        );
     }
 }
