@@ -4106,15 +4106,23 @@ counters (#(refs.metric)("rio_scheduler_lease_rebound_total"),
 #(refs.metric)("rio_scheduler_lease_acquired_total") counts acquire edges
 only.
 
-#r("sched.lease.holder-evidenced-lose")[
+#r("sched.lease.holder-evidenced-lose+2")[
   A renew 409 observed while this replica believes it leads MUST NOT run the
   lose transition by itself: the 409 proves only resourceVersion movement,
   whose mover may be this replica's own cancelled-then-committed write or a
   foreign non-protocol patch. The loop MUST defer exactly one round, keeping
-  belief, the hold, and the cancelled-write ledger intact, and the completed-
-  round lose transition MUST require holder evidence: a completed read
-  resolving to another holder, or a second consecutive believing 409
-  exhausting the one-round deferral.
+  belief, the hold, and the cancelled-write ledger intact. The lose
+  transition MUST require holder evidence: a completed READ resolving the
+  lease to a holder other than this replica --- on whichever arm observes it
+  (a Completed round's standby resolution or an act-failed round's completed
+  read) --- or a second consecutive believing 409 exhausting the one-round
+  deferral. And EVERY believing completed read MUST resolve a pending
+  deferral: a read resolving holder=us clears it through the observation
+  funnel (own-commit evidence, frozen content, and moved-content-without-
+  ledger alike), a read resolving holder=other clears it through the
+  evidenced lose --- so two 409s with any completed read between them are
+  never consecutive. A completed read observing ABSENCE re-baselines only:
+  absence is deletion-axis evidence, not holder evidence.
 ]
 
 The one-round bound is what preserves the fence/steal separation: an

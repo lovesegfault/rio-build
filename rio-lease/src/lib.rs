@@ -1204,6 +1204,7 @@ fn observe_held_while_believing<H: LeaseHooks>(
 /// vs eliminating spurious DAG/outbox wipes on own-write races.
 /// Formal: leaderElection.qnt `loseRequiresHolderEvidence` invariant +
 /// falsify twin (lease-085-blind-conflict-lose).
+#[derive(Debug)]
 enum CompletedLoseEvidence {
     /// A completed read resolved Standby: the apiserver named another
     /// holder (or the observed record says the holder is fresh and it
@@ -1236,6 +1237,162 @@ enum ContentBaseline {
     /// A completed read observed a lease with these holder-authored
     /// `renewTime` bytes (None when the field itself was absent).
     Present { renew_time: Option<String> },
+}
+
+/// Who the act-failed completed read says holds the lease (bug_002
+/// cell census). `Other` covers BOTH a foreign holderIdentity and a
+/// released lease (holderIdentity absent): the loop's fact is
+/// [`election::FetchFacts::holder_is_us`], and either way the lease
+/// provably does not resolve to us — the evidenced-lose reading the
+/// AnotherHolderObserved witness admits ("the lease provably no
+/// longer resolves to us").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HolderCell {
+    Us,
+    Other,
+}
+
+impl HolderCell {
+    /// Every variant — consumed by the census product test; pinned by
+    /// the total match in [`route_act_failed_read`] (a new variant
+    /// fails that match's exhaustiveness before this list can go
+    /// stale).
+    #[cfg(any(test, kani))]
+    const ALL: [Self; 2] = [Self::Us, Self::Other];
+
+    fn of(facts: &election::FetchFacts) -> Self {
+        if facts.holder_is_us {
+            Self::Us
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// Whether the read's holder-authored `renewTime` moved against the
+/// three-state [`ContentBaseline`] (merged_bug_164 mapping preserved:
+/// Present compares the bytes; Absent → a lease NAMING US is our POST
+/// committing, so it reads Moved — the holder cell carries the naming
+/// requirement; NoCompletedRead can prove nothing → Frozen).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentCell {
+    Moved,
+    Frozen,
+}
+
+impl ContentCell {
+    #[cfg(any(test, kani))]
+    const ALL: [Self; 2] = [Self::Moved, Self::Frozen];
+
+    fn of(baseline: &ContentBaseline, facts: &election::FetchFacts) -> Self {
+        let moved = match baseline {
+            ContentBaseline::Present { renew_time: prev } => prev != &facts.renew_time,
+            ContentBaseline::Absent => true,
+            ContentBaseline::NoCompletedRead => false,
+        };
+        if moved { Self::Moved } else { Self::Frozen }
+    }
+}
+
+/// Whether the cancelled-write ledger holds an unconsumed in-doubt
+/// write (bug_002 cell census). Derived read-only — only the
+/// EvidenceResolve executor consumes the entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LedgerCell {
+    Armed,
+    Empty,
+}
+
+impl LedgerCell {
+    #[cfg(any(test, kani))]
+    const ALL: [Self; 2] = [Self::Armed, Self::Empty];
+
+    fn of(unconfirmed: &Option<UnconfirmedPut>) -> Self {
+        if unconfirmed.is_some() {
+            Self::Armed
+        } else {
+            Self::Empty
+        }
+    }
+}
+
+/// What the act-failed arm MUST do with a completed read — the closed
+/// action alphabet (bug_002). There is deliberately NO no-action
+/// variant for believing cells: `ObserveOnly` is reachable only when
+/// `!believes` (post-fence reads, where the deferral latch is
+/// structurally clear — the `:on_believing_conflict` gate sets it
+/// only while believing and every fence/lose clears it), so "an arm
+/// that runs no transition on a believing completed read" is
+/// unrepresentable by the alphabet, not a per-cell review item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActFailedAction {
+    /// Own-commit evidence: consume the ledger, stamp the blind clock
+    /// at the LEDGER anchor, fence-gated (re-)entry, funnel — exactly
+    /// the pre-routing evidence leg (merged_bug_122/164/180 semantics
+    /// byte-preserved). Routed for Us x Moved x Armed in BOTH belief
+    /// states: the executor's `!believes` branch IS the documented
+    /// self-heal re-acquire.
+    EvidenceResolve,
+    /// A completed read of a lease we hold with nothing to consume
+    /// (frozen content, or moved content with an empty ledger): route
+    /// through THE observe-completed-read body, which resolves a
+    /// pending deferral structurally. NO blind stamp, NO ledger
+    /// consume — frozen content stamps NOTHING
+    /// (sched.lease.cancelled-write).
+    FunnelResolve,
+    /// The read completed and the lease does not resolve to us: run
+    /// the full evidenced lose edge (the same transition a Completed
+    /// Standby resolution runs). Leaving the cell latched keeps a
+    /// resolved question marked unresolved; clearing without losing
+    /// would let belief survive a provably-foreign lease.
+    EvidencedLose,
+    /// Not believing and nothing to consume: record the baseline
+    /// only. The latch is invariantly clear here.
+    ObserveOnly,
+}
+
+// r[impl sched.lease.holder-evidenced-lose+2]
+/// Total routing law for a believing/standby act-failed COMPLETED
+/// read (bug_002): every cell of the `believes x Holder x Content x
+/// Ledger` product names its action — no wildcard arms, so rustc
+/// exhaustiveness IS the census generator (a new cell variant fails
+/// compilation here before any review can miss it). Pure so the kani
+/// routing proof and the product census test fold it directly.
+fn route_act_failed_read(
+    believes: bool,
+    holder: HolderCell,
+    content: ContentCell,
+    ledger: LedgerCell,
+) -> ActFailedAction {
+    use ActFailedAction as A;
+    use ContentCell as C;
+    use HolderCell as H;
+    use LedgerCell as L;
+    match (believes, holder, content, ledger) {
+        // Own-commit evidence (both belief states; the executor's
+        // !believes branch is the fence-gated self-heal re-acquire).
+        (true, H::Us, C::Moved, L::Armed) | (false, H::Us, C::Moved, L::Armed) => {
+            A::EvidenceResolve
+        }
+        // Believing read of a lease we hold, nothing to consume: the
+        // funnel resolves (clears a pending deferral structurally).
+        (true, H::Us, C::Moved, L::Empty)
+        | (true, H::Us, C::Frozen, L::Armed)
+        | (true, H::Us, C::Frozen, L::Empty) => A::FunnelResolve,
+        // Believing read that does not name us: evidenced lose.
+        (true, H::Other, C::Moved, L::Armed)
+        | (true, H::Other, C::Moved, L::Empty)
+        | (true, H::Other, C::Frozen, L::Armed)
+        | (true, H::Other, C::Frozen, L::Empty) => A::EvidencedLose,
+        // Not believing, no evidence: baseline only.
+        (false, H::Us, C::Moved, L::Empty)
+        | (false, H::Us, C::Frozen, L::Armed)
+        | (false, H::Us, C::Frozen, L::Empty)
+        | (false, H::Other, C::Moved, L::Armed)
+        | (false, H::Other, C::Moved, L::Empty)
+        | (false, H::Other, C::Frozen, L::Armed)
+        | (false, H::Other, C::Frozen, L::Empty) => A::ObserveOnly,
+    }
 }
 
 pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
@@ -1569,7 +1726,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                     }
                     (None, true) => {
                         // ---- Lose-or-defer ----
-                        // r[impl sched.lease.holder-evidenced-lose]
+                        // r[impl sched.lease.holder-evidenced-lose+2]
                         // The lose edge demands a CompletedLoseEvidence
                         // witness (see its doc + the SIGNED Q3 block):
                         // a completed read naming another holder, or an
@@ -1736,103 +1893,168 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                 // (merged_bug_180; the foreign-rv companion test pins
                 // this direction alongside the frozen-rv one).
                 if let Some(f) = &facts {
-                    // Content movement against the three-state baseline
-                    // (merged_bug_164): Present compares the bytes;
-                    // Absent→a lease naming us is our POST committing
-                    // (the outer holder_is_us carries the naming
-                    // requirement); NoCompletedRead can prove nothing.
-                    let content_moved = match &content_baseline {
-                        ContentBaseline::Present { renew_time: prev } => prev != &f.renew_time,
-                        ContentBaseline::Absent => true,
-                        ContentBaseline::NoCompletedRead => false,
-                    };
-                    if f.holder_is_us
-                        && content_moved
-                        && let Some(led) = unconfirmed.take()
-                    {
-                        blind.stamp(led.anchor);
-                        // merged_bug_122: the stamp is unconditional
-                        // (the evidence is real and the ledger is
-                        // consumed) but the ACQUIRE is fence-gated. A
-                        // ledger anchor already past SELF_FENCE_AFTER
-                        // at consumption time makes the acquire
-                        // provably futile — the trailing
-                        // maybe_self_fence in this same arm would
-                        // re-fence it before the next await, churning
-                        // hooks/marks/recovery once per round of a
-                        // slow-commit brownout.
-                        let anchor_age = blind.blind_for(fence_now());
-                        if anchor_age > SELF_FENCE_AFTER {
-                            info!(
-                                ?anchor_age,
-                                "own-commit evidence consumed, but its anchor is already \
+                    // bug_002: EVERY completed act-failed read routes
+                    // through the total cell law — the product census
+                    // and the kani routing proof pin that no believing
+                    // read maps to a no-transition action (pre-fix,
+                    // only the Us x Moved x Armed cell ran transitions
+                    // and the other believing cells leaked a pending
+                    // 409 deferral into a false exhaustion).
+                    let action = route_act_failed_read(
+                        standing.believes(),
+                        HolderCell::of(f),
+                        ContentCell::of(&content_baseline, f),
+                        LedgerCell::of(&unconfirmed),
+                    );
+                    // The re-baseline is the match's VALUE: the arm
+                    // cannot record this read's content without
+                    // consuming the routing verdict (the same coupling
+                    // as the acquire arm's bound transition count).
+                    content_baseline = match action {
+                        ActFailedAction::EvidenceResolve => {
+                            let led = unconfirmed.take().expect(
+                                "EvidenceResolve is routed only for an armed ledger \
+                             (route_act_failed_read is total; census + kani pinned)",
+                            );
+                            blind.stamp(led.anchor);
+                            // merged_bug_122: the stamp is unconditional
+                            // (the evidence is real and the ledger is
+                            // consumed) but the ACQUIRE is fence-gated. A
+                            // ledger anchor already past SELF_FENCE_AFTER
+                            // at consumption time makes the acquire
+                            // provably futile — the trailing
+                            // maybe_self_fence in this same arm would
+                            // re-fence it before the next await, churning
+                            // hooks/marks/recovery once per round of a
+                            // slow-commit brownout.
+                            let anchor_age = blind.blind_for(fence_now());
+                            if anchor_age > SELF_FENCE_AFTER {
+                                info!(
+                                    ?anchor_age,
+                                    "own-commit evidence consumed, but its anchor is already \
                                  past the fence deadline — staying fenced (an acquire \
                                  here would be re-fenced this same arm)"
-                            );
-                        } else if !standing.believes() {
-                            // A self-fence inside the mid-band window
-                            // already ran the lose edge; the evidence
-                            // proves the apiserver still (or again)
-                            // names us holder, so re-enter through the
-                            // ordinary acquire edge with the FETCHED
-                            // transition count — the same-count case is
-                            // the documented same-epoch re-acquire
-                            // (generation fetch_max no-op, in-flight
-                            // work survives). The bump-confirmation is
-                            // deliberately NOT run here: confirmation
-                            // stays a completed-round property
-                            // (sched.recovery.bump-confirm), and
-                            // pre-fix this regime fenced outright —
-                            // strictly worse than a gated recovery.
-                            let new_gen = state.on_acquire(f.transitions);
-                            info!(
-                                generation = new_gen,
-                                holder = %cfg.holder_id,
-                                "own-commit evidence (holder=us, renewTime moved) restored \
-                                 leadership belief after an abandoned write"
-                            );
-                            marks_dirty.mark();
-                            hooks.on_acquire();
-                            // Counts as a Leading observation: the read
-                            // is apiserver-authoritative about the hold.
-                            // Routed THROUGH the funnel (merged_bug_114)
-                            // — the rebound comparison no-ops on the
-                            // just-recorded count, and the ObservedHeld
-                            // witness keeps a funnel-skipping sibling
-                            // consumer untypeable.
-                            observe_held_while_believing(
-                                &state,
-                                &mut standing,
-                                &marks_dirty,
-                                &hooks,
-                                &cfg.holder_id,
-                                f.transitions,
-                            );
-                        } else {
-                            // Still believing: this is a completed read
-                            // of a lease we hold — the SAME facts the
-                            // Leading renew round consumes, so it routes
-                            // through the SAME observe-completed-read
-                            // body. A foreign term that completed inside
-                            // the observation gap (moved count) rebounds
-                            // here exactly as it would on a Completed
-                            // round; pre-fix this leg skipped the
-                            // comparison and the term was never repaired
-                            // (no round Completes in the reads-complete/
-                            // acts-fail regime, and the evidence
-                            // re-stamps defeat the self-fence).
-                            observe_held_while_believing(
-                                &state,
-                                &mut standing,
-                                &marks_dirty,
-                                &hooks,
-                                &cfg.holder_id,
-                                f.transitions,
-                            );
+                                );
+                            } else if !standing.believes() {
+                                // A self-fence inside the mid-band window
+                                // already ran the lose edge; the evidence
+                                // proves the apiserver still (or again)
+                                // names us holder, so re-enter through the
+                                // ordinary acquire edge with the FETCHED
+                                // transition count — the same-count case is
+                                // the documented same-epoch re-acquire
+                                // (generation fetch_max no-op, in-flight
+                                // work survives). The bump-confirmation is
+                                // deliberately NOT run here: confirmation
+                                // stays a completed-round property
+                                // (sched.recovery.bump-confirm), and
+                                // pre-fix this regime fenced outright —
+                                // strictly worse than a gated recovery.
+                                let new_gen = state.on_acquire(f.transitions);
+                                info!(
+                                    generation = new_gen,
+                                    holder = %cfg.holder_id,
+                                    "own-commit evidence (holder=us, renewTime moved) restored \
+                                     leadership belief after an abandoned write"
+                                );
+                                marks_dirty.mark();
+                                hooks.on_acquire();
+                                // Counts as a Leading observation: the read
+                                // is apiserver-authoritative about the hold.
+                                // Routed THROUGH the funnel (merged_bug_114)
+                                // — the rebound comparison no-ops on the
+                                // just-recorded count, and the ObservedHeld
+                                // witness keeps a funnel-skipping sibling
+                                // consumer untypeable.
+                                observe_held_while_believing(
+                                    &state,
+                                    &mut standing,
+                                    &marks_dirty,
+                                    &hooks,
+                                    &cfg.holder_id,
+                                    f.transitions,
+                                );
+                            } else {
+                                // Still believing: this is a completed read
+                                // of a lease we hold — the SAME facts the
+                                // Leading renew round consumes, so it routes
+                                // through the SAME observe-completed-read
+                                // body. A foreign term that completed inside
+                                // the observation gap (moved count) rebounds
+                                // here exactly as it would on a Completed
+                                // round; pre-fix this leg skipped the
+                                // comparison and the term was never repaired
+                                // (no round Completes in the reads-complete/
+                                // acts-fail regime, and the evidence
+                                // re-stamps defeat the self-fence).
+                                observe_held_while_believing(
+                                    &state,
+                                    &mut standing,
+                                    &marks_dirty,
+                                    &hooks,
+                                    &cfg.holder_id,
+                                    f.transitions,
+                                );
+                            }
+                            ContentBaseline::Present {
+                                renew_time: f.renew_time.clone(),
+                            }
                         }
-                    }
-                    content_baseline = ContentBaseline::Present {
-                        renew_time: f.renew_time.clone(),
+                        ActFailedAction::FunnelResolve => {
+                            // A completed read of a lease we hold with
+                            // nothing to consume — the SAME facts the
+                            // Leading renew round consumes, so it
+                            // routes through the SAME
+                            // observe-completed-read body (the :1824
+                            // leg's rationale, now total over the
+                            // holder=us row). NO blind stamp, NO
+                            // ledger consume: frozen content stamps
+                            // NOTHING (sched.lease.cancelled-write —
+                            // the funnel stamps standing, never the
+                            // blind clock), and a moved-content read
+                            // with an empty ledger has nothing in
+                            // doubt to confirm.
+                            observe_held_while_believing(
+                                &state,
+                                &mut standing,
+                                &marks_dirty,
+                                &hooks,
+                                &cfg.holder_id,
+                                f.transitions,
+                            );
+                            ContentBaseline::Present {
+                                renew_time: f.renew_time.clone(),
+                            }
+                        }
+                        ActFailedAction::EvidencedLose => {
+                            // The read completed and the lease does
+                            // not resolve to us: the same evidenced
+                            // lose a Completed Standby resolution
+                            // runs (state/hook/marks/standing — the
+                            // standing transition clears any pending
+                            // deferral with it). The ledger is NOT
+                            // consumed and the arming tail below
+                            // still runs: a transmitted steal/renew
+                            // that commits late re-acquires through
+                            // the evidence leg next round (the
+                            // one-round self-heal).
+                            state.on_lose();
+                            warn!(
+                                holder = %cfg.holder_id,
+                                evidence = ?CompletedLoseEvidence::AnotherHolderObserved,
+                                "lost leadership (an act-failed completed read no \
+                                 longer names us as holder)"
+                            );
+                            hooks.on_lose();
+                            marks_dirty.mark();
+                            standing.on_observed_not_leading();
+                            ContentBaseline::Present {
+                                renew_time: f.renew_time.clone(),
+                            }
+                        }
+                        ActFailedAction::ObserveOnly => ContentBaseline::Present {
+                            renew_time: f.renew_time.clone(),
+                        },
                     };
                 } else {
                     // 404→Create round whose POST died unanswered: the
@@ -2048,8 +2270,11 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
 ///   reports exhaustion) and zero hand-clears: every transition that
 ///   resolves the 409's question or ends the belief episode —
 ///   [`Self::on_observed_held`] (the funnel: acquire, still-leading,
-///   and BOTH act-failed resolving legs), [`Self::on_observed_not_leading`]
-///   (lose-with-evidence, standby, step-down), [`Self::on_self_fence`]
+///   and every act-failed resolving cell — `route_act_failed_read`
+///   is TOTAL over the believing product, bug_002),
+///   [`Self::on_observed_not_leading`]
+///   (lose-with-evidence — Completed Standby and the act-failed
+///   EvidencedLose cell — standby, step-down), [`Self::on_self_fence`]
 ///   (all fence sites) — clears it structurally. A future lose or
 ///   resolve edge that skips `LeaseStanding` cannot observe or leak
 ///   the latch; the hand-enumerated-clears shape (a loop-local cleared
@@ -2105,10 +2330,13 @@ impl LeaseStanding {
     /// observation without running the fused rebound comparison does
     /// not typecheck in production code (merged_bug_114; the funnel
     /// doc carries the full claim). Resolves a pending 409 deferral:
-    /// the funnel is the only minting site, so BOTH act-failed
-    /// resolving legs and both Completed believing arms clear the
-    /// latch structurally (merged_bug_002) — a completed read of a
-    /// lease we hold answers the deferred 409's question.
+    /// the funnel is the only minting site, and the act-failed arm's
+    /// total routing (`route_act_failed_read`, bug_002) sends EVERY
+    /// believing holder=us cell here (the holder=other cells lose
+    /// with evidence instead), so all act-failed resolving cells and
+    /// both Completed believing arms clear the latch structurally
+    /// (merged_bug_002) — a completed read of a lease we hold answers
+    /// the deferred 409's question.
     fn on_observed_held(&mut self, _witness: ObservedHeld) {
         self.believes = true;
         self.held_unsuperseded = true;
@@ -2186,7 +2414,10 @@ impl LeaseStanding {
 /// bounded driver loop.
 #[cfg(kani)]
 mod lease_standing_proofs {
-    use super::{ConflictResolution, LeaseStanding};
+    use super::{
+        ActFailedAction, ConflictResolution, ContentCell, HolderCell, LeaseStanding, LedgerCell,
+        route_act_failed_read,
+    };
 
     const MAX_EVENTS: usize = 8;
 
@@ -2256,7 +2487,7 @@ mod lease_standing_proofs {
         );
     }
 
-    /// r[verify sched.lease.holder-evidenced-lose]
+    /// r[verify sched.lease.holder-evidenced-lose+2]
     /// The 409 deferral is episode-scoped (merged_bug_002): over every
     /// bounded event sequence drawn from the standing alphabet
     /// {ObservedHeld, ObservedNotLeading, SelfFence, BelievingConflict}
@@ -2302,6 +2533,67 @@ mod lease_standing_proofs {
                 }
             }
             i += 1;
+        }
+    }
+
+    /// r[verify sched.lease.holder-evidenced-lose+2]
+    /// Routing totality (bug_002): over the FULL `believes x Holder x
+    /// Content x Ledger` product, no believing completed act-failed
+    /// read maps to a no-transition action — and folding the routed
+    /// action's standing transition (resolve -> on_observed_held;
+    /// lose -> on_observed_not_leading) into a machine carrying a
+    /// pending 409 deferral CLEARS the latch for every believing
+    /// cell. Composes with the standing-algebra proof above: routing
+    /// totality (here) x episode-scoped exhaustion (above) = a
+    /// believing completed read can never leave a stale deferral
+    /// behind for a later 409 to exhaust on.
+    #[kani::proof]
+    fn lease_routing_no_believing_read_is_unconsumed() {
+        let believes: bool = kani::any();
+        let holder = if kani::any() {
+            HolderCell::Us
+        } else {
+            HolderCell::Other
+        };
+        let content = if kani::any() {
+            ContentCell::Moved
+        } else {
+            ContentCell::Frozen
+        };
+        let ledger = if kani::any() {
+            LedgerCell::Armed
+        } else {
+            LedgerCell::Empty
+        };
+
+        let action = route_act_failed_read(believes, holder, content, ledger);
+        if believes {
+            assert!(
+                action != ActFailedAction::ObserveOnly,
+                "no believing completed read may run no transition"
+            );
+            // Fold the routed transition through the PRODUCTION
+            // standing machine with a pending same-episode deferral.
+            let mut standing = LeaseStanding::new();
+            standing.on_observed(true);
+            let first = standing.on_believing_conflict();
+            assert!(matches!(first, ConflictResolution::Deferred));
+            match action {
+                ActFailedAction::EvidenceResolve | ActFailedAction::FunnelResolve => {
+                    standing.on_observed(true);
+                }
+                ActFailedAction::EvidencedLose => {
+                    standing.on_observed(false);
+                }
+                ActFailedAction::ObserveOnly => {
+                    // Unreachable: asserted above.
+                    assert!(false, "believing cell routed ObserveOnly");
+                }
+            }
+            assert!(
+                !standing.conflict_deferred,
+                "every believing completed read resolves a pending deferral"
+            );
         }
     }
 }
@@ -4378,7 +4670,7 @@ mod tests {
     /// completed read naming us resolves the deferral as a renew. The
     /// old immediate-lose wiped the DAG/outbox and bounced the leader
     /// marks on what was provably our own write.
-    // r[verify sched.lease.holder-evidenced-lose]
+    // r[verify sched.lease.holder-evidenced-lose+2]
     #[tokio::test(start_paused = true)]
     async fn believing_409_defers_for_holder_evidence_then_renews() {
         let (client, mut park) = RequestPark::new();
@@ -4452,7 +4744,7 @@ mod tests {
     /// what keeps the NeverDual fence/steal separation intact (an
     /// unbounded deferral under every-round CAS bounces would retain
     /// belief past a standby's steal).
-    // r[verify sched.lease.holder-evidenced-lose]
+    // r[verify sched.lease.holder-evidenced-lose+2]
     #[tokio::test(start_paused = true)]
     async fn second_consecutive_believing_409_loses_with_deferral_exhausted() {
         let (client, mut park) = RequestPark::new();
@@ -4514,7 +4806,7 @@ mod tests {
     /// Q3 evidence path: a deferred 409 whose next completed read names
     /// a DIFFERENT holder loses WITH holder evidence — the typed lose
     /// edge the signed decision demands.
-    // r[verify sched.lease.holder-evidenced-lose]
+    // r[verify sched.lease.holder-evidenced-lose+2]
     #[tokio::test(start_paused = true)]
     async fn deferred_409_resolving_to_foreign_holder_loses_with_evidence() {
         let (client, mut park) = RequestPark::new();
@@ -4584,7 +4876,7 @@ mod tests {
     /// the slow clock is the "rounds fast relative to the fence
     /// budget" regime that makes the believing-observe leg reachable
     /// (the wire shapes are untouched: production loop, park JSON).
-    // r[verify sched.lease.holder-evidenced-lose]
+    // r[verify sched.lease.holder-evidenced-lose+2]
     #[tokio::test(start_paused = true)]
     async fn act_failed_own_commit_resolution_clears_the_deferral() {
         let (client, mut park) = RequestPark::new();
@@ -4697,7 +4989,7 @@ mod tests {
     /// so after an evidence re-acquire (a NEW belief episode) the next
     /// believing 409 exhausted immediately from the OLD episode's
     /// latch, violating the ":new belief episode starts clean" law.
-    // r[verify sched.lease.holder-evidenced-lose]
+    // r[verify sched.lease.holder-evidenced-lose+2]
     #[tokio::test(start_paused = true)]
     async fn self_fence_resets_the_deferral_for_the_next_belief_episode() {
         let (client, mut park) = RequestPark::new();
@@ -4824,7 +5116,7 @@ mod tests {
     /// eventually happens is the fence law working, not a 409 edge —
     /// and the surviving ledger's own-commit evidence re-acquires in
     /// the same tick.
-    // r[verify sched.lease.holder-evidenced-lose]
+    // r[verify sched.lease.holder-evidenced-lose+2]
     // r[verify sched.lease.cancelled-write+2]
     #[tokio::test(start_paused = true)]
     async fn zombie_ledger_survives_the_409_for_evidence_reacquire() {
@@ -7128,5 +7420,394 @@ mod tests {
 
         shutdown.cancel();
         loop_task.await.expect("lease loop task exits cleanly");
+    }
+
+    /// bug_002 red #1: a believing act-failed completed read with
+    /// holder=us and FROZEN renewTime must RESOLVE a pending 409
+    /// deferral (the contract's "The NEXT completed read resolves:
+    /// holder=us -> ... run the funnel, which clears"). Pre-fix the
+    /// arm's only transitions sat inside holder_is_us && content_moved
+    /// && ledger-armed, so this cell ran NO transition: the latch
+    /// leaked across the resolving read and a later non-consecutive
+    /// believing 409 exhausted with the factually false "two
+    /// consecutive renew 409s" warn. The fence clock is injected 4x
+    /// slow (the same regime as the own-commit-resolution red: rounds
+    /// fast relative to the fence budget keeps the believing legs
+    /// reachable).
+    // r[verify sched.lease.holder-evidenced-lose+2]
+    #[tokio::test(start_paused = true)]
+    async fn act_failed_frozen_content_read_resolves_the_deferral() {
+        let (client, mut park) = RequestPark::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed() / 4
+            },
+        ));
+
+        // Round 1 (t=0, healthy): acquire; settle the marks PATCH.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 10));
+        let put = park.next().await;
+        put.respond_ok(park_lease_json(Some("us"), 3, 11));
+        settle().await;
+        assert!(state.is_leader(), "healthy round acquires");
+        let patch = park.next().await;
+        patch.respond_ok(pod_ok("us"));
+        settle().await;
+
+        // Round 2 (t=5s): act dies after a completed read — the
+        // cancelled-write ledger arms; baseline stays at renewTime 11.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 11));
+        let put = park.next().await;
+        drop(put);
+        settle().await;
+        assert!(state.is_leader(), "an act failure alone never loses");
+
+        // Round 3 (t=10s): the believing 409 — defers one round.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 11));
+        let put = park.next().await;
+        put.respond_status(409, "Conflict", "the object has been modified");
+        settle().await;
+        assert!(state.is_leader(), "first believing 409 defers");
+
+        // Round 4 (t=15s): act-failed completed read, holder=us,
+        // renewTime UNCHANGED (the round-2 zombie never committed) —
+        // the holder=us read answers the 409's question (the rv-mover
+        // was not a supersession of us; the apiserver still names us).
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 11));
+        let put = park.next().await;
+        drop(put);
+        settle().await;
+        assert!(
+            state.is_leader(),
+            "a frozen-content holder=us read never loses"
+        );
+
+        // Round 5 (t=20s): ANOTHER believing 409 — NOT consecutive
+        // (round 4's completed read sat between them). Must defer.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 11));
+        let put = park.next().await;
+        put.respond_status(409, "Conflict", "the object has been modified");
+        settle().await;
+        assert!(
+            state.is_leader(),
+            "the frozen-content completed read resolved the first 409 — \
+             the second 409 must defer, not exhaust (they were NOT \
+             consecutive)"
+        );
+        assert_eq!(
+            hooks.loses.lock().expect("loses lock").len(),
+            0,
+            "no lose edge: the deferral was resolved between the 409s"
+        );
+
+        shutdown.cancel();
+        for _ in 0..4 {
+            if let Some(req) = park.try_next().await {
+                if req.path.contains("/pods/us") {
+                    req.respond_ok(pod_ok("us"));
+                } else {
+                    req.respond_status(404, "NotFound", "gone");
+                }
+            }
+        }
+        loop_task.await.expect("lease loop exits");
+    }
+
+    /// bug_002 red #1 sibling: the moved-content/EMPTY-ledger cell —
+    /// the zombie-late-commit choreography. An act-failed transmitted
+    /// put arms the ledger; a Completed Leading round then answers the
+    /// unconfirmed question wholesale (ledger cleared); a believing
+    /// 409 defers; the next act-failed read shows holder=us with
+    /// renewTime MOVED but the ledger EMPTY — a completed read of a
+    /// lease we hold, which must resolve the deferral through the
+    /// funnel (no evidence consume: there is nothing to consume).
+    /// Pre-fix the cell sat outside the unconfirmed.take() gate and
+    /// ran nothing; the following 409 exhausted falsely.
+    // r[verify sched.lease.holder-evidenced-lose+2]
+    #[tokio::test(start_paused = true)]
+    async fn act_failed_moved_content_without_ledger_resolves_the_deferral() {
+        let (client, mut park) = RequestPark::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed() / 4
+            },
+        ));
+
+        // Round 1 (t=0): acquire.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 10));
+        let put = park.next().await;
+        put.respond_ok(park_lease_json(Some("us"), 3, 11));
+        settle().await;
+        assert!(state.is_leader(), "healthy round acquires");
+        let patch = park.next().await;
+        patch.respond_ok(pod_ok("us"));
+        settle().await;
+
+        // Round 2 (t=5s): act-failed transmitted put — ledger arms.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 11));
+        let put = park.next().await;
+        drop(put);
+        settle().await;
+
+        // Round 3 (t=10s): Completed Leading — the ledger is answered
+        // wholesale (cleared); baseline = this GET's renewTime (11).
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 11));
+        let put = park.next().await;
+        put.respond_ok(park_lease_json(Some("us"), 3, 12));
+        settle().await;
+        assert!(state.is_leader(), "still leading");
+
+        // Round 4 (t=15s): believing 409 — defers (baseline -> 12).
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 12));
+        let put = park.next().await;
+        put.respond_status(409, "Conflict", "the object has been modified");
+        settle().await;
+        assert!(state.is_leader(), "first believing 409 defers");
+
+        // Round 5 (t=20s): act-failed read, holder=us, renewTime
+        // MOVED (13 != 12) with the ledger EMPTY — the round-2
+        // zombie's late commit landing after round 3 cleared the
+        // ledger. A completed read of a lease we hold: resolves.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 13));
+        let put = park.next().await;
+        drop(put);
+        settle().await;
+        assert!(
+            state.is_leader(),
+            "a moved-content holder=us read (empty ledger) never loses"
+        );
+
+        // Round 6 (t=25s): ANOTHER believing 409 — not consecutive.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 13));
+        let put = park.next().await;
+        put.respond_status(409, "Conflict", "the object has been modified");
+        settle().await;
+        assert!(
+            state.is_leader(),
+            "the moved-no-ledger completed read resolved the first 409 — \
+             the second 409 must defer, not exhaust"
+        );
+        assert_eq!(
+            hooks.loses.lock().expect("loses lock").len(),
+            0,
+            "no lose edge: the deferral was resolved between the 409s"
+        );
+
+        shutdown.cancel();
+        for _ in 0..4 {
+            if let Some(req) = park.try_next().await {
+                if req.path.contains("/pods/us") {
+                    req.respond_ok(pod_ok("us"));
+                } else {
+                    req.respond_status(404, "NotFound", "gone");
+                }
+            }
+        }
+        loop_task.await.expect("lease loop exits");
+    }
+
+    /// bug_002 red #2: a believing act-failed completed read naming a
+    /// FOREIGN holder (here: a released lease — holderIdentity gone,
+    /// the one-round-reachable !holder_is_us shape; decide() steals,
+    /// the PUT dies) must run the EVIDENCED lose edge: the read
+    /// completed and the lease provably no longer resolves to us —
+    /// belief surviving it is a resolved question marked unresolved.
+    /// Pre-fix the cell ran nothing and belief survived. The
+    /// transmitted steal also arms the ledger, so the follow-up
+    /// holder=us + moved read re-acquires through the evidence leg's
+    /// !believes branch — the one-round self-heal pin.
+    // r[verify sched.lease.holder-evidenced-lose+2]
+    #[tokio::test(start_paused = true)]
+    async fn act_failed_foreign_holder_read_runs_the_evidenced_lose() {
+        let (client, mut park) = RequestPark::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed() / 4
+            },
+        ));
+
+        // Round 1 (t=0): acquire.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 10));
+        let put = park.next().await;
+        put.respond_ok(park_lease_json(Some("us"), 3, 11));
+        settle().await;
+        assert!(state.is_leader(), "healthy round acquires");
+        let patch = park.next().await;
+        patch.respond_ok(pod_ok("us"));
+        settle().await;
+
+        // Round 2 (t=5s): the lease no longer names us (released by a
+        // foreign actor); decide() steals; the PUT dies in flight.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(None, 4, 12));
+        let put = park.next().await;
+        drop(put);
+        settle().await;
+
+        assert!(
+            !state.is_leader(),
+            "a believing act-failed completed read that does not name \
+             us as holder must run the evidenced lose edge (belief \
+             survived a provably-foreign lease)"
+        );
+        assert_eq!(
+            hooks.loses.lock().expect("loses lock").len(),
+            1,
+            "exactly one lose edge, with holder evidence"
+        );
+        // The lose dirties the marks; answer the patch.
+        settle().await;
+        if let Some(req) = park.try_next().await {
+            req.respond_ok(pod_ok("us"));
+        }
+        settle().await;
+
+        // Round 3 (t=10s): the transmitted steal COMMITTED — the read
+        // names us with renewTime moved and the ledger armed: the
+        // evidence leg's !believes branch re-acquires (self-heal).
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 4, 13));
+        let put = park.next().await;
+        drop(put);
+        settle().await;
+        assert!(
+            state.is_leader(),
+            "the late steal commit re-acquires through the evidence leg"
+        );
+        assert_eq!(
+            hooks.acquires.lock().expect("acquires lock").len(),
+            2,
+            "lose then re-acquire: the one-round self-heal"
+        );
+
+        shutdown.cancel();
+        for _ in 0..4 {
+            if let Some(req) = park.try_next().await {
+                if req.path.contains("/pods/us") {
+                    req.respond_ok(pod_ok("us"));
+                } else {
+                    req.respond_status(404, "NotFound", "gone");
+                }
+            }
+        }
+        loop_task.await.expect("lease loop exits");
+    }
+
+    // r[verify sched.lease.holder-evidenced-lose+2]
+    /// bug_002 census (Q1-1, machine-derived): iterate the GENERATED
+    /// `believes x Holder x Content x Ledger` product (the ALL consts
+    /// are pinned by route_act_failed_read's own total match — a new
+    /// variant fails compilation there) and assert the routing table
+    /// against an independently written total spec table KEYED by the
+    /// product type, so under-enumeration cannot compile in either
+    /// function. Also pins the alphabet law directly: no believing
+    /// cell routes to ObserveOnly.
+    #[test]
+    fn act_failed_cell_census_total() {
+        use ActFailedAction as A;
+        use ContentCell as C;
+        use HolderCell as H;
+        use LedgerCell as L;
+        // The spec table — the WO routing law, written independently
+        // of route_act_failed_read's grouping (every cell named).
+        fn spec(believes: bool, h: H, c: C, l: L) -> A {
+            match (believes, h, c, l) {
+                (true, H::Us, C::Moved, L::Armed) => A::EvidenceResolve,
+                (false, H::Us, C::Moved, L::Armed) => A::EvidenceResolve,
+                (true, H::Us, C::Moved, L::Empty) => A::FunnelResolve,
+                (true, H::Us, C::Frozen, L::Armed) => A::FunnelResolve,
+                (true, H::Us, C::Frozen, L::Empty) => A::FunnelResolve,
+                (true, H::Other, C::Moved, L::Armed) => A::EvidencedLose,
+                (true, H::Other, C::Moved, L::Empty) => A::EvidencedLose,
+                (true, H::Other, C::Frozen, L::Armed) => A::EvidencedLose,
+                (true, H::Other, C::Frozen, L::Empty) => A::EvidencedLose,
+                (false, H::Us, C::Moved, L::Empty) => A::ObserveOnly,
+                (false, H::Us, C::Frozen, L::Armed) => A::ObserveOnly,
+                (false, H::Us, C::Frozen, L::Empty) => A::ObserveOnly,
+                (false, H::Other, C::Moved, L::Armed) => A::ObserveOnly,
+                (false, H::Other, C::Moved, L::Empty) => A::ObserveOnly,
+                (false, H::Other, C::Frozen, L::Armed) => A::ObserveOnly,
+                (false, H::Other, C::Frozen, L::Empty) => A::ObserveOnly,
+            }
+        }
+        for believes in [false, true] {
+            for h in HolderCell::ALL {
+                for c in ContentCell::ALL {
+                    for l in LedgerCell::ALL {
+                        let routed = route_act_failed_read(believes, h, c, l);
+                        assert_eq!(
+                            routed,
+                            spec(believes, h, c, l),
+                            "cell (believes={believes}, {h:?}, {c:?}, {l:?})"
+                        );
+                        if believes {
+                            assert_ne!(
+                                routed,
+                                ActFailedAction::ObserveOnly,
+                                "believing cell (believes={believes}, {h:?}, {c:?}, \
+                                 {l:?}) must run a transition"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

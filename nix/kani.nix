@@ -162,18 +162,21 @@ in
   # harness verifies the four #[kani::ensures] iff-clauses on decide_pure() over
   # the full input domain. The contract case structure parallels the action
   # partition in docs/spec/models/leaderElection.qnt. Plus lib.rs:
-  # the lease_standing_proofs trio (fence-never-clears-held,
-  # release-gate-iff-acquired-unsuperseded, and the merged_bug_002
+  # the lease_standing_proofs quartet (fence-never-clears-held,
+  # release-gate-iff-acquired-unsuperseded, the merged_bug_002
   # episode-scoped 409 deferral: Exhausted fires iff an unresolved
-  # same-episode deferral precedes) and the DirtyGen
-  # mark-after-snapshot proof.
-  # Harness ledger: 4 -> 5 (bughunt-5 S8 added the deferral proof).
+  # same-episode deferral precedes, and the bug_002 routing totality:
+  # no believing act-failed completed read maps to a no-transition
+  # action, and every routed transition clears a pending deferral)
+  # and the DirtyGen mark-after-snapshot proof.
+  # Harness ledger: 4 -> 5 (bughunt-5 S8 added the deferral proof)
+  # -> 6 (bughunt-6 S6 added the routing-totality proof).
   # r[verify sched.lease.k8s-lease+2]
   # r[verify sched.lease.at-most-one-leader+3]
   kani-rio-lease = mkKaniCheck {
     name = "rio-lease";
     crate = crateBuildKani.members.rio-lease;
-    expectedHarnesses = 5;
+    expectedHarnesses = 6;
   };
 
   # rio-log-kernel: the store's log-chunk decision kernels, extracted

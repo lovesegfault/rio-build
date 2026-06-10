@@ -1527,17 +1527,19 @@ rec {
     # quint-lease-calib-002-stale-deferral (the no-clear deferral
     # world falsifies noStaleExhaustedLose).
     # Measured (tttt duty, gating backend): TLC-exhaustive
-    # 1,066,069,779 generated / 241,853,458 distinct / depth 47 in
-    # 21m38s under a concurrent sibling-regime run (re-measured at
-    # bughunt-5 S8: the merged_bug_002 deferral ghosts are LIVE in
-    # this gate-on regime, +10% states over the pre-change
-    # 968,119,453/220,855,702@15m17s) — the 3600s budget is ~2.8x
+    # 1,221,981,535 generated / 254,626,350 distinct / depth 47 in
+    # 18m43s under concurrent sibling builds (re-measured at bughunt-6
+    # S6: the bug_002 actFailedHeldReadObserved action is LIVE in this
+    # regime's step, +14.6% generated / +5.3% distinct over the
+    # bughunt-5 measurement 1,066,069,779/241,853,458@21m38s, which
+    # was itself +10% over the pre-deferral-ghost
+    # 968,119,453/220,855,702@15m17s) — the 3600s budget is ~2.9x
     # headroom at the loaded measurement; raise only with a new
     # measured run. (At the foreign-rv sibling's MAX_DROPS = 2 the
     # space exceeded 720M generated WITHOUT exhausting — the regime's
     # module comment records the scope trim and what the droppedWrite
     # regime keeps.)
-    # r[verify sched.lease.holder-evidenced-lose]
+    # r[verify sched.lease.holder-evidenced-lose+2]
     quint-leader-election-holder-evidence = mkQuintCheck {
       name = "leader-election-holder-evidence";
       # quint-policy P1 exemption (bughunt-2 slot 11; §5-Q13): same
@@ -1565,12 +1567,56 @@ rec {
         "loseRequiresHolderEvidence"
         # merged_bug_002 twin: the exhausted-deferral lose fires only
         # on genuinely consecutive believing 409s — no resolving
-        # action (own-commit fetch, self-fence, step-down) answered
+        # action (own-commit fetch, the bug_002 evidence-free
+        # holder=self act-failed read, self-fence, step-down) answered
         # the deferral in between. [violation]-verified pre-fix
         # (resolving actions kept the latch; quint run, 20k samples,
-        # seed 0xb002); green with the episode-scoped clears.
+        # seed 0xb002); green with the episode-scoped clears. The
+        # bug_002 cell family rides actFailedHeldReadObserved (wired
+        # into holderEvidenceStep this round) — its as-built
+        # no-transition twin is
+        # quint-lease-calib-002-actfailed-frozen-noclear below.
         "noStaleExhaustedLose"
       ];
+    };
+
+    # bug_002 pre-fix (bughunt-6 S6): the AS-BUILT act-failed routing —
+    # the evidence-free believing holder=self completed read (frozen
+    # content / empty ledger; production route_act_failed_read's
+    # FunnelResolve cells) runs NO standing transition, so the
+    # 409-deferral latch survives the resolving read and a later
+    # believing 409 exhausts on an answered question (the false "two
+    # consecutive renew 409s" failover). KILL-ISOLATED (R16): unlike
+    # the sibling lease-002 pin, fetchObservesOwnCommit and selfFence
+    # keep their FIXED clearing forms — a fixed resolver clears the
+    # latch in the same action that sets the resolved ghost, so the
+    # exhausts-with-resolvedV state is reachable ONLY through the
+    # swapped act-failed read: the violation dies through ITS
+    # conjunct with the sibling resolvers proven intact in the same
+    # lane, and the violating trace doubles as the reachability
+    # evidence for the live action (same guard, constants, step
+    # family). TLC-exhaustive [violation] in 16s wall (measured
+    # 2026-06-10, depth <= 18) vs the 1800s default budget.
+    quint-lease-calib-002-actfailed-frozen-noclear = mkQuintWitnessCheck {
+      name = "lease-calib-002-actfailed-frozen-noclear";
+      spec = "calibration/lease-002-actfailed-frozen-noclear";
+      main = "leaseCalib002ActFailedFrozenNoClear";
+      witness = "noStaleExhaustedLose";
+      step = "calibStep";
+      extraSpecs = [ "leaderElection" ];
+    };
+
+    # bug_002 constructor-reachability probe (bbbbb idiom): the
+    # deterministic named-run replay for the holder-evidence regime —
+    # actFailedFrozenReadResolvesRun drives acquire -> foreign-bump
+    # 409 (defers) -> evidence-free holder=self act-failed read
+    # (clears, records resolution) -> second 409 (defers FRESH, no
+    # exhaustion), the loop red at model grain. Keeps the new action
+    # family executable as the model evolves.
+    quint-leader-election-runs-holder-evidence = mkQuintRunCheck {
+      name = "leader-election-runs-holder-evidence";
+      spec = "leaderElection";
+      main = "leaderElectionHolderEvidence";
     };
 
     # Non-vacuity witness: a believing 409 actually DEFERS in the

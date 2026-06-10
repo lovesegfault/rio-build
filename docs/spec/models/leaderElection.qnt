@@ -508,8 +508,9 @@ module leaderElection {
   /// lose. Writable only under CONFLICT_IMMEDIATE_LOSE (the twin
   /// toggle); loseRequiresHolderEvidence is its negation.
   var blindConflictLose: bool
-  /// Ghost (merged_bug_002): a resolving action -- own-commit fetch,
-  /// self-fence, cooperative step-down -- fired while this node's 409
+  /// Ghost (merged_bug_002/bug_002): a resolving action -- own-commit
+  /// fetch, the evidence-free holder=self act-failed read, self-fence,
+  /// cooperative step-down -- fired while this node's 409
   /// deferral was pending: the deferral's question was answered or its
   /// belief episode ended, so a LATER exhaustion from the same latch
   /// is stale (the production "two consecutive renew 409s" warn on
@@ -521,9 +522,12 @@ module leaderElection {
   /// 409 ran the exhausted-deferral lose edge although a resolving
   /// action had fired since the deferral was set -- merged_bug_002's
   /// spurious failover. The fix scopes the latch to the belief episode
-  /// (conflictDeferredV cleared by fetchObservesOwnCommit, selfFence,
-  /// serveStepDown), making this latch unreachable; its twin invariant
-  /// noStaleExhaustedLose is the regression pin.
+  /// (conflictDeferredV cleared by EVERY resolving completed read --
+  /// fetchObservesOwnCommit, actFailedHeldReadObserved (bug_002: the
+  /// frozen-content/empty-ledger holder=self read), loseObserved --
+  /// plus selfFence and serveStepDown), making this latch
+  /// unreachable; its twin invariant noStaleExhaustedLose is the
+  /// regression pin.
   var staleExhaustedLose: bool
   /// Per-acquire tenure-instance counter (production
   /// LeaderState::acquire_instance): bumped on every acquire edge,
@@ -2501,6 +2505,80 @@ module leaderElection {
     suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
   }
 
+  /// The believing holder=self completed read with NOTHING to consume
+  /// (bug_002, production route_act_failed_read's FunnelResolve
+  /// cells): the act phase died after a completed GET that still
+  /// names this node holder, and own-commit evidence is NOT
+  /// consumable (frozen content past the last completed fetch, or an
+  /// empty unconfirmed ledger). Routed through the observation
+  /// funnel, whose on_observed_held clears the episode latch — the
+  /// deferred 409's question is answered. NO fence stamp (frozen
+  /// content stamps NOTHING — sched.lease.cancelled-write+2's law is
+  /// untouched: fence' = fence) and NO ledger consume; the read
+  /// re-baselines the evidence cursor exactly as production
+  /// content_baseline := this read's content. Enabled only under
+  /// HOLDER_EVIDENCE_LOSE, so every gate-off regime is state-space
+  /// byte-identical by construction (the action never fires there).
+  /// Pre-change, this read was NOT expressible as a deferral-
+  /// resolving step — noStaleExhaustedLose was green-by-omission over
+  /// exactly the production leak (the model shared the blind spot).
+  // r[verify sched.lease.holder-evidenced-lose+2]
+  action actFailedHeldReadObserved(n: Node): bool = all {
+    HOLDER_EVIDENCE_LOSE,
+    alive.get(n),
+    pending.get(n) == NoPending,
+    leading.get(n),
+    lease.holder == Held(n),
+    not(evidenceEnabled(n)),
+    // Frozen content stamps NOTHING: no fence stamp, no belief
+    // change, no generation movement, no ledger consume.
+    fence' = fence,
+    leading' = leading,
+    gen' = gen,
+    unconfirmed' = unconfirmed,
+    lastFetchedKey' =
+      if (MAX_DROPS == 0) lastFetchedKey
+      else lastFetchedKey.put(n, leaseKey(lease)),
+    lastFetchedContent' =
+      if (MAX_FOREIGN_BUMPS == 0) lastFetchedContent
+      else lastFetchedContent.put(n, lease.content),
+    evidenceFabricated' = evidenceFabricated,
+    evidenceConsumed' = evidenceConsumed,
+    foreignBumps' = foreignBumps,
+    // The funnel resolution (bug_002): a completed read of a lease we
+    // hold answers a pending 409's question; the resolved-since ghost
+    // records it for the staleness latch.
+    conflictDeferredV' = conflictDeferredV.put(n, false),
+    deferralResolvedV' =
+      deferralResolvedV.put(
+        n, (deferralResolvedV.get(n) or conflictDeferredV.get(n))
+      ),
+    staleExhaustedLose' = staleExhaustedLose,
+    blindConflictLose' = blindConflictLose,
+    acquireInstV' = acquireInstV,
+    stepDownReqV' = stepDownReqV,
+    stepDownsV' = stepDownsV,
+    staleStepDownServed' = staleStepDownServed,
+    snap' = snap.put(n, Snap(lease)),
+    held' = trackHeld(held, n, true),
+    blindHolderFor' = bhNext(
+      lease, leading, alive, unconfirmed,
+      (if (MAX_DROPS == 0) lastFetchedKey else lastFetchedKey.put(n, leaseKey(lease))),
+      blindHolderFor, false
+    ),
+    clocks' = clocks, lease' = lease, alive' = alive, obs' = obs,
+    genHW' = genHW, genHWHolder' = genHWHolder,
+    acquiredAt' = acquiredAt, casRace' = casRace, deletes' = deletes,
+    delVictims' = delVictims, claimFailures' = claimFailures,
+    restores' = restores, stealRetained' = stealRetained,
+    stealBumpedForeignTie' = stealBumpedForeignTie,
+    renewBumpedAboveEntry' = renewBumpedAboveEntry,
+    pending' = pending, exited' = exited, drops' = drops,
+    suspends' = suspends, shutdowns' = shutdowns,
+    releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
+    suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
+  }
+
   /// Foreign non-protocol Lease write (merged_bug_180's fault axis): a
   /// third-party annotation/label patch bumps metadata.resourceVersion
   /// while the holder-authored spec content is untouched. Invalidates
@@ -2903,6 +2981,13 @@ module leaderElection {
   action fetchObservesOwnCommitAny = {
     nondet n = NODES.oneOf()
     fetchObservesOwnCommit(n)
+  }
+
+  /// One node's evidence-free believing holder=self completed read
+  /// (bug_002 FunnelResolve cells).
+  action actFailedHeldReadObservedAny = {
+    nondet n = NODES.oneOf()
+    actFailedHeldReadObserved(n)
   }
 
   action step = any {
@@ -3848,8 +3933,41 @@ module leaderElectionHolderEvidence {
     renewSendDroppedAny,
     renewSendLostAny,
     fetchObservesOwnCommitAny,
+    actFailedHeldReadObservedAny,
     bumpRv,
   }
+
+  /// Constructor-reachability probe (bug_002): the evidence-free
+  /// holder=self act-failed read FIRES with a pending deferral and
+  /// resolves it — n1 acquires, a foreign rv bump 409s its renew (the
+  /// one-round deferral), the act-failed frozen-content read clears
+  /// the latch and records the resolution, and the NEXT believing 409
+  /// defers fresh instead of exhausting (the loop red
+  /// act_failed_frozen_content_read_resolves_the_deferral, at model
+  /// grain). staleExhaustedLose stays down throughout: the 409s were
+  /// not consecutive.
+  run actFailedFrozenReadResolvesRun =
+    init
+      .then(apiGet("n1"))
+      .then(steal("n1"))
+      .then(apiGet("n1"))
+      .then(bumpRv)
+      .then(conflict("n1"))
+      .then(actFailedHeldReadObserved("n1"))
+      .expect(all {
+        leading.get("n1"),
+        not(conflictDeferredV.get("n1")),
+        deferralResolvedV.get("n1"),
+        not(staleExhaustedLose),
+      })
+      .then(apiGet("n1"))
+      .then(bumpRv)
+      .then(conflict("n1"))
+      .expect(all {
+        leading.get("n1"),
+        conflictDeferredV.get("n1"),
+        not(staleExhaustedLose),
+      })
 }
 
 // =========================================================================
