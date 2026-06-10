@@ -1744,12 +1744,19 @@ failed → fell through to a build).
   relays in arrival order.
 ]
 
-#r("gw.activity.subst-progress+3")[
+#r("gw.activity.subst-progress+4")[
   For each `DerivationEventKind::SUBSTITUTING` the gateway emits an
   `actSubstitute` (108) activity and increments the root `actBuilds`
   `SetExpected{actCopyPath, N}` (the denominator semantics match stock
   expected-substitutions-at-goal-creation, so nom shows an "X/Y copied"
-  denominator). The child `actCopyPath` (100) activity is DEFERRED: it starts
+  denominator); a pair that closes with no started copy child MUST retire its
+  increment — the close re-emits `SetExpected{actCopyPath}` with the
+  decremented count, after the pair's stops — so the denominator converges to
+  the count of `actCopyPath` activities actually started, and at build
+  terminus expected == started (the second half of stock's
+  `expectedSubstitutions` MaintainCount: mint at goal creation, retire on
+  goal exit without substituting). The child `actCopyPath` (100) activity is
+  DEFERRED: it starts
   on the FIRST `Event::SubstituteProgress` tick carrying a non-empty
   `upstream_uri`, with `fields=[storePath, upstream_uri, machineName]` — the
   stock `copyStorePath` start-frame shape, `from` pinned to that first URI;
@@ -1784,11 +1791,13 @@ URI. A parent `resProgress` lane therefore renders a second, never-deduped
 live row fed identical numbers — every displayed byte doubled, running/done
 counts doubled, and locally-present paths' job-level commit ticks booked as
 downloads. Stock nix has no parent lane to dedup against, so the copy-only
-convention is the compatibility contract. Residual accepted cosmetic: the
-`SetExpected{actCopyPath, N}` denominator still counts every SUBSTITUTING
-derivation, including zero-fetch materializations that never start a copy
-child, so nom's "X/Y copied" can complete with `X < Y` (the gap is exactly
-the locally-present paths — nothing was downloaded for them).
+convention is the compatibility contract. The denominator converges: every
+SUBSTITUTING derivation increments `SetExpected{actCopyPath, N}` at mint
+time, and a pair that closes copy-less (zero-fetch materializations,
+fell-through fetches, unobserved closes) retires its increment at the close
+chokepoint, so nom's "X/Y copied" denominator equals the count of copy
+children actually started — `X < Y` no longer survives to terminus (the
+residual the live_045 hotfix documented is retired, not accepted).
 
 == STDERR_RESULT BuildEvent mapping
 

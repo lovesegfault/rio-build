@@ -1322,10 +1322,38 @@ pkgs.testers.runNixOSTest {
                 f"full event: {e}"
             )
             last_done[aid] = done
+
+        # Denominator conservation law (gw.activity.subst-progress):
+        # the LAST setExpected{actCopyPath} on the wire equals the
+        # count of actCopyPath activities actually started — a pair
+        # that closes copy-less (zero-fetch/fell-through) retires its
+        # mint at the close chokepoint. Holds in EVERY walk/admission
+        # ordering (the law, not an ordering): a zero-fetch job occurs
+        # only when a concurrent job's reference walk ingests another
+        # job's output first, so pre-fix redness here was
+        # ordering-dependent — the deterministic reds are unit-level
+        # (zero_fetch/fell_through/mixed_closure in rio-gateway); this
+        # line is the real-pipeline witness of the law.
+        # setExpected = result type 106; fields[0]=100 is actCopyPath.
+        copy_expected = [
+            e["fields"][1]
+            for e in events
+            if e.get("action") == "result"
+            and e.get("type") == 106
+            and e.get("fields")
+            and e["fields"][0] == 100
+        ]
+        assert copy_expected, "no setExpected(actCopyPath) events captured"
+        assert copy_expected[-1] == len(copy_starts), (
+            f"denominator must converge to started copies: last "
+            f"setExpected(actCopyPath)={copy_expected[-1]} != "
+            f"{len(copy_starts)} copy starts (sequence: {copy_expected})"
+        )
         print(
             f"substitute-progress-e2e PASS: "
             f"{len(copy_starts)} actCopyPath start/stop matched, "
-            f"{n_progress} resProgress events all done≤expected and monotone"
+            f"{n_progress} resProgress events all done≤expected and monotone, "
+            f"denominator converged to {copy_expected[-1]}"
         )
 
     ${storeEndState}

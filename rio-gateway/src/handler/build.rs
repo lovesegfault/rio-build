@@ -261,7 +261,7 @@ enum DrvDisplay {
     /// (fetch failed → fell through to build); every close carries its
     /// [`SubstCloseCause`], and only a completion-proving cause
     /// licenses the close synthesis.
-    /// r[gw.activity.subst-progress+3]
+    /// r[gw.activity.subst-progress+4]
     Subst(SubstAids),
 }
 
@@ -272,12 +272,25 @@ struct BuildActivityState {
     /// Top-level `actBuilds` activity ID. `None` until `BuildStarted`
     /// arrives. `Progress`/`SetExpected` results attach here.
     builds_root: Option<u64>,
-    /// Running count of `actCopyPath` activities started. Re-emitted as
-    /// `SetExpected{actCopyPath, N}` on the root each time it
-    /// increments so nom's "X/Y copied" denominator tracks. The
-    /// scheduler doesn't know upfront how many drvs will go
-    /// `Substituting` (it's discovered as the DAG runs), so this grows
-    /// monotonically rather than being set once.
+    /// Root `SetExpected{actCopyPath}` denominator for nom's "X/Y
+    /// copied". Conservation law (bug_123): at every pair-close
+    /// boundary the last emitted denominator equals the count of
+    /// `actCopyPath` activities actually STARTED; at build terminus
+    /// expected == started. Three lifecycle edges — stock
+    /// `expectedSubstitutions` MaintainCount parity (mint AND retire):
+    /// - MINT at `Substituting` ([`start_subst_display`], the sole
+    ///   inserter of `DrvDisplay::Subst` — 1:1 with entry creation);
+    /// - REALIZE at the deferred copy start (no arithmetic — the mint
+    ///   already counted this pair);
+    /// - RETIRE at a copy-less close ([`stop_subst_pair`], total over
+    ///   closes via the single display map + stop-parity): the
+    ///   expectation never realized, so the close re-emits the
+    ///   decremented count (`SetExpected` is absolute on the wire — a
+    ///   lowered re-emission is protocol-legal, exactly how stock
+    ///   retires `expectedSubstitutions`).
+    /// The scheduler doesn't know upfront how many drvs will go
+    /// `Substituting` (it's discovered as the DAG runs), so the value
+    /// moves both ways rather than being set once.
     subst_expected: u64,
     /// Stable cluster identifier emitted as `actBuild` field 1
     /// (`machineName`). NOT per-pod — see the comment at the
@@ -296,7 +309,7 @@ impl Default for BuildActivityState {
     }
 }
 
-// r[impl gw.activity.subst-progress+3]
+// r[impl gw.activity.subst-progress+4]
 /// Why a [`SubstAids`] pair is closing — the close-cause axis of THE
 /// close chokepoint ([`stop_subst_pair`]). One variant per production
 /// call site, 1:1, so rustc enumerates the caller set (a new close
@@ -402,12 +415,24 @@ fn completion_proven(cause: SubstCloseCause) -> bool {
 /// frozen partial bar on an unobserved success is cosmetic). A pair
 /// with no started copy closes subst-only with NO synthesis frame —
 /// truthful (no sourced byte was ever reported), never the broken
-/// empty bar.
+/// empty bar — and RETIRES its `subst_expected` mint (bug_123): the
+/// expectation never realized into a copy, so after both stops the
+/// close re-emits the decremented `SetExpected{actCopyPath}` on the
+/// root (iff the root exists — mirroring the mint's emission guard).
+/// The retire is CAUSE-INDEPENDENT — the cause axis licenses
+/// synthesis; the copy discriminant drives retirement — and total
+/// over closes: `start_subst_display` is the sole mint (1:1 with
+/// Subst-entry creation) and every Subst-entry removal routes here
+/// (single map + stop-parity), so at every close boundary the last
+/// emitted denominator equals the count of copy children actually
+/// started.
 async fn stop_subst_pair<W: AsyncWrite + Unpin>(
     stderr: &mut StderrWriter<&mut W>,
+    act: &mut BuildActivityState,
     aids: SubstAids,
     cause: SubstCloseCause,
 ) -> Result<(), StreamProcessError> {
+    let copyless = aids.copy.is_none();
     if let Some(copy) = aids.copy {
         if completion_proven(cause)
             && let Some((done, expected)) = aids.progress
@@ -424,6 +449,27 @@ async fn stop_subst_pair<W: AsyncWrite + Unpin>(
         stderr.stop_activity(copy).await?;
     }
     stderr.stop_activity(aids.subst).await?;
+    if copyless {
+        // Structurally non-underflowing: the mint is 1:1 with
+        // Subst-entry creation and each entry closes exactly once.
+        debug_assert!(
+            act.subst_expected > 0,
+            "copy-less close without a live mint (subst_expected == 0)"
+        );
+        act.subst_expected = act.subst_expected.saturating_sub(1);
+        if let Some(root) = act.builds_root {
+            stderr
+                .result(
+                    root,
+                    ResultType::SetExpected,
+                    &[
+                        ResultField::Int(ActivityType::CopyPath as u64),
+                        ResultField::Int(act.subst_expected),
+                    ],
+                )
+                .await?;
+        }
+    }
     Ok(())
 }
 
@@ -437,7 +483,11 @@ async fn stop_subst_pair<W: AsyncWrite + Unpin>(
 /// `from` field can carry the upstream URI the way stock
 /// `copyStorePath` does. The `SetExpected` bump STAYS here at
 /// Substituting time — denominator semantics match stock
-/// expected-substitutions-at-goal-creation, and the deferred start
+/// expected-substitutions-at-goal-creation — and its INVERSE edge
+/// lives in [`stop_subst_pair`]: a close with no started copy retires
+/// this mint (bug_123), so a drv that re-enters `Substituting` after
+/// a fell-through close CONVERGES instead of double-counting (the
+/// first attempt's mint was retired at its close). The deferred start
 /// additionally removes the phantom done-copy on a
 /// fetch-failed→build fallback.
 ///
@@ -584,7 +634,7 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
                 act.display.get(&drv_event.derivation_path).cloned()
             {
                 act.display.remove(&drv_event.derivation_path);
-                stop_subst_pair(stderr, aids, SubstCloseCause::FellThroughToBuild).await?;
+                stop_subst_pair(stderr, act, aids, SubstCloseCause::FellThroughToBuild).await?;
             }
             // Re-dispatch (in-connection reassign, or replay after a
             // gateway↔scheduler reconnect) sends Started again for a
@@ -644,7 +694,7 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
             // and guards future scheduler changes.
             match act.display.remove(&drv_event.derivation_path) {
                 Some(DrvDisplay::Subst(aids)) => {
-                    stop_subst_pair(stderr, aids, SubstCloseCause::Completed).await?;
+                    stop_subst_pair(stderr, act, aids, SubstCloseCause::Completed).await?;
                 }
                 Some(DrvDisplay::Build(aid)) => {
                     stderr.stop_activity(aid).await?;
@@ -676,7 +726,7 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
             // "substituting 'X'" line until build terminus.
             match act.display.remove(&drv_event.derivation_path) {
                 Some(DrvDisplay::Subst(aids)) => {
-                    stop_subst_pair(stderr, aids, SubstCloseCause::Failed).await?;
+                    stop_subst_pair(stderr, act, aids, SubstCloseCause::Failed).await?;
                 }
                 Some(DrvDisplay::Build(aid)) => stderr.stop_activity(aid).await?,
                 None => {
@@ -731,7 +781,7 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
                 act.display.get(&drv_event.derivation_path).cloned()
             {
                 act.display.remove(&drv_event.derivation_path);
-                stop_subst_pair(stderr, aids, SubstCloseCause::Cached).await?;
+                stop_subst_pair(stderr, act, aids, SubstCloseCause::Cached).await?;
             }
         }
         // Queued: no activity to start/stop, no STDERR.
@@ -762,12 +812,15 @@ async fn drain_unstopped_activities<W: AsyncWrite + Unpin>(
         );
     }
     // ONE drain over THE key set — both display families, by
-    // construction. r[impl gw.display.single-map]
-    for (drv, display) in act.display.drain() {
+    // construction. Collect-first: the close chokepoint needs `act`
+    // for the copy-less denominator retire, so the drain cannot hold
+    // the map borrow across the calls. r[impl gw.display.single-map]
+    let drained: Vec<(String, DrvDisplay)> = act.display.drain().collect();
+    for (drv, display) in drained {
         match display {
             DrvDisplay::Subst(aids) => {
                 let (subst, copy) = (aids.subst, aids.copy);
-                stop_subst_pair(stderr, aids, SubstCloseCause::TerminalDrain).await?;
+                stop_subst_pair(stderr, act, aids, SubstCloseCause::TerminalDrain).await?;
                 debug!(subst, ?copy, %drv,
                        "stop_activity sent (terminal drain, subst pair)");
             }
@@ -796,7 +849,7 @@ enum SubstRelay {
     DroppedUntracked,
 }
 
-// r[impl gw.activity.subst-progress+3]
+// r[impl gw.activity.subst-progress+4]
 /// THE substitute-progress relay chokepoint (live_043; emission lane
 /// corrected in live_045): one code path owns, per tick, (i) the
 /// DEFERRED `actCopyPath` start on the first NON-EMPTY `upstream_uri`
@@ -1055,7 +1108,7 @@ async fn apply_snapshot<W: AsyncWrite + Unpin>(
                 debug!(%drv, "stop_activity sent (snapshot reconcile: drv no longer running)");
             }
             Some(DrvDisplay::Subst(aids)) => {
-                stop_subst_pair(stderr, aids, SubstCloseCause::SnapshotGone).await?;
+                stop_subst_pair(stderr, act, aids, SubstCloseCause::SnapshotGone).await?;
                 debug!(%drv, "subst pair stopped (snapshot reconcile: no longer running)");
             }
             None => {}
@@ -1095,7 +1148,7 @@ async fn apply_snapshot<W: AsyncWrite + Unpin>(
                     // Kind flip while detached (substitute fell through
                     // to a build): close the dangling subst pair.
                     act.display.remove(*drv);
-                    stop_subst_pair(stderr, aids, SubstCloseCause::SnapshotKindFlip).await?;
+                    stop_subst_pair(stderr, act, aids, SubstCloseCause::SnapshotKindFlip).await?;
                 }
                 if !act.display.contains_key(*drv) {
                     // Same actBuild shape as relay_derivation_status's
@@ -3556,7 +3609,36 @@ mod tests {
             .collect()
     }
 
-    // r[verify gw.activity.subst-progress+3]
+    /// SetExpected results on `aid` — the denominator-conservation
+    /// reads ride this beside [`progress_results`].
+    fn set_expected_results(frames: &[Frame], aid: u64) -> Vec<&Vec<FVal>> {
+        frames
+            .iter()
+            .filter_map(|f| match f {
+                Frame::Result {
+                    aid: a,
+                    rtype,
+                    fields,
+                } if *a == aid && *rtype == ResultType::SetExpected as u64 => Some(fields),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The root's `SetExpected{actCopyPath}` VALUE sequence — the
+    /// "X/Y copied" denominator nom renders, in emission order.
+    fn copy_path_expected_seq(frames: &[Frame], root: u64) -> Vec<u64> {
+        set_expected_results(frames, root)
+            .iter()
+            .filter(|f| f.first() == Some(&FVal::Int(ActivityType::CopyPath as u64)))
+            .map(|f| match f.get(1) {
+                Some(FVal::Int(v)) => *v,
+                other => panic!("malformed SetExpected fields: {other:?}"),
+            })
+            .collect()
+    }
+
+    // r[verify gw.activity.subst-progress+4]
     /// live_045 red: substitution progress rides the `actCopyPath`
     /// child ONLY — the `actSubstitute` parent is structural (stock
     /// convention: `substitution-goal.cc` never emits `resProgress` on
@@ -3606,7 +3688,7 @@ mod tests {
         assert_eq!(on_copy, 1, "the sourced tick's bytes ride the copy child");
     }
 
-    // r[verify gw.activity.subst-progress+3]
+    // r[verify gw.activity.subst-progress+4]
     /// live_043 red #2: the copy activity's START frame must carry the
     /// upstream source in its `from` field (stock copyStorePath
     /// semantics: [storePath, from, to]) — the relay discarded
@@ -3658,7 +3740,7 @@ mod tests {
         );
     }
 
-    // r[verify gw.activity.subst-progress+3]
+    // r[verify gw.activity.subst-progress+4]
     /// live_043 companion green: a progress tick arriving AFTER the
     /// pair closed (the post-outcome straggler — delivery is droppable
     /// and reorderable end-to-end) is TOLERATED: no frames, the typed
@@ -3718,7 +3800,7 @@ mod tests {
         assert!(!act.display.contains_key(drv), "never resurrected");
     }
 
-    // r[verify gw.activity.subst-progress+3]
+    // r[verify gw.activity.subst-progress+4]
     /// live_043 red #3 (the FS-1 relocated binding red; lane corrected
     /// in live_045): a terminal outcome closing a pair whose
     /// last-relayed progress is partial must synthesize the completing
@@ -3776,7 +3858,7 @@ mod tests {
         );
     }
 
-    // r[verify gw.activity.subst-progress+3]
+    // r[verify gw.activity.subst-progress+4]
     /// merged_bug_003 red R1: a `Started` close fires on fetch FAILURE
     /// (the drv fell through to a build) — it DISPROVES transfer
     /// completion, so the close must FREEZE the last truthful relayed
@@ -3861,7 +3943,7 @@ mod tests {
         );
     }
 
-    // r[verify gw.activity.subst-progress+3]
+    // r[verify gw.activity.subst-progress+4]
     /// merged_bug_003 red R2: a `Failed` cascade close (the drv never
     /// fetched — DependencyFailed without Started/Cached) DISPROVES
     /// transfer completion: exactly the one relayed partial frame on
@@ -3933,7 +4015,7 @@ mod tests {
         );
     }
 
-    // r[verify gw.activity.subst-progress+3]
+    // r[verify gw.activity.subst-progress+4]
     /// merged_bug_003 red R3: a snapshot kind-flip close ("substitute
     /// fell through to a build" while the gateway was detached)
     /// DISPROVES transfer completion — the detached fell-through close
@@ -3992,7 +4074,7 @@ mod tests {
         );
     }
 
-    // r[verify gw.activity.subst-progress+3]
+    // r[verify gw.activity.subst-progress+4]
     /// merged_bug_003 red R4: a snapshot gone-reconcile close (the drv
     /// left the running set while we were detached — outcome
     /// UNOBSERVED) does not prove completion; the close must freeze
@@ -4044,7 +4126,7 @@ mod tests {
         );
     }
 
-    // r[verify gw.activity.subst-progress+3]
+    // r[verify gw.activity.subst-progress+4]
     /// merged_bug_003 red R5: the terminal drain closes pairs whose
     /// terminal event was LOST — the outcome is unknown, so the close
     /// must freeze the last truthful bar.
@@ -4094,6 +4176,308 @@ mod tests {
         );
     }
 
+    // r[verify gw.activity.subst-progress+4]
+    /// bug_123 red R6: a zero-fetch pair (empty-URI commit tick only,
+    /// no copy child ever) must RETIRE its `SetExpected{actCopyPath}`
+    /// mint at close — the exact "X/Y copied completes at X < Y"
+    /// residual the live_045 hotfix documented, now a defect.
+    /// Certifies: the conservation law on the wire — the final
+    /// denominator equals the count of copy starts (here zero).
+    #[tokio::test]
+    async fn zero_fetch_close_retires_copy_denominator() {
+        use types::DerivationEventKind::*;
+        let drv = "/nix/store/r6r6r6r6r6r6r6r6r6r6r6r6r6r6r6r6-foo.drv";
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState::default();
+
+        relay_build_progress(
+            &mut stderr,
+            &mut act,
+            &types::build_event::Event::Started(types::BuildStarted {
+                total_derivations: 1,
+                cached_derivations: 0,
+            }),
+        )
+        .await
+        .unwrap();
+        let root = act.builds_root.expect("BuildStarted opens the root");
+
+        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
+            .await
+            .unwrap();
+        // The zero-fetch commit tick: empty URI, partial bar —
+        // absorbed frameless, recorded as close input.
+        relay_substitute_progress(
+            &mut stderr,
+            &mut act,
+            types::SubstituteProgress {
+                derivation_path: drv.into(),
+                bytes_done: 3,
+                bytes_expected: 9,
+                upstream_uri: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let aids = subst_aids(&act, drv);
+        assert_eq!(aids.copy, None, "zero-fetch: no copy child");
+
+        relay_derivation_status(&mut stderr, &mut act, ev(Cached, drv, &[]))
+            .await
+            .unwrap();
+
+        let frames = read_frames(buf).await;
+        assert_eq!(
+            copy_path_expected_seq(&frames, root),
+            vec![1, 0],
+            "a copy-less close must retire its mint: the root's \
+             SetExpected{{actCopyPath}} sequence converges to the count of \
+             copy starts (zero here)"
+        );
+        // The retire frame lands AFTER the pair's stop (deterministic
+        // frame order for exact-wire siblings).
+        let stop_subst = frames
+            .iter()
+            .position(|f| *f == Frame::Stop(aids.subst))
+            .expect("subst stop present");
+        let retire = frames
+            .iter()
+            .position(|f| {
+                *f == Frame::Result {
+                    aid: root,
+                    rtype: ResultType::SetExpected as u64,
+                    fields: vec![FVal::Int(ActivityType::CopyPath as u64), FVal::Int(0)],
+                }
+            })
+            .expect("retire frame present");
+        assert!(
+            stop_subst < retire,
+            "retire after the stops (stop@{stop_subst}, retire@{retire})"
+        );
+    }
+
+    // r[verify gw.activity.subst-progress+4]
+    /// bug_123 red R7: a fell-through close (fetch failed, no tick at
+    /// all, drv re-dispatched as a build) retires the mint — the drv
+    /// re-counts under "X/Y built", not "copied". Wire tail pinned:
+    /// `Stop(subst)` then the retire frame then `Start(build)`.
+    #[tokio::test]
+    async fn fell_through_close_retires_copy_denominator() {
+        use types::DerivationEventKind::*;
+        let drv = "/nix/store/r7r7r7r7r7r7r7r7r7r7r7r7r7r7r7r7-foo.drv";
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState::default();
+
+        relay_build_progress(
+            &mut stderr,
+            &mut act,
+            &types::build_event::Event::Started(types::BuildStarted {
+                total_derivations: 1,
+                cached_derivations: 0,
+            }),
+        )
+        .await
+        .unwrap();
+        let root = act.builds_root.expect("BuildStarted opens the root");
+
+        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
+            .await
+            .unwrap();
+        let aids = subst_aids(&act, drv);
+
+        relay_derivation_status(&mut stderr, &mut act, ev(Started, drv, &[]))
+            .await
+            .unwrap();
+
+        let frames = read_frames(buf).await;
+        let n = frames.len();
+        assert_eq!(
+            frames[n - 3],
+            Frame::Stop(aids.subst),
+            "tail: the pair's stop precedes the retire frame"
+        );
+        assert_eq!(
+            frames[n - 2],
+            Frame::Result {
+                aid: root,
+                rtype: ResultType::SetExpected as u64,
+                fields: vec![FVal::Int(ActivityType::CopyPath as u64), FVal::Int(0)],
+            },
+            "tail: the copy-less close re-emits the decremented denominator"
+        );
+        assert!(
+            matches!(&frames[n - 1], Frame::Start { act_type, .. }
+                if *act_type == ActivityType::Build as u64),
+            "tail: the build display opens after the retire (got {:?})",
+            frames[n - 1]
+        );
+    }
+
+    // r[verify gw.activity.subst-progress+4]
+    /// bug_123 companion green R8: a SOURCED pair (copy child started)
+    /// does NOT retire — the realize edge is not double-booked; the
+    /// final denominator equals the one copy start.
+    #[tokio::test]
+    async fn sourced_close_does_not_retire() {
+        use types::DerivationEventKind::*;
+        let drv = "/nix/store/r8r8r8r8r8r8r8r8r8r8r8r8r8r8r8r8-foo.drv";
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState::default();
+
+        relay_build_progress(
+            &mut stderr,
+            &mut act,
+            &types::build_event::Event::Started(types::BuildStarted {
+                total_derivations: 1,
+                cached_derivations: 0,
+            }),
+        )
+        .await
+        .unwrap();
+        let root = act.builds_root.expect("BuildStarted opens the root");
+
+        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
+            .await
+            .unwrap();
+        relay_substitute_progress(
+            &mut stderr,
+            &mut act,
+            types::SubstituteProgress {
+                derivation_path: drv.into(),
+                bytes_done: 3,
+                bytes_expected: 9,
+                upstream_uri: "https://cache.example".into(),
+            },
+        )
+        .await
+        .unwrap();
+        relay_derivation_status(&mut stderr, &mut act, ev(Cached, drv, &[]))
+            .await
+            .unwrap();
+
+        let frames = read_frames(buf).await;
+        assert_eq!(
+            copy_path_expected_seq(&frames, root),
+            vec![1],
+            "a sourced close keeps its mint — the expectation realized"
+        );
+        let copy_starts = frames
+            .iter()
+            .filter(|f| {
+                matches!(f, Frame::Start { act_type, .. }
+                    if *act_type == ActivityType::CopyPath as u64)
+            })
+            .count();
+        assert_eq!(copy_starts, 1);
+        assert_eq!(
+            copy_path_expected_seq(&frames, root).last().copied(),
+            Some(copy_starts as u64),
+            "final denominator == count of copy starts"
+        );
+    }
+
+    // r[verify gw.activity.subst-progress+4]
+    /// bug_123 red R9: multi-pair conservation. Three drvs — A sourced
+    /// then Cached, B empty-tick then Cached, C no-tick then Started —
+    /// mint 1,2,3; B and C retire (2, then 1); the final denominator
+    /// equals the ONE copy start. The only cross-pair coupling is the
+    /// scalar — this is the composition witness.
+    #[tokio::test]
+    async fn denominator_converges_to_copy_starts_mixed_closure() {
+        use types::DerivationEventKind::*;
+        let drv_a = "/nix/store/r9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9-a.drv";
+        let drv_b = "/nix/store/r9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9-b.drv";
+        let drv_c = "/nix/store/r9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9-c.drv";
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState::default();
+
+        relay_build_progress(
+            &mut stderr,
+            &mut act,
+            &types::build_event::Event::Started(types::BuildStarted {
+                total_derivations: 3,
+                cached_derivations: 0,
+            }),
+        )
+        .await
+        .unwrap();
+        let root = act.builds_root.expect("BuildStarted opens the root");
+
+        for drv in [drv_a, drv_b, drv_c] {
+            relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
+                .await
+                .unwrap();
+        }
+        // A: sourced tick → copy starts → Cached (keeps its mint).
+        relay_substitute_progress(
+            &mut stderr,
+            &mut act,
+            types::SubstituteProgress {
+                derivation_path: drv_a.into(),
+                bytes_done: 4,
+                bytes_expected: 8,
+                upstream_uri: "https://cache.example".into(),
+            },
+        )
+        .await
+        .unwrap();
+        relay_derivation_status(&mut stderr, &mut act, ev(Cached, drv_a, &[]))
+            .await
+            .unwrap();
+        // B: empty commit tick only → Cached (zero-fetch; retires).
+        relay_substitute_progress(
+            &mut stderr,
+            &mut act,
+            types::SubstituteProgress {
+                derivation_path: drv_b.into(),
+                bytes_done: 2,
+                bytes_expected: 5,
+                upstream_uri: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+        relay_derivation_status(&mut stderr, &mut act, ev(Cached, drv_b, &[]))
+            .await
+            .unwrap();
+        // C: no tick at all → Started (fell through; retires).
+        relay_derivation_status(&mut stderr, &mut act, ev(Started, drv_c, &[]))
+            .await
+            .unwrap();
+
+        let frames = read_frames(buf).await;
+        let copy_starts = frames
+            .iter()
+            .filter(|f| {
+                matches!(f, Frame::Start { act_type, .. }
+                    if *act_type == ActivityType::CopyPath as u64)
+            })
+            .count();
+        assert_eq!(copy_starts, 1, "only A sourced a copy");
+        assert_eq!(
+            copy_path_expected_seq(&frames, root),
+            vec![1, 2, 3, 2, 1],
+            "mints 1,2,3; B's close retires to 2; C's close retires to 1"
+        );
+        assert_eq!(
+            copy_path_expected_seq(&frames, root).last().copied(),
+            Some(copy_starts as u64),
+            "final denominator == count of copy starts (conservation)"
+        );
+    }
+
     /// Closure-set census: `SubstCloseCause::ALL` carries every
     /// variant exactly once. The index fn is a TOTAL match — adding a
     /// variant without extending it is a compile error; the `seen`
@@ -4122,17 +4506,21 @@ mod tests {
         );
     }
 
-    // r[verify gw.activity.subst-progress+3]
-    /// merged_bug_003 policy census: the close-synthesis law is TOTAL
+    // r[verify gw.activity.subst-progress+4]
+    /// merged_bug_003 + bug_123 policy census: the close law is TOTAL
     /// over `SubstCloseCause::ALL` × {copy-open-partial, copy-less} —
     /// cells generated from the alphabet, never hand-enumerated.
     /// Certifies: synthesis ⇔ (cause proves completion ∧ copy started
     /// ∧ bar partial), with the expected proof status restated per
     /// variant through an independent exhaustive match (a production
-    /// policy flip on ANY variant reds the matching cell).
+    /// policy flip on ANY variant reds the matching cell); AND the
+    /// retire law per cell — every copy-less close decrements the
+    /// denominator and re-emits it on the root after the stops, for
+    /// ALL 7 causes (retire is cause-independent); every copy-open
+    /// close retires NOTHING.
     /// Pre-fix this test is a COMPILE-level red — the cause type did
-    /// not exist (disclosed strawman; the behavioral pre-fix pin is
-    /// R1–R5 above).
+    /// not exist (disclosed strawman; the behavioral pre-fix pins are
+    /// R1–R5 for the synthesis license and R6/R7/R9 for the retire).
     #[tokio::test]
     async fn close_synthesis_policy_is_total_over_causes() {
         use types::DerivationEventKind::*;
@@ -4158,13 +4546,25 @@ mod tests {
                 | SubstCloseCause::TerminalDrain => false,
             };
             for copy_open in [true, false] {
-                // Mint the pair through the PRODUCTION path: relay
-                // arm + progress relay (sourced tick opens the copy
-                // child; empty-URI tick is absorbed frameless).
+                // Mint the pair through the PRODUCTION path: root via
+                // BuildStarted (so retire frames are observable),
+                // relay arm + progress relay (sourced tick opens the
+                // copy child; empty-URI tick is absorbed frameless).
                 let mut mint_buf = Vec::new();
                 let mut mint_w = &mut mint_buf;
                 let mut mint_stderr = StderrWriter::new(&mut mint_w);
                 let mut act = BuildActivityState::default();
+                relay_build_progress(
+                    &mut mint_stderr,
+                    &mut act,
+                    &types::build_event::Event::Started(types::BuildStarted {
+                        total_derivations: 1,
+                        cached_derivations: 0,
+                    }),
+                )
+                .await
+                .unwrap();
+                let root = act.builds_root.expect("BuildStarted opens the root");
                 relay_derivation_status(&mut mint_stderr, &mut act, ev(Substituting, drv, &[]))
                     .await
                     .unwrap();
@@ -4186,13 +4586,16 @@ mod tests {
                 .unwrap();
                 let aids = subst_aids(&act, drv);
                 assert_eq!(aids.copy.is_some(), copy_open, "mint shape");
+                assert_eq!(act.subst_expected, 1, "one mint");
 
-                // Drive THE chokepoint directly; a fresh buffer
+                // Drive THE chokepoint directly, mirroring production
+                // callers (entry removed first); a fresh buffer
                 // isolates the close frames.
+                act.display.remove(drv);
                 let mut buf = Vec::new();
                 let mut w = &mut buf;
                 let mut stderr = StderrWriter::new(&mut w);
-                stop_subst_pair(&mut stderr, aids.clone(), cause)
+                stop_subst_pair(&mut stderr, &mut act, aids.clone(), cause)
                     .await
                     .unwrap();
                 let frames = read_frames(buf).await;
@@ -4211,7 +4614,9 @@ mod tests {
                     "cell ({cause:?}, copy_open={copy_open}): synthesis ⇔ \
                      (proven ∧ copy ∧ partial)"
                 );
-                // Stops: child first iff started, parent always.
+                // Stops: child first iff started, parent always; the
+                // retire edge rides the copy discriminant, not the
+                // cause.
                 if copy_open {
                     let copy = aids.copy.unwrap();
                     let stop_copy = frames
@@ -4223,18 +4628,43 @@ mod tests {
                         .position(|f| *f == Frame::Stop(aids.subst))
                         .expect("subst stop present");
                     assert!(stop_copy < stop_subst, "child stops first");
+                    assert_eq!(
+                        act.subst_expected, 1,
+                        "cell ({cause:?}, copy_open): a realized expectation \
+                         is NOT retired"
+                    );
+                    assert!(
+                        copy_path_expected_seq(&frames, root).is_empty(),
+                        "cell ({cause:?}, copy_open): no denominator \
+                         re-emission at a copy-open close"
+                    );
                 } else {
                     assert_eq!(
                         frames,
-                        vec![Frame::Stop(aids.subst)],
-                        "a copy-less close is the subst stop alone"
+                        vec![
+                            Frame::Stop(aids.subst),
+                            Frame::Result {
+                                aid: root,
+                                rtype: ResultType::SetExpected as u64,
+                                fields: vec![
+                                    FVal::Int(ActivityType::CopyPath as u64),
+                                    FVal::Int(0),
+                                ],
+                            },
+                        ],
+                        "cell ({cause:?}, copy-less): the subst stop, then \
+                         the retire re-emission — for EVERY cause"
+                    );
+                    assert_eq!(
+                        act.subst_expected, 0,
+                        "cell ({cause:?}, copy-less): the mint is retired"
                     );
                 }
             }
         }
     }
 
-    // r[verify gw.activity.subst-progress+3]
+    // r[verify gw.activity.subst-progress+4]
     /// live_045 companion: a pair whose only tick carried an EMPTY
     /// upstream_uri (job-level commit walk of a locally-present
     /// closure) never starts a copy child, so the close emits NO
@@ -4323,7 +4753,7 @@ mod tests {
             .unwrap();
         assert_eq!(subst_count(&act), 0, "Cached must remove subst aids");
 
-        // r[verify gw.activity.subst-progress+3]
+        // r[verify gw.activity.subst-progress+4]
         // Wire (live_043 deferred-start): START(Substitute) only — no
         // sourced tick arrived, so no copy child ever started (a
         // zero-fetch/no-tick substitution closes subst-only, the
@@ -4350,7 +4780,7 @@ mod tests {
         );
     }
 
-    // r[verify gw.activity.subst-progress+3]
+    // r[verify gw.activity.subst-progress+4]
     /// Substituting → SubstituteProgress → Cached: progress emits a
     /// `STDERR_RESULT{copy_aid, resProgress, [done, expected, 0, 0]}`
     /// frame between START(CopyPath) and STOP(copy). This is what nom
