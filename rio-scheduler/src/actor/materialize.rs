@@ -77,13 +77,75 @@ pub(super) const LISTING_STEAL_HORIZON: std::time::Duration = std::time::Duratio
 /// "unlisted".
 pub(super) const LISTING_MEMBER_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// bug_045 (R17) — always-on operation counters for the listing
+/// chokepoint's cost envelope. The complexity claims are structural
+/// (count operations, never wall-clock — the repo's
+/// structural-over-wall-clock rule), so the counters live INSIDE the
+/// operations they count: every caller counts by construction, and a
+/// poll-path scoring call that bypasses the maintainer is structurally
+/// visible as a nonzero delta. Relaxed ordering: the actor is
+/// single-threaded; the counters are monotone diagnostics, never
+/// synchronization. nextest's process-per-test isolation makes the
+/// deltas test-local.
+static SCORES_COMPUTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Counted at the SOLE production head-window call site (the listing
+/// arm's `list_claimable_materialization_jobs` query).
+static SNAPSHOT_FETCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Counted per member element visited at the member-iteration choke
+/// sites (contact-map prune scans, membership snapshots, owner-age
+/// walks): the O(served slice) serving law's witness is "zero member
+/// touches on a stable-epoch poll", not prose.
+static MEMBER_TOUCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+fn member_touch() {
+    MEMBER_TOUCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Test-side reader for the three cost-envelope counters (the
+/// `sched.materialize.listing-cost` verify set takes deltas around
+/// production listing calls).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ListingCostSnapshot {
+    pub scores_computed: u64,
+    pub snapshot_fetches: u64,
+    pub member_touches: u64,
+}
+
+#[cfg(test)]
+pub(crate) fn listing_cost_snapshot() -> ListingCostSnapshot {
+    use std::sync::atomic::Ordering::Relaxed;
+    ListingCostSnapshot {
+        scores_computed: SCORES_COMPUTED.load(Relaxed),
+        snapshot_fetches: SNAPSHOT_FETCHES.load(Relaxed),
+        member_touches: MEMBER_TOUCHES.load(Relaxed),
+    }
+}
+
+// r[impl sched.materialize.listing-distribution]
+/// live_041 — THE per-pair rendezvous score: the SipHash of
+/// `(job_id, member)` with the member string as the total-order tie
+/// key. The SINGLE scoring source (Q1): [`rendezvous_owner`] is the
+/// batch argmax over this fn and the incremental owner-map maintainer
+/// consumes the same fn — one source, two composers, parity-pinned.
+/// The score counter increments HERE so every caller counts by
+/// construction (R17).
+pub(crate) fn rendezvous_score(job_id: Uuid, member: &str) -> (u64, &str) {
+    use std::hash::{Hash, Hasher};
+    SCORES_COMPUTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    job_id.hash(&mut h);
+    member.hash(&mut h);
+    (h.finish(), member)
+}
+
 // r[impl sched.materialize.listing-distribution]
 /// live_041 — THE rendezvous owner: highest-random-weight hash over
-/// `(job_id, member)`. The SINGLE partition source — the owner slice
-/// AND the steal horizon are both derived from this one fn at the one
-/// listing site (a second partition computation anywhere is the
-/// mirrored-literal shape the Q1 banner bans; the parity test pins
-/// served slices against this fn).
+/// `(job_id, member)` — the batch argmax over [`rendezvous_score`],
+/// the single partition source (a second partition computation
+/// anywhere is the mirrored-literal shape the Q1 banner bans; the
+/// parity test pins served slices against this fn).
 ///
 /// Member unit (RULED CF-2): the per-WORKER composite `{pod}-w{n}` —
 /// the token-bound identity the claim path already asserts. Never the
@@ -101,13 +163,9 @@ pub(crate) fn rendezvous_owner<'a, I>(job_id: Uuid, members: I) -> Option<&'a st
 where
     I: IntoIterator<Item = &'a str>,
 {
-    use std::hash::{Hash, Hasher};
-    members.into_iter().max_by_key(|m| {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        job_id.hash(&mut h);
-        m.hash(&mut h);
-        (h.finish(), *m)
-    })
+    members
+        .into_iter()
+        .max_by_key(|m| rendezvous_score(job_id, m))
 }
 
 /// live_041 — the leader's listing-contact map: `{worker member →
@@ -129,8 +187,10 @@ impl ListingContacts {
     /// silent past [`LISTING_MEMBER_TTL`] (the map stays bounded by
     /// live churn, not by all-time pod history).
     fn note(&mut self, member: &str, now: std::time::Instant) {
-        self.contacts
-            .retain(|_, last| now.duration_since(*last) <= LISTING_MEMBER_TTL);
+        self.contacts.retain(|_, last| {
+            member_touch();
+            now.duration_since(*last) <= LISTING_MEMBER_TTL
+        });
         self.contacts.insert(member.to_owned(), now);
     }
 
@@ -140,7 +200,10 @@ impl ListingContacts {
     fn members(&self, now: std::time::Instant) -> Vec<(String, std::time::Instant)> {
         self.contacts
             .iter()
-            .filter(|(_, last)| now.duration_since(**last) <= LISTING_MEMBER_TTL)
+            .filter(|(_, last)| {
+                member_touch();
+                now.duration_since(**last) <= LISTING_MEMBER_TTL
+            })
             .map(|(m, last)| (m.clone(), *last))
             .collect()
     }
@@ -863,6 +926,9 @@ impl DagActor {
             } else {
                 i64::from(limit).saturating_mul(2).min(512)
             };
+            // R17: the SOLE production head-window call site counts
+            // its fetches — the snapshot-TTL envelope's witness.
+            SNAPSHOT_FETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             match self.db.list_claimable_materialization_jobs(fetch).await {
                 Ok(rows) => {
                     let caller = instance.as_deref();
@@ -925,7 +991,10 @@ impl DagActor {
                 // direction).
                 members
                     .iter()
-                    .find(|(m, _)| m == owner)
+                    .find(|(m, _)| {
+                        member_touch();
+                        m == owner
+                    })
                     .map(|(_, last)| now.duration_since(*last) > LISTING_STEAL_HORIZON)
                     .unwrap_or(true)
             }

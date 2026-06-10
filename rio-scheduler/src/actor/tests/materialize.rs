@@ -10023,3 +10023,41 @@ async fn stale_owner_slice_enters_the_steal_horizon() -> TestResult {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// bug_045 — listing cost envelope (sched.materialize.listing-cost)
+// ---------------------------------------------------------------------------
+
+/// Instrumentation pin (R16): the three cost-envelope counters are
+/// wired to LIVE choke sites — a cold first beat in a multi-member
+/// epoch must move all three (scores: the partition walk; fetches:
+/// the head-window query; member touches: the contact-map scans).
+/// This certifies the counters' own wiring, on the unfixed tree and
+/// the fixed one alike (a cold beat legitimately scores, fetches, and
+/// scans on both); the per-poll ZERO laws are the envelope tests'
+/// proposition, not this pin's.
+#[tokio::test]
+async fn listing_cost_counters_move_at_the_choke_sites() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    seed_claimable_jobs(&handle, &store, "cost-wire", 6).await?;
+
+    let members: Vec<String> = (0..3).map(|w| worker_member("store-wire", w)).collect();
+    let before = crate::actor::materialize::listing_cost_snapshot();
+    for m in &members {
+        let _ = list_materialization_jobs_as(&handle, 64, m).await;
+    }
+    let after = crate::actor::materialize::listing_cost_snapshot();
+    assert!(
+        after.scores_computed > before.scores_computed,
+        "cold-beat partition work must pass through the counted scoring source"
+    );
+    assert!(
+        after.snapshot_fetches > before.snapshot_fetches,
+        "the head-window query must pass through the counted call site"
+    );
+    assert!(
+        after.member_touches > before.member_touches,
+        "membership scans must pass through the counted choke sites"
+    );
+    Ok(())
+}
