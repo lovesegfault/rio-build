@@ -228,14 +228,23 @@ pub const REBOUND_ORIGIN: &str = "resume_rebound";
 /// process-lost entry settles through the charged establishment
 /// window — the SIGNED residual (rule-4b): real crashes still pay,
 /// lost responses no longer do.
+///
+/// bug_034 — an entry plays TWO distinct roles, split as
+/// [`SlotStanding`]: the rule-4b recovery CREDENTIAL (which every
+/// live entry is, until authoritatively answered) and the claim-slot
+/// CHARGE (which only an UNANSWERED entry holds — the scheduler may
+/// have minted an attempt bound to this worker). The pass budget
+/// derives from [`Self::charged_len`] alone; [`Self::len`] keeps the
+/// cap/diagnostic semantics ([`RESUME_LEDGER_CAP`] counts ENTRIES —
+/// credential survival is unweakened by the split).
 #[derive(Default)]
 pub struct ResumeLedger {
     entries: VecDeque<ResumeEntry>,
 }
 
-/// One unanswered claim: everything the resume pull and the recovered
-/// [`ClaimedJob`] need from the original listing descriptor, plus the
-/// minted nonce.
+/// One claim whose lifecycle is not settled: everything the resume
+/// pull and the recovered [`ClaimedJob`] need from the original
+/// listing descriptor, plus the minted nonce and the slot standing.
 #[derive(Clone)]
 struct ResumeEntry {
     job_id: Uuid,
@@ -243,13 +252,64 @@ struct ResumeEntry {
     tenant_hint: Option<Uuid>,
     origin: String,
     nonce: Uuid,
+    standing: SlotStanding,
+}
+
+/// bug_034 — the typed split of a ledger entry's two roles. The
+/// transition lattice is MONOTONE by construction: `Charged` is
+/// minted by [`ResumeLedger::begin_fresh_claim`] (the sole fresh-mint
+/// authority) and moves to `CredentialOnly` on the FIRST answered
+/// NotYetReady ([`ResumeLedger::note_answered_not_ready`], both
+/// lanes); nothing moves back — a later LOST response cannot
+/// re-charge (a storm requires fresh mints, which always charge).
+/// Authoritative answers (Deliver / Gone / mint-disproving rejection)
+/// remove the entry, ending both roles at once.
+///
+/// Recorded residual (Q4/TOCTOU): a `CredentialOnly` entry whose
+/// original pull DID mint server-side can later Deliver through the
+/// resume lane while a fresh claim also Delivered this pass — bounded
+/// by [`RESUME_LEDGER_CAP`], serialized by the worker's inline
+/// execution loop, and strictly better than the pre-split shape where
+/// the answered loser starved the worker for the winner's whole job
+/// lifetime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotStanding {
+    /// Possibly minted, UNANSWERED: the entry consumes a claim slot —
+    /// the mint may have committed server-side, bound to this worker
+    /// (the bug_099/merged_bug_072 anti-storm law).
+    Charged,
+    /// The scheduler ANSWERED NotYetReady: the slot refunds (the pass
+    /// may keep claiming), but the credential survives — NotYetReady
+    /// is NOT proof of no-mint (the post-mint TOCTOU arm answers it
+    /// after persisting this worker's nonce), so the entry stays
+    /// nonce-resumable until Gone or delivery.
+    CredentialOnly,
 }
 
 /// Ledger capacity. At cap the mint authority REFUSES fresh mints
-/// (merged_bug_072 — live credentials are never evicted); 32
-/// unanswered claims on ONE worker already signals a scheduler-side
-/// outage the establishment sweep owns.
+/// (merged_bug_072 — live credentials are never evicted). What a full
+/// ledger SIGNALS depends on its standing mix (bug_034/FS-4): 32
+/// UNANSWERED claims on one worker is a scheduler-side outage the
+/// establishment sweep owns (the warn); 32 answered-NotYetReady
+/// credentials is the contested-remainder steady state (debug).
 const RESUME_LEDGER_CAP: usize = 32;
+
+/// FS-4 (bug_034 storm guard) — the per-pass fresh-mint allowance is
+/// `available_slots + STEAL_SPECULATION_ALLOWANCE`. The allowance
+/// exists because an answered raced loser REFUNDS its slot charge
+/// (the SlotStanding split): without a per-pass mint bound, a fully
+/// contested listing (every fresh pull answering NotYetReady — the
+/// steady state whenever fleet > work) would let a 1-slot worker mint
+/// the whole listing window of nonces per pass, accumulating
+/// CredentialOnly entries toward [`RESUME_LEDGER_CAP`] and wedging
+/// its own fresh mints.
+///
+/// Value: 1 — the production per-worker slot count (the claim loop
+/// polls with `available_slots = 1`), giving 2 mints/pass there. The
+/// resulting allowance MUST stay ≥ 2 at slots=1: an answered loser at
+/// the head must leave room for one more fresh mint, or the refund
+/// law is unreachable (the raced-loser red pins exactly that shape).
+const STEAL_SPECULATION_ALLOWANCE: usize = 1;
 
 impl ResumeLedger {
     /// Record a claim attempt BEFORE its pull rides the wire (upsert
@@ -296,18 +356,73 @@ impl ResumeLedger {
         // (the only proof of a server-side mint bound to this
         // worker); evicting one to fund a NEW speculative mint
         // forfeited a possibly-committed attempt to the charged
-        // establishment window. 32 unanswered claims on one worker
-        // already signals a scheduler-side outage the establishment
-        // sweep owns.
+        // establishment window. The refusal stands regardless of the
+        // population's standing mix (live credentials are never
+        // evicted) — but WHAT the full ledger signals depends on it
+        // (bug_034/FS-4): a Charged-dominated population is 32
+        // UNANSWERED claims on one worker — a scheduler-side outage
+        // the establishment sweep owns — while a CredentialOnly-
+        // dominated one is the contested-remainder steady state
+        // (answered raced losers waiting out the winners' jobs), not
+        // an outage; warning "outage" there would be false.
         if self.entries.len() >= RESUME_LEDGER_CAP {
-            warn!(job_id = %job_id,
-                  "resume ledger at capacity; fresh mint refused (live \
-                   credentials are never evicted)");
+            if self.cap_refusal_is_outage() {
+                warn!(job_id = %job_id,
+                      charged = self.charged_len(),
+                      entries = self.entries.len(),
+                      "resume ledger at capacity with unanswered mints \
+                       dominating; fresh mint refused (live credentials \
+                       are never evicted) — scheduler-side outage?");
+            } else {
+                debug!(job_id = %job_id,
+                       charged = self.charged_len(),
+                       entries = self.entries.len(),
+                       "resume ledger at capacity with answered \
+                        credentials dominating (contested listing \
+                        remainder); fresh mint refused");
+            }
             return None;
         }
         let nonce = Uuid::new_v4();
-        self.entries.push_back(fill(nonce));
+        // The mint authority stamps the charge — a fresh mint ALWAYS
+        // charges (bug_034: the budget's anti-storm half), whatever
+        // the fill closure carried.
+        let mut entry = fill(nonce);
+        entry.standing = SlotStanding::Charged;
+        self.entries.push_back(entry);
         Some(MintedClaim { nonce })
+    }
+
+    /// bug_034/FS-4 — the cap-refusal severity predicate: the outage
+    /// warn fires only when the population is Charged-DOMINATED
+    /// (charged ≥ credential-only; ties stay loud — the conservative
+    /// direction). A CredentialOnly-dominated full ledger is the
+    /// contested-remainder steady state and logs at debug.
+    fn cap_refusal_is_outage(&self) -> bool {
+        let charged = self.charged_len();
+        charged * 2 >= self.entries.len()
+    }
+
+    /// bug_034 — the FIRST answered NotYetReady refunds the slot:
+    /// `Charged` → `CredentialOnly`, never back (monotone — see
+    /// [`SlotStanding`]). Idempotent on an already-refunded entry; a
+    /// no-op when the job has no entry (cannot happen from the two
+    /// call sites, both of which hold a live entry by construction).
+    fn note_answered_not_ready(&mut self, job_id: Uuid) {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.job_id == job_id) {
+            e.standing = SlotStanding::CredentialOnly;
+        }
+    }
+
+    /// The claim-slot charge count — what the pass budget reads
+    /// (bug_034): entries whose mint is still UNANSWERED. Distinct
+    /// from [`Self::len`] (the cap/diagnostic population, which
+    /// counts every live credential).
+    fn charged_len(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| e.standing == SlotStanding::Charged)
+            .count()
     }
 
     /// Snapshot for the resume pass (entries are a handful of small
@@ -581,9 +696,13 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             }
             // Authoritative: the job resolved without us.
             PullAnswer::Gone => ledger.resolve(entry.job_id),
-            // Parked / raced / stale view: keep — one bounded RPC per
-            // pass until Gone or delivery; capacity bounds the total.
-            PullAnswer::NotYetReady => {}
+            // Parked / raced / stale view: the entry keeps — one
+            // bounded RPC per pass until Gone or delivery; capacity
+            // bounds the total. bug_034: an ANSWER on the resume lane
+            // is the first answer a brownout-era Charged mint ever
+            // got — the slot refunds (Charged→CredentialOnly), the
+            // credential rides on.
+            PullAnswer::NotYetReady => ledger.note_answered_not_ready(entry.job_id),
             PullAnswer::Unanswered => {}
             // bug_119 (narrowed by merged_bug_074): a MINT-DISPROVING
             // refusal resolves the entry — the request shape can
@@ -606,6 +725,12 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
     // starves behind one such head until it leaves the listing.
     // Listing is cheap (descriptors only); the claim loop below still
     // stops at the slot budget.
+    // live_041: this window is no longer a FLEET-wide throughput
+    // ceiling — the scheduler rendezvous-partitions the claimable
+    // head per live worker (identity from the verified service-token
+    // claims; zero wire change here), so N workers' windows cover N
+    // disjoint slices instead of all fighting the same oldest-first
+    // head.
     const LISTING_WINDOW_MIN: usize = 16;
     const LISTING_WINDOW_PER_SLOT: usize = 8;
     let window = LISTING_WINDOW_MIN.max(available_slots.saturating_mul(LISTING_WINDOW_PER_SLOT));
@@ -657,29 +782,60 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
 
     // bug_099: the walk's budget counts POTENTIAL server-side mints —
     // every nonce issued whose outcome the scheduler has not answered.
-    // An ANSWERED refusal (Gone / NotYetReady / Rejected) refunds the
-    // slot (the scheduler affirmatively did not mint — bug_385's
-    // in-pass skip stays free); an UNANSWERED pull keeps it consumed
-    // (the mint may have committed server-side, bound to this worker).
-    // Pre-fix, a mailbox brownout let a 1-slot worker mint a nonce per
-    // listed descriptor (16+ open attempts the resume lane drains at
-    // one per pass).
+    // An ANSWERED refusal refunds the slot; an UNANSWERED pull keeps
+    // it consumed (the mint may have committed server-side, bound to
+    // this worker). Pre-fix, a mailbox brownout let a 1-slot worker
+    // mint a nonce per listed descriptor (16+ open attempts the
+    // resume lane drains at one per pass).
     // merged_bug_072: the budget is DERIVED from the ledger
     // population — entries are created at mint and leave on every
-    // authoritative answer, so `ledger.len()` IS the outstanding-mint
-    // count, across passes as well as within one. The pre-fix
-    // per-pass counter reset to 0 each pass, making prior-pass
-    // Unanswered entries invisible: a list-ok/pull-lost brownout
-    // minted one fresh nonce per pass up to RESUME_LEDGER_CAP (32x a
-    // 1-slot worker), each eviction then forfeiting a live rule-4b
-    // credential. No parallel counter exists to desync (banner a).
+    // authoritative answer — across passes as well as within one. The
+    // pre-fix per-pass counter reset to 0 each pass, making
+    // prior-pass Unanswered entries invisible: a list-ok/pull-lost
+    // brownout minted one fresh nonce per pass up to RESUME_LEDGER_CAP
+    // (32x a 1-slot worker), each eviction then forfeiting a live
+    // rule-4b credential. No parallel counter exists to desync
+    // (banner a).
+    // bug_034: the two laws above collided on the answered-
+    // NotYetReady cell — bug_099's refund law says the slot frees,
+    // merged_bug_072's derived budget said the surviving entry keeps
+    // consuming it. The SlotStanding split dissolves the
+    // contradiction: the CREDENTIAL survives (rule-4b — NotYetReady
+    // is not proof of no-mint), the CHARGE refunds (the budget reads
+    // `charged_len()`, the unanswered subset only). At slots=1 the
+    // raced loser no longer idles the worker for the winner's whole
+    // job lifetime.
+    //
+    // FS-4 storm guard: the refund alone licenses a fresh-mint storm
+    // on a fully-contested remainder (every fresh pull answering
+    // NotYetReady — the common state whenever fleet > work): each
+    // answered loser refunds, the pass walks on, and a 1-slot worker
+    // would mint up to the full listing window of nonces per pass,
+    // accumulating CredentialOnly entries toward RESUME_LEDGER_CAP
+    // (entries clear only when the winners' jobs settle) — wedging
+    // its OWN fresh mints behind the cap. The per-pass speculation
+    // bound below caps fresh MINTS per pass; refunds restore the
+    // cross-pass budget, never the per-pass mint allowance.
+    let fresh_mint_allowance = available_slots.saturating_add(STEAL_SPECULATION_ALLOWANCE);
+    let mut fresh_mints_this_pass: usize = 0;
     for descriptor in listed {
+        // FS-4: the per-pass speculation bound — counted at the mint,
+        // never restored by a refund.
+        if fresh_mints_this_pass >= fresh_mint_allowance {
+            debug!(
+                fresh_mints = fresh_mints_this_pass,
+                allowance = fresh_mint_allowance,
+                "per-pass speculation bound reached; fresh pass ends"
+            );
+            break;
+        }
         // The claim budget: delivered claims plus unanswered potential
-        // mints (the surviving ledger population).
-        if claimed.len() + ledger.len() >= available_slots {
+        // mints (the CHARGED ledger population — bug_034).
+        if claimed.len() + ledger.charged_len() >= available_slots {
             debug!(
                 claimed = claimed.len(),
-                outstanding = ledger.len(),
+                charged = ledger.charged_len(),
+                entries = ledger.len(),
                 slots = available_slots,
                 "claim budget consumed by outstanding mints; fresh pass ends"
             );
@@ -719,9 +875,13 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             tenant_hint: Uuid::parse_str(&descriptor.tenant_id).ok(),
             origin: descriptor.origin.clone(),
             nonce,
+            standing: SlotStanding::Charged,
         }) else {
             continue;
         };
+        // FS-4: count the mint the moment it exists — an answered
+        // refusal refunds the BUDGET above, never this counter.
+        fresh_mints_this_pass += 1;
         let req = PullAssignmentRequest {
             // No executor token: the store's credential is the
             // service token in metadata (the kind-attested credential).
@@ -776,16 +936,15 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             // the scheduler's post-mint TOCTOU arm answers it AFTER
             // the durable mint committed with this nonce. The
             // credential survives (one bounded resume RPC per pass
-            // until Gone or delivery; cap bounds the total); the
-            // PASS budget refunds — the possibly-minted attempt is
-            // ledger-tracked now, and starving the walk behind a
-            // raced head would undo bug_385's in-pass skip.
-            // merged_bug_072: the credential survives in the ledger
-            // and therefore KEEPS consuming budget — the possibly-
-            // minted attempt holds a slot until answered (the
-            // pre-fix per-pass refund let the next pass mint over
-            // it).
-            PullAnswer::NotYetReady => {}
+            // until Gone or delivery; cap bounds the total) AND the
+            // PASS budget refunds (bug_034: the standing transition
+            // Charged→CredentialOnly IS the refund — under no
+            // refactor may this arm drop or revert the entry, the
+            // Q4/TOCTOU rider). Starving the walk behind a raced
+            // head would undo bug_385's in-pass skip; the FS-4
+            // speculation bound, not the charge, is what keeps the
+            // refunded pass from storming the ledger.
+            PullAnswer::NotYetReady => ledger.note_answered_not_ready(job_id),
             // The answer never arrived: the entry STAYS — the next
             // pass resumes it directly with the nonce.
             PullAnswer::Unanswered => {}
@@ -1372,6 +1531,7 @@ mod tests {
                 tenant_hint: None,
                 origin: "cache_opportunity".into(),
                 nonce,
+                standing: SlotStanding::Charged,
             }
         };
         assert!(
@@ -1610,6 +1770,7 @@ mod tests {
             tenant_hint: None,
             origin: "pruned".into(),
             nonce: live_nonce,
+            standing: SlotStanding::Charged,
         });
         // The same job is STILL LISTED (pass-N mint tx not yet visible
         // to pass-N+1's listing snapshot). Resume pull answers
@@ -1735,6 +1896,7 @@ mod tests {
             tenant_hint: None,
             origin: "pruned".into(),
             nonce: Uuid::new_v4(),
+            standing: SlotStanding::Charged,
         });
         let mut t = MockTransport::new(
             // The listing fails AFTER the resume pass delivered.
@@ -1811,6 +1973,7 @@ mod tests {
             tenant_hint: None,
             origin: "pruned".into(),
             nonce: Uuid::new_v4(),
+            standing: SlotStanding::Charged,
         });
         let mut t = MockTransport::new(
             vec![Ok(listing(vec![]))],
@@ -1854,6 +2017,7 @@ mod tests {
             tenant_hint: Some(Uuid::now_v7()),
             origin: "pruned".into(),
             nonce: Uuid::new_v4(),
+            standing: SlotStanding::Charged,
         });
         let mut t = MockTransport::new(
             vec![Ok(listing(vec![]))],
@@ -1908,6 +2072,7 @@ mod tests {
             tenant_hint: Some(tenant),
             origin: "pruned".into(),
             nonce: Uuid::new_v4(),
+            standing: SlotStanding::Charged,
         });
         let mut t = MockTransport::new(
             vec![Ok(listing(vec![]))],
@@ -2148,6 +2313,261 @@ mod tests {
         .await;
         assert!(claimed.is_empty());
         assert_eq!(idle.list_calls, 0, "zero slots never even lists");
+    }
+
+    /// bug_034 RED: an ANSWERED NotYetReady on a fresh claim — the
+    /// raced LOSER lane (the kernel's one-winner arbiter answers the
+    /// loser NotYetReady and keeps its entry alive until the winner's
+    /// job settles) — must REFUND the pass budget: the credential
+    /// survives in the ledger (rule-4b: NotYetReady is NOT proof of
+    /// no-mint), but the slot charge it held is released the moment
+    /// the scheduler ANSWERS. At slots=1 a raced loser must not idle
+    /// the worker for the winner's whole job lifetime.
+    #[tokio::test]
+    async fn raced_loser_not_yet_ready_refunds_the_claim_budget() {
+        let job_a = descriptor(1);
+        let job_b = descriptor(2);
+        let mut t = MockTransport::new(
+            vec![Ok(listing(vec![job_a.clone(), job_b.clone()]))],
+            vec![
+                Ok(not_yet_ready()),
+                Ok(deliver("exec-b", "/nix/store/bbb-two.drv")),
+            ],
+            vec![],
+        );
+        let mut ledger = ResumeLedger::default();
+        let claimed = poll_and_claim(
+            &mut t,
+            &instance("raced-loser-w"),
+            1,
+            &mut ledger,
+            &mut ListFailureLatch::default(),
+            &token(),
+        )
+        .await;
+        assert_eq!(
+            claimed.len(),
+            1,
+            "left: claimed=[] (budget consumed by the answered loser; the pass \
+             breaks at the head) / right: claimed=[B], ledger holds A as \
+             CredentialOnly"
+        );
+        assert_eq!(claimed[0].drv_hash, job_b.drv_hash);
+        assert_eq!(
+            ledger.len(),
+            1,
+            "the loser's credential SURVIVES (Q4/TOCTOU: NotYetReady is not \
+             proof of no-mint — the entry stays nonce-resumable)"
+        );
+        assert_eq!(
+            ledger.charged_len(),
+            0,
+            "the answered loser holds NO slot charge (CredentialOnly)"
+        );
+    }
+
+    /// bug_034 conservation twin (the bug_099/072 anti-storm half
+    /// SURVIVES the split): an UNANSWERED mint keeps its charge — the
+    /// scheduler may have committed the attempt, so the pass must not
+    /// mint past it. Slots=1, A's pull is lost → B is NOT claimed
+    /// this pass.
+    #[tokio::test(start_paused = true)]
+    async fn unanswered_mint_keeps_the_charge() {
+        let job_a = descriptor(1);
+        let job_b = descriptor(2);
+        let mut t = MockTransport::new(
+            vec![Ok(listing(vec![job_a.clone(), job_b.clone()]))],
+            vec![Ok(deliver("exec-b", "/nix/store/bbb-two.drv"))],
+            vec![],
+        );
+        t.hang_next_pulls = 1;
+        let mut ledger = ResumeLedger::default();
+        let claimed = poll_and_claim(
+            &mut t,
+            &instance("unanswered-w"),
+            1,
+            &mut ledger,
+            &mut ListFailureLatch::default(),
+            &token(),
+        )
+        .await;
+        assert!(
+            claimed.is_empty(),
+            "an UNANSWERED mint keeps the slot consumed — B must not be \
+             claimed this pass"
+        );
+        assert_eq!(t.pull_calls, 1, "only A's (lost) pull rode the wire");
+        assert_eq!(ledger.charged_len(), 1, "the lost mint stays Charged");
+    }
+
+    /// FS-4 RED: the fully-contested pass (every fresh pull answers
+    /// NotYetReady — the live 173-replica/16-head regime's steady
+    /// state) must NOT storm the ledger. The refund alone would let a
+    /// 1-slot worker walk the whole 16-job listing minting a nonce per
+    /// descriptor, accumulating CredentialOnly entries toward
+    /// RESUME_LEDGER_CAP (they clear only when the winners' jobs
+    /// settle) and wedging its own future fresh mints. The per-pass
+    /// speculation bound caps fresh mints at
+    /// `available_slots + STEAL_SPECULATION_ALLOWANCE` (= 2 at
+    /// slots=1).
+    ///
+    /// Strawman disclosure: pre-split the pass breaks at the FIRST
+    /// answered head (the bug_034 defect) and cannot storm, so this
+    /// red is recorded against the refund-WITHOUT-bound strawman (the
+    /// split alone), not against the pre-fix tree — left: 16 fresh
+    /// mints, 16 CredentialOnly entries this pass / right: fresh
+    /// mints <= 2, no cap pressure, no outage warn.
+    #[tokio::test]
+    async fn contested_remainder_does_not_storm_the_ledger() {
+        let listed: Vec<_> = (1..=16).map(descriptor).collect();
+        let mut t =
+            MockTransport::new(vec![Ok(listing(listed))], vec![Ok(not_yet_ready())], vec![]);
+        let mut ledger = ResumeLedger::default();
+        let claimed = poll_and_claim(
+            &mut t,
+            &instance("contested-w"),
+            1,
+            &mut ledger,
+            &mut ListFailureLatch::default(),
+            &token(),
+        )
+        .await;
+        assert!(claimed.is_empty(), "every claim lost the race");
+        assert!(
+            t.pull_calls <= 2,
+            "left: 16 fresh mints (one per listed descriptor) / right: fresh \
+             mints <= available_slots + STEAL_SPECULATION_ALLOWANCE (= 2); \
+             got {} pulls",
+            t.pull_calls
+        );
+        assert!(
+            ledger.len() <= 2,
+            "no ledger storm: {} entries accumulated toward the cap",
+            ledger.len()
+        );
+        assert_eq!(
+            ledger.charged_len(),
+            0,
+            "every minted entry was answered (CredentialOnly)"
+        );
+    }
+
+    /// FS-4 companion green: the cap-refusal severity keys on the
+    /// standing MIX — a Charged-dominated full ledger (unanswered
+    /// mints) still reads as the scheduler-side outage; a
+    /// CredentialOnly-dominated one is the contested-remainder steady
+    /// state. The refusal itself stands either way (live credentials
+    /// are never evicted).
+    #[test]
+    fn cap_refusal_severity_keys_on_the_standing_mix() {
+        let entry = |standing: SlotStanding| {
+            let job = Uuid::now_v7();
+            ResumeEntry {
+                job_id: job,
+                drv_hash: format!("drv-{job}"),
+                tenant_hint: None,
+                origin: "cache_opportunity".into(),
+                nonce: Uuid::new_v4(),
+                standing,
+            }
+        };
+
+        // Charged-dominated: the outage warn shape.
+        let mut charged_heavy = ResumeLedger::default();
+        for _ in 0..RESUME_LEDGER_CAP {
+            charged_heavy.note_pull(entry(SlotStanding::Charged));
+        }
+        assert!(
+            charged_heavy.cap_refusal_is_outage(),
+            "32/32 Charged: outage"
+        );
+        assert!(
+            charged_heavy
+                .begin_fresh_claim(Uuid::now_v7(), |nonce| {
+                    let mut e = entry(SlotStanding::Charged);
+                    e.nonce = nonce;
+                    e
+                })
+                .is_none(),
+            "the refusal stands"
+        );
+
+        // CredentialOnly-dominated: the contested steady state.
+        let mut contested = ResumeLedger::default();
+        for i in 0..RESUME_LEDGER_CAP {
+            contested.note_pull(entry(if i < 2 {
+                SlotStanding::Charged
+            } else {
+                SlotStanding::CredentialOnly
+            }));
+        }
+        assert!(
+            !contested.cap_refusal_is_outage(),
+            "2 Charged / 30 CredentialOnly: contested remainder, not an outage"
+        );
+        assert!(
+            contested
+                .begin_fresh_claim(Uuid::now_v7(), |nonce| {
+                    let mut e = entry(SlotStanding::Charged);
+                    e.nonce = nonce;
+                    e
+                })
+                .is_none(),
+            "the refusal stands either way (credentials are never evicted)"
+        );
+
+        // The tie stays loud (conservative direction).
+        let mut tie = ResumeLedger::default();
+        for i in 0..RESUME_LEDGER_CAP {
+            tie.note_pull(entry(if i < RESUME_LEDGER_CAP / 2 {
+                SlotStanding::Charged
+            } else {
+                SlotStanding::CredentialOnly
+            }));
+        }
+        assert!(tie.cap_refusal_is_outage(), "16/16 tie: keep the warn");
+    }
+
+    /// bug_034 — the standing transition is MONOTONE: a NotYetReady
+    /// answer refunds (Charged→CredentialOnly); a LATER lost response
+    /// on the resume lane does not re-charge. Pass 1: fresh mint for A
+    /// answers NotYetReady (refunded). Pass 2: A's resume pull is
+    /// LOST — the entry survives, still CredentialOnly, and the fresh
+    /// budget stays free (B claims).
+    #[tokio::test(start_paused = true)]
+    async fn lost_resume_response_does_not_recharge() {
+        let job_a = descriptor(1);
+        let job_b = descriptor(2);
+        let mut t = MockTransport::new(
+            vec![
+                Ok(listing(vec![job_a.clone()])),
+                Ok(listing(vec![job_a.clone(), job_b.clone()])),
+            ],
+            vec![Ok(not_yet_ready())],
+            vec![],
+        );
+        let mut ledger = ResumeLedger::default();
+        let mut latch = ListFailureLatch::default();
+        let tok = token();
+        let inst = instance("monotone-w");
+        let c1 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &tok).await;
+        assert!(c1.is_empty());
+        assert_eq!(ledger.charged_len(), 0, "pass 1: answered → refunded");
+
+        // Pass 2: the resume pull for A is lost; B's fresh pull
+        // delivers.
+        t.hang_next_pulls = 1;
+        t.pulls = vec![Ok(deliver("exec-b", "/nix/store/bbb-two.drv"))].into();
+        let c2 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &tok).await;
+        assert_eq!(
+            c2.len(),
+            1,
+            "a lost RESUME response cannot re-charge the refunded entry — \
+             the fresh budget stays free and B claims"
+        );
+        assert_eq!(c2[0].drv_hash, job_b.drv_hash);
+        assert_eq!(ledger.len(), 1, "A's credential still rides");
+        assert_eq!(ledger.charged_len(), 0, "still CredentialOnly (monotone)");
     }
 
     /// (d) The BC-1 wire obligation: every claim carries
@@ -2888,6 +3308,7 @@ mod tests {
                 tenant_hint: None,
                 origin: "cache_opportunity".into(),
                 nonce: Uuid::new_v4(),
+                standing: SlotStanding::Charged,
             });
         }
         assert_eq!(full.len(), RESUME_LEDGER_CAP);
@@ -2899,6 +3320,7 @@ mod tests {
                 tenant_hint: None,
                 origin: "cache_opportunity".into(),
                 nonce,
+                standing: SlotStanding::Charged,
             })
             .is_none(),
             "at cap the mint authority refuses"

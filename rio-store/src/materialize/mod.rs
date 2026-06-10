@@ -192,6 +192,25 @@ pub fn spawn_materialization_executor(
 
 /// One worker's claim loop: poll → claim (one job at a time) →
 /// execute → report, with jittered pacing; shutdown-aware.
+///
+/// **Beat cadence (live_041):** the jittered poll interval IS the
+/// listing beat — each pass's `ListMaterializationJobs` call doubles
+/// as this worker's liveness contact for the scheduler's
+/// rendezvous-partitioned listing (the scheduler tracks
+/// `{worker → last_listed_at}` from the verified token instance and
+/// serves each worker its own slice of the claimable head, plus a
+/// steal horizon of jobs whose owner has missed its beat). The
+/// worker carries NO steal logic: an idle worker's normal listing
+/// already contains whatever the scheduler decided it should see.
+/// Two cadence consequences, both intended:
+///   - execution is inline-serial below, so a worker mid-walk skips
+///     beats for the walk's duration — its unclaimed slice ages past
+///     the scheduler's steal horizon and is offered to idle workers
+///     (work stealing exactly when this worker cannot claim anyway);
+///   - the scheduler's staleness horizon is calibrated against the
+///     DEFAULT `poll_interval_secs = 1` (±20 % jitter): raising the
+///     interval past that horizon degrades to broader, more-contested
+///     listings (the pre-live_041 shape) — never to unlisted jobs.
 async fn claim_loop<T>(
     worker: usize,
     cfg: crate::config::MaterializationConfig,
