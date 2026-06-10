@@ -3214,3 +3214,147 @@ async fn outbox_replay_refused_requires_newer_foreign_truth() -> TestResult {
     assert_eq!(actor.status_outbox.len(), 0, "refusal is final; pops");
     Ok(())
 }
+
+// r[verify sched.attempt.cancel-close-driven+3]
+/// bug_078 R1: a tick whose persists all succeed emits ZERO staleness
+/// disclosures regardless of backlog age. PROPOSITION CERTIFIED at
+/// the VALUE (`stale_disclosure() == None` on the returned `Drained`
+/// outcome) over a production-latched aged backlog, plus the tracing
+/// capture pinning the emitted warn count at 0. Pre-fix TRUE red =
+/// the tracing-capture count (one "PG persists keep failing" per
+/// popped batch on the healed drain tick, depth counting down); the
+/// typed half is green-side by necessity — the type IS the fix — and
+/// is disclosed as such.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn healed_drain_claims_no_persist_failures() -> TestResult {
+    use crate::actor::housekeeping::FlushTickOutcome;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor(db.pool.clone());
+    // Three DAG-absent terminal latches (the terminal-KEEP arm), aged
+    // far past the disclosure floor — the >5min-PG-outage-heals world.
+    // Distinct drvs (no supersession); durable rows backdated so the
+    // replay's age cut admits them.
+    for i in 0..3 {
+        let h = format!("heal-drain-{i}");
+        sqlx::query(
+            "INSERT INTO derivations (drv_hash, drv_path, pname, system, status) \
+             VALUES ($1, $2, 'pkg', 'x86_64-linux', 'running')",
+        )
+        .bind(&h)
+        .bind(test_drv_path(&h))
+        .execute(&db.pool)
+        .await?;
+        sqlx::query(
+            "UPDATE derivations SET \
+               updated_at = now() - interval '900 seconds', \
+               status_changed_at = now() - interval '900 seconds' \
+             WHERE drv_hash = $1",
+        )
+        .bind(&h)
+        .execute(&db.pool)
+        .await?;
+        actor.latch_status_batch(crate::actor::StatusBatch {
+            drv_hashes: vec![h],
+            status: DerivationStatus::Cancelled,
+            exec_ids: vec![],
+            enqueued_at: std::time::Instant::now() - std::time::Duration::from_secs(400),
+            latched_at_epoch: crate::db::attempts::epoch_now() - 400.0,
+        });
+    }
+
+    let authority = actor.dag_authority().expect("always-leader test actor");
+    let outcome = actor.tick_flush_status_outbox(&authority).await;
+
+    // The typed half (green-side by necessity, disclosed): all three
+    // drained; the disclosure is unconstructible from this outcome.
+    assert_eq!(outcome, FlushTickOutcome::Drained { batches: 3 });
+    assert_eq!(outcome.stale_disclosure(), None);
+    assert_eq!(actor.status_outbox.len(), 0, "the healed tick drains all");
+    // The pre-fix red: the lying-warn count on the healed drain tick.
+    logs_assert(|lines: &[&str]| {
+        let lying = lines
+            .iter()
+            .filter(|l| l.contains("status outbox head is old"))
+            .count();
+        if lying == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "left: {lying} warns on a tick with zero failed persists \
+                 (one per popped batch, depth counting down) / right: 0"
+            ))
+        }
+    });
+    Ok(())
+}
+
+// r[verify sched.attempt.cancel-close-driven+3]
+/// bug_078 R2: a parked-on-Err tick with an aged head yields exactly
+/// one disclosure carrying that head's age and the live depth — the
+/// failure-evidence coupling. PROPOSITION CERTIFIED: the disclosure
+/// derives from the typed outcome's parked-on-Err arm (pool closed —
+/// the production-shaped PG failure where every query errors) and
+/// from nowhere else; totality over the third arm (Fenced → None)
+/// rides the same closed match. The typed assertions are
+/// pre-fix-inexpressible (the outcome type IS the fix — disclosed
+/// strawman per R16); the pre-fix behavior is pinned by R1's capture.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn parked_tick_disclosure_carries_the_failure_evidence() -> TestResult {
+    use crate::actor::housekeeping::FlushTickOutcome;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor(db.pool.clone());
+    actor.latch_status_batch(crate::actor::StatusBatch {
+        drv_hashes: vec!["parked-aged".into()],
+        status: DerivationStatus::Cancelled,
+        exec_ids: vec![],
+        enqueued_at: std::time::Instant::now() - std::time::Duration::from_secs(400),
+        latched_at_epoch: crate::db::attempts::epoch_now() - 400.0,
+    });
+    let authority = actor.dag_authority().expect("always-leader test actor");
+
+    // Production-shaped PG failure: the pool is closed; every query
+    // errors at acquire.
+    db.pool.close().await;
+    let outcome = actor.tick_flush_status_outbox(&authority).await;
+
+    match &outcome {
+        FlushTickOutcome::ParkedOnErr { head_age, depth } => {
+            assert!(
+                *head_age > std::time::Duration::from_secs(300),
+                "the park captured the aged head's enqueue age (got {head_age:?})"
+            );
+            assert_eq!(*depth, 1, "the re-pushed head is the live depth");
+        }
+        other => panic!("left: {other:?} / right: ParkedOnErr with the failure evidence"),
+    }
+    let d = outcome
+        .stale_disclosure()
+        .expect("an aged parked-on-Err head discloses");
+    assert!(d.head_age > std::time::Duration::from_secs(300));
+    assert_eq!(d.depth, 1);
+    assert_eq!(
+        actor.status_outbox.len(),
+        1,
+        "the batch is retained for the next tick"
+    );
+    // Exactly one disclosure (single constructor x single emission
+    // site — the cardinality envelope).
+    logs_assert(|lines: &[&str]| {
+        let n = lines
+            .iter()
+            .filter(|l| l.contains("status outbox head is old"))
+            .count();
+        if n == 1 {
+            Ok(())
+        } else {
+            Err(format!("left: {n} disclosures / right: exactly 1"))
+        }
+    });
+    Ok(())
+}

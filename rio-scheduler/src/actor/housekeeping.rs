@@ -42,6 +42,81 @@ const ORPHAN_BUILD_GRACE: std::time::Duration = std::time::Duration::from_secs(3
 #[cfg(test)]
 const ORPHAN_BUILD_GRACE: std::time::Duration = std::time::Duration::ZERO;
 
+/// Disclosure floor for a parked status-outbox head (bug_078). The
+/// violable axis, named: ≫ the housekeeping tick cadence (one slow PG
+/// round-trip or a single parked tick never discloses) and on the
+/// establishment-slack scale — the same order as the attempt-repair
+/// machinery whose rows the latched batches hold open, so by the time
+/// this fires the operator-visible claim ("persists keep FAILING")
+/// describes a sustained outage, not a blip.
+const STALE_OUTBOX_DISCLOSURE_AGE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// One flush tick's outcome over the status outbox (bug_078, the
+/// typed tick outcome): folded by the drain loop — `Applied`
+/// accumulates into [`FlushTickOutcome::Drained`]; the Err arm
+/// captures the re-pushed head's age + the remaining depth; the
+/// fence arm its own depth. The failure-claiming staleness
+/// disclosure is constructible ONLY from the parked-on-Err arm
+/// (see [`FlushTickOutcome::stale_disclosure`]), so a "PG persists
+/// keep failing" string cannot be assembled on a success path: the
+/// drain law (`sched.attempt.cancel-close-driven`) guarantees the
+/// post-heal tick visits every stale batch, and the pre-fix in-loop
+/// age warn fired once per batch on exactly that all-success tick —
+/// at the moment operators read logs to decide whether the system
+/// recovered.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum FlushTickOutcome {
+    /// Every queued batch replayed-and-popped this tick.
+    Drained {
+        /// Batches popped (replayed or close-only flushed).
+        batches: usize,
+    },
+    /// The tick parked on a failed persist: the head batch was
+    /// re-pushed; `head_age` is its enqueue age sampled at park time.
+    ParkedOnErr {
+        head_age: std::time::Duration,
+        depth: usize,
+    },
+    /// The tick parked on the claims-floor fence (deposed mid-tick).
+    /// The truthful observable is `note_fenced_evidence_write`; a
+    /// persist-failure claim is unrepresentable from this arm.
+    ParkedOnFence { depth: usize },
+}
+
+/// The staleness disclosure (bug_078): the operator-facing
+/// "persists keep failing" claim as a VALUE. Its only constructor is
+/// [`FlushTickOutcome::stale_disclosure`]'s parked-on-Err arm — on
+/// `Drained`/`ParkedOnFence` the type is unrepresentable, so the
+/// emission site after the loop cannot lie regardless of backlog age.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct StaleDisclosure {
+    pub(super) head_age: std::time::Duration,
+    pub(super) depth: usize,
+}
+
+impl FlushTickOutcome {
+    /// `Some` exclusively from [`FlushTickOutcome::ParkedOnErr`] with
+    /// `head_age >` [`STALE_OUTBOX_DISCLOSURE_AGE`] — the disclosure's
+    /// single constructor (its cardinality-per-tick envelope: ∈ {0,1},
+    /// = 0 on an all-success tick, typed by single-constructor ×
+    /// single-emission-site).
+    pub(super) fn stale_disclosure(&self) -> Option<StaleDisclosure> {
+        match self {
+            FlushTickOutcome::ParkedOnErr { head_age, depth }
+                if *head_age > STALE_OUTBOX_DISCLOSURE_AGE =>
+            {
+                Some(StaleDisclosure {
+                    head_age: *head_age,
+                    depth: *depth,
+                })
+            }
+            FlushTickOutcome::ParkedOnErr { .. }
+            | FlushTickOutcome::Drained { .. }
+            | FlushTickOutcome::ParkedOnFence { .. } => None,
+        }
+    }
+}
+
 impl DagActor {
     /// Refresh the SLA estimator from build_samples. Runs every ~6
     /// ticks (60s at the default 10s interval). Separated from
@@ -730,7 +805,12 @@ impl DagActor {
     /// fail-fasts on the first Err/Fenced (a dead PG costs one attempt
     /// per tick — the throttle rationale applies to failures only;
     /// pre-fix it throttled the success path to 6 batches/minute,
-    /// scaling the stale-replay window linearly with depth).
+    /// scaling the stale-replay window linearly with depth). Returns
+    /// the tick's [`FlushTickOutcome`] — the staleness disclosure
+    /// derives from it AFTER the loop (bug_078): the drain law above
+    /// guarantees the post-heal tick visits every stale batch, and the
+    /// pre-fix in-loop age warn emitted one "PG persists keep failing"
+    /// per latched batch on exactly that all-success tick.
     ///
     /// Each batch is re-derived against the authoritative in-memory
     /// DAG before replay (we hold the `DagAuthority` witness):
@@ -773,16 +853,14 @@ impl DagActor {
     /// Leader-gated by `handle_tick`; the outbox is cleared on
     /// leadership loss in `clear_persisted_state`.
     // r[impl sched.attempt.cancel-close-driven+3]
-    pub(super) async fn tick_flush_status_outbox(&mut self, _authority: &super::DagAuthority) {
-        while let Some(front) = self.status_outbox.front() {
-            let age = front.enqueued_at.elapsed();
-            if age > std::time::Duration::from_secs(300) {
-                warn!(
-                    depth = self.status_outbox.len(),
-                    age_secs = age.as_secs(),
-                    "status outbox head is old; PG persists keep failing \
-                     (the latched batches' attempt rows stay open until this drains)"
-                );
+    pub(super) async fn tick_flush_status_outbox(
+        &mut self,
+        _authority: &super::DagAuthority,
+    ) -> FlushTickOutcome {
+        let mut batches = 0usize;
+        let outcome = loop {
+            if self.status_outbox.front().is_none() {
+                break FlushTickOutcome::Drained { batches };
             }
             let batch = self
                 .status_outbox
@@ -840,7 +918,9 @@ impl DagActor {
                     // LeaderLost clears the whole outbox momentarily.
                     self.note_fenced_evidence_write("status outbox flush");
                     self.status_outbox.push_front(batch);
-                    break;
+                    break FlushTickOutcome::ParkedOnFence {
+                        depth: self.status_outbox.len(),
+                    };
                 }
                 Ok(crate::db::StatusReplay::Applied { replayed, residual }) => {
                     // merged_bug_108: every zero-row residual arrives
@@ -929,12 +1009,31 @@ impl DagActor {
                 Err(e) => {
                     warn!(count = kept.len(), error = %e,
                           "status outbox: flush failed; retrying next tick");
+                    // The failure evidence: the re-pushed head's age,
+                    // sampled at park time (the disclosure's clock).
+                    let head_age = batch.enqueued_at.elapsed();
                     self.status_outbox.push_front(batch);
-                    break;
+                    break FlushTickOutcome::ParkedOnErr {
+                        head_age,
+                        depth: self.status_outbox.len(),
+                    };
                 }
             }
+            batches += 1;
+        };
+        // The single emission site (bug_078): the disclosure exists
+        // only as a value minted from the parked-on-Err arm — a tick
+        // whose persists all succeeded cannot assemble this string.
+        if let Some(d) = outcome.stale_disclosure() {
+            warn!(
+                depth = d.depth,
+                age_secs = d.head_age.as_secs(),
+                "status outbox head is old; PG persists keep failing \
+                 (the latched batches' attempt rows stay open until this drains)"
+            );
         }
         metrics::gauge!("rio_scheduler_status_outbox_depth").set(self.status_outbox.len() as f64);
+        outcome
     }
 
     /// Establishment sweep for open pull-mode attempts — the single
