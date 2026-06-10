@@ -137,7 +137,8 @@ pkgs.testers.runNixOSTest {
   skipTypeCheck = true;
   # k3s bring-up ~240s + cache-seed ~20s + cascade poll ≤90s + drain
   # ≤90s + chain seed ~10s + chain submit ≤120s + slack. The 30-leaf
-  # substitute is serialized (admission=1) over a 200ms tc-netem
+  # substitute is serialized (P=1 path slot at admission cap 2,
+  # live_047/R-C) over a 200ms tc-netem
   # upstream → ~24s, so the scheduler's 10s housekeeping tick (the
   # gauge publication cadence) observes a nonzero backlog
   # deterministically.
@@ -418,7 +419,7 @@ pkgs.testers.runNixOSTest {
         # Tiny NARs over the local vlan drain in ~400ms — no tick
         # would ever observe a nonzero backlog and the rises/falls
         # assertions would be unprovable.
-        # 200ms egress delay × admission=1 (serial) → each
+        # 200ms egress delay × P=1 slot-serialized walks → each
         # narinfo+NAR fetch ≈ 2 RTTs ≈ 800ms → 30 leaves ≈ 24s.
         # eth1 = the test vlan (eth0 is QEMU user-net). qdisc replace
         # is idempotent across re-runs; deleted post-cascade so the
@@ -446,7 +447,8 @@ pkgs.testers.runNixOSTest {
         # ── (1) poll (backlog gauge, admission util) from t=0 ────────
         # Single Python loop sampling the scheduler + store Prometheus
         # surfaces — the exact series the store ScaledObject's triggers
-        # query. With netem 200ms + admission=1 the cascade lasts ~24s,
+        # query. With netem 200ms + the P=1 slot serialization the
+        # cascade lasts ~24s,
         # so both the 1s poll here AND the scheduler's 10s housekeeping
         # tick (the gauge publication cadence) reliably observe a
         # nonzero backlog. The STRUCTURAL proof of "every leaf took the
@@ -535,7 +537,7 @@ pkgs.testers.runNixOSTest {
             f"during the substitute cascade — the autoscaling signal "
             f"path is dead (gauge not published from the snapshot "
             f"bucket, leader pf stale, or the cascade drained inside "
-            f"one 10s gauge tick despite admission=1+netem). "
+            f"one 10s gauge tick despite P=1 slot serialization+netem). "
             f"samples={samples}"
         )
 
@@ -550,17 +552,24 @@ pkgs.testers.runNixOSTest {
         )
 
         # ── (4) admission utilization observable mid-cascade ─────────
-        # The 1-permit gate is held essentially continuously for ~24s
-        # (each fetch ≈ 800ms through the netem'd upstream, 30 serial
-        # fetches), so the 1s sampler must catch utilization 1.0 —
-        # observable on the SAME Prometheus surface KEDA and the
-        # store-scaling dashboard read. This replaces the retired
-        # CR-status (observedLoadFactor) wire proof: the gauge is set
-        # at acquire/release by the gate itself, no GetLoad needed.
-        assert adm_peak >= 1.0, (
+        # live_047/R-C: ONE admission permit of the 2-permit gate is
+        # held essentially continuously for ~24s (P = cap/2 = 1 path
+        # slot serializes the walks; each fetch ≈ 800ms through the
+        # netem'd upstream, 30 serial fetches), so the 1s sampler must
+        # catch utilization >= 0.5 — the executor's LAWFUL full-draw
+        # ceiling (r[store.materialize.gate-share]: the executor can
+        # never saturate the gate; >= cap/2 permits stay free for RPC
+        # miss traffic — saturating 1.0 was the pre-law inversion this
+        # scenario used as a harness device). Observable on the SAME
+        # Prometheus surface KEDA and the store-scaling dashboard
+        # read. This replaces the retired CR-status
+        # (observedLoadFactor) wire proof: the gauge is set at
+        # acquire/release by the gate itself, no GetLoad needed.
+        assert adm_peak >= 0.5, (
             f"rio_store_substitute_admission_utilization peaked at "
-            f"{adm_peak}, expected 1.0 on a 1-permit gate under a "
-            f"~24s serialized cascade — admission gauge not updating "
+            f"{adm_peak}, expected >= 0.5 on a 2-permit gate with the "
+            f"P=1 slot-serialized ~24s cascade (the executor's lawful "
+            f"full-draw ceiling) — admission gauge not updating "
             f"or the store metrics forward died. samples={samples}"
         )
 
@@ -866,7 +875,7 @@ pkgs.testers.runNixOSTest {
         # to a builder; we don't wait for that — the eager-probe proof
         # is the 49-link merge-time verdict, not root completion. Poll
         # the WatchBuild stream until all 49 SUBSTITUTING events have
-        # serialized through journalctl (admission=1 + tiny NARs ≈ 2s;
+        # serialized through journalctl (P=1 slots + tiny NARs ≈ 2s;
         # 60s slack), then assert exactly 49. Build cancelled after.
         k3s_server.wait_until_succeeds(
             "n=$(journalctl -u subchain-submit --no-pager "

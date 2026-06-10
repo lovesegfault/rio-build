@@ -8797,7 +8797,7 @@ rec {
     # fold evaluation's cell laws; a cross-path interleaving axis would
     # blast the const-binding radius across its calibration corpus).
     # Measured (TLC, exhaustive, F=2 x 4 paths): 250 states generated /
-    # 109 distinct, all four holds [ok] in 826ms; budget 120s.
+    # 109 distinct, all five holds [ok] in 867ms; budget 120s.
     # r[verify store.materialize.path-fold]
     quint-walkfanout = mkQuintCheck {
       name = "walkfanout";
@@ -8814,7 +8814,8 @@ rec {
         };
       };
       invariants = [
-        "windowBounded"
+        "windowWithinF"
+        "noSpawnAfterLatch"
         "foldTierLawful"
         "floorMonotoneCommitOnly"
         "cellsSingleGeneration"
@@ -8835,9 +8836,9 @@ rec {
       modelTimeoutSec = 120;
       witness = "foldTierLawful";
     };
-    # Kill isolation for the arrival-pick twin: windowBounded stays
+    # Kill isolation for the arrival-pick twin: BOTH window leaves stay
     # INTACT under calibStep (the perturbation kills exactly one hold).
-    # Measured (TLC, exhaustive): 109 distinct states, [ok] in 869ms;
+    # Measured (TLC, exhaustive): 109 distinct states, [ok] in 854ms;
     # budget 120s.
     quint-walkfanout-calib-arrival-pick-isolation = mkQuintCheck {
       name = "walkfanout-calib-arrival-pick-isolation";
@@ -8846,19 +8847,16 @@ rec {
       main = "walkFanoutArrivalPick";
       step = "calibStep";
       modelTimeoutSec = 120;
-      vacuityExempt = {
-        windowBounded = {
-          class = "scope-bound";
-          reason = "kill-isolation lane for the arrival-pick twin -- this leaf's falsifier is the spawn-after-abort twin in its own lane";
-        };
-      };
-      invariants = [ "windowBounded" ];
+      invariants = [
+        "windowWithinF"
+        "noSpawnAfterLatch"
+      ];
     };
     # The latch ignored at spawn (pre-law shape): a walk keeps widening
-    # after an abort-grade completion -- dies through windowBounded via
-    # the spawnedPostLatch ghost (written by the live seat, reachable
-    # only under the perturbation). Measured: [violation] 61ms at
-    # 2M-sample budget; budget 120s.
+    # after an abort-grade completion -- dies through noSpawnAfterLatch
+    # via the spawnedPostLatch ghost (written by the live seat,
+    # reachable only under the perturbation; width guard intact).
+    # Measured: [violation] 57ms at 2M-sample budget; budget 120s.
     quint-walkfanout-calib-spawn-after-abort = mkQuintWitnessCheck {
       name = "walkfanout-calib-spawn-after-abort";
       spec = "calibration/walkfanout-spawn-after-abort";
@@ -8866,7 +8864,21 @@ rec {
       main = "walkFanoutSpawnAfterAbort";
       step = "calibStep";
       modelTimeoutSec = 120;
-      witness = "windowBounded";
+      witness = "noSpawnAfterLatch";
+    };
+    # Width-blind spawn (pre-law shape): every frontier path spawns
+    # immediately -- dies through windowWithinF (inflight 3 > F = 2;
+    # latch guard intact, so this twin kills exactly the width
+    # clause). Measured: [violation] 58ms at 2M-sample budget;
+    # budget 120s.
+    quint-walkfanout-calib-spawn-unbounded = mkQuintWitnessCheck {
+      name = "walkfanout-calib-spawn-unbounded";
+      spec = "calibration/walkfanout-spawn-unbounded";
+      extraSpecs = [ "walkFanout" ];
+      main = "walkFanoutSpawnUnbounded";
+      step = "calibStep";
+      modelTimeoutSec = 120;
+      witness = "windowWithinF";
     };
   };
 

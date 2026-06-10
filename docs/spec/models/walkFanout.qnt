@@ -27,9 +27,10 @@
 //   4 = AbortGrade(transient).
 //
 // Twins (each dies through exactly one hold; kill isolation for the
-// arrival-pick twin is its own holds lane on windowBounded):
-//   calibration/walkfanout-arrival-pick  -> foldTierLawful
-//   calibration/walkfanout-spawn-after-abort -> windowBounded
+// arrival-pick twin is its own holds lane on the window leaves):
+//   calibration/walkfanout-arrival-pick      -> foldTierLawful
+//   calibration/walkfanout-spawn-after-abort -> noSpawnAfterLatch
+//   calibration/walkfanout-spawn-unbounded   -> windowWithinF
 //
 // State counts, depth, and wall-clock: in the wired check's
 // transcript and the introducing commit message, never here.
@@ -244,13 +245,16 @@ module walkFanout {
   }
 
   // ── holds ─────────────────────────────────────────────────────────
+  // (named single-conjunct leaves per the quint-policy P7 discipline —
+  // each owes its own falsify twin)
 
-  /// Law 2: in-flight ≤ F at every instant, and zero spawns after the
-  /// latch (the ghost — the spawn-after-abort twin's kill surface).
-  val windowBounded = and {
-    inflight.size() <= F,
-    not(spawnedPostLatch),
-  }
+  /// Law 2, width clause: in-flight ≤ F at every instant (the
+  /// spawn-unbounded twin's kill surface).
+  val windowWithinF = inflight.size() <= F
+
+  /// Law 2, latch clause: zero spawns after the latch (the ghost —
+  /// the spawn-after-abort twin's kill surface).
+  val noSpawnAfterLatch = not(spawnedPostLatch)
 
   /// Law 4: the job verdict is the tier fold of COMPLETED evidence —
   /// a function of the multiset, never of arrival order within it.

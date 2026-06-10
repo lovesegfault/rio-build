@@ -420,7 +420,12 @@ let
     fixture = k3sFull {
       jwtEnabled = true;
       extraValuesTyped = {
-        "store.substituteAdmissionPermits" = 1;
+        # live_047/R-C: 2 is the validate() floor (cap 1 would make the
+        # executor path-slot pool P = cap/2 = 0 and is boot-rejected).
+        # P = 1 slot-serializes the walks, which preserves this
+        # scenario's stretched-cascade intent — see the scenario-builder
+        # comment below.
+        "store.substituteAdmissionPermits" = 2;
       };
     };
   };
@@ -1223,13 +1228,19 @@ in
   #
   # jwtEnabled: substitution is tenant-scoped (try_substitute_on_miss
   # short-circuits without x-rio-tenant-token); the gateway must mint
-  # it from the SSH key comment. substituteAdmissionPermits=1
-  # serializes the 30 fetches so (with 200ms tc-netem on upstream-v6)
-  # the cascade outlives the scheduler's 10s housekeeping tick (the
-  # gauge publication cadence) — at the derived default (pg_max×3≥64),
-  # tiny NARs drain in <1s and no tick would observe a nonzero
-  # backlog. Set via the chart key (not extraEnv) so the values.yaml →
-  # store.yaml templating is exercised.
+  # it from the SSH key comment. substituteAdmissionPermits=2 — the
+  # validate() floor (live_047/R-C: cap 1 would make the executor
+  # path-slot pool P = 0 and is boot-rejected) — gives P = cap/2 = 1
+  # path slot: the 30 walks SLOT-serialize (one in-flight path fleet-
+  # wide — the store.materialize.gate-share law), so with 200ms tc-netem on
+  # upstream-v6 the cascade still outlives the scheduler's 10s
+  # housekeeping tick (the gauge publication cadence) — at the derived
+  # default (pg_max×3≥64, P=32), tiny NARs drain in <1s and no tick
+  # would observe a nonzero backlog. The executor's lawful full-draw
+  # ceiling is P/cap = 0.5 of the gate (it can never saturate it —
+  # that inversion was the pre-law harness device this fixture used to
+  # encode as admission=1). Set via the chart key (not extraEnv) so
+  # the values.yaml → store.yaml templating is exercised.
   #
   # r[verify obs.metric.scheduler-substituting+2]
   #   cascade: the §2.6 substituting bucket (pending unclaimed jobs)

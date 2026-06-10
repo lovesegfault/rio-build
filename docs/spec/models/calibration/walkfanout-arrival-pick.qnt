@@ -20,7 +20,8 @@
 //   complete(3 charge — the dequeue backlog) ->
 //   calibCompileArrivalPick (verdict "retry" with a completed charge).
 //
-// Kill isolation: windowBounded stays INTACT under calibStep — its
+// Kill isolation: both window leaves (windowWithinF,
+// noSpawnAfterLatch) stay INTACT under calibStep — their
 // own holds lane (quint-walkfanout-calib-arrival-pick-isolation).
 //
 // Run (falsification):
