@@ -10042,6 +10042,10 @@ async fn listing_cost_counters_move_at_the_choke_sites() -> TestResult {
     seed_claimable_jobs(&handle, &store, "cost-wire", 6).await?;
 
     let members: Vec<String> = (0..3).map(|w| worker_member("store-wire", w)).collect();
+    // Age any seeding-time snapshot past its TTL so the measured
+    // beats include a head-window refresh (post-close, joins alone
+    // do not refetch a warm snapshot — by design).
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let before = crate::actor::materialize::listing_cost_snapshot();
     for m in &members {
         let _ = list_materialization_jobs_as(&handle, 64, m).await;
@@ -10300,4 +10304,233 @@ proptest::proptest! {
             }
         }
     }
+}
+// r[verify sched.materialize.listing-cost]
+/// bug_045 envelope red (1) — the per-poll cost law's scoring half.
+/// Proposition certified (R16): on a poll in a STABLE membership
+/// epoch over a WARM snapshot, partition-scoring work is ZERO and no
+/// member scan runs — the owner map is maintained per membership
+/// event, never recomputed per poll. Structural witness: operation
+/// counters (the repo's structural-over-wall-clock rule), never
+/// wall-clock.
+///
+/// Pre-fix defect manifest (recorded verbatim in the close commit):
+/// every identity-bearing poll in a >1 membership rescored the whole
+/// window per member — delta = polls x window x members SipHashes,
+/// all serialized on the single-threaded actor turn.
+///
+/// The member-touch half is asserted when no TTL refresh fired during
+/// the measured polls (refresh-boundary beat work is membership-event
+/// work, not per-poll work; under a CI stall past the snapshot TTL
+/// the scoring assertion still binds unconditionally).
+#[tokio::test]
+async fn stable_epoch_polls_compute_zero_scores() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    seed_claimable_jobs(&handle, &store, "cost-stable", 12).await?;
+
+    let members: Vec<String> = (0..3).map(|w| worker_member("store-stable", w)).collect();
+    // Warm-up: two beats per member — joins processed, snapshot warm.
+    for _ in 0..2 {
+        for m in &members {
+            let _ = list_materialization_jobs_as(&handle, 64, m).await;
+        }
+    }
+
+    let before = crate::actor::materialize::listing_cost_snapshot();
+    for _ in 0..10 {
+        let served = list_materialization_jobs_as(&handle, 64, &members[0]).await;
+        assert!(!served.is_empty(), "precondition: the member owns a slice");
+    }
+    let after = crate::actor::materialize::listing_cost_snapshot();
+
+    let refreshes = after.snapshot_fetches - before.snapshot_fetches;
+    assert_eq!(
+        after.scores_computed - before.scores_computed,
+        0,
+        "left: every poll rescores the window per member (delta = polls x \
+         window x members SipHashes per actor turn) / right: zero scoring \
+         work on a stable-epoch poll over a warm snapshot"
+    );
+    if refreshes == 0 {
+        assert_eq!(
+            after.member_touches - before.member_touches,
+            0,
+            "left: per-poll membership scans (contact retain + owner-age \
+             walks per row) / right: zero member touches on a warm-snapshot \
+             stable-epoch poll"
+        );
+    }
+    Ok(())
+}
+
+// r[verify sched.materialize.listing-cost]
+/// bug_045 envelope red (2) — the head-window fetch half. Proposition
+/// certified (R16): identity-bearing polls within one beat share ONE
+/// head-window fetch — the query runs at most once per snapshot TTL,
+/// not once per poll. The bound is elapsed-derived (1 boundary fetch
+/// + one per TTL window actually crossed) so a CI stall widens the
+/// budget instead of flaking the law.
+///
+/// Pre-fix defect manifest: N fetches for N polls — the 512-row query
+/// awaited in-turn on the single-threaded actor, once per poll per
+/// worker fleet-wide.
+#[tokio::test]
+async fn listing_serves_polls_share_one_head_fetch_per_beat() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    seed_claimable_jobs(&handle, &store, "cost-beat", 12).await?;
+
+    let m0 = worker_member("store-beat", 0);
+    let m1 = worker_member("store-beat", 1);
+    // Warm-up beats: membership registered, snapshot warm.
+    let _ = list_materialization_jobs_as(&handle, 64, &m0).await;
+    let _ = list_materialization_jobs_as(&handle, 64, &m1).await;
+    // Age the snapshot past its TTL so the measured window opens on a
+    // refresh boundary: the law's "once" side is then observable
+    // (exactly one fetch serves all eight polls on a healthy run).
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    let started = std::time::Instant::now();
+    let before = crate::actor::materialize::listing_cost_snapshot();
+    for _ in 0..8 {
+        let _ = list_materialization_jobs_as(&handle, 64, &m0).await;
+    }
+    let after = crate::actor::materialize::listing_cost_snapshot();
+    let elapsed = started.elapsed();
+
+    let delta = after.snapshot_fetches - before.snapshot_fetches;
+    // 1 boundary refresh + 1 per full TTL window the measured polls
+    // actually spanned (TTL = 1 s).
+    let budget = 1 + elapsed.as_secs();
+    assert!(
+        delta >= 1,
+        "the TTL-expired boundary poll must refresh the snapshot"
+    );
+    assert!(
+        delta <= budget,
+        "left: one head-window fetch PER POLL ({delta} fetches for 8 polls \
+         in {elapsed:?}) / right: at most one fetch per snapshot TTL window \
+         (budget {budget})"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.listing-cost]
+/// bug_045 envelope red (3) — the membership-event maintenance bound.
+/// Proposition certified (R16): a member JOIN rescores at most the
+/// cached window — one score per cached job (the joiner against the
+/// cached winner) — never window x members.
+///
+/// Pre-fix defect manifest: the join beat rescored every row against
+/// every member (delta = window x (members+1) for the joiner's first
+/// listing).
+#[tokio::test]
+async fn member_join_rescores_at_most_the_window() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    const WINDOW: usize = 12;
+    seed_claimable_jobs(&handle, &store, "cost-join", WINDOW).await?;
+
+    let members: Vec<String> = (0..3).map(|w| worker_member("store-join", w)).collect();
+    for _ in 0..2 {
+        for m in &members {
+            let _ = list_materialization_jobs_as(&handle, 64, m).await;
+        }
+    }
+
+    // The fourth worker's first identity-bearing listing IS its join.
+    let joiner = worker_member("store-join", 3);
+    let before = crate::actor::materialize::listing_cost_snapshot();
+    let _ = list_materialization_jobs_as(&handle, 64, &joiner).await;
+    let after = crate::actor::materialize::listing_cost_snapshot();
+
+    let delta = after.scores_computed - before.scores_computed;
+    assert!(
+        delta <= WINDOW as u64,
+        "left: the join beat rescores window x members ({delta} scores for \
+         a {WINDOW}-job window, 4 members) / right: at most one score per \
+         cached job (the joiner vs each cached winner)"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.listing-cost]
+/// bug_045 envelope red (4) — the snapshot's refresh law. Proposition
+/// certified (R16): warm-snapshot polls do NOT fetch (at most one
+/// fetch per TTL window, elapsed-budgeted), and a job created through
+/// the production creation path enters the very next poll's listing —
+/// the creation-dirty edge refreshes without waiting out the TTL.
+///
+/// Pre-fix defect manifest: every poll fetched the head window (the
+/// warm-poll half is the red; the dirty half holds trivially pre-fix
+/// because every poll re-queries).
+#[tokio::test]
+async fn snapshot_refreshes_once_per_ttl_and_on_creation_dirty() -> TestResult {
+    let (test_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    seed_claimable_jobs(&handle, &store, "cost-dirty", 8).await?;
+    let db = crate::db::SchedulerDb::new(test_db.pool.clone());
+
+    let m0 = worker_member("store-dirty", 0);
+    let m1 = worker_member("store-dirty", 1);
+    let _ = list_materialization_jobs_as(&handle, 64, &m0).await;
+    let _ = list_materialization_jobs_as(&handle, 64, &m1).await;
+    // Open the measured window on a fresh beat (age the snapshot past
+    // its TTL, let ONE listing absorb the boundary refresh) so the
+    // warm-poll budget below is anchored, not racing the warm-up's
+    // unknown snapshot age.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let _ = list_materialization_jobs_as(&handle, 64, &m0).await;
+
+    // Warm polls: serve from the beat snapshot.
+    let started = std::time::Instant::now();
+    let before = crate::actor::materialize::listing_cost_snapshot();
+    for _ in 0..5 {
+        let _ = list_materialization_jobs_as(&handle, 64, &m0).await;
+    }
+    let after = crate::actor::materialize::listing_cost_snapshot();
+    let warm_delta = after.snapshot_fetches - before.snapshot_fetches;
+    let warm_budget = started.elapsed().as_secs();
+    assert!(
+        warm_delta <= warm_budget,
+        "left: warm polls each fetch the head window ({warm_delta} fetches \
+         for 5 polls) / right: zero fetches inside a warm TTL window \
+         (budget {warm_budget})"
+    );
+
+    // Creation-dirty edge: mint a ninth job through the production
+    // creation path (merge -> probe partition), with NO listing call
+    // in between — db row count is the creation witness.
+    let out = test_store_path("cost-dirty-late-out");
+    let mut node = make_node("cost-dirty-late");
+    node.expected_output_paths = vec![out.clone()];
+    merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+    barrier(&handle).await;
+    store.state.substitutable.write().unwrap().push(out);
+    let mut created = false;
+    for _ in 0..16 {
+        tick(&handle).await?;
+        barrier(&handle).await;
+        let (jobs, _) = db.count_materialization_rows().await?;
+        if jobs >= 9 {
+            created = true;
+            break;
+        }
+    }
+    assert!(created, "precondition: the probe partition minted job 9");
+
+    // The very next poll lists the new job — without waiting out the
+    // TTL (the dirty edge; on a stalled run the TTL may also have
+    // expired, which only widens the same refresh edge).
+    let served = list_materialization_jobs_as(&handle, 64, &m0).await;
+    let m1_served = list_materialization_jobs_as(&handle, 64, &m1).await;
+    let union: std::collections::HashSet<String> = served
+        .iter()
+        .chain(m1_served.iter())
+        .map(|j| j.drv_hash.clone())
+        .collect();
+    assert!(
+        union.contains("cost-dirty-late"),
+        "left: the new job waits out the snapshot TTL (absent from the \
+         post-creation beat) / right: the creation-dirty edge refreshes \
+         the snapshot immediately"
+    );
+    Ok(())
 }

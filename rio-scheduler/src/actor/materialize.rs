@@ -77,6 +77,31 @@ pub(super) const LISTING_STEAL_HORIZON: std::time::Duration = std::time::Duratio
 /// "unlisted".
 pub(super) const LISTING_MEMBER_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// bug_045 (`sched.materialize.listing-cost`) — how long one
+/// head-window snapshot serves polls before the listing beat re-runs
+/// the durable query. Derivation (R17, violable + testable): the
+/// bound must sit AT OR BELOW the worker poll cadence
+/// (`poll_interval_secs` default 1 s — a snapshot older than one beat
+/// would serve a staler head than the pre-fix per-poll query ever
+/// did) and FAR below the scales whose lapses feed the window
+/// (park backoffs: minutes; steal horizon: 5 s; member TTL: 60 s).
+/// Claimability is still filtered per poll from the LIVE view
+/// (bug_170's listed ⇒ admittable law is untouched — claimed /
+/// parked / deferred / resolved rows drop exactly as before); only
+/// park-LAPSE entry into the window waits ≤ this TTL, against park
+/// scales of minutes. Job CREATION does not wait it out at all: the
+/// view's creation feed marks the snapshot dirty
+/// ([`JobView::creations`]).
+pub(super) const LISTING_SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// bug_045 — the fixed head-window size (the pre-existing 512-row
+/// partition domain, now named): partitioned callers always drew the
+/// full bounded head so slices cover it; the snapshot subsumes the
+/// unpartitioned lanes' former `min(2×limit, 512)` over-fetch with
+/// the same superset (recorded delta — same per-poll view filter,
+/// same fail-closed arms).
+const LISTING_HEAD_WINDOW: i64 = 512;
+
 /// bug_045 (R17) — always-on operation counters for the listing
 /// chokepoint's cost envelope. The complexity claims are structural
 /// (count operations, never wall-clock — the repo's
@@ -213,11 +238,30 @@ pub(crate) struct ListingPlan {
     /// `{job_id → (winning hash, owner member)}` over the live
     /// membership, for every job in the current head window.
     owners: std::collections::HashMap<Uuid, (u64, String)>,
+    /// The beat-scoped head snapshot (raw head-window rows, SQL
+    /// order; claimability re-filtered per poll from the LIVE view).
+    snapshot: Vec<crate::db::materialization::MaterializationJobRow>,
+    /// When the snapshot was fetched; `None` = no usable snapshot
+    /// (cold start, or the last refresh errored — fail closed).
+    fetched_at: Option<std::time::Instant>,
+    /// [`JobView::creations`] at the last refresh — the dirty edge.
+    seen_creations: u64,
+    /// Per-beat owner buckets: member → ascending snapshot indices.
+    buckets: std::collections::HashMap<String, Vec<usize>>,
+    /// Members past [`LISTING_STEAL_HORIZON`] at the last beat (or
+    /// still-unrefreshed since); their buckets are served broadly.
+    stale_owners: std::collections::HashSet<String>,
+    /// The merged ascending indices of every stale owner's bucket —
+    /// precomputed per beat so a poll never iterates members.
+    stolen: Vec<usize>,
 }
 
 impl ListingPlan {
     /// The cached owner for a head-window job (present for every job
-    /// the window reconcile has seen).
+    /// the window reconcile has seen). Test-facing parity probe —
+    /// production serving reads the per-beat buckets, never per-job
+    /// lookups.
+    #[cfg(test)]
     pub(crate) fn owner(&self, job_id: Uuid) -> Option<&str> {
         self.owners.get(&job_id).map(|(_, m)| m.as_str())
     }
@@ -278,6 +322,166 @@ impl ListingPlan {
         }
         self.owners.retain(|job_id, _| seen.contains(job_id));
     }
+
+    /// Whether this poll must run the listing beat (the head-window
+    /// query): no usable snapshot, the snapshot TTL elapsed, or the
+    /// view's creation feed moved (new jobs must not wait out the
+    /// TTL).
+    fn refresh_due(&self, creations: u64, now: std::time::Instant) -> bool {
+        match self.fetched_at {
+            None => true,
+            Some(at) => {
+                now.duration_since(at) >= LISTING_SNAPSHOT_TTL || creations != self.seen_creations
+            }
+        }
+    }
+
+    /// Install one beat: the fresh head window, the owner-map
+    /// reconcile (only ENTERING jobs are scored), the staleness
+    /// partition, and the owner buckets — ALL the per-beat work, so a
+    /// poll between beats does none of it.
+    fn install_beat(
+        &mut self,
+        rows: Vec<crate::db::materialization::MaterializationJobRow>,
+        members: &[(String, std::time::Instant)],
+        creations: u64,
+        now: std::time::Instant,
+    ) {
+        self.snapshot = rows;
+        self.fetched_at = Some(now);
+        self.seen_creations = creations;
+        let window: Vec<Uuid> = self.snapshot.iter().map(|r| r.job_id).collect();
+        self.reconcile_window(window.into_iter(), members.iter().map(|(m, _)| m.as_str()));
+        self.stale_owners = members
+            .iter()
+            .filter(|(_, last)| {
+                member_touch();
+                now.duration_since(*last) > LISTING_STEAL_HORIZON
+            })
+            .map(|(m, _)| m.clone())
+            .collect();
+        self.rebuild_buckets();
+    }
+
+    /// The last refresh errored: never serve a stale-unusable
+    /// snapshot — answer empty until a refresh succeeds (the
+    /// pre-snapshot fail-closed arm, preserved).
+    fn clear_snapshot(&mut self) {
+        self.snapshot.clear();
+        self.fetched_at = None;
+        self.buckets.clear();
+        self.stolen.clear();
+    }
+
+    /// A previously-stale member listed again: un-stale it NOW (its
+    /// slice stops being served broadly on this very poll — the
+    /// partition-resumes edge the steal tests pin), rebuilding the
+    /// stolen overlay. Event-scoped work; a fresh member's poll is a
+    /// no-op O(1) lookup.
+    fn note_member_fresh(&mut self, member: &str) {
+        if self.stale_owners.remove(member) {
+            self.rebuild_stolen();
+        }
+    }
+
+    /// bug_045 mixed-mode re-seed (recorded delta): a join into an
+    /// epoch whose snapshot was installed over an EMPTY membership
+    /// (instance-less polls only) finds an empty owner cache — the
+    /// join walk has nothing to compare against, and serving would go
+    /// empty for ≤1 beat (the unsafe narrow direction). Re-seed the
+    /// cache over the current membership at the join event itself
+    /// (O(window × members) — membership-event work, exactly the
+    /// rule's budget).
+    fn reseed_if_unseeded<'a>(&mut self, members: impl Iterator<Item = &'a str> + Clone) {
+        if self.owners.is_empty() && !self.snapshot.is_empty() {
+            let window: Vec<Uuid> = self.snapshot.iter().map(|r| r.job_id).collect();
+            self.reconcile_window(window.into_iter(), members);
+        }
+    }
+
+    /// Rebuild the per-beat owner buckets and the stolen overlay from
+    /// the current snapshot + owner cache. Runs at beats and at
+    /// membership events (join/leave/un-stale) — never per poll.
+    fn rebuild_buckets(&mut self) {
+        self.buckets.clear();
+        for (idx, row) in self.snapshot.iter().enumerate() {
+            if let Some((_, owner)) = self.owners.get(&row.job_id) {
+                self.buckets.entry(owner.clone()).or_default().push(idx);
+            }
+        }
+        self.rebuild_stolen();
+    }
+
+    /// Merge the stale owners' buckets into one ascending index list.
+    fn rebuild_stolen(&mut self) {
+        let mut stolen: Vec<usize> = self
+            .stale_owners
+            .iter()
+            .filter_map(|owner| {
+                member_touch();
+                self.buckets.get(owner)
+            })
+            .flatten()
+            .copied()
+            .collect();
+        stolen.sort_unstable();
+        self.stolen = stolen;
+    }
+
+    /// Serve one poll from the beat state: the caller's owner bucket
+    /// united with the stolen overlay (ascending snapshot order — the
+    /// SQL ORDER BY survives as fairness within the served set), or
+    /// the whole snapshot for unpartitioned callers. O(served slice);
+    /// zero scoring; zero member iteration.
+    fn serve<'p>(
+        &'p self,
+        partitioned_caller: Option<&str>,
+    ) -> Box<dyn Iterator<Item = &'p crate::db::materialization::MaterializationJobRow> + 'p> {
+        match partitioned_caller {
+            None => Box::new(self.snapshot.iter()),
+            Some(me) => {
+                let mine: &[usize] = self.buckets.get(me).map(Vec::as_slice).unwrap_or(&[]);
+                let stolen: &[usize] = self.stolen.as_slice();
+                Box::new(MergeAscending::new(mine, stolen).map(|i| &self.snapshot[i]))
+            }
+        }
+    }
+}
+
+/// Two-pointer merge of two ascending, disjoint index slices (the
+/// caller's bucket + the stolen overlay) — the served set stays in
+/// snapshot (SQL) order without a sort or a member walk.
+struct MergeAscending<'a> {
+    a: &'a [usize],
+    b: &'a [usize],
+}
+
+impl<'a> MergeAscending<'a> {
+    fn new(a: &'a [usize], b: &'a [usize]) -> Self {
+        Self { a, b }
+    }
+}
+
+impl Iterator for MergeAscending<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        let take_a = match (self.a.first(), self.b.first()) {
+            (Some(x), Some(y)) => x <= y,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => return None,
+        };
+        if take_a {
+            let (x, rest) = self.a.split_first().expect("checked");
+            self.a = rest;
+            Some(*x)
+        } else {
+            let (y, rest) = self.b.split_first().expect("checked");
+            self.b = rest;
+            Some(*y)
+        }
+    }
 }
 
 /// live_041 — the leader's listing-contact map: `{worker member →
@@ -294,24 +498,23 @@ pub(crate) struct ListingContacts {
     contacts: std::collections::HashMap<String, std::time::Instant>,
 }
 
-/// What one contact note changed about the MEMBERSHIP SET (bug_045) —
-/// the only changes the incremental owner map reacts to. A refresh of
-/// an existing member produces neither.
-struct MembershipEvents {
-    /// The noting member was NEW (its insert created the key).
-    joined: bool,
-    /// Members pruned past [`LISTING_MEMBER_TTL`] by this note.
-    left: Vec<String>,
-}
-
 impl ListingContacts {
-    /// Record an identity-bearing listing call and prune members
-    /// silent past [`LISTING_MEMBER_TTL`] (the map stays bounded by
-    /// live churn, not by all-time pod history). Returns the
-    /// MEMBERSHIP EVENTS this contact produced — the joins/leaves the
-    /// incremental owner map keys on (bug_045: contact refreshes of
-    /// existing members are NOT events and cost the plan nothing).
-    fn note(&mut self, member: &str, now: std::time::Instant) -> MembershipEvents {
+    /// Record an identity-bearing listing call — an O(1) insert
+    /// (bug_045: the TTL prune moved to the listing BEAT via
+    /// [`Self::prune`]; per-poll contact recording walks nothing).
+    /// Returns whether the member JOINED (its insert created the key)
+    /// — the membership event the incremental owner map keys on;
+    /// refreshes of existing members are not events.
+    fn note(&mut self, member: &str, now: std::time::Instant) -> bool {
+        self.contacts.insert(member.to_owned(), now).is_none()
+    }
+
+    /// Prune members silent past [`LISTING_MEMBER_TTL`], returning
+    /// the leavers (the map stays bounded by live churn, not by
+    /// all-time pod history). Runs once per listing BEAT — the leave
+    /// granularity coarsens to ≤1 beat, far inside the 60 s TTL's
+    /// slack (recorded delta).
+    fn prune(&mut self, now: std::time::Instant) -> Vec<String> {
         let mut left = Vec::new();
         self.contacts.retain(|m, last| {
             member_touch();
@@ -321,13 +524,13 @@ impl ListingContacts {
             }
             live
         });
-        let joined = self.contacts.insert(member.to_owned(), now).is_none();
-        MembershipEvents { joined, left }
+        left
     }
 
     /// The live membership snapshot: members within
     /// [`LISTING_MEMBER_TTL`], with their last-listed instants (the
-    /// steal horizon reads the ages).
+    /// steal horizon reads the ages). Beat-scoped — polls between
+    /// beats never copy the membership.
     fn members(&self, now: std::time::Instant) -> Vec<(String, std::time::Instant)> {
         self.contacts
             .iter()
@@ -337,6 +540,15 @@ impl ListingContacts {
             })
             .map(|(m, last)| (m.clone(), *last))
             .collect()
+    }
+
+    /// Contact-map size — the per-poll solo/partitioned check. May
+    /// overcount by TTL-expired members for ≤1 beat (until the next
+    /// beat prunes); the affected rows are stale-owner rows already
+    /// served broadly, so the transient widens serving, never narrows
+    /// it (recorded delta).
+    fn len(&self) -> usize {
+        self.contacts.len()
     }
 }
 
@@ -885,7 +1097,15 @@ impl JobViewState {
 /// the durable authority). Availability (hydrated vs absent) is the
 /// enclosing [`JobViewState`]'s concern.
 #[derive(Debug, Default)]
-pub(crate) struct JobView(std::collections::HashMap<DrvHash, JobViewEntry>);
+pub(crate) struct JobView {
+    entries: std::collections::HashMap<DrvHash, JobViewEntry>,
+    /// bug_045 — monotone count of NEW entries fed into the view: the
+    /// listing snapshot's creation-dirty edge (new jobs must enter the
+    /// head window without waiting out the snapshot TTL). Bumped by
+    /// every insertion path that creates a key — the creation feed
+    /// itself signals, so no call site carries a separate hook.
+    creations: u64,
+}
 
 impl JobView {
     pub(crate) fn get<Q>(&self, k: &Q) -> Option<&JobViewEntry>
@@ -893,7 +1113,7 @@ impl JobView {
         DrvHash: std::borrow::Borrow<Q>,
         Q: std::hash::Hash + Eq + ?Sized,
     {
-        self.0.get(k)
+        self.entries.get(k)
     }
 
     pub(super) fn get_mut<Q>(&mut self, k: &Q) -> Option<&mut JobViewEntry>
@@ -901,7 +1121,7 @@ impl JobView {
         DrvHash: std::borrow::Borrow<Q>,
         Q: std::hash::Hash + Eq + ?Sized,
     {
-        self.0.get_mut(k)
+        self.entries.get_mut(k)
     }
 
     pub(crate) fn contains_key<Q>(&self, k: &Q) -> bool
@@ -909,28 +1129,42 @@ impl JobView {
         DrvHash: std::borrow::Borrow<Q>,
         Q: std::hash::Hash + Eq + ?Sized,
     {
-        self.0.contains_key(k)
+        self.entries.contains_key(k)
     }
 
     pub(super) fn keys(&self) -> impl Iterator<Item = &DrvHash> {
-        self.0.keys()
+        self.entries.keys()
     }
 
     pub(super) fn iter(&self) -> impl Iterator<Item = (&DrvHash, &JobViewEntry)> {
-        self.0.iter()
+        self.entries.iter()
+    }
+
+    /// bug_045 — the creation-feed cursor the listing snapshot's
+    /// dirty edge compares against (a changed count = new jobs the
+    /// snapshot has not seen).
+    pub(super) fn creations(&self) -> u64 {
+        self.creations
     }
 
     /// Recovery: rebuild the cache from the durable rows.
     pub(super) fn rebuild(&mut self, entries: impl IntoIterator<Item = (DrvHash, JobViewEntry)>) {
-        self.0.clear();
-        self.0.extend(entries);
+        self.entries.clear();
+        self.entries.extend(entries);
+        // Every rebuilt entry is new to THIS view generation — the
+        // first post-recovery beat must refresh.
+        self.creations = self.creations.wrapping_add(1);
     }
 
     /// Direct insertion (test seeding via [`JobViewState::insert`]).
     /// Additive only — the removal discipline is untouched.
     #[cfg(test)]
     fn insert(&mut self, k: DrvHash, v: JobViewEntry) -> Option<JobViewEntry> {
-        self.0.insert(k, v)
+        let prior = self.entries.insert(k, v);
+        if prior.is_none() {
+            self.creations = self.creations.wrapping_add(1);
+        }
+        prior
     }
 
     /// Insert-or-keep for the creation paths: a pre-existing entry
@@ -942,7 +1176,13 @@ impl JobView {
         k: DrvHash,
         default: JobViewEntry,
     ) -> &mut JobViewEntry {
-        self.0.entry(k).or_insert(default)
+        match self.entries.entry(k) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                self.creations = self.creations.wrapping_add(1);
+                e.insert(default)
+            }
+        }
     }
 
     // r[impl sched.materialize.view-settlement]
@@ -958,7 +1198,7 @@ impl JobView {
         Q: std::hash::Hash + Eq + ?Sized,
     {
         if d.settled() {
-            self.0.remove(k).is_some()
+            self.entries.remove(k).is_some()
         } else {
             false
         }
@@ -1003,9 +1243,9 @@ impl DagActor {
     /// the live store-worker membership: an identity-bearing caller
     /// (the verified `{pod}-w{n}` instance claim, threaded from the
     /// gRPC chokepoint) is recorded in the tenure-scoped
-    /// [`ListingContacts`] and served the jobs whose
-    /// [`rendezvous_owner`] it is — disjoint slices by construction,
-    /// so N workers advance N slices instead of all racing the same
+    /// [`ListingContacts`] and served the jobs the [`ListingPlan`]
+    /// owner map assigns it — disjoint slices by construction, so N
+    /// workers advance N slices instead of all racing the same
     /// `ORDER BY created_at` head (the convoy: one winner, N−1 burned
     /// passes, KEDA scale-out adding racers) — UNION the steal
     /// horizon: jobs whose owner has not listed within
@@ -1016,9 +1256,19 @@ impl DagActor {
     /// mode) contributes no member and is served the unpartitioned
     /// listing — with no identity-bearing callers the behavior is
     /// byte-for-byte the pre-partition shape.
+    ///
+    /// bug_045 — the partition is never recomputed per poll: polls
+    /// serve the beat-scoped head snapshot through the incremental
+    /// owner map, the head-window query runs at most once per
+    /// [`LISTING_SNAPSHOT_TTL`] or creation-dirty event, and ALL
+    /// membership-derived work (TTL prune, staleness partition,
+    /// owner buckets) runs per beat / per membership event
+    /// (`sched.materialize.listing-cost`; the envelope tests count
+    /// the operations).
     // r[impl sched.materialize.job+2]
     // r[impl sched.materialize.claimability-projection]
     // r[impl sched.materialize.listing-distribution]
+    // r[impl sched.materialize.listing-cost]
     pub(super) async fn handle_list_materialization_jobs(
         &mut self,
         limit: u32,
@@ -1028,145 +1278,104 @@ impl DagActor {
         let limit = limit.min(256);
         // Standby, zero limit, and an Unavailable view share one
         // fail-closed arm: answer empty.
-        let jobs = if !self.leader.is_leader()
-            || limit == 0
-            || self.materialization_jobs.hydrated().is_none()
+        if !self.leader.is_leader() || limit == 0 || self.materialization_jobs.hydrated().is_none()
         {
-            Vec::new()
-        } else {
-            let now = std::time::Instant::now();
-            // Record the caller's contact FIRST (its own membership
-            // entry rides this very call), fold the membership EVENTS
-            // it produced into the incremental owner map (bug_045:
-            // joins and TTL leaves are the ONLY times cached jobs are
-            // rescored -- contact refreshes cost the plan nothing),
-            // then snapshot the live membership. Owned snapshot: the
-            // borrows must end before the query await below.
-            let members: Vec<(String, std::time::Instant)> = {
-                let (_, contacts, plan) = self
-                    .materialization_jobs
-                    .hydrated_listing_mut()
-                    .expect("hydrated checked above");
-                if let Some(me) = instance.as_deref() {
-                    let events = contacts.note(me, now);
+            let _ = reply.send(Vec::new());
+            return;
+        }
+        let now = std::time::Instant::now();
+        // Phase 1 — contact + membership events + the refresh
+        // decision (bug_045: O(1) on a stable-epoch poll). The
+        // caller's contact records FIRST (its own membership entry
+        // rides this very call) and records even when the beat's
+        // query errors below — the caller IS live and capable; a DB
+        // blip must not mass-stale the fleet.
+        let needs_beat = {
+            let (view, contacts, plan) = self
+                .materialization_jobs
+                .hydrated_listing_mut()
+                .expect("hydrated checked above");
+            if let Some(me) = instance.as_deref() {
+                if contacts.note(me, now) {
+                    // JOIN: rescore cached jobs against the joiner
+                    // (one score each), re-seed if the cache was
+                    // installed over an empty membership, and fold
+                    // the new ownership into the beat buckets —
+                    // membership-event work, never per-poll work.
+                    plan.on_join(me);
                     let members = contacts.members(now);
-                    for leaver in &events.left {
+                    plan.reseed_if_unseeded(members.iter().map(|(m, _)| m.as_str()));
+                    plan.rebuild_buckets();
+                }
+                // A previously-stale member listing again un-stales
+                // NOW (the partition-resumes edge): its slice stops
+                // being served broadly on this very poll.
+                plan.note_member_fresh(me);
+            }
+            plan.refresh_due(view.creations(), now)
+        };
+        // Phase 2 — the listing BEAT: at most one head-window query
+        // per snapshot TTL or creation-dirty event (R17; the fetch
+        // counter at this sole production call site is the law's
+        // witness). The TTL prune, the staleness partition, the
+        // owner-map reconcile, and the bucket build all run HERE —
+        // polls between beats do none of it.
+        if needs_beat {
+            SNAPSHOT_FETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let fetched = self
+                .db
+                .list_claimable_materialization_jobs(LISTING_HEAD_WINDOW)
+                .await;
+            let (view, contacts, plan) = self
+                .materialization_jobs
+                .hydrated_listing_mut()
+                .expect("hydrated checked above");
+            match fetched {
+                Ok(rows) => {
+                    let leavers = contacts.prune(now);
+                    let members = contacts.members(now);
+                    for leaver in &leavers {
                         plan.on_leave(leaver, members.iter().map(|(m, _)| m.as_str()));
                     }
-                    if events.joined {
-                        plan.on_join(me);
-                    }
-                    members
-                } else {
-                    contacts.members(now)
-                }
-            };
-            // Partitioned callers draw from the FULL bounded
-            // head-window (512 — the partition domain must not shrink
-            // with one caller's limit, or slices stop covering the
-            // head); the unpartitioned lanes keep the pre-live_041
-            // over-fetch min(2×limit, 512) byte-for-byte (the view
-            // filter below may drop rows the query believed claimable
-            // — deferred / just-claimed / not-yet-fed — and a second
-            // query round trip per poll is worse than a bounded
-            // over-read).
-            let partitioned = instance.is_some() && members.len() > 1;
-            let fetch = if partitioned {
-                512
-            } else {
-                i64::from(limit).saturating_mul(2).min(512)
-            };
-            // R17: the SOLE production head-window call site counts
-            // its fetches — the snapshot-TTL envelope's witness.
-            SNAPSHOT_FETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            match self.db.list_claimable_materialization_jobs(fetch).await {
-                Ok(rows) => {
-                    let caller = instance.as_deref();
-                    let (view, _, plan) = self
-                        .materialization_jobs
-                        .hydrated_listing_mut()
-                        .expect("hydrated checked above");
-                    // Reconcile the owner cache to this head window:
-                    // only jobs ENTERING the window are scored
-                    // (bug_045) -- cached jobs cost nothing here.
-                    plan.reconcile_window(
-                        rows.iter().map(|r| r.job_id),
-                        members.iter().map(|(m, _)| m.as_str()),
-                    );
-                    let plan = &*plan;
-                    rows.into_iter()
-                        .filter(|row| {
-                            view.get(row.drv_hash.as_str()).is_some_and(|entry| {
-                                entry.claimability(now) == Claimability::ClaimableNow
-                            })
-                        })
-                        .filter(|row| Self::listing_serves(plan, row.job_id, caller, &members, now))
-                        .take(limit as usize)
-                        .map(JobDescriptor::from_row)
-                        .collect()
+                    plan.install_beat(rows, &members, view.creations(), now);
                 }
                 Err(e) => {
+                    // Fail closed: never serve a stale-unusable
+                    // snapshot (the pre-snapshot empty-answer arm,
+                    // preserved; the contact note above stands).
                     warn!(error = %e, "ListMaterializationJobs query failed; answering empty");
-                    Vec::new()
+                    plan.clear_snapshot();
+                    let _ = reply.send(Vec::new());
+                    return;
                 }
             }
-        };
+        }
+        // Phase 3 — serve from the beat state: the caller's owner
+        // bucket united with the stolen overlay (or the whole
+        // snapshot for instance-less / solo callers — the dev-mode
+        // fallback, byte-identical), with claimability re-filtered
+        // per row from the LIVE view (bug_170: a listed job is
+        // admittable by construction — claimed / parked / deferred /
+        // resolved rows drop exactly as before). O(served slice) map
+        // lookups; zero scoring; zero member iteration (R17:
+        // member_touches == 0 on this path).
+        let (view, contacts, plan) = self
+            .materialization_jobs
+            .hydrated_listing_mut()
+            .expect("hydrated checked above");
+        let plan = &*plan;
+        let caller = instance.as_deref().filter(|_| contacts.len() > 1);
+        let jobs = plan
+            .serve(caller)
+            .filter(|row| {
+                view.get(row.drv_hash.as_str())
+                    .is_some_and(|entry| entry.claimability(now) == Claimability::ClaimableNow)
+            })
+            .take(limit as usize)
+            .cloned()
+            .map(JobDescriptor::from_row)
+            .collect();
         let _ = reply.send(jobs);
-    }
-
-    // r[impl sched.materialize.listing-distribution]
-    // r[impl sched.materialize.listing-cost]
-    /// live_041 — whether THIS caller's listing carries the job: the
-    /// caller's owner slice UNION the steal horizon, BOTH derived
-    /// from the ONE [`rendezvous_score`] source through the
-    /// incremental [`ListingPlan`] owner map (no second partition
-    /// computation exists — Q1; the parity proptest pins cached ≡
-    /// batch argmax). bug_045: serving READS the cached owner — a
-    /// stable-epoch poll computes zero scores. Instance-less callers
-    /// and memberships without a second live worker serve
-    /// unpartitioned (the dev-mode / solo-worker fallback — today's
-    /// behavior).
-    fn listing_serves(
-        plan: &ListingPlan,
-        job_id: Uuid,
-        caller: Option<&str>,
-        members: &[(String, std::time::Instant)],
-        now: std::time::Instant,
-    ) -> bool {
-        let Some(me) = caller else {
-            // Instance-less caller (full dev mode): no member, no
-            // slice — the unpartitioned listing.
-            return true;
-        };
-        if members.len() <= 1 {
-            // Solo membership (the caller itself): owner of
-            // everything by construction — skip the owner lookup.
-            return true;
-        }
-        match plan.owner(job_id) {
-            Some(owner) if owner == me => true,
-            Some(owner) => {
-                // The steal horizon: the owner has missed its beat —
-                // its slice is served broadly until it returns (the
-                // caller is fresh by construction; the OWNER's age is
-                // what gates). The owner is always in the membership
-                // the cache was maintained over, so the lookup cannot
-                // miss; stay total and steal-open if it ever did
-                // (served-more-broadly is the safe direction).
-                members
-                    .iter()
-                    .find(|(m, _)| {
-                        member_touch();
-                        m == owner
-                    })
-                    .map(|(_, last)| now.duration_since(*last) > LISTING_STEAL_HORIZON)
-                    .unwrap_or(true)
-            }
-            // A job the window reconcile has not seen (unreachable:
-            // the reconcile covered this query's rows), but total:
-            // serve broadly (the safe direction).
-            None => true,
-        }
     }
 
     /// THE single job-creation helper for callers with NO enclosing

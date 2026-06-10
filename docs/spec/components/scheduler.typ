@@ -1735,6 +1735,36 @@ join/leave of `executor_concurrency` members. Machine witness:
 partition, own-slice disjointness/coverage, staleness-bounded steal,
 no-job-unlisted, orphan recovery; convoy and no-steal falsify twins).
 
+#r("sched.materialize.listing-cost")[
+  The leader listing chokepoint MUST NOT recompute the rendezvous
+  partition per poll: partition-scoring work MUST be zero on a poll
+  in a stable membership epoch over a warm head-window snapshot,
+  scoring MUST be bounded by one window rescore per membership event
+  (a join costs at most one score per cached head-window job; an
+  owner's leave re-scores only the departed owner's jobs over the
+  survivors), and the head-window query MUST run at most once per
+  snapshot TTL or job-creation dirty event.
+]
+The cost law is live_041's missing witness shape (bug_045): the
+serving-correctness parity witness passed every gate while the
+chokepoint did O(window x members) SipHashes plus a 512-row fetch per
+poll per worker --- ~M polls/s with per-worker membership M ~ 1384 at
+fleet scale, all serialized on the single-threaded actor turn with
+pull mints, completions, and heartbeats (the actor-blocking class the
+repo already documents as a bug). The rule's witnesses are OPERATION
+COUNTERS minted inside the operations themselves (scores inside the
+single scoring source; fetches at the sole head-window call site;
+member touches at the membership choke sites) --- wall-clock
+witnesses are banned here because the claim is complexity, not
+latency. Serving semantics are pinned byte-identical by the
+#rref("sched.materialize.listing-distribution") parity and coverage
+witnesses; the snapshot TTL (1 s) sits at the worker poll cadence and
+far below every lapse scale that feeds the window, and claimability
+is still filtered per poll from the live view
+(#rref("sched.materialize.claimability-projection") is untouched ---
+only park-LAPSE entry into the window waits out the TTL; job creation
+rides the view's dirty edge instead).
+
 #r("sched.materialize.conversion-strictness")[
   The parked-job re-evaluation MUST support two independently default-off
   strictness fields on the `[materialization]` config surface ---
