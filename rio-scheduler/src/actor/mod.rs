@@ -1134,7 +1134,12 @@ impl DagActor {
         // staleness inferences fail closed in every empty-DAG window.
         *dag_authoritative = false;
         // Deliberately retained across generations:
-        // - `ice`: cluster-level cell-backoff signal, 60s TTL self-heals.
+        // - `ice` ladder (`cells`): cluster-level cell-backoff signal,
+        //   TTL'd — 60s self-heals (true for the ladder ONLY).
+        // - `ice` watermark (`last_applied`): NOT self-healing (a
+        //   TTL-less ratchet) — reset via the LEADER_EDGES row
+        //   `ice-epoch-watermark` (the paired-hook law; bug_067), not
+        //   by this wipe.
         // - `cache_breaker`: store availability is generation-independent.
         // - `sla_estimator`: cluster-wide fitted curves.
         // - `solve_cache`: bounded by `sla_estimator`'s live set via the

@@ -4144,3 +4144,86 @@ async fn leader_edges_acquire_cells_fire() {
          housekeeping edge-reload"
     );
 }
+
+// r[verify sched.sla.hw-class.ice-mask]
+/// bug_067 red: a leadership cycle re-opens the per-cell evidence-
+/// epoch watermark so a LOWER-epoch successor lineage's genuine
+/// evidence applies — and the retention is per-field (the ladder
+/// survives the lose edge, the watermark does not).
+///
+/// Defect: the prose priced the handoff on a `last_applied` wipe that
+/// did not exist as an API — `EpochMint` is `Default prev=0` seeded
+/// `max(now, prev+1)`, so a clock-behind successor controller's
+/// genuine marks hit the `epoch_gate` NoOp arm until clock catch-up; a
+/// no-op'd genuine mark leaves a sick cell UNMASKED (absence of a mask
+/// has no TTL to heal). Witness strength: certifies "a leadership
+/// cycle re-opens the watermark so a lower-epoch successor lineage
+/// applies" — the adjudication's load-bearing leg itself (the
+/// `epoch_gate_table` keeps certifying the single-lineage gate
+/// algebra, which is untouched). Pre-fix, verbatim: the post-expiry
+/// successor mark NoOp'd — step stayed Some(0) and the cell read
+/// UNMASKED while sick.
+///
+/// World built through production constructors only: marks ride the
+/// production `handle_ack_spawned_intents` wire grammar
+/// (`"h:cap@epoch"`); the lose edge is the production
+/// `handle_leader_lost()` (the same entry the bug_310 latch pins
+/// drive); `force_expire` is the sanctioned cfg(test) expiry shim the
+/// refresh-not-step suite already uses.
+#[tokio::test]
+async fn leadership_cycle_resets_the_epoch_watermark() {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    let cell: crate::sla::config::Cell =
+        ("mid-ebs-x86".into(), crate::sla::config::CapacityType::Spot);
+
+    // Old controller lineage: genuine mark at epoch 1000 — masked,
+    // watermark ratchets to 1000.
+    actor
+        .handle_ack_spawned_intents(&[], &["mid-ebs-x86:spot@1000".into()], &[], &[], &[], None)
+        .expect("mark applied under leadership");
+    assert_eq!(
+        actor.ice.step(&cell),
+        Some(0),
+        "precondition: masked at step 0"
+    );
+
+    // The scheduler loses the lease (production lose edge — runs every
+    // LEADER_EDGES lose cell, the new ice-epoch-watermark row
+    // included).
+    actor.handle_leader_lost();
+
+    // Per-field retention, pinned by assertion not prose: the LADDER
+    // entry survived the lose edge…
+    assert_eq!(
+        actor.ice.step(&cell),
+        Some(0),
+        "the TTL'd ladder is RETAINED across the leadership edge"
+    );
+    // …and the cell's mask is then expired (the sick cell's window
+    // lapsed; only a GENUINE new mark can re-mask it).
+    actor.ice.force_expire(&cell);
+    assert!(!actor.ice.is_masked(&cell), "precondition: window lapsed");
+
+    // Successor controller lineage with a BEHIND clock mints epoch
+    // 500. Pre-fix: NoOp (500 <= 1000) — the genuine consecutive
+    // failure is black-holed, the sick cell stays unmasked and the
+    // step never climbs. Post-fix: the watermark was reset at the
+    // lose edge, so the mark APPLIES — post-expiry consecutive
+    // failure climbs the ladder and re-masks.
+    actor
+        .handle_ack_spawned_intents(&[], &["mid-ebs-x86:spot@500".into()], &[], &[], &[], None)
+        .expect("successor-lineage mark applied");
+    assert_eq!(
+        actor.ice.step(&cell),
+        Some(1),
+        "the clock-behind successor lineage's genuine mark must APPLY \
+         (post-expiry consecutive failure climbs) — not no-op against \
+         the previous lineage's watermark"
+    );
+    assert!(
+        actor.ice.is_masked(&cell),
+        "the sick cell is masked again by the genuine successor evidence"
+    );
+}

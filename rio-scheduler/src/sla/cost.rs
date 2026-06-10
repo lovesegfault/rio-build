@@ -1031,9 +1031,16 @@ fn epoch_gate(applied: Option<EvidenceEpoch>, incoming: Option<EvidenceEpoch>) -
 ///
 /// In-memory, lease-holder only — a scheduler lease handoff costs at
 /// most one wasted NodeClaim round per masked cell; the handoff also
-/// wipes `last_applied`, so the worst case adds one spurious re-apply
-/// of in-flight redelivered evidence (the same pre-existing posture —
-/// see the WO-S5-3 residual disclosure in the introducing commit).
+/// wipes `last_applied` via the `observability::LEADER_EDGES` row
+/// `ice-epoch-watermark` (the registered [`Self::reset_epoch_gate`]
+/// edge — bug_067: this sentence used to cite a wipe that did not
+/// exist as an API), so the worst case adds one spurious re-apply of
+/// in-flight redelivered evidence per cell (the same posture the
+/// pre-fix prose already priced, now actually purchased). The
+/// controller-handoff-while-scheduler-stable cell is NOT closable
+/// scheduler-side (no scheduler edge fires); its bound is
+/// inter-replica clock skew (ADJ-1 legs i/ii, the controller's
+/// evidence.rs pricing) — recorded honestly rather than claimed.
 #[derive(Debug)]
 pub struct IceBackoff {
     cells: DashMap<Cell, IceState>,
@@ -1107,6 +1114,31 @@ impl IceBackoff {
             }
             EpochGate::NoOp => {}
         }
+    }
+
+    /// Re-open the per-cell evidence-epoch gate at a leadership edge
+    /// (bug_067): clears `last_applied` ONLY — the TTL-less watermark
+    /// ratchet — and RETAINS `cells` (the ladder). Registered as the
+    /// `ice-epoch-watermark` row in `observability::LEADER_EDGES`
+    /// (lose + rebound; the registry is the machine-derived edge
+    /// census — never call this from edge-site code).
+    ///
+    /// Per-field rationale (heterogeneous retention needs per-field
+    /// reasons, not one note):
+    /// - ladder (`cells`): RETAINED — TTL'd `IceState`, the "60s TTL
+    ///   self-heals" claim is true for it; a retained mask is at worst
+    ///   one over-cautious window.
+    /// - watermark (`last_applied`): WIPED — a ratchet with no TTL; a
+    ///   clock-behind successor controller's `EpochMint` (Default
+    ///   prev=0, seeded `max(now, prev+1)`) mints epochs BELOW the
+    ///   previous lineage's, so genuine marks/clears would no-op until
+    ///   clock catch-up — a no-op'd genuine mark leaves a sick cell
+    ///   UNMASKED (absence of a mask has no TTL to heal). Wipe cost:
+    ///   at most one spurious re-apply of redelivered in-flight
+    ///   evidence per cell per scheduler transition (bounded by the
+    ///   refresh-not-step law).
+    pub fn reset_epoch_gate(&self) {
+        self.last_applied.clear();
     }
 
     /// Mark `cell` infeasible. TTL is `min(60s · 2^step, max_lead_time)`;
@@ -1785,6 +1817,36 @@ mod tests {
         let mut b = CostTable::seeded("us-east-1", HwCostSource::Spot);
         b.set_resolved_global(TEST_GLOBAL);
         assert_ne!(b.solve_relevant_hash(), h_before);
+    }
+
+    /// bug_067 unit companion: `reset_epoch_gate` clears the
+    /// watermark map ONLY and retains the ladder — the per-field
+    /// retention law, asserted at the API (the actor-level red drives
+    /// it through the LEADER_EDGES lose edge).
+    #[test]
+    fn reset_epoch_gate_clears_watermark_retains_ladder() {
+        let ice = IceBackoff::new(3600.0);
+        let cell: Cell = ("h".into(), CapacityType::Spot);
+        ice.apply_mark_event(&cell, Some(EvidenceEpoch(1000)));
+        assert_eq!(ice.step(&cell), Some(0), "ladder armed");
+        // Watermark live: a lower-epoch event no-ops.
+        ice.apply_clear_event(&cell, Some(EvidenceEpoch(500)));
+        assert_eq!(ice.step(&cell), Some(0), "gate NoOp under the ratchet");
+
+        ice.reset_epoch_gate();
+
+        assert_eq!(
+            ice.step(&cell),
+            Some(0),
+            "the ladder is RETAINED by the watermark reset"
+        );
+        // Gate re-opened: the same lower-epoch clear now applies.
+        ice.apply_clear_event(&cell, Some(EvidenceEpoch(500)));
+        assert_eq!(
+            ice.step(&cell),
+            None,
+            "post-reset the lower-epoch genuine clear applies (ladder reset)"
+        );
     }
 
     /// §13c-3: `resolved_global()` panics on read-before-set —

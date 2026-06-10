@@ -341,6 +341,22 @@ pub const LEADER_EDGES: &[LeaderEdge] = &[
         rebound: ReboundPolicy::Compound,
     },
     LeaderEdge {
+        name: "ice-epoch-watermark",
+        // The lose half already reset the watermark; an acquire-side
+        // repeat would be redundant (deposed replicas consume no Acks,
+        // so nothing can advance `last_applied` while standby).
+        on_acquire: |_| {},
+        // bug_067: re-open the per-cell evidence-epoch gate so a
+        // clock-behind successor controller lineage's GENUINE
+        // marks/clears apply instead of no-op'ing until clock
+        // catch-up. Covers handoff-away and the flap.
+        on_lose: |a| a.ice.reset_epoch_gate(),
+        // A rebound means a foreign term may have consumed evidence
+        // this replica never saw — the compressed lose→acquire pair
+        // must re-open the gate exactly like a real handoff.
+        rebound: ReboundPolicy::Compound,
+    },
+    LeaderEdge {
         name: "leader-gauge-family",
         // No acquire effect: the next leader tick republishes every
         // member from ground truth (snapshot/sweep sites) — seeding
