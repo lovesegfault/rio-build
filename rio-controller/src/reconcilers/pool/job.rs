@@ -534,20 +534,6 @@ pub(super) async fn reap_excess_pending(
     reaped
 }
 
-/// Prometheus `reason` label for the OA1 histogram on the
-/// synthesize-on-delete path. The controller-synthesized verdicts only
-/// (cancelled / preempted / reaped); the pod-terminal classifications
-/// keep flowing through [`termination_reason_label`].
-fn attempt_reason_label(reason: rio_proto::types::AttemptTerminalReason) -> &'static str {
-    use rio_proto::types::AttemptTerminalReason as R;
-    match reason {
-        R::Cancelled => "cancelled",
-        R::Preempted => "preempted",
-        R::Reaped => "reaped",
-        _ => "other",
-    }
-}
-
 /// The synthesize-on-delete decision: `Some(request)` exactly when an
 /// open pull-mode attempt covers the Job about to be deleted (the
 /// pull-filtered `ListOpenAttempts` view is the input; the match key
@@ -840,7 +826,16 @@ pub(super) async fn delete_job_with_synthesized_report(
                 {
                     metrics::histogram!(
                         "rio_controller_job_terminal_report_seconds",
-                        "reason" => attempt_reason_label(reason)
+                        // merged_bug_035 (Q1: shared constants, never
+                        // mirrored literals): the label routes through
+                        // rio-proto's exhaustive From + rio-common's
+                        // exhaustive label match -- a new proto
+                        // terminal reason fails compilation at both,
+                        // and the catch-all "other" arm of the
+                        // retired hand-rolled subset is gone. Live
+                        // strings are byte-identical ("reaped",
+                        // "cancelled"): no published-series change.
+                        "reason" => rio_common::classify::attempt_terminal_reason_label(reason.into())
                     )
                     .record(0.0);
                 }
