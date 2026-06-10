@@ -124,13 +124,25 @@ pub(crate) fn listing_cost_snapshot() -> ListingCostSnapshot {
 }
 
 // r[impl sched.materialize.listing-distribution]
-/// live_041 — THE per-pair rendezvous score: the SipHash of
-/// `(job_id, member)` with the member string as the total-order tie
-/// key. The SINGLE scoring source (Q1): [`rendezvous_owner`] is the
-/// batch argmax over this fn and the incremental owner-map maintainer
-/// consumes the same fn — one source, two composers, parity-pinned.
-/// The score counter increments HERE so every caller counts by
-/// construction (R17).
+/// live_041 — THE per-pair rendezvous score (highest-random-weight
+/// hash over `(job_id, member)`): the SipHash with the member string
+/// as the total-order tie key (ties are astronomically unlikely at
+/// 64 bits, but the owner must be a function). The SINGLE scoring
+/// source (Q1): the batch argmax oracle and the incremental owner-map
+/// maintainer both consume this fn — one source, two composers,
+/// parity-pinned. The score counter increments HERE so every caller
+/// counts by construction (R17).
+///
+/// Member unit (RULED CF-2): the per-WORKER composite `{pod}-w{n}` —
+/// the token-bound identity the claim path already asserts. Never the
+/// pod: `with_worker`'s sanitize-salt fallback makes suffix-stripping
+/// unreliable, so no pod aggregation exists anywhere.
+///
+/// Hashing: `DefaultHasher::new()` (SipHash-1-3, fixed keys) —
+/// deterministic within a process, which is all HRW needs here: the
+/// leader's listing plan is the only consumer, and a re-partition at
+/// leader failover or a std hash change is benign (claims arbitrate;
+/// the steal horizon covers any transient).
 pub(crate) fn rendezvous_score(job_id: Uuid, member: &str) -> (u64, &str) {
     use std::hash::{Hash, Hasher};
     SCORES_COMPUTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -140,32 +152,132 @@ pub(crate) fn rendezvous_score(job_id: Uuid, member: &str) -> (u64, &str) {
     (h.finish(), member)
 }
 
-// r[impl sched.materialize.listing-distribution]
-/// live_041 — THE rendezvous owner: highest-random-weight hash over
-/// `(job_id, member)` — the batch argmax over [`rendezvous_score`],
-/// the single partition source (a second partition computation
-/// anywhere is the mirrored-literal shape the Q1 banner bans; the
-/// parity test pins served slices against this fn).
-///
-/// Member unit (RULED CF-2): the per-WORKER composite `{pod}-w{n}` —
-/// the token-bound identity the claim path already asserts. Never the
-/// pod: `with_worker`'s sanitize-salt fallback makes suffix-stripping
-/// unreliable, so no pod aggregation exists anywhere.
-///
-/// Hashing: `DefaultHasher::new()` (SipHash-1-3, fixed keys) —
-/// deterministic within a process, which is all HRW needs here: the
-/// leader's listing arm is the only consumer, and a re-partition at
-/// leader failover or a std hash change is benign (claims arbitrate;
-/// the steal horizon covers any transient). Ties break on the member
-/// string (total order — astronomically unlikely at 64 bits, but the
-/// owner must be a function).
+/// The batch-argmax composer over [`rendezvous_score`] — since
+/// bug_045 the production serving path reads the incremental
+/// [`ListingPlan`] cache instead of recomputing this per row, so the
+/// batch form survives as the PARITY ORACLE: the proptest pins
+/// cached-owner ≡ this argmax across churn (Q1: one scoring source,
+/// two composers).
+#[cfg(test)]
 pub(crate) fn rendezvous_owner<'a, I>(job_id: Uuid, members: I) -> Option<&'a str>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    scored_owner(job_id, members).map(|(_, m)| m)
+}
+
+// r[impl sched.materialize.listing-distribution]
+/// The argmax WITH its winning score — what the incremental owner map
+/// caches so later membership events compare against the stored
+/// winner instead of recomputing the field. THE production argmax
+/// composer over the single scoring source; same `(hash, member)`
+/// total tie order as the batch oracle (`Iterator::max` keeps the
+/// greatest tuple, exactly `max_by_key`'s semantics — member strings
+/// are unique, so tuples never tie).
+fn scored_owner<'a, I>(job_id: Uuid, members: I) -> Option<(u64, &'a str)>
 where
     I: IntoIterator<Item = &'a str>,
 {
     members
         .into_iter()
-        .max_by_key(|m| rendezvous_score(job_id, m))
+        .map(|m| rendezvous_score(job_id, m))
+        .max()
+}
+
+/// bug_045 — the leader-tenure-scoped incremental rendezvous owner
+/// map (`sched.materialize.listing-cost`): the job→owner partition is
+/// a pure function of `(job_id, membership SET)`, and the membership
+/// set changes only at join/leave — never at contact refreshes — so
+/// the owner of every cached head-window job is maintained PER
+/// MEMBERSHIP EVENT instead of recomputed per poll:
+///
+///   - JOIN: one score per cached job (the joiner against the stored
+///     winner) — O(window);
+///   - LEAVE of a non-owner: free; LEAVE of an owner: re-argmax of
+///     exactly the departed member's jobs over the survivors —
+///     O(owned × members);
+///   - contact refreshes of existing members: nothing.
+///
+/// Lives beside [`ListingContacts`] inside [`JobViewState::Hydrated`]
+/// on purpose: leader-tenure-scoped soft state with exactly the
+/// view's lifecycle — wiped with the tenure on LeaderLost, empty at
+/// recovery, so stale owners across failover are unrepresentable.
+///
+/// Tie order parity: the cached comparison uses the same
+/// `(hash, member)` tuple order as [`rendezvous_score`] — the cached
+/// owner is ALWAYS the batch argmax over the live membership (the
+/// parity proptest pins cached ≡ [`rendezvous_owner`] across churn).
+// r[impl sched.materialize.listing-cost]
+#[derive(Debug, Default)]
+pub(crate) struct ListingPlan {
+    /// `{job_id → (winning hash, owner member)}` over the live
+    /// membership, for every job in the current head window.
+    owners: std::collections::HashMap<Uuid, (u64, String)>,
+}
+
+impl ListingPlan {
+    /// The cached owner for a head-window job (present for every job
+    /// the window reconcile has seen).
+    pub(crate) fn owner(&self, job_id: Uuid) -> Option<&str> {
+        self.owners.get(&job_id).map(|(_, m)| m.as_str())
+    }
+
+    /// A member JOINED (its first identity-bearing listing): compare
+    /// the joiner against each cached winner — one score per cached
+    /// job, never a full re-partition.
+    pub(crate) fn on_join(&mut self, joiner: &str) {
+        for (job_id, winner) in &mut self.owners {
+            let (h, m) = rendezvous_score(*job_id, joiner);
+            if (h, m) > (winner.0, winner.1.as_str()) {
+                *winner = (h, m.to_owned());
+            }
+        }
+    }
+
+    /// A member LEFT (TTL prune): non-owners are free; the departed
+    /// member's jobs re-argmax over the survivors. An emptied
+    /// membership clears the cache wholesale (the partition domain is
+    /// gone; the next window reconcile re-seeds over whatever
+    /// membership then exists).
+    pub(crate) fn on_leave<'a>(
+        &mut self,
+        leaver: &str,
+        survivors: impl Iterator<Item = &'a str> + Clone,
+    ) {
+        if survivors.clone().next().is_none() {
+            self.owners.clear();
+            return;
+        }
+        for (job_id, winner) in &mut self.owners {
+            if winner.1 != leaver {
+                continue;
+            }
+            if let Some((h, m)) = scored_owner(*job_id, survivors.clone()) {
+                *winner = (h, m.to_owned());
+            }
+        }
+    }
+
+    /// Reconcile the cache to the current head window: score jobs
+    /// ENTERING the window (over the live membership — the once-per-
+    /// window-change cost), drop jobs that left it. Cached jobs cost
+    /// nothing.
+    pub(crate) fn reconcile_window<'a>(
+        &mut self,
+        window: impl Iterator<Item = Uuid>,
+        members: impl Iterator<Item = &'a str> + Clone,
+    ) {
+        let mut seen = std::collections::HashSet::new();
+        for job_id in window {
+            seen.insert(job_id);
+            if !self.owners.contains_key(&job_id)
+                && let Some((h, m)) = scored_owner(job_id, members.clone())
+            {
+                self.owners.insert(job_id, (h, m.to_owned()));
+            }
+        }
+        self.owners.retain(|job_id, _| seen.contains(job_id));
+    }
 }
 
 /// live_041 — the leader's listing-contact map: `{worker member →
@@ -182,16 +294,35 @@ pub(crate) struct ListingContacts {
     contacts: std::collections::HashMap<String, std::time::Instant>,
 }
 
+/// What one contact note changed about the MEMBERSHIP SET (bug_045) —
+/// the only changes the incremental owner map reacts to. A refresh of
+/// an existing member produces neither.
+struct MembershipEvents {
+    /// The noting member was NEW (its insert created the key).
+    joined: bool,
+    /// Members pruned past [`LISTING_MEMBER_TTL`] by this note.
+    left: Vec<String>,
+}
+
 impl ListingContacts {
     /// Record an identity-bearing listing call and prune members
     /// silent past [`LISTING_MEMBER_TTL`] (the map stays bounded by
-    /// live churn, not by all-time pod history).
-    fn note(&mut self, member: &str, now: std::time::Instant) {
-        self.contacts.retain(|_, last| {
+    /// live churn, not by all-time pod history). Returns the
+    /// MEMBERSHIP EVENTS this contact produced — the joins/leaves the
+    /// incremental owner map keys on (bug_045: contact refreshes of
+    /// existing members are NOT events and cost the plan nothing).
+    fn note(&mut self, member: &str, now: std::time::Instant) -> MembershipEvents {
+        let mut left = Vec::new();
+        self.contacts.retain(|m, last| {
             member_touch();
-            now.duration_since(*last) <= LISTING_MEMBER_TTL
+            let live = now.duration_since(*last) <= LISTING_MEMBER_TTL;
+            if !live {
+                left.push(m.clone());
+            }
+            live
         });
-        self.contacts.insert(member.to_owned(), now);
+        let joined = self.contacts.insert(member.to_owned(), now).is_none();
+        MembershipEvents { joined, left }
     }
 
     /// The live membership snapshot: members within
@@ -613,14 +744,16 @@ pub(crate) enum JobViewState {
     #[default]
     Unavailable,
     /// Rebuilt from PG by recovery; live-maintained by the creation
-    /// and consumption paths. Carries the [`ListingContacts`] beside
-    /// the view (live_041): the contact map is leader-tenure-scoped
-    /// soft state with exactly the view's lifecycle (wiped with the
-    /// tenure, empty at recovery), and the listing arm — its only
-    /// consumer — already gates on this very arm.
+    /// and consumption paths. Carries the [`ListingContacts`] and the
+    /// [`ListingPlan`] beside the view (live_041 / bug_045): both are
+    /// leader-tenure-scoped soft state with exactly the view's
+    /// lifecycle (wiped with the tenure, empty at recovery), and the
+    /// listing arm — their only consumer — already gates on this very
+    /// arm.
     Hydrated {
         view: JobView,
         contacts: ListingContacts,
+        plan: ListingPlan,
     },
 }
 
@@ -642,15 +775,19 @@ impl JobViewState {
         }
     }
 
-    /// The hydrated view together with its listing-contact map
-    /// (live_041 — the listing arm's split borrow: contacts mutate
-    /// while the view is read).
-    pub(super) fn hydrated_with_contacts_mut(
+    /// The hydrated view together with its listing-contact map and
+    /// listing plan (live_041 / bug_045 — the listing arm's split
+    /// borrow: contacts and plan mutate while the view is read).
+    pub(super) fn hydrated_listing_mut(
         &mut self,
-    ) -> Option<(&JobView, &mut ListingContacts)> {
+    ) -> Option<(&JobView, &mut ListingContacts, &mut ListingPlan)> {
         match self {
             Self::Unavailable => None,
-            Self::Hydrated { view, contacts } => Some((view, contacts)),
+            Self::Hydrated {
+                view,
+                contacts,
+                plan,
+            } => Some((view, contacts, plan)),
         }
     }
 
@@ -715,6 +852,7 @@ impl JobViewState {
         *self = Self::Hydrated {
             view: v,
             contacts: ListingContacts::default(),
+            plan: ListingPlan::default(),
         };
     }
 
@@ -726,6 +864,7 @@ impl JobViewState {
             *self = Self::Hydrated {
                 view: JobView::default(),
                 contacts: ListingContacts::default(),
+                plan: ListingPlan::default(),
             };
         }
         match self {
@@ -897,19 +1036,30 @@ impl DagActor {
         } else {
             let now = std::time::Instant::now();
             // Record the caller's contact FIRST (its own membership
-            // entry rides this very call), then snapshot the live
-            // membership the partition is computed over. Owned
-            // snapshot: the contact borrow must end before the query
-            // await below.
+            // entry rides this very call), fold the membership EVENTS
+            // it produced into the incremental owner map (bug_045:
+            // joins and TTL leaves are the ONLY times cached jobs are
+            // rescored -- contact refreshes cost the plan nothing),
+            // then snapshot the live membership. Owned snapshot: the
+            // borrows must end before the query await below.
             let members: Vec<(String, std::time::Instant)> = {
-                let (_, contacts) = self
+                let (_, contacts, plan) = self
                     .materialization_jobs
-                    .hydrated_with_contacts_mut()
+                    .hydrated_listing_mut()
                     .expect("hydrated checked above");
                 if let Some(me) = instance.as_deref() {
-                    contacts.note(me, now);
+                    let events = contacts.note(me, now);
+                    let members = contacts.members(now);
+                    for leaver in &events.left {
+                        plan.on_leave(leaver, members.iter().map(|(m, _)| m.as_str()));
+                    }
+                    if events.joined {
+                        plan.on_join(me);
+                    }
+                    members
+                } else {
+                    contacts.members(now)
                 }
-                contacts.members(now)
             };
             // Partitioned callers draw from the FULL bounded
             // head-window (512 — the partition domain must not shrink
@@ -932,15 +1082,25 @@ impl DagActor {
             match self.db.list_claimable_materialization_jobs(fetch).await {
                 Ok(rows) => {
                     let caller = instance.as_deref();
+                    let (view, _, plan) = self
+                        .materialization_jobs
+                        .hydrated_listing_mut()
+                        .expect("hydrated checked above");
+                    // Reconcile the owner cache to this head window:
+                    // only jobs ENTERING the window are scored
+                    // (bug_045) -- cached jobs cost nothing here.
+                    plan.reconcile_window(
+                        rows.iter().map(|r| r.job_id),
+                        members.iter().map(|(m, _)| m.as_str()),
+                    );
+                    let plan = &*plan;
                     rows.into_iter()
                         .filter(|row| {
-                            self.materialization_jobs
-                                .get(row.drv_hash.as_str())
-                                .is_some_and(|entry| {
-                                    entry.claimability(now) == Claimability::ClaimableNow
-                                })
+                            view.get(row.drv_hash.as_str()).is_some_and(|entry| {
+                                entry.claimability(now) == Claimability::ClaimableNow
+                            })
                         })
-                        .filter(|row| Self::listing_serves(row.job_id, caller, &members, now))
+                        .filter(|row| Self::listing_serves(plan, row.job_id, caller, &members, now))
                         .take(limit as usize)
                         .map(JobDescriptor::from_row)
                         .collect()
@@ -955,14 +1115,19 @@ impl DagActor {
     }
 
     // r[impl sched.materialize.listing-distribution]
+    // r[impl sched.materialize.listing-cost]
     /// live_041 — whether THIS caller's listing carries the job: the
     /// caller's owner slice UNION the steal horizon, BOTH derived
-    /// from the ONE [`rendezvous_owner`] source and the same
-    /// membership snapshot (no second partition computation exists —
-    /// Q1). Instance-less callers and memberships without a second
-    /// live worker serve unpartitioned (the dev-mode / solo-worker
-    /// fallback — today's behavior).
+    /// from the ONE [`rendezvous_score`] source through the
+    /// incremental [`ListingPlan`] owner map (no second partition
+    /// computation exists — Q1; the parity proptest pins cached ≡
+    /// batch argmax). bug_045: serving READS the cached owner — a
+    /// stable-epoch poll computes zero scores. Instance-less callers
+    /// and memberships without a second live worker serve
+    /// unpartitioned (the dev-mode / solo-worker fallback — today's
+    /// behavior).
     fn listing_serves(
+        plan: &ListingPlan,
         job_id: Uuid,
         caller: Option<&str>,
         members: &[(String, std::time::Instant)],
@@ -975,20 +1140,19 @@ impl DagActor {
         };
         if members.len() <= 1 {
             // Solo membership (the caller itself): owner of
-            // everything by construction — skip the hash walk.
+            // everything by construction — skip the owner lookup.
             return true;
         }
-        match rendezvous_owner(job_id, members.iter().map(|(m, _)| m.as_str())) {
+        match plan.owner(job_id) {
             Some(owner) if owner == me => true,
             Some(owner) => {
                 // The steal horizon: the owner has missed its beat —
                 // its slice is served broadly until it returns (the
                 // caller is fresh by construction; the OWNER's age is
-                // what gates). The owner is always in the snapshot
-                // (rendezvous_owner picked it from there), so the
-                // lookup cannot miss; stay total and steal-open if it
-                // ever did (served-more-broadly is the safe
-                // direction).
+                // what gates). The owner is always in the membership
+                // the cache was maintained over, so the lookup cannot
+                // miss; stay total and steal-open if it ever did
+                // (served-more-broadly is the safe direction).
                 members
                     .iter()
                     .find(|(m, _)| {
@@ -998,8 +1162,9 @@ impl DagActor {
                     .map(|(_, last)| now.duration_since(*last) > LISTING_STEAL_HORIZON)
                     .unwrap_or(true)
             }
-            // Unreachable (the caller was just recorded), but total:
-            // an empty membership serves unpartitioned.
+            // A job the window reconcile has not seen (unreachable:
+            // the reconcile covered this query's rows), but total:
+            // serve broadly (the safe direction).
             None => true,
         }
     }

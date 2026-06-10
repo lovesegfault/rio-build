@@ -10061,3 +10061,243 @@ async fn listing_cost_counters_move_at_the_choke_sites() -> TestResult {
     );
     Ok(())
 }
+
+// r[verify sched.materialize.listing-cost]
+/// bug_045 — plan-level unit: a member JOIN scores EXACTLY one pair
+/// per cached job (the joiner against each stored winner), and the
+/// cache converges to the batch argmax after the poll's reconcile.
+/// Proposition certified (R16): the join leg of the membership-event
+/// maintenance bound, by operation count.
+#[test]
+fn member_join_scores_exactly_one_per_cached_job() {
+    let jobs: Vec<Uuid> = (0..16).map(|_| Uuid::now_v7()).collect();
+    let members: Vec<String> = (0..3)
+        .map(|w| worker_member("store-plan-join", w))
+        .collect();
+    let mut plan = crate::actor::materialize::ListingPlan::default();
+    for m in &members {
+        plan.on_join(m); // empty cache: joins cost nothing yet
+    }
+    plan.reconcile_window(jobs.iter().copied(), members.iter().map(|m| m.as_str()));
+
+    let joiner = worker_member("store-plan-join", 3);
+    let before = crate::actor::materialize::listing_cost_snapshot();
+    plan.on_join(&joiner);
+    let after = crate::actor::materialize::listing_cost_snapshot();
+    assert_eq!(
+        after.scores_computed - before.scores_computed,
+        16,
+        "left: the join rescores window x members / right: exactly one \
+         score per cached job (the joiner vs each stored winner)"
+    );
+
+    // Parity after the poll's reconcile (the arm always reconciles
+    // after folding events).
+    let all: Vec<&str> = members
+        .iter()
+        .map(|m| m.as_str())
+        .chain(std::iter::once(joiner.as_str()))
+        .collect();
+    plan.reconcile_window(jobs.iter().copied(), all.iter().copied());
+    for job in &jobs {
+        assert_eq!(
+            plan.owner(*job),
+            crate::actor::materialize::rendezvous_owner(*job, all.iter().copied()),
+            "cached owner must equal the batch argmax after the join"
+        );
+    }
+}
+
+// r[verify sched.materialize.listing-cost]
+/// bug_045 — plan-level unit: an OWNER's TTL leave re-argmaxes ONLY
+/// the departed member's jobs (exactly owned x survivors scores;
+/// within the rule's owned x members bound); non-owner leaves are
+/// free. Proposition certified (R16): the leave leg of the
+/// membership-event maintenance bound, by operation count.
+///
+/// Disclosed (R16 pre-fix-inexpressible): no leave-granular red is
+/// constructible on the unfixed tree — leaves are not events there;
+/// every poll rescored the whole window regardless, which is exactly
+/// the defect manifest `stable_epoch_polls_compute_zero_scores`
+/// recorded true-red (delta = polls x window x members). This test is
+/// the post-close structural witness at the event site, with
+/// parameterized membership (no wall clock, no TTL sleeps).
+#[test]
+fn owner_leave_rescores_only_its_bucket() {
+    let jobs: Vec<Uuid> = (0..24).map(|_| Uuid::now_v7()).collect();
+    let members: Vec<String> = (0..4)
+        .map(|w| worker_member("store-plan-leave", w))
+        .collect();
+    let mut plan = crate::actor::materialize::ListingPlan::default();
+    for m in &members {
+        plan.on_join(m);
+    }
+    plan.reconcile_window(jobs.iter().copied(), members.iter().map(|m| m.as_str()));
+
+    let leaver = members[2].clone();
+    let owned = jobs
+        .iter()
+        .filter(|j| plan.owner(**j) == Some(leaver.as_str()))
+        .count() as u64;
+    assert!(
+        owned > 0,
+        "precondition: the leaver owns part of the window"
+    );
+    let survivors: Vec<&str> = members
+        .iter()
+        .filter(|m| **m != leaver)
+        .map(|m| m.as_str())
+        .collect();
+
+    let before = crate::actor::materialize::listing_cost_snapshot();
+    plan.on_leave(&leaver, survivors.iter().copied());
+    let after = crate::actor::materialize::listing_cost_snapshot();
+    let delta = after.scores_computed - before.scores_computed;
+    assert_eq!(
+        delta,
+        owned * survivors.len() as u64,
+        "left: the leave rescores the whole window / right: exactly the \
+         departed owner's bucket over the survivors"
+    );
+    assert!(
+        delta <= owned * members.len() as u64,
+        "the sched.materialize.listing-cost bound: <= owned x members"
+    );
+    for job in &jobs {
+        assert_eq!(
+            plan.owner(*job),
+            crate::actor::materialize::rendezvous_owner(*job, survivors.iter().copied()),
+            "cached owner must equal the batch argmax over the survivors"
+        );
+    }
+}
+
+// r[verify sched.materialize.listing-cost]
+/// bug_045 — plan-level unit: the window reconcile scores ONLY jobs
+/// ENTERING the window (cached jobs cost nothing; departed jobs are
+/// evicted). Proposition certified (R16): the once-per-window-change
+/// scoring law, by operation count.
+#[test]
+fn window_reconcile_scores_only_entering_jobs() {
+    let jobs: Vec<Uuid> = (0..12).map(|_| Uuid::now_v7()).collect();
+    let members: Vec<String> = (0..3)
+        .map(|w| worker_member("store-plan-window", w))
+        .collect();
+    let mut plan = crate::actor::materialize::ListingPlan::default();
+    for m in &members {
+        plan.on_join(m);
+    }
+    plan.reconcile_window(jobs.iter().copied(), members.iter().map(|m| m.as_str()));
+
+    // Same window: zero scoring.
+    let before = crate::actor::materialize::listing_cost_snapshot();
+    plan.reconcile_window(jobs.iter().copied(), members.iter().map(|m| m.as_str()));
+    let after = crate::actor::materialize::listing_cost_snapshot();
+    assert_eq!(
+        after.scores_computed - before.scores_computed,
+        0,
+        "left: the reconcile rescores the standing window / right: cached \
+         jobs cost nothing"
+    );
+
+    // 4 jobs leave, 4 enter: exactly 4 x members scores; the departed
+    // are evicted.
+    let entering: Vec<Uuid> = (0..4).map(|_| Uuid::now_v7()).collect();
+    let next: Vec<Uuid> = jobs[4..].iter().copied().chain(entering).collect();
+    let before = crate::actor::materialize::listing_cost_snapshot();
+    plan.reconcile_window(next.iter().copied(), members.iter().map(|m| m.as_str()));
+    let after = crate::actor::materialize::listing_cost_snapshot();
+    assert_eq!(
+        after.scores_computed - before.scores_computed,
+        4 * members.len() as u64,
+        "only the entering jobs are scored, once per member"
+    );
+    for gone in &jobs[..4] {
+        assert_eq!(
+            plan.owner(*gone),
+            None,
+            "jobs that left the window are evicted from the cache"
+        );
+    }
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+    // r[verify sched.materialize.listing-cost]
+    /// bug_045 — THE parity pin (Q1 single-source law extended to the
+    /// maintainer): across generated join/leave/refresh/window-change
+    /// poll sequences, the cached owner of EVERY window job equals
+    /// the batch argmax `rendezvous_owner` over the live membership.
+    /// Proposition certified (R16): cached-owner ≡ batch-argmax under
+    /// churn — the claim live_041's serving correctness rides on.
+    /// Members are minted through the production composer
+    /// (`Dns1123Label::sanitize(..).with_worker`); jobs are `now_v7`.
+    /// Green-side by necessity (disclosed): the cache must exist to
+    /// be compared.
+    #[test]
+    fn cached_owner_map_matches_batch_argmax_under_churn(
+        polls in proptest::collection::vec(
+            (
+                proptest::option::of(0usize..6),  // joining worker
+                proptest::bits::u8::ANY,          // TTL-leave mask (workers 0..6)
+                proptest::option::of(proptest::bits::u32::ANY), // window change mask (jobs 0..24)
+            ),
+            1..32,
+        ),
+    ) {
+        let jobs: Vec<Uuid> = (0..24).map(|_| Uuid::now_v7()).collect();
+        let members: Vec<String> = (0..6)
+            .map(|w| worker_member("store-churn", w))
+            .collect();
+        let mut plan = crate::actor::materialize::ListingPlan::default();
+        let mut live: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        let mut window: Vec<Uuid> = Vec::new();
+
+        for (join, leave_mask, window_mask) in polls {
+            // The arm's event protocol per poll: prune leaves (all at
+            // once), note the caller (join), fold leave events over
+            // the post-prune membership (joiner included), fold the
+            // join, then reconcile the window.
+            let mut left: Vec<usize> = Vec::new();
+            for w in 0..6 {
+                if leave_mask & (1 << w) != 0 && live.remove(&w) {
+                    left.push(w);
+                }
+            }
+            let joined = match join {
+                Some(w) => live.insert(w),
+                None => false,
+            };
+            let live_members: Vec<&str> =
+                live.iter().map(|w| members[*w].as_str()).collect();
+            for w in &left {
+                plan.on_leave(&members[*w], live_members.iter().copied());
+            }
+            if joined
+                && let Some(w) = join
+            {
+                plan.on_join(&members[w]);
+            }
+            if let Some(mask) = window_mask {
+                window = jobs
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| mask & (1 << i) != 0)
+                    .map(|(_, j)| *j)
+                    .collect();
+            }
+            plan.reconcile_window(window.iter().copied(), live_members.iter().copied());
+
+            for job in &window {
+                proptest::prop_assert_eq!(
+                    plan.owner(*job),
+                    crate::actor::materialize::rendezvous_owner(
+                        *job,
+                        live_members.iter().copied()
+                    ),
+                    "cached owner != batch argmax after a poll's events"
+                );
+            }
+        }
+    }
+}
