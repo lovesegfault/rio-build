@@ -1085,11 +1085,22 @@ pub(super) async fn open_attempts_best_effort(
 /// [`select_excess_pending`]).
 pub(super) fn job_older_than(j: &Job, min_age: Duration) -> bool {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
-    let cutoff = Time(
-        k8s_openapi::jiff::Timestamp::now()
-            - k8s_openapi::jiff::SignedDuration::try_from(min_age)
-                .unwrap_or(k8s_openapi::jiff::SignedDuration::ZERO),
-    );
+    // Total over unrepresentable ages: a `min_age` too large for the
+    // signed-duration conversion OR the timestamp arithmetic means
+    // NOTHING can be that old — answer false (the conservative
+    // direction at every caller: not-old-enough never reaps, never
+    // covers). The retired `unwrap_or(ZERO)` fallback INVERTED here:
+    // an astronomically large age collapsed the cutoff to `now`, so
+    // EVERY pre-existing object read as older-than (merged_bug_036
+    // overflow rider — the saturated wire age must fail postdating,
+    // not pass it).
+    let Ok(min_age) = k8s_openapi::jiff::SignedDuration::try_from(min_age) else {
+        return false;
+    };
+    let Ok(cutoff) = k8s_openapi::jiff::Timestamp::now().checked_sub(min_age) else {
+        return false;
+    };
+    let cutoff = Time(cutoff);
     j.metadata
         .creation_timestamp
         .as_ref()

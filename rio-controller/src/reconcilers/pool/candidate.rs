@@ -453,10 +453,16 @@ impl VerdictWitness {
         job: &k8s_openapi::api::batch::v1::Job,
     ) -> Option<Self> {
         let kind_is_build = closed.attempt_kind == rio_proto::types::AttemptKind::Build as i32;
+        // Saturating: a wire age near u64::MAX must not wrap to a
+        // tiny window and INVERT the conjunct — saturation yields an
+        // astronomically large age, which correctly FAILS the
+        // postdates check (no Job predates it; fail-toward-counting).
         let postdates_job = super::job::job_older_than(
             job,
             std::time::Duration::from_secs(
-                closed.closed_age_secs + super::job::CANCEL_CLOSE_SKEW_SLACK_SECS,
+                closed
+                    .closed_age_secs
+                    .saturating_add(super::job::CANCEL_CLOSE_SKEW_SLACK_SECS),
             ),
         );
         (kind_is_build && postdates_job).then_some(Self(SpawnResolution::ClosedBuild {
@@ -821,8 +827,12 @@ impl PoolStreaks {
         if let SpawnResolution::ClosedBuild { closed_age_secs } = what
             && let Some(e) = self.respawn.get(&key)
         {
+            // Saturating: a wrapped tiny close_age would read as
+            // "postdates the death" and DROP a record that must be
+            // retained — saturation reads as an arbitrarily old
+            // close, which correctly RETAINS (the safe direction).
             let close_age = std::time::Duration::from_secs(
-                closed_age_secs + super::job::CANCEL_CLOSE_SKEW_SLACK_SECS,
+                closed_age_secs.saturating_add(super::job::CANCEL_CLOSE_SKEW_SLACK_SECS),
             );
             if close_age >= now.saturating_duration_since(e.last_death) {
                 tracing::debug!(pool = %pool, intent, closed_age_secs,

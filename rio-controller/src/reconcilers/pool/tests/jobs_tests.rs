@@ -2997,6 +2997,47 @@ fn older_close_does_not_erase_newer_deaths() {
 }
 
 // r[verify ctrl.pool.respawn-backoff+2]
+/// merged_bug_036 overflow red: a wire `closed_age_secs` near
+/// u64::MAX must saturate, never wrap — a wrapped tiny age INVERTS
+/// both chronology guards (a record that must be retained gets
+/// dropped; a close that covers nothing reads as covering).
+/// PROPOSITION CERTIFIED: with closed_age_secs = u64::MAX - 1, the
+/// record is RETAINED (saturation = arbitrarily old close) and the
+/// reap-mask mint fails (no Job predates it).
+#[test]
+fn near_max_close_age_saturates_and_retains() {
+    use crate::reconcilers::pool::candidate::{PoolStreaks, VerdictWitness};
+
+    let hostile = |intent: &str| rio_proto::types::ClosedAttempt {
+        intent_id: intent.into(),
+        exec_id: "exec-ov1".into(),
+        cause: rio_proto::types::CloseCause::Completed as i32,
+        closed_age_secs: u64::MAX - 1,
+        attempt_kind: rio_proto::types::AttemptKind::Build as i32,
+    };
+
+    // Reset lane: the record survives the hostile age.
+    let mut streaks = PoolStreaks::default();
+    let key = pkey();
+    let now = std::time::Instant::now();
+    streaks.note_verdict_free_death(&key, "ovf", now - std::time::Duration::from_secs(5));
+    let w = VerdictWitness::from_recently_closed_build(&hostile("ovf")).expect("BUILD mints");
+    streaks.note_resolution(&key, "ovf", w, now);
+    assert!(
+        streaks.respawn_blocked(&key, "ovf", now),
+        "left: record erased (the wrapped tiny close_age read as \
+         postdating the death) / right: retained (saturated age)"
+    );
+
+    // Reap-mask lane: the hostile age covers nothing.
+    let job = terminal_job_for_intent("rio-builder-p-ovf", "ovf");
+    assert!(
+        VerdictWitness::covers_job_death(&hostile("ovf"), &job).is_none(),
+        "left: Some (the wrapped age postdated every Job) / right: None"
+    );
+}
+
+// r[verify ctrl.pool.respawn-backoff+2]
 /// merged_bug_036 R3: the restored envelope — respawn count under
 /// sustained verdict-free fast-crash is LADDER-bounded inside a
 /// renewable close window. PROPOSITION CERTIFIED structurally (spawn
