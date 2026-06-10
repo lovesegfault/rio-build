@@ -10700,3 +10700,202 @@ fn store_mirrored_listing_constants_match() {
         crate::actor::materialize::LISTING_STEAL_HORIZON.as_secs(),
     );
 }
+
+// ── bug_090: the fail-fast park persists only an accepted release ──────
+
+/// bug_090 R1: the fail-fast park is a RELEASE through the kinded
+/// chokepoint, wired on the production path. PROPOSITION CERTIFIED:
+/// after the arm-3 settled fail-fast, the persisted value and the
+/// accepted edge are the same event — observed structurally through
+/// the claim carrier (`exec_id == None` after settlement iff the
+/// release chokepoint accepted; the carrier clear and the returned
+/// target are the same `apply_validated_transition` event, so the
+/// witness is the proposition one constructor earlier, not a proxy).
+/// Production constructors only: real merge (prune fires), real pull
+/// mint, real Unobtainable report through the consumption intake.
+#[tokio::test]
+async fn fail_fast_releases_the_claim_through_the_kinded_chokepoint() -> TestResult {
+    use rio_auth::hmac::HmacSigner;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let service_key = b"test-bug090-failfast-key-32bytes!".to_vec();
+    let (handle, _actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |_cfg, p| {
+            p.service_signer = Some(Arc::new(HmacSigner::from_key(service_key)));
+        });
+    let tenant = rio_store::test_helpers::seed_tenant(&db.pool, "bug090-tenant").await;
+
+    // The pruned-root shape: root substitutable at merge → prune fires
+    // → root marked + childless + origin=pruned job.
+    let root_out = test_store_path("b90-root-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(root_out.clone());
+    let mut root = make_node("b90-root");
+    root.expected_output_paths = vec![root_out.clone()];
+    root.wanted_output_names = vec!["out".into()];
+    let mut dep = make_node("b90-dep");
+    dep.expected_output_paths = vec![test_store_path("b90-dep-out")];
+    let build_id = Uuid::new_v4();
+    merge_dag_req(
+        &handle,
+        MergeDagRequest {
+            build_id,
+            tenant_id: Some(tenant),
+            priority_class: PriorityClass::Scheduled,
+            nodes: vec![root, dep],
+            edges: vec![make_test_edge("b90-root", "b90-dep")],
+            options: BuildOptions::default(),
+            keep_going: false,
+            traceparent: String::new(),
+            jti: None,
+            jwt_token: Some("harness-tenant-jwt".into()),
+        },
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Claim (the real pull mint stamps the exec carrier), then the
+    // upstream entry vanishes and the worker confirms the absence.
+    let assignment = match claim_materialization(&handle, "b90-root", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .retain(|p| p != &root_out);
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        "b90-root",
+        mat_unobtainable_outcome(
+            vec![root_out.clone()],
+            vec![],
+            "upstream 404 on the pruned root's output",
+        ),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("unobtainable report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    // The claim carrier is RELEASED through the kinded chokepoint —
+    // not latched through the terminal.
+    let info = handle
+        .debug_query_derivation("b90-root")
+        .await?
+        .expect("node still in DAG (reap runs on a later sweep)");
+    assert_eq!(
+        info.exec_id, None,
+        "left: exec_id = Some(mat_exec) latched through the terminal (the \
+         refused park left the claim carrier; the cancel epilogue \
+         cross-correlated the settled exec) / right: None (released through \
+         validate_transition_for_release)"
+    );
+    // The released Queued park is classified not-yet-dispatched by the
+    // cancel cascade (pre-fix: memory stuck Assigned → the in-flight
+    // arm cancelled it, an artifact of the divergence).
+    assert_eq!(
+        info.status,
+        DerivationStatus::DependencyFailed,
+        "the released park rides the cascade's not-yet-dispatched arm"
+    );
+    // PG and memory agree at every step (pre-fix PG was overwritten to
+    // 'queued' over a refused edge mid-flight).
+    let pg_status: String =
+        sqlx::query_scalar("SELECT status FROM derivations WHERE drv_hash = 'b90-root'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(pg_status, "dependency_failed", "durable row matches memory");
+    // The mat exec's drv_executions row carries the settled close's
+    // stamp — the close's assignment-close owns the verdict; the
+    // cancel-time epilogue no longer resolves this exec at all.
+    let exec_status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM drv_executions WHERE exec_id = $1")
+            .bind(exec_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        exec_status.as_deref(),
+        Some("succeeded"),
+        "the settled close's stamp is the row's verdict"
+    );
+    // The build still fails with the resubmit-directing format (the
+    // fail-fast's purpose is untouched by the release discipline).
+    let st = query_status(&handle, build_id).await?;
+    assert_eq!(
+        st.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "the fail-fast still fails the interested build"
+    );
+    Ok(())
+}
+
+/// bug_090 R2: a no-edge arrival produces ZERO durable writes — the
+/// persist-count delta IS the no-edge-no-write law. PROPOSITION
+/// CERTIFIED: an already-parked (Queued) pruned root re-entering the
+/// fail-fast helper persists nothing (pre-fix: one no-edge same-value
+/// persist — the merged_bug_006 RefusedNewer feeder). Defense-in-depth
+/// lane: production-minted entry state (a parked Queued root with live
+/// interest), then the `pub(super)` helper invoked directly — the
+/// sanctioned unit lane for a production-minted entry state.
+#[tokio::test]
+async fn already_parked_fail_fast_persists_nothing() -> TestResult {
+    use std::sync::atomic::Ordering;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let derivation_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO derivations (drv_hash, drv_path, pname, system, status) \
+         VALUES ($1, $2, 'pkg', 'x86_64-linux', 'queued') \
+         RETURNING derivation_id",
+    )
+    .bind("b90-parked")
+    .bind(test_drv_path("b90-parked"))
+    .fetch_one(&db.pool)
+    .await?;
+    let mut actor = DagActor::new(
+        SchedulerDb::new(db.pool.clone()),
+        DagActorConfig::default(),
+        DagActorPlumbing::default(),
+    );
+    actor.test_inject_ready_row(crate::db::RecoveryDerivationRow {
+        derivation_id,
+        ..crate::db::RecoveryDerivationRow::test_default("b90-parked", "x86_64-linux")
+    });
+    {
+        let s = actor.dag.node_mut("b90-parked").expect("just injected");
+        s.set_status_for_test(DerivationStatus::Queued);
+        // Live interest keeps the helper's actionable guard open; the
+        // build entry itself is absent (the cascade tolerates that —
+        // its persists ride the UNCOUNTED batch path either way).
+        s.interested_builds.insert(Uuid::new_v4());
+    }
+
+    let before = actor
+        .test_counters
+        .persist_status_calls
+        .load(Ordering::SeqCst);
+    actor
+        .fail_fast_pruned_root(&DrvHash::from("b90-parked"), "already-parked re-entry")
+        .await;
+    let after = actor
+        .test_counters
+        .persist_status_calls
+        .load(Ordering::SeqCst);
+    assert_eq!(
+        after - before,
+        0,
+        "left: 1 (a no-edge same-value persist — the merged_bug_006 \
+         RefusedNewer feeder) / right: 0 (no edge, no write)"
+    );
+    Ok(())
+}

@@ -489,20 +489,37 @@ impl DagActor {
         // resubmitted genuinely-pruned root re-prunes and gets a fresh
         // pruned-origin job; a full merge re-declares the closure and
         // creates none.
-        let parked = if let Some(s) = self.dag.node_mut(drv_hash) {
-            if let Err(e) = s.transition(DerivationStatus::Queued) {
-                warn!(%drv_hash, %e, "topdown fail-fast: transition to Queued rejected");
+        // The park is a materialization RELEASE through the kinded
+        // chokepoint (the A2.5 law: every claim-held materialization
+        // exit routes through `validate_transition_for_release` — the
+        // node arrives Assigned from the arm-3 settlement, which
+        // consumes a CLAIMED attempt's report and never requeues
+        // first), and the persist consumes the release's RETURNED
+        // target: no edge, no write. `deps_completed: false` is the
+        // truthful dep verdict — the pruned root's deps were DROPPED
+        // from the DAG, not completed (a vacuous all-deps-completed
+        // would release to Ready and re-dispatch, which the
+        // Queued-not-Ready design above forbids). An already-Queued
+        // arrival is parked already: a same-value persist is a
+        // comparand non-event (merged_bug_006) and the witness
+        // discipline forbids the write regardless.
+        let released_to = match self.dag.node_mut(drv_hash) {
+            None => None,
+            Some(s) if s.status() == DerivationStatus::Queued => None,
+            Some(s) => {
+                match s.reset_after_attempt(crate::state::AttemptKind::Materialization, false) {
+                    Ok(to) => Some(to),
+                    Err(e) => {
+                        warn!(%drv_hash, %e,
+                              "topdown fail-fast: release toward Queued rejected; \
+                               skipping persist (no edge, no write)");
+                        None
+                    }
+                }
             }
-            true
-        } else {
-            false
         };
-        // Persist only for a node the block above actually parked —
-        // never for one the early return skipped or that vanished
-        // between the check and the mutation.
-        if parked {
-            self.persist_status(drv_hash, DerivationStatus::Queued, None)
-                .await;
+        if let Some(to) = released_to {
+            self.persist_status(drv_hash, to, None).await;
         }
         for build_id in self.get_interested_builds(drv_hash) {
             if let Some(build) = self.builds.get_mut(&build_id) {
