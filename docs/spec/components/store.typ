@@ -568,53 +568,116 @@ unreferenced age past grace and are collected by a later collect cycle
   collect cycle). The bound is ≤1 NAR-size per failure.
 ]
 
-#r("store.put.nar-bytes-budget+4")[
+#r("store.put.nar-hold-envelope")[
+  Every NAR-budget HOLD must carry a typed transfer-deadline envelope derived
+  from its byte basis at the floor rate (`deadline = NAR_HOLD_GRACE_FACTOR ×
+  stall_window + bytes_basis / NAR_HOLD_FLOOR_RATE`, armed at permit grant —
+  park time never consumes hold time); every non-reservation budget acquire
+  must shed typed (`ResourceExhausted`) within the wait grace
+  (`BUDGET_WAIT_GRACE`); zero-holding parks are exempt backpressure.
+]
+
+The envelope's basis is the span's own ceiling: the verified narinfo's
+declared `NarSize` for a substitution hold, the `MAX_NAR_SIZE` charged-permit
+cap for a PutPath/PutPathBatch stream-ingest hold (the handler's own
+cumulative-charge ceiling), and the actual buffered byte count for a persist
+span (`finalize_single`, batch stage/commit — the rio-common S3 client ships
+no TimeoutConfig by design, so per-operation deadlines are the holder's
+duty). The grace factor is pinned `≥ 2` so the per-read stall clock always
+fires first on a genuinely wedged read; the wait grace is pinned strictly
+inside the smallest hold grace so a waiting holder sheds its WAIT before its
+own HOLD deadline can fire. Both knobs and the floor rate are violable
+builder overrides (R17) with violating reds
+(`hold_envelope_floor_rate_binds`, `wait_grace_binds`, `tenant_cap_binds`).
+The one deliberate non-clock: the substitute leg's zero-holding budget park
+stays untimed (`BudgetParked`, takeover-exempt) — parking is backpressure,
+never a strike, and the park's boundedness is the
+#rref("store.put.nar-bytes-budget") theorem, not a clock.
+
+#r("store.put.nar-bytes-budget+5")[
   A process-global `tokio::sync::Semaphore` (default `8 × MAX_NAR_SIZE` = 32
   GiB; configurable via `nar_buffer_budget_bytes`, floored by `validate()` at
   `MAX_NAR_SIZE` so every deployed budget admits at least one whole-NAR
   reservation) bounds in-flight NAR bytes across ALL concurrent `PutPath` AND
   upstream-substitution NAR ingests (one shared `Arc<Semaphore>`). Two charge
-  regimes, one semaphore unit. *PutPath/PutPathBatch (per-chunk):* each
-  handler `acquire_many(nar_chunk_charge(chunk.len()))` BEFORE extending its
-  `nar_data: Vec<u8>`; permits are held in a `Vec<SemaphorePermit>` and
-  released on handler drop (any exit path). Empty `NarChunk` messages are
-  rejected with `InvalidArgument`; tiny chunks are charged a floor of
-  `MIN_NAR_CHUNK_CHARGE` (256) bytes so per-permit tracking overhead is itself
-  bounded by the budget; the per-request `MAX_NAR_SIZE` raw-content check uses
-  `>=` so a single chunk of exactly 2³² bytes is rejected before it reaches
-  `acquire_many(0)`. Both RPCs track cumulative *charged permits* (each chunk
-  charged `nar_chunk_charge(len) = max(len, MIN_NAR_CHUNK_CHARGE)`) and reject
-  at `MAX_NAR_SIZE` BEFORE `acquire_many` --- `PutPathBatch` with
-  `FailedPrecondition` (builder falls back to per-output `PutPath`), `PutPath`
-  with `InvalidArgument` (too-many-tiny-chunks is a client bug).
-  *Substitution (whole-NAR reservation):* the substitute leg MUST charge its
-  entire declared size in ONE reservation
-  (`declared.max(MIN_NAR_CHUNK_CHARGE)`), acquired after the placeholder
-  claim arms and before the NAR GET, with `declared >= MAX_NAR_SIZE` rejected
-  first (PutPath parity; also what makes the reservation `u32`-expressible);
-  a budget waiter therefore holds ZERO permits, the read loop has no acquire
-  site, the decompressed read cap is `declared + 1` (over-delivery fails as
-  `SizeMismatch` during the read, so buffered bytes never exceed the
-  reservation), and the reservation's lifetime MUST cover the bytes'
-  residency --- it rides the buffer through the hash `spawn_blocking` detach
-  and is credited back after `persist_nar` (or when the detached hash task's
-  output drops, under cancellation). The substitute leg's entire cumulative
-  charged demand IS its single reservation `< MAX_NAR_SIZE`, so the
-  charged-permit-unit law --- the unit MUST match the semaphore's so a single
-  handler can never demand more than `MAX_NAR_SIZE` permits, and with
-  `budget >= MAX_NAR_SIZE` (validate()-enforced; production 8×) a single
-  handler can never self-deadlock on permits it holds --- now holds for EVERY
-  handler in this rule's scope, not only PutPath/PutPathBatch. Among
-  reservation-discipline acquirers the budget is additionally wedge-free as a
-  POPULATION (no hold-and-wait; fair-FIFO head progress), PROVIDED no
-  incremental-regime holder (PutPath/PutPathBatch, whose client-controlled
-  residence is unbounded) is in hold-and-wait at budget exhaustion --- the
-  per-chunk regime retains the multi-holder wedge class among RPC ingest
-  streams; unifying PutPath on the reservation discipline (the declared
-  `NarSize` is available in the request metadata) is the named restoration
-  step. When the budget is exhausted, the `await` backpressures (gRPC flow
-  control / `BudgetParked` substitution parking) instead of OOMing the
-  process. NOT shared with GetPath's chunk cache (moka-bounded separately).
+  regimes, one semaphore unit, ONE hold/wait discipline
+  (#rref("store.put.nar-hold-envelope"): waiters park free, holders expire).
+  *PutPath/PutPathBatch (per-chunk):* each handler
+  `acquire_many(nar_chunk_charge(chunk.len()))` BEFORE extending its
+  `nar_data: Vec<u8>`, with the acquire wait-grace-bounded (grant or typed
+  `ResourceExhausted` shed — uniform over all chunk acquires, first
+  included); permits are held in a `Vec<SemaphorePermit>` and released on
+  handler exit (any path), with holder residency bounded by the ingest hold
+  envelope from the first granted permit and the persist spans enveloped over
+  their buffered bytes. Empty `NarChunk` messages are rejected with
+  `InvalidArgument`; tiny chunks are charged a floor of
+  `MIN_NAR_CHUNK_CHARGE` (256) bytes so per-permit tracking overhead is
+  itself bounded by the budget; the per-request `MAX_NAR_SIZE` raw-content
+  check uses `>=` so a single chunk of exactly 2³² bytes is rejected before
+  it reaches `acquire_many(0)`. Both RPCs track cumulative *charged permits*
+  (each chunk charged `nar_chunk_charge(len) = max(len,
+  MIN_NAR_CHUNK_CHARGE)`) and reject at `MAX_NAR_SIZE` BEFORE `acquire_many`
+  --- `PutPathBatch` with `FailedPrecondition` (builder falls back to
+  per-output `PutPath`), `PutPath` with `InvalidArgument`
+  (too-many-tiny-chunks is a client bug). *Substitution (whole-NAR
+  reservation):* the substitute leg MUST charge its entire declared size in
+  ONE reservation (`declared.max(MIN_NAR_CHUNK_CHARGE)`), acquired after the
+  placeholder claim arms and before the NAR GET, with `declared >=
+  MAX_NAR_SIZE` rejected first (PutPath parity; also what makes the
+  reservation `u32`-expressible); a budget waiter therefore holds ZERO
+  permits, the read loop has no acquire site, the decompressed read cap is
+  `declared + 1` (over-delivery fails as `SizeMismatch` during the read, so
+  buffered bytes never exceed the reservation), and the reservation's
+  lifetime MUST cover the bytes' residency --- it rides the buffer through
+  the hash `spawn_blocking` detach and is credited back after `persist_nar`
+  (or when the detached hash task's output drops, under cancellation) ---
+  while the whole hold (read span AND the post-read hash→sigs→persist tail)
+  is bounded by the reservation's hold envelope. *Cost axis (per-tenant
+  cap):* substitution charge is declaration-priced (a hostile upstream's lies
+  are free to make), so the reservation constructor additionally charges a
+  per-tenant outstanding-aggregate ledger capped at `TENANT_RESERVATION_CAP =
+  2 × MAX_NAR_SIZE` (¼ of the default pool: ≥ 4 tenants must collude to fill
+  the pool by declaration; one tenant's parallel warm of two max-size
+  closures is preserved) --- over-cap is a typed REFUSAL
+  (`TenantBudgetExhausted`, before the park, never queued). The substitute
+  leg's entire cumulative charged demand IS its single reservation `<
+  MAX_NAR_SIZE`, so the charged-permit-unit law --- the unit MUST match the
+  semaphore's so a single handler can never demand more than `MAX_NAR_SIZE`
+  permits, and with `budget >= MAX_NAR_SIZE` (validate()-enforced; production
+  8×) a single handler can never self-deadlock on permits it holds --- holds
+  for EVERY handler in this rule's scope. *The no-deadlock theorem,
+  UNCONDITIONAL over the machine acquire-site census (both regimes, no
+  population proviso, no axis exemption):* every parked head is granted
+  within the sum of the residual holder bounds. Premise-to-witness table ---
+  (i) fair-FIFO grant order over `acquire_many`: W8-E
+  `budget_grants_follow_arrival_order`; (ii) every hold expires (read spans,
+  ingest residency, persist tails): W8-B
+  `trickle_hold_aborts_at_the_transfer_deadline`, W8-B′
+  `blackholed_persist_releases_by_the_hold_deadline` (the persist-span
+  holder), W8-C `stopped_client_putpath_releases_by_the_ingest_deadline`,
+  W8-F `stopped_client_batch_releases_by_the_ingest_deadline`; (iii) every
+  holding wait sheds: W8-D `chunk_acquire_sheds_typed_after_wait_grace`;
+  (iv) every single demand < the `validate()` floor ≤ budget: E-2(i) + the
+  const-asserts. The hash compute bound (≈ 10 s / 4 GiB) is PRICED slack on
+  a deadline-expired holder's release lag (the `spawn_blocking` digest is
+  non-cancellable; its completion still drops the moved reservation) ---
+  slack on top of the enforced deadline, never a premise. *Unification note
+  (corrected):* the prior restoration step assumed the declared `NarSize` is
+  available in PutPath request metadata --- FALSE: the wire contract
+  mandates metadata `nar_hash`/`nar_size` empty/zero (trailer-only mode; the
+  builder is a single-pass tee that cannot know the size up front). Unifying
+  PutPath onto the reservation discipline remains a recorded successor
+  hypothesis REQUIRING a wire-contract change (opt-in declared-size metadata
+  plus gateway/builder client changes) --- not a residual on the theorem,
+  which holds without it. *Priced adversarial-availability bound (NOT a
+  safety proviso):* a hostile tenant pins at most `TENANT_RESERVATION_CAP`
+  (¼ default pool) per tenant, each leg for at most one hold deadline
+  (`5 × stall_window + declared / 256 KiB/s` ≈ 4.6 h worst case), and an
+  extender must hold live TCP and deliver ≥ the floor rate --- all
+  observable via the `budget_parked` claim-phase mirror. When the budget is
+  exhausted, the `await` backpressures (gRPC flow control / `BudgetParked`
+  substitution parking) within these bounds instead of OOMing the process.
+  NOT shared with GetPath's chunk cache (moka-bounded separately).
 ]
 
 #r("store.put.placeholder-claim+2")[

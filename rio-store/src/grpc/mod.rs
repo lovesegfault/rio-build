@@ -236,7 +236,7 @@ pub struct StoreServiceImpl {
     /// NOT shared with GetPath's chunk cache — that's moka-bounded separately
     /// (chunk_cache above). This bounds ONLY the per-request accumulation
     /// Vec, which is the OOM vector: 10 × 4 GiB = 40 GiB RSS.
-    // r[impl store.put.nar-bytes-budget+4]
+    // r[impl store.put.nar-bytes-budget+5]
     nar_bytes_budget: Arc<tokio::sync::Semaphore>,
     /// Typed envelope knobs for the ingest plane's budget waits and
     /// holds ([`NarIngestEnvelopeCfg`]) — wait grace at the
@@ -677,6 +677,12 @@ pub(super) fn substitute_status(e: SubstituteError) -> Status {
         // make progress.
         SubstituteError::HoldDeadlineExceeded { .. } => {
             Status::unavailable("nar-budget hold exceeded its transfer deadline; retry")
+        }
+        // Cost-axis refusal (the budget law's per-tenant cap): a local
+        // capacity refusal, typed retryable — same posture as the
+        // admission gate's saturation answer.
+        SubstituteError::TenantBudgetExhausted { .. } => {
+            Status::resource_exhausted("tenant nar-budget reservation cap reached; retry")
         }
         // Upstream-429: genuinely transient — `Unavailable` so the
         // scheduler's 8-attempt backoff retries. A bare 429 (no

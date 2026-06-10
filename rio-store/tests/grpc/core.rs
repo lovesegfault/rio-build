@@ -991,7 +991,7 @@ async fn test_get_path_size_mismatch_returns_data_loss() -> TestResult {
 /// permits but pushes a `SemaphorePermit` (~16 B) into `held_permits`.
 /// An infinite empty-chunk stream OOMs the store with the byte budget
 /// untouched. `accumulate_chunk` now rejects empty chunks outright.
-// r[verify store.put.nar-bytes-budget+4]
+// r[verify store.put.nar-bytes-budget+5]
 #[tokio::test]
 async fn accumulate_chunk_rejects_empty() -> TestResult {
     let mut s = StoreSession::new().await?;

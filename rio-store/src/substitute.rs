@@ -258,6 +258,17 @@ pub enum SubstituteError {
         hold_budget: Duration,
     },
 
+    /// The tenant's AGGREGATE outstanding reservation charge would
+    /// exceed [`TENANT_RESERVATION_CAP`] — the budget law's COST axis:
+    /// substitution charge is declaration-priced (a hostile upstream's
+    /// lies cost nothing to make), so per-tenant accounting refuses at
+    /// the constructor instead of letting one tenant's declarations
+    /// pin the shared pool. Typed REFUSAL, never queueing — returned
+    /// as `Err` so moka does NOT cache it; the executor's retry
+    /// machinery absorbs it once earlier reservations drain.
+    #[error("tenant nar-budget reservation cap reached ({cap} bytes outstanding); retry")]
+    TenantBudgetExhausted { cap: u64 },
+
     /// Transient upstream-429 (`r[store.substitute.probe-429-retry+3]`).
     /// `retry_after` is the parsed `Retry-After` header (delta-seconds
     /// or HTTP-date), `None` if absent or unparseable. Returned as
@@ -350,6 +361,13 @@ pub(crate) fn substitute_error_evidence(
         SubstituteError::HoldDeadlineExceeded { hold_budget, .. } => {
             (C::Stalled, Some(*hold_budget))
         }
+        // The tenant-cap refusal is a LOCAL capacity refusal with the
+        // same operational posture as the admission gate's (typed,
+        // uncached, retry once in-flight work drains) — mapped onto
+        // `C::AdmissionSaturated` so the kernel's class alphabet stays
+        // untouched; the typed Rust variant preserves the distinction
+        // at every in-crate consumer.
+        SubstituteError::TenantBudgetExhausted { .. } => (C::AdmissionSaturated, None),
         SubstituteError::Admission(_) => (C::AdmissionSaturated, None),
         SubstituteError::Fetch(_) | SubstituteError::NarInfo(_) => (C::Fetch, None),
         SubstituteError::HashMismatch { .. }
@@ -516,7 +534,7 @@ pub struct Substituter {
     /// path-only key would let tenant B's miss poison tenant A's
     /// lookup for the full TTL.
     probe_cache: Cache<(Uuid, String), bool>,
-    // r[impl store.put.nar-bytes-budget+4]
+    // r[impl store.put.nar-bytes-budget+5]
     /// Global budget for in-flight NAR bytes — the SAME semaphore
     /// PutPath acquires from (wired in main.rs via
     /// [`with_nar_bytes_budget`](Self::with_nar_bytes_budget)). Without
@@ -549,6 +567,13 @@ pub struct Substituter {
     /// [`Self::with_nar_hold_floor_rate`]; each envelope axis has a
     /// violating red in the in-file battery.
     nar_hold_floor_rate: u64,
+    /// Per-tenant outstanding-charge accounting (the cost axis) —
+    /// consulted by `reserve` before the park; see
+    /// [`TenantReservationLedger`].
+    tenant_ledger: TenantReservationLedger,
+    /// Cap for the ledger ([`TENANT_RESERVATION_CAP`]); violable via
+    /// [`Self::with_tenant_reservation_cap`] (R17).
+    tenant_reservation_cap: u64,
     /// Owner attribution stamped on substitution-claimed placeholders
     /// (`manifests.claimed_by`): the pod name (`HOSTNAME`), or
     /// `"unknown"` outside k8s.
@@ -656,6 +681,88 @@ pub(crate) const NAR_HOLD_GRACE_FACTOR: u32 = 5;
 // cuts integral slowness.
 const _: () = assert!(NAR_HOLD_GRACE_FACTOR >= 2);
 
+/// Per-tenant cap on AGGREGATE outstanding reservation charge — the
+/// COST axis of the budget law (merged_bug_021's blast radius; R17
+/// all-axes). Substitution charge is DECLARATION-priced (a hostile
+/// upstream's lies are free), unlike PutPath's delivery-priced
+/// incremental charge — so without this cap one tenant's upstream
+/// could pin the whole pool by declaration alone (8 legs × ~4 GiB
+/// against the 32 GiB default). `2 × MAX_NAR_SIZE` (8 GiB = ¼ of the
+/// default pool): ≥ 4 tenants must collude to fill the pool by
+/// declaration, while a single tenant's parallel warm of two max-size
+/// closures is preserved. Refusal, never queueing: over-cap returns
+/// the typed [`SubstituteError::TenantBudgetExhausted`] (retryable —
+/// the executor's existing retry machinery absorbs it); a tenant-axis
+/// queue would mint new lock-order proof obligations for zero
+/// benefit. Violable per R17 via
+/// [`Substituter::with_tenant_reservation_cap`].
+pub(crate) const TENANT_RESERVATION_CAP: u64 = 2 * MAX_NAR_SIZE;
+
+// The cap admits at least one whole-NAR reservation (so a single
+// honest tenant is never structurally refused), and sits below the
+// default pool (so the cap is the binding constraint for one tenant).
+const _: () = assert!(TENANT_RESERVATION_CAP >= MAX_NAR_SIZE);
+const _: () = assert!(TENANT_RESERVATION_CAP as usize <= DEFAULT_SUBSTITUTE_NAR_BUDGET);
+
+// r[impl store.put.nar-bytes-budget+5]
+/// Tenant-keyed outstanding reservation charge — the cost-axis
+/// accounting behind [`TENANT_RESERVATION_CAP`]. Consulted inside
+/// [`NarBudgetReservation::reserve`] BEFORE the semaphore park (a
+/// refused tenant never queues, so the wait edge gains no new
+/// population); released when the reservation drops (the
+/// [`TenantChargeGuard`] rides the reservation, so every abort path —
+/// completion, deadline expiry, cancellation — releases through the
+/// ONE `Drop` impl).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TenantReservationLedger {
+    outstanding: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, u64>>>,
+}
+
+impl TenantReservationLedger {
+    /// Charge `charge` against `tenant_id`'s outstanding total, or
+    /// refuse typed if the aggregate would exceed `cap`. The critical
+    /// section is sync and await-free.
+    pub(crate) fn checked_charge(
+        &self,
+        tenant_id: Uuid,
+        charge: u64,
+        cap: u64,
+    ) -> Result<TenantChargeGuard, SubstituteError> {
+        let mut map = self.outstanding.lock().expect("ledger lock poisoned");
+        let entry = map.entry(tenant_id).or_insert(0);
+        if entry.saturating_add(charge) > cap {
+            return Err(SubstituteError::TenantBudgetExhausted { cap });
+        }
+        *entry += charge;
+        Ok(TenantChargeGuard {
+            outstanding: Arc::clone(&self.outstanding),
+            tenant_id,
+            charge,
+        })
+    }
+}
+
+/// RAII release of one tenant charge — see [`TenantReservationLedger`].
+#[derive(Debug)]
+pub(crate) struct TenantChargeGuard {
+    outstanding: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, u64>>>,
+    tenant_id: Uuid,
+    charge: u64,
+}
+
+impl Drop for TenantChargeGuard {
+    fn drop(&mut self) {
+        let mut map = self.outstanding.lock().expect("ledger lock poisoned");
+        if let Some(e) = map.get_mut(&self.tenant_id) {
+            *e = e.saturating_sub(self.charge);
+            if *e == 0 {
+                map.remove(&self.tenant_id);
+            }
+        }
+    }
+}
+
+// r[impl store.put.nar-hold-envelope]
 /// The typed, violable transfer-deadline envelope every NAR-budget
 /// HOLD must carry (merged_bug_021's hold-TIME axis; R17 all-axes).
 /// One discipline: **waiters park free; holders expire** — the
@@ -748,7 +855,7 @@ impl NarHoldEnvelope {
     }
 }
 
-// r[impl store.put.nar-bytes-budget+4]
+// r[impl store.put.nar-bytes-budget+5]
 /// One substitute leg's WHOLE-NAR budget reservation — the single-shot
 /// charge that replaced the incremental per-read acquire (live_047/R-C
 /// WO-R7-1). THE invariants it carries:
@@ -791,6 +898,11 @@ pub(crate) struct NarBudgetReservation {
     /// deadline (`remaining()`), and so the type system makes an
     /// unenveloped hold unwritable.
     envelope: NarHoldEnvelope,
+    /// The tenant's cost-axis charge (WO-S1-2b): released by the same
+    /// drop that credits the semaphore back, so EVERY abort path —
+    /// completion, deadline expiry, cancellation — restores the
+    /// tenant's headroom through the one `Drop` impl.
+    _tenant_charge: TenantChargeGuard,
 }
 
 impl NarBudgetReservation {
@@ -803,9 +915,15 @@ impl NarBudgetReservation {
     /// Deliberately OUTSIDE the stall watchdog for the same reason.
     /// The park is also OUTSIDE the hold envelope: `envelope` is armed
     /// only at grant (a waiter holds nothing — its boundedness is the
-    /// FIFO-induction theorem over the holders, not a clock).
+    /// FIFO-induction theorem over the holders, not a clock). The
+    /// tenant ledger is consulted BEFORE the park (cost axis,
+    /// WO-S1-2b): an over-cap tenant is REFUSED typed, never queued —
+    /// the wait edge gains no new population.
     async fn reserve(
         budget: Arc<Semaphore>,
+        ledger: &TenantReservationLedger,
+        tenant_id: Uuid,
+        tenant_cap: u64,
         declared: u64,
         envelope: NarHoldEnvelope,
         progress_handle: Option<&ingest::ProgressHandle>,
@@ -819,6 +937,7 @@ impl NarBudgetReservation {
             });
         }
         let charge = declared.max(MIN_NAR_CHUNK_CHARGE as u64) as u32;
+        let tenant_charge = ledger.checked_charge(tenant_id, charge as u64, tenant_cap)?;
         if let Some(h) = progress_handle {
             h.set_phase(ingest::ClaimPhase::BudgetParked);
         }
@@ -832,6 +951,7 @@ impl NarBudgetReservation {
         Ok(Self {
             _permits: permits,
             envelope: envelope.arm(),
+            _tenant_charge: tenant_charge,
         })
     }
 
@@ -841,7 +961,8 @@ impl NarBudgetReservation {
     }
 }
 
-// r[impl store.put.nar-bytes-budget+4]
+// r[impl store.put.nar-bytes-budget+5]
+// r[impl store.put.nar-hold-envelope]
 /// The substitute leg's read loop, budget-free by construction (§5.1
 /// laws-as-types census): its parameter set is the stream, the caps,
 /// the watchdog inputs, the progress sinks, and the PROOF a whole-NAR
@@ -995,6 +1116,8 @@ impl Substituter {
             admission: None,
             stall_window: DEFAULT_SUBSTITUTE_STALL_WINDOW,
             nar_hold_floor_rate: NAR_HOLD_FLOOR_RATE,
+            tenant_ledger: TenantReservationLedger::default(),
+            tenant_reservation_cap: TENANT_RESERVATION_CAP,
             claimed_by: std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".into()),
             #[cfg(test)]
             hash_gate: None,
@@ -1026,6 +1149,15 @@ impl Substituter {
     /// knob binds by flipping it.
     pub fn with_nar_hold_floor_rate(mut self, bytes_per_sec: u64) -> Self {
         self.nar_hold_floor_rate = bytes_per_sec;
+        self
+    }
+
+    /// Override the per-tenant aggregate reservation cap
+    /// ([`TENANT_RESERVATION_CAP`]). Builder-style — the R17
+    /// violability lane: the violation red (`tenant_cap_binds`)
+    /// proves the knob binds by flipping it.
+    pub fn with_tenant_reservation_cap(mut self, cap: u64) -> Self {
+        self.tenant_reservation_cap = cap;
         self
     }
 
@@ -1677,10 +1809,10 @@ impl Substituter {
         let expected_hash = parse_nar_hash(&ni.nar_hash)?;
 
         // r[impl store.substitute.untrusted-upstream+3]
-        // r[impl store.put.nar-bytes-budget+4]
+        // r[impl store.put.nar-bytes-budget+5]
         // Declared-size gate. `trusted_keys` is also tenant-supplied so
         // a verified sig is NOT a trust boundary; gate before download.
-        // `>=` (PutPath parity, store.put.nar-bytes-budget+4): an
+        // `>=` (PutPath parity, store.put.nar-bytes-budget+5): an
         // exactly-MAX_NAR_SIZE NAR was never cluster-uploadable (PutPath
         // rejects `>=`), and the rejection makes the whole-NAR budget
         // reservation u32-expressible (max reservation 2^32 − 1).
@@ -1852,7 +1984,7 @@ impl Substituter {
         // explicit abort (the drop-guard is for the implicit drop path).
         let persist = async {
             // — Step 4: whole-NAR budget reservation, then GET —
-            // r[impl store.put.nar-bytes-budget+4]
+            // r[impl store.put.nar-bytes-budget+5]
             // Single-shot reservation AFTER the claim arms (so
             // AlreadyComplete/Raced cost zero budget) and BEFORE the
             // NAR GET (so a budget park never rides an open upstream
@@ -1873,6 +2005,9 @@ impl Substituter {
             );
             let reservation = NarBudgetReservation::reserve(
                 self.nar_bytes_budget.clone(),
+                &self.tenant_ledger,
+                tenant_id,
+                self.tenant_reservation_cap,
                 ni.nar_size,
                 envelope,
                 Some(&progress_handle),
@@ -1905,6 +2040,7 @@ impl Substituter {
                 });
             }
 
+            // r[impl store.put.nar-hold-envelope]
             // — Post-read tail, ENFORCED under the hold envelope —
             // The reservation provably spans hash → sigs → persist,
             // and rio-common's S3 client ships NO TimeoutConfig by
@@ -1931,7 +2067,7 @@ impl Substituter {
                 // worker). `Bytes` is cheap-clone; move it in and back
                 // out alongside the digest.
                 //
-                // r[impl store.put.nar-bytes-budget+4]
+                // r[impl store.put.nar-bytes-budget+5]
                 // §3.2 step 4 (live_047/R-C): the RESERVATION rides
                 // the bytes through the detach. tokio never cancels
                 // blocking tasks, so dropping this future at the
@@ -6448,7 +6584,7 @@ mod tests {
         let _ = cluster_seed;
     }
 
-    // r[verify store.put.nar-bytes-budget+4]
+    // r[verify store.put.nar-bytes-budget+5]
     /// bug_070, re-aimed at the live_047/R-C reservation: the
     /// substitute leg MUST draw its whole-NAR reservation from
     /// `nar_bytes_budget` before the GET and credit it back after
@@ -6731,7 +6867,7 @@ mod tests {
         );
     }
 
-    // r[verify store.put.nar-bytes-budget+4]
+    // r[verify store.put.nar-bytes-budget+5]
     /// [GEN-SET] Budget acquire-site census — REBUILT crate-wide (bw8
     /// WO-S1-1; the RC-1 kill on the no-deadlock theorem's own
     /// quantifier domain). GENERATOR: this fn's scan over
@@ -6941,7 +7077,7 @@ mod tests {
         }
     }
 
-    // r[verify store.put.nar-bytes-budget+4]
+    // r[verify store.put.nar-bytes-budget+5]
     /// W-3 leg (a), live_047/R-C: two concurrent substitute legs whose
     /// sizes sum past the budget MUST both complete — the single-shot
     /// whole-NAR reservation means a budget waiter holds ZERO permits,
@@ -7072,7 +7208,7 @@ mod tests {
         );
     }
 
-    // r[verify store.put.nar-bytes-budget+4]
+    // r[verify store.put.nar-bytes-budget+5]
     /// W-3 leg (b) — THE K=1 charge-amplification closure
     /// (live_047/R-C §1.3 F1, adversarial regime): ONE dribbling
     /// stream (1-byte reads, raw bytes ≪ budget) MUST complete against
@@ -7143,7 +7279,7 @@ mod tests {
         );
     }
 
-    // r[verify store.put.nar-bytes-budget+4]
+    // r[verify store.put.nar-bytes-budget+5]
     /// W-6a reservation-residency: cancelling the substitute leg at
     /// the hash-verify detach point MUST NOT credit the budget back
     /// while the DETACHED blocking task (tokio never cancels blocking
@@ -7269,6 +7405,7 @@ mod tests {
         sub.try_upstream(http, tid, &ups[0], path, &hp, None).await
     }
 
+    // r[verify store.put.nar-hold-envelope]
     // W8-B (R16 statement): a reservation older than its typed
     // deadline cannot exist — abort + credit-back observed under an
     // adversarial trickle that satisfies every per-read clock, never
@@ -7391,6 +7528,7 @@ mod tests {
         }
     }
 
+    // r[verify store.put.nar-hold-envelope]
     // W8-B′ (R16 statement): a black-holed persist cannot hold a
     // reservation past the deadline — the holder parked in the persist
     // span releases by the hold deadline with permits restored and the
@@ -7486,6 +7624,7 @@ mod tests {
         }
     }
 
+    // r[verify store.put.nar-bytes-budget+5]
     // W8-E (R16 statement; GREEN-SIDE PIN, disclosed — it certifies a
     // premise the pre-fix tree also satisfies): tokio fair-FIFO over
     // `acquire_many` — three staggered PRODUCTION acquires (the
@@ -7502,9 +7641,14 @@ mod tests {
                 NAR_HOLD_FLOOR_RATE,
             )
         };
+        let ledger = TenantReservationLedger::default();
+        let tenant = Uuid::new_v4();
         // A holds the whole pool.
         let a = NarBudgetReservation::reserve(
             Arc::clone(&budget),
+            &ledger,
+            tenant,
+            TENANT_RESERVATION_CAP,
             MIN_NAR_CHUNK_CHARGE as u64,
             env(),
             None,
@@ -7515,19 +7659,37 @@ mod tests {
         let (b_started_tx, b_started) = tokio::sync::oneshot::channel::<()>();
         let b = {
             let budget = Arc::clone(&budget);
+            let ledger = ledger.clone();
             tokio::spawn(async move {
                 let _ = b_started_tx.send(());
-                NarBudgetReservation::reserve(budget, MIN_NAR_CHUNK_CHARGE as u64, env(), None)
-                    .await
+                NarBudgetReservation::reserve(
+                    budget,
+                    &ledger,
+                    tenant,
+                    TENANT_RESERVATION_CAP,
+                    MIN_NAR_CHUNK_CHARGE as u64,
+                    env(),
+                    None,
+                )
+                .await
             })
         };
         b_started.await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         let c = {
             let budget = Arc::clone(&budget);
+            let ledger = ledger.clone();
             tokio::spawn(async move {
-                NarBudgetReservation::reserve(budget, MIN_NAR_CHUNK_CHARGE as u64, env(), None)
-                    .await
+                NarBudgetReservation::reserve(
+                    budget,
+                    &ledger,
+                    tenant,
+                    TENANT_RESERVATION_CAP,
+                    MIN_NAR_CHUNK_CHARGE as u64,
+                    env(),
+                    None,
+                )
+                .await
             })
         };
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -7549,6 +7711,7 @@ mod tests {
             .unwrap();
     }
 
+    // r[verify store.put.nar-hold-envelope]
     // Envelope-violation red (R17, floor-rate axis): the SAME paced
     // stream completes under a loose floor rate and aborts typed under
     // an absurd one — the knob demonstrably BINDS, and the abort fires
@@ -7635,6 +7798,220 @@ mod tests {
         );
     }
 
+    // r[verify store.put.nar-bytes-budget+5]
+    // W8-G (R16 statement): the cost bound at the constructor — a
+    // third same-tenant large reservation is refused typed while a
+    // second tenant admits (cross-tenant isolation observed, not
+    // narrated). Production constructors throughout: the ledger, the
+    // cap, and `reserve` are the production objects.
+    /// RED pre-fix (verbatim, run at the WO-S1-2a tip 9bc598728 — the
+    /// 2b-pre tree): `left: three ~MAX-scale declarations from one
+    /// tenant all acquired (pool depleted 3x by one tenant's
+    /// declarations; no per-tenant accounting exists) / right: third
+    /// refused TenantBudgetExhausted; second tenant's reservation
+    /// admitted`.
+    #[tokio::test]
+    async fn tenant_reservation_charge_is_capped() {
+        // Permit pool large enough that the SEMAPHORE never refuses —
+        // the cap must be the binding constraint (permits are
+        // counters, not memory).
+        let budget = Arc::new(Semaphore::new((MAX_NAR_SIZE as usize) * 3));
+        let ledger = TenantReservationLedger::default();
+        let tenant_a = Uuid::new_v4();
+        let tenant_b = Uuid::new_v4();
+        let big = MAX_NAR_SIZE - 1;
+        let env = || {
+            NarHoldEnvelope::for_declared(big, DEFAULT_SUBSTITUTE_STALL_WINDOW, NAR_HOLD_FLOOR_RATE)
+        };
+        // Two near-MAX reservations from tenant A: admitted
+        // (2 x (MAX-1) <= TENANT_RESERVATION_CAP).
+        let _a1 = NarBudgetReservation::reserve(
+            Arc::clone(&budget),
+            &ledger,
+            tenant_a,
+            TENANT_RESERVATION_CAP,
+            big,
+            env(),
+            None,
+        )
+        .await
+        .expect("first same-tenant reservation admitted");
+        let _a2 = NarBudgetReservation::reserve(
+            Arc::clone(&budget),
+            &ledger,
+            tenant_a,
+            TENANT_RESERVATION_CAP,
+            big,
+            env(),
+            None,
+        )
+        .await
+        .expect("second same-tenant reservation admitted (parallel warm preserved)");
+        // Third same-tenant reservation — even a MINIMAL one — refused
+        // typed at the constructor (aggregate accounting, not
+        // per-attempt size).
+        let third = NarBudgetReservation::reserve(
+            Arc::clone(&budget),
+            &ledger,
+            tenant_a,
+            TENANT_RESERVATION_CAP,
+            1,
+            NarHoldEnvelope::for_declared(1, DEFAULT_SUBSTITUTE_STALL_WINDOW, NAR_HOLD_FLOOR_RATE),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(
+                third,
+                Err(SubstituteError::TenantBudgetExhausted { cap }) if cap == TENANT_RESERVATION_CAP
+            ),
+            "third same-tenant reservation must be refused typed: {third:?}"
+        );
+        // Cross-tenant isolation: tenant B admits at full size.
+        let b1 = NarBudgetReservation::reserve(
+            Arc::clone(&budget),
+            &ledger,
+            tenant_b,
+            TENANT_RESERVATION_CAP,
+            big,
+            env(),
+            None,
+        )
+        .await;
+        assert!(b1.is_ok(), "second tenant must admit: {:?}", b1.err());
+    }
+
+    // r[verify store.put.nar-bytes-budget+5]
+    // W8-H (R16 statement): release — drop restores headroom, no leak
+    // across abort paths. The guard rides the reservation, so EVERY
+    // abort path (completion, HoldDeadlineExceeded, cancellation)
+    // releases through the ONE Drop impl — rustc enforces there is no
+    // second release seam; the deadline-abort instance is additionally
+    // observed end-to-end by the trickle/blackhole reds' pool-restored
+    // assertions (a leaked guard would deadlock their re-reservations).
+    /// Pre-fix left disclosed as constructor-dependent (no per-tenant
+    /// accounting existed to assert against — green-side half,
+    /// R13-clean: all flows through `reserve`).
+    #[tokio::test]
+    async fn tenant_cap_releases_with_the_reservation() {
+        let budget = Arc::new(Semaphore::new((MAX_NAR_SIZE as usize) * 3));
+        let ledger = TenantReservationLedger::default();
+        let tenant = Uuid::new_v4();
+        let big = MAX_NAR_SIZE - 1;
+        let env = || {
+            NarHoldEnvelope::for_declared(big, DEFAULT_SUBSTITUTE_STALL_WINDOW, NAR_HOLD_FLOOR_RATE)
+        };
+        let r1 = NarBudgetReservation::reserve(
+            Arc::clone(&budget),
+            &ledger,
+            tenant,
+            TENANT_RESERVATION_CAP,
+            big,
+            env(),
+            None,
+        )
+        .await
+        .unwrap();
+        let r2 = NarBudgetReservation::reserve(
+            Arc::clone(&budget),
+            &ledger,
+            tenant,
+            TENANT_RESERVATION_CAP,
+            big,
+            env(),
+            None,
+        )
+        .await
+        .unwrap();
+        // At cap: refused.
+        assert!(
+            NarBudgetReservation::reserve(
+                Arc::clone(&budget),
+                &ledger,
+                tenant,
+                TENANT_RESERVATION_CAP,
+                big,
+                env(),
+                None,
+            )
+            .await
+            .is_err()
+        );
+        // Drop one: headroom restored, the SAME tenant re-admits.
+        drop(r1);
+        let r3 = NarBudgetReservation::reserve(
+            Arc::clone(&budget),
+            &ledger,
+            tenant,
+            TENANT_RESERVATION_CAP,
+            big,
+            env(),
+            None,
+        )
+        .await;
+        assert!(
+            r3.is_ok(),
+            "headroom must be restored on drop: {:?}",
+            r3.err()
+        );
+        drop(r2);
+        drop(r3);
+        // Full release: the ledger entry is gone (bounded map).
+        let again = NarBudgetReservation::reserve(
+            Arc::clone(&budget),
+            &ledger,
+            tenant,
+            TENANT_RESERVATION_CAP,
+            big,
+            env(),
+            None,
+        )
+        .await;
+        assert!(again.is_ok(), "fully drained tenant re-admits");
+    }
+
+    // r[verify store.put.nar-bytes-budget+5]
+    // Envelope-violation red (R17, cost-axis knob): an absurd cap
+    // refuses even a minimal reservation — the knob demonstrably
+    // BINDS — while the default admits the same charge.
+    #[tokio::test]
+    async fn tenant_cap_binds() {
+        let budget = Arc::new(Semaphore::new(MIN_NAR_CHUNK_CHARGE as usize * 4));
+        let ledger = TenantReservationLedger::default();
+        let tenant = Uuid::new_v4();
+        let env = || {
+            NarHoldEnvelope::for_declared(1, DEFAULT_SUBSTITUTE_STALL_WINDOW, NAR_HOLD_FLOOR_RATE)
+        };
+        // Violation arm: cap below the minimum charge floor — refused.
+        let refused = NarBudgetReservation::reserve(
+            Arc::clone(&budget),
+            &ledger,
+            tenant,
+            MIN_NAR_CHUNK_CHARGE as u64 - 1,
+            1,
+            env(),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(SubstituteError::TenantBudgetExhausted { .. })),
+            "absurd cap must refuse: {refused:?}"
+        );
+        // Control arm: default cap admits the identical charge.
+        let admitted = NarBudgetReservation::reserve(
+            Arc::clone(&budget),
+            &ledger,
+            tenant,
+            TENANT_RESERVATION_CAP,
+            1,
+            env(),
+            None,
+        )
+        .await;
+        assert!(admitted.is_ok(), "default cap admits: {:?}", admitted.err());
+    }
+
+    // r[verify store.put.nar-hold-envelope]
     /// Const-relation pin `hold_grace_exceeds_stall_window` (R17
     /// ordering law; the compile-time half is the
     /// `NAR_HOLD_GRACE_FACTOR >= 2` const assert): the derived
@@ -7654,6 +8031,7 @@ mod tests {
         }
     }
 
+    // r[verify store.put.nar-hold-envelope]
     /// Const-relation pin `wait_grace_within_hold_floor` (R17 ordering
     /// law; compile-time half lives beside BUDGET_WAIT_GRACE): the
     /// chunk-acquire wait grace is strictly inside the smallest hold

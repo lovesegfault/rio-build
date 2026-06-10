@@ -123,6 +123,7 @@ impl StoreServiceImpl {
             }};
         }
 
+        // r[impl store.put.nar-hold-envelope]
         // The batch persist spans (phase-2 staging + phase-3 commit)
         // run while the handler frame holds EVERY output's permits —
         // the same Q-108 black-hole channel as `finalize_single`'s
@@ -250,6 +251,7 @@ impl StoreServiceImpl {
         // need to fill it in order regardless of stream arrival order.
         let mut outputs: BTreeMap<u32, OutputAccum> = BTreeMap::new();
         let mut held_permits = Vec::new();
+        // r[impl store.put.nar-hold-envelope]
         // Hold axis (merged_bug_021's batch sibling; WO-S1-2a — the
         // one holder the WO-S1-1 census left unenveloped): once this
         // handler HOLDS budget permits, its cross-output stream
@@ -271,7 +273,7 @@ impl StoreServiceImpl {
         // MAX_BATCH_OUTPUTS × MAX_NAR_SIZE = 64 GiB could be demanded
         // against a 32 GiB budget — `acquire_many` would block on permits
         // THIS task holds (self-deadlock).
-        // r[impl store.put.nar-bytes-budget+4]
+        // r[impl store.put.nar-bytes-budget+5]
         let mut total_charged: u64 = 0;
 
         loop {

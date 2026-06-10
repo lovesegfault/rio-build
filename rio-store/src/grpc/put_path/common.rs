@@ -51,6 +51,7 @@ const PUTPATH_HOOKS: ingest::IngestHooks = ingest::IngestHooks {
     ctx_label: "PutPath",
 };
 
+// r[impl store.put.nar-hold-envelope]
 /// Bound on any single charged budget wait at the per-chunk acquire
 /// chokepoint ([`StoreServiceImpl::accumulate_chunk`]): a holder's
 /// next-chunk acquire that parks longer than this sheds typed
@@ -496,7 +497,7 @@ impl StoreServiceImpl {
         })
     }
 
-    // r[impl store.put.nar-bytes-budget+4]
+    // r[impl store.put.nar-bytes-budget+5]
     /// Append a NAR chunk under both bounds: per-output [`MAX_NAR_SIZE`]
     /// and the GLOBAL `nar_bytes_budget` semaphore. Feeds the chunk
     /// into the caller's incremental `hasher` so [`verify_nar`] never
@@ -537,6 +538,7 @@ impl StoreServiceImpl {
                 "{ctx_label}: NAR chunks exceed size bound {MAX_NAR_SIZE} (received {new_len}+ bytes)"
             )));
         }
+        // r[impl store.put.nar-hold-envelope]
         // Wait axis (merged_bug_001): the acquire is grace-bounded —
         // grant or typed shed within `budget_wait_grace`, UNIFORM over
         // all chunk acquires (first included: the chokepoint cannot
@@ -598,6 +600,7 @@ impl StoreServiceImpl {
         let mut hasher = Sha256::new();
         let mut trailer: Option<PutPathTrailer> = None;
         let mut held_permits = Vec::new();
+        // r[impl store.put.nar-hold-envelope]
         // Hold axis (merged_bug_021's ingest sibling): once this
         // handler HOLDS budget permits, its client-controlled stream
         // residency is bounded by a typed ingest envelope (armed at
@@ -616,7 +619,7 @@ impl StoreServiceImpl {
         // `accumulate_chunk` so a tiny-chunk stream that would exhaust
         // the global budget hits this cap instead of self-deadlocking on
         // `acquire_many` for permits this task already holds.
-        // r[impl store.put.nar-bytes-budget+4]
+        // r[impl store.put.nar-bytes-budget+5]
         let mut charged: u64 = 0;
         loop {
             let read = stream.message();
@@ -722,6 +725,7 @@ impl StoreServiceImpl {
     /// theorem must bound. Expiry aborts the placeholder and sheds
     /// typed (`ResourceExhausted`, retryable).
     // r[impl obs.metric.transfer-volume]
+    // r[impl store.put.nar-hold-envelope]
     pub(in crate::grpc) async fn finalize_single(
         &self,
         mut info: ValidatedPathInfo,

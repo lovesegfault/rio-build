@@ -965,7 +965,7 @@ async fn send_batch_output(
 /// alignment is verified at `rio_common::limits::nar_chunk_charge` and by
 /// the `total_charged` formula in `drain_batch_stream`; this test
 /// continues to cover the >256-byte chunk case.
-// r[verify store.put.nar-bytes-budget+4]
+// r[verify store.put.nar-bytes-budget+5]
 #[tokio::test]
 async fn batch_no_self_deadlock_under_budget() -> TestResult {
     let s =
@@ -1223,6 +1223,7 @@ mod bw8s1_budget {
         }
     }
 
+    // r[verify store.put.nar-bytes-budget+5]
     // W8-A (R16 statement): the JOINT mixed population the R7 census
     // named and W-3 withheld — a real PutPath holder and a real parked
     // whole-NAR substitution head on ONE pool reach completion /
@@ -1348,6 +1349,7 @@ mod bw8s1_budget {
         Ok(())
     }
 
+    // r[verify store.put.nar-hold-envelope]
     // W8-C (R16 statement): ingest-holder residency through the
     // production stream path including cleanup — a stopped-but-
     // connected client cannot hold permits past the ingest envelope.
@@ -1407,6 +1409,7 @@ mod bw8s1_budget {
         Ok(())
     }
 
+    // r[verify store.put.nar-hold-envelope]
     // W8-D (R16 statement): the wait axis at the sole non-reservation
     // acquire chokepoint — grant-or-typed-shed within
     // BUDGET_WAIT_GRACE (batch included by the census-pinned shared
@@ -1504,6 +1507,7 @@ mod bw8s1_budget {
         Ok(())
     }
 
+    // r[verify store.put.nar-hold-envelope]
     // Envelope-violation red (R17, wait-grace axis): zero grace ⇒ a
     // contended chunk acquire sheds immediately, while an uncontended
     // acquire still succeeds — the knob binds the WAIT, not the grant.
@@ -1593,6 +1597,7 @@ mod bw8s1_budget {
         (tx, ReceiverStream::new(rx))
     }
 
+    // r[verify store.put.nar-hold-envelope]
     // W8-F (R16 statement): batch-holder residency through the
     // production batch stream path -- with it, the holder census has
     // zero unenveloped rows and the slot theorem's quantifier domain
