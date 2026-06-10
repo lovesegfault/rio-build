@@ -11050,3 +11050,96 @@ async fn dirty_edge_paces_through_a_failure_window() -> TestResult {
     );
     Ok(())
 }
+
+/// bug_060 pin (merged_bug_083's screen × merged_bug_014's probe —
+/// the two licensed-by-the-stale-census edits both turn this red):
+/// the MATERIALIZATION PROBE SHAPE — `kind = Materialization,
+/// confirm_only = true, claim_nonce = fresh, executor_token_sha256 =
+/// None`, exactly what the store's resume lane presents past full
+/// slots (client.rs `confirm_only: probing`) — is SCREENED to
+/// `NotYetReady` with ZERO durable side effects, through the
+/// production actor command path against a hydrated, DeliverNew-
+/// eligible job. Premise reachability (T3): the same shape with
+/// `confirm_only = false` then DELIVERS — proving the probe WOULD
+/// have minted had the screen not converted it (the NotYetReady is
+/// the screen's work, not vacuity). No tracey marker: the
+/// `sched.executor.confirm-fence` rule covers the KEYED BUILD lane's
+/// fence screen, not this non-keyed kind-blind screen (re-verified at
+/// execution — do not stamp a rule the test does not witness).
+/// Strawman transcripts ((ddddd), quoted in the commit body) certify
+/// the red-capability: (a) a `debug_assert!(!confirm_only)` in the
+/// Materialization lane arm panics here; (b) gating the screen on
+/// `kind != Materialization` mints — the attempt row appears and the
+/// probe answer flips to Deliver.
+#[tokio::test]
+async fn materialization_probe_is_screened_not_minted() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // A claimable materialization job via the merge new_sub lane —
+    // the DeliverNew-eligible premise.
+    let out = test_store_path("maton-probe-screen-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut n = make_node("maton-probe-screen");
+    n.expected_output_paths = vec![out.clone()];
+    let build_id = Uuid::new_v4();
+    merge_dag(&handle, build_id, vec![n], vec![], false).await?;
+    barrier(&handle).await;
+    let jobs = sdb(&db.pool)
+        .list_claimable_materialization_jobs(16)
+        .await?;
+    assert_eq!(jobs.len(), 1, "the probe premise: one claimable job");
+
+    // The probe shape (the store's standing oracle, merged_bug_014).
+    let probe_nonce = Uuid::new_v4();
+    let outcome = handle
+        .query_unchecked(|reply| ActorCommand::PullAssignment {
+            intent_id: "maton-probe-screen".into(),
+            auth_intent: Some("maton-probe-screen".into()),
+            kind: rio_evidence_kernel::pull::PullKind::Materialization,
+            executor_instance: Some("store-replica-0".into()),
+            resume_exec_id: None,
+            claim_nonce: Some(probe_nonce),
+            confirm_only: true,
+            executor_token_sha256: None,
+            reply,
+        })
+        .await
+        .expect("actor alive");
+    assert!(
+        matches!(outcome, Ok(PullOutcome::NotYetReady { .. })),
+        "the probe must be screened to NotYetReady, got {outcome:?}"
+    );
+
+    // Zero durable side effects: no open-attempt row minted, no
+    // confirm-fence row written (the NonKeyed lane writes none).
+    let attempts: i64 = sqlx::query_scalar("SELECT count(*) FROM drv_executions")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(attempts, 0, "a screened probe must not mint an attempt");
+    let fences: i64 = sqlx::query_scalar("SELECT count(*) FROM executor_confirm_fences")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(fences, 0, "the non-keyed lane writes no fence rows");
+
+    // Premise reachability: the SAME shape minus confirm_only mints —
+    // the screen, not job state, produced the NotYetReady above.
+    let outcome = handle
+        .query_unchecked(|reply| ActorCommand::PullAssignment {
+            intent_id: "maton-probe-screen".into(),
+            auth_intent: Some("maton-probe-screen".into()),
+            kind: rio_evidence_kernel::pull::PullKind::Materialization,
+            executor_instance: Some("store-replica-0".into()),
+            resume_exec_id: None,
+            claim_nonce: Some(Uuid::new_v4()),
+            confirm_only: false,
+            executor_token_sha256: None,
+            reply,
+        })
+        .await
+        .expect("actor alive");
+    assert!(
+        matches!(outcome, Ok(PullOutcome::Deliver(_))),
+        "the claiming form of the same shape must deliver, got {outcome:?}"
+    );
+    Ok(())
+}
