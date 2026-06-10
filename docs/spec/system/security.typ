@@ -187,6 +187,34 @@
   `rio-store/src/grpc/{put_path/,admin.rs}`, `rio-scheduler/src/admin/mod.rs`.
 ]
 
+#r("sec.authz.refusal-adjudication")[
+  An ANSWERED `Unauthenticated`/`PermissionDenied` refusal of a
+  per-request-minted service credential MUST be classified as judging that
+  presentation only --- never as proof of request futility; every client-side
+  consumer MUST source the (regime, code) partition from the one exported
+  authority, and a permanent exit taken on repeated presentation-judgments
+  MUST ride a typed, violable observation budget, never a single observation.
+]
+The regime distinction is the load-bearing axis: under the *per-request*
+service-token regime (`ServiceTokenInterceptor` mints a fresh HMAC token from
+the mounted, rotating `rio-service-hmac` Secret on every send), an auth
+refusal is evidence about one presentation under one key observation ---
+kubelet Secret propagation lag means the next mint may verify --- whereas
+under the *attempt-bound* executor/assignment-token regime re-presentation is
+byte-identical, so the refusal is stable for the attempt and permanent exit
+on first observation is correct. The exported authority is
+`rio_proto::refusal::judge_refusal`. This rule supersedes the OQ-S5-2
+disposition (round-6, controller exposure shipping): that ruling's
+counted-drop-over-eternal-recirculation trade was priced as "a bounded run of
+60s windows" and its own text made the rotation-window cost a mandatory
+adversarial-review attack point --- the round-8 corpus is that attack landing
+(one skew pass counted-dropped the entire PENDING backlog, including
+outage-retained slices the conservation law preserves, while the
+eternal-recirculation wedge it traded against had been independently closed
+by the same commit's one-rotation law). The disposition's real concern ---
+loud disclosure under a persistent token misconfig --- is preserved by the
+typed observation budget this rule requires.
+
 #r("sec.jwt.pubkey-mount+2")[
   When `jwt.enabled=true`, scheduler and store pods MUST have the
   `rio-jwt-pubkey` ConfigMap mounted at `/etc/rio/jwt/ed25519_pubkey` and
