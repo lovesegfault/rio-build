@@ -568,7 +568,7 @@ in
   #   'materialization') are released once the interested builds go
   #   terminal (§5.3 / T-1.8 wiring), with the scheduler's release log
   #   line as the non-vacuity witness.
-  # r[verify gw.activity.subst-progress]
+  # r[verify gw.activity.subst-progress+2]
   #   substitute-progress-e2e: 4-path closure submitted via ssh-ng;
   #   captured internal-json wire stream asserts every actCopyPath
   #   start has a matching stop, every resProgress has done≤expected,

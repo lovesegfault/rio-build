@@ -1251,7 +1251,7 @@ async fn flag_on_materialization_lifecycle_through_grpc() -> anyhow::Result<()> 
 // ── T-1.2 (Phase B): the BC-4 progress relay through the wire ──────────────
 
 // r[verify sched.materialize.job+2]
-// r[verify gw.activity.subst-progress]
+// r[verify gw.activity.subst-progress+2]
 /// The Phase B progress relay (BC-4, replacing the PD-15b ack-and-drop
 /// stub): `ReportMaterializationProgress` through the REAL wire — with
 /// the store-service credential and a live materialization attempt —

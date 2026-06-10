@@ -1744,7 +1744,7 @@ failed → fell through to a build).
   relays in arrival order.
 ]
 
-#r("gw.activity.subst-progress+1")[
+#r("gw.activity.subst-progress+2")[
   For each `DerivationEventKind::SUBSTITUTING` the gateway emits an
   `actSubstitute` (108) activity and increments the root `actBuilds`
   `SetExpected{actCopyPath, N}` (the denominator semantics match stock
@@ -1758,15 +1758,32 @@ failed → fell through to a build).
   Each `Event::SubstituteProgress` (display-only, routed via the log broadcast
   ring; see #rref("store.substitute.progress-stream")) maps to
   `STDERR_RESULT{aid, resProgress, [bytes_done, bytes_expected, 0, 0]}` on the
-  `actSubstitute` aid ALWAYS and on the copy child once started, so
-  direction-aware consumers see the download bar on either aid. The pair
-  stops through ONE close chokepoint (child first, iff started) on the paired
+  copy child once started, and ONLY there: the `actSubstitute` parent is
+  structural and MUST NOT carry `resProgress` (the stock convention —
+  substitution progress rides the `copyStorePath` child); a tick with no
+  started copy child emits no frames. The pair stops through ONE close
+  chokepoint (child first, iff started) on the paired
   `CACHED`/`STARTED`/`COMPLETED`/`FAILED`; when the copy child is open with a
   partial last-relayed bar, the close synthesizes the completing
-  `resProgress` (`done == expected`) on BOTH aids before the stops — the
-  terminal outcome is the completion proof — and a progress tick arriving
+  `resProgress` (`done == expected`) on the copy aid before the stops — the
+  terminal outcome is the completion proof; a pair with no started copy
+  closes subst-only with no synthesis frame — and a progress tick arriving
   after the close is dropped with a debug line, never reordered.
 ]
+
+Why the parent is structural: direction-aware consumers (nxb et al.) dedup
+nested transfer rows by `(path, host)`; the `actSubstitute` start frame's
+substituter URI is empty until the store picks an upstream, which such
+consumers parse as a local source that never matches the copy child's sourced
+URI. A parent `resProgress` lane therefore renders a second, never-deduped
+live row fed identical numbers — every displayed byte doubled, running/done
+counts doubled, and locally-present paths' job-level commit ticks booked as
+downloads. Stock nix has no parent lane to dedup against, so the copy-only
+convention is the compatibility contract. Residual accepted cosmetic: the
+`SetExpected{actCopyPath, N}` denominator still counts every SUBSTITUTING
+derivation, including zero-fetch materializations that never start a copy
+child, so nom's "X/Y copied" can complete with `X < Y` (the gap is exactly
+the locally-present paths — nothing was downloaded for them).
 
 == STDERR_RESULT BuildEvent mapping
 

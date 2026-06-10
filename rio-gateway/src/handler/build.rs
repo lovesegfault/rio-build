@@ -217,12 +217,13 @@ async fn quota_check<W: AsyncWrite + Unpin>(
 /// the activity is constructed when the copy from the chosen
 /// substituter begins. Job-level commit ticks pass `uri=""` (including
 /// locally-present paths), so a zero-fetch materialization never
-/// starts a copy — truthful display: nothing was downloaded. Both
-/// `resProgress` lanes ride every tick (subst always; copy once
-/// started), and the pair stops together (child first, iff started)
-/// on the terminal `Cached`/`Started`/`Completed`/`Failed` through
-/// the ONE close chokepoint (`stop_subst_pair`), which synthesizes
-/// the completing progress frame when the last-relayed bar is
+/// starts a copy — truthful display: nothing was downloaded.
+/// `resProgress` rides the copy child once started and ONLY there —
+/// the parent is structural, per stock convention (live_045) — and
+/// the pair stops together (child first, iff started) on the terminal
+/// `Cached`/`Started`/`Completed`/`Failed` through the ONE close
+/// chokepoint (`stop_subst_pair`), which synthesizes the completing
+/// progress frame on the copy aid when the last-relayed bar is
 /// partial — the terminal outcome IS the completion proof.
 #[derive(Debug, Clone)]
 struct SubstAids {
@@ -257,7 +258,7 @@ enum DrvDisplay {
     /// `DerivationEventKind::Substituting` (or a kinded materialization
     /// snapshot entry), stopped by `Cached` (success) or `Started`
     /// (fetch failed → fell through to build).
-    /// r[gw.activity.subst-progress+1]
+    /// r[gw.activity.subst-progress+2]
     Subst(SubstAids),
 }
 
@@ -301,9 +302,11 @@ impl Default for BuildActivityState {
 /// triggered this close IS the completion proof (the system's
 /// documented recovery posture: the terminal Cached/Completed event
 /// covers any dropped tick), so a final completing `resProgress`
-/// (`done == expected`) is synthesized on BOTH aids before the stops.
-/// A pair with no started copy closes subst-only — truthful (no
-/// sourced byte was ever reported), never the broken empty bar.
+/// (`done == expected`) is synthesized on the COPY aid — the only
+/// progress lane (live_045: the parent is structural) — before the
+/// stops. A pair with no started copy closes subst-only with NO
+/// synthesis frame — truthful (no sourced byte was ever reported),
+/// never the broken empty bar.
 async fn stop_subst_pair<W: AsyncWrite + Unpin>(
     stderr: &mut StderrWriter<&mut W>,
     aids: SubstAids,
@@ -318,9 +321,6 @@ async fn stop_subst_pair<W: AsyncWrite + Unpin>(
                 ResultField::Int(0),
                 ResultField::Int(0),
             ];
-            stderr
-                .result(aids.subst, ResultType::Progress, &fields)
-                .await?;
             stderr.result(copy, ResultType::Progress, &fields).await?;
         }
         stderr.stop_activity(copy).await?;
@@ -684,24 +684,32 @@ async fn drain_unstopped_activities<W: AsyncWrite + Unpin>(
 /// drv + done/expected — never reordered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubstRelay {
-    /// Frames were emitted (and the copy child possibly started).
+    /// The tracked pair absorbed the tick: the copy child possibly
+    /// started, and frames were emitted iff the copy child exists
+    /// (the parent is structural — a pre-copy empty-URI tick is
+    /// absorbed frameless).
     Relayed,
     /// No pair tracked: the pair already closed (post-outcome
     /// straggler) or `Substituting` was lost — display-only.
     DroppedUntracked,
 }
 
-// r[impl gw.activity.subst-progress+1]
-/// THE substitute-progress relay chokepoint (live_043): one code path
-/// owns, per tick, (i) the DEFERRED `actCopyPath` start on the first
-/// NON-EMPTY `upstream_uri` (frame `[out, from=uri, to=machine]`, the
-/// stock `copyStorePath` shape — `from` is pinned to the FIRST URI;
-/// later upstream changes within the aggregate walk are accepted
-/// cosmetic loss), (ii) `resProgress` on the `actSubstitute` aid
-/// ALWAYS (direction-aware consumers keyed on the substitute activity
-/// see progress), and (iii) `resProgress` on the copy child iff
-/// started. nom renders `[done/expected]` as the download bar. A tick
-/// with no tracked pair is dropped-with-debug (the typed
+// r[impl gw.activity.subst-progress+2]
+/// THE substitute-progress relay chokepoint (live_043; emission lane
+/// corrected in live_045): one code path owns, per tick, (i) the
+/// DEFERRED `actCopyPath` start on the first NON-EMPTY `upstream_uri`
+/// (frame `[out, from=uri, to=machine]`, the stock `copyStorePath`
+/// shape — `from` is pinned to the FIRST URI; later upstream changes
+/// within the aggregate walk are accepted cosmetic loss), and (ii)
+/// `resProgress` on the copy child iff started — NEVER on the
+/// `actSubstitute` parent, which is structural (stock convention:
+/// substitution progress rides the `copyStorePath` child only;
+/// direction-aware consumers dedup nested copies by `(path, host)`,
+/// and the parent's empty substituter URI parses as Localhost, never
+/// matching the child's source, so a parent emission renders a
+/// second live row fed identical numbers — every byte displayed 2x).
+/// nom renders `[done/expected]` as the download bar. A tick with no
+/// tracked pair is dropped-with-debug (the typed
 /// [`SubstRelay::DroppedUntracked`] lane).
 async fn relay_substitute_progress<W: AsyncWrite + Unpin>(
     stderr: &mut StderrWriter<&mut W>,
@@ -741,20 +749,20 @@ async fn relay_substitute_progress<W: AsyncWrite + Unpin>(
             .await?;
         aids.copy = Some(copy);
     }
-    // resProgress fields: [done, expected, running, failed]. The latter
-    // two are 0 — the pair is single-transfer, not an aggregate.
-    let fields = [
-        ResultField::Int(p.bytes_done),
-        ResultField::Int(p.bytes_expected),
-        ResultField::Int(0),
-        ResultField::Int(0),
-    ];
-    // (ii) The substitute aid always carries the progress.
-    stderr
-        .result(aids.subst, ResultType::Progress, &fields)
-        .await?;
-    // (iii) The copy child iff started.
+    // (ii) The copy child iff started — the ONLY progress lane. An
+    // empty-URI tick with no copy child (job-level commit walk of a
+    // locally-present closure) emits nothing: zero-fetch progress is
+    // not a download.
     if let Some(copy) = aids.copy {
+        // resProgress fields: [done, expected, running, failed]. The
+        // latter two are 0 — the pair is single-transfer, not an
+        // aggregate.
+        let fields = [
+            ResultField::Int(p.bytes_done),
+            ResultField::Int(p.bytes_expected),
+            ResultField::Int(0),
+            ResultField::Int(0),
+        ];
         stderr.result(copy, ResultType::Progress, &fields).await?;
     }
     aids.progress = Some((p.bytes_done, p.bytes_expected));
@@ -3446,11 +3454,19 @@ mod tests {
             .collect()
     }
 
-    // r[verify gw.activity.subst-progress+1]
-    /// live_043 red #1: substitution progress must be representable in
-    /// consumers keyed on the SUBSTITUTE aid, not only the copy child.
+    // r[verify gw.activity.subst-progress+2]
+    /// live_045 red: substitution progress rides the `actCopyPath`
+    /// child ONLY — the `actSubstitute` parent is structural (stock
+    /// convention: `substitution-goal.cc` never emits `resProgress` on
+    /// the substitute activity; the bytes belong to the
+    /// `copyStorePath` child). The both-aids emission (42ebd60a9) fed
+    /// direction-aware consumers — which dedup nested copies by
+    /// `(path, host)` — two rows per path: the parent's empty
+    /// substituter URI parses as Localhost and never matches the
+    /// child's sourced URI, so every displayed byte doubled and
+    /// locally-present paths' commit ticks were booked as downloads.
     #[tokio::test]
-    async fn substitute_progress_lands_on_both_aids() {
+    async fn substitute_progress_lands_on_copy_child_only() {
         use types::DerivationEventKind::*;
         let drv = "/nix/store/qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq-foo.drv";
 
@@ -3480,12 +3496,15 @@ mod tests {
         let frames = read_frames(buf).await;
         let on_subst = progress_results(&frames, aids.subst).len();
         assert_eq!(
-            on_subst, 1,
-            "consumers keyed on the actSubstitute aid see zero progress (the relay rides only the copy child)"
+            on_subst, 0,
+            "the actSubstitute parent is structural and must receive ZERO resProgress frames (a parent emission renders a second, never-deduped row in direction-aware consumers)"
         );
+        let copy = subst_copy_aid(&frames);
+        let on_copy = progress_results(&frames, copy).len();
+        assert_eq!(on_copy, 1, "the sourced tick's bytes ride the copy child");
     }
 
-    // r[verify gw.activity.subst-progress+1]
+    // r[verify gw.activity.subst-progress+2]
     /// live_043 red #2: the copy activity's START frame must carry the
     /// upstream source in its `from` field (stock copyStorePath
     /// semantics: [storePath, from, to]) — the relay discarded
@@ -3537,7 +3556,7 @@ mod tests {
         );
     }
 
-    // r[verify gw.activity.subst-progress+1]
+    // r[verify gw.activity.subst-progress+2]
     /// live_043 companion green: a progress tick arriving AFTER the
     /// pair closed (the post-outcome straggler — delivery is droppable
     /// and reorderable end-to-end) is TOLERATED: no frames, the typed
@@ -3597,13 +3616,14 @@ mod tests {
         assert!(!act.display.contains_key(drv), "never resurrected");
     }
 
-    // r[verify gw.activity.subst-progress+1]
-    /// live_043 red #3 (the FS-1 relocated binding red): a terminal
-    /// outcome closing a pair whose last-relayed progress is partial
-    /// must synthesize the completing resProgress on BOTH aids before
-    /// the stops — the terminal outcome IS the completion proof; the
-    /// live shape was a partially-filled (or empty) bar frozen at
-    /// whatever tick happened to win the race.
+    // r[verify gw.activity.subst-progress+2]
+    /// live_043 red #3 (the FS-1 relocated binding red; lane corrected
+    /// in live_045): a terminal outcome closing a pair whose
+    /// last-relayed progress is partial must synthesize the completing
+    /// resProgress on the COPY aid — the only progress lane — before
+    /// the stops; the terminal outcome IS the completion proof. The
+    /// actSubstitute parent stays structural through the close: ZERO
+    /// resProgress frames over the pair's whole lifetime.
     #[tokio::test]
     async fn outcome_with_open_pair_renders_complete_progress() {
         use types::DerivationEventKind::*;
@@ -3640,15 +3660,81 @@ mod tests {
 
         let frames = read_frames(buf).await;
         let copy = subst_copy_aid(&frames);
-        for aid in [aids.subst, copy] {
-            let completing = progress_results(&frames, aid)
-                .iter()
-                .any(|fields| fields.first() == Some(&FVal::Int(100)));
-            assert!(
-                completing,
-                "pair closed with `done < expected` and no completing resProgress on aid {aid} — the terminal outcome is the completion proof and must fill the bar (the live partial/empty-bar shape)"
-            );
-        }
+        let completing = progress_results(&frames, copy)
+            .iter()
+            .any(|fields| fields.first() == Some(&FVal::Int(100)));
+        assert!(
+            completing,
+            "pair closed with `done < expected` and no completing resProgress on the copy aid — the terminal outcome is the completion proof and must fill the bar (the live partial/empty-bar shape)"
+        );
+        assert_eq!(
+            progress_results(&frames, aids.subst).len(),
+            0,
+            "the close synthesis must not leak resProgress onto the structural actSubstitute parent"
+        );
+    }
+
+    // r[verify gw.activity.subst-progress+2]
+    /// live_045 companion: a pair whose only tick carried an EMPTY
+    /// upstream_uri (job-level commit walk of a locally-present
+    /// closure) never starts a copy child, so the close emits NO
+    /// synthesis frame at all — the pair closes subst-only, the
+    /// ratified truthful display (nothing was downloaded; booking the
+    /// commit tick as a download is the regression shape).
+    #[tokio::test]
+    async fn close_without_copy_child_synthesizes_nothing() {
+        use types::DerivationEventKind::*;
+        let drv = "/nix/store/uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu-foo.drv";
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState::default();
+
+        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
+            .await
+            .unwrap();
+        let aids = subst_aids(&act, drv);
+
+        // The commit tick: empty URI, partial bar — recorded as
+        // close-synthesis input but MUST NOT start a copy or emit.
+        let relayed = relay_substitute_progress(
+            &mut stderr,
+            &mut act,
+            types::SubstituteProgress {
+                derivation_path: drv.into(),
+                bytes_done: 3,
+                bytes_expected: 9,
+                upstream_uri: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            relayed,
+            SubstRelay::Relayed,
+            "tracked: absorbed, not dropped"
+        );
+
+        relay_derivation_status(&mut stderr, &mut act, ev(Cached, drv, &[]))
+            .await
+            .unwrap();
+
+        // Wire: START(subst) → STOP(subst). No copy start, no
+        // resProgress on ANY aid — subst-only close.
+        let frames = read_frames(buf).await;
+        assert_eq!(
+            frames,
+            vec![
+                Frame::Start {
+                    aid: aids.subst,
+                    act_type: ActivityType::Substitute as u64,
+                    fields: vec![FVal::Str(drv.into()), FVal::Str(String::new())],
+                },
+                Frame::Stop(aids.subst),
+            ],
+            "a no-copy-child pair closes subst-only: no synthesis frame, no parent progress"
+        );
     }
 
     // r[verify gw.stderr.activity+2]
@@ -3677,7 +3763,7 @@ mod tests {
             .unwrap();
         assert_eq!(subst_count(&act), 0, "Cached must remove subst aids");
 
-        // r[verify gw.activity.subst-progress+1]
+        // r[verify gw.activity.subst-progress+2]
         // Wire (live_043 deferred-start): START(Substitute) only — no
         // sourced tick arrived, so no copy child ever started (a
         // zero-fetch/no-tick substitution closes subst-only, the
@@ -3704,7 +3790,7 @@ mod tests {
         );
     }
 
-    // r[verify gw.activity.subst-progress+1]
+    // r[verify gw.activity.subst-progress+2]
     /// Substituting → SubstituteProgress → Cached: progress emits a
     /// `STDERR_RESULT{copy_aid, resProgress, [done, expected, 0, 0]}`
     /// frame between START(CopyPath) and STOP(copy). This is what nom
@@ -3744,11 +3830,12 @@ mod tests {
             .await
             .unwrap();
 
-        // Wire (live_043): START(subst) → [sourced tick] START(copy,
-        // from=uri) → resProgress(subst) → resProgress(copy) →
-        // [final tick already complete? no: done < expected, so the
-        // close synthesizes completion on both] → STOP(copy) →
-        // STOP(subst).
+        // Wire (live_043 deferred start, live_045 copy-only lane):
+        // START(subst) → [sourced tick] START(copy, from=uri) →
+        // resProgress(copy) → [final tick already complete? no:
+        // done < expected, so the close synthesizes completion on the
+        // copy aid] → STOP(copy) → STOP(subst). The structural
+        // actSubstitute parent carries NO resProgress anywhere.
         let frames = read_frames(buf).await;
         let mut it = frames.iter();
         assert!(matches!(
@@ -3771,42 +3858,43 @@ mod tests {
             }
             other => panic!("expected copy START, got {other:?}"),
         }
-        // The tick's progress, subst first then copy.
-        for aid in [aids.subst, copy] {
-            match it.next() {
-                Some(Frame::Result {
-                    aid: a,
-                    rtype,
-                    fields,
-                }) => {
-                    assert_eq!(*a, aid);
-                    assert_eq!(*rtype, ResultType::Progress as u64);
-                    assert_eq!(fields[0], FVal::Int(12_345_678));
-                    assert_eq!(fields[1], FVal::Int(99_999_999));
-                }
-                other => panic!("expected progress on {aid}, got {other:?}"),
+        // The tick's progress: the copy child only.
+        match it.next() {
+            Some(Frame::Result {
+                aid: a,
+                rtype,
+                fields,
+            }) => {
+                assert_eq!(*a, copy);
+                assert_eq!(*rtype, ResultType::Progress as u64);
+                assert_eq!(fields[0], FVal::Int(12_345_678));
+                assert_eq!(fields[1], FVal::Int(99_999_999));
             }
+            other => panic!("expected progress on the copy aid, got {other:?}"),
         }
         // Close synthesis (done < expected at close): completing
-        // progress on both aids, then the stops, child first.
-        for aid in [aids.subst, copy] {
-            match it.next() {
-                Some(Frame::Result {
-                    aid: a,
-                    rtype,
-                    fields,
-                }) => {
-                    assert_eq!(*a, aid);
-                    assert_eq!(*rtype, ResultType::Progress as u64);
-                    assert_eq!(fields[0], FVal::Int(99_999_999), "done == expected");
-                    assert_eq!(fields[1], FVal::Int(99_999_999));
-                }
-                other => panic!("expected completing progress on {aid}, got {other:?}"),
+        // progress on the copy aid only, then the stops, child first.
+        match it.next() {
+            Some(Frame::Result {
+                aid: a,
+                rtype,
+                fields,
+            }) => {
+                assert_eq!(*a, copy);
+                assert_eq!(*rtype, ResultType::Progress as u64);
+                assert_eq!(fields[0], FVal::Int(99_999_999), "done == expected");
+                assert_eq!(fields[1], FVal::Int(99_999_999));
             }
+            other => panic!("expected completing progress on the copy aid, got {other:?}"),
         }
         assert_eq!(it.next(), Some(&Frame::Stop(copy)), "child first");
         assert_eq!(it.next(), Some(&Frame::Stop(aids.subst)));
         assert_eq!(it.next(), None);
+        assert_eq!(
+            progress_results(&frames, aids.subst).len(),
+            0,
+            "zero resProgress on the structural parent over the whole lifetime"
+        );
 
         // Progress for an untracked drv is a TOLERATED no-op: no
         // frames, the typed dropped lane.

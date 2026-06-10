@@ -602,7 +602,7 @@ impl DagActor {
         }
     }
 
-    // r[impl gw.activity.subst-progress]
+    // r[impl gw.activity.subst-progress+2]
     /// Relay byte-progress from a store replica's materialization
     /// execution to every interested build via
     /// `Event::SubstituteProgress` (BC-4: the
