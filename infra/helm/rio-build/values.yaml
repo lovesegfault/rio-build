@@ -1290,7 +1290,29 @@ karpenter:
   # §13c: kvm builds are now `metal-*` hwClasses (`scheduler.sla.
   # hwClasses.metal-{x86,arm}`) routed by §13b — there is no static
   # metal NodePool.
-  metalSizes: [metal, metal-16xl, metal-24xl, metal-32xl, metal-48xl]
+  # live_050(d): metal-96xl JOINED this list — its omission let 96xl
+  # metal variants leak through the band classes' NotIn partition into
+  # their ceiling argmax (the author-typed list rotted; the catalog-
+  # side exclusion census now diffs this list against the catalog's
+  # own metal-size enumeration, so the next omission is a test
+  # failure, not a live hang).
+  metalSizes: [metal, metal-16xl, metal-24xl, metal-32xl, metal-48xl, metal-96xl]
+
+  # live_050(d)/live_051(a): committed launch-evidence exclusion — the
+  # rev-3/rev-4 live-overlay content as the chart DEFAULT (the runtime
+  # overlays become duplicates, retired at first deploy per the wave
+  # record). Instance-size tokens that EXIST in describe_instance_types
+  # but have ZERO launchable capacity in the deployment region (either
+  # market): the gen-8 Intel 96xlarge/metal-96xl rows set every hi
+  # ceiling to max_cores=383 live and ICE'd every fleet in BOTH markets
+  # (the 512/704 hang; the hi->od override ICEd identically). Consumed
+  # twice from this ONE list: (a) the scheduler's derive_ceilings
+  # synthesizes `instance-size NotIn` for EVERY class (ceiling plane —
+  # a loose class cannot re-import a phantom into its ceiling or the
+  # global); (b) the scheduler template projects it as a per-class
+  # requirement row (fleet plane — NodeClaims carry it to Karpenter's
+  # selection).
+  unlaunchableSizes: [96xlarge, metal-96xl]
 
   nodePools:
     # §13e: static `rio-fetcher` NodePool DELETED. Fetcher capacity is

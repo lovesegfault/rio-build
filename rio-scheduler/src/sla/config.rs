@@ -493,6 +493,22 @@ pub struct SlaConfig {
     /// no partition (vmtest, single-pool clusters).
     #[serde(default)]
     pub metal_sizes: Vec<String>,
+    /// live_050(d): committed launch-evidence exclusion — AWS
+    /// `instance-size` tokens that EXIST in `describe_instance_types`
+    /// but have NO launchable capacity in the deployment region
+    /// (either market). [`super::catalog::derive_ceilings`] synthesizes
+    /// an `instance-size NotIn` requirement from this list for EVERY
+    /// class (one mint — a loose class cannot re-import a phantom into
+    /// its ceiling or the global), and the helm template projects the
+    /// same list as a per-class requirement row so NodeClaims carry it
+    /// to Karpenter's fleet selection. Grounding law: API existence is
+    /// NOT launchability; ceiling candidacy is grounded by
+    /// exclusion-only negative evidence (this list), never by
+    /// cap-at-largest-observed-launch (see the catalog module doc's
+    /// "Why not launch-observed"). Helm renders
+    /// `karpenter.unlaunchableSizes`. Empty → no exclusion (vmtest).
+    #[serde(default)]
+    pub unlaunchable_sizes: Vec<String>,
 }
 
 fn default_hw_cost_tolerance() -> f64 {
@@ -952,7 +968,7 @@ impl SlaConfig {
     /// Returns `(resolved_global, source)` where `source` is the
     /// human-readable origin (`"sla.maxCores/maxMem"` / `"derived from
     /// catalog max"`) for [`Self::validate_resolved`]'s error message.
-    // r[impl scheduler.sla.global.derive]
+    // r[impl scheduler.sla.global.derive+2]
     // r[impl scheduler.sla.global.spot-empty-fails]
     pub fn resolve_globals(
         &self,
@@ -1050,6 +1066,7 @@ impl SlaConfig {
             max_node_claims_per_cell_per_tick: default_max_node_claims_per_cell_per_tick(),
             cluster: String::new(),
             metal_sizes: Vec::new(),
+            unlaunchable_sizes: Vec::new(),
         }
     }
 
@@ -1366,6 +1383,40 @@ impl SlaConfig {
         source: &str,
     ) -> anyhow::Result<()> {
         let (gc, gm) = global;
+        // r[impl scheduler.sla.global.derive+2]
+        // live_051(a)/(f2): the global MUST NOT exceed the largest
+        // class ceiling — demand admitted at such a global is hostable
+        // by NO class, and pre-disclosure the first symptom was the
+        // silent empty-cells churn (the cancelled-python-builds
+        // verdict). On the catalog arm this is unreachable through the
+        // pure max (the global IS max over the same map) and reachable
+        // ONLY through the MIN_CORES/MIN_MEM floor clamp on a
+        // degenerate sub-floor catalog — named in the warn. On the
+        // operator-override arm it is a signed operator act: the
+        // doctrine is disclose-don't-wedge, so this WARNs with the
+        // delta and both provenances rather than erroring.
+        if !catalog.is_empty() {
+            let max_cc = catalog.values().map(|&(c, _)| c).max().unwrap_or(0);
+            let max_cm = catalog.values().map(|&(_, m)| m).max().unwrap_or(0);
+            if gc > max_cc || gm > max_cm {
+                tracing::warn!(
+                    global_cores = gc,
+                    global_mem = gm,
+                    max_class_cores = max_cc,
+                    max_class_mem = max_cm,
+                    delta_cores = gc.saturating_sub(max_cc),
+                    delta_mem = gm.saturating_sub(max_cm),
+                    global_source = source,
+                    class_source = "catalog-derived per-class ceilings",
+                    "resolved global ceiling exceeds EVERY class ceiling — \
+                     demand sized at the global can be hosted by no class \
+                     (live_051: such demand churned as no_hosting_class \
+                     until operators cancelled the builds). Check \
+                     sla.maxCores/maxMem against the catalog, or the \
+                     MIN_CORES/MIN_MEM floor clamp on a degenerate catalog."
+                );
+            }
+        }
         let hi = gc as f64;
         self.probe.validate("sla.probe", hi)?;
         for (feat, p) in &self.feature_probes {
@@ -1484,6 +1535,7 @@ pub const HELM_RENDERED_SLA_KEYS: &[&str] = &[
     "max_node_claims_per_cell_per_tick",
     "cluster",
     "metal_sizes",
+    "unlaunchable_sizes",
 ];
 
 /// `[sla]` keys intentionally NOT rendered by helm (with rationale).
@@ -1567,6 +1619,60 @@ mod tests {
     /// `validate_shape() ∘ validate_resolved()` against the configured
     /// `Some(max_cores, max_mem)` (the pre-§13c-3 `validate()` shape,
     /// kept so the existing test corpus exercises both passes).
+    /// Minimal catalog entry for the global/exclusion tests (amd64,
+    /// no nvme) — mirrors catalog::tests::ce without the cross-module
+    /// cfg(test) dependency.
+    fn cat_entry(name: &str, cores: u32, mem_gib: u64) -> super::super::catalog::CatalogEntry {
+        shipped_cat_entry(
+            &name
+                .chars()
+                .take_while(|c| c.is_ascii_alphabetic())
+                .collect::<String>(),
+            &name
+                .chars()
+                .skip_while(|c| c.is_ascii_alphabetic())
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>(),
+            name.split_once('.').map(|(_, s)| s).unwrap_or(""),
+            cores,
+            mem_gib,
+            "amd64",
+            0,
+        )
+    }
+
+    /// Catalog entry from explicit Karpenter attrs (the phantom-shape
+    /// census synthesizes these from each class's own requirements).
+    fn shipped_cat_entry(
+        category: &str,
+        generation: &str,
+        size: &str,
+        cores: u32,
+        mem_gib: u64,
+        arch: &str,
+        nvme_gb: i64,
+    ) -> super::super::catalog::CatalogEntry {
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert("karpenter.k8s.aws/instance-category", category.to_owned());
+        labels.insert(
+            "karpenter.k8s.aws/instance-generation",
+            generation.to_owned(),
+        );
+        labels.insert("karpenter.k8s.aws/instance-size", size.to_owned());
+        labels.insert(ARCH_LABEL, arch.to_owned());
+        labels.insert("karpenter.k8s.aws/instance-local-nvme", nvme_gb.to_string());
+        labels.insert(
+            "karpenter.k8s.aws/instance-cpu-manufacturer",
+            "intel".to_owned(),
+        );
+        super::super::catalog::CatalogEntry {
+            name: format!("{category}{generation}i.{size}"),
+            cores,
+            mem_bytes: mem_gib << 30,
+            labels,
+        }
+    }
+
     fn validate_both(cfg: &SlaConfig) -> anyhow::Result<()> {
         cfg.validate_shape()?;
         let global = (
@@ -1990,7 +2096,7 @@ mod tests {
     /// §13c-3 RED-FIRST: `resolve_globals()` derives the effective
     /// global from the catalog when unset, clamps to `[MIN_*, MAX_*_GLOBAL]`,
     /// boot-fails on Spot+empty-catalog+None, passes through `Some`.
-    // r[verify scheduler.sla.global.derive]
+    // r[verify scheduler.sla.global.derive+2]
     // r[verify scheduler.sla.global.spot-empty-fails]
     #[test]
     fn resolve_globals_derives_from_catalog() {
@@ -3011,78 +3117,162 @@ mod tests {
     /// class), and the closure law re-derives every declared ladder
     /// edge through `retain_hosting_cells` — the shipped values and
     /// the Rust laws cannot drift apart silently.
+    /// Shared mirror of the helm values subset the shipped-values
+    /// censuses read (tolerant — no deny_unknown_fields; the chart has
+    /// many keys these tests don't consume).
+    mod shipped {
+        #[derive(serde::Deserialize)]
+        pub struct Root {
+            pub scheduler: SchedV,
+            pub karpenter: KarpV,
+        }
+        #[derive(serde::Deserialize)]
+        pub struct KarpV {
+            #[serde(rename = "metalSizes")]
+            pub metal_sizes: Vec<String>,
+            #[serde(rename = "unlaunchableSizes")]
+            pub unlaunchable_sizes: Vec<String>,
+        }
+        #[derive(serde::Deserialize)]
+        pub struct SchedV {
+            pub sla: SlaV,
+        }
+        #[derive(serde::Deserialize)]
+        pub struct SlaV {
+            #[serde(rename = "hwClasses")]
+            pub hw_classes: std::collections::BTreeMap<String, ClassV>,
+            #[serde(rename = "referenceHwClass")]
+            pub reference_hw_class: String,
+            #[serde(rename = "leadTimeSeed")]
+            pub lead_time_seed: std::collections::BTreeMap<String, f64>,
+            #[serde(rename = "maxLeadTime")]
+            pub max_lead_time: f64,
+        }
+        #[derive(serde::Deserialize)]
+        pub struct ClassV {
+            #[serde(rename = "nodeClass")]
+            pub node_class: String,
+            pub labels: Vec<KvV>,
+            pub requirements: Vec<ReqV>,
+            #[serde(rename = "capacityTypes")]
+            pub capacity_types: Option<Vec<String>>,
+            pub ladder: Option<LadderV>,
+            #[serde(rename = "providesFeatures")]
+            pub provides_features: Option<Vec<String>>,
+            #[serde(rename = "maxCores")]
+            pub max_cores: Option<u32>,
+            #[serde(rename = "maxMem")]
+            pub max_mem: Option<u64>,
+            #[serde(rename = "maxFleetCores")]
+            pub _max_fleet_cores: Option<u32>,
+            pub taints: Option<Vec<TaintV>>,
+        }
+        #[derive(serde::Deserialize)]
+        pub struct KvV {
+            pub key: String,
+            pub value: String,
+        }
+        #[derive(serde::Deserialize)]
+        pub struct ReqV {
+            pub key: String,
+            pub operator: String,
+            pub values: Option<Vec<String>>,
+        }
+        #[derive(serde::Deserialize)]
+        pub struct LadderV {
+            pub rungs: Vec<RungV>,
+        }
+        #[derive(serde::Deserialize)]
+        pub struct RungV {
+            pub class: String,
+        }
+        #[derive(serde::Deserialize)]
+        pub struct TaintV {
+            pub key: String,
+            pub value: String,
+            pub effect: String,
+        }
+        pub fn parse() -> Root {
+            let path = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../infra/helm/rio-build/values.yaml"
+            );
+            let body = std::fs::read_to_string(path).expect("shipped values readable");
+            serde_saphyr::from_str(&body).expect("shipped values parse")
+        }
+    }
+
+    /// Build the production `HwClassDef` map from the parsed shipped
+    /// rows (field-by-field, the same projection the helm template +
+    /// TOML parse performs).
+    fn shipped_hw_classes(sla_v: &shipped::SlaV) -> HashMap<HwClassName, HwClassDef> {
+        sla_v
+            .hw_classes
+            .iter()
+            .map(|(h, d)| {
+                (
+                    h.clone(),
+                    HwClassDef {
+                        labels: d
+                            .labels
+                            .iter()
+                            .map(|l| NodeLabelMatch {
+                                key: l.key.clone(),
+                                value: l.value.clone(),
+                            })
+                            .collect(),
+                        requirements: d
+                            .requirements
+                            .iter()
+                            .map(|r| NodeSelectorReq {
+                                key: r.key.clone(),
+                                operator: r.operator.clone(),
+                                values: r.values.clone().unwrap_or_default(),
+                            })
+                            .collect(),
+                        node_class: d.node_class.clone(),
+                        max_cores: d.max_cores,
+                        max_mem: d.max_mem,
+                        taints: d
+                            .taints
+                            .iter()
+                            .flatten()
+                            .map(|t| NodeTaint {
+                                key: t.key.clone(),
+                                value: t.value.clone(),
+                                effect: t.effect.clone(),
+                            })
+                            .collect(),
+                        provides_features: d.provides_features.clone().unwrap_or_default(),
+                        max_fleet_cores: None,
+                        capacity_types: d
+                            .capacity_types
+                            .as_ref()
+                            .map(|caps| {
+                                caps.iter()
+                                    .map(|c| CapacityType::parse(c).expect("shipped cap token"))
+                                    .collect()
+                            })
+                            .unwrap_or_else(default_capacity_types),
+                        ladder: d.ladder.as_ref().map(|l| CapacityLadder {
+                            rungs: l
+                                .rungs
+                                .iter()
+                                .map(|r| LadderRung {
+                                    class: r.class.clone(),
+                                })
+                                .collect(),
+                        }),
+                    },
+                )
+            })
+            .collect()
+    }
+
     // r[verify ctrl.nodeclaim.capacity-ladder]
     #[test]
     fn shipped_values_cell_universe_census() {
-        #[derive(serde::Deserialize)]
-        struct Root {
-            scheduler: SchedV,
-        }
-        #[derive(serde::Deserialize)]
-        struct SchedV {
-            sla: SlaV,
-        }
-        #[derive(serde::Deserialize)]
-        struct SlaV {
-            #[serde(rename = "hwClasses")]
-            hw_classes: std::collections::BTreeMap<String, ClassV>,
-            #[serde(rename = "referenceHwClass")]
-            reference_hw_class: String,
-            #[serde(rename = "leadTimeSeed")]
-            lead_time_seed: std::collections::BTreeMap<String, f64>,
-            #[serde(rename = "maxLeadTime")]
-            max_lead_time: f64,
-        }
-        #[derive(serde::Deserialize)]
-        struct ClassV {
-            #[serde(rename = "nodeClass")]
-            node_class: String,
-            labels: Vec<KvV>,
-            requirements: Vec<ReqV>,
-            #[serde(rename = "capacityTypes")]
-            capacity_types: Option<Vec<String>>,
-            ladder: Option<LadderV>,
-            #[serde(rename = "providesFeatures")]
-            provides_features: Option<Vec<String>>,
-            #[serde(rename = "maxCores")]
-            max_cores: Option<u32>,
-            #[serde(rename = "maxMem")]
-            max_mem: Option<u64>,
-            #[serde(rename = "maxFleetCores")]
-            _max_fleet_cores: Option<u32>,
-            taints: Option<Vec<TaintV>>,
-        }
-        #[derive(serde::Deserialize)]
-        struct KvV {
-            key: String,
-            value: String,
-        }
-        #[derive(serde::Deserialize)]
-        struct ReqV {
-            key: String,
-            operator: String,
-            values: Option<Vec<String>>,
-        }
-        #[derive(serde::Deserialize)]
-        struct LadderV {
-            rungs: Vec<RungV>,
-        }
-        #[derive(serde::Deserialize)]
-        struct RungV {
-            class: String,
-        }
-        #[derive(serde::Deserialize)]
-        struct TaintV {
-            key: String,
-            value: String,
-            effect: String,
-        }
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../infra/helm/rio-build/values.yaml"
-        );
-        let body = std::fs::read_to_string(path).expect("shipped values readable");
-        let root: Root = serde_saphyr::from_str(&body).expect("shipped values parse");
+        let root = shipped::parse();
         let sla_v = root.scheduler.sla;
 
         // 1) The derived universe == the committed [GEN-SET] expectation.
@@ -3157,67 +3347,7 @@ mod tests {
         cfg.max_mem = Some(4096 << 30);
         cfg.reference_hw_class = sla_v.reference_hw_class.clone();
         cfg.max_lead_time = sla_v.max_lead_time;
-        cfg.hw_classes = sla_v
-            .hw_classes
-            .iter()
-            .map(|(h, d)| {
-                (
-                    h.clone(),
-                    HwClassDef {
-                        labels: d
-                            .labels
-                            .iter()
-                            .map(|l| NodeLabelMatch {
-                                key: l.key.clone(),
-                                value: l.value.clone(),
-                            })
-                            .collect(),
-                        requirements: d
-                            .requirements
-                            .iter()
-                            .map(|r| NodeSelectorReq {
-                                key: r.key.clone(),
-                                operator: r.operator.clone(),
-                                values: r.values.clone().unwrap_or_default(),
-                            })
-                            .collect(),
-                        node_class: d.node_class.clone(),
-                        max_cores: d.max_cores,
-                        max_mem: d.max_mem,
-                        taints: d
-                            .taints
-                            .iter()
-                            .flatten()
-                            .map(|t| NodeTaint {
-                                key: t.key.clone(),
-                                value: t.value.clone(),
-                                effect: t.effect.clone(),
-                            })
-                            .collect(),
-                        provides_features: d.provides_features.clone().unwrap_or_default(),
-                        max_fleet_cores: None,
-                        capacity_types: d
-                            .capacity_types
-                            .as_ref()
-                            .map(|caps| {
-                                caps.iter()
-                                    .map(|c| CapacityType::parse(c).expect("shipped cap token"))
-                                    .collect()
-                            })
-                            .unwrap_or_else(default_capacity_types),
-                        ladder: d.ladder.as_ref().map(|l| CapacityLadder {
-                            rungs: l
-                                .rungs
-                                .iter()
-                                .map(|r| LadderRung {
-                                    class: r.class.clone(),
-                                })
-                                .collect(),
-                        }),
-                    },
-                )
-            })
-            .collect();
+        cfg.hw_classes = shipped_hw_classes(&sla_v);
         cfg.lead_time_seed = sla_v
             .lead_time_seed
             .iter()
@@ -3267,6 +3397,293 @@ mod tests {
                 "shipped closure({h}) == parent cells + rung od cells"
             );
         }
+    }
+
+    /// R21 / W7-T (live_051(a) — the loose-class import kill):
+    /// certifies *a catalog containing a phantom top type matched by a
+    /// class WITHOUT its own exclusion row yields a global equal to
+    /// the max HONEST class ceiling, not the phantom* — through the
+    /// production `derive_ceilings ∘ resolve_globals` composition with
+    /// the committed exclusion active. The exclusion binds at the
+    /// derive seam for EVERY class (one mint), so the loose class
+    /// cannot re-import. Pre-fix left reproduced in-test via the
+    /// violability lane (empty exclusion ⇒ phantom global 383).
+    // r[verify scheduler.sla.global.derive+2]
+    #[test]
+    fn loose_class_does_not_set_the_global() {
+        let catalog_rows = vec![
+            cat_entry("r8i.96xlarge", 384, 3072),
+            cat_entry("c8a.48xlarge", 192, 384),
+        ];
+        let mk_class = || {
+            let mut d = test_def("rio.build/hw-band", "hi");
+            d.max_cores = None;
+            d.max_mem = None;
+            d.requirements = vec![
+                NodeSelectorReq {
+                    key: "karpenter.k8s.aws/instance-category".into(),
+                    operator: "In".into(),
+                    values: vec!["c".into(), "m".into(), "r".into()],
+                },
+                NodeSelectorReq {
+                    key: "karpenter.k8s.aws/instance-generation".into(),
+                    operator: "In".into(),
+                    values: vec!["8".into()],
+                },
+            ];
+            d
+        };
+        let mut cfg = base();
+        cfg.max_cores = None;
+        cfg.max_mem = None;
+        cfg.hw_cost_source = super::super::cost::HwCostSource::Spot;
+        cfg.hw_classes = HashMap::from([
+            ("honest".into(), mk_class()),
+            // The LOOSE class: identical requirements, no exclusion row
+            // of its own — the live fetcher-Gt-5 shape.
+            ("loose".into(), mk_class()),
+        ]);
+        let shipped_exclusions: Vec<String> = ["96xlarge", "metal-96xl"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let ceilings = super::super::catalog::derive_ceilings(
+            &catalog_rows,
+            &cfg.hw_classes,
+            &[],
+            &shipped_exclusions,
+        );
+        let ((gc, _), src) = cfg.resolve_globals(&ceilings).unwrap();
+        assert_eq!(
+            (gc, src),
+            (191, "derived from catalog max"),
+            "global == max honest class ceiling — the loose class \
+             cannot re-import the phantom"
+        );
+        // Violability lane (the pre-fix left): no committed exclusion
+        // ⇒ the loose class imports the phantom into the global.
+        let ceilings =
+            super::super::catalog::derive_ceilings(&catalog_rows, &cfg.hw_classes, &[], &[]);
+        let ((gc, _), _) = cfg.resolve_globals(&ceilings).unwrap();
+        assert_eq!(gc, 383, "violability: empty exclusion reproduces the left");
+    }
+
+    /// R22 / W7-U (live_051(f2) — the boot WARN rider): certifies *an
+    /// operator override above every class ceiling boots with the
+    /// disclosure WARN naming the delta and both provenances*;
+    /// kill-isolation: an override within the class range stays
+    /// silent. WARN not error — the override is a signed operator act
+    /// (disclose-don't-wedge). Pre-fix left: silent boot; the first
+    /// symptom was live_051(b)'s empty-cells churn.
+    // r[verify scheduler.sla.global.derive+2]
+    #[test]
+    #[tracing_test::traced_test]
+    fn overridden_global_above_every_class_warns_at_boot() {
+        let cfg = base();
+        let catalog: super::super::catalog::CatalogCeilings =
+            HashMap::from([("h1".into(), (191u32, 345u64 << 30))]);
+        // Kill-isolation FIRST (cumulative log capture): an override
+        // within the class range is silent.
+        cfg.validate_resolved((191, 345 << 30), &catalog, "sla.maxCores/maxMem")
+            .unwrap();
+        assert!(
+            !logs_contain("exceeds EVERY class ceiling"),
+            "within-range override stays silent"
+        );
+        // The disclosure: an override above every class ceiling WARNs
+        // with the delta and both provenances.
+        cfg.validate_resolved((400, 4096 << 30), &catalog, "sla.maxCores/maxMem")
+            .unwrap();
+        assert!(
+            logs_contain("exceeds EVERY class ceiling"),
+            "the unhostable-global foot-gun is named before the first \
+             solve consumes it"
+        );
+    }
+
+    /// The global-provenance census (R15): hand-written law table over
+    /// the (override × cost-source × catalog-emptiness) product — 8
+    /// cells from the alphabet, each arm's law asserted against
+    /// `resolve_globals`. The oracle is this table, not the impl.
+    // r[verify scheduler.sla.global.derive+2]
+    #[test]
+    fn resolve_globals_provenance_census() {
+        use super::super::cost::HwCostSource as Src;
+        let cat_full: super::super::catalog::CatalogCeilings =
+            HashMap::from([("h".into(), (191u32, 345u64 << 30))]);
+        let cat_empty = super::super::catalog::CatalogCeilings::new();
+        // (override?, source, catalog-nonempty?) -> expected
+        // Ok((cores, source-str)) / Err.
+        #[allow(clippy::type_complexity)]
+        let law: Vec<((bool, Src, bool), Option<(u32, &str)>)> = vec![
+            ((true, Src::Spot, true), Some((400, "sla.maxCores/maxMem"))),
+            ((true, Src::Spot, false), Some((400, "sla.maxCores/maxMem"))),
+            (
+                (true, Src::Static, true),
+                Some((400, "sla.maxCores/maxMem")),
+            ),
+            (
+                (true, Src::Static, false),
+                Some((400, "sla.maxCores/maxMem")),
+            ),
+            ((false, Src::Static, true), None),
+            ((false, Src::Static, false), None),
+            ((false, Src::Spot, false), None),
+            (
+                (false, Src::Spot, true),
+                Some((191, "derived from catalog max")),
+            ),
+        ];
+        for ((ovr, src, nonempty), expect) in law {
+            let mut cfg = base();
+            cfg.hw_cost_source = src;
+            if ovr {
+                cfg.max_cores = Some(400.0);
+                cfg.max_mem = Some(4096 << 30);
+            } else {
+                cfg.max_cores = None;
+                cfg.max_mem = None;
+            }
+            let cat = if nonempty { &cat_full } else { &cat_empty };
+            let got = cfg.resolve_globals(cat);
+            match expect {
+                Some((cores, source)) => {
+                    let ((gc, _), s) = got.unwrap_or_else(|e| {
+                        panic!("cell ({ovr},{src:?},{nonempty}) must resolve: {e}")
+                    });
+                    assert_eq!((gc, s), (cores, source), "cell ({ovr},{src:?},{nonempty})");
+                }
+                None => assert!(got.is_err(), "cell ({ovr},{src:?},{nonempty}) must refuse"),
+            }
+        }
+    }
+
+    /// The class-requirements × phantom-shapes product census
+    /// [GEN-SET] (live_051(a) — the structural loose-class kill):
+    /// iterates EVERY parsed shipped `sla.hwClasses` row × EVERY
+    /// committed exclusion token, synthesizes a catalog entry that
+    /// MATCHES the class's own requirements but carries the excluded
+    /// size (premise-reachability: the phantom would win the argmax
+    /// absent the exclusion), and asserts the class's EFFECTIVE
+    /// matcher — requirements ∧ metal partition ∧ the committed
+    /// class-wide exclusion — excludes it. Cells from the parsed
+    /// values and the parsed exclusion list; a future loose class is a
+    /// test failure, not a live hang.
+    // r[verify scheduler.sla.ceiling.catalog-derived+4]
+    // r[verify scheduler.sla.global.derive+2]
+    #[test]
+    fn shipped_class_requirements_exclude_every_phantom_shape() {
+        let root = shipped::parse();
+        let classes = shipped_hw_classes(&root.scheduler.sla);
+        let metal_sizes = root.karpenter.metal_sizes.clone();
+        let exclusions = root.karpenter.unlaunchable_sizes.clone();
+        assert!(!exclusions.is_empty(), "committed exclusion list present");
+        for (h, def) in &classes {
+            // Synthesize attrs the class's own requirements admit.
+            let mut category = "c".to_string();
+            let mut generation = "8".to_string();
+            for r in &def.requirements {
+                match (r.key.as_str(), r.operator.as_str()) {
+                    ("karpenter.k8s.aws/instance-category", "In") => {
+                        category = r.values.first().cloned().unwrap_or(category);
+                    }
+                    ("karpenter.k8s.aws/instance-generation", "In") => {
+                        generation = r.values.iter().max().cloned().unwrap_or(generation.clone());
+                    }
+                    ("karpenter.k8s.aws/instance-generation", "Gt") => {
+                        let n: i64 = r.values[0].parse().unwrap();
+                        generation = (n + 3).to_string();
+                    }
+                    _ => {}
+                }
+            }
+            let arch = def
+                .labels
+                .iter()
+                .find(|l| l.key == ARCH_LABEL)
+                .map(|l| l.value.clone())
+                .unwrap_or_else(|| "amd64".into());
+            let nvme = if def
+                .requirements
+                .iter()
+                .any(|r| r.key == "karpenter.k8s.aws/instance-local-nvme")
+            {
+                5700
+            } else {
+                0
+            };
+            let is_metal = def.node_class == "rio-metal";
+            let control_size = if is_metal { "metal-48xl" } else { "48xlarge" };
+            for excluded in &exclusions {
+                let phantom =
+                    shipped_cat_entry(&category, &generation, excluded, 384, 3072, &arch, nvme);
+                let control =
+                    shipped_cat_entry(&category, &generation, control_size, 192, 384, &arch, nvme);
+                let out = super::super::catalog::derive_ceilings(
+                    &[phantom, control],
+                    &HashMap::from([(h.clone(), def.clone())]),
+                    &metal_sizes,
+                    &exclusions,
+                );
+                // Premise-reachability: the control row matches by
+                // construction (attrs synthesized from the class's own
+                // requirements), so every class MUST resolve — an
+                // absent class would hide a phantom behind a vacuous
+                // census row.
+                let (cores, _) = *out.get(h).unwrap_or_else(|| {
+                    panic!("{h} x {excluded}: control row must match the class")
+                });
+                assert_eq!(
+                    cores, 191,
+                    "{h} x {excluded}: the effective matcher excludes \
+                     the phantom shape (got the control ceiling)"
+                );
+            }
+        }
+    }
+
+    /// W7-O — the exclusion-list census [GEN-SET]: every bare-metal
+    /// size token observable in the live c/m/r catalog (the
+    /// enumeration committed below; generating command in the commit
+    /// body) is in the SHIPPED `karpenter.metalSizes` — the
+    /// author-typed partition list can no longer rot silently
+    /// (live_050(d): metal-96xl's omission leaked 96xl metal rows into
+    /// the band ceilings). Also pins the committed exclusion list
+    /// itself (rev-3/rev-4 content).
+    // r[verify scheduler.sla.ceiling.catalog-derived+4]
+    #[test]
+    fn shipped_metal_sizes_cover_the_catalog_enumeration() {
+        let root = shipped::parse();
+        // The catalog's own metal-size enumeration at this commit
+        // ([GEN-SET] output; regenerate via the commit-body command
+        // when AWS ships a new metal size).
+        let observed = [
+            "metal",
+            "metal-16xl",
+            "metal-24xl",
+            "metal-32xl",
+            "metal-48xl",
+            "metal-96xl",
+        ];
+        for size in observed {
+            assert!(
+                root.karpenter.metal_sizes.contains(&size.to_string()),
+                "metal size {size} missing from karpenter.metalSizes — \
+                 the partition list rotted (live_050(d))"
+            );
+        }
+        assert_eq!(
+            root.karpenter.metal_sizes.len(),
+            observed.len(),
+            "metalSizes carries exactly the enumerated tokens — a \
+             stale extra entry is also drift"
+        );
+        assert_eq!(
+            root.karpenter.unlaunchable_sizes,
+            vec!["96xlarge".to_string(), "metal-96xl".to_string()],
+            "the committed launch-evidence exclusion (rev-3/rev-4 \
+             content as chart defaults)"
+        );
     }
 
     /// §13c-2 r[verify scheduler.sla.ceiling.uncatalogued-fallback]:
@@ -3382,6 +3799,7 @@ mod tests {
             max_node_claims_per_cell_per_tick: _, // (scalar)
             cluster: _,            // (scalar)
             metal_sizes: _,        // (free)   instance-size suffix strings
+            unlaunchable_sizes: _, // (free)   instance-size suffix strings
         } = cfg;
         // Silence unused-binding on the one (cell) field we kept by
         // name; the destructure itself is the load-bearing part.

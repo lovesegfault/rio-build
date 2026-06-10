@@ -17,7 +17,13 @@ helm template rio . \
   --set postgresql.enabled=false \
   >"$karp"
 
-want='["metal","metal-16xl","metal-24xl","metal-32xl","metal-48xl"]'
+# live_050(d): metal-96xl joined the partition list — its omission let
+# 96xl metal variants leak through the band classes' NotIn partition
+# into their ceiling argmax. This literal mirrors karpenter.metalSizes
+# (sorted); the scheduler-side census
+# (config.rs::shipped_metal_sizes_cover_the_catalog_enumeration) pins
+# the values list against the catalog's own metal-size enumeration.
+want='["metal","metal-16xl","metal-24xl","metal-32xl","metal-48xl","metal-96xl"]'
 
 # instance-size NotIn values for one pool, as a sorted JSON array (or []).
 notin_of() {

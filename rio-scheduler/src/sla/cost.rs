@@ -1815,7 +1815,7 @@ async fn poll_spot_once(
 mod tests {
     use super::*;
 
-    // r[verify scheduler.sla.ceiling.catalog-derived+3]
+    // r[verify scheduler.sla.ceiling.catalog-derived+4]
     /// `carry_catalog` preserves the boot-derived catalog across the
     /// lease-acquire edge-reload (`*cost.write() = fresh` would
     /// otherwise wipe it — it's not in PG and not re-derived).
@@ -1859,7 +1859,7 @@ mod tests {
     /// (boot snapshot, NOT in PG, NOT re-derived on lease-acquire).
     /// `solve_relevant_hash` includes it so a regression busts the
     /// solve memo instead of silently zeroing the global.
-    // r[verify scheduler.sla.global.derive]
+    // r[verify scheduler.sla.global.derive+2]
     #[test]
     fn carry_catalog_preserves_resolved_global() {
         let mut a = CostTable::seeded("us-east-1", HwCostSource::Spot);

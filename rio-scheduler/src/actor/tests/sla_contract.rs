@@ -4663,3 +4663,157 @@ async fn rung_one_ice_advances_to_a_different_rung() {
         "the declared rung's od cell is in the closure: {unmasked:?}"
     );
 }
+
+// r[verify scheduler.sla.ceiling.catalog-derived+4]
+/// R16 — the ARM-INDEPENDENT composed red (the CE-5 closure; the
+/// phantom-ceiling → ICE → walk composition across WO-S7-6 and
+/// WO-S7-5, witnessed via the slot's pinned-composition convention):
+/// ceilings GROUNDED through the production `derive_ceilings` over a
+/// catalog that CONTAINS the phantom row (the committed exclusion
+/// active — the WO-S7-6 fixture lane), the WO-S7-4 evidence path ICEs
+/// rung-1, and the ladder walk ADVANCES to a launchable rung — never
+/// sized to the phantom, never starved while a buyable rung exists.
+/// Leg coordinates (W7-D's form): leg A = the grounding
+/// (`derive_ceilings` → `set_catalog_ceilings`, this fn); the codec =
+/// `cell_wire::encode_cell_event` marks; leg B = the emission's
+/// unmasked rung (the W7-E shape); the assigned half = the cover.rs
+/// walk battery.
+#[tokio::test]
+async fn phantom_ceiling_rung_advances_not_starves() {
+    use crate::sla::config::{CapacityLadder, LadderRung};
+    use rio_common::cell_wire::{EvidenceEpoch, WireCapacity, encode_cell_event};
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw_builders_only(db.pool.clone());
+    // Ladder: intel-8 -> intel-8r7 (the WO-S7-5 machinery).
+    let rung_def = {
+        let mut d = actor.sla_config.hw_classes["intel-8"].clone();
+        d.labels[0].value = "intel-8r7".into();
+        d
+    };
+    actor
+        .sla_config
+        .hw_classes
+        .insert("intel-8r7".into(), rung_def);
+    actor
+        .sla_config
+        .hw_classes
+        .get_mut("intel-8")
+        .unwrap()
+        .ladder = Some(CapacityLadder {
+        rungs: vec![LadderRung {
+            class: "intel-8r7".into(),
+        }],
+    });
+    // The grounding (WO-S7-6): catalog ceilings derived from a catalog
+    // CONTAINING the phantom, with the committed exclusion active —
+    // every class lands at the launchable 191, never 383.
+    let cat_entry = |name: &str, cores: u32, mem_gib: u64| {
+        let (family, size) = name.split_once('.').unwrap();
+        let category: String = family
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic())
+            .collect();
+        let generation: String = family
+            .chars()
+            .skip_while(|c| c.is_ascii_alphabetic())
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert("karpenter.k8s.aws/instance-category", category);
+        labels.insert("karpenter.k8s.aws/instance-generation", generation);
+        labels.insert("karpenter.k8s.aws/instance-size", size.to_owned());
+        labels.insert("kubernetes.io/arch", "amd64".to_owned());
+        labels.insert("karpenter.k8s.aws/instance-local-nvme", "0".to_owned());
+        crate::sla::catalog::CatalogEntry {
+            name: name.into(),
+            cores,
+            mem_bytes: mem_gib << 30,
+            labels,
+        }
+    };
+    let catalog_rows = vec![
+        cat_entry("r8i.96xlarge", 384, 3072),
+        cat_entry("c8a.48xlarge", 192, 384),
+    ];
+    let unlaunchable: Vec<String> = ["96xlarge", "metal-96xl"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let ceilings = crate::sla::catalog::derive_ceilings(
+        &catalog_rows,
+        &actor.sla_config.hw_classes,
+        &[],
+        &unlaunchable,
+    );
+    for (h, &(c, _)) in &ceilings {
+        assert_eq!(c, 191, "{h}: grounded at the launchable ceiling, not 383");
+    }
+    actor.cost_table.write().set_catalog_ceilings(ceilings);
+    actor.test_inject_ready("d0", Some("test-pkg"), "x86_64-linux", false);
+
+    // First emission under the grounded ceilings.
+    let snap = actor.compute_spawn_intents(&Default::default());
+    let intent = snap
+        .intents
+        .iter()
+        .find(|i| i.intent_id == "d0")
+        .expect("d0 emitted")
+        .clone();
+    assert!(
+        intent.cores <= 191,
+        "no demand sized to the phantom: cores={} <= 191",
+        intent.cores
+    );
+
+    // The WO-S7-4 evidence path ICEs the spot plane (rung-1).
+    let marks: Vec<String> = ["intel-6", "intel-7", "intel-8", "intel-8r7"]
+        .iter()
+        .map(|h| encode_cell_event(h, WireCapacity::Spot, Some(EvidenceEpoch(1))))
+        .collect();
+    actor
+        .handle_ack_spawned_intents(&[], &marks, &[], &[], &[], None)
+        .expect("applied under leadership");
+
+    // The walk advances: a launchable unmasked rung exists (the
+    // ladder's od cell) — placement-able, never starved while a
+    // buyable rung exists.
+    let snap2 = actor.compute_spawn_intents(&Default::default());
+    let intent2 = snap2
+        .intents
+        .iter()
+        .find(|i| i.intent_id == "d0")
+        .expect("d0 re-emitted")
+        .clone();
+    let masked: std::collections::HashSet<(String, String)> = snap2
+        .ice_masked_cells
+        .iter()
+        .map(|s| {
+            let (h, cap) = crate::sla::config::parse_cell(s).expect("snapshot cell decodes");
+            (h, cap.label().to_string())
+        })
+        .collect();
+    let unmasked: Vec<(String, String)> = intent2
+        .hw_class_names
+        .iter()
+        .cloned()
+        .zip(intent2.node_affinity.iter().map(|t| {
+            t.match_expressions
+                .iter()
+                .find(|r| r.key == "karpenter.sh/capacity-type")
+                .and_then(|r| r.values.first().cloned())
+                .expect("capacity term present")
+        }))
+        .filter(|c| !masked.contains(c))
+        .collect();
+    assert!(
+        unmasked.contains(&("intel-8r7".into(), "on-demand".into())),
+        "the phantom-grounded universe still walks: unmasked rung \
+         present after rung-1 ICE: {unmasked:?}"
+    );
+    assert!(
+        intent2.cores <= 191,
+        "the re-emission stays grounded: cores={}",
+        intent2.cores
+    );
+}

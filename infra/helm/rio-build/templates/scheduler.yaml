@@ -52,6 +52,9 @@ hw_cost_source = {{ required "scheduler.sla.hwCostSource is mandatory (ADR-023 �
        uses it to mirror cover's `instance-size {In|NotIn}` predicate
        when deriving per-class catalog ceilings at boot. */}}
 metal_sizes = {{ toJson $.Values.karpenter.metalSizes }}
+{{- /* live_050(d): committed launch-evidence exclusion — derive_ceilings
+       synthesizes `instance-size NotIn` from this for EVERY class. */}}
+unlaunchable_sizes = {{ toJson $.Values.karpenter.unlaunchableSizes }}
 {{- with .leadTimeSeed }}
 
 [sla.lead_time_seed]
@@ -70,6 +73,13 @@ labels = [
 requirements = [
   {{- range $def.requirements }}
   { key = {{ .key | quote }}, operator = {{ .operator | quote }}, values = {{ toJson .values }} },
+  {{- end }}
+  {{- /* live_050(d) fleet plane: the committed launch-evidence exclusion
+         projected per-class from the ONE karpenter.unlaunchableSizes
+         list — NodeClaims carry it so Karpenter's fleet selection never
+         contains a phantom type (rev-3/rev-4 overlay content). */}}
+  {{- with $.Values.karpenter.unlaunchableSizes }}
+  { key = "karpenter.k8s.aws/instance-size", operator = "NotIn", values = {{ toJson . }} },
   {{- end }}
 ]
 node_class = {{ required (printf "scheduler.sla.hwClasses.%s.nodeClass is mandatory (rio-default / rio-nvme / rio-metal)" $h) $def.nodeClass | quote }}

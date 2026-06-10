@@ -427,7 +427,8 @@
       "max_consolidation_time": null,
       "max_node_claims_per_cell_per_tick": 8,
       "cluster": "",
-      "metal_sizes": []
+      "metal_sizes": [],
+      "unlaunchable_sizes": []
     },
     "allow_reference_change": false
   }

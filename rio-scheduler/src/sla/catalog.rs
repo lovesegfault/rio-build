@@ -4,9 +4,30 @@
 //! the hand-maintained per-class `maxCores`/`maxMem` config that drifted
 //! from what `requirements` actually permit (the §13c-1 STRIKE rounds).
 //!
+//! ## Launchability grounding (live_050(d))
+//!
+//! API existence is NOT launchability. `describe_instance_types` is a
+//! self-referential oracle for "can I buy this": the live counter-
+//! example is the gen-8 Intel 96xlarge/metal-96xl rows — present in
+//! the API, ZERO launchable us-east-2 capacity in EITHER market — that
+//! set every hi ceiling to `max_cores=383` and ICE'd every fleet (the
+//! 512/704 hang; the hi->od override ICED IDENTICALLY, refuting the
+//! market-exhaustion frame). Ceiling candidacy is therefore grounded
+//! by EXCLUSION-ONLY NEGATIVE EVIDENCE: the committed, censused
+//! `[sla].unlaunchable_sizes` list (helm `karpenter.unlaunchableSizes`)
+//! is synthesized as an `instance-size NotIn` requirement for EVERY
+//! class inside [`derive_ceilings`] — one mint, so a loose class
+//! cannot re-import a phantom into its ceiling or the global
+//! (`scheduler.sla.global.derive`). Runtime staleness (a ceiling that
+//! shrinks between boots) is the stale-solve revalidation law's axis
+//! (`scheduler.sla.ceiling.stale-solve-revalidation`), not this
+//! file's.
+//!
 //! ## Why not launch-observed
 //!
-//! Deriving from `CostTable.cells` (Acked instance types) ratchets DOWN:
+//! The grounding is exclusion-only by design — NEVER a
+//! cap-at-largest-observed-launch. Deriving from `CostTable.cells`
+//! (Acked instance types) ratchets DOWN:
 //! Karpenter launches the cheapest type that fits → first 4c probe →
 //! `observed_max(h)=4` → `retain_hosting_cells` strips `h` for any
 //! `cores>4` → no large build routes there → no large node launches →
@@ -81,7 +102,7 @@ pub struct CatalogEntry {
 /// requirements matcher reads. `None` when the API row is missing the
 /// type name, vCPU count, or memory (degenerate response — skip rather
 /// than match a `(0, 0)` phantom).
-// r[impl scheduler.sla.ceiling.catalog-derived+3]
+// r[impl scheduler.sla.ceiling.catalog-derived+4]
 pub fn from_instance_type_info(it: &InstanceTypeInfo) -> Option<CatalogEntry> {
     let name = it.instance_type()?.as_str().to_owned();
     let cores = it.v_cpu_info()?.default_v_cpus()?;
@@ -108,7 +129,7 @@ pub fn from_instance_type_info(it: &InstanceTypeInfo) -> Option<CatalogEntry> {
 /// generation; trailing letters (`g`, `d`, `n`, `e`, `i`) are family
 /// modifiers Karpenter folds into the family but does NOT label
 /// separately — `requirements` select on category+generation only.
-// r[impl scheduler.sla.ceiling.catalog-derived+3]
+// r[impl scheduler.sla.ceiling.catalog-derived+4]
 fn karpenter_labels(it: &InstanceTypeInfo, name: &str) -> BTreeMap<&'static str, String> {
     let mut m = BTreeMap::new();
     let (family, size) = name.split_once('.').unwrap_or((name, ""));
@@ -162,7 +183,7 @@ fn k8s_arch(a: &ArchitectureType) -> Option<&'static str> {
 /// parse); `Exists`/`DoesNotExist` test key presence. Unknown operator
 /// → no match (fail-closed; the catalog ceiling falls to global rather
 /// than over-routing on an operator the controller wouldn't accept).
-// r[impl scheduler.sla.ceiling.catalog-derived+3]
+// r[impl scheduler.sla.ceiling.catalog-derived+4]
 pub fn requirements_match(
     reqs: &[NodeSelectorReq],
     labels: &BTreeMap<&'static str, String>,
@@ -222,12 +243,25 @@ fn num_cmp(v: Option<&String>, values: &[String]) -> Option<(i64, i64)> {
 /// from the map (operator typo or AWS deprecation; warn) so they fall
 /// to the global ceiling and the [`super::metrics`] uncatalogued gauge
 /// fires.
-// r[impl scheduler.sla.ceiling.catalog-derived+3]
+// r[impl scheduler.sla.ceiling.catalog-derived+4]
 pub fn derive_ceilings(
     catalog: &[CatalogEntry],
     hw_classes: &HashMap<String, HwClassDef>,
     metal_sizes: &[String],
+    unlaunchable_sizes: &[String],
 ) -> CatalogCeilings {
+    // live_050(d)/live_051(a): the committed launch-evidence exclusion,
+    // synthesized ONCE and applied to EVERY class (the class-wide
+    // mint — a loose class whose own requirements omit the row cannot
+    // re-import a phantom into its ceiling, and `resolve_globals`'
+    // max-over-classes therefore cannot exceed the largest honest
+    // ceiling by composition). See the module doc's launchability
+    // grounding law.
+    let unlaunchable_req = (!unlaunchable_sizes.is_empty()).then(|| NodeSelectorReq {
+        key: label::SIZE.into(),
+        operator: "NotIn".into(),
+        values: unlaunchable_sizes.to_vec(),
+    });
     let mut out = CatalogCeilings::new();
     for (h, def) in hw_classes {
         let metal_req = (!metal_sizes.is_empty()).then(|| NodeSelectorReq {
@@ -242,6 +276,11 @@ pub fn derive_ceilings(
             .filter(|e| requirements_match(&def.requirements, &e.labels))
             .filter(|e| {
                 metal_req
+                    .as_ref()
+                    .is_none_or(|r| requirements_match(std::slice::from_ref(r), &e.labels))
+            })
+            .filter(|e| {
+                unlaunchable_req
                     .as_ref()
                     .is_none_or(|r| requirements_match(std::slice::from_ref(r), &e.labels))
             })
@@ -377,7 +416,7 @@ mod tests {
         }
     }
 
-    /// §13c-2 r[verify scheduler.sla.ceiling.catalog-derived+3]: the core
+    /// §13c-2 r[verify scheduler.sla.ceiling.catalog-derived+4]: the core
     /// red-first test. `requirements` intersected with the catalog
     /// picks `argmax_t cores` over the **matched** set, not the global
     /// max. A `[c, m]` × gen `[7]` requirement matches
@@ -400,13 +439,253 @@ mod tests {
                 ],
             ),
         )]);
-        let out = derive_ceilings(&catalog, &classes, &[]);
+        let out = derive_ceilings(&catalog, &classes, &[], &[]);
         assert_eq!(
             out.get("lo-x86"),
             Some(&(15, (64 << 30) / 10 * 9)),
             "argmax over matched [c7a.large, m7i.4xlarge] minus 1-core kubelet \
              reserve and 10% mem reserve"
         );
+    }
+
+    /// R13 (live_050(d) — phantom-catalog ceiling; W7-N): certifies
+    /// *a catalog containing an API-existent, never-launchable top
+    /// type does NOT become the ceiling* — the committed censused
+    /// exclusion (`unlaunchable_sizes`, the rev-3/rev-4 overlay
+    /// content as chart defaults) removes it from candidacy at boot.
+    /// Pre-fix red (transcript in the commit body): the 96xlarge
+    /// phantom set `max_cores=383` — the live boot-log shape.
+    /// Kill-isolation: the same catalog WITHOUT the exclusion still
+    /// yields the phantom (the violability lane — the exclusion is
+    /// config, not a hardcode).
+    // r[verify scheduler.sla.ceiling.catalog-derived+4]
+    #[test]
+    fn phantom_top_type_does_not_set_the_ceiling() {
+        let catalog = vec![
+            // The phantom: exists in describe_instance_types, zero
+            // launchable us-east-2 capacity in EITHER market (the
+            // live_050 boot-log evidence: max_cores=383 = 384-1).
+            ce("r8i.96xlarge", 384, 3072, "amd64", 0),
+            // The largest BUYABLE gen-8 c/m/r (family proven live).
+            ce("c8a.48xlarge", 192, 384, "amd64", 0),
+        ];
+        let classes = HashMap::from([(
+            "hi-ebs-x86".to_owned(),
+            hw(
+                "rio-default",
+                vec![
+                    req(label::CATEGORY, "In", &["c", "m", "r"]),
+                    req(label::GENERATION, "In", &["8"]),
+                ],
+            ),
+        )]);
+        // The SHIPPED exclusion (values.yaml karpenter.unlaunchableSizes).
+        let unlaunchable: Vec<String> = ["96xlarge", "metal-96xl"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let out = derive_ceilings(&catalog, &classes, &[], &unlaunchable);
+        assert_eq!(
+            out.get("hi-ebs-x86"),
+            Some(&(191, (384u64 << 30) / 10 * 9)),
+            "the committed launch-evidence exclusion grounds the argmax \
+             at the largest LAUNCHABLE type (192-1), not the phantom"
+        );
+        // Kill-isolation / violability: no exclusion => the phantom
+        // argmax returns (the pre-fix left, reproduced on demand).
+        let out = derive_ceilings(&catalog, &classes, &[], &[]);
+        assert_eq!(
+            out.get("hi-ebs-x86"),
+            Some(&(383, (3072u64 << 30) / 10 * 9)),
+            "violability lane: empty exclusion reproduces the phantom"
+        );
+    }
+
+    /// R14 (the metalSizes rot; the W7-O census's red row): metal-96xl
+    /// absent from the partition list LEAKS through the band classes'
+    /// NotIn filter. Pre-fix red (transcript in the commit body): the
+    /// band ceiling = the metal-96xl phantom (383).
+    // r[verify scheduler.sla.ceiling.catalog-derived+4]
+    #[test]
+    fn metal_96xl_is_partitioned() {
+        let catalog = vec![
+            ce("c8i.metal-96xl", 384, 768, "amd64", 0),
+            ce("c8a.48xlarge", 192, 384, "amd64", 0),
+        ];
+        let classes = HashMap::from([(
+            "hi-ebs-x86".to_owned(),
+            hw(
+                "rio-default",
+                vec![
+                    req(label::CATEGORY, "In", &["c", "m", "r"]),
+                    req(label::GENERATION, "In", &["8"]),
+                ],
+            ),
+        )]);
+        // The SHIPPED partition list (values.yaml karpenter.metalSizes).
+        let metal_sizes: Vec<String> = [
+            "metal",
+            "metal-16xl",
+            "metal-24xl",
+            "metal-32xl",
+            "metal-48xl",
+            "metal-96xl",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let out = derive_ceilings(&catalog, &classes, &metal_sizes, &[]);
+        assert_eq!(
+            out.get("hi-ebs-x86"),
+            Some(&(191, (384u64 << 30) / 10 * 9)),
+            "metal-96xl is partitioned OUT of the band classes (NotIn \
+             metalSizes) — the author-typed list can no longer omit it"
+        );
+    }
+
+    /// W7-P (non-regression at the buyable boundary): the committed
+    /// exclusion never strips LAUNCHABLE types — a 48xlarge-launchable
+    /// family yields the 48xlarge-derived ceiling (191 = 192-1), not a
+    /// degraded or zero one, with the exclusion active.
+    // r[verify scheduler.sla.ceiling.catalog-derived+4]
+    #[test]
+    fn exclusion_does_not_strip_launchable_types() {
+        let catalog = vec![ce("c8a.48xlarge", 192, 384, "amd64", 0)];
+        let classes = HashMap::from([(
+            "hi-ebs-x86".to_owned(),
+            hw(
+                "rio-default",
+                vec![
+                    req(label::CATEGORY, "In", &["c", "m", "r"]),
+                    req(label::GENERATION, "In", &["8"]),
+                ],
+            ),
+        )]);
+        let unlaunchable: Vec<String> = ["96xlarge", "metal-96xl"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let out = derive_ceilings(&catalog, &classes, &[], &unlaunchable);
+        assert_eq!(
+            out.get("hi-ebs-x86"),
+            Some(&(191, (384u64 << 30) / 10 * 9)),
+            "the exclusion is surgical — launchable types untouched"
+        );
+    }
+
+    /// live_050(e)(iii): the fetcher `instance-generation Gt 5` shape
+    /// shares the phantom-match class — its NotIn-metalSizes partition
+    /// admits the same 96xl rows into the argmax. The class-wide
+    /// committed exclusion MUST cover it (no per-class row needed —
+    /// the seam binds every class).
+    // r[verify scheduler.sla.ceiling.catalog-derived+4]
+    #[test]
+    fn fetcher_gt5_class_gets_the_exclusion() {
+        let catalog = vec![
+            ce("r8i.96xlarge", 384, 3072, "amd64", 0),
+            ce("c8a.48xlarge", 192, 384, "amd64", 0),
+        ];
+        let classes = HashMap::from([(
+            "fetcher-x86".to_owned(),
+            hw("rio-default", vec![req(label::GENERATION, "Gt", &["5"])]),
+        )]);
+        let metal_sizes: Vec<String> = [
+            "metal",
+            "metal-16xl",
+            "metal-24xl",
+            "metal-32xl",
+            "metal-48xl",
+            "metal-96xl",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let unlaunchable: Vec<String> = ["96xlarge", "metal-96xl"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let out = derive_ceilings(&catalog, &classes, &metal_sizes, &unlaunchable);
+        assert_eq!(
+            out.get("fetcher-x86"),
+            Some(&(191, (384u64 << 30) / 10 * 9)),
+            "the Gt-5 class is covered by the class-wide exclusion"
+        );
+        // Violability (the live pre-rev-4 left): without the committed
+        // exclusion the Gt-5 class imports the phantom.
+        let out = derive_ceilings(&catalog, &classes, &metal_sizes, &[]);
+        assert_eq!(
+            out.get("fetcher-x86"),
+            Some(&(383, (3072u64 << 30) / 10 * 9)),
+            "violability: the loose Gt-5 shape reproduces the live import"
+        );
+    }
+
+    /// The ceiling-derivation product census (R15): (class-kind ×
+    /// catalog-row) cells from the alphabet — band (NotIn partition) /
+    /// metal (In partition) / fetcher (Gt-5, partition-NotIn) classes
+    /// against phantom and buyable rows of both partitions, with the
+    /// shipped metalSizes + exclusion lists. Each class's ceiling MUST
+    /// come from its buyable partition row; no cell sees a phantom.
+    // r[verify scheduler.sla.ceiling.catalog-derived+4]
+    #[test]
+    fn ceiling_derivation_product_census() {
+        let catalog = vec![
+            ce("r8i.96xlarge", 384, 3072, "amd64", 0),
+            ce("c8i.metal-96xl", 384, 768, "amd64", 0),
+            ce("c8a.48xlarge", 192, 384, "amd64", 0),
+            ce("c8a.metal-48xl", 192, 384, "amd64", 0),
+        ];
+        let metal_sizes: Vec<String> = [
+            "metal",
+            "metal-16xl",
+            "metal-24xl",
+            "metal-32xl",
+            "metal-48xl",
+            "metal-96xl",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let unlaunchable: Vec<String> = ["96xlarge", "metal-96xl"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let classes = HashMap::from([
+            (
+                "band".to_owned(),
+                hw(
+                    "rio-default",
+                    vec![
+                        req(label::CATEGORY, "In", &["c", "m", "r"]),
+                        req(label::GENERATION, "In", &["8"]),
+                    ],
+                ),
+            ),
+            (
+                "metal".to_owned(),
+                hw(
+                    rio_common::k8s::METAL_NODE_CLASS,
+                    vec![
+                        req(label::CATEGORY, "In", &["c", "m", "r"]),
+                        req(label::GENERATION, "Gt", &["5"]),
+                    ],
+                ),
+            ),
+            (
+                "fetcher".to_owned(),
+                hw("rio-default", vec![req(label::GENERATION, "Gt", &["5"])]),
+            ),
+        ]);
+        let out = derive_ceilings(&catalog, &classes, &metal_sizes, &unlaunchable);
+        // band + fetcher: NotIn partition → 48xlarge (191); metal: In
+        // partition → metal-48xl (191). Nobody sees 383.
+        for h in ["band", "metal", "fetcher"] {
+            assert_eq!(
+                out.get(h),
+                Some(&(191, (384u64 << 30) / 10 * 9)),
+                "{h}: ceiling from the buyable partition row"
+            );
+        }
     }
 
     /// `Gt 0` on `instance-local-nvme` excludes ebs-only types; the
@@ -428,7 +707,7 @@ mod tests {
                 ],
             ),
         )]);
-        let out = derive_ceilings(&catalog, &classes, &[]);
+        let out = derive_ceilings(&catalog, &classes, &[], &[]);
         assert_eq!(
             out.get("nvme-arm"),
             Some(&(95, (192u64 << 30) / 10 * 9)),
@@ -448,7 +727,7 @@ mod tests {
                 vec![req(label::CATEGORY, "In", &["nonexistent-family"])],
             ),
         )]);
-        let out = derive_ceilings(&catalog, &classes, &[]);
+        let out = derive_ceilings(&catalog, &classes, &[], &[]);
         assert!(out.is_empty(), "0-match class omitted, not (0,0)");
     }
 
@@ -463,7 +742,7 @@ mod tests {
             "tiny".to_owned(),
             hw("rio-default", vec![req(label::CATEGORY, "In", &["t"])]),
         )]);
-        let out = derive_ceilings(&catalog, &classes, &[]);
+        let out = derive_ceilings(&catalog, &classes, &[], &[]);
         assert_eq!(
             out.get("tiny"),
             Some(&(1, (1u64 << 30) / 10 * 9)),
@@ -492,7 +771,7 @@ mod tests {
             ),
         ]);
         let metal_sizes = vec!["metal".to_owned(), "metal-48xl".to_owned()];
-        let out = derive_ceilings(&catalog, &classes, &metal_sizes);
+        let out = derive_ceilings(&catalog, &classes, &metal_sizes, &[]);
         // Both pick a real type; the partition determines WHICH one.
         // `cores` ties at 192 — the assertion is on the EXCLUSION
         // (metal-x86 must not pick a non-metal size and vice versa).
@@ -503,7 +782,7 @@ mod tests {
         // With only the metal type in the catalog: ebs-x86 would have
         // 0 matches and metal-x86 picks it.
         let metal_only = vec![ce("c8a.metal-48xl", 192, 384, "amd64", 0)];
-        let out = derive_ceilings(&metal_only, &classes, &metal_sizes);
+        let out = derive_ceilings(&metal_only, &classes, &metal_sizes, &[]);
         assert!(
             !out.contains_key("ebs-x86"),
             "NotIn metalSizes excludes the only type"
@@ -524,7 +803,7 @@ mod tests {
             "x86".to_owned(),
             hw("rio-default", vec![req(label::CATEGORY, "In", &["m"])]),
         )]);
-        let out = derive_ceilings(&catalog, &classes, &[]);
+        let out = derive_ceilings(&catalog, &classes, &[], &[]);
         let (_, mem) = *out.get("x86").expect("class matched");
         assert_eq!(mem, 61_847_529_057, "(64 << 30) / 10 * 9, integer division");
         assert!(

@@ -4415,7 +4415,7 @@ the AWS instance-type catalog rather than hand-maintained config --- the prior
 rounds). Boot-time derivation removes the operator-side staleness step
 entirely: a `requirements` edit takes effect on the next rollout.
 
-#r("scheduler.sla.ceiling.catalog-derived+3")[
+#r("scheduler.sla.ceiling.catalog-derived+4")[
   The scheduler derives a per-hwClass catalog ceiling at boot by calling
   `describe_instance_types`, projecting each type onto Karpenter discovery
   labels (`instance-category`, `instance-generation`, `instance-size`,
@@ -4432,8 +4432,25 @@ entirely: a `requirements` edit takes effect on the next rollout.
   never an independent per-axis max (which would phantom a shape no real type
   satisfies and ICE-loop Karpenter). Spot cost source only; Static (vmtest) has
   no AWS API and yields an empty catalog. A class matching 0 types is omitted
-  from the catalog (warn).
+  from the catalog (warn). Ceiling candidacy MUST be grounded in
+  LAUNCHABILITY, never bare API existence: the committed, censused
+  launch-evidence exclusion (`sla.unlaunchableSizes` --- instance-size tokens
+  present in `describe_instance_types` with ZERO launchable capacity in the
+  deployment region in either market) is synthesized as an `instance-size
+  NotIn` requirement for EVERY class at the derive seam --- one mint, so a
+  class whose own `requirements` omit the row cannot re-import a phantom into
+  its ceiling or the global --- and the grounding is EXCLUSION-ONLY negative
+  evidence, never a cap at the largest observed launch (the ratchet-down
+  failure mode the module doc records).
 ]
+Rationale (live_050(d), the 2026-06-10 mechanism revision): the boot log
+showed `max_cores=383` --- the gen-8 Intel 96xlarge/metal-96xl rows exist in
+the API with zero launchable us-east-2 capacity; every hi claim was sized to
+the phantom, Karpenter fleets contained only phantom types, and ICE hit BOTH
+markets (the hi→od override iced identically, refuting market exhaustion).
+The largest buyable gen-8 c/m/r is 48xlarge (192 vCPU, family proven live).
+Runtime ceiling staleness (a shrink between boots re-pinning persisted
+demand) is the `scheduler.sla.ceiling.stale-solve-revalidation` law's axis.
 
 #r("scheduler.sla.ceiling.uncatalogued-fallback")[
   A class with no catalog ceiling --- Static cost source, fetch failure, or 0
@@ -4477,7 +4494,7 @@ entirely: a `requirements` edit takes effect on the next rollout.
   non-trivial default).
 ]
 
-#r("scheduler.sla.global.derive")[
+#r("scheduler.sla.global.derive+2")[
   The boot-derived effective global is `max(catalog
   ceilings).clamp(MIN_CORES, MAX_CORES_GLOBAL)` for cores and `max(catalog
   ceilings).clamp(MIN_MEM, MAX_MEM_GLOBAL)` for mem, where
@@ -4488,8 +4505,26 @@ entirely: a `requirements` edit takes effect on the next rollout.
   after the catalog fetch, before actor spawn. Every consumer
   (`Ceilings::from_resolved`, `class_ceilings()`, `GetSlaDefaults`,
   `GetHwClassConfig`) reads from there; `carry_catalog` preserves it across the
-  lease-acquire reload.
+  lease-acquire reload. The global MUST derive from launchability-grounded
+  class ceilings only (the per-class exclusion binds at the derive seam for
+  every class, so `max` is honest by composition --- one loose class cannot
+  re-import a phantom into the global clamp) and MUST NOT exceed the largest
+  class ceiling --- on the catalog arm reachable only through the
+  `MIN_CORES`/`MIN_MEM` floor clamp against a degenerate sub-floor catalog;
+  an operator override exceeding every class ceiling MUST be disclosed at
+  boot (WARN naming the delta and both provenances --- the override is a
+  signed operator act, so the doctrine is disclose-don't-wedge, never a boot
+  failure).
 ]
+Rationale (live_051(a)/(f2), the cancelled-python-builds verdict):
+`resolve_globals` maxes over ALL per-class catalog ceilings, so one loose
+class (live: fetcher `Gt 5` pre-rev-4) re-imported the phantom into the
+GLOBAL clamp even after every other class was grounded; demand admitted at
+that global was hostable by no class, fell through the hw-agnostic emission
+silently, and churned as `no_hosting_class` until operators cancelled the
+builds. Disclosure on the override arm is the boot-time half; the
+emission-time half is the `scheduler.sla.ceiling.stale-solve-revalidation`
+law.
 
 #r("scheduler.sla.global.static-requires-some")[
   `hwCostSource=static` boot-fails when `sla.maxCores`/`maxMem` are unset ---
