@@ -34,6 +34,8 @@ module walkFanoutSpawnUnbounded {
       pending' = pending.exclude(Set(p)),
       inflight' = inflight.union(Set(p)),
       spawnedPostLatch' = spawnedPostLatch,
+      visitedM' = visitedM,
+      dupQueued' = dupQueued,
       served' = served,
       settledCells' = settledCells,
       abortsDone' = abortsDone,

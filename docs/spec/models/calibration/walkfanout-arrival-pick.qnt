@@ -49,6 +49,8 @@ module walkFanoutArrivalPick {
     gen' = gen,
     firstAbortVerdict' = firstAbortVerdict,
     spawnedPostLatch' = spawnedPostLatch,
+    visitedM' = visitedM,
+    dupQueued' = dupQueued,
   }
 
   action calibStep = any {

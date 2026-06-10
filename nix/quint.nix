@@ -8820,8 +8820,9 @@ rec {
     # materializationJob.qnt extension (its slot-10 plane models one
     # fold evaluation's cell laws; a cross-path interleaving axis would
     # blast the const-binding radius across its calibration corpus).
-    # Measured (TLC, exhaustive, F=2 x 4 paths): 250 states generated /
-    # 109 distinct, all five holds [ok] in 867ms; budget 120s.
+    # Measured (TLC, exhaustive, F=2 x 4 paths, + the bw8 dup-frontier
+    # axis): see the wired transcript + the introducing commit; budget
+    # 120s (raise-over-measurement).
     # r[verify store.materialize.path-fold+1]
     quint-walkfanout = mkQuintCheck {
       name = "walkfanout";
@@ -8843,6 +8844,7 @@ rec {
         "foldTierLawful"
         "floorMonotoneCommitOnly"
         "cellsSingleGeneration"
+        "frontierSpawnable"
       ];
     };
     # The R-c rejected shape: the outcome compiles from the FIRST
@@ -8903,6 +8905,86 @@ rec {
       step = "calibStep";
       modelTimeoutSec = 120;
       witness = "windowWithinF";
+    };
+    # The merged_bug_003 two-timestamp shape (bw8 S3): the frontier
+    # admission gate checks containment-in-PENDING instead of
+    # membership-in-visitedM, so an already-spawned path's re-offer
+    # lands as a duplicate entry -- dies through frontierSpawnable
+    # (dupQueued = 1: a membership lie that justifies a blocking slot
+    # acquire for zero spawnable work). Measured: see the introducing
+    # commit; budget 120s.
+    # r[verify store.materialize.path-fold+1]
+    quint-walkfanout-calib-dup-frontier = mkQuintWitnessCheck {
+      name = "walkfanout-calib-dup-frontier";
+      spec = "calibration/walkfanout-dup-frontier";
+      extraSpecs = [ "walkFanout" ];
+      main = "walkFanoutDupFrontier";
+      step = "calibStep";
+      modelTimeoutSec = 120;
+      witness = "frontierSpawnable";
+    };
+    # Kill isolation for the dup-frontier twin: BOTH window leaves stay
+    # INTACT under calibStep (the perturbation touches only the
+    # dupQueued ghost). Measured: see the introducing commit; budget
+    # 120s.
+    quint-walkfanout-calib-dup-frontier-isolation = mkQuintCheck {
+      name = "walkfanout-calib-dup-frontier-isolation";
+      spec = "calibration/walkfanout-dup-frontier";
+      extraSpecs = [ "walkFanout" ];
+      main = "walkFanoutDupFrontier";
+      step = "calibStep";
+      modelTimeoutSec = 120;
+      invariants = [
+        "windowWithinF"
+        "noSpawnAfterLatch"
+      ];
+    };
+    # The merged_bug_012 driver-fold plane (bw8 S3): the SECOND main in
+    # walkFanout.qnt -- two Served paths (sizes 2 and 3), per-path
+    # streamed counters, the floor-overtakes-declared cell reachable by
+    # construction. Success-only + provisional-frame scope stated in
+    # the val docs (commit frames are apply boundaries -- the recorded
+    # divergence (b)). Measured: see the introducing commit; budget
+    # 120s.
+    # r[verify store.materialize.path-fold+1]
+    quint-walkfanout-progress = mkQuintCheck {
+      name = "walkfanout-progress";
+      spec = "walkFanout";
+      main = "walkFanoutProgress";
+      modelTimeoutSec = 120;
+      invariants = [
+        "noFalseCompletion"
+        "emittedDoneNeverRegresses"
+      ];
+    };
+    # The pre-law future-side arithmetic (spawn-captured base +
+    # job-floor clamp): a sibling commit drives the floor past a
+    # still-streaming path's base+declared and its next tick renders
+    # done == expected with outstanding declared work -- dies through
+    # noFalseCompletion. Measured: see the introducing commit; budget
+    # 120s.
+    quint-walkfanout-calib-progress-base-capture = mkQuintWitnessCheck {
+      name = "walkfanout-calib-progress-base-capture";
+      spec = "calibration/walkfanout-progress-base-capture";
+      extraSpecs = [ "walkFanout" ];
+      main = "walkFanoutProgressBaseCapture";
+      step = "calibStep";
+      modelTimeoutSec = 120;
+      witness = "noFalseCompletion";
+    };
+    # The same perturbation's oscillation face (its OWN wired lane --
+    # the emittedDoneNeverRegresses leaf's falsifier per P7):
+    # interleaved siblings' raw dones differ by their stream gap, so
+    # the provisional done sequence regresses. Measured: see the
+    # introducing commit; budget 120s.
+    quint-walkfanout-calib-progress-base-regress = mkQuintWitnessCheck {
+      name = "walkfanout-calib-progress-base-regress";
+      spec = "calibration/walkfanout-progress-base-capture";
+      extraSpecs = [ "walkFanout" ];
+      main = "walkFanoutProgressBaseCapture";
+      step = "calibStep";
+      modelTimeoutSec = 120;
+      witness = "emittedDoneNeverRegresses";
     };
   };
 
