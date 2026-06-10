@@ -101,19 +101,45 @@ impl From<rio_common::cell_wire::WireCapacity> for CapacityType {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Cell(pub String, pub CapacityType);
 
+/// bug_050: the CLOSED refusal alphabet for the cell KEY decode —
+/// typed cause per refused entry (mirrors the bug_094 scheduler-side
+/// `CellDecodeError` loud-refusal close). A deny-plane consumer (the
+/// ICE-mask seam) matches this exhaustively and refuses LOUDLY
+/// (warn + counter) instead of silently dropping the entry — a
+/// dropped entry UNMASKS its cell against the mask's stated purpose.
+#[derive(Debug)]
+pub enum CellKeyRefusal {
+    /// The shared wire decoder rejected the string outright.
+    Undecodable(rio_common::cell_wire::CellDecodeError),
+    /// Decodable as a cell EVENT but epoch-suffixed (`"h:cap@epoch"`)
+    /// — these lanes carry KEYS, not evidence events.
+    EpochSuffixed,
+}
+
 impl Cell {
-    /// Parse the `"h:cap"` wire form used by helm `sla.leadTimeSeed`
-    /// keys and `GetSpawnIntentsResponse.ice_masked_cells`. Pinned to
-    /// the shared [`rio_common::cell_wire`] decoder; epoch-suffixed
-    /// cell EVENTS (`"h:cap@epoch"`) are rejected — these lanes carry
-    /// keys, not evidence events, and pre-pin the codec already
-    /// rejected `'@'` strings (the capacity token failed to parse).
-    pub fn parse(s: &str) -> Option<Self> {
-        let p = rio_common::cell_wire::decode_cell_event(s).ok()?;
+    /// Parse the `"h:cap"` wire KEY form used by helm
+    /// `sla.leadTimeSeed` keys and
+    /// `GetSpawnIntentsResponse.ice_masked_cells`, with a TYPED
+    /// refusal (bug_050). Pinned to the shared
+    /// [`rio_common::cell_wire`] decoder; epoch-suffixed cell EVENTS
+    /// are refused — these lanes carry keys, not evidence events, and
+    /// pre-pin the codec already rejected `'@'` strings (the capacity
+    /// token failed to parse). Deny-plane consumers (the ICE-mask
+    /// seam) match the refusal per entry; key-lane callers whose
+    /// refusal postures are out of plane keep [`Self::parse`].
+    pub fn parse_key(s: &str) -> Result<Self, CellKeyRefusal> {
+        let p = rio_common::cell_wire::decode_cell_event(s).map_err(CellKeyRefusal::Undecodable)?;
         if p.epoch.is_some() {
-            return None;
+            return Err(CellKeyRefusal::EpochSuffixed);
         }
-        Some(Self(p.hw_class, p.capacity.into()))
+        Ok(Self(p.hw_class, p.capacity.into()))
+    }
+
+    /// Option view of [`Self::parse_key`] for the key-lane callers
+    /// (seed precedence, gauge fallback) whose refusal postures are
+    /// out of plane — one grammar, single-sourced (bug_050).
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::parse_key(s).ok()
     }
 }
 

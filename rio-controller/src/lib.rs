@@ -282,6 +282,17 @@ pub fn describe_metrics() {
          the controller's GetHwClassConfig — config skew; self-heals within \
          ≤300s, persistent rate = controller's hw_refresh RPC failing."
     );
+    // bug_050: the ICE-mask decode seam's loud refusal (the lllll
+    // census requires describe-with-emit; emission at
+    // nodeclaim_pool/mod.rs decode_mask_entries).
+    describe_counter!(
+        "rio_controller_nodeclaim_mask_refused_total",
+        "ICE-mask entries refused at the cover-deficit decode seam by \
+         `reason` (undecodable | epoch_suffixed); each refusal leaves \
+         its cell unmaskable — non-zero means cell-codec skew between \
+         scheduler and controller (version drift): cover may re-mint \
+         into a cell the scheduler just ICE'd until the skew is fixed."
+    );
     describe_counter!(
         "rio_controller_nodeclaim_created_total",
         "nodeclaim_pool NodeClaim Api::create successes by `cell`. \

@@ -1577,8 +1577,18 @@ impl NodeClaimPoolReconciler {
         // received must still keep cover_deficit out of the cell —
         // pre-fix only the local tick's cells masked, so the tick
         // after a failed Ack re-minted into a cell that just ICE'd.
-        let mut masked: Vec<String> = intents.ice_masked_cells.clone();
-        masked.extend(self.pending_evidence.ice_cells().map(Cell::to_string));
+        // bug_050: wire entries are decoded ONCE at this seam with a
+        // LOUD per-entry refusal (warn + counter); local cells extend
+        // TYPED -- no string round-trip, so codec drift cannot poison
+        // the local lane (a compile-level close). Residual (disclosed,
+        // also in the counter HELP): a refused entry's cell stays
+        // unmaskable this tick -- bounded by per-cell maxFleetCores
+        // caps and ICE re-marking; the rejected fail-closed
+        // alternative (skip the tick on any undecodable entry, the
+        // `global_ceilings` precedent) would let ONE skewed string
+        // halt all provisioning indefinitely.
+        let mut masked: HashSet<Cell> = Self::decode_mask_entries(&intents.ice_masked_cells);
+        masked.extend(self.pending_evidence.ice_cells().cloned());
 
         let cover = self.cover_deficit(&unplaced, &live, &masked).await?;
         debug!(created = cover.created.len(), "deficit cover");
@@ -1952,11 +1962,51 @@ impl NodeClaimPoolReconciler {
     /// `Api::create` failures are warned + skipped (next tick retries);
     /// the method only propagates errors that would make the tick
     /// non-progressing.
+    /// bug_050: the ICE-mask decode seam --- wire entries decoded ONCE,
+    /// total-with-refusal over the closed [`sketch::CellKeyRefusal`]
+    /// alphabet (exhaustive match; R14): Ok inserts the cell, Err is
+    /// LOUD --- `warn!` with the entry + typed cause and a
+    /// `rio_controller_nodeclaim_mask_refused_total{reason}` increment
+    /// (the two-reason sibling pattern of `intent_dropped_total`).
+    /// Residual (disclosed, also in the HELP text): a refused entry's
+    /// cell stays unmaskable --- the refusal makes codec skew loud,
+    /// not impossible; non-zero means cell-codec skew between
+    /// scheduler and controller.
+    fn decode_mask_entries(entries: &[String]) -> HashSet<Cell> {
+        let mut masked = HashSet::with_capacity(entries.len());
+        for s in entries {
+            match Cell::parse_key(s) {
+                Ok(c) => {
+                    masked.insert(c);
+                }
+                Err(cause) => {
+                    let reason = match &cause {
+                        sketch::CellKeyRefusal::Undecodable(_) => "undecodable",
+                        sketch::CellKeyRefusal::EpochSuffixed => "epoch_suffixed",
+                    };
+                    metrics::counter!(
+                        "rio_controller_nodeclaim_mask_refused_total",
+                        "reason" => reason,
+                    )
+                    .increment(1);
+                    warn!(
+                        entry = %s,
+                        ?cause,
+                        "ICE-mask entry refused at the cover-deficit decode seam; \
+                         its cell stays unmaskable this tick (cell-codec skew \
+                         between scheduler and controller?)"
+                    );
+                }
+            }
+        }
+        masked
+    }
+
     async fn cover_deficit(
         &self,
         unplaced: &[SpawnIntent],
         live: &[ffd::LiveNode],
-        ice_masked: &[String],
+        ice: &HashSet<Cell>,
     ) -> anyhow::Result<CoverResult> {
         if unplaced.is_empty() {
             return Ok(CoverResult::default());
@@ -1975,12 +2025,11 @@ impl NodeClaimPoolReconciler {
             );
             return Ok(CoverResult::default());
         };
-        let ice: HashSet<Cell> = ice_masked.iter().filter_map(|s| Cell::parse(s)).collect();
         let live_cores: u32 = live.iter().map(|n| n.allocatable.0).sum();
         let mut created_cores = 0u32;
 
         let (by_cell, dropped) =
-            cover::assign_to_cells(unplaced, &self.sketches, &ice, cover::cell_rank, |i, m| {
+            cover::assign_to_cells(unplaced, &self.sketches, ice, cover::cell_rank, |i, m| {
                 self.cfg.fallback_cell(i, &self.hw_config, m)
             });
         // r41 merged_015: the runbook (sla-model.typ §NoHostingClass) and
@@ -2395,6 +2444,165 @@ async fn connect_pg(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ----- bug_050: ICE-mask decode seam (loud refusal, typed lanes) -----
+
+    /// bug_050 red (recorded verbatim in the close commit): the
+    /// deny-plane decode is total-with-refusal --- a refused entry is
+    /// COUNTED per typed cause, never silently dropped. Pre-fix the
+    /// seam was `filter_map(Cell::parse)`: the refused-count red
+    /// (`left: 0, right: 1` for the epoch-suffixed entry) pinned the
+    /// silent drop; the cover-side consequence (an undecodable entry
+    /// UNMASKS its cell, so cover re-mints into a just-ICE'd cell) is
+    /// asserted below as the DISCLOSED residual --- it holds on both
+    /// sides by design (the refusal makes skew loud, not impossible;
+    /// fail-closed skip-the-tick was considered and rejected: one
+    /// skewed string would halt all provisioning).
+    ///
+    /// Witness-strength: certifies undecodable input is counted and
+    /// dropped WITHOUT unmasking decodable siblings, through the
+    /// production seam (`decode_mask_entries`) and the production
+    /// assignment (`assign_to_cells`).
+    #[test]
+    fn cover_refuses_unmask_on_undecodable_mask_entry() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        let masked = metrics::with_local_recorder(&recorder, || {
+            NodeClaimPoolReconciler::decode_mask_entries(&[
+                // The scheduler ICE'd mid-ebs-x86:od but a skewed
+                // codec emitted the epoch-suffixed EVENT form.
+                "mid-ebs-x86:od@1234".to_string(),
+            ])
+        });
+        // The refusal is counted (pre-fix red: filter_map counted
+        // nothing --- left: 0, right: 1).
+        let entries = snap.snapshot().into_vec();
+        let refused: u64 = entries
+            .iter()
+            .filter(|(k, _, _, _)| k.key().name() == "rio_controller_nodeclaim_mask_refused_total")
+            .map(|(_, _, _, v)| match v {
+                DebugValue::Counter(c) => *c,
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(
+            refused, 1,
+            "a refused ICE-mask entry must be counted, never silently dropped"
+        );
+        // Disclosed residual (green both sides): the refused entry's
+        // cell stays unmaskable --- cover assigns into it. Bounded by
+        // per-cell caps + ICE re-marking; the counter + warn are the
+        // operator's tripwire.
+        let od = Cell("mid-ebs-x86".into(), CapacityType::OnDemand);
+        assert!(!masked.contains(&od), "refusal does not mask (residual)");
+    }
+
+    /// bug_050: two bad entries (one garbage, one epoch-suffixed) +
+    /// one good --- the refusal is loud AND classified per typed
+    /// cause, and the good sibling still masks (refusal never
+    /// poisons decodable entries).
+    ///
+    /// Witness-strength: certifies the per-entry refusal CLASSIFI-
+    /// CATION over the closed CellKeyRefusal alphabet (reason label
+    /// per variant) and sibling independence. DebuggingRecorder
+    /// snapshot exactly once (hazard ppppp).
+    #[test]
+    fn mask_refusal_is_loud_and_classified() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        let masked = metrics::with_local_recorder(&recorder, || {
+            NodeClaimPoolReconciler::decode_mask_entries(&[
+                "!!definitely-not-a-cell!!".to_string(),
+                "mid-ebs-x86:od@1234".to_string(),
+                "mid-ebs-x86:spot".to_string(),
+            ])
+        });
+        let entries = snap.snapshot().into_vec();
+        let count_for = |reason: &str| -> u64 {
+            entries
+                .iter()
+                .filter(|(k, _, _, _)| {
+                    k.key().name() == "rio_controller_nodeclaim_mask_refused_total"
+                        && k.key()
+                            .labels()
+                            .any(|l| l.key() == "reason" && l.value() == reason)
+                })
+                .map(|(_, _, _, v)| match v {
+                    DebugValue::Counter(c) => *c,
+                    _ => 0,
+                })
+                .sum()
+        };
+        assert_eq!(count_for("undecodable"), 1, "garbage entry classified");
+        assert_eq!(
+            count_for("epoch_suffixed"),
+            1,
+            "epoch-suffixed entry classified"
+        );
+        assert_eq!(
+            masked,
+            std::collections::HashSet::from([Cell("mid-ebs-x86".into(), CapacityType::Spot)]),
+            "the good sibling masks; refusals drop without poisoning it"
+        );
+    }
+
+    /// bug_050: locally-held typed Cells never round-trip through the
+    /// wire grammar --- a buffered local ICE mark masks cover with the
+    /// wire lane EMPTY (lane independence: codec drift cannot poison
+    /// the local lane; the property is carried by the TYPE --- no
+    /// string construction site remains on the local path --- and
+    /// this test asserts the behavioral half).
+    ///
+    /// Witness-strength: certifies the local lane masks independent
+    /// of the wire lane, via the production buffer path
+    /// (`PendingSchedulerEvidence::buffer_marks` -> `ice_cells`) and
+    /// the production assignment.
+    #[test]
+    fn local_ice_cells_mask_without_string_round_trip() {
+        let spot = Cell("mid-ebs-x86".into(), CapacityType::Spot);
+        let mut pending = evidence::PendingSchedulerEvidence::default();
+        pending.buffer_marks([spot.clone()]);
+
+        // The seam shape: wire lane EMPTY, local cells extended TYPED.
+        let mut masked: HashSet<Cell> = NodeClaimPoolReconciler::decode_mask_entries(&[]);
+        masked.extend(pending.ice_cells().cloned());
+        assert_eq!(masked, std::collections::HashSet::from([spot.clone()]));
+
+        // cover refuses the masked cell (intent spot-only: no
+        // failover --- silently skipped, re-evaluated next tick).
+        let term = rio_proto::types::NodeSelectorTerm {
+            match_expressions: vec![rio_proto::types::NodeSelectorRequirement {
+                key: ffd::CAPACITY_TYPE_LABEL.into(),
+                operator: "In".into(),
+                values: vec!["spot".into()],
+            }],
+        };
+        let unplaced = [SpawnIntent {
+            intent_id: "x".into(),
+            cores: 4,
+            mem_bytes: 1 << 30,
+            disk_bytes: 1 << 30,
+            ready: Some(true),
+            hw_class_names: vec!["mid-ebs-x86".into()],
+            node_affinity: vec![term],
+            ..Default::default()
+        }];
+        let (by_cell, _) = cover::assign_to_cells(
+            &unplaced,
+            &CellSketches::default(),
+            &masked,
+            cover::cell_rank,
+            |_, _| None,
+        );
+        assert!(
+            !by_cell.contains_key(&spot),
+            "a buffered local mark must mask cover with the wire lane empty"
+        );
+    }
 
     #[test]
     fn config_default() {

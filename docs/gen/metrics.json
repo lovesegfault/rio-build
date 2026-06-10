@@ -49,6 +49,7 @@
     "rio_controller_nodeclaim_lead_time_q_at_cap",
     "rio_controller_nodeclaim_lead_time_seconds",
     "rio_controller_nodeclaim_live",
+    "rio_controller_nodeclaim_mask_refused_total",
     "rio_controller_nodeclaim_reaped_total",
     "rio_controller_nodeclaim_terminating_age_max_seconds",
     "rio_controller_nodeclaim_tick_duration_seconds",
@@ -487,6 +488,11 @@
         "name": "rio_controller_nodeclaim_live",
         "kind": "gauge",
         "help": "Owned NodeClaims at the last tick by `cell` × `state`. state=registered: Registered=True AND not terminating (FFD-placeable); state=inflight: created but not yet Registered; state=terminating: metadata.deletionTimestamp set (Karpenter finalizer draining, ~60-90s; excluded from FFD placement, still in max_fleet_cores budget). Σ(registered) ≈ warm capacity; inflight stuck high = check reaped_total{reason=ice|boot-timeout}; terminating>0 with registered=0 + ffd_unplaced_cores>0 = node draining out from under a queue (cover_deficit mints the replacement next tick)."
+      },
+      {
+        "name": "rio_controller_nodeclaim_mask_refused_total",
+        "kind": "counter",
+        "help": "ICE-mask entries refused at the cover-deficit decode seam by `reason` (undecodable | epoch_suffixed); each refusal leaves its cell unmaskable — non-zero means cell-codec skew between scheduler and controller (version drift): cover may re-mint into a cell the scheduler just ICE'd until the skew is fixed."
       },
       {
         "name": "rio_controller_nodeclaim_reaped_total",
