@@ -741,7 +741,9 @@ across clusters, missing the same-cluster co-run collision it existed
 to absorb, and re-mintable under a backward clock step --- which
 merged_bug_001 closed with the typed, cluster-scoped, grid-aligned,
 monotonically-gated key this rule now requires (Q2-round5: the axis
-rides the uid FORMAT; M_047 stays frozen).
+rides the uid FORMAT; M_047 stays frozen). The cluster axis's VALUE
+distinctness across deployments --- which the typed key cannot enforce
+--- is `ctrl.informer.cluster-identity-boundary` below (bug_022).
 
 #r("ctrl.informer.exposure-drain-budget+2")[
   The pending-queue exposure sweep MUST bound each drain pass by a
@@ -769,6 +771,45 @@ permanent denominator loss the recredit rule exists to make visible
 of the keyed identity above: the aborted append is the ambiguous
 commit-or-not case, and the verbatim-requeued slice redelivers into the
 absorb.
+
+#r("ctrl.informer.cluster-identity-boundary")[
+  The cluster identity axis MUST be value-distinct across deployments
+  that share a PG: the chart MUST refuse to render an empty cluster id
+  when the external-secrets PG path (the shared-capable topology
+  declaration) is enabled, and the informer MUST disclose the
+  single-cluster default loudly at activation, so a cross-deployment
+  uid collision is constructible only past two explicit boundaries.
+]
+Presence-in-type (the `ClusterId` axis the recredit rule demands)
+cannot close VALUE distinctness: two deployments both at the empty
+default mint byte-identical `exposure::{hw}:{slot}` uids every window,
+and the scheduler's `ON CONFLICT (event_uid) DO NOTHING` absorb counts
+the loser as the designed at-most-once outcome --- silent, permanent,
+cross-deployment λ-evidence loss that no in-process check can detect
+(the colliding uids are byte-equal; the winning row's `cluster` stamp
+equals the loser's). The close is therefore LAYERED at the two
+boundaries that can act: render time --- `externalSecrets.enabled` is
+the chart's ONLY render-visible declaration of a shared-capable PG
+(release-local `postgresql.enabled` is provably unshared; the PG
+endpoint itself is Secret-borne and invisible to templates), so the
+`rio.clusterIdentity` helper `fail`s the render on the empty-id with
+external-secrets conjunction (zero blast radius: every in-tree values
+file and helm fragment leaves it disabled, while the `xtask k8s -p
+eks` path that enables it also sets `karpenter.clusterName`) --- and
+activation time, where the informer warns on the residual the chart
+cannot see (manual-secret external PG, out-of-chart installs).
+Derivation from an unforgeable per-deployment source (kube-system
+namespace UID) was REJECTED this wave: it breaks the
+one-values-expression mirror with the scheduler's `[sla].cluster` row
+stamp (fragment 39's law), needs a k8s-API identity channel the
+scheduler does not have, and re-mints dedup identity across the
+upgrade window (the frozen-M_047 cutover hazard). A controller boot
+refusal on the empty default was likewise REJECTED: empty is the
+legitimate single-cluster default mirroring the scheduler's
+`DEFAULT ''` column, and a refusal would brick every existing
+single-PG deployment. `nix/tests/helm/39-cluster-axis-single-source.sh`
+carries the render gate's planted-red leg (the gate MUST fail its
+planted fixture).
 
 #info(title: [Note])[
   The controller does NOT hold permissions for `NetworkPolicies` or

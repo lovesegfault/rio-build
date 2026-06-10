@@ -66,7 +66,13 @@ pub struct Config {
     /// the one values expression (`scheduler.sla.cluster`, falling
     /// back to `karpenter.clusterName`, then `""`) into the two TOMLs
     /// — never set them apart by hand. Empty = single-cluster default
-    /// (matches the scheduler's `DEFAULT ''` column).
+    /// (matches the scheduler's `DEFAULT ''` column). bug_022: the
+    /// default is safe ONLY while this deployment's PG is private to
+    /// it — two deployments both at `""` on one PG mint identical
+    /// uids and silently absorb each other's λ evidence; the chart
+    /// refuses to render an empty id when the external-secrets PG
+    /// path (the shared-capable topology) is enabled, and the
+    /// informer warns at activation on the empty default.
     pub cluster: String,
 }
 

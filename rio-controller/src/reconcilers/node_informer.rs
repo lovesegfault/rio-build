@@ -783,6 +783,13 @@ async fn node_hw_class(nodes: &Api<Node>, config: &HwClassConfig, name: &str) ->
 /// non-advancing flush window (`WindowGate::admit` → `None`; the gate
 /// is module-private) is the same posture: banking deferred, cursors
 /// untouched, nothing forfeited.
+///
+/// bug_022 (`ctrl.informer.cluster-identity-boundary`): startup
+/// discloses the cluster identity axis — the single-cluster default
+/// warns loudly (shared-PG absorption hazard), a non-empty id logs
+/// positively. main.rs stays the ONE `cfg.cluster` read site; the
+/// disclosure lives here because the informer is the exposure path's
+/// activation.
 pub async fn run(
     client: Client,
     config: HwClassConfig,
@@ -791,6 +798,10 @@ pub async fn run(
     cluster: ClusterId,
     shutdown: rio_common::signal::Token,
 ) {
+    // bug_022: activation disclosure FIRST — before any flush can
+    // mint a uid under an undisclosed identity.
+    disclose_cluster_identity(&cluster);
+
     let nodes: Api<Node> = Api::all(client);
 
     // merged_bug_070: process-boot epoch — the restart re-bank fence.
@@ -1502,6 +1513,42 @@ impl ClusterId {
     pub fn new(raw: &str) -> Self {
         Self(raw.trim().to_string())
     }
+
+    // r[impl ctrl.informer.cluster-identity-boundary]
+    /// bug_022: `true` iff this is the empty (post-trim)
+    /// single-cluster default — the value under which two deployments
+    /// sharing one PG mint byte-identical `exposure::{hw}:{slot}`
+    /// uids every window and silently absorb each other's
+    /// λ-denominator evidence (M_047 dedup). The predicate the
+    /// activation disclosure ([`disclose_cluster_identity`]) and the
+    /// config docs quantify over.
+    pub fn is_single_cluster_default(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+// r[impl ctrl.informer.cluster-identity-boundary]
+/// bug_022: the activation disclosure. The informer IS the exposure
+/// path's activation, and this is the only boundary present in EVERY
+/// topology — the helm `rio.clusterIdentity` render gate covers
+/// chart-driven installs where the shared-capable PG path
+/// (`externalSecrets.enabled`) is render-visible; this disclosure
+/// covers the residual the chart cannot see (manual-secret external
+/// PG, out-of-chart installs). Empty (single-cluster default) → ONE
+/// loud warn naming the cross-deployment absorption hazard;
+/// non-empty → ONE positive info disclosure, so the operator can
+/// read the live axis value off the boot log either way.
+fn disclose_cluster_identity(cluster: &ClusterId) {
+    if cluster.is_single_cluster_default() {
+        warn!(
+            "cluster identity is the single-cluster default (\"\"); exposure uids render \
+             exposure::{{hw}}:{{slot}} — if this scheduler's PG is shared with ANY other \
+             deployment, λ-denominator evidence is being silently absorbed cross-cluster \
+             (M_047); set [cluster] in controller.toml / scheduler.sla.cluster in helm"
+        );
+    } else {
+        info!(cluster = %cluster.0, "exposure uid cluster identity");
+    }
 }
 
 /// merged_bug_001: one logical exposure window — the grid slot START
@@ -1581,6 +1628,13 @@ impl WindowGate {
 /// `exposure:{hw}:{epoch}` (no dedup seam at the cut; the unshipped
 /// queue is process memory, so no pre-fix slice ever redelivers —
 /// old-format rows simply age out of the λ window).
+///
+/// bug_022: disjointness is between DISTINCT cluster values; two
+/// deployments BOTH at the empty default mint IDENTICAL uids — the
+/// shared-PG topology therefore requires distinct non-empty ids,
+/// enforced at render by the helm external-secrets gate
+/// (`rio.clusterIdentity`) and disclosed at activation by the
+/// informer warn ([`disclose_cluster_identity`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EventUid(String);
 
@@ -1882,6 +1936,109 @@ mod tests {
             wd,
         );
         assert_eq!(qd[0].uid.as_str(), "exposure::mid-ebs-x86:1767225600");
+    }
+
+    /// `MakeWriter` into a shared buffer (the rio-common task.rs
+    /// pattern) — `fmt::TestWriter` goes to stdout, no good for
+    /// asserting on the emitted bytes.
+    #[derive(Clone, Default)]
+    struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Capture the lines `f` emits through a scoped JSON subscriber
+    /// (drop-guard local — no global recorder races).
+    fn captured_lines(f: impl FnOnce()) -> Vec<String> {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let buf = LogBuf::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(buf.clone()),
+        );
+        let guard = tracing::subscriber::set_default(subscriber);
+        f();
+        drop(guard);
+        let bytes = std::mem::take(&mut *buf.0.lock().unwrap());
+        String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(String::from)
+            .collect()
+    }
+
+    // r[verify ctrl.informer.cluster-identity-boundary]
+    /// bug_022 red R-F: the activation disclosure EMITS — exactly one
+    /// WARN naming the single-cluster default at `ClusterId::new("")`,
+    /// and zero WARNs + one positive INFO carrying the axis value at a
+    /// non-empty id. Recorded red (strawman disclosure site present
+    /// but empty — pre-fix the informer emitted NOTHING at
+    /// activation): `panic: expected warn line not emitted; captured:
+    /// []`. Certifies: the disclosure duty itself, at emission — not
+    /// a classification proxy.
+    #[test]
+    fn informer_activation_warns_on_single_cluster_default() {
+        let lines = captured_lines(|| disclose_cluster_identity(&ClusterId::new("")));
+        let warns: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("\"WARN\"") && l.contains("single-cluster default"))
+            .collect();
+        assert_eq!(
+            warns.len(),
+            1,
+            "expected warn line not emitted; captured: {lines:?}"
+        );
+
+        let lines = captured_lines(|| disclose_cluster_identity(&ClusterId::new("prod-eu")));
+        assert!(
+            !lines.iter().any(|l| l.contains("\"WARN\"")),
+            "non-empty id must not warn; captured: {lines:?}"
+        );
+        let infos: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("\"INFO\"") && l.contains("prod-eu"))
+            .collect();
+        assert_eq!(
+            infos.len(),
+            1,
+            "positive disclosure must carry the axis value; captured: {lines:?}"
+        );
+    }
+
+    // r[verify ctrl.informer.cluster-identity-boundary]
+    /// bug_022 red R-G: the predicate the warn and the docs quantify
+    /// over — empty and whitespace-only ids are the single-cluster
+    /// default (trim law pinned); non-empty ids are not. Recorded red
+    /// (new surface, disclosed): `error[E0599]: no method named
+    /// `is_single_cluster_default` found for struct
+    /// `node_informer::ClusterId``.
+    #[test]
+    fn cluster_id_classifies_the_default() {
+        assert!(ClusterId::new("").is_single_cluster_default());
+        assert!(
+            ClusterId::new("  ").is_single_cluster_default(),
+            "trim law: whitespace-only normalizes to the default"
+        );
+        assert!(!ClusterId::new("prod-eu").is_single_cluster_default());
+        assert!(
+            !ClusterId::new(" prod-eu ").is_single_cluster_default(),
+            "trim law: padding does not change a real id's class"
+        );
     }
 
     // r[verify ctrl.informer.exposure-recredit+3]

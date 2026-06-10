@@ -72,3 +72,7 @@ metrics-util = { workspace = true }
 # C2 formal-delta proptest planes (candidate-set equivalence; wedge
 # evidence laws).
 proptest = { workspace = true }
+# Captured-subscriber emission witnesses (bug_022: the informer's
+# cluster-identity activation disclosure asserts WARN/INFO lines, not
+# a classification proxy).
+tracing-subscriber = { workspace = true }
