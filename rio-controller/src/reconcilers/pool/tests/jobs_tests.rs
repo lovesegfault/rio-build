@@ -2996,6 +2996,55 @@ fn older_close_does_not_erase_newer_deaths() {
     );
 }
 
+// r[verify sec.executor.identity-token+3]
+/// live_053 / D-053-1 red (owner-signed, 2026-06-10): an ERRING token
+/// mint spawns NOTHING this tick. PROPOSITION CERTIFIED: through the
+/// production transport-failure shape (dead channel — the same
+/// timeout class as the live 134s scheduler stall that expired the 5s
+/// mint RPC twice and launched 257 unauthenticatable-by-construction
+/// builders), `mint_spawn_tokens` returns None — no token witness —
+/// and the reconcile spawn match's None arm is `Vec::new()` with
+/// `spawn_for_each` structurally unreachable from it (the coupling is
+/// the typed match at the single consumer), so zero Jobs are created
+/// and the intents stay queued scheduler-side (no Job, no ack). The
+/// keyless-dev and empty-set arms stay on the Some path (parity
+/// pinned below).
+#[tokio::test]
+async fn erring_token_mint_spawns_nothing_this_tick() {
+    use crate::reconcilers::pool::jobs::mint_spawn_tokens;
+    use std::collections::HashMap;
+
+    // Production-shaped transport failure: the admin channel is dead
+    // (connect_lazy to a closed port — every RPC errs like a
+    // timeout/unavailable, the live shape).
+    let (client, _verifier) = ApiServerVerifier::new();
+    let ctx = super::test_ctx(client.clone());
+
+    let intents = vec![intent_named("tok1"), intent_named("tok2")];
+    let tokens = mint_spawn_tokens(&ctx, "p", &intents).await;
+    assert!(
+        tokens.is_none(),
+        "left: Some(empty) — the erring mint read as a token-less \
+         spawn authorization (257 dead builders) / right: None — no \
+         witness, no spawn this tick"
+    );
+
+    // Parity legs: an EMPTY spawn set never round-trips (Some(empty)),
+    // and a healthy keyless scheduler answers Some (the MockAdmin
+    // default stub = the keyless scheduler's empty-map answer).
+    let empty = mint_spawn_tokens(&ctx, "p", &[]).await;
+    assert_eq!(empty, Some(HashMap::new()), "empty set skips the RPC");
+    let (client2, _v2) = ApiServerVerifier::new();
+    let (ctx2, _mock, _h) = ctx_with_mock_admin(client2).await;
+    let healthy = mint_spawn_tokens(&ctx2, "p", &intents).await;
+    assert_eq!(
+        healthy,
+        Some(HashMap::new()),
+        "keyless dev parity: Ok(empty map) rides the Some arm and \
+         spawns token-less exactly as before"
+    );
+}
+
 // r[verify ctrl.pool.respawn-backoff+2]
 /// merged_bug_036 overflow red: a wire `closed_age_secs` near
 /// u64::MAX must saturate, never wrap — a wrapped tiny age INVERTS

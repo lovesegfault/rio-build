@@ -945,64 +945,62 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // it via `GetSpawnIntents`), so the credential lives here, not on
     // the intent. One RPC per reconcile per pool, only for the
     // headroom-truncated set the controller is about to create Jobs
-    // for. Empty `to_spawn_intents` skips the round-trip; on RPC
-    // failure pods spawn without a token (dev-mode parity — the
-    // builder omits the header, scheduler rejects under HMAC mode, pod
-    // idle-exits, next tick re-spawns). intent_ids the scheduler no
-    // longer recognizes (drv left Ready between the two calls) are
-    // omitted from the map → same fail-safe.
-    let executor_tokens: HashMap<String, String> = if to_spawn_intents.is_empty() {
-        HashMap::new()
-    } else {
-        match admin_call(
-            ctx.admin
-                .clone()
-                .mint_executor_tokens(rio_proto::types::MintExecutorTokensRequest {
-                    intent_ids: to_spawn_intents
-                        .iter()
-                        .map(|i| i.intent_id.clone())
-                        .collect(),
-                }),
-        )
-        .await
-        {
-            Ok(r) => r.into_inner().tokens,
-            Err(e) => {
-                warn!(
-                    pool = %name, error = %e,
-                    "mint_executor_tokens failed; spawning without tokens this tick"
-                );
-                HashMap::new()
-            }
-        }
-    };
+    // for. Empty `to_spawn_intents` skips the round-trip. intent_ids
+    // the scheduler no longer recognizes (drv left Ready between the
+    // two calls) are omitted from the map → those pods spawn
+    // token-less, the HMAC verifier rejects the pull, the pod exits,
+    // next tick re-spawns (the benign per-intent race, documented at
+    // the scheduler mint).
+    //
+    // live_053 / D-053-1 (owner-signed, 2026-06-10): an ERRING mint is
+    // FAIL-CLOSED — `None` means no token evidence exists, and a spawn
+    // cannot consume a witness that was never minted (the
+    // durable-witness-coupling law). The retired fail-open arm spawned
+    // whole token-less batches that are unauthenticatable BY
+    // CONSTRUCTION under HMAC: 257 builders died in one night when a
+    // 134s scheduler stall expired the 5s mint RPC twice. Skipping the
+    // tick keeps the intents queued scheduler-side (no Job, no ack, no
+    // dispatched_cells entry) — one tick of spawn latency instead of a
+    // guaranteed-dead batch. Dev-mode parity holds WITHOUT a knob: a
+    // keyless scheduler answers Ok with an EMPTY map (the actor mint
+    // returns empty when `hmac_signer` is None), so dev flows through
+    // the Ok arm and spawns token-less exactly as before — the Err arm
+    // is transport failure in every mode.
+    let executor_tokens = mint_spawn_tokens(ctx, &name, &to_spawn_intents).await;
 
     // One pod per intent with that intent's resources + annotation.
     // Headroom truncates; the remainder is picked up next tick after
     // `active` decreases. Under mandatory `[sla]` (Phase 5) the
     // scheduler ALWAYS populates intents — empty list means empty
     // queue → spawns nothing.
-    let spawned = spawn_for_each(
-        &jobs_api,
-        &to_spawn_intents,
-        &existing_names,
-        &name,
-        |intent| {
-            build_job(
-                pool,
-                oref.clone(),
-                &ctx.scheduler,
-                &ctx.store,
-                &ctx.hw_config,
-                intent,
-                executor_tokens.get(&intent.intent_id).map(String::as_str),
-                &hw_sampled,
-                ctx.hw_bench_mem_floor,
-                ctx.placeable.is_some() && ctx.kube_build_scheduler_enabled,
+    let spawned = match &executor_tokens {
+        Some(executor_tokens) => {
+            spawn_for_each(
+                &jobs_api,
+                &to_spawn_intents,
+                &existing_names,
+                &name,
+                |intent| {
+                    build_job(
+                        pool,
+                        oref.clone(),
+                        &ctx.scheduler,
+                        &ctx.store,
+                        &ctx.hw_config,
+                        intent,
+                        executor_tokens.get(&intent.intent_id).map(String::as_str),
+                        &hw_sampled,
+                        ctx.hw_bench_mem_floor,
+                        ctx.placeable.is_some() && ctx.kube_build_scheduler_enabled,
+                    )
+                },
             )
-        },
-    )
-    .await;
+            .await
+        }
+        // live_053 / D-053-1: no token evidence — zero spawns this
+        // tick; the already-Pending re-ack path below still runs.
+        None => Vec::new(),
+    };
     // r[impl ctrl.pool.ack-spawned-soundness]
     // Ack to the scheduler so it records `dispatched_cells` for intents
     // that have a Pending Job — both newly spawned AND already-Pending-
@@ -1193,6 +1191,52 @@ fn intent_suffix(intent_id: &str) -> String {
 ///     the pod's `job-tracking` finalizer is still live (same
 ///     reasoning as `reap_excess_pending`).
 ///
+/// live_053 / D-053-1 (owner-signed, 2026-06-10): the spawn-token
+/// mint outcome. `Some(map)` is the token WITNESS a spawn may consume
+/// (an empty map = keyless dev mode, or the per-intent
+/// scheduler-omitted race — both documented at the scheduler mint);
+/// `None` = the mint RPC FAILED and no token evidence exists — the
+/// single consumer (the reconcile spawn match) MUST spawn nothing
+/// this tick (fail-closed: the durable-witness-coupling law — a
+/// spawn cannot consume a witness that was never minted). The
+/// retired fail-open arm spawned whole token-less batches that are
+/// unauthenticatable BY CONSTRUCTION under HMAC: 257 builders died
+/// in one night when a 134s scheduler stall expired the 5s mint RPC
+/// twice. Skipping keeps the intents queued scheduler-side (no Job,
+/// no ack, no dispatched_cells entry) — one tick of spawn latency
+/// instead of a guaranteed-dead batch. Dev-mode parity holds WITHOUT
+/// a knob: a keyless scheduler answers Ok with an EMPTY map, so dev
+/// rides the Some arm; the Err arm is transport failure in every
+/// mode.
+// r[impl sec.executor.identity-token+3]
+pub(super) async fn mint_spawn_tokens(
+    ctx: &Ctx,
+    pool: &str,
+    to_spawn: &[SpawnIntent],
+) -> Option<HashMap<String, String>> {
+    if to_spawn.is_empty() {
+        return Some(HashMap::new());
+    }
+    match admin_call(ctx.admin.clone().mint_executor_tokens(
+        rio_proto::types::MintExecutorTokensRequest {
+            intent_ids: to_spawn.iter().map(|i| i.intent_id.clone()).collect(),
+        },
+    ))
+    .await
+    {
+        Ok(r) => Some(r.into_inner().tokens),
+        Err(e) => {
+            warn!(
+                pool, error = %e,
+                "mint_executor_tokens failed; skipping this tick's spawns \
+                 (fail-closed: a token-less batch is dead on arrival under \
+                 HMAC; intents stay queued and re-present next tick)"
+            );
+            None
+        }
+    }
+}
+
 /// live_051(e): per-Job-uid stale-classification strikes — the
 /// two-tick confirmation on the attempt-affecting reap arms
 /// (`terminal`/`selector-drift`). The first tick a Job classifies
