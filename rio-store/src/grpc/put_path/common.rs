@@ -90,14 +90,14 @@ const _: () = assert!(
 #[derive(Debug, Clone, Copy)]
 pub struct NarIngestEnvelopeCfg {
     /// Bound on a single charged chunk-acquire wait
-    /// ([`BUDGET_WAIT_GRACE`]).
+    /// (`BUDGET_WAIT_GRACE`).
     pub budget_wait_grace: Duration,
     /// Stall window the ingest hold envelope derives its grace from
     /// (`NAR_HOLD_GRACE_FACTOR ×` this; the substitute plane's
     /// default window is the one authority).
     pub hold_stall_window: Duration,
     /// Floor decompressed-throughput for the ingest hold envelope
-    /// ([`crate::substitute::NAR_HOLD_FLOOR_RATE`], bytes/second).
+    /// (`crate::substitute::NAR_HOLD_FLOOR_RATE`, bytes/second).
     pub hold_floor_rate: u64,
 }
 

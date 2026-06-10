@@ -1356,7 +1356,7 @@
       "name": "HoldDeadlineExceeded",
       "crate": "rio-store",
       "msg": "nar-budget hold exceeded its transfer deadline ({declared} declared bytes, {hold_budget:?} hold budget); aborted",
-      "doc": "A NAR-budget hold outlived its typed transfer-deadline envelope ([`NarHoldEnvelope`]): the leg held budget permits past `NarHoldEnvelope`'s deadline (grace + byte-basis at the floor rate) without completing. The per-read stall clock cannot see this shape — an adversarial trickle (or a black-holed persist) satisfies every per-read window while pinning the pool indefinitely. Returned as `Err` so moka does NOT cache it; the reservation is credited back by drop on the return path, so a parked sibling's whole-NAR head is granted within the residual holder bounds. `hold_budget` is the envelope's derived total (operator-meaningful; the raw deadline instant is not)."
+      "doc": "A NAR-budget hold outlived its typed transfer-deadline envelope (`NarHoldEnvelope`): the leg held budget permits past `NarHoldEnvelope`'s deadline (grace + byte-basis at the floor rate) without completing. The per-read stall clock cannot see this shape — an adversarial trickle (or a black-holed persist) satisfies every per-read window while pinning the pool indefinitely. Returned as `Err` so moka does NOT cache it; the reservation is credited back by drop on the return path, so a parked sibling's whole-NAR head is granted within the residual holder bounds. `hold_budget` is the envelope's derived total (operator-meaningful; the raw deadline instant is not)."
     },
     {
       "enum": "SubstituteError",
@@ -1405,7 +1405,7 @@
       "name": "TenantBudgetExhausted",
       "crate": "rio-store",
       "msg": "tenant nar-budget reservation cap reached ({cap} bytes outstanding); retry",
-      "doc": "The tenant's AGGREGATE outstanding reservation charge would exceed [`TENANT_RESERVATION_CAP`] — the budget law's COST axis: substitution charge is declaration-priced (a hostile upstream's lies cost nothing to make), so per-tenant accounting refuses at the constructor instead of letting one tenant's declarations pin the shared pool. Typed REFUSAL, never queueing — returned as `Err` so moka does NOT cache it; the executor's retry machinery absorbs it once earlier reservations drain."
+      "doc": "The tenant's AGGREGATE outstanding reservation charge would exceed `TENANT_RESERVATION_CAP` — the budget law's COST axis: substitution charge is declaration-priced (a hostile upstream's lies cost nothing to make), so per-tenant accounting refuses at the constructor instead of letting one tenant's declarations pin the shared pool. Typed REFUSAL, never queueing — returned as `Err` so moka does NOT cache it; the executor's retry machinery absorbs it once earlier reservations drain."
     },
     {
       "enum": "SubstituteError",

@@ -239,7 +239,7 @@ pub enum SubstituteError {
     Stalled { window: Duration },
 
     /// A NAR-budget hold outlived its typed transfer-deadline envelope
-    /// ([`NarHoldEnvelope`]): the leg held budget permits
+    /// (`NarHoldEnvelope`): the leg held budget permits
     /// past `NarHoldEnvelope`'s deadline (grace + byte-basis at the
     /// floor rate) without completing. The per-read stall clock cannot
     /// see this shape — an adversarial trickle (or a black-holed
@@ -259,7 +259,7 @@ pub enum SubstituteError {
     },
 
     /// The tenant's AGGREGATE outstanding reservation charge would
-    /// exceed [`TENANT_RESERVATION_CAP`] — the budget law's COST axis:
+    /// exceed `TENANT_RESERVATION_CAP` — the budget law's COST axis:
     /// substitution charge is declaration-priced (a hostile upstream's
     /// lies cost nothing to make), so per-tenant accounting refuses at
     /// the constructor instead of letting one tenant's declarations
@@ -655,7 +655,7 @@ const _: () = assert!(MAX_NAR_SIZE - 1 <= u32::MAX as u64);
 
 /// Floor decompressed-throughput axis of the NAR-hold envelope
 /// (bytes/second). Derivation: a holder's transfer-time allowance is
-/// `bytes_basis / NAR_HOLD_FLOOR_RATE` on top of [`NAR_HOLD_GRACE`]'s
+/// `bytes_basis / NAR_HOLD_FLOOR_RATE` on top of the grace term's
 /// fixed grace — at 256 KiB/s a `4 GiB − 1` declaration yields a
 /// ≈ 4.55 h ceiling, while an honest mirror sustaining ≥ 1 MiB/s
 /// clears with ≥ 4× margin. The ghc-binary rationale (the HTTP client
@@ -1142,7 +1142,7 @@ impl Substituter {
     }
 
     /// Override the NAR-hold envelope's floor decompressed-throughput
-    /// ([`NAR_HOLD_FLOOR_RATE`], bytes/second). Builder-style — the
+    /// (`NAR_HOLD_FLOOR_RATE`, bytes/second). Builder-style — the
     /// R17 violability lane: tests shrink the envelope so the
     /// hold-deadline aborts are exercisable in seconds, and the
     /// violation red (`hold_envelope_floor_rate_binds`) proves the
@@ -1153,7 +1153,7 @@ impl Substituter {
     }
 
     /// Override the per-tenant aggregate reservation cap
-    /// ([`TENANT_RESERVATION_CAP`]). Builder-style — the R17
+    /// (`TENANT_RESERVATION_CAP`). Builder-style — the R17
     /// violability lane: the violation red (`tenant_cap_binds`)
     /// proves the knob binds by flipping it.
     pub fn with_tenant_reservation_cap(mut self, cap: u64) -> Self {
