@@ -335,11 +335,23 @@ pub fn assign_to_cells<'a>(
     (by_cell, outcomes)
 }
 
-/// Cell ranking for [`assign_to_cells`]' cheapest-open pick: spot
-/// before on-demand (always cheaper), then alphabetical hw-class
-/// (stable tie-break). The scheduler's per-intent `dispatched_cells`
-/// already encodes its CostTable ranking, so this is only the
-/// disambiguator when an intent's `A_open` has multiple unmasked cells.
+/// Cell ranking for [`assign_to_cells`]' cheapest-open pick:
+/// capacity-major (spot in `[0, 0.5)` before on-demand in `[1, 1.5)` —
+/// spot is always cheaper), then a stable NAME-HASH fractional
+/// tiebreak within the band (the wrapping-mul fold below — NOT
+/// alphabetical; "hi-ebs-x86" ranks before "hi-ebs-x86-g7" because of
+/// its hash, not its spelling). The scheduler's per-intent
+/// `dispatched_cells` already encodes its CostTable ranking, so this
+/// is only the disambiguator when an intent's `A_open` has multiple
+/// unmasked cells.
+///
+/// live_050(c): under the capacity-degradation ladder this REALIZES
+/// the walk order over the intent's hosting closure — the declared
+/// `ladder` is membership authority only (option (a)); the order an
+/// intent actually advances through its rungs is THIS ranking over
+/// the unmasked closure cells: capacity-major, then the hash
+/// disambiguator within a band. Generation-blind by construction (the
+/// generation axis lives in the rung CLASSES, not in this fn).
 pub fn cell_rank(c: &Cell) -> f64 {
     let cap = match c.1 {
         CapacityType::Spot => 0.0,
@@ -1265,6 +1277,147 @@ mod tests {
             "outcome carries the pre-mask rung count: {:?}",
             o[0].1
         );
+    }
+
+    /// live_050(c) — the capacity-ladder walk battery (the ASSIGNED
+    /// half of W7-E's chosen→assigned composition; the chosen half is
+    /// the scheduler's `rung_one_ice_advances_to_a_different_rung`).
+    /// Universe = the shipped hi-band ladder pair under the committed
+    /// od-only posture: `("hi-ebs-x86", od)` + `("hi-ebs-x86-g7", od)`
+    /// — the closure cells a ladder'd intent carries on the wire.
+    ///
+    /// W7-E' (R5' — the unmasked-preference witness the masked reds
+    /// cannot certify): a fresh intent with ZERO masks is assigned the
+    /// REALIZED rung-1 — `cell_rank` argmin over the closure. Pinned
+    /// LITERAL, independently derived (not the impl as its own
+    /// oracle): rank = cap + hash(name)/u64::MAX × 0.5 with
+    /// hash = fold(h×31 + byte); hash("hi-ebs-x86") =
+    /// 2840604882467283 → od rank ≈ 1.000077; hash("hi-ebs-x86-g7") =
+    /// 10837483758744667882 → od rank ≈ 1.293751 — the gen-8 parent
+    /// ranks first (verified for all four shipped hi pairs; the
+    /// realized within-band order is hash-determined, recorded in the
+    /// `ctrl.nodeclaim.capacity-ladder` rationale).
+    // r[verify ctrl.nodeclaim.capacity-ladder]
+    #[test]
+    fn fresh_intent_prefers_realized_rung_one() {
+        let cells = [
+            ("hi-ebs-x86", CapacityType::OnDemand),
+            ("hi-ebs-x86-g7", CapacityType::OnDemand),
+        ];
+        let unplaced = [intent("x", 4, GI, &cells, Some(true))];
+        let (by, o) = assign_to_cells(
+            &unplaced,
+            &CellSketches::default(),
+            &HashSet::new(),
+            cell_rank,
+            |_, _| None,
+        );
+        let rung_one = Cell("hi-ebs-x86".into(), CapacityType::OnDemand);
+        assert_eq!(
+            by[&rung_one].len(),
+            1,
+            "zero masks ⇒ the realized rung-1 (gen-8 parent, od) is chosen"
+        );
+        assert!(matches!(o[0].1, PlacementOutcome::Placed(_)));
+    }
+
+    /// W7-F (the no-hard-starvation theorem over the rung census) +
+    /// R6 (all-rungs-masked is LOUD, composing WO-S7-3's alphabet):
+    /// every rung masked EXCEPT the last ⇒ placement on the last rung;
+    /// ALL rungs masked ⇒ `UnplaceableAllMasked` counted — never a
+    /// silent hang. Pre-fix (no ladder) the universe had a single
+    /// rung: the gen-7 cell did not exist to advance to (R5's left).
+    // r[verify ctrl.nodeclaim.capacity-ladder]
+    #[test]
+    fn every_rung_masked_except_last_places_on_last() {
+        let cells = [
+            ("hi-ebs-x86", CapacityType::OnDemand),
+            ("hi-ebs-x86-g7", CapacityType::OnDemand),
+        ];
+        let unplaced = [intent("x", 4, GI, &cells, Some(true))];
+        let parent = Cell("hi-ebs-x86".into(), CapacityType::OnDemand);
+        let rung = Cell("hi-ebs-x86-g7".into(), CapacityType::OnDemand);
+        // Rung-1 masked ⇒ the walk advances to the last rung.
+        let masked: HashSet<Cell> = [parent.clone()].into();
+        let (by, o) = assign_to_cells(
+            &unplaced,
+            &CellSketches::default(),
+            &masked,
+            cell_rank,
+            |_, _| None,
+        );
+        assert!(!by.contains_key(&parent));
+        assert_eq!(by[&rung].len(), 1, "last unmasked rung hosts the intent");
+        assert_eq!(DropTally::from_outcomes(&o), DropTally::default());
+        // ALL rungs masked ⇒ loud, never silent (R6).
+        let masked: HashSet<Cell> = [parent, rung].into();
+        let (by, o) = assign_to_cells(
+            &unplaced,
+            &CellSketches::default(),
+            &masked,
+            cell_rank,
+            |_, _| None,
+        );
+        assert!(by.is_empty());
+        assert_eq!(
+            DropTally::from_outcomes(&o),
+            DropTally {
+                ready_all_cells_ice_masked: 1,
+                ..Default::default()
+            },
+            "all-rungs-masked surfaces as the counted ready-all-masked \
+             outcome (live_050(a) alphabet), never a silent hang"
+        );
+        assert!(matches!(
+            o[0].1,
+            PlacementOutcome::UnplaceableAllMasked { open_rungs: 2 }
+        ));
+    }
+
+    /// W7-G's reachability half (R15): every declared rung is the
+    /// chosen cell under SOME mask configuration — product-iterated
+    /// FROM the closure universe (mask everything except rung r, for
+    /// each r), not author rows. Universe rows are the four shipped
+    /// hi-band ladder pairs under the committed od-only posture
+    /// (membership pinned against the shipped values by the scheduler-
+    /// side `shipped_values_cell_universe_census`; the [GEN-SET]
+    /// derivation command is in the commit body).
+    // r[verify ctrl.nodeclaim.capacity-ladder]
+    #[test]
+    fn declared_rung_reachability_census() {
+        for (parent, rung) in [
+            ("hi-nvme-x86", "hi-nvme-x86-g7"),
+            ("hi-nvme-arm", "hi-nvme-arm-g7"),
+            ("hi-ebs-x86", "hi-ebs-x86-g7"),
+            ("hi-ebs-arm", "hi-ebs-arm-g7"),
+        ] {
+            let cells = [
+                (parent, CapacityType::OnDemand),
+                (rung, CapacityType::OnDemand),
+            ];
+            let unplaced = [intent("x", 4, GI, &cells, Some(true))];
+            let universe: Vec<Cell> = cells
+                .iter()
+                .map(|(h, cap)| Cell((*h).into(), *cap))
+                .collect();
+            for target in &universe {
+                let masked: HashSet<Cell> =
+                    universe.iter().filter(|c| *c != target).cloned().collect();
+                let (by, _) = assign_to_cells(
+                    &unplaced,
+                    &CellSketches::default(),
+                    &masked,
+                    cell_rank,
+                    |_, _| None,
+                );
+                assert_eq!(
+                    by[target].len(),
+                    1,
+                    "rung {target:?} of ladder ({parent} → {rung}) is \
+                     reachable as the chosen cell"
+                );
+            }
+        }
     }
 
     /// Cold-start: `hw_class_names=[]` → routed via `fallback`.

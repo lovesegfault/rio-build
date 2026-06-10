@@ -1360,6 +1360,53 @@ looped Ready forever until operators cancelled the builds. The verdict
 budget and poison consumption are scheduler-side
 (`scheduler.sla.ceiling.stale-solve-revalidation`).
 
+#r("ctrl.nodeclaim.capacity-ladder")[
+  A hw-class's capacity-degradation ladder MUST be declared as typed
+  config — rung-sibling class references over the (capacity-type ×
+  instance-generation) product, every rung a declared hw-class row —
+  and the declared rungs MUST derive the class's hosting closure: an
+  intent solved into a ladder'd class carries the rungs'
+  hosting-valid `(class × capacity)` cells in `hw_class_names`,
+  membership independent of the cost deadband. Unfulfillable evidence
+  (ICE marks, the #rref("ctrl.nodeclaim.ice-mark-clear") plane) MUST
+  advance the walk to a different unmasked rung, and hard starvation
+  MUST be impossible while any rung has LAUNCHABLE capacity — every
+  rung masked except the last places on the last; all rungs masked
+  surfaces as the counted `UnplaceableAllMasked` outcome
+  (#rref("ctrl.nodeclaim.placement-outcome")), never a silent hang.
+  "Has capacity" means launchable at the class's derived ceiling
+  (the `scheduler.sla.ceiling.catalog-derived` launchability law) and
+  revalidated at emission (the
+  `scheduler.sla.ceiling.stale-solve-revalidation` law), never bare
+  API existence.
+]
+Rationale: the §5-S graceful-degradation directive ("the system
+shouldn't hang just because there isn't spot capacity … degrade
+gracefully to using gen7 and so on"), typed. live_050's hi band was a
+single-rung supply universe on the generation axis — gen-8-only
+classes, so the 512/704 hang had no rung to advance to. The ladder is
+MEMBERSHIP authority only (the recorded option-(a) form): the realized
+walk ORDER is derived from cost — capacity-major (the controller's
+`cell_rank`: spot in `[0, 0.5)` before od in `[1, 1.5)`), then the
+name-hash disambiguator within a band, because the scheduler's seed
+prices are capacity-type-only (`seed_price`, sla/cost.rs) and
+`cell_rank` is generation-blind — a declared-order quantifier would be
+unwitnessed (no machinery executes it). Under the committed hi od-only
+posture the realized order is gen8:od → gen7:od for all four shipped
+pairs (hash-verified: `hash("hi-ebs-x86") ≈ 2.84e15` ranks before
+`hash("hi-ebs-x86-g7") ≈ 1.08e19`; same direction for the nvme/arm
+pairs) — capacity-major and generation-major coincide; the within-band
+order is tiebreak-determined and re-derives per name. Per-rung price
+posture: od rungs are a PRICED availability trade, signed by the
+directive; lead-time seeds exist for every pre-existing class×capacity
+row, and NEW rung classes carry PLACEHOLDER seeds derived from their
+gen-8 parents' od rows until `probe-boot` re-runs — the helm/18
+seed-coverage lint structurally refuses an unseeded cell, so the gap
+cannot ship silent (execution superseded the authoring-time
+"ride `defaultLeadTimeSeed`" line; divergence recorded). Rung-advance
+latency ≤ one IceBackoff step + one tick (the backoff ladder's own
+consts, sla/cost.rs cite-only).
+
 #r("ctrl.nodeclaim.placeable-gate+5")[
   For Builder pools, the Pool reconciler creates Jobs only for intents the
   nodeclaim_pool reconciler's last FFD simulation placed on a `Registered=True`

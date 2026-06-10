@@ -131,6 +131,12 @@ tokio = { workspace = true, features = ["test-util"] }
 rio-store = { workspace = true, features = ["test-utils"] }
 rio-test-support = { workspace = true }
 tracing-test = { workspace = true }
+# live_050(c): the shipped-values cell-universe census
+# (sla/config.rs::shipped_values_cell_universe_census) parses
+# infra/helm values.yaml in-test so the supply-cell membership and the
+# ladder closure are pinned against the CHART, not a transcription.
+# Same YAML stack as xtask (workspace dep; zero new lockfile roots).
+serde-saphyr = { workspace = true }
 # parameterized test tables — collapses ~60 hand-rolled test clusters
 # (poison/ca-compare/resource-floor/cache-hit matrices) in actor/tests/.
 # default-features off: we don't need the `async-timeout` feature

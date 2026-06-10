@@ -103,6 +103,13 @@ max_fleet_cores = {{ int64 . }}
 {{- with $def.capacityTypes }}
 capacity_types = {{ toJson . }}
 {{- end }}
+{{- /* live_050(c): typed capacity-degradation ladder — rung-sibling
+       class references (ctrl.nodeclaim.capacity-ladder). Single-line
+       inline table (TOML inline tables must not span lines). Only
+       emitted when set — absent parses as serde `None`. */}}
+{{- with $def.ladder }}
+ladder = { rungs = [{{ range $i, $r := .rungs }}{{ if $i }}, {{ end }}{ class = {{ $r.class | quote }} }{{ end }}] }
+{{- end }}
 {{- end }}
 
 [sla.probe]

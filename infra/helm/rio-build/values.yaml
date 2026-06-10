@@ -621,8 +621,38 @@ scheduler:
     # → catalog wins; catalog absent (static cost source / fetch
     # failure) → global.
     hwClasses:
+      # live_050(c) — the hi band's graceful-degradation posture
+      # (ctrl.nodeclaim.capacity-ladder):
+      # - `capacityTypes: [on-demand]` is the rev-2 live-override
+      #   content COMMITTED as the chart default (pending-the-ladder
+      #   posture: gen-8 spot ICEd live, 512/704 hang). Spot
+      #   re-admission for the hi band is a one-row owner-signed flip
+      #   gated on the ladder walk's live validation — NOT part of
+      #   this change.
+      # - `ladder.rungs` names each class's generation-rung sibling
+      #   (`*-g7`, declared below the hi parents). The ladder is
+      #   MEMBERSHIP authority only: rungs join the intent's hosting
+      #   closure (hw_class_names); the realized walk order is
+      #   derived from cost — capacity-major, then the cell_rank
+      #   name-hash within a band. Under the od-only posture the
+      #   realized hi order is gen8:od -> gen7:od (hash-verified for
+      #   all four pairs; see the capacity-ladder rule rationale).
+      # - The g7 siblings carry `hw-band: hi-g7` (NOT `hi`): the
+      #   controller's match_node walks class conjunctions
+      #   lexicographic-first-match, so a sibling whose labels
+      #   superset the parent's would mis-attribute g7 Nodes to the
+      #   gen-8 class (hw_perf factor pollution). A distinct band
+      #   value keeps both conjunctions exact with zero edits to the
+      #   parents' live labels.
+      # - New rung classes carry PLACEHOLDER leadTimeSeed rows
+      #   (parent-derived; see the seed map) until `xtask k8s
+      #   probe-boot` is re-run — helm/18 refuses an unseeded cell.
       hi-nvme-x86:
         nodeClass: rio-nvme
+        capacityTypes: [on-demand]
+        ladder:
+          rungs:
+            - {class: hi-nvme-x86-g7}
         labels:
           - {key: rio.build/hw-band, value: hi}
           - {key: rio.build/storage, value: nvme}
@@ -634,6 +664,10 @@ scheduler:
           - {key: karpenter.k8s.aws/instance-local-nvme, operator: Gt, values: ["0"]}
       hi-nvme-arm:
         nodeClass: rio-nvme
+        capacityTypes: [on-demand]
+        ladder:
+          rungs:
+            - {class: hi-nvme-arm-g7}
         labels:
           - {key: rio.build/hw-band, value: hi}
           - {key: rio.build/storage, value: nvme}
@@ -645,6 +679,10 @@ scheduler:
           - {key: karpenter.k8s.aws/instance-local-nvme, operator: Gt, values: ["0"]}
       hi-ebs-x86:
         nodeClass: rio-default
+        capacityTypes: [on-demand]
+        ladder:
+          rungs:
+            - {class: hi-ebs-x86-g7}
         labels:
           - {key: rio.build/hw-band, value: hi}
           - {key: rio.build/storage, value: ebs}
@@ -655,6 +693,10 @@ scheduler:
           - {key: kubernetes.io/arch, operator: In, values: [amd64]}
       hi-ebs-arm:
         nodeClass: rio-default
+        capacityTypes: [on-demand]
+        ladder:
+          rungs:
+            - {class: hi-ebs-arm-g7}
         labels:
           - {key: rio.build/hw-band, value: hi}
           - {key: rio.build/storage, value: ebs}
@@ -662,6 +704,59 @@ scheduler:
         requirements:
           - {key: karpenter.k8s.aws/instance-category, operator: In, values: [c, m, r]}
           - {key: karpenter.k8s.aws/instance-generation, operator: In, values: ["8"]}
+          - {key: kubernetes.io/arch, operator: In, values: [arm64]}
+      # live_050(c): generation-rung siblings for the hi band (the
+      # ladder rungs declared above). Full class rows by design — the
+      # rung IS a class: its catalog ceiling, labels, taints, and
+      # capacity types all come from here, and the cell universe grows
+      # through the existing class x capacity product. gen-7 c/m/r,
+      # same storage/arch split as the parents; od-only under the same
+      # committed posture.
+      hi-nvme-x86-g7:
+        nodeClass: rio-nvme
+        capacityTypes: [on-demand]
+        labels:
+          - {key: rio.build/hw-band, value: hi-g7}
+          - {key: rio.build/storage, value: nvme}
+          - {key: kubernetes.io/arch, value: amd64}
+        requirements:
+          - {key: karpenter.k8s.aws/instance-category, operator: In, values: [c, m, r]}
+          - {key: karpenter.k8s.aws/instance-generation, operator: In, values: ["7"]}
+          - {key: kubernetes.io/arch, operator: In, values: [amd64]}
+          - {key: karpenter.k8s.aws/instance-local-nvme, operator: Gt, values: ["0"]}
+      hi-nvme-arm-g7:
+        nodeClass: rio-nvme
+        capacityTypes: [on-demand]
+        labels:
+          - {key: rio.build/hw-band, value: hi-g7}
+          - {key: rio.build/storage, value: nvme}
+          - {key: kubernetes.io/arch, value: arm64}
+        requirements:
+          - {key: karpenter.k8s.aws/instance-category, operator: In, values: [c, m, r]}
+          - {key: karpenter.k8s.aws/instance-generation, operator: In, values: ["7"]}
+          - {key: kubernetes.io/arch, operator: In, values: [arm64]}
+          - {key: karpenter.k8s.aws/instance-local-nvme, operator: Gt, values: ["0"]}
+      hi-ebs-x86-g7:
+        nodeClass: rio-default
+        capacityTypes: [on-demand]
+        labels:
+          - {key: rio.build/hw-band, value: hi-g7}
+          - {key: rio.build/storage, value: ebs}
+          - {key: kubernetes.io/arch, value: amd64}
+        requirements:
+          - {key: karpenter.k8s.aws/instance-category, operator: In, values: [c, m, r]}
+          - {key: karpenter.k8s.aws/instance-generation, operator: In, values: ["7"]}
+          - {key: kubernetes.io/arch, operator: In, values: [amd64]}
+      hi-ebs-arm-g7:
+        nodeClass: rio-default
+        capacityTypes: [on-demand]
+        labels:
+          - {key: rio.build/hw-band, value: hi-g7}
+          - {key: rio.build/storage, value: ebs}
+          - {key: kubernetes.io/arch, value: arm64}
+        requirements:
+          - {key: karpenter.k8s.aws/instance-category, operator: In, values: [c, m, r]}
+          - {key: karpenter.k8s.aws/instance-generation, operator: In, values: ["7"]}
           - {key: kubernetes.io/arch, operator: In, values: [arm64]}
       mid-nvme-x86:
         nodeClass: rio-nvme
@@ -873,12 +968,21 @@ scheduler:
     leadTimeSeed:
       "hi-ebs-arm:od": 17.0
       "hi-ebs-arm:spot": 18.0
+      # live_050(c) g7 rung cells — PLACEHOLDER seeds pending an
+      # `xtask k8s probe-boot` re-run (helm/18 refuses an unseeded
+      # cell; the metal/fetcher rows are the precedent). Value =
+      # the gen-8 parent's od seed: same nodeClass, same virtualized
+      # boot path — generation does not move the ~18s kubelet boot.
+      "hi-ebs-arm-g7:od": 17.0
       "hi-ebs-x86:od": 16.0
       "hi-ebs-x86:spot": 17.0
+      "hi-ebs-x86-g7:od": 16.0
       "hi-nvme-arm:od": 17.0
       "hi-nvme-arm:spot": 17.0
+      "hi-nvme-arm-g7:od": 17.0
       "hi-nvme-x86:od": 18.0
       "hi-nvme-x86:spot": 18.0
+      "hi-nvme-x86-g7:od": 18.0
       "lo-ebs-arm:od": 20.0
       "lo-ebs-arm:spot": 19.0
       "lo-ebs-x86:od": 17.0

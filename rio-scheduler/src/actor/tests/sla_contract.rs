@@ -4523,3 +4523,143 @@ async fn acked_vanish_mark_masks_spot_and_solve_buys_od() {
          capacity types: {caps:?}"
     );
 }
+
+// r[verify ctrl.nodeclaim.capacity-ladder]
+/// W7-E (R5 — the WO-S7-5 advance red): certifies *rung-1 cells
+/// ICE'd through the WO-S7-4 evidence path (production `cell_wire`
+/// marks via `handle_ack_spawned_intents`, epoch > `last_applied`)
+/// ⇒ the next emission carries a STRICTLY DIFFERENT unmasked rung —
+/// every unmasked cell's class+capacity ∉ rung-1's coordinates* — the
+/// chosen→assigned half of W7-D's failover chain (the assigned half
+/// is the controller's `assign_to_cells` walk, cover.rs W7-F battery).
+///
+/// The fixture stays at the DEFAULT cost tolerance: the cap-only seed
+/// ratio (od/spot ≈ 2.86) keeps od cells OUTSIDE the admissible set,
+/// so pre-fix a spot-wide ICE leaves the emission with ZERO unmasked
+/// cells (`A \ masked = ∅` → the full-A fallback re-emits the masked
+/// spot cells) — the live_050 starved shape. The ladder's hosting
+/// closure is deadband-INDEPENDENT membership: the rung's od cell is
+/// in `hw_class_names` from the FIRST emission (membership, not a
+/// mask-triggered special case) without widening τ, and once the spot
+/// plane is iced it is the walk's advance target.
+#[tokio::test]
+async fn rung_one_ice_advances_to_a_different_rung() {
+    use crate::sla::config::{CapacityLadder, LadderRung};
+    use rio_common::cell_wire::{EvidenceEpoch, WireCapacity, encode_cell_event};
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw_builders_only(db.pool.clone());
+    // The generation-rung sibling: a full class row (ceilings, labels,
+    // capacity types all its own) + the parent's ladder naming it.
+    let rung_def = {
+        let mut d = actor.sla_config.hw_classes["intel-8"].clone();
+        d.labels[0].value = "intel-8r7".into();
+        d
+    };
+    actor
+        .sla_config
+        .hw_classes
+        .insert("intel-8r7".into(), rung_def);
+    actor
+        .sla_config
+        .hw_classes
+        .get_mut("intel-8")
+        .unwrap()
+        .ladder = Some(CapacityLadder {
+        rungs: vec![LadderRung {
+            class: "intel-8r7".into(),
+        }],
+    });
+    actor.test_inject_ready("d0", Some("test-pkg"), "x86_64-linux", false);
+
+    let cells_of = |i: &rio_proto::types::SpawnIntent| -> Vec<(String, String)> {
+        i.hw_class_names
+            .iter()
+            .cloned()
+            .zip(i.node_affinity.iter().map(|t| {
+                t.match_expressions
+                    .iter()
+                    .find(|r| r.key == "karpenter.sh/capacity-type")
+                    .and_then(|r| r.values.first().cloned())
+                    .expect("every emitted cell carries the capacity term")
+            }))
+            .collect()
+    };
+    // Pre-mask: the solve's admissible set is spot-plane only (od is
+    // ≈2.86× the cap-only spot seed — outside the default deadband);
+    // the closure ADDS the declared rung's od cell as membership.
+    // rung-1 (the realized first rungs, capacity-major) = the spot
+    // cells.
+    let snap = actor.compute_spawn_intents(&Default::default());
+    let intent = snap
+        .intents
+        .iter()
+        .find(|i| i.intent_id == "d0")
+        .expect("d0 emitted")
+        .clone();
+    let rung_one: Vec<(String, String)> = cells_of(&intent)
+        .into_iter()
+        .filter(|(_, cap)| cap == "spot")
+        .collect();
+    assert!(
+        !rung_one.is_empty(),
+        "precondition: the solve admitted spot cells: {:?}",
+        cells_of(&intent)
+    );
+    assert!(
+        cells_of(&intent).contains(&("intel-8r7".into(), "on-demand".into())),
+        "the closure carries the rung od cell from the FIRST emission \
+         (membership, not a mask reaction): {:?}",
+        cells_of(&intent)
+    );
+
+    // Rung-1 ICE'd: every spot cell marked through the production
+    // codec (the WO-S7-4 evidence path — the leg-B convention of
+    // W7-D).
+    let marks: Vec<String> = ["intel-6", "intel-7", "intel-8", "intel-8r7"]
+        .iter()
+        .map(|h| encode_cell_event(h, WireCapacity::Spot, Some(EvidenceEpoch(1))))
+        .collect();
+    actor
+        .handle_ack_spawned_intents(&[], &marks, &[], &[], &[], None)
+        .expect("applied under leadership");
+
+    // The advance: the next emission's UNMASKED set is non-empty and
+    // every unmasked cell differs from every rung-1 coordinate —
+    // specifically the declared rung's od cell, which the deadband
+    // refused and the closure admitted. Pre-fix left (reverse-strawman
+    // transcript in the commit body): unmasked == [] — the emission
+    // re-offers only the masked spot cells and the intent starves.
+    let snap2 = actor.compute_spawn_intents(&Default::default());
+    let intent2 = snap2
+        .intents
+        .iter()
+        .find(|i| i.intent_id == "d0")
+        .expect("d0 re-emitted")
+        .clone();
+    let masked: std::collections::HashSet<(String, String)> = snap2
+        .ice_masked_cells
+        .iter()
+        .map(|s| {
+            let (h, cap) = crate::sla::config::parse_cell(s).expect("snapshot cell decodes");
+            (h, cap.label().to_string())
+        })
+        .collect();
+    let unmasked: Vec<(String, String)> = cells_of(&intent2)
+        .into_iter()
+        .filter(|c| !masked.contains(c))
+        .collect();
+    assert!(
+        !unmasked.is_empty(),
+        "the walk has an unmasked rung to advance to (pre-fix: empty)"
+    );
+    assert!(
+        unmasked.iter().all(|c| !rung_one.contains(c)),
+        "every unmasked cell is a STRICTLY DIFFERENT rung (class+capacity \
+         ∉ rung-1 {rung_one:?}): {unmasked:?}"
+    );
+    assert!(
+        unmasked.contains(&("intel-8r7".into(), "on-demand".into())),
+        "the declared rung's od cell is in the closure: {unmasked:?}"
+    );
+}

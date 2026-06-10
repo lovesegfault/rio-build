@@ -20760,6 +20760,10 @@
           "packageId": "rstest"
         },
         {
+          "name": "serde-saphyr",
+          "packageId": "serde-saphyr"
+        },
+        {
           "name": "tokio",
           "packageId": "tokio"
         },

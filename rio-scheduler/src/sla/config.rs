@@ -130,6 +130,19 @@ pub struct HwClassDef {
     /// would cause. Default `[Spot, Od]` (both).
     #[serde(default = "default_capacity_types")]
     pub capacity_types: Vec<CapacityType>,
+    /// live_050(c): typed capacity-degradation ladder. Names the
+    /// sibling classes (generation rungs, e.g. `hi-ebs-x86-g7` under
+    /// `hi-ebs-x86`) that join this class's HOSTING CLOSURE — every
+    /// intent solved into this class also carries the rung classes'
+    /// cells in `hw_class_names`, so ICE evidence on this class's
+    /// cells leaves the walk somewhere to advance TO. Membership
+    /// authority ONLY: the realized walk ORDER is derived from cost
+    /// (capacity-major, then price; name-hash disambiguator within a
+    /// band — the controller's `cell_rank`). `None` ⇒ no ladder
+    /// (single-rung class, today's shape for mid/lo/metal/fetcher).
+    /// Unrelated to `[sla].ladder_budget` (the explore-ladder budget).
+    #[serde(default)]
+    pub ladder: Option<CapacityLadder>,
 }
 
 fn default_capacity_types() -> Vec<CapacityType> {
@@ -152,8 +165,45 @@ impl Default for HwClassDef {
             provides_features: Vec::new(),
             max_fleet_cores: None,
             capacity_types: default_capacity_types(),
+            ladder: None,
         }
     }
+}
+
+// r[impl ctrl.nodeclaim.capacity-ladder]
+/// live_050(c) — the §5-S graceful-degradation directive's typed form.
+/// An ordered list of generation-rung sibling classes for one
+/// hw-class. The rungs derive the class's hosting closure
+/// ([`SlaConfig::retain_hosting_cells`] adds each rung's hosting-valid
+/// `(class × capacity_types)` cells to every emitted intent), so the
+/// existing IceBackoff mask-walk + cost ranking can ADVANCE to a rung
+/// when this class's own cells are unfulfillable, instead of starving.
+///
+/// MEMBERSHIP authority only (the recorded option-(a) form): the
+/// declared order is documentation of operator intent; the realized
+/// walk order is derived from cost — capacity-major (spot before od),
+/// then price, with the controller's `cell_rank` name-hash as the
+/// within-band disambiguator. Declaring a rung here never reorders the
+/// walk; it guarantees the rung is IN it.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CapacityLadder {
+    /// Rung-sibling classes, most-preferred first (operator intent;
+    /// see the type doc for what order does and does not govern).
+    /// `validate_shape` rejects an empty list, an undeclared class, a
+    /// self-rung, and duplicates.
+    pub rungs: Vec<LadderRung>,
+}
+
+/// One rung of a [`CapacityLadder`]: a reference to a declared sibling
+/// hw-class (e.g. the gen-7 twin of a gen-8 class). A struct (not a
+/// bare string) so future per-rung axes land as fields, not a parallel
+/// encoding.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LadderRung {
+    /// Key into `[sla.hw_classes]` — must resolve (`validate_shape`).
+    pub class: HwClassName,
 }
 
 /// `{key, value, effect}` Node taint. Same shape as k8s
@@ -787,7 +837,37 @@ impl SlaConfig {
         // / FFD `agnostic` arch=None pass-through (r35 B1: featured
         // arch-unmappable intents route by feature alone there too).
         let want_arch = rio_common::k8s::system_to_k8s_arch(system);
-        cells
+        // ONE hosting predicate for the two passes below (producer
+        // validation, then ladder-rung expansion) so the closure can
+        // never admit a cell the strip would refuse. `None` ⇔ unknown
+        // class. Per-axis booleans + the class ceiling are returned so
+        // the producer pass can attribute its strip warn.
+        let hosts = |h: &HwClassName, cap: &CapacityType| {
+            let d = self.hw_classes.get(h)?;
+            // Arch: class label `kubernetes.io/arch` matches OR is
+            // absent (arch-agnostic class hosts any arch).
+            let arch_ok = want_arch.is_none_or(|a| {
+                d.labels
+                    .iter()
+                    .find(|l| l.key == ARCH_LABEL)
+                    .is_none_or(|l| l.value == a)
+            });
+            // §13c D10: FULL bidirectional features_compatible (NOT
+            // half-predicate `provides⊄required` — that misses
+            // `required=[kvm], provides=[]` because ∅⊆anything).
+            let feat_ok = features_compatible(required_features, &d.provides_features);
+            // Size: per-class ceiling (catalog ∩ cfg ∩ global).
+            let (cc, cm) = self.class_ceilings(h, catalog, global);
+            let size_ok = cores <= cc && mem <= cm;
+            // Capacity-type: an od-only class structurally never
+            // hosts a `(h, Spot)` cell. The producer paths (`solve_
+            // full` over `cost.cells`, the `Some(cap)` bypass)
+            // SHOULD emit only configured caps — this is the
+            // backstop. (mb_033)
+            let cap_ok = d.capacity_types.contains(cap);
+            Some((arch_ok, feat_ok, size_ok, cap_ok, (cc, cm)))
+        };
+        let mut out: Vec<Cell> = cells
             .into_iter()
             .filter(|(h, cap)| {
                 // Unknown class → no per-class constraint on ANY axis
@@ -798,35 +878,15 @@ impl SlaConfig {
                 // gate it can't evaluate. Calling `features_compatible
                 // (_, provides_for(unknown)=[])` would wrongly strip
                 // kvm intents on unknown classes.
-                let Some(d) = self.hw_classes.get(h) else {
+                let Some((arch_ok, feat_ok, size_ok, cap_ok, class_cap)) = hosts(h, cap) else {
                     return true;
                 };
-                // Arch: class label `kubernetes.io/arch` matches OR is
-                // absent (arch-agnostic class hosts any arch).
-                let arch_ok = want_arch.is_none_or(|a| {
-                    d.labels
-                        .iter()
-                        .find(|l| l.key == ARCH_LABEL)
-                        .is_none_or(|l| l.value == a)
-                });
-                // §13c D10: FULL bidirectional features_compatible (NOT
-                // half-predicate `provides⊄required` — that misses
-                // `required=[kvm], provides=[]` because ∅⊆anything).
-                let feat_ok = features_compatible(required_features, &d.provides_features);
-                // Size: per-class ceiling (catalog ∩ cfg ∩ global).
-                let (cc, cm) = self.class_ceilings(h, catalog, global);
-                let size_ok = cores <= cc && mem <= cm;
-                // Capacity-type: an od-only class structurally never
-                // hosts a `(h, Spot)` cell. The producer paths (`solve_
-                // full` over `cost.cells`, the `Some(cap)` bypass)
-                // SHOULD emit only configured caps — this is the
-                // backstop. (mb_033)
-                let cap_ok = d.capacity_types.contains(cap);
                 let ok = arch_ok && feat_ok && size_ok && cap_ok;
                 if !ok {
                     tracing::warn!(
-                        %h, ?cap, cores, mem, class_cap = ?(cc, cm),
-                        ?required_features, provides = ?d.provides_features,
+                        %h, ?cap, cores, mem, ?class_cap,
+                        ?required_features,
+                        provides = ?self.provides_for(h),
                         ?want_arch, arch_ok, feat_ok, size_ok, cap_ok,
                         "hw_class cell stripped at post-finalize chokepoint — \
                          producer-path arch/feature/size/cap-filter regressed?"
@@ -834,7 +894,45 @@ impl SlaConfig {
                 }
                 ok
             })
-            .collect()
+            .collect();
+        // r[impl ctrl.nodeclaim.capacity-ladder]
+        // live_050(c) — the hosting-closure derivation (one mint site,
+        // every consumer derives): each retained class's declared
+        // ladder rungs join the closure as `(rung × rung.capacity_
+        // types)` cells, gated by the SAME hosting predicate as the
+        // producer cells. A rung failing the predicate is SKIPPED
+        // quietly (an unhostable rung is not a rung — e.g. the demand
+        // exceeds the rung's smaller catalog ceiling); only PRODUCER
+        // cells warn on strip, preserving the regression-signal
+        // contract above. Membership is deadband-independent by
+        // design: the solve's admissible set prices the walk, the
+        // ladder guarantees the walk has rungs — otherwise a price
+        // gap > τ would silently strand the intent on a single rung
+        // and ICE evidence would have nowhere to advance it (the
+        // live_050 hang's structural exposure). Derived from RETAINED
+        // classes only (a stripped producer cell is already a
+        // regression signal, not a closure seed). Deterministic append
+        // order: retained-cell order × declared-rung order × the
+        // class's capacity_types order; dedup against everything
+        // already present.
+        let parents: Vec<HwClassName> = out.iter().map(|(h, _)| h.clone()).collect();
+        for parent in parents {
+            let Some(ladder) = self.hw_classes.get(&parent).and_then(|d| d.ladder.as_ref()) else {
+                continue;
+            };
+            for rung in &ladder.rungs {
+                for cap in self.capacity_types_for(&rung.class) {
+                    let cell = (rung.class.clone(), *cap);
+                    if out.contains(&cell) {
+                        continue;
+                    }
+                    if hosts(&rung.class, cap).is_some_and(|(a, f, s, c, _)| a && f && s && c) {
+                        out.push(cell);
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// §13c-3: resolve the effective global `(max_cores, max_mem)`
@@ -935,6 +1033,7 @@ impl SlaConfig {
                     provides_features: vec![],
                     max_fleet_cores: None,
                     capacity_types: default_capacity_types(),
+                    ladder: None,
                 },
             )]),
             hw_cost_tolerance: default_hw_cost_tolerance(),
@@ -1187,6 +1286,40 @@ impl SlaConfig {
                     l.key
                 );
             }
+            // live_050(c): ladder shape. A declared ladder whose rungs
+            // don't resolve is a dangling hosting closure — the intent
+            // would name a class no informer/catalog row backs.
+            // Rejecting at boot keeps the closure derivation
+            // (`retain_hosting_cells`) total over declared classes.
+            if let Some(ladder) = &def.ladder {
+                anyhow::ensure!(
+                    !ladder.rungs.is_empty(),
+                    "sla.hwClasses[{h}].ladder.rungs must be non-empty — \
+                     remove the `ladder` key for a single-rung class"
+                );
+                let mut seen = std::collections::HashSet::new();
+                for r in &ladder.rungs {
+                    anyhow::ensure!(
+                        r.class != *h,
+                        "sla.hwClasses[{h}].ladder names itself as a rung — \
+                         a class is always its own first rung; declare only \
+                         the degradation siblings"
+                    );
+                    anyhow::ensure!(
+                        self.hw_classes.contains_key(&r.class),
+                        "sla.hwClasses[{h}].ladder rung {:?} not in \
+                         sla.hwClasses — every rung must be a declared \
+                         hw-class (the rung IS a class row: ceilings, \
+                         labels, and capacity types all come from it)",
+                        r.class
+                    );
+                    anyhow::ensure!(
+                        seen.insert(&r.class),
+                        "sla.hwClasses[{h}].ladder rung {:?} declared twice",
+                        r.class
+                    );
+                }
+            }
         }
         anyhow::ensure!(
             !self.hw_classes.is_empty(),
@@ -1392,6 +1525,7 @@ mod tests {
             provides_features: vec![],
             max_fleet_cores: None,
             capacity_types: default_capacity_types(),
+            ladder: None,
         }
     }
 
@@ -1678,6 +1812,103 @@ mod tests {
             38.0
         );
         validate_both(&sla).unwrap();
+    }
+
+    /// live_050(c): the capacity-degradation ladder is TYPED config —
+    /// a `ladder = { rungs = [{ class = "..." }] }` row on a hw-class
+    /// parses into the closed `CapacityLadder` shape and validates.
+    /// Pre-fix red (run verbatim at aa1ba4371): the field did not
+    /// exist and `deny_unknown_fields` refused the TOML — `unknown
+    /// field `ladder`, expected one of `labels`, `requirements`, …` —
+    /// the absence pin for the R7/R5' strawman disclosures.
+    // r[verify ctrl.nodeclaim.capacity-ladder]
+    #[test]
+    fn ladder_declares_typed_rungs_in_config() {
+        let toml = r#"
+            tiers = [{ name = "normal" }]
+            default_tier = "normal"
+            max_cores = 64.0
+            max_mem = 1
+            max_disk = 1
+            default_disk = 1
+            hw_cost_tolerance = 0.15
+            hw_explore_epsilon = 0.02
+            hw_cost_source = "static"
+            reference_hw_class = "intel-8"
+            [probe]
+            cpu = 4.0
+            mem_per_core = 1
+            mem_base = 1
+            [hw_classes.intel-8]
+            labels = [{ key = "rio.build/hw-band", value = "hi" }]
+            requirements = [
+              { key = "karpenter.k8s.aws/instance-generation", operator = "In", values = ["8"] },
+            ]
+            node_class = "rio-default"
+            ladder = { rungs = [{ class = "intel-7" }] }
+            [hw_classes.intel-7]
+            labels = [{ key = "rio.build/hw-band", value = "hi-g7" }]
+            requirements = [
+              { key = "karpenter.k8s.aws/instance-generation", operator = "In", values = ["7"] },
+            ]
+            node_class = "rio-default"
+        "#;
+        let sla: SlaConfig = toml::from_str(toml).unwrap();
+        let ladder = sla.hw_classes["intel-8"].ladder.as_ref().unwrap();
+        assert_eq!(
+            ladder.rungs,
+            vec![LadderRung {
+                class: "intel-7".into()
+            }]
+        );
+        assert!(
+            sla.hw_classes["intel-7"].ladder.is_none(),
+            "absent key parses as None (single-rung class)"
+        );
+        sla.validate_shape().unwrap();
+    }
+
+    /// R7 (the ladder-shape violation reds): a ladder naming an
+    /// undeclared class, an empty rung list, a self-rung, or a
+    /// duplicate rung is REJECTED at validate with a typed error.
+    /// Pre-fix the field cannot parse at all (the absence pin above).
+    // r[verify ctrl.nodeclaim.capacity-ladder]
+    #[test]
+    fn ladder_shape_violations_rejected_at_validate() {
+        let rungs_of = |classes: &[&str]| {
+            Some(CapacityLadder {
+                rungs: classes
+                    .iter()
+                    .map(|c| LadderRung { class: (*c).into() })
+                    .collect(),
+            })
+        };
+        // Undeclared rung class.
+        let mut cfg = base();
+        cfg.hw_classes.insert("parent".into(), test_def("k", "v"));
+        cfg.hw_classes.get_mut("parent").unwrap().ladder = rungs_of(&["ghost-rung"]);
+        let err = validate_both(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("ghost-rung") && err.contains("not in"),
+            "undeclared rung names the dangling class: {err}"
+        );
+        // Empty rung list.
+        cfg.hw_classes.get_mut("parent").unwrap().ladder = Some(CapacityLadder { rungs: vec![] });
+        let err = validate_both(&cfg).unwrap_err().to_string();
+        assert!(err.contains("non-empty"), "{err}");
+        // Self-rung.
+        cfg.hw_classes.get_mut("parent").unwrap().ladder = rungs_of(&["parent"]);
+        let err = validate_both(&cfg).unwrap_err().to_string();
+        assert!(err.contains("names itself"), "{err}");
+        // Duplicate rung.
+        cfg.hw_classes.insert("rung-a".into(), test_def("k2", "v2"));
+        cfg.hw_classes.get_mut("parent").unwrap().ladder = rungs_of(&["rung-a", "rung-a"]);
+        let err = validate_both(&cfg).unwrap_err().to_string();
+        assert!(err.contains("declared twice"), "{err}");
+        // Positive control: a resolving, deduped, non-self ladder
+        // passes.
+        cfg.hw_classes.get_mut("parent").unwrap().ladder = rungs_of(&["rung-a"]);
+        validate_both(&cfg).unwrap();
     }
 
     /// bug_038: `c7a.xlarge` (dot) booted cleanly, then every
@@ -2552,6 +2783,490 @@ mod tests {
             (256u32, 256u64 << 30),
         );
         assert!(kept.is_empty());
+    }
+
+    /// live_050(c) — the hosting-closure derivation. Certifies: *a
+    /// retained class's declared ladder rungs join the closure as
+    /// `(rung × rung.capacity_types)` cells, deadband-independent,
+    /// deduped, gated by the SAME hosting predicate as producer
+    /// cells.* The membership half of W7-E (the scheduler side of the
+    /// walk: the closure is what the emitted intent CAN advance to).
+    // r[verify ctrl.nodeclaim.capacity-ladder]
+    #[test]
+    fn ladder_rungs_join_the_hosting_closure() {
+        let cat = super::super::catalog::CatalogCeilings::new();
+        let mut cfg = base();
+        let mut parent = test_def("rio.build/hw-band", "hi");
+        parent.ladder = Some(CapacityLadder {
+            rungs: vec![LadderRung {
+                class: "parent-g7".into(),
+            }],
+        });
+        // Rung class is od-only: the closure must follow the RUNG's
+        // capacity_types, not the parent's.
+        let mut rung = test_def("rio.build/hw-band", "hi-g7");
+        rung.capacity_types = vec![CapacityType::Od];
+        cfg.hw_classes = HashMap::from([("parent".into(), parent), ("parent-g7".into(), rung)]);
+        let kept = cfg.retain_hosting_cells(
+            vec![
+                ("parent".into(), CapacityType::Spot),
+                ("parent".into(), CapacityType::Od),
+            ],
+            "x86_64-linux",
+            (1, 0),
+            &[],
+            &cat,
+            base_global(),
+        );
+        assert_eq!(
+            kept,
+            vec![
+                ("parent".into(), CapacityType::Spot),
+                ("parent".into(), CapacityType::Od),
+                ("parent-g7".into(), CapacityType::Od),
+            ],
+            "rung joins with ITS capacity types only ((parent-g7, spot) \
+             not minted for an od-only rung); producer cells unchanged \
+             and first"
+        );
+        // Dedup: a producer that already emitted the rung cell (e.g.
+        // the deadband admitted it) does not get a duplicate.
+        let kept = cfg.retain_hosting_cells(
+            vec![
+                ("parent".into(), CapacityType::Od),
+                ("parent-g7".into(), CapacityType::Od),
+            ],
+            "x86_64-linux",
+            (1, 0),
+            &[],
+            &cat,
+            base_global(),
+        );
+        assert_eq!(
+            kept,
+            vec![
+                ("parent".into(), CapacityType::Od),
+                ("parent-g7".into(), CapacityType::Od),
+            ],
+            "already-present rung cell not duplicated"
+        );
+    }
+
+    /// Kill-isolation for the closure: a rung that fails the hosting
+    /// predicate on ANY axis (size / arch / features) is skipped
+    /// QUIETLY — an unhostable rung is not a rung. The closure can
+    /// never admit a cell the producer strip would refuse.
+    // r[verify ctrl.nodeclaim.capacity-ladder]
+    #[test]
+    fn ladder_rung_outside_its_envelope_not_added() {
+        let cat = super::super::catalog::CatalogCeilings::new();
+        let mut cfg = base();
+        cfg.max_cores = Some(256.0);
+        let mut parent = test_def("rio.build/hw-band", "hi");
+        parent.max_cores = Some(128);
+        parent.ladder = Some(CapacityLadder {
+            rungs: vec![
+                LadderRung {
+                    class: "small-rung".into(),
+                },
+                LadderRung {
+                    class: "arm-rung".into(),
+                },
+                LadderRung {
+                    class: "kvm-rung".into(),
+                },
+            ],
+        });
+        // Size: rung ceiling 32 < demand 48.
+        let mut small = test_def("rio.build/hw-band", "g7");
+        small.max_cores = Some(32);
+        // Arch: arm rung for an x86 intent.
+        let mut arm = test_def("rio.build/hw-band", "g7");
+        arm.labels.push(NodeLabelMatch {
+            key: ARCH_LABEL.into(),
+            value: "arm64".into(),
+        });
+        // Features: kvm-providing rung for a featureless intent.
+        let kvm = test_def_provides("rio.build/hw-band", "g7", &["kvm"]);
+        cfg.hw_classes = HashMap::from([
+            ("parent".into(), parent),
+            ("small-rung".into(), small),
+            ("arm-rung".into(), arm),
+            ("kvm-rung".into(), kvm),
+        ]);
+        let kept = cfg.retain_hosting_cells(
+            vec![("parent".into(), CapacityType::Od)],
+            "x86_64-linux",
+            (48, 0),
+            &[],
+            &cat,
+            (256u32, 256u64 << 30),
+        );
+        assert_eq!(
+            kept,
+            vec![("parent".into(), CapacityType::Od)],
+            "size-, arch-, and feature-incompatible rungs all skipped"
+        );
+    }
+
+    /// Regression pin (the quiet edge): a config with NO ladders
+    /// leaves `retain_hosting_cells` byte-identical to the pre-ladder
+    /// behavior — the closure derivation is inert for single-rung
+    /// classes. (The pre-fix tree IS this behavior; the reverse-
+    /// strawman transcript for R5 shows the wired closure's absence.)
+    // r[verify ctrl.nodeclaim.capacity-ladder]
+    #[test]
+    fn no_ladder_leaves_closure_unchanged() {
+        let cat = super::super::catalog::CatalogCeilings::new();
+        let mut cfg = base();
+        cfg.hw_classes = HashMap::from([
+            ("a".into(), test_def("k", "a")),
+            ("b".into(), test_def("k", "b")),
+        ]);
+        let cells = vec![
+            ("a".into(), CapacityType::Spot),
+            ("b".into(), CapacityType::Od),
+        ];
+        let kept = cfg.retain_hosting_cells(
+            cells.clone(),
+            "x86_64-linux",
+            (1, 0),
+            &[],
+            &cat,
+            base_global(),
+        );
+        assert_eq!(kept, cells, "no ladder ⇒ closure == producer cells");
+    }
+
+    /// Option-(a) AGREEMENT census (R15): the ladder field is
+    /// MEMBERSHIP authority; the ranking machinery executes over
+    /// exactly that membership. Product-iterates every declared
+    /// (parent, rung) pair FROM the parsed config alphabet and asserts
+    /// closure == producer ∪ (rung × rung.capacity_types ∩ hosting) —
+    /// one authority, never two unchecked ones for one walk.
+    // r[verify ctrl.nodeclaim.capacity-ladder]
+    #[test]
+    fn ladder_membership_agreement_census() {
+        let cat = super::super::catalog::CatalogCeilings::new();
+        let mut cfg = base();
+        let mut p1 = test_def("rio.build/hw-band", "hi");
+        p1.ladder = Some(CapacityLadder {
+            rungs: vec![LadderRung { class: "r1".into() }],
+        });
+        let mut p2 = test_def("rio.build/hw-band", "lo");
+        p2.ladder = Some(CapacityLadder {
+            rungs: vec![
+                LadderRung { class: "r1".into() },
+                LadderRung { class: "r2".into() },
+            ],
+        });
+        let mut r2 = test_def("rio.build/hw-band", "lo-g6");
+        r2.capacity_types = vec![CapacityType::Od];
+        cfg.hw_classes = HashMap::from([
+            ("p1".into(), p1),
+            ("p2".into(), p2),
+            ("r1".into(), test_def("rio.build/hw-band", "g7")),
+            ("r2".into(), r2),
+        ]);
+        cfg.reference_hw_class = "p1".into();
+        validate_both(&cfg).unwrap();
+        // Census rows derive from the parsed alphabet, not author rows.
+        for (parent, def) in cfg.hw_classes.iter().filter(|(_, d)| d.ladder.is_some()) {
+            let producer = vec![(parent.clone(), CapacityType::Od)];
+            let kept = cfg.retain_hosting_cells(
+                producer.clone(),
+                "x86_64-linux",
+                (1, 0),
+                &[],
+                &cat,
+                base_global(),
+            );
+            let mut expect = producer;
+            for rung in &def.ladder.as_ref().unwrap().rungs {
+                for cap in cfg.capacity_types_for(&rung.class) {
+                    let cell = (rung.class.clone(), *cap);
+                    if !expect.contains(&cell) {
+                        expect.push(cell);
+                    }
+                }
+            }
+            assert_eq!(
+                kept, expect,
+                "closure({parent}) == declared membership × rung capacity types"
+            );
+        }
+    }
+
+    /// The cell-config census [GEN-SET] (R15; W7-G's totality half):
+    /// derives the FULL supply-cell universe from the SHIPPED helm
+    /// values — `scheduler.sla.hwClasses` parsed in-test (serde-saphyr,
+    /// the workspace YAML stack) — as classes × capacityTypes (absent
+    /// ⇒ [spot, on-demand]) + the declared ladder edges, and pins it
+    /// against the committed expectation (the generator's own output
+    /// at this commit; generating command in the commit body). Fails
+    /// on ANY membership drift — closure tomorrow, not completeness
+    /// today. Then the STRONG half: the parsed rows are assembled into
+    /// the production `SlaConfig`, `validate_shape` must accept the
+    /// shipped chart (every rung resolves, every seed row keys a
+    /// class), and the closure law re-derives every declared ladder
+    /// edge through `retain_hosting_cells` — the shipped values and
+    /// the Rust laws cannot drift apart silently.
+    // r[verify ctrl.nodeclaim.capacity-ladder]
+    #[test]
+    fn shipped_values_cell_universe_census() {
+        #[derive(serde::Deserialize)]
+        struct Root {
+            scheduler: SchedV,
+        }
+        #[derive(serde::Deserialize)]
+        struct SchedV {
+            sla: SlaV,
+        }
+        #[derive(serde::Deserialize)]
+        struct SlaV {
+            #[serde(rename = "hwClasses")]
+            hw_classes: std::collections::BTreeMap<String, ClassV>,
+            #[serde(rename = "referenceHwClass")]
+            reference_hw_class: String,
+            #[serde(rename = "leadTimeSeed")]
+            lead_time_seed: std::collections::BTreeMap<String, f64>,
+            #[serde(rename = "maxLeadTime")]
+            max_lead_time: f64,
+        }
+        #[derive(serde::Deserialize)]
+        struct ClassV {
+            #[serde(rename = "nodeClass")]
+            node_class: String,
+            labels: Vec<KvV>,
+            requirements: Vec<ReqV>,
+            #[serde(rename = "capacityTypes")]
+            capacity_types: Option<Vec<String>>,
+            ladder: Option<LadderV>,
+            #[serde(rename = "providesFeatures")]
+            provides_features: Option<Vec<String>>,
+            #[serde(rename = "maxCores")]
+            max_cores: Option<u32>,
+            #[serde(rename = "maxMem")]
+            max_mem: Option<u64>,
+            #[serde(rename = "maxFleetCores")]
+            _max_fleet_cores: Option<u32>,
+            taints: Option<Vec<TaintV>>,
+        }
+        #[derive(serde::Deserialize)]
+        struct KvV {
+            key: String,
+            value: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct ReqV {
+            key: String,
+            operator: String,
+            values: Option<Vec<String>>,
+        }
+        #[derive(serde::Deserialize)]
+        struct LadderV {
+            rungs: Vec<RungV>,
+        }
+        #[derive(serde::Deserialize)]
+        struct RungV {
+            class: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct TaintV {
+            key: String,
+            value: String,
+            effect: String,
+        }
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../infra/helm/rio-build/values.yaml"
+        );
+        let body = std::fs::read_to_string(path).expect("shipped values readable");
+        let root: Root = serde_saphyr::from_str(&body).expect("shipped values parse");
+        let sla_v = root.scheduler.sla;
+
+        // 1) The derived universe == the committed [GEN-SET] expectation.
+        let mut cells: Vec<String> = Vec::new();
+        let mut edges: Vec<String> = Vec::new();
+        for (h, d) in &sla_v.hw_classes {
+            let caps = d
+                .capacity_types
+                .clone()
+                .unwrap_or_else(|| vec!["spot".into(), "on-demand".into()]);
+            for c in &caps {
+                cells.push(format!("{h}:{c}"));
+            }
+            if let Some(l) = &d.ladder {
+                for r in &l.rungs {
+                    edges.push(format!("{h} -> {}", r.class));
+                }
+            }
+        }
+        let expect_cells: Vec<&str> = vec![
+            "fetcher-arm:spot",
+            "fetcher-arm:on-demand",
+            "fetcher-x86:spot",
+            "fetcher-x86:on-demand",
+            "hi-ebs-arm:on-demand",
+            "hi-ebs-arm-g7:on-demand",
+            "hi-ebs-x86:on-demand",
+            "hi-ebs-x86-g7:on-demand",
+            "hi-nvme-arm:on-demand",
+            "hi-nvme-arm-g7:on-demand",
+            "hi-nvme-x86:on-demand",
+            "hi-nvme-x86-g7:on-demand",
+            "lo-ebs-arm:spot",
+            "lo-ebs-arm:on-demand",
+            "lo-ebs-x86:spot",
+            "lo-ebs-x86:on-demand",
+            "lo-nvme-arm:spot",
+            "lo-nvme-arm:on-demand",
+            "lo-nvme-x86:spot",
+            "lo-nvme-x86:on-demand",
+            "metal-arm:on-demand",
+            "metal-x86:on-demand",
+            "mid-ebs-arm:spot",
+            "mid-ebs-arm:on-demand",
+            "mid-ebs-x86:spot",
+            "mid-ebs-x86:on-demand",
+            "mid-nvme-arm:spot",
+            "mid-nvme-arm:on-demand",
+            "mid-nvme-x86:spot",
+            "mid-nvme-x86:on-demand",
+        ];
+        assert_eq!(
+            cells, expect_cells,
+            "shipped cell universe drifted — regenerate the [GEN-SET] \
+             (commit body) and re-derive the ladder/posture consequences"
+        );
+        assert_eq!(
+            edges,
+            vec![
+                "hi-ebs-arm -> hi-ebs-arm-g7",
+                "hi-ebs-x86 -> hi-ebs-x86-g7",
+                "hi-nvme-arm -> hi-nvme-arm-g7",
+                "hi-nvme-x86 -> hi-nvme-x86-g7",
+            ],
+            "declared ladder edges drifted"
+        );
+
+        // 2) The STRONG half: shipped rows through the production
+        //    parser laws. Assemble the real SlaConfig and validate.
+        let mut cfg = base();
+        cfg.max_cores = Some(384.0);
+        cfg.max_mem = Some(4096 << 30);
+        cfg.reference_hw_class = sla_v.reference_hw_class.clone();
+        cfg.max_lead_time = sla_v.max_lead_time;
+        cfg.hw_classes = sla_v
+            .hw_classes
+            .iter()
+            .map(|(h, d)| {
+                (
+                    h.clone(),
+                    HwClassDef {
+                        labels: d
+                            .labels
+                            .iter()
+                            .map(|l| NodeLabelMatch {
+                                key: l.key.clone(),
+                                value: l.value.clone(),
+                            })
+                            .collect(),
+                        requirements: d
+                            .requirements
+                            .iter()
+                            .map(|r| NodeSelectorReq {
+                                key: r.key.clone(),
+                                operator: r.operator.clone(),
+                                values: r.values.clone().unwrap_or_default(),
+                            })
+                            .collect(),
+                        node_class: d.node_class.clone(),
+                        max_cores: d.max_cores,
+                        max_mem: d.max_mem,
+                        taints: d
+                            .taints
+                            .iter()
+                            .flatten()
+                            .map(|t| NodeTaint {
+                                key: t.key.clone(),
+                                value: t.value.clone(),
+                                effect: t.effect.clone(),
+                            })
+                            .collect(),
+                        provides_features: d.provides_features.clone().unwrap_or_default(),
+                        max_fleet_cores: None,
+                        capacity_types: d
+                            .capacity_types
+                            .as_ref()
+                            .map(|caps| {
+                                caps.iter()
+                                    .map(|c| CapacityType::parse(c).expect("shipped cap token"))
+                                    .collect()
+                            })
+                            .unwrap_or_else(default_capacity_types),
+                        ladder: d.ladder.as_ref().map(|l| CapacityLadder {
+                            rungs: l
+                                .rungs
+                                .iter()
+                                .map(|r| LadderRung {
+                                    class: r.class.clone(),
+                                })
+                                .collect(),
+                        }),
+                    },
+                )
+            })
+            .collect();
+        cfg.lead_time_seed = sla_v
+            .lead_time_seed
+            .iter()
+            .map(|(k, v)| (parse_cell(k).expect("shipped seed key decodes"), *v))
+            .collect();
+        cfg.validate_shape()
+            .expect("the SHIPPED chart values pass the production validator");
+
+        // 3) The closure law re-derives every declared edge: for each
+        //    ladder'd parent, retain_hosting_cells(parent cells) ==
+        //    parent cells + the rung's od cell (the shipped od-only
+        //    posture).
+        let cat = super::super::catalog::CatalogCeilings::new();
+        let arch_of = |d: &HwClassDef| {
+            d.labels
+                .iter()
+                .find(|l| l.key == ARCH_LABEL)
+                .map(|l| l.value.clone())
+        };
+        for (h, d) in cfg.hw_classes.clone() {
+            let Some(ladder) = &d.ladder else { continue };
+            let system = match arch_of(&d).as_deref() {
+                Some("arm64") => "aarch64-linux",
+                _ => "x86_64-linux",
+            };
+            let producer: Vec<Cell> = d
+                .capacity_types
+                .iter()
+                .map(|cap| (h.clone(), *cap))
+                .collect();
+            let kept = cfg.retain_hosting_cells(
+                producer.clone(),
+                system,
+                (1, 0),
+                &[],
+                &cat,
+                (384u32, 4096u64 << 30),
+            );
+            let mut expect = producer;
+            for rung in &ladder.rungs {
+                for cap in cfg.capacity_types_for(&rung.class) {
+                    expect.push((rung.class.clone(), *cap));
+                }
+            }
+            assert_eq!(
+                kept, expect,
+                "shipped closure({h}) == parent cells + rung od cells"
+            );
+        }
     }
 
     /// §13c-2 r[verify scheduler.sla.ceiling.uncatalogued-fallback]:
