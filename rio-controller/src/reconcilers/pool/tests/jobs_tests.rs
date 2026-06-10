@@ -1920,7 +1920,7 @@ fn gate_evaluates_all_wanted_not_just_window() {
 /// red (breaker neutered --- strawman, the gate cannot exist pre-fix):
 /// `left: 25 right: 5 --- verdict-free respawns must follow the
 /// exponential backoff schedule, not the reconcile cadence`.
-// r[verify ctrl.pool.respawn-backoff]
+// r[verify ctrl.pool.respawn-backoff+2]
 #[test]
 fn verdictless_respawn_backs_off_per_intent() {
     use crate::reconcilers::pool::candidate::PoolStreaks;
@@ -1976,7 +1976,7 @@ fn verdictless_respawn_backs_off_per_intent() {
 /// the ack response exactly as the production arm mints it (every
 /// poison-arm ack carries `attempt_resolved=false` by design --- the
 /// ack itself is the premise).
-// r[verify ctrl.pool.respawn-backoff]
+// r[verify ctrl.pool.respawn-backoff+2]
 #[test]
 fn verdict_resets_respawn_backoff() {
     use crate::reconcilers::pool::candidate::{PoolStreaks, VerdictWitness};
@@ -2017,6 +2017,7 @@ fn verdict_resets_respawn_backoff() {
         &key,
         "drv-loop",
         VerdictWitness::from_acked_no_eligible_source(&ack),
+        std::time::Instant::now(),
     );
     let tick = streaks.begin_tick(&key);
     let unblocked = evaluate_spawn_gate(
@@ -2474,7 +2475,7 @@ fn intent_named(id: &str) -> SpawnIntent {
     }
 }
 
-// r[verify ctrl.pool.respawn-backoff]
+// r[verify ctrl.pool.respawn-backoff+2]
 /// merged_bug_080(2a) red 1 (recorded verbatim in the close commit):
 /// a respawn record MUST survive the Job-alive phase. Paused clock:
 /// verdict-free death at t0 (deaths=1, backoff 10 s); the Job is
@@ -2527,7 +2528,7 @@ fn job_alive_phase_does_not_expire_respawn_record() {
     );
 }
 
-// r[verify ctrl.pool.respawn-backoff]
+// r[verify ctrl.pool.respawn-backoff+2]
 /// merged_bug_080(2a) red 2 (recorded verbatim in the close commit):
 /// same law through the TERMINAL-UNREAPED phase --- a terminal Job
 /// listed for the 600 s JOB_TTL window is the observable artifact of
@@ -2572,7 +2573,7 @@ fn respawn_record_survives_terminal_unreaped_window() {
     );
 }
 
-// r[verify ctrl.pool.respawn-backoff]
+// r[verify ctrl.pool.respawn-backoff+2]
 /// merged_bug_080(2a) census (R15): the record's retention horizon
 /// dominates EVERY cycle phase in which the intent is structurally
 /// un-evaluated --- exhaustively over the closed [`CyclePhase`]
@@ -2670,7 +2671,7 @@ fn deadline_exceeded_job(name: &str, intent_id: &str) -> Job {
     j
 }
 
-// r[verify ctrl.pool.respawn-backoff]
+// r[verify ctrl.pool.respawn-backoff+2]
 /// merged_bug_080(2b) red 4 (recorded verbatim in the close commit): a
 /// charge-free ack MUST NOT reset a respawn record. The reap steps the
 /// record (verdict-free death — the production noting call), then the
@@ -2724,7 +2725,7 @@ async fn noop_ack_does_not_reset_respawn_record() {
     );
 }
 
-// r[verify ctrl.pool.respawn-backoff]
+// r[verify ctrl.pool.respawn-backoff+2]
 /// merged_bug_080(2b) red 5 (recorded verbatim in the close commit): a
 /// worker-closed death is NOT verdict-free. The terminal reap finds no
 /// OPEN attempt (the attempt already closed — the scheduler holds an
@@ -2805,7 +2806,7 @@ async fn worker_closed_death_is_not_verdict_free() {
     );
 }
 
-// r[verify ctrl.pool.respawn-backoff]
+// r[verify ctrl.pool.respawn-backoff+2]
 /// merged_bug_080(2b) red 6 — the kind axis, differential form: the
 /// recently-closed reset lane must ride the BUILD conjunct. Same
 /// scenario twice, only `attempt_kind` differs: MATERIALIZATION and
@@ -2831,7 +2832,12 @@ async fn materialization_close_does_not_reset_build_record() {
     let key = pkey();
 
     // Two verdict-free deaths: 20 s floor — mid-backoff throughout.
-    let t0 = std::time::Instant::now();
+    // merged_bug_036: the deaths PREDATE the close (t0 backdated 60 s;
+    // the close below is 10 s old) — the chronology law resets only on
+    // a close that postdates the latest recorded death, and this
+    // test's BUILD half is exactly that motivating "close outran the
+    // reap" world.
+    let t0 = std::time::Instant::now() - std::time::Duration::from_secs(60);
     for n in 0..2u64 {
         ctx.exhausted_streak.lock().note_verdict_free_death(
             &key,
@@ -2879,7 +2885,167 @@ async fn materialization_close_does_not_reset_build_record() {
     );
 }
 
-// r[verify ctrl.pool.respawn-backoff]
+// r[verify ctrl.pool.respawn-backoff+2]
+/// merged_bug_036 R1: a close cannot mask the death of a Job created
+/// AFTER it. PROPOSITION CERTIFIED: the chronology conjunct at the
+/// constructor (mint 4b), over production-shaped Jobs (real
+/// `metadata.creation_timestamp`) and wire ClosedAttempt values,
+/// through the production reap conduit — a recently-closed BUILD
+/// entry at age 70s does NOT cover the verdict-free death of a
+/// terminal Job created 20s ago, so the death is noted and the
+/// ladder gates the respawn.
+#[tokio::test]
+async fn pre_creation_close_does_not_cover_a_death() {
+    use rio_proto::types::CloseCause;
+
+    let (client, verifier) = ApiServerVerifier::new();
+    let (ctx, mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
+    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+    let key = pkey();
+
+    // The close PREDATES the Job: closed 70s ago; Job created 20s ago.
+    mock.open_attempts.write().unwrap().recently_closed = vec![rio_proto::types::ClosedAttempt {
+        intent_id: "precre".into(),
+        exec_id: "exec-pc1".into(),
+        cause: CloseCause::Completed as i32,
+        closed_age_secs: 70,
+        attempt_kind: rio_proto::types::AttemptKind::Build as i32,
+    }];
+    let mut job = terminal_job_for_intent("rio-builder-p-precre", "precre");
+    {
+        use k8s_openapi::jiff::{SignedDuration, Timestamp};
+        job.metadata.creation_timestamp =
+            Some(Time(Timestamp::now() - SignedDuration::from_secs(20)));
+    }
+
+    let guard = verifier.run(vec![Scenario {
+        method: http::Method::DELETE,
+        path_contains: "/namespaces/rio/jobs/rio-builder-p-precre",
+        body_contains: Some(r#""propagationPolicy":"Background""#),
+        status: 200,
+        body_json: serde_json::to_string(&Job::default()).unwrap(),
+    }]);
+    // live_051(e) two-tick confirmation: strike pass, then the reap.
+    let first = reap_stale_for_intents(
+        &jobs_api,
+        std::slice::from_ref(&job),
+        &[intent_named("precre")],
+        &ctx,
+        "p",
+        ExecutorKind::Builder,
+        &key,
+    )
+    .await;
+    assert!(first.is_empty(), "strike 1 defers (live_051(e))");
+    let reaped = reap_stale_for_intents(
+        &jobs_api,
+        std::slice::from_ref(&job),
+        &[intent_named("precre")],
+        &ctx,
+        "p",
+        ExecutorKind::Builder,
+        &key,
+    )
+    .await;
+    guard.verified().await;
+    assert_eq!(reaped, HashSet::from(["rio-builder-p-precre".to_string()]));
+
+    let blocked =
+        ctx.exhausted_streak
+            .lock()
+            .respawn_blocked(&key, "precre", std::time::Instant::now());
+    assert!(
+        blocked,
+        "left: false (a close that predates the Job masked its death — \
+         deaths == 0, full-cadence respawn) / right: true (deaths == 1; \
+         the ladder gates the respawn)"
+    );
+}
+
+// r[verify ctrl.pool.respawn-backoff+2]
+/// merged_bug_036 R2: a close cannot erase deaths recorded AFTER it.
+/// PROPOSITION CERTIFIED: the chronology conjunct at the record — the
+/// reset loop fed an in-window close at age 70s does NOT remove a
+/// record whose latest death is 10s old (close_age + skew slack ≥
+/// death age ⇒ retain wholesale).
+#[test]
+fn older_close_does_not_erase_newer_deaths() {
+    use crate::reconcilers::pool::candidate::{PoolStreaks, VerdictWitness};
+
+    let mut streaks = PoolStreaks::default();
+    let key = pkey();
+    let now = std::time::Instant::now();
+    // The latest death is 5s old — inside its own 10s floor, so the
+    // retained record is observable through respawn_blocked.
+    streaks.note_verdict_free_death(&key, "newer", now - std::time::Duration::from_secs(5));
+
+    let witness = VerdictWitness::from_recently_closed_build(&rio_proto::types::ClosedAttempt {
+        intent_id: "newer".into(),
+        exec_id: "exec-n1".into(),
+        cause: rio_proto::types::CloseCause::Completed as i32,
+        closed_age_secs: 70,
+        attempt_kind: rio_proto::types::AttemptKind::Build as i32,
+    })
+    .expect("BUILD kind mints");
+    streaks.note_resolution(&key, "newer", witness, now);
+
+    assert!(
+        streaks.respawn_blocked(&key, "newer", now),
+        "left: record erased (the next tick respawns at full cadence) / \
+         right: retained (the close predates the death it would erase)"
+    );
+}
+
+// r[verify ctrl.pool.respawn-backoff+2]
+/// merged_bug_036 R3: the restored envelope — respawn count under
+/// sustained verdict-free fast-crash is LADDER-bounded inside a
+/// renewable close window. PROPOSITION CERTIFIED structurally (spawn
+/// DECISIONS counted over a synthetic tick clock, never wall-clock):
+/// one adjudicated close at T=0 rides the scheduler's 120s
+/// recently-closed window while generations fast-crash at the ~10s
+/// reconcile cadence; the per-tick reset loop re-delivers the close
+/// every tick, and the 10/20/40/80s floors hold from the first
+/// UNCOVERED death.
+#[test]
+fn fast_crash_generations_meet_the_ladder_inside_a_close_window() {
+    use crate::reconcilers::pool::candidate::{PoolStreaks, VerdictWitness};
+
+    let mut streaks = PoolStreaks::default();
+    let key = pkey();
+    let base = std::time::Instant::now();
+    let closed = |age: u64| rio_proto::types::ClosedAttempt {
+        intent_id: "ladder".into(),
+        exec_id: "exec-l1".into(),
+        cause: rio_proto::types::CloseCause::Completed as i32,
+        closed_age_secs: age,
+        attempt_kind: rio_proto::types::AttemptKind::Build as i32,
+    };
+
+    let mut spawns = 0u32;
+    for tick in 0..=12u64 {
+        let now = base + std::time::Duration::from_secs(tick * 10);
+        // The close happened at T=0; its wire age grows per tick and
+        // stays inside the scheduler's 120s window for the whole run.
+        let w = VerdictWitness::from_recently_closed_build(&closed(tick * 10))
+            .expect("BUILD kind mints");
+        streaks.note_resolution(&key, "ladder", w, now);
+        if !streaks.respawn_blocked(&key, "ladder", now) {
+            // The pool respawns; the generation fast-crashes
+            // verdict-free within the tick.
+            spawns += 1;
+            streaks.note_verdict_free_death(&key, "ladder", now);
+        }
+    }
+    assert!(
+        spawns <= 5,
+        "left: 13 full-cadence spawns (each tick's in-window close \
+         erased the deaths recorded after it — the ladder neutralized \
+         for a renewable 120s) / right: ladder-bounded ({spawns} ≤ 5: \
+         the 10/20/40/80s floors hold from the first uncovered death)"
+    );
+}
+
+// r[verify ctrl.pool.respawn-backoff+2]
 /// merged_bug_080(2b) red 7 — the green companion to red 4: a
 /// RESOLVING ack (`attempt_resolved=true`) still resets — the breaker
 /// must never tax a real verdict. Both mint polarities at the seam:
@@ -2928,7 +3094,7 @@ fn resolved_ack_still_resets() {
             attempt_resolved: true,
         })
         .expect("a resolved ack mints the witness");
-    streaks.note_resolution(&key, "drv-res", witness);
+    streaks.note_resolution(&key, "drv-res", witness, std::time::Instant::now());
     assert!(
         !streaks.respawn_blocked(&key, "drv-res", probe),
         "a resolving ack resets immediately — the breaker never taxes \

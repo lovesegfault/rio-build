@@ -450,7 +450,7 @@ pub(super) async fn report_no_eligible_source(
                 // ack — the poison lane's premise is the completed
                 // RPC itself (`attempt_resolved` is false by design
                 // on every NoEligibleSource arm; see the mint's doc).
-                // r[impl ctrl.pool.respawn-backoff]
+                // r[impl ctrl.pool.respawn-backoff+2]
                 acked.push((
                     intent.intent_id.clone(),
                     candidate::VerdictWitness::from_acked_no_eligible_source(&resp.into_inner()),
@@ -790,7 +790,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // sibling pools fold can still expire a record (the `?` above
     // aborts before this line) --- bounded: no LIST ⇒ no spawn either;
     // worst case one un-backed-off cycle on recovery.
-    // r[impl ctrl.pool.respawn-backoff]
+    // r[impl ctrl.pool.respawn-backoff+2]
     ctx.exhausted_streak.lock().note_job_alive(
         &streak_key,
         jobs.items
@@ -927,10 +927,10 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         // is a named resolution — the scheduler now holds the verdict,
         // so the intent's verdict-free-respawn record (if any) clears.
         // The witness was minted at the ack site (merged_bug_080(2b)).
-        // r[impl ctrl.pool.respawn-backoff]
+        // r[impl ctrl.pool.respawn-backoff+2]
         let mut streaks = ctx.exhausted_streak.lock();
         for (intent_id, witness) in acked {
-            streaks.note_resolution(&streak_key, &intent_id, witness);
+            streaks.note_resolution(&streak_key, &intent_id, witness, std::time::Instant::now());
         }
     }
     // Headroom truncate AFTER the gate, over spawnable intents only.
@@ -1365,7 +1365,7 @@ pub(super) async fn reap_stale_for_intents(
                 // the exhaustive merged_bug_080(2b) alphabet (a
                 // resolving ack already cleared the record inside the
                 // delete chokepoint; a charge-free ack proves nothing):
-                // r[impl ctrl.pool.respawn-backoff]
+                // r[impl ctrl.pool.respawn-backoff+2]
                 let no_verdict_at_delete = match &synthesized {
                     super::job::SynthesizedDelete::ReportedVerdict { .. } => false,
                     super::job::SynthesizedDelete::AckedNoAttempt
@@ -1408,7 +1408,10 @@ pub(super) async fn reap_stale_for_intents(
                             .iter()
                             .filter(|c| c.intent_id == intent_id)
                             .any(|c| {
-                                candidate::VerdictWitness::from_recently_closed_build(c).is_some()
+                                // merged_bug_036 mint 4b: the close
+                                // must POSTDATE the reaped Job's
+                                // creation to cover its death.
+                                candidate::VerdictWitness::covers_job_death(c, j).is_some()
                             });
                     if !covered_by_build {
                         ctx.exhausted_streak.lock().note_verdict_free_death(

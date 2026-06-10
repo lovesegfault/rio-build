@@ -898,7 +898,7 @@ impl AttemptsViewWitness {
 /// site speaks through. A charge-free ack (`attempt_resolved=false`)
 /// witnesses nothing and resets nothing — merged_bug_080(2b); the
 /// witness mint is `candidate::VerdictWitness::from_resolved_ack`.
-// r[impl ctrl.pool.respawn-backoff]
+// r[impl ctrl.pool.respawn-backoff+2]
 // r[impl ctrl.job.synthesize-on-delete+3]
 #[allow(clippy::too_many_arguments)] // the build_job precedent: reconcile plumbing, not an API
 pub(super) async fn delete_job_with_synthesized_report(
@@ -989,9 +989,12 @@ pub(super) async fn delete_job_with_synthesized_report(
                     synthesized = SynthesizedDelete::ReportedVerdict {
                         intent_id: intent_id.clone(),
                     };
-                    ctx.exhausted_streak
-                        .lock()
-                        .note_resolution(key, &intent_id, witness);
+                    ctx.exhausted_streak.lock().note_resolution(
+                        key,
+                        &intent_id,
+                        witness,
+                        std::time::Instant::now(),
+                    );
                 } else {
                     synthesized = SynthesizedDelete::AckedNoAttempt;
                 }
@@ -1464,12 +1467,12 @@ pub(super) async fn cancel_closed_attempt_jobs(
     // replica's attempt, not build progress, and never resets). This
     // is the one per-tick view read the cancel arm already pays for;
     // the noting is map-existing-only and cheap.
-    // r[impl ctrl.pool.respawn-backoff]
+    // r[impl ctrl.pool.respawn-backoff+2]
     {
         let mut streaks = ctx.exhausted_streak.lock();
         for a in attempts_view.attempts() {
             if let Some(witness) = super::candidate::VerdictWitness::from_open_build_attempt(a) {
-                streaks.note_resolution(key, &a.intent_id, witness);
+                streaks.note_resolution(key, &a.intent_id, witness, std::time::Instant::now());
             }
         }
         // merged_bug_080(2b) mint 4: a recently-closed BUILD attempt
@@ -1484,7 +1487,7 @@ pub(super) async fn cancel_closed_attempt_jobs(
         // either to match the other).
         for c in attempts_view.recently_closed() {
             if let Some(witness) = super::candidate::VerdictWitness::from_recently_closed_build(c) {
-                streaks.note_resolution(key, &c.intent_id, witness);
+                streaks.note_resolution(key, &c.intent_id, witness, std::time::Instant::now());
             }
         }
     }
@@ -2138,7 +2141,7 @@ pub(super) async fn report_terminated_pods(
                 // scheduler resolved an attempt with it
                 // (merged_bug_080(2b): a charge-free ack witnesses
                 // nothing and resets nothing).
-                // r[impl ctrl.pool.respawn-backoff]
+                // r[impl ctrl.pool.respawn-backoff+2]
                 if !intent_id_for_breaker.is_empty()
                     && let Some(witness) =
                         super::candidate::VerdictWitness::from_resolved_ack(&resp.into_inner())
@@ -2147,6 +2150,7 @@ pub(super) async fn report_terminated_pods(
                         key,
                         &intent_id_for_breaker,
                         witness,
+                        std::time::Instant::now(),
                     );
                 }
                 // OA1 interval (i): Pod terminal-condition timestamp →
@@ -2256,15 +2260,18 @@ pub(super) async fn report_deadline_exceeded_jobs(
                 // report for a never-pulled Job (no attempt) acks
                 // `attempt_resolved=false` and resets nothing — the
                 // record the same-tick reap just stepped survives.
-                // r[impl ctrl.pool.respawn-backoff]
+                // r[impl ctrl.pool.respawn-backoff+2]
                 let intent_id = report_intent_id_for_job(job);
                 if !intent_id.is_empty()
                     && let Some(witness) =
                         super::candidate::VerdictWitness::from_resolved_ack(&resp.into_inner())
                 {
-                    ctx.exhausted_streak
-                        .lock()
-                        .note_resolution(key, &intent_id, witness);
+                    ctx.exhausted_streak.lock().note_resolution(
+                        key,
+                        &intent_id,
+                        witness,
+                        std::time::Instant::now(),
+                    );
                 }
                 // OA1 interval (i): the Job's Failed/DeadlineExceeded
                 // condition transition → report acked, sampled once

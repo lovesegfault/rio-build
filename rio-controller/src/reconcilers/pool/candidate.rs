@@ -344,11 +344,18 @@ pub enum SpawnResolution {
     /// A recently-closed BUILD attempt for the intent was observed in
     /// the ledger view --- the scheduler holds an adjudicated verdict
     /// for a worker-closed death (the close outran the controller's
-    /// terminal reap).
-    ClosedBuild,
+    /// terminal reap). merged_bug_036: the wire age is baked into the
+    /// witness at mint, so every consumer can bind the chronology
+    /// conjunct (adjudication evidence covers only events it
+    /// postdates) at its own premise --- the conjunct is unskippable
+    /// once the variant carries the age.
+    ClosedBuild {
+        /// `ClosedAttempt.closed_age_secs` at mint time.
+        closed_age_secs: u64,
+    },
 }
 
-// r[impl ctrl.pool.respawn-backoff]
+// r[impl ctrl.pool.respawn-backoff+2]
 /// merged_bug_080(2b): the verdict-evidence witness
 /// [`PoolStreaks::note_resolution`] requires. Constructible ONLY
 /// through the four mint constructors below, each demanding its typed
@@ -379,7 +386,7 @@ impl VerdictWitness {
     /// with (merged_bug_080(2b): the same-tick wipe died here; a
     /// deadline report for a never-pulled Job acks
     /// `attempt_resolved=false` and resets nothing).
-    // r[impl ctrl.pool.respawn-backoff]
+    // r[impl ctrl.pool.respawn-backoff+2]
     pub fn from_resolved_ack(
         resp: &rio_proto::types::ReportAttemptOutcomeResponse,
     ) -> Option<Self> {
@@ -393,7 +400,7 @@ impl VerdictWitness {
     /// returns `attempt_resolved=false` by design (the verdict is not
     /// an attempt resolution), and requiring the response makes the
     /// mint unreachable before the RPC completes.
-    // r[impl ctrl.pool.respawn-backoff]
+    // r[impl ctrl.pool.respawn-backoff+2]
     pub fn from_acked_no_eligible_source(
         _ack: &rio_proto::types::ReportAttemptOutcomeResponse,
     ) -> Self {
@@ -404,7 +411,7 @@ impl VerdictWitness {
     /// pull identity. `None` for materialization claims, foreign
     /// shapes, and unknown kinds --- a store replica's attempt is not
     /// build progress and never resets.
-    // r[impl ctrl.pool.respawn-backoff]
+    // r[impl ctrl.pool.respawn-backoff+2]
     pub fn from_open_build_attempt(attempt: &rio_proto::types::OpenAttempt) -> Option<Self> {
         (super::job::MintedPullIdentity::of(attempt) == super::job::MintedPullIdentity::Build)
             .then_some(Self(SpawnResolution::Established))
@@ -420,10 +427,41 @@ impl VerdictWitness {
     /// pre-field scheduler's default would convert skew into money ---
     /// do not "fix" either site to match the other (the cross-reference
     /// lives at both).
-    // r[impl ctrl.pool.respawn-backoff]
+    // r[impl ctrl.pool.respawn-backoff+2]
     pub fn from_recently_closed_build(closed: &rio_proto::types::ClosedAttempt) -> Option<Self> {
-        (closed.attempt_kind == rio_proto::types::AttemptKind::Build as i32)
-            .then_some(Self(SpawnResolution::ClosedBuild))
+        (closed.attempt_kind == rio_proto::types::AttemptKind::Build as i32).then_some(Self(
+            SpawnResolution::ClosedBuild {
+                closed_age_secs: closed.closed_age_secs,
+            },
+        ))
+    }
+
+    /// Mint 4b (merged_bug_036): a recently-closed BUILD attempt that
+    /// POSTDATES the reaped Job's creation --- the chronology conjunct
+    /// lives inside the mint, where its premise (the Job in hand) is.
+    /// A close minted before the Job existed categorically cannot be
+    /// that Job's attempt's verdict, so it covers nothing. Same
+    /// PG↔apiserver clock pair, same slack const, and the same
+    /// fail-toward-counting inequality direction as
+    /// `CancelTarget::bind` conjunct 3 (the sibling that always had
+    /// this conjunct). The reap-mask consumes THIS mint; the
+    /// windowed-reset lane keeps mint 4 and binds its chronology at
+    /// the record ([`PoolStreaks::note_resolution`]).
+    // r[impl ctrl.pool.respawn-backoff+2]
+    pub fn covers_job_death(
+        closed: &rio_proto::types::ClosedAttempt,
+        job: &k8s_openapi::api::batch::v1::Job,
+    ) -> Option<Self> {
+        let kind_is_build = closed.attempt_kind == rio_proto::types::AttemptKind::Build as i32;
+        let postdates_job = super::job::job_older_than(
+            job,
+            std::time::Duration::from_secs(
+                closed.closed_age_secs + super::job::CANCEL_CLOSE_SKEW_SLACK_SECS,
+            ),
+        );
+        (kind_is_build && postdates_job).then_some(Self(SpawnResolution::ClosedBuild {
+            closed_age_secs: closed.closed_age_secs,
+        }))
     }
 }
 
@@ -509,7 +547,7 @@ impl EvidenceState {
 /// three doublings of the 10 s cadence --- an order-of-magnitude
 /// spend reduction under total failure while a genuine verdict (the
 /// reset lane) restores full cadence immediately.
-// r[impl ctrl.pool.respawn-backoff]
+// r[impl ctrl.pool.respawn-backoff+2]
 pub(crate) const RESPAWN_BACKOFF_CAP_SECS: u64 = 80;
 const _: () = assert!(
     RESPAWN_BACKOFF_CAP_SECS < POOL_STREAK_ORPHAN_EXPIRY_SECS,
@@ -700,7 +738,7 @@ impl PoolStreaks {
     /// and the same-named respawn would otherwise fire at reconcile
     /// cadence). Steps the record (deaths+1) and re-anchors the
     /// backoff at this observation.
-    // r[impl ctrl.pool.respawn-backoff]
+    // r[impl ctrl.pool.respawn-backoff+2]
     pub fn note_verdict_free_death(
         &mut self,
         pool: &PoolKey,
@@ -736,7 +774,7 @@ impl PoolStreaks {
     /// spawn could complete a poison from stale evidence. With this
     /// lane the expiry reverts to its documented orphan semantics:
     /// genuinely JOBLESS fold-skip silence.
-    // r[impl ctrl.pool.respawn-backoff]
+    // r[impl ctrl.pool.respawn-backoff+2]
     pub fn note_job_alive<'a>(
         &mut self,
         pool: &PoolKey,
@@ -757,14 +795,43 @@ impl PoolStreaks {
     /// merged_bug_080(2b): the [`VerdictWitness`] parameter makes a
     /// premise-free reset a compile error --- every caller must mint
     /// the witness at one of the four evidence sites first.
-    // r[impl ctrl.pool.respawn-backoff]
-    pub fn note_resolution(&mut self, pool: &PoolKey, intent: &str, witness: VerdictWitness) {
+    // r[impl ctrl.pool.respawn-backoff+2]
+    /// merged_bug_036: the `ClosedBuild` arm binds the chronology
+    /// conjunct at the record (the only place `last_death` lives) ---
+    /// the record is removed IFF the close provably postdates the
+    /// latest recorded death (`close_age + skew slack <
+    /// now - last_death`), else RETAINED wholesale (deaths are not
+    /// time-splittable; the over-caution residual is bounded by the
+    /// backoff cap + orphan expiry, the same posture as the
+    /// reap-mask's window residual). The other three variants reset
+    /// unconditionally: their premises are current by construction (a
+    /// just-completed ack RPC; a live open attempt). Remove-or-retain
+    /// on chronology subsumes per-close idempotency: a consumed
+    /// close's record is gone, and re-noting no-ops on the absent
+    /// key.
+    pub fn note_resolution(
+        &mut self,
+        pool: &PoolKey,
+        intent: &str,
+        witness: VerdictWitness,
+        now: std::time::Instant,
+    ) {
         let VerdictWitness(what) = witness;
-        if self
-            .respawn
-            .remove(&(pool.clone(), intent.to_owned()))
-            .is_some()
+        let key = (pool.clone(), intent.to_owned());
+        if let SpawnResolution::ClosedBuild { closed_age_secs } = what
+            && let Some(e) = self.respawn.get(&key)
         {
+            let close_age = std::time::Duration::from_secs(
+                closed_age_secs + super::job::CANCEL_CLOSE_SKEW_SLACK_SECS,
+            );
+            if close_age >= now.saturating_duration_since(e.last_death) {
+                tracing::debug!(pool = %pool, intent, closed_age_secs,
+                    "recently-closed verdict predates the latest recorded death; \
+                     respawn record retained (merged_bug_036)");
+                return;
+            }
+        }
+        if self.respawn.remove(&key).is_some() {
             tracing::debug!(pool = %pool, intent, resolution = ?what,
                 "verdict-free-respawn backoff reset by named resolution");
         }
@@ -804,7 +871,7 @@ impl PoolStreaks {
     /// gated behind the verdict-free backoff floor? Pure read --- the
     /// spawn arm consults it on EVERY tick (including fold-skip
     /// ticks, where deaths noted by the reap still gate immediately).
-    // r[impl ctrl.pool.respawn-backoff]
+    // r[impl ctrl.pool.respawn-backoff+2]
     pub fn respawn_blocked(&self, pool: &PoolKey, intent: &str, now: std::time::Instant) -> bool {
         self.respawn
             .get(&(pool.clone(), intent.to_owned()))

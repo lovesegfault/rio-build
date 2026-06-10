@@ -366,19 +366,22 @@ two reads.
   window, destroying by spawning what the retain law preserved.
 ]
 
-#r("ctrl.pool.respawn-backoff")[
+#r("ctrl.pool.respawn-backoff+2")[
   A pool MUST NOT respawn an intent whose previous Job died without
   the scheduler holding a verdict for an attempt of that intent,
   except behind the exponential backoff floor (base = reconcile
   cadence, documented cap). A respawn record MUST reset only on
   verdict-bearing evidence --- an ack witnessing that the scheduler
   resolved an attempt, an acked NoEligibleSource report, an open build
-  attempt in the ledger view, or a recently-closed build attempt; an
-  acknowledgment carrying no attempt-resolution witness MUST NOT
-  reset. A respawn record MUST NOT expire during any cycle phase in
-  which its intent is structurally unobservable to the gate fold --- a
-  live or terminal same-named Job in the tick's listing refreshes it;
-  the orphan expiry applies only to jobless silence.
+  attempt in the ledger view, or a recently-closed build attempt that
+  postdates the death(s) it resets; reap-time coverage MUST bind the
+  close to the reaped Job's generation (a close minted before the Job
+  existed covers nothing). An acknowledgment carrying no
+  attempt-resolution witness MUST NOT reset. A respawn record MUST NOT
+  expire during any cycle phase in which its intent is structurally
+  unobservable to the gate fold --- a live or terminal same-named Job
+  in the tick's listing refreshes it; the orphan expiry applies only
+  to jobless silence.
 ]
 
 #r("ctrl.pool.ack-spawned-soundness")[
