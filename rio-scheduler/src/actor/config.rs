@@ -153,6 +153,13 @@ pub struct DagActorPlumbing {
     /// exercise that fallback in isolation, without closing the pool.
     #[cfg(test)]
     pub fail_next_floor_read: bool,
+    /// Test-only (bug_015): when set, the next keyed fence write
+    /// stamps a successor generation claim AFTER the pull handler's
+    /// floor read and BEFORE `insert_confirm_fence` — the exact
+    /// deposed-writer TOCTOU window, made deterministic without
+    /// mocking PG (the `fail_next_*` injection-lane family).
+    #[cfg(test)]
+    pub bump_claims_floor_before_fence_write: bool,
     /// merged_bug_003: fail the next infrastructure-failure appending
     /// transaction (before `begin_fenced`), exercising the
     /// RecordFailed → CompletionEcho re-delivery path without touching
@@ -194,6 +201,8 @@ impl Default for DagActorPlumbing {
             fail_next_recovery_load: false,
             #[cfg(test)]
             fail_next_floor_read: false,
+            #[cfg(test)]
+            bump_claims_floor_before_fence_write: false,
             #[cfg(test)]
             fail_next_attempt_append: false,
             #[cfg(test)]

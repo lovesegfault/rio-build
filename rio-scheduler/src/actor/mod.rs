@@ -723,6 +723,10 @@ pub struct DagActor {
     /// `DagActorPlumbing::fail_next_floor_read`.
     #[cfg(test)]
     fail_next_floor_read: bool,
+    /// `DagActorPlumbing::bump_claims_floor_before_fence_write`
+    /// (bug_015's deposed-writer injection hook).
+    #[cfg(test)]
+    bump_claims_floor_before_fence_write: bool,
     /// Test-only: fail the next infra-failure appending transaction.
     /// See `DagActorPlumbing::fail_next_attempt_append`.
     #[cfg(test)]
@@ -929,6 +933,8 @@ impl DagActor {
             #[cfg(test)]
             fail_next_floor_read: plumbing.fail_next_floor_read,
             #[cfg(test)]
+            bump_claims_floor_before_fence_write: plumbing.bump_claims_floor_before_fence_write,
+            #[cfg(test)]
             fail_next_attempt_append: plumbing.fail_next_attempt_append,
             #[cfg(test)]
             test_counters: TestCounters::default(),
@@ -1070,6 +1076,8 @@ impl DagActor {
                 fail_next_recovery_load: _,
             #[cfg(test)]
                 fail_next_floor_read: _,
+            #[cfg(test)]
+                bump_claims_floor_before_fence_write: _,
             #[cfg(test)]
                 fail_next_attempt_append: _,
             #[cfg(test)]

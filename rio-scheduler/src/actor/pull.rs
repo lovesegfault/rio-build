@@ -611,8 +611,44 @@ impl DagActor {
                     rio_evidence_kernel::pull::FenceObligation::WriteAhead,
                     FenceLane::Keyed(hash),
                 ) => {
-                    match self.db.insert_confirm_fence(hash, intent_id).await {
-                        Ok(witness) => Some(witness),
+                    #[cfg(test)]
+                    if std::mem::take(&mut self.bump_claims_floor_before_fence_write) {
+                        // r13-allow(injection): the bug_015 TOCTOU
+                        // window made deterministic — a successor
+                        // stamps a higher claim AFTER this handler's
+                        // floor read, BEFORE the fence write (the
+                        // `fail_next_*` hook family's lane).
+                        self.db
+                            .claim_generation(
+                                self.serving_generation.as_i64() + 1,
+                                "test-interloper",
+                            )
+                            .await
+                            .expect("test interloper claim");
+                    }
+                    match self
+                        .db
+                        .insert_confirm_fence(hash, intent_id, serving_generation)
+                        .await
+                    {
+                        Ok(crate::db::confirm_fences::ConfirmFenceWrite::Durable(witness)) => {
+                            Some(witness)
+                        }
+                        // bug_015 (SIGNED Q2): the write transaction's
+                        // OWN floor check refused — this replica is
+                        // below the durable claims floor. The precise
+                        // truth is the SAME rejection the kernel's
+                        // floor check mints; uncounted leader-churn
+                        // class at the gRPC table. Nothing was
+                        // written; the license is withheld.
+                        Ok(crate::db::confirm_fences::ConfirmFenceWrite::Fenced { floor }) => {
+                            warn!(intent_id = %intent_id,
+                                  serving_generation = serving_generation.as_i64(),
+                                  floor,
+                                  "fence write refused below the durable claims floor; \
+                                   withholding the exit-0 license");
+                            return Err(PullRejection::StaleGeneration);
+                        }
                         Err(e) => {
                             warn!(intent_id = %intent_id, error = %e,
                                   "fence write-ahead failed; withholding the exit-0 license");
@@ -722,6 +758,10 @@ impl DagActor {
                 // invisible open attempt — and the mint transaction
                 // needs PG anyway.
                 if let FenceLane::Keyed(hash) = fence_lane {
+                    // Q2 scope: the screen READ stays unfenced by
+                    // design (which ANSWERS are fenced, not reads) —
+                    // the row it observes has transitively fenced
+                    // provenance (only a fenced write creates one).
                     match self.db.confirm_fence_exists(hash).await {
                         Ok(Some(witness)) => {
                             info!(intent_id = %intent_id,

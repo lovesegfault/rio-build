@@ -15,7 +15,14 @@
 //! SHA-256 of exactly the carrier bytes that VERIFIED, never of
 //! whichever carrier was merely present — and reaches the actor
 //! through the hash-or-nothing command conduit. No other layer sees
-//! raw token bytes, so no other derivation site exists.
+//! raw token bytes, so no other derivation site exists. Generation
+//! fencing (bug_015, SIGNED Q2): the license WRITE runs inside a
+//! [`super::FencedTx`] — the claims-floor check executes on the
+//! write's own connection, so "deposed replicas write nothing" is the
+//! transaction's own property, never a caller-side read-then-write.
+//! Q2's scope reading, in one line: the S4-OQ4 note below adjudicates
+//! which ANSWERS are fenced (write-ahead coverage); it is not a writer
+//! exemption — reads stay unfenced by design.
 //!
 //! Scope note (disclosed at the work order; resweep merged_bug_011):
 //! the fence covers the NOTHING-HELD answers — every keyed `Gone`
@@ -36,7 +43,7 @@
 //! risk for a window-defended residual (RULED S4-OQ4, accepted scope
 //! note — flagged for adversarial review to challenge).
 
-use super::SchedulerDb;
+use super::{SchedulerDb, ServingGeneration};
 
 /// Fence rows older than this are garbage: any straggler pull has
 /// long since timed out (client deadlines are seconds; the actor
@@ -51,20 +58,66 @@ pub(crate) const CONFIRM_FENCE_GC_SECS: f64 = 24.0 * 3600.0;
 /// keyed `Gone` license (`GoneLicense::Fenced`) cannot be built
 /// without the fence on disk — an unfenced keyed clean exit does not
 /// typecheck (merged_bug_011, keystone 1).
+///
+/// Provenance is transitively FENCED (bug_015): the write-side
+/// constructor is unreachable without the claims-floor check passing
+/// on the write transaction's own connection (the
+/// [`ConfirmFenceWrite::Durable`] arm), and the read-side constructor
+/// witnesses a row only such a fenced write can have created — so a
+/// deposed replica can neither mint the license nor launder one
+/// through the read.
 #[derive(Debug)]
 #[must_use = "a fence witness exists to license a Gone answer"]
 pub struct ConfirmFenceDurable(());
+
+/// Outcome alphabet of the fenced license write (bug_015 / R14: the
+/// write's closure set as a type — a future outcome forces an
+/// exhaustive-match decision at the one caller).
+#[derive(Debug)]
+pub(crate) enum ConfirmFenceWrite {
+    /// The floor check passed on the write's own connection and the
+    /// row is committed: the exit-0 license witness is live.
+    Durable(ConfirmFenceDurable),
+    /// The serving generation sits below the durable claims floor:
+    /// refused at the door, NOTHING written (rollback semantics of
+    /// [`super::FencedBegin::Fenced`]). `floor` is the durable floor
+    /// that refused the write, for the caller's `warn!`.
+    Fenced { floor: i64 },
+}
 
 impl SchedulerDb {
     /// Durably record the exit-0 license for one executor token
     /// (idempotent: re-confirms upsert nothing). MUST complete before
     /// the licensing reply is sent — the write-ahead half of the
-    /// fence. Returns the durable-fence witness.
+    /// fence. The INSERT runs on a [`super::FencedTx`] opened at
+    /// `serving_generation` (SIGNED Q2: `insert_confirm_fence` moves
+    /// inside `FencedTx`): the claims-floor check executes on this
+    /// write's own connection, closing the caller-side
+    /// read-then-write TOCTOU a deposed leader could exploit to mint
+    /// the license from a stale floor read. The witness is minted
+    /// ONLY after commit.
+    ///
+    /// Cost note (R17 n/a-with-reason — this is documentation, not a
+    /// typed envelope; bug_015 is not a time/cost-shaped defect): one
+    /// fenced BEGIN + floor-check SELECT (`claims_floor`: two MAX
+    /// aggregates over indexed columns) + idempotent INSERT + COMMIT
+    /// per KEYED LICENSING answer — rate-bounded by pod exits BY
+    /// CONSTRUCTION, not by the pull hot loop
+    /// (DeliverNew/DeliverExisting/NotYetReady take no fence write).
     pub(crate) async fn insert_confirm_fence(
         &self,
         executor_token_sha256: &str,
         intent_id: &str,
-    ) -> Result<ConfirmFenceDurable, sqlx::Error> {
+        serving_generation: ServingGeneration,
+    ) -> Result<ConfirmFenceWrite, sqlx::Error> {
+        let mut tx = match self.begin_fenced(serving_generation).await? {
+            super::FencedBegin::Fenced { floor } => {
+                // Rolled back at the door: nothing written, no
+                // witness — the caller withholds the license.
+                return Ok(ConfirmFenceWrite::Fenced { floor });
+            }
+            super::FencedBegin::Open(ftx) => ftx,
+        };
         sqlx::query(
             "INSERT INTO executor_confirm_fences (executor_token_sha256, intent_id) \
              VALUES ($1, $2) \
@@ -72,14 +125,19 @@ impl SchedulerDb {
         )
         .bind(executor_token_sha256)
         .bind(intent_id)
-        .execute(&self.pool)
+        .execute(tx.conn())
         .await?;
-        Ok(ConfirmFenceDurable(()))
+        tx.commit().await?;
+        // Only a committed fenced write mints the witness.
+        Ok(ConfirmFenceWrite::Durable(ConfirmFenceDurable(())))
     }
 
     /// Whether this executor token has declared its exit (the
     /// `DeliverNew` screen's read): `Some(witness)` when the fence
     /// row exists — the witness licenses the screen's `Gone` answer.
+    /// Unfenced BY DESIGN (Q2: which ANSWERS are fenced — reads
+    /// stay): the row it witnesses can only have been created by a
+    /// fenced write, so the provenance is transitively fenced.
     pub(crate) async fn confirm_fence_exists(
         &self,
         executor_token_sha256: &str,
@@ -94,7 +152,11 @@ impl SchedulerDb {
     }
 
     /// Delete fences older than `horizon_secs` (the housekeeping
-    /// rider). Returns rows deleted.
+    /// rider). Returns rows deleted. Unfenced BY DESIGN: GC is not a
+    /// decision write (a horizon-bounded delete of expired licenses
+    /// changes no answer — a swept row's straggler pull has long
+    /// since timed out), so the claims-floor capability is not
+    /// required here.
     pub(crate) async fn gc_confirm_fences(
         &self,
         horizon_secs: f64,

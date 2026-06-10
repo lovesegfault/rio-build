@@ -300,3 +300,103 @@ async fn straggler_after_live_gone_is_screened() -> TestResult {
     );
     Ok(())
 }
+
+// r[verify sched.executor.confirm-fence]
+/// bug_015 (SIGNED Q2) red: a DEPOSED replica cannot durably mint the
+/// exit-0 license from a stale floor read. The caller-side guards
+/// (`is_leader` + `max_known_generation`) are read-then-write — a
+/// successor's claim landing between the handler's floor read and the
+/// fence write is the exact TOCTOU `FencedTx` exists to close; the
+/// injection hook (`bump_claims_floor_before_fence_write`, the
+/// `fail_next_*` lane) stamps that claim deterministically inside the
+/// window. Pre-fix, verbatim: the bare-pool INSERT landed and the
+/// keyed confirm-only pull answered Gone — a deposed leader durably
+/// licensed an exit-0 that then screened the CURRENT leader's
+/// DeliverNew to Gone. Post-fix: the write transaction's OWN floor
+/// check refuses (`ConfirmFenceWrite::Fenced`), nothing is written,
+/// and the pull errs `StaleGeneration` (the same rejection the
+/// kernel's floor check mints).
+///
+/// Witness strength: certifies "a below-floor replica cannot make the
+/// license durable" — the capability claim itself, driven through the
+/// production `pull_assignment` chain (not a db-layer shortcut).
+#[tokio::test]
+async fn deposed_replica_cannot_mint_the_exit0_license() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let (handle, _task) =
+        crate::actor::tests::helpers::setup_actor_configured(db.pool.clone(), None, |_, p| {
+            p.bump_claims_floor_before_fence_write = true;
+        });
+
+    // A keyed confirm-only pull for an unknown intent answers Gone
+    // (empty DAG answers Gone to builders) — a nothing-held licensing
+    // answer, so the fence write-ahead runs. The hook stamps a
+    // successor claim AFTER the handler's floor read, BEFORE the
+    // write.
+    let outcome = handle
+        .query_unchecked(|reply| ActorCommand::PullAssignment {
+            intent_id: "fence-toctou".into(),
+            auth_intent: None,
+            kind: rio_evidence_kernel::pull::PullKind::Build,
+            executor_instance: None,
+            resume_exec_id: None,
+            claim_nonce: None,
+            confirm_only: true,
+            executor_token_sha256: Some("tokhash-deposed-pod".into()),
+            reply,
+        })
+        .await?;
+    assert!(
+        matches!(outcome, Err(PullRejection::StaleGeneration)),
+        "the deposed write must refuse with StaleGeneration (the durable \
+         claims floor moved past this replica mid-handler); got {outcome:?}"
+    );
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM executor_confirm_fences")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(
+        rows, 0,
+        "no fence row: the fenced transaction rolled back at the door — \
+         the exit-0 license was never durably minted by the deposed replica"
+    );
+    Ok(())
+}
+
+// r[verify sched.executor.confirm-fence]
+/// Green companion (happy-path regression for the fenced rewrite): at
+/// the current generation the SAME production chain mints the witness
+/// — the keyed confirm-only Gone is licensed and the fence row is
+/// durable before the reply.
+#[tokio::test]
+async fn fenced_license_write_at_current_generation_mints_the_witness() -> TestResult {
+    let (db, handle, _task) = setup().await;
+
+    let outcome = handle
+        .query_unchecked(|reply| ActorCommand::PullAssignment {
+            intent_id: "fence-current".into(),
+            auth_intent: None,
+            kind: rio_evidence_kernel::pull::PullKind::Build,
+            executor_instance: None,
+            resume_exec_id: None,
+            claim_nonce: None,
+            confirm_only: true,
+            executor_token_sha256: Some("tokhash-current-pod".into()),
+            reply,
+        })
+        .await?;
+    assert!(
+        matches!(outcome, Ok(crate::actor::pull::PullOutcome::Gone(_))),
+        "the at-floor confirm-only pull licenses Gone; got {outcome:?}"
+    );
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM executor_confirm_fences WHERE executor_token_sha256 = 'tokhash-current-pod'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        rows, 1,
+        "the write-ahead fence row is durable before the reply"
+    );
+    Ok(())
+}
