@@ -12,6 +12,7 @@
 #
 # Subtest map (each one guards a real failure mode):
 #   mount             mounts + prefetches + ready file; one root entry per --store-path
+#   uring-active      session log shows ring registration; no entry failures
 #   metadata          readdir/lookup/stat through FUSE match the original store path
 #   small-read        ≤ threshold miss: whole-file ReadBlob, byte-identical, promoted 0444 root
 #   streaming-read    > threshold miss: StatBlob+GetChunks fill, byte-identical, chunk cache fills
@@ -19,6 +20,7 @@
 #   negative-lookup   ENOENT outside the closure; the mount keeps answering
 #   teardown-b1       SIGTERM → exit 0; mountd detaches the mount and reaps staging
 #   missing-path      never-uploaded path fails fast: non-zero exit, no mount, no ready file
+#   uring-required    enable_uring=0: mount fails hard, names the kernel requirement
 #   cache-hit         second build-id reads from the shared cache: no re-fetch, passthrough hits
 #   teardown-final    second session and rio-mountd exit cleanly (SIGTERM, never -9)
 #
@@ -75,11 +77,20 @@ in
     # fuse passthrough machinery; the unprivileged serve-castore user
     # must have rio-builder (gid 990) as its PRIMARY group to pass the
     # daemon's SO_PEERCRED gid gate (production pod fsGroup analogue).
-    boot.kernelModules = [
-      "fuse"
-      "loop"
-    ];
-    boot.supportedFilesystems = [ "xfs" ];
+    boot = {
+      kernelModules = [
+        "fuse"
+        "loop"
+      ];
+      supportedFilesystems = [ "xfs" ];
+      # The kernel-side fuse-over-io_uring switch: the fuse module's
+      # `enable_uring` param defaults to off, and without it the kernel
+      # never advertises FUSE_OVER_IO_URING in INIT — the castore-FUSE
+      # (uring-only) then refuses to mount. Module params on the kernel
+      # command line apply to loadable modules too (modprobe reads
+      # /proc/cmdline).
+      kernelParams = [ "fuse.enable_uring=1" ];
+    };
     users = {
       groups.rio-builder.gid = 990;
       users.builder = {
@@ -103,7 +114,9 @@ in
   };
 
   mkTest =
-    { fixture }:
+    {
+      fixture,
+    }:
     let
       inherit (fixture) gatewayHost;
     in
@@ -111,8 +124,9 @@ in
       name = "rio-castore-fuse";
       skipTypeCheck = true;
       # Boot (3 VMs) + seed + three ssh-ng builds + DAG prefetch + chunk
-      # streaming under TCG + a second mount + coverage collection.
-      globalTimeout = 1200 + common.covTimeoutHeadroom;
+      # streaming under TCG + a second mount + coverage collection, plus
+      # one extra mount attempt for the uring-required leg.
+      globalTimeout = 1200 + 120 + common.covTimeoutHeadroom;
 
       inherit (fixture) nodes;
 
@@ -244,11 +258,25 @@ in
             )
 
         def wait_ready(tag):
-            # Ready file = mounted + prefetched + serving. If the process
-            # dies first, surface its log instead of a bare timeout.
-            client.wait_until_succeeds(
-                f"test -f /tmp/{tag}.ready -o -f /tmp/{tag}.exit", timeout=300
+            # Ready file = mounted + prefetched + serving. Three exits:
+            # ready (ok), process died (surface its log), or neither —
+            # a wedged mount sequence; surface the session log + dmesg
+            # tail instead of a bare timeout (the io_uring transport's
+            # failure mode is a parked request, not a crash).
+            rc, _ = client.execute(
+                f"timeout 300 sh -c 'until test -f /tmp/{tag}.ready -o -f /tmp/{tag}.exit; "
+                "do sleep 1; done'",
+                timeout=320,
             )
+            if rc != 0:
+                lrc, log = client.execute(f"cat /tmp/{tag}.log")
+                if lrc != 0:
+                    log = "<no log>"
+                dmesg = client.succeed("dmesg | tail -n 40")
+                raise Exception(
+                    f"serve-castore [{tag}] wedged (no ready, no exit) after 300s\n"
+                    f"--- session log ---\n{log}\n--- dmesg tail ---\n{dmesg}"
+                )
             rc, _ = client.execute(f"test -f /tmp/{tag}.ready")
             if rc != 0:
                 log = client.succeed(f"cat /tmp/{tag}.log")
@@ -319,6 +347,20 @@ in
             # The unprivileged builder uid (the one that will run the build)
             # can traverse it too.
             client.succeed("runuser -u builder -- ls /var/rio/castore/b1")
+
+        with subtest("uring-active: session registered fuse-over-io_uring rings"):
+            # The "active" line is only logged after every queue's REGISTER
+            # batch parked in the kernel; once the kernel marks the ring
+            # ready it routes ALL requests over it, so every subtest below
+            # this point exercises the ring transport — the session's only
+            # transport.
+            b1log = client.succeed("cat /tmp/b1.log")
+            assert "fuse-over-io_uring active" in b1log, (
+                f"expected ring registration in the session log:\n{b1log}"
+            )
+            assert "fuse-over-io_uring entry failed" not in b1log, (
+                f"ring entries failed after registration:\n{b1log}"
+            )
 
         with subtest("metadata: readdir/lookup/stat match the original store path"):
             orig = listing(busybox_path)
@@ -432,6 +474,30 @@ in
                 "test ! -e /var/rio/castore/b-missing && test ! -e /var/rio/staging/b-missing",
                 timeout=15,
             )
+
+        # ══ Required: kernel-side enable_uring off — mount must fail hard ══
+        with subtest("uring-required: enable_uring=0 fails the mount with a clear error"):
+            # The module param is runtime-writable; with it off the kernel
+            # stops advertising FUSE_OVER_IO_URING. There is no fallback
+            # transport: the session must exit non-zero with the kernel
+            # requirement in the error — same code path as a pre-6.14
+            # kernel — and leave no mount or staging dir behind.
+            client.succeed("echo 0 > /sys/module/fuse/parameters/enable_uring")
+            serve_castore("b-nouring", "nouring", [small_path])
+            client.wait_until_succeeds("test -f /tmp/nouring.exit", timeout=120)
+            rc = client.succeed("cat /tmp/nouring.exit").strip()
+            nlog = client.succeed("cat /tmp/nouring.log")
+            assert rc != "0", f"mount succeeded without FUSE_OVER_IO_URING:\n{nlog}"
+            assert "kernel lacks FUSE_OVER_IO_URING" in nlog, (
+                f"expected the kernel requirement in the error:\n{nlog}"
+            )
+            client.succeed("test ! -e /tmp/nouring.ready")
+            client.wait_until_succeeds(
+                "test ! -e /var/rio/castore/b-nouring && test ! -e /var/rio/staging/b-nouring",
+                timeout=15,
+            )
+            wait_mountd_idle()
+            client.succeed("echo 1 > /sys/module/fuse/parameters/enable_uring")
 
         # ══ Phase B: second build-id — everything served from the shared cache ══
         with subtest("cache-hit: second build-id reads via the shared cache, no re-fetch"):

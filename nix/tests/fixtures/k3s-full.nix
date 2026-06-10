@@ -390,7 +390,15 @@ let
         "loop"
         "wireguard"
       ];
-      kernelParams = [ "systemd.unified_cgroup_hierarchy=1" ];
+      kernelParams = [
+        "systemd.unified_cgroup_hierarchy=1"
+        # Worker pods mount the castore-FUSE, which serves exclusively
+        # over fuse-over-io_uring — without this switch the kernel
+        # never advertises FUSE_OVER_IO_URING and every per-build
+        # mount fails hard. Same switch as the production AMI
+        # (nix/nixos-node/hardening.nix).
+        "fuse.enable_uring=1"
+      ];
       supportedFilesystems = [ "xfs" ];
     };
 

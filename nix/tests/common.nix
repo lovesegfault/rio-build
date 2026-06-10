@@ -517,6 +517,13 @@ rec {
       imports = [ rioModules.worker ];
       networking.hostName = hostName;
 
+      # The worker's castore-FUSE serves exclusively over
+      # fuse-over-io_uring; without the fuse module's enable_uring
+      # param the kernel never advertises FUSE_OVER_IO_URING and every
+      # per-build mount fails hard. Same switch the production AMI sets
+      # (nix/nixos-node/hardening.nix).
+      boot.kernelParams = [ "fuse.enable_uring=1" ];
+
       services.rio = {
         package = rio-workspace;
         logFormat = "pretty"; # human-readable in test logs
