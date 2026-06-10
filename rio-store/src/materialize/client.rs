@@ -240,6 +240,33 @@ impl IntoIterator for PollPass {
 /// the stale entry's origin would mis-attribute the execution.
 pub const REBOUND_ORIGIN: &str = "resume_rebound";
 
+/// merged_bug_053 — consecutive GATED passes with an UNCHANGED
+/// Charged entry set before the wedge warn fires: the
+/// list-ok/pull-lost brownout signature ("the scheduler accepted
+/// presentations and answered none") needs several beats to
+/// distinguish itself from one slow answer.
+const WEDGE_WARN_THRESHOLD: u32 = 8;
+
+/// merged_bug_053 — the claim-wedge observer, AT THE GATE (the site
+/// the bounding invariant lets observe the stuck state): post-
+/// merged_bug_014 the standing is outcome-honest, so "the same
+/// Charged entry, N gated passes, never answered" is exactly
+/// "the scheduler accepted presentations and answered none" — the
+/// scheduler-side outage the retired cap-refusal severity predicate
+/// could never see (its site was unreachable at the production
+/// slots=1: the budget break preceded every cap refusal, so
+/// `charged == 0` at every refusal it classified). Warn-once with
+/// recovery info; the contested-remainder steady state (AtCap,
+/// CredentialOnly-dominated) stays at debug. Reset is STRUCTURAL:
+/// any answer/resolution/standing change alters the Charged set, and
+/// set-inequality is the reset.
+#[derive(Default)]
+struct WedgeLatch {
+    last_charged: Vec<Uuid>,
+    streak: u32,
+    warned: bool,
+}
+
 // r[impl sched.materialize.claim-resume]
 /// bug_251 (rule-4b, SIGNED 2026-06-04) — the bounded per-worker
 /// resume ledger, the client half of the lost-response credential.
@@ -280,33 +307,6 @@ pub const REBOUND_ORIGIN: &str = "resume_rebound";
 /// derives from the private `charged_len` alone; [`Self::len`] keeps
 /// the cap/diagnostic semantics (`RESUME_LEDGER_CAP` counts ENTRIES —
 /// credential survival is unweakened by the split).
-/// merged_bug_053 — consecutive GATED passes with an UNCHANGED
-/// Charged entry set before the wedge warn fires: the
-/// list-ok/pull-lost brownout signature ("the scheduler accepted
-/// presentations and answered none") needs several beats to
-/// distinguish itself from one slow answer.
-const WEDGE_WARN_THRESHOLD: u32 = 8;
-
-/// merged_bug_053 — the claim-wedge observer, AT THE GATE (the site
-/// the bounding invariant lets observe the stuck state): post-
-/// merged_bug_014 the standing is outcome-honest, so "the same
-/// Charged entry, N gated passes, never answered" is exactly
-/// "the scheduler accepted presentations and answered none" — the
-/// scheduler-side outage the retired cap-refusal severity predicate
-/// could never see (its site was unreachable at the production
-/// slots=1: the budget break preceded every cap refusal, so
-/// `charged == 0` at every refusal it classified). Warn-once with
-/// recovery info; the contested-remainder steady state (AtCap,
-/// CredentialOnly-dominated) stays at debug. Reset is STRUCTURAL:
-/// any answer/resolution/standing change alters the Charged set, and
-/// set-inequality is the reset.
-#[derive(Default)]
-struct WedgeLatch {
-    last_charged: Vec<Uuid>,
-    streak: u32,
-    warned: bool,
-}
-
 #[derive(Default)]
 pub struct ResumeLedger {
     entries: VecDeque<ResumeEntry>,
@@ -1077,8 +1077,8 @@ fn futility_evidence(answer: &PullAnswer) -> FutilityEvidence {
 /// served job into a claim, yet pre-fix it kept listing — staying
 /// eternally fresh under the scheduler's steal horizon and pinning
 /// its rendezvous slice fleet-wide (the wedged-but-polling worker).
-/// After [`FUTILE_PASS_THRESHOLD`] consecutive futile passes the
-/// LISTING is withheld for [`FUTILE_RELIST_INTERVAL_PASSES`] passes
+/// After `FUTILE_PASS_THRESHOLD` consecutive futile passes the
+/// LISTING is withheld for `FUTILE_RELIST_INTERVAL_PASSES` passes
 /// (long enough to leave the scheduler's membership — the slice
 /// re-homes permanently), then ONE probe pass re-lists; any
 /// delivery or clean outcome resets. The RESUME presentation lane
@@ -1128,7 +1128,10 @@ impl ConversionFutilityLatch {
                         streak = self.consecutive_futile,
                         withheld_passes = FUTILE_RELIST_INTERVAL_PASSES,
                         last_rejected = pass.last_rejected_drv.as_deref().unwrap_or("<none>"),
-                        "every fresh mint this streak was answered with a                          conversion-disproving rejection; withholding the                          listing beat so the rendezvous slice re-homes                          (the resume lane keeps presenting)"
+                        "every fresh mint this streak was answered with a \
+                         conversion-disproving rejection; withholding the \
+                         listing beat so the rendezvous slice re-homes \
+                         (the resume lane keeps presenting)"
                     );
                 }
             }
@@ -1142,9 +1145,7 @@ impl ConversionFutilityLatch {
 
     fn reset_on_conversion(&mut self) {
         if self.engaged {
-            info!(
-                "conversion recovered; listing beat resumes (futility                  latch reset)"
-            );
+            info!("conversion recovered; listing beat resumes (futility latch reset)");
         }
         self.consecutive_futile = 0;
         self.withhold_remaining = 0;
@@ -1349,7 +1350,8 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
     }
     if futility.withholds_this_pass() {
         debug!(
-            "conversion-futility latch engaged; listing beat withheld              until the re-probe interval elapses"
+            "conversion-futility latch engaged; listing beat withheld until \
+             the re-probe interval elapses"
         );
         pacing.beat_withheld = true;
         finish!();
