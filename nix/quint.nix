@@ -7292,6 +7292,109 @@ rec {
     };
 
     # ------------------------------------------------------------------
+    # Materialization listing distribution (bughunt-5 slot 6b,
+    # live_041; SIGNED Q4 full rendezvous, RULED CF-1/CF-2/CF-3):
+    # rendezvous-partitioned leader listings across the per-WORKER
+    # store membership (contact-map view, never process liveness) +
+    # the server-computed steal horizon for stale-owner jobs
+    # (docs/spec/models/materializationDistribution.qnt). The holds
+    # check is EXHAUSTIVE (tlc; 4 members x 3 jobs x 7 beats). The
+    # FS-3-reconciled hold set: ownership exactly-one, own-segment
+    # disjointness/coverage, staleness-bounded steal, the bounded
+    # silence horizon, and broad orphan recovery —
+    # exactly-one-LISTING is deliberately NOT a property (the steal
+    # horizon legitimately double-lists after staleness). Twins are
+    # const-lane imports of the live module (no action overrides):
+    # the as-built shared-head convoy, the no-steal orphan, and the
+    # no-horizon eager steal (the third completes quint-policy P1's
+    # twin-per-leaf for the staleness bound). maxSamples sized 25/p
+    # from measured traces-to-first-hit (~600-2000 across the five
+    # witnesses; measurements in the introducing commit).
+    # ------------------------------------------------------------------
+
+    # r[verify sched.materialize.listing-distribution]
+    quint-materialization-distribution = mkQuintCheck {
+      name = "materialization-distribution";
+      spec = "materializationDistribution";
+      main = "materializationDistributionBase";
+      invariants = [
+        "ownerMapPartitionsClaimable"
+        "ownSliceListingsPartitionClaimable"
+        "stealOnlyAfterOwnerStaleness"
+        "noJobUnlistedForever"
+        "stealRecoversOrphanedRemainder"
+      ];
+    };
+
+    # live_041 FALSIFY half 1, the as-built convoy: no owner law —
+    # everyone owns/lists the same head; coverage holds, disjointness
+    # dies (the live 95.6%-wasted / 29.1s-stall shape).
+    # r[verify sched.materialize.listing-distribution]
+    quint-matdist-falsify-convoy-ownership = mkQuintSimWitnessCheck {
+      name = "matdist-falsify-convoy-ownership";
+      spec = "calibration/matdist-shared-head-convoy";
+      main = "matDistCalibSharedHeadConvoy";
+      extraSpecs = [ "materializationDistribution" ];
+      witness = "ownerMapPartitionsClaimable";
+      maxSamples = 200000;
+      maxSteps = 12;
+    };
+
+    # Same convoy lane, the listing projection: every member's own
+    # segment is the whole head.
+    # r[verify sched.materialize.listing-distribution]
+    quint-matdist-falsify-convoy-listings = mkQuintSimWitnessCheck {
+      name = "matdist-falsify-convoy-listings";
+      spec = "calibration/matdist-shared-head-convoy";
+      main = "matDistCalibSharedHeadConvoy";
+      extraSpecs = [ "materializationDistribution" ];
+      witness = "ownSliceListingsPartitionClaimable";
+      maxSamples = 200000;
+      maxSteps = 12;
+    };
+
+    # live_041 FALSIFY half 2, the orphaned remainder: partition
+    # without the steal horizon — a dead owner's slice strands in the
+    # (horizon, ttl] gap.
+    # r[verify sched.materialize.listing-distribution]
+    quint-matdist-falsify-no-steal-orphan = mkQuintSimWitnessCheck {
+      name = "matdist-falsify-no-steal-orphan";
+      spec = "calibration/matdist-no-steal-orphan";
+      main = "matDistCalibNoStealOrphan";
+      extraSpecs = [ "materializationDistribution" ];
+      witness = "noJobUnlistedForever";
+      maxSamples = 200000;
+      maxSteps = 12;
+    };
+
+    # Same no-steal lane: the stale-owned job reaches nobody (broad
+    # recovery is the steal horizon's delivery obligation).
+    # r[verify sched.materialize.listing-distribution]
+    quint-matdist-falsify-no-steal-strand = mkQuintSimWitnessCheck {
+      name = "matdist-falsify-no-steal-strand";
+      spec = "calibration/matdist-no-steal-orphan";
+      main = "matDistCalibNoStealOrphan";
+      extraSpecs = [ "materializationDistribution" ];
+      witness = "stealRecoversOrphanedRemainder";
+      maxSamples = 200000;
+      maxSteps = 12;
+    };
+
+    # The no-horizon greedy steal (the design CF-3 rejected): serving
+    # the whole remainder regardless of owner freshness re-creates
+    # the convoy one hop later — the prematureSteal ghost latches.
+    # r[verify sched.materialize.listing-distribution]
+    quint-matdist-falsify-eager-steal = mkQuintSimWitnessCheck {
+      name = "matdist-falsify-eager-steal";
+      spec = "calibration/matdist-eager-steal";
+      main = "matDistCalibEagerSteal";
+      extraSpecs = [ "materializationDistribution" ];
+      witness = "stealOnlyAfterOwnerStaleness";
+      maxSamples = 200000;
+      maxSteps = 12;
+    };
+
+    # ------------------------------------------------------------------
     # Gateway connection/session lifecycle campaign (gw-session-formal,
     # round-2 Track B), Phase 0 Stage C: the rio-gateway accept → auth →
     # channel open → exec admission → protocol session → teardown
