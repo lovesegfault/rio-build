@@ -1520,8 +1520,8 @@ impl ClusterId {
     /// sharing one PG mint byte-identical `exposure::{hw}:{slot}`
     /// uids every window and silently absorb each other's
     /// λ-denominator evidence (M_047 dedup). The predicate the
-    /// activation disclosure ([`disclose_cluster_identity`]) and the
-    /// config docs quantify over.
+    /// activation disclosure (`disclose_cluster_identity`, private to
+    /// this module) and the config docs quantify over.
     pub fn is_single_cluster_default(&self) -> bool {
         self.0.is_empty()
     }
