@@ -170,6 +170,87 @@ impl WaveBudget {
     }
 }
 
+/// A typed per-operation retry envelope (merged_bug_006): the complete
+/// retry-layer shape — attempts × per-attempt timeout plus capped
+/// exponential backoffs — as ONE value, so the SDK wire config and the
+/// conformance arithmetic derive from the same source and cannot
+/// drift apart (the R14 shared-value shape).
+///
+/// The defect class this closes: [`WaveBudget`] brackets a whole I/O
+/// wave, but the shared S3 client deliberately carries NO
+/// `TimeoutConfig` and an operator-tunable `max_attempts` (see
+/// `rio_common::s3::default_client`). With no per-attempt bound BELOW
+/// the retry layer, the retry envelope on a slow-but-alive peer is
+/// unbounded — no finite wave budget can bracket it, so the budget
+/// CANCELS lawful churn-recovery ladders (the exact recoveries the
+/// raised attempt count exists for). The law: an enforced whole-op
+/// deadline must DOMINATE the retry envelope it brackets — per-attempt
+/// timeouts below the retry layer, whole-op budgets above it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryEnvelope {
+    /// Total attempts (first try + retries), ≥ 1 — the SDK's
+    /// `max_attempts`.
+    pub attempts: u32,
+    /// Per-attempt timeout (the SDK's `operation_attempt_timeout`).
+    pub attempt_timeout: Duration,
+    /// First between-attempt backoff; doubles per retry (the SDK's
+    /// `initial_backoff`; jitter only shrinks it).
+    pub initial_backoff: Duration,
+    /// Cap on any single between-attempt backoff (`max_backoff`).
+    pub max_backoff: Duration,
+}
+
+impl RetryEnvelope {
+    /// Worst-case wall time of the whole envelope: every attempt
+    /// consumes its full per-attempt timeout and every between-attempt
+    /// gap its capped backoff —
+    /// `attempts × attempt_timeout + Σᵢ min(initial_backoff·2ⁱ, max_backoff)`
+    /// over the `attempts − 1` gaps. (SDK jitter MULTIPLIES backoffs
+    /// by a factor in [0, 1], so this is an upper bound on the
+    /// backoff schedule.) The const-asserted ordering law
+    /// (`worst_case() ≤ ADMIN_VERIFY_WORST_WAVE`, R17) is what makes
+    /// the wave budget a true BACKSTOP: the envelope exhausts first,
+    /// and the budget fires only on shapes the retry layer itself
+    /// cannot bound.
+    #[must_use]
+    pub const fn worst_case(self) -> Duration {
+        let mut total_ms = self.attempt_timeout.as_millis() as u64 * self.attempts as u64;
+        let mut backoff_ms = self.initial_backoff.as_millis() as u64;
+        let max_ms = self.max_backoff.as_millis() as u64;
+        let mut gap = 1;
+        while gap < self.attempts {
+            total_ms += if backoff_ms < max_ms {
+                backoff_ms
+            } else {
+                max_ms
+            };
+            backoff_ms = backoff_ms.saturating_mul(2);
+            gap += 1;
+        }
+        Duration::from_millis(total_ms)
+    }
+}
+
+/// The VerifyChunks HeadObject lane's retry envelope, sized so
+/// `worst_case()` fits INSIDE [`ADMIN_VERIFY_WORST_WAVE`] with
+/// recorded headroom: 3 × 1200 ms + (100 ms + 200 ms) = 3.9 s ≤ 5 s
+/// (22% headroom; the conformance test below asserts the relation, a
+/// unit pins the arithmetic). Derivation: 3 attempts cover the
+/// rustfs/MinIO churn shape — a recycled pooled connection plus one
+/// more black-holed retry — while a fresh connection succeeds; 1200 ms
+/// per attempt is ~10× the p99 healthy HEAD; short capped backoffs
+/// because the failure mode is connection churn, not throttling. The
+/// envelope deliberately DOES NOT derive from the client-wide
+/// `s3_max_attempts` knob: that knob keeps governing the ops it was
+/// raised for (puts/gets under churn), while this chokepoint owns its
+/// own bound — drift-immunity by construction, not by assertion.
+pub const ADMIN_VERIFY_HEAD_ENVELOPE: RetryEnvelope = RetryEnvelope {
+    attempts: 3,
+    attempt_timeout: Duration::from_millis(1200),
+    initial_backoff: Duration::from_millis(100),
+    max_backoff: Duration::from_millis(200),
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +325,63 @@ mod tests {
             1,
             ADMIN_STREAM_INACTIVITY_TIMEOUT
         ));
+    }
+
+    /// The NEW first link of the three-link chain (merged_bug_006,
+    /// R17): `ADMIN_VERIFY_HEAD_ENVELOPE.worst_case()` ≤
+    /// `ADMIN_VERIFY_WORST_WAVE` ≤ emission gap ≤ the 120 s client
+    /// bound (links 2-3 asserted by
+    /// `verify_emission_gap_is_inside_the_client_bound` above).
+    /// Strawman disclosure (R16): this test cannot be red pre-fix —
+    /// the envelope type did not exist; it is the STANDING drift
+    /// gate, the same role the emission-gap test plays one link up.
+    /// The behavioral red lives in rio-store
+    /// (`churn_recovery_ladder_completes_inside_the_wave_budget`).
+    #[test]
+    fn head_retry_envelope_fits_inside_the_wave_budget() {
+        let worst = ADMIN_VERIFY_HEAD_ENVELOPE.worst_case();
+        assert!(
+            worst <= ADMIN_VERIFY_WORST_WAVE,
+            "the HEAD retry envelope's worst case ({worst:?}) must fit inside \
+             ADMIN_VERIFY_WORST_WAVE ({ADMIN_VERIFY_WORST_WAVE:?}) — a budget \
+             below its own retry envelope cancels lawful churn recoveries"
+        );
+    }
+
+    /// Pins the worst-case arithmetic (and the headroom note in the
+    /// const doc): 3 × 1200 ms + (100 + 200) ms = 3.9 s.
+    #[test]
+    fn head_retry_envelope_worst_case_arithmetic() {
+        assert_eq!(
+            ADMIN_VERIFY_HEAD_ENVELOPE.worst_case(),
+            Duration::from_millis(3900),
+            "recompute the headroom note in the const doc"
+        );
+        // The backoff cap binds: a 2-gap ladder pays initial then cap.
+        let uncapped = RetryEnvelope {
+            attempts: 3,
+            attempt_timeout: Duration::from_millis(1000),
+            initial_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_millis(10_000),
+        };
+        assert_eq!(uncapped.worst_case(), Duration::from_millis(3300));
+    }
+
+    /// The budget-elapse direction's OWN witness (re-homed from the
+    /// rio-store black-holed test, which post-fix exercises the
+    /// envelope instead): a future that outlives the envelope's worst
+    /// case is killed by the wave-budget BACKSTOP with the typed
+    /// error carrying the enforced const.
+    #[tokio::test(start_paused = true)]
+    async fn wave_budget_backstop_fires_beyond_the_envelope() {
+        let budget = admin_verify_wave_budget();
+        let err = budget
+            .run(std::future::pending::<()>())
+            .await
+            .expect_err("a never-resolving op must elapse the backstop");
+        assert_eq!(
+            err.budget, ADMIN_VERIFY_WORST_WAVE,
+            "the elapse must carry the liveness const it enforced"
+        );
     }
 }

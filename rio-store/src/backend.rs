@@ -556,7 +556,7 @@ impl ChunkBackend for S3ChunkBackend {
         // StoreAdminService.VerifyChunks (admin.rs).
         //
         // Chunked into batches of 16, each batch awaited concurrently via
-        // join_all. Simpler than pulling in futures-util just for buffered().
+        // futures_util::future::join_all (which preserves creation order).
         // Output order preserved: chunks_of_16[i] maps to hashes[i*16..].
         //
         // The wave width is the SHARED bilateral constant
@@ -575,6 +575,33 @@ impl ChunkBackend for S3ChunkBackend {
         // admin classification into Status::unavailable, instead of
         // hanging the audit past the CLI's 120 s inactivity bound.
         let budget = rio_common::liveness::admin_verify_wave_budget();
+        // merged_bug_006: the HEAD lane owns its own typed retry
+        // envelope, SIZED INSIDE the wave budget (the const-asserted
+        // ordering law lives beside the const in rio_common::liveness:
+        // envelope.worst_case() <= ADMIN_VERIFY_WORST_WAVE <= emission
+        // gap <= the CLI's 120 s bound). Per-attempt timeouts sit
+        // BELOW the SDK retry layer; the wave budget stays ABOVE it as
+        // the backstop — lawful churn-recovery ladders now COMPLETE
+        // inside the budget instead of being cancelled by it. Every
+        // wire knob derives from the ONE envelope value, so the bound
+        // and the retry shape cannot drift apart. The client-wide
+        // s3_max_attempts knob keeps governing the ops it was raised
+        // for (puts/gets under rustfs churn); this chokepoint is
+        // deliberately decoupled via per-operation config override.
+        const HEAD_ENVELOPE: rio_common::liveness::RetryEnvelope =
+            rio_common::liveness::ADMIN_VERIFY_HEAD_ENVELOPE;
+        let head_config = aws_sdk_s3::config::Config::builder()
+            .retry_config(
+                aws_sdk_s3::config::retry::RetryConfig::standard()
+                    .with_max_attempts(HEAD_ENVELOPE.attempts)
+                    .with_initial_backoff(HEAD_ENVELOPE.initial_backoff)
+                    .with_max_backoff(HEAD_ENVELOPE.max_backoff),
+            )
+            .timeout_config(
+                aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+                    .operation_attempt_timeout(HEAD_ENVELOPE.attempt_timeout)
+                    .build(),
+            );
         let mut results = Vec::with_capacity(hashes.len());
 
         for batch in hashes.chunks(CONCURRENCY) {
@@ -584,12 +611,21 @@ impl ChunkBackend for S3ChunkBackend {
                     let key = self.s3_key(hash);
                     let client = self.client.clone();
                     let bucket = self.bucket.clone();
+                    let head_config = head_config.clone();
                     async move {
                         metrics::counter!(
                             "rio_store_s3_requests_total", "operation" => "head_object"
                         )
                         .increment(1);
-                        match client.head_object().bucket(bucket).key(&key).send().await {
+                        match client
+                            .head_object()
+                            .bucket(bucket)
+                            .key(&key)
+                            .customize()
+                            .config_override(head_config)
+                            .send()
+                            .await
+                        {
                             Ok(_) => Ok(true),
                             Err(err) => {
                                 let service_err = err.into_service_error();
@@ -1067,16 +1103,20 @@ mod tests {
     #[tokio::test]
     async fn s3_exists_batch_ordering() -> anyhow::Result<()> {
         // Three HeadObject calls: found, not-found, found.
-        // exists_batch uses buffered() (not buffer_unordered) so results
-        // stay in input order even though the calls run in parallel.
+        // exists_batch awaits each wave via futures_util::future::join_all,
+        // so results stay in input order even though the calls run in
+        // parallel.
         let r1 = mock!(Client::head_object).then_output(|| HeadObjectOutput::builder().build());
         let r2 = mock!(Client::head_object)
             .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
         let r3 = mock!(Client::head_object).then_output(|| HeadObjectOutput::builder().build());
-        // Sequential mode: buffered() preserves the order futures were
+        // Sequential mode: join_all preserves the order futures were
         // CREATED (not the order they COMPLETE), so output[i] corresponds
-        // to input[i] regardless of which mock fires first.
-        let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&r1, &r2, &r3]);
+        // to input[i] regardless of which mock fires first. (The sleep
+        // impl backs the HEAD lane's per-op retry/timeout override —
+        // the SDK refuses retry/timeout config without one.)
+        let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&r1, &r2, &r3], |b| b
+            .sleep_impl(TestTokioSleep));
         let backend = make_s3_backend(client);
 
         let result = backend.exists_batch(&[HASH_A, HASH_B, HASH_C]).await?;
@@ -1084,15 +1124,19 @@ mod tests {
         Ok(())
     }
 
-    /// bug_108 red: a black-holed connection — established, then
-    /// silent forever — must fail TYPED within the liveness wave
-    /// budget, not hang past the client's 120 s inactivity bound.
-    /// The client is the production constructor over a test connector
+    /// bug_108 red, re-aimed by merged_bug_006: a black-holed
+    /// connection — established, then silent forever — must fail
+    /// TYPED within ADMIN_VERIFY_WORST_WAVE, not hang past the
+    /// client's 120 s inactivity bound. Post-envelope, the proposition
+    /// this certifies (R16) is sharper: the wave exhausts the
+    /// envelope's per-attempt timeouts and fails via the CLASSIFIED
+    /// SDK error BEFORE the budget elapses (the budget-elapse
+    /// direction has its own witness in rio-common:
+    /// `wave_budget_backstop_fires_beyond_the_envelope`). The client
+    /// is the production constructor over a test connector
     /// (production wire shapes, no hand-rolled backend stub): a
     /// custom HttpClient whose connector future never resolves is
-    /// exactly the established-then-black-holed peer, and with no
-    /// TimeoutConfig the SDK's never-completing FIRST attempt defeats
-    /// its own retry layer.
+    /// exactly the established-then-black-holed peer.
     #[tokio::test(start_paused = true)]
     async fn black_holed_head_fails_typed_within_the_wave_budget() {
         use aws_smithy_runtime_api::client::http::{
@@ -1124,29 +1168,143 @@ mod tests {
             .region(aws_sdk_s3::config::Region::new("us-east-1"))
             .credentials_provider(aws_sdk_s3::config::Credentials::for_tests())
             .http_client(BlackHole)
+            .sleep_impl(TestTokioSleep)
             .build();
         let backend = make_s3_backend(Client::from_conf(cfg));
 
         let budget = rio_common::liveness::admin_verify_wave_budget();
         let outer = budget.duration() * 2;
+        let started = tokio::time::Instant::now();
         match tokio::time::timeout(outer, backend.exists_batch(&[HASH_A])).await {
             Err(_elapsed) => panic!(
                 "exists_batch hung past 2x the wave budget against a black-holed \
-                 connection — the liveness const is unenforced (no BoundedOp wiring)"
+                 connection — neither the retry envelope nor the budget backstop \
+                 is wired"
             ),
             Ok(Ok(_)) => panic!("a black-holed HEAD cannot succeed"),
             Ok(Err(e)) => {
-                // The wiring assertion: the typed elapse carries the
-                // const budget the mint wrapped.
-                let exceeded = e
-                    .downcast_ref::<rio_common::liveness::WaveBudgetExceeded>()
-                    .unwrap_or_else(|| panic!("expected the typed WaveBudgetExceeded, got: {e:#}"));
-                assert_eq!(
-                    exceeded.budget,
-                    rio_common::liveness::ADMIN_VERIFY_WORST_WAVE,
-                    "the elapse must carry the liveness const it enforced"
+                // Paused-clock elapsed assertion: the failure lands
+                // within the wave const (envelope worst case 3.9 s
+                // < 5 s — the envelope exhausts FIRST).
+                let elapsed = started.elapsed();
+                assert!(
+                    elapsed <= rio_common::liveness::ADMIN_VERIFY_WORST_WAVE,
+                    "a black-holed wave must fail within ADMIN_VERIFY_WORST_WAVE; \
+                     took {elapsed:?}"
+                );
+                // The envelope (below the budget) classifies the
+                // failure — the budget backstop must NOT be the layer
+                // that fired.
+                assert!(
+                    e.downcast_ref::<rio_common::liveness::WaveBudgetExceeded>()
+                        .is_none(),
+                    "the per-attempt envelope must exhaust before the budget \
+                     backstop fires; got the backstop's elapse: {e:#}"
                 );
             }
         }
+    }
+
+    /// Paused-clock-respecting sleep for the SDK's retry/timeout
+    /// plumbing (the SDK re-exports the `AsyncSleep` trait but not a
+    /// tokio sleeper; this adapter is runtime infrastructure, not a
+    /// wire/identity fixture).
+    #[derive(Debug, Clone)]
+    struct TestTokioSleep;
+    impl aws_sdk_s3::config::AsyncSleep for TestTokioSleep {
+        fn sleep(&self, duration: std::time::Duration) -> aws_sdk_s3::config::Sleep {
+            aws_sdk_s3::config::Sleep::new(tokio::time::sleep(duration))
+        }
+    }
+
+    /// Production `aws_sdk_s3::Client` over a SCRIPTED test connector
+    /// (the BlackHole pattern extended to scripted responses,
+    /// R13-conformant): the first `hung` connector calls never
+    /// resolve — the established-then-recycled pooled connection the
+    /// rustfs/MinIO churn produces — and every later call answers a
+    /// bare HeadObject 200 on a fresh connection.
+    fn scripted_churn_client(hung: usize) -> Client {
+        use aws_smithy_runtime_api::client::http::{
+            HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings,
+            SharedHttpConnector,
+        };
+        use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
+        use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug, Clone)]
+        struct Scripted {
+            hung: usize,
+            calls: Arc<AtomicUsize>,
+        }
+        impl HttpConnector for Scripted {
+            fn call(&self, _request: HttpRequest) -> HttpConnectorFuture {
+                if self.calls.fetch_add(1, Ordering::SeqCst) < self.hung {
+                    HttpConnectorFuture::new(std::future::pending())
+                } else {
+                    HttpConnectorFuture::new(async {
+                        Ok(aws_smithy_runtime_api::http::Response::new(
+                            aws_smithy_runtime_api::http::StatusCode::try_from(200)
+                                .expect("static status"),
+                            aws_sdk_s3::primitives::SdkBody::empty(),
+                        ))
+                    })
+                }
+            }
+        }
+        impl HttpClient for Scripted {
+            fn http_connector(
+                &self,
+                _settings: &HttpConnectorSettings,
+                _components: &RuntimeComponents,
+            ) -> SharedHttpConnector {
+                SharedHttpConnector::new(self.clone())
+            }
+        }
+
+        let cfg = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::for_tests())
+            .http_client(Scripted {
+                hung,
+                calls: Arc::default(),
+            })
+            .sleep_impl(TestTokioSleep)
+            .build();
+        Client::from_conf(cfg)
+    }
+
+    /// merged_bug_006 red: a LAWFUL churn-recovery retry ladder — the
+    /// exact rustfs/MinIO connection-churn recovery the raised
+    /// attempt count exists for — must COMPLETE inside the wave
+    /// budget. Attempts 1-2 hang (pooled connections black-holed by a
+    /// server-side recycle); attempt 3 succeeds on a fresh
+    /// connection. Proposition certified (R16): the HEAD lane's retry
+    /// envelope sits BELOW the wave budget, so lawful churn recovery
+    /// finishes inside it — the claim the 5 s const's "SDK retries
+    /// included" sentence rides on. (The black-holed test certifies
+    /// only the easy direction: a never-resolving wave dies typed.)
+    #[tokio::test(start_paused = true)]
+    async fn churn_recovery_ladder_completes_inside_the_wave_budget() {
+        let backend = make_s3_backend(scripted_churn_client(2));
+
+        let started = tokio::time::Instant::now();
+        let result = backend.exists_batch(&[HASH_A]).await;
+        let elapsed = started.elapsed();
+
+        let exists = result.unwrap_or_else(|e| {
+            panic!(
+                "a lawful churn-recovery ladder (2 hung attempts, then success) \
+                 must complete INSIDE the wave budget — cancelling it aborts \
+                 whole audits with no resume cursor; got after {elapsed:?}: {e:#}"
+            )
+        });
+        assert_eq!(exists, vec![true]);
+        assert!(
+            elapsed <= rio_common::liveness::ADMIN_VERIFY_WORST_WAVE,
+            "the recovered ladder must fit the wave budget; took {elapsed:?}"
+        );
     }
 }

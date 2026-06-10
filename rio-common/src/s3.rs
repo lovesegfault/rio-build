@@ -53,7 +53,13 @@ pub const DEFAULT_S3_MAX_ATTEMPTS: u32 = 10;
 ///    attempt defeats the retry layer above. Every caller with a
 ///    liveness law therefore brings its OWN typed bound — the
 ///    `rio_common::liveness::WaveBudget` combinator is the standing
-///    vehicle (exists_batch's HeadObject waves are the exemplar). A
+///    vehicle, and the VerifyChunks HEAD lane is the worked example
+///    of the FULL shape (merged_bug_006): a typed
+///    `rio_common::liveness::RetryEnvelope`
+///    (`ADMIN_VERIFY_HEAD_ENVELOPE`) applied per-operation BELOW the
+///    budget, const-asserted to exhaust inside it, with the budget as
+///    backstop — a bare whole-op budget over this client's unbounded
+///    retry ladder would otherwise cancel lawful churn recoveries. A
 ///    client-wide `operation_attempt_timeout` needs an op-size census
 ///    across every caller (chunk puts, log batches, GetObject) under
 ///    load before it can be sized — recorded as open question Q-108,
