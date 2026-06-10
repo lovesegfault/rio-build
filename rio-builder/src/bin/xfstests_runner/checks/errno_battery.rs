@@ -317,7 +317,7 @@ pub fn generic_294_eexist_unprivileged(ctx: &Ctx) -> anyhow::Result<Outcome> {
 /// FINDING F-D (PLAN.md): unlink/mkdir/rmdir/create/rename/chmod/
 /// truncate/utimens return ENOSYS ("Function not implemented") and
 /// symlink/link return EPERM instead of EROFS, because the mount is
-/// not MS_RDONLY and `CastoreFs` implements no write ops.
+/// not MS_RDONLY and the write ops are denied in the FUSE handlers.
 pub fn generic_294_erofs_battery_root(ctx: &Ctx) -> anyhow::Result<Outcome> {
     ensure!(
         nix::unistd::geteuid().is_root(),
@@ -502,8 +502,8 @@ pub fn generic_007_enoent_never_eio(ctx: &Ctx) -> anyhow::Result<Outcome> {
 }
 
 /// statfs sanity: statvfs on the mount succeeds and reports a sane
-/// NAME_MAX. FINDING F-A (PLAN.md): `CastoreFs` does not implement
-/// statfs, so fuser's default reply gives all-zero block/file totals —
+/// NAME_MAX. FINDING F-A (PLAN.md): the castore-FUSE replies the
+/// conventional empty statfs (all-zero block/file totals) —
 /// harmless for builds that only read inputs, but tools that pre-check
 /// free space on an input path see 0. Asserted as `0 or >0` so a real
 /// statfs implementation keeps this green; the actual totals are
@@ -517,7 +517,7 @@ pub fn statfs_zero_totals(ctx: &Ctx) -> anyhow::Result<Outcome> {
     );
     if vfs.blocks() == 0 {
         println!(
-            "    FINDING F-A: statfs reports 0 total blocks (fuser default reply; CastoreFs has no statfs)"
+            "    FINDING F-A: statfs reports 0 total blocks (the castore-FUSE empty statfs reply)"
         );
     } else {
         println!(
@@ -532,10 +532,10 @@ pub fn statfs_zero_totals(ctx: &Ctx) -> anyhow::Result<Outcome> {
 /// generic/050 (root write leg) — the write-through probe.
 ///
 /// POSIX: open(O_WRONLY) on a read-only filesystem fails with EROFS,
-/// so write-through is impossible. On the castore-FUSE, root's
-/// open(O_WRONLY) reaches `CastoreFs::open`, which ignores the access
-/// mode and (for a cache-hit file) replies FOPEN_PASSTHROUGH with a
-/// backing id. The kernel then opens the backing cache file with the
+/// so write-through is impossible. On a castore-FUSE whose `open()`
+/// handler ignored the access mode, root's open(O_WRONLY) would (for
+/// a cache-hit file) get a FOPEN_PASSTHROUGH reply with a backing
+/// id. The kernel then opens the backing cache file with the
 /// caller's flags under the BACKING_OPEN broker's credentials
 /// (rio-mountd, root) — `backing_file_open` performs no DAC check —
 /// and write(2) goes straight into the node-shared cache file.

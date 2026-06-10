@@ -62,9 +62,10 @@ pub struct CastoreSettings {
     /// prefetch. Expiry is an infrastructure failure (re-queue), never
     /// a wedged mount.
     pub dag_prefetch_timeout: Duration,
-    /// FUSE event-loop threads (clamped to ≥ 1). Cold `open()`s block
-    /// their callback thread on the store fetch, so more than one keeps
-    /// metadata lookups responsive while a fetch is in flight.
+    /// Slow-pool worker threads for the ring engine (clamped to ≥ 1) —
+    /// cold `open()`s block a worker on the store fetch, so more than
+    /// one keeps further cold opens moving while a fetch is in flight.
+    /// Also the fuser thread count for the non-ring request classes.
     pub fuse_threads: usize,
     /// `open()` data-path tunables.
     pub opener: OpenerConfig,
@@ -138,6 +139,12 @@ pub struct CastoreSession {
     /// FUSE we are tearing down). `None` when fusectl is unavailable;
     /// teardown then degrades to UDS-shutdown-only.
     abort_path: Option<PathBuf>,
+    /// The fuse-over-io_uring engine serving the session. Held so the
+    /// ring buffers outlive the kernel's references; its threads wind
+    /// down on the teardown CQEs that the abort write in [`Drop`]
+    /// triggers (no join — same never-block contract as the fuser
+    /// threads).
+    _uring: super::uring::Engine,
     /// Kernel-enforced staging quota mountd applied at `Mount` time
     /// (0 = no quota configured on the daemon).
     pub staging_quota_bytes: u64,
@@ -302,12 +309,12 @@ pub fn mount_and_serve(
     )?;
 
     let mut directory = store.directory.clone();
-    let tree = runtime.block_on(InoMap::prefetch(
+    let tree = Arc::new(runtime.block_on(InoMap::prefetch(
         &mut directory,
         input_roots,
         settings.dag_prefetch_timeout,
         assignment_token,
-    ))?;
+    ))?);
     tracing::info!(
         build_id,
         roots = input_roots.len(),
@@ -332,22 +339,58 @@ pub fn mount_and_serve(
         settings.opener.clone(),
     ));
 
+    // fuse-over-io_uring, step 1 of 3 (probe): create the rings and
+    // dup the session fd BEFORE the INIT handshake. The INIT reply
+    // advertises FUSE_OVER_IO_URING, after which the kernel holds
+    // request processing until registration completes — so the rings
+    // must already exist when the flag is offered. The transport is
+    // mandatory: a failed probe (seccomp/sysctl-blocked io_uring, fd
+    // limits) fails the mount with the kernel requirement named.
+    // r[impl builder.fs.io-uring-required]
+    let (uring_prep, ring_fd) = super::uring::prepare()
+        .and_then(|prep| Ok((prep, fuse_fd.try_clone()?)))
+        .map_err(|e| {
+            std::io::Error::other(format!(
+                "io_uring unavailable ({e}); the castore-FUSE serves exclusively over \
+                 fuse-over-io_uring and requires Linux 6.14+ with fuse.enable_uring=1"
+            ))
+        })?;
+
+    let fs = CastoreFs::new(Arc::clone(&tree));
+
     let mut fuse_cfg = fuser::Config::default();
     fuse_cfg.n_threads = Some(settings.fuse_threads.max(1));
     // SessionACL::All matches the `allow_other` mount option mountd
     // passed: the build's userns uids (not this process's) are the ones
     // traversing the tree.
-    let session = fuser::Session::from_fd(
-        CastoreFs::new(tree, opener),
-        fuse_fd,
-        fuser::SessionACL::All,
-        fuse_cfg,
-    )?;
-    // `from_fd` already completed the FUSE_INIT handshake (where
-    // passthrough is negotiated — a kernel without FUSE_PASSTHROUGH
-    // fails here, not at first open); spawn only starts the request
-    // loop threads.
+    //
+    // Step 2 of 3 (handshake): `init` inside `from_fd` requires the
+    // kernel to accept FUSE_OVER_IO_URING — a kernel without it (or
+    // without FUSE_PASSTHROUGH) fails the mount here, with the
+    // requirement in the error.
+    let session = fuser::Session::from_fd(fs, fuse_fd, fuser::SessionACL::All, fuse_cfg)?;
+    // `spawn` only starts the fuser threads serving the non-ring
+    // request classes (INTERRUPT, FORGET, notifications).
     let fuse = session.spawn()?;
+
+    // Step 3 of 3 (register): with INIT done, register the rings.
+    // `spawn` returns once every queue's REGISTER batch is parked in
+    // the kernel; any rejection fails the mount — dropping the session
+    // (and the mountd connection) closes the fuse connection, which
+    // completes whatever did register.
+    let uring = uring_prep
+        .spawn(
+            ring_fd,
+            Arc::clone(&tree),
+            Arc::clone(&opener),
+            settings.fuse_threads.max(1),
+        )
+        .map_err(|e| {
+            std::io::Error::other(format!(
+                "fuse-over-io_uring ring registration failed ({e}); the castore-FUSE \
+                 requires Linux 6.14+ with fuse.enable_uring=1"
+            ))
+        })?;
 
     // The serving session is up; capture the fusectl abort path NOW
     // (the stat below is answered by the threads we just spawned). At
@@ -361,6 +404,7 @@ pub fn mount_and_serve(
         mountd,
         mountpoint,
         abort_path,
+        _uring: uring,
         staging_quota_bytes,
     })
 }

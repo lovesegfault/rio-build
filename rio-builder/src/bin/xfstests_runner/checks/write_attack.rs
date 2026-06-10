@@ -8,7 +8,7 @@
 //! read-only file's page cache therefore has the same blast radius as
 //! the fixed F-C write-through hole — a corrupted shared digest served
 //! to every co-tenant build — but reaches it through `splice`/pipe
-//! instead of `CastoreFs::open`. generic/680 is the canonical instance
+//! instead of the castore-FUSE `open()` handler. generic/680 is the canonical instance
 //! (Dirty Pipe, CVE-2022-0847).
 
 use std::fs;
@@ -39,7 +39,7 @@ use super::{Ctx, Outcome, PrivDrop, wait_for};
 /// On the castore mount the pinned page is a page of the node-shared
 /// backing cache file (FUSE passthrough), so a successful overwrite
 /// corrupts the digest for every build on the node — the F-C blast
-/// radius by a path that never touches `CastoreFs::open`. Both legs
+/// radius by a path that never touches the castore-FUSE `open()` handler. Both legs
 /// (root and the unprivileged build uid) must leave the file
 /// byte-identical through the mount; the backing cache file is checked
 /// too when `--cache-dir` is given. A regression repairs the cache
