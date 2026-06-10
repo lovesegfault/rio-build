@@ -1355,6 +1355,39 @@ shared by the gRPC gates and the walk, and the walk's `Present` arm
 requires the `TenantVisible` witness that only that body mints --- a
 tenant-blind Present does not compile.
 
+#r("store.materialize.honest-beat")[
+  A materialization worker MUST NOT issue a listing call on a poll
+  pass that cannot convert a served job into a claim: mint-headroom
+  exhaustion (the claim budget pinned by unanswered mints, or the
+  resume ledger at capacity) MUST withhold the beat, a
+  conversion-futility streak (every fresh mint of the pass answered
+  with a conversion-disproving rejection, at three consecutive
+  passes) MUST withhold the beat for an interval that exceeds the
+  scheduler's listing-membership TTL before one probe pass re-lists,
+  and the resume presentation lane MUST never be withheld.
+]
+The scheduler's steal horizon re-homes CLAIM capability but keys on
+listing recency --- the only freshness signal it has (RULED CF-3: no
+wire change, no lane flag). The beat is therefore the capability
+channel: pre-fix, a worker whose budget was pinned by a Charged
+orphan, whose ledger sat at cap, or whose every mint was refused with
+a conversion-disproving rejection KEPT LISTING --- staying eternally
+fresh under the horizon and pinning its rendezvous slice (~1/N of the
+claimable head) fleet-wide against the module's own
+served-more-broadly degradation law. Withholding makes the wedged
+worker exactly the stale owner the horizon already handles: its slice
+serves broadly within 5 s and re-homes permanently once the 60 s
+membership TTL drops it; the futility re-probe interval (64 passes at
+the 1 s beat floor) is pinned `>=` the TTL by a const-relation test,
+and the mirrored TTL/horizon constants are parity-pinned against the
+scheduler's through the exported store symbols (the dependency runs
+scheduler->store, so the store cannot import them). NotYetReady
+contest losses are NEVER futility evidence --- they are the healthy
+fleet>work steady state the FS-4 speculation bound already prices.
+Machine witness: `docs/spec/models/materializationDistribution.qnt`
+(the capability axis: `wedgedOwnerSliceRecovered`; the
+wedged-keeps-beating falsify twin).
+
 = Two-Phase Garbage Collection
 
 #r("store.gc.two-phase+2")[

@@ -202,6 +202,20 @@ pub fn spawn_materialization_executor(
 /// steal horizon of jobs whose owner has missed its beat). The
 /// worker carries NO steal logic: an idle worker's normal listing
 /// already contains whatever the scheduler decided it should see.
+///
+/// **The honest beat (merged_bug_005,
+/// `store.materialize.honest-beat`):** beats are withheld exactly
+/// when the pass cannot convert a served job into a claim —
+/// mint-headroom exhaustion (budget pinned by unanswered mints, or
+/// the resume ledger at cap) and a conversion-futility streak both
+/// gate the listing inside `poll_and_claim`, while the resume
+/// presentation lane always runs. The scheduler's freshness proxy is
+/// therefore capability-bearing BY CONSTRUCTION: "can list but
+/// cannot claim" is no longer representable as a fresh owner, and
+/// the degradation direction stays served-more-broadly (a withheld
+/// worker ages into the steal horizon and, past the membership TTL,
+/// out of the partition entirely).
+///
 /// Two cadence consequences, both intended:
 ///   - execution is inline-serial below, so a worker mid-walk skips
 ///     beats for the walk's duration — its unclaimed slice ages past
@@ -231,6 +245,11 @@ async fn claim_loop<T>(
     // listing failures — a dead store→scheduler edge surfaces above
     // debug instead of starving claims silently.
     let mut list_health = client::ListFailureLatch::default();
+    // merged_bug_005: per-worker conversion-futility latch — a worker
+    // whose every fresh mint is refused with a conversion-disproving
+    // rejection withholds its listing beat so the scheduler re-homes
+    // its rendezvous slice (the honest beat).
+    let mut futility = client::ConversionFutilityLatch::default();
     loop {
         if shutdown.is_cancelled() {
             return;
@@ -244,6 +263,7 @@ async fn claim_loop<T>(
             1,
             &mut ledger,
             &mut list_health,
+            &mut futility,
             &shutdown,
         )
         .await;

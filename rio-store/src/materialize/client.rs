@@ -311,6 +311,23 @@ const RESUME_LEDGER_CAP: usize = 32;
 /// law is unreachable (the raced-loser red pins exactly that shape).
 const STEAL_SPECULATION_ALLOWANCE: usize = 1;
 
+/// merged_bug_005 — what a pass may still do with fresh mints (the
+/// [`ResumeLedger::fresh_mint_headroom`] answer): the typed reason a
+/// pass cannot mint is what the honest-beat gate and the WO-side
+/// wedge diagnostics key on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MintHeadroom {
+    /// The pass may mint a fresh claim.
+    Available,
+    /// The claim budget is pinned: delivered claims plus UNANSWERED
+    /// (Charged) mints fill every slot — a fresh mint would over-bind
+    /// the worker past possibly-live server-side attempts.
+    BudgetPinned { charged: usize },
+    /// The ledger is at [`RESUME_LEDGER_CAP`]: the mint authority
+    /// refuses every fresh mint (live credentials are never evicted).
+    AtCap { charged: usize, entries: usize },
+}
+
 impl ResumeLedger {
     /// Record a claim attempt BEFORE its pull rides the wire (upsert
     /// by job: a re-claim re-mints, and exactly one nonce per job is
@@ -423,6 +440,33 @@ impl ResumeLedger {
             .iter()
             .filter(|e| e.standing == SlotStanding::Charged)
             .count()
+    }
+
+    // r[impl store.materialize.honest-beat]
+    /// merged_bug_005 — THE fresh-mint capability predicate, single-
+    /// sourced on the ledger: the conjunction the claim loop already
+    /// enforced piecewise (the in-loop budget break and the
+    /// [`Self::begin_fresh_claim`] cap refusal) as ONE typed answer.
+    /// The pre-listing honest-beat gate, the in-loop break, and the
+    /// mint authority all consume this fn — a pass whose headroom is
+    /// not [`MintHeadroom::Available`] cannot convert a served job
+    /// into a claim, so listing on it would be a false liveness beat
+    /// (the scheduler's steal horizon keys on listing recency as the
+    /// capability proxy; the beat must therefore be capability-
+    /// bearing).
+    fn fresh_mint_headroom(&self, claimed_len: usize, available_slots: usize) -> MintHeadroom {
+        if self.entries.len() >= RESUME_LEDGER_CAP {
+            MintHeadroom::AtCap {
+                charged: self.charged_len(),
+                entries: self.entries.len(),
+            }
+        } else if claimed_len + self.charged_len() >= available_slots {
+            MintHeadroom::BudgetPinned {
+                charged: self.charged_len(),
+            }
+        } else {
+            MintHeadroom::Available
+        }
     }
 
     /// Snapshot for the resume pass (entries are a handful of small
@@ -627,6 +671,181 @@ impl ListFailureLatch {
     }
 }
 
+/// merged_bug_005 — consecutive FUTILE passes before the conversion-
+/// futility latch withholds the listing beat. One or two
+/// all-rejected passes can be transient (a rotation mid-skew, a
+/// scheduler hiccup); three in a row is a worker that lists but can
+/// never convert.
+const FUTILE_PASS_THRESHOLD: u32 = 3;
+
+/// merged_bug_005 (R17, violable + testable) — how many passes the
+/// listing stays withheld after a futile streak before ONE probe
+/// pass re-lists. Derivation: at the 1 s production beat
+/// (`poll_interval_secs` floor — `claim_loop` clamps with
+/// `.max(1)`), 64 withheld passes ≈ 64 s ≥ the scheduler's 60 s
+/// listing-membership TTL ([`SCHEDULER_LISTING_MEMBER_TTL_SECS`]):
+/// the wedged worker leaves the membership ENTIRELY and its
+/// rendezvous slice re-homes permanently until a probe pass
+/// converts again. The residual is one ≤5 s re-pin (the steal
+/// horizon) per probe interval — recorded, accepted. The
+/// `futile_latch_probe_interval_exceeds_member_ttl` const-relation
+/// test pins the inequality.
+const FUTILE_RELIST_INTERVAL_PASSES: u32 = 64;
+
+/// Mirrored scheduler constant (rio-scheduler
+/// `LISTING_MEMBER_TTL` = 60 s): rio-store cannot import
+/// rio-scheduler (the dependency runs the other way), so the
+/// honest-beat interval derivation mirrors the value; the
+/// scheduler-side parity pin asserts equality THROUGH this exported
+/// symbol (R14 — never a second hand-typed literal there).
+pub const SCHEDULER_LISTING_MEMBER_TTL_SECS: u64 = 60;
+
+/// Mirrored scheduler constant (rio-scheduler
+/// `LISTING_STEAL_HORIZON` = 5 s) — same mirroring discipline as
+/// [`SCHEDULER_LISTING_MEMBER_TTL_SECS`].
+pub const SCHEDULER_LISTING_STEAL_HORIZON_SECS: u64 = 5;
+
+/// merged_bug_005 — one pass's conversion evidence: the futility
+/// latch's input, folded from the FULL [`PullAnswer`] alphabet at
+/// the fresh-claim dispatch through [`futility_evidence`] (an
+/// exhaustive match — a new answer variant forces a futility
+/// classification at compile time, the R15 compiler census).
+#[derive(Debug, Default)]
+struct PassConversion {
+    /// The listing served at least one descriptor.
+    listed: bool,
+    /// Fresh mints issued this pass.
+    fresh_mints: usize,
+    /// Deliveries on EITHER lane (resume or fresh).
+    deliveries: usize,
+    /// Fresh outcomes that were answered conversion-disproving
+    /// rejections (`RejectedDisproving` / `RejectedAuth`).
+    futile_rejections: usize,
+    /// Any fresh outcome that proves the pass was NOT futile-only
+    /// (delivery, Gone, a NotYetReady contest, an unanswered mint).
+    non_futile_outcome: bool,
+    /// The last conversion-disproving rejection's job (the latch
+    /// warn names it).
+    last_rejected_drv: Option<String>,
+}
+
+/// merged_bug_005 — the futility classification of ONE fresh-lane
+/// outcome, TOTAL over the [`PullAnswer`] alphabet (the latch's
+/// closure set is the enum itself; rustc is the census generator).
+enum FutilityEvidence {
+    /// Delivery or an authoritative clean settle (Gone): the pass
+    /// CAN convert — the streak resets.
+    Conversion,
+    /// An answered conversion-disproving rejection
+    /// (`RejectedDisproving` / `RejectedAuth`): futile evidence.
+    ConversionDisproved,
+    /// A NotYetReady contest loss (the healthy fleet>work steady
+    /// state — NEVER futile evidence) or an unanswered mint (no
+    /// evidence either way; the budget gate owns that lane).
+    NotFutile,
+    /// SIGTERM raced the pull — the pass is abandoned unobserved.
+    Inconclusive,
+}
+
+fn futility_evidence(answer: &PullAnswer) -> FutilityEvidence {
+    match answer {
+        PullAnswer::Deliver(_) | PullAnswer::Gone => FutilityEvidence::Conversion,
+        PullAnswer::RejectedDisproving | PullAnswer::RejectedAuth => {
+            FutilityEvidence::ConversionDisproved
+        }
+        PullAnswer::NotYetReady | PullAnswer::Unanswered => FutilityEvidence::NotFutile,
+        PullAnswer::Shutdown => FutilityEvidence::Inconclusive,
+    }
+}
+
+// r[impl store.materialize.honest-beat]
+/// merged_bug_005 — the conversion-futility latch (the in-file
+/// [`ListFailureLatch`] pattern): a worker whose every fresh mint is
+/// answered with a conversion-disproving rejection cannot convert a
+/// served job into a claim, yet pre-fix it kept listing — staying
+/// eternally fresh under the scheduler's steal horizon and pinning
+/// its rendezvous slice fleet-wide (the wedged-but-polling worker).
+/// After [`FUTILE_PASS_THRESHOLD`] consecutive futile passes the
+/// LISTING is withheld for [`FUTILE_RELIST_INTERVAL_PASSES`] passes
+/// (long enough to leave the scheduler's membership — the slice
+/// re-homes permanently), then ONE probe pass re-lists; any
+/// delivery or clean outcome resets. The RESUME presentation lane
+/// is NEVER withheld (presentations are answer-gathering, not
+/// mint-gated).
+#[derive(Default)]
+pub struct ConversionFutilityLatch {
+    consecutive_futile: u32,
+    withhold_remaining: u32,
+    engaged: bool,
+}
+
+impl ConversionFutilityLatch {
+    /// Whether THIS pass's listing is withheld (counts down the
+    /// re-probe interval; the pass that reaches zero is the probe).
+    fn withholds_this_pass(&mut self) -> bool {
+        if self.withhold_remaining > 0 {
+            self.withhold_remaining -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Fold one completed pass's conversion evidence.
+    fn observe_pass(&mut self, pass: &PassConversion) {
+        if pass.deliveries > 0 || (!pass.listed && pass.fresh_mints == 0) {
+            // A converting pass resets outright; a pass that served
+            // nothing (empty listing) carries no conversion evidence
+            // — it neither extends nor breaks the streak.
+            if pass.deliveries > 0 {
+                self.reset_on_conversion();
+            }
+            return;
+        }
+        let futile = pass.listed
+            && pass.fresh_mints > 0
+            && pass.futile_rejections == pass.fresh_mints
+            && !pass.non_futile_outcome;
+        if futile {
+            self.consecutive_futile = self.consecutive_futile.saturating_add(1);
+            if self.consecutive_futile >= FUTILE_PASS_THRESHOLD && self.withhold_remaining == 0 {
+                self.withhold_remaining = FUTILE_RELIST_INTERVAL_PASSES;
+                if !self.engaged {
+                    self.engaged = true;
+                    warn!(
+                        streak = self.consecutive_futile,
+                        withheld_passes = FUTILE_RELIST_INTERVAL_PASSES,
+                        last_rejected = pass.last_rejected_drv.as_deref().unwrap_or("<none>"),
+                        "every fresh mint this streak was answered with a                          conversion-disproving rejection; withholding the                          listing beat so the rendezvous slice re-homes                          (the resume lane keeps presenting)"
+                    );
+                }
+            }
+        } else if pass.non_futile_outcome || pass.fresh_mints > 0 {
+            // Conversion-capable evidence without a delivery (a
+            // contest loss, an unanswered mint, a Gone): the streak
+            // is broken — futile passes must be CONSECUTIVE.
+            self.consecutive_futile = 0;
+        }
+    }
+
+    fn reset_on_conversion(&mut self) {
+        if self.engaged {
+            info!(
+                "conversion recovered; listing beat resumes (futility                  latch reset)"
+            );
+        }
+        self.consecutive_futile = 0;
+        self.withhold_remaining = 0;
+        self.engaged = false;
+    }
+
+    /// Test visibility: is the listing currently withheld?
+    #[cfg(test)]
+    fn withholding(&self) -> bool {
+        self.withhold_remaining > 0
+    }
+}
+
 /// One poll→claim pass: list claimable jobs, then attempt to claim up
 /// to `available_slots` of them via
 /// `PullAssignment(kind=MATERIALIZATION, executor_instance=<pod>)`.
@@ -645,12 +864,17 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
     available_slots: usize,
     ledger: &mut ResumeLedger,
     list_health: &mut ListFailureLatch,
+    futility: &mut ConversionFutilityLatch,
     shutdown: &rio_common::signal::Token,
 ) -> ClaimedSet {
     // The accumulator is constructed ONCE; every exit below returns it
     // (bug_116 — the listing-failure arms can no longer fabricate an
     // empty result over accrued claims).
     let mut claimed = ClaimedSet::begin();
+    // merged_bug_005 — the pass's conversion evidence (folded from the
+    // full PullAnswer alphabet at the fresh dispatch); observed by the
+    // futility latch at pass end.
+    let mut pass = PassConversion::default();
     if available_slots == 0 {
         return claimed;
     }
@@ -683,6 +907,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             PullAnswer::Deliver(assignment) => {
                 info!(drv_hash = %entry.drv_hash, exec_id = %assignment.exec_id,
                       "lost-response claim resumed via nonce (rule-4b)");
+                pass.deliveries += 1;
                 ledger.resolve(entry.job_id);
                 claimed.push(ClaimedJob::bind(
                     ExpectedJob {
@@ -746,9 +971,28 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
     // (merged_bug_189): a black-holed leader connection becomes a
     // skipped pass instead of a parked claim loop, and SIGTERM ends
     // the pass promptly.
-    // Budget already consumed by the resume pass → the listing RPC is
-    // pure cost (the claim loop below could not claim anything).
-    if claimed.len() >= available_slots {
+    // r[impl store.materialize.honest-beat]
+    // merged_bug_005 — the honest-beat gate: the listing call doubles
+    // as this worker's liveness/capability beat for the scheduler's
+    // rendezvous partition (the steal horizon keys on listing recency
+    // as the capability proxy), so a pass that CANNOT convert a
+    // served job into a claim must not list — mint headroom exhausted
+    // (delivered claims, the budget pinned by Charged entries, or the
+    // ledger at cap: the SAME predicate the claim loop enforces) or a
+    // conversion-futility streak. The RESUME lane above already ran:
+    // presentations are answer-gathering and are never withheld.
+    let headroom = ledger.fresh_mint_headroom(claimed.len(), available_slots);
+    if headroom != MintHeadroom::Available {
+        debug!(
+            ?headroom,
+            "pass cannot mint a fresh claim; listing beat withheld (honest beat)"
+        );
+        return claimed;
+    }
+    if futility.withholds_this_pass() {
+        debug!(
+            "conversion-futility latch engaged; listing beat withheld              until the re-probe interval elapses"
+        );
         return claimed;
     }
     let listed = match bounded(
@@ -770,6 +1014,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
         }
         BoundedOutcome::Resolved(Ok(resp)) => {
             list_health.note_success();
+            pass.listed = !resp.jobs.is_empty();
             resp.jobs
         }
         BoundedOutcome::Resolved(Err(status)) => {
@@ -882,6 +1127,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
         // FS-4: count the mint the moment it exists — an answered
         // refusal refunds the BUDGET above, never this counter.
         fresh_mints_this_pass += 1;
+        pass.fresh_mints = fresh_mints_this_pass;
         let req = PullAssignmentRequest {
             // No executor token: the store's credential is the
             // service token in metadata (the kind-attested credential).
@@ -903,11 +1149,25 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             claim_nonce: minted.nonce_string(),
             confirm_only: false,
         };
-        match pull_once(transport, shutdown, req, &descriptor.drv_hash).await {
+        let answer = pull_once(transport, shutdown, req, &descriptor.drv_hash).await;
+        // merged_bug_005 — fold the outcome's futility evidence
+        // (total over the PullAnswer alphabet; rustc is the census).
+        match futility_evidence(&answer) {
+            FutilityEvidence::Conversion | FutilityEvidence::NotFutile => {
+                pass.non_futile_outcome = true;
+            }
+            FutilityEvidence::ConversionDisproved => {
+                pass.futile_rejections += 1;
+                pass.last_rejected_drv = Some(descriptor.drv_hash.clone());
+            }
+            FutilityEvidence::Inconclusive => {}
+        }
+        match answer {
             // SIGTERM mid-pass: return what was already claimed so the
             // caller can abort/report those attempts under the grace.
             PullAnswer::Shutdown => return claimed,
             PullAnswer::Deliver(assignment) => {
+                pass.deliveries += 1;
                 ledger.resolve(job_id);
                 // merged_bug_026 (fresh-claim sibling site): the same
                 // Pending-arm race exists between list and claim — the
@@ -950,6 +1210,10 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             PullAnswer::Unanswered => {}
         }
     }
+    // merged_bug_005 — the latch observes the completed pass (the
+    // SIGTERM exits above deliberately do not: an abandoned pass is
+    // inconclusive evidence).
+    futility.observe_pass(&pass);
     claimed
 }
 
@@ -1497,17 +1761,18 @@ mod tests {
         t.hang_next_pulls = 99;
         let mut ledger = ResumeLedger::default();
         let mut latch = ListFailureLatch::default();
+        let mut fut = ConversionFutilityLatch::default();
         let tok = token();
         let inst = instance("brownout-w");
         // Pass 1: fresh mint for A rides the wire; the answer is lost.
-        let c1 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &tok).await;
+        let c1 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
         assert!(c1.is_empty());
         assert_eq!(ledger.len(), 1, "pass 1 minted A (unanswered)");
         // Pass 2: A's unanswered mint still consumes the only slot —
         // the fresh pass must not mint B (pre-fix: outstanding_mints
         // reset to 0 each pass, so every pass minted one more nonce,
         // accumulating to RESUME_LEDGER_CAP = 32x capacity).
-        let c2 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &tok).await;
+        let c2 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
         assert!(c2.is_empty());
         assert_eq!(
             ledger.len(),
@@ -1599,13 +1864,14 @@ mod tests {
         t.hang_next_pulls = 1; // pass 1's fresh mint: answer lost
         let mut ledger = ResumeLedger::default();
         let mut latch = ListFailureLatch::default();
+        let mut fut = ConversionFutilityLatch::default();
         let tok = token();
         let inst = instance("skew-w");
-        let c1 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &tok).await;
+        let c1 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
         assert!(c1.is_empty());
         assert_eq!(ledger.len(), 1, "pass 1: unanswered mint recorded");
         // Pass 2: the resume presentation hits rotation skew.
-        let c2 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &tok).await;
+        let c2 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
         assert!(c2.is_empty());
         assert_eq!(
             ledger.len(),
@@ -1614,7 +1880,7 @@ mod tests {
              mint — the credential must survive rotation skew"
         );
         // Pass 3: skew over — the credential recovers the assignment.
-        let c3 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &tok).await;
+        let c3 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
         assert_eq!(
             c3.len(),
             1,
@@ -1709,6 +1975,7 @@ mod tests {
             8,
             &mut ResumeLedger::default(),
             &mut ListFailureLatch::default(),
+            &mut ConversionFutilityLatch::default(),
             &token(),
         )
         .await;
@@ -1792,6 +2059,7 @@ mod tests {
             2,
             &mut ledger,
             &mut ListFailureLatch::default(),
+            &mut ConversionFutilityLatch::default(),
             &token(),
         )
         .await;
@@ -1830,6 +2098,7 @@ mod tests {
             1,
             &mut ledger,
             &mut ListFailureLatch::default(),
+            &mut ConversionFutilityLatch::default(),
             &token(),
         )
         .await;
@@ -1861,6 +2130,7 @@ mod tests {
             1,
             &mut ledger,
             &mut ListFailureLatch::default(),
+            &mut ConversionFutilityLatch::default(),
             &token(),
         )
         .await;
@@ -1910,6 +2180,7 @@ mod tests {
             2,
             &mut ledger,
             &mut ListFailureLatch::default(),
+            &mut ConversionFutilityLatch::default(),
             &token(),
         )
         .await;
@@ -1949,6 +2220,7 @@ mod tests {
             1,
             &mut ledger,
             &mut ListFailureLatch::default(),
+            &mut ConversionFutilityLatch::default(),
             &token(),
         )
         .await;
@@ -1988,6 +2260,7 @@ mod tests {
             1,
             &mut ledger,
             &mut ListFailureLatch::default(),
+            &mut ConversionFutilityLatch::default(),
             &token(),
         )
         .await;
@@ -2034,6 +2307,7 @@ mod tests {
             1,
             &mut ledger,
             &mut ListFailureLatch::default(),
+            &mut ConversionFutilityLatch::default(),
             &token(),
         )
         .await;
@@ -2085,6 +2359,7 @@ mod tests {
             1,
             &mut ledger,
             &mut ListFailureLatch::default(),
+            &mut ConversionFutilityLatch::default(),
             &token(),
         )
         .await;
@@ -2119,6 +2394,7 @@ mod tests {
             1,
             &mut ResumeLedger::default(),
             &mut ListFailureLatch::default(),
+            &mut ConversionFutilityLatch::default(),
             &token(),
         )
         .await;
@@ -2158,6 +2434,7 @@ mod tests {
             1,
             &mut ResumeLedger::default(),
             &mut ListFailureLatch::default(),
+            &mut ConversionFutilityLatch::default(),
             &token(),
         )
         .await;
@@ -2201,6 +2478,7 @@ mod tests {
             2,
             &mut ResumeLedger::default(),
             &mut ListFailureLatch::default(),
+            &mut ConversionFutilityLatch::default(),
             &token(),
         )
         .await;
@@ -2228,6 +2506,7 @@ mod tests {
             8,
             &mut ResumeLedger::default(),
             &mut ListFailureLatch::default(),
+            &mut ConversionFutilityLatch::default(),
             &token(),
         )
         .await;
@@ -2261,6 +2540,7 @@ mod tests {
             8,
             &mut ResumeLedger::default(),
             &mut ListFailureLatch::default(),
+            &mut ConversionFutilityLatch::default(),
             &token(),
         )
         .await;
@@ -2291,6 +2571,7 @@ mod tests {
             2,
             &mut ResumeLedger::default(),
             &mut ListFailureLatch::default(),
+            &mut ConversionFutilityLatch::default(),
             &token(),
         )
         .await;
@@ -2308,6 +2589,7 @@ mod tests {
             0,
             &mut ResumeLedger::default(),
             &mut ListFailureLatch::default(),
+            &mut ConversionFutilityLatch::default(),
             &token(),
         )
         .await;
@@ -2342,6 +2624,7 @@ mod tests {
             1,
             &mut ledger,
             &mut ListFailureLatch::default(),
+            &mut ConversionFutilityLatch::default(),
             &token(),
         )
         .await;
@@ -2388,6 +2671,7 @@ mod tests {
             1,
             &mut ledger,
             &mut ListFailureLatch::default(),
+            &mut ConversionFutilityLatch::default(),
             &token(),
         )
         .await;
@@ -2429,6 +2713,7 @@ mod tests {
             1,
             &mut ledger,
             &mut ListFailureLatch::default(),
+            &mut ConversionFutilityLatch::default(),
             &token(),
         )
         .await;
@@ -2548,9 +2833,10 @@ mod tests {
         );
         let mut ledger = ResumeLedger::default();
         let mut latch = ListFailureLatch::default();
+        let mut fut = ConversionFutilityLatch::default();
         let tok = token();
         let inst = instance("monotone-w");
-        let c1 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &tok).await;
+        let c1 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
         assert!(c1.is_empty());
         assert_eq!(ledger.charged_len(), 0, "pass 1: answered → refunded");
 
@@ -2558,7 +2844,7 @@ mod tests {
         // delivers.
         t.hang_next_pulls = 1;
         t.pulls = vec![Ok(deliver("exec-b", "/nix/store/bbb-two.drv"))].into();
-        let c2 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &tok).await;
+        let c2 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
         assert_eq!(
             c2.len(),
             1,
@@ -2589,6 +2875,7 @@ mod tests {
             8,
             &mut ResumeLedger::default(),
             &mut ListFailureLatch::default(),
+            &mut ConversionFutilityLatch::default(),
             &token(),
         )
         .await;
@@ -2840,6 +3127,7 @@ mod tests {
             8,
             &mut ResumeLedger::default(),
             &mut ListFailureLatch::default(),
+            &mut ConversionFutilityLatch::default(),
             &shutdown,
         )
         .await;
@@ -3019,6 +3307,7 @@ mod tests {
             1,
             &mut ResumeLedger::default(),
             &mut ListFailureLatch::default(),
+            &mut ConversionFutilityLatch::default(),
             &token(),
         )
         .await;
@@ -3044,6 +3333,7 @@ mod tests {
                 1,
                 &mut ResumeLedger::default(),
                 &mut ListFailureLatch::default(),
+                &mut ConversionFutilityLatch::default(),
                 &token(),
             )
             .await;
@@ -3087,6 +3377,7 @@ mod tests {
             1,
             &mut ResumeLedger::default(),
             &mut ListFailureLatch::default(),
+            &mut ConversionFutilityLatch::default(),
             &token(),
         )
         .await;
@@ -3201,6 +3492,7 @@ mod tests {
             1,
             &mut ledger,
             &mut ListFailureLatch::default(),
+            &mut ConversionFutilityLatch::default(),
             &token(),
         )
         .await;
@@ -3225,6 +3517,7 @@ mod tests {
             1,
             &mut ledger,
             &mut ListFailureLatch::default(),
+            &mut ConversionFutilityLatch::default(),
             &token(),
         )
         .await;
@@ -3268,6 +3561,7 @@ mod tests {
             1,
             &mut ledger,
             &mut ListFailureLatch::default(),
+            &mut ConversionFutilityLatch::default(),
             &token(),
         )
         .await;
@@ -3279,6 +3573,7 @@ mod tests {
             1,
             &mut ledger,
             &mut ListFailureLatch::default(),
+            &mut ConversionFutilityLatch::default(),
             &token(),
         )
         .await;
@@ -3290,6 +3585,7 @@ mod tests {
             1,
             &mut ledger,
             &mut ListFailureLatch::default(),
+            &mut ConversionFutilityLatch::default(),
             &token(),
         )
         .await;
@@ -3410,5 +3706,172 @@ mod tests {
         assert!(!latch.warned(), "fresh episode counts from zero");
         latch.note_failure("timeout");
         assert!(latch.warned(), "and re-escalates at the threshold");
+    }
+
+    // -----------------------------------------------------------------
+    // merged_bug_005 — the honest beat (store.materialize.honest-beat)
+    // -----------------------------------------------------------------
+
+    // r[verify store.materialize.honest-beat]
+    /// merged_bug_005 RED 1 + the resume-lane pin. Proposition
+    /// certified (R16): a pass whose claim budget is pinned by a
+    /// Charged orphan issues NO listing RPC (the beat is the
+    /// scheduler's capability proxy; a pass that cannot mint must not
+    /// claim freshness) while the RESUME presentation still rides
+    /// (answer-gathering is never withheld). Witness: the scripted
+    /// transport's call census — the steal horizon's own input —
+    /// never log text.
+    #[tokio::test(start_paused = true)]
+    async fn budget_pinned_pass_withholds_the_listing_beat() {
+        let job_a = descriptor(1);
+        let mut t = MockTransport::new(vec![Ok(listing(vec![job_a.clone()]))], vec![], vec![]);
+        t.hang_next_pulls = 99; // every pull lost (fresh, then resume)
+        let mut ledger = ResumeLedger::default();
+        let mut latch = ListFailureLatch::default();
+        let mut fut = ConversionFutilityLatch::default();
+        let tok = token();
+        let inst = instance("gate-budget-w");
+        // Pass 1 (production flow): lists, fresh-mints A, the answer
+        // is lost — A becomes the Charged orphan.
+        let c1 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+        assert!(c1.is_empty());
+        assert_eq!(ledger.charged_len(), 1, "precondition: A is Charged");
+        assert_eq!(t.list_calls, 1, "precondition: pass 1 listed");
+        let pulls_before = t.pull_calls;
+        // Pass 2: budget pinned by the orphan — the beat is withheld;
+        // the resume presentation still rides.
+        let c2 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+        assert!(c2.is_empty());
+        assert_eq!(
+            t.pull_calls,
+            pulls_before + 1,
+            "the gated pass still runs the resume lane (presentations \
+             are answer-gathering, never withheld)"
+        );
+        assert_eq!(
+            t.list_calls, 1,
+            "left: 1 ListMaterializationJobs RPC issued on a pass that \
+             cannot mint (the false liveness beat) / right: 0 — the beat \
+             is withheld; the resume presentation still rode"
+        );
+    }
+
+    // r[verify store.materialize.honest-beat]
+    /// merged_bug_005 RED 2. Proposition certified (R16): a pass whose
+    /// ledger sits at RESUME_LEDGER_CAP issues NO listing RPC — every
+    /// begin_fresh_claim would refuse, so the listed slice could never
+    /// convert. The resume lane still presents all 32 credentials.
+    ///
+    /// Cap-shape seeding via the #[cfg(test)] note_pull raw insert
+    /// (disclosed: a 32-entry CredentialOnly population arises in
+    /// production only across many contested passes; the raw insert is
+    /// the documented seeding lane for cap shapes — the standings and
+    /// the gate decision under test are production code).
+    #[tokio::test]
+    async fn cap_full_ledger_withholds_the_listing_beat() {
+        let mut ledger = ResumeLedger::default();
+        for _ in 0..RESUME_LEDGER_CAP {
+            let job = Uuid::now_v7();
+            ledger.note_pull(ResumeEntry {
+                job_id: job,
+                drv_hash: format!("drv-{job}"),
+                tenant_hint: None,
+                origin: "cache_opportunity".into(),
+                nonce: Uuid::new_v4(),
+                standing: SlotStanding::CredentialOnly,
+            });
+        }
+        let mut t = MockTransport::new(
+            vec![Ok(listing(vec![descriptor(1)]))],
+            vec![Ok(not_yet_ready())],
+            vec![],
+        );
+        let mut latch = ListFailureLatch::default();
+        let mut fut = ConversionFutilityLatch::default();
+        let claimed = poll_and_claim(
+            &mut t,
+            &instance("gate-cap-w"),
+            1,
+            &mut ledger,
+            &mut latch,
+            &mut fut,
+            &token(),
+        )
+        .await;
+        assert!(claimed.is_empty());
+        assert_eq!(
+            t.pull_calls, RESUME_LEDGER_CAP as u32,
+            "the resume lane still presented every credential"
+        );
+        assert_eq!(
+            t.list_calls, 0,
+            "left: listing issued then every begin_fresh_claim refused \
+             / right: no listing"
+        );
+    }
+
+    // r[verify store.materialize.honest-beat]
+    /// merged_bug_005 RED 3 — the conversion-futility latch.
+    /// Proposition certified (R16): a streak of passes whose EVERY
+    /// fresh mint is answered with a conversion-disproving rejection
+    /// stops beating at the threshold — the rendezvous slice re-homes
+    /// instead of staying pinned to a worker that lists but can never
+    /// convert. NotYetReady contest losses never count (pinned by the
+    /// existing FS-4 battery staying green).
+    #[tokio::test]
+    async fn futile_conversion_streak_backs_off_listing() {
+        let mut t = MockTransport::new(
+            vec![Ok(listing(vec![descriptor(7)]))],
+            vec![Err(tonic::Status::invalid_argument(
+                "request shape can never mint",
+            ))],
+            vec![],
+        );
+        let mut ledger = ResumeLedger::default();
+        let mut latch = ListFailureLatch::default();
+        let mut fut = ConversionFutilityLatch::default();
+        let tok = token();
+        let inst = instance("gate-futile-w");
+        for _ in 0..5 {
+            let c = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+            assert!(c.is_empty(), "every mint is refused");
+        }
+        assert_eq!(
+            t.list_calls, 3,
+            "left: 5 listing RPCs (the slice stays pinned) / right: 3 \
+             (the threshold), then withheld until the probe interval"
+        );
+        assert!(
+            fut.withholding(),
+            "the latch holds the beat through the re-probe interval"
+        );
+    }
+
+    // r[verify store.materialize.honest-beat]
+    /// R17 const-relation pin: the futility re-probe interval at the
+    /// production beat floor (1 s — claim_loop clamps
+    /// `poll_interval_secs.max(1)`) covers the scheduler's
+    /// listing-membership TTL, so a withheld worker leaves the
+    /// membership ENTIRELY and its slice re-homes permanently (not
+    /// just via the 5 s steal horizon).
+    #[test]
+    fn futile_latch_probe_interval_exceeds_member_ttl() {
+        const MIN_BEAT_SECS: u64 = 1;
+        // Compile-anchored (R17): the relations are const blocks — a
+        // constant change that breaks the law fails the BUILD, not a
+        // test run.
+        const {
+            assert!(
+                (FUTILE_RELIST_INTERVAL_PASSES as u64) * MIN_BEAT_SECS
+                    >= SCHEDULER_LISTING_MEMBER_TTL_SECS,
+                "the withhold interval must outlast the scheduler's membership TTL"
+            );
+        }
+        const {
+            assert!(
+                SCHEDULER_LISTING_STEAL_HORIZON_SECS < SCHEDULER_LISTING_MEMBER_TTL_SECS,
+                "mirrored-constant sanity: horizon below TTL"
+            );
+        }
     }
 }
