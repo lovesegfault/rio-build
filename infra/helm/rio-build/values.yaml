@@ -439,7 +439,7 @@ store:
     # (BudgetParked exempts a parked owner from stall takeover)
     # instead of buffering unbounded NAR bytes — the budget is a
     # backpressure bound, sized independently of this knob.
-    # Gate pressure (r[store.materialize.gate-share]): the executor's
+    # Gate pressure (r[store.materialize.gate-share+1]): the executor's
     # total draw on the r[store.substitute.admission] gate is bounded
     # STRUCTURALLY by the pod path-slot pool — P = effective
     # admission cap / 2 (override-aware; pgMaxConnections 20 →

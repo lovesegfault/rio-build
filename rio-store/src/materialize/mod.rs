@@ -107,19 +107,22 @@ pub fn spawn_materialization_executor(
         authenticated = service_signer.is_some(),
         "materialization executor enabled; spawning claim loops"
     );
-    // r[impl store.materialize.gate-share]
-    // PERMANENT baseline-queuing tripwire: with n > P even width-1
-    // walks contend for slots — some claimed jobs always queue at the
-    // baseline acquire. (The TRANSIENT regime — n×F > P, reachable at
-    // helm defaults — is watched by the pool's wait facet instead:
+    // r[impl store.materialize.gate-share+1]
+    // PERMANENT worker-surplus tripwire (bug_102 semantics): with
+    // n > P, excess workers idle at claim ADMISSION — slotless passes
+    // mint no claims and jobs stay scheduler-listed; claimed jobs
+    // never queue for their first slot (slot ≺ claim). (The TRANSIENT
+    // regime — n×F > P, reachable at helm defaults — shifts queuing to
+    // MID-WALK re-acquires, watched by the pool's wait facet:
     // queued-baseline-waiters gauge + wait-age histogram.)
     if cfg.executor_concurrency > path_slots.capacity() {
         warn!(
             executor_concurrency = cfg.executor_concurrency,
             path_slots = path_slots.capacity(),
-            "executor_concurrency exceeds the path-slot pool: claimed jobs \
-             will queue at the baseline slot even at width 1 (lower the \
-             worker count or raise the admission cap)"
+            "executor_concurrency exceeds the path-slot pool: excess workers \
+             idle at claim admission (slotless passes mint no claims; jobs \
+             stay listed for pods with headroom) — lower the worker count or \
+             raise the admission cap"
         );
     }
     // T-6.2 (Phase B): pre-register the executor lifecycle counters at 0
@@ -296,13 +299,24 @@ async fn claim_loop<T>(
         if shutdown.is_cancelled() {
             return;
         }
-        // Each worker claims at most one job per pass — concurrency is
-        // the worker count, and the scheduler's one-winner arbitration
-        // (per-replica composite identity) handles claim races.
+        // bug_102 (slot ≺ claim): admission BEFORE the claiming pull —
+        // a worker that cannot hold a path slot mints no claim, opens
+        // no attempt window, and the job stays scheduler-listed
+        // (claimable by any pod with headroom). Leftover-only
+        // try-acquire: claim admission never overtakes queued mid-walk
+        // baseline waiters, so finish-started-work-first falls out of
+        // the existing semaphore discipline. The pass budget is the
+        // admission count (0|1): each worker claims at most one job
+        // per pass — concurrency is the worker count, and the
+        // scheduler's one-winner arbitration (per-replica composite
+        // identity) handles claim races. A slotless pass drives
+        // available_slots = 0 through poll_and_claim and paces at the
+        // normal empty-pass beat.
+        let mut admission = ctx.path_slots.try_admit_claim();
         let pass = client::poll_and_claim(
             &mut transport,
             &instance,
-            1,
+            admission.is_some() as usize,
             &mut ledger,
             &mut list_health,
             &mut futility,
@@ -313,6 +327,10 @@ async fn claim_loop<T>(
         // the pass's sealed outcome, read BEFORE the claims are
         // consumed by execution.
         let pace = pace_for(&pass.outcome);
+        // bug_102, the single-job form: the budget is 0|1, so at most
+        // one claim exists per pass and the admission moves INTO the
+        // one execute call (consumed by value — a second execution per
+        // pass has no admission to consume and does not typecheck).
         for job in pass.claimed {
             info!(
                 worker,
@@ -353,9 +371,15 @@ async fn claim_loop<T>(
                 }
             });
             let exec_id_for_progress = job.exec_id.clone();
+            let job_admission = admission.take().expect(
+                "a claim exists only on an admitted pass \
+                 (budget = admission.is_some() as usize, and the \
+                 client never delivers more claims than the budget)",
+            );
             let execute = executor::execute_job_with_progress(
                 &ctx,
                 &job,
+                job_admission,
                 move |bytes_done, bytes_expected, upstream| {
                     let _ = progress_tx.try_send(
                         rio_proto::types::ReportMaterializationProgressRequest {
@@ -1204,5 +1228,121 @@ mod tests {
              — mint cost stays within passes x allowance, never one per \
              round-trip"
         );
+    }
+
+    // ── bw8 S3 (bug_102): the slot ≺ claim seam ──────────────────────
+    // (appended OUTSIDE the S2-owned law/pacing-test region — the
+    // claim-admission seam is S3's surface; keep-both at rebase.)
+
+    // r[verify store.materialize.gate-share+1]
+    /// R2-102 (bug_102, TRUE RED pre-fix) / W-102b: a SLOTLESS pass
+    /// lists nothing and claims nothing — the worker's pass budget is
+    /// `try_admit_claim().is_some() as usize`, so with zero pod slot
+    /// headroom the pass drives `available_slots = 0` through
+    /// `poll_and_claim` and the transport sees ZERO listings and ZERO
+    /// pulls (the scripted-transport call census — never log text);
+    /// slotless passes pace at the normal empty-pass beat (no spin).
+    ///
+    /// Pre-fix red (run + recorded in the owning commit body): the
+    /// budget was hardwired 1 — every pass issued a listing (and
+    /// would mint a claim) with zero pod slot headroom.
+    ///
+    /// Composition (RE-DERIVED at the S2 rebase per the t0 handoff,
+    /// consuming S2's DONE response): the zero-budget pass seals
+    /// `PassOutcome::Empty` → `Pace::Beat` BY TYPE — the normal idle
+    /// pacing lane, distinct from charge-pinned `Wedged(BudgetPinned)`
+    /// — and can never feed futility backoff (the streak law is
+    /// mint-guarded; a zero-budget pass mints nothing). The
+    /// resume-presentation leg stays unobservable at this seam (the
+    /// loop-local ledger starts empty). S2's disclosed wobble — Empty
+    /// runs the wedge latch's HEAL arm, so a pool-exhausted stretch
+    /// clears a warned budget wedge early (re-arms at threshold) — is
+    /// accepted as recorded; the suppress-arm is NOT taken (client.rs
+    /// is zero-edit for S3).
+    #[tokio::test]
+    async fn slotless_pass_lists_nothing_and_claims_nothing() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct CountingTransport {
+            list_calls: Arc<Mutex<usize>>,
+            pull_calls: Arc<Mutex<usize>>,
+        }
+        impl client::MaterializeTransport for CountingTransport {
+            async fn list_jobs(
+                &mut self,
+                _req: rio_proto::types::ListMaterializationJobsRequest,
+            ) -> Result<rio_proto::types::ListMaterializationJobsResponse, tonic::Status>
+            {
+                *self.list_calls.lock().unwrap() += 1;
+                Ok(rio_proto::types::ListMaterializationJobsResponse { jobs: vec![] })
+            }
+            async fn pull(
+                &mut self,
+                _req: rio_proto::types::PullAssignmentRequest,
+            ) -> Result<rio_proto::types::PullAssignmentResponse, tonic::Status> {
+                *self.pull_calls.lock().unwrap() += 1;
+                Ok(rio_proto::types::PullAssignmentResponse { outcome: None })
+            }
+            async fn report(
+                &mut self,
+                _req: rio_proto::types::ReportOutcomeRequest,
+            ) -> Result<(), tonic::Status> {
+                Ok(())
+            }
+            async fn report_progress(
+                &mut self,
+                _req: rio_proto::types::ReportMaterializationProgressRequest,
+            ) -> Result<(), tonic::Status> {
+                Ok(())
+            }
+        }
+
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let substituter =
+            std::sync::Arc::new(crate::substitute::Substituter::new(db.pool.clone(), None));
+        let shutdown = rio_common::signal::Token::new();
+        let transport = CountingTransport::default();
+        let list_calls = Arc::clone(&transport.list_calls);
+        let pull_calls = Arc::clone(&transport.pull_calls);
+
+        // ZERO pod slot headroom: the pool's only slot is held for the
+        // whole test (a saturated pod — every slot mid-walk elsewhere).
+        let pool1 = executor::PathSlotPool::new(1);
+        let admission = pool1
+            .try_admit_claim()
+            .expect("fresh pool admits — now held for the test's duration");
+        let ctx = executor::ExecutorContext::new(db.pool.clone(), substituter, 1, pool1);
+
+        // Paused virtual clock: beats auto-advance, so several
+        // slotless passes elapse quickly; then shutdown.
+        tokio::time::pause();
+        let loop_task = tokio::spawn(claim_loop(
+            0,
+            crate::config::MaterializationConfig::default(),
+            ctx,
+            transport,
+            executor_instance().with_worker(0),
+            shutdown.clone(),
+        ));
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), loop_task)
+            .await
+            .expect("loop exits on shutdown")
+            .unwrap();
+
+        assert_eq!(
+            *list_calls.lock().unwrap(),
+            0,
+            "a slotless pass issued a listing with zero pod slot headroom \
+             (budget must be admission-derived, not hardwired 1)"
+        );
+        assert_eq!(
+            *pull_calls.lock().unwrap(),
+            0,
+            "a slotless pass minted a claiming pull with zero pod slot headroom"
+        );
+        drop(admission);
     }
 }

@@ -1133,17 +1133,17 @@
       {
         "name": "rio_store_executor_path_slot_baseline_wait_seconds",
         "kind": "histogram",
-        "help": "Wall-clock a walk spent queued at the baseline path-slot acquire. The wait-age facet of the n×F > P tripwire: the head waiter waits ~one in-flight path residence (wall-clock-unbounded by the no-body-timeout design), so sustained growth here means slot turnover is dominated by long downloads — lower pathFanout, executorConcurrency, or raise the admission cap."
+        "help": "Wall-clock a walk spent queued at the MID-WALK baseline path-slot re-acquire (never the first spawn — the claim carries that slot). The wait-age facet of the n×F > P tripwire: the head waiter waits ~one in-flight path residence (wall-clock-unbounded by the no-body-timeout design), so sustained growth here means slot turnover is dominated by long downloads — lower pathFanout, executorConcurrency, or raise the admission cap."
       },
       {
         "name": "rio_store_executor_path_slot_baseline_waiters",
         "kind": "gauge",
-        "help": "Materialization walks queued at the BASELINE path-slot acquire (width 0 with a nonempty frontier). The transient-regime tripwire for n×F > P (claimed jobs waiting on slot turnover); the boot warn covers only the permanent n > P regime."
+        "help": "Materialization walks queued at the MID-WALK baseline path-slot re-acquire (width 0 with a nonempty frontier after the carried claim slot was consumed — the slot-precedes-claim gate means no walk queues here between claim and first spawn). The transient-regime tripwire for n×F > P; the boot warn covers only the permanent n > P worker-surplus regime."
       },
       {
         "name": "rio_store_executor_path_slots_in_use",
         "kind": "gauge",
-        "help": "Executor path-slot pool occupancy (r[store.materialize.gate-share]): slots held by in-flight materialization path futures, out of P = effective admission cap / 2. Republished on both edges (acquire and release)."
+        "help": "Executor path-slot pool occupancy (r[store.materialize.gate-share+1]): slots held by in-flight materialization path futures, out of P = effective admission cap / 2. Republished on both edges (acquire and release)."
       },
       {
         "name": "rio_store_gc_chunk_resurrected_total",

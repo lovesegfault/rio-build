@@ -49,7 +49,7 @@ pub struct ExecutorContext {
     /// the one code shape (the driver/window structure is identical;
     /// only the width changes). Floored at 1 by the driver.
     pub path_fanout: usize,
-    /// The pod-wide path-slot pool (`store.materialize.gate-share`):
+    /// The pod-wide path-slot pool (`store.materialize.gate-share+1`):
     /// every path future holds one slot for its lifetime; main.rs
     /// sizes it at effective_admission_cap / 2 and threads ONE pool
     /// through every worker's context.
@@ -107,8 +107,12 @@ impl ExecutorContext {
 ///    coverage is against execution-end live wanted, not a snapshot.
 // r[impl store.materialize.executor+5]
 // r[impl sched.materialize.pinning]
-pub async fn execute_job(ctx: &ExecutorContext, claimed: &ClaimedJob) -> CountedOutcome {
-    execute_job_with_progress(ctx, claimed, |_, _, _| {}).await
+pub async fn execute_job(
+    ctx: &ExecutorContext,
+    claimed: &ClaimedJob,
+    admission: ClaimAdmission,
+) -> CountedOutcome {
+    execute_job_with_progress(ctx, claimed, admission, |_, _, _| {}).await
 }
 
 /// [`execute_job`] with a byte-progress callback (BC-4 / Phase B).
@@ -134,9 +138,10 @@ pub async fn execute_job(ctx: &ExecutorContext, claimed: &ClaimedJob) -> Counted
 pub async fn execute_job_with_progress(
     ctx: &ExecutorContext,
     claimed: &ClaimedJob,
+    admission: ClaimAdmission,
     on_progress: impl Fn(u64, u64, &str) + Send + Sync + 'static,
 ) -> CountedOutcome {
-    CountedOutcome::count(execute_job_inner(ctx, claimed, on_progress).await)
+    CountedOutcome::count(execute_job_inner(ctx, claimed, admission, on_progress).await)
 }
 
 /// Witness that a [`MaterializationOutcome`] passed the ONE counting
@@ -331,6 +336,7 @@ fn enqueue_path(
 async fn execute_job_inner(
     ctx: &ExecutorContext,
     claimed: &ClaimedJob,
+    admission: ClaimAdmission,
     on_progress: impl Fn(u64, u64, &str) + Send + Sync + 'static,
 ) -> MaterializationOutcome {
     use futures_util::StreamExt as _;
@@ -352,6 +358,12 @@ async fn execute_job_inner(
     // and the substitute-hit re-check share this one handle under one
     // lock discipline; F sibling probes overlap freely.
     let trust_cache = SharedTrustCache::default();
+    // bug_102 (slot ≺ claim): the claim carried its FIRST slot in —
+    // iteration 1's width-0 spawn consumes it without touching the
+    // baseline FIFO, so the interval between claim and first spawn
+    // contains zero slot waits. A walk that never spawns (empty first
+    // frontier / early returns) drops it — slot returned to the pool.
+    let mut first_slot: Option<PathSlot> = Some(admission.first_slot);
     let mut visited: HashSet<String> = HashSet::new();
     let mut ingested: Vec<String> = Vec::new();
     let mut verified: Vec<String> = Vec::new();
@@ -623,13 +635,23 @@ async fn execute_job_inner(
                 // order).
                 while window.len() < fanout && !frontier.is_empty() {
                     let slot = if window.is_empty() {
-                        // Width-1 baseline invariant: blocking-FIFO
-                        // whenever width 0 + nonempty frontier (job
-                        // start AND mid-walk drain after failed
-                        // widening) — with the opportunistic widening
-                        // below, the two wakeups jointly cover every
-                        // reachable state.
-                        ctx.path_slots.acquire_baseline().await
+                        match first_slot.take() {
+                            // bug_102: the claim's carried slot seeds
+                            // the first width-0 spawn — no FIFO entry
+                            // between claim and first spawn.
+                            Some(s) => s,
+                            // Width-1 baseline invariant (MID-WALK):
+                            // blocking-FIFO whenever width 0 + nonempty
+                            // frontier (window drained after failed
+                            // widening) — with the opportunistic
+                            // widening below, the two wakeups jointly
+                            // cover every reachable state. Mid-walk the
+                            // walk IS the attempt: FIFO gives it the
+                            // per-path fair share priced by the wait
+                            // facet and charged by the pre-existing
+                            // dispatch-deadline contract.
+                            None => ctx.path_slots.acquire_baseline().await,
+                        }
                     } else {
                         match ctx.path_slots.try_widen() {
                             Some(s) => s,
@@ -1016,7 +1038,7 @@ struct ProgressTick {
 /// overflow drops the tick — progress is droppable by contract.
 const PROGRESS_TICK_QUEUE: usize = 64;
 
-// r[impl store.materialize.gate-share]
+// r[impl store.materialize.gate-share+1]
 /// The pod-wide executor path-slot pool (live_047/R-C WO-R7-3): ONE
 /// fair-FIFO semaphore of `P = effective_admission_cap / 2` permits
 /// (`derive_executor_path_slots` over the SAME effective value main.rs
@@ -1130,6 +1152,26 @@ impl PathSlotPool {
         })
     }
 
+    /// Non-blocking CLAIM ADMISSION (bug_102 — the slot ≺ claim gate):
+    /// a worker obtains its first path slot BEFORE the claiming pull;
+    /// a worker with no slot headroom mints NO claim — the job stays
+    /// scheduler-listed, claimable by any pod with headroom (strictly
+    /// better placement than queueing inside an open attempt window).
+    /// Leftover-only try-acquire per the yield law: claim admission
+    /// never overtakes queued mid-walk baseline waiters, so
+    /// finish-started-work-first falls out of the existing semaphore
+    /// discipline.
+    pub fn try_admit_claim(&self) -> Option<ClaimAdmission> {
+        let permit = self.slots.clone().try_acquire_owned().ok()?;
+        self.publish_in_use();
+        Some(ClaimAdmission {
+            first_slot: PathSlot {
+                permit: Some(permit),
+                pool: self.clone(),
+            },
+        })
+    }
+
     /// Republish the in-use gauge from the pool's current truth.
     fn publish_in_use(&self) {
         let in_use = self.capacity.saturating_sub(self.slots.available_permits());
@@ -1152,6 +1194,21 @@ impl PathSlotPool {
 struct PathSlot {
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
     pool: PathSlotPool,
+}
+
+/// The CLAIM gate's typed admission (bug_102): holding one is the
+/// proof that this worker held a path slot BEFORE its claiming pull —
+/// the gate order is **slot ≺ claim ≺ admission ≺ budget**, so an
+/// attempt window opens only on admitted work and "slot waiters hold
+/// nothing" is true from the claim onward (the establishment sweep's
+/// pricing premise — window time is slot-held work or crash — holds
+/// again). Minted ONLY by [`PathSlotPool::try_admit_claim`];
+/// [`execute_job`]/[`execute_job_with_progress`] DEMAND one, so
+/// claim-without-slot does not typecheck. The carried slot seeds
+/// iteration 1's first width-0 spawn without touching the baseline
+/// FIFO; a walk that never spawns drops it — slot returned.
+pub struct ClaimAdmission {
+    first_slot: PathSlot,
 }
 
 impl Drop for PathSlot {
@@ -2159,6 +2216,15 @@ mod tests {
         )
     }
 
+    /// Mint a [`ClaimAdmission`] through the PRODUCTION gate (R13 — no
+    /// bypass constructor): tests model an admitted claim exactly the
+    /// way `claim_loop` creates one (slot ≺ claim).
+    fn admitted(ctx: &ExecutorContext) -> ClaimAdmission {
+        ctx.path_slots
+            .try_admit_claim()
+            .expect("test pool has headroom for the claim admission")
+    }
+
     /// Seed the scheduler-side rows one claimed job needs: a
     /// derivation (with output↔path arrays), a live build wanting
     /// `wanted_names` of it, a pending materialization job, and the
@@ -2342,7 +2408,9 @@ mod tests {
         .await;
 
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
+        let outcome = execute_job(&ctx, &seeded.claimed, admitted(&ctx))
+            .await
+            .into_outcome();
 
         let success = outcome_success(&outcome)
             .unwrap_or_else(|| panic!("expected Success, got {outcome:?}"));
@@ -2431,7 +2499,9 @@ mod tests {
         .expect("carrier seeded");
 
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
+        let outcome = execute_job(&ctx, &seeded.claimed, admitted(&ctx))
+            .await
+            .into_outcome();
 
         let success = outcome_success(&outcome)
             .unwrap_or_else(|| panic!("expected Success, got {outcome:?}"));
@@ -2518,7 +2588,9 @@ mod tests {
             .unwrap();
 
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
+        let outcome = execute_job(&ctx, &seeded.claimed, admitted(&ctx))
+            .await
+            .into_outcome();
 
         let success = outcome_success(&outcome)
             .unwrap_or_else(|| panic!("expected Success, got {outcome:?}"));
@@ -2557,7 +2629,9 @@ mod tests {
         .await;
 
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
+        let outcome = execute_job(&ctx, &seeded.claimed, admitted(&ctx))
+            .await
+            .into_outcome();
 
         let infra = outcome_infra(&outcome)
             .unwrap_or_else(|| panic!("expected InfraFailure, got {outcome:?}"));
@@ -2632,7 +2706,9 @@ mod tests {
             .unwrap();
 
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
+        let outcome = execute_job(&ctx, &seeded.claimed, admitted(&ctx))
+            .await
+            .into_outcome();
 
         let success = outcome_success(&outcome).unwrap_or_else(|| {
             panic!(
@@ -2694,7 +2770,11 @@ mod tests {
 
         let ctx = make_ctx(db.pool.clone());
         let claimed = seeded.claimed.clone();
-        let walk = tokio::spawn(async move { execute_job(&ctx, &claimed).await.into_outcome() });
+        let walk = tokio::spawn(async move {
+            execute_job(&ctx, &claimed, admitted(&ctx))
+                .await
+                .into_outcome()
+        });
 
         // Deterministic seam: the walk is INSIDE iteration 1's NAR
         // fetch of P when the gate reports the hit.
@@ -2804,7 +2884,11 @@ mod tests {
 
         let ctx = make_ctx(db.pool.clone());
         let claimed = seeded.claimed.clone();
-        let walk = tokio::spawn(async move { execute_job(&ctx, &claimed).await.into_outcome() });
+        let walk = tokio::spawn(async move {
+            execute_job(&ctx, &claimed, admitted(&ctx))
+                .await
+                .into_outcome()
+        });
 
         // Deterministic seam: inside iteration 1's gated NAR fetch of
         // P (Q's 404 verdict lands in this iteration either side of
@@ -2986,7 +3070,9 @@ mod tests {
         .unwrap();
 
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
+        let outcome = execute_job(&ctx, &seeded.claimed, admitted(&ctx))
+            .await
+            .into_outcome();
         let success = outcome_success(&outcome).unwrap_or_else(|| {
             panic!(
                 "expected Success via the second (serving) tenant, got {outcome:?} — \
@@ -3066,7 +3152,9 @@ mod tests {
         .unwrap();
 
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
+        let outcome = execute_job(&ctx, &seeded.claimed, admitted(&ctx))
+            .await
+            .into_outcome();
         let retry = outcome_retry_later(&outcome).unwrap_or_else(|| {
             panic!(
                 "expected uncharged RetryLater (the race defers; the sibling's \
@@ -3104,7 +3192,9 @@ mod tests {
         .await;
 
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
+        let outcome = execute_job(&ctx, &seeded.claimed, admitted(&ctx))
+            .await
+            .into_outcome();
 
         let unobtainable = outcome_unobtainable(&outcome)
             .unwrap_or_else(|| panic!("expected Unobtainable, got {outcome:?}"));
@@ -3172,7 +3262,9 @@ mod tests {
         .await;
 
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
+        let outcome = execute_job(&ctx, &seeded.claimed, admitted(&ctx))
+            .await
+            .into_outcome();
 
         let unobtainable = outcome_unobtainable(&outcome).unwrap_or_else(|| {
             panic!("present-but-untrusted must settle Unobtainable (uncharged), got {outcome:?}")
@@ -3235,7 +3327,9 @@ mod tests {
             &[],
         )
         .await;
-        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
+        let outcome = execute_job(&ctx, &seeded.claimed, admitted(&ctx))
+            .await
+            .into_outcome();
 
         let unobtainable = outcome_unobtainable(&outcome).unwrap_or_else(|| {
             panic!(
@@ -3353,7 +3447,9 @@ mod tests {
             PathSlotPool::new(32),
         );
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            execute_job(&ctx, &seeded.claimed).await.into_outcome()
+            execute_job(&ctx, &seeded.claimed, admitted(&ctx))
+                .await
+                .into_outcome()
         })
         .await
         .expect("the stall abort must end the wedged download (no hang)");
@@ -3397,7 +3493,9 @@ mod tests {
         .await;
 
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
+        let outcome = execute_job(&ctx, &seeded.claimed, admitted(&ctx))
+            .await
+            .into_outcome();
 
         let infra = outcome_infra(&outcome).unwrap_or_else(|| {
             panic!("expected InfraFailure for a 5xx-only upstream, got {outcome:?}")
@@ -3463,15 +3561,19 @@ mod tests {
         let calls: std::sync::Arc<std::sync::Mutex<Vec<(u64, u64, String)>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let calls_cb = calls.clone();
-        let outcome =
-            execute_job_with_progress(&ctx, &seeded.claimed, move |done, expected, uri| {
+        let outcome = execute_job_with_progress(
+            &ctx,
+            &seeded.claimed,
+            admitted(&ctx),
+            move |done, expected, uri| {
                 calls_cb
                     .lock()
                     .unwrap()
                     .push((done, expected, uri.to_string()));
-            })
-            .await
-            .into_outcome();
+            },
+        )
+        .await
+        .into_outcome();
 
         outcome_success(&outcome).unwrap_or_else(|| panic!("expected Success, got {outcome:?}"));
 
@@ -3563,7 +3665,9 @@ mod tests {
         )
         .await;
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
+        let outcome = execute_job(&ctx, &seeded.claimed, admitted(&ctx))
+            .await
+            .into_outcome();
         assert!(
             outcome_success(&outcome).is_some(),
             "precondition: the execution succeeds, got {outcome:?}"
@@ -3726,7 +3830,9 @@ mod tests {
         .await;
 
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
+        let outcome = execute_job(&ctx, &seeded.claimed, admitted(&ctx))
+            .await
+            .into_outcome();
 
         let unobtainable = outcome_unobtainable(&outcome)
             .unwrap_or_else(|| panic!("expected Unobtainable, got {outcome:?}"));
@@ -3808,7 +3914,9 @@ mod tests {
         .await;
 
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
+        let outcome = execute_job(&ctx, &seeded.claimed, admitted(&ctx))
+            .await
+            .into_outcome();
         let retry = outcome_retry_later(&outcome).unwrap_or_else(|| {
             panic!(
                 "expected RetryLater (probe-leg 429 closes uncharged), got {outcome:?} — \
@@ -3871,7 +3979,9 @@ mod tests {
         )
         .await;
         let ctx = make_ctx(db.pool.clone());
-        let first = execute_job(&ctx, &seeded1.claimed).await.into_outcome();
+        let first = execute_job(&ctx, &seeded1.claimed, admitted(&ctx))
+            .await
+            .into_outcome();
         assert!(
             outcome_success(&first).is_some(),
             "phase-1 ingest must succeed, got {first:?}"
@@ -3907,7 +4017,9 @@ mod tests {
             &[],
         )
         .await;
-        let outcome = execute_job(&ctx, &seeded2.claimed).await.into_outcome();
+        let outcome = execute_job(&ctx, &seeded2.claimed, admitted(&ctx))
+            .await
+            .into_outcome();
         let success = outcome_success(&outcome)
             .unwrap_or_else(|| panic!("expected Success from local presence, got {outcome:?}"));
         assert!(
@@ -3954,7 +4066,9 @@ mod tests {
             .await
             .unwrap();
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
+        let outcome = execute_job(&ctx, &seeded.claimed, admitted(&ctx))
+            .await
+            .into_outcome();
         let infra = outcome_infra(&outcome)
             .unwrap_or_else(|| panic!("expected InfraFailure, got {outcome:?}"));
         assert!(
@@ -4017,7 +4131,9 @@ mod tests {
         )
         .await;
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
+        let outcome = execute_job(&ctx, &seeded.claimed, admitted(&ctx))
+            .await
+            .into_outcome();
         let retry = outcome_retry_later(&outcome)
             .unwrap_or_else(|| panic!("expected RetryLater, got {outcome:?}"));
         assert_eq!(retry.class, "rate_limited");
@@ -4059,7 +4175,9 @@ mod tests {
         )
         .await;
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
+        let outcome = execute_job(&ctx, &seeded.claimed, admitted(&ctx))
+            .await
+            .into_outcome();
         let retry = outcome_retry_later(&outcome)
             .unwrap_or_else(|| panic!("expected RetryLater, got {outcome:?}"));
         assert_eq!(retry.class, "raced");
@@ -4102,7 +4220,9 @@ mod tests {
         )
         .await;
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
+        let outcome = execute_job(&ctx, &seeded.claimed, admitted(&ctx))
+            .await
+            .into_outcome();
         let infra = outcome_infra(&outcome)
             .unwrap_or_else(|| panic!("expected InfraFailure, got {outcome:?}"));
         assert!(
@@ -4170,7 +4290,9 @@ mod tests {
         .unwrap();
 
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
+        let outcome = execute_job(&ctx, &seeded.claimed, admitted(&ctx))
+            .await
+            .into_outcome();
         let success = outcome_success(&outcome)
             .unwrap_or_else(|| panic!("expected Success via tenant2, got {outcome:?}"));
         assert_eq!(
@@ -4232,7 +4354,9 @@ mod tests {
         .unwrap();
 
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
+        let outcome = execute_job(&ctx, &seeded.claimed, admitted(&ctx))
+            .await
+            .into_outcome();
         assert!(
             outcome_infra(&outcome).is_some(),
             "an unconfirmable tenant view must report infra, got {outcome:?}"
@@ -4534,7 +4658,9 @@ mod tests {
         )
         .await;
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
+        let outcome = execute_job(&ctx, &seeded.claimed, admitted(&ctx))
+            .await
+            .into_outcome();
         let unobtainable = outcome_unobtainable(&outcome).unwrap_or_else(|| {
             panic!("expected Unobtainable (gate-hidden local row must degrade), got {outcome:?}")
         });
@@ -4586,7 +4712,9 @@ mod tests {
         )
         .await;
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
+        let outcome = execute_job(&ctx, &seeded.claimed, admitted(&ctx))
+            .await
+            .into_outcome();
         assert!(
             outcome_unobtainable(&outcome).is_some(),
             "I-217: another tenant's built output must be hidden from the walk, got {outcome:?}"
@@ -4632,7 +4760,9 @@ mod tests {
         )
         .await;
         let ctx = make_ctx(db.pool.clone());
-        let outcome = execute_job(&ctx, &seeded.claimed).await.into_outcome();
+        let outcome = execute_job(&ctx, &seeded.claimed, admitted(&ctx))
+            .await
+            .into_outcome();
         let success = outcome_success(&outcome)
             .unwrap_or_else(|| panic!("expected Success via the local row, got {outcome:?}"));
         assert_eq!(success.verified_paths, vec![path.clone()]);
@@ -4707,7 +4837,11 @@ mod tests {
         ctx.probe_rendezvous = Some(std::sync::Arc::new(tokio::sync::Barrier::new(4)));
         let job = tokio::spawn({
             let claimed = seeded.claimed.clone();
-            async move { execute_job(&ctx, &claimed).await.into_outcome() }
+            async move {
+                execute_job(&ctx, &claimed, admitted(&ctx))
+                    .await
+                    .into_outcome()
+            }
         });
         let outcome = tokio::time::timeout(Duration::from_secs(10), job)
             .await
@@ -5103,7 +5237,11 @@ mod tests {
         let ctx = make_ctx(db.pool.clone()); // F = 4
         let job = tokio::spawn({
             let claimed = seeded.claimed.clone();
-            async move { execute_job(&ctx, &claimed).await.into_outcome() }
+            async move {
+                execute_job(&ctx, &claimed, admitted(&ctx))
+                    .await
+                    .into_outcome()
+            }
         });
 
         // Exactly F fetches start.
@@ -5213,7 +5351,7 @@ mod tests {
             let job = tokio::spawn({
                 let claimed = seeded.claimed.clone();
                 async move {
-                    execute_job_with_progress(&ctx, &claimed, move |d, e, u| {
+                    execute_job_with_progress(&ctx, &claimed, admitted(&ctx), move |d, e, u| {
                         sink.lock().unwrap().push((d, e, u.to_string()));
                     })
                     .await
@@ -5344,7 +5482,7 @@ mod tests {
         let job = tokio::spawn({
             let claimed = seeded.claimed.clone();
             async move {
-                execute_job_with_progress(&ctx, &claimed, move |d, e, u| {
+                execute_job_with_progress(&ctx, &claimed, admitted(&ctx), move |d, e, u| {
                     sink.lock().unwrap().push((d, e, u.to_string()));
                 })
                 .await
@@ -5414,11 +5552,13 @@ mod tests {
             }
         });
         let ctx2 = make_ctx(db.pool.clone());
-        let outcome2 =
-            tokio::time::timeout(Duration::from_secs(30), execute_job(&ctx2, &seeded.claimed))
-                .await
-                .expect("second attempt must complete")
-                .into_outcome();
+        let outcome2 = tokio::time::timeout(
+            Duration::from_secs(30),
+            execute_job(&ctx2, &seeded.claimed, admitted(&ctx2)),
+        )
+        .await
+        .expect("second attempt must complete")
+        .into_outcome();
         releaser.abort();
         let success = outcome_success(&outcome2)
             .unwrap_or_else(|| panic!("second attempt: expected Success, got {outcome2:?}"));
@@ -5532,7 +5672,7 @@ mod tests {
         );
     }
 
-    // r[verify store.materialize.gate-share]
+    // r[verify store.materialize.gate-share+1]
     /// W-4 pool ceiling: executor-held admission permits never exceed
     /// effective_cap / 2 — the d1f18610d invariant made STRUCTURAL
     /// (the pod path-slot pool), not arithmetic. Two concurrent walks
@@ -5603,7 +5743,11 @@ mod tests {
             .map(|j| {
                 let ctx = mk_ctx();
                 let claimed = j.claimed.clone();
-                tokio::spawn(async move { execute_job(&ctx, &claimed).await.into_outcome() })
+                tokio::spawn(async move {
+                    execute_job(&ctx, &claimed, admitted(&ctx))
+                        .await
+                        .into_outcome()
+                })
             })
             .collect();
 
@@ -5657,31 +5801,45 @@ mod tests {
         releaser.abort();
     }
 
-    // r[verify store.materialize.gate-share]
+    // r[verify store.materialize.gate-share+1]
     /// W-2(b) baseline liveness (TRUE RED against the first-path-only
-    /// slot rule): pool P=1, walk A holds the slot with a two-path
-    /// frontier, walk B's baseline waiter is queued. A's sole
-    /// in-flight path completes → the fair semaphore hands the freed
-    /// slot to B (yield law) → A sits at width 0 with a nonempty
-    /// frontier. Under the width-1 BASELINE INVARIANT A's next acquire
-    /// is blocking-FIFO and both walks finish; under the first-path-
-    /// only strawman A never re-queues and wedges. W-2(c)'s yield
-    /// direction rides the same harness: B's queued baseline waiter
-    /// gets the slot before A can re-widen.
+    /// slot rule): pool P=1, walk A's claim carries the slot into a
+    /// two-path frontier; while a1 is in flight a FOREIGN waiter
+    /// queues on the pool. a1 completes → the fair semaphore hands
+    /// the freed slot to the QUEUED waiter (yield law — the queued
+    /// entry beats any later acquire) → A sits at width 0 with a
+    /// nonempty frontier. Under the width-1 BASELINE INVARIANT A's
+    /// next acquire is blocking-FIFO and the walk finishes once the
+    /// waiter releases; under the first-path-only strawman A never
+    /// re-queues and wedges.
+    ///
+    /// DISCLOSED RE-DERIVATION (bug_102, recorded as a divergence in
+    /// the owning commit): the original two-walk topology — walk B
+    /// parked at its FIRST acquire on a saturated P=1 pool — is
+    /// UNREPRESENTABLE post-close (a claim cannot exist without
+    /// holding a slot: B would never have been admitted), so the
+    /// queued contender is a raw foreign waiter; the certified laws
+    /// (mid-walk width-1 baseline re-queue + the yield direction) are
+    /// unchanged, and the histogram pins exactly ONE baseline sample
+    /// (A's mid-walk re-queue; the carried first spawn contributes
+    /// none).
     #[tokio::test]
     async fn drained_walk_requeues_baseline_and_completes() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let rec = DebuggingRecorder::new();
+        let snap = rec.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&rec);
+
         let db = TestDb::new(&crate::MIGRATOR).await;
         let tenant = seed_tenant(&db.pool, "mat-w2b").await;
 
         let a1 = store_path(50, "w2b-a1");
         let a2 = store_path(51, "w2b-a2");
-        let b1 = store_path(52, "w2b-b1");
         let (nar, _) = rio_test_support::fixtures::make_nar(b"w2b contents");
         let (upstream, gates) = spawn_pathgated_upstream(
             vec![
                 (a1.clone(), nar.clone(), vec![]),
                 (a2.clone(), nar.clone(), vec![]),
-                (b1.clone(), nar.clone(), vec![]),
             ],
             "cache.w2b",
         )
@@ -5697,84 +5855,101 @@ mod tests {
             &[],
         )
         .await;
-        let job_b = seed_job(
-            &db.pool,
-            "mat-w2b-drv-b",
-            &[("b1", b1.as_str())],
-            Some(tenant),
-            Some(tenant),
-            &[],
-        )
-        .await;
 
         let substituter = std::sync::Arc::new(
             Substituter::new(db.pool.clone(), None).with_http_client(sandbox_http()),
         );
         // ONE slot: the steady-state contention regime, minimized.
         let pool1 = PathSlotPool::new(1);
-        let mk_ctx = || {
-            ExecutorContext::new(
-                db.pool.clone(),
-                std::sync::Arc::clone(&substituter),
-                4,
-                pool1.clone(),
-            )
-        };
+        let ctx_a = ExecutorContext::new(
+            db.pool.clone(),
+            std::sync::Arc::clone(&substituter),
+            4,
+            pool1.clone(),
+        );
 
-        // A starts first and takes the slot (a1 in flight, a2 queued
-        // behind the failed widening).
-        let ctx_a = mk_ctx();
+        // A's claim carries the pool's only slot in (slot ≺ claim);
+        // a1 spawns on it and parks at its gated fetch.
+        let adm_a = admitted(&ctx_a);
         let ca = job_a.claimed.clone();
-        let ha = tokio::spawn(async move { execute_job(&ctx_a, &ca).await.into_outcome() });
+        let ha = tokio::spawn(async move { execute_job(&ctx_a, &ca, adm_a).await.into_outcome() });
         tokio::time::sleep(Duration::from_millis(400)).await;
-        // B queues its baseline waiter on the saturated pool.
-        let ctx_b = mk_ctx();
-        let cb = job_b.claimed.clone();
-        let hb = tokio::spawn(async move { execute_job(&ctx_b, &cb).await.into_outcome() });
-        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        // The foreign waiter queues on the saturated pool (raw — it
+        // must not pollute the walk's baseline instrumentation).
+        let (waiter_got_tx, waiter_got_rx) = tokio::sync::oneshot::channel::<()>();
+        let (waiter_release_tx, waiter_release_rx) = tokio::sync::oneshot::channel::<()>();
+        let waiter = tokio::spawn({
+            let slots = std::sync::Arc::clone(&pool1.slots);
+            async move {
+                let permit = slots.acquire_owned().await.expect("pool never closed");
+                let _ = waiter_got_tx.send(());
+                let _ = waiter_release_rx.await;
+                drop(permit);
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Release a1: A completes its sole in-flight path; the freed
-        // slot goes to B's QUEUED waiter; A re-queues at the baseline
-        // (the invariant under test). Then release b1, then a2 —
-        // paced re-notifies until each fetch consumes its gate.
-        for path in [&a1, &b1, &a2] {
-            let g = std::sync::Arc::clone(&gates[path]);
-            tokio::spawn(async move {
-                for _ in 0..400 {
-                    g.notify_one();
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            });
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
+        // slot goes to the QUEUED waiter (yield law); A re-queues at
+        // the baseline (the invariant under test).
+        let g = std::sync::Arc::clone(&gates[&a1]);
+        tokio::spawn(async move {
+            for _ in 0..400 {
+                g.notify_one();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), waiter_got_rx)
+            .await
+            .expect("the queued waiter receives a1's freed slot (yield law)")
+            .unwrap();
+        // A is now width 0 with frontier [a2], queued blocking-FIFO.
+        // Release the waiter, then a2's gate — A must finish.
+        let _ = waiter_release_tx.send(());
+        let g2 = std::sync::Arc::clone(&gates[&a2]);
+        tokio::spawn(async move {
+            for _ in 0..400 {
+                g2.notify_one();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
 
-        for (name, h) in [("A", ha), ("B", hb)] {
-            let outcome = tokio::time::timeout(Duration::from_secs(30), h)
-                .await
-                .unwrap_or_else(|_| {
-                    panic!(
-                        "walk {name} wedged: width-0 with a nonempty frontier and no \
-                         completion event ever arrives again (the first-path-only \
-                         slot rule's permanent mid-walk stall)"
-                    )
-                })
-                .unwrap();
-            let success = outcome_success(&outcome)
-                .unwrap_or_else(|| panic!("walk {name}: expected Success, got {outcome:?}"));
-            assert!(
-                !success.ingested_paths.is_empty(),
-                "walk {name} must serve its paths"
-            );
-        }
+        let outcome = tokio::time::timeout(Duration::from_secs(30), ha)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "walk A wedged: width-0 with a nonempty frontier and no \
+                     completion event ever arrives again (the first-path-only \
+                     slot rule's permanent mid-walk stall)"
+                )
+            })
+            .unwrap();
+        let success = outcome_success(&outcome)
+            .unwrap_or_else(|| panic!("walk A: expected Success, got {outcome:?}"));
+        assert_eq!(success.ingested_paths.len(), 2, "walk A served both paths");
         assert_eq!(
             pin_count(&db.pool, "mat-w2b-drv-a", "materialization").await,
             2,
             "walk A finished BOTH paths (baseline re-queue worked)"
         );
+        // Exactly ONE baseline sample: A's mid-walk re-queue (the
+        // carried first spawn contributes none) — snapshot once.
+        let mut samples = 0usize;
+        for (ck, _, _, v) in snap.snapshot().into_vec() {
+            if ck.key().name() == "rio_store_executor_path_slot_baseline_wait_seconds" {
+                let DebugValue::Histogram(h) = v else {
+                    continue;
+                };
+                samples = h.len();
+            }
+        }
+        assert_eq!(samples, 1, "one mid-walk baseline re-queue, no more");
+        waiter.abort();
     }
 
     // r[verify store.materialize.path-fold+1]
-    // r[verify store.materialize.gate-share]
+    // r[verify store.materialize.gate-share+1]
     /// R1-003 (merged_bug_003, TRUE RED pre-fix) / W-003a: a walk
     /// whose remaining frontier is DUP-ONLY completes WITHOUT entering
     /// the baseline FIFO — certified two ways at once: completion
@@ -5849,7 +6024,7 @@ mod tests {
         let job = tokio::spawn({
             let claimed = seeded.claimed.clone();
             async move {
-                execute_job_with_progress(&ctx, &claimed, move |dn, e, u| {
+                execute_job_with_progress(&ctx, &claimed, admitted(&ctx), move |dn, e, u| {
                     sink.lock().unwrap().push((dn, e, u.to_string()));
                 })
                 .await
@@ -5923,8 +6098,9 @@ mod tests {
             4,
             "all four diamond paths served"
         );
-        // Histogram count: one sample per REAL spawn (A,B,C,D), none
-        // for the dup tail — snapshot exactly once.
+        // Histogram count: one sample per REAL baseline spawn (B,C,D —
+        // path A rode the claim's carried slot, bug_102), none for the
+        // dup tail — snapshot exactly once.
         let mut samples = 0usize;
         for (ck, _, _, v) in snap.snapshot().into_vec() {
             if ck.key().name() == "rio_store_executor_path_slot_baseline_wait_seconds" {
@@ -5935,9 +6111,9 @@ mod tests {
             }
         }
         assert_eq!(
-            samples, 4,
-            "baseline-wait histogram counts exactly the four real spawns \
-             (zero phantom samples for the dup-only tail)"
+            samples, 3,
+            "baseline-wait histogram counts exactly the three real baseline \
+             spawns (zero phantom samples for the dup-only tail)"
         );
         assert_eq!(
             pool1.slots.available_permits(),
@@ -6004,7 +6180,11 @@ mod tests {
 
         let ctx = make_ctx(db.pool.clone());
         let claimed = seeded.claimed.clone();
-        let walk = tokio::spawn(async move { execute_job(&ctx, &claimed).await.into_outcome() });
+        let walk = tokio::spawn(async move {
+            execute_job(&ctx, &claimed, admitted(&ctx))
+                .await
+                .into_outcome()
+        });
 
         // Inside iteration 1's gated W fetch: X has not yet settled
         // (references enter at W's apply), and the tenant set was
@@ -6074,6 +6254,142 @@ mod tests {
             b_hits += 1;
         }
         assert_eq!(b_hits, 1, "X fetched exactly once (single spawn)");
+    }
+
+    // r[verify store.materialize.gate-share+1]
+    /// R1-102 (bug_102, TRUE RED pre-fix): a claimed walk must not be
+    /// able to park waiting for its FIRST path slot — pre-fix the
+    /// width-0 baseline waiter at job start held the CLAIM (an open
+    /// attempt window with a running establishment deadline) while
+    /// holding zero slots, the exact "slot waiters hold nothing"
+    /// violation: the sweep cannot distinguish that queued-healthy
+    /// walk from an unreported crash, so it establishes charged and
+    /// ladders healthy jobs under the expected helm regime
+    /// (n×F = 128 > P = 32).
+    ///
+    /// Pre-fix red (run + recorded in the owning commit body): the
+    /// walk parked in acquire_baseline holding the claim — no
+    /// outcome, no slot, attempt window burning (the unreported-crash
+    /// establishment shape). Post-fix the parked shape DOES NOT
+    /// TYPECHECK — `execute_job` demands a `ClaimAdmission` and the
+    /// mint is non-blocking, so there is no first-slot wait state on
+    /// a claimed job at all; this re-aimed body pins the runtime half
+    /// (no headroom ⇒ no admission ⇒ no claim; an admission HOLDS its
+    /// slot; an unconsumed admission returns it).
+    #[tokio::test]
+    async fn claimed_walk_cannot_park_for_its_first_slot() {
+        let pool1 = PathSlotPool::new(1);
+        let held = pool1
+            .slots
+            .clone()
+            .try_acquire_owned()
+            .expect("fresh pool has the slot");
+        assert!(
+            pool1.try_admit_claim().is_none(),
+            "no slot headroom => no claim admission (the job stays \
+             scheduler-listed, claimable by a pod with headroom)"
+        );
+        drop(held);
+        let admission = pool1
+            .try_admit_claim()
+            .expect("freed headroom admits the claim");
+        assert_eq!(
+            pool1.slots.available_permits(),
+            0,
+            "the admission HOLDS the first slot from claim onward"
+        );
+        drop(admission);
+        assert_eq!(
+            pool1.slots.available_permits(),
+            1,
+            "an unconsumed admission returns its slot (empty-frontier drop)"
+        );
+    }
+
+    // r[verify store.materialize.gate-share+1]
+    /// R3-102 (bug_102, TRUE RED pre-fix): the admission slot seeds
+    /// the FIRST spawn — a claimed walk's path 1 consumes the slot
+    /// carried by the claim, never entering the baseline FIFO.
+    /// F = 4, 6-path closure, pool capacity 2: the carried slot
+    /// covers spawn 1 and every further width change rides try_widen,
+    /// so the baseline-wait histogram stays at ZERO samples for the
+    /// whole walk; widening proceeds as before (the W-2(a) shape —
+    /// all six served).
+    ///
+    /// Pre-fix red (run + recorded): the first spawn queued at the
+    /// baseline FIFO (histogram count >= 1 — a claim-to-first-spawn
+    /// wait inside the attempt window).
+    #[tokio::test]
+    async fn admission_slot_seeds_the_first_spawn() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let rec = DebuggingRecorder::new();
+        let snap = rec.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&rec);
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "adm-seed").await;
+        let paths: Vec<String> = (0..6).map(|i| store_path(90 + i, "admseed")).collect();
+        let (nar, _) = rio_test_support::fixtures::make_nar(b"admseed contents");
+        let served: Vec<(String, Vec<u8>, Vec<String>)> = paths
+            .iter()
+            .map(|p| (p.clone(), nar.clone(), vec![]))
+            .collect();
+        let upstream = spawn_multi_upstream(served, "cache.admseed").await;
+        wire_upstream(&db.pool, tenant, &upstream).await;
+        let outputs: Vec<(String, &str)> = paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (format!("o{i}"), p.as_str()))
+            .collect();
+        let outputs_ref: Vec<(&str, &str)> =
+            outputs.iter().map(|(n, p)| (n.as_str(), *p)).collect();
+        let seeded = seed_job(
+            &db.pool,
+            "admseed-drv",
+            &outputs_ref,
+            Some(tenant),
+            Some(tenant),
+            &[],
+        )
+        .await;
+
+        let pool2 = PathSlotPool::new(2);
+        let ctx = ExecutorContext::new(
+            db.pool.clone(),
+            std::sync::Arc::new(
+                Substituter::new(db.pool.clone(), None).with_http_client(sandbox_http()),
+            ),
+            4,
+            pool2,
+        );
+        let outcome = tokio::time::timeout(Duration::from_secs(30), async {
+            execute_job(&ctx, &seeded.claimed, admitted(&ctx))
+                .await
+                .into_outcome()
+        })
+        .await
+        .expect("walk completes");
+        let success = outcome_success(&outcome)
+            .unwrap_or_else(|| panic!("expected Success, got {outcome:?}"));
+        assert_eq!(
+            success.ingested_paths.len(),
+            6,
+            "all six paths served (widening preserved)"
+        );
+        let mut samples = 0usize;
+        for (ck, _, _, v) in snap.snapshot().into_vec() {
+            if ck.key().name() == "rio_store_executor_path_slot_baseline_wait_seconds" {
+                let DebugValue::Histogram(h) = v else {
+                    continue;
+                };
+                samples = h.len();
+            }
+        }
+        assert_eq!(
+            samples, 0,
+            "the first spawn queued at the baseline FIFO with the claim open \
+             (the carried admission slot must seed it — zero baseline samples)"
+        );
     }
 
     /// Prelude seam smoke (the width-4 red seams): a NO-OP publish

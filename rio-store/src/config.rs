@@ -328,7 +328,7 @@ pub struct MaterializationConfig {
     /// width F — at most this many concurrent path resolutions per
     /// walk. Default 4. Total executor pressure on the admission gate
     /// is bounded STRUCTURALLY by the pod path-slot pool (P =
-    /// effective admission cap / 2, `store.materialize.gate-share`),
+    /// effective admission cap / 2, `store.materialize.gate-share+1`),
     /// independent of F and `executor_concurrency` — both are
     /// shaping-only levers: at full worker occupancy walks run ~1
     /// slot each (job-grain); at low occupancy walks widen to F
@@ -368,7 +368,7 @@ pub fn derive_substitute_admission_cap(pg_max: u32) -> usize {
     (pg_max as usize * 3).clamp(64, 128)
 }
 
-// r[impl store.materialize.gate-share]
+// r[impl store.materialize.gate-share+1]
 /// The EFFECTIVE substitute-admission capacity — override included.
 /// THE one value main.rs constructs the gate from AND derives the
 /// executor path-slot pool from (live_047/R-C): a formula-only pool
@@ -380,9 +380,9 @@ pub fn effective_substitute_admission_cap(overridden: Option<usize>, pg_max: u32
     overridden.unwrap_or_else(|| derive_substitute_admission_cap(pg_max))
 }
 
-// r[impl store.materialize.gate-share]
+// r[impl store.materialize.gate-share+1]
 /// Executor path-slot pool size: P = effective_cap / 2
-/// (`store.materialize.gate-share`). The executor alone can never
+/// (`store.materialize.gate-share+1`). The executor alone can never
 /// saturate the admission gate — ≥ cap/2 permits remain available to
 /// RPC miss traffic at all times, independent of `path_fanout` and
 /// `executor_concurrency` (the d1f18610d n=32 envelope made
@@ -788,7 +788,7 @@ mod tests {
         assert!(ok.validate().is_ok());
     }
 
-    // r[verify store.materialize.gate-share]
+    // r[verify store.materialize.gate-share+1]
     /// E-3 (live_047/R-C): P = effective_admission_cap / 2, pinned
     /// through the REAL symbols on BOTH arms — formula (None →
     /// derive_substitute_admission_cap) and override (Some(o) → o) —
@@ -815,7 +815,7 @@ mod tests {
         }
     }
 
-    // r[verify store.materialize.gate-share]
+    // r[verify store.materialize.gate-share+1]
     /// live_047/R-C (WO-R7-3): an admission-permit override below 2
     /// makes the executor path-slot pool P = cap/2 = 0 — every walk
     /// wedges at the baseline slot acquire. Rejected at validate()

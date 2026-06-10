@@ -1423,7 +1423,7 @@ singleflight waiters of a cancelled leader recover by re-running their own
 init futures (moka retry semantics --- a transient raced window during the
 guard reap is lawful).
 
-#r("store.materialize.gate-share")[
+#r("store.materialize.gate-share+1")[
   The executor alone MUST NOT be able to saturate the substitute admission
   gate: at least cap/2 admission permits MUST remain available to RPC miss
   traffic at all times, where cap is the EFFECTIVE admission capacity (the
@@ -1432,20 +1432,26 @@ guard reap is lawful).
   ONE pod-wide fair-FIFO pool of `P = cap/2` permits for its whole
   lifetime, so executor-held admission permits ≤ in-flight path futures ≤
   held slots ≤ P, independent of `path_fanout` and `executor_concurrency`.
-  The process gate order is `slot ≺ admission ≺ budget` --- slot waiters
-  hold nothing, admission waiters may hold only a slot, budget waiters
-  hold both but never wait on either --- keeping the wait graph acyclic.
-  Width-1 baseline invariant: whenever a walk holds ZERO slots with a
-  nonempty frontier, its next slot acquire MUST be blocking-FIFO; only
-  spawns that would take the walk to width ≥ 2 may use a non-blocking
-  try-acquire. Yield law: the pool MUST be one fair FIFO semaphore whose
-  freed slots are assigned to queued baseline waiters BEFORE any
-  try-acquire can observe them (widening is non-preferential) --- a split
-  counter, a second extras-semaphore, or any non-queue-respecting fast
-  path violates this rule even while the permit ceiling holds. An
-  admission capacity below 2 MUST be rejected at config validation (P = 0
-  wedges every walk at the baseline acquire; flooring P at 1 = cap would
-  hand the executor 100% of a cap-1 gate).
+  The process gate order is `slot ≺ claim ≺ admission ≺ budget` --- a
+  worker MUST hold its first path slot BEFORE the claiming pull (claim
+  admission is a non-blocking, leftover-only acquire: a slotless worker
+  mints no claim and the job stays scheduler-listed), so slot waiters hold
+  nothing, claim holders hold exactly one slot and wait only on bounded
+  RPC, admission waiters may hold only slots, budget waiters hold both but
+  never wait on either --- keeping the wait graph acyclic and the attempt
+  window open only on admitted work. Width-1 baseline invariant: the claim
+  carries its first slot into the walk (iteration 1's width-0 spawn
+  consumes it without entering the FIFO); thereafter, whenever a walk
+  holds ZERO slots with a nonempty frontier, its next slot acquire MUST be
+  blocking-FIFO; only spawns that would take the walk to width ≥ 2 may use
+  a non-blocking try-acquire. Yield law: the pool MUST be one fair FIFO
+  semaphore whose freed slots are assigned to queued baseline waiters
+  BEFORE any try-acquire can observe them (widening and claim admission
+  are non-preferential) --- a split counter, a second extras-semaphore, or
+  any non-queue-respecting fast path violates this rule even while the
+  permit ceiling holds. An admission capacity below 2 MUST be rejected at
+  config validation (P = 0 wedges every worker at claim admission;
+  flooring P at 1 = cap would hand the executor 100% of a cap-1 gate).
 ]
 This is the d1f18610d n=32 envelope ("32 caps the executor at half the
 gate") converted from sizing arithmetic in a values comment --- which any
@@ -1457,16 +1463,24 @@ concurrency is constant at P; F vs n is adaptive --- at full worker
 occupancy each walk holds ~1 slot (job-grain, the backlog burst), at low
 occupancy walks widen to F (path-grain, the drain tail) --- GIVEN the yield
 law (without it, widened walks re-capture freed slots and the equilibrium
-is false). Baseline-slot queuing is TRANSIENT whenever n×F > P (helm: 128
-> 32) and PERMANENT only at n > P (boot warn; dead at both shipped
-configs); the runtime tripwire for the transient regime is the pool's
-queued-baseline-waiters/wait-age facet, and the disclosed residual is that
-a queued wait exceeding the dispatched deadline plus establishment slack
-ends in a charged C2 establishment requeue (the deadline-vs-churn
-arithmetic; a dispatch extension would be a scheduler-plane change).
-Executor admission timeouts when RPC traffic holds the whole gate remain
-the pre-existing charged posture --- the pool prevents only the
-executor-as-cause direction.
+is false). Baseline-slot queuing is MID-WALK-ONLY by construction: the
+slot ≺ claim gate means the attempt window opens only on admitted work, so
+the interval between claim and first spawn contains zero slot waits and
+the establishment sweep's pricing premise --- window time is slot-held
+work or crash --- holds again. n×F > P (helm: 128 > 32) shifts queuing to
+mid-walk re-acquires, where the walk IS the attempt and the FIFO gives it
+the per-path fair share priced by the queued-baseline-waiters/wait-age
+facet; a mid-walk wait that pushes a REAL attempt --- one that held a slot
+from claim onward --- past the dispatched deadline lands in the
+PRE-EXISTING dispatch-deadline-vs-slow-work contract (scheduler machinery
+predating fan-out), with monotone cross-attempt progress because committed
+paths are pinned and re-serve through the local probe on re-claim ---
+nothing width-authored remains on this property. n > P means excess
+workers idle at claim admission (boot warn; slotless passes mint no claims
+and jobs stay listed for pods with headroom --- strictly better placement
+than queueing inside an open window). Executor admission timeouts when RPC
+traffic holds the whole gate remain the pre-existing charged posture ---
+the pool prevents only the executor-as-cause direction.
 
 #r("store.materialize.progress-monotone+1")[
   Every materialization progress emission MUST route through a

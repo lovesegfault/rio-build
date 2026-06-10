@@ -129,7 +129,7 @@ async fn main() -> anyhow::Result<()> {
     // via GetLoad). Constructed before either builder chain so the
     // share is explicit — two `AdmissionGate::new()` calls would
     // compile but GetLoad would always read 0.0.
-    // r[impl store.materialize.gate-share]
+    // r[impl store.materialize.gate-share+1]
     // ONE effective value feeds the gate AND the executor path-slot
     // pool (live_047/R-C): the pool tracks the override, so the
     // documented `substituteAdmissionPermits` lever can never hand
