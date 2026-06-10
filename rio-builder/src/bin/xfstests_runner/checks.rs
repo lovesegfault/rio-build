@@ -20,12 +20,13 @@ pub mod io_paths;
 pub mod meta;
 pub mod read;
 pub mod support;
+pub mod walker;
 pub mod write_attack;
 pub mod xattr_statx;
 
 pub use support::{
-    Check, Ctx, Outcome, PrivDrop, errno_of, expect_errno, first_divergence, readable_plain_file,
-    resolve_dep_root, wait_for,
+    Check, Ctx, Outcome, PrivDrop, RawDir, count_nodes, cpath, errno_of, expect_errno,
+    first_divergence, open_raw, readable_plain_file, resolve_dep_root, wait_for,
 };
 
 /// All checks, in execution order (cold-read sequencing, then
@@ -79,6 +80,40 @@ pub fn registry() -> Vec<Check> {
             origin: "xfstests generic/453",
             run: meta::generic_453_byte_exact_names,
         },
+        // Identity/walker batch — the escaped-bug class (hardlinked-dir
+        // semantics from digest-keyed directory inodes). Metadata-only:
+        // none of these read file contents, so the cold-read sequencing
+        // of the blob checks below is preserved.
+        Check {
+            name: "posix_dir_inode_uniqueness",
+            origin: "castore-specific (POSIX: no hardlinked directories; GNU fts escape)",
+            run: walker::posix_dir_inode_uniqueness,
+        },
+        Check {
+            name: "hardlink_nlink_honesty",
+            origin: "xfstests generic/002+100 intent (tar/du (dev,ino,nlink) honesty)",
+            run: walker::hardlink_nlink_honesty,
+        },
+        Check {
+            name: "dot_dotdot_identity",
+            origin: "POSIX dir sanity ('.'/'..' identity; pairs with generic/028)",
+            run: walker::dot_dotdot_identity,
+        },
+        Check {
+            name: "generic_028_getcwd_stability",
+            origin: "xfstests generic/028 (read-only adaptation: alias lookups as dentry churn)",
+            run: walker::generic_028_getcwd_stability,
+        },
+        Check {
+            name: "generic_011_dirstress",
+            origin: "xfstests generic/011 (read-only adaptation)",
+            run: walker::generic_011_dirstress,
+        },
+        Check {
+            name: "fts_walk_concurrent_aliases",
+            origin: "regression: GNU find fts ENOENT on aliased dir dentries (data-plane escape)",
+            run: walker::fts_walk_concurrent_aliases,
+        },
         Check {
             name: "generic_075_091_read_integrity",
             origin: "xfstests generic/075 + generic/091",
@@ -111,6 +146,26 @@ pub fn registry() -> Vec<Check> {
             name: "generic_285_448_706_seek_hole_data",
             origin: "xfstests generic/285 + generic/448 + generic/706",
             run: io_paths::generic_285_448_706_seek_hole_data,
+        },
+        Check {
+            name: "generic_263_odirect_read",
+            origin: "xfstests generic/263 (read-only adaptation: O_DIRECT serves exact bytes or EINVAL)",
+            run: io_paths::generic_263_odirect_read,
+        },
+        Check {
+            name: "generic_013_fsstress_readonly",
+            origin: "xfstests generic/013 + generic/241 intent (read-only op-mix soak, 4 threads)",
+            run: walker::generic_013_fsstress_readonly,
+        },
+        Check {
+            name: "generic_003_192_atime_stable",
+            origin: "xfstests generic/003 + generic/192 (read-only adaptation: atime never moves)",
+            run: walker::generic_003_192_atime_stable,
+        },
+        Check {
+            name: "generic_467_open_by_handle",
+            origin: "xfstests generic/467 (+426/477/756/777 refusal contract)",
+            run: io_paths::generic_467_open_by_handle,
         },
         Check {
             name: "generic_020_062_097_xattr_read_legs",
@@ -148,6 +203,16 @@ pub fn registry() -> Vec<Check> {
             run: dir_locks::generic_131_read_locks,
         },
         Check {
+            name: "generic_478_571_ofd_locks_lease",
+            origin: "xfstests generic/478 + generic/571 (OFD lock + lease read legs)",
+            run: dir_locks::generic_478_571_ofd_locks_lease,
+        },
+        Check {
+            name: "generic_637_small_getdents",
+            origin: "xfstests generic/637 (small-getdents completeness leg)",
+            run: dir_locks::generic_637_small_getdents,
+        },
+        Check {
             name: "generic_126_exec_access",
             origin: "xfstests generic/126",
             run: errno_battery::generic_126_exec_access,
@@ -176,6 +241,21 @@ pub fn registry() -> Vec<Check> {
             name: "statfs_zero_totals",
             origin: "castore-specific (statfs F-A pin; no upstream statfs-totals analogue)",
             run: errno_battery::statfs_zero_totals,
+        },
+        Check {
+            name: "mount_readonly_honesty",
+            origin: "harness ro-mount intent (statvfs ST_RDONLY + /proc/mounts ro + W_OK EROFS)",
+            run: errno_battery::mount_readonly_honesty,
+        },
+        Check {
+            name: "generic_006_name_limits",
+            origin: "xfstests generic/006 intent (NAME_MAX/PATH_MAX errno contracts)",
+            run: errno_battery::generic_006_name_limits,
+        },
+        Check {
+            name: "open_flag_contracts",
+            origin: "xfstests generic/004 + generic/763 intent (O_DIRECTORY/O_NOFOLLOW/O_PATH/O_TMPFILE/zero-write)",
+            run: errno_battery::open_flag_contracts,
         },
         Check {
             name: "generic_680_dirty_pipe",

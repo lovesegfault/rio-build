@@ -6,12 +6,11 @@ use std::fs;
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirEntryExt, MetadataExt};
-use std::path::Path;
 
 use anyhow::{Context, bail, ensure};
 use nix::errno::Errno;
 
-use super::{Ctx, Outcome, errno_of};
+use super::{Ctx, Outcome, count_nodes, errno_of};
 use crate::manifest::SymlinkResolution;
 
 /// The mount under test must actually be the castore-FUSE: fstype
@@ -168,15 +167,18 @@ pub fn generic_257_readdir_multibatch(ctx: &Ctx) -> anyhow::Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
-/// Castore-specific identity contract: file/symlink inodes are
-/// content-derived, directory inodes are path-derived. Identical bytes
-/// (same exec bit) in different directories share one inode (with an
-/// honest st_nlink alias count); the same bytes with a different exec
-/// bit are distinct inodes; directories with identical contents at
-/// different paths are DISTINCT inodes — a shared directory inode is a
-/// hardlinked directory, which POSIX forbids and which desyncs
-/// fts-based walkers (find/du/rm -r abort with fabricated ENOENT under
-/// concurrency). Guards the ino derivation in `tree::InoMap`.
+/// Castore-specific identity contract for FILES: inodes are
+/// content-derived. Identical bytes (same exec bit) in different
+/// directories share one inode; the same bytes with a different exec
+/// bit are distinct inodes. Guards the digest→ino derivation in
+/// `tree::InoMap` — a regression here breaks dedup assumptions and
+/// inode-comparing tools.
+///
+/// Directories are deliberately NOT asserted to share inodes: the
+/// digest-keyed directory inode turned out to be hardlinked-dir
+/// semantics (POSIX-forbidden; GNU fts aborts walks over it — the
+/// data-plane escape). `walker::posix_dir_inode_uniqueness` asserts
+/// the inverse, per-path contract.
 pub fn inode_identity_content_addressed(ctx: &Ctx) -> anyhow::Result<Outcome> {
     let ino = |rel: &str| -> anyhow::Result<u64> {
         Ok(fs::symlink_metadata(ctx.on_mount(rel))
@@ -184,9 +186,7 @@ pub fn inode_identity_content_addressed(ctx: &Ctx) -> anyhow::Result<Outcome> {
             .ino())
     };
 
-    // Files: same (content, exec) class → one inode, and st_nlink
-    // reports at least the alias count visible in the fixture (the
-    // same content class may have more aliases elsewhere in the tree).
+    // Files: same (content, exec) class → one inode.
     let mut dedup_groups = 0;
     for ((_, _), members) in ctx.manifest.content_groups() {
         if members.len() < 2 {
@@ -201,13 +201,6 @@ pub fn inode_identity_content_addressed(ctx: &Ctx) -> anyhow::Result<Outcome> {
             inos.windows(2).all(|w| w[0] == w[1]),
             "files with identical content+exec have distinct inodes: {:?} -> {inos:?}",
             members.iter().map(|f| &f.path).collect::<Vec<_>>()
-        );
-        let nlink = fs::symlink_metadata(ctx.on_mount(&members[0].path))?.nlink();
-        ensure!(
-            nlink >= members.len() as u64,
-            "deduped file {} has nlink {nlink}, expected >= its {} aliases",
-            members[0].path,
-            members.len()
         );
     }
     ensure!(
@@ -244,54 +237,6 @@ pub fn inode_identity_content_addressed(ctx: &Ctx) -> anyhow::Result<Outcome> {
         "fixture has no exec/non-exec twin; the exec-bit identity split is not covered"
     );
 
-    // Directories with identical (name, content, exec) child sets share
-    // one decoded Directory body, but each PATH must be its own inode —
-    // equal inos here would be hardlinked directories.
-    let mut dir_shapes: BTreeMap<Vec<(String, String, bool)>, Vec<&str>> = BTreeMap::new();
-    for dir in &ctx.manifest.dirs {
-        let prefix = format!("{dir}/");
-        let mut children: Vec<(String, String, bool)> = ctx
-            .manifest
-            .files_under(&prefix)
-            .filter(|f| !f.path[prefix.len()..].contains('/'))
-            .map(|f| {
-                (
-                    f.path[prefix.len()..].to_owned(),
-                    f.content.clone(),
-                    f.executable,
-                )
-            })
-            .collect();
-        // Only meaningful for leaf dirs fully described by explicit
-        // files (no symlink/subdir/seq/big members).
-        let has_other_members = ctx
-            .manifest
-            .symlinks
-            .iter()
-            .any(|s| s.path.starts_with(&prefix))
-            || ctx.manifest.dirs.iter().any(|d| d.starts_with(&prefix))
-            || ctx.manifest.seq_dir.path.starts_with(&prefix)
-            || ctx.manifest.big_file.path.starts_with(&prefix);
-        if children.is_empty() || has_other_members {
-            continue;
-        }
-        children.sort();
-        dir_shapes.entry(children).or_default().push(dir);
-    }
-    for (_, dirs) in dir_shapes {
-        if dirs.len() < 2 {
-            continue;
-        }
-        let mut inos: Vec<u64> = dirs.iter().map(|d| ino(d)).collect::<anyhow::Result<_>>()?;
-        let count = inos.len();
-        inos.sort_unstable();
-        inos.dedup();
-        ensure!(
-            inos.len() == count,
-            "directories with identical contents share an inode (hardlinked-dir \
-             semantics): {dirs:?} -> {inos:?}"
-        );
-    }
     Ok(Outcome::Pass)
 }
 
@@ -379,30 +324,47 @@ pub fn generic_401_file_kinds(ctx: &Ctx) -> anyhow::Result<Outcome> {
 }
 
 /// generic/002 (adapted) + the structural completeness check: castore
-/// reports nlink=1 for every node — there is no backing tree to mirror
-/// (the btrfs-style choice, finding F-B in PLAN.md). The practical
-/// failure mode of bogus nlink is `find`/`fts` pruning subtrees via
-/// the nlink-2 heuristic, so a full walk must enumerate every node the
-/// manifest describes.
+/// reports honest nlink per the `builder.fs.castore-nlink` contract —
+/// a content-unique file is 1, a deduped file is its path-alias count
+/// (asserted by `walker::hardlink_nlink_honesty`), and a leaf
+/// directory is 2 (`.` plus the parent's entry; the old
+/// everything-is-nlink-1 choice, finding F-B, was superseded by the
+/// per-path inode fix). The practical failure mode of bogus nlink is
+/// `find`/`fts` pruning subtrees via the nlink-2 heuristic, so a full
+/// walk must enumerate every node the manifest describes.
 pub fn generic_002_nlink_walk(ctx: &Ctx) -> anyhow::Result<Outcome> {
-    let plain_file = ctx
+    // A content-unique plain file: exactly one path reaches its blob,
+    // so honest nlink is 1. (Seq-dir files hold "<i>\n", so skip
+    // all-digit contents to avoid an accidental alias.)
+    let unique_file = ctx
         .manifest
-        .files
-        .iter()
-        .find(|f| !f.executable)
-        .map(|f| f.path.as_str())
-        .context("manifest has no plain file for the nlink spot check")?;
-    for rel in [ctx.manifest.seq_dir.path.as_str(), plain_file] {
-        let st = fs::symlink_metadata(ctx.on_mount(rel))?;
-        ensure!(
-            st.nlink() == 1,
-            "{rel} nlink {} != the documented castore choice of 1 (finding F-B)",
-            st.nlink()
-        );
-    }
+        .content_groups()
+        .into_iter()
+        .find_map(|((content, exec), members)| {
+            let digits = content
+                .trim_end_matches('\n')
+                .bytes()
+                .all(|b| b.is_ascii_digit());
+            (!exec && members.len() == 1 && !digits).then(|| members[0].path.as_str())
+        })
+        .context("manifest has no content-unique plain file for the nlink spot check")?;
+    let st = fs::symlink_metadata(ctx.on_mount(unique_file))?;
+    ensure!(
+        st.nlink() == 1,
+        "{unique_file} nlink {} != 1 for a content-unique file (builder.fs.castore-nlink)",
+        st.nlink()
+    );
+    // The seq dir holds only files: nlink == 2 (`.` + parent entry).
+    let seq_dir = ctx.manifest.seq_dir.path.as_str();
+    let st = fs::symlink_metadata(ctx.on_mount(seq_dir))?;
+    ensure!(
+        st.nlink() == 2,
+        "{seq_dir} nlink {} != 2 for a leaf directory (builder.fs.castore-nlink)",
+        st.nlink()
+    );
 
     let mut count: u64 = 0;
-    walk(&ctx.dep_root, &mut count)?;
+    count_nodes(&ctx.dep_root, &mut count)?;
     ensure!(
         count == ctx.manifest.expected_node_count(),
         "walk enumerated {count} nodes, manifest expects {}",
@@ -412,10 +374,13 @@ pub fn generic_002_nlink_walk(ctx: &Ctx) -> anyhow::Result<Outcome> {
 }
 
 /// generic/005: dereferencing a symlink loop gives ELOOP, a dangling
-/// symlink gives ENOENT, while readlink still reports the target bytes
-/// for both. The kernel walks loops over the FUSE's readlink replies —
-/// a wrong reply turns ELOOP into build-visible misbehavior (configure
-/// scripts treat ELOOP and ENOENT very differently).
+/// symlink gives ENOENT — unless the target component exceeds
+/// NAME_MAX, where the daemon's lookup gate (the F-F fix) answers
+/// ENAMETOOLONG before the negative-entry path — while readlink still
+/// reports the target bytes for all of them. The kernel walks loops
+/// over the FUSE's readlink replies — a wrong reply turns ELOOP into
+/// build-visible misbehavior (configure scripts treat ELOOP and
+/// ENOENT very differently).
 pub fn generic_005_symlink_errnos(ctx: &Ctx) -> anyhow::Result<Outcome> {
     let mut loops = 0;
     let mut danglings = 0;
@@ -447,9 +412,17 @@ pub fn generic_005_symlink_errnos(ctx: &Ctx) -> anyhow::Result<Outcome> {
                         spec.path
                     );
                 };
+                // An over-long target component (links/longtarget's
+                // 900-byte name) hits the lookup NAME_MAX gate first:
+                // ENAMETOOLONG, not a negative entry.
+                let expected = if spec.target.split('/').any(|c| c.len() > 255) {
+                    Errno::ENAMETOOLONG
+                } else {
+                    Errno::ENOENT
+                };
                 ensure!(
-                    errno_of(&e) == Errno::ENOENT,
-                    "{}: deref of a dangling symlink gave {:?}, expected ENOENT",
+                    errno_of(&e) == expected,
+                    "{}: deref of a dangling symlink gave {:?}, expected {expected:?}",
                     spec.path,
                     errno_of(&e)
                 );
@@ -567,19 +540,6 @@ pub fn generic_453_byte_exact_names(ctx: &Ctx) -> anyhow::Result<Outcome> {
 }
 
 // ─── helpers ───────────────────────────────────────────────────────────
-
-fn walk(dir: &Path, count: &mut u64) -> anyhow::Result<()> {
-    *count += 1; // the directory itself
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            walk(&entry.path(), count)?;
-        } else {
-            *count += 1;
-        }
-    }
-    Ok(())
-}
 
 /// Number of manifest dirs that sit directly under the dep root.
 fn top_level_dir_count(ctx: &Ctx) -> usize {

@@ -6,11 +6,13 @@
 //! Two distinct legs, asserting two distinct enforcement layers:
 //!
 //! * **Unprivileged leg** (`PrivDrop` to the build uid): the castore
-//!   mount is MS_RDONLY, so the kernel's sb_permission rejects every
-//!   mutation (and `access(W_OK)`) with EROFS before the mode bits or
-//!   the FUSE daemon are consulted — the same answers a ro-tmpfs
-//!   gives. `default_permissions` over root-owned 0444/0555 attrs
-//!   remains underneath as defense in depth.
+//!   mount is read-only at the VFS level, so mnt_want_write rejects
+//!   every mutation with EROFS before the mode bits or the FUSE
+//!   daemon are consulted — the same answers a ro-tmpfs gives.
+//!   `access(W_OK)` is denied EACCES instead: the ro flag lands
+//!   per-mount, and DAC over the root-owned 0444/0555 attrs
+//!   (`default_permissions`) runs before faccessat's readonly-mount
+//!   check, which only DAC-passing (root) callers reach.
 //!
 //! * **Root leg**: root holds CAP_DAC_OVERRIDE; on an MS_RDONLY mount
 //!   the VFS still answers EROFS for mutations, and any op that does
@@ -33,7 +35,7 @@ use nix::sys::stat::{UtimensatFlags, utimensat};
 use nix::sys::time::TimeSpec;
 use nix::unistd::{AccessFlags, eaccess};
 
-use super::{Ctx, Outcome, PrivDrop, errno_of, expect_errno, wait_for};
+use super::{Ctx, Outcome, PrivDrop, cpath, errno_of, expect_errno, open_raw, wait_for};
 use crate::manifest::FileSpec;
 
 /// generic/126: the executable bit is the only mode bit castore
@@ -117,20 +119,26 @@ pub fn generic_126_exec_access(ctx: &Ctx) -> anyhow::Result<Outcome> {
                 AccessFlags::R_OK,
                 None,
             ),
-            // MS_RDONLY mount: sb_permission denies W_OK with EROFS
-            // before the mode bits are consulted — the same answer a
-            // ro-tmpfs gives, and what `test -w` probers rely on.
+            // The ro flag lands per-mount (MNT_READONLY), not on the
+            // FUSE superblock, so for an UNPRIVILEGED caller the
+            // 0444/0555 DAC denial (EACCES, inside inode_permission)
+            // fires before faccessat's __mnt_is_readonly check ever
+            // runs. Only a caller that passes DAC — root via
+            // CAP_DAC_OVERRIDE — reaches the mnt check and sees EROFS;
+            // that surface is pinned by mount_readonly_honesty's root
+            // leg. Either way W_OK is DENIED at the access check, which
+            // is what `test -w` probers need.
             (
                 "W_OK on a read-only input",
                 &plain.path,
                 AccessFlags::W_OK,
-                Some(Errno::EROFS),
+                Some(Errno::EACCES),
             ),
             (
                 "W_OK on an input directory",
                 &ctx.manifest.seq_dir.path,
                 AccessFlags::W_OK,
-                Some(Errno::EROFS),
+                Some(Errno::EACCES),
             ),
         ];
         for (what, rel, flags, expect) in probes {
@@ -148,8 +156,8 @@ pub fn generic_126_exec_access(ctx: &Ctx) -> anyhow::Result<Outcome> {
 }
 
 /// generic/050 + generic/123 (adapted): every mutation attempted by
-/// the build uid fails with EROFS — the MS_RDONLY mount makes the
-/// kernel's sb_permission deny writes before the mode bits (which
+/// the build uid fails with EROFS — the read-only mount makes the
+/// kernel's mnt_want_write deny writes before the mode bits (which
 /// would say EACCES/EPERM) are even consulted — and the tree is
 /// byte-identical afterwards. generic/123's four operations
 /// (overwrite, append, delete, move of a root-created file) are
@@ -669,6 +677,231 @@ pub fn write_through_passthrough_root(ctx: &Ctx) -> anyhow::Result<Outcome> {
         println!("    (backing cache file repaired to the original bytes)");
     }
     outcome
+}
+
+/// Read-only honesty of the mount itself (the xfstests `_require`
+/// ro-mount intent): a mount that serves an immutable tree must SAY
+/// so. Three surfaces, each consumed by real tooling:
+///
+/// * `statvfs().f_flag` carries ST_RDONLY — rsync/install pre-check it;
+/// * the mount's options in /proc/self/mounts say `ro` — mount(8),
+///   findmnt, and container runtimes read it;
+/// * `faccessat2(W_OK)` as root fails with EROFS — on an MS_RDONLY
+///   mount the kernel answers before any permission logic. A mount
+///   that is secretly rw passes W_OK (root holds CAP_DAC_OVERRIDE) and
+///   only refuses at open/write time, so tools that probe-then-write
+///   fail late with confusing errors.
+///
+/// RED on the pre-fix castore-FUSE: the mount was not MS_RDONLY (write
+/// protection was default_permissions + the daemon's EROFS table), so
+/// all three surfaces claimed writability.
+pub fn mount_readonly_honesty(ctx: &Ctx) -> anyhow::Result<Outcome> {
+    use nix::libc;
+
+    let mount_c = cpath(&ctx.mount);
+
+    // statvfs: ST_RDONLY advertised.
+    // SAFETY: zeroed statvfs is a valid out-buffer; rc checked.
+    let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(mount_c.as_ptr(), &mut vfs) };
+    ensure!(
+        rc == 0,
+        "statvfs({}) failed: {}",
+        ctx.mount.display(),
+        io::Error::last_os_error()
+    );
+    ensure!(
+        vfs.f_flag & libc::ST_RDONLY != 0,
+        "statvfs f_flag {:#x} lacks ST_RDONLY — the mount does not advertise itself \
+         read-only, so writability pre-checks (rsync, install) pass and fail late",
+        vfs.f_flag
+    );
+
+    // /proc/self/mounts: the options field must say ro.
+    let mounts = fs::read_to_string("/proc/self/mounts").context("read /proc/self/mounts")?;
+    let mount_str = ctx.mount.to_str().context("mount path is not UTF-8")?;
+    let line = mounts
+        .lines()
+        .find(|l| l.split_whitespace().nth(1) == Some(mount_str))
+        .with_context(|| format!("{mount_str} not in /proc/self/mounts"))?;
+    let options = line
+        .split_whitespace()
+        .nth(3)
+        .context("malformed /proc/self/mounts line")?;
+    ensure!(
+        options.split(',').any(|o| o == "ro"),
+        "mount options are \"{options}\" — expected an `ro` mount, got rw"
+    );
+
+    // faccessat2(W_OK) as root: EROFS from the MS_RDONLY check, not a
+    // CAP_DAC_OVERRIDE pass.
+    ensure!(
+        nix::unistd::geteuid().is_root(),
+        "the W_OK honesty leg must run as root (CAP_DAC_OVERRIDE is the point)"
+    );
+    let probe = plain_unique_file(ctx)?;
+    let file_c = cpath(&ctx.on_mount(&probe.path));
+    // SAFETY: valid C path; no out-pointers.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_faccessat2,
+            libc::AT_FDCWD,
+            file_c.as_ptr(),
+            libc::W_OK,
+            0,
+        )
+    };
+    let errno = Errno::last();
+    ensure!(
+        rc == -1 && errno == Errno::EROFS,
+        "faccessat2({}, W_OK) as root returned {rc} ({errno:?}) — on a read-only mount the \
+         kernel must answer EROFS; a pass here means the mount is secretly rw and write \
+         refusal only happens at open time",
+        probe.path
+    );
+    Ok(Outcome::Pass)
+}
+
+/// generic/006 (name-limit leg): the errno contract at the NAME_MAX /
+/// PATH_MAX boundaries. A 256-byte component must be ENAMETOOLONG —
+/// per-component NAME_MAX enforcement is the FILESYSTEM's job (the
+/// kernel only rejects past FUSE_NAME_MAX=1024), and the daemon's
+/// lookup handler gates components past its advertised NAME_MAX
+/// (finding F-F, fixed). A legal-length missing name is plain ENOENT,
+/// and a path longer than PATH_MAX is ENAMETOOLONG (enforced by
+/// getname before any lookup). Tools that build deep paths (tar,
+/// install -D) branch on exactly these errnos.
+pub fn generic_006_name_limits(ctx: &Ctx) -> anyhow::Result<Outcome> {
+    let names_parent = ctx.on_mount("names");
+
+    // One past NAME_MAX: POSIX says ENAMETOOLONG, strictly. ENOENT
+    // here is a regression of the F-F fix (the lookup handler must
+    // reject over-long names before the negative-entry path).
+    let too_long = names_parent.join("n".repeat(256));
+    expect_errno(
+        "lstat of a 256-byte name",
+        fs::symlink_metadata(&too_long),
+        &[Errno::ENAMETOOLONG],
+    )?;
+
+    // Exactly NAME_MAX but nonexistent: a legal name that is simply
+    // absent — ENOENT (the negative-entry contract, not a length error).
+    let absent_max = names_parent.join("z".repeat(255));
+    expect_errno(
+        "lstat of an absent NAME_MAX name",
+        fs::symlink_metadata(&absent_max),
+        &[Errno::ENOENT],
+    )?;
+
+    // Total path beyond PATH_MAX (4096): ENAMETOOLONG.
+    let mut deep = ctx.dep_root.clone();
+    while deep.as_os_str().len() <= 4096 {
+        deep.push("d");
+    }
+    expect_errno(
+        "lstat of a > PATH_MAX path",
+        fs::symlink_metadata(&deep),
+        &[Errno::ENAMETOOLONG],
+    )?;
+    Ok(Outcome::Pass)
+}
+
+/// open(2) flag contracts on a read-only tree (generic/004's O_TMPFILE
+/// refusal + generic/763's zero-byte-write leg + the open(2) flag
+/// errnos a build's tooling branches on):
+///
+/// * `O_DIRECTORY` on a regular file → ENOTDIR
+/// * `O_NOFOLLOW` on a symlink → ELOOP
+/// * `O_PATH|O_NOFOLLOW` on a symlink → an fd to the LINK itself
+///   (fstat reports S_IFLNK and size == strlen(target))
+/// * `O_TMPFILE` on an input dir → refused cleanly (EOPNOTSUPP from a
+///   FUSE without the tmpfile op, or EROFS/EACCES — never a created
+///   inode)
+/// * `write()` through an O_RDONLY fd → EBADF, even for zero bytes
+pub fn open_flag_contracts(ctx: &Ctx) -> anyhow::Result<Outcome> {
+    use std::os::fd::AsRawFd;
+
+    use nix::libc;
+
+    let plain = plain_unique_file(ctx)?;
+    let plain_path = ctx.on_mount(&plain.path);
+    let symlink = ctx
+        .manifest
+        .symlinks
+        .first()
+        .context("manifest has no symlinks")?;
+    let symlink_path = ctx.on_mount(&symlink.path);
+
+    expect_errno(
+        "open(O_DIRECTORY) on a regular file",
+        open_raw(&plain_path, libc::O_RDONLY | libc::O_DIRECTORY),
+        &[Errno::ENOTDIR],
+    )?;
+    expect_errno(
+        "open(O_NOFOLLOW) on a symlink",
+        open_raw(&symlink_path, libc::O_RDONLY | libc::O_NOFOLLOW),
+        &[Errno::ELOOP],
+    )?;
+
+    // O_PATH|O_NOFOLLOW yields a handle to the symlink itself.
+    let link_fd = open_raw(&symlink_path, libc::O_PATH | libc::O_NOFOLLOW)
+        .context("open(O_PATH|O_NOFOLLOW) on a symlink")?;
+    let st = nix::sys::stat::fstat(&link_fd)?;
+    ensure!(
+        st.st_mode & libc::S_IFMT == libc::S_IFLNK,
+        "O_PATH|O_NOFOLLOW fd of {} is not a symlink (mode {:o})",
+        symlink.path,
+        st.st_mode
+    );
+    ensure!(
+        st.st_size as u64 == symlink.target.len() as u64,
+        "O_PATH symlink fd size {} != target length {}",
+        st.st_size,
+        symlink.target.len()
+    );
+
+    // O_PATH on a file: stat through the fd matches lstat by identity.
+    let path_fd = open_raw(&plain_path, libc::O_PATH).context("open(O_PATH) on a file")?;
+    let via_fd = nix::sys::stat::fstat(&path_fd)?;
+    let via_lstat = fs::symlink_metadata(&plain_path)?;
+    ensure!(
+        via_fd.st_ino == via_lstat.ino() && via_fd.st_dev == via_lstat.dev(),
+        "O_PATH fstat identity (dev={}, ino={}) != lstat (dev={}, ino={})",
+        via_fd.st_dev,
+        via_fd.st_ino,
+        via_lstat.dev(),
+        via_lstat.ino()
+    );
+
+    // O_TMPFILE on an input dir must be refused, never create an inode.
+    let dir_path = ctx.on_mount(&ctx.manifest.seq_dir.path);
+    let before = fs::read_dir(&dir_path)?.count();
+    let tmpfile = expect_errno(
+        "open(O_TMPFILE|O_WRONLY) on an input dir",
+        open_raw(&dir_path, libc::O_TMPFILE | libc::O_WRONLY),
+        &[Errno::EOPNOTSUPP, Errno::EROFS, Errno::EACCES],
+    )?;
+    println!("    O_TMPFILE refused with {tmpfile:?}");
+    ensure!(
+        fs::read_dir(&dir_path)?.count() == before,
+        "the refused O_TMPFILE changed the directory's entry count"
+    );
+
+    // write(2) through an O_RDONLY fd: EBADF — including the zero-byte
+    // write (vfs_write checks FMODE_WRITE before looking at the count).
+    let ro = fs::File::open(&plain_path)?;
+    for len in [0usize, 1] {
+        let buf = [0u8; 1];
+        // SAFETY: valid fd and buffer; len <= buf.len().
+        let n = unsafe { libc::write(ro.as_raw_fd(), buf.as_ptr().cast(), len) };
+        let errno = Errno::last();
+        ensure!(
+            n == -1 && errno == Errno::EBADF,
+            "write of {len} bytes through an O_RDONLY fd returned {n}/{errno:?}, expected \
+             -1/EBADF"
+        );
+    }
+    Ok(Outcome::Pass)
 }
 
 // ─── helpers ───────────────────────────────────────────────────────────

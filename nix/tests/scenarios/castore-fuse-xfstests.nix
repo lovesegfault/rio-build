@@ -60,6 +60,11 @@ let
         "links"
         "dup-a"
         "dup-b"
+        "nest"
+        "nest/p1"
+        "nest/p2"
+        "nest/p1/shared"
+        "nest/p2/shared"
       ];
       files = [
         {
@@ -113,6 +118,26 @@ let
           content = "rio-xfstests-dedup\n";
           executable = false;
         }
+        {
+          path = "nest/p1/shared/payload.txt";
+          content = "rio-xfstests-nested-dedup\n";
+          executable = false;
+        }
+        {
+          path = "nest/p2/shared/payload.txt";
+          content = "rio-xfstests-nested-dedup\n";
+          executable = false;
+        }
+        {
+          path = "nest/p1/only-p1.txt";
+          content = "p1-marker\n";
+          executable = false;
+        }
+        {
+          path = "nest/p2/only-p2.txt";
+          content = "p2-marker\n";
+          executable = false;
+        }
       ];
       symlinks = [
         {
@@ -134,6 +159,19 @@ let
         {
           path = "links/loop2";
           target = "loop1";
+        }
+      ]
+      # 41-link chain: chain0..chain39 -> chain<i+1>, chain40 -> the
+      # small file. chain0 exceeds MAXSYMLINKS=40 (ELOOP), chain1 does
+      # not (resolves). Must match the while-loop in xfstests-tree.nix.
+      ++ lib.genList (i: {
+        path = "links/chain${toString i}";
+        target = "chain${toString (i + 1)}";
+      }) 40
+      ++ [
+        {
+          path = "links/chain40";
+          target = "../data/small.txt";
         }
       ];
       seq_dir = {
