@@ -553,8 +553,9 @@ pub fn describe_metrics() {
         "rio_store_executor_path_slots_in_use",
         "Executor path-slot pool occupancy (r[store.materialize.gate-share+1]): \
          slots held by in-flight materialization path futures, out of \
-         P = effective admission cap / 2. Republished on both edges \
-         (acquire and release)."
+         P = effective admission cap / 2. Event-sourced on the slot's RAII \
+         edges (mint increments, Drop decrements — commuting writers, zero \
+         staleness at quiescence; never sampled, so no tick floor is needed)."
     );
     describe_gauge!(
         "rio_store_executor_path_slot_baseline_waiters",

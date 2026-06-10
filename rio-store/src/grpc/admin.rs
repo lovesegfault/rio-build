@@ -159,18 +159,35 @@ impl StoreAdminServiceImpl {
 /// the gauge is a slow-moving utilization ratio, so 30 s is plenty.
 const STORE_GAUGE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Publish every store-owned gauge once from its live data source:
-/// `rio_store_pg_pool_utilization` from the pool counters (the same
-/// `(size − num_idle)/max_connections` formula GetLoad reports — see
-/// [`StoreAdminServiceImpl::pg_pool_utilization`]) and
+/// Publish the SAMPLED store gauges once from their live data
+/// sources: `rio_store_pg_pool_utilization` from the pool counters
+/// (the same `(size − num_idle)/max_connections` formula GetLoad
+/// reports — see [`StoreAdminServiceImpl::pg_pool_utilization`]) and
 /// `rio_store_substitute_admission_utilization` from the admission
-/// gate. ONE periodic publisher for the whole store gauge surface —
-/// a gauge whose only refresh rides an RPC freezes the moment the
-/// caller retires (the c9a9d163e ComponentScaler→KEDA orphan class:
-/// GetLoad's reconciler caller was deleted and the pool panel froze;
-/// bug_245 was the same class one gauge over). Edge publishers
-/// (acquire/drop on the gate) keep the instant signal; this tick is
-/// the steady-state floor and heals any concurrent-drop interleave.
+/// gate.
+///
+/// The store-gauge two-class law (bug_094 — the checkable form of the
+/// old "one periodic publisher" prose, which was already false twice
+/// over in-tree: `spawn_gc_gauge_publisher` is a second periodic
+/// publisher and the baseline-waiters gauge is event-sourced):
+///
+///   - every SAMPLED (read-then-set) store gauge MUST be
+///     floor-published by a periodic tick — a sampled gauge whose
+///     only refresh rides an RPC freezes when the caller retires (the
+///     c9a9d163e ComponentScaler→KEDA orphan class), and its
+///     read/set edges can lose a concurrent-drop update (bug_245;
+///     this tick is that class's ≤30 s healer). Members: the two
+///     gauges above (this tick) + the gc gauges
+///     (`spawn_gc_gauge_publisher`, 60 s).
+///   - EVENT-SOURCED RAII gauges are EXEMPT — their commuting
+///     increment/decrement writers are paired by construction (mint +
+///     Drop), so there is no interleave to heal and no traffic
+///     dependence. Members: the executor path-slot occupancy and
+///     baseline-waiters gauges.
+///
+/// Membership in the two classes is pinned by the R15 census in the
+/// executor module (the `gauge!` call-site classification sweep);
+/// edge publishers on the admission gate keep the instant signal.
 fn publish_store_gauges(pool: &PgPool, gate: &crate::admission::AdmissionGate) {
     let util = StoreAdminServiceImpl::pg_pool_utilization(pool);
     metrics::gauge!("rio_store_pg_pool_utilization").set(f64::from(util));

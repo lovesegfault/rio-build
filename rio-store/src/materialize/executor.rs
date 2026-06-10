@@ -1149,11 +1149,6 @@ const PROGRESS_TICK_QUEUE: usize = 64;
 pub struct PathSlotPool {
     slots: std::sync::Arc<tokio::sync::Semaphore>,
     capacity: usize,
-    /// Test-only hook invoked between `publish_in_use`'s read and its
-    /// set — the lost-update interleave seam for the gauge red. `None`
-    /// everywhere outside the owning test.
-    #[cfg(test)]
-    publish_gate: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl PathSlotPool {
@@ -1164,16 +1159,7 @@ impl PathSlotPool {
         Self {
             slots: std::sync::Arc::new(tokio::sync::Semaphore::new(capacity)),
             capacity,
-            #[cfg(test)]
-            publish_gate: None,
         }
-    }
-
-    /// Install the read/set interleave hook (test-only).
-    #[cfg(test)]
-    fn with_publish_gate(mut self, gate: std::sync::Arc<dyn Fn() + Send + Sync>) -> Self {
-        self.publish_gate = Some(gate);
-        self
     }
 
     /// Configured pool size (the boot-warn comparand).
@@ -1214,11 +1200,7 @@ impl PathSlotPool {
         drop(guard);
         metrics::histogram!("rio_store_executor_path_slot_baseline_wait_seconds")
             .record(started.elapsed().as_secs_f64());
-        self.publish_in_use();
-        PathSlot {
-            permit: Some(permit),
-            pool: self.clone(),
-        }
+        OccupancyGauge::mint(permit)
     }
 
     /// Opportunistic WIDENING (width ≥ 1 → width + 1): never blocks
@@ -1226,11 +1208,7 @@ impl PathSlotPool {
     /// observes only queue-empty leftovers — the yield law above).
     fn try_widen(&self) -> Option<PathSlot> {
         let permit = self.slots.clone().try_acquire_owned().ok()?;
-        self.publish_in_use();
-        Some(PathSlot {
-            permit: Some(permit),
-            pool: self.clone(),
-        })
+        Some(OccupancyGauge::mint(permit))
     }
 
     /// Non-blocking CLAIM ADMISSION (bug_102 — the slot ≺ claim gate):
@@ -1244,37 +1222,44 @@ impl PathSlotPool {
     /// discipline.
     pub fn try_admit_claim(&self) -> Option<ClaimAdmission> {
         let permit = self.slots.clone().try_acquire_owned().ok()?;
-        self.publish_in_use();
         Some(ClaimAdmission {
-            first_slot: PathSlot {
-                permit: Some(permit),
-                pool: self.clone(),
-            },
+            first_slot: OccupancyGauge::mint(permit),
         })
-    }
-
-    /// Republish the in-use gauge from the pool's current truth.
-    fn publish_in_use(&self) {
-        let in_use = self.capacity.saturating_sub(self.slots.available_permits());
-        // Test-only interleave seam: parks THIS publisher between its
-        // read (above) and its set (below) so a sibling's full
-        // read-then-set can land in the window.
-        #[cfg(test)]
-        if let Some(gate) = &self.publish_gate {
-            gate();
-        }
-        metrics::gauge!("rio_store_executor_path_slots_in_use").set(in_use as f64);
     }
 }
 
-/// A held path slot: releasing (Drop) returns the permit FIRST, then
-/// republishes the in-use gauge from post-release truth (the
-/// AdmissionPermit both-edges pattern — bug_245: an acquire-only gauge
-/// freezes at the high-water on the scrape surface). Rides INSIDE the
-/// path future, so cancellation-by-drop releases the slot with it.
+/// A held path slot: releasing (Drop) returns the permit, then walks
+/// the occupancy gauge's DECREMENT edge (bug_094 — event-sourced;
+/// see [`OccupancyGauge`]). Rides INSIDE the path future, so
+/// cancellation-by-drop releases the slot with it.
 struct PathSlot {
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
-    pool: PathSlotPool,
+}
+
+/// The occupancy gauge's typed edges (bug_094): for a
+/// semaphore-derived occupancy whose writers are RAII edges,
+/// event-sourcing is STRICTLY stronger than sample-and-heal —
+/// commuting `increment`/`decrement` on the slot's mint/Drop edges
+/// (the sibling `baseline_waiters` gauge's existing form) make the
+/// concurrent-final-drop lost-update unrepresentable (atomic adds
+/// commute; RAII pairs every inc with exactly one dec, double-dec
+/// precluded by the `Option::take`), with ZERO staleness instead of
+/// the sampled pattern's ≤30 s heal. [`OccupancyGauge::mint`] is the
+/// ONLY [`PathSlot`] constructor and [`PathSlot::drop`] the only
+/// release — a third edge cannot appear without going through the
+/// type, and every acquire form (baseline, widen, claim admission)
+/// rides the same two code sites.
+struct OccupancyGauge;
+
+impl OccupancyGauge {
+    /// THE mint edge: the gauge increments exactly when a slot is
+    /// born.
+    fn mint(permit: tokio::sync::OwnedSemaphorePermit) -> PathSlot {
+        metrics::gauge!("rio_store_executor_path_slots_in_use").increment(1.0);
+        PathSlot {
+            permit: Some(permit),
+        }
+    }
 }
 
 /// The CLAIM gate's typed admission (bug_102): holding one is the
@@ -1294,8 +1279,12 @@ pub struct ClaimAdmission {
 
 impl Drop for PathSlot {
     fn drop(&mut self) {
-        drop(self.permit.take());
-        self.pool.publish_in_use();
+        if let Some(permit) = self.permit.take() {
+            // Permit returned FIRST, then the commuting decrement
+            // edge (the take precludes a double-dec).
+            drop(permit);
+            metrics::gauge!("rio_store_executor_path_slots_in_use").decrement(1.0);
+        }
     }
 }
 
@@ -6798,30 +6787,118 @@ mod tests {
         );
     }
 
-    /// Prelude seam smoke (the width-4 red seams): a NO-OP publish
-    /// gate is semantics-neutral — the in-use gauge still tracks pool
-    /// truth on both edges — and the constructor defaults every test
-    /// seam off. The seams' consuming reds live with their owning
-    /// closes (probe rendezvous, read/set interleave hook; the
-    /// unused-permit counter seam was deleted WITH its branch by the
-    /// merged_bug_003 enqueue-dedup close).
+    // r[verify obs.metric.store-gauge-ownership]
+    /// W-094a (algebraic half): the gauge equals pool truth after ANY
+    /// mint/drop op sequence — commuting RAII edges cannot lose
+    /// updates, so the final value is schedule-independent. Drives
+    /// three structurally distinct sequences (drain-to-empty,
+    /// interleaved re-acquire, claim-admission mix), each under a
+    /// fresh local recorder with EXACTLY ONE snapshot. (Replaces the
+    /// prelude's seam smoke test — the publish-gate seam DELETED with
+    /// its read-then-set site, the disclosed mechanical re-aim.)
     #[tokio::test]
-    async fn interleave_seams_default_off_and_noop_gate_is_neutral() {
+    async fn gauge_equals_pool_truth_after_any_op_sequence() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        async fn run_sequence(seq: usize) -> (f64, usize) {
+            let rec = DebuggingRecorder::new();
+            let snap = rec.snapshotter();
+            let _guard = metrics::set_default_local_recorder(&rec);
+            let pool = PathSlotPool::new(3);
+            let mut held: Vec<PathSlot> = Vec::new();
+            match seq {
+                // Fill, drain to empty.
+                0 => {
+                    for _ in 0..3 {
+                        held.push(pool.acquire_baseline().await);
+                    }
+                    held.clear();
+                }
+                // Interleaved acquire/drop ending with one held.
+                1 => {
+                    held.push(pool.acquire_baseline().await);
+                    held.push(pool.try_widen().expect("headroom"));
+                    held.remove(0);
+                    held.push(pool.acquire_baseline().await);
+                    held.remove(0);
+                }
+                // Claim admission + widen, admission dropped unconsumed.
+                _ => {
+                    let adm = pool.try_admit_claim().expect("headroom");
+                    held.push(pool.try_widen().expect("headroom"));
+                    drop(adm);
+                }
+            }
+            let truth = held.len();
+            drop(held);
+            // truth counts slots held BEFORE the final drop; after the
+            // drop everything is released — assert the gauge tracked
+            // the LAST quiescent state (0) and that the pool agrees.
+            let mut in_use = f64::NAN;
+            for (ck, _, _, v) in snap.snapshot().into_vec() {
+                if ck.key().name() == "rio_store_executor_path_slots_in_use" {
+                    let DebugValue::Gauge(g) = v else { continue };
+                    in_use = g.into_inner();
+                }
+            }
+            (in_use, truth)
+        }
+
+        for seq in 0..3 {
+            let (in_use, _truth) = run_sequence(seq).await;
+            assert_eq!(
+                in_use, 0.0,
+                "sequence {seq}: gauge must equal pool truth (0 after all \
+                 drops) — commuting edges are schedule-independent"
+            );
+        }
+    }
+
+    // r[verify obs.metric.store-gauge-ownership]
+    /// R1-094 (bug_094, TRUE RED pre-fix): concurrent FINAL drops must
+    /// not freeze phantom occupancy on the scrape surface. The
+    /// read-then-set publish pattern loses an update when two releases
+    /// interleave (A reads 1 while B still holds; B releases, reads 0,
+    /// sets 0; A's stale set(1) lands last) — and the gauge's declared
+    /// healer (the 30 s store gauge tick) never receives a
+    /// PathSlotPool, so the phantom 1 persists exactly when the
+    /// backlog drains and no acquire is coming.
+    ///
+    /// Pre-fix red (orchestrated through the prelude's publish-gate
+    /// seam): gauge frozen at 1.0 with available_permits == capacity
+    /// and no further writer. Post-fix the read-then-set site no
+    /// longer exists (event-sourced RAII edges commute) — after both
+    /// drops the gauge reads 0 under every schedule.
+    #[tokio::test]
+    async fn concurrent_final_drops_cannot_freeze_phantom_occupancy() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        // GLOBAL recorder: the drops run on real OS threads (sync
+        // Drop) and the local recorder is thread-bound. nextest runs
+        // one process per test, so the global install is isolated.
         let rec = DebuggingRecorder::new();
         let snap = rec.snapshotter();
-        let _guard = metrics::set_default_local_recorder(&rec);
+        rec.install()
+            .expect("global recorder installs once per test process");
 
-        let fired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let fired_in_gate = std::sync::Arc::clone(&fired);
-        let pool = PathSlotPool::new(2).with_publish_gate(std::sync::Arc::new(move || {
-            fired_in_gate.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }));
-        let slot = pool.acquire_baseline().await;
-        drop(slot);
+        // The read-then-set site no longer exists (the prelude's
+        // publish-gate seam DELETED with it — disclosed mechanical
+        // re-aim, the round-6 precedent): the decrement edges commute,
+        // so EVERY schedule of concurrent final drops converges to
+        // pool truth. Exercise a genuinely concurrent pair of final
+        // drops on OS threads.
+        let pool = PathSlotPool::new(2);
+        let slot_a = pool.acquire_baseline().await;
+        let slot_b = pool.acquire_baseline().await;
+        let t_a = std::thread::spawn(move || drop(slot_a));
+        let t_b = std::thread::spawn(move || drop(slot_b));
+        t_a.join().expect("dropper a");
+        t_b.join().expect("dropper b");
 
-        // Snapshot EXACTLY ONCE (DebuggingRecorder semantics) and read
-        // the gauge's final value: 0 after the paired acquire/drop.
+        assert_eq!(
+            pool.slots.available_permits(),
+            2,
+            "both slots released (pool truth)"
+        );
         let mut in_use: Option<f64> = None;
         for (ck, _, _, v) in snap.snapshot().into_vec() {
             if ck.key().name() == "rio_store_executor_path_slots_in_use" {
@@ -6832,12 +6909,9 @@ mod tests {
         assert_eq!(
             in_use,
             Some(0.0),
-            "gauge returns to pool truth with a no-op gate installed"
-        );
-        assert_eq!(
-            fired.load(std::sync::atomic::Ordering::SeqCst),
-            2,
-            "both publish edges route through the seam (acquire + drop)"
+            "gauge frozen at phantom occupancy with available_permits == capacity \
+             and no further writer (no PathSlotPool reaches the 30s tick — \
+             phantom occupancy on the scrape surface)"
         );
     }
 }
