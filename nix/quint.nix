@@ -8783,6 +8783,91 @@ rec {
       modelTimeoutSec = 120;
       witness = "noMintAfterGoneAnswer";
     };
+
+    # live_047/R-C WO-R7-4: the materialization walk's path-axis
+    # evidence law under bounded fan-out (store.materialize.path-fold)
+    # -- one iteration's window/latch/fold plane; quint's scheduling is
+    # the completion-order adversary (the post-latch complete branch IS
+    # the dequeue-backlog family; cancelSibling the other -- the §2.3
+    # window-membership nondeterminism explored exhaustively).
+    # Per-walk SAFETY only: the cross-attempt charge-latency direction
+    # is out of model scope by design (the accepted §2.3 residual,
+    # no witness anywhere). A DEDICATED small model -- not a
+    # materializationJob.qnt extension (its slot-10 plane models one
+    # fold evaluation's cell laws; a cross-path interleaving axis would
+    # blast the const-binding radius across its calibration corpus).
+    # Measured (TLC, exhaustive, F=2 x 4 paths): 250 states generated /
+    # 109 distinct, all four holds [ok] in 826ms; budget 120s.
+    # r[verify store.materialize.path-fold]
+    quint-walkfanout = mkQuintCheck {
+      name = "walkfanout";
+      spec = "walkFanout";
+      modelTimeoutSec = 120;
+      vacuityExempt = {
+        floorMonotoneCommitOnly = {
+          class = "scope-bound";
+          reason = "the floor law's falsifiers live in the Rust witness plane (W-5(i)/(ii): the trace law through the real driver-routed adapter, and the cancelled-path zero-floor clause in W-1c) -- a model twin would only re-perturb the same single assignment the invariant equates";
+        };
+        cellsSingleGeneration = {
+          class = "scope-bound";
+          reason = "the generation barrier is structural in the implementation (per-iteration window locals -- no path future exists across a re-resolve) and bug_266's fold_guard suite is the live falsifier surface; the model's reResolve guard is the same structure, not a separate decision to perturb";
+        };
+      };
+      invariants = [
+        "windowBounded"
+        "foldTierLawful"
+        "floorMonotoneCommitOnly"
+        "cellsSingleGeneration"
+      ];
+    };
+    # The R-c rejected shape: the outcome compiles from the FIRST
+    # abort-grade completion's kind (first-dequeued-wins) instead of
+    # the tier fold over the completed multiset -- dies through
+    # foldTierLawful on the charge+transient interleaving (transient
+    # dequeues first, charge in the backlog). Measured: [violation]
+    # 67ms at 2M-sample budget; budget 120s.
+    quint-walkfanout-calib-arrival-pick = mkQuintWitnessCheck {
+      name = "walkfanout-calib-arrival-pick";
+      spec = "calibration/walkfanout-arrival-pick";
+      extraSpecs = [ "walkFanout" ];
+      main = "walkFanoutArrivalPick";
+      step = "calibStep";
+      modelTimeoutSec = 120;
+      witness = "foldTierLawful";
+    };
+    # Kill isolation for the arrival-pick twin: windowBounded stays
+    # INTACT under calibStep (the perturbation kills exactly one hold).
+    # Measured (TLC, exhaustive): 109 distinct states, [ok] in 869ms;
+    # budget 120s.
+    quint-walkfanout-calib-arrival-pick-isolation = mkQuintCheck {
+      name = "walkfanout-calib-arrival-pick-isolation";
+      spec = "calibration/walkfanout-arrival-pick";
+      extraSpecs = [ "walkFanout" ];
+      main = "walkFanoutArrivalPick";
+      step = "calibStep";
+      modelTimeoutSec = 120;
+      vacuityExempt = {
+        windowBounded = {
+          class = "scope-bound";
+          reason = "kill-isolation lane for the arrival-pick twin -- this leaf's falsifier is the spawn-after-abort twin in its own lane";
+        };
+      };
+      invariants = [ "windowBounded" ];
+    };
+    # The latch ignored at spawn (pre-law shape): a walk keeps widening
+    # after an abort-grade completion -- dies through windowBounded via
+    # the spawnedPostLatch ghost (written by the live seat, reachable
+    # only under the perturbation). Measured: [violation] 61ms at
+    # 2M-sample budget; budget 120s.
+    quint-walkfanout-calib-spawn-after-abort = mkQuintWitnessCheck {
+      name = "walkfanout-calib-spawn-after-abort";
+      spec = "calibration/walkfanout-spawn-after-abort";
+      extraSpecs = [ "walkFanout" ];
+      main = "walkFanoutSpawnAfterAbort";
+      step = "calibStep";
+      modelTimeoutSec = 120;
+      witness = "windowBounded";
+    };
   };
 
   # bughunt-2 (slot 11) funnel: flake.nix consumes ONLY `checks`, so a

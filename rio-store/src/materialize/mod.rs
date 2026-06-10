@@ -253,10 +253,16 @@ pub fn spawn_materialization_executor(
 /// out of the partition entirely).
 ///
 /// Two cadence consequences, both intended:
-///   - execution is inline-serial below, so a worker mid-walk skips
-///     beats for the walk's duration — its unclaimed slice ages past
+///   - execution is inline-serial below — ONE job per worker per
+///     pass, executed on this loop — so a worker mid-walk skips
+///     beats for the walk's duration; its unclaimed slice ages past
 ///     the scheduler's steal horizon and is offered to idle workers
-///     (work stealing exactly when this worker cannot claim anyway);
+///     (work stealing exactly when this worker cannot claim anyway).
+///     live_047/R-C: the walk is internally path-concurrent
+///     (`path_fanout` window, `store.materialize.path-fold`), which
+///     shortens mid-walk silence for multi-path closures but changes
+///     NOTHING at this layer — the claim unit, the inline execution,
+///     and the beat semantics are untouched;
 ///   - the scheduler's staleness horizon is calibrated against the
 ///     DEFAULT `poll_interval_secs = 1` (±20 % jitter): raising the
 ///     interval past that horizon degrades to broader, more-contested
