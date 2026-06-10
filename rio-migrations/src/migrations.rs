@@ -2278,6 +2278,41 @@ pub const M_097: () = ();
 /// the live collection cadence.
 pub const M_100: () = ();
 
+/// `101_derivations_status_changed_at.sql` — merged_bug_004 (bughunt-6
+/// S6; the wave's single sanctioned DDL, SIGNED Q3, R11-as-amended).
+///
+/// `derivations.status_changed_at TIMESTAMPTZ NOT NULL DEFAULT now()`:
+/// the instant the row's `status` VALUE last changed. Comparand-purity
+/// law: its only writers are the status-setting statements in
+/// rio-scheduler/src/db/derivations.rs (every `UPDATE derivations`
+/// whose SET list names `status` names this column; every SET list
+/// omitting `status` omits it — the source-scan census
+/// `derivations_status_stamp_census` in db/tests/fence_coverage.rs
+/// enforces the biconditional). It exists because the outbox-replay
+/// precedence conjunct previously cut on `updated_at` — a column EVERY
+/// writer touches (the replay's own stamp, the resource-floor ratchet,
+/// the merge-parity upsert), so the precedence law quantified over
+/// "status events" while comparing against "any write": the replay's
+/// own stamp refused newer truths, and a floor bump permanently
+/// cancelled a latched terminal persist.
+///
+/// Backfill semantics: the PG fast-path stable default — every
+/// pre-existing row reads the MIGRATION instant, not its true last
+/// status transition. SAFE because the column's only consumer is the
+/// in-memory leader-scoped status outbox, which cannot survive the
+/// deploy restart (actor/mod.rs clears it on leadership loss); no
+/// pre-migration latch can ever be compared against a backfilled
+/// stamp.
+///
+/// No-op-write nuance: the replay conjunct carries `status IS DISTINCT
+/// FROM $2`, so an already-at-target row is NOT re-stamped (it falls
+/// to the residual lane as already-applied instead of re-asserting a
+/// non-change). Fresh writers stamp unconditionally — a fresh
+/// same-value write is a transition-time re-assertion; the error
+/// direction is conservative (a too-new stamp only ever REFUSES a
+/// stale replay, never admits one).
+pub const M_101: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql
