@@ -613,7 +613,6 @@ struct UploadTask {
     config: LogUploaderConfig,
 
     input: ResidueReceiver,
-    /// False once the input channel has yielded `None`.
     /// `Some` once the input channel's `recv()` yielded `None` — the
     /// witness every normal-exit `DrainStatus` mint demands
     /// (merged_bug_010). `None` ⇔ the input is still open.
