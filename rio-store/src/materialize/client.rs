@@ -497,12 +497,6 @@ pub struct ResumeLedger {
     /// outcome of EVERY pass — gated passes drive the streak,
     /// un-gated ones the heal).
     wedge: WedgeLatch,
-    /// merged_bug_014 — the rotation cursor: the job last presented
-    /// by the resume pass; the next pass's window starts after it
-    /// (wrapping), so every live entry is presented within
-    /// ⌈len/bound⌉ passes. `None` (or a resolved id) restarts at the
-    /// front — recorded fairness coarsening on resolves.
-    last_presented: Option<Uuid>,
 }
 
 /// One claim whose lifecycle is not settled: everything the resume
@@ -616,9 +610,18 @@ const STEAL_SPECULATION_ALLOWANCE: usize = 1;
 /// beats). Pass wall-clock envelope: ≤ ONE timeout burn (the first
 /// Unanswered ends the pass — a brownout answers nobody) plus
 /// (bound − 1) answer latencies — vs the pre-fix cap-full worst case
-/// of 32 sequential 30 s timeouts (~16 min). Starvation bound (the
-/// rotation): every live entry is presented within ⌈len/bound⌉
-/// passes.
+/// of 32 sequential 30 s timeouts (~16 min).
+///
+/// Coverage bound (round-8 WO-S2-4 — the STRUCTURAL QUEUE, typed on
+/// both axes): every live entry is presented within ⌈len/bound⌉
+/// passes when windows complete, and within ≤ len PRESENTATIONS of
+/// queue depth under maximal break adversity (presented entries
+/// recycle to the BACK — overtaking is structurally impossible, so
+/// a persistent breaker burns at most its own queue turn per ring
+/// cycle; that one-turn window-tail truncation is the typed
+/// throughput residual). Resolutions preserve the bound: a resolved
+/// entry leaves the queue and the next pass presents the front — no
+/// cursor exists to dangle (merged_bug_050).
 const RESUME_PRESENTATIONS_PER_PASS: usize = 4;
 const _: () = assert!(
     RESUME_PRESENTATIONS_PER_PASS >= 1 + STEAL_SPECULATION_ALLOWANCE + 2,
@@ -640,6 +643,16 @@ enum MintHeadroom {
     /// The ledger is at [`RESUME_LEDGER_CAP`]: the mint authority
     /// refuses every fresh mint (live credentials are never evicted).
     AtCap { charged: usize, entries: usize },
+}
+
+/// round-8 WO-S2-4 — one pass's presentation budget over the
+/// structural queue (minted by [`ResumeLedger::presentation_window`],
+/// spent by [`ResumeLedger::begin_presentation`]): at most
+/// [`RESUME_PRESENTATIONS_PER_PASS`] front-pops per pass. The window
+/// carries NO entry identities — there is no cursor, no anchor, and
+/// nothing to dangle when an entry resolves (merged_bug_050).
+struct PresentationWindow {
+    remaining: usize,
 }
 
 impl ResumeLedger {
@@ -909,40 +922,72 @@ impl ResumeLedger {
         self.entries.iter().cloned().collect()
     }
 
-    /// merged_bug_014 — the pass's presentation WINDOW: at most
-    /// [`RESUME_PRESENTATIONS_PER_PASS`] entries, rotated to start
-    /// after the previously-presented entry (the starvation bound),
-    /// with Charged entries first WITHIN the window (the
-    /// unanswered-orphan priority — window-scoped so the rotation
-    /// fairness law survives a persistent Charged backlog; recorded
-    /// divergence from the global-priority phrasing).
-    fn presentation_window(&self) -> Vec<ResumeEntry> {
-        if self.entries.is_empty() {
-            return Vec::new();
+    /// merged_bug_014 → round-8 WO-S2-4 (merged_bug_005 +
+    /// merged_bug_050) — the pass's presentation window over the
+    /// STRUCTURAL QUEUE: the entries deque IS the rotation.
+    /// Presentations pop from the FRONT ([`Self::begin_presentation`])
+    /// and recycle survivors to the BACK
+    /// ([`Self::finish_presentation`]); resolutions drop out. The
+    /// fairness law is therefore a property of the data structure —
+    /// nothing can overtake, no identity anchor exists to dangle:
+    ///
+    ///   - coverage bound: every live entry is presented within
+    ///     ⌈len/bound⌉ passes when windows complete (answers flow),
+    ///     and within ≤ len PRESENTATIONS of queue depth under
+    ///     maximal break adversity (a persistent breaker burns at
+    ///     most its own queue turn, then sits BEHIND the entries it
+    ///     used to starve);
+    ///   - resolves keep the bound: a resolved entry simply leaves —
+    ///     the next pass presents the queue front (no cursor lookup
+    ///     to miss, the merged_bug_050 repair);
+    ///   - throughput residual (typed): a fast-erroring entry
+    ///     truncates the window tail it heads by breaking the pass —
+    ///     bounded to ONE turn per ring cycle (it recycles behind
+    ///     everything it truncated).
+    ///
+    /// The retired Charged-first WINDOW SORT is deliberately gone
+    /// (derived, not chosen): any ordering that can re-front the
+    /// same entry across passes re-creates starvation under the
+    /// break, whatever the cursor does. Its safety content survives
+    /// untouched — the budget law counts `charged_len`
+    /// order-independently, and a Charged entry that probes because
+    /// a CredentialOnly sibling claimed first answers
+    /// `DeliverExisting`, stays Charged, and re-presents claiming
+    /// within the bound. Cost recorded: orphan conversion latency
+    /// +≤1 pass worst case.
+    fn presentation_window(&self) -> PresentationWindow {
+        PresentationWindow {
+            remaining: self.entries.len().min(RESUME_PRESENTATIONS_PER_PASS),
         }
-        let start = self
-            .last_presented
-            .and_then(|id| self.entries.iter().position(|e| e.job_id == id))
-            .map(|i| (i + 1) % self.entries.len())
-            .unwrap_or(0);
-        let mut window: Vec<ResumeEntry> = self
-            .entries
-            .iter()
-            .cycle()
-            .skip(start)
-            .take(self.entries.len().min(RESUME_PRESENTATIONS_PER_PASS))
-            .cloned()
-            .collect();
-        // Stable: rotation order is preserved within each class.
-        window.sort_by_key(|e| e.standing != SlotStanding::Charged);
-        window
     }
 
-    /// Advance the rotation cursor (called per presentation, before
-    /// the answer settles the standing — a resolved entry still
-    /// anchors the next pass's start until it leaves the ledger).
-    fn note_presented(&mut self, job_id: Uuid) {
-        self.last_presented = Some(job_id);
+    /// Pop the queue front for presentation (None once the window's
+    /// budget is spent or the queue empties mid-pass).
+    fn begin_presentation(&mut self, window: &mut PresentationWindow) -> Option<ResumeEntry> {
+        if window.remaining == 0 {
+            return None;
+        }
+        window.remaining -= 1;
+        self.entries.pop_front()
+    }
+
+    /// Settle one presentation: apply the [`standing_effect`] verdict
+    /// to the popped entry — resolutions DROP it, every surviving
+    /// entry recycles to the BACK (presented entries queue behind
+    /// the un-presented remainder; overtaking is unrepresentable).
+    fn finish_presentation(&mut self, mut entry: ResumeEntry, effect: StandingEffect) {
+        match effect {
+            StandingEffect::Resolve => {}
+            StandingEffect::Refund => {
+                entry.standing = SlotStanding::CredentialOnly;
+                self.entries.push_back(entry);
+            }
+            StandingEffect::Recharge => {
+                entry.standing = SlotStanding::Charged;
+                self.entries.push_back(entry);
+            }
+            StandingEffect::Keep => self.entries.push_back(entry),
+        }
     }
 
     /// Test/diagnostic visibility: EVERY live credential currently
@@ -1623,17 +1668,22 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
     // show again). Each resume pull presents the persisted nonce; the
     // kernel's credential disjunction re-delivers.
     //
-    // merged_bug_014: the pass presents a bounded, rotated WINDOW
-    // (Charged first within it — the unanswered-orphan priority);
-    // once delivered claims fill the slots, remaining presentations
-    // switch to confirm_only PROBES (the landed confirm screen
-    // converts would-be-DeliverNew to NotYetReady, so no mint can
-    // occur; DeliverExisting passes through with the payload
-    // DISCARDED — the probe is a standing oracle, never an execution
-    // source). The FIRST Unanswered presentation ends the pass: a
-    // brownout answers nobody — one timeout burn per pass, not one
-    // per entry.
-    for entry in ledger.presentation_window() {
+    // merged_bug_014 → round-8 WO-S2-4: the pass presents a bounded
+    // window off the STRUCTURAL QUEUE — pop the front, present,
+    // recycle survivors to the back (resolutions drop out), so
+    // presentation coverage is a property of the data structure
+    // (nothing overtakes; no cursor to dangle). Once delivered
+    // claims fill the slots, remaining presentations switch to
+    // confirm_only PROBES (the landed confirm screen converts
+    // would-be-DeliverNew to NotYetReady, so no mint can occur;
+    // DeliverExisting passes through with the payload DISCARDED —
+    // the probe is a standing oracle, never an execution source).
+    // The FIRST Unanswered presentation ends the pass: a brownout
+    // answers nobody — one timeout burn per pass, not one per entry
+    // (the breaker has already recycled BEHIND the un-presented
+    // remainder, so it burns at most its own queue turn per cycle).
+    let mut window = ledger.presentation_window();
+    while let Some(entry) = ledger.begin_presentation(&mut window) {
         let probing = claimed.len() >= available_slots;
         let req = PullAssignmentRequest {
             executor_token: String::new(),
@@ -1652,6 +1702,10 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
         };
         let answer = pull_once(transport, shutdown, req, &entry.drv_hash).await;
         if matches!(answer, PullAnswer::Shutdown) {
+            // The presentation rode but the pass is abandoned: the
+            // popped entry recycles (Keep) before the exit so no
+            // credential is lost to the SIGTERM race.
+            ledger.finish_presentation(entry, StandingEffect::Keep);
             finish!(PassExit::Abandoned);
         }
         // round-8 WO-S2-1 — answered retry floors fold from EITHER
@@ -1669,7 +1723,6 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
         if matches!(futility_evidence(&answer), FutilityEvidence::Conversion) {
             pass.conversions += 1;
         }
-        ledger.note_presented(entry.job_id);
         // merged_bug_014 — the ONE transition law settles the
         // standing for every arm (per-arm rationale at
         // [`standing_effect`]); the resume highlights:
@@ -1689,7 +1742,8 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
         } else {
             PresentationLane::ResumeClaiming
         };
-        ledger.apply_standing(entry.job_id, standing_effect(lane, &answer));
+        let effect = standing_effect(lane, &answer);
+        let unanswered_break = matches!(answer, PullAnswer::Unanswered);
         match (probing, answer) {
             (false, PullAnswer::Deliver(assignment)) => {
                 info!(drv_hash = %entry.drv_hash, exec_id = %assignment.exec_id,
@@ -1698,16 +1752,16 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
                 claimed.push(ClaimedJob::bind(
                     ExpectedJob {
                         job_id: entry.job_id,
-                        drv_hash: entry.drv_hash,
+                        drv_hash: entry.drv_hash.clone(),
                         tenant_hint: entry.tenant_hint,
-                        origin: entry.origin,
+                        origin: entry.origin.clone(),
                     },
                     &assignment,
                 ));
             }
             (true, PullAnswer::Deliver(assignment)) => {
                 // DeliverExisting through the screen: my mint is
-                // PROVEN live — the entry (re-)charged above. The
+                // PROVEN live — the entry (re-)charges below. The
                 // payload is DISCARDED; the next pass's CLAIMING
                 // presentation re-delivers it for execution.
                 debug!(drv_hash = %entry.drv_hash, exec_id = %assignment.exec_id,
@@ -1720,9 +1774,12 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
                 debug!(drv_hash = %entry.drv_hash,
                        "resume presentation unanswered; ending the pass \
                         (one timeout burn per pass)");
-                break;
             }
             _ => {}
+        }
+        ledger.finish_presentation(entry, effect);
+        if unanswered_break {
+            break;
         }
     }
     // bug_385: the listing window is DECOUPLED from the claim budget.
@@ -2472,6 +2529,12 @@ mod tests {
         /// merged_bug_014 R2: hang exactly the Nth pull (1-based; the
         /// mixed answered-then-lost pass shape). 0 = disabled.
         hang_at_pull: u32,
+        /// round-8 WO-S2-4 — hang every pull presenting THIS claim
+        /// nonce (identity-keyed loss: "this job's answers never
+        /// arrive", independent of presentation order — the
+        /// deterministic per-job server fault the rotation reds
+        /// drive). `None` = disabled.
+        hang_nonce: Option<String>,
     }
 
     impl MockTransport {
@@ -2491,6 +2554,7 @@ mod tests {
                 seen_list_limits: Vec::new(),
                 hang_next_pulls: 0,
                 hang_at_pull: 0,
+                hang_nonce: None,
             }
         }
     }
@@ -2517,6 +2581,16 @@ mod tests {
             self.seen_pull_requests.push(req);
             if self.hang_at_pull != 0 && self.pull_calls == self.hang_at_pull {
                 // Exactly this pull's answer is lost.
+                std::future::pending::<()>().await;
+            }
+            let hang_by_identity = self.hang_nonce.as_deref().is_some_and(|nonce| {
+                self.seen_pull_requests
+                    .last()
+                    .is_some_and(|r| r.claim_nonce == nonce)
+            });
+            if hang_by_identity {
+                // Identity-keyed loss: THIS job's answers never
+                // arrive, whichever pass presents it.
                 std::future::pending::<()>().await;
             }
             if self.hang_next_pulls > 0 {
@@ -4914,11 +4988,20 @@ mod tests {
         );
     }
 
-    /// merged_bug_014 green pin: a confirm probe answered with MY
-    /// live mint (DeliverExisting through the screen) keeps the
-    /// charge AND discards the payload — the probe is a standing
-    /// oracle, never an execution source; the next pass's CLAIMING
-    /// presentation re-delivers it for execution.
+    /// merged_bug_014 green pin, REWRITTEN ORDER-FREE at round-8
+    /// WO-S2-4: the certified proposition is LANE SEMANTICS — a
+    /// confirm probe answered with MY live mint (DeliverExisting
+    /// through the screen) keeps the charge AND discards the payload
+    /// (the probe is a standing oracle, never an execution source;
+    /// the next pass's CLAIMING presentation re-delivers it for
+    /// execution) — not WHICH entry presents first. The ordering
+    /// half of the old pin (the Charged-first window sort) is
+    /// RETIRED with the sort: any cross-pass re-fronting ordering
+    /// re-creates starvation under the break (the merged_bug_005
+    /// composition), so presentation order is queue order and the
+    /// Charged orphan probes this pass, re-presents claiming within
+    /// the coverage bound (cost: +≤1 pass orphan conversion latency,
+    /// recorded at the window doc).
     #[tokio::test(start_paused = true)]
     async fn confirm_probe_deliver_existing_keeps_charge_and_discards_payload() {
         let job_a = descriptor(1);
@@ -4950,25 +5033,30 @@ mod tests {
         assert!(p1.is_empty());
         assert_eq!(ledger.charged_len(), 1, "B Charged (lost mint)");
 
-        // Pass 2 at slots=1: the Charged orphan B presents FIRST (the
-        // window's unanswered-orphan priority) and DELIVERS the
-        // claiming slot; A's PROBE then answers DeliverExisting — a
-        // PROVEN-live mint: payload discarded, A re-charges.
+        // Pass 2 at slots=1, queue order [A, B]: A (CredentialOnly)
+        // presents CLAIMING and delivers — the slot fills; B (the
+        // Charged orphan) then presents as a confirm PROBE and is
+        // answered DeliverExisting: a PROVEN-live mint — payload
+        // discarded, charge kept.
         let p2 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
         assert_eq!(p2.len(), 1, "only the claiming delivery executes");
         assert_eq!(
-            p2[0].drv_hash, job_b.drv_hash,
-            "the Charged orphan won the claiming slot; A's probe \
-             payload was discarded"
+            p2[0].drv_hash, job_a.drv_hash,
+            "the claiming presentation (queue front) executed; the \
+             probe's payload was discarded"
         );
-        let probe_req = t.seen_pull_requests.last().expect("A probed");
-        assert!(probe_req.confirm_only);
+        let probe_req = t.seen_pull_requests.last().expect("B probed");
+        assert!(probe_req.confirm_only, "past full slots: a PROBE");
+        assert_eq!(
+            probe_req.intent_id, job_b.drv_hash,
+            "the probe presented the Charged orphan"
+        );
         assert_eq!(
             ledger.charged_len(),
             1,
-            "A re-charged: its probe PROVED a live mint (budget honesty \
-             — a proven-live mint holds a slot); the next claiming pass \
-             re-delivers it for execution"
+            "B stays charged: its probe PROVED a live mint (budget \
+             honesty — a proven-live mint holds a slot); the next \
+             claiming pass re-delivers it for execution"
         );
     }
 
@@ -5291,6 +5379,270 @@ mod tests {
                 pass.deliveries,
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // round-8 WO-S2-4 — the rotation as a structural queue
+    // (merged_bug_005 + merged_bug_050)
+    // -----------------------------------------------------------------
+
+    /// Presented intent_ids recorded by the transport from `from`
+    /// onward (the production wire artifacts — the presented-set
+    /// census generator: every pull request with a non-empty
+    /// claim_nonce and an empty resume_exec_id, sliced past the mint
+    /// pass).
+    fn presented_intents(t: &MockTransport, from: usize) -> std::collections::HashSet<String> {
+        t.seen_pull_requests[from..]
+            .iter()
+            .filter(|r| !r.claim_nonce.is_empty() && r.resume_exec_id.is_empty())
+            .map(|r| r.intent_id.clone())
+            .collect()
+    }
+
+    /// round-8 R9 (merged_bug_005, len ≤ bound cell). Proposition
+    /// certified (R16): the TRAJECTORY law `seen == pool` over a
+    /// MIXED-standings population — one persistently-Unanswered
+    /// Charged head (a deterministic per-job server fault: its
+    /// answers never arrive, whichever pass presents it) plus three
+    /// CredentialOnly siblings answering NotYetReady — within four
+    /// passes at production slots=1. Pre-fix the Charged-first sort
+    /// re-headed the breaker every window and the break parked the
+    /// cursor on it: the siblings were never presented again.
+    /// Census from the transport's request log, never ledger
+    /// internals.
+    #[tokio::test(start_paused = true)]
+    async fn unanswered_charged_head_does_not_starve_siblings() {
+        let pool: Vec<_> = (1..=4).map(descriptor).collect();
+        let mut t = MockTransport::new(
+            vec![Ok(listing(pool.clone()))],
+            vec![
+                Ok(not_yet_ready()),
+                Ok(not_yet_ready()),
+                Ok(not_yet_ready()),
+            ],
+            vec![],
+        );
+        // Pass 1 at slots=4 (production mints): A's answer is lost
+        // (Charged); B, C, D answer NotYetReady (CredentialOnly).
+        t.hang_at_pull = 1;
+        let mut ledger = ResumeLedger::default();
+        let mut latch = ListFailureLatch::default();
+        let mut fut = ConversionFutilityLatch::default();
+        let tok = token();
+        let inst = instance("queue-r9-w");
+        let p1 = poll_and_claim(&mut t, &inst, 4, &mut ledger, &mut latch, &mut fut, &tok).await;
+        assert!(p1.is_empty());
+        assert_eq!(ledger.len(), 4);
+        assert_eq!(ledger.charged_len(), 1, "A is the Charged breaker");
+        // A's answers never arrive from here on (identity-keyed).
+        t.hang_at_pull = 0;
+        t.hang_nonce = Some(t.seen_pull_requests[0].claim_nonce.clone());
+        t.pulls = vec![Ok(not_yet_ready())].into();
+
+        // Four passes at slots=1: the breaker burns at most its own
+        // queue turn per cycle; the siblings present every cycle.
+        let presented_from = t.seen_pull_requests.len();
+        for _ in 0..4 {
+            let p = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+            assert!(p.is_empty());
+        }
+        let seen = presented_intents(&t, presented_from);
+        let pool_hashes: std::collections::HashSet<String> =
+            pool.iter().map(|d| d.drv_hash.clone()).collect();
+        assert_eq!(
+            seen, pool_hashes,
+            "left: presented set across 4 passes == {{A}} (the sort \
+             re-heads the breaker; the break parks the cursor) / right: \
+             seen == {{A,B,C,D}} — the siblings present every pass once \
+             A recycles behind them"
+        );
+    }
+
+    /// round-8 R10 (merged_bug_005, len > bound cell). Proposition
+    /// certified (R16): `seen == pool` past the window size — six
+    /// entries (one persistent breaker, five NotYetReady-answering
+    /// siblings) all present within the typed adversarial bound (≤
+    /// len presentations of queue depth; eight passes here). Pre-fix
+    /// the cursor REWOUND to the sorted-to-front breaker in a
+    /// period-2 cycle and the ring tail (F) never presented.
+    #[tokio::test(start_paused = true)]
+    async fn rewind_cycle_covers_the_ring_past_the_window() {
+        let pool: Vec<_> = (1..=6).map(descriptor).collect();
+        let mut t = MockTransport::new(
+            vec![Ok(listing(pool.clone()))],
+            vec![
+                Ok(not_yet_ready()),
+                Ok(not_yet_ready()),
+                Ok(not_yet_ready()),
+                Ok(not_yet_ready()),
+                Ok(not_yet_ready()),
+            ],
+            vec![],
+        );
+        // Pass 1 at slots=6: A lost (Charged), B..F NotYetReady.
+        t.hang_at_pull = 1;
+        let mut ledger = ResumeLedger::default();
+        let mut latch = ListFailureLatch::default();
+        let mut fut = ConversionFutilityLatch::default();
+        let tok = token();
+        let inst = instance("queue-r10-w");
+        let p1 = poll_and_claim(&mut t, &inst, 6, &mut ledger, &mut latch, &mut fut, &tok).await;
+        assert!(p1.is_empty());
+        assert_eq!(ledger.charged_len(), 1, "A is the Charged breaker");
+        t.hang_at_pull = 0;
+        t.hang_nonce = Some(t.seen_pull_requests[0].claim_nonce.clone());
+        t.pulls = vec![Ok(not_yet_ready())].into();
+
+        let presented_from = t.seen_pull_requests.len();
+        for _ in 0..8 {
+            let p = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+            assert!(p.is_empty());
+        }
+        let seen = presented_intents(&t, presented_from);
+        let pool_hashes: std::collections::HashSet<String> =
+            pool.iter().map(|d| d.drv_hash.clone()).collect();
+        assert_eq!(
+            seen, pool_hashes,
+            "left: F never presented (the period-2 cursor rewind onto \
+             the sorted-to-front breaker) / right: seen == pool within \
+             the typed adversarial bound"
+        );
+    }
+
+    /// round-8 R11 (merged_bug_050). Proposition certified (R16): a
+    /// window whose FINAL presentation resolves (Gone) does not
+    /// disturb coverage — the next pass presents the queue front
+    /// (the four untouched entries), preserving ⌈len/bound⌉ through
+    /// resolves. Pre-fix the cursor anchored on the resolved entry's
+    /// IDENTITY: the position() lookup missed, unwrap_or(0)
+    /// restarted at the ledger HEAD, the head trio re-presented and
+    /// the tail waited O(len). Population: 7 CredentialOnly + 1
+    /// Charged (mixed standings), answers NotYetReady + Gone (mixed
+    /// scripts).
+    #[tokio::test(start_paused = true)]
+    async fn resolving_final_presentation_keeps_the_rotation_anchor() {
+        let pool: Vec<_> = (1..=8).map(descriptor).collect();
+        let mut t = MockTransport::new(
+            vec![
+                Ok(listing(pool.clone())),
+                Ok(listing(vec![])),
+                Ok(listing(vec![])),
+            ],
+            vec![
+                Ok(not_yet_ready()),
+                Ok(not_yet_ready()),
+                Ok(not_yet_ready()),
+                Ok(not_yet_ready()),
+                Ok(not_yet_ready()),
+                Ok(not_yet_ready()),
+                Ok(not_yet_ready()),
+            ],
+            vec![],
+        );
+        // Pass 1 at slots=8: e1..e7 answer NotYetReady, e8's answer
+        // is lost (Charged) — the mixed-standings population.
+        t.hang_at_pull = 8;
+        let mut ledger = ResumeLedger::default();
+        let mut latch = ListFailureLatch::default();
+        let mut fut = ConversionFutilityLatch::default();
+        let tok = token();
+        let inst = instance("queue-r11-w");
+        let p1 = poll_and_claim(&mut t, &inst, 8, &mut ledger, &mut latch, &mut fut, &tok).await;
+        assert!(p1.is_empty());
+        assert_eq!(ledger.len(), 8);
+        assert_eq!(ledger.charged_len(), 1, "e8 is Charged");
+        t.hang_at_pull = 0;
+
+        // Pass 2: the window's LAST presentation (e4) answers GONE —
+        // the resolve-anchor cell.
+        t.pulls = vec![
+            Ok(not_yet_ready()),
+            Ok(not_yet_ready()),
+            Ok(not_yet_ready()),
+            Ok(gone()),
+        ]
+        .into();
+        let p2 = poll_and_claim(&mut t, &inst, 8, &mut ledger, &mut latch, &mut fut, &tok).await;
+        assert!(p2.is_empty());
+        assert_eq!(ledger.len(), 7, "e4 resolved (Gone)");
+
+        // Pass 3 presents the queue FRONT: e5..e8 — two passes cover
+        // all distinct survivors.
+        t.pulls = vec![Ok(not_yet_ready())].into();
+        let presented_from = t.seen_pull_requests.len();
+        let p3 = poll_and_claim(&mut t, &inst, 8, &mut ledger, &mut latch, &mut fut, &tok).await;
+        assert!(p3.is_empty());
+        let seen = presented_intents(&t, presented_from);
+        let expected: std::collections::HashSet<String> =
+            pool[4..8].iter().map(|d| d.drv_hash.clone()).collect();
+        assert_eq!(
+            seen, expected,
+            "left: the next pass restarts at the ledger head (the head \
+             trio re-presents; the tail waits O(len)) / right: the next \
+             pass presents the queue front — two passes cover all \
+             distinct survivors (⌈len/bound⌉ preserved through resolves)"
+        );
+    }
+
+    /// round-8 R12 — the structural queue law, direct: after any
+    /// pass, every UN-presented entry precedes every presented
+    /// survivor (overtaking is unrepresentable), and presented
+    /// survivors sit in presentation order. Driven through one
+    /// mixed pass (refund + resolve + a mid-window breaker); census
+    /// from the snapshot accessor against the presented-id log.
+    /// (Expected strawman-by-construction in the WO; in fact a TRUE
+    /// red — the pre-fix in-place ledger keeps presented entries at
+    /// the front, violating the law directly. Recorded.)
+    #[tokio::test(start_paused = true)]
+    async fn presented_entries_recycle_behind_unpresented_ones() {
+        let pool: Vec<_> = (1..=6).map(descriptor).collect();
+        let mut t = MockTransport::new(
+            vec![Ok(listing(pool.clone())), Ok(listing(vec![]))],
+            vec![
+                // Pass 1 mints: f1 lost (Charged), f2..f6 contested.
+                Ok(not_yet_ready()),
+                Ok(not_yet_ready()),
+                Ok(not_yet_ready()),
+                Ok(not_yet_ready()),
+                Ok(not_yet_ready()),
+            ],
+            vec![],
+        );
+        t.hang_at_pull = 1;
+        let mut ledger = ResumeLedger::default();
+        let mut latch = ListFailureLatch::default();
+        let mut fut = ConversionFutilityLatch::default();
+        let tok = token();
+        let inst = instance("queue-r12-w");
+        let p1 = poll_and_claim(&mut t, &inst, 6, &mut ledger, &mut latch, &mut fut, &tok).await;
+        assert!(p1.is_empty());
+        assert_eq!(ledger.len(), 6);
+        t.hang_at_pull = 0;
+
+        // Pass 2 at slots=1: f1 answers NotYetReady (refund), f2
+        // resolves (Gone), f3 answers NotYetReady, f4's answer is
+        // lost (the mid-window breaker) — f5, f6 stay un-presented.
+        t.pulls = vec![Ok(not_yet_ready()), Ok(gone()), Ok(not_yet_ready())].into();
+        let f4_nonce = t.seen_pull_requests[3].claim_nonce.clone();
+        t.hang_nonce = Some(f4_nonce);
+        let p2 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+        assert!(p2.is_empty());
+
+        let order: Vec<String> = ledger
+            .snapshot()
+            .iter()
+            .map(|e| e.drv_hash.clone())
+            .collect();
+        let expected: Vec<String> = [4usize, 5, 0, 2, 3]
+            .iter()
+            .map(|&i| pool[i].drv_hash.clone())
+            .collect();
+        assert_eq!(
+            order, expected,
+            "the queue law: un-presented entries (f5, f6) precede every \
+             presented survivor, and presented survivors (f1, f3, f4) \
+             sit in presentation order"
+        );
     }
 
     // -----------------------------------------------------------------
