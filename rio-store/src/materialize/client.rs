@@ -1181,20 +1181,27 @@ async fn pull_once<T: MaterializeTransport>(
                 PullAnswer::NotYetReady { retry_after: None }
             }
         },
-        // bug_119 + merged_bug_074: the ONE rpc-error classification
-        // chokepoint — an ANSWERED refusal is typed by WHAT IT
-        // DISPROVES, never laundered into the lost-response lane.
-        // InvalidArgument/Unimplemented disprove a mint (the request
-        // shape can never mint); PermissionDenied/Unauthenticated
-        // judge only the credential presentation (the scheduler's
-        // rotation-skew trace) and disprove nothing about a mint the
-        // ORIGINAL pull may have committed. The two sets partition
-        // is_fatal_rejection exactly, so the report leg's give-up
-        // semantics are untouched.
+        // bug_119 + merged_bug_074 + merged_bug_013: the ONE rpc-error
+        // classification chokepoint — an ANSWERED refusal is typed by
+        // WHAT IT DISPROVES, never laundered into the lost-response
+        // lane. The partition is sourced from the exported authority
+        // (`rio_proto::refusal::judge_refusal`, per-request
+        // service-token regime — `sec.authz.refusal-adjudication`):
+        // DisprovesRequest (InvalidArgument/Unimplemented — the
+        // request shape can never mint) → RejectedDisproving;
+        // JudgesPresentation (PermissionDenied/Unauthenticated — the
+        // scheduler's rotation-skew trace, disproving nothing about a
+        // mint the ORIGINAL pull may have committed) → RejectedAuth.
+        // The report leg consumes the SAME authority
+        // (`is_fatal_rejection`), so the two lanes structurally
+        // cannot re-diverge.
         BoundedOutcome::Resolved(Err(status))
             if matches!(
-                status.code(),
-                tonic::Code::InvalidArgument | tonic::Code::Unimplemented
+                rio_proto::refusal::judge_refusal(
+                    rio_proto::refusal::CredentialRegime::PerRequestService,
+                    status.code()
+                ),
+                rio_proto::refusal::RefusalJudgment::DisprovesRequest
             ) =>
         {
             warn!(drv_hash = %drv_hash,
@@ -1206,8 +1213,11 @@ async fn pull_once<T: MaterializeTransport>(
         }
         BoundedOutcome::Resolved(Err(status))
             if matches!(
-                status.code(),
-                tonic::Code::PermissionDenied | tonic::Code::Unauthenticated
+                rio_proto::refusal::judge_refusal(
+                    rio_proto::refusal::CredentialRegime::PerRequestService,
+                    status.code()
+                ),
+                rio_proto::refusal::RefusalJudgment::JudgesPresentation
             ) =>
         {
             warn!(drv_hash = %drv_hash,
@@ -2094,10 +2104,17 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
 /// it (the ack means the consumption transaction committed). Bounded
 /// by `budget`; returns `true` on ack.
 ///
-/// The builder's `report_until_acked` discipline (copied shape):
-/// permanent rejections (auth / invalid-argument / unimplemented) give
-/// up after one call — retrying cannot succeed and the establishment
+/// Give-up discipline (merged_bug_013, re-derived from the builder's
+/// copied shape): only REQUEST-DISPROVING rejections
+/// ([`is_fatal_rejection`] — invalid-argument / unimplemented under
+/// the per-request service-token regime) give up after one call —
+/// re-sending the same bytes cannot succeed and the establishment
 /// sweep remains the scheduler-side backstop for the open attempt.
+/// Auth refusals (rotation skew: every request carries a freshly
+/// minted token) retry under the same `AttemptBudget` +
+/// `REPORT_RETRY_ENVELOPE` as every other undecided failure — a
+/// completed walk's outcome survives any skew window shorter than
+/// the budget.
 // r[impl store.materialize.executor+5]
 pub async fn report_until_acked<T: MaterializeTransport>(
     transport: &mut T,
@@ -2188,16 +2205,25 @@ pub async fn report_until_acked<T: MaterializeTransport>(
     }
 }
 
-/// Permanent, non-retryable rejection codes (the builder pull client's
-/// `is_fatal_rejection`, same set): retrying these burns the budget
-/// with no chance of progress.
+// r[impl sec.authz.refusal-adjudication]
+/// Request-disproving rejection codes, sourced from the ONE exported
+/// adjudication authority (merged_bug_013;
+/// `rio_proto::refusal::judge_refusal` under the per-request
+/// service-token regime — this transport mints a fresh HMAC token per
+/// send): retrying these burns the budget with no chance of progress,
+/// because the server refused the request's CONTENT or lacks the RPC.
+/// The auth pair (`PermissionDenied | Unauthenticated`) is NOT here —
+/// it judges one credential presentation under one key observation
+/// (rotation skew), so those refusals ride the budgeted retry arm
+/// like any other undecided failure. The builder's
+/// `is_fatal_rejection` keeps the auth pair under its ATTEMPT-BOUND
+/// executor token, where re-presentation is byte-identical — same
+/// authority, different regime.
 fn is_fatal_rejection(code: tonic::Code) -> bool {
+    use rio_proto::refusal::{CredentialRegime, RefusalJudgment, judge_refusal};
     matches!(
-        code,
-        tonic::Code::PermissionDenied
-            | tonic::Code::Unauthenticated
-            | tonic::Code::Unimplemented
-            | tonic::Code::InvalidArgument
+        judge_refusal(CredentialRegime::PerRequestService, code),
+        RefusalJudgment::DisprovesRequest
     )
 }
 
@@ -3092,8 +3118,11 @@ mod tests {
     }
 
     /// bug_119: an ANSWERED permanent rejection (auth misconfig) is not
-    /// a lost response. `pull_once` classifies it through the same
-    /// `is_fatal_rejection` chokepoint the report leg uses, and BOTH
+    /// a lost response. `pull_once` types it at its own adjudication
+    /// chokepoint — sourced, like the report leg's
+    /// `is_fatal_rejection`, from the one exported refusal authority
+    /// (merged_bug_013; the lanes consume the same
+    /// `judge_refusal(PerRequestService, ·)` partition) — and BOTH
     /// claim passes resolve the ledger entry (the rule-4b contract:
     /// entries leave on every ANSWERED outcome). Pre-fix the entry was
     /// immortal: every pass burned a doomed resume pull plus a doomed
@@ -3860,8 +3889,11 @@ mod tests {
     }
 
     /// (e) The report loop: two transient failures then an ack → 3
-    /// calls, returns true. A permanent rejection gives up after one
-    /// call. Budget exhaustion gives up.
+    /// calls, returns true. Budget exhaustion gives up. (The
+    /// request-disproving give-up arm is
+    /// `report_gives_up_on_request_disproving_rejection`; the
+    /// rotation-skew retry arm is `report_survives_rotation_skew` —
+    /// merged_bug_013.)
     // r[verify store.materialize.executor+5]
     #[tokio::test(start_paused = true)]
     async fn report_until_acked_retries() {
@@ -3896,23 +3928,6 @@ mod tests {
         assert!(acked);
         assert_eq!(t.report_calls, 3);
 
-        // Permanent rejection → exactly one call, false.
-        let mut t = MockTransport::new(
-            vec![],
-            vec![],
-            vec![Err(tonic::Status::permission_denied("bad credential"))],
-        );
-        let acked = report_until_acked(
-            &mut t,
-            "exec-2",
-            crate::materialize::executor::CountedOutcome::count(outcome.clone()),
-            Duration::from_secs(600),
-            &token(),
-        )
-        .await;
-        assert!(!acked);
-        assert_eq!(t.report_calls, 1, "permanent rejections are never retried");
-
         // Budget exhaustion → false after spending the window.
         let mut t = MockTransport::new(
             vec![],
@@ -3935,6 +3950,102 @@ mod tests {
             t.report_calls >= 3,
             "the budget window is spent retrying, saw {}",
             t.report_calls
+        );
+    }
+
+    // r[verify sec.authz.refusal-adjudication]
+    // r[verify store.materialize.executor+5]
+    /// merged_bug_013 red R-1E: a COMPLETED materialization outcome
+    /// survives an HMAC rotation-skew window shorter than the report
+    /// budget — `report_until_acked` against a transport answering
+    /// `Unauthenticated, Unauthenticated, Ok(())` returns `true` in
+    /// exactly 3 attempts (the auth refusals judge the presentation;
+    /// the NEXT request's freshly minted service token may verify).
+    /// TRUE RED at 83e596f0c: `left: (false, 1) / right: (true, 3)` —
+    /// the pre-fix is_fatal_rejection gave up after ONE attempt and
+    /// the establishment sweep then closed the healthy Success as a
+    /// charged materialization_infra. Certifies: the
+    /// establishment-sweep charge path is structurally unreachable
+    /// for a skew window inside the report budget.
+    #[tokio::test(start_paused = true)]
+    async fn report_survives_rotation_skew() {
+        let outcome = MaterializationOutcome {
+            outcome: Some(rio_proto::types::materialization_outcome::Outcome::Success(
+                rio_proto::types::materialization_outcome::Success {
+                    ingested_paths: vec!["/nix/store/aaa-one".into()],
+                    verified_paths: vec![],
+                    verified_tenants: vec![],
+                },
+            )),
+        };
+        let mut t = MockTransport::new(
+            vec![],
+            vec![],
+            vec![
+                Err(tonic::Status::unauthenticated(
+                    "hmac verify failed: unknown key id",
+                )),
+                Err(tonic::Status::unauthenticated(
+                    "hmac verify failed: unknown key id",
+                )),
+                Ok(()),
+            ],
+        );
+        let acked = report_until_acked(
+            &mut t,
+            "exec-skew",
+            crate::materialize::executor::CountedOutcome::count(outcome),
+            Duration::from_secs(600),
+            &token(),
+        )
+        .await;
+        assert_eq!(
+            (acked, t.report_calls),
+            (true, 3),
+            "a completed walk's outcome must survive a skew window \
+             shorter than the report budget"
+        );
+    }
+
+    // r[verify sec.authz.refusal-adjudication]
+    // r[verify store.materialize.executor+5]
+    /// merged_bug_013 companion green R-1F (the RETAINED fatal half):
+    /// a request-disproving rejection (`InvalidArgument` —
+    /// `judge_refusal(PerRequestService, ·) == DisprovesRequest`)
+    /// still gives up after exactly one call — re-sending the same
+    /// bytes cannot succeed, and the establishment sweep remains the
+    /// scheduler-side backstop. Green at introduction BY DESIGN: it
+    /// pins what the fatal-set narrowing must NOT change.
+    #[tokio::test(start_paused = true)]
+    async fn report_gives_up_on_request_disproving_rejection() {
+        let outcome = MaterializationOutcome {
+            outcome: Some(rio_proto::types::materialization_outcome::Outcome::Success(
+                rio_proto::types::materialization_outcome::Success {
+                    ingested_paths: vec!["/nix/store/aaa-one".into()],
+                    verified_paths: vec![],
+                    verified_tenants: vec![],
+                },
+            )),
+        };
+        let mut t = MockTransport::new(
+            vec![],
+            vec![],
+            vec![Err(tonic::Status::invalid_argument(
+                "malformed materialization outcome",
+            ))],
+        );
+        let acked = report_until_acked(
+            &mut t,
+            "exec-2",
+            crate::materialize::executor::CountedOutcome::count(outcome),
+            Duration::from_secs(600),
+            &token(),
+        )
+        .await;
+        assert!(!acked);
+        assert_eq!(
+            t.report_calls, 1,
+            "request-disproving rejections are never retried"
         );
     }
 
