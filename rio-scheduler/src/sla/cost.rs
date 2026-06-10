@@ -142,7 +142,7 @@ pub const POLL_INTERVAL_SECS: u64 = 600;
 /// envelope): after a FAILED false→true leader-edge reload,
 /// [`interrupt_housekeeping`] re-attempts the reload within this many
 /// seconds — per failure, chain-total (every
-/// [`PreludeOutcome::ReloadFailed`] re-arms the retry, including one
+/// `PreludeOutcome::ReloadFailed` re-arms the retry, including one
 /// produced by a retry-initiated prelude) — instead of deferring to
 /// the next [`POLL_INTERVAL_SECS`] tick. Derivation: the reload is one
 /// PG read; 30s clears any plausible PG blip without hammering a down
