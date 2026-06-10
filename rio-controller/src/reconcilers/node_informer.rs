@@ -617,9 +617,9 @@ enum ExposureDropReason {
     /// counted drop per slice.
     Shutdown,
     /// The slice's permanent counted exit ([`classify_append_status`]
-    /// + the strike budget): either the scheduler refused the slice's
-    /// CONTENT or shape (request-disproving — re-sending the same
-    /// bytes cannot succeed, exits in the observing pass) or repeated
+    /// plus the strike budget): either the scheduler refused the
+    /// slice's CONTENT or shape (request-disproving — re-sending the
+    /// same bytes cannot succeed, exits in the observing pass) or repeated
     /// presentation-judging auth refusals exhausted the typed
     /// observation budget ([`AUTH_STRIKE_BUDGET`], merged_bug_013 — a
     /// persistent token misconfig exits counted and warn-disclosed at
@@ -2552,7 +2552,7 @@ mod tests {
         // Alternate the auth pair across passes — both codes are one
         // strike each (the adversarial mixed-code population).
         let skew = |pass_n: u32| {
-            let status = if pass_n % 2 == 0 {
+            let status = if pass_n.is_multiple_of(2) {
                 tonic::Status::unauthenticated("hmac verify failed: unknown key id")
             } else {
                 tonic::Status::permission_denied("service caller not allowed")

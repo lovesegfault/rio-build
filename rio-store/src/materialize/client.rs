@@ -2106,7 +2106,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
 ///
 /// Give-up discipline (merged_bug_013, re-derived from the builder's
 /// copied shape): only REQUEST-DISPROVING rejections
-/// ([`is_fatal_rejection`] — invalid-argument / unimplemented under
+/// (`is_fatal_rejection` — invalid-argument / unimplemented under
 /// the per-request service-token regime) give up after one call —
 /// re-sending the same bytes cannot succeed and the establishment
 /// sweep remains the scheduler-side backstop for the open attempt.
