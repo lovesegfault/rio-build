@@ -10682,3 +10682,21 @@ async fn redelivered_retry_later_after_classification_is_inert() -> TestResult {
     );
     Ok(())
 }
+
+/// R14 parity pin (merged_bug_005 / live_046 riders): the store's
+/// mirrored scheduler constants equal the real ones — asserted
+/// THROUGH the exported store symbols, so the cross-crate cadence
+/// derivations (the honest-beat futility interval, the eager-re-poll
+/// horizon margin) can never drift silently (rio-store cannot import
+/// rio-scheduler; the dependency runs this way).
+#[test]
+fn store_mirrored_listing_constants_match() {
+    assert_eq!(
+        rio_store::materialize::client::SCHEDULER_LISTING_MEMBER_TTL_SECS,
+        crate::actor::materialize::LISTING_MEMBER_TTL.as_secs(),
+    );
+    assert_eq!(
+        rio_store::materialize::client::SCHEDULER_LISTING_STEAL_HORIZON_SECS,
+        crate::actor::materialize::LISTING_STEAL_HORIZON.as_secs(),
+    );
+}

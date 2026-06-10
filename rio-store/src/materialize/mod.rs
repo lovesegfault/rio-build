@@ -54,6 +54,19 @@ const REPORT_RETRY_BUDGET: Duration = Duration::from_secs(600);
 /// ±20 % jitter applied to the poll interval so a fleet of store
 /// replicas doesn't poll the leader in lockstep (the builder pull
 /// client's pacing discipline).
+///
+/// live_046 (R-B) cadence re-derivation: the scheduler's 5 s steal
+/// horizon was derived from "a healthy IDLE worker lists at least
+/// every ~1.2 s" — the worst idle gap is one jittered beat,
+/// `poll_interval × (1 + 0.2)`, and four missed beats
+/// (4 × 1 × 1.2 = 4.8 s) fit inside the horizon. Eager re-poll
+/// changes cadence ONLY for productive passes (more frequent beats —
+/// freshness strictly improves) and leaves the idle/EMPTY cadence —
+/// the horizon's binding worst case — byte-identical; mid-walk
+/// silence (the intended stealing trigger) is unchanged. The
+/// `idle_beat_worst_gap_times_four_fits_the_steal_horizon` pin
+/// asserts the relation through this const, the config default, and
+/// the mirrored horizon symbol (R17).
 const POLL_JITTER: rio_common::backoff::Jitter = rio_common::backoff::Jitter::Proportional(0.2);
 
 /// Spawn the materialization-executor task set:
@@ -257,7 +270,7 @@ async fn claim_loop<T>(
         // Each worker claims at most one job per pass — concurrency is
         // the worker count, and the scheduler's one-winner arbitration
         // (per-replica composite identity) handles claim races.
-        let claimed = client::poll_and_claim(
+        let pass = client::poll_and_claim(
             &mut transport,
             &instance,
             1,
@@ -267,7 +280,10 @@ async fn claim_loop<T>(
             &shutdown,
         )
         .await;
-        for job in claimed {
+        // live_046 (R-B): the pacing decision reads the pass facts
+        // BEFORE the claims are consumed by execution.
+        let pass_empty = pass_is_empty(&pass.pacing, pass.claimed.len());
+        for job in pass.claimed {
             info!(
                 worker,
                 drv_hash = %job.drv_hash,
@@ -373,12 +389,39 @@ async fn claim_loop<T>(
                 );
             }
         }
-        // Jittered poll pacing, shutdown-aware.
-        let interval = POLL_JITTER.apply(Duration::from_secs(cfg.poll_interval_secs.max(1)));
-        tokio::select! {
-            _ = shutdown.cancelled() => return,
-            _ = tokio::time::sleep(interval) => {}
+        // live_046 (R-B): eager re-poll — sleep the jittered beat ONLY
+        // after EMPTY passes; a productive pass re-polls immediately
+        // (the post-walk dead second dies). A gate/latch-withheld pass
+        // is ALWAYS empty ⇒ always sleeps: the honest beat and the
+        // eager re-poll compose into "work fast, idle at the beat,
+        // never spin while wedged" (pinned by the law table + the
+        // pacing tests). Jitter is KEPT on every sleep that occurs.
+        if pass_empty {
+            let interval = POLL_JITTER.apply(Duration::from_secs(cfg.poll_interval_secs.max(1)));
+            if pace_after_empty_pass(&shutdown, interval).await {
+                return;
+            }
         }
+    }
+}
+
+/// live_046 (R-B) — THE structural pass-emptiness law (the pacing
+/// loop's only input): a pass is EMPTY iff its beat was withheld
+/// (honest-beat gate / futility latch — merged_bug_005: a withheld
+/// pass must idle, never spin) OR it produced nothing at all (zero
+/// claims, zero ledger transitions, empty listing). Productive passes
+/// — claims, ledger movement, or a non-withheld listing that served
+/// work — re-poll immediately.
+fn pass_is_empty(pacing: &client::PassPacing, claimed: usize) -> bool {
+    pacing.beat_withheld || (claimed == 0 && !pacing.ledger_transitioned && !pacing.listed_any)
+}
+
+/// The pacing primitive: one jittered, shutdown-aware beat sleep.
+/// Returns true when shutdown fired (the caller exits its loop).
+async fn pace_after_empty_pass(shutdown: &rio_common::signal::Token, interval: Duration) -> bool {
+    tokio::select! {
+        _ = shutdown.cancelled() => true,
+        _ = tokio::time::sleep(interval) => false,
     }
 }
 
@@ -639,5 +682,211 @@ mod tests {
             }
             other => panic!("expected the Aborted outcome, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // live_046 (R-B) — eager re-poll pacing
+    // -----------------------------------------------------------------
+
+    /// R15 product census: the structural EMPTY law, total over the
+    /// full (withheld x transitioned x listed x claimed) product —
+    /// the cells COME FROM the alphabet (two bools x two bools x two
+    /// bools x {0,1}), so a new pacing fact forces a new census here.
+    /// Proposition (R16): EMPTY iff withheld OR nothing-at-all; in
+    /// particular every WITHHELD cell is empty (the no-spin
+    /// composition law: never re-poll a wedged pass).
+    #[test]
+    fn empty_law_total_over_the_pass_product() {
+        for withheld in [false, true] {
+            for transitioned in [false, true] {
+                for listed in [false, true] {
+                    for claimed in [0usize, 1] {
+                        let pacing = client::PassPacing {
+                            beat_withheld: withheld,
+                            ledger_transitioned: transitioned,
+                            listed_any: listed,
+                        };
+                        let expected = withheld || (claimed == 0 && !transitioned && !listed);
+                        assert_eq!(
+                            pass_is_empty(&pacing, claimed),
+                            expected,
+                            "cell (withheld={withheld}, transitioned={transitioned}, \
+                             listed={listed}, claimed={claimed})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// R17 const-relation pin (the beat-cadence floor as a typed
+    /// envelope): the steal horizon was derived from "a healthy IDLE
+    /// worker lists at least every ~1.2 s"; eager re-poll changes
+    /// cadence only for PRODUCTIVE passes (freshness strictly
+    /// improves) and leaves the idle/empty cadence — the horizon's
+    /// binding worst case — byte-identical. The pin:
+    /// 4 x default-poll-interval x (1 + jitter) <= steal horizon,
+    /// asserted THROUGH the real symbols (POLL_JITTER, the config
+    /// default, the mirrored horizon const — R14).
+    #[test]
+    fn idle_beat_worst_gap_times_four_fits_the_steal_horizon() {
+        let interval = crate::config::MaterializationConfig::default()
+            .poll_interval_secs
+            .max(1);
+        let rio_common::backoff::Jitter::Proportional(j) = POLL_JITTER else {
+            panic!("the pacing jitter is proportional by construction");
+        };
+        let worst_gap = 4.0 * interval as f64 * (1.0 + j);
+        assert!(
+            worst_gap <= client::SCHEDULER_LISTING_STEAL_HORIZON_SECS as f64,
+            "four missed idle beats (worst gap {worst_gap:.2} s) must fit \
+             the scheduler's steal horizon ({} s)",
+            client::SCHEDULER_LISTING_STEAL_HORIZON_SECS
+        );
+    }
+
+    /// Scripted pacing transport for the claim-loop tests: pops
+    /// nothing, answers from a fixed shape, cancels shutdown after N
+    /// listing calls (the loop's exit valve).
+    #[derive(Clone)]
+    struct PacingTransport {
+        state: std::sync::Arc<std::sync::Mutex<PacingState>>,
+    }
+
+    struct PacingState {
+        descriptors: Vec<rio_proto::types::MaterializationJobDescriptor>,
+        list_calls: u32,
+        cancel_after: u32,
+        shutdown: rio_common::signal::Token,
+    }
+
+    impl client::MaterializeTransport for PacingTransport {
+        async fn list_jobs(
+            &mut self,
+            _req: rio_proto::types::ListMaterializationJobsRequest,
+        ) -> Result<rio_proto::types::ListMaterializationJobsResponse, tonic::Status> {
+            let mut st = self.state.lock().unwrap();
+            st.list_calls += 1;
+            if st.list_calls >= st.cancel_after {
+                st.shutdown.cancel();
+            }
+            Ok(rio_proto::types::ListMaterializationJobsResponse {
+                jobs: st.descriptors.clone(),
+            })
+        }
+
+        async fn pull(
+            &mut self,
+            _req: rio_proto::types::PullAssignmentRequest,
+        ) -> Result<rio_proto::types::PullAssignmentResponse, tonic::Status> {
+            Ok(rio_proto::types::PullAssignmentResponse {
+                outcome: Some(
+                    rio_proto::types::pull_assignment_response::Outcome::NotYetReady(
+                        rio_proto::types::NotYetReady {
+                            retry_after_seconds: 5,
+                        },
+                    ),
+                ),
+            })
+        }
+
+        async fn report(
+            &mut self,
+            _req: rio_proto::types::ReportOutcomeRequest,
+        ) -> Result<(), tonic::Status> {
+            Ok(())
+        }
+
+        async fn report_progress(
+            &mut self,
+            _req: rio_proto::types::ReportMaterializationProgressRequest,
+        ) -> Result<(), tonic::Status> {
+            Ok(())
+        }
+    }
+
+    async fn run_claim_loop_with(
+        descriptors: Vec<rio_proto::types::MaterializationJobDescriptor>,
+        cancel_after: u32,
+    ) -> std::time::Duration {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let substituter =
+            std::sync::Arc::new(crate::substitute::Substituter::new(db.pool.clone(), None));
+        let shutdown = rio_common::signal::Token::new();
+        let transport = PacingTransport {
+            state: std::sync::Arc::new(std::sync::Mutex::new(PacingState {
+                descriptors,
+                list_calls: 0,
+                cancel_after,
+                shutdown: shutdown.clone(),
+            })),
+        };
+        let cfg = crate::config::MaterializationConfig::default();
+        let ctx = executor::ExecutorContext {
+            pool: db.pool.clone(),
+            substituter,
+        };
+        // Pause the clock ONLY after the real-I/O setup (the ephemeral
+        // PG pool's connect timeouts run on tokio time; pausing before
+        // setup makes auto-advance fire them ahead of the socket).
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        claim_loop(
+            0,
+            cfg,
+            ctx,
+            transport,
+            executor_instance().with_worker(0),
+            shutdown,
+        )
+        .await;
+        started.elapsed()
+    }
+
+    /// live_046 RED (loop-level, paused virtual clock):
+    /// PRODUCTIVE passes re-poll immediately. Three consecutive
+    /// productive passes (pass 1 mints + gets a contested answer —
+    /// a ledger transition; passes 2-3 list live work) must complete
+    /// with ZERO virtual time elapsed: no beat sleep was taken.
+    /// Pre-fix (strawman-disclosed: the law fn and pacing facts do
+    /// not exist pre-fix, so the red is structural-by-construction):
+    /// the loop slept the jittered interval after EVERY pass — three
+    /// passes cost >= 2 x ~1 s of virtual time.
+    #[tokio::test]
+    async fn productive_pass_repolls_without_sleep() {
+        let descriptor = rio_proto::types::MaterializationJobDescriptor {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            drv_hash: "pacing-live-drv".into(),
+            tenant_id: String::new(),
+            origin: "cache_opportunity".into(),
+        };
+        let elapsed = run_claim_loop_with(vec![descriptor], 3).await;
+        assert_eq!(
+            elapsed,
+            std::time::Duration::ZERO,
+            "left: the second listing waits out poll_interval despite a \
+             productive first pass / right: immediate re-poll (zero beat \
+             sleeps across three productive passes)"
+        );
+    }
+
+    /// live_046 companion pin (the no-spin half): EMPTY passes sleep
+    /// the jittered beat — three empty passes advance the virtual
+    /// clock by at least two jittered intervals (>= 2 x 0.8 s at the
+    /// 1 s default with ±20% jitter; the third pass exits via
+    /// shutdown before its sleep). Jitter is preserved on every sleep
+    /// that occurs.
+    #[tokio::test]
+    async fn empty_and_gated_passes_sleep_the_jittered_beat() {
+        let elapsed = run_claim_loop_with(vec![], 3).await;
+        assert!(
+            elapsed >= std::time::Duration::from_millis(1600),
+            "two empty-pass beats must elapse (got {elapsed:?})"
+        );
+        assert!(
+            elapsed <= std::time::Duration::from_millis(2600),
+            "and no more than two jittered beats before the exit \
+             (got {elapsed:?})"
+        );
     }
 }

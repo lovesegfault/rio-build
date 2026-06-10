@@ -55,16 +55,25 @@ pub(super) const RETRY_LATER_MAX_DEFER_SECS: u64 = 300;
 /// one-winner, and WO-S6b-1's standing refund + speculation bound
 /// make the contested losses cheap).
 ///
-/// Calibration: the beat is the store worker's poll cadence —
-/// `poll_interval_secs` default 1 s, ±20 % jitter, so a healthy IDLE
-/// worker lists at least every ~1.2 s plus RPC/actor slack; 5 s is
-/// four missed beats. A worker mid-walk stops listing for the walk's
-/// duration and trips this ON PURPOSE: it cannot claim while
-/// executing (inline-serial, slots=1), so offering its unclaimed
-/// slice to idle workers is the intended stealing trigger. A
-/// deployment that raises the store's poll interval past this
-/// horizon degrades to broader, more-contested listings (the
-/// pre-live_041 shape) — never to unlisted jobs.
+/// Calibration (re-derived for live_046 eager re-poll): the beat is
+/// the store worker's poll cadence — `poll_interval_secs` default
+/// 1 s, ±20 % jitter — and the binding worst case is the IDLE/EMPTY
+/// cadence: a healthy idle worker lists at least every ~1.2 s plus
+/// RPC/actor slack, so 5 s is four missed beats (the store-side
+/// `idle_beat_worst_gap_times_four_fits_the_steal_horizon` pin holds
+/// 4 × interval × (1 + jitter) ≤ this horizon through the exported
+/// mirror symbol). Eager re-poll (live_046) tightens only PRODUCTIVE
+/// passes — freshness strictly improves — and leaves the idle
+/// cadence byte-identical; the honest beat (merged_bug_005,
+/// store.materialize.honest-beat) withholds beats from passes that
+/// cannot convert, so a wedged worker trips this horizon ON PURPOSE
+/// exactly like the mid-walk case below. A worker mid-walk stops
+/// listing for the walk's duration and trips this ON PURPOSE: it
+/// cannot claim while executing (inline-serial, slots=1), so
+/// offering its unclaimed slice to idle workers is the intended
+/// stealing trigger. A deployment that raises the store's poll
+/// interval past this horizon degrades to broader, more-contested
+/// listings (the pre-live_041 shape) — never to unlisted jobs.
 pub(super) const LISTING_STEAL_HORIZON: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// live_041 — membership TTL (OQ-6b-1): a worker silent past this

@@ -190,6 +190,49 @@ impl IntoIterator for ClaimedSet {
     }
 }
 
+/// live_046 (R-B) — the pacing facts the claim loop's eager re-poll
+/// reads off a completed pass (the structural EMPTY law:
+/// `rio-store/src/materialize/mod.rs::pass_is_empty`). Carried beside
+/// the claims so the pacing decision is derived from the pass that
+/// actually ran, never re-probed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PassPacing {
+    /// The listing beat was withheld (honest-beat gate or futility
+    /// latch — merged_bug_005). A withheld pass is ALWAYS paced: the
+    /// no-spin composition law ("work fast, idle at the beat, never
+    /// spin while wedged").
+    pub beat_withheld: bool,
+    /// The resume/fresh lanes changed the ledger (mint, resolution,
+    /// or a standing transition).
+    pub ledger_transitioned: bool,
+    /// The listing answered with at least one descriptor.
+    pub listed_any: bool,
+}
+
+/// One completed poll pass: the accrued claims plus the pacing facts.
+/// Derefs to the claimed slice (and consumes into it) so claim
+/// consumers read the pass exactly like the bare [`ClaimedSet`].
+#[must_use = "claimed assignments must be executed or aborted — dropping them strands open attempts"]
+pub struct PollPass {
+    pub claimed: ClaimedSet,
+    pub pacing: PassPacing,
+}
+
+impl std::ops::Deref for PollPass {
+    type Target = [ClaimedJob];
+    fn deref(&self) -> &[ClaimedJob] {
+        &self.claimed
+    }
+}
+
+impl IntoIterator for PollPass {
+    type Item = ClaimedJob;
+    type IntoIter = std::vec::IntoIter<ClaimedJob>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.claimed.into_iter()
+    }
+}
+
 /// Origin sentinel stamped when a delivery's wire-echoed job binding
 /// (`WorkAssignment.job_id`, merged_bug_026) names a DIFFERENT job
 /// than the client-side identity the pull was issued under: the
@@ -866,7 +909,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
     list_health: &mut ListFailureLatch,
     futility: &mut ConversionFutilityLatch,
     shutdown: &rio_common::signal::Token,
-) -> ClaimedSet {
+) -> PollPass {
     // The accumulator is constructed ONCE; every exit below returns it
     // (bug_116 — the listing-failure arms can no longer fabricate an
     // empty result over accrued claims).
@@ -875,8 +918,20 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
     // full PullAnswer alphabet at the fresh dispatch); observed by the
     // futility latch at pass end.
     let mut pass = PassConversion::default();
+    // live_046 (R-B) — the pacing facts: ledger transitions are
+    // derived from the (len, charged) pair around the pass (any mint,
+    // resolution, or standing transition moves at least one).
+    let mut pacing = PassPacing::default();
+    let ledger_shape_at_entry = (ledger.len(), ledger.charged_len());
+    macro_rules! finish {
+        () => {{
+            pacing.ledger_transitioned =
+                (ledger.len(), ledger.charged_len()) != ledger_shape_at_entry;
+            return PollPass { claimed, pacing };
+        }};
+    }
     if available_slots == 0 {
-        return claimed;
+        finish!();
     }
 
     // bug_251: the RESUME pass runs FIRST — unanswered claims from
@@ -903,7 +958,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             confirm_only: false,
         };
         match pull_once(transport, shutdown, req, &entry.drv_hash).await {
-            PullAnswer::Shutdown => return claimed,
+            PullAnswer::Shutdown => finish!(),
             PullAnswer::Deliver(assignment) => {
                 info!(drv_hash = %entry.drv_hash, exec_id = %assignment.exec_id,
                       "lost-response claim resumed via nonce (rule-4b)");
@@ -987,13 +1042,15 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             ?headroom,
             "pass cannot mint a fresh claim; listing beat withheld (honest beat)"
         );
-        return claimed;
+        pacing.beat_withheld = true;
+        finish!();
     }
     if futility.withholds_this_pass() {
         debug!(
             "conversion-futility latch engaged; listing beat withheld              until the re-probe interval elapses"
         );
-        return claimed;
+        pacing.beat_withheld = true;
+        finish!();
     }
     let listed = match bounded(
         shutdown,
@@ -1002,7 +1059,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
     )
     .await
     {
-        BoundedOutcome::Shutdown => return claimed,
+        BoundedOutcome::Shutdown => finish!(),
         BoundedOutcome::TimedOut { after } => {
             debug!(
                 after_secs = after.as_secs(),
@@ -1010,7 +1067,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             );
             list_health.note_failure("timed out (no answer)");
             transport.note_timeout();
-            return claimed;
+            finish!();
         }
         BoundedOutcome::Resolved(Ok(resp)) => {
             list_health.note_success();
@@ -1021,9 +1078,10 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             debug!(code = ?status.code(), msg = status.message(),
                    "ListMaterializationJobs failed; empty poll pass");
             list_health.note_failure(&format!("{:?}: {}", status.code(), status.message()));
-            return claimed;
+            finish!();
         }
     };
+    pacing.listed_any = pass.listed;
 
     // bug_099: the walk's budget counts POTENTIAL server-side mints —
     // every nonce issued whose outcome the scheduler has not answered.
@@ -1165,7 +1223,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
         match answer {
             // SIGTERM mid-pass: return what was already claimed so the
             // caller can abort/report those attempts under the grace.
-            PullAnswer::Shutdown => return claimed,
+            PullAnswer::Shutdown => finish!(),
             PullAnswer::Deliver(assignment) => {
                 pass.deliveries += 1;
                 ledger.resolve(job_id);
@@ -1214,7 +1272,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
     // SIGTERM exits above deliberately do not: an abandoned pass is
     // inconclusive evidence).
     futility.observe_pass(&pass);
-    claimed
+    finish!();
 }
 
 /// Forward a finished job's outcome until the scheduler acknowledges
@@ -3325,7 +3383,7 @@ mod tests {
         // poll passes. Without reconnect-on-UNAVAILABLE the transport
         // reuses the pinned connection forever and every pass stays
         // empty.
-        let mut claimed = ClaimedSet::begin();
+        let mut claimed: Vec<ClaimedJob> = Vec::new();
         for _ in 0..5 {
             claimed = poll_and_claim(
                 &mut transport,
@@ -3336,7 +3394,9 @@ mod tests {
                 &mut ConversionFutilityLatch::default(),
                 &token(),
             )
-            .await;
+            .await
+            .into_iter()
+            .collect();
             if !claimed.is_empty() {
                 break;
             }
