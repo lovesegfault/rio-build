@@ -6916,8 +6916,15 @@ rec {
     # law carries content. The latch regimes hold it trivially-but-
     # truthfully (whole-episode drain leaves no survivors by design).
     # TLC-EXHAUSTIVE: 242,502,085 states generated / 1,521,281
-    # distinct / 0 on queue, 10m06s at workers=auto — budget 1800s
-    # ≈ 3× measured.
+    # distinct / 0 on queue — byte-identical across the round-5 model
+    # extensions (every new var is frozen in this regime). Measured
+    # 10m06s at the round-4 baseline, 14m51s solo at the round-5
+    # re-measure (busier host), and a 124-kill at 95% frontier under
+    # a 23-way parallel TLC batch at the old 1800s budget — the
+    # budget is raised to 2700s ≈ 3× the measured solo runtime so
+    # gate-level contention cannot starve a correct exhaustive run
+    # (the space itself is unchanged; shrinking these bounds would
+    # weaken the one regime where this law is non-vacuous).
     # r[verify ctrl.nodeclaim.wedge-two-axis+5]
     quint-wedge-cluster-epilogue = mkQuintCheck {
       name = "wedge-cluster-epilogue";
@@ -6930,7 +6937,7 @@ rec {
         "reapedImpliesEvicted"
         "markedIncrementsOnlyOnEdges"
       ];
-      modelTimeoutSec = 1800;
+      modelTimeoutSec = 2700;
     };
     # The m288 tautology guard: suppressedAnchors goes non-empty.
     quint-wedge-cluster-epilogue-witness-suppressed = mkQuintWitnessCheck {
