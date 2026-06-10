@@ -305,9 +305,10 @@ impl PassOutcome {
     /// claimed count, and the pass's net ledger shrink.
     ///
     /// Seal precedence (derived, hand-tabled in
-    /// `seal_precedence_total_over_exits`): `Abandoned` > `Delivered`
-    /// > `Settled` > `Contested` > `Wedged` >
-    /// `ListedNoAction`/`Empty`/`ListFailed`. Conversion evidence
+    /// `seal_precedence_total_over_exits`), strongest first:
+    /// `Abandoned`, then `Delivered`, then `Settled`, then
+    /// `Contested`, then `Wedged`, then the idle shapes
+    /// (`ListedNoAction`/`Empty`/`ListFailed`). Conversion evidence
     /// wins over the exit shape on every non-abandoned exit — a
     /// delivering or ledger-shrinking pass seals productive EVEN
     /// UNDER A GATED EXIT (merged_bug_038: the resume delivery at
@@ -1212,6 +1213,14 @@ const FUTILE_PASS_THRESHOLD: u32 = 3;
 /// horizon) per probe interval — recorded, accepted. The
 /// `futile_latch_probe_interval_exceeds_member_ttl` const-relation
 /// test pins the inequality.
+///
+/// R17 (round-8 WO-S2-2): the countdown is decremented exactly once
+/// per OBSERVED pass at the `observe_outcome` chokepoint — never at
+/// the gate consult — so the cadence is exactly this many passes per
+/// probe over ALL exits (headroom-gated passes included; pre-fix
+/// those froze the countdown and stretched the cadence arbitrarily
+/// in wall-clock). Running witness:
+/// `withhold_countdown_advances_on_gated_passes`.
 const FUTILE_RELIST_INTERVAL_PASSES: u32 = 64;
 
 /// Mirrored scheduler constant (rio-scheduler
@@ -1243,13 +1252,22 @@ struct PassConversion {
     /// Fresh outcomes that were answered conversion-disproving
     /// rejections (`RejectedDisproving` / `RejectedAuth`).
     futile_rejections: usize,
-    /// Any fresh outcome that proves the pass was NOT futile-only
-    /// (delivery, Gone, a NotYetReady contest, an unanswered mint).
-    non_futile_outcome: bool,
+    /// Conversion-grade evidence (`FutilityEvidence::Conversion` —
+    /// Deliver/Gone), folded from BOTH lanes (round-8 WO-S2-2: the
+    /// pre-fix fold collapsed the typed evidence into an untyped
+    /// bool AND ran fresh-lane only, so a resume-lane Gone — the
+    /// documented reset-grade clean outcome — was invisible to the
+    /// futility latch).
+    conversions: usize,
     /// Fresh mints answered NotYetReady this pass (the contested
     /// population — round-8 WO-S2-1: [`PassOutcome::Contested`]'s
-    /// membership predicate).
+    /// membership predicate; streak-breaking contest evidence for
+    /// the futility latch).
     contested_mints: usize,
+    /// Fresh mints whose answer was lost this pass (no evidence
+    /// either way — streak-breaking; the budget gate owns the lost
+    /// lane).
+    unanswered_mints: usize,
     /// Min over the pass's answered `retry_after` floors (either
     /// lane — the earliest any contested job could be ready).
     retry_floor: Option<Duration>,
@@ -1356,37 +1374,105 @@ pub struct ConversionFutilityLatch {
 }
 
 impl ConversionFutilityLatch {
-    /// Whether THIS pass's listing is withheld (counts down the
-    /// re-probe interval; the pass that reaches zero is the probe).
-    fn withholds_this_pass(&mut self) -> bool {
-        if self.withhold_remaining > 0 {
-            self.withhold_remaining -= 1;
-            true
-        } else {
-            false
+    /// Whether the listing is currently withheld — the PURE gate
+    /// consult (round-8 WO-S2-2: the countdown is no longer
+    /// decremented here; it is counted once per OBSERVED pass at the
+    /// [`Self::observe_outcome`] chokepoint, so the "one probe per
+    /// 64 passes" cadence is honest over ALL exits, gated ones
+    /// included — pre-fix a headroom-gated pass never reached this
+    /// consult and the countdown froze).
+    fn is_withholding(&self) -> bool {
+        self.withhold_remaining > 0
+    }
+
+    // r[impl store.materialize.honest-beat]
+    /// round-8 WO-S2-2 (merged_bug_015) — fold ONE sealed pass
+    /// outcome. Called from `finish!`, so evidence observation is
+    /// structurally inseparable from pass completion: every exit
+    /// observes (gated and abandoned included — the latter as a
+    /// typed no-op), where pre-fix the single post-loop call site
+    /// sat after both withhold gates and the SIGTERM exits, making
+    /// the one contractually reset-grade event (a resume delivery at
+    /// slots=1, which always exits at the headroom gate) structurally
+    /// invisible.
+    ///
+    /// The episode law, derived from the latch's contract (warn once
+    /// at episode OPEN, disclose once at episode CLOSE, close
+    /// exactly on conversion-grade evidence):
+    ///   - `Delivered` or conversion-grade resolution (Gone, EITHER
+    ///     lane — `pass.conversions > 0`) → full reset: streak,
+    ///     countdown, episode (recovery disclosed iff one was open);
+    ///   - contest/lost evidence (`Contested`, or mixed mint
+    ///     outcomes under `ListedNoAction`) → streak = 0 only:
+    ///     NotYetReady is not a clean outcome, so the episode stays
+    ///     honestly open — a worker that never re-demonstrated
+    ///     conversion keeps its open episode;
+    ///   - an all-disproven mint set (under `ListedNoAction`/
+    ///     `Settled`) extends the streak (today's law, on typed
+    ///     counts instead of a lossy bool);
+    ///   - `Empty`/`ListFailed`/`Wedged` → streak-neutral (no
+    ///     conversion evidence either way);
+    ///   - `Abandoned` → typed no-op (SIGTERM cut the pass —
+    ///     inconclusive, the countdown does not move).
+    fn observe_outcome(&mut self, outcome: &PassOutcome, pass: &PassConversion) {
+        match outcome {
+            PassOutcome::Abandoned => {}
+            PassOutcome::Delivered { .. } => {
+                self.tick_countdown();
+                self.reset_on_conversion();
+            }
+            PassOutcome::Settled { .. }
+            | PassOutcome::Contested { .. }
+            | PassOutcome::ListedNoAction { .. }
+            | PassOutcome::Empty
+            | PassOutcome::Wedged(_)
+            | PassOutcome::ListFailed => {
+                self.tick_countdown();
+                if pass.conversions > 0 {
+                    // Gone (either lane): the documented reset-grade
+                    // clean outcome — the episode closes even
+                    // without a delivery.
+                    self.reset_on_conversion();
+                } else {
+                    self.fold_fresh_evidence(pass);
+                }
+            }
         }
     }
 
-    /// Fold one completed pass's conversion evidence.
-    fn observe_pass(&mut self, pass: &PassConversion) {
-        if pass.deliveries > 0 || (!pass.listed && pass.fresh_mints == 0) {
-            // A converting pass resets outright; a pass that served
-            // nothing (empty listing) carries no conversion evidence
-            // — it neither extends nor breaks the streak.
-            if pass.deliveries > 0 {
-                self.reset_on_conversion();
-            }
+    /// One observed pass elapses from the re-probe countdown (while
+    /// armed). Counted HERE — the observation chokepoint — never at
+    /// the gate consult, so gated passes advance the cadence too.
+    fn tick_countdown(&mut self) {
+        if self.withhold_remaining > 0 {
+            self.withhold_remaining -= 1;
+        }
+    }
+
+    /// The fresh-lane streak law (unchanged semantics, typed counts):
+    /// a pass is futile iff it listed, minted, and EVERY mint was
+    /// answered conversion-disproving — no conversion, no contest,
+    /// no lost answer. Contest/lost evidence breaks the streak
+    /// (futile passes must be CONSECUTIVE); mint-free passes are
+    /// streak-neutral. Resume-lane contests and disproofs stay
+    /// streak-invisible: they judge credential presentations and
+    /// ledger bookkeeping, never THIS worker's mint capability.
+    fn fold_fresh_evidence(&mut self, pass: &PassConversion) {
+        if pass.fresh_mints == 0 {
             return;
         }
         let futile = pass.listed
-            && pass.fresh_mints > 0
             && pass.futile_rejections == pass.fresh_mints
-            && !pass.non_futile_outcome;
+            && pass.contested_mints == 0
+            && pass.unanswered_mints == 0;
         if futile {
             self.consecutive_futile = self.consecutive_futile.saturating_add(1);
             if self.consecutive_futile >= FUTILE_PASS_THRESHOLD && self.withhold_remaining == 0 {
                 self.withhold_remaining = FUTILE_RELIST_INTERVAL_PASSES;
                 if !self.engaged {
+                    // The closed→open transition: the warn lives
+                    // INSIDE the arm (one warn per episode by
+                    // construction).
                     self.engaged = true;
                     warn!(
                         streak = self.consecutive_futile,
@@ -1399,17 +1485,20 @@ impl ConversionFutilityLatch {
                     );
                 }
             }
-        } else if pass.non_futile_outcome || pass.fresh_mints > 0 {
-            // Conversion-capable evidence without a delivery (a
-            // contest loss, an unanswered mint, a Gone): the streak
-            // is broken — futile passes must be CONSECUTIVE.
+        } else {
+            // Contest or lost-answer evidence without a conversion:
+            // the streak is broken — futile passes must be
+            // CONSECUTIVE. (The episode, if open, stays open.)
             self.consecutive_futile = 0;
         }
     }
 
     fn reset_on_conversion(&mut self) {
         if self.engaged {
-            info!("conversion recovered; listing beat resumes (futility latch reset)");
+            // The open→closed transition: the recovery disclosure
+            // lives INSIDE the arm (one recovery per episode by
+            // construction).
+            info!("conversion recovered; listing beat resumes (futility episode closed)");
         }
         self.consecutive_futile = 0;
         self.withhold_remaining = 0;
@@ -1420,6 +1509,13 @@ impl ConversionFutilityLatch {
     #[cfg(test)]
     fn withholding(&self) -> bool {
         self.withhold_remaining > 0
+    }
+
+    /// Test visibility: is a futility episode open (warn emitted,
+    /// no recovery disclosed yet)?
+    #[cfg(test)]
+    fn episode_open(&self) -> bool {
+        self.engaged
     }
 }
 
@@ -1463,6 +1559,11 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
         ($exit:expr) => {{
             let resolutions = entries_at_entry.saturating_sub(ledger.len());
             let outcome = PassOutcome::seal($exit, &pass, claimed.len(), resolutions);
+            // round-8 WO-S2-2 — the futility latch observes EVERY
+            // exit (gated and abandoned included): evidence
+            // observation is structurally inseparable from pass
+            // completion.
+            futility.observe_outcome(&outcome, &pass);
             return PollPass { claimed, outcome };
         }};
     }
@@ -1511,6 +1612,16 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
         // lane (the earliest any contested job could be ready).
         if let PullAnswer::NotYetReady { retry_after } = &answer {
             pass.fold_retry_floor(*retry_after);
+        }
+        // round-8 WO-S2-2 — resume-lane CONVERSION evidence (Gone /
+        // Deliver) folds into the pass: a Gone here is the documented
+        // reset-grade clean outcome the pre-fix fresh-only fold made
+        // invisible to the futility latch. Resume contests and
+        // disproofs stay out of the fold deliberately — they judge
+        // the credential presentation, not this worker's mint
+        // capability (the streak law is fresh-lane evidence only).
+        if matches!(futility_evidence(&answer), FutilityEvidence::Conversion) {
+            pass.conversions += 1;
         }
         ledger.note_presented(entry.job_id);
         // merged_bug_014 — the ONE transition law settles the
@@ -1618,7 +1729,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
         ledger.observe_gated_pass(&headroom);
         finish!(PassExit::GatedHeadroom(headroom));
     }
-    if futility.withholds_this_pass() {
+    if futility.is_withholding() {
         debug!(
             "conversion-futility latch engaged; listing beat withheld until \
              the re-probe interval elapses"
@@ -1783,23 +1894,42 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             confirm_only: false,
         };
         let answer = pull_once(transport, shutdown, req, &descriptor.drv_hash).await;
-        // merged_bug_005 — fold the outcome's futility evidence
-        // (total over the PullAnswer alphabet; rustc is the census).
+        // merged_bug_005 / round-8 WO-S2-2 — fold the outcome's
+        // futility evidence as TYPED COUNTS (total over the
+        // PullAnswer alphabet; rustc is the census): the latch
+        // consumes the per-variant counts, never a pre-collapsed
+        // bool.
         match futility_evidence(&answer) {
-            FutilityEvidence::Conversion | FutilityEvidence::NotFutile => {
-                pass.non_futile_outcome = true;
+            FutilityEvidence::Conversion => {
+                pass.conversions += 1;
             }
             FutilityEvidence::ConversionDisproved => {
                 pass.futile_rejections += 1;
                 pass.last_rejected_drv = Some(descriptor.drv_hash.clone());
             }
+            FutilityEvidence::NotFutile => {
+                // The contested/lost split rides the answer match
+                // below (both are streak-breaking; only contests
+                // carry a retry floor).
+            }
             FutilityEvidence::Inconclusive => {}
         }
         // round-8 WO-S2-1 — the contested-mint count and the answered
-        // retry floor (the [`PassOutcome::Contested`] inputs).
-        if let PullAnswer::NotYetReady { retry_after } = &answer {
-            pass.contested_mints += 1;
-            pass.fold_retry_floor(*retry_after);
+        // retry floor (the [`PassOutcome::Contested`] inputs); the
+        // lost-mint count (WO-S2-2 — streak-breaking evidence).
+        match &answer {
+            PullAnswer::NotYetReady { retry_after } => {
+                pass.contested_mints += 1;
+                pass.fold_retry_floor(*retry_after);
+            }
+            PullAnswer::Unanswered => {
+                pass.unanswered_mints += 1;
+            }
+            PullAnswer::Deliver(_)
+            | PullAnswer::Gone
+            | PullAnswer::Shutdown
+            | PullAnswer::RejectedDisproving
+            | PullAnswer::RejectedAuth => {}
         }
         // SIGTERM mid-pass: return what was already claimed so the
         // caller can abort/report those attempts under the grace.
@@ -1841,10 +1971,6 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             ));
         }
     }
-    // merged_bug_005 — the latch observes the completed pass (the
-    // SIGTERM exits above deliberately do not: an abandoned pass is
-    // inconclusive evidence).
-    futility.observe_pass(&pass);
     finish!(PassExit::Completed);
 }
 
@@ -5112,5 +5238,241 @@ mod tests {
                 pass.deliveries,
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // round-8 WO-S2-2 — the futility episode observed at every exit
+    // (merged_bug_015)
+    // -----------------------------------------------------------------
+
+    /// Engage the futility latch through production flows: one
+    /// contested seed pass leaves `d0` as a CredentialOnly credential
+    /// (so a later pass can resume-deliver it), then three futile
+    /// passes (every fresh mint answered with a conversion-disproving
+    /// rejection) arm the withhold and open the episode.
+    ///
+    /// Scripted pulls consumed per pass: seed = [NYR(d0)]; each
+    /// futile pass = [NYR(d0 resume), InvalidArgument(mint)].
+    async fn engage_futility_with_credential(
+        t: &mut MockTransport,
+        ledger: &mut ResumeLedger,
+        latch: &mut ListFailureLatch,
+        fut: &mut ConversionFutilityLatch,
+        inst: &rio_common::dns::Dns1123Label,
+        tok: &rio_common::signal::Token,
+    ) {
+        // Seed pass: d0 minted, answered NotYetReady → CredentialOnly.
+        let p0 = poll_and_claim(t, inst, 1, ledger, latch, fut, tok).await;
+        assert!(p0.is_empty());
+        assert_eq!(ledger.len(), 1, "d0 holds a credential");
+        assert_eq!(ledger.charged_len(), 0, "answered: refunded");
+        // Three futile passes: d0's resume answers NotYetReady (the
+        // credential rides on, streak-invisible — resume contests are
+        // presentation bookkeeping, not mint evidence); the fresh
+        // mint is rejected conversion-disproving each pass.
+        for futile_pass in 1..=3 {
+            let p = poll_and_claim(t, inst, 1, ledger, latch, fut, tok).await;
+            assert!(p.is_empty(), "futile pass {futile_pass} claims nothing");
+        }
+        assert!(
+            fut.withholding(),
+            "precondition: the streak armed the withhold"
+        );
+        assert!(fut.episode_open(), "precondition: the episode is open");
+    }
+
+    // r[verify store.materialize.honest-beat]
+    /// round-8 R5 (merged_bug_015 hole 2). Proposition certified
+    /// (R16): a resume delivery on a GATED exit — the only delivery
+    /// possible during a withhold at production slots=1 — resets the
+    /// futility latch (closes the episode, clears the withhold),
+    /// driven through the production gate ordering (no synthetic
+    /// observe call): the delivering pass exits at the headroom gate,
+    /// which pre-fix sat BEFORE the latch's only observation site.
+    #[tokio::test(start_paused = true)]
+    async fn gated_resume_delivery_resets_the_futility_withhold() {
+        let d0 = descriptor(10);
+        let d1 = descriptor(11);
+        let mut t = MockTransport::new(
+            vec![
+                Ok(listing(vec![d0.clone()])),
+                Ok(listing(vec![d1.clone()])),
+                Ok(listing(vec![d1.clone()])),
+                Ok(listing(vec![d1.clone()])),
+            ],
+            vec![
+                Ok(not_yet_ready()),
+                Ok(not_yet_ready()),
+                Err(tonic::Status::invalid_argument("shape can never mint")),
+                Ok(not_yet_ready()),
+                Err(tonic::Status::invalid_argument("shape can never mint")),
+                Ok(not_yet_ready()),
+                Err(tonic::Status::invalid_argument("shape can never mint")),
+                Ok(deliver_for_job(
+                    "exec-resumed-d0",
+                    "/nix/store/resumed-d0.drv",
+                    Uuid::nil(),
+                )),
+            ],
+            vec![],
+        );
+        let mut ledger = ResumeLedger::default();
+        let mut latch = ListFailureLatch::default();
+        let mut fut = ConversionFutilityLatch::default();
+        let tok = token();
+        let inst = instance("futility-deliver-w");
+        engage_futility_with_credential(&mut t, &mut ledger, &mut latch, &mut fut, &inst, &tok)
+            .await;
+
+        // The delivering pass: d0's resume presentation DELIVERS at
+        // slots=1 — the pass exits at the headroom gate.
+        let p = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+        assert_eq!(p.len(), 1, "the resume delivery executed");
+        assert!(
+            !fut.withholding(),
+            "left: withholding() still true, countdown frozen (the pass \
+             exited at the headroom gate before observe_pass) / right: \
+             the delivery reset the latch on the gated exit"
+        );
+        assert!(
+            !fut.episode_open(),
+            "the delivery closed the episode (recovery disclosed once)"
+        );
+    }
+
+    // r[verify store.materialize.honest-beat]
+    /// round-8 R6 (merged_bug_015 hole 1). Proposition certified
+    /// (R16): the episode lifecycle is typed over the evidence
+    /// alphabet — a deliveryless conversion-grade recovery (the probe
+    /// pass's mint answered Gone) CLOSES the episode, and a second
+    /// futile streak RE-OPENS it (the warn re-armed). The state
+    /// accessor is the witness; the warn/recovery emissions sit
+    /// inside the closed→open / open→closed transition arms by
+    /// construction (one-line separation, disclosed — the certified
+    /// proposition is the transition).
+    #[tokio::test(start_paused = true)]
+    async fn second_futility_episode_warns_after_deliveryless_recovery() {
+        let d1 = descriptor(21);
+        let mut t = MockTransport::new(
+            vec![Ok(listing(vec![d1.clone()]))],
+            vec![
+                Err(tonic::Status::invalid_argument("shape can never mint")),
+                Err(tonic::Status::invalid_argument("shape can never mint")),
+                Err(tonic::Status::invalid_argument("shape can never mint")),
+                Ok(gone()),
+                Err(tonic::Status::invalid_argument("shape can never mint")),
+            ],
+            vec![],
+        );
+        let mut ledger = ResumeLedger::default();
+        let mut latch = ListFailureLatch::default();
+        let mut fut = ConversionFutilityLatch::default();
+        let tok = token();
+        let inst = instance("futility-episodes-w");
+        // Episode 1 opens: three futile passes (no credential needed).
+        for _ in 1..=3 {
+            let p = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+            assert!(p.is_empty());
+        }
+        assert!(fut.episode_open(), "episode 1 open");
+        assert!(fut.withholding(), "withhold armed");
+
+        // 64 withheld passes (the re-probe interval), then the probe
+        // pass: its mint answers GONE — conversion-grade evidence
+        // without a delivery.
+        for _ in 0..FUTILE_RELIST_INTERVAL_PASSES {
+            let p = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+            assert!(p.is_empty());
+        }
+        let lists_before = t.list_calls;
+        let p = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+        assert!(p.is_empty(), "the Gone probe delivers nothing");
+        assert_eq!(t.list_calls, lists_before + 1, "the probe pass listed");
+        assert!(
+            !fut.episode_open(),
+            "left: episode_open() stays true (engaged latched by the \
+             deliveryless recovery; the next episode's warn suppressed \
+             by the engaged guard) / right: Gone closes the episode \
+             (recovery logged once)"
+        );
+
+        // A second futile streak re-opens the episode (the warn
+        // re-armed — it fires inside the closed→open transition).
+        for _ in 1..=3 {
+            let p = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+            assert!(p.is_empty());
+        }
+        assert!(
+            fut.episode_open(),
+            "a second 3-pass streak re-opens the episode"
+        );
+        assert!(fut.withholding(), "and re-arms the withhold");
+    }
+
+    // r[verify store.materialize.honest-beat]
+    /// round-8 R7 (merged_bug_015, the frozen countdown). Proposition
+    /// certified (R16): the withhold countdown advances once per
+    /// OBSERVED pass over MIXED exits — here 64 BudgetPinned-gated
+    /// passes (a Charged orphan population, the exits that pre-fix
+    /// never reached the gate-site decrement) — so the "one probe per
+    /// 64 passes" cadence is honest in PASSES, not just in
+    /// futility-gated consults; once the orphan answers, the expired
+    /// latch lets the probe pass list.
+    #[tokio::test(start_paused = true)]
+    async fn withhold_countdown_advances_on_gated_passes() {
+        let d0 = descriptor(30);
+        let d1 = descriptor(31);
+        let mut t = MockTransport::new(
+            vec![Ok(listing(vec![d0.clone()])), Ok(listing(vec![d1.clone()]))],
+            vec![
+                Ok(not_yet_ready()),
+                Ok(not_yet_ready()),
+                Err(tonic::Status::invalid_argument("shape can never mint")),
+                Ok(not_yet_ready()),
+                Err(tonic::Status::invalid_argument("shape can never mint")),
+                Ok(not_yet_ready()),
+                Err(tonic::Status::invalid_argument("shape can never mint")),
+            ],
+            vec![],
+        );
+        let mut ledger = ResumeLedger::default();
+        let mut latch = ListFailureLatch::default();
+        let mut fut = ConversionFutilityLatch::default();
+        let tok = token();
+        let inst = instance("futility-countdown-w");
+        engage_futility_with_credential(&mut t, &mut ledger, &mut latch, &mut fut, &inst, &tok)
+            .await;
+
+        // 64 BudgetPinned-gated passes: d0's resume presentation is
+        // LOST each pass (re-charging the slot), so every pass exits
+        // at the headroom gate — the exits the pre-fix countdown
+        // never observed.
+        t.hang_next_pulls = FUTILE_RELIST_INTERVAL_PASSES;
+        for _ in 0..FUTILE_RELIST_INTERVAL_PASSES {
+            let p = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+            assert!(p.is_empty());
+        }
+        assert_eq!(ledger.charged_len(), 1, "d0 stayed the Charged orphan");
+        assert!(
+            !fut.withholding(),
+            "left: still withholding after 64+ gated passes (countdown \
+             frozen — the probe never arrives) / right: expired at 64 \
+             observed passes"
+        );
+
+        // The orphan answers (refund) — the budget frees and the
+        // expired latch lets the next pass LIST (the probe).
+        t.pulls = vec![Ok(not_yet_ready())].into();
+        let p = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+        assert!(p.is_empty(), "the refund pass claims nothing");
+        let lists_before = t.list_calls;
+        let p = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+        assert!(p.is_empty());
+        assert_eq!(
+            t.list_calls,
+            lists_before + 1,
+            "the probe pass lists once the budget frees and the \
+             countdown has expired"
+        );
     }
 }
