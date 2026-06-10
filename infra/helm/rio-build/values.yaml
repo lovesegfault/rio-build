@@ -427,8 +427,31 @@ store:
   # iff schedulerAddr is set (PD-D2); rollback below the cutover is
   # binary-version rollback, not a values flip.
   materialization:
-    # Concurrent jobs per replica (design §2.2 item 1).
-    executorConcurrency: 8
+    # Concurrent jobs per replica (design §2.2 item 1; the binary
+    # default stays 8 — this value is the production lever). The
+    # workers are I/O-bound poll → fetch → ingest loops (live: pods
+    # held 150-310 millicores of the 16-CPU EKS request during a
+    # burst at 8), so CPU does not bound n. Memory does not either:
+    # in-flight NAR bytes are governed by the shared nar_bytes_budget
+    # semaphore (8 × MAX_NAR_SIZE = 32 GiB — equal to the EKS memory
+    # limit, so do NOT raise it with n); under pathological
+    # all-large-NAR load extra workers PARK on the byte budget
+    # (BudgetParked exempts a parked owner from stall takeover)
+    # instead of buffering n × 4 GiB. The binding constraint is the
+    # r[store.substitute.admission] gate: each worker's in-flight
+    # path holds one singleflight-LEADER permit from the SAME
+    # per-replica pool the RPC-side substitute-on-miss path draws
+    # from (pgMaxConnections 20 above → (20×3).clamp(64,128) = 64
+    # permits). 32 caps the executor at half the gate — ≥32 permits
+    # stay available to QueryPathInfo/GetPath miss traffic — and the
+    # executor cannot saturate the gate alone (admission saturation
+    # is charged to jobs as InfraFailure, so a self-saturating
+    # executor would park its own backlog). Raising this to 64
+    # requires raising the admission-cap formula first. PG queuing at
+    # 32 workers × short per-query claims vs the 20-conn pool is
+    # acceptable — the substitute path never holds a connection
+    # across an upstream fetch.
+    executorConcurrency: 32
     # The scheduler ExecutorService address — the store→scheduler edge
     # the store-egress netpol allows (port 9001).
     schedulerAddr: rio-scheduler.rio-system:9001
