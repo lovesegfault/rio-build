@@ -4,8 +4,8 @@
 //! (`lookup`/`getattr`/`readdir`/`readlink`) is answered from an
 //! in-heap Directory DAG with infinite cache TTLs; `open()` brokers a
 //! passthrough fd from the node-SSD backing cache so warm reads never
-//! upcall. Requests are served over fuse-over-io_uring (the [`uring`]
-//! module — the only transport; the fuser session on `/dev/fuse`
+//! upcall. Requests are served over fuse-over-io_uring (the private
+//! `uring` module — the only transport; the fuser session on `/dev/fuse`
 //! handles INIT and the request classes the kernel never routes over
 //! rings). The client-side mount/serve sequence lives in [`session`];
 //! the executor wires that session in front of each build's overlay as
