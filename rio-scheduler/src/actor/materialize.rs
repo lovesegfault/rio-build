@@ -231,7 +231,8 @@ where
 /// Tie order parity: the cached comparison uses the same
 /// `(hash, member)` tuple order as [`rendezvous_score`] — the cached
 /// owner is ALWAYS the batch argmax over the live membership (the
-/// parity proptest pins cached ≡ [`rendezvous_owner`] across churn).
+/// parity proptest pins cached ≡ `rendezvous_owner` — the test-only
+/// batch oracle — across churn).
 // r[impl sched.materialize.listing-cost]
 #[derive(Debug, Default)]
 pub(crate) struct ListingPlan {
@@ -965,7 +966,11 @@ pub(crate) enum JobViewState {
     Hydrated {
         view: JobView,
         contacts: ListingContacts,
-        plan: ListingPlan,
+        /// Boxed: the beat state (snapshot + buckets) dwarfs the
+        /// enum's other variant (stable clippy large_enum_variant);
+        /// the listing arm reaches it through one indirection per
+        /// poll.
+        plan: Box<ListingPlan>,
     },
 }
 
@@ -999,7 +1004,7 @@ impl JobViewState {
                 view,
                 contacts,
                 plan,
-            } => Some((view, contacts, plan)),
+            } => Some((view, contacts, plan.as_mut())),
         }
     }
 
@@ -1064,7 +1069,7 @@ impl JobViewState {
         *self = Self::Hydrated {
             view: v,
             contacts: ListingContacts::default(),
-            plan: ListingPlan::default(),
+            plan: Box::default(),
         };
     }
 
@@ -1076,7 +1081,7 @@ impl JobViewState {
             *self = Self::Hydrated {
                 view: JobView::default(),
                 contacts: ListingContacts::default(),
-                plan: ListingPlan::default(),
+                plan: Box::default(),
             };
         }
         match self {
