@@ -1108,7 +1108,8 @@ impl DagActor {
     }
 
     /// The un-admitted completion intake (bug_077): every sender that
-    /// is NOT already behind a [`fold_report`] admission routes here —
+    /// is NOT already behind a [`rio_evidence_kernel::pull::fold_report`]
+    /// admission routes here —
     /// the `ProcessCompletion` command arm (production: the
     /// append-failure redelivery echo; tests: the stream-era helper
     /// senders). The shim re-runs the SAME kernel admission law the
