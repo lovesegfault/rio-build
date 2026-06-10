@@ -1893,13 +1893,17 @@ mod tests {
     /// bundle in the nix sandbox; the fake upstream is plaintext).
     use crate::test_helpers::sandbox_http;
 
+    /// The battery context runs at the PRODUCTION fan-out (F = 4, the
+    /// WO-R7-3 default — gate parity per §6.2: a width-1 battery would
+    /// exercise a regime production does not use, hiding interleaving
+    /// bugs from the gate). Width-sensitive tests override the field.
     fn make_ctx(pool: PgPool) -> ExecutorContext {
         ExecutorContext {
             substituter: std::sync::Arc::new(
                 Substituter::new(pool.clone(), None).with_http_client(sandbox_http()),
             ),
             pool,
-            path_fanout: 1,
+            path_fanout: 4,
         }
     }
 
@@ -4436,5 +4440,760 @@ mod tests {
             assert_eq!(refusal, want as i32, "cell ({trust_on}, {content_on})");
             assert_eq!(echo, want_echo, "echo at cell ({trust_on}, {content_on})");
         }
+    }
+
+    // ── live_047/R-C WO-R7-2B: the path-fold law witnesses (F > 1) ────
+
+    /// Per-path-gated multi-path upstream: like [`spawn_gated_upstream`]
+    /// but each path's NAR route awaits its OWN gate (one `notify_one`
+    /// per request), so a test controls the COMPLETION ORDER of
+    /// concurrent in-flight paths exactly.
+    async fn spawn_pathgated_upstream(
+        paths: Vec<(String, Vec<u8>, Vec<String>)>,
+        key_name: &str,
+    ) -> (
+        FakeUpstream,
+        std::collections::HashMap<String, std::sync::Arc<tokio::sync::Notify>>,
+    ) {
+        use axum::{Router, routing::get};
+        use base64::Engine;
+        use sha2::Digest;
+
+        let seed = [0x44u8; 32];
+        let signer = Signer::from_seed(key_name, &seed);
+        let pubkey = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
+        let trusted_key = format!(
+            "{key_name}:{}",
+            base64::engine::general_purpose::STANDARD.encode(pubkey.as_bytes())
+        );
+        let mut gates: std::collections::HashMap<String, std::sync::Arc<tokio::sync::Notify>> =
+            std::collections::HashMap::new();
+
+        let mut app = Router::new().route(
+            "/nix-cache-info",
+            get(|| async { "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n" }),
+        );
+        for (path, nar, refs) in paths {
+            let nar_hash: [u8; 32] = sha2::Sha256::digest(&nar).into();
+            let nar_hash_str = format!(
+                "sha256:{}",
+                rio_nix::store_path::nixbase32::encode(&nar_hash)
+            );
+            let fp = fingerprint(&path, &nar_hash, nar.len() as u64, &refs);
+            let sig = signer.sign(&fp);
+            let sp = StorePath::parse(&path).unwrap();
+            let hash_part = sp.hash_part();
+            let ref_basenames: Vec<&str> = refs
+                .iter()
+                .map(|r| r.strip_prefix("/nix/store/").unwrap_or(r))
+                .collect();
+            let narinfo = format!(
+                "StorePath: {path}\n\
+                 URL: nar/{hash_part}.nar\n\
+                 Compression: none\n\
+                 NarHash: {nar_hash_str}\n\
+                 NarSize: {}\n\
+                 References: {}\n\
+                 Sig: {sig}\n",
+                nar.len(),
+                ref_basenames.join(" ")
+            );
+            let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+            gates.insert(path.clone(), std::sync::Arc::clone(&gate));
+            app = app
+                .route(
+                    &format!("/{hash_part}.narinfo"),
+                    get(move || async move { narinfo }),
+                )
+                .route(
+                    &format!("/nar/{hash_part}.nar"),
+                    get(move || async move {
+                        gate.notified().await;
+                        nar
+                    }),
+                );
+        }
+
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (
+            FakeUpstream {
+                url: format!("http://{addr}"),
+                trusted_key,
+                _task: task,
+            },
+            gates,
+        )
+    }
+
+    /// W-1c/W-6a fixture: ONE upstream serving path A (narinfo +
+    /// gated NAR with a hit signal — the mid-stream cancellation
+    /// victim) and path B whose narinfo route awaits `b_gate` and then
+    /// answers 429 ONCE (the deterministically-sequenced transient),
+    /// serving B normally afterwards (the reclaim phase).
+    async fn spawn_mixed_upstream(
+        a: (String, Vec<u8>),
+        b: (String, Vec<u8>),
+        key_name: &str,
+    ) -> (
+        FakeUpstream,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::{Router, routing::get};
+        use base64::Engine;
+        use sha2::Digest;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let seed = [0x45u8; 32];
+        let signer = Signer::from_seed(key_name, &seed);
+        let pubkey = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
+        let trusted_key = format!(
+            "{key_name}:{}",
+            base64::engine::general_purpose::STANDARD.encode(pubkey.as_bytes())
+        );
+        let (hit_tx, hit_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let a_release = Arc::new(tokio::sync::Notify::new());
+        let b_gate = Arc::new(tokio::sync::Notify::new());
+
+        let narinfo_for = |path: &str, nar: &[u8]| {
+            let nar_hash: [u8; 32] = sha2::Sha256::digest(nar).into();
+            let nar_hash_str = format!(
+                "sha256:{}",
+                rio_nix::store_path::nixbase32::encode(&nar_hash)
+            );
+            let fp = fingerprint(path, &nar_hash, nar.len() as u64, &[]);
+            let sig = signer.sign(&fp);
+            format!(
+                "StorePath: {path}\n\
+                 URL: nar/{}.nar\n\
+                 Compression: none\n\
+                 NarHash: {nar_hash_str}\n\
+                 NarSize: {}\n\
+                 References: \n\
+                 Sig: {sig}\n",
+                StorePath::parse(path).unwrap().hash_part(),
+                nar.len()
+            )
+        };
+
+        let (a_path, a_nar) = a;
+        let (b_path, b_nar) = b;
+        let a_hash = StorePath::parse(&a_path).unwrap().hash_part().to_string();
+        let b_hash = StorePath::parse(&b_path).unwrap().hash_part().to_string();
+        let a_ni = narinfo_for(&a_path, &a_nar);
+        let b_ni = narinfo_for(&b_path, &b_nar);
+        let b_429_pending = Arc::new(AtomicBool::new(true));
+
+        let a_rel = Arc::clone(&a_release);
+        let bg = Arc::clone(&b_gate);
+        let bp = Arc::clone(&b_429_pending);
+        let app = Router::new()
+            .route(
+                "/nix-cache-info",
+                get(|| async { "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n" }),
+            )
+            .route(
+                &format!("/{a_hash}.narinfo"),
+                get(move || async move { a_ni }),
+            )
+            .route(
+                &format!("/nar/{a_hash}.nar"),
+                get(move || async move {
+                    let _ = hit_tx.send(());
+                    a_rel.notified().await;
+                    a_nar
+                }),
+            )
+            .route(
+                &format!("/{b_hash}.narinfo"),
+                get(move || async move {
+                    if bp.swap(false, Ordering::SeqCst) {
+                        // The sequenced transient: held until the test
+                        // confirms A is mid-stream, then a bare 429.
+                        bg.notified().await;
+                        return (StatusCode::TOO_MANY_REQUESTS, String::new()).into_response();
+                    }
+                    b_ni.into_response()
+                }),
+            )
+            .route(
+                &format!("/nar/{b_hash}.nar"),
+                get(move || async move { b_nar }),
+            );
+
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (
+            FakeUpstream {
+                url: format!("http://{addr}"),
+                trusted_key,
+                _task: task,
+            },
+            hit_rx,
+            a_release,
+            b_gate,
+        )
+    }
+
+    proptest::proptest! {
+        // r[verify store.materialize.path-fold]
+        /// W-1a (fold-level permutation invariance): the backlog tier
+        /// fold over an arbitrary completed abort-evidence multiset is
+        /// input-order invariant, INCLUDING the within-tier merge — and
+        /// the law is re-derived independently: charge dominates
+        /// transient (the kernel tier table); the wire representative
+        /// is the lexicographically-first path of the winning tier
+        /// (never first-dequeued); the transient tier carries the MAX
+        /// retry_after across completed transient abort-grades.
+        #[test]
+        fn fold_abort_evidence_is_input_order_invariant(
+            evidence in proptest::collection::vec(
+                (0usize..5, proptest::bool::ANY, proptest::option::of(0u64..400)),
+                1..6,
+            ),
+            rot in 0usize..6,
+        ) {
+            let mk = |v: &[(usize, bool, Option<u64>)]| -> Vec<AbortEvidence> {
+                v.iter()
+                    .map(|(p, charge, ra)| AbortEvidence {
+                        path: format!("/nix/store/{p:032}-x"),
+                        grade: if *charge {
+                            AbortDisposition::Charge { detail: format!("charge {p}") }
+                        } else {
+                            AbortDisposition::Transient {
+                                class: "rate_limited",
+                                detail: format!("transient {p}"),
+                                retry_after: ra.map(Duration::from_secs),
+                            }
+                        },
+                    })
+                    .collect()
+            };
+            let base = mk(&evidence);
+            let mut rotated = evidence.clone();
+            let len = evidence.len();
+            rotated.rotate_left(rot % len);
+            let alt = mk(&rotated);
+            let a = fold_abort_evidence(&base);
+            let b = fold_abort_evidence(&alt);
+            proptest::prop_assert_eq!(&a, &b, "fold must be input-order invariant");
+
+            let any_charge = evidence.iter().any(|(_, c, _)| *c);
+            match a.outcome.as_ref().unwrap() {
+                materialization_outcome::Outcome::InfraFailure(f) => {
+                    proptest::prop_assert!(any_charge, "InfraFailure without charge evidence");
+                    let rep = evidence
+                        .iter()
+                        .filter(|(_, c, _)| *c)
+                        .map(|(p, _, _)| *p)
+                        .min()
+                        .unwrap();
+                    proptest::prop_assert!(
+                        f.detail.contains(&format!("charge {rep}")),
+                        "representative must be the lexicographically-first charge path; got {}",
+                        f.detail
+                    );
+                }
+                materialization_outcome::Outcome::RetryLater(r) => {
+                    proptest::prop_assert!(!any_charge, "charge must dominate transient");
+                    let rep = evidence.iter().map(|(p, _, _)| *p).min().unwrap();
+                    proptest::prop_assert!(
+                        r.detail.contains(&format!("transient {rep}")),
+                        "representative must be the lexicographically-first transient path; got {}",
+                        r.detail
+                    );
+                    let max_ra = evidence.iter().filter_map(|(_, _, ra)| *ra).max().unwrap_or(0);
+                    proptest::prop_assert_eq!(
+                        r.retry_after_secs, max_ra,
+                        "the transient tier carries the MAX retry_after"
+                    );
+                }
+                other => proptest::prop_assert!(false, "unexpected outcome class {other:?}"),
+            }
+        }
+    }
+
+    // r[verify store.materialize.path-fold]
+    /// W-2(a) window bound: concurrent in-flight path resolutions
+    /// never exceed F. Six cold wanted paths, all NAR fetches gated,
+    /// F = 4: exactly four fetches reach the upstream (high-water ==
+    /// F) and the fifth does NOT start until a slot frees. E-4 rides
+    /// the same harness: the walk then completes with ALL six served.
+    #[tokio::test]
+    async fn window_bounds_inflight_paths_at_fanout() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "mat-w2").await;
+
+        let paths: Vec<String> = (0..6).map(|i| store_path(10 + i, "w2-path")).collect();
+        let (nar, _) = rio_test_support::fixtures::make_nar(b"w2 contents");
+        let served: Vec<(String, Vec<u8>, Vec<String>)> = paths
+            .iter()
+            .map(|p| (p.clone(), nar.clone(), vec![]))
+            .collect();
+        let (upstream, mut hit_rx, release) = spawn_gated_upstream(served, "cache.w2").await;
+        wire_upstream(&db.pool, tenant, &upstream).await;
+
+        let outputs: Vec<(String, &str)> = paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (format!("o{i}"), p.as_str()))
+            .collect();
+        let outputs_ref: Vec<(&str, &str)> =
+            outputs.iter().map(|(n, p)| (n.as_str(), *p)).collect();
+        let seeded = seed_job(
+            &db.pool,
+            "mat-w2-drv",
+            &outputs_ref,
+            Some(tenant),
+            Some(tenant),
+            &[],
+        )
+        .await;
+
+        let ctx = make_ctx(db.pool.clone()); // F = 4
+        let job = tokio::spawn({
+            let claimed = seeded.claimed.clone();
+            async move { execute_job(&ctx, &claimed).await.into_outcome() }
+        });
+
+        // Exactly F fetches start.
+        let mut hits = 0usize;
+        while hits < 4 {
+            tokio::time::timeout(Duration::from_secs(10), hit_rx.recv())
+                .await
+                .expect("first four fetches must start")
+                .expect("hit channel open");
+            hits += 1;
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            hit_rx.try_recv().is_err(),
+            "a fifth path resolution started with the window at F=4 \
+             (window bound violated)"
+        );
+
+        // Release until the walk completes; count the late spawns.
+        let releaser = tokio::spawn({
+            let release = std::sync::Arc::clone(&release);
+            async move {
+                loop {
+                    release.notify_one();
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+        });
+        let outcome = tokio::time::timeout(Duration::from_secs(30), job)
+            .await
+            .expect("walk must complete once gates release")
+            .unwrap();
+        releaser.abort();
+        while hit_rx.try_recv().is_ok() {
+            hits += 1;
+        }
+        assert_eq!(hits, 6, "every path fetched exactly once");
+        let success = outcome_success(&outcome)
+            .unwrap_or_else(|| panic!("expected Success, got {outcome:?}"));
+        assert_eq!(
+            success.ingested_paths.len() + success.verified_paths.len(),
+            6,
+            "all six paths covered"
+        );
+    }
+
+    // r[verify store.materialize.path-fold]
+    // r[verify store.materialize.progress-monotone+1]
+    /// W-1b (same-multiset schedules) + W-5 (floor law under reorder,
+    /// both clauses): two jobs with byte-identical 3-path multisets
+    /// complete under DIFFERENT schedules (completion order 2,3,1 vs
+    /// 1,2,3 — driven by per-path gates). Both fold to the same
+    /// outcome class with the full covered set; the committed floor
+    /// equals the sum of served sizes under EITHER order (i); and the
+    /// OBSERVED emission trace — through the real driver-routed
+    /// adapter, ≥2 concurrent emitters with interleaved commits —
+    /// never steps below the committed floor at any point (ii).
+    #[tokio::test]
+    async fn completion_order_is_walk_invisible_and_floor_holds() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "mat-w5").await;
+
+        // Distinct sizes, each > the 16 KiB test progress interval so
+        // provisional ticks flow during the fetch.
+        let contents: [Vec<u8>; 3] = [vec![1u8; 20_000], vec![2u8; 28_000], vec![3u8; 36_000]];
+        let mut expected_sum = 0u64;
+
+        for (run, order) in [(0usize, [1usize, 2, 0]), (1usize, [0, 1, 2])] {
+            let paths: Vec<String> = (0..3)
+                .map(|i| store_path(20 + (run * 3 + i) as u8, "w5-path"))
+                .collect();
+            let nars: Vec<Vec<u8>> = contents
+                .iter()
+                .map(|c| rio_test_support::fixtures::make_nar(c).0)
+                .collect();
+            expected_sum = nars.iter().map(|n| n.len() as u64).sum();
+            let served: Vec<(String, Vec<u8>, Vec<String>)> = paths
+                .iter()
+                .zip(nars.iter())
+                .map(|(p, n)| (p.clone(), n.clone(), vec![]))
+                .collect();
+            let (upstream, gates) =
+                spawn_pathgated_upstream(served, &format!("cache.w5-{run}")).await;
+            wire_upstream(&db.pool, tenant, &upstream).await;
+
+            let outputs: Vec<(String, &str)> = paths
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (format!("o{i}"), p.as_str()))
+                .collect();
+            let outputs_ref: Vec<(&str, &str)> =
+                outputs.iter().map(|(n, p)| (n.as_str(), *p)).collect();
+            let seeded = seed_job(
+                &db.pool,
+                &format!("mat-w5-drv-{run}"),
+                &outputs_ref,
+                Some(tenant),
+                Some(tenant),
+                &[],
+            )
+            .await;
+
+            let events: std::sync::Arc<std::sync::Mutex<Vec<(u64, u64, String)>>> =
+                std::sync::Arc::default();
+            let sink = std::sync::Arc::clone(&events);
+            let ctx = make_ctx(db.pool.clone()); // F = 4: all three in flight
+            let job = tokio::spawn({
+                let claimed = seeded.claimed.clone();
+                async move {
+                    execute_job_with_progress(&ctx, &claimed, move |d, e, u| {
+                        sink.lock().unwrap().push((d, e, u.to_string()));
+                    })
+                    .await
+                    .into_outcome()
+                }
+            });
+
+            // Release in the schedule's order, pacing on the commit
+            // ticks so completion order is the schedule's order. The
+            // first two releases land close together so two fetches
+            // stream concurrently (interleaved emitters for (ii)).
+            let committed =
+                |evs: &[(u64, u64, String)]| evs.iter().filter(|(_, _, u)| u.is_empty()).count();
+            for (k, &idx) in order.iter().enumerate() {
+                // Keep the released fetch streaming while the next
+                // release lands (concurrent emitters), but pace the
+                // ORDER by waiting for the previous commit.
+                if k > 0 {
+                    let want = k;
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+                    while committed(&events.lock().unwrap()) < want {
+                        assert!(
+                            tokio::time::Instant::now() < deadline,
+                            "commit {want} never landed"
+                        );
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+                let release = std::sync::Arc::clone(&gates[&paths[idx]]);
+                // Paced re-notify until the fetch consumes the gate.
+                tokio::spawn(async move {
+                    for _ in 0..200 {
+                        release.notify_one();
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                });
+            }
+
+            let outcome = tokio::time::timeout(Duration::from_secs(30), job)
+                .await
+                .expect("walk must complete")
+                .unwrap();
+            let success = outcome_success(&outcome)
+                .unwrap_or_else(|| panic!("run {run}: expected Success, got {outcome:?}"));
+            let mut covered: Vec<String> = success
+                .ingested_paths
+                .iter()
+                .chain(success.verified_paths.iter())
+                .cloned()
+                .collect();
+            covered.sort();
+            let mut want = paths.clone();
+            want.sort();
+            assert_eq!(covered, want, "run {run}: full covered set");
+
+            let evs = events.lock().unwrap().clone();
+            // (i) the committed floor equals the sum of served sizes
+            // regardless of completion order: the LAST commit is the
+            // job total.
+            let last_commit = evs
+                .iter()
+                .rfind(|(_, _, u)| u.is_empty())
+                .expect("at least one commit");
+            assert_eq!(
+                (last_commit.0, last_commit.1),
+                (expected_sum, expected_sum),
+                "run {run}: final floor == sum of served nar sizes"
+            );
+            // (ii) the OBSERVED trace never steps below the committed
+            // floor at any point (commits are the uri=="" events; the
+            // floor at each event is the max committed before it).
+            let mut floor = 0u64;
+            for (i, (d, e, u)) in evs.iter().enumerate() {
+                assert!(
+                    *d >= floor,
+                    "run {run}: event {i} done {d} below committed floor {floor} \
+                     (trace: {evs:?})"
+                );
+                assert!(*d <= *e, "run {run}: event {i} done {d} > expected {e}");
+                if u.is_empty() {
+                    floor = floor.max(*d);
+                }
+            }
+        }
+        assert!(expected_sum > 0, "fixture sanity");
+    }
+
+    // r[verify store.materialize.path-fold]
+    /// W-1c (abort-first lawfulness) + W-6a (cancellation safety +
+    /// reclaim): path A is mid-NAR-stream when sibling B completes
+    /// with a sequenced transient (bare 429). The abort latch cancels
+    /// A; the outcome is the lawful fold of the ACTUALLY-completed
+    /// subset — RetryLater{class=rate_limited}, never a charge for
+    /// the cancelled sibling; A contributes ZERO cells and ZERO floor
+    /// trace (no commit event); A's placeholder is reaped by the
+    /// drop-guard and the NEXT attempt recovers both paths end-to-end.
+    #[tokio::test]
+    async fn abort_latch_cancels_siblings_lawfully_and_next_attempt_recovers() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "mat-w6a").await;
+
+        let a_path = store_path(30, "w6a-cancelled");
+        let b_path = store_path(31, "w6a-transient");
+        let (a_nar, _) = rio_test_support::fixtures::make_nar(&vec![7u8; 40_000]);
+        let (b_nar, _) = rio_test_support::fixtures::make_nar(b"w6a-b");
+        let (upstream, mut a_hit, a_release, b_gate) = spawn_mixed_upstream(
+            (a_path.clone(), a_nar.clone()),
+            (b_path.clone(), b_nar.clone()),
+            "cache.w6a",
+        )
+        .await;
+        wire_upstream(&db.pool, tenant, &upstream).await;
+
+        let seeded = seed_job(
+            &db.pool,
+            "mat-w6a-drv",
+            &[("a", a_path.as_str()), ("b", b_path.as_str())],
+            Some(tenant),
+            Some(tenant),
+            &[],
+        )
+        .await;
+
+        let events: std::sync::Arc<std::sync::Mutex<Vec<(u64, u64, String)>>> =
+            std::sync::Arc::default();
+        let sink = std::sync::Arc::clone(&events);
+        let ctx = make_ctx(db.pool.clone());
+        let job = tokio::spawn({
+            let claimed = seeded.claimed.clone();
+            async move {
+                execute_job_with_progress(&ctx, &claimed, move |d, e, u| {
+                    sink.lock().unwrap().push((d, e, u.to_string()));
+                })
+                .await
+                .into_outcome()
+            }
+        });
+
+        // A is mid-stream (claimed, GET sent, body gated)...
+        tokio::time::timeout(Duration::from_secs(10), a_hit.recv())
+            .await
+            .expect("A must reach its NAR fetch")
+            .expect("hit channel open");
+        // ...now release B's sequenced 429: the abort latch fires
+        // while A is in flight.
+        b_gate.notify_one();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(15), job)
+            .await
+            .expect("latch must cancel A, not wait for it")
+            .unwrap();
+        match outcome.outcome.as_ref().unwrap() {
+            materialization_outcome::Outcome::RetryLater(r) => {
+                assert_eq!(
+                    r.class, "rate_limited",
+                    "the transient's class rides the wire"
+                );
+            }
+            other => panic!(
+                "abort-first fold must be the lawful fold of the completed \
+                 subset (RetryLater), got {other:?}"
+            ),
+        }
+        // The cancelled sibling left no floor trace: zero commits.
+        assert!(
+            events.lock().unwrap().iter().all(|(_, _, u)| !u.is_empty()),
+            "a cancelled path's streamed bytes must never commit; events={:?}",
+            events.lock().unwrap()
+        );
+        assert_eq!(
+            pin_count(&db.pool, "mat-w6a-drv", "materialization").await,
+            0,
+            "no path served, no pin"
+        );
+
+        // W-6a reclaim: the drop-guard reaps A's placeholder...
+        let a_hash = StorePath::parse(&a_path).unwrap().sha256_digest();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let age = metadata::manifest_uploading_age(&db.pool, &a_hash)
+                .await
+                .unwrap();
+            if age.is_none() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "cancelled sibling's placeholder never reaped"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // ...and the next attempt recovers BOTH paths (B's 429 was
+        // once-only; A's gate is re-notified until consumed).
+        let releaser = tokio::spawn(async move {
+            loop {
+                a_release.notify_one();
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        });
+        let ctx2 = make_ctx(db.pool.clone());
+        let outcome2 =
+            tokio::time::timeout(Duration::from_secs(30), execute_job(&ctx2, &seeded.claimed))
+                .await
+                .expect("second attempt must complete")
+                .into_outcome();
+        releaser.abort();
+        let success = outcome_success(&outcome2)
+            .unwrap_or_else(|| panic!("second attempt: expected Success, got {outcome2:?}"));
+        assert_eq!(
+            success.ingested_paths.len() + success.verified_paths.len(),
+            2,
+            "both paths recovered after the cancelled attempt"
+        );
+        assert_eq!(
+            pin_count(&db.pool, "mat-w6a-drv", "materialization").await,
+            2,
+            "pin-at-ingest on the recovery attempt"
+        );
+    }
+
+    // r[verify store.materialize.path-fold]
+    /// W-6b (the moka retry leg — GATES the F>1 cancellation policy):
+    /// cancel a singleflight LEADER mid-NAR-fetch while a coalesced
+    /// second caller awaits the same `(tenant, path)`. moka 0.12.15
+    /// does NOT adopt the dropped leader's init future — the waiter
+    /// RETRIES with its OWN init future. The survivor must complete
+    /// `Ok` through that retry; a transient `Raced` (the dropped
+    /// leader's placeholder, pre-reap) is lawful and resolves on
+    /// re-call; a stranded or otherwise-erroring waiter is not.
+    #[tokio::test]
+    async fn cancelled_leader_recovers_coalesced_waiter_by_retry() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "mat-w6b").await;
+        let path = store_path(33, "w6b-path");
+        let (nar, _) = rio_test_support::fixtures::make_nar(b"w6b contents");
+        let (upstream, mut hit_rx, release) =
+            spawn_gated_upstream(vec![(path.clone(), nar.clone(), vec![])], "cache.w6b").await;
+        wire_upstream(&db.pool, tenant, &upstream).await;
+
+        let sub = std::sync::Arc::new(
+            Substituter::new(db.pool.clone(), None).with_http_client(sandbox_http()),
+        );
+        let leader = tokio::spawn({
+            let s = std::sync::Arc::clone(&sub);
+            let p = path.clone();
+            async move { s.try_substitute(tenant, &p).await }
+        });
+        tokio::time::timeout(Duration::from_secs(10), hit_rx.recv())
+            .await
+            .expect("leader must reach its NAR fetch")
+            .expect("hit channel open");
+        let waiter = tokio::spawn({
+            let s = std::sync::Arc::clone(&sub);
+            let p = path.clone();
+            async move { s.try_substitute(tenant, &p).await }
+        });
+        // Let the waiter coalesce on the moka key, then cancel the
+        // leader mid-fetch.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        leader.abort();
+        let _ = leader.await;
+
+        // The retry's own fetch awaits the same gate: keep releasing.
+        let releaser = tokio::spawn(async move {
+            loop {
+                release.notify_one();
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        });
+        // The waiter must RESOLVE (never strand): Ok directly, or a
+        // lawful BOUNDED transient while the drop settles — re-calls
+        // (the executor's re-arm) converge to Ok. Two lawful
+        // transients, both observed and both UNCACHED (the
+        // merged_bug_044 law held throughout — an error here must
+        // never become a 30s-cached definitive miss):
+        // - `Raced`: the dropped leader's placeholder pre-reap;
+        // - `Fetch` (all-errored fold): the cancelled leader's
+        //   mid-body drop poisons the SHARED reqwest pooled
+        //   connection, and the survivor's retry can hit the dead
+        //   connection once (recorded WO-R7-2B finding: a spurious
+        //   once-off charge-class error is possible on the retry
+        //   leg; bounded, uncached, self-healing — disclosed in the
+        //   wave-log rather than deferring cancellation).
+        let first = tokio::time::timeout(Duration::from_secs(15), waiter)
+            .await
+            .expect("coalesced waiter must never strand after leader drop")
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let mut latest = first;
+        let got = loop {
+            match latest {
+                Ok(Some(info)) => break info,
+                Ok(None) => panic!("retry leg must not cache a miss for a servable path"),
+                Err(
+                    e @ (crate::substitute::SubstituteError::Raced
+                    | crate::substitute::SubstituteError::Fetch(_)),
+                ) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "transient window never cleared (guard reap missing?); last: {e:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    latest = sub.try_substitute(tenant, &path).await;
+                }
+                Err(other) => panic!(
+                    "survivor must recover via its own retried init future; \
+                     got unlawful error {other:?}"
+                ),
+            }
+        };
+        releaser.abort();
+        assert_eq!(
+            got.nar_size,
+            nar.len() as u64,
+            "the survivor served the real path"
+        );
     }
 }
