@@ -229,13 +229,13 @@ pub const REBOUND_ORIGIN: &str = "resume_rebound";
 /// window — the SIGNED residual (rule-4b): real crashes still pay,
 /// lost responses no longer do.
 ///
-/// bug_034 — an entry plays TWO distinct roles, split as
-/// [`SlotStanding`]: the rule-4b recovery CREDENTIAL (which every
+/// bug_034 — an entry plays TWO distinct roles, split as the private
+/// `SlotStanding`: the rule-4b recovery CREDENTIAL (which every
 /// live entry is, until authoritatively answered) and the claim-slot
 /// CHARGE (which only an UNANSWERED entry holds — the scheduler may
 /// have minted an attempt bound to this worker). The pass budget
-/// derives from [`Self::charged_len`] alone; [`Self::len`] keeps the
-/// cap/diagnostic semantics ([`RESUME_LEDGER_CAP`] counts ENTRIES —
+/// derives from the private `charged_len` alone; [`Self::len`] keeps
+/// the cap/diagnostic semantics (`RESUME_LEDGER_CAP` counts ENTRIES —
 /// credential survival is unweakened by the split).
 #[derive(Default)]
 pub struct ResumeLedger {
