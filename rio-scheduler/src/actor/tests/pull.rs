@@ -2542,3 +2542,71 @@ async fn report_ack_attempt_resolved_per_arm_census() -> TestResult {
     );
     Ok(())
 }
+
+// r[verify sched.executor.pull-payload]
+/// bug_027 red: the `last_intent` stamp carries the RECONCILED
+/// dispatch shape — `max(resolved, carried)` — not the raw mint-time
+/// solve. The pod runs under the CARRIED `BoundIntent` deadline (the
+/// same solve `activeDeadlineSeconds` was rendered from; bug_106), so
+/// a stamp of the smaller mint value undersizes the D4 doubling base:
+/// on refit-down, DeadlineExceeded at the carried limit doubles from
+/// the mint value and the new floor can land at (or below) the
+/// deadline that provably failed. Witness strength: the live_040 red
+/// above certifies the stamp EXISTS; THIS red certifies the
+/// reconciliation claim itself (stamp == the dispatched shape).
+/// Pre-fix, verbatim: stamp == the raw solve (3600, the cold-pname
+/// probe default); post-fix: stamp == 7200 (the carried deadline,
+/// lifted).
+///
+/// World built through production constructors only: the binding
+/// rides the production `AckSpawnedIntents` snapshot arm; the mint is
+/// the real pull.
+#[tokio::test]
+async fn refit_down_stamp_carries_the_dispatched_deadline() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+    let _ev = merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "refit-stamp",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+
+    // Controller binding snapshot: the pod was rendered at 7200s —
+    // ABOVE the cold-pname solve (probe default 3600; asserted below
+    // so a config drift fails loudly instead of vacuously passing).
+    handle
+        .send_unchecked(ActorCommand::AckSpawnedIntents {
+            reply: tokio::sync::oneshot::channel().0,
+            spawned: vec![],
+            unfulfillable_cells: vec![],
+            registered_cells: vec![],
+            observed_instance_types: vec![],
+            bound_intents: vec![],
+            binding_snapshot: Some(vec![rio_proto::types::BoundIntent {
+                intent_id: "refit-stamp".into(),
+                node_name: "node-7".into(),
+                deadline_secs: 7200,
+            }]),
+        })
+        .await?;
+    barrier(&handle).await;
+
+    let _assignment = expect_deliver(pull(&handle, "refit-stamp", Some("refit-stamp")).await);
+    let info = expect_drv(&handle, "refit-stamp").await;
+    let stamped = info
+        .sched
+        .last_intent
+        .as_ref()
+        .expect("the mint stamps the dispatch shape (live_040)");
+    // Self-diagnosing either way: if the cold solve ever resolves ≥
+    // 7200 the lifted stamp exceeds 7200 and this fails loudly instead
+    // of passing vacuously.
+    assert_eq!(
+        stamped.deadline_secs, 7200,
+        "the stamp must carry the DISPATCHED deadline — max(resolved, \
+         carried) — not the raw mint solve (pre-fix: 3600, the probe \
+         default; the pod ran under 7200)"
+    );
+    Ok(())
+}

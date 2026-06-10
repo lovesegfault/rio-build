@@ -4759,3 +4759,90 @@ async fn store_degraded_counter_ticks_only_on_commit() -> TestResult {
     );
     Ok(())
 }
+
+// r[verify sched.sla.reactive-floor+4]
+/// bug_027 companion red — the carried-at-ceiling cell of `bump_dim`'s
+/// at_cap law: when the pod was DISPATCHED at the deadline cap (the
+/// carried `BoundIntent` rendered 86400s) and the mint-time solve
+/// resolved below it, a DeadlineExceeded must take the COUNTED at-cap
+/// arm (`at_cap=true`, floor catches up to the cap, the retry budget
+/// bounds it) — not the promotion-exempt path doubling from the
+/// smaller mint value (an UNCOUNTED guaranteed-futile full-length
+/// retry at a limit that provably failed; the exact uncounted
+/// at-ceiling burn the base-not-floor fix existed to kill).
+/// floor.rs/bump_dim is UNTOUCHED — the law's INPUT becomes honest
+/// (the stamp carries the reconciled shape), and the hole closes
+/// through the stamp alone. Pre-fix, verbatim: floor doubled to 7200
+/// with `floor_promoted=true ∧ floor_at_cap=false` (exempt); post-fix:
+/// floor == DEADLINE_CAP_SECS with `floor_at_cap=true ∧
+/// floor_promoted=false` (counted).
+#[tokio::test]
+async fn carried_at_cap_deadline_exceeded_is_counted_not_exempt() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
+    let drv_hash = "atcap-carried";
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+
+    // The controller rendered the pod at the 24h deadline cap.
+    handle
+        .send_unchecked(ActorCommand::AckSpawnedIntents {
+            reply: tokio::sync::oneshot::channel().0,
+            spawned: vec![],
+            unfulfillable_cells: vec![],
+            registered_cells: vec![],
+            observed_instance_types: vec![],
+            bound_intents: vec![],
+            binding_snapshot: Some(vec![rio_proto::types::BoundIntent {
+                intent_id: drv_hash.into(),
+                node_name: "node-7".into(),
+                deadline_secs: crate::actor::floor::DEADLINE_CAP_SECS,
+            }]),
+        })
+        .await?;
+    barrier(&handle).await;
+
+    let exec = open_pull_exec(&handle, drv_hash).await;
+    let stamped = expect_drv(&handle, drv_hash)
+        .await
+        .sched
+        .last_intent
+        .as_ref()
+        .expect("the mint stamps the dispatch shape")
+        .deadline_secs;
+    pull_report_exec(
+        &handle,
+        exec,
+        drv_hash,
+        pull_payload(rio_proto::types::BuildResult {
+            status: rio_proto::types::BuildResultStatus::TimedOut.into(),
+            error_msg: "build exceeded activeDeadlineSeconds at the cap".into(),
+            ..Default::default()
+        }),
+    )
+    .await?;
+
+    let info = expect_drv(&handle, drv_hash).await;
+    assert_eq!(
+        info.sched.resource_floor.deadline_secs,
+        crate::actor::floor::DEADLINE_CAP_SECS,
+        "dispatched at the cap ⇒ no growth possible ⇒ the floor catches \
+         up to the cap (pre-fix: doubled from the {stamped}s mint value \
+         to a floor still at/below the limit that provably failed)"
+    );
+    let rows = ledger_rows(&db.pool, drv_hash).await;
+    let row = rows.last().expect("the TimedOut attempt row");
+    assert!(
+        row.floor_at_cap && !row.floor_promoted,
+        "the carried-at-ceiling DeadlineExceeded must charge the COUNTED \
+         at-cap arm, not ride promotion-exempt (got promoted={} at_cap={})",
+        row.floor_promoted,
+        row.floor_at_cap
+    );
+    assert_eq!(
+        info.retry.timeout_count, 1,
+        "the counted charge is what bounds the at-cap case"
+    );
+    Ok(())
+}

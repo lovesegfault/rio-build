@@ -145,6 +145,87 @@ pub enum AttemptResolution {
     Unresolved,
 }
 
+/// The ONE derivation of "the shape this attempt is dispatched under"
+/// (bug_027): the mint-time solve reconciled with the CARRIED
+/// `BoundIntent` deadline (the pod runs under the carried rendered
+/// shape — bug_106), consumed by BOTH the persisted establishment
+/// anchor and the `last_intent` stamp. Two ad-hoc derivations of this
+/// fact in one function guaranteed sibling drift: the anchor lifted
+/// `max(resolved, carried)` while the stamp wrote the raw solve, so
+/// the D4 doubling base undersized on refit-down — the new floor could
+/// land at (or below) the deadline that provably failed, with
+/// `promoted=true` riding the promotion-exempt lane (an uncounted
+/// guaranteed-futile full-length retry) — and `bump_dim`'s at_cap test
+/// had the symmetric carried-at-ceiling hole.
+///
+/// `reconcile` is the total match over the `(solve, carried)` presence
+/// product; a future carried sizing dimension lands at THIS seam and
+/// nowhere else. Disclosed residual (priced): the mem/disk axes have
+/// NO carried source on today's wire (`PlannedBinding` carries
+/// `deadline_secs` only) — a refit-down OOM at the spawn-rendered mem
+/// limit still doubles from the mint value and can burn
+/// promotion-exempt futile retries until the doubling ladder passes
+/// the spawn limit (≥1 step; >1 only when spawn > 2× mint, i.e. a
+/// multi-step refit between spawn and pull — seconds-to-minutes in
+/// practice). Extending `BoundIntent` is a proto/wire change owned
+/// elsewhere (recorded in the wave handoff, not here).
+enum DispatchShape {
+    /// A solve exists; its `deadline_secs` is ALREADY lifted to
+    /// `max(resolved, carried)` — the shape actually dispatched.
+    Solved(crate::state::SolvedIntent),
+    /// No solve, but a carried deadline exists. NOT stamped onto
+    /// `last_intent`: a deadline-only `SolvedIntent` would poison the
+    /// sizing triple (cores/mem/disk) with zeros — refused by
+    /// construction; the establishment anchor still consumes the
+    /// deadline.
+    CarriedOnly { deadline_secs: u32 },
+    /// Neither source — and the materialization lane, which sizes
+    /// nothing and runs under its own config deadline.
+    Unsized,
+}
+
+impl DispatchShape {
+    /// Total over the presence product: `(Some, Some)` lifts the
+    /// deadline to the max, `(Some, None)` passes the solve through,
+    /// `(None, Some)` → CarriedOnly, `(None, None)` → Unsized.
+    fn reconcile(
+        solve: Option<crate::state::SolvedIntent>,
+        carried_deadline_secs: Option<u32>,
+    ) -> Self {
+        match (solve, carried_deadline_secs) {
+            (Some(mut s), Some(c)) => {
+                s.deadline_secs = s.deadline_secs.max(c);
+                Self::Solved(s)
+            }
+            (Some(s), None) => Self::Solved(s),
+            (None, Some(c)) => Self::CarriedOnly { deadline_secs: c },
+            (None, None) => Self::Unsized,
+        }
+    }
+
+    /// The establishment-anchor deadline — behavior-identical to the
+    /// previous `max()/or` table (the anchor leg carries no red; the
+    /// existing anchor tests pin it).
+    fn anchor_deadline_secs(&self) -> Option<f64> {
+        match self {
+            Self::Solved(s) => Some(f64::from(s.deadline_secs)),
+            Self::CarriedOnly { deadline_secs } => Some(f64::from(*deadline_secs)),
+            Self::Unsized => None,
+        }
+    }
+
+    /// The `last_intent` stamp: the dispatched shape when a solve
+    /// exists (deadline LIFTED — floor.rs's `base = max(floor, last)`
+    /// law now reads what was actually dispatched), nothing otherwise
+    /// (see [`Self::CarriedOnly`]).
+    fn stamp(self) -> Option<crate::state::SolvedIntent> {
+        match self {
+            Self::Solved(s) => Some(s),
+            Self::CarriedOnly { .. } | Self::Unsized => None,
+        }
+    }
+}
+
 /// Why a `PullAssignment` was refused without an outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PullRejection {
@@ -817,24 +898,39 @@ impl DagActor {
             .path_for_hash(drv_hash)
             .map(rio_nix::store_path::drv_log_hash)
             .unwrap_or_default();
-        // live_040: THE mint-time solve, computed once and consumed by
-        // BOTH the deadline reconciliation (the bug_106 max() below)
-        // and the last_intent stamp after the durable mint commits.
-        // The mint IS the dispatch decision in the pull architecture —
-        // with the stream dispatch pass gone, this is the one writer
-        // feeding every last_intent consumer (D4 floor doubling base,
-        // §13b running-dep ETA, SLA misprediction scoring,
-        // cpu_limit_cores min, the delivered assignment's sizing
-        // triple). Build lane only: a materialization claim runs under
-        // its own deadline and sizes nothing.
-        let minted_solve: Option<crate::state::SolvedIntent> = match kind {
+        // live_040 + bug_027: THE mint-time dispatch shape, derived
+        // ONCE and consumed by BOTH siblings — the persisted
+        // establishment anchor and the last_intent stamp after the
+        // durable mint commits. The mint IS the dispatch decision in
+        // the pull architecture; `DispatchShape::reconcile` lifts the
+        // solve's deadline to max(resolved, carried) because the pod
+        // runs under the CARRIED rendered shape (bug_106) — so the D4
+        // floor doubling base, §13b running-dep ETA, SLA misprediction
+        // scoring, cpu_limit_cores min, and the delivered assignment's
+        // sizing triple all read what was actually dispatched. The
+        // kube-authoritative binding row is read ONCE here (bug_027:
+        // the node and the carried deadline were two ad-hoc lookups of
+        // one fact). Build lane only: a materialization claim runs
+        // under its own deadline and sizes nothing.
+        let bound_node = self
+            .authoritative_binding
+            .get(drv_hash)
+            .map(|b| b.node.clone());
+        let dispatch: DispatchShape = match kind {
             rio_evidence_kernel::pull::PullKind::Build => {
+                let carried_deadline = self
+                    .authoritative_binding
+                    .get(drv_hash)
+                    .and_then(|b| b.deadline_secs);
                 let (hw, cost, inputs_gen) = self.solve_inputs();
-                self.dag
-                    .node(drv_hash)
-                    .map(|state| self.solve_intent_for(state, &hw, &cost, inputs_gen))
+                DispatchShape::reconcile(
+                    self.dag
+                        .node(drv_hash)
+                        .map(|state| self.solve_intent_for(state, &hw, &cost, inputs_gen)),
+                    carried_deadline,
+                )
             }
-            rio_evidence_kernel::pull::PullKind::Materialization => None,
+            rio_evidence_kernel::pull::PullKind::Materialization => DispatchShape::Unsized,
         };
         // THE one kind match (A2.3): every kind-divergent decision of
         // this mint is selected here; the body below consumes profile
@@ -844,40 +940,28 @@ impl DagActor {
         let profile = match kind {
             rio_evidence_kernel::pull::PullKind::Build => MintProfile {
                 attempt_kind: crate::state::AttemptKind::Build,
-                // Controller-authoritative pod→node binding, when known.
-                source_node: self
-                    .authoritative_binding
-                    .get(drv_hash)
-                    .map(|b| b.node.clone()),
+                // Controller-authoritative pod→node binding, when
+                // known (projected from the SAME binding read as the
+                // carried deadline above — one fact, one lookup).
+                source_node: bound_node,
                 // The deadline this attempt is dispatched under,
                 // persisted so the establishment window is anchored to
                 // it and can never shrink below it while the attempt
-                // is open: the max of the CARRIED rendered deadline
-                // (`BoundIntent.deadline_secs` — the same solve
-                // `activeDeadlineSeconds` was rendered from; bug_106)
-                // and the mint-time re-solve (`minted_solve` above).
-                // live_040: that same solve IS stamped onto
-                // `last_intent` once the durable mint commits — the
-                // mint is the dispatch decision, and the stamp is the
-                // ONE writer feeding every last_intent consumer (the
-                // pre-fix "no dispatch-time intent writer" world left
-                // the D4 floor, §13b ETA, SLA scoring, and the
-                // assignment sizing triple permanently dark; the
-                // debug.rs operator seed is a second writer with
-                // documented precedence — the mint overwrites it on
-                // the next pull, the intended freshness law).
-                deadline_secs: {
-                    let resolved = minted_solve.as_ref().map(|i| f64::from(i.deadline_secs));
-                    let carried = self
-                        .authoritative_binding
-                        .get(drv_hash)
-                        .and_then(|b| b.deadline_secs)
-                        .map(f64::from);
-                    match (resolved, carried) {
-                        (Some(r), Some(c)) => Some(r.max(c)),
-                        (r, c) => r.or(c),
-                    }
-                },
+                // is open. bug_027: this is `dispatch`'s OWN deadline
+                // — `DispatchShape::reconcile` already lifted the
+                // solve to max(resolved, carried) (the bug_106 law),
+                // and the SAME reconciled value is stamped onto
+                // `last_intent` once the durable mint commits, so the
+                // anchor and the doubling base can no longer drift
+                // (pre-fix the stamp wrote the raw solve while the
+                // anchor lifted — a refit-down DeadlineExceeded then
+                // doubled from the smaller mint value into an
+                // uncounted futile retry at the limit that provably
+                // failed). The debug.rs operator seed remains a second
+                // writer with documented precedence — the mint
+                // overwrites it on the next pull, the intended
+                // freshness law.
+                deadline_secs: dispatch.anchor_deadline_secs(),
                 clear_ice: true,
                 pin_live_inputs: true,
                 note_claimed: false,
@@ -1015,10 +1099,12 @@ impl DagActor {
             state.retry.backoff_until = None;
             state.assigned_executor = Some(pulling_identity.clone());
             state.exec_id = Some(exec_id);
-            // live_040: stamp the mint-time solve (computed above,
-            // build lane only) — BEFORE build_assignment_proto reads
-            // it for the assignment's sizing triple.
-            if let Some(solve) = minted_solve {
+            // live_040 + bug_027: stamp the RECONCILED dispatch shape
+            // (the same value the establishment anchor consumed, with
+            // the deadline lifted to max(resolved, carried)) — BEFORE
+            // build_assignment_proto reads it for the assignment's
+            // sizing triple. One derivation, two consumers.
+            if let Some(solve) = dispatch.stamp() {
                 state.sched.last_intent = Some(solve);
             }
             // rule-4b: mirror the persisted nonce (cleared in lockstep

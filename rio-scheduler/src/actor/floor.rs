@@ -49,10 +49,14 @@ pub struct FloorOutcome {
 /// poison at the same attempt number.
 ///
 /// The doubling base is `state.sched.last_intent` — stamped by the
-/// pull mint (live_040: the mint is the dispatch decision). The
-/// `max(floor, last)` form means a stale floor (lower than what was
-/// actually minted) doesn't under-double; if both are zero (cold
-/// start, never minted), the helper returns
+/// pull mint (live_040: the mint is the dispatch decision) with the
+/// RECONCILED dispatch shape (bug_027: `DispatchShape::reconcile`
+/// lifts the solve's deadline to `max(resolved, carried)`, so `last`
+/// is what the pod actually ran under — a carried deadline at the cap
+/// reads as `base ≥ cap` and takes the counted at-cap arm instead of
+/// an exempt under-double). The `max(floor, last)` form means a stale
+/// floor (lower than what was actually minted) doesn't under-double;
+/// if both are zero (cold start, never minted), the helper returns
 /// `{promoted:false, at_cap:false}` — the caller's unconditional
 /// post-check increment bounds this (I-200).
 pub fn bump_floor_or_count(
