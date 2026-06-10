@@ -1357,13 +1357,73 @@ impl AdminService for AdminServiceImpl {
         // layer. Count it and disclose the key so a sustained rate is
         // diagnosable; the RPC stays Ok (the controller's
         // Ok→delivered mapping is sound under the typed uid format).
+        //
+        // bug_022 / WO-S5-3: the absorb edge can additionally observe
+        // exactly the VALUE-DISTINCT stamp collisions (the
+        // intra-deployment cluster-skew class: the colliding uid was
+        // committed under one cluster stamp while THIS writer stamps
+        // another — reachable only when fragment 39's single-source
+        // law is broken in at least one deployment), so the winner's
+        // stamp is SELECTed and a mismatch warns loudly. BLIND SPOT,
+        // pinned not hidden: an empty-vs-empty CROSS-DEPLOYMENT
+        // absorption is row-indistinguishable from designed
+        // same-cluster dedup here (uid equality entails equal
+        // minting-controller cluster values, and the winner's stamp
+        // equals this writer's own `self.cluster`) — no sink-side
+        // detector can see it; that canonical bug_022 shape's covers
+        // are the helm `rio.clusterIdentity` render gate and the
+        // informer activation warn
+        // (`ctrl.informer.cluster-identity-boundary`). LOG-LEVEL
+        // only: the counter, its labels, and its HELP are untouched.
         if result.rows_affected() == 0 {
-            tracing::info!(
-                uid = r.event_uid.as_deref().unwrap_or(""),
-                cluster = %self.cluster,
-                kind = %r.kind,
-                "interrupt sample absorbed by the event-uid dedup (already banked)"
-            );
+            // Diagnostic SELECT, structurally guarded on the absorb
+            // edge — zero cost on the insert path. A NULL uid cannot
+            // take the partial-index ON CONFLICT arm, so the None
+            // lane is vacuous; a failed SELECT degrades to the
+            // designed-dedup framing rather than failing the RPC.
+            let winner: Option<String> = match r.event_uid.as_deref() {
+                Some(uid) => {
+                    sqlx::query_scalar("SELECT cluster FROM interrupt_samples WHERE event_uid = $1")
+                        .bind(uid)
+                        .fetch_optional(&self.pool)
+                        .await
+                        .unwrap_or_else(|e| {
+                            tracing::debug!(
+                                error = %e,
+                                "absorb diagnostic SELECT failed; classifying as designed dedup"
+                            );
+                            None
+                        })
+                }
+                None => None,
+            };
+            // The closed two-cell partition over the SELECTed winner:
+            // {value-distinct, same-stamp} — exhaustively matched (a
+            // missing row / failed diagnostic falls to the designed-
+            // dedup cell rather than minting a third outcome).
+            match winner.as_deref() {
+                Some(w) if w != self.cluster => {
+                    tracing::warn!(
+                        uid = r.event_uid.as_deref().unwrap_or(""),
+                        winner_cluster = w,
+                        self_cluster = %self.cluster,
+                        kind = %r.kind,
+                        hw_class = %r.hw_class,
+                        "interrupt sample absorbed by a row carrying a DIFFERENT cluster \
+                         stamp — value-distinct identity collision; this deployment's \
+                         evidence was dropped by the dedup (check the cluster axis \
+                         single-source law, helm fragment 39)"
+                    );
+                }
+                Some(_) | None => {
+                    tracing::info!(
+                        uid = r.event_uid.as_deref().unwrap_or(""),
+                        cluster = %self.cluster,
+                        kind = %r.kind,
+                        "interrupt sample absorbed by the event-uid dedup (already banked)"
+                    );
+                }
+            }
             metrics::counter!(
                 "rio_scheduler_interrupt_samples_absorbed_total",
                 "kind" => r.kind.clone()

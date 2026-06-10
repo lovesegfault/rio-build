@@ -171,6 +171,187 @@ async fn append_interrupt_sample_idempotent_on_event_uid() {
     );
 }
 
+/// WO-S5-3 fixture: a SECOND `AdminServiceImpl` over the SAME pool
+/// with its own `[sla].cluster` stamp — the two-deployments-one-PG
+/// shape (each deployment's scheduler stamps its own cluster into
+/// `interrupt_samples.cluster`).
+async fn svc_with_cluster(
+    pool: sqlx::PgPool,
+    cluster: &str,
+) -> (AdminServiceImpl, ActorHandle, tokio::task::JoinHandle<()>) {
+    let (actor, task) = setup_actor(pool.clone());
+    let svc = AdminServiceImpl::new(
+        pool,
+        actor.clone(),
+        "127.0.0.1:1".into(),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        crate::lease::LeaderState::default(),
+        rio_common::signal::Token::new(),
+        cluster.to_string(),
+        Arc::new(crate::sla::config::SlaConfig::test_default()),
+        None,
+        std::sync::Arc::new(parking_lot::RwLock::new(
+            crate::sla::cost::CostTable::default(),
+        )),
+    );
+    (svc, actor, task)
+}
+
+/// `MakeWriter` into a shared buffer (captured-subscriber emission
+/// witness — the rio-common task.rs pattern; `TestWriter` goes to
+/// stdout, no good for asserting on bytes).
+#[derive(Clone, Default)]
+struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// WO-S5-3 red: the absorb edge discloses VALUE-DISTINCT stamp
+/// collisions loudly. Fixture shape (relabeled post-adversarial-
+/// review): the INTRA-DEPLOYMENT cluster-skew class — the colliding
+/// uid was committed under one cluster stamp ("" here) while the
+/// second writer's scheduler stamps another ("prod-eu"), reachable
+/// only when fragment 39's single-source law is broken in at least
+/// one deployment. NOT the bug_022 empty-vs-empty shape, which is
+/// sink-invisible (uid equality entails equal minting-cluster values
+/// and the winner's stamp equals the loser's `self.cluster`) — that
+/// canonical shape's covers are WO-S5-2's render gate + activation
+/// warn; the companion test below pins the blind spot.
+///
+/// Both rows are minted via the PRODUCTION handler (the INSERT path);
+/// the uid is an opaque dedup key to this server (byte-equality
+/// through M_047) — no controller format is fabricated.
+///
+/// Recorded red (pre-fix): zero warns — the absorb logged as designed
+/// dedup info at every layer. Certifies: value-distinct stamp
+/// collisions at the absorb edge are disclosed at WARN naming BOTH
+/// cluster ids (the proposition the detector's claim rides on), not
+/// a counter proxy.
+#[tokio::test]
+async fn cross_deployment_absorb_is_disclosed_loudly() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let (svc_a, _actor_a, _task_a, db) = setup_svc_default().await; // cluster ""
+    let (svc_b, _actor_b, _task_b) = svc_with_cluster(db.pool.clone(), "prod-eu").await;
+
+    let req = || {
+        Request::new(AppendInterruptSampleRequest {
+            hw_class: "aws-8-nvme-hi".into(),
+            kind: "exposure".into(),
+            value: 60.0,
+            event_uid: Some("ev-skew-collision".into()),
+        })
+    };
+
+    // Writer 1: the row commits under cluster stamp "".
+    svc_a.append_interrupt_sample(req()).await.unwrap();
+
+    // Writer 2 (the skew shape): the same uid arrives at a scheduler
+    // stamping "prod-eu" — absorbed, and the winner's stamp differs
+    // from self.cluster.
+    let buf = LogBuf::default();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(buf.clone()),
+    );
+    let guard = tracing::subscriber::set_default(subscriber);
+    svc_b.append_interrupt_sample(req()).await.unwrap();
+    drop(guard);
+
+    let bytes = std::mem::take(&mut *buf.0.lock().unwrap());
+    let lines: Vec<String> = String::from_utf8(bytes)
+        .unwrap()
+        .lines()
+        .map(String::from)
+        .collect();
+    let warns: Vec<&String> = lines
+        .iter()
+        .filter(|l| {
+            l.contains("\"WARN\"")
+                && l.contains("\"winner_cluster\":\"\"")
+                && l.contains("\"self_cluster\":\"prod-eu\"")
+                && l.contains("ev-skew-collision")
+        })
+        .collect();
+    assert_eq!(
+        warns.len(),
+        1,
+        "value-distinct stamp collision must be disclosed at WARN naming both \
+         cluster ids; captured: {lines:?}"
+    );
+}
+
+/// WO-S5-3 companion green — deliberately pins the detector's HONEST
+/// BLIND SPOT: both handlers at `""` (the empty single-cluster
+/// default, the canonical bug_022 shape). An empty-vs-empty
+/// cross-deployment absorb is row-indistinguishable from designed
+/// same-cluster dedup at the sink (winner == "" == self.cluster), so
+/// it classifies as designed dedup: info, NO warn — the at-most-once
+/// posture is not reclassified, and the blind spot is pinned, not
+/// hidden. The canonical shape's covers are WO-S5-2's helm render
+/// gate and the informer activation warn.
+#[tokio::test]
+async fn same_cluster_absorb_stays_designed_dedup() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let (svc_a, _actor_a, _task_a, db) = setup_svc_default().await; // cluster ""
+    let (svc_b, _actor_b, _task_b) = svc_with_cluster(db.pool.clone(), "").await;
+
+    let req = || {
+        Request::new(AppendInterruptSampleRequest {
+            hw_class: "aws-8-nvme-hi".into(),
+            kind: "exposure".into(),
+            value: 60.0,
+            event_uid: Some("ev-default-twin".into()),
+        })
+    };
+
+    svc_a.append_interrupt_sample(req()).await.unwrap();
+
+    let buf = LogBuf::default();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(buf.clone()),
+    );
+    let guard = tracing::subscriber::set_default(subscriber);
+    svc_b.append_interrupt_sample(req()).await.unwrap();
+    drop(guard);
+
+    let bytes = std::mem::take(&mut *buf.0.lock().unwrap());
+    let lines: Vec<String> = String::from_utf8(bytes)
+        .unwrap()
+        .lines()
+        .map(String::from)
+        .collect();
+    assert!(
+        !lines.iter().any(|l| l.contains("\"WARN\"")),
+        "an empty-vs-empty absorb classifies as designed dedup (the pinned \
+         blind spot) — no warn; captured: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("\"INFO\"") && l.contains("absorbed")),
+        "the designed-dedup info still fires; captured: {lines:?}"
+    );
+}
+
 /// Defense-in-depth input validation: lands regardless of the
 /// service-token gate (dev-mode pass-through here).
 #[tokio::test]
