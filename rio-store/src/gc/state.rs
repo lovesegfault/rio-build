@@ -281,14 +281,36 @@ const COMMIT_PROBE_SQL: &str = "SELECT cycle_epoch, cursor, backlog_estimate, \
 ///   `last_mark_set_size == observation.mark_set_size()` (no temporal
 ///   leg ever existed; the payload-coincidence residual below).
 ///
-/// DOCUMENTED BENIGN RESIDUAL: a byte-identical foreign LIVE commit
-/// landing inside the milliseconds retry window is recognized as ours
-/// — durable row state is identical by construction, so the only error
-/// is WHICH replica's ok ticks. Accepted in lieu of a per-attempt
-/// nonce column, which would require a new migration on the frozen
+/// DOCUMENTED BENIGN RESIDUAL (re-priced 2026-06-10, bug_099 — from
+/// the module's own echo/non-echo column partition): a
+/// payload-coincident foreign LIVE commit landing anywhere in the
+/// stamp_attempt→probe span is recognized as ours. The span is the
+/// code's own anchor interval — `stamp_attempt` runs BEFORE the
+/// multi-minute cycle, and the 0-row retry runs only when the lock
+/// session died mid-cycle: exactly when the freed advisory lock
+/// admits a sibling's full cycle — never a "milliseconds" window.
+/// The absorbed row is identical in the pure-echo conjuncts (cursor,
+/// last_mark_set_size, live-stamp presence) and, for
+/// `backlog_estimate`, ONLY when the coinciding commit anchors zero
+/// (`CompleteFullScan`); in the non-anchoring coincidence (the
+/// both-resumed cell) the row carries the FOREIGN replica's victim
+/// decrement — ours (≤ `COLLECT_CYCLE_VICTIM_CAP`) is never applied,
+/// so `rio_store_gc_collect_backlog_chunks` reads HIGH by exactly our
+/// `victims_collected` until the next anchors-zero commit or shadow
+/// re-anchor, while `Committed` is returned and no disclosure fires.
+/// `backlog_estimate`'s absence from the Live `payload_matched`
+/// conjunct is DERIVED from the partition (its Live SET is a CASE
+/// over the committing replica's victims — non-echo), not an
+/// oversight; both arms are witnessed by
+/// `absorbed_foreign_commit_diverges_in_backlog_estimate`
+/// (collect.rs). Accepted in lieu of a per-attempt nonce column,
+/// which would require a new migration on the frozen
 /// `gc_collect_state` schema (rio-migrations is outside this plane;
-/// SIGNED Q2: zero DDL this wave). Modeled honestly as the
-/// `payloadCoincidence` nondet in `docs/spec/models/gcCadence.qnt`.
+/// SIGNED Q2: zero DDL — re-affirmed round-8). The per-replica
+/// ok-attribution axis is the `coincidenceOks` counter in
+/// `docs/spec/models/gcCadence.qnt`; the model carries NO backlog
+/// variable — the backlog axis is priced here and witnessed by the
+/// test above.
 pub(crate) fn classify_zero_row_retry(
     commit: &CycleCommit,
     expected_epoch: i64,

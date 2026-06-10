@@ -2980,6 +2980,204 @@ mod tests {
         );
     }
 
+    /// bug_099: the corrected pricing of the payload-coincidence
+    /// residual, CONSTRUCTED (state.rs's "DOCUMENTED BENIGN RESIDUAL"
+    /// block — re-priced in this commit — cites this witness). The
+    /// absorbed row diverges from our intended commit by EXACTLY our
+    /// victim decrement in the non-anchoring (both-resumed) arm, and
+    /// by NOTHING in the anchors-zero arm, under a constructed (not
+    /// hypothesized) misrecognition through the production
+    /// stamp/commit/probe/classify chain (lease + stamp_attempt +
+    /// commit_foreign_for_test + PrimaryRefused retry — R13; the
+    /// singleton-row seeding follows the
+    /// resumed_completion_keeps_decremented_backlog house pattern).
+    /// Strawman red ((ddddd), transcript in the commit body): the
+    /// pre-rewrite doc claim "durable row state is identical by
+    /// construction" asserted as `backlog == B - M - N` fails
+    /// `left: 4 / right: 2` (B=9, foreign M=5, ours N=2) — the row
+    /// carries the FOREIGN decrement only; ours is never subtracted,
+    /// so `rio_store_gc_collect_backlog_chunks` reads HIGH by exactly
+    /// our victims until the next anchors-zero commit or shadow
+    /// re-anchor, while `Committed` is returned and no disclosure
+    /// fires.
+    #[tokio::test]
+    async fn absorbed_foreign_commit_diverges_in_backlog_estimate() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        reset_collector_state(&db.pool).await;
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
+        let grace = super::super::sweep::CHUNK_GRACE_SECS;
+
+        // Two eligible chunks ABOVE a mid-keyspace cursor: our
+        // resumed pass drains exactly them (victims N = 2).
+        ChunkSeed::new(0xE0)
+            .age_secs(grace + 100)
+            .uploaded()
+            .seed(&db.pool)
+            .await;
+        ChunkSeed::new(0xF0)
+            .age_secs(grace + 100)
+            .uploaded()
+            .seed(&db.pool)
+            .await;
+        // Durable state: a mid-keyspace resume cursor and a known
+        // backlog estimate B = 9 (the house seeding pattern).
+        sqlx::query(
+            "UPDATE gc_collect_state SET cursor = $1, backlog_estimate = 9 \
+             WHERE singleton",
+        )
+        .bind(vec![0x80u8; 32])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // OUR lease (expected epoch 0) holds the attempt stamp — the
+        // recognition anchor the probe compares against.
+        let mut lease = super::super::state::GcCycleLease::try_acquire(&db.pool)
+            .await
+            .unwrap()
+            .expect("lock free");
+        lease.stamp_attempt().await.unwrap();
+
+        // OUR resumed LIVE cycle: drains [0x80, top] — victims N = 2,
+        // disposition CompleteResumed (cursor None, anchors NOTHING).
+        let ours = collect_cycle(
+            &db.pool,
+            Some(&backend),
+            grace,
+            CollectMode::Live,
+            Some(vec![0x80u8; 32]),
+        )
+        .await
+        .expect("live resumed cycle");
+        assert_eq!(ours.outcome, CollectOutcome::Ok);
+        assert_eq!(ours.victims_collected, 2, "N = 2 (the premise)");
+        let our_disposition = ours
+            .disposition
+            .clone()
+            .expect("live Ok report carries a disposition");
+        assert!(
+            matches!(our_disposition, PassDisposition::CompleteResumed),
+            "the both-resumed cell's premise: ours is non-anchoring, got {our_disposition:?}"
+        );
+        let observation = ours.durable.expect("Ok cycle carries an observation");
+
+        // The payload-coincident FOREIGN LIVE commit lands FIRST
+        // (between our epoch read and our retry), through the
+        // production router: byte-identical payload (same observation,
+        // same CompleteResumed shape) — the FOREIGN replica's victims
+        // M = 5 ride the non-echo backlog CASE.
+        let rows = super::super::state::commit_foreign_for_test(
+            &db.pool,
+            &super::super::state::CycleCommit::Live {
+                disposition: PassDisposition::CompleteResumed,
+                victims_collected: 5,
+                observation,
+            },
+        )
+        .await
+        .expect("foreign commit lands");
+        assert_eq!(rows, 1, "the foreign commit applied (epoch 0 -> 1)");
+
+        // OUR primary refused; the epoch-guarded retry matches 0 rows;
+        // the diagnostic probe MISRECOGNIZES the foreign commit as
+        // ours — payload coincides (cursor NULL == None; same mark-set
+        // size; live-stamped) and the live stamp postdates our held
+        // attempt stamp. The misrecognition is CONSTRUCTED, not
+        // hypothesized: premise-reachable.
+        super::super::state::CommitFaultMode::PrimaryRefused.arm();
+        let result = lease
+            .commit_cycle(super::super::state::CycleCommit::Live {
+                disposition: our_disposition,
+                victims_collected: ours.victims_collected,
+                observation,
+            })
+            .await;
+        assert!(
+            matches!(result, super::super::state::CycleCommitResult::Committed(_)),
+            "the payload-coincidence misrecognition must fire (the residual \
+             under price), got a different verdict"
+        );
+
+        // THE PRICED DIVERGENCE: the absorbed row carries the FOREIGN
+        // decrement (GREATEST(9 - 5, 0) = 4) — ours (N = 2) is never
+        // subtracted; the row does NOT read GREATEST(9 - 5 - 2, 0).
+        let backlog: Option<i64> =
+            sqlx::query_scalar("SELECT backlog_estimate FROM gc_collect_state WHERE singleton")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            backlog,
+            Some(4),
+            "the absorbed row carries exactly the foreign victim decrement \
+             (B - M); our victims are missing from it"
+        );
+        assert_ne!(
+            backlog,
+            Some(2),
+            "B - M - N is what a truly-identical-by-construction row would \
+             read — the old doc claim, refuted"
+        );
+
+        // THE EXEMPT ARM (companion, same witness — the doc's two-arm
+        // partition total): an anchors-zero coincidence writes 0,
+        // identical to what ours would have written. Fresh epoch
+        // round: our full (unresumed) pass over the now-empty
+        // keyspace, the foreign twin anchoring zero.
+        let mut lease2 = super::super::state::GcCycleLease::try_acquire(&db.pool)
+            .await
+            .unwrap()
+            .expect("lock free after release");
+        lease2.stamp_attempt().await.unwrap();
+        let ours2 = collect_cycle(&db.pool, Some(&backend), grace, CollectMode::Live, None)
+            .await
+            .expect("live full cycle");
+        assert_eq!(ours2.outcome, CollectOutcome::Ok);
+        let our_disposition2 = ours2
+            .disposition
+            .clone()
+            .expect("live Ok report carries a disposition");
+        assert!(
+            matches!(our_disposition2, PassDisposition::CompleteFullScan),
+            "the exempt arm's premise: an unresumed full scan anchors, got {our_disposition2:?}"
+        );
+        let observation2 = ours2.durable.expect("Ok cycle carries an observation");
+        let rows = super::super::state::commit_foreign_for_test(
+            &db.pool,
+            &super::super::state::CycleCommit::Live {
+                disposition: PassDisposition::CompleteFullScan,
+                victims_collected: 7,
+                observation: observation2,
+            },
+        )
+        .await
+        .expect("foreign anchors-zero commit lands");
+        assert_eq!(rows, 1, "epoch 1 -> 2");
+        super::super::state::CommitFaultMode::PrimaryRefused.arm();
+        let result = lease2
+            .commit_cycle(super::super::state::CycleCommit::Live {
+                disposition: our_disposition2,
+                victims_collected: ours2.victims_collected,
+                observation: observation2,
+            })
+            .await;
+        assert!(
+            matches!(result, super::super::state::CycleCommitResult::Committed(_)),
+            "the anchors-zero coincidence also misrecognizes"
+        );
+        let backlog: Option<i64> =
+            sqlx::query_scalar("SELECT backlog_estimate FROM gc_collect_state WHERE singleton")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            backlog,
+            Some(0),
+            "anchors-zero coincidence: the absorbed row is identical to what \
+             ours would have written — the exempt arm of the partition"
+        );
+    }
+
     // r[verify store.gc.collect-cadence+4]
     /// merged_bug_021/merged_bug_022: the 0-row retry verdict table as
     /// a GENERATED product census — `{payload} x {anchor} x {epoch}`
