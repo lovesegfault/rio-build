@@ -309,9 +309,10 @@ async fn claim_loop<T>(
             &shutdown,
         )
         .await;
-        // live_046 (R-B): the pacing decision reads the pass facts
-        // BEFORE the claims are consumed by execution.
-        let pass_empty = pass_is_empty(&pass.pacing, pass.claimed.len());
+        // round-8 WO-S2-1: the pacing decision is a total function of
+        // the pass's sealed outcome, read BEFORE the claims are
+        // consumed by execution.
+        let pace = pace_for(&pass.outcome);
         for job in pass.claimed {
             info!(
                 worker,
@@ -418,31 +419,77 @@ async fn claim_loop<T>(
                 );
             }
         }
-        // live_046 (R-B): eager re-poll — sleep the jittered beat ONLY
-        // after EMPTY passes; a productive pass re-polls immediately
-        // (the post-walk dead second dies). A gate/latch-withheld pass
-        // is ALWAYS empty ⇒ always sleeps: the honest beat and the
-        // eager re-poll compose into "work fast, idle at the beat,
-        // never spin while wedged" (pinned by the law table + the
-        // pacing tests). Jitter is KEPT on every sleep that occurs.
-        if pass_empty {
-            let interval = POLL_JITTER.apply(Duration::from_secs(cfg.poll_interval_secs.max(1)));
-            if pace_after_empty_pass(&shutdown, interval).await {
-                return;
+        // live_046 (R-B) → round-8 WO-S2-1: the eager re-poll rides
+        // the sealed outcome — work re-polls now, idle passes sleep
+        // the jittered beat, contested passes honor the server's
+        // floor (the `Floor` arm is unconstructed at this commit —
+        // the law flips next commit). Jitter is KEPT on every beat
+        // sleep; floor sleeps jitter upward only (the floor is never
+        // undercut).
+        match pace {
+            Pace::Now => {}
+            Pace::Beat => {
+                let interval =
+                    POLL_JITTER.apply(Duration::from_secs(cfg.poll_interval_secs.max(1)));
+                if pace_after_empty_pass(&shutdown, interval).await {
+                    return;
+                }
+            }
+            Pace::Floor(floor) => {
+                let interval = POLL_JITTER.apply(floor).max(floor);
+                if pace_after_empty_pass(&shutdown, interval).await {
+                    return;
+                }
             }
         }
     }
 }
 
-/// live_046 (R-B) — THE structural pass-emptiness law (the pacing
-/// loop's only input): a pass is EMPTY iff its beat was withheld
-/// (honest-beat gate / futility latch — merged_bug_005: a withheld
-/// pass must idle, never spin) OR it produced nothing at all (zero
-/// claims, zero ledger transitions, empty listing). Productive passes
-/// — claims, ledger movement, or a non-withheld listing that served
-/// work — re-poll immediately.
-fn pass_is_empty(pacing: &client::PassPacing, claimed: usize) -> bool {
-    pacing.beat_withheld || (claimed == 0 && !pacing.ledger_transitioned && !pacing.listed_any)
+/// What the claim loop does between passes (round-8 WO-S2-1 — the
+/// pacing law's closed output alphabet).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pace {
+    /// Re-poll immediately (no sleep).
+    Now,
+    /// Sleep one jittered poll beat.
+    Beat,
+    /// Sleep at least the server's answered retry floor (jitter
+    /// applied upward only — the floor is never undercut).
+    Floor(Duration),
+}
+
+/// round-8 WO-S2-1 — THE pacing law: one total function over the
+/// sealed [`client::PassOutcome`] alphabet (the pacing loop's only
+/// input; rustc's exhaustiveness is the census — a new outcome
+/// variant fails this build). This commit mirrors the RETIRED
+/// projection law cell-for-cell (semantics-neutral restructure); the
+/// two defect cells are annotated and flip in the NEXT commit:
+///
+///   - `Delivered`/`Settled` → `Now`: conversion work re-polls
+///     (reachable only on un-gated exits at this commit — the seal's
+///     exit-first precedence reproduces the old withheld
+///     short-circuit, the merged_bug_038 defect).
+///   - `Contested` → `Now`: **defect cell (merged_bug_008, FS-4
+///     face)** — contested passes re-poll at RPC speed, discarding
+///     the server's stated floor; flips to `Floor` next commit.
+///   - `ListedNoAction` → `Now`: **defect cell (merged_bug_008, hot
+///     loop)** — a pass that listed work and took zero actions
+///     re-polls unpaced; flips to `Beat` next commit.
+///   - `Empty`/`Wedged`/`ListFailed` → `Beat`: nothing to do (or the
+///     beat was withheld) — idle at the beat, never spin.
+///   - `Abandoned` → `Beat`: SIGTERM — the loop exits before any
+///     sleep matters; paced for totality.
+pub fn pace_for(outcome: &client::PassOutcome) -> Pace {
+    match outcome {
+        client::PassOutcome::Delivered { .. } => Pace::Now,
+        client::PassOutcome::Settled { .. } => Pace::Now,
+        client::PassOutcome::Contested { .. } => Pace::Now,
+        client::PassOutcome::ListedNoAction { .. } => Pace::Now,
+        client::PassOutcome::Empty => Pace::Beat,
+        client::PassOutcome::Wedged(_) => Pace::Beat,
+        client::PassOutcome::ListFailed => Pace::Beat,
+        client::PassOutcome::Abandoned => Pace::Beat,
+    }
 }
 
 /// The pacing primitive: one jittered, shutdown-aware beat sleep.
@@ -722,34 +769,95 @@ mod tests {
     // live_046 (R-B) — eager re-poll pacing
     // -----------------------------------------------------------------
 
-    /// R15 product census: the structural EMPTY law, total over the
-    /// full (withheld x transitioned x listed x claimed) product —
-    /// the cells COME FROM the alphabet (two bools x two bools x two
-    /// bools x {0,1}), so a new pacing fact forces a new census here.
-    /// Proposition (R16): EMPTY iff withheld OR nothing-at-all; in
-    /// particular every WITHHELD cell is empty (the no-spin
-    /// composition law: never re-poll a wedged pass).
+    /// R15 census: the pacing law, total over the sealed
+    /// [`client::PassOutcome`] alphabet — the census vector's
+    /// completeness is FORCED by the wildcard-free
+    /// `outcome_variant_index` match (a new variant fails the build)
+    /// plus the bijection assertion. Each expected value is a
+    /// HAND-WRITTEN literal derived from the pacing requirement —
+    /// never an expression sharable with the impl (the retired
+    /// `empty_law_total_over_the_pass_product` oracle was the impl's
+    /// own boolean, certifying f(x)==f(x); its R16 prose adopted
+    /// "withheld = wedged" underived — the merged_bug_038 lesson).
+    ///
+    /// Proposition (R16): per-cell pacing at THIS commit mirrors the
+    /// retired projection law (semantics-neutral restructure). Two
+    /// cells are the documented merged_bug_008 defect cells — they
+    /// flip in the next commit:
+    ///   - `Contested` → `Now` (defect: the server's floor is
+    ///     discarded; flips to `Floor`);
+    ///   - `ListedNoAction` → `Now` (defect: the zero-action hot
+    ///     loop; flips to `Beat`).
     #[test]
-    fn empty_law_total_over_the_pass_product() {
-        for withheld in [false, true] {
-            for transitioned in [false, true] {
-                for listed in [false, true] {
-                    for claimed in [0usize, 1] {
-                        let pacing = client::PassPacing {
-                            beat_withheld: withheld,
-                            ledger_transitioned: transitioned,
-                            listed_any: listed,
-                        };
-                        let expected = withheld || (claimed == 0 && !transitioned && !listed);
-                        assert_eq!(
-                            pass_is_empty(&pacing, claimed),
-                            expected,
-                            "cell (withheld={withheld}, transitioned={transitioned}, \
-                             listed={listed}, claimed={claimed})"
-                        );
-                    }
-                }
+    fn pacing_law_total_over_pass_outcomes() {
+        use client::{PassOutcome, WedgeKind};
+        const OUTCOME_VARIANTS: usize = 8;
+        fn outcome_variant_index(o: &PassOutcome) -> usize {
+            match o {
+                PassOutcome::Delivered { .. } => 0,
+                PassOutcome::Settled { .. } => 1,
+                PassOutcome::Contested { .. } => 2,
+                PassOutcome::ListedNoAction { .. } => 3,
+                PassOutcome::Empty => 4,
+                PassOutcome::Wedged(_) => 5,
+                PassOutcome::ListFailed => 6,
+                PassOutcome::Abandoned => 7,
             }
+        }
+        let alphabet: Vec<(PassOutcome, Pace)> = vec![
+            // A claim landed: execute it and come straight back.
+            (PassOutcome::Delivered { deliveries: 1 }, Pace::Now),
+            // The ledger strictly shrank: settle work re-polls.
+            (PassOutcome::Settled { resolutions: 2 }, Pace::Now),
+            // DEFECT CELL (merged_bug_008, FS-4 face): the wire floor
+            // is discarded — contested passes re-poll at RPC speed.
+            // Flips to Floor(5 s) in the next commit.
+            (
+                PassOutcome::Contested {
+                    floor: Some(Duration::from_secs(5)),
+                },
+                Pace::Now,
+            ),
+            (PassOutcome::Contested { floor: None }, Pace::Now),
+            // DEFECT CELL (merged_bug_008, hot loop): a zero-action
+            // listing re-polls unpaced. Flips to Beat next commit.
+            (
+                PassOutcome::ListedNoAction {
+                    refused: 1,
+                    skipped: 0,
+                },
+                Pace::Now,
+            ),
+            // Nothing to do: idle at the beat.
+            (PassOutcome::Empty, Pace::Beat),
+            // Withheld beats always pace (never spin while wedged).
+            (
+                PassOutcome::Wedged(WedgeKind::BudgetPinned { charged: 1 }),
+                Pace::Beat,
+            ),
+            (
+                PassOutcome::Wedged(WedgeKind::AtCap {
+                    charged: 20,
+                    entries: 32,
+                }),
+                Pace::Beat,
+            ),
+            (PassOutcome::Wedged(WedgeKind::Futility), Pace::Beat),
+            // A failed listing is an idle pass.
+            (PassOutcome::ListFailed, Pace::Beat),
+            // SIGTERM: the loop exits; paced for totality.
+            (PassOutcome::Abandoned, Pace::Beat),
+        ];
+        let mut seen = [false; OUTCOME_VARIANTS];
+        for (o, _) in &alphabet {
+            seen[outcome_variant_index(o)] = true;
+        }
+        assert!(
+            seen.iter().all(|s| *s),
+            "the census vector must cover every PassOutcome variant"
+        );
+        for (outcome, expected) in &alphabet {
+            assert_eq!(pace_for(outcome), *expected, "pacing cell for {outcome:?}");
         }
     }
 

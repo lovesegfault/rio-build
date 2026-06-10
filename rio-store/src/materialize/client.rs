@@ -190,32 +190,203 @@ impl IntoIterator for ClaimedSet {
     }
 }
 
-/// live_046 (R-B) — the pacing facts the claim loop's eager re-poll
-/// reads off a completed pass (the structural EMPTY law:
-/// `rio-store/src/materialize/mod.rs::pass_is_empty`). Carried beside
-/// the claims so the pacing decision is derived from the pass that
-/// actually ran, never re-probed.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct PassPacing {
-    /// The listing beat was withheld (honest-beat gate or futility
-    /// latch — merged_bug_005). A withheld pass is ALWAYS paced: the
-    /// no-spin composition law ("work fast, idle at the beat, never
-    /// spin while wedged").
-    pub beat_withheld: bool,
-    /// The resume/fresh lanes changed the ledger (mint, resolution,
-    /// or a standing transition).
-    pub ledger_transitioned: bool,
-    /// The listing answered with at least one descriptor.
-    pub listed_any: bool,
+/// merged_bug_038/merged_bug_008 (round-8 WO-S2-1) — every `finish!`
+/// site names its exit: the exit axis is total (9 sites — the
+/// committed `rg -n 'finish!'` census rides the introducing commit).
+/// The exit is one of [`PassOutcome::seal`]'s two inputs; sealing
+/// anywhere but `finish!` does not exist (the macro is the only
+/// construction path).
+#[derive(Debug, Clone, Copy)]
+enum PassExit {
+    /// The pass ran to the end of its fresh lane (or had zero slots
+    /// to fill — the zero-budget pass seals [`PassOutcome::Empty`]).
+    Completed,
+    /// The honest-beat gate withheld the listing on mint-headroom
+    /// exhaustion. Carries the gate's own verdict; the seal maps the
+    /// two withheld arms onto [`WedgeKind`].
+    GatedHeadroom(MintHeadroom),
+    /// The conversion-futility latch withheld the listing.
+    GatedFutility,
+    /// The listing RPC failed or timed out.
+    ListFailed,
+    /// SIGTERM raced the pass — evidence inconclusive, typed, never
+    /// skipped.
+    Abandoned,
 }
 
-/// One completed poll pass: the accrued claims plus the pacing facts.
-/// Derefs to the claimed slice (and consumes into it) so claim
-/// consumers read the pass exactly like the bare [`ClaimedSet`].
+/// merged_bug_038 — WHY a wedged pass cannot mint (the typed withhold
+/// reason the wedge observer and the pacing law consume).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WedgeKind {
+    /// Delivered claims plus unanswered (Charged) mints fill every
+    /// slot.
+    BudgetPinned {
+        /// Unanswered (Charged) ledger entries at the gate.
+        charged: usize,
+    },
+    /// The ledger sits at [`RESUME_LEDGER_CAP`] — the mint authority
+    /// refuses every fresh mint.
+    AtCap {
+        /// Unanswered (Charged) ledger entries at the gate.
+        charged: usize,
+        /// Total live credentials at the gate.
+        entries: usize,
+    },
+    /// The conversion-futility latch holds the beat through its
+    /// re-probe interval.
+    Futility,
+}
+
+/// THE one sealed verdict of a completed poll pass (round-8 WO-S2-1:
+/// merged_bug_038 + merged_bug_008). Minted exactly once, inside
+/// `finish!`, by [`PassOutcome::seal`] — every pass-scoped observer
+/// (pacing, the futility latch, the wedge latch) consumes THIS value
+/// through an exhaustive match, so an unobserved transition cannot
+/// compile. Partial projections of the pass (raw-listing bools,
+/// pre-collapsed evidence booleans) have no constructor into control
+/// decisions: the projection triple this enum replaces is dead
+/// vocabulary, machine-checked by the retirement census in the
+/// introducing commits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassOutcome {
+    /// A claim landed (either lane, any exit).
+    Delivered {
+        /// Deliveries this pass (== the claimed-set length).
+        deliveries: usize,
+    },
+    /// Entries left the ledger without a delivery and the ledger
+    /// STRICTLY SHRANK (Gone / mint-disproving answers on
+    /// pre-existing credentials). Strict shrink is the structural
+    /// termination argument: the backlog is finite, so Settled
+    /// passes cannot recur unboundedly. A same-pass mint that is
+    /// immediately disproven nets zero and does NOT settle.
+    Settled {
+        /// Net entries the pass removed from the ledger.
+        resolutions: usize,
+    },
+    /// Fresh mints were issued and EVERY one was answered
+    /// NotYetReady — the contested steady state. Carries the wire
+    /// retry floor (min over the pass's answered `retry_after`
+    /// values; `None` when the server stated no floor).
+    Contested {
+        /// The earliest instant the server said any contested job
+        /// could be ready.
+        floor: Option<Duration>,
+    },
+    /// The pass listed work and took no conversion-conclusive action
+    /// and held no live contest: every descriptor was refused
+    /// pre-pull (malformed job_id), skipped (live ledger entry), or
+    /// its mint was answered with refusals/lost answers only. (The
+    /// membership is wider than the pre-pull lanes alone — the
+    /// derivation note rides the introducing commit: the
+    /// mixed-mint-outcome pass is reachable at production slots=1
+    /// and must classify somewhere total.)
+    ListedNoAction {
+        /// Descriptors refused before any pull (malformed job_id).
+        refused: usize,
+        /// Descriptors skipped for a live ledger entry.
+        skipped: usize,
+    },
+    /// Nothing listed (or the pass had zero slots).
+    Empty,
+    /// A gated exit with zero deliveries and zero settles — the
+    /// typed withhold reason inside.
+    Wedged(WedgeKind),
+    /// The listing RPC failed or timed out.
+    ListFailed,
+    /// SIGTERM — evidence inconclusive, typed, not skipped.
+    Abandoned,
+}
+
+impl PassOutcome {
+    /// The SOLE constructor (minted inside `finish!`): seal one
+    /// completed pass from its exit, its conversion evidence, the
+    /// claimed count, and the pass's net ledger shrink.
+    ///
+    /// Seal precedence (1a — the OLD pacing law's exit-first shape,
+    /// preserved verbatim so this commit is semantics-neutral): a
+    /// gated exit seals [`PassOutcome::Wedged`] UNCONDITIONALLY —
+    /// deliveries and settles on a gated pass are invisible to
+    /// pacing, exactly the merged_bug_038 defect cell (annotated in
+    /// the law table; the flip is the NEXT commit).
+    fn seal(
+        exit: PassExit,
+        pass: &PassConversion,
+        claimed: usize,
+        resolutions: usize,
+    ) -> PassOutcome {
+        debug_assert_eq!(
+            claimed, pass.deliveries,
+            "every delivery pushes exactly one claimed job"
+        );
+        match exit {
+            PassExit::Abandoned => PassOutcome::Abandoned,
+            PassExit::GatedHeadroom(MintHeadroom::BudgetPinned { charged }) => {
+                PassOutcome::Wedged(WedgeKind::BudgetPinned { charged })
+            }
+            PassExit::GatedHeadroom(MintHeadroom::AtCap { charged, entries }) => {
+                PassOutcome::Wedged(WedgeKind::AtCap { charged, entries })
+            }
+            // Dead cell, total without a wildcard: the gate exits
+            // only on withheld headroom, so an Available-carrying
+            // gated exit is unconstructed; sealed Empty (paced) —
+            // the conservative arm.
+            PassExit::GatedHeadroom(MintHeadroom::Available) => PassOutcome::Empty,
+            PassExit::GatedFutility => PassOutcome::Wedged(WedgeKind::Futility),
+            PassExit::ListFailed => {
+                Self::conversion_outcome(pass, resolutions).unwrap_or(PassOutcome::ListFailed)
+            }
+            PassExit::Completed => Self::conversion_outcome(pass, resolutions)
+                .unwrap_or_else(|| Self::completed_shape(pass)),
+        }
+    }
+
+    /// The conversion-first half of the precedence ladder: a
+    /// delivering pass seals [`PassOutcome::Delivered`]; a strictly
+    /// shrinking pass seals [`PassOutcome::Settled`].
+    fn conversion_outcome(pass: &PassConversion, resolutions: usize) -> Option<PassOutcome> {
+        if pass.deliveries > 0 {
+            Some(PassOutcome::Delivered {
+                deliveries: pass.deliveries,
+            })
+        } else if resolutions > 0 {
+            Some(PassOutcome::Settled { resolutions })
+        } else {
+            None
+        }
+    }
+
+    /// A completed, non-delivering, non-shrinking pass: Empty when
+    /// nothing listed; Contested when every fresh mint was answered
+    /// NotYetReady; otherwise ListedNoAction (the residual listed
+    /// class — pre-pull exits and mixed/lost mint outcomes alike).
+    fn completed_shape(pass: &PassConversion) -> PassOutcome {
+        if !pass.listed {
+            PassOutcome::Empty
+        } else if pass.fresh_mints > 0 && pass.contested_mints == pass.fresh_mints {
+            PassOutcome::Contested {
+                floor: pass.retry_floor,
+            }
+        } else {
+            PassOutcome::ListedNoAction {
+                refused: pass.refused_pre_pull,
+                skipped: pass.skipped_live,
+            }
+        }
+    }
+}
+
+/// One completed poll pass: the accrued claims plus the sealed
+/// outcome. Derefs to the claimed slice (and consumes into it) so
+/// claim consumers read the pass exactly like the bare
+/// [`ClaimedSet`].
 #[must_use = "claimed assignments must be executed or aborted — dropping them strands open attempts"]
 pub struct PollPass {
+    /// The claims this pass accrued (bug_116 — never fabricated
+    /// empty over an exit arm).
     pub claimed: ClaimedSet,
-    pub pacing: PassPacing,
+    /// The pass's single sealed verdict (the only pacing input).
+    pub outcome: PassOutcome,
 }
 
 impl std::ops::Deref for PollPass {
@@ -749,7 +920,14 @@ enum PullAnswer {
     /// Answered: the job is resolved/absent — authoritative stop.
     Gone,
     /// Answered: refused for now (race lost, parked, not ready).
-    NotYetReady,
+    /// Carries the server's stated retry floor (round-8 WO-S2-1:
+    /// `build_types.proto` `NotYetReady.retry_after_seconds`, typed
+    /// at [`pull_once`]'s one mapping site instead of discarded —
+    /// `None` when the server stated no floor).
+    NotYetReady {
+        /// The earliest the server said this job could be ready.
+        retry_after: Option<Duration>,
+    },
     /// SIGTERM raced the pull — end the pass.
     Shutdown,
     /// The answer never arrived (timeout / transport error): a mint
@@ -836,7 +1014,7 @@ fn standing_effect(lane: PresentationLane, answer: &PullAnswer) -> StandingEffec
         }
         (PresentationLane::Probe, PullAnswer::Deliver(_)) => StandingEffect::Recharge,
         (_, PullAnswer::Gone) => StandingEffect::Resolve,
-        (_, PullAnswer::NotYetReady) => StandingEffect::Refund,
+        (_, PullAnswer::NotYetReady { .. }) => StandingEffect::Refund,
         (PresentationLane::Fresh | PresentationLane::ResumeClaiming, PullAnswer::Unanswered) => {
             StandingEffect::Recharge
         }
@@ -875,10 +1053,21 @@ async fn pull_once<T: MaterializeTransport>(
                 PullAnswer::Deliver(Box::new(assignment))
             }
             Some(pull_assignment_response::Outcome::Gone(_)) => PullAnswer::Gone,
-            Some(pull_assignment_response::Outcome::NotYetReady(_)) | None => {
+            Some(pull_assignment_response::Outcome::NotYetReady(nyr)) => {
                 debug!(drv_hash = %drv_hash,
                        "materialization claim not delivered (race lost / not ready)");
-                PullAnswer::NotYetReady
+                // The ONE wire→type mapping site for the server's
+                // stated retry floor (round-8 WO-S2-1): zero on the
+                // wire = "no floor stated" (proto3 default).
+                PullAnswer::NotYetReady {
+                    retry_after: (nyr.retry_after_seconds > 0)
+                        .then(|| Duration::from_secs(u64::from(nyr.retry_after_seconds))),
+                }
+            }
+            None => {
+                debug!(drv_hash = %drv_hash,
+                       "materialization claim not delivered (race lost / not ready)");
+                PullAnswer::NotYetReady { retry_after: None }
             }
         },
         // bug_119 + merged_bug_074: the ONE rpc-error classification
@@ -1036,9 +1225,63 @@ struct PassConversion {
     /// Any fresh outcome that proves the pass was NOT futile-only
     /// (delivery, Gone, a NotYetReady contest, an unanswered mint).
     non_futile_outcome: bool,
+    /// Fresh mints answered NotYetReady this pass (the contested
+    /// population — round-8 WO-S2-1: [`PassOutcome::Contested`]'s
+    /// membership predicate).
+    contested_mints: usize,
+    /// Min over the pass's answered `retry_after` floors (either
+    /// lane — the earliest any contested job could be ready).
+    retry_floor: Option<Duration>,
+    /// Descriptors refused before any pull (malformed job_id) —
+    /// the [`DescriptorDisposition::RefusedBadId`] fold.
+    refused_pre_pull: usize,
+    /// Descriptors skipped for a live ledger entry — the
+    /// [`DescriptorDisposition::SkippedLiveEntry`] fold.
+    skipped_live: usize,
     /// The last conversion-disproving rejection's job (the latch
     /// warn names it).
     last_rejected_drv: Option<String>,
+}
+
+impl PassConversion {
+    /// Fold one answered retry floor (min-combining — the earliest
+    /// instant any of the pass's contested jobs could be ready).
+    fn fold_retry_floor(&mut self, retry_after: Option<Duration>) {
+        if let Some(d) = retry_after {
+            self.retry_floor = Some(match self.retry_floor {
+                Some(cur) => cur.min(d),
+                None => d,
+            });
+        }
+    }
+
+    /// Fold one listed descriptor's disposition (the closed
+    /// [`DescriptorDisposition`] alphabet — this exhaustive match is
+    /// the census: a new lane in the fresh loop must mint a variant
+    /// and pick an arm here).
+    fn fold_disposition(&mut self, disposition: DescriptorDisposition) {
+        match disposition {
+            DescriptorDisposition::Minted => {}
+            DescriptorDisposition::RefusedBadId => self.refused_pre_pull += 1,
+            DescriptorDisposition::SkippedLiveEntry => self.skipped_live += 1,
+        }
+    }
+}
+
+/// round-8 WO-S2-1 — what the fresh loop did with ONE listed
+/// descriptor (the closed per-descriptor disposition alphabet;
+/// rustc's exhaustive fold below is the census). The pre-pull lanes
+/// derive [`PassOutcome::ListedNoAction`]'s fields.
+enum DescriptorDisposition {
+    /// A fresh claim nonce was minted and the pull rode the wire.
+    Minted,
+    /// Refused before the pull: the descriptor's job_id does not
+    /// parse (bug_233).
+    RefusedBadId,
+    /// Skipped: a live ledger entry already holds the job's nonce
+    /// (merged_bug_096; the gate-precluded at-cap refusal arm folds
+    /// here too — production slots sit far below the cap).
+    SkippedLiveEntry,
 }
 
 /// merged_bug_005 — the futility classification of ONE fresh-lane
@@ -1065,7 +1308,7 @@ fn futility_evidence(answer: &PullAnswer) -> FutilityEvidence {
         PullAnswer::RejectedDisproving | PullAnswer::RejectedAuth => {
             FutilityEvidence::ConversionDisproved
         }
-        PullAnswer::NotYetReady | PullAnswer::Unanswered => FutilityEvidence::NotFutile,
+        PullAnswer::NotYetReady { .. } | PullAnswer::Unanswered => FutilityEvidence::NotFutile,
         PullAnswer::Shutdown => FutilityEvidence::Inconclusive,
     }
 }
@@ -1188,20 +1431,22 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
     // full PullAnswer alphabet at the fresh dispatch); observed by the
     // futility latch at pass end.
     let mut pass = PassConversion::default();
-    // live_046 (R-B) — the pacing facts: ledger transitions are
-    // derived from the (len, charged) pair around the pass (any mint,
-    // resolution, or standing transition moves at least one).
-    let mut pacing = PassPacing::default();
-    let ledger_shape_at_entry = (ledger.len(), ledger.charged_len());
+    // round-8 WO-S2-1 — the seal's strict-shrink input: entries at
+    // pass entry vs exit (a pass that net-removed credentials did
+    // structural settle work — see [`PassOutcome::Settled`]).
+    let entries_at_entry = ledger.len();
+    // round-8 WO-S2-1 — the ONE exit chokepoint: every exit names its
+    // [`PassExit`] variant (the compile-forced exit census) and the
+    // sealed [`PassOutcome`] is minted HERE, nowhere else.
     macro_rules! finish {
-        () => {{
-            pacing.ledger_transitioned =
-                (ledger.len(), ledger.charged_len()) != ledger_shape_at_entry;
-            return PollPass { claimed, pacing };
+        ($exit:expr) => {{
+            let resolutions = entries_at_entry.saturating_sub(ledger.len());
+            let outcome = PassOutcome::seal($exit, &pass, claimed.len(), resolutions);
+            return PollPass { claimed, outcome };
         }};
     }
     if available_slots == 0 {
-        finish!();
+        finish!(PassExit::Completed);
     }
 
     // bug_251: the RESUME pass runs FIRST — unanswered claims from
@@ -1239,7 +1484,12 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
         };
         let answer = pull_once(transport, shutdown, req, &entry.drv_hash).await;
         if matches!(answer, PullAnswer::Shutdown) {
-            finish!();
+            finish!(PassExit::Abandoned);
+        }
+        // round-8 WO-S2-1 — answered retry floors fold from EITHER
+        // lane (the earliest any contested job could be ready).
+        if let PullAnswer::NotYetReady { retry_after } = &answer {
+            pass.fold_retry_floor(*retry_after);
         }
         ledger.note_presented(entry.job_id);
         // merged_bug_014 — the ONE transition law settles the
@@ -1345,16 +1595,14 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
         // only site that can see "the same Charged entries, pass
         // after pass, never answered".
         ledger.observe_gated_pass(&headroom);
-        pacing.beat_withheld = true;
-        finish!();
+        finish!(PassExit::GatedHeadroom(headroom));
     }
     if futility.withholds_this_pass() {
         debug!(
             "conversion-futility latch engaged; listing beat withheld until \
              the re-probe interval elapses"
         );
-        pacing.beat_withheld = true;
-        finish!();
+        finish!(PassExit::GatedFutility);
     }
     let listed = match bounded(
         shutdown,
@@ -1363,7 +1611,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
     )
     .await
     {
-        BoundedOutcome::Shutdown => finish!(),
+        BoundedOutcome::Shutdown => finish!(PassExit::Abandoned),
         BoundedOutcome::TimedOut { after } => {
             debug!(
                 after_secs = after.as_secs(),
@@ -1371,7 +1619,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             );
             list_health.note_failure("timed out (no answer)");
             transport.note_timeout();
-            finish!();
+            finish!(PassExit::ListFailed);
         }
         BoundedOutcome::Resolved(Ok(resp)) => {
             list_health.note_success();
@@ -1382,10 +1630,9 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             debug!(code = ?status.code(), msg = status.message(),
                    "ListMaterializationJobs failed; empty poll pass");
             list_health.note_failure(&format!("{:?}: {}", status.code(), status.message()));
-            finish!();
+            finish!(PassExit::ListFailed);
         }
     };
-    pacing.listed_any = pass.listed;
 
     // bug_099: the walk's budget counts POTENTIAL server-side mints —
     // every nonce issued whose outcome the scheduler has not answered.
@@ -1464,6 +1711,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
                 metrics::counter!("rio_store_materialization_claim_rejected_total",
                                   "reason" => "bad_job_id")
                 .increment(1);
+                pass.fold_disposition(DescriptorDisposition::RefusedBadId);
                 continue;
             }
         };
@@ -1484,8 +1732,10 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             nonce,
             standing: SlotStanding::Charged,
         }) else {
+            pass.fold_disposition(DescriptorDisposition::SkippedLiveEntry);
             continue;
         };
+        pass.fold_disposition(DescriptorDisposition::Minted);
         // FS-4: count the mint the moment it exists — an answered
         // refusal refunds the BUDGET above, never this counter.
         fresh_mints_this_pass += 1;
@@ -1524,10 +1774,16 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             }
             FutilityEvidence::Inconclusive => {}
         }
+        // round-8 WO-S2-1 — the contested-mint count and the answered
+        // retry floor (the [`PassOutcome::Contested`] inputs).
+        if let PullAnswer::NotYetReady { retry_after } = &answer {
+            pass.contested_mints += 1;
+            pass.fold_retry_floor(*retry_after);
+        }
         // SIGTERM mid-pass: return what was already claimed so the
         // caller can abort/report those attempts under the grace.
         if matches!(answer, PullAnswer::Shutdown) {
-            finish!();
+            finish!(PassExit::Abandoned);
         }
         // merged_bug_014 — the ONE transition law settles the
         // standing (per-arm rationale at [`standing_effect`]); the
@@ -1568,7 +1824,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
     // SIGTERM exits above deliberately do not: an abandoned pass is
     // inconclusive evidence).
     futility.observe_pass(&pass);
-    finish!();
+    finish!(PassExit::Completed);
 }
 
 /// Forward a finished job's outcome until the scheduler acknowledges
@@ -3163,7 +3419,7 @@ mod tests {
             match a {
                 PullAnswer::Deliver(_) => 0,
                 PullAnswer::Gone => 1,
-                PullAnswer::NotYetReady => 2,
+                PullAnswer::NotYetReady { .. } => 2,
                 PullAnswer::Shutdown => 3,
                 PullAnswer::Unanswered => 4,
                 PullAnswer::RejectedDisproving => 5,
@@ -3173,7 +3429,7 @@ mod tests {
         let alphabet: Vec<PullAnswer> = vec![
             PullAnswer::Deliver(Box::default()),
             PullAnswer::Gone,
-            PullAnswer::NotYetReady,
+            PullAnswer::NotYetReady { retry_after: None },
             PullAnswer::Shutdown,
             PullAnswer::Unanswered,
             PullAnswer::RejectedDisproving,
