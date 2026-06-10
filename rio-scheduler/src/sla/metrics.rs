@@ -415,7 +415,14 @@ pub const SLA_LABELED_METRICS: &[(&str, &str, &[&str])] = &[
     (
         "rio_scheduler_sla_hw_ladder_exhausted_total",
         "exit",
-        &["all_masked"],
+        // live_050(e)/live_051(b): the emission-revalidation exits —
+        // `stale_resolved` (demand re-solved/clamped into the largest
+        // live hosting class, disclosed) and `unhostable` (no class
+        // can host even re-solved — feature/arch gap, floor above the
+        // best ceiling, or operator-forced oversize). Census row
+        // appended by the WO that mints the emits (snapshot.rs
+        // emission fold) — the label-extension lane, zero new names.
+        &["all_masked", "stale_resolved", "unhostable"],
     ),
     (
         "rio_scheduler_sla_forecast_dropped_total",

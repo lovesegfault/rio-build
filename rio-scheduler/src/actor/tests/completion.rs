@@ -4988,6 +4988,7 @@ async fn carried_at_cap_deadline_exceeded_is_counted_not_exempt() -> TestResult 
     // The controller rendered the pod at the 24h deadline cap.
     handle
         .send_unchecked(ActorCommand::AckSpawnedIntents {
+            rejected: vec![],
             reply: tokio::sync::oneshot::channel().0,
             spawned: vec![],
             unfulfillable_cells: vec![],

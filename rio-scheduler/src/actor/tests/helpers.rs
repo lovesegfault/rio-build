@@ -1285,6 +1285,7 @@ pub(crate) async fn bind_intent_node(
         .send_unchecked(ActorCommand::AckSpawnedIntents {
             // merged_bug_005 reply: receiver intentionally dropped —
             // these tests assert via actor state, not the ack path.
+            rejected: vec![],
             reply: tokio::sync::oneshot::channel().0,
             binding_snapshot: None,
             spawned: vec![],

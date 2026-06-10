@@ -1001,7 +1001,7 @@ async fn ice_mask_is_read_time() {
     // Mask one cell from A' via the controller's unfulfillable report.
     let masked: crate::sla::config::Cell = ("intel-6".into(), CapacityType::Spot);
     actor
-        .handle_ack_spawned_intents(&[], &["intel-6:spot".into()], &[], &[], &[], None)
+        .handle_ack_spawned_intents(&[], &["intel-6:spot".into()], &[], &[], &[], None, &[])
         .expect("applied under leadership");
     assert!(actor.ice.is_masked(&masked));
 
@@ -1122,6 +1122,7 @@ async fn ice_step_doubles_across_mark_without_clear() {
                 &[],
                 &[],
                 None,
+                &[],
             )
             .expect("applied under leadership");
     }
@@ -1134,7 +1135,7 @@ async fn ice_step_doubles_across_mark_without_clear() {
 
     // `registered_cells` IS the success signal → resets.
     actor
-        .handle_ack_spawned_intents(&[], &[], &["intel-6:spot".into()], &[], &[], None)
+        .handle_ack_spawned_intents(&[], &[], &["intel-6:spot".into()], &[], &[], None, &[])
         .expect("applied under leadership");
     assert_eq!(actor.ice.step(&cell), None, "registered_cells clears");
 }
@@ -1167,6 +1168,7 @@ async fn pull_mint_ice_clear_only_at_single_cell() -> TestResult {
     };
     let ack =
         |intent_id: &str, hw: &[&str], unfulfillable: &[&str]| ActorCommand::AckSpawnedIntents {
+            rejected: vec![],
             reply: tokio::sync::oneshot::channel().0,
             spawned: vec![SpawnIntent {
                 intent_id: intent_id.into(),

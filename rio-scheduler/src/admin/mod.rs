@@ -782,6 +782,9 @@ impl AdminService for AdminServiceImpl {
                 // C2/285: optional wrapper → presence-preserving
                 // Option (absent ≠ empty on this wire by design).
                 binding_snapshot: req.binding_snapshot.map(|s| s.bound),
+                // live_051(c): the verdict plane rides the same
+                // validate-then-commit apply as every other plane.
+                rejected: req.rejected,
                 reply,
             })
             .await

@@ -469,6 +469,7 @@ async fn contract_ice_step_doubles_then_clears_on_registered() {
                 &[],
                 &[],
                 None,
+                &[],
             )
             .expect("applied under leadership");
     }
@@ -493,7 +494,7 @@ async fn contract_ice_step_doubles_then_clears_on_registered() {
     );
 
     actor
-        .handle_ack_spawned_intents(&[], &[], &["intel-6:spot".into()], &[], &[], None)
+        .handle_ack_spawned_intents(&[], &[], &["intel-6:spot".into()], &[], &[], None, &[])
         .expect("applied under leadership");
     assert_eq!(
         actor.ice.step(&cell),
@@ -547,6 +548,7 @@ async fn ack_observed_instance_types_folds_into_cost_table() {
             ],
             &[],
             None,
+            &[],
         )
         .expect("applied under leadership");
 
@@ -600,6 +602,7 @@ async fn ack_bound_intents_populates_authoritative_binding() {
                 bi("def456", "ip-10-0-1-6.ec2.internal"),
             ],
             None,
+            &[],
         )
         .expect("applied under leadership");
 
@@ -632,6 +635,7 @@ async fn ack_bound_intents_populates_authoritative_binding() {
             &[],
             &[bi("abc123", "ip-10-0-1-5.ec2.internal")],
             None,
+            &[],
         )
         .expect("applied under leadership");
     assert_eq!(actor.authoritative_binding.len(), 1);
@@ -642,7 +646,7 @@ async fn ack_bound_intents_populates_authoritative_binding() {
     // (per-pool reconciler at pool/jobs.rs sends `vec![]`; the
     // nodeclaim_pool reconciler owns the stream) → map unchanged.
     actor
-        .handle_ack_spawned_intents(&[], &[], &[], &[], &[], None)
+        .handle_ack_spawned_intents(&[], &[], &[], &[], &[], None, &[])
         .expect("applied under leadership");
     assert_eq!(
         actor.authoritative_binding.len(),
@@ -674,14 +678,22 @@ async fn ack_binding_snapshot_presence_semantics() {
 
     // Some(non-empty) rebuilds.
     actor
-        .handle_ack_spawned_intents(&[], &[], &[], &[], &[], Some(&[bi("abc285", "node-1")]))
+        .handle_ack_spawned_intents(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            Some(&[bi("abc285", "node-1")]),
+            &[],
+        )
         .expect("applied under leadership");
     assert_eq!(actor.authoritative_binding.len(), 1);
     assert!(actor.authoritative_binding.contains_key(&abc));
 
     // None leaves the map untouched (per-pool Ack shape).
     actor
-        .handle_ack_spawned_intents(&[], &[], &[], &[], &[], None)
+        .handle_ack_spawned_intents(&[], &[], &[], &[], &[], None, &[])
         .expect("applied under leadership");
     assert_eq!(
         actor.authoritative_binding.len(),
@@ -691,7 +703,7 @@ async fn ack_binding_snapshot_presence_semantics() {
 
     // Some(EMPTY) clears — scale-to-zero says so explicitly.
     actor
-        .handle_ack_spawned_intents(&[], &[], &[], &[], &[], Some(&[]))
+        .handle_ack_spawned_intents(&[], &[], &[], &[], &[], Some(&[]), &[])
         .expect("applied under leadership");
     assert!(
         actor.authoritative_binding.is_empty(),
@@ -740,7 +752,15 @@ async fn ack_observed_lands_pre_reload_and_survives_the_edge_reload() {
         .cost_was_leader
         .store(false, std::sync::atomic::Ordering::Relaxed);
     actor
-        .handle_ack_spawned_intents(&[], &["mid-ebs-x86:spot".into()], &[], &observed, &[], None)
+        .handle_ack_spawned_intents(
+            &[],
+            &["mid-ebs-x86:spot".into()],
+            &[],
+            &observed,
+            &[],
+            None,
+            &[],
+        )
         .expect("pre-reload Ack applies every plane (the gate is gone)");
     assert_eq!(
         actor.cost_table.read().menu(&spot).len(),
@@ -815,6 +835,7 @@ async fn ack_undecodable_plane_entry_refuses_whole_request() {
         &[],
         &[],
         None,
+        &[],
     );
     assert_eq!(
         r,
@@ -873,8 +894,15 @@ async fn ack_skewed_arm_echo_refused_not_truncated() {
     };
     intent.node_affinity.pop();
 
-    let r =
-        actor.handle_ack_spawned_intents(std::slice::from_ref(&intent), &[], &[], &[], &[], None);
+    let r = actor.handle_ack_spawned_intents(
+        std::slice::from_ref(&intent),
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        &[],
+    );
     assert_eq!(
         r,
         Err(crate::actor::AckApplyError::ArmEchoSkewed {
@@ -934,8 +962,15 @@ async fn arm_decode_refuses_the_label_copy_of_the_capacity_key() {
         ..Default::default()
     };
 
-    let r =
-        actor.handle_ack_spawned_intents(std::slice::from_ref(&intent), &[], &[], &[], &[], None);
+    let r = actor.handle_ack_spawned_intents(
+        std::slice::from_ref(&intent),
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        &[],
+    );
     assert!(
         matches!(
             &r,
@@ -982,8 +1017,15 @@ async fn arm_decode_refuses_notin_operator() {
         ..Default::default()
     };
 
-    let r =
-        actor.handle_ack_spawned_intents(std::slice::from_ref(&intent), &[], &[], &[], &[], None);
+    let r = actor.handle_ack_spawned_intents(
+        std::slice::from_ref(&intent),
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        &[],
+    );
     assert!(
         matches!(
             &r,
@@ -1029,8 +1071,15 @@ async fn arm_decode_refuses_multivalue_capacity() {
         ..Default::default()
     };
 
-    let r =
-        actor.handle_ack_spawned_intents(std::slice::from_ref(&intent), &[], &[], &[], &[], None);
+    let r = actor.handle_ack_spawned_intents(
+        std::slice::from_ref(&intent),
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        &[],
+    );
     assert!(
         matches!(
             &r,
@@ -1082,7 +1131,15 @@ async fn producer_echo_roundtrips_through_arm_decode() {
             ..Default::default()
         };
         actor
-            .handle_ack_spawned_intents(std::slice::from_ref(&intent), &[], &[], &[], &[], None)
+            .handle_ack_spawned_intents(
+                std::slice::from_ref(&intent),
+                &[],
+                &[],
+                &[],
+                &[],
+                None,
+                &[],
+            )
             .expect("the producer's own echo decodes");
         let armed = actor
             .dispatched_cells
@@ -1123,7 +1180,7 @@ async fn ack_legacy_unarmed_echo_answers_ok_without_arm() {
     };
 
     actor
-        .handle_ack_spawned_intents(std::slice::from_ref(&intent), &[], &[], &[], &[], None)
+        .handle_ack_spawned_intents(std::slice::from_ref(&intent), &[], &[], &[], &[], None, &[])
         .expect("legacy shape is a typed no-arm lane, not a refusal");
     assert!(
         actor.dispatched_cells.get("d-legacy").is_none(),
@@ -1161,7 +1218,15 @@ async fn ack_redelivered_epoch_mark_does_not_climb_post_expiry() {
 
     let mark_e7 = encode_cell_event("intel-6", WireCapacity::Spot, Some(EvidenceEpoch(7)));
     actor
-        .handle_ack_spawned_intents(&[], std::slice::from_ref(&mark_e7), &[], &[], &[], None)
+        .handle_ack_spawned_intents(
+            &[],
+            std::slice::from_ref(&mark_e7),
+            &[],
+            &[],
+            &[],
+            None,
+            &[],
+        )
         .expect("first delivery applies");
     assert_eq!(actor.ice.step(&cell), Some(0), "first failure at rung 0");
 
@@ -1169,7 +1234,15 @@ async fn ack_redelivered_epoch_mark_does_not_climb_post_expiry() {
     // the SAME buffered event (client timeout after server apply).
     actor.ice.force_expire(&cell);
     actor
-        .handle_ack_spawned_intents(&[], std::slice::from_ref(&mark_e7), &[], &[], &[], None)
+        .handle_ack_spawned_intents(
+            &[],
+            std::slice::from_ref(&mark_e7),
+            &[],
+            &[],
+            &[],
+            None,
+            &[],
+        )
         .expect("redelivery answers Ok — delivered evidence must clear the buffer");
     assert_eq!(
         actor.ice.step(&cell),
@@ -1180,7 +1253,15 @@ async fn ack_redelivered_epoch_mark_does_not_climb_post_expiry() {
     // A genuinely new failure (strictly newer epoch) climbs.
     let mark_e8 = encode_cell_event("intel-6", WireCapacity::Spot, Some(EvidenceEpoch(8)));
     actor
-        .handle_ack_spawned_intents(&[], std::slice::from_ref(&mark_e8), &[], &[], &[], None)
+        .handle_ack_spawned_intents(
+            &[],
+            std::slice::from_ref(&mark_e8),
+            &[],
+            &[],
+            &[],
+            None,
+            &[],
+        )
         .expect("newer epoch applies");
     assert_eq!(
         actor.ice.step(&cell),
@@ -1212,11 +1293,27 @@ async fn ack_clear_then_mark_realizes_reset_then_step0() {
 
     // Climb to rung 1 via two genuine post-expiry failures.
     actor
-        .handle_ack_spawned_intents(&[], std::slice::from_ref(&mark(1)), &[], &[], &[], None)
+        .handle_ack_spawned_intents(
+            &[],
+            std::slice::from_ref(&mark(1)),
+            &[],
+            &[],
+            &[],
+            None,
+            &[],
+        )
         .expect("applies");
     actor.ice.force_expire(&cell);
     actor
-        .handle_ack_spawned_intents(&[], std::slice::from_ref(&mark(2)), &[], &[], &[], None)
+        .handle_ack_spawned_intents(
+            &[],
+            std::slice::from_ref(&mark(2)),
+            &[],
+            &[],
+            &[],
+            None,
+            &[],
+        )
         .expect("applies");
     assert_eq!(actor.ice.step(&cell), Some(1), "precondition: rung 1");
     actor.ice.force_expire(&cell);
@@ -1230,6 +1327,7 @@ async fn ack_clear_then_mark_realizes_reset_then_step0() {
             &[],
             &[],
             None,
+            &[],
         )
         .expect("both planes apply");
     assert_eq!(
@@ -1277,7 +1375,7 @@ async fn contract_ack_spawned_records_full_a_prime() {
     };
 
     actor
-        .handle_ack_spawned_intents(std::slice::from_ref(&intent), &[], &[], &[], &[], None)
+        .handle_ack_spawned_intents(std::slice::from_ref(&intent), &[], &[], &[], &[], None, &[])
         .expect("applied under leadership");
 
     let got: std::collections::HashSet<Cell> = actor
@@ -4175,6 +4273,7 @@ async fn contract_first_pull_clears_ice_not_yet_ready_does_not() {
             &[],
             &[],
             None,
+            &[],
         )
         .expect("applied under leadership");
     // Arm + mark the waiter's intent the same way (hand-built echo with
@@ -4193,6 +4292,7 @@ async fn contract_first_pull_clears_ice_not_yet_ready_does_not() {
             &[],
             &[],
             None,
+            &[],
         )
         .expect("applied under leadership");
     assert!(actor.ice.is_masked(&cell), "precondition: cell ICE-masked");
@@ -4387,7 +4487,15 @@ async fn leadership_cycle_resets_the_epoch_watermark() {
     // Old controller lineage: genuine mark at epoch 1000 — masked,
     // watermark ratchets to 1000.
     actor
-        .handle_ack_spawned_intents(&[], &["mid-ebs-x86:spot@1000".into()], &[], &[], &[], None)
+        .handle_ack_spawned_intents(
+            &[],
+            &["mid-ebs-x86:spot@1000".into()],
+            &[],
+            &[],
+            &[],
+            None,
+            &[],
+        )
         .expect("mark applied under leadership");
     assert_eq!(
         actor.ice.step(&cell),
@@ -4419,7 +4527,15 @@ async fn leadership_cycle_resets_the_epoch_watermark() {
     // lose edge, so the mark APPLIES — post-expiry consecutive
     // failure climbs the ladder and re-masks.
     actor
-        .handle_ack_spawned_intents(&[], &["mid-ebs-x86:spot@500".into()], &[], &[], &[], None)
+        .handle_ack_spawned_intents(
+            &[],
+            &["mid-ebs-x86:spot@500".into()],
+            &[],
+            &[],
+            &[],
+            None,
+            &[],
+        )
         .expect("successor-lineage mark applied");
     assert_eq!(
         actor.ice.step(&cell),
@@ -4498,7 +4614,7 @@ async fn acked_vanish_mark_masks_spot_and_solve_buys_od() {
         .map(|h| encode_cell_event(h, WireCapacity::Spot, Some(EvidenceEpoch(1))))
         .collect();
     actor
-        .handle_ack_spawned_intents(&[], &marks, &[], &[], &[], None)
+        .handle_ack_spawned_intents(&[], &marks, &[], &[], &[], None, &[])
         .expect("applied under leadership");
     for h in ["intel-6", "intel-7", "intel-8"] {
         let cell: crate::sla::config::Cell = (h.into(), CapacityType::Spot);
@@ -4621,7 +4737,7 @@ async fn rung_one_ice_advances_to_a_different_rung() {
         .map(|h| encode_cell_event(h, WireCapacity::Spot, Some(EvidenceEpoch(1))))
         .collect();
     actor
-        .handle_ack_spawned_intents(&[], &marks, &[], &[], &[], None)
+        .handle_ack_spawned_intents(&[], &marks, &[], &[], &[], None, &[])
         .expect("applied under leadership");
 
     // The advance: the next emission's UNMASKED set is non-empty and
@@ -4772,7 +4888,7 @@ async fn phantom_ceiling_rung_advances_not_starves() {
         .map(|h| encode_cell_event(h, WireCapacity::Spot, Some(EvidenceEpoch(1))))
         .collect();
     actor
-        .handle_ack_spawned_intents(&[], &marks, &[], &[], &[], None)
+        .handle_ack_spawned_intents(&[], &marks, &[], &[], &[], None, &[])
         .expect("applied under leadership");
 
     // The walk advances: a launchable unmasked rung exists (the
@@ -4815,5 +4931,939 @@ async fn phantom_ceiling_rung_advances_not_starves() {
         intent2.cores <= 191,
         "the re-emission stays grounded: cores={}",
         intent2.cores
+    );
+}
+
+// ===========================================================================
+// WO-S7-7 — stale-solve revalidation: the CellEmission alphabet, the
+// floor clamp law, and the no-hosting-class verdict consumer
+// (live_050(e) + live_051(b)/(d)/(c)).
+// ===========================================================================
+
+/// Shrink every builder class's catalog ceiling to `(cores, mem)` —
+/// the WO-S7-6 catalog fixture lane in its minimal form (the ceiling
+/// vector swap between two emission passes).
+fn shrink_catalog(actor: &DagActor, cores: u32, mem: u64) {
+    let mut c = std::collections::HashMap::new();
+    for h in actor.sla_config.hw_classes.keys() {
+        c.insert(h.clone(), (cores, mem));
+    }
+    actor.cost_table.write().set_catalog_ceilings(c);
+}
+
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+/// **R17 + W7-Q + W7-S** — *a demand envelope solved under ceiling C,
+/// with ceilings then shrunk to C′ < demand, is RE-SOLVED on the next
+/// emission pass*: the emitted intent carries cells hostable under C′
+/// (structural: non-empty cells, each named class's live ceiling ≥ the
+/// re-solved dims). Promptness is operation-count (W7-S): the FIRST
+/// `compute_spawn_intents` after the shrink re-solves — no deadline
+/// pacing, zero wall-clock. Production emission pass end-to-end; the
+/// ceiling swap rides the catalog fixture lane.
+///
+/// Pre-fix red (left, reverse-strawman transcript in the commit body):
+/// `hw_class_names == []` — the fitted drv's BestEffort solve fell to
+/// the hw-agnostic fallback and `bypass_cells` emitted empty SILENTLY;
+/// the controller would churn it as `no_hosting_class` forever (the
+/// measured post-rev-3 live loop).
+#[tokio::test]
+async fn stale_envelope_revalidates_on_ceiling_shrink() {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw_builders_only(db.pool.clone());
+    actor.test_inject_ready("d-stale", Some("test-pkg"), "x86_64-linux", false);
+
+    // Pass 1: solved under the BIG ceilings — hw-routed cells.
+    let snap = actor.compute_spawn_intents(&Default::default());
+    let i1 = snap
+        .intents
+        .iter()
+        .find(|i| i.intent_id == "d-stale")
+        .expect("emitted");
+    assert!(
+        !i1.hw_class_names.is_empty(),
+        "precondition: solved hw-routed under C"
+    );
+
+    // The shrink: every class's catalog ceiling drops below the fitted
+    // demand (mem p90 6 GiB ≫ 1 GiB).
+    shrink_catalog(&actor, 2, 1 << 30);
+
+    // Pass 2 — the FIRST pass after the shrink (W7-S): re-solved, not
+    // empty. Every named class hosts the re-solved dims under C′.
+    let snap2 = actor.compute_spawn_intents(&Default::default());
+    let i2 = snap2
+        .intents
+        .iter()
+        .find(|i| i.intent_id == "d-stale")
+        .expect("re-emitted");
+    assert!(
+        !i2.hw_class_names.is_empty(),
+        "the stale envelope RE-SOLVES at the next emission — never empty cells \
+         for non-agnostic demand (pre-fix: [] silent)"
+    );
+    let catalog = actor.cost_table.read().clone();
+    for h in &i2.hw_class_names {
+        let (cc, cm) = actor.sla_config.class_ceilings(
+            h,
+            catalog.catalog_ceilings(),
+            catalog.resolved_global(),
+        );
+        assert!(
+            i2.cores <= cc && i2.mem_bytes <= cm,
+            "re-solved dims ({}, {}) hostable by {h} under C' ({cc}, {cm})",
+            i2.cores,
+            i2.mem_bytes
+        );
+    }
+}
+
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+/// **R18 (green-side pin, disclosed)** — *the genuinely hw-agnostic
+/// emission stays quiet*: a featureless drv with NO infeasibility
+/// evidence emits empty `hw_class_names` exactly as before the typing
+/// (the §13e cold-start arm's regression pin — quiet BY TYPE via
+/// `CellEmission::HwAgnostic`, not by shared emptiness). Green
+/// pre-fix AND post-fix by design (W7-R's quiet-edge half).
+#[tokio::test]
+async fn hw_agnostic_emission_stays_quiet() {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw_builders_only(db.pool.clone());
+    // No pname → no fit → probe path → zero infeasibility evidence.
+    actor.test_inject_ready("d-quiet", None, "x86_64-linux", false);
+    let snap = actor.compute_spawn_intents(&Default::default());
+    let i = snap
+        .intents
+        .iter()
+        .find(|i| i.intent_id == "d-quiet")
+        .expect("emitted");
+    assert!(
+        i.hw_class_names.is_empty() && i.node_affinity.is_empty(),
+        "genuinely agnostic demand keeps the quiet fallback-cell path: {:?}",
+        i.hw_class_names
+    );
+}
+
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+/// **R19 + R23 + W7-V (unhostable half) + W7-R (kill-isolation)** —
+/// *feature-constrained demand no class can host even re-solved is
+/// `Unhostable` + LOUD, never empty-silent*: a FOD whose clamped floor
+/// exceeds every fetcher class's live ceiling emits typed-empty WITH
+/// the disclosure (the `exit="unhostable"` counter + warn naming
+/// demand and best class). The task-named red (live_051(b)): pre-fix
+/// left = `hw_class_names == []` with ZERO disclosure (counter absent)
+/// — indistinguishable from hw-agnostic; the controller would churn
+/// `no_hosting_class`.
+///
+/// The floor value models the persisted-row population (a prior run's
+/// OOM ladder under bigger ceilings) — r13-allow(frozen-legacy): the
+/// adversarial INPUT is legacy persisted state by definition; the
+/// bump-law provenance of such values is pinned by the floor.rs unit
+/// battery.
+#[tokio::test]
+async fn infeasible_everywhere_drv_emits_unhostable_not_empty_cells() {
+    let metrics = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = metrics.snapshotter();
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    // FOD → effective features [fetcher] → fetcher-* candidates only.
+    actor.test_inject_ready("d-fod", Some("fod-pkg"), "x86_64-linux", true);
+    // Fetcher catalog ceilings shrink below the (clamped) floor.
+    shrink_catalog(&actor, 2, 1 << 30);
+    actor
+        .dag
+        .node_mut("d-fod")
+        .unwrap()
+        .sched
+        .resource_floor
+        .mem_bytes = 8 << 30; // legacy row: above every live class ceiling
+    let snap = metrics::with_local_recorder(&metrics, || {
+        actor.compute_spawn_intents(&Default::default())
+    });
+    let i = snap
+        .intents
+        .iter()
+        .find(|i| i.intent_id == "d-fod")
+        .expect("emitted");
+    assert!(
+        i.hw_class_names.is_empty(),
+        "unhostable demand emits typed-EMPTY (no phantom cell): {:?}",
+        i.hw_class_names
+    );
+    // The disclosure: exit="unhostable" counted exactly once
+    // (debounced per (tenant, pname, kind) edge). ONE snapshot
+    // (hazard ppppp).
+    let snap_m = snapshotter.snapshot().into_vec();
+    let unhostable: u64 = snap_m
+        .iter()
+        .filter_map(|(k, _, _, v)| {
+            let (kind, key) = k.clone().into_parts();
+            (kind == metrics_util::MetricKind::Counter
+                && key.name() == "rio_scheduler_sla_hw_ladder_exhausted_total"
+                && key
+                    .labels()
+                    .any(|l| l.key() == "exit" && l.value() == "unhostable"))
+            .then_some(match v {
+                metrics_util::debugging::DebugValue::Counter(c) => *c,
+                _ => 0,
+            })
+        })
+        .sum();
+    assert_eq!(
+        unhostable, 1,
+        "the unhostable emission is DISCLOSED (typed + loud) — pre-fix: zero"
+    );
+}
+
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+/// **The live_051(b) clamp green twin (W7-V, clamp half)** —
+/// *demand infeasible at every class with NO feature constraint
+/// clamps-with-disclosure into the largest mintable class*: a fitted
+/// featureless drv whose solve is BestEffort under shrunk per-class
+/// ceilings emits NAMED cells at the clamped size (hostable by
+/// composition — the global is honest post-live_051(a)) plus the
+/// `exit="stale_resolved"` disclosure. Kill-isolation vs `HwAgnostic`:
+/// the quiet arm (no evidence) emits no cells and no disclosure —
+/// `hw_agnostic_emission_stays_quiet` is the paired pin.
+#[tokio::test]
+async fn oversize_unconstrained_demand_clamps_with_disclosure() {
+    let metrics = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = metrics.snapshotter();
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw_builders_only(db.pool.clone());
+    actor.test_inject_ready("d-clamp", Some("test-pkg"), "x86_64-linux", false);
+    // Every class's catalog mem ceiling drops below the fitted demand
+    // (p90 6 GiB → 2 GiB ceilings): infeasible at every class, no
+    // feature constraint, floor zero.
+    shrink_catalog(&actor, 32, 2 << 30);
+    let snap = metrics::with_local_recorder(&metrics, || {
+        actor.compute_spawn_intents(&Default::default())
+    });
+    let i = snap
+        .intents
+        .iter()
+        .find(|i| i.intent_id == "d-clamp")
+        .expect("emitted");
+    assert!(
+        !i.hw_class_names.is_empty(),
+        "clamp-with-disclosure emits NAMED cells (never empty for evidenced demand)"
+    );
+    assert!(
+        i.mem_bytes <= 2 << 30,
+        "demand clamped into the live class ceiling: mem={}",
+        i.mem_bytes
+    );
+    let snap_m = snapshotter.snapshot().into_vec();
+    let resolved: u64 = snap_m
+        .iter()
+        .filter_map(|(k, _, _, v)| {
+            let (kind, key) = k.clone().into_parts();
+            (kind == metrics_util::MetricKind::Counter
+                && key.name() == "rio_scheduler_sla_hw_ladder_exhausted_total"
+                && key
+                    .labels()
+                    .any(|l| l.key() == "exit" && l.value() == "stale_resolved"))
+            .then_some(match v {
+                metrics_util::debugging::DebugValue::Counter(c) => *c,
+                _ => 0,
+            })
+        })
+        .sum();
+    assert_eq!(resolved, 1, "the clamp is DISCLOSED exactly once per edge");
+}
+
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+/// **R24 + W7-W** — *a floor persisted above the live global is
+/// consumed CLAMPED on the first post-boot read, and the hydrate seam
+/// grounds it on entry*: actor-1 ("the old boot", big ceilings)
+/// persists an 8 GiB floor row; actor-2 ("the new boot", 2 GiB live
+/// global via the test config) re-merges the same drv — the I-208
+/// hydrate clamps the row at entry (in-mem floor ≤ live global) and
+/// the production emission stays hostable (cells derivable; the
+/// bypass mem can no longer exceed the live global — the (b) channel
+/// is dead). Kill-isolation: a floor BELOW the live global hydrates
+/// byte-identical (`merge_hydrates_resource_floor_from_db` is the
+/// paired pin at the clamped boundary).
+///
+/// Pre-fix red (left, reverse-strawman transcript in the commit
+/// body): hydrated floor == 8 GiB (the 383-era value re-imported
+/// across the boot); the bypass max re-raises mem past the live
+/// global and the emission falls into the silent empty-cells channel.
+///
+/// The seeded row is the persisted-legacy population —
+/// r13-allow(frozen-legacy), disclosed: rows written by a prior boot
+/// under bigger ceilings ARE legacy data; the GREATEST-ratchet writer
+/// preserves them by design (the law grounds them at consumption).
+#[tokio::test]
+async fn floor_above_global_reclamps_at_boot() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+
+    // "Old boot": create the row via a production merge, then the
+    // prior run's OOM ladder leaves floor_mem=8GiB persisted (legacy
+    // row form, frozen-legacy lane).
+    let mut actor1 = bare_actor_hw_builders_only(db.pool.clone());
+    let node = make_node("d-floor");
+    let req = |nodes, build_id| crate::actor::command::MergeDagRequest {
+        build_id,
+        tenant_id: None,
+        priority_class: crate::state::PriorityClass::Scheduled,
+        nodes,
+        edges: vec![],
+        options: crate::state::BuildOptions::default(),
+        keep_going: false,
+        traceparent: String::new(),
+        jti: None,
+        jwt_token: None,
+    };
+    actor1
+        .handle_merge_dag(req(vec![node.clone()], Uuid::new_v4()))
+        .await
+        .expect("old-boot merge");
+    sqlx::query("UPDATE derivations SET floor_mem_bytes = $2 WHERE drv_hash = $1")
+        .bind(&node.drv_hash)
+        .bind(8i64 << 30)
+        .execute(&db.pool)
+        .await?;
+
+    // "New boot": fresh actor, SMALL live global (test_default 2 GiB).
+    let mut actor2 = bare_actor_cfg(
+        db.pool.clone(),
+        DagActorConfig {
+            sla: crate::sla::config::SlaConfig::test_default(),
+            ..Default::default()
+        },
+    );
+    let live_max_mem = actor2.sla_ceilings.max_mem;
+    assert!(
+        live_max_mem < 8 << 30,
+        "precondition: the live global shrank"
+    );
+    actor2
+        .handle_merge_dag(req(vec![node], Uuid::new_v4()))
+        .await
+        .expect("new-boot merge");
+    let hydrated = actor2
+        .dag
+        .node("d-floor")
+        .expect("merged")
+        .sched
+        .resource_floor
+        .mem_bytes;
+    assert_eq!(
+        hydrated, live_max_mem,
+        "the hydrate seam grounds the stale row at the LIVE global \
+         (pre-fix: 8 GiB re-imported raw)"
+    );
+    Ok(())
+}
+
+/// One `NO_HOSTING_CLASS` wire verdict.
+fn no_host_verdict(id: &str, detail: &str) -> rio_proto::types::IntentVerdict {
+    rio_proto::types::IntentVerdict {
+        intent_id: id.into(),
+        reason: rio_proto::types::IntentVerdictReason::NoHostingClass as i32,
+        detail: detail.into(),
+    }
+}
+
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+/// **R25 + W7-X** — *N consecutive no-hosting-class verdicts drive the
+/// drv out of Ready via poison with the controller's detail*
+/// (operation-count: exactly `NO_HOST_VERDICTS_TO_POISON` applied
+/// acks; zero wall-clock). Pre-fix red (left): the ack carried no
+/// verdict plane at all — nothing counted, the drv re-emitted Ready
+/// forever, and the measured live loop ended only by operator
+/// cancellation.
+///
+/// Kill-isolation pins (each its own conjunct):
+/// - N−1 verdicts then a SPAWNED echo for the drv → the track resets
+///   (the heal path) — N−1 further verdicts still do not poison;
+/// - a verdict whose `detail` changed (config reload / re-solved
+///   demand, in-band) restarts the count at 1;
+/// - duplicate entries for one drv within ONE ack count once (the
+///   in-request dedup half of the redelivery law; the cross-request
+///   half is the PRODUCER's no-buffer law — `CoverResult::rejected`
+///   is re-minted per pass, never redelivered, and `admin_call` is
+///   single-shot — cited, controller-side).
+#[tokio::test]
+async fn n_no_host_verdicts_poison_the_drv_with_the_verdict_message() {
+    use crate::actor::snapshot::NO_HOST_VERDICTS_TO_POISON as N;
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw_builders_only(db.pool.clone());
+    actor.test_inject_ready("d-loop", Some("test-pkg"), "x86_64-linux", false);
+    let detail = "no [sla.hw_classes] entry hosts system=x86_64-linux cores=383 \
+                  mem_bytes=412316860416 required_features=[]; configured classes: \
+                  [intel-6, intel-7, intel-8]";
+
+    // N−1 applied acks: counted, never poisoned.
+    for k in 1..N {
+        let p = actor
+            .handle_ack_spawned_intents(
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                None,
+                &[no_host_verdict("d-loop", detail)],
+            )
+            .expect("applied under leadership");
+        assert!(p.is_empty(), "no poison at {k} < {N}");
+    }
+    assert_eq!(
+        actor.dag.node("d-loop").unwrap().status(),
+        DerivationStatus::Ready,
+        "still Ready inside the budget"
+    );
+
+    // The Nth: the budget crosses — the typed poison row carries the
+    // controller's detail; applying it drives Ready → Poisoned.
+    let p = actor
+        .handle_ack_spawned_intents(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[no_host_verdict("d-loop", detail)],
+        )
+        .expect("applied under leadership");
+    assert_eq!(p.len(), 1, "budget crossing at exactly N = {N}");
+    assert_eq!(
+        p[0].detail, detail,
+        "the operator message IS the verdict detail"
+    );
+    actor.apply_no_host_poisons(p).await;
+    assert_eq!(
+        actor.dag.node("d-loop").unwrap().status(),
+        DerivationStatus::Poisoned,
+        "the drv leaves Ready via the EXISTING poison machinery — \
+         emission stops (Ready-only spawn-intent filter)"
+    );
+}
+
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+/// W7-X kill-isolation: the three reset/dedup conjuncts of the
+/// verdict-budget law, each driven through the production ack-apply
+/// plane (see `n_no_host_verdicts_poison_the_drv_with_the_verdict_
+/// message` for the poison half).
+#[tokio::test]
+async fn verdict_budget_resets_on_spawn_detail_change_and_dedups_in_request() {
+    use crate::actor::snapshot::NO_HOST_VERDICTS_TO_POISON as N;
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw_builders_only(db.pool.clone());
+    actor.test_inject_ready("d-heal", Some("test-pkg"), "x86_64-linux", false);
+
+    // (a) spawn reset: N−1 verdicts, then a spawned echo, then N−1
+    // more — never poisons (the count restarted).
+    for _ in 1..N {
+        actor
+            .handle_ack_spawned_intents(
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                None,
+                &[no_host_verdict("d-heal", "A")],
+            )
+            .expect("applied");
+    }
+    let spawned = rio_proto::types::SpawnIntent {
+        intent_id: "d-heal".into(),
+        ..Default::default()
+    };
+    actor
+        .handle_ack_spawned_intents(
+            std::slice::from_ref(&spawned),
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[],
+        )
+        .expect("applied");
+    for k in 1..N {
+        let p = actor
+            .handle_ack_spawned_intents(
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                None,
+                &[no_host_verdict("d-heal", "A")],
+            )
+            .expect("applied");
+        assert!(
+            p.is_empty(),
+            "spawn reset the track: no poison at {k} of the second run"
+        );
+    }
+
+    // (b) detail change restarts at 1: one B-verdict after the A-run
+    // (count N−1) leaves a track of 1 — N−2 more Bs still no poison.
+    let p = actor
+        .handle_ack_spawned_intents(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[no_host_verdict("d-heal", "B")],
+        )
+        .expect("applied");
+    assert!(p.is_empty(), "detail change restarts the count at 1");
+    for k in 0..N.saturating_sub(2) {
+        let p = actor
+            .handle_ack_spawned_intents(
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                None,
+                &[no_host_verdict("d-heal", "B")],
+            )
+            .expect("applied");
+        assert!(p.is_empty(), "B-run still inside the budget at {}", k + 2);
+    }
+
+    // (c) in-request dedup: ONE ack carrying the drv twice counts
+    // once — the Nth B entry rides this ack (count N−1 → N), and the
+    // duplicate does NOT overshoot (poison fires exactly here, len 1).
+    let p = actor
+        .handle_ack_spawned_intents(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[
+                no_host_verdict("d-heal", "B"),
+                no_host_verdict("d-heal", "B"),
+            ],
+        )
+        .expect("applied");
+    assert_eq!(p.len(), 1, "duplicate entries within one ack count once");
+}
+
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+/// Counter-lifecycle law table (R15 product census over the step
+/// alphabet): `step_no_host_counter` walked over (prev-state ×
+/// event-detail) cells with a HAND-WRITTEN oracle (never the impl's
+/// own expression). The apply-plane composition rows (spawn reset,
+/// in-request dedup, Ready-only poison) are pinned by the two
+/// production-plane tests above.
+#[test]
+fn no_host_counter_step_law_table() {
+    use crate::actor::snapshot::step_no_host_counter as step;
+    // (prev, incoming detail) → (count, detail) — hand oracle.
+    #[allow(clippy::type_complexity)] // law-table rows read better flat
+    let rows: &[(Option<(u32, &str)>, &str, (u32, &str))] = &[
+        (None, "A", (1, "A")),                         // first evidence
+        (Some((1, "A")), "A", (2, "A")),               // consecutive identical
+        (Some((7, "A")), "A", (8, "A")),               // accumulates
+        (Some((7, "A")), "B", (1, "B")),               // detail change restarts
+        (Some((u32::MAX, "A")), "A", (u32::MAX, "A")), // saturates, no wrap
+    ];
+    for (prev, detail, want) in rows {
+        let prev_owned = prev.map(|(n, d)| (n, d.to_string()));
+        let got = step(prev_owned.as_ref(), detail);
+        assert_eq!(
+            (got.0, got.1.as_str()),
+            (want.0, want.1),
+            "row ({prev:?}, {detail})"
+        );
+    }
+}
+
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+/// An out-of-alphabet verdict reason refuses the WHOLE request
+/// (validate-then-commit: no plane applied) — the closed-alphabet
+/// posture of the wire fold (rustc-exhaustive at validate; this pins
+/// the runtime half for unknown discriminants and UNSPECIFIED).
+#[tokio::test]
+async fn out_of_alphabet_verdict_reason_refuses_the_request() {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw_builders_only(db.pool.clone());
+    actor.test_inject_ready("d-bad", Some("test-pkg"), "x86_64-linux", false);
+    for reason in [0i32, 999] {
+        let bad = rio_proto::types::IntentVerdict {
+            intent_id: "d-bad".into(),
+            reason,
+            detail: "x".into(),
+        };
+        let r = actor.handle_ack_spawned_intents(
+            &[],
+            &["intel-6:spot".into()],
+            &[],
+            &[],
+            &[],
+            None,
+            std::slice::from_ref(&bad),
+        );
+        assert!(r.is_err(), "reason={reason} refused");
+        assert!(
+            !actor
+                .ice
+                .is_masked(&("intel-6".into(), crate::sla::config::CapacityType::Spot)),
+            "an erring ack applied NOTHING (the mark plane did not land)"
+        );
+    }
+}
+
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+/// **The emission-arm product census (R15)** — cells from the
+/// `CellEmission` alphabet over (feat ∅/non-∅ × {hostable,
+/// stale-hostable, infeasible-everywhere, unhostable} × pin rows),
+/// driven through the production classifier with per-row expected
+/// VARIANTS (rustc keeps the alphabet closed at the fold; this test
+/// keeps every arm REACHED — premise-reachability per row). The
+/// live_050(e) journal row (stale-hostable) and the live_051(b)
+/// verdict row (infeasible-everywhere) are DISTINCT input cells that
+/// share the `StaleSolve` family — pinned separately below.
+#[tokio::test]
+async fn cell_emission_arm_product_census() {
+    use crate::actor::snapshot::CellEmission as E;
+    use crate::sla::config::CapacityType;
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    actor.test_inject_ready("d-plain", Some("test-pkg"), "x86_64-linux", false);
+    actor.test_inject_ready("d-fod", Some("fod-pkg"), "x86_64-linux", true);
+    actor.test_inject_ready_with_features("d-exotic", None, "x86_64-linux", &["no-such"]);
+    actor.test_inject_ready("d-unmappable", None, "unmappable-system", false);
+    // Floored node: legacy 8 GiB row (frozen-legacy lane — see R23).
+    actor.test_inject_ready("d-floored", Some("fod2"), "x86_64-linux", true);
+    actor
+        .dag
+        .node_mut("d-floored")
+        .unwrap()
+        .sched
+        .resource_floor
+        .mem_bytes = 8 << 30;
+
+    let cost_big = actor.cost_table.read().clone();
+    // Shrunk-catalog cost table (the fixture lane) for the stale rows.
+    shrink_catalog(&actor, 2, 1 << 30);
+    let cost_small = actor.cost_table.read().clone();
+
+    let node = |h: &str| actor.dag.node(h).unwrap();
+    let feat_fetcher = vec![rio_common::k8s::FETCHER_FEATURE.to_string()];
+    let no_feat: Vec<String> = vec![];
+
+    // Row 1 (∅ feat, hostable demand, no evidence) → HwAgnostic.
+    let e = actor.classify_cell_emission(
+        node("d-plain"),
+        None,
+        4,
+        1 << 30,
+        &cost_big,
+        "t",
+        &no_feat,
+        false,
+        false,
+    );
+    assert!(matches!(e, E::HwAgnostic), "row 1: {e:?}");
+    // Row 1b (∅ feat, arch-unmappable) → HwAgnostic (the r35 B1 guard).
+    let e = actor.classify_cell_emission(
+        node("d-unmappable"),
+        None,
+        4,
+        1 << 30,
+        &cost_big,
+        "t",
+        &no_feat,
+        true,
+        false,
+    );
+    assert!(matches!(e, E::HwAgnostic), "row 1b: {e:?}");
+    // Row 2 (∅ feat, stale-hostable — the live_050(e) journal cell):
+    // demand above every shrunk class, candidates exist → StaleSolve.
+    let e = actor.classify_cell_emission(
+        node("d-plain"),
+        None,
+        48,
+        6 << 30,
+        &cost_small,
+        "t",
+        &no_feat,
+        true,
+        false,
+    );
+    let E::StaleSolve {
+        resolved, cells, ..
+    } = &e
+    else {
+        panic!("row 2 (journal cell): {e:?}")
+    };
+    assert!(resolved.0 <= 2 && resolved.1 <= 1 << 30 && !cells.is_empty());
+    // Row 3 (∅ feat, infeasible-everywhere — the live_051(b) verdict
+    // cell): same variant family, distinct input (solve-time
+    // infeasibility at the BIG table whose classes the demand still
+    // exceeds via the config ceiling axis is not constructible here;
+    // the in-tree (b) feed is BestEffort → the shrunk-ceiling shape) —
+    // pinned at the production pass by
+    // `oversize_unconstrained_demand_clamps_with_disclosure`.
+    let e = actor.classify_cell_emission(
+        node("d-plain"),
+        None,
+        383,
+        412 << 30,
+        &cost_small,
+        "t",
+        &no_feat,
+        true,
+        false,
+    );
+    assert!(
+        matches!(e, E::StaleSolve { .. }),
+        "row 3 (verdict cell): {e:?}"
+    );
+    // Row 4 (∅ feat, forced oversize) → Unhostable (a pin is never
+    // clamped — the bug_019 law).
+    let e = actor.classify_cell_emission(
+        node("d-plain"),
+        None,
+        383,
+        412 << 30,
+        &cost_small,
+        "t",
+        &no_feat,
+        true,
+        true,
+    );
+    assert!(
+        matches!(
+            e,
+            E::Unhostable {
+                best_class: Some(_),
+                ..
+            }
+        ),
+        "row 4: {e:?}"
+    );
+    // Row 5 (non-∅ feat, hostable) → Cells (the §13d cold-start arm).
+    let e = actor.classify_cell_emission(
+        node("d-fod"),
+        None,
+        2,
+        1 << 29,
+        &cost_big,
+        "t",
+        &feat_fetcher,
+        false,
+        false,
+    );
+    assert!(
+        matches!(e, E::Cells(ref c) if !c.is_empty()),
+        "row 5: {e:?}"
+    );
+    // Row 6 (non-∅ feat, oversize with candidates) → StaleSolve into
+    // the feature class.
+    let e = actor.classify_cell_emission(
+        node("d-fod"),
+        None,
+        48,
+        6 << 30,
+        &cost_small,
+        "t",
+        &feat_fetcher,
+        true,
+        false,
+    );
+    let E::StaleSolve { class, cells, .. } = &e else {
+        panic!("row 6: {e:?}")
+    };
+    assert!(
+        class.starts_with("fetcher-"),
+        "feature demand stays in its class: {class}"
+    );
+    assert!(cells.iter().all(|(h, _)| h.starts_with("fetcher-")));
+    // Row 7 (non-∅ feat, floor above the best feature ceiling) →
+    // Unhostable WITH the best class named (the WHY fields).
+    let e = actor.classify_cell_emission(
+        node("d-floored"),
+        None,
+        2,
+        1 << 29,
+        &cost_small,
+        "t",
+        &feat_fetcher,
+        false,
+        false,
+    );
+    let E::Unhostable {
+        demand: _,
+        best_class: Some((bh, _)),
+    } = &e
+    else {
+        panic!("row 7: {e:?}")
+    };
+    assert!(bh.starts_with("fetcher-"));
+    // Row 8 (unroutable feature — zero candidates) → Unhostable{None}.
+    let e = actor.classify_cell_emission(
+        node("d-exotic"),
+        None,
+        2,
+        1 << 29,
+        &cost_big,
+        "t",
+        &["no-such".to_string()],
+        false,
+        false,
+    );
+    assert!(
+        matches!(
+            e,
+            E::Unhostable {
+                best_class: None,
+                ..
+            }
+        ),
+        "row 8: {e:?}"
+    );
+    // Row 9 (pin hosted + fits) → Cells via the bypass Some-arm.
+    let e = actor.classify_cell_emission(
+        node("d-plain"),
+        Some(CapacityType::Spot),
+        4,
+        1 << 30,
+        &cost_big,
+        "t",
+        &no_feat,
+        false,
+        false,
+    );
+    assert!(matches!(e, E::Cells(ref c) if c.len() == 1), "row 9: {e:?}");
+    // Row 10 (pin + oversize, not forced) → StaleSolve HONORING the
+    // pin (one cell at the pinned capacity).
+    let e = actor.classify_cell_emission(
+        node("d-plain"),
+        Some(CapacityType::Spot),
+        48,
+        6 << 30,
+        &cost_small,
+        "t",
+        &no_feat,
+        true,
+        false,
+    );
+    let E::StaleSolve { cells, .. } = &e else {
+        panic!("row 10: {e:?}")
+    };
+    assert_eq!(cells.len(), 1);
+    assert!(
+        matches!(cells[0].1, CapacityType::Spot),
+        "the pin survives the re-solve"
+    );
+}
+
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+/// **[GEN-SET] call-site censuses (R15)** — committed scanner output
+/// over the EMBEDDED sources (include_str! — the nix-gate-safe form;
+/// bare runtime walks fail under the sandbox, the bughunt-6
+/// observation). Three needles:
+///
+/// 1. `reference_hw_class_for_system(` call sites — the emission
+///    seam's resolver: every production caller is one of the typed
+///    lanes (bypass Some-arm, bypass cold-start arm, the classifier's
+///    pin-mismatch probe) or the config-side definition;
+/// 2. `SolveFullResult::BestEffort` — the memo-None feed into the
+///    emission fold (live_051(b)): constructor + the two consumer
+///    folds;
+/// 3. `resource_floor` reads in the actor solve plane — every
+///    read-consume site takes the CLAMPED projection (the (d) law);
+///    the deadline-axis read is cap-const-bounded (Ceilings has no
+///    time dimension); hydrate/bump/debug rows classified.
+///
+/// An unlisted hit FAILS the census naming the file (closure
+/// tomorrow, not completeness today).
+#[test]
+fn stale_solve_revalidation_call_site_censuses() {
+    let snapshot_src = include_str!("../snapshot.rs");
+    let solve_src = include_str!("../../sla/solve.rs");
+    let config_src = include_str!("../../sla/config.rs");
+    let floor_src = include_str!("../floor.rs");
+    let merge_src = include_str!("../merge.rs");
+
+    let prod = |src: &str| -> String {
+        src.split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap_or(src)
+            .to_string()
+    };
+    let count = |src: &str, needle: &str| prod(src).matches(needle).count();
+
+    // (1) the resolver: 4 call sites in snapshot.rs (bypass Some-arm,
+    // bypass cold-start arm, classifier pin probe) + the fn def +
+    // 1 doc/comment mention in config.rs; solve.rs has none.
+    assert_eq!(
+        count(snapshot_src, ".reference_hw_class_for_system("),
+        3,
+        "snapshot.rs resolver call sites: bypass Some-arm, bypass \
+         cold-start arm, classifier pin probe — a NEW call site joins \
+         this census with its CellEmission lane named"
+    );
+    assert_eq!(
+        count(solve_src, ".reference_hw_class_for_system("),
+        0,
+        "solve.rs never CALLS the resolver (one doc-comment mention at          the §Canonicalize note is prose, not a call site — the          emission fold owns resolution)"
+    );
+    assert!(
+        prod(config_src).contains("pub fn reference_hw_class_for_system("),
+        "the single definition lives in sla/config.rs"
+    );
+
+    // (2) the memo-None feed (live_051(b)): the enum def + `Feasible`
+    // sibling live in solve.rs; snapshot.rs consumes it in EXACTLY
+    // one fold (the memo arm) — the silent second consumer would be a
+    // new feed into the emission chokepoint.
+    assert_eq!(
+        count(snapshot_src, "SolveFullResult::BestEffort"),
+        1,
+        "the ONE memo-None feed (snapshot.rs solve fold) — a second \
+         consumer must route through the CellEmission fold"
+    );
+
+    // (3) floor reads in the solve/emission plane: every mem/disk
+    // consumption is the clamped projection.
+    assert_eq!(
+        count(snapshot_src, "ClampedFloor::of("),
+        4,
+        "snapshot.rs clamped-projection sites: solve-arm pre-clamp, \
+         post-solve chokepoint, bypass seam (:2236 — the load-bearing \
+         one), classifier floor guard"
+    );
+    // Raw floor reads surviving in snapshot.rs: the chokepoint's
+    // deadline read (`floor.deadline_secs` — cap-const axis) + the
+    // binding that feeds it + the three projection constructor args.
+    assert_eq!(
+        count(snapshot_src, "state.sched.resource_floor"),
+        4,
+        "raw floor mentions in snapshot.rs = 3 projection-constructor \
+         args + the chokepoint binding (whose mem/disk reads go \
+         through `fclamped`, deadline through the cap const)"
+    );
+    assert_eq!(
+        count(merge_src, "clamp_floor_to_live"),
+        1,
+        "the hydrate seam applies the in-place clamp law exactly once"
+    );
+    assert!(
+        prod(floor_src).contains("pub(super) fn clamp_floor_to_live"),
+        "the law lives in actor/floor.rs"
     );
 }

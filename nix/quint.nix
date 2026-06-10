@@ -4529,7 +4529,7 @@ rec {
     # consumer's next tick).
     # r[verify ctrl.nodeclaim.lease-edge-polarity+4]
     # r[verify ctrl.nodeclaim.placeable-gate+5]
-    # r[verify ctrl.nodeclaim.ice-mark-clear+2]
+    # r[verify ctrl.nodeclaim.ice-mark-clear+3]
     quint-nodeclaim-lifecycle-fault-lease = mkQuintCheck {
       name = "nodeclaim-lifecycle-fault-lease";
       # quint-policy P1 exemption (bughunt-2 slot 11; the §5-Q13 census
@@ -4563,7 +4563,7 @@ rec {
     # detect_vanished, so an ICE mark is only ever emitted for a claim
     # that genuinely vanished or launch-failed).
     # r[verify ctrl.nodeclaim.inflight-conservation+3]
-    # r[verify ctrl.nodeclaim.ice-mark-clear+2]
+    # r[verify ctrl.nodeclaim.ice-mark-clear+3]
     quint-nodeclaim-lifecycle-fault-karpenter = mkQuintCheck {
       name = "nodeclaim-lifecycle-fault-karpenter";
       # quint-policy P1 exemption (bughunt-2 slot 11; the §5-Q13 census
@@ -7423,7 +7423,7 @@ rec {
 
     # r[verify sched.sla.ack-validate-then-commit+1]
     # r[verify ctrl.nodeclaim.evidence-ack-latch+3]
-    # r[verify ctrl.nodeclaim.ice-mark-clear+2]
+    # r[verify ctrl.nodeclaim.ice-mark-clear+3]
     quint-ice-evidence-ack = mkQuintCheck {
       name = "ice-evidence-ack";
       spec = "iceEvidenceAck";
@@ -7487,7 +7487,7 @@ rec {
     # merged_bug_003 FALSIFY half: latest-wins eviction — a newer
     # mark destroys the buffered clear; the mark-only request climbs
     # from the stale rung instead of reset-then-step-0.
-    # r[verify ctrl.nodeclaim.ice-mark-clear+2]
+    # r[verify ctrl.nodeclaim.ice-mark-clear+3]
     quint-ice-falsify-latest-wins-eviction = mkQuintSimWitnessCheck {
       name = "ice-falsify-latest-wins-eviction";
       spec = "calibration/ice-latest-wins-eviction";

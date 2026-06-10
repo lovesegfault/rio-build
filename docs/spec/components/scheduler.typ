@@ -4526,6 +4526,45 @@ builds. Disclosure on the override arm is the boot-time half; the
 emission-time half is the `scheduler.sla.ceiling.stale-solve-revalidation`
 law.
 
+#r("scheduler.sla.ceiling.stale-solve-revalidation")[
+  A demand envelope solved under a catalog ceiling MUST be revalidated
+  against the live ceilings at every emission; an envelope no class can
+  host MUST re-solve (clamp into the largest live hosting class, with
+  the clamp disclosed) or surface typed — never emit empty cells for
+  non-agnostic demand. Demand infeasible at every class MUST
+  clamp-with-disclosure into the largest mintable class or surface as a
+  typed `Unhostable` carrying demand and best-class — never empty
+  cells. A persisted resource floor is evidence under the ceiling that
+  authorized it: a floor above the live global MUST be consumed clamped
+  — at hydrate and at every read — while the durable row PRESERVES the
+  witnessed evidence (the `GREATEST`-ratchet writer; a later ceiling
+  re-growth re-admits it). A typed no-hosting-class verdict MUST be
+  consumed to a terminal, operator-actionable disposition within a
+  typed verdict budget — a drv never loops Ready unanswered. The
+  widen-only establishment window governs the deadline/reap axis ONLY
+  and never pins a demand envelope. Operator-forced dims are pins, not
+  stale solver evidence — they are never clamped; their unhostable form
+  surfaces typed and is answered by the verdict loop.
+]
+Rationale (live_050(e), the post-rev-3 journal): after the NotIn overlay
+shrank the derivable ceiling, 192 hi intents re-emitted with empty
+`hw_class_names` — open attempts' demand envelopes solved under the old
+383-core ceiling were never re-solved, the `reference_hw_class_for_system`
+None arm emitted empty cells silently, and the controller dropped them as
+`no_hosting_class` at \~25/min; \~120 durable attempts carried the stale
+envelopes across leader boots (the widen-only sweep re-solve never shrinks
+a persisted solve); the owner abandoned the run. Per-emission revalidation
+subsumes a shrink EVENT (an event observed only in-memory misses the
+cross-boot reload path) at the cost of work already done — the emission
+arm already resolves classes per intent. The 3600s attempt-deadline
+self-heal EXISTS (deadline+slack expiry eventually reaps and re-mints) and
+is PRICED as the recovery floor only — the live run starved past it; it is
+never the mechanism. The verdict budget's time envelope is
+`NO_HOST_VERDICTS_TO_POISON x the controller ack cadence` (\~10s tick;
+30 passes ≈ 5 minutes), violable by const; a hosting-class config reload
+resets the count in-band (the verdict detail names the configured
+classes, so a reload is observable without a side channel).
+
 #r("scheduler.sla.global.static-requires-some")[
   `hwCostSource=static` boot-fails when `sla.maxCores`/`maxMem` are unset ---
   Static mode has no instance-type catalog to derive from. The check is in

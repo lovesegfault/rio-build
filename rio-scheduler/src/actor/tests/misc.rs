@@ -103,6 +103,7 @@ async fn deposed_ack_spawned_intents_answers_not_leader() -> TestResult {
         observed_instance_types: vec![],
         bound_intents: vec![],
         binding_snapshot: None,
+        rejected: vec![],
         reply,
     };
 

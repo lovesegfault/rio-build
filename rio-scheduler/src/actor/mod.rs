@@ -726,6 +726,13 @@ pub struct DagActor {
     /// and on pod restart. Retained across `clear_persisted_state` —
     /// the drv set doesn't change on leader transition.
     forecast_dropped_warned: parking_lot::Mutex<lru::LruCache<(String, &'static str), ()>>,
+    /// live_050(e)/live_051(c): supply-revalidation state — the
+    /// per-drv consecutive no-hosting-class verdict counters
+    /// (tenure-scoped) + the emission-revalidation disclosure
+    /// debounce, one typed home with a type-enforced once-per-edge
+    /// gate (the r35 STRIKE-3 tripwire's asked-for shape, scoped to
+    /// this family — see [`snapshot::SupplyRevalidation`]).
+    supply_reval: snapshot::SupplyRevalidation,
     /// Advances once per `handle_tick`. The ready-set store
     /// short-circuit (`sweep_ready_cached`) stamps each checked node's
     /// `probed_generation` with this value and skips already-stamped
@@ -961,6 +968,7 @@ impl DagActor {
             forecast_dropped_warned: parking_lot::Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(FORECAST_DROPPED_WARNED_CAP).unwrap(),
             )),
+            supply_reval: Default::default(),
             probe_generation: 1,
             snapshot_tx: watch::channel(Arc::new(ClusterSnapshot::default())).0,
             #[cfg(test)]
@@ -1107,6 +1115,13 @@ impl DagActor {
             // it doesn't change on leader transition. The bound is the
             // LRU cap (r34 bug_018), not a `.retain()`.
             forecast_dropped_warned: _,
+            // Cleared: verdict budgets are tenure-scoped (IceBackoff
+            // precedent — the controller re-mints fresh verdicts every
+            // tick, so a successor re-burns its own budget). The
+            // disclosure LRU inside resets with it: re-arming warns on
+            // transition is the siblings' documented fail-safe
+            // over-emit.
+            supply_reval,
             probe_generation: _,
             snapshot_tx: _,
             #[cfg(test)]
@@ -1147,6 +1162,9 @@ impl DagActor {
         // generation's ack must not defer the successor's
         // fleet-exhaust verdicts.
         acked_spawned.clear();
+        // Tenure-scoped verdict budgets + disclosure debounce — see
+        // the destructure note above.
+        *supply_reval = Default::default();
         // The materialization-job view is a droppable per-tenure cache
         // of PG rows; a new tenure rebuilds it from PG (Phase B). The
         // wipe lands on UNAVAILABLE, not Hydrated(empty): stale entries
@@ -1489,6 +1507,7 @@ impl DagActor {
                     observed_instance_types,
                     bound_intents,
                     binding_snapshot,
+                    rejected,
                     reply,
                 } => {
                     // r[impl sched.lease.standby-drops-writes+3] —
@@ -1507,9 +1526,21 @@ impl DagActor {
                             &observed_instance_types,
                             &bound_intents,
                             binding_snapshot.as_deref(),
+                            &rejected,
                         )
                     } else {
                         Err(command::AckApplyError::NotLeader)
+                    };
+                    // live_051(c): budget crossings poison AFTER the
+                    // atomic apply (commit is infallible — a poison
+                    // can never follow a half-applied ack) and BEFORE
+                    // the reply, in this arm's async context.
+                    let applied = match applied {
+                        Ok(poisons) => {
+                            self.apply_no_host_poisons(poisons).await;
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
                     };
                     // Receiver gone = RPC already failed client-side;
                     // nothing to report (the controller retains its

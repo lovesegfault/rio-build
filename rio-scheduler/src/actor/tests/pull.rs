@@ -1188,6 +1188,7 @@ async fn pull_attempt_failure_stamps_source_node_and_excludes_node() -> TestResu
         .send_unchecked(ActorCommand::AckSpawnedIntents {
             // merged_bug_005 reply: receiver intentionally dropped —
             // these tests assert via actor state, not the ack path.
+            rejected: vec![],
             reply: tokio::sync::oneshot::channel().0,
             binding_snapshot: None,
             spawned: vec![],
@@ -1360,6 +1361,7 @@ async fn establishment_charge_falls_back_to_late_binding_ack() -> TestResult {
         .send_unchecked(ActorCommand::AckSpawnedIntents {
             // merged_bug_005 reply: receiver intentionally dropped —
             // these tests assert via actor state, not the ack path.
+            rejected: vec![],
             reply: tokio::sync::oneshot::channel().0,
             binding_snapshot: None,
             spawned: vec![],
@@ -1453,6 +1455,7 @@ async fn attempt_outcome_no_eligible_source_poisons_ready_drv() -> TestResult {
         .send_unchecked(ActorCommand::AckSpawnedIntents {
             // merged_bug_005 reply: receiver intentionally dropped —
             // these tests assert via actor state, not the ack path.
+            rejected: vec![],
             reply: tokio::sync::oneshot::channel().0,
             binding_snapshot: None,
             spawned: vec![],
@@ -1589,6 +1592,7 @@ async fn no_eligible_source_defers_on_fresh_acked_spawn() -> TestResult {
         .send_unchecked(ActorCommand::AckSpawnedIntents {
             // merged_bug_005 reply: receiver intentionally dropped —
             // these tests assert via actor state, not the ack path.
+            rejected: vec![],
             reply: tokio::sync::oneshot::channel().0,
             binding_snapshot: None,
             spawned: vec![],
@@ -1618,6 +1622,7 @@ async fn no_eligible_source_defers_on_fresh_acked_spawn() -> TestResult {
     // The controller acks a fresh spawn for the SAME intent…
     handle
         .send_unchecked(ActorCommand::AckSpawnedIntents {
+            rejected: vec![],
             reply: tokio::sync::oneshot::channel().0,
             spawned: vec![rio_proto::types::SpawnIntent {
                 intent_id: "nes-g3".into(),
@@ -1673,6 +1678,7 @@ async fn mint_refuses_delivery_to_excluded_bound_node() -> TestResult {
         .send_unchecked(ActorCommand::AckSpawnedIntents {
             // merged_bug_005 reply: receiver intentionally dropped —
             // these tests assert via actor state, not the ack path.
+            rejected: vec![],
             reply: tokio::sync::oneshot::channel().0,
             binding_snapshot: None,
             spawned: vec![],
@@ -1731,6 +1737,7 @@ async fn no_eligible_source_with_stale_cycle_echo_acks_no_poison() -> TestResult
         .send_unchecked(ActorCommand::AckSpawnedIntents {
             // merged_bug_005 reply: receiver intentionally dropped —
             // these tests assert via actor state, not the ack path.
+            rejected: vec![],
             reply: tokio::sync::oneshot::channel().0,
             binding_snapshot: None,
             spawned: vec![],
@@ -1948,6 +1955,7 @@ async fn build_mint_floors_deadline_at_carried_rendered() -> TestResult {
         .send_unchecked(ActorCommand::AckSpawnedIntents {
             // merged_bug_005 reply: receiver intentionally dropped —
             // these tests assert via actor state, not the ack path.
+            rejected: vec![],
             reply: tokio::sync::oneshot::channel().0,
             binding_snapshot: None,
             spawned: vec![],
@@ -2412,6 +2420,7 @@ async fn report_ack_attempt_resolved_per_arm_census() -> TestResult {
     // Establish a real failed builder (exclusion) through production flow.
     handle
         .send_unchecked(ActorCommand::AckSpawnedIntents {
+            rejected: vec![],
             reply: tokio::sync::oneshot::channel().0,
             binding_snapshot: None,
             spawned: vec![],
@@ -2489,6 +2498,7 @@ async fn report_ack_attempt_resolved_per_arm_census() -> TestResult {
     .await?;
     handle
         .send_unchecked(ActorCommand::AckSpawnedIntents {
+            rejected: vec![],
             reply: tokio::sync::oneshot::channel().0,
             binding_snapshot: None,
             spawned: vec![],
@@ -2516,6 +2526,7 @@ async fn report_ack_attempt_resolved_per_arm_census() -> TestResult {
     .expect("failure acked");
     handle
         .send_unchecked(ActorCommand::AckSpawnedIntents {
+            rejected: vec![],
             reply: tokio::sync::oneshot::channel().0,
             spawned: vec![rio_proto::types::SpawnIntent {
                 intent_id: "arm-nes2".into(),
@@ -2577,6 +2588,7 @@ async fn refit_down_stamp_carries_the_dispatched_deadline() -> TestResult {
     // so a config drift fails loudly instead of vacuously passing).
     handle
         .send_unchecked(ActorCommand::AckSpawnedIntents {
+            rejected: vec![],
             reply: tokio::sync::oneshot::channel().0,
             spawned: vec![],
             unfulfillable_cells: vec![],

@@ -2275,6 +2275,15 @@ impl DagActor {
         // since then wrote both in-mem and DB), so overwriting would
         // downgrade. Per-dimension `.max()` only RAISES so a stale DB
         // row never demotes a higher in-memory floor.
+        //
+        // r[impl scheduler.sla.ceiling.stale-solve-revalidation]
+        // live_051(d): hydrate-then-CLAMP — a row persisted under a
+        // larger old global (the M_044 GREATEST ratchet preserves it)
+        // enters memory grounded at the LIVE ceilings, so a stale
+        // 383-era value cannot re-import across a boot. The clamp
+        // direction is the law's clamp-down form (`actor::floor`
+        // clamp-law doc); raw-loading paths (recovery) are covered by
+        // the read-time `ClampedFloor` projection at every consumer.
         for (hash, (db_id, floor)) in &id_map {
             if let Some(state) = self.dag.node_mut(hash) {
                 state.db_id = Some(*db_id);
@@ -2283,6 +2292,7 @@ impl DagActor {
                     f.mem_bytes = f.mem_bytes.max(floor.mem_bytes);
                     f.disk_bytes = f.disk_bytes.max(floor.disk_bytes);
                     f.deadline_secs = f.deadline_secs.max(floor.deadline_secs);
+                    super::floor::clamp_floor_to_live(f, &self.sla_ceilings);
                 }
             }
         }

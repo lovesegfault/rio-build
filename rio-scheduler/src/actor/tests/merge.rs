@@ -1934,10 +1934,19 @@ async fn merge_hydrates_resource_floor_from_db() -> TestResult {
     merge_dag(&handle, build_id, vec![fod], vec![], false).await?;
 
     let info = expect_drv(&handle, "i208-fod").await;
+    // live_051(d): the hydrate seam clamps to the LIVE ceilings — the
+    // test config's resolved global mem is 2 GiB (`test_default`), so
+    // the 8 GiB row enters memory at the clamp, NOT raw (a floor above
+    // the live global is stale evidence; the stale-solve-revalidation
+    // law). Nonzero still proves I-208's own concern (RETURNING
+    // carried the floor columns; `try_from_node` zeros were replaced);
+    // the above-ceiling row's full law battery is
+    // `floor_above_global_reclamps_at_boot` (sla_contract.rs).
     assert_eq!(
         info.sched.resource_floor.mem_bytes,
-        8 << 30,
-        "I-208: floor_mem_bytes from DB hydrated onto re-merged node"
+        2 << 30,
+        "I-208 + live_051(d): floor hydrated from DB, clamped at the \
+         live global"
     );
     Ok(())
 }

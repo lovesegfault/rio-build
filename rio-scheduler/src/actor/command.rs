@@ -87,6 +87,10 @@ pub enum AckPlane {
     /// `spawned[].node_affinity` capacity requirements (wire field 1)
     /// — the arm-on-ack echo.
     SpawnedArming,
+    /// `rejected` (wire field 7) — live_051(c) per-intent
+    /// no-hosting-class verdicts. An entry whose reason falls outside
+    /// the closed `IntentVerdictReason` alphabet refuses the request.
+    Rejected,
 }
 
 impl AckPlane {
@@ -97,6 +101,7 @@ impl AckPlane {
             Self::UnfulfillableCells => "unfulfillable_cells",
             Self::ObservedTypes => "observed_instance_types",
             Self::SpawnedArming => "spawned.node_affinity",
+            Self::Rejected => "rejected",
         }
     }
 }
@@ -360,6 +365,13 @@ pub enum ActorCommand {
         /// LEGACY field-5 read arm (rolling skew, R9): consulted only
         /// when `binding_snapshot` is None.
         bound_intents: Vec<rio_proto::types::BoundIntent>,
+        /// live_051(c): per-intent `NO_HOSTING_CLASS` rejection
+        /// verdicts (wire field 7) — the controller's typed answer to
+        /// demand it structurally cannot host. Folded into the
+        /// consecutive-verdict counters at the ack-apply plane; at
+        /// the typed budget the drv poisons with the verdict's
+        /// `detail` as the operator-actionable message.
+        rejected: Vec<rio_proto::types::IntentVerdict>,
         /// C2/285 (`r[sched.snapshot.binding-presence]`): the explicit
         /// per-tick binding snapshot. `Some(set)` — even empty —
         /// wholesale-rebuilds `authoritative_binding` (present-and-

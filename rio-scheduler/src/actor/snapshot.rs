@@ -944,6 +944,10 @@ impl DagActor {
     /// entries take the pre-epoch semantics exactly (decode-totality
     /// lane; binding snapshots rebuild and observed types upsert,
     /// idempotent as before).
+    // One parameter per wire evidence plane — the positional shape IS
+    // the validate-then-commit contract (a new plane forces every
+    // caller through this seam).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn handle_ack_spawned_intents(
         &mut self,
         spawned: &[rio_proto::types::SpawnIntent],
@@ -952,7 +956,8 @@ impl DagActor {
         observed_instance_types: &[rio_proto::types::ObservedInstanceType],
         bound_intents: &[rio_proto::types::BoundIntent],
         binding_snapshot: Option<&[rio_proto::types::BoundIntent]>,
-    ) -> Result<(), super::command::AckApplyError> {
+        rejected: &[rio_proto::types::IntentVerdict],
+    ) -> Result<Vec<NoHostPoison>, super::command::AckApplyError> {
         let plan = AckApplyPlan::validate(
             spawned,
             unfulfillable_cells,
@@ -960,9 +965,174 @@ impl DagActor {
             observed_instance_types,
             bound_intents,
             binding_snapshot,
+            rejected,
         )?;
-        plan.commit(self);
-        Ok(())
+        Ok(plan.commit(self))
+    }
+
+    // r[impl scheduler.sla.ceiling.stale-solve-revalidation]
+    /// live_051(c): poison every drv whose consecutive no-hosting-class
+    /// verdict budget crossed in [`AckApplyPlan::commit`]. Runs AFTER
+    /// the atomic apply (commit is infallible, so a poison here can
+    /// never follow a half-applied ack) on the actor command arm's
+    /// async context; the poison rides the EXISTING machinery
+    /// (`poison_and_cascade` — Ready is a legal precondition there)
+    /// with the controller's `detail` as the operator-actionable
+    /// message, so the operator reads which classes exist and what
+    /// failed to match — never a bare "no hosting class".
+    pub(super) async fn apply_no_host_poisons(&mut self, poisons: Vec<NoHostPoison>) {
+        for p in poisons {
+            tracing::warn!(
+                drv_hash = %p.drv,
+                budget = NO_HOST_VERDICTS_TO_POISON,
+                detail = %p.detail,
+                "consecutive no-hosting-class verdict budget exhausted — \
+                 poisoning the drv with the controller's verdict detail",
+            );
+            self.poison_and_cascade(
+                &p.drv,
+                &format!(
+                    "no hosting class after {NO_HOST_VERDICTS_TO_POISON} \
+                     consecutive controller verdicts: {}",
+                    p.detail
+                ),
+                None,
+                None,
+            )
+            .await;
+        }
+    }
+}
+
+// r[impl scheduler.sla.ceiling.stale-solve-revalidation]
+/// live_051(c): the verdict budget — consecutive `NO_HOSTING_CLASS`
+/// verdicts (one per controller cover pass) a Ready drv may accumulate
+/// before it poisons with the verdict's detail. The TIME envelope is
+/// `N x the controller ack cadence` (the nodeclaim-pool tick, ~10s
+/// shipped): 30 passes ~= 5 minutes operator-visible budget — long
+/// enough to ride out a config rollout window (a reload that CHANGES
+/// the hosting-class set resets the counter via the detail-change law
+/// in [`step_no_host_counter`]), short enough that the measured live
+/// loop (hours of Ready-forever churn, operator cancellation as the
+/// only exit) dies promptly. Violable by test loop count; the budget
+/// IS the envelope (R17 time axis).
+pub(super) const NO_HOST_VERDICTS_TO_POISON: u32 = 30;
+
+/// One budget-crossing from [`AckApplyPlan::commit`]: the drv to
+/// poison and the controller's last verdict `detail` (the
+/// operator-actionable message).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct NoHostPoison {
+    pub(super) drv: DrvHash,
+    pub(super) detail: String,
+}
+
+/// live_051(c): one consecutive-verdict counter step — pure, so the
+/// counter-lifecycle census walks it as a law table. A verdict whose
+/// `detail` differs from the last counted one RESTARTS the count at 1:
+/// the detail names the intent's footprint AND the configured classes,
+/// so a hosting-class config reload (or a re-solved demand) is
+/// observable in-band and re-opens the heal window — the budget counts
+/// CONSECUTIVE IDENTICAL rejection evidence only.
+pub(super) fn step_no_host_counter(prev: Option<&(u32, String)>, detail: &str) -> (u32, String) {
+    match prev {
+        Some((n, last)) if last == detail => (n.saturating_add(1), detail.to_owned()),
+        _ => (1, detail.to_owned()),
+    }
+}
+
+// r[impl scheduler.sla.ceiling.stale-solve-revalidation]
+/// live_050(e)/live_051(b): the TOTAL typed outcome of the no-memo
+/// cell-emission chokepoint (R14 closed alphabet, zero wildcard arms
+/// at the fold in `solve_intent_for`). Pre-fix the chokepoint's only
+/// vocabulary was `Vec<Cell>` — emptiness conflated "genuinely
+/// hw-agnostic" (correct, quiet), "demand solved under a ceiling that
+/// no longer exists" (the live_050(e) starvation channel), "demand
+/// infeasible at every class" (live_051(b)), and "operator pin
+/// refused" — and the controller dropped the non-agnostic ones as a
+/// metric-only tally forever. A scheduler-side `StaleSolve`/
+/// `Unhostable` never reaches the controller as an empty-
+/// `hw_class_names` intent, so the controller's `no_hosting_class`
+/// arm shrinks to genuine config gaps (answered by the live_051(c)
+/// verdict loop — composition with WO-S7-3's `PlacementOutcome`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum CellEmission {
+    /// hw-routed cells — the unchanged §13d arms (reference-class
+    /// expansion, pin honored) plus disclosed re-solves.
+    Cells(Vec<crate::sla::config::Cell>),
+    /// Genuinely hw-agnostic: ∅ features, no infeasibility evidence,
+    /// no pin (or arch-unmappable featureless). The §13e cold-start
+    /// quiet edge — quiet BY TYPE, not by shared emptiness.
+    HwAgnostic,
+    /// Demand no class hosts at size, with live routing candidates —
+    /// re-solved under the LIVE ceilings (clamped into the largest
+    /// hosting class) and disclosed. Carries the WHY: the stale
+    /// solved dims, the live best-class ceilings, and the re-solved
+    /// emission.
+    StaleSolve {
+        solved: (u32, u64),
+        live_max: (u32, u64),
+        class: String,
+        resolved: (u32, u64),
+        cells: Vec<crate::sla::config::Cell>,
+    },
+    /// No class can host even re-solved: zero routing candidates
+    /// (feature/arch gap) or the clamped floor exceeds the best
+    /// candidate's ceiling. Carries the WHY by construction (T5):
+    /// the demand and the best class + its ceilings, so every
+    /// consumer derives the delta.
+    Unhostable {
+        demand: (u32, u64),
+        best_class: Option<(String, (u32, u64))>,
+    },
+    /// Operator `--capacity` pin refused by a size-hosting class —
+    /// the r31 A3 lane (its own debounced warn lives at the
+    /// `bypass_cells` arm); emission stays empty, the pin is never
+    /// silently rewritten.
+    PinGated,
+}
+
+/// live_050(e)/live_051(c): actor-held supply-revalidation state, one
+/// typed home for the two pieces the stale-solve law mints — the
+/// per-drv consecutive-verdict counters and the emission-disclosure
+/// debounce. The r35 STRIKE-3 tripwire (mod.rs LRU-cap consts) asks
+/// any further `Mutex<LruCache>` debounce accretion to carry a
+/// type-enforced gate: [`Self::disclose_once`] IS that gate — the LRU
+/// is private to this struct, so an emit site cannot bypass it.
+pub(super) struct SupplyRevalidation {
+    /// `drv -> (consecutive count, last detail)` for
+    /// `IntentVerdict::NO_HOSTING_CLASS` entries. Tenure-scoped
+    /// in-memory state (the IceBackoff precedent: ADR-023 "the
+    /// controller reports, the scheduler decides") — wiped on leader
+    /// transition; the controller re-mints fresh verdicts every tick,
+    /// so a successor re-burns its own budget.
+    pub(super) no_host_verdicts: std::collections::HashMap<DrvHash, (u32, String)>,
+    /// `(tenant, pname, kind)` emission-revalidation disclosures
+    /// already made (kind ∈ {stale_resolved, unhostable} — the
+    /// `exit` label values). Once-per-edge like the mod.rs siblings;
+    /// eviction and leader transition re-arm (fail-safe over-emit).
+    disclosed: parking_lot::Mutex<lru::LruCache<(String, String, &'static str), ()>>,
+}
+
+impl Default for SupplyRevalidation {
+    fn default() -> Self {
+        Self {
+            no_host_verdicts: std::collections::HashMap::new(),
+            disclosed: parking_lot::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(1024).unwrap(),
+            )),
+        }
+    }
+}
+
+impl SupplyRevalidation {
+    /// True exactly once per `(tenant, pname, kind)` edge (until
+    /// eviction/transition re-arms) — the type-level debounce gate.
+    pub(super) fn disclose_once(&self, tenant: &str, pname: &str, kind: &'static str) -> bool {
+        self.disclosed
+            .lock()
+            .put((tenant.to_owned(), pname.to_owned(), kind), ())
+            .is_none()
     }
 }
 
@@ -1002,6 +1172,11 @@ pub(super) struct AckApplyPlan {
     )>,
     /// Cost-table observations (decoded `observed_instance_types`).
     observed: Vec<(crate::sla::config::Cell, String, u32, u64)>,
+    /// live_051(c): decoded `rejected` verdicts (wire field 7) —
+    /// `(drv, detail)` rows whose reason decoded to the closed
+    /// alphabet's `NO_HOSTING_CLASS`. Folded by `commit` into the
+    /// consecutive-verdict counters.
+    verdicts: Vec<(DrvHash, String)>,
 }
 
 /// One decoded `BoundIntent` row — the typed remnant of the wire
@@ -1205,6 +1380,7 @@ impl AckApplyPlan {
         observed_instance_types: &[rio_proto::types::ObservedInstanceType],
         bound_intents: &[rio_proto::types::BoundIntent],
         binding_snapshot: Option<&[rio_proto::types::BoundIntent]>,
+        rejected: &[rio_proto::types::IntentVerdict],
     ) -> Result<Self, super::command::AckApplyError> {
         use super::command::{AckApplyError, AckPlane};
         // 124(d): record the spawn-ack witness for EVERY spawned
@@ -1247,6 +1423,28 @@ impl AckApplyPlan {
                 }
             }
         }
+        // live_051(c): decode the verdict plane through the CLOSED
+        // reason alphabet — rustc-exhaustive over the prost enum, zero
+        // wildcard arms, so a future `IntentVerdictReason` variant
+        // stops compiling here until this consumer decides its fold.
+        // `UNSPECIFIED` and unknown discriminants refuse the WHOLE
+        // request (validate-then-commit: an erring ack applied
+        // nothing; the controller re-mints next tick).
+        let mut verdicts = Vec::with_capacity(rejected.len());
+        for v in rejected {
+            use rio_proto::types::IntentVerdictReason;
+            match IntentVerdictReason::try_from(v.reason) {
+                Ok(IntentVerdictReason::NoHostingClass) => {
+                    verdicts.push((DrvHash::from(v.intent_id.as_str()), v.detail.clone()));
+                }
+                Ok(IntentVerdictReason::Unspecified) | Err(_) => {
+                    return Err(AckApplyError::PlaneEntryUndecodable {
+                        plane: AckPlane::Rejected,
+                        entry: format!("{} reason={}", v.intent_id, v.reason),
+                    });
+                }
+            }
+        }
         // r[impl sched.snapshot.binding-presence]
         // Plane selection: the nodeclaim_pool reconciler ships the
         // FULL set every tick as an EXPLICIT snapshot
@@ -1281,6 +1479,7 @@ impl AckApplyPlan {
             clears,
             marks,
             observed,
+            verdicts,
         })
     }
 
@@ -1316,7 +1515,7 @@ impl AckApplyPlan {
     /// field: a plane added to the plan without a commit handler is a
     /// compile error, and `commit` has no access to the raw request
     /// types (the wire stopped at `validate`).
-    pub(super) fn commit(self, actor: &mut DagActor) {
+    pub(super) fn commit(self, actor: &mut DagActor) -> Vec<NoHostPoison> {
         let AckApplyPlan {
             acked_spawned,
             binding,
@@ -1324,6 +1523,7 @@ impl AckApplyPlan {
             clears,
             marks,
             observed,
+            verdicts,
         } = self;
         // 124(d): opportunistic prune keeps the map bounded (entries
         // older than 2× the window are dead: the defer read only
@@ -1331,6 +1531,10 @@ impl AckApplyPlan {
         if !acked_spawned.is_empty() {
             let now = crate::db::attempts::epoch_now();
             for h in acked_spawned {
+                // live_051(c): a spawned ack is the success signal for
+                // the consecutive-verdict budget — the track resets
+                // (the heal path of `step_no_host_counter`'s law).
+                actor.supply_reval.no_host_verdicts.remove(&h);
                 actor.acked_spawned.insert(h, now);
             }
             actor
@@ -1407,6 +1611,54 @@ impl AckApplyPlan {
         if !observed.is_empty() {
             actor.cost_table.write().observe_instance_types(observed);
         }
+        // r[impl scheduler.sla.ceiling.stale-solve-revalidation]
+        // live_051(c): fold the verdict plane into the consecutive
+        // counters. The budget keys on EMISSION PASS, not ack count —
+        // realized as a composition: the producer mints at most one
+        // verdict per drv per cover pass and never redelivers them
+        // (`CoverResult::rejected` is NOT buffered across acks; the
+        // controller's `admin_call` is single-shot per tick), and this
+        // fold counts at most once per drv per APPLIED request (the
+        // `seen` dedup below kills duplicate entries within one ack).
+        // A spawned entry for a drv is the success signal — its track
+        // resets (the heal path); a detail change restarts at 1 (the
+        // config-reload reset, in-band via the detail's configured-
+        // classes text — see `step_no_host_counter`).
+        let mut poisons = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for (drv, detail) in verdicts {
+            if !seen.insert(drv.clone()) {
+                continue;
+            }
+            let next = step_no_host_counter(actor.supply_reval.no_host_verdicts.get(&drv), &detail);
+            if next.0 >= NO_HOST_VERDICTS_TO_POISON {
+                // Only the Ready loop population poisons — a drv that
+                // already left Ready (cancelled, substituted,
+                // completed) gets its track dropped instead.
+                if actor
+                    .dag
+                    .node(&drv)
+                    .is_some_and(|s| s.status() == DerivationStatus::Ready)
+                {
+                    poisons.push(NoHostPoison {
+                        drv: drv.clone(),
+                        detail,
+                    });
+                }
+                actor.supply_reval.no_host_verdicts.remove(&drv);
+            } else {
+                actor.supply_reval.no_host_verdicts.insert(drv, next);
+            }
+        }
+        // Opportunistic prune: tracks for drvs that left Ready are
+        // dead (the controller stops minting their verdicts; bounded
+        // map hygiene, the acked_spawned-retain precedent above).
+        let dag = &actor.dag;
+        actor.supply_reval.no_host_verdicts.retain(|h, _| {
+            dag.node(h)
+                .is_some_and(|s| s.status() == DerivationStatus::Ready)
+        });
+        poisons
     }
 }
 
@@ -2001,17 +2253,128 @@ impl DagActor {
                 // the end of `solve_intent_for` re-applies the same
                 // bounds — this pre-clamp is idempotent under it.
                 let c = c.min(self.sla_ceilings.max_cores as u32).max(1);
+                // live_051(d): the floor max consumes the CLAMPED
+                // projection — a stale persisted floor (minted under a
+                // larger old global) can never re-raise demand past
+                // the live ceiling at this seam.
                 let m = m
-                    .max(state.sched.resource_floor.mem_bytes)
+                    .max(
+                        super::floor::ClampedFloor::of(
+                            &state.sched.resource_floor,
+                            &self.sla_ceilings,
+                        )
+                        .mem_bytes,
+                    )
                     .min(self.sla_ceilings.max_mem);
-                let cells = self.bypass_cells(
+                // r[impl scheduler.sla.ceiling.stale-solve-revalidation]
+                // live_050(e)/live_051(b): the emission chokepoint
+                // mints a TOTAL typed outcome and folds it with zero
+                // wildcard arms — the pre-fix shape emitted `[]` for
+                // every unroutable case (stale demand, infeasible-
+                // everywhere, feature gaps, genuine agnosticism alike)
+                // and the controller churned the non-agnostic ones as
+                // `no_hosting_class` forever (the measured live loop).
+                let solve_infeasible = hw_emitted || infeasible.is_some();
+                // Operator-forced dims are pins, never stale solver
+                // evidence — the classifier refuses to clamp them.
+                let forced_demand = override_
+                    .as_ref()
+                    .is_some_and(|o| o.forced_cores.is_some() || o.forced_mem.is_some());
+                let (c, m, cells) = match self.classify_cell_emission(
                     state,
                     override_.as_ref().and_then(|o| o.capacity),
                     c,
                     m,
                     cost,
                     &tenant,
-                );
+                    &feat,
+                    solve_infeasible,
+                    forced_demand,
+                ) {
+                    CellEmission::Cells(cells) => (c, m, cells),
+                    // Genuinely hw-agnostic (∅ features, no
+                    // infeasibility evidence) — the §13e cold-start
+                    // quiet edge survives BY TYPE, not by shared
+                    // emptiness (R18's regression pin).
+                    CellEmission::HwAgnostic => (c, m, Vec::new()),
+                    // Operator `--capacity` pin not hosted — the r31
+                    // A3 lane already disclosed (debounced warn in
+                    // `bypass_cells`); emission stays empty so the
+                    // pin is never silently rewritten.
+                    CellEmission::PinGated => (c, m, Vec::new()),
+                    CellEmission::StaleSolve {
+                        solved,
+                        live_max,
+                        class,
+                        resolved,
+                        cells,
+                    } => {
+                        // Re-solve disclosed: demand authorized under
+                        // a stale/over-global ceiling is clamped into
+                        // the largest live hosting class instead of
+                        // emitting empty cells (clamp-with-disclosure
+                        // — §5-S: "the system shouldn't hang").
+                        if self.supply_reval.disclose_once(
+                            &tenant,
+                            state.pname.as_deref().unwrap_or(""),
+                            "stale_resolved",
+                        ) {
+                            ::metrics::counter!(
+                                "rio_scheduler_sla_hw_ladder_exhausted_total",
+                                "tenant" => tenant.clone(),
+                                "exit" => "stale_resolved",
+                            )
+                            .increment(1);
+                            tracing::warn!(
+                                %tenant,
+                                pname = state.pname.as_deref().unwrap_or(""),
+                                solved_cores = solved.0,
+                                solved_mem = solved.1,
+                                live_max_cores = live_max.0,
+                                live_max_mem = live_max.1,
+                                class = %class,
+                                resolved_cores = resolved.0,
+                                resolved_mem = resolved.1,
+                                "demand envelope no longer hostable under the \
+                                 live ceilings — re-solved (clamped) into the \
+                                 largest hosting class instead of emitting \
+                                 empty cells",
+                            );
+                        }
+                        (resolved.0, resolved.1, cells)
+                    }
+                    CellEmission::Unhostable { demand, best_class } => {
+                        // No class can host even re-solved — typed +
+                        // loud, never empty-silent. The controller
+                        // answers its own config gaps with the
+                        // IntentVerdict loop (live_051(c)).
+                        if self.supply_reval.disclose_once(
+                            &tenant,
+                            state.pname.as_deref().unwrap_or(""),
+                            "unhostable",
+                        ) {
+                            ::metrics::counter!(
+                                "rio_scheduler_sla_hw_ladder_exhausted_total",
+                                "tenant" => tenant.clone(),
+                                "exit" => "unhostable",
+                            )
+                            .increment(1);
+                            tracing::warn!(
+                                %tenant,
+                                pname = state.pname.as_deref().unwrap_or(""),
+                                demand_cores = demand.0,
+                                demand_mem = demand.1,
+                                best_class = ?best_class,
+                                "demand is unhostable by every configured \
+                                 hw class (feature/arch-constrained or floor \
+                                 above the best class ceiling) — emitting \
+                                 typed-empty; fix the class config or the \
+                                 demand",
+                            );
+                        }
+                        (c, m, Vec::new())
+                    }
+                };
                 (c, m, d, cells, None)
             }
         };
@@ -2031,10 +2394,18 @@ impl DagActor {
         // `resource_floor` dimension (OOM/DiskPressure are mem/disk
         // under-provision, per the spec); `.max(1)` is belt-and-braces
         // — every upstream branch already floors at 1.
+        // live_051(d): mem/disk floor dimensions consume the CLAMPED
+        // projection (stale persisted floors are grounded at the live
+        // ceilings on every read — see `actor::floor::ClampedFloor`);
+        // the deadline dimension keeps the raw floor, capped by
+        // DEADLINE_CAP_SECS below (Ceilings has no time axis).
         let floor = &state.sched.resource_floor;
+        let fclamped = super::floor::ClampedFloor::of(floor, &self.sla_ceilings);
         let cores = cores.min(self.sla_ceilings.max_cores as u32).max(1);
-        let mem = mem.max(floor.mem_bytes).min(self.sla_ceilings.max_mem);
-        let disk = disk.max(floor.disk_bytes).min(self.sla_ceilings.max_disk);
+        let mem = mem.max(fclamped.mem_bytes).min(self.sla_ceilings.max_mem);
+        let disk = disk
+            .max(fclamped.disk_bytes)
+            .min(self.sla_ceilings.max_disk);
         // §13e (was mb_023): `is_fixed_output ⟺ features ∋ fetcher` —
         // the `effective_features` chokepoint projects the role
         // discriminator onto the feature axis, so `retain_hosting_
@@ -2233,7 +2604,16 @@ impl DagActor {
     ) -> Vec<crate::sla::config::Cell> {
         // §13e: bind the EFFECTIVE feature set once. FOD ⟹ [fetcher].
         let feat = effective_features(state);
-        let mem = mem.max(state.sched.resource_floor.mem_bytes);
+        // live_051(d): THE load-bearing floor read — pre-fix this max
+        // consumed the RAW floor with no ceiling bound, so a stale
+        // persisted floor re-raised mem PAST the live global AFTER the
+        // caller's pre-clamp, drove `reference_hw_class_for_system` to
+        // None, and fed the silent empty-cells channel. The clamped
+        // projection makes the bypass max ≤ the live global by type.
+        let mem = mem.max(
+            super::floor::ClampedFloor::of(&state.sched.resource_floor, &self.sla_ceilings)
+                .mem_bytes,
+        );
         // mb_053(a) / V-5: `--capacity` on the bypass path. The
         // `Some(memo)` arm filters `cells` to `cap` post-memo, but ANY
         // bypass field gates `full=None` and lands here with empty
@@ -2321,11 +2701,19 @@ impl DagActor {
             // `fit` stays `None` → bootstrap deadlock.
             // Emit cells for every configured cap of the reference
             // class so the controller mints the matching cell.
-            // Featureless intents stay `[]` (genuinely hw-agnostic;
-            // controller's `fallback_cell` arch-matches).
             // §13e: `feat = [fetcher]` for FODs, so cold-start FODs
             // land here and route to `fetcher-*` — the same
             // chicken-egg fix as kvm-cold-start.
+            //
+            // live_050(e): an EMPTY return from these arms is no
+            // longer the end state — `classify_cell_emission` wraps
+            // this fn and types every empty exit through the
+            // `CellEmission` alphabet (HwAgnostic stays quiet BY
+            // TYPE; stale/over-ceiling demand RE-SOLVES into the
+            // largest live hosting class; a genuine feature/arch gap
+            // is `Unhostable` + loud). Pre-fix, `[]` here was
+            // indistinguishable on the wire from genuine hw-agnostic
+            // demand — the measured silent-starvation channel.
             None if !feat.is_empty() => self
                 .sla_config
                 .reference_hw_class_for_system(
@@ -2344,6 +2732,155 @@ impl DagActor {
                         .collect()
                 }),
             None => Vec::new(),
+        }
+    }
+
+    // r[impl scheduler.sla.ceiling.stale-solve-revalidation]
+    /// live_050(e)/live_051(b): classify one no-memo cell emission into
+    /// the TOTAL [`CellEmission`] alphabet. Wraps [`Self::bypass_cells`]
+    /// (whose operator-pin lane keeps its own r31 A3 disclosure
+    /// machinery untouched) and types every EMPTY exit — the pre-fix
+    /// silent population:
+    ///
+    /// - non-empty routing → `Cells` (the unchanged §13d arms);
+    /// - ∅ features + no infeasibility evidence (+ no pin) →
+    ///   `HwAgnostic` — the genuinely quiet edge, preserved by type;
+    /// - a `--capacity` pin a size-hosting class refuses → `PinGated`
+    ///   (bypass already warned, debounced);
+    /// - demand no class hosts at SIZE, with routing candidates →
+    ///   `StaleSolve` — the revalidation arm: re-solve under the LIVE
+    ///   ceilings by clamping into the largest hosting class (the
+    ///   demand was authorized by a ceiling vector that no longer
+    ///   exists — stale floors, shrunk catalogs, or an over-global
+    ///   solve all land here);
+    /// - no routing candidate at all, or a clamped floor above the
+    ///   best candidate's ceiling → `Unhostable` with the WHY (demand
+    ///   + best class) so every consumer can derive the delta.
+    ///
+    /// The re-solve is per-emission revalidation (T2: the envelope
+    /// consumes the ceiling-witness that authorized it) — boots,
+    /// reloads, and mid-run shrinks are all observed at the next
+    /// emission pass, durable rows included, because the validation is
+    /// read-time against `cost.catalog_ceilings()`/`resolved_global()`.
+    /// Zero new per-pass complexity class: the pre-fix arm already
+    /// called `reference_hw_class_for_system` per intent; the
+    /// candidate walk below runs only for the EMPTY population.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn classify_cell_emission(
+        &self,
+        state: &crate::state::DerivationState,
+        cap: Option<crate::sla::config::CapacityType>,
+        cores: u32,
+        mem: u64,
+        cost: &crate::sla::cost::CostTable,
+        tenant: &str,
+        feat: &[String],
+        solve_infeasible: bool,
+        forced_demand: bool,
+    ) -> CellEmission {
+        let routed = self.bypass_cells(state, cap, cores, mem, cost, tenant);
+        if !routed.is_empty() {
+            return CellEmission::Cells(routed);
+        }
+        let arch = rio_common::k8s::system_to_k8s_arch(&state.system);
+        if feat.is_empty() {
+            // Arch-unmappable featureless demand can never route
+            // (the r35 B1 guard in `reference_hw_class_for_system`);
+            // and featureless demand with NO infeasibility evidence
+            // and no pin is the designed agnostic lane — the
+            // controller's `fallback_cell` arch-matches it.
+            if arch.is_none() || (cap.is_none() && !solve_infeasible) {
+                return CellEmission::HwAgnostic;
+            }
+        }
+        if cap.is_some()
+            && self
+                .sla_config
+                .reference_hw_class_for_system(
+                    &state.system,
+                    cores,
+                    mem,
+                    feat,
+                    cost.catalog_ceilings(),
+                    cost.resolved_global(),
+                )
+                .is_some()
+        {
+            // A size-hosting class exists but refused the pin — the
+            // mb_003/r31 A3 lane (bypass_cells warned, debounced).
+            return CellEmission::PinGated;
+        }
+        // Routing candidates IGNORING size — the re-solve universe.
+        let catalog = cost.catalog_ceilings();
+        let global = cost.resolved_global();
+        let mut cands: Vec<&str> = self
+            .sla_config
+            .hw_classes
+            .keys()
+            .map(String::as_str)
+            .filter(|h| self.sla_config.class_routes(h, arch, feat))
+            .filter(|h| cap.is_none_or(|c| self.sla_config.capacity_types_for(h).contains(&c)))
+            .collect();
+        cands.sort_unstable();
+        // Largest by (mem ceiling, cores ceiling) — mem-major because
+        // the floor (the un-clampable demand component) is a mem/disk
+        // axis; ties resolve to the lexicographically last (sorted +
+        // max_by keeps the last maximum) for determinism.
+        let best = cands
+            .into_iter()
+            .map(|h| (h, self.sla_config.class_ceilings(h, catalog, global)))
+            .max_by(|a, b| (a.1.1, a.1.0).cmp(&(b.1.1, b.1.0)));
+        let Some((best_h, (bcc, bcm))) = best else {
+            return CellEmission::Unhostable {
+                demand: (cores, mem),
+                best_class: None,
+            };
+        };
+        // OPERATOR-FORCED demand is a pin, not stale solver evidence —
+        // the re-solve clamp would silently rewrite `--cores`/`--mem`
+        // (the bug_019 (a)-inverse law: oversized forced demand MUST
+        // emit empty so the controller's `fallback_cell` reaches its
+        // own None — now ANSWERED by the live_051(c) verdict loop,
+        // which poisons the drv with an actionable detail instead of
+        // looping silently). Typed loud, never clamped.
+        if forced_demand {
+            return CellEmission::Unhostable {
+                demand: (cores, mem),
+                best_class: Some((best_h.to_owned(), (bcc, bcm))),
+            };
+        }
+        // live_051(d): the floor is the demand component a re-solve
+        // cannot clamp away — consume it CLAMPED (the projection law)
+        // and refuse when even the best candidate sits below it.
+        let fclamped =
+            super::floor::ClampedFloor::of(&state.sched.resource_floor, &self.sla_ceilings);
+        if fclamped.mem_bytes > bcm {
+            return CellEmission::Unhostable {
+                demand: (cores, mem),
+                best_class: Some((best_h.to_owned(), (bcc, bcm))),
+            };
+        }
+        let resolved = (cores.min(bcc).max(1), mem.min(bcm).max(fclamped.mem_bytes));
+        let cells: Vec<crate::sla::config::Cell> = match cap {
+            // The pin survives the re-solve: one cell at the pinned
+            // capacity (candidates were pre-filtered to pin hosts).
+            Some(c) => vec![(best_h.to_owned(), c)],
+            // Mirror the §13d cold-start arm: every configured cap of
+            // the chosen class, so the controller mints the matching
+            // cell and the ladder closure can extend it.
+            None => self
+                .sla_config
+                .capacity_types_for(best_h)
+                .iter()
+                .map(|c| (best_h.to_owned(), *c))
+                .collect(),
+        };
+        CellEmission::StaleSolve {
+            solved: (cores, mem),
+            live_max: (bcc, bcm),
+            class: best_h.to_owned(),
+            resolved,
+            cells,
         }
     }
 
