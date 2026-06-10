@@ -1157,20 +1157,21 @@ impl IceBackoff {
     ///     just-proven-healthy cell. The normalization deletes the
     ///     expired cell at the wipe instant — post-reset every
     ///     cell's prev-state ∈ {None, Some((s, true))}.
+    ///
     ///   Priced residuals (SIGNED IN TEXT — both directions are
     ///   conservative over-masking, self-healing via TTL decay and
     ///   the next Ack clearing the buffer; the ICE ladder is
     ///   capacity-cost posture, not a safety theorem, so priced
     ///   residuals are admissible here — the R19 boundary):
     ///   (i) a mask LIVE at the wipe that expires before the next
-    ///       redelivery lands still climbs once — window
-    ///       arithmetic: redelivery cadence ~10s vs min TTL 60s ⇒
-    ///       the coincidence window is ≤ 1/6 of the base rung per
-    ///       affected cell per wipe; at most one rung;
+    ///   redelivery lands still climbs once — window arithmetic:
+    ///   redelivery cadence ~10s vs min TTL 60s ⇒ the coincidence
+    ///   window is ≤ 1/6 of the base rung per affected cell per
+    ///   wipe; at most one rung;
     ///   (ii) a post-local-clear redelivery mints one fresh 60s
-    ///        base mask — inherent to wiping the watermark (the
-    ///        axis-3 protection IS the watermark; not closable
-    ///        without re-growing it).
+    ///   base mask — inherent to wiping the watermark (the axis-3
+    ///   protection IS the watermark; not closable without
+    ///   re-growing it).
     /// - watermark (`last_applied`): WIPED — a ratchet with no TTL; a
     ///   clock-behind successor controller's `EpochMint` (Default
     ///   prev=0, seeded `max(now, prev+1)`) mints epochs BELOW the

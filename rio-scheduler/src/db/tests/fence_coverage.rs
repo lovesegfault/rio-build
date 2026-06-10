@@ -611,11 +611,11 @@ fn derivations_writes(file: &str, src: &str) -> Vec<DerivationsWrite> {
 /// merged_bug_004/merged_bug_006: the comparand-purity census, in its
 /// post-102 TOTAL-BAN form. PROPOSITION CERTIFIED: NO production
 /// `derivations` statement names `status_changed_at` in any SET list,
-/// `DO UPDATE SET` list, or INSERT column list — the migration-102
+/// `DO UPDATE SET` list, or INSERT column list — the migration 102
 /// BEFORE UPDATE trigger is the column's single authority (stamping
 /// IFF the status VALUE changes), so the single-authority law is
 /// checkable as the ABSENCE of any client-side writer; fresh rows
-/// ride the migration-101 DEFAULT. This is the precedence law's
+/// ride the migration 101 DEFAULT. This is the precedence law's
 /// quantification premise: the replay conjunct cuts on a column
 /// writable solely by status VALUE-change events. The law is TOTAL —
 /// no allowlist; the scan-derived writer sets stay pinned to the
@@ -634,7 +634,7 @@ fn derivations_status_stamp_census() {
             if names(&w.set_cols, "status_changed_at") {
                 violations.push(format!(
                     "{}:{}: fn `{}` names `status_changed_at` in a SET/DO-UPDATE list \
-                     (the migration-102 trigger is the stamp's single authority — \
+                     (the migration 102 trigger is the stamp's single authority — \
                      no client statement may write the comparand)",
                     w.file, w.line, w.fn_name
                 ));
@@ -642,7 +642,7 @@ fn derivations_status_stamp_census() {
             if names(&w.insert_cols, "status_changed_at") {
                 violations.push(format!(
                     "{}:{}: fn `{}` INSERTs `status_changed_at` (fresh rows ride \
-                     the migration-101 DEFAULT; the comparand has no client-side \
+                     the migration 101 DEFAULT; the comparand has no client-side \
                      writer)",
                     w.file, w.line, w.fn_name
                 ));

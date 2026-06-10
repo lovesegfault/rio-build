@@ -348,7 +348,7 @@ impl SchedulerDb {
             //
             // merged_bug_004/merged_bug_006: the comparand is
             // `status_changed_at` — stamped exclusively by the
-            // migration-102 BEFORE UPDATE trigger, WHEN the status
+            // migration 102 BEFORE UPDATE trigger, WHEN the status
             // VALUE changes (no Rust SET list names it; the total-ban
             // census in db/tests/fence_coverage.rs) — so neither a
             // non-status write (the resource-floor ratchet, the

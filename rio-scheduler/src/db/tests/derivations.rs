@@ -818,7 +818,7 @@ async fn stamp_epoch(pool: &sqlx::PgPool, drv_hash: &str) -> anyhow::Result<f64>
 /// law. PROPOSITION CERTIFIED: driving EVERY production derivations
 /// writer (the list pinned by `derivations_status_stamp_census`) with
 /// a value-CHANGING write, the `status_changed_at` stamp advances —
-/// the migration-102 trigger reproduces the old per-writer stamp on
+/// the migration 102 trigger reproduces the old per-writer stamp on
 /// every genuine transition — and every non-status writer leaves the
 /// comparand stationary. The STASIS half for value-PRESERVING status
 /// writes is the sibling test
