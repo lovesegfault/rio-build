@@ -4667,6 +4667,147 @@ async fn production_cancel_late_report_fills_the_line_count() -> TestResult {
     Ok(())
 }
 
+/// bug_098 R1: after cancel → resubmit → re-dispatch, the late
+/// report's fill lands on the REPORTING exec and the successor's row
+/// stays unstamped — both halves of the load-bearing claim (no
+/// foreign mint AND the true fill lands), through production
+/// constructors only (the bug_077 R13 lane: real merge, real pull
+/// mint, real CancelBuild, real report intake; the resubmit is the
+/// merge's remove+reinsert via is_retriable_on_resubmit — no
+/// Cancelled→Created edge exists).
+// r[verify sched.executor.report-idempotent]
+#[tokio::test]
+async fn late_cancelled_report_fills_its_own_exec_not_the_successor() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let b1 = Uuid::new_v4();
+    let _ev = merge_single_node(&handle, b1, "late-own-exec", PriorityClass::Scheduled).await?;
+
+    // Attempt A through the real mint; the user cancels (durable
+    // close lands; cancel-time epilogue stamps A 'cancelled', NULL
+    // count).
+    let exec_a = open_pull_exec(&handle, "late-own-exec").await;
+    cancel_build(&handle, b1).await?;
+
+    // The production resubmit: a second build re-merges the same drv
+    // (remove+reinsert), and re-dispatch mints attempt B — running,
+    // drv_executions row status IS NULL.
+    let b2 = Uuid::new_v4();
+    let _ev = merge_single_node(&handle, b2, "late-own-exec", PriorityClass::Scheduled).await?;
+    let exec_b = open_pull_exec(&handle, "late-own-exec").await;
+    assert_ne!(exec_a, exec_b, "the resubmit minted a fresh exec");
+
+    // A's late Cancelled report arrives AFTER the resubmit (pod
+    // SIGTERM-grace + report retries routinely span one), carrying
+    // the real post-footer count.
+    let mut payload = pull_payload(rio_proto::types::BuildResult {
+        status: rio_proto::types::BuildResultStatus::Cancelled.into(),
+        ..Default::default()
+    });
+    payload.final_line_count = 7;
+    pull_report_exec(&handle, exec_a, "late-own-exec", payload).await?;
+
+    // The fill is a spawned best-effort write: poll until it lands on
+    // either row (pre-fix it lands on B).
+    let row = |exec: Uuid| {
+        let pool = db.pool.clone();
+        async move {
+            let r: (Option<String>, Option<i64>) = sqlx::query_as(
+                "SELECT status, final_line_count FROM drv_executions WHERE exec_id = $1",
+            )
+            .bind(exec)
+            .fetch_one(&pool)
+            .await
+            .expect("exec row exists");
+            r
+        }
+    };
+    for _ in 0..100 {
+        let (_, a_count) = row(exec_a).await;
+        let (_, b_count) = row(exec_b).await;
+        if a_count.is_some() || b_count.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let (a_status, a_count) = row(exec_a).await;
+    let (b_status, b_count) = row(exec_b).await;
+    assert_eq!(
+        (
+            (a_status.as_deref(), a_count),
+            (b_status.as_deref(), b_count)
+        ),
+        ((Some("cancelled"), Some(7)), (None, None)),
+        "left: the fill re-resolved the CURRENT exec — successor B minted \
+         'cancelled' with A's count and a fabricated finished_at via the \
+         status-IS-NULL arm, A's count stayed NULL, and B's real verdict \
+         now matches zero rows forever / right: A fills its OWN row; \
+         B stays unstamped and running"
+    );
+    Ok(())
+}
+
+/// bug_098 R2: per-attempt count attribution — COALESCE first-wins
+/// can no longer cross attempts. Both attempts cancelled; each late
+/// report fills ITS OWN row (pre-fix: A's count landed on B through
+/// the node's mutable carrier, and first-wins then blocked B's true
+/// count forever). Production constructors only.
+// r[verify sched.executor.report-idempotent]
+#[tokio::test]
+async fn cross_attempt_count_never_migrates() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let b1 = Uuid::new_v4();
+    let _ev = merge_single_node(&handle, b1, "count-no-migrate", PriorityClass::Scheduled).await?;
+    let exec_a = open_pull_exec(&handle, "count-no-migrate").await;
+    cancel_build(&handle, b1).await?;
+
+    let b2 = Uuid::new_v4();
+    let _ev = merge_single_node(&handle, b2, "count-no-migrate", PriorityClass::Scheduled).await?;
+    let exec_b = open_pull_exec(&handle, "count-no-migrate").await;
+    cancel_build(&handle, b2).await?;
+
+    // A's late report first (count 7), then B's own (count 9).
+    let late = |count: u64| {
+        let mut payload = pull_payload(rio_proto::types::BuildResult {
+            status: rio_proto::types::BuildResultStatus::Cancelled.into(),
+            ..Default::default()
+        });
+        payload.final_line_count = count;
+        payload
+    };
+    pull_report_exec(&handle, exec_a, "count-no-migrate", late(7)).await?;
+    pull_report_exec(&handle, exec_b, "count-no-migrate", late(9)).await?;
+
+    let row = |exec: Uuid| {
+        let pool = db.pool.clone();
+        async move {
+            let r: (Option<i64>,) =
+                sqlx::query_as("SELECT final_line_count FROM drv_executions WHERE exec_id = $1")
+                    .bind(exec)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("exec row exists");
+            r.0
+        }
+    };
+    // Poll until BOTH fills land (spawned best-effort writes).
+    let mut pair = (None, None);
+    for _ in 0..100 {
+        pair = (row(exec_a).await, row(exec_b).await);
+        if pair.0.is_some() && pair.1.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        pair,
+        (Some(7), Some(9)),
+        "left: B.final_line_count = 7 — A's count migrated to the successor \
+         and first-wins blocked B's true count (A stayed NULL) / right: each \
+         report fills its own attempt's row"
+    );
+    Ok(())
+}
+
 /// merged_bug_200: rio_scheduler_store_degraded_requeues_total ticked
 /// at CLASSIFICATION time -- before the claims-floor fence, the
 /// appending transaction, and the dag presence guard -- so the counter

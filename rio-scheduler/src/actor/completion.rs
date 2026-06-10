@@ -39,23 +39,43 @@ use crate::state::{
 
 use super::DagActor;
 
+/// The identity witness of a late report's OWN execution (bug_098):
+/// minted ONLY where the fold resolved its evidence — the pull report
+/// intake's find key, the shim's admission-lookup exec, the in-body
+/// Cancelled arm's own carrier (a Cancelled node's `exec_id` is the
+/// cancelled attempt's own — the carrier clears on terminal EXIT,
+/// never entry). The fill stamps THIS execution; it is never
+/// re-resolved through mutable node state (cancel → resubmit →
+/// re-dispatch moves the node's carrier to the successor attempt; a
+/// fill that re-resolves mints a first 'cancelled' verdict on the
+/// RUNNING successor and blocks its real verdict forever).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ReportingExec(pub(super) Uuid);
+
 /// The late-report (AckIgnore) lane's typed effect alphabet (bug_077,
 /// the closure set): what a report that FAILED kernel admission may
 /// still do. A future late-report side effect adds a variant here —
 /// never an ad-hoc statement in an AckIgnore arm. Computed by
-/// [`late_report_effect`] from the payload alone; applied by
-/// [`DagActor::apply_late_report_effect`].
+/// [`late_report_effect`] from the payload plus the fold's resolved
+/// identity; applied by [`DagActor::apply_late_report_effect`].
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum LateReportEffect {
     /// merged_bug_294 relocated to where late reports actually arrive
     /// (bug_077): the cancelled execution's `final_line_count`
-    /// gap-fill. Correctness is backstopped by the stamp SQL's
-    /// equal-status COALESCE monotone guard — it fills ONLY a NULL
-    /// count on an already-cancelled-stamped row; a different verdict
-    /// matches zero rows — so firing on every Cancelled-status late
-    /// report is safe by construction (the SQL guard carries the
-    /// law).
+    /// gap-fill, addressed by the reporting execution's own identity
+    /// (bug_098). Safety = identity + monotone COALESCE: the stamp
+    /// lands on the exec the fold resolved — the identity is INSIDE
+    /// the effect, so a foreign exec is unrepresentable — and the SQL
+    /// qual (`status IS NULL OR status = $2`) admits a FIRST verdict
+    /// only on the reporting exec's OWN row, which is CORRECT (the
+    /// report IS that exec's terminal: the degraded-window cell
+    /// honestly delivers the count while the cancel persist is still
+    /// outbox-latched and the row unstamped). "Never mint a first
+    /// verdict" is true as "never mint a first verdict on a FOREIGN
+    /// exec", and the identity enforces it, not the qual.
     FillCancelledCount {
+        /// The reporting execution — the row the fill addresses.
+        exec: ReportingExec,
         /// The report's post-footer line count (> 0).
         count: i64,
     },
@@ -63,21 +83,26 @@ pub(super) enum LateReportEffect {
     Nothing,
 }
 
-/// The one computation `(payload status, final_line_count)` →
-/// [`LateReportEffect`]. Pure; both AckIgnore lanes (the pull report
-/// intake and the un-admitted `ProcessCompletion` shim) route through
-/// it.
+/// The one computation `(reporting identity, payload status,
+/// final_line_count)` → [`LateReportEffect`]. Pure; all three lanes
+/// (the pull report intake, the un-admitted `ProcessCompletion` shim,
+/// the in-body degraded-window Cancelled arm) route through it. A
+/// `None` identity returns [`LateReportEffect::Nothing`]: a ghost
+/// exec is never stamped (conservative — the count's only carrier is
+/// dropped exactly when no execution can be named for it; disclosed).
 pub(super) fn late_report_effect(
+    reporting: Option<ReportingExec>,
     status: rio_proto::types::BuildResultStatus,
     final_line_count: u64,
 ) -> LateReportEffect {
     let cancelled = status == rio_proto::types::BuildResultStatus::Cancelled;
     match (
+        reporting,
         cancelled,
         i64::try_from(final_line_count).ok().filter(|n| *n > 0),
     ) {
-        (true, Some(count)) => LateReportEffect::FillCancelledCount { count },
-        (true, None) | (false, _) => LateReportEffect::Nothing,
+        (Some(exec), true, Some(count)) => LateReportEffect::FillCancelledCount { exec, count },
+        (None, _, _) | (_, true, None) | (_, false, _) => LateReportEffect::Nothing,
     }
 }
 
@@ -1087,22 +1112,31 @@ impl DagActor {
     // -----------------------------------------------------------------------
 
     /// Apply one [`LateReportEffect`] (the AckIgnore lane's only
-    /// state-touching arm). The fill re-issues the terminal epilogue
-    /// with the SAME status — the stamp SQL's equal-status COALESCE
-    /// guard fills ONLY a NULL count on an already-cancelled-stamped
-    /// row (a different verdict matches zero rows), so this is
-    /// monotone-safe from any lane. Disclosed residual: a drv already
-    /// reaped from the DAG skips the epilogue (no exec to resolve) —
-    /// conservative direction, identical to the pre-fix behavior.
+    /// state-touching arm). The fill stamps the effect's OWN exec
+    /// directly (bug_098) — a count gap-fill on the reporting
+    /// execution's row, not a correlation event (the cancelled
+    /// attempt's correlation landed at cancel time) — so there is no
+    /// epilogue re-resolve through mutable node state: after a
+    /// resubmit the node's carrier names the SUCCESSOR attempt, and
+    /// the pre-fix re-resolve minted a first 'cancelled' verdict on
+    /// the running successor via the stamp SQL's `status IS NULL`
+    /// arm. The monotone COALESCE qual still bounds the write (an
+    /// already-stamped equal-status row only fills NULL gaps; a
+    /// different verdict matches zero rows). Delta from the epilogue
+    /// route, disclosed: a drv already reaped from the DAG now still
+    /// fills (the stamp needs no node), where the old route skipped —
+    /// strictly less count loss, same monotone bound.
     pub(super) fn apply_late_report_effect(
         &mut self,
         drv_hash: &DrvHash,
         effect: LateReportEffect,
     ) {
         match effect {
-            LateReportEffect::FillCancelledCount { count } => {
-                let interested = self.get_interested_builds(drv_hash);
-                self.terminal_log_epilogue(drv_hash, "cancelled", &interested, Some(count));
+            LateReportEffect::FillCancelledCount {
+                exec: ReportingExec(exec_id),
+                count,
+            } => {
+                self.stamp_drv_execution_terminal(drv_hash, exec_id, "cancelled", Some(count));
             }
             LateReportEffect::Nothing => {}
         }
@@ -1161,19 +1195,25 @@ impl DagActor {
             );
             return;
         };
-        let admission = match self.dag.node(&drv_hash).and_then(|s| s.exec_id) {
+        let (admission, reporting) = match self.dag.node(&drv_hash).and_then(|s| s.exec_id) {
             Some(exec_id) => match self.db.find_attempt_by_exec_id(exec_id).await {
                 Ok(Some(attempt)) => {
                     let core = attempt.core();
-                    fold_report(
-                        core.assignment_active,
-                        core.attempt_recorded || core.attempt_terminal,
+                    (
+                        fold_report(
+                            core.assignment_active,
+                            core.attempt_recorded || core.attempt_terminal,
+                        ),
+                        // The admission exec (bug_098): the durable
+                        // row whose facts the fold consumed — the
+                        // identity a late-report fill may stamp.
+                        Some(ReportingExec(exec_id)),
                     )
                 }
                 // Never-pulled or superseded exec: no active
                 // assignment exists — honest fold inputs, AckIgnore
-                // by the kernel law.
-                Ok(None) => fold_report(false, false),
+                // by the kernel law; a ghost exec is never stamped.
+                Ok(None) => (fold_report(false, false), None),
                 Err(e) => {
                     warn!(
                         drv_hash = %drv_hash, %exec_id, error = %e,
@@ -1184,7 +1224,8 @@ impl DagActor {
                 }
             },
             // No durable attempt named by the node: fold over the
-            // in-memory assignment view (see the method doc).
+            // in-memory assignment view (see the method doc). No
+            // exec, no fill identity.
             None => {
                 let in_memory_active = self.dag.node(&drv_hash).is_some_and(|s| {
                     matches!(
@@ -1192,7 +1233,7 @@ impl DagActor {
                         DerivationStatus::Assigned | DerivationStatus::Running
                     )
                 });
-                fold_report(in_memory_active, false)
+                (fold_report(in_memory_active, false), None)
             }
         };
         match admission {
@@ -1216,7 +1257,7 @@ impl DagActor {
                 );
                 let status = rio_proto::types::BuildResultStatus::try_from(result.status)
                     .unwrap_or(rio_proto::types::BuildResultStatus::Unspecified);
-                let effect = late_report_effect(status, final_line_count);
+                let effect = late_report_effect(reporting, status, final_line_count);
                 self.apply_late_report_effect(&drv_hash, effect);
             }
         }
@@ -1414,7 +1455,16 @@ impl DagActor {
         // same epilogue chokepoint, and the stamp SQL's equal-status
         // COALESCE guard makes the double coverage idempotent.
         if current_status == DerivationStatus::Cancelled {
-            let effect = late_report_effect(wire_status, final_line_count);
+            // The Cancelled node's carrier is the cancelled attempt's
+            // OWN exec (the carrier clears on terminal EXIT, never
+            // entry) — the degraded-window fill stamps its own row
+            // (bug_098).
+            let reporting = self
+                .dag
+                .node(drv_hash)
+                .and_then(|s| s.exec_id)
+                .map(ReportingExec);
+            let effect = late_report_effect(reporting, wire_status, final_line_count);
             self.apply_late_report_effect(drv_hash, effect);
             debug!(drv_hash = %drv_hash, executor_id = %executor_id,
                    "cancelled completion report (expected after a cancel)");

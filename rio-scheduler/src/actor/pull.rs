@@ -1472,9 +1472,14 @@ impl DagActor {
                 // bug_077: the late-report lane — the typed effect a
                 // non-admitted report may still have (the cancelled
                 // count gap-fill rides HERE, where late reports
-                // actually arrive; the SQL guard makes it safe).
+                // actually arrive). bug_098: the effect carries the
+                // REPORT'S OWN exec — the find key this intake
+                // resolved the attempt by — so the fill can never
+                // stamp a successor attempt through the node's
+                // mutable carrier.
                 let drv_hash = DrvHash::from(b.core.drv_hash.as_str());
                 let effect = super::completion::late_report_effect(
+                    Some(super::completion::ReportingExec(exec_id)),
                     payload.result.status(),
                     payload.final_line_count,
                 );

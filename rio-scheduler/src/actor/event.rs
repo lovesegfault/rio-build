@@ -531,7 +531,7 @@ impl DagActor {
     /// Returns the spawned write's join handle (`None` on the
     /// vocabulary-error arm). [`Self::terminal_log_epilogue`] forwards
     /// it; production never awaits it (see the caveat there).
-    fn stamp_drv_execution_terminal(
+    pub(super) fn stamp_drv_execution_terminal(
         &self,
         drv_hash: &DrvHash,
         exec_id: Uuid,
