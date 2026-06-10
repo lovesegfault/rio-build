@@ -54,6 +54,40 @@ pub struct ExecutorContext {
     /// sizes it at effective_admission_cap / 2 and threads ONE pool
     /// through every worker's context.
     pub path_slots: PathSlotPool,
+    /// Test-only probe rendezvous: when set, every `probe_local` call
+    /// awaits this barrier at entry. The width-4 probe-concurrency
+    /// red sizes it at F and watches whether siblings can rendezvous
+    /// (they cannot while any job-wide guard spans the probe).
+    /// `None` everywhere outside the owning tests — semantics-neutral.
+    #[cfg(test)]
+    pub probe_rendezvous: Option<std::sync::Arc<tokio::sync::Barrier>>,
+    /// Test-only counter for the spawn loop's `!spawned` break (a
+    /// slot acquired and dropped unused — frontier drained to dups or
+    /// the cap latched). The enqueue-dedup red asserts this stays 0.
+    #[cfg(test)]
+    pub unused_permit_drops: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+impl ExecutorContext {
+    /// THE context constructor (every construction site routes here —
+    /// the test-seam fields stay out of production literals).
+    pub fn new(
+        pool: PgPool,
+        substituter: std::sync::Arc<Substituter>,
+        path_fanout: usize,
+        path_slots: PathSlotPool,
+    ) -> Self {
+        Self {
+            pool,
+            substituter,
+            path_fanout,
+            path_slots,
+            #[cfg(test)]
+            probe_rendezvous: None,
+            #[cfg(test)]
+            unused_permit_drops: None,
+        }
+    }
 }
 
 /// Execute one claimed materialization job end-to-end and produce the
@@ -593,6 +627,10 @@ async fn execute_job_inner(
                     if !spawned {
                         // Frontier drained to dups (slot dropped
                         // unused) or the cap latched.
+                        #[cfg(test)]
+                        if let Some(counter) = &ctx.unused_permit_drops {
+                            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         break;
                     }
                 }
@@ -981,6 +1019,11 @@ const PROGRESS_TICK_QUEUE: usize = 64;
 pub struct PathSlotPool {
     slots: std::sync::Arc<tokio::sync::Semaphore>,
     capacity: usize,
+    /// Test-only hook invoked between `publish_in_use`'s read and its
+    /// set — the lost-update interleave seam for the gauge red. `None`
+    /// everywhere outside the owning test.
+    #[cfg(test)]
+    publish_gate: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl PathSlotPool {
@@ -991,7 +1034,16 @@ impl PathSlotPool {
         Self {
             slots: std::sync::Arc::new(tokio::sync::Semaphore::new(capacity)),
             capacity,
+            #[cfg(test)]
+            publish_gate: None,
         }
+    }
+
+    /// Install the read/set interleave hook (test-only).
+    #[cfg(test)]
+    fn with_publish_gate(mut self, gate: std::sync::Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.publish_gate = Some(gate);
+        self
     }
 
     /// Configured pool size (the boot-warn comparand).
@@ -1054,6 +1106,13 @@ impl PathSlotPool {
     /// Republish the in-use gauge from the pool's current truth.
     fn publish_in_use(&self) {
         let in_use = self.capacity.saturating_sub(self.slots.available_permits());
+        // Test-only interleave seam: parks THIS publisher between its
+        // read (above) and its set (below) so a sibling's full
+        // read-then-set can land in the window.
+        #[cfg(test)]
+        if let Some(gate) = &self.publish_gate {
+            gate();
+        }
         metrics::gauge!("rio_store_executor_path_slots_in_use").set(in_use as f64);
     }
 }
@@ -1431,6 +1490,13 @@ async fn probe_local(
     tenants: &[Uuid],
     trust_cache: &mut TrustedSetCache,
 ) -> Result<LocalPresence, crate::metadata::MetadataError> {
+    // Test-only rendezvous seam (see `ExecutorContext::probe_rendezvous`):
+    // sized at F by the probe-concurrency red — completes only when F
+    // sibling probes overlap in time.
+    #[cfg(test)]
+    if let Some(rendezvous) = &ctx.probe_rendezvous {
+        rendezvous.wait().await;
+    }
     let Some(info) = crate::metadata::query_path_info(&ctx.pool, store_path).await? else {
         return Ok(LocalPresence::Absent(LocalMiss(())));
     };
@@ -2060,14 +2126,12 @@ mod tests {
     /// exercise a regime production does not use, hiding interleaving
     /// bugs from the gate). Width-sensitive tests override the field.
     fn make_ctx(pool: PgPool) -> ExecutorContext {
-        ExecutorContext {
-            substituter: std::sync::Arc::new(
-                Substituter::new(pool.clone(), None).with_http_client(sandbox_http()),
-            ),
-            pool,
-            path_fanout: 4,
-            path_slots: PathSlotPool::new(32),
-        }
+        ExecutorContext::new(
+            pool.clone(),
+            std::sync::Arc::new(Substituter::new(pool, None).with_http_client(sandbox_http())),
+            4,
+            PathSlotPool::new(32),
+        )
     }
 
     /// Seed the scheduler-side rows one claimed job needs: a
@@ -3253,16 +3317,16 @@ mod tests {
         .await;
 
         // 1s stall window so the abort fires within the test budget.
-        let ctx = ExecutorContext {
-            substituter: std::sync::Arc::new(
+        let ctx = ExecutorContext::new(
+            db.pool.clone(),
+            std::sync::Arc::new(
                 Substituter::new(db.pool.clone(), None)
                     .with_http_client(sandbox_http())
                     .with_stall_window(std::time::Duration::from_secs(1)),
             ),
-            pool: db.pool.clone(),
-            path_fanout: 1,
-            path_slots: PathSlotPool::new(32),
-        };
+            1,
+            PathSlotPool::new(32),
+        );
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), async {
             execute_job(&ctx, &seeded.claimed).await.into_outcome()
         })
@@ -5419,11 +5483,13 @@ mod tests {
         let pool_p = crate::config::derive_executor_path_slots(gate_cap);
         assert_eq!(pool_p, gate_cap / 2);
         let path_slots = PathSlotPool::new(pool_p);
-        let mk_ctx = || ExecutorContext {
-            pool: db.pool.clone(),
-            substituter: std::sync::Arc::clone(&substituter),
-            path_fanout: 4,
-            path_slots: path_slots.clone(),
+        let mk_ctx = || {
+            ExecutorContext::new(
+                db.pool.clone(),
+                std::sync::Arc::clone(&substituter),
+                4,
+                path_slots.clone(),
+            )
         };
         let handles: Vec<_> = jobs
             .iter()
@@ -5539,11 +5605,13 @@ mod tests {
         );
         // ONE slot: the steady-state contention regime, minimized.
         let pool1 = PathSlotPool::new(1);
-        let mk_ctx = || ExecutorContext {
-            pool: db.pool.clone(),
-            substituter: std::sync::Arc::clone(&substituter),
-            path_fanout: 4,
-            path_slots: pool1.clone(),
+        let mk_ctx = || {
+            ExecutorContext::new(
+                db.pool.clone(),
+                std::sync::Arc::clone(&substituter),
+                4,
+                pool1.clone(),
+            )
         };
 
         // A starts first and takes the slot (a1 in flight, a2 queued
@@ -5595,6 +5663,48 @@ mod tests {
             pin_count(&db.pool, "mat-w2b-drv-a", "materialization").await,
             2,
             "walk A finished BOTH paths (baseline re-queue worked)"
+        );
+    }
+
+    /// Prelude seam smoke (the width-4 red seams): a NO-OP publish
+    /// gate is semantics-neutral — the in-use gauge still tracks pool
+    /// truth on both edges — and the constructor defaults every test
+    /// seam off. The seams' consuming reds live with their owning
+    /// closes (probe rendezvous, unused-permit counter, read/set
+    /// interleave hook).
+    #[tokio::test]
+    async fn interleave_seams_default_off_and_noop_gate_is_neutral() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let rec = DebuggingRecorder::new();
+        let snap = rec.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&rec);
+
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fired_in_gate = std::sync::Arc::clone(&fired);
+        let pool = PathSlotPool::new(2).with_publish_gate(std::sync::Arc::new(move || {
+            fired_in_gate.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let slot = pool.acquire_baseline().await;
+        drop(slot);
+
+        // Snapshot EXACTLY ONCE (DebuggingRecorder semantics) and read
+        // the gauge's final value: 0 after the paired acquire/drop.
+        let mut in_use: Option<f64> = None;
+        for (ck, _, _, v) in snap.snapshot().into_vec() {
+            if ck.key().name() == "rio_store_executor_path_slots_in_use" {
+                let DebugValue::Gauge(g) = v else { continue };
+                in_use = Some(g.into_inner());
+            }
+        }
+        assert_eq!(
+            in_use,
+            Some(0.0),
+            "gauge returns to pool truth with a no-op gate installed"
+        );
+        assert_eq!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "both publish edges route through the seam (acquire + drop)"
         );
     }
 }

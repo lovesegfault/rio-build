@@ -198,15 +198,15 @@ pub fn spawn_materialization_executor(
                 return spawned;
             }
         };
-        let ctx = executor::ExecutorContext {
-            pool: pool.clone(),
-            substituter: std::sync::Arc::clone(&substituter),
-            // live_047/R-C: width from the config lever (default 4);
-            // ONE pod-wide slot pool shared by every worker bounds
-            // the executor's total gate draw at P = cap/2.
-            path_fanout: cfg.path_fanout,
-            path_slots: path_slots.clone(),
-        };
+        // live_047/R-C: width from the config lever (default 4); ONE
+        // pod-wide slot pool shared by every worker bounds the
+        // executor's total gate draw at P = cap/2.
+        let ctx = executor::ExecutorContext::new(
+            pool.clone(),
+            std::sync::Arc::clone(&substituter),
+            cfg.path_fanout,
+            path_slots.clone(),
+        );
         let cfg_for_worker = cfg.clone();
         let instance_for_worker = worker_instance.clone();
         let shutdown_for_worker = shutdown.clone();
@@ -724,12 +724,12 @@ mod tests {
             shutdown: shutdown.clone(),
             reports: Arc::clone(&reports),
         };
-        let ctx = executor::ExecutorContext {
-            pool: db.pool.clone(),
+        let ctx = executor::ExecutorContext::new(
+            db.pool.clone(),
             substituter,
-            path_fanout: 1,
-            path_slots: executor::PathSlotPool::new(32),
-        };
+            1,
+            executor::PathSlotPool::new(32),
+        );
         tokio::time::timeout(
             Duration::from_secs(30),
             claim_loop(
@@ -1003,12 +1003,12 @@ mod tests {
             state: std::sync::Arc::clone(&state),
         };
         let cfg = crate::config::MaterializationConfig::default();
-        let ctx = executor::ExecutorContext {
-            pool: db.pool.clone(),
+        let ctx = executor::ExecutorContext::new(
+            db.pool.clone(),
             substituter,
-            path_fanout: 1,
-            path_slots: executor::PathSlotPool::new(32),
-        };
+            1,
+            executor::PathSlotPool::new(32),
+        );
         // Pause the clock ONLY after the real-I/O setup (the ephemeral
         // PG pool's connect timeouts run on tokio time; pausing before
         // setup makes auto-advance fire them ahead of the socket).
