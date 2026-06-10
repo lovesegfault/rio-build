@@ -34,6 +34,16 @@ API — `lex(text, blank_string_bodies=…) -> (out_text, spans)`:
   spans: `(body_start, body_end, is_raw)` for every string literal,
     ORIGINAL-text coordinates, delimiters excluded.
 
+`lex_full(text, blank_string_bodies=…) -> (out_text, spans,
+comment_spans)` is the additive round-6 extension (merged_bug_073):
+the SAME single walk, plus `(start, end)` for every comment —
+ORIGINAL-text coordinates, delimiters INCLUDED (`//…` to
+end-of-line-exclusive; `/*…*/` inclusive of the closer). A
+comment-lookalike inside a string literal is NOT a span (the walk is
+shared, so string and comment classification cannot disagree).
+`lex` delegates to `lex_full` and keeps its two-tuple contract —
+existing consumers are byte-identical.
+
 `selftest()` returns an error string on the first failed assertion (or
 None): an exact span/blank table over the escaped-quote families. Both
 consumers run it BEFORE their own arm-level selftests and exit 1 on
@@ -58,10 +68,12 @@ def _raw_prefix_len(text: str, i: int) -> int:
     return 0
 
 
-def lex(text: str, *, blank_string_bodies: bool):
-    """Single token walk; see the module docstring for the contract."""
+def lex_full(text: str, *, blank_string_bodies: bool):
+    """Single token walk; see the module docstring for the contract.
+    Returns `(out_text, string_spans, comment_spans)`."""
     out = list(text)
     spans = []
+    comments = []
     n = len(text)
 
     def blank(a: int, b: int) -> None:
@@ -76,6 +88,7 @@ def lex(text: str, *, blank_string_bodies: bool):
         if c == "/" and nxt == "/":
             j = text.find("\n", i)
             j = n if j == -1 else j
+            comments.append((i, j))
             blank(i, j)
             i = j
         elif c == "/" and nxt == "*":
@@ -89,6 +102,7 @@ def lex(text: str, *, blank_string_bodies: bool):
                     j += 2
                 else:
                     j += 1
+            comments.append((i, min(j, n)))
             blank(i, j)
             i = j
         elif _raw_prefix_len(text, i):
@@ -142,7 +156,14 @@ def lex(text: str, *, blank_string_bodies: bool):
             i = min(j + 1, n)
         else:
             i += 1
-    return "".join(out), spans
+    return "".join(out), spans, comments
+
+
+def lex(text: str, *, blank_string_bodies: bool):
+    """The standing two-tuple API — delegates to the single walk;
+    existing consumers are byte-identical (comment spans dropped)."""
+    out, spans, _comments = lex_full(text, blank_string_bodies=blank_string_bodies)
+    return out, spans
 
 
 def selftest() -> str | None:
@@ -198,6 +219,23 @@ def selftest() -> str | None:
     blanked, _ = lex(t, blank_string_bodies=True)
     if blanked != '"   \n   "':
         return f"newline not preserved under blanking: {blanked!r}"
+    # Comment-span API (lex_full) — exact original-coordinate rows.
+    # Line comment: delimiters included, end-of-line exclusive.
+    t = "let a = 1; // tail\nlet b = 2;"
+    _, _, comments = lex_full(t, blank_string_bodies=True)
+    if comments != [(11, 18)]:
+        return f"line-comment span mismatch: {comments}"
+    # Nested block comment: ONE span covering the whole nest.
+    t = "a /* x /* y */ z */ b"
+    _, _, comments = lex_full(t, blank_string_bodies=True)
+    if comments != [(2, 19)]:
+        return f"nested block-comment span mismatch: {comments}"
+    # Comment-lookalike inside a string literal: NOT a span (shared
+    # walk — string and comment classification cannot disagree).
+    t = 'let s = "// not a comment"; let c = \'/\';'
+    _, _, comments = lex_full(t, blank_string_bodies=False)
+    if comments != []:
+        return f"comment-lookalike inside a string produced spans: {comments}"
     return None
 
 
