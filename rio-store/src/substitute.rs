@@ -6945,8 +6945,10 @@ mod tests {
             (
                 "materialize/executor.rs",
                 "try_acquire",
-                1,
-                "executor slot pool — surplus try_ (non-parking)",
+                2,
+                "executor slot pool — surplus try_ (non-parking): try_widen \
+                 + try_admit_claim (the bw8 slot ≺ claim admission gate — \
+                 leftover-only per the yield law; zero NAR-budget contact)",
             ),
             (
                 "gc/lock.rs",
