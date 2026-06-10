@@ -328,7 +328,7 @@ lower floor there; the dashboard tab has neither bound.
   loop.
 ]
 
-#r("dash.graph.auto-stop+2")[
+#r("dash.graph.auto-stop+3")[
   The Graph tab's 5s `GetBuildGraph` poll MUST downshift to the settled
   cadence (`SETTLED_POLL_MS`, 30s) once every node is in a terminal status
   (per `graphLayout.TERMINAL`, which mirrors `is_terminal()`
@@ -355,10 +355,13 @@ lower floor there; the dashboard tab has neither bound.
   transitions MUST consume a closed evidence classification of the
   fenced response (settled | live | empty | partial-terminal | failed)
   as ONE total transition function over the latched x evidence
-  product: the latch is released ONLY on live-work evidence; empty,
-  truncated-terminal, or failed probes on a settled drawer retain the
-  latch, the retained graph, AND the settled cadence (an externally
-  purged build MUST NOT become an absorbing live-cadence storm); a
+  product: the latch is released ONLY on live-work evidence; on a
+  settled drawer the data axis is enumerated per evidence class ---
+  empty, truncated-terminal, and failed probes RETAIN the latch, the
+  retained graph, AND the settled cadence, while settled and live
+  responses APPLY (an externally purged build MUST NOT become an
+  absorbing live-cadence storm; a truncated first-N slice MUST NOT
+  replace a retained complete view); a
   probe failure with retained data degrades --- a non-replacing
   staleness surface --- while `error` is reserved for the never-loaded
   state.

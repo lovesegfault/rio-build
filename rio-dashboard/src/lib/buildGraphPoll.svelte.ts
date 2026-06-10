@@ -19,7 +19,7 @@
 // `allTerminal` is the build-level leg — the drawer's `build` prop
 // feeds no oracle input.
 //
-// r[impl dash.graph.auto-stop+2]
+// r[impl dash.graph.auto-stop+3]
 // The settle law lives here with the poll (merged_bug_043): once every
 // node settles (and the view is complete — see the guards on the
 // latch), the poll DOWNSHIFTS to the settled cadence
@@ -152,19 +152,27 @@ function assertNever(x: never): never {
  * takes a position on all four effects.
  *
  * The cells, from the evidence law — before settle, absence is the
- * state; after settle, absence cannot retro-erase terminal evidence:
+ * state; after settle, absence cannot retro-erase terminal evidence —
+ * with the DATA axis stated per cell (the axis where the retain
+ * siblings differ from the apply ones):
  * - un-latch ONLY on `(latched, live)`: the out-of-band-clear
- *   discovery, preserved.
- * - `(latched, empty)`: hold + retain + keep — the absorbing hole
+ *   discovery, preserved; data applies.
+ * - `(latched, empty)`: hold + keep + retain — the absorbing hole
  *   dies; retention keeps `statusOf` serving the oracle across
  *   purges.
- * - `(latched, partial-terminal | settled | failed)`: hold + keep
- *   (the truncated probe no longer un-latches either — the second
- *   input the bare edge wrongly accepted).
- * - `(unlatched, settled)`: latch + settled cadence.
+ * - `(latched, partial-terminal)`: hold + keep + RETAIN — a truncated
+ *   first-N slice never replaces the retained complete view (the
+ *   oracle keeps answering for past-cutoff nodes; re-latching needs
+ *   an untruncated response a grown build never serves again).
+ * - `(latched, failed)`: hold + keep + retain + flag (degraded).
+ * - `(latched, settled)`: hold + keep + apply (a complete view is
+ *   strictly fresher than the retained one).
+ * - `(unlatched, settled)`: latch + settled cadence + apply.
  * - `(unlatched, empty | partial-terminal | live)`: apply on the live
  *   cadence — empty pre-population is the truthful loading view (the
  *   asymmetry against `(latched, empty)` IS the evidence law).
+ * - `(unlatched, failed)`: retain + flag (`error` while nothing ever
+ *   loaded, `degraded` after).
  *
  * RESPONSE evidence only: `onCleared`/`destroy` are command edges
  * (user action / teardown) that bypass classification by design. */
@@ -201,7 +209,14 @@ export function nextTransition(
           }
         : { latch: 'hold', cadence: 'keep', data: 'apply', errorSurface: 'clear' };
     case 'partial-terminal':
-      return { latch: 'hold', cadence: 'keep', data: 'apply', errorSurface: 'clear' };
+      return latched
+        ? {
+            latch: 'hold',
+            cadence: 'keep',
+            data: 'retain',
+            errorSurface: 'clear',
+          }
+        : { latch: 'hold', cadence: 'keep', data: 'apply', errorSurface: 'clear' };
     case 'failed':
       return {
         latch: 'hold',

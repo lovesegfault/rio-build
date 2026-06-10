@@ -1,4 +1,4 @@
-// r[verify dash.graph.auto-stop+2]
+// r[verify dash.graph.auto-stop+3]
 // The drawer-lifetime poll store (merged_bug_134): one reactive
 // node-status source feeding Graph's rendering AND the log stream's
 // terminality oracle. The poll-loop semantics moved here from
@@ -26,6 +26,7 @@ import {
   GRAPH_FETCH_DEADLINE_MS,
   nextTransition,
   SETTLED_POLL_MS,
+  type CellEffects,
   type GraphEvidence,
 } from '../buildGraphPoll.svelte';
 import { POLL_MS } from '../poll';
@@ -52,6 +53,97 @@ async function flush(rounds = 4): Promise<void> {
   for (let i = 0; i < rounds; i++) {
     await Promise.resolve();
   }
+}
+
+// The spec-owned transcription of the transition table (merged_bug_004):
+// the census oracle is the NORMATIVE SENTENCE, never the implementation.
+// Transcribed by hand from dash.graph.auto-stop+3 (dashboard.typ):
+//   "the latch is released ONLY on live-work evidence; on a settled
+//   drawer the data axis is enumerated per evidence class --- empty,
+//   truncated-terminal, and failed probes RETAIN the latch, the
+//   retained graph, AND the settled cadence, while settled and live
+//   responses APPLY --- (an externally purged build MUST NOT become an
+//   absorbing live-cadence storm; a truncated first-N slice MUST NOT
+//   replace a retained complete view); a probe failure with retained
+//   data degrades [...] while `error` is reserved for the never-loaded
+//   state."
+// plus the latch/cadence clauses of the same rule (settle downshifts to
+// the settled cadence; un-latch restores the live cadence). The KEY
+// SPACE is the same compiler product as the implementation's
+// (Record totality over `latched x evidence` -- an omitted cell is a
+// compile error); only the VALUES are the transcription.
+type CellKey = `${'unlatched' | 'latched'}:${GraphEvidence}`;
+
+const SPEC_CELLS: Record<CellKey, CellEffects> = {
+  // Before settle, absence is the state: responses apply on the live
+  // cadence; only a settled view latches (and downshifts).
+  'unlatched:settled': {
+    latch: 'latch',
+    cadence: 'settled',
+    data: 'apply',
+    errorSurface: 'clear',
+  },
+  'unlatched:live': {
+    latch: 'hold',
+    cadence: 'keep',
+    data: 'apply',
+    errorSurface: 'clear',
+  },
+  'unlatched:empty': {
+    latch: 'hold',
+    cadence: 'keep',
+    data: 'apply',
+    errorSurface: 'clear',
+  },
+  'unlatched:partial-terminal': {
+    latch: 'hold',
+    cadence: 'keep',
+    data: 'apply',
+    errorSurface: 'clear',
+  },
+  'unlatched:failed': {
+    latch: 'hold',
+    cadence: 'keep',
+    data: 'retain',
+    errorSurface: 'flag',
+  },
+  // After settle: released ONLY on live-work evidence; empty,
+  // truncated-terminal, and failed probes retain the latch, the
+  // retained graph, AND the settled cadence.
+  'latched:settled': {
+    latch: 'hold',
+    cadence: 'keep',
+    data: 'apply',
+    errorSurface: 'clear',
+  },
+  'latched:live': {
+    latch: 'unlatch',
+    cadence: 'live',
+    data: 'apply',
+    errorSurface: 'clear',
+  },
+  'latched:empty': {
+    latch: 'hold',
+    cadence: 'keep',
+    data: 'retain',
+    errorSurface: 'clear',
+  },
+  'latched:partial-terminal': {
+    latch: 'hold',
+    cadence: 'keep',
+    data: 'retain',
+    errorSurface: 'clear',
+  },
+  'latched:failed': {
+    latch: 'hold',
+    cadence: 'keep',
+    data: 'retain',
+    errorSurface: 'flag',
+  },
+};
+
+function specCell(latched: boolean, ev: GraphEvidence): CellEffects {
+  return SPEC_CELLS[`${latched ? 'latched' : 'unlatched'}:${ev}`];
 }
 
 describe('createBuildGraphPoll', () => {
@@ -465,6 +557,85 @@ describe('createBuildGraphPoll', () => {
     p.destroy();
   });
 
+  it('settled_drawer_retains_graph_across_truncated_terminal_probe', async () => {
+    // THE failure frame of merged_bug_004: post-latch node growth past
+    // the server cap delivers a truncated all-terminal slice at the
+    // settled cadence; the retained complete graph MUST survive it
+    // (dash.graph.auto-stop+3) -- and the oracle leg (statusOf) must
+    // keep answering for past-cutoff nodes. No partial-terminal probe
+    // can ever restore the complete view (re-latching needs an
+    // untruncated response the server no longer serves), so a single
+    // wholesale replacement is permanent oracle damage.
+    const drv0 = `/nix/store/${'a'.repeat(32)}-pkg-0.drv`;
+    const truncatedTail = {
+      nodes: [
+        {
+          drvPath: `/nix/store/${'b'.repeat(32)}-pkg-9.drv`,
+          pname: 'pkg-9',
+          system: 'x86_64-linux',
+          status: 'completed',
+          assignedExecutorId: '',
+          execId: '',
+        },
+      ],
+      edges: [],
+      truncated: true,
+      totalNodes: 5001,
+    };
+    expect(classifyResponse({ response: truncatedTail })).toBe(
+      'partial-terminal',
+    );
+
+    getBuildGraph
+      .mockResolvedValueOnce(mkResp(['completed', 'skipped']))
+      .mockResolvedValue(truncatedTail);
+
+    const p = createBuildGraphPoll('b-trunc-retain');
+    await flush();
+    expect(p.allTerminal).toBe(true);
+    expect(p.nodes.length).toBe(2);
+
+    // The truncated-terminal probe arrives at the settled cadence.
+    await vi.advanceTimersByTimeAsync(SETTLED_POLL_MS);
+    await flush();
+
+    expect(p.nodes.length).toBe(2);
+    expect(p.statusOf(drv0)).toBe('completed');
+    expect(p.truncated).toBe(false);
+    // Green half (disclosed -- already true pre-fix): the latch and
+    // the settled cadence hold across the probe.
+    expect(p.allTerminal).toBe(true);
+    p.destroy();
+  });
+
+  it('transition_table_matches_the_spec_transcription', () => {
+    // PROPOSITION (R16): nextTransition conforms to the SPEC-OWNED
+    // table over the full compiler-generated 2x5 product -- the oracle
+    // is transcribed from the normative sentence, so the function
+    // under test never appears on the oracle side. Soft-collect so one
+    // run reports every divergent cell.
+    const failures: string[] = [];
+    for (const latched of [false, true]) {
+      for (const ev of EVIDENCE_ALL) {
+        const impl = nextTransition(latched, ev);
+        const spec = specCell(latched, ev);
+        for (const axis of [
+          'latch',
+          'cadence',
+          'data',
+          'errorSurface',
+        ] as const) {
+          if (impl[axis] !== spec[axis]) {
+            failures.push(
+              `(${latched ? 'latched' : 'unlatched'}, ${ev}) ${axis}: impl '${impl[axis]}' != spec '${spec[axis]}'`,
+            );
+          }
+        }
+      }
+    }
+    expect(failures).toEqual([]);
+  });
+
   it('latch_transition_is_total_over_the_evidence_product', async () => {
     // PROPOSITION (R15 census): the latch transition is ONE total
     // function over the latched x evidence product - every cell's
@@ -508,7 +679,7 @@ describe('createBuildGraphPoll', () => {
         // Anti-drift pin: the fixture really IS the evidence class.
         expect(classifyResponse(fixture), `fixture drift at ${ev}`).toBe(ev);
 
-        const cell = nextTransition(latched, ev);
+        const cell = specCell(latched, ev);
         getBuildGraph.mockReset();
         if (latched) {
           getBuildGraph.mockResolvedValueOnce(mkResp(['completed']));
