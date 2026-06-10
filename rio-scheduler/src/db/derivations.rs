@@ -70,11 +70,53 @@ pub(crate) enum StatusReplay {
     /// (a deposed replica writes nothing).
     Fenced,
     /// The replay transaction committed. `replayed` names the drvs
-    /// whose rows the PG-domain precedence conjunct allowed — the
-    /// caller computes `refused = kept − replayed` and surfaces the
-    /// refusals (the durable row was newer; the refusal is the
-    /// precedence law's FINAL verdict, not a retry lane).
-    Applied { replayed: Vec<String> },
+    /// whose rows the PG-domain precedence conjunct allowed;
+    /// `residual` classifies every kept-but-not-replayed drv at the
+    /// durability point (merged_bug_108) — the flusher consumes the
+    /// alphabet exhaustively and pops the batch in every lane (the
+    /// pop-as-final law is attribution-independent).
+    Applied {
+        replayed: Vec<String>,
+        residual: Vec<(String, ReplayResidual)>,
+    },
+}
+
+/// Why a kept drv was NOT replayed — the closed three-valued residual
+/// alphabet (merged_bug_108): a two-valued applied/refused partition
+/// forced three causally distinct zero-row outcomes (foreign
+/// precedence, our own lost commit, a GC-vanished row) into one lying
+/// refusal warn+counter, exactly during the PG brownouts the outbox
+/// exists for. Classified row-evidence-pure in the SAME transaction
+/// as the guarded UPDATE: absent row → `Vanished`; row at the latched
+/// target → `AlreadyApplied` (the comparand's `status IS DISTINCT
+/// FROM` guard left it un-stamped, merged_bug_004 — our own lost-ack
+/// commit, or anyone having landed the same truth: either way not a
+/// refusal); else → `RefusedNewer` (present with a DIFFERENT status —
+/// evidenced foreign precedence, the only lane that may warn/count).
+///
+/// READ COMMITTED tolerance (derivation): the diagnostic SELECT is a
+/// separate statement, so a cross-statement movement can land between
+/// the UPDATE's snapshot and the SELECT's — every such movement still
+/// lands in a TRUTHFUL lane (a row deleted after the UPDATE reads
+/// Vanished, a row advanced to the target reads AlreadyApplied, any
+/// other advance reads RefusedNewer): the classification describes
+/// the durable world AT the durability point, never a stale shadow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplayResidual {
+    /// The durable status already equals the latched truth — a
+    /// lost-ack retry of our own landed commit, or an equivalent
+    /// foreign write. Reconciled, not refused.
+    AlreadyApplied,
+    /// The row stands with a DIFFERENT status: evidenced foreign
+    /// precedence. `stamp_newer_than_cut` is a consistency field —
+    /// under the precedence conjunct it is true modulo PG clock
+    /// steps; a false value is logged as an anomaly, never minted
+    /// into a fourth lane.
+    RefusedNewer { stamp_newer_than_cut: bool },
+    /// No row: GC collected it before the replay (the orphan-GC tick
+    /// runs ahead of the flush in the same housekeeping pass).
+    /// Nothing stands; nothing to refuse.
+    Vanished,
 }
 
 /// Map a terminal `DerivationStatus` to the `assignments.status` value
@@ -256,10 +298,12 @@ impl SchedulerDb {
     /// stayed open until they aged into ChargeExecutorCrash against a
     /// healthily-rebuilding derivation.
     ///
-    /// Returns the [`StatusReplay`] named set (merged_bug_017): the
-    /// caller computes `refused = kept − replayed` and surfaces every
-    /// row the precedence conjunct refused — a zero-row replay is a
-    /// loud outcome, never an unconsulted count.
+    /// Returns the [`StatusReplay`] named set (merged_bug_017) with
+    /// every kept-but-not-replayed drv CLASSIFIED at the durability
+    /// point (merged_bug_108, [`ReplayResidual`]): the caller surfaces
+    /// each residual through its own lane — a zero-row replay is a
+    /// loud, truthfully-attributed outcome, never an unconsulted
+    /// count and never a blanket refusal.
     ///
     /// Runtime-bound (not `query!`): `cargo xtask regen sqlx`
     /// self-builds this crate (the same posture as the other fenced
@@ -277,7 +321,10 @@ impl SchedulerDb {
         serving_generation: ServingGeneration,
     ) -> Result<StatusReplay, sqlx::Error> {
         if drv_hashes.is_empty() && latched_exec_ids.is_empty() {
-            return Ok(StatusReplay::Applied { replayed: vec![] });
+            return Ok(StatusReplay::Applied {
+                replayed: vec![],
+                residual: vec![],
+            });
         }
         let mut tx = match self.begin_fenced(serving_generation).await? {
             FencedBegin::Fenced { .. } => return Ok(StatusReplay::Fenced),
@@ -338,6 +385,44 @@ impl SchedulerDb {
             .fetch_all(tx.conn())
             .await?
         };
+        // merged_bug_108: classify the residual (kept − replayed) at
+        // the durability point, in the SAME transaction as the UPDATE.
+        // The SELECT is structurally guarded on a non-empty residual —
+        // the healthy path pays ZERO extra round trips (the guard is
+        // the cost envelope's testable form).
+        let residual_keys: Vec<&str> = drv_hashes
+            .iter()
+            .copied()
+            .filter(|h| !replayed.iter().any(|r| r == h))
+            .collect();
+        let residual: Vec<(String, ReplayResidual)> = if residual_keys.is_empty() {
+            vec![]
+        } else {
+            let rows: Vec<(String, String, bool)> = sqlx::query_as(
+                "SELECT drv_hash, status, \
+                        status_changed_at > (now() - make_interval(secs => $2)) AS newer \
+                 FROM derivations WHERE drv_hash = ANY($1::text[])",
+            )
+            .bind(&residual_keys)
+            .bind(latch_age.secs())
+            .fetch_all(tx.conn())
+            .await?;
+            residual_keys
+                .iter()
+                .map(|h| {
+                    let kind = match rows.iter().find(|(rh, _, _)| rh == h) {
+                        None => ReplayResidual::Vanished,
+                        Some((_, durable, _)) if durable == status.as_str() => {
+                            ReplayResidual::AlreadyApplied
+                        }
+                        Some((_, _, newer)) => ReplayResidual::RefusedNewer {
+                            stamp_newer_than_cut: *newer,
+                        },
+                    };
+                    (h.to_string(), kind)
+                })
+                .collect()
+        };
         if let Some(close) = terminal_assignment_status(status)
             && !latched_exec_ids.is_empty()
         {
@@ -351,7 +436,7 @@ impl SchedulerDb {
                 .await?;
         }
         tx.commit().await?;
-        Ok(StatusReplay::Applied { replayed })
+        Ok(StatusReplay::Applied { replayed, residual })
     }
 
     /// Batch variant of [`update_derivation_status`]: set the same

@@ -607,7 +607,7 @@ async fn replay_with_all_drvs_dropped_still_closes_latched_execs() -> anyhow::Re
         )
         .await?;
     assert!(
-        matches!(&outcome, crate::db::StatusReplay::Applied { replayed } if replayed.is_empty()),
+        matches!(&outcome, crate::db::StatusReplay::Applied { replayed, .. } if replayed.is_empty()),
         "no derivation row may be updated by an all-dropped batch, got {outcome:?}"
     );
 
@@ -663,7 +663,7 @@ async fn replay_refuses_rows_updated_after_the_latch() -> anyhow::Result<()> {
         )
         .await?;
     assert!(
-        matches!(&outcome, crate::db::StatusReplay::Applied { replayed } if replayed.is_empty()),
+        matches!(&outcome, crate::db::StatusReplay::Applied { replayed, .. } if replayed.is_empty()),
         "left: {outcome:?} / right: Applied {{ replayed: [] }} (a row \
          updated after the latch refuses the replay)"
     );
@@ -723,7 +723,7 @@ async fn replay_lands_under_pg_ahead_skew() -> anyhow::Result<()> {
     assert!(
         matches!(
             &outcome,
-            crate::db::StatusReplay::Applied { replayed } if replayed == &["skew-cancel".to_string()]
+            crate::db::StatusReplay::Applied { replayed, .. } if replayed == &["skew-cancel".to_string()]
         ),
         "left: {outcome:?} (terminal latch silently refused by clock \
          skew) / right: Applied {{ replayed: [\"skew-cancel\"] }} — a \
@@ -789,7 +789,7 @@ async fn advanced_row_refusal_is_returned_loud() -> anyhow::Result<()> {
     // The refusal is NAMED: the kept drv is absent from the replayed
     // set, so the caller computes refused = kept − replayed.
     match outcome {
-        crate::db::StatusReplay::Applied { replayed } => assert!(
+        crate::db::StatusReplay::Applied { replayed, .. } => assert!(
             replayed.is_empty(),
             "left: {replayed:?} / right: [] (the advanced row must be \
              refused row-locally and absent from the named set)"
@@ -903,7 +903,7 @@ async fn status_writers_stamp_status_changed_at_biconditional() -> anyhow::Resul
                 assert!(
                     matches!(
                         &outcome,
-                        crate::db::StatusReplay::Applied { replayed } if replayed == &[hash.clone()]
+                        crate::db::StatusReplay::Applied { replayed, .. } if replayed == &[hash.clone()]
                     ),
                     "replay drive must apply (got {outcome:?})"
                 );
@@ -1039,7 +1039,7 @@ async fn outbox_floor_bump_does_not_refuse_latched_terminal_replay() -> anyhow::
     assert!(
         matches!(
             &outcome,
-            crate::db::StatusReplay::Applied { replayed }
+            crate::db::StatusReplay::Applied { replayed, .. }
                 if replayed == &["floor-bump-latched".to_string()]
         ),
         "left: {outcome:?} / right: Applied {{ replayed: \
@@ -1095,7 +1095,7 @@ async fn outbox_replay_cut_is_conservative_to_the_enqueue_instant() -> anyhow::R
         )
         .await?;
     assert!(
-        matches!(&outcome, crate::db::StatusReplay::Applied { replayed } if replayed.is_empty()),
+        matches!(&outcome, crate::db::StatusReplay::Applied { replayed, .. } if replayed.is_empty()),
         "left: {outcome:?} / right: Applied {{ replayed: [] }} (a row \
          advanced after the enqueue instant must refuse the replay — \
          the cut may never land ahead of the enqueue)"

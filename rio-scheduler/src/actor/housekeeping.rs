@@ -842,21 +842,48 @@ impl DagActor {
                     self.status_outbox.push_front(batch);
                     break;
                 }
-                Ok(crate::db::StatusReplay::Applied { replayed }) => {
-                    // merged_bug_017: a refused replay is a LOUD,
-                    // counted, named outcome. The batch still pops —
-                    // the refusal is the precedence law's FINAL
-                    // verdict (the durable row is newer than the
-                    // latch), distinct from the re-pushed Fenced/Err
-                    // arms above/below.
-                    let refused: Vec<&str> = kept
-                        .iter()
-                        .copied()
-                        .filter(|h| !replayed.iter().any(|r| r == h))
-                        .collect();
+                Ok(crate::db::StatusReplay::Applied { replayed, residual }) => {
+                    // merged_bug_108: every zero-row residual arrives
+                    // CLASSIFIED at the durability point — the three
+                    // lanes are consumed exhaustively (no `_`), each
+                    // with its own truthful observable. The batch
+                    // still pops in every lane: the pop-as-final law
+                    // is attribution-independent (merged_bug_017 —
+                    // the refusal lane is the precedence law's FINAL
+                    // verdict, distinct from the re-pushed Fenced/Err
+                    // arms above/below; this close retypes
+                    // attribution, not retry posture).
+                    let mut refused: Vec<&str> = Vec::new();
+                    let mut clock_anomaly: Vec<&str> = Vec::new();
+                    let mut already_applied: Vec<&str> = Vec::new();
+                    let mut vanished: Vec<&str> = Vec::new();
+                    for (drv, kind) in &residual {
+                        match kind {
+                            crate::db::ReplayResidual::RefusedNewer {
+                                stamp_newer_than_cut,
+                            } => {
+                                refused.push(drv.as_str());
+                                if !stamp_newer_than_cut {
+                                    clock_anomaly.push(drv.as_str());
+                                }
+                            }
+                            crate::db::ReplayResidual::AlreadyApplied => {
+                                already_applied.push(drv.as_str());
+                            }
+                            crate::db::ReplayResidual::Vanished => {
+                                vanished.push(drv.as_str());
+                            }
+                        }
+                    }
                     if !refused.is_empty() {
                         warn!(
                             refused = ?refused,
+                            // Evidence consistency (merged_bug_108):
+                            // a refused row whose stamp did NOT
+                            // postdate the cut is possible only under
+                            // PG clock steps — logged, never minted
+                            // into a fourth lane.
+                            clock_anomaly = ?clock_anomaly,
                             status = ?batch.status,
                             age_secs = batch.enqueued_at.elapsed().as_secs(),
                             // DIAGNOSTIC ONLY (merged_bug_017): the
@@ -864,11 +891,33 @@ impl DagActor {
                             // forensics — never compared against any
                             // PG-stamped column.
                             latched_at_epoch = batch.latched_at_epoch,
-                            "status outbox: replay refused (durable rows advanced \
-                             past the latch; the newer rows stand)"
+                            "status outbox: replay refused (durable status advanced \
+                             past the latch)"
                         );
                         metrics::counter!("rio_scheduler_status_outbox_replay_refused_total")
                             .increment(refused.len() as u64);
+                    }
+                    if !already_applied.is_empty() {
+                        info!(
+                            reconciled = ?already_applied,
+                            status = ?batch.status,
+                            "status outbox: latched status already durable; \
+                             lost-ack replay reconciled"
+                        );
+                        metrics::counter!(
+                            "rio_scheduler_status_outbox_replay_already_applied_total"
+                        )
+                        .increment(already_applied.len() as u64);
+                    }
+                    if !vanished.is_empty() {
+                        info!(
+                            vanished = ?vanished,
+                            status = ?batch.status,
+                            "status outbox: latched row GC'd before the replay; \
+                             nothing stands"
+                        );
+                        metrics::counter!("rio_scheduler_status_outbox_replay_vanished_total")
+                            .increment(vanished.len() as u64);
                     }
                     info!(
                         count = replayed.len(),
@@ -1550,10 +1599,30 @@ pub(crate) fn describe_housekeeping_metrics() {
     metrics::describe_counter!(
         "rio_scheduler_status_outbox_replay_refused_total",
         "Status-outbox replays refused row-locally by the PG-domain \
-         precedence conjunct (merged_bug_017): the durable row advanced \
-         past the latch, so the newer row stands and the batch pops. \
-         Nonzero is normal under resubmit/cancel races; a sustained rate \
-         tracks churn racing terminal latches. The refused drv set rides \
-         the paired warn."
+         precedence conjunct on EVIDENCED foreign precedence ONLY \
+         (merged_bug_108): the row stands with a DIFFERENT durable \
+         status whose stamp postdates the latch, so the newer truth \
+         stands and the batch pops. Lost-ack retries of our own landed \
+         commit count as replay_already_applied and GC'd rows as \
+         replay_vanished — never here. Nonzero is normal under \
+         resubmit/cancel races; a sustained rate tracks churn racing \
+         terminal latches. The refused drv set rides the paired warn."
+    );
+    metrics::describe_counter!(
+        "rio_scheduler_status_outbox_replay_already_applied_total",
+        "Status-outbox replay residuals whose durable status already \
+         equals the latched truth (merged_bug_108): an \
+         applied-but-ack-lost flush retried by the Err arm, or an \
+         equivalent write that landed first. Reconciled and popped — \
+         expected during PG brownouts (the exact condition the outbox \
+         exists for); never a refusal."
+    );
+    metrics::describe_counter!(
+        "rio_scheduler_status_outbox_replay_vanished_total",
+        "Status-outbox replay residuals whose row no longer exists \
+         (merged_bug_108): the orphan-derivation GC tick runs ahead of \
+         the flush in the same housekeeping pass and can collect a \
+         terminal unlinked row between latch and replay. Nothing \
+         stands, nothing to refuse; the batch pops."
     );
 }

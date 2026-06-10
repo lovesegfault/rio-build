@@ -2946,3 +2946,271 @@ async fn outbox_same_drv_newer_terminal_latch_supersedes_older() -> TestResult {
     assert_eq!(actor.status_outbox.len(), 0, "both batches drain");
     Ok(())
 }
+
+// r[verify sched.attempt.cancel-close-driven+2]
+/// merged_bug_108 case 2 red: an applied-but-ack-lost replay. The
+/// first flush COMMITS; the Err arm re-pushes the batch (pop-return);
+/// the next tick's kept set re-derives identically (memory never
+/// changed) and the replay's own previous stamp zero-rows the batch.
+/// PROPOSITION CERTIFIED: a zero-row residual whose durable status
+/// EQUALS the latched truth is classified already-applied at the
+/// durability point — never warned/counted as foreign precedence —
+/// exactly during the PG brownout the outbox exists for.
+#[tokio::test]
+async fn outbox_replay_lost_ack_residual_classified_already_applied() -> TestResult {
+    use crate::sla::metrics::counter_map;
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    sqlx::query(
+        "INSERT INTO derivations (drv_hash, drv_path, pname, system, status) \
+         VALUES ($1, $2, 'pkg', 'x86_64-linux', 'running')",
+    )
+    .bind("outbox-lost-ack")
+    .bind(test_drv_path("outbox-lost-ack"))
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "UPDATE derivations SET \
+           updated_at = now() - interval '120 seconds', \
+           status_changed_at = now() - interval '120 seconds' \
+         WHERE drv_hash = 'outbox-lost-ack'",
+    )
+    .execute(&db.pool)
+    .await?;
+
+    let mut actor = bare_actor(db.pool.clone());
+    let enqueued_at = std::time::Instant::now() - std::time::Duration::from_secs(60);
+    let latched_at_epoch = crate::db::attempts::epoch_now() - 60.0;
+    actor.latch_status_batch(crate::actor::StatusBatch {
+        drv_hashes: vec!["outbox-lost-ack".into()],
+        status: DerivationStatus::Cancelled,
+        exec_ids: vec![],
+        enqueued_at,
+        latched_at_epoch,
+    });
+    let authority = actor.dag_authority().expect("always-leader test actor");
+
+    // Flush 1: applies and commits (the ack of THIS flush is the one
+    // we model as lost).
+    actor.tick_flush_status_outbox(&authority).await;
+    let (status,): (String,) =
+        sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = 'outbox-lost-ack'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(status, "cancelled", "first flush must land the latch");
+
+    // The Err arm's pop-return: the SAME batch (same enqueue instant,
+    // same memory) is back at the head — the queue was empty, so the
+    // chokepoint reproduces the push_front state exactly.
+    actor.latch_status_batch(crate::actor::StatusBatch {
+        drv_hashes: vec!["outbox-lost-ack".into()],
+        status: DerivationStatus::Cancelled,
+        exec_ids: vec![],
+        enqueued_at,
+        latched_at_epoch,
+    });
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    {
+        let _g = metrics::set_default_local_recorder(&rec);
+        // Flush 2 IS the retry the Err arm produces.
+        actor.tick_flush_status_outbox(&authority).await;
+    }
+
+    let counters = counter_map(&snap);
+    assert_eq!(
+        counters
+            .get("rio_scheduler_status_outbox_replay_refused_total")
+            .copied()
+            .unwrap_or(0),
+        0,
+        "left: 1 (pre-fix: the retry's zero-row match was attributed \
+         to foreign precedence, with the false \"newer rows stand\" \
+         warn) / right: 0"
+    );
+    assert_eq!(
+        counters
+            .get("rio_scheduler_status_outbox_replay_already_applied_total")
+            .copied(),
+        Some(1),
+        "left: None (pre-fix: the lane does not exist) / right: \
+         Some(1) (lost-ack replay reconciled as already durable)"
+    );
+    assert_eq!(actor.status_outbox.len(), 0, "the reconciled batch pops");
+    Ok(())
+}
+
+// r[verify sched.attempt.cancel-close-driven+2]
+/// merged_bug_108 case 3 red: tick_gc_orphan_derivations runs BEFORE
+/// the flush in the same housekeeping tick and deletes terminal
+/// unlinked rows — the latched batch then zero-rows with NO newer row
+/// standing. PROPOSITION CERTIFIED: an absent-row residual is
+/// classified vanished at the durability point — never warned as
+/// "the newer rows stand" naming a row that does not exist.
+#[tokio::test]
+async fn outbox_replay_vanished_row_classified_vanished() -> TestResult {
+    use crate::sla::metrics::counter_map;
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    // A terminal, unlinked, assignment-free row: GC-eligible.
+    sqlx::query(
+        "INSERT INTO derivations (drv_hash, drv_path, pname, system, status) \
+         VALUES ($1, $2, 'pkg', 'x86_64-linux', 'cancelled')",
+    )
+    .bind("outbox-vanished")
+    .bind(test_drv_path("outbox-vanished"))
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "UPDATE derivations SET \
+           updated_at = now() - interval '120 seconds', \
+           status_changed_at = now() - interval '120 seconds' \
+         WHERE drv_hash = 'outbox-vanished'",
+    )
+    .execute(&db.pool)
+    .await?;
+
+    let mut actor = bare_actor(db.pool.clone());
+    // A DependencyFailed latch for the (DAG-absent) node — terminal,
+    // so the KEEP arm retains it; distinct from the durable status so
+    // the absent-row cell is unambiguous.
+    actor.latch_status_batch(crate::actor::StatusBatch {
+        drv_hashes: vec!["outbox-vanished".into()],
+        status: DerivationStatus::DependencyFailed,
+        exec_ids: vec![],
+        enqueued_at: std::time::Instant::now() - std::time::Duration::from_secs(60),
+        latched_at_epoch: crate::db::attempts::epoch_now() - 60.0,
+    });
+
+    // The same tick's earlier GC pass deletes the orphan row (the
+    // production deleter, driven directly).
+    let deleted = actor.db.gc_orphan_terminal_derivations(100).await?;
+    assert_eq!(deleted, 1, "world setup: the orphan row must be GC'd");
+
+    let authority = actor.dag_authority().expect("always-leader test actor");
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    {
+        let _g = metrics::set_default_local_recorder(&rec);
+        actor.tick_flush_status_outbox(&authority).await;
+    }
+
+    let counters = counter_map(&snap);
+    assert_eq!(
+        counters
+            .get("rio_scheduler_status_outbox_replay_refused_total")
+            .copied()
+            .unwrap_or(0),
+        0,
+        "left: 1 (pre-fix: the vanished row was counted as a refusal, \
+         with the \"newer rows stand\" warn naming a row that does \
+         not exist) / right: 0"
+    );
+    assert_eq!(
+        counters
+            .get("rio_scheduler_status_outbox_replay_vanished_total")
+            .copied(),
+        Some(1),
+        "left: None (pre-fix: the lane does not exist) / right: \
+         Some(1) (latched row GC'd before the replay; nothing stands)"
+    );
+    assert_eq!(actor.status_outbox.len(), 0, "the vanished batch pops");
+    Ok(())
+}
+
+// r[verify sched.attempt.cancel-close-driven+2]
+/// merged_bug_108 surviving-lane polarity pin — pre-fix this lane
+/// ALSO ticks refused, but by collapse (every zero-row cell ticked
+/// it), not by proof; DISCLOSED as such. PROPOSITION CERTIFIED
+/// (post-fix): the refused warn/counter fire ONLY on evidenced
+/// foreign precedence — a row standing with a DIFFERENT durable
+/// status — and the sibling lanes stay silent.
+#[tokio::test]
+async fn outbox_replay_refused_requires_newer_foreign_truth() -> TestResult {
+    use crate::sla::metrics::counter_map;
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    sqlx::query(
+        "INSERT INTO derivations (drv_hash, drv_path, pname, system, status) \
+         VALUES ($1, $2, 'pkg', 'x86_64-linux', 'created')",
+    )
+    .bind("outbox-foreign-truth")
+    .bind(test_drv_path("outbox-foreign-truth"))
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "UPDATE derivations SET \
+           updated_at = now() - interval '120 seconds', \
+           status_changed_at = now() - interval '120 seconds' \
+         WHERE drv_hash = 'outbox-foreign-truth'",
+    )
+    .execute(&db.pool)
+    .await?;
+
+    let mut actor = bare_actor(db.pool.clone());
+    actor.latch_status_batch(crate::actor::StatusBatch {
+        drv_hashes: vec!["outbox-foreign-truth".into()],
+        status: DerivationStatus::Cancelled,
+        exec_ids: vec![],
+        enqueued_at: std::time::Instant::now() - std::time::Duration::from_secs(60),
+        latched_at_epoch: crate::db::attempts::epoch_now() - 60.0,
+    });
+    // AFTER the latch: a production status writer advances the row
+    // (the resubmit-race shape — genuine foreign precedence).
+    let mut tx = db.pool.begin().await?;
+    crate::db::SchedulerDb::update_derivation_status_in_tx(
+        &mut tx,
+        &DrvHash::from("outbox-foreign-truth"),
+        DerivationStatus::Running,
+        None,
+    )
+    .await?;
+    tx.commit().await?;
+
+    let authority = actor.dag_authority().expect("always-leader test actor");
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    {
+        let _g = metrics::set_default_local_recorder(&rec);
+        actor.tick_flush_status_outbox(&authority).await;
+    }
+
+    let (status,): (String,) =
+        sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = 'outbox-foreign-truth'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(status, "running", "the newer foreign truth stands");
+    let counters = counter_map(&snap);
+    assert_eq!(
+        counters
+            .get("rio_scheduler_status_outbox_replay_refused_total")
+            .copied(),
+        Some(1),
+        "evidenced foreign precedence is the ONLY lane that counts a \
+         refusal"
+    );
+    assert_eq!(
+        counters
+            .get("rio_scheduler_status_outbox_replay_already_applied_total")
+            .copied()
+            .unwrap_or(0),
+        0,
+        "sibling lane silent (no lost-ack shape here)"
+    );
+    assert_eq!(
+        counters
+            .get("rio_scheduler_status_outbox_replay_vanished_total")
+            .copied()
+            .unwrap_or(0),
+        0,
+        "sibling lane silent (the row stands)"
+    );
+    assert_eq!(actor.status_outbox.len(), 0, "refusal is final; pops");
+    Ok(())
+}

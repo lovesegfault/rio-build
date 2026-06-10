@@ -155,7 +155,9 @@
     "rio_scheduler_stale_completed_substituted_total",
     "rio_scheduler_stale_realisation_filtered_total",
     "rio_scheduler_status_outbox_depth",
+    "rio_scheduler_status_outbox_replay_already_applied_total",
     "rio_scheduler_status_outbox_replay_refused_total",
+    "rio_scheduler_status_outbox_replay_vanished_total",
     "rio_scheduler_store_degraded_requeues_total",
     "rio_scheduler_substituting_derivations",
     "rio_scheduler_topdown_prune_total",
@@ -1032,9 +1034,19 @@
         "aggregation": "per-replica"
       },
       {
+        "name": "rio_scheduler_status_outbox_replay_already_applied_total",
+        "kind": "counter",
+        "help": "Status-outbox replay residuals whose durable status already equals the latched truth (merged_bug_108): an applied-but-ack-lost flush retried by the Err arm, or an equivalent write that landed first. Reconciled and popped — expected during PG brownouts (the exact condition the outbox exists for); never a refusal."
+      },
+      {
         "name": "rio_scheduler_status_outbox_replay_refused_total",
         "kind": "counter",
-        "help": "Status-outbox replays refused row-locally by the PG-domain precedence conjunct (merged_bug_017): the durable row advanced past the latch, so the newer row stands and the batch pops. Nonzero is normal under resubmit/cancel races; a sustained rate tracks churn racing terminal latches. The refused drv set rides the paired warn."
+        "help": "Status-outbox replays refused row-locally by the PG-domain precedence conjunct on EVIDENCED foreign precedence ONLY (merged_bug_108): the row stands with a DIFFERENT durable status whose stamp postdates the latch, so the newer truth stands and the batch pops. Lost-ack retries of our own landed commit count as replay_already_applied and GC'd rows as replay_vanished — never here. Nonzero is normal under resubmit/cancel races; a sustained rate tracks churn racing terminal latches. The refused drv set rides the paired warn."
+      },
+      {
+        "name": "rio_scheduler_status_outbox_replay_vanished_total",
+        "kind": "counter",
+        "help": "Status-outbox replay residuals whose row no longer exists (merged_bug_108): the orphan-derivation GC tick runs ahead of the flush in the same housekeeping pass and can collect a terminal unlinked row between latch and replay. Nothing stands, nothing to refuse; the batch pops."
       },
       {
         "name": "rio_scheduler_store_degraded_requeues_total",
