@@ -87,6 +87,18 @@ r[builder.fs.parity]
 
 The post-cutover `/nix/store` MUST be behaviourally indistinguishable from the pre-ADR-022 FUSE for every input-path read the Nix sandbox issues — same bytes, same `st_mode`/`st_size`/`st_mtime`, same symlink targets, same ENOENT for paths outside the closure. The cutover gate is the pre-existing build-running VM matrix (lifecycle, protocol, scheduling scenarios) passing with the castore-FUSE as the only lower (the scenarios themselves were adapted per the P0560 reconciliation), alongside `vm-castore-e2e`.
 
+### Transport: fuse-over-io_uring (the only transport)
+
+The castore-FUSE serves requests over Linux 6.14 fuse-over-io_uring rings instead of `read(2)`/`write(2)` pairs on `/dev/fuse` — one `COMMIT_AND_FETCH` submission answers a request and re-arms the ring entry, cutting syscalls and wakeups during cold-read upcall storms. There is exactly one wire transport, not a selector (and this is not a FUSE-implementation fallback: the implementation-plan's "no FUSE fallback flag" constraint banned keeping the old JIT-FUSE alive). mountd's role is unchanged: it still opens `/dev/fuse`, mounts, and brokers backing fds; the unprivileged session process owns the rings.
+
+r[builder.fs.io-uring-transport]
+
+The session MUST serve every kernel-routed request over fuse-over-io_uring: ring entries registered for every possible CPU, with the `/dev/fuse` fuser session retained only for the INIT handshake and the request classes the kernel never routes over rings (interrupts, forgets, notifications). Reply semantics — including passthrough backing-id `open()` replies — are those of the classic FUSE wire encoding.
+
+r[builder.fs.io-uring-required]
+
+When the kernel lacks `FUSE_OVER_IO_URING` (pre-6.14 or `fuse.enable_uring=0`), io_uring itself is unavailable (seccomp, `io_uring_disabled` sysctl), or ring registration fails, the mount MUST fail hard with an error naming the requirement (Linux 6.14+ with `fuse.enable_uring=1`) — never a silently degraded or wedged mount. The INIT reply MUST NOT advertise `FUSE_OVER_IO_URING` unless the rings already exist, because the kernel holds request processing between the INIT reply and ring readiness; and the mount MUST NOT be reported up until every queue's registration reached the kernel.
+
 ### Per-syscall resolution
 
 | Syscall on `/nix/store/...` | Resolved by | FUSE upcalls |
@@ -371,7 +383,7 @@ The `r[...]` markers introduced by ADR-022 across the design book are the spec-t
 | Domain | Markers |
 |---|---|
 | Mount stack | `builder.fs.castore-stack` · `builder.fs.castore-dag-source` · `builder.fs.castore-inode-digest` · `builder.fs.castore-cache-config` · `builder.fs.fd-handoff-ordering` · `builder.overlay.castore-lower` |
-| castore-FUSE | `builder.fs.digest-fuse-open` · `builder.fs.passthrough-on-hit` · `builder.fs.passthrough-stack-depth` · `builder.fs.file-digest-integrity` · `builder.fs.fetch-circuit` · `builder.fs.shared-backing-cache` · `builder.fs.node-digest-cache` · `builder.fs.node-chunk-cache` · `builder.fs.streaming-open` · `builder.fs.streaming-open-threshold` · `builder.fs.open-iomode-compatible` · `builder.fs.open-read-only` · `builder.fs.write-ops-erofs` |
+| castore-FUSE | `builder.fs.digest-fuse-open` · `builder.fs.passthrough-on-hit` · `builder.fs.passthrough-stack-depth` · `builder.fs.file-digest-integrity` · `builder.fs.fetch-circuit` · `builder.fs.shared-backing-cache` · `builder.fs.node-digest-cache` · `builder.fs.node-chunk-cache` · `builder.fs.streaming-open` · `builder.fs.streaming-open-threshold` · `builder.fs.open-iomode-compatible` · `builder.fs.open-read-only` · `builder.fs.write-ops-erofs` · `builder.fs.io-uring-transport` · `builder.fs.io-uring-required` |
 | Privilege | `builder.mountd.fuse-handoff` · `builder.mountd.backing-broker` · `builder.mountd.backing-readonly` · `builder.mountd.promote-verified` · `builder.mountd.promote-bounded-copy` · `builder.mountd.orphan-scan` · `builder.mountd.concurrency` · `builder.mountd.build-id-validated` · `builder.mountd.build-id-unique` · `builder.mountd.teardown-fast-release` · `builder.mountd.one-mount` · `builder.mountd.staging-quota` · `sec.boundary.mountd` |
 | FUSE handler quirks | `builder.fs.listxattr-size-branch` |
 | Result classification | `builder.result.input-eio-is-infra` · `builder.fs.parity` |
