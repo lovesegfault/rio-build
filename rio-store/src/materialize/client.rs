@@ -280,9 +280,39 @@ pub const REBOUND_ORIGIN: &str = "resume_rebound";
 /// derives from the private `charged_len` alone; [`Self::len`] keeps
 /// the cap/diagnostic semantics (`RESUME_LEDGER_CAP` counts ENTRIES —
 /// credential survival is unweakened by the split).
+/// merged_bug_053 — consecutive GATED passes with an UNCHANGED
+/// Charged entry set before the wedge warn fires: the
+/// list-ok/pull-lost brownout signature ("the scheduler accepted
+/// presentations and answered none") needs several beats to
+/// distinguish itself from one slow answer.
+const WEDGE_WARN_THRESHOLD: u32 = 8;
+
+/// merged_bug_053 — the claim-wedge observer, AT THE GATE (the site
+/// the bounding invariant lets observe the stuck state): post-
+/// merged_bug_014 the standing is outcome-honest, so "the same
+/// Charged entry, N gated passes, never answered" is exactly
+/// "the scheduler accepted presentations and answered none" — the
+/// scheduler-side outage the retired cap-refusal severity predicate
+/// could never see (its site was unreachable at the production
+/// slots=1: the budget break preceded every cap refusal, so
+/// `charged == 0` at every refusal it classified). Warn-once with
+/// recovery info; the contested-remainder steady state (AtCap,
+/// CredentialOnly-dominated) stays at debug. Reset is STRUCTURAL:
+/// any answer/resolution/standing change alters the Charged set, and
+/// set-inequality is the reset.
+#[derive(Default)]
+struct WedgeLatch {
+    last_charged: Vec<Uuid>,
+    streak: u32,
+    warned: bool,
+}
+
 #[derive(Default)]
 pub struct ResumeLedger {
     entries: VecDeque<ResumeEntry>,
+    /// merged_bug_053 — the gate-site wedge observer (lives with the
+    /// population it diagnoses; fed only by gated passes).
+    wedge: WedgeLatch,
     /// merged_bug_014 — the rotation cursor: the job last presented
     /// by the resume pass; the next pass's window starts after it
     /// (wrapping), so every live entry is presented within
@@ -471,21 +501,15 @@ impl ResumeLedger {
         // (answered raced losers waiting out the winners' jobs), not
         // an outage; warning "outage" there would be false.
         if self.entries.len() >= RESUME_LEDGER_CAP {
-            if self.cap_refusal_is_outage() {
-                warn!(job_id = %job_id,
-                      charged = self.charged_len(),
-                      entries = self.entries.len(),
-                      "resume ledger at capacity with unanswered mints \
-                       dominating; fresh mint refused (live credentials \
-                       are never evicted) — scheduler-side outage?");
-            } else {
-                debug!(job_id = %job_id,
-                       charged = self.charged_len(),
-                       entries = self.entries.len(),
-                       "resume ledger at capacity with answered \
-                        credentials dominating (contested listing \
-                        remainder); fresh mint refused");
-            }
+            // merged_bug_053: the refusal is the LAW; its severity
+            // classification moved to the honest-beat gate (the site
+            // that observes the stuck state across passes —
+            // [`ResumeLedger::observe_gated_pass`]). One debug here.
+            debug!(job_id = %job_id,
+                   charged = self.charged_len(),
+                   entries = self.entries.len(),
+                   "resume ledger at capacity; fresh mint refused \
+                    (live credentials are never evicted)");
             return None;
         }
         let nonce = Uuid::new_v4();
@@ -496,16 +520,6 @@ impl ResumeLedger {
         entry.standing = SlotStanding::Charged;
         self.entries.push_back(entry);
         Some(MintedClaim { nonce })
-    }
-
-    /// bug_034/FS-4 — the cap-refusal severity predicate: the outage
-    /// warn fires only when the population is Charged-DOMINATED
-    /// (charged ≥ credential-only; ties stay loud — the conservative
-    /// direction). A CredentialOnly-dominated full ledger is the
-    /// contested-remainder steady state and logs at debug.
-    fn cap_refusal_is_outage(&self) -> bool {
-        let charged = self.charged_len();
-        charged * 2 >= self.entries.len()
     }
 
     /// bug_034 / merged_bug_014 — an answered NotYetReady refunds the
@@ -580,6 +594,77 @@ impl ResumeLedger {
         }
     }
 
+    // r[impl store.materialize.honest-beat]
+    /// merged_bug_053 — feed the wedge observer one GATED pass (the
+    /// honest-beat gate calls this exactly when it withholds the
+    /// beat). The warn predicate is the one the invariant lets this
+    /// site observe: a persistent UNCHANGED Charged entry set across
+    /// [`WEDGE_WARN_THRESHOLD`] gated passes — post-merged_bug_014
+    /// the standing is outcome-honest, so this is exactly
+    /// "presentations accepted, none answered" (the scheduler-side
+    /// brownout). The AtCap CredentialOnly-dominated streak (the
+    /// contested-remainder steady state) stays at debug. Any answer,
+    /// resolution, or standing change alters the set — the reset is
+    /// the comparison itself; recovery logs once.
+    fn observe_gated_pass(&mut self, headroom: &MintHeadroom) {
+        let mut charged: Vec<Uuid> = self
+            .entries
+            .iter()
+            .filter(|e| e.standing == SlotStanding::Charged)
+            .map(|e| e.job_id)
+            .collect();
+        charged.sort_unstable();
+        let charged_dominated = match headroom {
+            MintHeadroom::Available => return,
+            MintHeadroom::BudgetPinned { .. } => true,
+            MintHeadroom::AtCap { charged, entries } => charged * 2 >= *entries,
+        };
+        if !charged_dominated || charged.is_empty() {
+            debug!(
+                entries = self.entries.len(),
+                "gated pass with an answered-credential population \
+                 (contested listing remainder); listing withheld"
+            );
+            self.wedge.streak = 0;
+            self.wedge.last_charged.clear();
+            if self.wedge.warned {
+                self.wedge.warned = false;
+                info!("claim wedge cleared (the charged population settled)");
+            }
+            return;
+        }
+        if charged == self.wedge.last_charged {
+            self.wedge.streak = self.wedge.streak.saturating_add(1);
+        } else {
+            if self.wedge.warned {
+                info!(
+                    "claim wedge recovered: the charged entry set changed \
+                     (an answer or resolution arrived)"
+                );
+                self.wedge.warned = false;
+            }
+            self.wedge.last_charged = charged;
+            self.wedge.streak = 1;
+        }
+        if self.wedge.streak >= WEDGE_WARN_THRESHOLD && !self.wedge.warned {
+            self.wedge.warned = true;
+            warn!(
+                streak = self.wedge.streak,
+                charged_jobs = ?self.wedge.last_charged,
+                "the SAME unanswered mints have pinned the claim budget \
+                 across consecutive gated passes — the scheduler accepted \
+                 these presentations and answered none (list-ok/pull-lost \
+                 brownout?); listing withheld, resume lane still presenting"
+            );
+        }
+    }
+
+    /// Test visibility: has the wedge observer warned?
+    #[cfg(test)]
+    fn wedge_warned(&self) -> bool {
+        self.wedge.warned
+    }
+
     /// Snapshot for the resume pass (entries are a handful of small
     /// strings; the pass mutates the ledger per answer).
     #[cfg(test)]
@@ -623,12 +708,17 @@ impl ResumeLedger {
         self.last_presented = Some(job_id);
     }
 
-    /// Test/diagnostic visibility: unanswered claims currently held.
+    /// Test/diagnostic visibility: EVERY live credential currently
+    /// held — Charged (unanswered) and CredentialOnly (answered,
+    /// nonce-resumable) alike (merged_bug_053: this is the
+    /// cap/diagnostic population, NOT the budget population —
+    /// the budget reads the private charged subset).
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
-    /// True when no unanswered claim is outstanding.
+    /// True when NO live credential of either standing is
+    /// outstanding (merged_bug_053: not just unanswered claims).
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -1250,6 +1340,10 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             ?headroom,
             "pass cannot mint a fresh claim; listing beat withheld (honest beat)"
         );
+        // merged_bug_053: the wedge observer watches the gate — the
+        // only site that can see "the same Charged entries, pass
+        // after pass, never answered".
+        ledger.observe_gated_pass(&headroom);
         pacing.beat_withheld = true;
         finish!();
     }
@@ -3003,82 +3097,6 @@ mod tests {
         );
     }
 
-    /// FS-4 companion green: the cap-refusal severity keys on the
-    /// standing MIX — a Charged-dominated full ledger (unanswered
-    /// mints) still reads as the scheduler-side outage; a
-    /// CredentialOnly-dominated one is the contested-remainder steady
-    /// state. The refusal itself stands either way (live credentials
-    /// are never evicted).
-    #[test]
-    fn cap_refusal_severity_keys_on_the_standing_mix() {
-        let entry = |standing: SlotStanding| {
-            let job = Uuid::now_v7();
-            ResumeEntry {
-                job_id: job,
-                drv_hash: format!("drv-{job}"),
-                tenant_hint: None,
-                origin: "cache_opportunity".into(),
-                nonce: Uuid::new_v4(),
-                standing,
-            }
-        };
-
-        // Charged-dominated: the outage warn shape.
-        let mut charged_heavy = ResumeLedger::default();
-        for _ in 0..RESUME_LEDGER_CAP {
-            charged_heavy.note_pull(entry(SlotStanding::Charged));
-        }
-        assert!(
-            charged_heavy.cap_refusal_is_outage(),
-            "32/32 Charged: outage"
-        );
-        assert!(
-            charged_heavy
-                .begin_fresh_claim(Uuid::now_v7(), |nonce| {
-                    let mut e = entry(SlotStanding::Charged);
-                    e.nonce = nonce;
-                    e
-                })
-                .is_none(),
-            "the refusal stands"
-        );
-
-        // CredentialOnly-dominated: the contested steady state.
-        let mut contested = ResumeLedger::default();
-        for i in 0..RESUME_LEDGER_CAP {
-            contested.note_pull(entry(if i < 2 {
-                SlotStanding::Charged
-            } else {
-                SlotStanding::CredentialOnly
-            }));
-        }
-        assert!(
-            !contested.cap_refusal_is_outage(),
-            "2 Charged / 30 CredentialOnly: contested remainder, not an outage"
-        );
-        assert!(
-            contested
-                .begin_fresh_claim(Uuid::now_v7(), |nonce| {
-                    let mut e = entry(SlotStanding::Charged);
-                    e.nonce = nonce;
-                    e
-                })
-                .is_none(),
-            "the refusal stands either way (credentials are never evicted)"
-        );
-
-        // The tie stays loud (conservative direction).
-        let mut tie = ResumeLedger::default();
-        for i in 0..RESUME_LEDGER_CAP {
-            tie.note_pull(entry(if i < RESUME_LEDGER_CAP / 2 {
-                SlotStanding::Charged
-            } else {
-                SlotStanding::CredentialOnly
-            }));
-        }
-        assert!(tie.cap_refusal_is_outage(), "16/16 tie: keep the warn");
-    }
-
     /// merged_bug_014 — the OUTCOME-DERIVED standing (the bug_034
     /// monotone-axiom pin, inverted with the law): pass 1's answered
     /// NotYetReady refunds (the credential survives); pass 2's LOST
@@ -4538,6 +4556,108 @@ mod tests {
             8,
             "two 4-entry windows must cover all eight live entries \
              (ceil(8/4) = 2 passes — the starvation bound)"
+        );
+    }
+
+    // r[verify store.materialize.honest-beat]
+    /// merged_bug_053 RED — the wedge observed where it happens.
+    /// Proposition certified (R16): a Charged orphan whose resume
+    /// presentation times out EVERY pass produces exactly ONE warn at
+    /// the gate after WEDGE_WARN_THRESHOLD consecutive gated passes
+    /// with the UNCHANGED Charged set — the list-ok/pull-lost
+    /// brownout signature, observed at the only site the budget
+    /// invariant lets observe it. Pre-fix: zero warns anywhere (the
+    /// retired cap-refusal warn needed charged >= 16 at a site the
+    /// budget break made unreachable at slots=1; nothing else
+    /// observed the wedge). Minted through production flows
+    /// end-to-end: fresh mint via begin_fresh_claim, Unanswered via
+    /// pull_once timeouts over the scripted transport — no note_pull
+    /// seeding.
+    #[tokio::test(start_paused = true)]
+    async fn persistent_budget_wedge_warns_at_the_gate() {
+        let job_a = descriptor(1);
+        let mut t = MockTransport::new(vec![Ok(listing(vec![job_a.clone()]))], vec![], vec![]);
+        t.hang_next_pulls = 99;
+        let mut ledger = ResumeLedger::default();
+        let mut latch = ListFailureLatch::default();
+        let mut fut = ConversionFutilityLatch::default();
+        let tok = token();
+        let inst = instance("wedge-warn-w");
+        // Pass 1: A minted, answer lost — the Charged orphan.
+        let p1 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+        assert!(p1.is_empty());
+        assert_eq!(ledger.charged_len(), 1);
+
+        // Eight GATED passes (overall passes 2..=9): budget pinned,
+        // the resume presentation times out each pass (the
+        // short-circuit burns one timeout) — the SAME Charged entry,
+        // never answered. The warn fires exactly at the eighth gated
+        // observation (WEDGE_WARN_THRESHOLD), not before.
+        for gated_pass in 1..=8 {
+            let p = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+            assert!(p.is_empty());
+            if gated_pass < 8 {
+                assert!(
+                    !ledger.wedge_warned(),
+                    "left: zero warns anywhere / right: exactly ONE warn at \
+                     the threshold pass — not before (gated pass {gated_pass})"
+                );
+            }
+        }
+        assert!(
+            ledger.wedge_warned(),
+            "left: zero warns anywhere (the cap-refusal warn needs \
+             charged >= 16 at a site the budget break makes unreachable; \
+             nothing else observes the wedge) / right: exactly ONE warn \
+             at the threshold gated pass naming the stuck job and streak"
+        );
+
+        // Recovery: the orphan finally answers (NotYetReady — refund);
+        // the Charged set changes and the latch clears on the next
+        // gated observation... here the budget frees outright, so the
+        // next pass lists again (the gate no longer fires).
+        t.hang_next_pulls = 0;
+        t.pulls = vec![Ok(not_yet_ready())].into();
+        let _p = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+        assert_eq!(ledger.charged_len(), 0, "the answer refunded the orphan");
+    }
+
+    /// merged_bug_053 companion green: an AtCap CredentialOnly-
+    /// dominated streak (the contested-remainder steady state) NEVER
+    /// cries outage — debug only, no warn. Cap-shape seeding via the
+    /// #[cfg(test)] note_pull lane (disclosed: the 32-entry answered
+    /// population arises only across many contested passes; the gate
+    /// decision and observer under test are production code).
+    #[tokio::test]
+    async fn at_cap_credential_only_streak_stays_debug() {
+        let mut ledger = ResumeLedger::default();
+        for _ in 0..RESUME_LEDGER_CAP {
+            let job = Uuid::now_v7();
+            ledger.note_pull(ResumeEntry {
+                job_id: job,
+                drv_hash: format!("drv-{job}"),
+                tenant_hint: None,
+                origin: "cache_opportunity".into(),
+                nonce: Uuid::new_v4(),
+                standing: SlotStanding::CredentialOnly,
+            });
+        }
+        let mut t = MockTransport::new(
+            vec![Ok(listing(vec![descriptor(1)]))],
+            vec![Ok(not_yet_ready())],
+            vec![],
+        );
+        let mut latch = ListFailureLatch::default();
+        let mut fut = ConversionFutilityLatch::default();
+        let tok = token();
+        let inst = instance("cap-debug-w");
+        for _ in 0..12 {
+            let p = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+            assert!(p.is_empty());
+        }
+        assert!(
+            !ledger.wedge_warned(),
+            "the contested steady state never cries outage"
         );
     }
 }
