@@ -343,6 +343,17 @@ impl SchedulerDb {
 
     /// The store-poll query: pending, not parked, no active assignment
     /// (the anti-join), oldest first, capped by `limit`.
+    ///
+    /// bug_099 — query-construction law: **no LIMIT without a total
+    /// order.** Batch-minted jobs tie on `created_at` (DEFAULT `now()`
+    /// is transaction-stable; the merge mints whole batches in one
+    /// UNNEST INSERT) and the consumer makes the returned order
+    /// load-bearing (512-window partition coverage + within-slice
+    /// fairness) — an unspecified tie order is the SQL twin of the
+    /// repo's HashMap-iteration-order rule. `job_id` is `Uuid::now_v7`
+    /// (time-ordered), so `(created_at, job_id)` is the total unique
+    /// key; PG satisfies it via incremental sort above the existing
+    /// `(created_at) WHERE state = 'pending'` partial index — no DDL.
     pub(crate) async fn list_claimable_materialization_jobs(
         &self,
         limit: i64,
@@ -356,7 +367,7 @@ impl SchedulerDb {
                     SELECT 1 FROM assignments a \
                      WHERE a.derivation_id = j.derivation_id \
                        AND a.status IN ('pending', 'acknowledged')) \
-              ORDER BY j.created_at \
+              ORDER BY j.created_at, j.job_id \
               LIMIT $1",
         )
         .bind(limit)

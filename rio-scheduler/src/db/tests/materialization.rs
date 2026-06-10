@@ -1156,3 +1156,116 @@ async fn unresolved_job_view_ignores_build_kind_assignments() -> anyhow::Result<
     drop(test_db);
     Ok(())
 }
+
+/// (k) bug_099 — the claimable listing's ORDER BY must be a TOTAL
+/// unique key. Batch-minted jobs tie on `created_at` (DEFAULT `now()`
+/// is transaction-stable; the merge mints whole batches in one UNNEST
+/// INSERT), and the wave-5 consumer made the returned order
+/// load-bearing (512-window partition coverage + within-slice
+/// fairness, actor/materialize.rs) — an unspecified tie order makes
+/// consecutive head-window snapshots disagree on window membership
+/// and within-slice order.
+///
+/// Witness strength (R16): this red certifies the ORDER itself — the
+/// full returned sequence equals the strict `(created_at, job_id)`
+/// order — not row membership.
+///
+/// Fixture provenance (R13): rows are minted through the production
+/// batch creator (`create_materialization_jobs_in_tx`) only;
+/// `created_at` is never hand-stamped. The tie-displacement is itself
+/// a production flow: a second merge batch re-presenting the first
+/// eight derivations with the `pruned` origin dedups onto the
+/// existing pending rows and the PD-D1 pruned-wins UPDATE rewrites
+/// exactly those tuples — PostgreSQL places the new tuple versions
+/// physically AFTER the untouched rows, so the heap order no longer
+/// matches the `job_id` order while every `created_at` still ties.
+///
+/// Disclosed plan-dependence: the red is reliable on the seeded shape
+/// (fresh table; all-equal sort keys preserve heap order; the
+/// displaced tuples sit at the heap tail) but PG does not contract
+/// the pre-fix order. The post-fix assertion is plan-independent.
+// r[verify sched.materialize.job+2]
+#[tokio::test]
+async fn listing_order_is_total_under_batch_minted_ties() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    // 96 derivations → one 96-job UNNEST batch in ONE transaction:
+    // every `created_at` ties (transaction-stable now()); job ids are
+    // minted `Uuid::now_v7()` in input order, so the strict
+    // `(created_at, job_id)` order equals the mint order.
+    let mut drvs = Vec::new();
+    let mut hashes = Vec::new();
+    for i in 0..96 {
+        let hash = format!("order-tie-{i:03}");
+        let drv = insert_test_derivation(&db, &hash).await?;
+        drvs.push(drv);
+        hashes.push(hash);
+    }
+    let rows: Vec<NewJobRow<'_>> = drvs
+        .iter()
+        .zip(hashes.iter())
+        .map(|(drv, hash)| NewJobRow {
+            derivation_id: *drv,
+            drv_hash: hash,
+            tenant_id: None,
+            origin: JobOrigin::CacheOpportunity,
+            carried_realized_paths: None,
+        })
+        .collect();
+    let mut tx = db.pool().begin().await?;
+    let created = SchedulerDb::create_materialization_jobs_in_tx(&mut tx, &rows, 1).await?;
+    tx.commit().await?;
+    let minted: Vec<Uuid> = created.iter().map(|r| r.job_id).collect();
+    assert!(created.iter().all(|r| r.created), "all 96 insert fresh");
+    {
+        let mut sorted = minted.clone();
+        sorted.sort();
+        assert_eq!(
+            minted, sorted,
+            "precondition: now_v7 mint order is the job_id order"
+        );
+    }
+    let distinct_created_at: i64 =
+        sqlx::query_scalar("SELECT COUNT(DISTINCT created_at) FROM materialization_jobs")
+            .fetch_one(&test_db.pool)
+            .await?;
+    assert_eq!(
+        distinct_created_at, 1,
+        "precondition: the whole batch ties on created_at"
+    );
+
+    // Production tie-displacement: a second merge batch re-presents
+    // the first eight derivations as `pruned` — the dedup finds the
+    // existing pending rows and the PD-D1 upgrade UPDATE rewrites
+    // them, moving their tuple versions to the heap tail.
+    let upgrade_rows: Vec<NewJobRow<'_>> = drvs[..8]
+        .iter()
+        .zip(hashes[..8].iter())
+        .map(|(drv, hash)| NewJobRow {
+            derivation_id: *drv,
+            drv_hash: hash,
+            tenant_id: None,
+            origin: JobOrigin::Pruned,
+            carried_realized_paths: None,
+        })
+        .collect();
+    let mut tx = db.pool().begin().await?;
+    let upgraded =
+        SchedulerDb::create_materialization_jobs_in_tx(&mut tx, &upgrade_rows, 1).await?;
+    tx.commit().await?;
+    assert!(
+        upgraded.iter().all(|r| !r.created && r.upgraded),
+        "the second batch dedups and upgrades (PD-D1) — no new rows"
+    );
+
+    // The listing must return the strict (created_at, job_id) order.
+    let listed = db.list_claimable_materialization_jobs(96).await?;
+    let returned: Vec<Uuid> = listed.iter().map(|j| j.job_id).collect();
+    assert_eq!(
+        returned, minted,
+        "left: returned order follows the shuffled heap/insert order within \
+         the created_at tie / right: job_id-ordered within the tie"
+    );
+    Ok(())
+}
