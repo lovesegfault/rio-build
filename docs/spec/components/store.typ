@@ -1564,6 +1564,34 @@ Machine witness: `docs/spec/models/materializationDistribution.qnt`
 (the capability axis: `wedgedOwnerSliceRecovered`; the
 wedged-keeps-beating falsify twin).
 
+#r("store.materialize.pass-outcome")[
+  Every pass-scoped observer MUST consume the single sealed pass
+  outcome; pacing MUST be a total function over the outcome alphabet;
+  a pass that neither delivered a claim nor removed ledger entries
+  MUST NOT re-poll unpaced, and a contested pass MUST honor the
+  server's answered retry floor.
+]
+One poll pass has several pass-scoped observers --- pacing, the
+conversion-futility latch, the claim-wedge latch --- and round-8 found
+each consuming a different hand-picked PARTIAL projection of the pass,
+each with a load-bearing unobserved edge (a resume delivery at
+production slots=1 classified EMPTY by the withheld short-circuit; a
+zero-action listing classified productive by raw listing
+non-emptiness; the server's `retry_after_seconds` discarded at the
+wire mapping). The structural form: `poll_and_claim` seals exactly ONE
+`PassOutcome` at its single exit chokepoint (`finish!` --- every exit
+names a typed `PassExit`; the seal is the sole constructor), and every
+observer total-folds the sealed value, so an unobserved transition
+cannot compile. The pacing law is the no-spin invariant stated over
+the alphabet: immediate re-poll is licensed only by variants that
+consumed finite supply (`Delivered` executed a claim; `Settled`
+strictly shrank the ledger --- the backlog is finite, so termination
+is structural), contested passes pace at the server's answered floor
+(cap-fill at `(cap/allowance - 1) x floor`, the FS-4 envelope), and
+every other shape (zero-action listing, empty, gated-wedged,
+list-failed) paces at the beat. Withhold reasons are typed
+(`WedgeKind`), never a boolean that shadows delivery.
+
 = Two-Phase Garbage Collection
 
 #r("store.gc.two-phase+2")[

@@ -422,9 +422,8 @@ async fn claim_loop<T>(
         // live_046 (R-B) → round-8 WO-S2-1: the eager re-poll rides
         // the sealed outcome — work re-polls now, idle passes sleep
         // the jittered beat, contested passes honor the server's
-        // floor (the `Floor` arm is unconstructed at this commit —
-        // the law flips next commit). Jitter is KEPT on every beat
-        // sleep; floor sleeps jitter upward only (the floor is never
+        // answered retry floor. Jitter is KEPT on every beat sleep;
+        // floor sleeps jitter upward only (the floor is never
         // undercut).
         match pace {
             Pace::Now => {}
@@ -458,23 +457,27 @@ pub enum Pace {
     Floor(Duration),
 }
 
+// r[impl store.materialize.pass-outcome]
 /// round-8 WO-S2-1 — THE pacing law: one total function over the
 /// sealed [`client::PassOutcome`] alphabet (the pacing loop's only
 /// input; rustc's exhaustiveness is the census — a new outcome
-/// variant fails this build). This commit mirrors the RETIRED
-/// projection law cell-for-cell (semantics-neutral restructure); the
-/// two defect cells are annotated and flip in the NEXT commit:
+/// variant fails this build). The structural no-spin law: immediate
+/// re-poll is licensed ONLY by variants that consumed finite supply —
+/// `Delivered` executed a claim, `Settled` strictly shrank the ledger
+/// (the backlog is finite, so termination is structural). A zero-work
+/// pass cannot re-poll unpaced BY TYPE, and a work-bearing pass
+/// cannot be classified idle BY TYPE:
 ///
-///   - `Delivered`/`Settled` → `Now`: conversion work re-polls
-///     (reachable only on un-gated exits at this commit — the seal's
-///     exit-first precedence reproduces the old withheld
-///     short-circuit, the merged_bug_038 defect).
-///   - `Contested` → `Now`: **defect cell (merged_bug_008, FS-4
-///     face)** — contested passes re-poll at RPC speed, discarding
-///     the server's stated floor; flips to `Floor` next commit.
-///   - `ListedNoAction` → `Now`: **defect cell (merged_bug_008, hot
-///     loop)** — a pass that listed work and took zero actions
-///     re-polls unpaced; flips to `Beat` next commit.
+///   - `Delivered`/`Settled` → `Now`: conversion work re-polls, even
+///     under a gated exit (merged_bug_038 — the seal's
+///     conversion-first precedence).
+///   - `Contested` → `Floor(retry_after)` when the server stated a
+///     floor, else `Beat` (merged_bug_008, FS-4 face): the wire fact
+///     is the earliest any contested job could be ready — cap-fill
+///     is paced at (cap/allowance − 1) × floor, not RPC speed.
+///   - `ListedNoAction` → `Beat` (merged_bug_008, hot loop): a pass
+///     that listed work and took no conversion-conclusive action is
+///     idle, whatever the listing said.
 ///   - `Empty`/`Wedged`/`ListFailed` → `Beat`: nothing to do (or the
 ///     beat was withheld) — idle at the beat, never spin.
 ///   - `Abandoned` → `Beat`: SIGTERM — the loop exits before any
@@ -483,8 +486,11 @@ pub fn pace_for(outcome: &client::PassOutcome) -> Pace {
     match outcome {
         client::PassOutcome::Delivered { .. } => Pace::Now,
         client::PassOutcome::Settled { .. } => Pace::Now,
-        client::PassOutcome::Contested { .. } => Pace::Now,
-        client::PassOutcome::ListedNoAction { .. } => Pace::Now,
+        client::PassOutcome::Contested { floor } => match floor {
+            Some(d) => Pace::Floor(*d),
+            None => Pace::Beat,
+        },
+        client::PassOutcome::ListedNoAction { .. } => Pace::Beat,
         client::PassOutcome::Empty => Pace::Beat,
         client::PassOutcome::Wedged(_) => Pace::Beat,
         client::PassOutcome::ListFailed => Pace::Beat,
@@ -769,6 +775,7 @@ mod tests {
     // live_046 (R-B) — eager re-poll pacing
     // -----------------------------------------------------------------
 
+    // r[verify store.materialize.pass-outcome]
     /// R15 census: the pacing law, total over the sealed
     /// [`client::PassOutcome`] alphabet — the census vector's
     /// completeness is FORCED by the wildcard-free
@@ -780,14 +787,13 @@ mod tests {
     /// own boolean, certifying f(x)==f(x); its R16 prose adopted
     /// "withheld = wedged" underived — the merged_bug_038 lesson).
     ///
-    /// Proposition (R16): per-cell pacing at THIS commit mirrors the
-    /// retired projection law (semantics-neutral restructure). Two
-    /// cells are the documented merged_bug_008 defect cells — they
-    /// flip in the next commit:
-    ///   - `Contested` → `Now` (defect: the server's floor is
-    ///     discarded; flips to `Floor`);
-    ///   - `ListedNoAction` → `Now` (defect: the zero-action hot
-    ///     loop; flips to `Beat`).
+    /// Proposition (R16): the requirement's own per-cell values —
+    /// re-poll-now ⇔ the pass consumed finite supply (delivered or
+    /// strictly shrank the ledger); contested passes pace at the
+    /// SERVER's stated floor (else the beat); every other shape
+    /// paces at the beat. The two former merged_bug_008 defect cells
+    /// (`Contested` and `ListedNoAction` re-polling unpaced) are
+    /// flipped here.
     #[test]
     fn pacing_law_total_over_pass_outcomes() {
         use client::{PassOutcome, WedgeKind};
@@ -809,24 +815,26 @@ mod tests {
             (PassOutcome::Delivered { deliveries: 1 }, Pace::Now),
             // The ledger strictly shrank: settle work re-polls.
             (PassOutcome::Settled { resolutions: 2 }, Pace::Now),
-            // DEFECT CELL (merged_bug_008, FS-4 face): the wire floor
-            // is discarded — contested passes re-poll at RPC speed.
-            // Flips to Floor(5 s) in the next commit.
+            // The server stated a floor: honor it — the earliest any
+            // contested job could be ready (merged_bug_008, FS-4
+            // face — the formerly-discarded wire fact, now the cell
+            // value the floor PROPAGATES through).
             (
                 PassOutcome::Contested {
                     floor: Some(Duration::from_secs(5)),
                 },
-                Pace::Now,
+                Pace::Floor(Duration::from_secs(5)),
             ),
-            (PassOutcome::Contested { floor: None }, Pace::Now),
-            // DEFECT CELL (merged_bug_008, hot loop): a zero-action
-            // listing re-polls unpaced. Flips to Beat next commit.
+            // No stated floor: the contested pass paces at the beat.
+            (PassOutcome::Contested { floor: None }, Pace::Beat),
+            // Zero-action listings are idle, whatever the listing
+            // said (merged_bug_008, hot loop — the flipped cell).
             (
                 PassOutcome::ListedNoAction {
                     refused: 1,
                     skipped: 0,
                 },
-                Pace::Now,
+                Pace::Beat,
             ),
             // Nothing to do: idle at the beat.
             (PassOutcome::Empty, Pace::Beat),
@@ -887,18 +895,23 @@ mod tests {
         );
     }
 
-    /// Scripted pacing transport for the claim-loop tests: pops
-    /// nothing, answers from a fixed shape, cancels shutdown after N
-    /// listing calls (the loop's exit valve).
+    /// Scripted pacing transport for the claim-loop tests: serves one
+    /// listing BATCH per call (repeating the last batch once the
+    /// script is exhausted), answers pulls from a popped script
+    /// (repeating the last answer), records every pull request, and
+    /// cancels shutdown after N listing calls (the loop's exit
+    /// valve).
     #[derive(Clone)]
     struct PacingTransport {
         state: std::sync::Arc<std::sync::Mutex<PacingState>>,
     }
 
     struct PacingState {
-        descriptors: Vec<rio_proto::types::MaterializationJobDescriptor>,
+        listings: std::collections::VecDeque<Vec<rio_proto::types::MaterializationJobDescriptor>>,
+        pulls: std::collections::VecDeque<rio_proto::types::PullAssignmentResponse>,
         list_calls: u32,
         cancel_after: u32,
+        seen_pulls: Vec<rio_proto::types::PullAssignmentRequest>,
         shutdown: rio_common::signal::Token,
     }
 
@@ -912,23 +925,24 @@ mod tests {
             if st.list_calls >= st.cancel_after {
                 st.shutdown.cancel();
             }
-            Ok(rio_proto::types::ListMaterializationJobsResponse {
-                jobs: st.descriptors.clone(),
-            })
+            let jobs = match st.listings.len() {
+                0 => Vec::new(),
+                1 => st.listings[0].clone(),
+                _ => st.listings.pop_front().expect("non-empty"),
+            };
+            Ok(rio_proto::types::ListMaterializationJobsResponse { jobs })
         }
 
         async fn pull(
             &mut self,
-            _req: rio_proto::types::PullAssignmentRequest,
+            req: rio_proto::types::PullAssignmentRequest,
         ) -> Result<rio_proto::types::PullAssignmentResponse, tonic::Status> {
-            Ok(rio_proto::types::PullAssignmentResponse {
-                outcome: Some(
-                    rio_proto::types::pull_assignment_response::Outcome::NotYetReady(
-                        rio_proto::types::NotYetReady {
-                            retry_after_seconds: 5,
-                        },
-                    ),
-                ),
+            let mut st = self.state.lock().unwrap();
+            st.seen_pulls.push(req);
+            Ok(match st.pulls.len() {
+                0 => not_yet_ready_in_5s(),
+                1 => st.pulls[0].clone(),
+                _ => st.pulls.pop_front().expect("non-empty"),
             })
         }
 
@@ -947,21 +961,46 @@ mod tests {
         }
     }
 
+    /// The contested wire answer (the production scheduler's uniform
+    /// 5 s floor).
+    fn not_yet_ready_in_5s() -> rio_proto::types::PullAssignmentResponse {
+        rio_proto::types::PullAssignmentResponse {
+            outcome: Some(
+                rio_proto::types::pull_assignment_response::Outcome::NotYetReady(
+                    rio_proto::types::NotYetReady {
+                        retry_after_seconds: 5,
+                    },
+                ),
+            ),
+        }
+    }
+
+    /// Run the REAL claim loop over a scripted transport under a
+    /// paused virtual clock; returns the elapsed virtual time and the
+    /// transport state (pull-request census for the mint-cost
+    /// assertions).
     async fn run_claim_loop_with(
-        descriptors: Vec<rio_proto::types::MaterializationJobDescriptor>,
+        listings: Vec<Vec<rio_proto::types::MaterializationJobDescriptor>>,
+        pulls: Vec<rio_proto::types::PullAssignmentResponse>,
         cancel_after: u32,
-    ) -> std::time::Duration {
+    ) -> (
+        std::time::Duration,
+        std::sync::Arc<std::sync::Mutex<PacingState>>,
+    ) {
         let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
         let substituter =
             std::sync::Arc::new(crate::substitute::Substituter::new(db.pool.clone(), None));
         let shutdown = rio_common::signal::Token::new();
+        let state = std::sync::Arc::new(std::sync::Mutex::new(PacingState {
+            listings: listings.into(),
+            pulls: pulls.into(),
+            list_calls: 0,
+            cancel_after,
+            seen_pulls: Vec::new(),
+            shutdown: shutdown.clone(),
+        }));
         let transport = PacingTransport {
-            state: std::sync::Arc::new(std::sync::Mutex::new(PacingState {
-                descriptors,
-                list_calls: 0,
-                cancel_after,
-                shutdown: shutdown.clone(),
-            })),
+            state: std::sync::Arc::clone(&state),
         };
         let cfg = crate::config::MaterializationConfig::default();
         let ctx = executor::ExecutorContext {
@@ -984,33 +1023,76 @@ mod tests {
             shutdown,
         )
         .await;
-        started.elapsed()
+        (started.elapsed(), state)
     }
 
-    /// live_046 RED (loop-level, paused virtual clock):
-    /// PRODUCTIVE passes re-poll immediately. Three consecutive
-    /// productive passes (pass 1 mints + gets a contested answer —
-    /// a ledger transition; passes 2-3 list live work) must complete
-    /// with ZERO virtual time elapsed: no beat sleep was taken.
-    /// Pre-fix (strawman-disclosed: the law fn and pacing facts do
-    /// not exist pre-fix, so the red is structural-by-construction):
-    /// the loop slept the jittered interval after EVERY pass — three
-    /// passes cost >= 2 x ~1 s of virtual time.
-    #[tokio::test]
-    async fn productive_pass_repolls_without_sleep() {
-        let descriptor = rio_proto::types::MaterializationJobDescriptor {
+    fn pacing_descriptor(n: u32) -> rio_proto::types::MaterializationJobDescriptor {
+        rio_proto::types::MaterializationJobDescriptor {
             job_id: uuid::Uuid::now_v7().to_string(),
-            drv_hash: "pacing-live-drv".into(),
+            drv_hash: format!("pacing-drv-{n}"),
             tenant_id: String::new(),
             origin: "cache_opportunity".into(),
-        };
-        let elapsed = run_claim_loop_with(vec![descriptor], 3).await;
-        assert_eq!(
-            elapsed,
-            std::time::Duration::ZERO,
-            "left: the second listing waits out poll_interval despite a \
-             productive first pass / right: immediate re-poll (zero beat \
-             sleeps across three productive passes)"
+        }
+    }
+
+    fn gone_answer() -> rio_proto::types::PullAssignmentResponse {
+        rio_proto::types::PullAssignmentResponse {
+            outcome: Some(rio_proto::types::pull_assignment_response::Outcome::Gone(
+                rio_proto::types::Gone {},
+            )),
+        }
+    }
+
+    fn not_yet_ready_no_floor() -> rio_proto::types::PullAssignmentResponse {
+        rio_proto::types::PullAssignmentResponse {
+            outcome: Some(
+                rio_proto::types::pull_assignment_response::Outcome::NotYetReady(
+                    rio_proto::types::NotYetReady {
+                        retry_after_seconds: 0,
+                    },
+                ),
+            ),
+        }
+    }
+
+    // r[verify store.materialize.pass-outcome]
+    /// round-8 (rewritten at WO-S2-1; was live_046's "three productive
+    /// passes" — an R16 statement whose passes 2-3 produced zero
+    /// mints, zero claims, and zero ledger movement: the
+    /// merged_bug_008 defect cell pinned as the feature, retired with
+    /// the flip). Proposition certified (R16): a pass that CONSUMES
+    /// FINITE SUPPLY re-polls with zero added virtual time — here the
+    /// supply-consuming population is a Settled pass (the resume lane
+    /// drains a Gone credential; the ledger strictly shrinks), driven
+    /// through the real claim loop; the DELIVERING sibling cell is
+    /// certified pass-level by `resume_delivery_is_sealed_productive_
+    /// not_empty` (loop-level delivery would execute a real walk
+    /// against PG under a paused clock — recorded divergence). The
+    /// contested setup pass paces at the beat (its floor is unstated
+    /// — `Contested{{floor: None}}`), so total elapsed is EXACTLY one
+    /// jittered beat: the Settled pass added nothing.
+    #[tokio::test]
+    async fn productive_pass_repolls_without_sleep() {
+        // Pass 1: mint d1, answered NotYetReady (no stated floor) —
+        // contested, paces one jittered beat. Pass 2: the resume lane
+        // drains d1 with Gone — Settled, re-polls NOW. Pass 3: empty
+        // listing; the exit valve cancels at the third list call.
+        let (elapsed, _state) = run_claim_loop_with(
+            vec![vec![pacing_descriptor(1)], vec![], vec![]],
+            vec![not_yet_ready_no_floor(), gone_answer()],
+            3,
+        )
+        .await;
+        assert!(
+            elapsed >= std::time::Duration::from_millis(780),
+            "the contested setup pass paces one jittered beat \
+             (got {elapsed:?})"
+        );
+        assert!(
+            elapsed <= std::time::Duration::from_millis(1300),
+            "left: >= two beats (the settle-draining pass slept too) / \
+             right: exactly one beat — the Settled pass re-polled with \
+             zero added virtual time (got {elapsed:?})"
         );
     }
 
@@ -1022,7 +1104,7 @@ mod tests {
     /// that occurs.
     #[tokio::test]
     async fn empty_and_gated_passes_sleep_the_jittered_beat() {
-        let elapsed = run_claim_loop_with(vec![], 3).await;
+        let (elapsed, _state) = run_claim_loop_with(vec![vec![]], vec![], 3).await;
         assert!(
             elapsed >= std::time::Duration::from_millis(1600),
             "two empty-pass beats must elapse (got {elapsed:?})"
@@ -1031,6 +1113,96 @@ mod tests {
             elapsed <= std::time::Duration::from_millis(2600),
             "and no more than two jittered beats before the exit \
              (got {elapsed:?})"
+        );
+    }
+
+    // r[verify store.materialize.pass-outcome]
+    /// round-8 R1 (merged_bug_008 hot-loop cell). Proposition
+    /// certified (R16): a pass that LISTS work but takes ZERO actions
+    /// — every descriptor refused pre-pull (malformed job_id, the
+    /// production bad_job_id lane) — sleeps the jittered beat. The
+    /// population is the vulnerable one: pre-fix no backstop engages
+    /// (the futility latch needs fresh mints, the honest-beat gate
+    /// sees Available, the list latch sees success), so a degraded
+    /// scheduler emitting malformed descriptors spun the warn+list
+    /// loop at RPC speed.
+    #[tokio::test]
+    async fn listed_zero_action_pass_sleeps_the_beat() {
+        let bad = rio_proto::types::MaterializationJobDescriptor {
+            job_id: "not-a-uuid".into(),
+            drv_hash: "zero-action-drv".into(),
+            tenant_id: String::new(),
+            origin: "cache_opportunity".into(),
+        };
+        let (elapsed, state) = run_claim_loop_with(vec![vec![bad]], vec![], 3).await;
+        let st = state.lock().unwrap();
+        assert_eq!(st.list_calls, 3, "three listing passes ran");
+        assert!(
+            st.seen_pulls.is_empty(),
+            "zero actions: every descriptor exited pre-pull"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(1600),
+            "left: three list RPCs, zero virtual time (the warn/list hot \
+             loop at RPC speed) / right: each zero-action pass sleeps >= \
+             the jittered beat (got {elapsed:?})"
+        );
+        assert!(
+            elapsed <= std::time::Duration::from_millis(2600),
+            "and no more than two jittered beats before the exit \
+             (got {elapsed:?})"
+        );
+    }
+
+    // r[verify store.materialize.pass-outcome]
+    /// round-8 R2 (merged_bug_008 FS-4 cell). Proposition certified
+    /// (R16): a CONTESTED pass — fresh mints issued, every one
+    /// answered NotYetReady carrying the server's
+    /// `retry_after_seconds: 5` — paces at the SERVER's floor, and
+    /// mint cost stays within the per-pass allowance (the cap-fill
+    /// product: time-to-cap >= (cap/allowance - 1) x floor, the FS-4
+    /// envelope this red is the running witness for). The population
+    /// is contested-only across three passes (fresh descriptor per
+    /// pass; resume re-presentations answer the same floor).
+    #[tokio::test]
+    async fn contested_mint_pass_honors_the_server_retry_floor() {
+        let (elapsed, state) = run_claim_loop_with(
+            vec![
+                vec![pacing_descriptor(1)],
+                vec![pacing_descriptor(2)],
+                vec![pacing_descriptor(3)],
+            ],
+            vec![],
+            3,
+        )
+        .await;
+        assert!(
+            elapsed >= std::time::Duration::from_secs(10),
+            "left: zero virtual time between contested passes (cap \
+             fills in ~cap/allowance round-trips) / right: >= 5 s floor \
+             per contested pass — time-to-cap >= (cap/allowance - 1) x \
+             floor (got {elapsed:?})"
+        );
+        assert!(
+            elapsed <= std::time::Duration::from_secs(13),
+            "and no more than two upward-jittered floors before the \
+             exit (got {elapsed:?})"
+        );
+        let st = state.lock().unwrap();
+        assert_eq!(st.list_calls, 3, "three contested passes ran");
+        let distinct_nonces: std::collections::HashSet<&str> = st
+            .seen_pulls
+            .iter()
+            .filter(|r| !r.claim_nonce.is_empty())
+            .map(|r| r.claim_nonce.as_str())
+            .collect();
+        assert_eq!(
+            distinct_nonces.len(),
+            2,
+            "one fresh nonce per COMPLETED contested pass (the third \
+             pass's mint pull is cut by the exit valve before it rides) \
+             — mint cost stays within passes x allowance, never one per \
+             round-trip"
         );
     }
 }

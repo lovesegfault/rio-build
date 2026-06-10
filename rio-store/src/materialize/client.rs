@@ -237,6 +237,7 @@ pub enum WedgeKind {
     Futility,
 }
 
+// r[impl store.materialize.pass-outcome]
 /// THE one sealed verdict of a completed poll pass (round-8 WO-S2-1:
 /// merged_bug_038 + merged_bug_008). Minted exactly once, inside
 /// `finish!`, by [`PassOutcome::seal`] — every pass-scoped observer
@@ -303,12 +304,17 @@ impl PassOutcome {
     /// completed pass from its exit, its conversion evidence, the
     /// claimed count, and the pass's net ledger shrink.
     ///
-    /// Seal precedence (1a — the OLD pacing law's exit-first shape,
-    /// preserved verbatim so this commit is semantics-neutral): a
-    /// gated exit seals [`PassOutcome::Wedged`] UNCONDITIONALLY —
-    /// deliveries and settles on a gated pass are invisible to
-    /// pacing, exactly the merged_bug_038 defect cell (annotated in
-    /// the law table; the flip is the NEXT commit).
+    /// Seal precedence (derived, hand-tabled in
+    /// `seal_precedence_total_over_exits`): `Abandoned` > `Delivered`
+    /// > `Settled` > `Contested` > `Wedged` >
+    /// `ListedNoAction`/`Empty`/`ListFailed`. Conversion evidence
+    /// wins over the exit shape on every non-abandoned exit — a
+    /// delivering or ledger-shrinking pass seals productive EVEN
+    /// UNDER A GATED EXIT (merged_bug_038: the resume delivery at
+    /// production slots=1 always exits at the headroom gate; the
+    /// retired exit-first precedence classified exactly those passes
+    /// idle). `Abandoned` dominates everything: a SIGTERM-cut pass
+    /// is inconclusive evidence, never a productivity claim.
     fn seal(
         exit: PassExit,
         pass: &PassConversion,
@@ -322,17 +328,20 @@ impl PassOutcome {
         match exit {
             PassExit::Abandoned => PassOutcome::Abandoned,
             PassExit::GatedHeadroom(MintHeadroom::BudgetPinned { charged }) => {
-                PassOutcome::Wedged(WedgeKind::BudgetPinned { charged })
+                Self::conversion_outcome(pass, resolutions)
+                    .unwrap_or(PassOutcome::Wedged(WedgeKind::BudgetPinned { charged }))
             }
             PassExit::GatedHeadroom(MintHeadroom::AtCap { charged, entries }) => {
-                PassOutcome::Wedged(WedgeKind::AtCap { charged, entries })
+                Self::conversion_outcome(pass, resolutions)
+                    .unwrap_or(PassOutcome::Wedged(WedgeKind::AtCap { charged, entries }))
             }
             // Dead cell, total without a wildcard: the gate exits
             // only on withheld headroom, so an Available-carrying
             // gated exit is unconstructed; sealed Empty (paced) —
             // the conservative arm.
             PassExit::GatedHeadroom(MintHeadroom::Available) => PassOutcome::Empty,
-            PassExit::GatedFutility => PassOutcome::Wedged(WedgeKind::Futility),
+            PassExit::GatedFutility => Self::conversion_outcome(pass, resolutions)
+                .unwrap_or(PassOutcome::Wedged(WedgeKind::Futility)),
             PassExit::ListFailed => {
                 Self::conversion_outcome(pass, resolutions).unwrap_or(PassOutcome::ListFailed)
             }
@@ -579,6 +588,18 @@ const RESUME_LEDGER_CAP: usize = 32;
 /// resulting allowance MUST stay ≥ 2 at slots=1: an answered loser at
 /// the head must leave room for one more fresh mint, or the refund
 /// law is unreachable (the raced-loser red pins exactly that shape).
+///
+/// Time-to-cap envelope (R17, round-8 WO-S2-1 — the previously
+/// untyped FS-4 derivation, typed): a fully contested worker mints at
+/// most `allowance = slots + STEAL_SPECULATION_ALLOWANCE` nonces per
+/// pass and every contested pass paces at the server's answered
+/// retry floor (`store.materialize.pass-outcome`), so filling
+/// [`RESUME_LEDGER_CAP`] takes at least
+/// `(RESUME_LEDGER_CAP / allowance − 1) × floor` of wall-clock —
+/// ≈ (32/2 − 1) × 5 s ≈ 75 s at production scale, vs ~16 RPC
+/// round-trips when the floor was discarded. Running witness:
+/// `contested_mint_pass_honors_the_server_retry_floor` (the
+/// loop-level paced red).
 const STEAL_SPECULATION_ALLOWANCE: usize = 1;
 
 /// merged_bug_014 (R17, violable + testable) — presentations per
@@ -4917,5 +4938,179 @@ mod tests {
             !ledger.wedge_warned(),
             "the contested steady state never cries outage"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // round-8 WO-S2-1 — the sealed pass outcome (merged_bug_038/008)
+    // -----------------------------------------------------------------
+
+    // r[verify store.materialize.pass-outcome]
+    /// round-8 R3 (merged_bug_038 defect cell). Proposition certified
+    /// (R16): a resume delivery at production slots=1 — which exits
+    /// the pass at the headroom gate — seals `Delivered{1}` and paces
+    /// `Now`: conversion work re-polls even under a gated exit.
+    /// Population: a Charged orphan minted through the production
+    /// flows (begin_fresh_claim + a lost pull), then delivered on the
+    /// resume lane — the exact withheld-by-own-delivery cell the
+    /// retired projection law classified EMPTY (the post-walk dead
+    /// beat).
+    #[tokio::test(start_paused = true)]
+    async fn resume_delivery_is_sealed_productive_not_empty() {
+        let job_a = descriptor(1);
+        let mut t = MockTransport::new(vec![Ok(listing(vec![job_a.clone()]))], vec![], vec![]);
+        t.hang_next_pulls = 1;
+        let mut ledger = ResumeLedger::default();
+        let mut latch = ListFailureLatch::default();
+        let mut fut = ConversionFutilityLatch::default();
+        let tok = token();
+        let inst = instance("sealed-deliver-w");
+        // Pass 1 (production flow): fresh mint for A, answer lost —
+        // A is the Charged orphan.
+        let p1 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+        assert!(p1.is_empty());
+        assert_eq!(ledger.charged_len(), 1, "precondition: A is Charged");
+
+        // Pass 2: A's resume presentation DELIVERS at slots=1 — the
+        // pass exits at the headroom gate (claimed == slots).
+        t.pulls = vec![Ok(deliver_for_job(
+            "exec-resumed-a",
+            "/nix/store/resumed-a.drv",
+            Uuid::nil(),
+        ))]
+        .into();
+        let p2 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+        assert_eq!(p2.len(), 1, "the resume delivery executed");
+        assert_eq!(
+            p2.outcome,
+            PassOutcome::Delivered { deliveries: 1 },
+            "left: Wedged(BudgetPinned) — the delivering, ledger-moving \
+             pass classified wedged-idle by the exit-first seal (the \
+             post-walk dead beat returns) / right: Delivered{{1}} — a \
+             work-bearing pass cannot be classified idle by type"
+        );
+        assert_eq!(
+            crate::materialize::pace_for(&p2.outcome),
+            crate::materialize::Pace::Now,
+            "left: Beat (the rule-4b recovery pays a dead beat) / right: \
+             Now (conversion work re-polls immediately)"
+        );
+    }
+
+    // r[verify store.materialize.pass-outcome]
+    /// round-8 WO-S2-1 — the seal precedence, hand-tabled over
+    /// (exit × conversion-evidence) cells: `Abandoned` dominates
+    /// everything (SIGTERM evidence is inconclusive — a cut-short
+    /// pass must not claim productivity); `Delivered` and `Settled`
+    /// dominate every COMPLETED-OR-GATED exit (conversion work is
+    /// never invisible to pacing — the merged_bug_038 repair); the
+    /// exit shape only classifies passes with no conversion
+    /// evidence. Expected values are hand literals derived from the
+    /// precedence law `Abandoned > Delivered > Settled > Contested >
+    /// Wedged > ListedNoAction/Empty/ListFailed`.
+    #[test]
+    fn seal_precedence_total_over_exits() {
+        let delivering = PassConversion {
+            deliveries: 1,
+            ..Default::default()
+        };
+        let bare = PassConversion::default();
+        let pinned = MintHeadroom::BudgetPinned { charged: 1 };
+        // (exit, pass, claimed, resolutions) → expected outcome.
+        let table: Vec<(PassExit, &PassConversion, usize, usize, PassOutcome)> = vec![
+            // SIGTERM dominates even a delivery: the pass is
+            // abandoned mid-evidence.
+            (
+                PassExit::Abandoned,
+                &delivering,
+                1,
+                0,
+                PassOutcome::Abandoned,
+            ),
+            (PassExit::Abandoned, &bare, 0, 1, PassOutcome::Abandoned),
+            (PassExit::Abandoned, &bare, 0, 0, PassOutcome::Abandoned),
+            // A gated exit with a delivery seals Delivered (the
+            // merged_bug_038 flip: conversion-first precedence).
+            (
+                PassExit::GatedHeadroom(pinned),
+                &delivering,
+                1,
+                0,
+                PassOutcome::Delivered { deliveries: 1 },
+            ),
+            (
+                PassExit::GatedHeadroom(pinned),
+                &bare,
+                0,
+                1,
+                PassOutcome::Settled { resolutions: 1 },
+            ),
+            (
+                PassExit::GatedHeadroom(pinned),
+                &bare,
+                0,
+                0,
+                PassOutcome::Wedged(WedgeKind::BudgetPinned { charged: 1 }),
+            ),
+            (
+                PassExit::GatedFutility,
+                &delivering,
+                1,
+                0,
+                PassOutcome::Delivered { deliveries: 1 },
+            ),
+            (
+                PassExit::GatedFutility,
+                &bare,
+                0,
+                1,
+                PassOutcome::Settled { resolutions: 1 },
+            ),
+            (
+                PassExit::GatedFutility,
+                &bare,
+                0,
+                0,
+                PassOutcome::Wedged(WedgeKind::Futility),
+            ),
+            (
+                PassExit::ListFailed,
+                &delivering,
+                1,
+                0,
+                PassOutcome::Delivered { deliveries: 1 },
+            ),
+            (
+                PassExit::ListFailed,
+                &bare,
+                0,
+                1,
+                PassOutcome::Settled { resolutions: 1 },
+            ),
+            (PassExit::ListFailed, &bare, 0, 0, PassOutcome::ListFailed),
+            (
+                PassExit::Completed,
+                &delivering,
+                1,
+                0,
+                PassOutcome::Delivered { deliveries: 1 },
+            ),
+            (
+                PassExit::Completed,
+                &bare,
+                0,
+                1,
+                PassOutcome::Settled { resolutions: 1 },
+            ),
+            // A bare completed pass that listed nothing is Empty.
+            (PassExit::Completed, &bare, 0, 0, PassOutcome::Empty),
+        ];
+        for (exit, pass, claimed, resolutions, expected) in table {
+            assert_eq!(
+                PassOutcome::seal(exit, pass, claimed, resolutions),
+                expected,
+                "precedence cell ({exit:?}, deliveries={}, resolutions={resolutions})",
+                pass.deliveries,
+            );
+        }
     }
 }
