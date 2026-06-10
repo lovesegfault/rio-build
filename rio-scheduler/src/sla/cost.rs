@@ -1510,13 +1510,17 @@ pub async fn interrupt_housekeeping(
 }
 
 /// Retention sweep for `interrupt_samples`. The 24h-halflife EMA in
-/// [`CostTable::refresh_lambda`] means rows >7d contribute ≈0, but the
-/// controller's 60s exposure flush writes ~N_hw_classes `kind=
-/// 'exposure'` rows/min with `event_uid=NULL` (unconstrained by M_047)
-/// — append-only ~5-10M rows/yr/cluster without this. Mirrors the
-/// `build_samples` age-sweep at `db/history.rs`; the `(cluster, at)`
-/// index from M_043 makes the range delete cheap. Lease-gated via the
-/// caller (one writer).
+/// [`CostTable::refresh_lambda`] means rows >7d contribute ≈0. The
+/// controller's exposure flush ships slot-keyed uids minted by the
+/// typed `EventUid` constructor (`node_informer.rs`'s
+/// `PendingExposure` mint), so M_047's partial unique index
+/// (`ON CONFLICT (event_uid) WHERE event_uid IS NOT NULL DO NOTHING`,
+/// `admin/mod.rs`) dedups same-slot re-flushes — volume scales with
+/// slot turnover, not flush cadence, and the rolling history still
+/// accretes; this sweep remains required for the long tail. Mirrors
+/// the `build_samples` age-sweep at `db/history.rs`; the
+/// `(cluster, at)` index from M_043 makes the range delete cheap.
+/// Lease-gated via the caller (one writer).
 pub(crate) async fn sweep_interrupt_samples(db: &SchedulerDb, cluster: &str) -> sqlx::Result<u64> {
     let r = sqlx::query(
         "DELETE FROM interrupt_samples \
