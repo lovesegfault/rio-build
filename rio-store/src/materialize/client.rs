@@ -224,7 +224,7 @@ pub enum WedgeKind {
         /// Unanswered (Charged) ledger entries at the gate.
         charged: usize,
     },
-    /// The ledger sits at [`RESUME_LEDGER_CAP`] — the mint authority
+    /// The ledger sits at `RESUME_LEDGER_CAP` — the mint authority
     /// refuses every fresh mint.
     AtCap {
         /// Unanswered (Charged) ledger entries at the gate.
@@ -240,8 +240,8 @@ pub enum WedgeKind {
 // r[impl store.materialize.pass-outcome]
 /// THE one sealed verdict of a completed poll pass (round-8 WO-S2-1:
 /// merged_bug_038 + merged_bug_008). Minted exactly once, inside
-/// `finish!`, by [`PassOutcome::seal`] — every pass-scoped observer
-/// (pacing, the futility latch, the wedge latch) consumes THIS value
+/// `finish!`, by the private `PassOutcome::seal` — every pass-scoped
+/// observer (pacing, futility latch, wedge latch) consumes THIS value
 /// through an exhaustive match, so an unobserved transition cannot
 /// compile. Partial projections of the pass (raw-listing bools,
 /// pre-collapsed evidence booleans) have no constructor into control
