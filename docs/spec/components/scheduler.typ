@@ -4516,22 +4516,26 @@ entirely: a `requirements` edit takes effect on the next rollout.
   `inputs_gen`.
 ]
 
-#r("sched.sla.ack-validate-then-commit")[
+#r("sched.sla.ack-validate-then-commit+1")[
   `AckSpawnedIntents` application MUST be validate-then-commit: every refusal
-  --- undecodable plane entry, length-skewed arming echo, closed cost gate ---
-  MUST be computed before the first state mutation, so an erring Ack implies
-  that NO plane landed; undecodable plane entries MUST be typed refusals
-  naming the plane and the offending entry, never silent drops.
+  --- undecodable plane entry, length-skewed arming echo --- MUST be computed
+  before the first state mutation, so an erring Ack implies that NO plane
+  landed; undecodable plane entries MUST be typed refusals naming the plane
+  and the offending entry, never silent drops.
 ]
 
 The commit half is infallible by signature (the validated plan carries only
 decoded cells, hashes, and rows --- no raw wire type crosses into it), so an
 error return after a sibling plane mutated is unrepresentable. Whole-request
-refusal is safe producer-side: the controller's commit-on-Ack buffer is
-retained on Ack-Err (#rref("ctrl.nodeclaim.evidence-ack-latch")) and buffered
-marks keep masking `cover_deficit` locally until acked, so refusing loses no
-protection --- the refusal is a loud skew signal where a drop was silent
-evidence destruction.
+refusal is safe producer-side for the surviving classes: the controller's
+commit-on-Ack buffer is retained on Ack-Err
+(#rref("ctrl.nodeclaim.evidence-ack-latch")) and buffered marks keep masking
+`cover_deficit` locally until acked, so refusing loses no protection --- the
+refusal is a loud skew signal where a drop was silent evidence destruction.
+The closed-cost-gate refusal class is retired: the gate existed solely to
+keep observed-type writes off the pre-reload table, and `carry_catalog`'s
+menu merge made that window lossless, so consume-once evidence is never
+refused for a sibling plane's apply-window anymore.
 
 #r("sched.sla.hw-class.anchor-slots")[
   The 32-slot ring buffer reserves one anchor slot per distinct `cpu_limit`,
@@ -4573,6 +4577,12 @@ evidence destruction.
   per-type AWS query and gates `smallest_fitting`'s capacity-reject; the
   returned price is the per-cell EMA, not a per-type field.
 ]
+
+The union-only law makes the lease-acquire reload lossless: `carry_catalog`
+merges the outgoing in-memory menus into the fresh PG load (per-`(cell,
+name)`, the newer `last_observed` winning wholesale), so an observation
+folded before the edge reload survives it --- the menu plane needs no
+apply-window gate.
 
 #r("sched.sla.forecast.one-layer")[
   `compute_spawn_intents` walks the Ready frontier AND a forecast frontier of

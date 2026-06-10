@@ -14,7 +14,7 @@ use crate::state::{BuildOptions, DrvHash, ExecutorId, PriorityClass};
 #[cfg(test)]
 use super::handle::DebugDerivationInfo;
 
-// r[impl sched.sla.ack-validate-then-commit]
+// r[impl sched.sla.ack-validate-then-commit+1]
 /// Why an `AckSpawnedIntents` payload was NOT applied
 /// (merged_bug_005 — ack means applied under leadership; bug_094 —
 /// validate-then-commit: every refusal is computed by
@@ -35,15 +35,6 @@ pub enum AckApplyError {
     /// controller wiped consume-once evidence the standby never
     /// applied.
     NotLeader,
-    /// The observed-instance-types plane arrived while the cost
-    /// table's lease-acquire edge-reload gate was still closed
-    /// (acquire→reload window): applying would land on the pre-reload
-    /// table and be clobbered. NOTHING was applied — the gate is
-    /// validated before the first mutation (merged_bug_008: pre-fix
-    /// the cell planes were applied first, so every gate-closed
-    /// redelivery re-applied them); the typed refusal makes the
-    /// controller retry the whole buffer until the gate opens.
-    CostGateClosed,
     /// A plane entry failed the strict shared-grammar decode
     /// (`rio_common::cell_wire`). The WHOLE request is refused before
     /// any mutation — pre-fix the entry was silently dropped while

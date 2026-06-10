@@ -918,17 +918,20 @@ impl DagActor {
     /// merged_bug_005 + bug_094: returns the apply outcome the drain
     /// relays to the gRPC layer — `Ok` only when EVERY plane landed,
     /// and `Err` only when NO plane landed (validate-then-commit).
-    /// Every refusal — undecodable plane entry, skewed arm echo,
-    /// closed cost gate — is computed by [`AckApplyPlan::validate`]
-    /// before the first state mutation; [`AckApplyPlan::commit`] is
-    /// infallible, so error-after-mutate is unrepresentable by
-    /// signature. The controller's commit-on-Ack buffer survives an
-    /// erring Ack and redelivers the WHOLE buffer — safe, because an
-    /// erring Ack applied nothing. Pre-fix the observed-types arm
-    /// erred `CostGateClosed` AFTER applying the cell planes, and
-    /// unparseable entries were silently dropped while the Ack
-    /// answered Ok — destroying the controller's consume-once
-    /// evidence ("the ONLY clear" is Ack-Ok).
+    /// Every refusal — undecodable plane entry, skewed arm echo — is
+    /// computed by [`AckApplyPlan::validate`] before the first state
+    /// mutation; [`AckApplyPlan::commit`] is infallible, so
+    /// error-after-mutate is unrepresentable by signature. The
+    /// controller's commit-on-Ack buffer survives an erring Ack and
+    /// redelivers the WHOLE buffer — safe, because an erring Ack
+    /// applied nothing. Pre-fix unparseable entries were silently
+    /// dropped while the Ack answered Ok — destroying the
+    /// controller's consume-once evidence ("the ONLY clear" is
+    /// Ack-Ok). merged_bug_046: the cost edge-reload gate is GONE
+    /// from this path — `carry_catalog` merges pre-reload menu
+    /// observations into the fresh load, so the clobber hazard the
+    /// gate refused evidence over no longer exists and a refusal
+    /// class died with it.
     ///
     /// merged_bug_008 — redelivery after a successful-but-unobserved
     /// Ack (routine: client timeout after server apply) is a no-op by
@@ -957,8 +960,6 @@ impl DagActor {
             observed_instance_types,
             bound_intents,
             binding_snapshot,
-            self.cost_was_leader
-                .load(std::sync::atomic::Ordering::Relaxed),
         )?;
         plan.commit(self);
         Ok(())
@@ -1099,17 +1100,16 @@ impl ArmDecode {
 }
 
 impl AckApplyPlan {
-    // r[impl sched.sla.ack-validate-then-commit]
+    // r[impl sched.sla.ack-validate-then-commit+1]
     /// Decode and refuse BEFORE any mutation exists. Planes validate
     /// in wire-field order (`spawned` arming = 1,
     /// `unfulfillable_cells` = 2, `registered_cells` = 3,
-    /// `observed_instance_types` = 4), then the cost gate; the first
-    /// failure refuses the WHOLE request. Whole-request refusal is
-    /// safe controller-side: the buffer is retained on Ack-Err and
-    /// buffered marks keep masking `cover_deficit` locally until
-    /// acked — the refusal is a loud, logged skew signal where the
-    /// pre-fix behavior was silent evidence destruction.
-    #[allow(clippy::too_many_arguments)]
+    /// `observed_instance_types` = 4); the first failure refuses the
+    /// WHOLE request. Whole-request refusal is safe controller-side:
+    /// the buffer is retained on Ack-Err and buffered marks keep
+    /// masking `cover_deficit` locally until acked — the refusal is a
+    /// loud, logged skew signal where the pre-fix behavior was silent
+    /// evidence destruction.
     pub(super) fn validate(
         spawned: &[rio_proto::types::SpawnIntent],
         unfulfillable_cells: &[String],
@@ -1117,7 +1117,6 @@ impl AckApplyPlan {
         observed_instance_types: &[rio_proto::types::ObservedInstanceType],
         bound_intents: &[rio_proto::types::BoundIntent],
         binding_snapshot: Option<&[rio_proto::types::BoundIntent]>,
-        cost_gate_open: bool,
     ) -> Result<Self, super::command::AckApplyError> {
         use super::command::{AckApplyError, AckPlane};
         // 124(d): record the spawn-ack witness for EVERY spawned
@@ -1187,13 +1186,6 @@ impl AckApplyPlan {
                 })
                 .collect()
         });
-        // The cost-table edge-reload gate, validated PRE-mutation
-        // (merged_bug_008's headline axis — pre-fix this refusal
-        // fired AFTER the cell planes were applied, so a gate-closed
-        // redelivery loop re-applied marks every ~10s tick).
-        if !observed.is_empty() && !cost_gate_open {
-            return Err(AckApplyError::CostGateClosed);
-        }
         Ok(Self {
             acked_spawned,
             binding,
@@ -1229,7 +1221,7 @@ impl AckApplyPlan {
             .collect()
     }
 
-    // r[impl sched.sla.ack-validate-then-commit]
+    // r[impl sched.sla.ack-validate-then-commit+1]
     /// Apply the validated plan. Infallible by signature — every
     /// refusal was computed in [`Self::validate`], so no arm here can
     /// err after a sibling plane mutated. The destructure names every
@@ -1311,15 +1303,19 @@ impl AckApplyPlan {
             actor.ice.apply_mark_event(&cell, epoch);
         }
         // Third writer to `cost_table` (after `fold_spot_poll`→price
-        // and `interrupt_housekeeping`→λ/node_count). The shared
-        // edge-reload latch was validated OPEN pre-mutation (the
-        // actor is single-threaded between validate and commit, so
-        // the gate cannot close in between); before
-        // `interrupt_housekeeping` has run the lease-acquire
-        // `*cost.write() = CostTable::load(...)`, writes here would
-        // land on the pre-reload table and be clobbered.
-        // `handle_leader_acquired` notifies `interrupt_housekeeping`
-        // so the gate is open within ~0s of lease win, not ≤600s.
+        // and `interrupt_housekeeping`→λ/node_count); field-disjoint —
+        // this arm writes only `cells`. Applies UNCONDITIONALLY
+        // (merged_bug_046): a write landing before the lease-acquire
+        // edge reload is preserved BY the reload — `carry_catalog`
+        // merges the outgoing menus into the fresh load (union-only
+        // monotone store, lossless reload law), so the gate that
+        // refused whole requests here protected against a clobber
+        // lane that no longer exists. Priced residual at the one
+        // surviving cross-task seam (bug_068): a leadership loss
+        // between this request's leader gate and this write leaves at
+        // most one observation batch on a table whose NEXT tenure's
+        // reload merges it forward — the batch survives (pre-merge,
+        // the same interleaving lost it).
         if !observed.is_empty() {
             actor.cost_table.write().observe_instance_types(observed);
         }

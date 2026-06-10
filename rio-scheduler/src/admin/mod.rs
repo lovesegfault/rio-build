@@ -736,8 +736,7 @@ impl AdminService for AdminServiceImpl {
     /// leader-gated apply, so "OK" here proves every evidence plane
     /// landed. bug_094 — and the apply is validate-then-commit, so
     /// every error here proves NO plane landed: a deposed drain
-    /// (`NotLeader`), the observed-types plane racing the cost-table
-    /// edge reload (`CostGateClosed`), or an undecodable plane entry
+    /// (`NotLeader`) or an undecodable plane entry
     /// (`PlaneEntryUndecodable` — pre-fix a silent drop) errs the RPC
     /// with nothing applied, and the controller's commit-on-Ack
     /// buffer is retained and redelivered whole. Pre-fix the handler
@@ -778,9 +777,6 @@ impl AdminService for AdminServiceImpl {
         applied.map_err(|e| match e {
             crate::actor::AckApplyError::NotLeader => Status::failed_precondition(
                 "not leader — evidence not applied; retry against the current leader",
-            ),
-            crate::actor::AckApplyError::CostGateClosed => Status::unavailable(
-                "cost table edge-reload pending — no evidence plane applied; retry",
             ),
             crate::actor::AckApplyError::PlaneEntryUndecodable { plane, entry } => {
                 Status::invalid_argument(format!(

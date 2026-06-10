@@ -7214,7 +7214,7 @@ rec {
     # measurements in the introducing commit).
     # ------------------------------------------------------------------
 
-    # r[verify sched.sla.ack-validate-then-commit]
+    # r[verify sched.sla.ack-validate-then-commit+1]
     # r[verify ctrl.nodeclaim.evidence-ack-latch+3]
     # r[verify ctrl.nodeclaim.ice-mark-clear+2]
     quint-ice-evidence-ack = mkQuintCheck {
@@ -7230,10 +7230,11 @@ rec {
     };
 
     # merged_bug_008 headline axis FALSIFY half (+ bug_094 ordering):
-    # the as-built apply-then-CostGateClosed order — planes mutate,
-    # then the refusal answers; the retained-buffer redelivery
-    # re-applies every tick.
-    # r[verify sched.sla.ack-validate-then-commit]
+    # the as-built apply-then-refuse order (historically the since-
+    # retired CostGateClosed class) — planes mutate, then the refusal
+    # answers; the retained-buffer redelivery re-applies every tick.
+    # The twin's teeth target the SURVIVING refusal classes.
+    # r[verify sched.sla.ack-validate-then-commit+1]
     quint-ice-falsify-apply-before-refuse = mkQuintSimWitnessCheck {
       name = "ice-falsify-apply-before-refuse";
       spec = "calibration/ice-apply-before-refuse";

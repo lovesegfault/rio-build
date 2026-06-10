@@ -323,8 +323,10 @@ pub const LEADER_EDGES: &[LeaderEdge] = &[
         name: "cost-table-edge-reload-latch",
         // Verbatim the pre-table acquire effect: nudge housekeeping so
         // the false→true store + reload happen within ~0s of the lease
-        // win, not ~600s (the controller's edge-detected instance-type
-        // observations during that window would be dropped).
+        // win, not ~600s (merged_bug_046: instance-type observations
+        // landing in that window are merged forward by `carry_catalog`
+        // — nothing is dropped or refused; the nudge keeps the reload
+        // and the post-reload persist prompt).
         on_acquire: |a| a.cost_reload_notify.notify_one(),
         // THE missing lose-edge writer (bug_310): without it, an
         // A→B→A flap within one housekeeping tick leaves

@@ -699,14 +699,24 @@ async fn ack_binding_snapshot_presence_semantics() {
     );
 }
 
-/// `observe_instance_types` is gated on the shared `cost_was_leader`
-/// latch (the `interrupt_housekeeping` edge-reload owner). Before the
-/// reload, writes to `cost_table` would be clobbered by `*cost.write()
-/// = CostTable::load(...)` — and the controller's `observe_registered`
-/// is edge-detected, so a clobbered observation isn't re-sent.
+/// merged_bug_046 red — REWRITES the retired cost-gate test. The OLD
+/// test here (`ack_observed_instance_types_gated_on_cost_was_leader`)
+/// certified "Err(CostGateClosed) ⇒ nothing landed": exactly the
+/// whole-request refusal mechanics that created the evidence blackout
+/// (one buffered observed type self-sustained a refusal of the
+/// binding and ICE planes for up to 600s per failed reload) — the
+/// availability claim the gate rode on was never witnessed. THIS test
+/// certifies the apply-safety claim itself: an observation applied in
+/// the PRE-RELOAD window (cost_was_leader=false) lands immediately —
+/// the sibling mark on the SAME request lands too — and SURVIVES the
+/// lease-acquire edge reload, because `carry_catalog` merges the
+/// outgoing menus into the fresh PG load (union-only monotone store ⇒
+/// lossless reload). Pre-fix red, verbatim:
+///   left:  `Err(CostGateClosed)` ∧ menu empty ∧ step None
+///   right: `Ok` ∧ menu len 1 ∧ step Some(0) ∧ entry survives reload
 // r[verify sched.sla.cost-instance-type-feedback]
 #[tokio::test]
-async fn ack_observed_instance_types_gated_on_cost_was_leader() {
+async fn ack_observed_lands_pre_reload_and_survives_the_edge_reload() {
     use rio_proto::types::ObservedInstanceType;
 
     let db = TestDb::new(&MIGRATOR).await;
@@ -722,48 +732,48 @@ async fn ack_observed_instance_types_gated_on_cost_was_leader() {
         mem_bytes: 64 << 30,
     }];
 
-    // Pre-reload (was_leader=false): the write must not land, and
-    // merged_bug_005 turned the silent drop into the typed refusal —
-    // the gRPC layer errs the Ack so the controller redelivers
-    // instead of wiping its consume-once buffer. merged_bug_008: the
-    // refusal is computed BEFORE any plane applies — a mark riding
-    // the same refused request must NOT land (pre-fix it did, so
-    // every ~10s gate-closed redelivery re-applied the cell planes).
+    // Pre-reload window: the edge-reload latch is false (the
+    // housekeeping prelude has not run for this tenure yet). One
+    // observed type and one mark ride the SAME request — pre-fix the
+    // observed plane closed the gate and the WHOLE request refused.
     actor
         .cost_was_leader
         .store(false, std::sync::atomic::Ordering::Relaxed);
+    actor
+        .handle_ack_spawned_intents(&[], &["mid-ebs-x86:spot".into()], &[], &observed, &[], None)
+        .expect("pre-reload Ack applies every plane (the gate is gone)");
     assert_eq!(
-        actor.handle_ack_spawned_intents(
-            &[],
-            &["mid-ebs-x86:spot".into()],
-            &[],
-            &observed,
-            &[],
-            None
-        ),
-        Err(crate::actor::AckApplyError::CostGateClosed),
-        "closed gate must be a typed refusal, not a silent drop"
-    );
-    assert!(
-        actor.cost_table.read().menu(&spot).is_empty(),
-        "observation must NOT land on pre-reload table"
+        actor.cost_table.read().menu(&spot).len(),
+        1,
+        "observation lands immediately on the pre-reload table"
     );
     assert_eq!(
         actor.ice.step(&spot),
-        None,
-        "err implies NO plane landed — the mark must not apply before \
-         the gate refusal (validate-then-commit)"
+        Some(0),
+        "the sibling mark is no longer refused for the observed plane's \
+         apply-window"
     );
 
-    // Post-reload (was_leader=true via interrupt_housekeeping's
-    // poller_tick_prelude Ok-arm): write applies — and the Ack is OK.
-    actor
-        .cost_was_leader
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-    actor
-        .handle_ack_spawned_intents(&[], &[], &[], &observed, &[], None)
-        .expect("open gate applies fully");
-    assert_eq!(actor.cost_table.read().menu(&spot).len(), 1);
+    // The lease-acquire edge reload against the SAME TestDb: the
+    // observation was never persisted (persist is a housekeeping-tick
+    // effect), so the fresh load does not contain it — the merge half
+    // of `carry_catalog` must carry it forward.
+    let sdb = crate::db::SchedulerDb::new(db.pool.clone());
+    let (cluster, source) = {
+        let g = actor.cost_table.read();
+        (g.cluster().to_owned(), g.source())
+    };
+    let fresh = crate::sla::cost::CostTable::load(&sdb, &cluster, source)
+        .await
+        .expect("fresh load");
+    actor.cost_table.write().carry_catalog(fresh);
+    let ct = actor.cost_table.read();
+    assert_eq!(
+        ct.menu(&spot).len(),
+        1,
+        "a pre-reload observation must SURVIVE the edge reload (merge law)"
+    );
+    assert_eq!(ct.menu(&spot)[0].name, "c7i.8xlarge");
 }
 
 /// bug_094 red: an undecodable entry in ANY plane refuses the WHOLE

@@ -12,8 +12,9 @@
 //
 // PIPELINE LAWS UNDER VERIFICATION (the slot's three keystones):
 //   - validate-then-commit: a REFUSED delivery applies NOTHING
-//     (sched.sla.ack-validate-then-commit; pre-fix the cell planes
-//     applied before the CostGateClosed refusal).
+//     (sched.sla.ack-validate-then-commit+1; pre-fix the cell planes
+//     applied before the refusal — historically the since-retired
+//     CostGateClosed class, merged_bug_046).
 //   - epoch gate: the scheduler applies a cell event iff its epoch is
 //     strictly greater than the cell's last-applied epoch — delivery
 //     of already-applied evidence (redelivery `==`, reorder `<`) is a
@@ -286,8 +287,9 @@ module iceEvidenceAck {
   /// duplicate.
   action deliverOkLost = deliverApply(true, false, true)
 
-  /// The whole-request refusal (deposed / closed cost gate /
-  /// undecodable entry — sched.sla.ack-validate-then-commit): NOTHING
+  /// The whole-request refusal (deposed / undecodable entry / skewed
+  /// arming echo — sched.sla.ack-validate-then-commit+1; the closed-
+  /// cost-gate cause is retired, merged_bug_046): NOTHING
   /// is applied; the controller's buffer survives to redeliver. The
   /// ghost write is the live law stated as state (inert non-identity
   /// per the P4 allowance; the apply-before-refuse twin is the

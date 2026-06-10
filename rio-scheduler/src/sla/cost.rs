@@ -381,12 +381,46 @@ impl CostTable {
 
     /// §13c-2/§13c-3: replace `self` with `fresh` while preserving the
     /// process-lifetime `catalog_ceilings` and `resolved_global` (not
-    /// in PG, not re-derived on lease-acquire). Used by
-    /// `poller_tick_prelude`'s edge-reload — `*cost.write() = fresh`
-    /// would otherwise wipe the boot-derived state.
+    /// in PG, not re-derived on lease-acquire) and MERGING the
+    /// outgoing in-memory menus into the fresh load (merged_bug_046).
+    /// Used by `poller_tick_prelude`'s edge-reload — `*cost.write() =
+    /// fresh` would otherwise wipe the boot-derived state and clobber
+    /// menu observations applied before the reload.
+    ///
+    /// The menu merge law: the menu store is union-only over monotone
+    /// facts (per-`(cell, name)` upsert, data-time `last_observed`, no
+    /// deletion lane — see [`Self::observe_instance_types`] and the
+    /// persist/load pair), so the lossless reload is a union — an
+    /// entry present on one side carries over; present on both, the
+    /// newer `last_observed` wins WHOLESALE (the whole
+    /// [`InstanceType`], not per field); each touched menu re-sorts by
+    /// `(cores, mem_bytes)` (the load/observe sort law). A write that
+    /// landed pre-reload is therefore preserved BY the reload — the
+    /// Ack-path cost gate this merge retires existed solely to refuse
+    /// evidence during the clobber window, and that window no longer
+    /// exists.
     pub fn carry_catalog(&mut self, mut fresh: Self) {
         fresh.catalog_ceilings = std::mem::take(&mut self.catalog_ceilings);
         fresh.resolved_global = self.resolved_global.take();
+        for (cell, mine) in std::mem::take(&mut self.cells) {
+            let menu = fresh.cells.entry(cell).or_default();
+            for it in mine {
+                match menu.iter_mut().find(|t| t.name == it.name) {
+                    // Both sides know the type: the newer observation
+                    // wins wholesale (data-time `last_observed`; ties
+                    // keep the PG side — same fact either way).
+                    Some(t) => {
+                        if it.last_observed > t.last_observed {
+                            *t = it;
+                        }
+                    }
+                    // Only the outgoing table knows it: a true cluster
+                    // fact observed in the pre-reload window — union.
+                    None => menu.push(it),
+                }
+            }
+            menu.sort_by_key(|t| (t.cores, t.mem_bytes));
+        }
         *self = fresh;
     }
 
@@ -1670,6 +1704,74 @@ mod tests {
     #[should_panic(expected = "read before")]
     fn resolved_global_panics_on_unset() {
         CostTable::default().resolved_global();
+    }
+
+    /// merged_bug_046 unit companion (the merge law cell-by-cell):
+    /// certifies that `carry_catalog` UNIONS the outgoing menus into
+    /// the fresh load — a both-sides entry keeps the WHOLE
+    /// `InstanceType` with the newer `last_observed`; one-sided
+    /// entries (either side) carry over; merged menus re-sort by
+    /// `(cores, mem_bytes)`. This is the lossless-reload property the
+    /// retired Ack cost gate existed to approximate by refusal.
+    #[test]
+    fn carry_catalog_merges_menus_newer_observation_wins() {
+        use std::time::{Duration, SystemTime};
+        let cell: Cell = ("h".into(), CapacityType::Spot);
+        let only_mine: Cell = ("h".into(), CapacityType::Od);
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let t1 = t0 + Duration::from_secs(60);
+        let it = |name: &str, cores: u32, mem: u64, at: SystemTime| InstanceType {
+            name: name.into(),
+            cores,
+            mem_bytes: mem,
+            price_per_vcpu_hr: 0.0,
+            last_observed: at,
+        };
+
+        // Outgoing (pre-reload) table: a newer observation of
+        // "shared" (with updated cores — wholesale-wins material), a
+        // menu entry the fresh load has never seen ("mine-only"), and
+        // a whole cell PG doesn't know about.
+        let mut mine = CostTable::seeded("c", HwCostSource::Spot);
+        mine.set_menu(
+            cell.clone(),
+            vec![
+                it("shared", 64, 256 << 30, t1),
+                it("mine-only", 8, 16 << 30, t0),
+            ],
+        );
+        mine.set_menu(only_mine.clone(), vec![it("solo", 4, 8 << 30, t0)]);
+
+        // Fresh PG load: an OLDER "shared" (stale cores) and an entry
+        // only PG knows about.
+        let mut fresh = CostTable::seeded("c", HwCostSource::Spot);
+        fresh.set_menu(
+            cell.clone(),
+            vec![
+                it("shared", 32, 128 << 30, t0),
+                it("pg-only", 16, 32 << 30, t0),
+            ],
+        );
+
+        mine.carry_catalog(fresh);
+
+        let m = mine.menu(&cell);
+        assert_eq!(
+            m.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            vec!["mine-only", "pg-only", "shared"],
+            "union of both sides, re-sorted by (cores, mem_bytes)"
+        );
+        let shared = m.iter().find(|t| t.name == "shared").unwrap();
+        assert_eq!(
+            (shared.cores, shared.mem_bytes, shared.last_observed),
+            (64, 256 << 30, t1),
+            "both-sides entry: the newer last_observed wins WHOLESALE"
+        );
+        assert_eq!(
+            mine.menu(&only_mine).len(),
+            1,
+            "a whole cell only the outgoing table knew carries over"
+        );
     }
 
     #[test]
