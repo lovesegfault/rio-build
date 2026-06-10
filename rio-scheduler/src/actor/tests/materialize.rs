@@ -7941,7 +7941,15 @@ async fn controller_verdict_never_consumes_materialization_attempt() -> TestResu
             reply: reply_tx,
         })
         .await?;
-    reply_rx.await?.expect("verdict acked");
+    // Row F3 of the merged_bug_080 attempt_resolved per-arm census
+    // (the table's home is pull.rs::report_ack_attempt_resolved_per_arm_census;
+    // this arm needs the store-claim harness): the materialization-kind
+    // refusal is charge-free — Unresolved on the wire bit.
+    assert_eq!(
+        reply_rx.await?.expect("verdict acked"),
+        crate::actor::pull::AttemptResolution::Unresolved,
+        "F3: a controller verdict on a materialization attempt acks Unresolved"
+    );
 
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM drv_attempts WHERE exec_id = $1")
         .bind(exec_id)

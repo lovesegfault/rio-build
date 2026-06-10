@@ -119,6 +119,32 @@ pub enum GoneLicense {
     Unfenced(#[allow(dead_code)] NonKeyedLane),
 }
 
+/// The typed resolution a `ReportAttemptOutcome` ack carries (the
+/// merged_bug_080 C-2 contract carrier): whether THIS report was
+/// applied to — or matched an already-recorded terminal classification
+/// of — an actual attempt, i.e. the scheduler holds a verdict for it.
+/// Both report-fold fns return `Result<AttemptResolution,
+/// PullRejection>`, so rustc exhaustiveness over their return sites IS
+/// the charge-free-arm census generator (R15): adding an arm without
+/// stating its resolution does not compile, and the admin layer
+/// consumes the witness into the wire `attempt_resolved` bit at its
+/// single response-construction site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptResolution {
+    /// An actual attempt was classified by this report, or the report
+    /// matched an attempt whose terminal classification is already
+    /// recorded (the idempotent-duplicate arm — the scheduler HOLDS a
+    /// verdict either way).
+    Resolved,
+    /// Charge-free ack: nothing was resolved (no matching attempt,
+    /// refused synthesized verdict, materialization-kind refusal,
+    /// unclassified-open-attempt ack, and EVERY NoEligibleSource arm —
+    /// the spawn-gate verdict rides its own poison lane, never an
+    /// attempt resolution; the controller's NoEligibleSource reset
+    /// rides its own mint, independent of this bit).
+    Unresolved,
+}
+
 /// Why a `PullAssignment` was refused without an outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PullRejection {
@@ -1573,7 +1599,7 @@ impl DagActor {
         reason: rio_proto::types::AttemptTerminalReason,
         node_name: Option<String>,
         resubmit_cycle: u32,
-        reply: oneshot::Sender<Result<(), PullRejection>>,
+        reply: oneshot::Sender<Result<AttemptResolution, PullRejection>>,
     ) {
         let result = self
             .report_attempt_outcome_inner(identity, reason, node_name, resubmit_cycle)
@@ -1587,7 +1613,7 @@ impl DagActor {
         reason: rio_proto::types::AttemptTerminalReason,
         node_name: Option<String>,
         resubmit_cycle: u32,
-    ) -> Result<(), PullRejection> {
+    ) -> Result<AttemptResolution, PullRejection> {
         if !self.leader.is_leader() {
             return Err(PullRejection::NotLeader);
         }
@@ -1629,7 +1655,7 @@ impl DagActor {
                 ?reason,
                 "synthesized verdict without exec_id refused (acked charge-free; synthesized closes are exec-pinned)"
             );
-            return Ok(());
+            return Ok(AttemptResolution::Unresolved);
         }
         // Whether the report named the execution directly — the AD2c
         // fill below is gated on it (R4: fill iff Build witness AND
@@ -1674,7 +1700,7 @@ impl DagActor {
                 ?reason,
                 "ReportAttemptOutcome with no matching attempt acknowledged charge-free"
             );
-            return Ok(());
+            return Ok(AttemptResolution::Unresolved);
         };
 
         // The kind witness FIRST (merged_bug_146): a controller verdict
@@ -1694,14 +1720,17 @@ impl DagActor {
                     "ReportAttemptOutcome for a materialization attempt acknowledged \
                      charge-free (controller verdicts never consume store attempts)"
                 );
-                return Ok(());
+                return Ok(AttemptResolution::Unresolved);
             }
             crate::db::open_attempts::AttemptRef::Build(b) => b,
         };
 
         if b.core.attempt_terminal {
-            // Duplicate / already established: idempotent no-op.
-            return Ok(());
+            // Duplicate / already established: idempotent no-op — but
+            // the attempt HAS a recorded terminal classification, so
+            // the scheduler holds a verdict (matched-already-recorded
+            // is Resolved per the C-2 iff).
+            return Ok(AttemptResolution::Resolved);
         }
 
         // AD2c: persist the controller-reported node onto the open
@@ -1780,7 +1809,11 @@ impl DagActor {
                         .await;
                 }
             }
-            return Ok(());
+            // attempt_recorded: a worker-reported classification row
+            // exists (this report filled — or another report already
+            // filled — the termination reason on it). The scheduler
+            // holds a verdict for the attempt either way: Resolved.
+            return Ok(AttemptResolution::Resolved);
         }
 
         // Open attempt with no classification row yet (pulled, never
@@ -1822,7 +1855,9 @@ impl DagActor {
                 "synthesized",
             )
             .await;
-            return Ok(());
+            // Charge-free in the BUDGET sense, but it closes an actual
+            // attempt: the scheduler now holds the verdict — Resolved.
+            return Ok(AttemptResolution::Resolved);
         }
         debug!(
             %exec_id,
@@ -1831,7 +1866,7 @@ impl DagActor {
             "ReportAttemptOutcome for an unclassified open attempt acknowledged (no fill \
              target; the establishment sweep remains its classifier)"
         );
-        Ok(())
+        Ok(AttemptResolution::Unresolved)
     }
 
     // r[impl sched.dispatch.fleet-exhaust+5]
@@ -1847,17 +1882,23 @@ impl DagActor {
     /// on — an already-poisoned (or in-flight, or terminal, or unknown)
     /// drv acknowledges and changes nothing, so controller re-ticks and
     /// duplicate reports are no-ops.
+    /// Resolution disposition (C-2 contract): every arm of this fn —
+    /// including the poison arm — answers `Unresolved`/false. There is
+    /// no pod and no attempt (the spawn-gate verdict maps to the
+    /// fleet-exhaust poison, never an attempt classification), and the
+    /// controller's NoEligibleSource reset lane rides its own mint,
+    /// independent of the `attempt_resolved` bit.
     async fn handle_no_eligible_source(
         &mut self,
         identity: &AttemptIdentity,
         resubmit_cycle: u32,
-    ) -> Result<(), PullRejection> {
+    ) -> Result<AttemptResolution, PullRejection> {
         let Some(intent) = identity.intent_id.as_deref().filter(|s| !s.is_empty()) else {
             debug!(
                 job_name = ?identity.job_name,
                 "NoEligibleSource report without an intent id acknowledged (nothing to act on)"
             );
-            return Ok(());
+            return Ok(AttemptResolution::Unresolved);
         };
         let drv_hash = DrvHash::from(intent);
         let status = self.dag.node(&drv_hash).map(|s| s.status());
@@ -1868,7 +1909,7 @@ impl DagActor {
                 "NoEligibleSource for a non-Ready derivation acknowledged (already resolved, \
                  in flight, or unknown)"
             );
-            return Ok(());
+            return Ok(AttemptResolution::Unresolved);
         }
         // 124(d) verdict guards — every miss acknowledges WITHOUT
         // poisoning (the controller re-evaluates next tick; a genuine
@@ -1883,7 +1924,7 @@ impl DagActor {
                     "NoEligibleSource for a derivation with no failed builders acknowledged \
                      (nothing is excluded — stale or raced verdict)"
                 );
-                return Ok(());
+                return Ok(AttemptResolution::Unresolved);
             }
             // (ii) Staleness: the echoed cycle must match the cycle the
             // verdict was computed against. A mismatch means the
@@ -1896,7 +1937,7 @@ impl DagActor {
                     current = state.retry.resubmit_cycles,
                     "NoEligibleSource with a stale resubmit-cycle echo acknowledged"
                 );
-                return Ok(());
+                return Ok(AttemptResolution::Unresolved);
             }
         }
         // (iii) Spawn race: the controller acked creating a Job for
@@ -1911,7 +1952,7 @@ impl DagActor {
                 "NoEligibleSource within the spawn-ack defer window acknowledged (verdict \
                  raced its own spawn)"
             );
-            return Ok(());
+            return Ok(AttemptResolution::Unresolved);
         }
         if let Some(state) = self.dag.node(&drv_hash) {
             warn!(
@@ -1946,6 +1987,9 @@ impl DagActor {
             marker,
         )
         .await;
-        Ok(())
+        // The poison is a derivation-level verdict, not an attempt
+        // resolution (the marker row carries exec_id=None) — the bit
+        // stays false on this arm too.
+        Ok(AttemptResolution::Unresolved)
     }
 }

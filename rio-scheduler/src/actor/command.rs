@@ -312,7 +312,13 @@ pub enum ActorCommand {
         /// stale echo means the derivation re-entered Ready since the
         /// verdict and the report is acknowledged without poisoning.
         resubmit_cycle: u32,
-        reply: oneshot::Sender<Result<(), super::pull::PullRejection>>,
+        /// The typed resolution witness (merged_bug_080 C-2): the
+        /// admin layer consumes it into the wire `attempt_resolved`
+        /// bit — adding the proto field alone would compile-break only
+        /// the response constructor, so THIS typed reply is what makes
+        /// the per-arm census compiler-forced at the fold's return
+        /// sites.
+        reply: oneshot::Sender<Result<super::pull::AttemptResolution, super::pull::PullRejection>>,
     },
 
     /// Controller acked it created Jobs for these intents → arm the

@@ -1329,7 +1329,7 @@ pub(crate) async fn report_attempt_terminal(
     exec_id: Option<Uuid>,
     reason: rio_proto::types::AttemptTerminalReason,
     node: Option<&str>,
-) -> Result<(), PullRejection> {
+) -> Result<crate::actor::pull::AttemptResolution, PullRejection> {
     handle
         .query_unchecked(|reply| ActorCommand::ReportAttemptOutcome {
             identity: crate::actor::pull::AttemptIdentity {

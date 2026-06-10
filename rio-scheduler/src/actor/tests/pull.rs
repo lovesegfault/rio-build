@@ -699,7 +699,7 @@ async fn report_attempt_outcome(
     intent_id: Option<&str>,
     exec_id: Option<uuid::Uuid>,
     reason: rio_proto::types::AttemptTerminalReason,
-) -> Result<(), PullRejection> {
+) -> Result<crate::actor::pull::AttemptResolution, PullRejection> {
     handle
         .query_unchecked(|reply| ActorCommand::ReportAttemptOutcome {
             identity: crate::actor::pull::AttemptIdentity {
@@ -1260,7 +1260,7 @@ async fn report_attempt_outcome_with_node(
     exec_id: uuid::Uuid,
     reason: rio_proto::types::AttemptTerminalReason,
     node: &str,
-) -> Result<(), PullRejection> {
+) -> Result<crate::actor::pull::AttemptResolution, PullRejection> {
     handle
         .query_unchecked(|reply| ActorCommand::ReportAttemptOutcome {
             identity: crate::actor::pull::AttemptIdentity {
@@ -1796,7 +1796,7 @@ async fn report_attempt_outcome_job(
     handle: &ActorHandle,
     job_name: &str,
     reason: rio_proto::types::AttemptTerminalReason,
-) -> Result<(), PullRejection> {
+) -> Result<crate::actor::pull::AttemptResolution, PullRejection> {
     handle
         .query_unchecked(|reply| ActorCommand::ReportAttemptOutcome {
             identity: crate::actor::pull::AttemptIdentity {
@@ -1821,7 +1821,7 @@ async fn report_attempt_outcome_both(
     job_name: &str,
     reason: rio_proto::types::AttemptTerminalReason,
     node_name: &str,
-) -> Result<(), PullRejection> {
+) -> Result<crate::actor::pull::AttemptResolution, PullRejection> {
     handle
         .query_unchecked(|reply| ActorCommand::ReportAttemptOutcome {
             identity: crate::actor::pull::AttemptIdentity {
@@ -2257,6 +2257,288 @@ async fn oom_floor_doubles_from_minted_intent() -> TestResult {
         "the OOM bump must double from the minted intent's mem, not no-op from \
          base 0 (pre-fix: last_intent=None → base=0 → next=0 → floor unchanged); \
          floor={floor}, minted_mem={minted_mem}"
+    );
+    Ok(())
+}
+
+// ── merged_bug_080 (C-2): the attempt_resolved per-arm census ───────
+
+/// The C-2 contract's producer-side witness (ws-3): drives EVERY arm
+/// of the committed GEN-SET census through the PRODUCTION report fold
+/// (`report_attempt_outcome_inner` + `handle_no_eligible_source`, via
+/// the actor command conduit — the same typed reply the admin layer
+/// consumes into the wire `attempt_resolved` bit) and asserts the
+/// resolution PER ARM. Census generator: rustc exhaustiveness over the
+/// `Result<AttemptResolution, PullRejection>` returns of BOTH fns — a
+/// new return site does not compile without stating its resolution;
+/// this table enumerates the live sites (13 = 10 Unresolved + 3
+/// Resolved at the round-6 wave base).
+///
+/// Witness strength: certifies the bit's truthfulness at its producer
+/// FOR EVERY ARM IN THE CENSUS — every charge-free/no-op arm answers
+/// `Unresolved`/false, every verdict-bearing arm answers
+/// `Resolved`/true (applied-now AND matched-already-recorded). Rows:
+///
+/// | row | arm (return site)                          | resolution |
+/// |-----|--------------------------------------------|------------|
+/// | F2  | no matching attempt                        | Unresolved |
+/// | F4  | unclassified open attempt, pod-terminal    | Unresolved |
+/// | T3  | synthesized close of an open attempt       | Resolved   |
+/// | F1  | synthesized verdict without exec_id        | Unresolved |
+/// | T2  | second-installment reason fill             | Resolved   |
+/// | T1  | duplicate on a terminal attempt            | Resolved   |
+/// | F5  | NoEligibleSource without an intent id      | Unresolved |
+/// | F7  | NES with no failed builders                | Unresolved |
+/// | F8  | NES with a stale resubmit-cycle echo       | Unresolved |
+/// | F10 | NES poison arm (fleet-exhaust verdict)     | Unresolved |
+/// | F6  | NES for a non-Ready derivation             | Unresolved |
+/// | F9  | NES within the spawn-ack defer window      | Unresolved |
+/// | F3  | materialization-kind refusal               | Unresolved |
+///
+/// Row F3 is asserted in its harness home —
+/// `materialize.rs::controller_verdict_never_consumes_materialization_attempt`
+/// (the arm requires a store-claim attempt; the assertion there is
+/// this table's thirteenth row). The wire mapping of the typed reply
+/// (`Resolved ⇒ attempt_resolved=true`, else false) is a single
+/// `matches!` at the admin response constructor, exercised by the
+/// admin handler path; proto3 absent-field skew reads false (bounded
+/// controller over-caution, never spend).
+#[tokio::test]
+async fn report_ack_attempt_resolved_per_arm_census() -> TestResult {
+    use crate::actor::pull::AttemptResolution as R;
+    use rio_proto::types::AttemptTerminalReason as Reason;
+    let (_db, handle, _task) = setup().await;
+
+    // F2 — no matching attempt (unknown intent).
+    assert_eq!(
+        report_attempt_outcome(&handle, Some("arm-none"), None, Reason::OomKilled).await,
+        Ok(R::Unresolved),
+        "F2: no-matching-attempt acks Unresolved"
+    );
+
+    // Open attempt for F4/T3.
+    let _ev = merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "arm-open",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    let a = expect_deliver(pull(&handle, "arm-open", Some("arm-open")).await);
+    let exec_open: uuid::Uuid = a.exec_id.parse()?;
+    // F4 — open, unclassified, non-synthesized reason: ack only.
+    assert_eq!(
+        report_attempt_outcome(&handle, None, Some(exec_open), Reason::OomKilled).await,
+        Ok(R::Unresolved),
+        "F4: unclassified-open-attempt ack is Unresolved (establishment \
+         sweep remains the classifier)"
+    );
+    // T3 — synthesized close of the open attempt: a verdict lands.
+    assert_eq!(
+        report_attempt_outcome(&handle, None, Some(exec_open), Reason::Cancelled).await,
+        Ok(R::Resolved),
+        "T3: synthesized close resolves the attempt (charge-free in the \
+         BUDGET sense only)"
+    );
+
+    // Recorded attempt for F1/T2/T1.
+    let _ev = merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "arm-fill",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    let a = expect_deliver(pull(&handle, "arm-fill", Some("arm-fill")).await);
+    let exec_fill: uuid::Uuid = a.exec_id.parse()?;
+    report(
+        &handle,
+        exec_fill,
+        Some("arm-fill"),
+        rio_proto::types::BuildResultStatus::TransientFailure,
+        None,
+    )
+    .await
+    .expect("worker report acked");
+    // F1 — synthesized verdict with no exec_id: refused charge-free.
+    assert_eq!(
+        report_attempt_outcome(&handle, Some("arm-fill"), None, Reason::Cancelled).await,
+        Ok(R::Unresolved),
+        "F1: exec-less synthesized verdict is refused Unresolved"
+    );
+    // T2 — second-installment fill on the worker-recorded row.
+    assert_eq!(
+        report_attempt_outcome(&handle, None, Some(exec_fill), Reason::OomKilled).await,
+        Ok(R::Resolved),
+        "T2: the reason fill resolves (the scheduler holds the verdict)"
+    );
+    // T1 — duplicate on the now-terminal attempt: matched-already-recorded.
+    assert_eq!(
+        report_attempt_outcome(&handle, None, Some(exec_fill), Reason::Error).await,
+        Ok(R::Resolved),
+        "T1: duplicate on a terminal attempt is Resolved (the verdict is held)"
+    );
+
+    // F5 — NoEligibleSource with no intent id (job name only).
+    let nes_job = handle
+        .query_unchecked(|reply| ActorCommand::ReportAttemptOutcome {
+            identity: crate::actor::pull::AttemptIdentity {
+                intent_id: None,
+                job_name: Some("rio-build-arm-zzz".into()),
+                exec_id: None,
+            },
+            reason: Reason::NoEligibleSource,
+            node_name: None,
+            resubmit_cycle: 0,
+            reply,
+        })
+        .await
+        .expect("actor alive");
+    assert_eq!(
+        nes_job,
+        Ok(R::Unresolved),
+        "F5: intent-less NES acks Unresolved"
+    );
+
+    // NES ladder drv: F7 → F8 → F10 → F6.
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), "arm-nes", PriorityClass::Scheduled).await?;
+    // F7 — no failed builders yet.
+    assert_eq!(
+        report_attempt_outcome(&handle, Some("arm-nes"), None, Reason::NoEligibleSource).await,
+        Ok(R::Unresolved),
+        "F7: NES with nothing excluded acks Unresolved"
+    );
+    // Establish a real failed builder (exclusion) through production flow.
+    handle
+        .send_unchecked(ActorCommand::AckSpawnedIntents {
+            reply: tokio::sync::oneshot::channel().0,
+            binding_snapshot: None,
+            spawned: vec![],
+            unfulfillable_cells: vec![],
+            registered_cells: vec![],
+            observed_instance_types: vec![],
+            bound_intents: vec![rio_proto::types::BoundIntent {
+                intent_id: "arm-nes".into(),
+                node_name: "node-7".into(),
+                deadline_secs: 0,
+            }],
+        })
+        .await?;
+    barrier(&handle).await;
+    let a = expect_deliver(pull(&handle, "arm-nes", Some("arm-nes")).await);
+    let exec_nes: uuid::Uuid = a.exec_id.parse()?;
+    report(
+        &handle,
+        exec_nes,
+        Some("arm-nes"),
+        rio_proto::types::BuildResultStatus::TransientFailure,
+        None,
+    )
+    .await
+    .expect("failure acked");
+    // F8 — stale resubmit-cycle echo.
+    let stale = handle
+        .query_unchecked(|reply| ActorCommand::ReportAttemptOutcome {
+            identity: crate::actor::pull::AttemptIdentity {
+                intent_id: Some("arm-nes".into()),
+                job_name: None,
+                exec_id: None,
+            },
+            reason: Reason::NoEligibleSource,
+            node_name: None,
+            resubmit_cycle: 7,
+            reply,
+        })
+        .await
+        .expect("actor alive");
+    assert_eq!(
+        stale,
+        Ok(R::Unresolved),
+        "F8: stale-cycle NES acks Unresolved"
+    );
+    // F10 — the genuine fleet-exhaust poison: a derivation-level
+    // verdict, NOT an attempt resolution (marker row has no exec).
+    assert_eq!(
+        report_attempt_outcome(&handle, Some("arm-nes"), None, Reason::NoEligibleSource).await,
+        Ok(R::Unresolved),
+        "F10: the poison arm is a derivation verdict — Unresolved on the \
+         attempt axis"
+    );
+    let info = expect_drv(&handle, "arm-nes").await;
+    assert_eq!(
+        info.status,
+        crate::state::DerivationStatus::Poisoned,
+        "F10 precondition check: the poison actually landed"
+    );
+    // F6 — NES for the now non-Ready (poisoned) derivation.
+    assert_eq!(
+        report_attempt_outcome(&handle, Some("arm-nes"), None, Reason::NoEligibleSource).await,
+        Ok(R::Unresolved),
+        "F6: non-Ready NES acks Unresolved"
+    );
+
+    // F9 — NES within the spawn-ack defer window (separate drv so the
+    // fresh ack cannot mask the F10 row above).
+    let _ev = merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "arm-nes2",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    handle
+        .send_unchecked(ActorCommand::AckSpawnedIntents {
+            reply: tokio::sync::oneshot::channel().0,
+            binding_snapshot: None,
+            spawned: vec![],
+            unfulfillable_cells: vec![],
+            registered_cells: vec![],
+            observed_instance_types: vec![],
+            bound_intents: vec![rio_proto::types::BoundIntent {
+                intent_id: "arm-nes2".into(),
+                node_name: "node-8".into(),
+                deadline_secs: 0,
+            }],
+        })
+        .await?;
+    barrier(&handle).await;
+    let a = expect_deliver(pull(&handle, "arm-nes2", Some("arm-nes2")).await);
+    let exec2: uuid::Uuid = a.exec_id.parse()?;
+    report(
+        &handle,
+        exec2,
+        Some("arm-nes2"),
+        rio_proto::types::BuildResultStatus::TransientFailure,
+        None,
+    )
+    .await
+    .expect("failure acked");
+    handle
+        .send_unchecked(ActorCommand::AckSpawnedIntents {
+            reply: tokio::sync::oneshot::channel().0,
+            spawned: vec![rio_proto::types::SpawnIntent {
+                intent_id: "arm-nes2".into(),
+                ..Default::default()
+            }],
+            unfulfillable_cells: vec![],
+            registered_cells: vec![],
+            observed_instance_types: vec![],
+            bound_intents: vec![],
+            binding_snapshot: None,
+        })
+        .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        report_attempt_outcome(&handle, Some("arm-nes2"), None, Reason::NoEligibleSource).await,
+        Ok(R::Unresolved),
+        "F9: NES inside the spawn-ack defer window acks Unresolved"
+    );
+    let info = expect_drv(&handle, "arm-nes2").await;
+    assert_eq!(
+        info.status,
+        crate::state::DerivationStatus::Ready,
+        "F9 precondition check: the verdict was deferred, not poisoned"
     );
     Ok(())
 }

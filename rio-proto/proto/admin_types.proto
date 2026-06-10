@@ -235,10 +235,22 @@ message ReportAttemptOutcomeRequest {
   uint64 resubmit_cycle = 6;
 }
 
-// Empty ack: the report is recorded (or was already recorded / matched
-// no attempt and was deliberately ignored). Always returned on success
-// so the controller never retries on semantics, only on transport.
-message ReportAttemptOutcomeResponse {}
+// Ack for ReportAttemptOutcome. Always returned on success so the
+// controller never retries on semantics, only on transport.
+message ReportAttemptOutcomeResponse {
+  // TRUE iff this report was applied to — or matched an
+  // already-recorded terminal classification of — an actual attempt:
+  // the scheduler holds a verdict for it. ALL charge-free ack arms
+  // (no matching attempt, exec-less synthesized verdict refusals,
+  // materialization-kind refusals, unclassified-open-attempt acks,
+  // and every NoEligibleSource arm — the spawn-gate verdict rides its
+  // own poison lane, never an attempt resolution) return false.
+  // Rolling-skew posture (proto3 default): a pre-field scheduler
+  // reads as false — the consumer direction is bounded over-caution
+  // (a controller treats "unresolved" as "keep its own evidence"),
+  // never spend.
+  bool attempt_resolved = 1;
+}
 
 message ListOpenAttemptsRequest {}
 
@@ -319,6 +331,15 @@ message ClosedAttempt {
   CloseCause cause = 3;
   // Seconds since the attempt reached its terminal status (PG clock).
   uint64 closed_age_secs = 4;
+  // Work class of the closed attempt's execution row — the
+  // merged_bug_146 cross-crate axis ClosedAttempt was missing
+  // (`OpenAttempt` carries it at field 9): consumers that tear down
+  // build-lifecycle Jobs filter on it instead of inferring kind from
+  // closed-ness. Rolling-skew posture: ATTEMPT_KIND_UNSPECIFIED (an
+  // older scheduler) MUST be read as BUILD — the wire default matches
+  // the as-built window's build-lane-only producer; the scheduler
+  // deploys before the controller.
+  rio.types.AttemptKind attempt_kind = 5;
 }
 
 message ClearPoisonRequest {

@@ -512,8 +512,20 @@ impl AdminService for AdminServiceImpl {
         })
         .await?;
         match result {
-            Ok(()) => Ok(Response::new(
-                rio_proto::types::ReportAttemptOutcomeResponse {},
+            // The single response-construction site (merged_bug_080
+            // C-2): consume the typed resolution witness into the wire
+            // bit. TRUE iff the report was applied to — or matched an
+            // already-recorded terminal classification of — an actual
+            // attempt; every charge-free ack arm answers false (the
+            // per-arm table test pins the full census at this wire
+            // shape).
+            Ok(resolution) => Ok(Response::new(
+                rio_proto::types::ReportAttemptOutcomeResponse {
+                    attempt_resolved: matches!(
+                        resolution,
+                        crate::actor::pull::AttemptResolution::Resolved
+                    ),
+                },
             )),
             Err(crate::actor::PullRejection::NotLeader)
             | Err(crate::actor::PullRejection::StaleGeneration) => {
@@ -1552,6 +1564,16 @@ pub(crate) fn closed_attempt_row_to_proto(
         exec_id: r.exec_id.to_string(),
         cause: cause as i32,
         closed_age_secs: r.closed_age_secs.max(0.0) as u64,
+        // Build BY CONSTRUCTION at this mapping site (merged_bug_080):
+        // the recently-closed SELECT's EXISTS filter admits build-kind
+        // rows only (db/open_attempts.rs — the window query joins
+        // through drv_executions.attempt_kind = 'build'; the db test
+        // `recently_closed_window_is_build_lane_only` pins that law),
+        // so the row cannot carry another kind. If the window query
+        // ever widens, this site — not the wire default — is where the
+        // real kind must be threaded (lifting the row-level exclusion
+        // is the recorded fallback).
+        attempt_kind: rio_proto::types::AttemptKind::Build as i32,
     }
 }
 
