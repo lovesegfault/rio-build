@@ -36,7 +36,7 @@
 // this module with a defect const flipped, no action overrides):
 //   - SHARED_HEAD_CONVOY: the as-built pre-fix world — no owner law;
 //     every member "owns" (and is served) the same head. Falsifies
-//     ownerMapPartitionsClaimable + ownSliceListingsPartitionClaimable
+//     ownerMapPartitionsClaimable + serveSliceDisjointWhenFresh
 //     (coverage holds, disjointness dies — the live convoy: 95.6% of
 //     claim attempts wasted, 29.1 s fleet-wide stall).
 //   - STEAL_ENABLED = false: partition without the steal horizon — a
@@ -46,7 +46,20 @@
 //     unconditional-remainder design CF-3 rejected) — every caller is
 //     served the whole remainder regardless of owner freshness.
 //     Falsifies stealOnlyAfterOwnerStaleness (the prematureSteal
-//     ghost latches at beat-list).
+//     ghost latches at beat-list) AND serveSliceDisjointWhenFresh —
+//     the ISOLATED disjointness kill (ownersOf is untouched by the
+//     eager lane, so ownership stays exactly-one while the serve
+//     plane overlaps).
+//   - OWNER_SERVE_SKEW (merged from bug_087's re-aim): the SERVE
+//     side consults a skewed owner view (inverted score) — the model
+//     analog of the CF-2 listing-arm/owner-map divergence
+//     (rendezvous-hash vs sanitize-salt disagreement). Falsifies
+//     serveSliceCoversFreshOwned (the map owner's beat does not
+//     serve its fresh-owned job) while ownerMapPartitionsClaimable
+//     AND serveSliceDisjointWhenFresh hold (the skewed view is
+//     equally injective) — the world where owning and serving
+//     disagree, the exact production failure the coverage law
+//     exists to forbid.
 //
 // EXACTLY-ONE-LISTING IS A NON-PROPERTY (RULED FS-3): the retired
 // everyClaimableListedToExactlyOneLiveReplicaPerBeat was falsified by
@@ -78,6 +91,10 @@ module materializationDistribution {
   const STEAL_ENABLED: bool
   /// Defect lane: the no-horizon greedy steal.
   const EAGER_STEAL: bool
+  /// Defect lane: the serve plane consults a SKEWED owner view
+  /// (inverted score) — owning and serving disagree (the CF-2
+  /// divergence class).
+  const OWNER_SERVE_SKEW: bool
 
   /// Per-worker composite members (CF-2): {replica}w{worker}.
   val MEMBERS = Set("r0w0", "r0w1", "r1w0", "r1w1")
@@ -135,19 +152,41 @@ module materializationDistribution {
     if (convoy) ms
     else ms.filter(m => ms.forall(o => (o == m) or (prio(j, m) > prio(j, o))))
 
+  /// The SERVE-side score: identical to `prio` in the live law; the
+  /// OWNER_SERVE_SKEW lane inverts it (still injective per job — the
+  /// scores stay distinct), so the serving arms and the owner map
+  /// pick DIFFERENT members whenever the view has two or more.
+  pure def servePrio(skew: bool, j: str, m: str): int =
+    if (skew) 30 - prio(j, m) else prio(j, m)
+
+  /// The owner view the SERVE PLANE consults (the bug_087 re-aim
+  /// seam): in the live law this is exactly `ownersOf`; under
+  /// OWNER_SERVE_SKEW the serve plane disagrees with the map — the
+  /// representable defect the coverage leaf exists to kill.
+  pure def serveOwnersOf(convoy: bool, skew: bool, j: str, ms: Set[str]): Set[str] =
+    if (convoy) ms
+    else ms.filter(m => ms.forall(o => (o == m) or (servePrio(skew, j, m) > servePrio(skew, j, o))))
+
   /// One caller's serve set (beat-list AND the claim-discovery
   /// abstraction): own slice UNION the steal horizon — owner-slice
   /// and steal derived from the SAME ownersOf source at the same
   /// site (CF-3). Solo membership and the convoy lane serve the
-  /// whole head (the unpartitioned fallbacks).
+  /// whole head (the unpartitioned fallbacks). The OWN arm consults
+  /// the SERVE-side owner view (`serveOwnersOf` — identical to the
+  /// map in the live law; the OWNER_SERVE_SKEW lane diverges exactly
+  /// here, the CF-2 listing-arm seam); the STALENESS gate stays on
+  /// the real owner map (freshness of the member the partition law
+  /// names — the steal contract is about the MAP owner missing its
+  /// beat).
   pure def serveSetFor(
-    convoy: bool, stealOn: bool, eager: bool, horizon: int,
+    convoy: bool, stealOn: bool, eager: bool, skew: bool, horizon: int,
     me: str, ms: Set[str], ll: str -> int, t: int, cl: Set[str]
   ): Set[str] =
     if (ms.size() <= 1) cl
     else cl.filter(j =>
       val owners = ownersOf(convoy, j, ms)
-      if (owners.contains(me)) true
+      val serveOwners = serveOwnersOf(convoy, skew, j, ms)
+      if (serveOwners.contains(me)) true
       else if (eager) true
       else if (stealOn) owners.forall(o => not(freshAt(ll, t, horizon, o)))
       else false)
@@ -173,7 +212,7 @@ module materializationDistribution {
     val ll1 = lastListed.set(m, now)
     val ms = membersAt(ll1, now, MEMBER_TTL)
     val served = serveSetFor(
-      SHARED_HEAD_CONVOY, STEAL_ENABLED, EAGER_STEAL, STEAL_HORIZON,
+      SHARED_HEAD_CONVOY, STEAL_ENABLED, EAGER_STEAL, OWNER_SERVE_SKEW, STEAL_HORIZON,
       m, ms, ll1, now, JOBS.exclude(claimed))
     val stolen = served.filter(j => not(ownersOf(SHARED_HEAD_CONVOY, j, ms).contains(m)))
     all {
@@ -193,7 +232,7 @@ module materializationDistribution {
     not(claimed.contains(j)),
     val ms = membersAt(lastListed, now, MEMBER_TTL)
     serveSetFor(
-      SHARED_HEAD_CONVOY, STEAL_ENABLED, EAGER_STEAL, STEAL_HORIZON,
+      SHARED_HEAD_CONVOY, STEAL_ENABLED, EAGER_STEAL, OWNER_SERVE_SKEW, STEAL_HORIZON,
       m, ms, lastListed, now, JOBS.exclude(claimed)).contains(j),
     claimed' = claimed.union(Set(j)),
     now' = now, live' = live, lastListed' = lastListed,
@@ -264,22 +303,53 @@ module materializationDistribution {
       JOBS.exclude(claimed).forall(j =>
         ownersOf(SHARED_HEAD_CONVOY, j, ms).size() == 1)
 
-  /// The OWN-SLICE segments of the fresh members' listings are
-  /// pairwise disjoint, and a claimable job with a FRESH owner is in
-  /// that owner's own segment (coverage of the served head). Under
-  /// the convoy lane coverage holds and disjointness dies — the
-  /// recorded live shape.
-  val ownSliceListingsPartitionClaimable =
+  /// LEAF 1 of the listing law, restated over the LAW FUNCTION
+  /// (bug_087 re-aim — the retired ownSliceListingsPartitionClaimable
+  /// re-derived ownersOf in its own definition, so its coverage
+  /// conjunct was definitionally true and its disjointness conjunct
+  /// was the sibling's negation; it never consulted serveSetFor):
+  /// for distinct members of the scheduler's view, the serve sets
+  /// restricted to FRESH-owned claimable jobs are pairwise disjoint —
+  /// a fresh-owned job is served ONLY by its owner (the steal lane is
+  /// staleness-gated, so this constrains serveSetFor's arm
+  /// structure). Dies under convoy (alongside ownership — the
+  /// as-built world) and under eager (the ISOLATED kill: ownersOf
+  /// untouched, ownership intact in the same lane).
+  val serveSliceDisjointWhenFresh =
     val ms = membersAt(lastListed, now, MEMBER_TTL)
-    val ownSeg = ms.mapBy(m =>
-      JOBS.exclude(claimed).filter(j => ownersOf(SHARED_HEAD_CONVOY, j, ms).contains(m)))
-    and {
-      ms.forall(m1 => ms.forall(m2 =>
-        (m1 == m2) or ownSeg.get(m1).intersect(ownSeg.get(m2)).size() == 0)),
-      JOBS.exclude(claimed).forall(j =>
-        ownersOf(SHARED_HEAD_CONVOY, j, ms).forall(o =>
-          freshAt(lastListed, now, STEAL_HORIZON, o) implies ownSeg.get(o).contains(j))),
-    }
+    val cl = JOBS.exclude(claimed)
+    val freshOwned = cl.filter(j =>
+      ownersOf(SHARED_HEAD_CONVOY, j, ms).forall(o =>
+        freshAt(lastListed, now, STEAL_HORIZON, o)))
+    ms.forall(m1 => ms.forall(m2 =>
+      (m1 == m2) or
+      serveSetFor(
+        SHARED_HEAD_CONVOY, STEAL_ENABLED, EAGER_STEAL, OWNER_SERVE_SKEW, STEAL_HORIZON,
+        m1, ms, lastListed, now, cl)
+        .intersect(serveSetFor(
+          SHARED_HEAD_CONVOY, STEAL_ENABLED, EAGER_STEAL, OWNER_SERVE_SKEW, STEAL_HORIZON,
+          m2, ms, lastListed, now, cl))
+        .intersect(freshOwned)
+        .size() == 0))
+
+  /// LEAF 2: coverage THROUGH the law function — every claimable job
+  /// with a FRESH owner is in that owner's OWN serve output. Not a
+  /// re-derivation of ownersOf: the proposition is that the thing
+  /// the Rust listing arm mirrors (serveSetFor) actually DELIVERS
+  /// the fresh-owned job to its owner. Falsifiable for the first
+  /// time: dies under OWNER_SERVE_SKEW (the map owner's beat does
+  /// not serve its fresh-owned job) while ownership AND disjointness
+  /// hold in the same lane — the world where owning and serving
+  /// disagree.
+  val serveSliceCoversFreshOwned =
+    val ms = membersAt(lastListed, now, MEMBER_TTL)
+    val cl = JOBS.exclude(claimed)
+    cl.forall(j =>
+      ownersOf(SHARED_HEAD_CONVOY, j, ms).forall(o =>
+        freshAt(lastListed, now, STEAL_HORIZON, o) implies
+          serveSetFor(
+            SHARED_HEAD_CONVOY, STEAL_ENABLED, EAGER_STEAL, OWNER_SERVE_SKEW, STEAL_HORIZON,
+            o, ms, lastListed, now, cl).contains(j)))
 
   /// Bounded duplication: a job is served to a NON-owner only when
   /// its owner has missed its beat (the prematureSteal ghost stays
@@ -299,7 +369,7 @@ module materializationDistribution {
         ms.exists(m => and {
           live.get(m),
           serveSetFor(
-            SHARED_HEAD_CONVOY, STEAL_ENABLED, EAGER_STEAL, STEAL_HORIZON,
+            SHARED_HEAD_CONVOY, STEAL_ENABLED, EAGER_STEAL, OWNER_SERVE_SKEW, STEAL_HORIZON,
             m, ms, lastListed, now, JOBS.exclude(claimed)).contains(j),
         })
         or
@@ -318,7 +388,7 @@ module materializationDistribution {
         implies
         ms.forall(m =>
           serveSetFor(
-            SHARED_HEAD_CONVOY, STEAL_ENABLED, EAGER_STEAL, STEAL_HORIZON,
+            SHARED_HEAD_CONVOY, STEAL_ENABLED, EAGER_STEAL, OWNER_SERVE_SKEW, STEAL_HORIZON,
             m, ms, lastListed, now, JOBS.exclude(claimed)).contains(j)))
 }
 
@@ -332,6 +402,7 @@ module materializationDistributionBase {
     MEMBER_TTL = 3,
     SHARED_HEAD_CONVOY = false,
     STEAL_ENABLED = true,
-    EAGER_STEAL = false
+    EAGER_STEAL = false,
+    OWNER_SERVE_SKEW = false
   ).*
 }

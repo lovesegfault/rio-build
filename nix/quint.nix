@@ -7293,23 +7293,36 @@ rec {
 
     # ------------------------------------------------------------------
     # Materialization listing distribution (bughunt-5 slot 6b,
-    # live_041; SIGNED Q4 full rendezvous, RULED CF-1/CF-2/CF-3):
-    # rendezvous-partitioned leader listings across the per-WORKER
-    # store membership (contact-map view, never process liveness) +
-    # the server-computed steal horizon for stale-owner jobs
+    # live_041; SIGNED Q4 full rendezvous, RULED CF-1/CF-2/CF-3;
+    # round-6 WO-S8-4 re-aim, bug_087): rendezvous-partitioned leader
+    # listings across the per-WORKER store membership (contact-map
+    # view, never process liveness) + the server-computed steal
+    # horizon for stale-owner jobs
     # (docs/spec/models/materializationDistribution.qnt). The holds
     # check is EXHAUSTIVE (tlc; 4 members x 3 jobs x 7 beats). The
-    # FS-3-reconciled hold set: ownership exactly-one, own-segment
-    # disjointness/coverage, staleness-bounded steal, the bounded
-    # silence horizon, and broad orphan recovery —
+    # listing law is stated as two NAMED leaves over serveSetFor (the
+    # model's law function — the thing the Rust listing arm mirrors):
+    # serveSliceDisjointWhenFresh (a fresh-owned job is served ONLY by
+    # its owner) and serveSliceCoversFreshOwned (the owner's own beat
+    # DELIVERS its fresh-owned job). The retired
+    # ownSliceListingsPartitionClaimable re-derived ownersOf inside
+    # its own definition: its coverage conjunct was definitionally
+    # true (exhaustive-tlc vacuity transcript in the introducing
+    # commit) and its disjointness conjunct was the sibling
+    # invariant's negation — the bundled val rode its
+    # sibling-killing conjunct to twin credit (quint-policy P7 now
+    # bans the anonymous-multi-conjunct shape). FS-3 stands:
     # exactly-one-LISTING is deliberately NOT a property (the steal
     # horizon legitimately double-lists after staleness). Twins are
     # const-lane imports of the live module (no action overrides):
-    # the as-built shared-head convoy, the no-steal orphan, and the
-    # no-horizon eager steal (the third completes quint-policy P1's
-    # twin-per-leaf for the staleness bound). maxSamples sized 25/p
-    # from measured traces-to-first-hit (~600-2000 across the five
-    # witnesses; measurements in the introducing commit).
+    # the as-built shared-head convoy, the no-steal orphan, the
+    # no-horizon eager steal, and the owner/serve skew (the CF-2
+    # divergence class — serving and owning disagree). Each leaf's
+    # twin dies through ITS conjunct: the kill-isolation holds
+    # checks (eager-ownership-intact, skew-siblings-intact) prove
+    # the sibling invariants SURVIVE the same lane. maxSamples sized
+    # 25/p from measured traces-to-first-hit (~500-700 across the
+    # seven witnesses; measurements in the introducing commits).
     # ------------------------------------------------------------------
 
     # r[verify sched.materialize.listing-distribution]
@@ -7319,7 +7332,8 @@ rec {
       main = "materializationDistributionBase";
       invariants = [
         "ownerMapPartitionsClaimable"
-        "ownSliceListingsPartitionClaimable"
+        "serveSliceDisjointWhenFresh"
+        "serveSliceCoversFreshOwned"
         "stealOnlyAfterOwnerStaleness"
         "noJobUnlistedForever"
         "stealRecoversOrphanedRemainder"
@@ -7340,15 +7354,21 @@ rec {
       maxSteps = 12;
     };
 
-    # Same convoy lane, the listing projection: every member's own
-    # segment is the whole head.
+    # Same convoy lane, the serve-plane projection (re-aimed, bug_087:
+    # the old witness was the bundled ownSliceListingsPartition-
+    # Claimable, whose only killable conjunct was the sibling's law):
+    # every member SERVES the whole head, so the serve sets overlap on
+    # fresh-owned jobs. Honest narration: this kill runs ALONGSIDE the
+    # ownership kill (the convoy lane is the as-built world, not the
+    # isolation proof — the eager-overlap twin below is the ISOLATED
+    # disjointness kill).
     # r[verify sched.materialize.listing-distribution]
     quint-matdist-falsify-convoy-listings = mkQuintSimWitnessCheck {
       name = "matdist-falsify-convoy-listings";
       spec = "calibration/matdist-shared-head-convoy";
       main = "matDistCalibSharedHeadConvoy";
       extraSpecs = [ "materializationDistribution" ];
-      witness = "ownSliceListingsPartitionClaimable";
+      witness = "serveSliceDisjointWhenFresh";
       maxSamples = 200000;
       maxSteps = 12;
     };
@@ -7392,6 +7412,68 @@ rec {
       witness = "stealOnlyAfterOwnerStaleness";
       maxSamples = 200000;
       maxSteps = 12;
+    };
+
+    # The ISOLATED disjointness kill (bug_087 re-aim): the eager lane
+    # never touches ownersOf, so the serve-plane overlap dies through
+    # serveSliceDisjointWhenFresh while ownership stays exactly-one in
+    # the SAME lane (the -eager-ownership-intact holds check below is
+    # the kill-isolation witness).
+    # r[verify sched.materialize.listing-distribution]
+    quint-matdist-falsify-eager-overlap = mkQuintSimWitnessCheck {
+      name = "matdist-falsify-eager-overlap";
+      spec = "calibration/matdist-eager-steal";
+      main = "matDistCalibEagerSteal";
+      extraSpecs = [ "materializationDistribution" ];
+      witness = "serveSliceDisjointWhenFresh";
+      maxSamples = 200000;
+      maxSteps = 12;
+    };
+
+    # The coverage kill (bug_087 re-aim — the law is falsifiable for
+    # the first time): under OWNER_SERVE_SKEW the serve plane consults
+    # an inverted score, so the MAP owner's own beat does not serve
+    # its fresh-owned job — the world where owning and serving
+    # disagree (the CF-2 divergence class), the exact production
+    # failure the coverage law forbids. Ownership AND disjointness
+    # hold in this same lane (-skew-siblings-intact below).
+    # r[verify sched.materialize.listing-distribution]
+    quint-matdist-falsify-skew-coverage = mkQuintSimWitnessCheck {
+      name = "matdist-falsify-skew-coverage";
+      spec = "calibration/matdist-owner-serve-skew";
+      main = "matDistCalibOwnerServeSkew";
+      extraSpecs = [ "materializationDistribution" ];
+      witness = "serveSliceCoversFreshOwned";
+      maxSamples = 200000;
+      maxSteps = 12;
+    };
+
+    # Kill-isolation holds (R16): the eager-overlap twin's kill went
+    # through the disjointness leaf — ownership SURVIVES the eager
+    # lane (exhaustive; solo-timed ~11 s, constructor-default budget).
+    # r[verify sched.materialize.listing-distribution]
+    quint-matdist-eager-ownership-intact = mkQuintCheck {
+      name = "matdist-eager-ownership-intact";
+      spec = "calibration/matdist-eager-steal";
+      main = "matDistCalibEagerSteal";
+      extraSpecs = [ "materializationDistribution" ];
+      invariants = [ "ownerMapPartitionsClaimable" ];
+    };
+
+    # Kill-isolation holds (R16): the skew-coverage twin's kill went
+    # through the coverage leaf — ownership and serve-plane
+    # disjointness BOTH survive the skew lane (exhaustive; solo-timed
+    # ~15 s, constructor-default budget).
+    # r[verify sched.materialize.listing-distribution]
+    quint-matdist-skew-siblings-intact = mkQuintCheck {
+      name = "matdist-skew-siblings-intact";
+      spec = "calibration/matdist-owner-serve-skew";
+      main = "matDistCalibOwnerServeSkew";
+      extraSpecs = [ "materializationDistribution" ];
+      invariants = [
+        "ownerMapPartitionsClaimable"
+        "serveSliceDisjointWhenFresh"
+      ];
     };
 
     # ------------------------------------------------------------------

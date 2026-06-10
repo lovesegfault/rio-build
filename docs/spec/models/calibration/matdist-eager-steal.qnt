@@ -10,7 +10,11 @@
 // PREDICTED: stealOnlyAfterOwnerStaleness falsifies — the
 // prematureSteal ghost latches the first time a beat-list serves a
 // non-own job whose owner is FRESH (two fresh members + one
-// claimable job suffice).
+// claimable job suffice). serveSliceDisjointWhenFresh ALSO falsifies
+// here, and this is the ISOLATED disjointness kill: EAGER_STEAL
+// never touches ownersOf, so ownerMapPartitionsClaimable stays green
+// in this very lane (the quint-matdist-eager-ownership-intact holds
+// check is the kill-isolation witness).
 //
 // (P1 twin-per-leaf: the book's two named twins cover the other four
 // holds; this third twin completes the falsify pairing for the
@@ -27,6 +31,7 @@ module matDistCalibEagerSteal {
     MEMBER_TTL = 3,
     SHARED_HEAD_CONVOY = false,
     STEAL_ENABLED = true,
-    EAGER_STEAL = true
+    EAGER_STEAL = true,
+    OWNER_SERVE_SKEW = false
   ).* from "../materializationDistribution"
 }

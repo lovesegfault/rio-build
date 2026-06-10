@@ -9,8 +9,12 @@
 //
 // PREDICTED: ownerMapPartitionsClaimable falsifies (two members in
 // the scheduler's view + one claimable job ⇒ |owners| = 2 ≠ 1) and
-// ownSliceListingsPartitionClaimable falsifies (every member's own
-// segment is the whole head — coverage holds, disjointness dies).
+// serveSliceDisjointWhenFresh falsifies (every member SERVES the
+// whole head — the serve plane overlaps on fresh-owned jobs; this
+// kill runs ALONGSIDE the ownership kill: the convoy lane is the
+// as-built world, not the isolation proof — the eager lane's twin is
+// the isolated disjointness kill). serveSliceCoversFreshOwned HOLDS
+// here (everyone serves everything, so owners are served too).
 // This is the recorded live shape: N replicas race the head job, one
 // wins, N−1 burn their pass (95.6% of claim attempts wasted; 29.1 s
 // fleet-wide zero-throughput stall; KEDA scale-out adds racers).
@@ -20,7 +24,7 @@
 //     --invariant=ownerMapPartitionsClaimable \
 //     docs/spec/models/calibration/matdist-shared-head-convoy.qnt
 //   quint run --backend=rust --main=matDistCalibSharedHeadConvoy \
-//     --invariant=ownSliceListingsPartitionClaimable \
+//     --invariant=serveSliceDisjointWhenFresh \
 //     docs/spec/models/calibration/matdist-shared-head-convoy.qnt
 module matDistCalibSharedHeadConvoy {
   import materializationDistribution(
@@ -29,6 +33,7 @@ module matDistCalibSharedHeadConvoy {
     MEMBER_TTL = 3,
     SHARED_HEAD_CONVOY = true,
     STEAL_ENABLED = true,
-    EAGER_STEAL = false
+    EAGER_STEAL = false,
+    OWNER_SERVE_SKEW = false
   ).* from "../materializationDistribution"
 }

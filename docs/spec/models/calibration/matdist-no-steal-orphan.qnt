@@ -28,6 +28,7 @@ module matDistCalibNoStealOrphan {
     MEMBER_TTL = 3,
     SHARED_HEAD_CONVOY = false,
     STEAL_ENABLED = false,
-    EAGER_STEAL = false
+    EAGER_STEAL = false,
+    OWNER_SERVE_SKEW = false
   ).* from "../materializationDistribution"
 }
