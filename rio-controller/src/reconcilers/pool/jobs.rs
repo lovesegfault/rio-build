@@ -1193,6 +1193,23 @@ fn intent_suffix(intent_id: &str) -> String {
 ///     the pod's `job-tracking` finalizer is still live (same
 ///     reasoning as `reap_excess_pending`).
 ///
+/// live_051(e): per-Job-uid stale-classification strikes — the
+/// two-tick confirmation on the attempt-affecting reap arms
+/// (`terminal`/`selector-drift`). The first tick a Job classifies
+/// into one of those arms records a strike and DEFERS; the second
+/// CONSECUTIVE tick reaps — any pull in flight at strike one
+/// surfaces in strike two's view (refetched per tick) and vetoes at
+/// the chokepoint. Keyed by (pool, uid) — the uid, never the
+/// reusable name (the bug_089 lesson at the OA1 sample) — and
+/// retained per tick only for uids struck THIS tick, so a Job that
+/// stops classifying (or is deleted by any path) resets/expires its
+/// entry: consecutive means consecutive. Process-local like the
+/// reconcile loop that feeds it; a controller restart counts afresh
+/// (conservative — one extra tick of deferral). The orphan-pending
+/// arm is OUT of scope: already age-gated by `REAP_PENDING_GRACE`.
+static STALE_STRIKES: std::sync::LazyLock<parking_lot::Mutex<HashMap<(String, String), u8>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
 /// A Pending Job whose selector MATCHES the current intent is NOT
 /// reaped — that's the intended NameCollision dedupe.
 ///
@@ -1240,8 +1257,13 @@ pub(super) async fn reap_stale_for_intents(
     // Lazily fetched once per tick, only if a delete is actually about
     // to happen (the synthesize-on-delete input; best-effort).
     // merged_bug_080(2b): the FULL view — the death classification
-    // below consults the `recently_closed` half too.
-    let mut attempts_view: Option<rio_proto::types::ListOpenAttemptsResponse> = None;
+    // below consults the `recently_closed` half too. live_051(e): the
+    // view rides inside its freshness WITNESS — the chokepoint
+    // refuses to adjudicate on stale evidence and refreshes the
+    // witness in place, so the gate below always folds the same
+    // evidence the delete consumed.
+    let mut attempts_view: Option<super::job::AttemptsViewWitness> = None;
+    let mut struck_this_tick: HashSet<String> = HashSet::new();
     for j in existing {
         let Some(jn) = j.metadata.name.as_deref() else {
             continue;
@@ -1276,11 +1298,37 @@ pub(super) async fn reap_stale_for_intents(
             }
             Some(_) => continue,
         };
-        let view = match &attempts_view {
+        // live_051(e): two-tick confirmation on the attempt-affecting
+        // arms — the first stale classification records a strike and
+        // defers; the orphan-pending arm keeps its single-tick path
+        // (already age-gated by REAP_PENDING_GRACE).
+        if matches!(why, "terminal" | "selector-drift") {
+            let Some(uid) = j.metadata.uid.clone() else {
+                // No uid: cannot key a strike — defer conservatively
+                // (apiserver objects always carry one in practice).
+                continue;
+            };
+            struck_this_tick.insert(uid.clone());
+            let strikes = {
+                let mut m = STALE_STRIKES.lock();
+                let e = m.entry((pool.to_owned(), uid)).or_insert(0);
+                *e = e.saturating_add(1);
+                *e
+            };
+            if strikes < 2 {
+                info!(
+                    pool, job = %jn, why,
+                    "stale-Job classification strike 1; reap deferred one \
+                     tick (live_051(e) two-tick confirmation)"
+                );
+                continue;
+            }
+        }
+        let view = match &mut attempts_view {
             Some(v) => v,
             None => {
-                attempts_view = Some(super::job::open_attempts_best_effort(ctx, pool).await);
-                attempts_view.as_ref().expect("just set")
+                attempts_view = Some(super::job::AttemptsViewWitness::fetch(ctx, pool).await);
+                attempts_view.as_mut().expect("just set")
             }
         };
         match super::job::delete_job_with_synthesized_report(
@@ -1290,11 +1338,21 @@ pub(super) async fn reap_stale_for_intents(
             jn,
             &params,
             rio_proto::types::AttemptTerminalReason::Reaped,
-            &view.attempts,
+            view,
             key,
         )
         .await
         {
+            Ok(super::job::SynthesizedDelete::Deferred { fresh_attempt }) => {
+                info!(
+                    pool, job = %jn, why, fresh_attempt,
+                    "stale-Job reap deferred at the chokepoint on attempt \
+                     evidence (live_051(e)); re-decided next tick"
+                );
+                // NOT reaped: the Job stands; the strike is retained
+                // via struck_this_tick, so next tick re-decides
+                // (strike monotonicity — no infinite-defer arm).
+            }
             Ok(synthesized) => {
                 info!(
                     pool, job = %jn, why,
@@ -1313,6 +1371,11 @@ pub(super) async fn reap_stale_for_intents(
                     super::job::SynthesizedDelete::AckedNoAttempt
                     | super::job::SynthesizedDelete::ReportFailed
                     | super::job::SynthesizedDelete::NoOpenAttempt => true,
+                    // Peeled by the arm above; a deferred delete
+                    // reaped nothing and adjudicates nothing.
+                    super::job::SynthesizedDelete::Deferred { .. } => {
+                        unreachable!("Deferred is peeled by the preceding match arm")
+                    }
                 };
                 if why == "terminal"
                     && no_verdict_at_delete
@@ -1329,14 +1392,19 @@ pub(super) async fn reap_stale_for_intents(
                     // older than the scheduler's recently-closed
                     // window still reads verdict-free — over-caution
                     // bounded by the 80 s backoff cap; widening the
-                    // window is scheduler-side.
-                    let covered_by_build = view
-                        .attempts
+                    // window is scheduler-side. live_051(e): the gate
+                    // reads the SAME witness the delete consumed
+                    // (refreshed in place on staleness).
+                    let gate_view = attempts_view
+                        .as_ref()
+                        .expect("witness minted before any delete");
+                    let covered_by_build = gate_view
+                        .attempts()
                         .iter()
                         .filter(|a| a.intent_id == intent_id)
                         .any(|a| candidate::VerdictWitness::from_open_build_attempt(a).is_some())
-                        || view
-                            .recently_closed
+                        || gate_view
+                            .recently_closed()
                             .iter()
                             .filter(|c| c.intent_id == intent_id)
                             .any(|c| {
@@ -1364,6 +1432,13 @@ pub(super) async fn reap_stale_for_intents(
             }
         }
     }
+    // live_051(e): strikes persist only for uids struck THIS tick —
+    // a Job that stops classifying (or was deleted by any path)
+    // expires its entry, so "two strikes" means two CONSECUTIVE
+    // ticks.
+    STALE_STRIKES
+        .lock()
+        .retain(|(p, uid), _| p != pool || struck_this_tick.contains(uid));
     reaped
 }
 

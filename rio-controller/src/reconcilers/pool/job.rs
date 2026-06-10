@@ -460,7 +460,7 @@ pub(super) async fn reap_excess_pending(
     // for the synthesize-on-delete arm (this path consumes only the
     // open half; the death classification consuming `recently_closed`
     // is the terminal reap's, in `reap_stale_for_intents`).
-    let open_attempts = open_attempts_best_effort(ctx, pool).await.attempts;
+    let mut attempts_view = AttemptsViewWitness::fetch(ctx, pool).await;
     let mut reaped = 0u32;
     for job in excess {
         let job_name = job.metadata.name.as_deref().unwrap_or("<unnamed>");
@@ -503,11 +503,17 @@ pub(super) async fn reap_excess_pending(
             job_name,
             &DeleteParams::foreground(),
             rio_proto::types::AttemptTerminalReason::Reaped,
-            &open_attempts,
+            &mut attempts_view,
             key,
         )
         .await
         {
+            Ok(SynthesizedDelete::Deferred { fresh_attempt }) => {
+                info!(
+                    pool, job = %job_name, fresh_attempt,
+                    "excess-Pending reap deferred on attempt evidence (live_051(e))"
+                );
+            }
             Ok(_) => {
                 info!(
                     pool, job = %job_name, queued,
@@ -547,7 +553,7 @@ pub(super) async fn reap_excess_pending(
 /// identity), carries the Job name and the attempt's intent id for the
 /// scheduler's resolution fallbacks, and forwards the attempt's
 /// `source_node` as the AD2c attribution when known.
-// r[impl ctrl.job.synthesize-on-delete+2]
+// r[impl ctrl.job.synthesize-on-delete+3]
 pub(super) fn synthesized_report_for_job(
     job: &Job,
     reason: rio_proto::types::AttemptTerminalReason,
@@ -776,6 +782,94 @@ pub(super) enum SynthesizedDelete {
     /// No open pull-mode attempt covered the Job — nothing was
     /// synthesized (the never-pulled death shape); NO verdict.
     NoOpenAttempt,
+    /// live_051(e): the delete did NOT happen this tick — the
+    /// chokepoint refused to synthesize-and-delete on stale attempt
+    /// evidence (fail-toward-keeping, the chronology family's
+    /// inequality direction). `fresh_attempt = true`: the one-shot
+    /// refetch revealed a covering open attempt the deciding view did
+    /// not contain (a just-pulled attempt — reaping would destroy a
+    /// live round-trip and stamp client-visible "cancelled");
+    /// `false`: fresh evidence could not be obtained (refetch failed)
+    /// — absence of staleness cannot be proven, so the Job keeps a
+    /// tick. Strike monotonicity at the callers guarantees a deferred
+    /// Job is re-decided next tick — no infinite-defer arm exists.
+    Deferred {
+        /// Whether a fresh covering open attempt vetoed the delete.
+        fresh_attempt: bool,
+    },
+}
+
+/// live_051(e): the typed freshness bound on the attempt evidence a
+/// synthesize-and-delete may consume. Violable axis, named:
+/// derivation — a reap WAVE iterates deletes over the once-per-tick
+/// lazy view at one apiserver round-trip each, so a mass wave (the
+/// measured 543-reap resubmit wave) holds its view for tens of
+/// seconds while workers actively pull the resubmitted attempts;
+/// 2s admits any single-burst tick (sub-second for tens of Jobs)
+/// while refusing exactly the long-wave staleness, and stays well
+/// under the ~10s reconcile cadence so at most one refresh per
+/// staleness episode fires. The residual in-bound window (an attempt
+/// pulled between the refetch and the apiserver delete) is closed by
+/// the callers' two-tick strike for the arm-classified Jobs and
+/// priced grace-bounded for the orphan arm.
+pub(super) const ATTEMPTS_VIEW_FRESHNESS: Duration = Duration::from_secs(2);
+
+/// live_051(e): the attempt view WITH its chronology — evidence and
+/// the instant it was fetched, in one mint (the WO-S4-7
+/// `closed_age_secs` sibling: adjudication evidence covers only
+/// events it postdates, so the consumer can decide whether the view
+/// may adjudicate at all). Minted ONLY at fetch completion
+/// ([`AttemptsViewWitness::minted_now`] — the sole constructor, used
+/// by the production fetch and by tests over hand-built responses);
+/// [`delete_job_with_synthesized_report`] consumes it and refuses to
+/// ride stale evidence.
+pub(super) struct AttemptsViewWitness {
+    fetched_at: std::time::Instant,
+    view: rio_proto::types::ListOpenAttemptsResponse,
+}
+
+impl AttemptsViewWitness {
+    /// THE constructor: stamps the fetch-completion instant
+    /// (completion-sampled — a caller cannot supply a backdated
+    /// instant).
+    pub(super) fn minted_now(view: rio_proto::types::ListOpenAttemptsResponse) -> Self {
+        Self {
+            fetched_at: std::time::Instant::now(),
+            view,
+        }
+    }
+
+    /// Best-effort production mint (wraps
+    /// [`open_attempts_best_effort`]; empty view on error — callers
+    /// proceed with the plain delete and the establishment sweep
+    /// remains the fallback classifier).
+    pub(super) async fn fetch(ctx: &Ctx, pool: &str) -> Self {
+        Self::minted_now(open_attempts_best_effort(ctx, pool).await)
+    }
+
+    /// The open half of the view.
+    pub(super) fn attempts(&self) -> &[rio_proto::types::OpenAttempt] {
+        &self.view.attempts
+    }
+
+    /// The `recently_closed` half (the merged_bug_080(2b) death
+    /// classification input).
+    pub(super) fn recently_closed(&self) -> &[rio_proto::types::ClosedAttempt] {
+        &self.view.recently_closed
+    }
+
+    /// Age of the evidence.
+    fn age(&self) -> Duration {
+        self.fetched_at.elapsed()
+    }
+
+    /// Test seam (the `force_expire` precedent): age the witness
+    /// without sleeping, so the staleness arm is drivable
+    /// deterministically.
+    #[cfg(test)]
+    pub(super) fn backdate_for_test(&mut self, age: Duration) {
+        self.fetched_at = std::time::Instant::now() - age;
+    }
 }
 
 /// Delete one Job, synthesizing the terminal `ReportAttemptOutcome`
@@ -805,7 +899,7 @@ pub(super) enum SynthesizedDelete {
 /// witnesses nothing and resets nothing — merged_bug_080(2b); the
 /// witness mint is `candidate::VerdictWitness::from_resolved_ack`.
 // r[impl ctrl.pool.respawn-backoff]
-// r[impl ctrl.job.synthesize-on-delete+2]
+// r[impl ctrl.job.synthesize-on-delete+3]
 #[allow(clippy::too_many_arguments)] // the build_job precedent: reconcile plumbing, not an API
 pub(super) async fn delete_job_with_synthesized_report(
     jobs_api: &Api<Job>,
@@ -814,11 +908,72 @@ pub(super) async fn delete_job_with_synthesized_report(
     job_name: &str,
     params: &DeleteParams,
     reason: rio_proto::types::AttemptTerminalReason,
-    open_attempts: &[rio_proto::types::OpenAttempt],
+    attempts: &mut AttemptsViewWitness,
     key: &super::candidate::PoolKey,
 ) -> kube::Result<SynthesizedDelete> {
+    // live_051(e): the synthesized verdict and the delete it rides
+    // consume attempt evidence within the typed freshness bound. On
+    // stale evidence: ONE refetch, then re-evaluation — a Job whose
+    // FRESH evidence shows a covering open attempt the deciding view
+    // did not contain is NOT deleted this tick (a just-pulled attempt
+    // — the 169-Reaped-within-~200ms shape); a failed refetch defers
+    // too (absence of staleness cannot be proven). The refreshed view
+    // REPLACES the witness in place, so a long reap wave pays at most
+    // one extra ListOpenAttempts per staleness episode and every
+    // subsequent delete (and the callers' death-classification gates)
+    // consumes the fresh evidence.
+    if attempts.age() > ATTEMPTS_VIEW_FRESHNESS {
+        match admin_call(
+            ctx.admin
+                .clone()
+                .list_open_attempts(rio_proto::types::ListOpenAttemptsRequest {}),
+        )
+        .await
+        {
+            Ok(resp) => {
+                let fresh = AttemptsViewWitness::minted_now(resp.into_inner());
+                let intent = job_intent_id(job).filter(|i| !i.is_empty());
+                if let Some(intent) = intent {
+                    let known: std::collections::HashSet<&str> = attempts
+                        .attempts()
+                        .iter()
+                        .filter(|a| a.intent_id == intent)
+                        .map(|a| a.exec_id.as_str())
+                        .collect();
+                    let just_pulled = fresh.attempts().iter().any(|a| {
+                        a.intent_id == intent
+                            && AttemptOwner::Job.owns(a)
+                            && !known.contains(a.exec_id.as_str())
+                    });
+                    if just_pulled {
+                        info!(
+                            job = %job_name, reason = ?reason,
+                            "delete deferred: fresh attempt evidence shows a \
+                             just-pulled covering attempt (live_051(e)); \
+                             re-decided next tick"
+                        );
+                        *attempts = fresh;
+                        return Ok(SynthesizedDelete::Deferred {
+                            fresh_attempt: true,
+                        });
+                    }
+                }
+                *attempts = fresh;
+            }
+            Err(e) => {
+                warn!(
+                    job = %job_name, reason = ?reason, error = %e,
+                    "stale attempt view and the refetch failed; deferring the \
+                     delete one tick (fail-toward-keeping)"
+                );
+                return Ok(SynthesizedDelete::Deferred {
+                    fresh_attempt: false,
+                });
+            }
+        }
+    }
     let mut synthesized = SynthesizedDelete::NoOpenAttempt;
-    if let Some(request) = synthesized_report_for_job(job, reason, open_attempts) {
+    if let Some(request) = synthesized_report_for_job(job, reason, attempts.attempts()) {
         synthesized = SynthesizedDelete::ReportFailed;
         let exec_id = request.exec_id.clone();
         let intent_id = request.intent_id.clone();
@@ -1077,8 +1232,8 @@ pub(super) async fn reap_orphan_running(
         );
         return 0;
     }
-    let open_attempts = resp.attempts;
-    let orphans = select_orphan_running(jobs, reaped, &open_attempts, grace);
+    let mut attempts_view = AttemptsViewWitness::minted_now(resp);
+    let orphans = select_orphan_running(jobs, reaped, attempts_view.attempts(), grace);
     if orphans.is_empty() {
         return 0;
     }
@@ -1104,11 +1259,17 @@ pub(super) async fn reap_orphan_running(
             job_name,
             &DeleteParams::foreground(),
             rio_proto::types::AttemptTerminalReason::Reaped,
-            &open_attempts,
+            &mut attempts_view,
             key,
         )
         .await
         {
+            Ok(SynthesizedDelete::Deferred { fresh_attempt }) => {
+                info!(
+                    pool, job = %job_name, fresh_attempt,
+                    "orphan-Running reap deferred on attempt evidence (live_051(e))"
+                );
+            }
             Ok(_) => {
                 info!(
                     pool, job = %job_name,
@@ -1295,7 +1456,7 @@ pub(super) async fn cancel_closed_attempt_jobs(
             return 0;
         }
     };
-    let open_attempts = resp.attempts;
+    let mut attempts_view = AttemptsViewWitness::minted_now(resp);
     // bug_028 futility breaker reset lane: an open BUILD pull-mode
     // attempt is the ledger's word that the pull ESTABLISHED — a
     // named resolution for any verdict-free-respawn record this pool
@@ -1306,7 +1467,7 @@ pub(super) async fn cancel_closed_attempt_jobs(
     // r[impl ctrl.pool.respawn-backoff]
     {
         let mut streaks = ctx.exhausted_streak.lock();
-        for a in &open_attempts {
+        for a in attempts_view.attempts() {
             if let Some(witness) = super::candidate::VerdictWitness::from_open_build_attempt(a) {
                 streaks.note_resolution(key, &a.intent_id, witness);
             }
@@ -1321,14 +1482,17 @@ pub(super) async fn cancel_closed_attempt_jobs(
         // `MintedPullIdentity`'s UNSPECIFIED-reads-as-Build report
         // posture — RULED S2-OQ4; see both sites before "fixing"
         // either to match the other).
-        for c in &resp.recently_closed {
+        for c in attempts_view.recently_closed() {
             if let Some(witness) = super::candidate::VerdictWitness::from_recently_closed_build(c) {
                 streaks.note_resolution(key, &c.intent_id, witness);
             }
         }
     }
-    let to_cancel: Vec<&Job> =
-        select_closed_attempt_jobs(&active, &open_attempts, &resp.recently_closed);
+    let to_cancel: Vec<&Job> = select_closed_attempt_jobs(
+        &active,
+        attempts_view.attempts(),
+        attempts_view.recently_closed(),
+    );
     let mut cancelled = 0u32;
     for job in to_cancel {
         let job_name = job.metadata.name.as_deref().unwrap_or("<unnamed>");
@@ -1339,11 +1503,17 @@ pub(super) async fn cancel_closed_attempt_jobs(
             job_name,
             &DeleteParams::foreground(),
             rio_proto::types::AttemptTerminalReason::Cancelled,
-            &open_attempts,
+            &mut attempts_view,
             key,
         )
         .await
         {
+            Ok(SynthesizedDelete::Deferred { fresh_attempt }) => {
+                info!(
+                    pool, job = %job_name, fresh_attempt,
+                    "cancel-arm delete deferred on attempt evidence (live_051(e))"
+                );
+            }
             Ok(_) => {
                 info!(
                     pool, job = %job_name,
