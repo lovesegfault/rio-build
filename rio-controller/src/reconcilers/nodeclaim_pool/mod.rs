@@ -2273,7 +2273,7 @@ impl NodeClaimPoolReconciler {
         // merged_bug_005 the Ack itself means APPLIED UNDER
         // LEADERSHIP, not enqueued: the scheduler answers after the
         // actor applies — and per bug_094's validate-then-commit, an
-        // erring Ack (deposed, closed gate, undecodable entry) means
+        // erring Ack (deposed, undecodable entry) means
         // NO plane landed, so retaining + redelivering here is exact.
         let req = AckSpawnedIntentsRequest {
             // The explicit per-tick snapshot (always present from this
