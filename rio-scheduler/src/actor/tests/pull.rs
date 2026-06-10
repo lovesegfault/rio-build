@@ -2543,7 +2543,7 @@ async fn report_ack_attempt_resolved_per_arm_census() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.executor.pull-payload]
+// r[verify sched.executor.pull-transaction+2]
 /// bug_027 red: the `last_intent` stamp carries the RECONCILED
 /// dispatch shape — `max(resolved, carried)` — not the raw mint-time
 /// solve. The pod runs under the CARRIED `BoundIntent` deadline (the
