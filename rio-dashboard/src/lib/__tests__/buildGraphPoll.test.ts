@@ -19,7 +19,12 @@ import {
 
 vi.mock('../../api/admin', () => ({ admin: adminMock }));
 
-import { createBuildGraphPoll } from '../buildGraphPoll.svelte';
+import {
+  createBuildGraphPoll,
+  GRAPH_FETCH_DEADLINE_MS,
+  SETTLED_POLL_MS,
+} from '../buildGraphPoll.svelte';
+import { POLL_MS } from '../poll';
 
 const { getBuildGraph } = adminMock;
 
@@ -275,5 +280,99 @@ describe('createBuildGraphPoll', () => {
     p.onCleared();
     await vi.advanceTimersByTimeAsync(30_000);
     expect(getBuildGraph).toHaveBeenCalledTimes(n);
+  });
+
+  // ---- per-dispatch deadline envelope (merged_bug_076) ----
+  //
+  // The epoch-keyed re-entrancy gate serializes the loop on the
+  // getBuildGraph await; without a deadline a single black-holed
+  // dispatch (nginx holds quiet upstream reads for 3600s) imports the
+  // transport's worst-case tail into the poll's liveness — and into
+  // every oracle reading it.
+
+  it('black_holed_dispatch_releases_the_gate_at_the_deadline', async () => {
+    // PROPOSITION: a never-settling dispatch consumes at most
+    // GRAPH_FETCH_DEADLINE_MS of poll liveness — the next tick after
+    // the deadline dispatches again (the gate is released by the
+    // abort edge, never by transport courtesy).
+    getBuildGraph.mockImplementation(() => new Promise(() => {}));
+
+    const p = createBuildGraphPoll('b-10');
+    await flush();
+    expect(getBuildGraph).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(GRAPH_FETCH_DEADLINE_MS + POLL_MS);
+    expect(getBuildGraph.mock.calls.length).toBeGreaterThanOrEqual(2);
+    p.destroy();
+  });
+
+  it('oracle_keeps_updating_past_a_black_holed_dispatch', async () => {
+    // PROPOSITION: the terminality oracle surfaces (statusOf,
+    // allTerminal) resume updating once a black-holed dispatch hits
+    // its deadline — the 3600s frozen-oracle consequence chain is
+    // dead, not merely the call count.
+    getBuildGraph
+      .mockImplementationOnce(() => new Promise(() => {}))
+      .mockResolvedValue(mkResp(['completed']));
+
+    const p = createBuildGraphPoll('b-11');
+    await flush();
+    const drv = `/nix/store/${'a'.repeat(32)}-pkg-0.drv`;
+    expect(p.statusOf(drv)).toBeUndefined();
+
+    await vi.advanceTimersByTimeAsync(GRAPH_FETCH_DEADLINE_MS + POLL_MS);
+    await flush();
+    expect(p.statusOf(drv)).toBe('completed');
+    expect(p.allTerminal).toBe(true);
+    p.destroy();
+  });
+
+  it('destroy_aborts_the_inflight_dispatch', async () => {
+    // PROPOSITION: every dispatch carries an AbortSignal and destroy()
+    // aborts the in-flight one — a closed drawer cannot leak a hung
+    // request into the proxy's 3600s read window.
+    getBuildGraph.mockImplementation(() => new Promise(() => {}));
+
+    const p = createBuildGraphPoll('b-12');
+    await flush();
+    const lastOpts = getBuildGraph.mock.calls[0]?.[1] as
+      | { signal?: AbortSignal }
+      | undefined;
+    expect(lastOpts?.signal).toBeDefined();
+    expect(lastOpts?.signal?.aborted).toBe(false);
+    p.destroy();
+    expect(lastOpts?.signal?.aborted).toBe(true);
+  });
+
+  it('request_deadline_is_independent_of_the_settling_cadence', async () => {
+    // PROPOSITION (R17 ordering law): POLL_MS < GRAPH_FETCH_DEADLINE_MS
+    // <= SETTLED_POLL_MS — the envelope tolerates the gate's intended
+    // slow-fetch serialization (two skipped live ticks) while a
+    // settled probe structurally cannot overlap its own cadence; and
+    // the SAME bound governs a settled drawer's probe (never a
+    // cadence-scaled one).
+    expect(POLL_MS).toBeLessThan(GRAPH_FETCH_DEADLINE_MS);
+    expect(GRAPH_FETCH_DEADLINE_MS).toBeLessThanOrEqual(SETTLED_POLL_MS);
+
+    getBuildGraph
+      .mockResolvedValueOnce(mkResp(['completed']))
+      .mockImplementationOnce(() => new Promise(() => {}))
+      .mockResolvedValue(mkResp(['completed']));
+
+    const p = createBuildGraphPoll('b-13');
+    await flush();
+    expect(p.allTerminal).toBe(true);
+
+    // The settled probe at +30s black-holes...
+    await vi.advanceTimersByTimeAsync(SETTLED_POLL_MS);
+    expect(getBuildGraph).toHaveBeenCalledTimes(2);
+    // ...its deadline fires GRAPH_FETCH_DEADLINE_MS later (not at a
+    // cadence-scaled bound), so the NEXT settled tick dispatches
+    // instead of bouncing off a still-held gate.
+    await vi.advanceTimersByTimeAsync(GRAPH_FETCH_DEADLINE_MS);
+    await vi.advanceTimersByTimeAsync(SETTLED_POLL_MS - GRAPH_FETCH_DEADLINE_MS);
+    await flush();
+    expect(getBuildGraph).toHaveBeenCalledTimes(3);
+    p.destroy();
   });
 });

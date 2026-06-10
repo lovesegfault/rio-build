@@ -41,6 +41,24 @@ import { POLL_MS, startPoll } from './poll';
  * (12 → 2 RPC/min per settled drawer). */
 export const SETTLED_POLL_MS = 30_000;
 
+/** Per-dispatch deadline envelope for the graph poll's unary
+ * (merged_bug_076). The epoch-keyed re-entrancy gate serializes the
+ * loop on the getBuildGraph await, so an unbounded dispatch would
+ * import the transport's worst-case tail — nginx holds quiet upstream
+ * reads for 3600s (dashboard-nginx.conf) — into the poll's liveness
+ * and into every oracle reading it.
+ *
+ * Derivation: 15s = 3x the live cadence (the gate's intended
+ * slow-fetch serialization tolerates up to two skipped ticks before
+ * the dispatch is cancelled), and <= SETTLED_POLL_MS so a settled
+ * probe structurally cannot overlap its own cadence. INDEPENDENT of
+ * the settling cadence by construction: both the live and the settled
+ * dispatch path read this one const — a settled drawer's probe gets
+ * the same 15s, never a 30s-scaled envelope. Violable + testable: the
+ * ordering law POLL_MS < GRAPH_FETCH_DEADLINE_MS <= SETTLED_POLL_MS is
+ * asserted in the test battery. */
+export const GRAPH_FETCH_DEADLINE_MS = 15_000;
+
 export type BuildGraphPoll = {
   /** Latest GetBuildGraph node set ($state.raw — wholesale replaced
    * per poll; identity-swap reactivity is all consumers need). */
@@ -87,6 +105,13 @@ export function createBuildGraphPoll(buildId: string): BuildGraphPoll {
   // shot after a clear — its epoch differs, so a fresh dispatch
   // proceeds.
   let inflightEpoch: number | null = null;
+  // The CURRENT dispatch's abort controller, slot-level so destroy()
+  // can cancel the in-flight request (merged_bug_076 — today's
+  // teardown bumped the epoch but aborted nothing, leaking the hung
+  // request into the proxy's 3600s read window). At most one
+  // current-epoch dispatch exists (the gate above); a STALE in-flight
+  // dispatch keeps its own controller and dies at its own deadline.
+  let inflightCtl: AbortController | null = null;
   let destroyed = false;
   // Live until destroy(); never null while alive — settling swaps the
   // cadence instead of stopping (the downshift).
@@ -163,16 +188,46 @@ export function createBuildGraphPoll(buildId: string): BuildGraphPoll {
     const epoch = pollEpoch;
     if (inflightEpoch === epoch) return;
     inflightEpoch = epoch;
+    // Per-dispatch deadline envelope (merged_bug_076): the owned timer
+    // aborts the request at GRAPH_FETCH_DEADLINE_MS — the browser
+    // fetch dies, defeating (not bypassing) the proxy's 3600s hold —
+    // and the abort-edge race below releases the loop even when a
+    // signal-deaf transport/mock never settles (logStream's
+    // per-iteration abort edge is the in-repo precedent).
+    const ctl = new AbortController();
+    inflightCtl = ctl;
+    const deadline = setTimeout(() => {
+      ctl.abort(
+        new Error(
+          `getBuildGraph exceeded GRAPH_FETCH_DEADLINE_MS (${GRAPH_FETCH_DEADLINE_MS} ms)`,
+        ),
+      );
+    }, GRAPH_FETCH_DEADLINE_MS);
+    let onAbort: (() => void) | undefined;
     try {
       let r;
       try {
-        r = await admin.getBuildGraph({ buildId });
+        const call = admin.getBuildGraph({ buildId }, { signal: ctl.signal });
+        // Orphaned-rejection hygiene: when the abort edge wins the
+        // race, the transport's own late rejection must not surface
+        // as unhandled (transport.test.ts precedent).
+        void call.catch(() => {});
+        const abortEdge = new Promise<never>((_, reject) => {
+          onAbort = () => reject(ctl.signal.reason);
+          ctl.signal.addEventListener('abort', onAbort, { once: true });
+        });
+        r = await Promise.race([call, abortEdge]);
       } catch (e) {
         settle(epoch, { error: e });
         return;
       }
       settle(epoch, { response: r });
     } finally {
+      clearTimeout(deadline);
+      if (onAbort !== undefined) {
+        ctl.signal.removeEventListener('abort', onAbort);
+      }
+      if (inflightCtl === ctl) inflightCtl = null;
       if (inflightEpoch === epoch) inflightEpoch = null;
     }
   }
@@ -219,6 +274,12 @@ export function createBuildGraphPoll(buildId: string): BuildGraphPoll {
     destroy() {
       destroyed = true;
       pollEpoch += 1;
+      // Abort the in-flight dispatch: a closed drawer must not keep a
+      // hung request alive for the proxy's read window. The settle is
+      // already fenced out (destroyed + epoch bump), so the abort's
+      // rejection is swallowed by the dispatch's own catch.
+      inflightCtl?.abort(new Error('poll destroyed'));
+      inflightCtl = null;
       stop?.();
       stop = null;
     },
