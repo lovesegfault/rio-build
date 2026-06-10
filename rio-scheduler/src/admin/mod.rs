@@ -1431,6 +1431,7 @@ mod absorb_tests {
             hw_class: "mid-ebs-x86".into(),
             kind: "exposure".into(),
             value: 60.0,
+            // r13-allow(opaque-consumer): scheduler-side opaque-key contract test
             event_uid: Some("exposure:prod-east:mid-ebs-x86:1767225600".into()),
         };
 
