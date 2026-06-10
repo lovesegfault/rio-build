@@ -14,7 +14,10 @@
 // This store owns the poll for the drawer's whole lifetime, so the
 // SAME live data feeds Graph's rendering AND the oracle — the
 // frozen-snapshot configuration is unrepresentable: there is no second
-// status source to capture from.
+// status source to capture from. Both oracle legs are getters on THIS
+// store (merged_bug_074): `statusOf` is the per-node leg and
+// `allTerminal` is the build-level leg — the drawer's `build` prop
+// feeds no oracle input.
 //
 // r[impl dash.graph.auto-stop+2]
 // The settle law lives here with the poll (merged_bug_043): once every

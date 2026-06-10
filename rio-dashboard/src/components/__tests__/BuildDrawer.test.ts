@@ -26,6 +26,13 @@ import {
 
 vi.mock('../../api/admin', () => ({ admin: adminMock }));
 vi.mock('../../api/logs', () => ({ logs: logsMock }));
+// Spy (NOT replace) the log-stream factory: the mount tests above
+// need the REAL chain (so "no stream constructed" is witnessed at
+// the wire mock), while the oracle tests below capture the
+// `isTerminal` closure BuildDrawer hands down — LogViewer forwards
+// it verbatim into createLogStream, so the spy's third argument IS
+// the drawer's oracle, captured at the real consumption seam.
+vi.mock('../../lib/logStream.svelte', { spy: true });
 
 // Graph.svelte imports the layout worker; jsdom has no Worker. The
 // degraded-table branch never posts to it — stub the constructor
@@ -40,6 +47,7 @@ vi.mock('../../lib/graphLayout.worker?worker', () => ({
 }));
 
 import type { BuildInfo } from '../../api/types';
+import { createLogStream } from '../../lib/logStream.svelte';
 import BuildDrawer from '../BuildDrawer.svelte';
 
 const { getBuildGraph } = adminMock;
@@ -123,5 +131,90 @@ describe('BuildDrawer log-stream scope', () => {
     expect(logsMock.tailLog).toHaveBeenCalled();
     const req = logsMock.tailLog.mock.calls[0][0] as { derivation: string };
     expect(req.derivation).toBe(DRV0);
+  });
+
+  // ---- the terminality oracle's legs (merged_bug_074) ----
+  //
+  // Every oracle input must derive from the drawer-lifetime graph
+  // poll: the `build` prop is a click-time snapshot (Builds.svelte's
+  // $effect tracks only statusFilter/pageIdx and `selected` is never
+  // re-pointed when the list refreshes), so a prop-frozen leg poisons
+  // the oracle in both directions.
+
+  /** The drawer's oracle closure, captured at the real consumption
+   * seam: LogViewer forwards the `isTerminal` prop verbatim into
+   * createLogStream's options (third argument). */
+  function capturedOracle(): () => boolean {
+    const calls = vi.mocked(createLogStream).mock.calls;
+    const opts = calls.at(-1)?.[2] as
+      | { isTerminal?: () => boolean }
+      | undefined;
+    expect(opts?.isTerminal).toBeDefined();
+    return opts!.isTerminal!;
+  }
+
+  /** Drive the drawer to a focused per-attempt mount via the
+   * degraded-table click path (truncated views never latch, so the
+   * later untruncated responses fully control the latch). */
+  async function focusFirstNode(): Promise<void> {
+    await fireEvent.click(screen.getByRole('tab', { name: 'Graph' }));
+    await flushSvelte();
+    await fireEvent.click(screen.getAllByTestId('graph-table-row')[0]);
+    await flushSvelte();
+  }
+
+  it('oracle_follows_the_retry_after_out_of_band_clear_on_a_terminal_build', async () => {
+    // PROPOSITION: the retry-follow flip the log-tail rule rides on —
+    // on a TERMINAL-at-click build (state=4, the canonical poisoned
+    // case), an out-of-band ClearPoison discovered by the settled
+    // poll flips the oracle back to false so the stream follows the
+    // retry instead of exiting. A frozen prop leg pins it true
+    // forever (the resurrected pre-merged_bug_134 defect).
+    getBuildGraph
+      .mockResolvedValueOnce(mkResp(['poisoned'], true))
+      .mockResolvedValueOnce(mkResp(['poisoned']))
+      .mockResolvedValue(mkResp(['queued']));
+
+    render(BuildDrawer, { props: { build: mkBuild({ state: 4 }) } });
+    await flushSvelte();
+    await focusFirstNode();
+    const oracle = capturedOracle();
+
+    // The untruncated all-poisoned view settles the poll...
+    await vi.advanceTimersByTimeAsync(5000);
+    await flushSvelte();
+    expect(oracle()).toBe(true);
+
+    // ...and the settled-cadence probe discovers the out-of-band
+    // clear: the shared row reads queued again. ZERO `build` prop
+    // mutation happened — the flip must come from the poll.
+    await vi.advanceTimersByTimeAsync(30_000);
+    await flushSvelte();
+    expect(oracle()).toBe(false);
+  });
+
+  it('oracle_reads_terminal_from_the_live_poll_not_the_prop', async () => {
+    // PROPOSITION (structural pin for the post-090 partition): the
+    // oracle's two legs are the focused node's live status and the
+    // poll's allTerminal — it flips false -> true on an ACTIVE-at-
+    // click build (state=2) purely from poll evidence, with ZERO
+    // `build` prop mutation across the sequence. (Pre-fix this case
+    // was green via the node leg — disclosed: the build-LEVEL leg's
+    // false-frozen red was the whole-build forever-stream, whose
+    // mount died with the bug_090 close last commit.)
+    getBuildGraph
+      .mockResolvedValueOnce(mkResp(['running'], true))
+      .mockResolvedValue(mkResp(['completed']));
+
+    render(BuildDrawer, { props: { build: mkBuild({ state: 2 }) } });
+    await flushSvelte();
+    await focusFirstNode();
+    const oracle = capturedOracle();
+    expect(oracle()).toBe(false);
+
+    // The focused node completes and the (untruncated) view settles.
+    await vi.advanceTimersByTimeAsync(5000);
+    await flushSvelte();
+    expect(oracle()).toBe(true);
   });
 });

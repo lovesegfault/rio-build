@@ -70,19 +70,32 @@
   // retry).
   const focusedStatus = $derived(poll?.statusOf(focusedDrv));
 
-  // BuildInfo.state wire values (BuildStatePill.STATE_META): 3 =
-  // succeeded, 4 = failed, 5 = cancelled — the build-level terminal
-  // set. A terminal build implies no derivation will print again even
-  // when the focused node's own status reads pre-terminal.
-  const buildTerminal = $derived(
-    build.state === 3 || build.state === 4 || build.state === 5,
-  );
-  // Live terminality closure for the log stream's tail_next exit law:
-  // reads the reactive build state at call time (the drawer's `build`
-  // prop refreshes with the list poll), plus the focused node's LIVE
-  // status from the graph poll. Whole-build view: build state alone.
+  // Live terminality closure for the log stream's tail_next exit law
+  // (merged_bug_074): EVERY oracle input reads the drawer-lifetime
+  // graph poll at call time. The `build` prop is render-only snapshot
+  // data — it is captured at click and never refreshes (Builds.svelte's
+  // $effect tracks only statusFilter/pageIdx, and `selected` is never
+  // re-pointed when a list refresh replaces the array) — so a prop leg
+  // would freeze the oracle in both directions: a dead build's focused
+  // node followed forever, and — the retry-follow killer — a
+  // terminal-at-click build whose node is poison-cleared out of band
+  // would pin the oracle terminal and exit the stream instead of
+  // following the retry (the log-tail rule's retry-follow clause: the
+  // shared row flips queued/running when the cleared drv re-runs under
+  // another build).
+  //
+  // poll.allTerminal is the build-level leg: subsumed by the node leg
+  // whenever the focused drv is in the served set, load-bearing exactly
+  // when statusOf returns undefined (degenerate/absent-row views), and
+  // kept live across purged/empty probes by the latch law's retention.
+  // Accepted residuals, by design: a sole-interest node left
+  // non-terminal by a dead build (the sub-second Failed transient in
+  // cancel_build_derivations) or a stuck node in a >5000-node truncated
+  // view follows until tab close — following a stuck node is the
+  // idle-timeout rule's own posture (an hour-quiet stream means the
+  // build is stuck).
   const isTerminal = () =>
-    buildTerminal ||
+    (poll?.allTerminal ?? false) ||
     (focusedStatus !== undefined && TERMINAL.has(focusedStatus));
 </script>
 
