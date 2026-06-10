@@ -676,7 +676,7 @@ Every uncounted drop under-reports the spot-reclaim rate exactly while spot
 is being reclaimed --- the anti-conservative direction for the SLA solver's
 capacity-type decision.
 
-#r("ctrl.informer.exposure-recredit+2")[
+#r("ctrl.informer.exposure-recredit+3")[
   The λ-denominator exposure leg of `AppendInterruptSample` MUST consume
   its evidence only on append acknowledgement, and every shipment MUST
   carry a deterministic per-(cluster, class, window) idempotency key
@@ -695,11 +695,13 @@ capacity-type decision.
   process (minted only through a gate that refuses a non-advancing
   slot) so a clock step backward cannot re-mint an already-shipped
   window under fresh seconds --- absorbed, counted delivered, lost. A
-  banked slice whose append RPC fails MUST be re-credited whole and
+  banked slice whose append RPC fails TRANSIENTLY MUST be re-credited
+  whole and
   IDENTICAL (uid and value; windows are never merged --- a merged value
   under an already-committed key would be absorbed and the fresh
   seconds lost) to the next flush, and a retained class with no fresh
-  slice in a later round MUST still retry. Every node-second that
+  slice in a later round MUST still retry --- so PENDING provably means
+  "deliverable by some future pass". Every node-second that
   leaves a cursor MUST exit through exactly one of BANK (append
   acknowledged), PENDING (the retained queue), or a COUNTED drop on
   #(refs.metric)("rio_controller_spot_exposure_dropped_seconds_total")`{reason}`;
@@ -707,10 +709,13 @@ capacity-type decision.
   matching no configured class --- the cursor advances by design, no
   retro-bank), `absent_node` (a node deleted between flushes forfeits
   its final partial slice --- one flush period in the common case,
-  growing with the gap across LIST-failure streaks), and `shutdown`
+  growing with the gap across LIST-failure streaks), `shutdown`
   (the pending queue is process memory; shutdown forfeits the WHOLE
   backlog, one counted drop per slice --- there is no single-window
-  bound). A LIST failure forfeits nothing (cursors untouched), and a
+  bound), and `refused` (the scheduler refused the slice's content or
+  this deployment's identity --- retrying cannot succeed; counted in
+  the pass that observes the refusal instead of recirculating
+  forever). A LIST failure forfeits nothing (cursors untouched), and a
   non-advancing flush window likewise forfeits nothing (banking
   deferred, cursors untouched --- the next admitted window banks the
   full delta); a scheduler outage spanning any number of flush windows
@@ -738,13 +743,18 @@ merged_bug_001 closed with the typed, cluster-scoped, grid-aligned,
 monotonically-gated key this rule now requires (Q2-round5: the axis
 rides the uid FORMAT; M_047 stays frozen).
 
-#r("ctrl.informer.exposure-drain-budget")[
+#r("ctrl.informer.exposure-drain-budget+2")[
   The pending-queue exposure sweep MUST bound each drain pass by a
   wall-clock budget and MUST be preemptible by shutdown both between
   and during shipments (the in-flight append raced against
   cancellation), so the shutdown arm's counted whole-backlog
   forfeiture is reachable within the pod termination grace at ANY
-  backlog depth; a budget-deferred or preemption-requeued slice
+  backlog depth; each pending slice MUST be attempted at most once
+  per drain pass --- pass work is bounded by queue length, never by
+  the budget/error-latency ratio, and the flush period itself is the
+  retry pacing; a permanently-refused slice MUST exit through the
+  counted-drop chokepoint in the pass that observes the refusal; a
+  budget-deferred or preemption-requeued slice
   remains PENDING --- never a drop.
 ]
 Pre-fix, the flush arm shipped the ENTIRE unshipped backlog serially

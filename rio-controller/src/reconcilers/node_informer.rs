@@ -616,6 +616,14 @@ enum ExposureDropReason {
     /// memory with no drain — the WHOLE backlog is forfeited, one
     /// counted drop per slice.
     Shutdown,
+    /// The scheduler refused the slice's content or this deployment's
+    /// identity ([`classify_append_status`]) — retrying cannot
+    /// succeed; counted here instead of recirculating forever
+    /// (merged_bug_001-r6: pre-fix a permanently-refused slice was
+    /// re-queued verbatim every pass, reported "pending" while
+    /// de-facto dropped, and wedged every pass into budget
+    /// exhaustion).
+    Refused,
 }
 
 impl ExposureDropReason {
@@ -624,11 +632,12 @@ impl ExposureDropReason {
             Self::NoHwClass => "no_hw_class",
             Self::AbsentNode => "absent_node",
             Self::Shutdown => "shutdown",
+            Self::Refused => "refused",
         }
     }
 }
 
-// r[impl ctrl.informer.exposure-recredit+2]
+// r[impl ctrl.informer.exposure-recredit+3]
 /// merged_bug_070: the one chokepoint for forfeited exposure
 /// node-seconds — warn + counted
 /// (`rio_controller_spot_exposure_dropped_seconds_total{reason}`,
@@ -637,7 +646,9 @@ impl ExposureDropReason {
 /// leg's conservation identity total: every observed node-second is
 /// banked, pending, or counted here — the pre-fix silent exits
 /// (match-None consumption, absent-node forfeiture, whole-backlog
-/// shutdown loss) are unrepresentable.
+/// shutdown loss) are unrepresentable, and the refused exit
+/// (merged_bug_001-r6) rides the same chokepoint so PENDING provably
+/// means "deliverable by some future pass".
 fn record_exposure_drop(reason: ExposureDropReason, secs: f64) {
     warn!(
         reason = reason.label(),
@@ -810,9 +821,12 @@ pub async fn run(
     // merged_bug_033: deliberately UNCAPPED. Memory is ~|H| slices
     // per minute (tens of bytes each — one per configured hw_class
     // per failed window), and a cap would mint a NEW forfeiture edge
-    // (a fourth drop reason) the spec's counted-forfeiture
-    // enumeration does not name. The drain is bounded per pass by
-    // [`ship_all`], never by dropping slices.
+    // the spec's counted-forfeiture enumeration does not name. The
+    // drain is bounded per pass by [`ship_all`]'s one-rotation law
+    // (each queued slice attempted at most once per pass), never by
+    // dropping retriable slices — the only in-combinator exit is the
+    // COUNTED `refused` drop for slices whose append provably cannot
+    // succeed (merged_bug_001-r6).
     let mut unshipped: VecDeque<PendingExposure> = VecDeque::new();
 
     // merged_bug_001: per-process window gate — window identity is
@@ -880,7 +894,7 @@ pub async fn run(
                             }
                             fb.retain(|_, (_, seen)| now - *seen < HW_FALLBACK_TTL_SECS);
                         }
-                        // r[impl ctrl.informer.exposure-recredit+2]
+                        // r[impl ctrl.informer.exposure-recredit+3]
                         let now = now_epoch();
                         match gate.admit(now) {
                             Some(window) => {
@@ -915,13 +929,18 @@ pub async fn run(
                         // path (the former report_exposure body,
                         // folded in so no shipment exists outside the
                         // ship_all combinator): one
-                        // AppendInterruptSample per slice, `true` iff
-                        // acknowledged (bug_150 consume-on-ack; the
-                        // combinator owns the recredit law).
-                        // merged_bug_002 + merged_bug_001: the typed
-                        // uid rides every retry, so the AMBIGUOUS
-                        // failure (server committed, client timed
-                        // out) redelivers into the M_047 absorb
+                        // AppendInterruptSample attempt per slice PER
+                        // PASS (the one-rotation law), the outcome
+                        // typed by [`classify_append_status`] —
+                        // `Delivered` iff acknowledged (bug_150
+                        // consume-on-ack; the combinator owns the
+                        // recredit law), `Transient` re-credits to a
+                        // later attempt, `Refused` exits through the
+                        // counted-drop chokepoint inside the
+                        // combinator. merged_bug_002 + merged_bug_001:
+                        // the typed uid rides every retry, so the
+                        // AMBIGUOUS failure (server committed, client
+                        // timed out) redelivers into the M_047 absorb
                         // instead of double-banking — Ok⇒delivered is
                         // sound. Bounded per-RPC by [`admin_call`]'s
                         // timeout so a hung scheduler can't wedge the
@@ -941,14 +960,36 @@ pub async fn run(
                                 };
                                 async move {
                                     match admin_call(admin.append_interrupt_sample(req)).await {
-                                        Ok(_) => true,
+                                        Ok(_) => ShipOutcome::Delivered,
                                         Err(e) => {
-                                            warn!(
-                                                error = %e,
-                                                %uid,
-                                                "spot-exposure: append failed; slice re-credited to the next flush"
-                                            );
-                                            false
+                                            let outcome = classify_append_status(e.code());
+                                            match outcome {
+                                                // Rare, high-signal: the uid and
+                                                // tonic code name exactly what the
+                                                // scheduler rejected (the chokepoint
+                                                // warn carries the counted seconds).
+                                                ShipOutcome::Refused => warn!(
+                                                    error = %e,
+                                                    code = ?e.code(),
+                                                    %uid,
+                                                    "spot-exposure: append refused; \
+                                                     slice exits counted (retrying \
+                                                     cannot succeed)"
+                                                ),
+                                                // O(queue) per pass — log-cost
+                                                // envelope keeps the per-attempt
+                                                // lane at debug; the caller's
+                                                // Completed arm emits the O(1)
+                                                // summary warn.
+                                                _ => debug!(
+                                                    error = %e,
+                                                    %uid,
+                                                    "spot-exposure: append failed; \
+                                                     slice re-credited to the next \
+                                                     flush"
+                                                ),
+                                            }
+                                            outcome
                                         }
                                     }
                                 }
@@ -958,10 +999,22 @@ pub async fn run(
                         // Closed exit alphabet — every variant's
                         // effect is explicit here (no wildcard arm):
                         // deferral and preemption keep slices
-                        // PENDING; only the shutdown arm below ever
-                        // forfeits (counted).
+                        // PENDING; refused slices exited COUNTED
+                        // inside the combinator; the shutdown arm
+                        // below forfeits the rest (counted).
                         match pass {
-                            ShipPass::Drained => {}
+                            ShipPass::Completed { retained, refused } => {
+                                if retained > 0 || refused > 0 {
+                                    warn!(
+                                        retained,
+                                        refused,
+                                        queue_depth = unshipped.len(),
+                                        "exposure drain pass completed with \
+                                         residue: retained slices retry next \
+                                         flush; refused slices exited counted"
+                                    );
+                                }
+                            }
                             ShipPass::BudgetExhausted { remaining } => {
                                 warn!(
                                     remaining,
@@ -1200,21 +1253,30 @@ pub async fn run_spot_interrupt_watcher(
 /// commit-or-not case — `ship_all` re-queues the slice VERBATIM and
 /// the redelivery dedups under the keyed (cluster, class, window)
 /// identity (merged_bug_001), which is exactly what makes mid-RPC
-/// preemption safe.
+/// preemption safe. merged_bug_001-r6: the budget is the pass's TIME
+/// leg only — pass WORK is independently bounded by the one-rotation
+/// law (attempts ≤ queue length at pass start; the budget bounds how
+/// long the rotation may take, never how many same-pass attempts one
+/// slice gets — fast failures cannot convert budget into a
+/// `budget / failure_latency` retry hot-loop).
 const EXPOSURE_SHIP_PASS_BUDGET: Duration = Duration::from_secs(30);
 
 /// merged_bug_033: the CLOSED exit alphabet of one [`ship_all`] drain
 /// pass. Every variant's effects are pinned by a dedicated test
-/// (`Drained`: queue empty; `BudgetExhausted`: remainder PENDING +
-/// zero drop ticks — deferral is not forfeiture; `Cancelled`:
-/// in-flight slice re-queued verbatim, the caller's next `select!`
-/// iteration reaches the counted-disclosure shutdown arm). A new exit
-/// cannot be added without the compiler demanding its effects at the
-/// caller's exhaustive match.
+/// (`Completed`: rotation finished — every slice queued at pass start
+/// attempted exactly once, residue counts carried; `BudgetExhausted`:
+/// remainder PENDING + zero drop ticks — deferral is not forfeiture;
+/// `Cancelled`: in-flight slice re-queued verbatim, the caller's next
+/// `select!` iteration reaches the counted-disclosure shutdown arm).
+/// A new exit cannot be added without the compiler demanding its
+/// effects at the caller's exhaustive match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShipPass {
-    /// Every queued slice was attempted and acknowledged.
-    Drained,
+    /// The rotation finished: every slice queued at pass start was
+    /// attempted exactly once. `retained` transient slices stay
+    /// QUEUED for the next flush; `refused` slices exited through the
+    /// counted-drop chokepoint (merged_bug_001-r6).
+    Completed { retained: usize, refused: usize },
     /// The per-pass budget expired; `remaining` slices stay QUEUED
     /// (pending, never dropped) for the next flush's pass.
     BudgetExhausted { remaining: usize },
@@ -1224,8 +1286,89 @@ enum ShipPass {
     Cancelled { requeued_in_flight: bool },
 }
 
-// r[impl ctrl.informer.exposure-recredit+2]
-// r[impl ctrl.informer.exposure-drain-budget]
+/// merged_bug_001-r6: the ship closure's CLOSED outcome alphabet —
+/// the drain combinator's classification axis. `bool` made the
+/// permanent-failure lane unrepresentable: every failure was
+/// re-credited, so an InvalidArgument-class slice (or an HMAC
+/// service-token refusal) recirculated forever — de-facto dropped
+/// while reported "pending", wedging every pass into budget
+/// exhaustion. Typing the axis in the closure's SIGNATURE makes every
+/// ship path (production and test) state it or fail to compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShipOutcome {
+    /// Append acknowledged — the slice is consumed (bug_150
+    /// consume-on-ack).
+    Delivered,
+    /// Possibly-transient failure — the slice is re-credited VERBATIM
+    /// (uid and value) for a later pass; the flush period is the
+    /// retry pacing.
+    Transient,
+    /// Provably-futile failure ([`classify_append_status`]) — the
+    /// slice exits through [`record_exposure_drop`] with
+    /// [`ExposureDropReason::Refused`] in the pass that observes the
+    /// refusal; retrying cannot succeed.
+    Refused,
+}
+
+/// merged_bug_001-r6: the ONE classification chokepoint mapping an
+/// `AppendInterruptSample` error status to its [`ShipOutcome`].
+/// EXHAUSTIVE over every [`tonic::Code`] variant — no wildcard arm,
+/// so a tonic code addition is a compile error here (the census is
+/// compiler-derived) — and fail-open toward RETENTION: a slice drops
+/// only on proof of futility, because a wrongly-dropped slice is
+/// permanent denominator loss while a wrongly-retained one costs one
+/// queue slot per flush.
+///
+/// Per-arm rationale:
+///
+/// - `InvalidArgument | OutOfRange | Unimplemented` — the scheduler
+///   rejected the request's CONTENT (validation gates at
+///   `append_interrupt_sample`) or lacks the RPC; the same bytes
+///   redeliver identically. Refused.
+/// - `FailedPrecondition` — the server names a state the client
+///   cannot fix by re-sending the same request. Refused.
+/// - `Unauthenticated | PermissionDenied` — the service-token gate
+///   (`ensure_service_caller`) refused this deployment's identity.
+///   Counted-drop over eternal recirculation: during an HMAC key-roll
+///   overlap this forfeits a bounded run of 60s windows (disclosed
+///   via `reason="refused"`), whereas a persistent token misconfig
+///   would otherwise recirculate the whole backlog silently forever
+///   (OQ-S5-2 disposition, ruled 2026-06-10).
+/// - `Unavailable | DeadlineExceeded | ResourceExhausted | Aborted |
+///   Internal | Unknown | Cancelled | DataLoss` — transport,
+///   leadership, load, or server-fault shapes that a later pass can
+///   plausibly clear. Transient.
+/// - `NotFound | AlreadyExists` — not emitted by this RPC today;
+///   fail-open toward retention rather than guessing futility.
+///   Transient.
+/// - `Ok` — an error status carrying `Ok` is a transport anomaly,
+///   not an acknowledgement; consume-on-ack (bug_150) forbids
+///   consuming without an ack. Transient.
+fn classify_append_status(code: tonic::Code) -> ShipOutcome {
+    use tonic::Code;
+    match code {
+        Code::InvalidArgument
+        | Code::OutOfRange
+        | Code::Unimplemented
+        | Code::FailedPrecondition
+        | Code::Unauthenticated
+        | Code::PermissionDenied => ShipOutcome::Refused,
+        Code::Ok
+        | Code::Cancelled
+        | Code::Unknown
+        | Code::DeadlineExceeded
+        | Code::NotFound
+        | Code::AlreadyExists
+        | Code::ResourceExhausted
+        | Code::Aborted
+        | Code::Internal
+        | Code::Unavailable
+        | Code::DataLoss => ShipOutcome::Transient,
+    }
+}
+
+// r[impl ctrl.informer.exposure-recredit+3]
+// r[impl ctrl.informer.exposure-drain-budget+2]
 /// merged_bug_033: drain the pending-exposure queue through ONE
 /// combinator — every shipment in this module rides `ship_all` (the
 /// production `ship` closure at the single [`run`] call site is the
@@ -1238,16 +1381,29 @@ enum ShipPass {
 /// `shutdown.cancelled()` (`biased` — preemption re-queues the slice
 /// verbatim and returns `Cancelled`, so the caller's loop reaches the
 /// counted-disclosure shutdown arm within one RPC, at ANY backlog
-/// depth). The recredit law lives HERE: a slice whose `ship` returns
-/// `false` (append not acknowledged — bug_150 consume-on-ack) is
-/// re-queued VERBATIM, uid and all, so however many times delivery is
-/// ambiguous the server holds at most one row per (cluster, class,
-/// window) — merged_bug_002: the retained slice keeps its EXACT
-/// identity (no re-mint, no merge); the cursor already advanced when
-/// the slice was banked, so this queue is the ONLY carrier of the
-/// failed window — dropping it here would be permanent denominator
-/// loss. A budget-deferred or preemption-requeued slice remains
-/// PENDING, never a drop.
+/// depth).
+///
+/// merged_bug_001-r6, the ONE-ROTATION law: the pass snapshots the
+/// queue length at start and attempts each queued slice AT MOST ONCE
+/// — pass work is bounded by QUEUE SIZE, never by the
+/// `budget / failure_latency` ratio (pre-fix, a fast-failing append
+/// — connection refused, standby-UNAVAILABLE in ~ms against the 30s
+/// budget — re-popped the same slice ~10^3-10^4 times per pass). The
+/// inter-attempt spacing of any given slice is therefore the flush
+/// period itself: the rotation IS the retry pacing, deterministic and
+/// timer-free. The classification axis rides the closure's SIGNATURE
+/// ([`ShipOutcome`]): `Delivered` consumes (bug_150 consume-on-ack);
+/// `Transient` re-credits VERBATIM, uid and all, so however many
+/// times delivery is ambiguous the server holds at most one row per
+/// (cluster, class, window) — merged_bug_002: the retained slice
+/// keeps its EXACT identity (no re-mint, no merge); the cursor
+/// already advanced when the slice was banked, so this queue is the
+/// ONLY carrier of the failed window — dropping a retriable slice
+/// here would be permanent denominator loss; `Refused` exits through
+/// [`record_exposure_drop`] IN THIS PASS (the counted chokepoint —
+/// the slice leaves the queue only via ack, counted drop, or stays).
+/// A budget-deferred or preemption-requeued slice remains PENDING,
+/// never a drop.
 ///
 /// `ship` returns its future by VALUE (`FnMut(&_) -> Fut`, not an
 /// async closure): the future owns everything it needs (the run()
@@ -1256,14 +1412,20 @@ enum ShipPass {
 /// trips rustc's HRTB Send check on the spawned informer future (the
 /// rust-lang/rust 102211 family; see `run_nodeclaim_pool`'s doc for
 /// the house precedent).
-async fn ship_all<Fut: Future<Output = bool>>(
+async fn ship_all<Fut: Future<Output = ShipOutcome>>(
     unshipped: &mut VecDeque<PendingExposure>,
     shutdown: &rio_common::signal::Token,
     per_pass_budget: Duration,
     mut ship: impl FnMut(&PendingExposure) -> Fut,
 ) -> ShipPass {
     let start = tokio::time::Instant::now();
-    loop {
+    // One rotation: exactly the slices queued at pass start get an
+    // attempt; Transient push_backs land BEHIND the un-attempted
+    // remainder, so they cannot be re-popped within this pass.
+    let round = unshipped.len();
+    let mut retained = 0usize;
+    let mut refused = 0usize;
+    for _ in 0..round {
         // Budget check FIRST: an expired pass defers the WHOLE
         // remainder (queued, pending — never dropped) to the next
         // flush, so the arm cedes the select loop every period no
@@ -1274,7 +1436,11 @@ async fn ship_all<Fut: Future<Output = bool>>(
             };
         }
         let Some(slice) = unshipped.pop_front() else {
-            return ShipPass::Drained;
+            // Structurally unreachable: the rotation pops at most
+            // `round` slices and only ever pushes back — the queue
+            // cannot run dry before `round` pops. Complete defensively
+            // rather than panic in the flush loop.
+            break;
         };
         tokio::select! {
             biased;
@@ -1284,23 +1450,33 @@ async fn ship_all<Fut: Future<Output = bool>>(
                 // all); the redelivery dedups under the keyed
                 // (cluster, class, window) identity. The caller's
                 // next select! iteration reaches the biased shutdown
-                // arm, whose per-slice counted forfeiture is the ONE
-                // sanctioned drop exit.
+                // arm, whose per-slice counted forfeiture closes the
+                // pass-external drop exits.
                 unshipped.push_back(slice);
                 return ShipPass::Cancelled {
                     requeued_in_flight: true,
                 };
             }
-            delivered = ship(&slice) => {
-                if !delivered {
+            outcome = ship(&slice) => match outcome {
+                ShipOutcome::Delivered => {}
+                ShipOutcome::Transient => {
                     // The recredit law: retain VERBATIM for the next
-                    // attempt (within this pass's budget, or the next
-                    // flush's pass).
+                    // flush's pass (one attempt per slice per pass —
+                    // never re-attempted within this one).
                     unshipped.push_back(slice);
+                    retained += 1;
+                }
+                ShipOutcome::Refused => {
+                    // The counted-drop chokepoint, IN the pass that
+                    // observes the refusal — a refused slice cannot
+                    // exit silently and cannot recirculate.
+                    record_exposure_drop(ExposureDropReason::Refused, slice.secs);
+                    refused += 1;
                 }
             }
         }
     }
+    ShipPass::Completed { retained, refused }
 }
 
 /// merged_bug_001 (Q2-round5): the cluster identity axis of every
@@ -1495,7 +1671,7 @@ fn annotation_target(pod: &Pod) -> Option<(String, String, String)> {
 
 #[cfg(test)]
 mod tests {
-    // r[verify ctrl.informer.exposure-recredit+2]
+    // r[verify ctrl.informer.exposure-recredit+3]
     /// bug_150 + merged_bug_002: a failed exposure append re-credits
     /// the slice; across an outage spanning N windows, total banked
     /// exposure is conserved as N DISTINCT keyed slices — never a
@@ -1519,17 +1695,15 @@ mod tests {
             (unshipped[0].hw.as_str(), unshipped[0].secs),
             ("m6id", 60.0)
         );
+        // Zero-time-advance closure (merged_bug_001-r6 wrong-witness
+        // kill): the recredit is a property of the ROTATION — the
+        // budget arm provably cannot be the bounder, because no
+        // virtual time ever elapses.
         ship_all(
             &mut unshipped,
             &rio_common::signal::Token::new(),
-            // Paused clock: 5 virtual seconds per failed attempt
-            // against a 5s budget = exactly one attempt per slice
-            // (the recredit law, without budget-loop re-attempts).
-            Duration::from_secs(5),
-            |_| async {
-                tokio::time::advance(Duration::from_secs(5)).await;
-                false
-            },
+            EXPOSURE_SHIP_PASS_BUDGET,
+            |_| std::future::ready(ShipOutcome::Transient),
         )
         .await;
         assert_eq!(unshipped.len(), 1, "failed slice re-credited, not consumed");
@@ -1558,7 +1732,7 @@ mod tests {
             EXPOSURE_SHIP_PASS_BUDGET,
             |s: &PendingExposure| {
                 shipped.push(s.secs);
-                std::future::ready(true)
+                std::future::ready(ShipOutcome::Delivered)
             },
         )
         .await;
@@ -1566,7 +1740,7 @@ mod tests {
         assert!(unshipped.is_empty(), "delivered slices leave no residue");
     }
 
-    // r[verify ctrl.informer.exposure-recredit+2]
+    // r[verify ctrl.informer.exposure-recredit+3]
     /// A retained class with NO fresh slice this round (its nodes were
     /// deleted mid-outage) still retries — retention is queue
     /// membership, independent of fresh production.
@@ -1577,17 +1751,13 @@ mod tests {
         let mut unshipped: VecDeque<PendingExposure> = VecDeque::new();
         let w1 = gate.admit(500.0).expect("first admit");
         queue_exposure_slices(&mut unshipped, vec![("m6id".into(), 45.0)], &cluster, w1);
+        // Zero-time-advance closure (merged_bug_001-r6 wrong-witness
+        // kill): retention is the rotation's law, not the budget's.
         ship_all(
             &mut unshipped,
             &rio_common::signal::Token::new(),
-            // Paused clock: 5 virtual seconds per failed attempt
-            // against a 5s budget = exactly one attempt per slice
-            // (the recredit law, without budget-loop re-attempts).
-            Duration::from_secs(5),
-            |_| async {
-                tokio::time::advance(Duration::from_secs(5)).await;
-                false
-            },
+            EXPOSURE_SHIP_PASS_BUDGET,
+            |_| std::future::ready(ShipOutcome::Transient),
         )
         .await;
         // Next flush: NO fresh slices — retention is queue
@@ -1601,7 +1771,7 @@ mod tests {
             EXPOSURE_SHIP_PASS_BUDGET,
             |s: &PendingExposure| {
                 attempted.push((s.hw.clone(), s.secs));
-                std::future::ready(true)
+                std::future::ready(ShipOutcome::Delivered)
             },
         )
         .await;
@@ -1609,7 +1779,7 @@ mod tests {
         assert!(unshipped.is_empty());
     }
 
-    // r[verify ctrl.informer.exposure-recredit+2]
+    // r[verify ctrl.informer.exposure-recredit+3]
     /// merged_bug_002 red: the retry of a slice whose append
     /// committed-but-timed-out MUST collide with its own committed row
     /// — which requires the uid to be deterministic and carried
@@ -1638,14 +1808,8 @@ mod tests {
         ship_all(
             &mut unshipped,
             &rio_common::signal::Token::new(),
-            // Paused clock: 5 virtual seconds per failed attempt
-            // against a 5s budget = exactly one attempt per slice
-            // (the recredit law, without budget-loop re-attempts).
-            Duration::from_secs(5),
-            |_| async {
-                tokio::time::advance(Duration::from_secs(5)).await;
-                false
-            },
+            EXPOSURE_SHIP_PASS_BUDGET,
+            |_| std::future::ready(ShipOutcome::Transient),
         )
         .await;
         assert_eq!(
@@ -1654,7 +1818,7 @@ mod tests {
         );
     }
 
-    // r[verify ctrl.informer.exposure-recredit+2]
+    // r[verify ctrl.informer.exposure-recredit+3]
     /// merged_bug_001 red R1: the uid carries the cluster axis and a
     /// grid-aligned window slot. Two clusters, same hw + same instant
     /// ⇒ uids DIFFER (cross-cluster absorbs unconstructible in the
@@ -1720,7 +1884,7 @@ mod tests {
         assert_eq!(qd[0].uid.as_str(), "exposure::mid-ebs-x86:1767225600");
     }
 
-    // r[verify ctrl.informer.exposure-recredit+2]
+    // r[verify ctrl.informer.exposure-recredit+3]
     /// merged_bug_001 red R2: window identity is strictly monotone per
     /// process — a clock step backward or a same-slot double tick is
     /// REFUSED (banking deferred), never re-minted under fresh
@@ -1755,7 +1919,7 @@ mod tests {
         );
     }
 
-    // r[verify ctrl.informer.exposure-recredit+2]
+    // r[verify ctrl.informer.exposure-recredit+3]
     /// merged_bug_001 red R3: a gate-deferred window forfeits NOTHING
     /// — cursors untouched, zero drop ticks, the retained queue
     /// intact (it still ships). Extends the conservation family
@@ -1775,7 +1939,10 @@ mod tests {
         let _g = ::metrics::set_default_local_recorder(&rec);
 
         // Round 1 (t=1060 → slot 1020): banks one slice; its append
-        // fails → retained (the combinator's recredit law).
+        // fails transiently → retained (the combinator's recredit
+        // law). Zero-time-advance closure (merged_bug_001-r6
+        // wrong-witness kill, R-D2): the gate-None conservation below
+        // is certified free of the paused-clock recredit scaffolding.
         let w1 = gate.admit(1060.0).expect("first admit");
         let out = flush_spot_exposure(&mut cursors, &nodes, &cfg, 0.0, 1060.0);
         assert!(out.drops.is_empty());
@@ -1784,14 +1951,8 @@ mod tests {
         ship_all(
             &mut unshipped,
             &rio_common::signal::Token::new(),
-            // Paused clock: 5 virtual seconds per failed attempt
-            // against a 5s budget = exactly one attempt per slice
-            // (the recredit law, without budget-loop re-attempts).
-            Duration::from_secs(5),
-            |_| async {
-                tokio::time::advance(Duration::from_secs(5)).await;
-                false
-            },
+            EXPOSURE_SHIP_PASS_BUDGET,
+            |_| std::future::ready(ShipOutcome::Transient),
         )
         .await;
         assert_eq!(unshipped.len(), 1, "failed slice retained");
@@ -1835,7 +1996,257 @@ mod tests {
         unshipped
     }
 
-    // r[verify ctrl.informer.exposure-drain-budget]
+    // r[verify ctrl.informer.exposure-drain-budget+2]
+    /// merged_bug_001-r6 red R-A: each queued slice gets AT MOST ONE
+    /// attempt per pass — the rotation, not the budget, bounds pass
+    /// work (the closure advances ZERO virtual time, so the budget
+    /// arm provably cannot be the bounder; the round-5 recredit
+    /// witnesses proved one-attempt-per-slice only via paused-clock
+    /// engineering, 5 virtual s/attempt against a 5s budget).
+    /// Recorded red against the pre-fix combinator (bool alphabet,
+    /// fail 5× then deliver): `left: 6 / right: 1` — the slice
+    /// delivered within ONE pass after 6 same-pass attempts.
+    /// Certifies: the attempts bound itself, with the budget provably
+    /// not the bounder.
+    #[tokio::test(start_paused = true)]
+    async fn drain_pass_attempts_each_queued_slice_exactly_once() {
+        let mut unshipped = minted_backlog(1);
+        let shutdown = rio_common::signal::Token::new();
+        let mut attempts = 0u32;
+        let pass = ship_all(&mut unshipped, &shutdown, EXPOSURE_SHIP_PASS_BUDGET, |_| {
+            attempts += 1;
+            // Would deliver on the 6th same-pass attempt — under the
+            // one-rotation law that attempt can never happen in THIS
+            // pass.
+            let outcome = if attempts > 5 {
+                ShipOutcome::Delivered
+            } else {
+                ShipOutcome::Transient
+            };
+            std::future::ready(outcome)
+        })
+        .await;
+        assert_eq!(
+            attempts, 1,
+            "one attempt per queued slice per pass (the flush period is the retry pacing)"
+        );
+        assert_eq!(
+            pass,
+            ShipPass::Completed {
+                retained: 1,
+                refused: 0
+            },
+            "the transient slice is retained, the rotation completes"
+        );
+        assert_eq!(unshipped.len(), 1, "retained for the NEXT flush's pass");
+    }
+
+    // r[verify ctrl.informer.exposure-recredit+3]
+    // r[verify ctrl.informer.exposure-drain-budget+2]
+    /// merged_bug_001-r6 red R-B: a permanently-refused slice exits
+    /// COUNTED within its pass — queue empty, pass residue carried in
+    /// `Completed`, and the whole seconds land on
+    /// `rio_controller_spot_exposure_dropped_seconds_total{reason="refused"}`.
+    /// Recorded red (DISCLOSED STRAWMAN — `Refused` is
+    /// unrepresentable in the old bool alphabet, mapped to `false`,
+    /// with 5 virtual s/attempt terminating the otherwise-unbounded
+    /// pre-fix loop at a 12s budget): `left: 1 / right: 0` queue
+    /// residue, and the reason="refused" series did not exist.
+    /// Certifies: the conservation identity's refused leg
+    /// (in == delivered + retained + counted).
+    #[tokio::test(start_paused = true)]
+    async fn refused_slice_exits_counted_within_its_pass() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let rec = DebuggingRecorder::new();
+        let _g = ::metrics::set_default_local_recorder(&rec);
+        let mut unshipped = minted_backlog(2);
+        let shutdown = rio_common::signal::Token::new();
+        let pass = ship_all(
+            &mut unshipped,
+            &shutdown,
+            EXPOSURE_SHIP_PASS_BUDGET,
+            |s: &PendingExposure| {
+                // Slice 1 (slot 960) is permanently refused; slice 2
+                // delivers. Zero virtual time advances.
+                let outcome = if s.uid.as_str().ends_with(":960") {
+                    ShipOutcome::Refused
+                } else {
+                    ShipOutcome::Delivered
+                };
+                std::future::ready(outcome)
+            },
+        )
+        .await;
+        assert_eq!(
+            unshipped.len(),
+            0,
+            "a permanently-refused slice must exit its pass counted, not recirculate"
+        );
+        assert_eq!(
+            pass,
+            ShipPass::Completed {
+                retained: 0,
+                refused: 1
+            }
+        );
+        // Snapshot EXACTLY ONCE (DebuggingRecorder drains on
+        // snapshot) and query the materialized Vec.
+        let snapshot = rec.snapshotter().snapshot().into_vec();
+        let refused_secs = snapshot.into_iter().find_map(|(k, _, _, v)| {
+            let key = k.key();
+            (key.name() == "rio_controller_spot_exposure_dropped_seconds_total"
+                && key
+                    .labels()
+                    .any(|l| l.key() == "reason" && l.value() == "refused"))
+            .then_some(v)
+        });
+        match refused_secs {
+            Some(DebugValue::Counter(n)) => assert_eq!(
+                n, 60,
+                "the refused slice's whole seconds exit through the counted chokepoint"
+            ),
+            other => panic!("refused drop uncounted: no reason=refused series ({other:?})"),
+        }
+    }
+
+    /// merged_bug_001-r6 red R-C: the classification chokepoint is
+    /// total over all 17 `tonic::Code` variants and fail-open toward
+    /// retention (drop only on proof of futility). New chokepoint —
+    /// no pre-fix red exists (disclosed); the compiler's exhaustive
+    /// match is the census generator, this table pins each arm's
+    /// VALUE. Certifies: the classification axis's totality and the
+    /// documented fail-open-toward-retention default.
+    #[test]
+    fn classify_append_status_total_over_tonic_codes() {
+        use tonic::Code;
+        let refused = [
+            Code::InvalidArgument,
+            Code::OutOfRange,
+            Code::Unimplemented,
+            Code::FailedPrecondition,
+            Code::Unauthenticated,
+            Code::PermissionDenied,
+        ];
+        let transient = [
+            Code::Ok,
+            Code::Cancelled,
+            Code::Unknown,
+            Code::DeadlineExceeded,
+            Code::NotFound,
+            Code::AlreadyExists,
+            Code::ResourceExhausted,
+            Code::Aborted,
+            Code::Internal,
+            Code::Unavailable,
+            Code::DataLoss,
+        ];
+        assert_eq!(
+            refused.len() + transient.len(),
+            17,
+            "every tonic::Code variant is pinned exactly once"
+        );
+        for code in refused {
+            assert_eq!(
+                classify_append_status(code),
+                ShipOutcome::Refused,
+                "{code:?} is provably futile — counted drop over eternal recirculation"
+            );
+        }
+        for code in transient {
+            assert_eq!(
+                classify_append_status(code),
+                ShipOutcome::Transient,
+                "{code:?} retains (fail-open toward retention; consume only on ack)"
+            );
+        }
+    }
+
+    mod ship_all_props {
+        use std::collections::VecDeque;
+
+        use proptest::prelude::*;
+
+        use super::super::{
+            EXPOSURE_SHIP_PASS_BUDGET, PendingExposure, ShipOutcome, ShipPass, ship_all,
+        };
+        use super::minted_backlog;
+
+        fn outcome(cell: u8) -> ShipOutcome {
+            match cell % 3 {
+                0 => ShipOutcome::Delivered,
+                1 => ShipOutcome::Transient,
+                _ => ShipOutcome::Refused,
+            }
+        }
+
+        proptest! {
+            /// merged_bug_001-r6 red R-E: under ARBITRARY queue sizes
+            /// × ARBITRARY per-slice outcome scripts — attempts ≤
+            /// |queue at pass start|, the conservation identity holds
+            /// (Σ secs in == Σ delivered + Σ retained + Σ
+            /// refused-counted), and the `Completed` counts match the
+            /// script. Paused-clock runtime with zero-advance
+            /// closures: the budget arm structurally cannot exit.
+            /// Certifies: the pass envelope's work leg over the whole
+            /// outcome alphabet, not a hand-picked script.
+            #[test]
+            fn ship_all_pass_work_bounded_by_queue(
+                script in proptest::collection::vec(0u8..3, 0..24)
+            ) {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .start_paused(true)
+                    .build()
+                    .expect("current-thread test runtime");
+                let checked: Result<(), TestCaseError> = rt.block_on(async {
+                    let mut unshipped: VecDeque<PendingExposure> =
+                        minted_backlog(script.len() as u64);
+                    let initial = unshipped.len();
+                    let total_in: f64 = unshipped.iter().map(|s| s.secs).sum();
+                    let mut attempts = 0usize;
+                    let mut delivered_secs = 0.0f64;
+                    let mut refused_secs = 0.0f64;
+                    let mut retained_n = 0usize;
+                    let mut refused_n = 0usize;
+                    let pass = ship_all(
+                        &mut unshipped,
+                        &rio_common::signal::Token::new(),
+                        EXPOSURE_SHIP_PASS_BUDGET,
+                        |s: &PendingExposure| {
+                            let o = outcome(script[attempts]);
+                            attempts += 1;
+                            match o {
+                                ShipOutcome::Delivered => delivered_secs += s.secs,
+                                ShipOutcome::Transient => retained_n += 1,
+                                ShipOutcome::Refused => {
+                                    refused_secs += s.secs;
+                                    refused_n += 1;
+                                }
+                            }
+                            std::future::ready(o)
+                        },
+                    )
+                    .await;
+                    prop_assert!(attempts <= initial, "attempts {} > initial {}", attempts, initial);
+                    let queued_after: f64 = unshipped.iter().map(|s| s.secs).sum();
+                    prop_assert_eq!(
+                        total_in,
+                        delivered_secs + queued_after + refused_secs,
+                        "Σ in == Σ delivered + Σ retained + Σ refused-counted"
+                    );
+                    prop_assert_eq!(
+                        pass,
+                        ShipPass::Completed { retained: retained_n, refused: refused_n }
+                    );
+                    prop_assert_eq!(unshipped.len(), retained_n);
+                    Ok(())
+                });
+                checked?;
+            }
+        }
+    }
+
+    // r[verify ctrl.informer.exposure-drain-budget+2]
     /// merged_bug_033 red R6: a drain pass is bounded by the
     /// wall-clock budget — the remainder DEFERS (stays queued, zero
     /// drop ticks; deferral is not forfeiture). Recorded red at the
@@ -1857,10 +2268,13 @@ mod tests {
             attempts += 1;
             async {
                 // Paused clock: each shipment costs 5 virtual
-                // seconds and fails (the stalled-scheduler
-                // shape).
+                // seconds and fails transiently (the
+                // stalled-scheduler shape). This is the DEADLINE
+                // witness — the time-advancing closure is the budget
+                // arm's own legitimate domain (merged_bug_001-r6:
+                // the attempts-bound witnesses advance zero time).
                 tokio::time::advance(Duration::from_secs(5)).await;
-                false
+                ShipOutcome::Transient
             }
         })
         .await;
@@ -1881,7 +2295,7 @@ mod tests {
         );
     }
 
-    // r[verify ctrl.informer.exposure-drain-budget]
+    // r[verify ctrl.informer.exposure-drain-budget+2]
     /// merged_bug_033 red R7: shutdown preempts the IN-FLIGHT ship —
     /// the combinator returns within one poll of cancellation, the
     /// preempted slice re-queues under an IDENTICAL EventUid (the
@@ -1909,9 +2323,9 @@ mod tests {
                         // Slice 2 hangs forever; shutdown fires
                         // mid-flight.
                         token.cancel();
-                        std::future::pending::<bool>().await
+                        std::future::pending::<ShipOutcome>().await
                     } else {
-                        true
+                        ShipOutcome::Delivered
                     }
                 }
             }),
@@ -1938,8 +2352,8 @@ mod tests {
         );
     }
 
-    // r[verify ctrl.informer.exposure-recredit+2]
-    // r[verify ctrl.informer.exposure-drain-budget]
+    // r[verify ctrl.informer.exposure-recredit+3]
+    // r[verify ctrl.informer.exposure-drain-budget+2]
     /// merged_bug_033 red R8: conservation across preemption — every
     /// node-second entering a cancelled pass is either ACKED or still
     /// QUEUED (the cancel-requeue is PENDING, not a drop; the counted
@@ -1970,9 +2384,9 @@ mod tests {
                     async move {
                         if cancel_now {
                             token.cancel();
-                            std::future::pending::<bool>().await
+                            std::future::pending::<ShipOutcome>().await
                         } else {
-                            true
+                            ShipOutcome::Delivered
                         }
                     }
                 },
@@ -2347,7 +2761,7 @@ mod tests {
         assert!(!cursors.contains_key("od"));
     }
 
-    // r[verify ctrl.informer.exposure-recredit+2]
+    // r[verify ctrl.informer.exposure-recredit+3]
     /// §4(a)2 gate (capacity-type / match gating): spot nodes whose
     /// labels match no configured `$h` advance their cursor WITHOUT
     /// banking — a late config load does not retro-bank the unmatched
@@ -2384,7 +2798,7 @@ mod tests {
         assert!(out.drops.is_empty());
     }
 
-    // r[verify ctrl.informer.exposure-recredit+2]
+    // r[verify ctrl.informer.exposure-recredit+3]
     /// §4(a)2 gate (the recorded accepted under-count): a node absent
     /// from the LIST has its cursor dropped without banking the final
     /// partial slice — and merged_bug_070(c) red: the forfeited
@@ -2447,7 +2861,7 @@ mod tests {
         assert!(out.drops.is_empty());
     }
 
-    // r[verify ctrl.informer.exposure-recredit+2]
+    // r[verify ctrl.informer.exposure-recredit+3]
     /// merged_bug_070(d) red: a controller RESTART must not re-bank
     /// windows the previous incarnation already shipped. Cursor seeds
     /// clamp to `max(creationTimestamp, boot_epoch)` — `left:` pre-fix
@@ -2479,7 +2893,7 @@ mod tests {
         assert_eq!(out.banked, vec![("intel-7".into(), 30.0)]);
     }
 
-    // r[verify ctrl.informer.exposure-recredit+2]
+    // r[verify ctrl.informer.exposure-recredit+3]
     /// merged_bug_070(b) red: shutdown forfeits the WHOLE pending
     /// backlog — the spec's old "at most one pending window" bound was
     /// false (each failed flush queues another window; the carrier is
