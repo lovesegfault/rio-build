@@ -596,7 +596,7 @@ impl DagActor {
             Err(e) => {
                 error!(count = drv_hashes.len(), ?status, error = %e,
                        "failed to batch-persist derivation status; latched in the outbox");
-                // r[impl sched.attempt.cancel-close-driven+2]
+                // r[impl sched.attempt.cancel-close-driven+3]
                 // The persist is what closes the batch's assignment
                 // rows: latch the owned batch for the housekeeping
                 // tick's flusher, dropped only on a later Ok or when

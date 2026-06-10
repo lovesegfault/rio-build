@@ -6320,7 +6320,7 @@ rec {
     # r[verify sched.grpc.fence-retryable]
     # r[verify sched.lease.tenure-stamp-type]
     # r[verify sched.recovery.step-down+3]
-    # r[verify sched.attempt.cancel-close-driven+2]
+    # r[verify sched.attempt.cancel-close-driven+3]
     quint-fenced-writes = mkQuintCheck {
       name = "fenced-writes";
       spec = "fencedWrites";
@@ -8522,7 +8522,7 @@ rec {
     # old form was a propositional tautology; the new one is a
     # live-computed latch seated at the transition that must arm the
     # driver).
-    # r[verify sched.attempt.cancel-close-driven+2]
+    # r[verify sched.attempt.cancel-close-driven+3]
     # r[verify sched.materialize.ack-law]
     # r[verify sched.materialize.claim-coherence]
     # r[verify sched.materialize.claim-resume]

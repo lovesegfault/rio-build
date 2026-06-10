@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use super::{TERMINAL_STATUSES, insert_test_derivation};
 use crate::db::{FencedOutcome, SchedulerDb};
-use crate::state::DrvHash;
+use crate::state::{DrvHash, ExecutorId};
 
 // r[verify sched.poison.ttl-persist]
 /// Roundtrip: persist_poisoned → load_poisoned_derivations → clear_poison.
@@ -575,7 +575,7 @@ async fn current_tenure_status_and_poison_writes_apply() -> anyhow::Result<()> {
 /// blip followed by a resubmit left the attempt durably open until it
 /// aged into ChargeExecutorCrash against a healthily-rebuilding
 /// derivation.
-// r[verify sched.attempt.cancel-close-driven+2]
+// r[verify sched.attempt.cancel-close-driven+3]
 #[tokio::test]
 async fn replay_with_all_drvs_dropped_still_closes_latched_execs() -> anyhow::Result<()> {
     use crate::state::DerivationStatus;
@@ -813,15 +813,18 @@ async fn stamp_epoch(pool: &sqlx::PgPool, drv_hash: &str) -> anyhow::Result<f64>
     Ok(epoch)
 }
 
-// r[verify sched.attempt.cancel-close-driven+2]
-/// merged_bug_004: the runtime half of the comparand-purity census.
-/// PROPOSITION CERTIFIED: driving EVERY production derivations writer
-/// (the list pinned by `derivations_status_stamp_census`), the
-/// `status_changed_at` stamp advances IFF the writer set `status` —
-/// so the precedence conjunct's comparand moves on exactly the events
-/// the precedence law quantifies over. The match below is total over
-/// the census consts: a writer added to the census without a drive
-/// arm panics here.
+// r[verify sched.attempt.cancel-close-driven+3]
+/// merged_bug_004/merged_bug_006: the ADVANCE half of the comparand
+/// law. PROPOSITION CERTIFIED: driving EVERY production derivations
+/// writer (the list pinned by `derivations_status_stamp_census`) with
+/// a value-CHANGING write, the `status_changed_at` stamp advances —
+/// the migration-102 trigger reproduces the old per-writer stamp on
+/// every genuine transition — and every non-status writer leaves the
+/// comparand stationary. The STASIS half for value-PRESERVING status
+/// writes is the sibling test
+/// `status_writers_hold_the_comparand_on_value_preserving_writes`.
+/// The match below is total over the census consts: a writer added to
+/// the census without a drive arm panics here.
 #[tokio::test]
 async fn status_writers_stamp_status_changed_at_biconditional() -> anyhow::Result<()> {
     use super::fence_coverage::{NON_STATUS_DERIVATIONS_WRITER_FNS, STATUS_WRITER_FNS};
@@ -985,7 +988,258 @@ async fn status_writers_stamp_status_changed_at_biconditional() -> anyhow::Resul
     Ok(())
 }
 
-// r[verify sched.attempt.cancel-close-driven+2]
+// r[verify sched.attempt.cancel-close-driven+3]
+/// merged_bug_006 R1: the STASIS half of the comparand law.
+/// PROPOSITION CERTIFIED: for EVERY member of the machine-derived
+/// `STATUS_WRITER_FNS` census, a value-PRESERVING drive leaves
+/// `status_changed_at` byte-stationary — the exact invariant the spec
+/// sentence quantifies over ("the comparand moves iff the status
+/// VALUE changes"), not column presence. The match is total over the
+/// census consts: a writer added to the census without a
+/// value-preserving drive arm panics here. The replay arm is the one
+/// writer whose own WHERE already excludes the same-value row (it
+/// classifies `AlreadyApplied`); the five siblings pre-fix stamped
+/// unconditionally.
+#[tokio::test]
+async fn status_writers_hold_the_comparand_on_value_preserving_writes() -> anyhow::Result<()> {
+    use super::fence_coverage::STATUS_WRITER_FNS;
+    use crate::state::DerivationStatus;
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+    let generation = ServingGeneration::stamp_from_claim(1);
+
+    for writer in STATUS_WRITER_FNS {
+        let hash = format!("stamp-stasis-{writer}");
+        let drv_hash: DrvHash = hash.as_str().into();
+        insert_test_derivation(&db, &hash).await?;
+
+        // World setup: a value-CHANGING drive to the target each
+        // writer re-asserts, so the measured drive below is
+        // value-preserving by construction.
+        match *writer {
+            "update_derivation_status_in_tx" => {
+                let mut tx = test_db.pool.begin().await?;
+                SchedulerDb::update_derivation_status_in_tx(
+                    &mut tx,
+                    &drv_hash,
+                    DerivationStatus::Ready,
+                    None,
+                )
+                .await?;
+                tx.commit().await?;
+            }
+            "update_derivation_status_batch_in_tx" | "replay_status_batch_guarded" => {
+                let mut tx = test_db.pool.begin().await?;
+                SchedulerDb::update_derivation_status_batch_in_tx(
+                    &mut tx,
+                    &[hash.as_str()],
+                    DerivationStatus::Cancelled,
+                )
+                .await?;
+                tx.commit().await?;
+            }
+            "persist_poisoned_in_tx" => {
+                let mut tx = test_db.pool.begin().await?;
+                SchedulerDb::persist_poisoned_in_tx(&mut tx, &drv_hash).await?;
+                tx.commit().await?;
+            }
+            // The clear arms re-assert 'created' — the fresh insert's
+            // own status; no transition needed.
+            "clear_poison_in_tx" | "clear_poison_batch_in_tx" => {}
+            other => panic!(
+                "census names status writer `{other}` but the stasis \
+                 test does not classify its world setup — add an arm"
+            ),
+        }
+        // Backdate so a spurious re-stamp is unambiguous (and the
+        // replay arm's age cut admits the row).
+        sqlx::query(
+            "UPDATE derivations SET \
+               updated_at = now() - interval '120 seconds', \
+               status_changed_at = now() - interval '120 seconds' \
+             WHERE drv_hash = $1",
+        )
+        .bind(&hash)
+        .execute(&test_db.pool)
+        .await?;
+        let before = stamp_epoch(&test_db.pool, &hash).await?;
+        let (status_before,): (String,) =
+            sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = $1")
+                .bind(&hash)
+                .fetch_one(&test_db.pool)
+                .await?;
+
+        // The measured drive: the SAME writer, the SAME target value.
+        match *writer {
+            "update_derivation_status_in_tx" => {
+                // Same status, new builder id — the same-status
+                // re-assignment shape from the merged_bug_006 trace.
+                let mut tx = test_db.pool.begin().await?;
+                SchedulerDb::update_derivation_status_in_tx(
+                    &mut tx,
+                    &drv_hash,
+                    DerivationStatus::Ready,
+                    Some(&ExecutorId::from("builder-reassigned")),
+                )
+                .await?;
+                tx.commit().await?;
+            }
+            "update_derivation_status_batch_in_tx" => {
+                // Duplicate cancel via the batch writer.
+                let mut tx = test_db.pool.begin().await?;
+                SchedulerDb::update_derivation_status_batch_in_tx(
+                    &mut tx,
+                    &[hash.as_str()],
+                    DerivationStatus::Cancelled,
+                )
+                .await?;
+                tx.commit().await?;
+            }
+            "replay_status_batch_guarded" => {
+                // Replay of an already-at-target row: the WHERE's
+                // `status IS DISTINCT FROM $2` excludes it — the one
+                // writer that was guarded pre-102. Classifies
+                // AlreadyApplied, never re-stamps.
+                let outcome = db
+                    .replay_status_batch_guarded(
+                        &[hash.as_str()],
+                        DerivationStatus::Cancelled,
+                        &[],
+                        std::time::Instant::now() - std::time::Duration::from_secs(60),
+                        generation,
+                    )
+                    .await?;
+                assert!(
+                    matches!(
+                        &outcome,
+                        crate::db::StatusReplay::Applied { replayed, residual }
+                            if replayed.is_empty()
+                                && matches!(
+                                    residual.as_slice(),
+                                    [(h, crate::db::ReplayResidual::AlreadyApplied)] if h == &hash
+                                )
+                    ),
+                    "same-value replay must classify AlreadyApplied (got {outcome:?})"
+                );
+            }
+            "persist_poisoned_in_tx" => {
+                // Re-poison the poisoned row.
+                let mut tx = test_db.pool.begin().await?;
+                SchedulerDb::persist_poisoned_in_tx(&mut tx, &drv_hash).await?;
+                tx.commit().await?;
+            }
+            "clear_poison_in_tx" => {
+                // Clear of an already-'created' row.
+                let mut tx = test_db.pool.begin().await?;
+                SchedulerDb::clear_poison_in_tx(&mut tx, &drv_hash).await?;
+                tx.commit().await?;
+            }
+            "clear_poison_batch_in_tx" => {
+                let mut tx = test_db.pool.begin().await?;
+                SchedulerDb::clear_poison_batch_in_tx(&mut tx, std::slice::from_ref(&drv_hash))
+                    .await?;
+                tx.commit().await?;
+            }
+            other => panic!(
+                "census names status writer `{other}` but the stasis \
+                 test does not drive it — add a value-preserving arm"
+            ),
+        }
+        let after = stamp_epoch(&test_db.pool, &hash).await?;
+        let (status_after,): (String,) =
+            sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = $1")
+                .bind(&hash)
+                .fetch_one(&test_db.pool)
+                .await?;
+        assert_eq!(
+            status_before, status_after,
+            "drive for `{writer}` must be value-preserving"
+        );
+        assert!(
+            (after - before).abs() < 1e-9,
+            "left: epoch advanced on a value-preserving write (the comparand \
+             re-asserted a non-change) / right: stationary \
+             (writer: {writer}, before: {before}, after: {after})"
+        );
+    }
+    Ok(())
+}
+
+// r[verify sched.attempt.cancel-close-driven+3]
+/// merged_bug_006 R2: the end-to-end form of the false-refusal trace.
+/// PROPOSITION CERTIFIED: a kept DAG-absent terminal latch survives an
+/// interposed value-preserving write — replayed and named in the
+/// RETURNING set, not `RefusedNewer` — i.e.
+/// `rio_scheduler_status_outbox_replay_refused_total` counts evidenced
+/// foreign precedence ONLY, the metric's documented semantics. Pre-102
+/// the interposed no-op write advanced the comparand past the latch
+/// cut and the batch popped as final with the durable row stale
+/// forever (the terminal-KEEP latch is the node's LAST truth).
+#[tokio::test]
+async fn kept_terminal_latch_survives_value_preserving_interposition() -> anyhow::Result<()> {
+    use crate::state::DerivationStatus;
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+    let generation = ServingGeneration::stamp_from_claim(1);
+
+    let hash = "latch-survives-interposition";
+    let drv_hash: DrvHash = hash.into();
+    insert_test_derivation(&db, hash).await?;
+    let mut tx = test_db.pool.begin().await?;
+    SchedulerDb::update_derivation_status_in_tx(&mut tx, &drv_hash, DerivationStatus::Queued, None)
+        .await?;
+    tx.commit().await?;
+
+    // The row's last STATUS event was 120s ago; the terminal latch
+    // was enqueued 60s ago (PG was down at persist time; the node
+    // left the DAG, so flush-time re-derivation KEEPS the latch).
+    sqlx::query(
+        "UPDATE derivations SET \
+           updated_at = now() - interval '120 seconds', \
+           status_changed_at = now() - interval '120 seconds' \
+         WHERE drv_hash = $1",
+    )
+    .bind(hash)
+    .execute(&test_db.pool)
+    .await?;
+
+    // Interpose a value-preserving write inside the latch->flush
+    // window: a duplicate Queued re-assertion via the batch writer.
+    let mut tx = test_db.pool.begin().await?;
+    SchedulerDb::update_derivation_status_batch_in_tx(&mut tx, &[hash], DerivationStatus::Queued)
+        .await?;
+    tx.commit().await?;
+
+    // Replay the kept terminal latch.
+    let outcome = db
+        .replay_status_batch_guarded(
+            &[hash],
+            DerivationStatus::Cancelled,
+            &[],
+            std::time::Instant::now() - std::time::Duration::from_secs(60),
+            generation,
+        )
+        .await?;
+    match &outcome {
+        crate::db::StatusReplay::Applied { replayed, residual } => {
+            assert_eq!(
+                replayed.as_slice(),
+                std::slice::from_ref(&hash.to_string()),
+                "left: replayed=[] and residual={residual:?} (a no-op write \
+                 popped the latched terminal as final) / right: replayed=[drv]"
+            );
+        }
+        other => panic!("replay must commit (got {other:?})"),
+    }
+    let (status,): (String,) = sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = $1")
+        .bind(hash)
+        .fetch_one(&test_db.pool)
+        .await?;
+    assert_eq!(status, "cancelled", "the latched terminal must land");
+    Ok(())
+}
+
+// r[verify sched.attempt.cancel-close-driven+3]
 /// merged_bug_004 hole 2 red: a NON-status write between latch and
 /// flush must not refuse a latched terminal replay. PROPOSITION
 /// CERTIFIED: the precedence conjunct's comparand is writable only by
@@ -1055,7 +1309,7 @@ async fn outbox_floor_bump_does_not_refuse_latched_terminal_replay() -> anyhow::
     Ok(())
 }
 
-// r[verify sched.attempt.cancel-close-driven+2]
+// r[verify sched.attempt.cancel-close-driven+3]
 /// merged_bug_004 hole 3 polarity guard — DISCLOSED, not a behavioral
 /// red: at test speeds the pre-fix sampling skew is microseconds, so
 /// this test cannot distinguish the boundary-sampled cut from the

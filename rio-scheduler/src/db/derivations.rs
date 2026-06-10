@@ -180,8 +180,7 @@ impl SchedulerDb {
         sqlx::query!(
             r#"
             UPDATE derivations
-            SET status = $2, assigned_builder_id = $3, updated_at = now(),
-                status_changed_at = now()
+            SET status = $2, assigned_builder_id = $3, updated_at = now()
             WHERE drv_hash = $1
             "#,
             drv_hash.as_str(),
@@ -249,8 +248,7 @@ impl SchedulerDb {
         let result = sqlx::query!(
             r#"
             UPDATE derivations
-            SET status = $2, assigned_builder_id = NULL, updated_at = now(),
-                status_changed_at = now()
+            SET status = $2, assigned_builder_id = NULL, updated_at = now()
             WHERE drv_hash = ANY($1::text[])
             "#,
             drv_hashes as &[&str],
@@ -310,7 +308,7 @@ impl SchedulerDb {
     /// writers added since).
     ///
     /// Claims-floor fenced like every evidence writer.
-    // r[impl sched.attempt.cancel-close-driven+2]
+    // r[impl sched.attempt.cancel-close-driven+3]
     // r[impl sched.evidence.durability+4]
     pub(crate) async fn replay_status_batch_guarded(
         &self,
@@ -348,18 +346,20 @@ impl SchedulerDb {
             // NON-terminal durable row, which the status-set guard
             // would have overwritten.
             //
-            // merged_bug_004: the comparand is `status_changed_at` —
-            // a column whose ONLY writers are status events (migration
-            // 101; the biconditional census in db/tests/
-            // fence_coverage.rs) — so a non-status write (the
-            // resource-floor ratchet, the merge-parity upsert) can no
-            // longer refuse a latched terminal persist, and the
-            // replay's own stamp moves the comparand only when it
-            // really changes the status VALUE: the `status IS
-            // DISTINCT FROM $2` guard keeps the comparand's meaning
-            // exact ("the instant the status VALUE last changed") —
-            // an already-at-target row is left to the residual lane
-            // instead of being re-stamped as a non-change.
+            // merged_bug_004/merged_bug_006: the comparand is
+            // `status_changed_at` — stamped exclusively by the
+            // migration-102 BEFORE UPDATE trigger, WHEN the status
+            // VALUE changes (no Rust SET list names it; the total-ban
+            // census in db/tests/fence_coverage.rs) — so neither a
+            // non-status write (the resource-floor ratchet, the
+            // merge-parity upsert) nor a value-preserving status
+            // write (same-status re-assignment, duplicate cancel,
+            // clear_poison on an already-'created' row) can refuse a
+            // latched terminal persist. The `status IS DISTINCT FROM
+            // $2` conjunct below is row FILTERING (precedence law —
+            // an already-at-target row is left to the residual lane),
+            // not stamping; the stamp's meaning ("the instant the
+            // status VALUE last changed") is exact by schema.
             //
             // merged_bug_017: BOTH comparands are PG-domain — the
             // latch crosses the clock boundary as a monotonic AGE
@@ -372,8 +372,7 @@ impl SchedulerDb {
             // allowed rows so the caller can surface the refused set.
             sqlx::query_scalar::<_, String>(
                 "UPDATE derivations \
-                 SET status = $2, assigned_builder_id = NULL, updated_at = now(), \
-                     status_changed_at = now() \
+                 SET status = $2, assigned_builder_id = NULL, updated_at = now() \
                  WHERE drv_hash = ANY($1::text[]) \
                    AND status_changed_at <= now() - make_interval(secs => $3) \
                    AND status IS DISTINCT FROM $2 \
@@ -559,8 +558,7 @@ impl SchedulerDb {
         sqlx::query!(
             "UPDATE derivations \
              SET status = 'poisoned', poisoned_at = now(), \
-                 assigned_builder_id = NULL, updated_at = now(), \
-                 status_changed_at = now() \
+                 assigned_builder_id = NULL, updated_at = now() \
              WHERE drv_hash = $1",
             drv_hash.as_str(),
         )
@@ -667,8 +665,7 @@ impl SchedulerDb {
     ) -> Result<(), sqlx::Error> {
         sqlx::query!(
             "UPDATE derivations
-             SET poisoned_at = NULL, status = 'created', updated_at = now(),
-                 status_changed_at = now()
+             SET poisoned_at = NULL, status = 'created', updated_at = now()
              WHERE drv_hash = $1",
             drv_hash.as_str(),
         )
@@ -769,8 +766,7 @@ impl SchedulerDb {
         let hashes: Vec<&str> = drv_hashes.iter().map(DrvHash::as_str).collect();
         let result = sqlx::query!(
             "UPDATE derivations
-             SET poisoned_at = NULL, status = 'created', updated_at = now(),
-                 status_changed_at = now()
+             SET poisoned_at = NULL, status = 'created', updated_at = now()
              WHERE drv_hash = ANY($1::text[])",
             &hashes as &[&str],
         )

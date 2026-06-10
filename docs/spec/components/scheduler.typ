@@ -3276,7 +3276,7 @@ deadline its pod really runs under; the residual gap between the Job's
 report slack. The kernel routing makes the decision axes explicit; the
 cancelled/absent-node row is normative below.
 
-#r("sched.attempt.cancel-close-driven+2")[
+#r("sched.attempt.cancel-close-driven+3")[
   A cancel-driven attempt close MUST be driven to durability: when the
   status persist that closes the attempt's assignment row fails, the
   scheduler MUST latch the batch — together with the affected
@@ -3298,9 +3298,10 @@ cancelled/absent-node row is normative below.
   derivation), so an attempt minted after the latch is untouchable by
   construction. The replay's precedence cut MUST be anchored on
   `status_changed_at` — a column whose only writers are status events
-  (migration 101; a status-preserving write MUST NOT refuse a latched
-  persist) — with the age sampled at the replay transaction boundary,
-  so the realized cut can only trail the enqueue instant (refuse,
+  (migrations 101+102 — the BEFORE UPDATE trigger is the stamp's
+  single authority; a status-preserving write MUST NOT refuse a
+  latched persist) — with the age sampled at the replay transaction
+  boundary, so the realized cut can only trail the enqueue instant (refuse,
   never overwrite), and the replay MUST NOT re-stamp a row already at
   the target status. Each zero-row residual MUST be classified at the
   durability point, in the replay transaction: already-applied (the

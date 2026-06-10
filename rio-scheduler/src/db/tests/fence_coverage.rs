@@ -383,12 +383,13 @@ fn absolute_status_batch_writer_callers_pinned() {
 }
 
 /// The status writers the source scan below derives — the runtime
-/// biconditional in `db/tests/derivations.rs` consumes EXACTLY this
-/// list (its per-writer match panics on an entry it does not drive),
-/// so a new status writer fails the census here until classified AND
-/// fails the runtime test until driven. The GENERATOR is the scan in
-/// [`derivations_status_stamp_census`]; this const is its pinned
-/// output, asserted equal every run.
+/// advance/stasis pair in `db/tests/derivations.rs` (the
+/// value-changing biconditional AND the value-preserving stasis test)
+/// consumes EXACTLY this list (each per-writer match panics on an
+/// entry it does not drive), so a new status writer fails the census
+/// here until classified AND fails the runtime tests until driven.
+/// The GENERATOR is the scan in [`derivations_status_stamp_census`];
+/// this const is its pinned output, asserted equal every run.
 pub(crate) const STATUS_WRITER_FNS: &[&str] = &[
     "clear_poison_batch_in_tx",
     "clear_poison_in_tx",
@@ -606,17 +607,19 @@ fn derivations_writes(file: &str, src: &str) -> Vec<DerivationsWrite> {
     out
 }
 
-// r[verify sched.attempt.cancel-close-driven+2]
-/// merged_bug_004: the comparand-purity census. PROPOSITION CERTIFIED:
-/// `status_changed_at`'s only production writers are status-setting
-/// statements — for every production `UPDATE derivations` (and every
-/// upsert's `DO UPDATE SET` list), the SET list names `status` IFF it
-/// names `status_changed_at`; an INSERT naming `status` is compliant
-/// via the column DEFAULT (a fresh row's status is born at insert) and
-/// may not name the stamp without naming `status`. This is the
-/// precedence law's quantification premise: the replay conjunct cuts
-/// on a column writable solely by the events the law orders. The law
-/// is TOTAL — no allowlist; a new writer fails here until classified.
+// r[verify sched.attempt.cancel-close-driven+3]
+/// merged_bug_004/merged_bug_006: the comparand-purity census, in its
+/// post-102 TOTAL-BAN form. PROPOSITION CERTIFIED: NO production
+/// `derivations` statement names `status_changed_at` in any SET list,
+/// `DO UPDATE SET` list, or INSERT column list — the migration-102
+/// BEFORE UPDATE trigger is the column's single authority (stamping
+/// IFF the status VALUE changes), so the single-authority law is
+/// checkable as the ABSENCE of any client-side writer; fresh rows
+/// ride the migration-101 DEFAULT. This is the precedence law's
+/// quantification premise: the replay conjunct cuts on a column
+/// writable solely by status VALUE-change events. The law is TOTAL —
+/// no allowlist; the scan-derived writer sets stay pinned to the
+/// consts the runtime stasis/advance tests drive.
 #[test]
 fn derivations_status_stamp_census() {
     let mut violations = Vec::new();
@@ -628,24 +631,19 @@ fn derivations_status_stamp_census() {
                 cols.as_ref().is_some_and(|cs| cs.iter().any(|c| c == col))
             };
             let set_status = names(&w.set_cols, "status");
-            let set_stamp = names(&w.set_cols, "status_changed_at");
-            if set_status && !set_stamp {
+            if names(&w.set_cols, "status_changed_at") {
                 violations.push(format!(
-                    "{}:{}: fn `{}` sets `status` without `status_changed_at = now()` \
-                     (the precedence comparand misses this status event)",
+                    "{}:{}: fn `{}` names `status_changed_at` in a SET/DO-UPDATE list \
+                     (the migration-102 trigger is the stamp's single authority — \
+                     no client statement may write the comparand)",
                     w.file, w.line, w.fn_name
                 ));
             }
-            if !set_status && set_stamp {
+            if names(&w.insert_cols, "status_changed_at") {
                 violations.push(format!(
-                    "{}:{}: fn `{}` sets `status_changed_at` without setting `status` \
-                     (a non-status event may not move the precedence comparand)",
-                    w.file, w.line, w.fn_name
-                ));
-            }
-            if names(&w.insert_cols, "status_changed_at") && !names(&w.insert_cols, "status") {
-                violations.push(format!(
-                    "{}:{}: fn `{}` INSERTs `status_changed_at` without `status`",
+                    "{}:{}: fn `{}` INSERTs `status_changed_at` (fresh rows ride \
+                     the migration-101 DEFAULT; the comparand has no client-side \
+                     writer)",
                     w.file, w.line, w.fn_name
                 ));
             }
@@ -658,7 +656,7 @@ fn derivations_status_stamp_census() {
     }
     assert!(
         violations.is_empty(),
-        "status_changed_at biconditional violations (merged_bug_004):\n{}",
+        "status_changed_at single-authority violations (merged_bug_006):\n{}",
         violations.join("\n")
     );
     // Pin the derived writer sets to the consts the runtime

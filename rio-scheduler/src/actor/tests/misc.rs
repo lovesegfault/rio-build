@@ -2814,7 +2814,7 @@ async fn wedge_strike_does_not_survive_claim_interlude() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.cancel-close-driven+2]
+// r[verify sched.attempt.cancel-close-driven+3]
 /// merged_bug_004 hole 1 red: two terminal batches for ONE reaped drv
 /// (DependencyFailed latched first, Cancelled latched later — the
 /// newer truth; Failed is non-terminal in this status alphabet, so
@@ -2947,7 +2947,7 @@ async fn outbox_same_drv_newer_terminal_latch_supersedes_older() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.cancel-close-driven+2]
+// r[verify sched.attempt.cancel-close-driven+3]
 /// merged_bug_108 case 2 red: an applied-but-ack-lost replay. The
 /// first flush COMMITS; the Err arm re-pushes the batch (pop-return);
 /// the next tick's kept set re-derives identically (memory never
@@ -3042,7 +3042,7 @@ async fn outbox_replay_lost_ack_residual_classified_already_applied() -> TestRes
     Ok(())
 }
 
-// r[verify sched.attempt.cancel-close-driven+2]
+// r[verify sched.attempt.cancel-close-driven+3]
 /// merged_bug_108 case 3 red: tick_gc_orphan_derivations runs BEFORE
 /// the flush in the same housekeeping tick and deletes terminal
 /// unlinked rows — the latched batch then zero-rows with NO newer row
@@ -3122,7 +3122,7 @@ async fn outbox_replay_vanished_row_classified_vanished() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.cancel-close-driven+2]
+// r[verify sched.attempt.cancel-close-driven+3]
 /// merged_bug_108 surviving-lane polarity pin — pre-fix this lane
 /// ALSO ticks refused, but by collapse (every zero-row cell ticked
 /// it), not by proof; DISCLOSED as such. PROPOSITION CERTIFIED

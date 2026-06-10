@@ -724,7 +724,7 @@ impl DagActor {
         }
     }
 
-    // r[impl sched.attempt.cancel-close-driven+2]
+    // r[impl sched.attempt.cancel-close-driven+3]
     /// Re-drive failed status-batch persists. FIFO; drains the WHOLE
     /// queue on Ok (a healed PG clears the backlog in one tick) and
     /// fail-fasts on the first Err/Fenced (a dead PG costs one attempt
@@ -772,7 +772,7 @@ impl DagActor {
     /// `rio_scheduler_status_outbox_replay_refused_total`).
     /// Leader-gated by `handle_tick`; the outbox is cleared on
     /// leadership loss in `clear_persisted_state`.
-    // r[impl sched.attempt.cancel-close-driven+2]
+    // r[impl sched.attempt.cancel-close-driven+3]
     pub(super) async fn tick_flush_status_outbox(&mut self, _authority: &super::DagAuthority) {
         while let Some(front) = self.status_outbox.front() {
             let age = front.enqueued_at.elapsed();
@@ -1318,7 +1318,7 @@ impl DagActor {
 
         match establish_expired_attempt(kind, node, probe, verifiable_refs.as_deref()) {
             EstablishmentAction::CloseChargeFree => {
-                // r[impl sched.attempt.cancel-close-driven+2]
+                // r[impl sched.attempt.cancel-close-driven+3]
                 // Nobody wants this work any more: close the assignment
                 // row and write NOTHING else — no AttemptRow (no
                 // exclusion seed), no pull_establishments_total (the

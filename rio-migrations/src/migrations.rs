@@ -2304,14 +2304,51 @@ pub const M_100: () = ();
 /// pre-migration latch can ever be compared against a backfilled
 /// stamp.
 ///
-/// No-op-write nuance: the replay conjunct carries `status IS DISTINCT
-/// FROM $2`, so an already-at-target row is NOT re-stamped (it falls
-/// to the residual lane as already-applied instead of re-asserting a
-/// non-change). Fresh writers stamp unconditionally — a fresh
+/// No-op-write nuance — RETRACTED (bughunt-8 S4, migration 102). The
+/// paragraph that stood here priced the five sibling writers'
+/// unconditional `status_changed_at = now()` stamps as "a fresh
 /// same-value write is a transition-time re-assertion; the error
 /// direction is conservative (a too-new stamp only ever REFUSES a
-/// stale replay, never admits one).
+/// stale replay, never admits one)". That pricing is FALSE for the
+/// terminal-KEEP arm of the outbox re-derivation: a latched terminal
+/// status for a DAG-absent node IS the node's last truth (the flush
+/// keeps it precisely because nothing newer can exist), so a
+/// value-preserving sibling write landing in the latch→flush window
+/// advanced the comparand past the cut and the refused replay
+/// dropped the node's FINAL status — the refusal was the error, not
+/// the conservative arm. It also contradicted the spec's own MUST
+/// ("a status-preserving write MUST NOT refuse a latched persist",
+/// scheduler.typ `sched.attempt.cancel-close-driven`). Migration 102
+/// moves the stamp into the column's single authority (see M_102):
+/// the value-change guard is now schema law, not per-writer
+/// discipline, and no Rust SET list names the column at all.
 pub const M_101: () = ();
+
+/// `102_derivations_status_changed_trigger.sql` — merged_bug_006
+/// (bughunt-8 S4; the wave's single sanctioned DDL, H7,
+/// R11-as-amended).
+///
+/// `derivations_stamp_status_changed()` + the BEFORE UPDATE trigger
+/// `derivations_status_changed_stamp`, `WHEN (OLD.status IS DISTINCT
+/// FROM NEW.status)`: the trigger is the SOLE author of
+/// `status_changed_at` on UPDATE — the comparand moves IFF the status
+/// VALUE changes, as a property of the column itself rather than of N
+/// client statements. 101 shipped the column with the value-change
+/// guard at exactly one of six writers (the outbox replay's `status
+/// IS DISTINCT FROM $2`); the five siblings stamped unconditionally,
+/// so a value-preserving write (same-status re-assignment with a new
+/// builder id, duplicate batch cancel, `clear_poison` on a row
+/// already `'created'`) advanced the comparand inside the
+/// latch→flush window and popped a kept DAG-absent terminal latch as
+/// `RefusedNewer` — permanently stale durable state (the M_101
+/// retraction above). Post-102 every Rust writer DROPS the stamp
+/// from its SET list (the census in db/tests/fence_coverage.rs
+/// enforces the total ban: no production SET/DO-UPDATE/INSERT list
+/// names the column); INSERTs ride the 101 DEFAULT (a fresh row's
+/// status is born at insert). Test backdates (`SET status_changed_at
+/// = …` without `status`) still land: the WHEN clause is false for
+/// them.
+pub const M_102: () = ();
 
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,

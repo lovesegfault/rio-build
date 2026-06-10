@@ -297,7 +297,7 @@ impl DagActor {
         self.dag_authoritative.then_some(DagAuthority(()))
     }
 
-    // r[impl sched.attempt.cancel-close-driven+2]
+    // r[impl sched.attempt.cancel-close-driven+3]
     /// The ONLY production latch site for the status outbox
     /// (merged_bug_004 hole 1): per-drv supersession — each drv the
     /// new batch names is stripped from every queued batch's
@@ -441,7 +441,7 @@ pub struct DagActor {
     /// (`materialization_jobs` + the partial-unique dedup index);
     /// recovery rebuild is Phase B.
     materialization_jobs: materialize::JobViewState,
-    // r[impl sched.attempt.cancel-close-driven+2]
+    // r[impl sched.attempt.cancel-close-driven+3]
     /// Terminal-status batches whose persist FAILED, latched for the
     /// housekeeping tick to re-drive until a persist succeeds ("latch
     /// on Ok only"). The persist is what closes the batch's assignment
@@ -1158,7 +1158,7 @@ impl DagActor {
         // creates are fenced anyway; the dropped-carrier accounting is
         // the PG-authority class documented on the field.
         pending_carriers.clear();
-        // r[impl sched.attempt.cancel-close-driven+2]
+        // r[impl sched.attempt.cancel-close-driven+3]
         // The outbox is leader-scoped: a deposed leader must not
         // re-drive status writes (they would be fenced anyway); the
         // rows now belong to the successor's recovery + the
