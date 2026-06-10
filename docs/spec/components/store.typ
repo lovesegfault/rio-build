@@ -1375,7 +1375,7 @@ tenant turned an obtainable path into InfraFailure. Charging evidence still
 outranks back-off advice at the fold (matching the per-upstream loop's
 ordering one level down), and the transient lane still closes uncharged.
 
-#r("store.materialize.path-fold")[
+#r("store.materialize.path-fold+1")[
   The walk MUST resolve paths through a single-driver evidence model: one
   driver task owns ALL job state (frontier, visited set, verdict-cell
   registries, the committed progress floor, generation machinery, the abort
@@ -1384,7 +1384,9 @@ ordering one level down), and the transient lane still closes uncharged.
   per-tenant axis inside a path future keeps
   #rref("store.materialize.tenant-fold") verbatim). The driver MUST spawn
   path futures in frontier order into a window of at most `path_fanout` in
-  flight (visited marked at spawn; the closure-walk cap checked at spawn)
+  flight (visited marked at ENQUEUE, so frontier membership witnesses
+  spawnable work — a nonempty frontier MUST imply the next pop spawns, and
+  the closure-walk cap is checked at the enqueue sites)
   and apply completions in COMPLETION order: a served path commits the
   floor, records its verified tenants, and extends the frontier; a settled
   path records generation-stamped cells at the driver's current generation;

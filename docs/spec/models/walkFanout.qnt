@@ -1,7 +1,7 @@
 // -*- mode: Bluespec; -*-
 //
 // live_047/R-C WO-R7-4: the materialization walk's path-axis evidence
-// law under bounded fan-out (`store.materialize.path-fold`) — ONE walk
+// law under bounded fan-out (`store.materialize.path-fold+1`) — ONE walk
 // iteration's window/latch/fold plane, with quint's nondeterministic
 // scheduling as the completion-order adversary.
 //

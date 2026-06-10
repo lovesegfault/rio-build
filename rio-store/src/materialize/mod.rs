@@ -259,7 +259,7 @@ pub fn spawn_materialization_executor(
 ///     the scheduler's steal horizon and is offered to idle workers
 ///     (work stealing exactly when this worker cannot claim anyway).
 ///     live_047/R-C: the walk is internally path-concurrent
-///     (`path_fanout` window, `store.materialize.path-fold`), which
+///     (`path_fanout` window, `store.materialize.path-fold+1`), which
 ///     shortens mid-walk silence for multi-path closures but changes
 ///     NOTHING at this layer — the claim unit, the inline execution,
 ///     and the beat semantics are untouched;

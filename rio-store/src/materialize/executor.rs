@@ -44,7 +44,7 @@ pub struct ExecutorContext {
     pub pool: PgPool,
     pub substituter: std::sync::Arc<Substituter>,
     /// Per-job path-resolution window width F (live_047/R-C,
-    /// `store.materialize.path-fold`): at most this many path futures
+    /// `store.materialize.path-fold+1`): at most this many path futures
     /// in flight per walk. 1 = the serial walk as the F=1 instance of
     /// the one code shape (the driver/window structure is identical;
     /// only the width changes). Floored at 1 by the driver.
@@ -61,11 +61,6 @@ pub struct ExecutorContext {
     /// `None` everywhere outside the owning tests — semantics-neutral.
     #[cfg(test)]
     pub probe_rendezvous: Option<std::sync::Arc<tokio::sync::Barrier>>,
-    /// Test-only counter for the spawn loop's `!spawned` break (a
-    /// slot acquired and dropped unused — frontier drained to dups or
-    /// the cap latched). The enqueue-dedup red asserts this stays 0.
-    #[cfg(test)]
-    pub unused_permit_drops: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl ExecutorContext {
@@ -84,8 +79,6 @@ impl ExecutorContext {
             path_slots,
             #[cfg(test)]
             probe_rendezvous: None,
-            #[cfg(test)]
-            unused_permit_drops: None,
         }
     }
 }
@@ -295,6 +288,44 @@ impl<F: Fn(u64, u64, &str) + Send + Sync + 'static> MonotoneProgress<F> {
     }
 }
 
+/// The ONE frontier admission gate (merged_bug_003): `visited` is
+/// inserted at ENQUEUE — frontier membership witnesses spawnable work
+/// (`!frontier.is_empty()` ⇒ the next pop spawns) — and the
+/// closure-walk cap is enforced here, at the growth point, latching
+/// the same driver-synthesized Charge evidence into the same
+/// latch+fold as any abort. Duplicates (closure diamonds under pool
+/// contention; cross-chain new_seeds × reseed arrivals) are dropped
+/// at the door; the spawn-time insert this replaces degenerated to
+/// the pop-side debug_assert.
+fn enqueue_path(
+    visited: &mut HashSet<String>,
+    frontier: &mut VecDeque<(String, PathCell)>,
+    walk_abort: &mut Option<Vec<AbortEvidence>>,
+    path: String,
+    cell: PathCell,
+) {
+    if !visited.insert(path.clone()) {
+        return;
+    }
+    if visited.len() > CLOSURE_WALK_CAP {
+        // Driver-synthesized charge evidence; enters the same latch +
+        // tier fold as any abort. Checked at the enqueue (the cap
+        // bounds enqueued-unique paths; trip timing is ≤ one
+        // in-flight window earlier than the old spawn-time check).
+        walk_abort.get_or_insert_with(Vec::new).push(AbortEvidence {
+            path,
+            grade: AbortDisposition::Charge {
+                detail: format!(
+                    "closure walk exceeded {CLOSURE_WALK_CAP} paths \
+                     (hostile upstream reference chain?)"
+                ),
+            },
+        });
+        return;
+    }
+    frontier.push_back((path, cell));
+}
+
 /// The walk body behind [`execute_job_with_progress`] (split so the
 /// outcome counter has a single increment site over every return path).
 async fn execute_job_inner(
@@ -469,21 +500,30 @@ async fn execute_job_inner(
             break;
         }
 
+        // The abort latch (law 4): Some = stop spawning; the Vec is
+        // the completed abort-grade evidence the tier fold consumes.
+        // Declared BEFORE the frontier build: the closure-walk cap is
+        // enforced at the ENQUEUE sites (merged_bug_003), and the
+        // build is the first of them.
+        let mut walk_abort: Option<Vec<AbortEvidence>> = None;
+
         // Frontier entries carry their CELL: live-wanted seeds vs
         // narinfo reference extensions (merged_bug_193). bug_266:
         // drained reference verdicts re-enter with their original
         // cell — the consumer's covered-root-over-punctured-closure
-        // law keeps holding.
-        let mut frontier: VecDeque<(String, PathCell)> = new_seeds
-            .into_iter()
-            .map(|p| (p, PathCell::Wanted))
-            .chain(
-                reseed_references
-                    .drain(..)
-                    .map(|p| (p, PathCell::Reference)),
-            )
-            .collect();
-        // ── Path-axis evidence law (store.materialize.path-fold) ──
+        // law keeps holding. merged_bug_003: every entry passes
+        // [`enqueue_path`] — `visited` is inserted at ENQUEUE, so a
+        // path arriving via BOTH chains in one iteration (wanted-set
+        // growth racing a bug_266 drain) is admitted exactly once.
+        let mut frontier: VecDeque<(String, PathCell)> = VecDeque::new();
+        for (p, cell) in new_seeds.into_iter().map(|p| (p, PathCell::Wanted)).chain(
+            reseed_references
+                .drain(..)
+                .map(|p| (p, PathCell::Reference)),
+        ) {
+            enqueue_path(&mut visited, &mut frontier, &mut walk_abort, p, cell);
+        }
+        // ── Path-axis evidence law (store.materialize.path-fold+1) ──
         // ONE driver (this function) owns ALL job state; per-path
         // resolution runs as evidence-returning futures in an
         // F-bounded window, spawned in frontier order, applied in
@@ -501,9 +541,6 @@ async fn execute_job_inner(
         let mut window: futures_util::stream::FuturesUnordered<
             futures_util::future::BoxFuture<'_, PathResolution>,
         > = futures_util::stream::FuturesUnordered::new();
-        // The abort latch (law 4): Some = stop spawning; the Vec is
-        // the completed abort-grade evidence the tier fold consumes.
-        let mut walk_abort: Option<Vec<AbortEvidence>> = None;
 
         // The apply chokepoint: a TOTAL match over PathResolution
         // (the variant-totality census — zero `_` arms), driver-side
@@ -530,10 +567,17 @@ async fn execute_job_inner(
                         // underneath, adapter clamp law untouched.
                         completed_bytes = completed_bytes.saturating_add(nar_size);
                         progress.commit(completed_bytes, "");
+                        // merged_bug_003: dedup at ENQUEUE — closure
+                        // diamonds under pool contention admit the
+                        // shared reference exactly once.
                         for r in references {
-                            if !visited.contains(&r) {
-                                frontier.push_back((r, PathCell::Reference));
-                            }
+                            enqueue_path(
+                                &mut visited,
+                                &mut frontier,
+                                &mut walk_abort,
+                                r,
+                                PathCell::Reference,
+                            );
                         }
                     }
                     PathResolution::Settled {
@@ -566,12 +610,17 @@ async fn execute_job_inner(
 
         'drive: loop {
             if walk_abort.is_none() {
-                // Spawn phase (law 2): frontier order, ≤ F in flight,
-                // `visited` marked at spawn (pop→spawn is immediate),
-                // CLOSURE_WALK_CAP checked at spawn. gate-share: the
-                // SLOT is acquired before the pop — slot waiters hold
-                // nothing (the three-gate order) and a permit is
-                // dropped unused iff the frontier drains to dups.
+                // Spawn phase (law 2): frontier order, ≤ F in flight.
+                // merged_bug_003: `visited` is marked at ENQUEUE, so
+                // frontier membership WITNESSES spawnable work —
+                // `!frontier.is_empty()` admits the acquire below only
+                // when the slot will be consumed, and a permit is
+                // NEVER dropped unused (the dup-only-frontier state is
+                // unrepresentable; the closure-walk cap latches at the
+                // enqueue sites, and a latched walk never re-enters
+                // this phase). gate-share: the SLOT is acquired before
+                // the pop — slot waiters hold nothing (the three-gate
+                // order).
                 while window.len() < fanout && !frontier.is_empty() {
                     let slot = if window.is_empty() {
                         // Width-1 baseline invariant: blocking-FIFO
@@ -589,53 +638,28 @@ async fn execute_job_inner(
                             None => break,
                         }
                     };
-                    let mut spawned = false;
-                    while let Some((path, cell)) = frontier.pop_front() {
-                        if !visited.insert(path.clone()) {
-                            continue;
-                        }
-                        if visited.len() > CLOSURE_WALK_CAP {
-                            // Driver-synthesized charge evidence;
-                            // enters the same latch + tier fold as
-                            // any abort.
-                            walk_abort.get_or_insert_with(Vec::new).push(AbortEvidence {
-                                path,
-                                grade: AbortDisposition::Charge {
-                                    detail: format!(
-                                        "closure walk exceeded {CLOSURE_WALK_CAP} paths \
-                                         (hostile upstream reference chain?)"
-                                    ),
-                                },
-                            });
-                            break;
-                        }
-                        // Law 6: base = the cumulative floor at SPAWN —
-                        // the tick arithmetic of the old `per_path(base)`,
-                        // now applied future-side onto event payloads.
-                        let base = completed_bytes;
-                        window.push(Box::pin(resolve_path(
-                            ctx,
-                            claimed,
-                            &tenants,
-                            &trust_cache,
-                            path,
-                            cell,
-                            base,
-                            tick_tx.clone(),
-                            slot,
-                        )));
-                        spawned = true;
-                        break;
-                    }
-                    if !spawned {
-                        // Frontier drained to dups (slot dropped
-                        // unused) or the cap latched.
-                        #[cfg(test)]
-                        if let Some(counter) = &ctx.unused_permit_drops {
-                            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        break;
-                    }
+                    let (path, cell) = frontier
+                        .pop_front()
+                        .expect("frontier nonempty by the loop guard");
+                    debug_assert!(
+                        visited.contains(&path),
+                        "frontier membership implies visited (enqueue-dedup)"
+                    );
+                    // Law 6: base = the cumulative floor at SPAWN —
+                    // the tick arithmetic of the old `per_path(base)`,
+                    // now applied future-side onto event payloads.
+                    let base = completed_bytes;
+                    window.push(Box::pin(resolve_path(
+                        ctx,
+                        claimed,
+                        &tenants,
+                        &trust_cache,
+                        path,
+                        cell,
+                        base,
+                        tick_tx.clone(),
+                        slot,
+                    )));
                 }
             }
             if walk_abort.is_some() {
@@ -848,7 +872,7 @@ enum PathCell {
     Reference,
 }
 
-// r[impl store.materialize.path-fold]
+// r[impl store.materialize.path-fold+1]
 /// The CLOSED per-path evidence object (path-fold law 1, live_047/R-C):
 /// a path future returns exactly one of these and NEVER mutates job
 /// state or returns a job-level outcome. The driver's apply is a total
@@ -926,7 +950,7 @@ struct AbortEvidence {
     grade: AbortDisposition,
 }
 
-// r[impl store.materialize.path-fold]
+// r[impl store.materialize.path-fold+1]
 /// THE path-axis abort fold (path-fold law 4): the job outcome is a
 /// pure function of the completed abort-evidence MULTISET, never of
 /// arrival order within it — input-order invariant by construction
@@ -1137,7 +1161,7 @@ impl Drop for PathSlot {
     }
 }
 
-// r[impl store.materialize.path-fold]
+// r[impl store.materialize.path-fold+1]
 /// Resolve ONE path against live state: the evidence-returning path
 /// future (path-fold law 1). The body is the serial walk's per-path
 /// block verbatim — local probe, the per-tenant substitute loop
@@ -4962,7 +4986,7 @@ mod tests {
     }
 
     proptest::proptest! {
-        // r[verify store.materialize.path-fold]
+        // r[verify store.materialize.path-fold+1]
         /// W-1a (fold-level permutation invariance): the backlog tier
         /// fold over an arbitrary completed abort-evidence multiset is
         /// input-order invariant, INCLUDING the within-tier merge — and
@@ -5039,7 +5063,7 @@ mod tests {
         }
     }
 
-    // r[verify store.materialize.path-fold]
+    // r[verify store.materialize.path-fold+1]
     /// W-2(a) window bound: concurrent in-flight path resolutions
     /// never exceed F. Six cold wanted paths, all NAR fetches gated,
     /// F = 4: exactly four fetches reach the upstream (high-water ==
@@ -5126,7 +5150,7 @@ mod tests {
         );
     }
 
-    // r[verify store.materialize.path-fold]
+    // r[verify store.materialize.path-fold+1]
     // r[verify store.materialize.progress-monotone+1]
     /// W-1b (same-multiset schedules) + W-5 (floor law under reorder,
     /// both clauses): two jobs with byte-identical 3-path multisets
@@ -5277,7 +5301,7 @@ mod tests {
         assert!(expected_sum > 0, "fixture sanity");
     }
 
-    // r[verify store.materialize.path-fold]
+    // r[verify store.materialize.path-fold+1]
     /// W-1c (abort-first lawfulness) + W-6a (cancellation safety +
     /// reclaim): path A is mid-NAR-stream when sibling B completes
     /// with a sequenced transient (bare 429). The abort latch cancels
@@ -5410,7 +5434,7 @@ mod tests {
         );
     }
 
-    // r[verify store.materialize.path-fold]
+    // r[verify store.materialize.path-fold+1]
     /// W-6b (the moka retry leg — GATES the F>1 cancellation policy):
     /// cancel a singleflight LEADER mid-NAR-fetch while a coalesced
     /// second caller awaits the same `(tenant, path)`. moka 0.12.15
@@ -5749,12 +5773,316 @@ mod tests {
         );
     }
 
+    // r[verify store.materialize.path-fold+1]
+    // r[verify store.materialize.gate-share]
+    /// R1-003 (merged_bug_003, TRUE RED pre-fix) / W-003a: a walk
+    /// whose remaining frontier is DUP-ONLY completes WITHOUT entering
+    /// the baseline FIFO — certified two ways at once: completion
+    /// under an externally-held pool (the wait would be unbounded
+    /// pre-fix) AND a baseline-wait histogram count of exactly one
+    /// sample per REAL spawn (the metric the defect inflated, now the
+    /// witness — counting, not wall-clock).
+    ///
+    /// Diamond closure A→{B,C}, B→{D}, C→{D} via production narinfo
+    /// references; F = 1, pool capacity 1. C's apply re-enqueues D
+    /// after D already spawned (push-time check vs spawn-time insert —
+    /// the two timestamps), leaving a dup-only frontier after D
+    /// completes. The test queues a raw holder on the pool while D is
+    /// in flight: the fair FIFO hands D's freed slot to the holder, so
+    /// a post-fix walk must finish WITHOUT another acquire.
+    ///
+    /// Pre-fix red: the walk parks in acquire_baseline on the dup-only
+    /// frontier behind the test-held slot — no outcome within the
+    /// deadline, a baseline FIFO entry for zero spawnable work.
+    /// Post-fix: the walk breaks at width 0 with an empty frontier,
+    /// outcome reported, histogram count == 4 (one per real spawn,
+    /// none for the dup tail), without the held slot ever releasing.
+    #[tokio::test]
+    async fn dup_only_frontier_completes_without_baseline_acquire() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let rec = DebuggingRecorder::new();
+        let snap = rec.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&rec);
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "dup-frontier").await;
+
+        let a = store_path(70, "dupf-a");
+        let b = store_path(71, "dupf-b");
+        let c = store_path(72, "dupf-c");
+        let d = store_path(73, "dupf-d");
+        let (nar, _) = rio_test_support::fixtures::make_nar(b"dupf contents");
+        let (upstream, gates) = spawn_pathgated_upstream(
+            vec![
+                (a.clone(), nar.clone(), vec![b.clone(), c.clone()]),
+                (b.clone(), nar.clone(), vec![d.clone()]),
+                (c.clone(), nar.clone(), vec![d.clone()]),
+                (d.clone(), nar.clone(), vec![]),
+            ],
+            "cache.dupf",
+        )
+        .await;
+        wire_upstream(&db.pool, tenant, &upstream).await;
+        let seeded = seed_job(
+            &db.pool,
+            "dupf-drv",
+            &[("out", a.as_str())],
+            Some(tenant),
+            Some(tenant),
+            &[],
+        )
+        .await;
+
+        // F = 1 (serial spawn order A,B,C,D), pool capacity 1.
+        let pool1 = PathSlotPool::new(1);
+        let ctx = ExecutorContext::new(
+            db.pool.clone(),
+            std::sync::Arc::new(
+                Substituter::new(db.pool.clone(), None).with_http_client(sandbox_http()),
+            ),
+            1,
+            pool1.clone(),
+        );
+        let events: std::sync::Arc<std::sync::Mutex<Vec<(u64, u64, String)>>> =
+            std::sync::Arc::default();
+        let sink = std::sync::Arc::clone(&events);
+        let job = tokio::spawn({
+            let claimed = seeded.claimed.clone();
+            async move {
+                execute_job_with_progress(&ctx, &claimed, move |dn, e, u| {
+                    sink.lock().unwrap().push((dn, e, u.to_string()));
+                })
+                .await
+                .into_outcome()
+            }
+        });
+
+        // Release A, B, C (paced re-notifies); D's gate stays closed.
+        for path in [&a, &b, &c] {
+            let g = std::sync::Arc::clone(&gates[path]);
+            tokio::spawn(async move {
+                for _ in 0..400 {
+                    g.notify_one();
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            });
+        }
+        // Wait for 3 commits (A, B, C applied — C's apply re-enqueued
+        // D pre-fix), then for D's spawn to hold the pool's only slot.
+        let committed =
+            |evs: &[(u64, u64, String)]| evs.iter().filter(|(_, _, u)| u.is_empty()).count();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while committed(&events.lock().unwrap()) < 3 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "commits A/B/C never landed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        while pool1.slots.available_permits() > 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "D's spawn never took the slot"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Queue the foreign holder BEHIND D (raw semaphore access —
+        // in-module; FIFO puts it ahead of any later walk acquire).
+        // Raw on purpose: the holder must not pollute the walk's
+        // baseline instrumentation.
+        let holder = tokio::spawn({
+            let slots = std::sync::Arc::clone(&pool1.slots);
+            async move {
+                let permit = slots.acquire_owned().await.expect("pool never closed");
+                tokio::time::sleep(Duration::from_secs(120)).await;
+                drop(permit);
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Release D: its slot goes to the queued holder on completion.
+        let g = std::sync::Arc::clone(&gates[&d]);
+        tokio::spawn(async move {
+            for _ in 0..400 {
+                g.notify_one();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), job)
+            .await
+            .expect(
+                "walk parks in acquire_baseline on a dup-only frontier behind the \
+                 test-held slot — no outcome within the deadline (a baseline FIFO \
+                 entry for zero spawnable work)",
+            )
+            .unwrap();
+        let success = outcome_success(&outcome)
+            .unwrap_or_else(|| panic!("expected Success, got {outcome:?}"));
+        assert_eq!(
+            success.ingested_paths.len(),
+            4,
+            "all four diamond paths served"
+        );
+        // Histogram count: one sample per REAL spawn (A,B,C,D), none
+        // for the dup tail — snapshot exactly once.
+        let mut samples = 0usize;
+        for (ck, _, _, v) in snap.snapshot().into_vec() {
+            if ck.key().name() == "rio_store_executor_path_slot_baseline_wait_seconds" {
+                let DebugValue::Histogram(h) = v else {
+                    continue;
+                };
+                samples = h.len();
+            }
+        }
+        assert_eq!(
+            samples, 4,
+            "baseline-wait histogram counts exactly the four real spawns \
+             (zero phantom samples for the dup-only tail)"
+        );
+        assert_eq!(
+            pool1.slots.available_permits(),
+            0,
+            "the foreign holder still holds the slot — the walk finished without it"
+        );
+        holder.abort();
+    }
+
+    /// R2-003 (merged_bug_003, cross-chain cell, TRUE RED pre-fix):
+    /// a path arriving via BOTH `new_seeds` and `reseed_references`
+    /// in ONE iteration is enqueued once. Choreography: build A
+    /// (tenant A) wants only output "out" = W; W's narinfo references
+    /// X (a declared output A does not want); A's upstream serves W
+    /// (gated) and 404s X, so X settles missing-Reference under
+    /// generation 0 and stays `visited`. During W's gate, A goes
+    /// terminal and build B (tenant B, upstream serving X) arrives
+    /// wanting ALL outputs. Iteration 2: the grown tenant set drains
+    /// X from `visited` into `reseed_references` (bug_266) while the
+    /// wanted re-read lists X as a new seed — the cross-chain dup.
+    ///
+    /// Pre-fix red (run + recorded in the owning commit body): the
+    /// frontier held X twice; after X spawned once (spawn-time
+    /// insert), the second X drained to a dup — a slot was acquired
+    /// and dropped unused (the prelude seam counter read 1 against
+    /// 0 expected). Post-fix: enqueue-dedup admits X once; X is
+    /// fetched exactly once. DISCLOSED MECHANICAL RE-AIM (the round-6
+    /// precedent): the unused-drop branch is structurally DELETED by
+    /// the close (pop always spawns under enqueue-dedup), so the seam
+    /// counter deleted with it — the single-spawn witness is the
+    /// upstream hit count, and the dup-enqueue state is pinned
+    /// unrepresentable by the pop-side debug_assert + the model-plane
+    /// `frontierSpawnable` hold.
+    #[tokio::test]
+    async fn cross_chain_duplicate_enqueues_once() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant_a = seed_tenant(&db.pool, "xchain-a").await;
+        let tenant_b = seed_tenant(&db.pool, "xchain-b").await;
+
+        let w = store_path(74, "xchain-w");
+        let x = store_path(75, "xchain-x");
+        let (nar_w, _) = rio_test_support::fixtures::make_nar(b"xchain w");
+        let (nar_x, _) = rio_test_support::fixtures::make_nar(b"xchain x");
+
+        // Tenant A: gated upstream serving ONLY W (refs X), 404s X.
+        let (up_a, mut hit_rx, release) =
+            spawn_gated_upstream(vec![(w.clone(), nar_w, vec![x.clone()])], "cache.xchain-a").await;
+        wire_upstream(&db.pool, tenant_a, &up_a).await;
+        // Tenant B: gated upstream serving ONLY X (hit-counted).
+        let (up_b, mut hit_rx_b, release_b) =
+            spawn_gated_upstream(vec![(x.clone(), nar_x, vec![])], "cache.xchain-b").await;
+        wire_upstream(&db.pool, tenant_b, &up_b).await;
+
+        // Outputs: out→W, doc→X; build A wants ONLY "out".
+        let seeded = seed_job(
+            &db.pool,
+            "xchain-drv",
+            &[("out", w.as_str()), ("doc", x.as_str())],
+            Some(tenant_a),
+            Some(tenant_a),
+            &["out"],
+        )
+        .await;
+
+        let ctx = make_ctx(db.pool.clone());
+        let claimed = seeded.claimed.clone();
+        let walk = tokio::spawn(async move { execute_job(&ctx, &claimed).await.into_outcome() });
+
+        // Inside iteration 1's gated W fetch: X has not yet settled
+        // (references enter at W's apply), and the tenant set was
+        // resolved as {A}.
+        tokio::time::timeout(Duration::from_secs(30), hit_rx.recv())
+            .await
+            .expect("the walk reached tenant A's gated W fetch")
+            .expect("gate signal");
+
+        // The growth: A terminal; B live, wanting ALL outputs ('{}').
+        sqlx::query("UPDATE builds SET status = 'succeeded' WHERE build_id = $1")
+            .bind(seeded.build_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let build_b = Uuid::new_v4();
+        sqlx::query("INSERT INTO builds (build_id, tenant_id, status) VALUES ($1, $2, 'active')")
+            .bind(build_b)
+            .bind(tenant_b)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO build_derivations (build_id, derivation_id) VALUES ($1, $2)")
+            .bind(build_b)
+            .bind(seeded.derivation_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO build_wanted_outputs (build_id, derivation_id, wanted_output_names) \
+             VALUES ($1, $2, '{}')",
+        )
+        .bind(build_b)
+        .bind(seeded.derivation_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        release.notify_waiters();
+        // X's fetch under B: paced release.
+        tokio::spawn(async move {
+            for _ in 0..400 {
+                release_b.notify_waiters();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        let outcome = tokio::time::timeout(Duration::from_secs(30), walk)
+            .await
+            .expect("walk completes")
+            .unwrap();
+        let success = outcome_success(&outcome)
+            .unwrap_or_else(|| panic!("expected Success, got {outcome:?}"));
+        let mut got: Vec<String> = success
+            .ingested_paths
+            .iter()
+            .chain(success.verified_paths.iter())
+            .cloned()
+            .collect();
+        got.sort();
+        let mut want = vec![w.clone(), x.clone()];
+        want.sort();
+        assert_eq!(got, want, "W (under A) and X (under B) both covered");
+
+        // Single spawn: X fetched exactly once from B.
+        let mut b_hits = 0usize;
+        while hit_rx_b.try_recv().is_ok() {
+            b_hits += 1;
+        }
+        assert_eq!(b_hits, 1, "X fetched exactly once (single spawn)");
+    }
+
     /// Prelude seam smoke (the width-4 red seams): a NO-OP publish
     /// gate is semantics-neutral — the in-use gauge still tracks pool
     /// truth on both edges — and the constructor defaults every test
     /// seam off. The seams' consuming reds live with their owning
-    /// closes (probe rendezvous, unused-permit counter, read/set
-    /// interleave hook).
+    /// closes (probe rendezvous, read/set interleave hook; the
+    /// unused-permit counter seam was deleted WITH its branch by the
+    /// merged_bug_003 enqueue-dedup close).
     #[tokio::test]
     async fn interleave_seams_default_off_and_noop_gate_is_neutral() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};

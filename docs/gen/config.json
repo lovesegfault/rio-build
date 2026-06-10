@@ -549,7 +549,7 @@
         "key": "materialization.path_fanout",
         "type": "uint",
         "default": "4",
-        "description": "Bounded intra-job substitution fan-out (live_047/R-C, `store.materialize.path-fold`): per-job path-resolution window width F — at most this many concurrent path resolutions per walk."
+        "description": "Bounded intra-job substitution fan-out (live_047/R-C, `store.materialize.path-fold+1`): per-job path-resolution window width F — at most this many concurrent path resolutions per walk."
       },
       {
         "key": "log_retention_days",

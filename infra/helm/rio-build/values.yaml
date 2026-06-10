@@ -457,7 +457,7 @@ store:
     # fetch.
     executorConcurrency: 32
     # Bounded intra-job substitution fan-out
-    # (r[store.materialize.path-fold]): per-job path-resolution window
+    # (r[store.materialize.path-fold+1]): per-job path-resolution window
     # width F — up to this many concurrent path fetches per walk. At
     # full worker occupancy walks run ~1 slot each (job-grain
     # parallelism, the backlog-burst case); at low occupancy walks

@@ -8809,7 +8809,7 @@ rec {
     };
 
     # live_047/R-C WO-R7-4: the materialization walk's path-axis
-    # evidence law under bounded fan-out (store.materialize.path-fold)
+    # evidence law under bounded fan-out (store.materialize.path-fold+1)
     # -- one iteration's window/latch/fold plane; quint's scheduling is
     # the completion-order adversary (the post-latch complete branch IS
     # the dequeue-backlog family; cancelSibling the other -- the §2.3
@@ -8822,7 +8822,7 @@ rec {
     # blast the const-binding radius across its calibration corpus).
     # Measured (TLC, exhaustive, F=2 x 4 paths): 250 states generated /
     # 109 distinct, all five holds [ok] in 867ms; budget 120s.
-    # r[verify store.materialize.path-fold]
+    # r[verify store.materialize.path-fold+1]
     quint-walkfanout = mkQuintCheck {
       name = "walkfanout";
       spec = "walkFanout";

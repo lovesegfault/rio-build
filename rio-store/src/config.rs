@@ -324,7 +324,7 @@ pub struct MaterializationConfig {
     /// explicitly.
     pub scheduler_addr: String,
     /// Bounded intra-job substitution fan-out (live_047/R-C,
-    /// `store.materialize.path-fold`): per-job path-resolution window
+    /// `store.materialize.path-fold+1`): per-job path-resolution window
     /// width F — at most this many concurrent path resolutions per
     /// walk. Default 4. Total executor pressure on the admission gate
     /// is bounded STRUCTURALLY by the pod path-slot pool (P =
