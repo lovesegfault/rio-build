@@ -231,7 +231,7 @@ impl StoreServiceImpl {
         // MAX_BATCH_OUTPUTS × MAX_NAR_SIZE = 64 GiB could be demanded
         // against a 32 GiB budget — `acquire_many` would block on permits
         // THIS task holds (self-deadlock).
-        // r[impl store.put.nar-bytes-budget+3]
+        // r[impl store.put.nar-bytes-budget+4]
         let mut total_charged: u64 = 0;
 
         while let Some(msg) = stream.message().await? {

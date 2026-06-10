@@ -965,7 +965,7 @@ async fn send_batch_output(
 /// alignment is verified at `rio_common::limits::nar_chunk_charge` and by
 /// the `total_charged` formula in `drain_batch_stream`; this test
 /// continues to cover the >256-byte chunk case.
-// r[verify store.put.nar-bytes-budget+3]
+// r[verify store.put.nar-bytes-budget+4]
 #[tokio::test]
 async fn batch_no_self_deadlock_under_budget() -> TestResult {
     let s =

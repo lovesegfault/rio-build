@@ -422,7 +422,7 @@ impl StoreServiceImpl {
         })
     }
 
-    // r[impl store.put.nar-bytes-budget+3]
+    // r[impl store.put.nar-bytes-budget+4]
     /// Append a NAR chunk under both bounds: per-output [`MAX_NAR_SIZE`]
     /// and the GLOBAL `nar_bytes_budget` semaphore. Feeds the chunk
     /// into the caller's incremental `hasher` so [`verify_nar`] never
@@ -510,7 +510,7 @@ impl StoreServiceImpl {
         // `accumulate_chunk` so a tiny-chunk stream that would exhaust
         // the global budget hits this cap instead of self-deadlocking on
         // `acquire_many` for permits this task already holds.
-        // r[impl store.put.nar-bytes-budget+3]
+        // r[impl store.put.nar-bytes-budget+4]
         let mut charged: u64 = 0;
         loop {
             let msg = match stream.message().await {

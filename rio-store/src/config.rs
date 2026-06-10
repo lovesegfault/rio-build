@@ -68,12 +68,17 @@ pub struct Config {
     /// warmed by either is hot for both. Only relevant when
     /// chunk_backend != inline.
     pub chunk_cache_capacity_bytes: u64,
-    /// Global NAR reassembly buffer budget in bytes — total permits
-    /// across ALL concurrent PutPath handlers. Each handler acquires
-    /// `chunk.len()` permits before extending its accumulation Vec.
-    /// None → DEFAULT_NAR_BUDGET (8 × MAX_NAR_SIZE = 32 GiB). Lower
-    /// this on small-memory nodes; raise it if you have >8 concurrent
-    /// max-size uploads and RAM to match.
+    /// Global NAR buffer budget in bytes — total permits across ALL
+    /// concurrent NAR ingests, shared by PutPath (per-chunk charges)
+    /// and upstream substitution (one whole-NAR reservation per leg,
+    /// live_047/R-C). None → DEFAULT_NAR_BUDGET (8 × MAX_NAR_SIZE =
+    /// 32 GiB). Floor: MAX_NAR_SIZE (4 GiB) — the budget MUST admit
+    /// one whole-NAR reservation, or a declared-near-MAX substitution
+    /// becomes a permanently-unsatisfiable fair-FIFO head that
+    /// starves every later budget waiter (the former "lower this on
+    /// small-memory nodes" use-case is retired: a sub-4 GiB budget
+    /// was a wedge, not a tuning). Raise it if you have >8 concurrent
+    /// max-size ingests and RAM to match.
     pub nar_buffer_budget_bytes: Option<u64>,
     /// ed25519 narinfo signing key path (Nix secret-key format:
     /// `name:base64-seed`). None = signing disabled (paths stored
@@ -378,7 +383,6 @@ impl rio_common::config::ValidateConfig for Config {
     /// meets that bar is checked here.
     fn validate(&self) -> anyhow::Result<()> {
         use rio_common::config::ensure_required as required;
-        use rio_common::limits::MIN_NAR_CHUNK_CHARGE;
         required(&self.database_url, "database_url", "store")?;
         // 0 → buffer_unordered(0) returns Pending forever (no waker):
         // every put_chunked silently hangs the data plane.
@@ -393,15 +397,24 @@ impl rio_common::config::ValidateConfig for Config {
             self.s3_max_attempts >= 1,
             "s3_max_attempts must be >= 1; set RIO_S3_MAX_ATTEMPTS"
         );
-        // < MIN_NAR_CHUNK_CHARGE → Semaphore::new(n<256); every PutPath
-        // acquire_many(chunk.len().max(256)) is Pending forever. There
-        // is no "unlimited" sentinel; unset for the 32 GiB default.
+        // E-2(i), live_047/R-C: the budget MUST admit one whole-NAR
+        // reservation (`declared.max(MIN_NAR_CHUNK_CHARGE)` <
+        // MAX_NAR_SIZE by the `>=` declared-size rejection). Below the
+        // floor, a near-MAX reservation is a permanently-unsatisfiable
+        // fair-FIFO head: it starves every later budget waiter
+        // (substitution AND PutPath) forever — the config-violable
+        // premise of the no-deadlock head-progress argument. Subsumes
+        // the former MIN_NAR_CHUNK_CHARGE floor (PutPath's per-chunk
+        // Pending-forever hang at < 256). There is no "unlimited"
+        // sentinel; unset for the 32 GiB default.
         anyhow::ensure!(
             self.nar_buffer_budget_bytes
-                .is_none_or(|b| b >= MIN_NAR_CHUNK_CHARGE as u64),
-            "nar_buffer_budget_bytes must be >= {MIN_NAR_CHUNK_CHARGE} \
-             (smaller hangs all uploads); unset RIO_NAR_BUFFER_BUDGET_BYTES \
-             for the 32 GiB default — there is no 'unlimited' sentinel"
+                .is_none_or(|b| b >= rio_common::limits::MAX_NAR_SIZE),
+            "nar_buffer_budget_bytes must be >= {} (MAX_NAR_SIZE — one whole-NAR \
+             reservation; a smaller budget wedges any near-max substitution at \
+             the FIFO head forever); unset RIO_NAR_BUFFER_BUDGET_BYTES for the \
+             32 GiB default — there is no 'unlimited' sentinel",
+            rio_common::limits::MAX_NAR_SIZE
         );
         // 0 → PgPoolOptions max_connections(0) → PoolTimedOut after 30s
         // with a misleading message.
@@ -700,8 +713,10 @@ mod tests {
         assert!(err.contains("nar_buffer_budget_bytes"), "got: {err}");
     }
 
-    /// Any budget < MIN_NAR_CHUNK_CHARGE has identical Pending-forever
-    /// behavior because `acquire_many` floors at 256.
+    /// Any budget below one whole-NAR reservation is rejected; the
+    /// sub-MIN_NAR_CHUNK_CHARGE case (PutPath's per-chunk
+    /// Pending-forever hang at < 256) is subsumed by the MAX_NAR_SIZE
+    /// floor (live_047/R-C).
     #[test]
     fn validate_rejects_sub_min_nar_budget() {
         let cfg = Config {
@@ -718,6 +733,34 @@ mod tests {
             ..Default::default()
         };
         assert!(ok.validate().is_ok());
+    }
+
+    /// E-2(i), live_047/R-C: the deployed NAR budget MUST admit one
+    /// whole-NAR reservation — `nar_buffer_budget_bytes >=
+    /// MAX_NAR_SIZE` — or a declared-near-MAX single-shot reservation
+    /// becomes a permanently-unsatisfiable fair-FIFO head that starves
+    /// every later budget waiter (the config-violable head-progress
+    /// premise; the `log_bytes_budget >= 2 × log_cut_threshold_bytes`
+    /// one-reservation floor is the precedent one lane over).
+    #[test]
+    fn validate_rejects_nar_budget_below_one_reservation() {
+        use rio_common::limits::MAX_NAR_SIZE;
+        let cfg = Config {
+            database_url: "postgres://x".into(),
+            nar_buffer_budget_bytes: Some(MAX_NAR_SIZE - 1),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("nar_buffer_budget_bytes"), "got: {err}");
+        // Boundary: exactly one reservation is admissible (reservations
+        // are < MAX_NAR_SIZE by the declared-size `>=` rejection).
+        let ok = Config {
+            database_url: "postgres://x".into(),
+            nar_buffer_budget_bytes: Some(MAX_NAR_SIZE),
+            ..Default::default()
+        };
+        ok.validate()
+            .expect("budget == MAX_NAR_SIZE admits one reservation");
     }
 
     #[test]

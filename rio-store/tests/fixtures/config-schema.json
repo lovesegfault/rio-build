@@ -42,7 +42,7 @@
         "default": 2147483648
       },
       "nar_buffer_budget_bytes": {
-        "description": "Global NAR reassembly buffer budget in bytes — total permits\nacross ALL concurrent PutPath handlers. Each handler acquires\n`chunk.len()` permits before extending its accumulation Vec.\nNone → DEFAULT_NAR_BUDGET (8 × MAX_NAR_SIZE = 32 GiB). Lower\nthis on small-memory nodes; raise it if you have >8 concurrent\nmax-size uploads and RAM to match.",
+        "description": "Global NAR buffer budget in bytes — total permits across ALL\nconcurrent NAR ingests, shared by PutPath (per-chunk charges)\nand upstream substitution (one whole-NAR reservation per leg,\nlive_047/R-C). None → DEFAULT_NAR_BUDGET (8 × MAX_NAR_SIZE =\n32 GiB). Floor: MAX_NAR_SIZE (4 GiB) — the budget MUST admit\none whole-NAR reservation, or a declared-near-MAX substitution\nbecomes a permanently-unsatisfiable fair-FIFO head that\nstarves every later budget waiter (the former \"lower this on\nsmall-memory nodes\" use-case is retired: a sub-4 GiB budget\nwas a wedge, not a tuning). Raise it if you have >8 concurrent\nmax-size ingests and RAM to match.",
         "type": [
           "integer",
           "null"

@@ -235,7 +235,7 @@ pub struct StoreServiceImpl {
     /// NOT shared with GetPath's chunk cache — that's moka-bounded separately
     /// (chunk_cache above). This bounds ONLY the per-request accumulation
     /// Vec, which is the OOM vector: 10 × 4 GiB = 40 GiB RSS.
-    // r[impl store.put.nar-bytes-budget+3]
+    // r[impl store.put.nar-bytes-budget+4]
     nar_bytes_budget: Arc<tokio::sync::Semaphore>,
     /// Upstream binary-cache substituter. `None` disables substitution
     /// (QueryPathInfo/GetPath miss → NotFound immediately, pre-P0462
@@ -282,6 +282,11 @@ pub const DEFAULT_CHUNK_PREFETCH_K: usize = 64;
 /// `tokio::sync::Semaphore` max permits is `usize::MAX >> 3`; this fits
 /// comfortably on 64-bit.
 const DEFAULT_NAR_BUDGET: usize = (8 * MAX_NAR_SIZE) as usize;
+
+// E-2(ii) backstop (live_047/R-C): the None-default budget admits one
+// whole-NAR substitution reservation; the config-plane premise is the
+// validate() floor `nar_buffer_budget_bytes >= MAX_NAR_SIZE`.
+const _: () = assert!(MAX_NAR_SIZE as usize <= DEFAULT_NAR_BUDGET);
 
 /// Witness: this request is NOT an end-user tenant session — the
 /// deny-tenants polarity check passed (`reject_end_user_tenant`).

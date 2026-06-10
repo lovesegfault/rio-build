@@ -568,31 +568,53 @@ unreferenced age past grace and are collected by a later collect cycle
   collect cycle). The bound is ≤1 NAR-size per failure.
 ]
 
-#r("store.put.nar-bytes-budget+3")[
+#r("store.put.nar-bytes-budget+4")[
   A process-global `tokio::sync::Semaphore` (default `8 × MAX_NAR_SIZE` = 32
-  GiB; configurable via `nar_buffer_budget_bytes`) bounds in-flight NAR bytes
-  across ALL concurrent `PutPath` AND upstream-substitution NAR ingests (one
-  shared `Arc<Semaphore>`). Each handler
-  `acquire_many(nar_chunk_charge(chunk.len()))` BEFORE extending its `nar_data:
-  Vec<u8>`; permits are held in a `Vec<SemaphorePermit>` and released on
-  handler drop (any exit path). When the budget is exhausted, the `await`
-  backpressures the client via gRPC flow control instead of OOMing the process
-  (10 × 4 GiB concurrent uploads = 40 GiB RSS otherwise). The per-request
-  `MAX_NAR_SIZE` raw-content check uses `>=` so a single chunk of exactly 2³²
-  bytes is rejected before it reaches `acquire_many(0)` and silently bypasses
-  the budget. Empty `NarChunk` messages are rejected with `InvalidArgument`;
-  tiny chunks are charged a floor of `MIN_NAR_CHUNK_CHARGE` (256) bytes so
-  per-permit tracking overhead is itself bounded by the budget. Both `PutPath`
-  and `PutPathBatch` track cumulative *charged permits* (each chunk charged
-  `nar_chunk_charge(len) = max(len, MIN_NAR_CHUNK_CHARGE)`) and reject at
-  `MAX_NAR_SIZE` BEFORE `acquire_many` --- `PutPathBatch` with
+  GiB; configurable via `nar_buffer_budget_bytes`, floored by `validate()` at
+  `MAX_NAR_SIZE` so every deployed budget admits at least one whole-NAR
+  reservation) bounds in-flight NAR bytes across ALL concurrent `PutPath` AND
+  upstream-substitution NAR ingests (one shared `Arc<Semaphore>`). Two charge
+  regimes, one semaphore unit. *PutPath/PutPathBatch (per-chunk):* each
+  handler `acquire_many(nar_chunk_charge(chunk.len()))` BEFORE extending its
+  `nar_data: Vec<u8>`; permits are held in a `Vec<SemaphorePermit>` and
+  released on handler drop (any exit path). Empty `NarChunk` messages are
+  rejected with `InvalidArgument`; tiny chunks are charged a floor of
+  `MIN_NAR_CHUNK_CHARGE` (256) bytes so per-permit tracking overhead is itself
+  bounded by the budget; the per-request `MAX_NAR_SIZE` raw-content check uses
+  `>=` so a single chunk of exactly 2³² bytes is rejected before it reaches
+  `acquire_many(0)`. Both RPCs track cumulative *charged permits* (each chunk
+  charged `nar_chunk_charge(len) = max(len, MIN_NAR_CHUNK_CHARGE)`) and reject
+  at `MAX_NAR_SIZE` BEFORE `acquire_many` --- `PutPathBatch` with
   `FailedPrecondition` (builder falls back to per-output `PutPath`), `PutPath`
-  with `InvalidArgument` (too-many-tiny-chunks is a client bug). The
-  charged-permit unit MUST match the semaphore's unit so a single handler can
-  never demand more than `MAX_NAR_SIZE` permits --- with `budget ≥
-  MAX_NAR_SIZE` (production: 8×), a single handler can never self-deadlock on
-  permits it holds. NOT shared with GetPath's chunk cache (moka-bounded
-  separately).
+  with `InvalidArgument` (too-many-tiny-chunks is a client bug).
+  *Substitution (whole-NAR reservation):* the substitute leg MUST charge its
+  entire declared size in ONE reservation
+  (`declared.max(MIN_NAR_CHUNK_CHARGE)`), acquired after the placeholder
+  claim arms and before the NAR GET, with `declared >= MAX_NAR_SIZE` rejected
+  first (PutPath parity; also what makes the reservation `u32`-expressible);
+  a budget waiter therefore holds ZERO permits, the read loop has no acquire
+  site, the decompressed read cap is `declared + 1` (over-delivery fails as
+  `SizeMismatch` during the read, so buffered bytes never exceed the
+  reservation), and the reservation's lifetime MUST cover the bytes'
+  residency --- it rides the buffer through the hash `spawn_blocking` detach
+  and is credited back after `persist_nar` (or when the detached hash task's
+  output drops, under cancellation). The substitute leg's entire cumulative
+  charged demand IS its single reservation `< MAX_NAR_SIZE`, so the
+  charged-permit-unit law --- the unit MUST match the semaphore's so a single
+  handler can never demand more than `MAX_NAR_SIZE` permits, and with
+  `budget >= MAX_NAR_SIZE` (validate()-enforced; production 8×) a single
+  handler can never self-deadlock on permits it holds --- now holds for EVERY
+  handler in this rule's scope, not only PutPath/PutPathBatch. Among
+  reservation-discipline acquirers the budget is additionally wedge-free as a
+  POPULATION (no hold-and-wait; fair-FIFO head progress), PROVIDED no
+  incremental-regime holder (PutPath/PutPathBatch, whose client-controlled
+  residence is unbounded) is in hold-and-wait at budget exhaustion --- the
+  per-chunk regime retains the multi-holder wedge class among RPC ingest
+  streams; unifying PutPath on the reservation discipline (the declared
+  `NarSize` is available in the request metadata) is the named restoration
+  step. When the budget is exhausted, the `await` backpressures (gRPC flow
+  control / `BudgetParked` substitution parking) instead of OOMing the
+  process. NOT shared with GetPath's chunk cache (moka-bounded separately).
 ]
 
 #r("store.put.placeholder-claim+2")[

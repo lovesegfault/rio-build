@@ -393,7 +393,7 @@
         "key": "nar_buffer_budget_bytes",
         "type": "integer",
         "default": "",
-        "description": "Global NAR reassembly buffer budget in bytes — total permits across ALL concurrent PutPath handlers."
+        "description": "Global NAR buffer budget in bytes — total permits across ALL concurrent NAR ingests, shared by PutPath (per-chunk charges) and upstream substitution (one whole-NAR reservation per leg, live_047/R-C)."
       },
       {
         "key": "signing_key_path",
