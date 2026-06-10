@@ -288,6 +288,7 @@ struct BuildActivityState {
     ///   decremented count (`SetExpected` is absolute on the wire — a
     ///   lowered re-emission is protocol-legal, exactly how stock
     ///   retires `expectedSubstitutions`).
+    ///
     /// The scheduler doesn't know upfront how many drvs will go
     /// `Substituting` (it's discovered as the DAG runs), so the value
     /// moves both ways rather than being set once.
