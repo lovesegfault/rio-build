@@ -258,8 +258,8 @@ fn statx_basic(path: &Path, follow: bool) -> anyhow::Result<libc::statx> {
 /// so a divergence means the FUSE answered inconsistently for the two
 /// paths (or the kernel could not populate a basic field). Builds that
 /// statx their inputs — coreutils, rustc's file cache, ninja — must see
-/// the canonical store metadata: root-owned, nlink 1, epoch+1s times,
-/// 512-byte block accounting.
+/// the canonical store metadata: root-owned, honest nlink, epoch+1s
+/// times, 512-byte block accounting.
 // r[verify builder.fuse.canonical-metadata+2]
 pub fn generic_423_statx_field_correctness(ctx: &Ctx) -> anyhow::Result<Outcome> {
     let (file, dir, symlink) = sample_nodes(ctx)?;
@@ -315,9 +315,12 @@ pub fn generic_423_statx_field_correctness(ctx: &Ctx) -> anyhow::Result<Outcome>
             sx.stx_nlink,
             st.nlink()
         );
+        // Honest nlink: files/symlinks report their path-alias count
+        // (>= 1), directories the 2-plus-subdirectories convention.
+        let nlink_floor = if kind == "dir" { 2 } else { 1 };
         ensure!(
-            u64::from(sx.stx_nlink) == 1,
-            "statx nlink of the {kind} {} is {}, expected the castore choice of 1",
+            u64::from(sx.stx_nlink) >= nlink_floor,
+            "statx nlink of the {kind} {} is {}, expected >= {nlink_floor}",
             path.display(),
             sx.stx_nlink
         );

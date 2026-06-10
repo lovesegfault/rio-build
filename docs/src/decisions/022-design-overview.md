@@ -75,7 +75,7 @@ On the store side, ADR-022 introduces the **NAR index** (per-file `{path, size, 
 
 The builder assembles `/nix/store` from two layers per build:
 
-1. **castore-FUSE** — a `fuser` filesystem mounted at `/var/rio/castore/{build_id}/` serving the closure's Directory DAG (§8). `lookup`/`getattr`/`readdir`/`readlink` are answered from an in-heap `HashMap<u64, Node>` keyed by content-derived inode (`r[builder.fs.castore-inode-digest]`); `open()` resolves `ino → file_digest` and brokers a passthrough fd from the node-SSD backing cache. The tree is immutable for the mount's lifetime, so every reply carries `ttl: Duration::MAX` and `init` advertises `FUSE_DO_READDIRPLUS | FUSE_READDIRPLUS_AUTO | FUSE_PARALLEL_DIROPS | FUSE_CACHE_SYMLINKS` (`r[builder.fs.castore-cache-config]`). The mount-time DAG prefetch is wrapped in `timeout(dag_prefetch_timeout)` (default 30 s); expiry is an infra-retry, not a build failure.
+1. **castore-FUSE** — a `fuser` filesystem mounted at `/var/rio/castore/{build_id}/` serving the closure's Directory DAG (§8). `lookup`/`getattr`/`readdir`/`readlink` are answered from an in-heap `HashMap<u64, Node>` keyed by inode — content-derived for files/symlinks, path-derived for directories (`r[builder.fs.castore-inode-digest]`); `open()` resolves `ino → file_digest` and brokers a passthrough fd from the node-SSD backing cache. The tree is immutable for the mount's lifetime, so every reply carries `ttl: Duration::MAX` and `init` advertises `FUSE_DO_READDIRPLUS | FUSE_READDIRPLUS_AUTO | FUSE_PARALLEL_DIROPS | FUSE_CACHE_SYMLINKS` (`r[builder.fs.castore-cache-config]`). The mount-time DAG prefetch is wrapped in `timeout(dag_prefetch_timeout)` (default 30 s); expiry is an infra-retry, not a build failure.
 
 r[builder.overlay.castore-lower]
 
@@ -137,7 +137,7 @@ r[store.index.rpc]
 
 ## 6. Builder-side data path: castore-FUSE `open()`
 
-The castore-FUSE handler serves the full tree from the in-heap Directory DAG (cold `lookup`/`readdir`/`readlink`, §4) and brokers data on `open()`. Its state is a `HashMap<u64, Node>` keyed by content-derived inode, populated at mount from one `GetDirectory(recursive=true)` call seeded with all closure `dir_digest` roots (`r[builder.fs.castore-dag-source]`). `lookup(parent_ino, name)` reads the parent's `Directory` body and returns the child's content-derived inode. Any name outside the prefetched DAG → `ENOENT` (declared-input allowlist).
+The castore-FUSE handler serves the full tree from the in-heap Directory DAG (cold `lookup`/`readdir`/`readlink`, §4) and brokers data on `open()`. Its state is a `HashMap<u64, Node>` keyed by inode (content-derived for files/symlinks, path-derived for directories), populated at mount from one `GetDirectory(recursive=true)` call seeded with all closure `dir_digest` roots (`r[builder.fs.castore-dag-source]`). `lookup(parent_ino, name)` probes the parent's precomputed child index and returns the child's inode. Any name outside the prefetched DAG → `ENOENT` (declared-input allowlist).
 
 The handler negotiates `FUSE_PASSTHROUGH` at `init` (`max_stack_depth = 1`). `FUSE_DEV_IOC_BACKING_OPEN` requires init-ns `CAP_SYS_ADMIN` ([`backing.c:91-93`](https://github.com/torvalds/linux/blob/master/fs/fuse/backing.c)), so the ioctl is brokered by `rio-mountd` (§11), which kept a `dup()` of this build's `/dev/fuse` fd. On `open(ino → file_digest)`:
 

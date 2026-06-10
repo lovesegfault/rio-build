@@ -168,12 +168,15 @@ pub fn generic_257_readdir_multibatch(ctx: &Ctx) -> anyhow::Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
-/// Castore-specific identity contract: inodes are content-derived.
-/// Identical bytes (same exec bit) in different directories share one
-/// inode; the same bytes with a different exec bit are distinct
-/// inodes; directories with identical contents share one inode.
-/// Guards the digest→ino derivation in `tree::InoMap` — a regression
-/// here breaks dedup assumptions and inode-comparing tools.
+/// Castore-specific identity contract: file/symlink inodes are
+/// content-derived, directory inodes are path-derived. Identical bytes
+/// (same exec bit) in different directories share one inode (with an
+/// honest st_nlink alias count); the same bytes with a different exec
+/// bit are distinct inodes; directories with identical contents at
+/// different paths are DISTINCT inodes — a shared directory inode is a
+/// hardlinked directory, which POSIX forbids and which desyncs
+/// fts-based walkers (find/du/rm -r abort with fabricated ENOENT under
+/// concurrency). Guards the ino derivation in `tree::InoMap`.
 pub fn inode_identity_content_addressed(ctx: &Ctx) -> anyhow::Result<Outcome> {
     let ino = |rel: &str| -> anyhow::Result<u64> {
         Ok(fs::symlink_metadata(ctx.on_mount(rel))
@@ -181,7 +184,9 @@ pub fn inode_identity_content_addressed(ctx: &Ctx) -> anyhow::Result<Outcome> {
             .ino())
     };
 
-    // Files: same (content, exec) class → one inode.
+    // Files: same (content, exec) class → one inode, and st_nlink
+    // reports at least the alias count visible in the fixture (the
+    // same content class may have more aliases elsewhere in the tree).
     let mut dedup_groups = 0;
     for ((_, _), members) in ctx.manifest.content_groups() {
         if members.len() < 2 {
@@ -196,6 +201,13 @@ pub fn inode_identity_content_addressed(ctx: &Ctx) -> anyhow::Result<Outcome> {
             inos.windows(2).all(|w| w[0] == w[1]),
             "files with identical content+exec have distinct inodes: {:?} -> {inos:?}",
             members.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+        let nlink = fs::symlink_metadata(ctx.on_mount(&members[0].path))?.nlink();
+        ensure!(
+            nlink >= members.len() as u64,
+            "deduped file {} has nlink {nlink}, expected >= its {} aliases",
+            members[0].path,
+            members.len()
         );
     }
     ensure!(
@@ -233,7 +245,8 @@ pub fn inode_identity_content_addressed(ctx: &Ctx) -> anyhow::Result<Outcome> {
     );
 
     // Directories with identical (name, content, exec) child sets share
-    // one Directory body and therefore one inode.
+    // one decoded Directory body, but each PATH must be its own inode —
+    // equal inos here would be hardlinked directories.
     let mut dir_shapes: BTreeMap<Vec<(String, String, bool)>, Vec<&str>> = BTreeMap::new();
     for dir in &ctx.manifest.dirs {
         let prefix = format!("{dir}/");
@@ -269,10 +282,14 @@ pub fn inode_identity_content_addressed(ctx: &Ctx) -> anyhow::Result<Outcome> {
         if dirs.len() < 2 {
             continue;
         }
-        let inos: Vec<u64> = dirs.iter().map(|d| ino(d)).collect::<anyhow::Result<_>>()?;
+        let mut inos: Vec<u64> = dirs.iter().map(|d| ino(d)).collect::<anyhow::Result<_>>()?;
+        let count = inos.len();
+        inos.sort_unstable();
+        inos.dedup();
         ensure!(
-            inos.windows(2).all(|w| w[0] == w[1]),
-            "directories with identical contents have distinct inodes: {dirs:?} -> {inos:?}"
+            inos.len() == count,
+            "directories with identical contents share an inode (hardlinked-dir \
+             semantics): {dirs:?} -> {inos:?}"
         );
     }
     Ok(Outcome::Pass)

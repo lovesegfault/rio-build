@@ -61,7 +61,7 @@ pub fn registry() -> Vec<Check> {
         },
         Check {
             name: "generic_002_nlink_walk",
-            origin: "xfstests generic/002 (inverted: castore has no hardlinks, asserts nlink==1 — F-B)",
+            origin: "xfstests generic/002 (adapted: honest nlink per builder.fs.castore-nlink)",
             run: meta::generic_002_nlink_walk,
         },
         Check {
