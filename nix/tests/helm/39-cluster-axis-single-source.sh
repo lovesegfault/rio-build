@@ -132,4 +132,46 @@ esk=$TMPDIR/cluster-axis-es-karpenter.yaml
 helm template rio . --set global.image.tag=test $es_args --set karpenter.clusterName=rio-eks-ci >"$esk"
 assert_pair "$esk" "rio-eks-ci" "external-secrets + karpenter fallback"
 
-echo "OK: controller strategy Recreate; cluster single-sourced (explicit/fallback/default) TOML-to-TOML; external-secrets empty-id render gate fires (planted red) and passes with either id source"
+# (i) merged_bug_067: the gate predicate and the emission are
+# NORMALIZED at the rio.clusterIdentity mint — driven over the
+# cross-boundary golden fixture ($clusterIdentityFixture: the same
+# bytes the Rust constructor golden test consumes, so the two
+# languages' trim ∘ classify predicates cannot drift). For every
+# helm-settable case: single_cluster_default=true ⟹ the
+# external-secrets render REFUSES (the refusal set is "every
+# helm-settable value the runtime classifies single-cluster-default",
+# not the empty-string point — the round-6 weak-witness kill);
+# =false ⟹ the render carries the NORMALIZED value in BOTH TOMLs
+# (the trim-collision axis closed at the mint: uid axis and λ-filter
+# axis provably consume one alphabet).
+test -n "${clusterIdentityFixture:-}" || {
+  echo "FAIL: clusterIdentityFixture env input missing — leg (i) cannot run" >&2
+  exit 1
+}
+norm_out=$TMPDIR/cluster-axis-norm.yaml
+norm_err=$TMPDIR/cluster-axis-norm.err
+while IFS= read -r case_json; do
+  raw=$(jq -r '.raw' <<<"$case_json")
+  normalized=$(jq -r '.normalized' <<<"$case_json")
+  is_default=$(jq -r '.single_cluster_default' <<<"$case_json")
+  if [ "$is_default" = "true" ]; then
+    # shellcheck disable=SC2086
+    if helm template rio . --set global.image.tag=test $es_args \
+      --set-string "scheduler.sla.cluster=$raw" >/dev/null 2>"$norm_err"; then
+      echo "FAIL: external-secrets render accepted raw '$raw' — the runtime classifies it single-cluster-default; the gate predicate is raw" >&2
+      exit 1
+    fi
+    grep -q "cluster identity required" "$norm_err" || {
+      echo "FAIL: gate refused raw '$raw' but without the 'cluster identity required' message:" >&2
+      cat "$norm_err" >&2
+      exit 1
+    }
+  else
+    # shellcheck disable=SC2086
+    helm template rio . --set global.image.tag=test $es_args \
+      --set-string "scheduler.sla.cluster=$raw" >"$norm_out"
+    assert_pair "$norm_out" "$normalized" "normalization: raw '$raw'"
+  fi
+done < <(jq -c '.cases[] | select(.helm_settable)' "$clusterIdentityFixture")
+
+echo "OK: controller strategy Recreate; cluster single-sourced (explicit/fallback/default) TOML-to-TOML; external-secrets empty-id render gate fires (planted red) and passes with either id source; normalization law pinned to the golden fixture (leg i)"

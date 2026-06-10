@@ -302,6 +302,12 @@ in
           # promtool ships in the cli output, not out.
           pkgs.prometheus.cli
         ];
+        # merged_bug_067 (fragment 39 leg (i)): the cross-boundary
+        # cluster-identity normalization fixture — ONE committed file
+        # consumed by BOTH the helm leg and the Rust constructor
+        # golden test, so the two languages' predicates cannot drift
+        # (the nix/dashboard.nix env-input wiring precedent).
+        clusterIdentityFixture = ../rio-controller/tests/golden/cluster_identity_normalization.json;
       }
       ''
         cp -r ${chart} $TMPDIR/chart

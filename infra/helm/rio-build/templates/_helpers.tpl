@@ -455,10 +455,22 @@ activation warn (ctrl.informer.cluster-identity-boundary). BOTH TOML
 defines consume this include — structural single-sourcing: drift
 between the two binaries' cluster values is unwritable, not just
 policed. Takes the ROOT context.
+ONE normalization law (merged_bug_067): the mint emits the TRIMMED
+value and the gate evaluates it — the same trim ∘ classify law as the
+runtime constructor (ClusterId::new: trim; post-trim-empty = the
+single-cluster default), pinned cross-language by
+rio-controller/tests/golden/cluster_identity_normalization.json
+(fragment 39 leg (i) drives this helper over the fixture's
+helm-settable cases; the Rust golden test drives the constructor over
+the full alphabet). The trim applies to the RESULT of the default
+chain, not per-operand: a whitespace-only scheduler.sla.cluster does
+NOT fall through to karpenter.clusterName — it normalizes to "",
+exactly what the runtime would classify it as (the gate then fires
+under externalSecrets; single-cluster default otherwise).
 Usage: cluster = {{ include "rio.clusterIdentity" $ | quote }}
 */}}
 {{- define "rio.clusterIdentity" -}}
-{{- $id := (.Values.scheduler.sla.cluster | default .Values.karpenter.clusterName | default "") -}}
+{{- $id := ((.Values.scheduler.sla.cluster | default .Values.karpenter.clusterName | default "") | toString | trim) -}}
 {{- if and .Values.externalSecrets.enabled (eq $id "") -}}
 {{- fail "cluster identity required with the external-secrets PG path: two deployments sharing one PG with cluster=\"\" mint identical exposure uids and silently absorb each other's λ evidence (M_047 event_uid dedup) — set scheduler.sla.cluster (any stable per-deployment name) or karpenter.clusterName" -}}
 {{- end -}}

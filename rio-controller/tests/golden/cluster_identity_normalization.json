@@ -1,0 +1,47 @@
+{
+  "_doc": "merged_bug_067: THE cluster-identity normalization law, pinned cross-language. One law: trim; post-trim-empty = the single-cluster default. Consumers: (1) helm fragment 39 leg (i) drives rio.clusterIdentity over the helm_settable cases (single_cluster_default=true => the external-secrets render gate MUST refuse; false => the render MUST carry `normalized` in BOTH TOMLs); (2) the Rust golden test (node_informer.rs cluster_identity_normalization_golden) drives ClusterId::new over the FULL alphabet (incl. non-helm-settable whitespace forms). Scope honesty: the helm leg quantifies over the helm_settable subset (space padding -- the realistic YAML accident); the Rust leg quantifies over the full alphabet; the SHARED law (trim then classify) is the same function on both sides pinned by the same bytes -- each side certifies its full reachable input set. Drift on either side breaks its consumer against THIS file.",
+  "cases": [
+    {
+      "raw": "",
+      "normalized": "",
+      "single_cluster_default": true,
+      "helm_settable": true
+    },
+    {
+      "raw": "  ",
+      "normalized": "",
+      "single_cluster_default": true,
+      "helm_settable": true
+    },
+    {
+      "raw": "\t",
+      "normalized": "",
+      "single_cluster_default": true,
+      "helm_settable": false
+    },
+    {
+      "raw": " \t ",
+      "normalized": "",
+      "single_cluster_default": true,
+      "helm_settable": false
+    },
+    {
+      "raw": "prod-eu",
+      "normalized": "prod-eu",
+      "single_cluster_default": false,
+      "helm_settable": true
+    },
+    {
+      "raw": " prod-eu ",
+      "normalized": "prod-eu",
+      "single_cluster_default": false,
+      "helm_settable": true
+    },
+    {
+      "raw": "prod eu",
+      "normalized": "prod eu",
+      "single_cluster_default": false,
+      "helm_settable": true
+    }
+  ]
+}
