@@ -406,12 +406,13 @@ async fn execute_job_inner(
     // `visited`).
     let mut reseed_references: Vec<String> = Vec::new();
     // BC-4 cumulative progress accounting: bytes of fully-processed
-    // paths. The per-path fetch callback adds the in-flight path's
-    // streamed bytes on top of `completed_bytes`, with the declared
-    // NarSize as the path's expected — so reports are cumulative
-    // across the closure, monotone in done, and expected genuinely
-    // leads done mid-fetch (merged_bug_195; the narinfo/local-row read
-    // precedes the body fetch).
+    // paths (the committed floor). merged_bug_012: the driver's
+    // per-iteration WindowProgress fold adds Σ streamed / Σ declared
+    // over the WHOLE in-flight window on top of this floor — so
+    // reports are cumulative across the closure, non-decreasing in
+    // done on success traces at any width, and expected genuinely
+    // leads done while declared work is outstanding (merged_bug_195;
+    // the narinfo/local-row read precedes the body fetch).
     let mut completed_bytes: u64 = 0;
     let mut first_iteration = true;
 
@@ -550,6 +551,9 @@ async fn execute_job_inner(
         let fanout = ctx.path_fanout.max(1);
         let (tick_tx, mut tick_rx) =
             tokio::sync::mpsc::channel::<ProgressTick>(PROGRESS_TICK_QUEUE);
+        // merged_bug_012: the per-iteration window fold — the driver
+        // owns the cumulative arithmetic; futures emit raw counters.
+        let mut window_progress = WindowProgress::default();
         let mut window: futures_util::stream::FuturesUnordered<
             futures_util::future::BoxFuture<'_, PathResolution>,
         > = futures_util::stream::FuturesUnordered::new();
@@ -567,6 +571,9 @@ async fn execute_job_inner(
                         verified_tenants: vt,
                         ingested: was_ingested,
                     } => {
+                        // merged_bug_012: leave the fold BEFORE the
+                        // commit below — late ticks are zombies.
+                        window_progress.retire(&path);
                         verified_tenants_by_path.insert(path.clone(), vt);
                         if was_ingested {
                             ingested.push(path);
@@ -598,6 +605,7 @@ async fn execute_job_inner(
                         trust_refused: t,
                         content_mismatched: c,
                     } => {
+                        window_progress.retire(&path);
                         if t {
                             trust_refused.record(path.clone(), tenant_generation);
                         }
@@ -612,6 +620,11 @@ async fn execute_job_inner(
                         }
                     }
                     PathResolution::AbortGrade { path, grade } => {
+                        // The aborted path's streamed bytes leave the
+                        // fold; a later emission steps back at most to
+                        // the committed floor (the truthful direction,
+                        // still representable — the spec's MAY).
+                        window_progress.retire(&path);
                         walk_abort
                             .get_or_insert_with(Vec::new)
                             .push(AbortEvidence { path, grade });
@@ -667,10 +680,12 @@ async fn execute_job_inner(
                         visited.contains(&path),
                         "frontier membership implies visited (enqueue-dedup)"
                     );
-                    // Law 6: base = the cumulative floor at SPAWN —
-                    // the tick arithmetic of the old `per_path(base)`,
-                    // now applied future-side onto event payloads.
-                    let base = completed_bytes;
+                    // Law 6 (merged_bug_012): the path joins the
+                    // driver's window fold at spawn — the future
+                    // emits RAW per-path counters and the driver
+                    // owns ALL cumulative arithmetic (no base is
+                    // captured; a stale-base emission is unwritable).
+                    window_progress.admit(&path, fanout);
                     window.push(Box::pin(resolve_path(
                         ctx,
                         claimed,
@@ -678,7 +693,6 @@ async fn execute_job_inner(
                         &trust_cache,
                         path,
                         cell,
-                        base,
                         tick_tx.clone(),
                         slot,
                     )));
@@ -706,13 +720,21 @@ async fn execute_job_inner(
                     apply_resolution!(res);
                 }
                 Some(tick) = tick_rx.recv() => {
-                    // Law 6: the driver is the SOLE on_progress
-                    // caller — commits and provisional emissions
-                    // form ONE total order, so the per-call floor
-                    // MUST of progress-monotone+1 is enforceable
-                    // trace-wide; the forward keeps the droppable/
-                    // non-blocking contract (ticks arrived try_send).
-                    progress.emit_provisional(tick.done, tick.expected, &tick.uri);
+                    // Law 6 + merged_bug_012: the driver is the SOLE
+                    // on_progress caller — commits and provisional
+                    // emissions form ONE total order — and the SOLE
+                    // owner of cumulative arithmetic: the fold emits
+                    // (floor + Σ streamed, floor + Σ declared) over
+                    // the in-flight map, so cross-sibling interleave
+                    // cannot oscillate the wire pair and a committed
+                    // floor passing one path's declared size cannot
+                    // render the bar complete. Retired paths' late
+                    // ticks are dropped (the zombie guard); the
+                    // droppable/non-blocking contract is kept (ticks
+                    // arrived try_send).
+                    if let Some((done, expected)) = window_progress.tick(completed_bytes, &tick) {
+                        progress.emit_provisional(done, expected, &tick.uri);
+                    }
                 }
             }
         }
@@ -1021,16 +1043,75 @@ fn fold_abort_evidence(evidence: &[AbortEvidence]) -> MaterializationOutcome {
 
 /// A per-path progress EVENT (path-fold law 6): path futures never
 /// call the progress adapter — they `try_send` (droppable, the relay
-/// contract) base-adjusted ticks onto the driver's stream, and the
-/// DRIVER is the sole `on_progress` caller, so commits and provisional
-/// emissions form one total order and the per-call floor MUST of
-/// `store.materialize.progress-monotone+1` is enforceable trace-wide
-/// (post-outcome zombie emissions are impossible — forwarding stops at
-/// outcome).
+/// contract) RAW per-path counters onto the driver's stream, and the
+/// DRIVER is the sole `on_progress` caller AND the sole owner of
+/// cumulative arithmetic (merged_bug_012: the WindowProgress fold), so
+/// commits and provisional emissions form one total order and the
+/// per-call floor MUST of `store.materialize.progress-monotone+1` is
+/// enforceable trace-wide (post-outcome zombie emissions are
+/// impossible — forwarding stops at outcome; post-RETIRE zombie ticks
+/// are dropped by the fold's membership).
 struct ProgressTick {
-    done: u64,
-    expected: u64,
+    /// The emitting path — the fold's map key (merged_bug_012: ticks
+    /// are RAW per-path events; a spawn-captured base is no longer
+    /// writable because there is no base field to fill).
+    path: String,
+    /// Bytes of this path's CURRENT fetch streamed so far (restarts
+    /// at zero on a stall failover — the licensed step-back).
+    streamed: u64,
+    /// The fetch's declared total (NarSize from the serving narinfo).
+    declared: u64,
     uri: String,
+}
+
+/// Driver-owned per-iteration window progress fold (merged_bug_012):
+/// at width > 1 only the component with a total order over emissions
+/// may compute cumulative display values, and the driver IS that
+/// component (path-fold law 6 — sole `on_progress` caller). Paths are
+/// ADMITTED at spawn, updated per raw tick, and RETIRED on every apply
+/// arm; the aggregate emission is `(floor + Σ streamed, floor + Σ
+/// declared)` over the in-flight map. Late ticks for retired paths
+/// find no entry and are dropped — the zombie guard. The in-flight map
+/// is window-bounded (≤ F entries — law 2).
+#[derive(Default)]
+struct WindowProgress {
+    in_flight: HashMap<String, (u64, u64)>,
+}
+
+impl WindowProgress {
+    /// Register a path at SPAWN (membership is the zombie guard's
+    /// authority: tick() updates only existing entries). The map is
+    /// window-bounded — the R17 memory envelope, asserted here.
+    fn admit(&mut self, path: &str, fanout: usize) {
+        debug_assert!(
+            self.in_flight.len() < fanout,
+            "in-flight fold exceeds the window bound (law 2)"
+        );
+        self.in_flight.insert(path.to_string(), (0, 0));
+    }
+
+    /// Fold one raw tick; returns the aggregate `(done, expected)`
+    /// over `floor`, or None for a retired path's late tick.
+    fn tick(&mut self, floor: u64, t: &ProgressTick) -> Option<(u64, u64)> {
+        let entry = self.in_flight.get_mut(&t.path)?;
+        *entry = (t.streamed, t.declared);
+        let (sum_streamed, sum_declared) = self
+            .in_flight
+            .values()
+            .fold((0u64, 0u64), |(s, d), (ps, pd)| {
+                (s.saturating_add(*ps), d.saturating_add(*pd))
+            });
+        Some((
+            floor.saturating_add(sum_streamed),
+            floor.saturating_add(sum_declared),
+        ))
+    }
+
+    /// Drop a path from the fold (every apply arm — Served, Settled,
+    /// AbortGrade). Subsequent ticks from it are ignored.
+    fn retire(&mut self, path: &str) {
+        self.in_flight.remove(path);
+    }
 }
 
 /// Per-iteration tick-queue depth. Sized for display traffic (ticks
@@ -1233,7 +1314,6 @@ async fn resolve_path(
     trust_cache: &SharedTrustCache,
     path: String,
     cell: PathCell,
-    progress_base: u64,
     ticks: tokio::sync::mpsc::Sender<ProgressTick>,
     // gate-share: the slot spans the WHOLE path future (local probe +
     // tenant loop + miss-probe leg — coarser but single-region; the
@@ -1285,16 +1365,21 @@ async fn resolve_path(
         }
     };
 
-    // merged_bug_195 + path-fold law 6: per-path progress through the
-    // substitute body fetch rides the driver's event stream. The tick
-    // is base-adjusted exactly like the old `per_path(base)` closure
-    // (base = the committed floor at SPAWN — concurrent siblings'
-    // ticks may understate the aggregate, the truthful direction);
-    // the driver's adapter clamp does the rest.
-    let per_path_progress = move |done: u64, expected: u64, uri: &str| {
+    // merged_bug_195 + path-fold law 6 + merged_bug_012: per-path
+    // progress through the substitute body fetch rides the driver's
+    // event stream as RAW per-path counters — the future reports only
+    // its own (streamed, declared); the driver's WindowProgress fold
+    // owns the cumulative arithmetic and the adapter clamp does the
+    // rest. (The old spawn-captured base is deleted: at width > 1 it
+    // oscillated the wire pair by the siblings' stream gap and
+    // rendered a false 100% once commits passed a still-streaming
+    // path's base + declared.)
+    let path_for_ticks = path.clone();
+    let per_path_progress = move |streamed: u64, declared: u64, uri: &str| {
         let _ = ticks.try_send(ProgressTick {
-            done: progress_base.saturating_add(done),
-            expected: progress_base.saturating_add(expected),
+            path: path_for_ticks.clone(),
+            streamed,
+            declared,
             uri: uri.to_string(),
         });
     };
@@ -3616,6 +3701,327 @@ mod tests {
         assert_eq!(
             *final_expected, total_nar_bytes,
             "the final report's expected equals the closure total ({calls:?})"
+        );
+    }
+
+    // r[verify store.materialize.progress-monotone+1]
+    /// R1-012 (merged_bug_012, TRUE RED pre-fix) / W-012a: over a
+    /// trace where a sibling commit drives the floor past a
+    /// still-streaming path's declared size, NO provisional emission
+    /// may render complete (`done == expected == post-commit floor`)
+    /// while that path is still mid-fetch. Two independent wanted
+    /// paths at F = 4, both spawned at job start: X (large) commits
+    /// first; Y (small, gated until X's commit) then streams.
+    ///
+    /// Pre-fix red: every Y tick emitted (base + streamed, base +
+    /// declared) = (streamed, declared) with base = 0, and the clamp
+    /// dragged both to the floor — (floor, floor) frames: a false
+    /// 100% bar mid-fetch, sawtoothing at each commit. Post-fix: the
+    /// driver fold emits (floor + Σ streamed, floor + Σ declared) —
+    /// expected genuinely leads done until Y's body completes.
+    #[tokio::test]
+    async fn floor_passing_a_streaming_base_does_not_render_complete() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "fold-floor").await;
+
+        let interval = crate::substitute::SUBSTITUTE_PROGRESS_INTERVAL_BYTES as usize;
+        let x = store_path(100, "foldfloor-x");
+        let y = store_path(101, "foldfloor-y");
+        // Under the cfg(test) 64 KiB decompressed cap: X = 3 intervals
+        // (48 KiB), Y = 2 (32 KiB); floor after X (~49K) > Y declared.
+        let (x_nar, _) = rio_test_support::fixtures::make_nar(&vec![0x6au8; interval * 3]);
+        let (y_nar, _) = rio_test_support::fixtures::make_nar(&vec![0x6bu8; interval * 2]);
+        let x_len = x_nar.len() as u64;
+        let (upstream, gates) = spawn_pathgated_upstream(
+            vec![(x.clone(), x_nar, vec![]), (y.clone(), y_nar, vec![])],
+            "cache.foldfloor",
+        )
+        .await;
+        wire_upstream(&db.pool, tenant, &upstream).await;
+        let seeded = seed_job(
+            &db.pool,
+            "foldfloor-drv",
+            &[("ox", x.as_str()), ("oy", y.as_str())],
+            Some(tenant),
+            Some(tenant),
+            &[],
+        )
+        .await;
+
+        let events: std::sync::Arc<std::sync::Mutex<Vec<(u64, u64, String)>>> =
+            std::sync::Arc::default();
+        let sink = std::sync::Arc::clone(&events);
+        let ctx = make_ctx(db.pool.clone()); // F = 4: both in flight
+        let job = tokio::spawn({
+            let claimed = seeded.claimed.clone();
+            let admission = admitted(&ctx);
+            async move {
+                execute_job_with_progress(&ctx, &claimed, admission, move |d, e, u| {
+                    sink.lock().unwrap().push((d, e, u.to_string()));
+                })
+                .await
+                .into_outcome()
+            }
+        });
+
+        // Release X; hold Y until X's commit raises the floor past
+        // Y's declared size (floor = x_len > y declared).
+        let gx = std::sync::Arc::clone(&gates[&x]);
+        tokio::spawn(async move {
+            for _ in 0..400 {
+                gx.notify_one();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        let committed =
+            |evs: &[(u64, u64, String)]| evs.iter().filter(|(_, _, u)| u.is_empty()).count();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while committed(&events.lock().unwrap()) < 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "X's commit never landed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let gy = std::sync::Arc::clone(&gates[&y]);
+        tokio::spawn(async move {
+            for _ in 0..400 {
+                gy.notify_one();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        let outcome = tokio::time::timeout(Duration::from_secs(30), job)
+            .await
+            .expect("walk completes")
+            .unwrap();
+        outcome_success(&outcome).unwrap_or_else(|| panic!("expected Success, got {outcome:?}"));
+
+        // Between X's commit (the first uri == "" event) and Y's
+        // commit (the second), NO provisional frame may read
+        // done == expected == the post-X floor (the clamped
+        // false-complete cell).
+        let evs = events.lock().unwrap().clone();
+        let first_commit = evs
+            .iter()
+            .position(|(_, _, u)| u.is_empty())
+            .expect("X committed");
+        let second_commit = evs
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, _, u))| u.is_empty())
+            .map(|(i, _)| i)
+            .nth(1)
+            .expect("Y committed");
+        let false_complete: Vec<&(u64, u64, String)> = evs[first_commit + 1..second_commit]
+            .iter()
+            .filter(|(d, e, u)| !u.is_empty() && d == e && *d == x_len)
+            .collect();
+        assert!(
+            false_complete.is_empty(),
+            "provisional frames rendered complete at the post-commit floor while \
+             Y was still streaming (false-100% mid-fetch): {false_complete:?} \
+             (full trace: {evs:?})"
+        );
+    }
+
+    /// R2-012 fixture: serves each path's NAR as a PACED chunked body
+    /// — one 16 KiB chunk per scheduled delay — so two siblings
+    /// genuinely stream CONCURRENTLY with a controlled offset (the
+    /// full-body-after-gate harnesses complete in microseconds on
+    /// loopback and never overlap mid-stream).
+    async fn spawn_paced_chunked_upstream(
+        paths: Vec<(String, Vec<u8>, Vec<Duration>)>,
+        key_name: &str,
+    ) -> FakeUpstream {
+        use axum::{Router, routing::get};
+        use base64::Engine;
+        use futures_util::StreamExt as _;
+        use sha2::Digest;
+
+        let seed = [0x47u8; 32];
+        let signer = Signer::from_seed(key_name, &seed);
+        let pubkey = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
+        let trusted_key = format!(
+            "{key_name}:{}",
+            base64::engine::general_purpose::STANDARD.encode(pubkey.as_bytes())
+        );
+        let mut app = Router::new().route(
+            "/nix-cache-info",
+            get(|| async { "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n" }),
+        );
+        for (path, nar, schedule) in paths {
+            let nar_hash: [u8; 32] = sha2::Sha256::digest(&nar).into();
+            let nar_hash_str = format!(
+                "sha256:{}",
+                rio_nix::store_path::nixbase32::encode(&nar_hash)
+            );
+            let fp = fingerprint(&path, &nar_hash, nar.len() as u64, &[]);
+            let sig = signer.sign(&fp);
+            let sp = StorePath::parse(&path).unwrap();
+            let hash_part = sp.hash_part();
+            let narinfo = format!(
+                "StorePath: {path}\n\
+                 URL: nar/{hash_part}.nar\n\
+                 Compression: none\n\
+                 NarHash: {nar_hash_str}\n\
+                 NarSize: {}\n\
+                 References: \n\
+                 Sig: {sig}\n",
+                nar.len(),
+            );
+            let chunks: Vec<(Vec<u8>, Duration)> = nar
+                .chunks(16 * 1024)
+                .map(|c| c.to_vec())
+                .zip(
+                    schedule
+                        .into_iter()
+                        .chain(std::iter::repeat(Duration::ZERO)),
+                )
+                .collect();
+            app = app
+                .route(
+                    &format!("/{hash_part}.narinfo"),
+                    get(move || async move { narinfo }),
+                )
+                .route(
+                    &format!("/nar/{hash_part}.nar"),
+                    get(move || async move {
+                        let stream =
+                            futures_util::stream::iter(chunks).then(|(chunk, delay)| async move {
+                                tokio::time::sleep(delay).await;
+                                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(chunk))
+                            });
+                        axum::body::Body::from_stream(stream)
+                    }),
+                );
+        }
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        FakeUpstream {
+            url: format!("http://{addr}"),
+            trusted_key,
+            _task: task,
+        }
+    }
+
+    // r[verify store.materialize.progress-monotone+1]
+    /// R2-012 (merged_bug_012, TRUE RED pre-fix) / W-012b: the emitted
+    /// `done` sequence on a SUCCESS-ONLY trace is non-decreasing —
+    /// each successive provisional differs from its predecessor by one
+    /// path's streamed delta or an apply boundary, so cross-sibling
+    /// oscillation (the 300K → 2K → 320K shape) is unrepresentable in
+    /// the emitted sequence. Asserted over the captured event vec,
+    /// not wall-clock. (The licensed step-back after a FAILED attempt
+    /// is out of this trace's scope — success-only; W-012c covers it.)
+    ///
+    /// Pre-fix red: two concurrently-streaming siblings of different
+    /// sizes emitted base-adjusted pairs whose interleave regressed
+    /// `done` by the inter-sibling stream gap on alternating frames.
+    #[tokio::test]
+    async fn sibling_ticks_do_not_oscillate_the_wire_pair() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "fold-osc").await;
+
+        let interval = crate::substitute::SUBSTITUTE_PROGRESS_INTERVAL_BYTES as usize;
+        let a = store_path(102, "foldosc-a");
+        let b = store_path(103, "foldosc-b");
+        // A streams two fast chunks then a LONG tail; B's first chunk
+        // lands inside A's tail — A's raw done (32K) is ahead of B's
+        // first tick (16K), so the pre-fix interleave regresses the
+        // wire pair while BOTH are mid-stream (no commit yet, so the
+        // clamp cannot mask it). Sizes under the cfg(test) 64 KiB cap.
+        let (a_nar, _) = rio_test_support::fixtures::make_nar(&vec![0x6cu8; interval * 3]);
+        let (b_nar, _) = rio_test_support::fixtures::make_nar(&vec![0x6du8; interval * 2]);
+        let upstream = spawn_paced_chunked_upstream(
+            vec![
+                (
+                    a.clone(),
+                    a_nar,
+                    vec![
+                        Duration::from_millis(10),
+                        Duration::from_millis(10),
+                        Duration::from_millis(400),
+                    ],
+                ),
+                (
+                    b.clone(),
+                    b_nar,
+                    vec![Duration::from_millis(120), Duration::from_millis(10)],
+                ),
+            ],
+            "cache.foldosc",
+        )
+        .await;
+        wire_upstream(&db.pool, tenant, &upstream).await;
+        let seeded = seed_job(
+            &db.pool,
+            "foldosc-drv",
+            &[("oa", a.as_str()), ("ob", b.as_str())],
+            Some(tenant),
+            Some(tenant),
+            &[],
+        )
+        .await;
+
+        let events: std::sync::Arc<std::sync::Mutex<Vec<(u64, u64, String)>>> =
+            std::sync::Arc::default();
+        let sink = std::sync::Arc::clone(&events);
+        let ctx = make_ctx(db.pool.clone()); // F = 4: both stream concurrently
+        let job = tokio::spawn({
+            let claimed = seeded.claimed.clone();
+            let admission = admitted(&ctx);
+            async move {
+                execute_job_with_progress(&ctx, &claimed, admission, move |d, e, u| {
+                    sink.lock().unwrap().push((d, e, u.to_string()));
+                })
+                .await
+                .into_outcome()
+            }
+        });
+        // No gates: the paced bodies overlap by construction.
+        let outcome = tokio::time::timeout(Duration::from_secs(30), job)
+            .await
+            .expect("walk completes")
+            .unwrap();
+        outcome_success(&outcome).unwrap_or_else(|| panic!("expected Success, got {outcome:?}"));
+
+        let evs = events.lock().unwrap().clone();
+        // Sanity: provisional ticks flowed.
+        assert!(
+            evs.iter().any(|(_, _, u)| !u.is_empty()),
+            "provisional ticks flowed"
+        );
+        // W-012b over the PROVISIONAL subsequence: `done` is
+        // non-decreasing — cross-sibling oscillation is
+        // unrepresentable. Commit frames (uri == \"\") are APPLY
+        // BOUNDARIES, allowed steps by the law (they emit the
+        // floor-only pair — the recorded divergence (b): commit-frame
+        // shape is out of defect scope); the boundary's effect on the
+        // next provisional is sign-checked separately below.
+        let mut prev = 0u64;
+        for (i, (d, _, u)) in evs.iter().enumerate() {
+            if u.is_empty() {
+                continue;
+            }
+            assert!(
+                *d >= prev,
+                "emitted done regressed at provisional frame {i}: {prev} -> {d} \
+                 (the cross-sibling oscillation cell; trace: {evs:?})"
+            );
+            prev = *d;
+        }
+        // Across an apply boundary the provisional aggregate never
+        // shrinks either (retire trades streamed-bytes for the
+        // committed nar size): the FULL provisional run is monotone.
+        let (final_done, final_expected, _) = evs.last().expect("non-empty");
+        assert_eq!(
+            final_done, final_expected,
+            "the final frame covers the closure total"
         );
     }
 
