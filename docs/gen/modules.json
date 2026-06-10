@@ -932,6 +932,11 @@
       "doc": "Protobuf/gRPC service definitions for the rio workspace."
     },
     {
+      "path": "refusal.rs",
+      "depth": 0,
+      "doc": "The ONE refusal-adjudication authority (merged_bug_013): what an ANSWERED gRPC refusal disproves is a function of `(credential regime, status code)` — mintable once, never per consumer."
+    },
+    {
       "path": "status.rs",
       "depth": 0,
       "doc": "Bidirectional mapping between the nix-daemon wire `BuildStatus` ([`rio_nix::protocol::build::BuildStatus`]) and the proto [`BuildResultStatus`]."

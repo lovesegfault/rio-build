@@ -185,8 +185,12 @@ pub fn describe_metrics() {
          denominator → λ reads HIGH → the solver under-prefers spot (the conservative \
          direction) — sustained non-zero no_hw_class means label/config drift; sustained \
          absent_node means LIST-failure streaks are eating deleted nodes' residuals; \
-         sustained refused means schema/version skew or a service-token misconfig — check \
-         the scheduler's AppendInterruptSample validation and the rio-service-hmac Secret."
+         sustained refused means schema/version skew or a PERSISTENT service-token \
+         misconfig: request-disproving refusals exit in the observing pass, while auth \
+         (presentation-judging) refusals exit only after exhausting the typed auth-strike \
+         budget — a transient HMAC rotation skew retains slices and never ticks this \
+         counter — check the scheduler's AppendInterruptSample validation and the \
+         rio-service-hmac Secret."
     );
     describe_counter!(
         "rio_controller_ephemeral_jobs_reaped_total",

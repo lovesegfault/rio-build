@@ -699,7 +699,7 @@ Every uncounted drop under-reports the spot-reclaim rate exactly while spot
 is being reclaimed --- the anti-conservative direction for the SLA solver's
 capacity-type decision.
 
-#r("ctrl.informer.exposure-recredit+3")[
+#r("ctrl.informer.exposure-recredit+4")[
   The λ-denominator exposure leg of `AppendInterruptSample` MUST consume
   its evidence only on append acknowledgement, and every shipment MUST
   carry a deterministic per-(cluster, class, window) idempotency key
@@ -736,9 +736,17 @@ capacity-type decision.
   (the pending queue is process memory; shutdown forfeits the WHOLE
   backlog, one counted drop per slice --- there is no single-window
   bound), and `refused` (the scheduler refused the slice's content or
-  this deployment's identity --- retrying cannot succeed; counted in
-  the pass that observes the refusal instead of recirculating
-  forever). A LIST failure forfeits nothing (cursors untouched), and a
+  shape --- re-sending the same bytes cannot succeed; counted in the
+  pass that observes the refusal instead of recirculating forever).
+  An identity (auth) refusal under the per-request service credential
+  is presentation-judging (`sec.authz.refusal-adjudication`: it judges
+  one presentation under one key observation, never the next fresh
+  mint) and MUST exit counted only at the typed auth-strike budget ---
+  with the observation count disclosed at the exit --- never on a
+  single observation; below the budget the slice MUST be retained
+  exactly like a transient failure (one strike per observation,
+  monotone, untouched by interleaved non-auth transients). A LIST
+  failure forfeits nothing (cursors untouched), and a
   non-advancing flush window likewise forfeits nothing (banking
   deferred, cursors untouched --- the next admitted window banks the
   full delta); a scheduler outage spanning any number of flush windows
@@ -768,7 +776,7 @@ rides the uid FORMAT; M_047 stays frozen). The cluster axis's VALUE
 distinctness across deployments --- which the typed key cannot enforce
 --- is `ctrl.informer.cluster-identity-boundary` below (bug_022).
 
-#r("ctrl.informer.exposure-drain-budget+2")[
+#r("ctrl.informer.exposure-drain-budget+3")[
   The pending-queue exposure sweep MUST bound each drain pass by a
   wall-clock budget and MUST be preemptible by shutdown both between
   and during shipments (the in-flight append raced against
@@ -777,10 +785,12 @@ distinctness across deployments --- which the typed key cannot enforce
   backlog depth; each pending slice MUST be attempted at most once
   per drain pass --- pass work is bounded by queue length, never by
   the budget/error-latency ratio, and the flush period itself is the
-  retry pacing; a permanently-refused slice MUST exit through the
-  counted-drop chokepoint in the pass that observes the refusal; a
-  budget-deferred or preemption-requeued slice
-  remains PENDING --- never a drop.
+  retry pacing; a REQUEST-DISPROVING refused slice MUST exit through
+  the counted-drop chokepoint in the pass that observes the refusal,
+  while a presentation-judging (auth) refusal exits counted only at
+  auth-strike-budget exhaustion (`sec.authz.refusal-adjudication`)
+  and is otherwise retained; a budget-deferred or preemption-requeued
+  slice remains PENDING --- never a drop.
 ]
 Pre-fix, the flush arm shipped the ENTIRE unshipped backlog serially
 inside one `select!` arm body (each shipment riding a 5s admin-RPC
