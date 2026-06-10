@@ -87,6 +87,7 @@ module controllerCalib113RespawnCancel {
     ownGatedTicks' = INTENTS.mapBy(i => 0),
     jobPostdatesClose' = INTENTS.mapBy(i => false),   // old job gone
     pendingClose' = INTENTS.mapBy(i => false),
+    skipSpawned' = INTENTS.mapBy(i => false),
     obsLive' = INTENTS.mapBy(i => false),
     inBackoff' = INTENTS.mapBy(i => false),
   }
@@ -149,6 +150,7 @@ module controllerCalib113RespawnCancelHold {
     ownGatedTicks' = INTENTS.mapBy(i => 0),
     jobPostdatesClose' = INTENTS.mapBy(i => false),
     pendingClose' = INTENTS.mapBy(i => false),
+    skipSpawned' = INTENTS.mapBy(i => false),
     obsLive' = INTENTS.mapBy(i => false),
     inBackoff' = INTENTS.mapBy(i => false),
   }
