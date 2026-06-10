@@ -32,10 +32,15 @@ rm -rf "$T"; mkdir -p "$T"
 
 render() {
   # jwt on (mounts the assign-hmac family), external-secrets on (the
-  # ESO entries under test), tofu-fed values stubbed.
+  # ESO entries under test), tofu-fed values stubbed. cluster set:
+  # the external-secrets PG path declares a shared-capable topology,
+  # and rio.clusterIdentity (bug_022, fragment 39's gate) refuses an
+  # empty cluster id there — this fragment tests keypath parity, not
+  # the identity gate, so satisfy the precondition.
   helm template rio "$1" \
     --set global.image.tag=test \
     --set jwt.enabled=true \
+    --set scheduler.sla.cluster=keypath-parity-stub \
     --set externalSecrets.enabled=true \
     --set externalSecrets.auroraSecretArn=arn:aws:secretsmanager:stub \
     --set externalSecrets.auroraEndpoint=db.stub.local

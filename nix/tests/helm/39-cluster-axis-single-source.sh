@@ -21,6 +21,11 @@
 #    wins a slightly different secs value) and interrupt-watcher
 #    duplication. The cost is exactly the "30s reschedule gap during
 #    pod restart" the chart already documents as acceptable.
+# 3. FAIL-CLOSED IDENTITY (bug_022): value distinctness across
+#    deployments cannot be typed in-process — the chart refuses to
+#    render an empty cluster id when the external-secrets PG path
+#    (the shared-capable topology declaration) is enabled, via the
+#    rio.clusterIdentity helper both TOML lines include.
 
 out=$TMPDIR/cluster-axis.yaml
 helm template rio . --set global.image.tag=test >"$out"
@@ -85,7 +90,46 @@ helm template rio . --set global.image.tag=test --set karpenter.clusterName=rio-
 assert_pair "$fb" "rio-eks-ci" "karpenter.clusterName fallback"
 
 # Default-empty: both render "" (the single-cluster default, matching
-# the scheduler column's DEFAULT '').
+# the scheduler column's DEFAULT ''). SCOPE (bug_022): this leg
+# certifies single-cluster RENDER behavior only — defaults stay
+# installable — never cross-deployment safety; the shared-PG topology
+# is gated by the external-secrets legs below.
 assert_pair "$out" "" "default-empty"
 
-echo "OK: controller strategy Recreate; cluster single-sourced (explicit/fallback/default) TOML-to-TOML"
+# bug_022 (ctrl.informer.cluster-identity-boundary, render half): the
+# external-secrets PG path is the chart's ONLY render-visible
+# declaration of a shared-capable PG. With it enabled and NO cluster
+# id, the rio.clusterIdentity helper MUST fail the render — two
+# deployments sharing one PG with cluster="" mint identical exposure
+# uids and the M_047 dedup silently absorbs one deployment's λ
+# evidence.
+es_args="--set externalSecrets.enabled=true --set externalSecrets.auroraSecretArn=arn:x --set externalSecrets.auroraEndpoint=db.example"
+
+# (e) PLANTED RED: a gate that cannot fail its planted fixture does
+# not gate (the fragment-35 self-test pattern). MUST exit nonzero AND
+# name the refusal.
+gate_err=$TMPDIR/cluster-axis-gate.err
+# shellcheck disable=SC2086
+if helm template rio . --set global.image.tag=test $es_args >/dev/null 2>"$gate_err"; then
+  echo "FAIL: external-secrets PG path rendered with an empty cluster id — the gate is fail-open" >&2
+  exit 1
+fi
+grep -q "cluster identity required" "$gate_err" || {
+  echo "FAIL: gate refused but without the 'cluster identity required' message:" >&2
+  cat "$gate_err" >&2
+  exit 1
+}
+
+# (f) explicit scheduler.sla.cluster satisfies the gate; parity holds.
+esx=$TMPDIR/cluster-axis-es-explicit.yaml
+# shellcheck disable=SC2086
+helm template rio . --set global.image.tag=test $es_args --set scheduler.sla.cluster=prod-east >"$esx"
+assert_pair "$esx" "prod-east" "external-secrets + explicit cluster"
+
+# (g) karpenter.clusterName fallback satisfies the gate; parity holds.
+esk=$TMPDIR/cluster-axis-es-karpenter.yaml
+# shellcheck disable=SC2086
+helm template rio . --set global.image.tag=test $es_args --set karpenter.clusterName=rio-eks-ci >"$esk"
+assert_pair "$esk" "rio-eks-ci" "external-secrets + karpenter fallback"
+
+echo "OK: controller strategy Recreate; cluster single-sourced (explicit/fallback/default) TOML-to-TOML; external-secrets empty-id render gate fires (planted red) and passes with either id source"

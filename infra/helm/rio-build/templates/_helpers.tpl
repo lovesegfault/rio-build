@@ -438,3 +438,29 @@ Usage: {{ include "rio.pgExternalEgress" $ | nindent 4 }}
   toPorts: [{ports: [{port: "5432", protocol: TCP}]}]
 {{- end }}
 {{- end -}}
+
+{{/*
+rio.clusterIdentity — THE cluster identity axis, single-sourced
+(bug_022; fragment 39's law: controller uid axis ≡ scheduler λ-filter
+axis). Computes the one values expression (scheduler.sla.cluster |
+default karpenter.clusterName | default "") and FAILS the render when
+the result is empty while the external-secrets PG path — the chart's
+only render-visible declaration of a shared-capable PG — is enabled:
+two deployments sharing one PG with cluster="" mint identical
+exposure uids and the M_047 event_uid dedup silently absorbs one
+deployment's λ evidence. Release-local PG (postgresql.enabled) is
+provably unshared, so chart defaults render freely; the
+manual-secret-external-PG residual is covered by the controller's
+activation warn (ctrl.informer.cluster-identity-boundary). BOTH TOML
+defines consume this include — structural single-sourcing: drift
+between the two binaries' cluster values is unwritable, not just
+policed. Takes the ROOT context.
+Usage: cluster = {{ include "rio.clusterIdentity" $ | quote }}
+*/}}
+{{- define "rio.clusterIdentity" -}}
+{{- $id := (.Values.scheduler.sla.cluster | default .Values.karpenter.clusterName | default "") -}}
+{{- if and .Values.externalSecrets.enabled (eq $id "") -}}
+{{- fail "cluster identity required with the external-secrets PG path: two deployments sharing one PG with cluster=\"\" mint identical exposure uids and silently absorb each other's λ evidence (M_047 event_uid dedup) — set scheduler.sla.cluster (any stable per-deployment name) or karpenter.clusterName" -}}
+{{- end -}}
+{{- $id -}}
+{{- end -}}

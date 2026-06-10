@@ -16,7 +16,10 @@ soft_features = [{{ range $i, $f := $s.softFeatures }}{{ if $i }}, {{ end }}{{ $
        their parent. p50/p90/p99 are optional per-tier. */ -}}
 {{- with required "scheduler.sla mandatory (ADR-023)" $s.sla }}
 [sla]
-cluster = {{ (.cluster | default $.Values.karpenter.clusterName | default "") | quote }}
+{{- /* bug_022: the ONE rio.clusterIdentity include — see
+       controller.yaml's twin line; the helper fails the render on an
+       empty id under the external-secrets PG path. */}}
+cluster = {{ include "rio.clusterIdentity" $ | quote }}
 default_tier = {{ .defaultTier | quote }}
 {{- /* §13c-3: maxCores/maxMem optional. Unset → scheduler derives
        from `describe_instance_types` catalog at boot (Spot only;
