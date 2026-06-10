@@ -719,8 +719,6 @@ fn workspace_members() -> Result<Vec<String>> {
         .collect())
 }
 
-/// One module's operator-surface summary (merged_bug_005): the file's
-/// LEADING `//!` doc paragraph — consecutive `//!` lines from line 1,
 /// The validated operator-surface summary mint (merged_bug_026): ONE
 /// typed constructor consumed by EVERY emitter of generated
 /// operator-surface text — `module_summary` (modules.json) and
@@ -747,11 +745,25 @@ mod summary {
     ///            class is the standard Latin set and removal would
     ///            re-open the hole the day one lands)
     ///   "vs."  — rio-builder/src/hw_bench.rs:467
-    /// Extension is UNDER TEST: the in-constructor reject below fails
-    /// the regen on any output that still ENDS at a member, so a new
-    /// abbreviation surfaces as a loud regen error naming the file,
-    /// never a silent fragment.
+    /// Certifiable scope (merged_bug_070): alphabet MEMBERS never ship
+    /// as fragments — the cut loop's `.`-arm lookahead refuses to cut
+    /// at a member, which is the abbreviation mechanism IN FULL. An
+    /// out-of-alphabet abbreviation ("approx.", "No.") is
+    /// definitionally indistinguishable from a sentence end, and no
+    /// end-of-output check can decide it (the deleted post-cut gate
+    /// re-evaluated the loop's own predicate on the loop's own output
+    /// — unreachable for every cut, while misdiagnosing legitimate
+    /// member-terminal paragraphs as tokenizer misses). Extension
+    /// stays exemplar-driven through the census above; the decidable
+    /// regression pin is cut idempotence (`first_sentence(&cut) ==
+    /// cut`, in the test battery).
     pub(super) const ABBREVIATIONS: &[&str] = &["e.g.", "i.e.", "etc.", "cf.", "vs."];
+
+    /// THE sentence-terminal alphabet — single author (merged_bug_070):
+    /// the tokenizer's cut loop and the validator
+    /// [`ends_in_terminal_punctuation`] are both projections of this
+    /// one const, so a `.`-vs-`.!?` skew is unrepresentable.
+    pub(super) const SENTENCE_TERMINALS: &[u8] = b".!?";
 
     /// A validated one-line operator-surface summary. The ONLY mint
     /// is [`summary_of`]; the field is private.
@@ -765,9 +777,16 @@ mod summary {
     }
 
     /// Total mint: whitespace-collapse/join, abbreviation-aware
-    /// sentence cut, then the two fail-closed gates — terminal
-    /// punctuation, and no output may END at an alphabet member (the
-    /// cut the lookahead missed cannot ship). Errors name `origin`.
+    /// sentence cut, then the ONE decidable fail-closed gate —
+    /// terminal punctuation. Errors name `origin`. (The former second
+    /// gate — "no output may END at an alphabet member" — was
+    /// unreachable for every cut output by construction: the cut loop
+    /// only returns positions whose trailing token is NOT a member,
+    /// and re-evaluating the same predicate on the same string cannot
+    /// fire. Its only reachable population — legitimate member-
+    /// terminal paragraphs like "Backends for S3, GCS, etc." — failed
+    /// the regen with a misdiagnosing error. Deleted, not re-scoped:
+    /// see the ABBREVIATIONS doc for the certifiable claim.)
     pub(super) fn summary_of(source: &str, origin: &Path) -> Result<Summary> {
         let cut = first_sentence(source);
         if !cut.is_empty() && !ends_in_terminal_punctuation(&cut) {
@@ -778,31 +797,24 @@ mod summary {
                 origin.display()
             );
         }
-        if let Some(abbr) = trailing_abbreviation(&cut) {
-            anyhow::bail!(
-                "summary for {} ends at the abbreviation {abbr:?}: {cut:?} — the \
-                 tokenizer's lookahead missed a cut (extend the sentence or the \
-                 ABBREVIATIONS alphabet, under test)",
-                origin.display()
-            );
-        }
         Ok(Summary(cut))
     }
 
     /// The abbreviation-aware sentence cut (shared with the
-    /// config-description emitter): first `". "` + uppercase boundary
-    /// whose preceding token is NOT an alphabet member; the whole
-    /// collapsed string when no real boundary exists. Intra-doc links
-    /// `[foo]` are kept as-is — typst renders square brackets
-    /// literally.
+    /// config-description emitter): first [`SENTENCE_TERMINALS`] +
+    /// `" "` + uppercase boundary — with the abbreviation lookahead
+    /// applying to `.` only (no abbreviation ends in `!`/`?`) — whose
+    /// preceding token is NOT an alphabet member; the whole collapsed
+    /// string when no real boundary exists. Intra-doc links `[foo]`
+    /// are kept as-is — typst renders square brackets literally.
     pub(super) fn first_sentence(desc: &str) -> String {
         let collapsed = desc.split_whitespace().collect::<Vec<_>>().join(" ");
         let bytes = collapsed.as_bytes();
         for i in 0..bytes.len().saturating_sub(2) {
-            if bytes[i] == b'.'
+            if SENTENCE_TERMINALS.contains(&bytes[i])
                 && bytes[i + 1] == b' '
                 && bytes[i + 2].is_ascii_uppercase()
-                && trailing_abbreviation(&collapsed[..=i]).is_none()
+                && (bytes[i] != b'.' || trailing_abbreviation(&collapsed[..=i]).is_none())
             {
                 return collapsed[..=i].to_string();
             }
@@ -810,10 +822,14 @@ mod summary {
         collapsed
     }
 
-    /// `[.!?]` optionally followed by closing quotes/brackets.
+    /// A [`SENTENCE_TERMINALS`] member optionally followed by closing
+    /// quotes/brackets — the validator is a projection of the SAME
+    /// alphabet the cut consumes (merged_bug_070).
     pub(super) fn ends_in_terminal_punctuation(s: &str) -> bool {
         s.trim_end_matches(['"', '\'', '`', ')', ']', '}'])
-            .ends_with(['.', '!', '?'])
+            .as_bytes()
+            .last()
+            .is_some_and(|b| SENTENCE_TERMINALS.contains(b))
     }
 
     /// The alphabet member `s` ends at, if any — token-boundary
@@ -830,6 +846,8 @@ mod summary {
     }
 }
 
+/// One module's operator-surface summary (merged_bug_005): the file's
+/// LEADING `//!` doc paragraph — consecutive `//!` lines from line 1,
 /// a blank `//!` ends the paragraph — cut at the first sentence
 /// boundary, then validated: a non-empty summary MUST end in terminal
 /// punctuation (`.`/`!`/`?`, optionally behind closing
@@ -1412,6 +1430,75 @@ mod tests {
             "the cut must skip the abbreviation pseudo-boundary and take the \
              real sentence end"
         );
+    }
+
+    /// merged_bug_070 red #1: a paragraph that legitimately ENDS at an
+    /// alphabet member ("Backends for S3, GCS, etc.") is a VALID
+    /// summary — the deleted post-cut gate was the only rejector of
+    /// this population, and it misdiagnosed the reject as a tokenizer
+    /// miss ("the tokenizer's lookahead missed a cut") while being
+    /// unreachable for every actual cut output.
+    #[test]
+    fn member_terminal_paragraph_is_a_valid_summary() {
+        let s = super::summary::summary_of(
+            "Backends for S3, GCS, etc.",
+            std::path::Path::new("member-terminal.rs"),
+        )
+        .expect("a member-terminal paragraph is a complete sentence")
+        .into_string();
+        assert_eq!(s, "Backends for S3, GCS, etc.");
+    }
+
+    /// merged_bug_070 red #2 (the alphabet skew): a `!`/`?` first
+    /// sentence must cut at ITS boundary — pre-fix the cut recognized
+    /// only `". "` while the validator accepted `.!?`, so a question
+    /// -terminal first sentence shipped a multi-sentence summary both
+    /// gates endorsed.
+    #[test]
+    fn question_terminal_first_sentence_cuts_at_the_boundary() {
+        assert_eq!(
+            super::summary::first_sentence(
+                "Is the floor hydrated? The gauge answers from the durable row. \
+                 Details follow."
+            ),
+            "Is the floor hydrated?",
+            "the cut must fire at the first SENTENCE_TERMINALS boundary, not \
+             only at '.'"
+        );
+    }
+
+    /// The decidable regression pin replacing the deleted gate
+    /// (merged_bug_070): the cut is IDEMPOTENT over the boundary
+    /// grammar — a shipped summary re-cut yields itself, so a future
+    /// multi-sentence blob the alphabet would re-cut cannot ship.
+    /// Battery generator: nested loops over
+    /// `SENTENCE_TERMINALS x {member, non-member-abbrev, plain} x
+    /// {uppercase, lowercase}` follow-token grammar (deterministic —
+    /// no proptest dependency for a docs-plane nit; same proposition).
+    /// Disclosed: GREEN pre-fix as a property — its load-bearing red
+    /// is the skew case above (the widened alphabet is what it pins).
+    #[test]
+    fn cut_is_idempotent_over_the_boundary_grammar() {
+        let terminals: &[u8] = super::summary::SENTENCE_TERMINALS;
+        let stems = [
+            "Backends for S3, GCS, etc",
+            "Clamps to approx",
+            "The gauge answers",
+        ];
+        let follows = ["The tail continues", "the tail continues"];
+        for &t in terminals {
+            for stem in stems {
+                for follow in follows {
+                    let input = format!("{stem}{} {follow}.", t as char);
+                    let cut = super::summary::first_sentence(&input);
+                    assert_eq!(
+                        super::summary::first_sentence(&cut),
+                        cut,
+                        "idempotence violated for input {input:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// merged_bug_005 red #2: the regen MUST fail closed on a summary
