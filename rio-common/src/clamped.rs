@@ -57,6 +57,131 @@ pub fn clamped_duration_secs(secs: f64) -> Duration {
     ClampedSecs::from_f64(secs).duration()
 }
 
+/// The daemon-default build timeout in seconds (2 h), shared so the
+/// scheduler's token-expiry fallback and the builder's
+/// `DEFAULT_DAEMON_TIMEOUT` derive from ONE symbol instead of
+/// mirrored `7200` literals (R14; merged_bug_034 sweep — the
+/// scheduler side previously carried "Can't reference the const
+/// cross-crate, so duplicate the value").
+pub const DAEMON_DEFAULT_TIMEOUT_SECS: u64 = 7200;
+
+/// Integer-seconds twin of [`ClampedSecs`] for WIRE-supplied `u64`
+/// seconds (merged_bug_034): tenant-supplied scalars are bounds-typed
+/// at the trust seam. `SubmitBuildRequest.{build_timeout,
+/// max_silent_time}` previously crossed the proto→domain seam raw;
+/// `u64::MAX` survived the scheduler's min-nonzero fold (min over one
+/// element) and the builder's verbatim `Duration::from_secs`, then
+/// PANICKED the stderr loop's `Instant + Duration` deadline math —
+/// caught and MISCLASSIFIED as infrastructure failure.
+///
+/// Semantics: `0` means UNSET (no timeout) and is preserved exactly;
+/// any value above the ONE shared absurdity ceiling
+/// ([`ClampedSecs::MAX_SECS`], one year) SATURATES to the ceiling
+/// with a debug log (Q-S8-B, signed: saturate, not reject — preserves
+/// the fold's permissiveness; a `u64::MAX` submission becomes
+/// effectively-unbounded-but-arithmetic-safe). Serde round-trips as
+/// the raw `u64` (`from`/`into`), so JSONB-persisted rows are
+/// byte-compatible AND re-clamped on load — a poisoned pre-fix row
+/// saturates at read time.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(from = "u64", into = "u64")]
+pub struct WireSecs(u64);
+
+impl WireSecs {
+    /// The integer view of the ONE absurdity ceiling — bound to
+    /// [`ClampedSecs::MAX_SECS`] (a unit test pins the equality).
+    pub const MAX_SECS: u64 = ClampedSecs::MAX_SECS as u64;
+
+    /// The unset value (`0` on the wire = no timeout).
+    pub const UNSET: WireSecs = WireSecs(0);
+
+    /// Total mint at a proto→domain seam: saturates above the ceiling
+    /// (with a debug log — the Q-S8-B signed posture), zero stays
+    /// unset. This is the ONLY constructor; a raw field assignment
+    /// does not compile, so an unclamped value is unrepresentable
+    /// (R14: the closure set is the field type).
+    pub fn from_wire(raw: u64) -> Self {
+        if raw > Self::MAX_SECS {
+            tracing::debug!(
+                raw,
+                ceiling = Self::MAX_SECS,
+                "wire-supplied seconds saturated at the shared absurdity ceiling"
+            );
+            Self(Self::MAX_SECS)
+        } else {
+            Self(raw)
+        }
+    }
+
+    /// Whether the wire value was `0` (= unset/no-timeout).
+    #[must_use]
+    pub const fn is_unset(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The bounded raw seconds (for proto re-emission and display).
+    #[must_use]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    /// `Some(Duration)` for a set value, `None` for unset — the
+    /// 0-means-unset wire semantics as a typed `Option`. The result
+    /// is ≤ one year, so `Instant + duration` is in-range.
+    #[must_use]
+    pub const fn to_duration_nonzero(self) -> Option<Duration> {
+        if self.0 == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(self.0))
+        }
+    }
+
+    /// The min-nonzero fold law owned by the type: unset loses to any
+    /// set value; two set values take the minimum. (Previously a free
+    /// fn beside the scheduler fold; owning it here keeps the law and
+    /// the bound in one place.)
+    #[must_use]
+    pub const fn min_permissive(self, other: Self) -> Self {
+        match (self.0, other.0) {
+            (0, _) => other,
+            (_, 0) => self,
+            (a, b) => {
+                if a <= b {
+                    self
+                } else {
+                    other
+                }
+            }
+        }
+    }
+}
+
+impl From<u64> for WireSecs {
+    /// Serde/wire entry: identical to [`WireSecs::from_wire`] (total,
+    /// saturating) — deserialized rows re-clamp on load.
+    fn from(raw: u64) -> Self {
+        Self::from_wire(raw)
+    }
+}
+
+impl From<WireSecs> for u64 {
+    fn from(w: WireSecs) -> u64 {
+        w.raw()
+    }
+}
+
 /// Total constructor for ABSOLUTE epoch seconds → `SystemTime`: the
 /// EPOCH-domain twin of [`ClampedSecs`] (the AGE/interval clamp).
 ///
@@ -140,5 +265,77 @@ mod tests {
                 "poisoned epoch {poisoned} must refuse, not panic or fabricate"
             );
         }
+    }
+
+    /// WireSecs totality over the wire domain: zero stays unset, the
+    /// ceiling is the ONE shared ceiling, everything above saturates
+    /// (u64::MAX included — the merged_bug_034 panic input).
+    #[test]
+    fn wire_secs_mint_is_total_and_saturating() {
+        assert_eq!(
+            WireSecs::MAX_SECS,
+            ClampedSecs::MAX_SECS as u64,
+            "ONE ceiling governs all clamped seconds"
+        );
+        for (input, expect) in [
+            (0, 0),
+            (1, 1),
+            (WireSecs::MAX_SECS, WireSecs::MAX_SECS),
+            (WireSecs::MAX_SECS + 1, WireSecs::MAX_SECS),
+            (u64::MAX, WireSecs::MAX_SECS),
+        ] {
+            assert_eq!(
+                WireSecs::from_wire(input).raw(),
+                expect,
+                "from_wire({input})"
+            );
+        }
+        assert!(WireSecs::from_wire(0).is_unset());
+        assert_eq!(WireSecs::from_wire(0).to_duration_nonzero(), None);
+        assert_eq!(
+            WireSecs::from_wire(u64::MAX).to_duration_nonzero(),
+            Some(Duration::from_secs(WireSecs::MAX_SECS)),
+            "the saturated duration is Instant-add-safe"
+        );
+    }
+
+    /// The fold law on the type: unset loses to any set value, two
+    /// set values take the min — the scheduler's previous free-fn
+    /// `min_nonzero` semantics, exactly.
+    #[test]
+    fn wire_secs_min_permissive_fold_law() {
+        let unset = WireSecs::UNSET;
+        let five = WireSecs::from_wire(5);
+        let nine = WireSecs::from_wire(9);
+        assert_eq!(unset.min_permissive(five), five);
+        assert_eq!(five.min_permissive(unset), five);
+        assert_eq!(five.min_permissive(nine), five);
+        assert_eq!(nine.min_permissive(five), five);
+        assert_eq!(unset.min_permissive(unset), unset);
+    }
+
+    /// Serde: raw-u64 wire/JSONB compatibility, and — the defense in
+    /// depth — re-clamp on load: a row persisted PRE-fix with
+    /// u64::MAX deserializes saturated.
+    #[test]
+    fn wire_secs_serde_roundtrips_and_reclamps() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Row {
+            t: WireSecs,
+        }
+        let json = serde_json::to_string(&Row {
+            t: WireSecs::from_wire(120),
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"t":120}"#, "wire format is the bare integer");
+        let back: Row = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.t.raw(), 120);
+
+        let poisoned: Row = serde_json::from_str(r#"{"t":18446744073709551615}"#).unwrap();
+        assert_eq!(
+            poisoned.t.raw(),
+            WireSecs::MAX_SECS,
+            "a pre-fix JSONB row carrying u64::MAX must saturate on load"
+        );
     }
 }

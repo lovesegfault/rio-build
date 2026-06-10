@@ -146,7 +146,12 @@ pub struct ExecutorEnv {
 }
 
 /// Default daemon build timeout: 2 hours. See `ExecutorEnv.daemon_timeout`.
-pub const DEFAULT_DAEMON_TIMEOUT: Duration = Duration::from_secs(7200);
+/// Derived from the SHARED const (merged_bug_034 sweep) so the
+/// scheduler's token-expiry fallback and this default cannot drift —
+/// the scheduler previously mirrored a literal `7200` with a "can't
+/// reference the const cross-crate" apology.
+pub const DEFAULT_DAEMON_TIMEOUT: Duration =
+    Duration::from_secs(rio_common::clamped::DAEMON_DEFAULT_TIMEOUT_SECS);
 
 /// Error type for executor operations.
 ///
@@ -956,7 +961,10 @@ pub async fn execute_build(
 /// `run_daemon_lifecycle` stays under `clippy::too_many_arguments`.
 struct BuildOpts {
     timeout: Duration,
-    max_silent_time: u64,
+    /// Bounds-typed at this process's assignment seam (merged_bug_034)
+    /// — a raw u64 cannot be assigned, so an unclamped wire value is
+    /// unrepresentable past `resolve_build_opts`.
+    max_silent_time: rio_common::clamped::WireSecs,
     build_cores: u64,
     /// Initial `LogBatcher` line counter: `HEADER_LINE_COUNT` on the
     /// first attempt, the prior attempt's `final_line_count` on a
@@ -967,11 +975,13 @@ struct BuildOpts {
 /// Compute the effective build options for this assignment.
 ///
 /// The scheduler computes `BuildOptions` per-derivation from the
-/// intersecting builds' options (`actor/build.rs` `min_nonzero` for
-/// timeouts, max for cores). `None` → daemon defaults: unbounded
-/// silence, nproc cores. 0 → 0 on the wire = unbounded/all-cores to
-/// the daemon — the scheduler's `min_nonzero` already handles the
-/// 0-means-unset semantics; we pass through verbatim.
+/// intersecting builds' options (`actor/build.rs`
+/// `WireSecs::min_permissive` for timeouts, max for cores). `None` →
+/// daemon defaults: unbounded silence, nproc cores. 0 → 0 on the wire
+/// = unbounded/all-cores to the daemon — the scheduler's fold already
+/// handles the 0-means-unset semantics; we pass values through the
+/// seam mint (merged_bug_034: each process clamps its OWN ingress —
+/// defense in depth, the scheduler is not trusted to have clamped).
 ///
 /// `batcher_seed` is passed through verbatim — it's not a build option,
 /// see [`BuildOpts`].
@@ -981,19 +991,28 @@ fn resolve_build_opts(
     effective_cores: u32,
     batcher_seed: u64,
 ) -> BuildOpts {
+    use rio_common::clamped::WireSecs;
     let opts = assignment.build_options.as_ref();
+    // This process's proto→domain seam: mint through the saturating
+    // constructor, then convert — `to_duration_nonzero` is ≤ the
+    // one-year ceiling, so the stderr-loop's `Instant + timeout`
+    // deadline math is in-range for ANY wire value (u64::MAX
+    // included; the pre-fix verbatim `Duration::from_secs` panicked
+    // the deadline add).
     let timeout = opts
-        .and_then(|o| (o.build_timeout > 0).then(|| Duration::from_secs(o.build_timeout)))
+        .and_then(|o| WireSecs::from_wire(o.build_timeout).to_duration_nonzero())
         .unwrap_or(env.daemon_timeout);
     // Assignment's max_silent_time wins if nonzero; else the worker
     // config default. Same 0-means-unset semantics as build_timeout above.
     // Config default exists because Nix ssh-ng clients don't send
     // wopSetOptions to the gateway — the BuildOptions path is dead until
-    // gateway-side propagation lands.
+    // gateway-side propagation lands. (The config lane is
+    // operator-trusted; routing it through the same mint just bounds
+    // it at the same absurdity ceiling.)
     let max_silent_time = opts
-        .map(|o| o.max_silent_time)
-        .filter(|&v| v > 0)
-        .unwrap_or(env.max_silent_time);
+        .map(|o| WireSecs::from_wire(o.max_silent_time))
+        .filter(|w| !w.is_unset())
+        .unwrap_or_else(|| WireSecs::from_wire(env.max_silent_time));
     // r[impl builder.cores.cgroup-clamp+2]
     // I-196: NEVER pass build_cores=0 to the daemon. 0 means "use
     // nproc", and nproc inside a pod sees ALL node cores (cgroup CPU
@@ -1147,7 +1166,10 @@ async fn run_daemon_lifecycle(
         basic_drv,
         DaemonBuildOpts {
             build_timeout: opts.timeout,
-            max_silent_time: opts.max_silent_time,
+            // Bounded by the WireSecs mint at resolve_build_opts —
+            // the stderr loop's `Duration::from_secs(raw)` and its
+            // `last_output + silence` add are in-range.
+            max_silent_time: opts.max_silent_time.raw(),
             build_cores: opts.build_cores,
         },
         batcher,
@@ -1777,6 +1799,54 @@ mod tests {
             fuse_fetch_timeout: Duration::from_secs(60),
             cancelled: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    // r[verify sched.timeout.per-build+2]
+    /// merged_bug_034 red: wire-supplied `u64::MAX` timeout seconds
+    /// must convert BOUNDED and survive the stderr-loop deadline
+    /// arithmetic. Proposition certified (R16): the builder's
+    /// proto→domain conversion is total over the wire domain —
+    /// `Instant + timeout` (the stderr_loop deadline shape, verbatim)
+    /// cannot overflow-panic on tenant input. The assignment is the
+    /// production prost value (R13). Pre-fix: `resolve_build_opts`
+    /// converted verbatim (`Duration::from_secs(u64::MAX)`) and the
+    /// add PANICS with "overflow when adding duration to instant" —
+    /// caught by the build-panic-catcher and MISCLASSIFIED as
+    /// InfrastructureFailure, per-attempt task death + retry churn.
+    #[test]
+    fn max_wire_timeout_converts_bounded_and_survives_deadline_math() {
+        let env = test_env();
+        let a = WorkAssignment {
+            build_options: Some(rio_proto::types::BuildOptions {
+                build_timeout: u64::MAX,
+                max_silent_time: u64::MAX,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let opts = resolve_build_opts(&a, &env, 8, 0);
+
+        // The stderr-loop deadline math, same shapes as
+        // daemon/stderr_loop.rs (`Instant::now() + build_timeout`;
+        // `last_output + silence`): in-range for any clamped value.
+        let build_deadline = tokio::time::Instant::now() + opts.timeout;
+        assert!(build_deadline > tokio::time::Instant::now() - Duration::from_secs(1));
+
+        let ceiling = rio_common::clamped::ClampedSecs::MAX_SECS as u64;
+        assert!(
+            opts.timeout <= Duration::from_secs(ceiling),
+            "wire build_timeout must saturate at the shared absurdity \
+             ceiling; got {:?}",
+            opts.timeout
+        );
+        let silence_secs = u64::from(opts.max_silent_time);
+        assert!(
+            silence_secs <= ceiling,
+            "wire max_silent_time must saturate at the shared absurdity \
+             ceiling; got {silence_secs}"
+        );
+        let silence_deadline = tokio::time::Instant::now() + Duration::from_secs(silence_secs);
+        assert!(silence_deadline > tokio::time::Instant::now() - Duration::from_secs(1));
     }
 
     // r[verify sched.sla.cores-reach-nix-build-cores]

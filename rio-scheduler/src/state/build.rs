@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
+use rio_common::clamped::WireSecs;
 use uuid::Uuid;
 
 use super::{DrvHash, PriorityClass, TransitionError};
@@ -353,10 +354,18 @@ impl BuildInfo {
 /// recovery): `insert_build` writes this as `options_json`,
 /// `load_nonterminal_builds` reads it back. Default for NULL rows
 /// (written before migration 004) = all zeroes = unlimited.
+///
+/// The timeout fields are [`WireSecs`] (merged_bug_034): bounds-typed
+/// at the tenant seam (`scheduler_service.rs` mints via the
+/// saturating constructor), so an unclamped `u64::MAX` is
+/// unrepresentable in domain state and the assignment fold cannot
+/// launder one onto the wire. `WireSecs` serializes as the raw `u64`
+/// — persisted JSONB rows are byte-compatible, and pre-fix rows
+/// carrying absurd values re-clamp on load.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct BuildOptions {
-    pub max_silent_time: u64,
-    pub build_timeout: u64,
+    pub max_silent_time: WireSecs,
+    pub build_timeout: WireSecs,
     pub build_cores: u64,
 }
 

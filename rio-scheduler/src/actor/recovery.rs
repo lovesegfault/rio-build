@@ -615,7 +615,7 @@ impl DagActor {
             info.total_count = row.total_drvs as u32;
             info.recovered_completed = row.completed_drvs as u32;
             info.cached_count = row.cached_drvs as u32;
-            // Seed submitted_at from PG so r[sched.timeout.per-build]
+            // Seed submitted_at from PG so r[sched.timeout.per-build+2]
             // and rio_scheduler_build_duration_seconds survive failover
             // (otherwise each failover grants a fresh full
             // build_timeout window, contradicting "wall-clock since

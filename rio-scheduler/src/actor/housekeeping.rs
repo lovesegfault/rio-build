@@ -238,15 +238,15 @@ impl DagActor {
     /// Zero = no overall timeout. Only Active builds are checked: Pending
     /// hasn't started dispatching (`validate_transition` rejects Pending →
     /// Failed anyway); terminal builds are already done.
-    // r[impl sched.timeout.per-build]
+    // r[impl sched.timeout.per-build+2]
     async fn tick_check_build_timeouts(&mut self, _authority: &super::DagAuthority) {
         let mut timed_out_builds: Vec<(Uuid, u64)> = Vec::new();
         for (build_id, build) in &self.builds {
             if build.state() == BuildState::Active
-                && build.options.build_timeout > 0
-                && build.submitted_at.elapsed().as_secs() > build.options.build_timeout
+                && !build.options.build_timeout.is_unset()
+                && build.submitted_at.elapsed().as_secs() > build.options.build_timeout.raw()
             {
-                timed_out_builds.push((*build_id, build.options.build_timeout));
+                timed_out_builds.push((*build_id, build.options.build_timeout.raw()));
             }
         }
         for (build_id, timeout) in timed_out_builds {

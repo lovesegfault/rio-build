@@ -2654,7 +2654,7 @@ async fn test_poison_clear_reevaluates_spared_recovered_parent(
     Ok(())
 }
 
-// r[verify sched.timeout.per-build]
+// r[verify sched.timeout.per-build+2]
 /// `build_timeout` is "wall-clock since SUBMISSION" — recovery must
 /// seed `submitted_at` from PG, not reset to `Instant::now()`. Otherwise
 /// each failover grants a fresh full timeout window.
@@ -2672,7 +2672,7 @@ async fn test_recovery_restores_build_timeout_baseline() -> TestResult {
                     nodes: vec![make_node("bto-drv")],
                     edges: vec![],
                     options: BuildOptions {
-                        build_timeout: 60,
+                        build_timeout: 60.into(),
                         ..Default::default()
                     },
                     keep_going: false,
@@ -3193,8 +3193,8 @@ async fn recovered_stale_build_times_out_on_first_tick() -> TestResult {
                 nodes: vec![make_node("stale-timeout-drv")],
                 edges: vec![],
                 options: BuildOptions {
-                    max_silent_time: 0,
-                    build_timeout: 60,
+                    max_silent_time: 0.into(),
+                    build_timeout: 60.into(),
                     build_cores: 0,
                 },
                 keep_going: false,

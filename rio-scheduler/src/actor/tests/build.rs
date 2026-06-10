@@ -879,7 +879,7 @@ async fn test_per_build_timeout_failure_is_build_level() -> TestResult {
             nodes: vec![x, y],
             edges: vec![],
             options: BuildOptions {
-                build_timeout: 1,
+                build_timeout: 1.into(),
                 ..Default::default()
             },
             keep_going: true,

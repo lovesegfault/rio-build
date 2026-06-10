@@ -115,7 +115,7 @@ fn drain_progress_count(ev: &mut broadcast::Receiver<rio_proto::types::BuildEven
     n
 }
 
-// r[verify sched.timeout.per-build]
+// r[verify sched.timeout.per-build+2]
 /// Per-build overall timeout: a build with `build_timeout=60` whose
 /// `submitted_at` is 61s ago transitions to Failed on Tick. Same build
 /// at 59s elapsed does NOT fail (boundary check).
@@ -150,8 +150,8 @@ async fn test_per_build_timeout_fails_build_on_tick() -> TestResult {
             nodes: vec![make_node("pbt-drv")],
             edges: vec![],
             options: BuildOptions {
-                max_silent_time: 0,
-                build_timeout: 60,
+                max_silent_time: 0.into(),
+                build_timeout: 60.into(),
                 build_cores: 0,
             },
             keep_going: false,

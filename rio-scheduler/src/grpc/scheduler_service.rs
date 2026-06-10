@@ -155,9 +155,17 @@ impl SchedulerService for SchedulerGrpc {
         let build_id = Uuid::now_v7();
         let (reply_tx, reply_rx) = oneshot::channel();
 
+        // r[impl sched.timeout.per-build+2]
+        // The TENANT SEAM mint (merged_bug_034): wire-supplied timeout
+        // seconds are bounds-typed here — WireSecs saturates anything
+        // above the shared one-year absurdity ceiling (with a debug
+        // log; Q-S8-B signed posture) and preserves 0-means-unset. A
+        // u64::MAX submission becomes effectively-unbounded-but-
+        // arithmetic-safe instead of a builder-side Instant+Duration
+        // panic misclassified as infrastructure failure.
         let options = BuildOptions {
-            max_silent_time: req.max_silent_time,
-            build_timeout: req.build_timeout,
+            max_silent_time: rio_common::clamped::WireSecs::from_wire(req.max_silent_time),
+            build_timeout: rio_common::clamped::WireSecs::from_wire(req.build_timeout),
             build_cores: req.build_cores,
         };
 

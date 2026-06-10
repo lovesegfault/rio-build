@@ -894,18 +894,23 @@ impl DagActor {
         // uploading after completion is well within that
         // window. Prevents replay from a leaked token later.
         let assignment_token = if let Some(signer) = &self.hmac_signer {
-            let timeout_secs = if build_opts.build_timeout > 0 {
-                build_opts.build_timeout
-            } else {
-                // Match rio-builder's DEFAULT_DAEMON_TIMEOUT.
-                // Can't reference the const cross-crate, so
-                // duplicate the value. 7200s = 2h.
-                7200
-            };
-            // Clamp BEFORE saturating_mul: a client sending
-            // build_timeout=u64::MAX would get saturating_mul
-            // → u64::MAX → expiry_unix = u64::MAX = immortal
-            // token. A leaked immortal token defeats the
+            // Typed consume (merged_bug_034): the folded wire
+            // value re-enters the WireSecs domain — it is
+            // ceiling-bounded by construction (the tenant seam
+            // mints, the fold preserves the bound), and the
+            // unset arm reads the SHARED daemon-default const
+            // (rio-builder's DEFAULT_DAEMON_TIMEOUT derives
+            // from the same symbol — no mirrored 7200s, R14).
+            let timeout_secs = rio_common::clamped::WireSecs::from_wire(build_opts.build_timeout)
+                .to_duration_nonzero()
+                .map_or(rio_common::clamped::DAEMON_DEFAULT_TIMEOUT_SECS, |d| {
+                    d.as_secs()
+                });
+            // Clamp BEFORE saturating_mul — the token-lifetime
+            // law, INDEPENDENT of the wire ceiling (1 yr): an
+            // expiry derived from even a lawfully-saturated
+            // timeout must not produce a months-lived token. A
+            // leaked long-lived token defeats the
             // replay-prevention purpose of expiry entirely.
             // 7 days max: well above any real build duration.
             const MAX_HMAC_TIMEOUT_SECS: u64 = 7 * 86400;

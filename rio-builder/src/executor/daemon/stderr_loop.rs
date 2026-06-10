@@ -518,7 +518,11 @@ where
     // Build deadline: absolute hard cap, never resets. Computed here
     // (not by caller) so paused-time tests advance it via
     // tokio::time::advance and the error message can name the
-    // configured seconds.
+    // configured seconds. Both durations arrive ceiling-bounded:
+    // wire-supplied seconds are minted through
+    // rio_common::clamped::WireSecs at resolve_build_opts
+    // (merged_bug_034), so these Instant + Duration adds cannot
+    // overflow-panic on tenant input.
     let build_deadline = Instant::now() + build_timeout;
     let mut state = StderrLoop::new(
         batcher,

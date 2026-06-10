@@ -2982,7 +2982,7 @@ What survives, re-keyed onto the durable open-attempt row, is the
   (#rref("sched.lease.standby-drops-writes"),
   #rref("sched.lease.generation-fence")).
 
-#r("sched.timeout.per-build")[
+#r("sched.timeout.per-build+2")[
   `BuildOptions.build_timeout` (proto field, seconds) is a wall-clock limit on
   the _entire_ build from submission to completion. In `handle_tick`, any build
   with `submitted_at.elapsed() > build_timeout` has its non-terminal
@@ -2993,7 +2993,13 @@ What survives, re-keyed onto the durable open-attempt row, is the
   #rref("sched.attempt.establishment-window")) and distinct from the
   executor-side daemon floor (which also receives
   `build_timeout` as a per-derivation `min_nonzero` --- defense-in-depth, NOT
-  the primary semantics). Zero means no overall timeout.
+  the primary semantics). Zero means no overall timeout. Wire-supplied
+  timeout seconds (`build_timeout`, `max_silent_time`) MUST saturate at the
+  shared one-year absurdity ceiling (`rio_common::clamped::WireSecs`) at
+  ingestion --- at the scheduler's tenant seam and again at the builder's
+  assignment seam; zero stays no-timeout, and a saturated value is
+  effectively unbounded but arithmetic-safe (no `Instant + Duration`
+  overflow on tenant input).
 ]
 
 #warning(title: [Reachability: gRPC-only])[

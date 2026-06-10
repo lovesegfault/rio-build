@@ -909,8 +909,14 @@ impl DagActor {
     ) -> rio_proto::types::BuildOptions {
         let interested = self.get_interested_builds(drv_hash);
 
-        let mut max_silent_time: u64 = 0;
-        let mut build_timeout: u64 = 0;
+        // The min-nonzero fold law lives ON the type now
+        // (WireSecs::min_permissive, merged_bug_034): zero means
+        // "unset" and loses to any set value. Operands are
+        // ceiling-bounded by construction (the tenant-seam mint
+        // saturates), so the fold output — min of bounded values, or
+        // unset — cannot launder an unclamped value onto the wire.
+        let mut max_silent_time = rio_common::clamped::WireSecs::UNSET;
+        let mut build_timeout = rio_common::clamped::WireSecs::UNSET;
         // Option distinguishes "unseen" from "saw 0". Per
         // build_types.proto:307, build_cores=0 means "all" — the MOST
         // permissive value. `.max()` would treat it as least-permissive
@@ -918,19 +924,10 @@ impl DagActor {
         // positive value), inverting the "more permissive wins" intent.
         let mut build_cores: Option<u64> = None;
 
-        // Helper: take the minimum of non-zero values; zero means "unset".
-        fn min_nonzero(acc: u64, val: u64) -> u64 {
-            match (acc, val) {
-                (0, v) => v,
-                (a, 0) => a,
-                (a, v) => a.min(v),
-            }
-        }
-
         for build_id in &interested {
             if let Some(build) = self.builds.get(build_id) {
-                max_silent_time = min_nonzero(max_silent_time, build.options.max_silent_time);
-                build_timeout = min_nonzero(build_timeout, build.options.build_timeout);
+                max_silent_time = max_silent_time.min_permissive(build.options.max_silent_time);
+                build_timeout = build_timeout.min_permissive(build.options.build_timeout);
                 // 0 = "all cores" (proto:307) — most permissive, sticky
                 // once seen. Otherwise, max of positives.
                 build_cores = Some(match (build_cores, build.options.build_cores) {
@@ -942,8 +939,8 @@ impl DagActor {
         }
 
         rio_proto::types::BuildOptions {
-            max_silent_time,
-            build_timeout,
+            max_silent_time: max_silent_time.raw(),
+            build_timeout: build_timeout.raw(),
             build_cores: build_cores.unwrap_or(0),
         }
     }

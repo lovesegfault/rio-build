@@ -556,7 +556,7 @@ async fn test_hmac_timeout_clamps_to_seven_days() -> TestResult {
             nodes: vec![make_node("clamp-drv")],
             edges: vec![],
             options: BuildOptions {
-                build_timeout: u64::MAX,
+                build_timeout: u64::MAX.into(),
                 ..Default::default()
             },
             keep_going: false,
@@ -2244,6 +2244,64 @@ async fn build_options_merge_zero_cores_is_all() {
     mk2(8);
     let opts = actor.build_options_for_derivation(&DrvHash::from("h2"));
     assert_eq!(opts.build_cores, 8, "all-positive → max");
+}
+
+// r[verify sched.timeout.per-build+2]
+/// merged_bug_034 red: ONE interested build carrying `u64::MAX` wire
+/// timeouts must not launder them onto the assignment wire — pre-fix
+/// `min_nonzero` over a single element preserved `u64::MAX` verbatim
+/// (min over one element is the element), and the folded value rode
+/// the assignment proto into the builder's `Instant + Duration`
+/// deadline math. Proposition certified (R16): the scheduler fold's
+/// output is ceiling-bounded for ANY tenant input, because the seam
+/// mint saturates and the fold preserves the bound (the typed
+/// `WireSecs` field makes an unclamped operand unrepresentable).
+#[tokio::test]
+async fn sole_build_max_options_fold_bounded() {
+    use crate::state::BuildInfo;
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor(db.pool.clone());
+    actor.test_inject_ready("h3", None, "x86_64-linux", false);
+
+    let bid = Uuid::new_v4();
+    let info = BuildInfo::new_pending(
+        bid,
+        None,
+        PriorityClass::Scheduled,
+        false,
+        BuildOptions {
+            // The tenant-seam mint (scheduler_service.rs) on a
+            // u64::MAX SubmitBuildRequest — the saturating
+            // constructor is the production ingestion path.
+            max_silent_time: rio_common::clamped::WireSecs::from_wire(u64::MAX),
+            build_timeout: rio_common::clamped::WireSecs::from_wire(u64::MAX),
+            build_cores: 1,
+        },
+        std::iter::once(DrvHash::from("h3")).collect(),
+    );
+    actor.builds.insert(bid, info);
+    actor
+        .dag
+        .node_mut("h3")
+        .unwrap()
+        .interested_builds
+        .insert(bid);
+
+    let opts = actor.build_options_for_derivation(&DrvHash::from("h3"));
+    let ceiling = rio_common::clamped::ClampedSecs::MAX_SECS as u64;
+    assert!(
+        opts.build_timeout <= ceiling && opts.build_timeout > 0,
+        "sole-build fold must emit the saturated ceiling, not u64::MAX; \
+         got {}",
+        opts.build_timeout
+    );
+    assert!(
+        opts.max_silent_time <= ceiling && opts.max_silent_time > 0,
+        "sole-build fold must emit the saturated ceiling, not u64::MAX; \
+         got {}",
+        opts.max_silent_time
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -20,8 +20,8 @@ async fn test_build_options_propagated_to_worker() -> TestResult {
             nodes: vec![make_node("opts-hash")],
             edges: vec![],
             options: BuildOptions {
-                max_silent_time: 60,
-                build_timeout: 300,
+                max_silent_time: 60.into(),
+                build_timeout: 300.into(),
                 build_cores: 4,
             },
             keep_going: false,
