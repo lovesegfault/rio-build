@@ -526,18 +526,16 @@ impl DagActor {
             // (intent, instance) composite under fleet-level service
             // credentials; the confirm-EXIT protocol (and so the
             // fence) does not exist here — only the builder's keyed
-            // build lane bears it (rio-builder pull.rs, the sole
-            // `confirm_only: true` fence-bearing constructor). The
-            // store's client DOES send `confirm_only` on this lane
-            // (bug_060 census correction): resume presentations past
-            // full slots probe with `confirm_only: probing`
-            // (merged_bug_014's standing oracle), and the kind-blind
+            // build lane bears it. The store's client DOES send
+            // `confirm_only` on this lane (bug_060 census correction):
+            // the only call sites passing `confirm_only: true` are the store's resume PROBE lane and the builder's confirm-exit — census[test: materialization_probe_is_screened_not_minted] census[test: delivered_resume_does_not_strand_charged_sibling]
+            // (resume presentations past full slots probe with
+            // `confirm_only: probing`, merged_bug_014's standing
+            // oracle; the mint path passes false), and the kind-blind
             // confirm screen below is LOAD-BEARING for exactly that
             // shape — it converts a probe's would-be-DeliverNew to
             // NotYetReady so no mint can occur. Absent on this lane:
             // the fence. Present and required: the screen.
-            // census[test: materialization_probe_is_screened_not_minted]
-            // census[test: delivered_resume_does_not_strand_charged_sibling]
             (rio_evidence_kernel::pull::PullKind::Materialization, _) => {
                 FenceLane::NonKeyed(NonKeyedLane(NonKeyedLaneClass::Materialization))
             }

@@ -1249,6 +1249,63 @@ in
         touch $out
       '';
 
+  # Census-enrollment lint (round-8 WO-S6-5 — the author-census kill):
+  # load-bearing prose MEMBERSHIP claims in rust comments (the
+  # call-graph family: "both call sites", "the only caller(s)",
+  # "all callers", "no other call sites", "exactly N callers",
+  # "never sends", ...) are UNSHIPPABLE unless the same line carries
+  # census[test: <fn>] / census[gen: <path>] binding the claim to an
+  # artifact the membership change breaks — or the line is
+  # grandfathered in nix/census-grandfather.txt (FROZEN, burn-down:
+  # machine-minted by the scanner's own --mint-grandfather mode at
+  # the round-8 final slot tree; content-keyed, so editing a
+  # grandfathered census line evicts it and the file only ever
+  # shrinks; this lint never suggests grandfathering). Every
+  # census[...] tag anywhere must RESOLVE (a test fn in the scanned
+  # trees / a committed file) — enrollment binds, never decorates.
+  # Four planted self-test arms (unenrolled-red, enrolled-green,
+  # dangling-red, stale-grandfather-red) run before the real scan may
+  # gate; the shared exact lexer's selftest gates first (comment-lane
+  # matching: string literals can never fire the grammar).
+  census-enrollment =
+    pkgs.runCommand "rio-census-enrollment"
+      {
+        src = pkgs.lib.fileset.toSource {
+          root = ../.;
+          fileset = pkgs.lib.fileset.unions [
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-auth/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-authz-kernel/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-builder/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-cli/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-common/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-controller/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-crds/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-evidence-kernel/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-gateway/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-lease/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-log-kernel/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-migrations/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-nix/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-proto/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-retry-kernel/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-scheduler/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-store/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-test-support/src)
+            ../nix/census-grandfather.txt
+          ];
+        };
+        nativeBuildInputs = [ pkgs.python3 ];
+        scanScript = ../nix/census_enrollment.py;
+        sharedLexer = ../nix/rust_strip.py;
+      }
+      ''
+        cp "$sharedLexer" rust_strip.py
+        cp "$scanScript" census_enrollment.py
+        python3 census_enrollment.py \
+          --grandfather "$src/nix/census-grandfather.txt" "$src"
+        touch $out
+      '';
+
   transport-unary-ban =
     pkgs.runCommand "rio-transport-unary-ban"
       {

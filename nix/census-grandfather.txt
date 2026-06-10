@@ -1,0 +1,24 @@
+rio-auth/src/jwt_interceptor.rs	// this is a worker/health/admin caller that never sends it).
+rio-auth/src/lib.rs	/// `ServiceTokenInterceptor`, scheduler's admin tests) so all callers
+rio-builder/src/runtime/result.rs	/// Tests the chokepoint directly: both call sites now route
+rio-common/src/server.rs	/// signatures; only callers that NEED the hook take the extra param.
+rio-common/src/tenant.rs	/// creating a tenant row that no other callsite will ever match
+rio-controller/src/reconcilers/nodeclaim_pool/wedge.rs	/// about to mutate; both call sites name this one definition.
+rio-controller/src/reconcilers/pool/candidate.rs	/// [`PoolStreaks::step`] is the only caller in the reconcile path and
+rio-controller/src/reconcilers/pool/candidate.rs	/// filtered wanted set. The production fold is the only caller
+rio-gateway/src/handler/mod.rs	/// (long build) never sends a stale token. `.token() == None` when
+rio-gateway/src/server/connection.rs	/// (long build) never sends a stale token.
+rio-gateway/src/server/connection.rs	/// and the client never sends another SSH message. See
+rio-gateway/src/server/mod.rs	// that never sends its SSH identification string parks
+rio-gateway/src/server/session_jwt.rs	/// post-build `wopQueryPathInfo` never sends an expired token.
+rio-gateway/src/translate.rs	/// `keep_going`) are hardcoded to defaults: ssh-ng clients never send
+rio-scheduler/src/actor/materialize.rs	/// this tick backstop and the tests are the only callers.
+rio-scheduler/src/admin/tests/gc_tests.rs	// Mock store stream that never yields: hold the sender, never send.
+rio-store/src/gc/mod.rs	// enqueue_chunk_deletes. One sort here covers all callers (the
+rio-store/src/grpc/admin.rs	/// Gate for control-plane-only callers. Thin wrapper over
+rio-store/src/grpc/mod.rs	/// "builder is the only caller, sends no token" into an enforced
+rio-store/src/grpc/mod.rs	/// None = accept all callers (dev mode, same as pre-Phase-3b).
+rio-store/src/grpc/put_path/common.rs	/// Empty chunks are rejected outright (legit clients never send
+rio-store/src/logs/ingest.rs	/// never sends these — the count is the builder's own post-footer
+rio-store/src/materialize/executor.rs	// A signed narinfo whose NAR endpoint never sends body bytes.
+rio-test-support/src/grpc/store.rs	// No mock state — the only caller (rio-builder hw_bench::report)
