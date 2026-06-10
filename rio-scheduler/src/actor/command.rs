@@ -195,7 +195,7 @@ pub enum ActorCommand {
     /// execution (BC-4: posted by the `ReportMaterializationProgress`
     /// RPC handler). Handler emits `Event::SubstituteProgress` to the
     /// drv's interested builds via the log broadcast ring (display-only;
-    /// not persisted). r[gw.activity.subst-progress+2]
+    /// not persisted). r[gw.activity.subst-progress+3]
     SubstituteProgress {
         drv_hash: DrvHash,
         bytes_done: u64,

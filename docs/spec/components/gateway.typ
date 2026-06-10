@@ -1744,7 +1744,7 @@ failed → fell through to a build).
   relays in arrival order.
 ]
 
-#r("gw.activity.subst-progress+2")[
+#r("gw.activity.subst-progress+3")[
   For each `DerivationEventKind::SUBSTITUTING` the gateway emits an
   `actSubstitute` (108) activity and increments the root `actBuilds`
   `SetExpected{actCopyPath, N}` (the denominator semantics match stock
@@ -1762,13 +1762,18 @@ failed → fell through to a build).
   structural and MUST NOT carry `resProgress` (the stock convention —
   substitution progress rides the `copyStorePath` child); a tick with no
   started copy child emits no frames. The pair stops through ONE close
-  chokepoint (child first, iff started) on the paired
-  `CACHED`/`STARTED`/`COMPLETED`/`FAILED`; when the copy child is open with a
-  partial last-relayed bar, the close synthesizes the completing
-  `resProgress` (`done == expected`) on the copy aid before the stops — the
-  terminal outcome is the completion proof; a pair with no started copy
-  closes subst-only with no synthesis frame — and a progress tick arriving
-  after the close is dropped with a debug line, never reordered.
+  chokepoint (child first, iff started) which carries its close CAUSE; when
+  the copy child is open with a partial last-relayed bar AND the cause proves
+  transfer completion (`CACHED` — the substitution-success terminal), the
+  close synthesizes the completing `resProgress` (`done == expected`) on the
+  copy aid before the stops; a close whose cause does not prove completion
+  (`STARTED` fetch-failed→build, `FAILED`, a snapshot kind-flip or
+  gone-reconcile, the terminus drain, and the defensive `COMPLETED` arm — not
+  a normal FSM transition for a substituting derivation) MUST NOT synthesize
+  completion: the bar freezes at the last relayed truthful frame; a pair with
+  no started copy closes subst-only with no synthesis frame — and a progress
+  tick arriving after the close is dropped with a debug line, never
+  reordered.
 ]
 
 Why the parent is structural: direction-aware consumers (nxb et al.) dedup
