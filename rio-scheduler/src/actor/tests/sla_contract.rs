@@ -786,7 +786,7 @@ async fn ack_observed_lands_pre_reload_and_survives_the_edge_reload() {
 /// unrecoverable. `left: Ok(()) ∧ clear applied ∧ mark silently gone`
 /// / `right: Err(PlaneEntryUndecodable{UnfulfillableCells, ..}) ∧ ice
 /// state byte-identical (zero mutations)`.
-// r[verify sched.sla.ack-validate-then-commit]
+// r[verify sched.sla.ack-validate-then-commit+1]
 #[tokio::test]
 async fn ack_undecodable_plane_entry_refuses_whole_request() {
     use crate::sla::config::CapacityType;
@@ -849,7 +849,7 @@ async fn ack_undecodable_plane_entry_refuses_whole_request() {
 /// paired-by-construction producer) with one `node_affinity` term
 /// dropped — the controller-side one-array-filter shape; no
 /// hand-rolled parallel arrays.
-// r[verify sched.sla.ack-validate-then-commit]
+// r[verify sched.sla.ack-validate-then-commit+1]
 #[tokio::test]
 async fn ack_skewed_arm_echo_refused_not_truncated() {
     use crate::sla::config::CapacityType;
@@ -890,6 +890,212 @@ async fn ack_skewed_arm_echo_refused_not_truncated() {
     );
 }
 
+/// merged_bug_039 red — the LABEL-COPY duplicate axis: an aligned term
+/// carrying TWO capacity-type requirements (the label copy FIRST, the
+/// authoritative one LAST — exactly what a colliding `hw_classes.labels`
+/// entry makes `cells_to_selector_terms` emit: labels first, capacity
+/// appended last) must REFUSE, not decode order-sensitively. Pre-fix,
+/// verbatim: `left: Ok — armed (intel-6, Od) (the wrong cell — the
+/// find() peek took the first match) / right:
+/// Err(PlaneEntryUndecodable{SpawnedArming, ..})`.
+///
+/// Witness strength: the existing skew tests certify the length-skew
+/// and missing-requirement axes ONLY; this red certifies the duplicate
+/// axis the alphabet never enumerated. r13-allow(refusal-probe): the
+/// duplicated term is the attack/skew shape under test — built by
+/// extending a production `cells_to_selector_terms` echo with the
+/// label copy the colliding config would inject.
+// r[verify sched.sla.ack-validate-then-commit+1]
+#[tokio::test]
+async fn arm_decode_refuses_the_label_copy_of_the_capacity_key() {
+    use crate::sla::config::CapacityType;
+    use rio_proto::types::{NodeSelectorRequirement, SpawnIntent};
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+
+    let cfg = test_hw_sla_config();
+    let cells: Vec<crate::sla::config::Cell> = vec![("intel-6".into(), CapacityType::Spot)];
+    let (mut terms, names) = crate::sla::solve::cells_to_selector_terms(&cells, &cfg.hw_classes);
+    // The colliding-config shape: the label copy lands FIRST (labels
+    // are emitted before the authoritative capacity requirement).
+    terms[0].match_expressions.insert(
+        0,
+        NodeSelectorRequirement {
+            key: crate::sla::config::LABEL_CAPACITY_TYPE.into(),
+            operator: "In".into(),
+            values: vec!["on-demand".into()],
+        },
+    );
+    let intent = SpawnIntent {
+        intent_id: "d-labelcopy".into(),
+        hw_class_names: names,
+        node_affinity: terms,
+        ..Default::default()
+    };
+
+    let r =
+        actor.handle_ack_spawned_intents(std::slice::from_ref(&intent), &[], &[], &[], &[], None);
+    assert!(
+        matches!(
+            &r,
+            Err(crate::actor::AckApplyError::PlaneEntryUndecodable {
+                plane: crate::actor::AckPlane::SpawnedArming,
+                ..
+            })
+        ),
+        "two capacity requirements in one term must refuse typed, not \
+         decode the first match order-sensitively; got {r:?}"
+    );
+    assert!(
+        actor.dispatched_cells.get("d-labelcopy").is_none(),
+        "no arm from the refused echo (pre-fix: armed the LABEL copy's cell)"
+    );
+}
+
+/// merged_bug_039 table red — the OPERATOR axis: `NotIn[spot]` names
+/// the COMPLEMENT of a cell; the pre-fix peek decoded it to its
+/// inverse. Pre-fix: `Ok — armed (intel-6, Spot)`; post-fix: typed
+/// refusal. r13-allow(refusal-probe): non-producer operator shape.
+// r[verify sched.sla.ack-validate-then-commit+1]
+#[tokio::test]
+async fn arm_decode_refuses_notin_operator() {
+    use crate::sla::config::CapacityType;
+    use rio_proto::types::SpawnIntent;
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+
+    let cfg = test_hw_sla_config();
+    let cells: Vec<crate::sla::config::Cell> = vec![("intel-6".into(), CapacityType::Spot)];
+    let (mut terms, names) = crate::sla::solve::cells_to_selector_terms(&cells, &cfg.hw_classes);
+    let cap_req = terms[0]
+        .match_expressions
+        .iter_mut()
+        .find(|r| r.key == crate::sla::config::LABEL_CAPACITY_TYPE)
+        .expect("producer emits the capacity requirement");
+    cap_req.operator = "NotIn".into();
+    let intent = SpawnIntent {
+        intent_id: "d-notin".into(),
+        hw_class_names: names,
+        node_affinity: terms,
+        ..Default::default()
+    };
+
+    let r =
+        actor.handle_ack_spawned_intents(std::slice::from_ref(&intent), &[], &[], &[], &[], None);
+    assert!(
+        matches!(
+            &r,
+            Err(crate::actor::AckApplyError::PlaneEntryUndecodable {
+                plane: crate::actor::AckPlane::SpawnedArming,
+                ..
+            })
+        ),
+        "NotIn must refuse (pre-fix: decoded to the set's own cell — its \
+         inverse); got {r:?}"
+    );
+    assert!(actor.dispatched_cells.get("d-notin").is_none());
+}
+
+/// merged_bug_039 table red — the ARITY axis: `In[spot,on-demand]`
+/// names TWO cells; the pre-fix peek decoded `values.first()` only.
+/// Pre-fix: `Ok — armed (intel-6, Spot)` (silent truncation of the
+/// cell set); post-fix: typed refusal. r13-allow(refusal-probe):
+/// non-producer arity shape.
+// r[verify sched.sla.ack-validate-then-commit+1]
+#[tokio::test]
+async fn arm_decode_refuses_multivalue_capacity() {
+    use crate::sla::config::CapacityType;
+    use rio_proto::types::SpawnIntent;
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+
+    let cfg = test_hw_sla_config();
+    let cells: Vec<crate::sla::config::Cell> = vec![("intel-6".into(), CapacityType::Spot)];
+    let (mut terms, names) = crate::sla::solve::cells_to_selector_terms(&cells, &cfg.hw_classes);
+    terms[0]
+        .match_expressions
+        .iter_mut()
+        .find(|r| r.key == crate::sla::config::LABEL_CAPACITY_TYPE)
+        .expect("producer emits the capacity requirement")
+        .values
+        .push("on-demand".into());
+    let intent = SpawnIntent {
+        intent_id: "d-multival".into(),
+        hw_class_names: names,
+        node_affinity: terms,
+        ..Default::default()
+    };
+
+    let r =
+        actor.handle_ack_spawned_intents(std::slice::from_ref(&intent), &[], &[], &[], &[], None);
+    assert!(
+        matches!(
+            &r,
+            Err(crate::actor::AckApplyError::PlaneEntryUndecodable {
+                plane: crate::actor::AckPlane::SpawnedArming,
+                ..
+            })
+        ),
+        "a multi-valued capacity requirement names {{spot, od}} — not one \
+         cell; the peek silently truncated to values[0]; got {r:?}"
+    );
+    assert!(actor.dispatched_cells.get("d-multival").is_none());
+}
+
+/// merged_bug_039 round-trip green: the decode accepts the producer's
+/// ACTUAL emission — `ArmDecode::decode(echo of
+/// cells_to_selector_terms(cells)) == Armed(cells)` for 1- and 2-cell
+/// sets, driven through the full apply path (R13: the producer fn IS
+/// the production constructor for echo shapes; the out-of-plane
+/// producer is imported READ-ONLY).
+// r[verify sched.sla.ack-validate-then-commit+1]
+#[tokio::test]
+async fn producer_echo_roundtrips_through_arm_decode() {
+    use crate::sla::config::CapacityType;
+    use rio_proto::types::SpawnIntent;
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    let cfg = test_hw_sla_config();
+
+    for (tag, cells) in [
+        (
+            "rt-one",
+            vec![("intel-6".into(), CapacityType::Spot)] as Vec<crate::sla::config::Cell>,
+        ),
+        (
+            "rt-two",
+            vec![
+                ("intel-6".into(), CapacityType::Spot),
+                ("intel-7".into(), CapacityType::Od),
+            ],
+        ),
+    ] {
+        let (terms, names) = crate::sla::solve::cells_to_selector_terms(&cells, &cfg.hw_classes);
+        let intent = SpawnIntent {
+            intent_id: tag.into(),
+            hw_class_names: names,
+            node_affinity: terms,
+            ..Default::default()
+        };
+        actor
+            .handle_ack_spawned_intents(std::slice::from_ref(&intent), &[], &[], &[], &[], None)
+            .expect("the producer's own echo decodes");
+        let armed = actor
+            .dispatched_cells
+            .get(tag)
+            .unwrap_or_else(|| panic!("{tag}: armed"));
+        assert_eq!(
+            armed.as_slice(),
+            cells.as_slice(),
+            "{tag}: decode(echo(cells)) == cells"
+        );
+    }
+}
+
 /// merged_bug_134 companion green: the legacy one-array-empty echo
 /// shape (`hw_class_names` empty, `node_affinity` non-empty) answers
 /// Ok with NO arm — `ArmDecode::LegacyUnarmed` is a typed no-arm
@@ -897,7 +1103,7 @@ async fn ack_skewed_arm_echo_refused_not_truncated() {
 /// it already zip-truncated to no-arm; its rolling-skew rationale is
 /// MOOT per SIGNED Q6 --wipe rollout and the lane survives as decode
 /// totality). Pins the refusal to the FORGING skew shapes only.
-// r[verify sched.sla.ack-validate-then-commit]
+// r[verify sched.sla.ack-validate-then-commit+1]
 #[tokio::test]
 async fn ack_legacy_unarmed_echo_answers_ok_without_arm() {
     use crate::sla::config::CapacityType;
@@ -942,7 +1148,7 @@ async fn ack_legacy_unarmed_echo_answers_ok_without_arm() {
 /// Witness provenance (Q1-1): suffixed strings are minted exclusively
 /// via `rio_common::cell_wire::encode_cell_event` — the same fn the
 /// controller's buffer mint calls; no hand-rolled "h:cap@e" literals.
-// r[verify sched.sla.ack-validate-then-commit]
+// r[verify sched.sla.ack-validate-then-commit+1]
 // r[verify ctrl.nodeclaim.evidence-ack-latch+3]
 #[tokio::test]
 async fn ack_redelivered_epoch_mark_does_not_climb_post_expiry() {
@@ -991,7 +1197,7 @@ async fn ack_redelivered_epoch_mark_does_not_climb_post_expiry() {
 /// reset-then-step-0: the fixed clears-then-marks apply order resets
 /// the ladder, then the strictly-newer mark masks at the BASE TTL
 /// instead of climbing from the stale rung.
-// r[verify sched.sla.ack-validate-then-commit]
+// r[verify sched.sla.ack-validate-then-commit+1]
 // r[verify ctrl.nodeclaim.evidence-ack-latch+3]
 #[tokio::test]
 async fn ack_clear_then_mark_realizes_reset_then_step0() {

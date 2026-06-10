@@ -1165,6 +1165,28 @@ impl SlaConfig {
                     r.key
                 );
             }
+            // merged_bug_039 (the strict ArmDecode's SAME-COMMIT
+            // precondition): the capacity key is PRODUCER-OWNED —
+            // `cells_to_selector_terms` emits the authoritative
+            // `karpenter.sh/capacity-type` requirement per cell, so a
+            // label copy here makes every spawn echo carry TWO
+            // capacity requirements and the strict decode refuses the
+            // whole Ack forever (the controller redelivers a
+            // forever-refusing echo). Pre-reservation this booted
+            // cleanly and silently mis-armed (the decode peeked the
+            // label copy, order-sensitively). Refusing at BOOT is the
+            // honest breaking change: the config was already wrong.
+            for l in &def.labels {
+                anyhow::ensure!(
+                    l.key != LABEL_CAPACITY_TYPE,
+                    "sla.hwClasses[{h}].labels key {:?} shadows the \
+                     producer-owned capacity axis — the scheduler emits the \
+                     authoritative {LABEL_CAPACITY_TYPE} requirement per cell \
+                     (cells_to_selector_terms); remove it from `labels` and \
+                     use `capacityTypes` to constrain capacity",
+                    l.key
+                );
+            }
         }
         anyhow::ensure!(
             !self.hw_classes.is_empty(),
@@ -1850,6 +1872,35 @@ mod tests {
             .insert("test-hw".into(), HwClassDef::default());
         let err = validate_both(&cfg).unwrap_err().to_string();
         assert!(err.contains("hwClasses[test-hw].labels"), "{err}");
+    }
+
+    /// merged_bug_039 config red (the strict-decode precondition):
+    /// a `karpenter.sh/capacity-type` key in `hw_classes.labels`
+    /// shadows the producer-owned capacity axis — pre-fix this BOOTED
+    /// CLEANLY (validate_shape banned only `rio.build/*` in
+    /// *requirements*) and made `cells_to_selector_terms` emit a label
+    /// copy ahead of the authoritative requirement, which the pre-fix
+    /// peek decoded order-sensitively. Post-fix it refuses boot naming
+    /// the key and the authoritative emission site. Pre-fix, verbatim:
+    /// `validate_both(&cfg)` returned Ok (the collision booted).
+    #[test]
+    fn hw_class_label_cannot_shadow_the_capacity_key() {
+        let mut cfg = base();
+        cfg.hw_classes
+            .get_mut("test-hw")
+            .unwrap()
+            .labels
+            .push(NodeLabelMatch {
+                key: LABEL_CAPACITY_TYPE.into(),
+                value: "on-demand".into(),
+            });
+        let err = validate_both(&cfg).unwrap_err().to_string();
+        assert!(err.contains(LABEL_CAPACITY_TYPE), "{err}");
+        assert!(err.contains("producer-owned"), "{err}");
+        assert!(
+            err.contains("cells_to_selector_terms"),
+            "the refusal names the authoritative emission site: {err}"
+        );
     }
 
     /// `requirements` must be non-empty AND no `rio.build/*` keys

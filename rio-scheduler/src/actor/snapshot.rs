@@ -1034,14 +1034,41 @@ struct PlannedBinding {
 /// no-arm — so it stays a typed no-arm TOTALITY lane, not a refusal
 /// (its rolling-skew rationale is MOOT per SIGNED Q6, --wipe rollout;
 /// the lane survives as decode totality over the echo shapes). In the
-/// `Armed` lane every aligned term must carry the
-/// `karpenter.sh/capacity-type` requirement
-/// ([`crate::sla::config::LABEL_CAPACITY_TYPE`] — the same const the
-/// producer `cells_to_selector_terms` emits) with a non-empty value:
-/// a missing requirement or empty values is `ArmEchoSkewed`
-/// (structural pairing skew), a present value outside the shared
-/// alphabet is `PlaneEntryUndecodable{SpawnedArming}` (undecodable
-/// entry).
+/// `Armed` lane every aligned term is decoded against the PRODUCER'S
+/// shape (merged_bug_039: parse-don't-validate —
+/// `cells_to_selector_terms` emits EXACTLY ONE
+/// `karpenter.sh/capacity-type` requirement per term, operator `In`,
+/// single-valued, the capacity LAST after the label requirements; the
+/// pre-fix `find().and_then(values.first())` peek read one cell out
+/// of `In[spot,on-demand]`, decoded `NotIn[spot]` to its inverse, and
+/// was order-sensitive across duplicate requirements — a
+/// `karpenter.sh/capacity-type` entry in `hw_classes.labels` made the
+/// producer emit a LABEL COPY first, which the peek decoded instead
+/// of the authoritative one). The axes product
+/// `{0,1,≥2} requirement multiplicity × {In, other} operator ×
+/// {0,1,≥2} values` is total (the generator is rustc — the decoder's
+/// match has no wildcard):
+///
+/// | axis cell                     | decode                          |
+/// |-------------------------------|---------------------------------|
+/// | 0 capacity requirements       | `ArmEchoSkewed` (pairing: the   |
+/// |                               | pair cannot name a cell)        |
+/// | ≥2 capacity requirements      | `PlaneEntryUndecodable` (NEW —  |
+/// |                               | present-but-not-producer-shaped)|
+/// | operator ≠ `In`               | `PlaneEntryUndecodable` (NEW)   |
+/// | 0 values                      | `ArmEchoSkewed` (existing       |
+/// |                               | empty-values law)               |
+/// | ≥2 values                     | `PlaneEntryUndecodable` (NEW)   |
+/// | value outside the alphabet    | `PlaneEntryUndecodable`         |
+/// |                               | (existing)                      |
+///
+/// Partition rationale: `ArmEchoSkewed` = absence/pairing structure;
+/// `PlaneEntryUndecodable{SpawnedArming}` = present-but-undecodable
+/// (both variants pre-exist — zero refusal-alphabet change). The
+/// strict decode's SAME-COMMIT precondition: `validate_shape`
+/// reserves `LABEL_CAPACITY_TYPE` out of `hw_classes.labels`, so a
+/// colliding config refuses at BOOT instead of converting into a
+/// permanent whole-request Ack refusal loop.
 pub(super) enum ArmDecode {
     /// Both arrays empty — hw-agnostic intent, nothing to arm.
     Empty,
@@ -1069,33 +1096,94 @@ impl ArmDecode {
                 let mut cells: smallvec::SmallVec<[crate::sla::config::Cell; 4]> =
                     smallvec::SmallVec::with_capacity(names);
                 for (h, term) in i.hw_class_names.iter().zip(&i.node_affinity) {
-                    let cap_value = term
-                        .match_expressions
-                        .iter()
-                        .find(|r| r.key == crate::sla::config::LABEL_CAPACITY_TYPE)
-                        .and_then(|r| r.values.first());
-                    let Some(cap_value) = cap_value else {
-                        // Aligned term without the capacity
-                        // requirement: structural skew — the pair
-                        // cannot name a cell, so the echo could forge
-                        // a different cell set.
-                        return Err(AckApplyError::ArmEchoSkewed {
-                            intent_id: i.intent_id.clone(),
-                            names,
-                            terms,
-                        });
-                    };
-                    let Some(cap) = crate::sla::config::CapacityType::parse(cap_value) else {
-                        return Err(AckApplyError::PlaneEntryUndecodable {
-                            plane: AckPlane::SpawnedArming,
-                            entry: cap_value.clone(),
-                        });
+                    let cap = match decode_capacity_requirement(term) {
+                        Ok(cap) => cap,
+                        // Absence/pairing structure: the pair cannot
+                        // name a cell, so the echo could forge a
+                        // different cell set.
+                        Err(CapacityReqDefect::Pairing) => {
+                            return Err(AckApplyError::ArmEchoSkewed {
+                                intent_id: i.intent_id.clone(),
+                                names,
+                                terms,
+                            });
+                        }
+                        // Present but not producer-shaped (duplicate
+                        // requirement, non-In operator, multi-value,
+                        // out-of-alphabet value).
+                        Err(CapacityReqDefect::Undecodable(entry)) => {
+                            return Err(AckApplyError::PlaneEntryUndecodable {
+                                plane: AckPlane::SpawnedArming,
+                                entry,
+                            });
+                        }
                     };
                     cells.push((h.clone(), cap));
                 }
                 Ok(Self::Armed(cells))
             }
         }
+    }
+}
+
+/// Why one aligned term's capacity requirement failed the typed parse
+/// — the [`decode_capacity_requirement`] refusal partition (the two
+/// existing [`super::command::AckApplyError`] classes; no new wire
+/// alphabet).
+enum CapacityReqDefect {
+    /// No capacity requirement at all, or empty values: structural
+    /// pairing skew (the existing `ArmEchoSkewed` lanes).
+    Pairing,
+    /// Present but not the producer's shape: the rendered offending
+    /// requirement(s) for the `PlaneEntryUndecodable` entry field.
+    Undecodable(String),
+}
+
+/// merged_bug_039: parse one aligned term's capacity requirement
+/// against the PRODUCER'S shape (`cells_to_selector_terms` emits
+/// exactly one `LABEL_CAPACITY_TYPE` requirement per term, operator
+/// `In`, single-valued) — a total match over the
+/// multiplicity × operator × arity product, replacing the
+/// `find().and_then(values.first())` peek that read one cell out of
+/// `In[spot,on-demand]`, decoded `NotIn[spot]` to its inverse, and
+/// resolved duplicate requirements order-sensitively.
+fn decode_capacity_requirement(
+    term: &rio_proto::types::NodeSelectorTerm,
+) -> Result<crate::sla::config::CapacityType, CapacityReqDefect> {
+    let mut matches = term
+        .match_expressions
+        .iter()
+        .filter(|r| r.key == crate::sla::config::LABEL_CAPACITY_TYPE);
+    let Some(req) = matches.next() else {
+        return Err(CapacityReqDefect::Pairing);
+    };
+    let dupes = matches.count();
+    if dupes > 0 {
+        return Err(CapacityReqDefect::Undecodable(format!(
+            "{} appears {} times in one term (the producer emits exactly one)",
+            crate::sla::config::LABEL_CAPACITY_TYPE,
+            dupes + 1,
+        )));
+    }
+    if req.operator != "In" {
+        return Err(CapacityReqDefect::Undecodable(format!(
+            "{} {} [{}]",
+            req.key,
+            req.operator,
+            req.values.join(", "),
+        )));
+    }
+    match req.values.as_slice() {
+        // The existing empty-values law: structural skew.
+        [] => Err(CapacityReqDefect::Pairing),
+        [value] => crate::sla::config::CapacityType::parse(value)
+            .ok_or_else(|| CapacityReqDefect::Undecodable(value.clone())),
+        more => Err(CapacityReqDefect::Undecodable(format!(
+            "{} In [{}] (multi-valued: names {} cells, not one)",
+            req.key,
+            req.values.join(", "),
+            more.len(),
+        ))),
     }
 }
 
