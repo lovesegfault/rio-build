@@ -49,6 +49,11 @@ pub struct ExecutorContext {
     /// the one code shape (the driver/window structure is identical;
     /// only the width changes). Floored at 1 by the driver.
     pub path_fanout: usize,
+    /// The pod-wide path-slot pool (`store.materialize.gate-share`):
+    /// every path future holds one slot for its lifetime; main.rs
+    /// sizes it at effective_admission_cap / 2 and threads ONE pool
+    /// through every worker's context.
+    pub path_slots: PathSlotPool,
 }
 
 /// Execute one claimed materialization job end-to-end and produce the
@@ -526,42 +531,70 @@ async fn execute_job_inner(
             if walk_abort.is_none() {
                 // Spawn phase (law 2): frontier order, ≤ F in flight,
                 // `visited` marked at spawn (pop→spawn is immediate),
-                // CLOSURE_WALK_CAP checked at spawn.
-                while window.len() < fanout {
-                    let Some((path, cell)) = frontier.pop_front() else {
-                        break;
+                // CLOSURE_WALK_CAP checked at spawn. gate-share: the
+                // SLOT is acquired before the pop — slot waiters hold
+                // nothing (the three-gate order) and a permit is
+                // dropped unused iff the frontier drains to dups.
+                while window.len() < fanout && !frontier.is_empty() {
+                    let slot = if window.is_empty() {
+                        // Width-1 baseline invariant: blocking-FIFO
+                        // whenever width 0 + nonempty frontier (job
+                        // start AND mid-walk drain after failed
+                        // widening) — with the opportunistic widening
+                        // below, the two wakeups jointly cover every
+                        // reachable state.
+                        ctx.path_slots.acquire_baseline().await
+                    } else {
+                        match ctx.path_slots.try_widen() {
+                            Some(s) => s,
+                            // Widening never blocks; re-attempted on
+                            // the next completion event.
+                            None => break,
+                        }
                     };
-                    if !visited.insert(path.clone()) {
-                        continue;
-                    }
-                    if visited.len() > CLOSURE_WALK_CAP {
-                        // Driver-synthesized charge evidence; enters
-                        // the same latch + tier fold as any abort.
-                        walk_abort.get_or_insert_with(Vec::new).push(AbortEvidence {
+                    let mut spawned = false;
+                    while let Some((path, cell)) = frontier.pop_front() {
+                        if !visited.insert(path.clone()) {
+                            continue;
+                        }
+                        if visited.len() > CLOSURE_WALK_CAP {
+                            // Driver-synthesized charge evidence;
+                            // enters the same latch + tier fold as
+                            // any abort.
+                            walk_abort.get_or_insert_with(Vec::new).push(AbortEvidence {
+                                path,
+                                grade: AbortDisposition::Charge {
+                                    detail: format!(
+                                        "closure walk exceeded {CLOSURE_WALK_CAP} paths \
+                                         (hostile upstream reference chain?)"
+                                    ),
+                                },
+                            });
+                            break;
+                        }
+                        // Law 6: base = the cumulative floor at SPAWN —
+                        // the tick arithmetic of the old `per_path(base)`,
+                        // now applied future-side onto event payloads.
+                        let base = completed_bytes;
+                        window.push(Box::pin(resolve_path(
+                            ctx,
+                            claimed,
+                            &tenants,
+                            &trust_cache,
                             path,
-                            grade: AbortDisposition::Charge {
-                                detail: format!(
-                                    "closure walk exceeded {CLOSURE_WALK_CAP} paths \
-                                     (hostile upstream reference chain?)"
-                                ),
-                            },
-                        });
+                            cell,
+                            base,
+                            tick_tx.clone(),
+                            slot,
+                        )));
+                        spawned = true;
                         break;
                     }
-                    // Law 6: base = the cumulative floor at SPAWN —
-                    // the tick arithmetic of the old `per_path(base)`,
-                    // now applied future-side onto event payloads.
-                    let base = completed_bytes;
-                    window.push(Box::pin(resolve_path(
-                        ctx,
-                        claimed,
-                        &tenants,
-                        &trust_cache,
-                        path,
-                        cell,
-                        base,
-                        tick_tx.clone(),
-                    )));
+                    if !spawned {
+                        // Frontier drained to dups (slot dropped
+                        // unused) or the cap latched.
+                        break;
+                    }
                 }
             }
             if walk_abort.is_some() {
@@ -918,6 +951,130 @@ struct ProgressTick {
 /// overflow drops the tick — progress is droppable by contract.
 const PROGRESS_TICK_QUEUE: usize = 64;
 
+// r[impl store.materialize.gate-share]
+/// The pod-wide executor path-slot pool (live_047/R-C WO-R7-3): ONE
+/// fair-FIFO semaphore of `P = effective_admission_cap / 2` permits
+/// (`derive_executor_path_slots` over the SAME effective value main.rs
+/// constructs the admission gate from — override included). A path
+/// future exists only while holding a slot, so executor-held admission
+/// permits ≤ in-flight path futures ≤ held slots ≤ P — the d1f18610d
+/// "executor caps at half the gate" invariant made STRUCTURAL,
+/// independent of `path_fanout` and `executor_concurrency`.
+///
+/// **Yield law (normative — the equilibrium rows ride on it):**
+/// widening MUST be non-preferential: a freed slot is assigned to
+/// QUEUED baseline waiters BEFORE any `try_acquire` can observe it.
+/// tokio's batch semaphore provides exactly this (releases assign
+/// permits to the wait queue first; `try_acquire` CASes only the
+/// queue-empty leftovers — vendored 1.52.3 `batch_semaphore.rs`).
+/// REJECTED shapes, named so an implementation cannot satisfy the
+/// permit CEILING while losing the property: a split counter, a
+/// second extras-semaphore, any non-queue-respecting fast path —
+/// each lets widened walks re-capture freed slots indefinitely,
+/// starving queued walks.
+///
+/// Gate order (the §3.2 no-deadlock record, three-gate form): **slot ≺
+/// admission ≺ budget** — slot waiters hold nothing; admission waiters
+/// may hold only a slot; budget waiters hold both but never wait on
+/// either. The wait graph stays acyclic.
+#[derive(Clone)]
+pub struct PathSlotPool {
+    slots: std::sync::Arc<tokio::sync::Semaphore>,
+    capacity: usize,
+}
+
+impl PathSlotPool {
+    /// New pool of `capacity` slots (main.rs passes
+    /// [`crate::config::derive_executor_path_slots`] of the effective
+    /// admission cap; tests size it directly).
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            slots: std::sync::Arc::new(tokio::sync::Semaphore::new(capacity)),
+            capacity,
+        }
+    }
+
+    /// Configured pool size (the boot-warn comparand).
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Width-1 BASELINE acquire — blocking-FIFO. Used whenever a walk
+    /// holds ZERO slots with a nonempty frontier: at job start AND any
+    /// time the window drains to zero after a failed widening (the
+    /// width-1 baseline invariant — the first-path-only form has a
+    /// permanent mid-walk stall: the fair semaphore hands a freed slot
+    /// to a queued waiter before any `try_acquire` observes it, and a
+    /// width-0 walk has no completion event to wake on).
+    ///
+    /// Module-owned BOTH-EDGES instrumentation (the admission-gate
+    /// pattern): the queued-baseline-waiters gauge rises on queue
+    /// entry and falls on exit (including cancellation — the guard),
+    /// and the wait-age histogram is the §4.2 TRANSIENT-queuing
+    /// tripwire (reachable at helm whenever n×F > P; the boot warn
+    /// covers only the PERMANENT n > P regime).
+    async fn acquire_baseline(&self) -> PathSlot {
+        struct WaiterGuard;
+        impl Drop for WaiterGuard {
+            fn drop(&mut self) {
+                metrics::gauge!("rio_store_executor_path_slot_baseline_waiters").decrement(1.0);
+            }
+        }
+        metrics::gauge!("rio_store_executor_path_slot_baseline_waiters").increment(1.0);
+        let guard = WaiterGuard;
+        let started = std::time::Instant::now();
+        let permit = self
+            .slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("path-slot pool is never closed");
+        drop(guard);
+        metrics::histogram!("rio_store_executor_path_slot_baseline_wait_seconds")
+            .record(started.elapsed().as_secs_f64());
+        self.publish_in_use();
+        PathSlot {
+            permit: Some(permit),
+            pool: self.clone(),
+        }
+    }
+
+    /// Opportunistic WIDENING (width ≥ 1 → width + 1): never blocks
+    /// and never overtakes queued baseline waiters (`try_acquire`
+    /// observes only queue-empty leftovers — the yield law above).
+    fn try_widen(&self) -> Option<PathSlot> {
+        let permit = self.slots.clone().try_acquire_owned().ok()?;
+        self.publish_in_use();
+        Some(PathSlot {
+            permit: Some(permit),
+            pool: self.clone(),
+        })
+    }
+
+    /// Republish the in-use gauge from the pool's current truth.
+    fn publish_in_use(&self) {
+        let in_use = self.capacity.saturating_sub(self.slots.available_permits());
+        metrics::gauge!("rio_store_executor_path_slots_in_use").set(in_use as f64);
+    }
+}
+
+/// A held path slot: releasing (Drop) returns the permit FIRST, then
+/// republishes the in-use gauge from post-release truth (the
+/// AdmissionPermit both-edges pattern — bug_245: an acquire-only gauge
+/// freezes at the high-water on the scrape surface). Rides INSIDE the
+/// path future, so cancellation-by-drop releases the slot with it.
+struct PathSlot {
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    pool: PathSlotPool,
+}
+
+impl Drop for PathSlot {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        self.pool.publish_in_use();
+    }
+}
+
 // r[impl store.materialize.path-fold]
 /// Resolve ONE path against live state: the evidence-returning path
 /// future (path-fold law 1). The body is the serial walk's per-path
@@ -935,6 +1092,11 @@ async fn resolve_path(
     cell: PathCell,
     progress_base: u64,
     ticks: tokio::sync::mpsc::Sender<ProgressTick>,
+    // gate-share: the slot spans the WHOLE path future (local probe +
+    // tenant loop + miss-probe leg — coarser but single-region; the
+    // pool is a ceiling, not a throughput promise) and releases on
+    // completion OR cancellation-by-drop.
+    _slot: PathSlot,
 ) -> PathResolution {
     // bug_042: the local-presence probe is a VERDICT input, so its
     // error is charging evidence (a PG blip is never absence).
@@ -1904,6 +2066,7 @@ mod tests {
             ),
             pool,
             path_fanout: 4,
+            path_slots: PathSlotPool::new(32),
         }
     }
 
@@ -3098,6 +3261,7 @@ mod tests {
             ),
             pool: db.pool.clone(),
             path_fanout: 1,
+            path_slots: PathSlotPool::new(32),
         };
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), async {
             execute_job(&ctx, &seeded.claimed).await.into_outcome()
@@ -5194,6 +5358,243 @@ mod tests {
             got.nar_size,
             nar.len() as u64,
             "the survivor served the real path"
+        );
+    }
+
+    // r[verify store.materialize.gate-share]
+    /// W-4 pool ceiling: executor-held admission permits never exceed
+    /// effective_cap / 2 — the d1f18610d invariant made STRUCTURAL
+    /// (the pod path-slot pool), not arithmetic. Two concurrent walks
+    /// x F=4 = 8 cold gated paths against an 8-permit gate: without
+    /// the pool the executor holds the ENTIRE gate (RPC miss traffic
+    /// starved, 25s queue then RESOURCE_EXHAUSTED — the n=64
+    /// rejection's failure mode reached through fan-out); with the
+    /// pool, held permits stay <= P = cap/2 and both walks still
+    /// complete.
+    #[tokio::test]
+    async fn executor_admission_draw_bounded_to_half_the_gate() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "mat-w4").await;
+
+        let gate_cap = 8usize;
+        let gate = crate::admission::AdmissionGate::new(gate_cap);
+        let paths: Vec<String> = (0..8).map(|i| store_path(40 + i, "w4-path")).collect();
+        let (nar, _) = rio_test_support::fixtures::make_nar(b"w4 contents");
+        let served: Vec<(String, Vec<u8>, Vec<String>)> = paths
+            .iter()
+            .map(|p| (p.clone(), nar.clone(), vec![]))
+            .collect();
+        let (upstream, mut hit_rx, release) = spawn_gated_upstream(served, "cache.w4").await;
+        wire_upstream(&db.pool, tenant, &upstream).await;
+
+        let substituter = std::sync::Arc::new(
+            Substituter::new(db.pool.clone(), None)
+                .with_http_client(sandbox_http())
+                .with_admission_gate(gate.clone()),
+        );
+        // Two jobs of four paths each (n=2 walks, F=4: nominal demand
+        // n x F = 8 = the WHOLE gate).
+        let mut jobs = Vec::new();
+        for (j, chunk) in paths.chunks(4).enumerate() {
+            let outputs: Vec<(String, &str)> = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (format!("o{i}"), p.as_str()))
+                .collect();
+            let outputs_ref: Vec<(&str, &str)> =
+                outputs.iter().map(|(n, p)| (n.as_str(), *p)).collect();
+            let seeded = seed_job(
+                &db.pool,
+                &format!("mat-w4-drv-{j}"),
+                &outputs_ref,
+                Some(tenant),
+                Some(tenant),
+                &[],
+            )
+            .await;
+            jobs.push(seeded);
+        }
+        // ONE pod pool at P = cap/2 through the REAL derivation fn —
+        // shared by both walks like main.rs shares it across workers.
+        let pool_p = crate::config::derive_executor_path_slots(gate_cap);
+        assert_eq!(pool_p, gate_cap / 2);
+        let path_slots = PathSlotPool::new(pool_p);
+        let mk_ctx = || ExecutorContext {
+            pool: db.pool.clone(),
+            substituter: std::sync::Arc::clone(&substituter),
+            path_fanout: 4,
+            path_slots: path_slots.clone(),
+        };
+        let handles: Vec<_> = jobs
+            .iter()
+            .map(|j| {
+                let ctx = mk_ctx();
+                let claimed = j.claimed.clone();
+                tokio::spawn(async move { execute_job(&ctx, &claimed).await.into_outcome() })
+            })
+            .collect();
+
+        // Sample the executor's admission draw until the in-flight
+        // population quiesces (no new gated fetch for 600 ms), then
+        // pin the high-water.
+        let mut held_high = 0usize;
+        let mut last_hit = tokio::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            held_high = held_high.max(gate_cap - gate.semaphore().available_permits());
+            if hit_rx.try_recv().is_ok() {
+                last_hit = tokio::time::Instant::now();
+            } else if last_hit.elapsed() > Duration::from_millis(600) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "fetches never quiesced"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            held_high <= gate_cap / 2,
+            "executor-held admission permits hit {held_high} of {gate_cap} — the \
+             executor saturated its own gate (>= cap/2 must stay available to \
+             RPC miss traffic; the gate-share invariant is inverted at F>1 \
+             without the path-slot pool)"
+        );
+
+        // Liveness: release everything; both walks complete fully.
+        let releaser = tokio::spawn(async move {
+            loop {
+                release.notify_one();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        for h in handles {
+            let outcome = tokio::time::timeout(Duration::from_secs(30), h)
+                .await
+                .expect("walk must complete")
+                .unwrap();
+            let success = outcome_success(&outcome)
+                .unwrap_or_else(|| panic!("expected Success, got {outcome:?}"));
+            assert_eq!(
+                success.ingested_paths.len() + success.verified_paths.len(),
+                4,
+                "all four paths covered"
+            );
+        }
+        releaser.abort();
+    }
+
+    // r[verify store.materialize.gate-share]
+    /// W-2(b) baseline liveness (TRUE RED against the first-path-only
+    /// slot rule): pool P=1, walk A holds the slot with a two-path
+    /// frontier, walk B's baseline waiter is queued. A's sole
+    /// in-flight path completes → the fair semaphore hands the freed
+    /// slot to B (yield law) → A sits at width 0 with a nonempty
+    /// frontier. Under the width-1 BASELINE INVARIANT A's next acquire
+    /// is blocking-FIFO and both walks finish; under the first-path-
+    /// only strawman A never re-queues and wedges. W-2(c)'s yield
+    /// direction rides the same harness: B's queued baseline waiter
+    /// gets the slot before A can re-widen.
+    #[tokio::test]
+    async fn drained_walk_requeues_baseline_and_completes() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "mat-w2b").await;
+
+        let a1 = store_path(50, "w2b-a1");
+        let a2 = store_path(51, "w2b-a2");
+        let b1 = store_path(52, "w2b-b1");
+        let (nar, _) = rio_test_support::fixtures::make_nar(b"w2b contents");
+        let (upstream, gates) = spawn_pathgated_upstream(
+            vec![
+                (a1.clone(), nar.clone(), vec![]),
+                (a2.clone(), nar.clone(), vec![]),
+                (b1.clone(), nar.clone(), vec![]),
+            ],
+            "cache.w2b",
+        )
+        .await;
+        wire_upstream(&db.pool, tenant, &upstream).await;
+
+        let job_a = seed_job(
+            &db.pool,
+            "mat-w2b-drv-a",
+            &[("a1", a1.as_str()), ("a2", a2.as_str())],
+            Some(tenant),
+            Some(tenant),
+            &[],
+        )
+        .await;
+        let job_b = seed_job(
+            &db.pool,
+            "mat-w2b-drv-b",
+            &[("b1", b1.as_str())],
+            Some(tenant),
+            Some(tenant),
+            &[],
+        )
+        .await;
+
+        let substituter = std::sync::Arc::new(
+            Substituter::new(db.pool.clone(), None).with_http_client(sandbox_http()),
+        );
+        // ONE slot: the steady-state contention regime, minimized.
+        let pool1 = PathSlotPool::new(1);
+        let mk_ctx = || ExecutorContext {
+            pool: db.pool.clone(),
+            substituter: std::sync::Arc::clone(&substituter),
+            path_fanout: 4,
+            path_slots: pool1.clone(),
+        };
+
+        // A starts first and takes the slot (a1 in flight, a2 queued
+        // behind the failed widening).
+        let ctx_a = mk_ctx();
+        let ca = job_a.claimed.clone();
+        let ha = tokio::spawn(async move { execute_job(&ctx_a, &ca).await.into_outcome() });
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        // B queues its baseline waiter on the saturated pool.
+        let ctx_b = mk_ctx();
+        let cb = job_b.claimed.clone();
+        let hb = tokio::spawn(async move { execute_job(&ctx_b, &cb).await.into_outcome() });
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        // Release a1: A completes its sole in-flight path; the freed
+        // slot goes to B's QUEUED waiter; A re-queues at the baseline
+        // (the invariant under test). Then release b1, then a2 —
+        // paced re-notifies until each fetch consumes its gate.
+        for path in [&a1, &b1, &a2] {
+            let g = std::sync::Arc::clone(&gates[path]);
+            tokio::spawn(async move {
+                for _ in 0..400 {
+                    g.notify_one();
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            });
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        for (name, h) in [("A", ha), ("B", hb)] {
+            let outcome = tokio::time::timeout(Duration::from_secs(30), h)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "walk {name} wedged: width-0 with a nonempty frontier and no \
+                         completion event ever arrives again (the first-path-only \
+                         slot rule's permanent mid-walk stall)"
+                    )
+                })
+                .unwrap();
+            let success = outcome_success(&outcome)
+                .unwrap_or_else(|| panic!("walk {name}: expected Success, got {outcome:?}"));
+            assert!(
+                !success.ingested_paths.is_empty(),
+                "walk {name} must serve its paths"
+            );
+        }
+        assert_eq!(
+            pin_count(&db.pool, "mat-w2b-drv-a", "materialization").await,
+            2,
+            "walk A finished BOTH paths (baseline re-queue worked)"
         );
     }
 }

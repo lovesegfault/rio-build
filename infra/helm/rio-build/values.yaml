@@ -431,27 +431,40 @@ store:
     # default stays 8 — this value is the production lever). The
     # workers are I/O-bound poll → fetch → ingest loops (live: pods
     # held 150-310 millicores of the 16-CPU EKS request during a
-    # burst at 8), so CPU does not bound n. Memory does not either:
-    # in-flight NAR bytes are governed by the shared nar_bytes_budget
-    # semaphore (8 × MAX_NAR_SIZE = 32 GiB — equal to the EKS memory
-    # limit, so do NOT raise it with n); under pathological
+    # burst at 8), so CPU does not bound n. In-flight NAR bytes are
+    # governed by the shared nar_bytes_budget semaphore (one
+    # whole-NAR reservation per substitute leg,
+    # r[store.put.nar-bytes-budget]): under pathological
     # all-large-NAR load extra workers PARK on the byte budget
     # (BudgetParked exempts a parked owner from stall takeover)
-    # instead of buffering n × 4 GiB. The binding constraint is the
-    # r[store.substitute.admission] gate: each worker's in-flight
-    # path holds one singleflight-LEADER permit from the SAME
-    # per-replica pool the RPC-side substitute-on-miss path draws
-    # from (pgMaxConnections 20 above → (20×3).clamp(64,128) = 64
-    # permits). 32 caps the executor at half the gate — ≥32 permits
-    # stay available to QueryPathInfo/GetPath miss traffic — and the
-    # executor cannot saturate the gate alone (admission saturation
-    # is charged to jobs as InfraFailure, so a self-saturating
-    # executor would park its own backlog). Raising this to 64
-    # requires raising the admission-cap formula first. PG queuing at
-    # 32 workers × short per-query claims vs the 20-conn pool is
-    # acceptable — the substitute path never holds a connection
-    # across an upstream fetch.
+    # instead of buffering unbounded NAR bytes — the budget is a
+    # backpressure bound, sized independently of this knob.
+    # Gate pressure (r[store.materialize.gate-share]): the executor's
+    # total draw on the r[store.substitute.admission] gate is bounded
+    # STRUCTURALLY by the pod path-slot pool — P = effective
+    # admission cap / 2 (override-aware; pgMaxConnections 20 →
+    # (20×3).clamp(64,128) = 64 → P = 32) — so ≥ cap/2 permits stay
+    # available to QueryPathInfo/GetPath miss traffic AT ALL TIMES,
+    # for ANY value of this knob and pathFanout. n and F are
+    # SHAPING-ONLY levers (n bounds claimed jobs, F bounds per-job
+    # width; safety lives in P alone): raising either past the pool
+    # shifts queuing to the baseline path-slot (watch
+    # rio_store_executor_path_slot_baseline_waiters / _wait_seconds —
+    # the n×F > P transient regime is expected and FIFO-fair; n > P
+    # additionally warns at boot). PG queuing at 32 workers × short
+    # per-query claims vs the 20-conn pool is acceptable — the
+    # substitute path never holds a connection across an upstream
+    # fetch.
     executorConcurrency: 32
+    # Bounded intra-job substitution fan-out
+    # (r[store.materialize.path-fold]): per-job path-resolution window
+    # width F — up to this many concurrent path fetches per walk. At
+    # full worker occupancy walks run ~1 slot each (job-grain
+    # parallelism, the backlog-burst case); at low occupancy walks
+    # widen toward F (path-grain, the big-closure drain-tail case) —
+    # the two regimes self-balance inside the path-slot pool's
+    # fair-FIFO yield law. Matches the binary default (gate parity).
+    pathFanout: 4
     # The scheduler ExecutorService address — the store→scheduler edge
     # the store-egress netpol allows (port 9001).
     schedulerAddr: rio-scheduler.rio-system:9001

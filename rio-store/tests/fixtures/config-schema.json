@@ -211,7 +211,8 @@
         "default": {
           "executor_concurrency": 8,
           "poll_interval_secs": 1,
-          "scheduler_addr": ""
+          "scheduler_addr": "",
+          "path_fanout": 4
         }
       },
       "log_retention_days": {
@@ -320,6 +321,13 @@
             "description": "Scheduler ExecutorService address (the store→scheduler edge:\nListMaterializationJobs / PullAssignment / ReportOutcome).\nTHE executor spawn condition (PD-D2): non-empty spawns the\nclaim loops; empty disables the executor (the schedulerless\npure-store deployment stays valid). The VM/helm wiring sets it\nexplicitly.",
             "type": "string",
             "default": ""
+          },
+          "path_fanout": {
+            "description": "Bounded intra-job substitution fan-out (live_047/R-C,\n`store.materialize.path-fold`): per-job path-resolution window\nwidth F — at most this many concurrent path resolutions per\nwalk. Default 4. Total executor pressure on the admission gate\nis bounded STRUCTURALLY by the pod path-slot pool (P =\neffective admission cap / 2, `store.materialize.gate-share`),\nindependent of F and `executor_concurrency` — both are\nshaping-only levers: at full worker occupancy walks run ~1\nslot each (job-grain); at low occupancy walks widen to F\n(path-grain). 1 = the serial walk as the F=1 instance of the\nsame code shape. Env: `RIO_MATERIALIZATION__PATH_FANOUT`.",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "default": 4
           }
         }
       }
@@ -365,7 +373,8 @@
     "materialization": {
       "executor_concurrency": 8,
       "poll_interval_secs": 1,
-      "scheduler_addr": ""
+      "scheduler_addr": "",
+      "path_fanout": 4
     },
     "log_retention_days": 30
   }

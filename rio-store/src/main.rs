@@ -18,9 +18,7 @@ use rio_store::logs::ingest::IngestConfig;
 use rio_store::signing::{Signer, TenantSigner};
 use rio_store::substitute::Substituter;
 
-use rio_store::config::{
-    ChunkBackendKind, CliArgs, Config, derive_substitute_admission_cap, init_chunk_backend,
-};
+use rio_store::config::{ChunkBackendKind, CliArgs, Config, init_chunk_backend};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -131,11 +129,20 @@ async fn main() -> anyhow::Result<()> {
     // via GetLoad). Constructed before either builder chain so the
     // share is explicit — two `AdmissionGate::new()` calls would
     // compile but GetLoad would always read 0.0.
-    let admission_cap = cfg
-        .substitute_admission_permits
-        .unwrap_or_else(|| derive_substitute_admission_cap(cfg.pg_max_connections));
+    // r[impl store.materialize.gate-share]
+    // ONE effective value feeds the gate AND the executor path-slot
+    // pool (live_047/R-C): the pool tracks the override, so the
+    // documented `substituteAdmissionPermits` lever can never hand
+    // the executor the whole gate.
+    let admission_cap = rio_store::config::effective_substitute_admission_cap(
+        cfg.substitute_admission_permits,
+        cfg.pg_max_connections,
+    );
     info!(admission_cap, "substitute admission gate");
     let substitute_admission = rio_store::admission::AdmissionGate::new(admission_cap);
+    let executor_path_slots = rio_store::materialize::executor::PathSlotPool::new(
+        rio_store::config::derive_executor_path_slots(substitute_admission.capacity()),
+    );
 
     // StoreServiceImpl: one constructor + builder chain. Unconditional
     // builders chain directly; Option<T> from config applies via
@@ -384,6 +391,7 @@ async fn main() -> anyhow::Result<()> {
         pool.clone(),
         Arc::clone(&substituter),
         materialization_signer,
+        executor_path_slots,
         shutdown.clone(),
     );
 

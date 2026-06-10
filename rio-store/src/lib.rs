@@ -142,6 +142,15 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
         SUBSTITUTE_DURATION_BUCKETS,
     ),
     (
+        // Baseline path-slot wait (r[store.materialize.gate-share]):
+        // sub-ms when the pool has headroom; under the n×F > P
+        // transient regime the head waiter waits ~one in-flight path
+        // residence — the same 0.01–120 s envelope as a substitute
+        // fetch, which IS the residence being waited out.
+        "rio_store_executor_path_slot_baseline_wait_seconds",
+        SUBSTITUTE_DURATION_BUCKETS,
+    ),
+    (
         // Same range: ⌈N_uncached/128⌉ × RTT spans the 0.01-120s
         // envelope (153k paths @ 30ms ≈ 36s; the 60-120s tail is
         // 429-retry sleeps).
@@ -539,6 +548,29 @@ pub fn describe_metrics() {
         "try_substitute admission-gate utilization: (capacity - available) / \
          capacity. Updated on each acquire AND each GetLoad call. Can saturate \
          independently of pg_pool_utilization (upstream HTTP bottleneck)."
+    );
+    describe_gauge!(
+        "rio_store_executor_path_slots_in_use",
+        "Executor path-slot pool occupancy (r[store.materialize.gate-share]): \
+         slots held by in-flight materialization path futures, out of \
+         P = effective admission cap / 2. Republished on both edges \
+         (acquire and release)."
+    );
+    describe_gauge!(
+        "rio_store_executor_path_slot_baseline_waiters",
+        "Materialization walks queued at the BASELINE path-slot acquire \
+         (width 0 with a nonempty frontier). The transient-regime tripwire \
+         for n×F > P (claimed jobs waiting on slot turnover); the boot warn \
+         covers only the permanent n > P regime."
+    );
+    describe_histogram!(
+        "rio_store_executor_path_slot_baseline_wait_seconds",
+        "Wall-clock a walk spent queued at the baseline path-slot acquire. \
+         The wait-age facet of the n×F > P tripwire: the head waiter waits \
+         ~one in-flight path residence (wall-clock-unbounded by the \
+         no-body-timeout design), so sustained growth here means slot \
+         turnover is dominated by long downloads — lower pathFanout, \
+         executorConcurrency, or raise the admission cap."
     );
     describe_counter!(
         "rio_store_substitute_admission_rejected_total",

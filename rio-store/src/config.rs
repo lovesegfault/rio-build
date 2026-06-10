@@ -323,6 +323,18 @@ pub struct MaterializationConfig {
     /// pure-store deployment stays valid). The VM/helm wiring sets it
     /// explicitly.
     pub scheduler_addr: String,
+    /// Bounded intra-job substitution fan-out (live_047/R-C,
+    /// `store.materialize.path-fold`): per-job path-resolution window
+    /// width F — at most this many concurrent path resolutions per
+    /// walk. Default 4. Total executor pressure on the admission gate
+    /// is bounded STRUCTURALLY by the pod path-slot pool (P =
+    /// effective admission cap / 2, `store.materialize.gate-share`),
+    /// independent of F and `executor_concurrency` — both are
+    /// shaping-only levers: at full worker occupancy walks run ~1
+    /// slot each (job-grain); at low occupancy walks widen to F
+    /// (path-grain). 1 = the serial walk as the F=1 instance of the
+    /// same code shape. Env: `RIO_MATERIALIZATION__PATH_FANOUT`.
+    pub path_fanout: usize,
 }
 
 impl Default for MaterializationConfig {
@@ -331,6 +343,7 @@ impl Default for MaterializationConfig {
             executor_concurrency: 8,
             poll_interval_secs: 1,
             scheduler_addr: String::new(),
+            path_fanout: 4,
         }
     }
 }
@@ -353,6 +366,34 @@ pub const DEFAULT_PG_MAX_CONNECTIONS: u32 = 50;
 /// 1024, the S3 single-prefix steady-state ceiling.
 pub fn derive_substitute_admission_cap(pg_max: u32) -> usize {
     (pg_max as usize * 3).clamp(64, 128)
+}
+
+// r[impl store.materialize.gate-share]
+/// The EFFECTIVE substitute-admission capacity — override included.
+/// THE one value main.rs constructs the gate from AND derives the
+/// executor path-slot pool from (live_047/R-C): a formula-only pool
+/// size would let the documented `substitute_admission_permits`
+/// override hand the executor the entire gate (e.g. override 32 with
+/// formula-P 32 = 100 % of the effective cap — the invariant inverted
+/// through an existing config surface).
+pub fn effective_substitute_admission_cap(overridden: Option<usize>, pg_max: u32) -> usize {
+    overridden.unwrap_or_else(|| derive_substitute_admission_cap(pg_max))
+}
+
+// r[impl store.materialize.gate-share]
+/// Executor path-slot pool size: P = effective_cap / 2
+/// (`store.materialize.gate-share`). The executor alone can never
+/// saturate the admission gate — ≥ cap/2 permits remain available to
+/// RPC miss traffic at all times, independent of `path_fanout` and
+/// `executor_concurrency` (the d1f18610d n=32 envelope made
+/// structural). Deliberately NO floor: a cap of 1 would make P = 0
+/// and wedge every walk at the baseline acquire — that override is
+/// REJECTED at validate() (`substitute_admission_permits >= 2`)
+/// rather than floored, because a floored P = 1 = cap silently hands
+/// the executor 100 % of a cap-1 gate, the exact inversion this
+/// derivation exists to prevent.
+pub fn derive_executor_path_slots(effective_cap: usize) -> usize {
+    effective_cap / 2
 }
 
 #[derive(Parser, Serialize, Default)]
@@ -427,13 +468,25 @@ impl rio_common::config::ValidateConfig for Config {
             self.max_batch_paths >= 1,
             "max_batch_paths must be >= 1; set RIO_MAX_BATCH_PATHS"
         );
-        // 0 → Semaphore::new(0) → every try_substitute_on_miss queues
-        // for SUBSTITUTE_ADMISSION_WAIT then ResourceExhausted; store
-        // never substitutes. None is fine (derived from pg_max).
+        // < 2 → either Semaphore::new(0) (store never substitutes) or,
+        // at exactly 1, an executor path-slot pool of P = cap/2 = 0 —
+        // every materialization walk wedges at the baseline slot
+        // acquire (live_047/R-C; rejection over flooring: a floored
+        // P = 1 = cap hands the executor the WHOLE cap-1 gate). None
+        // is fine (derived from pg_max).
         anyhow::ensure!(
-            self.substitute_admission_permits.is_none_or(|n| n >= 1),
-            "substitute_admission_permits must be >= 1; unset \
+            self.substitute_admission_permits.is_none_or(|n| n >= 2),
+            "substitute_admission_permits must be >= 2 (1 makes the executor \
+             path-slot pool empty and wedges every materialization walk); unset \
              RIO_SUBSTITUTE_ADMISSION_PERMITS to derive from pg_max_connections"
+        );
+        // E-1: the driver floors the window at 1 defensively, but a
+        // configured 0 is a typo — reject at startup, not silently
+        // reinterpret (the validate-over-clamp convention).
+        anyhow::ensure!(
+            self.materialization.path_fanout >= 1,
+            "materialization.path_fanout must be >= 1; set \
+             RIO_MATERIALIZATION__PATH_FANOUT"
         );
         // 0 → Semaphore::new(0) → every AppendLog open is rejected with
         // RESOURCE_EXHAUSTED: build logs silently stop being stored.
@@ -733,6 +786,58 @@ mod tests {
             ..Default::default()
         };
         assert!(ok.validate().is_ok());
+    }
+
+    // r[verify store.materialize.gate-share]
+    /// E-3 (live_047/R-C): P = effective_admission_cap / 2, pinned
+    /// through the REAL symbols on BOTH arms — formula (None →
+    /// derive_substitute_admission_cap) and override (Some(o) → o) —
+    /// no mirrored literals: the relation is computed from the same
+    /// functions main.rs feeds the gate and the pool.
+    #[test]
+    fn path_slot_pool_is_half_the_effective_admission_cap() {
+        // Formula arm: both clamp edges and the linear region.
+        for pg in [1u32, 20, 50, 1000] {
+            let cap = effective_substitute_admission_cap(None, pg);
+            assert_eq!(cap, derive_substitute_admission_cap(pg), "pg={pg}");
+            assert_eq!(derive_executor_path_slots(cap), cap / 2, "pg={pg}");
+            // The formula floor (64) keeps P >= 32 on every
+            // formula-derived deployment.
+            assert!(derive_executor_path_slots(cap) >= 32, "pg={pg}");
+        }
+        // Override arm: P tracks the EFFECTIVE value (the inversion
+        // EM-2 closed); the validate() >= 2 floor keeps P >= 1.
+        for o in [2usize, 3, 32, 64, 127, 128, 256] {
+            let cap = effective_substitute_admission_cap(Some(o), 20);
+            assert_eq!(cap, o, "override must win verbatim");
+            assert_eq!(derive_executor_path_slots(cap), o / 2, "o={o}");
+            assert!(derive_executor_path_slots(cap) >= 1, "o={o}");
+        }
+    }
+
+    // r[verify store.materialize.gate-share]
+    /// live_047/R-C (WO-R7-3): an admission-permit override below 2
+    /// makes the executor path-slot pool P = cap/2 = 0 — every walk
+    /// wedges at the baseline slot acquire. Rejected at validate()
+    /// rather than floored: a floored P = 1 = cap silently hands the
+    /// executor 100% of a cap-1 gate, the exact inversion the
+    /// gate-share invariant exists to prevent.
+    #[test]
+    fn validate_rejects_admission_cap_below_two() {
+        let cfg = Config {
+            database_url: "postgres://x".into(),
+            substitute_admission_permits: Some(1),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("substitute_admission_permits"), "got: {err}");
+        // Boundary: 2 admits one executor slot + one RPC permit.
+        let ok = Config {
+            database_url: "postgres://x".into(),
+            substitute_admission_permits: Some(2),
+            ..Default::default()
+        };
+        ok.validate().expect("cap 2 is the floor");
     }
 
     /// E-2(i), live_047/R-C: the deployed NAR budget MUST admit one

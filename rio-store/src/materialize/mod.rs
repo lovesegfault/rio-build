@@ -90,6 +90,7 @@ pub fn spawn_materialization_executor(
     pool: sqlx::PgPool,
     substituter: std::sync::Arc<crate::substitute::Substituter>,
     service_signer: Option<std::sync::Arc<rio_auth::hmac::HmacSigner>>,
+    path_slots: executor::PathSlotPool,
     shutdown: rio_common::signal::Token,
 ) -> usize {
     if cfg.scheduler_addr.is_empty() {
@@ -100,10 +101,27 @@ pub fn spawn_materialization_executor(
     info!(
         instance = %instance,
         concurrency = cfg.executor_concurrency,
+        path_fanout = cfg.path_fanout,
+        path_slots = path_slots.capacity(),
         scheduler_addr = %cfg.scheduler_addr,
         authenticated = service_signer.is_some(),
         "materialization executor enabled; spawning claim loops"
     );
+    // r[impl store.materialize.gate-share]
+    // PERMANENT baseline-queuing tripwire: with n > P even width-1
+    // walks contend for slots — some claimed jobs always queue at the
+    // baseline acquire. (The TRANSIENT regime — n×F > P, reachable at
+    // helm defaults — is watched by the pool's wait facet instead:
+    // queued-baseline-waiters gauge + wait-age histogram.)
+    if cfg.executor_concurrency > path_slots.capacity() {
+        warn!(
+            executor_concurrency = cfg.executor_concurrency,
+            path_slots = path_slots.capacity(),
+            "executor_concurrency exceeds the path-slot pool: claimed jobs \
+             will queue at the baseline slot even at width 1 (lower the \
+             worker count or raise the admission cap)"
+        );
+    }
     // T-6.2 (Phase B): pre-register the executor lifecycle counters at 0
     // (the gc-collect pre-registration pattern) so dashboards/alerts have
     // series from boot and the metrics-registered VM assertion sees them
@@ -183,11 +201,11 @@ pub fn spawn_materialization_executor(
         let ctx = executor::ExecutorContext {
             pool: pool.clone(),
             substituter: std::sync::Arc::clone(&substituter),
-            // live_047/R-C WO-R7-2 prelude: width 1 — the serial walk
-            // as the F=1 instance of the driver/window shape. The
-            // config lever (`materialization.path_fanout`) and the
-            // pod path-slot pool land with WO-R7-3.
-            path_fanout: 1,
+            // live_047/R-C: width from the config lever (default 4);
+            // ONE pod-wide slot pool shared by every worker bounds
+            // the executor's total gate draw at P = cap/2.
+            path_fanout: cfg.path_fanout,
+            path_slots: path_slots.clone(),
         };
         let cfg_for_worker = cfg.clone();
         let instance_for_worker = worker_instance.clone();
@@ -490,6 +508,7 @@ mod tests {
             db.pool.clone(),
             std::sync::Arc::clone(&substituter),
             None,
+            executor::PathSlotPool::new(32),
             shutdown.clone(),
         );
         assert_eq!(spawned, 0, "no scheduler_addr => no executor (PD-D2)");
@@ -505,6 +524,7 @@ mod tests {
             db.pool.clone(),
             substituter,
             None,
+            executor::PathSlotPool::new(32),
             shutdown.clone(),
         );
         assert_eq!(spawned, 3, "an address spawns the configured loops");
@@ -534,6 +554,7 @@ mod tests {
             db.pool.clone(),
             substituter,
             None,
+            executor::PathSlotPool::new(32),
             shutdown.clone(),
         );
         assert_eq!(
@@ -648,6 +669,7 @@ mod tests {
             pool: db.pool.clone(),
             substituter,
             path_fanout: 1,
+            path_slots: executor::PathSlotPool::new(32),
         };
         tokio::time::timeout(
             Duration::from_secs(30),
@@ -832,6 +854,7 @@ mod tests {
             pool: db.pool.clone(),
             substituter,
             path_fanout: 1,
+            path_slots: executor::PathSlotPool::new(32),
         };
         // Pause the clock ONLY after the real-I/O setup (the ephemeral
         // PG pool's connect timeouts run on tokio time; pausing before

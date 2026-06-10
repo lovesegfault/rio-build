@@ -173,6 +173,9 @@
     "rio_store_chunk_cache_misses_total",
     "rio_store_chunk_dedup_ratio",
     "rio_store_chunk_upgrade_tx_seconds",
+    "rio_store_executor_path_slot_baseline_wait_seconds",
+    "rio_store_executor_path_slot_baseline_waiters",
+    "rio_store_executor_path_slots_in_use",
     "rio_store_gc_chunk_resurrected_total",
     "rio_store_gc_chunks_collected_total",
     "rio_store_gc_chunks_live",
@@ -1126,6 +1129,21 @@
         "name": "rio_store_chunk_upgrade_tx_seconds",
         "kind": "histogram",
         "help": "upgrade_manifest_to_chunked transaction duration (begin to commit) — the single chunk-referencing write transaction. Monitors the chunk collector's collect-soundness assumption that no such transaction outlives the collect grace window (alerts at grace/2 and grace-60s)."
+      },
+      {
+        "name": "rio_store_executor_path_slot_baseline_wait_seconds",
+        "kind": "histogram",
+        "help": "Wall-clock a walk spent queued at the baseline path-slot acquire. The wait-age facet of the n×F > P tripwire: the head waiter waits ~one in-flight path residence (wall-clock-unbounded by the no-body-timeout design), so sustained growth here means slot turnover is dominated by long downloads — lower pathFanout, executorConcurrency, or raise the admission cap."
+      },
+      {
+        "name": "rio_store_executor_path_slot_baseline_waiters",
+        "kind": "gauge",
+        "help": "Materialization walks queued at the BASELINE path-slot acquire (width 0 with a nonempty frontier). The transient-regime tripwire for n×F > P (claimed jobs waiting on slot turnover); the boot warn covers only the permanent n > P regime."
+      },
+      {
+        "name": "rio_store_executor_path_slots_in_use",
+        "kind": "gauge",
+        "help": "Executor path-slot pool occupancy (r[store.materialize.gate-share]): slots held by in-flight materialization path futures, out of P = effective admission cap / 2. Republished on both edges (acquire and release)."
       },
       {
         "name": "rio_store_gc_chunk_resurrected_total",
