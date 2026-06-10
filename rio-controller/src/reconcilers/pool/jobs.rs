@@ -201,18 +201,31 @@ pub(super) fn priority_bucket(cores: u32) -> u32 {
     cores.checked_ilog2().unwrap_or(0).min(9)
 }
 
+/// merged_bug_080(2a) census addressability: the Job-alive deadline
+/// FLOOR, hoisted from `ephemeral_deadline`'s inline `.max(180)` so
+/// the alive-floor census generator (`rg 'const .*SECS'` over this
+/// module tree) captures it as a named row. The floor exceeds
+/// `candidate::POOL_STREAK_ORPHAN_EXPIRY_SECS` (120 s) — which is WHY
+/// a job-held intent's respawn record needs the structural
+/// `note_job_alive` refresh rather than a constant inequality (the
+/// close is structural; this const exists for the census, not as a
+/// load-bearing bound). The 86400 upper cap stays prose in the doc
+/// below (scheduler-side clamp; no controller const exists in-plane).
+pub(super) const EPHEMERAL_DEADLINE_FLOOR_SECS: i64 = 180;
+
 /// `activeDeadlineSeconds` for an ephemeral Job: `intent.
 /// deadline_secs` verbatim. The scheduler computes it per-derivation
 /// (D7: `wall_p99 × 5` for fitted, `[sla].probe.deadline_secs` for
 /// unfitted, clamped `[floor, 86400]`) and `SlaConfig::validate`
 /// guarantees `probe.deadline_secs >= 180`, so the intent value is
 /// always `>= 180`. No controller-side multiplier or per-kind
-/// fallback. `.max(180)` is defensive only — proto default is 0; a
-/// 0s deadline would fail the Job at creation, and `< 180` would tie
-/// the worker's `daemon_timeout = deadline − 90` against this timer.
+/// fallback. The [`EPHEMERAL_DEADLINE_FLOOR_SECS`] floor is defensive
+/// only — proto default is 0; a 0s deadline would fail the Job at
+/// creation, and `< 180` would tie the worker's
+/// `daemon_timeout = deadline − 90` against this timer.
 // r[impl ctrl.ephemeral.intent-deadline]
 pub(super) fn ephemeral_deadline(intent: &SpawnIntent) -> i64 {
-    i64::from(intent.deadline_secs).max(180)
+    i64::from(intent.deadline_secs).max(EPHEMERAL_DEADLINE_FLOOR_SECS)
 }
 
 /// `hw_class` strings the `HwClassSampled` RPC keys on for one
@@ -755,6 +768,29 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         .list(&ListParams::default().labels(&format!("{}={name}", super::POOL_LABEL)))
         .await?;
     let census = job_census(&jobs.items);
+
+    // merged_bug_080(2a) structural refresh: every same-pool Job in
+    // this tick's listing --- active AND terminal (a terminal-unreaped
+    // Job is the observable artifact of the terminal phase) ---
+    // refreshes its intent's respawn-record `touched`. A job-held
+    // intent leaves `wanted` (existing-name filter below) and is never
+    // evaluated, while every Job-alive floor (the >=180 s
+    // `EPHEMERAL_DEADLINE_FLOOR_SECS`, the 600 s terminal TTL) exceeds
+    // the 120 s orphan expiry: without this lane the breaker's record
+    // died mid-cycle and `deaths` never accumulated past 1. Residual
+    // (disclosed): a >120 s apiserver LIST outage for THIS pool while
+    // sibling pools fold can still expire a record (the `?` above
+    // aborts before this line) --- bounded: no LIST ⇒ no spawn either;
+    // worst case one un-backed-off cycle on recovery.
+    // r[impl ctrl.pool.respawn-backoff]
+    ctx.exhausted_streak.lock().note_job_alive(
+        &streak_key,
+        jobs.items
+            .iter()
+            .filter_map(super::job::job_intent_id)
+            .filter(|s| !s.is_empty()),
+        std::time::Instant::now(),
+    );
 
     // ---- Reap stale Jobs blocking respawn ----
     // (a) Terminal: a drv that re-enters Ready after its prior Job

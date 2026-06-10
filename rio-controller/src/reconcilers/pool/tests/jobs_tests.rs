@@ -769,8 +769,9 @@ async fn reap_excess_pending_skips_live_running_pod() {
 
 // r[verify ctrl.pool.reconcile]
 /// `job_census` excludes terminating Jobs from `active` (a Job
-/// foreground-deleted on a prior tick doesn't burn a headroom slot for
-/// up to TGPS=7200s) and computes `ready` distinctly from `active`
+/// foreground-deleted on a prior tick doesn't burn a headroom slot
+/// while the 45 s `PULL_MODE_TGPS_SECS` grace and the job-tracking
+/// finalizer keep it Terminating) and computes `ready` distinctly from `active`
 /// (`PoolStatus.ready_replicas` = "passed readinessProbe", NOT "all
 /// non-terminal"). Before JobCensus, `is_active_job` (no
 /// `deletion_timestamp` filter) was used for both.
@@ -1679,6 +1680,7 @@ fn gate_evaluates_all_wanted_not_just_window() {
 /// red (breaker neutered --- strawman, the gate cannot exist pre-fix):
 /// `left: 25 right: 5 --- verdict-free respawns must follow the
 /// exponential backoff schedule, not the reconcile cadence`.
+// r[verify ctrl.pool.respawn-backoff]
 #[test]
 fn verdictless_respawn_backs_off_per_intent() {
     use crate::reconcilers::pool::candidate::PoolStreaks;
@@ -1730,6 +1732,7 @@ fn verdictless_respawn_backs_off_per_intent() {
 /// here the acked NoEligibleSource verdict lane the reconcile calls
 /// after `report_no_eligible_source` acks --- resets the backoff
 /// immediately; the breaker must never mask a real verdict lane.
+// r[verify ctrl.pool.respawn-backoff]
 #[test]
 fn verdict_resets_respawn_backoff() {
     use crate::reconcilers::pool::candidate::{PoolStreaks, SpawnResolution};
@@ -2115,6 +2118,271 @@ fn spawn_decision_census_covers_arm_by_evidence_product() {
                 state.label()
             );
         }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────
+// merged_bug_080(2a): respawn-record lifetime across cycle phases
+// ───────────────────────────────────────────────────────────────────
+
+/// merged_bug_080(2a) census alphabet (R15): the CLOSED set of cycle
+/// phases a (pool, intent) pair occupies between two verdict-free
+/// deaths. `ALL` is pinned exhaustive by the same-file match in
+/// [`CyclePhase::production_loop_shape`]'s caller (the census test):
+/// adding a phase is a compile error there until its survival law is
+/// stated. The phase determines which PRODUCTION call the reconcile
+/// makes for the intent each tick --- the census drives exactly that
+/// call shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CyclePhase {
+    /// The intent is jobless and the fold evaluates it: `step`'s
+    /// evaluated-tick touch refreshes the record (pre-existing lane).
+    JoblessEvaluated,
+    /// A Pending Job holds the name: the intent left `wanted`, only
+    /// the LIST refresh (`note_job_alive`) can reach the record.
+    JobPending,
+    /// A Running Job holds the name: same structural lane as Pending
+    /// (the listing is phase-blind for the refresh).
+    JobRunning,
+    /// A terminal Job is listed but not yet reaped (<= the 600 s
+    /// JOB_TTL window): still in the listing, still refreshed.
+    TerminalUnreaped,
+    /// The reap just consumed the terminal Job this tick:
+    /// `note_verdict_free_death` re-anchors (touched = now).
+    ReapedAwaitingRespawn,
+    /// Jobless AND un-evaluated (fold-skip silence): NO refresh ---
+    /// the 120 s orphan expiry is EXACTLY this phase's law.
+    JoblessUnevaluated,
+}
+
+impl CyclePhase {
+    const ALL: [CyclePhase; 6] = [
+        CyclePhase::JoblessEvaluated,
+        CyclePhase::JobPending,
+        CyclePhase::JobRunning,
+        CyclePhase::TerminalUnreaped,
+        CyclePhase::ReapedAwaitingRespawn,
+        CyclePhase::JoblessUnevaluated,
+    ];
+}
+
+/// Drive ONE tick of the production loop shape for `phase` against
+/// `streaks` (paused clock; `drv-other` is the sibling intent whose
+/// completed folds keep the global expiry retain running, mirroring
+/// sibling-pool/intent activity in the reconcile).
+fn phase_tick(
+    streaks: &mut crate::reconcilers::pool::candidate::PoolStreaks,
+    key: &crate::reconcilers::pool::candidate::PoolKey,
+    phase: CyclePhase,
+    now: std::time::Instant,
+) {
+    use crate::reconcilers::pool::candidate::Observation;
+    match phase {
+        CyclePhase::JoblessEvaluated => {
+            // The fold evaluates drv-x (un-gated) and drv-other.
+            let ours = intent_named("drv-x");
+            let other = intent_named("drv-other");
+            let obs = Observation::from_partition(&[], &[ours, other]);
+            let tick = streaks.begin_tick(key);
+            let _ = streaks.step(tick, &obs, now);
+        }
+        CyclePhase::JobPending | CyclePhase::JobRunning | CyclePhase::TerminalUnreaped => {
+            // The Job LIST sees the same-named Job (any phase) and the
+            // reconcile refreshes from the listing BEFORE the fold;
+            // the fold then evaluates only the sibling (drv-x is
+            // excluded by the existing-name filter).
+            streaks.note_job_alive(key, std::iter::once("drv-x"), now);
+            let other = intent_named("drv-other");
+            let obs = Observation::from_partition(&[], &[other]);
+            let tick = streaks.begin_tick(key);
+            let _ = streaks.step(tick, &obs, now);
+        }
+        CyclePhase::ReapedAwaitingRespawn => {
+            // The reap notes the verdict-free death (re-anchor), then
+            // the fold runs over the sibling.
+            streaks.note_verdict_free_death(key, "drv-x", now);
+            let other = intent_named("drv-other");
+            let obs = Observation::from_partition(&[], &[other]);
+            let tick = streaks.begin_tick(key);
+            let _ = streaks.step(tick, &obs, now);
+        }
+        CyclePhase::JoblessUnevaluated => {
+            // Fold-skip silence for drv-x: only the sibling folds.
+            let other = intent_named("drv-other");
+            let obs = Observation::from_partition(&[], &[other]);
+            let tick = streaks.begin_tick(key);
+            let _ = streaks.step(tick, &obs, now);
+        }
+    }
+}
+
+/// Production-shaped intent with a chosen id (the jobs_tests sibling
+/// of candidate.rs's `intent_for`).
+fn intent_named(id: &str) -> SpawnIntent {
+    SpawnIntent {
+        intent_id: id.into(),
+        ..Default::default()
+    }
+}
+
+// r[verify ctrl.pool.respawn-backoff]
+/// merged_bug_080(2a) red 1 (recorded verbatim in the close commit):
+/// a respawn record MUST survive the Job-alive phase. Paused clock:
+/// verdict-free death at t0 (deaths=1, backoff 10 s); the Job is
+/// listed alive [t0, t0+200 s] with the intent excluded from wanted
+/// (un-evaluated folds at 10 s cadence stepping the SIBLING so the
+/// global expiry retain runs); second verdict-free death at t0+200 s.
+/// deaths must escalate to 2 (backoff 20 s). Pre-fix the record
+/// expired at t0+120 s and the second death minted a FRESH record
+/// (deaths=1, backoff 10 s): `left: 10, right: 20`.
+///
+/// Witness-strength: certifies record SURVIVAL through the job-held
+/// phase measured by the escalated backoff (deaths accumulate), not
+/// by map internals. Strawman disclosure: pre-fix the refresh lane
+/// does not exist --- the red was recorded with `note_job_alive`'s
+/// body no-op'd (the API must exist for the census to compile).
+#[test]
+fn job_alive_phase_does_not_expire_respawn_record() {
+    use crate::reconcilers::pool::candidate::PoolStreaks;
+
+    let mut streaks = PoolStreaks::default();
+    let key = pkey();
+    let t0 = std::time::Instant::now();
+    streaks.note_verdict_free_death(&key, "drv-x", t0);
+
+    // Job alive (Pending/Running) for 200 s at 10 s cadence.
+    for n in 1..=20u64 {
+        phase_tick(
+            &mut streaks,
+            &key,
+            CyclePhase::JobPending,
+            t0 + std::time::Duration::from_secs(n * 10),
+        );
+    }
+    let t_death2 = t0 + std::time::Duration::from_secs(200);
+    streaks.note_verdict_free_death(&key, "drv-x", t_death2);
+
+    // deaths=2 ⇒ the backoff floor is 20 s: blocked at +15 s, free at
+    // +25 s. A fresh (expired-and-reminted) record would be deaths=1
+    // ⇒ 10 s: already free at +15 s.
+    let backoff_secs =
+        if streaks.respawn_blocked(&key, "drv-x", t_death2 + std::time::Duration::from_secs(15)) {
+            20
+        } else {
+            10
+        };
+    assert_eq!(
+        backoff_secs, 20,
+        "the second verdict-free death must ESCALATE the backoff (record \
+         survived the job-held phase), not restart it"
+    );
+}
+
+// r[verify ctrl.pool.respawn-backoff]
+/// merged_bug_080(2a) red 2 (recorded verbatim in the close commit):
+/// same law through the TERMINAL-UNREAPED phase --- a terminal Job
+/// listed for the 600 s JOB_TTL window is the observable artifact of
+/// the terminal phase and must refresh the record. Pre-fix shape:
+/// `left: 10, right: 20`.
+///
+/// Witness-strength: certifies the TerminalUnreaped refresh lane
+/// specifically (the JOB_TTL=600 alive floor, the census's 120<600
+/// miss cell); same escalated-backoff observable as red 1.
+#[test]
+fn respawn_record_survives_terminal_unreaped_window() {
+    use crate::reconcilers::pool::candidate::PoolStreaks;
+
+    let mut streaks = PoolStreaks::default();
+    let key = pkey();
+    let t0 = std::time::Instant::now();
+    streaks.note_verdict_free_death(&key, "drv-x", t0);
+
+    // Terminal-but-listed for 600 s at 10 s cadence (the JOB_TTL
+    // phase).
+    for n in 1..=60u64 {
+        phase_tick(
+            &mut streaks,
+            &key,
+            CyclePhase::TerminalUnreaped,
+            t0 + std::time::Duration::from_secs(n * 10),
+        );
+    }
+    let t_death2 = t0 + std::time::Duration::from_secs(600);
+    streaks.note_verdict_free_death(&key, "drv-x", t_death2);
+
+    let backoff_secs =
+        if streaks.respawn_blocked(&key, "drv-x", t_death2 + std::time::Duration::from_secs(15)) {
+            20
+        } else {
+            10
+        };
+    assert_eq!(
+        backoff_secs, 20,
+        "the record must survive the terminal-unreaped window (JOB_TTL \
+         600 s > 120 s expiry) and escalate on the next death"
+    );
+}
+
+// r[verify ctrl.pool.respawn-backoff]
+/// merged_bug_080(2a) census (R15): the record's retention horizon
+/// dominates EVERY cycle phase in which the intent is structurally
+/// un-evaluated --- exhaustively over the closed [`CyclePhase`]
+/// alphabet (the same-file `ALL` pin + this match: a new phase fails
+/// compilation here until its survival law is stated). Each cell
+/// drives >120 s of the phase's PRODUCTION loop shape on a paused
+/// clock and asserts the record's survival law for that phase:
+/// refresh lanes keep it (deaths escalate on the next death), the
+/// jobless-unevaluated cell EXPIRES it (the orphan semantics --- the
+/// expiry's one remaining job). Pre-fix red on the JobPending,
+/// JobRunning, and TerminalUnreaped cells (3 of 6 --- the pigeonhole
+/// exhibit; the book's working estimate said 2 of 6, the executed
+/// census says 3: Pending and Running are distinct alphabet cells
+/// even though one refresh lane covers both).
+///
+/// Witness-strength: certifies REFRESH-LANE COVERAGE per phase
+/// through production calls only (note_job_alive / step /
+/// note_verdict_free_death), not a parallel table.
+#[test]
+fn cycle_phase_census_refreshes_every_observable_phase() {
+    use crate::reconcilers::pool::candidate::PoolStreaks;
+
+    for phase in CyclePhase::ALL {
+        let mut streaks = PoolStreaks::default();
+        let key = pkey();
+        let t0 = std::time::Instant::now();
+        streaks.note_verdict_free_death(&key, "drv-x", t0);
+
+        // >120 s of the phase's production loop shape (13 ticks x 10 s).
+        for n in 1..=13u64 {
+            phase_tick(
+                &mut streaks,
+                &key,
+                phase,
+                t0 + std::time::Duration::from_secs(n * 10),
+            );
+        }
+        let t_probe = t0 + std::time::Duration::from_secs(130);
+
+        // Survival law per cell: a surviving record escalates
+        // (deaths>=2 ⇒ backoff >= 20 s); an expired one restarts
+        // (deaths=1 ⇒ 10 s).
+        let survives = match phase {
+            CyclePhase::JoblessEvaluated => true,
+            CyclePhase::JobPending => true,
+            CyclePhase::JobRunning => true,
+            CyclePhase::TerminalUnreaped => true,
+            CyclePhase::ReapedAwaitingRespawn => true,
+            CyclePhase::JoblessUnevaluated => false,
+        };
+        streaks.note_verdict_free_death(&key, "drv-x", t_probe);
+        let escalated =
+            streaks.respawn_blocked(&key, "drv-x", t_probe + std::time::Duration::from_secs(15));
+        // ReapedAwaitingRespawn ticks call note_verdict_free_death 13
+        // times (deaths pile up) --- still "survives" (escalated).
+        assert_eq!(
+            escalated, survives,
+            "cycle-phase census cell {phase:?}: record survival law violated"
+        );
     }
 }
 

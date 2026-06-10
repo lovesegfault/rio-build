@@ -413,6 +413,7 @@ impl EvidenceState {
 /// three doublings of the 10 s cadence --- an order-of-magnitude
 /// spend reduction under total failure while a genuine verdict (the
 /// reset lane) restores full cadence immediately.
+// r[impl ctrl.pool.respawn-backoff]
 pub(crate) const RESPAWN_BACKOFF_CAP_SECS: u64 = 80;
 const _: () = assert!(
     RESPAWN_BACKOFF_CAP_SECS < POOL_STREAK_ORPHAN_EXPIRY_SECS,
@@ -499,9 +500,13 @@ struct RespawnEntry {
     /// runs from it).
     last_death: std::time::Instant,
     /// Refreshed on every EVALUATED tick (per-cell law in
-    /// [`PoolStreaks::step`]); the shared orphan expiry bounds the
-    /// map. Repeated fold skips (LIST failures) age it out --- the
-    /// breaker fails open with the spawn arm's documented posture.
+    /// [`PoolStreaks::step`]) AND by every live/terminal same-named
+    /// Job in a tick's listing ([`PoolStreaks::note_job_alive`],
+    /// merged_bug_080(2a) --- the record must survive the job-held
+    /// phases, whose alive floors all exceed the expiry); the shared
+    /// orphan expiry bounds the map. Only genuinely JOBLESS fold-skip
+    /// silence ages it out --- the breaker fails open with the spawn
+    /// arm's documented posture.
     touched: std::time::Instant,
 }
 
@@ -530,7 +535,9 @@ impl PoolStreaks {
     ///   - respawn records: evaluated (gated or not) → RETAIN and
     ///     refresh `touched` (spawnability is not recovery; only a
     ///     named resolution resets); un-evaluated → retain without
-    ///     refreshing (the expiry bounds the map).
+    ///     refreshing HERE --- the job-held phases refresh through
+    ///     [`Self::note_job_alive`] (merged_bug_080(2a)), so the
+    ///     expiry only ever consumes jobless silence.
     pub fn step(
         &mut self,
         tick: StreakTick,
@@ -597,6 +604,7 @@ impl PoolStreaks {
     /// and the same-named respawn would otherwise fire at reconcile
     /// cadence). Steps the record (deaths+1) and re-anchors the
     /// backoff at this observation.
+    // r[impl ctrl.pool.respawn-backoff]
     pub fn note_verdict_free_death(
         &mut self,
         pool: &PoolKey,
@@ -614,6 +622,36 @@ impl PoolStreaks {
         e.deaths = e.deaths.saturating_add(1);
         e.last_death = now;
         e.touched = now;
+    }
+
+    /// merged_bug_080(2a) structural refresh: a live or terminal
+    /// same-named Job in this tick's listing is the observable
+    /// artifact of the job-held cycle phases --- refresh the intents'
+    /// respawn-record `touched` so the orphan expiry cannot destroy a
+    /// record during a phase in which the intent is structurally
+    /// unobservable to the gate fold (a job-held intent leaves
+    /// `wanted` via the existing-name filter, so `step`'s
+    /// evaluated-tick touch never reaches it, while every Job-alive
+    /// floor --- the >=180 s deadline floor, the 600 s terminal TTL
+    /// --- exceeds the 120 s expiry). Refreshes ONLY respawn records,
+    /// NEVER streak entries: the merged_bug_073 staleness law for
+    /// streaks is a different proposition --- a live Job is not an
+    /// exhaustion observation, and a streak kept alive by its own
+    /// spawn could complete a poison from stale evidence. With this
+    /// lane the expiry reverts to its documented orphan semantics:
+    /// genuinely JOBLESS fold-skip silence.
+    // r[impl ctrl.pool.respawn-backoff]
+    pub fn note_job_alive<'a>(
+        &mut self,
+        pool: &PoolKey,
+        intents: impl Iterator<Item = &'a str>,
+        now: std::time::Instant,
+    ) {
+        for intent in intents {
+            if let Some(r) = self.respawn.get_mut(&(pool.clone(), intent.to_owned())) {
+                r.touched = now;
+            }
+        }
     }
 
     /// bug_028 futility breaker: apply one NAMED resolution --- the
@@ -665,6 +703,7 @@ impl PoolStreaks {
     /// gated behind the verdict-free backoff floor? Pure read --- the
     /// spawn arm consults it on EVERY tick (including fold-skip
     /// ticks, where deaths noted by the reap still gate immediately).
+    // r[impl ctrl.pool.respawn-backoff]
     pub fn respawn_blocked(&self, pool: &PoolKey, intent: &str, now: std::time::Instant) -> bool {
         self.respawn
             .get(&(pool.clone(), intent.to_owned()))

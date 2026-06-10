@@ -1864,9 +1864,10 @@ pub(super) async fn report_terminated_pods(
         // TTL-window Job; the scheduler's fill-once intake no-ops
         // them anyway. `Error` IS observable for a deadline-
         // SIGKILL'd pod (restartPolicy:Never + backoffLimit:0 +
-        // TGPS=7200 + job-tracking finalizer keep it listable for
-        // the full grace window) — reporting it here would race the
-        // same-tick `report_deadline_exceeded_jobs`, which owns the
+        // the 45 s `PULL_MODE_TGPS_SECS` grace + the job-tracking
+        // finalizer/JOB_TTL window keep it listable) — reporting it
+        // here would race the same-tick
+        // `report_deadline_exceeded_jobs`, which owns the
         // DeadlineExceeded classification from the Job condition.
         // This filter eliminates the wasted RPCs and the race.
         if !matches!(
@@ -1954,12 +1955,13 @@ pub(super) async fn report_terminated_pods(
 
 /// Job has a `Failed` condition with `reason=DeadlineExceeded` —
 /// `activeDeadlineSeconds` fired. With `restartPolicy:Never` +
-/// `backoffLimit:0` + TGPS=7200 + the `job-tracking` finalizer, the
-/// SIGKILL'd pod IS listable (`deletionTimestamp` set,
-/// `containerStatuses[].state.terminated.reason="Error"`) for the
-/// full grace window — but `Error` is not a classification-fill
-/// reason, so [`report_terminated_pods`] skips it; this reads the Job
-/// condition instead.
+/// `backoffLimit:0` + the 45 s `PULL_MODE_TGPS_SECS` grace + the
+/// `job-tracking` finalizer, the SIGKILL'd pod IS listable
+/// (`deletionTimestamp` set,
+/// `containerStatuses[].state.terminated.reason="Error"`) through
+/// the finalizer/JOB_TTL window — but `Error` is not a
+/// classification-fill reason, so [`report_terminated_pods`] skips
+/// it; this reads the Job condition instead.
 pub(super) fn job_deadline_exceeded(job: &Job) -> bool {
     job.status
         .as_ref()
