@@ -1573,11 +1573,13 @@ async fn gated_intent_reports_no_eligible_source_with_cycle_echo() {
     assert!(!r1 && !r2 && r3, "report fires on the third gated tick");
 
     // Exactly one report goes out for the one gated intent, acked by
-    // the (mock) scheduler, echoing the verdict's resubmit_cycle.
+    // the (mock) scheduler, echoing the verdict's resubmit_cycle. The
+    // ack now arrives PAIRED with its reset witness, minted at the ack
+    // site (merged_bug_080(2b)).
     let acked = report_no_eligible_source(&ctx, "p", &gated).await;
     assert_eq!(
-        acked,
-        vec!["drv-gated".to_owned()],
+        acked.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        vec!["drv-gated"],
         "exactly one NoEligibleSource report per gated intent, acked by id \
          (bug_028: the acked ids feed the futility breaker reset lane)"
     );
@@ -1732,10 +1734,14 @@ fn verdictless_respawn_backs_off_per_intent() {
 /// here the acked NoEligibleSource verdict lane the reconcile calls
 /// after `report_no_eligible_source` acks --- resets the backoff
 /// immediately; the breaker must never mask a real verdict lane.
+/// merged_bug_080(2b): the reset rides the typed witness, minted from
+/// the ack response exactly as the production arm mints it (every
+/// poison-arm ack carries `attempt_resolved=false` by design --- the
+/// ack itself is the premise).
 // r[verify ctrl.pool.respawn-backoff]
 #[test]
 fn verdict_resets_respawn_backoff() {
-    use crate::reconcilers::pool::candidate::{PoolStreaks, SpawnResolution};
+    use crate::reconcilers::pool::candidate::{PoolStreaks, VerdictWitness};
     use crate::reconcilers::pool::jobs::{GateUniverse, evaluate_spawn_gate};
 
     let mut streaks = PoolStreaks::default();
@@ -1765,10 +1771,15 @@ fn verdict_resets_respawn_backoff() {
         "mid-backoff the intent must be withheld"
     );
 
-    // The verdict lands (the same typed call the reconcile makes for
-    // each acked NoEligibleSource id): the record clears and the very
-    // next tick spawns at full cadence.
-    streaks.note_resolution(&key, "drv-loop", SpawnResolution::NoEligibleSource);
+    // The verdict lands (the same typed mint + reset call the
+    // reconcile makes for each acked NoEligibleSource id): the record
+    // clears and the very next tick spawns at full cadence.
+    let ack = rio_proto::types::ReportAttemptOutcomeResponse::default();
+    streaks.note_resolution(
+        &key,
+        "drv-loop",
+        VerdictWitness::from_acked_no_eligible_source(&ack),
+    );
     let tick = streaks.begin_tick(&key);
     let unblocked = evaluate_spawn_gate(
         vec![intent],
@@ -2384,6 +2395,295 @@ fn cycle_phase_census_refreshes_every_observable_phase() {
             "cycle-phase census cell {phase:?}: record survival law violated"
         );
     }
+}
+
+// ───────────────────────────────────────────────────────────────────
+// merged_bug_080(2b): reset only on verdict-bearing evidence
+// ───────────────────────────────────────────────────────────────────
+
+/// A terminal (succeeded) Job carrying the intent annotation, as the
+/// apiserver lists it through the JOB_TTL window.
+fn terminal_job_for_intent(name: &str, intent_id: &str) -> Job {
+    let mut j = running_job_for_intent(name, intent_id);
+    j.status = Some(JobStatus {
+        ready: Some(0),
+        succeeded: Some(1),
+        ..Default::default()
+    });
+    j
+}
+
+/// A Job whose `activeDeadlineSeconds` fired: `Failed/DeadlineExceeded`
+/// condition set, intent annotation carried (the
+/// `report_deadline_exceeded_jobs` input shape).
+fn deadline_exceeded_job(name: &str, intent_id: &str) -> Job {
+    let mut j = running_job_for_intent(name, intent_id);
+    j.status = Some(JobStatus {
+        ready: Some(0),
+        failed: Some(1),
+        conditions: Some(vec![k8s_openapi::api::batch::v1::JobCondition {
+            type_: "Failed".into(),
+            status: "True".into(),
+            reason: Some("DeadlineExceeded".into()),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    });
+    j
+}
+
+// r[verify ctrl.pool.respawn-backoff]
+/// merged_bug_080(2b) red 4 (recorded verbatim in the close commit): a
+/// charge-free ack MUST NOT reset a respawn record. The reap steps the
+/// record (verdict-free death — the production noting call), then the
+/// same-tick `report_deadline_exceeded_jobs` lands its report on the
+/// mock admin, which acks `ReportAttemptOutcomeResponse::default()` —
+/// `attempt_resolved=false`, the exact charge-free shape the scheduler
+/// returns for a never-pulled Job's deadline report (no matching
+/// attempt). The record must still block. Pre-fix every `Ok(_)` ack
+/// reset it: `left: false, right: true`.
+///
+/// Witness-strength (consumption-only scope): certifies the CONTROLLER
+/// CONSUMES `attempt_resolved` — a false bit resets nothing through
+/// the production report conduit; producer truthfulness per arm is
+/// S3's `report_ack_attempt_resolved_per_arm_census` (WO-S3-P), not
+/// re-proven here.
+#[tokio::test]
+async fn noop_ack_does_not_reset_respawn_record() {
+    use crate::reconcilers::pool::job::report_deadline_exceeded_jobs;
+
+    let (client, _verifier) = ApiServerVerifier::new();
+    let (ctx, mock, _admin_handle) = ctx_with_mock_admin(client).await;
+    let key = pkey();
+
+    // The reap observed a verdict-free death this tick (deaths=1,
+    // 10 s floor).
+    let t0 = std::time::Instant::now();
+    ctx.exhausted_streak
+        .lock()
+        .note_verdict_free_death(&key, "drv-ddl", t0);
+
+    // Same-tick deadline report over the PRE-reap listing; the mock
+    // acks charge-free (attempt_resolved=false by design — the
+    // rolling-skew default a pre-field scheduler also produces).
+    let job = deadline_exceeded_job("rio-builder-p-ddl1", "drv-ddl");
+    report_deadline_exceeded_jobs(&ctx, &[job], &key).await;
+    assert_eq!(
+        mock.outcome_calls.read().unwrap().len(),
+        1,
+        "the deadline report reached the wire (conduit sanity)"
+    );
+
+    let blocked = ctx.exhausted_streak.lock().respawn_blocked(
+        &key,
+        "drv-ddl",
+        t0 + std::time::Duration::from_secs(5),
+    );
+    assert!(
+        blocked,
+        "an acknowledgment carrying no attempt-resolution witness must \
+         not reset the respawn record (blocked: false, expected true)"
+    );
+}
+
+// r[verify ctrl.pool.respawn-backoff]
+/// merged_bug_080(2b) red 5 (recorded verbatim in the close commit): a
+/// worker-closed death is NOT verdict-free. The terminal reap finds no
+/// OPEN attempt (the attempt already closed — the scheduler holds an
+/// adjudicated verdict) but the served `recently_closed` window
+/// carries the BUILD close for the intent; the reap must not mint a
+/// respawn record. Pre-fix `open_attempts_best_effort` discarded
+/// `recently_closed` and the healthy adjudicated retry was taxed:
+/// `left: true, right: false`.
+///
+/// Witness-strength (consumption-only scope): certifies the reap's
+/// death CLASSIFICATION consumes the full view (open + recently-closed
+/// build attempts) through the production reap conduit; the window's
+/// content is the scheduler's (S3-certified) word.
+#[tokio::test]
+async fn worker_closed_death_is_not_verdict_free() {
+    use rio_proto::types::CloseCause;
+
+    let (client, verifier) = ApiServerVerifier::new();
+    let (ctx, mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
+    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+    let key = pkey();
+
+    // The attempt closed worker-side moments ago: no open attempt,
+    // one recently-closed BUILD entry (explicit kind — the
+    // consumption lane this red certifies).
+    mock.open_attempts.write().unwrap().recently_closed = vec![rio_proto::types::ClosedAttempt {
+        intent_id: "wkc".into(),
+        exec_id: "exec-w1".into(),
+        cause: CloseCause::Completed as i32,
+        closed_age_secs: 30,
+        attempt_kind: rio_proto::types::AttemptKind::Build as i32,
+    }];
+
+    // Terminal Job for a STILL-WANTED intent → the reap's "terminal"
+    // arm (background delete) and the verdict-free classification.
+    let job = terminal_job_for_intent("rio-builder-p-wkc", "wkc");
+    let guard = verifier.run(vec![Scenario {
+        method: http::Method::DELETE,
+        path_contains: "/namespaces/rio/jobs/rio-builder-p-wkc",
+        body_contains: Some(r#""propagationPolicy":"Background""#),
+        status: 200,
+        body_json: serde_json::to_string(&Job::default()).unwrap(),
+    }]);
+    let reaped = reap_stale_for_intents(
+        &jobs_api,
+        &[job],
+        &[intent_named("wkc")],
+        &ctx,
+        "p",
+        ExecutorKind::Builder,
+        &key,
+    )
+    .await;
+    guard.verified().await;
+    assert_eq!(reaped, HashSet::from(["rio-builder-p-wkc".into()]));
+
+    let blocked =
+        ctx.exhausted_streak
+            .lock()
+            .respawn_blocked(&key, "wkc", std::time::Instant::now());
+    assert!(
+        !blocked,
+        "a death covered by a recently-closed BUILD attempt is not \
+         verdict-free — the scheduler adjudicated it; taxing the retry \
+         violates the breaker's own doc (blocked: true, expected false)"
+    );
+}
+
+// r[verify ctrl.pool.respawn-backoff]
+/// merged_bug_080(2b) red 6 — the kind axis, differential form: the
+/// recently-closed reset lane must ride the BUILD conjunct. Same
+/// scenario twice, only `attempt_kind` differs: MATERIALIZATION and
+/// UNSPECIFIED closes leave the record blocking (fail-closed — a store
+/// replica's close is not build progress, and an UNSPECIFIED kind from
+/// a pre-field scheduler must not enable spend); an explicit BUILD
+/// close resets it. The negative half is green both sides (disclosed:
+/// pre-fix no recently-closed consult exists at all); the BUILD half
+/// is the recorded red — `left: true, right: false`.
+///
+/// Witness-strength (consumption-only scope): certifies the mint-4
+/// kind gate at the cancel-arm consult — reset iff
+/// `attempt_kind == BUILD` — through the production cancel-arm view
+/// read; which kinds the scheduler stamps is S3's per-arm table.
+#[tokio::test]
+async fn materialization_close_does_not_reset_build_record() {
+    use crate::reconcilers::pool::job::cancel_closed_attempt_jobs;
+    use rio_proto::types::CloseCause;
+
+    let (client, _verifier) = ApiServerVerifier::new();
+    let (ctx, mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
+    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+    let key = pkey();
+
+    // Two verdict-free deaths: 20 s floor — mid-backoff throughout.
+    let t0 = std::time::Instant::now();
+    for n in 0..2u64 {
+        ctx.exhausted_streak.lock().note_verdict_free_death(
+            &key,
+            "drv-kind",
+            t0 + std::time::Duration::from_secs(n),
+        );
+    }
+    let probe = t0 + std::time::Duration::from_secs(5);
+    // One active Job binding NO close (cause Completed never selects;
+    // the intent is disjoint anyway) — the consult still runs.
+    let bystander = running_job_for_intent("rio-builder-p-other1", "drv-other");
+    let closed_kind = |kind: i32| rio_proto::types::ClosedAttempt {
+        intent_id: "drv-kind".into(),
+        exec_id: "exec-k1".into(),
+        cause: CloseCause::Completed as i32,
+        closed_age_secs: 10,
+        attempt_kind: kind,
+    };
+
+    // Negative half: MATERIALIZATION and UNSPECIFIED do not mint.
+    mock.open_attempts.write().unwrap().recently_closed = vec![
+        closed_kind(rio_proto::types::AttemptKind::Materialization as i32),
+        closed_kind(rio_proto::types::AttemptKind::Unspecified as i32),
+    ];
+    cancel_closed_attempt_jobs(&jobs_api, std::slice::from_ref(&bystander), &ctx, "p", &key).await;
+    assert!(
+        ctx.exhausted_streak
+            .lock()
+            .respawn_blocked(&key, "drv-kind", probe),
+        "non-BUILD recently-closed kinds must not reset (fail-closed \
+         spend-enabling lane; blocked: false, expected true)"
+    );
+
+    // BUILD half (the recorded red): an explicit BUILD close resets.
+    mock.open_attempts.write().unwrap().recently_closed =
+        vec![closed_kind(rio_proto::types::AttemptKind::Build as i32)];
+    cancel_closed_attempt_jobs(&jobs_api, &[bystander], &ctx, "p", &key).await;
+    assert!(
+        !ctx.exhausted_streak
+            .lock()
+            .respawn_blocked(&key, "drv-kind", probe),
+        "a recently-closed BUILD attempt is a named resolution — the \
+         scheduler adjudicated this intent's attempt (blocked: true, \
+         expected false)"
+    );
+}
+
+// r[verify ctrl.pool.respawn-backoff]
+/// merged_bug_080(2b) red 7 — the green companion to red 4: a
+/// RESOLVING ack (`attempt_resolved=true`) still resets — the breaker
+/// must never tax a real verdict. Both mint polarities at the seam:
+/// the true bit mints the witness and the typed reset clears the
+/// record; the default (false) bit mints NOTHING — the type-level
+/// half of red 4.
+///
+/// Polarity disclosure: the in-process MockAdmin acks
+/// `attempt_resolved=false` BY DESIGN (the WO-S3-P consumption-mock
+/// note), so the true polarity drives the production mint
+/// (`VerdictWitness::from_resolved_ack`) + reset conduit directly on
+/// the wire response shape — the same typed calls the three job.rs
+/// ack arms make. Witness-strength (consumption-only scope):
+/// certifies the controller's consumption of the bit, both
+/// polarities; which arms the scheduler stamps true is S3's per-arm
+/// table. No pre-fix red exists for this test: the witness type does
+/// not compile pre-fix (the pre-fix green half is the existing
+/// `verdict_resets_respawn_backoff` shape).
+#[test]
+fn resolved_ack_still_resets() {
+    use crate::reconcilers::pool::candidate::{PoolStreaks, VerdictWitness};
+
+    let mut streaks = PoolStreaks::default();
+    let key = pkey();
+    let t0 = std::time::Instant::now();
+    streaks.note_verdict_free_death(&key, "drv-res", t0);
+    let probe = t0 + std::time::Duration::from_secs(5);
+    assert!(
+        streaks.respawn_blocked(&key, "drv-res", probe),
+        "mid-backoff before the verdict"
+    );
+
+    // The charge-free polarity mints nothing (the type-level half of
+    // red 4: there is no witness to reset with).
+    assert!(
+        VerdictWitness::from_resolved_ack(&rio_proto::types::ReportAttemptOutcomeResponse {
+            attempt_resolved: false,
+        })
+        .is_none(),
+        "a charge-free ack must not mint a reset witness"
+    );
+
+    // The resolving polarity mints, and the reset lane clears.
+    let witness =
+        VerdictWitness::from_resolved_ack(&rio_proto::types::ReportAttemptOutcomeResponse {
+            attempt_resolved: true,
+        })
+        .expect("a resolved ack mints the witness");
+    streaks.note_resolution(&key, "drv-res", witness);
+    assert!(
+        !streaks.respawn_blocked(&key, "drv-res", probe),
+        "a resolving ack resets immediately — the breaker never taxes \
+         a real verdict"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────

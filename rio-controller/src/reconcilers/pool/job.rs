@@ -457,8 +457,10 @@ pub(super) async fn reap_excess_pending(
         return 0;
     }
     // One best-effort view read per tick-with-deletions (never per Job)
-    // for the synthesize-on-delete arm.
-    let open_attempts = open_attempts_best_effort(ctx, pool).await;
+    // for the synthesize-on-delete arm (this path consumes only the
+    // open half; the death classification consuming `recently_closed`
+    // is the terminal reap's, in `reap_stale_for_intents`).
+    let open_attempts = open_attempts_best_effort(ctx, pool).await.attempts;
     let mut reaped = 0u32;
     for job in excess {
         let job_name = job.metadata.name.as_deref().unwrap_or("<unnamed>");
@@ -593,6 +595,12 @@ pub(super) fn synthesized_report_for_job(
 /// is a destructive Dead-reap where fail-closed means *skip*; this
 /// consumer is a report where the proto posture governs (RULED
 /// S2-OQ4, 2026-06-09 — do not "fix" either site to match the other).
+/// The merged_bug_080(2b) respawn-reset gate
+/// (`candidate::VerdictWitness::from_recently_closed_build`) is a
+/// THIRD posture, also deliberate: UNSPECIFIED does NOT mint there —
+/// fail-closed for a spend-enabling lane, the inverse of this
+/// classifier's report posture; the same S2-OQ4 do-not-unify rule
+/// covers all three sites.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MintedPullIdentity {
     /// `executor_id == intent_id` and kind ∈ {BUILD, UNSPECIFIED}.
@@ -626,7 +634,12 @@ impl MintedPullIdentity {
         MintedPullIdentity::Foreign
     }
 
-    fn of(a: &rio_proto::types::OpenAttempt) -> Self {
+    /// Classify one served open attempt (the wire shape). `pub(super)`
+    /// so the merged_bug_080(2b) witness mint
+    /// (`candidate::VerdictWitness::from_open_build_attempt`) speaks
+    /// the same classifier as every reap/synthesis owner check ---
+    /// single-sourced kind/shape law.
+    pub(super) fn of(a: &rio_proto::types::OpenAttempt) -> Self {
         Self::classify(&a.executor_id, &a.intent_id, a.attempt_kind)
     }
 }
@@ -736,15 +749,26 @@ pub(super) fn synthesized_report_for_intent(
 /// consume (bug_028 futility breaker: a terminal reap whose delete
 /// carried NO acked report is a VERDICT-FREE death; the same-named
 /// respawn would otherwise fire at reconcile cadence forever).
+/// merged_bug_080(2b): an ACK alone is not verdict presence — the
+/// scheduler Ok-acks charge-free on at least four arms (no matching
+/// attempt, exec-less synthesized refusal, materialization-kind
+/// refusal, stale resubmit cycle) and the retired empty response could
+/// not distinguish; the wire now carries `attempt_resolved` and the
+/// alphabet splits on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SynthesizedDelete {
-    /// An open attempt covered the Job and the synthesized terminal
-    /// report was ACKED before the delete — the scheduler holds a
-    /// verdict for this intent.
-    ReportAcked {
-        /// The intent the acked verdict classified.
+    /// The synthesized report was acked with `attempt_resolved=true` —
+    /// the scheduler RESOLVED an attempt with it (applied the
+    /// classification or matched an already-recorded terminal one):
+    /// a verdict exists for this intent.
+    ReportedVerdict {
+        /// The intent the resolved verdict classified.
         intent_id: String,
     },
+    /// The report was acknowledged CHARGE-FREE
+    /// (`attempt_resolved=false`): the RPC succeeded but the scheduler
+    /// holds NO verdict — an empty ack cannot witness its own premise.
+    AckedNoAttempt,
     /// An open attempt covered the Job but the report RPC failed; the
     /// establishment sweep is the fallback classifier — NO verdict
     /// yet.
@@ -773,10 +797,14 @@ pub(super) enum SynthesizedDelete {
 /// dropped — no current call site reads it); the Ok payload reports
 /// what the synthesize arm did (see [`SynthesizedDelete`]).
 ///
-/// An ACKED synthesized report is a named resolution for the bug_028
-/// futility breaker (`SpawnResolution::TerminalReport`): the record
-/// for `key` clears here, at the single chokepoint every controller
-/// Job-delete call site speaks through.
+/// An acked synthesized report carrying `attempt_resolved=true` is a
+/// named resolution for the bug_028 futility breaker
+/// (`SpawnResolution::TerminalReport`): the record for `key` clears
+/// here, at the single chokepoint every controller Job-delete call
+/// site speaks through. A charge-free ack (`attempt_resolved=false`)
+/// witnesses nothing and resets nothing — merged_bug_080(2b); the
+/// witness mint is `candidate::VerdictWitness::from_resolved_ack`.
+// r[impl ctrl.pool.respawn-backoff]
 // r[impl ctrl.job.synthesize-on-delete+2]
 #[allow(clippy::too_many_arguments)] // the build_job precedent: reconcile plumbing, not an API
 pub(super) async fn delete_job_with_synthesized_report(
@@ -795,17 +823,26 @@ pub(super) async fn delete_job_with_synthesized_report(
         let exec_id = request.exec_id.clone();
         let intent_id = request.intent_id.clone();
         match admin_call(ctx.admin.clone().report_attempt_outcome(request)).await {
-            Ok(_) => {
-                synthesized = SynthesizedDelete::ReportAcked {
-                    intent_id: intent_id.clone(),
-                };
-                ctx.exhausted_streak.lock().note_resolution(
-                    key,
-                    &intent_id,
-                    super::candidate::SpawnResolution::TerminalReport,
-                );
+            Ok(resp) => {
+                let resp = resp.into_inner();
+                // merged_bug_080(2b): split the verdict-presence
+                // alphabet on the wire bit — only a RESOLVING ack
+                // mints the reset witness; a charge-free ack leaves
+                // any respawn record standing (the same-tick wipe
+                // died here).
+                if let Some(witness) = super::candidate::VerdictWitness::from_resolved_ack(&resp) {
+                    synthesized = SynthesizedDelete::ReportedVerdict {
+                        intent_id: intent_id.clone(),
+                    };
+                    ctx.exhausted_streak
+                        .lock()
+                        .note_resolution(key, &intent_id, witness);
+                } else {
+                    synthesized = SynthesizedDelete::AckedNoAttempt;
+                }
                 info!(
                     job = %job_name, exec_id = %exec_id, reason = ?reason,
+                    attempt_resolved = resp.attempt_resolved,
                     "synthesized ReportAttemptOutcome for open pull-mode attempt before Job deletion"
                 );
                 // OA1: the synthesized path closes the terminal→report
@@ -852,17 +889,21 @@ pub(super) async fn delete_job_with_synthesized_report(
     jobs_api.delete(job_name, params).await.map(|_| synthesized)
 }
 
-/// Best-effort read of the open pull-mode attempt view for the
-/// synthesize-on-delete arm of the C1/C2 reap paths. `&[]` (empty) when
-/// the view is unavailable this tick — callers proceed with the plain
-/// delete; the establishment sweep is the fallback classifier. The
+/// Best-effort read of the FULL pull-mode attempt view (open attempts
+/// AND the `recently_closed` window) for the C1/C2 reap paths. Empty
+/// view when unavailable this tick — callers proceed with the plain
+/// delete; the establishment sweep is the fallback classifier.
+/// merged_bug_080(2b): the `recently_closed` half was previously
+/// discarded here, so the reap's death classification could not see
+/// that a worker-closed death was already adjudicated — return the
+/// whole response so the classification consults both halves. The
 /// orphan-Running reap (C3) does NOT use this: its read is fail-closed
 /// (`reap_orphan_running` skips the whole reap on error) because there
 /// the view is a busy-signal input, not just attribution.
 pub(super) async fn open_attempts_best_effort(
     ctx: &Ctx,
     pool: &str,
-) -> Vec<rio_proto::types::OpenAttempt> {
+) -> rio_proto::types::ListOpenAttemptsResponse {
     match admin_call(
         ctx.admin
             .clone()
@@ -870,13 +911,13 @@ pub(super) async fn open_attempts_best_effort(
     )
     .await
     {
-        Ok(resp) => resp.into_inner().attempts,
+        Ok(resp) => resp.into_inner(),
         Err(e) => {
             debug!(
                 pool, error = %e,
                 "ListOpenAttempts unavailable; deleting without synthesized reports this tick"
             );
-            Vec::new()
+            rio_proto::types::ListOpenAttemptsResponse::default()
         }
     }
 }
@@ -1262,15 +1303,27 @@ pub(super) async fn cancel_closed_attempt_jobs(
     // replica's attempt, not build progress, and never resets). This
     // is the one per-tick view read the cancel arm already pays for;
     // the noting is map-existing-only and cheap.
+    // r[impl ctrl.pool.respawn-backoff]
     {
         let mut streaks = ctx.exhausted_streak.lock();
         for a in &open_attempts {
-            if MintedPullIdentity::of(a) == MintedPullIdentity::Build {
-                streaks.note_resolution(
-                    key,
-                    &a.intent_id,
-                    super::candidate::SpawnResolution::Established,
-                );
+            if let Some(witness) = super::candidate::VerdictWitness::from_open_build_attempt(a) {
+                streaks.note_resolution(key, &a.intent_id, witness);
+            }
+        }
+        // merged_bug_080(2b) mint 4: a recently-closed BUILD attempt
+        // is equally a named resolution — the scheduler ADJUDICATED a
+        // worker-closed death whose close outran the controller's
+        // terminal reap (pre-fix this window was fetched and never
+        // consulted; healthy adjudicated retries were taxed). The
+        // witness mint carries the fail-closed kind gate: UNSPECIFIED
+        // and MATERIALIZATION do not mint (the deliberate INVERSE of
+        // `MintedPullIdentity`'s UNSPECIFIED-reads-as-Build report
+        // posture — RULED S2-OQ4; see both sites before "fixing"
+        // either to match the other).
+        for c in &resp.recently_closed {
+            if let Some(witness) = super::candidate::VerdictWitness::from_recently_closed_build(c) {
+                streaks.note_resolution(key, &c.intent_id, witness);
             }
         }
     }
@@ -1909,14 +1962,21 @@ pub(super) async fn report_terminated_pods(
         ))
         .await
         {
-            Ok(_) => {
-                // bug_028 futility breaker reset lane: the acked
-                // pod-terminal classification fill is a verdict.
-                if !intent_id_for_breaker.is_empty() {
+            Ok(resp) => {
+                // bug_028 futility breaker reset lane: the pod-terminal
+                // classification fill is a verdict ONLY when the
+                // scheduler resolved an attempt with it
+                // (merged_bug_080(2b): a charge-free ack witnesses
+                // nothing and resets nothing).
+                // r[impl ctrl.pool.respawn-backoff]
+                if !intent_id_for_breaker.is_empty()
+                    && let Some(witness) =
+                        super::candidate::VerdictWitness::from_resolved_ack(&resp.into_inner())
+                {
                     ctx.exhausted_streak.lock().note_resolution(
                         key,
                         &intent_id_for_breaker,
-                        super::candidate::SpawnResolution::TerminalReport,
+                        witness,
                     );
                 }
                 // OA1 interval (i): Pod terminal-condition timestamp →
@@ -2018,16 +2078,23 @@ pub(super) async fn report_deadline_exceeded_jobs(
         ))
         .await
         {
-            Ok(_) => {
-                // bug_028 futility breaker reset lane: the acked
-                // DeadlineExceeded fill is a verdict.
+            Ok(resp) => {
+                // bug_028 futility breaker reset lane: the
+                // DeadlineExceeded fill is a verdict ONLY when the
+                // scheduler resolved an attempt with it. THIS is where
+                // the merged_bug_080 same-tick wipe died: a deadline
+                // report for a never-pulled Job (no attempt) acks
+                // `attempt_resolved=false` and resets nothing — the
+                // record the same-tick reap just stepped survives.
+                // r[impl ctrl.pool.respawn-backoff]
                 let intent_id = report_intent_id_for_job(job);
-                if !intent_id.is_empty() {
-                    ctx.exhausted_streak.lock().note_resolution(
-                        key,
-                        &intent_id,
-                        super::candidate::SpawnResolution::TerminalReport,
-                    );
+                if !intent_id.is_empty()
+                    && let Some(witness) =
+                        super::candidate::VerdictWitness::from_resolved_ack(&resp.into_inner())
+                {
+                    ctx.exhausted_streak
+                        .lock()
+                        .note_resolution(key, &intent_id, witness);
                 }
                 // OA1 interval (i): the Job's Failed/DeadlineExceeded
                 // condition transition → report acked, sampled once

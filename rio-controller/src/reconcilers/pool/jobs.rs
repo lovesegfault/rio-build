@@ -420,7 +420,7 @@ pub(super) async fn report_no_eligible_source(
     ctx: &Ctx,
     pool: &str,
     gated: &[&SpawnIntent],
-) -> Vec<String> {
+) -> Vec<(String, candidate::VerdictWitness)> {
     let mut acked = Vec::new();
     for intent in gated {
         match admin_call(ctx.admin.clone().report_attempt_outcome(
@@ -438,7 +438,7 @@ pub(super) async fn report_no_eligible_source(
         ))
         .await
         {
-            Ok(_) => {
+            Ok(resp) => {
                 warn!(
                     pool,
                     intent_id = %intent.intent_id,
@@ -446,7 +446,15 @@ pub(super) async fn report_no_eligible_source(
                     "every spawnable node is excluded for this intent; reported NoEligibleSource \
                      instead of spawning an unschedulable Job"
                 );
-                acked.push(intent.intent_id.clone());
+                // merged_bug_080(2b): mint the reset witness AT the
+                // ack — the poison lane's premise is the completed
+                // RPC itself (`attempt_resolved` is false by design
+                // on every NoEligibleSource arm; see the mint's doc).
+                // r[impl ctrl.pool.respawn-backoff]
+                acked.push((
+                    intent.intent_id.clone(),
+                    candidate::VerdictWitness::from_acked_no_eligible_source(&resp.into_inner()),
+                ));
             }
             Err(e) => {
                 warn!(
@@ -918,13 +926,11 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         // bug_028 futility breaker reset lane: an ACKED poison verdict
         // is a named resolution — the scheduler now holds the verdict,
         // so the intent's verdict-free-respawn record (if any) clears.
+        // The witness was minted at the ack site (merged_bug_080(2b)).
+        // r[impl ctrl.pool.respawn-backoff]
         let mut streaks = ctx.exhausted_streak.lock();
-        for intent_id in &acked {
-            streaks.note_resolution(
-                &streak_key,
-                intent_id,
-                candidate::SpawnResolution::NoEligibleSource,
-            );
+        for (intent_id, witness) in acked {
+            streaks.note_resolution(&streak_key, &intent_id, witness);
         }
     }
     // Headroom truncate AFTER the gate, over spawnable intents only.
@@ -1199,12 +1205,14 @@ fn intent_suffix(intent_id: &str) -> String {
 ///
 /// bug_028 futility breaker: the TERMINAL arm is the verdict-free-
 /// death observation point — a terminal Job reaped for a still-wanted
-/// intent whose delete carried NO acked synthesized report means the
-/// scheduler holds no verdict and the same-named respawn would
-/// otherwise fire this very tick (the reap exists to clear the
-/// NameCollision window). The death is noted BEFORE the spawn pass
-/// runs, so the backoff gates the respawn immediately. The orphan-
-/// pending arm reaps UN-wanted intents (no respawn follows) and the
+/// intent with NO verdict anywhere (the delete's report was not
+/// RESOLVED by the scheduler, and neither an open nor a
+/// recently-closed BUILD attempt covers the intent —
+/// merged_bug_080(2b)) means the same-named respawn would otherwise
+/// fire this very tick (the reap exists to clear the NameCollision
+/// window). The death is noted BEFORE the spawn pass runs, so the
+/// backoff gates the respawn immediately. The orphan-pending arm
+/// reaps UN-wanted intents (no respawn follows) and the
 /// selector-drift arm reaps never-ran Pending Jobs whose respawn is
 /// the INTENDED re-render — neither is a verdict-free death.
 pub(super) async fn reap_stale_for_intents(
@@ -1231,7 +1239,9 @@ pub(super) async fn reap_stale_for_intents(
     }
     // Lazily fetched once per tick, only if a delete is actually about
     // to happen (the synthesize-on-delete input; best-effort).
-    let mut open_attempts: Option<Vec<rio_proto::types::OpenAttempt>> = None;
+    // merged_bug_080(2b): the FULL view — the death classification
+    // below consults the `recently_closed` half too.
+    let mut attempts_view: Option<rio_proto::types::ListOpenAttemptsResponse> = None;
     for j in existing {
         let Some(jn) = j.metadata.name.as_deref() else {
             continue;
@@ -1266,11 +1276,11 @@ pub(super) async fn reap_stale_for_intents(
             }
             Some(_) => continue,
         };
-        let attempts = match &open_attempts {
-            Some(a) => a,
+        let view = match &attempts_view {
+            Some(v) => v,
             None => {
-                open_attempts = Some(super::job::open_attempts_best_effort(ctx, pool).await);
-                open_attempts.as_ref().expect("just set")
+                attempts_view = Some(super::job::open_attempts_best_effort(ctx, pool).await);
+                attempts_view.as_ref().expect("just set")
             }
         };
         match super::job::delete_job_with_synthesized_report(
@@ -1280,7 +1290,7 @@ pub(super) async fn reap_stale_for_intents(
             jn,
             &params,
             rio_proto::types::AttemptTerminalReason::Reaped,
-            attempts,
+            &view.attempts,
             key,
         )
         .await
@@ -1291,24 +1301,54 @@ pub(super) async fn reap_stale_for_intents(
                     "reaped stale Job blocking re-queued intent respawn"
                 );
                 // bug_028 futility breaker: a terminal reap of a
-                // still-wanted intent with no acked verdict is a
-                // VERDICT-FREE death — step its respawn record so the
-                // same-tick respawn meets the backoff floor. (An
-                // acked report already cleared the record inside the
-                // delete chokepoint — the TerminalReport lane.)
+                // still-wanted intent with no verdict is a VERDICT-FREE
+                // death — step its respawn record so the same-tick
+                // respawn meets the backoff floor. Verdict presence is
+                // the exhaustive merged_bug_080(2b) alphabet (a
+                // resolving ack already cleared the record inside the
+                // delete chokepoint; a charge-free ack proves nothing):
+                // r[impl ctrl.pool.respawn-backoff]
+                let no_verdict_at_delete = match &synthesized {
+                    super::job::SynthesizedDelete::ReportedVerdict { .. } => false,
+                    super::job::SynthesizedDelete::AckedNoAttempt
+                    | super::job::SynthesizedDelete::ReportFailed
+                    | super::job::SynthesizedDelete::NoOpenAttempt => true,
+                };
                 if why == "terminal"
-                    && !matches!(
-                        synthesized,
-                        super::job::SynthesizedDelete::ReportAcked { .. }
-                    )
+                    && no_verdict_at_delete
                     && let Some(intent_id) = super::job::job_intent_id(j)
                     && !intent_id.is_empty()
                 {
-                    ctx.exhausted_streak.lock().note_verdict_free_death(
-                        key,
-                        intent_id,
-                        std::time::Instant::now(),
-                    );
+                    // ...and only when NO open and NO recently-closed
+                    // BUILD attempt covers the intent: a worker-closed
+                    // death the scheduler already adjudicated (the
+                    // close outran the reap) is NOT verdict-free —
+                    // taxing the healthy retry violated the breaker's
+                    // own doc. The kind law is single-sourced in the
+                    // witness mints. Residual (disclosed): a close
+                    // older than the scheduler's recently-closed
+                    // window still reads verdict-free — over-caution
+                    // bounded by the 80 s backoff cap; widening the
+                    // window is scheduler-side.
+                    let covered_by_build = view
+                        .attempts
+                        .iter()
+                        .filter(|a| a.intent_id == intent_id)
+                        .any(|a| candidate::VerdictWitness::from_open_build_attempt(a).is_some())
+                        || view
+                            .recently_closed
+                            .iter()
+                            .filter(|c| c.intent_id == intent_id)
+                            .any(|c| {
+                                candidate::VerdictWitness::from_recently_closed_build(c).is_some()
+                            });
+                    if !covered_by_build {
+                        ctx.exhausted_streak.lock().note_verdict_free_death(
+                            key,
+                            intent_id,
+                            std::time::Instant::now(),
+                        );
+                    }
                 }
                 reaped.insert(jn.to_owned());
             }

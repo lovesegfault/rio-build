@@ -315,20 +315,116 @@ impl Observation {
 /// recovery --- only a named resolution is. The record fields are
 /// private and the only mutators are
 /// [`PoolStreaks::note_verdict_free_death`],
-/// [`PoolStreaks::note_resolution`], and the step's expiry, so a
-/// reset path that bypasses this alphabet does not typecheck.
+/// [`PoolStreaks::note_resolution`], and the step's expiry --- and
+/// `note_resolution` requires a [`VerdictWitness`] (merged_bug_080(2b)),
+/// so a reset path that bypasses this alphabet, OR names a member
+/// without holding its evidence, does not typecheck.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpawnResolution {
-    /// A terminal `ReportAttemptOutcome` for the intent was ACKED
-    /// (controller-synthesized at delete, pod-terminal fill, or
-    /// deadline-exceeded fill) --- the scheduler holds a verdict.
+    /// A terminal `ReportAttemptOutcome` for the intent was acked with
+    /// `attempt_resolved=true` (controller-synthesized at delete,
+    /// pod-terminal fill, or deadline-exceeded fill) --- the scheduler
+    /// RESOLVED an attempt with it. A charge-free ack
+    /// (`attempt_resolved=false`: no matching attempt, exec-less
+    /// synthesized refusal, materialization-kind refusal, stale cycle)
+    /// is NOT this member --- an empty `Ok` cannot witness its own
+    /// premise (merged_bug_080(2b)).
     TerminalReport,
     /// A `NoEligibleSource` poison verdict for the intent was ACKED.
+    /// The ack itself is the premise: the spawn-gate verdict rides its
+    /// own poison lane scheduler-side, never an attempt resolution, so
+    /// every `NoEligibleSource` ack carries `attempt_resolved=false`
+    /// BY DESIGN (the WO-S3-P arm census) --- the bit is deliberately
+    /// not consulted here.
     NoEligibleSource,
     /// An open BUILD pull-mode attempt was observed covering the
     /// intent --- the pull established; the death cycle ended in a
     /// worker actually starting.
     Established,
+    /// A recently-closed BUILD attempt for the intent was observed in
+    /// the ledger view --- the scheduler holds an adjudicated verdict
+    /// for a worker-closed death (the close outran the controller's
+    /// terminal reap).
+    ClosedBuild,
+}
+
+// r[impl ctrl.pool.respawn-backoff]
+/// merged_bug_080(2b): the verdict-evidence witness
+/// [`PoolStreaks::note_resolution`] requires. Constructible ONLY
+/// through the four mint constructors below, each demanding its typed
+/// premise (the field is private), so every reset call site is forced
+/// to hold scheduler-verdict evidence at compile time and
+/// `rg -n 'note_resolution' rio-controller/src` is the complete
+/// reset-lane census --- the compiler generates it.
+///
+/// The four mints, one per [`SpawnResolution`] member:
+/// 1. [`Self::from_resolved_ack`] --- an ack carrying
+///    `attempt_resolved=true`.
+/// 2. [`Self::from_acked_no_eligible_source`] --- a `NoEligibleSource`
+///    ack (the response value proves the RPC completed; the bit is
+///    false by design on every poison arm).
+/// 3. [`Self::from_open_build_attempt`] --- an open attempt the minted
+///    identity classifier (`MintedPullIdentity::of`, job.rs) says is
+///    the intent's own BUILD pull.
+/// 4. [`Self::from_recently_closed_build`] --- a recently-closed entry
+///    whose `attempt_kind` is explicitly BUILD (raw-i32 compare;
+///    UNSPECIFIED and MATERIALIZATION do not mint --- fail-closed for
+///    a spend-enabling lane).
+#[derive(Debug, Clone, Copy)]
+pub struct VerdictWitness(SpawnResolution);
+
+impl VerdictWitness {
+    /// Mint 1: a `ReportAttemptOutcome` ack that RESOLVED an attempt.
+    /// `None` on a charge-free ack --- the caller has nothing to reset
+    /// with (merged_bug_080(2b): the same-tick wipe died here; a
+    /// deadline report for a never-pulled Job acks
+    /// `attempt_resolved=false` and resets nothing).
+    // r[impl ctrl.pool.respawn-backoff]
+    pub fn from_resolved_ack(
+        resp: &rio_proto::types::ReportAttemptOutcomeResponse,
+    ) -> Option<Self> {
+        resp.attempt_resolved
+            .then_some(Self(SpawnResolution::TerminalReport))
+    }
+
+    /// Mint 2: an acked `NoEligibleSource` report. Taking the response
+    /// value (not consulting its bit) is deliberate: the premise is
+    /// "the scheduler acked the poison verdict" --- every poison arm
+    /// returns `attempt_resolved=false` by design (the verdict is not
+    /// an attempt resolution), and requiring the response makes the
+    /// mint unreachable before the RPC completes.
+    // r[impl ctrl.pool.respawn-backoff]
+    pub fn from_acked_no_eligible_source(
+        _ack: &rio_proto::types::ReportAttemptOutcomeResponse,
+    ) -> Self {
+        Self(SpawnResolution::NoEligibleSource)
+    }
+
+    /// Mint 3: an open attempt that is the intent's own minted BUILD
+    /// pull identity. `None` for materialization claims, foreign
+    /// shapes, and unknown kinds --- a store replica's attempt is not
+    /// build progress and never resets.
+    // r[impl ctrl.pool.respawn-backoff]
+    pub fn from_open_build_attempt(attempt: &rio_proto::types::OpenAttempt) -> Option<Self> {
+        (super::job::MintedPullIdentity::of(attempt) == super::job::MintedPullIdentity::Build)
+            .then_some(Self(SpawnResolution::Established))
+    }
+
+    /// Mint 4: a recently-closed BUILD attempt. Raw-i32 compare
+    /// against the explicit BUILD value: UNSPECIFIED and
+    /// MATERIALIZATION DO NOT mint --- fail-closed for a spend-enabling
+    /// lane. This is the deliberate INVERSE of `MintedPullIdentity`'s
+    /// UNSPECIFIED-reads-as-Build REPORT posture (RULED S2-OQ4,
+    /// 2026-06-09): a report attribution must be total over the
+    /// rolling-skew window, while enabling respawn spend on a
+    /// pre-field scheduler's default would convert skew into money ---
+    /// do not "fix" either site to match the other (the cross-reference
+    /// lives at both).
+    // r[impl ctrl.pool.respawn-backoff]
+    pub fn from_recently_closed_build(closed: &rio_proto::types::ClosedAttempt) -> Option<Self> {
+        (closed.attempt_kind == rio_proto::types::AttemptKind::Build as i32)
+            .then_some(Self(SpawnResolution::ClosedBuild))
+    }
 }
 
 /// bug_075: the per-intent evidence-state alphabet the spawn decision
@@ -658,7 +754,12 @@ impl PoolStreaks {
     /// ONLY reset lane (see [`SpawnResolution`]). Removes the record:
     /// the scheduler holds (or just produced) a verdict, so the next
     /// death cycle starts fresh and a healthy retry is never taxed.
-    pub fn note_resolution(&mut self, pool: &PoolKey, intent: &str, what: SpawnResolution) {
+    /// merged_bug_080(2b): the [`VerdictWitness`] parameter makes a
+    /// premise-free reset a compile error --- every caller must mint
+    /// the witness at one of the four evidence sites first.
+    // r[impl ctrl.pool.respawn-backoff]
+    pub fn note_resolution(&mut self, pool: &PoolKey, intent: &str, witness: VerdictWitness) {
+        let VerdictWitness(what) = witness;
         if self
             .respawn
             .remove(&(pool.clone(), intent.to_owned()))
