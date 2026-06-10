@@ -3481,7 +3481,7 @@ mod tests {
         let on_subst = progress_results(&frames, aids.subst).len();
         assert_eq!(
             on_subst, 1,
-            "consumers keyed on the actSubstitute aid see zero progress              (the relay rides only the copy child)"
+            "consumers keyed on the actSubstitute aid see zero progress (the relay rides only the copy child)"
         );
     }
 
@@ -3533,7 +3533,7 @@ mod tests {
         assert_eq!(
             copy_start.get(1),
             Some(&FVal::Str(uri.to_string())),
-            "the copy START frame's `from` field must carry the first              sourced tick's upstream URI (got {copy_start:?})"
+            "the copy START frame's `from` field must carry the first sourced tick's upstream URI (got {copy_start:?})"
         );
     }
 
@@ -3646,7 +3646,7 @@ mod tests {
                 .any(|fields| fields.first() == Some(&FVal::Int(100)));
             assert!(
                 completing,
-                "pair closed with `done < expected` and no completing                  resProgress on aid {aid} — the terminal outcome is the                  completion proof and must fill the bar (the live                  partial/empty-bar shape)"
+                "pair closed with `done < expected` and no completing resProgress on aid {aid} — the terminal outcome is the completion proof and must fill the bar (the live partial/empty-bar shape)"
             );
         }
     }

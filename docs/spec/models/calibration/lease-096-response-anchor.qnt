@@ -80,6 +80,8 @@ module leaseCalib096ResponseAnchor {
     // bughunt-4 S2 planes, frozen here (HOLDER_EVIDENCE_LOSE = false,
     // MAX_STEP_DOWNS = 0 in this pin's import):
     conflictDeferredV' = conflictDeferredV,
+      deferralResolvedV' = deferralResolvedV,
+      staleExhaustedLose' = staleExhaustedLose,
     blindConflictLose' = blindConflictLose,
     acquireInstV' = acquireInstV,
     stepDownReqV' = stepDownReqV,

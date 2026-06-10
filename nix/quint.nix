@@ -1522,8 +1522,10 @@ rec {
     # the lose edge. neverDual re-verifies under the asymmetric
     # margin; boundedDualLeadership prices the new mid-deferral dual
     # shape (the deferral resolves or fences on the PRE-409 budget).
-    # The paired pin is quint-lease-calib-085-blind-conflict-lose
-    # (the immediate-lose world falsifies the headline).
+    # The paired pins: quint-lease-calib-085-blind-conflict-lose
+    # (the immediate-lose world falsifies the headline) and
+    # quint-lease-calib-002-stale-deferral (the no-clear deferral
+    # world falsifies noStaleExhaustedLose).
     # Measured (tttt duty, gating backend): TLC-exhaustive
     # 1,066,069,779 generated / 241,853,458 distinct / depth 47 in
     # 21m38s under a concurrent sibling-regime run (re-measured at
@@ -1793,6 +1795,26 @@ rec {
       spec = "calibration/lease-085-blind-conflict-lose";
       main = "leaseCalib085BlindConflictLose";
       witness = "loseRequiresHolderEvidence";
+      step = "calibStep";
+      extraSpecs = [ "leaderElection" ];
+    };
+
+    # merged_bug_002 pre-fix (bughunt-5 S8): the resolving completed
+    # read and the fence lose edge KEEP the 409-deferral latch (the
+    # loop-local world cleared only by the Completed match arms), so a
+    # later believing 409 exhausts on a stale latch — the spurious
+    # failover. The pin swaps fetchObservesOwnCommit and selfFence for
+    # no-clear variants and expects noStaleExhaustedLose to violate;
+    # it is the wired falsify twin (quint-policy P1) for the live
+    # holder-evidence regime's noStaleExhaustedLose, and the
+    # non-vacuity evidence that the model still reaches the
+    # stale-deferral class. Falsified by simulation in ~21s at 20k
+    # samples (seed 0xb002) pre-wiring.
+    quint-lease-calib-002-stale-deferral = mkQuintWitnessCheck {
+      name = "lease-calib-002-stale-deferral";
+      spec = "calibration/lease-002-stale-deferral";
+      main = "leaseCalib002StaleDeferral";
+      witness = "noStaleExhaustedLose";
       step = "calibStep";
       extraSpecs = [ "leaderElection" ];
     };
