@@ -79,7 +79,9 @@ pub struct BigFile {
 pub enum SymlinkResolution<'a> {
     /// Resolves to a regular file with this expected content.
     File(&'a FileSpec),
-    /// Resolution revisits a symlink — dereferencing must give ELOOP.
+    /// Dereferencing must give ELOOP: resolution revisits a symlink
+    /// (a true cycle) or traverses more than MAXSYMLINKS=40 links (the
+    /// kernel's depth limit — a finite chain can still ELOOP).
     Loop,
     /// Target does not exist in the tree — dereferencing must give
     /// ENOENT.
@@ -136,15 +138,80 @@ impl Manifest {
         groups
     }
 
+    /// Groups of content-identical directories (≥ 2 members) — paths
+    /// the content-addressed store dedups onto one Directory body. The
+    /// walker checks need them twice: as the vacuity guard (a fixture
+    /// without aliased dirs cannot cover directory-identity bugs) and
+    /// as the lookup targets that force the kernel to re-parent a
+    /// shared dentry (the GNU fts ENOENT escape).
+    pub fn alias_dir_groups(&self) -> Vec<Vec<&str>> {
+        let mut by_sig: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+        for dir in &self.dirs {
+            by_sig
+                .entry(self.dir_signature(dir))
+                .or_default()
+                .push(dir.as_str());
+        }
+        let mut groups: Vec<Vec<&str>> = by_sig.into_values().filter(|g| g.len() >= 2).collect();
+        // Deterministic order for error messages and tests (members
+        // already follow manifest order).
+        groups.sort_by_key(|g| g[0]);
+        groups
+    }
+
+    /// Canonical content signature of a directory: the recursive
+    /// (name, kind, content) shape a content-addressed store keys its
+    /// Directory bodies on. Equal signatures ⇒ the castore serves the
+    /// two paths from one body.
+    fn dir_signature(&self, dir: &str) -> String {
+        let prefix = format!("{dir}/");
+        let direct = |p: &str| {
+            p.strip_prefix(&prefix)
+                .filter(|rest| !rest.contains('/'))
+                .map(str::to_owned)
+        };
+        let mut parts: Vec<String> = Vec::new();
+        for d in &self.dirs {
+            if let Some(name) = direct(d) {
+                parts.push(format!("d:{name}:{}", self.dir_signature(d)));
+            }
+        }
+        for f in &self.files {
+            if let Some(name) = direct(&f.path) {
+                parts.push(format!("f:{name}:{}:{}", f.executable, f.content));
+            }
+        }
+        for s in &self.symlinks {
+            if let Some(name) = direct(&s.path) {
+                parts.push(format!("l:{name}:{}", s.target));
+            }
+        }
+        if let Some(name) = direct(&self.big_file.path) {
+            parts.push(format!("b:{name}:{}", self.big_file.size));
+        }
+        if self.seq_dir.path == dir {
+            parts.push(format!("s:{}", self.seq_dir.count));
+        }
+        parts.sort();
+        parts.join("\u{1}")
+    }
+
     /// Resolve a symlink within the manifest namespace, following
     /// chained symlinks, to decide what dereferencing it through the
     /// mount must do.
     pub fn resolve_symlink<'a>(&'a self, start: &'a SymlinkSpec) -> SymlinkResolution<'a> {
+        /// The kernel's MAXSYMLINKS: path resolution fails with ELOOP
+        /// after following the 40th symlink, even on a finite chain.
+        const MAX_SYMLINKS: u32 = 40;
         let mut visited = std::collections::HashSet::new();
         let mut link_path = start.path.as_str();
         let mut target = start.target.as_str();
+        let mut hops = 1u32; // `start` itself is the first traversal
         visited.insert(link_path.to_owned());
         loop {
+            if hops > MAX_SYMLINKS {
+                return SymlinkResolution::Loop;
+            }
             // Absolute targets leave the mount namespace; the fixture
             // only uses one, and it points at a nonexistent path.
             if target.starts_with('/') {
@@ -162,6 +229,7 @@ impl Manifest {
                     if !visited.insert(resolved.clone()) {
                         return SymlinkResolution::Loop;
                     }
+                    hops += 1;
                     link_path = next.path.as_str();
                     target = next.target.as_str();
                 }
@@ -199,13 +267,20 @@ mod tests {
         r##"{
             "root_suffix": "-rio-xfstests-dep",
             "fstype": "fuse.rio-castore",
-            "dirs": ["bin", "data", "links"],
+            "dirs": ["bin", "data", "links", "dup-a", "dup-b",
+                     "nest", "nest/p1", "nest/p2", "nest/p1/shared", "nest/p2/shared"],
             "files": [
                 {"path": "bin/tool", "content": "#!/bin/sh\necho tool-ok\n", "executable": true},
                 {"path": "data/tool.sh", "content": "#!/bin/sh\necho tool-ok\n"},
                 {"path": "data/small.txt", "content": "rio-xfstests-small\n"},
                 {"path": "names/café", "content": "nfc-content\n"},
                 {"path": "names/café", "content": "nfd-content\n"}
+                ,{"path": "dup-a/same.txt", "content": "rio-xfstests-dedup\n"},
+                {"path": "dup-b/same.txt", "content": "rio-xfstests-dedup\n"},
+                {"path": "nest/p1/shared/payload.txt", "content": "rio-xfstests-nested-dedup\n"},
+                {"path": "nest/p2/shared/payload.txt", "content": "rio-xfstests-nested-dedup\n"},
+                {"path": "nest/p1/only-p1.txt", "content": "p1-marker\n"},
+                {"path": "nest/p2/only-p2.txt", "content": "p2-marker\n"}
             ],
             "symlinks": [
                 {"path": "links/rel", "target": "../data/small.txt"},
@@ -250,8 +325,28 @@ mod tests {
     #[test]
     fn generic_002_expected_node_count_arithmetic() {
         let m: Manifest = serde_json::from_str(fixture_json()).unwrap();
-        // 1 root + 3 dirs + 5 files + 5 symlinks + 200 seq + 1 big.
-        assert_eq!(m.expected_node_count(), 215);
+        // 1 root + 10 dirs + 11 files + 5 symlinks + 200 seq + 1 big.
+        assert_eq!(m.expected_node_count(), 228);
+    }
+
+    /// Alias-group derivation feeds the directory-identity walker
+    /// checks: it must find exactly the content-identical directory
+    /// sets (and never group dirs whose contents differ only by a
+    /// marker file) — a miss makes those checks vacuously green, a
+    /// false group makes them fail healthy mounts.
+    #[test]
+    fn alias_dir_groups_finds_content_identical_dirs() {
+        let m: Manifest = serde_json::from_str(fixture_json()).unwrap();
+        let groups = m.alias_dir_groups();
+        assert_eq!(
+            groups,
+            vec![
+                vec!["dup-a", "dup-b"],
+                vec!["nest/p1/shared", "nest/p2/shared"],
+            ],
+            "expected exactly the dup pair (same parent) and the nested shared pair \
+             (different parents); nest/p1 vs nest/p2 differ by marker files and must NOT group"
+        );
     }
 
     /// Symlink resolution decides which deref errno each check expects
@@ -277,6 +372,41 @@ mod tests {
             m.resolve_symlink(by_path("links/self")),
             SymlinkResolution::Loop
         );
+    }
+
+    /// Symlink-depth classification: a finite chain of 41 links must
+    /// classify as Loop (the kernel ELOOPs past MAXSYMLINKS=40) while
+    /// the 40-link suffix of the same chain resolves. Misclassifying
+    /// either way makes generic/005 assert the wrong errno for the
+    /// chain fixture.
+    #[test]
+    fn generic_005_symlink_depth_limit_classification() {
+        let mut json: serde_json::Value = serde_json::from_str(fixture_json()).unwrap();
+        let links = json["symlinks"].as_array_mut().unwrap();
+        for i in 0..40 {
+            links.push(serde_json::json!({
+                "path": format!("links/chain{i}"),
+                "target": format!("chain{}", i + 1),
+            }));
+        }
+        links.push(serde_json::json!({
+            "path": "links/chain40",
+            "target": "../data/small.txt",
+        }));
+        let m: Manifest = serde_json::from_value(json).unwrap();
+        let by_path = |p: &str| m.symlinks.iter().find(|s| s.path == p).unwrap();
+
+        // chain0 = 41 traversals -> ELOOP by depth, not by cycle.
+        assert_eq!(
+            m.resolve_symlink(by_path("links/chain0")),
+            SymlinkResolution::Loop,
+            "41-deep chain must classify as Loop (kernel MAXSYMLINKS)"
+        );
+        // chain1 = exactly 40 traversals -> resolves.
+        match m.resolve_symlink(by_path("links/chain1")) {
+            SymlinkResolution::File(f) => assert_eq!(f.path, "data/small.txt"),
+            other => panic!("40-deep chain must resolve, got {other:?}"),
+        }
     }
 
     /// NFC and NFD lookalike names must stay distinct byte sequences

@@ -20,6 +20,11 @@
 #   links/dangling    symlink to a nonexistent path
 #   links/loop1+loop2 mutual symlink loop (generic/005 ELOOP)
 #   dup-a,dup-b/same.txt  identical content in two dirs → one shared inode
+#   nest/p1,p2/...    content-identical `shared/` dirs under two DIFFERENT,
+#                     non-identical parents (p1/p2 carry distinct marker
+#                     files). This is the aliased-directory shape behind
+#                     the GNU find fts ENOENT escape: a lookup of one
+#                     alias re-parents the other's dentry mid-walk.
 #
 # `consumer` depends on dep — building it dispatches a real build to a
 # worker whose per-build castore-FUSE mount (the overlay lowerdir)
@@ -80,9 +85,29 @@ let
     ${bb} ln -s loop2 $out/links/loop1
     ${bb} ln -s loop1 $out/links/loop2
 
+    # Finite 41-link chain (chain0 -> ... -> chain40 -> small.txt):
+    # resolving chain0 traverses 41 symlinks, one past the kernel's
+    # MAXSYMLINKS=40, so it must ELOOP even though the chain terminates;
+    # chain1 (40 traversals) must resolve (generic/005 depth leg).
+    i=0
+    while [ $i -lt 40 ]; do
+      ${bb} ln -s chain$((i+1)) $out/links/chain$i
+      i=$((i+1))
+    done
+    ${bb} ln -s ../data/small.txt $out/links/chain40
+
     # Identical content in two directories → content-addressed dedup.
     ${bb} printf 'rio-xfstests-dedup\n' > $out/dup-a/same.txt
     ${bb} printf 'rio-xfstests-dedup\n' > $out/dup-b/same.txt
+
+    # Content-identical shared/ dirs under two distinct parents (the
+    # parents differ via marker files, so only shared/ is deduped).
+    # Exercises directory-inode identity and fts ascent under aliasing.
+    ${bb} mkdir -p $out/nest/p1/shared $out/nest/p2/shared
+    ${bb} printf 'rio-xfstests-nested-dedup\n' > $out/nest/p1/shared/payload.txt
+    ${bb} printf 'rio-xfstests-nested-dedup\n' > $out/nest/p2/shared/payload.txt
+    ${bb} printf 'p1-marker\n' > $out/nest/p1/only-p1.txt
+    ${bb} printf 'p2-marker\n' > $out/nest/p2/only-p2.txt
   '' { };
 in
 {

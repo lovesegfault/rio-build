@@ -23,7 +23,6 @@
 
 use std::ffi::CString;
 use std::fs;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
@@ -31,7 +30,7 @@ use anyhow::{Context, bail, ensure};
 use nix::errno::Errno;
 use nix::libc;
 
-use super::{Ctx, Outcome, readable_plain_file};
+use super::{Ctx, Outcome, cpath, readable_plain_file};
 
 /// One representative path of each node kind, drawn from the manifest:
 /// a plain regular file, a directory, and a symlink.
@@ -52,11 +51,6 @@ fn sample_nodes(
         .map(|s| ctx.on_mount(&s.path))
         .context("manifest has no symlink")?;
     Ok((file, dir, symlink))
-}
-
-/// NUL-terminated copy of a mount path for the raw xattr syscalls.
-fn cpath(path: &Path) -> CString {
-    CString::new(path.as_os_str().as_bytes()).expect("mount path has no NUL")
 }
 
 /// NUL-terminated attribute name.
@@ -186,18 +180,12 @@ pub fn generic_020_062_097_xattr_read_legs(ctx: &Ctx) -> anyhow::Result<Outcome>
         );
 
         // Set/remove (generic/097 write legs): denied at the read-only
-        // boundary. For files and dirs the call reaches the FUSE
-        // write-path deny table, which answers EROFS. For symlinks the
-        // VFS rejects first: xattr_permission forbids `user.*` xattrs on
-        // anything but regular files and directories, returning EPERM
-        // for writes (and ENODATA for reads) before any FS or mount
-        // write check runs. removexattr of a never-present name may also
-        // legitimately surface ENODATA.
-        let denied: &[Errno] = if kind == "symlink" {
-            &[Errno::EPERM]
-        } else {
-            &[Errno::EROFS]
-        };
+        // boundary. setxattr takes mnt_want_write before
+        // xattr_permission, so on the read-only mount EVERY node kind
+        // answers EROFS — including symlinks, whose user.* EPERM
+        // rejection sits behind the mount write check. removexattr of
+        // a never-present name may also legitimately surface ENODATA.
+        let denied: &[Errno] = &[Errno::EROFS];
         match lsetxattr(path, "user.rio-probe", b"x") {
             Ok(()) => bail!(
                 "setxattr on the {kind} {} unexpectedly succeeded on a read-only mount",
@@ -226,7 +214,7 @@ pub fn generic_020_062_097_xattr_read_legs(ctx: &Ctx) -> anyhow::Result<Outcome>
 
 /// A `statx` wrapper requesting STATX_BASIC_STATS, syncing as stat does.
 fn statx_basic(path: &Path, follow: bool) -> anyhow::Result<libc::statx> {
-    let cpath = CString::new(path.as_os_str().as_bytes()).context("mount path has no NUL")?;
+    let c = cpath(path);
     // SAFETY: zeroed statx is a valid initial buffer; the struct is
     // filled by the kernel on success.
     let mut buf: libc::statx = unsafe { std::mem::zeroed() };
@@ -238,7 +226,7 @@ fn statx_basic(path: &Path, follow: bool) -> anyhow::Result<libc::statx> {
     let rc = unsafe {
         libc::statx(
             libc::AT_FDCWD,
-            cpath.as_ptr(),
+            c.as_ptr(),
             flags,
             libc::STATX_BASIC_STATS,
             &mut buf,
@@ -360,6 +348,19 @@ pub fn generic_423_statx_field_correctness(ctx: &Ctx) -> anyhow::Result<Outcome>
             sx.stx_ctime.tv_sec,
             sx.stx_mtime.tv_sec
         );
+        // generic/528 (btime leg): FUSE getattr carries no birth time,
+        // so the kernel normally leaves STATX_BTIME unfilled — but IF a
+        // future change fills it, the only honest value on an immutable
+        // store path is the same canonical epoch+1s as every other
+        // timestamp.
+        if sx.stx_mask & libc::STATX_BTIME != 0 {
+            ensure!(
+                sx.stx_btime.tv_sec == 1,
+                "statx btime of the {kind} {} is {}s, expected the canonical store time of 1s",
+                path.display(),
+                sx.stx_btime.tv_sec
+            );
+        }
     }
     Ok(Outcome::Pass)
 }

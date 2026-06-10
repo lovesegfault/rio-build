@@ -19,11 +19,9 @@
 //!   apply the served root-owned modes to arbitrary uids, not just the
 //!   builder's.
 
-use std::ffi::CStr;
 use std::fs;
 use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use anyhow::{Context, ensure};
@@ -31,92 +29,7 @@ use nix::errno::Errno;
 use nix::libc;
 use nix::unistd::{AccessFlags, eaccess};
 
-use super::{Ctx, Outcome, PrivDrop, expect_errno, readable_plain_file};
-
-/// A `libc` directory stream with RAII `closedir`. Exposes the cookie
-/// primitives (`telldir`/`seekdir`/`rewinddir`) that `std::fs::read_dir`
-/// hides but which the kernel readdir-resume path depends on.
-struct Dir {
-    dirp: *mut libc::DIR,
-    label: String,
-}
-
-impl Dir {
-    fn open(path: &Path) -> anyhow::Result<Self> {
-        let c = std::ffi::CString::new(path.as_os_str().as_bytes())
-            .with_context(|| format!("path {} has an interior NUL", path.display()))?;
-        // SAFETY: `c` is a valid NUL-terminated path for the duration of
-        // the call.
-        let dirp = unsafe { libc::opendir(c.as_ptr()) };
-        ensure!(
-            !dirp.is_null(),
-            "opendir({}) failed: {}",
-            path.display(),
-            io::Error::last_os_error()
-        );
-        Ok(Dir {
-            dirp,
-            label: path.display().to_string(),
-        })
-    }
-
-    /// One raw entry name (including `.`/`..`); `Ok(None)` at clean
-    /// end-of-stream. A NULL return with a non-zero errno is a readdir
-    /// error (e.g. EIO) and fails the check — distinguishing the two is
-    /// the whole point of the garbage-offset probe.
-    fn next_raw(&self) -> anyhow::Result<Option<Vec<u8>>> {
-        Errno::clear();
-        // SAFETY: `self.dirp` is a live stream; the returned dirent is
-        // owned by the stream and only read before the next call.
-        let ent = unsafe { libc::readdir(self.dirp) };
-        if ent.is_null() {
-            let raw = Errno::last_raw();
-            ensure!(
-                raw == 0,
-                "readdir({}) failed: {:?}",
-                self.label,
-                Errno::from_raw(raw)
-            );
-            return Ok(None);
-        }
-        let name = unsafe { CStr::from_ptr((*ent).d_name.as_ptr()) };
-        Ok(Some(name.to_bytes().to_vec()))
-    }
-
-    /// Every real entry name (dots filtered), order-independent.
-    fn names(&self) -> anyhow::Result<std::collections::BTreeSet<Vec<u8>>> {
-        let mut out = std::collections::BTreeSet::new();
-        while let Some(name) = self.next_raw()? {
-            if name != b"." && name != b".." {
-                out.insert(name);
-            }
-        }
-        Ok(out)
-    }
-
-    fn tell(&self) -> libc::c_long {
-        // SAFETY: live stream.
-        unsafe { libc::telldir(self.dirp) }
-    }
-
-    fn seek(&self, loc: libc::c_long) {
-        // SAFETY: live stream; any loc is accepted by the API, the FUSE
-        // resume path is exactly what this exercises.
-        unsafe { libc::seekdir(self.dirp, loc) }
-    }
-
-    fn rewind(&self) {
-        // SAFETY: live stream.
-        unsafe { libc::rewinddir(self.dirp) }
-    }
-}
-
-impl Drop for Dir {
-    fn drop(&mut self) {
-        // SAFETY: `dirp` came from opendir and is closed exactly once.
-        unsafe { libc::closedir(self.dirp) };
-    }
-}
+use super::{Ctx, Outcome, PrivDrop, RawDir, expect_errno, open_raw, readable_plain_file};
 
 /// generic/471: rewinddir resets an open directory stream to the start —
 /// reading it again yields the identical complete listing, and a rewind
@@ -130,7 +43,7 @@ pub fn generic_471_rewinddir(ctx: &Ctx) -> anyhow::Result<Outcome> {
     let expected: std::collections::BTreeSet<Vec<u8>> =
         (1..=count).map(|i| format!("f{i}").into_bytes()).collect();
 
-    let d = Dir::open(&dir)?;
+    let d = RawDir::open(&dir)?;
     let first = d.names()?;
     ensure!(
         first == expected,
@@ -147,9 +60,9 @@ pub fn generic_471_rewinddir(ctx: &Ctx) -> anyhow::Result<Outcome> {
 
     // Rewind after a PARTIAL read must restart from the beginning, not
     // continue from where the partial read stopped.
-    let d2 = Dir::open(&dir)?;
+    let d2 = RawDir::open(&dir)?;
     for _ in 0..count / 2 {
-        d2.next_raw()?;
+        d2.next_entry()?;
     }
     d2.rewind();
     let after_partial = d2.names()?;
@@ -175,13 +88,13 @@ pub fn generic_676_seekdir(ctx: &Ctx) -> anyhow::Result<Outcome> {
 
     // Record the cookie BEFORE each entry, the way an application using
     // telldir/seekdir does.
-    let d = Dir::open(&dir)?;
+    let d = RawDir::open(&dir)?;
     let mut entries: Vec<(libc::c_long, Vec<u8>)> = Vec::new();
     loop {
         let cookie = d.tell();
-        match d.next_raw()? {
+        match d.next_entry()? {
             None => break,
-            Some(name) => entries.push((cookie, name)),
+            Some((name, _)) => entries.push((cookie, name)),
         }
     }
     ensure!(
@@ -195,7 +108,7 @@ pub fn generic_676_seekdir(ctx: &Ctx) -> anyhow::Result<Outcome> {
     for &idx in &probe_indices {
         let (cookie, ref want) = entries[idx];
         d.seek(cookie);
-        let got = d.next_raw()?.with_context(|| {
+        let (got, _) = d.next_entry()?.with_context(|| {
             format!("seekdir to a valid cookie ({cookie}) then readdir hit EOF")
         })?;
         ensure!(
@@ -207,7 +120,7 @@ pub fn generic_676_seekdir(ctx: &Ctx) -> anyhow::Result<Outcome> {
     }
 
     // Garbage / out-of-range cookies: the stream must stay well-behaved.
-    // A bounded drain proves it neither errors (next_raw fails on a
+    // A bounded drain proves it neither errors (next_entry fails on a
     // readdir errno) nor runs forever.
     let cap = usize::try_from(count).expect("count fits usize") + 8;
     for bogus in [
@@ -219,7 +132,7 @@ pub fn generic_676_seekdir(ctx: &Ctx) -> anyhow::Result<Outcome> {
     ] {
         d.seek(bogus);
         let mut seen = 0usize;
-        while d.next_raw()?.is_some() {
+        while d.next_entry()?.is_some() {
             seen += 1;
             ensure!(
                 seen <= cap,
@@ -234,10 +147,11 @@ pub fn generic_676_seekdir(ctx: &Ctx) -> anyhow::Result<Outcome> {
 /// served root-owned 0444/0555 modes for ANY unprivileged uid, not only
 /// the uid that mounted the FUSE. Drops to a second unprivileged
 /// identity (distinct from the build uid the other batteries probe) and
-/// asserts the same view + same EACCES wall: reads and exec of an input
-/// succeed, every mutation is denied. A regression where only the
-/// mount-owner uid is enforced would let a build's helper processes
-/// (which can run under other uids) bypass input protection.
+/// asserts the same view + same denial wall: reads and exec of an input
+/// succeed, `access(W_OK)` answers the DAC EACCES, and every actual
+/// mutation is EROFS-denied by the read-only mount. A regression where
+/// only the mount-owner uid is enforced would let a build's helper
+/// processes (which can run under other uids) bypass input protection.
 pub fn generic_088_second_uid_dac(ctx: &Ctx) -> anyhow::Result<Outcome> {
     ensure!(
         nix::unistd::geteuid().is_root(),
@@ -309,7 +223,10 @@ pub fn generic_088_second_uid_dac(ctx: &Ctx) -> anyhow::Result<Outcome> {
             }
         }
 
-        // Mutations are denied exactly as for the build uid.
+        // Mutations are denied exactly as for the build uid: any
+        // write-mode open hits mnt_want_write's EROFS on the read-only
+        // mount before DAC is even consulted (POSIX-prescribed, same
+        // as ro-tmpfs).
         expect_errno(
             "create a file as the second uid",
             fs::OpenOptions::new()
@@ -317,7 +234,7 @@ pub fn generic_088_second_uid_dac(ctx: &Ctx) -> anyhow::Result<Outcome> {
                 .create_new(true)
                 .open(&new_file)
                 .map(drop),
-            &[Errno::EACCES],
+            &[Errno::EROFS],
         )?;
         expect_errno(
             "open(O_WRONLY|O_TRUNC) an input as the second uid",
@@ -326,7 +243,7 @@ pub fn generic_088_second_uid_dac(ctx: &Ctx) -> anyhow::Result<Outcome> {
                 .truncate(true)
                 .open(&read_path)
                 .map(drop),
-            &[Errno::EACCES],
+            &[Errno::EROFS],
         )?;
     }
 
@@ -454,7 +371,194 @@ pub fn generic_131_read_locks(ctx: &Ctx) -> anyhow::Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// generic/478 + generic/571 (read legs): OFD locks and leases on
+/// read-only input files. OFD (open-file-description) locks are what
+/// modern concurrent tooling uses instead of process-keyed POSIX
+/// locks; like the generic/131 records they must be granted on an
+/// O_RDONLY fd and tracked by the kernel (the daemon has no lock ops),
+/// and a second fd's F_OFD_GETLK must see the conflict with the OFD
+/// marker pid -1. A write OFD lock through a read-only fd is EBADF. A
+/// read lease (F_SETLEASE) on an input must be grantable and visible
+/// via F_GETLEASE — leases are pure VFS state, so anything else means
+/// the kernel thinks the file is open for conflicting writes.
+pub fn generic_478_571_ofd_locks_lease(ctx: &Ctx) -> anyhow::Result<Outcome> {
+    let target = readable_plain_file(ctx)?;
+    let path = ctx.on_mount(&target.path);
+
+    let f1 = fs::File::open(&path).with_context(|| format!("open {} O_RDONLY", target.path))?;
+
+    // OFD read lock on a read-only fd: granted. l_pid must be 0 on set
+    // (the kernel rejects nonzero with EINVAL).
+    let rd = make_flock(libc::F_RDLCK);
+    ensure!(
+        unsafe { libc::fcntl(f1.as_raw_fd(), libc::F_OFD_SETLK, &rd) } == 0,
+        "F_OFD_SETLK F_RDLCK on a read-only fd failed: {}",
+        io::Error::last_os_error()
+    );
+
+    // A second open file description must observe the conflict, with
+    // the OFD marker pid (-1) as the holder.
+    let f2 = fs::File::open(&path)?;
+    let mut query = make_flock(libc::F_WRLCK);
+    ensure!(
+        unsafe { libc::fcntl(f2.as_raw_fd(), libc::F_OFD_GETLK, &mut query) } == 0,
+        "F_OFD_GETLK failed: {}",
+        io::Error::last_os_error()
+    );
+    ensure!(
+        query.l_type == as_short(libc::F_RDLCK),
+        "F_OFD_GETLK on a second fd reported l_type={}, expected the read-lock conflict — \
+         OFD locks are not tracked kernel-locally",
+        query.l_type
+    );
+    ensure!(
+        query.l_pid == -1,
+        "F_OFD_GETLK conflict reported l_pid={}, expected the OFD marker -1",
+        query.l_pid
+    );
+
+    // A write OFD lock through a read-only fd: EBADF from the kernel.
+    let wr = make_flock(libc::F_WRLCK);
+    let r = unsafe { libc::fcntl(f2.as_raw_fd(), libc::F_OFD_SETLK, &wr) };
+    let e = Errno::last();
+    ensure!(
+        r == -1 && e == Errno::EBADF,
+        "F_OFD_SETLK F_WRLCK on a read-only fd returned {r}/{e:?}, expected -1/EBADF"
+    );
+
+    // Release the read lock.
+    let un = make_flock(libc::F_UNLCK);
+    unsafe { libc::fcntl(f1.as_raw_fd(), libc::F_OFD_SETLK, &un) };
+    drop(f2);
+
+    // Read lease: grantable on a file nobody holds open for writing
+    // (nothing on this mount can be), and reported back by F_GETLEASE.
+    ensure!(
+        unsafe { libc::fcntl(f1.as_raw_fd(), libc::F_SETLEASE, libc::F_RDLCK) } == 0,
+        "F_SETLEASE F_RDLCK on a read-only input failed: {} — a read lease on an immutable \
+         file must be grantable",
+        io::Error::last_os_error()
+    );
+    let lease = unsafe { libc::fcntl(f1.as_raw_fd(), libc::F_GETLEASE) };
+    ensure!(
+        lease == libc::F_RDLCK,
+        "F_GETLEASE reported {lease}, expected F_RDLCK"
+    );
+    ensure!(
+        unsafe { libc::fcntl(f1.as_raw_fd(), libc::F_SETLEASE, libc::F_UNLCK) } == 0,
+        "releasing the read lease failed: {}",
+        io::Error::last_os_error()
+    );
+    Ok(Outcome::Pass)
+}
+
+/// generic/637 (small-getdents leg): a directory must enumerate
+/// completely through a fresh fd even when every getdents64 call can
+/// only return a handful of entries — the 200-entry dir through a
+/// 64-byte buffer takes ~100 syscalls, each resuming from the kernel
+/// offset cookie. The lookalike-names dir runs with a 512-byte buffer
+/// (its NAME_MAX entry needs ~280 bytes). Duplicated or skipped
+/// entries on resume are the corruption class; the immutable-fs
+/// visibility half of upstream 637 is moot.
+pub fn generic_637_small_getdents(ctx: &Ctx) -> anyhow::Result<Outcome> {
+    // 200-entry dir, tiny buffer.
+    let seq = ctx.on_mount(&ctx.manifest.seq_dir.path);
+    let names = getdents_names(&seq, 64)?;
+    let expected: std::collections::BTreeSet<Vec<u8>> = (1..=ctx.manifest.seq_dir.count)
+        .map(|i| format!("f{i}").into_bytes())
+        .collect();
+    assert_complete(&seq, &names, &expected)?;
+
+    // Lookalike-names dir (holds a NAME_MAX entry), small buffer.
+    let names_dir = ctx.on_mount("names");
+    let listed = getdents_names(&names_dir, 512)?;
+    let expected: std::collections::BTreeSet<Vec<u8>> = ctx
+        .manifest
+        .files_under("names/")
+        .map(|f| f.path.as_bytes()["names/".len()..].to_vec())
+        .collect();
+    assert_complete(&names_dir, &listed, &expected)?;
+    Ok(Outcome::Pass)
+}
+
 // ─── helpers ───────────────────────────────────────────────────────────
+
+/// Raw getdents64 enumeration of `dir` through a `bufsize`-byte buffer,
+/// returning every entry name (dots excluded).
+fn getdents_names(dir: &Path, bufsize: usize) -> anyhow::Result<Vec<Vec<u8>>> {
+    let fd = open_raw(dir, libc::O_RDONLY | libc::O_DIRECTORY)
+        .with_context(|| format!("open({}, O_DIRECTORY)", dir.display()))?;
+
+    let mut buf = vec![0u8; bufsize];
+    let mut names = Vec::new();
+    loop {
+        // SAFETY: fd is a live directory fd; buf is bufsize bytes.
+        let n = unsafe {
+            libc::syscall(
+                libc::SYS_getdents64,
+                fd.as_raw_fd(),
+                buf.as_mut_ptr(),
+                bufsize,
+            )
+        };
+        ensure!(
+            n >= 0,
+            "getdents64({}, buf={bufsize}) failed: {} — a small buffer must yield a short \
+             batch, not an error",
+            dir.display(),
+            io::Error::last_os_error()
+        );
+        if n == 0 {
+            return Ok(names);
+        }
+        let mut off = 0usize;
+        while off < n as usize {
+            // SAFETY: the kernel wrote a valid dirent64 record at off;
+            // d_name is NUL-terminated within the record.
+            let (name, reclen) = unsafe {
+                let d = buf.as_ptr().add(off).cast::<libc::dirent64>();
+                (
+                    std::ffi::CStr::from_ptr(std::ptr::addr_of!((*d).d_name).cast())
+                        .to_bytes()
+                        .to_vec(),
+                    (*d).d_reclen as usize,
+                )
+            };
+            ensure!(reclen > 0, "getdents64 returned a zero-length record");
+            if name != b"." && name != b".." {
+                names.push(name);
+            }
+            off += reclen;
+        }
+    }
+}
+
+/// The enumeration must be exactly `expected`: no missing entries, no
+/// duplicates, no strays.
+fn assert_complete(
+    dir: &Path,
+    listed: &[Vec<u8>],
+    expected: &std::collections::BTreeSet<Vec<u8>>,
+) -> anyhow::Result<()> {
+    let unique: std::collections::BTreeSet<Vec<u8>> = listed.iter().cloned().collect();
+    ensure!(
+        unique.len() == listed.len(),
+        "{}: small-buffer getdents returned {} entries with duplicates ({} unique) — the \
+         offset resume re-served an entry",
+        dir.display(),
+        listed.len(),
+        unique.len()
+    );
+    ensure!(
+        &unique == expected,
+        "{}: small-buffer getdents listed {} entries, expected {} (missing: {:?})",
+        dir.display(),
+        unique.len(),
+        expected.len(),
+        expected.difference(&unique).take(3).collect::<Vec<_>>()
+    );
+    Ok(())
+}
 
 /// A whole-file `flock` of the given type, anchored at offset 0.
 fn make_flock(l_type: libc::c_int) -> libc::flock {

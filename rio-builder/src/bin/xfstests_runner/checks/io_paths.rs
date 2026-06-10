@@ -24,12 +24,12 @@
 
 use std::fs;
 use std::io;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::FileExt;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::{FileExt, MetadataExt};
 
 use anyhow::{Context, ensure};
 
-use super::{Ctx, Outcome, errno_of, expect_errno, first_divergence};
+use super::{Ctx, Outcome, cpath, errno_of, expect_errno, first_divergence, open_raw};
 use nix::errno::Errno;
 // The raw syscalls (mmap/splice/copy_file_range/SEEK_*) come through
 // nix's libc re-export — their safe nix wrappers sit behind features
@@ -195,6 +195,28 @@ pub fn generic_430_553_copy_file_range(ctx: &Ctx) -> anyhow::Result<Outcome> {
             .context("create cfr dest (O_EXCL)")
     };
 
+    // Error matrix first (generic/434, RO-fs legs): the fd-mode and
+    // fd-type checks fire BEFORE the cross-fs policy, so these must
+    // hold whether or not the data path below answers EXDEV. A
+    // destination fd not open for writing is EBADF; a directory fd on
+    // either side is EISDIR. Tools probing cfr support branch on
+    // exactly these errnos.
+    {
+        let ro_dst = fs::File::open(&big_path)?;
+        expect_errno(
+            "copy_file_range into an O_RDONLY destination",
+            copy_file_range_at(&src, 0, &ro_dst, 4096).map(drop),
+            &[Errno::EBADF],
+        )?;
+        let dir_fd = fs::File::open(ctx.on_mount(&ctx.manifest.seq_dir.path))?;
+        let dst = create_dst()?;
+        expect_errno(
+            "copy_file_range with a directory source",
+            copy_file_range_at(&dir_fd, 0, &dst, 4096).map(drop),
+            &[Errno::EISDIR],
+        )?;
+    }
+
     // Full copy, or the EXDEV fallback contract. EXDEV is a PASS: it is
     // the kernel's ≥5.19 cross-fs policy answer and the errno coreutils'
     // fallback path expects. Anything else is a failure — it would turn
@@ -271,6 +293,166 @@ pub fn generic_430_553_copy_file_range(ctx: &Ctx) -> anyhow::Result<Outcome> {
             "copy_file_range len=0 copied {zero_len} bytes, expected 0"
         );
     }
+    Ok(Outcome::Pass)
+}
+
+/// generic/263 (read-only adaptation of the O_DIRECT fsx): O_DIRECT
+/// reads from the mount must either serve byte-exact content or the
+/// open must fail cleanly with EINVAL ("filesystem does not support
+/// O_DIRECT") — never silent corruption, never a partial-garbage read.
+/// Aligned and offset-window reads compare against the oracle; runs
+/// after the integrity checks so the blob is warm and the read hits
+/// the passthrough/direct path a database-shaped build tool would.
+pub fn generic_263_odirect_read(ctx: &Ctx) -> anyhow::Result<Outcome> {
+    let big = &ctx.manifest.big_file;
+    let big_path = ctx.on_mount(&big.path);
+    let oracle = ctx.manifest.oracle_bytes();
+
+    let fd = match open_raw(&big_path, libc::O_RDONLY | libc::O_DIRECT) {
+        Ok(fd) => fd,
+        Err(e) => {
+            ensure!(
+                e.raw_os_error() == Some(libc::EINVAL),
+                "open(O_DIRECT) on {} failed with {e} — only success or EINVAL (no O_DIRECT \
+                 support) are conformant",
+                big.path
+            );
+            println!("    open(O_DIRECT) → EINVAL (not supported on this mount; conformant)");
+            return Ok(Outcome::Pass);
+        }
+    };
+
+    // O_DIRECT demands aligned buffer, offset, and length.
+    #[repr(C, align(4096))]
+    struct Aligned([u8; 64 * 1024]);
+    let mut buf = Box::new(Aligned([0u8; 64 * 1024]));
+
+    for off in [0u64, 512 * 1024] {
+        let mut got = 0usize;
+        while got < buf.0.len() {
+            // SAFETY: fd is live; the remaining slice is in bounds and
+            // keeps the kernel-required alignment (got advances in
+            // block-sized steps for O_DIRECT short reads).
+            let n = unsafe {
+                libc::pread(
+                    fd.as_raw_fd(),
+                    buf.0[got..].as_mut_ptr().cast(),
+                    buf.0.len() - got,
+                    (off as i64) + (got as i64),
+                )
+            };
+            ensure!(
+                n >= 0,
+                "O_DIRECT pread at {} failed: {}",
+                off + got as u64,
+                io::Error::last_os_error()
+            );
+            if n == 0 {
+                break;
+            }
+            got += n as usize;
+        }
+        ensure!(
+            got == buf.0.len(),
+            "O_DIRECT read window at {off} returned {got} bytes, expected {}",
+            buf.0.len()
+        );
+        let want = &oracle[off as usize..off as usize + buf.0.len()];
+        ensure!(
+            buf.0[..] == *want,
+            "O_DIRECT read window at {off} differs from the oracle at offset {:?}",
+            first_divergence(want, &buf.0)
+        );
+    }
+    Ok(Outcome::Pass)
+}
+
+/// generic/467 (+426/477/756/777 refusal contract): file-handle
+/// export from the mount. `name_to_handle_at` either fails with
+/// exactly EOPNOTSUPP (no export support — the errno backup tools
+/// recognize) or succeeds; a successful handle re-opened via
+/// `open_by_handle_at` must resolve to the SAME (dev,ino) — a handle
+/// silently resolving to a different inode would feed a backup tool
+/// the wrong content. ESTALE on re-open is conformant (the inode may
+/// have left the dcache and the daemon has no export lookup).
+pub fn generic_467_open_by_handle(ctx: &Ctx) -> anyhow::Result<Outcome> {
+    let plain = super::readable_plain_file(ctx)?;
+    let path = ctx.on_mount(&plain.path);
+
+    #[repr(C)]
+    struct FileHandle {
+        handle_bytes: libc::c_uint,
+        handle_type: libc::c_int,
+        f_handle: [u8; 128],
+    }
+    let mut fh = FileHandle {
+        handle_bytes: 128,
+        handle_type: 0,
+        f_handle: [0; 128],
+    };
+    let mut mount_id: libc::c_int = 0;
+    let c = cpath(&path);
+    // SAFETY: valid C path and out-pointers sized as declared.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_name_to_handle_at,
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            std::ptr::addr_of_mut!(fh),
+            std::ptr::addr_of_mut!(mount_id),
+            0,
+        )
+    };
+    if rc != 0 {
+        let e = Errno::last();
+        ensure!(
+            e == Errno::EOPNOTSUPP,
+            "name_to_handle_at({}) failed with {e:?} — only success or EOPNOTSUPP are \
+             conformant",
+            plain.path
+        );
+        println!("    name_to_handle_at → EOPNOTSUPP (no export support; conformant)");
+        return Ok(Outcome::Pass);
+    }
+
+    // The handle exists; re-opening it must give the same inode (or a
+    // clean ESTALE — the daemon advertises no export lookup, so a
+    // dcache miss cannot be served).
+    let want = fs::symlink_metadata(&path)?;
+    let mount_fd = fs::File::open(&ctx.mount)?;
+    // SAFETY: live mount fd and the handle filled in above.
+    let opened = unsafe {
+        libc::syscall(
+            libc::SYS_open_by_handle_at,
+            mount_fd.as_raw_fd(),
+            std::ptr::addr_of_mut!(fh),
+            libc::O_RDONLY,
+        )
+    };
+    if opened < 0 {
+        let e = Errno::last();
+        ensure!(
+            matches!(e, Errno::ESTALE | Errno::EOPNOTSUPP),
+            "open_by_handle_at on a fresh handle failed with {e:?} — expected success, \
+             ESTALE, or EOPNOTSUPP"
+        );
+        println!("    open_by_handle_at → {e:?} (conformant refusal)");
+        return Ok(Outcome::Pass);
+    }
+    // SAFETY: fresh owned fd from the successful syscall.
+    let handle_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(opened as i32) };
+    let got = nix::sys::stat::fstat(&handle_fd)?;
+    ensure!(
+        got.st_ino == want.ino() && got.st_dev == want.dev(),
+        "open_by_handle_at resolved to (dev={}, ino={}), expected {} (dev={}, ino={}) — a \
+         handle must never silently resolve to a different inode",
+        got.st_dev,
+        got.st_ino,
+        plain.path,
+        want.dev(),
+        want.ino()
+    );
+    println!("    file handles round-trip to the same inode");
     Ok(Outcome::Pass)
 }
 

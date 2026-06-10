@@ -410,3 +410,130 @@ fn generic_002_614_nlink_and_blocks() {
     let (_, link) = map.lookup(dir_ino, b"link").expect("symlink resolves");
     assert_eq!(link.nlink, 1, "symlink nlink");
 }
+
+/// The aliased-directory fixture shape behind the GNU fts ENOENT
+/// escape: content-identical `shared/` under two parents that are NOT
+/// identical themselves (distinct marker files keep p1/p2 from
+/// deduping).
+///
+///   hhh-xfstests-nest/p1/shared/payload.txt
+///   hhh-xfstests-nest/p1/only-p1.txt
+///   hhh-xfstests-nest/p2/shared/payload.txt   (identical to p1's)
+///   hhh-xfstests-nest/p2/only-p2.txt
+fn nest_sample() -> (Vec<(String, RootNode)>, Vec<Directory>) {
+    let shared = Directory {
+        directories: vec![],
+        files: vec![file_entry(b"payload.txt", 26, false)],
+        symlinks: vec![],
+    };
+    let shared_digest = dir_digest_of(&shared);
+    let parent = |marker: &[u8]| Directory {
+        directories: vec![DirectoryEntry {
+            name: b"shared".to_vec(),
+            digest: shared_digest.to_vec(),
+            size: 1,
+        }],
+        files: vec![file_entry(marker, 10, false)],
+        symlinks: vec![],
+    };
+    let p1 = parent(b"only-p1.txt");
+    let p2 = parent(b"only-p2.txt");
+    let nest = Directory {
+        directories: vec![
+            DirectoryEntry {
+                name: b"p1".to_vec(),
+                digest: dir_digest_of(&p1).to_vec(),
+                size: 2,
+            },
+            DirectoryEntry {
+                name: b"p2".to_vec(),
+                digest: dir_digest_of(&p2).to_vec(),
+                size: 2,
+            },
+        ],
+        files: vec![],
+        symlinks: vec![],
+    };
+    let roots = vec![dir_root("/nix/store/hhh-xfstests-nest", &nest)];
+    (roots, vec![shared, p1, p2, nest])
+}
+
+/// POSIX forbids two directory paths on one inode (hardlinked-dir
+/// semantics): the kernel keeps ONE dentry per directory inode and
+/// re-parents it on every lookup of a different alias, which GNU fts's
+/// (dev,ino) ascent check turns into a manufactured ENOENT — the bug
+/// that escaped to the data plane. Directory inodes must be per-path
+/// (parent_ino + name), not per-digest.
+#[test]
+fn posix_dir_inodes_are_per_path() {
+    let (roots, dirs) = nest_sample();
+    let map = InoMap::from_parts(&roots, dirs).expect("build tree");
+    let (via_p1, _) =
+        lookup_path(&map, &[b"hhh-xfstests-nest", b"p1", b"shared"]).expect("p1/shared");
+    let (via_p2, _) =
+        lookup_path(&map, &[b"hhh-xfstests-nest", b"p2", b"shared"]).expect("p2/shared");
+    assert_ne!(
+        via_p1, via_p2,
+        "content-identical directories under different parents must be distinct inodes \
+         (hardlinked-dir semantics are POSIX-forbidden and break fts walks)"
+    );
+}
+
+/// POSIX: readdir's `..` entry identifies the PARENT directory and `.`
+/// the directory itself. The pre-fix self-pointing `..` (justified by
+/// "a content-addressed dir has no unique parent") became resolvable
+/// when directory inodes went per-path — and tools like `find -depth`
+/// consume the d_ino of the dots directly.
+#[test]
+fn readdir_dotdot_points_at_parent() {
+    let (roots, dirs) = nest_sample();
+    let map = InoMap::from_parts(&roots, dirs).expect("build tree");
+    let (p1_ino, _) = lookup_path(&map, &[b"hhh-xfstests-nest", b"p1"]).expect("p1");
+    let (shared_ino, _) =
+        lookup_path(&map, &[b"hhh-xfstests-nest", b"p1", b"shared"]).expect("p1/shared");
+
+    let dots: Vec<(Vec<u8>, u64)> = map
+        .readdir(shared_ino, 0)
+        .expect("is a dir")
+        .filter(|e| e.name == b"." || e.name == b"..")
+        .map(|e| (e.name.to_vec(), e.ino))
+        .collect();
+    assert_eq!(dots.len(), 2, "readdir must emit both dot entries");
+    let ino_of = |name: &[u8]| dots.iter().find(|(n, _)| n == name).expect("dot entry").1;
+    assert_eq!(ino_of(b"."), shared_ino, "'.' must be the dir itself");
+    assert_eq!(
+        ino_of(b".."),
+        p1_ino,
+        "'..' of p1/shared must be p1, not a self-pointer"
+    );
+}
+
+/// Hardlink honesty: the same file content reachable at N paths must
+/// either be N distinct inodes (nlink=1 each) or one inode with
+/// st_nlink == N. The deduped-ino-with-nlink-1 combination silently
+/// breaks tar/du/cp, which dedup on (dev,ino,nlink).
+#[test]
+fn deduped_file_nlink_counts_its_paths() {
+    let (roots, dirs) = nest_sample();
+    let map = InoMap::from_parts(&roots, dirs).expect("build tree");
+    let (ino1, attr1) = lookup_path(
+        &map,
+        &[b"hhh-xfstests-nest", b"p1", b"shared", b"payload.txt"],
+    )
+    .expect("p1 payload");
+    let (ino2, attr2) = lookup_path(
+        &map,
+        &[b"hhh-xfstests-nest", b"p2", b"shared", b"payload.txt"],
+    )
+    .expect("p2 payload");
+    if ino1 == ino2 {
+        assert_eq!(
+            attr1.nlink, 2,
+            "one inode reachable at two paths must report st_nlink == 2"
+        );
+        assert_eq!(attr2.nlink, 2);
+    } else {
+        assert_eq!(attr1.nlink, 1);
+        assert_eq!(attr2.nlink, 1);
+    }
+}
