@@ -1324,30 +1324,57 @@ pkgs.testers.runNixOSTest {
             last_done[aid] = done
 
         # Denominator conservation law (gw.activity.subst-progress):
-        # the LAST setExpected{actCopyPath} on the wire equals the
-        # count of actCopyPath activities actually started — a pair
-        # that closes copy-less (zero-fetch/fell-through) retires its
-        # mint at the close chokepoint. Holds in EVERY walk/admission
-        # ordering (the law, not an ordering): a zero-fetch job occurs
-        # only when a concurrent job's reference walk ingests another
-        # job's output first, so pre-fix redness here was
-        # ordering-dependent — the deterministic reds are unit-level
-        # (zero_fetch/fell_through/mixed_closure in rio-gateway); this
-        # line is the real-pipeline witness of the law.
-        # setExpected = result type 106; fields[0]=100 is actCopyPath.
+        # the LAST setExpected{actCopyPath} on the GATEWAY's root
+        # equals the count of GATEWAY copy children actually started —
+        # a pair that closes copy-less (zero-fetch/fell-through)
+        # retires its mint at the close chokepoint. Holds in EVERY
+        # walk/admission ordering (the law, not an ordering): a
+        # zero-fetch job occurs only when a concurrent job's reference
+        # walk ingests another job's output first, so pre-fix redness
+        # here was ordering-dependent — the deterministic reds are
+        # unit-level (zero_fetch/fell_through/mixed_closure in
+        # rio-gateway); this line is the real-pipeline witness of the
+        # law. SCOPED to the gateway's activity family: the ssh-ng
+        # capture interleaves the CLIENT's local activities (its own
+        # copyPath uploads and byte-valued setExpected) with the
+        # forwarded gateway frames, so both sides of the law derive
+        # from the actSubstitute (108) parent edge — type-108 starts
+        # are gateway-only in this flow, their shared parent is the
+        # gateway's actBuilds root, and gateway copy children parent
+        # to a subst aid. setExpected = result type 106; fields[0]=100
+        # is actCopyPath.
+        subst_starts = [
+            e for e in events if e.get("action") == "start" and e.get("type") == 108
+        ]
+        assert subst_starts, "no actSubstitute starts captured"
+        gw_roots = {e.get("parent") for e in subst_starts}
+        assert len(gw_roots) == 1, (
+            f"actSubstitute starts under multiple parents: {gw_roots}"
+        )
+        gw_root = gw_roots.pop()
+        subst_aids = {e["id"] for e in subst_starts}
+        gw_copy_starts = {
+            e["id"]
+            for e in events
+            if e.get("action") == "start"
+            and e.get("type") == 100
+            and e.get("parent") in subst_aids
+        }
         copy_expected = [
             e["fields"][1]
             for e in events
             if e.get("action") == "result"
             and e.get("type") == 106
+            and e.get("id") == gw_root
             and e.get("fields")
             and e["fields"][0] == 100
         ]
-        assert copy_expected, "no setExpected(actCopyPath) events captured"
-        assert copy_expected[-1] == len(copy_starts), (
+        assert copy_expected, "no setExpected(actCopyPath) on the gateway root"
+        assert copy_expected[-1] == len(gw_copy_starts), (
             f"denominator must converge to started copies: last "
             f"setExpected(actCopyPath)={copy_expected[-1]} != "
-            f"{len(copy_starts)} copy starts (sequence: {copy_expected})"
+            f"{len(gw_copy_starts)} gateway copy starts "
+            f"(sequence: {copy_expected})"
         )
         print(
             f"substitute-progress-e2e PASS: "
