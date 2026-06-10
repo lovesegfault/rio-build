@@ -137,6 +137,24 @@ const N_LAMBDA_DAY_SECS: f64 = 86400.0;
 /// the 3h price halflife smooths sub-tick granularity.
 pub const POLL_INTERVAL_SECS: u64 = 600;
 
+/// The cost edge-reload retry envelope (merged_bug_046 second axis;
+/// the `sched.sla.cost-leader-edge-reload+1` bound, an R17 typed time
+/// envelope): after a FAILED false→true leader-edge reload,
+/// [`interrupt_housekeeping`] re-attempts the reload within this many
+/// seconds — per failure, chain-total (every
+/// [`PreludeOutcome::ReloadFailed`] re-arms the retry, including one
+/// produced by a retry-initiated prelude) — instead of deferring to
+/// the next [`POLL_INTERVAL_SECS`] tick. Derivation: the reload is one
+/// PG read; 30s clears any plausible PG blip without hammering a down
+/// database, and bounds the deferred price-fold/persist window at 5%
+/// of the tick period. The const relation below pins the envelope
+/// strictly inside the tick it bounds (R17 ordering law).
+pub(crate) const COST_RELOAD_RETRY_SECS: u64 = 30;
+const _: () = assert!(
+    COST_RELOAD_RETRY_SECS < POLL_INTERVAL_SECS,
+    "the reload-retry envelope must sit strictly inside the housekeeping tick"
+);
+
 /// `_hw_cost_stale_seconds` threshold past which [`CostTable::price`]
 /// clamps to seed and `_hw_cost_fallback_total{reason="stale"}` fires.
 /// 6× the poll interval = 1h: enough to absorb a few transient AWS
@@ -1368,7 +1386,12 @@ pub async fn spot_price_poller(
 /// is reloaded from PG so the next leader picks up where the last left
 /// off — without this, the standby's startup snapshot (loaded once at
 /// main.rs) would be `persist()`ed on the first leader tick,
-/// overwriting the previous leader's evolved EMA.
+/// overwriting the previous leader's evolved EMA. A FAILED edge reload
+/// retries within [`COST_RELOAD_RETRY_SECS`] (per failure,
+/// chain-total) via the wake law's retry arm — menu entries observed
+/// in the closed window ride the in-memory table (merged forward by
+/// `carry_catalog`) and become durable at the first healthy tick's
+/// persist.
 ///
 /// **Edge-reload ownership.** This task owns the load↔persist symmetry
 /// (it is the task that `persist()`s); the latch's WRITER SET is the
@@ -1393,20 +1416,45 @@ pub async fn interrupt_housekeeping(
 ) {
     let mut tick = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The bounded reload-retry arm (merged_bug_046 second axis;
+    // `sched.sla.cost-leader-edge-reload+1`): `None` = disarmed. Armed
+    // by every `ReloadFailed` prelude — INCLUDING one produced by a
+    // retry-initiated prelude (the rule's MUST quantifies per-failure
+    // over the chain: a one-shot arm would leave failure #2 waiting
+    // out the 600s tick while a single-failure witness stayed green).
+    let mut reload_retry: Option<tokio::time::Instant> = None;
     loop {
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => return,
             _ = tick.tick() => {},
             // `handle_leader_acquired` nudges so the edge-reload (and
-            // the `was_leader` false→true store that gates the actor's
-            // `observe_instance_types` write) happens promptly after
-            // lease win, not at the next 600s tick. `notified()` is
-            // permit-based — a notify before this await is not lost.
+            // the `was_leader` false→true store) happens promptly
+            // after lease win, not at the next 600s tick. `notified()`
+            // is permit-based — a notify before this await is not
+            // lost.
             _ = notify.notified() => {},
+            // The retry wake: fires within COST_RELOAD_RETRY_SECS of a
+            // failed leader-edge reload, so the deferred price-fold/
+            // persist window is the typed envelope, not the tick.
+            _ = async { tokio::time::sleep_until(reload_retry.unwrap()).await },
+                if reload_retry.is_some() => {},
         }
-        if !poller_tick_prelude(&was_leader, leader.is_leader(), &cost, &db).await {
-            continue;
+        // The wake law over the prelude's closed alphabet: Proceed
+        // disarms and runs the body; Standby disarms and skips (a
+        // standby owns no reload to retry); ReloadFailed re-arms the
+        // envelope and skips.
+        match poller_tick_prelude(&was_leader, leader.is_leader(), &cost, &db).await {
+            PreludeOutcome::Proceed => reload_retry = None,
+            PreludeOutcome::Standby => {
+                reload_retry = None;
+                continue;
+            }
+            PreludeOutcome::ReloadFailed => {
+                reload_retry =
+                    Some(tokio::time::Instant::now() + Duration::from_secs(COST_RELOAD_RETRY_SECS));
+                continue;
+            }
         }
         // Snapshot → refresh_lambda → write back λ ONLY (don't clobber
         // a concurrent `spot_price_poller` price fold).
@@ -1477,10 +1525,44 @@ pub(crate) fn fold_spot_poll(
     }
 }
 
+/// Typed outcome of [`poller_tick_prelude`] (merged_bug_046 second
+/// axis): the housekeeping wake law consumes the per-tick
+/// leader-gate-and-edge-reload result as a closed alphabet instead of
+/// a `bool`, so the failed-reload lane carries its own bounded retry
+/// arm — the pre-typed `false` conflated "standby" (no retry wanted)
+/// with "leader whose reload failed" (retry REQUIRED within the
+/// envelope).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreludeOutcome {
+    /// Leader with a current table (no edge, or the edge-reload
+    /// succeeded): run the tick body.
+    Proceed,
+    /// Not the leader: skip the body (and the latch was cleared).
+    Standby,
+    /// Leader, but the false→true edge reload FAILED: skip the body
+    /// (persisting would overwrite the previous leader's evolved EMA
+    /// with this replica's stale startup snapshot) and retry the
+    /// reload within [`COST_RELOAD_RETRY_SECS`], not at the next
+    /// [`POLL_INTERVAL_SECS`] tick.
+    ReloadFailed,
+}
+
+#[cfg(test)]
+/// Test-side load-attempt observable for the bounded-retry chain red
+/// (the envelope's witness counts OPERATIONS, not wall-clock — the
+/// structural-over-wall-clock rule). Incremented once per edge-reload
+/// `CostTable::load` ATTEMPT inside [`poller_tick_prelude`].
+/// Process-scoped: sound under nextest's process-per-test model (the
+/// repo's gating runner); injection-lane state beside the
+/// `fail_next_*` family, never a production metric (the reload-retry
+/// metric escalation is RULED log-only this wave).
+pub(crate) static PRELUDE_LOAD_ATTEMPTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Per-tick leader-gate + edge-reload for [`interrupt_housekeeping`]
 /// (the SOLE caller — [`spot_price_poller`] reads the shared
-/// `was_leader` directly and does NOT invoke this). Returns `true` if
-/// the caller should proceed with the tick body.
+/// `was_leader` directly and does NOT invoke this). Returns the typed
+/// [`PreludeOutcome`] the housekeeping wake law consumes.
 ///
 /// On a false→true leader edge, reloads from PG so the new leader
 /// resumes from the previous leader's persisted state, not its own
@@ -1498,18 +1580,20 @@ pub(crate) async fn poller_tick_prelude(
     is_leader: bool,
     cost: &std::sync::Arc<parking_lot::RwLock<CostTable>>,
     db: &SchedulerDb,
-) -> bool {
+) -> PreludeOutcome {
     use std::sync::atomic::Ordering;
     if !is_leader {
         was_leader.store(false, Ordering::Relaxed);
-        return false;
+        return PreludeOutcome::Standby;
     }
-    // r[impl sched.sla.cost-leader-edge-reload]
+    // r[impl sched.sla.cost-leader-edge-reload+1]
     if !was_leader.load(Ordering::Relaxed) {
         let (cluster, source) = {
             let g = cost.read();
             (g.cluster().to_owned(), g.source())
         };
+        #[cfg(test)]
+        PRELUDE_LOAD_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
         match CostTable::load(db, &cluster, source).await {
             Ok(fresh) => {
                 // §13c-2: carry the boot-derived catalog forward.
@@ -1520,16 +1604,21 @@ pub(crate) async fn poller_tick_prelude(
                 was_leader.store(true, Ordering::Relaxed);
             }
             Err(e) => {
-                tracing::warn!(error = %e, "cost reload on leader-acquire failed; retrying next tick");
+                tracing::warn!(
+                    error = %e,
+                    retry_within_secs = COST_RELOAD_RETRY_SECS,
+                    "cost reload on leader-acquire failed; retrying within the bounded envelope"
+                );
                 // Do NOT latch `was_leader` and do NOT proceed: the
                 // tick body would `persist()` this replica's stale
                 // startup snapshot over the previous leader's evolved
-                // EMA. Retried on the next tick.
-                return false;
+                // EMA. The caller's retry arm re-attempts within
+                // `COST_RELOAD_RETRY_SECS` (per failure, chain-total).
+                return PreludeOutcome::ReloadFailed;
             }
         }
     }
-    true
+    PreludeOutcome::Proceed
 }
 
 /// One `DescribeSpotPriceHistory` round. Returns vCPU-normalized
@@ -2437,12 +2526,15 @@ mod tests {
         );
     }
 
-    /// bug_009 prelude edge behavior. (a) standby: returns false,
-    /// does NOT reload, `was_leader` stays false (so the spot poller
-    /// keeps skipping). The standby `_hw_cost_stale_seconds` emit moved
-    /// inline to `spot_price_poller` (pre-leader-gate) — observability
-    /// .md "climbs on standby" is preserved there. (b) false→true edge:
-    /// reloads from PG, latches the shared flag, returns true.
+    /// bug_009 prelude edge behavior, restated over the typed wake-law
+    /// alphabet (merged_bug_046 second axis — the per-outcome ALGEBRA
+    /// table; the loop ROUTING is certified by
+    /// `reload_failure_arms_the_bounded_retry_not_the_600s_tick`).
+    /// (a) standby: `Standby`, does NOT reload, `was_leader` stays
+    /// false (so the spot poller keeps skipping). The standby
+    /// `_hw_cost_stale_seconds` emit moved inline to
+    /// `spot_price_poller` (pre-leader-gate). (b) false→true edge:
+    /// reloads from PG, latches the shared flag, `Proceed`.
     #[tokio::test]
     async fn poller_prelude_edge_reloads() {
         use std::sync::{
@@ -2463,17 +2555,17 @@ mod tests {
         mine.set_price("h", CapacityType::Spot, 0.02, 100.0);
         let cost = Arc::new(parking_lot::RwLock::new(mine));
 
-        // (a) standby: returns false, does NOT reload, flag stays false.
+        // (a) standby: `Standby`, does NOT reload, flag stays false.
         let was_leader = AtomicBool::new(false);
-        let proceed = poller_tick_prelude(&was_leader, false, &cost, &sdb).await;
-        assert!(!proceed);
+        let outcome = poller_tick_prelude(&was_leader, false, &cost, &sdb).await;
+        assert_eq!(outcome, PreludeOutcome::Standby);
         assert!(!was_leader.load(Ordering::Relaxed));
         // Standby did NOT reload (still 0.02).
         assert!((cost.read().price(&cell) - 0.02).abs() < 1e-9);
 
-        // (b) false→true edge: reloads from PG, returns true.
-        let proceed = poller_tick_prelude(&was_leader, true, &cost, &sdb).await;
-        assert!(proceed);
+        // (b) false→true edge: reloads from PG, `Proceed`.
+        let outcome = poller_tick_prelude(&was_leader, true, &cost, &sdb).await;
+        assert_eq!(outcome, PreludeOutcome::Proceed);
         assert!(was_leader.load(Ordering::Relaxed));
         assert!(
             (cost.read().price(&cell) - 0.08).abs() < 1e-9,
@@ -2484,23 +2576,25 @@ mod tests {
         // mutation if it did).
         cost.write()
             .set_price("h", CapacityType::Spot, 0.09, 6000.0);
-        let proceed = poller_tick_prelude(&was_leader, true, &cost, &sdb).await;
-        assert!(proceed);
+        let outcome = poller_tick_prelude(&was_leader, true, &cost, &sdb).await;
+        assert_eq!(outcome, PreludeOutcome::Proceed);
         assert!((cost.read().price(&cell) - 0.09).abs() < 1e-9);
 
         // Leader→standby: flag drops back so the next acquire reloads.
-        let proceed = poller_tick_prelude(&was_leader, false, &cost, &sdb).await;
-        assert!(!proceed);
+        let outcome = poller_tick_prelude(&was_leader, false, &cost, &sdb).await;
+        assert_eq!(outcome, PreludeOutcome::Standby);
         assert!(!was_leader.load(Ordering::Relaxed));
     }
 
     /// Regression: when `CostTable::load` fails on the false→true
     /// leader edge, the prelude must NOT latch `was_leader=true` and
-    /// must NOT return `true` — doing so would let the caller
+    /// must NOT answer `Proceed` — doing so would let the caller
     /// `persist()` this replica's stale startup snapshot over the
-    /// previous leader's evolved EMA, and skip the reload retry on
-    /// every subsequent tick.
-    // r[verify sched.sla.cost-leader-edge-reload]
+    /// previous leader's evolved EMA, and skip the reload retry. The
+    /// failure lane is the TYPED `ReloadFailed` so the caller's
+    /// bounded retry arm (COST_RELOAD_RETRY_SECS) engages instead of
+    /// deferring to the 600s tick.
+    // r[verify sched.sla.cost-leader-edge-reload+1]
     #[tokio::test]
     async fn poller_prelude_load_failure_retries_and_skips_persist() {
         use std::sync::Arc;
@@ -2526,10 +2620,13 @@ mod tests {
         let bad_db = SchedulerDb::new(bad.pool.clone());
 
         let was_leader = std::sync::atomic::AtomicBool::new(false);
-        let proceed = poller_tick_prelude(&was_leader, true, &cost, &bad_db).await;
-        assert!(
-            !proceed,
-            "load() Err → tick body skipped (no persist of stale snapshot)"
+        let outcome = poller_tick_prelude(&was_leader, true, &cost, &bad_db).await;
+        assert_eq!(
+            outcome,
+            PreludeOutcome::ReloadFailed,
+            "load() Err → typed ReloadFailed: tick body skipped (no persist of \
+             stale snapshot) AND the caller's bounded retry arm engages — the \
+             pre-typed `false` could not express the distinction"
         );
         assert!(
             !was_leader.load(std::sync::atomic::Ordering::Relaxed),
@@ -2541,8 +2638,12 @@ mod tests {
         );
 
         // Retry with a working DB: reload succeeds, latches, proceeds.
-        let proceed = poller_tick_prelude(&was_leader, true, &cost, &sdb).await;
-        assert!(proceed, "retry with working DB → proceed");
+        let outcome = poller_tick_prelude(&was_leader, true, &cost, &sdb).await;
+        assert_eq!(
+            outcome,
+            PreludeOutcome::Proceed,
+            "retry with working DB → Proceed"
+        );
         assert!(
             was_leader.load(std::sync::atomic::Ordering::Relaxed),
             "retry success → latched"
@@ -2551,6 +2652,117 @@ mod tests {
             (cost.read().price(&cell) - 0.08).abs() < 1e-9,
             "retry reloaded PG state (previous leader's EMA)"
         );
+    }
+
+    /// merged_bug_046 second axis — the loop ROUTING half (the typed
+    /// prelude tests above are the per-outcome ALGEBRA): a failed
+    /// leader-edge reload RE-ATTEMPTS the load within
+    /// `COST_RELOAD_RETRY_SECS` of virtual time — and not before —
+    /// and every further failure re-arms the same envelope
+    /// (chain-total: `k+1` load attempts after `k` envelopes, here
+    /// `k = 2`). Witness strength (R16): certifies the bumped
+    /// `sched.sla.cost-leader-edge-reload+1` proposition itself — a
+    /// bounded re-LOAD per failure — NOT arm-selection (the pre-fix
+    /// shape was precisely a wake that fired while the retry never
+    /// happened: the 600s tick). The observable is the test-side
+    /// `PRELUDE_LOAD_ATTEMPTS` injection-lane counter (counts
+    /// OPERATIONS, not wall-clock — the structural rule; no
+    /// production metric, per the ruled log-only posture). The pool
+    /// STAYS closed: persistent failure is the chain environment
+    /// (sqlx pools do not reopen). Drives the REAL
+    /// `interrupt_housekeeping` under paused tokio time.
+    // r[verify sched.sla.cost-leader-edge-reload+1]
+    #[tokio::test]
+    async fn reload_failure_arms_the_bounded_retry_not_the_600s_tick() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        // Real IO (postgres bootstrap) happens BEFORE the clock pauses;
+        // once the pool is closed every load fails synchronously, so
+        // the loop is purely timer-driven and paused-time safe.
+        let bad = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        bad.pool.close().await;
+        let bad_db = SchedulerDb::new(bad.pool.clone());
+        tokio::time::pause();
+
+        let cost = Arc::new(parking_lot::RwLock::new(CostTable::seeded(
+            "c",
+            HwCostSource::Static,
+        )));
+        let was_leader = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let shutdown = rio_common::signal::Token::new();
+        let leader = crate::lease::LeaderState::from_parts(
+            Arc::new(AtomicU64::new(1)),
+            Arc::new(AtomicBool::new(true)),
+            false,
+        );
+        let base = PRELUDE_LOAD_ATTEMPTS.load(Ordering::SeqCst);
+        let task = tokio::spawn(interrupt_housekeeping(
+            bad_db,
+            leader,
+            Arc::clone(&cost),
+            Arc::clone(&was_leader),
+            Arc::clone(&notify),
+            shutdown.clone(),
+        ));
+        let attempts = || PRELUDE_LOAD_ATTEMPTS.load(Ordering::SeqCst) - base;
+        // Park-driven settle: tokio timers fire when the runtime
+        // parks, so each wait point sleeps 1ms of virtual time (the
+        // paused clock auto-advances) — due timers (the interval's
+        // immediate first tick, the retry arm) fire FIRST, then the
+        // sleep completes. A yield-busy loop would never park and the
+        // due timers would never deliver.
+        async fn settle() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+        }
+
+        // t≈0: the interval's immediate first tick drives load #1;
+        // the failure arms the retry at t+COST_RELOAD_RETRY_SECS.
+        settle().await;
+        assert_eq!(attempts(), 1, "the immediate first tick drives load #1");
+
+        // Not before the envelope: two seconds short of the bound, no
+        // re-attempt has fired (pre-fix row: the next attempt sat at
+        // the 600s tick — `was_leader=false ⇒ retried on the next
+        // tick` was the entire liveness story).
+        tokio::time::advance(Duration::from_secs(COST_RELOAD_RETRY_SECS - 2)).await;
+        settle().await;
+        assert_eq!(
+            attempts(),
+            1,
+            "no re-attempt before COST_RELOAD_RETRY_SECS elapses"
+        );
+
+        // Within the envelope: crossing the bound fires re-load #2.
+        tokio::time::advance(Duration::from_secs(3)).await;
+        settle().await;
+        assert_eq!(
+            attempts(),
+            2,
+            "a failed leader-edge reload re-attempts within \
+             COST_RELOAD_RETRY_SECS, not at the 600s tick"
+        );
+
+        // Chain row (k = 2): the retry-initiated prelude failed again
+        // and RE-ARMED the envelope — k+1 = 3 attempts after k
+        // envelopes (small settle skew absorbed by the +1s margin). A
+        // one-shot arm (re-armed only from tick/notify preludes)
+        // would leave this at 2 until t = 600s.
+        tokio::time::advance(Duration::from_secs(COST_RELOAD_RETRY_SECS + 1)).await;
+        settle().await;
+        assert_eq!(
+            attempts(),
+            3,
+            "every ReloadFailed re-arms the retry — per-failure, chain-total"
+        );
+        assert!(
+            !was_leader.load(Ordering::Relaxed),
+            "the latch never set under persistent failure (no stale persist)"
+        );
+
+        shutdown.cancel();
+        let _ = task.await;
     }
 
     /// `refresh_lambda` advances `updated_at` to the rows' `MAX(at)`,

@@ -4060,7 +4060,7 @@ async fn contract_first_pull_clears_ice_not_yet_ready_does_not() {
 /// Pre-table, NO lose-side writer existed — `cost_was_leader` stayed
 /// true across an A→B→A lease flap inside one 600s housekeeping tick,
 /// so the prelude's `!was_leader` reload check
-/// (r[sched.sla.cost-leader-edge-reload], pinned by the prelude tests
+/// (r[sched.sla.cost-leader-edge-reload+1], pinned by the prelude tests
 /// in sla/cost.rs) was skipped and the tick body persisted the deposed
 /// tenure's prices. Composed invariant: this lose-edge store + the
 /// prelude test = "the first leader tick after ANY acquire edge

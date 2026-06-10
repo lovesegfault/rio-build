@@ -1186,12 +1186,15 @@ a controller-reported promote needs a durable dedup (e.g. keyed to the
 attempt row's first classification) --- a design item, not a silent
 re-add.
 
-#r("sched.sla.cost-leader-edge-reload")[
+#r("sched.sla.cost-leader-edge-reload+1")[
   On a false→true leader edge, the cost-table poller MUST reload
   `sla_ema_state` from PG before its first `persist()`. A failed reload
   MUST NOT proceed to `persist()` (which would overwrite the previous
-  leader's evolved EMA with this replica's stale startup snapshot); retry
-  on the next tick.
+  leader's evolved EMA with this replica's stale startup snapshot) and
+  MUST be retried within the bounded reload-retry envelope
+  (`COST_RELOAD_RETRY_SECS`) — per failure, chain-total: every failed
+  reload re-arms the envelope, including one initiated by the retry
+  itself — never deferred to the next poll tick.
 ]
 
 #r("sched.admin.spawn-intents.feature-filter")[
