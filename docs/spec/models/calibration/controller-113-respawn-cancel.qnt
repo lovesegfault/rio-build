@@ -58,7 +58,9 @@ module controllerCalib113RespawnCancel {
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
     STREAK_FLOOR = 2,
-    WINDOW_COUPLED_FOLD = false
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false
   ).* from "../spawnCoherence"
 
   /// The post-cancel mid-trace state (every var assigned; deltas from
@@ -120,7 +122,9 @@ module controllerCalib113RespawnCancelHold {
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
     STREAK_FLOOR = 2,
-    WINDOW_COUPLED_FOLD = false
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false
   ).* from "../spawnCoherence"
 
   action calibInit = all {

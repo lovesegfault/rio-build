@@ -182,6 +182,8 @@ module spawnCoherence {
     | EPoisoned
     | ECancelReap
     | ESynthClose
+    | ESkipFailopenSpawn
+    | ESkipWithheld
 
   /// Violation latches. Each invariant below is `not(contains(...))`;
   /// in a correct model every latch stays unset forever, so these add
@@ -205,6 +207,7 @@ module spawnCoherence {
     | VPoisonBurst
     | VYoungLeaderReap
     | VStaleClose
+    | VSpawnClobberedStreak
 
   // ------------------------------------------------------------------
   // 2. Constants (regime modules instantiate these)
@@ -320,6 +323,29 @@ module spawnCoherence {
   /// (the order this model always encoded --- the implementation
   /// diverged; the twin pins the divergence as a falsified law).
   const WINDOW_COUPLED_FOLD: bool
+  /// bug_075 axis pair (bughunt-6 S4; the m073 CADENCE/ENFORCED split
+  /// pattern --- the machinery const turns on the REAL fold-skip
+  /// fail-open spawn arm plus the clobber ghost/latch, the law const
+  /// adds the live-streak withhold). FAILOPEN=false everywhere
+  /// pre-existing keeps the historical idealized skip arm (exhausted
+  /// intents withheld on EVERY tick) --- byte-identical state spaces
+  /// per the round-4 §4.F16 discipline INCLUDING the floor-blind
+  /// 073-burst lane, the one pre-existing regime where foldSkip is
+  /// exercised (a single as-built-false axis would have grown its
+  /// banked space; the split is the recorded Q1 divergence from the
+  /// book's one-const prescription). FAILOPEN=true models the
+  /// as-built jobs.rs ListFailed arm: the LIST failure hides
+  /// exhaustion, so the skip tick spawns fail-open ---
+  /// WITHHOLD=false spawns ALL wanted (the bug_075 defect: the spawn
+  /// shadows the intent from evaluation, existing-name exclusion,
+  /// and the next completed fold zeroes its live streak --- the
+  /// model's immediate reset abstracts the 120 s orphan expiry vs
+  /// the >=180 s Job-alive floor); WITHHOLD=true withholds exactly
+  /// the live-streak intents (the fixed law --- fail-open preserved
+  /// for no-evidence intents, so a permanent LIST failure cannot
+  /// wedge spawn).
+  const ENABLE_SKIP_SPAWN_FAILOPEN: bool
+  const SKIP_SPAWN_WITHHOLD: bool
 
   pure val INTENTS: Set[IntentId] = Set("i1", "i2")
 
@@ -439,6 +465,14 @@ module spawnCoherence {
   /// opens the window also leaves Ready), and the spawn edge refuses
   /// in-backoff intents — noSpawnIntentInsideBackoff.
   var inBackoff: IntentId -> bool
+  /// bug_075 ghost (the TRACK_EPISODE_GHOSTS precedent:
+  /// constant-false unless ENABLE_SKIP_SPAWN_FAILOPEN --- zero state
+  /// cost off-axis): the intent's CURRENT Job was minted by a
+  /// fold-skip fail-open spawn while its streak was live (the
+  /// clobbering spawn). Set by the spawn pass, cleared when the Job
+  /// leaves the slot --- the latch reads it to tell "streak zeroed by
+  /// the skip-spawn's shadow" apart from observed recovery.
+  var skipSpawned: IntentId -> bool
 
   // ------------------------------------------------------------------
   // 5. Invariants
@@ -511,11 +545,15 @@ module spawnCoherence {
   /// reach the threshold for it. Falsified as-built under
   /// ENABLE_MULTI_POOL; holds with ENABLE_STREAK_POOL_KEY.
   val streakCountsOwnObservations = not(violations.contains(VPoisonForeignCount))
-  /// merged_bug_117: a foreign pool's tick never resets a live streak
-  /// (the as-built retain-wipe livelocked the report — the safety form
-  /// of "persistent exhaustion eventually reports": given no foreign
-  /// wipe, the 3-tick threshold delivers it).
-  val persistentExhaustionEventuallyReports = not(violations.contains(VForeignStreakWipe))
+  /// merged_bug_117 + bug_075: the safety form of "persistent
+  /// exhaustion eventually reports", over its defeater set --- a
+  /// foreign/window wipe of a live streak (the m117 shared-map wipe;
+  /// the bug_028 window-coupled fold records the same latch) and the
+  /// bug_075 fold-skip fail-open spawn whose Job shadows the intent
+  /// from evaluation until its live evidence dies. Given no defeater,
+  /// the 3-tick threshold delivers the report.
+  val persistentExhaustionEventuallyReports =
+    violations.intersect(Set(VForeignStreakWipe, VSpawnClobberedStreak)) == Set()
   /// m073 (bughunt-4 S1a): the poison verdict spans at least
   /// STREAK_FLOOR wall units from the streak's first gated
   /// observation — a sub-second reconcile burst (ticks without wall
@@ -541,6 +579,13 @@ module spawnCoherence {
   val canReachPoison = not(effects.contains(EPoisoned))
   val canReachCancelReap = not(effects.contains(ECancelReap))
   val canReachSynthClose = not(effects.contains(ESynthClose))
+  /// bug_075 twin trace evidence: a fold-skip fail-open spawn fired
+  /// (the clobbering edge is IN the trace, not inferred).
+  val canReachSkipFailopenSpawn = not(effects.contains(ESkipFailopenSpawn))
+  /// bug_075 hold non-vacuity: the withhold arm actually exercised —
+  /// a live-streak intent was withheld on a fold-skip tick (wired as
+  /// an expected-violation check in the failopen-withhold regime).
+  val canReachSkipWithheld = not(effects.contains(ESkipWithheld))
 
   // ------------------------------------------------------------------
   // 6. The tick (one action; helper pure defs first)
@@ -649,9 +694,18 @@ module spawnCoherence {
     // is WITHHELD (never created this tick) and its streak advances;
     // any non-exhausted (or unwanted) tick resets the streak to zero.
     // The poison verdict fires at the persistence threshold (PERSIST)
-    // or immediately (the as-built law).
+    // or immediately (the as-built law). bug_075: on a fold-skip tick
+    // under the REAL fail-open arm (ENABLE_SKIP_SPAWN_FAILOPEN) the
+    // LIST failure hides exhaustion — the withhold consults the
+    // intent's EVIDENCE instead: live streak ⇒ withheld iff
+    // SKIP_SPAWN_WITHHOLD (the fixed law); no evidence ⇒ fail-open
+    // spawn either way. Off-axis (FAILOPEN=false) this is exactly the
+    // historical idealized filter on every tick.
     val spawnCandidates = wantedCandidates.filter(i =>
-      not(ENABLE_EXHAUST_POISON and exhausted.get(i)))
+      if (ENABLE_SKIP_SPAWN_FAILOPEN and foldSkip)
+        not(SKIP_SPAWN_WITHHOLD and streak.get(i) > 0)
+      else
+        not(ENABLE_EXHAUST_POISON and exhausted.get(i)))
     // bug_028 axis: the as-built spawn WINDOW (take(headroom) BEFORE
     // the gate) and its fold-completion condition (the lazy LIST runs
     // only when an in-window intent carries exclusions). Pure derived
@@ -846,6 +900,14 @@ module spawnCoherence {
           Set(EMatJobFiltered) else Set())
         .union(if (poisoned.size() > 0) Set(EPoisoned) else Set())
         .union(if (cancelSelected.size() > 0) Set(ECancelReap) else Set())
+        // bug_075: the fold-skip fail-open spawn edge (trace evidence
+        // for the clobber twin) and the withhold arm's exercise (hold
+        // non-vacuity) — both dead off-axis.
+        .union(if (ENABLE_SKIP_SPAWN_FAILOPEN and foldSkip and spawnedSet.size() > 0)
+          Set(ESkipFailopenSpawn) else Set())
+        .union(if (ENABLE_SKIP_SPAWN_FAILOPEN and SKIP_SPAWN_WITHHOLD and foldSkip
+            and wantedCandidates.filter(i => streak.get(i) > 0).size() > 0)
+          Set(ESkipWithheld) else Set())
 
     // ---- Violation checks ----------------------------------------------
     // I4: spawns never push active-minus-freed past the ceiling.
@@ -886,6 +948,20 @@ module spawnCoherence {
         streak.get(i) > 0 and exhausted.get(i)
         and postGate.contains(i) and jobsAtList.get(i).phase == JAbsent
         and not(windowSet.contains(i))).size() > 0
+    // bug_075: a completed fold ZEROED a live streak for an intent
+    // that is still exhausted and wanted but JOB-HELD by a fold-skip
+    // fail-open spawn — the spawn destroyed by shadowing what the
+    // retain law preserved (the model's immediate job-held reset
+    // abstracts the 120 s orphan expiry vs the >=180 s Job-alive
+    // floor). The same latch family as the m117 foreign wipe and the
+    // 028 window wipe: persistent exhaustion never reports.
+    val vSpawnClobber =
+      ENABLE_SKIP_SPAWN_FAILOPEN and not(foldSkip) and
+      INTENTS.filter(i =>
+        skipSpawned.get(i)
+        and streak.get(i) > 0 and streakAfter.get(i) == 0
+        and exhausted.get(i) and postGate.contains(i)
+        and jobsAtList.get(i).phase != JAbsent).size() > 0
     // m073: a poison verdict on a streak younger than the wall floor
     // (the reconcile-burst verdict). Under ENFORCED the floor conjunct
     // above empties this set by construction — the enforcement IS the
@@ -977,6 +1053,7 @@ module spawnCoherence {
         .union(if (vWindowWipe) Set(VForeignStreakWipe) else Set())
         .union(if (vPoisonBurst) Set(VPoisonBurst) else Set())
         .union(if (vYoungReap) Set(VYoungLeaderReap) else Set())
+        .union(if (vSpawnClobber) Set(VSpawnClobberedStreak) else Set())
 
     all {
       job' = jobsAfter,
@@ -1007,6 +1084,13 @@ module spawnCoherence {
       jobPostdatesClose' = INTENTS.mapBy(i =>
         if (spawnedSet.contains(i)) closedCause.get(i) != CCNone
         else (jobPostdatesClose.get(i) and jobsAfter.get(i).phase != JAbsent)),
+      // bug_075 ghost (same birth/death frame as jobPostdatesClose):
+      // a spawn on a fold-skip tick while the streak was live marks
+      // the Job as the clobbering spawn; the bit dies with the Job.
+      skipSpawned' = INTENTS.mapBy(i =>
+        if (spawnedSet.contains(i))
+          ENABLE_SKIP_SPAWN_FAILOPEN and foldSkip and streak.get(i) > 0
+        else (skipSpawned.get(i) and jobsAfter.get(i).phase != JAbsent)),
       closedCause' = closedCause,
       exhausted' = exhausted,
       pendingClose' = pendingClose,
@@ -1039,6 +1123,7 @@ module spawnCoherence {
     jobPostdatesClose' = jobPostdatesClose,
     pendingClose' = pendingClose,
     inBackoff' = inBackoff,
+    skipSpawned' = skipSpawned,
   }
 
   /// A drv becomes Ready: the intent (re-)appears in the queue.
@@ -1168,6 +1253,7 @@ module spawnCoherence {
 
   /// The scheduler assigns work to the registered executor.
   action execGetsWork(i: IntentId): bool = all {
+    skipSpawned' = skipSpawned,
     execr.get(i) == ExecIdle,
     execr' = execr.set(i, ExecBusy),
     // A2/106: the rendered deadline rides the binding into the mint
@@ -1224,6 +1310,7 @@ module spawnCoherence {
   /// Scheduler restart / failover: the executor map and dispatched_cells
   /// are in-memory and empty out; the new leader is young.
   action schedulerRestarts = all {
+    skipSpawned' = skipSpawned,
     ENABLE_LEASE_FAULT,
     execr' = INTENTS.mapBy(i => ExecAbsent),
     leaderOld' = false,
@@ -1250,6 +1337,7 @@ module spawnCoherence {
   /// A dispatched_cells entry is consumed scheduler-side (heartbeat
   /// registration edge or DAG-state sweep).
   action dispatchedCleared(i: IntentId): bool = all {
+    skipSpawned' = skipSpawned,
     dispatched.contains(i),
     dispatched' = dispatched.exclude(Set(i)),
     queued' = queued, intentFp' = intentFp, job' = job, execr' = execr,
@@ -1283,6 +1371,7 @@ module spawnCoherence {
   /// (merge/probe classification) — the node stays Ready and queued
   /// scheduler-side; GetSpawnIntents stops serving it.
   action matJobOpens(i: IntentId): bool = all {
+    skipSpawned' = skipSpawned,
     ENABLE_MAT_JOBS,
     not(matJob.get(i)),
     matJob' = matJob.set(i, true),
@@ -1304,6 +1393,7 @@ module spawnCoherence {
   /// PD-7: the job resolves (success / from-source / cancelled) — the
   /// intent is servable again.
   action matJobResolves(i: IntentId): bool = all {
+    skipSpawned' = skipSpawned,
     ENABLE_MAT_JOBS,
     matJob.get(i),
     matJob' = matJob.set(i, false),
@@ -1343,6 +1433,7 @@ module spawnCoherence {
   /// latch records an establishment that beat the rendered deadline;
   /// with the carry in place the guard makes it unreachable.
   action establishExpired(i: IntentId): bool = all {
+    skipSpawned' = skipSpawned,
     ENABLE_RENDERED_DEADLINE,
     execr.get(i) == ExecAbsent,
     censusActive(job.get(i)),
@@ -1374,6 +1465,7 @@ module spawnCoherence {
   /// excluded ⊇ spawnable starts or stops holding (node restart,
   /// informer lag, genuine fleet exhaustion).
   action exhaustFlips(i: IntentId): bool = all {
+    skipSpawned' = skipSpawned,
     ENABLE_EXHAUST_POISON,
     exhausted' = exhausted.set(i, not(exhausted.get(i))),
     queued' = queued, intentFp' = intentFp, job' = job, execr' = execr,
@@ -1392,6 +1484,7 @@ module spawnCoherence {
   /// cancel): the attempt closes CANCELLED while the Job lives on —
   /// the teardown the cancel arm exists to perform.
   action attemptCancelled(i: IntentId): bool = all {
+    skipSpawned' = skipSpawned,
     or { ENABLE_CANCEL_ASBUILT, ENABLE_CANCEL_CAUSE },
     execr.get(i) != ExecAbsent,
     execr' = execr.set(i, ExecAbsent),
@@ -1417,6 +1510,7 @@ module spawnCoherence {
   /// COMPLETED; the Job stays Running until the controller's informer
   /// catches up (modeled by jobCompletes never having fired).
   action attemptCompletesLagged(i: IntentId): bool = all {
+    skipSpawned' = skipSpawned,
     or { ENABLE_CANCEL_ASBUILT, ENABLE_CANCEL_CAUSE },
     execr.get(i) == ExecBusy,
     job.get(i).phase == JRunning,
@@ -1438,6 +1532,7 @@ module spawnCoherence {
 
   /// C2/120: the close ages out of the recently_closed window (120 s).
   action windowExpires(i: IntentId): bool = all {
+    skipSpawned' = skipSpawned,
     or { ENABLE_CANCEL_ASBUILT, ENABLE_CANCEL_CAUSE },
     closedCause.get(i) != CCNone,
     closedCause' = closedCause.set(i, CCNone),
@@ -1457,6 +1552,7 @@ module spawnCoherence {
   /// C2/135: the disruption watcher decides to preempt — it OBSERVES
   /// the currently-open attempt and synthesizes the close it will send.
   action disruptionDecides(i: IntentId): bool = all {
+    skipSpawned' = skipSpawned,
     ENABLE_SYNTH_CLOSE,
     execr.get(i) == ExecBusy,
     not(pendingClose.get(i)),
@@ -1480,6 +1576,7 @@ module spawnCoherence {
   /// still the OBSERVED one; otherwise the scheduler refuses and
   /// nothing is consumed.
   action closeLands(i: IntentId): bool = all {
+    skipSpawned' = skipSpawned,
     ENABLE_SYNTH_CLOSE,
     pendingClose.get(i),
     pendingClose' = pendingClose.set(i, false),
@@ -1517,6 +1614,7 @@ module spawnCoherence {
   /// window — only on a non-queued intent (the failing attempt's
   /// release left Ready; the spawn edge is what the conjunct guards).
   action backoffStarts(i: IntentId): bool = all {
+    skipSpawned' = skipSpawned,
     ENABLE_RETRY_BACKOFF,
     not(queued.get(i)),
     not(inBackoff.get(i)),
@@ -1538,6 +1636,7 @@ module spawnCoherence {
 
   /// The backoff window expires — the intent is spawnable again.
   action backoffExpires(i: IntentId): bool = all {
+    skipSpawned' = skipSpawned,
     ENABLE_RETRY_BACKOFF,
     inBackoff.get(i),
     inBackoff' = inBackoff.set(i, false),
@@ -1582,6 +1681,7 @@ module spawnCoherence {
     pendingClose' = INTENTS.mapBy(i => false),
     obsLive' = INTENTS.mapBy(i => false),
     inBackoff' = INTENTS.mapBy(i => false),
+    skipSpawned' = INTENTS.mapBy(i => false),
   }
 
   /// merged_bug_117: a SECOND pool's reconcile tick, abstracted to its
@@ -1630,6 +1730,7 @@ module spawnCoherence {
       closedCause' = closedCause, seenOpen' = seenOpen,
       exhausted' = exhausted, pendingClose' = pendingClose,
       obsLive' = obsLive, inBackoff' = inBackoff,
+      skipSpawned' = skipSpawned,
     }
   }
 
@@ -1703,7 +1804,9 @@ module spawnCoherenceBase {
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
     STREAK_FLOOR = 2,
-    WINDOW_COUPLED_FOLD = false
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false
   ).*
 }
 
@@ -1733,7 +1836,9 @@ module spawnCoherenceFaultRpc {
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
     STREAK_FLOOR = 2,
-    WINDOW_COUPLED_FOLD = false
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false
   ).*
 }
 
@@ -1764,7 +1869,9 @@ module spawnCoherenceFaultLease {
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
     STREAK_FLOOR = 2,
-    WINDOW_COUPLED_FOLD = false
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false
   ).*
 }
 
@@ -1795,7 +1902,9 @@ module spawnCoherenceFaultStale {
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
     STREAK_FLOOR = 2,
-    WINDOW_COUPLED_FOLD = false
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false
   ).*
 }
 
@@ -1826,7 +1935,9 @@ module spawnCoherenceCrdAbsent {
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
     STREAK_FLOOR = 2,
-    WINDOW_COUPLED_FOLD = false
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false
   ).*
 }
 
@@ -1856,7 +1967,9 @@ module spawnCoherenceFetcher {
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
     STREAK_FLOOR = 2,
-    WINDOW_COUPLED_FOLD = false
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false
   ).*
 }
 
@@ -1890,7 +2003,9 @@ module spawnCoherenceMatJobs {
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
     STREAK_FLOOR = 2,
-    WINDOW_COUPLED_FOLD = false
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false
   ).*
 }
 
@@ -1925,7 +2040,9 @@ module spawnCoherenceRenderedDeadline {
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
     STREAK_FLOOR = 2,
-    WINDOW_COUPLED_FOLD = false
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false
   ).*
 }
 
@@ -1956,7 +2073,9 @@ module spawnCoherenceExhaustAsBuilt {
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
     STREAK_FLOOR = 2,
-    WINDOW_COUPLED_FOLD = false
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false
   ).*
 }
 
@@ -1988,7 +2107,9 @@ module spawnCoherenceExhaustPersist {
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
     STREAK_FLOOR = 2,
-    WINDOW_COUPLED_FOLD = false
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false
   ).*
 }
 
@@ -2019,7 +2140,9 @@ module spawnCoherenceCancelAsBuilt {
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
     STREAK_FLOOR = 2,
-    WINDOW_COUPLED_FOLD = false
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false
   ).*
 }
 
@@ -2050,7 +2173,9 @@ module spawnCoherenceCancelCause {
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
     STREAK_FLOOR = 2,
-    WINDOW_COUPLED_FOLD = false
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false
   ).*
 }
 
@@ -2085,7 +2210,9 @@ module spawnCoherenceReapYoungLeader {
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
     STREAK_FLOOR = 2,
-    WINDOW_COUPLED_FOLD = false
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false
   ).*
 }
 
@@ -2117,7 +2244,9 @@ module spawnCoherenceSynthCloseAsBuilt {
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
     STREAK_FLOOR = 2,
-    WINDOW_COUPLED_FOLD = false
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false
   ).*
 }
 
@@ -2149,7 +2278,9 @@ module spawnCoherenceSynthClosePinned {
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
     STREAK_FLOOR = 2,
-    WINDOW_COUPLED_FOLD = false
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false
   ).*
 }
 
@@ -2180,7 +2311,9 @@ module spawnCoherenceRetryBackoff {
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
     STREAK_FLOOR = 2,
-    WINDOW_COUPLED_FOLD = false
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false
   ).*
 }
 
@@ -2214,7 +2347,9 @@ module spawnCoherenceMultiPoolAsBuilt {
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
     STREAK_FLOOR = 2,
-    WINDOW_COUPLED_FOLD = false
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false
   ).*
 }
 
@@ -2246,7 +2381,9 @@ module spawnCoherenceMultiPool {
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
     STREAK_FLOOR = 2,
-    WINDOW_COUPLED_FOLD = false
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false
   ).*
 }
 
@@ -2280,7 +2417,9 @@ module spawnCoherenceCancelGenAsBuilt {
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
     STREAK_FLOOR = 2,
-    WINDOW_COUPLED_FOLD = false
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false
   ).*
 }
 
@@ -2311,7 +2450,9 @@ module spawnCoherenceCancelGeneration {
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
     STREAK_FLOOR = 2,
-    WINDOW_COUPLED_FOLD = false
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false
   ).*
 }
 
@@ -2354,6 +2495,52 @@ module spawnCoherenceStreakCadence {
     ENABLE_STREAK_CADENCE = true,
     STREAK_FLOOR_ENFORCED = true,
     STREAK_FLOOR = 2,
-    WINDOW_COUPLED_FOLD = false
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false
+  ).*
+}
+
+/// bug_075 HOLD half (bughunt-6 S4): the REAL fold-skip fail-open
+/// spawn arm (ENABLE_SKIP_SPAWN_FAILOPEN) under the FIXED withhold
+/// law (SKIP_SPAWN_WITHHOLD): a fold-skip tick withholds exactly the
+/// intents carrying live exhaustion streaks, so the skip-spawn can
+/// never shadow live evidence into the job-held reset —
+/// persistentExhaustionEventuallyReports holds over the same
+/// floor-blind trajectory generator the falsify twin
+/// (calibration/controller-075-failopen-spawn-clobber.qnt,
+/// WITHHOLD=false) violates it in. Floor-blind frame (ENFORCED=false)
+/// because foldSkip is only exercised there — the floor law is NOT
+/// wired in this regime (VPoisonBurst is reachable by design; the
+/// floor has its own regime). Non-vacuity: canReachSkipWithheld is
+/// wired as an expected-violation check — the withhold arm itself
+/// must be exercised.
+module spawnCoherenceFailopenWithhold {
+  import spawnCoherence(
+    IS_BUILDER = true,
+    CRD_PRESENT = true,
+    CEILING = 1,
+    ENABLE_RPC_FAULT = false,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = false,
+    ENABLE_RENDERED_DEADLINE = false,
+    ENABLE_EXHAUST_POISON = true,
+    ENABLE_EXHAUST_PERSIST = true,
+    ENABLE_CANCEL_ASBUILT = false,
+    ENABLE_CANCEL_CAUSE = false,
+    ENABLE_YOUNG_LEADER_REAP = false,
+    ENABLE_SYNTH_CLOSE = false,
+    ENABLE_EXEC_PINNED = false,
+    ENABLE_MULTI_POOL = false,
+    ENABLE_STREAK_POOL_KEY = false,
+    ENABLE_CANCEL_GENERATION = false,
+    ENABLE_RETRY_BACKOFF = false,
+    ENABLE_STREAK_CADENCE = true,
+    STREAK_FLOOR_ENFORCED = false,
+    STREAK_FLOOR = 2,
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = true,
+    SKIP_SPAWN_WITHHOLD = true
   ).*
 }

@@ -43,7 +43,9 @@ module gbCalibAckAttempted {
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
     STREAK_FLOOR = 2,
-    WINDOW_COUPLED_FOLD = false
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false
   ).* from "../spawnCoherence"
 
   /// The as-built tick with ONE change: the ack covers the attempted
@@ -234,6 +236,7 @@ module gbCalibAckAttempted {
       pendingClose' = pendingClose,
       obsLive' = obsLive,
       inBackoff' = inBackoff,
+      skipSpawned' = skipSpawned,
     }
   }
 
@@ -300,7 +303,9 @@ module gbCalibAckOnlyNew {
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
     STREAK_FLOOR = 2,
-    WINDOW_COUPLED_FOLD = false
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false
   ).* from "../spawnCoherence"
 
   /// The as-built tick with ONE change: only the spawned-this-tick set is
@@ -491,6 +496,7 @@ module gbCalibAckOnlyNew {
       pendingClose' = pendingClose,
       obsLive' = obsLive,
       inBackoff' = inBackoff,
+      skipSpawned' = skipSpawned,
     }
   }
 

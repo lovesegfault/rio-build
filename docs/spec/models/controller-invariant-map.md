@@ -1900,3 +1900,72 @@ in 56 s on the CI builder — inside the per-check budget with margin.
   the implementation actually REACH that binding under production
   identity shapes (`MintedPullIdentity` classifier). No model change;
   the m298 below-granularity disposition above stands.
+
+## bughunt-6 S4 — bug_075 skip-spawn axis pair, merged_bug_080 disposition, merged_bug_023 dwell arm (2026-06-10)
+
+- **bug_075 fold-skip fail-open spawn clobber (Model J
+  `ENABLE_SKIP_SPAWN_FAILOPEN` / `SKIP_SPAWN_WITHHOLD`, bughunt-6
+  S4):** the as-built jobs.rs ListFailed arm spawned mid-streak gated
+  intents fail-open; the Job's existing-name shadow froze evaluation
+  past the orphan expiry and destroyed live exhaustion evidence (the
+  report livelock). Two-const split per the m073 CADENCE/ENFORCED
+  precedent — FAILOPEN turns on the real skip-arm machinery + the
+  `skipSpawned` ghost + `VSpawnClobberedStreak` latch; WITHHOLD adds
+  the live-streak withhold law (the recorded Q1 divergence from the
+  book's one-const prescription: a single as-built-false axis would
+  have changed the floor-blind 073-burst lane's banked space, the one
+  pre-existing regime where `foldSkip` is exercised). FALSIFY:
+  `calibration/controller-075-failopen-spawn-clobber.qnt`
+  (FAILOPEN=true, WITHHOLD=false) violates
+  `persistentExhaustionEventuallyReports` — TLC 2,192 ms at the gate
+  check; rust-sim discovery seed 0x191f3eec3365d7f9 (972 ms at ~50k
+  traces/s); the violating trace carries `ESkipFailopenSpawn` at the
+  spawn tick and latches `VSpawnClobberedStreak` two ticks later
+  (trace-checked at introduction). Kill-isolation (R16): the
+  witness's other defeater `VForeignStreakWipe` is structurally
+  unreachable in the twin lane (WINDOW_COUPLED_FOLD=false,
+  ENABLE_MULTI_POOL=false). HOLD: `spawnCoherenceFailopenWithhold`
+  (both true, floor-blind frame so foldSkip is exercisable) —
+  EXHAUSTIVE green: 1,095,946,113 generated / 43,188,608 distinct /
+  0 queue in 939.4 s (TLC, inside the 1800 s budget); non-vacuity
+  `canReachSkipWithheld` expected-violation fires in 3,578 ms.
+  Byte-identity (F16) with both consts bound false:
+  `quint-spawn-coherence-streak-cadence` re-measure = 250,483,073
+  generated / 11,627,904 distinct — EXACT banked match (124.6 s vs
+  banked 118.6 s wall; states identical); every other pre-existing
+  regime pins `foldSkip` false structurally (CADENCE off or ENFORCED
+  on), so the axis is dead there by construction. All 22 in-file
+  instance modules + 11 calibration importer bindings carry the pair
+  (hazard cc/x); every override module typechecked solo (hazard
+  ccccc — the new `skipSpawned` ghost var moved the shared state
+  vector; ga/gb/gg custom tick frames extended frozen).
+- **merged_bug_080 respawn-record lifetime + reset evidence —
+  n/a-with-reason at quint AND kani:** the record law is single-key
+  with no interleaving content beyond what the typed unit census
+  drives, and the load-bearing time relation is made STRUCTURAL
+  (refresh-by-observed-artifact per cycle phase), not numeric.
+  Discharging artifacts: the `CyclePhase` exhaustive census witness
+  (`cycle_phase_census_refreshes_every_observable_phase`, 6 closed
+  phases, no wildcard arm) + the structural `note_job_alive` refresh
+  lane (commit 2a) + the typed `VerdictWitness` reset lane whose
+  caller census is compiler-derived (commit 2b, behind the WO-S3-P
+  proto contract). No model carries the record map; a quint axis
+  would re-encode the unit census without adding interleaving
+  content.
+- **merged_bug_023 Breadth→Dwell downgrade (Model N
+  `ENABLE_DWELL_ARM` / `DOWNGRADE_RUNS_CLOSE`, bughunt-6 S4):** the
+  code's engaged-continue arm swapped the stored axis with no
+  transition effects, so a breadth episode that decayed into the
+  dwell arm skipped Breadth's close and its retained evidence minted
+  per-node verdicts at dwell expiry. The wedgeCluster model had NO
+  dwell-engaged arm (releaseEdge fired the moment breadth decayed —
+  the model closed exactly where the code continued; the model was
+  right, the code diverged), hence no twin could drive the
+  trajectory. The dwell-engaged arm lands behind ENABLE_DWELL_ARM
+  (false = today's model, byte-identical pre-existing regimes per
+  F16) with DOWNGRADE_RUNS_CLOSE as the law const. FALSIFY:
+  `calibration/wedge-023-downgrade-skips-close.qnt` (arm on, law
+  off) violates `noPerNodeFromSuppressedEvidence` via the downgrade
+  path with a `sawDowngrade` reachability val; HOLD:
+  `quint-wedge-cluster-dwell-arm` (both true). Measures recorded in
+  the introducing commit.

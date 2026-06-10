@@ -40,6 +40,8 @@ module controller073Burst {
     ENABLE_STREAK_CADENCE = true,
     STREAK_FLOOR_ENFORCED = false,
     STREAK_FLOOR = 2,
-    WINDOW_COUPLED_FOLD = false
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false
   ).* from "../spawnCoherence"
 }

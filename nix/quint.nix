@@ -6720,6 +6720,55 @@ rec {
       witness = "persistentExhaustionEventuallyReports";
     };
 
+    # bug_075 FALSIFY half (bughunt-6 S4): the as-built ListFailed
+    # fail-open arm spawns a mid-streak gated intent on a fold-skip
+    # tick; the Job shadows the intent from evaluation (existing-name
+    # exclusion) and its LIVE streak dies job-held (the model's
+    # immediate reset abstracts the 120s orphan expiry vs the >=180s
+    # Job-alive floor) — VSpawnClobberedStreak latches and the report
+    # is livelocked. Kill-isolation: the witness's other defeater
+    # (VForeignStreakWipe) is structurally unreachable in this lane
+    # (WINDOW_COUPLED_FOLD=false, ENABLE_MULTI_POOL=false); the
+    # violating trace carries ESkipFailopenSpawn (the skip-tick spawn
+    # is trace-visible, verified at introduction). Rust-sim discovery
+    # seed 0x191f3eec3365d7f9 (972ms at ~50k traces/s) recorded in the
+    # introducing commit.
+    # r[verify ctrl.pool.no-eligible-persist+5]
+    quint-spawn-coherence-falsify-failopen-spawn-clobber = mkQuintWitnessCheck {
+      name = "spawn-coherence-falsify-failopen-spawn-clobber";
+      spec = "calibration/controller-075-failopen-spawn-clobber";
+      main = "controller075FailopenSpawnClobber";
+      extraSpecs = [ "spawnCoherence" ];
+      witness = "persistentExhaustionEventuallyReports";
+    };
+    # bug_075 HOLD half: the fixed withhold law over the SAME
+    # floor-blind trajectory generator (fold-skip exercised) — a
+    # fold-skip tick withholds exactly the live-streak intents, so the
+    # skip-spawn can never shadow live evidence into the job-held
+    # reset. The floor law is deliberately NOT wired here (ENFORCED is
+    # false so foldSkip is exercisable; VPoisonBurst is reachable by
+    # design and has its own regime).
+    # r[verify ctrl.pool.no-eligible-persist+5]
+    quint-spawn-coherence-failopen-withhold = mkQuintCheck {
+      name = "spawn-coherence-failopen-withhold";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceFailopenWithhold";
+      invariants = [
+        "persistentExhaustionEventuallyReports"
+        "noPoisonWhilePlaceable"
+      ];
+    };
+    # bug_075 hold non-vacuity: the withhold arm is actually exercised
+    # in the hold regime (a live-streak intent withheld on a fold-skip
+    # tick) — canReachSkipWithheld is expected [violation].
+    # r[verify ctrl.pool.no-eligible-persist+5]
+    quint-spawn-coherence-witness-skip-withheld = mkQuintWitnessCheck {
+      name = "spawn-coherence-witness-skip-withheld";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceFailopenWithhold";
+      witness = "canReachSkipWithheld";
+    };
+
     # bug_113 FALSIFY half: cancel + fast re-submit respawns the
     # deterministic Job name inside the recently_closed window; the
     # cause-only law cancel-selects the fresh Job. Live-import calib

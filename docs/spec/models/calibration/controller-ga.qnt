@@ -48,7 +48,9 @@ module gaCalibNoLiveRecheck {
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
     STREAK_FLOOR = 2,
-    WINDOW_COUPLED_FOLD = false
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false
   ).* from "../spawnCoherence"
 
   /// The as-built tick with ONE change: the live pod-phase re-check is
@@ -240,6 +242,7 @@ module gaCalibNoLiveRecheck {
       pendingClose' = pendingClose,
       obsLive' = obsLive,
       inBackoff' = inBackoff,
+      skipSpawned' = skipSpawned,
     }
   }
 
@@ -305,7 +308,9 @@ module gaCalibOrphanGateEmptyOk {
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
     STREAK_FLOOR = 2,
-    WINDOW_COUPLED_FOLD = false
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false
   ).* from "../spawnCoherence"
 
   /// The as-built tick with ONE change: the orphan-reap decision uses a
@@ -503,6 +508,7 @@ module gaCalibOrphanGateEmptyOk {
       pendingClose' = pendingClose,
       obsLive' = obsLive,
       inBackoff' = inBackoff,
+      skipSpawned' = skipSpawned,
     }
   }
 
@@ -568,7 +574,9 @@ module gaCalibCrdAbsentArmed {
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
     STREAK_FLOOR = 2,
-    WINDOW_COUPLED_FOLD = false
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false
   ).* from "../spawnCoherence"
 
   /// PRE-FIX gate retain: the crd-absent arm arms the gate (pass-through
@@ -777,6 +785,7 @@ module gaCalibCrdAbsentArmed {
       pendingClose' = pendingClose,
       obsLive' = obsLive,
       inBackoff' = inBackoff,
+      skipSpawned' = skipSpawned,
     }
   }
 

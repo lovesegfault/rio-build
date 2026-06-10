@@ -49,7 +49,9 @@ module ctrlCalib282BackoffIgnored {
     ENABLE_STREAK_CADENCE = false,
     STREAK_FLOOR_ENFORCED = false,
     STREAK_FLOOR = 2,
-    WINDOW_COUPLED_FOLD = false
+    WINDOW_COUPLED_FOLD = false,
+    ENABLE_SKIP_SPAWN_FAILOPEN = false,
+    SKIP_SPAWN_WITHHOLD = false
   ).* from "../spawnCoherence"
 
   /// PRE-FIX spawn edge: the backoff conjunct dropped (everything
