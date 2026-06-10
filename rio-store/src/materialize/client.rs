@@ -428,9 +428,8 @@ pub const REBOUND_ORIGIN: &str = "resume_rebound";
 /// distinguish itself from one slow answer.
 const WEDGE_WARN_THRESHOLD: u32 = 8;
 
-/// merged_bug_053 — the claim-wedge observer, AT THE GATE (the site
-/// the bounding invariant lets observe the stuck state): post-
-/// merged_bug_014 the standing is outcome-honest, so "the same
+/// merged_bug_053 → round-8 WO-S2-3 — the claim-wedge episode latch:
+/// post-merged_bug_014 the standing is outcome-honest, so "the same
 /// Charged entry, N gated passes, never answered" is exactly
 /// "the scheduler accepted presentations and answered none" — the
 /// scheduler-side outage the retired cap-refusal severity predicate
@@ -440,7 +439,9 @@ const WEDGE_WARN_THRESHOLD: u32 = 8;
 /// recovery info; the contested-remainder steady state (AtCap,
 /// CredentialOnly-dominated) stays at debug. Reset is STRUCTURAL:
 /// any answer/resolution/standing change alters the Charged set, and
-/// set-inequality is the reset.
+/// set-inequality is the reset — and the observer is TOTAL over the
+/// sealed pass outcome (every pass observes; the gated→Available
+/// heal clears the disclosure latch at the heal pass, bug_056).
 #[derive(Default)]
 struct WedgeLatch {
     last_charged: Vec<Uuid>,
@@ -491,8 +492,10 @@ struct WedgeLatch {
 #[derive(Default)]
 pub struct ResumeLedger {
     entries: VecDeque<ResumeEntry>,
-    /// merged_bug_053 — the gate-site wedge observer (lives with the
-    /// population it diagnoses; fed only by gated passes).
+    /// merged_bug_053 → round-8 WO-S2-3 — the wedge episode latch
+    /// (lives with the population it diagnoses; fed the sealed
+    /// outcome of EVERY pass — gated passes drive the streak,
+    /// un-gated ones the heal).
     wedge: WedgeLatch,
     /// merged_bug_014 — the rotation cursor: the job last presented
     /// by the resume pass; the next pass's window starts after it
@@ -788,18 +791,50 @@ impl ResumeLedger {
     }
 
     // r[impl store.materialize.honest-beat]
-    /// merged_bug_053 — feed the wedge observer one GATED pass (the
-    /// honest-beat gate calls this exactly when it withholds the
-    /// beat). The warn predicate is the one the invariant lets this
-    /// site observe: a persistent UNCHANGED Charged entry set across
-    /// [`WEDGE_WARN_THRESHOLD`] gated passes — post-merged_bug_014
-    /// the standing is outcome-honest, so this is exactly
-    /// "presentations accepted, none answered" (the scheduler-side
-    /// brownout). The AtCap CredentialOnly-dominated streak (the
-    /// contested-remainder steady state) stays at debug. Any answer,
-    /// resolution, or standing change alters the set — the reset is
-    /// the comparison itself; recovery logs once.
-    fn observe_gated_pass(&mut self, headroom: &MintHeadroom) {
+    /// merged_bug_053 → round-8 WO-S2-3 (bug_056) — the wedge episode
+    /// observer, TOTAL over the sealed pass outcome (fed from
+    /// `finish!` on EVERY pass): a warn-once episode latch is sound
+    /// only if its observer covers both gate outcomes — withheld AND
+    /// not — or the warned→cleared transition is enforced by the
+    /// absence of a writer. Pre-fix the observer was called only
+    /// inside the withhold branch, so a wedge that healed straight
+    /// into an un-gated pass left `warned`/`last_charged`/`streak`
+    /// stale-latched: the heal was never logged, the NEXT unrelated
+    /// episode's first gated pass emitted a spurious "recovered",
+    /// and an identical-charged-set repeat wedge never re-warned.
+    ///
+    /// The warn predicate is unchanged: a persistent UNCHANGED
+    /// Charged entry set across [`WEDGE_WARN_THRESHOLD`] gated
+    /// observations — post-merged_bug_014 the standing is
+    /// outcome-honest, so this is exactly "presentations accepted,
+    /// none answered" (the scheduler-side brownout). The AtCap
+    /// CredentialOnly-dominated streak (the contested-remainder
+    /// steady state) stays at debug. Every NON-wedged variant runs
+    /// the heal arm (an un-gated completed pass — including a
+    /// futility-withheld one, whose budget headroom was Available —
+    /// is evidence the mint headroom restored); `Abandoned` is a
+    /// typed no-op: a SIGTERM-cut pass observed no gate outcome, so
+    /// healing on it would be evidence-free.
+    fn observe_pass_outcome(&mut self, outcome: &PassOutcome) {
+        match outcome {
+            PassOutcome::Wedged(WedgeKind::BudgetPinned { .. }) => self.observe_wedged(true),
+            PassOutcome::Wedged(WedgeKind::AtCap { charged, entries }) => {
+                self.observe_wedged(charged * 2 >= *entries);
+            }
+            PassOutcome::Wedged(WedgeKind::Futility)
+            | PassOutcome::Delivered { .. }
+            | PassOutcome::Settled { .. }
+            | PassOutcome::Contested { .. }
+            | PassOutcome::ListedNoAction { .. }
+            | PassOutcome::Empty
+            | PassOutcome::ListFailed => self.heal_wedge(),
+            PassOutcome::Abandoned => {}
+        }
+    }
+
+    /// One headroom-gated observation (the streak/warn half — the
+    /// pre-fix body, preserved).
+    fn observe_wedged(&mut self, charged_dominated: bool) {
         let mut charged: Vec<Uuid> = self
             .entries
             .iter()
@@ -807,11 +842,6 @@ impl ResumeLedger {
             .map(|e| e.job_id)
             .collect();
         charged.sort_unstable();
-        let charged_dominated = match headroom {
-            MintHeadroom::Available => return,
-            MintHeadroom::BudgetPinned { .. } => true,
-            MintHeadroom::AtCap { charged, entries } => charged * 2 >= *entries,
-        };
         if !charged_dominated || charged.is_empty() {
             debug!(
                 entries = self.entries.len(),
@@ -850,6 +880,20 @@ impl ResumeLedger {
                  brownout?); listing withheld, resume lane still presenting"
             );
         }
+    }
+
+    /// The heal arm (bug_056): an un-wedged pass proves the mint
+    /// headroom restored — if a warn is latched, disclose the
+    /// recovery ONCE, then clear the episode state so a repeat wedge
+    /// with the identical charged set is a NEW episode (streak
+    /// restarts, warns at threshold).
+    fn heal_wedge(&mut self) {
+        if self.wedge.warned {
+            self.wedge.warned = false;
+            info!("claim wedge recovered (mint headroom restored)");
+        }
+        self.wedge.streak = 0;
+        self.wedge.last_charged.clear();
     }
 
     /// Test visibility: has the wedge observer warned?
@@ -1559,10 +1603,12 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
         ($exit:expr) => {{
             let resolutions = entries_at_entry.saturating_sub(ledger.len());
             let outcome = PassOutcome::seal($exit, &pass, claimed.len(), resolutions);
-            // round-8 WO-S2-2 — the futility latch observes EVERY
-            // exit (gated and abandoned included): evidence
-            // observation is structurally inseparable from pass
-            // completion.
+            // round-8 WO-S2-2/WO-S2-3 — BOTH episode observers (the
+            // wedge latch and the futility latch) consume the sealed
+            // outcome on EVERY exit: evidence observation is
+            // structurally inseparable from pass completion, so an
+            // unobserved transition cannot compile.
+            ledger.observe_pass_outcome(&outcome);
             futility.observe_outcome(&outcome, &pass);
             return PollPass { claimed, outcome };
         }};
@@ -1723,10 +1769,11 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             ?headroom,
             "pass cannot mint a fresh claim; listing beat withheld (honest beat)"
         );
-        // merged_bug_053: the wedge observer watches the gate — the
-        // only site that can see "the same Charged entries, pass
-        // after pass, never answered".
-        ledger.observe_gated_pass(&headroom);
+        // merged_bug_053 → WO-S2-3: the wedge observer rides the
+        // sealed outcome at finish! — this exit carries the gate's
+        // verdict in its PassExit, so the observer sees exactly
+        // "the same Charged entries, pass after pass, never
+        // answered" AND the heal when a later pass is un-gated.
         finish!(PassExit::GatedHeadroom(headroom));
     }
     if futility.is_withholding() {
@@ -5017,14 +5064,20 @@ mod tests {
              at the threshold gated pass naming the stuck job and streak"
         );
 
-        // Recovery: the orphan finally answers (NotYetReady — refund);
-        // the Charged set changes and the latch clears on the next
-        // gated observation... here the budget frees outright, so the
-        // next pass lists again (the gate no longer fires).
+        // Recovery: the orphan finally answers (NotYetReady — refund).
+        // The budget frees, the SAME pass lists (un-gated), and the
+        // wedge observer — fed the sealed outcome on EVERY pass —
+        // clears the disclosure latch AT THE HEAL with one recovery
+        // info (the doc's "recovery logs once", true as written).
         t.hang_next_pulls = 0;
         t.pulls = vec![Ok(not_yet_ready())].into();
         let _p = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
         assert_eq!(ledger.charged_len(), 0, "the answer refunded the orphan");
+        assert!(
+            !ledger.wedge_warned(),
+            "the heal pass cleared the disclosure latch (recovery \
+             disclosed once, at the heal — not at the next episode)"
+        );
     }
 
     /// merged_bug_053 companion green: an AtCap CredentialOnly-
@@ -5238,6 +5291,77 @@ mod tests {
                 pass.deliveries,
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // round-8 WO-S2-3 — the wedge episode total over the outcome
+    // alphabet (bug_056)
+    // -----------------------------------------------------------------
+
+    // r[verify store.materialize.honest-beat]
+    /// round-8 R8 (bug_056). Proposition certified (R16): the full
+    /// wedge episode lifecycle at the latch's state surface — warn
+    /// latched at threshold, CLEARED at the actual heal pass (a wedge
+    /// that heals straight into Available, the gate's un-observed
+    /// output arm pre-fix), and RE-WARNED at a repeat episode with
+    /// the IDENTICAL charged set. Pre-fix every wedge-state write
+    /// lived in an observer called only inside the withhold branch:
+    /// the gated→Available heal left warned/last_charged/streak
+    /// stale-latched — the heal was never logged, the NEXT unrelated
+    /// episode's first gated pass emitted a spurious "recovered", and
+    /// an identical-set repeat wedge never re-warned.
+    #[tokio::test(start_paused = true)]
+    async fn wedge_heal_into_available_logs_recovery_and_rearms() {
+        let d0 = descriptor(40);
+        let mut t = MockTransport::new(vec![Ok(listing(vec![d0.clone()]))], vec![], vec![]);
+        // Pass 1 mints d0 (answer lost), passes 2-9 are gated with the
+        // lost resume re-charging each pass: 9 hung pulls.
+        t.hang_next_pulls = 9;
+        let mut ledger = ResumeLedger::default();
+        let mut latch = ListFailureLatch::default();
+        let mut fut = ConversionFutilityLatch::default();
+        let tok = token();
+        let inst = instance("wedge-heal-w");
+        let p1 = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+        assert!(p1.is_empty());
+        assert_eq!(ledger.charged_len(), 1, "d0 is the Charged orphan");
+        for _ in 0..8 {
+            let p = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+            assert!(p.is_empty());
+        }
+        assert!(
+            ledger.wedge_warned(),
+            "precondition: the wedge warned at the threshold gated pass"
+        );
+
+        // The HEAL pass: d0's presentation answers NotYetReady — the
+        // refund frees the budget and the SAME pass lists (un-gated).
+        t.pulls = vec![Ok(not_yet_ready())].into();
+        let p = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+        assert!(p.is_empty());
+        assert_eq!(ledger.charged_len(), 0, "the answer refunded the orphan");
+        assert!(
+            !ledger.wedge_warned(),
+            "left: wedge_warned() stays true across the heal and all \
+             subsequent un-gated passes (no recovery line ever; the \
+             stale latch suppresses the next same-set episode's warn) / \
+             right: cleared at the heal pass with one recovery info"
+        );
+
+        // Phase 2: the SAME job re-charges (a lost resume) and wedges
+        // again — the repeat episode with the identical charged set
+        // must warn at threshold (the warn was re-armed at the heal).
+        t.hang_next_pulls = 8;
+        for _ in 0..8 {
+            let p = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+            assert!(p.is_empty());
+        }
+        assert_eq!(ledger.charged_len(), 1, "d0 re-charged (lost resume)");
+        assert!(
+            ledger.wedge_warned(),
+            "left: no second warn (the warn guard reads the stale \
+             latch) / right: the repeat episode warns at threshold"
+        );
     }
 
     // -----------------------------------------------------------------
