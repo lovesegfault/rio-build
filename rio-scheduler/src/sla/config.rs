@@ -490,8 +490,18 @@ pub struct SlaConfig {
     /// SAME `key` and reads every region's interrupt rows. Helm sets
     /// `scheduler.sla.cluster = .Values.karpenter.clusterName`.
     /// Empty (single-cluster default) matches the 043_sla_hardening
-    /// `DEFAULT ''` so greenfield deploys need no config.
-    #[serde(default)]
+    /// `DEFAULT ''` so greenfield deploys need no config. Normalized
+    /// at this serde seam by the ONE identity law (merged_bug_067:
+    /// trim; post-trim-empty = the single-cluster default — the same
+    /// law as the controller's `ClusterId::new` and the chart's
+    /// `rio.clusterIdentity` mint), so every SQL bind site — the
+    /// λ-filter, the EMA scope, the `interrupt_samples.cluster` stamp,
+    /// and any future consumer — reads the same alphabet the exposure
+    /// uids are minted from. One-time re-key note: a deployment that
+    /// previously ran a whitespace-padded value re-keys its
+    /// EMA/interrupt scope on upgrade (the padded scope's rows age
+    /// out) — the fix taking effect, not a residual.
+    #[serde(default, deserialize_with = "trim_string")]
     pub cluster: String,
     /// §13c-2: AWS bare-metal `instance-size` suffixes, used by
     /// [`super::catalog::derive_ceilings`] to synthesize the
@@ -519,6 +529,20 @@ pub struct SlaConfig {
     /// `karpenter.unlaunchableSizes`. Empty → no exclusion (vmtest).
     #[serde(default)]
     pub unlaunchable_sizes: Vec<String>,
+}
+
+/// merged_bug_067: the cluster-identity normalization seam — ONE
+/// deserializer covers every consumer of `[sla].cluster` (the
+/// λ-filter binds, the EMA scope, the `interrupt_samples.cluster`
+/// stamp), mirroring the controller's `ClusterId::new` trim law so
+/// the two binaries' identity alphabets cannot drift at the config
+/// boundary.
+fn trim_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    Ok(raw.trim().to_string())
 }
 
 fn default_hw_cost_tolerance() -> f64 {
@@ -1561,6 +1585,60 @@ pub const HELM_NOT_RENDERED_SLA_KEYS: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// merged_bug_067 R-3D: the scheduler's SQL scope axis consumes
+    /// the NORMALIZED cluster alphabet at every bind site — the trim
+    /// lives at the ONE serde seam, so every consumer (λ-filter, EMA
+    /// scope, the `interrupt_samples.cluster` stamp) and every future
+    /// one reads the same alphabet the controller's `ClusterId::new`
+    /// mints uids from. TRUE RED at 83e596f0c: `left: " prod-eu " /
+    /// right: "prod-eu"` — pre-fix the field was a bare
+    /// `#[serde(default)] String` bound raw into SQL, so ids
+    /// differing only in whitespace passed the render gate as
+    /// distinct, stayed distinct on the scheduler's λ-filter axis,
+    /// and trim-collided on the controller's uid axis with no warn.
+    #[test]
+    fn sla_cluster_trims_at_the_config_seam() {
+        let base_toml = r#"
+            tiers = [{ name = "normal" }]
+            default_tier = "normal"
+            max_cores = 64.0
+            max_mem = 1
+            max_disk = 1
+            default_disk = 1
+            hw_cost_source = "static"
+            reference_hw_class = "intel-8-nvme"
+            [probe]
+            cpu = 4.0
+            mem_per_core = 1
+            mem_base = 1
+            [hw_classes.intel-8-nvme]
+            labels = [
+              { key = "karpenter.k8s.aws/instance-generation", value = "8" },
+            ]
+            requirements = [
+              { key = "karpenter.k8s.aws/instance-generation", operator = "In", values = ["8"] },
+            ]
+            node_class = "rio-nvme"
+            max_cores = 64
+            max_mem = 1
+        "#;
+        let with_cluster = |cluster_line: &str| -> SlaConfig {
+            toml::from_str(&format!("{cluster_line}\n{base_toml}")).unwrap()
+        };
+        let sla = with_cluster("cluster = \" prod-eu \"");
+        assert_eq!(
+            sla.cluster, "prod-eu",
+            "the config seam normalizes; SQL binds consume the trimmed alphabet"
+        );
+        let sla = with_cluster("cluster = \"  \"");
+        assert_eq!(
+            sla.cluster, "",
+            "whitespace-only normalizes to the single-cluster default"
+        );
+        let sla = with_cluster("");
+        assert_eq!(sla.cluster, "", "the default stays the empty default");
+    }
 
     /// Minimal valid `requirements` for test fixtures (validate()
     /// requires non-empty + no `rio.build/*`).
