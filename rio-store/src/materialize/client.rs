@@ -1659,6 +1659,18 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
         }};
     }
     if available_slots == 0 {
+        // The ZERO-BUDGET pass (the round-8 executor-slot handoff:
+        // slot-gated passes drive available_slots = 0 through here):
+        // seals [`PassOutcome::Empty`] — the NORMAL idle pacing lane
+        // (one jittered beat), never the futility lane (the latch's
+        // streak law is mint-guarded and a zero-budget pass mints
+        // nothing). Composition note, recorded for the executor
+        // slot: `Empty` runs the wedge latch's heal arm, so a
+        // pool-exhausted stretch clears a warned budget wedge early
+        // — the warn re-arms at threshold on the next gated streak
+        // (bounded observability wobble; the wedge evidence model
+        // keys on gate outcomes and a zero-budget pass never reaches
+        // the gate).
         finish!(PassExit::Completed);
     }
 
