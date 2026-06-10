@@ -238,6 +238,26 @@ pub enum SubstituteError {
     #[error("download stalled: no body bytes for {window:?}; claim released in place")]
     Stalled { window: Duration },
 
+    /// A NAR-budget hold outlived its typed transfer-deadline envelope
+    /// ([`NarHoldEnvelope`]): the leg held budget permits
+    /// past `NarHoldEnvelope`'s deadline (grace + byte-basis at the
+    /// floor rate) without completing. The per-read stall clock cannot
+    /// see this shape — an adversarial trickle (or a black-holed
+    /// persist) satisfies every per-read window while pinning the pool
+    /// indefinitely. Returned as `Err` so moka does NOT cache it; the
+    /// reservation is credited back by drop on the return path, so a
+    /// parked sibling's whole-NAR head is granted within the residual
+    /// holder bounds. `hold_budget` is the envelope's derived total
+    /// (operator-meaningful; the raw deadline instant is not).
+    #[error(
+        "nar-budget hold exceeded its transfer deadline \
+         ({declared} declared bytes, {hold_budget:?} hold budget); aborted"
+    )]
+    HoldDeadlineExceeded {
+        declared: u64,
+        hold_budget: Duration,
+    },
+
     /// Transient upstream-429 (`r[store.substitute.probe-429-retry+3]`).
     /// `retry_after` is the parsed `Retry-After` header (delta-seconds
     /// or HTTP-date), `None` if absent or unparseable. Returned as
@@ -318,6 +338,18 @@ pub(crate) fn substitute_error_evidence(
         SubstituteError::Raced => (C::Raced, None),
         SubstituteError::RateLimited { retry_after } => (C::RateLimited, *retry_after),
         SubstituteError::Stalled { window } => (C::Stalled, Some(*window)),
+        // The hold-envelope abort is a budget-law stall: the leg's
+        // integral progress fell below the typed floor (trickle /
+        // black-holed persist) — the same operational posture as the
+        // per-read stall (claim released/aborted, infrastructure
+        // trouble, retryable), with the hold budget as the duration
+        // advice. Mapping it onto `C::Stalled` keeps the kernel's
+        // class alphabet untouched (no new class is commissioned this
+        // wave); the typed Rust variant preserves the distinction at
+        // every in-crate consumer.
+        SubstituteError::HoldDeadlineExceeded { hold_budget, .. } => {
+            (C::Stalled, Some(*hold_budget))
+        }
         SubstituteError::Admission(_) => (C::AdmissionSaturated, None),
         SubstituteError::Fetch(_) | SubstituteError::NarInfo(_) => (C::Fetch, None),
         SubstituteError::HashMismatch { .. }
@@ -511,6 +543,12 @@ pub struct Substituter {
     /// apply via [`ingest::SubstituteClaimParams`]. main.rs wires
     /// `Config::substitute_stall` here.
     stall_window: Duration,
+    /// Floor decompressed-throughput for the NAR-hold envelope
+    /// ([`NAR_HOLD_FLOOR_RATE`], bytes/second). The R17 violability
+    /// lane: tests/ops override via
+    /// [`Self::with_nar_hold_floor_rate`]; each envelope axis has a
+    /// violating red in the in-file battery.
+    nar_hold_floor_rate: u64,
     /// Owner attribution stamped on substitution-claimed placeholders
     /// (`manifests.claimed_by`): the pod name (`HOSTNAME`), or
     /// `"unknown"` outside k8s.
@@ -522,6 +560,18 @@ pub struct Substituter {
     /// assertable deterministically.
     #[cfg(test)]
     hash_gate: Option<HashGate>,
+    /// Test-only async gate at the head of `persist_nar`'s span (the
+    /// `hash_gate` seam form, one step later): models a black-holed
+    /// persist backend — rio-common's S3 client ships NO TimeoutConfig
+    /// by design (per-operation deadlines are the caller's duty,
+    /// Q-108), so an established-then-black-holed connection awaits
+    /// response headers forever. The W8-B′ red parks here and asserts
+    /// the call-site tail timeout releases the reservation by the hold
+    /// deadline. Async (`Notify`) so the tail `timeout` can CANCEL the
+    /// park — unlike the hash gate, whose `spawn_blocking` host tokio
+    /// never cancels (that lag is priced, not enforced).
+    #[cfg(test)]
+    persist_gate: Option<Arc<tokio::sync::Notify>>,
 }
 
 /// Test hook: a sync gate the hash `spawn_blocking` closure holds on.
@@ -578,6 +628,126 @@ const DEFAULT_SUBSTITUTE_NAR_BUDGET: usize = (8 * MAX_NAR_SIZE) as usize;
 const _: () = assert!(MAX_NAR_SIZE as usize <= DEFAULT_SUBSTITUTE_NAR_BUDGET);
 const _: () = assert!(MAX_NAR_SIZE - 1 <= u32::MAX as u64);
 
+/// Floor decompressed-throughput axis of the NAR-hold envelope
+/// (bytes/second). Derivation: a holder's transfer-time allowance is
+/// `bytes_basis / NAR_HOLD_FLOOR_RATE` on top of [`NAR_HOLD_GRACE`]'s
+/// fixed grace — at 256 KiB/s a `4 GiB − 1` declaration yields a
+/// ≈ 4.55 h ceiling, while an honest mirror sustaining ≥ 1 MiB/s
+/// clears with ≥ 4× margin. The ghc-binary rationale (the HTTP client
+/// is connect-timeout-only because a multi-GB body legitimately runs
+/// long) is PRESERVED: legitimate large transfers have real
+/// throughput; only a hold whose integral rate falls below this floor
+/// — the shape the per-read stall clock structurally cannot see — is
+/// aborted. Violable per R17 via [`Substituter::with_nar_hold_floor_rate`].
+pub(crate) const NAR_HOLD_FLOOR_RATE: u64 = 256 * 1024;
+
+/// Grace multiplier over the stall window for the NAR-hold envelope:
+/// `NAR_HOLD_GRACE = NAR_HOLD_GRACE_FACTOR × stall_window` (default
+/// 5 × 180 s = 15 min). Strictly looser than any single per-read
+/// window — the factor is pinned ≥ 2 below (`hold_grace_exceeds_
+/// stall_window`) so the hold deadline can never preempt a single
+/// healthy read; it only fires on integral slowness across reads.
+pub(crate) const NAR_HOLD_GRACE_FACTOR: u32 = 5;
+
+// Const-relation pin `hold_grace_exceeds_stall_window` (R17 ordering
+// law between nested budgets): the envelope's fixed grace is ≥ 2×
+// any stall window it is derived from, so the per-read clock always
+// fires first on a genuinely wedged read and the deadline only ever
+// cuts integral slowness.
+const _: () = assert!(NAR_HOLD_GRACE_FACTOR >= 2);
+
+/// The typed, violable transfer-deadline envelope every NAR-budget
+/// HOLD must carry (merged_bug_021's hold-TIME axis; R17 all-axes).
+/// One discipline: **waiters park free; holders expire** — the
+/// zero-holding budget park ([`NarBudgetReservation::reserve`]) stays
+/// untimed backpressure (the merged_bug_003 ruling, preserved
+/// verbatim on the wait edge), while every span that actually HOLDS
+/// permits is bounded by this envelope's deadline.
+///
+/// Derivation (constants above): `hold_budget = NAR_HOLD_GRACE_FACTOR
+/// × stall_window + bytes_basis / floor_rate`. The deadline is ARMED
+/// at permit grant ([`Self::arm`]), not at construction — a parked
+/// waiter holds nothing, so park time must not consume hold time
+/// (the slot invariant binds holders, and the substitute park's
+/// boundedness is the FIFO-induction theorem, not a clock).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NarHoldEnvelope {
+    /// Total typed hold budget (grace + transfer allowance).
+    hold_budget: Duration,
+    /// Byte basis the budget was derived from: the declared NarSize
+    /// (substitution) or the `MAX_NAR_SIZE` charged-permit cap
+    /// (PutPath/PutPathBatch ingest — the handler's own ceiling).
+    bytes_basis: u64,
+    /// Hold deadline. Provisional at construction; re-stamped by
+    /// [`Self::arm`] when the hold actually begins.
+    deadline: tokio::time::Instant,
+}
+
+impl NarHoldEnvelope {
+    /// Envelope for a substitute leg's whole-NAR reservation: basis is
+    /// the verified narinfo's declared `NarSize`.
+    pub(crate) fn for_declared(declared: u64, stall_window: Duration, floor_rate: u64) -> Self {
+        Self::derive(declared, stall_window, floor_rate)
+    }
+
+    /// Envelope for an incremental ingest holder (PutPath/PutPathBatch):
+    /// basis is the `MAX_NAR_SIZE` charged-permit cap — the most any
+    /// single handler may ever hold (`charged >= MAX_NAR_SIZE` is
+    /// rejected before each acquire), so the deadline is sufficient
+    /// for the largest lawful upload at the floor rate.
+    pub(crate) fn for_ingest_cap(stall_window: Duration, floor_rate: u64) -> Self {
+        Self::derive(MAX_NAR_SIZE, stall_window, floor_rate)
+    }
+
+    fn derive(bytes_basis: u64, stall_window: Duration, floor_rate: u64) -> Self {
+        let grace = stall_window.saturating_mul(NAR_HOLD_GRACE_FACTOR);
+        // `max(1)`: a zero floor rate would be division by zero; the
+        // production const is 256 KiB/s, and a 1-byte/s override is
+        // the loosest expressible envelope (≈ 136 years for 4 GiB —
+        // within tokio Instant range), not an unbounded one. Integer
+        // floor division (exact for the production pair: 4 GiB at
+        // 256 KiB/s = 16384 s); the sub-second remainder is noise
+        // against the ≥ 2×-stall grace, and `from_secs_f64` is
+        // banned (merged_bug_262 — panics on +inf/NaN).
+        let transfer = Duration::from_secs(bytes_basis / floor_rate.max(1));
+        let hold_budget = grace.saturating_add(transfer);
+        Self {
+            hold_budget,
+            bytes_basis,
+            deadline: tokio::time::Instant::now() + hold_budget,
+        }
+    }
+
+    /// Stamp the deadline from NOW — called exactly when the hold
+    /// begins (permit grant). Construction time (which may precede a
+    /// long zero-holding park) does not count against the hold.
+    pub(crate) fn arm(mut self) -> Self {
+        self.deadline = tokio::time::Instant::now() + self.hold_budget;
+        self
+    }
+
+    /// Time left before the deadline (zero once expired).
+    pub(crate) fn remaining(&self) -> Duration {
+        self.deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+    }
+
+    /// Whether the hold deadline has passed.
+    pub(crate) fn expired(&self) -> bool {
+        self.remaining() == Duration::ZERO
+    }
+
+    /// The derived total hold budget (for typed errors/diagnostics).
+    pub(crate) fn hold_budget(&self) -> Duration {
+        self.hold_budget
+    }
+
+    /// The byte basis the budget was derived from.
+    pub(crate) fn bytes_basis(&self) -> u64 {
+        self.bytes_basis
+    }
+}
+
 // r[impl store.put.nar-bytes-budget+4]
 /// One substitute leg's WHOLE-NAR budget reservation — the single-shot
 /// charge that replaced the incremental per-read acquire (live_047/R-C
@@ -597,6 +767,14 @@ const _: () = assert!(MAX_NAR_SIZE - 1 <= u32::MAX as u64);
 ///   cancelling the leg at the hash detach point cannot credit the
 ///   budget back while the detached blocking task still owns the
 ///   buffer — and drops after `persist_nar` returns.
+/// - **Every hold expires:** the reservation cannot be constructed
+///   without a [`NarHoldEnvelope`] (merged_bug_021 — an unenveloped
+///   permit-hold does not typecheck). The envelope is armed at grant
+///   and enforced over the read span ([`read_nar_capped`]'s per-read
+///   clamp + after-read expiry check) AND the post-read tail (the
+///   call-site `timeout(envelope.remaining(), …)` spanning hash →
+///   sigs → persist), so neither an adversarial trickle nor a
+///   black-holed persist can pin the pool past the deadline.
 ///
 /// The post-fix read loop ([`read_nar_capped`]) takes
 /// `&NarBudgetReservation` and neither `self` nor any semaphore — an
@@ -608,6 +786,11 @@ pub(crate) struct NarBudgetReservation {
     /// `reserve` permits in one `OwnedSemaphorePermit` (acquired via
     /// `acquire_many_owned`); credited back on drop.
     _permits: OwnedSemaphorePermit,
+    /// The typed hold envelope, armed at permit grant. Carried so the
+    /// read loop and the post-read tail derive every clock from ONE
+    /// deadline (`remaining()`), and so the type system makes an
+    /// unenveloped hold unwritable.
+    envelope: NarHoldEnvelope,
 }
 
 impl NarBudgetReservation {
@@ -618,9 +801,13 @@ impl NarBudgetReservation {
     /// the park now happens BEFORE the upstream connection opens, so a
     /// long park no longer rides an open socket the upstream may drop.
     /// Deliberately OUTSIDE the stall watchdog for the same reason.
+    /// The park is also OUTSIDE the hold envelope: `envelope` is armed
+    /// only at grant (a waiter holds nothing — its boundedness is the
+    /// FIFO-induction theorem over the holders, not a clock).
     async fn reserve(
         budget: Arc<Semaphore>,
         declared: u64,
+        envelope: NarHoldEnvelope,
         progress_handle: Option<&ingest::ProgressHandle>,
     ) -> Result<Self, SubstituteError> {
         // Defense in depth: the declared-size gate already rejected
@@ -642,7 +829,15 @@ impl NarBudgetReservation {
         if let Some(h) = progress_handle {
             h.set_phase(ingest::ClaimPhase::Downloading);
         }
-        Ok(Self { _permits: permits })
+        Ok(Self {
+            _permits: permits,
+            envelope: envelope.arm(),
+        })
+    }
+
+    /// The armed hold envelope (deadline stamped at permit grant).
+    pub(crate) fn envelope(&self) -> &NarHoldEnvelope {
+        &self.envelope
     }
 }
 
@@ -671,9 +866,14 @@ async fn read_nar_capped(
     progress: Option<&SubstProgressFn>,
     progress_handle: Option<&ingest::ProgressHandle>,
     upstream_base: &str,
-    _reservation: &NarBudgetReservation,
+    reservation: &NarBudgetReservation,
 ) -> Result<Vec<u8>, SubstituteError> {
     let stalled = || SubstituteError::Stalled { window: stall };
+    let envelope = reservation.envelope();
+    let deadline_exceeded = || SubstituteError::HoldDeadlineExceeded {
+        declared,
+        hold_budget: envelope.hold_budget(),
+    };
     // Exact-capacity allocation: appends never reallocate, so resident
     // heap for the buffer is bounded by the reservation (+1 sentinel
     // byte) at every instant — no doubling overshoot.
@@ -684,13 +884,33 @@ async fn read_nar_capped(
         // r[impl store.substitute.stall-abort+2]
         // Per-read stall clock: each successful read restarts it, so a
         // slow-but-advancing stream never trips — only a wedged one
-        // (no bytes for the whole window) does.
-        let n = tokio::time::timeout(stall, capped.read(&mut buf))
-            .await
-            .map_err(|_| stalled())?
-            .map_err(|e| SubstituteError::Fetch(format!("{nar_url} body: {e}")))?;
+        // (no bytes for the whole window) does. UNCHANGED as a rule —
+        // the envelope clamp below is a budget-law clock, not a new
+        // stall semantics: `min(stall, remaining)` only shortens the
+        // in-read wait when the HOLD deadline lands first, and the
+        // grace pin (`NAR_HOLD_GRACE_FACTOR ≥ 2`) guarantees the
+        // deadline can never preempt a single healthy read's window
+        // until integral slowness has already burned the grace.
+        let per_read = stall.min(envelope.remaining());
+        let n = match tokio::time::timeout(per_read, capped.read(&mut buf)).await {
+            Ok(r) => r.map_err(|e| SubstituteError::Fetch(format!("{nar_url} body: {e}")))?,
+            // Which clock fired? If the hold deadline has passed, this
+            // is the envelope abort (typed; credits the budget back by
+            // drop on the return path); otherwise the full per-read
+            // window elapsed byte-free — the classic stall.
+            Err(_) if envelope.expired() => return Err(deadline_exceeded()),
+            Err(_) => return Err(stalled()),
+        };
         if n == 0 {
             break;
+        }
+        // After-read expiry check: an adversarial trickle satisfies
+        // every per-read window (each read delivers ≥ 1 byte inside
+        // `stall`) while the integral rate stays below the floor —
+        // the merged_bug_021 evasion shape. The hold deadline is the
+        // clock that sees it.
+        if envelope.expired() {
+            return Err(deadline_exceeded());
         }
         out.extend_from_slice(&buf[..n]);
         if out.len() as u64 > declared {
@@ -774,9 +994,12 @@ impl Substituter {
             nar_bytes_budget: Arc::new(Semaphore::new(DEFAULT_SUBSTITUTE_NAR_BUDGET)),
             admission: None,
             stall_window: DEFAULT_SUBSTITUTE_STALL_WINDOW,
+            nar_hold_floor_rate: NAR_HOLD_FLOOR_RATE,
             claimed_by: std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".into()),
             #[cfg(test)]
             hash_gate: None,
+            #[cfg(test)]
+            persist_gate: None,
         }
     }
 
@@ -784,6 +1007,25 @@ impl Substituter {
     #[cfg(test)]
     pub(crate) fn with_hash_gate(mut self, gate: HashGate) -> Self {
         self.hash_gate = Some(gate);
+        self
+    }
+
+    /// Test-only: install the persist gate (see the field doc) — the
+    /// W8-B′ black-holed-persist seam.
+    #[cfg(test)]
+    pub(crate) fn with_persist_gate(mut self, gate: Arc<tokio::sync::Notify>) -> Self {
+        self.persist_gate = Some(gate);
+        self
+    }
+
+    /// Override the NAR-hold envelope's floor decompressed-throughput
+    /// ([`NAR_HOLD_FLOOR_RATE`], bytes/second). Builder-style — the
+    /// R17 violability lane: tests shrink the envelope so the
+    /// hold-deadline aborts are exercisable in seconds, and the
+    /// violation red (`hold_envelope_floor_rate_binds`) proves the
+    /// knob binds by flipping it.
+    pub fn with_nar_hold_floor_rate(mut self, bytes_per_sec: u64) -> Self {
+        self.nar_hold_floor_rate = bytes_per_sec;
         self
     }
 
@@ -1619,9 +1861,20 @@ impl Substituter {
             // (merged_bug_195) — and `>= MAX_NAR_SIZE` was rejected
             // above, so the charge is u32-expressible and below every
             // validate()-passing budget's floor.
+            // The typed hold envelope (merged_bug_021): demanded at
+            // the constructor — an unenveloped reservation does not
+            // typecheck — derived from the declared size at the floor
+            // rate, armed at permit grant (the zero-holding park does
+            // not consume hold time).
+            let envelope = NarHoldEnvelope::for_declared(
+                ni.nar_size,
+                self.stall_window,
+                self.nar_hold_floor_rate,
+            );
             let reservation = NarBudgetReservation::reserve(
                 self.nar_bytes_budget.clone(),
                 ni.nar_size,
+                envelope,
                 Some(&progress_handle),
             )
             .await?;
@@ -1652,73 +1905,112 @@ impl Substituter {
                 });
             }
 
-            // Hash-check the decompressed NAR against the narinfo's
-            // claim — off the async runtime (4 GiB ≈ 8-10s of pure
-            // compute would otherwise stall a tokio worker). `Bytes` is
-            // cheap-clone; move it in and back out alongside the digest.
-            //
-            // r[impl store.put.nar-bytes-budget+4]
-            // §3.2 step 4 (live_047/R-C): the RESERVATION rides the
-            // bytes through the detach. tokio never cancels blocking
-            // tasks, so dropping this future at the JoinHandle await
-            // leaves the digest task owning the full buffer — were the
-            // reservation parked in this frame, cancellation would
-            // credit the budget back while the bytes remain resident.
-            // Moving it into the closure ties credit-back to the
-            // moment the memory actually frees (the task's output
-            // drops). W-6a asserts this.
-            #[cfg(test)]
-            let hash_gate = self.hash_gate.clone();
-            // `_reservation`: re-bound here and held to the end of this
-            // block — the budget is credited back only after
-            // `persist_nar` returns (today's permit lifetime).
-            let (nar_bytes, _reservation, got_hash) =
-                tokio::task::spawn_blocking(move || -> (Bytes, NarBudgetReservation, [u8; 32]) {
-                    #[cfg(test)]
-                    if let Some(g) = &hash_gate {
-                        g.hold();
-                    }
-                    let h = sha2::Sha256::digest(&nar_bytes).into();
-                    (nar_bytes, reservation, h)
-                })
+            // — Post-read tail, ENFORCED under the hold envelope —
+            // The reservation provably spans hash → sigs → persist,
+            // and rio-common's S3 client ships NO TimeoutConfig by
+            // design (per-operation deadlines are the CALLER's duty;
+            // Q-108): an established-then-black-holed persist
+            // connection awaits response headers forever. So the
+            // whole tail runs under `timeout(envelope.remaining())` —
+            // expiry returns the typed `HoldDeadlineExceeded`,
+            // releasing the reservation by drop (the drop-guard above
+            // owns placeholder cleanup on the implicit-drop path;
+            // `put_chunked`'s internal rollback contract is
+            // unchanged). The one remaining NAMED premise is the hash
+            // compute bound (~10 s / 4 GiB): the `spawn_blocking`
+            // digest task is non-cancellable, so on timeout its
+            // completion still drops the moved reservation — that lag
+            // is PRICED slack on top of the enforced deadline, never
+            // a replacement for it (W-6a's credit-back-at-free
+            // property is preserved).
+            let tail_envelope = *reservation.envelope();
+            let tail = async {
+                // Hash-check the decompressed NAR against the
+                // narinfo's claim — off the async runtime (4 GiB ≈
+                // 8-10s of pure compute would otherwise stall a tokio
+                // worker). `Bytes` is cheap-clone; move it in and back
+                // out alongside the digest.
+                //
+                // r[impl store.put.nar-bytes-budget+4]
+                // §3.2 step 4 (live_047/R-C): the RESERVATION rides
+                // the bytes through the detach. tokio never cancels
+                // blocking tasks, so dropping this future at the
+                // JoinHandle await leaves the digest task owning the
+                // full buffer — were the reservation parked in this
+                // frame, cancellation would credit the budget back
+                // while the bytes remain resident. Moving it into the
+                // closure ties credit-back to the moment the memory
+                // actually frees (the task's output drops). W-6a
+                // asserts this.
+                #[cfg(test)]
+                let hash_gate = self.hash_gate.clone();
+                // `_reservation`: re-bound here and held to the end of
+                // this block — the budget is credited back only after
+                // `persist_nar` returns (today's permit lifetime).
+                let (nar_bytes, _reservation, got_hash) = tokio::task::spawn_blocking(
+                    move || -> (Bytes, NarBudgetReservation, [u8; 32]) {
+                        #[cfg(test)]
+                        if let Some(g) = &hash_gate {
+                            g.hold();
+                        }
+                        let h = sha2::Sha256::digest(&nar_bytes).into();
+                        (nar_bytes, reservation, h)
+                    },
+                )
                 .await
                 .map_err(|e| SubstituteError::Ingest(format!("hash task join: {e}")))?;
-            if got_hash != expected_hash {
-                return Err(SubstituteError::HashMismatch {
-                    expected: hex::encode(expected_hash),
-                    got: hex::encode(got_hash),
-                });
+                if got_hash != expected_hash {
+                    return Err(SubstituteError::HashMismatch {
+                        expected: hex::encode(expected_hash),
+                        got: hex::encode(got_hash),
+                    });
+                }
+
+                // Size + hash verified — `info.nar_size` (set in
+                // `narinfo_to_validated` from `ni.nar_size`) now
+                // provably equals what gets persisted. Compute sigs
+                // over the verified `info` so stored `(nar_size,
+                // signatures)` are mutually consistent.
+                info.signatures = self
+                    .sigs_for_mode(tenant_id, upstream.sig_mode, &ni, &info)
+                    .await;
+
+                // — Step 5-6: persist via the shared write-ahead core —
+                // merged_bug_003: the NAR is fully fetched; the persist
+                // can legitimately exceed the stall window (S3
+                // multipart, chunk dedup) with fetched_bytes frozen at
+                // nar_size — exempt AS DATA from the TAKEOVER
+                // predicate, not from the hold envelope: the budget
+                // law's deadline (hours at the floor rate) still
+                // bounds this span.
+                progress_handle.set_phase(ingest::ClaimPhase::Persisting);
+                #[cfg(test)]
+                if let Some(g) = &self.persist_gate {
+                    // The W8-B′ seam: a black-holed persist backend.
+                    g.notified().await;
+                }
+                ingest::persist_nar(
+                    &self.pool,
+                    self.chunk_backend.as_ref(),
+                    &info,
+                    claim,
+                    nar_bytes.into(),
+                    self.chunk_upload_max_concurrent,
+                    SUBSTITUTE_HOOKS,
+                )
+                .await
+                .map_err(|e| match e {
+                    PersistError::Chunked(e) => SubstituteError::Ingest(e.to_string()),
+                    PersistError::Inline(e) => SubstituteError::Ingest(e.to_string()),
+                })
+            };
+            match tokio::time::timeout(tail_envelope.remaining(), tail).await {
+                Ok(r) => r,
+                Err(_) => Err(SubstituteError::HoldDeadlineExceeded {
+                    declared: ni.nar_size,
+                    hold_budget: tail_envelope.hold_budget(),
+                }),
             }
-
-            // Size + hash verified — `info.nar_size` (set in
-            // `narinfo_to_validated` from `ni.nar_size`) now provably
-            // equals what gets persisted. Compute sigs over the
-            // verified `info` so stored `(nar_size, signatures)` are
-            // mutually consistent.
-            info.signatures = self
-                .sigs_for_mode(tenant_id, upstream.sig_mode, &ni, &info)
-                .await;
-
-            // — Step 5-6: persist via the shared write-ahead core —
-            // merged_bug_003: the NAR is fully fetched; the persist
-            // can legitimately exceed the stall window (S3 multipart,
-            // chunk dedup) with fetched_bytes frozen at nar_size —
-            // exempt AS DATA, not by a size-equality inference.
-            progress_handle.set_phase(ingest::ClaimPhase::Persisting);
-            ingest::persist_nar(
-                &self.pool,
-                self.chunk_backend.as_ref(),
-                &info,
-                claim,
-                nar_bytes.into(),
-                self.chunk_upload_max_concurrent,
-                SUBSTITUTE_HOOKS,
-            )
-            .await
-            .map_err(|e| match e {
-                PersistError::Chunked(e) => SubstituteError::Ingest(e.to_string()),
-                PersistError::Inline(e) => SubstituteError::Ingest(e.to_string()),
-            })
         }
         .await;
 
@@ -6243,55 +6535,410 @@ mod tests {
         assert_eq!(got2.nar_size, nar.len() as u64);
     }
 
+    /// The census file universe: EVERY `.rs` under `rio-store/src`,
+    /// embedded at compile time (the `fence_coverage.rs` hybrid — the
+    /// nix gate runs test binaries without the source tree on disk, so
+    /// a runtime-only walk fails there with NotFound; observed live at
+    /// the bughunt-6 gate). Completeness against the live tree is
+    /// pinned by [`census_universe_matches_live_tree`] on every
+    /// dev-tree run of the same commit.
+    const CENSUS_SOURCES: &[(&str, &str)] = &[
+        ("admission.rs", include_str!("admission.rs")),
+        ("authz.rs", include_str!("authz.rs")),
+        ("backend.rs", include_str!("backend.rs")),
+        ("cas.rs", include_str!("cas.rs")),
+        ("chunker.rs", include_str!("chunker.rs")),
+        ("config.rs", include_str!("config.rs")),
+        ("error.rs", include_str!("error.rs")),
+        ("gc/collect.rs", include_str!("gc/collect.rs")),
+        ("gc/drain.rs", include_str!("gc/drain.rs")),
+        ("gc/lock.rs", include_str!("gc/lock.rs")),
+        ("gc/mark.rs", include_str!("gc/mark.rs")),
+        (
+            "gc/mark_scan_bench.rs",
+            include_str!("gc/mark_scan_bench.rs"),
+        ),
+        ("gc/mod.rs", include_str!("gc/mod.rs")),
+        ("gc/orphan.rs", include_str!("gc/orphan.rs")),
+        ("gc/state.rs", include_str!("gc/state.rs")),
+        ("gc/sweep.rs", include_str!("gc/sweep.rs")),
+        ("gc/tenant.rs", include_str!("gc/tenant.rs")),
+        ("grpc/admin.rs", include_str!("grpc/admin.rs")),
+        ("grpc/chunk.rs", include_str!("grpc/chunk.rs")),
+        ("grpc/get_path.rs", include_str!("grpc/get_path.rs")),
+        ("grpc/mod.rs", include_str!("grpc/mod.rs")),
+        (
+            "grpc/put_path/common.rs",
+            include_str!("grpc/put_path/common.rs"),
+        ),
+        ("grpc/put_path/mod.rs", include_str!("grpc/put_path/mod.rs")),
+        (
+            "grpc/put_path_batch.rs",
+            include_str!("grpc/put_path_batch.rs"),
+        ),
+        ("grpc/queries.rs", include_str!("grpc/queries.rs")),
+        ("grpc/sign.rs", include_str!("grpc/sign.rs")),
+        ("ingest.rs", include_str!("ingest.rs")),
+        ("lib.rs", include_str!("lib.rs")),
+        ("logs/chunks.rs", include_str!("logs/chunks.rs")),
+        ("logs/gate.rs", include_str!("logs/gate.rs")),
+        ("logs/ingest.rs", include_str!("logs/ingest.rs")),
+        ("logs/loss.rs", include_str!("logs/loss.rs")),
+        ("logs/mbt_tests.rs", include_str!("logs/mbt_tests.rs")),
+        ("logs/mod.rs", include_str!("logs/mod.rs")),
+        ("logs/service.rs", include_str!("logs/service.rs")),
+        ("logs/sessions.rs", include_str!("logs/sessions.rs")),
+        ("logs/sweep.rs", include_str!("logs/sweep.rs")),
+        ("logs/tail.rs", include_str!("logs/tail.rs")),
+        ("main.rs", include_str!("main.rs")),
+        ("manifest.rs", include_str!("manifest.rs")),
+        (
+            "materialize/client.rs",
+            include_str!("materialize/client.rs"),
+        ),
+        (
+            "materialize/executor.rs",
+            include_str!("materialize/executor.rs"),
+        ),
+        ("materialize/mod.rs", include_str!("materialize/mod.rs")),
+        ("metadata/chunked.rs", include_str!("metadata/chunked.rs")),
+        (
+            "metadata/cluster_key_history.rs",
+            include_str!("metadata/cluster_key_history.rs"),
+        ),
+        ("metadata/inline.rs", include_str!("metadata/inline.rs")),
+        ("metadata/mod.rs", include_str!("metadata/mod.rs")),
+        ("metadata/queries.rs", include_str!("metadata/queries.rs")),
+        (
+            "metadata/tenant_keys.rs",
+            include_str!("metadata/tenant_keys.rs"),
+        ),
+        (
+            "metadata/upstreams.rs",
+            include_str!("metadata/upstreams.rs"),
+        ),
+        ("realisations.rs", include_str!("realisations.rs")),
+        ("signing.rs", include_str!("signing.rs")),
+        ("substitute.rs", include_str!("substitute.rs")),
+        ("test_helpers.rs", include_str!("test_helpers.rs")),
+        ("visibility.rs", include_str!("visibility.rs")),
+    ];
+
+    /// Files whose ENTIRE content is non-production (gated by their
+    /// parent module / feature, not by an in-file `mod tests`): their
+    /// hits classify as the `test` plane wholesale.
+    const CENSUS_WHOLE_FILE_NONPROD: &[(&str, &str)] = &[
+        (
+            "logs/mbt_tests.rs",
+            "wired `#[cfg(test)] mod mbt_tests` (logs/mod.rs)",
+        ),
+        (
+            "gc/mark_scan_bench.rs",
+            "wired `#[cfg(test)] mod mark_scan_bench` (gc/mod.rs)",
+        ),
+        (
+            "test_helpers.rs",
+            "test-utils feature plane (the dev self-dependency)",
+        ),
+    ];
+
+    /// Cut a source at its INLINE tests module (`#[cfg(test)]` line
+    /// followed by a `mod … {` line with a body) — not at the first
+    /// cfg(test) attribute (files carry cfg(test) consts mid-body) and
+    /// not at gated module DECLARATIONS (`#[cfg(test)] mod x;`, which
+    /// gc/mod.rs and logs/mod.rs carry mid-file; those files' bodies
+    /// continue after the declaration). The `gc/lock.rs` census
+    /// precedent, sharpened.
+    fn census_production_half(src: &str) -> String {
+        let lines: Vec<&str> = src.lines().collect();
+        for i in 0..lines.len().saturating_sub(1) {
+            let attr = lines[i].trim();
+            let next = lines[i + 1].trim_start();
+            if attr == "#[cfg(test)]" && next.starts_with("mod ") && next.contains('{') {
+                return lines[..i].join("\n");
+            }
+        }
+        src.to_string()
+    }
+
+    /// One classified needle family per line (first match wins;
+    /// `try_` checked first so `try_acquire_many_owned` cannot
+    /// double-count as the parking form). Split literals so a future
+    /// reorg cannot make production code self-match this table.
+    fn census_needle_class(line: &str) -> Option<&'static str> {
+        let t = line.trim_start();
+        if t.starts_with("//") {
+            return None;
+        }
+        let needles: &[(&str, &'static str)] = &[
+            (concat!("try_", "acquire"), "try_acquire"),
+            (concat!("acquire_many_", "owned("), "acquire_many_owned"),
+            (concat!(".acquire_", "many("), "acquire_many"),
+            (concat!(".acquire_", "owned("), "acquire_owned"),
+            (concat!(".acquire", "("), "acquire"),
+            (concat!("add_", "permits("), "add_permits"),
+            (concat!(".for", "get()"), "forget"),
+        ];
+        needles
+            .iter()
+            .find(|(n, _)| line.contains(n))
+            .map(|(_, c)| *c)
+    }
+
+    /// Dev-tree completeness pin for [`CENSUS_SOURCES`]: the embedded
+    /// universe equals the live `src/` tree EXACTLY (both directions),
+    /// so a new source file fails the census until embedded — the
+    /// acquire-site census's quantifier domain is generator-bounded,
+    /// never author-bounded. In the nix sandbox (no source dir) the
+    /// embedded scan is the same commit's content; the skip is
+    /// disclosed, not silent (the `fence_coverage.rs` form).
+    #[test]
+    fn census_universe_matches_live_tree() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        if !root.exists() {
+            eprintln!(
+                "src/ not on disk (nix sandbox): universe pinned by the \
+                 dev-tree run of this same commit"
+            );
+            return;
+        }
+        fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).expect("readable src dir") {
+                let path = entry.expect("readable dir entry").path();
+                if path.is_dir() {
+                    walk(&path, root, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(
+                        path.strip_prefix(root)
+                            .expect("under root")
+                            .to_str()
+                            .expect("source paths are UTF-8")
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        let mut live = Vec::new();
+        walk(&root, &root, &mut live);
+        live.sort();
+        let mut embedded: Vec<String> = CENSUS_SOURCES.iter().map(|(f, _)| f.to_string()).collect();
+        embedded.sort();
+        assert_eq!(
+            live, embedded,
+            "census universe drifted from the live tree: add/remove the \
+             named files in CENSUS_SOURCES so the acquire-site census sees \
+             the whole crate in the nix sandbox too"
+        );
+    }
+
     // r[verify store.put.nar-bytes-budget+4]
-    /// [GEN-SET] Budget acquire-site census (§5.1 census 3,
-    /// live_047/R-C). Generator: `rg -n 'acquire_many(_owned)?\(' \
-    /// rio-store/src/` — re-run it when this fails and re-derive the
-    /// expectations. The PRIMARY law is laws-as-types: the read loop
-    /// ([`read_nar_capped`]) takes `&NarBudgetReservation` and neither
-    /// `self` nor any semaphore, so an incremental per-read acquire
-    /// does not typecheck there; this census is the drift guard for
-    /// that signature and for the §3.2 residual's home (the per-chunk
-    /// regime lives ONLY in grpc/put_path/*; cas.rs holds the chunking
-    /// machinery and NO acquire site).
+    /// [GEN-SET] Budget acquire-site census — REBUILT crate-wide (bw8
+    /// WO-S1-1; the RC-1 kill on the no-deadlock theorem's own
+    /// quantifier domain). GENERATOR: this fn's scan over
+    /// [`CENSUS_SOURCES`] (the whole-crate embedded universe, pinned
+    /// to the live tree by [`census_universe_matches_live_tree`]) with
+    /// the needle family in [`census_needle_class`] — never an
+    /// author-typed file list (the prior form's four `include_str!`
+    /// files would have admitted a single-permit `.acquire_owned()` on
+    /// the budget handle, an `add_permits`/`forget` mint-or-leak site,
+    /// or any acquire outside the four files — e.g. grpc/mod.rs, where
+    /// the semaphore LIVES — into the pool invisibly, silently
+    /// re-conditionalizing the UNCONDITIONAL theorem).
+    ///
+    /// Three censuses ride this one scan:
+    /// - **Acquire-site:** every production acquire/mint/leak hit must
+    ///   match a classification row below (pool + discipline); the
+    ///   UNCLASSIFIED arm fails naming file/class/lines.
+    /// - **Wait-discipline:** the NAR-budget pool's parking acquires
+    ///   are EXACTLY {`reserve` (the one typed zero-holding park,
+    ///   provably holding nothing by the `NarBudgetReservation` type),
+    ///   `accumulate_chunk` (BUDGET_WAIT_GRACE-timed)} — pinned by the
+    ///   two `nar-budget` rows' counts.
+    /// - **Holder:** `held_permits` lives ONLY in the two ingest
+    ///   drains (each enveloped at first grant; persist spans
+    ///   enveloped at their finalize/stage chokepoints), and
+    ///   `NarBudgetReservation` construction lives ONLY in
+    ///   substitute.rs (envelope demanded at the constructor AND
+    ///   enforced end-of-hold by the call-site tail timeout).
+    ///
+    /// Test-half hits (everything past the tests-module cut, plus the
+    /// CENSUS_WHOLE_FILE_NONPROD planes) classify as the free `test`
+    /// plane: R13's sanctioned lanes construct freely there, and the
+    /// theorem quantifies over PRODUCTION acquire sites.
     #[test]
     fn nar_budget_acquire_site_census() {
-        // Split needles so this test's own source can't self-match.
-        let owned = concat!("acquire_many_", "owned(");
-        let borrowed = concat!(".acquire_", "many(");
-        // substitute.rs: the NarBudgetReservation::reserve body is the
-        // ONE production acquire site; the second hit is the
-        // `fetch_nar_backpressures_on_budget` test's pre-hold. A third
-        // hit means an incremental acquire crept back in.
-        let subs = include_str!("substitute.rs");
-        assert_eq!(
-            subs.matches(owned).count(),
-            2,
-            "substitute.rs budget-acquire census drifted: expected \
-             {{NarBudgetReservation::reserve, the backpressure test's pre-hold}}"
+        // (file, needle-class, expected production hits, classification)
+        // — machine-derived: filled from this test's own failure output
+        // at authoring (the committed-generator-output discipline), so
+        // any drift in either direction fails with the live counts.
+        const EXPECTED: &[(&str, &str, usize, &str)] = &[
+            (
+                "substitute.rs",
+                "acquire_many_owned",
+                1,
+                "NAR budget — THE whole-NAR reservation (reserve; typed \
+                 zero-holding park, envelope demanded at the constructor)",
+            ),
+            (
+                "grpc/put_path/common.rs",
+                "acquire_many",
+                1,
+                "NAR budget — THE per-chunk chokepoint (accumulate_chunk; \
+                 BUDGET_WAIT_GRACE-timed, grant-or-typed-shed)",
+            ),
+            (
+                "admission.rs",
+                "acquire_owned",
+                1,
+                "admission gate semaphore (sibling pool; SUBSTITUTE_ADMISSION_WAIT-timed)",
+            ),
+            (
+                "logs/service.rs",
+                "try_acquire",
+                2,
+                "logs stream-gate + byte_budget (sibling pools; non-parking \
+                 try_ forms, typed shed on None)",
+            ),
+            (
+                "materialize/executor.rs",
+                "acquire_owned",
+                1,
+                "executor slot pool (sibling pool; baseline parking acquire \
+                 under the executor's own laws)",
+            ),
+            (
+                "materialize/executor.rs",
+                "try_acquire",
+                1,
+                "executor slot pool — surplus try_ (non-parking)",
+            ),
+            (
+                "gc/lock.rs",
+                "acquire",
+                1,
+                "sqlx PgPool connection acquire (SessionConn::acquire's one \
+                 sanctioned site; not a tokio semaphore)",
+            ),
+            (
+                "gc/lock.rs",
+                "try_acquire",
+                1,
+                "PgSessionLock::try_acquire fn decl (PG advisory lock API; \
+                 non-blocking; not a tokio semaphore)",
+            ),
+            (
+                "gc/collect.rs",
+                "try_acquire",
+                1,
+                "GcCycleLease::try_acquire call (PG advisory lease; non-blocking)",
+            ),
+            (
+                "gc/mod.rs",
+                "try_acquire",
+                1,
+                "GcCycleLease::try_acquire call (PG advisory lease; non-blocking)",
+            ),
+            (
+                "gc/state.rs",
+                "try_acquire",
+                2,
+                "GcCycleLease::try_acquire decl + PgSessionLock::try_acquire \
+                 call (PG advisory lease plane; non-blocking)",
+            ),
+        ];
+
+        use std::collections::BTreeMap;
+        let mut observed: BTreeMap<(String, &'static str), Vec<usize>> = BTreeMap::new();
+        for (file, src) in CENSUS_SOURCES {
+            let scan_src = if CENSUS_WHOLE_FILE_NONPROD.iter().any(|(f, _)| f == file) {
+                String::new() // whole file is the test/bench plane — free.
+            } else {
+                census_production_half(src)
+            };
+            for (idx, line) in scan_src.lines().enumerate() {
+                if let Some(class) = census_needle_class(line) {
+                    observed
+                        .entry((file.to_string(), class))
+                        .or_default()
+                        .push(idx + 1);
+                }
+            }
+        }
+
+        let mut violations = Vec::new();
+        for ((file, class), lines) in &observed {
+            match EXPECTED.iter().find(|(f, c, _, _)| f == file && c == class) {
+                None => violations.push(format!(
+                    "UNCLASSIFIED: {file} [{class}] at lines {lines:?} — a new \
+                     acquire/mint/leak site joined the census; classify it \
+                     (which pool? parking or try_? enveloped or zero-holding?) \
+                     and, if it touches the NAR budget, extend the envelope \
+                     enforcement story before re-pinning"
+                )),
+                Some((_, _, n, _)) if *n != lines.len() => violations.push(format!(
+                    "COUNT DRIFT: {file} [{class}] expected {n}, found {} at \
+                     lines {lines:?}",
+                    lines.len()
+                )),
+                Some(_) => {}
+            }
+        }
+        for (file, class, n, _) in EXPECTED {
+            if !observed.contains_key(&(file.to_string(), *class)) {
+                violations.push(format!(
+                    "VANISHED: {file} [{class}] expected {n} production hits, \
+                     found none — the census row is stale"
+                ));
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "acquire-site census violations:\n{}",
+            violations.join("\n")
         );
-        assert_eq!(
-            subs.matches(borrowed).count(),
-            0,
-            "no borrowed acquire_many on the substitute plane"
-        );
-        // PutPath per-chunk family — the disclosed §3.2 residual stays
-        // exactly here (accumulate_chunk; PutPathBatch routes through
-        // the same body).
-        let put_common = include_str!("grpc/put_path/common.rs");
-        assert_eq!(
-            put_common.matches(borrowed).count(),
-            1,
-            "grpc/put_path/common.rs: accumulate_chunk is the one per-chunk site"
-        );
-        assert_eq!(put_common.matches(owned).count(), 0);
-        let put_batch = include_str!("grpc/put_path_batch.rs");
-        assert_eq!(put_batch.matches(owned).count(), 0);
-        assert_eq!(put_batch.matches(borrowed).count(), 0);
-        // cas.rs: chunking machinery only.
-        let cas_src = include_str!("cas.rs");
-        assert_eq!(cas_src.matches(owned).count(), 0);
-        assert_eq!(cas_src.matches(borrowed).count(), 0);
+
+        // Holder census riders on the same scan: `held_permits` only in
+        // the two ingest drains; `NarBudgetReservation` constructed only
+        // in substitute.rs (common.rs/put_path_batch.rs reference the
+        // envelope type, never the reservation).
+        let held = concat!("held_", "permits");
+        let resv = concat!("NarBudget", "Reservation");
+        for (file, src) in CENSUS_SOURCES {
+            let prod = if CENSUS_WHOLE_FILE_NONPROD.iter().any(|(f, _)| f == file) {
+                String::new()
+            } else {
+                census_production_half(src)
+            };
+            let held_hits = prod
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//") && l.contains(held))
+                .count();
+            let resv_hits = prod
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//") && l.contains(resv))
+                .count();
+            match *file {
+                // The two drains (envelope at first grant) + the
+                // single-path handler frame that carries the drain's
+                // returned permits through `finalize_single`'s
+                // enveloped persist span.
+                "grpc/put_path/common.rs" | "grpc/put_path_batch.rs" | "grpc/put_path/mod.rs" => {}
+                _ => assert_eq!(
+                    held_hits, 0,
+                    "{file}: held_permits outside the two ingest drains (+ \
+                     the single-path handler frame) — a new budget HOLDER \
+                     joined the census; envelope it"
+                ),
+            }
+            if *file != "substitute.rs" {
+                assert_eq!(
+                    resv_hits, 0,
+                    "{file}: NarBudgetReservation outside substitute.rs — a \
+                     new reservation site joined the census; the envelope \
+                     constructor demand + tail enforcement must follow"
+                );
+            }
+        }
     }
 
     // r[verify store.put.nar-bytes-budget+4]
@@ -6593,5 +7240,435 @@ mod tests {
             narinfo_to_validated(&ni, [0u8; 32]),
             Err(SubstituteError::NarInfo(_))
         ));
+    }
+
+    // =====================================================================
+    // NAR-hold envelope battery (bw8 WO-S1-1: merged_bug_021 + the
+    // hold edges of merged_bug_001). Shrunk envelopes ride the
+    // sanctioned builder overrides (`with_stall_window`,
+    // `with_nar_hold_floor_rate`) — the R17 violability lane;
+    // assertions are structural with ≥10× slack on shrunk bounds.
+    // =====================================================================
+
+    /// Drive ONE production upstream leg (the same `try_upstream` form
+    /// as the W-3 battery — `do_substitute`'s fold maps the typed
+    /// abort onto the Stalled class for fail-over, so the per-upstream
+    /// seam is where the typed variant is observable).
+    async fn drive_upstream(
+        sub: &Substituter,
+        tid: Uuid,
+        path: &str,
+    ) -> Result<UpstreamOutcome, SubstituteError> {
+        let http = sub.http.as_ref().unwrap();
+        let ups = metadata::upstreams::list_for_tenant(&sub.pool, tid)
+            .await
+            .unwrap();
+        // Each battery tenant seeds exactly ONE upstream.
+        assert_eq!(ups.len(), 1, "battery contract: one upstream per tenant");
+        let hp = StorePath::parse(path).unwrap().hash_part().to_string();
+        sub.try_upstream(http, tid, &ups[0], path, &hp, None).await
+    }
+
+    // W8-B (R16 statement): a reservation older than its typed
+    // deadline cannot exist — abort + credit-back observed under an
+    // adversarial trickle that satisfies every per-read clock, never
+    // over-delivers, and never EOFs (the exact merged_bug_021 evasion
+    // shape), with a parked sibling then completing.
+    /// RED pre-fix (verbatim, run at 83e596f0c): `left: leg still
+    /// holding at 3× the would-be deadline (5×stall + declared/
+    /// floor-rate ≈ 1.5s): a 150ms 1-byte trickle resets the per-read
+    /// stall clock forever, advances store_bytes so the takeover
+    /// predicate never strikes, never over-delivers, never EOFs;
+    /// available_permits == 0; parked sibling never granted / right:
+    /// HoldDeadlineExceeded ≤ deadline+slack; permits restored;
+    /// sibling completes`.
+    #[tokio::test]
+    async fn trickle_hold_aborts_at_the_transfer_deadline() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "bw8s1-r2").await;
+        let tid_sib = seed_tenant(&db.pool, "bw8s1-r2-sib").await;
+        let content = vec![0x6bu8; 64];
+        let (nar, _h) = rio_test_support::fixtures::make_nar(&content);
+        let path = rio_test_support::fixtures::test_store_path("bw8s1-trickle");
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let frames: Vec<Vec<u8>> = nar.iter().map(|b| vec![*b]).collect();
+        let n_frames = frames.len();
+        let fake = spawn_flex_upstream(
+            &path,
+            nar.clone(),
+            "cache.bw8r2",
+            FlexCfg {
+                nar_frames: Some((frames, Some(gate.clone()))),
+                ..Default::default()
+            },
+        )
+        .await;
+        insert_flex(&db.pool, tid, &fake, 50).await;
+
+        // Pool admits exactly one whole-NAR reservation. Envelope
+        // (shrunk via the builder lane): stall 300ms → deadline =
+        // 5×300ms + len/256KiB/s ≈ 1.5s.
+        let stall = Duration::from_millis(300);
+        let charge = (nar.len() as u64).max(MIN_NAR_CHUNK_CHARGE as u64) as usize;
+        let budget = Arc::new(Semaphore::new(charge));
+        let sub = Arc::new(
+            test_substituter(db.pool.clone())
+                .with_nar_bytes_budget(Arc::clone(&budget))
+                .with_stall_window(stall),
+        );
+        let deadline_bound = stall * NAR_HOLD_GRACE_FACTOR
+            + Duration::from_secs(nar.len() as u64 / NAR_HOLD_FLOOR_RATE);
+
+        // Trickle driver: one 1-byte frame per 150ms — inside every
+        // per-read stall window; the per-read clock NEVER fires.
+        let releaser = {
+            let g = gate.clone();
+            tokio::spawn(async move {
+                for _ in 0..n_frames {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    g.notify_one();
+                }
+            })
+        };
+        let leg = {
+            let s = Arc::clone(&sub);
+            let p = path.clone();
+            tokio::spawn(async move { drive_upstream(&s, tid, &p).await })
+        };
+        // Sibling parks on the exhausted pool (zero-holding head).
+        let path2 = rio_test_support::fixtures::test_store_path("bw8s1-sib");
+        let (nar2, _h2) = rio_test_support::fixtures::make_nar(b"sib");
+        let fake2 =
+            spawn_flex_upstream(&path2, nar2.clone(), "cache.bw8r2", FlexCfg::default()).await;
+        insert_flex(&db.pool, tid_sib, &fake2, 50).await;
+        let wait = tokio::time::Instant::now() + Duration::from_secs(5);
+        while budget.available_permits() > 0 {
+            assert!(
+                tokio::time::Instant::now() < wait,
+                "trickle leg never reserved"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let sib = {
+            let s = Arc::clone(&sub);
+            let p = path2.clone();
+            tokio::spawn(async move { drive_upstream(&s, tid_sib, &p).await })
+        };
+
+        // The hold MUST abort typed within 10× the derived deadline.
+        let got = tokio::time::timeout(deadline_bound * 10, leg)
+            .await
+            .expect("hold deadline must fire — the trickle satisfies every per-read window")
+            .unwrap();
+        assert!(
+            matches!(
+                got,
+                Err(SubstituteError::HoldDeadlineExceeded { declared, .. })
+                    if declared == nar.len() as u64
+            ),
+            "typed envelope abort expected, got {got:?}"
+        );
+        // Credit-back: the parked sibling is granted and completes.
+        let sib_got = tokio::time::timeout(Duration::from_secs(15), sib)
+            .await
+            .expect("sibling must complete once the expired hold credits back")
+            .unwrap()
+            .expect("sibling leg ok");
+        assert!(
+            matches!(sib_got, UpstreamOutcome::Hit { .. }),
+            "{sib_got:?}"
+        );
+        releaser.abort();
+        // Pool fully restored after both legs settle.
+        let restore = tokio::time::Instant::now() + Duration::from_secs(5);
+        while budget.available_permits() != charge {
+            assert!(
+                tokio::time::Instant::now() < restore,
+                "permits not restored: {} of {charge}",
+                budget.available_permits()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    // W8-B′ (R16 statement): a black-holed persist cannot hold a
+    // reservation past the deadline — the holder parked in the persist
+    // span releases by the hold deadline with permits restored and the
+    // parked sibling completing (the post-read tail is ENFORCED, not
+    // premised: rio-common's S3 client ships no TimeoutConfig, Q-108).
+    /// RED pre-fix (verbatim, run at 83e596f0c; the pre-fix park used
+    /// the hash gate — the only pre-fix-expressible post-read seam,
+    /// same population: a holder past the read loop): `left:
+    /// reservation still held at 3× the would-be deadline — the
+    /// post-read span (hash→sigs→persist) has no clock and the claim
+    /// phase is exempt from every watchdog; available_permits == 0 of
+    /// 256 / right: HoldDeadlineExceeded ≤ deadline+slack; permits
+    /// restored; parked sibling completes`.
+    #[tokio::test]
+    async fn blackholed_persist_releases_by_the_hold_deadline() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "bw8s1-r2b").await;
+        let tid_sib = seed_tenant(&db.pool, "bw8s1-r2b-sib").await;
+        let (path, nar) = make_path();
+        let fake =
+            spawn_flex_upstream(&path, nar.clone(), "cache.bw8r2b", FlexCfg::default()).await;
+        insert_flex(&db.pool, tid, &fake, 50).await;
+        let stall = Duration::from_millis(100);
+        let charge = (nar.len() as u64).max(MIN_NAR_CHUNK_CHARGE as u64) as usize;
+        let budget = Arc::new(Semaphore::new(charge));
+        let persist_gate = Arc::new(tokio::sync::Notify::new());
+        let sub = Arc::new(
+            test_substituter(db.pool.clone())
+                .with_nar_bytes_budget(Arc::clone(&budget))
+                .with_stall_window(stall)
+                .with_persist_gate(persist_gate.clone()),
+        );
+        let deadline_bound = stall * NAR_HOLD_GRACE_FACTOR
+            + Duration::from_secs(nar.len() as u64 / NAR_HOLD_FLOOR_RATE);
+
+        let leg = {
+            let s = Arc::clone(&sub);
+            let p = path.clone();
+            tokio::spawn(async move { drive_upstream(&s, tid, &p).await })
+        };
+        // Sibling parks behind the persist-parked holder.
+        let path2 = rio_test_support::fixtures::test_store_path("bw8s1-r2b-sib");
+        let (nar2, _h2) = rio_test_support::fixtures::make_nar(b"sib2");
+        let fake2 =
+            spawn_flex_upstream(&path2, nar2.clone(), "cache.bw8r2b", FlexCfg::default()).await;
+        insert_flex(&db.pool, tid_sib, &fake2, 50).await;
+        let wait = tokio::time::Instant::now() + Duration::from_secs(5);
+        while budget.available_permits() > 0 {
+            assert!(tokio::time::Instant::now() < wait, "leg never reserved");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // The sibling rides the SAME pool through its own ungated
+        // Substituter (the gate models ONE leg's black-holed backend;
+        // the pool is the shared object under test).
+        let sub_sib = Arc::new(
+            test_substituter(db.pool.clone())
+                .with_nar_bytes_budget(Arc::clone(&budget))
+                .with_stall_window(stall),
+        );
+        let sib = {
+            let s = Arc::clone(&sub_sib);
+            let p = path2.clone();
+            tokio::spawn(async move { drive_upstream(&s, tid_sib, &p).await })
+        };
+
+        // The persist park (never-notified gate) is cancelled by the
+        // tail timeout: typed abort within 10× the deadline.
+        let got = tokio::time::timeout(deadline_bound * 10, leg)
+            .await
+            .expect("the tail timeout must cancel the black-holed persist")
+            .unwrap();
+        assert!(
+            matches!(got, Err(SubstituteError::HoldDeadlineExceeded { .. })),
+            "typed envelope abort expected, got {got:?}"
+        );
+        let sib_got = tokio::time::timeout(Duration::from_secs(15), sib)
+            .await
+            .expect("sibling must complete once the expired hold credits back")
+            .unwrap()
+            .expect("sibling leg ok");
+        assert!(
+            matches!(sib_got, UpstreamOutcome::Hit { .. }),
+            "{sib_got:?}"
+        );
+        let restore = tokio::time::Instant::now() + Duration::from_secs(5);
+        while budget.available_permits() != charge {
+            assert!(
+                tokio::time::Instant::now() < restore,
+                "permits not restored: {} of {charge}",
+                budget.available_permits()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    // W8-E (R16 statement; GREEN-SIDE PIN, disclosed — it certifies a
+    // premise the pre-fix tree also satisfies): tokio fair-FIFO over
+    // `acquire_many` — three staggered PRODUCTION acquires (the
+    // reserve site itself) are granted in arrival order. This converts
+    // the theorem's fairness dependency from a documented upstream
+    // fact into an observed witness.
+    #[tokio::test]
+    async fn budget_grants_follow_arrival_order() {
+        let budget = Arc::new(Semaphore::new(MIN_NAR_CHUNK_CHARGE as usize));
+        let env = || {
+            NarHoldEnvelope::for_declared(
+                MIN_NAR_CHUNK_CHARGE as u64,
+                Duration::from_secs(1),
+                NAR_HOLD_FLOOR_RATE,
+            )
+        };
+        // A holds the whole pool.
+        let a = NarBudgetReservation::reserve(
+            Arc::clone(&budget),
+            MIN_NAR_CHUNK_CHARGE as u64,
+            env(),
+            None,
+        )
+        .await
+        .unwrap();
+        // B parks (signal just before the acquire polls), then C.
+        let (b_started_tx, b_started) = tokio::sync::oneshot::channel::<()>();
+        let b = {
+            let budget = Arc::clone(&budget);
+            tokio::spawn(async move {
+                let _ = b_started_tx.send(());
+                NarBudgetReservation::reserve(budget, MIN_NAR_CHUNK_CHARGE as u64, env(), None)
+                    .await
+            })
+        };
+        b_started.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let c = {
+            let budget = Arc::clone(&budget);
+            tokio::spawn(async move {
+                NarBudgetReservation::reserve(budget, MIN_NAR_CHUNK_CHARGE as u64, env(), None)
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!b.is_finished() && !c.is_finished(), "both must be parked");
+        // Release A: exactly B (the earlier arrival) is granted.
+        drop(a);
+        let b_res = tokio::time::timeout(Duration::from_secs(5), b)
+            .await
+            .expect("B granted after A frees")
+            .unwrap()
+            .unwrap();
+        assert!(!c.is_finished(), "C must still be parked behind B's grant");
+        // Release B: C granted.
+        drop(b_res);
+        tokio::time::timeout(Duration::from_secs(5), c)
+            .await
+            .expect("C granted after B frees")
+            .unwrap()
+            .unwrap();
+    }
+
+    // Envelope-violation red (R17, floor-rate axis): the SAME paced
+    // stream completes under a loose floor rate and aborts typed under
+    // an absurd one — the knob demonstrably BINDS, and the abort fires
+    // on a stream that satisfies every per-read window (the shape the
+    // stall clock structurally cannot see).
+    #[tokio::test]
+    async fn hold_envelope_floor_rate_binds() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let stall = Duration::from_millis(500);
+        let content = rio_test_support::fixtures::pseudo_random_bytes(21, 48 * 1024);
+        let (nar, _h) = rio_test_support::fixtures::make_nar(&content);
+        let frames: Vec<Vec<u8>> = nar.chunks(nar.len() / 12 + 1).map(|c| c.to_vec()).collect();
+        let n_frames = frames.len();
+
+        // Control arm (loose rate 8 KiB/s): deadline = 5×500ms +
+        // 48K/8K ≈ 8.5s; the ~3s paced transfer completes.
+        let tid_a = seed_tenant(&db.pool, "bw8s1-rate-a").await;
+        let path_a = rio_test_support::fixtures::test_store_path("bw8s1-rate-a");
+        let gate_a = Arc::new(tokio::sync::Notify::new());
+        let fake_a = spawn_flex_upstream(
+            &path_a,
+            nar.clone(),
+            "cache.bw8rate",
+            FlexCfg {
+                nar_frames: Some((frames.clone(), Some(gate_a.clone()))),
+                ..Default::default()
+            },
+        )
+        .await;
+        insert_flex(&db.pool, tid_a, &fake_a, 50).await;
+        let sub_a = test_substituter(db.pool.clone())
+            .with_stall_window(stall)
+            .with_nar_hold_floor_rate(8 * 1024);
+        let pace_a = {
+            let g = gate_a.clone();
+            tokio::spawn(async move {
+                for _ in 0..n_frames {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    g.notify_one();
+                }
+            })
+        };
+        let got_a = drive_upstream(&sub_a, tid_a, &path_a).await;
+        pace_a.abort();
+        assert!(
+            matches!(got_a, Ok(UpstreamOutcome::Hit { .. })),
+            "control arm (loose floor rate) must complete: {got_a:?}"
+        );
+
+        // Violation arm (absurd rate u64::MAX): deadline collapses to
+        // the grace (2.5s) < the ≥3s paced transfer — typed abort on a
+        // per-read-healthy stream.
+        let tid_b = seed_tenant(&db.pool, "bw8s1-rate-b").await;
+        let path_b = rio_test_support::fixtures::test_store_path("bw8s1-rate-b");
+        let gate_b = Arc::new(tokio::sync::Notify::new());
+        let fake_b = spawn_flex_upstream(
+            &path_b,
+            nar.clone(),
+            "cache.bw8rate",
+            FlexCfg {
+                nar_frames: Some((frames, Some(gate_b.clone()))),
+                ..Default::default()
+            },
+        )
+        .await;
+        insert_flex(&db.pool, tid_b, &fake_b, 50).await;
+        let sub_b = test_substituter(db.pool.clone())
+            .with_stall_window(stall)
+            .with_nar_hold_floor_rate(u64::MAX);
+        let pace_b = {
+            let g = gate_b.clone();
+            tokio::spawn(async move {
+                for _ in 0..n_frames {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    g.notify_one();
+                }
+            })
+        };
+        let got_b = drive_upstream(&sub_b, tid_b, &path_b).await;
+        pace_b.abort();
+        assert!(
+            matches!(got_b, Err(SubstituteError::HoldDeadlineExceeded { .. })),
+            "violation arm (absurd floor rate) must abort typed: {got_b:?}"
+        );
+    }
+
+    /// Const-relation pin `hold_grace_exceeds_stall_window` (R17
+    /// ordering law; the compile-time half is the
+    /// `NAR_HOLD_GRACE_FACTOR >= 2` const assert): the derived
+    /// envelope's fixed grace is ≥ 2× the stall window it derives
+    /// from, for every window — the deadline can never preempt a
+    /// single healthy read.
+    #[test]
+    fn hold_grace_exceeds_stall_window() {
+        for secs in [1u64, 30, 180, 600] {
+            let stall = Duration::from_secs(secs);
+            let env = NarHoldEnvelope::for_declared(0, stall, NAR_HOLD_FLOOR_RATE);
+            assert!(
+                env.hold_budget() >= stall * 2,
+                "grace {:?} < 2× stall {stall:?}",
+                env.hold_budget()
+            );
+        }
+    }
+
+    /// Const-relation pin `wait_grace_within_hold_floor` (R17 ordering
+    /// law; compile-time half lives beside BUDGET_WAIT_GRACE): the
+    /// chunk-acquire wait grace is strictly inside the smallest hold
+    /// envelope's fixed grace, so a waiting holder always sheds its
+    /// WAIT before its own HOLD deadline can fire.
+    #[test]
+    fn wait_grace_within_hold_floor() {
+        let min_hold_grace = DEFAULT_SUBSTITUTE_STALL_WINDOW * NAR_HOLD_GRACE_FACTOR;
+        assert!(
+            crate::grpc::NarIngestEnvelopeCfg::default().budget_wait_grace < min_hold_grace,
+            "wait grace must sit strictly inside the hold grace"
+        );
+        // And the ingest envelope's basis is the charged-permit cap.
+        let env =
+            NarHoldEnvelope::for_ingest_cap(DEFAULT_SUBSTITUTE_STALL_WINDOW, NAR_HOLD_FLOOR_RATE);
+        assert_eq!(env.bytes_basis(), MAX_NAR_SIZE);
     }
 }

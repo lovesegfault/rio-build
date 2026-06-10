@@ -53,6 +53,7 @@ mod sign;
 
 pub use admin::{StoreAdminServiceImpl, spawn_store_gauge_tick};
 pub use chunk::ChunkServiceImpl;
+pub use put_path::common::NarIngestEnvelopeCfg;
 
 /// Default cap on paths in a FindMissingPaths request (DoS guard).
 /// Matches `rio_nix::protocol::wire::MAX_COLLECTION_COUNT` — the gateway
@@ -237,6 +238,13 @@ pub struct StoreServiceImpl {
     /// Vec, which is the OOM vector: 10 × 4 GiB = 40 GiB RSS.
     // r[impl store.put.nar-bytes-budget+4]
     nar_bytes_budget: Arc<tokio::sync::Semaphore>,
+    /// Typed envelope knobs for the ingest plane's budget waits and
+    /// holds ([`NarIngestEnvelopeCfg`]) — wait grace at the
+    /// `accumulate_chunk` chokepoint, hold envelope over stream
+    /// residency and the persist span. Production default; tests
+    /// shrink via `.with_nar_ingest_envelope()` (the R17 violability
+    /// lane).
+    nar_ingest_envelope: NarIngestEnvelopeCfg,
     /// Upstream binary-cache substituter. `None` disables substitution
     /// (QueryPathInfo/GetPath miss → NotFound immediately, pre-P0462
     /// behavior). `Some` → on miss, try each of the requesting tenant's
@@ -327,6 +335,7 @@ impl StoreServiceImpl {
             service_verifier: None,
             service_bypass_callers: vec!["rio-gateway".to_string(), "rio-scheduler".to_string()],
             nar_bytes_budget: Arc::new(tokio::sync::Semaphore::new(DEFAULT_NAR_BUDGET)),
+            nar_ingest_envelope: NarIngestEnvelopeCfg::default(),
             substituter: None,
             chunk_upload_max_concurrent: cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
             max_batch_paths: DEFAULT_MAX_BATCH_PATHS,
@@ -658,6 +667,16 @@ pub(super) fn substitute_status(e: SubstituteError) -> Status {
         // may well exist upstream; only this download wedged.
         SubstituteError::Stalled { .. } => {
             Status::unavailable("upstream download stalled; claim released — retry")
+        }
+        // Hold-envelope abort (the budget law's clock, merged_bug_021):
+        // the leg held NAR-budget permits past its typed transfer
+        // deadline — an adversarial trickle or a black-holed persist.
+        // Same transient-retryable posture as `Stalled` (the claim is
+        // aborted on the same error path; a retry re-claims), and the
+        // budget permits were credited back by drop, so the retry can
+        // make progress.
+        SubstituteError::HoldDeadlineExceeded { .. } => {
+            Status::unavailable("nar-budget hold exceeded its transfer deadline; retry")
         }
         // Upstream-429: genuinely transient — `Unavailable` so the
         // scheduler's 8-attempt backoff retries. A bare 429 (no

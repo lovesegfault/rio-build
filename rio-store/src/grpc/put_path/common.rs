@@ -22,6 +22,8 @@
 //! chunked support). Factoring here keeps both impls thin wrappers
 //! around the same state machine.
 
+use std::time::Duration;
+
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use tonic::{Request, Status, Streaming};
@@ -48,6 +50,78 @@ const PUTPATH_HOOKS: ingest::IngestHooks = ingest::IngestHooks {
     stale_reclaimed_metric: "rio_store_putpath_stale_reclaimed_total",
     ctx_label: "PutPath",
 };
+
+/// Bound on any single charged budget wait at the per-chunk acquire
+/// chokepoint ([`StoreServiceImpl::accumulate_chunk`]): a holder's
+/// next-chunk acquire that parks longer than this sheds typed
+/// (`ResourceExhausted`, the retryable class the upload plane already
+/// absorbs — the logs-plane byte-budget shed is the house precedent)
+/// instead of hold-and-waiting forever behind a parked whole-NAR head
+/// (merged_bug_001's wedge edge). One authority, no mirrored literal:
+/// equals the substitute plane's stall window — a budget park longer
+/// than a full stall window means the pod has been at its
+/// OOM-protection bound for minutes, and shedding to the LB is the
+/// designed capacity answer. Uniform over ALL chunk acquires, first
+/// included: the chokepoint cannot see caller holdings, and the
+/// uniform bound is what makes the no-deadlock theorem's wait premise
+/// total over the census.
+pub(crate) const BUDGET_WAIT_GRACE: Duration = crate::substitute::DEFAULT_SUBSTITUTE_STALL_WINDOW;
+
+// Const-relation pin `wait_grace_within_hold_floor` (R17 ordering law
+// between nested budgets): the wait grace is strictly inside the
+// smallest hold envelope's fixed grace (`NAR_HOLD_GRACE_FACTOR ×
+// stall_window`), so a waiting holder always sheds its WAIT before
+// its own HOLD deadline can fire — wait-shedding is the first line
+// of defense, hold expiry the backstop.
+const _: () = assert!(
+    BUDGET_WAIT_GRACE.as_secs()
+        < crate::substitute::DEFAULT_SUBSTITUTE_STALL_WINDOW.as_secs()
+            * crate::substitute::NAR_HOLD_GRACE_FACTOR as u64
+);
+
+/// Typed NAR-budget envelope knobs for the gRPC ingest plane
+/// (PutPath/PutPathBatch) — the R17 violability lane for the
+/// service-side axes, mirroring the `Substituter` builder overrides.
+/// Production uses the `Default` impl; tests shrink via
+/// [`StoreServiceImpl::with_nar_ingest_envelope`] so the typed aborts
+/// are exercisable in seconds, and the violation reds prove each knob
+/// binds by flipping it.
+#[derive(Debug, Clone, Copy)]
+pub struct NarIngestEnvelopeCfg {
+    /// Bound on a single charged chunk-acquire wait
+    /// ([`BUDGET_WAIT_GRACE`]).
+    pub budget_wait_grace: Duration,
+    /// Stall window the ingest hold envelope derives its grace from
+    /// (`NAR_HOLD_GRACE_FACTOR ×` this; the substitute plane's
+    /// default window is the one authority).
+    pub hold_stall_window: Duration,
+    /// Floor decompressed-throughput for the ingest hold envelope
+    /// ([`crate::substitute::NAR_HOLD_FLOOR_RATE`], bytes/second).
+    pub hold_floor_rate: u64,
+}
+
+impl Default for NarIngestEnvelopeCfg {
+    fn default() -> Self {
+        Self {
+            budget_wait_grace: BUDGET_WAIT_GRACE,
+            hold_stall_window: crate::substitute::DEFAULT_SUBSTITUTE_STALL_WINDOW,
+            hold_floor_rate: crate::substitute::NAR_HOLD_FLOOR_RATE,
+        }
+    }
+}
+
+impl StoreServiceImpl {
+    /// Override the ingest-plane NAR-budget envelope knobs
+    /// ([`NarIngestEnvelopeCfg`]). Builder-style — the R17 violability
+    /// lane: tests shrink the wait grace / hold envelope so the typed
+    /// sheds and residency aborts are exercisable in seconds (and the
+    /// violation reds flip single knobs to prove each binds).
+    /// Production keeps the `Default`.
+    pub fn with_nar_ingest_envelope(mut self, cfg: NarIngestEnvelopeCfg) -> Self {
+        self.nar_ingest_envelope = cfg;
+        self
+    }
+}
 
 /// How the NAR was persisted. Batch uses this to pick the right
 /// `complete_manifest_*_in_tx` variant inside its atomic tx.
@@ -463,11 +537,30 @@ impl StoreServiceImpl {
                 "{ctx_label}: NAR chunks exceed size bound {MAX_NAR_SIZE} (received {new_len}+ bytes)"
             )));
         }
-        let permit = self
+        // Wait axis (merged_bug_001): the acquire is grace-bounded —
+        // grant or typed shed within `budget_wait_grace`, UNIFORM over
+        // all chunk acquires (first included: the chokepoint cannot
+        // see caller holdings). During a parked-head freeze a holder's
+        // next-chunk acquire cannot be granted at all and MUST shed to
+        // release; `ResourceExhausted` is the same retryable class the
+        // budget-closed arm already maps to, absorbed by the upload
+        // plane's retry machinery. Behavior delta (priced): deep
+        // saturation longer than the grace converts from an unbounded
+        // client hang into a typed shed.
+        let acquire = self
             .nar_bytes_budget
-            .acquire_many(nar_chunk_charge(chunk.len()) as u32)
-            .await
-            .map_err(|_| Status::resource_exhausted("NAR buffer budget closed"))?;
+            .acquire_many(nar_chunk_charge(chunk.len()) as u32);
+        let permit =
+            match tokio::time::timeout(self.nar_ingest_envelope.budget_wait_grace, acquire).await {
+                Ok(r) => r.map_err(|_| Status::resource_exhausted("NAR buffer budget closed"))?,
+                Err(_) => {
+                    return Err(Status::resource_exhausted(format!(
+                        "{ctx_label}: NAR buffer budget wait exceeded {:?} \
+                         (pod at its in-flight NAR-bytes bound); retry",
+                        self.nar_ingest_envelope.budget_wait_grace
+                    )));
+                }
+            };
         nar_data.extend_from_slice(chunk);
         hasher.update(chunk);
         Ok(permit)
@@ -505,6 +598,19 @@ impl StoreServiceImpl {
         let mut hasher = Sha256::new();
         let mut trailer: Option<PutPathTrailer> = None;
         let mut held_permits = Vec::new();
+        // Hold axis (merged_bug_021's ingest sibling): once this
+        // handler HOLDS budget permits, its client-controlled stream
+        // residency is bounded by a typed ingest envelope (armed at
+        // the FIRST granted permit — before that the read is untimed
+        // zero-holding backpressure, symmetric with the substitute
+        // park). A stopped-but-connected client (h2 keepalives held
+        // open, no messages) previously pinned its permits forever:
+        // PutPath claims keep `fetched_bytes` NULL — the structural
+        // exemption from every download-stall rule — so no watchdog
+        // ever reaps an ingest holder. Expiry aborts typed
+        // (`ResourceExhausted`); placeholder cleanup stays the
+        // caller's `abort_upload` contract.
+        let mut hold_envelope: Option<crate::substitute::NarHoldEnvelope> = None;
         // Cumulative permits charged (NOT raw bytes — `accumulate_chunk`
         // floors each chunk at MIN_NAR_CHUNK_CHARGE). Checked BEFORE
         // `accumulate_chunk` so a tiny-chunk stream that would exhaust
@@ -513,7 +619,25 @@ impl StoreServiceImpl {
         // r[impl store.put.nar-bytes-budget+4]
         let mut charged: u64 = 0;
         loop {
-            let msg = match stream.message().await {
+            let read = stream.message();
+            let msg = match &hold_envelope {
+                // Zero-holding: untimed backpressure (exempt).
+                None => read.await,
+                // Holding: the stream read is under the envelope clock.
+                Some(env) => match tokio::time::timeout(env.remaining(), read).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        return Err(Status::resource_exhausted(format!(
+                            "PutPath: NAR-budget hold exceeded its ingest envelope \
+                             ({:?} for the {}-byte charged-permit cap); \
+                             permits released — retry",
+                            env.hold_budget(),
+                            env.bytes_basis()
+                        )));
+                    }
+                },
+            };
+            let msg = match msg {
                 Ok(Some(m)) => m,
                 Ok(None) => break,
                 Err(e) => {
@@ -539,6 +663,13 @@ impl StoreServiceImpl {
                         .accumulate_chunk(&mut nar_data, &mut hasher, &chunk, "PutPath")
                         .await?;
                     held_permits.push(permit);
+                    // First grant: the hold begins — arm the envelope.
+                    if hold_envelope.is_none() {
+                        hold_envelope = Some(crate::substitute::NarHoldEnvelope::for_ingest_cap(
+                            self.nar_ingest_envelope.hold_stall_window,
+                            self.nar_ingest_envelope.hold_floor_rate,
+                        ));
+                    }
                 }
                 Some(put_path_request::Msg::Trailer(t)) => {
                     if trailer.is_some() {
@@ -578,6 +709,18 @@ impl StoreServiceImpl {
     /// output. On `persist_nar` error the placeholder is `abort_upload`ed
     /// here; the caller's drop-guard spawn is then a harmless no-op.
     /// `info.store_path_hash` MUST be populated.
+    ///
+    /// The caller's `held_permits` (the handler frame) span this whole
+    /// call, so the persist span is a budget HOLD and carries its own
+    /// envelope clock: a fresh [`crate::substitute::NarHoldEnvelope`]
+    /// over the ACTUAL buffered bytes (`nar_data.len()` — the basis
+    /// the permits actually cover), enforced via `timeout`. Same
+    /// Q-108 rationale as the substitute tail: rio-common's S3 client
+    /// ships NO TimeoutConfig by design, so an established-then-
+    /// black-holed persist connection would otherwise pin the
+    /// handler's permits forever — a holder span the no-deadlock
+    /// theorem must bound. Expiry aborts the placeholder and sheds
+    /// typed (`ResourceExhausted`, retryable).
     // r[impl obs.metric.transfer-volume]
     pub(in crate::grpc) async fn finalize_single(
         &self,
@@ -586,8 +729,24 @@ impl StoreServiceImpl {
         nar_data: Vec<u8>,
         tenant_id: Option<uuid::Uuid>,
     ) -> Result<(), Status> {
-        self.maybe_sign(tenant_id, &mut info).await;
-        if let Err(e) = self.persist_nar(&info, claim, nar_data, "PutPath").await {
+        let envelope = crate::substitute::NarHoldEnvelope::for_declared(
+            nar_data.len() as u64,
+            self.nar_ingest_envelope.hold_stall_window,
+            self.nar_ingest_envelope.hold_floor_rate,
+        );
+        let tail = async {
+            self.maybe_sign(tenant_id, &mut info).await;
+            self.persist_nar(&info, claim, nar_data, "PutPath").await
+        };
+        let persisted = match tokio::time::timeout(envelope.remaining(), tail).await {
+            Ok(r) => r.map(|_| ()),
+            Err(_) => Err(Status::resource_exhausted(format!(
+                "PutPath: NAR-budget hold exceeded its persist envelope \
+                 ({:?}); permits released — retry",
+                envelope.hold_budget()
+            ))),
+        };
+        if let Err(e) = persisted {
             self.abort_upload(&info.store_path_hash, claim).await;
             return Err(e);
         }

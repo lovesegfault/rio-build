@@ -1061,3 +1061,500 @@ async fn batch_guard_drop_reaps_placeholders() -> TestResult {
 
     Ok(())
 }
+
+// =========================================================================
+// BW8-S1 NAR-budget mixed-population battery (merged_bug_001 +
+// merged_bug_021's ingest edges). The mini upstream is a narinfo+NAR
+// axum pair (the in-file `spawn_flex_upstream`'s subset, ported here
+// because the substitute leg of the mixed population must be drivable
+// from the gRPC integration plane). Shrunk envelopes ride the
+// sanctioned builder overrides (`with_nar_ingest_envelope`,
+// `with_stall_window`) — the R17 violability lane; assertions are
+// structural with ≥10× slack on shrunk bounds.
+// =========================================================================
+
+mod bw8s1_budget {
+    use super::*;
+    use base64::Engine;
+    use rio_store::grpc::{NarIngestEnvelopeCfg, StoreServiceImpl as Svc};
+    use rio_store::substitute::Substituter;
+    use sha2::Digest as _;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    pub struct MiniUpstream {
+        pub url: String,
+        pub trusted_key: String,
+        _task: tokio::task::JoinHandle<()>,
+    }
+
+    /// Serve ONE (path, NAR) pair with a valid signature. When
+    /// `frames` is set, the NAR body streams those frames — every
+    /// frame after the first awaits the gate (one `notify_one` per
+    /// frame; Notify stores the permit).
+    pub async fn spawn_mini_upstream(
+        store_path: &str,
+        nar_bytes: Vec<u8>,
+        key_name: &str,
+        frames: Option<(Vec<Vec<u8>>, Arc<tokio::sync::Notify>)>,
+    ) -> MiniUpstream {
+        use axum::routing::get;
+
+        let seed = [0x42u8; 32];
+        let signer = rio_store::signing::Signer::from_seed(key_name, &seed);
+        let pubkey = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
+        let trusted_key = format!(
+            "{key_name}:{}",
+            base64::engine::general_purpose::STANDARD.encode(pubkey.as_bytes())
+        );
+        let nar_hash: [u8; 32] = sha2::Sha256::digest(&nar_bytes).into();
+        let nar_hash_str = format!(
+            "sha256:{}",
+            rio_nix::store_path::nixbase32::encode(&nar_hash)
+        );
+        let fp = rio_nix::narinfo::fingerprint(store_path, &nar_hash, nar_bytes.len() as u64, &[]);
+        let sig = signer.sign(&fp);
+        let sp = rio_nix::store_path::StorePath::parse(store_path).unwrap();
+        let hash_part = sp.hash_part();
+        let narinfo_body = format!(
+            "StorePath: {store_path}\nURL: nar/{hash_part}.nar\nCompression: none\n\
+             NarHash: {nar_hash_str}\nNarSize: {}\nReferences: \nSig: {sig}\n",
+            nar_bytes.len()
+        );
+        let narinfo_path = format!("/{hash_part}.narinfo");
+        let nar_path = format!("/nar/{hash_part}.nar");
+        let app = axum::Router::new()
+            .route(
+                "/nix-cache-info",
+                get(|| async { "StoreDir: /nix/store\nWantMassQuery: 1\n" }),
+            )
+            .route(&narinfo_path, get(move || async move { narinfo_body }))
+            .route(
+                &nar_path,
+                get(move || {
+                    let nar = nar_bytes.clone();
+                    let frames = frames.clone();
+                    async move {
+                        use axum::response::IntoResponse;
+                        if let Some((frames, gate)) = frames {
+                            let stream = futures_util::stream::unfold(
+                                (frames.into_iter(), gate, true),
+                                |(mut it, gate, first)| async move {
+                                    let f = it.next()?;
+                                    if !first {
+                                        gate.notified().await;
+                                    }
+                                    Some((
+                                        Ok::<_, std::io::Error>(axum::body::Bytes::from(f)),
+                                        (it, gate, false),
+                                    ))
+                                },
+                            );
+                            return axum::body::Body::from_stream(stream).into_response();
+                        }
+                        nar.into_response()
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        MiniUpstream {
+            url: format!("http://{addr}"),
+            trusted_key,
+            _task: task,
+        }
+    }
+
+    pub async fn seed_upstream(pool: &sqlx::PgPool, tid: uuid::Uuid, up: &MiniUpstream) {
+        sqlx::query(
+            "INSERT INTO tenant_upstreams (tenant_id, url, priority, trusted_keys, sig_mode) \
+             VALUES ($1, $2, 50, $3, 'keep')",
+        )
+        .bind(tid)
+        .bind(&up.url)
+        .bind(vec![up.trusted_key.clone()])
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// PutPath holder driver: send metadata + chunk1, return the open
+    /// tx so the test controls the rest of the stream.
+    pub fn holder_stream(
+        info: rio_proto::types::PathInfo,
+        chunk1: Vec<u8>,
+    ) -> (
+        mpsc::Sender<PutPathRequest>,
+        ReceiverStream<PutPathRequest>,
+        PutPathTrailer,
+    ) {
+        let mut info = info;
+        let (tx, rx) = mpsc::channel(8);
+        let trailer = PutPathTrailer {
+            nar_hash: std::mem::take(&mut info.nar_hash),
+            nar_size: std::mem::take(&mut info.nar_size),
+        };
+        tx.try_send(PutPathRequest {
+            msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
+                info: Some(info),
+            })),
+        })
+        .expect("fresh channel");
+        tx.try_send(PutPathRequest {
+            msg: Some(put_path_request::Msg::NarChunk(chunk1)),
+        })
+        .expect("fresh channel");
+        (tx, ReceiverStream::new(rx), trailer)
+    }
+
+    /// Shrunk service-side envelope for this battery: wait grace
+    /// 500ms; ingest hold envelope = 5×500ms + cap/2⁶⁴ ≈ 2.5s.
+    fn shrunk_cfg() -> NarIngestEnvelopeCfg {
+        NarIngestEnvelopeCfg {
+            budget_wait_grace: Duration::from_millis(500),
+            hold_stall_window: Duration::from_millis(500),
+            hold_floor_rate: u64::MAX,
+        }
+    }
+
+    // W8-A (R16 statement): the JOINT mixed population the R7 census
+    // named and W-3 withheld — a real PutPath holder and a real parked
+    // whole-NAR substitution head on ONE pool reach completion /
+    // typed-shed within the typed bounds — end-to-end through
+    // production gRPC and the production Substituter, asserted
+    // structurally (permit counts, completion, typed status codes).
+    // Batch-as-holder is W8-F (WO-S1-2a), same slot, same gate.
+    /// RED pre-fix (verbatim, run at 83e596f0c): `left: neither leg
+    /// completed within the observation bound; available_permits == 0
+    /// pinned below both demands (head demands 2016 > B − H = 1096;
+    /// the holder's next chunk acquire queues behind the parked head;
+    /// no release can occur in this two-party instance) / right:
+    /// substitution complete; upload completed or shed
+    /// resource_exhausted; permits restored`.
+    #[tokio::test]
+    async fn mixed_population_wedge_dissolves_within_typed_bounds() -> TestResult {
+        let db = TestDb::new(&MIGRATOR).await;
+        let budget_bytes = 4096usize;
+        let service = Svc::new(db.pool.clone())
+            .with_nar_budget(budget_bytes)
+            .with_nar_ingest_envelope(shrunk_cfg());
+        let budget = service.nar_bytes_budget().clone();
+        let (client, _server) = spawn_store_server(service).await?;
+
+        // Substituter on the SAME pool (the production main.rs wiring
+        // shape: one semaphore, two disciplines).
+        let tid = rio_store::test_helpers::seed_tenant(&db.pool, "bw8s1-r1").await;
+        let sub_content = rio_test_support::fixtures::pseudo_random_bytes(11, 1900);
+        let (sub_nar, _h) = make_nar(&sub_content);
+        let sub_path = test_store_path("bw8s1-r1-sub");
+        let up = spawn_mini_upstream(&sub_path, sub_nar.clone(), "cache.bw8r1", None).await;
+        seed_upstream(&db.pool, tid, &up).await;
+        let sub_stall = Duration::from_millis(300);
+        let sub = Arc::new(
+            Substituter::new(db.pool.clone(), None)
+                .with_http_client(rio_store::test_helpers::sandbox_http())
+                .with_nar_bytes_budget(budget.clone())
+                .with_stall_window(sub_stall),
+        );
+
+        // Fixture sizing pins: D > B − H (the head demands more than
+        // the holder leaves) and chunk2 ≤ B − H (the holder's next
+        // chunk is grantable in the head's absence) and D < B.
+        let h1 = 3000usize;
+        let chunk2_len = 800usize;
+        let d = sub_nar.len();
+        assert!(d > budget_bytes - h1, "sizing pin: D > B − H ({d})");
+        assert!(d < budget_bytes, "sizing pin: D < B ({d})");
+        assert!(
+            chunk2_len <= budget_bytes - h1,
+            "sizing pin: chunk2 fits sans head"
+        );
+
+        // Holder: real PutPath, chunk 1, pause (stream open).
+        let nar_a: Vec<u8> = rio_test_support::fixtures::pseudo_random_bytes(12, 3800);
+        let info_a = make_path_info_for_nar(&test_store_path("bw8s1-r1-hold"), &nar_a);
+        let (tx, rx, _trailer) = holder_stream(info_a.into(), nar_a[..h1].to_vec());
+        let mut put_client = client.clone();
+        let put = tokio::spawn(async move { put_client.put_path(rx).await });
+        let wait = tokio::time::Instant::now() + Duration::from_secs(5);
+        while budget.available_permits() != budget_bytes - h1 {
+            assert!(
+                tokio::time::Instant::now() < wait,
+                "holder never acquired chunk-1 permits; available={}",
+                budget.available_permits()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Head: real substitution parks (declared D > available B−H).
+        let leg = {
+            let s = Arc::clone(&sub);
+            let p = sub_path.clone();
+            tokio::spawn(async move { s.try_substitute(tid, &p).await })
+        };
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(!leg.is_finished(), "head must park on its reservation");
+
+        // Holder resumes: chunk 2 queues BEHIND the parked head — and
+        // now sheds typed within the wait grace, releasing the pool.
+        tx.send(PutPathRequest {
+            msg: Some(put_path_request::Msg::NarChunk(
+                nar_a[h1..h1 + chunk2_len].to_vec(),
+            )),
+        })
+        .await
+        .expect("stream open");
+
+        // The POST property, within 4× the summed typed bounds
+        // (wait grace + ingest envelope + the head's hold deadline).
+        let summed = Duration::from_millis(500)
+            + Duration::from_millis(2500)
+            + sub_stall * 5
+            + Duration::from_secs(1);
+        let put_res = tokio::time::timeout(summed * 4, put)
+            .await
+            .expect("upload must complete or shed typed within 4× summed bounds")
+            .unwrap();
+        let status = put_res.expect_err("the parked-head freeze must shed the holder typed");
+        assert_eq!(
+            status.code(),
+            tonic::Code::ResourceExhausted,
+            "typed shed expected, got {status:?}"
+        );
+        let leg_res = tokio::time::timeout(summed * 4, leg)
+            .await
+            .expect("substitution must complete within 4× summed bounds")
+            .unwrap()
+            .expect("substitute leg ok");
+        let info = leg_res.expect("upstream has the path");
+        assert_eq!(info.nar_size, sub_nar.len() as u64);
+        // Pool restored.
+        let restore = tokio::time::Instant::now() + Duration::from_secs(5);
+        while budget.available_permits() != budget_bytes {
+            assert!(
+                tokio::time::Instant::now() < restore,
+                "permits not restored: {} of {budget_bytes}",
+                budget.available_permits()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(tx);
+        Ok(())
+    }
+
+    // W8-C (R16 statement): ingest-holder residency through the
+    // production stream path including cleanup — a stopped-but-
+    // connected client cannot hold permits past the ingest envelope.
+    /// RED pre-fix (verbatim, run at 83e596f0c): `left: held_permits
+    /// retained at 3× the would-be ingest envelope (stopped-but-
+    /// connected client; available_permits == 57344 of 65536) /
+    /// right: typed resource_exhausted abort; permits restored ≤
+    /// bound`.
+    #[tokio::test]
+    async fn stopped_client_putpath_releases_by_the_ingest_deadline() -> TestResult {
+        let db = TestDb::new(&MIGRATOR).await;
+        let budget_bytes = 64 * 1024usize;
+        let service = Svc::new(db.pool.clone())
+            .with_nar_budget(budget_bytes)
+            .with_nar_ingest_envelope(shrunk_cfg());
+        let budget = service.nar_bytes_budget().clone();
+        let (client, _server) = spawn_store_server(service).await?;
+
+        let nar: Vec<u8> = rio_test_support::fixtures::pseudo_random_bytes(13, 8192);
+        let info = make_path_info_for_nar(&test_store_path("bw8s1-r3"), &nar);
+        let (tx, rx, _trailer) = holder_stream(info.into(), nar.clone());
+        let mut put_client = client.clone();
+        let put = tokio::spawn(async move { put_client.put_path(rx).await });
+        let wait = tokio::time::Instant::now() + Duration::from_secs(5);
+        while budget.available_permits() != budget_bytes - nar.len() {
+            assert!(
+                tokio::time::Instant::now() < wait,
+                "holder never acquired; available={}",
+                budget.available_permits()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Silence (stream open, tx alive). The ingest envelope
+        // (≈2.5s shrunk) must abort the holder typed within 10×.
+        let put_res = tokio::time::timeout(Duration::from_secs(25), put)
+            .await
+            .expect("ingest envelope must abort the stopped client")
+            .unwrap();
+        let status = put_res.expect_err("stopped client must be aborted typed");
+        assert_eq!(
+            status.code(),
+            tonic::Code::ResourceExhausted,
+            "typed ingest-envelope abort expected, got {status:?}"
+        );
+        // Permits restored ≤ bound.
+        let restore = tokio::time::Instant::now() + Duration::from_secs(5);
+        while budget.available_permits() != budget_bytes {
+            assert!(
+                tokio::time::Instant::now() < restore,
+                "permits not restored: {} of {budget_bytes}",
+                budget.available_permits()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(tx);
+        Ok(())
+    }
+
+    // W8-D (R16 statement): the wait axis at the sole non-reservation
+    // acquire chokepoint — grant-or-typed-shed within
+    // BUDGET_WAIT_GRACE (batch included by the census-pinned shared
+    // body), with the pool packed by a production reservation gated
+    // mid-read.
+    /// RED pre-fix (verbatim, run at 83e596f0c): `left: chunk acquire
+    /// still pending at 3× the would-be wait grace (parked behind a
+    /// production reservation; the chokepoint has no wait bound) /
+    /// right: resource_exhausted ≤ grace+slack; a post-drain retry
+    /// succeeds`.
+    #[tokio::test]
+    async fn chunk_acquire_sheds_typed_after_wait_grace() -> TestResult {
+        let db = TestDb::new(&MIGRATOR).await;
+        let budget_bytes = 4096usize;
+        let service = Svc::new(db.pool.clone())
+            .with_nar_budget(budget_bytes)
+            .with_nar_ingest_envelope(shrunk_cfg());
+        let budget = service.nar_bytes_budget().clone();
+        let (client, _server) = spawn_store_server(service).await?;
+
+        // Production reservation: substitute leg holds D ≈ 3500,
+        // gated mid-read (default stall window — no clock interferes
+        // with the gated read inside this test's horizon).
+        let tid = rio_store::test_helpers::seed_tenant(&db.pool, "bw8s1-r4").await;
+        let sub_content = rio_test_support::fixtures::pseudo_random_bytes(14, 3400);
+        let (sub_nar, _h) = make_nar(&sub_content);
+        let d = sub_nar.len();
+        assert!(d < budget_bytes, "sizing pin: D < B ({d})");
+        let sub_path = test_store_path("bw8s1-r4-sub");
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let frames = vec![sub_nar[..1000].to_vec(), sub_nar[1000..].to_vec()];
+        let up = spawn_mini_upstream(
+            &sub_path,
+            sub_nar.clone(),
+            "cache.bw8r4",
+            Some((frames, gate.clone())),
+        )
+        .await;
+        seed_upstream(&db.pool, tid, &up).await;
+        let sub = Arc::new(
+            Substituter::new(db.pool.clone(), None)
+                .with_http_client(rio_store::test_helpers::sandbox_http())
+                .with_nar_bytes_budget(budget.clone()),
+        );
+        let leg = {
+            let s = Arc::clone(&sub);
+            let p = sub_path.clone();
+            tokio::spawn(async move { s.try_substitute(tid, &p).await })
+        };
+        let wait = tokio::time::Instant::now() + Duration::from_secs(5);
+        while budget.available_permits() != budget_bytes - d {
+            assert!(
+                tokio::time::Instant::now() < wait,
+                "reservation never taken; available={}",
+                budget.available_permits()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // PutPath chunk whose charge exceeds the remainder: parks,
+        // then sheds typed within 10× the wait grace.
+        let chunk_len = 1000usize;
+        assert!(chunk_len > budget_bytes - d, "sizing pin: chunk > B − D");
+        let nar_b: Vec<u8> = rio_test_support::fixtures::pseudo_random_bytes(15, chunk_len);
+        let path_b = test_store_path("bw8s1-r4-up");
+        let info_b = make_path_info_for_nar(&path_b, &nar_b);
+        let (tx_b, rx_b, _trailer) = holder_stream(info_b.clone().into(), nar_b.clone());
+        let mut put_client = client.clone();
+        let put = tokio::spawn(async move { put_client.put_path(rx_b).await });
+        let put_res = tokio::time::timeout(Duration::from_secs(5), put)
+            .await
+            .expect("chunk acquire must shed within 10× the wait grace")
+            .unwrap();
+        let status = put_res.expect_err("packed pool must shed the chunk acquire typed");
+        assert_eq!(
+            status.code(),
+            tonic::Code::ResourceExhausted,
+            "typed shed expected, got {status:?}"
+        );
+        drop(tx_b);
+
+        // Drain: release the gated leg; it completes and frees the pool.
+        gate.notify_one();
+        let leg_res = tokio::time::timeout(Duration::from_secs(15), leg)
+            .await
+            .expect("gated leg completes after release")
+            .unwrap()
+            .expect("substitute leg ok");
+        assert!(leg_res.is_some(), "upstream has the path");
+
+        // A post-drain retry succeeds.
+        let mut retry_client = client.clone();
+        let created = put_path(&mut retry_client, info_b, nar_b).await?;
+        assert!(created, "post-drain retry must succeed");
+        Ok(())
+    }
+
+    // Envelope-violation red (R17, wait-grace axis): zero grace ⇒ a
+    // contended chunk acquire sheds immediately, while an uncontended
+    // acquire still succeeds — the knob binds the WAIT, not the grant.
+    #[tokio::test]
+    async fn wait_grace_binds() -> TestResult {
+        let db = TestDb::new(&MIGRATOR).await;
+        let budget_bytes = 4096usize;
+        let service = Svc::new(db.pool.clone())
+            .with_nar_budget(budget_bytes)
+            .with_nar_ingest_envelope(NarIngestEnvelopeCfg {
+                budget_wait_grace: Duration::ZERO,
+                ..shrunk_cfg()
+            });
+        let budget = service.nar_bytes_budget().clone();
+        let (client, _server) = spawn_store_server(service).await?;
+
+        // Uncontended: a full upload succeeds under zero grace (the
+        // acquire is granted on first poll).
+        let nar_ok: Vec<u8> = rio_test_support::fixtures::pseudo_random_bytes(16, 1024);
+        let info_ok = make_path_info_for_nar(&test_store_path("bw8s1-wg-ok"), &nar_ok);
+        let mut c1 = client.clone();
+        assert!(put_path(&mut c1, info_ok, nar_ok).await?);
+
+        // Contended (holder pins most of the pool): immediate shed.
+        let nar_hold: Vec<u8> = rio_test_support::fixtures::pseudo_random_bytes(17, 3500);
+        let info_hold = make_path_info_for_nar(&test_store_path("bw8s1-wg-hold"), &nar_hold);
+        let (tx, rx, _t) = holder_stream(info_hold.into(), nar_hold.clone());
+        let mut c2 = client.clone();
+        let put_hold = tokio::spawn(async move { c2.put_path(rx).await });
+        let wait = tokio::time::Instant::now() + Duration::from_secs(5);
+        while budget.available_permits() != budget_bytes - nar_hold.len() {
+            assert!(
+                tokio::time::Instant::now() < wait,
+                "holder never acquired; available={}",
+                budget.available_permits()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let nar_b: Vec<u8> = rio_test_support::fixtures::pseudo_random_bytes(18, 1000);
+        let info_b = make_path_info_for_nar(&test_store_path("bw8s1-wg-b"), &nar_b);
+        let (_tx_b, rx_b, _t2) = holder_stream(info_b.into(), nar_b);
+        let mut c3 = client.clone();
+        let put_b = tokio::spawn(async move { c3.put_path(rx_b).await });
+        let res = tokio::time::timeout(Duration::from_secs(2), put_b)
+            .await
+            .expect("zero grace must shed a contended acquire immediately")
+            .unwrap();
+        let status = res.expect_err("contended acquire under zero grace sheds");
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        drop(tx);
+        let _ = put_hold.await;
+        Ok(())
+    }
+}
