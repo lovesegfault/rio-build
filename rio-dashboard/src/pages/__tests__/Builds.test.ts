@@ -389,4 +389,42 @@ describe('Builds', () => {
       tenantFilter: '',
     });
   });
+
+  it('deep_link_fallback_does_not_steal_an_open_drawer', async () => {
+    // merged_bug_064 producer half: the async broad-fetch resolution
+    // must not re-point a drawer the user opened while it was in
+    // flight (the cross-wired-state route's producer). The deep link
+    // only fills an empty hand.
+    let resolveBroad!: (v: unknown) => void;
+    listBuilds
+      .mockResolvedValueOnce({
+        builds: [mkBuild({ buildId: 'clicked-build' })],
+        totalCount: 1,
+      })
+      .mockImplementationOnce(() => new Promise((r) => (resolveBroad = r)));
+
+    render(Builds, { props: { id: 'deep-link-target' } });
+    await tick();
+    await tick();
+    await tick();
+
+    // The user opens a drawer while the broad fetch is in flight.
+    await fireEvent.click(screen.getAllByTestId('build-row')[0]);
+    expect(screen.getByTestId('build-drawer')).toHaveTextContent(
+      'clicked-build',
+    );
+
+    // The broad fetch resolves with the deep-link target.
+    resolveBroad({
+      builds: [mkBuild({ buildId: 'deep-link-target', state: 4 })],
+      totalCount: 1,
+    });
+    await tick();
+    await tick();
+    await tick();
+
+    expect(screen.getByTestId('build-drawer')).toHaveTextContent(
+      'clicked-build',
+    );
+  });
 });

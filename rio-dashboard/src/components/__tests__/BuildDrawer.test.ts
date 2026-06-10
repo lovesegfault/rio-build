@@ -48,7 +48,10 @@ vi.mock('../../lib/graphLayout.worker?worker', () => ({
 
 import type { BuildInfo } from '../../api/types';
 import { createLogStream } from '../../lib/logStream.svelte';
-import BuildDrawer from '../BuildDrawer.svelte';
+import BuildDrawer, {
+  mkDrawerSession,
+  type DrawerSession,
+} from '../BuildDrawer.svelte';
 
 const { getBuildGraph } = adminMock;
 
@@ -216,5 +219,143 @@ describe('BuildDrawer log-stream scope', () => {
     await vi.advanceTimersByTimeAsync(5000);
     await flushSvelte();
     expect(oracle()).toBe(true);
+  });
+
+  // ---- the keyed session record (merged_bug_064) ----
+  //
+  // Per-build state has ONE owner whose lifecycle IS build.buildId: a
+  // re-point replaces the whole record. The pre-fix shape recreated
+  // only the poll while focusedDrv/focusedExecId survived, so the
+  // {#key} remounted LogViewer with build B's id and build A's
+  // NON-EMPTY exec-pinned selector -- past the api/logs.ts
+  // empty-selector backstop (it refuses only the all-empty form).
+
+  it('repoint_never_streams_the_previous_builds_selector', async () => {
+    // PROPOSITION (the failure frame, end-to-end): build A's
+    // exec-pinned selector never reaches the wire under build B's
+    // header -- asserted at the wire mock's call record, not at
+    // component internals.
+    const execA = '01900000-0000-7000-8000-00000000aaa1';
+    getBuildGraph.mockResolvedValue({
+      nodes: [
+        {
+          drvPath: DRV0,
+          pname: 'pkg-0',
+          system: 'x86_64-linux',
+          status: 'poisoned',
+          assignedExecutorId: '',
+          execId: execA,
+        },
+      ],
+      edges: [],
+      truncated: true,
+      totalNodes: 1,
+    });
+
+    const { rerender } = render(BuildDrawer, {
+      props: { build: mkBuild({ buildId: 'build-a' }) },
+    });
+    await flushSvelte();
+    await focusFirstNode();
+    await flushSvelte();
+
+    // The legit per-attempt mount under A, with A's exec pin.
+    expect(logsMock.tailLog).toHaveBeenCalledWith(
+      expect.objectContaining({ derivation: DRV0, execId: execA }),
+      expect.anything(),
+    );
+    logsMock.tailLog.mockClear();
+
+    // Re-point the SAME drawer instance at build B (the deep-link
+    // fallback race / keyboard-route shape -- no remount).
+    await rerender({ build: mkBuild({ buildId: 'build-b' }) });
+    await flushSvelte();
+    await flushSvelte();
+
+    expect(logsMock.tailLog).not.toHaveBeenCalledWith(
+      expect.objectContaining({ derivation: DRV0, execId: execA }),
+      expect.anything(),
+    );
+    // Post-fix shape: the Logs tab renders unfocused-by-design for B.
+    expect(screen.queryByTestId('logs-unfocused')).not.toBeNull();
+  });
+
+  it('repoint_replaces_the_session_wholesale', async () => {
+    // PROPOSITION (machine-censused membership): after a re-point,
+    // EVERY session field reads its fresh-mint value -- the membership
+    // is derived from Object.keys of a fresh constructor output (never
+    // an author list), and the per-field observable map is total over
+    // keyof DrawerSession (a new field fails compile until it maps).
+    const execA = '01900000-0000-7000-8000-00000000aaa2';
+    getBuildGraph.mockResolvedValue({
+      nodes: [
+        {
+          drvPath: DRV0,
+          pname: 'pkg-0',
+          system: 'x86_64-linux',
+          status: 'poisoned',
+          assignedExecutorId: '',
+          execId: execA,
+        },
+      ],
+      edges: [],
+      truncated: true,
+      totalNodes: 1,
+    });
+
+    const { rerender } = render(BuildDrawer, {
+      props: { build: mkBuild({ buildId: 'build-a' }) },
+    });
+    await flushSvelte();
+    await focusFirstNode();
+    await flushSvelte();
+    logsMock.tailLog.mockClear();
+    getBuildGraph.mockClear();
+
+    await rerender({ build: mkBuild({ buildId: 'build-b' }) });
+    await flushSvelte();
+    await flushSvelte();
+
+    // The fresh mint is the oracle for "reset": per session field,
+    // one rendered observable certifies the field equals its
+    // fresh-mint value (poll compared by buildId identity -- the
+    // post-repoint dispatch carries B's id).
+    const observableReset: Record<keyof DrawerSession, () => void> = {
+      buildId: () => {
+        // The key field: every keyed consumer re-minted under B — the
+        // wire-visible one is the poll dispatch carrying B's id (the
+        // constructor threads the key, so a stale key cannot dispatch).
+        expect(getBuildGraph).toHaveBeenCalledWith(
+          { buildId: 'build-b' },
+          expect.anything(),
+        );
+      },
+      poll: () => {
+        expect(getBuildGraph).toHaveBeenCalledWith(
+          { buildId: 'build-b' },
+          expect.anything(),
+        );
+      },
+      focusedDrv: () => {
+        // fresh.focusedDrv === undefined renders the unfocused panel.
+        expect(screen.queryByTestId('logs-unfocused')).not.toBeNull();
+      },
+      focusedExecId: () => {
+        // fresh.focusedExecId === '' -- no stale exec pin reaches the
+        // wire after the re-point.
+        expect(logsMock.tailLog).not.toHaveBeenCalledWith(
+          expect.objectContaining({ execId: execA }),
+          expect.anything(),
+        );
+      },
+    };
+    const fresh = mkDrawerSession('census-probe');
+    fresh.poll.destroy();
+    for (const k of Object.keys(fresh)) {
+      const probe = observableReset[k as keyof DrawerSession];
+      expect(probe, `no reset observable mapped for session field ${k}`)
+        .toBeDefined();
+      probe();
+    }
   });
 });

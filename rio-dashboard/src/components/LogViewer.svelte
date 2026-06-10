@@ -24,9 +24,13 @@
 
   let {
     // Populated by BuildDrawer when a DrvNode is clicked in the Graph
-    // tab — the drawer's `focusedDrv` state threads through via the
-    // `ondrvclick` callback on Graph.svelte. Undefined means "whole
-    // build" (no derivation filter on the log stream).
+    // tab — the drawer's session state threads through via the
+    // `ondrvclick` callback on Graph.svelte. Always defined in
+    // production: the unfocused Logs tab never mounts this component
+    // (dash.log.attempt-scope — the sole mount site sits behind a
+    // focused-drv guard), and the empty selector an undefined value
+    // would produce is refused at the api/logs.ts boundary as the
+    // backstop.
     drvPath = undefined,
     // Per-build observation of which execution this build watched
     // (`GraphNode.exec_id` ← `build_derivations.exec_id`). Empty for
@@ -74,8 +78,11 @@
   // builds), which is the right answer for a cache hit (it observed
   // whatever the last execution produced) but is "approximate" because
   // a later execution may have overwritten it by read time. The
-  // whole-build view (drvPath undefined) doesn't get the banner —
-  // there's no per-drv exec_id to be approximate against.
+  // `drvPath !== undefined` conjunct below is defensive: the retired
+  // whole-build mode is unrepresentable at the mount site (the drawer
+  // mounts this component only with a focused drv), so the conjunct
+  // never decides in production — it keeps the banner law total over
+  // the prop type.
   const approximate = $derived(drvPath !== undefined && execId === '');
 
   // The banner zone's single render input (bug_065): the exhaustive

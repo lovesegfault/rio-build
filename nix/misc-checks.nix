@@ -1693,7 +1693,7 @@ in
             # comments that reference spec markers + crate names — same
             # drift surface as .nix/.sh.
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "nix" || f.hasExt "sh" || f.hasExt "json") ../nix)
-            (pkgs.lib.fileset.fileFilter (f: f.hasExt "ts") ../rio-dashboard)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "ts" || f.hasExt "svelte") ../rio-dashboard)
             ../flake.nix
             ../CLAUDE.md
             ../README.md
@@ -1976,7 +1976,7 @@ in
         # tripped its own author three times exactly that way.
         # Self-allowlist: misc-checks.nix only (this file names the
         # tokens to deny them).
-        deny_concept='\bBuildExecution\b|\bCancelSignal\b|\bHeartbeatRequests?\b|\bHeartbeatResponses?\b|Heartbeat.{0,2}(RPC|unary)|\b[Rr]eady[- ]queues?\b|\bready_queue\b|\bDrainExecutor\b|terminationGracePeriodSeconds: 7200|blocks until its single in-flight build|Baked-in beats runtime envsubst|Forward-compat.*lands in P[0-9]|lands in P[0-9].*No Data|prox(y|ies|ying).{0,60}(Cilium|Envoy) Gateway|\(no series\).*never fires'
+        deny_concept='\bBuildExecution\b|\bCancelSignal\b|\bHeartbeatRequests?\b|\bHeartbeatResponses?\b|Heartbeat.{0,2}(RPC|unary)|\b[Rr]eady[- ]queues?\b|\bready_queue\b|\bDrainExecutor\b|terminationGracePeriodSeconds: 7200|blocks until its single in-flight build|Baked-in beats runtime envsubst|Forward-compat.*lands in P[0-9]|lands in P[0-9].*No Data|prox(y|ies|ying).{0,60}(Cilium|Envoy) Gateway|\(no series\).*never fires|[Uu]ndefined means .{0,4}.whole.{0,3}build|whole.?build view \(drvPath undefined\)|no derivation filter on the log stream'
         # merged_bug_081: every escape token WORD-BOUND — the old
         # unanchored vocabulary legalized live narration via substrings
         # ("unremoved", "pre-pulling") and via unrelated matches in the
@@ -2021,7 +2021,12 @@ in
         echo 'nginx proxies gRPC-Web POSTs to the Envoy Gateway listener' > "$TMPDIR/c1red/hop.nix"
         # merged_bug_006 token: the removed DrainExecutor RPC.
         echo 'operators drain a worker via the DrainExecutor RPC' > "$TMPDIR/c1red/drain.rs"
+        # merged_bug_063 token: the retired whole-build LogViewer mode
+        # narrated as live (.svelte is in-scope since the crossSrc
+        # fileset widening that shipped with this token).
+        echo 'Undefined means "whole build" (no derivation filter on the log stream)' > "$TMPDIR/c1red/prop.svelte"
         echo 'the removed DrainExecutor RPC once drained workers' > "$TMPDIR/c1green/drain.rs"
+        echo 'the retired whole-build view (drvPath undefined) no longer mounts' > "$TMPDIR/c1green/prop.svelte"
         echo 'the removed BuildExecution stream routed work (stream-era)' > "$TMPDIR/c1green/doc.typ"
         echo 'historical note: this text said it lands in P0539d; shows No Data — removed' > "$TMPDIR/c1green/panel.json"
         echo 'nginx no longer proxies to the Cilium Gateway listener (registry-direct now)' > "$TMPDIR/c1green/hop.nix"

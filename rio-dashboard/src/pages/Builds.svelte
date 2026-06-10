@@ -131,7 +131,11 @@
       .listBuilds({ statusFilter: '', limit: 1000, offset: 0, tenantFilter: '' })
       .then((r) => {
         const found = r.builds.find((b) => b.buildId === target);
-        if (found) selected = found;
+        // Non-stealing (merged_bug_064 producer half): the user may
+        // have opened a drawer while this broad fetch was in flight —
+        // an async re-point of an OPEN drawer cross-wires per-build
+        // state downstream. The deep link only fills an empty hand.
+        if (found && selected === null) selected = found;
       })
       .catch(() => {
         // Swallow — the list effect above will surface transport errors.

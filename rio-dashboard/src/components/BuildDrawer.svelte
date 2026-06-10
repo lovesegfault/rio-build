@@ -1,10 +1,57 @@
-<script lang="ts">
-  import type { BuildInfo } from '../api/types';
-  import { progress, fmtTsAbs } from '../lib/buildInfo';
+<script lang="ts" module>
   import {
     createBuildGraphPoll,
     type BuildGraphPoll,
   } from '../lib/buildGraphPoll.svelte';
+
+  /** Per-build drawer session (merged_bug_064) — the keyed-lifecycle
+   * law: state whose meaning is keyed by `build.buildId` has ONE owner
+   * whose lifecycle IS the key. A key change replaces the WHOLE record
+   * (the `$effect` in the instance script); retaining any field across
+   * a re-point is unrepresentable — a key change has no per-field
+   * write path, only the constructor.
+   *
+   * MEMBERSHIP RULE (derived; stated here so the next field lands on
+   * the right side): a field belongs to this record iff its VALUE
+   * references the keyed identity — `poll` (THIS build's graph),
+   * `focusedDrv`/`focusedExecId` (THIS build's drvs/execs).
+   * `activeTab` ('logs' | 'graph') is EXCLUDED: its value never
+   * references the keyed identity (cross-build UI preference), and
+   * with focus cleared a surviving Logs tab renders the
+   * unfocused-by-design panel for the new build, which is correct. */
+  export type DrawerSession = {
+    /** THE key itself — the record is self-keying, so keyed consumers
+     * ({#key}, Graph) structurally cannot pair this record's state
+     * with a different build's identity, even in the one-flush window
+     * between a prop write and the replacement effect. */
+    buildId: string;
+    /** THE node-status source (merged_bug_134): one session-lifetime
+     * GetBuildGraph poll feeding Graph's rendering AND the log
+     * stream's terminality oracle. */
+    poll: BuildGraphPoll;
+    /** Focused derivation (Graph tab click) — this build's drv. */
+    focusedDrv: string | undefined;
+    /** The focused node's exec pin — this build's observation. */
+    focusedExecId: string;
+  };
+
+  /** The ONE session constructor: every field starts at its
+   * fresh-build value. Exported for the headless census test —
+   * `Object.keys(mkDrawerSession(...))` is the machine-derived
+   * membership the wholesale-replacement witness iterates. */
+  export function mkDrawerSession(buildId: string): DrawerSession {
+    return {
+      buildId,
+      poll: createBuildGraphPoll(buildId),
+      focusedDrv: undefined,
+      focusedExecId: '',
+    };
+  }
+</script>
+
+<script lang="ts">
+  import type { BuildInfo } from '../api/types';
+  import { progress, fmtTsAbs } from '../lib/buildInfo';
   import { TERMINAL } from '../lib/graphLayout';
   import Graph from './Graph.svelte';
   import BuildStatePill from './BuildStatePill.svelte';
@@ -22,24 +69,22 @@
 
   let activeTab = $state<'logs' | 'graph'>('logs');
 
-  // THE node-status source (merged_bug_134): one drawer-lifetime
-  // GetBuildGraph poll feeding Graph's rendering AND the log stream's
-  // terminality oracle. The poll must outlive Graph.svelte — that
-  // component unmounts whenever the Logs tab is active, which is
-  // precisely when the oracle is load-bearing. Recreated (and the old
-  // one destroyed) if the parent re-points the drawer at a different
-  // build without remounting it.
-  let poll = $state<BuildGraphPoll | null>(null);
-  $effect(() => {
-    const p = createBuildGraphPoll(build.buildId);
-    poll = p;
-    return () => p.destroy();
-  });
-
-  // DrvNode click in the Graph tab focuses that derivation in the Logs
-  // tab. Keeping the state here (not in Graph.svelte) so switching
-  // between tabs doesn't lose the selection — Graph re-mounts on every
-  // tab flip but the drawer survives.
+  // THE per-build state record (merged_bug_064): minted by the single
+  // constructor, replaced WHOLESALE in this one $effect keyed on
+  // build.buildId — teardown destroys the old session's poll. The old
+  // shape had three independent $state cells with ONE shared lifecycle
+  // and no shared owner: the $effect recreated only the poll while
+  // focusedDrv/focusedExecId survived a re-point (deep-link fallback
+  // race, keyboard Enter on a row behind the click-only backdrop), so
+  // the {#key} below remounted LogViewer with build B's id and build
+  // A's NON-EMPTY exec-pinned selector — past the api/logs.ts
+  // empty-selector backstop, streaming A's attempt log under B's
+  // header, while statusOf(A-drv) on B's graph read undefined and the
+  // oracle degraded to B's allTerminal. The poll must outlive
+  // Graph.svelte (merged_bug_134) — that component unmounts whenever
+  // the Logs tab is active, which is precisely when the oracle is
+  // load-bearing. (null until the mount effect runs — the established
+  // poll-effect idiom this record replaces.)
   //
   // SCOPE LAW (bug_090, signed Q4): the Logs tab is the PER-ATTEMPT
   // surface — a stream mounts ONLY when a derivation is focused. The
@@ -50,15 +95,25 @@
   // whole-build aggregation is an explicit non-goal (no server
   // aggregation contract).
   //
-  // focusedExecId is the per-build observation of which execution this
-  // build watched (`GraphNode.exec_id` ← `build_derivations.exec_id`),
-  // captured at click time so the log fetch can pin the EXACT execution
-  // rather than fall back to "latest." Empty for Cached / never-ran
-  // terminals / non-terminal — LogViewer renders an "approximate"
-  // banner for those. (Pinning by click-time capture is correct: the
-  // {#key} below remounts LogViewer when the pin changes.)
-  let focusedDrv = $state<string | undefined>(undefined);
-  let focusedExecId = $state<string>('');
+  // session.focusedExecId is the per-build observation of which
+  // execution this build watched (`GraphNode.exec_id` ←
+  // `build_derivations.exec_id`), captured at click time so the log
+  // fetch can pin the EXACT execution rather than fall back to
+  // "latest." Empty for Cached / never-ran terminals / non-terminal —
+  // LogViewer renders an "approximate" banner for those. (Pinning by
+  // click-time capture is correct: the {#key} below remounts LogViewer
+  // when the pin changes.)
+  let session = $state<DrawerSession | null>(null);
+  // $effect.pre: the replacement lands BEFORE the DOM re-renders for a
+  // prop change, so the template never evaluates (new build, old
+  // session) — and the self-keyed record above makes that pairing
+  // unrepresentable for keyed consumers even if the timing ever
+  // changed.
+  $effect.pre(() => {
+    const s = mkDrawerSession(build.buildId);
+    session = s;
+    return () => s.poll.destroy();
+  });
 
   // The focused node's status, DERIVED LIVE from the poll
   // (merged_bug_134 — never a click-time snapshot). The pre-fix
@@ -68,7 +123,9 @@
   // "streaming"), and a poisoned-at-click node stayed "terminal" after
   // ClearPoison (the stream exited incomplete instead of following the
   // retry).
-  const focusedStatus = $derived(poll?.statusOf(focusedDrv));
+  const focusedStatus = $derived(
+    session ? session.poll.statusOf(session.focusedDrv) : undefined,
+  );
 
   // Live terminality closure for the log stream's tail_next exit law
   // (merged_bug_074): EVERY oracle input reads the drawer-lifetime
@@ -95,7 +152,7 @@
   // idle-timeout rule's own posture (an hour-quiet stream means the
   // build is stuck).
   const isTerminal = () =>
-    (poll?.allTerminal ?? false) ||
+    (session?.poll.allTerminal ?? false) ||
     (focusedStatus !== undefined && TERMINAL.has(focusedStatus));
 </script>
 
@@ -168,14 +225,14 @@
     >
   </div>
 
-  {#if poll?.degraded}
+  {#if session && session.poll.degraded}
     <!-- Data-bearing probe failure (merged_bug_081): a one-line
          staleness note that never REPLACES the retained graph or the
          tab body. poll.error stays reserved for the never-loaded
          state (Graph's banner arm). -->
     <p class="degraded" data-testid="poll-degraded">
-      Live status probe failing ({poll.degraded}) — showing the last
-      loaded graph.
+      Live status probe failing ({session.poll.degraded}) — showing the
+      last loaded graph.
     </p>
   {/if}
 
@@ -186,16 +243,18 @@
     aria-labelledby="tab-{activeTab}"
   >
     {#if activeTab === 'logs'}
-      {#if focusedDrv !== undefined}
+      {#if session && session.focusedDrv !== undefined}
         <!-- Keyed on buildId so switching builds (deep-link → different
              drawer target) tears down the old stream and starts a fresh
              one. Without the key Svelte reuses the component instance and
              the IIFE inside createLogStream keeps draining the prior
-             build's fetch. -->
-        {#key `${build.buildId}:${focusedDrv}:${focusedExecId}`}
+             build's fetch. The focus fields ride the SAME session record
+             as the poll, so a re-point can never key this mount with a
+             stale selector (merged_bug_064). -->
+        {#key `${session.buildId}:${session.focusedDrv}:${session.focusedExecId}`}
           <LogViewer
-            drvPath={focusedDrv}
-            execId={focusedExecId}
+            drvPath={session.focusedDrv}
+            execId={session.focusedExecId}
             {isTerminal}
           />
         {/key}
@@ -213,19 +272,20 @@
           </p>
         </div>
       {/if}
-    {:else if poll}
+    {:else if session}
+      {@const s = session}
       <!-- Keyed on buildId so a build switch tears down Graph's layout
            state + WebWorker cleanly. The POLL is not Graph's anymore
-           (merged_bug_134): it lives drawer-wide above, so the
+           (merged_bug_134): it lives session-wide above, so the
            terminality oracle stays live while the Logs tab is active.
            The click no longer captures status — the oracle derives it
            from the poll. -->
-      {#key build.buildId}
+      {#key s.buildId}
         <Graph
-          {poll}
+          poll={s.poll}
           ondrvclick={(drv, execId) => {
-            focusedDrv = drv;
-            focusedExecId = execId;
+            s.focusedDrv = drv;
+            s.focusedExecId = execId;
             activeTab = 'logs';
           }}
         />
