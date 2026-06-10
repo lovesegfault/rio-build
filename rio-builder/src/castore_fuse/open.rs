@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use fuser::{Errno, FileHandle, FopenFlags, ReplyOpen};
+use fuser::Errno;
 use tokio::runtime::Handle;
 use tonic::transport::Channel;
 
@@ -72,7 +72,7 @@ pub struct OpenerConfig {
 /// fuser reply object. Split from the decision logic so the open path
 /// can be exercised by unit tests without a kernel FUSE channel.
 #[derive(Debug)]
-enum OpenOutcome {
+pub(super) enum OpenOutcome {
     /// `opened_passthrough(fh, …, backing_id)`: warm reads go kernel →
     /// backing file with no upcall.
     Passthrough { fh: u64, backing_id: u32 },
@@ -243,50 +243,27 @@ impl Opener {
         self.cache_dir.join(&hex[..2]).join(&hex)
     }
 
-    /// `open(ino → file_digest)` per ADR §2.6. Consumes `reply`.
+    /// The `open(ino → file_digest)` decision per ADR §2.6, structured
+    /// as a degrade ladder: passthrough off the node cache → userspace
+    /// `KEEP_CACHE` read → fetch (whole-file or streaming). Expected
+    /// failures at one tier (an evicted cache entry, an exhausted
+    /// backing ceiling, an io-mode conflict) fall through to the next;
+    /// only genuinely unexpected errors become `EIO`. Side effects
+    /// (backing registration, fh table inserts, metrics) happen here;
+    /// the ring dispatcher marshals the outcome into the wire reply.
     // r[impl builder.fs.digest-fuse-open]
-    pub fn open(&self, file_digest: [u8; 32], size: u64, reply: ReplyOpen) {
-        match self.open_inner(file_digest, size) {
-            Ok(outcome) => reply_outcome(reply, outcome),
-            Err(errno) => reply_error_counted(reply, errno),
+    pub(super) fn open_inner(
+        &self,
+        file_digest: [u8; 32],
+        size: u64,
+    ) -> Result<OpenOutcome, Errno> {
+        // Warm rungs first (shared with the ring fast tier), then the
+        // network ladder.
+        if let Some(outcome) = self.open_warm(file_digest)? {
+            return Ok(outcome);
         }
-    }
-
-    /// The `open()` decision, structured as a degrade ladder:
-    /// passthrough off the node cache → userspace `KEEP_CACHE` read →
-    /// fetch (whole-file or streaming). Expected failures at one tier
-    /// (an evicted cache entry, an exhausted backing ceiling, an
-    /// io-mode conflict) fall through to the next; only genuinely
-    /// unexpected errors become `EIO`. Side effects (backing
-    /// registration, fh table inserts, metrics) happen here; the
-    /// kernel reply marshalling is left to [`Opener::open`].
-    fn open_inner(&self, file_digest: [u8; 32], size: u64) -> Result<OpenOutcome, Errno> {
         let started = std::time::Instant::now();
         let cache_path = self.cache_path(&file_digest);
-
-        // A passthrough backing registered by an earlier open of this
-        // digest is still live: reuse it. The kernel pins the backing
-        // file for as long as the registration exists, so this serves
-        // the open even after the LRU sweep unlinked the cache entry —
-        // and it is the only io-mode-compatible reply while passthrough
-        // opens of this inode are outstanding.
-        // r[impl builder.fs.open-iomode-compatible]
-        if let Some(outcome) = self.reuse_live_backing(&file_digest) {
-            metrics::counter!("rio_builder_castore_fuse_open_case_total", "case" => "hit")
-                .increment(1);
-            record_open(started, "hit");
-            return Ok(outcome);
-        }
-
-        // Case (a): already in the shared node cache — another build
-        // (or an earlier open in this one) fetched and promoted it.
-        if let Some(file) = self.open_cache_entry(&cache_path)? {
-            metrics::counter!("rio_builder_castore_fuse_open_case_total", "case" => "hit")
-                .increment(1);
-            let outcome = self.backed_outcome(&file_digest, file);
-            record_open(started, "hit");
-            return Ok(outcome);
-        }
 
         // Cache miss above the streaming threshold: reply after the
         // first chunk and fill in the background (§2.8).
@@ -341,6 +318,48 @@ impl Opener {
         };
         record_open(started, case);
         Ok(outcome)
+    }
+
+    /// The warm rungs of the open ladder — everything that can be
+    /// answered from local state, with no network round-trip:
+    /// reuse of a live passthrough backing, or a published node-cache
+    /// entry. `Ok(None)` means a genuine cache miss, i.e. serving this
+    /// open requires a fetch.
+    ///
+    /// This is the fuse-over-io_uring fast/slow boundary: the queue
+    /// thread answers `Some` inline and punts `None` to the slow pool
+    /// (which runs the full [`Opener::open_inner`] ladder — the warm
+    /// rungs are re-checked there, so a promotion that races the punt
+    /// is still served warm).
+    pub(super) fn open_warm(&self, file_digest: [u8; 32]) -> Result<Option<OpenOutcome>, Errno> {
+        let started = std::time::Instant::now();
+
+        // A passthrough backing registered by an earlier open of this
+        // digest is still live: reuse it. The kernel pins the backing
+        // file for as long as the registration exists, so this serves
+        // the open even after the LRU sweep unlinked the cache entry —
+        // and it is the only io-mode-compatible reply while passthrough
+        // opens of this inode are outstanding.
+        // r[impl builder.fs.open-iomode-compatible]
+        if let Some(outcome) = self.reuse_live_backing(&file_digest) {
+            metrics::counter!("rio_builder_castore_fuse_open_case_total", "case" => "hit")
+                .increment(1);
+            record_open(started, "hit");
+            return Ok(Some(outcome));
+        }
+
+        // Case (a): already in the shared node cache — another build
+        // (or an earlier open in this one) fetched and promoted it.
+        match self.open_cache_entry(&self.cache_path(&file_digest))? {
+            Some(file) => {
+                metrics::counter!("rio_builder_castore_fuse_open_case_total", "case" => "hit")
+                    .increment(1);
+                let outcome = self.backed_outcome(&file_digest, file);
+                record_open(started, "hit");
+                Ok(Some(outcome))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Open the digest's shared-cache entry. `Ok(None)` when the entry
@@ -821,27 +840,52 @@ impl Opener {
     /// userspace read (any tier of `Opener::backed_outcome`'s ladder)
     /// or while a streaming open is inside its fill window.
     pub fn read(&self, fh: u64, offset: u64, size: u32) -> Result<Vec<u8>, Errno> {
-        use std::os::unix::fs::FileExt;
-        {
-            let files = self.open_files.lock().ignore_poison();
-            if let Some(file) = files.get(&fh) {
-                let mut buf = vec![0u8; size as usize];
-                let n = file.read_at(&mut buf, offset).map_err(|e| {
-                    tracing::warn!(fh, offset, error = %e, "fallback read failed");
-                    Errno::EIO
-                })?;
-                buf.truncate(n);
-                return Ok(buf);
-            }
+        if let Some(result) = self.read_fast(fh, offset, size) {
+            return result;
         }
         // Clone out of the map before blocking on the fill's high-water
         // mark — holding the lock across the wait would stall every
-        // other read and open.
+        // other read and open. A release racing in between is an
+        // ordinary EBADF.
         let stream = self.streams.lock().ignore_poison().get(&fh).cloned();
         match stream {
             Some(state) => state.read_at(offset, size),
             None => Err(Errno::EBADF),
         }
+    }
+
+    /// The non-blocking half of [`Opener::read`]: serve `fh` from its
+    /// already-open fallback file (a local `pread`), or report `None`
+    /// when the handle is a streaming fill — whose `read_at` blocks on
+    /// the fill's high-water mark and therefore belongs on the slow
+    /// pool, never on a fuse-over-io_uring queue thread.
+    pub(super) fn read_fast(
+        &self,
+        fh: u64,
+        offset: u64,
+        size: u32,
+    ) -> Option<Result<Vec<u8>, Errno>> {
+        use std::os::unix::fs::FileExt;
+        {
+            let files = self.open_files.lock().ignore_poison();
+            if let Some(file) = files.get(&fh) {
+                let mut buf = vec![0u8; size as usize];
+                return Some(match file.read_at(&mut buf, offset) {
+                    Ok(n) => {
+                        buf.truncate(n);
+                        Ok(buf)
+                    }
+                    Err(e) => {
+                        tracing::warn!(fh, offset, error = %e, "fallback read failed");
+                        Err(Errno::EIO)
+                    }
+                });
+            }
+        }
+        if self.streams.lock().ignore_poison().contains_key(&fh) {
+            return None;
+        }
+        Some(Err(Errno::EBADF))
     }
 
     /// `release(fh)`: drop the userspace-read handle (fallback file or
@@ -945,34 +989,6 @@ pub(super) fn create_partial(partial: &Path) -> Result<File, Errno> {
             Err(Errno::EIO)
         }
     }
-}
-
-/// Marshal a decided [`OpenOutcome`] into the fuser reply.
-fn reply_outcome(reply: ReplyOpen, outcome: OpenOutcome) {
-    match outcome {
-        OpenOutcome::Passthrough { fh, backing_id } => {
-            // SAFETY: `backing_id` came from mountd's BACKING_OPEN on
-            // the dup of this session's /dev/fuse fd, so it is live and
-            // belongs to this FUSE connection. into_raw() defuses
-            // fuser's Drop (which would issue a BACKING_CLOSE ioctl the
-            // unprivileged builder cannot make) — release() sends
-            // BackingClose to mountd instead.
-            let bid = unsafe { reply.wrap_backing(backing_id) };
-            reply.opened_passthrough(FileHandle(fh), FopenFlags::empty(), &bid);
-            let _ = bid.into_raw();
-        }
-        OpenOutcome::KeepCache { fh } => {
-            reply.opened(FileHandle(fh), FopenFlags::FOPEN_KEEP_CACHE);
-        }
-    }
-}
-
-/// Fail an `open()` with `errno` and count it in the build's EIO
-/// budget. Every error exit from the open path goes through here so
-/// the counter and the kernel-visible failure cannot drift apart.
-fn reply_error_counted(reply: ReplyOpen, errno: Errno) {
-    metrics::counter!("rio_builder_castore_fuse_eio_total").increment(1);
-    reply.error(errno);
 }
 
 /// `case` mirrors the `open_case_total` increment on the same path, so
@@ -1673,6 +1689,90 @@ mod tests {
             partial.metadata().unwrap().len() <= size,
             "no byte past the expected size reaches staging (got {})",
             partial.metadata().unwrap().len()
+        );
+    }
+
+    // ── The fuse-over-io_uring fast/slow tier boundary ────────────────
+
+    /// `open_warm` is what a ring queue thread may call inline: it must
+    /// serve a published cache entry (local state + the mountd UDS
+    /// broker) and report a miss as `None` — the punt signal — without
+    /// touching the store. A `Some` for a cold digest would block a
+    /// queue thread on a gRPC fetch; a `None` for a warm one would
+    /// route every open through the slow pool and serialize warm-open
+    /// storms.
+    #[test]
+    fn open_warm_serves_published_entries_and_reports_misses() {
+        let h = OpenHarness::with_blob(vec![1u8; 64]);
+        let digest = h.seed_cache(b"warm bytes");
+        let outcome = h
+            .opener
+            .open_warm(digest)
+            .unwrap()
+            .expect("published cache entry must be servable warm");
+        assert!(
+            matches!(outcome, OpenOutcome::Passthrough { .. }),
+            "warm open of a published entry goes passthrough, got {outcome:?}"
+        );
+
+        let cold = *blake3::hash(b"never promoted").as_bytes();
+        assert!(
+            h.opener.open_warm(cold).unwrap().is_none(),
+            "a cache miss must punt (None), not fetch"
+        );
+    }
+
+    /// `read_fast` is the ring queue thread's read tier: an
+    /// already-open fallback handle is a local pread (`Some`), a
+    /// streaming fill handle can block on the fill's high-water mark
+    /// (`None` → slow pool), and an unknown fh is an immediate EBADF
+    /// (nothing to wait for). The full `read` must keep serving the
+    /// punted stream — that is what the slow worker calls.
+    #[test]
+    fn read_fast_serves_local_handles_and_punts_streams() {
+        // disable_passthrough lands the open in the userspace-read
+        // tier, i.e. `open_files`.
+        let content = b"local handle bytes".to_vec();
+        let h = OpenHarness::new(
+            FakeDirectory::new(Err(tonic::Code::FailedPrecondition), content.clone()),
+            Arc::new(CircuitBreaker::default()),
+            |cfg| cfg.disable_passthrough = true,
+            granting,
+        );
+        let digest = h.seed_cache(&content);
+        let outcome = h.opener.open_inner(digest, content.len() as u64).unwrap();
+        let fh = fh_of(&outcome);
+        let got = h
+            .opener
+            .read_fast(fh, 0, 64)
+            .expect("fallback handle reads are fast")
+            .unwrap();
+        assert_eq!(got, content);
+
+        assert!(
+            matches!(h.opener.read_fast(9999, 0, 16), Some(Err(e)) if e.code() == Errno::EBADF.code()),
+            "unknown fh is an inline EBADF, not a punt"
+        );
+
+        // Above the streaming threshold with nothing published: the
+        // open joins a fill and the handle lives in `streams`.
+        let big = vec![7u8; 16 * 1024];
+        let big_digest = *blake3::hash(&big).as_bytes();
+        let h2 = OpenHarness::with_blob(big.clone());
+        let outcome = h2.opener.open_inner(big_digest, big.len() as u64).unwrap();
+        assert!(
+            matches!(outcome, OpenOutcome::KeepCache { .. }),
+            "an in-flight fill serves KEEP_CACHE, got {outcome:?}"
+        );
+        let fh = fh_of(&outcome);
+        assert!(
+            h2.opener.read_fast(fh, 0, 1024).is_none(),
+            "streaming-fill reads must punt to the slow pool"
+        );
+        assert_eq!(
+            h2.opener.read(fh, 0, 1024).unwrap(),
+            vec![7u8; 1024],
+            "the slow tier's read still serves the punted stream"
         );
     }
 }

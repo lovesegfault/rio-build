@@ -223,6 +223,12 @@ pub fn describe_metrics() {
          repeats from dcache/icache. A high steady-state rate = the caches are \
          not absorbing (TTL regression or memory-pressure eviction)."
     );
+    describe_counter!(
+        "rio_builder_castore_fuse_uring_requests_total",
+        "Castore-FUSE requests delivered over the fuse-over-io_uring rings — \
+         the session's only request transport (upcalls_total carries the \
+         per-op split). Zero during a build means the mount never engaged."
+    );
     describe_histogram!(
         "rio_builder_castore_fuse_open_seconds",
         "Wall-clock from open() upcall to reply, labeled by the open_case_total \

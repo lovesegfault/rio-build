@@ -373,6 +373,12 @@ struct ServeCastoreArgs {
 }
 
 fn main() -> anyhow::Result<()> {
+    // serve-castore runs the full castore_fuse session (mountd
+    // handshake, DAG prefetch, fuse-over-io_uring engine) whose
+    // operational story lives in tracing events — without a subscriber
+    // those lines vanish and the VM scenarios cannot assert on them
+    // (e.g. the uring-active log check).
+    let _otel = rio_common::observability::init_tracing("spike-mountd-client")?;
     let args = Args::parse();
     match args.cmd {
         Cmd::Serve {

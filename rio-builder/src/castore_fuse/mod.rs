@@ -4,7 +4,10 @@
 //! (`lookup`/`getattr`/`readdir`/`readlink`) is answered from an
 //! in-heap Directory DAG with infinite cache TTLs; `open()` brokers a
 //! passthrough fd from the node-SSD backing cache so warm reads never
-//! upcall. The client-side mount/serve sequence lives in [`session`];
+//! upcall. Requests are served over fuse-over-io_uring (the [`uring`]
+//! module — the only transport; the fuser session on `/dev/fuse`
+//! handles INIT and the request classes the kernel never routes over
+//! rings). The client-side mount/serve sequence lives in [`session`];
 //! the executor wires that session in front of each build's overlay as
 //! its only lower (the P0560 cutover).
 
@@ -19,27 +22,21 @@ mod sweep;
 #[cfg(test)]
 mod testing;
 pub mod tree;
+mod uring;
 
 /// Re-export the bench/operator cache-reset entrypoint (`rio-mountd
 /// evict-cache`); the sweep module itself stays private.
 pub use self::sweep::evict_all;
 
-use std::ffi::OsStr;
 use std::io;
-use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 use fuser::{
-    BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
-    INodeNo, InitFlags, KernelConfig, LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate,
-    ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite,
-    ReplyXattr, Request, TimeOrNow, WriteFlags,
+    Errno, FileAttr, FileType, Filesystem, INodeNo, InitFlags, KernelConfig, OpenFlags, Request,
 };
 
-use self::open::Opener;
-use self::tree::{InoMap, Node, TTL};
+use self::tree::InoMap;
 
 /// Count one FUSE upcall. With the §2.4 cache configuration the kernel
 /// answers repeats from dcache/icache, so a high rate here means the
@@ -136,111 +133,34 @@ fn deny_write_op(op: &'static str) -> Errno {
     Errno::EROFS
 }
 
-/// The write-path deny table: one row per FUSE operation that would
-/// mutate the filesystem, carrying the exact fuser callback signature
-/// (minus `&self`/`_req`/`reply`). `write_path_deny_table!(expander)`
-/// re-expands the rows through `expander!`, so the trait impl and the
-/// unit test consume one source of truth: [`deny_with_erofs`] turns
-/// each row into a handler replying `EROFS`, `deny_table_op_names`
-/// (test-only) turns them into the op-name list checked against the
-/// POSIX write-op set. A row whose name or signature does not match a
-/// real `Filesystem` method is a compile error; a *deleted* row is
-/// caught by the test.
-macro_rules! write_path_deny_table {
-    ($expander:ident) => {
-        $expander! {
-            setattr(
-                _ino: INodeNo,
-                _mode: Option<u32>,
-                _uid: Option<u32>,
-                _gid: Option<u32>,
-                _size: Option<u64>,
-                _atime: Option<TimeOrNow>,
-                _mtime: Option<TimeOrNow>,
-                _ctime: Option<SystemTime>,
-                _fh: Option<FileHandle>,
-                _crtime: Option<SystemTime>,
-                _chgtime: Option<SystemTime>,
-                _bkuptime: Option<SystemTime>,
-                _flags: Option<BsdFileFlags>,
-            ) -> ReplyAttr;
-            mknod(_parent: INodeNo, _name: &OsStr, _mode: u32, _umask: u32, _rdev: u32) -> ReplyEntry;
-            mkdir(_parent: INodeNo, _name: &OsStr, _mode: u32, _umask: u32) -> ReplyEntry;
-            unlink(_parent: INodeNo, _name: &OsStr) -> ReplyEmpty;
-            rmdir(_parent: INodeNo, _name: &OsStr) -> ReplyEmpty;
-            symlink(_parent: INodeNo, _link_name: &OsStr, _target: &Path) -> ReplyEntry;
-            rename(
-                _parent: INodeNo,
-                _name: &OsStr,
-                _newparent: INodeNo,
-                _newname: &OsStr,
-                _flags: RenameFlags,
-            ) -> ReplyEmpty;
-            link(_ino: INodeNo, _newparent: INodeNo, _newname: &OsStr) -> ReplyEntry;
-            create(_parent: INodeNo, _name: &OsStr, _mode: u32, _umask: u32, _flags: i32) -> ReplyCreate;
-            write(
-                _ino: INodeNo,
-                _fh: FileHandle,
-                _offset: u64,
-                _data: &[u8],
-                _write_flags: WriteFlags,
-                _flags: OpenFlags,
-                _lock_owner: Option<LockOwner>,
-            ) -> ReplyWrite;
-            setxattr(_ino: INodeNo, _name: &OsStr, _value: &[u8], _flags: i32, _position: u32) -> ReplyEmpty;
-            removexattr(_ino: INodeNo, _name: &OsStr) -> ReplyEmpty;
-            fallocate(_ino: INodeNo, _fh: FileHandle, _offset: u64, _length: u64, _mode: i32) -> ReplyEmpty;
-        }
-    };
-}
-
-/// [`write_path_deny_table!`] expander: each row becomes a
-/// [`Filesystem`] method replying `EROFS` via [`deny_write_op`].
-macro_rules! deny_with_erofs {
-    ($( $op:ident($($arg:ident: $ty:ty),* $(,)?) -> $reply:ty; )*) => {
-        $(
-            fn $op(&self, _req: &Request, $($arg: $ty,)* reply: $reply) {
-                reply.error(deny_write_op(stringify!($op)));
-            }
-        )*
-    };
-}
-
-/// [`write_path_deny_table!`] expander for the unit test: the rows' op
-/// names, in declaration order.
-#[cfg(test)]
-macro_rules! deny_table_op_names {
-    ($( $op:ident($($arg:ident: $ty:ty),* $(,)?) -> $reply:ty; )*) => {
-        &[$(stringify!($op)),*]
-    };
-}
-
 /// One build's castore-FUSE. Constructed after the DAG prefetch and
 /// the mountd `Mount{}` handshake; consumed by `Session::from_fd`.
+/// Requests are dispatched by the fuse-over-io_uring engine (the
+/// private `uring` module) against the `Arc`-shared tree/opener pair —
+/// this type's `Filesystem` impl only carries the INIT negotiation.
 pub struct CastoreFs {
-    tree: InoMap,
-    opener: Arc<Opener>,
+    tree: Arc<InoMap>,
 }
 
 impl CastoreFs {
-    pub fn new(tree: InoMap, opener: Arc<Opener>) -> Self {
-        Self { tree, opener }
-    }
-
-    /// The inode table, for callers that need to resolve digests
-    /// outside a FUSE callback (e.g. the upload walk's input-reuse
-    /// shortcut).
-    pub fn tree(&self) -> &InoMap {
-        &self.tree
+    pub fn new(tree: Arc<InoMap>) -> Self {
+        Self { tree }
     }
 }
 
+/// The INIT-only `Filesystem` impl. Every request is served by the
+/// ring dispatcher (`uring::dispatch`); the fuser session this impl
+/// feeds exists for the handshake and the request classes the kernel
+/// never routes over rings (INTERRUPT, FORGET, notifications — all
+/// covered by fuser's defaults). The kernel parks regular requests
+/// between the INIT reply and ring readiness, so no serving callback
+/// can ever fire here.
 impl Filesystem for CastoreFs {
-    /// Negotiate the §2.4 cache capabilities and §2.9 passthrough
-    /// stacking depth. Failure to negotiate passthrough is fatal — a
-    /// castore-FUSE that silently degrades to userspace `read()` for
-    /// every input would still pass tests but ship a 10-100× data-path
-    /// regression.
+    /// Negotiate the §2.4 cache capabilities, §2.9 passthrough
+    /// stacking depth, and the mandatory fuse-over-io_uring transport.
+    /// Failure to negotiate passthrough is fatal — a castore-FUSE that
+    /// silently degrades to userspace `read()` for every input would
+    /// still pass tests but ship a 10-100× data-path regression.
     // r[impl builder.fs.castore-cache-config]
     // r[impl builder.fs.passthrough-stack-depth]
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> Result<(), io::Error> {
@@ -265,227 +185,30 @@ impl Filesystem for CastoreFs {
         config.set_max_stack_depth(1).map_err(|max| {
             io::Error::other(format!("kernel rejected max_stack_depth=1 (max {max})"))
         })?;
+        // fuse-over-io_uring is the only transport: a kernel that does
+        // not advertise the flag cannot serve this filesystem, so the
+        // mount fails here, in the INIT handshake. Echoing the flag is
+        // the kernel-side switch; mount_and_serve registers the rings
+        // (created before INIT) right after the handshake completes.
+        // r[impl builder.fs.io-uring-required]
+        config
+            .add_capabilities(InitFlags::FUSE_OVER_IO_URING)
+            .map_err(|_| {
+                io::Error::other(
+                    "kernel lacks FUSE_OVER_IO_URING: the castore-FUSE serves exclusively over \
+                 fuse-over-io_uring and requires Linux 6.14+ with fuse.enable_uring=1",
+                )
+            })?;
+        // Read-only fs: shrinking max_write only bounds the payload
+        // buffers the ring pre-registers per entry (see
+        // uring::PAYLOAD_BUF_SZ for the sizing chain).
+        let _ = config.set_max_write(uring::URING_MAX_WRITE);
         tracing::info!(
             inodes = self.tree.inode_count(),
-            "castore-FUSE init (passthrough, max_stack_depth=1)"
+            "castore-FUSE init (passthrough, max_stack_depth=1, fuse-over-io_uring)"
         );
         Ok(())
     }
-
-    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        upcall("lookup");
-        match self.tree.lookup(parent.0, name.as_bytes()) {
-            Some((_, attr)) => reply.entry(&TTL, &attr, Generation(0)),
-            // Names outside the prefetched DAG are a legitimate ENOENT
-            // (the closure is the allowlist), cached forever.
-            None => reply.entry(&TTL, &negative_attr(), Generation(0)),
-        }
-    }
-
-    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        upcall("getattr");
-        match self.tree.attr(ino.0) {
-            Some(attr) => reply.attr(&TTL, &attr),
-            None => reply.error(Errno::ENOENT),
-        }
-    }
-
-    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
-        upcall("readlink");
-        match self.tree.node(ino.0) {
-            Some(Node::Symlink { target }) => reply.data(target),
-            Some(_) => reply.error(Errno::EINVAL),
-            None => reply.error(Errno::ENOENT),
-        }
-    }
-
-    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        if ino.0 != INodeNo::ROOT.0 && !matches!(self.tree.node(ino.0), Some(Node::Dir { .. })) {
-            reply.error(Errno::ENOTDIR);
-            return;
-        }
-        // FOPEN_CACHE_DIR: the kernel caches the dirent pages, so the
-        // second readdir of the same directory is 0-upcall.
-        reply.opened(
-            FileHandle(0),
-            FopenFlags::FOPEN_CACHE_DIR | FopenFlags::FOPEN_KEEP_CACHE,
-        );
-    }
-
-    fn readdir(
-        &self,
-        _req: &Request,
-        ino: INodeNo,
-        _fh: FileHandle,
-        offset: u64,
-        mut reply: ReplyDirectory,
-    ) {
-        upcall("readdir");
-        let Some(entries) = self.tree.readdir(ino.0, offset) else {
-            reply.error(Errno::ENOTDIR);
-            return;
-        };
-        for e in entries {
-            if reply.add(
-                INodeNo(e.ino),
-                e.next_offset,
-                e.kind,
-                OsStr::from_bytes(e.name),
-            ) {
-                break;
-            }
-        }
-        reply.ok();
-    }
-
-    /// `readdirplus` pre-populates the dcache: every entry carries its
-    /// attrs with an infinite TTL, so the `stat()` storm that follows
-    /// a directory listing (ls -l, find, globbing) is 0-upcall.
-    fn readdirplus(
-        &self,
-        _req: &Request,
-        ino: INodeNo,
-        _fh: FileHandle,
-        offset: u64,
-        mut reply: ReplyDirectoryPlus,
-    ) {
-        upcall("readdir");
-        let Some(entries) = self.tree.readdir(ino.0, offset) else {
-            reply.error(Errno::ENOTDIR);
-            return;
-        };
-        for e in entries {
-            let attr = self.tree.attr(e.ino).unwrap_or_else(negative_attr);
-            if reply.add(
-                INodeNo(e.ino),
-                e.next_offset,
-                OsStr::from_bytes(e.name),
-                &TTL,
-                &attr,
-                Generation(0),
-            ) {
-                break;
-            }
-        }
-        reply.ok();
-    }
-
-    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        upcall("open");
-        // Write-mode opens must never reach the Opener: a passthrough
-        // reply to one would let the kernel open the node-shared
-        // backing cache file for writing under rio-mountd's root
-        // credentials. See [`write_open_violation`].
-        // r[impl builder.fs.open-read-only]
-        if let Some(errno) = write_open_violation(flags) {
-            reply.error(errno);
-            return;
-        }
-        match self.tree.node(ino.0) {
-            Some(Node::File {
-                file_digest, size, ..
-            }) => self.opener.open(*file_digest, *size, reply),
-            Some(Node::Dir { .. }) => reply.error(Errno::EISDIR),
-            // The kernel resolves symlinks before open(); reaching here
-            // with one means O_NOFOLLOW|O_PATH trickery. Refuse.
-            Some(Node::Symlink { .. }) => reply.error(Errno::ELOOP),
-            None => {
-                if ino.0 == INodeNo::ROOT.0 {
-                    reply.error(Errno::EISDIR);
-                } else {
-                    reply.error(Errno::ENOENT);
-                }
-            }
-        }
-    }
-
-    /// Reachable only when an open degraded to a userspace read or
-    /// during a streaming open's fill window (see [`Opener::read`]).
-    /// Warm passthrough reads go kernel → backing file with no upcall.
-    fn read(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        fh: FileHandle,
-        offset: u64,
-        size: u32,
-        _flags: OpenFlags,
-        _lock_owner: Option<LockOwner>,
-        reply: ReplyData,
-    ) {
-        upcall("read");
-        match self.opener.read(fh.0, offset, size) {
-            Ok(data) => reply.data(&data),
-            Err(e) => reply.error(e),
-        }
-    }
-
-    fn release(
-        &self,
-        _req: &Request,
-        ino: INodeNo,
-        fh: FileHandle,
-        _flags: OpenFlags,
-        _lock_owner: Option<LockOwner>,
-        _flush: bool,
-        reply: ReplyEmpty,
-    ) {
-        if let Some(Node::File { file_digest, .. }) = self.tree.node(ino.0) {
-            self.opener.release(file_digest, fh.0);
-        }
-        reply.ok();
-    }
-
-    fn getxattr(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        _name: &OsStr,
-        _size: u32,
-        reply: ReplyXattr,
-    ) {
-        // No xattrs on store paths, ever. ENODATA (not ENOSYS) so the
-        // kernel keeps the per-inode "has no xattrs" state instead of
-        // disabling xattr support for the whole mount — overlayfs
-        // probes `user.overlay.*` on every lower inode and treats a
-        // mount-wide ENOSYS as an error.
-        reply.error(Errno::ENODATA);
-    }
-
-    // r[impl builder.fuse.listxattr-empty]
-    fn listxattr(&self, _req: &Request, _ino: INodeNo, size: u32, reply: ReplyXattr) {
-        // Probe-vs-data branch (and the EIO trap it avoids) documented
-        // on XattrListReply.
-        match empty_xattr_list_reply(size) {
-            XattrListReply::SizeProbe => reply.size(0),
-            XattrListReply::EmptyData => reply.data(&[]),
-        }
-    }
-
-    /// `ENOTTY`, not fuser's default `ENOSYS`: overlay copy-up probes
-    /// `FS_IOC_GETFLAGS` via `ovl_copy_fileattr` and only `ENOTTY`
-    /// means "no fileattr support" there.
-    fn ioctl(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        _fh: FileHandle,
-        _flags: fuser::IoctlFlags,
-        _cmd: u32,
-        _in_data: &[u8],
-        _out_size: u32,
-        reply: fuser::ReplyIoctl,
-    ) {
-        reply.error(Errno::ENOTTY);
-    }
-
-    // ─── Write path: read-only filesystem, everything is EROFS ─────────
-    // The tree is immutable for the mount's lifetime and the backing
-    // cache is node-shared; every mutating operation is denied with the
-    // errno POSIX prescribes for a read-only filesystem. One macro row
-    // per op — see [`write_path_deny_table!`] and [`deny_write_op`].
-    // r[impl builder.fs.write-ops-erofs]
-    write_path_deny_table!(deny_with_erofs);
 }
 
 #[cfg(test)]
@@ -550,10 +273,10 @@ mod tests {
 
     // r[verify builder.fs.write-ops-erofs]
     /// Every write-path FUSE operation must answer EROFS (see
-    /// [`deny_write_op`] for why fuser's ENOSYS/EPERM defaults are
-    /// wrong). Comparing the deny table against the POSIX write-op set
-    /// catches a deleted row, which would silently fall back to those
-    /// defaults.
+    /// [`deny_write_op`] for why ENOSYS/EPERM would be wrong). The
+    /// opcode→DenyWrite classification half of the contract lives in
+    /// the ring dispatcher's `ring_disposition_covers_posix_write_ops`;
+    /// this half pins the errno every classified op replies with.
     #[test]
     fn write_path_ops_deny_with_erofs() {
         const POSIX_WRITE_OPS: &[&str] = &[
@@ -571,11 +294,6 @@ mod tests {
             "removexattr",
             "fallocate",
         ];
-        let table: &[&str] = write_path_deny_table!(deny_table_op_names);
-        assert_eq!(
-            table, POSIX_WRITE_OPS,
-            "the deny table must cover exactly the write-path ops"
-        );
         for &op in POSIX_WRITE_OPS {
             assert_eq!(
                 deny_write_op(op).code(),

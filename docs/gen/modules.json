@@ -188,6 +188,26 @@
       "doc": "Mount-time Directory-DAG prefetch and the content-addressed inode"
     },
     {
+      "path": "castore_fuse/uring/",
+      "depth": 1,
+      "doc": "fuse-over-io_uring transport for the castore-FUSE (Linux 6.14+)."
+    },
+    {
+      "path": "castore_fuse/uring/abi.rs",
+      "depth": 2,
+      "doc": "FUSE wire format for the fuse-over-io_uring transport."
+    },
+    {
+      "path": "castore_fuse/uring/dispatch.rs",
+      "depth": 2,
+      "doc": "Request dispatch for the castore-FUSE — every FUSE request the"
+    },
+    {
+      "path": "castore_fuse/uring/sys.rs",
+      "depth": 2,
+      "doc": "Minimal raw io_uring layer for the fuse-over-io_uring transport."
+    },
+    {
       "path": "cgroup.rs",
       "depth": 0,
       "doc": "Per-build cgroup v2 resource tracking."

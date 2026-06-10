@@ -11,6 +11,7 @@
     "rio_builder_castore_fuse_open_mode_total",
     "rio_builder_castore_fuse_open_seconds",
     "rio_builder_castore_fuse_upcalls_total",
+    "rio_builder_castore_fuse_uring_requests_total",
     "rio_builder_cgroup_leak_total",
     "rio_builder_cgroup_oom_total",
     "rio_builder_cpu_fraction",
@@ -286,6 +287,11 @@
         "name": "rio_builder_castore_fuse_upcalls_total",
         "kind": "counter",
         "help": "Castore-FUSE upcalls by op (lookup/getattr/readdir/readlink/open/read). Cold-path only by design: infinite cache TTLs mean the kernel answers repeats from dcache/icache. A high steady-state rate = the caches are not absorbing (TTL regression or memory-pressure eviction)."
+      },
+      {
+        "name": "rio_builder_castore_fuse_uring_requests_total",
+        "kind": "counter",
+        "help": "Castore-FUSE requests delivered over the fuse-over-io_uring rings — the session's only request transport (upcalls_total carries the per-op split). Zero during a build means the mount never engaged."
       },
       {
         "name": "rio_builder_cgroup_leak_total",
