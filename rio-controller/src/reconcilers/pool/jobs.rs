@@ -464,23 +464,53 @@ pub(super) enum GateUniverse {
     /// The lazy LIST succeeded: partition against these candidates.
     Nodes(Vec<candidate::CandidateNode>),
     /// The lazy LIST failed: cannot prove exhaustion — the fold is
-    /// SKIPPED (witness dropped) and spawn is fail-open.
+    /// SKIPPED (witness dropped) and spawn is fail-open for intents
+    /// bearing no LIVE exhaustion evidence (bug_075: a live streak is
+    /// withheld — see the arm in [`evaluate_spawn_gate`]).
     ListFailed,
+}
+
+impl GateUniverse {
+    /// bug_075 census generator half (R15): every arm's discriminant —
+    /// the spawn-decision census iterates this array so its (arm ×
+    /// evidence-state) cells come FROM the alphabet, never an author's
+    /// memory. Pinned exhaustive by the same-file match in
+    /// [`Self::discriminant`]: a new arm is a compile error there
+    /// until it is added HERE and its census cells are stated.
+    /// Test-only consumer BY DESIGN; production code matches the
+    /// closed enum exhaustively instead of iterating it.
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(super) const ALL_DISCRIMINANTS: [&'static str; 4] =
+        ["NoWanted", "NoExclusions", "Nodes", "ListFailed"];
+
+    /// The [`Self::ALL_DISCRIMINANTS`] compile pin: the exhaustive
+    /// match makes a new arm a compile error at this line until the
+    /// array above (and the census test's cells) name it.
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(super) fn discriminant(&self) -> &'static str {
+        match self {
+            GateUniverse::NoWanted => "NoWanted",
+            GateUniverse::NoExclusions => "NoExclusions",
+            GateUniverse::Nodes(_) => "Nodes",
+            GateUniverse::ListFailed => "ListFailed",
+        }
+    }
 }
 
 /// One completed (or skipped) AD2 gate evaluation (bug_028).
 pub(super) struct SpawnGateOutcome {
     /// Intents allowed to spawn this tick, in the scheduler's priority
-    /// order, NOT yet headroom-truncated: gated intents and intents
-    /// inside their verdict-free-respawn backoff are removed (neither
-    /// burns a headroom slot).
+    /// order, NOT yet headroom-truncated: gated intents, intents
+    /// inside their verdict-free-respawn backoff, AND fold-skip
+    /// intents carrying a live exhaustion streak (bug_075) are removed
+    /// (none burns a headroom slot).
     pub(super) spawnable: Vec<SpawnIntent>,
     /// Gated intents whose exhaustion satisfied the firing law this
     /// fold (count + wall-clock floor) — the NoEligibleSource reports.
     pub(super) to_report: Vec<SpawnIntent>,
 }
 
-// r[impl ctrl.pool.no-eligible-persist+4]
+// r[impl ctrl.pool.no-eligible-persist+5]
 /// The AD2 gate fold, extracted for unit-testability (bug_028): the
 /// partition runs over the FULL existing-names-filtered wanted set —
 /// never a headroom window — so exhaustion evaluation covers every
@@ -490,8 +520,13 @@ pub(super) struct SpawnGateOutcome {
 /// namespace-qualified (merged_bug_073), so this fold can only touch
 /// THIS pool's streaks. On the skip arms (no wanted intents, LIST
 /// failure) the witness is dropped and streaks retain without
-/// stepping; the verdict-free-respawn backoff still gates spawn on
-/// EVERY arm (deaths are noted by the reap before the fold, so a
+/// stepping — and the ListFailed arm withholds intents whose retained
+/// streak is LIVE (bug_075: the spawn decision is total over the
+/// (universe arm × [`candidate::EvidenceState`]) product; fail-open
+/// applies only to intents bearing no live exhaustion evidence,
+/// because a spawned Job hides the intent from evaluation past the
+/// orphan expiry). The verdict-free-respawn backoff still gates spawn
+/// on EVERY arm (deaths are noted by the reap before the fold, so a
 /// freshly reaped intent is blocked the same tick its respawn would
 /// otherwise fire).
 pub(super) fn evaluate_spawn_gate(
@@ -503,11 +538,56 @@ pub(super) fn evaluate_spawn_gate(
     now: std::time::Instant,
 ) -> SpawnGateOutcome {
     let (spawnable, to_report) = match universe {
-        GateUniverse::NoWanted | GateUniverse::ListFailed => {
-            // Fold skipped: drop the witness, retain streaks, spawn
-            // fail-open (ListFailed) or trivially nothing (NoWanted).
+        GateUniverse::NoWanted => {
+            // Fold skipped: drop the witness, retain streaks —
+            // trivially nothing to spawn (`wanted` is empty by
+            // construction of this arm).
             drop(tick);
             (wanted, Vec::new())
+        }
+        GateUniverse::ListFailed => {
+            // Fold skipped: drop the witness, retain streaks — and
+            // WITHHOLD intents carrying LIVE exhaustion evidence
+            // (bug_075): fail-open spawn applies only to intents
+            // bearing none. Spawning a suspected-exhausted intent
+            // makes it structurally unobservable (existing-name
+            // exclusion) for at least its ≥180 s Job deadline, which
+            // exceeds the 120 s orphan window — destroying by
+            // spawning what the retain law preserved, and livelocking
+            // the poison report that would un-wedge the scheduler. A
+            // withheld intent stays jobless and re-checks next tick;
+            // staleness self-limits the withhold (a stale streak is
+            // dead evidence and re-opens fail-open, so a permanent
+            // LIST failure cannot wedge spawn past the orphan
+            // window). The match is exhaustive over the closed
+            // [`candidate::EvidenceState`] alphabet (R14/R15): a new
+            // evidence state must state its fold-skip disposition
+            // here before it compiles.
+            drop(tick);
+            let streaks = &*streaks;
+            let (withheld, spawnable): (Vec<SpawnIntent>, Vec<SpawnIntent>) =
+                wanted.into_iter().partition(|i| {
+                    match streaks.evidence_state(key, &i.intent_id, now) {
+                        candidate::EvidenceState::LiveStreak => true,
+                        // No evidence to destroy / dead evidence —
+                        // fail-open preserved. In-backoff intents flow
+                        // through to the universal `respawn_blocked`
+                        // post-arm filter below (one withhold law, one
+                        // call site).
+                        candidate::EvidenceState::NoEvidence
+                        | candidate::EvidenceState::StaleStreak
+                        | candidate::EvidenceState::InBackoff => false,
+                    }
+                });
+            if !withheld.is_empty() {
+                tracing::debug!(
+                    pool = %key,
+                    withheld = withheld.len(),
+                    "node LIST failed: withholding fail-open spawn for intents \
+                     with live exhaustion streaks (re-checked next tick)"
+                );
+            }
+            (spawnable, Vec::new())
         }
         GateUniverse::NoExclusions => {
             // Trivially complete fold: every wanted intent evaluated

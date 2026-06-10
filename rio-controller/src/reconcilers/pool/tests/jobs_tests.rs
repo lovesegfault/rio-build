@@ -1520,7 +1520,7 @@ fn no_eligible_source_predicate() {
 }
 
 // r[verify sched.dispatch.fleet-exhaust+5]
-// r[verify ctrl.pool.no-eligible-persist+4]
+// r[verify ctrl.pool.no-eligible-persist+5]
 /// A gated intent produces exactly one acked `NoEligibleSource` report
 /// carrying the intent's `resubmit_cycle` echo (124(b): the scheduler
 /// ack-no-poisons a stale echo); the gated intent is the one removed
@@ -1589,7 +1589,7 @@ async fn gated_intent_reports_no_eligible_source_with_cycle_echo() {
     );
 }
 
-// r[verify ctrl.pool.no-eligible-persist+4]
+// r[verify ctrl.pool.no-eligible-persist+5]
 /// bug_028: the AD2 gate evaluates ALL wanted intents, never just the
 /// headroom window --- an exhausted intent behind a full pool accrues
 /// its verdict instead of stalling behind the ceiling. Drives the
@@ -1784,6 +1784,338 @@ fn verdict_resets_respawn_backoff() {
         vec!["drv-loop"],
         "a named resolution must reset the backoff --- the breaker never masks a verdict lane"
     );
+}
+
+// ───────────────────────────────────────────────────────────────────
+// bug_075: ListFailed fail-open vs live exhaustion evidence
+// ───────────────────────────────────────────────────────────────────
+
+/// Two completed Nodes-arm folds that gate `drv-x` (t0, t0+10s) ---
+/// the shared red-test prefix: a live two-tick streak.
+fn two_gated_folds(
+    streaks: &mut crate::reconcilers::pool::candidate::PoolStreaks,
+    key: &crate::reconcilers::pool::candidate::PoolKey,
+    t0: std::time::Instant,
+) -> SpawnIntent {
+    use crate::reconcilers::pool::candidate::CandidateNode;
+    use crate::reconcilers::pool::jobs::{GateUniverse, evaluate_spawn_gate};
+
+    let gated = SpawnIntent {
+        intent_id: "drv-x".into(),
+        excluded_nodes: vec!["n1".into()],
+        ..Default::default()
+    };
+    let candidates = vec![CandidateNode {
+        name: "n1".into(),
+        labels: Default::default(),
+        schedulable: true,
+    }];
+    for n in 0..2u64 {
+        let now = t0 + std::time::Duration::from_secs(n * 10);
+        let tick = streaks.begin_tick(key);
+        let outcome = evaluate_spawn_gate(
+            vec![gated.clone()],
+            &GateUniverse::Nodes(candidates.clone()),
+            streaks,
+            tick,
+            key,
+            now,
+        );
+        assert!(
+            outcome.spawnable.is_empty(),
+            "prefix fold {n}: the gated intent must be withheld"
+        );
+    }
+    gated
+}
+
+// r[verify ctrl.pool.no-eligible-persist+5]
+/// bug_075 red 1 (recorded verbatim in the close commit): a fold-skip
+/// (ListFailed) tick MUST NOT spawn an intent whose retained streak is
+/// live --- spawning makes it structurally unobservable (existing-name
+/// exclusion) for >=180s while the streak expires at 120s, destroying
+/// the evidence the retain law preserved. Pre-fix the arm returned
+/// every wanted intent spawnable: `left: ["drv-x"], right: []`.
+///
+/// Witness-strength: certifies the production fold's ListFailed arm
+/// withholds a LIVE-streak intent (the new census cell), driven
+/// through `evaluate_spawn_gate` with streaks built only by production
+/// noting/step calls.
+#[test]
+fn list_failed_arm_withholds_live_streak_intents() {
+    use crate::reconcilers::pool::candidate::PoolStreaks;
+    use crate::reconcilers::pool::jobs::{GateUniverse, evaluate_spawn_gate};
+
+    let mut streaks = PoolStreaks::default();
+    let key = pkey();
+    let t0 = std::time::Instant::now();
+    let gated = two_gated_folds(&mut streaks, &key, t0);
+
+    // Node LIST fails at t0+20s: the streak (touched t0+10s) is live.
+    let tick = streaks.begin_tick(&key);
+    let outcome = evaluate_spawn_gate(
+        vec![gated],
+        &GateUniverse::ListFailed,
+        &mut streaks,
+        tick,
+        &key,
+        t0 + std::time::Duration::from_secs(20),
+    );
+    assert_eq!(
+        outcome
+            .spawnable
+            .iter()
+            .map(|i| i.intent_id.as_str())
+            .collect::<Vec<_>>(),
+        Vec::<&str>::new(),
+        "a fold-skip tick must withhold intents carrying live exhaustion streaks"
+    );
+}
+
+// r[verify ctrl.pool.no-eligible-persist+5]
+/// bug_075 red 2 (recorded verbatim in the close commit): one node-LIST
+/// blip mid-streak must not livelock the poison report. Pre-fix the
+/// t0+20s fail-open spawn froze evaluation (existing-name exclusion,
+/// mirrored here per the `verdictless_respawn_backs_off_per_intent`
+/// precedent) past the 120s expiry, the streak restarted from scratch,
+/// and the next gated fold did NOT fire: `left: [], right: ["drv-x"]`.
+/// Post-fix the withhold keeps the intent jobless, the t0+30s fold
+/// gates it (streak 3, floor 30s >= 20s) and the verdict fires.
+///
+/// Witness-strength: certifies streak CONTINUITY across a fold-skip
+/// tick end-to-end through the production fold --- the firing law
+/// completes after the blip, not merely "the intent was withheld".
+#[test]
+fn list_failed_blip_preserves_streak_to_fire() {
+    use crate::reconcilers::pool::candidate::{CandidateNode, PoolStreaks};
+    use crate::reconcilers::pool::jobs::{GateUniverse, evaluate_spawn_gate};
+
+    let mut streaks = PoolStreaks::default();
+    let key = pkey();
+    let t0 = std::time::Instant::now();
+    let gated = two_gated_folds(&mut streaks, &key, t0);
+    let candidates = vec![CandidateNode {
+        name: "n1".into(),
+        labels: Default::default(),
+        schedulable: true,
+    }];
+
+    // t0+20s: node LIST fails. Pre-fix this spawned drv-x; the harness
+    // mirrors the reconcile's existing-name exclusion --- a spawned
+    // intent leaves `wanted` until its Job ends (>=180s deadline, far
+    // past this test's window).
+    let tick = streaks.begin_tick(&key);
+    let blip = evaluate_spawn_gate(
+        vec![gated.clone()],
+        &GateUniverse::ListFailed,
+        &mut streaks,
+        tick,
+        &key,
+        t0 + std::time::Duration::from_secs(20),
+    );
+    let job_held = !blip.spawnable.is_empty();
+
+    // t0+30s: the LIST recovers. Post-fix drv-x is still jobless and
+    // wanted; the completed fold gates it (streak 3) and the verdict
+    // fires (floor: 30s since first_gated >= 20s). Pre-fix drv-x is
+    // job-held --- excluded from wanted --- so nothing fires.
+    let wanted = if job_held {
+        vec![]
+    } else {
+        vec![gated.clone()]
+    };
+    let tick = streaks.begin_tick(&key);
+    let outcome = evaluate_spawn_gate(
+        wanted,
+        &GateUniverse::Nodes(candidates),
+        &mut streaks,
+        tick,
+        &key,
+        t0 + std::time::Duration::from_secs(30),
+    );
+    assert_eq!(
+        outcome
+            .to_report
+            .iter()
+            .map(|i| i.intent_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["drv-x"],
+        "exhaustion report after the blip --- the streak must survive a \
+         fold-skip tick and fire on the next gated fold"
+    );
+}
+
+// r[verify ctrl.pool.no-eligible-persist+5]
+/// bug_075 companion polarity pin (GREEN both sides --- disclosed, not
+/// a red): the withhold is self-limiting by the SAME staleness law as
+/// the retain --- once the streak entry is older than the orphan
+/// window it is dead evidence, the intent re-reads as fail-open, and a
+/// PERSISTENT node-LIST failure cannot wedge spawn forever.
+///
+/// Witness-strength: certifies the ListFailed x stale-streak census
+/// cell (fail-open restored at expiry); the live-streak withhold is
+/// red 1's proposition, deliberately not re-asserted here so this pin
+/// stays green on pre-fix code too (polarity disclosure).
+#[test]
+fn persistent_list_failure_restores_fail_open_after_expiry() {
+    use crate::reconcilers::pool::candidate::PoolStreaks;
+    use crate::reconcilers::pool::jobs::{GateUniverse, evaluate_spawn_gate};
+
+    let mut streaks = PoolStreaks::default();
+    let key = pkey();
+    let t0 = std::time::Instant::now();
+    let gated = two_gated_folds(&mut streaks, &key, t0);
+
+    // t0+140s: the entry (touched t0+10s) is 130s old --- past the
+    // 120s orphan window. Fail-open applies again.
+    let tick = streaks.begin_tick(&key);
+    let outcome = evaluate_spawn_gate(
+        vec![gated],
+        &GateUniverse::ListFailed,
+        &mut streaks,
+        tick,
+        &key,
+        t0 + std::time::Duration::from_secs(140),
+    );
+    assert_eq!(
+        outcome
+            .spawnable
+            .iter()
+            .map(|i| i.intent_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["drv-x"],
+        "a stale streak is dead evidence: persistent LIST failure must \
+         restore fail-open at the orphan expiry"
+    );
+}
+
+// r[verify ctrl.pool.no-eligible-persist+5]
+/// bug_075 census (R15): the spawn decision is a total function over
+/// (universe arm x per-intent evidence state). Walks EVERY cell of the
+/// product through the REAL `evaluate_spawn_gate` --- the member lists
+/// are `GateUniverse::ALL_DISCRIMINANTS` and `EvidenceState::ALL`,
+/// each pinned exhaustive by a same-file match, so a new arm or
+/// evidence state is a compile error at its pin AND a panic here until
+/// its cells are stated. Pre-fix red on exactly the
+/// ListFailed x live-streak cell (1 of 12 non-vacuous cells --- the
+/// pigeonhole exhibit), recorded verbatim in the close commit.
+///
+/// Witness-strength: certifies the PRODUCTION fold's disposition per
+/// cell (not a parallel table) --- every state is built through
+/// production noting/step/death calls, observations only via
+/// `from_partition` inside the fold itself.
+///
+/// Cell law (post-fix):
+///   - NoWanted x *: vacuous (empty wanted --- nothing spawns).
+///   - NoExclusions x {no-evidence, live-streak, stale-streak}: spawn
+///     (a completed fold's evaluated-ungated read IS observed
+///     recovery); x in-backoff: withhold.
+///   - Nodes(gated) x {no-evidence, live-streak, stale-streak}:
+///     withhold + step (the gate withholds from tick 1);
+///     x in-backoff: withhold.
+///   - ListFailed x no-evidence: spawn (fail-open preserved);
+///     x live-streak: WITHHOLD (the bug_075 cell);
+///     x stale-streak: spawn (staleness re-opens fail-open);
+///     x in-backoff: withhold (the universal post-arm filter).
+#[test]
+fn spawn_decision_census_covers_arm_by_evidence_product() {
+    use crate::reconcilers::pool::candidate::{CandidateNode, EvidenceState, PoolStreaks};
+    use crate::reconcilers::pool::jobs::{GateUniverse, evaluate_spawn_gate};
+
+    let key = pkey();
+    let candidates = vec![CandidateNode {
+        name: "n1".into(),
+        labels: Default::default(),
+        schedulable: true,
+    }];
+
+    for disc in GateUniverse::ALL_DISCRIMINANTS {
+        for state in EvidenceState::ALL {
+            let t0 = std::time::Instant::now();
+            let mut streaks = PoolStreaks::default();
+            // The intent under test: excluded from the only candidate,
+            // so the Nodes arm reads it gated (the arm's canonical
+            // exhaustion shape; an ungated Nodes read is the
+            // NoExclusions row's trivially-complete semantics).
+            let gated = SpawnIntent {
+                intent_id: "drv-x".into(),
+                excluded_nodes: vec!["n1".into()],
+                ..Default::default()
+            };
+            // Build the evidence state through PRODUCTION calls only,
+            // then probe the cell at `now`.
+            let now = match state {
+                EvidenceState::NoEvidence => t0,
+                // Two gated folds: entry touched at t0+10s; probe at
+                // t0+20s (live).
+                EvidenceState::LiveStreak => {
+                    two_gated_folds(&mut streaks, &key, t0);
+                    t0 + std::time::Duration::from_secs(20)
+                }
+                // Same prefix; probe at t0+140s (130s since touch ---
+                // past the 120s orphan window).
+                EvidenceState::StaleStreak => {
+                    two_gated_folds(&mut streaks, &key, t0);
+                    t0 + std::time::Duration::from_secs(140)
+                }
+                // One verdict-free death 5s ago: inside the 10s
+                // first-death backoff floor.
+                EvidenceState::InBackoff => {
+                    streaks.note_verdict_free_death(&key, "drv-x", t0);
+                    t0 + std::time::Duration::from_secs(5)
+                }
+            };
+            assert_eq!(
+                streaks.evidence_state(&key, "drv-x", now),
+                state,
+                "fixture must construct the {} state it claims",
+                state.label()
+            );
+
+            let (universe, wanted) = match disc {
+                "NoWanted" => (GateUniverse::NoWanted, vec![]),
+                "NoExclusions" => {
+                    // The NoExclusions arm requires an exclusion-free
+                    // wanted set by construction; same intent id so
+                    // the evidence state carries.
+                    let open = SpawnIntent {
+                        intent_id: "drv-x".into(),
+                        ..Default::default()
+                    };
+                    (GateUniverse::NoExclusions, vec![open])
+                }
+                "Nodes" => (GateUniverse::Nodes(candidates.clone()), vec![gated.clone()]),
+                "ListFailed" => (GateUniverse::ListFailed, vec![gated.clone()]),
+                other => panic!("new GateUniverse arm {other}: state its census cells here"),
+            };
+            // The discriminant pin round-trips: the constructed
+            // universe IS the cell's arm (a stale ALL_DISCRIMINANTS
+            // entry cannot silently walk the wrong arm).
+            assert_eq!(universe.discriminant(), disc);
+            let spawns = match (disc, state) {
+                ("NoWanted", _) => false, // vacuous: empty wanted
+                ("NoExclusions", EvidenceState::InBackoff) => false,
+                ("NoExclusions", _) => true,
+                ("Nodes", _) => false, // gated: withheld from tick 1
+                ("ListFailed", EvidenceState::NoEvidence) => true,
+                ("ListFailed", EvidenceState::LiveStreak) => false, // the bug_075 cell
+                ("ListFailed", EvidenceState::StaleStreak) => true,
+                ("ListFailed", EvidenceState::InBackoff) => false,
+                (other, s) => panic!(
+                    "census cell ({other}, {}) has no stated disposition",
+                    s.label()
+                ),
+            };
+            let tick = streaks.begin_tick(&key);
+            let outcome = evaluate_spawn_gate(wanted, &universe, &mut streaks, tick, &key, now);
+            assert_eq!(
+                outcome.spawnable.iter().any(|i| i.intent_id == "drv-x"),
+                spawns,
+                "census cell ({disc}, {}): expected spawns={spawns}",
+                state.label()
+            );
+        }
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────

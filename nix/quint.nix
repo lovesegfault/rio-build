@@ -6520,14 +6520,14 @@ rec {
     # C2/077 (area A): the AD2 fleet-exhaust verdict fires only at the
     # third consecutive exhausted-and-wanted tick; a placeable tick
     # resets the streak.
-    # r[verify ctrl.pool.no-eligible-persist+4]
+    # r[verify ctrl.pool.no-eligible-persist+5]
     quint-spawn-coherence-falsify-exhaust-asbuilt = mkQuintWitnessCheck {
       name = "spawn-coherence-falsify-exhaust-asbuilt";
       spec = "spawnCoherence";
       main = "spawnCoherenceExhaustAsBuilt";
       witness = "noPoisonWhilePlaceable";
     };
-    # r[verify ctrl.pool.no-eligible-persist+4]
+    # r[verify ctrl.pool.no-eligible-persist+5]
     quint-spawn-coherence-exhaust-persist = mkQuintCheck {
       name = "spawn-coherence-exhaust-persist";
       spec = "spawnCoherence";
@@ -6613,14 +6613,14 @@ rec {
     # 0xa108dd26025cd507). Own-count law: an overlap intent
     # double-steps to the threshold on 2 own observations (rust-sim
     # seed 0xdf6e64671329a316).
-    # r[verify ctrl.pool.no-eligible-persist+4]
+    # r[verify ctrl.pool.no-eligible-persist+5]
     quint-spawn-coherence-falsify-multipool-wipe = mkQuintWitnessCheck {
       name = "spawn-coherence-falsify-multipool-wipe";
       spec = "spawnCoherence";
       main = "spawnCoherenceMultiPoolAsBuilt";
       witness = "persistentExhaustionEventuallyReports";
     };
-    # r[verify ctrl.pool.no-eligible-persist+4]
+    # r[verify ctrl.pool.no-eligible-persist+5]
     quint-spawn-coherence-falsify-multipool-own-count = mkQuintWitnessCheck {
       name = "spawn-coherence-falsify-multipool-own-count";
       spec = "spawnCoherence";
@@ -6631,7 +6631,7 @@ rec {
     # neither wipe nor advance A's streaks; the poison verdict counts
     # the observing pool's own 3 observations. canReachPoison keeps the
     # threshold path non-vacuous under the multi-pool alphabet.
-    # r[verify ctrl.pool.no-eligible-persist+4]
+    # r[verify ctrl.pool.no-eligible-persist+5]
     quint-spawn-coherence-multipool-hold = mkQuintCheck {
       name = "spawn-coherence-multipool-hold";
       spec = "spawnCoherence";
@@ -6665,7 +6665,7 @@ rec {
     # edge is pinned to the floor-blind world (see the model's
     # nondet comment: monotone-safe for the floor law; the twin
     # exercises it).
-    # r[verify ctrl.pool.no-eligible-persist+4]
+    # r[verify ctrl.pool.no-eligible-persist+5]
     quint-spawn-coherence-streak-cadence = mkQuintCheck {
       name = "spawn-coherence-streak-cadence";
       spec = "spawnCoherence";
@@ -6688,7 +6688,7 @@ rec {
     # m073 FALSIFY half: the as-built floor-blind verdict (clock
     # tracked, not enforced) fires on a burst — VPoisonBurst latches
     # and poisonRespectsWallFloor is violated.
-    # r[verify ctrl.pool.no-eligible-persist+4]
+    # r[verify ctrl.pool.no-eligible-persist+5]
     quint-spawn-coherence-calib-073-burst = mkQuintWitnessCheck {
       name = "spawn-coherence-calib-073-burst";
       spec = "calibration/controller-073-burst";
@@ -6711,7 +6711,7 @@ rec {
     # bughunt4-fix-specs.md). Rust-sim discovery seed
     # 0x2f3a83e7a2c962ea (952ms at ~112k traces/s) recorded in the
     # introducing commit.
-    # r[verify ctrl.pool.no-eligible-persist+4]
+    # r[verify ctrl.pool.no-eligible-persist+5]
     quint-spawn-coherence-falsify-truncated-prune = mkQuintWitnessCheck {
       name = "spawn-coherence-falsify-truncated-prune";
       spec = "calibration/controller-028-truncated-prune";

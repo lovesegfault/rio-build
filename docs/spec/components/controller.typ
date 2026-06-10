@@ -334,7 +334,7 @@ two reads.
   field-sensitivity contract test fails).
 ]
 
-#r("ctrl.pool.no-eligible-persist+4")[
+#r("ctrl.pool.no-eligible-persist+5")[
   The AD2 `NoEligibleSource` REPORT --- the verdict that poisons the
   derivation scheduler-side --- MUST NOT fire on a single-tick exhaustion
   observation NOR on a reconcile-count alone: the gate withholds the
@@ -358,7 +358,12 @@ two reads.
   window MUST expire (stale evidence MUST NOT complete a poison): this
   covers removed pools and frozen streaks alike. A controller restart
   MAY restart streaks (delaying a genuine poison by at most the
-  persistence window).
+  persistence window). A fold-skip tick MUST NOT spawn an intent whose
+  retained streak is live (younger than the orphan window): fail-open
+  spawn applies only to intents bearing no live exhaustion evidence ---
+  spawning a suspected-exhausted intent makes it structurally
+  unobservable for at least its Job deadline, which exceeds the orphan
+  window, destroying by spawning what the retain law preserved.
 ]
 
 #r("ctrl.pool.ack-spawned-soundness")[

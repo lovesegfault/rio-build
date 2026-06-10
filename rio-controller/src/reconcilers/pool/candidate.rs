@@ -201,14 +201,14 @@ pub(crate) fn no_eligible_source(intent: &SpawnIntent, candidates: &[CandidateNo
 /// of wall clock (merged_bug_073: reconciles are event-driven --- a
 /// Job-event burst can deliver 3 ticks in under a second, so the count
 /// alone never carried the documented ~30s persistence).
-// r[impl ctrl.pool.no-eligible-persist+4]
+// r[impl ctrl.pool.no-eligible-persist+5]
 pub(crate) const NO_ELIGIBLE_SOURCE_PERSIST_TICKS: u32 = 3;
 
 /// Wall-clock floor for the irreversible report (merged_bug_073). At
 /// the 10s steady-state requeue cadence three consecutive ticks span
 /// 20s, so the floor adds no latency on the steady path; an event
 /// burst (4 reconciles <1s) is structurally below it.
-// r[impl ctrl.pool.no-eligible-persist+4]
+// r[impl ctrl.pool.no-eligible-persist+5]
 pub(crate) const NO_ELIGIBLE_SOURCE_PERSIST_FLOOR_SECS: u64 = 20;
 
 /// One streak-map update for one gated tick. Returns the new streak
@@ -331,6 +331,71 @@ pub enum SpawnResolution {
     Established,
 }
 
+/// bug_075: the per-intent evidence-state alphabet the spawn decision
+/// is total over — the second axis of the (universe arm × evidence
+/// state) decision table. The wave-5 bug_028 close typed the fold-skip
+/// alphabet ([`super::jobs::GateUniverse`]) but never typed each arm's
+/// SPAWN effect on evidence-carrying intents, so the ListFailed
+/// fail-open spawned a mid-streak intent into a Job that made it
+/// structurally unobservable past the orphan expiry — destroying by
+/// spawning exactly what the retain law preserved. Every spawn arm now
+/// consults this alphabet through [`PoolStreaks::evidence_state`]; the
+/// census test walks the full product through the production fold.
+///
+/// Classification precedence (the states are derived from two
+/// underlying records that can coexist): a respawn record inside its
+/// backoff floor dominates (the backoff withholds on EVERY arm via the
+/// universal post-arm filter), then streak liveness by the SAME
+/// staleness bound as the retain law ([`POOL_STREAK_ORPHAN_EXPIRY_SECS`]
+/// — one constant, no new time axis).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EvidenceState {
+    /// No streak entry and no in-backoff respawn record: fail-open
+    /// spawn is safe — there is no evidence to destroy.
+    NoEvidence,
+    /// A streak entry younger than the orphan window: live exhaustion
+    /// evidence — a fold-skip spawn would orphan it behind the Job's
+    /// ≥180 s alive floor (> the 120 s expiry), so the skip arm
+    /// withholds.
+    LiveStreak,
+    /// A streak entry at/past the orphan window: dead evidence by the
+    /// merged_bug_073 staleness law — the intent re-qualifies for
+    /// fail-open (persistent LIST failure cannot wedge spawn forever).
+    StaleStreak,
+    /// A respawn record inside its backoff floor: withheld on every
+    /// arm by the universal [`PoolStreaks::respawn_blocked`] filter.
+    InBackoff,
+}
+
+impl EvidenceState {
+    /// Census alphabet (R15 generator: this array is pinned exhaustive
+    /// by the same-file match in [`Self::label`] — a new variant fails
+    /// that match until it is added HERE, and the census test walks
+    /// this array so the new cells must be stated). Test-only consumer
+    /// BY DESIGN; production code matches the closed enum exhaustively
+    /// (the fold-skip arm in `jobs.rs`) instead of iterating it.
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) const ALL: [EvidenceState; 4] = [
+        EvidenceState::NoEvidence,
+        EvidenceState::LiveStreak,
+        EvidenceState::StaleStreak,
+        EvidenceState::InBackoff,
+    ];
+
+    /// Census-cell label — and the [`Self::ALL`] compile pin: the
+    /// exhaustive match makes a new variant a compile error at this
+    /// line until the array above (and every census cell) names it.
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            EvidenceState::NoEvidence => "no-evidence",
+            EvidenceState::LiveStreak => "live-streak",
+            EvidenceState::StaleStreak => "stale-streak",
+            EvidenceState::InBackoff => "in-backoff",
+        }
+    }
+}
+
 /// Exponential floor cap for the verdict-free-respawn backoff
 /// (bug_028 futility breaker). Schedule: `JOB_REQUEUE × 2^(deaths-1)`
 /// seconds, capped here --- 10, 20, 40, 80, 80, ... The base is the
@@ -441,7 +506,7 @@ struct RespawnEntry {
 }
 
 impl PoolStreaks {
-    // r[impl ctrl.pool.no-eligible-persist+4]
+    // r[impl ctrl.pool.no-eligible-persist+5]
     /// Mint the per-reconcile witness. NON-MUTATING (merged_bug_073):
     /// a reconcile that never reaches the gate fold drops the witness
     /// and leaves every streak exactly as it found it.
@@ -449,7 +514,7 @@ impl PoolStreaks {
         StreakTick { key: pool.clone() }
     }
 
-    // r[impl ctrl.pool.no-eligible-persist+4]
+    // r[impl ctrl.pool.no-eligible-persist+5]
     /// Fold one pool's COMPLETED gate evaluation: expire stale entries
     /// and respawn records, apply the per-cell retain laws against the
     /// fold's [`Observation`], step each gated intent, and return the
@@ -563,6 +628,36 @@ impl PoolStreaks {
         {
             tracing::debug!(pool = %pool, intent, resolution = ?what,
                 "verdict-free-respawn backoff reset by named resolution");
+        }
+    }
+
+    /// bug_075: classify one intent's evidence state for the spawn
+    /// decision — the typed query the fold-skip arm consults (and the
+    /// census walks). Pure read. Streak liveness uses the SAME
+    /// staleness bound as the retain law
+    /// ([`POOL_STREAK_ORPHAN_EXPIRY_SECS`]): evidence the next `step`
+    /// would expire is already dead for the spawn decision, so the
+    /// withhold is self-limiting — a permanently failing node LIST
+    /// restores fail-open once the entry goes stale.
+    // r[impl ctrl.pool.no-eligible-persist+5]
+    pub(crate) fn evidence_state(
+        &self,
+        pool: &PoolKey,
+        intent: &str,
+        now: std::time::Instant,
+    ) -> EvidenceState {
+        if self.respawn_blocked(pool, intent, now) {
+            return EvidenceState::InBackoff;
+        }
+        match self.entries.get(&(pool.clone(), intent.to_owned())) {
+            Some(e)
+                if now.saturating_duration_since(e.touched).as_secs()
+                    < POOL_STREAK_ORPHAN_EXPIRY_SECS =>
+            {
+                EvidenceState::LiveStreak
+            }
+            Some(_) => EvidenceState::StaleStreak,
+            None => EvidenceState::NoEvidence,
         }
     }
 
@@ -854,7 +949,7 @@ mod tests {
 /// universe — these properties pin the algebra of that universe
 /// against a mirror specification, over arbitrary intents and fleets.
 // r[verify ctrl.pool.intent-candidate-set]
-// r[verify ctrl.pool.no-eligible-persist+4]
+// r[verify ctrl.pool.no-eligible-persist+5]
 #[cfg(test)]
 mod proptests {
     use std::collections::BTreeMap;
@@ -1064,7 +1159,7 @@ mod proptests {
         }
     }
 
-    // r[verify ctrl.pool.no-eligible-persist+4]
+    // r[verify ctrl.pool.no-eligible-persist+5]
     /// merged_bug_117 law 1 (recorded red: the retired pool-shared map's
     /// `retain(|id| gated_B.contains(id))` wiped pool A's streaks every
     /// B tick — a persistently exhausted intent in a multi-pool config
@@ -1093,7 +1188,7 @@ mod proptests {
         );
     }
 
-    // r[verify ctrl.pool.no-eligible-persist+4]
+    // r[verify ctrl.pool.no-eligible-persist+5]
     /// merged_bug_117 law 2 (recorded red: an intent gated in two
     /// overlapping pools double-stepped the shared entry — reported
     /// after 2 wall-clock ticks instead of each pool's own 3): each
@@ -1125,7 +1220,7 @@ mod proptests {
         );
     }
 
-    // r[verify ctrl.pool.no-eligible-persist+4]
+    // r[verify ctrl.pool.no-eligible-persist+5]
     /// Orphan expiry: a pool removed from config never ticks again —
     /// its entries expire at POOL_STREAK_ORPHAN_EXPIRY_SECS instead of
     /// living forever (the retired global wipe GC'd them by accident;
@@ -1160,7 +1255,7 @@ mod proptests {
         );
     }
 
-    // r[verify ctrl.pool.no-eligible-persist+4]
+    // r[verify ctrl.pool.no-eligible-persist+5]
     /// merged_bug_073 (amends bug_069): a skipped fold retains the
     /// streak WITHOUT stepping --- but the wall-clock floor still
     /// blocks a burst that interleaves skips at the same instant. The
@@ -1194,7 +1289,7 @@ mod proptests {
         );
     }
 
-    // r[verify ctrl.pool.no-eligible-persist+4]
+    // r[verify ctrl.pool.no-eligible-persist+5]
     /// merged_bug_073, staleness bound: a streak frozen for hours (no
     /// completed folds) is dead evidence --- the orphan expiry applies
     /// to the OWN pool's unstepped entries too, so one isolated blip
@@ -1255,7 +1350,7 @@ mod proptests {
         );
     }
 
-    // r[verify ctrl.pool.no-eligible-persist+4]
+    // r[verify ctrl.pool.no-eligible-persist+5]
     /// bug_028 red (recorded against the retired gated-ids API, where
     /// truncation absence was only expressible as absence-from-gated
     /// --- that inexpressibility WAS the bug; the API migration is the
@@ -1313,7 +1408,7 @@ mod proptests {
         );
     }
 
-    // r[verify ctrl.pool.no-eligible-persist+4]
+    // r[verify ctrl.pool.no-eligible-persist+5]
     /// bug_028 companion pin: OBSERVED recovery still resets --- a
     /// completed fold that EVALUATED the intent into its spawnable
     /// half (universe un-exhausted) drops the streak, so the next
