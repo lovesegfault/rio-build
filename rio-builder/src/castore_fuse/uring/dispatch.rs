@@ -202,6 +202,16 @@ fn open_reply(payload: &mut [u8], outcome: Result<OpenOutcome, Errno>) -> Reply 
     }
 }
 
+/// The errno gate applied to a lookup name BEFORE the InoMap probe.
+/// A component longer than the advertised NAME_MAX must be
+/// ENAMETOOLONG (`_POSIX_NO_TRUNC`), never ENOENT: ENOENT asserts the
+/// name was validly looked up and is absent, and the infinite-TTL
+/// negative entry caches that lie. `None` = the name is legal, proceed
+/// to the DAG probe.
+fn lookup_name_errno(name: &[u8]) -> Option<Errno> {
+    (name.len() > abi::NAME_MAX).then_some(Errno::ENAMETOOLONG)
+}
+
 /// The errno for an `open()` of a non-file node (or a missing one) —
 /// shared by both tiers.
 fn open_node_errno(ino: u64, node: Option<&Node>) -> Errno {
@@ -243,6 +253,12 @@ fn handle_read_path_fast(
             // out before the reply overwrites the buffer.
             let raw = &payload[..req_payload_len.min(payload.len())];
             let name = raw.split(|&b| b == 0).next().unwrap_or(&[]).to_vec();
+            // Oversized components are ENAMETOOLONG before any DAG
+            // probe — the kernel passes long names through, and the
+            // advertised NAME_MAX makes ENOENT here a POSIX lie.
+            if let Some(errno) = lookup_name_errno(&name) {
+                return Done(Reply::err(errno));
+            }
             // Names outside the prefetched DAG are a legitimate ENOENT
             // (the closure is the allowlist), cached forever via the
             // nodeid=0 negative entry.
@@ -452,6 +468,30 @@ mod tests {
         // gets fuser-parity ENOSYS.
         for opcode in [20, 25, 31, 34, 40, 46, 47, 52, 999] {
             assert_eq!(disposition(opcode), Disposition::NotImplemented);
+        }
+    }
+
+    /// POSIX `_POSIX_NO_TRUNC`: a lookup of a name component longer
+    /// than the advertised NAME_MAX (statfs `f_namemax` = 255, see
+    /// `write_statfs_out`) must fail with ENAMETOOLONG, not ENOENT —
+    /// ENOENT claims the name was validly looked up and is absent,
+    /// and the infinite-TTL negative entry makes that lie permanent.
+    /// The kernel sends each path component as its own FUSE_LOOKUP, so
+    /// one gate covers final and mid-path components alike.
+    #[test]
+    fn lookup_rejects_oversized_name_components_with_enametoolong() {
+        // At or under the limit: no gate — the name proceeds to the
+        // DAG probe.
+        assert!(lookup_name_errno(&[b'a'; 255]).is_none());
+        assert!(lookup_name_errno(b"normal-name").is_none());
+        // Past the limit: ENAMETOOLONG.
+        for len in [256usize, 300, 4000] {
+            let verdict = lookup_name_errno(&vec![b'x'; len]);
+            assert_eq!(
+                verdict.map(|e| e.code()),
+                Some(Errno::ENAMETOOLONG.code()),
+                "{len}-byte component must be ENAMETOOLONG"
+            );
         }
     }
 

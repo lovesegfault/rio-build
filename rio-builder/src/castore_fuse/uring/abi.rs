@@ -305,13 +305,19 @@ pub(super) fn write_open_out(b: &mut [u8], fh: u64, open_flags: u32, backing_id:
     OPEN_OUT_SZ
 }
 
+/// The NAME_MAX this filesystem advertises (statfs `f_namemax`,
+/// pathconf `_PC_NAME_MAX`). Lookup enforces it (`lookup_name_errno`):
+/// advertising a limit and then answering ENOENT past it violates
+/// `_POSIX_NO_TRUNC`.
+pub(super) const NAME_MAX: usize = 255;
+
 /// Encode `struct fuse_statfs_out` with fuser's default-handler values
-/// (everything 0 except bsize=512, namelen=255); returns the byte
-/// count written.
+/// (everything 0 except bsize=512, namelen=[`NAME_MAX`]); returns the
+/// byte count written.
 pub(super) fn write_statfs_out(b: &mut [u8]) -> usize {
     b[..STATFS_OUT_SZ].fill(0);
     put_u32(b, 40, 512); // bsize
-    put_u32(b, 44, 255); // namelen
+    put_u32(b, 44, NAME_MAX as u32); // namelen
     STATFS_OUT_SZ
 }
 
