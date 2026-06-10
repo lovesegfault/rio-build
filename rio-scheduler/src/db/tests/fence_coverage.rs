@@ -405,37 +405,102 @@ pub(crate) const STATUS_WRITER_FNS: &[&str] = &[
 pub(crate) const NON_STATUS_DERIVATIONS_WRITER_FNS: &[&str] =
     &["batch_upsert_derivations", "update_resource_floor"];
 
-/// Every production `.rs` source under `rio-scheduler/src`, walked at
-/// test time (the member list is DERIVED from the tree, never
-/// author-enumerated): any path containing a `tests` component or a
-/// `tests.rs` file is excluded — fixtures there construct historical
-/// row shapes deliberately.
-fn production_rs_sources() -> Vec<(String, String)> {
-    fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+/// Every production source the stamp census scans: the COMPILE-TIME
+/// embedded [`SOURCES`] (db/) + [`ACTOR_SOURCES`] (actor/) lists —
+/// the same embedding every fence test in this file uses, because
+/// the nix gate runs the test binary without the source tree on
+/// disk (a runtime walk fails there with NotFound; observed live at
+/// the bughunt-6 gate). Completeness of the embedded lists against
+/// the live tree is pinned by
+/// [`derivations_sql_confined_to_embedded_sources`], which walks the
+/// real `src/` whenever it exists (every dev-tree `cargo nextest`
+/// run of the same commit).
+fn production_rs_sources() -> Vec<(String, &'static str)> {
+    SOURCES
+        .iter()
+        .map(|(f, s)| (format!("db/{f}"), *s))
+        .chain(
+            ACTOR_SOURCES
+                .iter()
+                .map(|(f, s)| (format!("actor/{f}"), *s)),
+        )
+        .collect()
+}
+
+/// Dev-tree completeness pin for the census's file universe: any
+/// production `.rs` under `src/` that names a `derivations` write
+/// verb MUST be one of the embedded census sources (db/ in
+/// [`SOURCES`], actor/ in [`ACTOR_SOURCES`]). Walks the real tree
+/// when present; in the nix sandbox (no source dir) the embedded
+/// scan is the same commit's content, so the dev-run enforcement
+/// covers the identical tree — the skip is disclosed, not silent.
+#[test]
+fn derivations_sql_confined_to_embedded_sources() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    if !root.exists() {
+        eprintln!(
+            "src/ not on disk (nix sandbox): completeness pinned by the \
+             dev-tree run of this same commit"
+        );
+        return;
+    }
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         for entry in std::fs::read_dir(dir).expect("readable src dir") {
             let entry = entry.expect("readable dir entry");
             let path = entry.path();
             let name = entry.file_name();
-            let name = name.to_string_lossy();
             if path.is_dir() {
                 if name == "tests" {
                     continue;
                 }
                 walk(&path, out);
-            } else if name.ends_with(".rs") && name != "tests.rs" {
-                let src = std::fs::read_to_string(&path).expect("readable source");
-                out.push((path.display().to_string(), src));
+            } else if path.extension().is_some_and(|e| e == "rs") && name != "tests.rs" {
+                out.push(path);
             }
         }
     }
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut out = Vec::new();
-    walk(&root, &mut out);
+    let mut files = Vec::new();
+    walk(&root, &mut files);
     assert!(
-        out.iter().any(|(p, _)| p.ends_with("db/derivations.rs")),
+        files.iter().any(|p| p.ends_with("db/derivations.rs")),
         "walk must reach the known writer file (src layout moved?)"
     );
-    out
+    let mut violations = Vec::new();
+    for path in files {
+        let src = std::fs::read_to_string(&path).expect("readable source");
+        let has_write = src.lines().any(|l| {
+            let t = l.trim_start();
+            if t.starts_with("//") || t.starts_with("--") {
+                return false;
+            }
+            let u = l.to_uppercase();
+            u.contains("UPDATE DERIVATIONS") || u.contains("INSERT INTO DERIVATIONS")
+        });
+        if !has_write {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        let embedded = (path.parent().is_some_and(|d| d.ends_with("db"))
+            && SOURCES.iter().any(|(f, _)| *f == name))
+            || (path.parent().is_some_and(|d| d.ends_with("actor"))
+                && ACTOR_SOURCES.iter().any(|(f, _)| *f == name));
+        if !embedded {
+            violations.push(format!(
+                "{}: writes derivations but is not in the embedded census \
+                 sources (add it to SOURCES/ACTOR_SOURCES so the stamp \
+                 census sees it in the nix sandbox too)",
+                path.display()
+            ));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "derivations SQL outside the embedded census universe:\n{}",
+        violations.join("\n")
+    );
 }
 
 /// One scanned `derivations` write statement: where it is, what kind,
@@ -558,7 +623,7 @@ fn derivations_status_stamp_census() {
     let mut status_writers = std::collections::BTreeSet::new();
     let mut non_status_writers = std::collections::BTreeSet::new();
     for (file, src) in production_rs_sources() {
-        for w in derivations_writes(&file, &src) {
+        for w in derivations_writes(&file, src) {
             let names = |cols: &Option<Vec<String>>, col: &str| {
                 cols.as_ref().is_some_and(|cs| cs.iter().any(|c| c == col))
             };

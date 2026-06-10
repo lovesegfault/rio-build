@@ -903,7 +903,7 @@ async fn status_writers_stamp_status_changed_at_biconditional() -> anyhow::Resul
                 assert!(
                     matches!(
                         &outcome,
-                        crate::db::StatusReplay::Applied { replayed, .. } if replayed == &[hash.clone()]
+                        crate::db::StatusReplay::Applied { replayed, .. } if replayed == std::slice::from_ref(&hash)
                     ),
                     "replay drive must apply (got {outcome:?})"
                 );
@@ -920,7 +920,8 @@ async fn status_writers_stamp_status_changed_at_biconditional() -> anyhow::Resul
             }
             "clear_poison_batch_in_tx" => {
                 let mut tx = test_db.pool.begin().await?;
-                SchedulerDb::clear_poison_batch_in_tx(&mut tx, &[drv_hash.clone()]).await?;
+                SchedulerDb::clear_poison_batch_in_tx(&mut tx, std::slice::from_ref(&drv_hash))
+                    .await?;
                 tx.commit().await?;
             }
             other => panic!(
