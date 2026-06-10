@@ -60,6 +60,21 @@
     kernelParams = [
       "panic=10"
       "panic_on_oops=1"
+      # The fuse module's enable_uring param, REQUIRED on builder
+      # nodes: the worker's castore-FUSE serves exclusively over Linux
+      # 6.14 fuse-over-io_uring, and without this switch the kernel
+      # never advertises FUSE_OVER_IO_URING — every castore mount then
+      # fails hard with the requirement in the error (no fallback
+      # transport exists). The kernel parks the param behind this
+      # switch (CONFIG_FUSE_IO_URING gates the knob's existence). fuse
+      # is loaded as a module (kernel.nix boot.kernelModules), and
+      # modulename.param= on the cmdline applies at modprobe.
+      # Node-wide on the worker AMI: harmless on fetcher/general nodes
+      # (the fetcher seccomp denies io_uring and nothing there mounts
+      # a castore-FUSE), it only raises a kernel default.
+      # Runtime-writable at /sys/module/fuse/parameters/enable_uring
+      # if it ever needs to be flipped without a reboot.
+      "fuse.enable_uring=1"
     ];
 
     # kdump: the cgwb_release panic above was preceded by a [W]-taint

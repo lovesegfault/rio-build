@@ -419,11 +419,21 @@ fn seccomp_allowlist() -> Result<()> {
     const BUILDER_NEEDED_TRACE: &[&str] = &["ptrace", "process_vm_readv"];
 
     // Fetcher-only ADR-019 denies, on top of the builder DENIED set.
-    // `ptrace`/`process_vm_readv` are allowed in the BUILDER profile
-    // (read-side tracing for check phases — see regen::seccomp::DENIED)
-    // but stay denied here: FOD fetch scripts have no check phase, and
-    // the fetcher faces the open internet.
-    const FETCHER_EXTRA_DENIED: &[&str] = &["keyctl", "add_key", "ptrace", "process_vm_readv"];
+    // `ptrace`/`process_vm_readv` and the `io_uring_*` trio are allowed
+    // in the BUILDER profile (read-side tracing for check phases; the
+    // castore-FUSE fuse-over-io_uring transport — see
+    // regen::seccomp::DENIED) but stay denied here: FOD fetch scripts
+    // have no check phase and no FUSE transport of their own, and the
+    // fetcher faces the open internet.
+    const FETCHER_EXTRA_DENIED: &[&str] = &[
+        "keyctl",
+        "add_key",
+        "ptrace",
+        "process_vm_readv",
+        "io_uring_setup",
+        "io_uring_enter",
+        "io_uring_register",
+    ];
 
     let fetcher_denied: Vec<&str> = crate::regen::seccomp::DENIED
         .iter()

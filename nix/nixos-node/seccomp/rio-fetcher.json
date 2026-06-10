@@ -1,6 +1,6 @@
 {
-  "//": "rio-fetcher seccomp profile (Localhost). ADR-019 §Sandbox hardening. Derived from seccomp-rio-builder.json with extra denies for ptrace/bpf/setns/process_vm_*/keyctl/add_key — fetchers face the open internet; a compromised upstream serving an exploit payload (curl/git CVE) could pivot to the node without these guards. The FOD hash check catches content tampering but not a rooted fetcher process.",
-  "//provenance": "seccomp-rio-builder.json is itself derived from Docker/moby default.json v27.5.1, flattened to OCI runtime spec format for the executor cap set (CAP_SYS_ADMIN + CAP_SYS_CHROOT). The fetcher profile adds an explicit SCMP_ACT_ERRNO block for the 7 syscalls ADR-019 calls out — most were already denied-by-omission under the builder profile (defaultAction=ERRNO, not in any ALLOW block), but the explicit block makes the intent grep-able and guards against future allowlist widening accidentally re-enabling them.",
+  "//": "rio-fetcher seccomp profile (Localhost). ADR-019 §Sandbox hardening. Derived from seccomp-rio-builder.json with extra denies for ptrace/bpf/setns/process_vm_*/keyctl/add_key/io_uring_* — fetchers face the open internet; a compromised upstream serving an exploit payload (curl/git CVE) could pivot to the node without these guards. The FOD hash check catches content tampering but not a rooted fetcher process.",
+  "//provenance": "seccomp-rio-builder.json is itself derived from Docker/moby default.json v27.5.1, flattened to OCI runtime spec format for the executor cap set (CAP_SYS_ADMIN + CAP_SYS_CHROOT). The fetcher profile adds an explicit SCMP_ACT_ERRNO block for the 10 syscalls ADR-019 (plus the io_uring trio) calls out — most were already denied-by-omission under the builder profile (defaultAction=ERRNO, not in any ALLOW block), but the explicit block makes the intent grep-able and guards against future allowlist widening accidentally re-enabling them.",
   "//denied-explicit": {
     "ptrace": "debugger attach — lets an escapee inspect/modify other processes sharing the PID namespace",
     "bpf": "load eBPF programs — kernel-side code execution surface",
@@ -8,7 +8,10 @@
     "process_vm_readv": "cross-process memory read without ptrace — same attack class as ptrace",
     "process_vm_writev": "cross-process memory write without ptrace",
     "keyctl": "kernel keyring manipulation — fetcher has no legitimate need for persistent kernel keys",
-    "add_key": "add to kernel keyring — paired with keyctl"
+    "add_key": "add to kernel keyring — paired with keyctl",
+    "io_uring_setup": "create an io_uring instance — broad async-syscall surface (container-escape CVE history); the builder profile re-allows the trio for the castore-FUSE fuse-over-io_uring transport, but the fetcher has no FUSE transport of its own and faces the open internet",
+    "io_uring_enter": "submit/await io_uring SQEs — paired with io_uring_setup",
+    "io_uring_register": "register io_uring buffers/files — paired with io_uring_setup"
   },
   "//kept": "mount/umount/unshare/clone/pivot_root — FUSE + overlayfs + nix sandbox need these even in fetch mode (the FOD build script runs inside the same sandbox).",
   "//caveat": "ADR-019 warns this may be too strict for git-lfs/hg/svn FODs. Allowlist widens as real FODs hit denials; the VM test git-based FOD subtest is the canary.",
@@ -31,7 +34,10 @@
         "process_vm_readv",
         "process_vm_writev",
         "keyctl",
-        "add_key"
+        "add_key",
+        "io_uring_setup",
+        "io_uring_enter",
+        "io_uring_register"
       ],
       "action": "SCMP_ACT_ERRNO",
       "errnoRet": 1
