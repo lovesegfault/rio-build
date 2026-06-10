@@ -87,20 +87,34 @@ pub enum TreeError {
 }
 
 /// The castore-FUSE's entire metadata state: content-derived inode →
-/// node, dir-digest → decoded `Directory` body, and the synthetic
-/// root's children. Built once at mount, never mutated.
+/// node, per-directory child indexes, and the synthetic root's
+/// children. Built once at mount, never mutated.
 pub struct InoMap {
     /// ino → node, for every node reachable from the roots. Two files
     /// with identical bytes and executable bit share one entry.
     inodes: HashMap<u64, Node>,
-    /// Decoded `Directory` bodies keyed by their *recomputed* canonical
-    /// digest — the `GetDirectory` stream carries no digest field, so
-    /// the key is `blake3(body.encode_to_vec())` and cannot lie.
-    dirs: HashMap<[u8; 32], Directory>,
+    /// dir ino → its serve-time child index. Precomputed at build so
+    /// the metadata hot path (`lookup`/`readdir`, the bulk of a cold
+    /// `find` over the closure) never re-derives a child ino (a blake3
+    /// hash each) and never scans a child list — both showed up as
+    /// ~11% of serve-thread CPU before this index existed.
+    children: HashMap<u64, DirChildren>,
     /// `FUSE_ROOT_ID`'s children: store-path basename → child ino.
     /// `BTreeMap` so `readdir(ROOT)` enumerates in a stable order
     /// across calls (the kernel resumes by offset).
     roots: BTreeMap<Vec<u8>, u64>,
+}
+
+/// One directory's child index. The decoded `Directory` bodies are
+/// dropped after construction — everything the serve path needs is
+/// here and in [`InoMap::inodes`].
+struct DirChildren {
+    /// The `Directory` body's canonical order (directories, files,
+    /// symlinks) with each child's derived ino — `readdir`'s stable
+    /// enumeration, offset-resumable because the order never changes.
+    entries: Vec<(Vec<u8>, u64, FileType)>,
+    /// `lookup(parent, name)` probe: name → derived ino.
+    by_name: HashMap<Vec<u8>, u64>,
 }
 
 // ── Inode derivation (ADR §2.3) ───────────────────────────────────────
@@ -331,6 +345,7 @@ impl InoMap {
             }
         }
 
+        let mut children: HashMap<u64, DirChildren> = HashMap::with_capacity(dirs.len());
         while let Some(digest) = pending.pop() {
             let Some(dir) = dirs.get(&digest) else {
                 return Err(TreeError::MissingDirectory {
@@ -341,21 +356,31 @@ impl InoMap {
             // Error context only; hoisted so the per-child calls below
             // don't allocate a hex string each on the happy path.
             let ctx = hex::encode(digest);
+            let mut entries: Vec<(Vec<u8>, u64, FileType)> =
+                Vec::with_capacity(dir.directories.len() + dir.files.len() + dir.symlinks.len());
             for d in &dir.directories {
                 let child = digest32(&d.digest, &ctx)?;
-                insert_dir(child, &mut inodes, &mut pending, &mut visited);
+                let ino = insert_dir(child, &mut inodes, &mut pending, &mut visited);
+                entries.push((d.name.clone(), ino, FileType::Directory));
             }
             for f in &dir.files {
-                insert_file(f, &ctx, &mut inodes)?;
+                let ino = insert_file(f, &ctx, &mut inodes)?;
+                entries.push((f.name.clone(), ino, FileType::RegularFile));
             }
             for s in &dir.symlinks {
-                insert_symlink(s, &mut inodes);
+                let ino = insert_symlink(s, &mut inodes);
+                entries.push((s.name.clone(), ino, FileType::Symlink));
             }
+            let by_name = entries
+                .iter()
+                .map(|(n, ino, _)| (n.clone(), *ino))
+                .collect();
+            children.insert(dir_ino(&digest), DirChildren { entries, by_name });
         }
 
         Ok(Self {
             inodes,
-            dirs,
+            children,
             roots: root_children,
         })
     }
@@ -369,28 +394,12 @@ impl InoMap {
             let ino = *self.roots.get(name)?;
             return Some((ino, self.attr(ino)?));
         }
-        let Node::Dir { dir_digest } = self.inodes.get(&parent_ino)? else {
-            return None;
-        };
-        let dir = self.dirs.get(dir_digest)?;
-        // The three child lists are each sorted by name; a linear scan
-        // is fine at castore fan-outs (chromium's widest dir is ~3k
-        // entries) and avoids a per-directory name index.
-        if let Some(d) = dir.directories.iter().find(|d| d.name == name) {
-            let digest: [u8; 32] = d.digest.as_slice().try_into().ok()?;
-            let ino = dir_ino(&digest);
-            return Some((ino, self.attr(ino)?));
-        }
-        if let Some(f) = dir.files.iter().find(|f| f.name == name) {
-            let digest: [u8; 32] = f.digest.as_slice().try_into().ok()?;
-            let ino = file_ino(&digest, f.executable);
-            return Some((ino, self.attr(ino)?));
-        }
-        if let Some(s) = dir.symlinks.iter().find(|s| s.name == name) {
-            let ino = symlink_ino(&s.target);
-            return Some((ino, self.attr(ino)?));
-        }
-        None
+        // Two hash probes, no digest re-derivation: the child index was
+        // built alongside the inode table, so a hit here is exactly the
+        // ino the derivation functions produce (and a non-directory
+        // parent has no index → None, same as before).
+        let ino = *self.children.get(&parent_ino)?.by_name.get(name)?;
+        Some((ino, self.attr(ino)?))
     }
 
     /// Canonical store-path attributes for `ino`. Everything is owned
@@ -431,10 +440,9 @@ impl InoMap {
         let dir = if ino == INodeNo::ROOT.0 {
             None
         } else {
-            match self.inodes.get(&ino)? {
-                Node::Dir { dir_digest } => Some(self.dirs.get(dir_digest)?),
-                _ => return None,
-            }
+            // Only directories have a child index; files/symlinks (and
+            // unknown inos) fall out here as "not a directory".
+            Some(self.children.get(&ino)?)
         };
 
         let dots = [
@@ -442,9 +450,9 @@ impl InoMap {
             (ino, FileType::Directory, b"..".as_slice()),
         ];
 
-        // Root: enumerate the closure's basenames. Non-root: chain the
-        // Directory body's three lists. Both are stable across calls,
-        // which is all the offset-resume contract needs.
+        // Root: enumerate the closure's basenames. Non-root: the
+        // precomputed child index. Both are stable across calls, which
+        // is all the offset-resume contract needs.
         let root_iter = if ino == INodeNo::ROOT.0 {
             Some(self.roots.iter().map(|(name, &child)| {
                 let kind = match self.inodes.get(&child) {
@@ -457,29 +465,10 @@ impl InoMap {
         } else {
             None
         };
-        // Child digests were length-validated by `from_parts` (a bad
-        // one fails tree construction), so the readdir of a built tree
-        // can derive every child ino the same way `lookup` does. The
-        // `?` on a malformed digest is therefore unreachable, but
-        // skipping the entry beats serving a fabricated inode.
-        let dir_iter = dir.map(|d| {
-            let dirs = d.directories.iter().filter_map(|e| {
-                let digest: [u8; 32] = e.digest.as_slice().try_into().ok()?;
-                Some((dir_ino(&digest), FileType::Directory, e.name.as_slice()))
-            });
-            let files = d.files.iter().filter_map(|e| {
-                let digest: [u8; 32] = e.digest.as_slice().try_into().ok()?;
-                Some((
-                    file_ino(&digest, e.executable),
-                    FileType::RegularFile,
-                    e.name.as_slice(),
-                ))
-            });
-            let symlinks = d
-                .symlinks
+        let dir_iter = dir.map(|c| {
+            c.entries
                 .iter()
-                .map(|e| (symlink_ino(&e.target), FileType::Symlink, e.name.as_slice()));
-            dirs.chain(files).chain(symlinks)
+                .map(|(name, ino, kind)| (*ino, *kind, name.as_slice()))
         });
 
         Some(
@@ -806,6 +795,42 @@ mod tests {
         );
         let (file_ino, _) = lookup_path(&map, &[b"aaa-pkg", b"lib", b"data"]).unwrap();
         assert!(map.readdir(file_ino, 0).is_none());
+    }
+
+    /// The serve path reads the build-time child index; the derivation
+    /// functions (`file_ino`/`dir_ino`/`symlink_ino`) are the spec
+    /// (ADR §2.3). They must agree — a drifted index would let lookup
+    /// advertise one inode while `open()`/`getattr` (which go through
+    /// the node table) serve another.
+    // r[verify builder.fs.castore-inode-digest]
+    #[test]
+    fn child_index_agrees_with_ino_derivation() {
+        let (roots, dirs) = sample();
+        let map = InoMap::from_parts(&roots, dirs).expect("build tree");
+
+        let (lib_ino, _) = lookup_path(&map, &[b"aaa-pkg", b"lib"]).unwrap();
+        let (bin_ino, _) = lookup_path(&map, &[b"aaa-pkg", b"bin"]).unwrap();
+        assert_eq!(
+            map.lookup(lib_ino, b"libfoo.so").unwrap().0,
+            file_ino(&[1u8; 32], false)
+        );
+        assert_eq!(
+            map.lookup(bin_ino, b"tool").unwrap().0,
+            file_ino(&[1u8; 32], true)
+        );
+        assert_eq!(
+            map.lookup(lib_ino, b"alias").unwrap().0,
+            symlink_ino(b"libfoo.so")
+        );
+
+        // readdir's precomputed inos match lookup's for every entry
+        // (offset 2 skips the dot entries, which have no lookup).
+        for dir in [lib_ino, bin_ino] {
+            for e in map.readdir(dir, 2).expect("is a dir") {
+                let (ino, _) = map.lookup(dir, e.name).expect("readdir name resolves");
+                assert_eq!(ino, e.ino, "readdir/lookup ino mismatch for {:?}", e.name);
+            }
+        }
     }
 
     /// A DAG that references a directory the server never streamed must
