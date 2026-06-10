@@ -69,9 +69,11 @@ specs (
           nix/docker.nix
           rio-dashboard/src/lib/logStream.svelte.ts
           rio-dashboard/src/lib/graphLayout.ts
+          rio-dashboard/src/lib/buildGraphPoll.svelte.ts
           rio-dashboard/src/lib/toast.ts
           rio-dashboard/src/api/transport.ts
           rio-dashboard/src/api/admin.ts
+          rio-dashboard/src/api/logs.ts
         )
         exclude (
           target/**
@@ -92,6 +94,7 @@ specs (
           rio-dashboard/src/lib/__tests__/*.ts
           rio-dashboard/src/components/__tests__/*.ts
           rio-dashboard/src/pages/__tests__/*.ts
+          rio-dashboard/src/api/__tests__/*.ts
         )
       }
     )

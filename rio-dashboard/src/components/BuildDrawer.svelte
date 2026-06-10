@@ -41,6 +41,15 @@
   // between tabs doesn't lose the selection — Graph re-mounts on every
   // tab flip but the drawer survives.
   //
+  // SCOPE LAW (bug_090, signed Q4): the Logs tab is the PER-ATTEMPT
+  // surface — a stream mounts ONLY when a derivation is focused. The
+  // TailLog selector alphabet is closed (pinned exec | non-empty
+  // derivation, api/logs.ts); the empty form has no resolver, so the
+  // pre-fix unfocused mount was a guaranteed-NotFound dial loop.
+  // Unfocused renders the static unavailable-by-design panel below;
+  // whole-build aggregation is an explicit non-goal (no server
+  // aggregation contract).
+  //
   // focusedExecId is the per-build observation of which execution this
   // build watched (`GraphNode.exec_id` ← `build_derivations.exec_id`),
   // captured at click time so the log fetch can pin the EXACT execution
@@ -164,14 +173,33 @@
     aria-labelledby="tab-{activeTab}"
   >
     {#if activeTab === 'logs'}
-      <!-- Keyed on buildId so switching builds (deep-link → different
-           drawer target) tears down the old stream and starts a fresh
-           one. Without the key Svelte reuses the component instance and
-           the IIFE inside createLogStream keeps draining the prior
-           build's fetch. -->
-      {#key `${build.buildId}:${focusedDrv ?? ''}:${focusedExecId}`}
-        <LogViewer drvPath={focusedDrv} execId={focusedExecId} {isTerminal} />
-      {/key}
+      {#if focusedDrv !== undefined}
+        <!-- Keyed on buildId so switching builds (deep-link → different
+             drawer target) tears down the old stream and starts a fresh
+             one. Without the key Svelte reuses the component instance and
+             the IIFE inside createLogStream keeps draining the prior
+             build's fetch. -->
+        {#key `${build.buildId}:${focusedDrv}:${focusedExecId}`}
+          <LogViewer
+            drvPath={focusedDrv}
+            execId={focusedExecId}
+            {isTerminal}
+          />
+        {/key}
+      {:else}
+        <!-- The unfocused Logs tab (bug_090): no stream object is
+             constructed — there is nothing servable to stream. The
+             empty TailLog selector is additionally refused at the
+             api/logs.ts boundary as the backstop. No auto-focus: Q4
+             fixes the mode SCOPE, not a selection policy. -->
+        <div class="logs-unfocused" data-testid="logs-unfocused">
+          <p>Logs are per-attempt. Pick a derivation in the Graph tab.</p>
+          <p class="dim">
+            Whole-build log aggregation is unavailable by design — no
+            server-side aggregation contract exists.
+          </p>
+        </div>
+      {/if}
     {:else if poll}
       <!-- Keyed on buildId so a build switch tears down Graph's layout
            state + WebWorker cleanly. The POLL is not Graph's anymore
@@ -285,6 +313,14 @@
     margin: 0.5rem 0 0;
     font-size: 0.8125rem;
     color: #92400e;
+  }
+  .logs-unfocused {
+    padding: 2rem 0;
+    color: #6b7280;
+    text-align: center;
+  }
+  .logs-unfocused .dim {
+    font-size: 0.8125rem;
   }
   .tab-body {
     padding: 1rem 0;

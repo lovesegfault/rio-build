@@ -312,6 +312,22 @@ lower floor there; the dashboard tab has neither bound.
   builds.
 ]
 
+#r("dash.log.attempt-scope")[
+  The Logs tab is PER-ATTEMPT: a `TailLog` request MUST carry a
+  non-empty selector --- a pinned execution (`exec_id`) or a non-empty
+  `derivation` --- and the dashboard MUST refuse the empty form
+  client-side, before the transport, with the store's permanent
+  unservable type (`x-rio-log-unservable` metadata), which the
+  stream's exit law already classifies as terminal (no re-dial). An
+  unfocused Logs tab MUST render a static unavailable-by-design
+  affordance instead of mounting a stream. Whole-build log
+  aggregation is an explicit NON-GOAL absent a server-side
+  aggregation contract: no resolver exists for an empty selector
+  (`drv_log_hash('')` matches no execution), so the mode is
+  unrepresentable in the UI rather than a guaranteed-NotFound dial
+  loop.
+]
+
 #r("dash.graph.auto-stop+2")[
   The Graph tab's 5s `GetBuildGraph` poll MUST downshift to the settled
   cadence (`SETTLED_POLL_MS`, 30s) once every node is in a terminal status

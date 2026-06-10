@@ -11,8 +11,10 @@ import {
   teardownStandardAfterEach,
 } from '../../test-support/admin-mock';
 
-// The drawer embeds LogViewer (P0279), which fires logs.tailLog on
-// mount (build logs live in rio-store, not AdminService) — logsMock's
+// The drawer mounts LogViewer only once a derivation is focused
+// (bug_090: the default Logs tab renders the per-attempt placeholder;
+// no stream mounts unfocused). logsMock still backs any focused mount
+// (build logs live in rio-store, not AdminService); its
 // empty-generator default keeps the `for await` from crashing on
 // `undefined is not iterable`. The log stream itself is covered in
 // lib/__tests__/logStream.test.ts.
@@ -93,11 +95,14 @@ describe('Builds', () => {
     const drawer = screen.getByTestId('build-drawer');
     expect(drawer).toHaveTextContent('click-target-id');
     expect(drawer).toHaveTextContent('succeeded');
-    // Both tab buttons render; Logs is active by default and hosts the
-    // live LogViewer.
+    // Both tab buttons render; Logs is active by default and — with
+    // no derivation focused yet — hosts the per-attempt placeholder,
+    // not a stream (bug_090: the empty TailLog selector has no
+    // resolver, so no LogViewer mounts unfocused).
     expect(drawer).toHaveTextContent('Logs');
     expect(drawer).toHaveTextContent('Graph');
-    expect(screen.getByTestId('log-viewer')).toBeInTheDocument();
+    expect(screen.getByTestId('logs-unfocused')).toBeInTheDocument();
+    expect(screen.queryByTestId('log-viewer')).not.toBeInTheDocument();
 
     // Close via backdrop click.
     await fireEvent.click(screen.getByTestId('drawer-backdrop'));
