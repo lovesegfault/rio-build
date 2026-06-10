@@ -529,7 +529,7 @@
       {
         "name": "rio_controller_spot_exposure_dropped_seconds_total",
         "kind": "counter",
-        "help": "Spot-exposure node-seconds forfeited without reaching the scheduler (labeled by reason: no_hw_class | absent_node | shutdown; incremented by whole seconds). The denominator twin of rio_controller_spot_interrupt_dropped_total — together they close the exposure leg's conservation identity: every observed node-second is banked, pending, or counted here (merged_bug_070). Every drop under-counts λ's denominator → λ reads HIGH → the solver under-prefers spot (the conservative direction) — sustained non-zero no_hw_class means label/config drift; sustained absent_node means LIST-failure streaks are eating deleted nodes' residuals."
+        "help": "Spot-exposure node-seconds forfeited without reaching the scheduler (labeled by reason: no_hw_class | absent_node | shutdown | refused; incremented by whole seconds). The denominator twin of rio_controller_spot_interrupt_dropped_total — together they close the exposure leg's conservation identity: every observed node-second is banked, pending, or counted here (merged_bug_070). Every drop under-counts λ's denominator → λ reads HIGH → the solver under-prefers spot (the conservative direction) — sustained non-zero no_hw_class means label/config drift; sustained absent_node means LIST-failure streaks are eating deleted nodes' residuals; sustained refused means schema/version skew or a service-token misconfig — check the scheduler's AppendInterruptSample validation and the rio-service-hmac Secret."
       },
       {
         "name": "rio_controller_spot_interrupt_dropped_total",
