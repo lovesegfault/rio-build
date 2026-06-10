@@ -135,6 +135,18 @@ fn nc_json(name: &str, created: u64, registered: Option<u64>) -> Value {
     })
 }
 
+/// NEVER-Registered NodeClaim observed mid-GC-transit: Karpenter set
+/// `deletionTimestamp` (terminal launch failure → finalize) but the
+/// finalizer hasn't cleared yet — the live_050(b) window. NOT reaped by
+/// `classify` (already-terminating claims are skipped); only
+/// `detect_vanished`'s exit alphabet sees it.
+fn nc_json_terminating(name: &str, created: u64) -> Value {
+    let mut v = nc_json(name, created, None);
+    v["metadata"]["deletionTimestamp"] = json!(rfc3339(created + 2));
+    v["metadata"]["finalizers"] = json!(["karpenter.sh/termination"]);
+    v
+}
+
 /// In-flight NodeClaim carrying `Launched=False reason=LaunchFailed` —
 /// [`health::classify`] short-circuits this to an ICE reap with no age
 /// gate (the deterministic reap shape).
@@ -626,7 +638,7 @@ async fn reload_ok_preserves_evidence_buffered_during_err_window() {
 /// healthy cell; `right:` the buffer holds only the newest polarity,
 /// so the Ack ships the clear alone.
 // r[verify ctrl.nodeclaim.evidence-ack-latch+3]
-// r[verify ctrl.nodeclaim.ice-mark-clear+2]
+// r[verify ctrl.nodeclaim.ice-mark-clear+3]
 #[tokio::test]
 async fn newer_registration_supersedes_buffered_mark_end_to_end() {
     let mut lab = Lab::new().await;
@@ -686,7 +698,7 @@ async fn newer_registration_supersedes_buffered_mark_end_to_end() {
 /// scheduler's fixed clears-then-marks order + epoch gate realize
 /// reset-then-step-0`.
 // r[verify ctrl.nodeclaim.evidence-ack-latch+3]
-// r[verify ctrl.nodeclaim.ice-mark-clear+2]
+// r[verify ctrl.nodeclaim.ice-mark-clear+3]
 #[tokio::test]
 async fn clear_then_mark_ships_both_planes_with_ordered_epochs() {
     let mut lab = Lab::new().await;
@@ -737,7 +749,7 @@ async fn clear_then_mark_ships_both_planes_with_ordered_epochs() {
 /// R2 recency gate: a stale (>3×TICK) Registered edge after the
 /// acquire clear is recorded WITHOUT a sample and WITHOUT an ICE-clear
 /// on the wire (noMassClearAfterFailover / m34CalibNoRecencyGate).
-// r[verify ctrl.nodeclaim.ice-mark-clear+2]
+// r[verify ctrl.nodeclaim.ice-mark-clear+3]
 #[tokio::test]
 async fn post_acquire_stale_registration_records_without_clear_or_sample() {
     let mut lab = Lab::new().await;
@@ -1643,5 +1655,40 @@ async fn no_hosting_class_drop_answers_a_typed_verdict() {
     assert!(
         !rejected.iter().any(|v| v.intent_id == "drv-masked"),
         "masked population stays off the wire (kill-isolation)"
+    );
+}
+
+// r[verify ctrl.nodeclaim.ice-mark-clear+3]
+/// live_050(b) red R4-A / W7-D leg A — certifies: *never-registered-
+/// terminating transit through the production retain + reconcile ships
+/// the mark AT THE WIRE ARTIFACT* — `AckSpawnedIntentsRequest.
+/// unfulfillable_cells` carries the encoded cell event. Pre-fix red
+/// (verbatim): `left: unfulfillable_cells == [] (no mark shipped; the
+/// Terminating arm misread launch-failure teardown as deliberate) /
+/// right: carries the encoded cell event`. Leg B (the scheduler-side
+/// consumption pin, R4-B) lives at actor/tests/sla_contract.rs over
+/// the shared `rio_common::cell_wire` codec — the pinned-composition
+/// convention (W7-D).
+#[tokio::test]
+async fn never_registered_vanish_ships_the_mark_on_the_wire() {
+    let mut lab = Lab::new().await;
+    // cover_deficit created it last tick; never observed Registered.
+    lab.r.inflight_created.insert("nc-doomed".into(), cell());
+    // This tick observes it TERMINATING without ever Registering
+    // (Karpenter terminal launch failure mid-finalize).
+    lab.tick(
+        600,
+        full_tick_scenario(vec![], vec![nc_json_terminating("nc-doomed", 595)], vec![]),
+    )
+    .await;
+    let last = lab.ack_calls().pop().expect("tick acked");
+    assert!(
+        carries(&last.unfulfillable_cells, &cell()),
+        "launch-failure teardown ships the mark on the wire: {:?}",
+        last.unfulfillable_cells
+    );
+    assert!(
+        !lab.r.inflight_created.contains_key("nc-doomed"),
+        "exited tracking through the typed exit alphabet"
     );
 }

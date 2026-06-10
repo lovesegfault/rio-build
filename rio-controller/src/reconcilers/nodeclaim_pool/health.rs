@@ -185,14 +185,26 @@ pub fn classify(
 /// holds `(name, cell)` for everything `cover_deficit` created and
 /// hasn't yet observed Registered, terminating, or absent.
 ///
-/// Drop rules (all `→ false` removes the entry):
-/// - **Registered**: `observe_registered`/FFD own it now.
-/// - **Terminating**: the controller (or Karpenter expiration) is
-///   tearing it down deliberately; not an ICE signal.
-/// - **Absent from `live`**: vanished without ever Registering.
-///   Karpenter GC'd it (the controller's own reaps are removed from
-///   `inflight` by the caller before this runs) ⇒ the cell is
-///   unfulfillable. ICE-mask + `reaped_total{reason=vanished}`.
+/// Drop rules (all `→ false` removes the entry; the closed
+/// [`VanishClass`] alphabet is the classification law):
+/// - **RegisteredHandoff**: `observe_registered`/FFD own it now.
+/// - **DeliberateTeardown** (REGISTERED ∧ terminating): the controller
+///   (or Karpenter expiration/consolidation) is tearing down a node
+///   that proved launchable; not an ICE signal. live_050(b): this
+///   rationale is REGISTERED-ONLY — the pre-fix arm applied it to
+///   never-Registered claims too, silently eating launch-failure
+///   teardowns.
+/// - **LaunchFailureTeardown** (NEVER-Registered ∧ terminating):
+///   Karpenter terminal launch failure → deletionTimestamp → finalize,
+///   observed mid-GC-transit (the window straddles a 10s tick whenever
+///   finalization outlasts the tick boundary). Launch-failure
+///   teardown, NOT deliberate consolidation: produces the SAME
+///   unfulfillable evidence as a vanish — ICE-mask +
+///   `reaped_total{reason=vanished}`.
+/// - **GcVanish** (absent from `live`): vanished without ever
+///   Registering. Karpenter GC'd it (the controller's own reaps are
+///   removed from `inflight` by the caller before this runs) ⇒ the
+///   cell is unfulfillable. ICE-mask + `reaped_total{reason=vanished}`.
 /// - **In-flight (present, not Registered, not terminating)**: KEEP.
 ///   r40 bug_020: dropping on first sighting let a claim observed at
 ///   age ~10s and GC'd at ~13–16s escape every detection path —
@@ -238,28 +250,77 @@ pub fn detect_vanished(inflight: &mut HashMap<String, Cell>, live: &[LiveNode]) 
     let live_by_name: HashMap<&str, &LiveNode> =
         live.iter().map(|n| (n.name.as_str(), n)).collect();
     let mut ice = Vec::new();
-    inflight.retain(|name, cell| match live_by_name.get(name.as_str()) {
-        // Registered or terminating → done tracking; `classify` /
-        // `observe_registered` own it.
-        Some(n) if n.registered || n.terminating() => false,
-        // Still in-flight: KEEP. classify's reason short-circuit and
-        // ice_timeout don't cover the GC'd-between-observations
-        // window for slow-ICE cells.
-        Some(_) => true,
-        // Vanished without ever Registering → ICE.
-        None => {
-            warn!(%name, %cell, "in-flight NodeClaim vanished (Karpenter GC); ICE-masking cell");
-            metrics::counter!(
-                "rio_controller_nodeclaim_reaped_total",
-                "reason" => "vanished",
-                "cell" => cell.to_string(),
-            )
-            .increment(1);
-            ice.push(cell.clone());
-            false
+    inflight.retain(|name, cell| {
+        let Some(class) = classify_vanish(live_by_name.get(name.as_str()).copied()) else {
+            // Still in-flight: KEEP. classify's reason short-circuit
+            // and ice_timeout don't cover the GC'd-between-
+            // observations window for slow-ICE cells.
+            return true;
+        };
+        // Total fold over the exit alphabet (zero wildcard arms):
+        // every exit either hands off quietly or produces the
+        // unfulfillable evidence — never a silent launch-failure exit.
+        // r[impl ctrl.nodeclaim.ice-mark-clear+3]
+        match class {
+            VanishClass::RegisteredHandoff | VanishClass::DeliberateTeardown => {}
+            VanishClass::LaunchFailureTeardown | VanishClass::GcVanish => {
+                warn!(
+                    %name, %cell, ?class,
+                    "in-flight NodeClaim {}; ICE-masking cell",
+                    match class {
+                        VanishClass::LaunchFailureTeardown =>
+                            "terminating without ever Registering (launch-failure teardown)",
+                        _ => "vanished (Karpenter GC)",
+                    }
+                );
+                metrics::counter!(
+                    "rio_controller_nodeclaim_reaped_total",
+                    "reason" => "vanished",
+                    "cell" => cell.to_string(),
+                )
+                .increment(1);
+                ice.push(cell.clone());
+            }
         }
+        false
     });
     ice
+}
+
+/// The closed exit alphabet at the vanish seam (live_050(b)): *every
+/// launch-failure observation, on every observation path, produces
+/// the same unfulfillable evidence.* `None` = still in-flight (KEEP —
+/// not an exit). The pre-fix retain arm conflated rows 2 and 3
+/// (`registered || terminating() → false`), so a never-Registered
+/// claim observed mid-GC-transit exited tracking with ZERO mark —
+/// the scheduler's IceBackoff failover never armed (live: vanished=101
+/// vs ice=0; zero `:od` claims ever minted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VanishClass {
+    /// Registered (∧ not terminating): `observe_registered`/FFD own it.
+    RegisteredHandoff,
+    /// Registered ∧ terminating: deliberate teardown of a node that
+    /// proved launchable — not an ICE signal.
+    DeliberateTeardown,
+    /// NEVER-Registered ∧ terminating: launch-failure teardown caught
+    /// mid-GC-transit — IS ICE evidence (marks exactly like GcVanish).
+    LaunchFailureTeardown,
+    /// Absent from `live`: GC'd between ticks without Registering.
+    GcVanish,
+}
+
+/// Pure classification law for one tracked claim's observation —
+/// `observed = None` ⇔ absent from `live`. Product-censused by
+/// `vanish_class_census_over_the_observation_product` (registered ×
+/// terminating × present — eight cells from the alphabet).
+pub fn classify_vanish(observed: Option<&LiveNode>) -> Option<VanishClass> {
+    match observed {
+        Some(n) if n.registered && n.terminating() => Some(VanishClass::DeliberateTeardown),
+        Some(n) if n.registered => Some(VanishClass::RegisteredHandoff),
+        Some(n) if n.terminating() => Some(VanishClass::LaunchFailureTeardown),
+        Some(_) => None,
+        None => Some(VanishClass::GcVanish),
+    }
 }
 
 /// One `reap_unhealthy` tick's outcome.
@@ -432,12 +493,14 @@ mod tests {
         .into();
         let mut reg = node("nc-reg", "h", CapacityType::Spot, 8, 0, 0);
         reg.registered = true;
-        // node() defaults registered=true; force unregistered so the test
-        // pins the n.terminating() arm of the retain `||` independently —
-        // otherwise n.registered short-circuits and a regression that drops
-        // the terminating() clause stays green.
+        // live_050(b) re-derivation: the typed exit alphabet narrows
+        // the quiet-teardown arm to REGISTERED claims (DeliberateTeardown)
+        // — a never-registered terminating claim is LaunchFailureTeardown
+        // and MARKS (pinned by `never_registered_terminating_claim_
+        // marks_its_cell` and the product census); this battery keeps
+        // the quiet arms quiet.
         let mut term = node("nc-term", "h", CapacityType::Spot, 8, 0, 0);
-        term.registered = false;
+        term.registered = true;
         let term = set_terminating(term);
         // node() defaults registered=true; force in-flight.
         let mut inflight_node = node("nc-inflight", "h", CapacityType::Spot, 8, 0, 0);
@@ -461,6 +524,116 @@ mod tests {
             vec![Cell("h".into(), CapacityType::Spot)]
         );
         assert!(inflight.is_empty());
+    }
+
+    // r[verify ctrl.nodeclaim.ice-mark-clear+3]
+    /// live_050(b) red R3 / witness W7-C — certifies: *a never-Registered
+    /// terminating claim produces a buffered-able mark with the vanish
+    /// warn/counter — through the production retain path, not a
+    /// hand-rolled map.* Pre-fix red (verbatim): `left: inflight entry
+    /// dropped; ice == [] (no mark; misread as deliberate teardown) /
+    /// right: ice == [cell]; reaped_total{reason=vanished} incremented;
+    /// entry exits tracking`.
+    #[test]
+    fn never_registered_terminating_claim_marks_its_cell() {
+        use super::super::ffd::tests::set_terminating;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let h = Cell("h".into(), CapacityType::Spot);
+        let mut inflight: HashMap<String, Cell> = [("nc-doomed".to_string(), h.clone())].into();
+        let mut doomed = node("nc-doomed", "h", CapacityType::Spot, 8, 0, 0);
+        doomed.registered = false;
+        let doomed = set_terminating(doomed);
+        let rec = DebuggingRecorder::new();
+        let _g = ::metrics::set_default_local_recorder(&rec);
+        let ice = detect_vanished(&mut inflight, &[doomed]);
+        assert_eq!(
+            ice,
+            vec![h.clone()],
+            "launch-failure teardown IS ICE evidence"
+        );
+        assert!(
+            inflight.is_empty(),
+            "exited tracking (classify owns nothing here)"
+        );
+        // ppppp: snapshot exactly once.
+        let snap = rec.snapshotter().snapshot().into_vec();
+        let vanished = snap.into_iter().find_map(|(k, _, _, v)| {
+            let key = k.key();
+            (key.name() == "rio_controller_nodeclaim_reaped_total"
+                && key
+                    .labels()
+                    .any(|l| l.key() == "reason" && l.value() == "vanished")
+                && key
+                    .labels()
+                    .any(|l| l.key() == "cell" && l.value() == h.to_string()))
+            .then_some(v)
+        });
+        assert_eq!(
+            vanished,
+            Some(DebugValue::Counter(1)),
+            "the same unfulfillable evidence as a GC vanish"
+        );
+        // Kill-isolation (the deliberate-teardown arm stays quiet): a
+        // REGISTERED terminating claim exits with ZERO mark.
+        let mut inflight: HashMap<String, Cell> = [("nc-reg-term".to_string(), h.clone())].into();
+        let mut reg_term = node("nc-reg-term", "h", CapacityType::Spot, 8, 0, 0);
+        reg_term.registered = true;
+        let reg_term = set_terminating(reg_term);
+        assert!(
+            detect_vanished(&mut inflight, &[reg_term]).is_empty(),
+            "registered teardown is deliberate — not an ICE signal"
+        );
+        assert!(inflight.is_empty());
+    }
+
+    /// R15 vanish-path census: `classify_vanish` product-iterated over
+    /// (present × registered × terminating) — eight cells FROM the
+    /// alphabet, each row asserting its class AND its mark/tracking
+    /// effect through the production `detect_vanished` fold. The
+    /// conflated cell (present, never-registered, terminating) is the
+    /// R3 red's row. Generator: the loop product + rustc
+    /// exhaustiveness at the law match.
+    #[test]
+    fn vanish_class_census_over_the_observation_product() {
+        use super::super::ffd::tests::set_terminating;
+        let h = Cell("h".into(), CapacityType::Spot);
+        for present in [false, true] {
+            for registered in [false, true] {
+                for terminating in [false, true] {
+                    let mut n = node("nc-x", "h", CapacityType::Spot, 8, 0, 0);
+                    n.registered = registered;
+                    let n = if terminating { set_terminating(n) } else { n };
+                    let want = match (present, registered, terminating) {
+                        (false, _, _) => Some(VanishClass::GcVanish),
+                        (true, true, true) => Some(VanishClass::DeliberateTeardown),
+                        (true, true, false) => Some(VanishClass::RegisteredHandoff),
+                        (true, false, true) => Some(VanishClass::LaunchFailureTeardown),
+                        (true, false, false) => None,
+                    };
+                    let got = classify_vanish(present.then_some(&n));
+                    assert_eq!(got, want, "cell ({present},{registered},{terminating})");
+                    // Effect row through the production fold:
+                    let mut inflight: HashMap<String, Cell> =
+                        [("nc-x".to_string(), h.clone())].into();
+                    let live = if present { vec![n] } else { vec![] };
+                    let ice = detect_vanished(&mut inflight, &live);
+                    let marks = matches!(
+                        want,
+                        Some(VanishClass::LaunchFailureTeardown | VanishClass::GcVanish)
+                    );
+                    assert_eq!(
+                        !ice.is_empty(),
+                        marks,
+                        "mark effect for ({present},{registered},{terminating})"
+                    );
+                    assert_eq!(
+                        inflight.contains_key("nc-x"),
+                        want.is_none(),
+                        "tracking effect for ({present},{registered},{terminating})"
+                    );
+                }
+            }
+        }
     }
 
     /// A NodeClaim already terminating (`metadata.deletionTimestamp`

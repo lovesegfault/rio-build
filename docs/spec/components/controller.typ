@@ -1508,7 +1508,7 @@ its clock passes the prior leader's last mint — symmetric in kind and
 magnitude with the scheduler-side handoff posture (in-memory ladder +
 gate state, lease-holder only).
 
-#r("ctrl.nodeclaim.ice-mark-clear+2")[
+#r("ctrl.nodeclaim.ice-mark-clear+3")[
   ICE mark and clear signals sent via `AckSpawnedIntents` MUST be sound:
   `unfulfillable_cells` (marks) are deduplicated to at most one entry per
   cell per tick (the scheduler's backoff ladder climbs once per DISTINCT
@@ -1521,7 +1521,15 @@ gate state, lease-holder only).
   shape is forbidden), and a mark is emitted only for a
   cell whose claim launch-failed, timed out unregistered, or vanished to
   Karpenter GC --- never for a claim this controller itself reaped
-  (#rref("ctrl.nodeclaim.inflight-conservation")). `registered_cells`
+  (#rref("ctrl.nodeclaim.inflight-conservation")). A never-Registered
+  NodeClaim observed terminating or absent MUST produce the same
+  unfulfillable evidence as a timed-out launch (the closed `VanishClass`
+  exit alphabet: only a REGISTERED claim's teardown is deliberate ---
+  live_050(b): the conflated arm starved the scheduler's IceBackoff
+  failover, vanished=101/ice=0, zero od claims); the failover TIME axis
+  is the existing IceBackoff ladder (60s -> 120s -> ... <= max-lead-time,
+  scheduler-side) and vanish-detection latency is one tick by
+  construction (tick-over-tick absence). `registered_cells`
   (clears) are emitted only for `Registered=True` edges that pass the
   recency gate in `observe_registered`: a registration older than the gate
   is recorded without emitting a clear, so a restart or lease acquire ---

@@ -2248,7 +2248,7 @@ impl NodeClaimPoolReconciler {
         // idle window (and mis-attributes the next re-dispatch). One
         // Ack per tick is the cost; the old all-empty early-return
         // suppressed exactly the tick that mattered.
-        // r[impl ctrl.nodeclaim.ice-mark-clear+2]
+        // r[impl ctrl.nodeclaim.ice-mark-clear+3]
         // Per-cell dedup (inherent — the buffer keys by cell):
         // `health::reap_unhealthy`/`detect_vanished` push one entry
         // per ICE'd CLAIM (up to 8/cell/tick); the per-cell ordered

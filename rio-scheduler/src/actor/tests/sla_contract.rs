@@ -4433,3 +4433,93 @@ async fn leadership_cycle_resets_the_epoch_watermark() {
         "the sick cell is masked again by the genuine successor evidence"
     );
 }
+
+// r[verify ctrl.nodeclaim.ice-mark-clear+3]
+/// W7-D leg B (R4-B — a DISCLOSED green-side consumption pin, never
+/// claimed as a red: this WO contains zero rio-scheduler production
+/// edits, so a scheduler-side test cannot regress pre-fix). Certifies:
+/// *an acked vanish mark — minted by the production
+/// `rio_common::cell_wire::encode_cell_event` codec, the EXACT call
+/// the controller's evidence builder makes, with epoch >
+/// `last_applied[cell]` so the apply is not an epoch-gate no-op —
+/// masks `(h, spot)` in IceBackoff, and the next solve's
+/// `A \ ice_masked` chooses an OnDemand cell* (structural: the solved
+/// cells' capacity types, not log text). Composes with leg A
+/// (`never_registered_vanish_ships_the_mark_on_the_wire`,
+/// rio-controller lifecycle_tests) over the shared wire codec — the
+/// W7-D pinned-composition convention (rio-scheduler has no dependency
+/// on rio-controller, so no single fn can drive both halves).
+#[tokio::test]
+async fn acked_vanish_mark_masks_spot_and_solve_buys_od() {
+    use crate::sla::config::CapacityType;
+    use rio_common::cell_wire::{EvidenceEpoch, WireCapacity, encode_cell_event};
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    // τ widened so the od cells are ADMITTED into A beside spot (seed
+    // od/spot price ratio ≈ 1/0.35 ≈ 2.86 — the default deadband
+    // excludes od while spot exists; the read-time `A \ ice_masked`
+    // subtraction is what this pin certifies, and it can only choose
+    // od if od is in A). The capacity-type rungs themselves default
+    // [spot, od] per class.
+    let mut actor = bare_actor_hw(db.pool.clone());
+    actor.sla_config.hw_cost_tolerance = 2.0;
+    actor.test_inject_ready("d0", Some("test-pkg"), "x86_64-linux", false);
+
+    // Pre-mask solve: the admissible set prefers spot (cost order).
+    let snap = actor.compute_spawn_intents(&Default::default());
+    let intent = snap
+        .intents
+        .iter()
+        .find(|i| i.intent_id == "d0")
+        .expect("d0 emitted")
+        .clone();
+    let caps_of = |i: &rio_proto::types::SpawnIntent| -> Vec<String> {
+        i.node_affinity
+            .iter()
+            .filter_map(|t| {
+                t.match_expressions
+                    .iter()
+                    .find(|r| r.key == "karpenter.sh/capacity-type")
+                    .and_then(|r| r.values.first().cloned())
+            })
+            .collect()
+    };
+    assert!(
+        caps_of(&intent).iter().any(|c| c == "spot"),
+        "precondition: pre-mask solve offers spot: {:?}",
+        caps_of(&intent)
+    );
+
+    // Leg-B payload: every builder class's spot cell marked via the
+    // production codec (the controller-side vanish marks for a
+    // spot-wide launch-failure event), epoch 1 > last_applied (empty).
+    let marks: Vec<String> = ["intel-6", "intel-7", "intel-8"]
+        .iter()
+        .map(|h| encode_cell_event(h, WireCapacity::Spot, Some(EvidenceEpoch(1))))
+        .collect();
+    actor
+        .handle_ack_spawned_intents(&[], &marks, &[], &[], &[], None)
+        .expect("applied under leadership");
+    for h in ["intel-6", "intel-7", "intel-8"] {
+        let cell: crate::sla::config::Cell = (h.into(), CapacityType::Spot);
+        assert!(
+            actor.ice.step(&cell).is_some(),
+            "IceBackoff masks ({h}, spot) from the acked vanish mark"
+        );
+    }
+
+    // The failover: the next solve's A \ ice_masked chooses OnDemand.
+    let snap2 = actor.compute_spawn_intents(&Default::default());
+    let intent2 = snap2
+        .intents
+        .iter()
+        .find(|i| i.intent_id == "d0")
+        .expect("d0 re-emitted")
+        .clone();
+    let caps = caps_of(&intent2);
+    assert!(
+        !caps.is_empty() && caps.iter().all(|c| c == "on-demand"),
+        "post-mask solve buys od — structural on the solved cells' \
+         capacity types: {caps:?}"
+    );
+}
