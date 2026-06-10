@@ -2813,3 +2813,136 @@ async fn wedge_strike_does_not_survive_claim_interlude() -> TestResult {
     );
     Ok(())
 }
+
+// r[verify sched.attempt.cancel-close-driven+2]
+/// merged_bug_004 hole 1 red: two terminal batches for ONE reaped drv
+/// (DependencyFailed latched first, Cancelled latched later — the
+/// newer truth; Failed is non-terminal in this status alphabet, so
+/// the DAG-absent terminal pair is dep-failed/cancelled).
+/// FIFO replays the older first; its own stamp then refuses the newer
+/// batch, INVERTING the durable row while the warn claims "the newer
+/// rows stand". PROPOSITION CERTIFIED: per-drv supersession at the
+/// latch chokepoint keeps at most ONE pending status per drv
+/// queue-wide — the newest latched transition is the only truth worth
+/// replaying — so the durable row lands on the newer truth and the
+/// older batch still closes its latched exec rows (the close is
+/// exec-scoped and unconditional, bug_158).
+#[tokio::test]
+async fn outbox_same_drv_newer_terminal_latch_supersedes_older() -> TestResult {
+    use crate::sla::metrics::counter_map;
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    // The durable row's last status event predates both latches.
+    sqlx::query(
+        "INSERT INTO derivations (drv_hash, drv_path, pname, system, status) \
+         VALUES ($1, $2, 'pkg', 'x86_64-linux', 'running')",
+    )
+    .bind("outbox-superseded")
+    .bind(test_drv_path("outbox-superseded"))
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "UPDATE derivations SET \
+           updated_at = now() - interval '120 seconds', \
+           status_changed_at = now() - interval '120 seconds' \
+         WHERE drv_hash = 'outbox-superseded'",
+    )
+    .execute(&db.pool)
+    .await?;
+    // The older batch's latched exec row (its attempt ended at latch
+    // time and must close whatever happens to the drv UPDATE).
+    let (derivation_id,): (Uuid,) =
+        sqlx::query_as("SELECT derivation_id FROM derivations WHERE drv_hash = $1")
+            .bind("outbox-superseded")
+            .fetch_one(&db.pool)
+            .await?;
+    let older_exec = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO assignments \
+             (derivation_id, builder_id, generation, status, exec_id) \
+         VALUES ($1, 'builder-0', 1, 'acknowledged', $2)",
+    )
+    .bind(derivation_id)
+    .bind(older_exec)
+    .execute(&db.pool)
+    .await?;
+
+    let mut actor = bare_actor(db.pool.clone());
+    // Failed latched at T1 (60s ago), Cancelled at T2 (30s ago) — the
+    // node is DAG-absent (reaped), so the terminal-KEEP arm keeps
+    // both. Latched through the production chokepoint.
+    actor.latch_status_batch(crate::actor::StatusBatch {
+        drv_hashes: vec!["outbox-superseded".into()],
+        status: DerivationStatus::DependencyFailed,
+        exec_ids: vec![older_exec],
+        enqueued_at: std::time::Instant::now() - std::time::Duration::from_secs(60),
+        latched_at_epoch: crate::db::attempts::epoch_now() - 60.0,
+    });
+    actor.latch_status_batch(crate::actor::StatusBatch {
+        drv_hashes: vec!["outbox-superseded".into()],
+        status: DerivationStatus::Cancelled,
+        exec_ids: vec![],
+        enqueued_at: std::time::Instant::now() - std::time::Duration::from_secs(30),
+        latched_at_epoch: crate::db::attempts::epoch_now() - 30.0,
+    });
+    // Supersession invariant: at most one pending status per drv
+    // queue-wide — the older batch no longer carries the drv.
+    let carriers = actor
+        .status_outbox
+        .iter()
+        .filter(|b| b.drv_hashes.iter().any(|h| h == "outbox-superseded"))
+        .count();
+    assert_eq!(
+        carriers, 1,
+        "left: {carriers} / right: 1 (per-drv supersession at the \
+         latch chokepoint: the newest latch is the only carrier)"
+    );
+
+    let authority = actor.dag_authority().expect("always-leader test actor");
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    {
+        let _g = metrics::set_default_local_recorder(&rec);
+        actor.tick_flush_status_outbox(&authority).await;
+    }
+
+    // The durable row lands on the NEWER truth.
+    let (status,): (String,) =
+        sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = 'outbox-superseded'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        status, "cancelled",
+        "left: {status} / right: cancelled (the older same-drv replay's \
+         own stamp must not refuse the newer terminal truth)"
+    );
+    // The older batch's latched exec row still closed (close-only
+    // flush of the emptied batch).
+    let (exec_status,): (String,) =
+        sqlx::query_as("SELECT status FROM assignments WHERE exec_id = $1")
+            .bind(older_exec)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        exec_status, "failed",
+        "left: {exec_status} / right: failed (the emptied older batch \
+         still flushes close-only for its latched exec_ids, with the \
+         OLDER batch's terminal close mapping)"
+    );
+    // No false refusal fired: the only counted refusals would be the
+    // inversion's lie.
+    let counters = counter_map(&snap);
+    assert_eq!(
+        counters
+            .get("rio_scheduler_status_outbox_replay_refused_total")
+            .copied()
+            .unwrap_or(0),
+        0,
+        "left: 1 (pre-fix: the older batch's own stamp refused the \
+         newer truth and counted it as foreign precedence) / right: 0"
+    );
+    assert_eq!(actor.status_outbox.len(), 0, "both batches drain");
+    Ok(())
+}

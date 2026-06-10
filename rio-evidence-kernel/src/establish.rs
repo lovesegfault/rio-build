@@ -204,7 +204,7 @@ pub enum EstablishmentDisposition {
 /// [`NoStoreConfigured`]: ProbeEvidence::NoStoreConfigured
 /// [`AdoptCompleted`]: EstablishmentAction::AdoptCompleted
 /// [`ChargeExecutorCrash`]: EstablishmentAction::ChargeExecutorCrash
-// r[impl sched.attempt.cancel-close-driven+1]
+// r[impl sched.attempt.cancel-close-driven+2]
 pub fn establish_expired_attempt(
     kind: PullKind,
     node: NodeDisposition,

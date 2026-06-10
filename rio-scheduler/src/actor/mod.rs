@@ -262,15 +262,17 @@ pub(super) struct StatusBatch {
     pub(super) exec_ids: Vec<Uuid>,
     pub(super) enqueued_at: std::time::Instant,
     /// Wall-clock latch instant (epoch seconds, POD `SystemTime` —
-    /// NOT the clock that stamps `derivations.updated_at`, which is
-    /// PG `now()`). DIAGNOSTIC ONLY (merged_bug_017): logged in the
-    /// flusher's refusal warn for skew forensics, never compared
-    /// against any PG-stamped column. The replay's precedence anchor
-    /// (merged_bug_025) is the MONOTONIC `enqueued_at` above, mapped
-    /// into the PG domain at flush time as a latch AGE
-    /// (`db::LatchAge::since_enqueue` →
-    /// `updated_at <= now() - make_interval(secs => age)`), so the
-    /// comparison lives entirely in one clock domain.
+    /// NOT the clock that stamps `derivations.status_changed_at`,
+    /// which is PG `now()`). DIAGNOSTIC ONLY (merged_bug_017): logged
+    /// in the flusher's refusal warn for skew forensics, never
+    /// compared against any PG-stamped column. The replay's
+    /// precedence anchor (merged_bug_025) is the MONOTONIC
+    /// `enqueued_at` above, mapped into the PG domain INSIDE the
+    /// replay transaction as a latch AGE (the boundary-witnessed
+    /// `db::LatchAge::at_replay_boundary`, merged_bug_004 →
+    /// `status_changed_at <= now() - make_interval(secs => age)`), so
+    /// the comparison lives entirely in one clock domain and the cut
+    /// can only trail the enqueue instant.
     pub(super) latched_at_epoch: f64,
 }
 
@@ -293,6 +295,43 @@ impl DagActor {
     /// [`DagActor::dag_authoritative`]).
     pub(super) fn dag_authority(&self) -> Option<DagAuthority> {
         self.dag_authoritative.then_some(DagAuthority(()))
+    }
+
+    // r[impl sched.attempt.cancel-close-driven+2]
+    /// The ONLY production latch site for the status outbox
+    /// (merged_bug_004 hole 1): per-drv supersession — each drv the
+    /// new batch names is stripped from every queued batch's
+    /// `drv_hashes`, so at most ONE pending status exists per drv
+    /// queue-wide and FIFO can never replay an older same-drv truth
+    /// whose own stamp would refuse the newer one (two terminal
+    /// latches for one reaped drv: the older replayed first, stamped
+    /// the comparand, and inverted the durable row while the warn
+    /// claimed "the newer rows stand"). The flush-time re-derivation
+    /// already enforces newest-wins for DAG-PRESENT nodes; the
+    /// DAG-absent terminal pair was the unguarded cell.
+    ///
+    /// `exec_ids` STAY on the superseded batch (bug_158: the close is
+    /// exec-scoped and unconditional — those attempts ended at THEIR
+    /// latch instant whatever the drv's newest truth is; an emptied
+    /// batch still flushes close-only).
+    ///
+    /// Interleaving: the actor is single-threaded, and the flusher's
+    /// Fenced/Err `push_front` re-queues are pop-returns (the batch
+    /// re-enters at the position it left, with its drv set already
+    /// superseded by any later latch) — no new-latch call can run
+    /// between the flusher's pop and its re-queue, so the at-most-one
+    /// invariant holds across flush ticks by construction. Push-site
+    /// census rides the owning commit ([GEN-SET]:
+    /// `rg -n 'status_outbox\.push_back' rio-scheduler/src/` = this
+    /// chokepoint + the two direct-latch test pushes).
+    pub(super) fn latch_status_batch(&mut self, batch: StatusBatch) {
+        for queued in &mut self.status_outbox {
+            queued
+                .drv_hashes
+                .retain(|h| !batch.drv_hashes.iter().any(|b| b == h));
+        }
+        self.status_outbox.push_back(batch);
+        metrics::gauge!("rio_scheduler_status_outbox_depth").set(self.status_outbox.len() as f64);
     }
 }
 
@@ -402,7 +441,7 @@ pub struct DagActor {
     /// (`materialization_jobs` + the partial-unique dedup index);
     /// recovery rebuild is Phase B.
     materialization_jobs: materialize::JobViewState,
-    // r[impl sched.attempt.cancel-close-driven+1]
+    // r[impl sched.attempt.cancel-close-driven+2]
     /// Terminal-status batches whose persist FAILED, latched for the
     /// housekeeping tick to re-drive until a persist succeeds ("latch
     /// on Ok only"). The persist is what closes the batch's assignment
@@ -1119,7 +1158,7 @@ impl DagActor {
         // creates are fenced anyway; the dropped-carrier accounting is
         // the PG-authority class documented on the field.
         pending_carriers.clear();
-        // r[impl sched.attempt.cancel-close-driven+1]
+        // r[impl sched.attempt.cancel-close-driven+2]
         // The outbox is leader-scoped: a deposed leader must not
         // re-drive status writes (they would be fenced anyway); the
         // rows now belong to the successor's recovery + the

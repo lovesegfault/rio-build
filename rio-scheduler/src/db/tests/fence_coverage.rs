@@ -382,6 +382,237 @@ fn absolute_status_batch_writer_callers_pinned() {
     );
 }
 
+/// The status writers the source scan below derives — the runtime
+/// biconditional in `db/tests/derivations.rs` consumes EXACTLY this
+/// list (its per-writer match panics on an entry it does not drive),
+/// so a new status writer fails the census here until classified AND
+/// fails the runtime test until driven. The GENERATOR is the scan in
+/// [`derivations_status_stamp_census`]; this const is its pinned
+/// output, asserted equal every run.
+pub(crate) const STATUS_WRITER_FNS: &[&str] = &[
+    "clear_poison_batch_in_tx",
+    "clear_poison_in_tx",
+    "persist_poisoned_in_tx",
+    "replay_status_batch_guarded",
+    "update_derivation_status_batch_in_tx",
+    "update_derivation_status_in_tx",
+];
+
+/// Production writers that touch `derivations` WITHOUT setting
+/// `status` — the comparand-purity law's other half: their SET lists
+/// must NEVER name `status_changed_at`. Same generator/pin contract
+/// as [`STATUS_WRITER_FNS`].
+pub(crate) const NON_STATUS_DERIVATIONS_WRITER_FNS: &[&str] =
+    &["batch_upsert_derivations", "update_resource_floor"];
+
+/// Every production `.rs` source under `rio-scheduler/src`, walked at
+/// test time (the member list is DERIVED from the tree, never
+/// author-enumerated): any path containing a `tests` component or a
+/// `tests.rs` file is excluded — fixtures there construct historical
+/// row shapes deliberately.
+fn production_rs_sources() -> Vec<(String, String)> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+        for entry in std::fs::read_dir(dir).expect("readable src dir") {
+            let entry = entry.expect("readable dir entry");
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if path.is_dir() {
+                if name == "tests" {
+                    continue;
+                }
+                walk(&path, out);
+            } else if name.ends_with(".rs") && name != "tests.rs" {
+                let src = std::fs::read_to_string(&path).expect("readable source");
+                out.push((path.display().to_string(), src));
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut out = Vec::new();
+    walk(&root, &mut out);
+    assert!(
+        out.iter().any(|(p, _)| p.ends_with("db/derivations.rs")),
+        "walk must reach the known writer file (src layout moved?)"
+    );
+    out
+}
+
+/// One scanned `derivations` write statement: where it is, what kind,
+/// and which columns its SET list (or INSERT column list) names.
+struct DerivationsWrite {
+    file: String,
+    line: usize,
+    fn_name: String,
+    /// `UPDATE` SET list or `ON CONFLICT … DO UPDATE SET` list
+    /// (`None` for a plain INSERT — its columns ride `insert_cols`).
+    set_cols: Option<Vec<String>>,
+    /// INSERT column list (`None` for UPDATEs).
+    insert_cols: Option<Vec<String>>,
+}
+
+/// Column names on the LHS of `lhs = rhs` assignments in a SET list.
+fn set_list_columns(set_list: &str) -> Vec<String> {
+    set_list
+        .split(',')
+        .filter_map(|assign| assign.split_once('='))
+        .map(|(lhs, _)| {
+            lhs.trim()
+                .trim_matches(|c: char| !c.is_alphanumeric() && c != '_')
+                .to_string()
+        })
+        .filter(|c| !c.is_empty())
+        .collect()
+}
+
+/// Scan a source file for `UPDATE derivations` / `INSERT INTO
+/// derivations` statements and parse the column sets the law
+/// quantifies over. Statement text is captured across lines (the
+/// `query!` raw-string forms put the verb and the SET list on
+/// different lines — a quote heuristic would silently skip them).
+fn derivations_writes(file: &str, src: &str) -> Vec<DerivationsWrite> {
+    let lines: Vec<&str> = src.lines().collect();
+    let mut out = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with("--") {
+            continue;
+        }
+        let upper = line.to_uppercase();
+        let is_update = upper.contains("UPDATE DERIVATIONS");
+        let is_insert = upper.contains("INSERT INTO DERIVATIONS");
+        if !is_update && !is_insert {
+            continue;
+        }
+        // The statement window: this line plus the rest of the SQL
+        // string (raw strings span many lines; 80 is comfortably past
+        // the longest production statement).
+        let window = lines[idx..(idx + 80).min(lines.len())].join("\n");
+        let upper_window = window.to_uppercase();
+        let fn_name = enclosing_fn(&lines, idx)
+            .map(|(n, _)| n)
+            .unwrap_or_else(|| format!("<no enclosing fn at {file}:{}>", idx + 1));
+        if is_update {
+            let set_at = upper_window.find("SET").unwrap_or(0);
+            let end = upper_window[set_at..]
+                .find("WHERE")
+                .map(|w| set_at + w)
+                .unwrap_or(upper_window.len());
+            out.push(DerivationsWrite {
+                file: file.to_string(),
+                line: idx + 1,
+                fn_name,
+                set_cols: Some(set_list_columns(&window[set_at + 3..end])),
+                insert_cols: None,
+            });
+        } else {
+            // INSERT: column list between the first '(' and its ')'.
+            let cols = window
+                .find('(')
+                .and_then(|open| window[open..].find(')').map(|close| (open, open + close)))
+                .map(|(open, close)| {
+                    window[open + 1..close]
+                        .split(',')
+                        .map(|c| c.trim().to_string())
+                        .filter(|c| !c.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            // An upsert's DO UPDATE SET list gets the UPDATE law.
+            let set_cols = upper_window.find("DO UPDATE SET").map(|s| {
+                let after = s + "DO UPDATE SET".len();
+                let end = ["WHERE", "RETURNING"]
+                    .iter()
+                    .filter_map(|t| upper_window[after..].find(t))
+                    .min()
+                    .map(|e| after + e)
+                    .unwrap_or(upper_window.len());
+                set_list_columns(&window[after..end])
+            });
+            out.push(DerivationsWrite {
+                file: file.to_string(),
+                line: idx + 1,
+                fn_name,
+                set_cols,
+                insert_cols: Some(cols),
+            });
+        }
+    }
+    out
+}
+
+// r[verify sched.attempt.cancel-close-driven+2]
+/// merged_bug_004: the comparand-purity census. PROPOSITION CERTIFIED:
+/// `status_changed_at`'s only production writers are status-setting
+/// statements — for every production `UPDATE derivations` (and every
+/// upsert's `DO UPDATE SET` list), the SET list names `status` IFF it
+/// names `status_changed_at`; an INSERT naming `status` is compliant
+/// via the column DEFAULT (a fresh row's status is born at insert) and
+/// may not name the stamp without naming `status`. This is the
+/// precedence law's quantification premise: the replay conjunct cuts
+/// on a column writable solely by the events the law orders. The law
+/// is TOTAL — no allowlist; a new writer fails here until classified.
+#[test]
+fn derivations_status_stamp_census() {
+    let mut violations = Vec::new();
+    let mut status_writers = std::collections::BTreeSet::new();
+    let mut non_status_writers = std::collections::BTreeSet::new();
+    for (file, src) in production_rs_sources() {
+        for w in derivations_writes(&file, &src) {
+            let names = |cols: &Option<Vec<String>>, col: &str| {
+                cols.as_ref().is_some_and(|cs| cs.iter().any(|c| c == col))
+            };
+            let set_status = names(&w.set_cols, "status");
+            let set_stamp = names(&w.set_cols, "status_changed_at");
+            if set_status && !set_stamp {
+                violations.push(format!(
+                    "{}:{}: fn `{}` sets `status` without `status_changed_at = now()` \
+                     (the precedence comparand misses this status event)",
+                    w.file, w.line, w.fn_name
+                ));
+            }
+            if !set_status && set_stamp {
+                violations.push(format!(
+                    "{}:{}: fn `{}` sets `status_changed_at` without setting `status` \
+                     (a non-status event may not move the precedence comparand)",
+                    w.file, w.line, w.fn_name
+                ));
+            }
+            if names(&w.insert_cols, "status_changed_at") && !names(&w.insert_cols, "status") {
+                violations.push(format!(
+                    "{}:{}: fn `{}` INSERTs `status_changed_at` without `status`",
+                    w.file, w.line, w.fn_name
+                ));
+            }
+            if set_status {
+                status_writers.insert(w.fn_name.clone());
+            } else if w.set_cols.is_some() || w.insert_cols.is_some() {
+                non_status_writers.insert(w.fn_name.clone());
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "status_changed_at biconditional violations (merged_bug_004):\n{}",
+        violations.join("\n")
+    );
+    // Pin the derived writer sets to the consts the runtime
+    // biconditional drives — drift in EITHER direction fails.
+    assert_eq!(
+        status_writers.iter().cloned().collect::<Vec<_>>(),
+        STATUS_WRITER_FNS,
+        "scan-derived status-writer set drifted from STATUS_WRITER_FNS \
+         (update the const AND drive the new writer in \
+         status_writers_stamp_status_changed_at_biconditional)"
+    );
+    assert_eq!(
+        non_status_writers.iter().cloned().collect::<Vec<_>>(),
+        NON_STATUS_DERIVATIONS_WRITER_FNS,
+        "scan-derived non-status-writer set drifted from \
+         NON_STATUS_DERIVATIONS_WRITER_FNS"
+    );
+}
+
 /// The `ServingGeneration` stamp has exactly TWO production
 /// constructors: the boot stamp (`DagActor::new`) and the
 /// claim stamp (`handle_leader_acquired`). A third

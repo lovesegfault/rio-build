@@ -575,7 +575,7 @@ async fn current_tenure_status_and_poison_writes_apply() -> anyhow::Result<()> {
 /// blip followed by a resubmit left the attempt durably open until it
 /// aged into ChargeExecutorCrash against a healthily-rebuilding
 /// derivation.
-// r[verify sched.attempt.cancel-close-driven+1]
+// r[verify sched.attempt.cancel-close-driven+2]
 #[tokio::test]
 async fn replay_with_all_drvs_dropped_still_closes_latched_execs() -> anyhow::Result<()> {
     use crate::state::DerivationStatus;
@@ -602,7 +602,7 @@ async fn replay_with_all_drvs_dropped_still_closes_latched_execs() -> anyhow::Re
             &[],
             DerivationStatus::Cancelled,
             &[exec],
-            crate::db::LatchAge::since_enqueue(std::time::Instant::now()),
+            std::time::Instant::now(),
             ServingGeneration::stamp_from_claim(1),
         )
         .await?;
@@ -643,7 +643,8 @@ async fn replay_refuses_rows_updated_after_the_latch() -> anyhow::Result<()> {
     // The world advanced after the latch: the resubmitted drv is
     // Running, updated_at = now().
     sqlx::query(
-        "UPDATE derivations SET status = 'running', updated_at = now() \
+        "UPDATE derivations SET status = 'running', updated_at = now(), \
+                                status_changed_at = now() \
          WHERE drv_hash = 'post-latch-resubmit'",
     )
     .execute(&test_db.pool)
@@ -651,15 +652,13 @@ async fn replay_refuses_rows_updated_after_the_latch() -> anyhow::Result<()> {
 
     // The latch predates the resubmit by a minute (a 60s-aged
     // monotonic enqueue anchor).
-    let latch_age = crate::db::LatchAge::since_enqueue(
-        std::time::Instant::now() - std::time::Duration::from_secs(60),
-    );
+    let enqueued_at = std::time::Instant::now() - std::time::Duration::from_secs(60);
     let outcome = db
         .replay_status_batch_guarded(
             &["post-latch-resubmit"],
             DerivationStatus::Cancelled,
             &[],
-            latch_age,
+            enqueued_at,
             ServingGeneration::stamp_from_claim(1),
         )
         .await?;
@@ -696,8 +695,10 @@ async fn replay_refuses_rows_updated_after_the_latch() -> anyhow::Result<()> {
 /// the PG domain at flush time (`updated_at <= now() -
 /// make_interval(secs => age)`) — the pod epoch is no longer an
 /// input, so the skew shape this red exercised is UNWRITABLE through
-/// the `LatchAge` parameter: this migrated form pins the fresh latch
-/// landing, with the skew immunity carried by the type.
+/// the enqueue-instant parameter (the boundary-witnessed `LatchAge`
+/// is minted inside the replay, merged_bug_004): this migrated form
+/// pins the fresh latch landing, with the skew immunity carried by
+/// the type.
 #[tokio::test]
 async fn replay_lands_under_pg_ahead_skew() -> anyhow::Result<()> {
     use crate::state::DerivationStatus;
@@ -708,14 +709,14 @@ async fn replay_lands_under_pg_ahead_skew() -> anyhow::Result<()> {
     // latched LOGICALLY AFTER that write (the batch enqueues now —
     // whatever epoch the pod clock would have read at that moment).
     insert_test_derivation(&db, "skew-cancel").await?;
-    let latch_age = crate::db::LatchAge::since_enqueue(std::time::Instant::now());
+    let enqueued_at = std::time::Instant::now();
 
     let outcome = db
         .replay_status_batch_guarded(
             &["skew-cancel"],
             DerivationStatus::Cancelled,
             &[],
-            latch_age,
+            enqueued_at,
             ServingGeneration::stamp_from_claim(1),
         )
         .await?;
@@ -759,21 +760,20 @@ async fn advanced_row_refusal_is_returned_loud() -> anyhow::Result<()> {
     // The latch is 60s old; the row advanced (fresh PG write) after it.
     insert_test_derivation(&db, "advanced-row").await?;
     sqlx::query(
-        "UPDATE derivations SET status = 'running', updated_at = now() \
+        "UPDATE derivations SET status = 'running', updated_at = now(), \
+                                status_changed_at = now() \
          WHERE drv_hash = 'advanced-row'",
     )
     .execute(&test_db.pool)
     .await?;
-    let latch_age = crate::db::LatchAge::since_enqueue(
-        std::time::Instant::now() - std::time::Duration::from_secs(60),
-    );
+    let enqueued_at = std::time::Instant::now() - std::time::Duration::from_secs(60);
 
     let outcome = db
         .replay_status_batch_guarded(
             &["advanced-row"],
             DerivationStatus::Cancelled,
             &[],
-            latch_age,
+            enqueued_at,
             ServingGeneration::stamp_from_claim(1),
         )
         .await?;
@@ -796,5 +796,317 @@ async fn advanced_row_refusal_is_returned_loud() -> anyhow::Result<()> {
         ),
         other => panic!("unexpected outcome {other:?}"),
     }
+    Ok(())
+}
+
+/// Epoch read of the precedence comparand — tests compare advance/
+/// stasis only, so the float crosses the boundary as a NUMBER, never
+/// as a timestamp bound back into a PG comparison.
+async fn stamp_epoch(pool: &sqlx::PgPool, drv_hash: &str) -> anyhow::Result<f64> {
+    let (epoch,): (f64,) = sqlx::query_as(
+        "SELECT EXTRACT(EPOCH FROM status_changed_at)::float8 \
+         FROM derivations WHERE drv_hash = $1",
+    )
+    .bind(drv_hash)
+    .fetch_one(pool)
+    .await?;
+    Ok(epoch)
+}
+
+// r[verify sched.attempt.cancel-close-driven+2]
+/// merged_bug_004: the runtime half of the comparand-purity census.
+/// PROPOSITION CERTIFIED: driving EVERY production derivations writer
+/// (the list pinned by `derivations_status_stamp_census`), the
+/// `status_changed_at` stamp advances IFF the writer set `status` —
+/// so the precedence conjunct's comparand moves on exactly the events
+/// the precedence law quantifies over. The match below is total over
+/// the census consts: a writer added to the census without a drive
+/// arm panics here.
+#[tokio::test]
+async fn status_writers_stamp_status_changed_at_biconditional() -> anyhow::Result<()> {
+    use super::fence_coverage::{NON_STATUS_DERIVATIONS_WRITER_FNS, STATUS_WRITER_FNS};
+    use crate::state::DerivationStatus;
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+    let generation = ServingGeneration::stamp_from_claim(1);
+
+    for writer in STATUS_WRITER_FNS {
+        let hash = format!("stamp-bicond-{writer}");
+        let drv_hash: DrvHash = hash.as_str().into();
+        insert_test_derivation(&db, &hash).await?;
+        // Backdate both stamps so the replay writer's cut admits the
+        // row and an advance is unambiguous.
+        sqlx::query(
+            "UPDATE derivations SET \
+               updated_at = now() - interval '120 seconds', \
+               status_changed_at = now() - interval '120 seconds' \
+             WHERE drv_hash = $1",
+        )
+        .bind(&hash)
+        .execute(&test_db.pool)
+        .await?;
+        // World setup: the clear arms need a poisoned row to clear
+        // (setup runs BEFORE the before-read so the drive itself is
+        // the only status transition under measurement).
+        if matches!(*writer, "clear_poison_in_tx" | "clear_poison_batch_in_tx") {
+            assert!(
+                db.persist_poisoned(&drv_hash, generation).await?.settled(),
+                "world setup poison must apply"
+            );
+            sqlx::query(
+                "UPDATE derivations SET \
+                   status_changed_at = now() - interval '120 seconds' \
+                 WHERE drv_hash = $1",
+            )
+            .bind(&hash)
+            .execute(&test_db.pool)
+            .await?;
+        }
+        let before = stamp_epoch(&test_db.pool, &hash).await?;
+        let (status_before,): (String,) =
+            sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = $1")
+                .bind(&hash)
+                .fetch_one(&test_db.pool)
+                .await?;
+        match *writer {
+            "update_derivation_status_in_tx" => {
+                let mut tx = test_db.pool.begin().await?;
+                SchedulerDb::update_derivation_status_in_tx(
+                    &mut tx,
+                    &drv_hash,
+                    DerivationStatus::Ready,
+                    None,
+                )
+                .await?;
+                tx.commit().await?;
+            }
+            "update_derivation_status_batch_in_tx" => {
+                let mut tx = test_db.pool.begin().await?;
+                SchedulerDb::update_derivation_status_batch_in_tx(
+                    &mut tx,
+                    &[hash.as_str()],
+                    DerivationStatus::Cancelled,
+                )
+                .await?;
+                tx.commit().await?;
+            }
+            "replay_status_batch_guarded" => {
+                let outcome = db
+                    .replay_status_batch_guarded(
+                        &[hash.as_str()],
+                        DerivationStatus::Cancelled,
+                        &[],
+                        std::time::Instant::now() - std::time::Duration::from_secs(60),
+                        generation,
+                    )
+                    .await?;
+                assert!(
+                    matches!(
+                        &outcome,
+                        crate::db::StatusReplay::Applied { replayed } if replayed == &[hash.clone()]
+                    ),
+                    "replay drive must apply (got {outcome:?})"
+                );
+            }
+            "persist_poisoned_in_tx" => {
+                let mut tx = test_db.pool.begin().await?;
+                SchedulerDb::persist_poisoned_in_tx(&mut tx, &drv_hash).await?;
+                tx.commit().await?;
+            }
+            "clear_poison_in_tx" => {
+                let mut tx = test_db.pool.begin().await?;
+                SchedulerDb::clear_poison_in_tx(&mut tx, &drv_hash).await?;
+                tx.commit().await?;
+            }
+            "clear_poison_batch_in_tx" => {
+                let mut tx = test_db.pool.begin().await?;
+                SchedulerDb::clear_poison_batch_in_tx(&mut tx, &[drv_hash.clone()]).await?;
+                tx.commit().await?;
+            }
+            other => panic!(
+                "census names status writer `{other}` but the runtime \
+                 biconditional does not drive it — add a drive arm"
+            ),
+        }
+        let after = stamp_epoch(&test_db.pool, &hash).await?;
+        let (status_after,): (String,) =
+            sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = $1")
+                .bind(&hash)
+                .fetch_one(&test_db.pool)
+                .await?;
+        assert_ne!(
+            status_before, status_after,
+            "drive for `{writer}` must actually change status"
+        );
+        assert!(
+            after > before,
+            "status changed but status_changed_at did not advance \
+             (writer: {writer}): left: {after} / right: > {before}"
+        );
+    }
+
+    for writer in NON_STATUS_DERIVATIONS_WRITER_FNS {
+        let hash = format!("stamp-bicond-{writer}");
+        let drv_hash: DrvHash = hash.as_str().into();
+        insert_test_derivation(&db, &hash).await?;
+        let before = stamp_epoch(&test_db.pool, &hash).await?;
+        match *writer {
+            "update_resource_floor" => {
+                let outcome = db
+                    .update_resource_floor(
+                        &drv_hash,
+                        &crate::state::ResourceFloor {
+                            mem_bytes: 1 << 30,
+                            disk_bytes: 1 << 31,
+                            deadline_secs: 600,
+                        },
+                        generation,
+                    )
+                    .await?;
+                assert!(outcome.settled(), "floor ratchet must apply");
+            }
+            "batch_upsert_derivations" => {
+                // Re-merge the same drv: the ON CONFLICT DO UPDATE arm.
+                insert_test_derivation(&db, &hash).await?;
+            }
+            other => panic!(
+                "census names non-status writer `{other}` but the \
+                 runtime biconditional does not drive it — add an arm"
+            ),
+        }
+        let after = stamp_epoch(&test_db.pool, &hash).await?;
+        assert!(
+            (after - before).abs() < 1e-9,
+            "non-status writer `{writer}` moved status_changed_at: \
+             left: {after} / right: {before} (comparand purity broken)"
+        );
+    }
+    Ok(())
+}
+
+// r[verify sched.attempt.cancel-close-driven+2]
+/// merged_bug_004 hole 2 red: a NON-status write between latch and
+/// flush must not refuse a latched terminal replay. PROPOSITION
+/// CERTIFIED: the precedence conjunct's comparand is writable only by
+/// status events — a resource-floor ratchet (an `updated_at`-bumping,
+/// status-preserving write) leaves the latched terminal persist
+/// applicable. Pre-fix the conjunct read `updated_at`, so the floor
+/// bump permanently cancelled the persist: replayed == [].
+#[tokio::test]
+async fn outbox_floor_bump_does_not_refuse_latched_terminal_replay() -> anyhow::Result<()> {
+    use crate::state::DerivationStatus;
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+    let generation = ServingGeneration::stamp_from_claim(1);
+
+    // The row's last STATUS event was 120s ago; the terminal latch
+    // was enqueued 60s ago (PG was down at persist time).
+    insert_test_derivation(&db, "floor-bump-latched").await?;
+    sqlx::query(
+        "UPDATE derivations SET \
+           updated_at = now() - interval '120 seconds', \
+           status_changed_at = now() - interval '120 seconds' \
+         WHERE drv_hash = 'floor-bump-latched'",
+    )
+    .execute(&test_db.pool)
+    .await?;
+    let enqueued_at = std::time::Instant::now() - std::time::Duration::from_secs(60);
+
+    // Between latch and flush: an OOM report ratchets the floor — a
+    // production write that bumps updated_at and PRESERVES status.
+    let floor_outcome = db
+        .update_resource_floor(
+            &DrvHash::from("floor-bump-latched"),
+            &crate::state::ResourceFloor {
+                mem_bytes: 4 << 30,
+                disk_bytes: 8 << 30,
+                deadline_secs: 900,
+            },
+            generation,
+        )
+        .await?;
+    assert!(floor_outcome.settled(), "floor ratchet must apply");
+
+    let outcome = db
+        .replay_status_batch_guarded(
+            &["floor-bump-latched"],
+            DerivationStatus::Cancelled,
+            &[],
+            enqueued_at,
+            generation,
+        )
+        .await?;
+    assert!(
+        matches!(
+            &outcome,
+            crate::db::StatusReplay::Applied { replayed }
+                if replayed == &["floor-bump-latched".to_string()]
+        ),
+        "left: {outcome:?} / right: Applied {{ replayed: \
+         [\"floor-bump-latched\"] }} (a floor bump is not a status \
+         event; it must not refuse the latched terminal replay)"
+    );
+    let (status,): (String,) =
+        sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = 'floor-bump-latched'")
+            .fetch_one(&test_db.pool)
+            .await?;
+    assert_eq!(status, "cancelled", "the latched terminal status lands");
+    Ok(())
+}
+
+// r[verify sched.attempt.cancel-close-driven+2]
+/// merged_bug_004 hole 3 polarity guard — DISCLOSED, not a behavioral
+/// red: at test speeds the pre-fix sampling skew is microseconds, so
+/// this test cannot distinguish the boundary-sampled cut from the
+/// argument-construction cut by outcome. PROPOSITION CERTIFIED
+/// (direction only): a row whose status advanced AFTER the enqueue
+/// instant is REFUSED, never overwritten — the conservative polarity
+/// the boundary-witnessed constructor's envelope law claims (realized
+/// cut <= enqueue instant; the structural half is the constructor
+/// type, which demands the open replay transaction).
+#[tokio::test]
+async fn outbox_replay_cut_is_conservative_to_the_enqueue_instant() -> anyhow::Result<()> {
+    use crate::state::DerivationStatus;
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+    let generation = ServingGeneration::stamp_from_claim(1);
+
+    insert_test_derivation(&db, "cut-conservative").await?;
+    let enqueued_at = std::time::Instant::now();
+    // The row's status advances AFTER the enqueue instant, through a
+    // production status writer (stamp = its commit's now()).
+    let mut tx = test_db.pool.begin().await?;
+    SchedulerDb::update_derivation_status_in_tx(
+        &mut tx,
+        &DrvHash::from("cut-conservative"),
+        DerivationStatus::Running,
+        None,
+    )
+    .await?;
+    tx.commit().await?;
+
+    let outcome = db
+        .replay_status_batch_guarded(
+            &["cut-conservative"],
+            DerivationStatus::Cancelled,
+            &[],
+            enqueued_at,
+            generation,
+        )
+        .await?;
+    assert!(
+        matches!(&outcome, crate::db::StatusReplay::Applied { replayed } if replayed.is_empty()),
+        "left: {outcome:?} / right: Applied {{ replayed: [] }} (a row \
+         advanced after the enqueue instant must refuse the replay — \
+         the cut may never land ahead of the enqueue)"
+    );
+    let (status,): (String,) =
+        sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = 'cut-conservative'")
+            .fetch_one(&test_db.pool)
+            .await?;
+    assert_eq!(
+        status, "running",
+        "left: {status} / right: running (refuse, never overwrite)"
+    );
     Ok(())
 }

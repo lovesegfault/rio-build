@@ -328,7 +328,7 @@ async fn establishment_skips_synthesized_closed_attempt() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.cancel-close-driven+1]
+// r[verify sched.attempt.cancel-close-driven+2]
 /// Cancelled work is NEVER charged, even when the cancel's terminal
 /// persist fails: the failed batch latches in the status outbox
 /// (assignment stays open meanwhile), the next tick's flush re-drives
@@ -632,7 +632,7 @@ async fn establishment_terminal_settled_node_closes_charge_free() -> TestResult 
 /// replay must DROP the entry (present-different: the node advanced),
 /// never regress the row to cancelled or force-close exec2's pending
 /// assignment (pre-fix the derivation-scoped absolute close hit it).
-// r[verify sched.attempt.cancel-close-driven+1]
+// r[verify sched.attempt.cancel-close-driven+2]
 #[tokio::test]
 async fn outbox_stale_replay_never_touches_resubmitted_attempt() -> TestResult {
     let (db, handle, _task) = setup().await;
@@ -695,7 +695,7 @@ async fn outbox_stale_replay_never_touches_resubmitted_attempt() -> TestResult {
 /// the stale Cancelled replay must be dropped, not rewrite completed
 /// work back to cancelled (pre-fix fallout: a failover re-dispatches
 /// already-built work, dual execution).
-// r[verify sched.attempt.cancel-close-driven+1]
+// r[verify sched.attempt.cancel-close-driven+2]
 #[tokio::test]
 async fn outbox_stale_replay_never_regresses_completed_row() -> TestResult {
     let (db, handle, _task) = setup().await;
@@ -761,7 +761,7 @@ async fn outbox_stale_replay_never_regresses_completed_row() -> TestResult {
 /// for the Err path only (fail fast once per tick), not a 6/minute
 /// trickle after recovery (each queued tick was another window for a
 /// latched batch's derivations to advance).
-// r[verify sched.attempt.cancel-close-driven+1]
+// r[verify sched.attempt.cancel-close-driven+2]
 #[tokio::test]
 async fn outbox_drains_fully_on_ok_in_one_tick() -> TestResult {
     let (db, handle, _task) = setup().await;
@@ -808,7 +808,7 @@ async fn outbox_drains_fully_on_ok_in_one_tick() -> TestResult {
 /// CleanupTerminalBuild contract the DROP rule depends on (reap only
 /// removes in-memory-terminal nodes, so absent ⇒ the latched terminal
 /// status is still the node's truth).
-// r[verify sched.attempt.cancel-close-driven+1]
+// r[verify sched.attempt.cancel-close-driven+2]
 #[tokio::test]
 async fn outbox_reaped_node_batch_still_flushes() -> TestResult {
     let (db, handle, _task) = setup().await;

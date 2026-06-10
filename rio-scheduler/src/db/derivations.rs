@@ -12,12 +12,14 @@ use crate::state::{DerivationStatus, DrvHash, ExecutorId};
 
 /// PG-domain latch age (merged_bug_017): the precedence anchor of a
 /// status-outbox replay, constructible ONLY from the batch's MONOTONIC
-/// enqueue instant. There is deliberately NO constructor from
-/// `SystemTime`/epoch floats — the replay's precedence comparison must
-/// live entirely in the PG clock domain (`updated_at <= now() -
-/// make_interval(secs => age)`, both comparands PG-stamped), so
-/// binding ANY absolute timestamp (app epoch OR a pg-read instant)
-/// against the PG-stamped `updated_at` no longer typechecks. This is
+/// enqueue instant at the open replay transaction (merged_bug_004 —
+/// see [`LatchAge::at_replay_boundary`]). There is deliberately NO
+/// constructor from `SystemTime`/epoch floats — the replay's
+/// precedence comparison must live entirely in the PG clock domain
+/// (`status_changed_at <= now() - make_interval(secs => age)`, both
+/// comparands PG-stamped), so binding ANY absolute timestamp (app
+/// epoch OR a pg-read instant) against the PG-stamped comparand no
+/// longer typechecks. This is
 /// the repo's BACKSTOP_DUE_SQL discipline (rio-store/src/gc/state.rs:
 /// durations cross the clock boundary; instants never do) made a
 /// type. Residual error: ppm monotonic frequency drift over the
@@ -30,12 +32,23 @@ use crate::state::{DerivationStatus, DrvHash, ExecutorId};
 pub(crate) struct LatchAge(f64);
 
 impl LatchAge {
-    /// The latch's age, measured monotonically from the batch's
-    /// enqueue instant (the latch and the enqueue are the same code
-    /// path: the failed persist latches and pushes in one step).
-    /// Recomputed per flush attempt, so a re-pushed batch keeps its
-    /// latch-pinned cut.
-    pub(crate) fn since_enqueue(enqueued_at: std::time::Instant) -> Self {
+    /// Boundary-witnessed constructor (merged_bug_004 hole 3): the
+    /// latch's age, measured monotonically from the batch's enqueue
+    /// instant AT THE REPLAY TRANSACTION BOUNDARY — demanding the
+    /// open [`super::FencedTx`] makes pre-BEGIN sampling
+    /// unrepresentable (the pre-fix age was sampled at argument
+    /// construction, before `begin_fenced`'s pool-acquire/BEGIN, so
+    /// the realized cut landed at enqueue+delta and admitted stale
+    /// overwrites of rows advanced within delta).
+    ///
+    /// Envelope law (typed direction): PG `now()` froze at BEGIN ≤
+    /// this sample instant, so the realized cut = enqueue − (sample −
+    /// BEGIN) ≤ the ENQUEUE instant — the residual error is bounded
+    /// by the awaits between BEGIN and this call and points in the
+    /// refuse-never-overwrite direction. Recomputed from the
+    /// immutable enqueue instant per flush attempt, so a re-pushed
+    /// batch keeps its latch-pinned cut.
+    fn at_replay_boundary(enqueued_at: std::time::Instant, _tx: &super::FencedTx) -> Self {
         Self(enqueued_at.elapsed().as_secs_f64())
     }
 
@@ -125,7 +138,8 @@ impl SchedulerDb {
         sqlx::query!(
             r#"
             UPDATE derivations
-            SET status = $2, assigned_builder_id = $3, updated_at = now()
+            SET status = $2, assigned_builder_id = $3, updated_at = now(),
+                status_changed_at = now()
             WHERE drv_hash = $1
             "#,
             drv_hash.as_str(),
@@ -193,7 +207,8 @@ impl SchedulerDb {
         let result = sqlx::query!(
             r#"
             UPDATE derivations
-            SET status = $2, assigned_builder_id = NULL, updated_at = now()
+            SET status = $2, assigned_builder_id = NULL, updated_at = now(),
+                status_changed_at = now()
             WHERE drv_hash = ANY($1::text[])
             "#,
             drv_hashes as &[&str],
@@ -251,14 +266,14 @@ impl SchedulerDb {
     /// writers added since).
     ///
     /// Claims-floor fenced like every evidence writer.
-    // r[impl sched.attempt.cancel-close-driven+1]
+    // r[impl sched.attempt.cancel-close-driven+2]
     // r[impl sched.evidence.durability+4]
     pub(crate) async fn replay_status_batch_guarded(
         &self,
         drv_hashes: &[&str],
         status: DerivationStatus,
         latched_exec_ids: &[uuid::Uuid],
-        latch_age: LatchAge,
+        enqueued_at: std::time::Instant,
         serving_generation: ServingGeneration,
     ) -> Result<StatusReplay, sqlx::Error> {
         if drv_hashes.is_empty() && latched_exec_ids.is_empty() {
@@ -268,17 +283,36 @@ impl SchedulerDb {
             FencedBegin::Fenced { .. } => return Ok(StatusReplay::Fenced),
             FencedBegin::Open(ftx) => ftx,
         };
+        // merged_bug_004 hole 3: the age is minted AFTER `begin_fenced`
+        // returned the open transaction — PG `now()` froze at BEGIN ≤
+        // the sample instant, so the realized cut can only TRAIL the
+        // enqueue instant (refuse-never-overwrite; the constructor doc
+        // carries the envelope law).
+        let latch_age = LatchAge::at_replay_boundary(enqueued_at, &tx);
         let replayed: Vec<String> = if drv_hashes.is_empty() {
             vec![]
         } else {
             // merged_bug_025: the precedence conjunct — a row the
             // world advanced AFTER the latch (resubmitted drv:
-            // Running with a newer updated_at) refuses the replay
+            // Running with a newer status stamp) refuses the replay
             // row-locally, even when the in-memory re-derivation
             // could not see it. The timestamp form is PINNED over the
             // status-set form: the two diverge exactly on a newer
             // NON-terminal durable row, which the status-set guard
             // would have overwritten.
+            //
+            // merged_bug_004: the comparand is `status_changed_at` —
+            // a column whose ONLY writers are status events (migration
+            // 101; the biconditional census in db/tests/
+            // fence_coverage.rs) — so a non-status write (the
+            // resource-floor ratchet, the merge-parity upsert) can no
+            // longer refuse a latched terminal persist, and the
+            // replay's own stamp moves the comparand only when it
+            // really changes the status VALUE: the `status IS
+            // DISTINCT FROM $2` guard keeps the comparand's meaning
+            // exact ("the instant the status VALUE last changed") —
+            // an already-at-target row is left to the residual lane
+            // instead of being re-stamped as a non-change.
             //
             // merged_bug_017: BOTH comparands are PG-domain — the
             // latch crosses the clock boundary as a monotonic AGE
@@ -291,9 +325,11 @@ impl SchedulerDb {
             // allowed rows so the caller can surface the refused set.
             sqlx::query_scalar::<_, String>(
                 "UPDATE derivations \
-                 SET status = $2, assigned_builder_id = NULL, updated_at = now() \
+                 SET status = $2, assigned_builder_id = NULL, updated_at = now(), \
+                     status_changed_at = now() \
                  WHERE drv_hash = ANY($1::text[]) \
-                   AND updated_at <= now() - make_interval(secs => $3) \
+                   AND status_changed_at <= now() - make_interval(secs => $3) \
+                   AND status IS DISTINCT FROM $2 \
                  RETURNING drv_hash",
             )
             .bind(drv_hashes)
@@ -438,7 +474,8 @@ impl SchedulerDb {
         sqlx::query!(
             "UPDATE derivations \
              SET status = 'poisoned', poisoned_at = now(), \
-                 assigned_builder_id = NULL, updated_at = now() \
+                 assigned_builder_id = NULL, updated_at = now(), \
+                 status_changed_at = now() \
              WHERE drv_hash = $1",
             drv_hash.as_str(),
         )
@@ -545,7 +582,8 @@ impl SchedulerDb {
     ) -> Result<(), sqlx::Error> {
         sqlx::query!(
             "UPDATE derivations
-             SET poisoned_at = NULL, status = 'created', updated_at = now()
+             SET poisoned_at = NULL, status = 'created', updated_at = now(),
+                 status_changed_at = now()
              WHERE drv_hash = $1",
             drv_hash.as_str(),
         )
@@ -646,7 +684,8 @@ impl SchedulerDb {
         let hashes: Vec<&str> = drv_hashes.iter().map(DrvHash::as_str).collect();
         let result = sqlx::query!(
             "UPDATE derivations
-             SET poisoned_at = NULL, status = 'created', updated_at = now()
+             SET poisoned_at = NULL, status = 'created', updated_at = now(),
+                 status_changed_at = now()
              WHERE drv_hash = ANY($1::text[])",
             &hashes as &[&str],
         )

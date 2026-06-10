@@ -724,7 +724,7 @@ impl DagActor {
         }
     }
 
-    // r[impl sched.attempt.cancel-close-driven+1]
+    // r[impl sched.attempt.cancel-close-driven+2]
     /// Re-drive failed status-batch persists. FIFO; drains the WHOLE
     /// queue on Ok (a healed PG clears the backlog in one tick) and
     /// fail-fasts on the first Err/Fenced (a dead PG costs one attempt
@@ -757,19 +757,22 @@ impl DagActor {
     /// assignment close is scoped to the LATCHED exec_ids — never the
     /// derivation — so a successor attempt is untouchable by
     /// construction, and whose UPDATE carries the PG-domain precedence
-    /// conjunct `updated_at <= now() - make_interval(secs =>
-    /// latch_age)` (merged_bug_025; clock domains merged_bug_017 — the
-    /// latch crosses the boundary as a monotonic age from the batch's
-    /// enqueue instant, never as a pod timestamp): a row the world
-    /// advanced AFTER the latch — including a resubmitted drv sitting
-    /// Running with a newer `updated_at`, which a status-set guard
-    /// would miss — refuses the replay row-locally even when the
-    /// in-memory re-derivation could not see it, and every refusal is
-    /// surfaced (named warn +
+    /// conjunct `status_changed_at <= now() - make_interval(secs =>
+    /// latch_age)` (merged_bug_025; comparand purity merged_bug_004 —
+    /// `status_changed_at` is writable solely by status events, so a
+    /// floor ratchet or parity upsert can never refuse a latched
+    /// terminal persist; clock domains merged_bug_017 — the latch
+    /// crosses the boundary as a monotonic age from the batch's
+    /// enqueue instant, never as a pod timestamp, minted INSIDE the
+    /// replay transaction): a row the world advanced AFTER the latch
+    /// — including a resubmitted drv sitting Running with a newer
+    /// status stamp, which a status-set guard would miss — refuses
+    /// the replay row-locally even when the in-memory re-derivation
+    /// could not see it, and every refusal is surfaced (named warn +
     /// `rio_scheduler_status_outbox_replay_refused_total`).
     /// Leader-gated by `handle_tick`; the outbox is cleared on
     /// leadership loss in `clear_persisted_state`.
-    // r[impl sched.attempt.cancel-close-driven+1]
+    // r[impl sched.attempt.cancel-close-driven+2]
     pub(super) async fn tick_flush_status_outbox(&mut self, _authority: &super::DagAuthority) {
         while let Some(front) = self.status_outbox.front() {
             let age = front.enqueued_at.elapsed();
@@ -823,7 +826,11 @@ impl DagActor {
                     // enqueue instant — recomputed per flush attempt
                     // so a re-pushed batch keeps its latch-pinned
                     // cut; no pod epoch ever reaches the conjunct.
-                    crate::db::LatchAge::since_enqueue(batch.enqueued_at),
+                    // merged_bug_004 hole 3: the AGE itself is minted
+                    // inside the replay AFTER its transaction opened
+                    // (the boundary-witnessed LatchAge constructor) —
+                    // only the immutable enqueue instant crosses here.
+                    batch.enqueued_at,
                     self.serving_generation(),
                 )
                 .await
@@ -1262,7 +1269,7 @@ impl DagActor {
 
         match establish_expired_attempt(kind, node, probe, verifiable_refs.as_deref()) {
             EstablishmentAction::CloseChargeFree => {
-                // r[impl sched.attempt.cancel-close-driven+1]
+                // r[impl sched.attempt.cancel-close-driven+2]
                 // Nobody wants this work any more: close the assignment
                 // row and write NOTHING else — no AttemptRow (no
                 // exclusion seed), no pull_establishments_total (the

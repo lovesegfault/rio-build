@@ -596,7 +596,7 @@ impl DagActor {
             Err(e) => {
                 error!(count = drv_hashes.len(), ?status, error = %e,
                        "failed to batch-persist derivation status; latched in the outbox");
-                // r[impl sched.attempt.cancel-close-driven+1]
+                // r[impl sched.attempt.cancel-close-driven+2]
                 // The persist is what closes the batch's assignment
                 // rows: latch the owned batch for the housekeeping
                 // tick's flusher, dropped only on a later Ok or when
@@ -612,15 +612,16 @@ impl DagActor {
                     .iter()
                     .filter_map(|h| self.dag.node(h).and_then(|s| s.exec_id))
                     .collect();
-                self.status_outbox.push_back(super::StatusBatch {
+                // Latched through the per-drv supersession chokepoint
+                // (merged_bug_004): a newer latch for the same drv is
+                // the only truth worth replaying queue-wide.
+                self.latch_status_batch(super::StatusBatch {
                     drv_hashes: drv_hashes.iter().map(|s| s.to_string()).collect(),
                     status,
                     exec_ids,
                     enqueued_at: std::time::Instant::now(),
                     latched_at_epoch: crate::db::attempts::epoch_now(),
                 });
-                metrics::gauge!("rio_scheduler_status_outbox_depth")
-                    .set(self.status_outbox.len() as f64);
             }
         }
     }

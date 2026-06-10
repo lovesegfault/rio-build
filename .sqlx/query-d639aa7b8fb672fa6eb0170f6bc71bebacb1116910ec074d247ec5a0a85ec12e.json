@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE derivations\n            SET status = $2, assigned_builder_id = NULL, updated_at = now(),\n                status_changed_at = now()\n            WHERE drv_hash = ANY($1::text[])\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d639aa7b8fb672fa6eb0170f6bc71bebacb1116910ec074d247ec5a0a85ec12e"
+}

@@ -3246,21 +3246,39 @@ deadline its pod really runs under; the residual gap between the Job's
 report slack. The kernel routing makes the decision axes explicit; the
 cancelled/absent-node row is normative below.
 
-#r("sched.attempt.cancel-close-driven+1")[
+#r("sched.attempt.cancel-close-driven+2")[
   A cancel-driven attempt close MUST be driven to durability: when the
   status persist that closes the attempt's assignment row fails, the
   scheduler MUST latch the batch — together with the affected
   derivations' ACTIVE exec_ids read from the in-memory DAG at failure
   time — in a leader-scoped outbox and retry it on the housekeeping
-  tick; the outbox MUST be cleared on leadership loss. The retry is a
-  REPLAY, not a repeat: before re-driving, each latched derivation MUST
-  be re-derived against the authoritative in-memory DAG — kept when its
-  node still carries the latched status or has left the DAG, DROPPED
-  when the node is present with a different status (a resubmit reset or
-  later transition made the latch stale; replaying it would regress
-  newer state) — and the replay's assignment close MUST be scoped to
-  the latched exec_ids (never the derivation), so an attempt minted
-  after the latch is untouchable by construction. On a healthy persist
+  tick; the outbox MUST be cleared on leadership loss. Latching is
+  per-derivation newest-wins: the single latch chokepoint MUST strip
+  each newly latched derivation from every queued batch, so at most
+  one pending status exists per derivation queue-wide (stripped
+  batches keep their exec_ids — the close is exec-scoped and
+  unconditional, and an emptied batch still flushes close-only). The
+  retry is a REPLAY, not a repeat: before re-driving, each latched
+  derivation MUST be re-derived against the authoritative in-memory
+  DAG — kept when its node still carries the latched status or has
+  left the DAG, DROPPED when the node is present with a different
+  status (a resubmit reset or later transition made the latch stale;
+  replaying it would regress newer state) — and the replay's
+  assignment close MUST be scoped to the latched exec_ids (never the
+  derivation), so an attempt minted after the latch is untouchable by
+  construction. The replay's precedence cut MUST be anchored on
+  `status_changed_at` — a column whose only writers are status events
+  (migration 101; a status-preserving write MUST NOT refuse a latched
+  persist) — with the age sampled at the replay transaction boundary,
+  so the realized cut can only trail the enqueue instant (refuse,
+  never overwrite), and the replay MUST NOT re-stamp a row already at
+  the target status. Each zero-row residual MUST be classified at the
+  durability point, in the replay transaction: already-applied (the
+  durable status equals the latched truth — a lost-ack retry or an
+  equivalent landed write, never counted as a refusal), refused-newer
+  (evidenced foreign precedence — the row stands with a different
+  status; the ONLY lane that may warn and count a refusal), or
+  vanished (the row was GC'd; nothing stands). On a healthy persist
   the flush MUST drain the entire outbox in the same tick (fail-fast
   applies to failures only — one attempt per tick on a dead PG, never a
   one-batch-per-tick trickle on a healed one). And the establishment
