@@ -805,14 +805,29 @@ of the keyed identity above: the aborted append is the ambiguous
 commit-or-not case, and the verbatim-requeued slice redelivers into the
 absorb.
 
-#r("ctrl.informer.cluster-identity-boundary")[
+#r("ctrl.informer.cluster-identity-boundary+1")[
   The cluster identity axis MUST be value-distinct across deployments
   that share a PG: the chart MUST refuse to render an empty cluster id
   when the external-secrets PG path (the shared-capable topology
   declaration) is enabled, and the informer MUST disclose the
   single-cluster default loudly at activation, so a cross-deployment
   uid collision is constructible only past two explicit boundaries.
+  The axis has exactly ONE normalization law (trim; post-trim-empty =
+  the single-cluster default): the chart's identity emission MUST be
+  normalized by the same law as the runtime constructor, the render
+  gate MUST evaluate the normalized value --- the refusal set is
+  "every value the runtime classifies single-cluster-default", never
+  the raw-empty point --- and the chart-side and constructor-side
+  predicates MUST be pinned to one committed cross-boundary fixture.
 ]
+One-time re-key disclosure (merged_bug_067, non-normative): a
+deployment that previously ran a whitespace-padded cluster value
+re-keys its `sla_ema_state`/`interrupt_samples` scope on upgrade (the
+padded scope's rows age out of the λ window; the EMA reseeds) --- this
+is the fix taking effect, not a residual on a safety property: the
+affected population is installs that hand-wrote padded values past
+every documented path (R19 check: no proviso minted).
+
 Presence-in-type (the `ClusterId` axis the recredit rule demands)
 cannot close VALUE distinctness: two deployments both at the empty
 default mint byte-identical `exposure::{hw}:{slot}` uids every window,

@@ -1608,7 +1608,7 @@ impl ClusterId {
         Self(raw.trim().to_string())
     }
 
-    // r[impl ctrl.informer.cluster-identity-boundary]
+    // r[impl ctrl.informer.cluster-identity-boundary+1]
     /// bug_022: `true` iff this is the empty (post-trim)
     /// single-cluster default — the value under which two deployments
     /// sharing one PG mint byte-identical `exposure::{hw}:{slot}`
@@ -1621,7 +1621,7 @@ impl ClusterId {
     }
 }
 
-// r[impl ctrl.informer.cluster-identity-boundary]
+// r[impl ctrl.informer.cluster-identity-boundary+1]
 /// bug_022: the activation disclosure. The informer IS the exposure
 /// path's activation, and this is the only boundary present in EVERY
 /// topology — the helm `rio.clusterIdentity` render gate covers
@@ -2088,7 +2088,7 @@ mod tests {
             .collect()
     }
 
-    // r[verify ctrl.informer.cluster-identity-boundary]
+    // r[verify ctrl.informer.cluster-identity-boundary+1]
     /// bug_022 red R-F: the activation disclosure EMITS — exactly one
     /// WARN naming the single-cluster default at `ClusterId::new("")`,
     /// and zero WARNs + one positive INFO carrying the axis value at a
@@ -2126,7 +2126,7 @@ mod tests {
         );
     }
 
-    // r[verify ctrl.informer.cluster-identity-boundary]
+    // r[verify ctrl.informer.cluster-identity-boundary+1]
     /// bug_022 red R-G: the predicate the warn and the docs quantify
     /// over — empty and whitespace-only ids are the single-cluster
     /// default (trim law pinned); non-empty ids are not. Recorded red
@@ -2145,6 +2145,60 @@ mod tests {
             !ClusterId::new(" prod-eu ").is_single_cluster_default(),
             "trim law: padding does not change a real id's class"
         );
+    }
+
+    // r[verify ctrl.informer.cluster-identity-boundary+1]
+    /// merged_bug_067 R-3C: the Rust constructor agrees with the
+    /// cross-boundary golden fixture CELL-FOR-CELL over the FULL
+    /// alphabet (including the non-helm-settable whitespace forms) —
+    /// `ClusterId::new(raw)` yields exactly `normalized` (in-module
+    /// private access) and `is_single_cluster_default()` matches the
+    /// fixture's flag. The SAME committed bytes drive helm fragment
+    /// 39's leg (i) over the helm-settable subset, so the two
+    /// languages' trim ∘ classify predicates cannot drift (the
+    /// derivation_statuses.json precedent; the fixture's `_doc` field
+    /// carries the scope split — each side certifies its full
+    /// reachable input set). Subsumes-but-keeps
+    /// `cluster_id_classifies_the_default` (the round-6 point pins).
+    #[test]
+    fn cluster_identity_normalization_golden() {
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            cases: Vec<Case>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Case {
+            raw: String,
+            normalized: String,
+            single_cluster_default: bool,
+            helm_settable: bool,
+        }
+        let fixture: Fixture = serde_json::from_str(include_str!(
+            "../../tests/golden/cluster_identity_normalization.json"
+        ))
+        .expect("golden fixture parses");
+        assert!(
+            fixture.cases.len() >= 6,
+            "the fixture covers the alphabet (defaults, padding, interior space)"
+        );
+        assert!(
+            fixture.cases.iter().any(|c| !c.helm_settable),
+            "the Rust leg quantifies past the helm-settable subset"
+        );
+        for case in &fixture.cases {
+            let id = ClusterId::new(&case.raw);
+            assert_eq!(
+                id.0, case.normalized,
+                "ClusterId::new({:?}) must normalize per the one law",
+                case.raw
+            );
+            assert_eq!(
+                id.is_single_cluster_default(),
+                case.single_cluster_default,
+                "classification of {:?} must match the fixture",
+                case.raw
+            );
+        }
     }
 
     // r[verify ctrl.informer.exposure-recredit+4]
