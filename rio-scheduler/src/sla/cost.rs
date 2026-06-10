@@ -1034,9 +1034,14 @@ fn epoch_gate(applied: Option<EvidenceEpoch>, incoming: Option<EvidenceEpoch>) -
 /// wipes `last_applied` via the `observability::LEADER_EDGES` row
 /// `ice-epoch-watermark` (the registered [`Self::reset_epoch_gate`]
 /// edge — bug_067: this sentence used to cite a wipe that did not
-/// exist as an API), so the worst case adds one spurious re-apply of
-/// in-flight redelivered evidence per cell (the same posture the
-/// pre-fix prose already priced, now actually purchased). The
+/// exist as an API). The wipe's spurious-re-apply cost per cell is
+/// ∈ {refresh of a live rung, one fresh base mask} at the wipe
+/// instant — the reset NORMALIZES expired rungs away (bug_095), so
+/// a redelivered already-applied mark can refresh or re-base but
+/// never climb at the wipe; see [`Self::reset_epoch_gate`]'s
+/// row-enumerated pricing over `next_mark_step`'s full domain and
+/// its two SIGNED time-shaped residuals (live-at-wipe expiry inside
+/// the redelivery interval; post-local-clear base mask). The
 /// controller-handoff-while-scheduler-stable cell is NOT closable
 /// scheduler-side (no scheduler edge fires); its bound is
 /// inter-replica clock skew (ADJ-1 legs i/ii, the controller's
@@ -1117,28 +1122,82 @@ impl IceBackoff {
     }
 
     /// Re-open the per-cell evidence-epoch gate at a leadership edge
-    /// (bug_067): clears `last_applied` ONLY — the TTL-less watermark
-    /// ratchet — and RETAINS `cells` (the ladder). Registered as the
+    /// (bug_067): clears `last_applied` — the TTL-less watermark
+    /// ratchet — and NORMALIZES `cells` (bug_095: live masks
+    /// retained, EXPIRED rows dropped). Registered as the
     /// `ice-epoch-watermark` row in `observability::LEADER_EDGES`
     /// (lose + rebound; the registry is the machine-derived edge
     /// census — never call this from edge-site code).
     ///
     /// Per-field rationale (heterogeneous retention needs per-field
     /// reasons, not one note):
-    /// - ladder (`cells`): RETAINED — TTL'd `IceState`, the "60s TTL
-    ///   self-heals" claim is true for it; a retained mask is at worst
-    ///   one over-cautious window.
+    /// - ladder (`cells`): live masks RETAINED — TTL'd `IceState`,
+    ///   the "60s TTL self-heals" claim is true for them; a retained
+    ///   live mask is at worst one over-cautious window. EXPIRED
+    ///   rows are DROPPED at the wipe (bug_095): the wipe destroys
+    ///   the watermark that made `mark()`'s expiry proxy ("a mark
+    ///   after expiry ⇒ a fresh claim was minted and failed") sound,
+    ///   so the wipe must not leave ladder states where the proxy
+    ///   fires on stale evidence. Priced over `next_mark_step`'s
+    ///   THREE rows — the law's full domain, not the middle row
+    ///   alone (the pre-fix pricing cited the law while holding only
+    ///   for `Some((s, true))`):
+    ///   - `None` (never marked, or normalized away): a post-wipe
+    ///     Apply re-bases at step 0 — refresh-not-step holds;
+    ///   - `Some((s, true))` (live mask): a post-wipe Apply
+    ///     refreshes at rung `s` — the one row the old pricing was
+    ///     true for;
+    ///   - `Some((s, false))` (expired, retained): pre-fix a
+    ///     post-wipe redelivered already-applied mark climbed to
+    ///     `s+1` — a rung and a doubled mask with NO new failure;
+    ///     and after a §13a local `clear()` (which removes the
+    ///     ladder entry and retains `last_applied` precisely as the
+    ///     axis-3 protection) the wipe voided that protection and
+    ///     the redelivery minted a fresh 60s mask over the
+    ///     just-proven-healthy cell. The normalization deletes the
+    ///     expired cell at the wipe instant — post-reset every
+    ///     cell's prev-state ∈ {None, Some((s, true))}.
+    ///   Priced residuals (SIGNED IN TEXT — both directions are
+    ///   conservative over-masking, self-healing via TTL decay and
+    ///   the next Ack clearing the buffer; the ICE ladder is
+    ///   capacity-cost posture, not a safety theorem, so priced
+    ///   residuals are admissible here — the R19 boundary):
+    ///   (i) a mask LIVE at the wipe that expires before the next
+    ///       redelivery lands still climbs once — window
+    ///       arithmetic: redelivery cadence ~10s vs min TTL 60s ⇒
+    ///       the coincidence window is ≤ 1/6 of the base rung per
+    ///       affected cell per wipe; at most one rung;
+    ///   (ii) a post-local-clear redelivery mints one fresh 60s
+    ///        base mask — inherent to wiping the watermark (the
+    ///        axis-3 protection IS the watermark; not closable
+    ///        without re-growing it).
     /// - watermark (`last_applied`): WIPED — a ratchet with no TTL; a
     ///   clock-behind successor controller's `EpochMint` (Default
     ///   prev=0, seeded `max(now, prev+1)`) mints epochs BELOW the
     ///   previous lineage's, so genuine marks/clears would no-op until
     ///   clock catch-up — a no-op'd genuine mark leaves a sick cell
     ///   UNMASKED (absence of a mask has no TTL to heal). Wipe cost:
-    ///   at most one spurious re-apply of redelivered in-flight
-    ///   evidence per cell per scheduler transition (bounded by the
-    ///   refresh-not-step law).
+    ///   post-wipe spurious-re-apply ∈ {refresh, base-mask} at the
+    ///   wipe instant (the normalized table above), plus the two
+    ///   signed time-shaped residuals.
+    ///
+    /// `ReboundPolicy::Compound` note (recorded, not changed): the
+    /// registered policy fires this wipe on every lose AND rebound,
+    /// widening exposure, while the motivating hazard (the
+    /// clock-behind successor CONTROLLER) is independent of
+    /// scheduler rebounds — a future re-derivation candidate;
+    /// changing the registered policy is an edge-semantics change
+    /// outside this defect's close (non-goal; not a safety
+    /// property, no R19 trigger).
     pub fn reset_epoch_gate(&self) {
         self.last_applied.clear();
+        // bug_095: normalize at the gate re-open — drop EXPIRED
+        // ladder rows; live masks stand. Wipe-instant invariant:
+        // post-reset every cell's `next_mark_step` prev-state is in
+        // {None, Some((s, true))} — a post-wipe Apply refreshes or
+        // re-bases, never climbs at the wipe instant.
+        let now = Instant::now();
+        self.cells.retain(|_, s| now < s.until);
     }
 
     /// Mark `cell` infeasible. TTL is `min(60s · 2^step, max_lead_time)`;
@@ -1823,12 +1882,15 @@ mod tests {
         assert_ne!(b.solve_relevant_hash(), h_before);
     }
 
-    /// bug_067 unit companion: `reset_epoch_gate` clears the
-    /// watermark map ONLY and retains the ladder — the per-field
-    /// retention law, asserted at the API (the actor-level red drives
-    /// it through the LEADER_EDGES lose edge).
+    /// bug_067/bug_095 unit companion: `reset_epoch_gate` clears the
+    /// watermark map AND normalizes the ladder — watermark cleared,
+    /// LIVE rows retained, EXPIRED rows dropped (the per-field law,
+    /// asserted at the API; the actor-level red drives it through the
+    /// LEADER_EDGES lose edge). Replaces the retention-only statement
+    /// with the stronger proposition (R20): retention alone was
+    /// strictly weaker than the signed wipe-cost bound.
     #[test]
-    fn reset_epoch_gate_clears_watermark_retains_ladder() {
+    fn reset_epoch_gate_clears_watermark_and_normalizes_ladder() {
         let ice = IceBackoff::new(3600.0);
         let cell: Cell = ("h".into(), CapacityType::Spot);
         ice.apply_mark_event(&cell, Some(EvidenceEpoch(1000)));
@@ -1842,7 +1904,7 @@ mod tests {
         assert_eq!(
             ice.step(&cell),
             Some(0),
-            "the ladder is RETAINED by the watermark reset"
+            "a LIVE mask is RETAINED by the watermark reset"
         );
         // Gate re-opened: the same lower-epoch clear now applies.
         ice.apply_clear_event(&cell, Some(EvidenceEpoch(500)));
@@ -1851,6 +1913,82 @@ mod tests {
             None,
             "post-reset the lower-epoch genuine clear applies (ladder reset)"
         );
+    }
+
+    /// bug_095 R1: the expired-row climb on redelivered evidence —
+    /// the exact cell the signed pricing excluded — is deleted at the
+    /// wipe instant. PROPOSITION CERTIFIED: a post-wipe redelivered
+    /// already-applied mark on a cell whose mask EXPIRED before the
+    /// wipe re-bases at step 0; pre-fix it climbed the retained
+    /// expired rung (mask doubled with no new failure).
+    #[test]
+    fn post_wipe_redelivery_never_climbs_an_expired_rung() {
+        let ice = IceBackoff::new(3600.0);
+        let cell: Cell = ("h".into(), CapacityType::Spot);
+        // Step 0, then a genuine post-expiry consecutive failure →
+        // step 1 (force_expire is the production-precedented seam).
+        ice.apply_mark_event(&cell, Some(EvidenceEpoch(1000)));
+        ice.force_expire(&cell);
+        ice.apply_mark_event(&cell, Some(EvidenceEpoch(1001)));
+        assert_eq!(ice.step(&cell), Some(1), "armed at rung 1");
+        ice.force_expire(&cell);
+
+        // The leadership edge wipes the watermark; the controller
+        // then redelivers its whole buffer (~10s cadence until an
+        // Ack provably lands) — same epoch, gate now open.
+        ice.reset_epoch_gate();
+        ice.apply_mark_event(&cell, Some(EvidenceEpoch(1001)));
+
+        assert_eq!(
+            ice.step(&cell),
+            Some(0),
+            "left: step Some(2) (an expired retained row climbed on \
+             redelivered already-applied evidence; mask doubled with no \
+             new failure) / right: Some(0) (the normalized gate re-bases)"
+        );
+    }
+
+    /// bug_095 R2: the wipe-instant invariant, TOTAL over the
+    /// `next_mark_step` prev-state alphabet — the generator is the
+    /// table's own domain {None, Some((s,true)), Some((s,false))},
+    /// never an author-picked case list. PROPOSITION CERTIFIED:
+    /// post-reset rows ∈ {absent, live-unchanged}, and a subsequent
+    /// Apply yields {0, s-refresh, 0} respectively.
+    #[test]
+    fn epoch_gate_reset_normalizes_the_ladder_table() {
+        let ice = IceBackoff::new(3600.0);
+        let never: Cell = ("never".into(), CapacityType::Spot);
+        let live: Cell = ("live".into(), CapacityType::Spot);
+        let expired: Cell = ("expired".into(), CapacityType::Spot);
+        // Arm `live` at rung 1 with a LIVE window (mark, expire,
+        // post-expiry mark), `expired` at rung 0 then expire it.
+        ice.apply_mark_event(&live, Some(EvidenceEpoch(10)));
+        ice.force_expire(&live);
+        ice.apply_mark_event(&live, Some(EvidenceEpoch(11)));
+        ice.apply_mark_event(&expired, Some(EvidenceEpoch(10)));
+        ice.force_expire(&expired);
+
+        ice.reset_epoch_gate();
+
+        // Wipe-instant table: every row ∈ {absent, live-unchanged}.
+        assert_eq!(ice.step(&never), None, "never-marked stays absent");
+        assert_eq!(ice.step(&live), Some(1), "live mask retained unchanged");
+        assert_eq!(
+            ice.step(&expired),
+            None,
+            "expired row dropped at the wipe (the climb cell deleted)"
+        );
+        // A subsequent Apply yields {0, s-refresh, 0} respectively.
+        ice.apply_mark_event(&never, Some(EvidenceEpoch(20)));
+        ice.apply_mark_event(&live, Some(EvidenceEpoch(20)));
+        ice.apply_mark_event(&expired, Some(EvidenceEpoch(20)));
+        assert_eq!(ice.step(&never), Some(0), "fresh base");
+        assert_eq!(
+            ice.step(&live),
+            Some(1),
+            "in-window redelivery refreshes, never steps"
+        );
+        assert_eq!(ice.step(&expired), Some(0), "re-base, never climb");
     }
 
     /// §13c-3: `resolved_global()` panics on read-before-set —
