@@ -6771,7 +6771,7 @@ rec {
     # quint-wedge-cluster-latch below at one-notch-shrunk bounds. Every
     # law is paired with a falsify twin below (no vacuous-invariant
     # debt; boundsOK is the standard bounds-only exemption).
-    # r[verify ctrl.nodeclaim.wedge-two-axis+5]
+    # r[verify ctrl.nodeclaim.wedge-two-axis+6]
     quint-wedge-cluster-main = mkQuintCheck {
       name = "wedge-cluster-main";
       spec = "wedgeCluster";
@@ -6794,7 +6794,7 @@ rec {
     # latch-witness-systemic check below pins the systemic arm
     # reachable at these shrunk bounds, so the latch law cannot go
     # silently vacuous.
-    # r[verify ctrl.nodeclaim.wedge-two-axis+5]
+    # r[verify ctrl.nodeclaim.wedge-two-axis+6]
     quint-wedge-cluster-latch = mkQuintCheck {
       name = "wedge-cluster-latch";
       spec = "wedgeCluster";
@@ -6814,7 +6814,7 @@ rec {
     # populations — retained-evidence wedged nodes over the THIS-TICK
     # fleet — emit Systemic{affected: 2, of: 1} within 2 ticks
     # (merged_bug_009; solo-verified [violation] in ~3s).
-    # r[verify ctrl.nodeclaim.wedge-two-axis+5]
+    # r[verify ctrl.nodeclaim.wedge-two-axis+6]
     quint-wedge-cluster-calib-split-population = mkQuintWitnessCheck {
       name = "wedge-cluster-calib-split-population";
       spec = "calibration/wedge-009-split-population";
@@ -6828,7 +6828,7 @@ rec {
     # a verdict whose survivor set is empty (merged_bug_176;
     # [violation] at 172,796 generated / 3,953 distinct, ~7s —
     # re-verified at the round-5 retention restatement).
-    # r[verify ctrl.nodeclaim.wedge-two-axis+5]
+    # r[verify ctrl.nodeclaim.wedge-two-axis+6]
     quint-wedge-cluster-calib-early-return = mkQuintWitnessCheck {
       name = "wedge-cluster-calib-early-return";
       spec = "calibration/wedge-176-early-return";
@@ -6840,7 +6840,7 @@ rec {
     # later build a per-node verdict a suppression already explained
     # ([violation] at 474,362 generated / 8,939 distinct, ~10s —
     # re-verified at the round-5 retention restatement).
-    # r[verify ctrl.nodeclaim.wedge-two-axis+5]
+    # r[verify ctrl.nodeclaim.wedge-two-axis+6]
     quint-wedge-cluster-calib-suppressed-evidence = mkQuintWitnessCheck {
       name = "wedge-cluster-calib-suppressed-evidence";
       spec = "calibration/wedge-176-early-return";
@@ -6856,7 +6856,7 @@ rec {
     # with a later blip (merged_bug_163; TLC first-violation at
     # 1,203,834 generated / 46,017 distinct). Runs with
     # TRACK_EPISODE_GHOSTS = true — the ghosts carry the violation.
-    # r[verify ctrl.nodeclaim.wedge-two-axis+5]
+    # r[verify ctrl.nodeclaim.wedge-two-axis+6]
     quint-wedge-cluster-calib-partial-drain = mkQuintWitnessCheck {
       name = "wedge-cluster-calib-partial-drain";
       spec = "calibration/wedge-163-partial-drain";
@@ -6869,7 +6869,7 @@ rec {
     # pre-reap anchors survive the next update and keep feeding the
     # Dead arm (the REQUIRED-argument rationale; solo-verified
     # [violation] in ~5s).
-    # r[verify ctrl.nodeclaim.wedge-two-axis+5]
+    # r[verify ctrl.nodeclaim.wedge-two-axis+6]
     quint-wedge-cluster-falsify-no-eviction = mkQuintWitnessCheck {
       name = "wedge-cluster-falsify-no-eviction";
       spec = "wedgeCluster";
@@ -6963,7 +6963,7 @@ rec {
     # carriers are frozen off-trajectory, so the other regimes'
     # spaces are byte-identical to their recorded baselines). The dwell-gated systemic arm is
     # reachability-pinned below.
-    # r[verify ctrl.nodeclaim.wedge-two-axis+5]
+    # r[verify ctrl.nodeclaim.wedge-two-axis+6]
     quint-wedge-cluster-trajectory = mkQuintCheck {
       name = "wedge-cluster-trajectory";
       spec = "wedgeCluster";
@@ -6988,7 +6988,7 @@ rec {
     # suppressed phase. [violation] of suppressedTickRetainsMarked at
     # the trajectory regime's exact bounds (125,827 generated / 1,990
     # distinct, ~6s).
-    # r[verify ctrl.nodeclaim.wedge-two-axis+5]
+    # r[verify ctrl.nodeclaim.wedge-two-axis+6]
     quint-wedge-cluster-calib-suppressed-drain = mkQuintWitnessCheck {
       name = "wedge-cluster-calib-suppressed-drain";
       spec = "calibration/wedge-016-suppressed-drain";
@@ -7023,7 +7023,7 @@ rec {
     # suppression-survivor set, so the law carries the release-edge
     # content it was previously blind to; [violation] at 193,678
     # generated / 2,584 distinct, ~18s).
-    # r[verify ctrl.nodeclaim.wedge-two-axis+5]
+    # r[verify ctrl.nodeclaim.wedge-two-axis+6]
     quint-wedge-cluster-calib-open-release = mkQuintWitnessCheck {
       name = "wedge-cluster-calib-open-release";
       spec = "calibration/wedge-023-open-release";
@@ -7035,7 +7035,7 @@ rec {
     # merged_bug_034 falsify twin: the retired instantaneous guard at
     # the trajectory regime's exact bounds — both laws [violation]
     # (the lull false-Systemic and the staggered serial reap).
-    # r[verify ctrl.nodeclaim.wedge-two-axis+5]
+    # r[verify ctrl.nodeclaim.wedge-two-axis+6]
     quint-wedge-cluster-calib-instantaneous-denominator = mkQuintWitnessCheck {
       name = "wedge-cluster-calib-instantaneous-denominator";
       spec = "calibration/wedge-034-instantaneous";
@@ -7043,7 +7043,7 @@ rec {
       extraSpecs = [ "wedgeCluster" ];
       witness = "systemicDenominatorIsFleet";
     };
-    # r[verify ctrl.nodeclaim.wedge-two-axis+5]
+    # r[verify ctrl.nodeclaim.wedge-two-axis+6]
     quint-wedge-cluster-calib-instantaneous-serial-reap = mkQuintWitnessCheck {
       name = "wedge-cluster-calib-instantaneous-serial-reap";
       spec = "calibration/wedge-034-instantaneous";
@@ -7069,7 +7069,7 @@ rec {
     # gate-level contention cannot starve a correct exhaustive run
     # (the space itself is unchanged; shrinking these bounds would
     # weaken the one regime where this law is non-vacuous).
-    # r[verify ctrl.nodeclaim.wedge-two-axis+5]
+    # r[verify ctrl.nodeclaim.wedge-two-axis+6]
     quint-wedge-cluster-epilogue = mkQuintCheck {
       name = "wedge-cluster-epilogue";
       spec = "wedgeCluster";

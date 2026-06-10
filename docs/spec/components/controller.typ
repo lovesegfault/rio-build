@@ -1582,7 +1582,7 @@ scheduler's cost table when the outage ends.
   controller did not observe).
 ]
 
-#r("ctrl.nodeclaim.wedge-two-axis+5")[
+#r("ctrl.nodeclaim.wedge-two-axis+6")[
   The wedge clustering's verdict MUST be trajectory-gated over
   COMMENSURABLE, FLEET-DERIVED populations: the denominator is the
   registered NodeClaim fleet united with the evidence-bearing nodes ---
@@ -1617,7 +1617,14 @@ scheduler's cost table when the outage ends.
   watermark latches, per-node verdicts MUST remain suppressed (an
   episode's trailing edge is not a sequence of fresh per-node wedges);
   a dwell release is a no-op (draining at dwell expiry would destroy
-  legitimate fresh post-watermark evidence). Every verdict runs its
+  legitimate fresh post-watermark evidence). An axis CHANGE on an
+  engaged episode is itself an edge: the outgoing axis's release
+  obligations MUST run at the transition, before the incoming axis's
+  engaged-tick effects --- in particular a breadth episode that
+  downgrades to the dwell arm MUST close (drain + merge-latch + dwell
+  measured from the transition) at the downgrade; no edge out of an
+  engaged breadth phase may skip its close, and the transition law
+  MUST be total over the axis product. Every verdict runs its
   full epilogue through one sealed exit whose token is constructible
   only inside that exit, and every suppressed tick MUST increment the
   suppression counter
