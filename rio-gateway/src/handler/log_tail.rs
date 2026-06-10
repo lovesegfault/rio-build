@@ -194,6 +194,18 @@ impl LogTailSet {
         self.tasks.keys().cloned().collect()
     }
 
+    /// Test-only visibility: whether `derivation_path`'s subscription
+    /// has been flipped to drain-and-exit by [`Self::on_terminal`]
+    /// (`None` = no subscription was ever opened). Lets sibling-module
+    /// tests assert a display-family flip cut the dead execution's
+    /// tail without timing on task exit.
+    #[cfg(test)]
+    pub(super) fn draining(&self, derivation_path: &str) -> Option<bool> {
+        self.tasks
+            .get(derivation_path)
+            .map(|handle| *handle.drain.borrow())
+    }
+
     /// `DerivationEvent::Started` arrived for `derivation_path`.
     ///
     /// - Empty `exec_id` → no subscription (the field is documented as

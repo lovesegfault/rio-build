@@ -592,34 +592,100 @@ async fn relay_log_batch<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// The display family an event (or snapshot running entry) demands for
+/// its derivation — the input alphabet of [`flip_to_family`]. Closed:
+/// the gateway renders exactly two families ([`DrvDisplay`]), so the
+/// incoming side is the same two-letter alphabet, with the build letter
+/// carrying the [`SubstCloseCause`] its flip stamps on the closed pair.
+enum IncomingFamily {
+    /// The derivation is (re)entering builder execution: an open
+    /// substitute pair closes with `subst_close`.
+    Build { subst_close: SubstCloseCause },
+    /// The derivation is entering store-side materialization: an open
+    /// build activity stops and its dead execution's log tail is cut.
+    Subst,
+}
+
+// r[impl gw.display.single-map]
+/// THE family-flip chokepoint: every display-family transition — live
+/// relay or snapshot reconcile — projects from this one total function
+/// over (current display, incoming family). Returns `true` iff a flip
+/// closed the previous family (the caller then starts the incoming
+/// family's display); same-family and absent cells are no-ops so every
+/// caller may invoke it unconditionally. Closing a build display cuts
+/// the dead execution's log tail here too — display map and tail set
+/// have ONE lifecycle owner.
+async fn flip_to_family<W: AsyncWrite + Unpin>(
+    stderr: &mut StderrWriter<&mut W>,
+    act: &mut BuildActivityState,
+    tails: &mut LogTailSet,
+    drv: &str,
+    incoming: IncomingFamily,
+) -> Result<bool, StreamProcessError> {
+    // Take the entry out; non-flip cells restore it unchanged. Total
+    // over (family × incoming) — no wildcard arms, so a third display
+    // family cannot compile without minting its flip cells here.
+    match (act.display.remove(drv), incoming) {
+        (Some(DrvDisplay::Build(aid)), IncomingFamily::Subst) => {
+            // The attempt kind flipped to materialization: the old
+            // execution is dead — stop its activity and cut its tail.
+            tails.on_terminal(drv);
+            stderr.stop_activity(aid).await?;
+            debug!(aid, %drv, "family flip: build display closed for substitute");
+            Ok(true)
+        }
+        (Some(DrvDisplay::Subst(aids)), IncomingFamily::Build { subst_close }) => {
+            // Substitute fell through to a build (or the kind flipped
+            // while detached): close the dangling pair under its cause.
+            stop_subst_pair(stderr, act, aids, subst_close).await?;
+            Ok(true)
+        }
+        (Some(entry @ DrvDisplay::Build(_)), IncomingFamily::Build { .. })
+        | (Some(entry @ DrvDisplay::Subst(_)), IncomingFamily::Subst) => {
+            act.display.insert(drv.to_string(), entry);
+            Ok(false)
+        }
+        (None, IncomingFamily::Build { .. }) | (None, IncomingFamily::Subst) => Ok(false),
+    }
+}
+
 // r[impl gw.stderr.activity+2]
 /// Relay one `DerivationEvent` (Started/Completed/Failed/Cached/Queued)
 /// to the client as `actBuild` start/stop activity frames. Mutates
 /// `act.display` to track which display family belongs to which
-/// derivation across reconnects.
+/// derivation across reconnects, and owns the live-tail subscription
+/// lifecycle for the same events: `on_started` fires before the
+/// duplicate-`Started` early-return (a duplicate `Started` carrying a
+/// NEW exec_id must still replace the subscription — the old
+/// execution's log is dead), `on_terminal` fires at the terminal arms'
+/// heads. Display map and tail set move together — one lifecycle owner.
 async fn relay_derivation_status<W: AsyncWrite + Unpin>(
     stderr: &mut StderrWriter<&mut W>,
     act: &mut BuildActivityState,
+    tails: &mut LogTailSet,
     drv_event: types::DerivationEvent,
 ) -> Result<(), StreamProcessError> {
     match drv_event.kind() {
         types::DerivationEventKind::Substituting => {
-            match act.display.get(&drv_event.derivation_path) {
-                // Idempotent across reconnects / duplicate events.
-                Some(DrvDisplay::Subst(_)) => return Ok(()),
-                // The FSM never goes Started → Substituting within one
-                // attempt cycle; if an event-loss window produced this
-                // ordering, keep the build display — the terminal arms
-                // (or the snapshot reconcile) close it.
-                Some(DrvDisplay::Build(_)) => {
-                    debug!(
-                        drv = %drv_event.derivation_path,
-                        "Substituting for a drv with a build display; keeping build"
-                    );
-                    return Ok(());
-                }
-                None => {}
+            // Idempotent across reconnects / duplicate events.
+            if let Some(DrvDisplay::Subst(_)) = act.display.get(&drv_event.derivation_path) {
+                return Ok(());
             }
+            // The attempt IS a materialization now (the scheduler's
+            // claim intake emits SUBSTITUTING for a re-dispatch through
+            // the store lane, with no terminal event for the dead build
+            // execution — an uncharged requeue leaves the drv
+            // non-terminal). Flip an open build display through the
+            // family-transition authority, then start the substitute
+            // family exactly as the snapshot reconcile does.
+            flip_to_family(
+                stderr,
+                act,
+                tails,
+                &drv_event.derivation_path,
+                IncomingFamily::Subst,
+            )
+            .await?;
             let out = drv_event
                 .output_paths
                 .first()
@@ -628,15 +694,27 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
             start_subst_display(stderr, act, &drv_event.derivation_path, &out).await?;
         }
         types::DerivationEventKind::Started => {
+            // Tail subscription first — BEFORE the duplicate-Started
+            // early-return below: its arm re-uses the existing activity
+            // id, while a duplicate Started carrying a NEW exec_id must
+            // still replace the subscription (the old execution's log
+            // is dead). `on_started` is idempotent for an unchanged
+            // exec_id and ignores an empty one.
+            tails.on_started(&drv_event.derivation_path, &drv_event.exec_id);
             // A failed substitute fetch reverts to Ready → may later
-            // dispatch as a build. Close the dangling actSubstitute +
-            // actCopyPath pair so nom doesn't show it stuck forever.
-            if let Some(DrvDisplay::Subst(aids)) =
-                act.display.get(&drv_event.derivation_path).cloned()
-            {
-                act.display.remove(&drv_event.derivation_path);
-                stop_subst_pair(stderr, act, aids, SubstCloseCause::FellThroughToBuild).await?;
-            }
+            // dispatch as a build. Flip the dangling actSubstitute +
+            // actCopyPath pair closed so nom doesn't show it stuck
+            // forever.
+            flip_to_family(
+                stderr,
+                act,
+                tails,
+                &drv_event.derivation_path,
+                IncomingFamily::Build {
+                    subst_close: SubstCloseCause::FellThroughToBuild,
+                },
+            )
+            .await?;
             // Re-dispatch (in-connection reassign, or replay after a
             // gateway↔scheduler reconnect) sends Started again for a
             // drv we already track. The existing aid is still valid on
@@ -689,10 +767,12 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
                 .insert(drv_event.derivation_path.clone(), DrvDisplay::Build(aid));
         }
         types::DerivationEventKind::Completed => {
-            // Terminal: close whichever display family is open.
-            // Substituting → Completed shouldn't happen via the normal
-            // scheduler FSM, but terminal-arm symmetry costs nothing
-            // and guards future scheduler changes.
+            // Terminal: stop the subscription from re-opening and let
+            // its current stream drain, then close whichever display
+            // family is open. Substituting → Completed shouldn't happen
+            // via the normal scheduler FSM, but terminal-arm symmetry
+            // costs nothing and guards future scheduler changes.
+            tails.on_terminal(&drv_event.derivation_path);
             match act.display.remove(&drv_event.derivation_path) {
                 Some(DrvDisplay::Subst(aids)) => {
                     stop_subst_pair(stderr, act, aids, SubstCloseCause::Completed).await?;
@@ -718,13 +798,15 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
             }
         }
         types::DerivationEventKind::Failed => {
-            // Terminal: close whichever display family is open.
+            // Terminal: cut the tail (as Completed above), close
+            // whichever display family is open.
             // Scheduler path Substituting → (silent revert to Queued
             // via `handle_substitute_complete(ok=false)` with
             // `!all_deps_completed`) → DependencyFailed cascade emits
             // Failed without ever emitting Started/Cached — the subst
             // aid was never closed and nom showed a stuck
             // "substituting 'X'" line until build terminus.
+            tails.on_terminal(&drv_event.derivation_path);
             match act.display.remove(&drv_event.derivation_path) {
                 Some(DrvDisplay::Subst(aids)) => {
                     stop_subst_pair(stderr, act, aids, SubstCloseCause::Failed).await?;
@@ -1131,26 +1213,28 @@ async fn apply_snapshot<W: AsyncWrite + Unpin>(
     for (drv, (exec_id, kind)) in &running {
         match kind {
             types::AttemptKind::Materialization => {
-                if let Some(DrvDisplay::Build(aid)) = act.display.get(*drv).cloned() {
-                    // Kind flip while detached (the build re-dispatched
-                    // as a materialization): the old execution is dead —
-                    // close the stale build display and its tail.
-                    act.display.remove(*drv);
-                    tails.on_terminal(drv);
-                    stderr.stop_activity(aid).await?;
-                }
+                // Kind flip while detached (the build re-dispatched as
+                // a materialization): the family-transition authority
+                // closes the stale build display and its tail.
+                flip_to_family(stderr, act, tails, drv, IncomingFamily::Subst).await?;
                 if !act.display.contains_key(*drv) {
                     start_subst_display(stderr, act, drv, drv).await?;
                 }
             }
             _ => {
                 tails.on_started(drv, exec_id);
-                if let Some(DrvDisplay::Subst(aids)) = act.display.get(*drv).cloned() {
-                    // Kind flip while detached (substitute fell through
-                    // to a build): close the dangling subst pair.
-                    act.display.remove(*drv);
-                    stop_subst_pair(stderr, act, aids, SubstCloseCause::SnapshotKindFlip).await?;
-                }
+                // Kind flip while detached (substitute fell through to
+                // a build): the authority closes the dangling pair.
+                flip_to_family(
+                    stderr,
+                    act,
+                    tails,
+                    drv,
+                    IncomingFamily::Build {
+                        subst_close: SubstCloseCause::SnapshotKindFlip,
+                    },
+                )
+                .await?;
                 if !act.display.contains_key(*drv) {
                     // Same actBuild shape as relay_derivation_status's
                     // Started arm.
@@ -1291,23 +1375,11 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
                 }
             }
             Some(Event::Derivation(drv_event)) => {
-                // The live-tail subscription lifecycle keys off the
-                // same events that drive the actBuild activities, but
-                // BEFORE relay_derivation_status: its Started arm
-                // early-returns on a duplicate Started (re-using the
-                // existing activity id), while a duplicate Started
-                // carrying a NEW exec_id must still replace the
-                // subscription (the old execution's log is dead).
-                match drv_event.kind() {
-                    types::DerivationEventKind::Started => {
-                        tails.on_started(&drv_event.derivation_path, &drv_event.exec_id);
-                    }
-                    types::DerivationEventKind::Completed | types::DerivationEventKind::Failed => {
-                        tails.on_terminal(&drv_event.derivation_path);
-                    }
-                    _ => {}
-                }
-                relay_derivation_status(stderr, act, drv_event).await?;
+                // Display map AND live-tail subscriptions move together
+                // inside the relay (one lifecycle owner — see
+                // relay_derivation_status's doc for the ordering the
+                // arms preserve).
+                relay_derivation_status(stderr, act, tails, drv_event).await?;
             }
             Some(Event::SubstituteProgress(p)) => {
                 relay_substitute_progress(stderr, act, p).await?;
@@ -3659,10 +3731,16 @@ mod tests {
         let mut w = &mut buf;
         let mut stderr = StderrWriter::new(&mut w);
         let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
 
-        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
-            .await
-            .unwrap();
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            ev(Substituting, drv, &[]),
+        )
+        .await
+        .unwrap();
         let aids = subst_aids(&act, drv);
 
         relay_substitute_progress(
@@ -3706,10 +3784,16 @@ mod tests {
         let mut w = &mut buf;
         let mut stderr = StderrWriter::new(&mut w);
         let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
 
-        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
-            .await
-            .unwrap();
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            ev(Substituting, drv, &[]),
+        )
+        .await
+        .unwrap();
 
         relay_substitute_progress(
             &mut stderr,
@@ -3756,10 +3840,16 @@ mod tests {
         let mut w = &mut buf;
         let mut stderr = StderrWriter::new(&mut w);
         let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
 
-        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
-            .await
-            .unwrap();
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            ev(Substituting, drv, &[]),
+        )
+        .await
+        .unwrap();
         relay_substitute_progress(
             &mut stderr,
             &mut act,
@@ -3772,7 +3862,7 @@ mod tests {
         )
         .await
         .unwrap();
-        relay_derivation_status(&mut stderr, &mut act, ev(Cached, drv, &[]))
+        relay_derivation_status(&mut stderr, &mut act, &mut tails, ev(Cached, drv, &[]))
             .await
             .unwrap();
         // The straggler: the final tick lost the race to the outcome.
@@ -3818,10 +3908,16 @@ mod tests {
         let mut w = &mut buf;
         let mut stderr = StderrWriter::new(&mut w);
         let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
 
-        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
-            .await
-            .unwrap();
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            ev(Substituting, drv, &[]),
+        )
+        .await
+        .unwrap();
         let aids = subst_aids(&act, drv);
 
         relay_substitute_progress(
@@ -3839,7 +3935,7 @@ mod tests {
 
         // The closing outcome arrives with NO further tick (the final
         // tick lost the race end-to-end).
-        relay_derivation_status(&mut stderr, &mut act, ev(Cached, drv, &[]))
+        relay_derivation_status(&mut stderr, &mut act, &mut tails, ev(Cached, drv, &[]))
             .await
             .unwrap();
 
@@ -3876,11 +3972,17 @@ mod tests {
         let mut w = &mut buf;
         let mut stderr = StderrWriter::new(&mut w);
         let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
         let machine = act.machine_name.clone();
 
-        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
-            .await
-            .unwrap();
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            ev(Substituting, drv, &[]),
+        )
+        .await
+        .unwrap();
         relay_substitute_progress(
             &mut stderr,
             &mut act,
@@ -3898,7 +4000,7 @@ mod tests {
 
         // Fetch failed → the drv reverted to Ready → dispatched as a
         // build: `Started` closes the dangling pair.
-        relay_derivation_status(&mut stderr, &mut act, ev(Started, drv, &[]))
+        relay_derivation_status(&mut stderr, &mut act, &mut tails, ev(Started, drv, &[]))
             .await
             .unwrap();
         let build = build_aid(&act, drv);
@@ -3959,10 +4061,16 @@ mod tests {
         let mut w = &mut buf;
         let mut stderr = StderrWriter::new(&mut w);
         let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
 
-        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
-            .await
-            .unwrap();
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            ev(Substituting, drv, &[]),
+        )
+        .await
+        .unwrap();
         relay_substitute_progress(
             &mut stderr,
             &mut act,
@@ -3981,7 +4089,7 @@ mod tests {
         let mut fail_ev = ev(Failed, drv, &[]);
         fail_ev.failure_status = types::BuildResultStatus::DependencyFailed as i32;
         fail_ev.error_message = "dependency failed".into();
-        relay_derivation_status(&mut stderr, &mut act, fail_ev)
+        relay_derivation_status(&mut stderr, &mut act, &mut tails, fail_ev)
             .await
             .unwrap();
 
@@ -4032,9 +4140,14 @@ mod tests {
         let mut act = BuildActivityState::default();
         let (mut tails, _rx) = lazy_tails();
 
-        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
-            .await
-            .unwrap();
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            ev(Substituting, drv, &[]),
+        )
+        .await
+        .unwrap();
         relay_substitute_progress(
             &mut stderr,
             &mut act,
@@ -4091,9 +4204,14 @@ mod tests {
         let mut act = BuildActivityState::default();
         let (mut tails, _rx) = lazy_tails();
 
-        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
-            .await
-            .unwrap();
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            ev(Substituting, drv, &[]),
+        )
+        .await
+        .unwrap();
         relay_substitute_progress(
             &mut stderr,
             &mut act,
@@ -4140,10 +4258,16 @@ mod tests {
         let mut w = &mut buf;
         let mut stderr = StderrWriter::new(&mut w);
         let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
 
-        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
-            .await
-            .unwrap();
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            ev(Substituting, drv, &[]),
+        )
+        .await
+        .unwrap();
         relay_substitute_progress(
             &mut stderr,
             &mut act,
@@ -4193,6 +4317,7 @@ mod tests {
         let mut w = &mut buf;
         let mut stderr = StderrWriter::new(&mut w);
         let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
 
         relay_build_progress(
             &mut stderr,
@@ -4206,9 +4331,14 @@ mod tests {
         .unwrap();
         let root = act.builds_root.expect("BuildStarted opens the root");
 
-        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
-            .await
-            .unwrap();
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            ev(Substituting, drv, &[]),
+        )
+        .await
+        .unwrap();
         // The zero-fetch commit tick: empty URI, partial bar —
         // absorbed frameless, recorded as close input.
         relay_substitute_progress(
@@ -4226,7 +4356,7 @@ mod tests {
         let aids = subst_aids(&act, drv);
         assert_eq!(aids.copy, None, "zero-fetch: no copy child");
 
-        relay_derivation_status(&mut stderr, &mut act, ev(Cached, drv, &[]))
+        relay_derivation_status(&mut stderr, &mut act, &mut tails, ev(Cached, drv, &[]))
             .await
             .unwrap();
 
@@ -4274,6 +4404,7 @@ mod tests {
         let mut w = &mut buf;
         let mut stderr = StderrWriter::new(&mut w);
         let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
 
         relay_build_progress(
             &mut stderr,
@@ -4287,12 +4418,17 @@ mod tests {
         .unwrap();
         let root = act.builds_root.expect("BuildStarted opens the root");
 
-        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
-            .await
-            .unwrap();
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            ev(Substituting, drv, &[]),
+        )
+        .await
+        .unwrap();
         let aids = subst_aids(&act, drv);
 
-        relay_derivation_status(&mut stderr, &mut act, ev(Started, drv, &[]))
+        relay_derivation_status(&mut stderr, &mut act, &mut tails, ev(Started, drv, &[]))
             .await
             .unwrap();
 
@@ -4333,6 +4469,7 @@ mod tests {
         let mut w = &mut buf;
         let mut stderr = StderrWriter::new(&mut w);
         let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
 
         relay_build_progress(
             &mut stderr,
@@ -4346,9 +4483,14 @@ mod tests {
         .unwrap();
         let root = act.builds_root.expect("BuildStarted opens the root");
 
-        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
-            .await
-            .unwrap();
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            ev(Substituting, drv, &[]),
+        )
+        .await
+        .unwrap();
         relay_substitute_progress(
             &mut stderr,
             &mut act,
@@ -4361,7 +4503,7 @@ mod tests {
         )
         .await
         .unwrap();
-        relay_derivation_status(&mut stderr, &mut act, ev(Cached, drv, &[]))
+        relay_derivation_status(&mut stderr, &mut act, &mut tails, ev(Cached, drv, &[]))
             .await
             .unwrap();
 
@@ -4403,6 +4545,7 @@ mod tests {
         let mut w = &mut buf;
         let mut stderr = StderrWriter::new(&mut w);
         let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
 
         relay_build_progress(
             &mut stderr,
@@ -4417,9 +4560,14 @@ mod tests {
         let root = act.builds_root.expect("BuildStarted opens the root");
 
         for drv in [drv_a, drv_b, drv_c] {
-            relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
-                .await
-                .unwrap();
+            relay_derivation_status(
+                &mut stderr,
+                &mut act,
+                &mut tails,
+                ev(Substituting, drv, &[]),
+            )
+            .await
+            .unwrap();
         }
         // A: sourced tick → copy starts → Cached (keeps its mint).
         relay_substitute_progress(
@@ -4434,7 +4582,7 @@ mod tests {
         )
         .await
         .unwrap();
-        relay_derivation_status(&mut stderr, &mut act, ev(Cached, drv_a, &[]))
+        relay_derivation_status(&mut stderr, &mut act, &mut tails, ev(Cached, drv_a, &[]))
             .await
             .unwrap();
         // B: empty commit tick only → Cached (zero-fetch; retires).
@@ -4450,11 +4598,11 @@ mod tests {
         )
         .await
         .unwrap();
-        relay_derivation_status(&mut stderr, &mut act, ev(Cached, drv_b, &[]))
+        relay_derivation_status(&mut stderr, &mut act, &mut tails, ev(Cached, drv_b, &[]))
             .await
             .unwrap();
         // C: no tick at all → Started (fell through; retires).
-        relay_derivation_status(&mut stderr, &mut act, ev(Started, drv_c, &[]))
+        relay_derivation_status(&mut stderr, &mut act, &mut tails, ev(Started, drv_c, &[]))
             .await
             .unwrap();
 
@@ -4555,6 +4703,7 @@ mod tests {
                 let mut mint_w = &mut mint_buf;
                 let mut mint_stderr = StderrWriter::new(&mut mint_w);
                 let mut act = BuildActivityState::default();
+                let (mut tails, _rx) = lazy_tails();
                 relay_build_progress(
                     &mut mint_stderr,
                     &mut act,
@@ -4566,9 +4715,14 @@ mod tests {
                 .await
                 .unwrap();
                 let root = act.builds_root.expect("BuildStarted opens the root");
-                relay_derivation_status(&mut mint_stderr, &mut act, ev(Substituting, drv, &[]))
-                    .await
-                    .unwrap();
+                relay_derivation_status(
+                    &mut mint_stderr,
+                    &mut act,
+                    &mut tails,
+                    ev(Substituting, drv, &[]),
+                )
+                .await
+                .unwrap();
                 relay_substitute_progress(
                     &mut mint_stderr,
                     &mut act,
@@ -4681,10 +4835,16 @@ mod tests {
         let mut w = &mut buf;
         let mut stderr = StderrWriter::new(&mut w);
         let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
 
-        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
-            .await
-            .unwrap();
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            ev(Substituting, drv, &[]),
+        )
+        .await
+        .unwrap();
         let aids = subst_aids(&act, drv);
 
         // The commit tick: empty URI, partial bar — recorded as
@@ -4707,7 +4867,7 @@ mod tests {
             "tracked: absorbed, not dropped"
         );
 
-        relay_derivation_status(&mut stderr, &mut act, ev(Cached, drv, &[]))
+        relay_derivation_status(&mut stderr, &mut act, &mut tails, ev(Cached, drv, &[]))
             .await
             .unwrap();
 
@@ -4742,14 +4902,20 @@ mod tests {
         let mut w = &mut buf;
         let mut stderr = StderrWriter::new(&mut w);
         let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
 
-        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[out]))
-            .await
-            .unwrap();
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            ev(Substituting, drv, &[out]),
+        )
+        .await
+        .unwrap();
         let aids = subst_aids(&act, drv);
         assert_eq!(act.subst_expected, 1);
 
-        relay_derivation_status(&mut stderr, &mut act, ev(Cached, drv, &[out]))
+        relay_derivation_status(&mut stderr, &mut act, &mut tails, ev(Cached, drv, &[out]))
             .await
             .unwrap();
         assert_eq!(subst_count(&act), 0, "Cached must remove subst aids");
@@ -4772,7 +4938,7 @@ mod tests {
         let mut w2 = &mut buf2;
         let mut stderr2 = StderrWriter::new(&mut w2);
         let mut act2 = BuildActivityState::default();
-        relay_derivation_status(&mut stderr2, &mut act2, ev(Cached, drv, &[out]))
+        relay_derivation_status(&mut stderr2, &mut act2, &mut tails, ev(Cached, drv, &[out]))
             .await
             .unwrap();
         assert!(
@@ -4795,10 +4961,16 @@ mod tests {
         let mut w = &mut buf;
         let mut stderr = StderrWriter::new(&mut w);
         let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
 
-        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
-            .await
-            .unwrap();
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            ev(Substituting, drv, &[]),
+        )
+        .await
+        .unwrap();
 
         let relayed = relay_substitute_progress(
             &mut stderr,
@@ -4817,7 +4989,7 @@ mod tests {
         let aids = subst_aids(&act, drv);
         let copy = aids.copy.expect("sourced tick starts the copy child");
 
-        relay_derivation_status(&mut stderr, &mut act, ev(Cached, drv, &[]))
+        relay_derivation_status(&mut stderr, &mut act, &mut tails, ev(Cached, drv, &[]))
             .await
             .unwrap();
 
@@ -4920,13 +5092,19 @@ mod tests {
         let mut w = &mut buf;
         let mut stderr = StderrWriter::new(&mut w);
         let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
 
-        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
-            .await
-            .unwrap();
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            ev(Substituting, drv, &[]),
+        )
+        .await
+        .unwrap();
         let aids = subst_aids(&act, drv);
 
-        relay_derivation_status(&mut stderr, &mut act, ev(Started, drv, &[]))
+        relay_derivation_status(&mut stderr, &mut act, &mut tails, ev(Started, drv, &[]))
             .await
             .unwrap();
         assert_eq!(subst_count(&act), 0, "Started must clear subst aids");
@@ -4957,15 +5135,21 @@ mod tests {
         let mut w = &mut buf;
         let mut stderr = StderrWriter::new(&mut w);
         let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
 
-        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
-            .await
-            .unwrap();
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            ev(Substituting, drv, &[]),
+        )
+        .await
+        .unwrap();
         let aids = subst_aids(&act, drv);
 
         let mut fail_ev = ev(Failed, drv, &[]);
         fail_ev.error_message = "dependency failed".into();
-        relay_derivation_status(&mut stderr, &mut act, fail_ev)
+        relay_derivation_status(&mut stderr, &mut act, &mut tails, fail_ev)
             .await
             .unwrap();
         assert_eq!(
@@ -5001,13 +5185,19 @@ mod tests {
         let mut w = &mut buf;
         let mut stderr = StderrWriter::new(&mut w);
         let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
 
-        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
-            .await
-            .unwrap();
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            ev(Substituting, drv, &[]),
+        )
+        .await
+        .unwrap();
         let _ = subst_aids(&act, drv);
 
-        relay_derivation_status(&mut stderr, &mut act, ev(Completed, drv, &[]))
+        relay_derivation_status(&mut stderr, &mut act, &mut tails, ev(Completed, drv, &[]))
             .await
             .unwrap();
         assert_eq!(
@@ -5035,9 +5225,10 @@ mod tests {
         let mut w = &mut buf;
         let mut stderr = StderrWriter::new(&mut w);
         let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
 
         for d in &drvs {
-            relay_derivation_status(&mut stderr, &mut act, ev(Started, d, &[]))
+            relay_derivation_status(&mut stderr, &mut act, &mut tails, ev(Started, d, &[]))
                 .await
                 .unwrap();
         }
@@ -5046,9 +5237,14 @@ mod tests {
         let aid_c = build_aid(&act, drvs[2]);
 
         // One Completed arrives normally; aids b/c leak.
-        relay_derivation_status(&mut stderr, &mut act, ev(Completed, drvs[0], &[]))
-            .await
-            .unwrap();
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            ev(Completed, drvs[0], &[]),
+        )
+        .await
+        .unwrap();
         assert_eq!(build_count(&act), 2, "two aids leaked into terminal");
 
         let pre_drain_len = buf.len();
@@ -5118,9 +5314,14 @@ mod tests {
         let mut act = BuildActivityState::default();
         let (mut tails, _rx) = lazy_tails();
 
-        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
-            .await
-            .unwrap();
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            ev(Substituting, drv, &[]),
+        )
+        .await
+        .unwrap();
         let aids = subst_aids(&act, drv);
 
         let outcome = apply_snapshot(&mut stderr, &mut act, &mut tails, snap_running(&[]))
@@ -5210,7 +5411,7 @@ mod tests {
         let mut act = BuildActivityState::default();
         let (mut tails, _rx) = lazy_tails();
 
-        relay_derivation_status(&mut stderr, &mut act, ev(Started, drv, &[]))
+        relay_derivation_status(&mut stderr, &mut act, &mut tails, ev(Started, drv, &[]))
             .await
             .unwrap();
         let build_aid = match act.display.get(drv) {
@@ -5231,6 +5432,241 @@ mod tests {
             "kind flip must swap the display family to subst"
         );
         let _ = build_aid;
+    }
+
+    // r[verify gw.display.single-map]
+    /// The LIVE twin of `apply_snapshot_kind_flip_swaps_display_family`:
+    /// a `Substituting` event for a drv with an open build display flips
+    /// the family through the same authority the snapshot reconcile
+    /// uses — the stale actBuild stops, the substitute pair starts, and
+    /// the root's CopyPath denominator bumps.
+    #[tokio::test]
+    async fn live_substituting_kind_flip_swaps_display_family() {
+        use types::DerivationEventKind::*;
+        let drv = "/nix/store/gggggggggggggggggggggggggggggggg-liveflip.drv";
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
+
+        // Root first so the SetExpected{actCopyPath} bump is on-wire.
+        relay_build_progress(
+            &mut stderr,
+            &mut act,
+            &types::build_event::Event::Started(types::BuildStarted {
+                total_derivations: 1,
+                cached_derivations: 0,
+            }),
+        )
+        .await
+        .unwrap();
+        let root = act.builds_root.expect("root exists");
+
+        relay_derivation_status(&mut stderr, &mut act, &mut tails, ev(Started, drv, &[]))
+            .await
+            .unwrap();
+        let aid = build_aid(&act, drv);
+
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            ev(Substituting, drv, &[]),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(act.display.get(drv), Some(DrvDisplay::Subst(_))),
+            "live kind flip must swap the display family to subst (got {:?})",
+            act.display.get(drv)
+        );
+
+        let frames = read_frames(buf).await;
+        assert!(
+            frames.contains(&Frame::Stop(aid)),
+            "the dead build execution's stop_activity frame must be written"
+        );
+        let copy_bumps: Vec<_> = set_expected_results(&frames, root)
+            .into_iter()
+            .filter(|f| f.first() == Some(&FVal::Int(ActivityType::CopyPath as u64)))
+            .collect();
+        assert_eq!(
+            copy_bumps,
+            vec![&vec![
+                FVal::Int(ActivityType::CopyPath as u64),
+                FVal::Int(1)
+            ]],
+            "the root SetExpected{{actCopyPath}} denominator bump must be emitted"
+        );
+    }
+
+    // r[verify gw.display.single-map]
+    /// After the live kind flip, `SubstituteProgress` ticks must relay.
+    /// Pre-fix every tick dropped as `DroppedUntracked` — no `Subst`
+    /// entry existed for the drv, so the download bar never moved.
+    #[tokio::test]
+    async fn substitute_progress_relays_after_live_kind_flip() {
+        use types::DerivationEventKind::*;
+        let drv = "/nix/store/hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh-livetick.drv";
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
+
+        relay_derivation_status(&mut stderr, &mut act, &mut tails, ev(Started, drv, &[]))
+            .await
+            .unwrap();
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            ev(Substituting, drv, &[]),
+        )
+        .await
+        .unwrap();
+
+        let relay = relay_substitute_progress(
+            &mut stderr,
+            &mut act,
+            types::SubstituteProgress {
+                derivation_path: drv.into(),
+                bytes_done: 7,
+                bytes_expected: 100,
+                upstream_uri: "https://cache.example".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            relay,
+            SubstRelay::Relayed,
+            "progress after the live flip must relay, not drop"
+        );
+    }
+
+    // r[verify gw.display.single-map]
+    /// A flipped drv terminates via `Cached`; the flip means terminus
+    /// finds NOTHING left to drain — the "upstream event loss" warn is
+    /// structurally silent for this path (nothing was lost).
+    #[tokio::test]
+    async fn cached_after_live_flip_leaves_no_drain_set() {
+        use types::DerivationEventKind::*;
+        let drv = "/nix/store/jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj-livecached.drv";
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
+
+        relay_derivation_status(&mut stderr, &mut act, &mut tails, ev(Started, drv, &[]))
+            .await
+            .unwrap();
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            ev(Substituting, drv, &[]),
+        )
+        .await
+        .unwrap();
+        relay_derivation_status(&mut stderr, &mut act, &mut tails, ev(Cached, drv, &[]))
+            .await
+            .unwrap();
+        assert!(
+            act.display.is_empty(),
+            "Cached after the live flip closes the (single) display entry — drain set empty, got {:?}",
+            act.display
+        );
+
+        let pre_drain_len = buf.len();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        drain_unstopped_activities(&mut stderr, &mut act)
+            .await
+            .unwrap();
+        assert_eq!(
+            buf.len(),
+            pre_drain_len,
+            "the terminus drain emits ZERO frames for this path"
+        );
+    }
+
+    // r[verify gw.display.single-map]
+    /// The live flip cuts the dead execution's log tail exactly as the
+    /// snapshot arm does: one drv flipped live, one flipped through the
+    /// snapshot reconcile — both subscriptions end drain-flagged.
+    #[tokio::test]
+    async fn live_flip_cuts_the_stale_tail() {
+        use types::DerivationEventKind::*;
+        let live = "/nix/store/kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk-livetail.drv";
+        let snap = "/nix/store/llllllllllllllllllllllllllllllll-snaptail.drv";
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
+
+        for drv in [live, snap] {
+            relay_derivation_status(
+                &mut stderr,
+                &mut act,
+                &mut tails,
+                types::DerivationEvent {
+                    exec_id: "01900000-0000-7000-8000-0000000000e1".into(),
+                    ..ev(Started, drv, &[])
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                tails.draining(drv),
+                Some(false),
+                "the execution's subscription opens live"
+            );
+        }
+
+        // Live flip for `live` — asserted BEFORE any snapshot drive, so
+        // the gone-reconcile (which also cuts build tails) cannot mask
+        // a missing live cut.
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            ev(Substituting, live, &[]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tails.draining(live),
+            Some(true),
+            "the live flip must cut the dead execution's tail (parity with the snapshot arm)"
+        );
+
+        // Snapshot kind-flip for `snap` — the parity baseline. `live`
+        // rides along as a gone entry (its pair closes; no tail effect).
+        apply_snapshot(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            snap_running(&[(
+                snap,
+                "01900000-0000-7000-8000-0000000000e2",
+                types::AttemptKind::Materialization,
+            )]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tails.draining(snap),
+            Some(true),
+            "the snapshot flip cuts the tail (the parity baseline)"
+        );
     }
 
     /// The live Progress arm and the snapshot correction emit the same
