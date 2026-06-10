@@ -6,18 +6,18 @@
 //! Two distinct legs, asserting two distinct enforcement layers:
 //!
 //! * **Unprivileged leg** (`PrivDrop` to the build uid): the castore
-//!   mount is NOT MS_RDONLY — write protection is `default_permissions`
-//!   over root-owned 0444/0555 attrs, so the kernel rejects every
-//!   mutation with EACCES/EPERM before the FUSE daemon ever sees it.
-//!   This is the layer that protects inputs from build processes.
+//!   mount is MS_RDONLY, so the kernel's sb_permission rejects every
+//!   mutation (and `access(W_OK)`) with EROFS before the mode bits or
+//!   the FUSE daemon are consulted — the same answers a ro-tmpfs
+//!   gives. `default_permissions` over root-owned 0444/0555 attrs
+//!   remains underneath as defense in depth.
 //!
-//! * **Root leg**: root holds CAP_DAC_OVERRIDE, passes the kernel's
-//!   default_permissions check, and the operation reaches the FUSE
-//!   daemon. POSIX/xfstests expect EROFS from a read-only filesystem;
-//!   what the castore-FUSE actually returns is fuser's default reply
-//!   for each unimplemented op — the divergences are documented
-//!   findings (PLAN.md F-C/F-D), asserted so they cannot drift
-//!   silently.
+//! * **Root leg**: root holds CAP_DAC_OVERRIDE; on an MS_RDONLY mount
+//!   the VFS still answers EROFS for mutations, and any op that does
+//!   reach the FUSE daemon is denied EROFS by its write-op handlers
+//!   (`r[builder.fs.write-ops-erofs]`). The probe accepts EROFS or the
+//!   historically-documented fuser default (PLAN.md F-C/F-D) so a
+//!   divergence cannot drift silently.
 
 use std::fs;
 use std::io;
@@ -117,17 +117,20 @@ pub fn generic_126_exec_access(ctx: &Ctx) -> anyhow::Result<Outcome> {
                 AccessFlags::R_OK,
                 None,
             ),
+            // MS_RDONLY mount: sb_permission denies W_OK with EROFS
+            // before the mode bits are consulted — the same answer a
+            // ro-tmpfs gives, and what `test -w` probers rely on.
             (
                 "W_OK on a read-only input",
                 &plain.path,
                 AccessFlags::W_OK,
-                Some(Errno::EACCES),
+                Some(Errno::EROFS),
             ),
             (
                 "W_OK on an input directory",
                 &ctx.manifest.seq_dir.path,
                 AccessFlags::W_OK,
-                Some(Errno::EACCES),
+                Some(Errno::EROFS),
             ),
         ];
         for (what, rel, flags, expect) in probes {
@@ -145,16 +148,14 @@ pub fn generic_126_exec_access(ctx: &Ctx) -> anyhow::Result<Outcome> {
 }
 
 /// generic/050 + generic/123 (adapted): every mutation attempted by
-/// the build uid fails — EACCES from the kernel's default_permissions
-/// check over the served root-owned 0444/0555 modes (EPERM for the
-/// ownership-gated setattr calls) — and the tree is byte-identical
-/// afterwards. generic/123's four operations (overwrite, append,
-/// delete, move of a root-created file) are exactly the O_TRUNC,
-/// O_APPEND, unlink, and rename probes below, so it folds in here
-/// rather than as a separate check. A regression lets builds scribble
-/// on (or appear to scribble on) shared inputs. The mount is not
-/// MS_RDONLY, so EROFS is structurally impossible on this leg; the
-/// EROFS intent is covered by the root leg.
+/// the build uid fails with EROFS — the MS_RDONLY mount makes the
+/// kernel's sb_permission deny writes before the mode bits (which
+/// would say EACCES/EPERM) are even consulted — and the tree is
+/// byte-identical afterwards. generic/123's four operations
+/// (overwrite, append, delete, move of a root-created file) are
+/// exactly the O_TRUNC, O_APPEND, unlink, and rename probes below, so
+/// it folds in here rather than as a separate check. A regression lets
+/// builds scribble on (or appear to scribble on) shared inputs.
 pub fn generic_050_write_protection_unprivileged(ctx: &Ctx) -> anyhow::Result<Outcome> {
     let plain = plain_unique_file(ctx)?;
     let exec = ctx
@@ -180,7 +181,7 @@ pub fn generic_050_write_protection_unprivileged(ctx: &Ctx) -> anyhow::Result<Ou
         let probes: Vec<Probe> = vec![
             (
                 "open(O_WRONLY|O_TRUNC) on a read-only input",
-                Errno::EACCES,
+                Errno::EROFS,
                 Box::new(|| {
                     fs::OpenOptions::new()
                         .write(true)
@@ -191,12 +192,12 @@ pub fn generic_050_write_protection_unprivileged(ctx: &Ctx) -> anyhow::Result<Ou
             ),
             (
                 "open(O_WRONLY|O_APPEND) on a read-only input",
-                Errno::EACCES,
+                Errno::EROFS,
                 Box::new(|| fs::OpenOptions::new().append(true).open(&small).map(drop)),
             ),
             (
                 "create a new file",
-                Errno::EACCES,
+                Errno::EROFS,
                 Box::new(|| {
                     fs::OpenOptions::new()
                         .write(true)
@@ -207,37 +208,37 @@ pub fn generic_050_write_protection_unprivileged(ctx: &Ctx) -> anyhow::Result<Ou
             ),
             (
                 "mkdir a new directory",
-                Errno::EACCES,
+                Errno::EROFS,
                 Box::new(|| fs::create_dir(&new_dir)),
             ),
             (
                 "unlink a read-only input",
-                Errno::EACCES,
+                Errno::EROFS,
                 Box::new(|| fs::remove_file(&small)),
             ),
             (
                 "rename a read-only input",
-                Errno::EACCES,
+                Errno::EROFS,
                 Box::new(|| fs::rename(&small, &renamed)),
             ),
             (
                 "create a symlink",
-                Errno::EACCES,
+                Errno::EROFS,
                 Box::new(|| std::os::unix::fs::symlink("foo", &new_symlink)),
             ),
             (
                 "truncate a read-only input",
-                Errno::EACCES,
+                Errno::EROFS,
                 Box::new(|| nix::unistd::truncate(&big, 1).map_err(io::Error::from)),
             ),
             (
                 "chmod a read-only input",
-                Errno::EPERM,
+                Errno::EROFS,
                 Box::new(|| fs::set_permissions(&tool, fs::Permissions::from_mode(0o700))),
             ),
             (
                 "utimensat with explicit times",
-                Errno::EPERM,
+                Errno::EROFS,
                 Box::new(|| {
                     utimensat(AT_FDCWD, &small, &ts, &ts, UtimensatFlags::FollowSymlink)
                         .map_err(io::Error::from)
@@ -308,16 +309,13 @@ pub fn generic_294_eexist_unprivileged(ctx: &Ctx) -> anyhow::Result<Outcome> {
 /// generic/050 + generic/294 (root leg): operations that pass the
 /// kernel's default_permissions check (root holds CAP_DAC_OVERRIDE)
 /// reach the FUSE daemon itself. POSIX/xfstests expect every mutation
-/// of a read-only filesystem to fail with EROFS; the castore-FUSE
-/// instead surfaces fuser's default reply for each unimplemented write
-/// op. Asserted as `EROFS or the documented actual` so the divergence
-/// is pinned (a future real-EROFS implementation keeps this green) and
-/// printed as FINDING lines for the VM log.
-///
-/// FINDING F-D (PLAN.md): unlink/mkdir/rmdir/create/rename/chmod/
-/// truncate/utimens return ENOSYS ("Function not implemented") and
-/// symlink/link return EPERM instead of EROFS, because the mount is
-/// not MS_RDONLY and the write ops are denied in the FUSE handlers.
+/// of a read-only filesystem to fail with EROFS; the MS_RDONLY mount
+/// answers that in the VFS, and anything that still reaches the FUSE
+/// daemon is denied EROFS by its write-op handlers
+/// (`r[builder.fs.write-ops-erofs]`). Asserted as `EROFS or the
+/// historically-documented actual` (PLAN.md F-D: fuser's
+/// ENOSYS/EPERM defaults from before those layers existed) so any
+/// divergence is pinned and printed as FINDING lines for the VM log.
 pub fn generic_294_erofs_battery_root(ctx: &Ctx) -> anyhow::Result<Outcome> {
     ensure!(
         nix::unistd::geteuid().is_root(),
