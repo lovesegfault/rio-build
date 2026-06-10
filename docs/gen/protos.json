@@ -80,7 +80,7 @@
       "ImportSlaCorpusRequest",
       "ImportSlaCorpusResponse"
     ],
-    "doc": "Admin/status wire types — ClusterStatus, ListExecutors/Builds/Tenants,"
+    "doc": "Admin/status wire types — ClusterStatus, ListExecutors/Builds/Tenants, ClearPoison, GetSpawnIntents."
   },
   "build_types.proto": {
     "services": [],
@@ -123,14 +123,14 @@
       "CancelBuildRequest",
       "CancelBuildResponse"
     ],
-    "doc": "Build lifecycle wire types — SubmitBuild/WatchBuild/QueryBuild/CancelBuild"
+    "doc": "Build lifecycle wire types — SubmitBuild/WatchBuild/QueryBuild/CancelBuild requests, the BuildEvent stream, and the pull-mode dispatch payloads (PullAssignment / ReportOutcome)."
   },
   "builder.proto": {
     "services": [
       "ExecutorService"
     ],
     "messages": [],
-    "doc": "Executor-facing RPCs served by the rio-scheduler process."
+    "doc": "Executor-facing RPCs served by the rio-scheduler process. \"Executor\" is the generic term for both builders (airgapped, arbitrary derivation code) and fetchers (open egress, FOD-only, hash-check bounded) — same binary, same pair of unaries, different RIO_EXECUTOR_KIND env."
   },
   "dag.proto": {
     "services": [],
@@ -219,6 +219,6 @@
       "AddUpstreamRequest",
       "RemoveUpstreamRequest"
     ],
-    "doc": "Shared primitive message types — imported by every other .proto in the"
+    "doc": "Shared primitive message types — imported by every other .proto in the package."
   }
 }

@@ -638,6 +638,13 @@ fn cli() -> Result<serde_json::Value> {
 }
 
 fn protos() -> Result<serde_json::Value> {
+    protos_in(&repo_root().join("rio-proto/proto"))
+}
+
+/// The production walk, dir-parameterized so the unit tests drive a
+/// REAL temp dir through the same path (the module_summary fixture
+/// precedent, R13-conformant).
+fn protos_in(proto_dir: &Path) -> Result<serde_json::Value> {
     // `service X` declarations + first `//` comment per .proto file.
     // crate-structure.typ's proto/ block derives from this — last
     // hand-tree (R7-030: it said BuilderService; file defines
@@ -652,7 +659,7 @@ fn protos() -> Result<serde_json::Value> {
     let svc_re = Regex::new(r"(?m)^service\s+(\w+)\b")?;
     let msg_re = Regex::new(r"(?m)^message\s+(\w+)\b")?;
     let mut out = BTreeMap::<String, serde_json::Value>::new();
-    for entry in fs::read_dir(repo_root().join("rio-proto/proto"))? {
+    for entry in fs::read_dir(proto_dir)? {
         let p = entry?.path();
         if p.extension().is_some_and(|e| e == "proto") {
             let body = fs::read_to_string(&p)?;
@@ -664,11 +671,28 @@ fn protos() -> Result<serde_json::Value> {
                 .captures_iter(&body)
                 .map(|c| c[1].to_string())
                 .collect();
-            let doc = body
+            // The LEADING `//` comment paragraph (consecutive `//`
+            // lines from the first comment line; a bare `//` or a
+            // non-comment line ends it), minted through the validated
+            // constructor (merged_bug_026 — this emitter previously
+            // took the first PHYSICAL line with no join/cut/gate, and
+            // committed protos.json shipped three mid-sentence
+            // fragments).
+            let mut para: Vec<&str> = Vec::new();
+            for line in body
                 .lines()
-                .find(|l| l.trim_start().starts_with("//"))
-                .map(|l| l.trim_start().trim_start_matches("//").trim().to_string())
-                .unwrap_or_default();
+                .skip_while(|l| !l.trim_start().starts_with("//"))
+            {
+                let Some(rest) = line.trim_start().strip_prefix("//") else {
+                    break;
+                };
+                let content = rest.trim();
+                if content.is_empty() {
+                    break;
+                }
+                para.push(content);
+            }
+            let doc = summary::summary_of(&para.join(" "), &p)?.into_string();
             out.insert(
                 p.file_name()
                     .and_then(|n| n.to_str())
@@ -697,6 +721,115 @@ fn workspace_members() -> Result<Vec<String>> {
 
 /// One module's operator-surface summary (merged_bug_005): the file's
 /// LEADING `//!` doc paragraph — consecutive `//!` lines from line 1,
+/// The validated operator-surface summary mint (merged_bug_026): ONE
+/// typed constructor consumed by EVERY emitter of generated
+/// operator-surface text — `module_summary` (modules.json) and
+/// `protos_in` (protos.json) mint through it (the config-description
+/// emitter shares its CUT; see the census note at the call site).
+/// The newtype's field is private to this module, so a sibling
+/// emitter cannot fabricate a `Summary` around the gate.
+mod summary {
+    use std::path::Path;
+
+    use anyhow::Result;
+
+    /// The CLOSED abbreviation alphabet the sentence tokenizer owns.
+    /// Author-curated (natural language has no generator — divergence
+    /// disclosed in the introducing commit); each entry ships with an
+    /// in-tree exemplar from the committed abbreviation census
+    /// (generator: rg -no '\b(e\.g\.|i\.e\.|etc\.|cf\.|vs\.)\s+[A-Z]'
+    /// --type rust):
+    ///   "e.g." — rio-builder/src/banner.rs:100
+    ///   "i.e." — rio-lease/src/lib.rs:2684
+    ///   "etc." — rio-cli/src/tenants.rs:75 (and xtask/src/k8s/eks/
+    ///            destroy.rs:15, the latent modules.json near-miss)
+    ///   "cf."  — reserved (no in-tree exemplar yet; kept because the
+    ///            class is the standard Latin set and removal would
+    ///            re-open the hole the day one lands)
+    ///   "vs."  — rio-builder/src/hw_bench.rs:467
+    /// Extension is UNDER TEST: the in-constructor reject below fails
+    /// the regen on any output that still ENDS at a member, so a new
+    /// abbreviation surfaces as a loud regen error naming the file,
+    /// never a silent fragment.
+    pub(super) const ABBREVIATIONS: &[&str] = &["e.g.", "i.e.", "etc.", "cf.", "vs."];
+
+    /// A validated one-line operator-surface summary. The ONLY mint
+    /// is [`summary_of`]; the field is private.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) struct Summary(String);
+
+    impl Summary {
+        pub(super) fn into_string(self) -> String {
+            self.0
+        }
+    }
+
+    /// Total mint: whitespace-collapse/join, abbreviation-aware
+    /// sentence cut, then the two fail-closed gates — terminal
+    /// punctuation, and no output may END at an alphabet member (the
+    /// cut the lookahead missed cannot ship). Errors name `origin`.
+    pub(super) fn summary_of(source: &str, origin: &Path) -> Result<Summary> {
+        let cut = first_sentence(source);
+        if !cut.is_empty() && !ends_in_terminal_punctuation(&cut) {
+            anyhow::bail!(
+                "summary for {} does not end in terminal punctuation: {cut:?} — \
+                 end the leading doc paragraph's first sentence with `.`, `!` or `?` \
+                 (it is operator-surface text in docs/gen)",
+                origin.display()
+            );
+        }
+        if let Some(abbr) = trailing_abbreviation(&cut) {
+            anyhow::bail!(
+                "summary for {} ends at the abbreviation {abbr:?}: {cut:?} — the \
+                 tokenizer's lookahead missed a cut (extend the sentence or the \
+                 ABBREVIATIONS alphabet, under test)",
+                origin.display()
+            );
+        }
+        Ok(Summary(cut))
+    }
+
+    /// The abbreviation-aware sentence cut (shared with the
+    /// config-description emitter): first `". "` + uppercase boundary
+    /// whose preceding token is NOT an alphabet member; the whole
+    /// collapsed string when no real boundary exists. Intra-doc links
+    /// `[foo]` are kept as-is — typst renders square brackets
+    /// literally.
+    pub(super) fn first_sentence(desc: &str) -> String {
+        let collapsed = desc.split_whitespace().collect::<Vec<_>>().join(" ");
+        let bytes = collapsed.as_bytes();
+        for i in 0..bytes.len().saturating_sub(2) {
+            if bytes[i] == b'.'
+                && bytes[i + 1] == b' '
+                && bytes[i + 2].is_ascii_uppercase()
+                && trailing_abbreviation(&collapsed[..=i]).is_none()
+            {
+                return collapsed[..=i].to_string();
+            }
+        }
+        collapsed
+    }
+
+    /// `[.!?]` optionally followed by closing quotes/brackets.
+    pub(super) fn ends_in_terminal_punctuation(s: &str) -> bool {
+        s.trim_end_matches(['"', '\'', '`', ')', ']', '}'])
+            .ends_with(['.', '!', '?'])
+    }
+
+    /// The alphabet member `s` ends at, if any — token-boundary
+    /// checked (start-of-string or a preceding space/opening bracket/
+    /// quote), so "Pkg." or "approx." never false-match a member's
+    /// suffix.
+    fn trailing_abbreviation(s: &str) -> Option<&'static str> {
+        ABBREVIATIONS.iter().copied().find(|a| {
+            s.ends_with(a) && {
+                let pre = &s[..s.len() - a.len()];
+                pre.is_empty() || pre.ends_with([' ', '(', '"', '\'', '`', '['])
+            }
+        })
+    }
+}
+
 /// a blank `//!` ends the paragraph — cut at the first sentence
 /// boundary, then validated: a non-empty summary MUST end in terminal
 /// punctuation (`.`/`!`/`?`, optionally behind closing
@@ -724,22 +857,7 @@ fn module_summary(p: &Path) -> Result<String> {
         }
         para.push(content);
     }
-    let summary = first_sentence(&para.join(" "));
-    if !summary.is_empty() && !ends_in_terminal_punctuation(&summary) {
-        anyhow::bail!(
-            "module summary for {} does not end in terminal punctuation: {summary:?} — \
-             end the leading `//!` paragraph's first sentence with `.`, `!` or `?` \
-             (it is operator-surface text in docs/gen/modules.json)",
-            p.display()
-        );
-    }
-    Ok(summary)
-}
-
-/// `[.!?]` optionally followed by closing quotes/brackets.
-fn ends_in_terminal_punctuation(s: &str) -> bool {
-    s.trim_end_matches(['"', '\'', '`', ')', ']', '}'])
-        .ends_with(['.', '!', '?'])
+    Ok(summary::summary_of(&para.join(" "), p)?.into_string())
 }
 
 fn walk_modules(
@@ -1109,11 +1227,17 @@ fn walk_props(
             "key": dotted,
             "type": describe_type(resolved, ref_name.as_deref()),
             "default": render_default(&default),
+            // Census note (merged_bug_026): this emitter shares the
+            // constructor's abbreviation-aware CUT but not its gates —
+            // schema descriptions are rustdoc fragments whose shape is
+            // owned by the per-crate frozen config-schema fixtures and
+            // the docs-data-fresh drift gate (classification:
+            // constructor-cut, gate-exempt).
             "description": prop
                 .get("description")
                 .or_else(|| resolved.get("description"))
                 .and_then(|v| v.as_str())
-                .map(first_sentence)
+                .map(summary::first_sentence)
                 .unwrap_or_default(),
         }));
     }
@@ -1205,24 +1329,6 @@ fn is_emptyish(v: &serde_json::Value) -> bool {
         || matches!(v, serde_json::Value::String(s) if s.is_empty())
 }
 
-/// Doc comments are paragraphs of design rationale; the reference
-/// table wants the one-line summary. Take the first sentence (up to
-/// the first `. ` followed by an uppercase letter, or the whole
-/// string if no sentence break). Intra-doc links `[foo]` are kept
-/// as-is — typst renders square brackets literally.
-fn first_sentence(desc: &str) -> String {
-    let collapsed = desc.split_whitespace().collect::<Vec<_>>().join(" ");
-    // Find ". " followed by uppercase (real sentence boundary, not
-    // "e.g. foo" or "1.5").
-    let bytes = collapsed.as_bytes();
-    for i in 0..bytes.len().saturating_sub(2) {
-        if bytes[i] == b'.' && bytes[i + 1] == b' ' && bytes[i + 2].is_ascii_uppercase() {
-            return collapsed[..=i].to_string();
-        }
-    }
-    collapsed
-}
-
 #[cfg(test)]
 mod tests {
     /// merged_bug_005 red #1: the module-index summary must be the
@@ -1251,6 +1357,60 @@ mod tests {
              terminal frame.",
             "the summary must be the full first sentence (paragraph-joined, \
              sentence-cut), not the first physical line's mid-sentence fragment"
+        );
+    }
+
+    /// merged_bug_026 red #1: the proto-header doc must be the FULL
+    /// first sentence of the leading `//` comment paragraph, minted
+    /// through the validated constructor — not the first PHYSICAL
+    /// line. Fixture = a real temp `.proto` through the production
+    /// walk (the types.proto shape verbatim: the committed
+    /// protos.json fragment was "Shared primitive message types —
+    /// imported by every other .proto in the").
+    #[test]
+    fn proto_doc_is_the_full_first_sentence_of_the_header() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("types.proto"),
+            "syntax = \"proto3\";\npackage rio.types;\n\n\
+             // Shared primitive message types — imported by every other .proto in the\n\
+             // package. Domain split:\n\
+             //\n\
+             //   - dag.proto — DerivationNode/Edge.\n\n\
+             message Hash { bytes sha256 = 1; }\n",
+        )
+        .expect("write fixture");
+        let out = super::protos_in(dir.path()).expect("walk");
+        assert_eq!(
+            out["types.proto"]["doc"],
+            "Shared primitive message types — imported by every other .proto in the package.",
+            "the proto doc must be the full first sentence (paragraph-joined, \
+             sentence-cut, gate-checked), not the first physical line's \
+             mid-sentence fragment"
+        );
+    }
+
+    /// merged_bug_026 red #2: a summary must never END at an
+    /// abbreviation — `". " + uppercase` after "e.g." is not a
+    /// sentence boundary, and the terminal-punctuation gate
+    /// structurally cannot catch the fragment (it ends in "."). The
+    /// double hole in one transcript: pre-fix the cut produced
+    /// "Sweep stale rows (e.g." AND the gate passed it.
+    #[test]
+    fn summary_never_ends_at_an_abbreviation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("sweep.rs"),
+            "//! Sweep stale rows (e.g. S3 tombstones). Mirrors the build sweep.\n\
+             fn x() {}\n",
+        )
+        .expect("write fixture");
+        let mut out = Vec::new();
+        super::walk_modules(dir.path(), "", 0, &mut out).expect("walk");
+        assert_eq!(
+            out[0]["doc"], "Sweep stale rows (e.g. S3 tombstones).",
+            "the cut must skip the abbreviation pseudo-boundary and take the \
+             real sentence end"
         );
     }
 
