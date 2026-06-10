@@ -3517,19 +3517,22 @@ rec {
     # laws (bughunt-4 S4: bug_284 + merged_bug_218) plus the bughunt-5
     # S7 COMMIT-CLASSIFICATION axis (merged_bug_022: witness at the
     # durability point, three-valued attribution, own-commit
-    # recognition; store.gc.collect-cadence+3). DEDICATED regime per
-    # the gcDrainPass precedent: the time axis must not multiply the
+    # recognition) plus the bughunt-6 S6 SIBLING-STAMP axis
+    # (merged_bug_021: the own-held-anchor recognition law —
+    # siblingStampAttempt + the commit-step interposition nondet;
+    # store.gc.collect-cadence+4). DEDICATED regime per the
+    # gcDrainPass precedent: the time axis must not multiply the
     # other gc regimes.
-    # Measured 2026-06-09 (TLC exhaustive, INTERVAL=4 / MAX_TIME=12,
-    # workers=4, axis ON): 74,869 generated / 12,506 distinct, [ok] in
-    # ~5s — the default 1800s budget is >300x the measurement.
-    # Byte-identity probe of the LEGACY lane (COMMIT_CLASSIFY=false,
-    # the pre-extension main bindings, F16 convention): 4,347
-    # generated / 1,926 distinct — EXACTLY the pre-extension record,
-    # so the two axis-off calibration regimes below are
-    # state-space-identical to their pre-extension selves (the round-5
-    # vars evolve as pure functions of the legacy trajectory).
-    # r[verify store.gc.collect-cadence+3]
+    # Measured 2026-06-10 (TLC exhaustive, INTERVAL=4 / MAX_TIME=12,
+    # SIBLING_STAMPS axis ON in main): main [ok] in ~1.5s — the
+    # default 1800s budget is >1000x the measurement. The four
+    # pre-existing calibration twins re-verified [violation] at
+    # 0.9-1.2s each with the new axis OFF (SIBLING_STAMPS=false: the
+    # action is disabled and stampInterposedRecognitions evolves as
+    # the constant 0 — the F16 byte-identity convention; the earlier
+    # bughunt-5 probe record stands: legacy lane 4,347 generated /
+    # 1,926 distinct, exactly the pre-extension space).
+    # r[verify store.gc.collect-cadence+4]
     quint-gc-cadence = mkQuintCheck {
       name = "gc-cadence";
       spec = "gcCadence";
@@ -3545,7 +3548,7 @@ rec {
     # The bug_284 red, deterministically: two checks inside one
     # interval run exactly ONE heavy cycle (the second is throttled by
     # the attempt stamp) and the success stamp stays unwritten.
-    # r[verify store.gc.collect-cadence+3]
+    # r[verify store.gc.collect-cadence+4]
     quint-gc-cadence-runs = mkQuintRunCheck {
       name = "gc-cadence-runs";
       spec = "gcCadence";
@@ -3573,19 +3576,53 @@ rec {
     # RECOGNITION trace and the proven-foreign-winner trace are both
     # reachable — noFalseLost polices paths the regime actually
     # explores. Measured: [violation] in <1s each, TLC.
-    # r[verify store.gc.collect-cadence+3]
+    # r[verify store.gc.collect-cadence+4]
     quint-gc-cadence-witness-response-lost-recognized = mkQuintWitnessCheck {
       name = "gc-cadence-witness-response-lost-recognized";
       spec = "gcCadence";
       main = "gcCadenceMain";
       witness = "noRecognizedResponseLost";
     };
-    # r[verify store.gc.collect-cadence+3]
+    # r[verify store.gc.collect-cadence+4]
     quint-gc-cadence-witness-proven-foreign = mkQuintWitnessCheck {
       name = "gc-cadence-witness-proven-foreign";
       spec = "gcCadence";
       main = "gcCadenceMain";
       witness = "noProvenForeignWinner";
+    };
+
+    # Non-vacuity witness for the round-6 own-held-anchor law (must
+    # VIOLATE in the main regime, merged_bug_021): own-commit
+    # recognition WITH a sibling attempt stamp interposed is actually
+    # explored — noFalseLost's verdict is about a space where the
+    # interposition really happens. Measured: [violation] in ~1.1s,
+    # TLC (solo-timed 2026-06-10).
+    # r[verify store.gc.collect-cadence+4]
+    quint-gc-cadence-witness-stamp-interposed = mkQuintWitnessCheck {
+      name = "gc-cadence-witness-stamp-interposed";
+      spec = "gcCadence";
+      main = "gcCadenceMain";
+      witness = "noStampInterposedRecognition";
+    };
+
+    # CALIBRATION (expect-violation, merged_bug_021): the as-built
+    # recognition conjunct reading the SHARED attempt clock — a
+    # sibling's stamp interposing between our applied-but-
+    # response-lost commit and the probe forges "another holder
+    # committed first" out of our own landed write; noFalseLost
+    # falsifies. KILL-ISOLATED (R16): with the zero-rows/release
+    # toggles OFF, falseLost is reachable ONLY through the interposed
+    # shape-2 cell (shape 1 stays ok, shape 3's commit_failed cells
+    # all have ourCommitLands = false), so the violation dies through
+    # THIS conjunct with the sibling lanes proven intact. Same regime
+    # constants as the main regime, axis ON. Measured: [violation] in
+    # ~1.3s, TLC (solo-timed 2026-06-10).
+    # r[verify store.gc.collect-cadence+4]
+    quint-gc-cadence-calib-shared-clock-anchor = mkQuintWitnessCheck {
+      name = "gc-cadence-calib-shared-clock-anchor";
+      spec = "gcCadence";
+      main = "gcCadenceCalibSharedClockAnchor";
+      witness = "noFalseLost";
     };
 
     # CALIBRATION (expect-violation, merged_bug_022): the as-built
@@ -3595,7 +3632,7 @@ rec {
     # at expected+1) is reported lost; noFalseLost falsifies. Same
     # regime constants as the main regime. Measured: [violation] in
     # <1s, TLC.
-    # r[verify store.gc.collect-cadence+3]
+    # r[verify store.gc.collect-cadence+4]
     quint-gc-cadence-calib-zero-rows-foreign = mkQuintWitnessCheck {
       name = "gc-cadence-calib-zero-rows-foreign";
       spec = "gcCadence";
@@ -3609,7 +3646,7 @@ rec {
     # whose lock release fails is reported lost; noFalseLost
     # falsifies. Same regime constants as the main regime. Measured:
     # [violation] in <1s, TLC.
-    # r[verify store.gc.collect-cadence+3]
+    # r[verify store.gc.collect-cadence+4]
     quint-gc-cadence-calib-release-fails = mkQuintWitnessCheck {
       name = "gc-cadence-calib-release-fails";
       spec = "gcCadence";
@@ -3710,7 +3747,7 @@ rec {
     # onto one predicate); shadow commits stamp a fresh estimate
     # WITHOUT answering the cadence question; every replica publishes
     # its gauges from a 60s row read (spawn_gc_gauge_publisher).
-    # r[verify store.gc.collect-cadence+3]
+    # r[verify store.gc.collect-cadence+4]
     quint-gc-coordination-main = mkQuintCheck {
       name = "gc-coordination-main";
       spec = "chunkCollect";

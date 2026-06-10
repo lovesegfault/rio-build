@@ -1,6 +1,6 @@
 // gcCadence.qnt — the backstop's ATTEMPT-CADENCE and COMMIT-GATES-OK
 // laws (bughunt-4 S4: bug_284 + merged_bug_218,
-// store.gc.collect-cadence+3; `rio-store/src/gc/{collect,state}.rs`
+// store.gc.collect-cadence+4; `rio-store/src/gc/{collect,state}.rs`
 // `stamp_attempt` / `CycleCommitted`), extended with the bughunt-5 S7
 // COMMIT-CLASSIFICATION axis (merged_bug_022: witness at the
 // durability point, three-valued attribution, own-commit recognition).
@@ -8,7 +8,7 @@
 
 // ===========================================================================
 // CADENCE + COMMIT-WITNESS LAWS (bughunt-4 S4: bug_284 + merged_bug_218,
-// store.gc.collect-cadence+3).
+// store.gc.collect-cadence+4).
 //
 // Laws of the backstop loop:
 //
@@ -76,6 +76,27 @@ module gcCadence {
   /// after the release instead of at the durability point).
   const CALIB_RELEASE_FAILS: bool
 
+  /// Round-6 axis gate (merged_bug_021): enables the SIBLING attempt
+  /// stamp — any replica lawfully writes the shared attempt clock
+  /// with no dueness gate (run_gc phase 3: an operator GC must not
+  /// abort over cadence bookkeeping) whenever the advisory lock is
+  /// free (the dead-session world), both as a first-class action
+  /// (siblingStampAttempt, deferring the backstop) and as the
+  /// commit-step interposition nondet the classifier consults.
+  /// Default-FALSE so the pre-extension regimes stay
+  /// state-space-identical (the new var evolves as a pure function of
+  /// the legacy trajectory; the action is disabled).
+  const SIBLING_STAMPS: bool
+
+  /// CALIBRATION ONLY (`gcCadenceCalibSharedClockAnchor`): the
+  /// as-built recognition conjunct reading the SHARED attempt clock —
+  /// a sibling's stamp interposing between our applied-but-
+  /// response-lost commit and the probe makes our own landed payload
+  /// read as "another holder committed first" (the merged_bug_021
+  /// forged foreign winner). The fixed law anchors recognition at the
+  /// holder's OWN held stamp, which a sibling cannot move.
+  const CALIB_SHARED_CLOCK_ANCHOR: bool
+
   var time: int
   /// Success stamp: last COMMITTED live cycle (-1 = never). The
   /// stalled alert keys on this; aborts never write it.
@@ -111,6 +132,11 @@ module gcCadence {
   /// Response-lost commits recognized as our own by payload echo —
   /// non-vacuity observable for the recognition path.
   var responseLostRecognized: int
+  /// Response-lost commits recognized as our own WITH a sibling
+  /// attempt stamp interposed (merged_bug_021) — the non-vacuity
+  /// observable for the own-held-anchor law (frozen 0 at
+  /// SIBLING_STAMPS = false).
+  var stampInterposedRecognitions: int
   /// Foreign winners PROVEN by row evidence (epoch at expected+1,
   /// mismatched payload) — non-vacuity observable.
   var provenForeign: int
@@ -139,6 +165,7 @@ module gcCadence {
     lostTicks' = 0,
     indeterminateTicks' = 0,
     responseLostRecognized' = 0,
+    stampInterposedRecognitions' = 0,
     provenForeign' = 0,
     coincidenceOks' = 0,
     falseLost' = false,
@@ -161,6 +188,7 @@ module gcCadence {
     lostTicks' = lostTicks,
     indeterminateTicks' = indeterminateTicks,
     responseLostRecognized' = responseLostRecognized,
+    stampInterposedRecognitions' = stampInterposedRecognitions,
     provenForeign' = provenForeign,
     coincidenceOks' = coincidenceOks,
     falseLost' = falseLost,
@@ -183,6 +211,7 @@ module gcCadence {
     lostTicks' = lostTicks,
     indeterminateTicks' = indeterminateTicks,
     responseLostRecognized' = responseLostRecognized,
+    stampInterposedRecognitions' = stampInterposedRecognitions,
     provenForeign' = provenForeign,
     coincidenceOks' = coincidenceOks,
     falseLost' = falseLost,
@@ -205,6 +234,7 @@ module gcCadence {
     lostTicks' = lostTicks,
     indeterminateTicks' = indeterminateTicks,
     responseLostRecognized' = responseLostRecognized,
+    stampInterposedRecognitions' = stampInterposedRecognitions,
     provenForeign' = provenForeign,
     coincidenceOks' = coincidenceOks,
     falseLost' = falseLost,
@@ -251,19 +281,27 @@ module gcCadence {
 
   /// The attribution the code under the active calibration emits:
   /// 0 = ok, 1 = commit_failed, 2 = commit_indeterminate.
-  /// Post-fix (both round-5 CALIB flags false) this is the
-  /// merged_bug_022 classifier: witness at the durability point
-  /// (shapes 0/1 -> ok), own-echo recognition (shape 2, no foreign ->
-  /// ok), interleaved epochs unprovable (shape 2 with foreign ->
-  /// indeterminate), retry-applied -> ok, retry-error ->
-  /// indeterminate, proven foreign -> commit_failed (coincidence
-  /// excepted - the documented residual).
-  def classifyAttribution(shape: int, foreignArm: int, coincide: bool, retryWorks: bool): int =
+  /// Post-fix (all CALIB flags false) this is the merged_bug_022
+  /// classifier under the merged_bug_021 own-held-anchor law: witness
+  /// at the durability point (shapes 0/1 -> ok), own-echo recognition
+  /// at the holder's OWN held attempt stamp (shape 2, no foreign ->
+  /// ok REGARDLESS of a sibling stamp interposing — the probe no
+  /// longer reads the shared clock), interleaved epochs unprovable
+  /// (shape 2 with foreign -> indeterminate), retry-applied -> ok,
+  /// retry-error -> indeterminate, proven foreign -> commit_failed on
+  /// POSITIVE payload contradiction only (coincidence excepted - the
+  /// documented residual). The CALIB_SHARED_CLOCK_ANCHOR twin
+  /// restores the as-built shared-clock conjunct: an interposed
+  /// sibling stamp forges commit_failed out of our own landed write.
+  def classifyAttribution(shape: int, foreignArm: int, coincide: bool, retryWorks: bool, interposedPick: bool): int =
+    val interposed = and { SIBLING_STAMPS, interposedPick }
     if (shape == 0) 0
     else if (shape == 1) (if (CALIB_RELEASE_FAILS) 1 else 0)
     else if (shape == 2) (
       if (CALIB_ZERO_ROWS_FOREIGN) 1
-      else if (foreignArm == 0) 0
+      else if (foreignArm == 0) (
+        if (and { CALIB_SHARED_CLOCK_ANCHOR, interposed }) 1 else 0
+      )
       else 2
     )
     else (
@@ -310,6 +348,7 @@ module gcCadence {
       lostTicks' = lostTicks,
       indeterminateTicks' = indeterminateTicks,
       responseLostRecognized' = responseLostRecognized,
+      stampInterposedRecognitions' = stampInterposedRecognitions,
       provenForeign' = provenForeign,
       coincidenceOks' = coincidenceOks,
       falseLost' = falseLost,
@@ -324,6 +363,10 @@ module gcCadence {
         nondet foreignArm = Set(0, 1, 2).oneOf()
         nondet coincide = Set(true, false).oneOf()
         nondet retryWorks = Set(true, false).oneOf()
+        // merged_bug_021: a sibling's attempt stamp interposing
+        // between our apply and the diagnostic probe (consulted only
+        // under SIBLING_STAMPS; an unconsulted pick changes nothing).
+        nondet stampInterposedPick = Set(true, false).oneOf()
         all {
           committedEpochs' = committedEpochs
             + (if (ourCommitLands(shape, foreignArm, retryWorks)) 1 else 0)
@@ -334,32 +377,39 @@ module gcCadence {
           }) time else lastLive,
           lostCommits' = if (ourCommitLands(shape, foreignArm, retryWorks))
             lostCommits else lostCommits + 1,
-          okTicks' = if (classifyAttribution(shape, foreignArm, coincide, retryWorks) == 0)
+          okTicks' = if (classifyAttribution(shape, foreignArm, coincide, retryWorks, stampInterposedPick) == 0)
             okTicks + 1 else okTicks,
-          lostTicks' = if (classifyAttribution(shape, foreignArm, coincide, retryWorks) == 1)
+          lostTicks' = if (classifyAttribution(shape, foreignArm, coincide, retryWorks, stampInterposedPick) == 1)
             lostTicks + 1 else lostTicks,
-          indeterminateTicks' = if (classifyAttribution(shape, foreignArm, coincide, retryWorks) == 2)
+          indeterminateTicks' = if (classifyAttribution(shape, foreignArm, coincide, retryWorks, stampInterposedPick) == 2)
             indeterminateTicks + 1 else indeterminateTicks,
           responseLostRecognized' = if (and {
             shape == 2,
             foreignArm == 0,
-            classifyAttribution(shape, foreignArm, coincide, retryWorks) == 0,
+            classifyAttribution(shape, foreignArm, coincide, retryWorks, stampInterposedPick) == 0,
           }) responseLostRecognized + 1 else responseLostRecognized,
+          stampInterposedRecognitions' = if (and {
+            SIBLING_STAMPS,
+            stampInterposedPick,
+            shape == 2,
+            foreignArm == 0,
+            classifyAttribution(shape, foreignArm, coincide, retryWorks, stampInterposedPick) == 0,
+          }) stampInterposedRecognitions + 1 else stampInterposedRecognitions,
           provenForeign' = if (and {
             shape == 3,
             foreignArm != 0,
-            classifyAttribution(shape, foreignArm, coincide, retryWorks) == 1,
+            classifyAttribution(shape, foreignArm, coincide, retryWorks, stampInterposedPick) == 1,
           }) provenForeign + 1 else provenForeign,
           coincidenceOks' = if (and {
             shape == 3,
             foreignArm == 1,
             coincide,
-            classifyAttribution(shape, foreignArm, coincide, retryWorks) == 0,
+            classifyAttribution(shape, foreignArm, coincide, retryWorks, stampInterposedPick) == 0,
           }) coincidenceOks + 1 else coincidenceOks,
           falseLost' = or {
             falseLost,
             and {
-              classifyAttribution(shape, foreignArm, coincide, retryWorks) == 1,
+              classifyAttribution(shape, foreignArm, coincide, retryWorks, stampInterposedPick) == 1,
               ourCommitLands(shape, foreignArm, retryWorks),
             },
           },
@@ -382,6 +432,7 @@ module gcCadence {
           lostTicks' = if (commitLands) lostTicks else lostTicks + 1,
           indeterminateTicks' = indeterminateTicks,
           responseLostRecognized' = responseLostRecognized,
+          stampInterposedRecognitions' = stampInterposedRecognitions,
           provenForeign' = provenForeign,
           coincidenceOks' = coincidenceOks,
           falseLost' = falseLost,
@@ -390,14 +441,45 @@ module gcCadence {
     },
   }
 
+  /// merged_bug_021: a SIBLING replica's attempt stamp — written with
+  /// NO dueness gate (run_gc phase 3's unconditional stamp) whenever
+  /// the lock is free. Defers the backstop's due predicate exactly as
+  /// production does (the cadence law quantifies attempts per
+  /// holder-SET, not per replica: a sibling stamp only ever WIDENS
+  /// spacing, so attemptCadenceBounded is unaffected by construction).
+  /// Disabled at SIBLING_STAMPS = false (pre-extension byte-identity).
+  action siblingStampAttempt = all {
+    SIBLING_STAMPS,
+    time < MAX_TIME,
+    lastAttempt' = time,
+    time' = time,
+    lastLive' = lastLive,
+    lastHeavyAt' = lastHeavyAt,
+    corrupt' = corrupt,
+    ranEarly' = ranEarly,
+    aborts' = aborts,
+    okTicks' = okTicks,
+    committedEpochs' = committedEpochs,
+    lostCommits' = lostCommits,
+    drainedCycles' = drainedCycles,
+    lostTicks' = lostTicks,
+    indeterminateTicks' = indeterminateTicks,
+    responseLostRecognized' = responseLostRecognized,
+    stampInterposedRecognitions' = stampInterposedRecognitions,
+    provenForeign' = provenForeign,
+    coincidenceOks' = coincidenceOks,
+    falseLost' = falseLost,
+  }
+
   action step = any {
     tick,
     repair,
     corruptAppears,
     backstopFires,
+    siblingStampAttempt,
   }
 
-  // --- invariants (store.gc.collect-cadence+3) ----------------------------
+  // --- invariants (store.gc.collect-cadence+4) ----------------------------
 
   /// Heavy-cycle attempts are spaced at least INTERVAL apart, for ALL
   /// outcome arms. The hourly-retry twin falsifies it: with the
@@ -446,6 +528,13 @@ module gcCadence {
   /// evidence requirement is only meaningful if foreign winners
   /// actually occur.
   val noProvenForeignWinner = provenForeign == 0
+
+  /// Non-vacuity witness (must VIOLATE in the main regime,
+  /// merged_bug_021): own-commit recognition WITH a sibling attempt
+  /// stamp interposed is actually explored — the own-held-anchor
+  /// law's noFalseLost verdict is about a space where the
+  /// interposition really happens.
+  val noStampInterposedRecognition = stampInterposedRecognitions == 0
 }
 
 // ===========================================================================
@@ -460,7 +549,9 @@ module gcCadenceMain {
     CALIB_TICK_BEFORE_COMMIT = false,
     COMMIT_CLASSIFY = true,
     CALIB_ZERO_ROWS_FOREIGN = false,
-    CALIB_RELEASE_FAILS = false
+    CALIB_RELEASE_FAILS = false,
+    SIBLING_STAMPS = true,
+    CALIB_SHARED_CLOCK_ANCHOR = false
   ).*
 
   /// The bug_284 red, deterministically: a corrupt store, two checks
@@ -484,6 +575,7 @@ module gcCadenceMain {
         lostTicks' = 0,
         indeterminateTicks' = 0,
         responseLostRecognized' = 0,
+        stampInterposedRecognitions' = 0,
         provenForeign' = 0,
         coincidenceOks' = 0,
         falseLost' = false,
@@ -498,6 +590,40 @@ module gcCadenceMain {
       .expect(all {
         not(due(time)),
         aborts == 1,
+        attemptCadenceBounded,
+      })
+
+  /// merged_bug_021 constructor probe: a SIBLING's attempt stamp
+  /// (no dueness gate) defers our backstop exactly one interval —
+  /// the attempt clock is holder-set-wide, so the cadence law is
+  /// unaffected while the recognition anchor must not be.
+  run siblingStampDefersBackstopRun =
+    init
+      .then(all {
+        time' = 0,
+        lastLive' = -1,
+        lastAttempt' = -1,
+        lastHeavyAt' = -1,
+        corrupt' = true,
+        ranEarly' = false,
+        aborts' = 0,
+        okTicks' = 0,
+        committedEpochs' = 0,
+        lostCommits' = 0,
+        drainedCycles' = 0,
+        lostTicks' = 0,
+        indeterminateTicks' = 0,
+        responseLostRecognized' = 0,
+        stampInterposedRecognitions' = 0,
+        provenForeign' = 0,
+        coincidenceOks' = 0,
+        falseLost' = false,
+      })
+      .then(siblingStampAttempt) // the sibling stamps at t=0 (lock free)
+      .expect(all {
+        lastAttempt == 0,
+        aborts == 0,        // no heavy run happened here
+        not(due(time)),     // ...yet our backstop is deferred
         attemptCadenceBounded,
       })
 }
@@ -516,7 +642,9 @@ module gcCadenceCalibHourlyRetry {
     CALIB_TICK_BEFORE_COMMIT = false,
     COMMIT_CLASSIFY = false,
     CALIB_ZERO_ROWS_FOREIGN = false,
-    CALIB_RELEASE_FAILS = false
+    CALIB_RELEASE_FAILS = false,
+    SIBLING_STAMPS = false,
+    CALIB_SHARED_CLOCK_ANCHOR = false
   ).*
 }
 
@@ -534,7 +662,9 @@ module gcCadenceCalibTickBeforeCommit {
     CALIB_TICK_BEFORE_COMMIT = true,
     COMMIT_CLASSIFY = false,
     CALIB_ZERO_ROWS_FOREIGN = false,
-    CALIB_RELEASE_FAILS = false
+    CALIB_RELEASE_FAILS = false,
+    SIBLING_STAMPS = false,
+    CALIB_SHARED_CLOCK_ANCHOR = false
   ).*
 }
 
@@ -554,7 +684,9 @@ module gcCadenceCalibZeroRowsClaimsForeign {
     CALIB_TICK_BEFORE_COMMIT = false,
     COMMIT_CLASSIFY = true,
     CALIB_ZERO_ROWS_FOREIGN = true,
-    CALIB_RELEASE_FAILS = false
+    CALIB_RELEASE_FAILS = false,
+    SIBLING_STAMPS = false,
+    CALIB_SHARED_CLOCK_ANCHOR = false
   ).*
 }
 
@@ -573,6 +705,36 @@ module gcCadenceCalibReleaseFailsCommit {
     CALIB_TICK_BEFORE_COMMIT = false,
     COMMIT_CLASSIFY = true,
     CALIB_ZERO_ROWS_FOREIGN = false,
-    CALIB_RELEASE_FAILS = true
+    CALIB_RELEASE_FAILS = true,
+    SIBLING_STAMPS = false,
+    CALIB_SHARED_CLOCK_ANCHOR = false
+  ).*
+}
+
+// ===========================================================================
+// SHARED-CLOCK-ANCHOR CALIBRATION TWIN (expect-violation, bughunt-6
+// S6 merged_bug_021): the as-built recognition conjunct reads the
+// SHARED attempt clock — a sibling's stamp interposing between our
+// applied-but-response-lost commit and the diagnostic probe makes our
+// own landed payload read as "another holder committed first";
+// noFalseLost falsifies. KILL ISOLATION (R16): with the zero-rows and
+// release toggles OFF, falseLost (classify == commit_failed AND
+// ourCommitLands) is reachable ONLY through the interposed shape-2
+// cell — shape 1 is ok (release toggle off), shape 3's commit_failed
+// cells all have ourCommitLands = false — so the violation dies
+// through THIS conjunct with the sibling lanes proven intact in the
+// same trace. Same regime constants as the main regime, axis ON.
+// ===========================================================================
+module gcCadenceCalibSharedClockAnchor {
+  import gcCadence(
+    INTERVAL = 4,
+    MAX_TIME = 12,
+    CALIB_NO_ATTEMPT_GATE = false,
+    CALIB_TICK_BEFORE_COMMIT = false,
+    COMMIT_CLASSIFY = true,
+    CALIB_ZERO_ROWS_FOREIGN = false,
+    CALIB_RELEASE_FAILS = false,
+    SIBLING_STAMPS = true,
+    CALIB_SHARED_CLOCK_ANCHOR = true
   ).*
 }

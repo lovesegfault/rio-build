@@ -319,12 +319,16 @@ pub fn describe_metrics() {
          CycleCommitted witness, minted at the durability point per \
          merged_bug_022, so metric attribution cannot diverge from the \
          commit result; an applied-but-response-lost commit recognized by \
-         its own payload echo on the epoch-guarded retry is ok); \
-         commit_failed = the cycle drained and the commit is PROVEN not to \
-         have landed (a foreign winner sits at the guarded epoch+1 with a \
-         mismatched payload); commit_indeterminate = the cycle drained but \
-         neither leg could prove the outcome (retry refused/errored, or the \
-         epoch advanced past +1) -- the commit may or may not have landed. \
+         its own payload echo at the held attempt anchor on the \
+         epoch-guarded retry is ok); commit_failed = the cycle drained and \
+         the commit is PROVEN not to have landed (a foreign winner sits at \
+         the guarded epoch+1 with a POSITIVELY mismatched payload -- pure \
+         payload contradiction only, merged_bug_021: a stale or absent \
+         recognition anchor is never proof); commit_indeterminate = the \
+         cycle drained but neither leg could prove the outcome (retry \
+         refused/errored, the epoch advanced past +1, or the payload \
+         matches with a stale/absent own-attempt anchor) -- the commit may \
+         or may not have landed. \
          A cycle that stops at the per-cycle victim cap counts as ok; \
          error = the cycle failed against PostgreSQL (counted by the \
          caller: run_gc phase 3 or the backstop). Staleness of ok cycles \

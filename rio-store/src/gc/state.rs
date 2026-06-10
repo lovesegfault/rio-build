@@ -174,20 +174,51 @@ pub(crate) enum RetryVerdict {
     /// The guarded UPDATE applied (1 row): the retry landed the commit.
     Applied,
     /// 0 rows because the row already carries OUR write: the primary
-    /// applied and only its response was lost.
+    /// applied and only its response was lost — pure payload echo at
+    /// or after the held own-attempt anchor (merged_bug_021).
     OwnCommitLanded,
-    /// 0 rows and the row at `expected+1` carries a foreign payload:
-    /// PROVEN lost.
+    /// 0 rows and the row at `expected+1` carries a POSITIVELY
+    /// mismatched payload (pure contradiction of our SET list):
+    /// PROVEN lost. A stale or absent temporal anchor is NEVER this
+    /// verdict (merged_bug_021 — a sibling can lawfully perturb any
+    /// shared temporal ordering; only payload proves).
     ForeignWinner,
     /// 0 rows and the row evidence proves nothing (epoch past `+1`,
-    /// or the impossible `== expected` after a 0-row guarded UPDATE).
+    /// the impossible `== expected` after a 0-row guarded UPDATE, or
+    /// a matching payload whose own-attempt anchor is stale/absent —
+    /// incl. the warn-tolerated stamp-failure path holding no
+    /// anchor).
     Unprovable,
+}
+
+/// The held attempt stamp (merged_bug_021): the `last_attempt_at`
+/// value OUR OWN `stamp_attempt` wrote, returned by the statement and
+/// held as an OPAQUE TOKEN — `last_attempt_at::text` out,
+/// `$1::timestamptz` back in (PG's own out/in round-trip,
+/// microsecond-exact). The comparison stays DB-side, so the module's
+/// "no timestamp crosses into process frame" law holds LITERALLY: the
+/// process never parses, orders, or arithmetics the value. This is
+/// the recognition anchor the shared `last_attempt_at` COLUMN cannot
+/// be: any holder lawfully stamps the column with no dueness gate
+/// (run_gc phase 3), so a sibling's stamp could interpose between our
+/// applied-but-response-lost commit and the probe and forge a
+/// "proven foreign" verdict out of our own landed write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OwnAttemptStamp(String);
+
+impl OwnAttemptStamp {
+    /// The `$n::timestamptz` bind value.
+    fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// One diagnostic read of the singleton row for 0-row retry
 /// classification (merged_bug_022). Timestamp comparisons are computed
 /// DB-side (booleans out) — no timestamp crosses into process frame,
-/// so no cross-clock comparison exists (the merged_bug_017 class).
+/// so no cross-clock comparison exists (the merged_bug_017 class); the
+/// own-attempt anchor crosses only as the opaque [`OwnAttemptStamp`]
+/// token (merged_bug_021).
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub(crate) struct CommitProbe {
     pub(crate) cycle_epoch: i64,
@@ -197,38 +228,58 @@ pub(crate) struct CommitProbe {
     pub(crate) last_would_collect: Option<i64>,
     /// `last_live_cycle_at IS NOT NULL`.
     pub(crate) live_stamped: bool,
-    /// `last_attempt_at IS NULL OR last_live_cycle_at >= last_attempt_at`
-    /// (false when `last_live_cycle_at` is NULL and an attempt exists).
-    pub(crate) live_at_or_after_attempt: bool,
+    /// `$1 IS NOT NULL AND last_live_cycle_at IS NOT NULL AND
+    /// last_live_cycle_at >= $1` where `$1` is OUR OWN held attempt
+    /// stamp (merged_bug_021) — false when we hold no stamp (the
+    /// warn-tolerated stamp failure left None) or the live stamp
+    /// predates OUR attempt. A sibling's `last_attempt_at` write is
+    /// invisible here: the probe no longer reads the shared column,
+    /// so the interposition is untypeable.
+    pub(crate) live_since_own_attempt: bool,
 }
 
 const COMMIT_PROBE_SQL: &str = "SELECT cycle_epoch, cursor, backlog_estimate, \
        last_mark_set_size, last_would_collect, \
        last_live_cycle_at IS NOT NULL AS live_stamped, \
-       (last_attempt_at IS NULL OR (last_live_cycle_at IS NOT NULL \
-          AND last_live_cycle_at >= last_attempt_at)) AS live_at_or_after_attempt \
+       ($1::timestamptz IS NOT NULL AND last_live_cycle_at IS NOT NULL \
+          AND last_live_cycle_at >= $1::timestamptz) AS live_since_own_attempt \
   FROM gc_collect_state WHERE singleton";
 
-/// The 0-row retry classification table (merged_bug_022) — pure and
-/// exhaustive; the alphabet test in collect.rs pins every row (the
-/// classify.rs/bug_178 style).
+/// The 0-row retry classification table (merged_bug_022; recognition
+/// anchor merged_bug_021) — pure and exhaustive; the generated product
+/// census in collect.rs pins every cell.
 ///
 /// Echo fields are ONLY those whose committed value is a pure function
-/// of the [`CycleCommit`] (the SET lists in `execute_commit`):
+/// of the [`CycleCommit`] (the SET lists in `execute_commit`) — the
+/// module's pure-echo law, now holding for the TEMPORAL leg too:
 ///
-/// - Live: `cursor == disposition.cursor_at_stop()` AND
+/// - Live, pure payload: `cursor == disposition.cursor_at_stop()` AND
 ///   `last_mark_set_size == observation.mark_set_size()` AND
-///   `last_live_cycle_at IS NOT NULL` AND (`last_attempt_at IS NULL OR
-///   last_live_cycle_at >= last_attempt_at`). The temporal conjunct
-///   (DB-frame, computed in SQL) excludes foreign-SHADOW
-///   misrecognition: a shadow never writes `last_live_cycle_at`, and
-///   both live paths stamp the attempt BEFORE the cycle
-///   (`collect_backstop_once`, run_gc phase 3), so a pre-existing
-///   stale live stamp sits BEFORE our attempt stamp and fails the
-///   conjunct.
+///   `last_live_cycle_at IS NOT NULL` (`IS NOT NULL` is a pure
+///   predicate of our SET list — a shadow never writes it). A
+///   POSITIVE payload contradiction here is the ONLY thing that
+///   proves the +1 commit was not ours (`ForeignWinner`).
+/// - Live, recognition anchor: `live_since_own_attempt` — the live
+///   stamp at-or-after OUR OWN held attempt stamp
+///   ([`OwnAttemptStamp`], returned by `stamp_attempt`'s RETURNING;
+///   compared DB-side). Its only writers are live commits (in the
+///   quantified event set) and the comparand is a constant WE minted
+///   — a sibling's `stamp_attempt` writes a column the probe no
+///   longer reads. Excludes foreign-SHADOW misrecognition exactly as
+///   the old shared-column conjunct intended: both live paths stamp
+///   the attempt BEFORE the cycle, so a pre-existing stale live stamp
+///   predates our stamp and fails the anchor.
+/// - A failed anchor with a MATCHING payload downgrades to
+///   `Unprovable`, never `ForeignWinner`: distinguishing "foreign
+///   shadow with coincident payload" from "PG clock regression on our
+///   own landed commit" would require exactly the cross-session
+///   ordering assumption the pure-echo law forbids; the same lane
+///   covers the held-stamp-absent case (the warn-tolerated stamp
+///   failure) honestly.
 /// - Shadow: `backlog_estimate == observation.would_collect()` AND
 ///   `last_would_collect == observation.would_collect()` AND
-///   `last_mark_set_size == observation.mark_set_size()`.
+///   `last_mark_set_size == observation.mark_set_size()` (no temporal
+///   leg ever existed; the payload-coincidence residual below).
 ///
 /// DOCUMENTED BENIGN RESIDUAL: a byte-identical foreign LIVE commit
 /// landing inside the milliseconds retry window is recognized as ours
@@ -251,27 +302,38 @@ pub(crate) fn classify_zero_row_retry(
         // row — equally unprovable.
         return RetryVerdict::Unprovable;
     }
-    let echo_matched = match commit {
+    match commit {
         CycleCommit::Live {
             disposition,
             observation,
             ..
         } => {
-            probe.cursor.as_deref() == disposition.cursor_at_stop()
+            let payload_matched = probe.cursor.as_deref() == disposition.cursor_at_stop()
                 && probe.last_mark_set_size == Some(observation.mark_set_size())
-                && probe.live_stamped
-                && probe.live_at_or_after_attempt
+                && probe.live_stamped;
+            if !payload_matched {
+                // Positive pure-payload contradiction: the +1 commit
+                // provably was not ours.
+                RetryVerdict::ForeignWinner
+            } else if probe.live_since_own_attempt {
+                RetryVerdict::OwnCommitLanded
+            } else {
+                // Payload matches but the recognition anchor is stale
+                // or absent: never claim PROVEN foreign on the absence
+                // of a temporal ordering (merged_bug_021).
+                RetryVerdict::Unprovable
+            }
         }
         CycleCommit::Shadow { observation } => {
-            probe.backlog_estimate == Some(observation.would_collect())
+            let echo_matched = probe.backlog_estimate == Some(observation.would_collect())
                 && probe.last_would_collect == Some(observation.would_collect())
-                && probe.last_mark_set_size == Some(observation.mark_set_size())
+                && probe.last_mark_set_size == Some(observation.mark_set_size());
+            if echo_matched {
+                RetryVerdict::OwnCommitLanded
+            } else {
+                RetryVerdict::ForeignWinner
+            }
         }
-    };
-    if echo_matched {
-        RetryVerdict::OwnCommitLanded
-    } else {
-        RetryVerdict::ForeignWinner
     }
 }
 
@@ -289,6 +351,18 @@ pub(crate) async fn commit_foreign_for_test(
     let rows = GcCycleLease::execute_commit(commit, None, &mut *conn.conn()).await?;
     conn.release_to_pool();
     Ok(rows)
+}
+
+/// Test-only production-statement router (Q1 witness provenance): the
+/// sibling-stamp red drives a FOREIGN holder's `stamp_attempt` through
+/// the SAME statement production uses — the lock-free dead-session
+/// world where any replica lawfully stamps the shared column.
+#[cfg(test)]
+pub(crate) async fn stamp_attempt_foreign_for_test(pool: &PgPool) -> Result<(), sqlx::Error> {
+    let mut conn = super::lock::SessionConn::acquire(pool).await?;
+    let _foreign_stamp = GcCycleLease::execute_stamp_attempt(&mut *conn.conn()).await?;
+    conn.release_to_pool();
+    Ok(())
 }
 
 /// Test-only commit-fault injection carrier; the protocol is the
@@ -360,6 +434,11 @@ pub(crate) struct GcCycleLease {
     lock: PgSessionLock,
     pool: PgPool,
     pub(crate) state: GcCollectState,
+    /// The attempt stamp OUR `stamp_attempt` wrote (merged_bug_021):
+    /// the 0-row retry's recognition anchor. `None` at acquire and
+    /// after a warn-tolerated stamp failure — that triple-fault path
+    /// classifies `Unprovable`, honestly.
+    own_attempt_stamp: Option<OwnAttemptStamp>,
 }
 
 impl GcCycleLease {
@@ -376,6 +455,7 @@ impl GcCycleLease {
             lock,
             pool: pool.clone(),
             state,
+            own_attempt_stamp: None,
         }))
     }
 
@@ -400,16 +480,32 @@ impl GcCycleLease {
     /// bookkeeping. Shadow (dry-run) cycles MUST NOT call this: a dry
     /// run never defers the live collection cadence.
     pub(crate) async fn stamp_attempt(&mut self) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "UPDATE gc_collect_state SET last_attempt_at = now(), updated_at = now() \
-             WHERE singleton",
-        )
-        .execute(&mut **self.lock.conn())
-        .await?;
+        let stamp = Self::execute_stamp_attempt(&mut *self.lock.conn()).await?;
+        // Held as the 0-row retry's recognition anchor
+        // (merged_bug_021): the probe compares the live stamp against
+        // THIS value — a constant we minted — never against the
+        // shared column a sibling lawfully overwrites.
+        self.own_attempt_stamp = Some(stamp);
         Ok(())
     }
 
-    // r[impl store.gc.collect-cadence+3]
+    /// The one attempt-stamp statement (merged_bug_021): RETURNING the
+    /// written value as text — the opaque [`OwnAttemptStamp`] token.
+    /// Extracted so the test router below reuses the PRODUCTION
+    /// statement (the `commit_foreign_for_test` pattern).
+    async fn execute_stamp_attempt(
+        conn: &mut sqlx::PgConnection,
+    ) -> Result<OwnAttemptStamp, sqlx::Error> {
+        let (stamp,): (String,) = sqlx::query_as(
+            "UPDATE gc_collect_state SET last_attempt_at = now(), updated_at = now() \
+             WHERE singleton RETURNING last_attempt_at::text",
+        )
+        .fetch_one(conn)
+        .await?;
+        Ok(OwnAttemptStamp(stamp))
+    }
+
+    // r[impl store.gc.collect-cadence+4]
     /// Commit a finished cycle to the row (epoch+1, stamps), then
     /// release the lock — three-valued (merged_bug_022): the caller
     /// receives [`CycleCommitResult`] and matches it exhaustively.
@@ -436,9 +532,11 @@ impl GcCycleLease {
     /// sits at `expected+1` from OUR OWN UPDATE, so the guard
     /// necessarily matches 0 rows — the retry must recognize its own
     /// landed commit instead of unconditionally claiming a foreign
-    /// winner. Outcomes: own echo → `Committed`; foreign payload at
-    /// `expected+1` → `NotCommitted` (proven); anything else
-    /// (retry/diagnostic error, epoch past `+1`) → `Ambiguous`.
+    /// winner. Outcomes: own payload echo at the held
+    /// attempt anchor → `Committed`; POSITIVE payload contradiction at
+    /// `expected+1` → `NotCommitted` (proven, merged_bug_021); anything
+    /// else (retry/diagnostic error, epoch past `+1`, matching payload
+    /// with a stale/absent anchor) → `Ambiguous`.
     pub(crate) async fn commit_cycle(mut self, commit: CycleCommit) -> CycleCommitResult {
         let expected_epoch = self.state.cycle_epoch;
         let primary = {
@@ -538,6 +636,7 @@ impl GcCycleLease {
                                     &self.pool,
                                     &commit,
                                     expected_epoch,
+                                    self.own_attempt_stamp.as_ref(),
                                 )
                                 .await
                             }
@@ -545,7 +644,13 @@ impl GcCycleLease {
                     }
                     #[cfg(not(test))]
                     {
-                        Self::retry_commit_on_fresh_conn(&self.pool, &commit, expected_epoch).await
+                        Self::retry_commit_on_fresh_conn(
+                            &self.pool,
+                            &commit,
+                            expected_epoch,
+                            self.own_attempt_stamp.as_ref(),
+                        )
+                        .await
                     }
                 };
                 match retry {
@@ -586,6 +691,7 @@ impl GcCycleLease {
         pool: &PgPool,
         commit: &CycleCommit,
         expected_epoch: i64,
+        own_attempt: Option<&OwnAttemptStamp>,
     ) -> Result<RetryVerdict, sqlx::Error> {
         let mut conn = super::lock::SessionConn::acquire(pool).await?;
         let rows = Self::execute_commit(commit, Some(expected_epoch), &mut *conn.conn()).await?;
@@ -594,7 +700,10 @@ impl GcCycleLease {
             return Ok(RetryVerdict::Applied);
         }
         // 0 rows: classify on row evidence before deciding anything.
+        // The held own-attempt token rides the bind (NULL when the
+        // stamp failed or never ran — that lane reads Unprovable).
         let probe: CommitProbe = sqlx::query_as(COMMIT_PROBE_SQL)
+            .bind(own_attempt.map(OwnAttemptStamp::as_str))
             .fetch_one(&mut **conn.conn())
             .await?;
         conn.release_to_pool();

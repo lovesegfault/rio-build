@@ -1529,7 +1529,7 @@ too large, and the backstop cadence paced against the counterfactual
 invariants; its calibration twin re-wires the commit to the simulated
 products and both falsify.
 
-#r("store.gc.collect-cadence+3")[
+#r("store.gc.collect-cadence+4")[
   The collect cycle's cadence, resume cursor, and gauge sources are CLUSTER
   state, durable in the `gc_collect_state` singleton row (migrations 090,
   100), never process state. The backstop MUST run a live cycle only when
@@ -1554,12 +1554,21 @@ products and both falsify.
   minted at the durability point --- in the expression observing the
   commit statement's success, before any post-commit cleanup, so a failed
   lock release cannot alter attribution --- and a zero-row guarded retry
-  MUST be classified on row evidence read on the same fresh connection: an
-  epoch at expected+1 whose payload echoes the intended write is the
+  MUST be classified on row evidence read on the same fresh connection.
+  The own-recognition echo is pure payload PLUS the own-held-attempt
+  anchor (merged_bug_021): the attempt stamp statement returns the value
+  it wrote and the holder keeps it as an opaque token, the probe compares
+  the live stamp against THAT held value DB-side --- never against the
+  shared `last_attempt_at` column, which any holder lawfully overwrites
+  with no dueness gate. An epoch at expected+1 whose payload echoes the
+  intended write with the live stamp at-or-after the held anchor is the
   cycle's OWN landed commit (applied-but-response-lost; `outcome="ok"`);
-  an epoch at expected+1 with a foreign payload is a PROVEN lost commit
-  (`outcome="commit_failed"`); anything else (retry or diagnostic error,
-  epoch past +1) is `outcome="commit_indeterminate"` --- the
+  PROVEN loss (`outcome="commit_failed"`) requires a POSITIVE pure-payload
+  contradiction of the intended write; a temporal-anchor failure with a
+  matching payload --- a stale or absent anchor, including a holder whose
+  attempt stamp failed and holds none --- is
+  `outcome="commit_indeterminate"`, never `commit_failed`, as is anything
+  else unprovable (retry or diagnostic error, epoch past +1) --- the
   `outcome="ok"` cycle metric ticks only on a landed commit (the
   witness), and `commit_failed` only on proof of loss. A dry-run (shadow) cycle commits its observation WITHOUT the
   live or attempt stamps. Every replica publishes
