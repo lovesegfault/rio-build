@@ -476,7 +476,7 @@ mod metric_help_tests {
 
         // OA1 job-terminal family (merged_bug_035): the HELP names
         // every LIVE reason label — the pod-terminal alphabet AND the
-        // controller-synthesized delete arms — sourced from the SAME
+        // controller-synthesized delete arms — pinned through the SAME
         // shared rio-common label fn both record paths consume, never
         // restated literals. Live synthesized arms at this tree:
         // Reaped (pool/job.rs reap-excess + reap-orphan, pool/jobs.rs

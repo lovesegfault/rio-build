@@ -637,7 +637,12 @@ mod seal {
             tracing::warn!(
                 axis = axis.label(),
                 engaged_at = episode.engaged_at,
-                "suppression episode closed at its release edge: draining the episode's                  window evidence, merge-latching the suppression watermark and starting                  the dwell — evidence observed during the engaged episode cannot mint a                  per-node verdict after release (a late-onset node re-detects from fresh                  post-watermark expiries after the dwell)"
+                "suppression episode closed at its release edge: draining the \
+                 episode's window evidence, merge-latching the suppression \
+                 watermark and starting the dwell — evidence observed during \
+                 the engaged episode cannot mint a per-node verdict after \
+                 release (a late-onset node re-detects from fresh \
+                 post-watermark expiries after the dwell)"
             );
         }
         apply(t, effects, now_secs);
