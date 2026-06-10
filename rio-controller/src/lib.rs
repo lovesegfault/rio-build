@@ -294,16 +294,25 @@ pub fn describe_metrics() {
     );
     describe_histogram!(
         "rio_controller_job_terminal_report_seconds",
-        "OA1 interval (i): Pod/Job terminal-condition timestamp → \
-         the pod-terminal ReportAttemptOutcome acked by the scheduler, by reason \
-         (oom_killed | evicted_disk_pressure | deadline_exceeded). Sampled once \
-         per terminal Pod/Job per controller process at the first acked \
-         report — the report path re-reports the same object every tick \
-         for the Job TTL window (the scheduler dedups server-side), and \
-         re-sampling those would measure the TTL window instead of the \
-         report latency. This is the controller-report-slack baseline \
-         the executor-replacement establishment window is sized against \
-         (executor-lifecycle campaign, OA1)."
+        "OA1 interval (i): terminal condition → the ReportAttemptOutcome \
+         acked by the scheduler, by `reason`. Pod/Job-terminal arms \
+         (oom_killed | evicted_disk_pressure | deadline_exceeded) measure \
+         the report latency; controller-synthesized delete arms \
+         (reaped | cancelled) record a constant 0.0 — the controller \
+         initiates the delete, so the interval closes at the delete by \
+         construction. A `preempted` eviction routes through the \
+         disruption watcher WITHOUT a histogram sample (counted in \
+         disruption_drains_total; the establishment sweep classifies any \
+         missed report). Sampled once per terminal Pod/Job per controller \
+         process at the first acked report — the report path re-reports \
+         the same object every tick for the Job TTL window (the scheduler \
+         dedups server-side), and re-sampling those would measure the TTL \
+         window instead of the report latency. This is the \
+         controller-report-slack baseline the executor-replacement \
+         establishment window is sized against (executor-lifecycle \
+         campaign, OA1) — filter to the pod-terminal reasons when \
+         baselining the establishment window, or the synthesized 0.0 \
+         samples fold into the slack quantile."
     );
     describe_gauge!(
         "rio_controller_nodeclaim_live",
@@ -415,14 +424,28 @@ pub fn describe_metrics() {
 mod metric_help_tests {
     use crate::reconcilers::nodeclaim_pool::wedge::SuppressionAxis;
 
-    /// The HELP window after a family name — generous enough to cover
-    /// the longest description, short enough not to bleed into the
-    /// next family.
+    /// The HELP window for a family: from the family name at its
+    /// `describe_*!` call site (NOT the buckets table, a doc comment,
+    /// or this test's own literals) to the next `describe_`
+    /// invocation — exact, so an assertion cannot be satisfied by a
+    /// neighboring family's text.
     fn help_window<'a>(lib: &'a str, family: &str) -> &'a str {
-        let start = lib
-            .find(family)
-            .unwrap_or_else(|| panic!("{family} HELP present in describe_metrics"));
-        &lib[start..(start + 1100).min(lib.len())]
+        let mut from = 0usize;
+        let start = loop {
+            let i = lib[from..]
+                .find(family)
+                .map(|o| from + o)
+                .unwrap_or_else(|| panic!("{family} present at a describe_* call site"));
+            if lib[i.saturating_sub(60)..i].contains("describe_") {
+                break i;
+            }
+            from = i + family.len();
+        };
+        let end = lib[start + family.len()..]
+            .find("describe_")
+            .map(|o| start + family.len() + o)
+            .unwrap_or(lib.len());
+        &lib[start..end]
     }
 
     #[test]
@@ -449,6 +472,51 @@ mod metric_help_tests {
         assert!(
             !lib.contains(&retired),
             "the retired denominator phrasing '{retired}' must not survive in lib.rs"
+        );
+
+        // OA1 job-terminal family (merged_bug_035): the HELP names
+        // every LIVE reason label — the pod-terminal alphabet AND the
+        // controller-synthesized delete arms — sourced from the SAME
+        // shared rio-common label fn both record paths consume, never
+        // restated literals. Live synthesized arms at this tree:
+        // Reaped (pool/job.rs reap-excess + reap-orphan, pool/jobs.rs
+        // busy-reap) and Cancelled (pool/job.rs cancel arm), all via
+        // delete_job_with_synthesized_report's constant-0.0 record.
+        use rio_common::classify::{AttemptTerminalKind as K, attempt_terminal_reason_label};
+        let oa1 = "rio_controller_job_terminal_report_seconds";
+        let help = help_window(lib, oa1);
+        for kind in [K::OomKilled, K::EvictedDiskPressure, K::DeadlineExceeded] {
+            let label = attempt_terminal_reason_label(kind);
+            assert!(
+                help.contains(label),
+                "{oa1} HELP must name pod-terminal reason '{label}'"
+            );
+        }
+        for kind in [K::Reaped, K::Cancelled] {
+            let label = attempt_terminal_reason_label(kind);
+            assert!(
+                help.contains(label),
+                "{oa1} HELP must name live synthesized reason '{label}'"
+            );
+        }
+        // The synthesized arms record a constant 0.0 (the controller
+        // initiates the delete, so the interval closes at the delete
+        // by construction) — disclosed, with the sizing instruction
+        // filtering to the pod-terminal arms.
+        assert!(
+            help.contains("0.0"),
+            "{oa1} HELP must disclose the synthesized arms' constant-0.0 samples"
+        );
+        assert!(
+            help.contains("filter"),
+            "{oa1} HELP must instruct filtering to the pod-terminal reasons when sizing"
+        );
+        // Preempted reports flow through the disruption watcher
+        // WITHOUT a histogram sample — the HELP states the routing
+        // instead of overclaiming a preempted arm.
+        assert!(
+            help.contains(attempt_terminal_reason_label(K::Preempted)),
+            "{oa1} HELP must state the preempted routing (disruption watcher, no sample)"
         );
     }
 }

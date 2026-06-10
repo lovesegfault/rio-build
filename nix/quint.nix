@@ -6811,13 +6811,13 @@ rec {
     # PLUS (round-5, merged_bug_016) the suppressed-retention law:
     # developing-episode ticks retain the marked transition-memory.
     # All eight laws TLC-EXHAUSTIVE at MAX_TIME=4/WINDOW=2:
-    # 10,031,131 states generated / 58,763 distinct / 0 on queue, 96s
-    # at workers=auto under an 8-way parallel sweep — budget 1800s
-    # ≈ 18× measured (the retention restatement + its two
-    # tick-computed carrier vars grew the space from 8.7M/44,111; the
-    # carriers are constant false off-trajectory, so the other
-    # regimes' spaces are byte-identical to their recorded
-    # baselines). The dwell-gated systemic arm is
+    # 9,987,163 states generated / 57,968 distinct / 0 on queue, 69s
+    # at workers=auto under a parallel sweep — budget 1800s ≈ 26×
+    # measured (the round-5 ladder: the retention restatement grew
+    # the space from 8.7M/44,111, then the release-edge close pruned
+    # it slightly — drained windows collapse states; the episode
+    # carriers are frozen off-trajectory, so the other regimes'
+    # spaces are byte-identical to their recorded baselines). The dwell-gated systemic arm is
     # reachability-pinned below.
     # r[verify ctrl.nodeclaim.wedge-two-axis+5]
     quint-wedge-cluster-trajectory = mkQuintCheck {
@@ -6862,7 +6862,8 @@ rec {
     };
     # merged_bug_023 anti-vacuity: the release edge (an engaged
     # episode disengaging on an observed tick) is reachable at the
-    # trajectory bounds — the close law cannot go silently vacuous.
+    # trajectory bounds — the close law cannot go silently vacuous
+    # ([violation] at 52,248 generated / 1,143 distinct, ~9s).
     quint-wedge-cluster-trajectory-witness-release = mkQuintWitnessCheck {
       name = "wedge-cluster-trajectory-witness-release";
       spec = "wedgeCluster";
@@ -6876,7 +6877,8 @@ rec {
     # late-onset node ([violation] of noPerNodeFromSuppressedEvidence
     # at the trajectory bounds; the developing-tick anchors feed the
     # suppression-survivor set, so the law carries the release-edge
-    # content it was previously blind to).
+    # content it was previously blind to; [violation] at 193,678
+    # generated / 2,584 distinct, ~18s).
     # r[verify ctrl.nodeclaim.wedge-two-axis+5]
     quint-wedge-cluster-calib-open-release = mkQuintWitnessCheck {
       name = "wedge-cluster-calib-open-release";
