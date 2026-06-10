@@ -51,6 +51,7 @@ mod executor;
 pub(crate) mod floor;
 mod handle;
 mod housekeeping;
+pub(crate) use housekeeping::describe_housekeeping_metrics;
 pub(crate) mod materialize;
 mod merge;
 pub(crate) mod pull;

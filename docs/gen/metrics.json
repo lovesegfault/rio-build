@@ -155,6 +155,7 @@
     "rio_scheduler_stale_completed_substituted_total",
     "rio_scheduler_stale_realisation_filtered_total",
     "rio_scheduler_status_outbox_depth",
+    "rio_scheduler_status_outbox_replay_refused_total",
     "rio_scheduler_store_degraded_requeues_total",
     "rio_scheduler_substituting_derivations",
     "rio_scheduler_topdown_prune_total",
@@ -1029,6 +1030,11 @@
         "kind": "gauge",
         "help": "Failed terminal-status persist batches awaiting the housekeeping tick's re-drive. Nonzero means PG persists are failing; a sustained nonzero depth means cancelled derivations' attempts stay open (their close rides the persist) until the flush succeeds.",
         "aggregation": "per-replica"
+      },
+      {
+        "name": "rio_scheduler_status_outbox_replay_refused_total",
+        "kind": "counter",
+        "help": "Status-outbox replays refused row-locally by the PG-domain precedence conjunct (merged_bug_017): the durable row advanced past the latch, so the newer row stands and the batch pops. Nonzero is normal under resubmit/cancel races; a sustained rate tracks churn racing terminal latches. The refused drv set rides the paired warn."
       },
       {
         "name": "rio_scheduler_store_degraded_requeues_total",

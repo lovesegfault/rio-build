@@ -2552,14 +2552,13 @@ async fn absent_node_nonterminal_latch_must_not_regress_durable_status() -> Test
 /// flusher — the named refusal warn — while the durable row stays
 /// unregressed and the batch still POPS (the refusal is the precedence
 /// law's FINAL verdict: the durable row is newer; re-pushing would
-/// retry forever against it). Pre-fix the only observable was the
-/// info "batch flushed". The companion counter
-/// (`rio_scheduler_status_outbox_replay_refused_total`) lands WITH its
-/// describe in the scheduler-HELP owner's pass (emission and describe
-/// must land together under the all_emitted_metrics_are_described
-/// census); its assertion line rides that landing.
+/// retry forever against it). Pre-fix neither the counter nor the
+/// warn existed — the only observable was the info "batch flushed".
 #[tokio::test]
-async fn refused_replay_pops_batch_and_stays_unregressed() -> TestResult {
+async fn refused_replay_pops_batch_and_ticks_counter() -> TestResult {
+    use crate::sla::metrics::counter_map;
+    use metrics_util::debugging::DebuggingRecorder;
+
     let db = TestDb::new(&MIGRATOR).await;
     crate::actor::tests::seed_default_tenant(&db.pool).await;
     // Durable truth: the node advanced (Running, fresh PG stamp)
@@ -2587,7 +2586,12 @@ async fn refused_replay_pops_batch_and_stays_unregressed() -> TestResult {
         latched_at_epoch: crate::db::attempts::epoch_now() - 60.0,
     });
     let authority = actor.dag_authority().expect("always-leader test actor");
-    actor.tick_flush_status_outbox(&authority).await;
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    {
+        let _g = metrics::set_default_local_recorder(&rec);
+        actor.tick_flush_status_outbox(&authority).await;
+    }
 
     // The durable row stands.
     let (status,): (String,) =
@@ -2605,6 +2609,16 @@ async fn refused_replay_pops_batch_and_stays_unregressed() -> TestResult {
         0,
         "the refused batch must pop (re-pushing would retry forever \
          against the newer durable row)"
+    );
+    // The refusal is counted.
+    let counters = counter_map(&snap);
+    assert_eq!(
+        counters
+            .get("rio_scheduler_status_outbox_replay_refused_total")
+            .copied(),
+        Some(1),
+        "left: None (pre-fix: no refusal surface — the only observable \
+         was the info \"batch flushed\") / right: Some(1)"
     );
     Ok(())
 }

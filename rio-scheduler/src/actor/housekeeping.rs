@@ -848,17 +848,6 @@ impl DagActor {
                         .filter(|h| !replayed.iter().any(|r| r == h))
                         .collect();
                     if !refused.is_empty() {
-                        // The named warn is the refusal surface. Its
-                        // companion counter
-                        // (rio_scheduler_status_outbox_replay_refused_total)
-                        // is NOT ticked here BY CONSTRAINT: the
-                        // all_emitted_metrics_are_described census
-                        // requires emission and describe in one
-                        // landing, and describe_metrics() is the
-                        // scheduler-HELP owner's surface — both
-                        // halves land together in that pass (the
-                        // posted wave handoff carries the exact
-                        // increment + describe + test lines).
                         warn!(
                             refused = ?refused,
                             status = ?batch.status,
@@ -871,6 +860,8 @@ impl DagActor {
                             "status outbox: replay refused (durable rows advanced \
                              past the latch; the newer rows stand)"
                         );
+                        metrics::counter!("rio_scheduler_status_outbox_replay_refused_total")
+                            .increment(refused.len() as u64);
                     }
                     info!(
                         count = replayed.len(),
@@ -1540,4 +1531,22 @@ impl DagActor {
             }
         }
     }
+}
+
+/// Canonical HELP for the housekeeping-emitted metrics — colocated
+/// beside their only emit sites (the merged_bug_001 module-owned
+/// pattern: admin/mod.rs::describe_admin_metrics is the precedent),
+/// fired from `crate::describe_metrics()` via the one-line delegation
+/// so the metrics_registered census sees every name reachable from
+/// the crate chokepoint.
+pub(crate) fn describe_housekeeping_metrics() {
+    metrics::describe_counter!(
+        "rio_scheduler_status_outbox_replay_refused_total",
+        "Status-outbox replays refused row-locally by the PG-domain \
+         precedence conjunct (merged_bug_017): the durable row advanced \
+         past the latch, so the newer row stands and the batch pops. \
+         Nonzero is normal under resubmit/cancel races; a sustained rate \
+         tracks churn racing terminal latches. The refused drv set rides \
+         the paired warn."
+    );
 }

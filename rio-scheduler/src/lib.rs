@@ -622,6 +622,9 @@ pub fn describe_metrics() {
     // merged_bug_001: the absorb-counter HELP lives beside its emit
     // site (admin/mod.rs) — same module-owned pattern as sla above.
     crate::admin::describe_admin_metrics();
+    // merged_bug_017: the outbox replay-refused HELP lives beside its
+    // emit site (actor/housekeeping.rs) — same module-owned pattern.
+    crate::actor::describe_housekeeping_metrics();
 
     // Series birth (C3 metric-ownership): every alert-referenced
     // counter and every leader-family gauge exists from the first
