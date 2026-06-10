@@ -128,18 +128,110 @@ pub struct DropTally {
     /// is no `[sla.hw_classes]` entry whose `(arch, max_cores, max_mem,
     /// provides_features)` admits the intent. Persistent until the
     /// config changes. **Operator action:** add or fix a class. See
-    /// `sla-model.typ#rionodeclaimpool-nohostingclass`.
+    /// `sla-model.typ#rionodeclaimpool-nohostingclass`. live_051(c):
+    /// this population is ALSO answered to the scheduler as a typed
+    /// [`rio_proto::types::IntentVerdict`] on the spawn-intent ack —
+    /// the tally is the operator plane, the verdict is the consumer
+    /// plane; neither substitutes for the other.
     pub no_hosting_class: u64,
-    /// `fallback` admits the intent in principle, but **every** cell
-    /// that could host it is ICE-masked — NodeClaim launches are
-    /// failing in the cloud (capacity exhaustion, quota, IAM). Self-
-    /// heals once the ICE backoff expires *if* the cloud recovers;
-    /// persistent if the cloud failure is structural (e.g. a missing
-    /// `AWSServiceRoleForEC2Spot`). **Operator action:** check
+    /// Cold-start intent (`hw_class_names=[]`): `fallback` admits it in
+    /// principle, but **every** cell that could host it is ICE-masked —
+    /// NodeClaim launches are failing in the cloud (capacity
+    /// exhaustion, quota, IAM). Self-heals once the ICE backoff expires
+    /// *if* the cloud recovers; persistent if the cloud failure is
+    /// structural (e.g. a missing `AWSServiceRoleForEC2Spot`).
+    /// **Operator action:** check
     /// `rio_controller_nodeclaim_reaped_total{reason=~"ice|vanished"}`
     /// and the Karpenter controller log for launch errors. See
     /// `sla-model.typ#rionodeclaimpool-icemaskedhigh`.
     pub all_cells_ice_masked: u64,
+    /// READY intent (`hw_class_names` non-empty, `A_open` non-empty
+    /// before masking): every hosting cell is ICE-masked. Same cloud
+    /// capacity gap as `all_cells_ice_masked`, measured on the
+    /// population that carries solved demand — live_050(a): this
+    /// population starved SILENTLY (208 intents, zero tally, zero
+    /// warn) because the old fold conflated it with the lead-time
+    /// gate. **Operator action:** as `all_cells_ice_masked`; the
+    /// degradation ladder (`ctrl.nodeclaim.capacity-ladder`) is the
+    /// structural consumer that gives the walk a next rung.
+    pub ready_all_cells_ice_masked: u64,
+}
+
+/// One intent's minted outcome, paired with the intent it judges —
+/// [`assign_to_cells`]' per-intent record.
+pub type PlacementRecord<'a> = (&'a SpawnIntent, PlacementOutcome);
+
+/// Total typed outcome of the cell-assignment chokepoint, minted ONCE
+/// per intent inside [`assign_to_cells`] from evidence at the filter
+/// site (only the filter knows whether `A_open` was non-empty BEFORE
+/// masking — a post-hoc tally cannot reconstruct it). The caller
+/// total-folds this alphabet with zero wildcard arms; rustc
+/// exhaustiveness is the membership census (R15).
+// r[impl ctrl.nodeclaim.placement-outcome]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlacementOutcome {
+    /// Assigned to an unmasked cell (grouped into `by_cell`).
+    Placed(Cell),
+    /// Forecast intent lead-time-gated on every cell (`A_open` empty
+    /// BEFORE masking, `hw_class_names` non-empty): legitimately quiet
+    /// — the next tick re-evaluates as the ETA approaches.
+    LeadTimeGated,
+    /// Every cell that could host the intent is ICE-masked. LOUD —
+    /// cloud capacity gap. `open_rungs` = |`A_open`| before masking
+    /// (0 ⇔ the cold-start fallback path: `hw_class_names=[]`, the
+    /// fallback cell was the only candidate).
+    UnplaceableAllMasked { open_rungs: usize },
+    /// No `[sla.hw_classes]` entry admits the intent at all. LOUD —
+    /// config gap; answered to the scheduler as a typed
+    /// `IntentVerdict` (live_051(c)).
+    NoHostingClass,
+}
+
+impl PlacementOutcome {
+    /// The outcome→wire law (live_051(c)): which arm ships an
+    /// `IntentVerdict` on the spawn-intent ack. Total match — a new
+    /// variant forces a wire decision here; the census test
+    /// `exactly_one_outcome_variant_ships_a_verdict` pins the
+    /// exactly-one property. The masked arms stay OFF the wire: their
+    /// masks are the scheduler's own (`ice_masked_cells` /
+    /// `unfulfillable_cells`) — the surviving no-wire half of the
+    /// WO-S7-3 derivation.
+    pub fn verdict_reason(&self) -> Option<rio_proto::types::IntentVerdictReason> {
+        match self {
+            PlacementOutcome::Placed(_)
+            | PlacementOutcome::LeadTimeGated
+            | PlacementOutcome::UnplaceableAllMasked { .. } => None,
+            PlacementOutcome::NoHostingClass => {
+                Some(rio_proto::types::IntentVerdictReason::NoHostingClass)
+            }
+        }
+    }
+}
+
+impl DropTally {
+    /// The single outcome→tally law: a total fold over the
+    /// [`PlacementOutcome`] alphabet (zero wildcard arms — a new
+    /// variant fails compilation here, forcing a visibility decision).
+    /// The ICE-masked split is population-keyed: `open_rungs == 0` ⇔
+    /// the cold-start fallback path (`all_cells_ice_masked`),
+    /// `open_rungs > 0` ⇔ the ready path (`ready_all_cells_ice_masked`
+    /// — the live_050(a) population).
+    pub fn from_outcomes(outcomes: &[PlacementRecord<'_>]) -> Self {
+        let mut t = Self::default();
+        for (_, o) in outcomes {
+            match o {
+                PlacementOutcome::Placed(_) | PlacementOutcome::LeadTimeGated => {}
+                PlacementOutcome::UnplaceableAllMasked { open_rungs: 0 } => {
+                    t.all_cells_ice_masked += 1;
+                }
+                PlacementOutcome::UnplaceableAllMasked { .. } => {
+                    t.ready_all_cells_ice_masked += 1;
+                }
+                PlacementOutcome::NoHostingClass => t.no_hosting_class += 1,
+            }
+        }
+        t
+    }
 }
 
 /// Group `unplaced` by the cheapest cell in each intent's `A_open`.
@@ -156,12 +248,20 @@ pub struct DropTally {
 /// arch-matching cell when the reference cell is ICE-masked (mb_024).
 /// When the masked call returns `None`, the implementation re-evaluates
 /// `fallback(i, ∅)` to attribute the drop: still `None` → no class
-/// hosts the intent at all (`DropTally::no_hosting_class` — config
+/// hosts the intent at all (`PlacementOutcome::NoHostingClass` — config
 /// gap); `Some` → the class exists but every hosting cell is masked
-/// (`DropTally::all_cells_ice_masked` — cloud capacity gap). The
+/// (`PlacementOutcome::UnplaceableAllMasked` — cloud capacity gap). The
 /// re-eval is bounded at one extra `O(|hw_classes|)` predicate pass
 /// **per dropped intent** — the steady-state hot path (intents that
 /// place) never pays it.
+///
+/// Returns `(by_cell, outcomes)`: one [`PlacementOutcome`] per intent,
+/// minted at this chokepoint (the only site that knows whether
+/// `A_open` was non-empty before masking). Callers total-fold the
+/// outcome alphabet — [`DropTally::from_outcomes`] is the shared
+/// outcome→tally law; the production caller additionally mints
+/// `IntentVerdict`s from the `NoHostingClass` arm (live_051(c)) and
+/// the named-cells WARN from the ready `UnplaceableAllMasked` arm.
 ///
 /// `masked` cells (ICE-hit this tick or scheduler-reported
 /// `ice_masked_cells`) are filtered from each intent's `A_open` BEFORE
@@ -178,43 +278,61 @@ pub fn assign_to_cells<'a>(
     masked: &HashSet<Cell>,
     cell_price: impl Fn(&Cell) -> f64,
     fallback: impl Fn(&SpawnIntent, &HashSet<Cell>) -> Option<Cell>,
-) -> (BTreeMap<Cell, Vec<&'a SpawnIntent>>, DropTally) {
+) -> (
+    BTreeMap<Cell, Vec<&'a SpawnIntent>>,
+    Vec<PlacementRecord<'a>>,
+) {
     let mut by_cell: BTreeMap<Cell, Vec<&SpawnIntent>> = BTreeMap::new();
-    let mut dropped = DropTally::default();
+    let mut outcomes: Vec<PlacementRecord<'a>> = Vec::with_capacity(unplaced.len());
     let unmasked = HashSet::new();
     for i in unplaced {
         let open = a_open(i, sketches);
-        let cheapest = open
+        let open_rungs = open.len();
+        // The single mint site: exactly one PlacementOutcome per
+        // intent, constructed from filter-site evidence.
+        let outcome = match open
             .into_iter()
             .filter(|c| !masked.contains(c))
             .min_by(|a, b| cell_price(a).total_cmp(&cell_price(b)))
-            .or_else(|| {
-                if !i.hw_class_names.is_empty() {
-                    // Non-empty hw_class_names + empty A_open ⇔
-                    // forecast intent lead-time-gated on every cell.
-                    // No fallback — next tick re-evaluates.
-                    return None;
+        {
+            Some(c) => PlacementOutcome::Placed(c),
+            None if !i.hw_class_names.is_empty() => {
+                // Non-empty hw_class_names + empty filtered set is a
+                // DISJUNCTION, not the old "⇔ lead-time-gated" claim
+                // (live_050(a) — the false ⇔ silently starved 208
+                // ready intents): either A_open was empty BEFORE
+                // masking (genuinely lead-time-gated; quiet — next
+                // tick re-evaluates) or masking emptied a non-empty
+                // A_open (every hosting cell ICE-masked; LOUD).
+                if open_rungs == 0 {
+                    PlacementOutcome::LeadTimeGated
+                } else {
+                    PlacementOutcome::UnplaceableAllMasked { open_rungs }
                 }
+            }
+            None => {
+                // Cold-start (`hw_class_names=[]`): fallback path.
                 // Defense-in-depth: re-filter even though the
                 // `fallback_cell` impl already respects `masked`. A
-                // masked `(referenceHwClass, spot)` that slipped through
-                // would land in `by_cell` and then be `continue`d by the
-                // per-cell ICE skip — silently stranding cold-start
-                // probes.
-                let c = fallback(i, masked).filter(|c| !masked.contains(c));
-                if c.is_none() {
-                    if fallback(i, &unmasked).is_some() {
-                        dropped.all_cells_ice_masked += 1;
-                    } else {
-                        dropped.no_hosting_class += 1;
+                // masked `(referenceHwClass, spot)` that slipped
+                // through would land in `by_cell` and then be
+                // `continue`d by the per-cell ICE skip — silently
+                // stranding cold-start probes.
+                match fallback(i, masked).filter(|c| !masked.contains(c)) {
+                    Some(c) => PlacementOutcome::Placed(c),
+                    None if fallback(i, &unmasked).is_some() => {
+                        PlacementOutcome::UnplaceableAllMasked { open_rungs: 0 }
                     }
+                    None => PlacementOutcome::NoHostingClass,
                 }
-                c
-            });
-        let Some(cheapest) = cheapest else { continue };
-        by_cell.entry(cheapest).or_default().push(i);
+            }
+        };
+        if let PlacementOutcome::Placed(c) = &outcome {
+            by_cell.entry(c.clone()).or_default().push(i);
+        }
+        outcomes.push((i, outcome));
     }
-    (by_cell, dropped)
+    (by_cell, outcomes)
 }
 
 /// Cell ranking for [`assign_to_cells`]' cheapest-open pick: spot
@@ -1016,10 +1134,10 @@ mod tests {
         // h1 cheaper.
         let price = |c: &Cell| if c.0 == "h1" { 0.03 } else { 0.05 };
         let none = HashSet::new();
-        let (by, d) = assign_to_cells(&unplaced, &CellSketches::default(), &none, price, |_, _| {
+        let (by, o) = assign_to_cells(&unplaced, &CellSketches::default(), &none, price, |_, _| {
             None
         });
-        assert_eq!(d, DropTally::default());
+        assert_eq!(DropTally::from_outcomes(&o), DropTally::default());
         assert_eq!(by.len(), 2);
         let h1k = Cell("h1".into(), CapacityType::Spot);
         let h2k = Cell("h2".into(), CapacityType::Spot);
@@ -1057,7 +1175,7 @@ mod tests {
         );
         let unplaced = [fod, bld];
         let none = HashSet::new();
-        let (by, d) = assign_to_cells(
+        let (by, o) = assign_to_cells(
             &unplaced,
             &CellSketches::default(),
             &none,
@@ -1065,7 +1183,7 @@ mod tests {
             |_, _| None,
         );
         assert_eq!(
-            d,
+            DropTally::from_outcomes(&o),
             DropTally::default(),
             "no fallback drops — both have hw_class_names"
         );
@@ -1108,21 +1226,22 @@ mod tests {
         assert_eq!(by[&spot].len(), 1);
         // spot ICE-masked → od.
         let masked: HashSet<Cell> = [spot.clone()].into();
-        let (by, d) = assign_to_cells(
+        let (by, o) = assign_to_cells(
             &unplaced,
             &CellSketches::default(),
             &masked,
             cell_rank,
             |_, _| None,
         );
-        assert_eq!(d, DropTally::default());
+        assert_eq!(DropTally::from_outcomes(&o), DropTally::default());
         assert!(!by.contains_key(&spot));
         assert_eq!(by[&od].len(), 1);
-        // Both masked → A_open empties; non-empty hw_class_names ⇒ NOT
-        // fallback-routed (silently skipped, NOT counted as a drop —
-        // next tick re-evaluates).
+        // Both masked → masking emptied a NON-empty A_open: the ready
+        // all-masked outcome IS counted (live_050(a) — the old
+        // ":silently skipped, NOT counted" expectation pinned the
+        // silent starvation as intended; re-derived to the W7-A green).
         let masked: HashSet<Cell> = [spot, od].into();
-        let (by, d) = assign_to_cells(
+        let (by, o) = assign_to_cells(
             &unplaced,
             &CellSketches::default(),
             &masked,
@@ -1130,7 +1249,22 @@ mod tests {
             |_, _| None,
         );
         assert!(by.is_empty());
-        assert_eq!(d, DropTally::default());
+        assert_eq!(
+            DropTally::from_outcomes(&o),
+            DropTally {
+                ready_all_cells_ice_masked: 1,
+                ..Default::default()
+            },
+            "both-masked ready intent counted, never silent"
+        );
+        assert!(
+            matches!(
+                o[0].1,
+                PlacementOutcome::UnplaceableAllMasked { open_rungs: 2 }
+            ),
+            "outcome carries the pre-mask rung count: {:?}",
+            o[0].1
+        );
     }
 
     /// Cold-start: `hw_class_names=[]` → routed via `fallback`.
@@ -1167,23 +1301,33 @@ mod tests {
         let fallback = |i: &SpawnIntent, _: &HashSet<Cell>| {
             (i.system == "x86_64-linux").then(|| Cell("ref".into(), CapacityType::Spot))
         };
-        let (by, d) = assign_to_cells(
+        let (by, o) = assign_to_cells(
             &unplaced,
             &CellSketches::default(),
             &HashSet::new(),
             |_| 0.0,
             fallback,
         );
+        let d = DropTally::from_outcomes(&o);
         assert_eq!(d.no_hosting_class, 1, "agn-u dropped");
         assert_eq!(d.all_cells_ice_masked, 0);
+        assert_eq!(d.ready_all_cells_ice_masked, 0);
         assert_eq!(by.len(), 1);
         assert_eq!(by[&ref_cell].len(), 1);
         assert_eq!(by[&ref_cell][0].intent_id, "agn-x");
+        // W7-B kill-isolation: the lead-time-gated forecast intent is
+        // typed LeadTimeGated (quiet) — the new masked-ready arm
+        // cannot eat the legitimate case.
+        assert!(
+            matches!(o[2].1, PlacementOutcome::LeadTimeGated),
+            "fc is lead-time-gated, not a drop: {:?}",
+            o[2].1
+        );
     }
 
     #[test]
     fn assign_empty_unplaced_empty_output() {
-        let (by, d) = assign_to_cells(
+        let (by, o) = assign_to_cells(
             &[],
             &CellSketches::default(),
             &HashSet::new(),
@@ -1191,7 +1335,8 @@ mod tests {
             |_, _| None,
         );
         assert!(by.is_empty());
-        assert_eq!(d, DropTally::default());
+        assert!(o.is_empty());
+        assert_eq!(DropTally::from_outcomes(&o), DropTally::default());
     }
 
     /// `assign_to_cells` distinguishes WHY a cold-start intent dropped —
@@ -1253,7 +1398,7 @@ mod tests {
             (!m.contains(&c)).then_some(c)
         };
         let masked: HashSet<Cell> = [ref_cell].into();
-        let (by, d) = assign_to_cells(
+        let (by, o) = assign_to_cells(
             &unplaced,
             &CellSketches::default(),
             &masked,
@@ -1261,10 +1406,11 @@ mod tests {
             fallback,
         );
         assert_eq!(
-            d,
+            DropTally::from_outcomes(&o),
             DropTally {
                 no_hosting_class: 1,
                 all_cells_ice_masked: 1,
+                ready_all_cells_ice_masked: 0,
             },
             "hostable-masked → ice; unhostable → no_class"
         );
@@ -1685,7 +1831,7 @@ mod tests {
         // `all_cells_ice_masked` (the fallback CAN host it; the cell is
         // just masked).
         let masked: HashSet<Cell> = [ref_cell.clone()].into();
-        let (by, d) = assign_to_cells(
+        let (by, o) = assign_to_cells(
             &unplaced,
             &CellSketches::default(),
             &masked,
@@ -1694,12 +1840,232 @@ mod tests {
         );
         assert!(by.is_empty(), "masked fallback must not appear in by_cell");
         assert_eq!(
-            d,
+            DropTally::from_outcomes(&o),
             DropTally {
                 no_hosting_class: 0,
                 all_cells_ice_masked: 1,
+                ready_all_cells_ice_masked: 0,
             },
             "masked fallback counted as ICE drop, not config drop"
+        );
+    }
+
+    /// Scoped JSON-subscriber capture (the node_informer.rs LogBuf
+    /// pattern) for asserting on warn emission without a global
+    /// subscriber race.
+    #[derive(Clone, Default)]
+    struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn captured_lines(f: impl FnOnce()) -> Vec<String> {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let buf = LogBuf::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(buf.clone()),
+        );
+        let guard = tracing::subscriber::set_default(subscriber);
+        f();
+        drop(guard);
+        let bytes = std::mem::take(&mut *buf.0.lock().unwrap());
+        String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(String::from)
+            .collect()
+    }
+
+    // r[verify ctrl.nodeclaim.placement-outcome]
+    /// live_050(a) red R1 / witness W7-A — certifies: *a READY intent
+    /// (non-empty `hw_class_names`, non-empty `A_open`) whose every
+    /// hosting cell is ICE-masked produces `UnplaceableAllMasked` +
+    /// tally + WARN + metric — not silence, not `LeadTimeGated`.* The
+    /// adversarial population is exactly the one that starved live
+    /// (208 ready intents, zero tally, zero warn). Asserts the mod.rs
+    /// fold half (warn + metric) the `assign_masked_cell_fails_over_
+    /// to_od` pin structurally cannot see.
+    #[test]
+    fn ready_intent_with_all_cells_masked_is_counted_and_warned() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let cells = [("h", CapacityType::Spot), ("h", CapacityType::OnDemand)];
+        let unplaced = [intent("starved", 4, GI, &cells, Some(true))];
+        let masked: HashSet<Cell> = [
+            Cell("h".into(), CapacityType::Spot),
+            Cell("h".into(), CapacityType::OnDemand),
+        ]
+        .into();
+        let (by, o) = assign_to_cells(
+            &unplaced,
+            &CellSketches::default(),
+            &masked,
+            cell_rank,
+            |_, _| None,
+        );
+        assert!(by.is_empty());
+        let d = DropTally::from_outcomes(&o);
+        assert_eq!(
+            d,
+            DropTally {
+                ready_all_cells_ice_masked: 1,
+                ..Default::default()
+            },
+            "counted — never the silent skip"
+        );
+        // The fold half: warn + metric, driven through the production
+        // emission fn under a local recorder + scoped subscriber.
+        let rec = DebuggingRecorder::new();
+        let _g = ::metrics::set_default_local_recorder(&rec);
+        let masked_ready: Vec<(&str, &[String])> = vec![("starved", &unplaced[0].hw_class_names)];
+        let lines =
+            captured_lines(|| super::super::emit_drop_tally(&d, &masked_ready, masked.len()));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("READY SpawnIntents unplaceable") && l.contains("starved")),
+            "warn names the starved intents: {lines:?}"
+        );
+        // ppppp: snapshot exactly once; query the materialized Vec.
+        let snap = rec.snapshotter().snapshot().into_vec();
+        let count = snap.into_iter().find_map(|(k, _, _, v)| {
+            let key = k.key();
+            (key.name() == "rio_controller_nodeclaim_intent_dropped_total"
+                && key
+                    .labels()
+                    .any(|l| l.key() == "reason" && l.value() == "ready_all_cells_ice_masked"))
+            .then_some(v)
+        });
+        assert_eq!(
+            count,
+            Some(DebugValue::Counter(1)),
+            "metric incremented under the new reason label"
+        );
+    }
+
+    // r[verify ctrl.nodeclaim.placement-outcome]
+    /// R2 / witness W7-B (DISCLOSED GREEN-SIDE PIN — the lead-time path
+    /// is correct pre-fix and must stay so) — certifies: *a genuinely
+    /// lead-time-gated forecast intent still produces zero drop-tally;
+    /// the new masked-ready arm cannot eat the legitimate quiet case*
+    /// (kill-isolation for W7-A).
+    #[test]
+    fn lead_time_gated_forecast_intent_stays_quiet() {
+        let mut i = intent("fc", 4, GI, &[("h1", CapacityType::Spot)], Some(false));
+        i.eta_seconds = 999.0; // > every default lead time → A_open empty pre-mask
+        let unplaced = [i];
+        let (by, o) = assign_to_cells(
+            &unplaced,
+            &CellSketches::default(),
+            &HashSet::new(),
+            cell_rank,
+            |_, _| None,
+        );
+        assert!(by.is_empty());
+        assert!(matches!(o[0].1, PlacementOutcome::LeadTimeGated));
+        assert_eq!(
+            DropTally::from_outcomes(&o),
+            DropTally::default(),
+            "zero tally on the quiet edge"
+        );
+    }
+
+    /// R15 census rows for the `PlacementOutcome` alphabet. The
+    /// generator is rustc: the `witness` match below fails to compile
+    /// when a variant is added, and the coverage pin asserts every
+    /// variant has a row — membership is machine-derived, never
+    /// author-trusted.
+    fn outcome_census_rows() -> Vec<PlacementOutcome> {
+        let rows = vec![
+            PlacementOutcome::Placed(Cell("h".into(), CapacityType::Spot)),
+            PlacementOutcome::LeadTimeGated,
+            PlacementOutcome::UnplaceableAllMasked { open_rungs: 0 },
+            PlacementOutcome::UnplaceableAllMasked { open_rungs: 2 },
+            PlacementOutcome::NoHostingClass,
+        ];
+        let witness = |o: &PlacementOutcome| -> usize {
+            match o {
+                PlacementOutcome::Placed(_) => 0,
+                PlacementOutcome::LeadTimeGated => 1,
+                PlacementOutcome::UnplaceableAllMasked { .. } => 2,
+                PlacementOutcome::NoHostingClass => 3,
+            }
+        };
+        let mut seen = [false; 4];
+        for r in &rows {
+            seen[witness(r)] = true;
+        }
+        assert!(
+            seen.iter().all(|s| *s),
+            "census rows must cover every PlacementOutcome variant"
+        );
+        rows
+    }
+
+    /// R15 drop-reason product census: the outcome→tally law over
+    /// cells FROM the alphabet — each variant maps to exactly its
+    /// tally field (the ICE split population-keyed on `open_rungs`),
+    /// quiet arms map to none.
+    #[test]
+    fn drop_tally_fold_census_over_the_outcome_alphabet() {
+        let probe = intent("p", 4, GI, &[("h", CapacityType::Spot)], Some(true));
+        for o in outcome_census_rows() {
+            let got = DropTally::from_outcomes(&[(&probe, o.clone())]);
+            let want = match &o {
+                PlacementOutcome::Placed(_) | PlacementOutcome::LeadTimeGated => {
+                    DropTally::default()
+                }
+                PlacementOutcome::UnplaceableAllMasked { open_rungs: 0 } => DropTally {
+                    all_cells_ice_masked: 1,
+                    ..Default::default()
+                },
+                PlacementOutcome::UnplaceableAllMasked { .. } => DropTally {
+                    ready_all_cells_ice_masked: 1,
+                    ..Default::default()
+                },
+                PlacementOutcome::NoHostingClass => DropTally {
+                    no_hosting_class: 1,
+                    ..Default::default()
+                },
+            };
+            assert_eq!(got, want, "outcome {o:?}");
+        }
+    }
+
+    // r[verify ctrl.nodeclaim.placement-outcome]
+    /// live_051(c) wire-mapping census (R15): over the alphabet rows,
+    /// EXACTLY ONE variant ships an `IntentVerdict` (NoHostingClass —
+    /// the controller-config-gap population the scheduler structurally
+    /// cannot see); the masked populations stay off the wire (their
+    /// masks are the scheduler's own — the surviving no-wire half of
+    /// the WO-S7-3 derivation).
+    #[test]
+    fn exactly_one_outcome_variant_ships_a_verdict() {
+        let rows = outcome_census_rows();
+        let shipped: Vec<&PlacementOutcome> = rows
+            .iter()
+            .filter(|o| o.verdict_reason().is_some())
+            .collect();
+        assert_eq!(shipped.len(), 1, "exactly one wire-mapped variant");
+        assert!(matches!(shipped[0], PlacementOutcome::NoHostingClass));
+        assert_eq!(
+            PlacementOutcome::NoHostingClass.verdict_reason(),
+            Some(rio_proto::types::IntentVerdictReason::NoHostingClass)
         );
     }
 }

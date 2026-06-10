@@ -1055,9 +1055,11 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
                 observed_instance_types: vec![],
                 // nodeclaim_pool's report_unfulfillable owns the
                 // bound-intents stream (full set every tick from its
-                // per-tick Pod LIST); the per-pool ack only arms
-                // dispatched_cells.
+                // per-tick Pod LIST) AND the live_051(c) rejection
+                // verdicts (minted at the cover fold); the per-pool
+                // ack only arms dispatched_cells.
                 bound_intents: vec![],
+                rejected: vec![],
             },
         ))
         .await

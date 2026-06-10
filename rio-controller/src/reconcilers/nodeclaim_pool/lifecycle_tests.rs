@@ -1284,7 +1284,10 @@ async fn report_unfulfillable_always_ships_the_snapshot() {
 
     // The scale-to-zero shape: nothing ICE'd, nothing registered, no
     // observations, zero bound pods.
-    lab.r.report_unfulfillable(vec![]).await.expect("ack sent");
+    lab.r
+        .report_unfulfillable(vec![], vec![])
+        .await
+        .expect("ack sent");
 
     let acks = lab.ack_calls();
     assert_eq!(acks.len(), 1, "the all-empty tick still Acks");
@@ -1300,11 +1303,14 @@ async fn report_unfulfillable_always_ships_the_snapshot() {
 
     // A bound pod travels inside the snapshot, not field 5.
     lab.r
-        .report_unfulfillable(vec![rio_proto::types::BoundIntent {
-            intent_id: "drv-285".into(),
-            node_name: "node-1".into(),
-            deadline_secs: 0,
-        }])
+        .report_unfulfillable(
+            vec![rio_proto::types::BoundIntent {
+                intent_id: "drv-285".into(),
+                node_name: "node-1".into(),
+                deadline_secs: 0,
+            }],
+            vec![],
+        )
         .await
         .expect("ack sent");
     let acks = lab.ack_calls();
@@ -1508,5 +1514,134 @@ async fn ice_mark_survives_ack_failure() {
         carries(&last.unfulfillable_cells, &cell()),
         "ICE mark dropped on Ack failure: tick-2 unfulfillable_cells = {:?}",
         last.unfulfillable_cells
+    );
+}
+
+// r[verify ctrl.nodeclaim.placement-outcome]
+/// live_051(c) red R26 / witness W7-Y — certifies: *a `NoHostingClass`
+/// intent produces an ack whose `rejected` entry carries its
+/// `intent_id` + reason + actionable detail — through the production
+/// cover fold to the WIRE ARTIFACT* (the R4-A form), with
+/// kill-isolation: a masked-population intent produces ZERO `rejected`
+/// entries (the surviving no-wire half of the WO-S7-3 derivation).
+///
+/// Pre-fix red (verbatim): `left: ack carries spawned/
+/// unfulfillable_cells only; the drop is tally-only; the scheduler
+/// never learns (rejected == []) / right: rejected == [{drv-unhostable,
+/// NO_HOSTING_CLASS, detail naming the configured classes}]`. The live
+/// measurement this kills: the drv re-emits Ready forever at
+/// ~25 drops/min while cover.rs:209 counts and nobody answers.
+#[tokio::test]
+async fn no_hosting_class_drop_answers_a_typed_verdict() {
+    let mut lab = Lab::new().await;
+    // Global ceilings loaded (so cover_deficit runs), ZERO usable
+    // hosting class for the riscv intent — the config-gap population.
+    // One decoy class is configured so the detail string's
+    // configured-classes census is non-empty (operator-actionable).
+    let mut classes = std::collections::HashMap::new();
+    classes.insert(
+        "mid-ebs-x86".to_string(),
+        rio_proto::types::HwClassLabels {
+            labels: vec![rio_proto::types::NodeLabelMatch {
+                key: "kubernetes.io/arch".into(),
+                value: "amd64".into(),
+            }],
+            ..Default::default()
+        },
+    );
+    lab.r.hw_config.set(classes, (192, 768 << 30));
+    *lab.admin.spawn_intents.write().unwrap() = rio_proto::types::GetSpawnIntentsResponse {
+        intents: vec![
+            // Unhostable: no class admits riscv64 (config gap) → the
+            // verdict population.
+            rio_proto::types::SpawnIntent {
+                intent_id: "drv-unhostable".into(),
+                cores: 4,
+                mem_bytes: 1 << 30,
+                system: "riscv64-none".into(),
+                ready: Some(true),
+                ..Default::default()
+            },
+            // Masked-ready: hosting cell exists but is ICE-masked →
+            // counted as ready_all_cells_ice_masked, NEVER a verdict
+            // (the kill-isolation population).
+            rio_proto::types::SpawnIntent {
+                intent_id: "drv-masked".into(),
+                cores: 4,
+                mem_bytes: 1 << 30,
+                system: "x86_64-linux".into(),
+                ready: Some(true),
+                hw_class_names: vec!["mid-ebs-x86".into()],
+                node_affinity: vec![rio_proto::types::NodeSelectorTerm {
+                    match_expressions: vec![rio_proto::types::NodeSelectorRequirement {
+                        key: "karpenter.sh/capacity-type".into(),
+                        operator: "In".into(),
+                        values: vec!["spot".into()],
+                    }],
+                }],
+                ..Default::default()
+            },
+        ],
+        // The scheduler's own mask covers drv-masked's only cell —
+        // information the scheduler already owns, hence no verdict.
+        ice_masked_cells: vec!["mid-ebs-x86:spot".into()],
+        ..Default::default()
+    };
+    // The pool-coverage axis must admit the intents (an uncovered
+    // intent drops as `no_pool_covers` BEFORE the cover fold — a
+    // different, pre-existing outcome): one Builder pool covering
+    // both systems.
+    let pools = serde_json::json!({
+        "apiVersion": "rio.build/v1alpha1",
+        "kind": "Pool",
+        "metadata": {"name": "builders", "namespace": "rio"},
+        "spec": {
+            "kind": "Builder",
+            "maxConcurrent": 10,
+            "features": [],
+            "systems": ["riscv64-none", "x86_64-linux"],
+            "image": "x",
+        },
+    });
+    let scenarios = vec![
+        Scenario::ok(
+            Method::GET,
+            "/apis/rio.build/v1alpha1/pools",
+            list("PoolList", "rio.build/v1alpha1", vec![pools]),
+        ),
+        Scenario::ok(Method::GET, "/api/v1/pods", pod_list(vec![])),
+        Scenario::ok(
+            Method::GET,
+            "/apis/karpenter.sh/v1/nodeclaims",
+            nc_list(vec![]),
+        ),
+    ];
+    lab.tick(0, scenarios).await;
+    let acks = lab.ack_calls();
+    let with_verdict: Vec<_> = acks.iter().filter(|a| !a.rejected.is_empty()).collect();
+    assert_eq!(
+        with_verdict.len(),
+        1,
+        "exactly one ack carries the verdicts: {acks:?}"
+    );
+    let rejected = &with_verdict[0].rejected;
+    assert_eq!(
+        rejected.len(),
+        1,
+        "ONLY the config-gap intent: {rejected:?}"
+    );
+    assert_eq!(rejected[0].intent_id, "drv-unhostable");
+    assert_eq!(
+        rejected[0].reason,
+        i32::from(rio_proto::types::IntentVerdictReason::NoHostingClass)
+    );
+    assert!(
+        rejected[0].detail.contains("riscv64-none") && rejected[0].detail.contains("mid-ebs-x86"),
+        "detail names the unmatched system and the configured classes: {}",
+        rejected[0].detail
+    );
+    assert!(
+        !rejected.iter().any(|v| v.intent_id == "drv-masked"),
+        "masked population stays off the wire (kill-isolation)"
     );
 }

@@ -1333,6 +1333,33 @@ defines no store CR.) The controller's `/scale` patches use field-manager
   create consumes no budget.
 ]
 
+#r("ctrl.nodeclaim.placement-outcome")[
+  The cell-assignment chokepoint (`assign_to_cells`) MUST mint a total
+  typed outcome per intent (`PlacementOutcome`: placed,
+  lead-time-gated, unplaceable-all-masked, no-hosting-class),
+  constructed at the filter site — the only point that knows whether
+  `A_open` was non-empty before ICE-masking. An intent whose every
+  hosting cell is ICE-masked MUST surface as a counted,
+  operator-visible outcome (`ready_all_cells_ice_masked` tally + WARN
+  naming the intents and their hosting classes + the
+  `intent_dropped_total` reason series) — never a silent drop; the
+  lead-time-gated arm stays quiet (the next tick re-evaluates). A
+  `NoHostingClass` outcome MUST additionally be answered to the
+  scheduler as a typed per-intent verdict
+  (`AckSpawnedIntentsRequest.rejected`: intent id + closed reason +
+  operator-actionable detail naming the configured classes) — the
+  masked outcomes stay OFF the wire, since their masks are already the
+  scheduler's own evidence.
+]
+Rationale: live_050(a) measured 208 ready intents starving silently —
+the pre-fix fold asserted "non-empty `hw_class_names` + empty `A_open`
+⇔ lead-time-gated", a false equivalence once masking empties a
+non-empty `A_open`; live_051(c) measured the `no_hosting_class` arm as
+drop-tally-only — the scheduler never learned, and the affected drvs
+looped Ready forever until operators cancelled the builds. The verdict
+budget and poison consumption are scheduler-side
+(`scheduler.sla.ceiling.stale-solve-revalidation`).
+
 #r("ctrl.nodeclaim.placeable-gate+5")[
   For Builder pools, the Pool reconciler creates Jobs only for intents the
   nodeclaim_pool reconciler's last FFD simulation placed on a `Registered=True`

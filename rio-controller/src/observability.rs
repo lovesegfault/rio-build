@@ -47,6 +47,11 @@ pub const INTENT_DROP_REASONS: &[&str] = &[
     "exceeds_cell_cap",
     "no_hosting_class",
     "no_pool_covers",
+    // live_050(a): the READY all-masked population (solved demand,
+    // named hosting classes) — split from `all_cells_ice_masked` so
+    // the silently-starved population the live hang measured has its
+    // own series; minted at the `PlacementOutcome` fold.
+    "ready_all_cells_ice_masked",
     "unknown_hw_class",
 ];
 

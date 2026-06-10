@@ -42,6 +42,7 @@
       "GetSpawnIntentsRequest",
       "GetSpawnIntentsResponse",
       "AckSpawnedIntentsRequest",
+      "IntentVerdict",
       "BindingSnapshot",
       "BoundIntent",
       "ObservedInstanceType",

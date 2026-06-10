@@ -1593,12 +1593,13 @@ impl NodeClaimPoolReconciler {
         let cover = self.cover_deficit(&unplaced, &live, &masked).await?;
         debug!(created = cover.created.len(), "deficit cover");
         self.inflight_created.extend(cover.created.iter().cloned());
+        let rejected = cover.rejected;
         // Kube-authoritative `intent_id → spec.nodeName` for the
         // scheduler's hung-node detector. Full set every tick (one
         // entry per bound builder pod) so the scheduler's
         // `authoritative_binding` map stays current without delta
         // tracking; cardinality is O(active builds).
-        self.report_unfulfillable(pod_snapshot.bound_intent_protos())
+        self.report_unfulfillable(pod_snapshot.bound_intent_protos(), rejected)
             .await?;
 
         // r42 bug_023: same gauge_universe as `emit_live_gauges` —
@@ -2028,52 +2029,51 @@ impl NodeClaimPoolReconciler {
         let live_cores: u32 = live.iter().map(|n| n.allocatable.0).sum();
         let mut created_cores = 0u32;
 
-        let (by_cell, dropped) =
+        let (by_cell, outcomes) =
             cover::assign_to_cells(unplaced, &self.sketches, ice, cover::cell_rank, |i, m| {
                 self.cfg.fallback_cell(i, &self.hw_config, m)
             });
-        // r41 merged_015: the runbook (sla-model.typ §NoHostingClass) and
-        // pod.rs:769,772 both claim "the controller logs WARN once per
-        // intent drop" — sibling reasons `no_pool_covers`,
-        // `exceeds_cell_cap`, and `unknown_hw_class` already warn; this
-        // was the asymmetric outlier. Per intent-tick (10s), so a
-        // persistent gap is visible in logs without waiting for the 15m
-        // alert window.
-        //
-        // Two `reason`s, two operator actions: collapsing them once
-        // misdiagnosed an account-level AWS spot SLR gap as a
-        // `[sla.hw_classes]` config gap (see `cover::DropTally`).
-        if dropped.no_hosting_class > 0 {
-            metrics::counter!(
-                "rio_controller_nodeclaim_intent_dropped_total",
-                "reason" => "no_hosting_class",
-            )
-            .increment(dropped.no_hosting_class);
-            warn!(
-                dropped = dropped.no_hosting_class,
-                "SpawnIntents dropped — no configured hw-class can host them \
-                 (wrong arch, footprint exceeds every class's max_cores/max_mem, \
-                 or required_features unmatched); add or fix a [sla.hw_classes] \
-                 entry. See sla-model.typ#rionodeclaimpool-nohostingclass"
-            );
+        // r[impl ctrl.nodeclaim.placement-outcome]
+        // The caller's total fold over the PlacementOutcome alphabet:
+        // tally via the shared outcome→tally law, plus the two LOUD
+        // populations' side artifacts — the named-cells WARN input
+        // (ready all-masked) and the typed IntentVerdict mint
+        // (NoHostingClass, live_051(c)). Zero wildcard arms: a new
+        // outcome variant fails compilation here.
+        let dropped = cover::DropTally::from_outcomes(&outcomes);
+        let mut masked_ready: Vec<(&str, &[String])> = Vec::new();
+        let mut rejected: Vec<rio_proto::types::IntentVerdict> = Vec::new();
+        for (i, o) in &outcomes {
+            // The wire mapping is `PlacementOutcome::verdict_reason` —
+            // ONE authority (censused by `exactly_one_outcome_variant_
+            // ships_a_verdict`); the detail string is built here where
+            // the configured-class census lives.
+            if let Some(reason) = o.verdict_reason() {
+                rejected.push(rio_proto::types::IntentVerdict {
+                    intent_id: i.intent_id.clone(),
+                    reason: reason.into(),
+                    detail: format!(
+                        "no [sla.hw_classes] entry hosts system={} cores={} \
+                         mem_bytes={} required_features={:?}; configured classes: [{}]",
+                        i.system,
+                        i.cores,
+                        i.mem_bytes,
+                        i.required_features,
+                        self.hw_config.names().join(", "),
+                    ),
+                });
+            }
+            match o {
+                cover::PlacementOutcome::Placed(_)
+                | cover::PlacementOutcome::LeadTimeGated
+                | cover::PlacementOutcome::NoHostingClass => {}
+                cover::PlacementOutcome::UnplaceableAllMasked { open_rungs: 0 } => {}
+                cover::PlacementOutcome::UnplaceableAllMasked { .. } => {
+                    masked_ready.push((i.intent_id.as_str(), &i.hw_class_names));
+                }
+            }
         }
-        if dropped.all_cells_ice_masked > 0 {
-            metrics::counter!(
-                "rio_controller_nodeclaim_intent_dropped_total",
-                "reason" => "all_cells_ice_masked",
-            )
-            .increment(dropped.all_cells_ice_masked);
-            warn!(
-                dropped = dropped.all_cells_ice_masked,
-                masked_cells = ice.len(),
-                "SpawnIntents dropped — every cell that could host them is \
-                 ICE-masked (NodeClaim launches failing in the cloud, NOT a \
-                 [sla.hw_classes] config gap); check the Karpenter controller \
-                 log for capacity/quota/IAM errors and \
-                 `rio_controller_nodeclaim_reaped_total{{reason=~\"ice|vanished\"}}`. \
-                 See sla-model.typ#rionodeclaimpool-icemaskedhigh"
-            );
-        }
+        emit_drop_tally(&dropped, &masked_ready, ice.len());
         let order =
             cover::cells_round_robin(self.cfg.all_cells(&self.hw_config), self.tick_counter);
 
@@ -2219,7 +2219,7 @@ impl NodeClaimPoolReconciler {
                  scheduler/controller deployment ages"
             );
         }
-        Ok(CoverResult { created })
+        Ok(CoverResult { created, rejected })
     }
 
     /// Report the buffered ICE marks (`unfulfillable_cells`),
@@ -2238,6 +2238,7 @@ impl NodeClaimPoolReconciler {
     async fn report_unfulfillable(
         &mut self,
         bound_intents: Vec<rio_proto::types::BoundIntent>,
+        rejected: Vec<rio_proto::types::IntentVerdict>,
     ) -> anyhow::Result<()> {
         // C2/285: NO empty-tick suppression — this reconciler ALWAYS
         // attaches the binding snapshot (even empty), because
@@ -2316,6 +2317,11 @@ impl NodeClaimPoolReconciler {
                 .collect(),
             observed_instance_types: self.pending_evidence.observed_types().to_vec(),
             bound_intents: vec![],
+            // live_051(c): this tick's NoHostingClass verdicts — the
+            // typed answer to demand the controller cannot host. Ships
+            // exactly one entry per rejected intent per ack; see
+            // `CoverResult::rejected` for the no-buffering derivation.
+            rejected,
         };
         // r[impl ctrl.nodeclaim.evidence-ack-latch+3]
         match admin_call(self.admin.clone().ack_spawned_intents(req)).await {
@@ -2365,6 +2371,98 @@ pub async fn nodeclaim_crd_present(kube: &kube::Client) -> bool {
     }
 }
 
+/// The drop-tally observability fold (live_050(a)): the three LOUD
+/// arms' WARN + metric emission, one block per `DropTally` field —
+/// extracted from `cover_deficit` so the R1 red can drive the warn +
+/// metric assertions directly (the `assign_masked_cell_fails_over_to_od`
+/// pin structurally cannot see this fold). `masked_ready` carries
+/// `(intent_id, hw_class_names)` for the ready all-masked population
+/// (the named-cells WARN input); `masked_cells` is the tick's ICE-mask
+/// cardinality.
+// r[impl ctrl.nodeclaim.placement-outcome]
+pub(crate) fn emit_drop_tally(
+    dropped: &cover::DropTally,
+    masked_ready: &[(&str, &[String])],
+    masked_cells: usize,
+) {
+    let ice_len = masked_cells;
+    // r41 merged_015: the runbook (sla-model.typ §NoHostingClass) and
+    // pod.rs:769,772 both claim "the controller logs WARN once per
+    // intent drop" — sibling reasons `no_pool_covers`,
+    // `exceeds_cell_cap`, and `unknown_hw_class` already warn; this
+    // was the asymmetric outlier. Per intent-tick (10s), so a
+    // persistent gap is visible in logs without waiting for the 15m
+    // alert window.
+    //
+    // Two `reason`s, two operator actions: collapsing them once
+    // misdiagnosed an account-level AWS spot SLR gap as a
+    // `[sla.hw_classes]` config gap (see `cover::DropTally`).
+    if dropped.no_hosting_class > 0 {
+        metrics::counter!(
+            "rio_controller_nodeclaim_intent_dropped_total",
+            "reason" => "no_hosting_class",
+        )
+        .increment(dropped.no_hosting_class);
+        warn!(
+            dropped = dropped.no_hosting_class,
+            "SpawnIntents dropped — no configured hw-class can host them \
+             (wrong arch, footprint exceeds every class's max_cores/max_mem, \
+             or required_features unmatched); add or fix a [sla.hw_classes] \
+             entry. live_051(c): each drop is ALSO answered to the \
+             scheduler as a typed IntentVerdict on the spawn-intent ack \
+             (the scheduler poisons the drv at its verdict budget with \
+             the per-intent detail), so the alert on this counter names \
+             a config gap an operator must still fix — the verdict stops \
+             the Ready-forever loop, not the gap. \
+             See sla-model.typ#rionodeclaimpool-nohostingclass"
+        );
+    }
+    if dropped.all_cells_ice_masked > 0 {
+        metrics::counter!(
+            "rio_controller_nodeclaim_intent_dropped_total",
+            "reason" => "all_cells_ice_masked",
+        )
+        .increment(dropped.all_cells_ice_masked);
+        warn!(
+            dropped = dropped.all_cells_ice_masked,
+            masked_cells = ice_len,
+            "SpawnIntents dropped — every cell that could host them is \
+             ICE-masked (NodeClaim launches failing in the cloud, NOT a \
+             [sla.hw_classes] config gap); check the Karpenter controller \
+             log for capacity/quota/IAM errors and \
+             `rio_controller_nodeclaim_reaped_total{{reason=~\"ice|vanished\"}}`. \
+             See sla-model.typ#rionodeclaimpool-icemaskedhigh"
+        );
+    }
+    if dropped.ready_all_cells_ice_masked > 0 {
+        metrics::counter!(
+            "rio_controller_nodeclaim_intent_dropped_total",
+            "reason" => "ready_all_cells_ice_masked",
+        )
+        .increment(dropped.ready_all_cells_ice_masked);
+        // live_050(a): the READY population (solved demand, named
+        // hosting classes) — the one that silently starved live.
+        // Names the intents and the classes they wanted so the
+        // operator sees WHICH demand the cloud gap is starving;
+        // next action mirrors the sibling arm (Karpenter log /
+        // reaped_total), and the degradation ladder
+        // (`ctrl.nodeclaim.capacity-ladder`) is the structural
+        // next rung once configured.
+        warn!(
+            dropped = dropped.ready_all_cells_ice_masked,
+            masked_cells = ice_len,
+            intents = ?masked_ready,
+            "READY SpawnIntents unplaceable — every hosting cell is \
+             ICE-masked (cloud capacity gap on the named cells, NOT a \
+             [sla.hw_classes] config gap); check the Karpenter controller \
+             log for capacity/quota/IAM errors and \
+             `rio_controller_nodeclaim_reaped_total{{reason=~\"ice|vanished\"}}`; \
+             configure a degradation ladder rung if one exists. \
+             See sla-model.typ#rionodeclaimpool-icemaskedhigh"
+        );
+    }
+}
+
 /// Result of one [`NodeClaimPoolReconciler::cover_deficit`] tick.
 #[derive(Debug, Default)]
 pub(crate) struct CoverResult {
@@ -2373,6 +2471,15 @@ pub(crate) struct CoverResult {
     /// can ICE-mask cells whose claims Karpenter GC'd before we
     /// observed them.
     pub created: Vec<(String, Cell)>,
+    /// live_051(c): per-intent `NoHostingClass` verdicts minted by the
+    /// cover fold this tick, shipped on the SAME tick's
+    /// `AckSpawnedIntentsRequest.rejected`. NOT buffered across acks:
+    /// unlike ICE marks (consume-once producers — bug_082), an
+    /// unhostable intent re-emits every pass until answered, so a lost
+    /// ack re-mints the verdict next tick — at-least-once by
+    /// re-derivation, and the scheduler's consecutive-verdict counter
+    /// keys on emission pass, not ack count.
+    pub rejected: Vec<rio_proto::types::IntentVerdict>,
 }
 
 /// Connect the reconciler's PG pool. Separate from the scheduler/store

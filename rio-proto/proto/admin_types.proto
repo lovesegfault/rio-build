@@ -717,6 +717,45 @@ message AckSpawnedIntentsRequest {
   // stays as the legacy non-empty-only rebuild path for rolling skew
   // (read-side back-compat arm; never dual-written by a C2 sender).
   optional BindingSnapshot binding_snapshot = 6;
+  // live_051(c): per-intent rejection verdicts for intents the
+  // controller structurally CANNOT host — minted from the cover fold's
+  // `PlacementOutcome::NoHostingClass` arm ONLY (a controller-config
+  // gap the scheduler cannot see). ICE-masked populations stay OFF this
+  // field: their masks are the scheduler's own (`ice_masked_cells` /
+  // `unfulfillable_cells`), so a verdict would re-ship information the
+  // scheduler already owns. One entry per rejected intent per ack
+  // (bounded by the tick's drop population); re-minted every tick the
+  // intent stays unhostable, so a lost ack self-heals on the next tick.
+  // The scheduler accumulates consecutive verdicts per drv and poisons
+  // at a typed budget with `detail` as the operator-actionable message
+  // — a drv never loops Ready unanswered.
+  repeated IntentVerdict rejected = 7;
+}
+
+// live_051(c): one rejected spawn intent + WHY, carried on
+// `AckSpawnedIntentsRequest.rejected`. The controller answers demand it
+// cannot host instead of dropping it into a metric-only tally.
+message IntentVerdict {
+  // The rejected intent (== drv_hash), same identity as
+  // `SpawnIntent.intent_id`.
+  string intent_id = 1;
+  // Closed rejection-reason alphabet. Consumers fold EXHAUSTIVELY
+  // (zero wildcard arms) — a new variant forces a consumer decision.
+  IntentVerdictReason reason = 2;
+  // Human-actionable: names the intent's footprint/arch/features and
+  // the configured hw-classes that failed to match, so the poison
+  // message an operator reads is never a bare "no hosting class".
+  string detail = 3;
+}
+
+// Closed reason set for `IntentVerdict.reason`.
+enum IntentVerdictReason {
+  INTENT_VERDICT_REASON_UNSPECIFIED = 0;
+  // No configured `[sla.hw_classes]` entry admits the intent's
+  // (arch, footprint, required_features) — persistent until the
+  // config changes; the scheduler-side budget consumes this to a
+  // terminal poison with `detail`.
+  INTENT_VERDICT_REASON_NO_HOSTING_CLASS = 1;
 }
 
 // C2/285: the full `intent_id → spec.nodeName` binding set for one
