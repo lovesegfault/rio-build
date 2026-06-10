@@ -2861,6 +2861,9 @@ mod tests {
             exec_id: "0198c0de-0000-7000-8000-00000000cafe".into(),
             cause: rio_proto::types::CloseCause::Cancelled as i32,
             closed_age_secs: 60,
+            // Wire default (UNSPECIFIED reads as BUILD — the
+            // pre-field scheduler posture these fixtures model).
+            ..Default::default()
         };
         let active = vec![&fresh];
         let selected = select_closed_attempt_jobs(&active, &[], &[close]);
@@ -2882,6 +2885,7 @@ mod tests {
             exec_id: "0198c0de-0000-7000-8000-00000000beef".into(),
             cause: cause as i32,
             closed_age_secs: 60,
+            ..Default::default()
         };
         let cancelled = close(rio_proto::types::CloseCause::Cancelled);
         // All four hold → selected.

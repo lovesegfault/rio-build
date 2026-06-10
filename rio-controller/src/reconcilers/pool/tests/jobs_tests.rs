@@ -1869,6 +1869,7 @@ fn cancel_arm_selects_only_cancelled_close_causes() {
         exec_id: format!("exec-{intent}"),
         cause: cause as i32,
         closed_age_secs: 5,
+        ..Default::default()
     };
 
     let cancelled = running_job_for_intent("rio-builder-p-can1", "drv-cancelled");
@@ -1932,6 +1933,7 @@ fn cancel_arm_normal_completion_in_lag_window_not_selected() {
         exec_id: "exec-d2".into(),
         cause: CloseCause::Completed as i32,
         closed_age_secs: 3,
+        ..Default::default()
     }];
     assert!(
         select_closed_attempt_jobs(&active, &[], &window).is_empty(),
@@ -1959,6 +1961,7 @@ async fn cancel_arm_deletes_job_on_cancelled_close() {
         exec_id: "exec-e1".into(),
         cause: CloseCause::Cancelled as i32,
         closed_age_secs: 4,
+        ..Default::default()
     }];
 
     let guard = verifier.run(vec![delete_scenario("rio-builder-p-edge1")]);
