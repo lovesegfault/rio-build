@@ -36,6 +36,8 @@ module matDistCalibOwnerServeSkew {
     SHARED_HEAD_CONVOY = false,
     STEAL_ENABLED = true,
     EAGER_STEAL = false,
-    OWNER_SERVE_SKEW = true
+    OWNER_SERVE_SKEW = true,
+    WEDGE_AXIS_ENABLED = false,
+    WEDGED_KEEPS_BEATING = false
   ).* from "../materializationDistribution"
 }

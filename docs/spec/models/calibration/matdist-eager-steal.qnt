@@ -32,6 +32,8 @@ module matDistCalibEagerSteal {
     SHARED_HEAD_CONVOY = false,
     STEAL_ENABLED = true,
     EAGER_STEAL = true,
-    OWNER_SERVE_SKEW = false
+    OWNER_SERVE_SKEW = false,
+    WEDGE_AXIS_ENABLED = false,
+    WEDGED_KEEPS_BEATING = false
   ).* from "../materializationDistribution"
 }

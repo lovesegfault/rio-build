@@ -7684,6 +7684,74 @@ rec {
       ];
     };
 
+    # Round-6 WO-S1-4 (merged_bug_005, store.materialize.honest-beat):
+    # the capability axis in the LIVE law — the rust honest-beat gate
+    # withholds a wedged (conversion-incapable) worker's beats, so its
+    # slice ages into the steal horizon and re-homes to capable
+    # members. SECOND main (the book's bounded-census contingency,
+    # taken by design): the axis is unreachable in the base main
+    # (WEDGE_AXIS_ENABLED=false freezes wedgedAt — the base census is
+    # byte-identical to the pre-axis model), and the wedge main
+    # explores it over ONE designated wedgeable member (WEDGEABLE =
+    # r1w0, a full-membership owner) to keep the check exhaustively
+    # convergent. All seven invariants asserted: the new recovery law
+    # PLUS the six siblings (regression over the axis).
+    # r[verify store.materialize.honest-beat]
+    quint-matdist-wedge-recovery = mkQuintCheck {
+      name = "matdist-wedge-recovery";
+      spec = "materializationDistribution";
+      main = "materializationDistributionWedge";
+      invariants = [
+        "wedgedOwnerSliceRecovered"
+        "ownerMapPartitionsClaimable"
+        "serveSliceDisjointWhenFresh"
+        "serveSliceCoversFreshOwned"
+        "stealOnlyAfterOwnerStaleness"
+        "noJobUnlistedForever"
+        "stealRecoversOrphanedRemainder"
+      ];
+    };
+
+    # The honest-beat falsify twin (round-6 WO-S1-4): a wedged worker
+    # KEEPS beating (WEDGED_KEEPS_BEATING — the as-built pre-fix
+    # world) — eternally fresh, its slice never enters anyone's steal
+    # horizon, and it cannot claim: wedgedOwnerSliceRecovered dies.
+    # maxSamples 25/p from measured traces-to-first-hit (~28-35k
+    # across five seeds, ~190 ms at ~170k traces/s; 25/p ≈ 775k →
+    # 1M, the ice-twin precedent budget).
+    # r[verify store.materialize.honest-beat]
+    quint-matdist-falsify-wedged-poller = mkQuintSimWitnessCheck {
+      name = "matdist-falsify-wedged-poller";
+      spec = "calibration/matdist-wedged-poller";
+      main = "matDistCalibWedgedPoller";
+      extraSpecs = [ "materializationDistribution" ];
+      witness = "wedgedOwnerSliceRecovered";
+      maxSamples = 1000000;
+      maxSteps = 12;
+    };
+
+    # Kill-isolation holds (R16): the wedged-poller twin's kill goes
+    # through the honest-beat recovery leaf ALONE — all six sibling
+    # invariants survive the WEDGED_KEEPS_BEATING lane (the defect
+    # keeps beats flowing, so the sibling census projects into the
+    # base model's; the capability guard only restricts claims).
+    # Exhaustive on the twin module.
+    # r[verify store.materialize.honest-beat]
+    quint-matdist-wedged-siblings-intact = mkQuintCheck {
+      name = "matdist-wedged-siblings-intact";
+      spec = "calibration/matdist-wedged-poller";
+      main = "matDistCalibWedgedPoller";
+      extraSpecs = [ "materializationDistribution" ];
+      invariants = [
+        "ownerMapPartitionsClaimable"
+        "serveSliceDisjointWhenFresh"
+        "serveSliceCoversFreshOwned"
+        "stealOnlyAfterOwnerStaleness"
+        "noJobUnlistedForever"
+        "stealRecoversOrphanedRemainder"
+      ];
+    };
+
     # ------------------------------------------------------------------
     # Gateway connection/session lifecycle campaign (gw-session-formal,
     # round-2 Track B), Phase 0 Stage C: the rio-gateway accept → auth →

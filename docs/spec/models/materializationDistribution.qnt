@@ -60,6 +60,29 @@
 //     equally injective) — the world where owning and serving
 //     disagree, the exact production failure the coverage law
 //     exists to forbid.
+//   - WEDGED_KEEPS_BEATING (round-6 WO-S1-4, merged_bug_005 — the
+//     honest-beat law, store.materialize.honest-beat): a WEDGED
+//     worker (alive, listing, but conversion-incapable — budget
+//     pinned, ledger at cap, or every mint refused) KEEPS beating.
+//     Its slice then never enters anyone's steal horizon: the
+//     wedged-but-polling worker pins ~1/N of the claimable head
+//     fleet-wide. Falsifies wedgedOwnerSliceRecovered. The live law
+//     (the rust honest-beat gate) withholds the beat instead, so
+//     capability loss ages into the steal horizon exactly like
+//     silence does. The capability axis (wedgedAt + the wedge and
+//     unwedge actions) is gated on WEDGE_AXIS_ENABLED and explored
+//     in the SECOND main (materializationDistributionWedge) over a
+//     single designated wedgeable member (WEDGEABLE = r1w0, an
+//     owner at full membership) — the bounded exhaustive census;
+//     the base main binds the axis OFF and keeps its original
+//     census byte-for-byte (wedgedAt is frozen there).
+//
+// BEAT GRANULARITY NOTE (bug_045 / sched.materialize.listing-cost):
+// the Rust listing arm now serves polls from a beat-scoped snapshot
+// (TTL = 1 s) with per-beat staleness; the model's tick already IS
+// the beat, so the cache sits below this abstraction — no model
+// change for the cost law (its witnesses are Rust operation
+// counters).
 //
 // EXACTLY-ONE-LISTING IS A NON-PROPERTY (RULED FS-3): the retired
 // everyClaimableListedToExactlyOneLiveReplicaPerBeat was falsified by
@@ -95,6 +118,16 @@ module materializationDistribution {
   /// (inverted score) — owning and serving disagree (the CF-2
   /// divergence class).
   const OWNER_SERVE_SKEW: bool
+  /// Capability axis master switch (round-6 WO-S1-4): the wedge and
+  /// unwedge actions exist only when enabled. The base main binds
+  /// false — its census is byte-identical to the pre-axis model
+  /// (wedgedAt is frozen at all-capable).
+  const WEDGE_AXIS_ENABLED: bool
+  /// Defect lane (the honest-beat violation, merged_bug_005): a
+  /// wedged worker KEEPS issuing listing beats — the as-built
+  /// pre-fix world where listing recency lies about claim
+  /// capability.
+  const WEDGED_KEEPS_BEATING: bool
 
   /// Per-worker composite members (CF-2): {replica}w{worker}.
   val MEMBERS = Set("r0w0", "r0w1", "r1w0", "r1w1")
@@ -105,6 +138,13 @@ module materializationDistribution {
   /// worker batches).
   pure def workersOf(r: str): Set[str] =
     if (r == "r0") Set("r0w0", "r0w1") else Set("r1w0", "r1w1")
+
+  /// The designated wedgeable member (the bounded wedge-axis census:
+  /// one member's wedge state keeps the second main exhaustively
+  /// checkable; r1w0 OWNS j0 at full membership under `prio`, so the
+  /// wedged-owner premise is reachable, never vacuous). The recovery
+  /// law itself quantifies over ALL owners.
+  val WEDGEABLE = Set("r1w0")
 
   // --- state ----------------------------------------------------------------
 
@@ -122,8 +162,16 @@ module materializationDistribution {
   /// (the premature steal — impossible in the live regime, the
   /// EAGER_STEAL twin's witness).
   var prematureSteal: bool
+  /// Capability axis (round-6 WO-S1-4): the beat a member became
+  /// conversion-incapable (wedged), or -1 = capable. The honest-beat
+  /// gate reads it; only [WEDGEABLE] members ever move it (the
+  /// bounded census).
+  var wedgedAt: str -> int
 
   // --- pure law ---------------------------------------------------------------
+
+  /// Conversion capability: not currently wedged.
+  pure def canConvertAt(w: str -> int, m: str): bool = w.get(m) < 0
 
   pure def jIdx(j: str): int = if (j == "j0") 0 else if (j == "j1") 1 else 2
   pure def mIdx(m: str): int =
@@ -198,7 +246,7 @@ module materializationDistribution {
     now < MAX_TIME,
     now' = now + 1,
     live' = live, lastListed' = lastListed, claimed' = claimed,
-    prematureSteal' = prematureSteal,
+    prematureSteal' = prematureSteal, wedgedAt' = wedgedAt,
   }
 
   /// An identity-bearing listing call: the caller's contact is
@@ -209,6 +257,11 @@ module materializationDistribution {
   /// the P4-allowance inert write; EAGER_STEAL makes it reachable).
   action beatList(m: str): bool = all {
     live.get(m),
+    // The honest beat (merged_bug_005, store.materialize.honest-beat):
+    // a pass that cannot convert withholds the listing — UNLESS the
+    // WEDGED_KEEPS_BEATING defect lane is on (the as-built pre-fix
+    // world the falsify twin certifies).
+    (WEDGED_KEEPS_BEATING or canConvertAt(wedgedAt, m)),
     val ll1 = lastListed.set(m, now)
     val ms = membersAt(ll1, now, MEMBER_TTL)
     val served = serveSetFor(
@@ -221,14 +274,17 @@ module materializationDistribution {
         stolen.exists(j =>
           ownersOf(SHARED_HEAD_CONVOY, j, ms).exists(o => freshAt(ll1, now, STEAL_HORIZON, o))))),
       now' = now, live' = live, claimed' = claimed,
+      wedgedAt' = wedgedAt,
     }
   }
 
   /// A worker claims a job its CURRENT listing would carry (the
   /// discovery abstraction); one-winner arbitration = the claimed
-  /// set.
+  /// set. A wedged worker can never convert (the capability the
+  /// honest beat witnesses).
   action claimJob(m: str, j: str): bool = all {
     live.get(m),
+    canConvertAt(wedgedAt, m),
     not(claimed.contains(j)),
     val ms = membersAt(lastListed, now, MEMBER_TTL)
     serveSetFor(
@@ -236,7 +292,7 @@ module materializationDistribution {
       m, ms, lastListed, now, JOBS.exclude(claimed)).contains(j),
     claimed' = claimed.union(Set(j)),
     now' = now, live' = live, lastListed' = lastListed,
-    prematureSteal' = prematureSteal,
+    prematureSteal' = prematureSteal, wedgedAt' = wedgedAt,
   }
 
   /// Replica scale-out: a BATCH join of the replica's workers
@@ -246,7 +302,7 @@ module materializationDistribution {
     workersOf(r).exists(w => not(live.get(w))),
     live' = MEMBERS.mapBy(m => (live.get(m) or workersOf(r).contains(m))),
     now' = now, lastListed' = lastListed, claimed' = claimed,
-    prematureSteal' = prematureSteal,
+    prematureSteal' = prematureSteal, wedgedAt' = wedgedAt,
   }
 
   /// Replica scale-in: a BATCH leave (CF-2).
@@ -254,7 +310,7 @@ module materializationDistribution {
     workersOf(r).exists(w => live.get(w)),
     live' = MEMBERS.mapBy(m => (live.get(m) and not(workersOf(r).contains(m)))),
     now' = now, lastListed' = lastListed, claimed' = claimed,
-    prematureSteal' = prematureSteal,
+    prematureSteal' = prematureSteal, wedgedAt' = wedgedAt,
   }
 
   /// A single worker dies (the per-worker churn axis: its contact
@@ -264,7 +320,32 @@ module materializationDistribution {
     live.get(m),
     live' = live.set(m, false),
     now' = now, lastListed' = lastListed, claimed' = claimed,
-    prematureSteal' = prematureSteal,
+    prematureSteal' = prematureSteal, wedgedAt' = wedgedAt,
+  }
+
+  /// The capability axis (round-6 WO-S1-4): a member becomes
+  /// conversion-incapable — budget pinned by an unanswered mint, the
+  /// resume ledger at cap, or a conversion-futility streak. The
+  /// member stays LIVE (the wedged-but-polling class); only
+  /// [WEDGEABLE] members wedge (the bounded census).
+  action wedgeWorker(m: str): bool = all {
+    WEDGE_AXIS_ENABLED,
+    WEDGEABLE.contains(m),
+    live.get(m),
+    canConvertAt(wedgedAt, m),
+    wedgedAt' = wedgedAt.set(m, now),
+    now' = now, live' = live, lastListed' = lastListed,
+    claimed' = claimed, prematureSteal' = prematureSteal,
+  }
+
+  /// Capability returns (the futility latch's probe converting, the
+  /// orphan answering, the ledger draining).
+  action unwedgeWorker(m: str): bool = all {
+    WEDGE_AXIS_ENABLED,
+    not(canConvertAt(wedgedAt, m)),
+    wedgedAt' = wedgedAt.set(m, -1),
+    now' = now, live' = live, lastListed' = lastListed,
+    claimed' = claimed, prematureSteal' = prematureSteal,
   }
 
   // --- harness ------------------------------------------------------------------
@@ -275,6 +356,7 @@ module materializationDistribution {
     lastListed' = MEMBERS.mapBy(m => -1),
     claimed' = Set(),
     prematureSteal' = false,
+    wedgedAt' = MEMBERS.mapBy(m => -1),
   }
 
   action step = {
@@ -288,6 +370,8 @@ module materializationDistribution {
       joinReplica(r),
       leaveReplica(r),
       crashWorker(m),
+      wedgeWorker(m),
+      unwedgeWorker(m),
     }
   }
 
@@ -376,6 +460,34 @@ module materializationDistribution {
         ownersOf(SHARED_HEAD_CONVOY, j, ms).exists(o =>
           freshAt(lastListed, now, STEAL_HORIZON, o)))
 
+  /// The honest-beat recovery law (round-6 WO-S1-4, merged_bug_005;
+  /// verified via the nix/quint.nix wedge-recovery + wedged-poller
+  /// entries — the markers live at the WIRING, not here):
+  /// a claimable job whose rendezvous owner is WEDGED (alive but
+  /// conversion-incapable) past the steal-horizon grace measured
+  /// from the WEDGE ONSET is in some capable live member's serve set
+  /// — the withheld beat ages the wedged owner into the steal
+  /// horizon, so capability loss re-homes the slice exactly like
+  /// silence does (the stealRecoversOrphanedRemainder shape re-keyed
+  /// on capability). Under WEDGED_KEEPS_BEATING the wedged poller
+  /// stays eternally fresh and its slice never re-homes — the
+  /// falsify twin's kill. P7: a named single-proposition leaf (one
+  /// implication chain; no anonymous conjunct bundle).
+  val wedgedOwnerSliceRecovered =
+    val ms = membersAt(lastListed, now, MEMBER_TTL)
+    ms.exists(m => live.get(m) and canConvertAt(wedgedAt, m)) implies
+      JOBS.exclude(claimed).forall(j =>
+        ownersOf(SHARED_HEAD_CONVOY, j, ms).forall(o =>
+          (live.get(o) and not(canConvertAt(wedgedAt, o)) and now - wedgedAt.get(o) > STEAL_HORIZON)
+            implies
+          ms.exists(m => and {
+            live.get(m),
+            canConvertAt(wedgedAt, m),
+            serveSetFor(
+              SHARED_HEAD_CONVOY, STEAL_ENABLED, EAGER_STEAL, OWNER_SERVE_SKEW, STEAL_HORIZON,
+              m, ms, lastListed, now, JOBS.exclude(claimed)).contains(j),
+          })))
+
   /// The steal horizon DELIVERS the orphaned remainder: a claimable
   /// job whose owners are all past the steal horizon is in EVERY
   /// member's serve set (served broadly, not just to someone).
@@ -394,7 +506,9 @@ module materializationDistribution {
 
 /// The wired live regime: horizon 1 < ttl 3 < MAX_TIME 6 keeps the
 /// silent-owner gap (stale-but-member) and the TTL re-key both
-/// reachable; defect consts all off.
+/// reachable; defect consts all off; the wedge axis OFF (wedgedAt
+/// frozen at all-capable — the census is byte-identical to the
+/// pre-axis model).
 module materializationDistributionBase {
   import materializationDistribution(
     MAX_TIME = 6,
@@ -403,6 +517,27 @@ module materializationDistributionBase {
     SHARED_HEAD_CONVOY = false,
     STEAL_ENABLED = true,
     EAGER_STEAL = false,
-    OWNER_SERVE_SKEW = false
+    OWNER_SERVE_SKEW = false,
+    WEDGE_AXIS_ENABLED = false,
+    WEDGED_KEEPS_BEATING = false
+  ).*
+}
+
+/// The SECOND main (round-6 WO-S1-4): the wedge axis ON in the live
+/// law — the honest-beat gate withholds the wedged member's beats,
+/// so its slice ages into the steal horizon and re-homes. Bounded
+/// exhaustive census: one designated wedgeable member (WEDGEABLE);
+/// every other parameter as the base regime.
+module materializationDistributionWedge {
+  import materializationDistribution(
+    MAX_TIME = 6,
+    STEAL_HORIZON = 1,
+    MEMBER_TTL = 3,
+    SHARED_HEAD_CONVOY = false,
+    STEAL_ENABLED = true,
+    EAGER_STEAL = false,
+    OWNER_SERVE_SKEW = false,
+    WEDGE_AXIS_ENABLED = true,
+    WEDGED_KEEPS_BEATING = false
   ).*
 }
