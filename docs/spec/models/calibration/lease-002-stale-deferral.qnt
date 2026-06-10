@@ -71,18 +71,11 @@ module leaseCalib002StaleDeferral {
     // what the evidence cursor keys on: consuming "evidence" while the
     // holder-authored content never moved past this node's last
     // completed fetch means the consumed signal was foreign rv churn.
-    evidenceFabricated' = or {
-      evidenceFabricated,
-      MAX_FOREIGN_BUMPS > 0 and lease.content == lastFetchedContent.get(n),
-    },
-    // Live latch (quint-policy P4): the consumption event is THIS
-    // action's firing; evidenceEnabled(n) is its own state-dependent
-    // enabling condition (true at every firing), so the latch carries
-    // a real state-reading writer instead of a const toggle.
-    evidenceConsumed' = or {
-      evidenceConsumed,
-      MAX_FOREIGN_BUMPS > 0 and evidenceEnabled(n),
-    },
+    // P5 latch integrity: the fabrication/consumption oracles live in
+    // the SHARED live module — calibration actions frame them
+    // identity (this pin exercises the deferral plane only).
+    evidenceFabricated' = evidenceFabricated,
+    evidenceConsumed' = evidenceConsumed,
     lastFetchedContent' =
       if (MAX_FOREIGN_BUMPS == 0) lastFetchedContent
       else lastFetchedContent.put(n, lease.content),
