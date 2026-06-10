@@ -124,10 +124,10 @@ fn generic_257_readdir_resume_exhaustive() {
         "resume past the last entry must be empty"
     );
 
-    // d_ino == st_ino for every real entry. Dot entries are excluded by
-    // design: a content-addressed directory has no unique parent, so
-    // "." and ".." self-point and the kernel resolves ".." through the
-    // dcache instead.
+    // d_ino == st_ino for every real entry. Dot entries are excluded:
+    // readdir synthesizes them rather than resolving them via lookup,
+    // and their inos are pinned by tree.rs's
+    // readdir_dotdot_reports_parent_ino.
     for (name, d_ino, _) in &full {
         if name == b"." || name == b".." {
             continue;
@@ -355,11 +355,12 @@ fn generic_401_readdir_kinds_match_getattr() {
 }
 
 /// generic/002 + generic/614 (adapted): link counts and block counts.
-/// Castore reports nlink=1 for every node (there is no backing tree to
-/// mirror — the btrfs-style choice, recorded as finding F-B in
-/// PLAN.md); st_blocks must be ceil(size/512) so `du`/space estimates
-/// on inputs stay sane. Asserting the choice here means a silent
-/// change shows up as a test diff instead of a production surprise.
+/// Castore reports honest nlink: alias count for files/symlinks (1
+/// for a single-path node), 2 + subdirectory count for directories;
+/// st_blocks must be ceil(size/512) so `du`/space estimates on inputs
+/// stay sane. Asserting the choice here means a silent change shows up
+/// as a test diff instead of a production surprise.
+// r[verify builder.fs.castore-nlink]
 #[test]
 fn generic_002_614_nlink_and_blocks() {
     let dir = Directory {
@@ -383,7 +384,10 @@ fn generic_002_614_nlink_and_blocks() {
         .lookup(INodeNo::ROOT.0, b"ggg-xfstests-blocks")
         .expect("root resolves");
 
-    assert_eq!(dir_attr.nlink, 1, "directory nlink is the documented 1");
+    assert_eq!(
+        dir_attr.nlink, 2,
+        "leaf directory nlink is 2 (no subdirectories)"
+    );
 
     for (name, size, want_blocks) in [
         (b"empty".as_slice(), 0, 0),

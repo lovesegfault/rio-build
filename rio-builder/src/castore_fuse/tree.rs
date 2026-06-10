@@ -1,5 +1,5 @@
-//! Mount-time Directory-DAG prefetch and the content-addressed inode
-//! table (ADR-022 §2.2–2.3).
+//! Mount-time Directory-DAG prefetch and the inode table (ADR-022
+//! §2.2–2.3).
 //!
 //! The castore-FUSE serves an immutable tree: the closure's store-path
 //! basenames under a synthetic root, each expanding into the path's
@@ -8,8 +8,19 @@
 //! `GetDirectory(recursive=true)` call before the mount is announced.
 //! Chunk coordinates are NOT prefetched — `open()` resolves them
 //! server-side via `ReadBlob`/`StatBlob` keyed on `file_digest` alone.
+//!
+//! Inode identity is split by node kind: files and symlinks are
+//! content-derived (identical bytes anywhere in the closure share one
+//! inode — legal hardlink semantics, reported via `st_nlink`), while
+//! directories are PATH-derived (each alias of a content-deduped
+//! `Directory` body gets its own inode — POSIX forbids hardlinked
+//! directories, and serving them desyncs tree walkers; see
+//! [`dir_ino`]). The decoded `Directory` bodies, the backing cache,
+//! and the chunk store all stay content-deduped — only the runtime
+//! inode numbers multiply, so heap scales with the closure's path
+//! count rather than its content count.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, UNIX_EPOCH};
 
 use fuser::{FileAttr, FileType, INodeNo};
@@ -86,46 +97,65 @@ pub enum TreeError {
     MissingDirectory { digest: String, returned: usize },
 }
 
-/// The castore-FUSE's entire metadata state: content-derived inode →
-/// node, per-directory child indexes, and the synthetic root's
-/// children. Built once at mount, never mutated.
+/// The castore-FUSE's entire metadata state: inode → node, per-path
+/// directory child indexes, and the synthetic root's children. Built
+/// once at mount, never mutated.
 pub struct InoMap {
     /// ino → node, for every node reachable from the roots. Two files
-    /// with identical bytes and executable bit share one entry.
+    /// with identical bytes and executable bit share one entry; many
+    /// per-path directory inos may map to one `Node::Dir` body digest.
     inodes: HashMap<u64, Node>,
-    /// dir ino → its serve-time child index. Precomputed at build so
-    /// the metadata hot path (`lookup`/`readdir`, the bulk of a cold
-    /// `find` over the closure) never re-derives a child ino (a blake3
-    /// hash each) and never scans a child list — both showed up as
-    /// ~11% of serve-thread CPU before this index existed.
+    /// dir ino → its serve-time child index, one per directory PATH
+    /// (aliases of a content-deduped body each get their own).
+    /// Precomputed at build so the metadata hot path
+    /// (`lookup`/`readdir`, the bulk of a cold `find` over the
+    /// closure) never re-derives a child ino (a blake3 hash each) and
+    /// never scans a child list — both showed up as ~11% of
+    /// serve-thread CPU before this index existed.
     children: HashMap<u64, DirChildren>,
     /// `FUSE_ROOT_ID`'s children: store-path basename → child ino.
     /// `BTreeMap` so `readdir(ROOT)` enumerates in a stable order
     /// across calls (the kernel resumes by offset).
     roots: BTreeMap<Vec<u8>, u64>,
+    /// file/symlink ino → number of paths that reach it (`st_nlink`).
+    /// Deduped content with several aliases is exactly a hardlink, so
+    /// the count must be honest for `du`/`tar` to dedup by
+    /// (dev, ino, nlink). Directory nlink lives in [`DirChildren`].
+    nlink: HashMap<u64, u32>,
+    /// `FUSE_ROOT_ID`'s `st_nlink`: 2 + number of directory roots.
+    root_nlink: u32,
 }
 
 /// One directory's child index. The decoded `Directory` bodies are
 /// dropped after construction — everything the serve path needs is
 /// here and in [`InoMap::inodes`].
 struct DirChildren {
+    /// The directory's parent ino — `readdir`'s `..` entry. Unique
+    /// because inos are per-path: every directory is reached by
+    /// exactly one (parent, name) edge.
+    parent_ino: u64,
     /// The `Directory` body's canonical order (directories, files,
     /// symlinks) with each child's derived ino — `readdir`'s stable
     /// enumeration, offset-resumable because the order never changes.
     entries: Vec<(Vec<u8>, u64, FileType)>,
     /// `lookup(parent, name)` probe: name → derived ino.
     by_name: HashMap<Vec<u8>, u64>,
+    /// `st_nlink`: 2 + subdirectory count (`.`, the parent's entry,
+    /// and one `..` per subdirectory) — the convention fts' leaf-count
+    /// optimization relies on.
+    nlink: u32,
 }
 
 // ── Inode derivation (ADR §2.3) ───────────────────────────────────────
 //
 // `h` = low 63 bits of blake3 with bit 63 set, so every derived ino is
 // ≥ 2^63 and can never collide with `FUSE_ROOT_ID` (= 1). The three
-// node kinds hash different-length inputs (33 / 32 / 1+n bytes), so a
-// file digest can never alias a directory digest. A 63-bit collision
-// between two distinct nodes is ~2^-63 per pair over a ~35k-node tree
-// and would surface as one file's content served for another's path —
-// caught by the build's own output-hash check.
+// node kinds hash domain-separated inputs (33 raw bytes / "d"-prefixed
+// path edge / "l"-prefixed target), so one kind can only alias another
+// through a blake3 preimage. A 63-bit collision between two distinct
+// nodes is ~2^-63 per pair over a ~572k-ino whole-store tree and would
+// surface as one file's content served for another's path — caught by
+// the build's own output-hash check.
 
 fn h(input: &[u8]) -> u64 {
     let d = *blake3::hash(input).as_bytes();
@@ -138,7 +168,7 @@ fn h(input: &[u8]) -> u64 {
 /// paths sharing an inode share their mode. Both inodes still resolve
 /// to the same backing-cache file (keyed by `file_digest` alone), so
 /// the split costs one extra `struct inode`, not a second fetch.
-// r[impl builder.fs.castore-inode-digest]
+// r[impl builder.fs.castore-inode-digest+1]
 pub fn file_ino(file_digest: &[u8; 32], executable: bool) -> u64 {
     let mut buf = [0u8; 33];
     buf[..32].copy_from_slice(file_digest);
@@ -146,11 +176,27 @@ pub fn file_ino(file_digest: &[u8; 32], executable: bool) -> u64 {
     h(&buf)
 }
 
-/// `ino(DirectoryEntry) = h(dir_digest)`. Identical subtrees share one
-/// inode and one dcache subtree regardless of which store path led
-/// there.
-pub fn dir_ino(dir_digest: &[u8; 32]) -> u64 {
-    h(dir_digest)
+/// `ino(DirectoryEntry) = h("d" ‖ parent_ino LE ‖ name)` — PATH
+/// identity, not content. Content-deduping directory inos (the old
+/// `h(dir_digest)` scheme) gave one inode to every alias of an
+/// identical subtree — hardlinked-directory semantics, which
+/// POSIX/Linux forbid (`link(2)` on a directory is EPERM) precisely
+/// because multiple parents break tree walkers: the kernel holds ONE
+/// dentry for the shared inode and re-parents it whenever a concurrent
+/// walk takes a different alias, so GNU find's fts — ascending via
+/// `openat(fd, "..")` and comparing (dev, ino) against the remembered
+/// parent — sees a mismatch, fabricates ENOENT, and aborts with zero
+/// failing syscalls. Per-path inos restore the single-parent
+/// invariant; the decoded body, backing cache, and chunks stay deduped
+/// by digest. Roots hang under `FUSE_ROOT_ID`:
+/// `dir_ino(INodeNo::ROOT.0, basename)`.
+// r[impl builder.fs.castore-inode-digest+1]
+pub fn dir_ino(parent_ino: u64, name: &[u8]) -> u64 {
+    let mut buf = Vec::with_capacity(1 + 8 + name.len());
+    buf.push(b'd');
+    buf.extend_from_slice(&parent_ino.to_le_bytes());
+    buf.extend_from_slice(name);
+    h(&buf)
 }
 
 /// `ino(SymlinkEntry) = h("l" ‖ target)`. The `"l"` prefix separates
@@ -263,43 +309,41 @@ impl InoMap {
         }
 
         let mut inodes: HashMap<u64, Node> = HashMap::new();
+        let mut nlink: HashMap<u64, u32> = HashMap::new();
         let mut root_children: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
-        // Directories whose children still need inodes. Explicit stack:
-        // the DAG is content-deduped but can be deep.
-        let mut pending: Vec<[u8; 32]> = Vec::new();
-        let mut visited: HashSet<[u8; 32]> = HashSet::new();
-
-        let insert_dir = |digest: [u8; 32],
-                          inodes: &mut HashMap<u64, Node>,
-                          pending: &mut Vec<[u8; 32]>,
-                          visited: &mut HashSet<[u8; 32]>|
-         -> u64 {
-            let ino = dir_ino(&digest);
-            inodes.insert(ino, Node::Dir { dir_digest: digest });
-            if visited.insert(digest) {
-                pending.push(digest);
-            }
-            ino
-        };
+        // Directory PATHS whose children still need inodes:
+        // (own ino, body digest, parent ino). Per-path expansion — a
+        // content-deduped body is revisited once per alias, so the walk
+        // is bounded by the closure's path count (~572k on a
+        // whole-store mount), not its body count. Explicit stack: the
+        // tree can be deep.
+        let mut pending: Vec<(u64, [u8; 32], u64)> = Vec::new();
 
         // `ctx` is the error context for a bad digest length: the input
         // root's store path, or the parent directory's hex digest.
-        let insert_file =
-            |f: &FileEntry, ctx: &str, inodes: &mut HashMap<u64, Node>| -> Result<u64, TreeError> {
-                let digest = digest32(&f.digest, ctx)?;
-                let ino = file_ino(&digest, f.executable);
-                inodes.insert(
-                    ino,
-                    Node::File {
-                        file_digest: digest,
-                        size: f.size,
-                        executable: f.executable,
-                    },
-                );
-                Ok(ino)
-            };
+        let insert_file = |f: &FileEntry,
+                           ctx: &str,
+                           inodes: &mut HashMap<u64, Node>,
+                           nlink: &mut HashMap<u64, u32>|
+         -> Result<u64, TreeError> {
+            let digest = digest32(&f.digest, ctx)?;
+            let ino = file_ino(&digest, f.executable);
+            inodes.insert(
+                ino,
+                Node::File {
+                    file_digest: digest,
+                    size: f.size,
+                    executable: f.executable,
+                },
+            );
+            *nlink.entry(ino).or_insert(0) += 1;
+            Ok(ino)
+        };
 
-        let insert_symlink = |s: &SymlinkEntry, inodes: &mut HashMap<u64, Node>| -> u64 {
+        let insert_symlink = |s: &SymlinkEntry,
+                              inodes: &mut HashMap<u64, Node>,
+                              nlink: &mut HashMap<u64, u32>|
+         -> u64 {
             let ino = symlink_ino(&s.target);
             inodes.insert(
                 ino,
@@ -307,9 +351,11 @@ impl InoMap {
                     target: s.target.clone(),
                 },
             );
+            *nlink.entry(ino).or_insert(0) += 1;
             ino
         };
 
+        let mut root_nlink: u32 = 2;
         for (store_path, root) in roots {
             let basename = store_path
                 .rsplit('/')
@@ -321,10 +367,16 @@ impl InoMap {
             let ino = match &root.node {
                 Some(root_node::Node::DirDigest(d)) => {
                     let digest = digest32(d, store_path)?;
-                    insert_dir(digest, &mut inodes, &mut pending, &mut visited)
+                    let ino = dir_ino(INodeNo::ROOT.0, basename.as_bytes());
+                    inodes.insert(ino, Node::Dir { dir_digest: digest });
+                    pending.push((ino, digest, INodeNo::ROOT.0));
+                    root_nlink += 1;
+                    ino
                 }
-                Some(root_node::Node::File(f)) => insert_file(f, store_path, &mut inodes)?,
-                Some(root_node::Node::Symlink(s)) => insert_symlink(s, &mut inodes),
+                Some(root_node::Node::File(f)) => {
+                    insert_file(f, store_path, &mut inodes, &mut nlink)?
+                }
+                Some(root_node::Node::Symlink(s)) => insert_symlink(s, &mut inodes, &mut nlink),
                 None => {
                     return Err(TreeError::MissingRootNode {
                         store_path: store_path.clone(),
@@ -345,8 +397,8 @@ impl InoMap {
             }
         }
 
-        let mut children: HashMap<u64, DirChildren> = HashMap::with_capacity(dirs.len());
-        while let Some(digest) = pending.pop() {
+        let mut children: HashMap<u64, DirChildren> = HashMap::with_capacity(pending.len());
+        while let Some((self_ino, digest, parent_ino)) = pending.pop() {
             let Some(dir) = dirs.get(&digest) else {
                 return Err(TreeError::MissingDirectory {
                     digest: hex::encode(digest),
@@ -359,29 +411,46 @@ impl InoMap {
             let mut entries: Vec<(Vec<u8>, u64, FileType)> =
                 Vec::with_capacity(dir.directories.len() + dir.files.len() + dir.symlinks.len());
             for d in &dir.directories {
-                let child = digest32(&d.digest, &ctx)?;
-                let ino = insert_dir(child, &mut inodes, &mut pending, &mut visited);
+                let child_digest = digest32(&d.digest, &ctx)?;
+                let ino = dir_ino(self_ino, &d.name);
+                inodes.insert(
+                    ino,
+                    Node::Dir {
+                        dir_digest: child_digest,
+                    },
+                );
+                pending.push((ino, child_digest, self_ino));
                 entries.push((d.name.clone(), ino, FileType::Directory));
             }
             for f in &dir.files {
-                let ino = insert_file(f, &ctx, &mut inodes)?;
+                let ino = insert_file(f, &ctx, &mut inodes, &mut nlink)?;
                 entries.push((f.name.clone(), ino, FileType::RegularFile));
             }
             for s in &dir.symlinks {
-                let ino = insert_symlink(s, &mut inodes);
+                let ino = insert_symlink(s, &mut inodes, &mut nlink);
                 entries.push((s.name.clone(), ino, FileType::Symlink));
             }
             let by_name = entries
                 .iter()
                 .map(|(n, ino, _)| (n.clone(), *ino))
                 .collect();
-            children.insert(dir_ino(&digest), DirChildren { entries, by_name });
+            children.insert(
+                self_ino,
+                DirChildren {
+                    parent_ino,
+                    nlink: 2 + dir.directories.len() as u32,
+                    entries,
+                    by_name,
+                },
+            );
         }
 
         Ok(Self {
             inodes,
             children,
             roots: root_children,
+            nlink,
+            root_nlink,
         })
     }
 
@@ -404,11 +473,20 @@ impl InoMap {
 
     /// Canonical store-path attributes for `ino`. Everything is owned
     /// by root, timestamped at epoch+1s, and read-only — the same
-    /// normalization the NAR format applies.
+    /// normalization the NAR format applies. `st_nlink` is honest:
+    /// alias count for files/symlinks, 2 + subdirectories for
+    /// directories.
     // r[impl builder.fuse.canonical-metadata+2]
+    // r[impl builder.fs.castore-nlink]
     pub fn attr(&self, ino: u64) -> Option<FileAttr> {
         if ino == INodeNo::ROOT.0 {
-            return Some(make_attr(ino, FileType::Directory, 0, 0o555));
+            return Some(make_attr(
+                ino,
+                FileType::Directory,
+                0,
+                0o555,
+                self.root_nlink,
+            ));
         }
         let (kind, size, perm) = match self.inodes.get(&ino)? {
             Node::Dir { .. } => (FileType::Directory, 0, 0o555),
@@ -421,7 +499,11 @@ impl InoMap {
             ),
             Node::Symlink { target } => (FileType::Symlink, target.len() as u64, 0o777),
         };
-        Some(make_attr(ino, kind, size, perm))
+        let nlink = match kind {
+            FileType::Directory => self.children.get(&ino).map_or(2, |c| c.nlink),
+            _ => self.nlink.get(&ino).copied().unwrap_or(1),
+        };
+        Some(make_attr(ino, kind, size, perm, nlink))
     }
 
     /// The node behind `ino`, for `open()`'s `ino → file_digest`
@@ -432,10 +514,11 @@ impl InoMap {
 
     /// Enumerate `ino`'s children starting from `offset` (the kernel's
     /// resume point; 0 on the first call). `None` if `ino` is not a
-    /// directory. Emits `.` and `..` at offsets 1 and 2 — a
-    /// content-addressed dir has no unique parent, so both point at
-    /// the dir itself; the kernel resolves `..` through the dcache and
-    /// never through these inos.
+    /// directory. Emits `.` and `..` at offsets 1 and 2; `..` carries
+    /// the parent's ino (per-path inos give every directory exactly
+    /// one parent) because fts-based walkers compare it against the
+    /// directory they descended from. The mount root's `..` is itself,
+    /// the FUSE convention — the kernel resolves the mount boundary.
     pub fn readdir(&self, ino: u64, offset: u64) -> Option<impl Iterator<Item = DirEntry<'_>>> {
         let dir = if ino == INodeNo::ROOT.0 {
             None
@@ -445,9 +528,10 @@ impl InoMap {
             Some(self.children.get(&ino)?)
         };
 
+        let parent_ino = dir.map_or(INodeNo::ROOT.0, |c| c.parent_ino);
         let dots = [
             (ino, FileType::Directory, b".".as_slice()),
-            (ino, FileType::Directory, b"..".as_slice()),
+            (parent_ino, FileType::Directory, b"..".as_slice()),
         ];
 
         // Root: enumerate the closure's basenames. Non-root: the
@@ -492,7 +576,7 @@ impl InoMap {
     }
 }
 
-fn make_attr(ino: u64, kind: FileType, size: u64, perm: u16) -> FileAttr {
+fn make_attr(ino: u64, kind: FileType, size: u64, perm: u16, nlink: u32) -> FileAttr {
     let t = UNIX_EPOCH + STORE_MTIME;
     FileAttr {
         ino: INodeNo(ino),
@@ -504,7 +588,7 @@ fn make_attr(ino: u64, kind: FileType, size: u64, perm: u16) -> FileAttr {
         crtime: t,
         kind,
         perm,
-        nlink: 1,
+        nlink,
         uid: 0,
         gid: 0,
         rdev: 0,
@@ -695,22 +779,18 @@ mod tests {
         assert_eq!(TTL, Duration::MAX);
     }
 
-    /// Content-addressed inode identity (ADR §2.3): same bytes anywhere
-    /// in the closure → same inode (one icache entry, one fetch, one
-    /// page cache); same bytes but different executable bit → distinct
-    /// inodes (st_mode is per-inode in VFS); identical directories
-    /// reached from different store paths → one shared subtree.
-    // r[verify builder.fs.castore-inode-digest]
+    /// File/symlink inode identity (ADR §2.3): same bytes anywhere in
+    /// the closure → same inode (one icache entry, one fetch, one page
+    /// cache); same bytes but different executable bit → distinct
+    /// inodes (st_mode is per-inode in VFS). Directory identity is
+    /// per-path — covered by `dir_alias_inodes_are_per_path`.
+    // r[verify builder.fs.castore-inode-digest+1]
     #[test]
     fn inode_identity_is_content_derived() {
         let (roots, dirs) = sample();
         let map = InoMap::from_parts(&roots, dirs).expect("build tree");
 
-        // aaa-pkg/lib and bbb-dup/lib are the same Directory body →
-        // same ino → the dcache subtree is shared.
         let (a, _) = lookup_path(&map, &[b"aaa-pkg", b"lib"]).unwrap();
-        let (b, _) = lookup_path(&map, &[b"bbb-dup", b"lib"]).unwrap();
-        assert_eq!(a, b, "identical dirs share one inode");
 
         // Same file digest, same exec bit, different paths → same ino.
         let (f1, _) = lookup_path(&map, &[b"aaa-pkg", b"lib", b"libfoo.so"]).unwrap();
@@ -802,14 +882,19 @@ mod tests {
     /// (ADR §2.3). They must agree — a drifted index would let lookup
     /// advertise one inode while `open()`/`getattr` (which go through
     /// the node table) serve another.
-    // r[verify builder.fs.castore-inode-digest]
+    // r[verify builder.fs.castore-inode-digest+1]
     #[test]
     fn child_index_agrees_with_ino_derivation() {
         let (roots, dirs) = sample();
         let map = InoMap::from_parts(&roots, dirs).expect("build tree");
 
+        // Directory inos chain from the root: h-derived per path edge.
+        let aaa_ino = dir_ino(INodeNo::ROOT.0, b"aaa-pkg");
+        assert_eq!(map.lookup(INodeNo::ROOT.0, b"aaa-pkg").unwrap().0, aaa_ino);
         let (lib_ino, _) = lookup_path(&map, &[b"aaa-pkg", b"lib"]).unwrap();
         let (bin_ino, _) = lookup_path(&map, &[b"aaa-pkg", b"bin"]).unwrap();
+        assert_eq!(lib_ino, dir_ino(aaa_ino, b"lib"));
+        assert_eq!(bin_ino, dir_ino(aaa_ino, b"bin"));
         assert_eq!(
             map.lookup(lib_ino, b"libfoo.so").unwrap().0,
             file_ino(&[1u8; 32], false)
@@ -831,6 +916,144 @@ mod tests {
                 assert_eq!(ino, e.ino, "readdir/lookup ino mismatch for {:?}", e.name);
             }
         }
+    }
+
+    /// Directories must get one inode PER PATH, not per content:
+    /// `aaa-pkg/lib` and `bbb-dup/lib` decode to the byte-identical
+    /// `Directory` body, but sharing an inode is hardlinked-directory
+    /// semantics, which POSIX forbids (link(2) on a directory is
+    /// EPERM). With a shared inode the kernel re-parents the one
+    /// dentry alias whenever a concurrent path walk takes the other
+    /// route, and GNU find's fts — which ascends via openat(fd, "..")
+    /// and compares (dev, ino) against the remembered parent —
+    /// fabricates ENOENT and aborts with zero failing syscalls.
+    /// Files and symlinks keep content-derived dedup (legal hardlink
+    /// semantics) with an honest st_nlink alias count so du/tar dedup
+    /// by (dev, ino, nlink) keeps working.
+    // r[verify builder.fs.castore-inode-digest+1]
+    // r[verify builder.fs.castore-nlink]
+    #[test]
+    fn dir_alias_inodes_are_per_path() {
+        let (roots, dirs) = sample();
+        let map = InoMap::from_parts(&roots, dirs).expect("build tree");
+
+        // The two aliases of the deduped leaf directory: distinct inos.
+        let (lib_a, _) = lookup_path(&map, &[b"aaa-pkg", b"lib"]).unwrap();
+        let (lib_b, _) = lookup_path(&map, &[b"bbb-dup", b"lib"]).unwrap();
+        assert_ne!(
+            lib_a, lib_b,
+            "two paths to the same Directory body must be distinct inodes \
+             (hardlinked directories are illegal)"
+        );
+
+        // readdir of each parent advertises that parent's alias ino.
+        let readdir_ino = |dir: u64, name: &[u8]| -> u64 {
+            map.readdir(dir, 0)
+                .expect("is a dir")
+                .find(|e| e.name == name)
+                .expect("entry listed")
+                .ino
+        };
+        let (aaa, _) = map.lookup(INodeNo::ROOT.0, b"aaa-pkg").unwrap();
+        let (bbb, _) = map.lookup(INodeNo::ROOT.0, b"bbb-dup").unwrap();
+        assert_eq!(readdir_ino(aaa, b"lib"), lib_a);
+        assert_eq!(readdir_ino(bbb, b"lib"), lib_b);
+
+        // A byte-identical FILE under both parents stays ONE inode
+        // (legitimate hardlink dedup) and reports both aliases in
+        // st_nlink.
+        let (f1, a1) = lookup_path(&map, &[b"aaa-pkg", b"lib", b"libfoo.so"]).unwrap();
+        let (f2, a2) = lookup_path(&map, &[b"bbb-dup", b"lib", b"libfoo.so"]).unwrap();
+        assert_eq!(f1, f2, "identical files share one inode");
+        assert_eq!(a1.nlink, 2, "st_nlink counts both path aliases");
+        assert_eq!(a2.nlink, 2);
+
+        // A file with a single path keeps nlink 1.
+        let (_, tool) = lookup_path(&map, &[b"aaa-pkg", b"bin", b"tool"]).unwrap();
+        assert_eq!(tool.nlink, 1, "unaliased file has nlink 1");
+    }
+
+    /// readdir's `..` entry must carry the PARENT's inode (and `.` the
+    /// directory's own): fts/find compare the d_ino of `..` against
+    /// the parent they descended from, so a self-referential `..`
+    /// d_ino is disinformation. The per-path inode scheme gives every
+    /// directory exactly one parent, so the true parent ino is always
+    /// known. The mount root keeps the FUSE convention (its `..` is
+    /// itself — the kernel resolves the mount boundary).
+    #[test]
+    fn readdir_dotdot_reports_parent_ino() {
+        let (roots, dirs) = sample();
+        let map = InoMap::from_parts(&roots, dirs).expect("build tree");
+
+        let dot_inos = |dir: u64| -> (u64, u64) {
+            let mut it = map.readdir(dir, 0).expect("is a dir");
+            let dot = it.next().expect("`.` first");
+            assert_eq!(dot.name, b".");
+            let dotdot = it.next().expect("`..` second");
+            assert_eq!(dotdot.name, b"..");
+            (dot.ino, dotdot.ino)
+        };
+
+        // Mount root: both dots are the root itself.
+        assert_eq!(
+            dot_inos(INodeNo::ROOT.0),
+            (INodeNo::ROOT.0, INodeNo::ROOT.0)
+        );
+
+        // Store-path root dirs hang under FUSE_ROOT_ID.
+        let (aaa, _) = map.lookup(INodeNo::ROOT.0, b"aaa-pkg").unwrap();
+        let (bbb, _) = map.lookup(INodeNo::ROOT.0, b"bbb-dup").unwrap();
+        assert_eq!(dot_inos(aaa), (aaa, INodeNo::ROOT.0));
+
+        // Each alias of the deduped leaf reports ITS OWN parent.
+        let (lib_a, _) = lookup_path(&map, &[b"aaa-pkg", b"lib"]).unwrap();
+        let (lib_b, _) = lookup_path(&map, &[b"bbb-dup", b"lib"]).unwrap();
+        assert_eq!(dot_inos(lib_a), (lib_a, aaa));
+        assert_eq!(dot_inos(lib_b), (lib_b, bbb));
+    }
+
+    /// Every readdir entry of every directory alias must resolve via
+    /// `lookup(alias_ino, name)` to the SAME ino readdir advertised —
+    /// i.e. each alias's enumeration belongs to that alias's subtree.
+    #[test]
+    fn readdir_alias_children_match_lookup_through_alias() {
+        let (roots, dirs) = sample();
+        let map = InoMap::from_parts(&roots, dirs).expect("build tree");
+
+        let (lib_a, _) = lookup_path(&map, &[b"aaa-pkg", b"lib"]).unwrap();
+        let (lib_b, _) = lookup_path(&map, &[b"bbb-dup", b"lib"]).unwrap();
+        let (bin, _) = lookup_path(&map, &[b"aaa-pkg", b"bin"]).unwrap();
+        let (aaa, _) = map.lookup(INodeNo::ROOT.0, b"aaa-pkg").unwrap();
+        let (bbb, _) = map.lookup(INodeNo::ROOT.0, b"bbb-dup").unwrap();
+        for dir in [lib_a, lib_b, bin, aaa, bbb] {
+            for e in map.readdir(dir, 2).expect("is a dir") {
+                let (ino, _) = map.lookup(dir, e.name).expect("readdir name resolves");
+                assert_eq!(
+                    ino, e.ino,
+                    "readdir/lookup ino mismatch under {dir:#x} for {:?}",
+                    e.name
+                );
+            }
+        }
+    }
+
+    /// Directory st_nlink follows the 2-plus-subdirectories convention
+    /// (`.` + parent's entry + one `..` per subdirectory), so fts'
+    /// leaf-count optimization sees honest numbers.
+    // r[verify builder.fs.castore-nlink]
+    #[test]
+    fn dir_nlink_is_two_plus_subdir_count() {
+        let (roots, dirs) = sample();
+        let map = InoMap::from_parts(&roots, dirs).expect("build tree");
+
+        // ROOT: two of the four closure roots are directories.
+        assert_eq!(map.attr(INodeNo::ROOT.0).unwrap().nlink, 4);
+        // aaa-pkg has two subdirectories (bin, lib).
+        let (_, aaa) = map.lookup(INodeNo::ROOT.0, b"aaa-pkg").unwrap();
+        assert_eq!(aaa.nlink, 4);
+        // lib is a leaf directory.
+        let (_, lib) = lookup_path(&map, &[b"aaa-pkg", b"lib"]).unwrap();
+        assert_eq!(lib.nlink, 2);
     }
 
     /// A DAG that references a directory the server never streamed must
