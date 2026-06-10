@@ -1159,36 +1159,32 @@ fn build_executor_container(
                 // per-cap rationale (SETUID/GID for nixbld drop,
                 // NET_ADMIN for lo up in newns, SETPCAP for the
                 // inheritable-caps dance post-CVE-2022-24769, etc).
-                add: Some({
-                    let mut caps: Vec<String> = vec![
-                        "SYS_ADMIN".into(),
-                        "SYS_CHROOT".into(),
-                        "SETUID".into(),
-                        "SETGID".into(),
-                        "NET_ADMIN".into(),
-                        "CHOWN".into(),
-                        "DAC_OVERRIDE".into(),
-                        "KILL".into(),
-                        "FOWNER".into(),
-                        "SETPCAP".into(),
-                    ];
+                add: Some(vec![
+                    "SYS_ADMIN".into(),
+                    "SYS_CHROOT".into(),
+                    "SETUID".into(),
+                    "SETGID".into(),
+                    "NET_ADMIN".into(),
+                    "CHOWN".into(),
+                    "DAC_OVERRIDE".into(),
+                    "KILL".into(),
+                    "FOWNER".into(),
+                    "SETPCAP".into(),
                     // IPC_LOCK exempts the worker from per-user
                     // pinned-memory accounting (RLIMIT_MEMLOCK, 8 MiB
                     // containerd default), which io_uring_setup
                     // otherwise trips with ENOMEM (observed on EKS
                     // kernel 7.0.8; CAP_IPC_LOCK was the verified
                     // delta). The castore-FUSE serves exclusively over
-                    // fuse-over-io_uring, so every builder pod needs
-                    // the cap — without it no castore mount comes up.
-                    // Untrusted build code does not inherit it:
-                    // nix-daemon drops builds to the non-root nixbld
-                    // users, which clears the capability. Fetchers run
-                    // no castore-FUSE and never get it.
-                    if !fetcher {
-                        caps.push("IPC_LOCK".into());
-                    }
-                    caps
-                }),
+                    // fuse-over-io_uring, and EVERY executor pod runs
+                    // it — fetchers included: the FOD sandbox's
+                    // overlay lower is the per-build castore mount
+                    // (overlay.rs), so a fetcher without the cap fails
+                    // every FOD. Untrusted build code does not inherit
+                    // it: nix-daemon drops builds to the non-root
+                    // nixbld users, which clears the capability.
+                    "IPC_LOCK".into(),
+                ]),
                 ..Default::default()
             }),
             // allowPrivilegeEscalation=true: runc's no_new_privs
@@ -1508,14 +1504,18 @@ mod tests {
         assert_eq!(POOL_IDLE_EXIT_SECS, 120);
     }
 
-    /// Builder pods get `CAP_IPC_LOCK` unconditionally: the
+    /// EVERY executor pod gets `CAP_IPC_LOCK` — fetchers included: the
     /// castore-FUSE serves exclusively over fuse-over-io_uring, and
     /// without the cap the kernel's pinned-memory accounting (8 MiB
     /// containerd RLIMIT_MEMLOCK default) fails `io_uring_setup` with
-    /// ENOMEM — no castore mount could ever come up. Fetchers run no
-    /// castore-FUSE and must NOT carry the cap (no blanket widening).
+    /// ENOMEM — no castore mount could ever come up. The fetcher's
+    /// worker mounts the castore too (the FOD sandbox's overlay lower
+    /// serves the fetch script's input closure); withholding the cap
+    /// from fetchers made every FOD fail and wedged
+    /// vm-fetcher-split-k3s with zero builder pods (the consumer was
+    /// never dispatched).
     #[test]
-    fn builder_pool_gets_ipc_lock_cap() {
+    fn executor_pods_get_ipc_lock_cap() {
         let caps_of = |pool: &Pool| -> Vec<String> {
             build_executor_container(
                 pool,
@@ -1532,18 +1532,14 @@ mod tests {
             .add
             .unwrap()
         };
-        let builder = crate::fixtures::test_pool("u", ExecutorKind::Builder);
-        let caps = caps_of(&builder);
-        assert!(
-            caps.iter().any(|c| c == "IPC_LOCK"),
-            "builder pod carries IPC_LOCK; got {caps:?}"
-        );
-
-        let fetcher = crate::fixtures::test_pool("c", ExecutorKind::Fetcher);
-        assert!(
-            !caps_of(&fetcher).iter().any(|c| c == "IPC_LOCK"),
-            "fetcher pod must not carry IPC_LOCK"
-        );
+        for kind in [ExecutorKind::Builder, ExecutorKind::Fetcher] {
+            let pool = crate::fixtures::test_pool("u", kind);
+            let caps = caps_of(&pool);
+            assert!(
+                caps.iter().any(|c| c == "IPC_LOCK"),
+                "{kind:?} pod carries IPC_LOCK; got {caps:?}"
+            );
+        }
     }
 
     /// `LLVM_PROFILE_FILE` carries `$(RIO_EXECUTOR_ID)` for per-pod

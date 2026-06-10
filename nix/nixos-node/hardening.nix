@@ -69,9 +69,9 @@
       # switch (CONFIG_FUSE_IO_URING gates the knob's existence). fuse
       # is loaded as a module (kernel.nix boot.kernelModules), and
       # modulename.param= on the cmdline applies at modprobe.
-      # Node-wide on the worker AMI: harmless on fetcher/general nodes
-      # (the fetcher seccomp denies io_uring and nothing there mounts
-      # a castore-FUSE), it only raises a kernel default.
+      # Node-wide on the worker AMI: REQUIRED on fetcher nodes too —
+      # the fetcher's worker serves the same castore-FUSE for the FOD
+      # sandbox's overlay lower, over the same uring-only transport.
       # Runtime-writable at /sys/module/fuse/parameters/enable_uring
       # if it ever needs to be flipped without a reboot.
       "fuse.enable_uring=1"

@@ -347,11 +347,12 @@ typed observation budget this rule requires.
   cross-process *write* syscall `process_vm_writev` on top of RuntimeDefault's
   \~40-syscall denylist, while keeping the read-side trace syscalls `ptrace`
   and `process_vm_readv` permitted (the builder profile only; the fetcher
-  profile denies all five). The builder profile additionally re-allows
+  profile denies all five). Both profiles additionally re-allow
   `io_uring_setup`/`io_uring_enter`/`io_uring_register` (in RuntimeDefault's
   denylist since Docker v24) so the worker's fuse-over-io_uring castore
-  transport can engage; the fetcher profile keeps them denied. The profile
-  JSON lives at
+  transport can engage --- every executor pod serves it, fetchers included
+  (the FOD sandbox's overlay lower is the per-build castore mount). The
+  profile JSON lives at
   `nix/nixos-node/seccomp/rio-{builder,fetcher}.json`; the chart's default
   `localhostProfile` is `operator/rio-builder.json` (fetchers hardcode
   `operator/rio-fetcher.json`) --- that path is relative to
@@ -371,9 +372,21 @@ the transport (the worker's only castore-FUSE transport) to come up:
 accounting, and the containerd-default `RLIMIT_MEMLOCK` (8 MiB) fails it with
 `ENOMEM` --- observed on the EKS worker nodes. The controller therefore
 grants `CAP_IPC_LOCK` --- which exempts a process from that accounting --- to
-every builder-pool executor container, and never to fetchers (which run no
-castore-FUSE). Untrusted build code does not inherit the capability:
-nix-daemon runs builds as the non-root `nixbld` users, which clears it.
+every executor container, fetcher pools included: the fetcher's worker mounts
+the castore too (the FOD sandbox's overlay lower serves the fetch script's
+input closure), so a fetcher without the capability fails every FOD.
+Untrusted build code does not inherit the capability: nix-daemon runs builds
+as the non-root `nixbld` users, which clears it.
+
+Residual risk, accepted: seccomp filters (unlike capabilities) survive the
+uid drop, so untrusted code in any executor pod --- including the
+internet-facing fetch scripts of FODs --- can issue io_uring syscalls, a
+kernel surface with a container-escape CVE history that RuntimeDefault
+deliberately denies. This is the cost of fuse-over-io_uring being the only
+castore transport. The planned hardening is a process split: the
+FUSE-serving worker keeps the io_uring-allowed profile while fetch/build
+children get a nested seccomp filter (installed before exec) that re-denies
+the trio --- tracked as a TODO at the profile generator.
 
 The read-side trace syscalls are permitted because denying them breaks every
 build whose check phase traces its own processes: LeakSanitizer's at-exit

@@ -38,7 +38,14 @@ const WORKER_CAPS: &[&str] = &["CAP_SYS_ADMIN", "CAP_SYS_CHROOT"];
 /// cluster is single-tenant today — revisit (e.g. a nested seccomp
 /// filter on the build child, or splitting the FUSE serve into its own
 /// process/profile) before onboarding untrusted tenants. The fetcher
-/// profile keeps the trio denied (`FETCHER_EXTRA_DENIED` in lint.rs).
+/// profile allows the trio too: the fetcher's worker serves the same
+/// castore-FUSE (the FOD sandbox's overlay lower) and the session has
+/// no other transport (`NEEDED_URING` in lint.rs pins both profiles).
+///
+/// TODO: process-split hardening — install a nested seccomp filter on
+/// fetch/build children (before exec) that re-denies the io_uring trio,
+/// so only the FUSE-serving worker keeps it. Required before onboarding
+/// untrusted tenants; see the residual-risk note in security.typ.
 ///
 /// `ptrace` and `process_vm_readv` are deliberately NOT in this set —
 /// they are allowed (and `lint seccomp-allowlist` asserts they STAY in
