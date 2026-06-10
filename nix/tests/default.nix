@@ -526,9 +526,18 @@ in
   # castore_fuse::session assembly on the client VM: rio-mountd fd
   # handoff, tenant-scoped Directory-DAG prefetch from rio-store,
   # whole-file and streaming reads, shared-cache passthrough hits, and
-  # clean SIGTERM teardown. Subtest map: the scenario header.
+  # clean SIGTERM teardown — all over fuse-over-io_uring, the session's
+  # only transport (the client VM boots with fuse.enable_uring=1; the
+  # kernel routes ALL requests over the rings once ready, so the
+  # cache-hit phase's passthrough/backing-id assertions double as the
+  # proof that open() replies carry backing ids over the ring). The
+  # uring-required leg flips enable_uring off at runtime and asserts
+  # the mount fails hard with the kernel requirement named — same code
+  # path as a pre-6.14 kernel. Subtest map: the scenario header.
   # r[verify builder.fs.digest-fuse-open]
   # r[verify builder.fs.shared-backing-cache]
+  # r[verify builder.fs.io-uring-transport]
+  # r[verify builder.fs.io-uring-required]
   vm-castore-fuse = castore-fuse.mkTest {
     fixture = standalone {
       # P0560 stopgap (implies HMAC, so the store can verify the
