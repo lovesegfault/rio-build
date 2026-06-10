@@ -10066,7 +10066,7 @@ async fn listing_cost_counters_move_at_the_choke_sites() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.listing-cost]
+// r[verify sched.materialize.listing-cost+2]
 /// bug_045 — plan-level unit: a member JOIN scores EXACTLY one pair
 /// per cached job (the joiner against each stored winner), and the
 /// cache converges to the batch argmax after the poll's reconcile.
@@ -10112,7 +10112,7 @@ fn member_join_scores_exactly_one_per_cached_job() {
     }
 }
 
-// r[verify sched.materialize.listing-cost]
+// r[verify sched.materialize.listing-cost+2]
 /// bug_045 — plan-level unit: an OWNER's TTL leave re-argmaxes ONLY
 /// the departed member's jobs (exactly owned x survivors scores;
 /// within the rule's owned x members bound); non-owner leaves are
@@ -10176,7 +10176,7 @@ fn owner_leave_rescores_only_its_bucket() {
     }
 }
 
-// r[verify sched.materialize.listing-cost]
+// r[verify sched.materialize.listing-cost+2]
 /// bug_045 — plan-level unit: the window reconcile scores ONLY jobs
 /// ENTERING the window (cached jobs cost nothing; departed jobs are
 /// evicted). Proposition certified (R16): the once-per-window-change
@@ -10227,7 +10227,7 @@ fn window_reconcile_scores_only_entering_jobs() {
 
 proptest::proptest! {
     #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
-    // r[verify sched.materialize.listing-cost]
+    // r[verify sched.materialize.listing-cost+2]
     /// bug_045 — THE parity pin (Q1 single-source law extended to the
     /// maintainer): across generated join/leave/refresh/window-change
     /// poll sequences, the cached owner of EVERY window job equals
@@ -10305,7 +10305,7 @@ proptest::proptest! {
         }
     }
 }
-// r[verify sched.materialize.listing-cost]
+// r[verify sched.materialize.listing-cost+2]
 /// bug_045 envelope red (1) — the per-poll cost law's scoring half.
 /// Proposition certified (R16): on a poll in a STABLE membership
 /// epoch over a WARM snapshot, partition-scoring work is ZERO and no
@@ -10363,13 +10363,20 @@ async fn stable_epoch_polls_compute_zero_scores() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.listing-cost]
+// r[verify sched.materialize.listing-cost+2]
 /// bug_045 envelope red (2) — the head-window fetch half. Proposition
-/// certified (R16): identity-bearing polls within one beat share ONE
-/// head-window fetch — the query runs at most once per snapshot TTL,
-/// not once per poll. The bound is elapsed-derived (1 boundary fetch
-/// + one per TTL window actually crossed) so a CI stall widens the
-/// budget instead of flaking the law.
+/// certified (R16, scope stated exactly): the HEALTHY-path wall-clock
+/// fetch-rate bound — identity-bearing polls within one beat share
+/// ONE head-window fetch, budgeted `1 + elapsed` so a CI stall widens
+/// the budget instead of flaking. This is deliberately NOT the
+/// degraded-regime law (an elapsed-derived budget self-widens when
+/// each fetch itself consumes ≥ TTL of wall clock — merged_bug_066):
+/// failure-arm pacing, latency independence, and dirty-token
+/// consumption are certified STRUCTURALLY — fetches per refresh
+/// decision, never per wall-second — by
+/// `failed_beat_charges_the_pacing_envelope`,
+/// `slow_beat_does_not_convert_polls_into_serial_beats`, and
+/// `dirty_edge_paces_through_a_failure_window`.
 ///
 /// Pre-fix defect manifest: N fetches for N polls — the 512-row query
 /// awaited in-turn on the single-threaded actor, once per poll per
@@ -10414,7 +10421,7 @@ async fn listing_serves_polls_share_one_head_fetch_per_beat() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.listing-cost]
+// r[verify sched.materialize.listing-cost+2]
 /// bug_045 envelope red (3) — the membership-event maintenance bound.
 /// Proposition certified (R16): a member JOIN rescores at most the
 /// cached window — one score per cached job (the joiner against the
@@ -10452,7 +10459,7 @@ async fn member_join_rescores_at_most_the_window() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.listing-cost]
+// r[verify sched.materialize.listing-cost+2]
 /// bug_045 envelope red (4) — the snapshot's refresh law. Proposition
 /// certified (R16): warm-snapshot polls do NOT fetch (at most one
 /// fetch per TTL window, elapsed-budgeted), and a job created through
@@ -10896,6 +10903,149 @@ async fn already_parked_fail_fast_persists_nothing() -> TestResult {
         0,
         "left: 1 (a no-edge same-value persist — the merged_bug_006 \
          RefusedNewer feeder) / right: 0 (no edge, no write)"
+    );
+    Ok(())
+}
+
+// ── merged_bug_066: the beat charges its pacing per ATTEMPT ────────────
+
+// r[verify sched.materialize.listing-cost+2]
+/// merged_bug_066 R1: under a real PG failure (closed pool — every
+/// query errors at acquire, the production-shaped connection
+/// failure), fetch ATTEMPTS are bounded by the pacing envelope, not
+/// by poll count. PROPOSITION CERTIFIED: fetches per refresh
+/// decision — the rule's true quantity — with the failed attempt
+/// charging the envelope (BeatToken spent into spend_failed).
+/// Structural count; the elapsed guard only documents that the loop
+/// stayed inside one TTL window.
+#[tokio::test]
+async fn failed_beat_charges_the_pacing_envelope() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+    seed_claimable_jobs(&handle, &store, "cost-errbeat", 4).await?;
+    let m0 = worker_member("store-errbeat", 0);
+    // Warm membership + snapshot.
+    let _ = list_materialization_jobs_as(&handle, 64, &m0).await;
+    // Age past the TTL so the measured window opens on a beat
+    // boundary, then kill PG.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    db.pool.close().await;
+
+    let started = std::time::Instant::now();
+    let before = crate::actor::materialize::listing_cost_snapshot();
+    for _ in 0..6 {
+        let served = list_materialization_jobs_as(&handle, 64, &m0).await;
+        assert!(served.is_empty(), "failed beats serve fail-closed empty");
+    }
+    let after = crate::actor::materialize::listing_cost_snapshot();
+    let elapsed = started.elapsed();
+
+    let delta = after.snapshot_fetches - before.snapshot_fetches;
+    let budget = 1 + elapsed.as_secs();
+    assert!(
+        delta <= budget,
+        "left: 6 (the Err arm zeroed the TTL — one 512-row attempt per \
+         poll, serialized on the actor into the degraded PG) / right: 1 \
+         (the failed attempt charges the envelope; budget {budget} over \
+         {elapsed:?})"
+    );
+    assert!(delta >= 1, "the boundary poll attempts once");
+    Ok(())
+}
+
+// r[verify sched.materialize.listing-cost+2]
+/// merged_bug_066 R2: with injected beat latency ≥ TTL, polls queued
+/// behind a completing beat share its snapshot. PROPOSITION
+/// CERTIFIED: the fetch delta counts completions, not polls — the
+/// pacing anchor samples at attempt COMPLETION, so query latency
+/// cannot birth every snapshot expired. The latency hook is a
+/// DISCLOSED harness alignment (r13-allow(opaque-consumer) shape: a
+/// cfg(test) awaited delay between the query await and the spend —
+/// exactly where production PG latency sits; 3 lines in the
+/// handler).
+#[tokio::test]
+async fn slow_beat_does_not_convert_polls_into_serial_beats() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor(db.pool.clone());
+    actor
+        .materialization_jobs
+        .hydrated_listing_mut()
+        .expect("always-leader actor starts hydrated")
+        .2
+        .test_beat_latency = Some(std::time::Duration::from_millis(1200));
+
+    let before = crate::actor::materialize::listing_cost_snapshot();
+    for _ in 0..6 {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        actor
+            .handle_list_materialization_jobs(64, Some("w0".into()), tx)
+            .await;
+        let _ = rx.await;
+    }
+    let after = crate::actor::materialize::listing_cost_snapshot();
+    let delta = after.snapshot_fetches - before.snapshot_fetches;
+    // Beat 1 completes at ~1.2s; the 5 polls behind it land inside
+    // the TTL measured FROM COMPLETION. ≤ 2 absorbs one scheduler
+    // stall between adjacent polls; the pre-fix shape is 6 (every
+    // poll a serial 1.2s beat — the budget must NOT scale with the
+    // beats' own latency, which is exactly the self-widening escape).
+    assert!(
+        delta <= 2,
+        "left: {delta} = one serial beat per poll (the pre-query stamp \
+         births every snapshot expired once latency ≥ TTL) / right: 1 \
+         (completion-sampled clock; ≤ 2 under harness stall)"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.listing-cost+2]
+/// merged_bug_066 R3: the dirty edge cannot re-open per-poll beating
+/// during a failure window. PROPOSITION CERTIFIED: a creation
+/// observed by a FAILED attempt is consumed by that attempt's charge
+/// (spend_failed takes the token), so outage-time creations cost at
+/// most one extra attempt each with the TTL leg as the retry floor.
+#[tokio::test]
+async fn dirty_edge_paces_through_a_failure_window() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor(db.pool.clone());
+
+    // One healthy beat to warm the pacing state.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    actor
+        .handle_list_materialization_jobs(64, Some("w0".into()), tx)
+        .await;
+    let _ = rx.await;
+
+    // PG dies; one job-creation event lands mid-window (the cfg(test)
+    // view-seeding lane bumps the creation cursor exactly like the
+    // production creation path does).
+    db.pool.close().await;
+    actor.materialization_jobs.insert(
+        crate::state::DrvHash::from("dirty-window-drv"),
+        crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+    );
+
+    let started = std::time::Instant::now();
+    let before = crate::actor::materialize::listing_cost_snapshot();
+    for _ in 0..4 {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        actor
+            .handle_list_materialization_jobs(64, Some("w0".into()), tx)
+            .await;
+        let _ = rx.await;
+    }
+    let after = crate::actor::materialize::listing_cost_snapshot();
+    let elapsed = started.elapsed();
+
+    let delta = after.snapshot_fetches - before.snapshot_fetches;
+    let budget = 2 + elapsed.as_secs();
+    assert!(
+        delta <= budget,
+        "left: 4 (unconsumed creations re-beat per poll through the \
+         failure window) / right: ≤ 2 (the failed attempt consumed the \
+         dirty token; one TTL-paced retry; budget {budget} over \
+         {elapsed:?})"
     );
     Ok(())
 }

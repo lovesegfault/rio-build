@@ -242,7 +242,24 @@ where
 /// owner is ALWAYS the batch argmax over the live membership (the
 /// parity proptest pins cached ≡ `rendezvous_owner` — the test-only
 /// batch oracle — across churn).
-// r[impl sched.materialize.listing-cost]
+/// The listing beat's pacing charge (merged_bug_066): minted ONLY by
+/// [`ListingPlan::refresh_decision`], spent BY VALUE into exactly one
+/// of [`ListingPlan::spend_install`] (the Ok arm) or
+/// [`ListingPlan::spend_failed`] (the Err arm). `#[must_use]` +
+/// move-only: a beat arm that neither installs nor fails-the-charge
+/// does not compile — the closure set over outcome arms is the type,
+/// so the pacing envelope binds ATTEMPTS, not successes, and its
+/// clock anchors at attempt COMPLETION (both spends sample their
+/// instant internally, post-await).
+#[must_use = "a fired beat MUST spend its pacing charge (spend_install / spend_failed)"]
+#[derive(Debug)]
+pub(crate) struct BeatToken {
+    /// [`JobView::creations`] at decision time — the dirty token both
+    /// spends consume into `seen_creations`.
+    creations_seen: u64,
+}
+
+// r[impl sched.materialize.listing-cost+2]
 #[derive(Debug, Default)]
 pub(crate) struct ListingPlan {
     /// `{job_id → (winning hash, owner member)}` over the live
@@ -251,11 +268,27 @@ pub(crate) struct ListingPlan {
     /// The beat-scoped head snapshot (raw head-window rows, SQL
     /// order; claimability re-filtered per poll from the LIVE view).
     snapshot: Vec<crate::db::materialization::MaterializationJobRow>,
-    /// When the snapshot was fetched; `None` = no usable snapshot
-    /// (cold start, or the last refresh errored — fail closed).
-    fetched_at: Option<std::time::Instant>,
-    /// [`JobView::creations`] at the last refresh — the dirty edge.
+    /// The pacing anchor (merged_bug_066): when the last beat ATTEMPT
+    /// completed — stamped by BOTH spends ([`Self::spend_install`] and
+    /// [`Self::spend_failed`]), sampled internally post-await, so
+    /// neither failure nor query latency re-opens per-poll beating.
+    /// `None` only at construction/tenure wipe (cold start beats
+    /// immediately). Serving keys on snapshot CONTENTS, never on this
+    /// field — a failed beat's cleared snapshot answers empty
+    /// (fail-closed preserved) while the pacing stands.
+    last_beat: Option<std::time::Instant>,
+    /// [`JobView::creations`] at the last beat ATTEMPT — the dirty
+    /// edge, consumed by both spends (a creation observed during a
+    /// failed beat costs at most one extra attempt; the TTL leg is
+    /// its retry floor).
     seen_creations: u64,
+    /// Disclosed harness alignment (merged_bug_066 W2, the R13
+    /// disclosed-alignment lane): an awaited delay the handler
+    /// inserts between the head-window query await and the spend —
+    /// exactly where production PG latency sits. `None` in
+    /// production; settable only from tests.
+    #[cfg(test)]
+    pub(crate) test_beat_latency: Option<std::time::Duration>,
     /// Per-beat owner buckets: member → ascending snapshot indices.
     buckets: std::collections::HashMap<String, Vec<usize>>,
     /// Members past [`LISTING_STEAL_HORIZON`] at the last beat (or
@@ -333,33 +366,43 @@ impl ListingPlan {
         self.owners.retain(|job_id, _| seen.contains(job_id));
     }
 
-    /// Whether this poll must run the listing beat (the head-window
-    /// query): no usable snapshot, the snapshot TTL elapsed, or the
-    /// view's creation feed moved (new jobs must not wait out the
-    /// TTL).
-    fn refresh_due(&self, creations: u64, now: std::time::Instant) -> bool {
-        match self.fetched_at {
+    /// The refresh decision (merged_bug_066): whether this poll must
+    /// run the listing beat (the head-window query) — no beat yet
+    /// this tenure, the pacing TTL elapsed since the last ATTEMPT, or
+    /// the view's creation feed moved (new jobs must not wait out the
+    /// TTL). The `Some` arm mints the [`BeatToken`] the handler MUST
+    /// spend by value into exactly one of [`Self::spend_install`] /
+    /// [`Self::spend_failed`] — the pacing charge exists on every
+    /// outcome arm by construction.
+    fn refresh_decision(&self, creations: u64, now: std::time::Instant) -> Option<BeatToken> {
+        let due = match self.last_beat {
             None => true,
             Some(at) => {
                 now.duration_since(at) >= LISTING_SNAPSHOT_TTL || creations != self.seen_creations
             }
-        }
+        };
+        due.then_some(BeatToken {
+            creations_seen: creations,
+        })
     }
 
-    /// Install one beat: the fresh head window, the owner-map
-    /// reconcile (only ENTERING jobs are scored), the staleness
-    /// partition, and the owner buckets — ALL the per-beat work, so a
-    /// poll between beats does none of it.
-    fn install_beat(
+    /// Spend the beat charge on a SUCCESSFUL fetch: install the fresh
+    /// head window, the owner-map reconcile (only ENTERING jobs are
+    /// scored), the staleness partition, and the owner buckets — ALL
+    /// the per-beat work, so a poll between beats does none of it.
+    /// Samples the pacing/partition instant INTERNALLY (post-await —
+    /// a caller cannot supply a backdated instant, so query latency
+    /// ≥ TTL cannot birth the snapshot expired; merged_bug_066).
+    fn spend_install(
         &mut self,
+        token: BeatToken,
         rows: Vec<crate::db::materialization::MaterializationJobRow>,
         members: &[(String, std::time::Instant)],
-        creations: u64,
-        now: std::time::Instant,
     ) {
+        let now = std::time::Instant::now();
+        self.last_beat = Some(now);
+        self.seen_creations = token.creations_seen;
         self.snapshot = rows;
-        self.fetched_at = Some(now);
-        self.seen_creations = creations;
         let window: Vec<Uuid> = self.snapshot.iter().map(|r| r.job_id).collect();
         self.reconcile_window(window.into_iter(), members.iter().map(|(m, _)| m.as_str()));
         self.stale_owners = members
@@ -373,12 +416,20 @@ impl ListingPlan {
         self.rebuild_buckets();
     }
 
-    /// The last refresh errored: never serve a stale-unusable
-    /// snapshot — answer empty until a refresh succeeds (the
-    /// pre-snapshot fail-closed arm, preserved).
-    fn clear_snapshot(&mut self) {
+    /// Spend the beat charge on a FAILED fetch: never serve a
+    /// stale-unusable snapshot — answer empty until a refresh
+    /// succeeds (the pre-snapshot fail-closed arm, preserved) — but
+    /// the attempt still charges the pacing envelope and consumes the
+    /// dirty token (merged_bug_066: pre-fix the Err arm zeroed the
+    /// TTL, so during a PG failure every worker poll re-ran the
+    /// 512-row query serialized on the actor, M-fold amplification
+    /// into the degraded PG; and unconsumed creations re-opened
+    /// per-poll beating through the dirty leg even where the TTL leg
+    /// was paced).
+    fn spend_failed(&mut self, token: BeatToken) {
+        self.last_beat = Some(std::time::Instant::now());
+        self.seen_creations = token.creations_seen;
         self.snapshot.clear();
-        self.fetched_at = None;
         self.buckets.clear();
         self.stolen.clear();
     }
@@ -1282,7 +1333,7 @@ impl DagActor {
     // r[impl sched.materialize.job+2]
     // r[impl sched.materialize.claimability-projection]
     // r[impl sched.materialize.listing-distribution]
-    // r[impl sched.materialize.listing-cost]
+    // r[impl sched.materialize.listing-cost+2]
     pub(super) async fn handle_list_materialization_jobs(
         &mut self,
         limit: u32,
@@ -1304,7 +1355,7 @@ impl DagActor {
         // rides this very call) and records even when the beat's
         // query errors below — the caller IS live and capable; a DB
         // blip must not mass-stale the fleet.
-        let needs_beat = {
+        let beat_token = {
             let (view, contacts, plan) = self
                 .materialization_jobs
                 .hydrated_listing_mut()
@@ -1326,39 +1377,62 @@ impl DagActor {
                 // being served broadly on this very poll.
                 plan.note_member_fresh(me);
             }
-            plan.refresh_due(view.creations(), now)
+            plan.refresh_decision(view.creations(), now)
         };
         // Phase 2 — the listing BEAT: at most one head-window query
-        // per snapshot TTL or creation-dirty event (R17; the fetch
-        // counter at this sole production call site is the law's
-        // witness). The TTL prune, the staleness partition, the
-        // owner-map reconcile, and the bucket build all run HERE —
-        // polls between beats do none of it.
-        if needs_beat {
+        // ATTEMPT per pacing TTL or consumed creation-dirty event
+        // (R17, all axes: the charge is per attempt over the full
+        // {Ok, Err} × {fast, ≥TTL} product — the BeatToken must be
+        // spent into exactly one outcome arm, and both spends sample
+        // the pacing clock at attempt COMPLETION; the fetch counter
+        // at this sole production call site is the law's witness).
+        // The TTL prune, the staleness partition, the owner-map
+        // reconcile, and the bucket build all run HERE — polls
+        // between beats do none of it.
+        if let Some(token) = beat_token {
             SNAPSHOT_FETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let fetched = self
                 .db
                 .list_claimable_materialization_jobs(LISTING_HEAD_WINDOW)
                 .await;
-            let (view, contacts, plan) = self
+            // Disclosed harness alignment (W2's latency hook): an
+            // awaited delay exactly where production PG latency sits.
+            #[cfg(test)]
+            {
+                let delay = self
+                    .materialization_jobs
+                    .hydrated_listing_mut()
+                    .and_then(|(_, _, plan)| plan.test_beat_latency);
+                if let Some(delay) = delay {
+                    tokio::time::sleep(delay).await;
+                }
+            }
+            let (_view, contacts, plan) = self
                 .materialization_jobs
                 .hydrated_listing_mut()
                 .expect("hydrated checked above");
             match fetched {
                 Ok(rows) => {
-                    let leavers = contacts.prune(now);
-                    let members = contacts.members(now);
+                    // Prune/membership on the post-await clock — the
+                    // pre-fix pre-query `now` backdated the prune and
+                    // the steal-horizon partition by the query
+                    // latency (disclosed correction).
+                    let beat_now = std::time::Instant::now();
+                    let leavers = contacts.prune(beat_now);
+                    let members = contacts.members(beat_now);
                     for leaver in &leavers {
                         plan.on_leave(leaver, members.iter().map(|(m, _)| m.as_str()));
                     }
-                    plan.install_beat(rows, &members, view.creations(), now);
+                    plan.spend_install(token, rows, &members);
                 }
                 Err(e) => {
                     // Fail closed: never serve a stale-unusable
                     // snapshot (the pre-snapshot empty-answer arm,
-                    // preserved; the contact note above stands).
+                    // preserved; the contact note above stands) —
+                    // but the ATTEMPT charges the envelope and
+                    // consumes the dirty token.
                     warn!(error = %e, "ListMaterializationJobs query failed; answering empty");
-                    plan.clear_snapshot();
+                    plan.spend_failed(token);
                     let _ = reply.send(Vec::new());
                     return;
                 }

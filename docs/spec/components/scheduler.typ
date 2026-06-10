@@ -1735,7 +1735,7 @@ join/leave of `executor_concurrency` members. Machine witness:
 partition, own-slice disjointness/coverage, staleness-bounded steal,
 no-job-unlisted, orphan recovery; convoy and no-steal falsify twins).
 
-#r("sched.materialize.listing-cost")[
+#r("sched.materialize.listing-cost+2")[
   The leader listing chokepoint MUST NOT recompute the rendezvous
   partition per poll: partition-scoring work MUST be zero on a poll
   in a stable membership epoch over a warm head-window snapshot,
@@ -1743,7 +1743,12 @@ no-job-unlisted, orphan recovery; convoy and no-steal falsify twins).
   (a join costs at most one score per cached head-window job; an
   owner's leave re-scores only the departed owner's jobs over the
   survivors), and the head-window query MUST run at most once per
-  snapshot TTL or job-creation dirty event.
+  snapshot TTL or job-creation dirty event. The pacing charge MUST be
+  per attempt: a failed or slow head-window query charges the same
+  envelope, with the pacing anchor sampled at attempt completion, so
+  neither failure nor latency re-opens per-poll querying; a failed
+  attempt MUST also consume the job-creation dirty event it was
+  fired for.
 ]
 The cost law is live_041's missing witness shape (bug_045): the
 serving-correctness parity witness passed every gate while the
