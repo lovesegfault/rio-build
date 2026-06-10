@@ -141,9 +141,12 @@ module materializationDistribution {
 
   /// The designated wedgeable member (the bounded wedge-axis census:
   /// one member's wedge state keeps the second main exhaustively
-  /// checkable; r1w0 OWNS j0 at full membership under `prio`, so the
-  /// wedged-owner premise is reachable, never vacuous). The recovery
-  /// law itself quantifies over ALL owners.
+  /// checkable). Premise reachability is MACHINE-CHECKED, never a
+  /// verified-at-a-commit note (bug_083): the wired expect-violation
+  /// witness (canReachWedgedPastHorizonOwner, the
+  /// quint-matdist-wedge-premise-reachable entry) goes red the moment
+  /// the wedged-owner premise becomes unreachable in the live wedge
+  /// regime. The recovery law itself quantifies over ALL owners.
   val WEDGEABLE = Set("r1w0")
 
   // --- state ----------------------------------------------------------------
@@ -487,6 +490,33 @@ module materializationDistribution {
               SHARED_HEAD_CONVOY, STEAL_ENABLED, EAGER_STEAL, OWNER_SERVE_SKEW, STEAL_HORIZON,
               m, ms, lastListed, now, JOBS.exclude(claimed)).contains(j),
           })))
+
+  /// bug_083 (round-8 WO-S2-5) — the premise-reachability witness for
+  /// wedgedOwnerSliceRecovered, wired as an EXPECT-VIOLATION check on
+  /// the LIVE wedge regime (the quint-matdist-wedge-premise-reachable
+  /// entry in nix/quint.nix — markers live at the wiring, per the
+  /// header discipline): VIOLATED exactly when the law's contended
+  /// premise — a live, wedged-past-horizon owner of a claimable job,
+  /// with a capable live member in the view — is reached WITHOUT the
+  /// defect lane's WEDGED_KEEPS_BEATING freshness (the falsify twin's
+  /// kill certifies reachability only under that mechanism, which the
+  /// live gate forbids — a strictly weaker proposition). In the live
+  /// main the premise exists only through the corridor
+  /// wedgedAt + STEAL_HORIZON < now <= lastListed + MEMBER_TTL, open
+  /// solely because STEAL_HORIZON < MEMBER_TTL in the wedge
+  /// instantiation: a retune to MEMBER_TTL <= STEAL_HORIZON, a
+  /// wedgeWorker guard narrowing, or a membersAt/freshAt change
+  /// closes it and vacuates the law with the three wedge checks still
+  /// green — THIS check goes red instead.
+  val canReachWedgedPastHorizonOwner =
+    val ms = membersAt(lastListed, now, MEMBER_TTL)
+    not(JOBS.exclude(claimed).exists(j =>
+      ownersOf(SHARED_HEAD_CONVOY, j, ms).exists(o => and {
+        live.get(o),
+        not(canConvertAt(wedgedAt, o)),
+        now - wedgedAt.get(o) > STEAL_HORIZON,
+        ms.exists(m => live.get(m) and canConvertAt(wedgedAt, m)),
+      })))
 
   /// The steal horizon DELIVERS the orphaned remainder: a claimable
   /// job whose owners are all past the steal horizon is in EVERY

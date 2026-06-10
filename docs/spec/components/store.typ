@@ -1562,7 +1562,12 @@ contest losses are NEVER futility evidence --- they are the healthy
 fleet>work steady state the FS-4 speculation bound already prices.
 Machine witness: `docs/spec/models/materializationDistribution.qnt`
 (the capability axis: `wedgedOwnerSliceRecovered`; the
-wedged-keeps-beating falsify twin).
+wedged-keeps-beating falsify twin). Premise reachability in the live
+withheld-beat regime is itself machine-checked: the wired
+expect-violation witness `canReachWedgedPastHorizonOwner`
+(`quint-matdist-wedge-premise-reachable`) goes red the moment the
+wedge corridor closes, retiring the model-header
+verified-at-a-commit note.
 
 #r("store.materialize.pass-outcome")[
   Every pass-scoped observer MUST consume the single sealed pass

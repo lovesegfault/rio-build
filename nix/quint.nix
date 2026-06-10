@@ -7752,6 +7752,30 @@ rec {
       ];
     };
 
+    # bug_083 (round-8 WO-S2-5): the premise-reachability witness for
+    # the wedge recovery law, ON the live withheld-beat regime — the
+    # SAME instantiation the holds check runs against. The falsify
+    # twin's kill certifies premise reachability only under
+    # WEDGED_KEEPS_BEATING-refreshed freshness (the defect lane's own
+    # mechanism, which the live gate forbids — a strictly weaker
+    # proposition); in the live main the premise exists only through
+    # the corridor wedgedAt + STEAL_HORIZON < now <= lastListed +
+    # MEMBER_TTL, open solely because STEAL_HORIZON(1) < MEMBER_TTL(3)
+    # in the wedge instantiation. A retune to MEMBER_TTL <=
+    # STEAL_HORIZON, a wedgeWorker guard narrowing, or a
+    # membersAt/freshAt change would vacuate the law with all three
+    # wedge checks green — THIS check goes red instead
+    # (expect-violation semantics: the violation transcript IS the
+    # success; "no violation found" is the vacuity signal). Expected
+    # violation at shallow depth: one list + one wedge + two ticks.
+    # r[verify store.materialize.honest-beat]
+    quint-matdist-wedge-premise-reachable = mkQuintWitnessCheck {
+      name = "matdist-wedge-premise-reachable";
+      spec = "materializationDistribution";
+      main = "materializationDistributionWedge";
+      witness = "canReachWedgedPastHorizonOwner";
+    };
+
     # ------------------------------------------------------------------
     # Gateway connection/session lifecycle campaign (gw-session-formal,
     # round-2 Track B), Phase 0 Stage C: the rio-gateway accept → auth →
