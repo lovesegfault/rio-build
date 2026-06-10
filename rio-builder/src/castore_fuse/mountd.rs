@@ -1164,6 +1164,17 @@ fn reject_reason(kind: &ErrKind) -> &'static str {
     }
 }
 
+/// Mount flags for the per-build castore FUSE mount. MS_RDONLY is
+/// load-bearing for POSIX correctness, not just hardening: the FUSE
+/// handler answers every write op with EROFS, but only the VFS-level
+/// `ro` flag makes /proc/mounts say `ro`, sets ST_RDONLY in statvfs
+/// `f_flag`, and lets the kernel deny `access(W_OK)`/`faccessat2` —
+/// without it `test -w` succeeds and the failure is deferred to
+/// `open(O_WRONLY)`, which probing tools treat as an fs bug.
+const CASTORE_MOUNT_FLAGS: MsFlags = MsFlags::MS_NODEV
+    .union(MsFlags::MS_NOSUID)
+    .union(MsFlags::MS_RDONLY);
+
 /// `Mount{build_id}`: claim the id, fuse-mount the per-build castore
 /// mountpoint, set up staging with a kernel-enforced quota, and hand
 /// the `/dev/fuse` fd back.
@@ -1257,7 +1268,7 @@ fn mount_build(
         Some("rio-castore"),
         &mnt,
         Some("fuse.rio-castore"),
-        MsFlags::MS_NODEV | MsFlags::MS_NOSUID,
+        CASTORE_MOUNT_FLAGS,
         Some(data.as_str()),
     )
     .with_context(|| format!("mount fuse at {}", mnt.display()))?;
@@ -1444,6 +1455,24 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::unix::fs::symlink;
+
+    /// The castore mount must carry MS_RDONLY: the FUSE handler
+    /// already answers every write op with EROFS, but without the
+    /// VFS-level `ro` flag the mount advertises `rw` in /proc/mounts,
+    /// statvfs lacks ST_RDONLY, and `access(W_OK)`/`faccessat2`
+    /// succeed — so `test -w` passes and the EROFS only surfaces at
+    /// `open(O_WRONLY)`. POSIX tools probe writability before opening;
+    /// the kernel must deny it at the access check, like ro-tmpfs.
+    #[test]
+    fn castore_mount_flags_include_rdonly() {
+        assert!(
+            CASTORE_MOUNT_FLAGS.contains(MsFlags::MS_RDONLY),
+            "castore FUSE must be mounted read-only at the VFS level"
+        );
+        // The hardening pair predates ro and must stay.
+        assert!(CASTORE_MOUNT_FLAGS.contains(MsFlags::MS_NODEV));
+        assert!(CASTORE_MOUNT_FLAGS.contains(MsFlags::MS_NOSUID));
+    }
 
     // ─── BackingOpen pins the registration to read-only ────────────────
 
