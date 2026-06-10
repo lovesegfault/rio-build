@@ -31,6 +31,9 @@ module wedgeCalib023OpenRelease {
     TRACK_GHOST_NODES = false,
     ENABLE_ADMISSION = true,
     ENABLE_SUPPRESSED_RETENTION = true,
-    ENABLE_RELEASE_CLOSE = false
+    ENABLE_RELEASE_CLOSE = false,
+    ENABLE_DWELL_ARM = false,
+    DOWNGRADE_RUNS_CLOSE = false,
+    VERDICT_DWELL_TICKS = 1
   ).* from "../wedgeCluster"
 }

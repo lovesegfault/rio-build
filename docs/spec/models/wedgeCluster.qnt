@@ -161,6 +161,27 @@ module wedgeCluster {
   // init values in every non-trajectory regime (zero state cost; the
   // TRACK_EPISODE_GHOSTS parameter-ladder precedent).
   const ENABLE_RELEASE_CLOSE: bool
+  /// merged_bug_023 dwell-engaged arm (bughunt-6 S4): the CODE keeps
+  /// an episode engaged while the post-watermark verdict dwell is
+  /// active and wedged is non-empty (the Dwell axis); this model
+  /// historically CLOSED the moment breadth decayed (releaseEdge) ---
+  /// the model was right, the code diverged, and the divergent
+  /// trajectory (a Breadth->Dwell downgrade that skips Breadth's
+  /// close) was inexpressible. ENABLE_DWELL_ARM=false everywhere
+  /// pre-existing = today's model, byte-identical per §4.F16. With
+  /// the arm on: engagement = systemic | developing |
+  /// (watermark-recent and wedged != {}), episodeState gains the
+  /// dwell-engaged value 3, and the release edge at dwell expiry
+  /// keys the STORED state --- exactly the code's machine.
+  /// DOWNGRADE_RUNS_CLOSE: the law under test --- true = the fix (a
+  /// 2->3 downgrade runs the breadth close: drain + merge-latch);
+  /// false = the as-built continue-without-effects.
+  /// VERDICT_DWELL_TICKS: the post-watermark dwell duration (the
+  /// WEDGE_VERDICT_DWELL_SECS abstraction; only read when the arm is
+  /// on).
+  const ENABLE_DWELL_ARM: bool
+  const DOWNGRADE_RUNS_CLOSE: bool
+  const VERDICT_DWELL_TICKS: int
 
   val NODES = Set("n0", "n1", "n2")
   val GHOSTS = if (TRACK_GHOST_NODES) Set("g0") else Set()
@@ -223,6 +244,13 @@ module wedgeCluster {
   // engaged via a retaining tick (breadth/developing --- its release
   // MUST close). Frozen 0 off-trajectory.
   var episodeState: int
+  /// bughunt-6 S4 reachability ghost (frozen false when the dwell arm
+  /// is off --- zero state cost): a 2->3 (developing->dwell-engaged)
+  /// downgrade edge occurred. The dwell-arm hold wires its negation
+  /// as an expected-violation check so the hold cannot go vacuous;
+  /// the falsify twin's violating trace shows it latched before the
+  /// per-node verdict.
+  var sawDowngrade: bool
   // merged_bug_023 reachability: a release edge was taken (frozen
   // false off-trajectory).
   var sawRelease: bool
@@ -285,6 +313,7 @@ module wedgeCluster {
     lastSuppressedNoDrain' = false,
     lastShrankMarked' = false,
     episodeState' = 0,
+    sawDowngrade' = false,
     sawRelease' = false,
   }
 
@@ -301,7 +330,7 @@ module wedgeCluster {
       wedged: Set[str], skip: bool, episodeAnchors: Set[(str, str, int)],
       watermark: int, expiredSince: (str, str) -> int,
       pendingSince: int, suppressedNoDrain: bool, shrankMarked: bool,
-      episodeState: int, releaseEdge: bool } =
+      episodeState: int, releaseEdge: bool, downgradeEdge: bool } =
     val now = time + 1
     val consumed = if (ENABLE_EVICTION) pendingEvictions else Set()
     val evAfterEvict = evidence.keys().filter(n => not(consumed.contains(n))).mapBy(n => evidence.get(n))
@@ -367,17 +396,41 @@ module wedgeCluster {
     // observed now, disengaged now. Only a RETAINING episode (state 2)
     // closes with effects; ratio episodes (state 1) already drained
     // per-tick and release as a no-op.
+    // merged_bug_023 dwell-engaged arm (bughunt-6 S4): the code's
+    // third engagement source --- watermark-recent AND wedged
+    // non-empty (precedence below ratio/breadth). Requires the
+    // watermark ghost; dead when the arm is off.
+    val dwellEngaged = and {
+      ENABLE_DWELL_ARM,
+      ENABLE_TRAJECTORY,
+      TRACK_EPISODE_GHOSTS,
+      not(skip),
+      not(systemic or developing),
+      watermark >= 0,
+      now - watermark <= VERDICT_DWELL_TICKS,
+      wedged.size() > 0,
+    }
     val releaseEdge = and {
       ENABLE_TRAJECTORY,
       episodeState != 0,
       not(skip),
-      not(systemic or developing),
+      not(systemic or developing or dwellEngaged),
     }
     val closeFires = releaseEdge and (episodeState == 2) and ENABLE_RELEASE_CLOSE
+    // bughunt-6 S4: the downgrade edge --- a RETAINING (developing)
+    // episode recomputes to dwell-engaged. As-built the stored state
+    // silently becomes 3 with NO effects (the defect: the eventual
+    // release then keys Dwell's no-op and the retained breadth-phase
+    // evidence mints per-node verdicts at dwell expiry); under
+    // DOWNGRADE_RUNS_CLOSE the downgrade runs the breadth close
+    // (drain + merge-latch) exactly like the release edge.
+    val downgradeEdge = (episodeState == 2) and dwellEngaged
+    val downgradeFires = downgradeEdge and DOWNGRADE_RUNS_CLOSE
     val newEpisodeState = if (not(ENABLE_TRAJECTORY)) 0
       else if (skip) episodeState
       else if (systemic) 1
       else if (developing) 2
+      else if (dwellEngaged) 3
       else 0
     val drained = if (systemic and ENABLE_EPISODE_LATCH)
         // Whole-episode drain: every node in the window.
@@ -386,13 +439,14 @@ module wedgeCluster {
         evObserved.keys().filter(n => not(wedged.contains(n))).mapBy(n => evObserved.get(n))
       else evObserved
     // merged_bug_023: the close drains the WHOLE window at the
-    // release edge.
-    val drainedFinal = if (closeFires) Map() else drained
-    val survivors = if (systemic or developing or closeFires) Set() else wedged
+    // release edge --- and (bughunt-6 S4) at the DOWNGRADE edge when
+    // the law is on.
+    val drainedFinal = if (closeFires or downgradeFires) Map() else drained
+    val survivors = if (systemic or developing or dwellEngaged or closeFires) Set() else wedged
     // merged_bug_016: a suppressed tick that retains evidence (the
     // developing breadth phase --- ratio did not fire) must retain
     // the marked transition-memory too.
-    val suppressedNoDrain = developing and not(systemic) and not(skip)
+    val suppressedNoDrain = (developing or (dwellEngaged and not(downgradeFires))) and not(systemic) and not(skip)
     // As-built early return: the Systemic arm skips BOTH the insert
     // loop and the retain — marked freezes. m288: a SKIP tick retains
     // the marked set unchanged (the retired encoding wiped it through
@@ -404,9 +458,10 @@ module wedgeCluster {
         markedAfterEvict
       else if (suppressedNoDrain and ENABLE_SUPPRESSED_RETENTION)
         markedAfterEvict
-      else if (closeFires)
+      else if (closeFires or downgradeFires)
         // The close drains the marked transition-memory (the same
-        // re-entry law as a ratio drain).
+        // re-entry law as a ratio drain); the downgrade close
+        // (bughunt-6 S4) is the same law at the transition edge.
         Set()
       else survivors
     // Computed only on suppressed-no-drain ticks (zero state cost
@@ -452,13 +507,14 @@ module wedgeCluster {
       // The close merge-latches the watermark where the episode
       // ghosts are tracked (now >= any prior latch, so assignment IS
       // the merge --- the gate never lowers).
-      watermark: if (TRACK_EPISODE_GHOSTS) (if (systemic or closeFires) now else watermark) else -1,
+      watermark: if (TRACK_EPISODE_GHOSTS) (if (systemic or closeFires or downgradeFires) now else watermark) else -1,
       expiredSince: if (TRACK_EPISODE_GHOSTS) newExpiredSince else Map(),
       pendingSince: newPendingSince,
       suppressedNoDrain: suppressedNoDrain,
       shrankMarked: shrankMarked,
       episodeState: newEpisodeState,
       releaseEdge: releaseEdge,
+      downgradeEdge: downgradeEdge,
     }
 
   action tick = {
@@ -504,6 +560,7 @@ module wedgeCluster {
       lastShrankMarked' = r.shrankMarked,
       episodeState' = r.episodeState,
       sawRelease' = (sawRelease or r.releaseEdge),
+      sawDowngrade' = (sawDowngrade or r.downgradeEdge),
     }
   }
 
@@ -528,6 +585,7 @@ module wedgeCluster {
     sawSuppressed' = sawSuppressed, pendingSince' = pendingSince, lastSkip' = lastSkip,
     lastSuppressedNoDrain' = lastSuppressedNoDrain, lastShrankMarked' = lastShrankMarked,
     episodeState' = episodeState, sawRelease' = sawRelease,
+    sawDowngrade' = sawDowngrade,
   }
 
   // (nn): the literal step alias — runs live in regime modules only.
@@ -643,6 +701,11 @@ module wedgeCluster {
   // trajectory bounds (an engaged episode disengages on an observed
   // tick).
   val releaseEdgeReachableW = not(sawRelease)
+  /// bughunt-6 S4: the downgrade edge is reachable (wired as an
+  /// expected-violation check in the dwell-arm hold --- the
+  /// noPerNodeFromSuppressedEvidence law must not hold vacuously
+  /// over a never-exercised arm).
+  val downgradeReachableW = not(sawDowngrade)
   val perNodeReachableW = not(sawPerNode)
   // m288: the suppression-survivor set is actually populated in the
   // wired epilogue regime --- the tautology guard.
@@ -670,7 +733,10 @@ module wedgeClusterMain {
     TRACK_GHOST_NODES = false,
     ENABLE_ADMISSION = true,
     ENABLE_SUPPRESSED_RETENTION = true,
-    ENABLE_RELEASE_CLOSE = true
+    ENABLE_RELEASE_CLOSE = true,
+    ENABLE_DWELL_ARM = false,
+    DOWNGRADE_RUNS_CLOSE = false,
+    VERDICT_DWELL_TICKS = 1
   ).*
 }
 
@@ -696,7 +762,10 @@ module wedgeClusterLatch {
     TRACK_GHOST_NODES = false,
     ENABLE_ADMISSION = true,
     ENABLE_SUPPRESSED_RETENTION = true,
-    ENABLE_RELEASE_CLOSE = true
+    ENABLE_RELEASE_CLOSE = true,
+    ENABLE_DWELL_ARM = false,
+    DOWNGRADE_RUNS_CLOSE = false,
+    VERDICT_DWELL_TICKS = 1
   ).*
 }
 
@@ -717,7 +786,10 @@ module wedgeClusterNoEviction {
     TRACK_GHOST_NODES = false,
     ENABLE_ADMISSION = true,
     ENABLE_SUPPRESSED_RETENTION = true,
-    ENABLE_RELEASE_CLOSE = true
+    ENABLE_RELEASE_CLOSE = true,
+    ENABLE_DWELL_ARM = false,
+    DOWNGRADE_RUNS_CLOSE = false,
+    VERDICT_DWELL_TICKS = 1
   ).*
 }
 
@@ -743,7 +815,10 @@ module wedgeClusterTrajectory {
     TRACK_GHOST_NODES = false,
     ENABLE_ADMISSION = true,
     ENABLE_SUPPRESSED_RETENTION = true,
-    ENABLE_RELEASE_CLOSE = true
+    ENABLE_RELEASE_CLOSE = true,
+    ENABLE_DWELL_ARM = false,
+    DOWNGRADE_RUNS_CLOSE = false,
+    VERDICT_DWELL_TICKS = 1
   ).*
 }
 
@@ -768,7 +843,10 @@ module wedgeClusterEpilogue {
     TRACK_GHOST_NODES = false,
     ENABLE_ADMISSION = true,
     ENABLE_SUPPRESSED_RETENTION = true,
-    ENABLE_RELEASE_CLOSE = true
+    ENABLE_RELEASE_CLOSE = true,
+    ENABLE_DWELL_ARM = false,
+    DOWNGRADE_RUNS_CLOSE = false,
+    VERDICT_DWELL_TICKS = 1
   ).*
 }
 
@@ -795,6 +873,46 @@ module wedgeClusterAdmission {
     TRACK_GHOST_NODES = true,
     ENABLE_ADMISSION = true,
     ENABLE_SUPPRESSED_RETENTION = true,
-    ENABLE_RELEASE_CLOSE = true
+    ENABLE_RELEASE_CLOSE = true,
+    ENABLE_DWELL_ARM = false,
+    DOWNGRADE_RUNS_CLOSE = false,
+    VERDICT_DWELL_TICKS = 1
+  ).*
+}
+
+// bughunt-6 S4 (merged_bug_023 downgrade law): the dwell-arm HOLD
+// regime --- the code's full engagement alphabet (ratio | breadth |
+// dwell) with the downgrade close ON. Ghosts on (the dwell reads the
+// watermark), trajectory on, latch-regime bounds (MAX_TIME=4,
+// WINDOW=2 --- the ghost x trajectory x dwell product; the
+// systemic-arm witness guards the bounds against vacuation).
+// VERDICT_DWELL_TICKS=2: the dwell-ENGAGED state is cold-reachable
+// (a Ratio->Dwell identity transition at t3: post-drain fresh wedged
+// evidence under the t2 watermark); the 2->3 DOWNGRADE cell is NOT
+// cold-reachable at these bounds (the asymmetric anchor ages need
+// the seeded frame --- measured 55M+ states, depth 7, no edge), so
+// the downgrade's violation AND reachability halves live in the
+// seeded calibration pair
+// (calibration/wedge-023-downgrade-skips-close.qnt); the safety law
+// (noPerNodeFromSuppressedEvidence under the full alphabet) holds
+// exhaustively here.
+module wedgeClusterDwellArm {
+  import wedgeCluster(
+    MAX_TIME = 4, WINDOW = 2, MIN_DISTINCT = 2,
+    ENABLE_POPULATIONS = true,
+    ENABLE_FULL_EPILOGUE = true,
+    ENABLE_EPISODE_LATCH = true,
+    ENABLE_EVICTION = true,
+    TRACK_EPISODE_GHOSTS = true,
+    ENABLE_TRAJECTORY = true,
+    DWELL_TICKS = 1,
+    BREADTH_MIN = 2,
+    TRACK_GHOST_NODES = false,
+    ENABLE_ADMISSION = true,
+    ENABLE_SUPPRESSED_RETENTION = true,
+    ENABLE_RELEASE_CLOSE = true,
+    ENABLE_DWELL_ARM = true,
+    DOWNGRADE_RUNS_CLOSE = true,
+    VERDICT_DWELL_TICKS = 2
   ).*
 }

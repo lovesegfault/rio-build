@@ -7081,6 +7081,81 @@ rec {
       witness = "noPerNodeFromSuppressedEvidence";
     };
 
+    # merged_bug_023 DOWNGRADE falsify twin (bughunt-6 S4): the code's
+    # engaged-continue arm swapped the stored axis with no transition
+    # effects — a developing (breadth) episode that decayed into the
+    # dwell arm (ENABLE_DWELL_ARM=true, the code's machine) skipped
+    # Breadth's close, and at dwell expiry the release keyed the
+    # stored dwell state's no-op: the retained breadth-phase evidence
+    # minted a per-node verdict. DOWNGRADE_RUNS_CLOSE=false = as-built;
+    # RELEASE_CLOSE stays TRUE (kill-isolation: the round-5
+    # missing-release conjunct cannot be the killer — its own twin is
+    # calib-open-release above). MID-TRACE init per the controller-113
+    # precedent (the asymmetric anchor ages are past cold-init reach;
+    # seeded frame derived in the module header). Violation in 3 ticks
+    # from the frame; TLC 2,073 ms; rust-sim seed 0xde0daa5a43424a7b
+    # (3,571 ms at ~34.7k traces/s); the violating trace latches
+    # sawDowngrade (trace-checked at introduction).
+    # r[verify ctrl.nodeclaim.wedge-two-axis+6]
+    quint-wedge-cluster-calib-downgrade-skips-close = mkQuintWitnessCheck {
+      name = "wedge-cluster-calib-downgrade-skips-close";
+      spec = "calibration/wedge-023-downgrade-skips-close";
+      main = "wedge023DowngradeSkipsClose";
+      extraSpecs = [ "wedgeCluster" ];
+      init = "calibInit";
+      step = "calibStep";
+      witness = "noPerNodeFromSuppressedEvidence";
+    };
+    # merged_bug_023 downgrade HOLD halves (bughunt-6 S4), two tiers:
+    # (1) the SEEDED-frame hold from the SAME mid-trace init as the
+    # twin (the controller-113-hold precedent) — the t6 downgrade RUNS
+    # the close and t7 mints nothing; its non-vacuity witness below
+    # proves the downgrade edge is exercised. (2) the broad in-file
+    # wedgeClusterDwellArm regime: the full engagement alphabet
+    # (ratio | breadth | dwell) cold-init at the latch-regime bounds —
+    # the dwell-ENGAGED state is cold-reachable there (a Ratio→Dwell
+    # identity transition at t3); the 2→3 DOWNGRADE cell specifically
+    # is NOT (the asymmetric anchor ages need the seeded frame —
+    # measured: 55M+ states at depth 7 with no downgrade edge), so the
+    # downgrade reachability deliberately rides tier (1).
+    # r[verify ctrl.nodeclaim.wedge-two-axis+6]
+    quint-wedge-cluster-downgrade-hold = mkQuintCheck {
+      name = "wedge-cluster-downgrade-hold";
+      spec = "calibration/wedge-023-downgrade-skips-close";
+      main = "wedge023DowngradeSkipsCloseHold";
+      extraSpecs = [ "wedgeCluster" ];
+      init = "calibInit";
+      step = "calibStep";
+      invariants = [
+        "noPerNodeFromSuppressedEvidence"
+      ];
+    };
+    # r[verify ctrl.nodeclaim.wedge-two-axis+6]
+    quint-wedge-cluster-dwell-arm = mkQuintCheck {
+      name = "wedge-cluster-dwell-arm";
+      spec = "wedgeCluster";
+      main = "wedgeClusterDwellArm";
+      invariants = [
+        "noPerNodeFromSuppressedEvidence"
+        "affectedLeOf"
+        "reapedImpliesEvicted"
+      ];
+    };
+    # bughunt-6 S4 non-vacuity: the 2->3 downgrade edge is exercised
+    # under the LAW (downgradeReachableW = not(sawDowngrade) expected
+    # [violation] from the seeded frame in 2 ticks) — the hold tier
+    # (1) is not vacuous.
+    # r[verify ctrl.nodeclaim.wedge-two-axis+6]
+    quint-wedge-cluster-witness-downgrade = mkQuintWitnessCheck {
+      name = "wedge-cluster-witness-downgrade";
+      spec = "calibration/wedge-023-downgrade-skips-close";
+      main = "wedge023DowngradeSkipsCloseHold";
+      extraSpecs = [ "wedgeCluster" ];
+      init = "calibInit";
+      step = "calibStep";
+      witness = "downgradeReachableW";
+    };
+
     # merged_bug_034 falsify twin: the retired instantaneous guard at
     # the trajectory regime's exact bounds — both laws [violation]
     # (the lull false-Systemic and the staggered serial reap).

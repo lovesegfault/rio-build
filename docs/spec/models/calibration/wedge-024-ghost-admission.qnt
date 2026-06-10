@@ -30,6 +30,9 @@ module wedgeCalib024GhostAdmission {
     TRACK_GHOST_NODES = true,
     ENABLE_ADMISSION = false,
     ENABLE_SUPPRESSED_RETENTION = true,
-    ENABLE_RELEASE_CLOSE = true
+    ENABLE_RELEASE_CLOSE = true,
+    ENABLE_DWELL_ARM = false,
+    DOWNGRADE_RUNS_CLOSE = false,
+    VERDICT_DWELL_TICKS = 1
   ).* from "../wedgeCluster"
 }
