@@ -1879,13 +1879,36 @@ async fn report_materialization_outcome(
 }
 
 /// List claimable jobs through the production actor command (the path
-/// `ExecutorService.ListMaterializationJobs` drives).
+/// `ExecutorService.ListMaterializationJobs` drives). Instance-less —
+/// the dev-mode lane: served the unpartitioned listing (live_041).
 async fn list_materialization_jobs(
     handle: &ActorHandle,
     limit: u32,
 ) -> Vec<crate::actor::materialize::JobDescriptor> {
     handle
-        .query_unchecked(|reply| ActorCommand::ListMaterializationJobs { limit, reply })
+        .query_unchecked(|reply| ActorCommand::ListMaterializationJobs {
+            limit,
+            instance: None,
+            reply,
+        })
+        .await
+        .expect("actor alive")
+}
+
+/// List as an identity-bearing store worker (live_041): the verified
+/// `{pod}-w{n}` member identity the gRPC chokepoint threads from the
+/// signed instance claim.
+async fn list_materialization_jobs_as(
+    handle: &ActorHandle,
+    limit: u32,
+    member: &str,
+) -> Vec<crate::actor::materialize::JobDescriptor> {
+    handle
+        .query_unchecked(|reply| ActorCommand::ListMaterializationJobs {
+            limit,
+            instance: Some(member.to_owned()),
+            reply,
+        })
         .await
         .expect("actor alive")
 }
@@ -9694,4 +9717,218 @@ fn recovered_row_with_infinite_park_does_not_panic() {
         entry.claimability(std::time::Instant::now()),
         crate::actor::materialize::Claimability::Parked
     ));
+}
+
+// ---------------------------------------------------------------------------
+// live_041 — listing distribution (rendezvous partition + steal horizon)
+// ---------------------------------------------------------------------------
+
+/// Seed `n` claimable materialization jobs through the production
+/// creation path: one merged build of `n` independent nodes, outputs
+/// marked substitutable AFTER the merge, dispatch ticks until the
+/// probe partition has created every job (bounded loop — one tick per
+/// dispatch wave, panics rather than spinning forever).
+async fn seed_claimable_jobs(
+    handle: &ActorHandle,
+    store: &rio_test_support::grpc::MockStore,
+    prefix: &str,
+    n: usize,
+) -> TestResult {
+    let mut nodes = Vec::with_capacity(n);
+    let mut outs = Vec::with_capacity(n);
+    for i in 0..n {
+        let out = test_store_path(&format!("{prefix}-{i}-out"));
+        let mut node = make_node(&format!("{prefix}-{i}"));
+        node.expected_output_paths = vec![out.clone()];
+        nodes.push(node);
+        outs.push(out);
+    }
+    let build_id = Uuid::new_v4();
+    merge_dag(handle, build_id, nodes, vec![], false).await?;
+    barrier(handle).await;
+    store.state.substitutable.write().unwrap().extend(outs);
+    for _ in 0..(n * 2).max(8) {
+        tick(handle).await?;
+        barrier(handle).await;
+        let listed = list_materialization_jobs(handle, (n as u32) * 2).await;
+        if listed.len() >= n {
+            return Ok(());
+        }
+    }
+    panic!("seed_claimable_jobs: probe partition never created all {n} jobs");
+}
+
+/// The per-worker member identity exactly as the store's claim path
+/// mints it (mod.rs: `executor_instance().with_worker(w)` — sanitize
+/// + the one composer; R13 witness provenance).
+fn worker_member(pod: &str, w: usize) -> String {
+    rio_common::dns::Dns1123Label::sanitize(
+        pod,
+        rio_common::dns::WORKER_SUFFIX_RESERVED,
+        "rio-store-dev",
+    )
+    .with_worker(w)
+    .as_str()
+    .to_owned()
+}
+
+// r[verify sched.materialize.listing-distribution]
+/// live_041 RED (1): the leader listing must PARTITION the claimable
+/// head across the live store-worker membership — three workers'
+/// listings pairwise disjoint and jointly covering the claimable set.
+/// Pre-fix there is no identity axis at all: every caller is served
+/// the same deterministic `ORDER BY created_at` head, so N replicas
+/// race the head job, one wins, N-1 burn their pass (live exhibit:
+/// 95.6% of claim attempts wasted; 29.1s fleet-wide zero-throughput
+/// stall; KEDA scale-out during a stall ADDS RACERS).
+#[tokio::test]
+async fn rendezvous_listings_are_disjoint_and_cover() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    seed_claimable_jobs(&handle, &store, "rdv-part", 12).await?;
+
+    let members: Vec<String> = (0..3).map(|w| worker_member("store-rdv", w)).collect();
+    // Beat 0: every member announces itself (its first listing call
+    // IS its membership registration — sparse-membership listings
+    // during this warm-up are the designed bootstrap and not asserted
+    // on).
+    for m in &members {
+        let _ = list_materialization_jobs_as(&handle, 64, m).await;
+    }
+    // Beat 1: full membership — the partition law applies.
+    let mut listings = Vec::new();
+    for m in &members {
+        listings.push(list_materialization_jobs_as(&handle, 64, m).await);
+    }
+    let sets: Vec<std::collections::HashSet<Uuid>> = listings
+        .iter()
+        .map(|l| l.iter().map(|j| j.job_id).collect())
+        .collect();
+    // Pairwise disjoint.
+    for a in 0..sets.len() {
+        for b in (a + 1)..sets.len() {
+            assert!(
+                sets[a].is_disjoint(&sets[b]),
+                "left: 3 identical heads (every member served the same \
+                 deterministic listing) / right: partition — workers {a} and \
+                 {b} overlap on {:?}",
+                sets[a].intersection(&sets[b]).collect::<Vec<_>>()
+            );
+        }
+    }
+    // Jointly cover the claimable set.
+    let union: std::collections::HashSet<Uuid> = sets.iter().flatten().copied().collect();
+    assert_eq!(
+        union.len(),
+        12,
+        "the three slices must jointly cover the claimable head-window"
+    );
+
+    // Parity through the ONE owner fn (Q1: a second partition
+    // computation is the banned mirrored-literal shape): each served
+    // slice must equal the rendezvous_owner-derived slice exactly.
+    let member_refs: Vec<&str> = members.iter().map(|s| s.as_str()).collect();
+    for (i, m) in members.iter().enumerate() {
+        let expected: std::collections::HashSet<Uuid> = union
+            .iter()
+            .copied()
+            .filter(|j| {
+                crate::actor::materialize::rendezvous_owner(*j, member_refs.iter().copied())
+                    == Some(m.as_str())
+            })
+            .collect();
+        assert_eq!(
+            sets[i], expected,
+            "worker {i}'s served slice must be derived from the single \
+             rendezvous_owner source"
+        );
+    }
+    Ok(())
+}
+
+// r[verify sched.materialize.listing-distribution]
+/// live_041 green pin (CF-1 fallback law): instance-less callers
+/// (full dev mode — no member, no slice) are served the UNPARTITIONED
+/// listing, byte-identical to the pre-partition deterministic head —
+/// even while identity-bearing members exist (unreachable mix in
+/// production, pinned total here).
+#[tokio::test]
+async fn instance_less_listing_stays_unpartitioned() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    seed_claimable_jobs(&handle, &store, "rdv-dev", 12).await?;
+
+    let head_a: Vec<Uuid> = list_materialization_jobs(&handle, 8)
+        .await
+        .iter()
+        .map(|j| j.job_id)
+        .collect();
+    let head_b: Vec<Uuid> = list_materialization_jobs(&handle, 8)
+        .await
+        .iter()
+        .map(|j| j.job_id)
+        .collect();
+    assert_eq!(
+        head_a, head_b,
+        "dev mode: the deterministic head, unchanged"
+    );
+    assert_eq!(head_a.len(), 8);
+
+    // Identity-bearing members join; the instance-less caller still
+    // sees the full head (it cannot own a slice).
+    for w in 0..2 {
+        let _ = list_materialization_jobs_as(&handle, 8, &worker_member("store-dev", w)).await;
+    }
+    let head_c: Vec<Uuid> = list_materialization_jobs(&handle, 8)
+        .await
+        .iter()
+        .map(|j| j.job_id)
+        .collect();
+    assert_eq!(
+        head_a, head_c,
+        "an instance-less caller is served the unpartitioned head even \
+         alongside live members"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.listing-distribution]
+/// live_041 RED (3), the KEDA shape (structural count, not
+/// wall-clock): per-beat DISTINCT listed jobs must strictly grow when
+/// a member joins. Pre-fix the fleet advances at most one listing
+/// window per round regardless of replica count — a hard
+/// ~window-size/round ceiling that inverts the KEDA feedback
+/// (scale-out adds racers, not throughput).
+#[tokio::test]
+async fn member_join_grows_distinct_listed_jobs() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    seed_claimable_jobs(&handle, &store, "rdv-grow", 40).await?;
+
+    // One member, window 8: at most 8 distinct jobs per beat (solo
+    // membership serves unpartitioned — the worker owns everything).
+    let m0 = worker_member("store-grow", 0);
+    let solo = list_materialization_jobs_as(&handle, 8, &m0).await;
+    let solo_distinct: std::collections::HashSet<Uuid> = solo.iter().map(|j| j.job_id).collect();
+    assert_eq!(
+        solo_distinct.len(),
+        8,
+        "precondition: window-bound solo beat"
+    );
+
+    // A second member joins: the two members' post-join beats draw
+    // from DISJOINT slices of the 40-job head, so their union must
+    // exceed one window (the slices partition all 40 jobs — both
+    // fitting inside one 8-window is unsatisfiable).
+    let m1 = worker_member("store-grow", 1);
+    let _ = list_materialization_jobs_as(&handle, 8, &m1).await; // join beat
+    let beat0 = list_materialization_jobs_as(&handle, 8, &m0).await;
+    let beat1 = list_materialization_jobs_as(&handle, 8, &m1).await;
+    let mut union: std::collections::HashSet<Uuid> = beat0.iter().map(|j| j.job_id).collect();
+    union.extend(beat1.iter().map(|j| j.job_id));
+    assert!(
+        union.len() > 8,
+        "left: per-beat distinct listed jobs flat at the window size as \
+         members grow / right: strictly grows per member (got {} distinct \
+         across 2 members, window 8)",
+        union.len()
+    );
+    Ok(())
 }

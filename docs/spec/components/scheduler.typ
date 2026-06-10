@@ -1690,14 +1690,50 @@ view update).
   Unavailable view, so every listed job is admittable by construction.
 ]
 The listing over-fetches the durable query (bounded at
-`min(2×limit, 512)`) because the durable axis cannot see view-only
-armament: the transient deferral has no column by design
-(merged_bug_178), and a fresh claim can commit between the query and
-the reply. This rule does NOT re-key
-#rref("sched.materialize.view-settlement"): entry removal still gates
-exclusively on the durable write's settled disposition --- the privacy
-change moves reads behind the classification, not the removal
-discipline.
+`min(2×limit, 512)`; partitioned callers draw the full 512-row
+head-window --- the partition domain must not shrink with one caller's
+limit) because the durable axis cannot see view-only armament: the
+transient deferral has no column by design (merged_bug_178), and a
+fresh claim can commit between the query and the reply. This rule does
+NOT re-key #rref("sched.materialize.view-settlement"): entry removal
+still gates exclusively on the durable write's settled disposition ---
+the privacy change moves reads behind the classification, not the
+removal discipline.
+
+#r("sched.materialize.listing-distribution")[
+  The leader job listing MUST partition the claimable head-window
+  across the live store-worker membership by rendezvous hashing over
+  (job, worker member) --- the member unit is the per-worker composite
+  identity carried by the verified store-service credential's instance
+  claim, the membership is the set of members whose last
+  identity-bearing listing call is within the membership TTL, and ONE
+  owner function is the single partition source --- and MUST serve each
+  identity-bearing caller exactly its owner slice united with the steal
+  horizon (jobs whose owner has not listed within the staleness
+  horizon), with no wire-visible distinction between the segments; an
+  instance-less caller or an empty membership MUST be served the
+  unpartitioned listing.
+]
+The live_041 convoy (2026-06-09): every replica polled the same
+deterministic `ORDER BY created_at` head --- N workers raced the head
+job, one won, N-1 burned their pass; the fleet advanced at most one
+listing window per round regardless of replica count, and KEDA
+scale-out during a stall ADDED RACERS (live: 95.6% of claim attempts
+wasted; a 29.1 s fleet-wide zero-throughput stall). Identity rides the
+verified service-token claims (T-5.1) --- zero wire change; the steal
+horizon is computed server-side at the same site from the same
+membership map (RULED CF-3 --- no client steal lane, no lane flag), so
+duplication is bounded by owner staleness, never asserted away:
+exactly-one-LISTING is deliberately NOT a property of this rule (a
+stale owner's slice is legitimately double-listed until it returns;
+claims still arbitrate one-winner). The member unit is the per-WORKER
+`{pod}-w{n}` composite, never the pod (RULED CF-2: `with_worker`'s
+sanitize-salt fallback makes suffix-stripping unreliable, so no pod
+aggregation exists anywhere); a replica scale event is a batch
+join/leave of `executor_concurrency` members. Machine witness:
+`docs/spec/models/materializationDistribution.qnt` (owner-map
+partition, own-slice disjointness/coverage, staleness-bounded steal,
+no-job-unlisted, orphan recovery; convoy and no-steal falsify twins).
 
 #r("sched.materialize.conversion-strictness")[
   The parked-job re-evaluation MUST support two independently default-off

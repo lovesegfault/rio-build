@@ -1387,11 +1387,16 @@ impl DagActor {
                     )
                     .await;
                 }
-                ActorCommand::ListMaterializationJobs { limit, reply } => {
+                ActorCommand::ListMaterializationJobs {
+                    limit,
+                    instance,
+                    reply,
+                } => {
                     // r[sched.lease.standby-drops-writes+3]: the handler
                     // self-gates on is_leader() (standby answers empty)
                     // and is read-only either way.
-                    self.handle_list_materialization_jobs(limit, reply).await;
+                    self.handle_list_materialization_jobs(limit, instance, reply)
+                        .await;
                 }
                 ActorCommand::ReportPullOutcome {
                     exec_id,

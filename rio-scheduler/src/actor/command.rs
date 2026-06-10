@@ -280,6 +280,16 @@ pub enum ActorCommand {
     ListMaterializationJobs {
         /// Cap on returned descriptors (server clamps to 256).
         limit: u32,
+        /// The VERIFIED per-worker member identity (live_041) — the
+        /// `{pod}-w{n}` composite from the store-service token's
+        /// signed instance claim (`ResolvedCredential::StoreService`;
+        /// the gRPC chokepoint already rejected instance-unbound
+        /// tokens for this surface), threaded so the listing arm can
+        /// rendezvous-partition the claimable head per live worker.
+        /// `None` = full dev mode (no key families configured): the
+        /// caller contributes no member and is served the
+        /// unpartitioned listing.
+        instance: Option<String>,
         reply: oneshot::Sender<Vec<super::materialize::JobDescriptor>>,
     },
 

@@ -504,12 +504,13 @@ pub(super) enum ResolvedCredential {
     /// key configured: nothing verified, nothing keyed.
     Executor(Option<super::VerifiedExecutor>),
     /// Materialization family: the store-service gate's outcome.
-    /// The carried auth (DevMode vs the verified instance claim) is
-    /// not consumed by today's handlers — it is the landing site for
-    /// any future per-replica binding (the merged_bug_115 record names
-    /// `credential_for` as that single site), so the chokepoint
-    /// surfaces it now rather than re-plumbing later.
-    StoreService(#[allow(dead_code)] StoreServiceAuth),
+    /// The carried auth (DevMode vs the verified instance claim) IS
+    /// consumed since live_041: the listing handler threads the
+    /// verified worker instance into the actor's rendezvous-
+    /// partitioned listing — the per-replica binding this variant was
+    /// surfaced for (the merged_bug_115 record names `credential_for`
+    /// as that single site).
+    StoreService(StoreServiceAuth),
 }
 
 /// Why a credential was rejected — the `pull_rejected_total` reason
@@ -1056,15 +1057,32 @@ impl ExecutorService for SchedulerGrpc {
         // the check, the listing carries no executor_instance to
         // match). Full dev mode passes through to the flag gate
         // (empty list).
-        self.credential_for(
-            PayloadCredentialKind::MaterializationStateEffecting {
-                executor_body_token: request.get_ref().service_token.as_str(),
-                service_body_token: request.get_ref().service_token.as_str(),
-                request_instance: None,
-            },
-            &request,
-        )
-        .map_err(|rej| rej.into_status_counted("list_materialization_jobs"))?;
+        let credential = self
+            .credential_for(
+                PayloadCredentialKind::MaterializationStateEffecting {
+                    executor_body_token: request.get_ref().service_token.as_str(),
+                    service_body_token: request.get_ref().service_token.as_str(),
+                    request_instance: None,
+                },
+                &request,
+            )
+            .map_err(|rej| rej.into_status_counted("list_materialization_jobs"))?;
+        // live_041: the VERIFIED worker identity from the signed
+        // instance claim — the same `{pod}-w{n}` composite the claim
+        // path binds (T-5.1) — threads into the actor so the listing
+        // arm can rendezvous-partition the claimable head per live
+        // worker. The instance-bound gate above already rejected
+        // unbound tokens for this surface, so `Authorized` always
+        // carries `Some`; `None` is full dev mode (no member — the
+        // unpartitioned listing).
+        let instance = match credential {
+            ResolvedCredential::StoreService(StoreServiceAuth::Authorized { instance }) => instance,
+            ResolvedCredential::StoreService(StoreServiceAuth::DevMode) => None,
+            // credential_for never resolves the executor family for a
+            // materialization payload class; stay total (and
+            // member-less) rather than panic.
+            ResolvedCredential::Executor(_) => None,
+        };
         let req = request.into_inner();
 
         // send_unchecked: the store polls on an interval; a dropped
@@ -1073,6 +1091,7 @@ impl ExecutorService for SchedulerGrpc {
         self.actor
             .send_unchecked(ActorCommand::ListMaterializationJobs {
                 limit: req.limit,
+                instance,
                 reply: reply_tx,
             })
             .await

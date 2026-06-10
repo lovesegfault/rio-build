@@ -47,6 +47,86 @@ impl JobDescriptor {
 pub(super) const RETRY_LATER_DEFAULT_DEFER_SECS: u64 = 5;
 pub(super) const RETRY_LATER_MAX_DEFER_SECS: u64 = 300;
 
+/// live_041 — membership TTL (OQ-6b-1): a worker silent past this
+/// bound leaves the contact map entirely — the rendezvous partition
+/// re-keys over the survivors, permanently re-homing the departed
+/// worker's slice (scale-down leaves no residue). A silent worker
+/// still inside this bound keeps owning its slice; the steal horizon
+/// (the companion bound, calibrated against the store's poll beat)
+/// is what serves a missed-beat owner's jobs broadly in the interim —
+/// the degradation direction is always "served more broadly", never
+/// "unlisted".
+pub(super) const LISTING_MEMBER_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+// r[impl sched.materialize.listing-distribution]
+/// live_041 — THE rendezvous owner: highest-random-weight hash over
+/// `(job_id, member)`. The SINGLE partition source — the owner slice
+/// AND the steal horizon are both derived from this one fn at the one
+/// listing site (a second partition computation anywhere is the
+/// mirrored-literal shape the Q1 banner bans; the parity test pins
+/// served slices against this fn).
+///
+/// Member unit (RULED CF-2): the per-WORKER composite `{pod}-w{n}` —
+/// the token-bound identity the claim path already asserts. Never the
+/// pod: `with_worker`'s sanitize-salt fallback makes suffix-stripping
+/// unreliable, so no pod aggregation exists anywhere.
+///
+/// Hashing: `DefaultHasher::new()` (SipHash-1-3, fixed keys) —
+/// deterministic within a process, which is all HRW needs here: the
+/// leader's listing arm is the only consumer, and a re-partition at
+/// leader failover or a std hash change is benign (claims arbitrate;
+/// the steal horizon covers any transient). Ties break on the member
+/// string (total order — astronomically unlikely at 64 bits, but the
+/// owner must be a function).
+pub(crate) fn rendezvous_owner<'a, I>(job_id: Uuid, members: I) -> Option<&'a str>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    use std::hash::{Hash, Hasher};
+    members.into_iter().max_by_key(|m| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        job_id.hash(&mut h);
+        m.hash(&mut h);
+        (h.finish(), *m)
+    })
+}
+
+/// live_041 — the leader's listing-contact map: `{worker member →
+/// last identity-bearing listing}`. Fed exclusively by the listing
+/// arm (the claim-path composites are the same identities; a
+/// lease/endpoint view was REJECTED — it sees pods, not workers).
+/// Lives inside [`JobViewState::Hydrated`] on purpose: it is
+/// leader-tenure-scoped soft state with exactly the view's lifecycle
+/// — wiped with the tenure on LeaderLost, empty at recovery (the
+/// first post-failover beats serve broadly and converge within one
+/// beat as workers list).
+#[derive(Debug, Default)]
+pub(crate) struct ListingContacts {
+    contacts: std::collections::HashMap<String, std::time::Instant>,
+}
+
+impl ListingContacts {
+    /// Record an identity-bearing listing call and prune members
+    /// silent past [`LISTING_MEMBER_TTL`] (the map stays bounded by
+    /// live churn, not by all-time pod history).
+    fn note(&mut self, member: &str, now: std::time::Instant) {
+        self.contacts
+            .retain(|_, last| now.duration_since(*last) <= LISTING_MEMBER_TTL);
+        self.contacts.insert(member.to_owned(), now);
+    }
+
+    /// The live membership snapshot: members within
+    /// [`LISTING_MEMBER_TTL`], with their last-listed instants (the
+    /// steal horizon reads the ages).
+    fn members(&self, now: std::time::Instant) -> Vec<(String, std::time::Instant)> {
+        self.contacts
+            .iter()
+            .filter(|(_, last)| now.duration_since(**last) <= LISTING_MEMBER_TTL)
+            .map(|(m, last)| (m.clone(), *last))
+            .collect()
+    }
+}
+
 /// The in-memory job view entry (droppable, never written back —
 /// design handoff input 1's "derived droppable view"). Authority lives
 /// in PG: creation dedup is the partial-unique index; consumption is
@@ -451,8 +531,15 @@ pub(crate) enum JobViewState {
     #[default]
     Unavailable,
     /// Rebuilt from PG by recovery; live-maintained by the creation
-    /// and consumption paths.
-    Hydrated(JobView),
+    /// and consumption paths. Carries the [`ListingContacts`] beside
+    /// the view (live_041): the contact map is leader-tenure-scoped
+    /// soft state with exactly the view's lifecycle (wiped with the
+    /// tenure, empty at recovery), and the listing arm — its only
+    /// consumer — already gates on this very arm.
+    Hydrated {
+        view: JobView,
+        contacts: ListingContacts,
+    },
 }
 
 impl JobViewState {
@@ -462,14 +549,26 @@ impl JobViewState {
     pub(super) fn hydrated(&self) -> Option<&JobView> {
         match self {
             Self::Unavailable => None,
-            Self::Hydrated(v) => Some(v),
+            Self::Hydrated { view, .. } => Some(view),
         }
     }
 
     pub(super) fn hydrated_mut(&mut self) -> Option<&mut JobView> {
         match self {
             Self::Unavailable => None,
-            Self::Hydrated(v) => Some(v),
+            Self::Hydrated { view, .. } => Some(view),
+        }
+    }
+
+    /// The hydrated view together with its listing-contact map
+    /// (live_041 — the listing arm's split borrow: contacts mutate
+    /// while the view is read).
+    pub(super) fn hydrated_with_contacts_mut(
+        &mut self,
+    ) -> Option<(&JobView, &mut ListingContacts)> {
+        match self {
+            Self::Unavailable => None,
+            Self::Hydrated { view, contacts } => Some((view, contacts)),
         }
     }
 
@@ -523,11 +622,18 @@ impl JobViewState {
         *self = Self::Unavailable;
     }
 
-    /// Recovery: the only `Hydrated` constructor.
+    /// Recovery: the only `Hydrated` constructor. The contact map
+    /// starts EMPTY on purpose (live_041): a new tenure trusts no
+    /// prior contact times — the first beats serve broadly
+    /// (empty/sparse membership ⇒ unpartitioned-to-coarse listings)
+    /// and converge within one beat as workers list.
     pub(super) fn rebuild(&mut self, entries: impl IntoIterator<Item = (DrvHash, JobViewEntry)>) {
         let mut v = JobView::default();
         v.rebuild(entries);
-        *self = Self::Hydrated(v);
+        *self = Self::Hydrated {
+            view: v,
+            contacts: ListingContacts::default(),
+        };
     }
 
     /// Test seeding: hydrate-if-needed then insert (tests model a
@@ -535,10 +641,13 @@ impl JobViewState {
     #[cfg(test)]
     pub(super) fn insert(&mut self, k: DrvHash, v: JobViewEntry) -> Option<JobViewEntry> {
         if matches!(self, Self::Unavailable) {
-            *self = Self::Hydrated(JobView::default());
+            *self = Self::Hydrated {
+                view: JobView::default(),
+                contacts: ListingContacts::default(),
+            };
         }
         match self {
-            Self::Hydrated(view) => view.insert(k, v),
+            Self::Hydrated { view, .. } => view.insert(k, v),
             Self::Unavailable => unreachable!(),
         }
     }
@@ -668,11 +777,27 @@ impl DagActor {
     /// merged_bug_246/155 fail-closed postures verbatim (advertising
     /// jobs whose armament we cannot see would hand out claims that
     /// race the durable holders).
+    ///
+    /// live_041 — the claimable head is rendezvous-PARTITIONED across
+    /// the live store-worker membership: an identity-bearing caller
+    /// (the verified `{pod}-w{n}` instance claim, threaded from the
+    /// gRPC chokepoint) is recorded in the tenure-scoped
+    /// [`ListingContacts`] and served exactly the jobs whose
+    /// [`rendezvous_owner`] it is — disjoint slices by construction,
+    /// so N workers advance N slices instead of all racing the same
+    /// `ORDER BY created_at` head (the convoy: one winner, N−1 burned
+    /// passes, KEDA scale-out adding racers). The SQL `ORDER BY`
+    /// survives as fairness WITHIN a slice. An instance-less caller
+    /// (full dev mode) contributes no member and is served the
+    /// unpartitioned listing — with no identity-bearing callers the
+    /// behavior is byte-for-byte the pre-partition shape.
     // r[impl sched.materialize.job+2]
     // r[impl sched.materialize.claimability-projection]
+    // r[impl sched.materialize.listing-distribution]
     pub(super) async fn handle_list_materialization_jobs(
         &mut self,
         limit: u32,
+        instance: Option<String>,
         reply: oneshot::Sender<Vec<JobDescriptor>>,
     ) {
         let limit = limit.min(256);
@@ -684,14 +809,40 @@ impl DagActor {
         {
             Vec::new()
         } else {
-            // Over-fetch min(2×limit, 512): the view filter below may
-            // drop rows the query believed claimable (deferred /
-            // just-claimed / not-yet-fed), and a second query round
-            // trip per poll is worse than a bounded over-read.
-            let fetch = i64::from(limit).saturating_mul(2).min(512);
+            let now = std::time::Instant::now();
+            // Record the caller's contact FIRST (its own membership
+            // entry rides this very call), then snapshot the live
+            // membership the partition is computed over. Owned
+            // snapshot: the contact borrow must end before the query
+            // await below.
+            let members: Vec<(String, std::time::Instant)> = {
+                let (_, contacts) = self
+                    .materialization_jobs
+                    .hydrated_with_contacts_mut()
+                    .expect("hydrated checked above");
+                if let Some(me) = instance.as_deref() {
+                    contacts.note(me, now);
+                }
+                contacts.members(now)
+            };
+            // Partitioned callers draw from the FULL bounded
+            // head-window (512 — the partition domain must not shrink
+            // with one caller's limit, or slices stop covering the
+            // head); the unpartitioned lanes keep the pre-live_041
+            // over-fetch min(2×limit, 512) byte-for-byte (the view
+            // filter below may drop rows the query believed claimable
+            // — deferred / just-claimed / not-yet-fed — and a second
+            // query round trip per poll is worse than a bounded
+            // over-read).
+            let partitioned = instance.is_some() && members.len() > 1;
+            let fetch = if partitioned {
+                512
+            } else {
+                i64::from(limit).saturating_mul(2).min(512)
+            };
             match self.db.list_claimable_materialization_jobs(fetch).await {
                 Ok(rows) => {
-                    let now = std::time::Instant::now();
+                    let caller = instance.as_deref();
                     rows.into_iter()
                         .filter(|row| {
                             self.materialization_jobs
@@ -700,6 +851,7 @@ impl DagActor {
                                     entry.claimability(now) == Claimability::ClaimableNow
                                 })
                         })
+                        .filter(|row| Self::listing_serves(row.job_id, caller, &members, now))
                         .take(limit as usize)
                         .map(JobDescriptor::from_row)
                         .collect()
@@ -711,6 +863,36 @@ impl DagActor {
             }
         };
         let _ = reply.send(jobs);
+    }
+
+    // r[impl sched.materialize.listing-distribution]
+    /// live_041 — whether THIS caller's listing carries the job: the
+    /// caller's owner slice, derived from the ONE
+    /// [`rendezvous_owner`] source. Instance-less callers and
+    /// memberships without a second live worker serve unpartitioned
+    /// (the dev-mode / solo-worker fallback — today's behavior).
+    fn listing_serves(
+        job_id: Uuid,
+        caller: Option<&str>,
+        members: &[(String, std::time::Instant)],
+        _now: std::time::Instant,
+    ) -> bool {
+        let Some(me) = caller else {
+            // Instance-less caller (full dev mode): no member, no
+            // slice — the unpartitioned listing.
+            return true;
+        };
+        if members.len() <= 1 {
+            // Solo membership (the caller itself): owner of
+            // everything by construction — skip the hash walk.
+            return true;
+        }
+        match rendezvous_owner(job_id, members.iter().map(|(m, _)| m.as_str())) {
+            Some(owner) => owner == me,
+            // Unreachable (the caller was just recorded), but total:
+            // an empty membership serves unpartitioned.
+            None => true,
+        }
     }
 
     /// THE single job-creation helper for callers with NO enclosing
