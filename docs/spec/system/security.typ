@@ -347,7 +347,11 @@ typed observation budget this rule requires.
   cross-process *write* syscall `process_vm_writev` on top of RuntimeDefault's
   \~40-syscall denylist, while keeping the read-side trace syscalls `ptrace`
   and `process_vm_readv` permitted (the builder profile only; the fetcher
-  profile denies all five). The profile JSON lives at
+  profile denies all five). The builder profile additionally re-allows
+  `io_uring_setup`/`io_uring_enter`/`io_uring_register` (in RuntimeDefault's
+  denylist since Docker v24) so the worker's fuse-over-io_uring castore
+  transport can engage; the fetcher profile keeps them denied. The profile
+  JSON lives at
   `nix/nixos-node/seccomp/rio-{builder,fetcher}.json`; the chart's default
   `localhostProfile` is `operator/rio-builder.json` (fetchers hardcode
   `operator/rio-fetcher.json`) --- that path is relative to
@@ -360,6 +364,16 @@ typed observation budget this rule requires.
   missing profile surfaces as the executor container's `CreateContainerError`
   with the profile path in the message.
 ]
+
+Allowing the io_uring syscalls in seccomp is necessary but not sufficient for
+the transport (the worker's only castore-FUSE transport) to come up:
+`io_uring_setup` is also subject to the kernel's per-user pinned-memory
+accounting, and the containerd-default `RLIMIT_MEMLOCK` (8 MiB) fails it with
+`ENOMEM` --- observed on the EKS worker nodes. The controller therefore
+grants `CAP_IPC_LOCK` --- which exempts a process from that accounting --- to
+every builder-pool executor container, and never to fetchers (which run no
+castore-FUSE). Untrusted build code does not inherit the capability:
+nix-daemon runs builds as the non-root `nixbld` users, which clears it.
 
 The read-side trace syscalls are permitted because denying them breaks every
 build whose check phase traces its own processes: LeakSanitizer's at-exit
