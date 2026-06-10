@@ -149,7 +149,7 @@ pub const POLL_INTERVAL_SECS: u64 = 600;
 /// database, and bounds the deferred price-fold/persist window at 5%
 /// of the tick period. The const relation below pins the envelope
 /// strictly inside the tick it bounds (R17 ordering law).
-pub(crate) const COST_RELOAD_RETRY_SECS: u64 = 30;
+pub const COST_RELOAD_RETRY_SECS: u64 = 30;
 const _: () = assert!(
     COST_RELOAD_RETRY_SECS < POLL_INTERVAL_SECS,
     "the reload-retry envelope must sit strictly inside the housekeeping tick"
