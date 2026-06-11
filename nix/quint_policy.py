@@ -119,6 +119,18 @@ P7_GRANDFATHER: frozenset = frozenset(
         ("logService", "readerBoundsOK"),
         ("logService", "servedStreamSpanExact"),
         ("materializationJob", "boundsOK"),
+        # bw10 WO-S8-5 ruling (merged_bug_090's re-scan duty): the
+        # unified refusal predicate surfaced this MIXED bundle (1
+        # anonymous forall + 1 named conjunct) that the old anon>=2
+        # gate never saw — visible across all 8 materialization-holds
+        # checks. The model-plane fix (split into named leaves + per-
+        # leaf P1 twins) is docs/spec/models work outside this wave's
+        # S8 grant (models are S4-sole this round, §1.6.3); recorded
+        # here per the WO's fixed-or-twinned-RECORDED arm so the
+        # bundle is a visible census row instead of an invisible
+        # laundering. Burn-down trigger: the next materializationJob
+        # model pass splits the leaf and deletes this row.
+        ("materializationJob", "noWrongfulTerminalFailure"),
         ("nodeclaimLifecycle", "boundsOK"),
         ("nodeclaimLifecycle", "degradedCoverPolarity"),
         ("nodeclaimLifecycle", "provisioningBudget"),
@@ -306,43 +318,63 @@ class Corpus:
         self._readset_cache[key] = out
         return out
 
-    def anon_conjunct_count(self, mod, leaf):
-        """P7: the number of NON-NAME operands of the leaf body's `and`
-        application, unwrapping local `val` bindings (IR `let` nodes)
-        first. 0 when the body is not an `and` application. The let
-        unwrap matters: `conj_leaves` expands only bare all-name
-        conjunctions, so a let-wrapped `and{...}` is one opaque leaf —
-        exactly the bundle shape P7 bans."""
+    def conj_expansion(self, mod, leaf):
+        """THE expansion capability test (merged_bug_090): the single
+        predicate BOTH the twin engine (`conj_leaves`) and the P7 gate
+        consume — P7 is DEFINED as this function's refusal, so the ban
+        and the engine cannot drift (the old gate re-derived a
+        narrower predicate: anon>=2 after a let unwrap, which let a
+        MIXED bundle [anon=1] and a LET-WRAPPED all-name bundle
+        [anon=0] each ship as one opaque leaf earning
+        intersection-based twin credit over the merged read-set — the
+        bug_087 shape P7 exists to ban). Returns one of:
+          ("atom", None)         — body is not a conjunction (or an
+                                   empty one): a true leaf;
+          ("expanded", names)    — a bare all-name and/actionAll: the
+                                   engine recurses through it;
+          ("refused", detail)    — conjunction-shaped but NOT
+                                   expandable (anonymous operands
+                                   and/or a let wrapper): ships as ONE
+                                   opaque leaf; exactly what P7 bans.
+        detail = {"anon": n, "named": n, "lets": n}."""
         dmod, d = self.visible_decl(mod, leaf)
         if d is None or d["kind"] != "def":
-            return 0
+            return ("atom", None)
         e = d.get("expr")
-        while isinstance(e, dict) and e.get("kind") == "let":
-            e = e.get("expr")
-        if isinstance(e, dict) and e.get("kind") == "app" and e.get("opcode") == "and":
-            return sum(
-                1
-                for a in e.get("args", [])
-                if not (isinstance(a, dict) and a.get("kind") == "name")
-            )
-        return 0
+        lets = 0
+        inner = e
+        while isinstance(inner, dict) and inner.get("kind") == "let":
+            lets += 1
+            inner = inner.get("expr")
+        if not (
+            isinstance(inner, dict)
+            and inner.get("kind") == "app"
+            and inner.get("opcode") in ("and", "actionAll")
+        ):
+            return ("atom", None)
+        args = inner.get("args", [])
+        if not args:
+            return ("atom", None)
+        anon = sum(1 for a in args if not (isinstance(a, dict) and a.get("kind") == "name"))
+        if lets == 0 and anon == 0:
+            return ("expanded", [a["name"] for a in args])
+        return ("refused", {"anon": anon, "named": len(args) - anon, "lets": lets})
 
     def conj_leaves(self, mod, inv):
-        """Expand a conjunction val to leaf val names; a non-and expr is its own leaf."""
+        """Expand a conjunction val to leaf val names via
+        [`conj_expansion`]; an atom or a REFUSED expansion is its own
+        leaf (the P7 gate consumes the same predicate, so every
+        refused leaf in this output is flagged there — the complement
+        is structural, not re-derived)."""
         dmod, d = self.visible_decl(mod, inv)
         if d is None or d["kind"] != "def":
             return [(mod, inv)]
-        e = d.get("expr")
-        if isinstance(e, dict) and e.get("kind") == "app" and e.get("opcode") in ("and", "actionAll"):
+        verdict, payload = self.conj_expansion(mod, inv)
+        if verdict == "expanded":
             leaves = []
-            allnames = True
-            for a in e.get("args", []):
-                if isinstance(a, dict) and a.get("kind") == "name":
-                    leaves.extend(self.conj_leaves(dmod, a["name"]))
-                else:
-                    allnames = False
-            if allnames and leaves:
-                return leaves
+            for name in payload:
+                leaves.extend(self.conj_leaves(dmod, name))
+            return leaves
         return [(dmod, inv)]
 
     def assigns_reachable(self, mod, roots):
@@ -498,17 +530,30 @@ def run_policy(manifest, corpus, assume_latches=""):
             for lmod, leaf in corpus.conj_leaves(main_mod, inv):
                 reads = corpus.var_readset(lmod, leaf)
                 ex = exempts.get(leaf) or exempts.get(inv)
-                # P7: anonymous multi-conjunct wired leaves are banned —
-                # the bundle defeats P1's per-leaf twin engine (bug_087).
-                anon = corpus.anon_conjunct_count(lmod, leaf)
-                if anon >= 2:
+                # P7: unexpandable conjunction bundles are banned —
+                # the bundle defeats P1's per-leaf twin engine
+                # (bug_087). The ban IS the expansion engine's own
+                # refusal (merged_bug_090: one predicate, drift
+                # unrepresentable) — every leaf in conj_leaves' output
+                # is an atom or a refusal, and refusals are flagged.
+                verdict, detail = corpus.conj_expansion(lmod, leaf)
+                if verdict == "refused":
                     if (lmod, leaf) in P7_GRANDFATHER:
                         census["P7-grandfathered"].append(f"{cname}:{lmod}.{leaf}")
                     else:
+                        shape = []
+                        if detail["anon"]:
+                            shape.append(f"{detail['anon']} anonymous")
+                        if detail["named"]:
+                            shape.append(f"{detail['named']} named")
+                        if detail["lets"]:
+                            shape.append("let-wrapped")
                         violations.append(
-                            f"P7 {cname}: invariant leaf '{leaf}' ({lmod}) bundles {anon} anonymous "
-                            "conjuncts in one val — split into named val leaves (each then owes its "
-                            "own P1 falsify twin); grandfather entries are frozen generator output "
+                            f"P7 {cname}: invariant leaf '{leaf}' ({lmod}) is an unexpandable "
+                            f"conjunction bundle ({', '.join(shape)}) — the twin engine refuses "
+                            "to expand it, so it ships as ONE opaque leaf with merged-read-set "
+                            "twin credit; split into named val leaves (each then owes its own "
+                            "P1 falsify twin); grandfather entries are frozen generator output "
                             "and new ones require a wave ruling"
                         )
                         census["P7-anonymous-bundle"].append(f"{cname}:{lmod}.{leaf}")
@@ -846,12 +891,54 @@ def selftest():
         p7_files,
         p7_manifest,
         [
-            "P7 p7Check: invariant leaf 'bundled' (liveP7) bundles 2 anonymous conjuncts",
+            "P7 p7Check: invariant leaf 'bundled' (liveP7) is an unexpandable conjunction bundle (2 anonymous, let-wrapped)",
             "P1 p7Check: invariant leaf 'bundled'",
         ],
     )
     if not census.get("P7-anonymous-bundle"):
         fail("self-test[p7-red]: P7-anonymous-bundle census bucket empty")
+
+    # P7 planted reds for the engine-complement axes (merged_bug_090 —
+    # both TRUE reds against the old anon>=2-after-let-unwrap gate):
+    # (a) a MIXED bundle (one anonymous + one named operand, anon=1):
+    # the engine refuses it (not all-name), so it shipped as ONE
+    # opaque leaf earning intersection-based twin credit over the
+    # merged read-set — while the old gate, counting anon>=2, stayed
+    # silent. The unified predicate fires on the refusal itself.
+    p7_mixed = (
+        "module liveP7m {\n  var p: int\n  action init = p' = 0\n"
+        "  action step = p' = p + 1\n"
+        "  val leafA = p >= 0\n"
+        "  val mixed = and { leafA, p < 10 }\n}\n"
+    )
+    expect(
+        "p7-mixed-red",
+        {"live_p7m.qnt": p7_mixed},
+        {"p7Mixed": {"kind": "holds", "main": "liveP7m", "invariants": ["mixed"]}},
+        [
+            "P7 p7Mixed: invariant leaf 'mixed' (liveP7m) is an unexpandable conjunction bundle (1 anonymous, 1 named)",
+            "P1 p7Mixed: invariant leaf 'mixed'",
+        ],
+    )
+    # (b) a LET-WRAPPED ALL-NAME bundle (anon=0 after unwrap): the
+    # engine never unwraps let, so the conjunction shipped opaque —
+    # the old gate's own docstring called this exactly the banned
+    # shape, and counted 0. The refusal predicate names the wrapper.
+    p7_letnamed = (
+        "module liveP7l {\n  var p: int\n  action init = p' = 0\n"
+        "  action step = p' = p + 1\n"
+        "  val leafA = p >= 0\n  val leafB = p + 1 > 0\n"
+        "  val letNamed =\n    val unused = 1\n    and { leafA, leafB }\n}\n"
+    )
+    expect(
+        "p7-letnamed-red",
+        {"live_p7l.qnt": p7_letnamed},
+        {"p7Let": {"kind": "holds", "main": "liveP7l", "invariants": ["letNamed"]}},
+        [
+            "P7 p7Let: invariant leaf 'letNamed' (liveP7l) is an unexpandable conjunction bundle (2 named, let-wrapped)",
+            "P1 p7Let: invariant leaf 'letNamed'",
+        ],
+    )
 
     # P7 green: the SAME propositions as NAMED leaves — conj_leaves
     # expands the all-name `and`, each leaf is a plain application
