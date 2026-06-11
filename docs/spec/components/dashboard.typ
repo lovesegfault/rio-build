@@ -367,6 +367,33 @@ lower floor there; the dashboard tab has neither bound.
   state.
 ]
 
+#r("dash.graph.truncated-follow")[
+  A truncated graph view MUST keep following at the live cadence until
+  the drawer closes: the settle latch consumes graph-shape evidence
+  from the `GetBuildGraph` response alone (`!truncated` is a
+  NECESSARY settle condition --- visible-terminal #sym.eq.not
+  all-terminal under insertion-order truncation), and no second
+  evidence source --- in particular the build-status poll's
+  terminality --- may feed the latch unless a future rule mints a
+  two-evidence settle law reconciled with the no-prop-fed-oracle
+  posture.
+]
+Disposition record (merged_bug_082, PARTIAL --- a pre-campaign spec
+tension, not a campaign regression): for builds above the server's
+truncation threshold the MUST-downshift trigger of
+#rref("dash.graph.auto-stop+3") is unobservable from this RPC exactly
+where each poll is most expensive, so the drawer polls at the live
+cadence for the build's whole open lifetime. That cost is the PRICED,
+ACCEPTED residual --- the in-tree pricing lives at the BuildDrawer
+oracle comment ("a stuck node in a >5000-node truncated view follows
+until tab close --- following a stuck node is the idle-timeout rule's
+own posture"), which cites this rule back. The alternative --- a
+second typed evidence input from the build-status poll --- is the
+recorded TRIGGER-NAMED future: it is minted (as a new two-evidence
+settle rule, never an edit to this one) on the first operator
+complaint about truncated-view poll cost; minting it now, with no
+implementation, would violate the marker-first discipline.
+
 #r("dash.executors.kind-filter")[
   The Executors page exposes a `kind` `<select>` filtering on
   `ExecutorInfo.kind` (raw wire integers `0`=builder, `1`=fetcher). Surfaces

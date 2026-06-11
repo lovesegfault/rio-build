@@ -150,7 +150,10 @@
   // cancel_build_derivations) or a stuck node in a >5000-node truncated
   // view follows until tab close — following a stuck node is the
   // idle-timeout rule's own posture (an hour-quiet stream means the
-  // build is stuck).
+  // build is stuck). This pricing is the rationale text of
+  // dash.graph.truncated-follow (the merged_bug_082 disposition rule),
+  // which cites this comment; the two-evidence settle alternative is
+  // trigger-named there, not implemented here.
   const isTerminal = () =>
     (session?.poll.allTerminal ?? false) ||
     (focusedStatus !== undefined && TERMINAL.has(focusedStatus));

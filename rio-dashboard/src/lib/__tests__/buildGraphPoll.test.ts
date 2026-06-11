@@ -557,6 +557,7 @@ describe('createBuildGraphPoll', () => {
     p.destroy();
   });
 
+  // r[verify dash.graph.truncated-follow]
   it('settled_drawer_retains_graph_across_truncated_terminal_probe', async () => {
     // THE failure frame of merged_bug_004: post-latch node growth past
     // the server cap delivers a truncated all-terminal slice at the

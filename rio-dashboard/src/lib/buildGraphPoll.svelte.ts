@@ -118,6 +118,7 @@ export type GraphFetchOutcome = {
  *   insertion-order truncation settles roots first, so visible
  *   terminal says nothing about the tail;
  * - `settled`: complete nonempty view, every node terminal. */
+// r[impl dash.graph.truncated-follow]
 export function classifyResponse(outcome: GraphFetchOutcome): GraphEvidence {
   if (outcome.response === undefined) return 'failed';
   const r = outcome.response;
