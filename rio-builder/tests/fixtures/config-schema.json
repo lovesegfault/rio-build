@@ -140,7 +140,7 @@
         "default": ""
       },
       "daemon_timeout_secs": {
-        "description": "Timeout (seconds) for the local nix-daemon subprocess build when\nthe client didn't specify BuildOptions.build_timeout. Intentionally\nlong (2h default) — some builds genuinely take that long; this is\na bound on blast radius of a truly stuck daemon, not an expected\nbuild time.",
+        "description": "Timeout (seconds) for the local nix-daemon subprocess build when\nthe client didn't specify BuildOptions.build_timeout. Intentionally\nlong (2h default) — some builds genuinely take that long; this is\na bound on blast radius of a truly stuck daemon, not an expected\nbuild time.\nBounded at the shared one-year absurdity ceiling BY TYPE\n(saturating at parse): a `u64::MAX`-class \"disable the timeout\"\nvalue becomes effectively-unbounded-but-arithmetic-safe instead\nof panicking the stderr-loop deadline add (bug_117).",
         "type": "integer",
         "format": "uint64",
         "minimum": 0,

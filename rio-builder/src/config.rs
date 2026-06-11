@@ -107,7 +107,10 @@ pub struct Config {
     /// within 60s. Pre-I-211, the wall-clock bound aborted a 2.9 GB
     /// `clang-21.1.8-debug` mid-stream → daemon EIO → build failure on a
     /// healthy store. Env: `RIO_FUSE_FETCH_TIMEOUT_SECS`.
-    #[serde(rename = "fuse_fetch_timeout_secs", with = "rio_common::config::secs")]
+    #[serde(
+        rename = "fuse_fetch_timeout_secs",
+        with = "rio_common::config::secs_bounded"
+    )]
     #[schemars(with = "u64")]
     pub fuse_fetch_timeout: std::time::Duration,
     /// Base directory for per-build overlay upper/work layers.
@@ -172,9 +175,13 @@ pub struct Config {
     /// long (2h default) — some builds genuinely take that long; this is
     /// a bound on blast radius of a truly stuck daemon, not an expected
     /// build time.
-    #[serde(rename = "daemon_timeout_secs", with = "rio_common::config::secs")]
+    /// Bounded at the shared one-year absurdity ceiling BY TYPE
+    /// (saturating at parse): a `u64::MAX`-class "disable the timeout"
+    /// value becomes effectively-unbounded-but-arithmetic-safe instead
+    /// of panicking the stderr-loop deadline add (bug_117).
+    #[serde(rename = "daemon_timeout_secs")]
     #[schemars(with = "u64")]
-    pub daemon_timeout: std::time::Duration,
+    pub daemon_timeout: rio_common::config::BoundedSecs,
     /// Silence timeout (seconds): kill the build if no output for N seconds.
     /// 0 = disabled. Used when the assignment's BuildOptions.max_silent_time
     /// is 0/unset. Env: `RIO_MAX_SILENT_TIME_SECS`.
@@ -191,7 +198,10 @@ pub struct Config {
     /// Upstream fix 32827b9fb adds selective ssh-ng forwarding but requires
     /// the daemon to advertise `set-options-map-only`, which rio-gateway does
     /// not — tracked under WONTFIX(P0310).
-    #[serde(rename = "max_silent_time_secs", with = "rio_common::config::secs")]
+    #[serde(
+        rename = "max_silent_time_secs",
+        with = "rio_common::config::secs_bounded"
+    )]
     #[schemars(with = "u64")]
     pub max_silent_time: std::time::Duration,
     /// I-116 idle timeout: exit if no assignment arrives for this
@@ -204,7 +214,7 @@ pub struct Config {
     /// the previous answer's suggested pacing), so scheduler outages
     /// between answers do not count and a pod exits 0 charge-free only
     /// after this much *answered* idle time.
-    #[serde(rename = "idle_secs", with = "rio_common::config::secs")]
+    #[serde(rename = "idle_secs", with = "rio_common::config::secs_bounded")]
     #[schemars(with = "u64")]
     pub idle_timeout: std::time::Duration,
     // dispatch_mode removed with the stream client (executor-lifecycle
@@ -246,7 +256,9 @@ impl Default for Config {
             hw_bench_needed: false,
             intent_id: String::new(),
             executor_token: String::new(),
-            daemon_timeout: crate::executor::DEFAULT_DAEMON_TIMEOUT,
+            daemon_timeout: rio_common::config::BoundedSecs::from_duration(
+                crate::executor::DEFAULT_DAEMON_TIMEOUT,
+            ),
             max_silent_time: std::time::Duration::ZERO,
             idle_timeout: std::time::Duration::from_secs(120),
         }

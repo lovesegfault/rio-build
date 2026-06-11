@@ -82,7 +82,13 @@ pub struct ExecutorEnv {
     /// client didn't specify `BuildOptions.build_timeout`. Intentionally
     /// long (default 2h) — some builds genuinely take that long; the
     /// purpose is to bound blast radius of a truly stuck daemon.
-    pub daemon_timeout: Duration,
+    /// Ceiling-bounded BY TYPE (bug_117, R24): `BoundedSecs` saturates
+    /// at the shared one-year absurdity ceiling at construction, so
+    /// the config lane cannot deliver an `Instant + Duration`-
+    /// overflowing value to the stderr loop — same guarantee the wire
+    /// lane gets from `WireSecs` below, carried by the field type
+    /// instead of a per-consumer mint.
+    pub daemon_timeout: rio_common::config::BoundedSecs,
     /// Silence timeout default (seconds). Used when the assignment's
     /// `BuildOptions.max_silent_time` is 0. 0 = disabled.
     ///
@@ -998,10 +1004,13 @@ fn resolve_build_opts(
     // one-year ceiling, so the stderr-loop's `Instant + timeout`
     // deadline math is in-range for ANY wire value (u64::MAX
     // included; the pre-fix verbatim `Duration::from_secs` panicked
-    // the deadline add).
+    // the deadline add). The fallback arm is bounded BY TYPE
+    // (bug_117): `env.daemon_timeout` is `BoundedSecs`, so the config
+    // lane — the COMMON lane, since ssh-ng assignments carry no
+    // build_options — carries the same ceiling from parse.
     let timeout = opts
         .and_then(|o| WireSecs::from_wire(o.build_timeout).to_duration_nonzero())
-        .unwrap_or(env.daemon_timeout);
+        .unwrap_or_else(|| env.daemon_timeout.duration());
     // Assignment's max_silent_time wins if nonzero; else the worker
     // config default. Same 0-means-unset semantics as build_timeout above.
     // Config default exists because Nix ssh-ng clients don't send
@@ -1789,7 +1798,7 @@ mod tests {
             overlay_base_dir: "/tmp".into(),
             executor_id: "t".into(),
             log_limits: crate::log_stream::LogLimits::UNLIMITED,
-            daemon_timeout: DEFAULT_DAEMON_TIMEOUT,
+            daemon_timeout: rio_common::config::BoundedSecs::from_duration(DEFAULT_DAEMON_TIMEOUT),
             max_silent_time: 0,
             cgroup_parent: "/tmp".into(),
             executor_kind: rio_proto::types::ExecutorKind::Builder,
@@ -1847,6 +1856,62 @@ mod tests {
         );
         let silence_deadline = tokio::time::Instant::now() + Duration::from_secs(silence_secs);
         assert!(silence_deadline > tokio::time::Instant::now() - Duration::from_secs(1));
+    }
+
+    /// W10-BG (bug_117): the CONFIG lane joins the wire lane's bound.
+    /// The regression matrix covers BOTH lanes × {sane, sentinel} —
+    /// the wave-6 close bounded only the wire lane, and ssh-ng
+    /// assignments carry no `build_options`, so the config fallback is
+    /// the COMMON lane: a `u64::MAX`-class "disable the timeout"
+    /// config value reached the stderr-loop `Instant + Duration`
+    /// deadline add raw and panicked fleet-wide, misclassified
+    /// InfrastructureFailure.
+    #[test]
+    fn daemon_timeout_config_lane_bounded_like_wire_lane() {
+        let ceiling = rio_common::clamped::WireSecs::MAX_SECS;
+
+        // Config-lane sentinel: u64::MAX "disable the timeout".
+        // Pre-fix red (env.daemon_timeout was a raw `Duration`;
+        // `env.daemon_timeout = Duration::from_secs(u64::MAX)`):
+        //   config daemon_timeout must arrive ceiling-bounded at the
+        //   deadline math (the wire lane already is); got
+        //   18446744073709551615s
+        // Post-fix that assignment NO LONGER COMPILES — `BoundedSecs`'
+        // inner Duration is private and both constructors saturate, so
+        // the sentinel is expressed through the type and arrives
+        // clamped.
+        let mut env = test_env();
+        env.daemon_timeout = rio_common::config::BoundedSecs::from_raw_secs(u64::MAX);
+        // ssh-ng shape: no build_options → config fallback is the lane.
+        let opts = resolve_build_opts(&WorkAssignment::default(), &env, 8, 0);
+        assert!(
+            opts.timeout <= Duration::from_secs(ceiling),
+            "config daemon_timeout must arrive ceiling-bounded at the \
+             deadline math (the wire lane already is); got {:?}",
+            opts.timeout
+        );
+        // The stderr-loop deadline shape survives (the pre-fix panic site).
+        let build_deadline = tokio::time::Instant::now() + opts.timeout;
+        assert!(build_deadline > tokio::time::Instant::now() - Duration::from_secs(1));
+
+        // Config-lane sane: the 2h default passes through exactly.
+        let opts = resolve_build_opts(&WorkAssignment::default(), &test_env(), 8, 0);
+        assert_eq!(opts.timeout, DEFAULT_DAEMON_TIMEOUT);
+
+        // Wire-lane sane: a set wire value wins over config, exact.
+        let a = WorkAssignment {
+            build_options: Some(rio_proto::types::BuildOptions {
+                build_timeout: 300,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_build_opts(&a, &test_env(), 8, 0).timeout,
+            Duration::from_secs(300)
+        );
+        // Wire-lane sentinel: covered in depth by
+        // `max_wire_timeout_converts_bounded_and_survives_deadline_math`.
     }
 
     // r[verify sched.sla.cores-reach-nix-build-cores]

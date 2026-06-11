@@ -97,7 +97,9 @@ pub struct BuildSpawnContext {
     /// per-assignment — the limits are a worker policy, not a build option.
     pub log_limits: log_stream::LogLimits,
     /// nix-daemon subprocess timeout (from `Config.daemon_timeout_secs`).
-    pub daemon_timeout: std::time::Duration,
+    /// Ceiling-bounded BY TYPE (bug_117): the bound travels with the
+    /// value from parse to the stderr-loop deadline add.
+    pub daemon_timeout: rio_common::config::BoundedSecs,
     /// Silence timeout default (from `Config.max_silent_time`).
     /// Used when WorkAssignment's BuildOptions.max_silent_time is 0.
     /// 0 = disabled.

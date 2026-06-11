@@ -76,6 +76,96 @@ pub mod secs {
     }
 }
 
+/// Ceiling-typed variant of [`secs`]: same wire format (bare integer
+/// seconds, TOML `foo_secs = 6`, env `RIO_FOO_SECS=6`), but
+/// deserialization SATURATES at the one shared absurdity ceiling
+/// ([`crate::clamped::ClampedSecs::MAX_SECS`], one year) instead of
+/// trusting the value verbatim (bug_117, R24).
+///
+/// The wave-6 clamp law bounded WIRE-supplied seconds at the proto
+/// seams and left the CONFIG lane raw: a `u64::MAX`-class "disable
+/// the timeout" config value deserialized verbatim and panicked the
+/// first unconditional `Instant + Duration` add downstream. Bounding
+/// at the deserializer makes every present and future consumer of the
+/// field inherit the ceiling. Saturation (not rejection) preserves
+/// operator intent — "effectively unbounded" stays effectively
+/// unbounded, arithmetic-safe; `0` is preserved exactly, so
+/// 0-means-disabled fields keep their semantics.
+pub mod secs_bounded {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
+        d.as_secs().serialize(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+        Ok(super::BoundedSecs::from_raw_secs(u64::deserialize(d)?).duration())
+    }
+}
+
+/// A `Duration` whose seconds are bounded at the one shared absurdity
+/// ceiling ([`crate::clamped::ClampedSecs::MAX_SECS`], one year) BY
+/// CONSTRUCTION — the config-lane twin of
+/// [`crate::clamped::WireSecs`] (bug_117, R24: the clamp belongs to
+/// the type, not the consumer seam).
+///
+/// Use as the FIELD type when the bound must travel with the value
+/// (e.g. `Config.daemon_timeout` → `ExecutorEnv.daemon_timeout`): the
+/// inner `Duration` is private, both constructors saturate, so an
+/// unbounded value is unrepresentable and `Instant + duration()` is
+/// in-range for every holder — present and future — without a
+/// per-consumer mint. Serde round-trips as the bare integer seconds
+/// (the [`secs`]/[`secs_bounded`] wire format), re-clamping on load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "u64", into = "u64")]
+pub struct BoundedSecs(std::time::Duration);
+
+impl BoundedSecs {
+    /// Total, saturating mint from raw seconds — the ONLY construction
+    /// path besides [`BoundedSecs::from_duration`] (serde routes
+    /// here). Values above the shared ceiling saturate with a debug
+    /// log via [`crate::clamped::WireSecs::from_wire`].
+    pub fn from_raw_secs(raw: u64) -> Self {
+        Self(std::time::Duration::from_secs(
+            crate::clamped::WireSecs::from_wire(raw).raw(),
+        ))
+    }
+
+    /// Saturating mint from a `Duration` (sub-second precision
+    /// truncated — config seconds are integral by wire format).
+    pub fn from_duration(d: std::time::Duration) -> Self {
+        Self::from_raw_secs(d.as_secs())
+    }
+
+    /// The bounded duration (≤ one year): `Instant + duration()` is
+    /// in-range by construction.
+    #[must_use]
+    pub const fn duration(self) -> std::time::Duration {
+        self.0
+    }
+
+    /// The bounded whole seconds.
+    #[must_use]
+    pub const fn as_secs(self) -> u64 {
+        self.0.as_secs()
+    }
+}
+
+impl From<u64> for BoundedSecs {
+    /// Serde/wire entry: identical to [`BoundedSecs::from_raw_secs`]
+    /// (total, saturating) — deserialized values re-clamp on load.
+    fn from(raw: u64) -> Self {
+        Self::from_raw_secs(raw)
+    }
+}
+
+impl From<BoundedSecs> for u64 {
+    fn from(b: BoundedSecs) -> u64 {
+        b.as_secs()
+    }
+}
+
 /// Configuration fields shared by every rio-* binary's `Config`.
 ///
 /// Embed via `#[serde(flatten)]` so the wire format stays flat:
@@ -1124,6 +1214,47 @@ mod tests {
         // = 7` both work via the existing layers).
         let json = serde_json::to_value(&original).unwrap();
         assert_eq!(json["tick_secs"], 7);
+    }
+
+    /// W10-BG (bug_117, the type half): `secs_bounded` and
+    /// `BoundedSecs` saturate at the ONE shared ceiling at
+    /// deserialization — the config lane's `u64::MAX` "disable the
+    /// timeout" sentinel becomes arithmetic-safe instead of reaching
+    /// an `Instant + Duration` add verbatim. Zero and sane values are
+    /// preserved exactly (0-means-disabled semantics intact).
+    #[test]
+    fn bounded_secs_saturates_at_the_shared_ceiling_at_parse() {
+        let ceiling = crate::clamped::WireSecs::MAX_SECS;
+
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct BoundedCfg {
+            #[serde(rename = "t_secs", with = "secs_bounded")]
+            t: std::time::Duration,
+            f: BoundedSecs,
+        }
+
+        // Sentinel: u64::MAX saturates at the ceiling on BOTH shapes.
+        let parsed: BoundedCfg =
+            serde_json::from_str(&format!(r#"{{"t_secs": {m}, "f": {m}}}"#, m = u64::MAX)).unwrap();
+        assert_eq!(parsed.t, std::time::Duration::from_secs(ceiling));
+        assert_eq!(parsed.f.as_secs(), ceiling);
+        // The deadline shape the bound exists for: in-range.
+        let _ = std::time::Instant::now() + parsed.t;
+        let _ = std::time::Instant::now() + parsed.f.duration();
+
+        // Sane + zero: preserved exactly; wire format is the bare integer.
+        let parsed: BoundedCfg = serde_json::from_str(r#"{"t_secs": 7200, "f": 0}"#).unwrap();
+        assert_eq!(parsed.t, std::time::Duration::from_secs(7200));
+        assert_eq!(parsed.f.as_secs(), 0);
+        let json = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(json["t_secs"], 7200);
+        assert_eq!(json["f"], 0);
+
+        // The Duration constructor saturates too (the non-serde path).
+        assert_eq!(
+            BoundedSecs::from_duration(std::time::Duration::from_secs(u64::MAX)).as_secs(),
+            ceiling
+        );
     }
 
     /// serialized_layer must preserve glob map keys and empty maps — the
