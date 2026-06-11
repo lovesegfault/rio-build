@@ -89,13 +89,12 @@ const MAX_CONSECUTIVE_CUT_FAILURES: u8 = 3;
 /// store's config; [`Default`] carries the design's production values.
 #[derive(Debug, Clone)]
 pub struct IngestConfig {
-    /// Abort the stream (`FAILED_PRECONDITION` via
-    /// [`super::gate::cap_rejection`] — the cap travels with the
-    /// EXECUTION, so no retry anywhere can succeed; never
-    /// `RESOURCE_EXHAUSTED`, which is reserved for per-replica
-    /// capacity) once this many bytes (post-truncation content +
-    /// `PER_LINE_OVERHEAD` per line) have been accepted for the
-    /// execution.
+    /// Abort the stream (`FAILED_PRECONDITION` via the gate module's
+    /// `cap_rejection` — the cap travels with the EXECUTION, so no
+    /// retry anywhere can succeed; never `RESOURCE_EXHAUSTED`, which
+    /// is reserved for per-replica capacity) once this many bytes
+    /// (post-truncation content + `PER_LINE_OVERHEAD` per line) have
+    /// been accepted for the execution.
     pub per_exec_byte_cap: u64,
     /// `accept` reports `cut_due` once the buffer holds this many bytes
     /// (post-truncation content + `PER_LINE_OVERHEAD` per line,
