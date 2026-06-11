@@ -266,6 +266,165 @@ impl From<NodeClaim> for LiveNode {
 /// landed yet".
 pub type Placement = (SpawnIntent, String, bool);
 
+/// Cores-window slack multiplier for [`sim_window_cores`]. The window
+/// is denominated on the cores axis only; the ×2 absorbs (a) multi-axis
+/// packing inefficiency (an intent can be unplaceable by mem/disk while
+/// small on cores) and (b) placed-on-live variance, so the windowed
+/// unplaced residual still saturates the budget brake whenever the full
+/// set would (W9-AV). VIOLABLE (R17, cost axis): the value is a
+/// derivation-note constant, not a measured bound — revisit if the
+/// deficit-equivalence witness ever needs more headroom.
+pub const SIM_WINDOW_SLACK: u64 = 2;
+
+/// Yield quantum for [`simulate_windowed`]: the walk yields to the
+/// runtime every `FFD_YIELD_QUANTUM` simulated intents so a large tick
+/// cannot starve the reconciler's executor (Banner A-1 on the
+/// controller). VIOLABLE (R17, time axis): the quantum is deliberately
+/// UNSIZED-BY-MEASUREMENT this round — the B4 freeze primitive is
+/// unidentified (17-18s whole-runtime freezes at 0.13-0.47 cores,
+/// blocked-not-compute), so the quantum is sized at the first
+/// sentinel-attributed freeze (the D5 skew sentinel landed this wave;
+/// see `rio_controller_runtime_skew_seconds`). 256 bounds the
+/// between-yield chunk to ~sub-millisecond at the benched per-intent
+/// score cost while keeping yield overhead negligible.
+pub const FFD_YIELD_QUANTUM: usize = 256;
+
+/// Typed per-tick window remainder — demand beyond the
+/// fleet-capacity-derived admission window. NOT dropped: the scheduler
+/// still holds these Ready/forecast intents and the next tick re-polls
+/// them; the type makes the truncation observable (remainder gauges +
+/// the deficit law) instead of silent.
+// r[impl ctrl.nodeclaim.sim-window]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SimRemainder {
+    pub intents: usize,
+    pub cores: u64,
+}
+
+/// One windowed-simulation tick's outcome: the FFD result over the
+/// admitted window plus the typed remainder.
+pub struct SimOutcome {
+    pub placeable: Vec<Placement>,
+    pub unplaced: Vec<SpawnIntent>,
+    pub remainder: SimRemainder,
+}
+
+/// The per-tick simulated-intent window, denominated in cores and
+/// derived from FLEET CAPACITY in the budget-brake's own terms:
+/// `(live free + budget remaining) × slack`. Window ≥ the mint law's
+/// per-tick consumption (`ctrl.nodeclaim.mint-deficit-proportional`'s
+/// budget term is ≤ `budget_remaining_cores`), so supply is never
+/// window-starved: every intent the brake could mint for this tick is
+/// inside the window, and the windowed unplaced residual saturates the
+/// budget whenever the full set would.
+// r[impl ctrl.nodeclaim.sim-window]
+pub fn sim_window_cores(live_free_cores: u64, budget_remaining_cores: u64) -> u64 {
+    live_free_cores
+        .saturating_add(budget_remaining_cores)
+        .saturating_mul(SIM_WINDOW_SLACK)
+}
+
+/// Split `sorted` (FFD priority order) into the admitted window and the
+/// typed remainder.
+///
+/// Admission is round-robin-fair across hw-class buckets (keyed on the
+/// intent's first `hw_class_names` entry; `""` = the hw-agnostic
+/// bucket), with the bucket start rotated by `tick` — mirroring
+/// `cells_round_robin`, so a single class's pathological demand cannot
+/// permanently starve a sibling class's window share across ticks.
+/// Priority order is preserved WITHIN a bucket and restored globally
+/// (admitted intents are re-emitted in their original sort positions).
+/// Already-bound intents bypass the window entirely: their simulation
+/// cost is a map lookup and excluding them would mis-read bound work as
+/// remainder.
+// r[impl ctrl.nodeclaim.sim-window]
+pub fn admit_window(
+    sorted: Vec<SpawnIntent>,
+    bound: &HashMap<String, String>,
+    window_cores: u64,
+    tick: u64,
+) -> (Vec<SpawnIntent>, Vec<SpawnIntent>) {
+    // Fast path: total unbound cores within the window — admit all.
+    let unbound_cores: u64 = sorted
+        .iter()
+        .filter(|i| !bound.contains_key(&i.intent_id))
+        .map(|i| u64::from(i.cores))
+        .sum();
+    if unbound_cores <= window_cores {
+        return (sorted, Vec::new());
+    }
+    // Bucket the sort positions by hw-class (stable: bucket order ==
+    // priority order within each class).
+    let mut buckets: BTreeMap<&str, std::collections::VecDeque<usize>> = BTreeMap::new();
+    let mut admitted_idx: Vec<usize> = Vec::with_capacity(sorted.len());
+    for (idx, i) in sorted.iter().enumerate() {
+        if bound.contains_key(&i.intent_id) {
+            admitted_idx.push(idx); // window-exempt
+        } else {
+            buckets
+                .entry(i.hw_class_names.first().map_or("", String::as_str))
+                .or_default()
+                .push_back(idx);
+        }
+    }
+    let mut order: Vec<&str> = buckets.keys().copied().collect();
+    if !order.is_empty() {
+        let off = (tick % order.len() as u64) as usize;
+        order.rotate_left(off);
+    }
+    let mut cum: u64 = 0;
+    let mut open = order.len();
+    let mut blocked: Vec<bool> = vec![false; order.len()];
+    while open > 0 {
+        let mut progressed = false;
+        for (bi, key) in order.iter().enumerate() {
+            if blocked[bi] {
+                continue;
+            }
+            let q = buckets.get_mut(key).expect("bucket exists");
+            let Some(&idx) = q.front() else {
+                blocked[bi] = true;
+                open -= 1;
+                continue;
+            };
+            let cores = u64::from(sorted[idx].cores);
+            if cum.saturating_add(cores) > window_cores {
+                // Head doesn't fit: the bucket blocks (priority order
+                // within a bucket is never skipped past).
+                blocked[bi] = true;
+                open -= 1;
+                continue;
+            }
+            q.pop_front();
+            cum += cores;
+            admitted_idx.push(idx);
+            progressed = true;
+        }
+        if !progressed {
+            break;
+        }
+    }
+    // Restore global priority order, then split.
+    admitted_idx.sort_unstable();
+    let admitted_set: Vec<bool> = {
+        let mut v = vec![false; sorted.len()];
+        for &i in &admitted_idx {
+            v[i] = true;
+        }
+        v
+    };
+    let mut admitted = Vec::with_capacity(admitted_idx.len());
+    let mut remainder = Vec::with_capacity(sorted.len() - admitted_idx.len());
+    for (idx, i) in sorted.into_iter().enumerate() {
+        if admitted_set[idx] {
+            admitted.push(i);
+        } else {
+            remainder.push(i);
+        }
+    }
+    (admitted, remainder)
+}
+
 /// FFD-simulate placing `intents` onto `live`. Returns
 /// `(placeable, unplaced)`.
 ///
@@ -324,48 +483,151 @@ pub fn simulate(
     fuse_cache_bytes: u64,
     hw_admits: impl Fn(&str, Option<&str>, &[String]) -> bool,
 ) -> (Vec<Placement>, Vec<SpawnIntent>) {
-    use crate::reconcilers::pool::jobs::intent_pod_footprint;
-    // Running free per node. Cell-less nodes excluded up front: no
-    // intent can match them, and excluding here keeps the score loop's
-    // `cell.unwrap` infallible. Terminating nodes excluded: §13d
-    // "placement ⊇ provisioning" — kube-scheduler won't bind onto a
-    // draining node, so a simulated placement there overcounts capacity
-    // and `cover_deficit` under-mints the replacement (~80s of Pending
-    // before Karpenter's finalizer clears the object). The dying node's
-    // cores STILL count toward `max_fleet_cores`/`class_budget` (it's
-    // billing), just not toward FFD's free-bin set.
-    // r[impl ctrl.nodeclaim.ffd-exclude-terminating]
-    let mut free: HashMap<&str, (u32, u64, u64)> = live
-        .iter()
-        .filter(|n| n.cell.is_some() && !n.terminating())
-        .map(|n| (n.name.as_str(), n.free()))
-        .collect();
-
     let mut sorted: Vec<SpawnIntent> = intents.to_vec();
+    sort_ffd(&mut sorted);
+    let mut st = SimState::new(live, sorted.len());
+    for i in sorted {
+        sim_one(
+            &mut st,
+            live,
+            i,
+            sketches,
+            bound,
+            fuse_cache_bytes,
+            &hw_admits,
+        );
+    }
+    (st.placeable, st.unplaced)
+}
+
+/// The windowed, runtime-cooperative form of [`simulate`] — same
+/// placement semantics over the admitted window ([`admit_window`]),
+/// yielding to the executor every [`FFD_YIELD_QUANTUM`] intents so a
+/// large tick cannot starve the reconciler's runtime; demand beyond
+/// the window is the typed [`SimRemainder`].
+// r[impl ctrl.nodeclaim.sim-window]
+#[allow(clippy::too_many_arguments)]
+pub async fn simulate_windowed(
+    intents: &[SpawnIntent],
+    live: &[LiveNode],
+    sketches: &CellSketches,
+    bound: &HashMap<String, String>,
+    fuse_cache_bytes: u64,
+    window_cores: u64,
+    tick: u64,
+    hw_admits: impl Fn(&str, Option<&str>, &[String]) -> bool,
+) -> SimOutcome {
+    let mut sorted: Vec<SpawnIntent> = intents.to_vec();
+    sort_ffd(&mut sorted);
+    let (admitted, remainder) = admit_window(sorted, bound, window_cores, tick);
+    let rem = SimRemainder {
+        intents: remainder.len(),
+        cores: remainder.iter().map(|i| u64::from(i.cores)).sum(),
+    };
+    let mut st = SimState::new(live, admitted.len());
+    for (n, i) in admitted.into_iter().enumerate() {
+        if n > 0 && n % FFD_YIELD_QUANTUM == 0 {
+            tokio::task::yield_now().await;
+        }
+        sim_one(
+            &mut st,
+            live,
+            i,
+            sketches,
+            bound,
+            fuse_cache_bytes,
+            &hw_admits,
+        );
+    }
+    SimOutcome {
+        placeable: st.placeable,
+        unplaced: st.unplaced,
+        remainder: rem,
+    }
+}
+
+/// The FFD priority order: `(ready, cores, mem_bytes)` descending,
+/// `intent_id` ascending tiebreak (stable across ticks).
+fn sort_ffd(sorted: &mut [SpawnIntent]) {
     sorted.sort_by(|a, b| {
         let k = |i: &SpawnIntent| (i.ready.unwrap_or(true), i.cores, i.mem_bytes);
         k(b).cmp(&k(a)).then_with(|| a.intent_id.cmp(&b.intent_id))
     });
+}
 
-    // Map node_name → (registered, in `live`) for the bound short-
-    // circuit. `live` is keyed by NodeClaim name; bound is by Node
-    // name (`spec.nodeName`). Terminating nodes excluded: a pod still
-    // bound there is draining — the intent should fall through to the
-    // fit-check so it lands on (or mints) a replacement that's ready
-    // when the eviction completes, instead of being "placed" on a node
-    // it's about to leave.
-    let by_node_name: HashMap<&str, (bool, &str)> = live
-        .iter()
-        .filter(|n| !n.terminating())
-        .filter_map(|n| {
-            n.node_name
-                .as_deref()
-                .map(|nn| (nn, (n.registered, n.name.as_str())))
-        })
-        .collect();
-    let mut placeable = Vec::with_capacity(sorted.len());
-    let mut unplaced = Vec::new();
-    for i in sorted {
+/// Carry-state for one simulation pass. [`simulate`] drives it in one
+/// sync pass; [`simulate_windowed`] threads it across yield points so
+/// the running `free` tally survives chunking.
+struct SimState<'a> {
+    free: HashMap<&'a str, (u32, u64, u64)>,
+    by_node_name: HashMap<&'a str, (bool, &'a str)>,
+    placeable: Vec<Placement>,
+    unplaced: Vec<SpawnIntent>,
+}
+
+impl<'a> SimState<'a> {
+    fn new(live: &'a [LiveNode], cap: usize) -> Self {
+        // Running free per node. Cell-less nodes excluded up front: no
+        // intent can match them, and excluding here keeps the score loop's
+        // `cell.unwrap` infallible. Terminating nodes excluded: §13d
+        // "placement ⊇ provisioning" — kube-scheduler won't bind onto a
+        // draining node, so a simulated placement there overcounts capacity
+        // and `cover_deficit` under-mints the replacement (~80s of Pending
+        // before Karpenter's finalizer clears the object). The dying node's
+        // cores STILL count toward `max_fleet_cores`/`class_budget` (it's
+        // billing), just not toward FFD's free-bin set.
+        // r[impl ctrl.nodeclaim.ffd-exclude-terminating]
+        let free: HashMap<&str, (u32, u64, u64)> = live
+            .iter()
+            .filter(|n| n.cell.is_some() && !n.terminating())
+            .map(|n| (n.name.as_str(), n.free()))
+            .collect();
+
+        // Map node_name → (registered, in `live`) for the bound short-
+        // circuit. `live` is keyed by NodeClaim name; bound is by Node
+        // name (`spec.nodeName`). Terminating nodes excluded: a pod still
+        // bound there is draining — the intent should fall through to the
+        // fit-check so it lands on (or mints) a replacement that's ready
+        // when the eviction completes, instead of being "placed" on a node
+        // it's about to leave.
+        let by_node_name: HashMap<&str, (bool, &str)> = live
+            .iter()
+            .filter(|n| !n.terminating())
+            .filter_map(|n| {
+                n.node_name
+                    .as_deref()
+                    .map(|nn| (nn, (n.registered, n.name.as_str())))
+            })
+            .collect();
+        Self {
+            free,
+            by_node_name,
+            placeable: Vec::with_capacity(cap),
+            unplaced: Vec::new(),
+        }
+    }
+}
+
+/// Simulate placing ONE intent against the running state — the
+/// per-intent body shared verbatim by [`simulate`] and
+/// [`simulate_windowed`].
+fn sim_one<'a>(
+    st: &mut SimState<'a>,
+    live: &'a [LiveNode],
+    i: SpawnIntent,
+    sketches: &CellSketches,
+    bound: &HashMap<String, String>,
+    fuse_cache_bytes: u64,
+    hw_admits: &impl Fn(&str, Option<&str>, &[String]) -> bool,
+) {
+    use crate::reconcilers::pool::jobs::intent_pod_footprint;
+    let SimState {
+        free,
+        by_node_name,
+        placeable,
+        unplaced,
+    } = st;
+    {
         // Already bound → straight to placeable (no fit-check, no
         // free() decrement — its slot is already counted in
         // `requested`).
@@ -378,7 +640,7 @@ pub fn simulate(
             && let Some(&(registered, nc_name)) = by_node_name.get(node.as_str())
         {
             placeable.push((i, nc_name.to_string(), !registered));
-            continue;
+            return;
         }
         let (ic, im, id) = intent_pod_footprint(&i, fuse_cache_bytes);
         let open = a_open(&i, sketches);
@@ -446,7 +708,6 @@ pub fn simulate(
             None => unplaced.push(i),
         }
     }
-    (placeable, unplaced)
 }
 
 /// Does the production [`simulate`] pack every intent in `u` into `n`
@@ -1744,5 +2005,183 @@ pub(crate) mod tests {
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].0.intent_id, "aa", "intent_id asc tiebreak");
         assert_eq!(u[0].intent_id, "zz");
+    }
+
+    // r[verify ctrl.nodeclaim.sim-window]
+    /// W9-AU (yield-count + schedulability, structural): on a
+    /// current_thread runtime a canary task can run DURING the walk iff
+    /// the walk yields — canary starvation ⇔ zero yields, with no
+    /// wall-clock axis (deterministic under load, per the
+    /// ci-failure-patterns structural preference). The shipped sync
+    /// walk starves the canary for the whole tick (the B4 shape); the
+    /// windowed walk hands the executor back every FFD_YIELD_QUANTUM
+    /// intents.
+    #[tokio::test(flavor = "current_thread")]
+    async fn windowed_walk_yields_between_chunks() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let n = FFD_YIELD_QUANTUM * 8;
+        let intents: Vec<SpawnIntent> = (0..n)
+            .map(|k| intent(&format!("i{k:05}"), 4, GI, &[("h", CapacityType::Spot)]))
+            .collect();
+        let nodes = [node("n", "h", CapacityType::Spot, 8, 64 * GI, 100 * GI)];
+        let ran = Arc::new(AtomicUsize::new(0));
+        let canary = {
+            let ran = Arc::clone(&ran);
+            tokio::spawn(async move {
+                loop {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        // Let the canary start, then snapshot.
+        tokio::task::yield_now().await;
+        let before = ran.load(Ordering::SeqCst);
+        let sketches = CellSketches::default();
+        let bound = HashMap::new();
+        let out = simulate_windowed(
+            &intents,
+            &nodes,
+            &sketches,
+            &bound,
+            0,
+            u64::MAX, // capacity-unbounded: this test pins yielding, not the window
+            0,
+            any_admit,
+        )
+        .await;
+        let during = ran.load(Ordering::SeqCst) - before;
+        canary.abort();
+        assert_eq!(
+            out.placeable.len() + out.unplaced.len(),
+            n,
+            "window admits everything at u64::MAX"
+        );
+        assert!(
+            during >= 4,
+            "the walk must yield to the runtime between chunks \
+             (canary ran {during}x during a {n}-intent walk; 0 <=> the \
+             shipped sync-walk starvation)"
+        );
+    }
+
+    // r[verify ctrl.nodeclaim.sim-window]
+    /// The admission law: bound intents bypass the window; unbound
+    /// admission is cores-capped and round-robin-fair across hw-class
+    /// buckets (a pathological class cannot evict a sibling's share);
+    /// priority order is preserved within a bucket; the remainder is
+    /// typed, never dropped.
+    #[test]
+    fn window_admits_capacity_fairly_and_types_remainder() {
+        // Class A floods (100 × 8c), class B wants 2 × 8c. Window fits
+        // only 32 cores of unbound demand → RR admits from BOTH
+        // classes instead of letting A's flood evict B.
+        let mut intents: Vec<SpawnIntent> = (0..100)
+            .map(|k| intent(&format!("a{k:03}"), 8, GI, &[("ca", CapacityType::Spot)]))
+            .collect();
+        intents.push(intent("b000", 8, GI, &[("cb", CapacityType::Spot)]));
+        intents.push(intent("b001", 8, GI, &[("cb", CapacityType::Spot)]));
+        // A bound intent rides for free regardless of the window.
+        let mut bound_i = intent("zbound", 8, GI, &[("ca", CapacityType::Spot)]);
+        bound_i.cores = 8;
+        intents.push(bound_i);
+        let bound: HashMap<String, String> = [("zbound".to_string(), "node-n".to_string())].into();
+        let mut sorted = intents.clone();
+        sort_ffd(&mut sorted);
+        let (admitted, remainder) = admit_window(sorted, &bound, 32, 0);
+        let a_adm = admitted
+            .iter()
+            .filter(|i| i.intent_id.starts_with('a'))
+            .count();
+        let b_adm = admitted
+            .iter()
+            .filter(|i| i.intent_id.starts_with('b'))
+            .count();
+        assert!(
+            admitted.iter().any(|i| i.intent_id == "zbound"),
+            "bound intents bypass the window"
+        );
+        assert_eq!(b_adm, 2, "RR fairness: the sibling class keeps its share");
+        assert_eq!(a_adm, 2, "32 cores = 4 unbound slots, split 2/2 by RR");
+        assert_eq!(
+            remainder.len(),
+            102 - a_adm - b_adm,
+            "every non-admitted unbound intent is in the typed remainder"
+        );
+        // Priority preserved within a bucket: admitted A-intents are
+        // the bucket's head in sort order (a000, a001 — id asc among
+        // equal keys).
+        let a_ids: Vec<&str> = admitted
+            .iter()
+            .filter(|i| i.intent_id.starts_with('a'))
+            .map(|i| i.intent_id.as_str())
+            .collect();
+        assert_eq!(a_ids, ["a000", "a001"], "bucket head, never skipped past");
+    }
+
+    // r[verify ctrl.nodeclaim.sim-window]
+    /// W9-AV (window-starved supply unconstructible): at the
+    /// capacity-derived window, the windowed pipeline's unplaced
+    /// residual demands at least everything the budget brake can mint —
+    /// the mint vector equals the full-set pipeline's. (The negation is
+    /// reachable: window_cores=1 starves — the strawman red disclosed
+    /// in the commit body; the capacity derivation cannot.)
+    #[test]
+    fn window_never_starves_supply() {
+        use super::super::cover;
+        let n = 64;
+        let intents: Vec<SpawnIntent> = (0..n)
+            .map(|k| intent(&format!("i{k:03}"), 8, GI, &[("h", CapacityType::Spot)]))
+            .collect();
+        // No live nodes: everything is deficit. Budget allows 4 claims
+        // of 16c each.
+        let live: Vec<LiveNode> = Vec::new();
+        let budget = 64u32;
+        let sketches = CellSketches::default();
+        let bound = HashMap::new();
+        let mint = |unplaced: &[SpawnIntent]| -> Vec<(u32, u64, u64)> {
+            let none = std::collections::HashSet::new();
+            let (by_cell, _) =
+                cover::assign_to_cells(unplaced, &sketches, &none, cover::cell_rank, |_, _| None);
+            by_cell
+                .iter()
+                .flat_map(|(cell, u)| {
+                    cover::sizing(
+                        cell,
+                        u,
+                        &cover::SizingCfg {
+                            max_node_cores: 16,
+                            max_node_mem: 256 * GI,
+                            max_node_disk: 450 * GI,
+                            budget,
+                            fuse_cache_bytes: 0,
+                        },
+                    )
+                    .0
+                })
+                .collect()
+        };
+        // Full set (the pre-window truth).
+        let (_, full_unplaced) = simulate(&intents, &live, &sketches, &bound, 0, any_admit);
+        let full_mint = mint(&full_unplaced);
+        // Windowed at the capacity-derived bound (live free = 0).
+        let window = sim_window_cores(0, u64::from(budget));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let out = rt.block_on(simulate_windowed(
+            &intents, &live, &sketches, &bound, 0, window, 0, any_admit,
+        ));
+        assert!(
+            out.remainder.intents > 0,
+            "premise: the window actually truncated (else the test is vacuous)"
+        );
+        let windowed_mint = mint(&out.unplaced);
+        assert_eq!(
+            windowed_mint, full_mint,
+            "the windowed deficit mints exactly what the full set would \
+             (window ≥ the mint law's per-tick consumption)"
+        );
     }
 }

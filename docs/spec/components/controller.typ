@@ -1278,6 +1278,28 @@ defines no store CR.) The controller's `/scale` patches use field-manager
   #(refs.metric)("rio_controller_nodeclaim_live")`{state="terminating"}`.
 ]
 
+#r("ctrl.nodeclaim.sim-window")[
+  The per-tick FFD simulation MUST be work-bounded: intents beyond a
+  fleet-capacity-derived admission window --- cores-denominated,
+  `(live free + budget remaining) × slack`, round-robin-fair across
+  hw-class buckets with priority order preserved within a bucket ---
+  are a TYPED remainder (counted, gauge-surfaced, re-seen next tick),
+  never a silent drop; the window MUST be at least the mint law's
+  per-tick consumption (`ctrl.nodeclaim.mint-deficit-proportional`'s
+  budget term) so supply is never window-starved; and the walk MUST
+  yield to the runtime between bounded chunks so a pathological tick
+  cannot starve the reconciler's executor.
+]
+Rationale: B4 --- the unwindowed clone+sort+walk was the one unbounded
+O(demand) compute pass left on the reconciler runtime (measured: 385
+intents did NOT explain the 17--18s whole-runtime freezes, so the walk
+is bounded structurally while the D5 skew sentinel attributes the
+residual primitive; the yield quantum is a violable envelope sized at
+the first sentinel-attributed freeze). The window's fairness mirrors
+`cells_round_robin`: a single class's pathological demand cannot
+permanently starve a sibling class's window share, preserving the
+budget brake's rotation property upstream of the mint.
+
 #r("ctrl.nodeclaim.anchor-bulk+5")[
   Unplaced intents per `(h,cap)` cell whose pod footprint fits the cell's
   per-class `(max_cores, max_mem)` and global `max_disk` cap are covered by `n`

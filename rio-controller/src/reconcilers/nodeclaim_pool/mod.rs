@@ -1414,17 +1414,58 @@ impl NodeClaimPoolReconciler {
         // `/dev/kvm`; pool-static nodeSelector deleted r33 bug_002); a
         // featureless intent must NOT land on a kvm-tainted metal node
         // (pod has no toleration → wasted on-demand metal).
-        let (placeable, unplaced) = ffd::simulate(
+        // r[impl ctrl.nodeclaim.sim-window]
+        // Banner A-1 (B4): the FFD walk is work-bounded — the admission
+        // window sizes off FLEET CAPACITY in the budget-brake's own
+        // terms (live free + budget remaining, cores-denominated,
+        // ×slack), so every intent the mint law could consume this tick
+        // is inside the window and supply is never window-starved
+        // (W9-AV); demand beyond it is a TYPED remainder, re-seen next
+        // tick. The walk yields every FFD_YIELD_QUANTUM intents so a
+        // pathological tick cannot starve the reconciler runtime.
+        let live_free_cores: u64 = live
+            .iter()
+            .filter(|n| n.cell.is_some() && !n.terminating())
+            .map(|n| u64::from(n.free().0))
+            .sum();
+        let budget_remaining_cores = u64::from(
+            self.cfg
+                .max_fleet_cores
+                .saturating_sub(live.iter().map(|n| n.allocatable.0).sum()),
+        );
+        let window_cores = ffd::sim_window_cores(live_free_cores, budget_remaining_cores);
+        let sim = ffd::simulate_windowed(
             &intents.intents,
             &live,
             &self.sketches,
             bound,
             self.cfg.fuse_cache_bytes,
+            window_cores,
+            self.tick_counter,
             |h, a, f| {
                 self.hw_config.matches_arch(h, a)
                     && rio_common::k8s::features_compatible(f, &self.hw_config.provides_for(h))
             },
-        );
+        )
+        .await;
+        // Unconditional write (incl. zero) — Prometheus gauge freshness:
+        // a tick whose remainder drained to 0 must read 0, not
+        // stale-at-last-nonzero. Unlabeled, so no per-cell trailing-zero
+        // machinery is needed.
+        metrics::gauge!("rio_controller_ffd_window_remainder_cores")
+            .set(sim.remainder.cores as f64);
+        metrics::gauge!("rio_controller_ffd_window_remainder_intents")
+            .set(sim.remainder.intents as f64);
+        if sim.remainder.intents > 0 {
+            debug!(
+                remainder_intents = sim.remainder.intents,
+                remainder_cores = sim.remainder.cores,
+                window_cores,
+                "FFD window remainder — demand beyond fleet capacity \
+                 deferred to the next tick (typed, never dropped)"
+            );
+        }
+        let (placeable, unplaced) = (sim.placeable, sim.unplaced);
         // Schmitt-adjust `lead_time_q` from the per-cell EWMA of
         // `on_reg/(on_reg+on_inf)` — the warm-hit proxy. A cell whose
         // placements land mostly in-flight (low ratio) is

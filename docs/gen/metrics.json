@@ -35,6 +35,8 @@
     "rio_controller_fenced_mutations_refused_total",
     "rio_controller_ffd_placeable_intents",
     "rio_controller_ffd_unplaced_cores",
+    "rio_controller_ffd_window_remainder_cores",
+    "rio_controller_ffd_window_remainder_intents",
     "rio_controller_gc_runs_total",
     "rio_controller_job_terminal_report_seconds",
     "rio_controller_lease_acquired_total",
@@ -430,6 +432,16 @@
         "name": "rio_controller_ffd_unplaced_cores",
         "kind": "gauge",
         "help": "Σ SpawnIntent.cores per `cell` left unplaced by the FFD simulation at the last tick. cover_deficit's per-cell input. Non-zero with created_total flat = max_fleet_cores or per-tick cap throttling."
+      },
+      {
+        "name": "rio_controller_ffd_window_remainder_cores",
+        "kind": "gauge",
+        "help": "Σ SpawnIntent.cores beyond the per-tick FFD admission window at the last tick (the typed remainder — ctrl.nodeclaim.sim-window). The window sizes off fleet capacity (live free + budget remaining, ×slack), so non-zero means demand exceeds what the fleet could absorb this tick; the remainder is re-seen next tick, never dropped. Persistent growth = demand structurally above maxFleetCores."
+      },
+      {
+        "name": "rio_controller_ffd_window_remainder_intents",
+        "kind": "gauge",
+        "help": "SpawnIntents beyond the per-tick FFD admission window at the last tick (companion count for rio_controller_ffd_window_remainder_cores)."
       },
       {
         "name": "rio_controller_gc_runs_total",

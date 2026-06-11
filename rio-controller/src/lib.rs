@@ -413,6 +413,20 @@ pub fn describe_metrics() {
          created_total flat = max_fleet_cores or per-tick cap throttling."
     );
     describe_gauge!(
+        "rio_controller_ffd_window_remainder_cores",
+        "Σ SpawnIntent.cores beyond the per-tick FFD admission window at the \
+         last tick (the typed remainder — ctrl.nodeclaim.sim-window). The \
+         window sizes off fleet capacity (live free + budget remaining, \
+         ×slack), so non-zero means demand exceeds what the fleet could \
+         absorb this tick; the remainder is re-seen next tick, never dropped. \
+         Persistent growth = demand structurally above maxFleetCores."
+    );
+    describe_gauge!(
+        "rio_controller_ffd_window_remainder_intents",
+        "SpawnIntents beyond the per-tick FFD admission window at the last \
+         tick (companion count for rio_controller_ffd_window_remainder_cores)."
+    );
+    describe_gauge!(
         "rio_controller_ffd_placeable_intents",
         "SpawnIntents FFD-placed at the last tick by `state`. state=registered: \
          on a Registered=True NodeClaim (Jobs created this tick); state=inflight: \
