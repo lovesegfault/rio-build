@@ -822,8 +822,12 @@ mod registration_writer_census {
             // stamp_path_tenants (single funnel) + the batch funnel
             ("actor/completion.rs".to_string(), 2),
             // db-fn semantics tests (idempotence/witness-law pins) —
-            // they exercise the censused fns directly by design
-            ("actor/tests/completion.rs".to_string(), 2),
+            // they exercise the censused fns directly by design — plus
+            // the bug_138 W10-M forged-report red's victim seeding
+            // (tenant B's pre-existing rows are the I-217 baseline the
+            // flip assertion reads; seeded through the censused writer
+            // on purpose, never a raw INSERT)
+            ("actor/tests/completion.rs".to_string(), 3),
         ]
         .into();
         assert_eq!(

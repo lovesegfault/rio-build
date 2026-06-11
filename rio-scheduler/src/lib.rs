@@ -392,6 +392,15 @@ pub fn describe_metrics() {
          (dropped at handle_completion membership filter); alert if rate > 0"
     );
     describe_counter!(
+        "rio_scheduler_unexpected_built_output_total",
+        "Worker-supplied BuiltOutput.output_path outside the assignment's \
+         dispatch-minted expected set (refused before any path_tenants \
+         registration stamp, on the admitted and late-register lanes; the \
+         scheduler-side mirror of the store's PutPath path-in-claims check); \
+         alert if rate > 0 — a nonzero rate is a forged or misbehaving worker \
+         report"
+    );
+    describe_counter!(
         "rio_scheduler_pull_rejected_total",
         "Pull-mode unaries rejected (labels: rpc = \
          pull_assignment|report_outcome|list_materialization_jobs|\

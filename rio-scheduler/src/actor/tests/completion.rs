@@ -734,14 +734,18 @@ async fn built_outputs_membership_filter() -> TestResult {
 
     let (_db, handle, _task) = setup().await;
     let drv_hash = "memb-drv";
-    // make_node → output_names = ["out"] (1 declared output).
-    let _ev =
-        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+    // make_node → output_names = ["out"] (1 declared output). The
+    // expected set carries the lawful path (production-faithful:
+    // the gateway always populates it for IA — bug_138's membership
+    // law fail-closes on a node without one).
+    let valid = test_store_path("memb-out");
+    let mut node = make_node(drv_hash);
+    node.expected_output_paths = vec![valid.clone()];
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
 
     // 1 valid "out" + 100 fabricated names + 1 duplicate "out". All
     // paths are well-formed (the format-filter passes); only the
     // membership/dedup filter catches them.
-    let valid = test_store_path("memb-out");
     let mut outs = vec![rio_proto::types::BuiltOutput {
         output_name: "out".into(),
         output_path: valid.clone(),
@@ -2481,6 +2485,10 @@ async fn test_completion_path_tenants_dedup_idempotent() -> TestResult {
     let out_path = test_store_path("pt-out");
 
     for (build_id, tenant) in [(Uuid::new_v4(), tenant_a), (Uuid::new_v4(), tenant_b)] {
+        // bug_138: the lawful out_path rides the dispatch-minted
+        // expected set (production-faithful fixture).
+        let mut node = make_node(drv_tag);
+        node.expected_output_paths = vec![out_path.clone()];
         let (reply_tx, reply_rx) = oneshot::channel();
         handle
             .send_unchecked(ActorCommand::MergeDag {
@@ -2488,7 +2496,7 @@ async fn test_completion_path_tenants_dedup_idempotent() -> TestResult {
                     build_id,
                     tenant_id: Some(tenant),
                     priority_class: PriorityClass::Scheduled,
-                    nodes: vec![make_node(drv_tag)],
+                    nodes: vec![node],
                     edges: vec![],
                     options: BuildOptions::default(),
                     keep_going: false,
@@ -5082,7 +5090,13 @@ async fn late_built_report_after_cancel_registers_path_tenants() -> TestResult {
     use sha2::Digest;
     let (db, handle, _task) = setup().await;
     let build = Uuid::new_v4();
-    let _ev = merge_single_node(&handle, build, "cancel-reg", PriorityClass::Scheduled).await?;
+    // bug_138: the lawful late output must be a member of the durable
+    // expected set (W10-O — the membership law must NOT regress the
+    // lawful late registration this test exists for).
+    let out_path = test_store_path("cancel-reg-out");
+    let mut node = make_node("cancel-reg");
+    node.expected_output_paths = vec![out_path.clone()];
+    let _ev = merge_dag(&handle, build, vec![node], vec![], false).await?;
 
     // The pod opens its attempt through the real mint.
     let exec_id = open_pull_exec(&handle, "cancel-reg").await;
@@ -5095,7 +5109,6 @@ async fn late_built_report_after_cancel_registers_path_tenants() -> TestResult {
     // The pod finished the build + upload during the SIGTERM grace;
     // its late BUILT report arrives after the durable close, so it
     // folds AckIgnore at the production report intake.
-    let out_path = test_store_path("cancel-reg-out");
     let mut payload = pull_payload(rio_proto::types::BuildResult {
         status: rio_proto::types::BuildResultStatus::Built.into(),
         built_outputs: vec![rio_proto::types::BuiltOutput {
@@ -5152,7 +5165,11 @@ async fn late_built_report_after_eviction_registers_path_tenants() -> TestResult
     use sha2::Digest;
     let (db, handle, _task) = setup().await;
     let build = Uuid::new_v4();
-    let _ev = merge_single_node(&handle, build, "cancel-evict", PriorityClass::Scheduled).await?;
+    // bug_138 / W10-O: lawful late output ∈ the durable expected set.
+    let out_path = test_store_path("cancel-evict-out");
+    let mut node = make_node("cancel-evict");
+    node.expected_output_paths = vec![out_path.clone()];
+    let _ev = merge_dag(&handle, build, vec![node], vec![], false).await?;
     let exec_id = open_pull_exec(&handle, "cancel-evict").await;
     cancel_build(&handle, build).await?;
 
@@ -5165,7 +5182,6 @@ async fn late_built_report_after_eviction_registers_path_tenants() -> TestResult
 
     // The late BUILT report lands AFTER the reap: the node and the
     // build are gone from memory; only the durable rows remain.
-    let out_path = test_store_path("cancel-evict-out");
     let mut payload = pull_payload(rio_proto::types::BuildResult {
         status: rio_proto::types::BuildResultStatus::Built.into(),
         built_outputs: vec![rio_proto::types::BuiltOutput {
@@ -5215,7 +5231,11 @@ async fn evicted_shim_report_registers_path_tenants() -> TestResult {
     use sha2::Digest;
     let (db, handle, _task) = setup().await;
     let build = Uuid::new_v4();
-    let _ev = merge_single_node(&handle, build, "cancel-shim", PriorityClass::Scheduled).await?;
+    // bug_138 / W10-O: lawful late output ∈ the durable expected set.
+    let out_path = test_store_path("cancel-shim-out");
+    let mut node = make_node("cancel-shim");
+    node.expected_output_paths = vec![out_path.clone()];
+    let _ev = merge_dag(&handle, build, vec![node], vec![], false).await?;
     let _exec_id = open_pull_exec(&handle, "cancel-shim").await;
     cancel_build(&handle, build).await?;
     handle
@@ -5225,7 +5245,6 @@ async fn evicted_shim_report_registers_path_tenants() -> TestResult {
 
     // The shim path: ProcessCompletion (the append-failure redelivery
     // echo's production lane) for the evicted drv.
-    let out_path = test_store_path("cancel-shim-out");
     complete_success(&handle, "shim-w", "cancel-shim", &out_path).await?;
     barrier(&handle).await;
 
@@ -5387,6 +5406,200 @@ async fn cancel_late_report_resubmit_solves_warm_with_identity() -> TestResult {
     assert!(
         !matches!(pull, Ok(PullOutcome::Deliver(_))),
         "warm solve must leave nothing dispatchable; got {pull:?}"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// bug_138: worker-supplied output paths verify membership against the
+// dispatch-minted expected set before any path_tenants stamp (W10-M)
+// ---------------------------------------------------------------------------
+
+/// W10-M — proposition: NO worker-supplied output path outside the
+/// scheduler-authoritative expected set
+/// (`state.expected_output_paths`, the same set the AssignmentClaims
+/// mint signs at dispatch) reaches `path_tenants`, on ANY report lane.
+/// The quantifier is both-lanes; this test drives BOTH: the admitted
+/// success epilogue AND the late-report Register lane's evicted face
+/// (the weaker-checked wave-9 replica).
+///
+/// The attack (the red this test was born failing on, pre-fix): a
+/// compromised worker assigned drv X (tenant A's build) reports tenant
+/// B's EXISTING store path as its own output. No upload occurs, so the
+/// store's PutPath `path ∈ claims.expected_outputs` check
+/// (put_path/common.rs — the enforcement this lane shadows) never
+/// runs. The stamp lands `(B's path, tenant A)` with BuiltLocally
+/// provenance; the store's `own_built_projection`
+/// (`bool_or(tenant_id = $tid)` over exactly these rows) then yields
+/// `owned=true` for A, and the I-217 law
+/// (`rio_evidence_kernel::visibility::visibility_verdict`) flips B's
+/// path Hidden → Visible for tenant A. This test asserts the verdict
+/// cell itself through the projection's own SQL — the full I-217
+/// assertion, not a weaker row-count sibling.
+///
+/// Post-fix: membership refusal — a TYPED, counted, attributed,
+/// non-poisoning letter (`rio_scheduler_unexpected_built_output_total`
+/// + the structured WARN; the report's lawful effects are unaffected
+/// — the drv still completes on the admitted lane).
+#[tokio::test]
+async fn forged_output_path_never_reaches_path_tenants_on_any_lane() -> TestResult {
+    use sha2::Digest;
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let (db, handle, _task) = setup().await;
+    let sched_db = crate::db::SchedulerDb::new(db.pool.clone());
+
+    // Tenant B (the victim) owns two pre-existing paths, Hidden from
+    // every other tenant under I-217 (built-by-another-tenant-only).
+    let tenant_b = rio_store::test_helpers::seed_tenant(&db.pool, "forge-victim").await;
+    let victim_adm = test_store_path("forge-victim-secret-adm");
+    let victim_reg = test_store_path("forge-victim-secret-reg");
+    let prov = crate::db::live_pins::StampProvenance::BuiltLocally;
+    sched_db
+        .upsert_path_tenants(
+            &[victim_adm.clone(), victim_reg.clone()],
+            &[tenant_b],
+            &prov,
+        )
+        .await?;
+
+    // The I-217 projection cell for tenant A over a path: EXACTLY the
+    // store's `own_built_projection` semantics (visibility.rs —
+    // CITE-ONLY surface: `bool_or(pt.tenant_id = $2) AS owned`,
+    // any_built = group-exists), folded through the kernel's verdict.
+    let verdict_for_a = |path: String, pool: sqlx::PgPool| async move {
+        let hash = sha2::Sha256::digest(path.as_bytes()).to_vec();
+        let owned: Option<bool> = sqlx::query_scalar(
+            "SELECT bool_or(tenant_id = $2) FROM path_tenants WHERE store_path_hash = $1",
+        )
+        .bind(&hash)
+        .bind(DEFAULT_TEST_TENANT)
+        .fetch_one(&pool)
+        .await?;
+        let (owned, any_built) = (owned.unwrap_or(false), owned.is_some());
+        anyhow::Ok(rio_evidence_kernel::visibility::visibility_verdict(
+            owned, any_built, false,
+        ))
+    };
+
+    // Baseline: both victim paths Hidden from tenant A.
+    for p in [&victim_adm, &victim_reg] {
+        assert_eq!(
+            verdict_for_a(p.clone(), db.pool.clone()).await?,
+            rio_evidence_kernel::visibility::VisibilityVerdict::Hidden,
+            "baseline: tenant B's path must be Hidden from tenant A (I-217)"
+        );
+    }
+
+    // ── Lane 1: the ADMITTED success epilogue ──────────────────────
+    // Tenant A's build, drv with a dispatch-minted expected set. The
+    // worker reports B's path as its only output.
+    let lawful_adm = test_store_path("forge-adm-out");
+    let mut node = make_node("forge-adm");
+    node.expected_output_paths = vec![lawful_adm.clone()];
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+    let _assignment = pull_attempt(&handle, "forge-adm").await;
+    pull_complete_success(&handle, "forge-adm", &victim_adm).await?;
+    barrier(&handle).await;
+
+    assert_eq!(
+        verdict_for_a(victim_adm.clone(), db.pool.clone()).await?,
+        rio_evidence_kernel::visibility::VisibilityVerdict::Hidden,
+        "left (pre-fix): a worker-supplied output_path FLIPPED tenant \
+         B's path Hidden → Visible for tenant A (owned=true via the \
+         forged BuiltLocally row; no upload occurred — the full I-217 \
+         visibility consequence on the admitted lane) / right: the \
+         membership check refuses the non-member path; the verdict \
+         stays Hidden"
+    );
+    let adm_hash = sha2::Sha256::digest(victim_adm.as_bytes()).to_vec();
+    let stamped: Vec<Uuid> =
+        sqlx::query_scalar("SELECT tenant_id FROM path_tenants WHERE store_path_hash = $1")
+            .bind(&adm_hash)
+            .fetch_all(&db.pool)
+            .await?;
+    assert_eq!(
+        stamped,
+        vec![tenant_b],
+        "left (pre-fix): the admitted epilogue stamped the forged path \
+         for tenant A — path_tenants gained (B's path, A) with \
+         BuiltLocally provenance, no upload required / right: the \
+         membership check refuses the non-member path at the boundary; \
+         only B's own row exists"
+    );
+    // Non-poisoning: the report's lawful effects are unaffected — the
+    // drv still completes (the refusal letter is per-output, not a
+    // report failure).
+    let info = expect_drv(&handle, "forge-adm").await;
+    assert_eq!(
+        info.status,
+        DerivationStatus::Completed,
+        "the membership refusal must not poison the completion itself"
+    );
+
+    // ── Lane 2: the late-report Register lane, EVICTED face ────────
+    // (declared=None — the wave-9 lane with no membership check at
+    // all pre-fix.) Cancel + evict, then the late forged report.
+    let lawful_reg = test_store_path("forge-reg-out");
+    let mut node = make_node("forge-reg");
+    node.expected_output_paths = vec![lawful_reg.clone()];
+    let build = Uuid::new_v4();
+    let _ev = merge_dag(&handle, build, vec![node], vec![], false).await?;
+    let exec_id = open_pull_exec(&handle, "forge-reg").await;
+    cancel_build(&handle, build).await?;
+    handle
+        .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id: build })
+        .await?;
+    barrier(&handle).await;
+
+    let mut payload = pull_payload(rio_proto::types::BuildResult {
+        status: rio_proto::types::BuildResultStatus::Built.into(),
+        built_outputs: vec![rio_proto::types::BuiltOutput {
+            output_name: "out".into(),
+            output_path: victim_reg.clone(),
+            output_hash: vec![0u8; 32],
+        }],
+        ..Default::default()
+    });
+    payload.final_line_count = 3;
+    pull_report_exec(&handle, exec_id, "forge-reg", payload).await?;
+    barrier(&handle).await;
+    // The Register apply awaits inline behind the actor channel;
+    // barrier flushed it. A short settle absorbs runtime scheduling
+    // before the ABSENCE assertion (presence-polling would be wrong:
+    // post-fix nothing must appear).
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let reg_hash = sha2::Sha256::digest(victim_reg.as_bytes()).to_vec();
+    let stamped: Vec<Uuid> =
+        sqlx::query_scalar("SELECT tenant_id FROM path_tenants WHERE store_path_hash = $1")
+            .bind(&reg_hash)
+            .fetch_all(&db.pool)
+            .await?;
+    assert_eq!(
+        stamped,
+        vec![tenant_b],
+        "left (pre-fix): the Register lane's evicted face stamped the \
+         forged path for tenant A — the weaker-checked wave-9 replica \
+         of the admitted hole / right: the cold membership check \
+         against the durable expected set refuses it; only B's row \
+         exists"
+    );
+    assert_eq!(
+        verdict_for_a(victim_reg.clone(), db.pool.clone()).await?,
+        rio_evidence_kernel::visibility::VisibilityVerdict::Hidden,
+        "left (pre-fix): I-217 verdict FLIPPED for tenant A on the \
+         late lane / right: Hidden holds"
+    );
+
+    // The typed refusal letter: counted once per refused output, one
+    // per lane here.
+    assert_eq!(
+        recorder.get("rio_scheduler_unexpected_built_output_total{}"),
+        2,
+        "the membership refusal is a COUNTED letter (one per refused \
+         output: admitted lane + Register lane), not a silent drop"
     );
     Ok(())
 }

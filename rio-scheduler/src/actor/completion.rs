@@ -117,7 +117,9 @@ pub(super) enum LateReportEffect {
     /// registered or registrable completed work.
     Register {
         /// The report's validated outputs (store-path shape checked;
-        /// declared-membership checked when the node is resident).
+        /// declared-NAME membership checked when the node is
+        /// resident; the expected-set PATH membership law — bug_138 —
+        /// is enforced at apply against the durable row, both faces).
         outputs: Vec<crate::domain::BuiltOutput>,
     },
     /// Acknowledge and write nothing (every other late report).
@@ -1303,6 +1305,7 @@ impl DagActor {
     // r[impl store.registration.cancel-survives]
     pub(super) async fn apply_late_report_effect(
         &mut self,
+        executor_id: &str,
         drv_key: &str,
         effect: LateReportEffect,
     ) {
@@ -1314,14 +1317,20 @@ impl DagActor {
             } => {
                 self.stamp_drv_execution_terminal(&drv_hash, exec_id, "cancelled", Some(count));
             }
-            LateReportEffect::Register { outputs } => {
+            LateReportEffect::Register { mut outputs } => {
                 // Cold identity resolve: canonical drv_hash + the
                 // tenants whose builds were interested (LEFT JOIN so a
                 // known drv with zero tenanted builds still resolves
-                // its hash — the stamp is then vacuous, logged).
-                let rows: Vec<(String, String, Option<Uuid>)> = match sqlx::query_as(
+                // its hash — the stamp is then vacuous, logged) + the
+                // durable expected set and CA flags (bug_138: the
+                // membership inputs — the evicted face has no resident
+                // node, so the dispatch-minted truth is read from the
+                // SAME durable row identity resolves from).
+                type ColdRow = (String, String, Option<Uuid>, Vec<String>, bool, bool);
+                let rows: Vec<ColdRow> = match sqlx::query_as(
                     r#"
-                    SELECT d.drv_hash, d.drv_path, b.tenant_id
+                    SELECT d.drv_hash, d.drv_path, b.tenant_id,
+                           d.expected_output_paths, d.is_fixed_output, d.is_ca
                       FROM derivations d
                       LEFT JOIN build_derivations bd USING (derivation_id)
                       LEFT JOIN builds b
@@ -1345,7 +1354,9 @@ impl DagActor {
                         return;
                     }
                 };
-                let Some((canonical_hash, canonical_drv_path, _)) = rows.first() else {
+                let Some((canonical_hash, canonical_drv_path, _, expected, is_fo, is_ca)) =
+                    rows.first()
+                else {
                     // The censused no-evidence sibling: no durable drv
                     // row — nothing to address registration to. Loud:
                     // this is the only arm that still drops a
@@ -1361,8 +1372,41 @@ impl DagActor {
                 };
                 let canonical = DrvHash::from(canonical_hash.as_str());
                 let canonical_drv_path = canonical_drv_path.clone();
+                // bug_138 — the membership law on the late lane (the
+                // weaker-checked wave-9 Register face): worker paths
+                // verify against the durable expected set, mirroring
+                // the admitted lane's resident check and the store's
+                // PutPath enforcement. CA exemption under the durable
+                // claims-mint predicate (`is_ca AND NOT
+                // is_fixed_output` — the same face the store's
+                // content recompute authorizes). The durable set is
+                // the MERGE-time truth: a deferred-IA drv (CA-chain
+                // input, is_ca=false) whose row still carries the
+                // unresolved "" placeholders refuses here — priced:
+                // that cell's bytes were claims-checked at upload
+                // (PutPath ran against the post-resolve claims), the
+                // refusal degrades exactly to the pre-registration
+                // posture (bytes durable, tenant-invisible until
+                // re-stamp), and "" never matches a parsed store
+                // path, so the placeholder can never be forged.
+                if !(*is_ca && !*is_fo) {
+                    Self::retain_expected_members(
+                        executor_id,
+                        drv_key,
+                        "late-register",
+                        expected,
+                        &mut outputs,
+                    );
+                    if outputs.is_empty() {
+                        // Every output refused — each one counted and
+                        // attributed above (the typed letter); the
+                        // Register effect degrades to no stamp at
+                        // all, never a partial one.
+                        return;
+                    }
+                }
                 let tenants: Vec<Uuid> = {
-                    let mut t: Vec<Uuid> = rows.iter().filter_map(|(_, _, t)| *t).collect();
+                    let mut t: Vec<Uuid> = rows.iter().filter_map(|(_, _, t, ..)| *t).collect();
                     t.sort();
                     t.dedup();
                     t
@@ -1411,14 +1455,17 @@ impl DagActor {
     }
 
     /// Validate a late report's raw wire outputs into the typed
-    /// Register payload: the SAME two boundary filters the admitted
-    /// success path applies (store-path SHAPE at the trust boundary,
-    /// then declared-membership + dedup when the resident node's
-    /// declared `output_names` are available — the evicted face has no
-    /// declared set; its residual is priced by the path-shape filter,
-    /// the authenticated report, and the cold tenant scoping to
-    /// historically-interested builds). Same counters as the admitted
-    /// path — one metric surface for malformed/undeclared outputs.
+    /// Register payload: the SAME name/shape boundary filters the
+    /// admitted success path applies (store-path SHAPE at the trust
+    /// boundary, then declared-NAME membership + dedup when the
+    /// resident node's `output_names` are available — the evicted
+    /// face has no declared set). The PATH membership law (bug_138 —
+    /// path ∈ the dispatch-minted expected set) runs at APPLY time
+    /// for this lane ([`DagActor::apply_late_report_effect`]'s
+    /// Register arm, against the durable row both faces cold-resolve
+    /// from), so the evicted face is exactly as path-checked as the
+    /// resident one. Same counters as the admitted path — one metric
+    /// surface for malformed/undeclared/unexpected outputs.
     pub(super) fn validated_late_outputs(
         executor_id: &str,
         drv_key: &str,
@@ -1460,6 +1507,59 @@ impl DagActor {
                 output_hash: o.output_hash.clone(),
             })
             .collect()
+    }
+
+    /// bug_138 — the trust-boundary MEMBERSHIP law, the one filter
+    /// both worker-report lanes share: a worker-supplied output path
+    /// is retained ONLY if it is a member of the
+    /// scheduler-authoritative expected set for the assignment — the
+    /// SAME set the AssignmentClaims mint signs at dispatch
+    /// (dispatch.rs `expected_outputs`) and the store's PutPath check
+    /// enforces on upload (`put_path/common.rs`: `path ∈
+    /// claims.expected_outputs`). This is the scheduler-side mirror:
+    /// a report that triggers NO upload (the path already exists —
+    /// another tenant's bytes) never meets the store's check, so the
+    /// scheduler must enforce the same law before any registration
+    /// stamp.
+    ///
+    /// Each refused output is a TYPED letter, not a shadow drop:
+    /// counted (`rio_scheduler_unexpected_built_output_total`),
+    /// attributed (executor, drv, lane, output), non-poisoning (the
+    /// caller keeps processing the lawful subset; the report itself
+    /// is never failed for it — same family as the malformed/
+    /// undeclared siblings above).
+    ///
+    /// Callers gate the CA exemption with EXACTLY the claims-mint
+    /// predicate (`state.ca.is_ca && !state.is_fixed_output`, or the
+    /// durable `is_ca AND NOT is_fixed_output` on the cold face):
+    /// floating-CA paths are computed post-build from the NAR hash —
+    /// no sign-time expected set exists; that face's authorization is
+    /// the store's content recompute (`verify_ca_store_path`) plus
+    /// the gated realisation insert, exactly as on upload.
+    pub(super) fn retain_expected_members(
+        executor_id: &str,
+        drv_key: &str,
+        lane: &'static str,
+        expected: &[String],
+        outputs: &mut Vec<crate::domain::BuiltOutput>,
+    ) {
+        outputs.retain(|o| {
+            if expected.iter().any(|e| e == &o.output_path) {
+                return true;
+            }
+            warn!(
+                executor_id,
+                drv_key,
+                lane,
+                output_name = %o.output_name,
+                output_path = %o.output_path,
+                "refusing worker-supplied output_path outside the \
+                 assignment's expected set (no registration stamp; \
+                 the report's other effects are unaffected)"
+            );
+            metrics::counter!("rio_scheduler_unexpected_built_output_total").increment(1);
+            false
+        });
     }
 
     /// The late-report classification context for `drv_key`: resident
@@ -1565,7 +1665,8 @@ impl DagActor {
                 );
                 return;
             }
-            self.apply_late_report_effect(drv_key, effect).await;
+            self.apply_late_report_effect(executor_id.as_str(), drv_key, effect)
+                .await;
             return;
         };
         let (admission, reporting) = match self.dag.node(&drv_hash).and_then(|s| s.exec_id) {
@@ -1638,7 +1739,7 @@ impl DagActor {
                     &result.built_outputs,
                 );
                 let effect = late_report_effect(reporting, ctx, status, final_line_count, outputs);
-                self.apply_late_report_effect(drv_hash.as_str(), effect)
+                self.apply_late_report_effect(executor_id.as_str(), drv_hash.as_str(), effect)
                     .await;
             }
         }
@@ -1776,7 +1877,8 @@ impl DagActor {
                 );
                 return;
             }
-            self.apply_late_report_effect(drv_key, effect).await;
+            self.apply_late_report_effect(executor_id.as_str(), drv_key, effect)
+                .await;
             return;
         };
         let drv_hash = &drv_hash;
@@ -1806,7 +1908,7 @@ impl DagActor {
                 warn!(drv_hash = %drv_hash, "completion for unknown derivation, ignoring");
                 return;
             }
-            self.apply_late_report_effect(drv_hash.as_str(), effect)
+            self.apply_late_report_effect(executor_id.as_str(), drv_hash.as_str(), effect)
                 .await;
             return;
         };
@@ -1841,6 +1943,31 @@ impl DagActor {
             // false on dup → drop.
             seen.insert(o.output_name.clone())
         });
+        // bug_138, threat-model boundary part 3 — the MEMBERSHIP law
+        // (the pre-campaign admitted half, closed with the Register
+        // half in the same commit): the name retain above bounds
+        // cardinality; this bounds the VALUE. Without it, a worker on
+        // its own assigned drv reports another tenant's EXISTING path
+        // as its output — no upload occurs, so the store's PutPath
+        // `path ∈ claims.expected_outputs` check never runs — and the
+        // path lands in `state.output_paths` → `path_tenants`
+        // (BuiltLocally) → the store's `own_built_projection` reads
+        // owned=true → I-217 flips the victim path Visible for this
+        // report's tenants. The expected set is dispatch-minted and
+        // claims-signed (dispatch.rs); deferred-IA nodes carry their
+        // post-resolve real paths here by report time (the dispatch
+        // overwrite runs before any assignment exists). Floating-CA
+        // is exempt under EXACTLY the claims-mint predicate — see
+        // [`Self::retain_expected_members`].
+        if !(state.ca.is_ca && !state.is_fixed_output) {
+            Self::retain_expected_members(
+                executor_id.as_str(),
+                drv_key,
+                "admitted",
+                &state.expected_output_paths,
+                &mut result.built_outputs,
+            );
+        }
         let current_status = state.status();
 
         // r[impl sched.completion.idempotent]
@@ -1886,7 +2013,7 @@ impl DagActor {
                 final_line_count,
                 result.built_outputs.clone(),
             );
-            self.apply_late_report_effect(drv_hash.as_str(), effect)
+            self.apply_late_report_effect(executor_id.as_str(), drv_hash.as_str(), effect)
                 .await;
             debug!(drv_hash = %drv_hash, executor_id = %executor_id,
                    "cancelled completion report (expected after a cancel)");

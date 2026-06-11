@@ -1504,8 +1504,12 @@ impl DagActor {
                     payload.final_line_count,
                     outputs,
                 );
-                self.apply_late_report_effect(drv_hash.as_str(), effect)
-                    .await;
+                self.apply_late_report_effect(
+                    b.core.executor_id.as_str(),
+                    drv_hash.as_str(),
+                    effect,
+                )
+                .await;
                 Ok(())
             }
             ReportAdmission::Process(admission) => {

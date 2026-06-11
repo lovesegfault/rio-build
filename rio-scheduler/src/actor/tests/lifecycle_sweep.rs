@@ -234,7 +234,11 @@ async fn test_upsert_at_merge_preexisting_completed() -> TestResult {
     let tenant_a = rio_store::test_helpers::seed_tenant(&db.pool, "pre-tenant-a").await;
     let tenant_b = rio_store::test_helpers::seed_tenant(&db.pool, "pre-tenant-b").await;
 
-    // Build A completes the drv.
+    // Build A completes the drv. bug_138: the lawful out_path rides
+    // the dispatch-minted expected set (production-faithful fixture).
+    let out_path = test_store_path("pre-out");
+    let mut node_a = make_node("pre-drv");
+    node_a.expected_output_paths = vec![out_path.clone()];
     let build_a = Uuid::new_v4();
     let _ev_a = merge_dag_req(
         &handle,
@@ -242,7 +246,7 @@ async fn test_upsert_at_merge_preexisting_completed() -> TestResult {
             build_id: build_a,
             tenant_id: Some(tenant_a),
             priority_class: PriorityClass::Scheduled,
-            nodes: vec![make_node("pre-drv")],
+            nodes: vec![node_a],
             edges: vec![],
             options: BuildOptions::default(),
             keep_going: false,
@@ -252,7 +256,6 @@ async fn test_upsert_at_merge_preexisting_completed() -> TestResult {
         },
     )
     .await?;
-    let out_path = test_store_path("pre-out");
     pull_complete_success(&handle, "pre-drv", &out_path).await?;
     barrier(&handle).await;
 
