@@ -462,7 +462,7 @@ store:
     # burst at 8), so CPU does not bound n. In-flight NAR bytes are
     # governed by the shared nar_bytes_budget semaphore (one
     # whole-NAR reservation per substitute leg,
-    # r[store.put.nar-bytes-budget]): under pathological
+    # r[store.put.nar-bytes-budget+6]): under pathological
     # all-large-NAR load extra workers PARK on the byte budget
     # (BudgetParked exempts a parked owner from stall takeover)
     # instead of buffering unbounded NAR bytes — the budget is a
