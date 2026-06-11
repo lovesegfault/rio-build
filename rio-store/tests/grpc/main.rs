@@ -245,5 +245,6 @@ mod hash_part;
 mod hmac;
 mod realisations;
 mod reassembly;
+mod registration;
 mod signing;
 mod trailer;

@@ -214,7 +214,7 @@ impl StoreServiceImpl {
             self.nar_ingest_envelope.hold_stall_window,
             self.nar_ingest_envelope.hold_floor_rate,
         );
-        let committing = self.commit_batch(&mut outputs, resolved_signer.as_ref());
+        let committing = self.commit_batch(&mut outputs, resolved_signer.as_ref(), auth.tenant_id);
         let created = match tokio::time::timeout(commit_env.remaining(), committing).await {
             Ok(Ok(c)) => c,
             Ok(Err(e)) => bail!(e),
@@ -423,6 +423,7 @@ impl StoreServiceImpl {
         &self,
         outputs: &mut BTreeMap<u32, OutputAccum>,
         resolved_signer: Option<&(crate::signing::Signer, bool)>,
+        tenant_id: Option<uuid::Uuid>,
     ) -> Result<Vec<bool>, Status> {
         let mut tx = self
             .pool
@@ -459,6 +460,32 @@ impl StoreServiceImpl {
                 ));
             }
             created[*idx as usize] = true;
+        }
+
+        // Round-9 WO-S1-2: registration evidence INSIDE the atomic
+        // commit — every output this tx creates is stamped with the
+        // authenticated tenant in the same transaction, so a torn
+        // stamp/commit pair is unrepresentable. AlreadyComplete
+        // outputs are NOT stamped (their bytes predate this upload; a
+        // same-path/different-content poisoning attempt must not buy
+        // visibility — the re-upload-same-content face heals through
+        // the build lane or the recorded backfill shape).
+        if let Some(tid) = tenant_id {
+            let created_hashes: Vec<Vec<u8>> = outputs
+                .iter()
+                .filter(|(idx, _)| created[**idx as usize])
+                .map(|(_, accum)| accum.store_path_hash.clone())
+                .collect();
+            if let Err(e) =
+                super::put_path::common::stamp_ingest_tenant_in_tx(&mut tx, &created_hashes, tid)
+                    .await
+            {
+                drop(tx);
+                return Err(putpath_metadata_status(
+                    "PutPathBatch: registration stamp",
+                    e.into(),
+                ));
+            }
         }
 
         tx.commit()

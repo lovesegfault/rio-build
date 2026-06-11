@@ -754,6 +754,17 @@ impl StoreServiceImpl {
             self.abort_upload(&info.store_path_hash, claim).await;
             return Err(e);
         }
+        // Round-9 WO-S1-2: registration evidence at the ingest seam —
+        // immediately after the persist commit, before the response
+        // (the client's durability signal). Best-effort like every
+        // registration stamp: the bytes ARE durable here, so a failed
+        // stamp must not trigger a useless re-upload — the 2h grace +
+        // the signature fallback cover until a re-stamp (warn keeps it
+        // visible). The batch lane stamps INSIDE its atomic tx; this
+        // single-path lane's persist owns its own tx, so post-commit
+        // is the closest seam (divergence recorded in the owning
+        // commit).
+        stamp_ingest_tenant(&self.pool, &info.store_path_hash, tenant_id).await;
         metrics::counter!("rio_store_put_path_total", "result" => "created").increment(1);
         metrics::counter!("rio_store_put_path_bytes_total").increment(info.nar_size);
         Ok(())
@@ -915,5 +926,162 @@ mod verify_nar_tests {
         let incremental: [u8; 32] = hasher.finalize().into();
         assert_eq!(incremental, digest(&buf));
         assert_eq!(buf, b"first second third");
+    }
+}
+
+// ===========================================================================
+// Round-9 WO-S1-2 — the ingestion-lane registration stamp (the signed
+// Q1 invariant's generality leg: every byte-complete upload the store
+// accepted is registered evidence). The ingest commit seam is the one
+// place EVERY upload passes; the witness here is the AUTHENTICATED
+// PutAuth tenant itself (the JWT-verified uploader — the store-side
+// evidence class beside the scheduler's BuiltLocally lane: stamps
+// EXACTLY the uploading tenant, never a wider set). Anonymous
+// uploads (no tenant claims) register no per-tenant ownership — the
+// anonymous view is unfiltered by design.
+// ===========================================================================
+
+/// THE one ingest-lane INSERT body (census-pinned: the store crate's
+/// sole production `path_tenants` writer — see the
+/// `registration_writer_census` test below). Shared by the
+/// single-path post-persist stamp and the batch in-tx stamp via the
+/// generic executor bound. `ON CONFLICT DO NOTHING`: a re-upload by
+/// the same tenant is idempotent.
+async fn insert_path_tenant_rows<'e, E>(
+    exec: E,
+    hashes: &[Vec<u8>],
+    tenant_id: uuid::Uuid,
+) -> Result<u64, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    if hashes.is_empty() {
+        return Ok(0);
+    }
+    let result = sqlx::query(
+        r#"
+        INSERT INTO path_tenants (store_path_hash, tenant_id)
+        SELECT u.h, $2 FROM UNNEST($1::bytea[]) AS u(h)
+        ON CONFLICT DO NOTHING
+        "#,
+    )
+    .bind(hashes)
+    .bind(tenant_id)
+    .execute(exec)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Single-path lane (PutPath): stamp immediately after the persist
+/// commit, before the response. Best-effort — the bytes ARE durable
+/// here, so a failed stamp must not trigger a useless re-upload; the
+/// 2h GC grace + the signature visibility fallback cover until a
+/// re-stamp (warn keeps it operator-visible). `None` tenant
+/// (anonymous/dev) is a typed no-op.
+pub(in crate::grpc) async fn stamp_ingest_tenant(
+    pool: &sqlx::PgPool,
+    store_path_hash: &[u8],
+    tenant_id: Option<uuid::Uuid>,
+) {
+    let Some(tid) = tenant_id else {
+        return;
+    };
+    if let Err(e) = insert_path_tenant_rows(pool, &[store_path_hash.to_vec()], tid).await {
+        warn!(
+            tenant_id = %tid,
+            error = %e,
+            "PutPath: ingest registration stamp failed; tenant visibility \
+             rides the signature fallback and GC retention rides the \
+             grace window until a re-stamp"
+        );
+    }
+}
+
+/// Batch lane (PutPathBatch): stamp every CREATED output inside the
+/// SAME atomic transaction that completes the manifests — a torn
+/// stamp/commit pair is unrepresentable. Err propagates: the batch's
+/// whole point is atomicity, and a failing INSERT here means the tx
+/// is dying anyway.
+pub(in crate::grpc) async fn stamp_ingest_tenant_in_tx(
+    conn: &mut sqlx::PgConnection,
+    hashes: &[Vec<u8>],
+    tenant_id: uuid::Uuid,
+) -> Result<(), sqlx::Error> {
+    insert_path_tenant_rows(conn, hashes, tenant_id)
+        .await
+        .map(|_| ())
+}
+
+// ===========================================================================
+// W9-E (round-9 WO-S1-2) — the registration-writer census, store crate
+// half (the scheduler half lives beside `upsert_path_tenants_raw` in
+// rio-scheduler/src/db/live_pins.rs; per-crate scans only — hazard
+// (vvvvv): a per-crate nix test sandbox stages only its own crate's
+// source). Proposition: the store's ONE production ownership-INSERT is
+// `insert_path_tenant_rows` above; every other occurrence is a test
+// seed pinned by exact count.
+// ===========================================================================
+#[cfg(test)]
+mod registration_writer_census {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    fn scan(dir: &Path, needle: &str, hits: &mut BTreeMap<String, usize>, root: &Path) {
+        for entry in std::fs::read_dir(dir).expect("readable src dir") {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            if path.is_dir() {
+                scan(&path, needle, hits, root);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).expect("readable source file");
+                let n = text.matches(needle).count();
+                if n > 0 {
+                    let rel = path
+                        .strip_prefix(root)
+                        .expect("under root")
+                        .to_str()
+                        .expect("source paths are utf-8")
+                        .to_owned();
+                    *hits.entry(rel).or_insert(0) += n;
+                }
+            }
+        }
+    }
+
+    /// Needles assembled at runtime so the census never matches its
+    /// own source text.
+    fn census(parts: &[&str]) -> BTreeMap<String, usize> {
+        let needle = parts.join("");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut hits = BTreeMap::new();
+        scan(&root, &needle, &mut hits, &root);
+        hits
+    }
+
+    /// ONE production ownership-INSERT (this file's
+    /// `insert_path_tenant_rows`); every other occurrence is a
+    /// `#[cfg(test)]` seed, pinned by exact count — a count drift in a
+    /// pinned file means the diff touched a seed (re-derive); a NEW
+    /// file means an uncensused writer (the W9-E reject).
+    #[test]
+    fn store_ownership_insert_census() {
+        let hits = census(&["INSERT INTO ", "path_tenants"]);
+        let expected: BTreeMap<String, usize> = [
+            // the ONE production writer (insert_path_tenant_rows)
+            ("grpc/put_path/common.rs".to_string(), 1),
+            // test seeds (visibility/gc/executor fixtures)
+            ("grpc/sign.rs".to_string(), 4),
+            ("gc/mark.rs".to_string(), 3),
+            ("gc/sweep.rs".to_string(), 3),
+            ("materialize/executor.rs".to_string(), 1),
+        ]
+        .into();
+        assert_eq!(
+            hits, expected,
+            "the store-crate ownership-INSERT census moved — the ingest \
+             stamp (insert_path_tenant_rows) is the sole production \
+             writer; route new registration writes through it or census \
+             them here with their witness rationale"
+        );
     }
 }

@@ -13,6 +13,20 @@
 // RetireTenantKey/RotateClusterKey) — manual psql is the current
 // workflow; see the "Signing keys" section of
 // docs/spec/components/store.typ.
+//
+// RULED (round-9 WO-S1-2, the A2-residual close shape; trigger = first
+// operator need): the registration BACKFILL hook — an admin sweep
+// stamping PRE-EXISTING unstamped paths (the 93.4% pre-WO-S1-2
+// population: narSign covers visibility for future uploads only and
+// ingest stamping covers future uploads only; history keeps riding the
+// grace window + signature fallback until backfilled). The close shape
+// when the trigger fires: an admin-plane sweep deriving (path →
+// tenant) attribution from the durable build/interest rows (the same
+// derivations/bd/builds join the scheduler's late-report Register arm
+// cold-resolves through) and stamping via the censused ingest writer
+// (put_path::common::insert_path_tenant_rows); an RPC verb needs a
+// store.proto change — unclaimed this wave (R6 partition), so the verb
+// rides the next proto-granted slot. Recorded, never silently dropped.
 
 /// Default GC grace period when the AdminService GC request omits
 /// `grace_period_hours`. The window after a gateway restart during
