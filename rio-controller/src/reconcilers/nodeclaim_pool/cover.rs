@@ -1,14 +1,16 @@
 //! §13b deficit cover.
 //!
-//! Per `r[ctrl.nodeclaim.anchor-bulk+5]`: for each `(h,cap)` cell with
+//! Per `r[ctrl.nodeclaim.anchor-bulk+6]`: for each `(h,cap)` cell with
 //! unplaced demand, mint `n` uniform NodeClaims sized so the production
 //! FFD packs every fitting intent (over-cap dropped with
-//! `exceeds_cell_cap` metric — see [`sizing`]), capped at
-//! `sla.maxNodeClaimsPerCellPerTick` and the `sla.maxFleetCores`
-//! budget. Karpenter resolves each claim's `resources.requests`
-//! against the hw-class's `requirements` (instance-type properties) to
-//! pick the actual instance type. Cells iterate round-robin from a
-//! rotating start so no cell starves under sustained pressure.
+//! `exceeds_cell_cap` metric — see [`sizing`]), bounded by the two-term
+//! law `min(n_pack, ⌊budget/chunk⌋)` — demand and the `sla.maxFleetCores`
+//! fleet-budget brake, nothing else (live_049 L1: the flat per-tick cap
+//! is RETIRED — `ctrl.nodeclaim.mint-deficit-proportional`). Karpenter
+//! resolves each claim's `resources.requests` against the hw-class's
+//! `requirements` (instance-type properties) to pick the actual
+//! instance type. Cells iterate round-robin from a rotating start so no
+//! cell starves under sustained pressure.
 //!
 //! This module is the pure-compute half: cell assignment, claim-count
 //! math, and NodeClaim spec construction. The `Api::create` side-effect
@@ -575,9 +577,18 @@ pub struct SizingCfg {
 /// budget, the two quantities with safety meaning, and by nothing
 /// else (`ctrl.nodeclaim.mint-deficit-proportional`).
 ///
-/// Each claim is uniformly `(max(⌈Σc/n⌉, max_i c), max(Σm/n, max_i m),
-/// max(Σd/n, max_i d))` — every intent fits every claim on every axis,
-/// and `Σ out ≥ Σ in`. The production FFD is guaranteed to pack at
+/// Each claim is uniformly `uniform_claim` (private fn, plain-code
+/// reference): `(max(⌈Σc/n⌉, max_i c),
+/// max(⌈Σm/n⌉, max_i m), max(⌈Σd/n⌉, max_i d))` — every intent fits
+/// every claim on every axis (the `max_i` term), and `Σ out ≥ Σ in`
+/// holds at EVERY candidate `n` by the uniform `div_ceil` term
+/// (`n·⌈Σ/n⌉ ≥ Σ`; bug_127 — mem/disk previously FLOORED, which
+/// violated the inequality at unselected small `n` where `Σ/n` exceeds
+/// `max_i`; ≤1 unit per bin, no behavioral reach because COVERAGE at
+/// the SELECTED `n` is delivered by the sim_packs pigeonhole — a pack
+/// that places every fitting intent into `n` claims IS `Σ in ≤
+/// n·claim` — and by the `n_hi` one-per-intent fallback, not by the
+/// per-claim formula). The production FFD is guaranteed to pack at
 /// `n = |u|`; [`ffd::sim_packs`](super::ffd::sim_packs) finds the
 /// smallest `n` where it does. STRIKE-4 close (r26 mb_002): the
 /// predicate IS production `simulate` — no reimplemented sort/score to
@@ -592,7 +603,23 @@ pub struct Sizing<'a> {
     pub over_cap: Vec<&'a SpawnIntent>,
 }
 
-// r[impl ctrl.nodeclaim.anchor-bulk+5]
+/// The uniform per-claim formula at candidate bin count `n` (bug_127:
+/// `div_ceil` on ALL THREE axes — uniform rounding, the over-provision
+/// direction, ≤1 unit per bin): each axis is
+/// `max(⌈Σ/n⌉, max_i)` (cores additionally floored at 1), so every
+/// intent fits every claim (the `max_i` term) and `n·claim ≥ Σ` on
+/// every axis at every `n` (the `div_ceil` term — the formula-level
+/// half of the sizing doc's `Σ out ≥ Σ in`; the packed-coverage half
+/// is the sim_packs pigeonhole).
+fn uniform_claim(n: u32, sums: (u32, u64, u64), maxes: (u32, u64, u64)) -> (u32, u64, u64) {
+    (
+        sums.0.div_ceil(n).max(maxes.0).max(1),
+        sums.1.div_ceil(u64::from(n)).max(maxes.1),
+        sums.2.div_ceil(u64::from(n)).max(maxes.2),
+    )
+}
+
+// r[impl ctrl.nodeclaim.anchor-bulk+6]
 pub fn sizing<'a>(cell: &Cell, u: &[&'a SpawnIntent], cfg: &SizingCfg) -> Sizing<'a> {
     use crate::reconcilers::pool::jobs::intent_pod_footprint;
     if u.is_empty() {
@@ -656,13 +683,7 @@ pub fn sizing<'a>(cell: &Cell, u: &[&'a SpawnIntent], cfg: &SizingCfg) -> Sizing
             },
         );
     let min_eta = fits.iter().map(|i| i.eta_seconds).fold(f64::MAX, f64::min);
-    let claim_at = |n: u32| {
-        (
-            sum_c.div_ceil(n).max(max_c).max(1),
-            (sum_m / u64::from(n)).max(max_m),
-            (sum_d / u64::from(n)).max(max_d),
-        )
-    };
+    let claim_at = |n: u32| uniform_claim(n, (sum_c, sum_m, sum_d), (max_c, max_m, max_d));
     let n_lo = claim_count((sum_c, sum_m, sum_d), cfg);
     let n_hi = fits.len() as u32;
     // After the over-cap filter, every footprint ≤ cap on every axis, so
@@ -1132,7 +1153,7 @@ mod tests {
 
     /// STRIKE-3 (mb_009): direct cases. Unconstrained budget so sizing
     /// covers ALL intents (FFD oracle), and every claim ≤ per-axis cap.
-    // r[verify ctrl.nodeclaim.anchor-bulk+5]
+    // r[verify ctrl.nodeclaim.anchor-bulk+6]
     #[test]
     fn sizing_invariants_hold() {
         let scfg = cfg(64, u32::MAX);
@@ -1229,7 +1250,7 @@ mod tests {
     /// the claim's `(c,m,d)`); a clamped 32c claim would just loop
     /// (mint→Pending→re-mint). `sizing()` filters and DROPS (with metric
     /// + warn), sizing on the remainder.
-    // r[verify ctrl.nodeclaim.anchor-bulk+5]
+    // r[verify ctrl.nodeclaim.anchor-bulk+6]
     #[test]
     fn sizing_filters_intent_exceeding_per_cell_cap() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
@@ -2877,31 +2898,95 @@ mod mint_law_tests {
         );
     }
 
+    /// Alias family of the retired per-tick cap (merged_bug_001's R22
+    /// upgrade — ALIAS CLOSURE): every spelling tier the symbol exists
+    /// in — Rust snake_case (the config field + the historical
+    /// `SizingCfg` member), helm camelCase, and the prose-phrase
+    /// family ("per-tick cap" also matches inside
+    /// "per-cell-per-tick cap"). The pre-fix generator was
+    /// snake_case-only and rio-controller/src-scoped, so the camelCase
+    /// operator spelling and the normative docs/spec surface never
+    /// entered the censused universe (the enrolled-census-over-the-
+    /// wrong-universe shape; same lesson as bug_094's vanish census).
+    const CAP_ALIASES: &[&str] = &[
+        "per_tick_cap",
+        "max_node_claims_per_cell_per_tick",
+        "maxNodeClaimsPerCellPerTick",
+        "per-tick cap",
+    ];
+
+    /// Retirement qualifiers: an alias mention is RETIREMENT-NARRATING
+    /// (allowed) iff its own line or a ±1-line neighbor carries one of
+    /// these (lowercased substring match — "retir" covers
+    /// retired/RETIRED/retirement; "deprecat" covers
+    /// DEPRECATED/deprecation). Everything else is STALE-AS-LIVE.
+    const RETIREMENT_QUALIFIERS: &[&str] = &[
+        "retir",
+        "deprecat",
+        "parse-only",
+        "parse only",
+        "not a flat",
+        "former",
+    ];
+
+    /// The alias-closed scan law (the generator fn the R22 corpus
+    /// plants fire against): flag every line mentioning ANY
+    /// [`CAP_ALIASES`] spelling with NO [`RETIREMENT_QUALIFIERS`]
+    /// token in its ±1-line window. Returns `(1-based line, text)`
+    /// rows — empty ⇔ the scanned source states the cap only as
+    /// retired, never as live.
+    fn stale_cap_lines(src: &str) -> Vec<(usize, String)> {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if !CAP_ALIASES.iter().any(|a| line.contains(a)) {
+                continue;
+            }
+            let lo = i.saturating_sub(1);
+            let hi = (i + 1).min(lines.len().saturating_sub(1));
+            let qualified = lines[lo..=hi].iter().any(|l| {
+                let low = l.to_lowercase();
+                RETIREMENT_QUALIFIERS.iter().any(|q| low.contains(q))
+            });
+            if !qualified {
+                out.push((i + 1, (*line).to_string()));
+            }
+        }
+        out
+    }
+
     // r[verify ctrl.nodeclaim.mint-deficit-proportional]
-    /// **R12 — the cap-reader census [GEN-SET]** (re-scoped post-review:
-    /// code-readers ZERO + the committed surviving-surface expected
-    /// set). Generator:
+    /// **R12 — the cap-reader census [GEN-SET], alias-closed**
+    /// (merged_bug_001 / R22 upgrade). Generator, ALL alias tiers:
     ///
-    ///   rg -n 'per_tick_cap|max_node_claims_per_cell_per_tick' \
-    ///      rio-controller/src/
+    ///   rg -n -i 'maxNodeClaimsPerCellPerTick|max_node_claims_per_cell_per_tick|per.tick cap|per_tick_cap' \
+    ///      rio-controller/src/ docs/ infra/ nix/ rio-scheduler/ --glob '!docs/gen'
     ///
-    /// over the EMBEDDED production sources (include_str!): the mint
-    /// path carries ZERO readers of the retired cap — the only
-    /// surviving mentions are the retirement rationale prose. The
-    /// out-of-crate surviving surface is the committed EXPECTED-SET
-    /// below, one disposition per row; an UNLISTED code reader fails
-    /// this census (closure tomorrow, not completeness today).
+    /// TIER SCOPE: the in-crate tiers (cover.rs, mod.rs, lib.rs) are
+    /// scanned HERE via include_str! (sandbox-safe — the crate2nix
+    /// per-member fileset cannot stage docs/ or infra/, so the
+    /// docs/spec + infra + models tiers are carried by the committed
+    /// [GEN-SET] artifact in the sweeping commit's body: the command
+    /// above + its full output at the swept tip, every row classified
+    /// in the EXPECTED-SET below). Two laws over the in-crate tiers:
+    /// (1) ZERO code readers of the retired cap (the snake_case count
+    /// pins); (2) ZERO stale-as-live mentions in ANY alias tier (the
+    /// alias-closed scan — retirement-narrating prose passes by its
+    /// qualifier, everything else fails). An UNLISTED out-of-crate
+    /// reader fails the [GEN-SET] re-run (closure tomorrow, not
+    /// completeness today).
     #[test]
     fn cap_reader_census_code_readers_zero() {
         let cover_src = include_str!("cover.rs");
         let mod_src = include_str!("mod.rs");
+        let lib_src = include_str!("../../lib.rs");
         let prod = |s: &str| {
             s.split("#[cfg(test)]\nmod ")
                 .next()
                 .unwrap_or(s)
                 .to_string()
         };
-        // cover.rs: 1 retirement-rationale prose mention in the sizing
+        // cover.rs: 1 retirement-rationale snake mention in the sizing
         // doc; ZERO code reads (the law is two-term).
         assert_eq!(
             prod(cover_src).matches("per_tick_cap").count(),
@@ -2931,26 +3016,166 @@ mod mint_law_tests {
             "mod.rs: the field, its default, and the SizingCfg plumb are \
              retired"
         );
-        // The committed EXPECTED-SET (out-of-crate surfaces; verified
-        // by the generator run committed in the WO-S7-1 commit body):
-        // - templates/controller.yaml:34 — renders into the TOLERANT
-        //   NodeClaimPoolConfig (serde(default): unknown key ignored);
-        // - templates/scheduler.yaml:44 — renders into the RETAINED
-        //   deny_unknown_fields SlaConfig field (parse-only);
-        // - infra/helm values.yaml sla row — DEPRECATION-COMMENTED
-        //   (arm (a): kept so the scheduler template's rendered key
-        //   keeps parsing);
-        // - nix/tests/default.nix — sets the retained field
-        //   (banner-protected, untouched);
-        // - rio-scheduler sla/config.rs — the deprecated-ignored
-        //   field + serde default + HELM_RENDERED_SLA_KEYS row +
-        //   test_default/destructure rows (parse-surface only);
-        // - docs/spec sla-sizing.typ — the two-term law + burst
-        //   pricing + the deprecated-row note ([GEN-SET] prose);
-        // - docs/spec/models/nodeclaimLifecycle.qnt:243 — the
-        //   MODELED-BUT-RETIRED knob (P7 scope-bound rationale in the
-        //   commit body; the model is NOT edited in-wave).
-        const EXPECTED_SET_ROWS: usize = 7;
-        assert_eq!(EXPECTED_SET_ROWS, 7, "the disposition table above");
+        // The alias-closed law over every in-crate tier (W9-BD face 1:
+        // EMPTY on the swept tree — camelCase, snake, and prose
+        // mentions all qualified or absent).
+        for (name, src) in [
+            ("cover.rs", prod(cover_src)),
+            ("mod.rs", prod(mod_src)),
+            ("lib.rs", lib_src.to_string()),
+        ] {
+            let stale = stale_cap_lines(&src);
+            assert!(
+                stale.is_empty(),
+                "{name}: stale-as-live cap mentions (alias-closed scan): {stale:?}"
+            );
+        }
+        // The committed EXPECTED-SET (out-of-crate alias-bearing
+        // survivors at the bughunt-9 S4 sweep; re-verified by the
+        // [GEN-SET] run committed in the sweeping commit's body —
+        // each row's disposition):
+        // 1. templates/controller.yaml:34 — render line into the
+        //    TOLERANT NodeClaimPoolConfig (serde(default): unknown key
+        //    ignored); PARSE-RETAINED.
+        // 2. templates/scheduler.yaml:44 — render line into the
+        //    RETAINED deny_unknown_fields SlaConfig field;
+        //    PARSE-RETAINED.
+        // 3. infra/helm values.yaml sla row — DEPRECATION-COMMENTED
+        //    (kept so the scheduler template's rendered key keeps
+        //    parsing).
+        // 4. nix/tests/default.nix — sets the retained field
+        //    (banner-protected fixture, untouched).
+        // 5. rio-scheduler sla/config.rs (+ config-schema.json
+        //    fixture) — the deprecated-ignored field + serde default +
+        //    HELM_RENDERED_SLA_KEYS row + test rows; PARSE-SURFACE.
+        // 6. docs/spec sla-sizing.typ :794/:1112-class — the
+        //    RETIREMENT-NARRATING rows (two-term law, burst pricing,
+        //    deprecated-row note; every mention qualifier-bearing
+        //    after the bughunt-9 S4 sweep).
+        // 7. docs/spec/models/nodeclaimLifecycle.qnt:243 — the
+        //    MODELED-BUT-RETIRED knob (S7's model plane; not edited
+        //    by S4).
+        // 8. docs/spec/models/calibration/controller-ffd.qnt:48/:99 —
+        //    stale per-tick-cap narration, UNROUTED at the S4 sweep:
+        //    FLAGGED in the S4 DONE for S7-or-WO-S6-12 RULED routing
+        //    (the qnt tier is S7's; never edited by S4, never
+        //    silently dropped).
+        // 9. nix/tests/helm/env-parity-allowlist.json:46/:102 — the
+        //    deliberate env-parity allowlist entries documenting the
+        //    parse-retention posture; PROSE-DISPOSITIONED.
+        const EXPECTED_SET_ROWS: usize = 9;
+        assert_eq!(EXPECTED_SET_ROWS, 9, "the disposition table above");
+    }
+
+    /// **R22 planted-red corpus, one per declared evasion axis**
+    /// (W9-BD face 2): each plant is the PRE-FIX tree's own
+    /// stale-as-live site (quoted), and [`stale_cap_lines`] must flag
+    /// it — a generator that re-loses an axis (alias form, tier
+    /// shape, prose phrase) goes red here. The qualifier green face
+    /// rides the same test: the retirement-narrating form passes.
+    #[test]
+    fn cap_census_planted_reds_fire_per_axis() {
+        // Axis 1 — alias-form, camelCase (the pre-fix cover.rs:6-:7
+        // header, quoted): the helm spelling stated as a live bound.
+        let camel_survivor = "//! FFD packs every fitting intent, capped at\n\
+             //! `sla.maxNodeClaimsPerCellPerTick` and the `sla.maxFleetCores`\n\
+             //! budget.\n";
+        assert!(
+            !stale_cap_lines(camel_survivor).is_empty(),
+            "camelCase survivor must be flagged (the merged_bug_001 \
+             snake_case-only blindness)"
+        );
+        // Axis 2 — tier, docs/spec-shaped (the pre-fix
+        // sla-sizing.typ:798 N-formula, quoted): a normative formula
+        // carrying the retired term.
+        let spec_survivor = "+ $N <- min(1 + ceil(...), \
+             \"sla.maxNodeClaimsPerCellPerTick\", 1 + floor(...))$ \
+             #rann[$>= 1$]\n";
+        assert!(
+            !stale_cap_lines(spec_survivor).is_empty(),
+            "docs/spec-shaped survivor must be flagged (the crate-scope \
+             blindness)"
+        );
+        // Axis 3 — tier, infra (a values.yaml-comment plant narrating
+        // the cap as live; the shape the chart row would take if its
+        // deprecation comment were dropped).
+        let infra_survivor = "    # throttles NodeClaim creation per cell per tick\n\
+             maxNodeClaimsPerCellPerTick: 8\n";
+        assert!(
+            !stale_cap_lines(infra_survivor).is_empty(),
+            "values.yaml-comment plant must be flagged (the infra-tier \
+             blindness)"
+        );
+        // Axis 4 — alias-form, prose phrase (the pre-fix
+        // sla-sizing.typ:799 rann / lib.rs HELP, quoted): rationale
+        // prose stating the cap as a live defense.
+        let prose_survivor =
+            "core-waste bounded; per-tick cap defends CreateFleet rate-limit cascade\n";
+        assert!(
+            !stale_cap_lines(prose_survivor).is_empty(),
+            "prose-phrase plant must be flagged (the spelling-tier \
+             blindness)"
+        );
+        // The qualifier green face: every retirement-narrating form
+        // passes — same-line and adjacent-line qualifiers both.
+        let qualified = "live_049 L1: the former flat `per_tick_cap` term is\n\
+             RETIRED — minting is bounded by demand and the fleet budget.\n";
+        assert!(
+            stale_cap_lines(qualified).is_empty(),
+            "retirement-narrating prose is allowed (same-line + \
+             adjacent-line qualifiers)"
+        );
+        let parse_only = "(the retired per-tick cap's helm row is parse-only)\n";
+        assert!(
+            stale_cap_lines(parse_only).is_empty(),
+            "parse-retention narration is allowed"
+        );
+    }
+
+    /// W9-BE — the uniform-rounding law pinned at the formula
+    /// (bug_127): [`uniform_claim`] ceils ALL THREE axes, so
+    /// `n·claim ≥ Σ` holds per-axis at EVERY candidate `n` — swept
+    /// over exact/non-exact divisions and avg-bound/max-bound cells
+    /// (the pre-fix mem/disk FLOOR violated the inequality exactly on
+    /// the avg-bound non-exact cells, e.g. Σm=91, max_m=30, n=2:
+    /// 2·max(⌊45.5⌋, 30)=90 < 91). The packed-coverage half of the
+    /// sizing doc's `Σ out ≥ Σ in` is the sim_packs pigeonhole, cited
+    /// there — this test pins the formula's own half.
+    #[test]
+    fn uniform_claim_ceils_every_axis_at_every_n() {
+        // (Σ, max) cells: exact + non-exact division, avg-bound
+        // (Σ/n > max) + max-bound (Σ/n ≤ max).
+        let sums_maxes = [
+            (90u64, 30u64), // exact at n=2,3; avg-bound at n=2
+            (91, 30),       // non-exact avg-bound (the floor red)
+            (91, 50),       // max-bound at n=2 (max term dominates)
+            (7, 7),         // single-element shape
+            (100, 1),       // many-small avg-bound
+        ];
+        for (sum, max) in sums_maxes {
+            for n in 1u32..=8 {
+                let claim = uniform_claim(n, (sum as u32, sum, sum), (max as u32, max, max));
+                assert!(
+                    u64::from(claim.0) * u64::from(n) >= sum,
+                    "cores: n={n} sum={sum} max={max} claim={claim:?}"
+                );
+                assert!(
+                    claim.1 * u64::from(n) >= sum,
+                    "mem: n={n} sum={sum} max={max} claim={claim:?}"
+                );
+                assert!(
+                    claim.2 * u64::from(n) >= sum,
+                    "disk: n={n} sum={sum} max={max} claim={claim:?}"
+                );
+                // The uniformity law itself: all three axes carry the
+                // SAME rounding (cores' extra .max(1) floor aside).
+                assert_eq!(
+                    u64::from(claim.0),
+                    claim.1.max(1),
+                    "cores and mem rounding identical at n={n} sum={sum} max={max}"
+                );
+                assert_eq!(claim.1, claim.2, "mem and disk identical by symmetry");
+            }
+        }
     }
 }

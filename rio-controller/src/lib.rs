@@ -443,7 +443,9 @@ pub fn describe_metrics() {
         "rio_controller_ffd_unplaced_cores",
         "Σ SpawnIntent.cores per `cell` left unplaced by the FFD simulation \
          at the last tick. cover_deficit's per-cell input. Non-zero with \
-         created_total flat = max_fleet_cores or per-tick cap throttling."
+         created_total flat = max_fleet_cores budget-brake throttling (the \
+         flat per-tick cap is retired — minting is bounded by demand and \
+         the fleet budget only)."
     );
     describe_gauge!(
         "rio_controller_ffd_window_remainder_cores",

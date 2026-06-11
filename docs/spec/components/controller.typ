@@ -1300,11 +1300,13 @@ the first sentinel-attributed freeze). The window's fairness mirrors
 permanently starve a sibling class's window share, preserving the
 budget brake's rotation property upstream of the mint.
 
-#r("ctrl.nodeclaim.anchor-bulk+5")[
+#r("ctrl.nodeclaim.anchor-bulk+6")[
   Unplaced intents per `(h,cap)` cell whose pod footprint fits the cell's
   per-class `(max_cores, max_mem)` and global `max_disk` cap are covered by `n`
-  uniform claims at `(max(⌈Σc*/n⌉, max_i c*), max(Σm/n, max_i m), max(Σd_eph/n,
-  max_i d_eph))`, where `n` iterates upward from the 3-axis lower bound
+  uniform claims at `(max(⌈Σc*/n⌉, max_i c*), max(⌈Σm/n⌉, max_i m),
+  max(⌈Σd_eph/n⌉, max_i d_eph))` (uniform `div_ceil` on all three axes — the
+  over-provision direction, ≤1 unit per bin), where `n` iterates upward from
+  the 3-axis lower bound
   `max(⌈Σc*/cell_cores⌉, ⌈Σm/cell_mem⌉, ⌈Σd_eph/maxDisk⌉)` until the production
   FFD's MostAllocated-cpu placement order packs every fitting intent; over-cap
   intents are dropped with `intent_dropped_total{reason=exceeds_cell_cap}` (`Σ/n`
@@ -1314,8 +1316,12 @@ budget brake's rotation property upstream of the mint.
   shipped over `GetHwClassConfig`, not `controller.toml`), so each claim's `(c,
   m)` chunk is hostable by some instance in `h`'s `requirements` set;
   `cover_deficit` skips the tick when the global ceiling is not yet loaded
-  (fail-closed, ≤300s self-heal). NodeClaim creation is capped at
-  `sla.maxNodeClaimsPerCellPerTick` and the `sla.maxFleetCores` budget; cells
+  (fail-closed, ≤300s self-heal). NodeClaim creation is bounded by the
+  two-term law `min(n_pack, ⌊budget/chunk⌋)` — demand (the FFD bin count over
+  real placeable-gated footprints) and the `sla.maxFleetCores` fleet-budget
+  brake, and by nothing else (the flat `sla.maxNodeClaimsPerCellPerTick`
+  per-tick cap is RETIRED, live_049 L1 — its helm row is parse-only;
+  #rref("ctrl.nodeclaim.mint-deficit-proportional")); cells
   are iterated round-robin from a rotating start so no cell starves under
   sustained pressure.
 ]

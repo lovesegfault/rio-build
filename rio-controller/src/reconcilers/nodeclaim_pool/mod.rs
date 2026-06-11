@@ -549,8 +549,9 @@ impl Default for NodeClaimPoolConfig {
             lease_name: None,
             lease_namespace: None,
             reference_hw_class: String::new(),
-            // Matches helm `sla.maxFleetCores` / `maxNodeClaimsPerCellPerTick`
-            // / `maxLeadTime` defaults.
+            // Matches helm `sla.maxFleetCores` / `maxLeadTime` defaults
+            // (the retired per-tick cap's helm row is parse-only —
+            // live_049 L1; this struct has no field for it).
             max_fleet_cores: 10_000,
             max_lead_time: 600.0,
             max_consolidation_time: None,
@@ -2381,13 +2382,31 @@ impl NodeClaimPoolReconciler {
     /// scheduler's ICE backoff ladder marks/clears each. `spawned` is
     /// empty: the `Pool` reconciler owns Job-creation acks (it creates
     /// the Jobs; this reconciler only gates which intents are eligible
-    /// via [`PlaceableGate`]). bug_082: ALL evidence planes of this
-    /// request are built FROM `pending_evidence` — the function takes
-    /// no evidence parameters, so a plane that bypasses the
-    /// commit-on-Ack buffer cannot exist at this RPC. An Ack failure
-    /// retains every plane for the next tick (the marks' producers are
-    /// consume-once; "next tick retries" is only true for evidence
-    /// that lives in the buffer).
+    /// via [`PlaceableGate`]).
+    ///
+    /// Retention census over the request's planes (merged_bug_016: the
+    /// previous prose here — "the function takes no evidence
+    /// parameters / an Ack failure retains every plane" — was BORN
+    /// false: the signature has carried wire planes since bug_082's
+    /// own commit. The law is per-plane retention CLASS, enumerated
+    /// from the request type and pinned by the total destructure at
+    /// the build site below — a new proto plane fails compilation
+    /// until classified here):
+    ///
+    /// - **BUFFERED (commit-on-Ack; consume-once producers; an
+    ///   Ack-Err retains them)**: `unfulfillable_cells`,
+    ///   `registered_cells`, `observed_instance_types` — all built
+    ///   FROM `pending_evidence`, no bypass exists for THESE planes
+    ///   (bug_082's surviving half).
+    /// - **LEVEL-TRIGGERED (rebuilt from scratch every tick; an
+    ///   Ack-Err drops them and the NEXT tick's rebuild is the
+    ///   retry)**: `binding_snapshot` (full per-tick bound-pod
+    ///   snapshot — present-and-empty is load-bearing) and `rejected`
+    ///   (this tick's placement verdicts, re-derived per tick by
+    ///   `cover_deficit`). Dropping these on Ack-Err loses nothing:
+    ///   they are derivations of state that still exists, not events.
+    /// - **EMPTY-BY-CONTRACT**: `spawned` (the Pool reconciler's),
+    ///   `bound_intents` (legacy field, never dual-written — R9).
     async fn report_unfulfillable(
         &mut self,
         bound_intents: Vec<rio_proto::types::BoundIntent>,
@@ -2476,6 +2495,22 @@ impl NodeClaimPoolReconciler {
             // `CoverResult::rejected` for the no-buffering derivation.
             rejected,
         };
+        // Retention-census pin (merged_bug_016): TOTAL destructure of
+        // the request — adding a proto plane stops compiling HERE
+        // until the doc table above classifies its retention
+        // (BUFFERED / LEVEL-TRIGGERED / EMPTY-BY-CONTRACT). Generator:
+        // rustc exhaustiveness over the prost struct's fields.
+        {
+            let rio_proto::types::AckSpawnedIntentsRequest {
+                binding_snapshot: _,
+                spawned: _,
+                unfulfillable_cells: _,
+                registered_cells: _,
+                observed_instance_types: _,
+                bound_intents: _,
+                rejected: _,
+            } = &req;
+        }
         // r[impl ctrl.nodeclaim.evidence-ack-latch+3]
         match admin_call(self.admin.clone().ack_spawned_intents(req)).await {
             Ok(_) => {

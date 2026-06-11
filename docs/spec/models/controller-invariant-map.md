@@ -64,7 +64,7 @@ per-read snapshot staleness inside a tick.
 | N5 | FFD simulate (placeable / unplaced) | `ffd.rs::simulate` |
 | N6 | Publish the placeable set (Registered-placed intent ids only) | `mod.rs::reconcile_once` (the `placeable_tx.send_replace` site) |
 | N7 | `health::reap_unhealthy` (incl. `dead_nodes`, capped) + reap-name removal from `inflight_created` + `health::detect_vanished` (ICE) | `health.rs`, `mod.rs::reconcile_once` |
-| N8 | `cover_deficit` (per-class/global budgets, per-tick cap, round-robin, masked cells skipped) | `mod.rs::cover_deficit`, `cover.rs::class_budget` |
+| N8 | `cover_deficit` (per-class/global budgets, the two-term budget brake `min(n_pack, ⌊budget/chunk⌋)` --- the flat per-tick cap is RETIRED (live_049 L1), round-robin, masked cells skipped) | `mod.rs::cover_deficit`, `cover.rs::class_budget` |
 | N9 | `report_unfulfillable` (`unfulfillable_cells`/`registered_cells`/`observed_instance_types`/`bound_intents`, deduped) | `mod.rs::report_unfulfillable` |
 | N10 | `consolidate::reap_idle` (idle-now ∧ not reserved ∧ not terminating ∧ past threshold) | `consolidate.rs::reap_idle` |
 | N11 | Sketch persist to PG (gated by the reload latch) | `sketch.rs`, `mod.rs::reconcile_once` |
@@ -142,7 +142,7 @@ do what the rule says it MUST; recorded in the contradiction table below.
 | `ctrl.pool.degraded-polarity` *(new)* | **COVERS** (the matrix as a whole) | Was a GAP: each mechanism rule carried its own half but nothing stated the per-consumer (not per-RPC) principle, the Pool-coverage fail-open, the unknown-cell drop, or the 5-⊥-tick mode switch as one degradation contract. Cross-references the per-mechanism rules rather than restating them. |
 | `ctrl.ephemeral.reap-excess-pending+3` | **COVERS** (its half) | Spawn fail-open / reap fail-closed for a failed poll was already normative here. |
 | `ctrl.ephemeral.reap-orphan-running+3` | **COVERS** (its half) | The 3-arm fail-closed gate was already normative. |
-| `ctrl.nodeclaim.anchor-bulk+5` | **COVERS** (cover's half) | `cover_deficit` skips the tick when the global ceiling is not yet loaded (fail-closed, ≤300s self-heal). |
+| `ctrl.nodeclaim.anchor-bulk+6` | **COVERS** (cover's half) | `cover_deficit` skips the tick when the global ceiling is not yet loaded (fail-closed, ≤300s self-heal). |
 | `ctrl.nodeclaim.consolidate-only-degraded` *(new)* | **COVERS** (the degraded mode) | Was a GAP — see F4. |
 | `ctrl.pool.hw-bench-needed+2` | **COVERS** (bench gate) | RPC failure reads as 0 distinct tenants: over-bench, never under-bench. Out of model (G-D family) but listed because it is part of the same per-consumer matrix. |
 
@@ -221,7 +221,7 @@ do what the rule says it MUST; recorded in the contradiction table below.
 | Rule | Verdict | Audit finding |
 |---|---|---|
 | `ctrl.nodeclaim.budget.per-class+2` *(amended)* | **COVERS** (per-class clamp + failed creates) | The pre-bump text stated the per-hwClass clamp and the global fallback; "failed creates consume no budget" existed only as the create-loop comment (the r40 budget fix). The +2 amendment states it; the existing impl/verify markers were re-pointed and a marker added at the Ok-arm-only accounting site. |
-| `ctrl.nodeclaim.anchor-bulk+5` | **COVERS** (per-tick cap, global budget, rotation, ceilings fail-closed) | Already normative. |
+| `ctrl.nodeclaim.anchor-bulk+6` | **COVERS** (two-term budget brake --- the flat per-tick cap is retired, global budget, rotation, ceilings fail-closed) | Already normative. **Re-bumped `+6` (bughunt-9 S4, merged_bug_001/bug_127):** the `+5` body still stated the RETIRED `sla.maxNodeClaimsPerCellPerTick` cap as a live bound (contradicting `ctrl.nodeclaim.mint-deficit-proportional` and the shipped two-term min) and floored the mem/disk per-claim axes; `+6` states the two-term law and the uniform `div_ceil` formula. |
 | `ctrl.nodeclaim.ffd-exclude-terminating` | **COVERS** (terminating still counted) | Already normative: terminating claims are excluded from placement but still consume fleet-core budget. |
 
 ## Contradiction records
@@ -319,7 +319,7 @@ Grouped, with the reason they stay outside the Stage-B models:
   `ctrl.nodeclaim.shim-nodepool`, `ctrl.crd.*`, `ctrl.event.spec-degrade` —
   k8s object shape, not protocol state.
 - **FFD/sizing internals**: `ctrl.nodeclaim.ffd-sim`,
-  `ctrl.nodeclaim.anchor-bulk+5` (its sizing half),
+  `ctrl.nodeclaim.anchor-bulk+6` (its sizing half),
   `ctrl.nodeclaim.lead-time-ddsketch`, `ctrl.nodeclaim.consolidate-na+6`
   (its formula half) — abstracted to opaque outcomes / bucketed
   thresholds; their budget- and polarity-relevant clauses are mapped
