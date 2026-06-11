@@ -236,7 +236,7 @@ pub struct StoreServiceImpl {
     /// NOT shared with GetPath's chunk cache — that's moka-bounded separately
     /// (chunk_cache above). This bounds ONLY the per-request accumulation
     /// Vec, which is the OOM vector: 10 × 4 GiB = 40 GiB RSS.
-    // r[impl store.put.nar-bytes-budget+5]
+    // r[impl store.put.nar-bytes-budget+6]
     nar_bytes_budget: Arc<tokio::sync::Semaphore>,
     /// Typed envelope knobs for the ingest plane's budget waits and
     /// holds ([`NarIngestEnvelopeCfg`]) — wait grace at the

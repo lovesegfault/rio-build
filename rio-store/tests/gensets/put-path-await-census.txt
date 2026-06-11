@@ -10,11 +10,13 @@
 rio-store/src/grpc/put_path/common.rs	.await
 rio-store/src/grpc/put_path/common.rs	.await
 rio-store/src/grpc/put_path/common.rs	.await
+rio-store/src/grpc/put_path/common.rs	.await
 rio-store/src/grpc/put_path/common.rs	.await?
 rio-store/src/grpc/put_path/common.rs	.await?;
 rio-store/src/grpc/put_path/common.rs	.await?;
 rio-store/src/grpc/put_path/common.rs	None => read.await,
 rio-store/src/grpc/put_path/common.rs	Some(h) => h.bounded("PutPath ingest", read).await?,
+rio-store/src/grpc/put_path/common.rs	let h = self.reserve_declared(d, "PutPath").await?;
 rio-store/src/grpc/put_path/common.rs	let persisted = match tokio::time::timeout(envelope.remaining(), tail).await {
 rio-store/src/grpc/put_path/common.rs	match tokio::time::timeout(self.envelope.remaining(), fut).await {
 rio-store/src/grpc/put_path/common.rs	match tokio::time::timeout(self.nar_ingest_envelope.budget_wait_grace, acquire).await {
@@ -30,7 +32,8 @@ rio-store/src/grpc/put_path/mod.rs	None => claiming.await?,
 rio-store/src/grpc/put_path/mod.rs	Some(h) => h.bounded("PutPath ca-claim", claiming).await??,
 rio-store/src/grpc/put_path/mod.rs	drain_stream(&mut stream).await;
 rio-store/src/grpc/put_path/mod.rs	drain_stream(&mut stream).await;
-rio-store/src/grpc/put_path/mod.rs	let raw_info = common::read_first_metadata(&mut stream).await?;
+rio-store/src/grpc/put_path/mod.rs	drain_stream(&mut stream).await;
+rio-store/src/grpc/put_path/mod.rs	let (raw_info, declared) = common::read_first_metadata(&mut stream).await?;
 rio-store/src/grpc/put_path/mod.rs	metadata::check_manifest_complete(&self.pool, store_path_hash).await
 rio-store/src/grpc/put_path/mod.rs	self.abort_upload(&store_path_hash, c).await;
 rio-store/src/grpc/put_path/mod.rs	while let Ok(Some(_)) = stream.message().await {

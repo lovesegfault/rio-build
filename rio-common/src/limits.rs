@@ -193,7 +193,7 @@ mod tests {
     /// and is identity for chunks at/above the floor. This is the unit
     /// the per-handler MAX_NAR_SIZE cap MUST be tracked in — see
     /// `r[store.put.nar-bytes-budget]`.
-    // r[verify store.put.nar-bytes-budget+5]
+    // r[verify store.put.nar-bytes-budget+6]
     #[test]
     fn nar_chunk_charge_floors_tiny_chunks() {
         assert_eq!(nar_chunk_charge(0), MIN_NAR_CHUNK_CHARGE as u64);

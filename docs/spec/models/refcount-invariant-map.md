@@ -200,7 +200,7 @@ plus the prose corrections of P1–P4.
   as calibration family G4b. The chunk-level audit leans on it only through
   "manifest exists/was deleted".
 - `store.put.wal-manifest`, `store.put.idempotent`,
-  `store.put.placeholder-refs`, `store.put.nar-bytes-budget+5`,
+  `store.put.placeholder-refs`, `store.put.nar-bytes-budget+6`,
   `store.atomic.multi-output` — write-path rules whose chunk-relevant content
   is either the placeholder lifecycle (covered under S4/S5/L3 above) or an
   incidental refcount mention (`store.atomic.multi-output`'s orphaned-blob

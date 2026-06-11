@@ -238,11 +238,13 @@ pub fn chunk_nar_for_put(
     let metadata = PutPathRequest {
         msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
             info: Some(raw),
-            // Trailer mode in THIS commit (read-side-first wire
-            // evolution): the store's reservation-mode reader lands
-            // before any sender declares. The buffered copy path
-            // adopts declared mode in the follow-up commit.
-            declared_nar_size: 0,
+            // DECLARED mode (N1): this sender HAS the whole NAR
+            // buffered — the size is knowable, so it declares and the
+            // store reserves single-shot pre-stream instead of
+            // charging chunk-by-chunk while holding. The trailer
+            // below still carries the same size (mandatory; the store
+            // enforces trailer == declaration).
+            declared_nar_size: nar.len() as u64,
         })),
     };
 

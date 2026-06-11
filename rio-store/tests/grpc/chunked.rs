@@ -966,7 +966,7 @@ async fn send_batch_output(
 /// alignment is verified at `rio_common::limits::nar_chunk_charge` and by
 /// the `total_charged` formula in `drain_batch_stream`; this test
 /// continues to cover the >256-byte chunk case.
-// r[verify store.put.nar-bytes-budget+5]
+// r[verify store.put.nar-bytes-budget+6]
 #[tokio::test]
 async fn batch_no_self_deadlock_under_budget() -> TestResult {
     let s =
@@ -1225,7 +1225,7 @@ mod bw8s1_budget {
         }
     }
 
-    // r[verify store.put.nar-bytes-budget+5]
+    // r[verify store.put.nar-bytes-budget+6]
     // W8-A (R16 statement): the JOINT mixed population the R7 census
     // named and W-3 withheld — a real PutPath holder and a real parked
     // whole-NAR substitution head on ONE pool reach completion /

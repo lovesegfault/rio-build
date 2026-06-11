@@ -605,7 +605,7 @@ substitute leg's zero-holding budget park stays untimed (`BudgetParked`,
 takeover-exempt) — parking is backpressure, never a strike, and the park's
 boundedness is the #rref("store.put.nar-bytes-budget") theorem, not a clock.
 
-#r("store.put.nar-bytes-budget+5")[
+#r("store.put.nar-bytes-budget+6")[
   A process-global `tokio::sync::Semaphore` (default `8 × MAX_NAR_SIZE` = 32
   GiB; configurable via `nar_buffer_budget_bytes`, floored by `validate()` at
   `MAX_NAR_SIZE` so every deployed budget admits at least one whole-NAR
@@ -613,7 +613,7 @@ boundedness is the #rref("store.put.nar-bytes-budget") theorem, not a clock.
   upstream-substitution NAR ingests (one shared `Arc<Semaphore>`). Two charge
   regimes, one semaphore unit, ONE hold/wait discipline
   (#rref("store.put.nar-hold-envelope"): waiters park free, holders expire).
-  *PutPath/PutPathBatch (per-chunk):* each handler
+  *Trailer-mode PutPath/PutPathBatch (per-chunk):* each handler
   `acquire_many(nar_chunk_charge(chunk.len()))` BEFORE extending its
   `nar_data: Vec<u8>`, with the acquire wait-grace-bounded (grant or typed
   `ResourceExhausted` shed — uniform over all chunk acquires, first
@@ -673,14 +673,17 @@ boundedness is the #rref("store.put.nar-bytes-budget") theorem, not a clock.
   a deadline-expired holder's release lag (the `spawn_blocking` digest is
   non-cancellable; its completion still drops the moved reservation) ---
   slack on top of the enforced deadline, never a premise. *Unification note
-  (corrected):* the prior restoration step assumed the declared `NarSize` is
-  available in PutPath request metadata --- FALSE: the wire contract
-  mandates metadata `nar_hash`/`nar_size` empty/zero (trailer-only mode; the
-  builder is a single-pass tee that cannot know the size up front). Unifying
-  PutPath onto the reservation discipline remains a recorded successor
-  hypothesis REQUIRING a wire-contract change (opt-in declared-size metadata
-  plus gateway/builder client changes) --- not a residual on the theorem,
-  which holds without it. *Priced adversarial-availability bound (NOT a
+  (LANDED --- the recorded successor hypothesis discharged):* the wire now
+  carries opt-in declared-size metadata, and a DECLARED `PutPath`
+  (#rref("store.put.declared-reserve")) ingests in reservation mode --- the
+  whole charge in ONE pre-stream acquisition, no per-chunk acquire site, the
+  substitute leg's discipline applied to ingest. The per-chunk regime above
+  remains the TRAILER-mode law (the builder's single-pass tee cannot declare
+  --- the capability boundary, not a version bridge); the no-deadlock
+  theorem gains no premise: the declared acquisition is a zero-holding park
+  (the waiter holds no permits and no buffered bytes), the same class as the
+  substitute reservation already in the census. *Priced
+  adversarial-availability bound (NOT a
   safety proviso):* a hostile tenant pins at most `TENANT_RESERVATION_CAP`
   (¼ default pool) per tenant, each leg for at most one hold deadline
   (`5 × stall_window + declared / 256 KiB/s` ≈ 4.6 h worst case), and an
@@ -690,6 +693,36 @@ boundedness is the #rref("store.put.nar-bytes-budget") theorem, not a clock.
   substitution parking) within these bounds instead of OOMing the process.
   NOT shared with GetPath's chunk cache (moka-bounded separately).
 ]
+
+#r("store.put.declared-reserve")[
+  A `PutPath` whose metadata carries a nonzero `declared_nar_size` MUST be
+  ingested in RESERVATION MODE: the handler charges
+  `declared.max(MIN_NAR_CHUNK_CHARGE)` in ONE `acquire_many` BEFORE reading
+  any chunk --- a zero-holding park (the waiter holds no permits and no
+  buffered bytes; its placeholder claim carries no budget) --- arms the ONE
+  hold envelope on the declared-byte basis at the grant, and never acquires
+  again: the trailer regime's per-chunk acquire-while-holding is
+  structurally unreachable on this path. `declared >= MAX_NAR_SIZE` refuses
+  before the claim (which also makes the charge `u32`-expressible). The
+  declaration is a BINDING BOUND: a chunk that would push the buffer past it
+  refuses `InvalidArgument` AT the crossing chunk (buffered bytes never
+  exceed the reservation); the still-MANDATORY trailer's `nar_size` MUST
+  equal the declaration (refused at commit otherwise); a short stream dies
+  on that equality or on `verify_nar`'s size check --- both delivery axes
+  typed. `declared_nar_size = 0` IS trailer mode, byte-for-byte.
+  `PutPathBatch` REJECTS a nonzero value fail-closed (its senders are
+  trailer-capability). Opt-in is by sender CAPABILITY, never by version:
+  buffered/size-known senders (the gateway copy and streaming paths)
+  declare; the builder's single-pass tee cannot know the size up front and
+  stays trailer-mode by design.
+]
+This is the root-cause kill of the ingest plane's hold-and-wait (N1): the
+wave-8 envelope family bounded the hold's TIME; the declared mode removes
+the SHAPE --- park free, then hold, exactly the substitute leg's
+single-shot reservation discipline applied to upload. The capability
+boundary is the round-8 refutation carried verbatim: a tee that streams
+while hashing cannot declare, so the field is opt-in rather than a
+release-skew bridge (the `--wipe` posture).
 
 #r("store.put.placeholder-claim+2")[
   `insert_manifest_uploading` generates a fresh `claim_id UUID` per placeholder

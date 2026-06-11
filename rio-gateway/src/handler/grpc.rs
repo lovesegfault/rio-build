@@ -349,7 +349,12 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
 
     let (tx, rx) = tokio::sync::mpsc::channel::<types::PutPathRequest>(CHANNEL_BUF);
 
-    // Metadata first. Zero nar_hash/nar_size → trailer mode.
+    // Metadata first. Zero nar_hash/nar_size in the PathInfo (the
+    // trailer carries the authoritative pair), but DECLARED size set
+    // (N1): this sender reads exactly `nar_size` bytes from the
+    // reader — the size is knowable up front, so the store reserves
+    // single-shot pre-stream instead of charging chunk-by-chunk
+    // while holding.
     let mut raw: types::PathInfo = info.into();
     raw.nar_hash = Vec::new();
     raw.nar_size = 0;
@@ -357,9 +362,7 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
         msg: Some(types::put_path_request::Msg::Metadata(
             types::PutPathMetadata {
                 info: Some(raw),
-                // Trailer mode this commit (read-side-first): the
-                // reader lands before this size-known stream declares.
-                declared_nar_size: 0,
+                declared_nar_size: nar_size,
             },
         )),
     })

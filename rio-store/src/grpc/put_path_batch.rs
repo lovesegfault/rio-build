@@ -288,7 +288,7 @@ impl StoreServiceImpl {
         // MAX_BATCH_OUTPUTS × MAX_NAR_SIZE = 64 GiB could be demanded
         // against a 32 GiB budget — `acquire_many` would block on permits
         // THIS task holds (self-deadlock).
-        // r[impl store.put.nar-bytes-budget+5]
+        // r[impl store.put.nar-bytes-budget+6]
         let mut total_charged: u64 = 0;
 
         loop {
@@ -322,6 +322,19 @@ impl StoreServiceImpl {
                     if accum.info.is_some() {
                         return Err(Status::invalid_argument(format!(
                             "{ctx}: duplicate metadata"
+                        )));
+                    }
+                    // r[impl store.put.declared-reserve]
+                    // Declared mode is single-PutPath only — the batch
+                    // plane's senders are trailer-capability today
+                    // (the builder's multi-output tee). FAIL-CLOSED on
+                    // a set value: silently ignoring it would buy the
+                    // sender none of the reservation semantics it
+                    // asked for while looking accepted on the wire.
+                    if meta.declared_nar_size != 0 {
+                        return Err(Status::invalid_argument(format!(
+                            "{ctx}: declared_nar_size is not supported on PutPathBatch \
+                             (single PutPath only); send trailer-mode (0)"
                         )));
                     }
                     let raw_info = meta.info.ok_or_else(|| {

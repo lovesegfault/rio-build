@@ -183,6 +183,33 @@ impl<'a> NarIngestHold<'a> {
         }
     }
 
+    // r[impl store.put.declared-reserve]
+    /// The DECLARED-mode hold (N1): the whole charge was granted in
+    /// ONE pre-stream acquisition, so the envelope arms on the
+    /// `declared`-byte basis (the substitute leg's
+    /// [`crate::substitute::NarHoldEnvelope::for_declared`] form) —
+    /// tighter than the ingest-cap basis whenever declared < cap,
+    /// and exact from the first byte. Everything else COMPOSES with
+    /// the trailer-mode law unchanged: same private permits, same
+    /// [`Self::bounded`] combinator, same monotone
+    /// [`Self::tighten_for_tail`]; [`Self::push`] is simply never
+    /// called (there are no later grants to join).
+    pub(in crate::grpc) fn arm_declared(
+        whole_permit: tokio::sync::SemaphorePermit<'a>,
+        declared: u64,
+        cfg: NarIngestEnvelopeCfg,
+    ) -> Self {
+        Self {
+            permits: vec![whole_permit],
+            envelope: crate::substitute::NarHoldEnvelope::for_declared(
+                declared,
+                cfg.hold_stall_window,
+                cfg.hold_floor_rate,
+            ),
+            cfg,
+        }
+    }
+
     /// Add a later grant to the hold. Deliberately does NOT touch the
     /// envelope: one clock, armed at the first grant.
     pub(in crate::grpc) fn push(&mut self, permit: tokio::sync::SemaphorePermit<'a>) {
@@ -423,18 +450,24 @@ pub(in crate::grpc) fn apply_trailer(
 }
 
 /// Read the first PutPath message; must be `Metadata` carrying a
-/// `PathInfo`. Shared step-1 of the write-ahead flow.
+/// `PathInfo`. Shared step-1 of the write-ahead flow. The second
+/// element is the N1 `declared_nar_size` opt-in, normalized to
+/// `None` for 0 (the trailer-mode wire state — 0 is never a valid
+/// NAR size, so zero-as-absent is unambiguous).
 pub(in crate::grpc) async fn read_first_metadata(
     stream: &mut Streaming<PutPathRequest>,
-) -> Result<rio_proto::types::PathInfo, Status> {
+) -> Result<(rio_proto::types::PathInfo, Option<u64>), Status> {
     let first = stream
         .message()
         .await?
         .ok_or_else(|| Status::invalid_argument("empty PutPath stream"))?;
     match first.msg {
-        Some(put_path_request::Msg::Metadata(meta)) => meta
-            .info
-            .ok_or_else(|| Status::invalid_argument("PutPathMetadata missing PathInfo")),
+        Some(put_path_request::Msg::Metadata(meta)) => {
+            let declared = (meta.declared_nar_size > 0).then_some(meta.declared_nar_size);
+            meta.info
+                .ok_or_else(|| Status::invalid_argument("PutPathMetadata missing PathInfo"))
+                .map(|info| (info, declared))
+        }
         Some(put_path_request::Msg::NarChunk(_)) => Err(Status::invalid_argument(
             "first PutPath message must be metadata, not nar_chunk",
         )),
@@ -600,7 +633,7 @@ impl StoreServiceImpl {
         })
     }
 
-    // r[impl store.put.nar-bytes-budget+5]
+    // r[impl store.put.nar-bytes-budget+6]
     /// Append a NAR chunk under both bounds: per-output [`MAX_NAR_SIZE`]
     /// and the GLOBAL `nar_bytes_budget` semaphore. Feeds the chunk
     /// into the caller's incremental `hasher` so [`verify_nar`] never
@@ -671,6 +704,46 @@ impl StoreServiceImpl {
         Ok(permit)
     }
 
+    // r[impl store.put.declared-reserve]
+    /// N1 declared-mode reservation: the WHOLE charge in ONE
+    /// pre-stream acquisition — the ingest twin of the substitute
+    /// leg's `NarBudgetReservation::reserve` (park free, THEN hold).
+    /// The acquiring task holds NOTHING while parked (zero permits,
+    /// zero claim — the claim is taken before this call but carries
+    /// no budget), so the park is the lawful unbounded zero-holding
+    /// wait ("waiters park free; holders expire" — boundedness is the
+    /// FIFO induction over the envelope-bounded holders, not a
+    /// clock); the client's own RPC deadline bounds its patience,
+    /// exactly like the trailer path's pre-first-chunk stream read.
+    ///
+    /// `declared >= MAX_NAR_SIZE` refuses up front (which also makes
+    /// the u32 charge cast lossless — the substitute reserve's
+    /// defense-in-depth, verbatim). The floor mirrors the per-chunk
+    /// charge floor so a 1-byte declared upload charges what its
+    /// trailer-mode twin would.
+    pub(in crate::grpc) async fn reserve_declared(
+        &self,
+        declared: u64,
+        ctx_label: &str,
+    ) -> Result<NarIngestHold<'_>, Status> {
+        if declared >= MAX_NAR_SIZE {
+            return Err(Status::invalid_argument(format!(
+                "{ctx_label}: declared_nar_size {declared} exceeds size bound {MAX_NAR_SIZE}"
+            )));
+        }
+        let charge = declared.max(u64::from(rio_common::limits::MIN_NAR_CHUNK_CHARGE)) as u32;
+        let permit = self
+            .nar_bytes_budget
+            .acquire_many(charge)
+            .await
+            .map_err(|_| Status::resource_exhausted("NAR buffer budget closed"))?;
+        Ok(NarIngestHold::arm_declared(
+            permit,
+            declared,
+            self.nar_ingest_envelope,
+        ))
+    }
+
     /// Thin wrapper over [`crate::ingest::spawn_placeholder_guard`]
     /// supplying `self.pool`. See that fn's doc for the drop-cleanup +
     /// heartbeat invariants. `progress: None` — PutPath claims keep
@@ -698,6 +771,7 @@ impl StoreServiceImpl {
         stream: &mut Streaming<PutPathRequest>,
         info: &mut ValidatedPathInfo,
         hmac_claims: Option<&rio_auth::hmac::AssignmentClaims>,
+        declared: Option<u64>,
     ) -> Result<(Vec<u8>, Option<NarIngestHold<'a>>), Status> {
         let mut nar_data = Vec::new();
         let mut hasher = Sha256::new();
@@ -717,13 +791,31 @@ impl StoreServiceImpl {
         // an ingest holder. Expiry aborts typed (`ResourceExhausted`);
         // placeholder cleanup stays the caller's `abort_upload`
         // contract.
-        let mut hold: Option<NarIngestHold<'a>> = None;
+        // r[impl store.put.declared-reserve]
+        // N1 fork: a DECLARED sender gets reservation-mode ingest —
+        // the whole charge granted single-shot BEFORE the first chunk
+        // (park free, then hold), so the per-chunk acquire-while-
+        // holding below is structurally unreachable on this path
+        // (zero hold-and-wait). The hold is Some from here on: every
+        // stream read rides the declared-basis envelope via the
+        // existing `bounded` arm. Trailer senders (declared None)
+        // keep the incremental path byte-for-byte.
+        let mut hold: Option<NarIngestHold<'a>> = match declared {
+            Some(d) => {
+                let h = self.reserve_declared(d, "PutPath").await?;
+                // Capacity is budget-backed: the permits for `d`
+                // bytes are already held.
+                nar_data.reserve_exact(d as usize);
+                Some(h)
+            }
+            None => None,
+        };
         // Cumulative permits charged (NOT raw bytes — `accumulate_chunk`
         // floors each chunk at MIN_NAR_CHUNK_CHARGE). Checked BEFORE
         // `accumulate_chunk` so a tiny-chunk stream that would exhaust
         // the global budget hits this cap instead of self-deadlocking on
         // `acquire_many` for permits this task already holds.
-        // r[impl store.put.nar-bytes-budget+5]
+        // r[impl store.put.nar-bytes-budget+6]
         let mut charged: u64 = 0;
         loop {
             let read = stream.message();
@@ -747,6 +839,30 @@ impl StoreServiceImpl {
                         return Err(Status::invalid_argument(
                             "PutPath: nar_chunk after trailer (trailer must be last)",
                         ));
+                    }
+                    if let Some(d) = declared {
+                        // r[impl store.put.declared-reserve]
+                        // Reservation-mode accumulate: NO acquire (the
+                        // whole charge is held) — only the declared
+                        // BOUND, enforced at the crossing chunk
+                        // (over-delivery refuses typed AT the bound,
+                        // never buffers past the reservation).
+                        if chunk.is_empty() {
+                            return Err(Status::invalid_argument(
+                                "PutPath: empty NarChunk (protocol violation)",
+                            ));
+                        }
+                        let new_len = (nar_data.len() as u64).saturating_add(chunk.len() as u64);
+                        if new_len > d {
+                            return Err(Status::invalid_argument(format!(
+                                "PutPath: stream exceeds its declared_nar_size {d} \
+                                 (received {new_len}+ bytes) — the declaration is a \
+                                 binding bound"
+                            )));
+                        }
+                        nar_data.extend_from_slice(&chunk);
+                        hasher.update(&chunk);
+                        continue;
                     }
                     charged = charged.saturating_add(nar_chunk_charge(chunk.len()));
                     if charged >= MAX_NAR_SIZE {
@@ -788,6 +904,23 @@ impl StoreServiceImpl {
                  (PutPathTrailer is required as the last message)",
             )
         })?;
+        // r[impl store.put.declared-reserve]
+        // The declaration is BINDING: the (still mandatory) trailer
+        // must equal it. Under-delivery refuses here either way — a
+        // coherent-but-short sender (trailer == actual < declared)
+        // dies on this equality; a lying-short sender (trailer ==
+        // declared > actual) dies on verify_nar's size check below.
+        // Both axes typed at commit; over-delivery already refused at
+        // the bound mid-stream.
+        if let Some(d) = declared
+            && t.nar_size != d
+        {
+            return Err(Status::invalid_argument(format!(
+                "PutPath: trailer nar_size {} contradicts declared_nar_size {d} — \
+                 the declaration is a binding bound",
+                t.nar_size
+            )));
+        }
         apply_trailer(info, &t, "PutPath")?;
         verify_nar(
             hasher.finalize().into(),

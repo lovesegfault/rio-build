@@ -159,7 +159,23 @@ impl StoreServiceImpl {
         let auth = self.authorize(&request)?;
         let mut stream = request.into_inner();
 
-        let raw_info = common::read_first_metadata(&mut stream).await?;
+        let (raw_info, declared) = common::read_first_metadata(&mut stream).await?;
+        // r[impl store.put.declared-reserve]
+        // N1 declared-mode gate: bound the declaration BEFORE the
+        // claim (a hostile declaration must not cost a placeholder
+        // round-trip). The reservation itself happens inside
+        // `ingest_nar_stream` — after the IA claim, before the first
+        // chunk — so the park holds no budget and the claim/park
+        // ordering matches the substitute leg (claim, then reserve).
+        if let Some(d) = declared
+            && d >= rio_common::limits::MAX_NAR_SIZE
+        {
+            drain_stream(&mut stream).await;
+            return Err(Status::invalid_argument(format!(
+                "PutPath: declared_nar_size {d} exceeds size bound {}",
+                rio_common::limits::MAX_NAR_SIZE
+            )));
+        }
         let mut info = validate_put_metadata(raw_info, auth.builder_claims(), "PutPath")?;
         // Server-derived in validate_put_metadata (step 7) — never the
         // wire value. r[sec.boundary.grpc-hmac].
@@ -206,7 +222,7 @@ impl StoreServiceImpl {
         };
 
         let (nar_data, hold) = match self
-            .ingest_nar_stream(&mut stream, &mut info, auth.builder_claims())
+            .ingest_nar_stream(&mut stream, &mut info, auth.builder_claims(), declared)
             .await
         {
             Ok(x) => x,

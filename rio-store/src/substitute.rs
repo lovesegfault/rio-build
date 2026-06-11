@@ -616,7 +616,7 @@ pub struct Substituter {
     /// path-only key would let tenant B's miss poison tenant A's
     /// lookup for the full TTL.
     probe_cache: Cache<(Uuid, String), bool>,
-    // r[impl store.put.nar-bytes-budget+5]
+    // r[impl store.put.nar-bytes-budget+6]
     /// Global budget for in-flight NAR bytes — the SAME semaphore
     /// PutPath acquires from (wired in main.rs via
     /// [`with_nar_bytes_budget`](Self::with_nar_bytes_budget)). Without
@@ -810,7 +810,7 @@ pub(crate) const TENANT_RESERVATION_CAP: u64 = 2 * MAX_NAR_SIZE;
 const _: () = assert!(TENANT_RESERVATION_CAP >= MAX_NAR_SIZE);
 const _: () = assert!(TENANT_RESERVATION_CAP as usize <= DEFAULT_SUBSTITUTE_NAR_BUDGET);
 
-// r[impl store.put.nar-bytes-budget+5]
+// r[impl store.put.nar-bytes-budget+6]
 /// Tenant-keyed outstanding reservation charge — the cost-axis
 /// accounting behind [`TENANT_RESERVATION_CAP`]. Consulted inside
 /// [`NarBudgetReservation::reserve`] BEFORE the semaphore park (a
@@ -985,7 +985,7 @@ impl NarHoldEnvelope {
     }
 }
 
-// r[impl store.put.nar-bytes-budget+5]
+// r[impl store.put.nar-bytes-budget+6]
 /// One substitute leg's WHOLE-NAR budget reservation — the single-shot
 /// charge that replaced the incremental per-read acquire (live_047/R-C
 /// WO-R7-1). THE invariants it carries:
@@ -1091,7 +1091,7 @@ impl NarBudgetReservation {
     }
 }
 
-// r[impl store.put.nar-bytes-budget+5]
+// r[impl store.put.nar-bytes-budget+6]
 // r[impl store.put.nar-hold-envelope+2]
 /// The substitute leg's read loop, budget-free by construction (§5.1
 /// laws-as-types census): its parameter set is the stream, the caps,
@@ -1429,7 +1429,7 @@ impl Substituter {
     ///   gRPC caller (the unary `QueryPathInfo`/`GetPath` plane keeps
     ///   its fast-`Raced` → `NotFound` mapping untouched);
     /// - **register, THEN re-check** — the broadcast receiver
-    ///   subscribes BEFORE [`placeholder_blocked`]'s row read, so a
+    ///   subscribes BEFORE `placeholder_blocked`'s row read, so a
     ///   release landing between the raced attempt and the park is
     ///   seen either by the re-check (loop immediately) or by the
     ///   already-registered receiver (NOTIFY at COMMIT) — the
@@ -2130,10 +2130,10 @@ impl Substituter {
         let expected_hash = parse_nar_hash(&ni.nar_hash)?;
 
         // r[impl store.substitute.untrusted-upstream+3]
-        // r[impl store.put.nar-bytes-budget+5]
+        // r[impl store.put.nar-bytes-budget+6]
         // Declared-size gate. `trusted_keys` is also tenant-supplied so
         // a verified sig is NOT a trust boundary; gate before download.
-        // `>=` (PutPath parity, store.put.nar-bytes-budget+5): an
+        // `>=` (PutPath parity, store.put.nar-bytes-budget+6): an
         // exactly-MAX_NAR_SIZE NAR was never cluster-uploadable (PutPath
         // rejects `>=`), and the rejection makes the whole-NAR budget
         // reservation u32-expressible (max reservation 2^32 − 1).
@@ -2305,7 +2305,7 @@ impl Substituter {
         // explicit abort (the drop-guard is for the implicit drop path).
         let persist = async {
             // — Step 4: whole-NAR budget reservation, then GET —
-            // r[impl store.put.nar-bytes-budget+5]
+            // r[impl store.put.nar-bytes-budget+6]
             // Single-shot reservation AFTER the claim arms (so
             // AlreadyComplete/Raced cost zero budget) and BEFORE the
             // NAR GET (so a budget park never rides an open upstream
@@ -2393,7 +2393,7 @@ impl Substituter {
                 // worker). `Bytes` is cheap-clone; move it in and back
                 // out alongside the digest.
                 //
-                // r[impl store.put.nar-bytes-budget+5]
+                // r[impl store.put.nar-bytes-budget+6]
                 // §3.2 step 4 (live_047/R-C): the RESERVATION rides
                 // the bytes through the detach. tokio never cancels
                 // blocking tasks, so dropping this future at the
@@ -7245,7 +7245,7 @@ mod tests {
         let _ = cluster_seed;
     }
 
-    // r[verify store.put.nar-bytes-budget+5]
+    // r[verify store.put.nar-bytes-budget+6]
     /// bug_070, re-aimed at the live_047/R-C reservation: the
     /// substitute leg MUST draw its whole-NAR reservation from
     /// `nar_bytes_budget` before the GET and credit it back after
@@ -7528,7 +7528,7 @@ mod tests {
         );
     }
 
-    // r[verify store.put.nar-bytes-budget+5]
+    // r[verify store.put.nar-bytes-budget+6]
     /// [GEN-SET] Budget acquire-site census — REBUILT crate-wide (bw8
     /// WO-S1-1; the RC-1 kill on the no-deadlock theorem's own
     /// quantifier domain). GENERATOR: this fn's scan over
@@ -7579,9 +7579,13 @@ mod tests {
             (
                 "grpc/put_path/common.rs",
                 "acquire_many",
-                1,
-                "NAR budget — THE per-chunk chokepoint (accumulate_chunk; \
-                 BUDGET_WAIT_GRACE-timed, grant-or-typed-shed)",
+                2,
+                "NAR budget — the TWO ingest regimes' chokepoints: \
+                 accumulate_chunk (trailer mode, per-chunk, \
+                 BUDGET_WAIT_GRACE-timed grant-or-typed-shed) + \
+                 reserve_declared (declared mode, whole-charge single-shot \
+                 pre-stream; zero-holding park, the substitute reserve's \
+                 posture — store.put.declared-reserve)",
             ),
             (
                 "admission.rs",
@@ -7740,7 +7744,7 @@ mod tests {
         }
     }
 
-    // r[verify store.put.nar-bytes-budget+5]
+    // r[verify store.put.nar-bytes-budget+6]
     /// W-3 leg (a), live_047/R-C: two concurrent substitute legs whose
     /// sizes sum past the budget MUST both complete — the single-shot
     /// whole-NAR reservation means a budget waiter holds ZERO permits,
@@ -7871,7 +7875,7 @@ mod tests {
         );
     }
 
-    // r[verify store.put.nar-bytes-budget+5]
+    // r[verify store.put.nar-bytes-budget+6]
     /// W-3 leg (b) — THE K=1 charge-amplification closure
     /// (live_047/R-C §1.3 F1, adversarial regime): ONE dribbling
     /// stream (1-byte reads, raw bytes ≪ budget) MUST complete against
@@ -7942,7 +7946,7 @@ mod tests {
         );
     }
 
-    // r[verify store.put.nar-bytes-budget+5]
+    // r[verify store.put.nar-bytes-budget+6]
     /// W-6a reservation-residency: cancelling the substitute leg at
     /// the hash-verify detach point MUST NOT credit the budget back
     /// while the DETACHED blocking task (tokio never cancels blocking
@@ -8421,7 +8425,7 @@ mod tests {
         assert_eq!(preserved, 1, "re-claim preserves the stall evidence");
     }
 
-    // r[verify store.put.nar-bytes-budget+5]
+    // r[verify store.put.nar-bytes-budget+6]
     // W8-E (R16 statement; GREEN-SIDE PIN, disclosed — it certifies a
     // premise the pre-fix tree also satisfies): tokio fair-FIFO over
     // `acquire_many` — three staggered PRODUCTION acquires (the
@@ -8595,7 +8599,7 @@ mod tests {
         );
     }
 
-    // r[verify store.put.nar-bytes-budget+5]
+    // r[verify store.put.nar-bytes-budget+6]
     // W8-G (R16 statement): the cost bound at the constructor — a
     // third same-tenant large reservation is refused typed while a
     // second tenant admits (cross-tenant isolation observed, not
@@ -8678,7 +8682,7 @@ mod tests {
         assert!(b1.is_ok(), "second tenant must admit: {:?}", b1.err());
     }
 
-    // r[verify store.put.nar-bytes-budget+5]
+    // r[verify store.put.nar-bytes-budget+6]
     // W8-H (R16 statement): release — drop restores headroom, no leak
     // across abort paths. The guard rides the reservation, so EVERY
     // abort path (completion, HoldDeadlineExceeded, cancellation)
@@ -8767,7 +8771,7 @@ mod tests {
         assert!(again.is_ok(), "fully drained tenant re-admits");
     }
 
-    // r[verify store.put.nar-bytes-budget+5]
+    // r[verify store.put.nar-bytes-budget+6]
     // Envelope-violation red (R17, cost-axis knob): an absurd cap
     // refuses even a minimal reservation — the knob demonstrably
     // BINDS — while the default admits the same charge.
