@@ -996,6 +996,17 @@ pub struct SolvedIntent {
     /// without reimplementing the curve. Unfitted (probe/cold) → the
     /// flat 1.5× fallback.
     pub disk_headroom: f64,
+    /// bug_121 (R25): the operator `--capacity` pin, stamped ONCE at
+    /// the `solve_intent_for` post-finalize chokepoint (never
+    /// re-resolved at emission time — a re-resolution could race an
+    /// override change and ship a pin the solved cells were not
+    /// filtered under). Carried through `SpawnIntent.capacity_pin` so
+    /// a pin-gated emission (empty cells + the pin) is no longer
+    /// byte-identical on the wire to an HwAgnostic one, and the
+    /// controller's fallback lane fails the pin closed instead of
+    /// running the build at the class's first configured capacity.
+    /// `None` = unpinned (the wire's Q6 absence semantics).
+    pub capacity_pin: Option<crate::sla::config::CapacityType>,
 }
 
 /// Scheduling-hint sub-state of a [`DerivationState`].

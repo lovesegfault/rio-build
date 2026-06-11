@@ -7163,3 +7163,153 @@ async fn over_cap_only_pass_advances_the_verdict_ordinal() {
          restarts the track at 1"
     );
 }
+
+// r[verify sched.sla.pin-wire]
+/// **W10-Z (bug_121, the R25 injectivity census)** — *every
+/// [`CellEmission`]-shaped population × its wire image
+/// `(cell set, capacity_pin)` × the consumer disposition its premise
+/// derives: no two letters share BOTH a wire image and a consumer
+/// disposition.* The pre-fix red on the image axis: PinGated's wire
+/// image was byte-identical to HwAgnostic's (empty cells, no pin
+/// field existed) while their dispositions diverge (typed pend vs the
+/// designed first-cap fallback walk) — the silent pin→spot decay.
+/// Post-fix the `capacity_pin` field splits those images. The two
+/// populations that STILL share an image — PinGated and a pinned
+/// Unhostable, both `(∅, Some(pin))` — are split by the consumer's
+/// OWN re-derivation (the controller's pin-stripped fallback
+/// attribution, pinned at `w10y_…` / `pinned_but_genuinely_…` in
+/// rio-controller), and their scheduler-side mint premises are the
+/// two branches of exactly that predicate, asserted here over the
+/// cap-blind reference resolve: PinGated mints ONLY when a
+/// size-hosting class exists ignoring the pin; the pinned walk falls
+/// to Unhostable ONLY when none does. Cells rows are image-disjoint
+/// by non-emptiness. Populations driven through the production
+/// `solve_intent_for` (the one mint site), never hand-built.
+#[tokio::test]
+async fn w10z_cell_emission_wire_image_injectivity() {
+    use crate::sla::config::{ARCH_LABEL, CapacityType, NodeLabelMatch};
+
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    // Builder classes get explicit amd64 arch labels (the bug_008
+    // form) so the riscv population below is structurally unhostable,
+    // and SPOT-ONLY capacity types so an od pin has no hosting class
+    // while the size axis stays hostable (the PinGated premise).
+    for d in actor.sla_config.hw_classes.values_mut() {
+        d.labels.push(NodeLabelMatch {
+            key: ARCH_LABEL.into(),
+            value: "amd64".into(),
+        });
+        d.capacity_types = vec![CapacityType::Spot];
+    }
+    actor.sla_tiers = actor.sla_config.solve_tiers();
+
+    // Population 1 — HwAgnostic: unfitted featureless x86 demand, no
+    // override. The designed quiet edge.
+    actor.test_inject_ready("d-agnostic", Some("never-fit"), "x86_64-linux", false);
+    // Population 2 — PinGated: unfitted featureless x86 demand with a
+    // `--capacity=on-demand` pin no (spot-only) class hosts, while
+    // size-hosting classes exist ignoring the pin.
+    actor.test_inject_ready("d-pin", Some("pin-pkg"), "x86_64-linux", false);
+    // Population 3 — pinned Unhostable: cores+capacity override on a
+    // system no class hosts (arch axis binds, not the pin).
+    actor.test_inject_ready("d-rv-pin", Some("rv-pkg"), "riscv64-linux", false);
+    // Population 4 — Cells: fitted, routed (image-disjoint by
+    // non-emptiness; pin axis exercised on the empty images above).
+    actor.test_inject_ready("d-cells", Some("test-pkg"), "x86_64-linux", false);
+    actor.sla_estimator.seed_overrides(vec![
+        crate::db::SlaOverrideRow {
+            pname: "pin-pkg".into(),
+            capacity_type: Some("on-demand".into()),
+            ..Default::default()
+        },
+        crate::db::SlaOverrideRow {
+            pname: "rv-pkg".into(),
+            cores: Some(16.0),
+            capacity_type: Some("on-demand".into()),
+            ..Default::default()
+        },
+    ]);
+
+    let (hw, cost, ig) = actor.solve_inputs();
+    let image = |drv: &str| {
+        let state = actor.dag.node(drv).unwrap();
+        let i = actor.solve_intent_for(state, &hw, &cost, ig);
+        // The wire image: what `to_proto` ships — cell emptiness +
+        // the pin token through the shared alphabet.
+        let pin_wire = i.capacity_pin.map(|c| {
+            rio_common::cell_wire::WireCapacity::from(c)
+                .wire_str()
+                .to_owned()
+        });
+        (i.node_affinity.is_empty(), pin_wire, i)
+    };
+
+    let (agn_empty, agn_pin, agn) = image("d-agnostic");
+    let (pin_empty, pin_pin, pin) = image("d-pin");
+    let (rv_empty, rv_pin, rv) = image("d-rv-pin");
+    let (cells_empty, cells_pin, _) = image("d-cells");
+
+    // Row images.
+    assert!(
+        agn_empty && agn_pin.is_none(),
+        "HwAgnostic image = (∅, None)"
+    );
+    assert!(
+        pin_empty && pin_pin.as_deref() == Some("od"),
+        "PinGated image = (∅, Some(od)) — the pin SURVIVES the wire; \
+         got (empty={pin_empty}, pin={pin_pin:?})"
+    );
+    assert!(
+        rv_empty && rv_pin.as_deref() == Some("od"),
+        "pinned Unhostable image = (∅, Some(od)); got (empty={rv_empty}, pin={rv_pin:?})"
+    );
+    assert!(!cells_empty, "Cells image is non-empty (image-disjoint)");
+    assert!(cells_pin.is_none(), "unpinned routed demand carries no pin");
+
+    // THE bug_121 axis: PinGated and HwAgnostic MUST NOT share a wire
+    // image (pre-fix they did — both (∅, nothing)).
+    assert_ne!(
+        (agn_empty, &agn_pin),
+        (pin_empty, &pin_pin),
+        "two letters sharing a wire image re-creates the silent-empty \
+         population the alphabet was minted to kill (R25)"
+    );
+
+    // The shared-(∅, Some) pair splits on the consumer's own
+    // re-derivation; the mint premises are its two branches. Probe the
+    // cap-blind reference resolve (what the controller's pin-stripped
+    // fallback re-derives) at each row's own demand:
+    let feat: Vec<String> = vec![];
+    let premise = |state_sys: &str, i: &crate::state::SolvedIntent| {
+        actor
+            .sla_config
+            .reference_hw_class_for_system(
+                state_sys,
+                i.cores,
+                i.mem_bytes,
+                &feat,
+                cost.catalog_ceilings(),
+                cost.resolved_global(),
+                None,
+            )
+            .is_some()
+    };
+    assert!(
+        premise("x86_64-linux", &pin),
+        "PinGated premise: a size-hosting class EXISTS ignoring the pin \
+         — the consumer's pin-stripped re-eval succeeds ⇒ typed pend"
+    );
+    assert!(
+        !premise("riscv64-linux", &rv),
+        "pinned-Unhostable premise: NO class hosts even ignoring the \
+         pin — the consumer's pin-stripped re-eval fails ⇒ the \
+         poison-feeding NoHostingClass, exactly like an unpinned config \
+         gap (the pin is not the differentiator)"
+    );
+    // Belt: the agnostic row's demand is hostable sans pin too — its
+    // disposition (designed first-cap walk) differs from PinGated's
+    // pend purely BY the image split asserted above.
+    assert!(premise("x86_64-linux", &agn));
+}

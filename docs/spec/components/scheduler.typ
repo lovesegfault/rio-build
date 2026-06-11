@@ -4548,6 +4548,37 @@ This approach keeps per-event processing well under the 1ms budget needed for
   fetcher airgap (#rref("builder.netpol.airgap")).
 ]
 
+#r("sched.sla.pin-wire")[
+  An operator `--capacity` pin MUST survive serialization as typed data
+  (`SpawnIntent.capacity_pin`, values from the shared
+  `rio_common::cell_wire` alphabet, stamped at the solve chokepoint on
+  EVERY emission of pinned demand) and MUST fail closed at every
+  consumer: the controller's cold-start fallback lane may only pick
+  cells at the pinned capacity, an undecodable pin refuses every class,
+  and "no class hosts the pin" is the typed ADVISORY pend
+  (`PlacementOutcome::PinGated` --- counted, off the verdict wire) ---
+  never the poison-feeding no-hosting-class verdict and never an
+  off-pin placement.
+]
+
+Rationale (bug_121, R25): a pin-gated emission folded to empty cells and was
+byte-identical on the wire to an hw-agnostic one --- the controller's
+`fallback_cell` arch/size-matched it and ran the on-demand-pinned build on
+spot at the class's first configured capacity, with the only disclosure a
+debounced scheduler-side warn. Two letters sharing a wire image re-create the
+silent-empty population the emission alphabet was minted to kill, so the pin
+either survives as a typed field or the letters must map injectively onto
+consumer dispositions; this rule demands the field. The pend is deliberately
+OFF the verdict wire: the pin disposition is the scheduler's own knowledge
+(it minted `CellEmission::PinGated` and disclosed at the mint site), and the
+two populations sharing the empty-cells-plus-pin image (pin-gated vs pinned
+genuinely-unhostable) are split by the consumer's own pin-stripped
+re-derivation --- the injectivity census (`W10-Z`) pins both mint premises to
+that predicate's branches, and the wire-mapping census pins `PinGated` into
+the no-verdict set. Absence of the field decodes as "no pin" (the Q6
+read-side-first law: pre-pin-wire schedulers only ever emitted unpinned or
+affinity-constrained intents).
+
 == Catalog-derived per-class ceilings (ADR-023 §13c-2)
 
 Per-class `(max_cores, max_mem)` ceilings are derived *at scheduler boot* from

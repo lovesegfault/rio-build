@@ -504,6 +504,16 @@ impl NodeClaimPoolConfig {
         if arch.is_none() && i.required_features.is_empty() {
             return None;
         }
+        // r[impl sched.sla.pin-wire]
+        // bug_121 (R25): the wire pin filters the candidate capacity.
+        // Outer `None` = unpinned (legacy first-configured capacity).
+        // `Some(Some(p))` = honor the pin or refuse the class.
+        // `Some(None)` = present-but-undecodable: fail CLOSED at every
+        // class — an unreadable pin must not be ignored (ignoring it
+        // is exactly the run-anywhere decay this field kills); the
+        // caller's pin-stripped attribution then pends it typed
+        // (`PlacementOutcome::PinGated`), never a silent launch.
+        let pin: Option<Option<CapacityType>> = i.capacity_pin.as_deref().map(CapacityType::parse);
         let candidate = |h: &str| {
             // Per-class ceiling filter: an hw-agnostic intent (override
             // bypass-path with `--cores=N`) may carry `cores >
@@ -513,7 +523,12 @@ impl NodeClaimPoolConfig {
             // `no_hosting_class` metric, which is the right operator
             // signal: "no class for this arch+size+feature").
             let (cls_c, cls_m) = hw.ceilings_for(h).unwrap_or((u32::MAX, u64::MAX));
-            let cap = *hw.capacity_types_for(h).first()?;
+            let caps = hw.capacity_types_for(h);
+            let cap = match &pin {
+                None => *caps.first()?,
+                Some(Some(p)) => *caps.iter().find(|c| *c == p)?,
+                Some(None) => return None,
+            };
             let c = Cell(h.into(), cap);
             (hw.matches_arch(h, arch)
                 && !masked.contains(&c)
@@ -2346,6 +2361,7 @@ impl NodeClaimPoolReconciler {
                     | cover::PlacementOutcome::LeadTimeGated
                     | cover::PlacementOutcome::UnplaceableAllMasked { .. }
                     | cover::PlacementOutcome::UnknownUniverse { .. }
+                    | cover::PlacementOutcome::PinGated
                     | cover::PlacementOutcome::DecodeRefused { .. } => {
                         unreachable!("verdict_reason() maps these arms to None")
                     }
@@ -2360,6 +2376,7 @@ impl NodeClaimPoolReconciler {
                 cover::PlacementOutcome::Placed(_)
                 | cover::PlacementOutcome::LeadTimeGated
                 | cover::PlacementOutcome::NoHostingClass
+                | cover::PlacementOutcome::PinGated
                 | cover::PlacementOutcome::OverCap { .. }
                 | cover::PlacementOutcome::UnknownUniverse { .. }
                 | cover::PlacementOutcome::DecodeRefused { .. } => {}
@@ -2618,6 +2635,31 @@ pub(crate) fn emit_drop_tally(
              a config gap an operator must still fix — the verdict stops \
              the Ready-forever loop, not the gap. \
              See sla-model.typ#rionodeclaimpool-nohostingclass"
+        );
+    }
+    // bug_121 (R25): the pin-gated ADVISORY pend — its own reason so
+    // the operator action is unambiguous (change the pin / add the
+    // capacity), never conflated with the no_hosting_class config gap
+    // (whose action is "add a class") or silently placed off-pin (the
+    // pre-fix laundering). OFF the wire by design — the scheduler
+    // minted the PinGated letter and already disclosed; this counter
+    // is the controller-side half of the pend's loudness.
+    if dropped.pin_gated > 0 {
+        metrics::counter!(
+            "rio_controller_nodeclaim_intent_dropped_total",
+            "reason" => "pin_gated",
+        )
+        .increment(dropped.pin_gated);
+        warn!(
+            dropped = dropped.pin_gated,
+            "SpawnIntents pin-gated — a wire `capacity_pin` rides each \
+             and NO configured hw-class hosts the intent at that \
+             capacity (classes DO host it ignoring the pin, or the pin \
+             value is undecodable — fail-closed either way, the build \
+             is NEVER launched off-pin). ADVISORY pend: the drv stays \
+             Ready and re-evaluates every tick; change the build's \
+             `--capacity` pin, or add the pinned capacity to a hosting \
+             class's `[sla.hw_classes.<h>].capacityTypes`"
         );
     }
     if dropped.all_cells_ice_masked > 0 {
@@ -3382,6 +3424,223 @@ mod tests {
             cfg.fallback_cell(&fod, &hw, &none),
             Some(Cell("fetcher-x86".into(), CapacityType::OnDemand)),
             "builtin FOD must route to the fetcher class via features"
+        );
+    }
+
+    // r[verify sched.sla.pin-wire]
+    /// bug_121 (R25): `fallback_cell` honors the wire `capacity_pin` —
+    /// the pin filters the candidate capacity instead of the class's
+    /// FIRST configured capacity (the pre-fix shape ran an
+    /// od-pinned build on spot). Rows: pinned-od on a default
+    /// ([spot, on-demand]) class picks the OD cell; pinned-od on a
+    /// spot-only universe refuses (`None` — the caller's attribution
+    /// pends it typed); an undecodable pin fails CLOSED at every
+    /// class; absent pin keeps the legacy first-configured walk
+    /// byte-identical (the Q6 read-side law, also pinned in
+    /// tests/roundtrip.rs against decoded absent-tag bytes).
+    #[test]
+    fn fallback_cell_honors_the_wire_capacity_pin() {
+        use rio_proto::types::{HwClassLabels, NodeLabelMatch};
+        let cfg = NodeClaimPoolConfig {
+            reference_hw_class: "mid-ebs-x86".into(),
+            ..Default::default()
+        };
+        let arch = |a: &str| NodeLabelMatch {
+            key: ARCH_LABEL.into(),
+            value: a.into(),
+        };
+        let none = HashSet::new();
+        let pinned = |pin: &str| SpawnIntent {
+            system: "x86_64-linux".into(),
+            capacity_pin: Some(pin.into()),
+            ..Default::default()
+        };
+        // Default-caps class: the pin picks OD even though spot is
+        // first in the configured order.
+        let hw = HwClassConfig::from_literals(&[("mid-ebs-x86", &[(ARCH_LABEL, "amd64")])]);
+        assert_eq!(
+            cfg.fallback_cell(&pinned("od"), &hw, &none),
+            Some(Cell("mid-ebs-x86".into(), CapacityType::OnDemand)),
+            "od pin picks the OD cell, not the first-configured spot"
+        );
+        // The Karpenter label form decodes through the shared alphabet.
+        assert_eq!(
+            cfg.fallback_cell(&pinned("on-demand"), &hw, &none),
+            Some(Cell("mid-ebs-x86".into(), CapacityType::OnDemand)),
+            "the alphabet's on-demand alias decodes"
+        );
+        // Spot-only universe: the od pin refuses every class.
+        let hw_spot_only = HwClassConfig::default();
+        hw_spot_only.set(
+            [(
+                "mid-ebs-x86".into(),
+                HwClassLabels {
+                    labels: vec![arch("amd64")],
+                    max_cores: 64,
+                    max_mem: 256 << 30,
+                    capacity_types: vec!["spot".into()],
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            (192, 1536 << 30),
+        );
+        assert_eq!(
+            cfg.fallback_cell(&pinned("od"), &hw_spot_only, &none),
+            None,
+            "no class hosts the pinned capacity — refuse, never launch off-pin"
+        );
+        // Undecodable pin: fail CLOSED (never "ignore and run anywhere").
+        assert_eq!(
+            cfg.fallback_cell(&pinned("hovercraft"), &hw, &none),
+            None,
+            "a pin outside the capacity alphabet fails closed"
+        );
+        // Absent pin: the legacy first-configured walk, unchanged.
+        let legacy = SpawnIntent {
+            system: "x86_64-linux".into(),
+            capacity_pin: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.fallback_cell(&legacy, &hw, &none),
+            Some(Cell("mid-ebs-x86".into(), CapacityType::Spot)),
+            "absent pin = legacy spot-first fallback (Q6)"
+        );
+    }
+
+    // r[verify sched.sla.pin-wire]
+    /// **W10-Y (bug_121, the R25 banner red)** — *an on-demand-pinned
+    /// emission with no od hosting class, END-TO-END through the
+    /// serialization boundary: pre-fix the controller provisioned
+    /// spot and RAN the build there (the wire image was
+    /// byte-identical to HwAgnostic); post-fix the typed
+    /// `PlacementOutcome::PinGated` pend, counted, ZERO spot launch.*
+    /// The intent crosses prost encode/decode so the test also fails
+    /// if `capacity_pin` ever stops surviving the wire. Driven through
+    /// the production composition (`cover::assign_to_cells` with the
+    /// real `fallback_cell` closure — the same wiring as
+    /// `cover_deficit`).
+    ///
+    /// red (captured pre-fix, fallback/attribution hunks reverted):
+    ///   `pre-fix laundering: the od-pinned build is PLACED on
+    ///    (mid-ebs-x86, spot): got Placed(Cell("mid-ebs-x86", Spot))`
+    #[test]
+    fn w10y_od_pinned_no_od_class_pends_typed_zero_spot_launch() {
+        use prost::Message;
+        use rio_proto::types::{HwClassLabels, NodeLabelMatch};
+        let cfg = NodeClaimPoolConfig {
+            reference_hw_class: "mid-ebs-x86".into(),
+            ..Default::default()
+        };
+        let arch = |a: &str| NodeLabelMatch {
+            key: ARCH_LABEL.into(),
+            value: a.into(),
+        };
+        // Spot-only universe (no od hosting class anywhere).
+        let hw = HwClassConfig::default();
+        hw.set(
+            [(
+                "mid-ebs-x86".into(),
+                HwClassLabels {
+                    labels: vec![arch("amd64")],
+                    max_cores: 64,
+                    max_mem: 256 << 30,
+                    capacity_types: vec!["spot".into()],
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            (192, 1536 << 30),
+        );
+        // The wire image a PinGated emission produces: EMPTY cells +
+        // the pin — through the serialization boundary.
+        let emitted = SpawnIntent {
+            intent_id: "od-pinned".into(),
+            system: "x86_64-linux".into(),
+            cores: 4,
+            mem_bytes: 1 << 30,
+            ready: Some(true),
+            capacity_pin: Some("od".into()),
+            ..Default::default()
+        };
+        let received = SpawnIntent::decode(&*emitted.encode_to_vec()).unwrap();
+        assert_eq!(
+            received.capacity_pin.as_deref(),
+            Some("od"),
+            "the pin survives the wire (R25)"
+        );
+        let unplaced = [received];
+        let none = HashSet::new();
+        let known: HashSet<Cell> = cfg.all_cells(&hw).into_iter().collect();
+        let (by_cell, outcomes) = cover::assign_to_cells(
+            &unplaced,
+            &CellSketches::default(),
+            &none,
+            &known,
+            cover::cell_rank,
+            |i, m| cfg.fallback_cell(i, &hw, m),
+        );
+        assert!(
+            !matches!(&outcomes[0].1, cover::PlacementOutcome::Placed(_)),
+            "pre-fix laundering: the od-pinned build is PLACED on \
+             (mid-ebs-x86, spot): got {:?}",
+            outcomes[0].1
+        );
+        assert!(
+            matches!(&outcomes[0].1, cover::PlacementOutcome::PinGated),
+            "the pin's terminal is the typed ADVISORY pend, got {:?}",
+            outcomes[0].1
+        );
+        assert!(by_cell.is_empty(), "zero launches at any capacity");
+        let tally = cover::DropTally::from_outcomes(&outcomes);
+        assert_eq!(tally.pin_gated, 1, "the pend is COUNTED");
+        assert_eq!(
+            tally.no_hosting_class, 0,
+            "never the poison-feeding lane (the laundering form)"
+        );
+    }
+
+    // r[verify sched.sla.pin-wire]
+    /// W10-Y kill-isolation: a PINNED intent that is genuinely
+    /// unhostable (arch mismatch everywhere — the pin is NOT the
+    /// differentiator) takes `NoHostingClass` exactly like an
+    /// unpinned one; the pin-stripped attribution must not absorb
+    /// real config gaps into the quiet ADVISORY lane.
+    #[test]
+    fn pinned_but_genuinely_unhostable_stays_no_hosting_class() {
+        let cfg = NodeClaimPoolConfig {
+            reference_hw_class: "lo-ebs-arm".into(),
+            ..Default::default()
+        };
+        // arm-only universe, x86 intent: no class hosts it with OR
+        // without the pin.
+        let hw = HwClassConfig::from_literals(&[("lo-ebs-arm", &[(ARCH_LABEL, "arm64")])]);
+        let i = SpawnIntent {
+            intent_id: "pinned-wrong-arch".into(),
+            system: "x86_64-linux".into(),
+            cores: 4,
+            mem_bytes: 1 << 30,
+            ready: Some(true),
+            capacity_pin: Some("od".into()),
+            ..Default::default()
+        };
+        let unplaced = [i];
+        let none = HashSet::new();
+        let known: HashSet<Cell> = cfg.all_cells(&hw).into_iter().collect();
+        let (_, outcomes) = cover::assign_to_cells(
+            &unplaced,
+            &CellSketches::default(),
+            &none,
+            &known,
+            cover::cell_rank,
+            |i, m| cfg.fallback_cell(i, &hw, m),
+        );
+        assert!(
+            matches!(&outcomes[0].1, cover::PlacementOutcome::NoHostingClass),
+            "arch binds, not the pin — the real config gap keeps its \
+             poison-feeding verdict, got {:?}",
+            outcomes[0].1
         );
     }
 

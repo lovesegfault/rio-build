@@ -83,3 +83,40 @@ fn spawn_intent_disk_headroom_absent_decodes_none() {
     let decoded = SpawnIntent::decode(&*bytes).unwrap();
     assert_eq!(decoded.disk_headroom_factor, None);
 }
+
+// r[verify sched.sla.pin-wire]
+/// `capacity_pin` (field 18, `optional string`) absent on the wire — a
+/// pre-pin-wire scheduler — decodes as `None`, NOT `Some("")`, and the
+/// consumer's fallback lane keeps the legacy first-configured-capacity
+/// walk (bug_121's Q6 read-side law: a pre-pin scheduler only ever
+/// emitted unpinned or affinity-constrained intents, so absence ⇒
+/// "no pin" is BY DEFINITION the old behaviour). The behavioural half
+/// (absent pin ⇒ legacy spot-first fallback; present pin ⇒ honored or
+/// typed PinGated pend, never an off-pin launch) is unit-tested at
+/// `nodeclaim_pool::tests::fallback_cell_honors_the_wire_capacity_pin`
+/// and `w10y_od_pinned_no_od_class_pends_typed_zero_spot_launch`.
+#[test]
+fn spawn_intent_capacity_pin_absent_decodes_none() {
+    let legacy = SpawnIntent {
+        capacity_pin: None,
+        ..Default::default()
+    };
+    let bytes = legacy.encode_to_vec();
+    // Tag 18 wire key is `(18 << 3) | 2` = 0x92 (len-delimited).
+    // Empty-default intent encodes zero bytes, so the contains check
+    // is exact.
+    assert!(
+        !bytes.contains(&0x92),
+        "capacity_pin=None must not emit tag 18; got {bytes:02x?}"
+    );
+    let decoded = SpawnIntent::decode(&*bytes).unwrap();
+    assert_eq!(decoded.capacity_pin, None);
+
+    // And the present case round-trips the alphabet's wire token.
+    let pinned = SpawnIntent {
+        capacity_pin: Some("od".into()),
+        ..Default::default()
+    };
+    let decoded = SpawnIntent::decode(&*pinned.encode_to_vec()).unwrap();
+    assert_eq!(decoded.capacity_pin.as_deref(), Some("od"));
+}

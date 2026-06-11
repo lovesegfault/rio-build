@@ -329,6 +329,13 @@ pub fn describe_metrics() {
          required_features unmatched (the hwClasses key-set lacks a \
          `provides_features` entry for it). Persistent until \
          `[sla.hw_classes]` changes. \
+         reason=pin_gated: the intent's wire `capacity_pin` is the \
+         binding axis — classes host its arch/size/features but none \
+         at the pinned capacity (or the pin value is undecodable; \
+         fail-closed either way, the build is never launched off-pin). \
+         ADVISORY pend, off the verdict wire: the drv stays Ready and \
+         re-evaluates each tick; change the build's `--capacity` pin \
+         or add the capacity to a hosting class's capacityTypes. \
          reason=all_cells_ice_masked: a class CAN host the intent but \
          every hosting cell is ICE-masked — NodeClaim launches are \
          failing in the cloud (capacity, quota, IAM). Self-heals once \

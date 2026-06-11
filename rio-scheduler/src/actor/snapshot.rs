@@ -618,10 +618,16 @@ impl DagActor {
                 // with only legacy (pod-name-keyed) failures.
                 // r[impl sched.dispatch.fleet-exhaust+5]
                 excluded_nodes: state.excluded_source_nodes(),
-                // bug_121: absent = unpinned (the field's Q6 law); this
-                // arm emits None — the solve-chokepoint pin stamp rides
-                // the same wave's consumer-arm commit.
-                capacity_pin: None,
+                // r[impl sched.sla.pin-wire]
+                // bug_121 (R25): the solve-chokepoint pin stamp, in
+                // the shared cell-wire vocabulary ("spot"/"od") so
+                // both consumers parse through the alphabet's one
+                // owner. None = unpinned (the field's Q6 law).
+                capacity_pin: intent.capacity_pin.map(|c| {
+                    rio_common::cell_wire::WireCapacity::from(c)
+                        .wire_str()
+                        .to_owned()
+                }),
             }
         };
 
@@ -3066,6 +3072,16 @@ impl DagActor {
             node_affinity,
             hw_class_names,
             disk_headroom,
+            // bug_121 (R25): the pin survives as data from the ONE
+            // mint site — every arm above converges here, so a pinned
+            // emission carries the pin REGARDLESS of which letter
+            // folded (Cells already pin-filtered; PinGated/Unhostable
+            // empty). Two letters may still share an empty cell set,
+            // but never a wire image AND a consumer disposition: the
+            // controller re-derives hostability locally, and the pin
+            // field is what splits its fallback lane (honor the pin /
+            // typed PinGated pend) from the agnostic first-cap walk.
+            capacity_pin: override_.as_ref().and_then(|o| o.capacity),
         }
     }
 
@@ -3194,9 +3210,12 @@ impl DagActor {
                                 "`--capacity` override pin hosted by NO \
                                  configured hwClass at this size (size-hosting \
                                  classes exist without the pin) — cells \
-                                 emitted empty, the emission classifies as \
-                                 PinGated; change the pin to a hosted cap, or \
-                                 add the cap to a routing class's \
+                                 emitted empty with the pin on the wire \
+                                 (SpawnIntent.capacity_pin), the emission \
+                                 classifies as PinGated and the controller \
+                                 pends it typed (never an off-pin launch); \
+                                 change the pin to a hosted cap, or add the \
+                                 cap to a routing class's \
                                  `[sla.hw_classes.<h>].capacity_types`",
                             );
                         }
@@ -3526,8 +3545,18 @@ impl DagActor {
             }
             // Operator `--capacity` pin not hosted — the r31
             // A3 lane already disclosed (debounced warn in
-            // `bypass_cells`); emission stays empty so the
-            // pin is never silently rewritten.
+            // `bypass_cells`); emission stays empty AND the
+            // chokepoint stamps `SolvedIntent.capacity_pin`
+            // (bug_121/R25: empty cells alone were
+            // byte-identical to HwAgnostic on the wire, and
+            // the controller's fallback ran the pinned build
+            // at the class's first configured capacity — the
+            // pin WAS silently rewritten, one process over).
+            // With the pin surviving as data, the consumer's
+            // fallback lane fails closed: typed
+            // `PlacementOutcome::PinGated` pend, counted,
+            // never a poison fold and never an off-pin
+            // launch.
             CellEmission::PinGated => (cores, mem, Vec::new()),
             CellEmission::StaleSolve {
                 solved,

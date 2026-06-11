@@ -173,6 +173,18 @@ pub struct DropTally {
     /// forecast cells), so the live_050(a) alert lane measures only
     /// solved waiting demand. The split is the alert tier's input.
     pub forecast_all_cells_ice_masked: u64,
+    /// bug_121 (R25): the wire `capacity_pin` is the binding axis —
+    /// classes host the intent, none at the pinned capacity (or the
+    /// pin value is undecodable — fail-closed, same lane). ADVISORY
+    /// pend: counted via `intent_dropped_total{reason=pin_gated}` +
+    /// WARN; OFF the wire (the scheduler minted the PinGated letter
+    /// and already disclosed); never the poison-feeding reason.
+    /// Persistent until the operator changes the pin or adds the
+    /// capacity to a hosting class's `capacityTypes`. **Operator
+    /// action:** change the build's `--capacity` pin, or add the
+    /// pinned capacity to a `[sla.hw_classes.<h>].capacityTypes` that
+    /// hosts the size.
+    pub pin_gated: u64,
     /// Pod footprint exceeds the assigned cell's per-class cap —
     /// [`sizing`]'s over-cap partition, re-classified onto the alphabet
     /// (bug_026). The per-intent counter
@@ -226,6 +238,25 @@ pub enum PlacementOutcome {
     /// config gap; answered to the scheduler as a typed
     /// `IntentVerdict` (live_051(c)).
     NoHostingClass,
+    // r[impl sched.sla.pin-wire]
+    /// bug_121 (R25): the intent's wire `capacity_pin` is the BINDING
+    /// axis — some class hosts the intent's arch/size/features, but
+    /// none of them at the pinned capacity (attributed by the
+    /// pin-stripped re-eval in [`assign_to_cells`], the same bounded
+    /// one-extra-pass form as the masked attribution). ADVISORY-pend:
+    /// the intent stays unplaced this tick (counted via
+    /// `intent_dropped_total{reason="pin_gated"}` + WARN), the drv
+    /// stays Ready scheduler-side, and the next tick re-evaluates —
+    /// self-heals the moment the operator changes the pin or adds the
+    /// capacity to a hosting class. NEVER poison-folded and NEVER an
+    /// off-pin placement (the pre-fix shape: `fallback_cell` ran an
+    /// on-demand-pinned build on spot at the class's first configured
+    /// capacity — the laundering form this row exists to kill). An
+    /// undecodable pin value lands here too, fail-closed: an
+    /// unreadable pin must not be ignored, and ignoring it is exactly
+    /// the run-anywhere decay. OFF the wire — see
+    /// [`Self::verdict_reason`].
+    PinGated,
     /// The intent's pod footprint exceeds its assigned cell's per-class
     /// cap — [`sizing`] can mint no valid claim of ANY `n` for it this
     /// tick (bug_026; the R21 post-chokepoint letter: re-classified
@@ -281,6 +312,18 @@ impl PlacementOutcome {
             | PlacementOutcome::UnplaceableAllMasked { .. }
             | PlacementOutcome::UnknownUniverse { .. }
             | PlacementOutcome::DecodeRefused { .. } => None,
+            // bug_121: OFF the wire BY DECISION — the pin disposition
+            // is the SCHEDULER'S OWN knowledge (it minted
+            // `CellEmission::PinGated` and disclosed at the mint
+            // site's debounced warn); this row is the anti-laundering
+            // backstop + the operator counter, and echoing it would
+            // re-state what the producer already knows (the same
+            // their-facts-are-the-scheduler's-own posture as the
+            // masked arms). Mapping it onto NO_HOSTING_CLASS would
+            // feed the terminal poison budget with an
+            // operator-config-shaped, self-healing population — the
+            // laundering form, forbidden (§1.6.4-5).
+            PlacementOutcome::PinGated => None,
             PlacementOutcome::NoHostingClass => {
                 Some(rio_proto::types::IntentVerdictReason::NoHostingClass)
             }
@@ -324,6 +367,7 @@ impl DropTally {
                     t.forecast_all_cells_ice_masked += 1;
                 }
                 PlacementOutcome::NoHostingClass => t.no_hosting_class += 1,
+                PlacementOutcome::PinGated => t.pin_gated += 1,
                 PlacementOutcome::OverCap { .. } => t.over_cap += 1,
                 PlacementOutcome::UnknownUniverse { .. } => t.unknown_universe += 1,
                 PlacementOutcome::DecodeRefused { .. } => t.decode_refused += 1,
@@ -371,13 +415,17 @@ pub fn reclassify_over_cap(
 /// `fallback` takes the live mask so it can fail over to the next
 /// arch-matching cell when the reference cell is ICE-masked (mb_024).
 /// When the masked call returns `None`, the implementation re-evaluates
-/// `fallback(i, ∅)` to attribute the drop: still `None` → no class
-/// hosts the intent at all (`PlacementOutcome::NoHostingClass` — config
-/// gap); `Some` → the class exists but every hosting cell is masked
-/// (`PlacementOutcome::UnplaceableAllMasked` — cloud capacity gap). The
-/// re-eval is bounded at one extra `O(|hw_classes|)` predicate pass
-/// **per dropped intent** — the steady-state hot path (intents that
-/// place) never pays it.
+/// `fallback(i, ∅)` to attribute the drop: `Some` → the class exists
+/// but every hosting cell is masked
+/// (`PlacementOutcome::UnplaceableAllMasked` — cloud capacity gap);
+/// still `None` with a wire `capacity_pin` riding the intent →
+/// re-evaluate once more WITHOUT the pin (bug_121): `Some` → the PIN
+/// is the binding axis (`PlacementOutcome::PinGated` — typed ADVISORY
+/// pend, never poison, never an off-pin launch), `None` → the config
+/// gap is real (`PlacementOutcome::NoHostingClass`, same as an
+/// unpinned intent). Each re-eval is bounded at one extra
+/// `O(|hw_classes|)` predicate pass **per dropped intent** — the
+/// steady-state hot path (intents that place) never pays it.
 ///
 /// Returns `(by_cell, outcomes)`: one [`PlacementOutcome`] per intent,
 /// minted at this chokepoint (the only site that knows whether
@@ -486,6 +534,31 @@ pub fn assign_to_cells<'a>(
                         Some(c) => PlacementOutcome::Placed(c),
                         None if fallback(i, &unmasked).is_some() => {
                             PlacementOutcome::UnplaceableAllMasked { open_rungs: 0 }
+                        }
+                        // r[impl sched.sla.pin-wire]
+                        // bug_121 (R25): pin attribution — nothing
+                        // hosts the intent even unmasked, and a pin
+                        // rides the wire. Re-evaluate WITHOUT the pin
+                        // (the same bounded one-extra-pass form as the
+                        // masked attribution above): Some ⇒ the PIN is
+                        // the binding axis (classes host the
+                        // arch/size/features; none at the pinned
+                        // capacity, or the pin is undecodable —
+                        // fail-closed, same lane) ⇒ the typed ADVISORY
+                        // pend; None ⇒ the pin is not the
+                        // differentiator, the config gap is real ⇒ the
+                        // poison-feeding NoHostingClass verdict, same
+                        // as an unpinned intent.
+                        None if i.capacity_pin.is_some() => {
+                            let unpinned = SpawnIntent {
+                                capacity_pin: None,
+                                ..i.clone()
+                            };
+                            if fallback(&unpinned, &unmasked).is_some() {
+                                PlacementOutcome::PinGated
+                            } else {
+                                PlacementOutcome::NoHostingClass
+                            }
                         }
                         None => PlacementOutcome::NoHostingClass,
                     }
@@ -2635,6 +2708,7 @@ mod tests {
             PlacementOutcome::UnplaceableAllMasked { open_rungs: 0 },
             PlacementOutcome::UnplaceableAllMasked { open_rungs: 2 },
             PlacementOutcome::NoHostingClass,
+            PlacementOutcome::PinGated,
             PlacementOutcome::OverCap {
                 footprint: (128, 2 * GI, 4 * GI),
                 cap: (64, GI, 2 * GI),
@@ -2651,12 +2725,13 @@ mod tests {
                 PlacementOutcome::LeadTimeGated => 1,
                 PlacementOutcome::UnplaceableAllMasked { .. } => 2,
                 PlacementOutcome::NoHostingClass => 3,
-                PlacementOutcome::OverCap { .. } => 4,
-                PlacementOutcome::UnknownUniverse { .. } => 5,
-                PlacementOutcome::DecodeRefused { .. } => 6,
+                PlacementOutcome::PinGated => 4,
+                PlacementOutcome::OverCap { .. } => 5,
+                PlacementOutcome::UnknownUniverse { .. } => 6,
+                PlacementOutcome::DecodeRefused { .. } => 7,
             }
         };
-        let mut seen = [false; 7];
+        let mut seen = [false; 8];
         for r in &rows {
             seen[witness(r)] = true;
         }
@@ -2708,6 +2783,10 @@ mod tests {
                     no_hosting_class: 1,
                     ..Default::default()
                 },
+                PlacementOutcome::PinGated => DropTally {
+                    pin_gated: 1,
+                    ..Default::default()
+                },
                 PlacementOutcome::OverCap { .. } => DropTally {
                     over_cap: 1,
                     ..Default::default()
@@ -2726,17 +2805,23 @@ mod tests {
     }
 
     // r[verify ctrl.nodeclaim.placement-outcome+1]
+    // r[verify sched.sla.pin-wire]
     /// live_051(c) + bug_026 wire-mapping census (R15): over the
     /// alphabet rows, the wire-mapped set is EXACTLY
     /// {NoHostingClass → NO_HOSTING_CLASS (poison-feeding),
     /// OverCap → OVER_CAP (ADVISORY — never poison-feeding)}; the
     /// masked populations stay off the wire (their masks are the
     /// scheduler's own — the surviving no-wire half of the WO-S7-3
-    /// derivation), and the decode-refused arm stays off the wire
-    /// (controller-side fault, loud locally). The two wire reasons are
-    /// DISTINCT BY TYPE — conflating over-cap onto NO_HOSTING_CLASS
-    /// (the laundering form) would feed the terminal poison budget
-    /// with a self-healing population.
+    /// derivation), the decode-refused arm stays off the wire
+    /// (controller-side fault, loud locally), and the bug_121
+    /// PinGated arm stays off the wire (the pin is the scheduler's
+    /// own knowledge — minted as `CellEmission::PinGated` and
+    /// disclosed at the mint site; the row here is the
+    /// anti-laundering backstop + the operator counter). The two wire
+    /// reasons are DISTINCT BY TYPE — conflating over-cap OR
+    /// pin-gated onto NO_HOSTING_CLASS (the laundering form) would
+    /// feed the terminal poison budget with a self-healing
+    /// population.
     #[test]
     fn wire_mapped_outcome_variants_census() {
         let rows = outcome_census_rows();
@@ -2747,6 +2832,16 @@ mod tests {
         assert_eq!(shipped.len(), 2, "exactly two wire-mapped variants");
         assert!(matches!(shipped[0], PlacementOutcome::NoHostingClass));
         assert!(matches!(shipped[1], PlacementOutcome::OverCap { .. }));
+        // bug_121 (the anti-laundering pin, both directions): PinGated
+        // is in the NO-wire set — never NO_HOSTING_CLASS (the poison
+        // feeder), never any verdict at all.
+        assert_eq!(
+            PlacementOutcome::PinGated.verdict_reason(),
+            None,
+            "PinGated is ADVISORY-pending OFF the wire — mapping it \
+             onto a verdict (esp. NO_HOSTING_CLASS) is the laundering \
+             form, forbidden (§1.6.4-5)"
+        );
         assert_eq!(
             PlacementOutcome::NoHostingClass.verdict_reason(),
             Some(rio_proto::types::IntentVerdictReason::NoHostingClass)
