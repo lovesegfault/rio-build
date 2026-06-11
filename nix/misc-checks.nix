@@ -1270,30 +1270,18 @@ in
   census-enrollment =
     pkgs.runCommand "rio-census-enrollment"
       {
-        src = pkgs.lib.fileset.toSource {
-          root = ../.;
-          fileset = pkgs.lib.fileset.unions [
-            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-auth/src)
-            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-authz-kernel/src)
-            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-builder/src)
-            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-cli/src)
-            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-common/src)
-            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-controller/src)
-            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-crds/src)
-            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-evidence-kernel/src)
-            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-gateway/src)
-            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-lease/src)
-            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-log-kernel/src)
-            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-migrations/src)
-            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-nix/src)
-            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-proto/src)
-            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-retry-kernel/src)
-            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-scheduler/src)
-            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-store/src)
-            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-test-support/src)
-            ../nix/census-grandfather.txt
-          ];
-        };
+        # The WHOLE flake source, not a rust-only fileset: the scan
+        # walks rio-*/src *.rs, but `census[gen: <path>]` enrollment
+        # binds to ARBITRARY repo-relative committed files (the first
+        # in-tree adopter points at a helm test fragment), so the
+        # check's verdict genuinely depends on those files existing —
+        # a narrower staging made gen tags premise-unreachable in the
+        # sandbox while resolving locally (caught live at the round-8
+        # wave close: the gate refused a tag the working tree
+        # satisfied). The lint is a sub-second lexer pass; rebuilding
+        # it on any repo change is the correct dependency semantics,
+        # not waste.
+        src = pkgs.lib.cleanSource ../.;
         nativeBuildInputs = [ pkgs.python3 ];
         scanScript = ../nix/census_enrollment.py;
         sharedLexer = ../nix/rust_strip.py;
