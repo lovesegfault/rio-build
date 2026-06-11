@@ -823,6 +823,103 @@ mod tests {
     }
 
     // r[verify store.substitute.stale-reclaim+3]
+    /// W9-BK (live_055(a), bughunt-9): a claim with ZERO bytes — no
+    /// heartbeat ever mirrored (`fetched_bytes`/`last_progress_at`
+    /// NULL), `updated_at` past the stall window — is
+    /// takeover-eligible at window+ε and the path completes via the
+    /// reclaimer (the full `claim_placeholder` flow returns Owned).
+    /// Pre-fix RED (verbatim in the landing commit): the predicate's
+    /// `fetched_bytes IS NOT NULL` conjunct exempted the row — only
+    /// the 300s heartbeat-death reap ever freed it (the incident's
+    /// 300s MTTR on two chain-head claims gating a whole closure).
+    #[tokio::test]
+    async fn takeover_reclaims_dead_zero_progress_claim_at_the_stall_window() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let hash = test_hash(0xb9);
+        let _claim = claim_owned(&db.pool, &hash, "/nix/store/b9-zero").await;
+        set_phase(&db.pool, &hash, Some("downloading")).await;
+        // NO set_progress: fetched_bytes/last_progress_at stay NULL —
+        // the claim-then-no-first-byte shape. Dead 200s (> the 60s
+        // test window, < the 300s reap threshold — the blind band).
+        sqlx::query(
+            "UPDATE manifests SET updated_at = now() - make_interval(secs => 200) \
+             WHERE store_path_hash = $1",
+        )
+        .bind(&hash)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // The (a) law at its own boundary: the full claim flow takes
+        // the row over IN PLACE (stall arm), strike recorded, row
+        // surviving — not Concurrent-until-300s.
+        match claim_substitute(&db.pool, &hash, "/nix/store/b9-zero").await {
+            PlaceholderClaim::Owned(_) => {}
+            PlaceholderClaim::Concurrent => panic!(
+                "zero-progress dead claim must be takeover-eligible at the \
+                 stall window — Concurrent means the 300s blind spot is back"
+            ),
+            PlaceholderClaim::AlreadyComplete => panic!("unexpected AlreadyComplete"),
+        }
+        let (_, _, _, _, strikes, _, _) = row_state(&db.pool, &hash).await.expect("row survives");
+        assert_eq!(strikes, 1, "the handoff records the strike in place");
+    }
+
+    // r[verify store.substitute.stale-reclaim+3]
+    /// W9-BK exempt faces: (i) a LIVE zero-progress owner (heartbeats
+    /// fresh, first byte pending — e.g. mid-narinfo/connect inside its
+    /// own watchdog) is NOT deposed; (ii) a parked owner is exempt AS
+    /// DATA even when dead-zero-progress-shaped (parks are not holds
+    /// — the phase conjunct, preserved verbatim).
+    #[tokio::test]
+    async fn zero_progress_takeover_exempts_live_and_parked_owners() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        // (i) alive zero-progress: updated_at fresh.
+        let hash = test_hash(0xba);
+        let _claim = claim_owned(&db.pool, &hash, "/nix/store/ba-live").await;
+        set_phase(&db.pool, &hash, Some("downloading")).await;
+        let took = crate::metadata::stall_takeover_placeholder(
+            &db.pool,
+            &hash,
+            Some("competitor-pod"),
+            1000,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("takeover query");
+        assert!(
+            took.is_none(),
+            "a live zero-progress owner is never deposed"
+        );
+
+        // (ii) parked, dead-shaped: phase exempts regardless of age.
+        let hash2 = test_hash(0xbb);
+        let _claim2 = claim_owned(&db.pool, &hash2, "/nix/store/bb-parked").await;
+        set_phase(&db.pool, &hash2, Some("budget_parked")).await;
+        sqlx::query(
+            "UPDATE manifests SET updated_at = now() - make_interval(secs => 200) \
+             WHERE store_path_hash = $1",
+        )
+        .bind(&hash2)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let took2 = crate::metadata::stall_takeover_placeholder(
+            &db.pool,
+            &hash2,
+            Some("competitor-pod"),
+            1000,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("takeover query");
+        assert!(
+            took2.is_none(),
+            "the parked population stays exempt from the zero-progress arm"
+        );
+    }
+
+    // r[verify store.substitute.stale-reclaim+3]
     /// merged_bug_003 (c): a PERSISTING owner is exempt even when the
     /// competitor expects a BIGGER NAR. Pre-092 RED: the persist
     /// exemption was the inference `fetched_bytes == nar_size`, which

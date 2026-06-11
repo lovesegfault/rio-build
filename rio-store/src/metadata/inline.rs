@@ -214,24 +214,45 @@ pub(crate) async fn stall_takeover_placeholder(
 }
 
 /// The single-sourced stall-takeover rule (092, merged_bug_003;
-/// r[store.substitute.stale-reclaim+3]). `$4` = the competitor\'s
-/// verified NarSize, `$5` = the stall window in seconds. Two clocks,
-/// one phase:
+/// live_055(a), bughunt-9; r[store.substitute.stale-reclaim+3]).
+/// `$4` = the competitor\'s verified NarSize, `$5` = the stall window
+/// in seconds. One phase, two eligible shapes:
 ///
 /// - `claim_phase = 'downloading'`: parked/persisting owners exempt
-///   AS DATA;
-/// - progress stale: `fetched_bytes` short of the size and
-///   `last_progress_at` older than the window;
-/// - liveness FRESH: `updated_at` within the window — dead owners
-///   route to the 300s reap arm (reaped, not striked).
+///   AS DATA (parks are not holds — preserved verbatim);
+/// - shape 1 (mid-download stall, unchanged): progress stale
+///   (`fetched_bytes` short of the size, `last_progress_at` older
+///   than the window) with liveness FRESH (`updated_at` within the
+///   window — a dead mid-download owner routes to the 300s reap arm,
+///   reaped not striked, the 092 hygiene);
+/// - shape 2 (the live_055(a) pre-download blind spot): ZERO-PROGRESS
+///   claims — `fetched_bytes IS NULL AND last_progress_at IS NULL`
+///   (no heartbeat ever mirrored: the first tick writes 0, not NULL)
+///   with `updated_at` OLDER than the window. A claim that died (or
+///   silently wedged) before its first byte was invisible to both
+///   fast arms — released-in-place needs a graceful abort, shape 1
+///   is scoped to mid-download WITH progress — so only the 300s
+///   heartbeat-death reap ever freed it: two such chain-head claims
+///   gated a whole deep closure at 300s MTTR. Eligibility at the
+///   stall window turns that into ≤180s. The takeover (not the reap)
+///   is the vehicle so the row and any prior stall evidence SURVIVE
+///   the handoff; a LIVE zero-progress owner is exempt by its own
+///   heartbeats (`updated_at` fresh fails the age conjunct), and a
+///   live owner past its first mirror tick has `fetched_bytes = 0`
+///   (NOT NULL) — shape 1 covers it once progress stales.
 ///
-/// Both time conjuncts evaluate on PG `now()` — no cross-replica
-/// clock skew; durability lag of the phase is ≤ one heartbeat
-/// (30s ≪ the validated ≥60s stall floor).
+/// PutPath claims (`claim_phase` NULL) stay structurally outside the
+/// phase conjunct — their dead claims keep the 300s reap (recorded:
+/// the live_055 population was substitute claims). All time
+/// conjuncts evaluate on PG `now()` — no cross-replica clock skew;
+/// durability lag of the phase is ≤ one heartbeat (30s ≪ the
+/// validated ≥60s stall floor).
 pub(crate) const STALL_TAKEOVER_PREDICATE: &str = "AND claim_phase = 'downloading'
-           AND fetched_bytes IS NOT NULL AND fetched_bytes < $4
-           AND last_progress_at < now() - make_interval(secs => $5)
-           AND updated_at      >= now() - make_interval(secs => $5)";
+           AND (   (fetched_bytes IS NOT NULL AND fetched_bytes < $4
+                    AND last_progress_at < now() - make_interval(secs => $5)
+                    AND updated_at      >= now() - make_interval(secs => $5))
+                OR (fetched_bytes IS NULL AND last_progress_at IS NULL
+                    AND updated_at      <  now() - make_interval(secs => $5)))";
 
 /// Owner-side **release-in-place** after a stall abort
 /// (`r[store.substitute.stall-abort]`): relinquish the claim
