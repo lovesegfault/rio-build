@@ -1017,9 +1017,14 @@ impl StoreServiceImpl {
         claim: uuid::Uuid,
         nar_data: Vec<u8>,
         tenant_id: Option<uuid::Uuid>,
-        hold: Option<&NarIngestHold<'_>>,
+        hold: Option<NarIngestHold<'_>>,
     ) -> Result<(), Status> {
-        let envelope = match hold {
+        // BY VALUE (bug_094): this fn owns the hold's tail so the
+        // error arm can release the budget BEFORE the abort — the
+        // wave-8/-9 inverse-arm class (an unbounded await sandwiched
+        // between two enveloped ones while the caller's frame pinned
+        // the permits) is structurally unwritable from here.
+        let envelope = match &hold {
             Some(h) => *h.envelope(),
             None => crate::substitute::NarHoldEnvelope::for_declared(
                 nar_data.len() as u64,
@@ -1040,6 +1045,18 @@ impl StoreServiceImpl {
             ))),
         };
         if let Err(e) = persisted {
+            // r[impl store.put.nar-hold-envelope+2]
+            // bug_094 (drop-before-abort): the budget releases FIRST
+            // — the abort needs no permits (the NAR buffer is already
+            // gone: the timed-out tail future dropped it), so a
+            // black-holed abort_placeholder (the bug_114 scenario) or
+            // 600s row-lock contention pins NOTHING, and the
+            // already-minted "permits released — retry" message is
+            // true the moment it exists. Placeholder cleanup stays
+            // best-effort with the orphan scanner as the recorded
+            // fallback (and the reap itself is hold-consulted —
+            // store.gc.hold-lanes).
+            drop(hold);
             self.abort_upload(&info.store_path_hash, claim).await;
             return Err(e);
         }
@@ -1664,6 +1681,104 @@ mod declared_budget_tests {
             declared_charge_tenant(Some(&claims)),
             t,
             "the signed tenant is the charge authority"
+        );
+    }
+}
+
+// r[verify store.put.nar-hold-envelope+2]
+#[cfg(test)]
+mod drop_before_abort_tests {
+    use super::*;
+    use rio_test_support::TestDb;
+    use rio_test_support::fixtures::{make_path_info_for_nar, test_store_path};
+
+    /// W10-J (bug_094): permit hold time <= the envelope under a
+    /// black-holed abort. Harness: the placeholder row is FOR
+    /// UPDATE-locked by an open tx (the bug_114 / 600s row-lock
+    /// contention shape, deterministic — a Notify-free structural
+    /// gate), the envelope is shrunk so the persist tail times out
+    /// instantly, and the probe asserts the budget returns to FULL
+    /// while the abort is still blocked on the lock. Pre-fix the
+    /// caller's frame pinned the declared-size permits for the whole
+    /// abort (red: the probe deadline fires with permits missing);
+    /// post-fix drop-before-abort releases them before the abort's
+    /// first PG statement.
+    #[tokio::test]
+    async fn budget_releases_before_blocked_abort() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let svc =
+            StoreServiceImpl::new(db.pool.clone()).with_nar_ingest_envelope(NarIngestEnvelopeCfg {
+                budget_wait_grace: Duration::from_millis(50),
+                hold_stall_window: Duration::from_millis(10),
+                hold_floor_rate: u64::MAX, // transfer allowance ~0
+            });
+        let full = svc.nar_budget().available_permits();
+
+        // The placeholder the abort will try to reap.
+        let nar = vec![0u8; 1024 * 1024];
+        let mut info = make_path_info_for_nar(&test_store_path("w10j"), &nar);
+        let claim = crate::metadata::insert_manifest_uploading(
+            &db.pool,
+            &info.store_path_hash.clone(),
+            info.store_path.as_str(),
+            &[],
+        )
+        .await
+        .unwrap()
+        .expect("fresh placeholder");
+        info.nar_hash = [0u8; 32]; // irrelevant: the tail times out first
+
+        // Declared-mode hold: the permits the law is about.
+        let hold = svc
+            .reserve_declared(nar.len() as u64, uuid::Uuid::from_u128(0x94), "W10-J")
+            .await
+            .expect("reservation grants");
+        assert!(svc.nar_budget().available_permits() < full);
+
+        // Black-hole the abort: FOR UPDATE the manifests row so
+        // reap_one blocks until we release.
+        let mut tx = db.pool.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM manifests WHERE store_path_hash = $1 FOR UPDATE")
+            .bind(&info.store_path_hash)
+            .fetch_optional(&mut *tx)
+            .await
+            .unwrap();
+        let tx_cell = std::cell::RefCell::new(Some(tx));
+
+        let fin = svc.finalize_single(info.clone(), claim, nar.clone(), None, Some(hold));
+        let probe = async {
+            // The witness: the budget restores to FULL while the
+            // abort still cannot finish (the row lock is ours).
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while svc.nar_budget().available_permits() != full {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "W10-J RED: permits pinned past the envelope while the \
+                     abort is black-holed on row-lock contention"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // Budget restored BEFORE the abort could complete; now
+            // release the lock so the (detached, best-effort) abort
+            // proceeds.
+            drop(tx_cell.borrow_mut().take());
+        };
+        let (fin_res, ()) = tokio::join!(fin, probe);
+        let err = fin_res.expect_err("the shrunk envelope aborts the persist tail");
+        assert_eq!(
+            err.code(),
+            tonic::Code::ResourceExhausted,
+            "the typed envelope abort, got {err:?}"
+        );
+        assert!(
+            err.message().contains("permits released"),
+            "the retry message is minted true (the permits ARE released), got: {}",
+            err.message()
+        );
+        assert_eq!(
+            svc.nar_budget().available_permits(),
+            full,
+            "every permit restored"
         );
     }
 }

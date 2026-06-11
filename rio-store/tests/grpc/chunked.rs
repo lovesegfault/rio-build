@@ -1902,3 +1902,230 @@ mod bw9s5_tiling {
         );
     }
 }
+
+// r[verify store.put.nar-hold-envelope+2]
+/// W10-K (bug_094, R22′): the tiling law for HOLD-PARAMETER fns,
+/// machine-checked — in any ingest-plane fn that RECEIVES a
+/// `NarIngestHold` parameter (the finalize_single class: a callee
+/// running inside someone else's hold), every `.await` must route
+/// through the deadline-consulting forms — `.bounded(`,
+/// `envelope.remaining()` — or sit AFTER the hold is dropped
+/// (`drop(hold`). Wave-8 bounded "every hold" and missed the error
+/// arm; wave-9 re-walked the same fn, restated the law 20 lines
+/// below the violation, and missed it again: per-await discipline
+/// loses to siblings, so the classifier is the census's verdict
+/// layer (the line inventory above stays the review surface).
+/// Planted red: a strawman hold-parameter fn with a naked await.
+#[test]
+fn hold_parameter_fns_await_only_through_the_envelope() {
+    let files: [(&str, &str); 3] = [
+        (
+            "rio-store/src/grpc/put_path/mod.rs",
+            include_str!("../../src/grpc/put_path/mod.rs"),
+        ),
+        (
+            "rio-store/src/grpc/put_path/common.rs",
+            include_str!("../../src/grpc/put_path/common.rs"),
+        ),
+        (
+            "rio-store/src/grpc/put_path_batch.rs",
+            include_str!("../../src/grpc/put_path_batch.rs"),
+        ),
+    ];
+
+    /// Extract `fn` items (signature + brace-matched body) whose
+    /// PARAMETER LIST mentions NarIngestHold.
+    fn hold_param_fns(src: &str) -> Vec<(String, String)> {
+        let needle = concat!("NarIngest", "Hold");
+        let bytes = src.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while let Some(pos) = src[i..].find("fn ") {
+            let at = i + pos;
+            if at > 0 && (bytes[at - 1] as char).is_alphanumeric() {
+                i = at + 3;
+                continue;
+            }
+            let name: String = src[at + 3..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            // param list: balanced parens from the first '(' after fn
+            let Some(p0) = src[at..].find('(').map(|p| at + p) else {
+                i = at + 3;
+                continue;
+            };
+            let mut depth = 1i32;
+            let mut j = p0 + 1;
+            while j < src.len() && depth > 0 {
+                match bytes[j] as char {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            let params = &src[p0..j];
+            // body: first '{' at depth 0 after the params (skip `;`)
+            let mut k = j;
+            let mut body = None;
+            while k < src.len() {
+                match bytes[k] as char {
+                    ';' => break,
+                    '{' => {
+                        let mut d = 0i32;
+                        let mut e = k;
+                        while e < src.len() {
+                            match bytes[e] as char {
+                                '{' => d += 1,
+                                '}' => {
+                                    d -= 1;
+                                    if d == 0 {
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            e += 1;
+                        }
+                        body = Some(&src[k..e.min(src.len())]);
+                        break;
+                    }
+                    _ => {}
+                }
+                k += 1;
+            }
+            if params.contains(needle)
+                && let Some(b) = body
+            {
+                out.push((name, b.to_string()));
+            }
+            i = match body {
+                Some(b) => at + 3 + b.len(),
+                None => at + 3,
+            };
+        }
+        out
+    }
+
+    /// The verdict: naked awaits in a hold-parameter fn body —
+    /// lawful forms are the combinator, the envelope timeout
+    /// (including a continuation `.await` line directly under it),
+    /// awaits inside an `async` block whose BINDING is demonstrably
+    /// consumed by `timeout(envelope.remaining(), <binding>)` later
+    /// in the same body, or a position after `drop(hold`.
+    fn naked_awaits(body: &str) -> Vec<String> {
+        // Enveloped async-block bindings: names N where the body
+        // contains `timeout(envelope.remaining(), N)`.
+        let mut enveloped: Vec<String> = Vec::new();
+        let pat = "envelope.remaining(), ";
+        let mut f = 0;
+        while let Some(i) = body[f..].find(pat) {
+            let at = f + i + pat.len();
+            let name: String = body[at..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                enveloped.push(name);
+            }
+            f = at;
+        }
+        let mut dropped = false;
+        let mut in_enveloped_block = 0i32;
+        let mut prev_lawful = false;
+        let mut bad = Vec::new();
+        for line in body.lines() {
+            let t = line.trim();
+            if t.starts_with("//") {
+                continue;
+            }
+            if t.contains("drop(hold") {
+                dropped = true;
+            }
+            // enter/leave enveloped async blocks (brace counting from
+            // the binding line `let N = async {`)
+            if in_enveloped_block == 0
+                && enveloped
+                    .iter()
+                    .any(|n| t.contains(&format!("let {n} = async")))
+            {
+                in_enveloped_block = 1;
+                // count braces on the binding line itself
+                in_enveloped_block += t.matches('{').count() as i32 - 1;
+                in_enveloped_block -= t.matches('}').count() as i32;
+                continue;
+            }
+            if in_enveloped_block > 0 {
+                in_enveloped_block += t.matches('{').count() as i32;
+                in_enveloped_block -= t.matches('}').count() as i32;
+                continue;
+            }
+            if !t.contains(".await") {
+                continue;
+            }
+            let lawful = t.contains(".bounded(")
+                || t.contains("envelope.remaining()")
+                || (t.starts_with('.') && prev_lawful)
+                || dropped;
+            prev_lawful = t.contains("envelope.remaining()") || t.contains(".bounded(");
+            if !lawful {
+                bad.push(t.to_string());
+            }
+        }
+        bad
+    }
+
+    let mut violations = Vec::new();
+    for (file, src) in files {
+        for (name, body) in hold_param_fns(src) {
+            for line in naked_awaits(&body) {
+                violations.push(format!("{file}::{name}: {line}"));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "naked .await inside hold-parameter fn(s) — every await while \
+         holding routes through NarIngestHold::bounded or the envelope \
+         timeout, or runs after drop(hold) (bug_094's :990 class):\n{}",
+        violations.join("\n")
+    );
+
+    // R22′ planted red: the strawman hold-parameter fn with a naked
+    // await MUST be flagged by the same extraction + verdict.
+    let strawman = "
+    async fn strawman_finalize(
+        &self,
+        claim: uuid::Uuid,
+        hold: Option<&NarIngestHold<'_>>,
+    ) -> Result<(), Status> {
+        self.abort_upload(&hash, claim).await;
+        Ok(())
+    }
+    ";
+    let fns = hold_param_fns(strawman);
+    assert_eq!(fns.len(), 1, "the scan must see the strawman fn");
+    assert_eq!(
+        naked_awaits(&fns[0].1).len(),
+        1,
+        "the strawman's naked await must be flagged"
+    );
+    // Polarity control: the lawful forms pass.
+    let lawful = "
+    async fn lawful_finalize(&self, hold: Option<&NarIngestHold<'_>>) {
+        let x = match hold {
+            Some(h) => h.bounded(\"x\", fut).await,
+            None => tokio::time::timeout(envelope.remaining(), fut).await,
+        };
+        drop(hold);
+        self.abort_upload(&hash, claim).await;
+    }
+    ";
+    let fns = hold_param_fns(lawful);
+    assert_eq!(fns.len(), 1);
+    assert!(
+        naked_awaits(&fns[0].1).is_empty(),
+        "combinator/envelope/post-drop awaits are lawful"
+    );
+}
