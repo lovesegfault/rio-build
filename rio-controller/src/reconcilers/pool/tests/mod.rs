@@ -92,7 +92,7 @@ pub(crate) fn test_ctx_with_admin(
     })
 }
 
-// r[verify ctrl.pool.fetcher-hardening+3]
+// r[verify ctrl.pool.fetcher-hardening+4]
 /// D3 belt-and-suspenders behind the CEL admission gate: a
 /// `Pool{kind=Fetcher}` whose spec slips past CEL with
 /// `seccompProfile: Unconfined` and `hostUsers: true` STILL
@@ -152,12 +152,25 @@ fn fetcher_hardening_ignores_spec() {
     );
 
     // Unset spec → ADR-019 default Some(false). Production EKS path.
+    // KNOWN-BROKEN against mountd's UDS gid-DAC check (0660 root:990
+    // host-side gid; userns remaps 990 → connect(2) EACCES) until
+    // reconciliation W01 lands Ed25519 mountd auth.
     pool.spec.host_users = None;
     assert_eq!(
         test_pod_spec(&pool).host_users,
         Some(false),
-        "Fetcher defaults hostUsers:false when spec is silent"
+        "Fetcher defaults hostUsers:false when spec is silent \
+         (ADR-019; mountd gid-DAC known broken until W01 Ed25519)"
     );
+
+    // Explicit spec override still honored in both directions.
+    pool.spec.host_users = Some(true);
+    assert_eq!(
+        test_pod_spec(&pool).host_users,
+        Some(true),
+        "explicit spec hostUsers:true honored for Fetcher (k3s escape hatch)"
+    );
+    pool.spec.host_users = None;
 
     // §13e B4: the legacy `rio.build/node-role` pool-static nodeSelector
     // is DELETED, but `effective_node_selector` RESTORES a pool-static

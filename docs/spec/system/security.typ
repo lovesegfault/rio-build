@@ -261,8 +261,8 @@ typed observation budget this rule requires.
 
 == Executor Pod Security
 
-#r("sec.pod.host-users-false+2")[
-  Executor pods MUST set `hostUsers: false` to activate Kubernetes
+#r("sec.pod.host-users-false+3")[
+  Builder pods MUST set `hostUsers: false` to activate Kubernetes
   user-namespace isolation (K8s 1.33+) on every cluster where the FUSE
   passthrough chain supports it. Container UIDs are remapped to
   unprivileged host UIDs; `CAP_SYS_ADMIN` applies only within the user
@@ -279,7 +279,14 @@ typed observation budget this rule requires.
   below kubelet's `1048576+` allocator) and the wave-13 sanitization
   boundary (the executor's overlay/chroot). The MUST re-engages
   unconditionally when P0560 (kernel/containerd idmapped-FUSE support)
-  lands and the I-186 pin is retired.
+  lands and the I-186 pin is retired. Fetcher pods inherit the same
+  `hostUsers: false` default; KNOWN-BROKEN until reconciliation W01 lands
+  Ed25519-based mountd auth: rio-mountd's UDS admission is a host-side gid
+  DAC check (`0660 root:990`) that is non-functional under a non-init
+  userns (kubelet remaps gid 990) --- until W01, the gid gate MUST NOT be
+  treated as an authorization boundary for Fetcher pods running
+  `hostUsers: false`; no other compensating control currently closes this
+  gap (see #rref("ctrl.pool.fetcher-hardening")).
 ]
 
 // rule-id is historical (device-plugin era); FUSE delivery is the rio-mountd

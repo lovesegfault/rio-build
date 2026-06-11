@@ -8,7 +8,7 @@ Manages rio-build lifecycle on Kubernetes via CRDs.
 
 == Pool
 
-#r("ctrl.crd.pool+1")[
+#r("ctrl.crd.pool+2")[
   ```yaml
   apiVersion: rio.build/v1alpha1
   kind: Pool
@@ -19,7 +19,7 @@ Manages rio-build lifecycle on Kubernetes via CRDs.
     maxConcurrent: 20                            # u32?, optional — concurrent-Job ceiling (one Job = one build); omit = uncapped Job count (the §13b placeable gate + per-class maxFleetCores caps bound fanout, not Job count)
     image: rio-builder:dev                       # string, required — container image ref
     systems: [x86_64-linux]                      # list<string>, required (non-empty per CEL)
-    hostUsers: false                             # bool?, optional — None ⇒ hostUsers:false (userns per ADR-012); CEL-forbidden for Fetcher
+    hostUsers: false                             # bool?, optional — None ⇒ kind-dependent default (Builder: false, userns per ADR-012; Fetcher: true, mountd UDS gid gate); NOT CEL-gated for Fetcher (k3s escape hatch)
     nodeSelector:
       rio.build/builder: "true"
     tolerations:
@@ -761,10 +761,12 @@ producer-emittable faces), not over the value domain.
   excluded from the already-Pending re-ack set in the same tick.
 ]
 
-#r("ctrl.pool.fetcher-hardening+3")[
+#r("ctrl.pool.fetcher-hardening+4")[
   For `kind=Fetcher`, `executor_params` MUST apply ADR-019 hardening regardless
   of spec: `readOnlyRootFilesystem: true`, `seccompProfile: Localhost
-  operator/rio-fetcher.json`, `hostUsers: false`, `privileged: false`, default
+  operator/rio-fetcher.json`, `privileged: false`, default `hostUsers: false`
+  (KNOWN-BROKEN against rio-mountd's host-side gid DAC check until
+  reconciliation W01 lands Ed25519 mountd auth --- see below), default
   `rio.build/fetcher: true` nodeSelector (§13e key, restored in B4) +
   `rio.build/fetcher:NoSchedule` toleration. CRD CEL rejects fetcher specs
   that set the overridden fields at admission time; the reconciler override
@@ -773,6 +775,18 @@ producer-emittable faces), not over the value domain.
   #rref("ctrl.pod.tgps-default"); the former 600 s stream-drain grace retired
   with the dispatch-mode knob.)
 ]
+
+The `hostUsers: false` default is KNOWN-BROKEN against rio-mountd's gid-DAC UDS
+admission: rio-mountd's only access control on its UDS is the socket-file DAC
+check (`0660 root:990`) against the connecting process's *host-side* gid; under
+`hostUsers: false` the kubelet remaps the fetcher's gid 990 into the pod's
+non-init user namespace, the host-side gid is no longer 990, and `connect(2)`
+fails EACCES --- every FOD fetch in the fleet fails. Until reconciliation W01
+lands Ed25519-based mountd access control, the gid gate MUST NOT be treated as
+an authorization boundary for Fetcher pods running `hostUsers: false`.
+Compensating controls while the gid gate is non-functional under userns: the
+forced Localhost `rio-fetcher.json` seccomp profile and the fetcher namespace's
+default-deny NetworkPolicy. The k3s VM tests set `hostUsers: true` explicitly.
 
 #r("ctrl.pool.fetcher-spawn-builtin")[
   For `kind=Fetcher` pools, `spec.systems` SHOULD include `"builtin"` so

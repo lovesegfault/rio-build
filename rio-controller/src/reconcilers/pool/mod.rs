@@ -6,7 +6,7 @@
 //! 3. Reap excess Pending and orphan Running Jobs.
 //! 4. Patch Pool.status from active Job count.
 // r[impl ctrl.pool.reconcile]
-// r[impl ctrl.crd.pool+1]
+// r[impl ctrl.crd.pool+2]
 // r[impl ctrl.reconcile.owner-refs]
 // r[impl ctrl.drain.sigterm+3]
 //!

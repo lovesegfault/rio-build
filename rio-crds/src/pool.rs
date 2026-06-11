@@ -59,7 +59,7 @@ impl ExecutorKind {
 /// have their own pools). Printer columns: what `kubectl get pools`
 /// shows — Kind/Ready/Desired at a glance is the main thing operators
 /// want.
-// r[impl ctrl.crd.pool+1]
+// r[impl ctrl.crd.pool+2]
 ///
 /// `KubeSchema` alongside `CustomResource`: KubeSchema processes
 /// `#[x_kube(validation)]` attrs into x-kubernetes-validations.
@@ -412,7 +412,7 @@ mod tests {
             json.contains("hostNetwork:true requires privileged:true"),
             "hostNetwork→privileged CEL rule has no message"
         );
-        // r[verify ctrl.crd.pool+1]
+        // r[verify ctrl.crd.pool+2]
         // D3: fetcher hardening rules. Admission-time rejection of
         // spec fields ADR-019 forces — the reconciler's belt-and-
         // suspenders override is `pool/pod.rs` fetcher hardening.

@@ -8,7 +8,7 @@
 {
   boot = {
     # ── sysctl ────────────────────────────────────────────────────────
-    # r[impl sec.pod.host-users-false+2]
+    # r[impl sec.pod.host-users-false+3]
     # Bottlerocket defaults user.max_user_namespaces=0; the old userData
     # raised it via [settings.kernel.sysctl]. Worker pods set hostUsers:
     # false (userns-mapped root, ADR-012) which clones a userns to idmap-
