@@ -179,6 +179,7 @@
     "rio_scheduler_topdown_substitute_fail_total",
     "rio_scheduler_transition_rejected_total",
     "rio_scheduler_undeclared_built_output_total",
+    "rio_scheduler_unexpected_built_output_total",
     "rio_scheduler_unroutable_features_total",
     "rio_scheduler_wanted_outputs_gc_total",
     "rio_scheduler_wanted_width_saturated_total",
@@ -1175,6 +1176,11 @@
         "name": "rio_scheduler_undeclared_built_output_total",
         "kind": "counter",
         "help": "Worker-supplied BuiltOutput.output_name not in derivation's output_names (dropped at handle_completion membership filter); alert if rate > 0"
+      },
+      {
+        "name": "rio_scheduler_unexpected_built_output_total",
+        "kind": "counter",
+        "help": "Worker-supplied BuiltOutput.output_path outside the assignment's dispatch-minted expected set (refused before any path_tenants registration stamp, on the admitted and late-register lanes; the scheduler-side mirror of the store's PutPath path-in-claims check); alert if rate > 0 — a nonzero rate is a forged or misbehaving worker report"
       },
       {
         "name": "rio_scheduler_unroutable_features_total",
