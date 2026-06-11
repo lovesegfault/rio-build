@@ -111,7 +111,7 @@
   certificate to rotate or expire.
 ]
 
-#r("common.hmac.claims")[
+#r("common.hmac.claims+2")[
   The scheduler signs *assignment tokens* (HMAC-SHA256) when dispatching work.
   Token format is
   `base64url(json(AssignmentClaims)).base64url(hmac_sha256(key, claims_json))`.
@@ -128,7 +128,11 @@
   - This prevents a compromised executor from writing to store paths it was
     never assigned to build.
   - Token lifetime is scoped to the build assignment; tokens expire after a
-    configurable TTL (default: 2× the build timeout).
+    configurable TTL (default: 2× the build timeout). The lifetime law bounds
+    the EXPIRY: `expiry_unix − mint ≤ 7 days` for any requested timeout — the
+    grace factor lives inside the bound (the timeout clamp is derived as
+    lifetime ÷ grace), so a leaked token's replay window never exceeds seven
+    days.
   - The signing key is a shared HMAC secret between the scheduler and store,
     stored as a Kubernetes Secret (recommend KMS/Vault for production).
   - *Read authorization:* Executors call `GetPath` and `QueryPathInfo` on the

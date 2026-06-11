@@ -533,10 +533,16 @@ async fn test_hmac_assignment_carries_tenant() -> TestResult {
     Ok(())
 }
 
-/// MAX_HMAC_TIMEOUT_SECS clamp: even if build_timeout is u64::MAX,
-/// the token's expiry stays bounded (≤ ~14 days from now: 7d × 2).
+// r[verify common.hmac.claims+2]
+/// E3, the token-LIFETIME law: the 7-day bound is on the EXPIRY (the
+/// security-relevant quantity — a leaked token's replay window), not
+/// on the timeout input. Pre-fix the clamp bounded the timeout and
+/// THEN doubled it (expiry = now + min(t, 7d) × 2 → 14d effective),
+/// so the "7 days max" comment was false by a factor of two. The law:
+/// for ANY requested build_timeout — saturating u64::MAX or the
+/// boundary 7d request alike — expiry − now ≤ 7 days.
 #[tokio::test]
-async fn test_hmac_timeout_clamps_to_seven_days() -> TestResult {
+async fn test_hmac_expiry_bounded_by_seven_day_lifetime() -> TestResult {
     use rio_auth::hmac::{HmacSigner, HmacVerifier};
 
     let db = TestDb::new(&MIGRATOR).await;
@@ -547,45 +553,54 @@ async fn test_hmac_timeout_clamps_to_seven_days() -> TestResult {
         p.hmac_signer = Some(Arc::new(HmacSigner::from_key(test_key.clone())));
     });
 
-    // Merge with build_timeout = u64::MAX.
-    let _ = merge_dag_req(
-        &handle,
-        MergeDagRequest {
-            build_id: Uuid::new_v4(),
-            tenant_id: None,
-            priority_class: PriorityClass::Scheduled,
-            nodes: vec![make_node("clamp-drv")],
-            edges: vec![],
-            options: BuildOptions {
-                build_timeout: u64::MAX.into(),
-                ..Default::default()
+    // Two populations: the saturation face (u64::MAX) and the
+    // boundary face (a lawful request of exactly 7d — the case the
+    // pre-fix law doubled to 14d).
+    for (drv, timeout) in [("clamp-drv", u64::MAX), ("boundary-drv", 7 * 86400)] {
+        let _ = merge_dag_req(
+            &handle,
+            MergeDagRequest {
+                build_id: Uuid::new_v4(),
+                tenant_id: None,
+                priority_class: PriorityClass::Scheduled,
+                nodes: vec![make_node(drv)],
+                edges: vec![],
+                options: BuildOptions {
+                    build_timeout: timeout.into(),
+                    ..Default::default()
+                },
+                keep_going: false,
+                traceparent: String::new(),
+                jti: None,
+                jwt_token: None,
             },
-            keep_going: false,
-            traceparent: String::new(),
-            jti: None,
-            jwt_token: None,
-        },
-    )
-    .await?;
+        )
+        .await?;
 
-    let assignment = pull_attempt(&handle, "clamp-drv").await;
+        let assignment = pull_attempt(&handle, drv).await;
 
-    let claims = HmacVerifier::from_key(test_key)
-        .verify::<rio_auth::hmac::AssignmentClaims>(&assignment.assignment_token)
-        .expect("token verifies");
+        let claims = HmacVerifier::from_key(test_key.clone())
+            .verify::<rio_auth::hmac::AssignmentClaims>(&assignment.assignment_token)
+            .expect("token verifies");
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    // 7 days × 2 = 14 days max. Allow 15 for clock skew tolerance.
-    let max_expected = now + 15 * 86400;
-    assert!(
-        claims.expiry_unix < max_expected,
-        "expiry {} should be clamped (< {}), not year 584942417355",
-        claims.expiry_unix,
-        max_expected
-    );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // The law's own quantity: lifetime = expiry − now ≤ 7d.
+        // 60s slack covers test elapsed time between mint and check.
+        let max_expected = now + 7 * 86400 + 60;
+        assert!(
+            claims.expiry_unix <= max_expected,
+            "requested timeout {timeout}: token lifetime must be bounded by the \
+             7-day law on the EXPIRY axis — got expiry {} (> {max_expected}; \
+             a 14d window means the bound was applied to the timeout, not \
+             the lifetime)",
+            claims.expiry_unix,
+        );
+
+        Ok::<(), anyhow::Error>(())?;
+    }
 
     Ok(())
 }

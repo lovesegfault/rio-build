@@ -951,9 +951,11 @@ impl DagActor {
         // accepted by a store with hmac_verifier=None (dev).
         //
         // Expiry: 2× build_timeout (or 2× daemon_timeout
-        // default if timeout=0). A worker legitimately
-        // uploading after completion is well within that
-        // window. Prevents replay from a leaked token later.
+        // default if timeout=0), bounded by the 7-day LIFETIME
+        // law below (expiry − now ≤ 7d for any requested
+        // timeout). A worker legitimately uploading after
+        // completion is well within that window. Prevents
+        // replay from a leaked token later.
         let assignment_token = if let Some(signer) = &self.hmac_signer {
             // Typed consume (merged_bug_034): the folded wire
             // value re-enters the WireSecs domain — it is
@@ -967,20 +969,27 @@ impl DagActor {
                 .map_or(rio_common::clamped::DAEMON_DEFAULT_TIMEOUT_SECS, |d| {
                     d.as_secs()
                 });
-            // Clamp BEFORE saturating_mul — the token-lifetime
-            // law, INDEPENDENT of the wire ceiling (1 yr): an
-            // expiry derived from even a lawfully-saturated
-            // timeout must not produce a months-lived token. A
-            // leaked long-lived token defeats the
-            // replay-prevention purpose of expiry entirely.
-            // 7 days max: well above any real build duration.
-            const MAX_HMAC_TIMEOUT_SECS: u64 = 7 * 86400;
-            let timeout_secs = timeout_secs.min(MAX_HMAC_TIMEOUT_SECS);
+            // r[impl common.hmac.claims+2]
+            // E3, the token-LIFETIME law, INDEPENDENT of the wire
+            // ceiling (1 yr): the 7-day bound is on the EXPIRY —
+            // the security-relevant quantity is a leaked token's
+            // replay window, which is expiry − now, not the
+            // timeout input. The ×2 grace (build run time plus the
+            // upload/report tail) lives INSIDE the bound: the
+            // timeout clamp is derived as lifetime ÷ grace, so
+            // expiry − now ≤ MAX_HMAC_LIFETIME_SECS by
+            // construction. Pre-fix the clamp bounded the timeout
+            // and then doubled it — a 14-day effective window
+            // under a "7 days max" comment.
+            const MAX_HMAC_LIFETIME_SECS: u64 = 7 * 86400;
+            const HMAC_LIFETIME_GRACE_FACTOR: u64 = 2;
+            let timeout_secs =
+                timeout_secs.min(MAX_HMAC_LIFETIME_SECS / HMAC_LIFETIME_GRACE_FACTOR);
             let expiry_unix = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0)
-                .saturating_add(timeout_secs.saturating_mul(2));
+                .saturating_add(timeout_secs.saturating_mul(HMAC_LIFETIME_GRACE_FACTOR));
             signer.sign(&rio_auth::hmac::AssignmentClaims {
                 executor_id: executor_id.to_string(),
                 drv_hash: drv_hash.to_string(),
