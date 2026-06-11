@@ -1082,17 +1082,39 @@ impl DagActor {
     /// dashboard/CLI/ComponentScaler never hold it
     /// (`r[sched.sla.threat.read-path-auth]`).
     ///
-    /// Reads `(kind, deadline_secs, eta_seconds)` from the current
-    /// [`compute_spawn_intents`] snapshot — the controller calls this
-    /// immediately after `GetSpawnIntents` so the `SolveCache` is warm
-    /// and the second pass is O(dag_nodes) HashMap walk + memo hits.
-    /// `intent_ids` not in the snapshot (drv left Ready/Queued between
-    /// the two calls — the two-RPC read-read race) are omitted from
-    /// the map; bug_121: the controller SKIPS an omitted intent this
-    /// tick (a token-less Job under HMAC is unauthenticatable BY
-    /// CONSTRUCTION — the retired posture spawned it into a
-    /// fast-fail + NameCollision + backoff-tax detour) and the intent
+    /// bug_046 (triage-corrected close): each REQUESTED id resolves
+    /// DIRECTLY against the DAG — node present AND status in the
+    /// mintable population (`Ready | Queued`, the same two statuses
+    /// the Ready and forecast emission loops serve — the match below
+    /// IS that population, structurally) → solve-per-id (SolveCache
+    /// memo hit; the controller calls this right after
+    /// `GetSpawnIntents`) → sign. The pre-fix form re-solved a full
+    /// unfiltered PAGE and diffed the ids against it, so a held id
+    /// was punished for OTHER nodes' movement (budget displacement by
+    /// newly merged candidates, the pre-W10-S per-view budget skew) —
+    /// the deterministic per-tick "drv left Ready" Omitted churn on
+    /// the live Fetcher/static-node arms. Now ONLY the id's own state
+    /// movement omits (the true read-read race: drv left
+    /// Ready/Queued between the two RPCs); bug_121: the controller
+    /// SKIPS an omitted intent this tick (a token-less Job under HMAC
+    /// is unauthenticatable BY CONSTRUCTION) and the intent
     /// re-presents next tick, minted.
+    ///
+    /// The mint AUTHENTICATES, never admits: the token binds the pod
+    /// to its intent identity; admission stays with the pull
+    /// (`DeliverNew` resolves the drv's state at pull time, and the
+    /// kernel fold refuses non-deliverable states), so resolving
+    /// per-id grants nothing the page diff withheld — it only stops
+    /// withholding credentials for intents the controller lawfully
+    /// holds.
+    ///
+    /// Token expiry: `deadline + eta-bound + 5min`. The eta bound is
+    /// 0 for Ready ids and the pass-wide `max_lead` fold for Queued
+    /// (forecast) ids — every admissible forecast intent satisfies
+    /// `eta < cell_lead ≤ max_lead`, so the bound covers any boot
+    /// horizon the page's per-intent `eta_seconds` could have carried
+    /// (conservative by ≤ `max_lead − eta`; the family clamp and the
+    /// derived fence horizon both dominate it).
     ///
     /// The second tuple element is the bug_121 keyless DISCRIMINATOR:
     /// `true` iff `hmac_signer` is None (keyless dev mode — no tokens
@@ -1110,34 +1132,45 @@ impl DagActor {
             return (HashMap::new(), true);
         };
         let now = rio_auth::now_unix().unwrap_or(0);
-        // Unfiltered: same population GetSpawnIntents serves. The
-        // controller's request may span Builder+Fetcher pools and
-        // Ready+forecast; one snapshot covers both.
-        let snap = self.compute_spawn_intents(&SpawnIntentsRequest::default());
-        let by_id: HashMap<&str, &rio_proto::types::SpawnIntent> = snap
-            .intents
-            .iter()
-            .map(|i| (i.intent_id.as_str(), i))
-            .collect();
+        let (hw, cost, inputs_gen) = self.solve_inputs();
+        let max_lead = self
+            .sla_config
+            .lead_time_seed
+            .values()
+            .copied()
+            .fold(0.0, f64::max);
         let tokens = intent_ids
             .iter()
             .filter_map(|id| {
-                let intent = by_id.get(id.as_str())?;
+                let drv_hash = crate::state::DrvHash::from(id.as_str());
+                let state = self.dag.node(&drv_hash)?;
+                // The mintable population — exactly the statuses the
+                // two emission loops serve (Ready loop / §13b
+                // forecast loop); anything else has left it (the
+                // id's OWN movement, the only lawful omission).
+                let eta_bound = match state.status() {
+                    DerivationStatus::Ready => 0.0,
+                    DerivationStatus::Queued => max_lead,
+                    _ => return None,
+                };
+                let kind = crate::state::kind_for_drv(state.is_fixed_output);
+                let intent = self.solve_intent_for(state, &hw, &cost, inputs_gen);
                 let token = signer.sign(&rio_auth::hmac::ExecutorClaims {
                     intent_id: id.clone(),
-                    kind: intent.kind,
-                    // `deadline + eta + 5min`: a forecast-spawned pod's
-                    // token covers its boot horizon. Preserved verbatim
-                    // from the pre-split `to_proto` mint. merged_bug_045:
-                    // this SIBLING mint of the dispatch assignment-token
-                    // mint (same family key) carried no seven-day clamp —
-                    // the family law now lives inside `sign` itself
-                    // (rio_auth::hmac::MAX_HMAC_LIFETIME_SECS), so this
-                    // expression is a REQUEST the signer bounds, and every
-                    // future family mint inherits the law by construction.
+                    kind: kind.into(),
+                    // `deadline + eta-bound + 5min`: the boot-horizon
+                    // window (see the method doc). merged_bug_045:
+                    // this SIBLING mint of the dispatch assignment-
+                    // token mint (same family key) carried no
+                    // seven-day clamp — the family law now lives
+                    // inside `sign` itself
+                    // (rio_auth::hmac::MAX_HMAC_LIFETIME_SECS), so
+                    // this expression is a REQUEST the signer bounds,
+                    // and every future family mint inherits the law
+                    // by construction.
                     expiry_unix: now
                         .saturating_add(u64::from(intent.deadline_secs))
-                        .saturating_add(intent.eta_seconds as u64)
+                        .saturating_add(eta_bound as u64)
                         .saturating_add(300),
                 });
                 Some((id.clone(), token))

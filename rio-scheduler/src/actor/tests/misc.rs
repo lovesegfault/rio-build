@@ -4242,3 +4242,117 @@ async fn forecast_tenant_ceiling_holds_across_filter_views() {
          cap admits nothing in any view"
     );
 }
+
+// r[verify sec.executor.identity-token+3]
+/// W10-T (bug_046, triage-corrected) — the Omitted-loop death,
+/// count-based at the mint. Pre-fix `mint_executor_tokens` re-solved
+/// a full unfiltered page and DIFFED the requested ids against it:
+/// any divergence between the page the controller polled and the
+/// page the mint re-solved (the budget-granularity bug pre-W10-S;
+/// population movement between the two RPCs after it) silently
+/// OMITTED held intents — the controller skips the token-less Job
+/// and re-polls, the same ids re-present, and the live
+/// Fetcher/static-node arms looped "drv left Ready" Omitted skips
+/// per tick (deterministic, not a transient race — the page diff
+/// punished ids for OTHER nodes' movement).
+///
+/// Post-fix the mint resolves each REQUESTED id directly against the
+/// DAG (solve-per-id, memoized): an id is minted iff ITS OWN node is
+/// still in the mintable population (Ready|Queued — the same status
+/// set the two emission loops serve); only the id's own state
+/// movement omits.
+///
+/// Cells:
+/// (a) displacement: ids lawfully obtained from a view poll, then
+///     the population SHIFTS (new, higher-rank forecast candidates
+///     merge before the mint). Pre-fix: the re-solved page admits
+///     the newcomers, the budget displaces the held ids — ZERO
+///     tokens for valid held intents (the red, count-based).
+///     Post-fix: the held ids' own nodes are unchanged — full
+///     coverage.
+/// (b) stationary churn: with no population movement, repeated
+///     polls and mints stay at full coverage (zero per-tick churn —
+///     count-based, not wall-clock).
+#[tokio::test]
+async fn mint_resolves_requested_ids_not_a_reemitted_page() {
+    use crate::sla::config::CapacityType;
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+
+    let mut sla = test_sla_config();
+    sla.lead_time_seed
+        .insert(("test-hw".into(), CapacityType::Spot), 200.0);
+    sla.max_forecast_cores_per_tenant = 8; // admits 2 × 4-core intents
+    let plumbing = DagActorPlumbing {
+        hmac_signer: Some(std::sync::Arc::new(rio_auth::hmac::HmacSigner::from_key(
+            b"test-key-at-least-32-bytes-long!".to_vec(),
+        ))),
+        ..Default::default()
+    };
+    let mut actor = DagActor::new(
+        SchedulerDb::new(db.pool.clone()),
+        DagActorConfig {
+            sla,
+            ..Default::default()
+        },
+        plumbing,
+    );
+
+    // Two aarch64 forecast candidates (hash-late: "zz*").
+    for q in ["zz0", "zz1"] {
+        let dep = format!("{q}dep");
+        actor.test_inject_at(&dep, "aarch64-linux", DerivationStatus::Running);
+        actor.test_inject_at(q, "aarch64-linux", DerivationStatus::Queued);
+        actor.test_inject_edge(q, &dep);
+        actor.test_set_running_eta(&dep, 50.0, 10, 4);
+    }
+    // The controller's per-pool poll: both zz intents emitted.
+    let view = SpawnIntentsRequest {
+        systems: vec!["aarch64-linux".into()],
+        ..Default::default()
+    };
+    let polled: Vec<String> = actor
+        .compute_spawn_intents(&view)
+        .intents
+        .iter()
+        .filter(|i| i.ready == Some(false))
+        .map(|i| i.intent_id.clone())
+        .collect();
+    assert_eq!(polled.len(), 2, "both zz intents polled");
+
+    // ── (a) displacement between poll and mint ─────────────────────
+    // Two new x86 candidates merge with near-zero ETA (deps almost
+    // done): the canonical admission sort (priority, cores, ETA asc,
+    // hash) ranks them FIRST, and they exhaust the cap in any page
+    // re-solve.
+    for q in ["aa0", "aa1"] {
+        let dep = format!("{q}dep");
+        actor.test_inject_at(&dep, "x86_64-linux", DerivationStatus::Running);
+        actor.test_inject_at(q, "x86_64-linux", DerivationStatus::Queued);
+        actor.test_inject_edge(q, &dep);
+        actor.test_set_running_eta(&dep, 50.0, 49, 4);
+    }
+    let (tokens, keyless) = actor.mint_executor_tokens(&polled);
+    assert!(!keyless, "signer configured");
+    assert_eq!(
+        tokens.len(),
+        polled.len(),
+        "left (pre-fix): the mint re-solved a page in which the newly \
+         merged aa* candidates displaced the HELD zz ids from the budget — \
+         0 of 2 lawfully held intents minted (the controller skips the \
+         token-less Job and loops the Omitted skip while its intent stays \
+         valid) / right: the mint resolves the requested ids against their \
+         OWN nodes (still Queued, still mintable) — full coverage"
+    );
+
+    // ── (b) stationary zero-churn, count-based over 3 mint beats ───
+    for beat in 0..3 {
+        let (tokens, _) = actor.mint_executor_tokens(&polled);
+        assert_eq!(
+            tokens.len(),
+            polled.len(),
+            "beat {beat}: a stationary population must produce ZERO \
+             per-tick Omitted churn (count-based)"
+        );
+    }
+}
