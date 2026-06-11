@@ -216,11 +216,13 @@ impl AdminServiceImpl {
     /// (poisoning λ\[h\]), drain arbitrary executors, or set SLA
     /// overrides to bias the solver fleet-wide.
     ///
-    /// MUST gate every mutating RPC. The canonical list lives in
-    /// `tests::mutating_rpcs_require_service_token` — adding a new
-    /// mutating RPC means adding it there too (so the test fails if
-    /// the gate is forgotten); read-only RPCs go in that test's
-    /// header comment instead.
+    /// MUST gate every RPC — mutating AND read-path. Every read leaks
+    /// something a compromised builder wants (logs, tenant attribution,
+    /// fleet topology, SLA fit state). The canonical classification
+    /// lives in `tests::{SERVICE_GATED, UNGATED_PUBLIC}` — a new RPC
+    /// fails `tests::admin_rpc_gate_coverage` until classified, and the
+    /// tokenless-reject coverage lives in
+    /// `tests::{mutating,read_path}_rpcs_require_service_token`.
     ///
     /// Thin wrapper over the shared
     /// [`rio_auth::hmac::ensure_service_caller`] (also used by
@@ -259,7 +261,16 @@ impl AdminService for AdminServiceImpl {
         // tonic emit HEADERS → TRAILERS, which Envoy encodes as a 0x80
         // body frame the browser CAN read.
         // r[impl dash.journey.build-to-logs]
-        if let Err(status) = self.ensure_leader() {
+        //
+        // Service-token gate (r[impl sched.sla.threat.read-path-auth]):
+        // build logs leak secrets routinely (env dumps, curl URLs with
+        // tokens, compiler paths) — a compromised builder on port 9001
+        // could read ANY build's logs cross-tenant without it. The
+        // dashboard's nginx mints `caller: rio-dashboard` per request.
+        if let Err(status) = self
+            .ensure_service_caller(request.metadata(), &["rio-cli", "rio-dashboard"])
+            .and_then(|_| self.ensure_leader())
+        {
             return Ok(Response::new(logs::err_stream(status)));
         }
         let req = request.into_inner();
@@ -284,6 +295,15 @@ impl AdminService for AdminServiceImpl {
         request: Request<()>,
     ) -> Result<Response<ClusterStatusResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        // r[impl sched.sla.threat.read-path-auth]
+        // Queue depth / executor counts / store size are capacity
+        // telemetry — a compromised builder on port 9001 could time its
+        // abuse to saturation windows. Same threat surface as
+        // `HwClassSampled`.
+        self.ensure_service_caller(
+            request.metadata(),
+            &["rio-controller", "rio-cli", "rio-dashboard"],
+        )?;
         self.ensure_leader()?;
         self.check_actor_alive()?;
 
@@ -327,6 +347,14 @@ impl AdminService for AdminServiceImpl {
         request: Request<ListExecutorsRequest>,
     ) -> Result<Response<ListExecutorsResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        // r[impl sched.sla.threat.read-path-auth]
+        // Executor ids, features, and current builds are fleet topology
+        // — exactly what a compromised builder needs to target
+        // `DrainExecutor`-style abuse or cross-tenant build snooping.
+        self.ensure_service_caller(
+            request.metadata(),
+            &["rio-controller", "rio-cli", "rio-dashboard"],
+        )?;
         self.ensure_leader()?;
         self.check_actor_alive()?;
         let req = request.into_inner();
@@ -342,6 +370,12 @@ impl AdminService for AdminServiceImpl {
         request: Request<ListBuildsRequest>,
     ) -> Result<Response<ListBuildsResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        // r[impl sched.sla.threat.read-path-auth]
+        // Build rows carry tenant attribution and derivation names for
+        // EVERY tenant (the tenant_filter is caller-chosen, not
+        // identity-derived) — ungated, any builder could enumerate who
+        // builds what.
+        self.ensure_service_caller(request.metadata(), &["rio-cli", "rio-dashboard"])?;
         self.ensure_leader()?;
         let req = request.into_inner();
         // Empty filter → no tenant filter (list all). Non-empty →
@@ -905,6 +939,11 @@ impl AdminService for AdminServiceImpl {
         request: Request<()>,
     ) -> Result<Response<DebugListExecutorsResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        // r[impl sched.sla.threat.read-path-auth]
+        // Same topology leak as `ListExecutors`, plus running_build per
+        // executor. rio-cli (`workers --actor/--diff`) is the only
+        // caller — the dashboard's nginx allowlist doesn't route it.
+        self.ensure_service_caller(request.metadata(), &["rio-cli"])?;
         let workers = self
             .actor
             .debug_query_workers()

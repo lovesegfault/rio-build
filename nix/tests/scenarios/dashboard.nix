@@ -119,8 +119,10 @@
   # appends a trailing LF, so any consumer that doesn't byte-trim it
   # (mirroring rio-auth load_key) computes a divergent HMAC and every
   # gated RPC returns PermissionDenied (Trailers-Only, first byte
-  # 0x80 not 0x00). ClusterStatus/GetDerivationLogs above are NOT gated,
-  # so they can't witness a bad token; this subtest is the tripwire.
+  # 0x80 not 0x00). ClusterStatus/GetDerivationLogs above are gated
+  # too (every AdminService read is, since the read-path sweep), so
+  # (3) also witnesses the token — this subtest predates that and
+  # stays as the named tripwire for the byte-trim regression.
       with subtest("service-token via nginx: njs HMAC verifies on gated RPC"):
           k3s_server.wait_until_succeeds(
               "printf '\\x00\\x00\\x00\\x00\\x00' | "
