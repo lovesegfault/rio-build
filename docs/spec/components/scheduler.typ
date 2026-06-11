@@ -4801,13 +4801,38 @@ name)`, the newer `last_observed` winning wholesale), so an observation
 folded before the edge reload survives it --- the menu plane needs no
 apply-window gate.
 
-#r("sched.sla.forecast.one-layer")[
+#r("sched.sla.forecast.one-layer+2")[
   `compute_spawn_intents` walks the Ready frontier AND a forecast frontier of
-  `Queued` derivations whose every incomplete dependency is running with $"ETA"
+  `Queued` derivations whose every incomplete dependency is running with a
+  fitted-curve $"ETA"$ — or substitution-active with the typed prior
+  (#rref("sched.sla.forecast.substituting-dep-eta")) — under $"ETA"
   < max_((h,"cap") in A) "lead_time"[h,"cap"]$. Each `SpawnIntent` carries
   $(A, c^*, M, D, "eta")$ with $"eta"=0$ for Ready and max-dep-ETA for
-  forecast. Forecast lookahead is exactly one DAG layer.
+  forecast. Forecast lookahead is exactly one DAG layer; the substitution
+  contribution is job-grounded direct evidence, never layer propagation.
 ]
+
+#r("sched.sla.forecast.substituting-dep-eta")[
+  A dependency carrying a store-ACTIVE materialization job (claimed, or
+  claimable now) MUST contribute the typed substitution prior
+  (`SUBSTITUTING_DEP_ETA_PRIOR_SECS`, violable) to the forecast dep walk
+  through the unchanged lead-horizon gates; a PACING job (parked/deferred)
+  MUST yield a typed, counted exclusion
+  (`forecast_dropped_total{reason="substituting_pacing"}`); an UNCLAIMED job
+  MUST NOT displace a live build attempt's progress-grounded ETA; an
+  unhydrated job view MUST fail closed to the status disposition, uncounted.
+]
+
+The disposition set is total over status × job armament (`SubstDepEta`,
+derived from the one `claimability` source — bug_170): a held claim displaces
+a stale build curve (cache hits never builder-dispatched have no curve at
+all); terminal dep statuses kill regardless of job state. The prior is static
+by design — the scheduler retains neither claim timestamps nor byte progress
+(`ReportMaterializationProgress` is a display-only relay), so in-flight decay
+is a recorded non-goal; the error rides the same `eta_error` absorption family
+as the ref↔wall skew, and the per-cell `lead_time` return channel remains
+absent (the seed-based gate approximation is the operative law for BOTH eta
+sources — r34 merged_bug_006's caveat carries unchanged).
 
 #r("sched.sla.forecast.tenant-ceiling")[
   Per-tenant Ready cores MUST be subtracted from the

@@ -4090,7 +4090,7 @@ fn bare_actor_per_intent_lead(pool: sqlx::PgPool, max_forecast_cores: u32) -> Da
 /// pre-solve and emits `forecast_dropped_total{reason=lead_horizon}`.
 ///
 /// Pre-fix: RED — drv `q-shallow` is admitted, no metric.
-// r[verify sched.sla.forecast.one-layer]
+// r[verify sched.sla.forecast.one-layer+2]
 #[tokio::test]
 async fn forecast_lead_horizon_per_intent() {
     let db = TestDb::new(&MIGRATOR).await;
@@ -4138,7 +4138,7 @@ async fn forecast_lead_horizon_per_intent() {
 /// metal seed (600s) for kvm intents. `eta=300 < 600` → admitted.
 /// Pre-fix: GREEN (the global max already admitted it). This is the
 /// inverse — the per-intent gate must not over-fire.
-// r[verify sched.sla.forecast.one-layer]
+// r[verify sched.sla.forecast.one-layer+2]
 #[tokio::test]
 async fn forecast_kvm_intent_uses_metal_lead() {
     let db = TestDb::new(&MIGRATOR).await;

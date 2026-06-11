@@ -1709,7 +1709,7 @@ fn bare_actor_forecast(pool: sqlx::PgPool, max_lead: f64, max_forecast_cores: u3
 /// Queued dep does NOT (no progress-grounded ETA — propagating
 /// `ETA(B)=ETA(A)+T(B)` would compound σ_resid per hop and admit
 /// trivial-drv fanout chains).
-// r[verify sched.sla.forecast.one-layer]
+// r[verify sched.sla.forecast.one-layer+2]
 #[tokio::test]
 async fn forecast_frontier_one_layer_only() {
     let db = TestDb::new(&MIGRATOR).await;
@@ -1773,7 +1773,7 @@ async fn forecast_frontier_one_layer_only() {
 /// clamped at 0. Regression: an early draft used `predicted.wall_secs`
 /// directly → forecast pods spawned `T(c)` early, idling for `elapsed`
 /// before the dep completed.
-// r[verify sched.sla.forecast.one-layer]
+// r[verify sched.sla.forecast.one-layer+2]
 #[tokio::test]
 async fn eta_is_remaining_not_total() {
     let db = TestDb::new(&MIGRATOR).await;
@@ -2118,7 +2118,7 @@ async fn forecast_substituting_prior_respects_lead_horizon() {
 /// one-layer cutoff forbids. A Queued dep WITHOUT a job still kills
 /// (the pre-F1 law, unchanged).
 // r[verify sched.sla.forecast.substituting-dep-eta]
-// r[verify sched.sla.forecast.one-layer]
+// r[verify sched.sla.forecast.one-layer+2]
 #[tokio::test]
 async fn forecast_substituting_queued_dep_job_grounded() {
     let db = TestDb::new(&MIGRATOR).await;
@@ -2460,7 +2460,7 @@ async fn forecast_budget_deterministic() {
 /// `lead_time_seed` empty → `max_lead = 0` → forecast pass disabled.
 /// Deploys without `xtask k8s probe-boot` seeding stay on the v1.0
 /// Ready-only path.
-// r[verify sched.sla.forecast.one-layer]
+// r[verify sched.sla.forecast.one-layer+2]
 #[tokio::test]
 async fn forecast_disabled_on_empty_lead_time_seed() {
     let db = TestDb::new(&MIGRATOR).await;

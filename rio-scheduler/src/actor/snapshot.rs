@@ -741,7 +741,7 @@ impl DagActor {
                 .is_none()
         };
 
-        // r[impl sched.sla.forecast.one-layer]
+        // r[impl sched.sla.forecast.one-layer+2]
         // ── §13b forecast frontier ────────────────────────────────
         // One DAG layer: a Queued drv whose every incomplete dep is
         // Assigned|Running with `ETA < max_h lead_time[h,cap]`. ETA is
