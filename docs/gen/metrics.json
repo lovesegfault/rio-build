@@ -84,6 +84,7 @@
     "rio_scheduler_attempt_record_retries_total",
     "rio_scheduler_attempt_requeue_seconds",
     "rio_scheduler_attempts_gc_deleted_total",
+    "rio_scheduler_backpressure_projected_drain_seconds",
     "rio_scheduler_broadcast_lagged_total",
     "rio_scheduler_build_duration_seconds",
     "rio_scheduler_build_graph_edges",
@@ -675,6 +676,12 @@
         "name": "rio_scheduler_attempts_gc_deleted_total",
         "kind": "counter",
         "help": "drv_attempts rows deleted by the periodic attempt-ledger retention sweep (sched.db.attempts-gc): suffix-complement rows past the retention horizon plus orphaned histories. The decision suffix is provably unchanged by every increment"
+      },
+      {
+        "name": "rio_scheduler_backpressure_projected_drain_seconds",
+        "kind": "gauge",
+        "help": "Projected mailbox drain time: queue depth × per-turn work-cost EWMA, refreshed at every dequeue. The cost axis of the backpressure law (round-9 B6): the flag engages when this reaches 30s (the submit-side caller deadline class) even at low depth — the live_053 inversion was 140s-class turns at 1–12.8% depth with silent depth watermarks. Watch it approach the budget; sustained high values at low mailbox depth mean individual commands are too expensive (pair with rio_scheduler_actor_cmd_seconds to name them).",
+        "aggregation": "per-replica"
       },
       {
         "name": "rio_scheduler_broadcast_lagged_total",

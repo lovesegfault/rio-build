@@ -8,7 +8,7 @@
 
 use super::*;
 
-// r[verify sched.admin.spawn-intents]
+// r[verify sched.admin.spawn-intents+2]
 /// `[sla]` on: each Ready derivation emits one intent. Proves the gRPC
 /// handler threads `ActorCommand::Admin(AdminQuery::GetSpawnIntents)`
 /// through to the proto response, and that proto3's `optional
@@ -173,7 +173,8 @@ async fn test_mint_executor_tokens_signs_per_intent() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.admin.spawn-intents]
+// r[verify sched.admin.spawn-intents+2]
+// r[verify sched.admission.mint-uncapped]
 /// **W9-AD (round-9 B3, Banner A-1/A-2)** — *the priority-head window:
 /// at N ≫ limit the served slice is bounded, `truncated` is honest,
 /// and the aggregates carry the UNCAPPED demand truth* — the

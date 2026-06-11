@@ -1,5 +1,5 @@
 //! External-facing actor handle.
-// r[impl sched.backpressure.hysteresis+2]
+// r[impl sched.backpressure.hysteresis+3]
 
 use super::*;
 
@@ -31,11 +31,12 @@ pub struct ActorHandle {
     /// boundary. Full lane fails OPEN to the main mailbox (the pre-B8
     /// FIFO path) — never drops.
     pub(super) admin_fast_tx: mpsc::Sender<FastAdmin>,
-    /// Shared read-only backpressure flag with the actor. The actor computes
-    /// hysteresis (activate at 80%, deactivate at 60%) and writes to its
-    /// `Arc<AtomicBool>`; the handle reads it via this read-only view for
-    /// send() and is_backpressured(). Without hysteresis, the handle used a
-    /// simple threshold -> flapping under load near 80%.
+    /// Shared read-only backpressure flag with the actor. The actor
+    /// computes joint two-axis hysteresis (depth 80%/60% watermarks OR
+    /// projected drain 30s/10s — round-9 B6's cost axis) and writes to
+    /// its `Arc<AtomicBool>`; the handle reads it via this read-only
+    /// view for send() and is_backpressured(). Without hysteresis, the
+    /// handle used a simple threshold -> flapping under load near 80%.
     pub(super) backpressure: BackpressureReader,
     /// Leader generation reader. The lease task and recovery's
     /// PG-floor seed write the underlying Arc;
@@ -85,8 +86,9 @@ impl ActorHandle {
 
     /// Send a command to the actor, checking backpressure (with hysteresis).
     pub async fn send(&self, cmd: ActorCommand) -> Result<(), ActorError> {
-        // Read the actor's hysteresis-aware backpressure flag, not a simple
-        // threshold. Activated at 80%, stays active until drained to 60%.
+        // Read the actor's hysteresis-aware backpressure flag, not a
+        // simple threshold. Engaged on depth (80%) OR projected drain
+        // (30s); stays active until BOTH axes are low (60% / 10s).
         if self.backpressure.is_active() {
             return Err(ActorError::Backpressure);
         }

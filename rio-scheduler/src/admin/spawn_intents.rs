@@ -14,7 +14,8 @@ use tonic::Status;
 use crate::actor::{ActorCommand, ActorHandle, AdminQuery, SpawnIntentsRequest};
 
 /// Query the actor for the spawn-intent snapshot, convert to proto.
-// r[impl sched.admin.spawn-intents]
+// r[impl sched.admin.spawn-intents+2]
+// r[impl sched.admission.mint-uncapped]
 pub(super) async fn get_spawn_intents(
     actor: &ActorHandle,
     req: GetSpawnIntentsRequest,

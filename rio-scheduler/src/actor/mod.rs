@@ -118,6 +118,37 @@ pub(crate) const ADMIN_FAST_LANE_CAPACITY: usize = 256;
 /// dashboard reads per second).
 pub(crate) const ADMIN_FAST_LANE_DRAIN_QUOTA: usize = 16;
 
+/// EWMA weight for the per-turn cost estimate feeding the cost-axis
+/// backpressure law (round-9 B6). 0.3 makes a single pathological
+/// turn (the live_053 140s command) dominate the estimate immediately
+/// (one observation lands 0.3 × 140s = 42s — already over the high
+/// drain budget at ANY non-zero depth) while ~10 healthy sub-ms turns
+/// decay it back under the release bound (0.7¹⁰ ≈ 0.03). Violable
+/// (R17): the law W9-AH pins is engage-on-cost / release-on-decay,
+/// not the weight.
+const BACKPRESSURE_COST_EWMA_ALPHA: f64 = 0.3;
+
+/// Cost-axis ENGAGE bound (round-9 B6): backpressure activates when
+/// projected mailbox drain time (queue depth × per-turn cost EWMA)
+/// reaches this many seconds, regardless of depth fraction.
+/// Derivation: 30s is the submit-side caller deadline class
+/// (`grpc_timeout` — the gateway returns DEADLINE_EXCEEDED past it);
+/// a mailbox that cannot drain within the deadline of the callers
+/// queued in it is already failing all of them, so shedding NEW work
+/// is strictly better than accepting it. Violable (R17): the paired
+/// witness pins the inversion (engage while depth ≪ watermark), not
+/// the number.
+const BACKPRESSURE_DRAIN_HIGH_SECS: f64 = 30.0;
+
+/// Cost-axis RELEASE bound (round-9 B6): the cost term clears when
+/// projected drain falls to this many seconds. 3× under the engage
+/// bound — the same anti-flap band shape as the 0.80/0.60 depth pair
+/// — and far above any healthy steady state (sub-ms turns × even a
+/// full mailbox ≈ single-digit seconds). Release requires BOTH axes
+/// low (depth AND cost): a one-axis release would re-admit work the
+/// other axis is still drowning under.
+const BACKPRESSURE_DRAIN_LOW_SECS: f64 = 10.0;
+
 /// Phase 1b: how many times a failure completion whose appending
 /// transaction failed is re-delivered to the actor's own mailbox before
 /// the event is dropped. The derivation stays in its pre-report state
@@ -832,6 +863,12 @@ pub struct DagActor {
     /// a sender never wedges shutdown (the loop exits via the
     /// cancellation token, not channel closure).
     admin_fast_tx: mpsc::Sender<FastAdmin>,
+    /// Per-turn work-cost EWMA in seconds (round-9 B6) — fed by
+    /// [`DagActor::note_turn_cost`] after every mailbox command and
+    /// every fast-lane serve; consumed by `update_backpressure`'s
+    /// cost axis (projected drain = depth × this). Plain `f64`: only
+    /// the single-threaded actor loop reads/writes it.
+    turn_cost_ewma_secs: f64,
     /// Last [`ClusterSnapshot`] published by `handle_tick`. The
     /// AdminService `cluster_status` handler reads `snapshot_tx.
     /// subscribe().borrow()` via [`ActorHandle::cluster_snapshot_cached`]
@@ -1074,6 +1111,7 @@ impl DagActor {
             probe_quota: ProbeQuotaLedger::default(),
             admin_fast_rx,
             admin_fast_tx,
+            turn_cost_ewma_secs: 0.0,
             snapshot_tx: watch::channel(Arc::new(ClusterSnapshot::default())).0,
             #[cfg(test)]
             recovery_toctou_gate: plumbing.recovery_toctou_gate,
@@ -1239,6 +1277,10 @@ impl DagActor {
             // leader-agnostic exactly as the mailbox Admin path is.
             admin_fast_rx: _,
             admin_fast_tx: _,
+            // Retained: the cost estimate describes THIS process's
+            // turn costs, which a leader transition does not change;
+            // it decays in ~10 turns either way.
+            turn_cost_ewma_secs: _,
             snapshot_tx: _,
             #[cfg(test)]
                 recovery_toctou_gate: _,
@@ -1756,6 +1798,11 @@ impl DagActor {
             }
 
             let cmd_elapsed = t_cmd.elapsed();
+            // B6: feed the per-turn cost EWMA — the NEXT iteration's
+            // update_backpressure prices the queue with it (the
+            // engagement window is the first dequeue after a stall,
+            // which is exactly when the built-up queue needs shedding).
+            self.note_turn_cost(cmd_elapsed);
             metrics::histogram!("rio_scheduler_actor_cmd_seconds", "cmd" => cmd_name)
                 .record(cmd_elapsed.as_secs_f64());
             if cmd_elapsed >= std::time::Duration::from_secs(1) {
@@ -1775,27 +1822,75 @@ impl DagActor {
     // Backpressure
     // -----------------------------------------------------------------------
 
-    // pub(crate) for hysteresis unit test (tests/misc.rs). Called once
-    // per command iteration at the top of run_inner (line ~295); tests
-    // exercise the watermark transitions directly on a bare actor.
+    /// Record one actor work unit's cost into the per-turn EWMA
+    /// (round-9 B6) — the producer side of the cost-axis backpressure
+    /// law. Called by `run_inner` after every mailbox command and by
+    /// `serve_fast_admin` after every fast-lane handler: any work that
+    /// occupies the single-threaded actor inflates the drain time of
+    /// everything queued behind it, whichever lane it arrived on.
+    pub(crate) fn note_turn_cost(&mut self, elapsed: std::time::Duration) {
+        let s = elapsed.as_secs_f64();
+        self.turn_cost_ewma_secs = BACKPRESSURE_COST_EWMA_ALPHA * s
+            + (1.0 - BACKPRESSURE_COST_EWMA_ALPHA) * self.turn_cost_ewma_secs;
+    }
+
+    // pub(crate) for the hysteresis + cost-axis unit tests
+    // (tests/misc.rs). Called once per command iteration at the top of
+    // run_inner; tests exercise the watermark transitions directly on
+    // a bare actor.
+    //
+    // TWO axes (round-9 B6 added the second):
+    // - depth: queue fraction vs the 0.80/0.60 watermarks (unchanged).
+    // - cost: projected drain time = queue_len × per-turn cost EWMA
+    //   vs the 30s/10s drain bounds. The live_053 inversion this
+    //   closes: one 140s command at 1–12.8% depth = total
+    //   time-starvation with silent watermarks — depth is a proxy for
+    //   drain time only when turns are uniform, and the incident
+    //   turns were 5 orders of magnitude apart.
+    // Engage on EITHER axis high; release only when BOTH are low
+    // (joint hysteresis — a one-axis release would re-admit work the
+    // other axis is still drowning under).
+    // r[impl sched.admission.work-per-turn]
     pub(crate) fn update_backpressure(&mut self, queue_len: usize, capacity: usize) {
         let fraction = queue_len as f64 / capacity as f64;
+        let projected_drain_secs = queue_len as f64 * self.turn_cost_ewma_secs;
+        // The cost signal's falsifiable production surface (the
+        // W9-AH plane): visible BEFORE engagement, so dashboards can
+        // watch the drain projection approach the budget.
+        metrics::gauge!("rio_scheduler_backpressure_projected_drain_seconds")
+            .set(projected_drain_secs);
         let was_active = self.backpressure_active.load(Ordering::Relaxed);
 
-        if !was_active && fraction >= BACKPRESSURE_HIGH_WATERMARK {
+        if !was_active
+            && (fraction >= BACKPRESSURE_HIGH_WATERMARK
+                || projected_drain_secs >= BACKPRESSURE_DRAIN_HIGH_SECS)
+        {
             self.backpressure_active.store(true, Ordering::Relaxed);
             warn!(
                 queue_len,
                 capacity,
-                "backpressure activated at {:.0}% capacity",
-                fraction * 100.0
+                projected_drain_secs,
+                turn_cost_ewma_secs = self.turn_cost_ewma_secs,
+                "backpressure activated ({}): {:.0}% capacity, projected drain {:.1}s",
+                if fraction >= BACKPRESSURE_HIGH_WATERMARK {
+                    "depth"
+                } else {
+                    "work-cost"
+                },
+                fraction * 100.0,
+                projected_drain_secs,
             );
             metrics::counter!("rio_scheduler_queue_backpressure").increment(1);
-        } else if was_active && fraction <= BACKPRESSURE_LOW_WATERMARK {
+        } else if was_active
+            && fraction <= BACKPRESSURE_LOW_WATERMARK
+            && projected_drain_secs <= BACKPRESSURE_DRAIN_LOW_SECS
+        {
             self.backpressure_active.store(false, Ordering::Relaxed);
             info!(
                 queue_len,
-                capacity, "backpressure deactivated, resuming normal operation"
+                capacity,
+                projected_drain_secs,
+                "backpressure deactivated, resuming normal operation"
             );
         }
     }
@@ -1838,6 +1933,9 @@ impl DagActor {
         let t = Instant::now();
         self.handle_admin(fa.query);
         let elapsed = t.elapsed();
+        // B6: fast-lane serves occupy the actor too — they price into
+        // the same per-turn cost EWMA the mailbox path feeds.
+        self.note_turn_cost(elapsed);
         metrics::histogram!("rio_scheduler_actor_cmd_seconds", "cmd" => "Admin")
             .record(elapsed.as_secs_f64());
         if elapsed >= std::time::Duration::from_secs(1) {
@@ -1854,6 +1952,7 @@ impl DagActor {
     /// queries (work-per-turn — the A-1 discipline applied to the lane
     /// itself). Called at every Tick phase boundary; the run loop's
     /// biased select covers between-command service.
+    // r[impl sched.admission.work-per-turn]
     pub(super) fn drain_admin_fast_lane(&mut self) {
         for _ in 0..ADMIN_FAST_LANE_DRAIN_QUOTA {
             match self.admin_fast_rx.try_recv() {

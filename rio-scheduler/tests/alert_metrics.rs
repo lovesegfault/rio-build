@@ -45,6 +45,13 @@ fn gauge_exemptions() -> Vec<GaugeExemption> {
                         a standby's depth is real signal, not a stale leader copy",
         },
         GaugeExemption {
+            name: "rio_scheduler_backpressure_projected_drain_seconds",
+            rationale: "per-replica by design (round-9 B6): depth × per-turn cost \
+                        EWMA of THIS replica's mailbox — the same ownership as \
+                        actor_mailbox_depth, whose product it is; a standby's \
+                        projection is its own real signal",
+        },
+        GaugeExemption {
             name: "rio_scheduler_sla_hw_cost_stale_seconds",
             rationale: "per-replica BY SPEC (observability.typ: climbs while this \
                         replica is standby under hw_cost_source=spot); zeroing it \

@@ -206,6 +206,18 @@ pub fn describe_metrics() {
          the actor is single-threaded so a slow command head-of-line \
          blocks every queued RPC"
     );
+    describe_gauge!(
+        "rio_scheduler_backpressure_projected_drain_seconds",
+        "Projected mailbox drain time: queue depth × per-turn work-cost \
+         EWMA, refreshed at every dequeue. The cost axis of the \
+         backpressure law (round-9 B6): the flag engages when this \
+         reaches 30s (the submit-side caller deadline class) even at \
+         low depth — the live_053 inversion was 140s-class turns at \
+         1–12.8% depth with silent depth watermarks. Watch it approach \
+         the budget; sustained high values at low mailbox depth mean \
+         individual commands are too expensive (pair with \
+         rio_scheduler_actor_cmd_seconds to name them)."
+    );
     describe_histogram!(
         "rio_scheduler_actor_admin_fast_delivery_seconds",
         "Fast-lane admin DELIVERY latency (enqueue to handler start, \

@@ -745,7 +745,7 @@ async fn test_merge_dag_reply_dropped_cancels_orphan() -> TestResult {
 // Backpressure hysteresis (direct unit test)
 // ---------------------------------------------------------------------------
 
-// r[verify sched.backpressure.hysteresis+2]
+// r[verify sched.backpressure.hysteresis+3]
 /// Hysteresis: active fires at ≥80% (HIGH), clears at ≤60% (LOW).
 /// Between 60-80% the current state is sticky — prevents flapping.
 ///
@@ -787,6 +787,68 @@ async fn test_backpressure_hysteresis() -> TestResult {
     // 70% again → below HIGH → STAYS inactive (sticky).
     actor.update_backpressure(7000, 10_000);
     assert!(!reader.is_active(), "70% < HIGH → sticky inactive");
+
+    Ok(())
+}
+
+/// W9-AH (round-9 B6): backpressure engages on projected WORK-COST,
+/// not queue depth alone. The live_053 inversion: one command worth
+/// 140s of actor time, mailbox depth 1.0–12.8% — the depth watermarks
+/// stayed silent through total time-starvation while queued callers'
+/// deadlines all lapsed. Post-fix the same shape engages: projected
+/// drain (depth × per-turn cost EWMA) over the high drain budget
+/// trips the SAME hysteresis flag the gateway already sheds on, and
+/// release requires BOTH axes low (depth AND projected drain).
+///
+/// Structural drive (no wall clock): the cost observations are fed
+/// directly to `note_turn_cost` — exactly what `run_inner` records
+/// after each command — and the law is asserted on the flag.
+// r[verify sched.admission.work-per-turn]
+// r[verify sched.backpressure.hysteresis+3]
+#[tokio::test]
+async fn backpressure_engages_on_work_cost_while_depth_low() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor(db.pool.clone());
+    let reader = actor.backpressure_flag();
+
+    // The incident shape: ONE turn worth 140s, then the loop observes
+    // a 1% depth (100 of 10,000 queued during the stall).
+    actor.note_turn_cost(std::time::Duration::from_secs(140));
+    actor.update_backpressure(100, 10_000);
+    assert!(
+        reader.is_active(),
+        "depth 1% but projected drain = 100 × EWMA(140s-turn) ≫ the drain \
+         budget: cost-blind watermarks stayed silent through total \
+         time-starvation (W9-AH)"
+    );
+
+    // Recovery: fast turns decay the EWMA; release only when BOTH the
+    // depth axis (already low) AND the projected drain axis clear LOW.
+    for _ in 0..200 {
+        actor.note_turn_cost(std::time::Duration::from_millis(1));
+    }
+    actor.update_backpressure(100, 10_000);
+    assert!(
+        !reader.is_active(),
+        "after 200 × 1ms turns the projected drain is far under the LOW \
+         release bound at depth 1% — the cost axis must release (sticky \
+         forever = a one-off stall sheds work indefinitely)"
+    );
+
+    // The depth law is UNCHANGED (joint hysteresis, not replacement):
+    // 80% engages even with a cold cost EWMA…
+    actor.update_backpressure(8000, 10_000);
+    assert!(
+        reader.is_active(),
+        "80% depth must still engage with a near-zero cost EWMA"
+    );
+    // …and release needs depth back under LOW too.
+    actor.update_backpressure(6000, 10_000);
+    assert!(
+        !reader.is_active(),
+        "60% depth + near-zero projected drain must release (both axes low)"
+    );
 
     Ok(())
 }
@@ -1970,7 +2032,7 @@ async fn forecast_overdue_dep_is_not_ready() {
 /// Assigned → intent drops (only Ready emits intents). Also covers
 /// `solve_intent_for`'s `deadline_secs` clamp:
 /// `min(max(computed, floor.deadline), DEADLINE_CAP_SECS)`.
-// r[verify sched.admin.spawn-intents]
+// r[verify sched.admin.spawn-intents+2]
 #[tokio::test]
 async fn spawn_intents_end_to_end_and_deadline_clamp() -> TestResult {
     let (_db, handle, _task) = setup_with_big_ceilings().await;
@@ -3472,6 +3534,7 @@ async fn driven_leader_tick_records_every_phase_cell() -> TestResult {
 ///
 /// Pre-fix red (FIFO delivery behind the whole tick): the first mint
 /// waited out the remaining ~6.3s of the 6.6s tick > 5s SLO.
+// r[verify sched.admission.work-per-turn]
 #[tokio::test]
 async fn admin_mint_latency_bounded_under_long_tick() -> TestResult {
     let (_db, handle, _task) = setup().await;

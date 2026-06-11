@@ -790,6 +790,7 @@ fn general_pool_cpu_limit(values_yaml: &str) -> Result<u32> {
 /// ceiling now stops where hosting stops; the previous live fix was a
 /// hand `--set` to 46 that the next `eks up` would have clobbered
 /// back to 173.
+// r[impl sched.admission.leading-signal-clamped]
 fn derive_store_ceiling(
     measured_max_connections: u32,
     non_store_budget: u32,
@@ -961,6 +962,7 @@ mod ceiling_tests {
     /// store nodes under one-replica-per-node anti-affinity — KEDA
     /// committed 4->173 in 75s and stranded 133 pods Pending. The
     /// deployed ceiling is the min of the arms.
+    // r[verify sched.admission.leading-signal-clamped]
     #[test]
     fn derive_store_ceiling_clamps_to_karpenter_hostable() {
         // The incident shape: min(173, 46) = 46 — the value the live

@@ -11169,6 +11169,7 @@ async fn materialization_probe_is_screened_not_minted() -> TestResult {
 /// (subtracted); the per-job regression shape is >= N fenced write
 /// transactions, the batched form a small constant (the sweep tx;
 /// the pin release is read-only when no pins exist).
+// r[verify sched.admission.work-per-turn]
 #[tokio::test]
 async fn zero_interest_cancel_sweep_transaction_bound() -> TestResult {
     const N: usize = 40;

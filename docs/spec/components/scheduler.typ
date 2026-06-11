@@ -68,8 +68,11 @@ freshly-spawned builder did not idle a full tick). There is no scheduler-side
 dispatch pass and no heartbeat intake left to pace: work delivery is the
 pod-initiated `PullAssignment` unary, and the surviving Ready-set store
 short-circuit (`sweep_ready_cached`) runs from the same state-change events
-plus once per Tick, bounded by `probed_generation` rather than by a dispatch
-cap. The actor-mailbox protection that motivated the pacing is carried by the
+plus once per Tick, bounded by the per-tick probe-admission quota
+(`DISPATCH_PROBE_TICK_QUOTA` with `probed_generation` stamping --- the
+deferred tail carries to the next tick, oldest-first;
+#rref("sched.admission.work-per-turn")). The actor-mailbox protection that
+motivated the pacing is carried by the
 unary admission shape itself --- a pull is one bounded actor turn, and
 backpressure surfaces as retried pulls (#rref("sched.executor.pull-transaction")).
 
@@ -934,13 +937,20 @@ registration, draining, degraded, or connecting state left to report.
   --scenarios` ephemeral-tenant cleanup; no soft-delete or audit trail.
 ]
 
-#r("sched.admin.spawn-intents")[
+#r("sched.admin.spawn-intents+2")[
   `AdminService.GetSpawnIntents` returns one `SpawnIntent` per Ready
-  derivation, optionally filtered server-side by `{kind, systems, features}`.
-  `intent_id == drv_hash`; `(cores, mem_bytes, disk_bytes, deadline_secs)` are
+  derivation, optionally filtered server-side by `{kind, systems, features}`
+  and served through a priority-head window: a request with `limit > 0`
+  MUST receive the first `limit` intents of the priority-descending order
+  with `truncated` set iff the page was cut; `limit == 0` (the proto3
+  default and every pre-window client) is unbounded --- the exact
+  pre-window behavior. `intent_id == drv_hash`; `(cores, mem_bytes,
+  disk_bytes, deadline_secs)` are
   computed by `solve_intent_for` so the controller spawns and the scheduler
   dispatches the SAME shape. `queued_by_system` carries the unfiltered
-  per-system Ready breakdown (sum == `ClusterStatus.queued_derivations`) for
+  FULL-population per-system Ready breakdown (sum ==
+  `ClusterStatus.queued_derivations`, window-invariant --- the aggregate is
+  the demand truth per #rref("sched.admission.mint-uncapped")) for
   the ComponentScaler's predictive signal.
 ]
 
@@ -3359,6 +3369,62 @@ The same view feeds the #(refs.metric)("rio_scheduler_open_attempts") gauge
 the establishment sweep, and backs the re-implemented
 #rref("sched.admin.list-executors+3") projection.
 
+= Admission
+
+The round-9 Banner-A laws. The live_053 freeze measured the failure
+shape they close: a 134.65s Tick (one 16.6s unbatched cancel sweep +
+unattributed remainder), admin mints delivered 18s late against a 5s
+caller deadline, depth-based backpressure silent at 1--12.8% capacity
+through total time-starvation, and a 379-call/12min unpaginated
+intent-poll plane. Admission is therefore denominated in
+*work-per-turn* --- per-cycle quotas with carried remainders, cost-priced
+shedding, windowed serving --- never in raw queue depth or producer caps.
+
+#r("sched.admission.work-per-turn")[
+  Every scheduler-side consumer of an unbounded demand population MUST
+  bound its work per cycle by a typed quota and carry the unserved
+  remainder to later cycles, never re-granting it within the same
+  cycle; and admission pressure MUST price projected work-cost (queue
+  depth × observed per-turn cost), not queue depth alone.
+]
+Worked instances: the dispatch-probe tick quota
+(`DISPATCH_PROBE_TICK_QUOTA` --- per-generation ledger, oldest-first
+next-tick carry), the admin fast lane's per-visit drain quota
+(`ADMIN_FAST_LANE_DRAIN_QUOTA` --- also the biased-select fairness cap),
+the batched zero-interest cancel sweep (one fenced statement regardless
+of population --- the B1 interstitial), and the cost-axis backpressure
+signal (projected drain = depth × per-turn EWMA against the 30s/10s
+drain bounds, #rref("sched.backpressure.hysteresis+3")).
+
+#r("sched.admission.mint-uncapped")[
+  The demand record is the demand truth: the scheduler MUST NOT cap the
+  spawn-intent mint or the aggregate demand signals (`queued_by_system`,
+  the ice-masked cells); bounds live on the consumer's served slice ---
+  the priority-head window of #rref("sched.admin.spawn-intents+2") ---
+  never on the mint.
+]
+Capping the mint is the anti-shape: a capped demand record under-feeds
+every downstream sizing decision (the controller's cover deficit, the
+ComponentScaler's predictive signal, the KEDA backlog gauge) exactly
+when demand is highest, and the consumers cannot detect the
+shortfall --- a truncation FLAG on a windowed page is honest, a silently
+clipped aggregate is not.
+
+#r("sched.admission.leading-signal-clamped")[
+  A leading capacity signal MAY lead demand; its ceiling MUST be
+  hostability-clamped (the demand-derived arm taken `min` against what
+  the fleet can actually host) and its per-period scale commitment
+  bounded.
+]
+Landed instances (the B-1 interstitial): xtask's `derive_store_ceiling`
+takes `min(pg_arm, hostable_arm)` and logs the binding arm at boot ---
+the PG-only ceiling once let KEDA commit 4→173 replicas in 75s against
+a pool hosting 46 (live_052); and the store ScaledObject's scaleUp
+policy bounds per-period commitment (Pods 16/30s, stabilization window
+0s preserved) --- the chart half carries no tracey markers (YAML is
+unscannable), so it is bound by the helm fragment test
+`nix/tests/helm/26-store-scaling.sh` and cited here.
+
 = Backpressure
 
 The scheduler applies @backpressure at multiple layers to prevent overload:
@@ -3369,20 +3435,30 @@ that cannot be served (overload, failover, recovery) surfaces as a retried
 unary on the pod side; the actor never queues undelivered work for a slow
 consumer.
 
-#r("sched.backpressure.hysteresis+2")[
-  *Actor queue depth limit:* The DAG actor's `mpsc` channel has a fixed
-  capacity (`ACTOR_CHANNEL_CAPACITY` = 10,000 messages; compile-time constant).
-  If the queue depth exceeds 80% of capacity:
+#r("sched.backpressure.hysteresis+3")[
+  *Actor queue pressure:* The DAG actor's `mpsc` channel has a fixed
+  capacity (`ACTOR_CHANNEL_CAPACITY` = 10,000 messages; compile-time
+  constant). Backpressure MUST engage when EITHER axis is high: queue
+  depth at/above 80% of capacity, OR projected drain time (queue depth ×
+  the observed per-turn work-cost EWMA) at/above the 30s drain budget ---
+  depth is a drain-time proxy only under uniform turn costs, and the
+  live_053 turns spanned five orders of magnitude (one 140s command at
+  1--12.8% depth starved every queued caller with silent watermarks).
+  While engaged:
   + New `SubmitBuild` requests from the gateway receive gRPC
     `RESOURCE_EXHAUSTED` status.
   + The scheduler increments the
-    #(refs.metric)("rio_scheduler_queue_backpressure") counter for alerting.
+    #(refs.metric)("rio_scheduler_queue_backpressure") counter for alerting
+    (the projected drain itself is continuously visible on
+    #(refs.metric)("rio_scheduler_backpressure_projected_drain_seconds")).
   + Pull-mode report intake keeps using `send_unchecked` --- a completion
     report must never be dropped (a lost completion would leave the
     derivation stuck `Running`); the pod's bounded retry is the relief
     valve, never discard.
-  Normal processing resumes when the queue depth drops below 60% (hysteresis to
-  prevent oscillation). (The stream-era intake arms this rule used to
+  Normal processing resumes only when BOTH axes are low --- depth at/below
+  60% AND projected drain at/below 10s (joint hysteresis: a one-axis
+  release would re-admit work the other axis is still drowning under).
+  (The stream-era intake arms this rule used to
   enumerate --- blocking the removed `BuildExecution` reader on completions and
   dropping `LogBatch` forwards --- left with that protocol surface.)
 ]

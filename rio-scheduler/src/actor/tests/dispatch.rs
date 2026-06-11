@@ -1873,6 +1873,7 @@ async fn batch_probe_tail_never_per_drv_fmp() -> TestResult {
 // W9-AF (round-9 B7): per-tick probe admission quota
 // ---------------------------------------------------------------------------
 
+// r[verify sched.admission.work-per-turn]
 /// W9-AF — the dispatch probe cap is a PER-TICK admission quota, not a
 /// per-sweep batch size: across however many inline sweeps fire within
 /// one `probe_generation` (merges, completion cascades), the total

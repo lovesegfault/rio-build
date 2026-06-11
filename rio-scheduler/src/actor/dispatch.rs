@@ -81,6 +81,7 @@ impl DagActor {
     /// per-drv fallback. A quota-exhausted sweep returns the whole
     /// candidate set unprobed.
     // r[impl sched.dispatch.fod-substitute+3]
+    // r[impl sched.admission.work-per-turn]
     async fn batch_probe_cached_ready(&mut self) -> HashSet<DrvHash> {
         let Some(store) = &self.store_client else {
             return HashSet::new();

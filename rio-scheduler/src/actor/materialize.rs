@@ -3738,6 +3738,7 @@ impl DagActor {
     // r[impl sched.materialize.settlement]
     // r[impl sched.materialize.job+2]
     // r[impl sched.materialize.view-settlement]
+    // r[impl sched.admission.work-per-turn]
     pub(super) async fn tick_cancel_zero_interest_materialization(
         &mut self,
         _authority: &super::DagAuthority,
