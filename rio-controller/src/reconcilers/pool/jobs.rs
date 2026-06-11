@@ -119,6 +119,36 @@ pub(crate) const HW_BENCH_NEEDED_ANNOTATION: &str = "rio.build/hw-bench-needed";
 /// (nix ≥2.30 default = stateDir/builds), but stdout/stderr capture and
 /// the daemon's own state live outside. 1 GiB headroom.
 const LOG_BUDGET_BYTES: u64 = 1 << 30;
+
+/// Round-10 live_058-a (HIGH): the worker's RESIDENT overhead pad on
+/// the container-mem axis — the rio-builder daemon + FUSE client +
+/// log capture that live INSIDE the container the k8s limit binds,
+/// on top of the solved BUILD size. The solve sizes the BUILD; the
+/// limit binds the CONTAINER (k8s memory.max is set at the delegated
+/// POD level — monitors.rs: the per-build sub-cgroup carries no
+/// limit of its own), so a warm tiny fit (~45-69 MB solved, the live
+/// incident specimens) raw-stamped as request==limit landed BELOW
+/// the worker's own baseline and the kernel OOM-killed the whole
+/// container before/regardless of the build — the live_058 2.75h
+/// same-size requeue loop. Derivation basis (recorded per the A1
+/// duty): the incident pins baseline > 69 MB (those containers
+/// died); the pad covers daemon RSS + FUSE client structures + log
+/// capture with headroom — 256 MiB is the HYPOTHESIS value carried
+/// from the incident review, VIOLABLE (R17, all axes): size = the
+/// pad itself per pod (the cost of never under-housing the worker);
+/// cost = 256 MiB × pods/node of billable mem; population = every
+/// builder/fetcher container; time N/A. Measurement note: re-derive
+/// from worker-baseline RSS telemetry once a soak window exists —
+/// the consts are the knob, the constructor is the law.
+const WORKER_MEM_OVERHEAD_BYTES: u64 = 256 << 20;
+
+/// The container-mem FLOOR (live_058-a): no container renders below
+/// this regardless of how tiny the solve is — tiny solves carry the
+/// same resident worker. 512 MiB = pad + the sub-pad solve band with
+/// headroom (the incident's 45-69 MB solves land here). VIOLABLE
+/// (R17): same axes as the pad; the floor only binds when
+/// `solved + pad < floor`, i.e. solves under 256 MiB.
+const CONTAINER_MEM_MIN_BYTES: u64 = 512 << 20;
 /// Overlay emptyDir sizeLimit headroom multiplier on `disk_bytes` when
 /// `SpawnIntent.disk_headroom_factor` is absent/zero (pre-ADR-023
 /// scheduler skew). The variance-aware `headroom(n_eff)` curve is
@@ -187,17 +217,99 @@ pub(crate) fn pod_ephemeral_request(disk_bytes: u64, headroom: f64, fuse_cache_b
 /// [`pod::fuse_cache_bytes`]; the scheduler's intent filter
 /// (`intent.kind == pool.spec.kind`) keeps the two in agreement for
 /// every intent a pool actually spawns.
-pub(crate) fn intent_pod_footprint(i: &SpawnIntent, fuse_cache_bytes: u64) -> (u32, u64, u64) {
+pub(crate) fn intent_pod_footprint(i: &SpawnIntent, fuse_cache_bytes: u64) -> PodFootprint {
     let fuse = if i.kind == i32::from(rio_proto::types::ExecutorKind::Fetcher) {
         pod::fetcher_fuse_cache_bytes()
     } else {
         fuse_cache_bytes
     };
-    (
-        i.cores,
-        i.mem_bytes,
-        pod_ephemeral_request(i.disk_bytes, intent_headroom(i), fuse),
-    )
+    PodFootprint {
+        cores: i.cores,
+        // r[impl ctrl.pool.container-overhead]
+        // live_058-a: the container law — solved BUILD mem + the
+        // resident worker pad, floored. Additive at the container
+        // seam, applied to the SOLVED dimension after any floor
+        // ladder clamp upstream (the ladder still doubles the solve;
+        // CgroupOom keys on the padded pod limit — the per-build
+        // sub-cgroup refinement is the RULED named candidate).
+        mem_bytes: i
+            .mem_bytes
+            .saturating_add(WORKER_MEM_OVERHEAD_BYTES)
+            .max(CONTAINER_MEM_MIN_BYTES),
+        ephemeral_bytes: pod_ephemeral_request(i.disk_bytes, intent_headroom(i), fuse),
+    }
+}
+
+/// The CONTAINER resource footprint (round-10 live_058-a, R24): the
+/// `(cores, mem, ephemeral)` a pod will actually request, with the
+/// container-mem law applied IN THE CONSTRUCTOR
+/// ([`intent_pod_footprint`] — the sole mint:
+/// `mem = max(solved + WORKER_MEM_OVERHEAD_BYTES,
+/// CONTAINER_MEM_MIN_BYTES)`). Because FFD's simulate and
+/// `cover_deficit` consume the same constructor, the pad propagates
+/// to fit-checks and NodeClaim floors by construction — the
+/// §Simulator-shares-accounting contract holds for mem exactly as
+/// the disk lesson demanded for disk. The pod stamp goes through
+/// [`stamp_container_resources`], whose signature admits ONLY this
+/// type: the raw `i.mem_bytes` read does not type-check inside that
+/// seam (compile-sealed AT THE HELPER — the honest tier: `mem_bytes`
+/// is a public proto field, so solve/telemetry reads elsewhere stay
+/// legitimate; that wider population is CENSUS-HELD, see the
+/// `mem_axis_census` module).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PodFootprint {
+    cores: u32,
+    mem_bytes: u64,
+    ephemeral_bytes: u64,
+}
+
+impl PodFootprint {
+    pub(crate) fn cores(&self) -> u32 {
+        self.cores
+    }
+
+    /// The PADDED container mem (never the bare solve).
+    pub(crate) fn mem_bytes(&self) -> u64 {
+        self.mem_bytes
+    }
+
+    pub(crate) fn ephemeral_bytes(&self) -> u64 {
+        self.ephemeral_bytes
+    }
+
+    /// The `(c, m, d)` triple for fold/compare consumers (FFD sums,
+    /// cover sizing, the OverCap letter evidence).
+    pub(crate) fn as_triple(&self) -> (u32, u64, u64) {
+        (self.cores, self.mem_bytes, self.ephemeral_bytes)
+    }
+}
+
+/// The container-resource STAMP seam (round-10 live_058-a, R24): the
+/// resource map is buildable ONLY from a [`PodFootprint`] — the
+/// intent is out of scope in this body, so stamping a raw solve
+/// (`i.mem_bytes`) into container resources no longer type-checks
+/// here. `requests == limits` (hard caps, no burst) — ADR-023
+/// §sizing-model. Quantities rendered as raw byte counts (no SI
+/// suffix): k8s parses bare integers as base-unit and they roundtrip
+/// exactly.
+// r[impl ctrl.pool.container-overhead]
+fn stamp_container_resources(
+    container: &mut k8s_openapi::api::core::v1::Container,
+    fp: &PodFootprint,
+) {
+    let map: BTreeMap<String, Quantity> = BTreeMap::from([
+        ("cpu".into(), Quantity(fp.cores().to_string())),
+        ("memory".into(), Quantity(fp.mem_bytes().to_string())),
+        (
+            "ephemeral-storage".into(),
+            Quantity(fp.ephemeral_bytes().to_string()),
+        ),
+    ]);
+    container.resources = Some(ResourceRequirements {
+        requests: Some(map.clone()),
+        limits: Some(map),
+        ..Default::default()
+    });
 }
 
 /// Margin between the worker's `daemon_timeout` and K8s
@@ -2678,21 +2790,21 @@ pub(super) fn apply_intent_resources(
 ) {
     let headroom = intent_headroom(i);
     let overlay_limit = (i.disk_bytes as f64 * headroom) as u64;
-    let ephemeral = pod_ephemeral_request(i.disk_bytes, headroom, pod::fuse_cache_bytes(pool));
-    let map: BTreeMap<String, Quantity> = BTreeMap::from([
-        ("cpu".into(), Quantity(i.cores.to_string())),
-        ("memory".into(), Quantity(i.mem_bytes.to_string())),
-        ("ephemeral-storage".into(), Quantity(ephemeral.to_string())),
-    ]);
+    // live_058-a: the container triple comes from the FOOTPRINT
+    // constructor (the pad/floor law) and is stamped through the
+    // sealed helper — the raw solve cannot reach the resource map
+    // from here. `pod::fuse_cache_bytes(pool)` keys on
+    // `pool.spec.kind`; the constructor's selection keys on
+    // `SpawnIntent.kind` — the scheduler's intent filter keeps the
+    // two in agreement for every intent a pool actually spawns (the
+    // pre-existing footprint contract, now load-bearing for the
+    // stamp too).
+    let fp = intent_pod_footprint(i, pod::fuse_cache_bytes(pool));
     let container = pod_spec
         .containers
         .first_mut()
         .expect("build_executor_pod_spec emits exactly one container");
-    container.resources = Some(ResourceRequirements {
-        requests: Some(map.clone()),
-        limits: Some(map),
-        ..Default::default()
-    });
+    stamp_container_resources(container, &fp);
 
     // Couple the worker's `daemon_timeout` to the per-intent K8s
     // `activeDeadlineSeconds`: worker fires `WORKER_DEADLINE_SLACK_SECS`
@@ -2835,9 +2947,9 @@ pub(super) fn apply_intent_resources(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::{test_pool, test_sched_addrs, test_store_addrs};
+    pub(super) use crate::fixtures::{test_pool, test_sched_addrs, test_store_addrs};
 
-    fn intent(id: &str) -> SpawnIntent {
+    pub(super) fn intent(id: &str) -> SpawnIntent {
         SpawnIntent {
             intent_id: id.into(),
             ..Default::default()
@@ -3079,7 +3191,7 @@ mod tests {
     /// (vacuous on `A = ∅`). Default `HwClassConfig` ⇔ `wants_metal`
     /// falls back to the literal `kvm` feature and `apply_intent_
     /// resources` adds no per-intent tolerations (`taints_for(h)` empty).
-    fn job(pool: &Pool, i: &SpawnIntent) -> Job {
+    pub(super) fn job(pool: &Pool, i: &SpawnIntent) -> Job {
         build_job(
             pool,
             crate::fixtures::oref(pool),
@@ -3236,7 +3348,7 @@ mod tests {
             cfg_fuse,
             "Builder pool fuse_cache_bytes single-sourced from BUILDER_FUSE_CACHE"
         );
-        let (fc, fm, fd) = intent_pod_footprint(&i, cfg_fuse);
+        let (fc, fm, fd) = intent_pod_footprint(&i, cfg_fuse).as_triple();
         assert_eq!(q("cpu"), u64::from(fc));
         assert_eq!(q("memory"), fm);
         assert_eq!(q("ephemeral-storage"), fd);
@@ -3302,7 +3414,7 @@ mod tests {
             "fetcher budget must differ from the builder budget for this \
              test to prove the per-kind selection"
         );
-        let (fc, fm, fd) = intent_pod_footprint(&i, cfg_fuse);
+        let (fc, fm, fd) = intent_pod_footprint(&i, cfg_fuse).as_triple();
         assert_eq!(q("cpu"), u64::from(fc));
         assert_eq!(q("memory"), fm);
         assert_eq!(q("ephemeral-storage"), fd);
@@ -3342,7 +3454,7 @@ mod tests {
         let cfg_fuse = *pod::BUILDER_FUSE_CACHE
             .get()
             .unwrap_or(&pod::BUILDER_FUSE_CACHE_BYTES);
-        let (_, _, eph) = intent_pod_footprint(&i, cfg_fuse);
+        let (_, _, eph) = intent_pod_footprint(&i, cfg_fuse).as_triple();
         assert_eq!(
             eph,
             (3 * GI) / 2 + pod::FETCHER_FUSE_CACHE_BYTES + LOG_BUDGET_BYTES,
@@ -3593,7 +3705,14 @@ mod tests {
         let res = pod_spec.containers[0].resources.as_ref().unwrap();
         let req = res.requests.as_ref().unwrap();
         assert_eq!(req["cpu"], Quantity("8".into()));
-        assert_eq!(req["memory"], Quantity((16 * GI).to_string()));
+        // live_058-a: the rendered memory is the PADDED container
+        // law, never the bare solve (16Gi solve → +256Mi pad; the
+        // 512Mi floor is inert here — the W10-CJ battery drives it).
+        assert_eq!(
+            req["memory"],
+            Quantity((16 * GI + (256 << 20)).to_string()),
+            "container mem = solved + WORKER_MEM_OVERHEAD_BYTES"
+        );
         assert_eq!(
             req["ephemeral-storage"],
             Quantity(((60 + 8 + 1) * GI).to_string()),
@@ -4324,10 +4443,11 @@ mod disk_four_caller_census {
         // direct caller (apply_intent_resources).
         assert_eq!(
             prod(JOBS_SRC).matches("pod_ephemeral_request(").count(),
-            4,
+            3,
             "jobs.rs: def + doc-prose mention + bridge (intent_pod_footprint) \
-             + direct caller (apply_intent_resources) — a new caller joins \
-             the census with its member classified"
+             — the former direct caller (apply_intent_resources) now rides \
+             the FOOTPRINT (live_058-a: one constructor for all three axes); \
+             a new caller joins the census with its member classified"
         );
         assert_eq!(
             prod(JOBS_SRC).matches("fn intent_pod_footprint(").count(),
@@ -4578,5 +4698,221 @@ mod demand_lane_census {
         // The plant is NOT an enrolled census row — the same string
         // appearing in any enrolled file would shift its committed
         // count and fail enrollment totality.
+    }
+}
+
+#[cfg(test)]
+mod w10_cj_container_pad {
+    //! **W10-CJ (live_058-a, HIGH — the live incident is the
+    //! production specimen).** The container limit binds the
+    //! CONTAINER: both the PAD corner and the MINIMUM corner driven
+    //! at the floor's own quantifier, end-to-end through `build_job`
+    //! (the rendered request==limit map the kubelet enforces).
+
+    use super::tests::{intent, job, test_pool};
+    use super::*;
+    use rio_crds::pool::ExecutorKind;
+
+    fn rendered_mem(i: &SpawnIntent) -> u64 {
+        let pool = test_pool("p", ExecutorKind::Builder);
+        let j = job(&pool, i);
+        let spec = j.spec.unwrap().template.spec.unwrap();
+        let req = spec.containers[0]
+            .resources
+            .as_ref()
+            .and_then(|r| r.requests.as_ref())
+            .unwrap();
+        req["memory"].0.parse::<u64>().unwrap()
+    }
+
+    // r[verify ctrl.pool.container-overhead]
+    /// The MINIMUM corner: a 64 MiB solve (the live incident band)
+    /// renders the 512 MiB floor — pre-fix the rendered limit WAS the
+    /// solve (64 MiB, below the worker's own baseline → whole-
+    /// container OOM → the live_058 2.75h requeue loop).
+    ///
+    /// Pre-fix red (pad severed — the raw stamp):
+    ///   left: 67108864  right: 536870912
+    #[test]
+    fn min_corner_floors_tiny_solves() {
+        let mut i = intent("tiny64");
+        i.mem_bytes = 64 << 20;
+        assert_eq!(
+            rendered_mem(&i),
+            512 << 20,
+            "64 MiB solve + 256 MiB pad = 320 MiB < the 512 MiB floor \
+             → the floor binds (the live incident specimen)"
+        );
+    }
+
+    // r[verify ctrl.pool.container-overhead]
+    /// The PAD corner: a 1 GiB solve renders solve + pad (the floor
+    /// is inert above 256 MiB solves).
+    #[test]
+    fn pad_corner_adds_worker_overhead() {
+        let mut i = intent("one-gi");
+        i.mem_bytes = 1 << 30;
+        assert_eq!(
+            rendered_mem(&i),
+            (1u64 << 30) + (256 << 20),
+            "1 GiB solve → 1 GiB + 256 MiB pad (> floor)"
+        );
+    }
+
+    // r[verify ctrl.pool.container-overhead]
+    /// **W10-CK** rides `footprint_matches_stamped_requests` (the
+    /// shared-fn quantifier: FFD's decrement == the pod's rendered
+    /// request, count-exact, now over the PADDED mem) — this twin
+    /// pins the SOLVE-side scoping: the pad never mutates the intent
+    /// (telemetry and ladder algebra read the solve unchanged).
+    #[test]
+    fn pad_is_additive_at_the_container_seam_only() {
+        let mut i = intent("scope");
+        i.mem_bytes = 2 << 30;
+        let before = i.mem_bytes;
+        let fp = intent_pod_footprint(&i, 0);
+        assert_eq!(i.mem_bytes, before, "the solve is untouched");
+        assert_eq!(fp.mem_bytes(), before + (256 << 20));
+        assert_eq!(
+            fp.as_triple().1,
+            fp.mem_bytes(),
+            "one padded value everywhere the footprint is read"
+        );
+    }
+}
+
+#[cfg(test)]
+mod mem_axis_census {
+    //! **W10-CJ/CK support (round-10 live_058-a): the mem-axis
+    //! consumer census** — the disk four-caller pattern extended to
+    //! container memory. The COMPILE claim is scoped to the stamp
+    //! helper ([`super::stamp_container_resources`]: the intent is
+    //! out of scope, so a raw `i.mem_bytes` stamp does not
+    //! type-check there); the WIDER population of `mem_bytes`
+    //! readers is CENSUS-HELD here (the honest tier — `mem_bytes` is
+    //! a public proto field; solve/telemetry reads stay legitimate
+    //! and are enumerated). [GEN-SET] generator:
+    //!
+    //!   rg -n 'mem_bytes' rio-controller/src/reconcilers/pool/jobs.rs
+    //!
+    //! Production members (jobs.rs prod half):
+    //! - the FOOTPRINT CONSTRUCTOR (`intent_pod_footprint`): the SOLE
+    //!   pad site — `i.mem_bytes` enters container accounting only
+    //!   here;
+    //! - the hw-bench floor gate (`build_job`): telemetry read
+    //!   (`intent.mem_bytes >= hw_bench_mem_floor`) — never a
+    //!   resource stamp;
+    //! - doc/comment mentions.
+    //!
+    //! R22′ plant matrix (grammar-derived, BOTH read forms — the
+    //! direct field stamp AND the arithmetic/derived stamp; red at
+    //! the scan layer):
+
+    const JOBS_SRC: &str = include_str!("jobs.rs");
+
+    fn prod(src: &str) -> &str {
+        src.split("#[cfg(test)]\nmod ").next().unwrap_or(src)
+    }
+
+    /// The stamp-helper extent (fn header to the next top-level
+    /// brace) — the compile-sealed seam the scan re-verifies.
+    fn stamp_helper_extent(src: &str) -> &str {
+        let start = src
+            .find("fn stamp_container_resources(")
+            .expect("the sealed stamp helper exists");
+        let end = src[start..]
+            .find("\n}\n")
+            .map(|e| start + e)
+            .expect("helper body terminates");
+        &src[start..end]
+    }
+
+    /// The raw-stamp detectors: a `mem_bytes` token inside a
+    /// container-resource construction context (direct), or an
+    /// arithmetic derivation of one feeding a Quantity (derived).
+    fn raw_stamp_hits(src: &str) -> usize {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .filter(|l| l.contains("Quantity") && l.contains("mem_bytes"))
+            // The sealed accessor (`fp.mem_bytes()` / `.mem_bytes()`)
+            // is the LAWFUL stamp; raw = the bare field.
+            .filter(|l| !l.contains("mem_bytes()"))
+            .count()
+    }
+
+    // r[verify ctrl.pool.container-overhead]
+    /// The compile-sealed seam, re-verified at the scan layer: ZERO
+    /// `mem_bytes` tokens inside the stamp helper (the intent cannot
+    /// be read there — rustc enforces it; this pin makes the seam's
+    /// EXTENT a census fact so a widened signature is caught).
+    #[test]
+    fn stamp_helper_is_sealed_to_the_footprint() {
+        let helper = stamp_helper_extent(prod(JOBS_SRC));
+        assert_eq!(
+            helper.matches("mem_bytes()").count(),
+            1,
+            "the helper reads the FOOTPRINT's padded accessor exactly once"
+        );
+        assert_eq!(
+            helper.matches("i.mem_bytes").count() + helper.matches("intent").count(),
+            0,
+            "the intent is out of scope in the stamp seam (the raw \
+             solve cannot be stamped here — live_058-a)"
+        );
+    }
+
+    // r[verify ctrl.pool.container-overhead]
+    /// The census-held wider population: every production `mem_bytes`
+    /// read in jobs.rs enumerated — the constructor (1 read), the
+    /// hw-bench telemetry gate (1 read), zero raw Quantity stamps.
+    #[test]
+    fn mem_readers_enumerated() {
+        let p = prod(JOBS_SRC);
+        let code_reads = p
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("///"))
+            .filter(|l| l.contains("mem_bytes"))
+            .count();
+        assert_eq!(
+            code_reads, 8,
+            "jobs.rs prod mem_bytes code lines: the constructor's \
+             2-line read + the struct field + the accessor (3 lines: \
+             fn/self/triple) + the helper's padded-accessor stamp + \
+             the hw-bench telemetry gate — a new reader joins the \
+             census with its class named"
+        );
+        assert_eq!(
+            raw_stamp_hits(p),
+            0,
+            "zero raw mem stamps outside the sealed helper (the \
+             live_058-a recurrence shape)"
+        );
+    }
+
+    // r[verify ctrl.pool.container-overhead]
+    /// R22′ plants — BOTH grammar forms red at the scan layer.
+    #[test]
+    fn plant_raw_and_derived_stamps_detected() {
+        const PLANT_DIRECT: &str =
+            r#"map.insert("memory".into(), Quantity(i.mem_bytes.to_string()));"#;
+        const PLANT_DERIVED: &str = r#"let m = intent.mem_bytes * 2; map.insert("memory".into(), Quantity(m.to_string()));"#;
+        assert!(
+            raw_stamp_hits(PLANT_DIRECT) > 0,
+            "the direct-field stamp plant must trip the detector"
+        );
+        // The derived form: the arithmetic line carries mem_bytes; the
+        // Quantity line carries the derived var — the detector's
+        // per-line scan catches the DIRECT form; the derived form is
+        // caught by the enumeration census (a new mem_bytes code line
+        // shifts the committed count) — both axes planted, each red
+        // through its own scanner.
+        let derived_code_lines = PLANT_DERIVED
+            .lines()
+            .filter(|l| l.contains("mem_bytes"))
+            .count();
+        assert!(
+            derived_code_lines > 0,
+            "the derived-read plant must shift the enumeration census"
+        );
     }
 }

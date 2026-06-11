@@ -703,7 +703,7 @@ fn sim_one<'a>(
             placeable.push((i, nc_name.to_string(), !registered));
             return;
         }
-        let (ic, im, id) = intent_pod_footprint(&i, fuse_cache_bytes);
+        let (ic, im, id) = intent_pod_footprint(&i, fuse_cache_bytes).as_triple();
         let open = a_open(&i, sketches);
         // hw-agnostic (`hw_class_names=[]`): eligible on any node
         // whose hw-class admits the intent (arch + features — see

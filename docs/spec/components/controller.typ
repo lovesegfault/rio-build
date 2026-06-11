@@ -344,6 +344,33 @@ the page despite restart-totality/continuity contracts (merged_bug_049).
 The completeness witness already rode the wire (`truncated`); this rule
 makes consuming it structural rather than per-consumer diligence.
 
+#r("ctrl.pool.container-overhead")[
+  The container memory limit binds the WHOLE container --- the worker
+  daemon, FUSE client, and log capture are resident beside the build,
+  and the per-build sub-cgroup carries no limit of its own --- so the
+  rendered container memory MUST exceed the solved build size by the
+  worker overhead pad, floored at the container minimum:
+  `container_mem = max(solved + WORKER_MEM_OVERHEAD_BYTES,
+  CONTAINER_MEM_MIN_BYTES)`. The law MUST be applied in the ONE
+  footprint constructor consumed by the pod stamp, the FFD fit-check,
+  and the NodeClaim floor alike (the simulator-shares-accounting
+  contract on the memory axis), and the container resource map MUST be
+  buildable only from that footprint --- a raw solved size MUST NOT be
+  writable into container resources at the stamp seam. The solve and
+  its telemetry are untouched: the pad is additive at the container
+  seam, applied after any floor-ladder clamp of the solved dimension,
+  so ladder algebra is unchanged.
+]
+
+The live_058 incident is the production specimen: a warm tiny fit
+(~45-69 MB solved) stamped request==limit landed below the worker's
+own baseline; the kernel OOM-killed the container before the build,
+and the same-size requeue looped at ~2.75 h per iteration. The
+sub-cgroup refinement (a per-build `memory.max = solved` restoring
+exact CgroupOom attribution) is a RULED named candidate --- builder
+plane, trigger: CgroupOom attribution noise observed at the padded
+limit.
+
 #r("ctrl.pool.spawn-once")[
   Job identity is the deterministic name `job_name(pool, kind,
   intent_suffix(intent_id))` --- one intent maps to one Job name per Pool,

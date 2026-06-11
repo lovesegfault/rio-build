@@ -395,7 +395,7 @@ pub fn reclassify_over_cap(
     for (i, o) in outcomes.iter_mut() {
         if ids.contains(i.intent_id.as_str()) && matches!(o, PlacementOutcome::Placed(_)) {
             *o = PlacementOutcome::OverCap {
-                footprint: intent_pod_footprint(i, fuse_cache_bytes),
+                footprint: intent_pod_footprint(i, fuse_cache_bytes).as_triple(),
                 cap,
             };
         }
@@ -721,11 +721,11 @@ pub fn sizing<'a>(cell: &Cell, u: &[&'a SpawnIntent], cfg: &SizingCfg) -> Sizing
     // `solve_intent_for` entirely.
     let (fits, over): (Vec<&'a SpawnIntent>, Vec<&'a SpawnIntent>) =
         u.iter().copied().partition(|i| {
-            let (ic, im, id) = intent_pod_footprint(i, cfg.fuse_cache_bytes);
+            let (ic, im, id) = intent_pod_footprint(i, cfg.fuse_cache_bytes).as_triple();
             ic <= cfg.max_node_cores && im <= cfg.max_node_mem && id <= cfg.max_node_disk
         });
     for i in &over {
-        let (ic, im, id) = intent_pod_footprint(i, cfg.fuse_cache_bytes);
+        let (ic, im, id) = intent_pod_footprint(i, cfg.fuse_cache_bytes).as_triple();
         tracing::warn!(
             intent_id = %i.intent_id, cell = %cell, footprint = ?(ic, im, id),
             cap = ?(cfg.max_node_cores, cfg.max_node_mem, cfg.max_node_disk),
@@ -748,7 +748,7 @@ pub fn sizing<'a>(cell: &Cell, u: &[&'a SpawnIntent], cfg: &SizingCfg) -> Sizing
     }
     let (sum_c, sum_m, sum_d, max_c, max_m, max_d) = fits
         .iter()
-        .map(|i| intent_pod_footprint(i, cfg.fuse_cache_bytes))
+        .map(|i| intent_pod_footprint(i, cfg.fuse_cache_bytes).as_triple())
         .fold(
             (0u32, 0u64, 0u64, 0u32, 0u64, 0u64),
             |(c, m, d, mc, mm, md), (ic, im, id)| {
