@@ -131,6 +131,25 @@ pub(crate) enum FencedJobCreate {
     Fenced,
 }
 
+/// Outcome of the batched zero-interest cancel sweep
+/// ([`SchedulerDb::cancel_jobs_and_close_attempts_fenced`]): the
+/// whole sweep is ONE fenced transaction, so the fence verdict is
+/// sweep-level while application is reported per job.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FencedCancelSweep {
+    /// Committed. `cancelled` holds exactly the job_ids whose row
+    /// flipped pending → cancelled; a member absent from the set was
+    /// already terminal (idempotent re-entry — its attempt close
+    /// still ran). The caller folds this into per-job
+    /// [`rio_evidence_kernel::settle::WriteDisposition`]s for the
+    /// settled-gated view removal.
+    Applied { cancelled: HashSet<Uuid> },
+    /// The serving generation is below the claims floor: the
+    /// transaction rolled back having written nothing — for ANY
+    /// member of the sweep.
+    Fenced,
+}
+
 impl SchedulerDb {
     /// THE creation core (adjudication PDQ-9 / design §2.1 rows 1–2,
     /// A13/B6): create (or find existing) unresolved jobs for a batch
@@ -437,57 +456,65 @@ impl SchedulerDb {
     }
 
     // r[impl sched.materialize.view-settlement]
-    /// The zero-live-interest closer (BC-2), job_id-keyed and TOTAL
-    /// over the DAG-absent arm: ONE fenced transaction (1) cancels the
-    /// pending job row and (2) closes its open materialization-kind
-    /// assignment — found through the durable
-    /// `drv_executions.attempt_kind` join, never an in-memory exec_id
-    /// (the node may be reaped; the post-failover view rebuild
-    /// presents exactly that shape). Charge-free by construction: no
-    /// `drv_attempts` row is written, and a closed assignment is
-    /// invisible to the establishment sweep — the leaked-attempt →
-    /// `materialization_infra` conversion is unreachable for cancelled
-    /// jobs. `Applied(n)` = the job row flipped pending→cancelled;
-    /// `AlreadyResolved` = it was already terminal (the attempt close
-    /// still ran — idempotent re-entry).
-    pub(crate) async fn cancel_job_and_close_attempt_fenced(
+    /// The zero-live-interest closer (BC-2), job_id-keyed, BATCHED,
+    /// and TOTAL over the DAG-absent arm: ONE fenced transaction
+    /// (1) cancels every pending job row in the sweep and (2) closes
+    /// their open materialization-kind assignments — found through
+    /// the durable `drv_executions.attempt_kind` join, never an
+    /// in-memory exec_id (nodes may be reaped; the post-failover view
+    /// rebuild presents exactly that shape). Charge-free by
+    /// construction: no `drv_attempts` row is written, and a closed
+    /// assignment is invisible to the establishment sweep — the
+    /// leaked-attempt → `materialization_infra` conversion is
+    /// unreachable for cancelled jobs.
+    ///
+    /// Batched for the actor's sake (the `build.rs`
+    /// persist_status_batch precedent): the per-job predecessor cost
+    /// ~5 PG round-trips per job inside the single-threaded actor —
+    /// live_053's 134.65s Tick spent 16.6s cancelling 5,258 jobs
+    /// sequentially at 3.16ms each while every queued RPC waited
+    /// head-of-line. A sweep is now a constant number of round-trips
+    /// regardless of N.
+    pub(crate) async fn cancel_jobs_and_close_attempts_fenced(
         &self,
-        job_id: Uuid,
+        job_ids: &[Uuid],
         serving_generation: ServingGeneration,
-    ) -> Result<FencedOutcome, sqlx::Error> {
+    ) -> Result<FencedCancelSweep, sqlx::Error> {
         let mut tx = match self.begin_fenced(serving_generation).await? {
-            FencedBegin::Fenced { .. } => return Ok(FencedOutcome::Fenced),
+            FencedBegin::Fenced { .. } => return Ok(FencedCancelSweep::Fenced),
             FencedBegin::Open(ftx) => ftx,
         };
-        let cancelled = sqlx::query(
+        let cancelled: Vec<Uuid> = sqlx::query_scalar(
             "UPDATE materialization_jobs \
                 SET state = 'cancelled', resolved_at = now() \
-              WHERE job_id = $1 AND state = 'pending'",
+              WHERE job_id = ANY($1) AND state = 'pending' \
+              RETURNING job_id",
         )
-        .bind(job_id)
-        .execute(tx.conn())
-        .await?
-        .rows_affected();
+        .bind(job_ids)
+        .fetch_all(tx.conn())
+        .await?;
+        // The attempt close runs over the WHOLE sweep, not just the
+        // freshly-flipped rows — re-entry on an already-terminal job
+        // still closes a straggler open attempt (the same idempotent
+        // semantics the per-job closer had).
         static SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
             super::close_assignments_sql(
-                "derivation_id = \
-                     (SELECT derivation_id FROM materialization_jobs WHERE job_id = $1) \
+                "derivation_id IN \
+                     (SELECT derivation_id FROM materialization_jobs WHERE job_id = ANY($1)) \
                  AND exec_id IN (SELECT e.exec_id FROM drv_executions e \
                                  WHERE e.attempt_kind = 'materialization')",
                 2,
             )
         });
         sqlx::query_scalar::<_, i64>(SQL.as_str())
-            .bind(job_id)
+            .bind(job_ids)
             .bind(super::AssignmentCloseStatus::Cancelled.as_str())
             .bind(super::AssignmentCloseStatus::Cancelled.exec_status())
             .fetch_one(tx.conn())
             .await?;
         tx.commit().await?;
-        Ok(if cancelled > 0 {
-            FencedOutcome::Applied(cancelled)
-        } else {
-            FencedOutcome::AlreadyResolved
+        Ok(FencedCancelSweep::Applied {
+            cancelled: cancelled.into_iter().collect(),
         })
     }
 

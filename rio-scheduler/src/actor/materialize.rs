@@ -1094,11 +1094,6 @@ impl JobViewState {
         self.hydrated().into_iter().flat_map(|v| v.iter())
     }
 
-    /// Hydrated keys; empty when Unavailable (ticks → skip).
-    pub(super) fn keys(&self) -> impl Iterator<Item = &DrvHash> {
-        self.hydrated().into_iter().flat_map(|v| v.keys())
-    }
-
     /// Settled-gated removal; `false` when Unavailable (nothing to
     /// remove — the durable row is the authority).
     pub(super) fn remove_settled<Q>(&mut self, k: &Q, d: WriteDisposition) -> bool
@@ -1195,10 +1190,6 @@ impl JobView {
         Q: std::hash::Hash + Eq + ?Sized,
     {
         self.entries.contains_key(k)
-    }
-
-    pub(super) fn keys(&self) -> impl Iterator<Item = &DrvHash> {
-        self.entries.keys()
     }
 
     pub(super) fn iter(&self) -> impl Iterator<Item = (&DrvHash, &JobViewEntry)> {
@@ -3683,19 +3674,36 @@ impl DagActor {
     /// The flag-gated housekeeping backstop: cancel jobs for
     /// derivations whose live interest dropped to zero (node gone,
     /// node terminal, or every interested build terminal), closing any
-    /// open materialization attempt charge-free. Phase B's
-    /// build-terminal hooks will call the closer directly; in Phase A
-    /// this tick backstop and the tests are the only callers.
+    /// open materialization attempt charge-free — BC-2's no-controller
+    /// closer. Phase B's build-terminal hooks will call the batch
+    /// closer directly; in Phase A it is reached through this tick
+    /// backstop. census[test: zero_interest_cancel_closes_attempt_without_dag_node]
+    ///
+    /// ONE fenced sweep for the whole zero-interest set (the
+    /// `cancel_build_derivations` batched-persist precedent —
+    /// `build.rs` documents the N+1 actor stall this avoids).
+    /// live_053 measured the per-job form: 5,258 sequential fenced
+    /// cancels at 3.16ms each = 16.6s inside a single 134.65s Tick,
+    /// head-of-line blocking every queued RPC. The sweep resolves the
+    /// job rows AND closes the kind-guarded assignment rows keyed
+    /// entirely on durable state: the close is TOTAL over the
+    /// DAG-absent arm (its own trigger — the `None => true` filter —
+    /// guarantees the node may be gone, so no in-memory exec_id is
+    /// ever read). Per-job view removal gates on the folded
+    /// disposition; a Fenced or Failed sweep keeps every entry and
+    /// re-attempts next tick (level-triggered).
     // r[impl sched.materialize.settlement]
+    // r[impl sched.materialize.job+2]
+    // r[impl sched.materialize.view-settlement]
     pub(super) async fn tick_cancel_zero_interest_materialization(
         &mut self,
         _authority: &super::DagAuthority,
     ) {
         use crate::state::BuildStateExt;
-        let zero_interest: Vec<DrvHash> = self
+        let zero_interest: Vec<(DrvHash, Uuid)> = self
             .materialization_jobs
-            .keys()
-            .filter(|h| match self.dag.node(h.as_str()) {
+            .iter()
+            .filter(|(h, _)| match self.dag.node(h.as_str()) {
                 None => true,
                 Some(state) => {
                     state.status().is_terminal()
@@ -3706,71 +3714,66 @@ impl DagActor {
                         })
                 }
             })
-            .cloned()
+            .map(|(h, entry)| (h.clone(), entry.job_id))
             .collect();
-        for drv_hash in zero_interest {
-            self.cancel_materialization_for_zero_interest(&drv_hash)
-                .await;
-        }
-    }
-
-    // r[impl sched.materialize.job+2]
-    // r[impl sched.materialize.view-settlement]
-    /// Cancel the job for a derivation whose live interest dropped to
-    /// zero, closing any open materialization attempt CHARGE-FREE (no
-    /// drv_attempts row at all) — BC-2's no-controller closer. ONE
-    /// fenced transaction resolves the job AND closes the kind-guarded
-    /// assignments row, keyed entirely on durable state: the close is
-    /// TOTAL over the DAG-absent arm (its own trigger — the
-    /// `None => true` zero-interest filter — guarantees the node may
-    /// be gone, so no in-memory exec_id is ever read). The view
-    /// removal gates on the disposition; a Fenced/Failed cancel keeps
-    /// the entry and re-attempts next tick (level-triggered).
-    pub(super) async fn cancel_materialization_for_zero_interest(&mut self, drv_hash: &DrvHash) {
-        let Some(entry) = self.materialization_jobs.get(drv_hash) else {
+        if zero_interest.is_empty() {
             return;
-        };
-        let job_id = entry.job_id;
+        }
+        let job_ids: Vec<Uuid> = zero_interest.iter().map(|(_, job_id)| *job_id).collect();
         let serving_generation = self.serving_generation();
-        let d = match self
+        let cancelled = match self
             .db
-            .cancel_job_and_close_attempt_fenced(job_id, serving_generation)
+            .cancel_jobs_and_close_attempts_fenced(&job_ids, serving_generation)
             .await
         {
-            Ok(crate::db::FencedOutcome::Applied(_)) => {
+            Ok(crate::db::materialization::FencedCancelSweep::Applied { cancelled }) => cancelled,
+            Ok(crate::db::materialization::FencedCancelSweep::Fenced) => {
+                // Sweep-level fence: every view entry survives (the
+                // durable rows are a successor's to settle); one note
+                // per sweep, not per job.
+                self.note_fenced_evidence_write("materialization job cancel");
+                return;
+            }
+            Err(e) => {
+                warn!(jobs = job_ids.len(), error = %e,
+                      "zero-interest materialization cancel sweep failed; retried next tick");
+                return;
+            }
+        };
+        let mut settled = 0usize;
+        for (drv_hash, job_id) in zero_interest {
+            let d = if cancelled.contains(&job_id) {
                 // The at-most-once edge: the same lifecycle counter the
-                // exec-keyed resolver increments (T-6.2).
+                // exec-keyed resolver increments (T-6.2) — once per
+                // APPLIED row, exactly as the per-job form counted.
                 metrics::counter!(
                     "rio_scheduler_materialization_jobs_resolved_total",
                     "outcome" => Self::resolution_outcome_label(crate::state::JobState::Cancelled)
                 )
                 .increment(1);
                 WriteDisposition::Applied
+            } else {
+                WriteDisposition::AlreadyResolved
+            };
+            if self.materialization_jobs.remove_settled(&drv_hash, d) {
+                settled += 1;
+                tracing::info!(
+                    drv_hash = %drv_hash,
+                    %job_id,
+                    "materialization job cancelled: no live interested build remains \
+                     (attempt closed in the same fenced sweep)"
+                );
             }
-            Ok(crate::db::FencedOutcome::AlreadyResolved) => WriteDisposition::AlreadyResolved,
-            Ok(crate::db::FencedOutcome::Fenced) => {
-                self.note_fenced_evidence_write("materialization job cancel");
-                WriteDisposition::Fenced
-            }
-            Err(e) => {
-                warn!(drv_hash = %drv_hash, %job_id, error = %e,
-                      "zero-interest materialization cancel failed; retried next tick");
-                WriteDisposition::Failed
-            }
-        };
-        if self.materialization_jobs.remove_settled(drv_hash, d) {
+        }
+        if settled > 0 {
             // r[impl sched.materialize.pinning]
-            // §5.3 release site: cancellation resolves the job, so its
-            // pins may be releasable (self-scoping no-op when live
-            // interest remains elsewhere).
+            // §5.3 release site: cancellation resolves jobs, so pins
+            // may be releasable (self-scoping no-op when live interest
+            // remains elsewhere). ONCE per sweep: the release is a
+            // global resolved-jobs query, so the per-job form ran N
+            // identical statements for one effect.
             self.release_materialization_pins_best_effort("job cancellation")
                 .await;
-            tracing::info!(
-                drv_hash = %drv_hash,
-                %job_id,
-                "materialization job cancelled: no live interested build remains \
-                 (attempt closed in the same fenced transaction)"
-            );
         }
     }
 }

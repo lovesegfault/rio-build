@@ -12,7 +12,6 @@ rio-gateway/src/server/connection.rs	/// and the client never sends another SSH 
 rio-gateway/src/server/mod.rs	// that never sends its SSH identification string parks
 rio-gateway/src/server/session_jwt.rs	/// post-build `wopQueryPathInfo` never sends an expired token.
 rio-gateway/src/translate.rs	/// `keep_going`) are hardcoded to defaults: ssh-ng clients never send
-rio-scheduler/src/actor/materialize.rs	/// this tick backstop and the tests are the only callers.
 rio-scheduler/src/admin/tests/gc_tests.rs	// Mock store stream that never yields: hold the sender, never send.
 rio-store/src/gc/mod.rs	// enqueue_chunk_deletes. One sort here covers all callers (the
 rio-store/src/grpc/admin.rs	/// Gate for control-plane-only callers. Thin wrapper over

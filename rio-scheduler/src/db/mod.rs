@@ -547,7 +547,7 @@ pub(crate) enum AssignmentCloseStatus {
     Completed,
     Failed,
     /// The zero-interest cancel path's status
-    /// ([`SchedulerDb::cancel_job_and_close_attempt_fenced`]).
+    /// ([`SchedulerDb::cancel_jobs_and_close_attempts_fenced`]).
     Cancelled,
 }
 

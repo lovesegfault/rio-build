@@ -461,90 +461,147 @@ async fn parked_job_excluded_until_backoff_expires() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// (f) `cancel_job_and_close_attempt_fenced`: pending → cancelled,
-/// open materialization-kind assignment closed in the SAME fenced
+/// (f) `cancel_jobs_and_close_attempts_fenced`: ONE fenced sweep
+/// cancels every pending job in the set (pending → cancelled) and
+/// closes their open materialization-kind assignments in the SAME
 /// transaction (the zero-live-interest closer, total over the
-/// DAG-absent arm), charge-free; idempotent re-entry answers
-/// `AlreadyResolved`.
+/// DAG-absent arm), charge-free. Application is per-job — the
+/// returned `cancelled` set carries exactly the rows that flipped, an
+/// already-terminal member is simply absent (idempotent re-entry,
+/// attempt close still runs) — while the fence verdict is sweep-level.
+/// The batch IS the contract (live_053: 5,258 sequential per-job
+/// fenced cancels = 16.6s inside one Tick).
 // r[verify sched.materialize.job+2]
 // r[verify sched.materialize.view-settlement]
 #[tokio::test]
-async fn job_cancellation_marks_cancelled_and_closes_attempt() -> anyhow::Result<()> {
-    let (test_db, db, drv) = setup("job-cancel-hash").await?;
+async fn job_cancellation_sweep_marks_cancelled_and_closes_attempts() -> anyhow::Result<()> {
+    use crate::db::materialization::FencedCancelSweep;
+    let (test_db, db, drv_a) = setup("job-cancel-hash-a").await?;
+    let drv_b = insert_test_derivation(&db, "job-cancel-hash-b").await?;
 
-    let created = db
-        .create_materialization_job_fenced(
-            drv,
-            "job-cancel-hash",
-            None,
-            JobOrigin::Pruned,
-            None,
-            ServingGeneration::stamp_from_claim(1),
+    let mut job_ids = Vec::new();
+    for (drv, hash) in [(drv_a, "job-cancel-hash-a"), (drv_b, "job-cancel-hash-b")] {
+        let created = db
+            .create_materialization_job_fenced(
+                drv,
+                hash,
+                None,
+                JobOrigin::Pruned,
+                None,
+                ServingGeneration::stamp_from_claim(1),
+            )
+            .await?;
+        let FencedJobCreate::Applied { job_id, .. } = created else {
+            anyhow::bail!("create must apply");
+        };
+        job_ids.push(job_id);
+
+        // Seed an open materialization-kind attempt for the derivation
+        // (assignment + drv_executions row carrying the kind).
+        let exec_id = uuid::Uuid::new_v4();
+        db.insert_assignment(drv, &crate::state::ExecutorId::from("store-0"), 1, exec_id)
+            .await?;
+        sqlx::query(
+            "INSERT INTO drv_executions (exec_id, drv_hash, executor_id, started_at, attempt_kind) \
+             VALUES ($1, $2, 'store-0', now(), 'materialization')",
         )
+        .bind(exec_id)
+        .bind(hash)
+        .execute(&test_db.pool)
         .await?;
-    let FencedJobCreate::Applied { job_id, .. } = created else {
-        anyhow::bail!("create must apply");
+    }
+
+    let swept = db
+        .cancel_jobs_and_close_attempts_fenced(&job_ids, ServingGeneration::stamp_from_claim(1))
+        .await?;
+    let FencedCancelSweep::Applied { cancelled } = swept else {
+        anyhow::bail!("sweep must apply, got {swept:?}");
     };
-
-    // Seed an open materialization-kind attempt for the derivation
-    // (assignment + drv_executions row carrying the kind).
-    let exec_id = uuid::Uuid::new_v4();
-    db.insert_assignment(drv, &crate::state::ExecutorId::from("store-0"), 1, exec_id)
-        .await?;
-    sqlx::query(
-        "INSERT INTO drv_executions (exec_id, drv_hash, executor_id, started_at, attempt_kind) \
-         VALUES ($1, 'job-cancel-hash', 'store-0', now(), 'materialization')",
-    )
-    .bind(exec_id)
-    .execute(&test_db.pool)
-    .await?;
-
-    let cancelled = db
-        .cancel_job_and_close_attempt_fenced(job_id, ServingGeneration::stamp_from_claim(1))
-        .await?;
     assert_eq!(
         cancelled,
-        FencedOutcome::Applied(1),
-        "one pending job cancelled"
+        job_ids.iter().copied().collect(),
+        "both pending jobs flipped in one sweep"
     );
 
-    let (state, resolved_at): (String, Option<String>) = sqlx::query_as(
-        "SELECT state, resolved_at::text FROM materialization_jobs WHERE job_id = $1",
+    for job_id in &job_ids {
+        let (state, resolved_at): (String, Option<String>) = sqlx::query_as(
+            "SELECT state, resolved_at::text FROM materialization_jobs WHERE job_id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&test_db.pool)
+        .await?;
+        assert_eq!(state, "cancelled");
+        assert!(resolved_at.is_some(), "cancellation stamps resolved_at");
+    }
+    let open: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM assignments WHERE status IN ('pending', 'acknowledged')",
     )
-    .bind(job_id)
     .fetch_one(&test_db.pool)
     .await?;
-    assert_eq!(state, "cancelled");
-    assert!(resolved_at.is_some(), "cancellation stamps resolved_at");
-    let (a_status,): (String,) =
-        sqlx::query_as("SELECT status FROM assignments WHERE exec_id = $1")
-            .bind(exec_id)
+    assert_eq!(
+        open, 0,
+        "every open attempt closes in the same fenced sweep"
+    );
+    let closed: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM assignments WHERE status = 'cancelled'")
             .fetch_one(&test_db.pool)
             .await?;
-    assert_eq!(
-        a_status, "cancelled",
-        "the open attempt closes in the same fenced transaction"
-    );
+    assert_eq!(closed, 2, "closed BY the cancel, one per job");
     let (charges,): (i64,) =
         sqlx::query_as("SELECT count(*) FROM drv_attempts WHERE event_kind = 'attempt'")
             .fetch_one(&test_db.pool)
             .await?;
     assert_eq!(charges, 0, "charge-free (BC-2)");
 
-    // Cancelling again (nothing pending): idempotent re-entry.
+    // Sweeping again (nothing pending): idempotent re-entry — the
+    // sweep applies with an EMPTY cancelled set.
     let again = db
-        .cancel_job_and_close_attempt_fenced(job_id, ServingGeneration::stamp_from_claim(1))
+        .cancel_jobs_and_close_attempts_fenced(&job_ids, ServingGeneration::stamp_from_claim(1))
         .await?;
-    assert_eq!(again, FencedOutcome::AlreadyResolved);
+    assert_eq!(
+        again,
+        FencedCancelSweep::Applied {
+            cancelled: std::collections::HashSet::new()
+        },
+        "already-terminal members are absent from the cancelled set"
+    );
 
-    // Below the floor: fenced.
+    // Mixed sweep: a fresh pending job alongside the two terminal
+    // ones — exactly the fresh one flips.
+    let drv_c = insert_test_derivation(&db, "job-cancel-hash-c").await?;
+    let created = db
+        .create_materialization_job_fenced(
+            drv_c,
+            "job-cancel-hash-c",
+            None,
+            JobOrigin::Pruned,
+            None,
+            ServingGeneration::stamp_from_claim(1),
+        )
+        .await?;
+    let FencedJobCreate::Applied { job_id: job_c, .. } = created else {
+        anyhow::bail!("create must apply");
+    };
+    let mixed_ids: Vec<uuid::Uuid> = job_ids.iter().copied().chain([job_c]).collect();
+    let mixed = db
+        .cancel_jobs_and_close_attempts_fenced(&mixed_ids, ServingGeneration::stamp_from_claim(1))
+        .await?;
+    assert_eq!(
+        mixed,
+        FencedCancelSweep::Applied {
+            cancelled: [job_c].into_iter().collect()
+        },
+        "a mixed sweep reports exactly the rows that flipped"
+    );
+
+    // Below the floor: the WHOLE sweep is fenced, nothing written.
     sqlx::query("INSERT INTO leader_generation_claims (generation, holder_id) VALUES (5, 'succ')")
         .execute(&test_db.pool)
         .await?;
     let fenced = db
-        .cancel_job_and_close_attempt_fenced(job_id, ServingGeneration::stamp_from_claim(1))
+        .cancel_jobs_and_close_attempts_fenced(&job_ids, ServingGeneration::stamp_from_claim(1))
         .await?;
-    assert_eq!(fenced, FencedOutcome::Fenced);
+    assert_eq!(fenced, FencedCancelSweep::Fenced);
     Ok(())
 }
 
