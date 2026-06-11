@@ -125,13 +125,17 @@ resource "helm_release" "cilium" {
       # default set; the exclusions-only form below is the only safe
       # shape — never mix inclusion patterns into this string.
       #
-      # Mirrored in nix/cilium-render.nix (one chart, two render
-      # paths, one filter; the share-pin assert there keys both to
-      # nix/pins.toml's cilium version, so a pin bump re-validates
-      # the filter semantics by ritual). The k3s fixture-render check
-      # (cilium-labels-filter, nix/misc-checks.nix) asserts the
-      # rendered ConfigMap carries this line.
-      labels = "k8s:!job-name k8s:!batch.kubernetes.io/job-name k8s:!controller-uid k8s:!batch.kubernetes.io/controller-uid"
+      # Single-sourced from nix/pins.toml addons.cilium
+      # identity_label_filter (bug_104: one value, three consumers —
+      # this tf render, nix/cilium-render.nix, and the
+      # cilium-labels-filter check's `want`). The value arrives via
+      # `cargo xtask regen tfvars` → generated.auto.tfvars.json; the
+      # cilium-labels-filter check (nix/misc-checks.nix) STAGES this
+      # file and fails if an open-coded copy reappears here, so the
+      # tf and nix render paths cannot drift (the share-pin assert
+      # keys both to pins.toml's cilium version, so a pin bump
+      # re-validates the filter semantics by ritual).
+      labels = var.addons.cilium.identity_label_filter
 
       kubeProxyReplacement = true
       k8sServiceHost       = replace(module.eks.cluster_endpoint, "https://", "")

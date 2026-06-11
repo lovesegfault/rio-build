@@ -2757,14 +2757,24 @@ in
   #        pattern flips the whole filter to whitelist-mode and
   #        REPLACES the default set — the unsafe shape this guard
   #        makes unshippable).
-  # The addons.tf side carries the same value (W9-CR: the yamlencode
-  # block is plain HCL — terraform validate covers parse; the
-  # CONTENT pin is the mirror comment + this check on the shared
-  # chart). Scoped honestly: this certifies "the committed default
-  # renders into the chart"; the live identity-cardinality readback
-  # rides the owner-queue act list (the WO-S5-9 retirement record).
-  # No repo-path existence quantification — the rendered derivation
-  # is a build input, so the (vvvvv) staging hazard does not apply.
+  # bug_104 (bughunt-10): ONE value, THREE consumers. The filter is
+  # single-sourced at nix/pins.toml addons.cilium.identity_label_filter
+  # and this check asserts every consumer renders that one pin:
+  #   (a) the k3s/VM chart render (cilium-render.nix reads the pin);
+  #   (b) infra/eks/addons.tf, which consumes
+  #       var.addons.cilium.identity_label_filter — the value flows
+  #       pins.toml → `cargo xtask regen tfvars` →
+  #       generated.auto.tfvars.json (the tfvars-fresh check pins THAT
+  #       edge); this check STAGES addons.tf and the generated tfvars
+  #       ((vvvvv): they are part of the quantified universe, so they
+  #       are build inputs — the OLD check rendered only the nix chart,
+  #       and an edit through the CI-enforced nix+want pair stranded
+  #       the production copy with CI green);
+  #   (c) this check's own `want`, which IS the pin now, not a third
+  #       copy.
+  # Scoped honestly: this certifies "the committed pin renders into
+  # every lane"; the live identity-cardinality readback rides the
+  # owner-queue act list (the W9-CR record, unchanged by this close).
   cilium-labels-filter =
     let
       rendered = import ./cilium-render.nix {
@@ -2772,43 +2782,75 @@ in
         inherit (inputs) nixhelm;
         system = pkgs.stdenv.hostPlatform.system;
       };
-      want = "k8s:!job-name k8s:!batch.kubernetes.io/job-name k8s:!controller-uid k8s:!batch.kubernetes.io/controller-uid";
+      pins = import ./pins.nix;
+      want = pins.addons.cilium.identity_label_filter;
     in
-    pkgs.runCommand "rio-cilium-labels-filter" { } ''
-      cfg=${rendered}/02-cilium.yaml
-      line=$(grep -E '^  labels: ' "$cfg" || true)
-      if [ -z "$line" ]; then
-        echo "FAIL: rendered cilium-config carries NO identity-label filter —" >&2
-        echo "every ephemeral builder Job mints a fresh CiliumIdentity" >&2
-        echo "(live_056-a: 8.3K identities collapsed policy enforcement)." >&2
-        echo "Expected in cilium-render.nix + infra/eks/addons.tf:" >&2
-        echo "  labels: ${want}" >&2
-        exit 1
-      fi
-      case "$line" in
-        *"${want}"*) : ;;
-        *)
-          echo "FAIL: cilium labels filter drifted from the committed default:" >&2
-          echo "  got:  $line" >&2
-          echo "  want: labels: ${want}" >&2
+    pkgs.runCommand "rio-cilium-labels-filter"
+      {
+        addonsTf = ../infra/eks/addons.tf;
+        generatedTfvars = ../infra/eks/generated.auto.tfvars.json;
+        nativeBuildInputs = [ pkgs.jq ];
+      }
+      ''
+        cfg=${rendered}/02-cilium.yaml
+        line=$(grep -E '^  labels: ' "$cfg" || true)
+        if [ -z "$line" ]; then
+          echo "FAIL: rendered cilium-config carries NO identity-label filter —" >&2
+          echo "every ephemeral builder Job mints a fresh CiliumIdentity" >&2
+          echo "(live_056-a: 8.3K identities collapsed policy enforcement)." >&2
+          echo "Expected from nix/pins.toml identity_label_filter:" >&2
+          echo "  labels: ${want}" >&2
           exit 1
-          ;;
-      esac
-      # Whitelist-mode guard (exclusions-only law): every pattern
-      # token must be !-prefixed after the k8s: source prefix.
-      for tok in $(printf '%s' "$line" | sed 's/^  labels: //; s/"//g'); do
-        case "$tok" in
-          k8s:!*) : ;;
+        fi
+        case "$line" in
+          *"${want}"*) : ;;
           *)
-            echo "FAIL: labels filter contains a non-exclusion pattern '$tok' —" >&2
-            echo "one inclusion pattern flips cilium to whitelist-mode and" >&2
-            echo "REPLACES the default identity-relevant set (v1.19.4 semantics)." >&2
+            echo "FAIL: rendered cilium labels filter drifted from the pins.toml value:" >&2
+            echo "  got:  $line" >&2
+            echo "  want: labels: ${want}" >&2
             exit 1
             ;;
         esac
-      done
-      touch $out
-    '';
+        # Whitelist-mode guard (exclusions-only law): every pattern
+        # token must be !-prefixed after the k8s: source prefix.
+        for tok in $(printf '%s' "$line" | sed 's/^  labels: //; s/"//g'); do
+          case "$tok" in
+            k8s:!*) : ;;
+            *)
+              echo "FAIL: labels filter contains a non-exclusion pattern '$tok' —" >&2
+              echo "one inclusion pattern flips cilium to whitelist-mode and" >&2
+              echo "REPLACES the default identity-relevant set (v1.19.4 semantics)." >&2
+              exit 1
+              ;;
+          esac
+        done
+        # (b) the production tf lane: addons.tf consumes the variable
+        # and carries NO open-coded copy of the filter.
+        grep -q 'labels = var.addons.cilium.identity_label_filter' "$addonsTf" || {
+          echo "FAIL: infra/eks/addons.tf no longer consumes" >&2
+          echo "var.addons.cilium.identity_label_filter — the production render" >&2
+          echo "lane detached from the pins.toml single source (bug_104)." >&2
+          exit 1
+        }
+        if grep -nE 'labels *= *"k8s:' "$addonsTf"; then
+          echo "FAIL: infra/eks/addons.tf carries an open-coded labels filter" >&2
+          echo "copy — the single source is nix/pins.toml" >&2
+          echo "addons.cilium.identity_label_filter (bug_104)." >&2
+          exit 1
+        fi
+        # The tfvars emission carries the pin verbatim (the value
+        # addons.tf actually reads at plan time).
+        got=$(jq -r '.addons.cilium.identity_label_filter // empty' "$generatedTfvars")
+        if [ "$got" != "${want}" ]; then
+          echo "FAIL: infra/eks/generated.auto.tfvars.json identity_label_filter" >&2
+          echo "does not match nix/pins.toml:" >&2
+          echo "  got:  $got" >&2
+          echo "  want: ${want}" >&2
+          echo "run: cargo xtask regen tfvars" >&2
+          exit 1
+        fi
+        touch $out
+      '';
 }
 # The quint/TLC protocol-model checks and the mbt-* conformance checks
 # used to be spliced in here; they are now imported directly by

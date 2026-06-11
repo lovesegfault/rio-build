@@ -161,13 +161,12 @@ pkgs.runCommand "cilium-rendered"
       `# live_056-a: exclude per-Job identity labels from identity` \
       `# relevance — the Job-per-build plane minted one CiliumIdentity` \
       `# per build (8.3K live) and collapsed policy enforcement.` \
-      `# EXCLUSIONS-ONLY ("!"-prefixed = subtract from the default` \
-      `# set, v1.19.4 additive semantics); a non-"!" pattern would` \
-      `# flip to whitelist-mode and REPLACE the default set. Mirrors` \
-      `# infra/eks/addons.tf (one chart, two render paths, one` \
-      `# filter); the cilium-labels-filter check asserts the rendered` \
-      `# ConfigMap carries it.` \
-      --set 'labels=k8s:!job-name k8s:!batch.kubernetes.io/job-name k8s:!controller-uid k8s:!batch.kubernetes.io/controller-uid' \
+      `# Single-sourced from nix/pins.toml addons.cilium` \
+      `# identity_label_filter (bug_104: one value, three consumers —` \
+      `# this render, addons.tf via the generated tfvars lane, and` \
+      `# the cilium-labels-filter check). EXCLUSIONS-ONLY semantics` \
+      `# and the whitelist-mode hazard are documented at the pin.` \
+      --set 'labels=${pins.addons.cilium.identity_label_filter}' \
       --set operator.replicas=1 \
       `# r[impl sec.transport.cilium-wireguard]` \
       --set encryption.enabled=true \

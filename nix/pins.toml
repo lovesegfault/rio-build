@@ -29,6 +29,22 @@ kubernetes_version = "1.35"
 # first-class only since PR #40324). Same pin as nix/cilium-render.nix
 # (k3s VM tests) and infra/eks/addons.tf.
 version = "1.19.4"
+# live_056-a identity-label exclusion filter — THE single source
+# (bug_104: one value, three consumers). Consumed by:
+#   - nix/cilium-render.nix (k3s/VM chart render),
+#   - the cilium-labels-filter check (nix/misc-checks.nix `want`),
+#   - infra/eks/addons.tf via var.addons.cilium.identity_label_filter
+#     (this file → `cargo xtask regen tfvars` →
+#     infra/eks/generated.auto.tfvars.json; the variables.tf object
+#     type carries the field).
+# EXCLUSIONS-ONLY ("!"-prefixed = subtract from cilium's default
+# identity-relevant set, v1.19.4 additive semantics): one non-"!"
+# inclusion pattern flips the whole filter to whitelist-mode and
+# REPLACES the default set — the check's exclusions-only guard makes
+# that shape unshippable. Per-Job labels are excluded so the
+# Job-per-build plane cannot mint per-build CiliumIdentities (the
+# 8.3K-identity explosion).
+identity_label_filter = "k8s:!job-name k8s:!batch.kubernetes.io/job-name k8s:!controller-uid k8s:!batch.kubernetes.io/controller-uid"
 
 [addons.gateway_api]
 # Gateway API CRDs (standard channel). Cilium chart's gatewayAPI.enabled

@@ -35,7 +35,13 @@ variable "addons" {
   description = "Cluster addon pins (helm chart versions + Gateway API CRDs)."
   type = object({
     # cilium chart version (helm.cilium.io). Same pin as nix/cilium-render.nix.
-    cilium = object({ version = string })
+    # identity_label_filter: the live_056-a identity-label exclusion
+    # string, single-sourced from nix/pins.toml (bug_104) so the tf and
+    # nix render paths cannot drift; addons.tf consumes it verbatim.
+    cilium = object({
+      version               = string
+      identity_label_filter = string
+    })
     # Gateway API CRD release tag; crds_hash is the fetchurl hash for the
     # standard-install.yaml bundle (consumed by nix/cilium-render.nix, not
     # terraform — it rides along because the whole pins tree lands here).
