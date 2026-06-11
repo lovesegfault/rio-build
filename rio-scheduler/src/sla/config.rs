@@ -933,14 +933,40 @@ impl SlaConfig {
                 };
                 let ok = arch_ok && feat_ok && size_ok && cap_ok;
                 if !ok {
-                    tracing::warn!(
-                        %h, ?cap, cores, mem, ?class_cap,
-                        ?required_features,
-                        provides = ?self.provides_for(h),
-                        ?want_arch, arch_ok, feat_ok, size_ok, cap_ok,
-                        "hw_class cell stripped at post-finalize chokepoint — \
-                         producer-path arch/feature/size/cap-filter regressed?"
-                    );
+                    // merged_bug_002 (the warn's predicate re-derived):
+                    // the arch/feature/cap axes are solve-time facts a
+                    // producer arm enforces — a strip on any of them IS
+                    // a producer-path filter regression. The SIZE axis
+                    // alone is different: demand/ceiling drift between
+                    // solve and finalize is the stale-solve channel,
+                    // and the emission classifier re-routes that
+                    // population upstream on BOTH arms (the memo arm's
+                    // post-overlay survival check + the no-memo
+                    // classify), so a pure-size strip reaching this
+                    // chokepoint means a demand mutation landed BETWEEN
+                    // classification and the strip — name that, never
+                    // "producer regression" (the pre-fix misattribution
+                    // was the only signal the silent-empty channel
+                    // had).
+                    if arch_ok && feat_ok && cap_ok {
+                        tracing::warn!(
+                            %h, ?cap, cores, mem, ?class_cap,
+                            "hw_class cell stripped at post-finalize chokepoint \
+                             on the SIZE axis alone — demand/ceiling drifted \
+                             after classification (the stale-solve channel is \
+                             re-routed upstream; reaching this strip is a \
+                             classify-coverage bug, not a producer regression)"
+                        );
+                    } else {
+                        tracing::warn!(
+                            %h, ?cap, cores, mem, ?class_cap,
+                            ?required_features,
+                            provides = ?self.provides_for(h),
+                            ?want_arch, arch_ok, feat_ok, size_ok, cap_ok,
+                            "hw_class cell stripped at post-finalize chokepoint — \
+                             producer-path arch/feature/cap-filter regressed?"
+                        );
+                    }
                 }
                 ok
             })

@@ -5538,6 +5538,7 @@ async fn out_of_alphabet_verdict_reason_refuses_the_request() {
 async fn cell_emission_arm_product_census() {
     use crate::actor::snapshot::CellEmission as E;
     use crate::sla::config::CapacityType;
+    use crate::sla::solve::InfeasibleReason;
     let db = TestDb::new(&MIGRATOR).await;
     crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
@@ -5573,7 +5574,7 @@ async fn cell_emission_arm_product_census() {
         &cost_big,
         "t",
         &no_feat,
-        false,
+        None,
         false,
     );
     assert!(matches!(e, E::HwAgnostic), "row 1: {e:?}");
@@ -5586,7 +5587,7 @@ async fn cell_emission_arm_product_census() {
         &cost_big,
         "t",
         &no_feat,
-        true,
+        Some(InfeasibleReason::MemCeiling),
         false,
     );
     assert!(matches!(e, E::HwAgnostic), "row 1b: {e:?}");
@@ -5600,7 +5601,7 @@ async fn cell_emission_arm_product_census() {
         &cost_small,
         "t",
         &no_feat,
-        true,
+        Some(InfeasibleReason::MemCeiling),
         false,
     );
     let E::StaleSolve {
@@ -5625,7 +5626,7 @@ async fn cell_emission_arm_product_census() {
         &cost_small,
         "t",
         &no_feat,
-        true,
+        Some(InfeasibleReason::MemCeiling),
         false,
     );
     assert!(
@@ -5642,7 +5643,7 @@ async fn cell_emission_arm_product_census() {
         &cost_small,
         "t",
         &no_feat,
-        true,
+        Some(InfeasibleReason::MemCeiling),
         true,
     );
     assert!(
@@ -5664,7 +5665,7 @@ async fn cell_emission_arm_product_census() {
         &cost_big,
         "t",
         &feat_fetcher,
-        false,
+        None,
         false,
     );
     assert!(
@@ -5681,7 +5682,7 @@ async fn cell_emission_arm_product_census() {
         &cost_small,
         "t",
         &feat_fetcher,
-        true,
+        Some(InfeasibleReason::MemCeiling),
         false,
     );
     let E::StaleSolve { class, cells, .. } = &e else {
@@ -5702,7 +5703,7 @@ async fn cell_emission_arm_product_census() {
         &cost_small,
         "t",
         &feat_fetcher,
-        false,
+        None,
         false,
     );
     let E::Unhostable {
@@ -5722,7 +5723,7 @@ async fn cell_emission_arm_product_census() {
         &cost_big,
         "t",
         &["no-such".to_string()],
-        false,
+        None,
         false,
     );
     assert!(
@@ -5744,7 +5745,7 @@ async fn cell_emission_arm_product_census() {
         &cost_big,
         "t",
         &no_feat,
-        false,
+        None,
         false,
     );
     assert!(matches!(e, E::Cells(ref c) if c.len() == 1), "row 9: {e:?}");
@@ -5758,7 +5759,7 @@ async fn cell_emission_arm_product_census() {
         &cost_small,
         "t",
         &no_feat,
-        true,
+        Some(InfeasibleReason::MemCeiling),
         false,
     );
     let E::StaleSolve { cells, .. } = &e else {
@@ -5768,6 +5769,44 @@ async fn cell_emission_arm_product_census() {
     assert!(
         matches!(cells[0].1, CapacityType::Spot),
         "the pin survives the re-solve"
+    );
+    // Row 11 (∅ feat × hostable × TIME evidence) — the product cell
+    // the pre-round-9 row-set omitted (merged_bug_057's census LINT
+    // GAP): time-only evidence (SerialFloor) leaves fitting
+    // featureless demand on the designed agnostic lane; pre-fix the
+    // flattened bool pinned it to the mem-largest class with a false
+    // stale disclosure.
+    let e = actor.classify_cell_emission(
+        node("d-plain"),
+        None,
+        4,
+        1 << 30,
+        &cost_big,
+        "t",
+        &no_feat,
+        Some(InfeasibleReason::SerialFloor),
+        false,
+    );
+    assert!(matches!(e, E::HwAgnostic), "row 11 (time evidence): {e:?}");
+    // Row 12 (∅ feat × hostable × SIZE evidence) — the sibling cell:
+    // size evidence excludes the agnostic lane, but demand FITTING
+    // the best hosting class has nothing stale to disclose (the
+    // StaleSolve premise is resolved != solved) — it routes as plain
+    // Cells at that class, no WARN, no exit increment.
+    let e = actor.classify_cell_emission(
+        node("d-plain"),
+        None,
+        4,
+        1 << 30,
+        &cost_big,
+        "t",
+        &no_feat,
+        Some(InfeasibleReason::MemCeiling),
+        false,
+    );
+    assert!(
+        matches!(e, E::Cells(ref c) if !c.is_empty()),
+        "row 12 (size evidence, fits): {e:?}"
     );
 }
 
@@ -5844,20 +5883,23 @@ fn stale_solve_revalidation_call_site_censuses() {
     // consumption is the clamped projection.
     assert_eq!(
         count(snapshot_src, "ClampedFloor::of("),
-        4,
+        5,
         "snapshot.rs clamped-projection sites: solve-arm pre-clamp, \
-         post-solve chokepoint, bypass seam (:2236 — the load-bearing \
-         one), classifier floor guard"
+         post-solve chokepoint, bypass seam (the load-bearing one), \
+         classifier floor guard, memo-arm survival check \
+         (merged_bug_002 — predicts the chokepoint's overlay so the \
+         memo emission re-classifies when the floor kills its cells)"
     );
     // Raw floor reads surviving in snapshot.rs: the chokepoint's
     // deadline read (`floor.deadline_secs` — cap-const axis) + the
     // binding that feeds it + the three projection constructor args.
     assert_eq!(
         count(snapshot_src, "state.sched.resource_floor"),
-        4,
-        "raw floor mentions in snapshot.rs = 3 projection-constructor \
-         args + the chokepoint binding (whose mem/disk reads go \
-         through `fclamped`, deadline through the cap const)"
+        5,
+        "raw floor mentions in snapshot.rs = 4 projection-constructor \
+         args (incl. the memo-arm survival check's) + the chokepoint \
+         binding (whose mem/disk reads go through `fclamped`, deadline \
+         through the cap const)"
     );
     assert_eq!(
         count(merge_src, "clamp_floor_to_live"),
@@ -5867,5 +5909,192 @@ fn stale_solve_revalidation_call_site_censuses() {
     assert!(
         prod(floor_src).contains("pub(super) fn clamp_floor_to_live"),
         "the law lives in actor/floor.rs"
+    );
+
+    // (4) W9-R (merged_bug_002, the 2026-06 revision): the
+    // producer-side totality claim made machine-shaped. The STRIKE-7
+    // chokepoint doc asserts "a new producer-hole would require a
+    // SpawnIntent construction site that bypasses `solve_intent_for`
+    // entirely" — this needle IS that census: the sole production
+    // construction site is the shared `to_proto` constructor inside
+    // `compute_spawn_intents` (whose `(cores, mem, cells)` inputs come
+    // from `solve_intent_for`'s classified fold). Count = 2 because
+    // the closure's return-type annotation and the struct literal
+    // share the needle. A bypassing constructor anywhere in the
+    // emission plane fails this census naming the file.
+    let dispatch_src = include_str!("../dispatch.rs");
+    let mod_src = include_str!("../mod.rs");
+    let command_src = include_str!("../command.rs");
+    let admin_mod_src = include_str!("../../admin/mod.rs");
+    let admin_si_src = include_str!("../../admin/spawn_intents.rs");
+    assert_eq!(
+        count(snapshot_src, "SpawnIntent {"),
+        2,
+        "snapshot.rs SpawnIntent construction = the shared `to_proto` \
+         constructor only (type annotation + struct literal); a new \
+         construction site joins the classified fold or fails here"
+    );
+    for (name, other) in [
+        ("dispatch.rs", dispatch_src),
+        ("mod.rs", mod_src),
+        ("command.rs", command_src),
+        ("admin/mod.rs", admin_mod_src),
+        ("admin/spawn_intents.rs", admin_si_src),
+    ] {
+        assert_eq!(
+            count(other, "SpawnIntent {"),
+            0,
+            "{name}: zero SpawnIntent construction sites — the serving \
+             plane re-serves snapshot intents, it never mints them"
+        );
+    }
+}
+
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+/// **W9-P (merged_bug_002)** — *a memoized solve + post-memo floor
+/// bump into the (class-ceiling, global] band yields a CLASSIFIED
+/// emission, never silent `hw_class_names=[]`* — driven through the
+/// MEMO path, the population the round-8 battery never drove (the
+/// law quantifies over EMISSIONS, not over no-memo emissions).
+///
+/// The floor is NOT in `inputs_gen` BY DESIGN (a floor bump must not
+/// thrash the memo), so the second solve memo-HITS; pre-fix the
+/// shared chokepoint then raised mem to the clamped floor, stripped
+/// every per-class cell at `retain_hosting_cells` (size axis), and
+/// emitted empty cells with only the misattributed
+/// producer-regression warn. Post-fix the memo arm re-classifies
+/// after the overlay: floor above EVERY class ceiling => Unhostable
+/// (typed-empty BY DESIGN + the loud disclosure + the exit counter).
+#[tokio::test]
+async fn memo_arm_floor_bump_is_classified_not_silent_empty() {
+    use crate::sla::metrics::counter_map_by;
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    // Class ceilings BELOW the global so the (class-ceiling, global]
+    // band exists: intel-* at 128 GiB, global stays 256 GiB.
+    for h in ["intel-6", "intel-7", "intel-8"] {
+        actor.sla_config.hw_classes.get_mut(h).unwrap().max_mem = Some(128 << 30);
+    }
+    actor.test_inject_ready("d-memo-floor", Some("test-pkg"), "x86_64-linux", false);
+
+    // First solve: the memo path (harness seeds the test-pkg fit and
+    // the hw table) — hw-routed, non-empty cells.
+    let (hw, cost, g) = actor.solve_inputs();
+    let state = actor.dag.node("d-memo-floor").unwrap();
+    let i0 = actor.solve_intent_for(state, &hw, &cost, g);
+    assert!(
+        !i0.hw_class_names.is_empty(),
+        "precondition: the first solve memoizes and routes: {i0:?}"
+    );
+
+    // Post-memo floor bump into the band: 160 GiB sits above every
+    // class ceiling (128 GiB) and below the global (256 GiB).
+    actor
+        .dag
+        .node_mut("d-memo-floor")
+        .unwrap()
+        .sched
+        .resource_floor
+        .mem_bytes = 160 << 30;
+
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    let state = actor.dag.node("d-memo-floor").unwrap();
+    let i1 = {
+        let _g = metrics::set_default_local_recorder(&rec);
+        actor.solve_intent_for(state, &hw, &cost, g)
+    };
+    // ONE snapshot read (it drains).
+    let exits = counter_map_by(
+        &snap,
+        "rio_scheduler_sla_hw_ladder_exhausted_total",
+        Some("exit"),
+    );
+    assert!(
+        i1.hw_class_names.is_empty(),
+        "no class hosts a 160 GiB floor — Unhostable serializes \
+         typed-empty by design: {i1:?}"
+    );
+    assert_eq!(
+        exits.get("unhostable").copied().unwrap_or(0),
+        1,
+        "the memo-arm emission must be CLASSIFIED after the floor \
+         overlay (the unhostable disclosure) — silent hw_class_names=[] \
+         with only the chokepoint strip warn was merged_bug_002; \
+         exits: {exits:?}"
+    );
+    assert!(
+        i1.mem_bytes >= 160 << 30,
+        "the clamped floor survives emission: {}",
+        i1.mem_bytes
+    );
+}
+
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+/// **W9-Q (merged_bug_057)** — *time-only BestEffort (SerialFloor)
+/// featureless demand fitting every class does NOT mint StaleSolve
+/// and KEEPS the designed agnostic lane* (the false-pin inverse).
+///
+/// Pre-fix `classify_cell_emission` gated the HwAgnostic lane on a
+/// flattened `solve_infeasible: bool` — true for EVERY BestEffort
+/// including time-only SerialFloor whose demand fits every class —
+/// and the StaleSolve mint had no demand-vs-ceiling premise, so
+/// size-hosting featureless demand was pinned to the mem-largest
+/// class with `resolved==solved`, a false "no longer hostable" WARN,
+/// and an `exit=stale_resolved` increment: demand concentrated on
+/// the most expensive class exactly under capacity/interrupt
+/// pressure. The typed reason (`Option<InfeasibleReason>`) lets the
+/// agnostic gate key on SIZE-infeasibility.
+#[tokio::test]
+async fn time_only_best_effort_keeps_the_agnostic_lane() {
+    use crate::sla::metrics::counter_map_by;
+    use crate::sla::types::{DurationFit, RefSeconds};
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    // SerialFloor fit: S=3000s — the serial floor breaches the only
+    // tier bound (p90=1200s) at EVERY hw class (the largest factor,
+    // intel-8 at 2.0, still leaves S_eff=1500 > 1200), so the
+    // hw-aware solve is BestEffort{SerialFloor} everywhere, while the
+    // demand envelope (6 GiB mem fit, 10 GiB disk) fits EVERY class.
+    let mut f = make_fit("test-pkg");
+    f.fit = DurationFit::Amdahl {
+        s: RefSeconds(3000.0),
+        p: RefSeconds(30.0),
+    };
+    actor.sla_estimator.seed(f);
+    actor.test_inject_ready("d-serial", Some("test-pkg"), "x86_64-linux", false);
+
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    let (hw, cost, g) = actor.solve_inputs();
+    let state = actor.dag.node("d-serial").unwrap();
+    let i = {
+        let _g = metrics::set_default_local_recorder(&rec);
+        actor.solve_intent_for(state, &hw, &cost, g)
+    };
+    // ONE snapshot read (it drains).
+    let exits = counter_map_by(
+        &snap,
+        "rio_scheduler_sla_hw_ladder_exhausted_total",
+        Some("exit"),
+    );
+    assert!(
+        i.hw_class_names.is_empty(),
+        "time-only infeasibility keeps the agnostic lane (empty \
+         affinity; the controller's fallback arch-matches) — a pin to \
+         the mem-largest class is merged_bug_057: {i:?}"
+    );
+    assert_eq!(
+        exits.get("stale_resolved").copied().unwrap_or(0),
+        0,
+        "nothing is stale: no false 'no longer hostable' disclosure \
+         for fitting demand; exits: {exits:?}"
+    );
+    assert!(
+        exits.is_empty(),
+        "no ladder-exhausted exit fires for time-only fitting demand; \
+         exits: {exits:?}"
     );
 }

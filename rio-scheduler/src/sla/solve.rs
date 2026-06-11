@@ -156,6 +156,30 @@ impl InfeasibleReason {
         }
     }
 
+    /// True iff the reason testifies the demand cannot fit some
+    /// envelope/supply axis — the populations the agnostic lane is
+    /// reserved AWAY from (merged_bug_057: the emission classifier
+    /// keys its HwAgnostic gate on this, not on "any infeasibility").
+    /// Time-shaped reasons (`SerialFloor`: `S ≥ bound` at the loosest
+    /// tier; `InterruptRunaway`: λ rejects spot at every `c`) leave
+    /// the demand hostable by every class size-wise, so featureless
+    /// demand KEEPS the designed agnostic lane — clamping it into the
+    /// mem-largest class concentrated demand on the most expensive
+    /// class exactly under capacity/interrupt pressure.
+    /// `CapacityExhausted` cannot reach the emission classifier today
+    /// (it is minted only at the memo arm's read-time ICE-mask edge,
+    /// never by `classify_ceiling`/`classify_best_effort`); it is
+    /// classed size-side conservatively because §Capacity backoff
+    /// reserves the agnostic lane for envelope-infeasibility.
+    pub const fn is_size_infeasibility(&self) -> bool {
+        match self {
+            Self::MemCeiling | Self::DiskCeiling | Self::CoreCeiling | Self::CapacityExhausted => {
+                true
+            }
+            Self::SerialFloor | Self::InterruptRunaway => false,
+        }
+    }
+
     /// Increment `rio_scheduler_sla_infeasible_total{reason=…,tenant=…}`.
     /// Single emit point — grep `\.emit(` to find every infeasible call
     /// site.
