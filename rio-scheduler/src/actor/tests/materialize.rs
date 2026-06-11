@@ -11374,3 +11374,121 @@ fn listing_handler_reads_one_pass_clock() {
         "exactly two arms: pass start + the beat completion re-arm"
     );
 }
+
+// r[verify sched.materialize.view-settlement]
+/// W10-X (bug_120) — proposition: every successful PD-20 conversion
+/// drives the disclosure tail with ZERO skew-WARNs. The park tail
+/// already released the node (Assigned/Running → Queued|Ready — the
+/// park's requeue companion), so the conversion's requeue at the
+/// release chokepoint finds the node ALREADY at a released status.
+/// Pre-fix `reset_after_attempt` conflated that benign idempotence
+/// with genuine state-machine skew: the "invalid state for
+/// reassignment, skipping" WARN fired on EVERY successful conversion
+/// and the early return skipped `affected.extend` — no
+/// `emit_progress` fan-out, so the build's dashboard view stayed
+/// stale until the next unrelated event, while the WARN correlated
+/// noise into the conversions alert lane.
+///
+/// Post-fix: already-at-a-released-status is the TYPED
+/// `AlreadyReleased` outcome — no WARN (reserved for truly
+/// unexpected statuses), and the disclosure tail still fans out (a
+/// Progress event lands on the build's state ring after the
+/// conversion tick).
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn conversion_requeue_is_a_disclosing_no_op() -> TestResult {
+    use rio_proto::types::build_event::Event;
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let (store, store_client, store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let (handle, actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, _| {
+            cfg.materialization.max_attempts = 1;
+            cfg.materialization.park_backoff_base_secs = 3600;
+            cfg.materialization.park_backoff_cap_secs = 3600;
+        });
+    let _tasks = (store_task, actor_task);
+
+    // Substitutable node → job; claim; infra-fail → PARKED (the park
+    // tail releases the node).
+    let out = test_store_path("w10x-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut r = make_node("w10x");
+    r.expected_output_paths = vec![out.clone()];
+    r.wanted_output_names = vec!["out".into()];
+    let b1 = Uuid::new_v4();
+    let mut ev = merge_dag(&handle, b1, vec![r], vec![], false).await?;
+    barrier(&handle).await;
+    let assignment = match claim_materialization(&handle, "w10x", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    report_materialization_outcome(&handle, exec_id, "w10x", mat_infra_outcome("dead upstream"))
+        .await
+        .map_err(|e| anyhow::anyhow!("infra report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    // Durable truth: the closure is produced + vouched — from-source
+    // viable; the next tick converts (PD-20).
+    let r_id = pg_derivation_id(&db.pool, "w10x").await?;
+    let c_id = insert_pg_derivation(&db.pool, "w10x-child", "completed").await?;
+    pg_edge(&db.pool, r_id, c_id).await?;
+    pg_link(&db.pool, b1, c_id).await?;
+
+    // Drain the ring so the fan-out assertion sees only post-tick
+    // events, and let emit_progress's 250ms I-140 debounce window
+    // lapse (the park flow just emitted Progress; the debounce is an
+    // orthogonal rate policy — the claim under test is that the
+    // chokepoint CALLS the fan-out at all).
+    while ev.try_recv().is_ok() {}
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    while ev.try_recv().is_ok() {}
+
+    tick(&handle).await?;
+    barrier(&handle).await;
+
+    let job_state: String =
+        sqlx::query_scalar("SELECT state FROM materialization_jobs WHERE drv_hash = 'w10x'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(job_state, "resolved_from_source", "the conversion fired");
+
+    // (1) zero skew-WARNs: the conversion's requeue found the node
+    // already released — benign idempotence, not state-machine skew.
+    assert!(
+        !logs_contain("invalid state for reassignment"),
+        "left (pre-fix): EVERY successful conversion fired the \
+         'invalid state for reassignment, skipping' WARN (the park tail \
+         had already released the node; the chokepoint conflated benign \
+         idempotence with skew) / right: already-released is a typed \
+         no-op — the WARN is reserved for truly unexpected statuses"
+    );
+
+    // (2) the disclosure tail fires: a Progress event lands on the
+    // build's state ring after the conversion tick.
+    let mut progressed = false;
+    for _ in 0..100 {
+        match ev.try_recv() {
+            Ok(e) => {
+                if matches!(e.event, Some(Event::Progress(_))) {
+                    progressed = true;
+                    break;
+                }
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Err(_) => break,
+        }
+    }
+    assert!(
+        progressed,
+        "left (pre-fix): the early return skipped affected.extend — no \
+         emit_progress fan-out after the conversion; the build's view \
+         stayed stale until the next unrelated event / right: the typed \
+         AlreadyReleased outcome still drives the disclosure tail"
+    );
+    Ok(())
+}

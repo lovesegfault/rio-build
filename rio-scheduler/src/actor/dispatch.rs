@@ -552,7 +552,12 @@ impl DagActor {
             Some(s) if s.status() == DerivationStatus::Queued => None,
             Some(s) => {
                 match s.reset_after_attempt(crate::state::AttemptKind::Materialization, false) {
-                    Ok(to) => Some(to),
+                    Ok(crate::state::ReleaseOutcome::Released(to)) => Some(to),
+                    // bug_120: already at a released status (Ready —
+                    // the Queued case pre-guards above). Nothing
+                    // moved; the same no-persist disposition as the
+                    // Queued arm, without the skew WARN.
+                    Ok(crate::state::ReleaseOutcome::AlreadyReleased(_)) => None,
                     Err(e) => {
                         warn!(%drv_hash, %e,
                               "topdown fail-fast: release toward Queued rejected; \

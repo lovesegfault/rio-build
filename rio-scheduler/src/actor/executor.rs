@@ -11,7 +11,7 @@
 //! pull-attempt verdict arms and the establishment sweep. Periodic
 //! `tick_*` housekeeping lives in [`super::housekeeping`].
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::state::{DrvHash, ExecutorId};
@@ -239,18 +239,35 @@ impl DagActor {
     ) {
         let deps_completed = self.dag.all_deps_completed(drv_hash.as_str());
         if let Some(state) = self.dag.node_mut(drv_hash) {
-            let released_to = match state.reset_after_attempt(kind, deps_completed) {
-                Ok(to) => to,
+            match state.reset_after_attempt(kind, deps_completed) {
+                Ok(crate::state::ReleaseOutcome::Released(to)) => {
+                    self.persist_status(drv_hash, to, None).await;
+                    affected.extend(self.get_interested_builds(drv_hash));
+                }
+                // bug_120: benign idempotence — the node was already
+                // released (the PD-20 conversion's requeue after the
+                // park tail is the production shape). Nothing moved,
+                // nothing to persist; the disclosure tail STILL fans
+                // out so the build's view reflects the conversion
+                // (pre-fix this arm was the skew WARN + an early
+                // return that starved emit_progress).
+                Ok(crate::state::ReleaseOutcome::AlreadyReleased(at)) => {
+                    debug!(
+                        drv_hash = %drv_hash, status = %at,
+                        "release chokepoint: already at a released status —                          typed no-op; disclosure fan-out proceeds"
+                    );
+                    affected.extend(self.get_interested_builds(drv_hash));
+                }
+                // Truly unexpected statuses (Completed/Poisoned/
+                // DepFailed/…) keep the WARN — genuine state-machine
+                // skew from a stale caller.
                 Err(e) => {
                     warn!(
                         drv_hash = %drv_hash, error = %e,
                         "invalid state for reassignment, skipping"
                     );
-                    return;
                 }
-            };
-            self.persist_status(drv_hash, released_to, None).await;
-            affected.extend(self.get_interested_builds(drv_hash));
+            }
         }
     }
 }

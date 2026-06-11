@@ -1234,6 +1234,24 @@ impl RealizedPathCarrier {
     pub fn discard_for_from_source(self) {}
 }
 
+/// The typed outcome of a release-shaped chokepoint (bug_120, R14):
+/// the closure set every release caller dispatches on — a release
+/// either MOVED the node to its target or found it ALREADY at a
+/// released status (benign idempotence: the park tail or an earlier
+/// release got there first). Callers treat `AlreadyReleased` as a
+/// no-op that STILL drives the disclosure tail (affected builds /
+/// emit_progress); the `Err` lane is reserved for truly unexpected
+/// statuses (Completed/Poisoned/DepFailed/… — genuine state-machine
+/// skew, the WARN class).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseOutcome {
+    /// The release transitioned the node; persist the new status.
+    Released(DerivationStatus),
+    /// The node already sat at a released status for this kind —
+    /// nothing moved, nothing to persist; disclosure still fans out.
+    AlreadyReleased(DerivationStatus),
+}
+
 impl DerivationState {
     /// THE stale-reset destruction site (merged_bug_257): clear
     /// `output_paths`, returning the non-empty, still-wanted realized
@@ -1773,10 +1791,29 @@ impl DerivationState {
         &mut self,
         kind: AttemptKind,
         deps_completed: bool,
-    ) -> Result<DerivationStatus, TransitionError> {
+    ) -> Result<ReleaseOutcome, TransitionError> {
+        // bug_120 (R21: the conflated arm splits): already sitting at
+        // a released status for this kind is BENIGN IDEMPOTENCE — the
+        // park tail (or an earlier release) already walked the node
+        // there, and a second release-shaped caller (the PD-20
+        // conversion's requeue is the production shape) must get a
+        // typed no-op that still drives the disclosure tail, never
+        // the skew WARN. The released-status set per kind mirrors the
+        // release targets below: Build releases to Ready only;
+        // Materialization to its dep-derived Ready|Queued.
+        let already = match kind {
+            AttemptKind::Build => self.status == DerivationStatus::Ready,
+            AttemptKind::Materialization => matches!(
+                self.status,
+                DerivationStatus::Ready | DerivationStatus::Queued
+            ),
+        };
+        if already {
+            return Ok(ReleaseOutcome::AlreadyReleased(self.status));
+        }
         if kind == AttemptKind::Build {
             self.reset_to_ready()?;
-            return Ok(DerivationStatus::Ready);
+            return Ok(ReleaseOutcome::Released(DerivationStatus::Ready));
         }
         let target = if deps_completed {
             DerivationStatus::Ready
@@ -1811,7 +1848,7 @@ impl DerivationState {
         self.exec_id = None;
         self.open_attempt_kind = None;
         self.claim_nonce = None;
-        Ok(target)
+        Ok(ReleaseOutcome::Released(target))
     }
 
     /// If Assigned, transition to Running (intermediate step — the
@@ -3162,14 +3199,39 @@ mod tests {
         ] {
             let mut st = mk(from);
             let got = st.reset_after_attempt(kind, deps).expect("legal release");
-            assert_eq!(got, want, "({from}, {kind:?}, deps={deps})");
+            assert_eq!(
+                got,
+                ReleaseOutcome::Released(want),
+                "({from}, {kind:?}, deps={deps})"
+            );
             assert_eq!(st.status(), want);
             assert!(st.assigned_executor.is_none() && st.exec_id.is_none());
             assert!(st.open_attempt_kind.is_none());
         }
-        // Illegal sources reject for both kinds.
+        // bug_120: already-at-a-released-status is the TYPED no-op —
+        // status unchanged, bookkeeping untouched (it was cleared by
+        // the release that got there first), never an error.
+        for (from, kind) in [
+            (S::Ready, AttemptKind::Build),
+            (S::Ready, AttemptKind::Materialization),
+            (S::Queued, AttemptKind::Materialization),
+        ] {
+            let mut st = mk(from);
+            assert_eq!(
+                st.reset_after_attempt(kind, true).expect("typed no-op"),
+                ReleaseOutcome::AlreadyReleased(from),
+                "({from}, {kind:?})"
+            );
+            assert_eq!(st.status(), from, "no movement on the no-op");
+        }
+        // Truly unexpected sources still reject for both kinds (the
+        // WARN lane): Queued is NOT a released status for Build.
+        assert!(
+            mk(S::Queued)
+                .reset_after_attempt(AttemptKind::Build, true)
+                .is_err()
+        );
         for kind in [AttemptKind::Build, AttemptKind::Materialization] {
-            assert!(mk(S::Ready).reset_after_attempt(kind, true).is_err());
             assert!(mk(S::Completed).reset_after_attempt(kind, true).is_err());
         }
     }
