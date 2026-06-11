@@ -124,6 +124,7 @@ impl GuardHandle {
     /// probe is outstanding this is a RUNNING LOWER BOUND (it grows
     /// with the stall), so the value is truthful DURING a freeze, not
     /// only after it resolves. The W9-AU oracle (S4 consumes this).
+    // r[impl sys.guard.skew-sentinel]
     pub fn main_skew(&self) -> Duration {
         Duration::from_micros(self.main_skew_us.load(Ordering::Relaxed))
     }
@@ -186,6 +187,7 @@ struct ReadyState {
 ///
 /// `main` is the WORKING domain's handle (probe target); `ready` is
 /// the readiness flag main.rs flips after `connect_forever`.
+// r[impl sys.guard.domain-isolation]
 pub fn spawn(
     main: tokio::runtime::Handle,
     ready: Arc<AtomicBool>,

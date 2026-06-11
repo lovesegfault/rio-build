@@ -268,6 +268,7 @@ const DECLARED_MARKER: &str =
 /// W9-AL main face: totality + closed vocabulary + zero-irreversible +
 /// snapshot equality over the production tree.
 #[test]
+// r[verify sys.guard.brownout-only]
 fn timeout_census_is_total_classified_and_frozen() {
     let sites = scan_pairs(CENSUS_SOURCES);
     assert!(

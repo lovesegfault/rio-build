@@ -1198,12 +1198,13 @@ fn build_executor_container(
         }),
 
         // No LIVENESS/STARTUP probes: executor pods are one-shot
-        // Jobs, kill-wired by EXIT (D3 — the cold-start budget exits
-        // nonzero; activeDeadlineSeconds bounds hangs) and a
-        // CPU-pegged build would fail a 1s-timeout liveness probe →
-        // kubelet SIGKILL mid-build → FUSE/overlay torn down →
-        // nix-daemon EIO (I-114's liveness half STANDS; only its
-        // readiness half is revisited above).
+        // Jobs, kill-wired by EXIT (sys.guard.kill-wired-isolated —
+        // the doctrine rule this folklore graduated into; the
+        // cold-start budget exits nonzero, activeDeadlineSeconds
+        // bounds hangs) and a CPU-pegged build would fail a
+        // 1s-timeout liveness probe → kubelet SIGKILL mid-build →
+        // FUSE/overlay torn down → nix-daemon EIO (I-114's liveness
+        // half STANDS; only its readiness half is revisited above).
         ..Default::default()
     }
 }

@@ -109,6 +109,7 @@ fn stall_main(rt: &tokio::runtime::Runtime, workers: usize, len: Duration) {
 }
 
 #[test]
+// r[verify sys.guard.domain-isolation]
 fn w9_aj_guard_serves_liveness_and_sheds_readiness_during_main_stall() {
     let ready = Arc::new(AtomicBool::new(false));
     let cfg = GuardConfig {
@@ -212,6 +213,7 @@ fn w9_aj_guard_serves_liveness_and_sheds_readiness_during_main_stall() {
 }
 
 #[test]
+// r[verify sys.guard.skew-sentinel]
 fn w9_ak_stall_counter_and_capture_fire_past_threshold() {
     let ready = Arc::new(AtomicBool::new(true));
     let cfg = GuardConfig {

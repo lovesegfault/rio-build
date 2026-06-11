@@ -360,6 +360,7 @@ mod tests {
     /// body): connect_forever retried the same shape forever — the
     /// invisible wedge.
     #[tokio::test]
+    // r[verify sys.guard.kill-wired-isolated]
     async fn w9_cn_budget_bounds_hung_cold_start_connect() {
         let token = CancellationToken::new();
         let started = std::time::Instant::now();

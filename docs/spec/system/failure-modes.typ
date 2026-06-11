@@ -134,15 +134,29 @@ the incident this rule generalizes; its point fix (no token evidence
 This was repo folklore in three places before it was a rule: the
 scheduler chart's tcpSocket-probe rationale
 (`infra/helm/rio-build/templates/scheduler.yaml`, the standby block —
-liveness on `is_leader` would kill the standby), the builder's
-no-probes rationale (`rio-controller/src/reconcilers/pool/job.rs`,
-I-114: with `parallelism: 1` a readiness probe adds nothing the pull
-loop's own deadline does not), and the controller counterexample that
-killed itself in live-054 (an axum `/healthz` on the shared runtime —
-the negation of this rule, repaired by the guard-runtime split). The
+liveness on `is_leader` would kill the standby), the builder's probe
+rationale (`rio-controller/src/reconcilers/pool/job.rs`, I-114), and
+the controller counterexample that killed itself in live-054 (an axum
+`/healthz` on the shared runtime — the negation of this rule,
+repaired by the guard-runtime split). The
 controller probe chart block (`controller.yaml`, the D-054-1a
 rationale: readiness 5s/5s, liveness 10s/10s with failureThreshold 6,
 startupProbe 2s/10s×30) is the chart-side realization.
+
+The builder's landed posture (live-056-b) is the rule's dual-face
+exemplar, KILL-WIRED BY EXIT: liveness probes are deliberately ABSENT
+on executor pods (I-114's liveness half stands — a CPU-pegged build
+must never be probe-SIGKILLed), and the kill-wired surface is the
+process's own exit instead — a cold-start connect that exceeds its
+typed budget exits NONZERO, so the platform's escalation alphabet
+(Job backoff, CrashLoopBackOff) carries the failure without any
+probe sharing the build's failure domain. READINESS is shed-wired
+and MAY share the working domain per this rule: the `/servingz`
+serving-state endpoint (200 iff the serving file exists — written
+post-connect, pre-first-pull) feeds the Job's readiness probe, and
+steady-state reconnects keep the infinite posture (a claim-state
+holder must not die on upstream outage), so established pods do not
+flap Ready on a correlated upstream blip.
 
 #r("sys.guard.correlated-readiness-brownout")[
   On a horizontally scaled fleet, a shed-wired readiness surface MUST

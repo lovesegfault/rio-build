@@ -47,6 +47,7 @@ use tracing::warn;
 /// mutation seam. The check consults the SAME LeaderState, so a lease
 /// loss or steal observed by the (guard-domain) lease loop between
 /// mint and mutation flips the verdict.
+// r[impl sys.guard.scheduling-premise]
 pub struct MutationFence {
     generation: u64,
     leader: rio_lease::LeaderState,
@@ -148,6 +149,7 @@ mod tests {
     /// LeaderStates over the REAL lease state machinery (production
     /// constructors — R13): actor A's fence goes stale the moment the
     /// lease moves; actor B's stays live. Both directions.
+    // r[verify sys.guard.scheduling-premise]
     #[test]
     fn w9_am_stale_fence_refuses_live_fence_proceeds() {
         // Actor A: leader after acquire at lease-transitions 5

@@ -27,6 +27,7 @@ pub type ReadyFlag = Arc<AtomicBool>;
 /// pulled/building axis (useful capacity). `serving_file` is a
 /// parameter so the route law is testable without touching the
 /// production path (`rio_common::k8s::BUILDER_SERVING_STATE_FILE`).
+// r[impl sys.guard.correlated-readiness-brownout]
 fn builder_health_router(ready: ReadyFlag, serving_file: std::path::PathBuf) -> axum::Router {
     rio_common::server::health_router(ready).route(
         "/servingz",
@@ -120,6 +121,7 @@ mod tests {
     /// IS) — independent of `/readyz`'s pulled/building axis. Pre-fix
     /// red: the endpoint did not exist (404 — no probe COULD exist;
     /// I-114's readiness half), transcript in the commit body.
+    // r[verify sys.guard.correlated-readiness-brownout]
     #[tokio::test]
     async fn w9_co_servingz_tracks_the_serving_state_file() {
         let dir = tempfile::tempdir().expect("tempdir");

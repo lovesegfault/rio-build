@@ -1434,6 +1434,7 @@ pub(super) fn filter_spawnable_by_token(
 /// keyless scheduler declares itself on the wire (`keyless=true`),
 /// so dev rides the Some arm into the Keyless letter; the Err arm is
 /// transport failure in every mode.
+// r[impl sys.guard.brownout-only]
 // r[impl sec.executor.identity-token+3]
 pub(super) async fn mint_spawn_tokens(
     ctx: &Ctx,

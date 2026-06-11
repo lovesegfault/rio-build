@@ -521,6 +521,7 @@ const COLD_START_CONNECT_BUDGET: std::time::Duration = std::time::Duration::from
 ///   route through the same balanced channel — leadership flip
 ///   detected within one probe tick (~3s).
 /// - Single (non-K8s): plain connect. VM tests use this.
+// r[impl sys.guard.kill-wired-isolated]
 async fn connect_upstreams(
     cfg: &crate::config::Config,
     shutdown: &rio_common::signal::Token,
