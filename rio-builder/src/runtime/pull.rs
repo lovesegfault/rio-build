@@ -199,21 +199,32 @@ pub(super) enum PullPhaseOutcome {
     },
 }
 
-/// Permanent, non-retryable rejection codes: a mis-bound or
-/// expired/invalid executor token (PermissionDenied / Unauthenticated),
-/// a scheduler without the pull RPCs (Unimplemented), or a request the
-/// server will never accept (InvalidArgument). Retrying these holds a
-/// node for the full `activeDeadlineSeconds` with no chance of
-/// progress; the loops terminate promptly and loudly instead
-/// (`builder.pull.retry-loop+2`).
+// r[impl sec.authz.refusal-adjudication]
+/// Permanent, non-retryable rejection codes, sourced from the ONE
+/// exported adjudication authority (merged_bug_059 — this consumer
+/// was the re-point the authority's own AttemptBound doc named but
+/// never received): `rio_proto::refusal::judge_refusal` under the
+/// ATTEMPT-BOUND regime. The builder's executor token is fixed for
+/// the pod's lifetime, so re-presentation is byte-identical and an
+/// auth refusal is stable for the whole attempt — the regime split
+/// that keeps the store's fresh-mint lanes retrying the same pair.
+/// Retrying these holds a node for the full `activeDeadlineSeconds`
+/// with no chance of progress; the loops terminate promptly and
+/// loudly instead (`builder.pull.retry-loop+2`).
+///
+/// Exhaustive over [`RefusalJudgment`] — never `matches!` (which
+/// desugars to `_ => false`): a future judgment variant must decide
+/// its fatality HERE at compile time, not land in silent-retry. The
+/// agreement census (`fatal_set_agrees_with_the_authority`) pins the
+/// behavioral set: identical to the pre-re-point hand-coded
+/// {PermissionDenied, Unauthenticated, Unimplemented,
+/// InvalidArgument} — zero behavior change, asserted cell-by-cell.
 fn is_fatal_rejection(code: tonic::Code) -> bool {
-    matches!(
-        code,
-        tonic::Code::PermissionDenied
-            | tonic::Code::Unauthenticated
-            | tonic::Code::Unimplemented
-            | tonic::Code::InvalidArgument
-    )
+    use rio_proto::refusal::{CredentialRegime, RefusalJudgment, judge_refusal};
+    match judge_refusal(CredentialRegime::AttemptBound, code) {
+        RefusalJudgment::DisprovesRequest => true,
+        RefusalJudgment::JudgesPresentation | RefusalJudgment::Undecided => false,
+    }
 }
 
 /// The two unaries the loop speaks, abstracted so the state machine is
@@ -1070,6 +1081,54 @@ pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    // r[verify sec.authz.refusal-adjudication]
+    /// The agreement census (merged_bug_059): the builder's fatal set,
+    /// now derived from the authority, equals the pre-re-point
+    /// hand-coded set on EVERY tonic code — zero behavior change is
+    /// asserted by the census itself, cell-by-cell over all 17 codes,
+    /// with the expectation table hand-transcribed (the independent
+    /// oracle), never computed from the implementation.
+    #[test]
+    fn fatal_set_agrees_with_the_authority() {
+        use tonic::Code;
+        // The pre-re-point hand-coded set, transcribed verbatim from
+        // the replaced matches! body.
+        let hand_coded = [
+            Code::PermissionDenied,
+            Code::Unauthenticated,
+            Code::Unimplemented,
+            Code::InvalidArgument,
+        ];
+        let all = [
+            Code::Ok,
+            Code::Cancelled,
+            Code::Unknown,
+            Code::InvalidArgument,
+            Code::DeadlineExceeded,
+            Code::NotFound,
+            Code::AlreadyExists,
+            Code::PermissionDenied,
+            Code::ResourceExhausted,
+            Code::FailedPrecondition,
+            Code::Aborted,
+            Code::OutOfRange,
+            Code::Unimplemented,
+            Code::Internal,
+            Code::Unavailable,
+            Code::DataLoss,
+            Code::Unauthenticated,
+        ];
+        assert_eq!(all.len(), 17, "the tonic code census is total");
+        for code in all {
+            assert_eq!(
+                is_fatal_rejection(code),
+                hand_coded.contains(&code),
+                "code {code:?}: the authority-derived fatal set must \
+                 agree with the pre-re-point hand-coded set"
+            );
+        }
+    }
 
     /// Scripted transport: pops one scripted answer per call; repeats
     /// the last entry forever once the script is exhausted. Counts
