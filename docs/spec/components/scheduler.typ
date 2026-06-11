@@ -4526,15 +4526,20 @@ builds. Disclosure on the override arm is the boot-time half; the
 emission-time half is the `scheduler.sla.ceiling.stale-solve-revalidation`
 law.
 
-#r("scheduler.sla.ceiling.stale-solve-revalidation")[
+#r("scheduler.sla.ceiling.stale-solve-revalidation+2")[
   A demand envelope solved under a catalog ceiling MUST be revalidated
   against the live ceilings at every emission; an envelope no class can
   host MUST re-solve (clamp into the largest live hosting class, with
-  the clamp disclosed) or surface typed — never emit empty cells for
-  non-agnostic demand. Demand infeasible at every class MUST
-  clamp-with-disclosure into the largest mintable class or surface as a
-  typed `Unhostable` carrying demand and best-class — never empty
-  cells. A persisted resource floor is evidence under the ceiling that
+  the clamp disclosed) or surface typed — never an UNCLASSIFIED empty
+  emission for non-agnostic demand. Demand infeasible at every class
+  MUST clamp-with-disclosure into the largest mintable class or surface
+  as a typed `Unhostable` carrying demand and best-class. The totality
+  of the emission alphabet is scoped to the scheduler: a typed
+  `Unhostable` serializes as empty `hw_class_names` BY DESIGN (the
+  designed feeder of the controller's `no_hosting_class` arm — the
+  forced-demand law requires the empty emission so `fallback_cell`
+  reaches its own `None`), distinguished controller-side by the
+  `IntentVerdict` plane, never by a second wire axis. A persisted resource floor is evidence under the ceiling that
   authorized it: a floor above the live global MUST be consumed clamped
   — at hydrate and at every read — while the durable row PRESERVES the
   witnessed evidence (the `GREATEST`-ratchet writer; a later ceiling

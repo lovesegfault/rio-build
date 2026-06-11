@@ -2276,7 +2276,7 @@ impl DagActor {
         // downgrade. Per-dimension `.max()` only RAISES so a stale DB
         // row never demotes a higher in-memory floor.
         //
-        // r[impl scheduler.sla.ceiling.stale-solve-revalidation]
+        // r[impl scheduler.sla.ceiling.stale-solve-revalidation+2]
         // live_051(d): hydrate-then-CLAMP — a row persisted under a
         // larger old global (the M_044 GREATEST ratchet preserves it)
         // enters memory grounded at the LIVE ceilings, so a stale

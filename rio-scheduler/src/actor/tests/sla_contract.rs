@@ -4993,7 +4993,7 @@ fn shrink_catalog(actor: &DagActor, cores: u32, mem: u64) {
     actor.cost_table.write().set_catalog_ceilings(c);
 }
 
-// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation+2]
 /// **R17 + W7-Q + W7-S** — *a demand envelope solved under ceiling C,
 /// with ceilings then shrunk to C′ < demand, is RE-SOLVED on the next
 /// emission pass*: the emitted intent carries cells hostable under C′
@@ -5060,7 +5060,7 @@ async fn stale_envelope_revalidates_on_ceiling_shrink() {
     }
 }
 
-// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation+2]
 /// **R18 (green-side pin, disclosed)** — *the genuinely hw-agnostic
 /// emission stays quiet*: a featureless drv with NO infeasibility
 /// evidence emits empty `hw_class_names` exactly as before the typing
@@ -5087,7 +5087,7 @@ async fn hw_agnostic_emission_stays_quiet() {
     );
 }
 
-// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation+2]
 /// **R19 + R23 + W7-V (unhostable half) + W7-R (kill-isolation)** —
 /// *feature-constrained demand no class can host even re-solved is
 /// `Unhostable` + LOUD, never empty-silent*: a FOD whose clamped floor
@@ -5159,7 +5159,7 @@ async fn infeasible_everywhere_drv_emits_unhostable_not_empty_cells() {
     );
 }
 
-// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation+2]
 /// **The live_051(b) clamp green twin (W7-V, clamp half)** —
 /// *demand infeasible at every class with NO feature constraint
 /// clamps-with-disclosure into the largest mintable class*: a fitted
@@ -5217,7 +5217,7 @@ async fn oversize_unconstrained_demand_clamps_with_disclosure() {
     assert_eq!(resolved, 1, "the clamp is DISCLOSED exactly once per edge");
 }
 
-// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation+2]
 /// **R24 + W7-W** — *a floor persisted above the live global is
 /// consumed CLAMPED on the first post-boot read, and the hydrate seam
 /// grounds it on entry*: actor-1 ("the old boot", big ceilings)
@@ -5312,7 +5312,7 @@ fn no_host_verdict(id: &str, detail: &str) -> rio_proto::types::IntentVerdict {
     }
 }
 
-// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation+2]
 /// **R25 + W7-X** — *N consecutive no-hosting-class verdicts drive the
 /// drv out of Ready via poison with the controller's detail*
 /// (operation-count: exactly `NO_HOST_VERDICTS_TO_POISON` applied
@@ -5390,7 +5390,7 @@ async fn n_no_host_verdicts_poison_the_drv_with_the_verdict_message() {
     );
 }
 
-// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation+2]
 /// W7-X kill-isolation: the three reset/dedup conjuncts of the
 /// verdict-budget law, each driven through the production ack-apply
 /// plane (see `n_no_host_verdicts_poison_the_drv_with_the_verdict_
@@ -5551,7 +5551,7 @@ async fn verdict_budget_resets_on_spawn_and_census_change_and_dedups_in_request(
     assert_eq!(p.len(), 1, "duplicate entries within one ack count once");
 }
 
-// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation+2]
 /// Counter-lifecycle law table (R15 product census over the step
 /// alphabet, merged_bug_043 form): `step_no_host_counter` walked over
 /// (prev-track × census × pass) cells with a HAND-WRITTEN oracle
@@ -5609,7 +5609,7 @@ fn no_host_counter_step_law_table() {
     }
 }
 
-// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation+2]
 /// An out-of-alphabet verdict reason refuses the WHOLE request
 /// (validate-then-commit: no plane applied) — the closed-alphabet
 /// posture of the wire fold (rustc-exhaustive at validate; this pins
@@ -5645,7 +5645,7 @@ async fn out_of_alphabet_verdict_reason_refuses_the_request() {
     }
 }
 
-// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation+2]
 /// **The emission-arm product census (R15)** — cells from the
 /// `CellEmission` alphabet over (feat ∅/non-∅ × {hostable,
 /// stale-hostable, infeasible-everywhere, unhostable} × pin rows),
@@ -5931,7 +5931,7 @@ async fn cell_emission_arm_product_census() {
     );
 }
 
-// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation+2]
 /// **[GEN-SET] call-site censuses (R15)** — committed scanner output
 /// over the EMBEDDED sources (include_str! — the nix-gate-safe form;
 /// bare runtime walks fail under the sandbox, the bughunt-6
@@ -6072,9 +6072,27 @@ fn stale_solve_revalidation_call_site_censuses() {
              plane re-serves snapshot intents, it never mints them"
         );
     }
+
+    // (5) W9-AA (merged_bug_037): the wire-empty emitter census — the
+    // scoped totality claim ("within the scheduler the alphabet is
+    // total; `Unhostable` serializes typed-empty BY DESIGN") is bound
+    // to a machine count of the fold's empty-cells returns: exactly
+    // THREE letters emit wire-empty (`HwAgnostic` — the designed
+    // quiet edge; `PinGated` — the pin never silently rewritten;
+    // `Unhostable` — the no_hosting_class feeder). A fourth empty
+    // return is a new silent-wire population that must either join a
+    // typed letter or update the scoped claim (doc + spec clause +
+    // this census together).
+    assert_eq!(
+        count(snapshot_src, "(cores, mem, Vec::new())"),
+        3,
+        "fold_cell_emission wire-empty returns: HwAgnostic, PinGated, \
+         Unhostable — the scoped-totality claim's census \
+         (merged_bug_037)"
+    );
 }
 
-// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation+2]
 /// **W9-P (merged_bug_002)** — *a memoized solve + post-memo floor
 /// bump into the (class-ceiling, global] band yields a CLASSIFIED
 /// emission, never silent `hw_class_names=[]`* — driven through the
@@ -6155,7 +6173,7 @@ async fn memo_arm_floor_bump_is_classified_not_silent_empty() {
     );
 }
 
-// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation+2]
 /// **W9-Q (merged_bug_057)** — *time-only BestEffort (SerialFloor)
 /// featureless demand fitting every class does NOT mint StaleSolve
 /// and KEEPS the designed agnostic lane* (the false-pin inverse).
@@ -6223,7 +6241,7 @@ async fn time_only_best_effort_keeps_the_agnostic_lane() {
     );
 }
 
-// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation+2]
 /// **W9-S (merged_bug_004)** — *an od-pinned intent over a
 /// `[spot, on-demand]` rung config NEVER lands on a spot rung* —
 /// end-to-end through the memo pin filter, `retain_hosting_cells`'
@@ -6292,7 +6310,7 @@ async fn od_pinned_intent_never_lands_on_a_spot_rung() {
     );
 }
 
-// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation+2]
 /// **W9-T (merged_bug_067)** — *pinned demand with a pin-honoring
 /// sibling routes to it; pinned demand with NO pin-honoring class
 /// mints `PinGated`* (the inversion's inverse + the letter's premise).
@@ -6410,7 +6428,7 @@ async fn pinned_demand_prefers_the_pin_honoring_sibling() {
     );
 }
 
-// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation+2]
 /// **W9-V (merged_bug_043(1))** — *a genuinely-unhostable drv under
 /// continuous detail-jitter churn POISONS at the budget* (the
 /// eternal-Ready inverse; the jitter population driven).
@@ -6479,7 +6497,7 @@ async fn jitter_churn_does_not_defeat_the_verdict_budget() {
     );
 }
 
-// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation+2]
 /// **W9-Y (bug_119)** — *heal-then-relapse for the same
 /// `(tenant, pname)` discloses BOTH episodes* (warn + increment) —
 /// the per-episode quantifier driven across the latch boundary.
@@ -6562,7 +6580,7 @@ async fn heal_then_relapse_discloses_both_episodes() {
     );
 }
 
-// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation+2]
 /// **W9-W (merged_bug_043(2))** — *a Pending re-ack (Job-EXISTS echo)
 /// does NOT reset the counter; the fresh spawn edge does* (both
 /// edges).
@@ -6661,7 +6679,7 @@ async fn pending_reack_echo_does_not_reset_the_verdict_budget() {
     );
 }
 
-// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation+2]
 /// **W9-X (merged_bug_043(3))** — *verdicts-cease-while-Ready decays
 /// the track structurally: a later identical verdict cannot claim
 /// false consecutiveness* (the frozen-29+1 shape pinned).

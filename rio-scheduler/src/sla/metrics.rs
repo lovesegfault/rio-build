@@ -92,9 +92,16 @@ pub fn describe_all() {
     );
     describe_counter!(
         "rio_scheduler_sla_hw_ladder_exhausted_total",
-        "ICE-mask hardware ladder exhausted at the terminal tier with \
-         no admissible (hw_class, cap) cell left. Labeled `tenant`, \
-         `exit` (the cell the ladder gave up on). Replaces \
+        "emission gave up routing a demand within the configured \
+         hw-class universe. Labeled `tenant` and `exit`: `all_masked` \
+         (ICE-mask ladder exhausted at the terminal tier, no \
+         admissible (hw_class, cap) cell left), `stale_resolved` \
+         (demand authorized under a stale/over-global ceiling was \
+         re-solved and clamped into the largest live hosting class, \
+         disclosed), `unhostable` (no class hosts the demand even \
+         re-solved - feature/arch gap, clamped floor above the best \
+         ceiling, or operator-forced oversize; emitted typed-empty by \
+         design, answered by the controller verdict loop). Replaces \
          `_ice_backoff_total`."
     );
     describe_counter!(
@@ -875,5 +882,41 @@ mod tests {
             !top2.iter().any(|(k, _, _)| k.pname == "a"),
             "ring cap evicted a: got {top2:?}"
         );
+    }
+
+    /// **W9-Z (merged_bug_109)** — the HELP-alphabet pin: every value
+    /// in the `exit` label census appears in the metric's
+    /// `describe_counter!` HELP text. 8635839bf added the
+    /// `stale_resolved`/`unhostable` exits and updated the census but
+    /// not the HELP — the stale "ICE-ladder exhaustion" narration
+    /// (wrong for 2 of 3 live values) mirrored verbatim into
+    /// docs/gen/metrics.json and the helm metric-help.json, and the
+    /// metric_reason_help_sync lint hardcodes the `reason` label key
+    /// so `exit` drift was invisible to CI (the R22 generator fix is
+    /// S6's; this is the crate-side content pin). Census-driven: the
+    /// values come FROM `SLA_LABELED_METRICS` (R15), never re-typed.
+    #[test]
+    fn ladder_exhausted_help_names_every_exit_value() {
+        let src = include_str!("metrics.rs");
+        let describe = src
+            .split("describe_counter!")
+            .find(|seg| seg.contains("\"rio_scheduler_sla_hw_ladder_exhausted_total\""))
+            .expect("the describe block exists");
+        let describe = &describe[..describe.find(");").expect("block closes")];
+        let (_, label, values) = SLA_LABELED_METRICS
+            .iter()
+            .find(|(n, _, _)| *n == "rio_scheduler_sla_hw_ladder_exhausted_total")
+            .expect("census row exists");
+        assert_eq!(*label, "exit");
+        for v in *values {
+            assert!(
+                describe.contains(v),
+                "HELP for rio_scheduler_sla_hw_ladder_exhausted_total \
+                 does not name exit value `{v}` — an operator triaging \
+                 the counter reads the HELP, and an unnamed value is an \
+                 undocumented failure mode (merged_bug_109; regen the \
+                 (ttttt) pair after fixing)"
+            );
+        }
     }
 }

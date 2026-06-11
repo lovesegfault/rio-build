@@ -113,7 +113,7 @@ pub fn bump_floor_or_count(
     }
 }
 
-// r[impl scheduler.sla.ceiling.stale-solve-revalidation]
+// r[impl scheduler.sla.ceiling.stale-solve-revalidation+2]
 /// live_051(d): the read-time projection of a resource floor under the
 /// LIVE ceiling vector — the floor-axis half of the stale-solve
 /// revalidation law. A persisted M_044 floor is evidence minted UNDER
@@ -162,7 +162,7 @@ impl ClampedFloor {
     }
 }
 
-// r[impl scheduler.sla.ceiling.stale-solve-revalidation]
+// r[impl scheduler.sla.ceiling.stale-solve-revalidation+2]
 /// The hydrate-seam half of the floor clamp law: clamp a floor IN
 /// PLACE to the live ceilings (mem/disk) and the deadline cap. Applied
 /// where DB floors meet in-memory state (the I-208 hydrate seam,
@@ -330,7 +330,7 @@ mod tests {
         assert_eq!(s.sched.resource_floor.mem_bytes, 0);
     }
 
-    // r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+    // r[verify scheduler.sla.ceiling.stale-solve-revalidation+2]
     /// live_051(d) floor-axis product census — cells from the alphabet
     /// (dim × {fresh-below, at-live-cap, above-live-cap (the stale
     /// row), zero}) driven through BOTH halves of the clamp law (the

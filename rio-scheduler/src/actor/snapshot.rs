@@ -970,7 +970,7 @@ impl DagActor {
         Ok(plan.commit(self))
     }
 
-    // r[impl scheduler.sla.ceiling.stale-solve-revalidation]
+    // r[impl scheduler.sla.ceiling.stale-solve-revalidation+2]
     /// live_051(c): poison every drv whose consecutive no-hosting-class
     /// verdict budget crossed in [`AckApplyPlan::commit`]. Runs AFTER
     /// the atomic apply (commit is infallible, so a poison here can
@@ -1010,7 +1010,7 @@ impl DagActor {
     }
 }
 
-// r[impl scheduler.sla.ceiling.stale-solve-revalidation]
+// r[impl scheduler.sla.ceiling.stale-solve-revalidation+2]
 /// live_051(c): the verdict budget — consecutive `NO_HOSTING_CLASS`
 /// verdicts (one per controller cover pass) a Ready drv may accumulate
 /// before it poisons with the verdict's detail. The TIME envelope is
@@ -1096,7 +1096,7 @@ pub(super) fn step_no_host_counter(
     }
 }
 
-// r[impl scheduler.sla.ceiling.stale-solve-revalidation]
+// r[impl scheduler.sla.ceiling.stale-solve-revalidation+2]
 /// live_050(e)/live_051(b): the TOTAL typed outcome of the
 /// cell-emission chokepoint — BOTH solve arms since merged_bug_002:
 /// the no-memo classify and the memo arm's post-overlay
@@ -1108,11 +1108,18 @@ pub(super) fn step_no_host_counter(
 /// no longer exists" (the live_050(e) starvation channel), "demand
 /// infeasible at every class" (live_051(b)), and "operator pin
 /// refused" — and the controller dropped the non-agnostic ones as a
-/// metric-only tally forever. A scheduler-side `StaleSolve`/
-/// `Unhostable` never reaches the controller as an empty-
-/// `hw_class_names` intent, so the controller's `no_hosting_class`
-/// arm shrinks to genuine config gaps (answered by the live_051(c)
-/// verdict loop — composition with WO-S7-3's `PlacementOutcome`).
+/// metric-only tally forever. The totality claim is SCOPED to the
+/// typed segment (merged_bug_037): within the scheduler the alphabet
+/// is total — `StaleSolve` re-routes (clamped cells, disclosed),
+/// while `Unhostable` serializes as typed-empty `hw_class_names` BY
+/// DESIGN (the forced-demand law mandates the empty emission so the
+/// controller's `fallback_cell` reaches its own `None`), making it
+/// the designed feeder of the controller's `no_hosting_class` arm —
+/// distinguished controller-side by the `IntentVerdict` plane
+/// (answered by the live_051(c) verdict loop — composition with
+/// WO-S7-3's `PlacementOutcome`). The wire DELIBERATELY erases the
+/// variant: the verdict plane already carries the controller-side
+/// answer, so a second wire axis would duplicate it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum CellEmission {
     /// hw-routed cells — the unchanged §13d arms (reference-class
@@ -1725,7 +1732,7 @@ impl AckApplyPlan {
         if !observed.is_empty() {
             actor.cost_table.write().observe_instance_types(observed);
         }
-        // r[impl scheduler.sla.ceiling.stale-solve-revalidation]
+        // r[impl scheduler.sla.ceiling.stale-solve-revalidation+2]
         // live_051(c): fold the verdict plane into the consecutive
         // counters. The budget keys on EMISSION PASS, not ack count —
         // realized as a composition: the producer mints at most one
@@ -2337,7 +2344,7 @@ impl DagActor {
                 // (`handle_ack_spawned_intents`); each `cells[i]` round-
                 // trips via `(hw_class_names[i], node_affinity[i].cap-type)`.
                 //
-                // r[impl scheduler.sla.ceiling.stale-solve-revalidation]
+                // r[impl scheduler.sla.ceiling.stale-solve-revalidation+2]
                 // merged_bug_002 (R21): the law quantifies over
                 // EMISSIONS, not over no-memo emissions — memo hits
                 // re-classify after the overlays. The shared chokepoint
@@ -2483,7 +2490,7 @@ impl DagActor {
                         .mem_bytes,
                     )
                     .min(self.sla_ceilings.max_mem);
-                // r[impl scheduler.sla.ceiling.stale-solve-revalidation]
+                // r[impl scheduler.sla.ceiling.stale-solve-revalidation+2]
                 // live_050(e)/live_051(b): the emission chokepoint
                 // mints a TOTAL typed outcome and folds it with zero
                 // wildcard arms — the pre-fix shape emitted `[]` for
@@ -2900,7 +2907,7 @@ impl DagActor {
         }
     }
 
-    // r[impl scheduler.sla.ceiling.stale-solve-revalidation]
+    // r[impl scheduler.sla.ceiling.stale-solve-revalidation+2]
     /// live_050(e)/live_051(b): classify one no-memo cell emission into
     /// the TOTAL [`CellEmission`] alphabet (the memo arm enters the
     /// same alphabet through [`Self::resolve_stale_demand`] when its
