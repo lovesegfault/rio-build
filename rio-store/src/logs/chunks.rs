@@ -302,6 +302,10 @@ impl LogChunkStore for S3LogChunkStore {
             .if_none_match("*")
             .content_type("application/zstd")
             .body(body.into())
+            // D5: per-attempt deadline at the seam (s3-op-census row:
+            // log put_object, zstd body <= ~8 MiB worst).
+            .customize()
+            .config_override(crate::backend::log_op_override())
             .send()
             .await
         {
@@ -341,18 +345,31 @@ impl LogChunkStore for S3LogChunkStore {
             .get_object()
             .bucket(&self.bucket)
             .key(key)
+            // D5: per-attempt deadline at the seam (s3-op-census row:
+            // log get_object); the body collect below carries its own
+            // clock — the attempt timeout covers only headers.
+            .customize()
+            .config_override(crate::backend::log_op_override())
             .send()
             .await
         {
-            Ok(output) => Ok(output
-                .body
-                .collect()
-                .await
-                .map_err(|e| {
-                    LogChunkError::Backend(anyhow::anyhow!("S3 body read failed for {key}: {e}"))
-                })?
-                .into_bytes()
-                .to_vec()),
+            Ok(output) => Ok(tokio::time::timeout(
+                crate::backend::LOG_GET_BODY_TIMEOUT,
+                output.body.collect(),
+            )
+            .await
+            .map_err(|_| {
+                LogChunkError::Backend(anyhow::anyhow!(
+                    "S3 body read for {key} exceeded its typed bound ({:?}) — \
+                     peer presumed black-holed",
+                    crate::backend::LOG_GET_BODY_TIMEOUT
+                ))
+            })?
+            .map_err(|e| {
+                LogChunkError::Backend(anyhow::anyhow!("S3 body read failed for {key}: {e}"))
+            })?
+            .into_bytes()
+            .to_vec()),
             Err(err) => {
                 let service_err = err.into_service_error();
                 if service_err.is_no_such_key() {
@@ -381,10 +398,14 @@ impl LogChunkStore for S3LogChunkStore {
                 .increment(1);
             // DeleteObject is idempotent: deleting a non-existent key
             // returns success.
+            // D5: per-attempt deadline at the seam (s3-op-census
+            // row: log delete_object, no body).
             self.client
                 .delete_object()
                 .bucket(&self.bucket)
                 .key(key)
+                .customize()
+                .config_override(crate::backend::log_op_override())
                 .send()
                 .await
                 .map_err(|e| {

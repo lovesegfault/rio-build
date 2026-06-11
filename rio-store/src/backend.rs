@@ -480,6 +480,80 @@ impl S3ChunkBackend {
     }
 }
 
+/// D5 (Q-108 closed at the seam): per-attempt timeout for the
+/// chunk-plane S3 ops — PutObject / GetObject (headers) /
+/// DeleteObject. The shared client deliberately ships NO
+/// `TimeoutConfig` (rio_common::s3); pre-fix, an
+/// established-then-black-holed connection on any of these ops
+/// awaited response headers forever and the never-completing FIRST
+/// attempt defeated the retry layer — only the NAR-hold envelope
+/// (minutes-class, the budget law's backstop) ever cut it. This
+/// override is applied per-operation (`config_override`, the HEAD
+/// lane's worked-example shape) and is TIMEOUT-ONLY: `max_attempts`
+/// stays the operator's `s3_max_attempts` knob (raised for
+/// rustfs/MinIO churn — the envelope must not cancel the recoveries
+/// the knob exists for), backoffs stay the SDK standard caps (1 s
+/// initial, 20 s max — bounded).
+///
+/// Derivation (the op census, committed at
+/// `rio-store/tests/gensets/s3-op-census.txt`): every body in this
+/// class is pre-buffered and ≤ `CHUNK_MAX` (256 KiB) — p99 healthy
+/// round-trip is tens of ms; 5 s is ~20× that with throttle-burst
+/// headroom. Ordering law (R17, pinned by
+/// `chunk_op_envelope_exhausts_inside_the_hold_grace`): the whole
+/// retry ladder at the default knob (10 attempts) worst-cases at
+/// ~3.6 min — strictly inside the smallest NAR-hold grace (15 min),
+/// so the seam exhausts FIRST and the hold envelope stays the
+/// backstop, never the first line.
+pub(crate) const CHUNK_OP_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// D5: bound on the GetObject BODY collect — the attempt timeout
+/// covers only up to response headers (the body is a separate
+/// stream), so a black-holed body read needs its own clock.
+/// Derivation: `CHUNK_MAX` (256 KiB) at an 8 KiB/s pathological floor
+/// = 32 s; 30 s is the same order with the whole-op single-shot shape
+/// (no retry below it — a failed collect surfaces to the caller's
+/// retry machinery).
+pub(crate) const CHUNK_GET_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// D5: per-attempt timeout for the LOG-plane S3 ops (zstd log-chunk
+/// PutObject / GetObject / DeleteObject — `logs/chunks.rs`). Bigger
+/// bodies than the chunk plane: the cut threshold is 8 MiB
+/// uncompressed (~2 MiB at the typical 4:1 zstd ratio, worst case
+/// approaching the threshold), so the bound is 15 s — ≥ the 8 MiB
+/// worst body at 1 MiB/s with headroom. Same timeout-only discipline
+/// as [`CHUNK_OP_ATTEMPT_TIMEOUT`].
+pub(crate) const LOG_OP_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// D5: bound on the log-chunk GetObject BODY collect (see
+/// [`CHUNK_GET_BODY_TIMEOUT`] for why the attempt timeout cannot
+/// cover it): ≤ ~8 MiB compressed worst case at an 8 KiB/s
+/// pathological floor would be 17 min — that is the black-hole shape,
+/// not a lawful read; 60 s covers the worst lawful body at 136 KiB/s.
+pub(crate) const LOG_GET_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The timeout-only per-op override for the chunk-plane ops. Retry
+/// shape (attempts/backoff) deliberately NOT set — see
+/// [`CHUNK_OP_ATTEMPT_TIMEOUT`].
+fn chunk_op_override() -> aws_sdk_s3::config::Builder {
+    aws_sdk_s3::config::Config::builder().timeout_config(
+        aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+            .operation_attempt_timeout(CHUNK_OP_ATTEMPT_TIMEOUT)
+            .build(),
+    )
+}
+
+/// The timeout-only per-op override for the log-plane ops
+/// ([`LOG_OP_ATTEMPT_TIMEOUT`]). Exposed crate-wide for
+/// `logs/chunks.rs` — one derivation site per op class.
+pub(crate) fn log_op_override() -> aws_sdk_s3::config::Builder {
+    aws_sdk_s3::config::Config::builder().timeout_config(
+        aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+            .operation_attempt_timeout(LOG_OP_ATTEMPT_TIMEOUT)
+            .build(),
+    )
+}
+
 #[async_trait::async_trait]
 impl ChunkBackend for S3ChunkBackend {
     async fn put(&self, hash: &[u8; 32], data: Bytes) -> anyhow::Result<()> {
@@ -487,11 +561,15 @@ impl ChunkBackend for S3ChunkBackend {
         debug!(bucket = %self.bucket, key = %key, size = data.len(), "S3ChunkBackend: uploading");
         metrics::counter!("rio_store_s3_requests_total", "operation" => "put_object").increment(1);
 
+        // D5: per-attempt deadline at the seam (s3-op-census row:
+        // put_object, body ≤ CHUNK_MAX, pre-buffered).
         self.client
             .put_object()
             .bucket(&self.bucket)
             .key(&key)
             .body(data.into())
+            .customize()
+            .config_override(chunk_op_override())
             .send()
             .await
             .map_err(|e| classify_s3_error(e, format!("S3 PutObject failed for {key}")))?;
@@ -503,11 +581,15 @@ impl ChunkBackend for S3ChunkBackend {
         let key = self.s3_key(hash);
         metrics::counter!("rio_store_s3_requests_total", "operation" => "get_object").increment(1);
 
+        // D5: per-attempt deadline at the seam (s3-op-census row:
+        // get_object, response body ≤ CHUNK_MAX).
         match self
             .client
             .get_object()
             .bucket(&self.bucket)
             .key(&key)
+            .customize()
+            .config_override(chunk_op_override())
             .send()
             .await
         {
@@ -517,11 +599,19 @@ impl ChunkBackend for S3ChunkBackend {
                 // aws_sdk's ByteStream::collect returns AggregatedBytes;
                 // into_bytes() is zero-copy if it was a single segment,
                 // one concat if it was chunked transfer (rare for small
-                // objects).
-                let data = output
-                    .body
-                    .collect()
+                // objects). The attempt timeout above covers only up to
+                // response HEADERS — the body stream needs its own
+                // clock (CHUNK_GET_BODY_TIMEOUT) or a black-holed body
+                // read pins the caller forever.
+                let collected = tokio::time::timeout(CHUNK_GET_BODY_TIMEOUT, output.body.collect())
                     .await
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "S3 body read for {key} exceeded its typed bound \
+                                 ({CHUNK_GET_BODY_TIMEOUT:?}) — peer presumed black-holed"
+                        )
+                    })?;
+                let data = collected
                     .map_err(|e| anyhow::anyhow!("S3 body read failed for {key}: {e}"))?
                     .into_bytes();
                 Ok(Some(data))
@@ -671,10 +761,14 @@ impl ChunkBackend for S3ChunkBackend {
         // DeleteObject is idempotent: deleting a non-existent key
         // returns success (no NotFound error). So no special-case
         // for "already gone" — just send and return.
+        // D5: per-attempt deadline at the seam (s3-op-census row:
+        // delete_object, no body).
         self.client
             .delete_object()
             .bucket(&self.bucket)
             .key(key)
+            .customize()
+            .config_override(chunk_op_override())
             .send()
             .await
             .map_err(|e| classify_s3_error(e, format!("S3 DeleteObject failed for {key}")))?;
@@ -1306,5 +1400,149 @@ mod tests {
             elapsed <= rio_common::liveness::ADMIN_VERIFY_WORST_WAVE,
             "the recovered ladder must fit the wave budget; took {elapsed:?}"
         );
+    }
+
+    /// D5 ordering law (R17): every op-class retry ladder at the
+    /// DEFAULT `s3_max_attempts` knob (10) — per-attempt timeout ×
+    /// attempts + SDK-standard capped backoffs (1 s initial, 20 s
+    /// max) — plus its body clock exhausts STRICTLY inside the
+    /// smallest NAR-hold grace (NAR_HOLD_GRACE_FACTOR × the default
+    /// stall window = 15 min), so the seam is the first line and the
+    /// hold envelope stays the backstop. An operator raising the
+    /// knob re-derives: the relation holds to ~170 attempts; the
+    /// knob doc cites this test.
+    #[test]
+    fn chunk_op_envelope_exhausts_inside_the_hold_grace() {
+        use rio_common::liveness::RetryEnvelope;
+        let sdk_standard = |attempt_timeout| RetryEnvelope {
+            attempts: rio_common::s3::DEFAULT_S3_MAX_ATTEMPTS,
+            attempt_timeout,
+            initial_backoff: std::time::Duration::from_secs(1),
+            max_backoff: std::time::Duration::from_secs(20),
+        };
+        let grace = crate::substitute::DEFAULT_SUBSTITUTE_STALL_WINDOW
+            * crate::substitute::NAR_HOLD_GRACE_FACTOR;
+        let chunk = sdk_standard(CHUNK_OP_ATTEMPT_TIMEOUT).worst_case() + CHUNK_GET_BODY_TIMEOUT;
+        assert!(
+            chunk < grace,
+            "chunk-plane worst ladder ({chunk:?}) must exhaust inside the hold grace ({grace:?})"
+        );
+        let log = sdk_standard(LOG_OP_ATTEMPT_TIMEOUT).worst_case() + LOG_GET_BODY_TIMEOUT;
+        assert!(
+            log < grace,
+            "log-plane worst ladder ({log:?}) must exhaust inside the hold grace ({grace:?})"
+        );
+    }
+
+    /// W9-BH (R16 statement, the PUT face): a black-holed chunk
+    /// PutObject — established connection, response never arrives —
+    /// fails TYPED within its op-class envelope's worst case
+    /// (attempt-count axis = the production knob, time axis = the
+    /// per-attempt const; R17 all-axes), instead of awaiting headers
+    /// forever. Production client shape (standard retry at the
+    /// default knob) over the BlackHole connector; paused clock.
+    /// RED pre-fix (verbatim in the landing commit): the put future
+    /// was still pending at 2x the ladder worst case — no per-op
+    /// timeout existed at the seam.
+    #[tokio::test(start_paused = true)]
+    async fn black_holed_chunk_put_fails_typed_within_its_op_envelope() {
+        let backend = make_s3_backend(black_holed_knob_client());
+        let worst = rio_common::liveness::RetryEnvelope {
+            attempts: rio_common::s3::DEFAULT_S3_MAX_ATTEMPTS,
+            attempt_timeout: CHUNK_OP_ATTEMPT_TIMEOUT,
+            initial_backoff: std::time::Duration::from_secs(1),
+            max_backoff: std::time::Duration::from_secs(20),
+        }
+        .worst_case();
+        let started = tokio::time::Instant::now();
+        match tokio::time::timeout(worst * 2, backend.put(&HASH_A, Bytes::from_static(b"x"))).await
+        {
+            Err(_elapsed) => panic!(
+                "chunk put hung past 2x its op-envelope worst case against a \
+                 black-holed connection — the per-op timeout is not wired"
+            ),
+            Ok(Ok(())) => panic!("a black-holed put cannot succeed"),
+            Ok(Err(_e)) => {
+                let elapsed = started.elapsed();
+                assert!(
+                    elapsed <= worst,
+                    "a black-holed put must fail within the ladder worst case \
+                     ({worst:?}); took {elapsed:?}"
+                );
+            }
+        }
+    }
+
+    /// W9-BH (the GET face): same statement for GetObject — the
+    /// header wait deadlines per attempt; the ladder exhausts typed.
+    #[tokio::test(start_paused = true)]
+    async fn black_holed_chunk_get_fails_typed_within_its_op_envelope() {
+        let backend = make_s3_backend(black_holed_knob_client());
+        let worst = rio_common::liveness::RetryEnvelope {
+            attempts: rio_common::s3::DEFAULT_S3_MAX_ATTEMPTS,
+            attempt_timeout: CHUNK_OP_ATTEMPT_TIMEOUT,
+            initial_backoff: std::time::Duration::from_secs(1),
+            max_backoff: std::time::Duration::from_secs(20),
+        }
+        .worst_case();
+        let started = tokio::time::Instant::now();
+        match tokio::time::timeout(worst * 2, backend.get(&HASH_A)).await {
+            Err(_elapsed) => panic!(
+                "chunk get hung past 2x its op-envelope worst case against a \
+                 black-holed connection — the per-op timeout is not wired"
+            ),
+            Ok(Ok(_)) => panic!("a black-holed get cannot succeed"),
+            Ok(Err(_e)) => {
+                let elapsed = started.elapsed();
+                assert!(
+                    elapsed <= worst,
+                    "a black-holed get must fail within the ladder worst case \
+                     ({worst:?}); took {elapsed:?}"
+                );
+            }
+        }
+    }
+
+    /// Production-shaped client (standard retry at the DEFAULT
+    /// `s3_max_attempts` knob — exactly `rio_common::s3::
+    /// default_client`'s retry posture) over a connector whose
+    /// futures never resolve: the established-then-black-holed peer.
+    fn black_holed_knob_client() -> Client {
+        use aws_smithy_runtime_api::client::http::{
+            HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings,
+            SharedHttpConnector,
+        };
+        use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
+        use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
+
+        #[derive(Debug, Clone)]
+        struct BlackHole;
+        impl HttpConnector for BlackHole {
+            fn call(&self, _request: HttpRequest) -> HttpConnectorFuture {
+                HttpConnectorFuture::new(std::future::pending())
+            }
+        }
+        impl HttpClient for BlackHole {
+            fn http_connector(
+                &self,
+                _settings: &HttpConnectorSettings,
+                _components: &RuntimeComponents,
+            ) -> SharedHttpConnector {
+                SharedHttpConnector::new(self.clone())
+            }
+        }
+
+        let cfg = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::for_tests())
+            .retry_config(
+                aws_sdk_s3::config::retry::RetryConfig::standard()
+                    .with_max_attempts(rio_common::s3::DEFAULT_S3_MAX_ATTEMPTS),
+            )
+            .http_client(BlackHole)
+            .sleep_impl(TestTokioSleep)
+            .build();
+        Client::from_conf(cfg)
     }
 }

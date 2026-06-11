@@ -46,24 +46,29 @@ pub const DEFAULT_S3_MAX_ATTEMPTS: u32 = 10;
 ///    (chunks are tiny, pre-buffered; logs are pre-compressed), so
 ///    the protection is pure downside.
 ///
-/// 3. NO `TimeoutConfig` — per-operation deadlines are the CALLER's
-///    explicit duty (bug_108). The SDK default is connect-timeout
-///    only: an established-then-black-holed connection awaits
-///    response headers forever, and the never-completing FIRST
-///    attempt defeats the retry layer above. Every caller with a
-///    liveness law therefore brings its OWN typed bound — the
-///    `rio_common::liveness::WaveBudget` combinator is the standing
-///    vehicle, and the VerifyChunks HEAD lane is the worked example
-///    of the FULL shape (merged_bug_006): a typed
-///    `rio_common::liveness::RetryEnvelope`
-///    (`ADMIN_VERIFY_HEAD_ENVELOPE`) applied per-operation BELOW the
-///    budget, const-asserted to exhaust inside it, with the budget as
-///    backstop — a bare whole-op budget over this client's unbounded
-///    retry ladder would otherwise cancel lawful churn recoveries. A
-///    client-wide `operation_attempt_timeout` needs an op-size census
-///    across every caller (chunk puts, log batches, GetObject) under
-///    load before it can be sized — recorded as open question Q-108,
-///    deliberately NOT set here.
+/// 3. NO client-wide `TimeoutConfig` — per-operation deadlines live
+///    at each op-class SEAM via `config_override` (D5 closed the
+///    historical Q-108 item; the bug-number in older comments refers
+///    to that item, not bughunt-9's bug_108). The SDK default is
+///    connect-timeout only: an established-then-black-holed
+///    connection awaits response headers forever, and the
+///    never-completing FIRST attempt defeats the retry layer above.
+///    The op-size census that sizing required is COMMITTED at
+///    `rio-store/tests/gensets/s3-op-census.txt`; every op class owns
+///    a timeout-only override beside its call sites — chunk plane
+///    (`CHUNK_OP_ATTEMPT_TIMEOUT`, bodies ≤ 256 KiB), log plane
+///    (`LOG_OP_ATTEMPT_TIMEOUT`, zstd bodies ≤ ~8 MiB), VerifyChunks
+///    HEAD (`ADMIN_VERIFY_HEAD_ENVELOPE`, the original worked
+///    example, which additionally pins its retry shape because the
+///    `WaveBudget` above it demands a const-asserted worst case).
+///    Timeout-only overrides keep `max_attempts` on the operator's
+///    knob (the churn recoveries it was raised for) and the SDK's
+///    capped standard backoffs. Streaming GET bodies carry their own
+///    collect clocks (`*_GET_BODY_TIMEOUT`) — an attempt timeout
+///    covers only up to response headers. A client-wide value
+///    remains deliberately unset: the classes' lawful worst cases
+///    span 5 s to 60 s, and one number would either cancel lawful
+///    log reads or under-defend the chunk plane.
 pub async fn default_client(max_attempts: u32) -> aws_sdk_s3::Client {
     let cfg = aws_config::from_env()
         .retry_config(RetryConfig::standard().with_max_attempts(max_attempts))

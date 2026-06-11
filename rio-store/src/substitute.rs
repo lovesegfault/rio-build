@@ -2066,15 +2066,20 @@ impl Substituter {
 
             // r[impl store.put.nar-hold-envelope+2]
             // — Post-read tail, ENFORCED under the hold envelope —
-            // The reservation provably spans hash → sigs → persist,
-            // and rio-common's S3 client ships NO TimeoutConfig by
-            // design (per-operation deadlines are the CALLER's duty;
-            // Q-108): an established-then-black-holed persist
-            // connection awaits response headers forever. So the
-            // whole tail runs under `timeout(envelope.remaining())` —
-            // expiry returns the typed `HoldDeadlineExceeded`,
-            // releasing the reservation by drop (the drop-guard above
-            // owns placeholder cleanup on the implicit-drop path;
+            // The reservation provably spans hash → sigs → persist.
+            // LAYERING (D5 superseded the Q-108 caller-duty
+            // doctrine): black-holed S3 ops now fail typed at the
+            // SEAM first (per-op-class attempt timeouts in
+            // backend.rs; the chunk-plane ladder worst-cases ~3 min,
+            // const-pinned inside this envelope's 15-min grace), and
+            // this `timeout(envelope.remaining())` remains the
+            // HOLD-law backstop — the budget axis's own clock, which
+            // Σ-of-bounded-ops can never replace (slow-but-alive ops
+            // can sum past the hold deadline; holders expire by THIS
+            // clock so parked waiters get capacity). Expiry returns
+            // the typed `HoldDeadlineExceeded`, releasing the
+            // reservation by drop (the drop-guard above owns
+            // placeholder cleanup on the implicit-drop path;
             // `put_chunked`'s internal rollback contract is
             // unchanged). The one remaining NAMED premise is the hash
             // compute bound (~10 s / 4 GiB): the `spawn_blocking`

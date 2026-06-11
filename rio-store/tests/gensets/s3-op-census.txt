@@ -1,0 +1,30 @@
+# [GEN-SET] S3 op-size census (D5, the Q-108 closure table).
+# Generator command (run from the repo root; re-run on any S3 call-site change):
+#   rg -n "\.(put_object|get_object|head_object|delete_object|list_objects)\(\)" \
+#      --type rust rio-store/src rio-scheduler/src rio-common/src rio-builder/src
+#
+# Op-class table (the sizing derivation each override cites):
+#   class        body bound            attempt timeout              body clock              retry shape
+#   chunk put    <= CHUNK_MAX (256KiB) CHUNK_OP_ATTEMPT_TIMEOUT 5s  n/a (pre-buffered)      knob attempts + SDK std backoffs
+#   chunk get    <= CHUNK_MAX (256KiB) CHUNK_OP_ATTEMPT_TIMEOUT 5s  CHUNK_GET_BODY_TIMEOUT  30s   same
+#   chunk delete no body               CHUNK_OP_ATTEMPT_TIMEOUT 5s  n/a                     same
+#   log put      zstd <= ~8MiB worst   LOG_OP_ATTEMPT_TIMEOUT 15s   n/a (pre-buffered)      same
+#   log get      zstd <= ~8MiB worst   LOG_OP_ATTEMPT_TIMEOUT 15s   LOG_GET_BODY_TIMEOUT 60s same
+#   log delete   no body               LOG_OP_ATTEMPT_TIMEOUT 15s   n/a                     same
+#   verify HEAD  no body               ADMIN_VERIFY_HEAD_ENVELOPE   n/a                     envelope-pinned (WaveBudget above)
+#
+# Ordering law: chunk_op_envelope_exhausts_inside_the_hold_grace pins
+# every ladder + body clock strictly inside the smallest NAR-hold
+# grace (15 min) at the default knob.
+#
+# Scan output (sites): the only live S3 call sites in the workspace
+# are the store backend + log planes (rio-scheduler's sole match is a
+# comment in sla/cost.rs:1421 citing rio_common::s3::default_client;
+# zero op calls).
+rio-store/src/backend.rs:put_object (chunk put)
+rio-store/src/backend.rs:get_object (chunk get)
+rio-store/src/backend.rs:head_object (verify HEAD, exists_batch)
+rio-store/src/backend.rs:delete_object (chunk delete)
+rio-store/src/logs/chunks.rs:put_object (log put)
+rio-store/src/logs/chunks.rs:get_object (log get)
+rio-store/src/logs/chunks.rs:delete_object (log delete)
