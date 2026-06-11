@@ -87,6 +87,22 @@ Families:
              on dispatch-time FindMissingPaths/QueryPathInfo so the
              store honours x-rio-probe-tenant-id
              (r[sched.dispatch.fod-substitute]); store verifies.
+  narSign    .Values.externalSecrets.enabled. STORE ONLY. Secret
+             rio-signing-key (ESO-synced from AWS SM rio/signing-key,
+             minted by the bootstrap Job; Nix secret-key format
+             name:base64-seed) → /etc/rio/signing-key/key, env
+             RIO_SIGNING_KEY_PATH, defaultMode 0440 (288). Without
+             the mount, cfg.signing_key_path stays None → Signer
+             disabled → every upload stored UNSIGNED and the evidence
+             kernel's signature fallback ((owned=false,
+             any_built=false, sig_trusted=true) → Visible) is
+             structurally unreachable — the round-9 dossier A2
+             cold-solve link. externalSecrets-gated (not a jwt
+             concern): the secret exists wherever ESO syncs it, and
+             signing wants to be on for every such deployment.
+             Signing covers FUTURE uploads only — no backfill of
+             already-stored unsigned paths (the R9-S1 registration
+             work owns that half).
   cov        .Values.coverage.enabled. hostPath /var/lib/rio/cov for
              LLVM profraw atexit flush. POD_NAME in the filename: pods
              share the hostPath and all run PID 1, so %p alone does NOT
@@ -132,6 +148,12 @@ Families:
         "src"  (dict "secret" (dict "secretName" "rio-service-hmac"))
         "env"  (list
           (dict "name" "RIO_SERVICE_HMAC_KEY_PATH" "value" "/etc/rio/hmac/service-hmac.key")))
+      "narSign" (dict
+        "on"   $root.Values.externalSecrets.enabled
+        "vol"  "signing-key" "path" "/etc/rio/signing-key" "ro" true
+        "src"  (dict "secret" (dict "secretName" "rio-signing-key" "defaultMode" 288))
+        "env"  (list
+          (dict "name" "RIO_SIGNING_KEY_PATH" "value" "/etc/rio/signing-key/key")))
 -}}
 {{- range .want }}
 {{- $f := get $fams . }}
