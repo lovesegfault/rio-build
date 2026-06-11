@@ -2637,6 +2637,30 @@ pub const M_113: () = ();
 //   (migrate.rs). Reverting that flag would brick deploys against
 //   the persistent DB with `VersionMissing(69)`.
 
+/// 071 — `file_blobs(store_path_hash)` index for the GC-sweep FK CASCADE.
+///
+/// GC sweep deletes a path's `narinfo` row; the CASCADE chain runs
+/// `manifests` → `file_blobs`, and PG executes the referencing-side
+/// delete as `DELETE FROM file_blobs WHERE store_path_hash = $1`. The
+/// PK is `(digest, store_path_hash)` — leading column `digest` — so
+/// without a dedicated index that delete is O(table) per swept path.
+/// `directory_paths` (the castore sibling junction) got the analogous
+/// `directory_paths_path_idx` at creation in 067; `file_blobs`
+/// (created in 065, pre-dating the GC-scale work) never did.
+///
+/// Measured on a 100×-scale copy of the dev DB (12M `file_blobs`
+/// rows): 130.8 ms/path for the cascade without the index, 0.61 ms
+/// with it (~214×); a 1000-path sweep dropped 170.8 s → 40.7 s.
+///
+/// CONCURRENTLY + `-- no-transaction` (precedent: 011/022): plain
+/// `CREATE INDEX` takes a SHARE lock that blocks every `file_blobs`
+/// writer (PutPath castore indexing) for the duration of a build over
+/// millions of rows while the previous release is still serving. The
+/// runner's try-then-wait advisory lock was built to allow CIC
+/// (I-194). `IF NOT EXISTS` + the documented DROP-then-rerun recovery
+/// for a failed half-built INVALID index follow 022 verbatim.
+pub const M_114: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql
