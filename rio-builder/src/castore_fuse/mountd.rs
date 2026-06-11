@@ -1328,71 +1328,122 @@ fn mount_build(
     .with_context(|| format!("mount fuse at {}", mnt.display()))?;
 
     // ── Staging: 0700, owned by the build's uid, kernel-quota'd.
-    match mkdirat(
-        &shared.staging_base,
+    let staging = setup_staging(
+        shared.staging_base.as_fd(),
         build_id,
-        Mode::from_bits_truncate(0o700),
-    ) {
+        state.peer_uid,
+        state.peer_gid,
+        cfg.staging_quota_bytes,
+        &shared.next_projid,
+    )?;
+
+    state.projid = staging.projid;
+    state.kept = Some(kept);
+    state.staging_dirfd = Some(Arc::new(staging.dirfd));
+    state.staging_chunks_dirfd = Some(Arc::new(staging.chunks_dirfd));
+    info!(
+        build_id,
+        uid = state.peer_uid,
+        quota = staging.applied_quota,
+        "mounted castore FUSE, fd handed off"
+    );
+    Ok((fuse_fd, staging.applied_quota))
+}
+
+/// Handles to the per-build staging tree produced by [`setup_staging`].
+#[derive(Debug)]
+struct StagingDirs {
+    dirfd: OwnedFd,
+    chunks_dirfd: OwnedFd,
+    /// The mountd-assigned project id, when a quota was configured.
+    projid: Option<u32>,
+    /// The quota actually applied (0 when quotas are disabled).
+    applied_quota: u64,
+}
+
+/// Create and prepare `staging/<build_id>`: the 0700 build-owned root,
+/// the kernel-enforced project quota, and the `chunks/` subdirectory.
+///
+/// Ordering is security-critical: when a quota is configured, the
+/// project id + PROJINHERIT tag must land on the staging root before
+/// any child is created beneath it. XFS/ext4 propagate the project id
+/// only to children created *after* the parent is tagged — there is no
+/// retroactive retag — so a pre-tag `chunks/` would hang the whole
+/// chunk tree outside the quota project and every byte written under
+/// it would escape the staging bound the quota exists to enforce.
+///
+/// The projid is mountd-assigned and monotonic — never derived from
+/// the adversary-chosen `build_id`, so a build cannot collide into a
+/// victim's quota bucket.
+// r[impl builder.mountd.staging-quota]
+fn setup_staging(
+    staging_base: BorrowedFd<'_>,
+    build_id: &str,
+    peer_uid: libc::uid_t,
+    peer_gid: libc::gid_t,
+    quota_bytes: u64,
+    next_projid: &AtomicU32,
+) -> anyhow::Result<StagingDirs> {
+    match mkdirat(staging_base, build_id, Mode::from_bits_truncate(0o700)) {
         Ok(()) | Err(nix::errno::Errno::EEXIST) => {}
         Err(e) => return Err(e).context("mkdir staging"),
     }
-    let staging_dirfd = openat(
-        &shared.staging_base,
+    let dirfd = openat(
+        staging_base,
         build_id,
         OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
         Mode::empty(),
     )
     .context("open staging dir")?;
+
+    // Tag before creating any child (PROJINHERIT is not retroactive —
+    // see doc comment); the `chunks/` mkdir below must stay after this.
+    //
+    // The projid is mountd-assigned and monotonic — never derived from
+    // the adversary-chosen build_id, so a build cannot collide into a
+    // victim's quota bucket.
+    let mut projid = None;
+    let mut applied_quota = 0;
+    if quota_bytes > 0 {
+        let id = crate::quota::MOUNTD_PROJID_BASE
+            + (next_projid.fetch_add(1, Ordering::Relaxed)
+                % (crate::quota::MOUNTD_PROJID_CEILING - crate::quota::MOUNTD_PROJID_BASE));
+        apply_project_quota(&dirfd, id, quota_bytes).context("apply staging project quota")?;
+        projid = Some(id);
+        applied_quota = quota_bytes;
+    }
+
     fchownat(
-        &staging_dirfd,
+        &dirfd,
         ".",
-        Some(Uid::from_raw(state.peer_uid)),
-        Some(Gid::from_raw(state.peer_gid)),
+        Some(Uid::from_raw(peer_uid)),
+        Some(Gid::from_raw(peer_gid)),
         AtFlags::empty(),
     )
     .context("chown staging dir")?;
-    mkdirat(&staging_dirfd, "chunks", Mode::from_bits_truncate(0o700))
-        .context("mkdir staging/chunks")?;
+    mkdirat(&dirfd, "chunks", Mode::from_bits_truncate(0o700)).context("mkdir staging/chunks")?;
     fchownat(
-        &staging_dirfd,
+        &dirfd,
         "chunks",
-        Some(Uid::from_raw(state.peer_uid)),
-        Some(Gid::from_raw(state.peer_gid)),
+        Some(Uid::from_raw(peer_uid)),
+        Some(Gid::from_raw(peer_gid)),
         AtFlags::empty(),
     )
     .context("chown staging/chunks")?;
-    let staging_chunks_dirfd = openat(
-        &staging_dirfd,
+    let chunks_dirfd = openat(
+        &dirfd,
         "chunks",
         OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
         Mode::empty(),
     )
     .context("open staging/chunks")?;
 
-    // ── Kernel-enforced staging quota. The projid is mountd-assigned
-    // and monotonic — never derived from the adversary-chosen build_id,
-    // so a build cannot collide into a victim's quota bucket.
-    let mut applied_quota = 0;
-    if cfg.staging_quota_bytes > 0 {
-        let projid = crate::quota::MOUNTD_PROJID_BASE
-            + (shared.next_projid.fetch_add(1, Ordering::Relaxed)
-                % (crate::quota::MOUNTD_PROJID_CEILING - crate::quota::MOUNTD_PROJID_BASE));
-        apply_project_quota(&staging_dirfd, projid, cfg.staging_quota_bytes)
-            .context("apply staging project quota")?;
-        state.projid = Some(projid);
-        applied_quota = cfg.staging_quota_bytes;
-    }
-
-    state.kept = Some(kept);
-    state.staging_dirfd = Some(Arc::new(staging_dirfd));
-    state.staging_chunks_dirfd = Some(Arc::new(staging_chunks_dirfd));
-    info!(
-        build_id,
-        uid = state.peer_uid,
-        quota = applied_quota,
-        "mounted castore FUSE, fd handed off"
-    );
-    Ok((fuse_fd, applied_quota))
+    Ok(StagingDirs {
+        dirfd,
+        chunks_dirfd,
+        projid,
+        applied_quota,
+    })
 }
 
 /// Best-effort removal of the per-build castore mountpoint and staging
@@ -1627,6 +1678,46 @@ mod tests {
 
         // Must return, not hang.
         reopen_backing_readonly(client.as_fd()).expect("re-open of a FIFO must not block");
+    }
+
+    // r[verify builder.mountd.staging-quota]
+    /// XFS/ext4 PROJINHERIT propagates the project id only to children
+    /// created AFTER the directory is tagged — there is no retroactive
+    /// retag. `setup_staging` must therefore tag the staging root
+    /// before it creates `chunks/`: a pre-tag `chunks/` sits outside
+    /// the quota project and every byte written under it escapes the
+    /// kernel-enforced staging bound.
+    ///
+    /// The tempdir lives on a filesystem without project quotas, so
+    /// the tag attempt itself fails — which pins the order: if any
+    /// child of the staging root exists at that failure point, it was
+    /// created before the tag.
+    #[test]
+    fn staging_quota_tag_precedes_child_dir_creation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dirfd(tmp.path());
+        let next_projid = AtomicU32::new(1);
+        let err = setup_staging(
+            base.as_fd(),
+            "b-quota-order",
+            nix::unistd::geteuid().as_raw(),
+            nix::unistd::getegid().as_raw(),
+            8 << 20,
+            &next_projid,
+        )
+        .expect_err("a fs without prjquota must fail the mount, not run unquota'd");
+        assert!(
+            format!("{err:#}").contains("apply staging project quota"),
+            "unexpected failure: {err:#}"
+        );
+        assert!(
+            !tmp.path().join("b-quota-order").join("chunks").exists(),
+            "chunks/ was created before the project-quota tag — \
+             files under it would escape the staging quota"
+        );
+        // The staging root itself must exist: it is what the (failed)
+        // tag targeted.
+        assert!(tmp.path().join("b-quota-order").is_dir());
     }
 
     // r[verify builder.mountd.build-id-validated]
