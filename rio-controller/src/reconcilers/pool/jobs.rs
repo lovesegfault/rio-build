@@ -699,15 +699,17 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // is unreachable: log + treat as queued=0 + requeue. Next tick
     // retries. We ALSO set a SchedulerUnreachable condition on the
     // Pool so operators can see WHY nothing is spawning.
-    let (mut intents, scheduler_err): (Vec<SpawnIntent>, Option<String>) =
+    let (mut intents, fetch_complete, scheduler_err): (Vec<SpawnIntent>, bool, Option<String>) =
         match queued_for_pool(ctx, pool).await {
-            Ok(intents) => (intents, None),
+            Ok(view) => (view.held, view.complete, None),
             Err(e) => {
                 warn!(
                     pool = %name, error = %e,
                     "spawn-intents poll failed; treating as queued=0, will retry"
                 );
-                (Vec::new(), Some(e.to_string()))
+                // `complete=true` is vacuous here: `scheduler_err` already
+                // fail-closes every count consumer on its own conjunct.
+                (Vec::new(), true, Some(e.to_string()))
             }
         };
     // r[impl ctrl.nodeclaim.placeable-gate+5]
@@ -1100,9 +1102,10 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // ---- Reap excess Pending ----
     // r[impl ctrl.pool.degraded-polarity]
     // I-183: spawn-only is half a control loop. `None` when scheduler
-    // unreachable OR placeable-gate unarmed: reap is fail-CLOSED (spawn
-    // is fail-open).
-    let queued_known = (scheduler_err.is_none() && gate_armed).then_some(queued);
+    // unreachable OR placeable-gate unarmed OR the demand view is
+    // incomplete: reap is fail-CLOSED (spawn is fail-open).
+    let queued_known =
+        reap_queued_known(scheduler_err.is_none(), gate_armed, fetch_complete, queued);
     reap_excess_pending(
         &jobs_api,
         &pods_api,
@@ -1161,7 +1164,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
 async fn queued_for_pool(
     ctx: &Ctx,
     pool: &Pool,
-) -> std::result::Result<Vec<SpawnIntent>, tonic::Status> {
+) -> std::result::Result<PoolDemandView, tonic::Status> {
     // I-176: `filter_features=true` even when `features` is empty: a
     // featureless pool then sees only featureless work.
     // `effective_features` (Fetcher → [fetcher]) is the same chokepoint
@@ -1183,7 +1186,49 @@ async fn queued_for_pool(
     ))
     .await?
     .into_inner();
-    Ok(resp.intents)
+    // Today the fetch is unwindowed, so the page IS the demand truth.
+    // When the GetSpawnIntents pagination fields land scheduler-side
+    // (window + truncation flag), `complete` derives from the response
+    // (`!truncated`) and the request carries the per-pool fetch budget
+    // — the consumer law below is already total either way.
+    Ok(PoolDemandView {
+        held: resp.intents,
+        complete: true,
+    })
+}
+
+/// The per-reconcile demand view from [`queued_for_pool`]. `held` is
+/// the intent page this reconcile holds; `complete` says whether `held`
+/// is the WHOLE demand for this pool's filter (the B3/B9 consumer law):
+///
+/// - Counts that infer ABSENCE (`reap_excess_pending`'s `queued_known`)
+///   may only consume a COMPLETE view — an incomplete page understates
+///   demand, and a pending Job whose intent fell outside the page would
+///   read as excess and be reaped while still wanted. Incomplete ⇒
+///   fail-closed `None` via [`reap_queued_known`], the same lever as
+///   scheduler-unreachable.
+/// - Per-element walks (the AD2 spawn gate, stale-Job reap, the spawn
+///   pass) quantify over `held` only — their conclusions are per-intent
+///   and stay valid under any page (the bug_028 totality property is
+///   per-held-element: every HELD intent is evaluated, absent intents
+///   are simply not judged).
+struct PoolDemandView {
+    held: Vec<SpawnIntent>,
+    complete: bool,
+}
+
+/// The reap-authority law (W9-AW): a `queued` count may drive
+/// excess-Pending reaping only when the scheduler answered, the
+/// placeable gate is armed, AND the demand view is complete. Pure so
+/// the law table is unit-walkable.
+// r[impl ctrl.pool.degraded-polarity]
+pub(crate) fn reap_queued_known(
+    scheduler_ok: bool,
+    gate_armed: bool,
+    complete: bool,
+    queued: u32,
+) -> Option<u32> {
+    (scheduler_ok && gate_armed && complete).then_some(queued)
 }
 
 /// DNS-1123-safe deterministic suffix from `intent_id`. In production

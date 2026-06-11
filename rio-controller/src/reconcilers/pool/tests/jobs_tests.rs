@@ -3891,3 +3891,31 @@ async fn w9_as_keyless_mode_spawns_every_intent_tokenless() {
         "token-less by LAW (the Keyless letter), not by accident"
     );
 }
+
+/// W9-AW (the reap-authority law table, WO-S4-1b): a `queued` count may
+/// drive excess-Pending reaping only when the scheduler answered, the
+/// placeable gate is armed, AND the demand view is COMPLETE. An
+/// incomplete page understates demand — a pending Job whose intent fell
+/// outside the page would read as excess and be reaped while still
+/// wanted (the window-starved-reap shape). The downstream consequence
+/// of `None` is already pinned by
+/// `reap_excess_pending_noop_when_covered_or_unknown`; this table is
+/// the authority conjunction itself, walked over the full cube.
+#[test]
+fn reap_authority_requires_complete_demand_view() {
+    use crate::reconcilers::pool::jobs::reap_queued_known;
+    for sched_ok in [false, true] {
+        for armed in [false, true] {
+            for complete in [false, true] {
+                let got = reap_queued_known(sched_ok, armed, complete, 7);
+                let want = (sched_ok && armed && complete).then_some(7);
+                assert_eq!(
+                    got, want,
+                    "authority cube (sched_ok={sched_ok}, armed={armed}, \
+                     complete={complete}): an incomplete view must \
+                     fail-closed exactly like scheduler-unreachable"
+                );
+            }
+        }
+    }
+}
