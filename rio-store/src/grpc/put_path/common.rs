@@ -1000,7 +1000,26 @@ impl StoreServiceImpl {
         // single-path lane's persist owns its own tx, so post-commit
         // is the closest seam (divergence recorded in the owning
         // commit).
-        stamp_ingest_tenant(&self.pool, &info.store_path_hash, tenant_id).await;
+        //
+        // r[impl store.put.nar-hold-envelope+2]
+        // Merged-seam composition (S1 registration × bug_114 tiling):
+        // the handler frame still HOLDS its budget permits here, so
+        // this PG await rides the same ONE clock as the persist tail
+        // — a blocked-PG black hole must release by the hold
+        // deadline, never pin the budget on a best-effort stamp.
+        // Elapse degrades exactly like a failed stamp (skip + warn;
+        // the registration grace covers the re-stamp).
+        let stamping = stamp_ingest_tenant(&self.pool, &info.store_path_hash, tenant_id);
+        if tokio::time::timeout(envelope.remaining(), stamping)
+            .await
+            .is_err()
+        {
+            warn!(
+                store_path = %info.store_path.as_str(),
+                "PutPath: ingest-stamp skipped (hold envelope elapsed); \
+                 re-stamp covered by the registration grace"
+            );
+        }
         metrics::counter!("rio_store_put_path_total", "result" => "created").increment(1);
         metrics::counter!("rio_store_put_path_bytes_total").increment(info.nar_size);
         Ok(())

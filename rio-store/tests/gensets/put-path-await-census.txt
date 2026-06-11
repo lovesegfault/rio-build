@@ -11,11 +11,15 @@ rio-store/src/grpc/put_path/common.rs	.await
 rio-store/src/grpc/put_path/common.rs	.await
 rio-store/src/grpc/put_path/common.rs	.await
 rio-store/src/grpc/put_path/common.rs	.await
+rio-store/src/grpc/put_path/common.rs	.await
+rio-store/src/grpc/put_path/common.rs	.await
 rio-store/src/grpc/put_path/common.rs	.await?
+rio-store/src/grpc/put_path/common.rs	.await?;
 rio-store/src/grpc/put_path/common.rs	.await?;
 rio-store/src/grpc/put_path/common.rs	.await?;
 rio-store/src/grpc/put_path/common.rs	None => read.await,
 rio-store/src/grpc/put_path/common.rs	Some(h) => h.bounded("PutPath ingest", read).await?,
+rio-store/src/grpc/put_path/common.rs	if let Err(e) = insert_path_tenant_rows(pool, &[store_path_hash.to_vec()], tid).await {
 rio-store/src/grpc/put_path/common.rs	let h = self.reserve_declared(d, "PutPath").await?;
 rio-store/src/grpc/put_path/common.rs	let persisted = match tokio::time::timeout(envelope.remaining(), tail).await {
 rio-store/src/grpc/put_path/common.rs	match tokio::time::timeout(self.envelope.remaining(), fut).await {
@@ -37,6 +41,7 @@ rio-store/src/grpc/put_path/mod.rs	let (raw_info, declared) = common::read_first
 rio-store/src/grpc/put_path/mod.rs	metadata::check_manifest_complete(&self.pool, store_path_hash).await
 rio-store/src/grpc/put_path/mod.rs	self.abort_upload(&store_path_hash, c).await;
 rio-store/src/grpc/put_path/mod.rs	while let Ok(Some(_)) = stream.message().await {
+rio-store/src/grpc/put_path_batch.rs	.await
 rio-store/src/grpc/put_path_batch.rs	.await
 rio-store/src/grpc/put_path_batch.rs	.await
 rio-store/src/grpc/put_path_batch.rs	.await
