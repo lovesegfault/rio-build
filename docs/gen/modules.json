@@ -1480,6 +1480,11 @@
       "doc": "Commit-side assembly for `PutPathChunked` (ADR-022 §6.2)."
     },
     {
+      "path": "grpc/put_path_chunked/file_digest.rs",
+      "depth": 2,
+      "doc": "Deferred whole-file digest verification for `PutPathChunked`"
+    },
+    {
       "path": "grpc/put_path_chunked/validate.rs",
       "depth": 2,
       "doc": "`Begin`-frame validation for `PutPathChunked` (ADR-022 §6.2)."

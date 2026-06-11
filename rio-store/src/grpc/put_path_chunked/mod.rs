@@ -10,9 +10,14 @@
 //!   S3; runs before any placeholder claim or side effect.
 //! - [`verify`] — the §6.3 sequential receive walk: consume each novel
 //!   chunk off the stream in `Begin.novel` order, BLAKE3-verify and
-//!   length-check every received body, and pipeline the backend PUTs.
-//!   The builder's `nar_hash`/refs/file-digest claims are committed as
-//!   claimed; deduped chunks are never fetched.
+//!   length-check every received body, pipeline the backend PUTs, and
+//!   recompute each file's whole-file digest while its bytes are in
+//!   hand. The builder's `nar_hash`/refs claims are committed as
+//!   claimed; file-digest claims are NOT (they key the cross-tenant
+//!   `file_blobs` dedup namespace).
+//! - [`file_digest`] — prove the file runs the walk could not hash
+//!   inline (deduped chunks): committed-window agreement, else a
+//!   backend refetch + recompute.
 //! - [`commit`] — derive the castore index from the validated tree;
 //!   the single-transaction §6.2 commit across all non-skipped outputs
 //!   lives in [`StoreServiceImpl::commit_chunked`].
@@ -45,6 +50,7 @@ use super::{StoreServiceImpl, putpath_metadata_status};
 pub(crate) mod validate;
 
 mod commit;
+mod file_digest;
 mod verify;
 
 use validate::{ValidatedBegin, validate_begin};
@@ -148,9 +154,9 @@ impl StoreServiceImpl {
         // `auth.tenant_id` (unchanged behavior).
         let junction_tenant = auth.registration_tenant();
 
-        // The receive walk PUTs novel chunks to the backend; deduped
-        // chunks are never fetched (their digests were verified when
-        // first uploaded).
+        // The receive walk PUTs novel chunks to the backend; the
+        // deferred file-digest proof reads chunks back only for runs
+        // that mix deduped chunks into an uncommitted digest.
         let Some(backend) = self.chunk_backend.clone() else {
             return Err(Status::failed_precondition(
                 "PutPathChunked requires a chunk backend",
@@ -301,6 +307,7 @@ impl StoreServiceImpl {
         let verdict = match verify::run_verify(
             &mut stream,
             &validated,
+            &skipped,
             &backend,
             self.chunk_upload_max_concurrent,
         )
@@ -310,8 +317,8 @@ impl StoreServiceImpl {
             Err(e) => bail!(e),
         };
 
-        let uploaded = match verdict {
-            Verdict::Match { uploaded } => uploaded,
+        let (uploaded, deferred) = match verdict {
+            Verdict::Match { uploaded, deferred } => (uploaded, deferred),
             Verdict::Incomplete => {
                 metrics::counter!("rio_store_putpath_incomplete_total").increment(1);
                 bail!(Status::failed_precondition(
@@ -323,6 +330,17 @@ impl StoreServiceImpl {
                 bail!(Status::unavailable(format!("PutPathChunked: {msg}")));
             }
         };
+
+        // File runs the walk could not recompute inline (deduped
+        // chunks): prove their digest bindings before anything is
+        // committed into the `file_blobs` namespace. Runs after the
+        // pipeline drain, so every novel chunk is re-fetchable.
+        // r[impl store.integrity.verify-on-put+3]
+        if let Err(e) =
+            file_digest::verify_deferred_runs(&self.pool, &backend, &validated, &deferred).await
+        {
+            bail!(e);
+        }
 
         // ── Phase C: CA path check → CA placeholders → ONE commit tx. ─
         if let Err(e) = self
@@ -664,7 +682,7 @@ impl StoreServiceImpl {
                 store_path_hash: output_claims[i].store_path_hash.clone(),
                 deriver: deriver.clone(),
                 // The builder's fused-walk claims, committed as
-                // claimed (`r[store.integrity.verify-on-put+2]`).
+                // claimed (`r[store.integrity.verify-on-put+3]`).
                 nar_hash: out.nar_hash,
                 nar_size: out.nar_size,
                 references: out.references.clone(),

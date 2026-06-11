@@ -88,31 +88,44 @@ narinfo.
 
 = Content Integrity Verification
 
-#r("store.integrity.verify-on-put+2")[
+#r("store.integrity.verify-on-put+3")[
   *On NAR-byte ingest (`PutPath`, `PutPathBatch`, the substituter):* the store
   independently computes SHA-256 over the uploaded NAR stream and rejects the
   upload on mismatch with the declared `NarHash`.
   *On `PutPathChunked`:* the store BLAKE3-verifies every chunk body received
   on the stream against its claimed digest, and length-checks it against the
-  manifest, before the body is stored or referenced. `nar_hash`, `nar_size`,
-  `references`, and per-file digests are computed by the authenticated
-  builder's fused walk over the same bytes it uploads
-  (#rref("builder.upload.fused-walk")) and are committed as claimed; the
-  store does not regenerate the NAR or fetch already-durable chunks to
+  manifest, before the body is stored or referenced. Every per-file digest
+  MUST be proven to match its file's chunk-run content before the commit
+  binds it into the digest-keyed `file_blobs` namespace — by recomputing the
+  whole-file BLAKE3 from the bodies received on this stream, by exact
+  `(chunk digest, size)` window agreement with an already-committed binding
+  of the same digest, or by re-fetching the run's chunks from the backend
+  and recomputing; a mismatch rejects the upload. `nar_hash`, `nar_size`,
+  and `references` are computed by the authenticated builder's fused walk
+  over the same bytes it uploads (#rref("builder.upload.fused-walk")) and
+  are committed as claimed; the store does not regenerate the NAR to
   recompute them.
 ]
 
-The asymmetry is a trust-boundary line. The builder is a rio service
-authenticated per-build (HMAC assignment token); its fused walk derives every
-digest from the bytes it is uploading in the same pass, so a server-side
-recompute could only catch rio's own bugs, not an outside party. That
-recompute had a structural cost: NAR SHA-256 is not composable from chunk
-digests, so verifying a fully-deduped upload meant re-fetching every
-already-durable chunk from the backend — O(chunks) serial S3 round-trips on
-an upload that streams no bodies at all, long enough on large outputs to
-exceed the client's stream timeout. Substituted content arrives from
-*outside* the service boundary (an upstream binary cache), so the substituter
-keeps independent NAR-hash verification.
+The asymmetry is a trust-boundary line drawn by blast radius. The builder
+runs adversary-supplied build instructions, so every claim in `Begin` is
+attacker-controlled — but `nar_hash`, `nar_size`, and `references` are
+recorded under the store *path* the assignment token authorized, so a lie
+corrupts only outputs the builder was entitled to write (and NAR SHA-256 is
+not composable from chunk digests: recomputing it on a fully-deduped upload
+meant re-fetching every already-durable chunk — O(chunks) serial S3 round
+trips on an upload that streams no bodies at all, long enough on large
+outputs to exceed the client's stream timeout). Per-file digests are
+different: they key the `file_blobs` dedup namespace that
+`ReadBlob`/`StatBlob`/`HasBlobs` resolve by digest alone across every tenant
+that can see any referrer, so a forged `digest → content` binding poisons
+reads far beyond the forger's own paths — that one claim must be proven,
+not trusted. The window-agreement form keeps the fully-deduped re-upload on
+PostgreSQL metadata (zero chunk reads, preserving the stall fix above); the
+refetch form is reserved for runs that mix deduped chunks into a digest the
+store has never committed. Substituted content arrives from *outside* the
+service boundary (an upstream binary cache), so the substituter keeps
+independent NAR-hash verification.
 
 #r("store.integrity.verify-on-get")[
   - *On chunk read (S3 or cache):* Every chunk fetched from S3 or the

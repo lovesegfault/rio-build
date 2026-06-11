@@ -90,10 +90,11 @@ pub(crate) mod upstreams;
 // `pub use chunked::*` etc.) so dead items in submodules
 // surface as `unused` instead of being silently exported.
 pub(crate) use chunked::{
-    commit_chunked_output_in_conn, complete_manifest_chunked, insert_path_tenant_in_conn,
-    insert_path_tenant_skipping_deleted_in_tx, insert_pending_chunks, is_deleted_tenant_fk,
-    lock_chunks_for_commit, lock_staged_chunks_for_commit, mark_chunks_uploaded,
-    mark_chunks_uploaded_in_conn, upgrade_manifest_to_chunked,
+    chunk_lists_for_paths, commit_chunked_output_in_conn, complete_manifest_chunked,
+    insert_path_tenant_in_conn, insert_path_tenant_skipping_deleted_in_tx, insert_pending_chunks,
+    is_deleted_tenant_fk, lock_chunks_for_commit, lock_staged_chunks_for_commit,
+    mark_chunks_uploaded, mark_chunks_uploaded_in_conn, trusted_file_windows,
+    upgrade_manifest_to_chunked,
 };
 pub(crate) use cluster_key_history::load_cluster_key_history;
 pub(crate) use inline::{

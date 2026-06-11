@@ -5,21 +5,28 @@
 //! Every received body is BLAKE3-verified against its claimed digest
 //! and length-checked against the manifest before anything trusts it
 //! ([`recv_novel_chunk`]); backend PUTs are pipelined through
-//! [`UploadPipeline`]. The builder's `nar_hash`/`nar_size`/references/
-//! file-digest claims are committed as claimed — the builder's fused
-//! walk computed them from the same bytes it uploaded, and the store
-//! does not regenerate the NAR or fetch deduped chunks to re-derive
-//! them (`r[store.integrity.verify-on-put+2]`). Deduped chunks are never
-//! touched here at all: their digests were verified when they were
-//! first uploaded, and the commit transaction's presence proof
-//! (`lock_chunks_for_commit`) is what binds them to this manifest.
+//! [`UploadPipeline`]. The builder's `nar_hash`/`nar_size`/references
+//! claims are committed as claimed — the builder's fused walk computed
+//! them from the same bytes it uploaded, and the store does not
+//! regenerate the NAR to re-derive them
+//! (`r[store.integrity.verify-on-put+3]`). Whole-file digests are NOT
+//! committed as claimed: they key the digest-addressed `file_blobs`
+//! dedup namespace `ReadBlob`/`StatBlob`/`HasBlobs` resolve across
+//! tenants, so every file run is recomputed here while its bytes are
+//! in hand; runs whose bytes are not all on this stream are handed to
+//! [`super::file_digest`] for the metadata/refetch proof. Deduped
+//! chunks are never fetched by THIS walk: their digests were verified
+//! when they were first uploaded, and the commit transaction's
+//! presence proof (`lock_chunks_for_commit`) is what binds them to
+//! this manifest.
 //!
 //! There is **no whole-NAR buffer** and no `nar_bytes_budget` charge:
 //! the working set is one chunk frame in hand (bounded by the gRPC
 //! message cap) plus at most `chunk_upload_max_concurrent` chunk
 //! bodies whose backend PUTs are still in flight. That is the point of
 //! this RPC — the standing 40 GiB-RSS hazard of the buffered `PutPath`
-//! path does not exist here.
+//! path does not exist here. The per-run file hasher adds O(1) state
+//! per output (one incremental BLAKE3 over bodies already in memory).
 //!
 //! Because `validate_begin` proved `Begin.novel` is ordered by global
 //! first occurrence, the next `Chunk` frame the builder must send is
@@ -37,6 +44,7 @@ use rio_proto::types::{ChunkData, PutPathChunkedRequest, put_path_chunked_reques
 use crate::backend::ChunkBackend;
 use crate::cas;
 
+use super::file_digest::{DeferredRun, file_digest_mismatch};
 use super::validate::ValidatedBegin;
 
 /// Outcome of the §6.3 walk. `Err(Status)` from [`run_verify`] is
@@ -52,6 +60,11 @@ pub(super) enum Verdict {
         /// backend (the commit transaction stamps `uploaded_at` for
         /// exactly these).
         uploaded: HashSet<[u8; 32]>,
+        /// File runs whose whole-file digest could NOT be recomputed
+        /// inline (some chunk's bytes were not received on this
+        /// stream). The handler MUST prove these via
+        /// [`super::file_digest::verify_deferred_runs`] before commit.
+        deferred: Vec<DeferredRun>,
     },
     /// The stream ended before every `novel` digest arrived.
     Incomplete,
@@ -145,10 +158,22 @@ impl UploadPipeline {
 /// backend PUT. Outputs whose digests are all deduped contribute no
 /// stream traffic and no backend reads — the walk only ever touches
 /// bodies the builder sent.
+///
+/// The walk iterates each output's `file_runs` (validate_begin proved
+/// they partition `chunk_manifest` in order, so the receive sequence
+/// is unchanged) and recomputes the whole-file BLAKE3 for every run of
+/// a non-skipped output whose bytes all arrive on this stream — a
+/// mismatch with the claimed `FileRun::digest` rejects the upload
+/// before anything is committed. Runs with any chunk NOT in hand (a
+/// deduped digest, or a repeat of a novel digest whose body was
+/// already pipelined away) are returned as `deferred` for the
+/// metadata/refetch proof in [`super::file_digest`].
 // r[impl store.chunk.self-verify]
+// r[impl store.integrity.verify-on-put+3]
 pub(super) async fn run_verify(
     stream: &mut Streaming<PutPathChunkedRequest>,
     validated: &ValidatedBegin,
+    skipped: &[bool],
     backend: &Arc<dyn ChunkBackend>,
     chunk_upload_max_concurrent: usize,
 ) -> Result<Verdict, Status> {
@@ -159,19 +184,65 @@ pub(super) async fn run_verify(
         chunk_upload_max_concurrent,
         validated.novel.len(),
     );
+    let mut deferred: Vec<DeferredRun> = Vec::new();
 
-    for out in &validated.outputs {
-        for (digest, len) in &out.chunk_manifest {
-            if novel_set.contains(digest) && !pipeline.seen(digest) {
-                let body = match recv_novel_chunk(stream, digest, *len, validated, &mut next_novel)
-                    .await?
-                {
-                    Some(b) => b,
-                    None => return Ok(Verdict::Incomplete),
-                };
-                if let Err(e) = pipeline.submit(*digest, body).await {
-                    return Ok(Verdict::Unavailable(e));
+    for (oi, out) in validated.outputs.iter().enumerate() {
+        // Idempotent-skipped outputs commit no `file_blobs` rows, so
+        // their digest claims bind nothing — receive their novel
+        // chunks (the wire protocol is position-based) but skip the
+        // recompute. CA outputs are not yet claimable here (phase C),
+        // so `skipped[oi]` is false for them and they ARE verified.
+        let check = !skipped[oi];
+        for (ri, run) in out.file_runs.iter().enumerate() {
+            // `Some` while every chunk so far arrived on this stream —
+            // the only case where the run's bytes are in hand. An
+            // empty run hashes zero bytes, so an empty file's claimed
+            // digest must be blake3("").
+            let mut hasher = if check {
+                Some(blake3::Hasher::new())
+            } else {
+                None
+            };
+            for j in run.chunks.clone() {
+                let (digest, len) = out.chunk_manifest[j];
+                if novel_set.contains(&digest) && !pipeline.seen(&digest) {
+                    let body =
+                        match recv_novel_chunk(stream, &digest, len, validated, &mut next_novel)
+                            .await?
+                        {
+                            Some(b) => b,
+                            None => return Ok(Verdict::Incomplete),
+                        };
+                    if let Some(mut h) = hasher.take() {
+                        // `Bytes` clone is a refcount bump; the update
+                        // re-reads a buffer already in memory.
+                        let b = body.clone();
+                        hasher = Some(cas::cpu_bound(move || {
+                            h.update(&b);
+                            h
+                        }));
+                    }
+                    if let Err(e) = pipeline.submit(digest, body).await {
+                        return Ok(Verdict::Unavailable(e));
+                    }
+                } else {
+                    // Bytes not on this stream (deduped, or a repeat
+                    // occurrence) — the inline recompute can't finish.
+                    hasher = None;
                 }
+            }
+            match hasher {
+                Some(h) => {
+                    let actual: [u8; 32] = h.finalize().into();
+                    if actual != run.digest {
+                        return Err(file_digest_mismatch(oi, &run.digest, &actual));
+                    }
+                }
+                None if check => deferred.push(DeferredRun {
+                    output: oi,
+                    run: ri,
+                }),
+                None => {}
             }
         }
     }
@@ -201,7 +272,7 @@ pub(super) async fn run_verify(
         Err(e) => return Ok(Verdict::Unavailable(e)),
     };
 
-    Ok(Verdict::Match { uploaded })
+    Ok(Verdict::Match { uploaded, deferred })
 }
 
 /// Receive the next `Chunk` frame and validate it against the position
@@ -211,7 +282,7 @@ pub(super) async fn run_verify(
 /// digest. Any disagreement is a protocol violation
 /// (`INVALID_ARGUMENT`); `Ok(None)` means the stream ended (the caller
 /// maps that to [`Verdict::Incomplete`]).
-// r[impl store.integrity.verify-on-put+2]
+// r[impl store.integrity.verify-on-put+3]
 async fn recv_novel_chunk(
     stream: &mut Streaming<PutPathChunkedRequest>,
     expected_digest: &[u8; 32],

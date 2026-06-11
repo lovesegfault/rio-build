@@ -170,7 +170,7 @@ pub(super) async fn collect_outputs(
     // the reference-scan candidate set (the upload adds the scanned
     // output paths itself, covering self- and cross-output references).
     // The scan is authoritative — the store commits the resolved set as
-    // claimed (`r[store.integrity.verify-on-put+2]`) — so a candidate
+    // claimed (`r[store.integrity.verify-on-put+3]`) — so a candidate
     // set that misses a path silently drops that reference from the
     // narinfo; input_closure ∪ Begin.outputs is the complete set.
     //

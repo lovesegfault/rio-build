@@ -12,7 +12,7 @@
 
 use super::*;
 
-// r[verify store.integrity.verify-on-put+2]
+// r[verify store.integrity.verify-on-put+3]
 /// Add with CORRECT hash → query returns it. Real store computes sha256
 /// of received NAR bytes and compares against the declared hash.
 #[tokio::test(flavor = "multi_thread")]
@@ -68,7 +68,7 @@ async fn add_then_query_path_info_real_hash() -> TestResult {
     Ok(())
 }
 
-// r[verify store.integrity.verify-on-put+2]
+// r[verify store.integrity.verify-on-put+3]
 /// Add with WRONG hash → `STDERR_ERROR`. This is the MockStore gap made
 /// concrete: `MockStore` has no hash verification; `StoreServiceImpl`'s
 /// `validate_nar_digest` rejects the mismatch.
