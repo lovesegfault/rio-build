@@ -125,13 +125,42 @@ impl types::DerivationEvent {
         derivation_path: String,
         error_message: String,
         status: types::BuildResultStatus,
+        backing: VerdictBacking,
     ) -> Self {
         Self {
             derivation_path,
             kind: types::DerivationEventKind::Failed as i32,
             error_message,
             failure_status: status as i32,
+            has_execution: backing.into(),
             ..Default::default()
+        }
+    }
+}
+
+/// Whether a fresh execution of the CURRENT attempt cycle backs a
+/// failure event (bug_080 — the KD-fact law: the EMITTER is the only
+/// author of this fact; consumers read it from the wire instead of
+/// re-deriving it from correlated signals). The typed constructor
+/// parameter makes the compiler the emitter census: every
+/// [`types::DerivationEvent::failed`] mint states its backing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerdictBacking {
+    /// A fresh execution of the current attempt cycle produced (or
+    /// directly precedes) this verdict — its log is the right pointer
+    /// for `rio-cli logs`.
+    FreshExecution,
+    /// No execution backs this verdict (cascaded bystanders, spawn-gate
+    /// poisons with no pod and no attempt): any log resolved by the
+    /// drv's name would be a PRIOR attempt's — misleading, never shown.
+    NoExecution,
+}
+
+impl From<VerdictBacking> for bool {
+    fn from(backing: VerdictBacking) -> bool {
+        match backing {
+            VerdictBacking::FreshExecution => true,
+            VerdictBacking::NoExecution => false,
         }
     }
 }

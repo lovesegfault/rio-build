@@ -821,31 +821,35 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
                 }
             }
             // Log failure via STDERR_NEXT, with a copy-pasteable
-            // `rio-cli logs` hint for drvs that actually ran. No
-            // `--build-id` needed — logs are keyed by `(drv_hash,
-            // exec_id)` and `rio-cli logs <drv>` resolves the latest
-            // execution, which is the one that just failed. The drv
-            // path is single-quoted so the line is shell-safe to
-            // copy-paste even when the drv name contains shell
+            // `rio-cli logs` hint for failures a fresh execution
+            // backs. No `--build-id` needed — logs are keyed by
+            // `(drv_hash, exec_id)` and `rio-cli logs <drv>` resolves
+            // the latest execution, which is the one that just failed.
+            // The drv path is single-quoted so the line is shell-safe
+            // to copy-paste even when the drv name contains shell
             // metacharacters.
             //
-            // Gated on `failure_status != DEPENDENCY_FAILED`: a
-            // cascaded ancestor never executed (the trigger drv
-            // failed first), so there is no log keyed by this drv —
-            // `rio-cli logs '<cascaded>'` would resolve to NotFound,
-            // or worse, a *prior* build's stale log of the same drv.
-            // The trigger drv (the one with the actual log) gets its
-            // own `Failed` event with a real `failure_status` and
-            // emits the hint. In a `--keep-going` build with N
-            // cascaded ancestors, suppressing N misleading hints is
-            // the difference between a copy-pasteable failure tail
-            // and noise.
-            let cascaded =
-                drv_event.failure_status == types::BuildResultStatus::DependencyFailed as i32;
-            let hint = if cascaded {
-                String::new()
-            } else {
+            // Gated on the STATED fact `has_execution` (bug_080 — the
+            // KD-fact law): only the emitter knows whether a fresh
+            // execution of the current attempt cycle backs this
+            // failure event, and it says so on the wire. The previous
+            // gate INFERRED validity from a correlated status
+            // (`!= DEPENDENCY_FAILED`) — it discharged exactly one
+            // no-execution population (cascaded ancestors, who now
+            // state NoExecution, preserving that behavior as a derived
+            // consequence) while printing stale prior-execution hints
+            // for the reportless family (spawn-gate poisons with no
+            // pod and no attempt — real but WRONG-attempt logs, the
+            // operator debugs the wrong attempt). Fail-closed: absent
+            // => false => no hint (mixed-version skew loses a hint,
+            // never mints a misleading one). In a `--keep-going` build
+            // with N cascaded ancestors, suppressing N misleading
+            // hints is the difference between a copy-pasteable failure
+            // tail and noise.
+            let hint = if drv_event.has_execution {
                 format!("\n  ↳ rio-cli logs '{}'", drv_event.derivation_path)
+            } else {
+                String::new()
             };
             stderr
                 .log(&format!(
@@ -5666,6 +5670,158 @@ mod tests {
             tails.draining(snap),
             Some(true),
             "the snapshot flip cuts the tail (the parity baseline)"
+        );
+    }
+
+    /// Collect the STDERR_NEXT log lines from `buf`.
+    async fn log_lines(buf: Vec<u8>) -> Vec<String> {
+        read_frames(buf)
+            .await
+            .into_iter()
+            .filter_map(|f| match f {
+                Frame::Log(s) => Some(s),
+                Frame::Start { .. } | Frame::Stop(_) | Frame::Result { .. } => None,
+            })
+            .collect()
+    }
+
+    // r[verify gw.stderr.activity+2]
+    /// bug_080: a failure event NOT backed by a fresh execution (the
+    /// no-eligible-source lane fires with "no pod and no attempt")
+    /// must print NO `rio-cli logs` hint — any log a drv-named lookup
+    /// resolves is a PRIOR attempt's, and the operator would debug the
+    /// wrong attempt. Population: Subst display open (the lost-Started
+    /// window the old status gate ignored).
+    #[tokio::test]
+    async fn no_execution_failure_prints_no_log_hint_over_subst_display() {
+        use types::DerivationEventKind::*;
+        let drv = "/nix/store/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-noexec.drv";
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
+
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            ev(Substituting, drv, &[]),
+        )
+        .await
+        .unwrap();
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            types::DerivationEvent::failed(
+                drv.into(),
+                "no eligible source: every spawnable node is excluded".into(),
+                types::BuildResultStatus::TransientFailure,
+                rio_proto::VerdictBacking::NoExecution,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let lines = log_lines(buf).await;
+        let failure_line = lines
+            .iter()
+            .find(|l| l.contains("failed"))
+            .expect("the failure line prints");
+        assert!(
+            !failure_line.contains("rio-cli logs"),
+            "no-execution failure must not print the misleading log hint, got: {failure_line:?}"
+        );
+    }
+
+    // r[verify gw.stderr.activity+2]
+    /// bug_080, the under-coverage twin: the same no-execution failure
+    /// with NO prior display (a poison before any dispatch in a new
+    /// build with carried exclusions) — the rejected `was_subst`
+    /// discriminant misses this population entirely.
+    #[tokio::test]
+    async fn no_execution_failure_prints_no_log_hint_with_no_display() {
+        let drv = "/nix/store/nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn-nodisp.drv";
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
+
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            types::DerivationEvent::failed(
+                drv.into(),
+                "no eligible source: every spawnable node is excluded".into(),
+                types::BuildResultStatus::TransientFailure,
+                rio_proto::VerdictBacking::NoExecution,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let lines = log_lines(buf).await;
+        let failure_line = lines
+            .iter()
+            .find(|l| l.contains("failed"))
+            .expect("the failure line prints");
+        assert!(
+            !failure_line.contains("rio-cli logs"),
+            "no-display no-execution failure must not print the hint, got: {failure_line:?}"
+        );
+    }
+
+    /// bug_080 over-suppression refutation (GREEN pin, disclosed: green
+    /// by accident pre-fix — status-gated; green by statement post-fix):
+    /// a worker-reported failure on a drv whose display is still Subst
+    /// (a lost `Started` window) has a fresh, useful log — the hint
+    /// stays. The rejected `was_subst` discriminant would suppress it.
+    #[tokio::test]
+    async fn worker_reported_failure_keeps_the_hint_regardless_of_display_family() {
+        use types::DerivationEventKind::*;
+        let drv = "/nix/store/pppppppppppppppppppppppppppppppp-fresh.drv";
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
+
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            ev(Substituting, drv, &[]),
+        )
+        .await
+        .unwrap();
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            types::DerivationEvent::failed(
+                drv.into(),
+                "builder exited 1".into(),
+                types::BuildResultStatus::PermanentFailure,
+                rio_proto::VerdictBacking::FreshExecution,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let lines = log_lines(buf).await;
+        let failure_line = lines
+            .iter()
+            .find(|l| l.contains("failed"))
+            .expect("the failure line prints");
+        assert!(
+            failure_line.contains("rio-cli logs"),
+            "a fresh-execution failure keeps its hint whatever the display family, got: {failure_line:?}"
         );
     }
 

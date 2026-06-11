@@ -1673,6 +1673,10 @@ impl DagActor {
                     &drv_hash,
                     "poison threshold reached after unreported executor crashes",
                     None,
+                    // Establishment-sweep backstop: a dispatched
+                    // execution existed (the crashed pod) — fresh
+                    // execution (bug_080).
+                    rio_proto::VerdictBacking::FreshExecution,
                 )
                 .await;
             }

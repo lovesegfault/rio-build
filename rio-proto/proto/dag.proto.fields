@@ -7,6 +7,7 @@ DERIVATION_EVENT_KIND_STARTED = 1;
 DERIVATION_EVENT_KIND_SUBSTITUTING = 5;
 DerivationEventKind kind = 2;
 bool explicitly_requested = 19;
+bool has_execution = 8;
 bool is_content_addressed = 11;
 bool is_fixed_output = 7;
 bool needs_resolve = 13;

@@ -1146,6 +1146,7 @@ async fn test_build_paths_derivation_failed_emits_log_and_stop() -> anyhow::Resu
                 target.clone(),
                 "boom".into(),
                 types::BuildResultStatus::PermanentFailure,
+                rio_proto::VerdictBacking::FreshExecution,
             ),
         )),
         ev(build_event::Event::Failed(types::BuildFailed {
@@ -1223,6 +1224,7 @@ async fn test_build_paths_dependency_failed_omits_rio_cli_hint() -> anyhow::Resu
                 trigger.clone(),
                 "boom".into(),
                 types::BuildResultStatus::PermanentFailure,
+                rio_proto::VerdictBacking::FreshExecution,
             ),
         )),
         // Cascaded ancestor never executed → no log → no hint.
@@ -1231,6 +1233,10 @@ async fn test_build_paths_dependency_failed_omits_rio_cli_hint() -> anyhow::Resu
                 cascaded.clone(),
                 format!("dependency '{trigger}' failed"),
                 types::BuildResultStatus::DependencyFailed,
+                // The cascaded emission states NoExecution (bug_080) —
+                // the old status-inferred suppression preserved as a
+                // derived consequence of the stated fact.
+                rio_proto::VerdictBacking::NoExecution,
             ),
         )),
         ev(build_event::Event::Failed(types::BuildFailed {
@@ -2242,6 +2248,7 @@ async fn test_mid_opcode_disconnect_cancels_build() -> anyhow::Result<()> {
                     format!("/nix/store/{i:032}-step.drv"),
                     format!("building step {i}"),
                     types::BuildResultStatus::TransientFailure,
+                    rio_proto::VerdictBacking::FreshExecution,
                 ),
             ))
         })
@@ -2393,6 +2400,7 @@ async fn test_shutdown_signal_cancels_active_builds() -> anyhow::Result<()> {
                     format!("/nix/store/{i:032}-step.drv"),
                     format!("building step {i}"),
                     types::BuildResultStatus::TransientFailure,
+                    rio_proto::VerdictBacking::FreshExecution,
                 ),
             ))
         })
@@ -2504,6 +2512,7 @@ async fn test_shutdown_signal_mid_build_no_pipe_break_cancels() -> anyhow::Resul
                     format!("/nix/store/{i:032}-step.drv"),
                     format!("building step {i}"),
                     types::BuildResultStatus::TransientFailure,
+                    rio_proto::VerdictBacking::FreshExecution,
                 ),
             ))
         })
@@ -2889,6 +2898,7 @@ async fn test_disconnect_cancel_propagates_jwt() -> anyhow::Result<()> {
                     format!("/nix/store/{i:032}-step.drv"),
                     format!("building step {i}"),
                     types::BuildResultStatus::TransientFailure,
+                    rio_proto::VerdictBacking::FreshExecution,
                 ),
             ))
         })

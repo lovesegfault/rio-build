@@ -2116,6 +2116,10 @@ impl DagActor {
              (controller spawn gate)",
             None,
             marker,
+            // THE defect lane (bug_080): \"no pod and no attempt\" — any
+            // log a drv-named lookup resolves is a PRIOR execution's;
+            // state NoExecution so the gateway never prints it.
+            rio_proto::VerdictBacking::NoExecution,
         )
         .await;
         // The poison is a derivation-level verdict, not an attempt

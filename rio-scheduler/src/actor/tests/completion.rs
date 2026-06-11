@@ -2723,6 +2723,65 @@ async fn test_high_fanin_completion_batches_ready() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.event.derivation-terminal]
+/// bug_080: the terminal-failure epilogue STATES execution backing on
+/// the wire — the trigger's event carries the caller's backing (a
+/// worker-reported permanent failure => has_execution = true) and
+/// EVERY cascaded DependencyFailed event states NoExecution (bystanders
+/// swept from non-executing states). Pre-fix red is type-level
+/// (disclosed): the field cannot pre-exist; the behavioral half is the
+/// value split across trigger/cascade asserted here on the real actor.
+#[tokio::test]
+async fn cascaded_failed_event_states_no_execution() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    let nodes = vec![
+        make_node("vb-leaf"),
+        make_node("vb-mid"),
+        make_node("vb-top"),
+    ];
+    let edges = vec![
+        make_test_edge("vb-mid", "vb-leaf"),
+        make_test_edge("vb-top", "vb-mid"),
+    ];
+    let mut ev = merge_dag(&handle, Uuid::new_v4(), nodes, edges, true).await?;
+    pull_complete_failure(
+        &handle,
+        "vb-leaf",
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "leaf busted",
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let drv_events = drain_derivation_events(&mut ev);
+    let failed_kind = rio_proto::types::DerivationEventKind::Failed as i32;
+    let perm = rio_proto::types::BuildResultStatus::PermanentFailure as i32;
+    let dep = rio_proto::types::BuildResultStatus::DependencyFailed as i32;
+    let trigger: Vec<_> = drv_events
+        .iter()
+        .filter(|d| d.kind == failed_kind && d.failure_status == perm)
+        .collect();
+    let cascaded: Vec<_> = drv_events
+        .iter()
+        .filter(|d| d.kind == failed_kind && d.failure_status == dep)
+        .collect();
+    assert_eq!(trigger.len(), 1, "one trigger Failed event");
+    assert!(
+        trigger[0].has_execution,
+        "the worker-reported trigger states FreshExecution on the wire"
+    );
+    assert_eq!(cascaded.len(), 2, "both ancestors cascade");
+    for d in cascaded {
+        assert!(
+            !d.has_execution,
+            "every cascaded event states NoExecution ({})",
+            d.derivation_path
+        );
+    }
+    Ok(())
+}
+
 // r[verify sched.db.batch-unnest]
 // r[verify sched.event.derivation-terminal]
 /// `cascade_dependency_failure` collects-then-batches AND emits a

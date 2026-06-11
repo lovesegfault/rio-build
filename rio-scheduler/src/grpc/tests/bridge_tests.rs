@@ -134,6 +134,7 @@ async fn test_completed_event_survives_display_flood() {
             error_message: String::new(),
             failure_status: 0,
             exec_id: String::new(),
+            has_execution: false,
         })),
     });
 

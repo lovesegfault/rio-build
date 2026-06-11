@@ -891,6 +891,9 @@ impl DagActor {
                 ),
                 None,
                 None,
+                // The pre-crash execution is the latest; its partial
+                // log is the right pointer — fresh execution (bug_080).
+                rio_proto::VerdictBacking::FreshExecution,
             )
             .await;
         }

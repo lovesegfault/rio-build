@@ -135,6 +135,17 @@ message DerivationEvent {
   // STARTED with a DIFFERENT exec_id means the derivation was re-dispatched
   // and any per-execution subscription keyed on the old value is stale.
   string exec_id = 7;
+  // FAILED only (bug_080): a fresh execution of the CURRENT attempt cycle
+  // backs this failure event — the emitter states the fact; consumers
+  // (the gateway's `rio-cli logs` hint gate) READ it instead of inferring
+  // validity from correlated signals (failure_status, display family).
+  // Reading is FAIL-CLOSED: absent => false => no hint. Version-skew
+  // posture (proto3 default + the --wipe rollout signature): an old
+  // scheduler never sets it, so the worst outcome during skew is a
+  // MISSING hint, never a misleading one — the gate's purpose-aligned
+  // direction. Plain bool (absent-vs-false are deliberately the same
+  // behavior; no `optional`).
+  bool has_execution = 8;
 }
 
 enum DerivationEventKind {

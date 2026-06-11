@@ -2659,6 +2659,10 @@ impl DagActor {
         drv_hash: &DrvHash,
         error_msg: &str,
         final_line_count: Option<i64>,
+        // Whether a fresh execution backs the poison (bug_080): every
+        // caller is a collapsed worker-report site or the establishment
+        // sweep — each states its value with a one-line justification.
+        backing: rio_proto::VerdictBacking,
     ) {
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return;
@@ -2684,6 +2688,7 @@ impl DagActor {
             error_msg,
             rio_proto::types::BuildResultStatus::TransientFailure,
             final_line_count,
+            backing,
         )
         .await;
     }
@@ -2707,6 +2712,11 @@ impl DagActor {
         // backstop, controller reports) or no row applies (recovery
         // re-check) — the poison persist then runs alone, as today.
         attempt_row: Option<AttemptRow>,
+        // Whether a fresh execution backs the poison (bug_080): each
+        // caller states its value with a one-line justification — the
+        // no-eligible-source lane ("no pod and no attempt") is the one
+        // NoExecution caller.
+        backing: rio_proto::VerdictBacking,
     ) {
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return;
@@ -2740,6 +2750,7 @@ impl DagActor {
             error_msg,
             rio_proto::types::BuildResultStatus::TransientFailure,
             final_line_count,
+            backing,
         )
         .await;
     }
@@ -2780,6 +2791,13 @@ impl DagActor {
         // conservative value — the row reads as incomplete rather than
         // falsely complete.
         final_line_count: Option<i64>,
+        // Whether a fresh execution of the current attempt cycle backs
+        // the TRIGGER's failure event (bug_080) — stated on the wire as
+        // `DerivationEvent.has_execution` so the gateway's log-hint
+        // gate reads a fact instead of inferring from failure_status.
+        // Cascaded ancestors always emit NoExecution: they are
+        // bystanders swept from non-executing states (the note below).
+        backing: rio_proto::VerdictBacking,
     ) {
         // Stamp + emit use the trigger's interested set (those builds
         // saw THIS drv fail); handle_derivation_failure below uses the
@@ -2813,6 +2831,7 @@ impl DagActor {
                         trigger_path.clone(),
                         error_msg.to_string(),
                         status,
+                        backing,
                     ),
                 ),
             );
@@ -2841,6 +2860,10 @@ impl DagActor {
                             cascaded_path.clone(),
                             dep_msg.clone(),
                             rio_proto::types::BuildResultStatus::DependencyFailed,
+                            // Bystanders swept from non-executing
+                            // states: no execution of THEIR cycle
+                            // exists — stated, not narrated (bug_080).
+                            rio_proto::VerdictBacking::NoExecution,
                         ),
                     ),
                 );
@@ -3163,6 +3186,9 @@ impl DagActor {
                     drv_hash,
                     &format!("max_retries={n} exhausted after transient failures"),
                     report.final_line_count,
+                    // Collapsed worker-report poison: this report IS a
+                    // fresh execution's outcome (bug_080).
+                    rio_proto::VerdictBacking::FreshExecution,
                 )
                 .await;
             }
@@ -3177,6 +3203,9 @@ impl DagActor {
                         decision.counters.failed_builders.len()
                     ),
                     report.final_line_count,
+                    // Collapsed worker-report poison: fresh execution
+                    // (bug_080).
+                    rio_proto::VerdictBacking::FreshExecution,
                 )
                 .await;
             }
@@ -3553,6 +3582,9 @@ impl DagActor {
                     drv_hash,
                     &format!("max_exempt_infra_retries={max} exceeded: {error_msg}"),
                     report.final_line_count,
+                    // Collapsed worker-report poison: fresh execution
+                    // (bug_080).
+                    rio_proto::VerdictBacking::FreshExecution,
                 )
                 .await;
             }
@@ -3582,6 +3614,9 @@ impl DagActor {
                         "max_infra_retries={max} exhausted after infrastructure failures: {error_msg}"
                     ),
                     report.final_line_count,
+                    // Collapsed worker-report poison: fresh execution
+                    // (bug_080).
+                    rio_proto::VerdictBacking::FreshExecution,
                 )
                 .await;
             }
@@ -3772,6 +3807,9 @@ impl DagActor {
             error_msg,
             rio_proto::types::BuildResultStatus::PermanentFailure,
             report.final_line_count,
+            // Worker-reported permanent failure: the report carries the
+            // execution's own line count — fresh execution (bug_080).
+            rio_proto::VerdictBacking::FreshExecution,
         )
         .await;
         FailureHandling::Handled
@@ -3941,6 +3979,10 @@ impl DagActor {
                 error_msg,
                 rio_proto::types::BuildResultStatus::TimedOut,
                 report.final_line_count,
+                // Worker-reported timeout at the retry cap: the timed-
+                // out execution exists and its partial log is the right
+                // pointer — fresh execution (bug_080).
+                rio_proto::VerdictBacking::FreshExecution,
             )
             .await;
             return FailureHandling::Handled;

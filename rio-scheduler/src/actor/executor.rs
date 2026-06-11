@@ -190,6 +190,10 @@ impl DagActor {
                             "poison threshold reached on worker loss after prior failures",
                             None,
                             None,
+                            // The lost worker's execution is the latest
+                            // and its (possibly partial) log is the
+                            // right pointer — fresh execution (bug_080).
+                            rio_proto::VerdictBacking::FreshExecution,
                         )
                         .await;
                         continue;
