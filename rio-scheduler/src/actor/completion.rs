@@ -52,6 +52,27 @@ use super::DagActor;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ReportingExec(pub(super) Uuid);
 
+/// The disposition of the derivation a late report names, as the
+/// classifier consumes it (round-9 WO-S1-1): the SECOND classification
+/// axis beside the report's own status. `Cancelled` = the node is
+/// DAG-resident in the cancelled state (the within-grace face — the
+/// node itself is the warm cancel context; no separate grace constant
+/// exists, `TERMINAL_CLEANUP_DELAY` bounds the residency). `Unknown` =
+/// the node is gone (evicted by `handle_cleanup_terminal_build`, or
+/// never known) — the beyond-grace face; identity cold-resolves from
+/// the durable rows. `Other` = resident in any non-cancelled state
+/// (e.g. a duplicate report on a Completed node, whose registration
+/// already rode the success epilogue — no late registration applies).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LateNodeContext {
+    /// DAG-resident, status == Cancelled.
+    Cancelled,
+    /// Not in the DAG (evicted or never merged).
+    Unknown,
+    /// DAG-resident in any other status.
+    Other,
+}
+
 /// The late-report (AckIgnore) lane's typed effect alphabet (bug_077,
 /// the closure set): what a report that FAILED kernel admission may
 /// still do. A future late-report side effect adds a variant here —
@@ -79,23 +100,71 @@ pub(super) enum LateReportEffect {
         /// The report's post-footer line count (> 0).
         count: i64,
     },
+    /// Round-9 WO-S1-1 (the signed §5-S Q1 invariant: *completed
+    /// uploads survive cancellation as registered evidence*): a late
+    /// SUCCESS-class report (Built/Substituted/AlreadyValid) for a
+    /// cancelled or evicted derivation carries everything registration
+    /// needs — the validated output paths ride IN the letter; the
+    /// historically-interested tenants cold-resolve from the durable
+    /// builds/bd rows at apply time (cancellation strips in-memory
+    /// interest synchronously, so warm attribution does not exist for
+    /// this class on ANY face). Applying stamps `path_tenants` through
+    /// the censused writer funnel ([`DagActor::stamp_path_tenants`] —
+    /// the same family `handle_success_completion` rides; no second
+    /// stamp path) and routes CA-shaped reports through the gated
+    /// realisation insert ([`DagActor::ca_insert_realisations`]).
+    /// Cancellation MAY stop future work; it MUST NOT discard
+    /// registered or registrable completed work.
+    Register {
+        /// The report's validated outputs (store-path shape checked;
+        /// declared-membership checked when the node is resident).
+        outputs: Vec<crate::domain::BuiltOutput>,
+    },
     /// Acknowledge and write nothing (every other late report).
     Nothing,
 }
 
-/// The one computation `(reporting identity, payload status,
-/// final_line_count)` → [`LateReportEffect`]. Pure; all three lanes
-/// (the pull report intake, the un-admitted `ProcessCompletion` shim,
-/// the in-body degraded-window Cancelled arm) route through it. A
-/// `None` identity returns [`LateReportEffect::Nothing`]: a ghost
-/// exec is never stamped (conservative — the count's only carrier is
-/// dropped exactly when no execution can be named for it; disclosed).
+/// The one computation `(reporting identity, node context, payload
+/// status, final_line_count, validated outputs)` →
+/// [`LateReportEffect`]. Pure; all three lanes (the pull report
+/// intake, the un-admitted `ProcessCompletion` shim, the in-body
+/// degraded-window Cancelled arm) route through it — and since
+/// round-9 WO-S1-1 the unknown-derivation early-returns classify here
+/// too (a Register-or-censused-sibling classification, never a
+/// pre-classifier discard). A `None` identity returns
+/// [`LateReportEffect::Nothing`] for the fill law: a ghost exec is
+/// never stamped (conservative — the count's only carrier is dropped
+/// exactly when no execution can be named for it; disclosed). The
+/// Register law needs no exec identity: it registers PATH evidence,
+/// addressed by drv + tenant, not an execution row.
+///
+/// Law order: the fill is the Cancelled-status report's lane and the
+/// Register is the success-status report's lane — the two cannot
+/// collide on one report (disjoint on `status`).
 pub(super) fn late_report_effect(
     reporting: Option<ReportingExec>,
+    ctx: LateNodeContext,
     status: rio_proto::types::BuildResultStatus,
     final_line_count: u64,
+    outputs: Vec<crate::domain::BuiltOutput>,
 ) -> LateReportEffect {
-    let cancelled = status == rio_proto::types::BuildResultStatus::Cancelled;
+    use rio_proto::types::BuildResultStatus as S;
+    let success = matches!(status, S::Built | S::Substituted | S::AlreadyValid);
+    // The registration arm (round-9 WO-S1-1): success-class report ×
+    // cancelled-or-evicted derivation × at least one validated output.
+    // `Other` (resident, non-cancelled) never registers late — a
+    // duplicate on a Completed node already registered through the
+    // success epilogue, and a report on a live node is not LATE
+    // evidence (the admitted lane owns it).
+    if success && !outputs.is_empty() {
+        match ctx {
+            LateNodeContext::Cancelled | LateNodeContext::Unknown => {
+                return LateReportEffect::Register { outputs };
+            }
+            LateNodeContext::Other => {}
+        }
+    }
+    let cancelled = status == S::Cancelled;
     match (
         reporting,
         cancelled,
@@ -744,14 +813,35 @@ impl DagActor {
         if tenant_ids.is_empty() {
             return;
         }
+        self.stamp_path_tenants(drv_hash, &state.output_paths, &tenant_ids, provenance)
+            .await;
+    }
+
+    /// THE single-drv registration-stamp chokepoint (round-9 WO-S1-1;
+    /// census-pinned with [`Self::upsert_path_tenants_for_batch`] —
+    /// the two actor-side callers of the db writer family): every
+    /// non-batched `path_tenants` ownership write in the scheduler
+    /// routes through here, whether the (paths, tenants) pair resolved
+    /// warm (the success epilogue via
+    /// [`Self::upsert_path_tenants_for`]) or cold (the late-report
+    /// Register arm). Best-effort: warn on Err, never block the
+    /// caller — the tenant-retention GC seed under-retains until a
+    /// re-stamp; the 24h global grace is the fallback.
+    pub(super) async fn stamp_path_tenants(
+        &self,
+        drv_hash: &DrvHash,
+        output_paths: &[String],
+        tenant_ids: &[Uuid],
+        provenance: &crate::db::live_pins::StampProvenance,
+    ) {
         if let Err(e) = self
             .db
-            .upsert_path_tenants(&state.output_paths, &tenant_ids, provenance)
+            .upsert_path_tenants(output_paths, tenant_ids, provenance)
             .await
         {
             warn!(
                 drv_hash = %drv_hash, ?e,
-                output_paths = state.output_paths.len(),
+                output_paths = output_paths.len(),
                 tenants = tenant_ids.len(),
                 "path_tenants upsert failed; GC retention may under-retain"
             );
@@ -1126,19 +1216,197 @@ impl DagActor {
     /// route, disclosed: a drv already reaped from the DAG now still
     /// fills (the stamp needs no node), where the old route skipped —
     /// strictly less count loss, same monotone bound.
-    pub(super) fn apply_late_report_effect(
+    ///
+    /// The Register arm (round-9 WO-S1-1, the signed Q1 invariant):
+    /// `drv_key` may be a drv_hash OR a drv_path (the evicted face
+    /// arrives with whatever key the report carried); the canonical
+    /// hash and the historically-interested tenants cold-resolve in
+    /// ONE indexed query over the durable rows (derivations ⋈ bd ⋈
+    /// builds — cancellation strips in-memory interest synchronously,
+    /// so this is the lawful attribution on EVERY face). The stamp
+    /// rides the censused writer funnel ([`Self::stamp_path_tenants`],
+    /// `StampProvenance::BuiltLocally` — locally produced bytes; all
+    /// historically-interested tenants lawful under the signed Q2
+    /// witness law) and CA-shaped reports reach the gated realisation
+    /// insert ([`Self::ca_insert_realisations`] — resident CA nodes;
+    /// the general identity writes are WO-S1-3's). Best-effort like
+    /// every registration write: a PG blip degrades retention, never
+    /// the intake.
+    pub(super) async fn apply_late_report_effect(
         &mut self,
-        drv_hash: &DrvHash,
+        drv_key: &str,
         effect: LateReportEffect,
     ) {
+        let drv_hash = DrvHash::from(drv_key);
         match effect {
             LateReportEffect::FillCancelledCount {
                 exec: ReportingExec(exec_id),
                 count,
             } => {
-                self.stamp_drv_execution_terminal(drv_hash, exec_id, "cancelled", Some(count));
+                self.stamp_drv_execution_terminal(&drv_hash, exec_id, "cancelled", Some(count));
+            }
+            LateReportEffect::Register { outputs } => {
+                // Cold identity resolve: canonical drv_hash + the
+                // tenants whose builds were interested (LEFT JOIN so a
+                // known drv with zero tenanted builds still resolves
+                // its hash — the stamp is then vacuous, logged).
+                let rows: Vec<(String, Option<Uuid>)> = match sqlx::query_as(
+                    r#"
+                    SELECT d.drv_hash, b.tenant_id
+                      FROM derivations d
+                      LEFT JOIN build_derivations bd USING (derivation_id)
+                      LEFT JOIN builds b
+                        ON b.build_id = bd.build_id AND b.tenant_id IS NOT NULL
+                     WHERE d.drv_hash = $1 OR d.drv_path = $1
+                    "#,
+                )
+                .bind(drv_key)
+                .fetch_all(self.db.pool())
+                .await
+                {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        warn!(
+                            drv_key,
+                            error = %e,
+                            "late-report registration: identity resolve failed; \
+                             registration evidence lost for this delivery \
+                             (best-effort — the report redelivery may retry)"
+                        );
+                        return;
+                    }
+                };
+                let Some((canonical_hash, _)) = rows.first() else {
+                    // The censused no-evidence sibling: no durable drv
+                    // row — nothing to address registration to. Loud:
+                    // this is the only arm that still drops a
+                    // registrable report, and it requires the drv to
+                    // have never been merged.
+                    warn!(
+                        drv_key,
+                        outputs = outputs.len(),
+                        "late success report for a derivation with no durable row; \
+                         registration has no addressable identity — dropped"
+                    );
+                    return;
+                };
+                let canonical = DrvHash::from(canonical_hash.as_str());
+                let tenants: Vec<Uuid> = {
+                    let mut t: Vec<Uuid> = rows.iter().filter_map(|(_, t)| *t).collect();
+                    t.sort();
+                    t.dedup();
+                    t
+                };
+                let paths: Vec<String> = outputs.iter().map(|o| o.output_path.clone()).collect();
+                if tenants.is_empty() {
+                    info!(
+                        drv_hash = %canonical,
+                        paths = paths.len(),
+                        "late success report registered no tenants (no tenanted \
+                         build ever held interest); path stamp vacuous"
+                    );
+                } else {
+                    info!(
+                        drv_hash = %canonical,
+                        paths = paths.len(),
+                        tenants = tenants.len(),
+                        "registering late built outputs for cancelled/evicted \
+                         derivation (completed uploads survive cancellation)"
+                    );
+                    self.stamp_path_tenants(
+                        &canonical,
+                        &paths,
+                        &tenants,
+                        &crate::db::live_pins::StampProvenance::BuiltLocally,
+                    )
+                    .await;
+                }
+                // CA-shaped late reports reach the SAME gated
+                // realisation insert the success epilogue uses (the
+                // is_ca/needs_resolve gate reads the resident node;
+                // the evicted face is a no-op here until WO-S1-3's
+                // general identity writes).
+                self.ca_insert_realisations(&canonical, &outputs).await;
             }
             LateReportEffect::Nothing => {}
+        }
+    }
+
+    /// Validate a late report's raw wire outputs into the typed
+    /// Register payload: the SAME two boundary filters the admitted
+    /// success path applies (store-path SHAPE at the trust boundary,
+    /// then declared-membership + dedup when the resident node's
+    /// declared `output_names` are available — the evicted face has no
+    /// declared set; its residual is priced by the path-shape filter,
+    /// the authenticated report, and the cold tenant scoping to
+    /// historically-interested builds). Same counters as the admitted
+    /// path — one metric surface for malformed/undeclared outputs.
+    pub(super) fn validated_late_outputs(
+        executor_id: &str,
+        drv_key: &str,
+        declared: Option<&[String]>,
+        raw: &[rio_proto::types::BuiltOutput],
+    ) -> Vec<crate::domain::BuiltOutput> {
+        let mut seen: HashSet<String> = HashSet::with_capacity(raw.len());
+        raw.iter()
+            .filter(|o| {
+                if rio_nix::store_path::StorePath::parse(&o.output_path).is_err() {
+                    warn!(
+                        executor_id,
+                        drv_key,
+                        output_name = %o.output_name,
+                        output_path = %o.output_path,
+                        "dropping malformed worker-supplied output_path (late lane)"
+                    );
+                    metrics::counter!("rio_scheduler_malformed_built_output_total").increment(1);
+                    return false;
+                }
+                if let Some(declared) = declared
+                    && !declared.contains(&o.output_name)
+                {
+                    warn!(
+                        executor_id,
+                        drv_key,
+                        output_name = %o.output_name,
+                        "dropping worker-supplied output not declared by \
+                         derivation (late lane)"
+                    );
+                    metrics::counter!("rio_scheduler_undeclared_built_output_total").increment(1);
+                    return false;
+                }
+                seen.insert(o.output_name.clone())
+            })
+            .map(|o| crate::domain::BuiltOutput {
+                output_name: o.output_name.clone(),
+                output_path: o.output_path.clone(),
+                output_hash: o.output_hash.clone(),
+            })
+            .collect()
+    }
+
+    /// The late-report classification context for `drv_key`: resident
+    /// node status → Cancelled/Other; absent → Unknown. Also returns
+    /// the declared output names when resident (the membership filter
+    /// input for [`Self::validated_late_outputs`]).
+    pub(super) fn late_node_context(
+        &self,
+        drv_key: &str,
+    ) -> (LateNodeContext, Option<Vec<String>>) {
+        let resolved: Option<DrvHash> = if self.dag.contains(drv_key) {
+            Some(drv_key.into())
+        } else {
+            self.dag.hash_for_path(drv_key).cloned()
+        };
+        match resolved.as_ref().and_then(|h| self.dag.node(h)) {
+            Some(state) => {
+                let ctx = if state.status() == DerivationStatus::Cancelled {
+                    LateNodeContext::Cancelled
+                } else {
+                    LateNodeContext::Other
+                };
+                (ctx, Some(state.output_names.to_vec()))
+            }
+            None => (LateNodeContext::Unknown, None),
         }
     }
 
@@ -1188,11 +1456,38 @@ impl DagActor {
             self.dag.hash_for_path(drv_key).cloned()
         };
         let Some(drv_hash) = drv_hash else {
-            warn!(
-                executor_id = %executor_id,
-                key = drv_key,
-                "completion for unknown derivation, ignoring"
+            // Round-9 WO-S1-1 (W9-C): the unknown-derivation report
+            // folds through the late-report chokepoint instead of a
+            // pre-classifier discard — a BUILT report for an EVICTED
+            // cancelled drv (the beyond-grace face) is registrable
+            // completed work; identity cold-resolves from the durable
+            // rows inside the Register applier. Non-success unknowns
+            // still classify Nothing (the censused sibling) and land
+            // exactly where the old early-return left them.
+            let status = rio_proto::types::BuildResultStatus::try_from(result.status)
+                .unwrap_or(rio_proto::types::BuildResultStatus::Unspecified);
+            let outputs = Self::validated_late_outputs(
+                executor_id.as_str(),
+                drv_key,
+                None,
+                &result.built_outputs,
             );
+            let effect = late_report_effect(
+                None,
+                LateNodeContext::Unknown,
+                status,
+                final_line_count,
+                outputs,
+            );
+            if effect == LateReportEffect::Nothing {
+                warn!(
+                    executor_id = %executor_id,
+                    key = drv_key,
+                    "completion for unknown derivation, ignoring"
+                );
+                return;
+            }
+            self.apply_late_report_effect(drv_key, effect).await;
             return;
         };
         let (admission, reporting) = match self.dag.node(&drv_hash).and_then(|s| s.exec_id) {
@@ -1257,8 +1552,16 @@ impl DagActor {
                 );
                 let status = rio_proto::types::BuildResultStatus::try_from(result.status)
                     .unwrap_or(rio_proto::types::BuildResultStatus::Unspecified);
-                let effect = late_report_effect(reporting, status, final_line_count);
-                self.apply_late_report_effect(&drv_hash, effect);
+                let (ctx, declared) = self.late_node_context(drv_hash.as_str());
+                let outputs = Self::validated_late_outputs(
+                    executor_id.as_str(),
+                    drv_hash.as_str(),
+                    declared.as_deref(),
+                    &result.built_outputs,
+                );
+                let effect = late_report_effect(reporting, ctx, status, final_line_count, outputs);
+                self.apply_late_report_effect(drv_hash.as_str(), effect)
+                    .await;
             }
         }
     }
@@ -1375,11 +1678,27 @@ impl DagActor {
             // attempt was already consumed on the ReportOutcome path.
             // The WARN includes executor_id so the race is traceable
             // in logs.
-            warn!(
-                executor_id = %executor_id,
-                key = drv_key,
-                "completion for unknown derivation, ignoring"
+            //
+            // Round-9 WO-S1-1 (W9-C): a SUCCESS-class report still
+            // classifies through the late-report chokepoint (the
+            // beyond-grace registration face) — the shape filter above
+            // already ran; identity cold-resolves in the applier.
+            let effect = late_report_effect(
+                None,
+                LateNodeContext::Unknown,
+                wire_status,
+                final_line_count,
+                result.built_outputs.clone(),
             );
+            if effect == LateReportEffect::Nothing {
+                warn!(
+                    executor_id = %executor_id,
+                    key = drv_key,
+                    "completion for unknown derivation, ignoring"
+                );
+                return;
+            }
+            self.apply_late_report_effect(drv_key, effect).await;
             return;
         };
         let drv_hash = &drv_hash;
@@ -1395,7 +1714,22 @@ impl DagActor {
 
         // Find the derivation in the DAG
         let Some(state) = self.dag.node(drv_hash) else {
-            warn!(drv_hash = %drv_hash, "completion for unknown derivation, ignoring");
+            // Same W9-C fold as the resolve-failure arm above: the
+            // hash resolved but the node is gone — a success-class
+            // report is still registrable completed work.
+            let effect = late_report_effect(
+                None,
+                LateNodeContext::Unknown,
+                wire_status,
+                final_line_count,
+                result.built_outputs.clone(),
+            );
+            if effect == LateReportEffect::Nothing {
+                warn!(drv_hash = %drv_hash, "completion for unknown derivation, ignoring");
+                return;
+            }
+            self.apply_late_report_effect(drv_hash.as_str(), effect)
+                .await;
             return;
         };
         // r[impl sched.completion.output-membership]
@@ -1458,14 +1792,24 @@ impl DagActor {
             // The Cancelled node's carrier is the cancelled attempt's
             // OWN exec (the carrier clears on terminal EXIT, never
             // entry) — the degraded-window fill stamps its own row
-            // (bug_098).
+            // (bug_098). A success-class report in this window is the
+            // within-grace REGISTRATION face (round-9 WO-S1-1): the
+            // shape AND declared-membership filters above already ran,
+            // so `result.built_outputs` is the validated payload.
             let reporting = self
                 .dag
                 .node(drv_hash)
                 .and_then(|s| s.exec_id)
                 .map(ReportingExec);
-            let effect = late_report_effect(reporting, wire_status, final_line_count);
-            self.apply_late_report_effect(drv_hash, effect);
+            let effect = late_report_effect(
+                reporting,
+                LateNodeContext::Cancelled,
+                wire_status,
+                final_line_count,
+                result.built_outputs.clone(),
+            );
+            self.apply_late_report_effect(drv_hash.as_str(), effect)
+                .await;
             debug!(drv_hash = %drv_hash, executor_id = %executor_id,
                    "cancelled completion report (expected after a cancel)");
             return;
@@ -4258,6 +4602,169 @@ impl DagActor {
             // is DAG-derived and resets to 0 if the poisoned node is later
             // removed via ClearPoison/TTL. Check if all derivations resolved.
             self.check_build_completion(build_id).await;
+        }
+    }
+}
+
+// =======================================================================
+// The late-report classifier law (round-9 WO-S1-1 — red 2's post-fix
+// form + the W9-C product cells). The PRE-FIX transcript (recorded in
+// the owning commit body): `late_report_effect(Some(exec), Built, 42)`
+// classified `Nothing` — the shipped law discarded the registration
+// with the acknowledgment.
+// =======================================================================
+#[cfg(test)]
+mod late_report_classifier_tests {
+    use super::*;
+    use rio_proto::types::BuildResultStatus as S;
+
+    fn out(name: &str) -> crate::domain::BuiltOutput {
+        crate::domain::BuiltOutput {
+            output_name: name.into(),
+            output_path: format!("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-{name}"),
+            output_hash: vec![0u8; 32],
+        }
+    }
+
+    /// red 2 flipped: (Built, Cancelled-resident) classifies Register
+    /// — the pre-fix law classified Nothing (transcript in the commit
+    /// body; the signed Q1 invariant reverses the design intent).
+    #[test]
+    fn built_on_cancelled_classifies_register() {
+        let effect = late_report_effect(
+            Some(ReportingExec(Uuid::new_v4())),
+            LateNodeContext::Cancelled,
+            S::Built,
+            42,
+            vec![out("out")],
+        );
+        assert_eq!(
+            effect,
+            LateReportEffect::Register {
+                outputs: vec![out("out")]
+            },
+            "a late BUILT report on a cancelled drv is registrable completed \
+             work — the registration arm, not the Nothing arm"
+        );
+    }
+
+    /// red 2's sibling flipped: (Built, Unknown/evicted) ALSO
+    /// registers — the invariant is unconditional over the grace
+    /// (pre-fix this cell was unrepresentable: the pre-chokepoint
+    /// early-returns discarded it before classification).
+    #[test]
+    fn built_on_unknown_classifies_register() {
+        let effect = late_report_effect(
+            None,
+            LateNodeContext::Unknown,
+            S::Built,
+            0,
+            vec![out("out")],
+        );
+        assert!(
+            matches!(effect, LateReportEffect::Register { .. }),
+            "the beyond-grace face classifies Register (identity cold-resolves \
+             in the applier); got {effect:?}"
+        );
+    }
+
+    /// The success family closes over all three success statuses (the
+    /// epilogue treats them identically; carving Built-only would mint
+    /// an artificial sibling — divergence vs the WO's `(Built, …)`
+    /// phrasing recorded in the commit body).
+    #[test]
+    fn success_family_registers_uniformly() {
+        for status in [S::Built, S::Substituted, S::AlreadyValid] {
+            let effect = late_report_effect(
+                None,
+                LateNodeContext::Cancelled,
+                status,
+                0,
+                vec![out("out")],
+            );
+            assert!(
+                matches!(effect, LateReportEffect::Register { .. }),
+                "{status:?} is success-class: registrable"
+            );
+        }
+    }
+
+    /// The Other-context cell: a resident NON-cancelled node (e.g. a
+    /// duplicate report on a Completed drv) never registers late —
+    /// its registration rode (or rides) the admitted epilogue.
+    #[test]
+    fn built_on_other_context_classifies_nothing() {
+        let effect =
+            late_report_effect(None, LateNodeContext::Other, S::Built, 0, vec![out("out")]);
+        assert_eq!(effect, LateReportEffect::Nothing);
+    }
+
+    /// Empty validated outputs ⇒ nothing to register (a success report
+    /// with no surviving outputs after the boundary filters).
+    #[test]
+    fn empty_outputs_classify_nothing() {
+        let effect = late_report_effect(None, LateNodeContext::Cancelled, S::Built, 0, vec![]);
+        assert_eq!(effect, LateReportEffect::Nothing);
+    }
+
+    /// The fill law is UNCHANGED by the registration arm (disjoint on
+    /// status): a late Cancelled report with identity + count still
+    /// gap-fills; without identity it still classifies Nothing (the
+    /// ghost-exec conservatism, bug_098).
+    #[test]
+    fn fill_law_unchanged() {
+        let exec = ReportingExec(Uuid::new_v4());
+        assert_eq!(
+            late_report_effect(
+                Some(exec),
+                LateNodeContext::Cancelled,
+                S::Cancelled,
+                7,
+                vec![]
+            ),
+            LateReportEffect::FillCancelledCount { exec, count: 7 }
+        );
+        assert_eq!(
+            late_report_effect(None, LateNodeContext::Cancelled, S::Cancelled, 7, vec![]),
+            LateReportEffect::Nothing,
+            "ghost exec is never stamped"
+        );
+        assert_eq!(
+            late_report_effect(
+                Some(exec),
+                LateNodeContext::Cancelled,
+                S::Cancelled,
+                0,
+                vec![]
+            ),
+            LateReportEffect::Nothing,
+            "zero count = not reported"
+        );
+    }
+
+    /// Failure-class late reports never register (TransientFailure /
+    /// PermanentFailure / TimedOut / Unspecified carry no completed
+    /// upload claim).
+    #[test]
+    fn failure_class_never_registers() {
+        for status in [
+            S::TransientFailure,
+            S::PermanentFailure,
+            S::TimedOut,
+            S::Unspecified,
+        ] {
+            for ctx in [
+                LateNodeContext::Cancelled,
+                LateNodeContext::Unknown,
+                LateNodeContext::Other,
+            ] {
+                let effect = late_report_effect(None, ctx, status, 0, vec![out("out")]);
+                assert_eq!(
+                    effect,
+                    LateReportEffect::Nothing,
+                    "({status:?}, {ctx:?}) must not register"
+                );
+            }
         }
     }
 }

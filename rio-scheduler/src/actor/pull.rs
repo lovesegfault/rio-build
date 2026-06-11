@@ -1485,14 +1485,27 @@ impl DagActor {
                 // REPORT'S OWN exec — the find key this intake
                 // resolved the attempt by — so the fill can never
                 // stamp a successor attempt through the node's
-                // mutable carrier.
+                // mutable carrier. Round-9 WO-S1-1: a late
+                // success-class report on a cancelled/evicted drv
+                // classifies `Register` here — THE production lane
+                // the 1,735 lost run-1 registrations arrived on.
                 let drv_hash = DrvHash::from(b.core.drv_hash.as_str());
+                let (ctx, declared) = self.late_node_context(drv_hash.as_str());
+                let outputs = Self::validated_late_outputs(
+                    b.core.executor_id.as_str(),
+                    drv_hash.as_str(),
+                    declared.as_deref(),
+                    &payload.result.built_outputs,
+                );
                 let effect = super::completion::late_report_effect(
                     Some(super::completion::ReportingExec(exec_id)),
+                    ctx,
                     payload.result.status(),
                     payload.final_line_count,
+                    outputs,
                 );
-                self.apply_late_report_effect(&drv_hash, effect);
+                self.apply_late_report_effect(drv_hash.as_str(), effect)
+                    .await;
                 Ok(())
             }
             ReportAdmission::Process(admission) => {

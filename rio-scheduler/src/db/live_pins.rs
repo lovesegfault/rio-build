@@ -16,13 +16,15 @@ use crate::state::DrvHash;
 /// authorizes it, and the funnel derives the lawful (path, tenant)
 /// pairs FROM the witness — a witness-less stamp does not compile,
 /// and a one-tenant verdict cannot be widened into all-tenant
-/// ownership at any call site. Six producer sites, four classes:
+/// ownership at any call site. Seven producer sites, four classes:
 ///
 /// * walk Success → [`WalkVerified`](Self::WalkVerified) (the wire's
 ///   per-path verified-tenant sets; stamps INTERSECT);
-/// * worker-built / recovery-orphan completion →
-///   [`BuiltLocally`](Self::BuiltLocally) (locally produced bytes —
-///   all interested tenants lawful, signed under Q2);
+/// * worker-built / recovery-orphan completion / the late-report
+///   `Register` arm (round-9 WO-S1-1 — completed uploads survive
+///   cancellation; tenants cold-resolved from the durable interest
+///   rows) → [`BuiltLocally`](Self::BuiltLocally) (locally produced
+///   bytes — all interested tenants lawful, signed under Q2);
 /// * the dispatch locally-present lane →
 ///   [`AllTenantProbe`](Self::AllTenantProbe) (every stamped tenant's
 ///   own visibility-gated probe answered present);
@@ -370,5 +372,103 @@ impl SchedulerDb {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
+    }
+}
+
+// =======================================================================
+// W9-B (round-9 WO-S1-1) — the registration-writer census, scheduler
+// crate half. Proposition: ZERO uncensused registration writers of the
+// tenant-ownership table — the ONE production SQL body is the
+// witness-funneled `upsert_path_tenants_raw` above, and every caller
+// of the writer family is a censused chokepoint (or a test exercising
+// one of the db fns directly). Source-scanning generator (RC-1 class):
+// the member list comes FROM the tree, never from an author-typed
+// list. Same-crate scan only — the store-crate half of the census
+// lives beside the store's ingest writer (hazard (vvvvv): a per-crate
+// nix test sandbox stages only its own crate's source).
+// =======================================================================
+#[cfg(test)]
+mod registration_writer_census {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    fn scan(dir: &Path, needle: &str, hits: &mut BTreeMap<String, usize>, root: &Path) {
+        for entry in std::fs::read_dir(dir).expect("readable src dir") {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            if path.is_dir() {
+                scan(&path, needle, hits, root);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).expect("readable source file");
+                let n = text.matches(needle).count();
+                if n > 0 {
+                    let rel = path
+                        .strip_prefix(root)
+                        .expect("under root")
+                        .to_str()
+                        .expect("source paths are utf-8")
+                        .to_owned();
+                    *hits.entry(rel).or_insert(0) += n;
+                }
+            }
+        }
+    }
+
+    /// Needles are assembled at runtime (`concat`-free) so the census
+    /// never matches its own source text.
+    fn census(parts: &[&str]) -> BTreeMap<String, usize> {
+        let needle = parts.join("");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut hits = BTreeMap::new();
+        scan(&root, &needle, &mut hits, &root);
+        hits
+    }
+
+    /// The SQL-body census: exactly ONE ownership-INSERT statement in
+    /// this crate — the provenance-funneled writer in this file. A
+    /// second SQL body anywhere is an uncensused stamp path (the W9-B
+    /// reject). Test-seed INSERTs in OTHER crates are that crate's
+    /// census's rows.
+    #[test]
+    fn one_production_insert_statement() {
+        let hits = census(&["INSERT INTO ", "path_tenants"]);
+        let expected: BTreeMap<String, usize> = [("db/live_pins.rs".to_string(), 1)].into();
+        assert_eq!(
+            hits, expected,
+            "the ownership-INSERT census moved — every registration write \
+             must route through the witness-funneled upsert_path_tenants_raw \
+             (signed Q2); re-derive the pin only for a censused writer"
+        );
+    }
+
+    /// The db-writer call-site census: the actor-side stamp
+    /// chokepoints — completion.rs's `stamp_path_tenants` (single-drv
+    /// funnel: the warm epilogue resolves AND the late-report Register
+    /// arm) and `upsert_path_tenants_for_batch` (the I-139 batch
+    /// funnel) — plus the in-family wrapper in this file and the
+    /// db-layer tests that pin the writer fns' own semantics.
+    #[test]
+    fn writer_family_callers_pinned() {
+        let mut hits = census(&[".upsert_path_tenants", "("]);
+        for (k, v) in census(&[".upsert_path_tenants_raw", "("]) {
+            *hits.entry(k).or_insert(0) += v;
+        }
+        let expected: BTreeMap<String, usize> = [
+            // the wrapper delegating to _raw (one call, in-family)
+            ("db/live_pins.rs".to_string(), 1),
+            // stamp_path_tenants (single funnel) + the batch funnel
+            ("actor/completion.rs".to_string(), 2),
+            // db-fn semantics tests (idempotence/witness-law pins) —
+            // they exercise the censused fns directly by design
+            ("actor/tests/completion.rs".to_string(), 2),
+        ]
+        .into();
+        assert_eq!(
+            hits, expected,
+            "a new caller of the path_tenants writer family appeared — \
+             route it through the censused stamp chokepoints \
+             (stamp_path_tenants / upsert_path_tenants_for_batch) or \
+             census it here with its witness rationale"
+        );
     }
 }

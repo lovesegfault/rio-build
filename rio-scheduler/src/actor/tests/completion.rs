@@ -5047,3 +5047,204 @@ async fn carried_at_cap_deadline_exceeded_is_counted_not_exempt() -> TestResult 
     );
     Ok(())
 }
+
+// =======================================================================
+// Round-9 WO-S1-1 — the signed registration invariant (§5-S Q1):
+// "completed uploads survive cancellation as registered evidence."
+// A late BUILT report on a cancelled derivation carries everything
+// registration needs (paths, hashes, tenant via the durable interest
+// rows, drv identity); the pre-fix lane discarded the bookkeeping
+// while the bytes stayed durable — 1,735/4,529 (38.3%) of run-1's
+// uploads lost their registration to the cancel-intake no-op arm.
+// =======================================================================
+
+/// W9-A face (a), red 1 — the WITHIN-GRACE cell (the measured incident
+/// shape: p50 139ms / p99 19.3s after cancel; the cancelled node is
+/// still DAG-resident). Production constructors only (the bug_077 R13
+/// lane): real merge (tenanted build → durable builds/bd rows), real
+/// pull mint, real CancelBuild (durable close + interest stripped),
+/// late BUILT report through the production report intake
+/// (`ReportPullOutcome` → the pull.rs AckIgnore lane).
+///
+/// Asserts the REGISTRATION half structurally on rows: the
+/// `path_tenants` stamp for (output path × historically-interested
+/// tenant) EXISTS post-report. The tenant-scoped FindMissingPaths
+/// verdict rides this row by the pinned store/kernel laws (the I-217
+/// table: owned ⇒ Visible regardless of signatures —
+/// `rio_evidence_kernel::visibility::visibility_verdict`; the store's
+/// `own_built_projection` consumes exactly these rows): the row IS the
+/// FMP input, so "missing" flips to "present" for this tenant when the
+/// row exists. Composition recorded per W9-A (rows + the cited pinned
+/// laws; no live store RPC in this crate — PD-13).
+#[tokio::test]
+async fn late_built_report_after_cancel_registers_path_tenants() -> TestResult {
+    use sha2::Digest;
+    let (db, handle, _task) = setup().await;
+    let build = Uuid::new_v4();
+    let _ev = merge_single_node(&handle, build, "cancel-reg", PriorityClass::Scheduled).await?;
+
+    // The pod opens its attempt through the real mint.
+    let exec_id = open_pull_exec(&handle, "cancel-reg").await;
+
+    // The user cancels: the durable close lands before the reply and
+    // the build interest is stripped from the DAG (cold tenant
+    // resolution is the ONLY lawful attribution from here on).
+    cancel_build(&handle, build).await?;
+
+    // The pod finished the build + upload during the SIGTERM grace;
+    // its late BUILT report arrives after the durable close, so it
+    // folds AckIgnore at the production report intake.
+    let out_path = test_store_path("cancel-reg-out");
+    let mut payload = pull_payload(rio_proto::types::BuildResult {
+        status: rio_proto::types::BuildResultStatus::Built.into(),
+        built_outputs: vec![rio_proto::types::BuiltOutput {
+            output_name: "out".into(),
+            output_path: out_path.clone(),
+            output_hash: vec![0u8; 32],
+        }],
+        ..Default::default()
+    });
+    payload.final_line_count = 3;
+    pull_report_exec(&handle, exec_id, "cancel-reg", payload).await?;
+    barrier(&handle).await;
+
+    // The registration stamp: poll (the apply is best-effort PG work
+    // behind the actor channel; barrier flushes the command, the row
+    // write is awaited inline — one poll loop absorbs scheduling).
+    let hash = sha2::Sha256::digest(out_path.as_bytes()).to_vec();
+    let mut tenants: Vec<Uuid> = vec![];
+    for _ in 0..100 {
+        tenants =
+            sqlx::query_scalar("SELECT tenant_id FROM path_tenants WHERE store_path_hash = $1")
+                .bind(&hash)
+                .fetch_all(&db.pool)
+                .await?;
+        if !tenants.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        tenants,
+        vec![DEFAULT_TEST_TENANT],
+        "left: the late BUILT report's outputs carry NO path_tenants stamp \
+         (the cancel-intake no-op arm discarded the registration; the bytes \
+         are durable but tenant-invisible — the I-217 own-tenant-Hidden \
+         channel) / right: the Register letter stamps the historically-\
+         interested tenant through the censused writer"
+    );
+    Ok(())
+}
+
+/// W9-A face (b), red 1b — the BEYOND-GRACE/EVICTED cell: the same
+/// report after cancel-context is GONE, driven STRUCTURALLY by the
+/// production eviction path (`CleanupTerminalBuild` →
+/// `handle_cleanup_terminal_build` reaps the orphaned terminal node),
+/// never by clock advance (the RC-2 paused-clock ban). Identity is
+/// cold-resolved from the persisted rows (derivations + bd + builds —
+/// the attempt row names the drv; the durable interest names the
+/// tenant). Pre-fix this report dies at the unknown-derivation
+/// early-return — zero stamps (the face-(b) shipped truth).
+#[tokio::test]
+async fn late_built_report_after_eviction_registers_path_tenants() -> TestResult {
+    use sha2::Digest;
+    let (db, handle, _task) = setup().await;
+    let build = Uuid::new_v4();
+    let _ev = merge_single_node(&handle, build, "cancel-evict", PriorityClass::Scheduled).await?;
+    let exec_id = open_pull_exec(&handle, "cancel-evict").await;
+    cancel_build(&handle, build).await?;
+
+    // The production eviction, driven structurally (no clock advance):
+    // the delayed-cleanup command the terminal timer would post.
+    handle
+        .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id: build })
+        .await?;
+    barrier(&handle).await;
+
+    // The late BUILT report lands AFTER the reap: the node and the
+    // build are gone from memory; only the durable rows remain.
+    let out_path = test_store_path("cancel-evict-out");
+    let mut payload = pull_payload(rio_proto::types::BuildResult {
+        status: rio_proto::types::BuildResultStatus::Built.into(),
+        built_outputs: vec![rio_proto::types::BuiltOutput {
+            output_name: "out".into(),
+            output_path: out_path.clone(),
+            output_hash: vec![0u8; 32],
+        }],
+        ..Default::default()
+    });
+    payload.final_line_count = 5;
+    pull_report_exec(&handle, exec_id, "cancel-evict", payload).await?;
+    barrier(&handle).await;
+
+    let hash = sha2::Sha256::digest(out_path.as_bytes()).to_vec();
+    let mut tenants: Vec<Uuid> = vec![];
+    for _ in 0..100 {
+        tenants =
+            sqlx::query_scalar("SELECT tenant_id FROM path_tenants WHERE store_path_hash = $1")
+                .bind(&hash)
+                .fetch_all(&db.pool)
+                .await?;
+        if !tenants.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        tenants,
+        vec![DEFAULT_TEST_TENANT],
+        "left: the evicted-node report died at the pre-chokepoint \
+         unknown-derivation discard — zero stamps (the invariant is \
+         unconditional; eviction must not un-register completed work) \
+         / right: cold-resolved identity stamps the historically-\
+         interested tenant"
+    );
+    Ok(())
+}
+
+/// W9-A face (b), the ProcessCompletion-shim sibling: the un-admitted
+/// intake (`handle_completion`) has its own pre-chokepoint
+/// unknown-derivation early-return — W9-C folds it into the alphabet's
+/// sight (a Register-or-censused-sibling classification, never a
+/// pre-classifier discard). Same eviction setup, report via the shim.
+#[tokio::test]
+async fn evicted_shim_report_registers_path_tenants() -> TestResult {
+    use sha2::Digest;
+    let (db, handle, _task) = setup().await;
+    let build = Uuid::new_v4();
+    let _ev = merge_single_node(&handle, build, "cancel-shim", PriorityClass::Scheduled).await?;
+    let _exec_id = open_pull_exec(&handle, "cancel-shim").await;
+    cancel_build(&handle, build).await?;
+    handle
+        .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id: build })
+        .await?;
+    barrier(&handle).await;
+
+    // The shim path: ProcessCompletion (the append-failure redelivery
+    // echo's production lane) for the evicted drv.
+    let out_path = test_store_path("cancel-shim-out");
+    complete_success(&handle, "shim-w", "cancel-shim", &out_path).await?;
+    barrier(&handle).await;
+
+    let hash = sha2::Sha256::digest(out_path.as_bytes()).to_vec();
+    let mut tenants: Vec<Uuid> = vec![];
+    for _ in 0..100 {
+        tenants =
+            sqlx::query_scalar("SELECT tenant_id FROM path_tenants WHERE store_path_hash = $1")
+                .bind(&hash)
+                .fetch_all(&db.pool)
+                .await?;
+        if !tenants.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        tenants,
+        vec![DEFAULT_TEST_TENANT],
+        "left: the shim's unknown-derivation early-return discarded a \
+         registrable BUILT report before classification / right: the \
+         shim folds through the late-report chokepoint like every lane"
+    );
+    Ok(())
+}

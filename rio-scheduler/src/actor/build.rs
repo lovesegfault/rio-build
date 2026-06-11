@@ -130,9 +130,16 @@ impl DagActor {
             }
             // Stamp the cancelled execution's drv_executions row +
             // bd.exec_id correlation. The worker's eventual report (if
-            // any arrives before the pod dies) is a no-op early-return
-            // at the completion intake, so this is the only place that
-            // can stamp the cancelled exec — for any of
+            // any arrives before the pod dies) folds through the
+            // late-report chokepoint at the completion intake
+            // (`LateReportEffect`): a late Cancelled report gap-fills
+            // this stamp's NULL count, and a late SUCCESS-class report
+            // classifies `LateReportEffect::Register` — the completed
+            // upload survives this cancel as registered evidence
+            // (round-9 WO-S1-1, the signed Q1 invariant; cancellation
+            // stops future work, it does not discard registrable
+            // completed work). This remains the only place that can
+            // stamp the cancelled exec's TERMINAL row — for any of
             // cancel_build_derivations' callers (user cancel, per-build
             // timeout, fail-fast, top-down substitute fail).
             // Sole-interest filter at collect time means `&[build_id]`

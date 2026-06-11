@@ -126,7 +126,12 @@ impl From<proto::DerivationEdge> for DerivationEdge {
 }
 
 /// Domain mirror of [`rio_proto::types::BuiltOutput`].
-#[derive(Debug, Clone)]
+///
+/// `PartialEq`/`Eq`: the late-report chokepoint's typed effect
+/// alphabet (`LateReportEffect`) carries validated outputs in its
+/// `Register` letter and the alphabet is compared structurally in
+/// classification tests — equality is field equality.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuiltOutput {
     pub output_name: String,
     pub output_path: String,
