@@ -716,6 +716,22 @@
               };
 
               # --------------------------------------------------------------
+              # rio:// eval-store plugin (ADR-024 M0)
+              # --------------------------------------------------------------
+              #
+              # C++ shim + rio-evalstore staticlib compiled into a nix store
+              # plugin against the PINNED inputs.nix headers. Exposed as
+              # packages.evalstore-plugin; checks evalstore-smoke (plugin
+              # loads, scheme registers) and evalstore-parity (byte-identical
+              # drvPaths vs stock nix on a local fixture — the M0 acceptance
+              # criterion).
+              evalstorePlugin = import ./nix/evalstore-plugin.nix {
+                inherit pkgs inputs system;
+                inherit (pkgs) lib;
+                evalstoreCrate = crateBuild.cargoNix.workspaceMembers.rio-evalstore.build;
+              };
+
+              # --------------------------------------------------------------
               # Mutation testing (dev-only — NOT in checks)
               # --------------------------------------------------------------
               inherit
@@ -967,6 +983,9 @@
                 tfvars = pkgs.writeText "generated.auto.tfvars.json" (builtins.toJSON (import ./nix/pins.nix));
                 # Typst design book outputs.
                 inherit (docsLib) docs docs-pdf;
+                # rio:// eval-store nix plugin (ADR-024 M0). Pin contract:
+                # only load into inputs.nix binaries.
+                evalstore-plugin = evalstorePlugin.plugin;
               }
               # Container images. `.#dockerImages` is the linkFarm xtask
               # `eks push` walks; individual images at `.#dockerImages.<name>`
@@ -1212,6 +1231,9 @@
                 // prefixed "golden-" goldenMatrix.runs
                 // {
                   dashboard = rioDashboard;
+                  # Plugin loads into the pinned nix-cli and the rio://
+                  # scheme registers.
+                  evalstore-smoke = evalstorePlugin.smoke;
                 }
                 # Workspace-level policy checks (deny, helm-lint,
                 # tracey-validate, crds-drift, tfvars-fresh, …).
