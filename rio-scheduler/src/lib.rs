@@ -723,7 +723,11 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_scheduler_broadcast_lagged_total",
         "BuildEvent broadcast events skipped by lagging subscribers \
-         (sum of RecvError::Lagged(n) across all bridge tasks). Non-zero \
+         (sum of RecvError::Lagged(n) across all bridge tasks; labeled \
+         by kind: state = state-event stream, the watcher gets an \
+         in-stream ResyncRequired and recovers via snapshot reconcile; \
+         log = log-batch stream, skipped batches are lost to live \
+         tailing but durable in the store's log lane). Non-zero \
          under sustained event burst (large DAG, many concurrent drvs \
          emitting Log lines) — gateway can't drain fast enough (I-144)."
     );
