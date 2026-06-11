@@ -173,17 +173,24 @@ scope: with scope; ''
       # degraded_total++); the JWT-mode scheduler then rejects
       # SubmitBuild with Unauthenticated. The very next 3s probe tick
       # discovers the new leader and the next connect mints fine.
-      # 30s budget covers ≤2 probe ticks + nix-build dispatch (~15s).
+      #
+      # Budget: ≤2 probe ticks + nix-build dispatch ≈ 21s NOMINAL,
+      # but the dispatch leg is builder-load-sensitive — observed
+      # 39.15s under the round-9 boundary gate (18 VM tests in
+      # parallel on the shared builder; solo re-run green at the same
+      # tip). 120s = ~3× the observed tail / ~6× nominal — the
+      # ci-failure-patterns tail-budget discipline (budget for tail,
+      # not typical; builder variance 5×).
       #
       # Structural (convergence wait), not retry-on-error: same
       # pattern as sched_metric_wait above. The probe-interval gap is
-      # the only window; a sustained mint failure exhausts 30s and
-      # raises.
+      # the only window; a sustained mint failure exhausts the budget
+      # and raises.
       out_recovery = client.wait_until_succeeds(
           "nix-build --no-out-link --store 'ssh-ng://k3s-server' "
           "--arg busybox '(builtins.storePath ${common.busybox})' "
           "${recoveryDrv}",
-          timeout=30,
+          timeout=120,
       ).strip()
       assert out_recovery.startswith("/nix/store/"), (
           f"post-recovery build should succeed: {out_recovery!r}"
