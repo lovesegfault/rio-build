@@ -288,7 +288,22 @@ pub(crate) async fn release_placeholder_in_place(
     .bind(claim)
     .execute(pool)
     .await?;
-    Ok(result.rows_affected() > 0)
+    let released = result.rows_affected() > 0;
+    if released {
+        // live_055(b): announce the release to raced waiters.
+        // Best-effort AFTER the release applied (single-statement
+        // UPDATE on the pool — the release is already durable;
+        // NOTIFY loss is healed by the subscribers' bounded
+        // fallback poll).
+        if let Err(e) = super::notify_placeholder_event(pool, store_path_hash).await {
+            tracing::debug!(
+                store_path_hash = %hex::encode(store_path_hash),
+                error = %e,
+                "release_placeholder_in_place: NOTIFY failed (waiters fall back to polling)",
+            );
+        }
+    }
+    Ok(released)
 }
 
 /// Finalize an inline upload: fill real narinfo + store the NAR in

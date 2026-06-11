@@ -340,6 +340,13 @@ pub(crate) async fn reap_one(
         return Ok(false);
     }
 
+    // live_055(b): announce the reap to raced waiters — this is the
+    // ONE delete chokepoint (abort_placeholder, the drop-guard, the
+    // orphan scanner, and the hot-path stale reclaim all funnel
+    // here). Inside the tx: PG delivers at COMMIT, so a woken
+    // waiter's re-check sees the freed slot.
+    crate::metadata::notify_placeholder_event(&mut *tx, store_path_hash).await?;
+
     tx.commit().await?;
     Ok(true)
 }

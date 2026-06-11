@@ -537,6 +537,19 @@ pub fn describe_metrics() {
          Retry-After; concurrency is halved when >10% of a pass 429s."
     );
     describe_counter!(
+        "rio_store_substitute_raced_parks_total",
+        "Raced-substitution park outcomes (live_055(b)), labeled by wake: \
+         notified = the placeholder-event subscription woke the waiter \
+         (release/abort/completion NOTIFY); recheck = the post-register \
+         re-check found the slot already free (the lost-wakeup arm); \
+         fallback = the bounded re-poll fired (NOTIFY loss, or a silently \
+         wedged holder being driven toward takeover); budget_exhausted = \
+         the waiter returned Raced to the RetryLater backstop. Healthy \
+         shape: notified >> fallback. Sustained fallback names a LISTEN \
+         connection problem; sustained budget_exhausted names a holder \
+         outliving stall_window + slack (takeover plane broken)."
+    );
+    describe_counter!(
         "rio_store_substitute_infra_charge_total",
         "Per-upstream substitute failures whose kernel disposition is \
          ChargeInfra, labeled by class (stalled|admissionsaturated|fetch|\

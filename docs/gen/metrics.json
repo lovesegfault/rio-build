@@ -252,6 +252,7 @@
     "rio_store_substitute_probe_cache_hits_total",
     "rio_store_substitute_probe_cache_misses_total",
     "rio_store_substitute_probe_ratelimited_total",
+    "rio_store_substitute_raced_parks_total",
     "rio_store_substitute_skipped_total",
     "rio_store_substitute_stale_reclaimed_total",
     "rio_store_substitute_total"
@@ -1538,6 +1539,11 @@
         "name": "rio_store_substitute_probe_ratelimited_total",
         "kind": "counter",
         "help": "Upstream HEAD/GET probes that returned 429, labeled by tenant. The rate-limited subset is retried (≤3 passes) after honoring Retry-After; concurrency is halved when >10% of a pass 429s."
+      },
+      {
+        "name": "rio_store_substitute_raced_parks_total",
+        "kind": "counter",
+        "help": "Raced-substitution park outcomes (live_055(b)), labeled by wake: notified = the placeholder-event subscription woke the waiter (release/abort/completion NOTIFY); recheck = the post-register re-check found the slot already free (the lost-wakeup arm); fallback = the bounded re-poll fired (NOTIFY loss, or a silently wedged holder being driven toward takeover); budget_exhausted = the waiter returned Raced to the RetryLater backstop. Healthy shape: notified >> fallback. Sustained fallback names a LISTEN connection problem; sustained budget_exhausted names a holder outliving stall_window + slack (takeover plane broken)."
       },
       {
         "name": "rio_store_substitute_skipped_total",

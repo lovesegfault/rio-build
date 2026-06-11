@@ -1106,6 +1106,32 @@ Identity honored, never identity attached.
   and the 5-minute stale-reclaim.
 ]
 
+#r("store.substitute.raced-subscribe")[
+  On the materialization-executor plane, a `Raced` substitution answer MUST
+  park on a placeholder-event subscription instead of poll-racing the claim:
+  every transition that frees an `'uploading'` slot (release-in-place, the
+  reap/abort delete chokepoint, the `'complete'` flip) announces the
+  `store_path_hash` on one PG NOTIFY channel, transactional senders notifying
+  inside their transaction so a woken waiter's re-check observes the new row
+  state. The park MUST hold nothing --- no admission permit, no NAR-budget
+  reservation, no claim, and no singleflight slot a coalesced caller waits on
+  (each re-attempt runs the ordinary singleflight; the unary
+  `QueryPathInfo`/`GetPath` plane keeps its immediate-`Raced` mapping). The
+  waiter MUST register its subscription BEFORE re-checking the row state (the
+  lost-wakeup kill), MUST re-poll on a bounded fallback interval (NOTIFY is
+  best-effort; every fallback wake re-runs the full claim, whose takeover arms
+  reclaim a silently wedged holder), and MUST return `Raced` to the caller's
+  retry plane once a typed park budget --- derived from the stall window plus
+  fallback slack --- expires.
+]
+Rationale: the live_055 capture measured 633 re-claim round-trips at \~2/s
+against one blocked placeholder (94% of raced losses concentrated on two
+chain-head paths), with post-reclaim completion under 200ms --- the polling
+plane was pure waste between two wakeups' worth of information. The
+subscription collapses it to \~2 round-trips (the raced attempt and the
+post-release re-attempt) while the fallback poll preserves the reclaim
+plane's takeover latency to within one interval.
+
 #r("store.substitute.untrusted-upstream+3")[
   `tenant_upstreams` rows (URL and `trusted_keys`) are tenant-supplied via
   `AddUpstream`, and the substituter is process-global, so one tenant's hostile

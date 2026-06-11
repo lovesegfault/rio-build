@@ -1413,9 +1413,16 @@ async fn resolve_path(
     let mut cells = TenantAttemptCells::new();
     let mut cell_msgs: Vec<(&'static str, String)> = Vec::with_capacity(tenants.len());
     for &tenant_id in tenants {
+        // r[impl store.substitute.raced-subscribe]
+        // The SUBSCRIBED entry (live_055(b)): a raced answer parks on
+        // the placeholder-event subscription inside the substituter
+        // instead of surfacing here per-poll — `Err(Raced)` now means
+        // "still blocked past the park budget", and the AbortRaced →
+        // RetryLater plane below is the BACKSTOP cadence, not the
+        // wake mechanism.
         match ctx
             .substituter
-            .try_substitute_with_progress(tenant_id, &path, &per_path_progress)
+            .try_substitute_subscribed(tenant_id, &path, &per_path_progress)
             .await
         {
             Ok(Some(path_info)) => {
@@ -2308,6 +2315,21 @@ mod tests {
     /// bundle in the nix sandbox; the fake upstream is plaintext).
     use crate::test_helpers::sandbox_http;
 
+    /// Battery substituter: sandbox HTTP + raced-park budget pinned to
+    /// ZERO (`r[store.substitute.raced-subscribe]`'s violability lane)
+    /// so a `Concurrent` placeholder surfaces `Err(Raced)` immediately
+    /// — this battery certifies the executor's FOLD plane (loop
+    /// control, RetryLater, charge precedence) GIVEN a raced answer;
+    /// the park's own law is certified in substitute.rs (W9-BL).
+    fn battery_substituter(pool: PgPool) -> Substituter {
+        Substituter::new(pool, None)
+            .with_http_client(sandbox_http())
+            .with_raced_park(
+                crate::substitute::RACED_PARK_FALLBACK_POLL,
+                Some(std::time::Duration::ZERO),
+            )
+    }
+
     /// The battery context runs at the PRODUCTION fan-out (F = 4, the
     /// WO-R7-3 default — gate parity per §6.2: a width-1 battery would
     /// exercise a regime production does not use, hiding interleaving
@@ -2315,7 +2337,7 @@ mod tests {
     fn make_ctx(pool: PgPool) -> ExecutorContext {
         ExecutorContext::new(
             pool.clone(),
-            std::sync::Arc::new(Substituter::new(pool, None).with_http_client(sandbox_http())),
+            std::sync::Arc::new(battery_substituter(pool)),
             4,
             PathSlotPool::new(32),
         )
@@ -3544,8 +3566,7 @@ mod tests {
         let ctx = ExecutorContext::new(
             db.pool.clone(),
             std::sync::Arc::new(
-                Substituter::new(db.pool.clone(), None)
-                    .with_http_client(sandbox_http())
+                battery_substituter(db.pool.clone())
                     .with_stall_window(std::time::Duration::from_secs(1)),
             ),
             1,
@@ -6013,9 +6034,7 @@ mod tests {
             spawn_gated_upstream(vec![(path.clone(), nar.clone(), vec![])], "cache.w6b").await;
         wire_upstream(&db.pool, tenant, &upstream).await;
 
-        let sub = std::sync::Arc::new(
-            Substituter::new(db.pool.clone(), None).with_http_client(sandbox_http()),
-        );
+        let sub = std::sync::Arc::new(battery_substituter(db.pool.clone()));
         let leader = tokio::spawn({
             let s = std::sync::Arc::clone(&sub);
             let p = path.clone();
@@ -6119,9 +6138,7 @@ mod tests {
         wire_upstream(&db.pool, tenant, &upstream).await;
 
         let substituter = std::sync::Arc::new(
-            Substituter::new(db.pool.clone(), None)
-                .with_http_client(sandbox_http())
-                .with_admission_gate(gate.clone()),
+            battery_substituter(db.pool.clone()).with_admission_gate(gate.clone()),
         );
         // Two jobs of four paths each (n=2 walks, F=4: nominal demand
         // n x F = 8 = the WHOLE gate).
@@ -6276,9 +6293,7 @@ mod tests {
         )
         .await;
 
-        let substituter = std::sync::Arc::new(
-            Substituter::new(db.pool.clone(), None).with_http_client(sandbox_http()),
-        );
+        let substituter = std::sync::Arc::new(battery_substituter(db.pool.clone()));
         // ONE slot: the steady-state contention regime, minimized.
         let pool1 = PathSlotPool::new(1);
         let ctx_a = ExecutorContext::new(
@@ -6432,9 +6447,7 @@ mod tests {
         let pool1 = PathSlotPool::new(1);
         let ctx = ExecutorContext::new(
             db.pool.clone(),
-            std::sync::Arc::new(
-                Substituter::new(db.pool.clone(), None).with_http_client(sandbox_http()),
-            ),
+            std::sync::Arc::new(battery_substituter(db.pool.clone())),
             1,
             pool1.clone(),
         );
@@ -6776,9 +6789,7 @@ mod tests {
         let pool2 = PathSlotPool::new(2);
         let ctx = ExecutorContext::new(
             db.pool.clone(),
-            std::sync::Arc::new(
-                Substituter::new(db.pool.clone(), None).with_http_client(sandbox_http()),
-            ),
+            std::sync::Arc::new(battery_substituter(db.pool.clone())),
             4,
             pool2,
         );

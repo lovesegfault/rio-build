@@ -67,6 +67,31 @@ pub const DEFAULT_SUBSTITUTE_STALL_WINDOW: Duration = Duration::from_secs(180);
 /// rsb retry loop doesn't wait for the orphan scanner's 15-minute sweep.
 pub const SUBSTITUTE_STALE_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 
+/// Fallback re-poll interval for a raced waiter parked on the
+/// placeholder-event subscription (live_055(b),
+/// `r[store.substitute.raced-subscribe]`). NAMED VIOLABLE (R17, time
+/// axis): this is the NOTIFY-loss healing bound AND the
+/// takeover-latency tax parking adds — every fallback wake re-runs
+/// the FULL claim (whose stall/zero-progress arms perform takeover),
+/// so a wedged holder is reclaimed at most one interval after its
+/// takeover window opens. 15 s = stall window / 12 (≤ 8.3% added to
+/// the 180 s reclaim MTTR) while a NOTIFY-dropped release still heals
+/// ~24× faster than the 300 s heartbeat reap, at ~4 re-claim
+/// round-trips per parked minute worst-case (vs the incident's ~2/s).
+/// Tests shrink it via [`Substituter::with_raced_park`]; the
+/// violation red proves the knob binds.
+pub const RACED_PARK_FALLBACK_POLL: Duration = Duration::from_secs(15);
+
+/// Attempts-axis twin of the park's time budget (R17 all-axes): the
+/// park budget is DERIVED, never free-standing —
+/// `stall_window + 2 × fallback` (reach the zero-progress takeover
+/// boundary, plus one fallback to observe it opening and one for
+/// NOTIFY-loss slack). With defaults: 180 + 30 = 210 s, ≈ 14 fallback
+/// re-claims worst-case. Past the budget the waiter returns
+/// `Err(Raced)` — the executor's RetryLater plane stays the backstop,
+/// now at per-budget cadence instead of per-poll.
+const RACED_PARK_BUDGET_FALLBACK_SLACK: u32 = 2;
+
 /// Bound on concurrent narinfo HEAD probes in [`Substituter::check_available`].
 /// The reqwest connection pool is the next bottleneck above this; 128
 /// keeps the in-flight set well under typical fd limits and avoids
@@ -635,6 +660,30 @@ pub struct Substituter {
     /// (`manifests.claimed_by`): the pod name (`HOSTNAME`), or
     /// `"unknown"` outside k8s.
     claimed_by: String,
+    // r[impl store.substitute.raced-subscribe]
+    /// Placeholder-event fanout for raced waiters (live_055(b)): the
+    /// PG LISTEN task (lazily spawned by
+    /// [`Self::ensure_placeholder_listener`]) broadcasts each
+    /// announced `store_path_hash`; parked waiters in
+    /// [`Self::try_substitute_subscribed`] filter for theirs. One
+    /// channel, no per-hash registry to leak: a waiter that finds a
+    /// foreign hash just keeps waiting; `Lagged` is a conservative
+    /// wake (re-check now). Capacity 1024 ≫ plausible concurrent
+    /// terminal events between two polls of a single waiter.
+    raced_events: tokio::sync::broadcast::Sender<Vec<u8>>,
+    /// At-most-once spawn latch for the PG LISTEN task. Lazy (first
+    /// park) so gRPC-only processes and the unparked test majority
+    /// never hold a LISTEN connection.
+    raced_listener_started: std::sync::atomic::AtomicBool,
+    /// [`RACED_PARK_FALLBACK_POLL`], violable via
+    /// [`Self::with_raced_park`] (R17 — tests shrink it; the
+    /// violation red proves it binds).
+    raced_park_fallback: Duration,
+    /// Optional override for the DERIVED park budget
+    /// (`stall_window + 2 × fallback` when `None`). Tests pin it
+    /// (e.g. `Some(ZERO)` = the pre-subscription immediate-Raced
+    /// observable) via [`Self::with_raced_park`].
+    raced_park_budget: Option<Duration>,
     /// Test-only gate INSIDE the hash `spawn_blocking` closure: lets a
     /// test hold the detached digest task mid-flight so the W-6a
     /// reservation-residency law (budget credited back only after the
@@ -1200,11 +1249,29 @@ impl Substituter {
             tenant_ledger: TenantReservationLedger::default(),
             tenant_reservation_cap: TENANT_RESERVATION_CAP,
             claimed_by: std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".into()),
+            raced_events: tokio::sync::broadcast::channel(1024).0,
+            raced_listener_started: std::sync::atomic::AtomicBool::new(false),
+            raced_park_fallback: RACED_PARK_FALLBACK_POLL,
+            raced_park_budget: None,
             #[cfg(test)]
             hash_gate: None,
             #[cfg(test)]
             persist_gate: None,
         }
+    }
+
+    /// Override the raced-park knobs (`r[store.substitute.raced-
+    /// subscribe]`): the fallback re-poll interval and (when `Some`)
+    /// the total park budget — production derives the budget as
+    /// `stall_window + 2 × fallback`. Builder-style, the R17
+    /// violability lane: tests shrink the pair so the budget-exhaust
+    /// red runs in milliseconds, or pin the budget to `ZERO` for the
+    /// immediate-`Err(Raced)` observable the singleflight battery is
+    /// stated in.
+    pub fn with_raced_park(mut self, fallback: Duration, budget: Option<Duration>) -> Self {
+        self.raced_park_fallback = fallback;
+        self.raced_park_budget = budget;
+        self
     }
 
     /// Test-only: install the hash gate (see [`HashGate`]).
@@ -1344,6 +1411,159 @@ impl Substituter {
     ) -> Result<Option<ValidatedPathInfo>, SubstituteError> {
         self.try_substitute_inner(tenant_id, store_path, Some(progress))
             .await
+    }
+
+    // r[impl store.substitute.raced-subscribe]
+    /// [`try_substitute_with_progress`](Self::try_substitute_with_progress)
+    /// for the EXECUTOR plane (live_055(b)): a `Raced` answer parks on
+    /// the placeholder-event subscription instead of bouncing back to
+    /// the scheduler's RetryLater re-dispatch loop (the incident's 633
+    /// re-claim round-trips at ~2/s against one blocked placeholder;
+    /// post-reclaim completion was <200 ms).
+    ///
+    /// Structure (each clause load-bearing):
+    /// - **the park holds NOTHING** — each attempt runs the ordinary
+    ///   singleflight (admission permit acquired and dropped INSIDE
+    ///   the leader future), so a parked waiter consumes no permit,
+    ///   no budget, no claim, and no moka slot pinning a coalesced
+    ///   gRPC caller (the unary `QueryPathInfo`/`GetPath` plane keeps
+    ///   its fast-`Raced` → `NotFound` mapping untouched);
+    /// - **register, THEN re-check** — the broadcast receiver
+    ///   subscribes BEFORE [`placeholder_blocked`]'s row read, so a
+    ///   release landing between the raced attempt and the park is
+    ///   seen either by the re-check (loop immediately) or by the
+    ///   already-registered receiver (NOTIFY at COMMIT) — the
+    ///   lost-wakeup race is structurally dead;
+    /// - **bounded fallback poll** ([`RACED_PARK_FALLBACK_POLL`]) —
+    ///   NOTIFY is best-effort (listener reconnect gaps drop
+    ///   messages); every fallback wake re-runs the FULL claim, whose
+    ///   stall/zero-progress arms perform takeover, so a silently
+    ///   wedged holder (no terminal event to announce) is still
+    ///   reclaimed at most one interval past its takeover window;
+    /// - **typed budget** — `stall_window + 2 × fallback` (derived;
+    ///   override via [`Self::with_raced_park`]); past it the waiter
+    ///   returns `Err(Raced)` and the RetryLater plane resumes as the
+    ///   backstop, at per-budget cadence instead of per-poll.
+    #[instrument(skip(self, progress), fields(tenant = %tenant_id, path = store_path))]
+    pub async fn try_substitute_subscribed(
+        &self,
+        tenant_id: Uuid,
+        store_path: &str,
+        progress: &SubstProgressFn,
+    ) -> Result<Option<ValidatedPathInfo>, SubstituteError> {
+        let budget = self.raced_park_budget.unwrap_or(
+            self.stall_window + RACED_PARK_BUDGET_FALLBACK_SLACK * self.raced_park_fallback,
+        );
+        let parked_since = Instant::now();
+        loop {
+            let r = self
+                .try_substitute_inner(tenant_id, store_path, Some(progress))
+                .await;
+            if !matches!(r, Err(SubstituteError::Raced)) {
+                return r;
+            }
+            let remaining = budget.saturating_sub(parked_since.elapsed());
+            if remaining.is_zero() {
+                metrics::counter!(
+                    "rio_store_substitute_raced_parks_total",
+                    "wake" => "budget_exhausted"
+                )
+                .increment(1);
+                return r;
+            }
+            // The hash is the event key (announced hex-encoded by the
+            // writers). Parse failures route through do_substitute's
+            // own NarInfo arm — by the time we're Raced the path
+            // parsed, so this expect is unreachable.
+            let hash = StorePath::parse(store_path)
+                .map_err(|e| SubstituteError::NarInfo(format!("bad store path: {e}")))?
+                .sha256_digest();
+            self.ensure_placeholder_listener();
+            // Register BEFORE the re-check (the lost-wakeup kill).
+            let mut rx = self.raced_events.subscribe();
+            // A non-blocked answer re-attempts immediately; `Ok(true)`
+            // AND a read error both park (the fail-safe direction: the
+            // bounded fallback re-poll retries against a recovering PG
+            // instead of hot-looping the claim path).
+            if let Ok(false) = placeholder_blocked(&self.pool, &hash).await {
+                // Released/completed/reaped between the raced attempt
+                // and the park — re-attempt immediately.
+                metrics::counter!(
+                    "rio_store_substitute_raced_parks_total",
+                    "wake" => "recheck"
+                )
+                .increment(1);
+                continue;
+            }
+            let slice = self.raced_park_fallback.min(remaining);
+            let notified = wait_for_placeholder_event(&mut rx, &hash, slice).await;
+            metrics::counter!(
+                "rio_store_substitute_raced_parks_total",
+                "wake" => if notified { "notified" } else { "fallback" }
+            )
+            .increment(1);
+        }
+    }
+
+    /// Spawn the process-wide PG LISTEN task at most once (lazy — the
+    /// first raced park pays it; gRPC-only processes never do). The
+    /// task LISTENs on [`metadata::PLACEHOLDER_EVENTS_CHANNEL`],
+    /// decodes each hex payload, and fans it out on
+    /// [`Self::raced_events`]. Reconnects with capped backoff on any
+    /// listener error; notifications dropped during a gap are healed
+    /// by the waiters' bounded fallback poll (the subscription is a
+    /// latency optimization, never a correctness dependency).
+    fn ensure_placeholder_listener(&self) {
+        use std::sync::atomic::Ordering;
+        if self
+            .raced_listener_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let pool = self.pool.clone();
+        let tx = self.raced_events.clone();
+        tokio::spawn(async move {
+            let mut backoff = Duration::from_secs(1);
+            loop {
+                match sqlx::postgres::PgListener::connect_with(&pool).await {
+                    Ok(mut listener) => {
+                        if let Err(e) = listener.listen(metadata::PLACEHOLDER_EVENTS_CHANNEL).await
+                        {
+                            debug!(error = %e, "placeholder listener: LISTEN failed; retrying");
+                        } else {
+                            backoff = Duration::from_secs(1);
+                            loop {
+                                match listener.recv().await {
+                                    Ok(n) => {
+                                        if let Ok(hash) = hex::decode(n.payload()) {
+                                            // Send fails only with zero
+                                            // receivers — nobody parked,
+                                            // nothing to wake.
+                                            let _ = tx.send(hash);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        debug!(
+                                            error = %e,
+                                            "placeholder listener: recv failed; reconnecting \
+                                             (parked waiters heal via fallback poll)",
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "placeholder listener: connect failed; retrying");
+                    }
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
+        });
     }
 
     /// The shared capability gate both substitution legs consult
@@ -3003,6 +3223,58 @@ fn verdict_effects(
 /// for missing keys. 410: Gone. Matches CppNix `HttpBinaryCacheStore`.
 fn is_not_found(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 404 | 403 | 410)
+}
+
+// r[impl store.substitute.raced-subscribe]
+/// The parked waiter's re-check (the lost-wakeup kill's second half):
+/// is the slot still HELD — an `'uploading'` row with a live claim?
+/// All three released states answer `false`: row absent (aborted/
+/// reaped), `claim_id` NULL (released-in-place, claimable now),
+/// `status='complete'` (waiters will hit `AlreadyComplete`).
+async fn placeholder_blocked(pool: &PgPool, store_path_hash: &[u8]) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM manifests
+             WHERE store_path_hash = $1
+               AND status = 'uploading'
+               AND claim_id IS NOT NULL
+        )
+        "#,
+    )
+    .bind(store_path_hash)
+    .fetch_one(pool)
+    .await
+}
+
+/// Wait up to `slice` for a placeholder event naming `hash`. Returns
+/// `true` on a matching (or `Lagged` — conservatively treated as
+/// maybe-missed) wake, `false` on the fallback deadline. Foreign
+/// hashes keep waiting; a `Closed` channel (listener task gone —
+/// unreachable in practice, the task loops forever) degrades to the
+/// fallback deadline rather than a hot loop.
+async fn wait_for_placeholder_event(
+    rx: &mut tokio::sync::broadcast::Receiver<Vec<u8>>,
+    hash: &[u8],
+    slice: Duration,
+) -> bool {
+    use tokio::sync::broadcast::error::RecvError;
+    let deadline = tokio::time::sleep(slice);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => return false,
+            msg = rx.recv() => match msg {
+                Ok(h) if h == hash => return true,
+                Ok(_) => continue,
+                Err(RecvError::Lagged(_)) => return true,
+                Err(RecvError::Closed) => {
+                    deadline.as_mut().await;
+                    return false;
+                }
+            },
+        }
+    }
 }
 
 // r[impl store.substitute.untrusted-upstream+3]
@@ -5588,6 +5860,274 @@ mod tests {
         let got2 = sub.try_substitute(tid, &path).await.unwrap();
         let got2 = got2.expect("second call after Busy must re-run and hit (not cached None)");
         assert_eq!(got2.nar_size, nar.len() as u64);
+    }
+
+    /// [`spawn_fake_upstream`] variant that counts narinfo GETs — one
+    /// per substitution ATTEMPT (the narinfo fetch precedes the
+    /// placeholder claim), so the counter is the round-trip witness
+    /// the live_055(b) poll-count law is stated in.
+    async fn spawn_fake_upstream_counted(
+        store_path: &str,
+        nar_bytes: Vec<u8>,
+        key_name: &str,
+    ) -> (FakeUpstream, Arc<std::sync::atomic::AtomicUsize>) {
+        use axum::{Router, routing::get};
+        use base64::Engine;
+
+        let seed = [0x42u8; 32];
+        let signer = Signer::from_seed(key_name, &seed);
+        let pubkey = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
+        let trusted_key = format!(
+            "{key_name}:{}",
+            base64::engine::general_purpose::STANDARD.encode(pubkey.as_bytes())
+        );
+
+        let nar_hash: [u8; 32] = sha2::Sha256::digest(&nar_bytes).into();
+        let nar_hash_str = format!(
+            "sha256:{}",
+            rio_nix::store_path::nixbase32::encode(&nar_hash)
+        );
+        let fp = fingerprint(store_path, &nar_hash, nar_bytes.len() as u64, &[]);
+        let sig = signer.sign(&fp);
+        let sp = StorePath::parse(store_path).unwrap();
+        let hash_part = sp.hash_part();
+        let narinfo = format!(
+            "StorePath: {store_path}\n\
+             URL: nar/{hash_part}.nar\n\
+             Compression: none\n\
+             NarHash: {nar_hash_str}\n\
+             NarSize: {}\n\
+             References: \n\
+             Sig: {sig}\n",
+            nar_bytes.len()
+        );
+
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits_c = Arc::clone(&hits);
+        let narinfo_path = format!("/{hash_part}.narinfo");
+        let nar_path = format!("/nar/{hash_part}.nar");
+        let app = Router::new()
+            .route(
+                "/nix-cache-info",
+                get(|| async { "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n" }),
+            )
+            .route(
+                &narinfo_path,
+                get(move || {
+                    let narinfo = narinfo.clone();
+                    let hits = Arc::clone(&hits_c);
+                    async move {
+                        hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        narinfo
+                    }
+                }),
+            )
+            .route(&nar_path, get(move || async move { nar_bytes }));
+
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (
+            FakeUpstream {
+                url: format!("http://{addr}"),
+                trusted_key,
+                _task: task,
+            },
+            hits,
+        )
+    }
+
+    // r[verify store.substitute.raced-subscribe]
+    /// live_055(b) / W9-BL — the raced-path round-trip law: a waiter
+    /// blocked on a concurrently held placeholder completes within
+    /// TWO upstream round-trips of the holder's release (the initial
+    /// raced attempt + at most ONE post-release re-attempt). Pre-fix
+    /// the executor plane poll-raced (`Err(Raced)` → RetryLater →
+    /// re-dispatch ~seconds — 633 round-trips against one blocked
+    /// placeholder in the live_055 capture); the close subscribes the
+    /// raced path to placeholder release/completion instead.
+    ///
+    /// Count-witnessed: the narinfo GET counter is the round-trip
+    /// oracle (one GET per attempt, fetched before the claim). The
+    /// fallback poll is set to 120s so a wake within the 20s harness
+    /// timeout is structurally a NOTIFY wake, never the fallback.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn raced_waiter_completes_within_two_round_trips_of_release() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-raced-subscribe").await;
+        let (path, nar) = make_path();
+        let (fake, hits) =
+            spawn_fake_upstream_counted(&path, nar.clone(), "cache.subscribe-1").await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &fake.url,
+            50,
+            std::slice::from_ref(&fake.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        // A live concurrent holder: heartbeat-fresh placeholder whose
+        // claim survives every takeover arm (young + claimed).
+        let sp = StorePath::parse(&path).unwrap();
+        let hash = sp.sha256_digest();
+        let holder_claim =
+            metadata::insert_manifest_uploading_as(&db.pool, &hash, &path, &[], Some("holder-pod"))
+                .await
+                .unwrap()
+                .expect("placeholder inserted");
+
+        // Fallback pinned to 120s: any wake inside the 20s harness
+        // timeout is structurally a NOTIFY wake (or the post-register
+        // re-check), never the fallback poll.
+        let sub = Arc::new(
+            test_substituter(db.pool.clone()).with_raced_park(Duration::from_secs(120), None),
+        );
+
+        // The executor-plane caller: ONE subscribed call replaces the
+        // pre-fix re-claim polling (the captured red: 250ms polls
+        // against this fixture = 7 round-trips; the incident = 633).
+        let waiter = {
+            let sub = Arc::clone(&sub);
+            let path = path.clone();
+            tokio::spawn(async move {
+                let cb: Box<SubstProgressFn> = Box::new(|_, _, _| {});
+                sub.try_substitute_subscribed(tid, &path, &cb)
+                    .await
+                    .expect("subscribed substitution must succeed after release")
+                    .expect("blocked placeholder must not read as a miss")
+            })
+        };
+
+        // Let the waiter park, then release the holder's claim in
+        // place (the owner-side stall-abort shape — claim_id NULL,
+        // immediately claimable).
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let released = metadata::release_placeholder_in_place(&db.pool, &hash, holder_claim)
+            .await
+            .unwrap();
+        assert!(released, "release must apply to the held placeholder");
+
+        let info = tokio::time::timeout(Duration::from_secs(20), waiter)
+            .await
+            .expect("waiter must complete promptly after release (notify wake, not fallback)")
+            .unwrap();
+        assert_eq!(info.nar_size, nar.len() as u64);
+
+        let round_trips = hits.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            round_trips <= 2,
+            "raced waiter must complete within TWO upstream round-trips \
+             (initial raced attempt + <=1 post-release attempt); \
+             observed {round_trips} — the poll-racing shape is back"
+        );
+    }
+
+    // r[verify store.substitute.raced-subscribe]
+    /// The park-budget axis binds (R17 violation red): a holder that
+    /// never releases bounds the subscribed waiter at the typed
+    /// budget — `Err(Raced)` returns to the RetryLater backstop, and
+    /// the fallback poll DROVE re-claims while parked (each fallback
+    /// wake is a takeover-evaluating claim attempt, so a silently
+    /// wedged holder is still reclaimed without any NOTIFY). Both
+    /// axes count-witnessed: >=2 round-trips (the fallback re-claims
+    /// ran) and bounded above (the budget stopped them).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn raced_park_budget_bounds_the_wait_and_fallback_drives_reclaims() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-raced-budget").await;
+        let (path, nar) = make_path();
+        let (fake, hits) = spawn_fake_upstream_counted(&path, nar, "cache.subscribe-2").await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &fake.url,
+            50,
+            std::slice::from_ref(&fake.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        let sp = StorePath::parse(&path).unwrap();
+        let hash = sp.sha256_digest();
+        metadata::insert_manifest_uploading_as(&db.pool, &hash, &path, &[], Some("wedged-pod"))
+            .await
+            .unwrap()
+            .expect("placeholder inserted");
+
+        // fallback 100ms, budget 450ms → 1 initial + <=5 fallback
+        // re-claims, then Raced.
+        let sub = test_substituter(db.pool.clone())
+            .with_raced_park(Duration::from_millis(100), Some(Duration::from_millis(450)));
+        let cb: Box<SubstProgressFn> = Box::new(|_, _, _| {});
+        let got = tokio::time::timeout(
+            Duration::from_secs(10),
+            sub.try_substitute_subscribed(tid, &path, &cb),
+        )
+        .await
+        .expect("park must end at the budget, not hang");
+        assert!(
+            matches!(got, Err(SubstituteError::Raced)),
+            "budget exhaustion must surface Raced to the backstop, got {got:?}"
+        );
+        let round_trips = hits.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            (2..=7).contains(&round_trips),
+            "fallback re-claims must run while parked and stop at the \
+             budget (expected 2..=7 round-trips for 450ms/100ms), \
+             observed {round_trips}"
+        );
+    }
+
+    // r[verify store.substitute.raced-subscribe]
+    /// [`placeholder_blocked`] — the parked waiter's re-check decision
+    /// table over the row states: held → blocked; released-in-place
+    /// (claim_id NULL) → free; completed → free; absent → free. The
+    /// lost-wakeup kill is register-then-re-check (code order) — this
+    /// pins the re-check's DECISION so a wrong answer cannot park a
+    /// waiter against an already-free slot for a full fallback slice.
+    #[tokio::test]
+    async fn placeholder_blocked_decision_table() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let (path, _nar) = make_path();
+        let sp = StorePath::parse(&path).unwrap();
+        let hash = sp.sha256_digest();
+
+        // Absent → free.
+        assert!(!placeholder_blocked(&db.pool, &hash).await.unwrap());
+
+        // Held ('uploading' + live claim) → blocked.
+        let claim = metadata::insert_manifest_uploading_as(&db.pool, &hash, &path, &[], None)
+            .await
+            .unwrap()
+            .expect("placeholder inserted");
+        assert!(placeholder_blocked(&db.pool, &hash).await.unwrap());
+
+        // Released-in-place (claim_id NULL, row survives) → free.
+        assert!(
+            metadata::release_placeholder_in_place(&db.pool, &hash, claim)
+                .await
+                .unwrap()
+        );
+        assert!(!placeholder_blocked(&db.pool, &hash).await.unwrap());
+
+        // Completed → free (waiters re-check into AlreadyComplete).
+        sqlx::query(
+            "UPDATE manifests SET status = 'complete', claim_id = $2 WHERE store_path_hash = $1",
+        )
+        .bind(hash.as_slice())
+        .bind(claim)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        assert!(!placeholder_blocked(&db.pool, &hash).await.unwrap());
     }
 
     // r[verify store.substitute.admission+2]

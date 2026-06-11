@@ -38,6 +38,46 @@ use std::time::Duration;
 use bytes::Bytes;
 use rio_proto::validated::ValidatedPathInfo;
 
+/// PG NOTIFY channel for placeholder terminal events (live_055(b)).
+///
+/// Every transition that frees a `status='uploading'` slot announces
+/// the affected `store_path_hash` (hex) here, so raced substitution
+/// waiters subscribe instead of poll-racing:
+///
+/// - release-in-place ([`release_placeholder_in_place`]) — claim
+///   relinquished, row survives, immediately claimable;
+/// - abort/reap ([`crate::gc::orphan::reap_one`] — covers
+///   `abort_placeholder`, the drop-guard, the orphan scanner, and the
+///   hot-path stale reclaim) — row deleted, slot free;
+/// - completion ([`complete_manifest_in_conn`]) — status flipped to
+///   'complete'; waiters re-check and hit `AlreadyComplete`.
+///
+/// Transactional senders NOTIFY inside their tx (PG delivers at
+/// COMMIT, so a woken waiter's re-check always sees the new row
+/// state). Delivery is best-effort by design — the subscriber's
+/// bounded fallback poll (`r[store.substitute.raced-subscribe]`)
+/// heals NOTIFY loss (listener reconnect gaps).
+pub(crate) const PLACEHOLDER_EVENTS_CHANNEL: &str = "rio_placeholder_events";
+
+/// Announce a placeholder terminal event on
+/// [`PLACEHOLDER_EVENTS_CHANNEL`]. Callable on a pool (immediate
+/// delivery) or inside a tx (delivery at COMMIT — the ordering the
+/// waiters' re-check law relies on).
+pub(crate) async fn notify_placeholder_event<'e, E>(
+    exec: E,
+    store_path_hash: &[u8],
+) -> std::result::Result<(), sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query("SELECT pg_notify($1, encode($2, 'hex'))")
+        .bind(PLACEHOLDER_EVENTS_CHANNEL)
+        .bind(store_path_hash)
+        .execute(exec)
+        .await?;
+    Ok(())
+}
+
 mod chunked;
 mod cluster_key_history;
 mod inline;
@@ -321,6 +361,10 @@ pub(crate) async fn complete_manifest_in_conn(
             store_path: info.store_path.to_string(),
         });
     }
+    // live_055(b): announce the completion to raced waiters. Inside
+    // the caller's tx — PG delivers at COMMIT, so a woken waiter's
+    // re-check sees status='complete' (→ AlreadyComplete hit).
+    notify_placeholder_event(&mut *conn, &info.store_path_hash).await?;
     Ok(())
 }
 
