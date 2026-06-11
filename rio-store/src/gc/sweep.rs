@@ -294,7 +294,7 @@ async fn delete_swept_path(
 /// conjunct — a hold set between mark and this path's batch still
 /// protects it). See the call-site comment in [`sweep`] for the
 /// GIN/anti-join rationale.
-// r[impl store.gc.hold]
+// r[impl store.gc.hold+2]
 async fn recheck_has_live_referrer(
     tx: &mut Transaction<'_, Postgres>,
     store_path_hash: &[u8],

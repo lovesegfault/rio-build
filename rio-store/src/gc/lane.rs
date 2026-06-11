@@ -579,6 +579,130 @@ mod tests {
             .unwrap();
         assert_eq!(pending.0, 1, "the queue holds from the hold onward");
     }
+
+    // r[verify store.gc.hold-lanes]
+    // r[verify store.gc.hold+2]
+    /// W10-E (the starvation negation, merged_bug_050 commit 2): a
+    /// hold spanning k backstop periods produces ZERO deletes and
+    /// ZERO fresh collect cycles (population: the census-derived lane
+    /// set), AND the held run_gc's no-op tick STAMPS
+    /// last_live_cycle_at — a held cycle is a live cycle for
+    /// staleness purposes, so the hold itself can never make the
+    /// backstop come due (pre-fix: a held run_gc starved the stamp,
+    /// guaranteeing due-ness; the un-held backstop then minted fresh
+    /// Live cycles whose enqueued deletes the drain executed).
+    #[tokio::test]
+    async fn held_cycles_stay_live_so_the_backstop_never_fires_off_the_hold() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
+
+        // Seed the durable collect row with a STALE last_live (the
+        // backstop is due) via the production stamp + backdate.
+        let _ = crate::gc::state::backstop_due_unlocked(&db.pool, Duration::from_secs(3600)).await;
+        sqlx::query(
+            "INSERT INTO gc_collect_state (singleton, last_live_cycle_at) \
+             VALUES (TRUE, now() - interval '10 days') \
+             ON CONFLICT (singleton) DO UPDATE \
+             SET last_live_cycle_at = now() - interval '10 days'",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        assert!(
+            crate::gc::state::backstop_due_unlocked(&db.pool, Duration::from_secs(86_400))
+                .await
+                .unwrap(),
+            "precondition: the backstop is due before the hold"
+        );
+        let epoch_before: Option<i64> =
+            sqlx::query_scalar("SELECT cycle_epoch FROM gc_collect_state WHERE singleton")
+                .fetch_optional(&db.pool)
+                .await
+                .unwrap();
+
+        hold::set_hold(
+            &db.pool,
+            hold::GcHoldScope::Global,
+            "starvation freeze",
+            "w10-e",
+            None,
+        )
+        .await
+        .unwrap();
+
+        // k backstop periods elapse: k held ticks through the lane.
+        let mut body = backstop_body(db.pool.clone());
+        for k in 0..3 {
+            let outcome = DestructiveLane::tick("gc-collect-backstop", &db.pool, &mut body).await;
+            assert_eq!(
+                outcome,
+                LaneTick::SkippedHeld,
+                "backstop period {k}: the held tick must skip"
+            );
+        }
+        // Zero fresh collect cycles: the epoch never moved.
+        let epoch_after: Option<i64> =
+            sqlx::query_scalar("SELECT cycle_epoch FROM gc_collect_state WHERE singleton")
+                .fetch_optional(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            epoch_before, epoch_after,
+            "a hold spanning k backstop periods mints zero fresh cycles"
+        );
+
+        // The held run_gc tick STAMPS: drive run_gc itself (the
+        // pinned member) and assert last_live_cycle_at advanced.
+        let before: Option<i64> = sqlx::query_scalar(
+            "SELECT EXTRACT(EPOCH FROM last_live_cycle_at)::bigint \
+             FROM gc_collect_state WHERE singleton",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let stats = crate::gc::run_gc(
+            &db.pool,
+            Some(Arc::clone(&backend)),
+            crate::gc::GcParams {
+                dry_run: false,
+                grace_hours: 2,
+                extra_roots: vec![],
+            },
+            tx,
+            &rio_common::signal::Token::new(),
+        )
+        .await
+        .unwrap();
+        assert!(stats.is_none(), "held run_gc is a no-op");
+        let mut held_frame = false;
+        while let Some(m) = rx.recv().await {
+            if m.unwrap().current_path.starts_with("held:") {
+                held_frame = true;
+            }
+        }
+        assert!(held_frame, "the operator surface reports the hold");
+        let after: Option<i64> = sqlx::query_scalar(
+            "SELECT EXTRACT(EPOCH FROM last_live_cycle_at)::bigint \
+             FROM gc_collect_state WHERE singleton",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(
+            after > before,
+            "the HELD run_gc tick stamps last_live_cycle_at \
+             (a held cycle is a live cycle): {before:?} -> {after:?}"
+        );
+        // The starvation negation: the backstop-due predicate is now
+        // FALSE — the hold can never make the backstop fire.
+        assert!(
+            !crate::gc::state::backstop_due_unlocked(&db.pool, Duration::from_secs(86_400))
+                .await
+                .unwrap(),
+            "post-stamp the backstop is NOT due: the coupling is dead"
+        );
+    }
 }
 
 #[cfg(test)]

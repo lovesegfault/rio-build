@@ -51,11 +51,16 @@
 /// The GC-hold control (round-9 WO-S1-4, signed Q3: "GC-hold as a
 /// first-class operator control — tonight's freeze was scale-to-0").
 ///
-/// A typed, persisted hold that mark/sweep consult: a GLOBAL hold
-/// makes `run_gc` a no-op before mark; a TENANT hold makes the held
-/// tenant's registered paths reachable regardless of their retention
-/// window (seed (f) + the sweep re-check gain the conjunct). Holds are
-/// RELEASED, never deleted — the hold history is audit evidence.
+/// A typed, persisted hold every destructive actor consults: a
+/// GLOBAL hold suspends EVERY destructive lane — `run_gc` (no-op
+/// before mark, held tick stamped live) plus the whole
+/// census-derived lane set via the [`crate::gc::lane::DestructiveLane`]
+/// per-tick consult and the demand-driven reap face
+/// (merged_bug_050; `store.gc.hold-lanes`). A TENANT hold makes the
+/// held tenant's registered paths reachable regardless of their
+/// retention window (seed (f) + the sweep re-check gain the
+/// conjunct). Holds are RELEASED, never deleted — the hold history
+/// is audit evidence.
 ///
 /// R17 axes, priced: `scope` ∈ {global, tenant} (CHECK-paired with
 /// `tenant_id`); mandatory `reason` + `created_by`; `expires_at`
@@ -70,7 +75,11 @@
 /// documented interim procedure in `store.typ`); the wire verb rides
 /// the next proto-granted slot. The ENFORCEMENT — the signed
 /// invariant's substance — is total here regardless of which surface
-/// sets the row.
+/// sets the row, where "total" is machine-backed (R23′): the
+/// destructive-lane census (`gc/lane.rs`,
+/// `gensets/destructive-lane-census.txt`) derives the suspended
+/// population from the spawn-periodic family × the
+/// reaches-delete-sink predicate, with `run_gc` pinned.
 pub mod hold {
     use sqlx::PgPool;
     use uuid::Uuid;
@@ -78,7 +87,16 @@ pub mod hold {
     /// The typed hold scope (the closed axis; no wildcard consumers).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum GcHoldScope {
-        /// Suspend ALL collection (mark, sweep, chunk-collect).
+        /// Suspend ALL collection — where ALL is machine-backed
+        /// (R23′): the census-derived destructive-lane set (the
+        /// spawn-periodic family scan × reaches-delete-sink in
+        /// `gc/lane.rs::census::destructive_lane_census`, committed
+        /// at `rio-store/tests/gensets/destructive-lane-census.txt`)
+        /// ∪ {run_gc} pinned — run_gc's mark/sweep/chunk-collect
+        /// pass, the chunk-collect backstop, the s3-delete drain,
+        /// the log TTL sweep, the gc-orphan-scanner, and the
+        /// demand-driven claim-reap face, each consulting fail-closed
+        /// per tick (`store.gc.hold-lanes`).
         Global,
         /// Pin one tenant's registered paths as reachable.
         Tenant(Uuid),
@@ -95,7 +113,7 @@ pub mod hold {
     /// Set a hold. `expires_at_secs` = None is an UNBOUNDED hold — the
     /// operator's explicit decision, recorded in the row. Returns the
     /// hold id (the release handle).
-    // r[impl store.gc.hold]
+    // r[impl store.gc.hold+2]
     pub async fn set_hold(
         pool: &PgPool,
         scope: GcHoldScope,
@@ -127,7 +145,7 @@ pub mod hold {
 
     /// Release a hold (the heal edge). Idempotent: releasing a released
     /// or unknown hold affects zero rows and returns false.
-    // r[impl store.gc.hold]
+    // r[impl store.gc.hold+2]
     pub async fn release_hold(pool: &PgPool, hold_id: Uuid) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
             "UPDATE gc_holds SET released_at = now() \
@@ -190,7 +208,7 @@ pub mod hold {
     }
 
     /// The first active GLOBAL hold, if any — `run_gc`'s entry consult.
-    // r[impl store.gc.hold]
+    // r[impl store.gc.hold+2]
     pub async fn active_global_hold(pool: &PgPool) -> Result<Option<ActiveHold>, sqlx::Error> {
         sqlx::query_as(concat!(
             "SELECT hold_id, reason, created_by FROM gc_holds ",
@@ -429,7 +447,7 @@ pub async fn run_gc(
     };
 
     // --- Global-hold consult (round-9 WO-S1-4, signed Q3) ---
-    // r[impl store.gc.hold]
+    // r[impl store.gc.hold+2]
     // A FIRST-CLASS operator hold replaces the freeze-by-scale-to-0
     // workaround: an active GLOBAL hold makes the whole collection
     // pass (mark, sweep, chunk-collect) a no-op — consulted once at
@@ -455,6 +473,18 @@ pub async fn run_gc(
                 "lane" => "run_gc", "cause" => "held"
             )
             .increment(1);
+            // r[impl store.gc.hold-lanes]
+            // The starvation coupling dies HERE (merged_bug_050): a
+            // held cycle is a live cycle for staleness purposes —
+            // stamping keeps the backstop's due-ness clock quiet so
+            // the hold itself can never make the backstop fire (and
+            // the stalled alert stays silent through the freeze).
+            // Best-effort: a failed stamp degrades to the pre-fix
+            // due-ness shape, which the lane wrapper now skips
+            // anyway — defense in depth, not a correctness edge.
+            if let Err(e) = state::stamp_held_cycle(pool).await {
+                warn!(error = %e, "GC: held-cycle stamp failed (lane wrapper still suspends)");
+            }
             let _ = progress_tx
                 .send(Ok(GcProgress {
                     paths_scanned: 0,
@@ -1619,7 +1649,7 @@ mod registration_evidence_tests {
     /// no-op (sweep included); hold released ⇒ the NEXT pass proceeds.
     /// Both directions through the production control API (the heal
     /// edge witnessed per T2).
-    // r[verify store.gc.hold]
+    // r[verify store.gc.hold+2]
     #[tokio::test]
     async fn global_hold_suspends_and_release_heals() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -1663,7 +1693,7 @@ mod registration_evidence_tests {
 
     /// W9-J tenant face — a tenant-scoped hold pins the held tenant's
     /// registered paths past their retention window; release heals.
-    // r[verify store.gc.hold]
+    // r[verify store.gc.hold+2]
     #[tokio::test]
     async fn tenant_hold_pins_registered_paths() {
         let db = TestDb::new(&crate::MIGRATOR).await;

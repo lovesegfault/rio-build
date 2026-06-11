@@ -55,7 +55,7 @@ use sqlx::PgPool;
 // registered paths past their retention window — reachability only
 // ever widens. The activity predicate has ONE author
 // (`hold::active_hold_predicate!`), spliced at compile time.
-// r[impl store.gc.hold]
+// r[impl store.gc.hold+2]
 const COMPUTE_UNREACHABLE_SQL: &str = concat!(
     r#"
 WITH RECURSIVE reachable(store_path) AS (

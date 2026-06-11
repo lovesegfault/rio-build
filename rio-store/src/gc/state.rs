@@ -375,6 +375,30 @@ pub(crate) async fn commit_foreign_for_test(
     Ok(rows)
 }
 
+// r[impl store.gc.hold-lanes]
+/// Stamp `last_live_cycle_at` from a HELD `run_gc` tick
+/// (merged_bug_050): a held cycle is a LIVE cycle for staleness
+/// purposes — the operator deliberately suspended collection, so
+/// retention is HELD, not stalled. Without this stamp a long hold
+/// starves the staleness clock, which pre-fix GUARANTEED the
+/// (then-unconsulted) backstop came due and minted fresh Live
+/// collect cycles during the freeze; post-fix the lane wrapper skips
+/// those ticks, and this stamp kills the due-ness accumulation at
+/// its root — the `RioStoreGcCollectStalled` alert stays quiet
+/// through the freeze and release is not followed by a thundering
+/// catch-up cycle. Does NOT bump `cycle_epoch` (nothing was
+/// collected); a missing singleton row is a no-op (a cluster that
+/// never ran a cycle has no staleness clock to keep).
+pub(crate) async fn stamp_held_cycle(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE gc_collect_state SET last_live_cycle_at = now(), updated_at = now() \
+         WHERE singleton",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Test-only production-statement router (Q1 witness provenance): the
 /// sibling-stamp red drives a FOREIGN holder's `stamp_attempt` through
 /// the SAME statement production uses — the lock-free dead-session

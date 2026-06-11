@@ -1808,15 +1808,20 @@ wrong-tenant-revival leak (#rref("store.gc.sweep-path-tenants+1")) and keeps
 every live reader's semantics untouched. The tombstones are history, consulted
 by operators and backfills, never by visibility or retention.
 
-#r("store.gc.hold")[
+#r("store.gc.hold+2")[
   The store MUST honor a typed, persisted GC hold (the `gc_holds` table,
-  migration 103): an active global-scope hold makes the whole collection pass
-  (mark, sweep, chunk-collect) a no-op before mark runs, and an active
-  tenant-scope hold makes the held tenant's registered paths reachable in the
-  mark seed and the sweep re-check regardless of their retention window. A
-  hold is active while it is unreleased and unexpired; `expires_at` NULL is an
-  unbounded hold --- an explicit operator decision recorded in the row. An
-  unreadable hold table MUST fail the collection pass closed.
+  migration 103): an active global-scope hold suspends EVERY destructive
+  lane (#rref("store.gc.hold-lanes") --- the census-derived lane set, not
+  just the collection pass): `run_gc` is a no-op before mark whose HELD
+  tick still stamps `last_live_cycle_at` (a held cycle is a live cycle for
+  staleness purposes, so the hold itself can never make the backstop come
+  due or trip the stalled alert), and the periodic delete lanes skip their
+  ticks. An active tenant-scope hold makes the held tenant's registered
+  paths reachable in the mark seed and the sweep re-check regardless of
+  their retention window. A hold is active while it is unreleased and
+  unexpired; `expires_at` NULL is an unbounded hold --- an explicit
+  operator decision recorded in the row. An unreadable hold table MUST
+  fail every consult closed.
 ]
 The hold replaces the freeze-by-scale-to-0 workaround (the signed Q3 record).
 Interim operator surface: the typed in-crate API (`gc::hold`) plus any PG
@@ -1824,6 +1829,36 @@ session (`INSERT INTO gc_holds (scope, reason, created_by) VALUES ('global',
 ..., ...)`; release via `UPDATE gc_holds SET released_at = now() WHERE hold_id
 = ...`); a wire admin verb rides the next proto-granted slot --- this wave's
 proto partition grants the store none (recorded divergence, never silent).
+
+#r("store.gc.hold-lanes")[
+  During an active global hold, NO lane with delete authority may execute a
+  destructive act: every destructive lane MUST consult the active-hold
+  predicate FAIL-CLOSED at each tick before any destructive work (a consult
+  error is a skip, never a bypass), and lane membership MUST be
+  machine-derived --- the census over the spawn-periodic family
+  (`spawn_periodic` + `spawn_periodic_with` call sites) intersected with the
+  reaches-delete-sink predicate (`DELETE FROM` / `delete_by_key` /
+  `pending_s3_deletes` enqueue, transitive), union `run_gc` pinned --- never
+  author-enumerated. Periodic registration is the `DestructiveLane` wrapper
+  (the only way to register a deleting periodic lane); the per-tick
+  `HoldClearance` capability is demanded by the named delete sinks
+  (`reap_one`, `drain_once`, `collect_cycle`), and demand-driven delete
+  callers consult at call time (`reap_one_consulted`). An in-flight
+  destructive batch at hold-start completes-or-aborts within
+  `DESTRUCTIVE_BATCH_DRAIN_BOUND` (one drain cadence) and the next batch
+  never starts; the drain lane HOLDS its queue (`pending_s3_deletes` rows
+  age, never execute).
+]
+Wave-9 shipped the hold consulted at exactly one entry (`run_gc`) while four
+sibling lanes kept deleting during the freeze --- and the held `run_gc`
+starving `last_live_cycle_at` GUARANTEED the backstop fired (merged_bug_050,
+HIGH). The lane census (`gc/lane.rs`, committed at
+`rio-store/tests/gensets/destructive-lane-census.txt`) is the load-bearing
+population totality: the author-enumerated four-lane list this close first
+carried was the round-6 closure-set defect recurring inside a high close ---
+the gc-orphan-scanner (the fifth lane) hid from it; a sixth cannot hide from
+the family scan. Enforcement tiers, stated honestly (R24): the clearance
+type compile-seals the named sinks; the census holds the population.
 
 #r("store.gc.sweep-cycle-reclaim")[
   The sweep-phase reference re-check MUST exclude referrers that are themselves
