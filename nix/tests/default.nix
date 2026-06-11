@@ -591,7 +591,7 @@ in
   # end-to-end: the build's /nix/store stack (overlay over the per-build
   # castore mount, fed by the mountd fd handoff in the load-bearing
   # order — a wrong order deadlocks the cold build).
-  # r[verify builder.fs.castore-stack]
+  # r[verify builder.fs.castore-stack+1]
   # r[verify builder.fs.fd-handoff-ordering]
   # r[verify builder.overlay.castore-lower]
   vm-castore-e2e = castore-e2e {

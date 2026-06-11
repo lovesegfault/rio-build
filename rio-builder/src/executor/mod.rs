@@ -935,7 +935,7 @@ pub async fn execute_build(
         //
         // The mountd-facing id is the drv's store hash, NOT the full
         // sanitized `build_id` — see `mountd_build_id`.
-        // r[impl builder.fs.castore-stack]
+        // r[impl builder.fs.castore-stack+1]
         // r[impl builder.fs.fd-handoff-ordering]
         let castore_settings = env.castore.clone();
         let castore_build_id = mountd_build_id(drv_path);
