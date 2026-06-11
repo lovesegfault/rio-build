@@ -537,10 +537,22 @@ async fn fill_from_chunks(
 /// Content verification is mountd's job (`PromoteChunks` re-hashes
 /// before the entry becomes visible, and the directory is read-only to
 /// builders); the whole-file digest at fill-complete is the final gate.
+/// `O_NOFOLLOW` is defense-in-depth: the chunk-cache parents are
+/// root-owned 0755, so only root could plant a symlink here — a leaf
+/// entry is never legitimately one, and refusing it falls back to the
+/// remote path like any other miss.
 fn read_local_chunk(chunks_dir: &Path, meta: &ChunkMeta) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
     let hex = hex::encode(&meta.digest);
     let path = chunks_dir.join(&hex[..2]).join(&hex);
-    let data = std::fs::read(&path).ok()?;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(&path)
+        .ok()?;
+    let mut data = Vec::new();
+    file.read_to_end(&mut data).ok()?;
     (data.len() as u64 == meta.size).then_some(data)
 }
 
@@ -550,6 +562,11 @@ fn read_local_chunk(chunks_dir: &Path, meta: &ChunkMeta) -> Option<Vec<u8>> {
 /// the staging dir holds one tenant's build inputs and only mountd
 /// (root) needs to read them back. Best-effort: a failed staging write
 /// only costs the cross-build dedup for that chunk.
+///
+/// `create_new` like the `.partial` staging path: the staging dir is
+/// per-build 0700 and only this process writes it, so an existing
+/// entry means the same chunk was staged twice — a bug worth surfacing
+/// loudly, not silently truncating over.
 fn stage_chunks(staging_dir: &Path, misses: &[&ChunkMeta], fetched: &HashMap<Vec<u8>, Vec<u8>>) {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -561,13 +578,18 @@ fn stage_chunks(staging_dir: &Path, misses: &[&ChunkMeta], fetched: &HashMap<Vec
         let path = dir.join(hex::encode(&meta.digest));
         let written = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(&path)
             .and_then(|mut f| f.write_all(data));
-        if let Err(e) = written {
-            tracing::debug!(path = %path.display(), error = %e, "chunk staging write failed");
+        match written {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                tracing::warn!(path = %path.display(), "chunk staged twice; keeping existing entry");
+            }
+            Err(e) => {
+                tracing::debug!(path = %path.display(), error = %e, "chunk staging write failed");
+            }
         }
     }
 }
@@ -1352,6 +1374,48 @@ mod tests {
         assert!(
             circuit.is_open(),
             "the abandoned fill must report a failure so a claimed half-open probe is released"
+        );
+    }
+
+    /// `stage_chunks` exclusively creates each entry: a colliding name
+    /// keeps the existing bytes instead of truncating over them, and
+    /// the chunks that don't collide are still staged.
+    #[test]
+    fn stage_chunks_does_not_overwrite_existing_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("chunks");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let existing = chunk_bytes(1, 64);
+        let fresh = chunk_bytes(2, 64);
+        let metas: Vec<ChunkMeta> = [&existing, &fresh]
+            .iter()
+            .map(|d| ChunkMeta {
+                digest: blake3::hash(d).as_bytes().to_vec(),
+                size: d.len() as u64,
+            })
+            .collect();
+        let fetched: HashMap<Vec<u8>, Vec<u8>> = [
+            (metas[0].digest.clone(), existing.clone()),
+            (metas[1].digest.clone(), fresh.clone()),
+        ]
+        .into();
+        // Pre-stage the first chunk with different bytes so an
+        // overwrite (or truncate) is detectable.
+        let pre_staged = vec![0xEE; 16];
+        std::fs::write(dir.join(hex::encode(&metas[0].digest)), &pre_staged).unwrap();
+
+        stage_chunks(tmp.path(), &metas.iter().collect::<Vec<_>>(), &fetched);
+
+        assert_eq!(
+            std::fs::read(dir.join(hex::encode(&metas[0].digest))).unwrap(),
+            pre_staged,
+            "an existing staged entry must not be overwritten or truncated"
+        );
+        assert_eq!(
+            std::fs::read(dir.join(hex::encode(&metas[1].digest))).unwrap(),
+            fresh,
+            "a non-colliding chunk is still staged"
         );
     }
 }
