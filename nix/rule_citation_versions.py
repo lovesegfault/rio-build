@@ -67,6 +67,13 @@ SCAN_SUFFIXES = {
     ".yml",
     ".qnt",
 }
+# Exclusion semantics are PATH-COMPONENT, not substring (merged_bug_001
+# hole 2: substring matching silently excluded
+# rio-builder/src/runtime/result.rs via "result", every
+# fuzz/*/fuzz_targets/ file via "target", and the whole .github/ tree
+# via ".git"). An entry WITHOUT "/" must equal a whole path component;
+# an entry WITH "/" is a repo-relative path prefix (exact file or
+# directory subtree).
 EXCLUDE_PARTS = {
     ".git",
     "target",
@@ -91,11 +98,29 @@ EXCLUDE_PARTS = {
     "CLAUDE.md",
 }
 
+
+def excluded(rel: str) -> bool:
+    parts = rel.split("/")
+    for e in EXCLUDE_PARTS:
+        if "/" in e:
+            if rel == e or rel.startswith(e + "/"):
+                return True
+        elif e in parts:
+            return True
+    return False
+
+
 MINT_RE = re.compile(r'#r\(\s*"([a-z][a-z0-9_.+-]*)"')
 # A dotted rule-shaped token: >=3 dot-separated lowercase segments,
 # optional +N version suffix, hard word boundaries on both sides.
+# The version alternative carries its OWN trailing guard (merged_bug_001
+# hole 1): a versioned cite is closed by anything but [\w+] — sentence
+# punctuation included — so `id+3.` matches VERSIONED instead of
+# backtracking to an exempt bare match of `id`. The bare alternative
+# keeps the hard guard (`.`/`-`/`+` continue a longer token).
 TOKEN_RE = re.compile(
-    r"(?<![\w.+-])([a-z][a-z0-9_-]*(?:\.[a-z0-9_-]+){2,})(\+\d+)?(?![\w.-])"
+    r"(?<![\w.+-])([a-z][a-z0-9_-]*(?:\.[a-z0-9_-]+){2,})"
+    r"(?:(\+\d+)(?![\w+])|(?![\w.+-]))"
 )
 
 
@@ -159,7 +184,7 @@ def scan_tree(root: Path, defined: dict):
         if not f.is_file() or f.suffix not in SCAN_SUFFIXES:
             continue
         rel = f.relative_to(root).as_posix()
-        if any(part in rel for part in EXCLUDE_PARTS):
+        if excluded(rel):
             continue
         try:
             text = f.read_text(encoding="utf-8")
@@ -217,6 +242,37 @@ def scan_tree(root: Path, defined: dict):
 def self_test():
     import tempfile
 
+    # --- the token grammar's own productions (R22′: the corpus rows
+    # derive from TOKEN_RE's alternation arms — bare vs versioned —
+    # crossed with the adjacency contexts each trailing guard owns;
+    # adding an arm to TOKEN_RE without a row here is a review
+    # surface, not a silent gap) -----------------------------------
+    productions = [
+        # (arm, specimen, expect: None | (base, version-or-None))
+        ("bare/clean", "see dom.area.rule here", ("dom.area.rule", None)),
+        ("bare/longer-token", "dom.area.rule.extra x", ("dom.area.rule.extra", None)),
+        ("versioned/clean", "see dom.area.rule+2 here", ("dom.area.rule", 2)),
+        # merged_bug_001 hole 1 (the adjacency axis): sentence
+        # punctuation after the version token — the old single guard
+        # backtracked this to an EXEMPT BARE match.
+        ("versioned/punctuation", "see dom.area.rule+2.", ("dom.area.rule", 2)),
+        ("versioned/comma", "per dom.area.rule+10, then", ("dom.area.rule", 10)),
+        ("versioned/bracket", "r[verify dom.area.rule+2]", ("dom.area.rule", 2)),
+        # Non-version trailing `+<alpha>` is not a citation; a bare
+        # match here would be the same downgrade hole.
+        ("versioned/alpha-tail", "dom.area.rule+2x", None),
+        ("bare/two-segments", "dom.area only", None),
+    ]
+    for arm, specimen, want in productions:
+        m = TOKEN_RE.search(specimen)
+        if want is None:
+            assert m is None, f"grammar arm {arm}: unexpected match {m and m.groups()}"
+        else:
+            base, ver = want
+            assert m is not None, f"grammar arm {arm}: no match"
+            got_ver = int(m.group(2)[1:]) if m.group(2) else None
+            assert (m.group(1), got_ver) == (base, ver), f"grammar arm {arm}: {m.groups()}"
+
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         spec = root / "docs" / "spec"
@@ -234,6 +290,12 @@ def self_test():
             ("g.nix", "# r[verify dom.area.rule+2]\n", False),  # exact marker
             ("h.rs", "// r[impl dom.area.rule]\n", False),  # tracey-scanned marker: tracey's domain
             ("i.rs", "// per dom.area.rule+1 above\n", True),  # scanned tier, stale versioned prose
+            # The adjacency plants at the SCAN layer (hole 1): a stale
+            # versioned cite right before sentence punctuation must
+            # fail — red against the old regex, which read it as an
+            # exempt bare mention; the exact sibling must pass.
+            ("j.nix", "# see dom.area.rule+1.\n", True),
+            ("k.nix", "# see dom.area.rule+2.\n", False),
         ]
         for name, body, must_fail in cases:
             (root / name).write_text(body)
@@ -241,6 +303,36 @@ def self_test():
             failed = any(name in v for v in got)
             assert failed == must_fail, f"self-test arm for {name}: {got}"
             (root / name).unlink()
+        # Path-scope plants (hole 2): a stale cite in a live file whose
+        # path merely CONTAINS an excluded substring must be scanned —
+        # red against the old substring semantics for all three
+        # shipped escapes (runtime/result.rs, fuzz_targets/, .github/)
+        # — while a true excluded COMPONENT/prefix stays excluded.
+        scoped = [
+            ("runtime/result.rs", "// per dom.area.rule+1 above\n", True),
+            ("fuzz/fuzz_targets/wire.rs", "// per dom.area.rule+1\n", True),
+            (".github/workflows/ci.yaml", "# per dom.area.rule+1\n", True),
+            ("target/debug/gen.rs", "// per dom.area.rule+1\n", False),
+            ("docs/gen/snippet.md", "per dom.area.rule+1\n", False),
+        ]
+        for relname, body, must_fail in scoped:
+            p = root / relname
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(body)
+            got = scan_tree(root, defined)
+            failed = any(relname in v for v in got)
+            assert failed == must_fail, f"path-scope arm for {relname}: {got}"
+            p.unlink()
+        # Error-lane plants (hole 3): a duplicate mint is DETECTED, and
+        # both its one-colon error format and a path:line violation go
+        # through the grandfather keyer without crashing (the old
+        # 3-way split raised ValueError, burying the diagnostic).
+        (spec / "y.typ").write_text('#r("dom.area.rule+3")[body]\n')
+        _, errs = collect_defined(spec)
+        assert errs and "duplicate mint" in errs[0], f"duplicate mint not detected: {errs}"
+        assert grandfather_key(errs[0]) == errs[0].strip(), "error-format key not tolerant"
+        assert "\t" in grandfather_key("a/b.nix:12: stale rule citation `x` — y"), "violation key shape"
+        (spec / "y.typ").unlink()
 
 
 GRANDFATHER = "nix/rule-citation-grandfather.txt"
@@ -250,7 +342,14 @@ def grandfather_key(violation: str) -> str:
     # path:line: message → content-keyed `path<TAB>message-tail` so
     # line drift evicts nothing while editing the cited line evicts
     # the entry (the census_enrollment.py burn-down semantics).
-    path, _lineno, msg = violation.split(":", 2)
+    # TOLERANT split (merged_bug_001 hole 3): a violation without the
+    # path:line:message shape (the duplicate-mint error format has one
+    # colon) keys as its own full text instead of crashing the keyer —
+    # check mode and --mint-grandfather both stay diagnostic-bearing.
+    parts = violation.split(":", 2)
+    if len(parts) < 3:
+        return violation.strip()
+    path, _lineno, msg = parts
     return f"{path}\t{msg.strip()}"
 
 
@@ -274,7 +373,21 @@ def main():
     if not defined:
         print("setup: zero rules parsed from docs/spec — extractor rotted", file=sys.stderr)
         return 2
-    violations = errors + scan_tree(root, defined)
+    # Duplicate-mint errors are SPEC defects, not citations: they are
+    # surfaced as diagnostics and fail both modes directly — never
+    # grandfathered, never run through the citation keyer
+    # (merged_bug_001 hole 3: the one-colon error format crashed the
+    # 3-way split, burying the diagnostic under a traceback).
+    if errors:
+        for e in errors:
+            print(f"DUPLICATE MINT: {e}", file=sys.stderr)
+        print(
+            f"\n{len(errors)} duplicate rule mint(s) in docs/spec — resolve the "
+            "spec before citations can be adjudicated.",
+            file=sys.stderr,
+        )
+        return 1
+    violations = scan_tree(root, defined)
 
     gf_path = root / GRANDFATHER
     if mint:
