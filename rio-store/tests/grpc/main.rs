@@ -169,6 +169,7 @@ pub async fn put_path_with_header(
     tx.send(PutPathRequest {
         msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
             info: Some(info),
+            declared_nar_size: 0,
         })),
     })
     .await
@@ -208,6 +209,7 @@ pub async fn put_path_with_token(
     tx.send(PutPathRequest {
         msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
             info: Some(info),
+            declared_nar_size: 0,
         })),
     })
     .await

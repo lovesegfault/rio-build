@@ -534,6 +534,7 @@ async fn test_put_path_client_disconnect_releases_placeholder() -> TestResult {
         tx.send(PutPathRequest {
             msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
                 info: Some(raw_info),
+                declared_nar_size: 0,
             })),
         })
         .await
@@ -685,6 +686,7 @@ async fn test_put_path_rejects_duplicate_metadata() -> TestResult {
     tx.send(PutPathRequest {
         msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
             info: Some(raw.clone()),
+            declared_nar_size: 0,
         })),
     })
     .await?;
@@ -692,6 +694,7 @@ async fn test_put_path_rejects_duplicate_metadata() -> TestResult {
     tx.send(PutPathRequest {
         msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
             info: Some(raw),
+            declared_nar_size: 0,
         })),
     })
     .await?;
@@ -1007,6 +1010,7 @@ async fn accumulate_chunk_rejects_empty() -> TestResult {
     tx.send(PutPathRequest {
         msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
             info: Some(info),
+            declared_nar_size: 0,
         })),
     })
     .await

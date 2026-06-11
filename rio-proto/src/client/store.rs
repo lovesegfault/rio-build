@@ -238,6 +238,11 @@ pub fn chunk_nar_for_put(
     let metadata = PutPathRequest {
         msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
             info: Some(raw),
+            // Trailer mode in THIS commit (read-side-first wire
+            // evolution): the store's reservation-mode reader lands
+            // before any sender declares. The buffered copy path
+            // adopts declared mode in the follow-up commit.
+            declared_nar_size: 0,
         })),
     };
 

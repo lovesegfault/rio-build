@@ -102,6 +102,7 @@ uint32 batch_size = 1;
 uint32 output_index = 1;
 uint32 size = 2;
 uint64 bytes_freed = 3;
+uint64 declared_nar_size = 2;
 uint64 disk_total_bytes = 5;
 uint64 disk_used_bytes = 4;
 uint64 memory_total_bytes = 3;

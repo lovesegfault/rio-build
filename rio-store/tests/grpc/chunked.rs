@@ -923,6 +923,7 @@ async fn send_batch_output(
         inner: Some(PutPathRequest {
             msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
                 info: Some(info),
+                declared_nar_size: 0,
             })),
         }),
     })
@@ -1203,6 +1204,7 @@ mod bw8s1_budget {
         tx.try_send(PutPathRequest {
             msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
                 info: Some(info),
+                declared_nar_size: 0,
             })),
         })
         .expect("fresh channel");
@@ -1583,6 +1585,7 @@ mod bw8s1_budget {
             inner: Some(PutPathRequest {
                 msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
                     info: Some(info),
+                    declared_nar_size: 0,
                 })),
             }),
         })
@@ -1787,6 +1790,7 @@ mod bw9s5_tiling {
             tx.send(PutPathRequest {
                 msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
                     info: Some(info),
+                    declared_nar_size: 0,
                 })),
             })
             .await

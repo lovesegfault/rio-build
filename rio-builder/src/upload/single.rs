@@ -252,6 +252,10 @@ async fn do_upload_streaming(
     tx.send(PutPathRequest {
         msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
             info: Some(info),
+            // The builder is a single-pass tee — it cannot know the
+            // size before streaming. Trailer mode BY DESIGN,
+            // permanently (the N1 capability boundary).
+            declared_nar_size: 0,
         })),
     })
     .await

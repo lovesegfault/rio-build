@@ -97,6 +97,26 @@ message PutPathMetadata {
   // Path metadata (references, etc.). `nar_hash` and `nar_size` MUST be
   // empty/zero — the store rejects them if set. Real values go in the trailer.
   PathInfo info = 1;
+  // OPT-IN declared NAR size (N1, declared-mode PutPath). 0 = absent =
+  // today's trailer mode, byte-for-byte (0 is never a valid NAR size, so
+  // proto3 zero-as-absent is unambiguous; no version bridge — the --wipe
+  // rollout posture).
+  //
+  // Opt-in BY CAPABILITY, not by version: the builder is a single-pass
+  // tee that cannot know the size before streaming — it stays trailer-
+  // mode BY DESIGN. Senders that HAVE the size (the gateway's buffered
+  // copy path; size-known reader streams) declare it and get
+  // reservation-mode ingest: the store reserves the WHOLE NAR budget in
+  // ONE pre-stream acquisition (park free, then hold under one envelope
+  // — zero hold-and-wait) instead of charging chunk-by-chunk while
+  // already holding.
+  //
+  // The declaration is a BINDING BOUND, not a hint: chunks exceeding it
+  // refuse mid-stream at the bound; the (still MANDATORY) trailer's
+  // nar_size must equal it; a short stream refuses at commit. Single
+  // PutPath only — PutPathBatch rejects a set value (fail-closed; the
+  // batch plane's senders are trailer-capability today).
+  uint64 declared_nar_size = 2;
 }
 
 // Finalizes a PutPath upload. MUST be the last message.

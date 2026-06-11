@@ -355,7 +355,12 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
     raw.nar_size = 0;
     tx.send(types::PutPathRequest {
         msg: Some(types::put_path_request::Msg::Metadata(
-            types::PutPathMetadata { info: Some(raw) },
+            types::PutPathMetadata {
+                info: Some(raw),
+                // Trailer mode this commit (read-side-first): the
+                // reader lands before this size-known stream declares.
+                declared_nar_size: 0,
+            },
         )),
     })
     .await

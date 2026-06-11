@@ -433,6 +433,7 @@ async fn hmac_is_ca_wrong_path_leaves_no_placeholder() -> TestResult {
     atx.send(PutPathRequest {
         msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
             info: Some(bogus_info),
+            declared_nar_size: 0,
         })),
     })
     .await
@@ -527,6 +528,7 @@ async fn hmac_is_ca_batch_wrong_path_rejected() -> TestResult {
     };
     tx.send(wrap(put_path_request::Msg::Metadata(PutPathMetadata {
         info: Some(info),
+        declared_nar_size: 0,
     })))
     .await
     .unwrap();
@@ -822,6 +824,7 @@ async fn hmac_store_path_hash_mismatch_ignored() -> TestResult {
     tx.send(PutPathRequest {
         msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
             info: Some(raw),
+            declared_nar_size: 0,
         })),
     })
     .await

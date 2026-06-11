@@ -78,6 +78,12 @@ pub(super) async fn upload_outputs_batch(
                 inner: Some(PutPathRequest {
                     msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
                         info: Some(info),
+                        // The builder is a single-pass tee — it cannot
+                        // know the size before streaming. Trailer mode
+                        // BY DESIGN, permanently (the N1 capability
+                        // boundary; batch additionally rejects a set
+                        // value server-side).
+                        declared_nar_size: 0,
                     })),
                 }),
             })

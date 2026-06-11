@@ -22,6 +22,7 @@ async fn put_path_trailer_mode(
     tx.send(PutPathRequest {
         msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
             info: Some(info_without_hash),
+            declared_nar_size: 0,
         })),
     })
     .await
@@ -57,6 +58,7 @@ async fn test_metadata_with_hash_rejected() -> TestResult {
     tx.send(PutPathRequest {
         msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
             info: Some(raw),
+            declared_nar_size: 0,
         })),
     })
     .await
@@ -178,6 +180,7 @@ async fn test_trailer_mode_missing_trailer_rejected() -> TestResult {
     tx.send(PutPathRequest {
         msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
             info: Some(raw),
+            declared_nar_size: 0,
         })),
     })
     .await
@@ -248,6 +251,7 @@ async fn test_trailer_chunk_after_trailer_rejected() -> TestResult {
     tx.send(PutPathRequest {
         msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
             info: Some(raw),
+            declared_nar_size: 0,
         })),
     })
     .await
@@ -301,6 +305,7 @@ async fn test_trailer_duplicate_trailer_rejected() -> TestResult {
     tx.send(PutPathRequest {
         msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
             info: Some(raw),
+            declared_nar_size: 0,
         })),
     })
     .await
