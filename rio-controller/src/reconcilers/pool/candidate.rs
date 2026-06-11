@@ -667,11 +667,135 @@ fn respawn_backoff(deaths: u32) -> std::time::Duration {
 /// retain law lives in [`Self::step`].
 #[derive(Debug, Default)]
 pub struct PoolStreaks {
-    /// `(pool, intent) -> entry`; see [`StreakEntry`].
-    entries: std::collections::HashMap<(PoolKey, String), StreakEntry>,
+    /// `(pool, intent) -> entry` on the SEALED ledger; see
+    /// [`StreakEntry`] and [`PoolScopedLedger`] (merged_bug_140).
+    entries: PoolScopedLedger<StreakEntry>,
     /// `(pool, intent) -> verdict-free-respawn record` (the futility
-    /// breaker); see [`RespawnEntry`].
-    respawn: std::collections::HashMap<(PoolKey, String), RespawnEntry>,
+    /// breaker) on the SEALED ledger; see [`RespawnEntry`].
+    respawn: PoolScopedLedger<RespawnEntry>,
+}
+
+/// Round-10 merged_bug_140 (R24 — LAWS BY CONSTRUCTION): the
+/// pool-scoped evidence-ledger pattern as ONE shared abstraction
+/// whose ONLY key type is [`PoolKey`]. Process-global per-pool
+/// ledgers kept being minted ad hoc (PoolStreaks, pool_seq, then
+/// StrikeLedger), each independently re-learning the
+/// key-qualification, wall-clock-floor, and prune laws the previous
+/// one codified — and the third mint (StrikeLedger) keyed its tick
+/// clock on the BARE pool name beside the PoolKey doctrine, so
+/// same-named pools across namespaces (Api::all watch) interleaved
+/// one counter and `last_tick + 1 == tick` never held under
+/// alternation. With the key type SEALED here, a `&str`-keyed
+/// consumer no longer compiles (the doctrine's "untypeable at every
+/// consumer" claim is constructor-true — R23' bind: this type IS the
+/// claim's carrier); the prune law is the TYPE's: [`Self::prune_stale`]
+/// retires rows AND tick-clock entries together (the pre-fix
+/// begin_tick pruned only strikes, leaking ticks entries forever
+/// against the ledger's own memory-bound doc).
+///
+/// Consumers ([GEN-SET] — the W10-AP census commits this list):
+/// - `jobs::STALE_STRIKES` (`PoolScopedLedger<StrikeEntry>`): the
+///   two-tick stale-Job confirmation, count-AND-floor by
+///   construction (the 20s wall-clock floor inherited from the
+///   sibling — Job event bursts deliver adjacent ticks milliseconds
+///   apart, which re-opened the priced in-flight-pull window).
+/// - [`PoolStreaks`] (`PoolScopedLedger<StreakEntry>` +
+///   `PoolScopedLedger<RespawnEntry>`): the exhaustion-streak and
+///   futility-breaker evidence maps (their bespoke retain laws stay
+///   in `PoolStreaks` methods; the SEAL and the row storage are the
+///   shared abstraction's).
+#[derive(Debug)]
+pub struct PoolScopedLedger<V> {
+    /// `(pool, id) -> row`. The key tuple is private — rows are
+    /// reachable only through the [`PoolKey`]-typed accessors.
+    rows: std::collections::HashMap<(PoolKey, String), V>,
+    /// Per-pool tick clock + the wall stamp of its last advance
+    /// (feeds the unified prune — a clock whose pool stopped ticking
+    /// past the horizon is dead state).
+    ticks: std::collections::HashMap<PoolKey, (u64, std::time::Instant)>,
+}
+
+impl<V> Default for PoolScopedLedger<V> {
+    /// Manual impl: an empty ledger needs no `V: Default`.
+    fn default() -> Self {
+        Self {
+            rows: std::collections::HashMap::new(),
+            ticks: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl<V> PoolScopedLedger<V> {
+    /// Advance `pool`'s tick clock (every pass, an empty pass
+    /// included — an empty pass IS a tick, so rows stamped before an
+    /// outage read as non-adjacent when classification resumes).
+    pub fn begin_tick(&mut self, pool: &PoolKey, now: std::time::Instant) -> u64 {
+        let e = self.ticks.entry(pool.clone()).or_insert((0, now));
+        e.0 += 1;
+        e.1 = now;
+        e.0
+    }
+
+    /// The unified prune law: rows whose `touched` stamp passed
+    /// `horizon` AND tick-clock entries whose pool last advanced past
+    /// `horizon` are retired TOGETHER (merged_bug_140: the split
+    /// prune leaked ticks entries forever).
+    pub fn prune_stale(
+        &mut self,
+        now: std::time::Instant,
+        horizon: std::time::Duration,
+        touched: impl Fn(&V) -> std::time::Instant,
+    ) {
+        self.rows
+            .retain(|_, v| now.saturating_duration_since(touched(v)) < horizon);
+        self.ticks
+            .retain(|_, (_, at)| now.saturating_duration_since(*at) < horizon);
+    }
+
+    /// Row access by the SEALED key pair (insert-or-default form).
+    pub fn row_or_insert_with(
+        &mut self,
+        pool: &PoolKey,
+        id: &str,
+        mk: impl FnOnce() -> V,
+    ) -> &mut V {
+        self.rows
+            .entry((pool.clone(), id.to_owned()))
+            .or_insert_with(mk)
+    }
+
+    pub fn get(&self, pool: &PoolKey, id: &str) -> Option<&V> {
+        self.rows.get(&(pool.clone(), id.to_owned()))
+    }
+
+    pub fn get_mut(&mut self, pool: &PoolKey, id: &str) -> Option<&mut V> {
+        self.rows.get_mut(&(pool.clone(), id.to_owned()))
+    }
+
+    pub fn remove(&mut self, pool: &PoolKey, id: &str) -> Option<V> {
+        self.rows.remove(&(pool.clone(), id.to_owned()))
+    }
+
+    /// Bespoke-law passthroughs (the consumers' own retain/iterate
+    /// laws run over the sealed rows; the key stays [`PoolKey`]-typed
+    /// at every closure).
+    pub fn retain_rows(&mut self, mut f: impl FnMut(&PoolKey, &str, &mut V) -> bool) {
+        self.rows.retain(|(p, id), v| f(p, id, v));
+    }
+
+    pub fn iter_rows_mut(&mut self) -> impl Iterator<Item = (&PoolKey, &str, &mut V)> {
+        self.rows.iter_mut().map(|((p, id), v)| (p, id.as_str(), v))
+    }
+
+    pub fn iter_rows(&self) -> impl Iterator<Item = (&PoolKey, &str, &V)> {
+        self.rows.iter().map(|((p, id), v)| (p, id.as_str(), v))
+    }
+
+    /// Test-only: row + tick-clock cardinality (the W10-AO leak pin).
+    #[cfg(test)]
+    pub fn sizes(&self) -> (usize, usize) {
+        (self.rows.len(), self.ticks.len())
+    }
 }
 
 #[derive(Debug)]
@@ -792,12 +916,12 @@ impl PoolStreaks {
         // Census row (W10-AH): continuity / witness-suspended.
         // r[impl ctrl.pool.demand-completeness]
         if coverage == crate::reconcilers::pool::jobs::DemandCoverage::Incomplete {
-            for ((p, _), e) in self.entries.iter_mut() {
+            for (p, _, e) in self.entries.iter_rows_mut() {
                 if p == &key {
                     e.touched = now;
                 }
             }
-            for ((p, _), r) in self.respawn.iter_mut() {
+            for (p, _, r) in self.respawn.iter_rows_mut() {
                 if p == &key {
                     r.touched = now;
                 }
@@ -807,18 +931,18 @@ impl PoolStreaks {
         // an entry unstepped for the expiry window is dead evidence
         // REGARDLESS of pool --- otherwise two stale observations plus
         // one fresh blip hours later could complete the poison.
-        self.entries.retain(|_, e| {
+        self.entries.retain_rows(|_, _, e| {
             now.saturating_duration_since(e.touched).as_secs() < POOL_STREAK_ORPHAN_EXPIRY_SECS
         });
         // Respawn records: touch this pool's evaluated cells FIRST
         // (an evaluated record at the expiry boundary survives), then
         // expire by the same staleness law.
-        for ((p, id), r) in self.respawn.iter_mut() {
+        for (p, id, r) in self.respawn.iter_rows_mut() {
             if p == &key && obs.evaluated(id) {
                 r.touched = now;
             }
         }
-        self.respawn.retain(|_, r| {
+        self.respawn.retain_rows(|_, _, r| {
             // live_056-b option (b): an entry that currently BLOCKS
             // respawn (mid-backoff or gave-up) is immune to the
             // touched-staleness expiry --- mid-backoff expiry is
@@ -837,24 +961,28 @@ impl PoolStreaks {
         // --- observed recovery. Un-evaluated entries (headroom has no
         // bearing now, but job-pending and absent-from-stream intents
         // are still un-evaluated) retain without stepping.
-        self.entries.retain(|(p, id), _| {
+        self.entries.retain_rows(|p, id, _| {
             let observed_recovery = obs.evaluated(id) && !obs.gated(id);
             p != &key || !observed_recovery
         });
         let mut report = Vec::new();
         for id in &obs.gated {
-            let k = (key.clone(), id.clone());
-            let prev = self.entries.get(&k).map(|e| (e.streak, e.first_gated));
+            let prev = self
+                .entries
+                .get(&key, id)
+                .map(|e| (e.streak, e.first_gated));
             let (streak, count_ok) = exhausted_streak_step(prev.map(|(s, _)| s));
             let first_gated = prev.map_or(now, |(_, f)| f);
-            self.entries.insert(
-                k,
-                StreakEntry {
-                    streak,
-                    first_gated,
-                    touched: now,
-                },
-            );
+            let row = self.entries.row_or_insert_with(&key, id, || StreakEntry {
+                streak,
+                first_gated,
+                touched: now,
+            });
+            *row = StreakEntry {
+                streak,
+                first_gated,
+                touched: now,
+            };
             if count_ok
                 && now.saturating_duration_since(first_gated).as_secs()
                     >= NO_ELIGIBLE_SOURCE_PERSIST_FLOOR_SECS
@@ -887,8 +1015,7 @@ impl PoolStreaks {
     ) -> DeathNote {
         let e = self
             .respawn
-            .entry((pool.clone(), intent.to_owned()))
-            .or_insert(RespawnEntry {
+            .row_or_insert_with(pool, intent, || RespawnEntry {
                 deaths: 0,
                 last_death: now,
                 touched: now,
@@ -927,7 +1054,7 @@ impl PoolStreaks {
         now: std::time::Instant,
     ) {
         for intent in intents {
-            if let Some(r) = self.respawn.get_mut(&(pool.clone(), intent.to_owned())) {
+            if let Some(r) = self.respawn.get_mut(pool, intent) {
                 r.touched = now;
             }
         }
@@ -937,16 +1064,13 @@ impl PoolStreaks {
     /// `None` once expired/reset — the W10-AM suspension probe.
     #[cfg(test)]
     pub fn respawn_deaths(&self, pool: &PoolKey, intent: &str) -> Option<u32> {
-        self.respawn
-            .get(&(pool.clone(), intent.to_owned()))
-            .map(|r| r.deaths)
+        self.respawn.get(pool, intent).map(|r| r.deaths)
     }
 
     /// Test-only: streak-entry presence — the W10-AM suspension probe.
     #[cfg(test)]
     pub fn has_streak(&self, pool: &PoolKey, intent: &str) -> bool {
-        self.entries
-            .contains_key(&(pool.clone(), intent.to_owned()))
+        self.entries.get(pool, intent).is_some()
     }
 
     /// bug_028 futility breaker: apply one NAMED resolution --- the
@@ -978,9 +1102,8 @@ impl PoolStreaks {
         now: std::time::Instant,
     ) {
         let VerdictWitness(what) = witness;
-        let key = (pool.clone(), intent.to_owned());
         if let SpawnResolution::ClosedBuild { closed_age_secs } = what
-            && let Some(e) = self.respawn.get(&key)
+            && let Some(e) = self.respawn.get(pool, intent)
         {
             // Saturating: a wrapped tiny close_age would read as
             // "postdates the death" and DROP a record that must be
@@ -996,7 +1119,7 @@ impl PoolStreaks {
                 return;
             }
         }
-        if self.respawn.remove(&key).is_some() {
+        if self.respawn.remove(pool, intent).is_some() {
             tracing::debug!(pool = %pool, intent, resolution = ?what,
                 "verdict-free-respawn backoff reset by named resolution");
         }
@@ -1020,7 +1143,7 @@ impl PoolStreaks {
         if self.respawn_blocked(pool, intent, now) {
             return EvidenceState::InBackoff;
         }
-        match self.entries.get(&(pool.clone(), intent.to_owned())) {
+        match self.entries.get(pool, intent) {
             Some(e)
                 if now.saturating_duration_since(e.touched).as_secs()
                     < POOL_STREAK_ORPHAN_EXPIRY_SECS =>
@@ -1039,7 +1162,7 @@ impl PoolStreaks {
     // r[impl ctrl.pool.respawn-backoff+2]
     pub fn respawn_blocked(&self, pool: &PoolKey, intent: &str, now: std::time::Instant) -> bool {
         self.respawn
-            .get(&(pool.clone(), intent.to_owned()))
+            .get(pool, intent)
             .is_some_and(|r| r.blocks_respawn(now))
     }
 }

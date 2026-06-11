@@ -452,6 +452,12 @@ async fn reap_stale_for_intents_selector_drift_and_terminal() {
         strike_pass.is_empty(),
         "strike 1 defers the attempt-affecting arms (live_051(e))"
     );
+    // merged_bug_140: cross the 20s wall floor (the count conjunct is
+    // satisfied by the adjacent pass; backdate instead of sleeping).
+    crate::reconcilers::pool::jobs::backdate_strikes_for_test(
+        &pkey(),
+        std::time::Duration::from_secs(21),
+    );
     let reaped = reap_stale_for_intents(
         &jobs_api,
         &existing,
@@ -561,6 +567,11 @@ async fn reap_stale_at_ceiling_saturation() {
     )
     .await;
     assert!(strike_pass.is_empty(), "strike 1 defers (live_051(e))");
+    // merged_bug_140: cross the 20s wall floor (backdate, not sleep).
+    crate::reconcilers::pool::jobs::backdate_strikes_for_test(
+        &pkey(),
+        std::time::Duration::from_secs(21),
+    );
     let reaped = reap_stale_for_intents(
         &jobs_api,
         &existing,
@@ -1333,6 +1344,11 @@ async fn attemptless_stale_job_reaps_on_the_second_strike() {
         first.is_empty(),
         "strike 1 defers the terminal-arm reap (live_051(e))"
     );
+    // merged_bug_140: cross the 20s wall floor (backdate, not sleep).
+    crate::reconcilers::pool::jobs::backdate_strikes_for_test(
+        &key,
+        std::time::Duration::from_secs(21),
+    );
 
     // Tick 2: the second consecutive classification reaps — fresh
     // view still shows no cover, so the chokepoint proceeds and the
@@ -1444,6 +1460,11 @@ async fn w9_aq_strikes_reset_across_empty_want_gap_ticks() {
          strike 1)"
     );
 
+    // merged_bug_140: cross the 20s wall floor (backdate, not sleep).
+    crate::reconcilers::pool::jobs::backdate_strikes_for_test(
+        &key,
+        std::time::Duration::from_secs(21),
+    );
     // The genuinely adjacent second pass reaps — the two-tick law
     // still confirms on back-to-back classifications.
     let adjacent = reap_stale_for_intents(
@@ -3021,6 +3042,11 @@ async fn worker_closed_death_is_not_verdict_free() {
     )
     .await;
     assert!(strike_pass.is_empty(), "strike 1 defers (live_051(e))");
+    // merged_bug_140: cross the 20s wall floor (backdate, not sleep).
+    crate::reconcilers::pool::jobs::backdate_strikes_for_test(
+        &pkey(),
+        std::time::Duration::from_secs(21),
+    );
     let reaped = reap_stale_for_intents(
         &jobs_api,
         &[job],
@@ -3177,6 +3203,11 @@ async fn pre_creation_close_does_not_cover_a_death() {
     )
     .await;
     assert!(first.is_empty(), "strike 1 defers (live_051(e))");
+    // merged_bug_140: cross the 20s wall floor (backdate, not sleep).
+    crate::reconcilers::pool::jobs::backdate_strikes_for_test(
+        &key,
+        std::time::Duration::from_secs(21),
+    );
     let reaped = reap_stale_for_intents(
         &jobs_api,
         std::slice::from_ref(&job),

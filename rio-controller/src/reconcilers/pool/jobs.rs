@@ -2047,73 +2047,105 @@ pub(super) fn note_reap_disposition(pool: &str, d: ReapDisposition) {
 /// reconcile loop that feeds it; a controller restart counts afresh
 /// (conservative — one extra tick of deferral). The orphan-pending
 /// arm is OUT of scope: already age-gated by `REAP_PENDING_GRACE`.
-struct StrikeLedger {
-    /// Per-pool reap-pass counter — the strike clock. Advanced at
-    /// every [`reap_stale_for_intents`] entry for the pool,
-    /// INCLUDING passes that early-return on an empty `want`.
-    ticks: HashMap<String, u64>,
-    /// (pool, uid) → the tick-stamped strike row.
-    strikes: HashMap<(String, String), StrikeEntry>,
-}
-
+/// Round-10 merged_bug_140 (R24): the strike book is an instantiation
+/// of [`candidate::PoolScopedLedger`] — the key is SEALED to the
+/// namespaced [`candidate::PoolKey`] (the pre-fix bare-name tick
+/// clock interleaved same-named pools across namespaces: under
+/// alternation `last_tick + 1 == tick` never held, StaleTerminal/
+/// SelectorDrift reaps deferred indefinitely, and a SelectorDrift'd
+/// Pending Job NameCollision-blocked its intent with no TTL
+/// backstop), the prune law is the ledger's (rows AND tick clocks
+/// retired together — the pre-fix begin_tick pruned only strikes,
+/// leaking ticks entries against the ledger's own memory-bound doc),
+/// and the firing law is COUNT-AND-FLOOR by construction
+/// ([`StrikeEntry::confirmed`]: two adjacent-tick strikes AND the
+/// [`STRIKE_WALL_FLOOR`] of wall clock since the row's first strike
+/// — inherited from the exhaustion-streak sibling: Job event bursts
+/// deliver adjacent ticks milliseconds apart, which re-opened the
+/// priced in-flight-pull window the two-tick confirmation absorbs).
 struct StrikeEntry {
-    /// Consecutive-adjacent-tick strike count (reap at >= 2).
+    /// Consecutive-adjacent-tick strike count.
     count: u8,
     /// The pool tick this row was last struck at.
     last_tick: u64,
+    /// Wall clock of this row's FIRST strike in the current
+    /// consecutive run — the count-AND-floor anchor.
+    first_struck: std::time::Instant,
     /// Wall clock of the last strike — feeds the memory prune ONLY.
     touched: std::time::Instant,
 }
 
-/// Prune horizon for [`StrikeLedger`] rows — the memory bound, not a
+impl StrikeEntry {
+    /// The firing law (count AND floor — by construction, the only
+    /// confirmation path).
+    fn confirmed(&self, now: std::time::Instant) -> bool {
+        self.count >= 2 && now.saturating_duration_since(self.first_struck) >= STRIKE_WALL_FLOOR
+    }
+}
+
+/// Prune horizon for strike rows — the memory bound, not a
 /// correctness bound (see the ledger doc). One hour dwarfs any
 /// plausible reconcile cadence: a row this stale belongs to a deleted
 /// pool or a long-gone Job, and its adjacency has long since lapsed.
 const STRIKE_PRUNE_HORIZON: std::time::Duration = std::time::Duration::from_secs(3600);
 
-impl StrikeLedger {
-    /// Advance `pool`'s tick — every reap pass, an empty-`want` pass
-    /// included — and prune rows past the memory horizon. `now` is
-    /// threaded (house pattern) so the prune law is drivable by
-    /// value in tests.
-    fn begin_tick(&mut self, pool: &str, now: std::time::Instant) -> u64 {
-        self.strikes
-            .retain(|_, e| now.saturating_duration_since(e.touched) < STRIKE_PRUNE_HORIZON);
-        let t = self.ticks.entry(pool.to_owned()).or_insert(0);
-        *t += 1;
-        *t
-    }
+/// The wall-clock half of the strike firing law (merged_bug_140: the
+/// 20s floor inherited from the exhaustion-streak sibling). Two
+/// reconcile ticks are nominally ~10s apart, so the floor is inert on
+/// the timer cadence and bites exactly on event-burst adjacency.
+/// VIOLABLE (R17): time axis only — the deferral it can add is
+/// bounded by the floor itself; cost/size/population axes N/A (the
+/// ledger's prune horizon is the memory envelope).
+const STRIKE_WALL_FLOOR: std::time::Duration = std::time::Duration::from_secs(20);
 
-    /// Record a strike for (pool, uid) at `tick`; returns the
-    /// resulting count — `previous + 1` when the row's stamp is
-    /// adjacent by value, else 1.
-    fn strike(&mut self, pool: &str, uid: String, tick: u64, now: std::time::Instant) -> u8 {
-        let e = self
-            .strikes
-            .entry((pool.to_owned(), uid))
-            .or_insert(StrikeEntry {
-                count: 0,
-                last_tick: 0,
-                touched: now,
-            });
-        e.count = if e.count > 0 && e.last_tick + 1 == tick {
-            e.count.saturating_add(1)
-        } else {
-            1
-        };
-        e.last_tick = tick;
-        e.touched = now;
-        e.count
+/// Record a strike for `(pool, uid)` at `tick`: `previous + 1` when
+/// the row's stamp is adjacent by value, else a fresh run of 1 (the
+/// floor anchor re-arms with the run).
+fn strike(
+    ledger: &mut candidate::PoolScopedLedger<StrikeEntry>,
+    pool: &candidate::PoolKey,
+    uid: &str,
+    tick: u64,
+    now: std::time::Instant,
+) -> StrikeEntry {
+    let e = ledger.row_or_insert_with(pool, uid, || StrikeEntry {
+        count: 0,
+        last_tick: 0,
+        first_struck: now,
+        touched: now,
+    });
+    if e.count > 0 && e.last_tick + 1 == tick {
+        e.count = e.count.saturating_add(1);
+    } else {
+        e.count = 1;
+        e.first_struck = now;
+    }
+    e.last_tick = tick;
+    e.touched = now;
+    StrikeEntry {
+        count: e.count,
+        last_tick: e.last_tick,
+        first_struck: e.first_struck,
+        touched: e.touched,
     }
 }
 
-static STALE_STRIKES: std::sync::LazyLock<parking_lot::Mutex<StrikeLedger>> =
-    std::sync::LazyLock::new(|| {
-        parking_lot::Mutex::new(StrikeLedger {
-            ticks: HashMap::new(),
-            strikes: HashMap::new(),
-        })
-    });
+static STALE_STRIKES: std::sync::LazyLock<
+    parking_lot::Mutex<candidate::PoolScopedLedger<StrikeEntry>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(candidate::PoolScopedLedger::default()));
+
+/// Test-only: rewind every strike row's floor anchor for `pool` so
+/// the two-tick scenarios can cross [`STRIKE_WALL_FLOOR`] without
+/// sleeping (the candidate.rs backdate_for_test precedent).
+#[cfg(test)]
+pub(super) fn backdate_strikes_for_test(pool: &candidate::PoolKey, by: std::time::Duration) {
+    let mut book = STALE_STRIKES.lock();
+    for (p, _, e) in book.iter_rows_mut() {
+        if p == pool {
+            e.first_struck -= by;
+        }
+    }
+}
 
 /// A Pending Job whose selector MATCHES the current intent is NOT
 /// reaped — that's the intended NameCollision dedupe.
@@ -2152,9 +2184,13 @@ pub(super) async fn reap_stale_for_intents(
     // before the empty-`want` early return below — an empty pass IS
     // a tick, so strikes stamped before a scheduler outage / idle
     // stretch read as non-adjacent when classification resumes.
-    let tick = STALE_STRIKES
-        .lock()
-        .begin_tick(pool, std::time::Instant::now());
+    let tick = {
+        let mut book = STALE_STRIKES.lock();
+        let now = std::time::Instant::now();
+        // The ledger's unified prune: rows AND tick clocks together.
+        book.prune_stale(now, STRIKE_PRUNE_HORIZON, |e| e.touched);
+        book.begin_tick(key, now)
+    };
     if want.is_empty() {
         return reaped;
     }
@@ -2243,14 +2279,14 @@ pub(super) async fn reap_stale_for_intents(
                 // (apiserver objects always carry one in practice).
                 continue;
             };
-            let strikes = STALE_STRIKES
-                .lock()
-                .strike(pool, uid, tick, std::time::Instant::now());
-            if strikes < 2 {
+            let now = std::time::Instant::now();
+            let row = strike(&mut STALE_STRIKES.lock(), key, &uid, tick, now);
+            if !row.confirmed(now) {
                 info!(
-                    pool, job = %jn, why,
-                    "stale-Job classification strike 1; reap deferred one \
-                     tick (live_051(e) two-tick confirmation)"
+                    pool, job = %jn, why, strikes = row.count,
+                    "stale-Job classification deferred (live_051(e) \
+                     two-tick confirmation + the merged_bug_140 20s \
+                     wall floor; re-decided next tick)"
                 );
                 continue;
             }
@@ -2742,11 +2778,19 @@ mod tests {
         }
     }
 
-    fn ledger() -> StrikeLedger {
-        StrikeLedger {
-            ticks: HashMap::new(),
-            strikes: HashMap::new(),
-        }
+    fn ledger() -> candidate::PoolScopedLedger<StrikeEntry> {
+        candidate::PoolScopedLedger::default()
+    }
+
+    /// Strike + prune driver mirroring the production pass entry
+    /// (prune-then-tick), keyed on the SEALED PoolKey.
+    fn tick_at(
+        l: &mut candidate::PoolScopedLedger<StrikeEntry>,
+        pool: &candidate::PoolKey,
+        now: std::time::Instant,
+    ) -> u64 {
+        l.prune_stale(now, STRIKE_PRUNE_HORIZON, |e| e.touched);
+        l.begin_tick(pool, now)
     }
 
     /// W9-AQ (merged_bug_033), ledger faces: "consecutive" is
@@ -2757,23 +2801,25 @@ mod tests {
     #[test]
     fn w9_aq_strike_gap_resets_consecutiveness_by_value() {
         let mut l = ledger();
+        let pk = candidate::PoolKey::new("rio-system", "p");
         let now = std::time::Instant::now();
-        let t1 = l.begin_tick("p", now);
-        assert_eq!(l.strike("p", "uid-1".into(), t1, now), 1);
+        let t1 = tick_at(&mut l, &pk, now);
+        assert_eq!(strike(&mut l, &pk, "uid-1", t1, now).count, 1);
         // k empty-want passes: the clock advances, nothing strikes.
-        let _ = l.begin_tick("p", now);
-        let _ = l.begin_tick("p", now);
-        let t4 = l.begin_tick("p", now);
+        let _ = tick_at(&mut l, &pk, now);
+        let _ = tick_at(&mut l, &pk, now);
+        let t4 = tick_at(&mut l, &pk, now);
         assert_eq!(
-            l.strike("p", "uid-1".into(), t4, now),
+            strike(&mut l, &pk, "uid-1", t4, now).count,
             1,
             "left: 2 (the frozen strike escalates across the gap) / \
              right: 1 (adjacency by value resets the confirmation)"
         );
         // Adjacent follow-up: two genuine back-to-back
-        // classifications still confirm.
-        let t5 = l.begin_tick("p", now);
-        assert_eq!(l.strike("p", "uid-1".into(), t5, now), 2);
+        // classifications still confirm (count half; the wall floor
+        // is the other conjunct — see the count-and-floor test).
+        let t5 = tick_at(&mut l, &pk, now);
+        assert_eq!(strike(&mut l, &pk, "uid-1", t5, now).count, 2);
     }
 
     /// Strike clocks are POOL-scoped: another pool's passes advance
@@ -2782,18 +2828,72 @@ mod tests {
     #[test]
     fn strike_clocks_are_pool_scoped() {
         let mut l = ledger();
+        let pk = candidate::PoolKey::new("rio-system", "p");
+        let qk = candidate::PoolKey::new("rio-system", "q");
         let now = std::time::Instant::now();
-        let t1 = l.begin_tick("p", now);
-        assert_eq!(l.strike("p", "uid-1".into(), t1, now), 1);
+        let t1 = tick_at(&mut l, &pk, now);
+        assert_eq!(strike(&mut l, &pk, "uid-1", t1, now).count, 1);
         // Sibling-pool passes interleave (the reconcile loop is
         // per-pool; ticks for q are not ticks for p).
-        let _ = l.begin_tick("q", now);
-        let _ = l.begin_tick("q", now);
-        let t2 = l.begin_tick("p", now);
+        let _ = tick_at(&mut l, &qk, now);
+        let _ = tick_at(&mut l, &qk, now);
+        let t2 = tick_at(&mut l, &pk, now);
         assert_eq!(
-            l.strike("p", "uid-1".into(), t2, now),
+            strike(&mut l, &pk, "uid-1", t2, now).count,
             2,
             "p's tick 2 is adjacent to p's tick 1 regardless of q's clock"
+        );
+    }
+
+    // r[verify ctrl.pool.demand-completeness]
+    /// **W10-AN (merged_bug_140).** PROPOSITION at the cross-namespace
+    /// quantifier: same-NAMED pools in distinct namespaces are
+    /// DISTINCT strike owners — under strict alternation each pool's
+    /// adjacency holds independently and the confirmation fires
+    /// (count-based). Pre-fix (bare-name keys, strawman-DISCLOSED:
+    /// the shipped `ticks: HashMap<String, u64>` shape is deleted by
+    /// the seal — the alternation arithmetic is quoted in the commit
+    /// body: ns-a's passes land ticks 1,3,5 on the SHARED clock, so
+    /// `last_tick + 1 == tick` never held and zero reaps ever fired).
+    #[test]
+    fn w10_an_same_named_pools_alternate_independently() {
+        let mut l = ledger();
+        let a = candidate::PoolKey::new("ns-a", "metal");
+        let b = candidate::PoolKey::new("ns-b", "metal");
+        let now = std::time::Instant::now();
+        // Strict alternation, two rounds each.
+        let ta1 = tick_at(&mut l, &a, now);
+        let tb1 = tick_at(&mut l, &b, now);
+        assert_eq!(strike(&mut l, &a, "uid-a", ta1, now).count, 1);
+        assert_eq!(strike(&mut l, &b, "uid-b", tb1, now).count, 1);
+        let ta2 = tick_at(&mut l, &a, now);
+        let tb2 = tick_at(&mut l, &b, now);
+        assert_eq!(
+            strike(&mut l, &a, "uid-a", ta2, now).count,
+            2,
+            "ns-a/metal confirms on ITS OWN adjacent ticks (pre-fix: \
+             the shared bare-name clock read 1,3 — never adjacent, \
+             zero reaps ever fired)"
+        );
+        assert_eq!(strike(&mut l, &b, "uid-b", tb2, now).count, 2);
+        // The floor conjunct: confirmation = count AND wall floor.
+        let aged = now + STRIKE_WALL_FLOOR;
+        let ta3 = tick_at(&mut l, &a, aged);
+        let row = strike(&mut l, &a, "uid-a", ta3, aged);
+        assert!(
+            row.confirmed(aged),
+            "count-and-floor fires once both conjuncts hold"
+        );
+        let tb3 = tick_at(&mut l, &b, aged);
+        let _ = strike(&mut l, &b, "uid-burst", tb3, aged);
+        let burst_now = aged + std::time::Duration::from_millis(1);
+        let tb4 = tick_at(&mut l, &b, burst_now);
+        let burst2 = strike(&mut l, &b, "uid-burst", tb4, burst_now);
+        assert_eq!(burst2.count, 2, "event-burst adjacency counts...");
+        assert!(
+            !burst2.confirmed(burst_now),
+            "...but the 20s wall floor DEFERS millisecond-adjacent \
+             bursts (the in-flight-pull window stays priced)"
         );
     }
 
@@ -2804,21 +2904,54 @@ mod tests {
     #[test]
     fn strike_rows_for_absent_pools_prune_at_the_horizon() {
         let mut l = ledger();
+        let dead = candidate::PoolKey::new("rio-system", "deleted-pool");
+        let live = candidate::PoolKey::new("rio-system", "live-pool");
         let t0 = std::time::Instant::now();
-        let t = l.begin_tick("deleted-pool", t0);
-        l.strike("deleted-pool", "uid-9".into(), t, t0);
-        assert_eq!(l.strikes.len(), 1);
+        let t = tick_at(&mut l, &dead, t0);
+        let _ = strike(&mut l, &dead, "uid-9", t, t0);
+        assert_eq!(l.sizes().0, 1);
         // Just inside the horizon: retained.
-        let _ = l.begin_tick(
-            "live-pool",
+        let _ = tick_at(
+            &mut l,
+            &live,
             t0 + STRIKE_PRUNE_HORIZON - std::time::Duration::from_secs(1),
         );
-        assert_eq!(l.strikes.len(), 1, "row inside the horizon is retained");
+        assert_eq!(l.sizes().0, 1, "row inside the horizon is retained");
         // At the horizon: any pool's next pass prunes globally.
-        let _ = l.begin_tick("live-pool", t0 + STRIKE_PRUNE_HORIZON);
-        assert!(
-            l.strikes.is_empty(),
+        let _ = tick_at(&mut l, &live, t0 + STRIKE_PRUNE_HORIZON);
+        assert_eq!(
+            l.sizes().0,
+            0,
             "absent-pool rows vanish at the stamp horizon (memory bound)"
+        );
+    }
+
+    // r[verify ctrl.pool.demand-completeness]
+    /// **W10-AO (merged_bug_140, the ticks leak).** The unified prune
+    /// retires TICK-CLOCK entries with the rows: k dead pools tick
+    /// once each, then a live pool's pass at the horizon prunes ALL
+    /// of them — the pre-fix begin_tick pruned only strikes, so the
+    /// ticks map grew one entry per pool name forever against the
+    /// ledger's own memory-bound doc.
+    ///
+    /// Pre-fix red (the split prune — rows-only):
+    ///   left: 8  right: 1 (dead pools' tick clocks leaked)
+    #[test]
+    fn w10_ao_tick_clocks_prune_with_the_rows() {
+        let mut l = ledger();
+        let t0 = std::time::Instant::now();
+        for k in 0..8 {
+            let dead = candidate::PoolKey::new("rio-system", &format!("dead-{k}"));
+            let _ = tick_at(&mut l, &dead, t0);
+        }
+        assert_eq!(l.sizes().1, 8, "eight pools ticked");
+        let live = candidate::PoolKey::new("rio-system", "live");
+        let _ = tick_at(&mut l, &live, t0 + STRIKE_PRUNE_HORIZON);
+        assert_eq!(
+            l.sizes().1,
+            1,
+            "dead pools' tick clocks pruned with the rows (pre-fix: \
+             leaked forever); the live pool's fresh clock remains"
         );
     }
 
@@ -4289,6 +4422,58 @@ mod demand_lane_census {
                 0,
                 "{file}: raw-slice intent-membership test — absence \
                  judgments go through WantMap::verdict (R26)"
+            );
+        }
+    }
+
+    /// **W10-AP (merged_bug_140, the R15 type census).** The
+    /// pool-scoped ledger consumer list is COMMITTED and the key seal
+    /// is rustc-checked: every instantiation is
+    /// `PoolScopedLedger<...>` (key type sealed to `PoolKey` by the
+    /// type itself — a `&str`-keyed consumer no longer compiles), and
+    /// ZERO bare-keyed ledger shapes remain in the pool plane.
+    /// [GEN-SET] generator:
+    ///   rg -n 'PoolScopedLedger<|HashMap<String, u64>|HashMap<\(String, String\)' rio-controller/src/reconcilers/pool/
+    #[test]
+    fn w10_ap_pool_scoped_ledgers_are_sealed() {
+        let jobs_prod = prod(JOBS_SRC);
+        let cand_prod = prod(CANDIDATE_SRC);
+        // The committed consumer list: STALE_STRIKES (jobs.rs static +
+        // the strike fn + the backdate helper signature) and
+        // PoolStreaks' two evidence maps (+ the ledger's own def/impl
+        // blocks in candidate.rs).
+        assert_eq!(
+            jobs_prod.matches("PoolScopedLedger<").count(),
+            2,
+            "jobs.rs: the STALE_STRIKES instantiation (static type + \
+             the strike fn signature) — a new consumer joins the \
+             committed list"
+        );
+        assert_eq!(
+            cand_prod.matches("PoolScopedLedger<").count(),
+            8,
+            "candidate.rs: the abstraction (struct + Default + impl + \
+             the committed consumer-list doc rows) + PoolStreaks' two \
+             maps — re-run the [GEN-SET] generator on drift"
+        );
+        // The seal's negative space: zero bare-keyed ledger shapes in
+        // CODE lines (comment lines excluded — the StrikeEntry doc
+        // quotes the deleted shape; `aggregate_upper_for`'s wire map
+        // is a system→count projection, not a pool ledger, hence the
+        // tick-clock/row-tuple needles, not bare HashMap<String, _>).
+        for (file, src) in [("jobs.rs", jobs_prod), ("candidate.rs", cand_prod)] {
+            let code_hits = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .filter(|l| {
+                    l.contains("ticks: HashMap<String") || l.contains("HashMap<(String, String)")
+                })
+                .count();
+            assert_eq!(
+                code_hits, 0,
+                "{file}: a bare-name pool ledger shape re-minted — the \
+                 merged_bug_140 recurrence; instantiate \
+                 PoolScopedLedger instead"
             );
         }
     }
