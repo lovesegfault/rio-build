@@ -164,6 +164,15 @@ const FUSE_DEV_IOC_BACKING_CLOSE: libc::c_ulong = iow::<u32>(FUSE_DEV_IOC_MAGIC,
 /// never registers a writable file description, whatever access mode
 /// the client's fd carries.
 ///
+/// The reverse direction needs its own gate: the re-open's permission
+/// check runs under root, not the client, so the received fd must be
+/// proven readable *by the client* first — access mode O_RDONLY or
+/// O_RDWR, never O_PATH or O_WRONLY — or the broker becomes a confused
+/// deputy that upgrades no-read-permission fds. The gate checks the
+/// description's access mode, not where the fd came from: holding a
+/// readable description *is* the client's read capability, so the
+/// broker only ever mirrors access the client already has.
+///
 /// `/proc/self/fd/<n>` resolves to the open file description's inode,
 /// not its (re-traversed) path, so this also works for a cache entry
 /// the LRU sweep unlinked between the client's open and this request.
@@ -172,6 +181,22 @@ const FUSE_DEV_IOC_BACKING_CLOSE: libc::c_ulong = iow::<u32>(FUSE_DEV_IOC_MAGIC,
 /// source open); the ioctl's `d_is_reg` check then rejects it.
 // r[impl builder.mountd.backing-readonly]
 fn reopen_backing_readonly(client_fd: BorrowedFd<'_>) -> std::io::Result<OwnedFd> {
+    // Readability gate (see doc comment). O_PATH needs its own check:
+    // F_GETFL reports it in the status flags, but an O_PATH
+    // description's access-mode bits read as 0 == O_RDONLY, so the
+    // access-mode test alone would pass it.
+    let fl = nix::fcntl::fcntl(client_fd, nix::fcntl::FcntlArg::F_GETFL)
+        .map_err(std::io::Error::from)?;
+    let acc = fl & libc::O_ACCMODE;
+    if fl & libc::O_PATH != 0 || (acc != libc::O_RDONLY && acc != libc::O_RDWR) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "backing fd is not readable (status flags {fl:#o}): \
+                 need access mode O_RDONLY or O_RDWR, not O_PATH/O_WRONLY"
+            ),
+        ));
+    }
     let proc_path = format!("/proc/self/fd/{}", client_fd.as_raw_fd());
     nix::fcntl::open(
         Path::new(&proc_path),
@@ -1678,6 +1703,47 @@ mod tests {
 
         // Must return, not hang.
         reopen_backing_readonly(client.as_fd()).expect("re-open of a FIFO must not block");
+    }
+
+    // r[verify builder.mountd.backing-readonly]
+    /// An O_PATH fd carries no read permission: a client can obtain
+    /// one for any file it can reach, including files it cannot read.
+    /// The `/proc/self/fd` re-open runs under the broker's root
+    /// credentials with a fresh DAC-free permission check, so accepting
+    /// O_PATH would launder a no-access fd into a readable one
+    /// (confused deputy). It must be rejected before the re-open.
+    #[test]
+    fn backing_fd_reopen_rejects_o_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("unreadable");
+        std::fs::write(&path, b"secret").unwrap();
+        let opath =
+            nix::fcntl::open(&path, OFlag::O_PATH | OFlag::O_CLOEXEC, Mode::empty()).unwrap();
+
+        let r = reopen_backing_readonly(opath.as_fd());
+        assert!(
+            r.is_err(),
+            "an O_PATH fd must not be laundered into a readable fd: {r:?}"
+        );
+    }
+
+    // r[verify builder.mountd.backing-readonly]
+    /// A write-only fd likewise proves nothing about the client's read
+    /// access (0200 append logs, etc.) — the root re-open would grant
+    /// reads the client never had. Reject it.
+    #[test]
+    fn backing_fd_reopen_rejects_write_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("write-only");
+        std::fs::write(&path, b"secret").unwrap();
+        let wronly =
+            nix::fcntl::open(&path, OFlag::O_WRONLY | OFlag::O_CLOEXEC, Mode::empty()).unwrap();
+
+        let r = reopen_backing_readonly(wronly.as_fd());
+        assert!(
+            r.is_err(),
+            "a write-only fd must not be laundered into a readable fd: {r:?}"
+        );
     }
 
     // r[verify builder.mountd.staging-quota]
