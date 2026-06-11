@@ -274,6 +274,16 @@ impl SchedulerGrpc {
     /// `Unauthenticated`; when no key is configured (dev mode),
     /// `Ok(None)`.
     ///
+    /// The Err carries the typed [`ExecutorAuthDetail`] beside the
+    /// wire status (E1): this is the KNOWING arm — the header probe
+    /// and the HMAC verify are where absent/malformed/bad-signature/
+    /// expired are distinguishable — and the detail must survive the
+    /// module boundary typed, because the terminal-rejection decision
+    /// (and therefore the counting site) lives in `credential_for`,
+    /// where a metadata-carrier failure may still be recovered by a
+    /// verifying body token. Counting here would tally recovered
+    /// carrier failures as rejections.
+    ///
     /// Called per-unary by the `ExecutorService` handlers
     /// (`PullAssignment` binds the body's `intent_id` AND `kind` to
     /// the token's; `ReportOutcome` verifies the same identity before
@@ -284,22 +294,27 @@ impl SchedulerGrpc {
     pub(super) fn require_executor<T>(
         &self,
         req: &Request<T>,
-    ) -> Result<Option<VerifiedExecutor>, Status> {
+    ) -> Result<Option<VerifiedExecutor>, ExecutorAuthFailure> {
         let Some(key) = &self.hmac_key else {
             return Ok(None);
         };
-        let token = req
-            .metadata()
-            .get(rio_proto::EXECUTOR_TOKEN_HEADER)
-            .ok_or_else(|| {
-                Status::unauthenticated(
+        let Some(value) = req.metadata().get(rio_proto::EXECUTOR_TOKEN_HEADER) else {
+            return Err(ExecutorAuthFailure {
+                detail: ExecutorAuthDetail::Absent,
+                status: Status::unauthenticated(
                     "ExecutorService requires x-rio-executor-token when HMAC is configured",
-                )
-            })?
-            .to_str()
-            .map_err(|_| Status::unauthenticated("x-rio-executor-token: non-ASCII value"))?;
-        let claims: ExecutorClaims = key.verify(token).map_err(|e| {
-            Status::unauthenticated(format!("x-rio-executor-token verification failed: {e}"))
+                ),
+            });
+        };
+        let token = value.to_str().map_err(|_| ExecutorAuthFailure {
+            detail: ExecutorAuthDetail::Malformed,
+            status: Status::unauthenticated("x-rio-executor-token: non-ASCII value"),
+        })?;
+        let claims: ExecutorClaims = key.verify(token).map_err(|e| ExecutorAuthFailure {
+            detail: ExecutorAuthDetail::from_hmac_error(&e),
+            status: Status::unauthenticated(format!(
+                "x-rio-executor-token verification failed: {e}"
+            )),
         })?;
         // r[impl sched.executor.confirm-fence]
         // Verification-success site 1 of 2: the fence key is minted
@@ -309,6 +324,74 @@ impl SchedulerGrpc {
             fence_key: ConfirmFenceKey::from_verified_carrier(token.as_bytes()),
         }))
     }
+}
+
+/// E1: WHICH executor-credential fault the knowing arm observed —
+/// minted exactly where the distinction exists (the header probe and
+/// the HMAC verify), before everything merges into the wire's single
+/// `Unauthenticated`. Observability metadata on the SAME judgment:
+/// no consumer re-adjudicates from this value; the wire contract is
+/// untouched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ExecutorAuthDetail {
+    /// No executor credential presented on any carrier.
+    Absent,
+    /// A credential was presented but is not a decodable token:
+    /// non-ASCII metadata bytes, wrong `.`-part count, base64 or
+    /// JSON decode failure.
+    Malformed,
+    /// The token decodes but its HMAC tag does not verify — tampered
+    /// bytes or a wrong/rotated key.
+    BadSignature,
+    /// Signature valid; the expiry claim is in the past. The
+    /// clock-before-epoch refusal folds here too: when the time axis
+    /// cannot be read the token cannot be proven within lifetime, so
+    /// verification fails closed on the same axis.
+    Expired,
+}
+
+impl ExecutorAuthDetail {
+    pub(super) fn as_label(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Malformed => "malformed",
+            Self::BadSignature => "bad_signature",
+            Self::Expired => "expired",
+        }
+    }
+
+    /// THE one fold of [`rio_auth::hmac::HmacError`] into the detail
+    /// alphabet — exhaustive (no wildcard arm), so an HmacError
+    /// variant addition is a compile error here, not a silent
+    /// mis-label.
+    pub(super) fn from_hmac_error(e: &rio_auth::hmac::HmacError) -> Self {
+        use rio_auth::hmac::HmacError as E;
+        match e {
+            E::Format(_) | E::Base64(_) | E::Json(_) => Self::Malformed,
+            E::InvalidSignature => Self::BadSignature,
+            E::Expired { .. } | E::Clock(_) => Self::Expired,
+            // Load-time variants: `verify()` never constructs them
+            // (they belong to `HmacKey::load`). Premise-asserted and
+            // classified malformed for totality.
+            E::Io { .. } | E::EmptyKey => {
+                debug_assert!(
+                    false,
+                    "load-time HmacError variant reached verify-time fold"
+                );
+                Self::Malformed
+            }
+        }
+    }
+}
+
+/// A failed executor-credential verification: the wire [`Status`]
+/// plus the typed detail, produced together at the knowing arm so no
+/// later site can re-derive (and mis-derive) the reason from the
+/// status string. The counting decision is NOT made here — see
+/// `credential_for`: only a terminal rejection counts.
+pub(super) struct ExecutorAuthFailure {
+    pub(super) detail: ExecutorAuthDetail,
+    pub(super) status: Status,
 }
 
 /// The confirm-fence key: SHA-256 hex of EXACTLY the carrier bytes

@@ -377,15 +377,13 @@ impl SchedulerGrpc {
             PayloadCredentialKind::Build { body_token } => {
                 match self.require_executor(req) {
                     Ok(claims) => Ok(ResolvedCredential::Executor(claims)),
-                    Err(metadata_err) => {
+                    Err(metadata_failure) => {
                         if body_token.is_empty() {
                             // Missing/unverifiable executor credential
-                            // (require_executor only mints
-                            // Unauthenticated statuses).
-                            return Err(CredentialRejection::counted(
-                                RejectReason::Unauthenticated,
-                                metadata_err,
-                            ));
+                            // on the only presented carrier — the
+                            // metadata failure IS the terminal
+                            // disposition; its typed detail counts.
+                            return Err(CredentialRejection::counted_executor(metadata_failure));
                         }
                         // r[impl sched.executor.input-bounds+2]
                         rio_common::grpc::check_bound(
@@ -397,19 +395,20 @@ impl SchedulerGrpc {
                         let Some(key) = &self.hmac_key else {
                             // require_executor only fails when a key is
                             // configured; unreachable, but stay closed.
-                            return Err(CredentialRejection::counted(
-                                RejectReason::Unauthenticated,
-                                metadata_err,
-                            ));
+                            return Err(CredentialRejection::counted_executor(metadata_failure));
                         };
                         let claims: rio_auth::hmac::ExecutorClaims =
                             key.verify(body_token).map_err(|e| {
-                                CredentialRejection::counted(
-                                    RejectReason::Unauthenticated,
-                                    Status::unauthenticated(format!(
+                                // The body was the authenticating
+                                // carrier — ITS failure detail is the
+                                // terminal one, superseding the
+                                // metadata carrier's.
+                                CredentialRejection::counted_executor(super::ExecutorAuthFailure {
+                                    detail: super::ExecutorAuthDetail::from_hmac_error(&e),
+                                    status: Status::unauthenticated(format!(
                                         "executor_token verification failed: {e}"
                                     )),
-                                )
+                                })
                             })?;
                         // r[impl sched.executor.confirm-fence]
                         // Verification-success site 2 of 2: the fence
@@ -561,6 +560,14 @@ impl RejectReason {
 pub(super) struct CredentialRejection {
     pub(super) status: Status,
     pub(super) reason: Option<RejectReason>,
+    /// E1: the executor-token detail axis, present exactly when the
+    /// rejection is the terminal disposition of an executor-credential
+    /// failure ([`super::ExecutorAuthFailure`] carried through
+    /// `credential_for`). Rides the SAME judgment — never a second
+    /// adjudication — and feeds the fine
+    /// `rio_scheduler_executor_auth_rejected_total{rpc, reason}`
+    /// counter beside the coarse row at the one consuming path.
+    pub(super) auth_detail: Option<super::ExecutorAuthDetail>,
 }
 
 impl CredentialRejection {
@@ -568,6 +575,20 @@ impl CredentialRejection {
         Self {
             status,
             reason: Some(reason),
+            auth_detail: None,
+        }
+    }
+
+    /// E1: a TERMINAL executor-credential rejection — the coarse
+    /// `unauthenticated` row plus the typed detail from the knowing
+    /// arm. The only constructor that sets the detail axis: a
+    /// carrier failure recovered by the body token never reaches
+    /// here, so recovered failures are structurally uncountable.
+    fn counted_executor(failure: super::ExecutorAuthFailure) -> Self {
+        Self {
+            status: failure.status,
+            reason: Some(RejectReason::Unauthenticated),
+            auth_detail: Some(failure.detail),
         }
     }
 
@@ -575,6 +596,7 @@ impl CredentialRejection {
         Self {
             status,
             reason: None,
+            auth_detail: None,
         }
     }
 
@@ -585,13 +607,23 @@ impl CredentialRejection {
     /// silently drop the classified reason no longer typechecks, so
     /// the compiler enumerates every consumer (the machine witness for
     /// "all credential_for consumers count"). Shape violations
-    /// (reason: None) surface uncounted, as before.
+    /// (reason: None) surface uncounted, as before. The E1 detail row
+    /// increments HERE too — same site, same judgment — so the fine
+    /// and coarse counters cannot drift apart.
     fn into_status_counted(self, rpc: &'static str) -> Status {
         if let Some(reason) = self.reason {
             metrics::counter!(
                 "rio_scheduler_pull_rejected_total",
                 "rpc" => rpc,
                 "reason" => reason.as_label()
+            )
+            .increment(1);
+        }
+        if let Some(detail) = self.auth_detail {
+            metrics::counter!(
+                "rio_scheduler_executor_auth_rejected_total",
+                "rpc" => rpc,
+                "reason" => detail.as_label()
             )
             .increment(1);
         }

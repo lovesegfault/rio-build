@@ -2071,3 +2071,151 @@ async fn pull_assignment_fence_nack_ticks_the_brownout_counter() -> anyhow::Resu
     );
     Ok(())
 }
+
+/// E1 (the 053 mis-narration class): the executor-token lane's four
+/// rejection shapes — absent, malformed, bad signature, expired — are
+/// distinct at the knowing arms (`require_executor`'s header probe,
+/// the HMAC verify) but merge on the wire as `Unauthenticated` and
+/// merged in observability as one `reason=unauthenticated` label, so
+/// a fleet of expired tokens was indistinguishable from token-less
+/// pods. The split is observability metadata on the SAME judgment:
+/// each shape increments its own
+/// `rio_scheduler_executor_auth_rejected_total{reason}` label, the
+/// wire status stays `Unauthenticated` for every shape, and the
+/// coarse `pull_rejected_total{reason=unauthenticated}` row is
+/// unchanged.
+#[tokio::test]
+async fn executor_auth_rejections_split_by_detail() -> anyhow::Result<()> {
+    use rio_auth::hmac::{ExecutorClaims, HmacKey};
+    use rio_proto::ExecutorService;
+    let recorder = rio_test_support::metrics::CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let (_db, mut grpc, _handle, _actor_task) = setup_grpc().await;
+    let key = std::sync::Arc::new(HmacKey::from_key(
+        b"executor-key-32-bytes-long!!!!!!".to_vec(),
+    ));
+    grpc.hmac_key = Some(std::sync::Arc::clone(&key));
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let build_req = || rio_proto::types::PullAssignmentRequest {
+        executor_token: String::new(),
+        intent_id: "drv-auth-detail".into(),
+        kind: rio_proto::types::AttemptKind::Build.into(),
+        executor_instance: String::new(),
+        resume_exec_id: String::new(),
+        claim_nonce: String::new(),
+        confirm_only: false,
+    };
+
+    // Shape 1 — ABSENT: no credential on any carrier.
+    let err = grpc
+        .pull_assignment(Request::new(build_req()))
+        .await
+        .expect_err("credential-less pull must be rejected");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    // Shape 2 — MALFORMED: a presented value that is not a decodable
+    // token (no '.'-separator → HmacError::Format).
+    let mut req = Request::new(build_req());
+    req.metadata_mut()
+        .insert(rio_proto::EXECUTOR_TOKEN_HEADER, "not-a-token".parse()?);
+    let err = grpc
+        .pull_assignment(req)
+        .await
+        .expect_err("an undecodable token must be rejected");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    // Shape 3 — BAD SIGNATURE: a structurally valid token whose tag
+    // does not verify. Tamper the FIRST tag character (the char after
+    // the '.'): the last char carries base64 NO_PAD trailing-bit
+    // constraints, so flipping it can fail DECODE (malformed) instead
+    // of the signature check — and the tag bytes vary per sign() via
+    // the spawn nonce, which would make a last-char flip flaky.
+    let valid = key.sign(&ExecutorClaims {
+        intent_id: "drv-auth-detail".into(),
+        kind: rio_proto::types::ExecutorKind::Builder as i32,
+        expiry_unix: now + 600,
+    });
+    let dot = valid.find('.').expect("token has a '.' separator");
+    let mut tampered = valid.clone();
+    let flipped = if &tampered[dot + 1..dot + 2] == "A" {
+        "B"
+    } else {
+        "A"
+    };
+    tampered.replace_range(dot + 1..dot + 2, flipped);
+    let mut req = Request::new(build_req());
+    req.metadata_mut()
+        .insert(rio_proto::EXECUTOR_TOKEN_HEADER, tampered.parse()?);
+    let err = grpc
+        .pull_assignment(req)
+        .await
+        .expect_err("a tampered token must be rejected");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    // Shape 4 — EXPIRED: signature valid, expiry claim in the past
+    // (the production mint shape with a lapsed lifetime).
+    let expired = key.sign(&ExecutorClaims {
+        intent_id: "drv-auth-detail".into(),
+        kind: rio_proto::types::ExecutorKind::Builder as i32,
+        expiry_unix: now.saturating_sub(600),
+    });
+    let mut req = Request::new(build_req());
+    req.metadata_mut()
+        .insert(rio_proto::EXECUTOR_TOKEN_HEADER, expired.parse()?);
+    let err = grpc
+        .pull_assignment(req)
+        .await
+        .expect_err("an expired token must be rejected");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    // Each shape carried ITS label — the four-way split.
+    for reason in ["absent", "malformed", "bad_signature", "expired"] {
+        assert_eq!(
+            recorder.get(&format!(
+                "rio_scheduler_executor_auth_rejected_total{{reason={reason},rpc=pull_assignment}}"
+            )),
+            1,
+            "shape `{reason}` must increment its own label; keys seen: {:?}",
+            recorder.all_keys()
+        );
+    }
+    // The coarse counter is UNCHANGED in shape: all four shapes still
+    // land on the one unauthenticated row (the split is beside, not
+    // instead).
+    assert_eq!(
+        recorder
+            .get("rio_scheduler_pull_rejected_total{reason=unauthenticated,rpc=pull_assignment}"),
+        4,
+        "the coarse identity row keeps counting every shape"
+    );
+
+    // Dual face — a metadata-carrier failure RECOVERED by a verifying
+    // body token is not a terminal rejection and must not count: the
+    // detail counter stays at the four terminal rejections above.
+    let mut recovered = build_req();
+    recovered.executor_token = valid;
+    // The RPC proceeds past the identity gate (whatever the actor
+    // answers for an unknown intent, it is not an auth rejection).
+    let res = grpc.pull_assignment(Request::new(recovered)).await;
+    if let Err(s) = &res {
+        assert_ne!(
+            s.code(),
+            tonic::Code::Unauthenticated,
+            "a verifying body token must pass the identity gate"
+        );
+    }
+    let total: u64 = ["absent", "malformed", "bad_signature", "expired"]
+        .iter()
+        .map(|r| {
+            recorder.get(&format!(
+                "rio_scheduler_executor_auth_rejected_total{{reason={r},rpc=pull_assignment}}"
+            ))
+        })
+        .sum();
+    assert_eq!(total, 4, "a recovered carrier failure is not counted");
+    Ok(())
+}

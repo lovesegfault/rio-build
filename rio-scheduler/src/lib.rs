@@ -422,6 +422,22 @@ pub fn describe_metrics() {
          their logs are ephemeral, so this counter is the alertable trace."
     );
     describe_counter!(
+        "rio_scheduler_executor_auth_rejected_total",
+        "Executor-token credential rejections by detail (labels: rpc; \
+         reason = absent — no executor credential on any carrier; \
+         malformed — non-ASCII metadata or an undecodable token \
+         (format/base64/json); bad_signature — the HMAC tag does not \
+         verify (tampered bytes or a wrong/rotated key); expired — \
+         signature valid, expiry claim past). Splits the executor-token \
+         slice of pull_rejected_total{reason=unauthenticated} so an \
+         identity episode reads as WHAT failed — a fleet holding expired \
+         tokens vs a key-rotation mismatch vs token-less pods — instead \
+         of one merged label; the wire status stays Unauthenticated for \
+         every shape and the coarse row keeps counting. Counted at the \
+         terminal rejection only: a metadata-carrier failure recovered \
+         by a verifying body token does not count."
+    );
+    describe_counter!(
         "rio_scheduler_pull_establishments_total",
         "Open pull-mode attempts established as unreported executor crashes \
          by the establishment sweep (the C2 charge arm; the store-probe adopt \
