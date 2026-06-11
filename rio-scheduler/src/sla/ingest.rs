@@ -173,7 +173,7 @@ pub fn refit(
         .collect();
 
     if fit_rows.is_empty() {
-        return probe_only(key, rows.last());
+        return probe_only(key, rows.last(), aggregate_disk_p90(rows));
     }
 
     let versions: Vec<_> = fit_rows.iter().map(|r| r.version.clone()).collect();
@@ -365,8 +365,18 @@ pub fn refit(
         .filter(|(r, _)| r.peak_disk_bytes.is_some())
         .map(|(_, &wi)| wi)
         .collect();
-    let disk_p90 =
-        (!disk.is_empty()).then(|| DiskBytes(weighted_quantile(&disk, &disk_w, 0.9) as u64));
+    // r[impl sched.sla.disk-reaches-ephemeral-storage+1]
+    // live_049 L2: disk is a c-INDEPENDENT scalar (sched.sla.disk-
+    // scalar) — its evidence universe is every peaked sample, not the
+    // c-axis subset the duration fit needs. Recency-weighted over the
+    // ring when the c-axis rows carry peaks (unchanged); when they
+    // carry NONE, recover the evidence from the full row set (unit
+    // weights) instead of falling back to the 100 GiB chart prior —
+    // pre-fix, peaked rows without a cpu_limit seat were silently
+    // dropped here and by the probe_only arm's last-row read.
+    let disk_p90 = (!disk.is_empty())
+        .then(|| DiskBytes(weighted_quantile(&disk, &disk_w, 0.9) as u64))
+        .or_else(|| aggregate_disk_p90(rows));
 
     let log_residuals: Vec<f64> = if matches!(fit, DurationFit::Probe) {
         Vec::new()
@@ -719,18 +729,40 @@ pub(super) fn reassign_tier(
     Some(bounded[i].0.to_string())
 }
 
+// r[impl sched.sla.disk-reaches-ephemeral-storage+1]
+/// live_049 L2: the disk p90 over EVERY row carrying a peak, unit
+/// weights — the probe-shaped fit's disk aggregate. Pre-fix the
+/// probe_only arm read ONLY the last row (a serial pname with five
+/// observed peaks whose newest row lacked one fell back to the 100 GiB
+/// chart default forever — the un-fitted population the live ramp
+/// measured at ~189-201 GiB/pod). Unit weights: the full-fit path's
+/// recency weighting needs the ring's ordinal ages, which the
+/// probe-only arm doesn't compute; a uniform p90 over the available
+/// peaks is strictly better evidence than one row or none, and the
+/// full fit takes over (weighted) as soon as c-diversity exists.
+fn aggregate_disk_p90(rows: &[BuildSampleRow]) -> Option<DiskBytes> {
+    let disk: Vec<f64> = rows
+        .iter()
+        .filter_map(|r| r.peak_disk_bytes.map(|b| b as f64))
+        .collect();
+    let w = vec![1.0; disk.len()];
+    (!disk.is_empty()).then(|| DiskBytes(weighted_quantile(&disk, &w, 0.9) as u64))
+}
+
 /// No usable c-axis samples → emit a Probe placeholder so the explore
 /// ladder (Task 5.2) can pick a first c. `last` (if any) seeds `last_wall`.
-fn probe_only(key: &ModelKey, last: Option<&BuildSampleRow>) -> FittedParams {
+fn probe_only(
+    key: &ModelKey,
+    last: Option<&BuildSampleRow>,
+    disk_p90: Option<DiskBytes>,
+) -> FittedParams {
     FittedParams {
         key: key.clone(),
         fit: DurationFit::Probe,
         mem: MemFit::Independent {
             p90: MemBytes(last.map(|r| r.peak_memory_bytes as u64).unwrap_or(0)),
         },
-        disk_p90: last
-            .and_then(|r| r.peak_disk_bytes)
-            .map(|b| DiskBytes(b as u64)),
+        disk_p90,
         sigma_resid: 0.2,
         log_residuals: Vec::new(),
         n_eff_ring: RingNEff(0.0),
@@ -1676,5 +1708,97 @@ mod tests {
             "post-filter Σw over 3 rows NOT 8; got {}",
             f.sum_w
         );
+    }
+}
+
+#[cfg(test)]
+mod disk_axis_tests {
+    use super::*;
+    use crate::sla::types::ModelKey;
+
+    fn key() -> ModelKey {
+        ModelKey {
+            pname: "p".into(),
+            system: "x86_64-linux".into(),
+            tenant: "t".into(),
+        }
+    }
+
+    /// One sample with an optional c-axis seat and disk peak.
+    fn disk_row(c: Option<f64>, t: f64, peak_disk: Option<i64>) -> BuildSampleRow {
+        BuildSampleRow {
+            pname: "p".into(),
+            system: "x86_64-linux".into(),
+            tenant: "t".into(),
+            duration_secs: t,
+            peak_memory_bytes: 256 << 20,
+            cpu_limit_cores: c,
+            cpu_seconds_total: c.map(|cc| t * cc * 0.5),
+            peak_disk_bytes: peak_disk,
+            completed_at: now_epoch(),
+            ..Default::default()
+        }
+    }
+
+    // r[verify sched.sla.disk-reaches-ephemeral-storage+1]
+    /// **R8 (ingest half) + W7-H** — *the fit retires the disk prior
+    /// on the probe_only arm too*: a pname with fewer than two c-axis
+    /// rows (the `kept.len() < 2` early return) but MULTIPLE observed
+    /// peaks carries the aggregated p90, not the last row's absent
+    /// one. Pre-fix red (left, reverse-strawman transcript in the
+    /// commit body): `disk_p90 == None` — `probe_only` read ONLY
+    /// `rows.last()`, so two real observations were erased by one
+    /// peak-less newest row and the consumer fell back to the 100 GiB
+    /// chart default. DIVERGENCE recorded (R5): the book's R8 premise
+    /// ("warm pname on default") holds at tree ONLY for populations
+    /// whose peaks sit outside the c-axis subset — the full-fit
+    /// quantile aggregated peaked C-AXIS rows already (the book's own
+    /// evidence cites :360-:365), but filtered disk evidence to
+    /// `fit_rows` even though disk is a c-independent scalar, and the
+    /// probe_only arm read one row; both arms now recover the full
+    /// evidence universe. The live 100 GiB fleet population is the
+    /// prjquota-less pool (peaks recorded NULL — the sla-sizing.typ-
+    /// named residual: no fit can conjure absent data; the envelope
+    /// types its prior for it).
+    #[test]
+    fn probe_only_disk_p90_aggregates_all_observed_rows() {
+        const GI: i64 = 1 << 30;
+        let rows = vec![
+            // Legacy/peaked rows without a usable c-axis seat.
+            disk_row(None, 100.0, Some(2 * GI)),
+            disk_row(None, 101.0, Some(3 * GI)),
+            // Newest row: the only c-axis seat, no peak recorded.
+            disk_row(Some(4.0), 100.2, None),
+        ];
+        let f = refit(&key(), &rows, None, &[], &HwTable::default(), None);
+        assert!(
+            matches!(f.fit, DurationFit::Probe),
+            "precondition: <2 c-axis rows takes the probe_only arm"
+        );
+        let p90 = f.disk_p90.expect(
+            "the disk aggregate covers EVERY observed row — a peak-less \
+             newest row no longer erases two real observations \
+             (pre-fix: None)",
+        );
+        assert!(
+            p90.0 >= 2 * GI as u64 && p90.0 <= 3 * GI as u64,
+            "p90 of the observed peaks (2,3 GiB), got {}",
+            p90.0
+        );
+    }
+
+    // r[verify sched.sla.disk-reaches-ephemeral-storage+1]
+    /// Cold rows (zero peaks anywhere) stay None — no evidence is no
+    /// evidence; the envelope's prior arm (the chart default) is the
+    /// designed cold-start posture (kill-isolation for W7-H: the
+    /// aggregate never invents data).
+    #[test]
+    fn no_disk_observations_stay_unfitted() {
+        let rows = vec![
+            disk_row(Some(4.0), 100.0, None),
+            disk_row(None, 101.0, None),
+        ];
+        let f = refit(&key(), &rows, None, &[], &HwTable::default(), None);
+        assert_eq!(f.disk_p90, None);
     }
 }

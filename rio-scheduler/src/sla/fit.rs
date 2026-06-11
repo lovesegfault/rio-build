@@ -1,6 +1,66 @@
 use nalgebra::{DMatrix, DVector};
 
-use super::types::{DurationFit, FitDf, MemBytes, MemFit, RawCores, RefSeconds, RingNEff};
+use super::types::{
+    DiskBytes, DurationFit, FitDf, MemBytes, MemFit, RawCores, RefSeconds, RingNEff,
+};
+
+// r[impl sched.sla.disk-reaches-ephemeral-storage+1]
+/// live_049 L2: the typed disk-axis envelope — `floor ≤ fitted ≤
+/// ceiling` BY CONSTRUCTION (the constructor clamps; R9's ordering
+/// law). The disk request gets the same lifecycle cores/mem have:
+///
+/// - `fitted` = the per-pname observed p90 when ANY disk observation
+///   exists (the ingest aggregate — including probe-shaped fits, whose
+///   single-row read this WO widened to the full aggregate), else the
+///   cold-start PRIOR (`sla.defaultDisk`) that observation RETIRES —
+///   mirroring the mem axis's observed-or-probe-shape form, NOT a
+///   blend toward the chart constant (a 100 GiB blend would never
+///   shrink to a small fitted value);
+/// - `floor` = the probe's own scratch footprint ([`Self::FLOOR_BYTES`]
+///   — unpack + outputs of a bounded probe; mirrors the trivial-builder
+///   `LOCAL_DISK_BYTES` lane in `solve.rs`, census-pinned);
+/// - `ceiling` = `sla.maxDisk` — the operator bound (the solve-side
+///   `.min(max_disk)` clamps are this law's other impl sites).
+///
+/// This envelope is the constructor for the EXPLORE lane's disk
+/// request (probe + warm paths); the `solve.rs` fallback arms read the
+/// same `(prior, ceiling)` pair and benefit from the widened `disk_p90`
+/// automatically (census rows in the explore tests name every lane).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskFitEnvelope {
+    pub floor: DiskBytes,
+    pub fitted: DiskBytes,
+    pub ceiling: DiskBytes,
+}
+
+impl DiskFitEnvelope {
+    /// Minimal scratch a probe build needs (source unpack + outputs).
+    /// Mirrors `solve::LOCAL_DISK_BYTES` (1 GiB — the trivial-builder
+    /// disk const); the agreement is pinned by `disk_envelope_floor_
+    /// mirrors_local_disk` below.
+    pub const FLOOR_BYTES: u64 = 1 << 30;
+
+    /// Derive the envelope. Ordering law `floor ≤ fitted ≤ ceiling`
+    /// holds by construction for every input (an inverted
+    /// configuration — ceiling below the floor — saturates at the
+    /// ceiling: the operator bound wins, typed).
+    pub fn derive(observed_p90: Option<DiskBytes>, prior: u64, ceiling: u64) -> Self {
+        let floor = Self::FLOOR_BYTES.min(ceiling);
+        let fitted = observed_p90
+            .map_or(prior, |d| d.0)
+            .clamp(floor, ceiling.max(floor));
+        Self {
+            floor: DiskBytes(floor),
+            fitted: DiskBytes(fitted),
+            ceiling: DiskBytes(ceiling),
+        }
+    }
+
+    /// The dispatch request — the fitted point of the envelope.
+    pub fn request(&self) -> DiskBytes {
+        self.fitted
+    }
+}
 
 // r[impl sched.sla.hw-class.sample-weight-ordinal]
 // r[impl sched.sla.fit-nnls]  (weights are part of the fit contract)
@@ -807,5 +867,50 @@ mod tests {
             .at(RawCores(64.0)),
             MemBytes(4096)
         );
+    }
+}
+
+#[cfg(test)]
+mod disk_envelope_tests {
+    use super::*;
+
+    // r[verify sched.sla.disk-reaches-ephemeral-storage+1]
+    /// **R9 + W7-I** — the envelope ordering law `floor ≤ fitted ≤
+    /// ceiling` over the ADVERSARIAL population (hand-oracle rows,
+    /// never the impl's own min/max expression): zero observations,
+    /// small observation, huge outlier above the ceiling, a prior
+    /// above the ceiling, and an inverted configuration (ceiling below
+    /// the floor — the operator bound saturates, typed). Each row pins
+    /// the exact fitted value.
+    #[test]
+    fn disk_envelope_ordering_law_product() {
+        const GI: u64 = 1 << 30;
+        // (observed, prior, ceiling, want_fitted)
+        let rows: &[(Option<u64>, u64, u64, u64)] = &[
+            (None, 100 * GI, 200 * GI, 100 * GI),           // cold: prior
+            (Some(2 * GI), 100 * GI, 200 * GI, 2 * GI),     // warm: p90 retires prior
+            (Some(500 * GI), 100 * GI, 200 * GI, 200 * GI), // outlier: ceiling clamps
+            (None, 500 * GI, 200 * GI, 200 * GI),           // prior above ceiling: clamps
+            (Some(1), 100 * GI, 200 * GI, GI),              // degenerate tiny obs: floor
+            (Some(2 * GI), 100 * GI, GI / 2, GI / 2),       // inverted: ceiling wins
+        ];
+        for &(obs, prior, ceiling, want) in rows {
+            let e = DiskFitEnvelope::derive(obs.map(DiskBytes), prior, ceiling);
+            assert_eq!(e.fitted.0, want, "row ({obs:?}, {prior}, {ceiling})");
+            assert!(
+                e.floor.0 <= e.fitted.0 && e.fitted.0 <= e.ceiling.0.max(e.floor.0),
+                "ordering law on ({obs:?}, {prior}, {ceiling}): {e:?}"
+            );
+            assert_eq!(e.request(), e.fitted, "the request IS the fitted point");
+        }
+    }
+
+    /// The floor mirrors the trivial-builder `LOCAL_DISK_BYTES` lane
+    /// (solve.rs, private const 1 GiB) — the literal pin keeps the two
+    /// lanes in lockstep; a change to either side fails one of the two
+    /// pins (this one or `intent_for_prefer_local_is_minimal`).
+    #[test]
+    fn disk_envelope_floor_mirrors_local_disk() {
+        assert_eq!(DiskFitEnvelope::FLOOR_BYTES, 1 << 30);
     }
 }

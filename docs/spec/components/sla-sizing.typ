@@ -180,7 +180,14 @@ $S_(x x) = sum w_i (log c_i - overline(log c))^2$, and $overline(log c) := (sum 
   ),
 ) <fig-disk-probe>
 
-#r("sched.sla.disk-reaches-ephemeral-storage")
+#r("sched.sla.disk-reaches-ephemeral-storage+1")
+
+The disk input to `pod_ephemeral_request` MUST be a fitted, typed envelope —
+`floor <= fitted <= ceiling` (`DiskFitEnvelope`): the per-pname observed p90
+(aggregated over every peaked sample, probe-shaped fits included) retires the
+`sla.defaultDisk` cold-start prior, the floor is the probe's own scratch
+footprint, and the ceiling is `sla.maxDisk`; a flat default is a cold-start
+prior that observation MUST retire, never a steady state.
 
 Measurement reads kubelet's own XFS/ext4 *project quota* on the emptyDir, a node-local scratch volume. Kubelet (`LocalStorageCapacityIsolationFSQuotaMonitoring=true`) assigns the project ID; the @supervisor scrapes it via `FS_IOC_FSGETXATTR` on the dir inode and reads usage with `quotactl_fd()`. This requires Linux $>= 5.14$ and piggybacks the @supervisor#"'"s existing `CAP_SYS_ADMIN` from the overlay mount; the older `quotactl()` needs a block-device path the container cannot see. The read is kernel-tracked $O(1)$ and polled in the #qty("1", "Hz") `cpu_poll` loop. On the gp3-root pool today — `-o prjquota` lands with the NVMe-backed EC2NodeClass in v1.1 — kubelet falls back to \~#qty("60", "s") `du` polls and $D$ is *recorded as NULL*. The no-neighbor-eviction guarantee below holds only on the prjquota-enabled pool, and the request falls back to `sla.defaultDisk`. A statvfs-delta fallback was rejected because other pods on the same node would cross-contaminate it. The build tempdir lands inside this subtree by default — nix ≥2.30 sets `build-dir = ${stateDir}/builds` — so the quota captures intermediate object files, not just outputs.
 

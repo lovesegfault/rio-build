@@ -257,7 +257,13 @@ pub fn next(
     let mem_for = |c: f64| MemBytes((c * probe.mem_per_core as f64 + probe.mem_base as f64) as u64);
 
     let Some(f) = fit else {
-        return decision(probe.cpu, mem_for, DiskBytes(cfg.default_disk));
+        // r[impl sched.sla.disk-reaches-ephemeral-storage+1]
+        // live_049 L2: the cold-pname probe rides the typed envelope —
+        // fitted = the prior (no observation yet), floor/ceiling law
+        // applied. Same value as the bare default when defaultDisk is
+        // within [floor, maxDisk]; typed + clamped when it is not.
+        let env = super::fit::DiskFitEnvelope::derive(None, cfg.default_disk, ceil.max_disk);
+        return decision(probe.cpu, mem_for, env.request());
     };
     // `resource_floor` is per-drv_hash so a fresh version would
     // otherwise re-climb OOM/DiskPressure from probe defaults. Disk is
@@ -275,7 +281,12 @@ pub fn next(
                 .max((f.mem.at(RawCores(c)).0 as f64 * h) as u64),
         )
     };
-    let disk = DiskBytes(f.disk_p90.map(|d| d.0).unwrap_or(cfg.default_disk));
+    // r[impl sched.sla.disk-reaches-ephemeral-storage+1]
+    // live_049 L2: the warm path's disk request is the typed envelope —
+    // the observed per-pname p90 (now aggregated for probe-shaped fits
+    // too) retires the 100 GiB prior; floor/ceiling by construction.
+    let disk =
+        super::fit::DiskFitEnvelope::derive(f.disk_p90, cfg.default_disk, ceil.max_disk).request();
     let st = &f.explore;
     // First sample landed but min/max not yet diverse → treat as cold.
     if st.max_c.0 <= 0.0 {
@@ -1076,5 +1087,169 @@ mod tests {
             d.c.0, 192.0,
             "frozen at the resolved global wall — re-emit max_c, do not climb"
         );
+    }
+}
+
+#[cfg(test)]
+mod disk_axis_tests {
+    use super::*;
+    use crate::sla::config::SlaConfig;
+    use crate::sla::ingest::refit;
+    use crate::sla::solve::Ceilings;
+    use crate::sla::types::{
+        DurationFit, ExploreState, FitDf, MemFit, ModelKey, RingNEff, WallSeconds,
+    };
+
+    fn cfg_and_ceil() -> (SlaConfig, Ceilings) {
+        let cfg = SlaConfig {
+            default_disk: 100 << 30, // the shipped 100 GiB chart default
+            max_disk: 200 << 30,
+            ..SlaConfig::test_default()
+        };
+        let ceil = Ceilings {
+            max_cores: 64.0,
+            max_mem: 256 << 30,
+            max_disk: cfg.max_disk,
+            default_disk: cfg.default_disk,
+        };
+        (cfg, ceil)
+    }
+
+    // r[verify sched.sla.disk-reaches-ephemeral-storage+1]
+    /// **R8 + W7-H** — *the warm pname's disk request is FITTED, not
+    /// the default*: five serial samples with small observed peaks,
+    /// the newest peak-less, through the PRODUCTION ingest → explore
+    /// pipeline. Structural ratio assert with ≥10× slack (no
+    /// wall-clock): the fitted request collapses from the 100 GiB
+    /// prior to ~p90(2-3 GiB) — the `pod_ephemeral_request` input that
+    /// turned ~189-201 GiB/pod into a fitted footprint (the L2 live
+    /// waste; the consumer arithmetic is byte-identical, fed fitted
+    /// input). Pre-fix red (left): `disk == default_disk` (100 GiB).
+    #[test]
+    fn warm_pname_disk_request_is_fitted_not_default() {
+        const GI: i64 = 1 << 30;
+        let row = |t: f64, peak: Option<i64>| crate::db::BuildSampleRow {
+            pname: "p".into(),
+            system: "x86_64-linux".into(),
+            tenant: "t".into(),
+            duration_secs: t,
+            peak_memory_bytes: 256 << 20,
+            // Peaked rows carry no c-axis seat → the probe_only arm
+            // (the reachable pre-fix gap; full-fit rows aggregate
+            // pre-fix already — divergence recorded at the ingest red).
+            cpu_limit_cores: peak.is_none().then_some(4.0),
+            cpu_seconds_total: peak.is_none().then_some(t * 2.0),
+            peak_disk_bytes: peak,
+            completed_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64(),
+            ..Default::default()
+        };
+        // The probe_only-reachable population (R5 divergence in the
+        // ingest red's doc): <2 c-axis rows, peaks on the others.
+        let rows = vec![
+            row(100.0, Some(2 * GI)),
+            row(101.0, Some(2 * GI)),
+            row(99.0, Some(3 * GI)),
+            row(100.5, Some(2 * GI)),
+            row(100.2, None),
+        ];
+        let key = ModelKey {
+            pname: "p".into(),
+            system: "x86_64-linux".into(),
+            tenant: "t".into(),
+        };
+        let f = refit(
+            &key,
+            &rows,
+            None,
+            &[],
+            &crate::sla::hw::HwTable::default(),
+            None,
+        );
+        let (cfg, ceil) = cfg_and_ceil();
+        let d = next(Some(&f), &cfg, &Default::default(), &ceil);
+        assert!(
+            d.disk.0 * 10 <= cfg.default_disk,
+            "fitted request ({}) retires the {} prior by ≥10x \
+             (pre-fix: == default)",
+            d.disk.0,
+            cfg.default_disk
+        );
+        assert!(
+            d.disk.0 >= 2 * GI as u64,
+            "and stays at the observed p90 scale, never below the evidence"
+        );
+    }
+
+    // r[verify sched.sla.disk-reaches-ephemeral-storage+1]
+    /// The cold-pname probe keeps the prior (the designed cold-start
+    /// posture — the default IS the cold prior, typed through the
+    /// envelope; the existing :949/:963 default-path pins re-derived:
+    /// they pin the ZERO-observation arm, which survives).
+    #[test]
+    fn cold_pname_probe_keeps_the_prior() {
+        let (cfg, ceil) = cfg_and_ceil();
+        let d = next(None, &cfg, &Default::default(), &ceil);
+        assert_eq!(d.disk.0, cfg.default_disk);
+    }
+
+    // r[verify sched.sla.disk-reaches-ephemeral-storage+1]
+    /// Ceiling law at the explore seam: a fit whose p90 exceeds
+    /// `sla.maxDisk` is clamped typed (the envelope's ceiling arm) —
+    /// the warm path can never request past the operator bound.
+    #[test]
+    fn warm_pname_disk_request_clamps_at_max_disk() {
+        let (cfg, ceil) = cfg_and_ceil();
+        let mut f = crate::sla::types::FittedParams {
+            key: ModelKey {
+                pname: "p".into(),
+                system: "x86_64-linux".into(),
+                tenant: "t".into(),
+            },
+            ..test_fit_shell()
+        };
+        f.disk_p90 = Some(DiskBytes(500 << 30));
+        let d = next(Some(&f), &cfg, &Default::default(), &ceil);
+        assert_eq!(d.disk.0, cfg.max_disk, "ceiling clamps the outlier, typed");
+    }
+
+    /// Minimal fitted shell for the clamp test (probe-shaped — the
+    /// explore path reads only disk/explore state from it here).
+    fn test_fit_shell() -> crate::sla::types::FittedParams {
+        crate::sla::types::FittedParams {
+            key: ModelKey {
+                pname: "x".into(),
+                system: "x86_64-linux".into(),
+                tenant: String::new(),
+            },
+            fit: DurationFit::Probe,
+            mem: MemFit::Independent {
+                p90: crate::sla::types::MemBytes(0),
+            },
+            disk_p90: None,
+            sigma_resid: 0.2,
+            log_residuals: Vec::new(),
+            n_eff_ring: RingNEff(0.0),
+            fit_df: FitDf(0.0),
+            n_distinct_c: 0,
+            sum_w: 0.0,
+            span: 1.0,
+            explore: ExploreState {
+                distinct_c: 0,
+                min_c: RawCores(0.0),
+                max_c: RawCores(0.0),
+                saturated: false,
+                last_wall: WallSeconds(0.0),
+            },
+            t_min_ci: None,
+            ci_computed_at: None,
+            tier: None,
+            hw_bias: Default::default(),
+            alpha: crate::sla::alpha::UNIFORM,
+            prior_source: None,
+            is_fod: false,
+        }
     }
 }
