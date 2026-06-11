@@ -685,6 +685,85 @@ fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     out
 }
 
+/// A pre-existing symlink at `dest` must make restore FAIL, not be
+/// followed (CVE-2021-31566 class). `restore_path_streaming`'s contract
+/// is "`dest` must NOT exist"; before the fd-based metadata fix,
+/// `File::create(dest)` followed a planted symlink and clobbered the
+/// target — content AND the path-based `set_permissions`/mtime writes
+/// all landed on the victim. With `File::create_new` the open is
+/// `O_EXCL` and never follows; the victim stays untouched.
+#[test]
+fn restore_streaming_refuses_symlink_at_dest_file() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::TempDir::new()?;
+    let victim = tmp.path().join("victim.txt");
+    std::fs::write(&victim, "secret")?;
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600))?;
+    let dest = tmp.path().join("dest");
+    std::os::unix::fs::symlink(&victim, &dest)?;
+
+    // Executable regular-file NAR: exercises both the content write and
+    // the 0o755 chmod — neither may reach `victim` through the symlink.
+    let mut nar = Vec::new();
+    serialize(&mut nar, &reg(true, b"pwned"))?;
+
+    let res = restore_path_streaming(&mut Cursor::new(&nar), &dest);
+    assert!(
+        res.is_err(),
+        "restore onto a pre-existing symlink must fail, got {res:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&victim)?,
+        "secret",
+        "symlink at dest was followed: victim content clobbered"
+    );
+    assert_eq!(
+        std::fs::metadata(&victim)?.permissions().mode() & 0o777,
+        0o600,
+        "symlink at dest was followed: victim permissions changed"
+    );
+    Ok(())
+}
+
+/// Directory variant of the symlink-at-dest guard: a planted symlink to
+/// a victim directory must fail the restore (`mkdir` returns `EEXIST`
+/// on a symlink regardless of its target) — nothing may be created
+/// inside the victim and its metadata must stay untouched.
+#[test]
+fn restore_streaming_refuses_symlink_at_dest_dir() -> anyhow::Result<()> {
+    let tmp = tempfile::TempDir::new()?;
+    let victim = tmp.path().join("victim-dir");
+    std::fs::create_dir(&victim)?;
+    let victim_mtime = std::fs::metadata(&victim)?.modified()?;
+    let dest = tmp.path().join("dest");
+    std::os::unix::fs::symlink(&victim, &dest)?;
+
+    let mut nar = Vec::new();
+    serialize(
+        &mut nar,
+        &NarNode::Directory {
+            entries: vec![entry("planted.txt", reg(false, b"pwned"))],
+        },
+    )?;
+
+    let res = restore_path_streaming(&mut Cursor::new(&nar), &dest);
+    assert!(
+        res.is_err(),
+        "restore onto a symlinked directory must fail, got {res:?}"
+    );
+    assert!(
+        std::fs::read_dir(&victim)?.next().is_none(),
+        "symlink at dest was followed: entry created inside victim dir"
+    );
+    assert_eq!(
+        std::fs::metadata(&victim)?.modified()?,
+        victim_mtime,
+        "symlink at dest was followed: victim dir mtime canonicalized"
+    );
+    Ok(())
+}
+
 /// Same path-traversal guard as `parse`: `..`, `/`, NUL, empty, `.`
 /// in entry names are rejected BEFORE any filesystem write under
 /// `dest` for that name.

@@ -31,35 +31,53 @@ const STREAM_CHUNK: usize = 256 * 1024;
 /// by the NAR.
 const CANON_MTIME_SECS: u64 = 1;
 
-/// Set `dest`'s `atime`/`mtime` to the canonical Nix store-path value
-/// ([`CANON_MTIME_SECS`]). Mirrors the timestamp half of Nix's
+/// The canonical Nix store-path `atime`/`mtime` ([`CANON_MTIME_SECS`])
+/// as a [`std::fs::FileTimes`]. Mirrors the timestamp half of Nix's
 /// `canonicalisePathMetaData` so a restored store path is byte-for-byte
 /// what `nix-store --import` would have produced.
 ///
-/// Does nothing for symlinks: `std` has no `lutimes`/`utimensat(NOFOLLOW)`
+/// Applied via [`std::fs::File::set_times`] (`futimens(2)`) through the
+/// fd each call site already holds — NEVER by re-opening the path.
+/// Re-resolving `dest` after creating it is a TOCTOU window
+/// (CVE-2021-31566 class): a concurrent attacker with write access to
+/// the destination tree can swap in a symlink between create and
+/// chmod/utimens and retarget the metadata write.
+///
+/// Not applied to symlinks: `std` has no `lutimes`/`utimensat(NOFOLLOW)`
 /// wrapper, the `set-source-date-epoch-to-latest.sh` `postUnpackHook`
 /// (the consumer this fix exists for) only scans `find -type f`, and the
 /// FUSE attribute layer (`stat_to_attr`) hardcodes canonical times for
 /// every node type regardless of on-disk state, so a non-canonical
 /// on-disk symlink mtime is never observable from inside a build.
 ///
-/// **Ordering:** for directories this MUST be called *after* all children
-/// are written. Creating/renaming a child entry updates the parent's
-/// `mtime`; setting a child's *own* `mtime` does not. `restore_node`'s
-/// post-recursion call site satisfies this.
-fn set_canonical_mtime(dest: &std::path::Path) -> io::Result<()> {
+/// **Ordering:** for directories the times MUST be set *after* all
+/// children are written. Creating/renaming a child entry updates the
+/// parent's `mtime`; setting a child's *own* `mtime` does not.
+/// `restore_node`'s post-recursion call site satisfies this.
+fn canonical_times() -> std::fs::FileTimes {
     use std::time::{Duration, SystemTime};
     let canon = SystemTime::UNIX_EPOCH + Duration::from_secs(CANON_MTIME_SECS);
-    // O_RDONLY suffices — `futimens(2)` only requires the fd's owner to
-    // match (or `CAP_FOWNER`), not write permission. Works on directory
-    // fds (`O_RDONLY` on a dir is valid on Linux). `OpenOptions` rather
-    // than `File::open` to make the intent explicit.
-    let f = std::fs::OpenOptions::new().read(true).open(dest)?;
-    f.set_times(
-        std::fs::FileTimes::new()
-            .set_accessed(canon)
-            .set_modified(canon),
-    )
+    std::fs::FileTimes::new()
+        .set_accessed(canon)
+        .set_modified(canon)
+}
+
+/// Open `dest` as a directory fd for metadata application, refusing to
+/// follow a symlink in the final component (`O_NOFOLLOW` → `ELOOP`).
+/// Used by `restore_node` right after `create_dir` so the canonical
+/// mtime set after the children are written goes through a held fd
+/// instead of re-resolving the path (see [`canonical_times`] for the
+/// TOCTOU rationale).
+///
+/// `O_RDONLY` suffices — `futimens(2)` only requires the fd's owner to
+/// match (or `CAP_FOWNER`), not write permission, and `O_RDONLY` on a
+/// directory is valid on Linux.
+fn open_dir_nofollow(dest: &std::path::Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dest)
 }
 
 /// Eager in-memory NAR dump. Test/fuzz oracle only — production uses
@@ -363,7 +381,11 @@ fn restore_node(r: &mut impl Read, dest: &std::path::Path, depth: usize) -> Resu
             // `vec![0; len]` — peak alloc is one STREAM_CHUNK buffer.
             // No MAX_CONTENT_SIZE check (caller bounds total upstream).
             let len = read_u64(r)?;
-            let mut f = std::fs::File::create(dest)?;
+            // `create_new` (O_CREAT|O_EXCL) — never follows a planted
+            // symlink at `dest` (contract: `dest` must NOT exist). All
+            // metadata below is applied through this held fd, never by
+            // path (see `canonical_times` for the TOCTOU rationale).
+            let mut f = std::fs::File::create_new(dest)?;
             let mut buf = vec![0u8; STREAM_CHUNK];
             let mut remaining = len;
             while remaining > 0 {
@@ -387,20 +409,32 @@ fn restore_node(r: &mut impl Read, dest: &std::path::Path, depth: usize) -> Resu
             }
             // Consume NAR padding to 8-byte boundary (validated zero).
             consume_padding(r, len as usize)?;
-            drop(f);
             if executable {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755))?;
+                f.set_permissions(std::fs::Permissions::from_mode(0o755))?;
             }
             // Canonical mtime LAST — after `write_all` (which bumps
-            // mtime) and `set_permissions` (which only bumps ctime per
-            // POSIX, but ordering it before the mtime set keeps the
-            // sequence obviously-correct on a non-POSIX FS).
-            set_canonical_mtime(dest)?;
+            // mtime) and the chmod (which only bumps ctime per POSIX,
+            // but ordering it before the mtime set keeps the sequence
+            // obviously-correct on a non-POSIX FS).
+            f.set_times(canonical_times())?;
             expect_str(r, ")")?;
         }
         "directory" => {
             std::fs::create_dir(dest)?;
+            // Directory fd taken immediately after mkdir; the
+            // post-children mtime goes through it instead of a
+            // path-based utimens (see `canonical_times`). O_NOFOLLOW
+            // turns a symlink swapped in since the mkdir into an error.
+            //
+            // TODO: children are still created by path (`dest.join(name)`
+            // below), so a concurrent swap of `dest` for a symlink after
+            // this open can redirect creation of NEW entries into the
+            // symlink target (never overwrites — create_new/create_dir/
+            // symlink all fail on existing paths). Closing that needs
+            // openat()-relative creation with a dirfd per level; the
+            // metadata writes themselves are fd-based and unaffected.
+            let dir = open_dir_nofollow(dest)?;
             let mut prev_name: Option<String> = None;
             let mut count = 0usize;
             loop {
@@ -450,7 +484,7 @@ fn restore_node(r: &mut impl Read, dest: &std::path::Path, depth: usize) -> Resu
             // created an entry under `dest`, refreshing its mtime each
             // time. (A child setting its *own* mtime does NOT refresh the
             // parent's — only namespace operations do.)
-            set_canonical_mtime(dest)?;
+            dir.set_times(canonical_times())?;
         }
         "symlink" => {
             expect_str(r, "target")?;
@@ -461,7 +495,7 @@ fn restore_node(r: &mut impl Read, dest: &std::path::Path, depth: usize) -> Resu
                 source: e,
             })?;
             std::os::unix::fs::symlink(&target, dest)?;
-            // No mtime canonicalization for symlinks: `set_canonical_mtime`
+            // No mtime canonicalization for symlinks: `canonical_times`
             // documents why this is correct (no `std` API, the consumer
             // hooks ignore symlinks, FUSE serve-side covers it).
             expect_str(r, ")")?;
@@ -629,5 +663,30 @@ mod tests {
         let dest = tempfile::tempdir().unwrap();
         let dest_root = dest.path().join("out");
         restore_path_streaming(&mut streamed.as_slice(), &dest_root).unwrap();
+    }
+
+    /// The directory-fd open used for post-children mtime application
+    /// must refuse a symlink in the final component (ELOOP), not follow
+    /// it — this is what closes the mkdir→utimens TOCTOU window
+    /// (CVE-2021-31566 class) when an attacker swaps `dest` for a
+    /// symlink mid-restore.
+    #[test]
+    fn open_dir_nofollow_rejects_symlinked_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let err = open_dir_nofollow(&link).unwrap_err();
+        // O_NOFOLLOW on a symlink is ELOOP; combined with O_DIRECTORY,
+        // Linux reports ENOTDIR ("not a directory" wins). Accept either —
+        // the invariant is that the open FAILS instead of following.
+        assert!(
+            matches!(err.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)),
+            "got {err:?}"
+        );
+        // The real directory still opens fine.
+        open_dir_nofollow(&real).unwrap();
     }
 }

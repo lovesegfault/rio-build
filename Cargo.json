@@ -20228,6 +20228,10 @@
           "packageId": "hex"
         },
         {
+          "name": "libc",
+          "packageId": "libc"
+        },
+        {
           "name": "serde_json",
           "packageId": "serde_json"
         },
