@@ -208,10 +208,15 @@ impl DagActor {
                 // (the B2 attribution plane stays honest).
                 self.drain_admin_fast_lane();
                 t_phase = Instant::now();
-                // W9-AG hook: the synthetic stall is attributed to the
-                // FOLLOWING phase (sleep after the timer reset) so the
-                // phase histogram shows the modeled load.
-                #[cfg(test)]
+                // W9-AG hook (no-op in production builds): the
+                // synthetic stall is attributed to the FOLLOWING
+                // phase (sleep after the timer reset) so the phase
+                // histogram shows the modeled load. The call is
+                // UNCONDITIONAL — its cfg(test) gate lives at
+                // statement level inside the helper body: a cfg
+                // attribute here, inside macro_rules tokens, is
+                // opaque to the RetentionTruth corpus pruner's syn
+                // walk and trips its corpus floor.
                 self.test_stall_phase().await;
             };
         }
@@ -342,8 +347,13 @@ impl DagActor {
 
     /// W9-AG: consume one armed phase stall (REAL sleep — the admin
     /// latency SLO is a wall-clock law, paused-clock-free by design).
-    #[cfg(test)]
+    /// Empty in production builds: the gate is a statement-level
+    /// `#[cfg(test)]` INSIDE the body (the chunks.rs/fsync_recorder
+    /// house shape, the RetentionTruth pruner's supported form) so
+    /// the `phase!` macro can call it unconditionally without
+    /// smuggling a cfg attribute into macro tokens.
     async fn test_stall_phase(&mut self) {
+        #[cfg(test)]
         if let Some((n, d)) = &mut self.tick_phase_stall
             && *n > 0
         {
