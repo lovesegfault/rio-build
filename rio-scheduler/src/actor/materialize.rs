@@ -1278,6 +1278,31 @@ pub(crate) struct CreatedJob {
     pub origin: JobOrigin,
 }
 
+/// T3 (bug_110): ONE clock per logical listing pass. The handler
+/// reads time ONLY through this type — `arm()` at pass start and the
+/// single re-arm at the beat arm's completion (post-await) are the
+/// only mint sites, so a second raw `Instant::now()` inside the
+/// handler is structurally absent (pinned by the handler-region
+/// census in the test battery). Wave-8's faac1261e re-pointed only
+/// the prune/members reads to a post-await clock; the Phase-3
+/// claimability serve filter and the caller's contact stamp stayed
+/// on the pre-await one — on a slow beat a backoff lapsing during
+/// the query was withheld a poll, and the contact stamp ran older
+/// than the prune clock within the same pass.
+pub(super) struct PassClock(std::time::Instant);
+
+impl PassClock {
+    /// Arm (or re-arm, at the beat completion) the pass clock.
+    fn arm() -> Self {
+        Self(std::time::Instant::now())
+    }
+
+    /// The single instant every read in the pass consumes.
+    fn instant(&self) -> std::time::Instant {
+        self.0
+    }
+}
+
 impl DagActor {
     /// Leader-served job listing (the store's poll). Standby or no
     /// jobs → empty vec (never an error).
@@ -1339,7 +1364,10 @@ impl DagActor {
             let _ = reply.send(Vec::new());
             return;
         }
-        let now = std::time::Instant::now();
+        // bug_110 (T3): the pass clock — armed once here; re-armed
+        // exactly once at the beat arm's completion. Every time read
+        // below goes through it.
+        let mut pass = PassClock::arm();
         // Phase 1 — contact + membership events + the refresh
         // decision (bug_045: O(1) on a stable-epoch poll). The
         // caller's contact records FIRST (its own membership entry
@@ -1352,14 +1380,14 @@ impl DagActor {
                 .hydrated_listing_mut()
                 .expect("hydrated checked above");
             if let Some(me) = instance.as_deref() {
-                if contacts.note(me, now) {
+                if contacts.note(me, pass.instant()) {
                     // JOIN: rescore cached jobs against the joiner
                     // (one score each), re-seed if the cache was
                     // installed over an empty membership, and fold
                     // the new ownership into the beat buckets —
                     // membership-event work, never per-poll work.
                     plan.on_join(me);
-                    let members = contacts.members(now);
+                    let members = contacts.members(pass.instant());
                     plan.reseed_if_unseeded(members.iter().map(|(m, _)| m.as_str()));
                     plan.rebuild_buckets();
                 }
@@ -1368,7 +1396,7 @@ impl DagActor {
                 // being served broadly on this very poll.
                 plan.note_member_fresh(me);
             }
-            plan.refresh_decision(view.creations(), now)
+            plan.refresh_decision(view.creations(), pass.instant())
         };
         // Phase 2 — the listing BEAT: at most one head-window query
         // ATTEMPT per pacing TTL or consumed creation-dirty event
@@ -1404,13 +1432,27 @@ impl DagActor {
                 .expect("hydrated checked above");
             match fetched {
                 Ok(rows) => {
-                    // Prune/membership on the post-await clock — the
-                    // pre-fix pre-query `now` backdated the prune and
-                    // the steal-horizon partition by the query
-                    // latency (disclosed correction).
-                    let beat_now = std::time::Instant::now();
-                    let leavers = contacts.prune(beat_now);
-                    let members = contacts.members(beat_now);
+                    // bug_110: the beat arm's SINGLE re-arm — the
+                    // whole tail of the pass (caller re-note, prune,
+                    // members, steal-horizon, the Phase-3 serve
+                    // filter) reads this one post-await clock.
+                    // faac1261e's correction covered only
+                    // prune/members; the serve filter stayed
+                    // pre-await (a backoff lapsing during the query
+                    // was withheld a poll) and the contact stamp ran
+                    // older than the prune clock.
+                    pass = PassClock::arm();
+                    if let Some(me) = instance.as_deref() {
+                        // Re-stamp the caller at the pass clock
+                        // BEFORE pruning: the caller is live AT beat
+                        // completion (it is this very call), so its
+                        // stamp can never run older than the prune
+                        // clock within the pass — structural, both
+                        // consume the same instant.
+                        contacts.note(me, pass.instant());
+                    }
+                    let leavers = contacts.prune(pass.instant());
+                    let members = contacts.members(pass.instant());
                     for leaver in &leavers {
                         plan.on_leave(leaver, members.iter().map(|(m, _)| m.as_str()));
                     }
@@ -1447,8 +1489,9 @@ impl DagActor {
         let jobs = plan
             .serve(caller)
             .filter(|row| {
-                view.get(row.drv_hash.as_str())
-                    .is_some_and(|entry| entry.claimability(now) == Claimability::ClaimableNow)
+                view.get(row.drv_hash.as_str()).is_some_and(|entry| {
+                    entry.claimability(pass.instant()) == Claimability::ClaimableNow
+                })
             })
             .take(limit as usize)
             .cloned()

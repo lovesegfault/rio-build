@@ -11257,3 +11257,119 @@ async fn zero_interest_cancel_sweep_transaction_bound() -> TestResult {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Round-9 WO-S2-6 (bug_110): one PassClock per logical listing pass
+// ---------------------------------------------------------------------------
+
+/// **W9-AB (bug_110)** — *a backoff lapsing DURING the beat query is
+/// served on this very poll, not withheld until the next one*. The
+/// wave-8 disclosed-correction (faac1261e) re-pointed only the
+/// prune/members reads to the post-await `beat_now`; the Phase-3
+/// `claimability(now)` serve filter and the caller's contact stamp
+/// stayed on the PRE-await clock — half the same-class reads. With
+/// the listing pass on ONE [`PassClock`] (re-armed once at the beat
+/// arm's completion), the serve filter evaluates at the pass clock:
+/// a job whose `parked_until` expires during the query latency is
+/// ClaimableNow when served.
+#[tokio::test]
+async fn backoff_lapsing_during_the_beat_query_is_served() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor(db.pool.clone());
+
+    // One durable claimable job + its view entry, parked until 400ms
+    // from now — the backoff lapses INSIDE the 1200ms beat latency.
+    let drv = insert_test_derivation_local(&db.pool, "beat-lapse").await?;
+    let created = sdb(&db.pool)
+        .create_materialization_job_fenced(
+            drv,
+            "beat-lapse",
+            None,
+            JobOrigin::Pruned,
+            None,
+            actor.serving_generation(),
+        )
+        .await?;
+    let crate::db::materialization::FencedJobCreate::Applied { job_id, .. } = created else {
+        anyhow::bail!("job create must apply");
+    };
+    let mut entry = crate::actor::materialize::JobViewEntry::new_unclaimed(job_id, None);
+    entry.test_set_parked_until(Some(
+        std::time::Instant::now() + std::time::Duration::from_millis(400),
+    ));
+    actor
+        .materialization_jobs
+        .insert(crate::state::DrvHash::from("beat-lapse"), entry);
+    actor
+        .materialization_jobs
+        .hydrated_listing_mut()
+        .expect("hydrated")
+        .2
+        .test_beat_latency = Some(std::time::Duration::from_millis(1200));
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    actor
+        .handle_list_materialization_jobs(64, Some("w0".into()), tx)
+        .await;
+    let served = rx.await?;
+    assert_eq!(
+        served.len(),
+        1,
+        "the backoff lapsed during the 1200ms beat (parked 400ms) — \
+         the serve filter must evaluate at the pass clock, not the \
+         pre-await one (bug_110): served={served:?}"
+    );
+    Ok(())
+}
+
+/// Local single-derivation insert (the db/tests helper is `pub(super)`
+/// to db::tests — this mirrors it for the actor battery).
+async fn insert_test_derivation_local(pool: &sqlx::PgPool, hash: &str) -> anyhow::Result<Uuid> {
+    let row = crate::db::DerivationRow {
+        drv_hash: hash.into(),
+        drv_path: rio_test_support::fixtures::test_drv_path(hash),
+        pname: Some("test-pkg".into()),
+        system: "x86_64-linux".into(),
+        status: DerivationStatus::Created,
+        required_features: vec![],
+        expected_output_paths: vec![],
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_ca: false,
+    };
+    let mut tx = pool.begin().await?;
+    let ids = crate::db::SchedulerDb::batch_upsert_derivations(&mut tx, &[row]).await?;
+    tx.commit().await?;
+    Ok(ids.get(hash).expect("just inserted").0)
+}
+
+/// bug_110's structural pin: the listing handler reads time ONLY
+/// through [`PassClock`] — zero raw `Instant::now()` mints inside the
+/// handler region, exactly two `PassClock::arm()` sites (pass start +
+/// the beat arm's completion re-arm). A third arm or a raw now() is a
+/// second clock in the pass — the merged-half-sweep shape (faac1261e
+/// re-pointed prune/members and left the serve filter + contact stamp
+/// on the stale clock).
+#[test]
+fn listing_handler_reads_one_pass_clock() {
+    let src = include_str!("../materialize.rs");
+    let start = src
+        .find("pub(super) async fn handle_list_materialization_jobs(")
+        .expect("handler exists");
+    // The handler region ends at the next fn item at the same impl depth.
+    let end = src[start..]
+        .find("\n    /// THE single job-creation helper")
+        .expect("the next item's doc anchors the region");
+    let handler = &src[start..start + end];
+    assert_eq!(
+        handler.matches("Instant::now()").count(),
+        0,
+        "the handler must not mint raw clocks — thread the PassClock"
+    );
+    assert_eq!(
+        handler.matches("PassClock::arm()").count(),
+        2,
+        "exactly two arms: pass start + the beat completion re-arm"
+    );
+}
