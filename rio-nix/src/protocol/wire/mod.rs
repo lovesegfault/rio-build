@@ -22,6 +22,15 @@ pub const MAX_STRING_LEN: u64 = 64 * 1024 * 1024;
 /// Maximum allowed collection count (1M items) to prevent OOM on malicious input.
 pub const MAX_COLLECTION_COUNT: u64 = 1_048_576;
 
+// r[impl gw.wire.collection-total-bytes]
+/// Maximum aggregate string payload per collection (64 MiB, matching
+/// [`MAX_STRING_LEN`]). The per-item and per-count caps alone still admit
+/// `MAX_COLLECTION_COUNT × MAX_STRING_LEN` (~64 TiB) of retained
+/// allocation from a single message; this budget bounds the whole
+/// collection. Sized to the largest single legal string so any payload
+/// `read_string` accepts also fits in a (fresh) collection budget.
+pub const MAX_COLLECTION_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+
 #[derive(Debug, Error)]
 pub enum WireError {
     #[error("I/O error: {0}")]
@@ -32,6 +41,9 @@ pub enum WireError {
 
     #[error("collection count {0} exceeds maximum {MAX_COLLECTION_COUNT}")]
     CollectionTooLarge(u64),
+
+    #[error("collection payload {0} bytes exceeds maximum {MAX_COLLECTION_TOTAL_BYTES}")]
+    CollectionPayloadTooLarge(u64),
 
     #[error("non-zero padding byte after {0}-byte string")]
     NonZeroPadding(usize),
@@ -77,20 +89,40 @@ pub async fn read_bool<R: AsyncRead + Unpin>(r: &mut R) -> Result<bool> {
     Ok(read_u64(r).await? != 0)
 }
 
-/// Read a length-prefixed, padded byte string.
-pub async fn read_bytes<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>> {
-    let len = read_u64(r).await?;
-    if len > MAX_STRING_LEN {
-        return Err(WireError::StringTooLong(len));
-    }
-    let len = len as usize;
+/// Incremental-read chunk size for length-prefixed payloads. Buffers grow
+/// as data arrives instead of being allocated at the full claimed length
+/// upfront, so a peer that claims a large length but never sends the bytes
+/// holds memory proportional to what it actually sent (russh
+/// CVE-2024-43410 class).
+const READ_CHUNK: usize = 64 * 1024;
 
+/// Append exactly `len` bytes from `r` to `buf`, growing in [`READ_CHUNK`]
+/// steps. On a short read, memory held is bounded by bytes received plus
+/// one chunk (plus `Vec`'s amortized doubling) — never the claimed `len`.
+async fn read_exact_growing<R: AsyncRead + Unpin>(
+    r: &mut R,
+    buf: &mut Vec<u8>,
+    len: usize,
+) -> Result<()> {
+    let target = buf.len() + len;
+    while buf.len() < target {
+        let take = (target - buf.len()).min(READ_CHUNK);
+        let start = buf.len();
+        buf.resize(start + take, 0);
+        r.read_exact(&mut buf[start..]).await?;
+    }
+    Ok(())
+}
+
+/// Read `len` payload bytes plus validated zero-padding. Callers MUST have
+/// validated `len` against the relevant cap already.
+async fn read_padded_body<R: AsyncRead + Unpin>(r: &mut R, len: usize) -> Result<Vec<u8>> {
     if len == 0 {
         return Ok(Vec::new());
     }
 
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf).await?;
+    let mut buf = Vec::new();
+    read_exact_growing(r, &mut buf, len).await?;
 
     // Consume and VALIDATE padding bytes. Nix C++ `readPadding`
     // (serialise.cc) throws on non-zero; accepting garbage would let a
@@ -105,37 +137,81 @@ pub async fn read_bytes<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Read a length-prefixed, padded byte string.
+///
+/// The `MAX_STRING_LEN` check precedes any allocation, and the body buffer
+/// grows with received data (see [`read_exact_growing`]) — an oversize or
+/// unfulfilled length claim cannot reserve memory it never fills.
+pub async fn read_bytes<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>> {
+    let len = read_u64(r).await?;
+    if len > MAX_STRING_LEN {
+        return Err(WireError::StringTooLong(len));
+    }
+    read_padded_body(r, len as usize).await
+}
+
 /// Read a length-prefixed, padded UTF-8 string.
 pub async fn read_string<R: AsyncRead + Unpin>(r: &mut R) -> Result<String> {
     let bytes = read_bytes(r).await?;
     Ok(String::from_utf8(bytes)?)
 }
 
+/// Read one element of a collection, charging its claimed length against
+/// the collection's remaining byte budget BEFORE reading or buffering the
+/// body — an over-budget claim is rejected without allocating for it.
+async fn read_string_budgeted<R: AsyncRead + Unpin>(r: &mut R, budget: &mut u64) -> Result<String> {
+    let len = read_u64(r).await?;
+    if len > MAX_STRING_LEN {
+        return Err(WireError::StringTooLong(len));
+    }
+    if len > *budget {
+        // Carried value: total payload the collection would have reached.
+        return Err(WireError::CollectionPayloadTooLarge(
+            MAX_COLLECTION_TOTAL_BYTES - *budget + len,
+        ));
+    }
+    *budget -= len;
+    let bytes = read_padded_body(r, len as usize).await?;
+    Ok(String::from_utf8(bytes)?)
+}
+
 /// Read a collection of UTF-8 strings (`u64(count)` followed by `count` strings).
+///
+/// Enforces `MAX_COLLECTION_COUNT` on the count and an aggregate
+/// `MAX_COLLECTION_TOTAL_BYTES` budget across all element payloads — the
+/// per-item `MAX_STRING_LEN` cap alone would still admit `count × len`
+/// retained allocation from a single message.
+// r[impl gw.wire.collection-total-bytes]
 pub async fn read_strings<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<String>> {
     let count = read_u64(r).await?;
     if count > MAX_COLLECTION_COUNT {
         return Err(WireError::CollectionTooLarge(count));
     }
     let count = count as usize;
+    let mut budget = MAX_COLLECTION_TOTAL_BYTES;
     let mut result = Vec::with_capacity(count.min(1024));
     for _ in 0..count {
-        result.push(read_string(r).await?);
+        result.push(read_string_budgeted(r, &mut budget).await?);
     }
     Ok(result)
 }
 
 /// Read a collection of key-value string pairs.
+///
+/// Keys and values are charged against ONE shared
+/// `MAX_COLLECTION_TOTAL_BYTES` budget (see [`read_strings`]).
+// r[impl gw.wire.collection-total-bytes]
 pub async fn read_string_pairs<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<(String, String)>> {
     let count = read_u64(r).await?;
     if count > MAX_COLLECTION_COUNT {
         return Err(WireError::CollectionTooLarge(count));
     }
     let count = count as usize;
+    let mut budget = MAX_COLLECTION_TOTAL_BYTES;
     let mut result = Vec::with_capacity(count.min(1024));
     for _ in 0..count {
-        let key = read_string(r).await?;
-        let value = read_string(r).await?;
+        let key = read_string_budgeted(r, &mut budget).await?;
+        let value = read_string_budgeted(r, &mut budget).await?;
         result.push((key, value));
     }
     Ok(result)
@@ -260,10 +336,9 @@ pub async fn read_framed_stream<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u
             return Err(WireError::FramedStreamTooLarge(total));
         }
 
-        let frame_len = frame_len as usize;
-        let start = result.len();
-        result.resize(start + frame_len, 0);
-        r.read_exact(&mut result[start..]).await?;
+        // Chunked append: a frame claim only consumes memory as its bytes
+        // actually arrive (see read_exact_growing).
+        read_exact_growing(r, &mut result, frame_len as usize).await?;
     }
 }
 
@@ -424,6 +499,129 @@ mod tests {
         let mut reader = Cursor::new(buf);
         let result = read_strings(&mut reader).await;
         assert!(matches!(result, Err(WireError::CollectionTooLarge(_))));
+        Ok(())
+    }
+
+    /// Eager-allocation regression (russh CVE-2024-43410 class): a length
+    /// claim must not allocate the claimed size upfront. Feed a 1 MiB claim
+    /// with only 100 KiB of body: the read fails with EOF and the buffer
+    /// only ever grew to bytes-received plus chunk granularity — far below
+    /// the claim. (Allocation-ordering for the `len > MAX_STRING_LEN` cap
+    /// is pinned by `test_string_too_long`: the input ends right after the
+    /// length field, so an alloc-then-read implementation would EOF instead
+    /// of returning StringTooLong.)
+    #[tokio::test]
+    async fn read_growing_does_not_eagerly_allocate_claim() {
+        const CLAIM: usize = 1024 * 1024;
+        const SENT: usize = 100 * 1024;
+        let mut buf = Vec::new();
+        let mut reader = Cursor::new(vec![0xAB; SENT]);
+        let result = read_exact_growing(&mut reader, &mut buf, CLAIM).await;
+        assert!(result.is_err(), "short body must EOF");
+        assert!(
+            buf.capacity() < CLAIM / 2,
+            "buffer grew to {} bytes for a {CLAIM}-byte claim with only \
+             {SENT} bytes sent — eager allocation regressed",
+            buf.capacity()
+        );
+        assert!(buf.len() <= SENT + READ_CHUNK);
+    }
+
+    /// Multi-chunk success path: payloads larger than READ_CHUNK must
+    /// roundtrip byte-identically through the incremental reader, for both
+    /// the string and framed-stream paths.
+    #[tokio::test]
+    async fn read_bytes_multi_chunk_roundtrip() -> anyhow::Result<()> {
+        let data: Vec<u8> = (0..(3 * READ_CHUNK + 17))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let result = roundtrip_bytes(&data).await?;
+        assert_eq!(result, data);
+
+        // Framed: one frame larger than READ_CHUNK.
+        let mut buf = Vec::new();
+        write_framed_stream(&mut buf, &data, 2 * READ_CHUNK + 11).await?;
+        let mut reader = Cursor::new(buf);
+        assert_eq!(read_framed_stream(&mut reader).await?, data);
+        Ok(())
+    }
+
+    /// Aggregate-budget regression (CONTINUATION-flood class): a collection
+    /// of many max-size strings must trip `MAX_COLLECTION_TOTAL_BYTES`, not
+    /// allocate `count × MAX_STRING_LEN`. The second element's CLAIM alone
+    /// exceeds the remaining budget and carries no body bytes — getting
+    /// `CollectionPayloadTooLarge` (not an Io/EOF error) proves the budget
+    /// check fires before the body is read or buffered.
+    // r[verify gw.wire.collection-total-bytes]
+    #[tokio::test]
+    async fn read_strings_aggregate_budget() -> anyhow::Result<()> {
+        let mut buf = Vec::new();
+        write_u64(&mut buf, 3).await?; // count
+        write_string(&mut buf, "small").await?; // 5 bytes of budget spent
+        write_u64(&mut buf, MAX_STRING_LEN).await?; // claim 64 MiB, no body
+        let mut reader = Cursor::new(buf);
+        let result = read_strings(&mut reader).await;
+        assert!(
+            matches!(
+                result,
+                Err(WireError::CollectionPayloadTooLarge(t)) if t == MAX_STRING_LEN + 5
+            ),
+            "expected CollectionPayloadTooLarge(MAX_STRING_LEN + 5): {result:?}"
+        );
+        Ok(())
+    }
+
+    /// Pairs share ONE budget across keys and values: a value claim that
+    /// exceeds what the key left over must be rejected.
+    // r[verify gw.wire.collection-total-bytes]
+    #[tokio::test]
+    async fn read_string_pairs_aggregate_budget() -> anyhow::Result<()> {
+        let mut buf = Vec::new();
+        write_u64(&mut buf, 1).await?; // count
+        write_string(&mut buf, "key").await?; // 3 bytes of budget spent
+        write_u64(&mut buf, MAX_STRING_LEN).await?; // value claim, no body
+        let mut reader = Cursor::new(buf);
+        let result = read_string_pairs(&mut reader).await;
+        assert!(
+            matches!(
+                result,
+                Err(WireError::CollectionPayloadTooLarge(t)) if t == MAX_STRING_LEN + 3
+            ),
+            "expected CollectionPayloadTooLarge(MAX_STRING_LEN + 3): {result:?}"
+        );
+        Ok(())
+    }
+
+    /// Budget boundary: one string of exactly MAX_STRING_LEN consumes the
+    /// whole budget and succeeds; a following empty string still fits
+    /// (0 ≤ 0 remaining); one more byte does not. Catches `>` → `>=` on
+    /// the budget comparison.
+    // r[verify gw.wire.collection-total-bytes]
+    #[tokio::test]
+    async fn read_strings_budget_boundary() -> anyhow::Result<()> {
+        let big = "x".repeat(MAX_STRING_LEN as usize);
+
+        // At-max + empty trailer: OK.
+        let mut buf = Vec::new();
+        write_u64(&mut buf, 2).await?;
+        write_string(&mut buf, &big).await?;
+        write_string(&mut buf, "").await?;
+        let mut reader = Cursor::new(buf);
+        let result = read_strings(&mut reader).await?;
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].len(), MAX_STRING_LEN as usize);
+        assert_eq!(result[1], "");
+
+        // One byte over: budget error carrying MAX_STRING_LEN + 1.
+        let mut buf2 = Vec::new();
+        write_u64(&mut buf2, 2).await?;
+        write_string(&mut buf2, &big).await?;
+        write_string(&mut buf2, "y").await?;
+        let mut reader2 = Cursor::new(buf2);
+        assert!(matches!(
+            read_strings(&mut reader2).await,
+            Err(WireError::CollectionPayloadTooLarge(t)) if t == MAX_STRING_LEN + 1
+        ));
         Ok(())
     }
 

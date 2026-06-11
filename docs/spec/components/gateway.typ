@@ -782,6 +782,19 @@ Each *builtOutput* entry is a `(DrvOutput, Realisation)` pair:
   STDERR trace/field readers).
 ]
 
+#r("gw.wire.collection-total-bytes")[
+  `read_strings` / `read_string_pairs` MUST additionally enforce an aggregate
+  payload budget (`MAX_COLLECTION_TOTAL_BYTES`, 64 MiB) across all element
+  bytes of one collection, charged against each element's *claimed* length
+  before its body is read.
+]
+The per-element `MAX_STRING_LEN` and per-collection `MAX_COLLECTION_COUNT`
+caps alone still admit `count × len` (~64 TiB) of retained allocation from a
+single message — the HTTP/2 CONTINUATION-flood shape. The budget equals
+`MAX_STRING_LEN`, so any single string the protocol accepts also fits in a
+fresh collection budget; pairs charge keys and values against one shared
+budget.
+
 #r("gw.wire.framed-no-padding")[
   Framed data (for NARs): sequence of `u64(chunk_len) + chunk_data` terminated
   by `u64(0)` --- chunk data is NOT padded (unlike strings).
