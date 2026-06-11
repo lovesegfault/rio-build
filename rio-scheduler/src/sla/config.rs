@@ -3280,6 +3280,134 @@ mod tests {
     }
 
     // r[verify ctrl.nodeclaim.capacity-ladder]
+    /// **The spot+od doctrine witness (owner directive, 2026-06-10;
+    /// the W7-D mechanics template at the VALUES level)** — *the
+    /// SHIPPED hi class serves spot first and fails over to od when
+    /// the spot plane ICEs*: parse values.yaml, build the production
+    /// `SlaConfig` rows for the representative class (hi-nvme-x86 +
+    /// its g7 rung), drive the production emission; the FIRST
+    /// emission's closure carries the spot cells (the doctrine's
+    /// spot-preferred half — RED against the pre-directive od-only
+    /// chart: zero spot cells existed in the closure, the reversal
+    /// transcript in the commit body), then `cell_wire` ICE marks on
+    /// the WHOLE spot plane leave a non-empty all-od unmasked set on
+    /// the next emission (the od-fallback half; the WO-S7-4 evidence
+    /// path, leg-B codec). No order enforcement anywhere: membership
+    /// (closure) + cost ranking + read-time `A \ masked` compose to
+    /// the directive's semantics. Catalog lane not engaged (ceilings
+    /// fall to the global — this red probes the capacity axis, not
+    /// sizing; the sizing composition is
+    /// `phantom_ceiling_rung_advances_not_starves`).
+    #[tokio::test]
+    async fn shipped_hi_spot_plane_ice_fails_over_to_on_demand() {
+        use rio_common::cell_wire::{EvidenceEpoch, WireCapacity, encode_cell_event};
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        crate::actor::tests::seed_default_tenant(&db.pool).await;
+        let mut actor = crate::actor::tests::helpers::bare_actor_hw_builders_only(db.pool.clone());
+        // The SHIPPED rows under test: the representative hi class +
+        // its declared rung, straight from values.yaml.
+        let root = shipped::parse();
+        let shipped_classes = shipped_hw_classes(&root.scheduler.sla);
+        let mut classes = HashMap::new();
+        for h in ["hi-nvme-x86", "hi-nvme-x86-g7"] {
+            classes.insert(h.to_string(), shipped_classes[h].clone());
+        }
+        actor.sla_config.hw_classes = classes;
+        actor.sla_config.reference_hw_class = "hi-nvme-x86".into();
+        let mut m = std::collections::HashMap::new();
+        m.insert("hi-nvme-x86".to_string(), 2.0);
+        m.insert("hi-nvme-x86-g7".to_string(), 1.4);
+        actor
+            .sla_estimator
+            .seed_hw(crate::sla::hw::HwTable::from_map(m));
+        crate::actor::tests::helpers::seed_fit(&actor, "test-pkg");
+        actor.test_inject_ready("d-doctrine", Some("test-pkg"), "x86_64-linux", false);
+
+        let cells_of = |i: &rio_proto::types::SpawnIntent| -> Vec<(String, String)> {
+            i.hw_class_names
+                .iter()
+                .zip(&i.node_affinity)
+                .map(|(h, t)| {
+                    let cap = t
+                        .match_expressions
+                        .iter()
+                        .find(|e| e.key == "karpenter.sh/capacity-type")
+                        .map(|e| e.values[0].clone())
+                        .unwrap_or_default();
+                    (h.clone(), cap)
+                })
+                .collect()
+        };
+
+        // Emission 1: the closure carries the spot plane (RED against
+        // the od-only chart) AND the od plane (membership, not a mask
+        // reaction).
+        let snap = actor.compute_spawn_intents(&Default::default());
+        let i1 = snap
+            .intents
+            .iter()
+            .find(|i| i.intent_id == "d-doctrine")
+            .expect("emitted")
+            .clone();
+        let c1 = cells_of(&i1);
+        assert!(
+            c1.iter().any(|(_, cap)| cap == "spot"),
+            "the doctrine's spot-preferred half: the SHIPPED hi closure \
+             admits spot cells (pre-directive od-only chart: none): {c1:?}"
+        );
+        assert!(
+            c1.iter().any(|(_, cap)| cap == "on-demand"),
+            "the od plane is in the closure from the FIRST emission \
+             (membership): {c1:?}"
+        );
+
+        // The spot plane ICEs (vanish-as-ICE / unfulfillable evidence
+        // through the production codec: encode -> decode -> the same
+        // `apply_mark_event` fold the ack-apply plane commits — the
+        // wire round-trip kept, one seam in; `handle_ack_spawned_
+        // intents` is actor-private, the W7-D leg-B convention is the
+        // codec + the epoch'd mark fold).
+        for h in ["hi-nvme-x86", "hi-nvme-x86-g7"] {
+            let wire = encode_cell_event(h, WireCapacity::Spot, Some(EvidenceEpoch(1)));
+            let ev = rio_common::cell_wire::decode_cell_event(&wire).expect("codec round-trip");
+            actor
+                .ice
+                .apply_mark_event(&(ev.hw_class, ev.capacity.into()), ev.epoch);
+        }
+
+        // Emission 2: the unmasked set is NON-EMPTY and ALL od — od
+        // serves exactly when spot cannot.
+        let snap2 = actor.compute_spawn_intents(&Default::default());
+        let i2 = snap2
+            .intents
+            .iter()
+            .find(|i| i.intent_id == "d-doctrine")
+            .expect("re-emitted")
+            .clone();
+        let masked: std::collections::HashSet<(String, String)> = snap2
+            .ice_masked_cells
+            .iter()
+            .map(|s| {
+                let (h, cap) = parse_cell(s).expect("snapshot cell decodes");
+                (h, cap.label().to_string())
+            })
+            .collect();
+        let unmasked: Vec<(String, String)> = cells_of(&i2)
+            .into_iter()
+            .filter(|c| !masked.contains(c))
+            .collect();
+        assert!(
+            !unmasked.is_empty(),
+            "the walk has an od rung to serve (never starve while a \
+             buyable plane exists)"
+        );
+        assert!(
+            unmasked.iter().all(|(_, cap)| cap == "on-demand"),
+            "with the whole spot plane masked, od serves: {unmasked:?}"
+        );
+    }
+
+    // r[verify ctrl.nodeclaim.capacity-ladder]
     #[test]
     fn shipped_values_cell_universe_census() {
         let root = shipped::parse();
@@ -3307,13 +3435,21 @@ mod tests {
             "fetcher-arm:on-demand",
             "fetcher-x86:spot",
             "fetcher-x86:on-demand",
+            "hi-ebs-arm:spot",
             "hi-ebs-arm:on-demand",
+            "hi-ebs-arm-g7:spot",
             "hi-ebs-arm-g7:on-demand",
+            "hi-ebs-x86:spot",
             "hi-ebs-x86:on-demand",
+            "hi-ebs-x86-g7:spot",
             "hi-ebs-x86-g7:on-demand",
+            "hi-nvme-arm:spot",
             "hi-nvme-arm:on-demand",
+            "hi-nvme-arm-g7:spot",
             "hi-nvme-arm-g7:on-demand",
+            "hi-nvme-x86:spot",
             "hi-nvme-x86:on-demand",
+            "hi-nvme-x86-g7:spot",
             "hi-nvme-x86-g7:on-demand",
             "lo-ebs-arm:spot",
             "lo-ebs-arm:on-demand",

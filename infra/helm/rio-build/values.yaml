@@ -629,20 +629,27 @@ scheduler:
     hwClasses:
       # live_050(c) — the hi band's graceful-degradation posture
       # (ctrl.nodeclaim.capacity-ladder):
-      # - `capacityTypes: [on-demand]` is the rev-2 live-override
-      #   content COMMITTED as the chart default (pending-the-ladder
-      #   posture: gen-8 spot ICEd live, 512/704 hang). Spot
-      #   re-admission for the hi band is a one-row owner-signed flip
-      #   gated on the ladder walk's live validation — NOT part of
-      #   this change.
+      # - `capacityTypes: [spot, on-demand]` is the OWNER DOCTRINE
+      #   (signed 2026-06-10, mid-wave): "all classes should be
+      #   spot+on-demand — if spot is available great, otherwise we
+      #   get on-demand." It SUPERSEDES the rev-2 od-only committed
+      #   default (which itself superseded the live override; the
+      #   running rev-2 overlay now DIVERGES from this chart default
+      #   and is retired at first deploy per the wave-close protocol
+      #   — the deploy flips hi to spot-preferred).
       # - `ladder.rungs` names each class's generation-rung sibling
       #   (`*-g7`, declared below the hi parents). The ladder is
       #   MEMBERSHIP authority only: rungs join the intent's hosting
       #   closure (hw_class_names); the realized walk order is
-      #   derived from cost — capacity-major, then the cell_rank
-      #   name-hash within a band. Under the od-only posture the
-      #   realized hi order is gen8:od -> gen7:od (hash-verified for
-      #   all four pairs; see the capacity-ladder rule rationale).
+      #   derived from cost — capacity-major (spot ~2.86x cheaper at
+      #   the cap-only seed), then the cell_rank name-hash within a
+      #   band. Under spot+od the closure spans gen8:{spot,od} ∪
+      #   g7:{spot,od} — spot-preferred-with-od-fallback WITHOUT
+      #   order enforcement: spot prices rank first, vanish/ICE
+      #   evidence masks a dry spot plane at read time (A\masked),
+      #   and the all-masked fallback re-offers the full closure, so
+      #   od serves exactly when spot cannot (the membership-only
+      #   ruling; witnessed by the shipped-values failover red).
       # - The g7 siblings carry `hw-band: hi-g7` (NOT `hi`): the
       #   controller's match_node walks class conjunctions
       #   lexicographic-first-match, so a sibling whose labels
@@ -655,7 +662,7 @@ scheduler:
       #   probe-boot` is re-run — helm/18 refuses an unseeded cell.
       hi-nvme-x86:
         nodeClass: rio-nvme
-        capacityTypes: [on-demand]
+        capacityTypes: [spot, on-demand]
         ladder:
           rungs:
             - {class: hi-nvme-x86-g7}
@@ -670,7 +677,7 @@ scheduler:
           - {key: karpenter.k8s.aws/instance-local-nvme, operator: Gt, values: ["0"]}
       hi-nvme-arm:
         nodeClass: rio-nvme
-        capacityTypes: [on-demand]
+        capacityTypes: [spot, on-demand]
         ladder:
           rungs:
             - {class: hi-nvme-arm-g7}
@@ -685,7 +692,7 @@ scheduler:
           - {key: karpenter.k8s.aws/instance-local-nvme, operator: Gt, values: ["0"]}
       hi-ebs-x86:
         nodeClass: rio-default
-        capacityTypes: [on-demand]
+        capacityTypes: [spot, on-demand]
         ladder:
           rungs:
             - {class: hi-ebs-x86-g7}
@@ -699,7 +706,7 @@ scheduler:
           - {key: kubernetes.io/arch, operator: In, values: [amd64]}
       hi-ebs-arm:
         nodeClass: rio-default
-        capacityTypes: [on-demand]
+        capacityTypes: [spot, on-demand]
         ladder:
           rungs:
             - {class: hi-ebs-arm-g7}
@@ -716,11 +723,12 @@ scheduler:
       # rung IS a class: its catalog ceiling, labels, taints, and
       # capacity types all come from here, and the cell universe grows
       # through the existing class x capacity product. gen-7 c/m/r,
-      # same storage/arch split as the parents; od-only under the same
-      # committed posture.
+      # same storage/arch split as the parents; spot+od under the
+      # owner doctrine (the full hi walk is gen8:{spot,od} ∪
+      # g7:{spot,od} — membership-only, cost-ranked).
       hi-nvme-x86-g7:
         nodeClass: rio-nvme
-        capacityTypes: [on-demand]
+        capacityTypes: [spot, on-demand]
         labels:
           - {key: rio.build/hw-band, value: hi-g7}
           - {key: rio.build/storage, value: nvme}
@@ -732,7 +740,7 @@ scheduler:
           - {key: karpenter.k8s.aws/instance-local-nvme, operator: Gt, values: ["0"]}
       hi-nvme-arm-g7:
         nodeClass: rio-nvme
-        capacityTypes: [on-demand]
+        capacityTypes: [spot, on-demand]
         labels:
           - {key: rio.build/hw-band, value: hi-g7}
           - {key: rio.build/storage, value: nvme}
@@ -744,7 +752,7 @@ scheduler:
           - {key: karpenter.k8s.aws/instance-local-nvme, operator: Gt, values: ["0"]}
       hi-ebs-x86-g7:
         nodeClass: rio-default
-        capacityTypes: [on-demand]
+        capacityTypes: [spot, on-demand]
         labels:
           - {key: rio.build/hw-band, value: hi-g7}
           - {key: rio.build/storage, value: ebs}
@@ -755,7 +763,7 @@ scheduler:
           - {key: kubernetes.io/arch, operator: In, values: [amd64]}
       hi-ebs-arm-g7:
         nodeClass: rio-default
-        capacityTypes: [on-demand]
+        capacityTypes: [spot, on-demand]
         labels:
           - {key: rio.build/hw-band, value: hi-g7}
           - {key: rio.build/storage, value: ebs}
@@ -977,18 +985,24 @@ scheduler:
       # live_050(c) g7 rung cells — PLACEHOLDER seeds pending an
       # `xtask k8s probe-boot` re-run (helm/18 refuses an unseeded
       # cell; the metal/fetcher rows are the precedent). Value =
-      # the gen-8 parent's od seed: same nodeClass, same virtualized
-      # boot path — generation does not move the ~18s kubelet boot.
+      # the gen-8 parent's matching-cap seed: same nodeClass, same
+      # virtualized boot path — generation does not move the ~18s
+      # kubelet boot. The :spot rows joined with the spot+od owner
+      # doctrine (every g7 cell must be seeded for helm/18).
       "hi-ebs-arm-g7:od": 17.0
+      "hi-ebs-arm-g7:spot": 18.0
       "hi-ebs-x86:od": 16.0
       "hi-ebs-x86:spot": 17.0
       "hi-ebs-x86-g7:od": 16.0
+      "hi-ebs-x86-g7:spot": 17.0
       "hi-nvme-arm:od": 17.0
       "hi-nvme-arm:spot": 17.0
       "hi-nvme-arm-g7:od": 17.0
+      "hi-nvme-arm-g7:spot": 17.0
       "hi-nvme-x86:od": 18.0
       "hi-nvme-x86:spot": 18.0
       "hi-nvme-x86-g7:od": 18.0
+      "hi-nvme-x86-g7:spot": 18.0
       "lo-ebs-arm:od": 20.0
       "lo-ebs-arm:spot": 19.0
       "lo-ebs-x86:od": 17.0
