@@ -47,6 +47,7 @@ ready_all_cells_ice_masked	alert:RioNodeclaimPoolReadyAllCellsIceMasked
 no_hosting_class	alert:RioNodeclaimPoolNoHostingClass
 no_pool_covers	alert:RioNodeclaimPoolNoHostingClass
 exceeds_cell_cap	none: single-intent producer/config anomaly (override-bypass hole); visible in the drop tally + cover WARN; per-intent pages would be noise without an incident class
+forecast_all_cells_ice_masked	none: the forecast half of the masked split (merged_bug_013) — no build waits yet, so the landed HELP says observe-don't-page; the ready sibling carries the page and the split exists to keep its calibration honest during routine ICE x forecast churn
 unknown_hw_class	none: <=300s self-healing GetHwClassConfig skew; a persistent rate is the hw_refresh failure trace read off the counter; promoting to a page awaits an incident class
 EOF
 
@@ -144,9 +145,11 @@ yq -N 'select(.kind == "PrometheusRule")' "$mon" >"$rules"
 reasons=$TMPDIR/42-reasons.txt
 extract_reasons "$obs_src" >"$reasons"
 [ -s "$reasons" ] || { echo "FAIL: extracted zero reasons from the staged source — the extraction regex rotted" >&2; exit 1; }
-# Premise pin: the const had 6 members when this fragment landed; a
-# shrink below that means the extraction broke, not policy.
-[ "$(grep -c . "$reasons")" -ge 6 ] || { echo "FAIL: fewer reasons extracted than the landing floor (6)" >&2; exit 1; }
+# Premise pin: the const had 6 members when this fragment landed and
+# 7 at the wave-integrated tree (S4's forecast_all_cells_ice_masked
+# joined); the floor only ratchets UP — a shrink below it means the
+# extraction broke, not policy.
+[ "$(grep -c . "$reasons")" -ge 7 ] || { echo "FAIL: fewer reasons extracted than the landing floor (7)" >&2; exit 1; }
 
 expr_reasons=$TMPDIR/42-expr-reasons.txt
 extract_expr_reasons "$rules" >"$expr_reasons"
