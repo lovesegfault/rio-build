@@ -122,11 +122,28 @@ where
     Fut: Future<Output = Result<T>>,
 {
     keys.sort_unstable();
-    match body(keys.clone()).await {
+    retry_once_on_deadlock(|| body(keys.clone())).await
+}
+
+/// Run `body`; on SQLSTATE 40P01 ([`MetadataError::Deadlock`]) retry
+/// it exactly once after [`jitter`]. PG aborts the WHOLE transaction
+/// on deadlock, so `body` must own a complete begin→…→commit attempt.
+///
+/// Bounded at one retry by design: every caller's sorted
+/// lock-acquisition discipline (`r[store.chunk.lock-order]`) SHOULD
+/// prevent the deadlock outright; a single retry absorbs the residual
+/// index-page-split case, while unbounded retry would mask a real
+/// lock-order regression as latency.
+pub(crate) async fn retry_once_on_deadlock<T, F, Fut>(body: F) -> Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    match body().await {
         Err(MetadataError::Deadlock(e)) => {
-            warn!(error = %e, "40P01 on batch UPDATE; retrying once after jitter");
+            warn!(error = %e, "40P01; retrying once after jitter");
             tokio::time::sleep(jitter()).await;
-            body(keys).await
+            body().await
         }
         r => r,
     }
@@ -442,10 +459,43 @@ async fn mark_manifest_chunks_durable(
         .into_iter()
         .collect();
     hashes.sort_unstable();
-    sqlx::query("UPDATE chunks SET durable = TRUE WHERE blake3_hash = ANY($1) AND NOT durable")
-        .bind(&hashes)
-        .execute(&mut *conn)
-        .await?;
+    // Lock-then-update, NOT a bare batch UPDATE: a single-statement
+    // `UPDATE ... WHERE blake3_hash = ANY($1)` row-locks in SCAN
+    // order — whatever order the chosen plan visits rows (btree
+    // ascending, bitmap-heap physical, seq) — and the sorted bind
+    // array does NOT constrain it. The ingest refcount UPSERT locks
+    // in sorted UNNEST input order, so two concurrent PutPaths with
+    // overlapping chunk sets could circular-wait: measured 1,713 PG
+    // 40P01 deadlocks under concurrent ingest, ~1% of PutPaths
+    // failing client-visible. `SELECT ... ORDER BY ... FOR UPDATE`
+    // acquires locks in ORDER BY order (PG sorts beneath the
+    // LockRows node) — the same idiom as `lock_chunks_for_commit`.
+    // In the PutPathBatch path that helper already holds every one
+    // of these row locks, making this re-lock an instant no-op.
+    //
+    // `AND NOT durable` keeps this from re-locking rows a prior
+    // manifest already flipped (a shared chunk is flipped once, by
+    // whichever referencing manifest completes first). `durable`
+    // only goes FALSE for refcount-0 rows (GC tombstone), which
+    // these aren't (the upsert's committed refcount is ≥1), so the
+    // locked set can't change between the SELECT and the UPDATE —
+    // and the UPDATE binds the locked set, touching only held rows.
+    // r[impl store.chunk.lock-order]
+    let locked: Vec<Vec<u8>> = sqlx::query_scalar(
+        "SELECT blake3_hash FROM chunks \
+          WHERE blake3_hash = ANY($1) AND NOT durable \
+          ORDER BY blake3_hash \
+            FOR UPDATE",
+    )
+    .bind(&hashes)
+    .fetch_all(&mut *conn)
+    .await?;
+    if !locked.is_empty() {
+        sqlx::query("UPDATE chunks SET durable = TRUE WHERE blake3_hash = ANY($1)")
+            .bind(&locked)
+            .execute(&mut *conn)
+            .await?;
+    }
     Ok(())
 }
 
@@ -811,6 +861,64 @@ mod tests {
                 .unwrap();
         assert_eq!(refcount, 1, "upsert bumped refcount");
         assert!(!deleted, "upsert cleared deleted=false (chunk resurrected)");
+    }
+
+    /// [`retry_once_on_deadlock`] retries EXACTLY once on
+    /// `MetadataError::Deadlock` — the bounded server-side retry the
+    /// chunked-completion ingest path relies on (measured pre-fix:
+    /// 1,713 PG 40P01s, ~1% of PutPaths failing client-visible with
+    /// no retry).
+    #[tokio::test]
+    async fn retry_once_on_deadlock_recovers_single_deadlock() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let r = retry_once_on_deadlock(|| {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n == 0 {
+                    Err(MetadataError::Deadlock(sqlx::Error::PoolClosed))
+                } else {
+                    Ok(7u32)
+                }
+            }
+        })
+        .await;
+        assert_eq!(r.unwrap(), 7, "second attempt's success propagates");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "exactly one retry");
+    }
+
+    /// Non-deadlock errors are NOT retried — a retry would mask real
+    /// failures (constraint violations, lost placeholders) as latency.
+    #[tokio::test]
+    async fn retry_once_on_deadlock_propagates_other_errors() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let r: Result<()> = retry_once_on_deadlock(|| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(MetadataError::Serialization) }
+        })
+        .await;
+        assert!(matches!(r, Err(MetadataError::Serialization)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry on non-40P01");
+    }
+
+    /// The retry is BOUNDED: a second consecutive deadlock propagates
+    /// (unbounded retry would mask a lock-order regression).
+    #[tokio::test]
+    async fn retry_once_on_deadlock_bounded_at_one_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let r: Result<()> = retry_once_on_deadlock(|| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(MetadataError::Deadlock(sqlx::Error::PoolClosed)) }
+        })
+        .await;
+        assert!(matches!(r, Err(MetadataError::Deadlock(_))));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "two attempts, then give up"
+        );
     }
 
     /// Test-only shallow clone. MetadataError can't derive Clone (holds
