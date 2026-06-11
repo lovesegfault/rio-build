@@ -2090,51 +2090,10 @@ impl NodeClaimPoolReconciler {
         let live_cores: u32 = live.iter().map(|n| n.allocatable.0).sum();
         let mut created_cores = 0u32;
 
-        let (by_cell, outcomes) =
+        let (by_cell, mut outcomes) =
             cover::assign_to_cells(unplaced, &self.sketches, ice, cover::cell_rank, |i, m| {
                 self.cfg.fallback_cell(i, &self.hw_config, m)
             });
-        // r[impl ctrl.nodeclaim.placement-outcome]
-        // The caller's total fold over the PlacementOutcome alphabet:
-        // tally via the shared outcome→tally law, plus the two LOUD
-        // populations' side artifacts — the named-cells WARN input
-        // (ready all-masked) and the typed IntentVerdict mint
-        // (NoHostingClass, live_051(c)). Zero wildcard arms: a new
-        // outcome variant fails compilation here.
-        let dropped = cover::DropTally::from_outcomes(&outcomes);
-        let mut masked_ready: Vec<(&str, &[String])> = Vec::new();
-        let mut rejected: Vec<rio_proto::types::IntentVerdict> = Vec::new();
-        for (i, o) in &outcomes {
-            // The wire mapping is `PlacementOutcome::verdict_reason` —
-            // ONE authority (censused by `exactly_one_outcome_variant_
-            // ships_a_verdict`); the detail string is built here where
-            // the configured-class census lives.
-            if let Some(reason) = o.verdict_reason() {
-                rejected.push(rio_proto::types::IntentVerdict {
-                    intent_id: i.intent_id.clone(),
-                    reason: reason.into(),
-                    detail: format!(
-                        "no [sla.hw_classes] entry hosts system={} cores={} \
-                         mem_bytes={} required_features={:?}; configured classes: [{}]",
-                        i.system,
-                        i.cores,
-                        i.mem_bytes,
-                        i.required_features,
-                        self.hw_config.names().join(", "),
-                    ),
-                });
-            }
-            match o {
-                cover::PlacementOutcome::Placed(_)
-                | cover::PlacementOutcome::LeadTimeGated
-                | cover::PlacementOutcome::NoHostingClass => {}
-                cover::PlacementOutcome::UnplaceableAllMasked { open_rungs: 0 } => {}
-                cover::PlacementOutcome::UnplaceableAllMasked { .. } => {
-                    masked_ready.push((i.intent_id.as_str(), &i.hw_class_names));
-                }
-            }
-        }
-        emit_drop_tally(&dropped, &masked_ready, ice.len());
         let order =
             cover::cells_round_robin(self.cfg.all_cells(&self.hw_config), self.tick_counter);
 
@@ -2175,7 +2134,23 @@ impl NodeClaimPoolReconciler {
                 ),
                 fuse_cache_bytes: self.cfg.fuse_cache_bytes,
             };
-            let (claims, min_eta) = cover::sizing(cell, u, &scfg);
+            let cover::Sizing {
+                claims,
+                min_eta,
+                over_cap,
+            } = cover::sizing(cell, u, &scfg);
+            // bug_026 (R21): the sizing partition's over-cap drops
+            // re-classify Placed → OverCap on the SAME alphabet via the
+            // shared seam (`cover::reclassify_over_cap` — the unit
+            // witness drives it directly), so the post-loop total fold
+            // sees the letter for the tally, the WARN, and the wire
+            // mint.
+            cover::reclassify_over_cap(
+                &mut outcomes,
+                &over_cap,
+                (scfg.max_node_cores, scfg.max_node_mem, scfg.max_node_disk),
+                self.cfg.fuse_cache_bytes,
+            );
             if claims.is_empty() {
                 debug!(%cell, budget = scfg.budget, "no claims (budget exhausted or empty)");
                 continue;
@@ -2218,8 +2193,20 @@ impl NodeClaimPoolReconciler {
             for &(c, m, d) in &claims {
                 // D4 mutation seam: a deposed pass mints nothing more
                 // (the next tenure's pass re-derives the deficit).
+                // Verdicts ship EMPTY on the deposed exit: the
+                // `rejected` plane is LEVEL-TRIGGERED (re-derived per
+                // tick from still-existing state — the
+                // report_unfulfillable retention census), it is built
+                // by the post-loop outcome fold this return skips, and
+                // a deposed pass's Ack is leadership-refused
+                // server-side anyway. Created-so-far IS returned —
+                // those creates happened and must enter
+                // `inflight_created` tracking.
                 if pass_fence.check("nodeclaim-create").is_err() {
-                    return Ok(CoverResult { created, rejected });
+                    return Ok(CoverResult {
+                        created,
+                        rejected: Vec::new(),
+                    });
                 }
                 let nc = cover::build_nodeclaim(cell, (c, m, d), min_eta, &hw, &cover_cfg);
                 match self.nodeclaims.create(&PostParams::default(), &nc).await {
@@ -2252,6 +2239,69 @@ impl NodeClaimPoolReconciler {
                 }
             }
         }
+        // r[impl ctrl.nodeclaim.placement-outcome+1]
+        // The caller's total fold over the PlacementOutcome alphabet —
+        // AFTER the sizing loop so the over-cap letter is visible:
+        // tally via the shared outcome→tally law, plus the LOUD
+        // populations' side artifacts — the named-cells WARN input
+        // (ready all-masked) and the typed IntentVerdict mints
+        // (NoHostingClass, live_051(c); OverCap ADVISORY, bug_026).
+        // Zero wildcard arms: a new outcome variant fails compilation
+        // here.
+        let dropped = cover::DropTally::from_outcomes(&outcomes);
+        let mut masked_ready: Vec<(&str, &[String])> = Vec::new();
+        let mut rejected: Vec<rio_proto::types::IntentVerdict> = Vec::new();
+        for (i, o) in &outcomes {
+            // The wire mapping is `PlacementOutcome::verdict_reason` —
+            // ONE authority (censused by
+            // `wire_mapped_outcome_variants_census`); the per-letter
+            // detail is built here where the configured-class census
+            // lives. The no-verdict arms are listed (not wildcarded) so
+            // a new wire-mapped letter forces a detail decision (R21).
+            if let Some(reason) = o.verdict_reason() {
+                let detail = match o {
+                    cover::PlacementOutcome::NoHostingClass => format!(
+                        "no [sla.hw_classes] entry hosts system={} cores={} \
+                         mem_bytes={} required_features={:?}; configured classes: [{}]",
+                        i.system,
+                        i.cores,
+                        i.mem_bytes,
+                        i.required_features,
+                        self.hw_config.names().join(", "),
+                    ),
+                    cover::PlacementOutcome::OverCap { footprint, cap } => format!(
+                        "pod footprint (cores={} mem={} disk={}) exceeds the \
+                         assigned cell's per-class cap (cores={} mem={} disk={}); \
+                         advisory: self-heals on GetHwClassConfig refresh \
+                         (<=300s) or scheduler re-solve — not a hosting refusal",
+                        footprint.0, footprint.1, footprint.2, cap.0, cap.1, cap.2,
+                    ),
+                    cover::PlacementOutcome::Placed(_)
+                    | cover::PlacementOutcome::LeadTimeGated
+                    | cover::PlacementOutcome::UnplaceableAllMasked { .. }
+                    | cover::PlacementOutcome::DecodeRefused { .. } => {
+                        unreachable!("verdict_reason() maps these arms to None")
+                    }
+                };
+                rejected.push(rio_proto::types::IntentVerdict {
+                    intent_id: i.intent_id.clone(),
+                    reason: reason.into(),
+                    detail,
+                });
+            }
+            match o {
+                cover::PlacementOutcome::Placed(_)
+                | cover::PlacementOutcome::LeadTimeGated
+                | cover::PlacementOutcome::NoHostingClass
+                | cover::PlacementOutcome::OverCap { .. }
+                | cover::PlacementOutcome::DecodeRefused { .. } => {}
+                cover::PlacementOutcome::UnplaceableAllMasked { open_rungs: 0 } => {}
+                cover::PlacementOutcome::UnplaceableAllMasked { .. } => {
+                    masked_ready.push((i.intent_id.as_str(), &i.hw_class_names));
+                }
+            }
+        }
+        emit_drop_tally(&dropped, &masked_ready, ice.len());
         // r41 bug_021: `assign_to_cells` keys `by_cell` on scheduler-
         // stamped cells (`cells_of(i)` reads `hw_class_names`/
         // `node_affinity`, both written by the SCHEDULER at solve time).
@@ -2448,7 +2498,7 @@ pub async fn nodeclaim_crd_present(kube: &kube::Client) -> bool {
 /// `(intent_id, hw_class_names)` for the ready all-masked population
 /// (the named-cells WARN input); `masked_cells` is the tick's ICE-mask
 /// cardinality.
-// r[impl ctrl.nodeclaim.placement-outcome]
+// r[impl ctrl.nodeclaim.placement-outcome+1]
 pub(crate) fn emit_drop_tally(
     dropped: &cover::DropTally,
     masked_ready: &[(&str, &[String])],
@@ -2528,6 +2578,38 @@ pub(crate) fn emit_drop_tally(
              `rio_controller_nodeclaim_reaped_total{{reason=~\"ice|vanished\"}}`; \
              configure a degradation ladder rung if one exists. \
              See sla-model.typ#rionodeclaimpool-icemaskedhigh"
+        );
+    }
+    if dropped.over_cap > 0 {
+        // bug_026: the per-intent counter
+        // (`intent_dropped_total{reason=exceeds_cell_cap}`) already
+        // incremented at the sizing partition — no second count here;
+        // this WARN is the fold's operator narration and the verdict
+        // plane (ADVISORY `OVER_CAP` reason on the same tick's ack) is
+        // the consumer answer.
+        warn!(
+            dropped = dropped.over_cap,
+            "SpawnIntents over their assigned cell's per-class cap — \
+             sizing minted no claim (scheduler ClassCeiling not gating? \
+             GetHwClassConfig skew converges <=300s); each is answered \
+             to the scheduler as an ADVISORY over-cap IntentVerdict \
+             (distinct from no_hosting_class; never poison-feeding)"
+        );
+    }
+    if dropped.decode_refused > 0 {
+        // merged_bug_006: the loud decode-refusal lane (the
+        // `mask_refused_total` posture) — a skewed
+        // `(hw_class_names, node_affinity)` pair refuses the WHOLE
+        // intent instead of laundering into the forecast-quiet arm.
+        metrics::counter!("rio_controller_nodeclaim_cells_decode_refused_total")
+            .increment(dropped.decode_refused);
+        warn!(
+            refused = dropped.decode_refused,
+            "SpawnIntents with undecodable (hw_class_names, \
+             node_affinity) entries REFUSED — scheduler/controller \
+             version skew or a cells_to_selector_terms producer \
+             regression; check deployment ages (self-heals with rollout \
+             convergence)"
         );
     }
 }

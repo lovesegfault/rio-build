@@ -19,6 +19,7 @@ CloseCause cause = 3;
 ExecutorKind kind = 11;
 ExecutorKind kind = 6;
 INTENT_VERDICT_REASON_NO_HOSTING_CLASS = 1;
+INTENT_VERDICT_REASON_OVER_CAP = 2;
 INTENT_VERDICT_REASON_UNSPECIFIED = 0;
 IntentVerdictReason reason = 2;
 ResourceUsage resources = 7;

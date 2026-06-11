@@ -28,7 +28,7 @@ use rio_common::k8s::metal_partition_op;
 use rio_crds::karpenter::{NodeClaim, NodeClaimSpec, NodeClassRef, NodeSelectorRequirementWithMin};
 use rio_proto::types::{NodeSelectorRequirement, SpawnIntent};
 
-use super::ffd::{CAPACITY_TYPE_LABEL, HW_CLASS_LABEL, a_open};
+use super::ffd::{CAPACITY_TYPE_LABEL, HW_CLASS_LABEL};
 use super::sketch::{CapacityType, Cell, CellSketches};
 
 /// `karpenter.sh/nodepool` label key. Karpenter's state-tracking
@@ -161,6 +161,23 @@ pub struct DropTally {
     /// degradation ladder (`ctrl.nodeclaim.capacity-ladder`) is the
     /// structural consumer that gives the walk a next rung.
     pub ready_all_cells_ice_masked: u64,
+    /// Pod footprint exceeds the assigned cell's per-class cap —
+    /// [`sizing`]'s over-cap partition, re-classified onto the alphabet
+    /// (bug_026). The per-intent counter
+    /// (`intent_dropped_total{reason=exceeds_cell_cap}`) increments at
+    /// the partition; this tally is the fold's view for the WARN and
+    /// the wire mint (ADVISORY verdict — `IntentVerdictReason::
+    /// OVER_CAP`, never the poison-feeding reason). Self-heals ≤300s
+    /// (GetHwClassConfig skew) or on scheduler re-solve.
+    pub over_cap: u64,
+    /// The intent's `(hw_class_names, node_affinity)` pair had
+    /// undecodable entries (merged_bug_006) — the whole intent REFUSES
+    /// (`ArmEchoSkewed` posture; counted via
+    /// `rio_controller_nodeclaim_cells_decode_refused_total`).
+    /// Operator action: scheduler/controller version skew or a
+    /// producer regression in `cells_to_selector_terms` — check
+    /// deployment ages; self-heals with rollout convergence.
+    pub decode_refused: u64,
 }
 
 /// One intent's minted outcome, paired with the intent it judges —
@@ -173,7 +190,7 @@ pub type PlacementRecord<'a> = (&'a SpawnIntent, PlacementOutcome);
 /// masking — a post-hoc tally cannot reconstruct it). The caller
 /// total-folds this alphabet with zero wildcard arms; rustc
 /// exhaustiveness is the membership census (R15).
-// r[impl ctrl.nodeclaim.placement-outcome]
+// r[impl ctrl.nodeclaim.placement-outcome+1]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlacementOutcome {
     /// Assigned to an unmasked cell (grouped into `by_cell`).
@@ -191,24 +208,54 @@ pub enum PlacementOutcome {
     /// config gap; answered to the scheduler as a typed
     /// `IntentVerdict` (live_051(c)).
     NoHostingClass,
+    /// The intent's pod footprint exceeds its assigned cell's per-class
+    /// cap — [`sizing`] can mint no valid claim of ANY `n` for it this
+    /// tick (bug_026; the R21 post-chokepoint letter: re-classified
+    /// from `Placed` at the sizing partition, the only site that knows
+    /// the footprint-vs-cap comparison). ADVISORY on the wire: the lane
+    /// is version-skew transient (≤300s GetHwClassConfig convergence,
+    /// or a scheduler re-solve), so the verdict reason is DISTINCT from
+    /// `NO_HOSTING_CLASS` and MUST NOT feed the scheduler's terminal
+    /// poison budget — see `IntentVerdictReason::OVER_CAP`.
+    OverCap {
+        footprint: (u32, u64, u64),
+        cap: (u32, u64, u64),
+    },
+    /// The intent's `(hw_class_names, node_affinity)` wire pair had
+    /// undecodable entries (length mismatch, missing capacity-type
+    /// requirement, unparseable capacity value — merged_bug_006). LOUD
+    /// refusal of the WHOLE intent (the `ArmEchoSkewed` /
+    /// `mask_refused_total` posture: a skewed set is untrustworthy
+    /// evidence, never a placement base), counted via
+    /// `rio_controller_nodeclaim_cells_decode_refused_total`. OFF the
+    /// wire: the decode fault is controller-side and self-heals with
+    /// producer/skew convergence; the scheduler's own echo-skew
+    /// refusals already cover its half.
+    DecodeRefused { refused: usize, decoded: usize },
 }
 
 impl PlacementOutcome {
-    /// The outcome→wire law (live_051(c)): which arm ships an
+    /// The outcome→wire law (live_051(c) + bug_026): which arm ships an
     /// `IntentVerdict` on the spawn-intent ack. Total match — a new
     /// variant forces a wire decision here; the census test
-    /// `exactly_one_outcome_variant_ships_a_verdict` pins the
-    /// exactly-one property. The masked arms stay OFF the wire: their
-    /// masks are the scheduler's own (`ice_masked_cells` /
-    /// `unfulfillable_cells`) — the surviving no-wire half of the
-    /// WO-S7-3 derivation.
+    /// `wire_mapped_outcome_variants_census` pins the wire-mapped set
+    /// at exactly {NoHostingClass → poison-feeding, OverCap →
+    /// advisory}. The masked arms stay OFF the wire: their masks are
+    /// the scheduler's own (`ice_masked_cells` / `unfulfillable_cells`)
+    /// — the surviving no-wire half of the WO-S7-3 derivation; the
+    /// decode-refused arm stays OFF the wire (controller-side fault,
+    /// loud locally).
     pub fn verdict_reason(&self) -> Option<rio_proto::types::IntentVerdictReason> {
         match self {
             PlacementOutcome::Placed(_)
             | PlacementOutcome::LeadTimeGated
-            | PlacementOutcome::UnplaceableAllMasked { .. } => None,
+            | PlacementOutcome::UnplaceableAllMasked { .. }
+            | PlacementOutcome::DecodeRefused { .. } => None,
             PlacementOutcome::NoHostingClass => {
                 Some(rio_proto::types::IntentVerdictReason::NoHostingClass)
+            }
+            PlacementOutcome::OverCap { .. } => {
+                Some(rio_proto::types::IntentVerdictReason::OverCap)
             }
         }
     }
@@ -234,9 +281,36 @@ impl DropTally {
                     t.ready_all_cells_ice_masked += 1;
                 }
                 PlacementOutcome::NoHostingClass => t.no_hosting_class += 1,
+                PlacementOutcome::OverCap { .. } => t.over_cap += 1,
+                PlacementOutcome::DecodeRefused { .. } => t.decode_refused += 1,
             }
         }
         t
+    }
+}
+
+/// bug_026 (R21): apply the over-cap re-classification minted at the
+/// [`sizing`] partition onto the outcome records — the post-chokepoint
+/// terminal drop becomes a compile-time variant of the SAME alphabet
+/// (`PlacementOutcome::OverCap`), never a shadow disposition. `cap` is
+/// the assigned cell's effective per-class ceiling triple; only
+/// `Placed` records re-classify (an intent is assigned to exactly one
+/// cell, so at most one sizing partition sees it).
+pub fn reclassify_over_cap(
+    outcomes: &mut [PlacementRecord<'_>],
+    over: &[&SpawnIntent],
+    cap: (u32, u64, u64),
+    fuse_cache_bytes: u64,
+) {
+    use crate::reconcilers::pool::jobs::intent_pod_footprint;
+    let ids: HashSet<&str> = over.iter().map(|i| i.intent_id.as_str()).collect();
+    for (i, o) in outcomes.iter_mut() {
+        if ids.contains(i.intent_id.as_str()) && matches!(o, PlacementOutcome::Placed(_)) {
+            *o = PlacementOutcome::OverCap {
+                footprint: intent_pod_footprint(i, fuse_cache_bytes),
+                cap,
+            };
+        }
     }
 }
 
@@ -292,44 +366,67 @@ pub fn assign_to_cells<'a>(
     let mut outcomes: Vec<PlacementRecord<'a>> = Vec::with_capacity(unplaced.len());
     let unmasked = HashSet::new();
     for i in unplaced {
-        let open = a_open(i, sketches);
+        let decode = super::ffd::a_open_checked(i, sketches);
+        let open = decode.open;
         let open_rungs = open.len();
         // The single mint site: exactly one PlacementOutcome per
         // intent, constructed from filter-site evidence.
-        let outcome = match open
-            .into_iter()
-            .filter(|c| !masked.contains(c))
-            .min_by(|a, b| cell_price(a).total_cmp(&cell_price(b)))
-        {
-            Some(c) => PlacementOutcome::Placed(c),
-            None if !i.hw_class_names.is_empty() => {
-                // Non-empty hw_class_names + empty filtered set is a
-                // DISJUNCTION, not the old "⇔ lead-time-gated" claim
-                // (live_050(a) — the false ⇔ silently starved 208
-                // ready intents): either A_open was empty BEFORE
-                // masking (genuinely lead-time-gated; quiet — next
-                // tick re-evaluates) or masking emptied a non-empty
-                // A_open (every hosting cell ICE-masked; LOUD).
-                if open_rungs == 0 {
-                    PlacementOutcome::LeadTimeGated
-                } else {
-                    PlacementOutcome::UnplaceableAllMasked { open_rungs }
-                }
+        // merged_bug_006: decode refusals pre-empt EVERY placement arm
+        // — a skewed `(hw_class_names, node_affinity)` pair is
+        // untrustworthy evidence (the ArmEchoSkewed posture), so the
+        // whole intent refuses loudly instead of placing on (or being
+        // quietly gated by) a silently truncated set.
+        let outcome = if decode.refused > 0 {
+            PlacementOutcome::DecodeRefused {
+                refused: decode.refused,
+                decoded: decode.decoded,
             }
-            None => {
-                // Cold-start (`hw_class_names=[]`): fallback path.
-                // Defense-in-depth: re-filter even though the
-                // `fallback_cell` impl already respects `masked`. A
-                // masked `(referenceHwClass, spot)` that slipped
-                // through would land in `by_cell` and then be
-                // `continue`d by the per-cell ICE skip — silently
-                // stranding cold-start probes.
-                match fallback(i, masked).filter(|c| !masked.contains(c)) {
-                    Some(c) => PlacementOutcome::Placed(c),
-                    None if fallback(i, &unmasked).is_some() => {
-                        PlacementOutcome::UnplaceableAllMasked { open_rungs: 0 }
+        } else {
+            match open
+                .into_iter()
+                .filter(|c| !masked.contains(c))
+                .min_by(|a, b| cell_price(a).total_cmp(&cell_price(b)))
+            {
+                Some(c) => PlacementOutcome::Placed(c),
+                None if !i.hw_class_names.is_empty() => {
+                    // Non-empty hw_class_names + empty filtered set is a
+                    // DISJUNCTION, not the old "⇔ lead-time-gated" claim
+                    // (live_050(a) — the false ⇔ silently starved 208
+                    // ready intents): either A_open was empty BEFORE
+                    // masking (genuinely lead-time-gated; quiet — next
+                    // tick re-evaluates) or masking emptied a non-empty
+                    // A_open (every hosting cell ICE-masked; LOUD).
+                    if open_rungs == 0 {
+                        // T1 premise assert: forecast-gating requires a
+                        // forecast. With decode refusals their own
+                        // letter, a READY intent with non-empty
+                        // hw_class_names always decodes a non-empty
+                        // cell set — this arm is forecast-only.
+                        debug_assert!(
+                            !i.ready.unwrap_or(true),
+                            "forecast-gating requires a forecast \
+                             (ready intent reached the LeadTimeGated arm)"
+                        );
+                        PlacementOutcome::LeadTimeGated
+                    } else {
+                        PlacementOutcome::UnplaceableAllMasked { open_rungs }
                     }
-                    None => PlacementOutcome::NoHostingClass,
+                }
+                None => {
+                    // Cold-start (`hw_class_names=[]`): fallback path.
+                    // Defense-in-depth: re-filter even though the
+                    // `fallback_cell` impl already respects `masked`. A
+                    // masked `(referenceHwClass, spot)` that slipped
+                    // through would land in `by_cell` and then be
+                    // `continue`d by the per-cell ICE skip — silently
+                    // stranding cold-start probes.
+                    match fallback(i, masked).filter(|c| !masked.contains(c)) {
+                        Some(c) => PlacementOutcome::Placed(c),
+                        None if fallback(i, &unmasked).is_some() => {
+                            PlacementOutcome::UnplaceableAllMasked { open_rungs: 0 }
+                        }
+                        None => PlacementOutcome::NoHostingClass,
+                    }
                 }
             }
         };
@@ -426,11 +523,24 @@ pub struct SizingCfg {
 /// predicate IS production `simulate` — no reimplemented sort/score to
 /// diverge on. Unit-tested via the same call (the
 /// §Simulator-shares-accounting executable guarantee).
+/// One cell's [`sizing`] outcome: the uniform claim vector, the
+/// `min(eta)` annotation input, and the over-cap drops (re-classified
+/// onto the placement alphabet by [`reclassify_over_cap`] — bug_026).
+pub struct Sizing<'a> {
+    pub claims: Vec<(u32, u64, u64)>,
+    pub min_eta: f64,
+    pub over_cap: Vec<&'a SpawnIntent>,
+}
+
 // r[impl ctrl.nodeclaim.anchor-bulk+5]
-pub fn sizing(cell: &Cell, u: &[&SpawnIntent], cfg: &SizingCfg) -> (Vec<(u32, u64, u64)>, f64) {
+pub fn sizing<'a>(cell: &Cell, u: &[&'a SpawnIntent], cfg: &SizingCfg) -> Sizing<'a> {
     use crate::reconcilers::pool::jobs::intent_pod_footprint;
     if u.is_empty() {
-        return (Vec::new(), f64::MAX);
+        return Sizing {
+            claims: Vec::new(),
+            min_eta: f64::MAX,
+            over_cap: Vec::new(),
+        };
     }
     // STRIKE-5 (r27 mb_006): per-cell `cfg.max_node_*` (from
     // `HwClassDef.max_cores`) means the upstream "≤ global cap"
@@ -449,10 +559,11 @@ pub fn sizing(cell: &Cell, u: &[&SpawnIntent], cfg: &SizingCfg) -> (Vec<(u32, u6
     // classes`). This backstop now fires only on version-skew
     // (controller `hw_classes` ≠ scheduler's) or a producer bypassing
     // `solve_intent_for` entirely.
-    let (fits, over): (Vec<&SpawnIntent>, Vec<&SpawnIntent>) = u.iter().copied().partition(|i| {
-        let (ic, im, id) = intent_pod_footprint(i, cfg.fuse_cache_bytes);
-        ic <= cfg.max_node_cores && im <= cfg.max_node_mem && id <= cfg.max_node_disk
-    });
+    let (fits, over): (Vec<&'a SpawnIntent>, Vec<&'a SpawnIntent>) =
+        u.iter().copied().partition(|i| {
+            let (ic, im, id) = intent_pod_footprint(i, cfg.fuse_cache_bytes);
+            ic <= cfg.max_node_cores && im <= cfg.max_node_mem && id <= cfg.max_node_disk
+        });
     for i in &over {
         let (ic, im, id) = intent_pod_footprint(i, cfg.fuse_cache_bytes);
         tracing::warn!(
@@ -469,7 +580,11 @@ pub fn sizing(cell: &Cell, u: &[&SpawnIntent], cfg: &SizingCfg) -> (Vec<(u32, u6
         .increment(1);
     }
     if fits.is_empty() {
-        return (Vec::new(), f64::MAX);
+        return Sizing {
+            claims: Vec::new(),
+            min_eta: f64::MAX,
+            over_cap: over,
+        };
     }
     let (sum_c, sum_m, sum_d, max_c, max_m, max_d) = fits
         .iter()
@@ -503,7 +618,13 @@ pub fn sizing(cell: &Cell, u: &[&SpawnIntent], cfg: &SizingCfg) -> (Vec<(u32, u6
         .unwrap_or(n_hi);
     let (chunk, mem, disk) = claim_at(n_pack);
     if cfg.budget < chunk {
-        return (Vec::new(), min_eta);
+        // Budget-deferred, NOT over-cap: the fits population is
+        // demanded and right-sized; the brake re-sees it next tick.
+        return Sizing {
+            claims: Vec::new(),
+            min_eta,
+            over_cap: over,
+        };
     }
     // r[impl ctrl.nodeclaim.mint-deficit-proportional]
     // live_049 L1: the two-term mint law — demand x budget. The
@@ -511,7 +632,11 @@ pub fn sizing(cell: &Cell, u: &[&SpawnIntent], cfg: &SizingCfg) -> (Vec<(u32, u6
     // protecting nothing: every claim it deferred was demanded
     // (placeable-gated), budget-affordable, and right-sized.
     let n = n_pack.min(cfg.budget / chunk);
-    (vec![(chunk, mem, disk); n as usize], min_eta)
+    Sizing {
+        claims: vec![(chunk, mem, disk); n as usize],
+        min_eta,
+        over_cap: over,
+    }
 }
 
 // r[impl ctrl.nodeclaim.budget.per-class+3]
@@ -850,7 +975,7 @@ mod tests {
         // Σc=80, n_lo=⌈80/32⌉=3; sim_packs finds n_pack=5 (disk-bound:
         // each pod's footprint.d = 5×1.5+50+1 ≈ 58.5Gi; 3 bins of
         // ⌈Σd/3⌉≈195Gi fit 3 each = 9 < 10).
-        let (c, _) = sizing(&h_spot(), &refs, &cfg(32, 200));
+        let Sizing { claims: c, .. } = sizing(&h_spot(), &refs, &cfg(32, 200));
         assert_eq!(
             c.len(),
             5,
@@ -859,9 +984,9 @@ mod tests {
              per_tick_cap=2)"
         );
         // chunk at n_pack=5 is ⌈80/5⌉.max(8)=16; budget=20 → ⌊20/16⌋=1.
-        let (c, _) = sizing(&h_spot(), &refs, &cfg(32, 20));
+        let Sizing { claims: c, .. } = sizing(&h_spot(), &refs, &cfg(32, 20));
         assert_eq!(c.len(), 1, "R11: the fleet-budget brake binds (green pin)");
-        let (c, _) = sizing(&h_spot(), &refs, &cfg(32, 10));
+        let Sizing { claims: c, .. } = sizing(&h_spot(), &refs, &cfg(32, 10));
         assert!(c.is_empty(), "budget < chunk");
     }
 
@@ -932,7 +1057,7 @@ mod tests {
         let scfg = cfg(64, u32::MAX);
         let check = |name: &str, intents: Vec<SpawnIntent>| {
             let refs: Vec<&SpawnIntent> = intents.iter().collect();
-            let (claims, _) = sizing(&h_spot(), &refs, &scfg);
+            let Sizing { claims, .. } = sizing(&h_spot(), &refs, &scfg);
             assert!(
                 oracle_places_all(&h_spot(), &intents, &claims, scfg.fuse_cache_bytes),
                 "{name}: FFD-oracle leaves unplaced; claims={claims:?}"
@@ -974,7 +1099,11 @@ mod tests {
                 .collect(),
         );
         // Empty.
-        let (c, e) = sizing(&h_spot(), &[], &scfg);
+        let Sizing {
+            claims: c,
+            min_eta: e,
+            ..
+        } = sizing(&h_spot(), &[], &scfg);
         assert!(c.is_empty());
         assert_eq!(e, f64::MAX);
     }
@@ -1004,7 +1133,7 @@ mod tests {
             fuse_cache_bytes: 50 * GI,
         };
         let refs: Vec<&SpawnIntent> = u.iter().collect();
-        let (claims, _) = sizing(&h_spot(), &refs, &scfg);
+        let Sizing { claims, .. } = sizing(&h_spot(), &refs, &scfg);
         assert!(
             oracle_places_all(&h_spot(), &u, &claims, scfg.fuse_cache_bytes),
             "mixed-ready FFD-oracle leaves unplaced; claims={claims:?}"
@@ -1043,7 +1172,11 @@ mod tests {
             let rec = DebuggingRecorder::new();
             let _g = ::metrics::set_default_local_recorder(&rec);
             let over = intent_hd("o", 48, 8 * GI, 5 * GI, Some(true));
-            let (claims, eta) = sizing(&h_spot(), &[&over], &scfg);
+            let Sizing {
+                claims,
+                min_eta: eta,
+                ..
+            } = sizing(&h_spot(), &[&over], &scfg);
             assert!(
                 claims.is_empty(),
                 "48c@cap=32 must drop, not clamp: {claims:?}"
@@ -1059,7 +1192,7 @@ mod tests {
             let f0 = intent_hd("f0", 16, 8 * GI, 5 * GI, Some(true));
             let f1 = intent_hd("f1", 16, 8 * GI, 5 * GI, Some(true));
             let u = [&over, &f0, &f1];
-            let (claims, _) = sizing(&h_spot(), &u, &scfg);
+            let Sizing { claims, .. } = sizing(&h_spot(), &u, &scfg);
             assert_eq!(claims.len(), 1, "Σc(fits)=32 at cap=32 → n=1");
             assert_eq!(claims[0].0, 32);
             assert!(
@@ -1078,7 +1211,7 @@ mod tests {
             let rec = DebuggingRecorder::new();
             let _g = ::metrics::set_default_local_recorder(&rec);
             let over_m = intent_hd("om", 4, 512 * GI, 5 * GI, Some(true));
-            let (claims, _) = sizing(&h_spot(), &[&over_m], &scfg);
+            let Sizing { claims, .. } = sizing(&h_spot(), &[&over_m], &scfg);
             assert!(claims.is_empty(), "mem 512Gi@cap=256Gi must drop");
             assert_eq!(dropped_count(&rec), Some(DebugValue::Counter(1)));
         }
@@ -1118,7 +1251,7 @@ mod tests {
                 })
                 .collect();
             let refs: Vec<&SpawnIntent> = intents.iter().collect();
-            let (claims, _) = sizing(&h_spot(), &refs, &scfg);
+            let Sizing { claims, .. } = sizing(&h_spot(), &refs, &scfg);
             assert!(
                 oracle_places_all(&h_spot(), &intents, &claims, scfg.fuse_cache_bytes),
                 "case {case}: FFD leaves unplaced; len={len} claims={claims:?}"
@@ -1595,7 +1728,7 @@ mod tests {
             DropTally {
                 no_hosting_class: 1,
                 all_cells_ice_masked: 1,
-                ready_all_cells_ice_masked: 0,
+                ..Default::default()
             },
             "hostable-masked → ice; unhostable → no_class"
         );
@@ -2036,9 +2169,8 @@ mod tests {
         assert_eq!(
             DropTally::from_outcomes(&o),
             DropTally {
-                no_hosting_class: 0,
                 all_cells_ice_masked: 1,
-                ready_all_cells_ice_masked: 0,
+                ..Default::default()
             },
             "masked fallback counted as ICE drop, not config drop"
         );
@@ -2086,7 +2218,7 @@ mod tests {
             .collect()
     }
 
-    // r[verify ctrl.nodeclaim.placement-outcome]
+    // r[verify ctrl.nodeclaim.placement-outcome+1]
     /// live_050(a) red R1 / witness W7-A — certifies: *a READY intent
     /// (non-empty `hw_class_names`, non-empty `A_open`) whose every
     /// hosting cell is ICE-masked produces `UnplaceableAllMasked` +
@@ -2152,7 +2284,7 @@ mod tests {
         );
     }
 
-    // r[verify ctrl.nodeclaim.placement-outcome]
+    // r[verify ctrl.nodeclaim.placement-outcome+1]
     /// R2 / witness W7-B (DISCLOSED GREEN-SIDE PIN — the lead-time path
     /// is correct pre-fix and must stay so) — certifies: *a genuinely
     /// lead-time-gated forecast intent still produces zero drop-tally;
@@ -2179,6 +2311,105 @@ mod tests {
         );
     }
 
+    // r[verify ctrl.nodeclaim.placement-outcome+1]
+    /// W9-AX (controller mint face, bug_026): an over-cap drop is a
+    /// letter of the placement alphabet reaching the verdict plane —
+    /// never a shadow disposition after the chokepoint.
+    #[test]
+    fn over_cap_drop_ships_a_typed_verdict() {
+        let i = intent("big", 128, GI, &[("h", CapacityType::Spot)], Some(true));
+        let sketches = CellSketches::default();
+        let none = HashSet::new();
+        let (by_cell, outcomes) = assign_to_cells(
+            std::slice::from_ref(&i),
+            &sketches,
+            &none,
+            cell_rank,
+            |_, _| None,
+        );
+        let cell = Cell("h".into(), CapacityType::Spot);
+        let u: Vec<&SpawnIntent> = by_cell[&cell].to_vec();
+        // Per-cell cap 64 < footprint 128: sizing can mint no claim.
+        let Sizing {
+            claims,
+            over_cap: over,
+            ..
+        } = sizing(
+            &cell,
+            &u,
+            &SizingCfg {
+                max_node_cores: 64,
+                max_node_mem: 256 * GI,
+                max_node_disk: 450 * GI,
+                budget: u32::MAX,
+                fuse_cache_bytes: 0,
+            },
+        );
+        assert!(
+            claims.is_empty(),
+            "premise: the intent was over-cap dropped"
+        );
+        let mut outcomes = outcomes;
+        reclassify_over_cap(&mut outcomes, &over, (64, 256 * GI, 450 * GI), 0);
+        let shipped: Vec<_> = outcomes
+            .iter()
+            .filter_map(|(_, o)| o.verdict_reason())
+            .collect();
+        assert!(
+            !shipped.is_empty(),
+            "an over-cap drop must ship a typed IntentVerdict (a reason \
+             DISTINCT from NO_HOSTING_CLASS) — not vanish after the \
+             chokepoint as a counter-and-warn-only shadow disposition"
+        );
+        assert_eq!(
+            shipped,
+            [rio_proto::types::IntentVerdictReason::OverCap],
+            "the over-cap letter ships the ADVISORY reason — mapping it \
+             onto NO_HOSTING_CLASS (the laundering form) is forbidden"
+        );
+        assert!(
+            matches!(
+                outcomes[0].1,
+                PlacementOutcome::OverCap {
+                    footprint: (128, _, _),
+                    cap: (64, _, _)
+                }
+            ),
+            "the letter carries the footprint-vs-cap evidence: {:?}",
+            outcomes[0].1
+        );
+    }
+
+    // r[verify ctrl.nodeclaim.placement-outcome+1]
+    /// W9-AY (merged_bug_006): a skewed cell list (any undecodable
+    /// entry) REFUSES loudly; a READY intent can never launder into the
+    /// forecast-quiet arm (forecast-gating requires a forecast).
+    #[test]
+    fn skewed_cell_list_refuses_loudly_not_leadtimegated() {
+        // Ready intent whose single affinity term lacks the
+        // capacity-type requirement: cells_of silently drops it today.
+        let mut i = intent("skew", 4, GI, &[("h", CapacityType::Spot)], Some(true));
+        i.node_affinity[0]
+            .match_expressions
+            .retain(|r| r.key != CAPACITY_TYPE_LABEL);
+        let sketches = CellSketches::default();
+        let none = HashSet::new();
+        let (_, outcomes) = assign_to_cells(
+            std::slice::from_ref(&i),
+            &sketches,
+            &none,
+            cell_rank,
+            |_, _| None,
+        );
+        assert!(
+            !matches!(outcomes[0].1, PlacementOutcome::LeadTimeGated),
+            "a READY intent with decode losses must REFUSE loudly \
+             (typed letter + metric), not launder into LeadTimeGated; \
+             got {:?}",
+            outcomes[0].1
+        );
+    }
+
     /// R15 census rows for the `PlacementOutcome` alphabet. The
     /// generator is rustc: the `witness` match below fails to compile
     /// when a variant is added, and the coverage pin asserts every
@@ -2191,6 +2422,14 @@ mod tests {
             PlacementOutcome::UnplaceableAllMasked { open_rungs: 0 },
             PlacementOutcome::UnplaceableAllMasked { open_rungs: 2 },
             PlacementOutcome::NoHostingClass,
+            PlacementOutcome::OverCap {
+                footprint: (128, 2 * GI, 4 * GI),
+                cap: (64, GI, 2 * GI),
+            },
+            PlacementOutcome::DecodeRefused {
+                refused: 1,
+                decoded: 0,
+            },
         ];
         let witness = |o: &PlacementOutcome| -> usize {
             match o {
@@ -2198,9 +2437,11 @@ mod tests {
                 PlacementOutcome::LeadTimeGated => 1,
                 PlacementOutcome::UnplaceableAllMasked { .. } => 2,
                 PlacementOutcome::NoHostingClass => 3,
+                PlacementOutcome::OverCap { .. } => 4,
+                PlacementOutcome::DecodeRefused { .. } => 5,
             }
         };
-        let mut seen = [false; 4];
+        let mut seen = [false; 6];
         for r in &rows {
             seen[witness(r)] = true;
         }
@@ -2236,30 +2477,54 @@ mod tests {
                     no_hosting_class: 1,
                     ..Default::default()
                 },
+                PlacementOutcome::OverCap { .. } => DropTally {
+                    over_cap: 1,
+                    ..Default::default()
+                },
+                PlacementOutcome::DecodeRefused { .. } => DropTally {
+                    decode_refused: 1,
+                    ..Default::default()
+                },
             };
             assert_eq!(got, want, "outcome {o:?}");
         }
     }
 
-    // r[verify ctrl.nodeclaim.placement-outcome]
-    /// live_051(c) wire-mapping census (R15): over the alphabet rows,
-    /// EXACTLY ONE variant ships an `IntentVerdict` (NoHostingClass —
-    /// the controller-config-gap population the scheduler structurally
-    /// cannot see); the masked populations stay off the wire (their
-    /// masks are the scheduler's own — the surviving no-wire half of
-    /// the WO-S7-3 derivation).
+    // r[verify ctrl.nodeclaim.placement-outcome+1]
+    /// live_051(c) + bug_026 wire-mapping census (R15): over the
+    /// alphabet rows, the wire-mapped set is EXACTLY
+    /// {NoHostingClass → NO_HOSTING_CLASS (poison-feeding),
+    /// OverCap → OVER_CAP (ADVISORY — never poison-feeding)}; the
+    /// masked populations stay off the wire (their masks are the
+    /// scheduler's own — the surviving no-wire half of the WO-S7-3
+    /// derivation), and the decode-refused arm stays off the wire
+    /// (controller-side fault, loud locally). The two wire reasons are
+    /// DISTINCT BY TYPE — conflating over-cap onto NO_HOSTING_CLASS
+    /// (the laundering form) would feed the terminal poison budget
+    /// with a self-healing population.
     #[test]
-    fn exactly_one_outcome_variant_ships_a_verdict() {
+    fn wire_mapped_outcome_variants_census() {
         let rows = outcome_census_rows();
         let shipped: Vec<&PlacementOutcome> = rows
             .iter()
             .filter(|o| o.verdict_reason().is_some())
             .collect();
-        assert_eq!(shipped.len(), 1, "exactly one wire-mapped variant");
+        assert_eq!(shipped.len(), 2, "exactly two wire-mapped variants");
         assert!(matches!(shipped[0], PlacementOutcome::NoHostingClass));
+        assert!(matches!(shipped[1], PlacementOutcome::OverCap { .. }));
         assert_eq!(
             PlacementOutcome::NoHostingClass.verdict_reason(),
             Some(rio_proto::types::IntentVerdictReason::NoHostingClass)
+        );
+        assert_eq!(
+            shipped[1].verdict_reason(),
+            Some(rio_proto::types::IntentVerdictReason::OverCap),
+            "over-cap ships the ADVISORY reason, never NO_HOSTING_CLASS"
+        );
+        assert_ne!(
+            shipped[1].verdict_reason(),
+            PlacementOutcome::NoHostingClass.verdict_reason(),
+            "the two wire reasons are distinct by type (anti-laundering pin)"
         );
     }
 }
@@ -2378,7 +2643,7 @@ mod mint_law_tests {
                         fuse_cache_bytes: 50 * GI,
                     },
                 )
-                .0
+                .claims
                 .len()
             })
             .sum();

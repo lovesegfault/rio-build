@@ -776,6 +776,17 @@ enum IntentVerdictReason {
   // config changes; the scheduler-side budget consumes this to a
   // terminal poison with `detail`.
   INTENT_VERDICT_REASON_NO_HOSTING_CLASS = 1;
+  // The intent's pod footprint exceeds its assigned cell's per-class
+  // cap, so sizing can mint no valid claim for it this tick. ADVISORY
+  // semantics, distinct from NO_HOSTING_CLASS BY TYPE: the lane is
+  // transient and self-healing (GetHwClassConfig version skew, ≤300s,
+  // or a scheduler re-solve clears it), so the scheduler consumer MUST
+  // NOT step the terminal no-hosting poison budget on it — the drv
+  // stays Ready and the controller re-mints once the skew clears.
+  // Conflating this onto NO_HOSTING_CLASS would poison self-healing
+  // drvs at exactly the skew threshold (30 verdicts × ~10s tick ≈ the
+  // same ≤300s window).
+  INTENT_VERDICT_REASON_OVER_CAP = 2;
 }
 
 // C2/285: the full `intent_id → spec.nodeName` binding set for one

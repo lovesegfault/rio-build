@@ -799,24 +799,78 @@ fn cap_from_label(s: &str) -> Option<CapacityType> {
     }
 }
 
+/// One intent's decoded cell set plus its decode-loss count
+/// (merged_bug_006): `refused` counts wire entries the decode could
+/// not honor — a length mismatch between the parallel arrays, a term
+/// missing the `karpenter.sh/capacity-type` requirement, or an
+/// unparseable capacity value. `refused > 0` means the pair is SKEWED
+/// (producer regression or scheduler/controller version skew) and the
+/// set is untrustworthy evidence; the cover chokepoint refuses the
+/// whole intent loudly (`PlacementOutcome::DecodeRefused`) instead of
+/// placing against a silently truncated set.
+pub struct CellsDecode {
+    pub cells: Vec<Cell>,
+    pub refused: usize,
+}
+
 /// Recover `(hw_class, cap)` cells from a SpawnIntent's parallel
-/// `(hw_class_names, node_affinity)` arrays. One cell per term; terms
-/// missing a `karpenter.sh/capacity-type` requirement are dropped
-/// (hw-agnostic mode emits empty arrays, so the zip is empty).
+/// `(hw_class_names, node_affinity)` arrays, REPORTING decode losses.
+/// One cell per term; hw-agnostic mode emits empty arrays (zero terms,
+/// zero losses).
+pub fn cells_of_checked(i: &SpawnIntent) -> CellsDecode {
+    let mut refused = i.hw_class_names.len().abs_diff(i.node_affinity.len());
+    let mut cells = Vec::with_capacity(i.hw_class_names.len());
+    for (h, t) in i.hw_class_names.iter().zip(&i.node_affinity) {
+        let cap = t
+            .match_expressions
+            .iter()
+            .find(|r| r.key == CAPACITY_TYPE_LABEL)
+            .and_then(|r| r.values.first())
+            .and_then(|v| cap_from_label(v));
+        match cap {
+            Some(cap) => cells.push(Cell(h.clone(), cap)),
+            None => refused += 1,
+        }
+    }
+    CellsDecode { cells, refused }
+}
+
+/// The lossy view of [`cells_of_checked`] — kept for consumers whose
+/// disposition is NOT minted at the cover chokepoint (the FFD sim
+/// places conservatively against whatever decoded; the typed refusal
+/// letter is minted once, at `assign_to_cells`).
 pub fn cells_of(i: &SpawnIntent) -> Vec<Cell> {
-    i.hw_class_names
-        .iter()
-        .zip(&i.node_affinity)
-        .filter_map(|(h, t)| {
-            let cap = t
-                .match_expressions
-                .iter()
-                .find(|r| r.key == CAPACITY_TYPE_LABEL)?
-                .values
-                .first()?;
-            Some(Cell(h.clone(), cap_from_label(cap)?))
-        })
-        .collect()
+    cells_of_checked(i).cells
+}
+
+/// [`a_open`] plus the decode evidence the cover chokepoint folds:
+/// `open` is the admissible-open set, `refused` the decode-loss count,
+/// `decoded` how many wire entries DID decode (pre lead-time filter —
+/// context for the refusal WARN).
+pub struct AOpenDecode {
+    pub open: Vec<Cell>,
+    pub refused: usize,
+    pub decoded: usize,
+}
+
+/// Admissible-open cell set with decode evidence: Ready → all decoded
+/// cells; forecast → those with `eta_seconds < lead_time[cell]`.
+pub fn a_open_checked(i: &SpawnIntent, sketches: &CellSketches) -> AOpenDecode {
+    let CellsDecode { cells, refused } = cells_of_checked(i);
+    let decoded = cells.len();
+    let open = if i.ready.unwrap_or(true) {
+        cells
+    } else {
+        cells
+            .into_iter()
+            .filter(|c| i.eta_seconds < sketches.lead_time(c))
+            .collect()
+    };
+    AOpenDecode {
+        open,
+        refused,
+        decoded,
+    }
 }
 
 /// Admissible-open cell set for `i`: Ready → all of `cells_of(i)`;
@@ -824,14 +878,7 @@ pub fn cells_of(i: &SpawnIntent) -> Vec<Cell> {
 /// `cover_deficit` reuses this (the cheapest-open-cell choice operates
 /// on the same set FFD placed against).
 pub fn a_open(i: &SpawnIntent, sketches: &CellSketches) -> Vec<Cell> {
-    let cells = cells_of(i);
-    if i.ready.unwrap_or(true) {
-        return cells;
-    }
-    cells
-        .into_iter()
-        .filter(|c| i.eta_seconds < sketches.lead_time(c))
-        .collect()
+    a_open_checked(i, sketches).open
 }
 
 /// `(cores, mem_bytes, disk_bytes)` from a `cpu`/`memory`/
@@ -2158,7 +2205,7 @@ pub(crate) mod tests {
                             fuse_cache_bytes: 0,
                         },
                     )
-                    .0
+                    .claims
                 })
                 .collect()
         };

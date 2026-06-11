@@ -5645,6 +5645,97 @@ async fn out_of_alphabet_verdict_reason_refuses_the_request() {
     }
 }
 
+/// One `OVER_CAP` wire verdict (the advisory letter).
+fn over_cap_verdict(id: &str) -> rio_proto::types::IntentVerdict {
+    rio_proto::types::IntentVerdict {
+        intent_id: id.into(),
+        reason: rio_proto::types::IntentVerdictReason::OverCap as i32,
+        detail: "pod footprint (64, 1Ti, 2Ti) exceeds cell intel-6:spot per-class cap".into(),
+    }
+}
+
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation+2]
+/// **W9-AX (scheduler observe face) + W9-AX′ (the negative face — the
+/// mis-poison hazard's own population):** the over-cap letter is
+/// ADVISORY — acknowledged WITHOUT poison. Driven at the
+/// `NO_HOST_VERDICTS_TO_POISON` threshold population: ≥ N consecutive
+/// over-cap dispositions for ONE Ready drv leave its no-host track
+/// UN-STEPPED and the drv UN-POISONED (over-cap is transient/
+/// self-healing ≤300s skew; the poison budget is 30 × ~10s ≈ the SAME
+/// window — conflation would poison exactly the population that heals
+/// itself). The un-stepped clause is probed BOTH directly (the track
+/// map carries no entry) and structurally (a follow-on N−1
+/// no-hosting-class run still does not poison — if over-cap had fed
+/// the shared budget, 30 + N−1 ≥ N would have crossed it).
+#[tokio::test]
+async fn over_cap_verdicts_acknowledge_without_poison() {
+    use crate::actor::snapshot::NO_HOST_VERDICTS_TO_POISON as N;
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw_builders_only(db.pool.clone());
+    actor.test_inject_ready("d-overcap", Some("test-pkg"), "x86_64-linux", false);
+
+    // W9-AX observe face: the ack DECODES and APPLIES (reason distinct
+    // from NO_HOSTING_CLASS — not refused, not conflated); W9-AX′: at
+    // and beyond the poison threshold, zero poisons and the track
+    // never steps.
+    for k in 1..=(N + 5) {
+        let p = actor
+            .handle_ack_spawned_intents(
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                None,
+                &[over_cap_verdict("d-overcap")],
+            )
+            .expect("an over-cap verdict is a VALID ack plane entry (observed, not refused)");
+        assert!(
+            p.is_empty(),
+            "no poison at {k} consecutive over-cap dispositions (advisory lane)"
+        );
+        assert!(
+            !actor
+                .supply_reval
+                .no_host_verdicts
+                .contains_key(&crate::state::DrvHash::from("d-overcap")),
+            "the no-host poison track is UN-STEPPED at {k} over-cap dispositions"
+        );
+    }
+    assert_eq!(
+        actor.dag.node("d-overcap").unwrap().status(),
+        DerivationStatus::Ready,
+        "the drv stays Ready — re-mint/wait is the advisory consumer answer"
+    );
+
+    // Structural un-steppedness: a follow-on N−1 no-hosting-class run
+    // does NOT poison (the over-cap dispositions contributed nothing
+    // to the terminal budget).
+    for _ in 1..N {
+        let p = actor
+            .handle_ack_spawned_intents(
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                None,
+                &[no_host_verdict(
+                    "d-overcap",
+                    "no [sla.hw_classes] entry hosts it",
+                )],
+            )
+            .expect("applied");
+        assert!(p.is_empty(), "fresh budget: over-cap never fed it");
+    }
+    assert_eq!(
+        actor.dag.node("d-overcap").unwrap().status(),
+        DerivationStatus::Ready,
+        "still Ready at N-1 no-host verdicts after the over-cap run"
+    );
+}
+
 // r[verify scheduler.sla.ceiling.stale-solve-revalidation+2]
 /// **The emission-arm product census (R15)** — cells from the
 /// `CellEmission` alphabet over (feat ∅/non-∅ × {hostable,

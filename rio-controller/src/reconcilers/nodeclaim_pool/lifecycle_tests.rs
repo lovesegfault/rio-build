@@ -1532,7 +1532,7 @@ async fn ice_mark_survives_ack_failure() {
     );
 }
 
-// r[verify ctrl.nodeclaim.placement-outcome]
+// r[verify ctrl.nodeclaim.placement-outcome+1]
 /// live_051(c) red R26 / witness W7-Y — certifies: *a `NoHostingClass`
 /// intent produces an ack whose `rejected` entry carries its
 /// `intent_id` + reason + actionable detail — through the production

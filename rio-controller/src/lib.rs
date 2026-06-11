@@ -326,12 +326,32 @@ pub fn describe_metrics() {
          the intents and classes). \
          reason=exceeds_cell_cap: intent's pod footprint exceeds the assigned \
          cell's per-class catalog ceiling (or max_node_disk) — \
-         the scheduler's ClassCeiling gate didn't reject it (override-bypass \
-         producer hole). The intent has no valid claim of any n; sizing drops \
-         it instead of looping mint→Pending. \
+         the scheduler's ClassCeiling gate didn't reject it (GetHwClassConfig \
+         version skew, ≤300s convergence). The intent has no valid claim of \
+         any n; sizing drops it instead of looping mint→Pending, and the drop \
+         is ALSO answered to the scheduler as an ADVISORY over-cap \
+         IntentVerdict (reason OVER_CAP — distinct from no_hosting_class, \
+         never poison-feeding; the drv stays Ready and re-mints once the \
+         skew clears). \
          reason=unknown_hw_class: scheduler stamped a hwClass not yet in \
          the controller's GetHwClassConfig — config skew; self-heals within \
          ≤300s, persistent rate = controller's hw_refresh RPC failing."
+    );
+    // merged_bug_006: the cover decode seam's loud refusal (the same
+    // posture as nodeclaim_mask_refused_total below — skew is refused,
+    // never silently tolerated; emission at
+    // nodeclaim_pool/mod.rs emit_drop_tally).
+    describe_counter!(
+        "rio_controller_nodeclaim_cells_decode_refused_total",
+        "SpawnIntents REFUSED because their (hw_class_names, node_affinity) \
+         wire pair had undecodable entries (length mismatch, missing \
+         capacity-type requirement, or unparseable capacity value). A skewed \
+         pair is untrustworthy placement evidence, so the whole intent takes \
+         the typed DecodeRefused outcome instead of placing against a \
+         silently truncated set (or laundering into the quiet lead-time \
+         arm). Causes: scheduler/controller version skew (self-heals with \
+         rollout convergence) or a cells_to_selector_terms producer \
+         regression (persistent — check deployment ages)."
     );
     // bug_050: the ICE-mask decode seam's loud refusal (the lllll
     // census requires describe-with-emit; emission at

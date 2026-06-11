@@ -3517,13 +3517,18 @@ mod disk_four_caller_census {
             "ffd.rs: the simulate fit-check consumes the SHARED triple"
         );
         // cover.rs: the NodeClaim floor member, via the footprint
-        // (2 sizing reads + 1 aggregate map + 2 doc-prose mentions).
+        // (2 sizing reads + 1 aggregate map + 1 over-cap letter
+        // evidence read + 2 doc-prose mentions).
         assert_eq!(
             prod(COVER_SRC).matches("intent_pod_footprint(").count(),
-            4,
+            5,
             "cover.rs: cover_deficit's disk-floor inputs ride the SHARED \
-             footprint (3 call sites + 1 doc mention; a 2nd doc mention \
-             sits in cover.rs's own test half)"
+             footprint (3 sizing/aggregate call sites + the \
+             reclassify_over_cap letter-evidence read (bug_026: the \
+             OverCap letter's footprint MUST be the same triple the \
+             sizing partition compared, so the verdict detail cannot \
+             drift from the drop decision) + 1 doc mention; a 2nd doc \
+             mention sits in cover.rs's own test half)"
         );
     }
 

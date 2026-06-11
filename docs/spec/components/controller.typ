@@ -1423,23 +1423,36 @@ cloud-provider backoff (sla-sizing.typ carries the same pricing). The
 per-Cell round-robin start rotation, not the cap, is what prevents
 early-cell budget capture --- re-verified unchanged.
 
-#r("ctrl.nodeclaim.placement-outcome")[
-  The cell-assignment chokepoint (`assign_to_cells`) MUST mint a total
-  typed outcome per intent (`PlacementOutcome`: placed,
-  lead-time-gated, unplaceable-all-masked, no-hosting-class),
-  constructed at the filter site — the only point that knows whether
-  `A_open` was non-empty before ICE-masking. An intent whose every
-  hosting cell is ICE-masked MUST surface as a counted,
-  operator-visible outcome (`ready_all_cells_ice_masked` tally + WARN
-  naming the intents and their hosting classes + the
-  `intent_dropped_total` reason series) — never a silent drop; the
-  lead-time-gated arm stays quiet (the next tick re-evaluates). A
-  `NoHostingClass` outcome MUST additionally be answered to the
-  scheduler as a typed per-intent verdict
+#r("ctrl.nodeclaim.placement-outcome+1")[
+  Every nodeclaim-plane intent disposition MUST be a letter of ONE
+  total typed alphabet (`PlacementOutcome`: placed, lead-time-gated,
+  unplaceable-all-masked, no-hosting-class, over-cap, decode-refused)
+  — minted at the cell-assignment chokepoint (`assign_to_cells`, the
+  only point that knows whether `A_open` was non-empty before
+  ICE-masking and whether the wire pair decoded cleanly), with the
+  sizing partition's over-cap drop RE-CLASSIFIED onto the same
+  alphabet (a post-chokepoint terminal drop is a compile-time variant,
+  never a shadow disposition). An intent whose every hosting cell is
+  ICE-masked MUST surface as a counted, operator-visible outcome
+  (`ready_all_cells_ice_masked` tally + WARN naming the intents and
+  their hosting classes + the `intent_dropped_total` reason series) —
+  never a silent drop; the lead-time-gated arm stays quiet (the next
+  tick re-evaluates) and is reachable ONLY by forecast intents
+  (decode losses are their own LOUD letter — `DecodeRefused`,
+  `cells_decode_refused_total` — so a ready intent can never launder
+  into the forecast-quiet arm). The wire-mapped set is EXACTLY
+  {`NoHostingClass`, `OverCap`}: a `NoHostingClass` outcome MUST be
+  answered to the scheduler as a typed per-intent verdict
   (`AckSpawnedIntentsRequest.rejected`: intent id + closed reason +
-  operator-actionable detail naming the configured classes) — the
-  masked outcomes stay OFF the wire, since their masks are already the
-  scheduler's own evidence.
+  operator-actionable detail naming the configured classes; the
+  scheduler consumes it to its terminal poison budget); an `OverCap`
+  outcome MUST be answered with the DISTINCT `OVER_CAP` reason whose
+  consumer semantics are ADVISORY — the scheduler MUST NOT step any
+  terminal budget on it (the lane is version-skew transient, ≤300s;
+  conflating it onto `NO_HOSTING_CLASS` would poison self-healing
+  drvs at exactly the skew threshold). The masked and decode-refused
+  outcomes stay OFF the wire, since their masks are already the
+  scheduler's own evidence and the decode fault is controller-side.
 ]
 Rationale: live_050(a) measured 208 ready intents starving silently —
 the pre-fix fold asserted "non-empty `hw_class_names` + empty `A_open`
@@ -1463,7 +1476,7 @@ budget and poison consumption are scheduler-side
   MUST be impossible while any rung has LAUNCHABLE capacity — every
   rung masked except the last places on the last; all rungs masked
   surfaces as the counted `UnplaceableAllMasked` outcome
-  (#rref("ctrl.nodeclaim.placement-outcome")), never a silent hang.
+  (#rref("ctrl.nodeclaim.placement-outcome+1")), never a silent hang.
   "Has capacity" means launchable at the class's derived ceiling
   (the `scheduler.sla.ceiling.catalog-derived` launchability law) and
   revalidated at emission (the

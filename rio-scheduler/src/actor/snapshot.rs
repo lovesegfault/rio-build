@@ -1553,6 +1553,28 @@ impl AckApplyPlan {
                 Ok(IntentVerdictReason::NoHostingClass) => {
                     verdicts.push((DrvHash::from(v.intent_id.as_str()), v.detail.clone()));
                 }
+                Ok(IntentVerdictReason::OverCap) => {
+                    // ADVISORY acknowledge-WITHOUT-poison (the typed
+                    // non-poisoning arm). Over-cap is a TRANSIENT,
+                    // self-healing disposition — the controller's
+                    // sizing backstop fires on ≤300s GetHwClassConfig
+                    // version skew — while this fold's sibling lane
+                    // feeds the terminal poison budget
+                    // (NO_HOST_VERDICTS_TO_POISON = 30 × the ~10s ack
+                    // cadence ≈ the SAME window): stepping ANY terminal
+                    // budget here would poison self-healing drvs at
+                    // exactly the skew threshold. The drv stays Ready;
+                    // the controller re-mints once the skew clears or
+                    // the demand re-solves. The wire reason is DISTINCT
+                    // from NO_HOSTING_CLASS by type; conflating the two
+                    // (the laundering form) is forbidden — see the
+                    // IntentVerdictReason proto doc.
+                    tracing::debug!(
+                        intent_id = %v.intent_id,
+                        detail = %v.detail,
+                        "over-cap verdict acknowledged without poison",
+                    );
+                }
                 Ok(IntentVerdictReason::Unspecified) | Err(_) => {
                     return Err(AckApplyError::PlaneEntryUndecodable {
                         plane: AckPlane::Rejected,
