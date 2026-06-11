@@ -157,6 +157,33 @@ critical-path value).
   #(refs.metric)("rio_scheduler_undeclared_built_output_total").
 ]
 
+#r("sched.trust.report-membership")[
+  A worker-supplied `output_path` MUST enter `path_tenants` (or any other
+  registration sink) ONLY if it is a member of the scheduler-authoritative
+  expected set for that assignment (`expected_output_paths` --- dispatch-minted
+  and signed into the `AssignmentClaims` the store enforces on upload), on
+  EVERY report lane: the admitted success epilogue checks the resident node's
+  set; the late-report Register lane checks the durable row's set, so the
+  evicted face is exactly as checked as the resident one. Non-membership MUST
+  be a typed refusal --- counted
+  (#(refs.metric)("rio_scheduler_unexpected_built_output_total")), attributed,
+  and non-poisoning (the report's lawful effects proceed). Floating-CA reports
+  (`is_ca` and not fixed-output, the claims-mint predicate) are exempt: their
+  paths are computed post-build from the NAR hash and authorized by the
+  store's content recompute on upload. Trust-boundary residual pricing for
+  worker report fields MUST be per-consumer: every sink of a worker-supplied
+  field either re-derives from scheduler-authoritative data, sits downstream
+  of this membership check, or carries a priced-residual entry NAMING that
+  sink (the taint-to-consumer census is the enforcing witness).
+]
+The name-membership rule above bounds the report's output *names*; this rule
+binds the *paths* --- the axis that reaches tenant visibility. The repaired
+hole (bug 138): a report naming another tenant's existing path triggers no
+upload, so the store's PutPath `path ∈ claims.expected_outputs` check never
+runs, and the stamped row flips the victim path Hidden → Visible for the
+forging tenant through `own_built_projection`'s `bool_or(tenant_id)` and the
+I-217 verdict.
+
 *Retired (1d proto sweep --- the stream-carried BuildPhase surface):*
 `sched.log.phase-binding` and `sched.log.path-length` normed the actor-side
 binding gate and the recv-loop length bound for `BuildPhase` updates arriving

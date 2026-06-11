@@ -5441,6 +5441,7 @@ async fn cancel_late_report_resubmit_solves_warm_with_identity() -> TestResult {
 /// non-poisoning letter (`rio_scheduler_unexpected_built_output_total`
 /// + the structured WARN; the report's lawful effects are unaffected
 /// — the drv still completes on the admitted lane).
+// r[verify sched.trust.report-membership]
 #[tokio::test]
 async fn forged_output_path_never_reaches_path_tenants_on_any_lane() -> TestResult {
     use sha2::Digest;

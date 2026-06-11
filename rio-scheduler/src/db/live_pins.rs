@@ -731,15 +731,49 @@ mod registration_writer_census {
     /// Needles are assembled at runtime so the census never matches
     /// its own source text.
     fn census(parts: &[&str]) -> BTreeMap<String, usize> {
+        census_over(
+            &CENSUS_SOURCES
+                .iter()
+                .map(|(f, t)| (f.to_string(), (*t).to_string()))
+                .collect::<Vec<_>>(),
+            parts,
+        )
+    }
+
+    /// The raw-source scanner the censuses run on — split out so the
+    /// W10-N plant can push a STRAWMAN SOURCE FILE through the SAME
+    /// outermost derivation layer (R22′: plants enter at the raw
+    /// scan, never as post-extraction fixtures).
+    fn census_over(universe: &[(String, String)], parts: &[&str]) -> BTreeMap<String, usize> {
         let needle = parts.join("");
         let mut hits = BTreeMap::new();
-        for (rel, text) in CENSUS_SOURCES {
+        for (rel, text) in universe {
             let n = text.matches(&needle).count();
             if n > 0 {
-                *hits.entry((*rel).to_string()).or_insert(0) += n;
+                *hits.entry(rel.clone()).or_insert(0) += n;
             }
         }
         hits
+    }
+
+    /// The one comparison every pinned census rides (factored so the
+    /// W10-N plant proves THE CHECK rejects — not a weaker sibling):
+    /// `Err` names the drifted rows verbatim.
+    fn assert_census(
+        actual: &BTreeMap<String, usize>,
+        expected: &BTreeMap<String, usize>,
+        what: &str,
+    ) -> Result<(), String> {
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(format!(
+                "{what}: census drifted.\n  actual:   {actual:?}\n  expected: {expected:?}\n\
+                 every row is generated from the embedded-source scan — file the \
+                 new consumer with a disposition (re-derives | membership-checked \
+                 | priced-residual(named)) or remove the read"
+            ))
+        }
     }
 
     /// Dev-tree completeness pin: the embedded universe equals the
@@ -836,6 +870,154 @@ mod registration_writer_census {
              route it through the censused stamp chokepoints \
              (stamp_path_tenants / upsert_path_tenants_for_batch) or \
              census it here with its witness rationale"
+        );
+    }
+
+    // r[verify sched.trust.report-membership]
+    /// bug_138 commit 2 (W10-N) — the TAINT-TO-CONSUMER census, the
+    /// per-consumer half of the membership law (RC-2(iii): a priced
+    /// residual must name every downstream sink of the tainted field
+    /// or the pricing is a weaker-sibling witness). Two generated
+    /// member lists ([GEN-SET], R15/R22′ — derived from the
+    /// embedded-source scan over the whole crate, never
+    /// author-enumerated):
+    ///
+    /// (a) every consumer of the worker report's `built_outputs`
+    ///     payload (the tainted object), and
+    /// (b) every WRITE to the post-boundary carrier
+    ///     (the dot-`output_paths` assignment shape) — the field the admitted
+    ///     epilogue, events, registration, and CA planes all read.
+    ///
+    /// Per-row dispositions (the census IS the pricing record):
+    ///
+    /// payload (`built_outputs`-dot-read) consumers —
+    /// - actor/completion.rs (11): the trust boundary itself — the
+    ///   shape filter, the declared-name retain, the bug_138
+    ///   MEMBERSHIP retain (admitted lane), the late-validator
+    ///   inputs, the Register-apply membership check (durable row),
+    ///   the post-retain epilogue write, and the CA bookkeeping.
+    ///   Disposition: membership-checked; the CA-exempt face is the
+    ///   NAMED priced residual — floating-CA paths are content-proven
+    ///   by the store's verify_ca_store_path on upload + the gated
+    ///   realisation insert; the evicted-CA modular-hash residual is
+    ///   priced at the Register applier.
+    /// - actor/pull.rs (1): feeds `validated_late_outputs` — the late
+    ///   lane whose path law runs at apply. Membership-checked.
+    /// - domain.rs (1): the proto→domain conversion — a
+    ///   taint-PRESERVING carrier, not a sink; every consumer of the
+    ///   converted value is one of this census's rows.
+    /// - assignment.rs (1) / ca/resolve.rs (1): doc-comment
+    ///   narrative only (no field read; the scan counts prose
+    ///   honestly rather than special-casing comments).
+    ///
+    /// carrier (dot-`output_paths` assignment) writes —
+    /// - actor/completion.rs (1): THE one worker-sourced write,
+    ///   downstream of the membership retain. Membership-checked.
+    /// - actor/dispatch.rs (1): re-derives (expected_output_paths
+    ///   clone — scheduler-authoritative cache-hit completion).
+    /// - actor/merge.rs (1): re-derives (store-probe cache hit over
+    ///   the expected set).
+    /// - actor/recovery.rs (1): re-derives (durable verified rows).
+    /// - actor/materialize.rs (1): re-derives (store-verified
+    ///   materialization carrier).
+    /// - actor/debug.rs (1): re-derives (operator/test debug command
+    ///   — not a worker surface).
+    ///
+    /// Downstream consumer planes the rows above feed, named for the
+    /// pricing record (the repaired bug_138 lie — the visibility
+    /// consumer is now FIRST-CLASS): path_tenants → GC tenant
+    /// retention AND the store's own_built_projection →
+    /// `visibility_verdict(owned=true) = Visible` (the I-217 flip
+    /// channel W10-M pins); realisations → gateway QueryRealisation;
+    /// completed events → client-facing output paths; FindMissingPaths
+    /// probes → dispatch short-circuits.
+    #[test]
+    fn worker_report_taint_sinks_pinned() {
+        let payload = census(&[".built_", "outputs"]);
+        let expected_payload: BTreeMap<String, usize> = [
+            ("actor/completion.rs".to_string(), 11),
+            ("actor/pull.rs".to_string(), 1),
+            ("assignment.rs".to_string(), 1),
+            ("ca/resolve.rs".to_string(), 1),
+            ("domain.rs".to_string(), 1),
+        ]
+        .into();
+        assert_census(
+            &payload,
+            &expected_payload,
+            "worker-report payload (built_outputs) consumers",
+        )
+        .unwrap();
+
+        let writes = census(&[".output_paths", " = "]);
+        let expected_writes: BTreeMap<String, usize> = [
+            ("actor/completion.rs".to_string(), 1),
+            ("actor/debug.rs".to_string(), 1),
+            ("actor/dispatch.rs".to_string(), 1),
+            ("actor/materialize.rs".to_string(), 1),
+            ("actor/merge.rs".to_string(), 1),
+            ("actor/recovery.rs".to_string(), 1),
+        ]
+        .into();
+        assert_census(
+            &writes,
+            &expected_writes,
+            "output_paths carrier writes (exactly one worker-sourced, membership-checked)",
+        )
+        .unwrap();
+    }
+
+    /// W10-N's planted red (R22′): a STRAWMAN unlisted sink — raw
+    /// source text carrying a new payload consumer and a new carrier
+    /// write — enters at the scanner layer (the outermost derivation
+    /// layer, not a post-extraction fixture) and the census
+    /// comparison MUST reject it, naming the strawman file. The
+    /// strawman text is runtime-assembled so this file's static text
+    /// never matches the needles itself.
+    #[test]
+    fn taint_census_plants_red_on_unlisted_sink() {
+        let strawman = format!(
+            "fn exfiltrate(r: &BuildResult) {{ for o in &r{}built_outputs {{ send(o); }} }}\n\
+             fn clobber(state: &mut DerivationState) {{ state{}output_paths = stolen; }}\n",
+            '.', '.'
+        );
+        let mut universe: Vec<(String, String)> = CENSUS_SOURCES
+            .iter()
+            .map(|(f, t)| (f.to_string(), (*t).to_string()))
+            .collect();
+        universe.push(("actor/strawman_sink.rs".to_string(), strawman));
+
+        let payload = census_over(&universe, &[".built_", "outputs"]);
+        let expected_payload: BTreeMap<String, usize> = [
+            ("actor/completion.rs".to_string(), 11),
+            ("actor/pull.rs".to_string(), 1),
+            ("assignment.rs".to_string(), 1),
+            ("ca/resolve.rs".to_string(), 1),
+            ("domain.rs".to_string(), 1),
+        ]
+        .into();
+        let err = assert_census(&payload, &expected_payload, "plant: payload consumers")
+            .expect_err("an unlisted payload consumer MUST go census-red");
+        assert!(
+            err.contains("strawman_sink.rs"),
+            "the red must NAME the unlisted sink; got: {err}"
+        );
+
+        let writes = census_over(&universe, &[".output_paths", " = "]);
+        let expected_writes: BTreeMap<String, usize> = [
+            ("actor/completion.rs".to_string(), 1),
+            ("actor/debug.rs".to_string(), 1),
+            ("actor/dispatch.rs".to_string(), 1),
+            ("actor/materialize.rs".to_string(), 1),
+            ("actor/merge.rs".to_string(), 1),
+            ("actor/recovery.rs".to_string(), 1),
+        ]
+        .into();
+        let err = assert_census(&writes, &expected_writes, "plant: carrier writes")
+            .expect_err("an unlisted carrier write MUST go census-red");
+        assert!(
+            err.contains("strawman_sink.rs"),
+            "the red must NAME the unlisted write; got: {err}"
         );
     }
 

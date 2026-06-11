@@ -1389,6 +1389,7 @@ impl DagActor {
                 // posture (bytes durable, tenant-invisible until
                 // re-stamp), and "" never matches a parsed store
                 // path, so the placeholder can never be forged.
+                // r[impl sched.trust.report-membership]
                 if !(*is_ca && !*is_fo) {
                     Self::retain_expected_members(
                         executor_id,
@@ -1536,6 +1537,7 @@ impl DagActor {
     /// no sign-time expected set exists; that face's authorization is
     /// the store's content recompute (`verify_ca_store_path`) plus
     /// the gated realisation insert, exactly as on upload.
+    // r[impl sched.trust.report-membership]
     pub(super) fn retain_expected_members(
         executor_id: &str,
         drv_key: &str,
@@ -1920,12 +1922,18 @@ impl DagActor {
         // SHAPE only — it does not check membership or cardinality. A
         // compromised worker reporting on its own assigned drv could
         // otherwise stuff ~30k fabricated entries (4MB tonic limit ÷
-        // ~130B/entry), all reaching `state.output_paths` →
-        // `upsert_path_tenants` (arbitrary worker-chosen paths pinned
-        // against GC) and, for CA drvs, the sequential
+        // ~130B/entry). Consequence pricing is PER-CONSUMER (bug_138,
+        // RC-2(iii)) and lives in the taint-to-consumer census
+        // (db/live_pins.rs `worker_report_taint_sinks_pinned`): the
+        // sinks are GC retention (`path_tenants` pinning), the
+        // VISIBILITY axis (`own_built_projection` → the I-217 verdict
+        // — the consequence this comment's pre-bug_138 form omitted),
+        // the gateway-facing realisations, the client-facing
+        // completed-event paths, and the sequential
         // `insert_realisation` loop (~150s actor stall — same I-139
         // shape called out at the cascade-dispatch comment). After
-        // this retain, `built_outputs.len() ≤ output_names.len()`.
+        // this retain, `built_outputs.len() ≤ output_names.len()`;
+        // the part-3 retain below bounds the path VALUES.
         let declared = &state.output_names;
         let mut seen: HashSet<String> = HashSet::with_capacity(declared.len());
         result.built_outputs.retain(|o| {
@@ -1959,6 +1967,7 @@ impl DagActor {
         // overwrite runs before any assignment exists). Floating-CA
         // is exempt under EXACTLY the claims-mint predicate — see
         // [`Self::retain_expected_members`].
+        // r[impl sched.trust.report-membership]
         if !(state.ca.is_ca && !state.is_fixed_output) {
             Self::retain_expected_members(
                 executor_id.as_str(),
