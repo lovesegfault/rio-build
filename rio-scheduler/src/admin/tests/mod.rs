@@ -507,8 +507,17 @@ const SERVICE_GATED: &[&str] = &[
     "ExportSlaCorpus",
     "HwClassSampled",
     "GetHwClassConfig",
+    "ClusterStatus",
+    "ListExecutors",
+    "ListBuilds",
 ];
-const UNGATED_PUBLIC: &[&str] = &["ClusterStatus", "ListExecutors", "ListBuilds"];
+// Empty since the CVE-2023-32082-analog fix: ClusterStatus/
+// ListExecutors/ListBuilds leaked cluster/executor topology to
+// anything that could reach port 9001 (builders included). The
+// dashboard never needed an ungated path — its nginx mints
+// `caller: rio-dashboard` per request for every readonly route
+// (nix/dashboard-nginx.conf).
+const UNGATED_PUBLIC: &[&str] = &[];
 
 /// Every mutating AdminService RPC is service-token gated. Builders
 /// share port 9001 with this service (CCNP allows scheduler:9001 at L4
@@ -701,6 +710,15 @@ async fn read_path_rpcs_require_service_token() {
     assert_gated!(
         "MintExecutorTokens",
         svc.mint_executor_tokens(Request::new(MintExecutorTokensRequest::default()))
+    );
+    assert_gated!("ClusterStatus", svc.cluster_status(Request::new(())));
+    assert_gated!(
+        "ListExecutors",
+        svc.list_executors(Request::new(ListExecutorsRequest::default()))
+    );
+    assert_gated!(
+        "ListBuilds",
+        svc.list_builds(Request::new(ListBuildsRequest::default()))
     );
 }
 
