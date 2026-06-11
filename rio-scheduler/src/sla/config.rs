@@ -776,15 +776,26 @@ impl SlaConfig {
 
     /// `reference_hw_class` if [`Self::class_routes`] admits it for
     /// `(system, features)` AND [`Self::class_ceilings`] hosts
-    /// `(cores, mem)`, else the first (sorted) `hw_classes` entry that
-    /// does. `None` ⇔ `system` unmappable AND `features` empty (no
-    /// constraint axis to route on — r35 B1) OR no configured class
-    /// hosts that arch/feature at that size — caller emits empty
+    /// `(cores, mem)` AND it hosts the `cap` pin (when pinned), else
+    /// the first (sorted) `hw_classes` entry that does. `None` ⇔
+    /// `system` unmappable AND `features` empty (no constraint axis to
+    /// route on — r35 B1) OR no configured class hosts that
+    /// arch/feature/capacity at that size — caller emits empty
     /// `hw_class_names` so the controller's `fallback_cell` reaches its
     /// OWN `None` → `no_hosting_class`. An arch-unmappable system with
     /// non-empty `features` (`system="builtin"` FODs) IS routed — by
     /// feature alone, arch axis a no-op (r35 B1, §13d
     /// placement⊇provisioning STRIKE-2).
+    ///
+    /// merged_bug_067: `cap` is a TYPED parameter, not a caller-side
+    /// post-filter — the STRIKE-7 chokepoint doc catalogs exactly this
+    /// axis-omission class (bug_042 arch, mb_033 capacity-type): a
+    /// "does a hosting class exist" helper that omits an adjudicated
+    /// axis becomes an axis-omission factory for its callers (the
+    /// capacity-blind PinGated adjudication pre-empted the pin-aware
+    /// walk while a pin-honoring sibling existed). `None` = the axis
+    /// is unconstrained (every pre-existing call site's semantics).
+    #[allow(clippy::too_many_arguments)]
     pub fn reference_hw_class_for_system(
         &self,
         system: &str,
@@ -793,6 +804,7 @@ impl SlaConfig {
         features: &[String],
         catalog: &super::catalog::CatalogCeilings,
         global: (u32, u64),
+        cap: Option<CapacityType>,
     ) -> Option<&str> {
         // r35 B1 (§13e B5): builtin FODs are arch-agnostic. Unmappable
         // system → arch is a no-op (everything matches); the feature
@@ -808,10 +820,12 @@ impl SlaConfig {
             return None;
         }
         let matches = |h: &str| {
-            self.class_routes(h, arch, features) && {
-                let (cc, cm) = self.class_ceilings(h, catalog, global);
-                cores <= cc && mem <= cm
-            }
+            self.class_routes(h, arch, features)
+                && cap.is_none_or(|c| self.capacity_types_for(h).contains(&c))
+                && {
+                    let (cc, cm) = self.class_ceilings(h, catalog, global);
+                    cores <= cc && mem <= cm
+                }
         };
         if matches(&self.reference_hw_class) {
             return Some(&self.reference_hw_class);
@@ -871,6 +885,7 @@ impl SlaConfig {
     /// reached. The known residual is the `Some(memo)` arm's
     /// `all_candidates` capacity-fallback (memo-keyed, not per-poll —
     /// low blast radius; r32 candidate).
+    #[allow(clippy::too_many_arguments)]
     pub fn retain_hosting_cells(
         &self,
         cells: Vec<Cell>,
@@ -879,6 +894,7 @@ impl SlaConfig {
         required_features: &[String],
         catalog: &super::catalog::CatalogCeilings,
         global: (u32, u64),
+        cap_pin: Option<CapacityType>,
     ) -> Vec<Cell> {
         let (cores, mem) = demand;
         // bug_042: arch axis. `None` (unmappable / `builtin`) → arch is
@@ -920,6 +936,24 @@ impl SlaConfig {
         let mut out: Vec<Cell> = cells
             .into_iter()
             .filter(|(h, cap)| {
+                // merged_bug_004: the operator pin is DEMAND, not
+                // config — a pinned emission may carry only
+                // pin-capacity cells. The axis is class-INDEPENDENT
+                // (no `hw_classes` lookup needed), so it binds even
+                // the unknown-class pass-through below. Every producer
+                // arm honors the pin (memo filter + `all_candidates ∩
+                // {cap}` fallback, bypass Some-arm, StaleSolve pinned
+                // arm), so an off-pin cell reaching this chokepoint is
+                // a producer regression exactly like a wrong-arch one.
+                if !cap_pin.is_none_or(|p| cap == &p) {
+                    tracing::warn!(
+                        %h, ?cap, ?cap_pin, cores, mem,
+                        "hw_class cell stripped at post-finalize chokepoint — \
+                         off-pin capacity under an operator `--capacity` pin \
+                         (producer pin filter regressed?)"
+                    );
+                    return false;
+                }
                 // Unknown class → no per-class constraint on ANY axis
                 // (mirrors `class_ceilings`' `(MAX, MAX)` backstop for
                 // size). `cells_to_selector_terms` already drops unknown
@@ -998,6 +1032,19 @@ impl SlaConfig {
             };
             for rung in &ladder.rungs {
                 for cap in self.capacity_types_for(&rung.class) {
+                    // merged_bug_004: the expansion seam inherits the
+                    // pin axis its producers enforce — an operator
+                    // `--capacity` pin honored by every producer arm
+                    // was silently WIDENED here (rung cells minted at
+                    // every configured capacity type), and the
+                    // controller's spot-first `cell_rank` then bound
+                    // od-pinned builds onto spot rung nodes. A rung
+                    // cap outside the pin is skipped quietly, exactly
+                    // like an unhostable rung (a rung the pin forbids
+                    // is not a rung for THIS demand).
+                    if !cap_pin.is_none_or(|p| *cap == p) {
+                        continue;
+                    }
                     let cell = (rung.class.clone(), *cap);
                     if out.contains(&cell) {
                         continue;
@@ -2508,7 +2555,8 @@ mod tests {
                 0,
                 &[],
                 &Default::default(),
-                base_global()
+                base_global(),
+                None,
             ),
             Some("mid-x86")
         );
@@ -2521,7 +2569,8 @@ mod tests {
                 0,
                 &[],
                 &Default::default(),
-                base_global()
+                base_global(),
+                None,
             ),
             Some("agnostic")
         );
@@ -2534,7 +2583,8 @@ mod tests {
                 0,
                 &[],
                 &Default::default(),
-                base_global()
+                base_global(),
+                None,
             ),
             Some("mid-arm")
         );
@@ -2546,7 +2596,8 @@ mod tests {
                 0,
                 &[],
                 &Default::default(),
-                base_global()
+                base_global(),
+                None,
             ),
             None
         );
@@ -2576,7 +2627,8 @@ mod tests {
                 0,
                 &kvm,
                 &Default::default(),
-                base_global()
+                base_global(),
+                None,
             ),
             Some("metal-x86")
         );
@@ -2589,7 +2641,8 @@ mod tests {
                 0,
                 &[],
                 &Default::default(),
-                base_global()
+                base_global(),
+                None,
             ),
             Some("std-x86")
         );
@@ -2601,7 +2654,8 @@ mod tests {
                 0,
                 &kvm,
                 &Default::default(),
-                base_global()
+                base_global(),
+                None,
             ),
             None
         );
@@ -2643,7 +2697,8 @@ mod tests {
                 2 << 30,
                 &fetcher,
                 &Default::default(),
-                base_global()
+                base_global(),
+                None,
             ),
             Some("fetcher-arm"),
             "builtin FOD must route by feature to a fetcher class"
@@ -2657,7 +2712,8 @@ mod tests {
                 2 << 30,
                 &[],
                 &Default::default(),
-                base_global()
+                base_global(),
+                None,
             ),
             None,
             "featureless arch-unmappable system stays unroutable"
@@ -2695,16 +2751,30 @@ mod tests {
             ]
         };
         // kvm intent: std-x86 (provides=[]) MUST be stripped; metal kept.
-        let kept =
-            cfg.retain_hosting_cells(cells(), "x86_64-linux", (1, 0), &kvm, &cat, base_global());
+        let kept = cfg.retain_hosting_cells(
+            cells(),
+            "x86_64-linux",
+            (1, 0),
+            &kvm,
+            &cat,
+            base_global(),
+            None,
+        );
         assert_eq!(
             names(&kept),
             vec!["metal-x86"],
             "std-x86 stripped for kvm intent"
         );
         // non-kvm intent: metal-x86 (provides=[kvm]) MUST be stripped.
-        let kept =
-            cfg.retain_hosting_cells(cells(), "x86_64-linux", (1, 0), &[], &cat, base_global());
+        let kept = cfg.retain_hosting_cells(
+            cells(),
+            "x86_64-linux",
+            (1, 0),
+            &[],
+            &cat,
+            base_global(),
+            None,
+        );
         assert_eq!(
             names(&kept),
             vec!["std-x86"],
@@ -2755,6 +2825,7 @@ mod tests {
             &kvm,
             &cat,
             base_global(),
+            None,
         );
         let mut kept = names(&kept);
         kept.sort_unstable();
@@ -2771,6 +2842,7 @@ mod tests {
             &kvm,
             &cat,
             base_global(),
+            None,
         );
         let mut kept = names(&kept);
         kept.sort_unstable();
@@ -2780,7 +2852,8 @@ mod tests {
             "wrong-arch metal-x86 stripped for aarch64-linux"
         );
         // unmappable system → arch axis is a no-op (everything kept).
-        let kept = cfg.retain_hosting_cells(cells, "builtin", (1, 0), &kvm, &cat, base_global());
+        let kept =
+            cfg.retain_hosting_cells(cells, "builtin", (1, 0), &kvm, &cat, base_global(), None);
         assert_eq!(kept.len(), 3, "unmappable system → arch-agnostic");
     }
 
@@ -2805,8 +2878,15 @@ mod tests {
             ("metal-x86".into(), CapacityType::Spot),
             ("metal-x86".into(), CapacityType::Od),
         ];
-        let kept =
-            cfg.retain_hosting_cells(cells, "x86_64-linux", (1, 0), &kvm, &cat, base_global());
+        let kept = cfg.retain_hosting_cells(
+            cells,
+            "x86_64-linux",
+            (1, 0),
+            &kvm,
+            &cat,
+            base_global(),
+            None,
+        );
         assert_eq!(
             kept,
             vec![("metal-x86".to_string(), CapacityType::Od)],
@@ -2820,6 +2900,7 @@ mod tests {
             &[],
             &cat,
             base_global(),
+            None,
         );
         assert_eq!(kept.len(), 1, "unknown class → no cap constraint");
     }
@@ -2871,6 +2952,7 @@ mod tests {
                 &["kvm".to_string()],
                 &cat,
                 global,
+                None,
             );
             assert_eq!(
                 kept,
@@ -2904,7 +2986,8 @@ mod tests {
                 0,
                 &[],
                 &cat,
-                (256u32, 256u64 << 30)
+                (256u32, 256u64 << 30),
+                None,
             ),
             Some("hi"),
             "mid.max_cores=32 cannot host 48; must pick hi"
@@ -2917,7 +3000,8 @@ mod tests {
                 0,
                 &[],
                 &cat,
-                (256u32, 256u64 << 30)
+                (256u32, 256u64 << 30),
+                None,
             ),
             Some("mid")
         );
@@ -2929,7 +3013,8 @@ mod tests {
                 0,
                 &[],
                 &cat,
-                (256u32, 256u64 << 30)
+                (256u32, 256u64 << 30),
+                None,
             ),
             None
         );
@@ -2941,7 +3026,8 @@ mod tests {
                 512 << 30,
                 &[],
                 &cat,
-                (256u32, 256u64 << 30)
+                (256u32, 256u64 << 30),
+                None,
             ),
             None,
             "no class hosts 512GiB mem"
@@ -2973,6 +3059,7 @@ mod tests {
             &[],
             &cat,
             (256u32, 256u64 << 30),
+            None,
         );
         assert_eq!(
             names(&kept),
@@ -2987,6 +3074,7 @@ mod tests {
             &[],
             &cat,
             (256u32, 256u64 << 30),
+            None,
         );
         assert_eq!(
             names(&kept),
@@ -3001,6 +3089,7 @@ mod tests {
             &[],
             &cat,
             (256u32, 256u64 << 30),
+            None,
         );
         assert!(kept.is_empty());
     }
@@ -3037,6 +3126,7 @@ mod tests {
             &[],
             &cat,
             base_global(),
+            None,
         );
         assert_eq!(
             kept,
@@ -3061,6 +3151,7 @@ mod tests {
             &[],
             &cat,
             base_global(),
+            None,
         );
         assert_eq!(
             kept,
@@ -3121,6 +3212,7 @@ mod tests {
             &[],
             &cat,
             (256u32, 256u64 << 30),
+            None,
         );
         assert_eq!(
             kept,
@@ -3154,6 +3246,7 @@ mod tests {
             &[],
             &cat,
             base_global(),
+            None,
         );
         assert_eq!(kept, cells, "no ladder ⇒ closure == producer cells");
     }
@@ -3200,6 +3293,7 @@ mod tests {
                 &[],
                 &cat,
                 base_global(),
+                None,
             );
             let mut expect = producer;
             for rung in &def.ladder.as_ref().unwrap().rungs {
@@ -3643,6 +3737,7 @@ mod tests {
                 &[],
                 &cat,
                 (384u32, 4096u64 << 30),
+                None,
             );
             let mut expect = producer;
             for rung in &ladder.rungs {

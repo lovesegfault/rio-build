@@ -3610,9 +3610,12 @@ async fn contract_fod_capacity_override_routes_to_fetcher() {
 /// `reference_hw_class_for_system` size filter and the post-finalize
 /// `retain_hosting_cells` chokepoint agree on `(cores, mem)`. With
 /// pre-clamp `cores > ceiling`, the size filter rejects every class →
-/// `bypass_cells` returns `[]` → `retain_hosting_cells` (filter-only,
-/// can't add) keeps `[]` → `node_affinity = []`. For a featured intent
-/// the pod silently lands without the feature affinity and crashloops.
+/// `bypass_cells` returns `[]` → `retain_hosting_cells`
+/// (filters-then-expands over RETAINED classes — merged_bug_004; it
+/// never RECOVERS a producer-rejected cell, and an empty input has no
+/// retained class to expand) keeps `[]` → `node_affinity = []`. For a
+/// featured intent the pod silently lands without the feature affinity
+/// and crashloops.
 ///
 /// A `bypass_cells`-level test does NOT pin this: `bypass_cells(192) →
 /// non-empty` and `bypass_cells(256) → empty` are both true pre-fix —
@@ -3744,8 +3747,36 @@ async fn bypass_cells_unhosted_cap_pin_drops_at_producer() {
         vec![("intel-6".to_owned(), CapacityType::Od)],
         "hosted `--capacity` pin MUST emit the reference cell"
     );
-    // Unhosted cap (Spot) drops at the producer — empty cells, NOT a
-    // chokepoint strip.
+    // A cap the reference class refuses but a SIBLING hosts routes to
+    // the sibling at the pinned capacity (merged_bug_067 — pre-fix
+    // this dropped empty and the controller fallback inverted the
+    // pin). The mb_003 contract is PRESERVED: no cell is emitted that
+    // `retain_hosting_cells` would strip.
+    let sibling = actor.bypass_cells(
+        state,
+        Some(CapacityType::Spot),
+        4,
+        4 << 30,
+        &cost,
+        "tenant-a",
+    );
+    assert_eq!(
+        sibling,
+        vec![("intel-7".to_owned(), CapacityType::Spot)],
+        "a pin the reference class refuses routes to the first sorted \
+         pin-honoring sibling"
+    );
+    // NO class hosts the pin → the true producer drop (empty cells,
+    // NOT a chokepoint strip; the classifier mints PinGated).
+    for h in ["intel-7", "intel-8", "fetcher-x86", "fetcher-arm"] {
+        actor
+            .sla_config
+            .hw_classes
+            .get_mut(h)
+            .unwrap()
+            .capacity_types = vec![CapacityType::Od];
+    }
+    let state = actor.dag.node("d-cap").unwrap();
     let dropped = actor.bypass_cells(
         state,
         Some(CapacityType::Spot),
@@ -3756,9 +3787,9 @@ async fn bypass_cells_unhosted_cap_pin_drops_at_producer() {
     );
     assert!(
         dropped.is_empty(),
-        "`--capacity=spot` on an od-only reference class MUST drop the \
-         cell at the producer (mb_003), not at retain_hosting_cells — \
-         got {dropped:?}",
+        "`--capacity=spot` hosted by NO class MUST drop at the \
+         producer (mb_003), not at retain_hosting_cells — got \
+         {dropped:?}",
     );
 }
 
@@ -3921,12 +3952,23 @@ async fn bypass_cells_unhosted_cap_pin_warns_once() {
     crate::actor::tests::seed_default_tenant(&db.pool).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     actor.sla_config.reference_hw_class = "intel-6".into();
-    actor
-        .sla_config
-        .hw_classes
-        .get_mut("intel-6")
-        .unwrap()
-        .capacity_types = vec![CapacityType::Od];
+    // merged_bug_067: the warn lane keys on "NO class hosts the pin"
+    // (a pin-honoring SIBLING now routes instead of warning) — make
+    // every class od-only so the spot pin is truly unhosted.
+    for h in [
+        "intel-6",
+        "intel-7",
+        "intel-8",
+        "fetcher-x86",
+        "fetcher-arm",
+    ] {
+        actor
+            .sla_config
+            .hw_classes
+            .get_mut(h)
+            .unwrap()
+            .capacity_types = vec![CapacityType::Od];
+    }
     actor.test_inject_ready("d-cap-w", Some("test-pkg"), "x86_64-linux", false);
 
     let state = actor.dag.node("d-cap-w").unwrap();
@@ -5851,10 +5893,13 @@ fn stale_solve_revalidation_call_site_censuses() {
     // 1 doc/comment mention in config.rs; solve.rs has none.
     assert_eq!(
         count(snapshot_src, ".reference_hw_class_for_system("),
-        3,
-        "snapshot.rs resolver call sites: bypass Some-arm, bypass \
-         cold-start arm, classifier pin probe — a NEW call site joins \
-         this census with its CellEmission lane named"
+        5,
+        "snapshot.rs resolver call sites: bypass Some-arm (pin-aware \
+         since merged_bug_067), the bypass cap-is-binding probe (the \
+         re-keyed r31 A3 warn lane), bypass cold-start arm, classifier \
+         cap-blind PinGated probe, the PinGated premise debug_assert — \
+         a NEW call site joins this census with its CellEmission lane \
+         named"
     );
     assert_eq!(
         count(solve_src, ".reference_hw_class_for_system("),
@@ -6096,5 +6141,192 @@ async fn time_only_best_effort_keeps_the_agnostic_lane() {
         exits.is_empty(),
         "no ladder-exhausted exit fires for time-only fitting demand; \
          exits: {exits:?}"
+    );
+}
+
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+/// **W9-S (merged_bug_004)** — *an od-pinned intent over a
+/// `[spot, on-demand]` rung config NEVER lands on a spot rung* —
+/// end-to-end through the memo pin filter, `retain_hosting_cells`'
+/// ladder expansion, and `cells_to_selector_terms`.
+///
+/// Pre-fix `retain_hosting_cells` appended rung cells at EVERY
+/// configured capacity type without receiving the operator pin — a
+/// pin honored by every producer arm (memo filter, bypass Some-arm,
+/// StaleSolve pinned arm) was silently widened at the post-finalize
+/// seam, and with the controller's spot-first `cell_rank` an
+/// od-pinned build was preferentially provisioned onto a spot rung
+/// node with zero disclosure (the pin-times-ladder interaction the
+/// pre-fix signature made structurally untestable).
+#[tokio::test]
+async fn od_pinned_intent_never_lands_on_a_spot_rung() {
+    use crate::sla::config::{CapacityLadder, LadderRung};
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    // intel-6 gains a declared rung sibling (intel-7) hosting BOTH
+    // capacity types (the default `[Spot, Od]`).
+    actor
+        .sla_config
+        .hw_classes
+        .get_mut("intel-6")
+        .unwrap()
+        .ladder = Some(CapacityLadder {
+        rungs: vec![LadderRung {
+            class: "intel-7".into(),
+        }],
+    });
+    actor.test_inject_ready("d-od-pin", Some("test-pkg"), "x86_64-linux", false);
+    actor
+        .sla_estimator
+        .seed_overrides(vec![crate::db::SlaOverrideRow {
+            pname: "test-pkg".into(),
+            capacity_type: Some("on-demand".into()),
+            ..Default::default()
+        }]);
+
+    let state = actor.dag.node("d-od-pin").unwrap();
+    let (hw, cost, g) = actor.solve_inputs();
+    let intent = actor.solve_intent_for(state, &hw, &cost, g);
+
+    assert!(
+        !intent.hw_class_names.is_empty(),
+        "the od pin routes (precondition): {intent:?}"
+    );
+    // STRUCTURAL: no emitted affinity term may carry a spot
+    // capacity-type requirement under an od pin — neither the parent
+    // cell nor any ladder rung.
+    let spot_terms: Vec<_> = intent
+        .node_affinity
+        .iter()
+        .filter(|t| {
+            t.match_expressions.iter().any(|r| {
+                r.key == "karpenter.sh/capacity-type" && r.values.iter().any(|v| v == "spot")
+            })
+        })
+        .collect();
+    assert!(
+        spot_terms.is_empty(),
+        "an od-pinned intent must NEVER emit a spot cell (the ladder \
+         expansion widened the pin pre-fix — merged_bug_004): \
+         {spot_terms:?}"
+    );
+}
+
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+/// **W9-T (merged_bug_067)** — *pinned demand with a pin-honoring
+/// sibling routes to it; pinned demand with NO pin-honoring class
+/// mints `PinGated`* (the inversion's inverse + the letter's premise).
+///
+/// Pre-fix the `PinGated` guard adjudicated the `--capacity` pin via
+/// the capacity-BLIND `reference_hw_class_for_system` (arch/features/
+/// size only) and pre-empted the capacity-aware candidate walk
+/// whenever ANY size-hosting class existed — empty emission then
+/// routed the controller's `fallback_cell` first-cap with no capacity
+/// term, silently INVERTING the pin while a pin-honoring sibling
+/// route existed.
+#[tokio::test]
+async fn pinned_demand_prefers_the_pin_honoring_sibling() {
+    use crate::actor::snapshot::CellEmission as E;
+    use crate::sla::config::CapacityType;
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    // Reference class od-only; siblings (intel-7/8) keep [Spot, Od].
+    actor.sla_config.reference_hw_class = "intel-6".into();
+    actor
+        .sla_config
+        .hw_classes
+        .get_mut("intel-6")
+        .unwrap()
+        .capacity_types = vec![CapacityType::Od];
+    actor.test_inject_ready("d-pin-sib", Some("test-pkg"), "x86_64-linux", false);
+    let (_, cost, _) = actor.solve_inputs();
+
+    // Face 1: a spot pin the reference class refuses but a SIBLING
+    // hosts must route to the sibling at the pinned capacity — never
+    // mint PinGated (whose empty emission inverts the pin downstream).
+    let e = actor.classify_cell_emission(
+        actor.dag.node("d-pin-sib").unwrap(),
+        Some(CapacityType::Spot),
+        4,
+        4 << 30,
+        &cost,
+        "t",
+        &[],
+        None,
+        false,
+    );
+    let E::Cells(cells) = &e else {
+        panic!(
+            "a pin-honoring sibling exists (intel-7/8 host spot) — the \
+             pin routes to it, never PinGated/empty (merged_bug_067): {e:?}"
+        )
+    };
+    assert!(
+        !cells.is_empty() && cells.iter().all(|(_, c)| *c == CapacityType::Spot),
+        "every routed cell honors the pin: {cells:?}"
+    );
+
+    // Face 2 (the letter's premise): NO class hosts the pin — every
+    // class od-only, spot pinned — while size-hosting classes exist:
+    // PinGated is the honest letter (empty emission, the pin is the
+    // binding axis).
+    for h in ["intel-6", "intel-7", "intel-8"] {
+        actor
+            .sla_config
+            .hw_classes
+            .get_mut(h)
+            .unwrap()
+            .capacity_types = vec![CapacityType::Od];
+    }
+    let e = actor.classify_cell_emission(
+        actor.dag.node("d-pin-sib").unwrap(),
+        Some(CapacityType::Spot),
+        4,
+        4 << 30,
+        &cost,
+        "t",
+        &[],
+        None,
+        false,
+    );
+    assert!(
+        matches!(e, E::PinGated),
+        "no pin-honoring class anywhere + size-hosting classes exist \
+         => PinGated (the premise): {e:?}"
+    );
+
+    // W9-U: oversized pinned demand and fitting pinned demand get the
+    // SAME pin-respect (population: both). Fitting → face 1 above
+    // (sibling Cells, all at the pin). Oversized → the StaleSolve walk
+    // honors the pin (one cell at the pinned capacity) — restore
+    // dual-cap classes and drive the oversize face.
+    for h in ["intel-6", "intel-7", "intel-8"] {
+        actor
+            .sla_config
+            .hw_classes
+            .get_mut(h)
+            .unwrap()
+            .capacity_types = vec![CapacityType::Spot, CapacityType::Od];
+    }
+    let e = actor.classify_cell_emission(
+        actor.dag.node("d-pin-sib").unwrap(),
+        Some(CapacityType::Spot),
+        383,
+        412 << 30,
+        &cost,
+        "t",
+        &[],
+        Some(crate::sla::solve::InfeasibleReason::MemCeiling),
+        false,
+    );
+    let E::StaleSolve { cells, .. } = &e else {
+        panic!("oversized pinned demand re-solves (StaleSolve): {e:?}")
+    };
+    assert!(
+        cells.len() == 1 && matches!(cells[0].1, CapacityType::Spot),
+        "the oversize face honors the pin exactly like the fitting \
+         face (W9-U): {cells:?}"
     );
 }

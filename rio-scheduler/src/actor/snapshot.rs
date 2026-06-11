@@ -2310,9 +2310,11 @@ impl DagActor {
                 // producer-side `reference_hw_class_for_system` size
                 // filter and the post-finalize `retain_hosting_cells`
                 // chokepoint must agree on `(cores, mem)` —
-                // `retain_hosting_cells` is filter-only (can drop,
-                // can't add), so an over-cap override that makes the
-                // producer reject every class yields
+                // `retain_hosting_cells` filters-then-expands (it
+                // closes over RETAINED classes' declared ladder
+                // rungs; merged_bug_004) but never RECOVERS a
+                // producer-rejected cell, so an over-cap override
+                // that makes the producer reject every class yields
                 // `node_affinity=[]`, and the chokepoint can't
                 // recover. With `[]` affinity, a featured intent's pod
                 // lands without the feature affinity and crashloops
@@ -2436,6 +2438,11 @@ impl DagActor {
             &feat,
             cost.catalog_ceilings(),
             cost.resolved_global(),
+            // merged_bug_004: the chokepoint inherits the operator
+            // pin — the ladder expansion may only close over
+            // pin-capacity rungs, and an off-pin producer cell strips
+            // loud (the axis every producer arm enforces upstream).
+            override_.as_ref().and_then(|o| o.capacity),
         );
         let (node_affinity, hw_class_names) =
             solve::cells_to_selector_terms(&cells, &self.sla_config.hw_classes);
@@ -2630,14 +2637,21 @@ impl DagActor {
             //
             // r40 bug_025: `(cores, mem)` MUST be the caller's
             // post-clamp values, not raw `intent_for` output. The
-            // post-finalize `retain_hosting_cells` chokepoint is
-            // filter-only — it cannot recover cells the producer
-            // rejected on a pre-clamp `cores > ceiling`, so the
-            // producer-side size filter and the chokepoint must agree
-            // on the demand they evaluate. `solve_intent_for`'s `None`
-            // arm pre-clamps before calling here. (Pre-r40 this
+            // post-finalize `retain_hosting_cells` chokepoint
+            // filters-then-expands (the ladder closure over RETAINED
+            // classes — merged_bug_004) but never RECOVERS a cell the
+            // producer rejected on a pre-clamp `cores > ceiling`, so
+            // the producer-side size filter and the chokepoint must
+            // agree on the demand they evaluate. `solve_intent_for`'s
+            // `None` arm pre-clamps before calling here. (Pre-r40 this
             // comment claimed "the post-finalize chokepoint catches
             // the post-clamp delta" — that claim IS the bug.)
+            // merged_bug_067: the resolver consumes the pin as a TYPED
+            // axis (mb_003's caller-side `capacity_types_for` gate
+            // folded into it) — a pin the REFERENCE class refuses but a
+            // SIBLING hosts now routes to the sibling at the pinned
+            // capacity instead of dropping empty (where the controller
+            // `fallback_cell`'s first-cap silently INVERTED the pin).
             Some(cap) => match self.sla_config.reference_hw_class_for_system(
                 &state.system,
                 cores,
@@ -2645,46 +2659,56 @@ impl DagActor {
                 &feat,
                 cost.catalog_ceilings(),
                 cost.resolved_global(),
+                Some(cap),
             ) {
-                // mb_003: gate `cap` on `capacity_types_for(h)`,
-                // mirroring the `None` arm. Without it, `--cores=16
-                // --capacity=spot` on a kvm pname emits `(metal-x86,
-                // Spot)` on an od-only class → `retain_hosting_cells`
-                // strips (`cap_ok=false`) → chokepoint `warn!` per drv
-                // per poll for the override TTL, defeating the
-                // "strip = regression" contract at config.rs.
-                Some(h) if self.sla_config.capacity_types_for(h).contains(&cap) => {
-                    vec![(h.to_owned(), cap)]
-                }
-                // r31 A3: the operator's `--capacity` pin names a cap
-                // the reference class doesn't host — silent drop is a
-                // diagnostic blind spot (the override looks applied but
-                // the pin is ignored). Debounced WARN names the fix.
-                Some(h) => {
-                    let pname = state.pname.clone().unwrap_or_default();
-                    if self
-                        .cap_mismatch_warned
-                        .lock()
-                        .put((tenant.to_owned(), pname, cap), ())
-                        .is_none()
-                    {
-                        let hosted = self.sla_config.capacity_types_for(h);
-                        tracing::warn!(
-                            %tenant,
-                            pname = state.pname.as_deref().unwrap_or(""),
-                            ?cap,
-                            h,
-                            ?hosted,
-                            "`--capacity` override pin not hosted by the \
-                             reference hwClass for this drv — pin ignored, \
-                             cells emitted empty; change the pin to a \
-                             hosted cap, or add the cap to the class's \
-                             `[sla.hw_classes.<h>].capacity_types`",
-                        );
+                Some(h) => vec![(h.to_owned(), cap)],
+                // r31 A3 (re-keyed at merged_bug_067): NO configured
+                // class hosts the pin at this size. When the pin is
+                // the BINDING axis (a size-hosting class exists
+                // ignoring it), the debounced WARN keeps the operator
+                // signal (the pin cannot be honored as configured) and
+                // the classifier mints the typed `PinGated`; when even
+                // the cap-blind resolve fails, the size/feature axes
+                // bind and the classifier walk discloses
+                // (StaleSolve/Unhostable) — no warn here, the pin is
+                // not the differentiator.
+                None => {
+                    let cap_is_binding = self
+                        .sla_config
+                        .reference_hw_class_for_system(
+                            &state.system,
+                            cores,
+                            mem,
+                            &feat,
+                            cost.catalog_ceilings(),
+                            cost.resolved_global(),
+                            None,
+                        )
+                        .is_some();
+                    if cap_is_binding {
+                        let pname = state.pname.clone().unwrap_or_default();
+                        if self
+                            .cap_mismatch_warned
+                            .lock()
+                            .put((tenant.to_owned(), pname, cap), ())
+                            .is_none()
+                        {
+                            tracing::warn!(
+                                %tenant,
+                                pname = state.pname.as_deref().unwrap_or(""),
+                                ?cap,
+                                "`--capacity` override pin hosted by NO \
+                                 configured hwClass at this size (size-hosting \
+                                 classes exist without the pin) — cells \
+                                 emitted empty, the emission classifies as \
+                                 PinGated; change the pin to a hosted cap, or \
+                                 add the cap to a routing class's \
+                                 `[sla.hw_classes.<h>].capacity_types`",
+                            );
+                        }
                     }
                     Vec::new()
                 }
-                None => Vec::new(),
             },
             // §13d STRIKE-7 (mb_012, A9): cold-start featured intent
             // (`fit=None`, no override). Pre-fix this arm returned `[]`
@@ -2717,6 +2741,7 @@ impl DagActor {
                     &feat,
                     cost.catalog_ceilings(),
                     cost.resolved_global(),
+                    None,
                 )
                 .map_or_else(Vec::new, |h| {
                     self.sla_config
@@ -2802,7 +2827,7 @@ impl DagActor {
                 return CellEmission::HwAgnostic;
             }
         }
-        if cap.is_some()
+        if let Some(pinned) = cap
             && self
                 .sla_config
                 .reference_hw_class_for_system(
@@ -2812,11 +2837,35 @@ impl DagActor {
                     feat,
                     cost.catalog_ceilings(),
                     cost.resolved_global(),
+                    None,
                 )
                 .is_some()
         {
-            // A size-hosting class exists but refused the pin — the
-            // mb_003/r31 A3 lane (bypass_cells warned, debounced).
+            // merged_bug_067 (the letter's premise): PinGated mints
+            // only when the PIN is the binding axis — a size-hosting
+            // class exists IGNORING the pin (the cap-blind probe
+            // above) while no class hosts it WITH the pin (asserted
+            // below: `bypass_cells`' Some-arm resolver is pin-aware,
+            // so any pin-honoring class would have routed before this
+            // point). The pre-fix capacity-blind probe pre-empted the
+            // pin-aware walk whenever ANY size-hosting class existed,
+            // silently inverting the pin via the controller fallback
+            // while a pin-honoring sibling route existed.
+            debug_assert!(
+                self.sla_config
+                    .reference_hw_class_for_system(
+                        &state.system,
+                        cores,
+                        mem,
+                        feat,
+                        cost.catalog_ceilings(),
+                        cost.resolved_global(),
+                        Some(pinned),
+                    )
+                    .is_none(),
+                "PinGated premise: no pin-honoring class exists (bypass \
+                 routes pin-honoring siblings before classification)"
+            );
             return CellEmission::PinGated;
         }
         self.resolve_stale_demand(state, cap, cores, mem, cost, feat, forced_demand)
