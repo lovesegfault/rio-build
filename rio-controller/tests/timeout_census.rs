@@ -19,10 +19,23 @@
 //!   (regenerate with
 //!   `cargo test -p rio-controller --test timeout_census -- --ignored regenerate_timeout_census`).
 //!
-//! Generator evasion corpus (R22 — one planted red per axis, under
-//! `tests/timeout_census_corpus/`):
-//! - `alias-red/`: `use tokio::time::timeout as <alias>` + an untagged
-//!   `<alias>(...)` call — alias-form evasion must still scan.
+//! Generator evasion corpus (R22′ — plants DERIVE from the grammar's
+//! production list, under `tests/timeout_census_corpus/`):
+//! - the USE-GRAMMAR axes (bug_151): one plant per production of the
+//!   import grammar — `use-plain-red/` (`use tokio::time::timeout;`),
+//!   `alias-red/` (`… as <alias>`), `brace-group-red/`
+//!   (`use tokio::time::{…, timeout as x, …}`, multi-line),
+//!   `module-path-red/` (`use tokio::time;` + `time::timeout(…)`).
+//!   `use_grammar_axis_total` iterates [`USE_GRAMMAR`]: a production
+//!   row without a firing plant is itself a red, so the needle table
+//!   cannot silently re-open one form at a time (the wave-9 scanner
+//!   enabled needles for exactly 1 of 4 forms and the registry
+//!   self-certified the axis closed).
+//! - `string-brace-red/`: a `{` inside a string within a cfg(test)
+//!   module must not extend the skip over production code — brace
+//!   counting runs over comment/string-STRIPPED text (the shared
+//!   lexer's semantics, ported below with a parity selftest; the old
+//!   raw-line counting could swallow everything after a test module).
 //! - `scope-red/`: an untagged site in a sibling-crate-shaped tree —
 //!   the generator finds sites in ANY root handed to it (the
 //!   production scope — this crate's `src/` — is a declared argument,
@@ -108,9 +121,26 @@ const CENSUS_SOURCES: &[(&str, &str)] = &[
 #[rustfmt::skip]
 const CORPUS_SOURCES: &[(&str, &str, &str)] = &[
     ("alias-red", "aliased.rs", include_str!("timeout_census_corpus/alias-red/aliased.rs")),
+    ("brace-group-red", "braced.rs", include_str!("timeout_census_corpus/brace-group-red/braced.rs")),
     ("cfgtest-green", "with_tests.rs", include_str!("timeout_census_corpus/cfgtest-green/with_tests.rs")),
     ("label-red", "mislabeled.rs", include_str!("timeout_census_corpus/label-red/mislabeled.rs")),
+    ("module-path-red", "modpath.rs", include_str!("timeout_census_corpus/module-path-red/modpath.rs")),
     ("scope-red", "other-crate/src/lib.rs", include_str!("timeout_census_corpus/scope-red/other-crate/src/lib.rs")),
+    ("string-brace-red", "skew.rs", include_str!("timeout_census_corpus/string-brace-red/skew.rs")),
+    ("use-plain-red", "plain.rs", include_str!("timeout_census_corpus/use-plain-red/plain.rs")),
+];
+
+/// The import-grammar PRODUCTION TABLE (bug_151, R22′): every form by
+/// which `tokio::time::timeout` comes into scope, mapped to the corpus
+/// axis that plants its red. Needle derivation ([`needles_for`]) and
+/// plant totality ([`use_grammar_axis_total`]) both consume THIS table
+/// — adding a production without a plant is a test red, so coverage
+/// is computed from the grammar, never self-declared.
+const USE_GRAMMAR: &[(&str, &str)] = &[
+    ("use-plain", "use-plain-red"),
+    ("use-as-rename", "alias-red"),
+    ("use-brace-group", "brace-group-red"),
+    ("use-module-path", "module-path-red"),
 ];
 
 /// The committed census artifact, embedded (same commit, same bytes —
@@ -156,34 +186,259 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Per-file scan. Detection needles: the fully-qualified
-/// `tokio::time::timeout(`, the bare name when `use tokio::time::timeout`
-/// is in scope, and any alias from `use tokio::time::timeout as X`.
-/// `#[cfg(test)]`-attributed blocks are excluded by brace tracking
-/// (the population is production Err arms).
-fn scan_file(src: &str, rel: &str, out: &mut Vec<Site>) {
-    // Alias closure (the merged_bug_001 lesson, applied at birth).
-    let mut needles: Vec<String> = vec!["tokio::time::timeout(".into()];
-    for line in src.lines() {
-        let t = line.trim();
-        if t == "use tokio::time::timeout;" {
-            needles.push("timeout(".into());
-        } else if let Some(rest) = t.strip_prefix("use tokio::time::timeout as ")
-            && let Some(alias) = rest.strip_suffix(';')
-        {
-            needles.push(format!("{}(", alias.trim()));
+/// Line-preserving comment/string strip — the shared lexer's walk
+/// (nix/rust_strip.py) ported for the in-crate face: line comments and
+/// NESTED block comments blanked; string bodies (plain/byte/raw/
+/// byte-raw) and char/byte-char bodies blanked with exact escape-pair
+/// stepping; delimiters kept (brace/quote parity for the structural
+/// pass); newlines survive, so line numbers are stable. The parity
+/// selftest (`strip_parity_with_shared_lexer_families`) pins the same
+/// token families the python selftest pins.
+fn strip_rust(src: &str) -> String {
+    let b: Vec<char> = src.chars().collect();
+    let n = b.len();
+    let mut out: Vec<char> = b.clone();
+    let mut blank = |o: &mut Vec<char>, a: usize, z: usize| {
+        for k in a..z.min(n) {
+            if o[k] != '\n' {
+                o[k] = ' ';
+            }
+        }
+    };
+    let raw_prefix_len = |i: usize| -> usize {
+        let mut j = i;
+        if j < n && b[j] == 'b' {
+            j += 1;
+        }
+        if j >= n || b[j] != 'r' {
+            return 0;
+        }
+        j += 1;
+        while j < n && b[j] == '#' {
+            j += 1;
+        }
+        if j < n && b[j] == '"' { j - i + 1 } else { 0 }
+    };
+    let mut i = 0;
+    while i < n {
+        let c = b[i];
+        let nxt = if i + 1 < n { b[i + 1] } else { '\0' };
+        if c == '/' && nxt == '/' {
+            let mut j = i;
+            while j < n && b[j] != '\n' {
+                j += 1;
+            }
+            blank(&mut out, i, j);
+            i = j;
+        } else if c == '/' && nxt == '*' {
+            let mut depth = 1i64;
+            let mut j = i + 2;
+            while j < n && depth > 0 {
+                if b[j] == '/' && j + 1 < n && b[j + 1] == '*' {
+                    depth += 1;
+                    j += 2;
+                } else if b[j] == '*' && j + 1 < n && b[j + 1] == '/' {
+                    depth -= 1;
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+            }
+            blank(&mut out, i, j);
+            i = j;
+        } else if raw_prefix_len(i) > 0 {
+            let plen = raw_prefix_len(i);
+            let hashes = plen - (if b[i] == 'b' { 2 } else { 1 }) - 1;
+            let mut j = i + plen;
+            // find `"` + hashes `#`s
+            let close_found = loop {
+                if j >= n {
+                    break n;
+                }
+                if b[j] == '"' && (j + 1..=j + hashes).all(|k| k < n && b[k] == '#') {
+                    break j;
+                }
+                j += 1;
+            };
+            blank(&mut out, i + plen, close_found);
+            i = if close_found >= n {
+                n
+            } else {
+                close_found + 1 + hashes
+            };
+        } else if c == '"' || (c == 'b' && nxt == '"') {
+            let start = i + if c == 'b' { 2 } else { 1 };
+            let mut j = start;
+            while j < n {
+                if b[j] == '\\' {
+                    j += 2;
+                    continue;
+                }
+                if b[j] == '"' {
+                    break;
+                }
+                j += 1;
+            }
+            blank(&mut out, start, j);
+            i = (j + 1).min(n);
+        } else if c == '\'' || (c == 'b' && nxt == '\'') {
+            let q = if c == '\'' { i } else { i + 1 };
+            let mut j = q + 1;
+            if j < n && b[j] == '\\' {
+                j += 2;
+                while j < n && b[j] != '\'' {
+                    if b[j] == '\\' {
+                        j += 2;
+                    } else {
+                        j += 1;
+                    }
+                }
+            } else if j + 1 < n && b[j + 1] == '\'' {
+                j += 1;
+            } else {
+                // Lifetime: untouched.
+                i += 1;
+                continue;
+            }
+            blank(&mut out, q + 1, j);
+            i = (j + 1).min(n);
+        } else {
+            i += 1;
         }
     }
-    let lines: Vec<&str> = src.lines().collect();
+    out.into_iter().collect()
+}
+
+/// Expand a use-tree body (STRIPPED text, `;`-terminated item interior)
+/// to `(leaf_path, alias)` rows — `tokio::{time::{timeout as t},
+/// sync}` yields `("tokio::time::timeout", Some("t"))` and
+/// `("tokio::sync", None)`.
+fn expand_use_tree(prefix: &str, tree: &str, out: &mut Vec<(String, Option<String>)>) {
+    // Split top-level commas.
+    let mut depth = 0i64;
+    let mut start = 0usize;
+    let bytes = tree.as_bytes();
+    let mut pieces: Vec<&str> = Vec::new();
+    for (idx, &ch) in bytes.iter().enumerate() {
+        match ch {
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
+            b',' if depth == 0 => {
+                pieces.push(&tree[start..idx]);
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    pieces.push(&tree[start..]);
+    for piece in pieces {
+        let p = piece.trim();
+        if p.is_empty() {
+            continue;
+        }
+        if let Some(brace) = p.find('{') {
+            // `head::{interior}` — recurse with the extended prefix.
+            let head = p[..brace].trim().trim_end_matches("::").trim();
+            let interior = p[brace + 1..].rsplit_once('}').map_or("", |(a, _)| a);
+            let new_prefix = if prefix.is_empty() {
+                head.to_string()
+            } else if head.is_empty() {
+                prefix.to_string()
+            } else {
+                format!("{prefix}::{head}")
+            };
+            expand_use_tree(&new_prefix, interior, out);
+        } else {
+            let (path_part, alias) = match p.split_once(" as ") {
+                Some((a, b)) => (a.trim(), Some(b.trim().to_string())),
+                None => (p, None),
+            };
+            let full = if prefix.is_empty() {
+                path_part.to_string()
+            } else {
+                format!("{prefix}::{path_part}")
+            };
+            out.push((full, alias));
+        }
+    }
+}
+
+/// Detection-needle derivation over the import grammar ([`USE_GRAMMAR`]
+/// — bug_151): the fully-qualified call is always a needle; every
+/// `use` item is expanded via [`expand_use_tree`], and a leaf reaching
+/// `tokio::time::timeout`, `tokio::time`, or `tokio` enables the
+/// bare/aliased, module-path, or crate-path needle respectively. All
+/// four grammar productions (plain, as-rename, brace-group,
+/// module-path) flow through the ONE resolver — there is no per-form
+/// needle code to forget.
+fn needles_for(stripped: &str) -> Vec<String> {
+    let mut needles: Vec<String> = vec!["tokio::time::timeout(".into()];
+    let mut leaves: Vec<(String, Option<String>)> = Vec::new();
+    let chars: Vec<char> = stripped.chars().collect();
+    let mut i = 0usize;
+    let n = chars.len();
+    while i < n {
+        // Word-boundary `use` keyword.
+        if stripped[i..].starts_with("use ")
+            && (i == 0 || !chars[i - 1].is_alphanumeric() && chars[i - 1] != '_')
+        {
+            let mut j = i + 4;
+            while j < n && chars[j] != ';' {
+                j += 1;
+            }
+            let item: String = chars[i + 4..j.min(n)].iter().collect();
+            let normalized: String = item.split_whitespace().collect::<Vec<_>>().join(" ");
+            expand_use_tree("", &normalized, &mut leaves);
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+    for (path, alias) in leaves {
+        match path.as_str() {
+            "tokio::time::timeout" => {
+                needles.push(format!("{}(", alias.as_deref().unwrap_or("timeout")));
+            }
+            "tokio::time" => {
+                needles.push(format!("{}::timeout(", alias.as_deref().unwrap_or("time")));
+            }
+            "tokio" => {
+                needles.push(format!(
+                    "{}::time::timeout(",
+                    alias.as_deref().unwrap_or("tokio")
+                ));
+            }
+            _ => {}
+        }
+    }
+    needles
+}
+
+/// Per-file scan. Needles derive from the import grammar
+/// ([`needles_for`]); `#[cfg(test)]`-attributed blocks are excluded by
+/// brace tracking over the comment/string-STRIPPED text (bug_151: raw
+/// lines counted braces inside strings and comments, so a `{` in a
+/// test-module string could extend the skip over production code).
+/// Classification tags are read from the RAW lines (the comment lane).
+fn scan_file(src: &str, rel: &str, out: &mut Vec<Site>) {
+    let stripped = strip_rust(src);
+    let needles = needles_for(&stripped);
+    let raw_lines: Vec<&str> = src.lines().collect();
+    let stripped_lines: Vec<&str> = stripped.lines().collect();
     let mut depth_skip: Option<i64> = None; // brace depth inside a cfg(test) block
     let mut pending_cfg_test = false;
     let mut depth: i64 = 0;
-    for (i, raw) in lines.iter().enumerate() {
-        let line = raw;
+    for (i, line) in stripped_lines.iter().enumerate() {
         let trimmed = line.trim();
         if depth_skip.is_none() {
             if trimmed.starts_with("#[cfg(test)]") {
-                pending_cfg_test = true;
+                // Attribute and opener on ONE line (`#[cfg(test)] mod t {`)
+                // starts the skip immediately; otherwise it pends.
+                if line.contains('{') {
+                    depth_skip = Some(depth);
+                } else {
+                    pending_cfg_test = true;
+                }
             } else if pending_cfg_test {
                 // The attribute applies to THIS item; if it opens a
                 // brace, skip until it closes.
@@ -208,25 +463,33 @@ fn scan_file(src: &str, rel: &str, out: &mut Vec<Site>) {
         if in_skip {
             continue;
         }
-        // Comment lines never fire (the needle would be prose).
-        if trimmed.starts_with("//") {
-            continue;
-        }
-        let hit = needles.iter().any(|n| {
-            line.find(n.as_str()).is_some_and(|pos| {
-                // Reject prose matches inside line comments.
-                line.find("//").is_none_or(|c| pos < c)
-            })
+        // Needle hit on the STRIPPED line (comments/strings blanked),
+        // word-boundary on the left so `my_timeout(` never fires.
+        let hit = needles.iter().any(|nd| {
+            let mut from = 0usize;
+            while let Some(pos) = line[from..].find(nd.as_str()) {
+                let abs = from + pos;
+                let ok = abs == 0
+                    || line[..abs]
+                        .chars()
+                        .next_back()
+                        .is_none_or(|p| !p.is_alphanumeric() && p != '_' && p != ':');
+                if ok {
+                    return true;
+                }
+                from = abs + 1;
+            }
+            false
         });
         if !hit {
             continue;
         }
         // Classification: `timeout-census: <word>` on this line or the
-        // three lines above (comment lane).
+        // three lines above (the COMMENT lane — read from raw lines).
         let mut class = None;
         for j in (i.saturating_sub(3)..=i).rev() {
-            if let Some(pos) = lines[j].find("timeout-census:") {
-                let rest = &lines[j][pos + "timeout-census:".len()..];
+            if let Some(pos) = raw_lines[j].find("timeout-census:") {
+                let rest = &raw_lines[j][pos + "timeout-census:".len()..];
                 class = rest.split_whitespace().next().map(|w| {
                     w.trim_matches(|c: char| !c.is_ascii_alphabetic())
                         .to_owned()
@@ -384,17 +647,118 @@ fn regenerate_timeout_census() {
 // and the tree itself is clean (asserted above).
 // ---------------------------------------------------------------------------
 
+/// R22′ (bug_151): plant totality DERIVES from the grammar table —
+/// every [`USE_GRAMMAR`] production has a corpus plant and the plant
+/// FIRES (exactly one untagged site). Adding a production row without
+/// a plant, or a plant the scanner cannot see, is a red here — the
+/// registry cannot self-certify the axis closed (the covered/gap set
+/// is this loop's output, not a declaration).
 #[test]
-fn corpus_alias_red_fires() {
-    let sites = scan_pairs(&corpus_pairs("alias-red"));
+fn use_grammar_axis_total() {
+    for (production, axis) in USE_GRAMMAR {
+        let pairs = corpus_pairs(axis);
+        assert!(
+            !pairs.is_empty(),
+            "grammar production `{production}` has NO corpus plant under \
+             axis `{axis}` — every import form gets a plant mechanically"
+        );
+        let sites = scan_pairs(&pairs);
+        assert_eq!(
+            sites.len(),
+            1,
+            "grammar production `{production}` plant must yield exactly one \
+             site: {sites:#?}"
+        );
+        assert!(
+            sites[0].class.is_none(),
+            "the `{production}` plant is untagged BY DESIGN (the red): {sites:#?}"
+        );
+    }
+}
+
+/// bug_151 (brace integrity): a `{` inside a test-module STRING must
+/// not extend the cfg(test) skip over the production site below —
+/// red against the raw-line counter, which swallowed it.
+#[test]
+fn corpus_string_brace_red_fires() {
+    let sites = scan_pairs(&corpus_pairs("string-brace-red"));
     assert_eq!(
         sites.len(),
         1,
-        "alias-form call must be detected: {sites:#?}"
+        "the production site after the string-brace test module must be \
+         detected: {sites:#?}"
     );
+    assert!(sites[0].class.is_none(), "{sites:#?}");
+}
+
+/// The strip walk's parity selftest — the same token families
+/// nix/rust_strip.py's selftest pins (escaped quotes, raw strings,
+/// nested comments, newline preservation), so the in-crate port and
+/// the shared lexer cannot silently diverge on the classes that
+/// decide brace integrity.
+#[test]
+fn strip_parity_with_shared_lexer_families() {
+    // Escaped-quote char soup: parity kept, bodies blanked.
+    assert_eq!(strip_rust("let p = ('\\'','{');"), "let p = ('  ',' ');");
+    // String bodies blanked, delimiters kept; braces in strings die.
+    assert_eq!(
+        strip_rust("let s = \"{ }\"; fn f() {}"),
+        "let s = \"   \"; fn f() {}"
+    );
+    // Nested block comments fully blanked.
+    let t = "a /* x /* y */ z */ b";
+    let s = strip_rust(t);
     assert!(
-        sites[0].class.is_none(),
-        "the alias plant is untagged BY DESIGN (the red): {sites:#?}"
+        s.starts_with('a') && s.ends_with('b') && !s.contains("y"),
+        "{s:?}"
+    );
+    // Raw strings with hashes: closer found, tail survives.
+    let s = strip_rust("let r = r#\"a \" inside\"#; let after = 1;");
+    assert!(s.contains("let after = 1;"), "{s:?}");
+    assert!(!s.contains("inside"), "{s:?}");
+    // Newlines survive blanking (line numbers stable).
+    assert_eq!(strip_rust("\"one\ntwo\""), "\"   \n   \"");
+    // Line comments blanked (to spaces — length preserved); code
+    // before them kept.
+    assert_eq!(strip_rust("x(); // tail { brace").trim_end(), "x();");
+    // Lifetimes untouched.
+    let s = strip_rust("fn f<'a>(x: &'a str) {}");
+    assert_eq!(s.matches("'a").count(), 2, "{s:?}");
+}
+
+/// The use-tree resolver's own rows (the needle table's unit face):
+/// nested groups, group-interior aliases, module aliases.
+#[test]
+fn needles_derive_from_every_grammar_production() {
+    let plain = needles_for("use tokio::time::timeout;\n");
+    assert!(plain.contains(&"timeout(".to_string()), "{plain:?}");
+    let renamed = needles_for("use tokio::time::timeout as deadline;\n");
+    assert!(renamed.contains(&"deadline(".to_string()), "{renamed:?}");
+    let braced = needles_for("use tokio::time::{\n    sleep,\n    timeout as bounded,\n};\n");
+    assert!(braced.contains(&"bounded(".to_string()), "{braced:?}");
+    let modpath = needles_for("use tokio::time;\n");
+    assert!(
+        modpath.contains(&"time::timeout(".to_string()),
+        "{modpath:?}"
+    );
+    let nested = needles_for("use tokio::{time::{timeout}, sync};\n");
+    assert!(nested.contains(&"timeout(".to_string()), "{nested:?}");
+    let mod_alias = needles_for("use tokio::time as t;\n");
+    assert!(
+        mod_alias.contains(&"t::timeout(".to_string()),
+        "{mod_alias:?}"
+    );
+    let crate_alias = needles_for("use tokio as tk;\n");
+    assert!(
+        crate_alias.contains(&"tk::time::timeout(".to_string()),
+        "{crate_alias:?}"
+    );
+    // Unrelated imports derive nothing beyond the qualified needle.
+    let other = needles_for("use std::time::Duration;\n");
+    assert_eq!(
+        other,
+        vec!["tokio::time::timeout(".to_string()],
+        "{other:?}"
     );
 }
 

@@ -25,11 +25,23 @@ THE REGISTRY below is the closed enrollment set. Per row it pins:
     finding on that generator upgrades the corpus in the same close,
     per R22); gaps only ever SHRINK - removing a gap requires the
     plant, growing one requires editing this registry (review
-    surface).
+    surface);
+  - DERIVED_FROM (R22', bug_151/merged_bug_090): the production
+    table / refusal predicate INSIDE the generator that its coverage
+    is computed from (a pattern that must resolve in the anchor
+    file). A row claiming ZERO gaps without a derived_from is a
+    FAILURE - the round-10 corpus carried two self-certified
+    zero-gap rows whose axes were demonstrably unplanted (the
+    timeout census's import-grammar forms; quint-policy's alias
+    forms): a registry row whose covered/gap set the generator
+    cannot itself compute is exactly the self-reporting this field
+    kills. Burn-down rows (named gaps) may predate the discipline;
+    CLOSING the last gap requires deriving.
 
 A generator-shaped file outside the registry is a FAILURE (the
 reverse direction over the enrollment set itself); a registry row
-whose file or plant pattern is gone is a FAILURE (rot).
+whose file, plant pattern, or derived_from anchor is gone is a
+FAILURE (rot).
 
 Two enforcement arms ride along (their plants embedded here):
   - MODEL-DIVERGENCE grammar (the model-tier drift grep): every
@@ -66,31 +78,34 @@ import rust_strip
 AXES = {"alias", "scope", "label-key", "fold-site", "reverse-direction", "tier"}
 
 # name, anchor file, plant/self-test pattern (regex over the anchor
-# file), axes covered, axis gaps (burn-down rows, named).
+# file), axes covered, axis gaps (burn-down rows, named), derived_from
+# (regex naming the in-generator production table / refusal predicate
+# coverage is computed from; REQUIRED for zero-gap rows, None only on
+# burn-down rows that predate the discipline).
 REGISTRY = [
     # nix-side generators (self-test arms run first, in-file).
-    ("census-enrollment", "nix/census_enrollment.py", r"self-?test", {"scope"}, {"alias", "tier"}),
-    ("metric-reason-help-sync", "nix/metric_reason_help_sync.py", r"Self-test.*label-key|label-key self-test", {"label-key", "scope"}, {"alias"}),
-    ("rule-citation-versions", "nix/rule_citation_versions.py", r"self-?test", {"tier", "scope"}, set()),
-    ("exposure-producer-census", "nix/exposure_producer_census.py", r"self-test arm", {"reverse-direction", "scope"}, set()),
-    ("reason-alert-sync", "nix/tests/helm/42-reason-alert-sync.sh", r"Self-test arms run FIRST|self-test arm", {"reverse-direction", "scope"}, set()),
-    ("cilium-labels-filter", "nix/cilium-render.nix", r"share-pin|labels", {"scope"}, {"reverse-direction"}),
-    ("string-interior-spaces", "nix/string_interior_spaces.py", r"planted red", {"scope", "fold-site"}, {"alias"}),
-    ("streaming-open-ban", "nix/streaming_open_ban.py", r"selftest", {"scope"}, {"alias"}),
-    ("quint-policy", "nix/quint_policy.py", r"planted RED per rule arm|selftest", {"scope", "fold-site"}, set()),
-    ("fixture-provenance", "nix/fixture_provenance.py", r"selftest|planted red", {"scope", "label-key"}, set()),
+    ("census-enrollment", "nix/census_enrollment.py", r"self-?test", {"scope"}, {"alias", "tier"}, r"CLAIM_SHAPES"),
+    ("metric-reason-help-sync", "nix/metric_reason_help_sync.py", r"Self-test.*label-key|label-key self-test", {"label-key", "scope"}, {"alias"}, r"LABEL_KEYS"),
+    ("rule-citation-versions", "nix/rule_citation_versions.py", r"self-?test", {"tier", "scope"}, set(), r"productions = \["),
+    ("exposure-producer-census", "nix/exposure_producer_census.py", r"self-test arm", {"reverse-direction", "scope"}, set(), r"DISPOSITIONS = \{"),
+    ("reason-alert-sync", "nix/tests/helm/42-reason-alert-sync.sh", r"Self-test arms run FIRST|self-test arm", {"reverse-direction", "scope"}, set(), r"INTENT_DROP_REASONS"),
+    ("cilium-labels-filter", "nix/cilium-render.nix", r"share-pin|labels", {"scope"}, {"reverse-direction"}, None),
+    ("string-interior-spaces", "nix/string_interior_spaces.py", r"planted red", {"scope", "fold-site"}, {"alias"}, None),
+    ("streaming-open-ban", "nix/streaming_open_ban.py", r"selftest", {"scope"}, {"alias"}, None),
+    ("quint-policy", "nix/quint_policy.py", r"planted RED per rule arm|selftest", {"scope", "fold-site"}, set(), r"def conj_leaves"),
+    ("fixture-provenance", "nix/fixture_provenance.py", r"selftest|planted red", {"scope", "label-key"}, set(), r"LANES = \{"),
     # in-crate generators (EMBEDDED corpora per the registration-census
     # precedent; the pattern pins the embed form, not a dev-tree path).
-    ("timeout-census", "rio-controller/tests/timeout_census.rs", r"CORPUS_SOURCES|include_str!", {"alias", "scope", "label-key"}, set()),
-    ("cap-reader-census", "rio-controller/src/reconcilers/nodeclaim_pool/cover.rs", r"CAP_ALIASES", {"alias", "scope", "tier"}, set()),
-    ("vanish-census", "rio-controller/src/reconcilers/nodeclaim_pool/health.rs", r"axis[- ]omission|96-row|provenance.*launched", {"scope"}, {"alias"}),
-    ("await-genset", "rio-store/src/substitute.rs", r"genset|GEN-SET", {"fold-site", "scope"}, set()),
-    ("cleanup-posture-fold", "rio-store/src/substitute.rs", r"CleanupPosture", {"fold-site"}, set()),
-    ("registration-writer-census", "rio-scheduler/src/db/live_pins.rs", r"registration_writer_census", {"scope"}, {"reverse-direction"}),
-    ("registration-writer-census-store", "rio-store/src/grpc/put_path/common.rs", r"registration_writer_census", {"scope"}, {"reverse-direction"}),
-    ("cell-emission-arm-product", "rio-scheduler/src/actor/snapshot.rs", r"classify_cell_emission", {"scope"}, {"fold-site"}),
-    ("subst-dep-eta-disposition", "rio-scheduler/src/actor/tests/misc.rs", r"subst_dep_eta_disposition_census", {"scope"}, set()),
-    ("refusal-agreement-census", "rio-builder/src/runtime/pull.rs", r"fatal_set_agrees_with_the_authority", {"scope"}, set()),
+    ("timeout-census", "rio-controller/tests/timeout_census.rs", r"CORPUS_SOURCES|include_str!", {"alias", "scope", "label-key"}, set(), r"USE_GRAMMAR"),
+    ("cap-reader-census", "rio-controller/src/reconcilers/nodeclaim_pool/cover.rs", r"CAP_ALIASES", {"alias", "scope", "tier"}, set(), r"CAP_ALIASES"),
+    ("vanish-census", "rio-controller/src/reconcilers/nodeclaim_pool/health.rs", r"axis[- ]omission|96-row|provenance.*launched", {"scope"}, {"alias"}, None),
+    ("await-genset", "rio-store/src/substitute.rs", r"genset|GEN-SET", {"fold-site", "scope"}, set(), r"acquire-site census"),
+    ("cleanup-posture-fold", "rio-store/src/substitute.rs", r"CleanupPosture", {"fold-site"}, set(), r"enum CleanupPosture"),
+    ("registration-writer-census", "rio-scheduler/src/db/live_pins.rs", r"registration_writer_census", {"scope"}, {"reverse-direction"}, None),
+    ("registration-writer-census-store", "rio-store/src/grpc/put_path/common.rs", r"registration_writer_census", {"scope"}, {"reverse-direction"}, None),
+    ("cell-emission-arm-product", "rio-scheduler/src/actor/snapshot.rs", r"classify_cell_emission", {"scope"}, {"fold-site"}, None),
+    ("subst-dep-eta-disposition", "rio-scheduler/src/actor/tests/misc.rs", r"subst_dep_eta_disposition_census", {"scope"}, set(), r"SubstDepEta"),
+    ("refusal-agreement-census", "rio-builder/src/runtime/pull.rs", r"fatal_set_agrees_with_the_authority", {"scope"}, set(), r"judge_refusal"),
     # Riding arm of THIS file (the refusal-census precedent): the
     # WireSecs pacing-seam census — raw `from_secs` over `*_seconds`
     # proto fields is banned in production code; proto→sleep seams
@@ -102,7 +117,7 @@ REGISTRY = [
     # fn or beyond the window is unplanted. Trigger: the next
     # lint-gap finding on this generator upgrades the corpus in the
     # same close.
-    ("wire-secs-pacing-seams", "nix/census_corpora.py", r"WIRE_SECS_GRAMMAR", {"alias", "scope"}, {"fold-site"}),
+    ("wire-secs-pacing-seams", "nix/census_corpora.py", r"WIRE_SECS_GRAMMAR", {"alias", "scope"}, {"fold-site"}, r"WIRE_SECS_GRAMMAR = \["),
 ]
 
 MODEL_DIVERGENCE = re.compile(
@@ -140,10 +155,11 @@ def strip_production(text: str) -> str:
     return out
 
 
-def check_registry(src_root: pathlib.Path):
+def check_registry(src_root: pathlib.Path, registry=None):
+    registry = REGISTRY if registry is None else registry
     fails = []
     seen_axes = set()
-    for name, rel, plant_pat, axes, gaps in REGISTRY:
+    for name, rel, plant_pat, axes, gaps, derived_from in registry:
         f = src_root / rel
         if not axes <= AXES or not gaps <= AXES:
             fails.append(f"{name}: axes outside the closed vocabulary {sorted(AXES)}")
@@ -151,11 +167,28 @@ def check_registry(src_root: pathlib.Path):
         if axes & gaps:
             fails.append(f"{name}: axis listed both covered and gapped: {sorted(axes & gaps)}")
             continue
+        # R22' (bug_151/merged_bug_090): a zero-gap claim must name the
+        # computable production surface it derives from — a registry
+        # row whose covered/gap set the generator cannot itself
+        # compute is the self-certification this check kills.
+        if not gaps and derived_from is None:
+            fails.append(
+                f"{name}: SELF-CERTIFIED zero-gap row — name the generator's "
+                f"production table / refusal predicate in derived_from, or "
+                f"record the real gaps as burn-down rows"
+            )
+            continue
         if not f.is_file():
             fails.append(f"{name}: anchor file {rel} missing — registry rot or an unrecorded retirement")
             continue
-        if not re.search(plant_pat, f.read_text()):
+        text = f.read_text()
+        if not re.search(plant_pat, text):
             fails.append(f"{name}: plant/self-test pattern /{plant_pat}/ not found in {rel} — the corpus or its embed form rotted")
+        if derived_from is not None and not re.search(derived_from, text):
+            fails.append(
+                f"{name}: derived_from anchor /{derived_from}/ not found in {rel} — "
+                f"the production table the coverage claim derives from rotted"
+            )
         seen_axes |= axes
     if seen_axes != AXES:
         fails.append(f"axis vocabulary not exercised by any enrolled corpus: {sorted(AXES - seen_axes)}")
@@ -248,7 +281,11 @@ def scan_wire_secs_seams(files):
     fails = []
     for rel, raw in files:
         lines = raw.splitlines()
-        stripped = strip_comments(raw)
+        # Seam reconciliation (bw10 close): the arm was authored
+        # against the pre-merged_bug_009 stripper; it now rides the
+        # shared production pipeline (attribute-position cfg(test)
+        # prune + comment/string blanking) like every arm here.
+        stripped = strip_production(raw)
         slines = stripped.splitlines()
 
         def flag(lineno, what):
@@ -321,6 +358,23 @@ def main() -> int:
     f_e = check_registry(pathlib.Path("/nonexistent-root"))
     if not any("missing" in x for x in f_e):
         print(f"FAIL: self-test arm E (registry rot) expected missing-anchor failures, got {f_e}", file=sys.stderr)
+        return 1
+    # Arm E2 (W10-CC — the R22' recursion close): a strawman row
+    # claiming ZERO gaps with NO derived_from production table is the
+    # bug_151/merged_bug_090 self-certification shape; the registry
+    # check itself reds on it.
+    strawman = [("strawman-zero-gap", "nix/census_corpora.py", r"REGISTRY", {"scope"}, set(), None)]
+    f_e2 = check_registry(pathlib.Path("/nonexistent-root"), strawman)
+    if len(f_e2) < 1 or "SELF-CERTIFIED" not in f_e2[0]:
+        print(f"FAIL: self-test arm E2 (zero-gap self-certification) expected the strawman row red, got {f_e2}", file=sys.stderr)
+        return 1
+    # Arm E3: a derived_from anchor that no longer resolves in the
+    # generator is rot, same as a dead plant pattern. (The needle is
+    # concatenation-built so this file never carries it.)
+    rotted = [("rotted-derivation", "nix/census_corpora.py", r"REGISTRY", {"scope"}, set(), r"NO_SUCH_" + r"PRODUCTION_TABLE")]
+    f_e3 = check_registry(src_root, rotted)
+    if not any("derived_from anchor" in x for x in f_e3):
+        print(f"FAIL: self-test arm E3 (derived_from rot) expected the rotted anchor red, got {f_e3}", file=sys.stderr)
         return 1
     # Arm F (merged_bug_009, the SCOPE axis, planted at the outermost
     # layer — raw source in, violations out): a production fold AFTER
@@ -400,7 +454,7 @@ def main() -> int:
     # one level up. (In-crate generators are reachable only through
     # their registry rows; their discovery surface is the crate's own
     # census-enrollment lint.)
-    registered = {rel for _, rel, _, _, _ in REGISTRY}
+    registered = {rel for _, rel, *_ in REGISTRY}
     registered.add("nix/census_corpora.py")  # self
     # The shared exact lexer is a LIBRARY consumed by the scanners
     # (one grammar, one place) — not itself a generator with a corpus.
@@ -444,9 +498,11 @@ def main() -> int:
     fails += scan_refusal_folds(refusal_files)
     fails += scan_wire_secs_seams(refusal_files)
 
-    gaps = sorted(f"{name}:{ax}" for name, _, _, _, g in REGISTRY for ax in g)
+    gaps = sorted(f"{name}:{ax}" for name, _, _, _, g, _ in REGISTRY for ax in g)
+    derived = sum(1 for *_, d in REGISTRY if d is not None)
     print(
-        f"census-corpora: {len(REGISTRY)} generators enrolled, axes {sorted(AXES)} all exercised, "
+        f"census-corpora: {len(REGISTRY)} generators enrolled ({derived} with derived_from "
+        f"production anchors; every zero-gap row derived), axes {sorted(AXES)} all exercised, "
         f"{len(gaps)} grandfathered axis gaps (burn-down: {', '.join(gaps)}), "
         f"{md_count} MODEL-DIVERGENCE headers grammar-checked, "
         f"{len(refusal_files)} files swept by the negative refusal census and the wire-secs pacing-seam census"
