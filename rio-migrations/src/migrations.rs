@@ -68,6 +68,17 @@
 /// verifies as a Bitmap Index Scan on `idx_narinfo_references_gin`.
 /// The index itself was always correct; only the comment and the
 /// caller were wrong.
+///
+/// **Second regression (same index, different shape):** the rewrite
+/// initially inlined the hash→path resolution as a scalar subquery in
+/// the array constructor (`@> ARRAY[(SELECT store_path FROM narinfo
+/// WHERE store_path_hash = $1)]`), and the earlier "EXPLAIN-verified
+/// even with the InitPlan subquery" claim here did not hold at scale:
+/// at 225k narinfo rows the planner seq-scanned again (51.6 ms/probe,
+/// 2 probes/path — 98% of sweep time once the file_blobs cascade was
+/// fixed by 071). The probe now resolves the path in Rust and binds
+/// TEXT directly (`LIVE_REFERRER_PROBE_SQL` in sweep.rs, with an
+/// EXPLAIN regression test).
 pub const M_008: () = ();
 
 /// `migrations/009_phase4.sql`
