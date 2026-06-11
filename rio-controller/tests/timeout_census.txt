@@ -20,3 +20,4 @@ reconcilers/mod.rs:62	refusal
 rio-store/src/substitute.rs (NarHoldEnvelope deadline)	delay	hold released; claim re-claimable; envelope-bounded
 rio-store/src/grpc/put_path/common.rs (BUDGET_WAIT_GRACE=180s shed)	delay	budget wait shed; upload retryable; envelope-bounded
 rio-store/src/grpc/put_path/common.rs (NarHoldEnvelope::for_ingest_cap)	delay	ingest hold capped; envelope-bounded
+rio-builder/src/runtime/setup.rs (COLD_START_CONNECT_BUDGET first-connect)	refusal	budget breach = exit nonzero; Job backoff/CrashLoopBackOff carry escalation; steady-state reconnect keeps the infinite posture (dual face); envelope-bounded (live_056-b)

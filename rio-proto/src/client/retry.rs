@@ -128,6 +128,65 @@ where
     }
 }
 
+/// The typed budget breach for [`connect_within`] (live_056-b; R17 —
+/// violable, named). Carries the budget so the exit line prices
+/// itself.
+#[derive(Debug)]
+pub struct ConnectBudgetExceeded {
+    /// The wall-clock budget that was exceeded.
+    pub budget: Duration,
+}
+
+impl std::fmt::Display for ConnectBudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cold-start connect budget exceeded after {:?} (upstreams \
+             unreachable; exiting so the platform's escalation alphabet \
+             carries the failure)",
+            self.budget
+        )
+    }
+}
+
+impl std::error::Error for ConnectBudgetExceeded {}
+
+/// live_056-b: [`connect_forever`] bounded by a WALL-CLOCK budget —
+/// the COLD-START form. A first-connect is a hold on the fleet's
+/// capacity story: a builder that cannot reach its upstreams has
+/// never held claim state, so exiting is free — and exit is the only
+/// posture that makes the failure VISIBLE (nonzero exit ⇒ Job
+/// backoff / CrashLoopBackOff; the incident shape was a
+/// policy-blackholed builder retrying forever as a Running pod with
+/// zero failure signal anywhere). The budget is wall-clock, not
+/// attempt-count, BECAUSE the wedge mode is hung connects (dropped
+/// SYNs never complete), where an attempt counter may never tick.
+///
+/// The dual face is load-bearing: steady-state reconnect posture is
+/// deliberately NOT this — once serving, an upstream outage must not
+/// kill workers holding claim state, so post-serving call sites (and
+/// the controller's bind-before-connect bootstrap, whose liveness
+/// rationale depends on it) keep [`connect_forever`]'s infinite
+/// posture. Only cold-start call sites take a budget.
+///
+/// Returns `Ok(Some(T))` connected within budget; `Ok(None)` if
+/// shutdown fired (clean exit, matching [`connect_forever`]);
+/// `Err(ConnectBudgetExceeded)` on breach — the caller maps the
+/// breach to a NONZERO exit.
+pub async fn connect_within<T, E>(
+    budget: Duration,
+    shutdown: &CancellationToken,
+    op: impl AsyncFnMut() -> Result<T, E>,
+) -> Result<Option<T>, ConnectBudgetExceeded>
+where
+    E: std::fmt::Display,
+{
+    match tokio::time::timeout(budget, connect_forever(shutdown, op)).await {
+        Ok(outcome) => Ok(outcome),
+        Err(_elapsed) => Err(ConnectBudgetExceeded { budget }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,5 +348,72 @@ mod tests {
             assert!(j >= Duration::from_secs(3), "{j:?} below 75% of {base:?}");
             assert!(j <= Duration::from_secs(5), "{j:?} above 125% of {base:?}");
         }
+    }
+
+    /// W9-CN, mechanism faces (live_056-b): the cold-start budget
+    /// bounds the BLACKHOLE shape — a hung connect attempt (dropped
+    /// SYNs: the op future never completes, so no attempt counter
+    /// could ever tick) breaches the budget and returns the typed
+    /// violation; the caller maps it to a nonzero exit and the
+    /// platform's escalation alphabet (Job backoff/CrashLoopBackOff)
+    /// carries the failure. Pre-fix red (transcript in the commit
+    /// body): connect_forever retried the same shape forever — the
+    /// invisible wedge.
+    #[tokio::test]
+    async fn w9_cn_budget_bounds_hung_cold_start_connect() {
+        let token = CancellationToken::new();
+        let started = std::time::Instant::now();
+        let breach = connect_within(Duration::from_millis(300), &token, || async {
+            std::future::pending::<Result<(), std::io::Error>>().await
+        })
+        .await;
+        let err = breach.expect_err("hung connect must breach the budget");
+        assert_eq!(err.budget, Duration::from_millis(300));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the breach surfaces within the envelope, not eventually"
+        );
+    }
+
+    /// W9-CN, success face: a connect that lands within the budget
+    /// (after transient refusals — the healthy cold-start race) is
+    /// indistinguishable from connect_forever's success.
+    #[tokio::test]
+    async fn w9_cn_budget_admits_connects_within_envelope() {
+        let token = CancellationToken::new();
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls2 = Arc::clone(&calls);
+        let ok = connect_within(Duration::from_secs(30), &token, move || {
+            let calls = Arc::clone(&calls2);
+            async move {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(std::io::Error::other("endpoints not ready yet"))
+                } else {
+                    Ok(42u32)
+                }
+            }
+        })
+        .await
+        .expect("within budget");
+        assert_eq!(ok, Some(42), "second attempt connects (1s backoff)");
+    }
+
+    /// W9-CN, shutdown face: SIGTERM during the bounded cold-start is
+    /// a CLEAN exit (Ok(None)), exactly matching connect_forever — the
+    /// budget breach is the only new arm.
+    #[tokio::test]
+    async fn w9_cn_shutdown_during_budget_is_clean() {
+        let token = CancellationToken::new();
+        let token2 = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            token2.cancel();
+        });
+        let out = connect_within(Duration::from_secs(30), &token, || async {
+            std::future::pending::<Result<(), std::io::Error>>().await
+        })
+        .await
+        .expect("shutdown is not a breach");
+        assert_eq!(out, None, "clean-exit arm preserved");
     }
 }

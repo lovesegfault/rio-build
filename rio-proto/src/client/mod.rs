@@ -16,7 +16,9 @@ pub mod balance;
 pub use balance::BalancedChannel;
 
 pub mod retry;
-pub use retry::{RetryError, connect_forever, connect_with_retry};
+pub use retry::{
+    ConnectBudgetExceeded, RetryError, connect_forever, connect_with_retry, connect_within,
+};
 
 pub mod store;
 pub use store::{

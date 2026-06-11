@@ -32,7 +32,10 @@ pub(super) type BalanceGuards = (
 /// build context. Everything `main()` does before the pull loop.
 ///
 /// Returns `None` if shutdown fired during cold-start connect — caller
-/// exits cleanly (nothing started, never connected).
+/// exits cleanly (nothing started, never connected). Returns `Err`
+/// when the cold-start connect budget is exceeded (live_056-b) —
+/// caller propagates and the process exits NONZERO so the wedge is
+/// visible platform-side.
 pub async fn setup(
     mut cfg: Config,
     shutdown: rio_common::signal::Token,
@@ -59,8 +62,11 @@ pub async fn setup(
     let ready = Arc::new(AtomicBool::new(false));
     crate::health::spawn_health_server(cfg.health_addr, Arc::clone(&ready), shutdown.clone());
 
+    // live_056-b: the `?` is the cold-start envelope's exit conduit —
+    // a budget breach propagates to main() and the process exits
+    // NONZERO (Job backoff / CrashLoopBackOff carry the failure).
     let Some((store_clients, scheduler_client, _balance_guard)) =
-        connect_upstreams(&cfg, &shutdown).await
+        connect_upstreams(&cfg, &shutdown).await?
     else {
         // Shutdown fired during cold-start connect. Clean exit —
         // nothing to drain (never connected), no FUSE mounted yet.
@@ -73,6 +79,20 @@ pub async fn setup(
         systems = ?systems,
         "connected to gRPC services"
     );
+    // live_056-b: the serving-state signal — past cold start, channels
+    // live, about to ask for work (post-connect, pre-first-pull). The
+    // Job's exec readiness probe tests this file, so Pod Ready ⟺
+    // serving (W9-CO); a wedged cold-start never creates it. (The
+    // /readyz flag is a DIFFERENT axis: pulled/building — useful
+    // capacity, not serving state.) Best-effort: a failed write
+    // leaves the pod NotReady — observable, never blocking.
+    if let Err(e) = std::fs::write(rio_common::k8s::BUILDER_SERVING_STATE_FILE, b"serving\n") {
+        tracing::warn!(
+            error = %e,
+            path = rio_common::k8s::BUILDER_SERVING_STATE_FILE,
+            "failed to write the serving-state file; the pod will stay NotReady"
+        );
+    }
 
     // ADR-023 phase-10 hw self-calibration. Resolve `hw_class` from
     // the downward-API volume (bounded poll — the controller stamps
@@ -449,17 +469,51 @@ fn init_cgroup(
     Ok((cgroup_parent, resource_snapshot))
 }
 
-/// Retry-until-connected store + scheduler clients via
-/// [`connect_forever`](rio_proto::client::connect_forever)
-/// (shutdown-aware, exponential backoff).
+/// live_056-b R17 envelope: the cold-start first-connect budget —
+/// typed, VIOLABLE const. Axes: time = 120 s (load-bearing — the
+/// wedge mode is hung connects, where attempts never complete);
+/// attempts = derived (~10 at the 1→16 s capped curve when attempts
+/// fail fast; fewer when they hang). Derivation: (a) ≥ 20× the
+/// healthy cold-start (helm install / node churn resolves in
+/// single-digit seconds, covered by attempt 4 of the curve); (b)
+/// ≥ 5 capped retries past the curve's 31 s ramp, so a slow-rolling
+/// upstream restart is ridden out; (c) strictly under the
+/// controller's 300 s `ORPHAN_REAP_GRACE`, so a wedged cold-start
+/// EXITS and surfaces through the typed terminal lane (Job Failed →
+/// counted death → escalating respawn backoff) before the blind
+/// orphan reap would recycle the same name invisibly. Violable: a
+/// deployment whose cold path legitimately exceeds this raises the
+/// const WITH a new derivation note — deliberately not config (a
+/// deployment invariant, not an operator dial; config would drag the
+/// BLESS/docs-data schema obligations).
+const COLD_START_CONNECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Bounded first-connect of store + scheduler clients via
+/// [`connect_within`](rio_proto::client::connect_within) —
+/// shutdown-aware, exponential backoff, COLD-START budget
+/// ([`COLD_START_CONNECT_BUDGET`]).
+///
+/// live_056-b: this is deliberately the cold-start posture ONLY. The
+/// dual face is load-bearing — once serving, an upstream outage must
+/// not kill a worker holding claim state (post-serving traffic rides
+/// the tonic channel's own reconnect; no other builder call site
+/// uses a bounded connect), and the controller's bind-before-connect
+/// bootstrap keeps `connect_forever`'s infinite posture untouched.
 ///
 /// Cold-start race: store/scheduler Services may have no endpoints
 /// yet. /healthz stays 200 (process IS alive, restart won't help),
 /// /readyz stays 503 (ready flag won't flip until the pull loop has
-/// an assignment in hand, far past this loop).
+/// an assignment in hand, far past this loop); the serving-state
+/// file ([`rio_common::k8s::BUILDER_SERVING_STATE_FILE`]) does not
+/// exist yet, so the Job's exec readiness probe holds the pod
+/// NotReady for exactly the un-served window.
 ///
-/// Returns `None` if shutdown fires during retry — caller exits
-/// main() cleanly (nothing started, never connected).
+/// Returns `Ok(None)` if shutdown fires during retry — caller exits
+/// main() cleanly (nothing started, never connected). Returns
+/// `Err` when the budget is exceeded — the caller propagates and
+/// main() exits NONZERO, so the platform's own escalation alphabet
+/// (Job backoff / CrashLoopBackOff) makes the failure visible
+/// (W9-CN: the incident's invisible-wedge inverse).
 ///
 /// Scheduler has two modes:
 /// - Balanced (K8s, multi-replica): DNS-resolve headless Service,
@@ -470,16 +524,19 @@ fn init_cgroup(
 async fn connect_upstreams(
     cfg: &crate::config::Config,
     shutdown: &rio_common::signal::Token,
-) -> Option<(StoreClients, WorkerClient, BalanceGuards)> {
-    rio_proto::client::connect_forever(shutdown, || async {
-        // `connect_raw` returns the bare Channel; StoreClients wraps it
-        // in the typed StoreService client with the standard message-size
-        // headroom.
-        let (ch, store_guard) =
-            rio_proto::client::connect_raw::<rio_proto::StoreServiceClient<_>>(&cfg.store).await?;
-        let store = StoreClients::from_channel(ch);
-        let (sched, sched_guard) = rio_proto::client::connect(&cfg.scheduler).await?;
-        anyhow::Ok((store, sched, (store_guard, sched_guard)))
-    })
-    .await
+) -> anyhow::Result<Option<(StoreClients, WorkerClient, BalanceGuards)>> {
+    let connected =
+        rio_proto::client::connect_within(COLD_START_CONNECT_BUDGET, shutdown, || async {
+            // `connect_raw` returns the bare Channel; StoreClients wraps it
+            // in the typed StoreService client with the standard message-size
+            // headroom.
+            let (ch, store_guard) =
+                rio_proto::client::connect_raw::<rio_proto::StoreServiceClient<_>>(&cfg.store)
+                    .await?;
+            let store = StoreClients::from_channel(ch);
+            let (sched, sched_guard) = rio_proto::client::connect(&cfg.scheduler).await?;
+            anyhow::Ok((store, sched, (store_guard, sched_guard)))
+        })
+        .await?;
+    Ok(connected)
 }

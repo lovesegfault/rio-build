@@ -104,6 +104,18 @@ pub fn features_compatible(required: &[String], provides: &[String]) -> bool {
     required.iter().all(|f| provides.contains(f)) && required.is_empty() == provides.is_empty()
 }
 
+/// live_056-b: the builder's serving-state file — the contract between
+/// `rio-builder` (writes it once `connect_upstreams` succeeds:
+/// post-connect, pre-first-pull) and the controller's Job spec (mints
+/// an exec readiness probe testing it), shared here so neither side
+/// can drift (the merged_bug_035 shared-constant law). Pod Ready ⟺
+/// the builder is past cold start and asking for work; a
+/// policy-blackholed builder never creates it and stays NotReady for
+/// exactly the un-served window. `/tmp` is writable for BOTH executor
+/// kinds (builders: writable rootfs; fetchers: the `tmp` tmpfs mount
+/// in `READ_ONLY_ROOT_MOUNTS`).
+pub const BUILDER_SERVING_STATE_FILE: &str = "/tmp/rio-serving";
+
 #[cfg(test)]
 mod tests {
     use super::*;
