@@ -1383,8 +1383,13 @@ in
         src = pkgs.lib.cleanSource ../.;
         nativeBuildInputs = [ pkgs.python3 ];
         scanScript = ../nix/census_corpora.py;
+        # The refusal census routes through the shared exact lexer
+        # (merged_bug_009), staged beside the scanner so `import
+        # rust_strip` resolves; its selftest gates first.
+        sharedLexer = ../nix/rust_strip.py;
       }
       ''
+        cp "$sharedLexer" rust_strip.py
         cp "$scanScript" census_corpora.py
         python3 census_corpora.py "$src"
         touch $out
@@ -1410,8 +1415,12 @@ in
         src = pkgs.lib.cleanSource ../.;
         nativeBuildInputs = [ pkgs.python3 ];
         scanScript = ../nix/exposure_producer_census.py;
+        # Constructor scan routes through the shared exact lexer
+        # (merged_bug_009) — staged beside the scanner.
+        sharedLexer = ../nix/rust_strip.py;
       }
       ''
+        cp "$sharedLexer" rust_strip.py
         cp "$scanScript" exposure_producer_census.py
         python3 exposure_producer_census.py "$src"
         touch $out
@@ -1566,9 +1575,16 @@ in
           ];
         };
         nativeBuildInputs = [ pkgs.python3 ];
+        scanScript = ../nix/metric_reason_help_sync.py;
+        # Comment stripping routes through the shared exact lexer
+        # (merged_bug_009), staged beside the scanner so `import
+        # rust_strip` resolves; its selftest gates first.
+        sharedLexer = ../nix/rust_strip.py;
       }
       ''
-        python3 ${../nix/metric_reason_help_sync.py} $src
+        cp "$sharedLexer" rust_strip.py
+        cp "$scanScript" metric_reason_help_sync.py
+        python3 metric_reason_help_sync.py $src
         touch $out
       '';
 

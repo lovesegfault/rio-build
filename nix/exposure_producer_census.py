@@ -37,6 +37,8 @@ import pathlib
 import re
 import sys
 
+import rust_strip
+
 CLASSIFIER_FILE = "rio-controller/src/reconcilers/node_informer.rs"
 SERVER_FILE = "rio-scheduler/src/admin/mod.rs"
 
@@ -46,7 +48,11 @@ DISPOSITIONS = {"emitted", "never-emitted", "defaulted"}
 
 
 def strip_comments(text: str) -> str:
-    return "\n".join(line.split("//")[0] if "//" in line and '"//' not in line else line for line in text.splitlines())
+    # Shared exact lexer (merged_bug_009): comments AND string bodies
+    # blanked — a constructor named in prose or inside a string cannot
+    # satisfy an `emitted` row. Newline-preserving.
+    out, _ = rust_strip.lex(text, blank_string_bodies=True)
+    return out
 
 
 def parse_rows(classifier_text: str):
@@ -85,6 +91,12 @@ def check(rows, emitted: set):
 
 def main() -> int:
     src_root = pathlib.Path(sys.argv[1])
+
+    # A broken shared lexer fails closed before any scan may gate.
+    lexer_err = rust_strip.selftest()
+    if lexer_err:
+        print(f"FAIL: shared lexer self-test — {lexer_err}", file=sys.stderr)
+        return 1
 
     # --- self-test arms (planted, must fail) ---------------------------
     gates_iv_only = 'fn append(){ return Err(Status::invalid_argument("kind")); }'

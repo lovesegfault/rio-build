@@ -44,12 +44,26 @@ shared, so string and comment classification cannot disagree).
 `lex` delegates to `lex_full` and keeps its two-tuple contract —
 existing consumers are byte-identical.
 
+`strip_cfg_test(text) -> str` is the attribute-position `#[cfg(test)]`
+pruner (merged_bug_009): ONE implementation of scope-pruning for every
+scanner, replacing the per-scanner truncate-at-first-marker walks that
+left whole production bodies unswept after an early test module
+(census_corpora.py's mid-file prune) — the xtask corpus pruner's
+attribute-position semantics, lifted here. Each cfg(test)-attributed
+ITEM (the attribute, any stacked attributes after it, and the item
+through its matching close brace or terminating `;`) is blanked
+newline-preserving; scanning RESUMES after the item. Attribute
+detection runs over the LEXED text, so a `#[cfg(test)]` lookalike
+inside a string or comment never prunes.
+
 `selftest()` returns an error string on the first failed assertion (or
 None): an exact span/blank table over the escaped-quote families. Both
 consumers run it BEFORE their own arm-level selftests and exit 1 on
 any miss — a broken shared lexer fails closed before any scan may
 gate.
 """
+
+import re
 
 
 def _raw_prefix_len(text: str, i: int) -> int:
@@ -166,6 +180,69 @@ def lex(text: str, *, blank_string_bodies: bool):
     return out, spans
 
 
+CFG_TEST_ATTR = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
+
+
+def strip_cfg_test(text: str) -> str:
+    """Attribute-position `#[cfg(test)]` pruner — see the module
+    docstring. Returns the ORIGINAL text with each cfg(test)-attributed
+    item blanked (newlines kept; line numbers stable)."""
+    lexed, _ = lex(text, blank_string_bodies=True)
+    out = list(text)
+    n = len(text)
+
+    def blank(a: int, b: int) -> None:
+        for k in range(a, min(b, n)):
+            if out[k] != "\n":
+                out[k] = " "
+
+    for m in CFG_TEST_ATTR.finditer(lexed):
+        i = m.end()
+        # Skip whitespace and any stacked attribute blocks after the
+        # cfg(test) attr (`#[allow(...)]`, multi-line attrs — bracket
+        # matched on the lexed text). Doc comments are already blank.
+        while True:
+            while i < n and lexed[i].isspace():
+                i += 1
+            if i < n and lexed[i] == "#":
+                j = i + 1
+                while j < n and lexed[j].isspace():
+                    j += 1
+                if j < n and lexed[j] == "[":
+                    depth = 1
+                    j += 1
+                    while j < n and depth:
+                        if lexed[j] == "[":
+                            depth += 1
+                        elif lexed[j] == "]":
+                            depth -= 1
+                        j += 1
+                    i = j
+                    continue
+            break
+        # The item extent: through the matching close of its first
+        # top-level `{` (fn/mod/impl bodies), or a `;` at depth 0 if
+        # one lands first (use decls, consts, type aliases).
+        depth = 0
+        j = i
+        end = n
+        while j < n:
+            c = lexed[j]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    end = j + 1
+                    break
+            elif c == ";" and depth == 0:
+                end = j + 1
+                break
+            j += 1
+        blank(m.start(), end)
+    return "".join(out)
+
+
 def selftest() -> str | None:
     """Exact span/blank assertions, escaped-quote families included."""
     # The merged_bug_049 family: '\'' then a tuple/char soup. The walk
@@ -236,6 +313,28 @@ def selftest() -> str | None:
     _, _, comments = lex_full(t, blank_string_bodies=False)
     if comments != []:
         return f"comment-lookalike inside a string produced spans: {comments}"
+    # cfg(test) pruner: a MID-FILE test module is blanked and scanning
+    # resumes — production code after it survives (the merged_bug_009
+    # scope axis: the old per-scanner walks truncated here).
+    t = "fn a() {}\n#[cfg(test)]\nmod tests {\n  fn t() { prod_marker(); }\n}\nfn b() { after_marker(); }\n"
+    pruned = strip_cfg_test(t)
+    if "prod_marker" in pruned:
+        return f"cfg(test) body survived the prune: {pruned!r}"
+    if "after_marker" not in pruned or "fn a()" not in pruned:
+        return f"prune ate production code around the test module: {pruned!r}"
+    if pruned.count("\n") != t.count("\n"):
+        return "cfg(test) prune broke line numbering"
+    # Stacked attributes after the cfg attr ride the same item.
+    t = "#[cfg(test)]\n#[allow(dead_code)]\nfn t() { x(); }\nfn keep() {}\n"
+    pruned = strip_cfg_test(t)
+    if "x()" in pruned or "keep" not in pruned:
+        return f"stacked-attr prune wrong: {pruned!r}"
+    # Braceless items terminate at `;`; a cfg(test) LOOKALIKE inside a
+    # string or comment never prunes.
+    t = '#[cfg(test)]\nuse x::y;\nfn keep() {}\nlet s = "#[cfg(test)]"; // #[cfg(test)]\nfn also_keep() {}\n'
+    pruned = strip_cfg_test(t)
+    if "use x::y" in pruned or "keep" not in pruned or "also_keep" not in pruned:
+        return f"semicolon/lookalike prune wrong: {pruned!r}"
     return None
 
 

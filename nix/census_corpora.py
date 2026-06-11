@@ -44,11 +44,24 @@ Two enforcement arms ride along (their plants embedded here):
     matches! desugars to `_ => false`, excluding the site from the
     authority's compile-error census. Documented extension sites
     carry `refusal-census: allow(<why>)` within the 6 lines above.
+
+Lexing is STRUCTURAL, not conventional (merged_bug_009): this scanner
+consumed the exact modes it polices — a naive per-line comment split
+and a truncate-at-first-`#[cfg(test)]` scope prune that left the bulk
+of jobs.rs/substitute.rs/actor mod.rs production bodies unswept by
+the refusal census. Both lanes now route through the shared exact
+lexer (nix/rust_strip.py: comment/string blanking + the
+attribute-position cfg(test) pruner), and a third enforcement arm
+rides along: open-coded `split` on the line-comment delimiter in ANY
+nix/*.py scanner is BANNED (the shadow-stripper negative census) —
+canonicalization is enforced, not asked for.
 """
 
 import pathlib
 import re
 import sys
+
+import rust_strip
 
 AXES = {"alias", "scope", "label-key", "fold-site", "reverse-direction", "tier"}
 
@@ -108,8 +121,23 @@ REFUSAL_ALLOW = re.compile(r"refusal-census:\s*allow\(")
 MATCHES_CODE = re.compile(r"matches!\s*\(\s*[^;]{0,400}?\bCode::", re.S)
 
 
-def strip_comments(text: str) -> str:
-    return "\n".join(line.split("//")[0] if "//" in line and '"//' not in line else line for line in text.splitlines())
+# The shadow-stripper ban (the negative census over the scanner set
+# itself): an open-coded `.split` on the line-comment delimiter is the
+# exact lexer this meta-lint exists to forbid — every nix/*.py scanner
+# consumes rust_strip instead. The needle is built by concatenation so
+# this file's own source never carries the banned token.
+SHADOW_STRIPPER = re.compile(r"\.split\(\s*['\"]/" + r"/['\"]\s*\)")
+
+
+def strip_production(text: str) -> str:
+    """The shared production-scan pipeline (merged_bug_009): the
+    attribute-position cfg(test) pruner, then comments AND string
+    bodies blanked — newline-preserving throughout, so violation line
+    numbers are stable. Mid-file test modules are pruned in place;
+    production code after them stays in the scan."""
+    pruned = rust_strip.strip_cfg_test(text)
+    out, _ = rust_strip.lex(pruned, blank_string_bodies=True)
+    return out
 
 
 def check_registry(src_root: pathlib.Path):
@@ -156,7 +184,7 @@ def scan_refusal_folds(files):
     fails = []
     for rel, raw in files:
         lines = raw.splitlines()
-        stripped = strip_comments(raw)
+        stripped = strip_production(raw)
         for m in MATCHES_CODE.finditer(stripped):
             lineno = stripped[: m.start()].count("\n") + 1
             window = "\n".join(lines[max(0, lineno - 7) : lineno])
@@ -258,6 +286,12 @@ REFUSAL_SCAN_CRATES = ["rio-builder", "rio-store", "rio-gateway", "rio-scheduler
 def main() -> int:
     src_root = pathlib.Path(sys.argv[1])
 
+    # A broken shared lexer fails closed before any scan may gate.
+    lexer_err = rust_strip.selftest()
+    if lexer_err:
+        print(f"FAIL: shared lexer self-test — {lexer_err}", file=sys.stderr)
+        return 1
+
     # --- self-test arms (planted, must fail) ---------------------------
     # Arm A: the founding refusal plant reds under the negative census.
     f_a = scan_refusal_folds([("planted/pull.rs", FOUNDING_PLANT)])
@@ -287,6 +321,51 @@ def main() -> int:
     f_e = check_registry(pathlib.Path("/nonexistent-root"))
     if not any("missing" in x for x in f_e):
         print(f"FAIL: self-test arm E (registry rot) expected missing-anchor failures, got {f_e}", file=sys.stderr)
+        return 1
+    # Arm F (merged_bug_009, the SCOPE axis, planted at the outermost
+    # layer — raw source in, violations out): a production fold AFTER
+    # an early cfg(test) module. The old truncate-at-first-marker prune
+    # ended the scan at the test module, so this arm was a silent miss
+    # (the red the wave-9 corpus never planted); the attribute-position
+    # pruner resumes after the item and the fold fires.
+    scope_plant = (
+        "#[cfg(test)]\nmod tests {\n    fn t() { let _ = 1; }\n}\n"
+        "fn classify(code: tonic::Code) -> bool {\n"
+        "    matches!(code, tonic::Code::Internal)\n}\n"
+    )
+    f_f = scan_refusal_folds([("planted/scope.rs", scope_plant)])
+    if len(f_f) != 1:
+        print(f"FAIL: self-test arm F (production fold after early cfg(test)) expected 1 violation, got {f_f}", file=sys.stderr)
+        return 1
+    # ... and the cfg(test)-INTERIOR fold stays out of the population.
+    interior = "#[cfg(test)]\nmod tests {\n    fn t() { assert!(matches!(c, tonic::Code::Internal)); }\n}\n"
+    if scan_refusal_folds([("planted/interior.rs", interior)]):
+        print("FAIL: self-test arm F' — a cfg(test)-interior fold entered the production census", file=sys.stderr)
+        return 1
+    # Arm G (merged_bug_009, the LEXICAL axis): a block-comment fold
+    # must not fire, and a `//`-bearing URL inside a string must not
+    # eat the rest of the line (the naive per-line split truncated
+    # here — string-blind). The real fold beneath them must fire
+    # EXACTLY once.
+    lexical_plant = (
+        "/* commented out:\n   matches!(code, tonic::Code::Internal)\n*/\n"
+        'const DOCS: &str = "https://example.com/refusals"; // prose: matches!(code, tonic::Code::Aborted)\n'
+        "fn classify(code: tonic::Code) -> bool {\n"
+        "    matches!(code, tonic::Code::Unavailable)\n}\n"
+    )
+    f_g = scan_refusal_folds([("planted/lexical.rs", lexical_plant)])
+    if len(f_g) != 1 or "planted/lexical.rs:6" not in f_g[0]:
+        print(f"FAIL: self-test arm G (block-comment + url-in-string) expected exactly the line-6 violation, got {f_g}", file=sys.stderr)
+        return 1
+    # Arm H (the shadow-stripper ban's own red, W10-BY): a strawman
+    # scanner open-coding the line-comment split is flagged. The
+    # needle is concatenation-built so this file never carries it.
+    strawman = "def strip(text):\n    return text.split(" + '"/' + '/")[0]\n'
+    if not SHADOW_STRIPPER.search(strawman):
+        print("FAIL: self-test arm H (shadow-stripper ban) — the strawman open-coded stripper did not match", file=sys.stderr)
+        return 1
+    if SHADOW_STRIPPER.search('text.split("|")[0] + "//"'):
+        print("FAIL: self-test arm H' — the ban matched a non-stripper split", file=sys.stderr)
         return 1
 
     # Arm F: the WireSecs pacing-seam plants — DERIVED from the
@@ -328,12 +407,22 @@ def main() -> int:
     registered.add("nix/rust_strip.py")
     for f in sorted((src_root / "nix").glob("*.py")):
         rel = f"nix/{f.name}"
+        text = f.read_text()
         # Generators SELF-DESCRIBE in their module docstring (the
         # house pattern); body mentions (a CI matrix fixture naming a
         # check) are not self-description.
-        head = f.read_text()[:1500].lower()
+        head = text[:1500].lower()
         if ("census" in head or "lint" in head or "scanner" in head) and rel not in registered:
             fails.append(f"{rel}: generator-shaped scanner not enrolled in the census-corpora registry")
+        # The shadow-stripper ban (merged_bug_009): every scanner
+        # consumes the shared lexer; an open-coded line-comment split
+        # is the per-scanner lexing this meta-lint exists to kill.
+        for m in SHADOW_STRIPPER.finditer(text):
+            lineno = text[: m.start()].count("\n") + 1
+            fails.append(
+                f"{rel}:{lineno}: open-coded line-comment split — route through "
+                f"nix/rust_strip.py (lex/strip_cfg_test); shadow strippers are banned"
+            )
 
     md_fails, md_count = check_model_divergence(src_root)
     fails += md_fails
@@ -344,14 +433,14 @@ def main() -> int:
             rel = str(f.relative_to(src_root))
             # Production folds only: test dirs and in-file test mods
             # assert specific codes lawfully (the adjudication law
-            # governs production classification sites).
+            # governs production classification sites). In-file
+            # cfg(test) items are pruned ATTRIBUTE-POSITION inside
+            # scan_refusal_folds (rust_strip.strip_cfg_test) — the
+            # old truncate-at-first-marker walk left everything after
+            # an early test module unswept (merged_bug_009).
             if "/tests/" in rel or rel.endswith("test_helpers.rs"):
                 continue
-            raw = f.read_text()
-            cut = raw.find("#[cfg(test)]")
-            if cut != -1:
-                raw = raw[:cut]
-            refusal_files.append((rel, raw))
+            refusal_files.append((rel, f.read_text()))
     fails += scan_refusal_folds(refusal_files)
     fails += scan_wire_secs_seams(refusal_files)
 

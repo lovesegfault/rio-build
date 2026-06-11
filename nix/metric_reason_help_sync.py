@@ -27,6 +27,8 @@ import re
 import sys
 from collections import defaultdict
 
+import rust_strip
+
 CRATES = ["rio-gateway", "rio-store", "rio-scheduler", "rio-controller", "rio-builder"]
 
 # The enumerated-alphabet label keys (the label-key census). Inclusion
@@ -70,7 +72,11 @@ CONST_PATH = re.compile(r"^[A-Za-z_][\w]*(?:::[A-Za-z_][\w]*)*$")
 
 
 def strip_comments(text: str) -> str:
-    return "\n".join(line.split("//")[0] if "//" in line and '"//' not in line else line for line in text.splitlines())
+    # Shared exact lexer (merged_bug_009): comments blanked, string
+    # bodies KEPT — metric names, label keys, and values are read from
+    # the literals. Newline-preserving, so nothing shifts.
+    out, _ = rust_strip.lex(text, blank_string_bodies=False)
+    return out
 
 
 def squash(text: str) -> str:
@@ -182,6 +188,12 @@ def check(describes, emissions, dyn_emissions=(), field_inits=None, const_strs=N
 
 def main() -> int:
     src_root = pathlib.Path(sys.argv[1])
+
+    # A broken shared lexer fails closed before any scan may gate.
+    lexer_err = rust_strip.selftest()
+    if lexer_err:
+        print(f"FAIL: shared lexer self-test — {lexer_err}", file=sys.stderr)
+        return 1
 
     # Self-test: a planted mismatch MUST fire; a matching pair must not.
     d = {"rio_x_total": "Things (labeled by reason: good = fine)."}
