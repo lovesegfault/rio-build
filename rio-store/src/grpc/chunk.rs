@@ -9,11 +9,14 @@
 //! the server, which fans out [`GET_CHUNKS_K`] concurrent backend
 //! reads and streams chunks back in completion order).
 //!
-//! The retrieval RPCs are unscoped: knowing a BLAKE3 hash already
-//! proves you have (or had) the bytes, so the response discloses
-//! nothing new. `HasChunks` is different — presence is one *new* bit —
-//! and requires an authenticated caller (see
-//! [`ChunkServiceImpl::require_caller_identity`]).
+//! Every RPC requires an authenticated caller (see
+//! [`ChunkServiceImpl::require_caller_identity`]). The chunk namespace
+//! is global (dedup by design), so the gate is identity-only — no
+//! tenant scoping — but none of it is anonymous: `HasChunks` answers
+//! a presence bit the caller could not compute themselves, and the
+//! retrieval RPCs hand out the bytes for any digest that leaks
+//! (manifests, `StatBlob` chunk lists, logs travel separately from
+//! the content they name).
 
 use std::sync::Arc;
 
@@ -70,9 +73,9 @@ pub struct ChunkServiceImpl {
     /// disabled (all RPCs return FAILED_PRECONDITION); main.rs only
     /// constructs this when a chunk backend is configured.
     chunk_cache: Option<Arc<ChunkCache>>,
-    /// Verifier for the builder's HMAC assignment token —
-    /// `HasChunks`'s caller-identity gate. Same instance as
-    /// `DirectoryServiceImpl`'s.
+    /// Verifier for the builder's HMAC assignment token — the
+    /// caller-identity gate every ChunkService RPC passes through.
+    /// Same instance as `DirectoryServiceImpl`'s.
     hmac_verifier: Option<Arc<rio_auth::hmac::HmacVerifier>>,
 }
 
@@ -99,24 +102,28 @@ impl ChunkServiceImpl {
         })
     }
 
-    /// `HasChunks` caller-identity gate: a JWT (gateway path) or a
-    /// verified HMAC assignment token (builder path). The *answer* is
-    /// deliberately cross-tenant — chunk dedup is global by design —
-    /// but the *probe* must not be anonymous: presence is one bit the
-    /// caller could not compute themselves ("someone, somewhere, has
-    /// uploaded content with exactly these bytes"), which for a
-    /// sub-`FASTCDC_MIN_BYTES` file is a whole-file content-existence
-    /// oracle over candidate guesses. The retrieval RPCs (`GetChunk`,
-    /// `GetChunks`) stay unscoped — their response contains nothing
-    /// the caller couldn't already derive from the digest they sent.
-    // r[impl store.chunk.has-chunks-authenticated]
+    /// Caller-identity gate for every ChunkService RPC: a JWT (gateway
+    /// path) or a verified HMAC assignment token (builder path). The
+    /// *answer* is deliberately cross-tenant — chunk dedup is global by
+    /// design — but no request may be anonymous. For `HasChunks`,
+    /// presence is one bit the caller could not compute themselves
+    /// ("someone, somewhere, has uploaded content with exactly these
+    /// bytes"), which for a sub-`FASTCDC_MIN_BYTES` file is a
+    /// whole-file content-existence oracle over candidate guesses. For
+    /// `GetChunk`/`GetChunks` the stakes are higher: digests travel
+    /// separately from the bytes they name (chunk manifests, `StatBlob`
+    /// chunk lists, debug logs), so serving retrieval anonymously turns
+    /// any leaked digest into the plaintext — an anonymous cross-tenant
+    /// read oracle (the zot CVE-2024-39897 shape).
+    // r[impl store.chunk.has-chunks-authenticated+1]
     fn require_caller_identity<T>(&self, request: &Request<T>) -> Result<(), Status> {
-        // The verified identity is discarded: HasChunks is deliberately
-        // cross-tenant, so only the *existence* of an identity matters.
+        // The verified identity is discarded: the chunk namespace is
+        // deliberately cross-tenant, so only the *existence* of an
+        // identity matters.
         super::directory::caller_identity(
             request,
             self.hmac_verifier.as_ref(),
-            "HasChunks requires a caller identity: send a JWT or an HMAC \
+            "ChunkService requires a caller identity: send a JWT or an HMAC \
              assignment token",
         )
         .map(|_| ())
@@ -159,6 +166,9 @@ impl ChunkService for ChunkServiceImpl {
         request: Request<GetChunkRequest>,
     ) -> Result<Response<Self::GetChunkStream>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        // Identity before anything else — an anonymous caller learns
+        // neither chunk contents nor whether a chunk backend exists.
+        self.require_caller_identity(&request)?;
         let cache = self.require_cache()?;
         let digest = request.into_inner().digest;
         let hash = parse_digest(&digest)?;
@@ -207,6 +217,9 @@ impl ChunkService for ChunkServiceImpl {
         request: Request<Streaming<GetChunksRequest>>,
     ) -> Result<Response<Self::GetChunksStream>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        // Same identity-first ordering as GetChunk: the gate fires at
+        // stream-open, before any request frame is consumed.
+        self.require_caller_identity(&request)?;
         let cache = Arc::clone(self.require_cache()?);
         let requests = request.into_inner();
 

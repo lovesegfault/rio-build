@@ -21,28 +21,40 @@ use rio_proto::types::GetChunkRequest;
 use rio_store::cas::ChunkCache;
 use rio_store::grpc::ChunkServiceImpl;
 
-/// HMAC key for the `HasChunks` caller-identity gate. The probe is
-/// not tenant-scoped, but it must not be anonymous — see
-/// `ChunkServiceImpl::require_caller_identity`.
+/// HMAC key for the ChunkService caller-identity gate. The chunk
+/// namespace is not tenant-scoped, but no ChunkService RPC may be
+/// anonymous — see `ChunkServiceImpl::require_caller_identity`.
 const CHUNK_HMAC_KEY: &[u8] = b"chunk-service-test-key-32-bytes!";
 
-/// A `HasChunksRequest` carrying a valid builder assignment token.
-fn authed_has_chunks(digests: Vec<Vec<u8>>) -> tonic::Request<HasChunksRequest> {
-    let tok = rio_auth::hmac::HmacSigner::from_key(CHUNK_HMAC_KEY.to_vec()).sign(
-        &rio_auth::hmac::AssignmentClaims {
-            executor_id: "test".into(),
-            drv_hash: "00".repeat(32),
-            expected_outputs: vec![],
-            is_ca: false,
-            expiry_unix: 9_999_999_999,
-            tenant: Some(uuid::Uuid::nil().to_string()),
-            input_closure_digest: String::new(),
-        },
-    );
-    let mut r = tonic::Request::new(HasChunksRequest { digests });
+/// A key the server does NOT hold — tokens signed with it must be
+/// rejected exactly like anonymous requests.
+const FORGED_HMAC_KEY: &[u8] = b"not-the-server-key-aaaaaaaaaaaaa";
+
+/// Builder assignment token signed with `key`. Sign with
+/// [`CHUNK_HMAC_KEY`] for a valid token, any other key for a forged one.
+fn assignment_token(key: &[u8]) -> String {
+    rio_auth::hmac::HmacSigner::from_key(key.to_vec()).sign(&rio_auth::hmac::AssignmentClaims {
+        executor_id: "test".into(),
+        drv_hash: "00".repeat(32),
+        expected_outputs: vec![],
+        is_ca: false,
+        expiry_unix: 9_999_999_999,
+        tenant: Some(uuid::Uuid::nil().to_string()),
+        input_closure_digest: String::new(),
+    })
+}
+
+/// Wrap `msg` in a request carrying a valid builder assignment token.
+fn authed<T>(msg: T) -> tonic::Request<T> {
+    with_token(msg, &assignment_token(CHUNK_HMAC_KEY))
+}
+
+/// Wrap `msg` in a request carrying `token` verbatim.
+fn with_token<T>(msg: T, token: &str) -> tonic::Request<T> {
+    let mut r = tonic::Request::new(msg);
     r.metadata_mut().insert(
         rio_proto::ASSIGNMENT_TOKEN_HEADER,
-        tok.parse().expect("token is ASCII"),
+        token.parse().expect("token is ASCII"),
     );
     r
 }
@@ -128,9 +140,9 @@ async fn test_getchunk_after_putpath() -> TestResult {
     // GetChunk it back. Should succeed + return non-empty data.
     let mut stream = s
         .chunk
-        .get_chunk(GetChunkRequest {
+        .get_chunk(authed(GetChunkRequest {
             digest: hash.clone(),
-        })
+        }))
         .await?
         .into_inner();
     let mut got = Vec::new();
@@ -156,9 +168,9 @@ async fn test_getchunk_not_found() -> TestResult {
 
     let result = s
         .chunk
-        .get_chunk(GetChunkRequest {
+        .get_chunk(authed(GetChunkRequest {
             digest: vec![0xEE; 32],
-        })
+        }))
         .await;
     assert_eq!(
         result.expect_err("unknown chunk should fail").code(),
@@ -174,9 +186,9 @@ async fn test_getchunk_bad_digest_length() -> TestResult {
 
     let result = s
         .chunk
-        .get_chunk(GetChunkRequest {
+        .get_chunk(authed(GetChunkRequest {
             digest: vec![0xEE; 7],
-        })
+        }))
         .await;
     assert_eq!(
         result.expect_err("short digest should fail").code(),
@@ -185,12 +197,20 @@ async fn test_getchunk_bad_digest_length() -> TestResult {
     Ok(())
 }
 
-/// Inline-only store: ChunkService RPCs → FAILED_PRECONDITION.
+/// Inline-only store: ChunkService RPCs → FAILED_PRECONDITION for an
+/// authenticated caller (an anonymous one is rejected earlier — the
+/// identity gate runs before the cache guard).
 #[tokio::test]
 async fn test_chunkservice_no_cache_failed_precondition() -> TestResult {
     // Construct with cache=None explicitly.
     let db = TestDb::new(&MIGRATOR).await;
-    let chunk_service = ChunkServiceImpl::new(db.pool.clone(), None, None);
+    let chunk_service = ChunkServiceImpl::new(
+        db.pool.clone(),
+        None,
+        Some(Arc::new(rio_auth::hmac::HmacVerifier::from_key(
+            CHUNK_HMAC_KEY.to_vec(),
+        ))),
+    );
 
     let router = Server::builder().add_service(ChunkServiceServer::new(chunk_service));
     let (addr, server) = rio_test_support::grpc::spawn_grpc_server(router).await;
@@ -200,9 +220,9 @@ async fn test_chunkservice_no_cache_failed_precondition() -> TestResult {
     let mut client = ChunkServiceClient::new(channel);
 
     let get = client
-        .get_chunk(GetChunkRequest {
+        .get_chunk(authed(GetChunkRequest {
             digest: vec![0; 32],
-        })
+        }))
         .await;
     assert_eq!(
         get.expect_err("should fail").code(),
@@ -275,13 +295,13 @@ async fn test_shared_cache_warms_across_services() -> TestResult {
     Ok(())
 }
 
-/// Helper: GetChunk stream → flatten to bytes.
+/// Helper: authenticated GetChunk stream → flatten to bytes.
 async fn collect_get_chunk(
     client: &mut ChunkServiceClient<Channel>,
     digest: Vec<u8>,
 ) -> anyhow::Result<Vec<u8>> {
     let mut stream = client
-        .get_chunk(GetChunkRequest { digest })
+        .get_chunk(authed(GetChunkRequest { digest }))
         .await?
         .into_inner();
     let mut out = Vec::new();
@@ -299,10 +319,10 @@ use std::collections::HashMap;
 
 use rio_proto::types::GetChunksRequest;
 
-/// Helper: open a GetChunks bidi stream, send `frames` (each a list of
-/// digests), close the request side, and collect every `ChunkData`
-/// keyed by digest. Errors from the stream propagate so callers can
-/// assert on the abort code.
+/// Helper: open an authenticated GetChunks bidi stream, send `frames`
+/// (each a list of digests), close the request side, and collect every
+/// `ChunkData` keyed by digest. Errors from the stream propagate so
+/// callers can assert on the abort code.
 async fn collect_get_chunks(
     client: &mut ChunkServiceClient<Channel>,
     frames: Vec<Vec<Vec<u8>>>,
@@ -315,7 +335,7 @@ async fn collect_get_chunks(
     }
     drop(tx);
     let mut stream = client
-        .get_chunks(ReceiverStream::new(rx))
+        .get_chunks(authed(ReceiverStream::new(rx)))
         .await?
         .into_inner();
     let mut got: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
@@ -410,7 +430,13 @@ async fn test_getchunks_not_found_aborts() -> TestResult {
 #[tokio::test]
 async fn test_getchunks_no_cache_failed_precondition() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
-    let chunk_service = ChunkServiceImpl::new(db.pool.clone(), None, None);
+    let chunk_service = ChunkServiceImpl::new(
+        db.pool.clone(),
+        None,
+        Some(Arc::new(rio_auth::hmac::HmacVerifier::from_key(
+            CHUNK_HMAC_KEY.to_vec(),
+        ))),
+    );
     let router = Server::builder().add_service(ChunkServiceServer::new(chunk_service));
     let (addr, server) = rio_test_support::grpc::spawn_grpc_server(router).await;
     let channel = Channel::from_shared(format!("http://{addr}"))?
@@ -424,6 +450,109 @@ async fn test_getchunks_no_cache_failed_precondition() -> TestResult {
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
 
     server.abort();
+    Ok(())
+}
+
+// ===========================================================================
+// Caller-identity gate on the retrieval RPCs
+// ===========================================================================
+
+/// An anonymous (or forged-token) GetChunk is rejected with
+/// UNAUTHENTICATED before any backend read. Chunk digests travel
+/// outside the content they name (manifests, StatBlob chunk lists,
+/// logs), so digest knowledge alone must not be a read capability:
+/// an ungated GetChunk is an anonymous cross-tenant read oracle
+/// (the zot CVE-2024-39897 shape).
+// r[verify store.chunk.has-chunks-authenticated+1]
+#[tokio::test]
+async fn test_get_chunk_rejects_anonymous_and_forged_callers() -> TestResult {
+    let mut s = ChunkSession::new().await?;
+
+    // Seed a real chunk so the sentinel below proves the gate fired,
+    // not that the chunk was absent.
+    let (nar, info, _) = make_large_nar(60, 512 * 1024);
+    put_path(&mut s.store, info, nar).await?;
+    let hash: Vec<u8> = sqlx::query_scalar("SELECT blake3_hash FROM chunks LIMIT 1")
+        .fetch_one(&s.db.pool)
+        .await?;
+
+    // No token at all.
+    let err = s
+        .chunk
+        .get_chunk(GetChunkRequest {
+            digest: hash.clone(),
+        })
+        .await
+        .expect_err("anonymous GetChunk must be rejected");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    // A token signed with the wrong key.
+    let err = s
+        .chunk
+        .get_chunk(with_token(
+            GetChunkRequest {
+                digest: hash.clone(),
+            },
+            &assignment_token(FORGED_HMAC_KEY),
+        ))
+        .await
+        .expect_err("forged-token GetChunk must be rejected");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    // Vacuity sentinel: the same digest IS readable by an
+    // authenticated caller, so the rejections above are the auth gate
+    // firing, not the chunk being absent.
+    let got = collect_get_chunk(&mut s.chunk, hash).await?;
+    assert!(!got.is_empty(), "authenticated GetChunk still serves data");
+    Ok(())
+}
+
+/// Same gate on the bidi-stream variant: an anonymous (or
+/// forged-token) GetChunks call fails at stream-open, before any
+/// request frame is read.
+// r[verify store.chunk.has-chunks-authenticated+1]
+#[tokio::test]
+async fn test_get_chunks_rejects_anonymous_and_forged_callers() -> TestResult {
+    let mut s = ChunkSession::new().await?;
+    let (nar, info, _) = make_large_nar(60, 512 * 1024);
+    put_path(&mut s.store, info, nar).await?;
+    let hashes: Vec<Vec<u8>> = sqlx::query_scalar("SELECT blake3_hash FROM chunks")
+        .fetch_all(&s.db.pool)
+        .await?;
+
+    // No token at all.
+    let (tx, rx) = mpsc::channel(8);
+    tx.send(GetChunksRequest {
+        digests: hashes.clone(),
+    })
+    .await
+    .expect("fresh channel");
+    drop(tx);
+    let err = s
+        .chunk
+        .get_chunks(ReceiverStream::new(rx))
+        .await
+        .expect_err("anonymous GetChunks must be rejected");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    // A token signed with the wrong key. Empty request stream — the
+    // gate fires before any frame is consumed.
+    let (tx, rx) = mpsc::channel::<GetChunksRequest>(1);
+    drop(tx);
+    let err = s
+        .chunk
+        .get_chunks(with_token(
+            ReceiverStream::new(rx),
+            &assignment_token(FORGED_HMAC_KEY),
+        ))
+        .await
+        .expect_err("forged-token GetChunks must be rejected");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    // Vacuity sentinel: the same batch IS served to an authenticated
+    // caller.
+    let got = collect_get_chunks(&mut s.chunk, vec![hashes.clone()]).await?;
+    assert_eq!(got.len(), hashes.len(), "authenticated batch still serves");
     Ok(())
 }
 
@@ -473,12 +602,14 @@ async fn test_has_chunks_durable_only_presence() -> TestResult {
 
     let resp = s
         .chunk
-        .has_chunks(authed_has_chunks(vec![
-            durable.clone(),
-            wal_window.clone(),
-            dead.clone(),
-            absent.clone(),
-        ]))
+        .has_chunks(authed(HasChunksRequest {
+            digests: vec![
+                durable.clone(),
+                wal_window.clone(),
+                dead.clone(),
+                absent.clone(),
+            ],
+        }))
         .await?
         .into_inner();
     // Only bit 0 (durable, not deleted) is set.
@@ -493,14 +624,18 @@ async fn test_has_chunks_validation() -> TestResult {
 
     let err = s
         .chunk
-        .has_chunks(authed_has_chunks(vec![vec![0xEE; 7]]))
+        .has_chunks(authed(HasChunksRequest {
+            digests: vec![vec![0xEE; 7]],
+        }))
         .await
         .expect_err("short digest must be rejected");
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 
     let resp = s
         .chunk
-        .has_chunks(authed_has_chunks(Vec::new()))
+        .has_chunks(authed(HasChunksRequest {
+            digests: Vec::new(),
+        }))
         .await?
         .into_inner();
     assert!(resp.bitmap.is_empty(), "empty probe → empty bitmap");
@@ -513,9 +648,9 @@ async fn test_has_chunks_validation() -> TestResult {
 /// whole file is one chunk, so an unauthenticated probe would be a
 /// content-existence oracle over offline candidate guesses ("has
 /// anyone built a config containing exactly this secret?"). The
-/// retrieval RPCs stay anonymous — their response discloses nothing
-/// the digest didn't already prove.
-// r[verify store.chunk.has-chunks-authenticated]
+/// retrieval RPCs carry the same gate — see
+/// `test_get_chunk_rejects_anonymous_and_forged_callers`.
+// r[verify store.chunk.has-chunks-authenticated+1]
 #[tokio::test]
 async fn test_has_chunks_rejects_anonymous_and_forged_callers() -> TestResult {
     let mut s = ChunkSession::new().await?;
@@ -533,26 +668,14 @@ async fn test_has_chunks_rejects_anonymous_and_forged_callers() -> TestResult {
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
 
     // A token signed with the wrong key.
-    let forged = rio_auth::hmac::HmacSigner::from_key(b"not-the-server-key-aaaaaaaaaaaaa".to_vec())
-        .sign(&rio_auth::hmac::AssignmentClaims {
-            executor_id: "evil".into(),
-            drv_hash: "00".repeat(32),
-            expected_outputs: vec![],
-            is_ca: false,
-            expiry_unix: 9_999_999_999,
-            tenant: Some(uuid::Uuid::nil().to_string()),
-            input_closure_digest: String::new(),
-        });
-    let mut req = tonic::Request::new(HasChunksRequest {
-        digests: vec![durable.clone()],
-    });
-    req.metadata_mut().insert(
-        rio_proto::ASSIGNMENT_TOKEN_HEADER,
-        forged.parse().expect("token is ASCII"),
-    );
     let err = s
         .chunk
-        .has_chunks(req)
+        .has_chunks(with_token(
+            HasChunksRequest {
+                digests: vec![durable.clone()],
+            },
+            &assignment_token(FORGED_HMAC_KEY),
+        ))
         .await
         .expect_err("forged token must be rejected");
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
@@ -562,7 +685,9 @@ async fn test_has_chunks_rejects_anonymous_and_forged_callers() -> TestResult {
     // firing, not the chunk being absent.
     let resp = s
         .chunk
-        .has_chunks(authed_has_chunks(vec![durable]))
+        .has_chunks(authed(HasChunksRequest {
+            digests: vec![durable],
+        }))
         .await?
         .into_inner();
     assert_eq!(resp.bitmap, vec![0b0000_0001]);
@@ -587,7 +712,9 @@ async fn test_has_chunks_after_putpath_complete() -> TestResult {
 
     let resp = s
         .chunk
-        .has_chunks(authed_has_chunks(hashes.clone()))
+        .has_chunks(authed(HasChunksRequest {
+            digests: hashes.clone(),
+        }))
         .await?
         .into_inner();
     // Every chunk of the completed manifest is durable → every bit set.
