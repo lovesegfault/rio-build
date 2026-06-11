@@ -696,9 +696,10 @@ pub struct PoolStreaks {
 /// Consumers ([GEN-SET] — the W10-AP census commits this list):
 /// - `jobs::STALE_STRIKES` (`PoolScopedLedger<StrikeEntry>`): the
 ///   two-tick stale-Job confirmation, count-AND-floor by
-///   construction (the 20s wall-clock floor inherited from the
-///   sibling — Job event bursts deliver adjacent ticks milliseconds
-///   apart, which re-opened the priced in-flight-pull window).
+///   construction (the pull-surfacing wall floor — Job event bursts
+///   deliver adjacent ticks milliseconds apart, and a ms-apart second
+///   view cannot surface an in-flight pull; see STRIKE_WALL_FLOOR's
+///   derivation record).
 /// - [`PoolStreaks`] (`PoolScopedLedger<StreakEntry>` +
 ///   `PoolScopedLedger<RespawnEntry>`): the exhaustion-streak and
 ///   futility-breaker evidence maps (their bespoke retain laws stay

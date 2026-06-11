@@ -2218,14 +2218,30 @@ impl StrikeEntry {
 /// pool or a long-gone Job, and its adjacency has long since lapsed.
 const STRIKE_PRUNE_HORIZON: std::time::Duration = std::time::Duration::from_secs(3600);
 
-/// The wall-clock half of the strike firing law (merged_bug_140: the
-/// 20s floor inherited from the exhaustion-streak sibling). Two
-/// reconcile ticks are nominally ~10s apart, so the floor is inert on
-/// the timer cadence and bites exactly on event-burst adjacency.
+/// The wall-clock half of the strike firing law (merged_bug_140).
+/// RE-DERIVED from the hazard the floor owns (R5 divergence record,
+/// post-gate evidence): the two-tick confirmation exists so "any
+/// pull in flight at strike one surfaces in strike two's view" —
+/// Job-event bursts deliver adjacent ticks milliseconds apart, and
+/// two ms-apart views cannot surface anything. The floor therefore
+/// prices the PULL-SURFACING window: the strike-2 view must be
+/// mintable strictly after strike 1's evidence horizon =
+/// [`super::job::ATTEMPTS_VIEW_FRESHNESS`] (the 2s staleness license
+/// a deciding view may carry) + scheduler-side attempt-visibility
+/// slack + margin → 5s. The book's inherited hypothesis (the poison
+/// sibling's 20s) priced a DIFFERENT hazard — verdict PERSISTENCE
+/// for an irreversible report — and was falsified live: 20s on every
+/// stale-terminal NameCollision clear added a deterministic
+/// +10-20s per build-retry cycle (the fetcher-split fod-fail
+/// pipeline went 61.4s → 71.2s, twice, identical — over its 60s
+/// bound at every run). A reap is recoverable (the respawn follows);
+/// poison persistence pricing does not transfer. Two timer-cadence
+/// ticks (~10s) still clear the floor untouched; only sub-5s bursts
+/// defer — exactly the population whose second view proves nothing.
 /// VIOLABLE (R17): time axis only — the deferral it can add is
 /// bounded by the floor itself; cost/size/population axes N/A (the
 /// ledger's prune horizon is the memory envelope).
-const STRIKE_WALL_FLOOR: std::time::Duration = std::time::Duration::from_secs(20);
+const STRIKE_WALL_FLOOR: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Record a strike for `(pool, uid)` at `tick`: `previous + 1` when
 /// the row's stamp is adjacent by value, else a fresh run of 1 (the
@@ -2414,8 +2430,8 @@ pub(super) async fn reap_stale_for_intents(
                 info!(
                     pool, job = %jn, why, strikes = row.count,
                     "stale-Job classification deferred (live_051(e) \
-                     two-tick confirmation + the merged_bug_140 20s \
-                     wall floor; re-decided next tick)"
+                     two-tick confirmation + the merged_bug_140 \
+                     pull-surfacing wall floor; re-decided next tick)"
                 );
                 continue;
             }
@@ -3070,8 +3086,8 @@ mod tests {
         assert_eq!(burst2.count, 2, "event-burst adjacency counts...");
         assert!(
             !burst2.confirmed(burst_now),
-            "...but the 20s wall floor DEFERS millisecond-adjacent \
-             bursts (the in-flight-pull window stays priced)"
+            "...but the pull-surfacing wall floor DEFERS millisecond-\
+             adjacent bursts (a ms-apart second view proves nothing)"
         );
     }
 
