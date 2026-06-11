@@ -38,6 +38,14 @@ output "chunk_bucket_name" {
   value       = aws_s3_bucket.chunks.bucket
 }
 
+output "express_buckets_json" {
+  description = "JSON map: AZ name (topology.kubernetes.io/zone value, e.g. us-east-2a) -> S3 Express directory bucket (ADR-023 cache tier). JSON-encoded string because xtask's tofu::outputs keeps string-valued outputs only. xtask deploy passes it as --set-json store.chunkBackend.expressBuckets and flips chunkBackend.kind to tiered when non-empty; \"{}\" when express_az_ids = []."
+  value = jsonencode({
+    for id in var.express_az_ids :
+    local.az_id_to_name[id] => aws_s3_directory_bucket.express_cache[id].bucket
+  })
+}
+
 output "region" {
   description = "AWS region (scripts read this so they don't have to hardcode it)"
   value       = var.region

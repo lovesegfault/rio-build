@@ -91,6 +91,22 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
 
     let ecr = tf.get("ecr_registry")?;
     let bucket = tf.get("chunk_bucket_name")?;
+    // ADR-023: per-AZ S3 Express cache tier. JSON-encoded map of AZ
+    // name → directory bucket (string output because tofu::outputs
+    // keeps string values only). Absent output (tfstate predating
+    // s3-express.tf) or empty map → stay on kind=s3; non-empty →
+    // tiered backend + express initContainer + zone-preferred
+    // scheduling, all driven from the same map.
+    let express_buckets_json = tf
+        .get_opt("express_buckets_json")
+        .unwrap_or_else(|| "{}".into());
+    let express_zones: Vec<String> =
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&express_buckets_json)
+            .context("parse express_buckets_json tofu output")?
+            .keys()
+            .cloned()
+            .collect();
+    let express_zones_json = serde_json::to_string(&express_zones)?;
     let store_arn = tf.get("store_iam_role_arn")?;
     let scheduler_arn = tf.get("scheduler_iam_role_arn")?;
     let bootstrap_arn = tf.get("bootstrap_iam_role_arn")?;
@@ -340,6 +356,15 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             // rio-migrate is a plain Job, not a hook — it applies and
             // runs on every deploy regardless of this flag.
             .no_hooks(no_hooks);
+        if !express_zones.is_empty() {
+            helm_cmd = helm_cmd
+                .set("store.chunkBackend.kind", "tiered")
+                .set_json(
+                    "store.chunkBackend.expressBuckets",
+                    express_buckets_json.as_str(),
+                )
+                .set_json("karpenter.expressZones", express_zones_json.as_str());
+        }
         if let Some(arn) = &controller_arn {
             helm_cmd = helm_cmd.set(
                 r"controller.serviceAccount.annotations.eks\.amazonaws\.com/role-arn",

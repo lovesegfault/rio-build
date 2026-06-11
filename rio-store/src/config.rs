@@ -776,6 +776,44 @@ mod tests {
         });
     }
 
+    /// The EKS helm wiring splits `[chunk_backend]` across config
+    /// layers: kind/bucket/prefix arrive as `RIO_` env vars
+    /// (store.yaml), while the per-AZ `express_bucket` is written to
+    /// the TOML file layer by the express-bucket initContainer (pod
+    /// zone label → bucket lookup, ADR-023). The loader must merge the
+    /// table per-key across layers — a wholesale-replace would either
+    /// drop the express tier silently or fail tagged-enum
+    /// deserialization.
+    #[test]
+    fn chunk_backend_kind_env_plus_toml_express() {
+        rio_test_support::Jail::expect_with(|jail| {
+            jail.create_file(
+                "store.toml",
+                "[chunk_backend]\nexpress_bucket = \"rio-cache--use2-az1--x-s3\"\n",
+            )?;
+            jail.set_env("RIO_CHUNK_BACKEND__KIND", "tiered");
+            jail.set_env("RIO_CHUNK_BACKEND__BUCKET", "rio-chunks");
+            jail.set_env("RIO_CHUNK_BACKEND__PREFIX", "");
+            let cfg: Config = rio_common::config::load("store", CliArgs::default()).unwrap();
+            match cfg.chunk_backend {
+                ChunkBackendKind::Tiered {
+                    bucket,
+                    express_bucket,
+                    ..
+                } => {
+                    assert_eq!(bucket, "rio-chunks");
+                    assert_eq!(
+                        express_bucket.as_deref(),
+                        Some("rio-cache--use2-az1--x-s3"),
+                        "file-layer express_bucket must survive the env-layer merge"
+                    );
+                }
+                other => panic!("expected Tiered; got {other:?}"),
+            }
+            Ok(())
+        });
+    }
+
     /// `EXPRESS_BUCKET` env var omitted → `express_bucket: None`.
     /// Helm omits the var on AZs without S3 Express; the env layer must
     /// surface the absence as `None` (via `#[serde(default)]`) rather

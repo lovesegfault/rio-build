@@ -2,6 +2,7 @@
 {{- $s := .Values.store -}}
 {{- $cb := $s.chunkBackend | default dict -}}
 {{- $fsChunks := eq ($cb.kind | default "") "filesystem" -}}
+{{- $express := and (eq ($cb.kind | default "") "tiered") $cb.expressBuckets -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -51,6 +52,67 @@ spec:
       # hung process. Same shape as gateway.yaml's three-stage budget.
       terminationGracePeriodSeconds: {{ add 6 ($s.streamDrainSecs | default 90) 24 }}
       {{- include "rio.podSecurityContext" . | nindent 6 }}
+      {{- if $express }}
+      # ADR-023: PREFER the AZs that have an Express bucket so replicas
+      # actually get the cache tier. Preferred (not required) — AZs
+      # without Express must stay schedulable; a pod landing there runs
+      # local=None (plain S3-standard reads). kube-scheduler scores
+      # existing nodes by this, and Karpenter honors preferences when
+      # provisioning (relaxing them only when unsatisfiable).
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: topology.kubernetes.io/zone
+                    operator: In
+                    values: {{ keys $cb.expressBuckets | sortAlpha | toJson }}
+      # Per-AZ express bucket selection. The store binary takes ONE
+      # express_bucket; which one is per-pod knowledge (the node's AZ),
+      # so a Deployment-level env can't carry it. The pod's
+      # topology.kubernetes.io/zone POD label (PodTopologyLabels copies
+      # it from the node at binding; beta+default since k8s 1.34, EKS
+      # cluster is 1.35) is resolved here against the expressBuckets
+      # map and written as the /etc/rio/store.toml config layer — env
+      # vars (kind/bucket/prefix above) merge per-key on top. IMDS is
+      # NOT an option: nodes run IMDSv2 hop-limit 1 (karpenter.yaml),
+      # unreachable from pods by design. Zones absent from the map
+      # (and an absent label) write nothing → express_bucket None →
+      # tiered backend degrades to pass-through.
+      initContainers:
+        - name: express-bucket
+          # rio-bootstrap: the only rio image with a shell (control
+          # plane images are binary-only per sec.image.control-plane-
+          # minimal; this initContainer runs no rio code).
+          image: {{ include "rio.image" (list . .Values.bootstrap.image) }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          {{- include "rio.containerSecurityContext" . | nindent 10 }}
+          env:
+            - name: ZONE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['topology.kubernetes.io/zone']
+          command:
+            - /bin/bash
+            - -ec
+            - |
+              case "$ZONE" in
+              {{- range $zone, $bucket := $cb.expressBuckets }}
+                {{ $zone }}) bucket={{ $bucket | quote }} ;;
+              {{- end }}
+                *) bucket="" ;;
+              esac
+              if [ -n "$bucket" ]; then
+                printf '[chunk_backend]\nexpress_bucket = "%s"\n' "$bucket" > /etc/rio/store.toml
+                echo "zone $ZONE -> express bucket $bucket"
+              else
+                echo "zone ${ZONE:-unlabeled}: no express bucket; cache tier disabled (local=None)"
+              fi
+          volumeMounts:
+            - name: rio-etc
+              mountPath: /etc/rio
+      {{- end }}
       containers:
         - name: store
           image: {{ include "rio.image" (list . $s.image) }}
@@ -117,6 +179,15 @@ spec:
             {{- end }}
           volumeMounts:
             {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "jwtVerify" "serviceHmac" "assignmentHmac" "rdsCa")) | nindent 12 }}
+            {{- if $express }}
+            # /etc/rio/store.toml written by the express-bucket
+            # initContainer. Mounting the emptyDir at /etc/rio is safe
+            # alongside the /etc/rio/<sub> mounts above — each
+            # volumeMount is its own mount point; kubelet layers the
+            # subdirectory mounts over this one.
+            - name: rio-etc
+              mountPath: /etc/rio
+            {{- end }}
             {{- if $fsChunks }}
             # readOnlyRootFilesystem (rio.containerSecurityContext)
             # makes the image filesystem immutable — the filesystem
@@ -141,6 +212,10 @@ spec:
             {{- toYaml $s.resources | nindent 12 }}
       volumes:
         {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "jwtVerify" "serviceHmac" "assignmentHmac" "rdsCa")) | nindent 8 }}
+        {{- if $express }}
+        - name: rio-etc
+          emptyDir: {}
+        {{- end }}
         {{- if $fsChunks }}
         - name: chunks
           persistentVolumeClaim:

@@ -295,6 +295,17 @@ store:
     # base_dir would be unwritable). Set when kind=filesystem, e.g.
     # /var/lib/rio/chunks.
     baseDir: ""
+    # tiered backend only (ADR-023): map of AZ NAME (the pod's
+    # topology.kubernetes.io/zone label value, e.g. us-east-2a) → S3
+    # Express One Zone directory bucket for that AZ. Non-empty +
+    # kind=tiered renders the express-bucket initContainer (resolves
+    # the pod's zone label → bucket, writes /etc/rio/store.toml) and a
+    # PREFERRED zone affinity toward the listed AZs. Pods in AZs not
+    # in this map run with express_bucket unset (local=None — plain
+    # S3-standard reads, fully functional). EKS: xtask deploy passes
+    # the tofu express_buckets_json output as --set-json; never set
+    # for k3s (no Express off AWS).
+    expressBuckets: {}
     persistence:
       # filesystem backend only: rio-store-chunks PVC size. A PVC (not
       # emptyDir) because uploaded chunks are recorded durable=TRUE in
@@ -1107,6 +1118,16 @@ karpenter:
   # hwClasses.metal-{x86,arm}`) routed by §13b — there is no static
   # metal NodePool.
   metalSizes: [metal, metal-16xl, metal-24xl, metal-32xl, metal-48xl]
+
+  # ADR-023: AZ names that have an S3 Express bucket (keys of
+  # store.chunkBackend.expressBuckets; EKS: xtask deploy sets both from
+  # the same tofu output). Non-empty renders rio-general-express — a
+  # higher-weight clone of rio-general zone-restricted to these AZs.
+  # NodePool requirements are hard constraints, so "preferred" is
+  # expressed structurally: Karpenter tries the heavier pool first and
+  # falls back to the unrestricted rio-general on insufficient
+  # capacity — AZs without Express stay schedulable.
+  expressZones: []
 
   nodePools:
     # §13e: static `rio-fetcher` NodePool DELETED. Fetcher capacity is
