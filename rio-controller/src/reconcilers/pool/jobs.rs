@@ -78,6 +78,22 @@ pub(crate) const DEADLINE_SECS_ANNOTATION: &str = "rio.build/deadline-secs";
 /// NameCollision-blocking the re-solved intent forever.
 pub(crate) const INTENT_SELECTOR_ANNOTATION: &str = "rio.build/intent-selector";
 
+/// Pod-template annotation carrying the intent's `(h, cap)` cell list
+/// as `"h:cap"` rows joined by `","` (the house cell grammar —
+/// round-10 merged_bug_049). The DURABLE half of the re-ack lane's
+/// local inventory: a Pending Job whose intent is OFF the demand page
+/// (>page-limit backlog after a scheduler restart) re-arms the
+/// scheduler's `dispatched_cells` from this stamp — the in-memory map
+/// is armed only by acks, and without a full-set re-ack lane the
+/// heartbeat-edge ICE clear never re-arms for off-page Jobs
+/// (`ctrl.pool.ack-spawned-soundness` requires the re-ack; this stamp
+/// makes it page-independent). Written by [`build_job`] from the
+/// SPAWNED intent's `(hw_class_names[i], node_affinity[i])` zip;
+/// parsed by [`cells_from_annotation`]. Absent on pre-upgrade Jobs ⇒
+/// the bare `intent_id` re-ack (the legacy no-arm echo) — a one
+/// deploy-generation residual, disclosed at the re-ack assembly.
+pub(crate) const INTENT_CELLS_ANNOTATION: &str = "rio.build/intent-cells";
+
 /// Pod-template annotation carrying the controller's create-time
 /// bench-gate decision. `"true"` ⇒ the spawned builder runs the full
 /// K=3 microbench (STREAM/ioseq/alu) before accepting work. Read via
@@ -560,6 +576,7 @@ pub(super) fn evaluate_spawn_gate(
     streaks: &mut candidate::PoolStreaks,
     tick: candidate::StreakTick,
     key: &candidate::PoolKey,
+    coverage: DemandCoverage,
     now: std::time::Instant,
 ) -> SpawnGateOutcome {
     let (spawnable, to_report) = match universe {
@@ -620,7 +637,7 @@ pub(super) fn evaluate_spawn_gate(
             let obs = candidate::Observation::from_partition(&[], &wanted);
             // An empty gated set cannot fire (reports are drawn from
             // the observation's gated half) — drop the fire list.
-            let _ = streaks.step(tick, &obs, now);
+            let _ = streaks.step(tick, &obs, coverage, now);
             (wanted, Vec::new())
         }
         GateUniverse::Nodes(candidates) => {
@@ -639,7 +656,7 @@ pub(super) fn evaluate_spawn_gate(
             // drv leaves the intent stream (duplicate reports are
             // server-side no-ops).
             let obs = candidate::Observation::from_partition(&gated, &spawnable);
-            let fire = streaks.step(tick, &obs, now);
+            let fire = streaks.step(tick, &obs, coverage, now);
             let to_report: Vec<SpawnIntent> = gated
                 .into_iter()
                 .filter(|intent| fire.iter().any(|f| f == &intent.intent_id))
@@ -955,6 +972,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         &mut ctx.exhausted_streak.lock(),
         streak_tick,
         &streak_key,
+        evidence.coverage(),
         std::time::Instant::now(),
     );
     if !outcome.to_report.is_empty() {
@@ -1072,25 +1090,12 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // hit `SpawnOutcome::Failed` (apiserver 5xx, quota 403, webhook
     // reject) has no Job behind it; acking it would leak a
     // `dispatched_cells` entry until the housekeeping DAG-state sweep.
-    let pending_job_names: HashSet<String> = jobs
-        .items
-        .iter()
-        .filter(|j| is_pending_job(j))
-        .filter_map(|j| j.metadata.name.clone())
-        .filter(|n| !reaped.contains(n))
-        .collect();
-    let to_ack: Vec<SpawnIntent> = page
-        .iter_page()
-        .filter(|i| {
-            pending_job_names.contains(&pod::job_name(
-                &name,
-                pool.spec.kind,
-                &intent_suffix(&i.intent_id),
-            ))
-        })
-        .cloned()
-        .chain(spawned)
-        .collect();
+    // Round-10 merged_bug_049: derive from the Job LIST (the local
+    // complete inventory), not the page — restart totality holds
+    // independent of paging (off-page Pending Jobs re-ack via their
+    // own durable cell stamps). `assemble_re_acks` owns the lane.
+    let to_ack: Vec<SpawnIntent> =
+        assemble_re_acks(&page, &name, pool.spec.kind, &jobs.items, &reaped, spawned);
     if to_ack.is_empty() {
         debug!(pool = %name, queued, active = census.active, ?ceiling, "no Pending intents to ack");
     } else {
@@ -1394,7 +1399,7 @@ impl IntentPage {
 /// provably read it off the view (R26: the witness is consumed BY the
 /// test, not asserted beside it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DemandCoverage {
+pub enum DemandCoverage {
     /// The page IS the whole demand for this pool's filter.
     Complete,
     /// The page was truncated — membership absence is unknowable.
@@ -1609,6 +1614,141 @@ fn intent_suffix(intent_id: &str) -> String {
     // Degenerate (all-filtered) — pad so the resulting Job name is
     // still valid DNS-1123 (no trailing hyphen).
     if s.is_empty() { "0".into() } else { s }
+}
+
+/// Render the [`INTENT_CELLS_ANNOTATION`] value from a spawned
+/// intent: `zip(hw_class_names, node_affinity)` → `"h:cap"` rows,
+/// where `cap` is the value of the term's
+/// `karpenter.sh/capacity-type` `In` requirement. Returns `None`
+/// (skip the stamp, warn at the caller) when the zip is unrenderable
+/// — skewed lengths, a term without exactly one capacity value, or a
+/// name that would collide with the grammar (`:`/`,` are not legal in
+/// k8s label values, so a colliding name is config-invalid anyway).
+/// Fail-open: an unstamped Job degrades to the legacy no-arm re-ack,
+/// never a skewed echo (the scheduler refuses a whole ack on one
+/// undecodable entry — validate-then-commit).
+fn intent_cells_annotation_value(i: &SpawnIntent) -> Option<String> {
+    if i.hw_class_names.is_empty() || i.hw_class_names.len() != i.node_affinity.len() {
+        return None;
+    }
+    let mut rows = Vec::with_capacity(i.hw_class_names.len());
+    for (h, term) in i.hw_class_names.iter().zip(&i.node_affinity) {
+        if h.contains(':') || h.contains(',') {
+            return None;
+        }
+        let cap = term
+            .match_expressions
+            .iter()
+            .filter(|r| {
+                r.key == crate::reconcilers::nodeclaim_pool::ffd::CAPACITY_TYPE_LABEL
+                    && r.operator == "In"
+            })
+            .flat_map(|r| r.values.iter())
+            .collect::<Vec<_>>();
+        match cap.as_slice() {
+            [one] if !one.contains(':') && !one.contains(',') => rows.push(format!("{h}:{one}")),
+            _ => return None,
+        }
+    }
+    Some(rows.join(","))
+}
+
+/// Parse the [`INTENT_CELLS_ANNOTATION`] back into the
+/// `(hw_class_names, node_affinity)` echo pair — minimal terms (one
+/// `In` requirement on the capacity label per cell), which is exactly
+/// the shape the scheduler's arm decode consumes; pairing holds by
+/// construction (`names.len() == terms.len()` from one parsed list).
+/// `None` on an absent/garbled annotation (the legacy no-arm echo).
+fn cells_from_annotation(
+    v: &str,
+) -> Option<(Vec<String>, Vec<rio_proto::types::NodeSelectorTerm>)> {
+    let mut names = Vec::new();
+    let mut terms = Vec::new();
+    for row in v.split(',') {
+        let (h, cap) = row.split_once(':')?;
+        if h.is_empty() || cap.is_empty() {
+            return None;
+        }
+        names.push(h.to_string());
+        terms.push(rio_proto::types::NodeSelectorTerm {
+            match_expressions: vec![rio_proto::types::NodeSelectorRequirement {
+                key: crate::reconcilers::nodeclaim_pool::ffd::CAPACITY_TYPE_LABEL.into(),
+                operator: "In".into(),
+                values: vec![cap.to_string()],
+            }],
+        });
+    }
+    Some((names, terms))
+}
+
+/// The re-ack assembly (round-10 merged_bug_049, the R26 third-class
+/// close): `to_ack` DERIVES from the controller's own Job LIST — the
+/// local COMPLETE inventory — instead of filtering the demand page,
+/// so the `ctrl.pool.ack-spawned-soundness` restart-totality contract
+/// holds independent of paging. Per pending (non-reaped) Job:
+///
+/// - intent ON the page → the page copy (full-fidelity echo);
+/// - OFF-page → reconstructed from the Job's own stamps
+///   ([`INTENT_CELLS_ANNOTATION`] → the minimal decodable echo; the
+///   scheduler reads `intent_id` + the `(names, terms)` zip and
+///   nothing else from `spawned`);
+/// - off-page with NO stamp (pre-upgrade Job) → the bare `intent_id`
+///   (the legacy no-arm echo: `acked_spawned` witness lands, the arm
+///   is `Empty`) — a one deploy-generation residual, PRICED: bounded
+///   by the Job population spawned before this lane shipped, healed
+///   by each such Job's natural terminal/reap cycle.
+///
+/// Census row (W10-AH): continuity / derives-from-Job-LIST.
+// r[impl ctrl.pool.demand-completeness]
+// r[impl ctrl.pool.ack-spawned-soundness]
+pub(crate) fn assemble_re_acks(
+    page: &IntentPage,
+    pool: &str,
+    kind: ExecutorKind,
+    jobs: &[Job],
+    reaped: &HashSet<String>,
+    spawned: Vec<SpawnIntent>,
+) -> Vec<SpawnIntent> {
+    let page_by_name: HashMap<String, &SpawnIntent> = page
+        .iter_page()
+        .map(|i| (pod::job_name(pool, kind, &intent_suffix(&i.intent_id)), i))
+        .collect();
+    jobs.iter()
+        .filter(|j| is_pending_job(j))
+        .filter(|j| {
+            !j.metadata
+                .name
+                .as_deref()
+                .is_some_and(|n| reaped.contains(n))
+        })
+        .filter_map(|j| {
+            let name = j.metadata.name.as_deref()?;
+            if let Some(on_page) = page_by_name.get(name) {
+                return Some((*on_page).clone());
+            }
+            // Off-page: the Job LIST is the inventory; the stamps are
+            // the echo.
+            let intent_id = super::job::job_intent_id(j)?.to_string();
+            if intent_id.is_empty() {
+                return None;
+            }
+            let (hw_class_names, node_affinity) = j
+                .spec
+                .as_ref()
+                .and_then(|s| s.template.metadata.as_ref())
+                .and_then(|m| m.annotations.as_ref())
+                .and_then(|a| a.get(INTENT_CELLS_ANNOTATION))
+                .and_then(|v| cells_from_annotation(v))
+                .unwrap_or_default();
+            Some(SpawnIntent {
+                intent_id,
+                hw_class_names,
+                node_affinity,
+                ..Default::default()
+            })
+        })
+        .chain(spawned)
+        .collect()
 }
 
 /// Delete Jobs whose name collides with an intent we are about to
@@ -2390,6 +2530,20 @@ pub(super) fn build_job(
         .and_then(|m| m.annotations.as_mut())
         .expect("ephemeral_job sets template.metadata.annotations");
     pod_anns.insert(INTENT_ID_ANNOTATION.into(), intent.intent_id.clone());
+    // Round-10 merged_bug_049: the durable cell echo for the
+    // page-independent re-ack lane (see INTENT_CELLS_ANNOTATION).
+    // Fail-open on unrenderable zips — hw-agnostic intents
+    // (hw_class_names=[]) legitimately have no cells to stamp.
+    if let Some(cells) = intent_cells_annotation_value(intent) {
+        pod_anns.insert(INTENT_CELLS_ANNOTATION.into(), cells);
+    } else if !intent.hw_class_names.is_empty() {
+        warn!(
+            intent = %intent.intent_id,
+            "intent cells unrenderable (skewed names/affinity zip or \
+             grammar-colliding name); Job spawns unstamped — its \
+             off-page re-ack degrades to the no-arm echo"
+        );
+    }
     pod_anns.insert(
         DEADLINE_SECS_ANNOTATION.into(),
         ephemeral_deadline(intent).to_string(),
@@ -3844,6 +3998,73 @@ mod tests {
             "untainted hwClass → no per-intent toleration"
         );
     }
+
+    // r[verify ctrl.pool.demand-completeness]
+    /// The durable stamp round-trip: `build_job` writes
+    /// `rio.build/intent-cells` from the spawned intent's
+    /// `(hw_class_names, node_affinity)` zip, and the re-ack
+    /// reconstruction reads back exactly the cells the scheduler's arm
+    /// decode consumes (the `karpenter.sh/capacity-type` In requirement).
+    /// Hw-agnostic intents (no cells) spawn unstamped.
+    #[test]
+    fn intent_cells_annotation_round_trips_via_build_job() {
+        let mut i = intent("cellsrt");
+        i.hw_class_names = vec!["m7i".into(), "c8g".into()];
+        i.node_affinity = (0..2)
+            .map(|k| rio_proto::types::NodeSelectorTerm {
+                match_expressions: vec![
+                    rio_proto::types::NodeSelectorRequirement {
+                        key: "rio.build/hw-class".into(),
+                        operator: "In".into(),
+                        values: vec![format!("h{k}")],
+                    },
+                    rio_proto::types::NodeSelectorRequirement {
+                        key: "karpenter.sh/capacity-type".into(),
+                        operator: "In".into(),
+                        values: vec![if k == 0 {
+                            "spot".into()
+                        } else {
+                            "on-demand".into()
+                        }],
+                    },
+                ],
+            })
+            .collect();
+        let pool = test_pool("cells-pool", ExecutorKind::Builder);
+        let j = job(&pool, &i);
+        let anns = j
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .metadata
+            .as_ref()
+            .unwrap()
+            .annotations
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            anns.get(INTENT_CELLS_ANNOTATION).map(String::as_str),
+            Some("m7i:spot,c8g:on-demand"),
+            "the stamp is the (h, cap) zip in the house grammar"
+        );
+
+        // Hw-agnostic: no stamp (nothing to arm — the Empty echo is law).
+        let bare = intent("nocells");
+        let j = job(&pool, &bare);
+        let anns = j
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .metadata
+            .as_ref()
+            .unwrap()
+            .annotations
+            .as_ref()
+            .unwrap();
+        assert!(!anns.contains_key(INTENT_CELLS_ANNOTATION));
+    }
 }
 
 #[cfg(test)]
@@ -3974,11 +4195,12 @@ mod demand_lane_census {
     //! | `WantMap::for_pool` body walk        | absence mint  | snapshot-tolerant (projects the page INTO the witness-fused map) |
     //! | `HwSampledCache::fetch` fan-out      | page walk     | snapshot-tolerant (per-intent RPC union) |
     //! | spawn-candidate filter (`wanted`)    | page walk     | snapshot-tolerant (per-held-element; AD2 totality is per-held by design) |
-    //! | `to_ack` pending re-ack              | page walk     | continuity — INTERIM page-lane (restart-totality contract; WO-S4-3 derives it from the controller's own Job LIST) |
+    //! | `assemble_re_acks` page index        | continuity    | derives-from-Job-LIST (WO-S4-3: the lane's MEMBERSHIP comes from the controller's own Job LIST — the local complete inventory; the page walk here only builds the on-page full-fidelity echo index) |
     //! | `apply_placeable_gate` retain/clear  | page mutation | snapshot-tolerant (gate fold) |
     //! | `queued` count (`len_page`)          | page count    | snapshot-tolerant (bound law owns demand counting) |
     //! | reconcile `WantMap::for_pool` mint   | absence mint  | the R26 accessor's sole production constructor call |
     //! | reap loop `want.verdict(jn)`         | absence       | witness-fused verdict (suspends on `Unknowable`) |
+    //! | `PoolStreaks::step` expiry clock     | continuity    | witness-suspended (candidate.rs — the touched-staleness expiry suspends for the pool's entries while its view is `Incomplete`; W10-AM) |
     //!
     //! R22′ plants (BOTH evasion axes, red at the SCAN layer — the
     //! corpora are raw-source strings driven through the same

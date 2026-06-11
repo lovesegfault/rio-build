@@ -263,6 +263,13 @@ impl std::fmt::Display for PoolKey {
 /// job-pending, or absent from the stream) is unrepresentable as
 /// recovery. Zero headroom no longer skips the fold: the gate
 /// evaluates every wanted intent independent of the spawn window.
+/// Round-10 merged_bug_049 (R23' bind): "unrepresentable as recovery"
+/// holds across DEMAND-VIEW WINDOWS too --- the claim is carried by
+/// [`PoolStreaks::step`]'s coverage-gated expiry suspension (a
+/// page-excluded intent's evidence cannot expire while the pool's
+/// view is `Incomplete`), pinned by `w10_am_touched_expiry_suspends_
+/// while_view_incomplete` and filed in the W10-AH consumer census as
+/// continuity/witness-suspended --- not by this prose.
 #[must_use = "the streak tick must reach the gate fold's step (or be dropped) --- never stored"]
 pub struct StreakTick {
     key: PoolKey,
@@ -762,9 +769,40 @@ impl PoolStreaks {
         &mut self,
         tick: StreakTick,
         obs: &Observation,
+        coverage: crate::reconcilers::pool::jobs::DemandCoverage,
         now: std::time::Instant,
     ) -> Vec<String> {
         let StreakTick { key } = tick;
+        // Round-10 merged_bug_049 (R26 third class --- the
+        // evidence-expiry clock is a CONTINUITY consumer): while THIS
+        // pool's demand view is INCOMPLETE, a wanted intent may be
+        // page-excluded and therefore structurally unobservable to
+        // the fold --- jobless silence proves nothing, so the
+        // touched-staleness expiry SUSPENDS for this pool's entries
+        // (both streaks and respawn records) by refreshing `touched`
+        // at this observed-but-incomplete tick. The suspension
+        // composes per-pool: every pool refreshes its own entries at
+        // its own incomplete steps, so the cross-pool retain below
+        // still prunes pools that stopped stepping entirely (the
+        // merged_bug_073 memory bound survives). Streak FIRING is
+        // unaffected: a kept streak still needs evaluated-and-gated
+        // ticks to step, and a kept respawn record still resets only
+        // on a named resolution --- the suspension preserves ladder
+        // POSITION, never advances it.
+        // Census row (W10-AH): continuity / witness-suspended.
+        // r[impl ctrl.pool.demand-completeness]
+        if coverage == crate::reconcilers::pool::jobs::DemandCoverage::Incomplete {
+            for ((p, _), e) in self.entries.iter_mut() {
+                if p == &key {
+                    e.touched = now;
+                }
+            }
+            for ((p, _), r) in self.respawn.iter_mut() {
+                if p == &key {
+                    r.touched = now;
+                }
+            }
+        }
         // Staleness bound (merged_bug_073): with retain-without-step,
         // an entry unstepped for the expiry window is dead evidence
         // REGARDLESS of pool --- otherwise two stale observations plus
@@ -893,6 +931,22 @@ impl PoolStreaks {
                 r.touched = now;
             }
         }
+    }
+
+    /// Test-only: the respawn record's death count (ladder position),
+    /// `None` once expired/reset — the W10-AM suspension probe.
+    #[cfg(test)]
+    pub fn respawn_deaths(&self, pool: &PoolKey, intent: &str) -> Option<u32> {
+        self.respawn
+            .get(&(pool.clone(), intent.to_owned()))
+            .map(|r| r.deaths)
+    }
+
+    /// Test-only: streak-entry presence — the W10-AM suspension probe.
+    #[cfg(test)]
+    pub fn has_streak(&self, pool: &PoolKey, intent: &str) -> bool {
+        self.entries
+            .contains_key(&(pool.clone(), intent.to_owned()))
     }
 
     /// bug_028 futility breaker: apply one NAMED resolution --- the
@@ -1187,7 +1241,14 @@ mod tests {
         for _ in 0..4 {
             let tick = streaks.begin_tick(&key);
             let obs = Observation::from_partition(&gated, &[]);
-            fired |= !streaks.step(tick, &obs, now).is_empty();
+            fired |= !streaks
+                .step(
+                    tick,
+                    &obs,
+                    crate::reconcilers::pool::jobs::DemandCoverage::Complete,
+                    now,
+                )
+                .is_empty();
         }
         assert!(!fired, "a sub-second reconcile burst must not fire");
         // The SAME streak, aged past the floor: fires on its next
@@ -1196,7 +1257,12 @@ mod tests {
         let tick = streaks.begin_tick(&key);
         let obs = Observation::from_partition(&gated, &[]);
         assert_eq!(
-            streaks.step(tick, &obs, aged),
+            streaks.step(
+                tick,
+                &obs,
+                crate::reconcilers::pool::jobs::DemandCoverage::Complete,
+                aged
+            ),
             vec!["i1".to_owned()],
             "wall-clock-aged persistence must fire"
         );
@@ -1214,7 +1280,12 @@ mod tests {
         for i in 0..2 {
             let tick = streaks.begin_tick(&key);
             let obs = Observation::from_partition(&gated, &[]);
-            let _ = streaks.step(tick, &obs, t0 + std::time::Duration::from_secs(i * 10));
+            let _ = streaks.step(
+                tick,
+                &obs,
+                crate::reconcilers::pool::jobs::DemandCoverage::Complete,
+                t0 + std::time::Duration::from_secs(i * 10),
+            );
         }
         // Fold skipped this reconcile: witness minted then dropped.
         let dropped = streaks.begin_tick(&key);
@@ -1225,7 +1296,12 @@ mod tests {
         let tick = streaks.begin_tick(&key);
         let obs = Observation::from_partition(&gated, &[]);
         assert_eq!(
-            streaks.step(tick, &obs, t3),
+            streaks.step(
+                tick,
+                &obs,
+                crate::reconcilers::pool::jobs::DemandCoverage::Complete,
+                t3
+            ),
             vec!["i1".to_owned()],
             "a skipped fold must not break an aged streak"
         );
@@ -1243,18 +1319,110 @@ mod tests {
         let ka = PoolKey::new("ns-a", "metal");
         let kb = PoolKey::new("ns-b", "metal");
         let t = streaks.begin_tick(&ka); // ns-a tick 1
-        streaks.step(t, &Observation::from_partition(&gated, &[]), now);
+        streaks.step(
+            t,
+            &Observation::from_partition(&gated, &[]),
+            crate::reconcilers::pool::jobs::DemandCoverage::Complete,
+            now,
+        );
         let t = streaks.begin_tick(&kb); // ns-b tick 1 (distinct key)
-        let r = streaks.step(t, &Observation::from_partition(&gated, &[]), now);
+        let r = streaks.step(
+            t,
+            &Observation::from_partition(&gated, &[]),
+            crate::reconcilers::pool::jobs::DemandCoverage::Complete,
+            now,
+        );
         // Under colliding keys the second pool CONTINUES ns-a's streak
         // (streak 2 of a pool that observed once). Distinct keys would
         // leave both at streak 1 and this stays empty at tick 3 below
         // only if pools are independent.
         let t = streaks.begin_tick(&ka);
-        let r3 = streaks.step(t, &Observation::from_partition(&gated, &[]), now);
+        let r3 = streaks.step(
+            t,
+            &Observation::from_partition(&gated, &[]),
+            crate::reconcilers::pool::jobs::DemandCoverage::Complete,
+            now,
+        );
         assert!(
             r.is_empty() && r3.is_empty(),
             "two pools' interleaved ticks must not pool one streak: r={r:?} r3={r3:?}"
+        );
+    }
+
+    // r[verify ctrl.pool.demand-completeness]
+    /// **W10-AM (merged_bug_049, the continuity half).** PROPOSITION
+    /// at the off-page quantifier: while a pool's demand view is
+    /// INCOMPLETE, the 120s touched-staleness expiry SUSPENDS for that
+    /// pool's evidence --- a page-excluded still-wanted intent keeps
+    /// its streak AND its respawn-ladder position across windows
+    /// longer than the expiry. The COMPLETE twin pins that the expiry
+    /// semantics are unchanged when the page is the whole demand.
+    ///
+    /// Pre-fix red (suspension severed --- the coverage-blind step):
+    ///   assertion failed: incomplete view: the ladder position
+    ///   survives the window (pre-fix: wiped --- the next verdict-free
+    ///   death re-entered at 10s, the live_056-b cadence reset)
+    #[test]
+    fn w10_am_touched_expiry_suspends_while_view_incomplete() {
+        use crate::reconcilers::pool::jobs::DemandCoverage;
+        let key = PoolKey::new("rio-system", "metal");
+        let t0 = std::time::Instant::now();
+
+        // A respawn record whose backoff has fully run out (1 death =
+        // 10s window) --- expiry-eligible once jobless silence crosses
+        // 120s --- and a streak entry from an evaluated-gated tick.
+        let mk = || {
+            let mut s = PoolStreaks::default();
+            let _ = s.note_verdict_free_death(&key, "offpage", t0);
+            let tick = s.begin_tick(&key);
+            let obs = Observation::from_partition(&[intent_for("offpage", &["n1"])], &[]);
+            let _ = s.step(tick, &obs, DemandCoverage::Complete, t0);
+            s
+        };
+
+        // INCOMPLETE view at t0+121s, intent absent from the page
+        // (off the priority head; empty observation): both survive.
+        let mut s = mk();
+        let tick = s.begin_tick(&key);
+        let t_late = t0 + std::time::Duration::from_secs(121);
+        let _ = s.step(
+            tick,
+            &Observation::from_partition(&[], &[]),
+            DemandCoverage::Incomplete,
+            t_late,
+        );
+        assert!(
+            s.respawn_deaths(&key, "offpage").is_some(),
+            "incomplete view: the ladder position survives the window \
+             (pre-fix: wiped --- the next verdict-free death re-entered \
+             at 10s, the live_056-b cadence reset)"
+        );
+        assert!(
+            s.has_streak(&key, "offpage"),
+            "incomplete view: the exhaustion streak survives (pre-fix: \
+             wiped --- the bug_028 poison-report deferral re-opened one \
+             window over)"
+        );
+
+        // COMPLETE twin at the same instants: expiry semantics
+        // unchanged --- jobless silence past the window expires both.
+        let mut s = mk();
+        let tick = s.begin_tick(&key);
+        let _ = s.step(
+            tick,
+            &Observation::from_partition(&[], &[]),
+            DemandCoverage::Complete,
+            t_late,
+        );
+        assert!(
+            s.respawn_deaths(&key, "offpage").is_none(),
+            "complete view: the orphan expiry consumes jobless silence \
+             exactly as before"
+        );
+        assert!(
+            !s.has_streak(&key, "offpage"),
+            "complete view: stale streak evidence expires (merged_bug_\
+             073 --- stale evidence must not complete a poison)"
         );
     }
 }
@@ -1460,7 +1628,12 @@ mod proptests {
     ) -> Vec<String> {
         let tick = s.begin_tick(pool);
         let obs = Observation::from_partition(gated, spawnable);
-        s.step(tick, &obs, t)
+        s.step(
+            tick,
+            &obs,
+            crate::reconcilers::pool::jobs::DemandCoverage::Complete,
+            t,
+        )
     }
 
     /// A gated production-shaped intent with a caller-chosen id.
@@ -2117,7 +2290,12 @@ mod proptests {
         }
         let t_silent = t0 + std::time::Duration::from_secs(125);
         let tick = s.begin_tick(&key);
-        let _ = s.step(tick, &silence, t_silent);
+        let _ = s.step(
+            tick,
+            &silence,
+            crate::reconcilers::pool::jobs::DemandCoverage::Complete,
+            t_silent,
+        );
         assert!(
             s.respawn_blocked(&key, "wedge", t_silent),
             "left: expired mid-backoff (the FS-6 hazard the numeric \
@@ -2132,7 +2310,12 @@ mod proptests {
         let mut s2 = PoolStreaks::default();
         let _ = s2.note_verdict_free_death(&key, "ran-out", t0);
         let tick2 = s2.begin_tick(&key);
-        let _ = s2.step(tick2, &silence, t_silent);
+        let _ = s2.step(
+            tick2,
+            &silence,
+            crate::reconcilers::pool::jobs::DemandCoverage::Complete,
+            t_silent,
+        );
         // Re-death after expiry: the ladder restarts at 10s (deaths
         // would have been 2 → 20s had the record survived).
         let note = s2.note_verdict_free_death(&key, "ran-out", t_silent);
@@ -2150,7 +2333,12 @@ mod proptests {
             let _ = s3.note_verdict_free_death(&key, "gone", t0);
         }
         let tick3 = s3.begin_tick(&key);
-        let _ = s3.step(tick3, &silence, t_silent);
+        let _ = s3.step(
+            tick3,
+            &silence,
+            crate::reconcilers::pool::jobs::DemandCoverage::Complete,
+            t_silent,
+        );
         assert!(
             s3.respawn_blocked(
                 &key,

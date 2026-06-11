@@ -2080,6 +2080,7 @@ fn gate_evaluates_all_wanted_not_just_window() {
             &mut streaks,
             tick,
             &key,
+            DemandCoverage::Complete,
             now,
         );
         // The exhausted intent is EVALUATED and withheld every fold:
@@ -2155,6 +2156,7 @@ fn verdictless_respawn_backs_off_per_intent() {
             &mut streaks,
             tick,
             &key,
+            DemandCoverage::Complete,
             now,
         );
         if !outcome.spawnable.is_empty() {
@@ -2205,6 +2207,7 @@ fn verdict_resets_respawn_backoff() {
         &mut streaks,
         tick,
         &key,
+        DemandCoverage::Complete,
         now,
     );
     assert!(
@@ -2229,6 +2232,7 @@ fn verdict_resets_respawn_backoff() {
         &mut streaks,
         tick,
         &key,
+        DemandCoverage::Complete,
         now + std::time::Duration::from_secs(10),
     );
     assert_eq!(
@@ -2275,6 +2279,7 @@ fn two_gated_folds(
             streaks,
             tick,
             key,
+            DemandCoverage::Complete,
             now,
         );
         assert!(
@@ -2315,6 +2320,7 @@ fn list_failed_arm_withholds_live_streak_intents() {
         &mut streaks,
         tick,
         &key,
+        DemandCoverage::Complete,
         t0 + std::time::Duration::from_secs(20),
     );
     assert_eq!(
@@ -2367,6 +2373,7 @@ fn list_failed_blip_preserves_streak_to_fire() {
         &mut streaks,
         tick,
         &key,
+        DemandCoverage::Complete,
         t0 + std::time::Duration::from_secs(20),
     );
     let job_held = !blip.spawnable.is_empty();
@@ -2387,6 +2394,7 @@ fn list_failed_blip_preserves_streak_to_fire() {
         &mut streaks,
         tick,
         &key,
+        DemandCoverage::Complete,
         t0 + std::time::Duration::from_secs(30),
     );
     assert_eq!(
@@ -2431,6 +2439,7 @@ fn persistent_list_failure_restores_fail_open_after_expiry() {
         &mut streaks,
         tick,
         &key,
+        DemandCoverage::Complete,
         t0 + std::time::Duration::from_secs(140),
     );
     assert_eq!(
@@ -2563,7 +2572,15 @@ fn spawn_decision_census_covers_arm_by_evidence_product() {
                 ),
             };
             let tick = streaks.begin_tick(&key);
-            let outcome = evaluate_spawn_gate(wanted, &universe, &mut streaks, tick, &key, now);
+            let outcome = evaluate_spawn_gate(
+                wanted,
+                &universe,
+                &mut streaks,
+                tick,
+                &key,
+                DemandCoverage::Complete,
+                now,
+            );
             assert_eq!(
                 outcome.spawnable.iter().any(|i| i.intent_id == "drv-x"),
                 spawns,
@@ -2637,7 +2654,12 @@ fn phase_tick(
             let other = intent_named("drv-other");
             let obs = Observation::from_partition(&[], &[ours, other]);
             let tick = streaks.begin_tick(key);
-            let _ = streaks.step(tick, &obs, now);
+            let _ = streaks.step(
+                tick,
+                &obs,
+                crate::reconcilers::pool::jobs::DemandCoverage::Complete,
+                now,
+            );
         }
         CyclePhase::JobPending | CyclePhase::JobRunning | CyclePhase::TerminalUnreaped => {
             // The Job LIST sees the same-named Job (any phase) and the
@@ -2648,7 +2670,12 @@ fn phase_tick(
             let other = intent_named("drv-other");
             let obs = Observation::from_partition(&[], &[other]);
             let tick = streaks.begin_tick(key);
-            let _ = streaks.step(tick, &obs, now);
+            let _ = streaks.step(
+                tick,
+                &obs,
+                crate::reconcilers::pool::jobs::DemandCoverage::Complete,
+                now,
+            );
         }
         CyclePhase::ReapedAwaitingRespawn => {
             // The reap notes the verdict-free death (re-anchor), then
@@ -2657,14 +2684,24 @@ fn phase_tick(
             let other = intent_named("drv-other");
             let obs = Observation::from_partition(&[], &[other]);
             let tick = streaks.begin_tick(key);
-            let _ = streaks.step(tick, &obs, now);
+            let _ = streaks.step(
+                tick,
+                &obs,
+                crate::reconcilers::pool::jobs::DemandCoverage::Complete,
+                now,
+            );
         }
         CyclePhase::JoblessUnevaluated => {
             // Fold-skip silence for drv-x: only the sibling folds.
             let other = intent_named("drv-other");
             let obs = Observation::from_partition(&[], &[other]);
             let tick = streaks.begin_tick(key);
-            let _ = streaks.step(tick, &obs, now);
+            let _ = streaks.step(
+                tick,
+                &obs,
+                crate::reconcilers::pool::jobs::DemandCoverage::Complete,
+                now,
+            );
         }
     }
 }
@@ -4346,4 +4383,103 @@ fn w10_ak_disposition_consumers_match_exhaustively() {
         "no if-let escape hatch between the FFD letter producer and \
          the demand law (R25)"
     );
+}
+
+// r[verify ctrl.pool.demand-completeness]
+// r[verify ctrl.pool.ack-spawned-soundness]
+/// **W10-AL (merged_bug_049, the re-ack half).** PROPOSITION at the
+/// off-page quantifier: after a scheduler restart under >page-limit
+/// backlog, EVERY pending Job re-acks — the lane derives from the
+/// controller's own Job LIST (the local complete inventory), not the
+/// page. Off-page Jobs reconstruct their echo from the durable cell
+/// stamp (`rio.build/intent-cells`); on-page Jobs send the
+/// full-fidelity page copy; pre-upgrade (unstamped) Jobs degrade to
+/// the bare-id no-arm echo (the priced one-generation residual);
+/// reaped names are excluded; freshly-spawned intents chain.
+///
+/// Pre-fix red (the page-filter form — off-page lane severed):
+///   assertion failed: off-page pending Job re-acked from the LIST
+///   (pre-fix: absent — dispatched_cells never re-armed, the
+///   heartbeat-edge ICE clear dead after restart)
+#[test]
+fn w10_al_re_ack_derives_from_job_list_independent_of_paging() {
+    use crate::reconcilers::pool::jobs::{INTENT_CELLS_ANNOTATION, assemble_re_acks};
+
+    let pending_with = |name: &str, intent_id: &str, cells: Option<&str>| {
+        let mut j = pending_job(name, 0, 30);
+        let mut anns = BTreeMap::from([(INTENT_ID_ANNOTATION.to_string(), intent_id.to_string())]);
+        if let Some(c) = cells {
+            anns.insert(INTENT_CELLS_ANNOTATION.to_string(), c.to_string());
+        }
+        j.spec = Some(JobSpec {
+            template: PodTemplateSpec {
+                metadata: Some(ObjectMeta {
+                    annotations: Some(anns),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        j
+    };
+
+    // Page holds ONLY "onpage" (the >2048 regime: everything else
+    // rotated off). Jobs: on-page, off-page stamped, off-page
+    // pre-upgrade, and one reaped-this-tick.
+    let page = IntentPage::for_test(vec![intent_named("onpage")]);
+    let jobs = vec![
+        pending_with("rio-builder-p-onpage", "onpage", Some("m7i:spot")),
+        pending_with(
+            "rio-builder-p-offpage",
+            "offpage",
+            Some("m7i:spot,c8g:on-demand"),
+        ),
+        pending_with("rio-builder-p-legacy", "legacy", None),
+        pending_with("rio-builder-p-reaped", "reapedid", Some("m7i:spot")),
+    ];
+    let reaped: HashSet<String> = ["rio-builder-p-reaped".to_string()].into();
+    let spawned = vec![intent_named("fresh")];
+
+    let acks = assemble_re_acks(&page, "p", ExecutorKind::Builder, &jobs, &reaped, spawned);
+    let by_id: std::collections::HashMap<&str, &SpawnIntent> =
+        acks.iter().map(|i| (i.intent_id.as_str(), i)).collect();
+
+    assert!(
+        by_id.contains_key("offpage"),
+        "off-page pending Job re-acked from the LIST (pre-fix: absent \
+         — dispatched_cells never re-armed, the heartbeat-edge ICE \
+         clear dead after restart)"
+    );
+    let off = by_id["offpage"];
+    assert_eq!(
+        off.hw_class_names,
+        vec!["m7i".to_string(), "c8g".to_string()],
+        "reconstructed names from the durable stamp"
+    );
+    assert_eq!(
+        off.node_affinity.len(),
+        2,
+        "paired minimal terms (names.len == terms.len by construction \
+         — the scheduler's skew refusal is unreachable from this lane)"
+    );
+    assert_eq!(
+        off.node_affinity[1].match_expressions[0].values,
+        vec!["on-demand".to_string()],
+        "capacity value rides the In requirement the arm decode reads"
+    );
+    assert!(by_id.contains_key("onpage"), "on-page re-ack (page copy)");
+    let legacy = by_id["legacy"];
+    assert!(
+        legacy.hw_class_names.is_empty() && legacy.node_affinity.is_empty(),
+        "pre-upgrade Job degrades to the bare-id no-arm echo (priced \
+         one-generation residual)"
+    );
+    assert!(
+        !by_id.contains_key("reapedid"),
+        "names reaped this tick are excluded (ctrl.pool.ack-spawned-\
+         soundness)"
+    );
+    assert!(by_id.contains_key("fresh"), "spawned intents chain");
+    assert_eq!(acks.len(), 4, "exactly the four lawful acks");
 }
