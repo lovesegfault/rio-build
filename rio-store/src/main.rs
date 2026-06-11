@@ -186,7 +186,7 @@ async fn main() -> anyhow::Result<()> {
     let substituter = {
         let mut s = Substituter::new(pool.clone(), chunk_backend)
             .with_chunk_upload_max_concurrent(cfg.chunk_upload_max_concurrent)
-            .with_nar_bytes_budget(store_service.nar_bytes_budget().clone())
+            .with_nar_budget(store_service.nar_budget().clone())
             .with_admission_gate(substitute_admission.clone())
             .with_stall_window(cfg.substitute_stall);
         if let Some(signer) = store_service.signer() {

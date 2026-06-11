@@ -697,8 +697,8 @@ impl StoreServiceImpl {
         // saturation longer than the grace converts from an unbounded
         // client hang into a typed shed.
         let acquire = self
-            .nar_bytes_budget
-            .acquire_many(nar_chunk_charge(chunk.len()) as u32);
+            .nar_budget
+            .acquire_chunk(nar_chunk_charge(chunk.len()) as u32);
         let permit =
             match tokio::time::timeout(self.nar_ingest_envelope.budget_wait_grace, acquire).await {
                 Ok(r) => r.map_err(|_| Status::resource_exhausted("NAR buffer budget closed"))?,
@@ -754,8 +754,7 @@ impl StoreServiceImpl {
         ctx_label: &str,
     ) -> Result<NarIngestHold<'_>, Status> {
         let charge = crate::budget::DeclaredCharge::new(
-            std::sync::Arc::clone(&self.nar_bytes_budget),
-            &self.tenant_ledger,
+            &self.nar_budget,
             charge_tenant,
             crate::budget::TENANT_RESERVATION_CAP,
             declared,

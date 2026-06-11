@@ -230,22 +230,17 @@ pub struct StoreServiceImpl {
     /// handler drop. Default `8 * MAX_NAR_SIZE` (32 GiB) — lets 8× max-size
     /// uploads run in parallel before the 9th blocks. Configurable via
     /// `store.toml nar_buffer_budget_bytes` (or `.with_nar_budget()` in
-    /// tests). main.rs wires this same `Arc<Semaphore>` into the
-    /// `Substituter` so both ingest paths draw from one pool.
+    /// tests). main.rs wires this same sealed [`crate::budget::NarBudget`]
+    /// into the `Substituter` so both ingest paths draw from one pool
+    /// under one tenant ledger (the raw semaphore is module-private
+    /// to `crate::budget` — merged_bug_005's seal).
     ///
     /// NOT shared with GetPath's chunk cache — that's moka-bounded separately
     /// (chunk_cache above). This bounds ONLY the per-request accumulation
     /// Vec, which is the OOM vector: 10 × 4 GiB = 40 GiB RSS.
     // r[impl store.put.nar-bytes-budget+6]
-    nar_bytes_budget: Arc<tokio::sync::Semaphore>,
-    /// Cost-axis accounting for DECLARED-mode reservations against
-    /// `nar_bytes_budget` (merged_bug_005): consulted by the one
-    /// `DeclaredCharge` constructor so a single tenant's aggregate
-    /// declared charge is capped at `crate::budget::
-    /// TENANT_RESERVATION_CAP` — trailer mode stays delivery-priced
-    /// and outside it.
     // r[impl store.budget.cost-axis]
-    tenant_ledger: crate::budget::TenantReservationLedger,
+    nar_budget: crate::budget::NarBudget,
     /// Typed envelope knobs for the ingest plane's budget waits and
     /// holds ([`NarIngestEnvelopeCfg`]) — wait grace at the
     /// `accumulate_chunk` chokepoint, hold envelope over stream
@@ -353,8 +348,7 @@ impl StoreServiceImpl {
             hmac_verifier: None,
             service_verifier: None,
             service_bypass_callers: vec!["rio-gateway".to_string(), "rio-scheduler".to_string()],
-            nar_bytes_budget: Arc::new(tokio::sync::Semaphore::new(DEFAULT_NAR_BUDGET)),
-            tenant_ledger: crate::budget::TenantReservationLedger::default(),
+            nar_budget: crate::budget::NarBudget::new(DEFAULT_NAR_BUDGET),
             nar_ingest_envelope: NarIngestEnvelopeCfg::default(),
             substituter: None,
             chunk_upload_max_concurrent: cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
@@ -438,9 +432,8 @@ impl StoreServiceImpl {
     /// concurrent PutPath handlers). Builder-style. Tests use small values
     /// (e.g., `10 * 4096`) to exercise backpressure without 32 GiB of RAM.
     pub fn with_nar_budget(mut self, bytes: usize) -> Self {
-        self.nar_bytes_budget = Arc::new(tokio::sync::Semaphore::new(
-            rio_common::semaphore_permits(bytes as u64),
-        ));
+        self.nar_budget =
+            crate::budget::NarBudget::new(rio_common::semaphore_permits(bytes as u64));
         self
     }
 
@@ -473,11 +466,13 @@ impl StoreServiceImpl {
         Arc::clone(&self.active_get_path_streams)
     }
 
-    /// Borrow the NAR-bytes budget semaphore. main.rs clones this into
-    /// the `Substituter` so PutPath and substitution share ONE pool;
-    /// tests inspect it to assert backpressure.
-    pub fn nar_bytes_budget(&self) -> &Arc<tokio::sync::Semaphore> {
-        &self.nar_bytes_budget
+    /// Borrow the sealed NAR budget. main.rs clones this into the
+    /// `Substituter` so PutPath and substitution share ONE pool under
+    /// ONE tenant ledger (clones share identity — merged_bug_005);
+    /// tests inspect `available_permits` to assert backpressure (the
+    /// read face; reads are not debits).
+    pub fn nar_budget(&self) -> &crate::budget::NarBudget {
+        &self.nar_budget
     }
 
     /// Verify `x-rio-service-token` and return the allowlisted caller

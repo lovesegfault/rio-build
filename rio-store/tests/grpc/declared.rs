@@ -47,7 +47,7 @@ fn trailer_msg(info: &ValidatedPathInfo, size: u64) -> PutPathRequest {
 }
 
 /// Poll until `budget.available_permits()` equals `target` (or ~2s).
-async fn wait_permits(budget: &Arc<tokio::sync::Semaphore>, target: usize) -> usize {
+async fn wait_permits(budget: &rio_store::budget::NarBudget, target: usize) -> usize {
     for _ in 0..200 {
         let n = budget.available_permits();
         if n == target {
@@ -73,7 +73,7 @@ async fn declared_upload_reserves_single_shot_pre_stream() -> TestResult {
     // Inline session built by hand so the budget Arc is observable.
     let db = TestDb::new(&MIGRATOR).await;
     let service = StoreServiceImpl::new(db.pool.clone());
-    let budget = service.nar_bytes_budget().clone();
+    let budget = service.nar_budget().clone();
     let (mut client, _server) = spawn_store_server(service).await?;
 
     let (nar, info) = declared_fixture("declared-census");

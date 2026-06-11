@@ -13,9 +13,9 @@
 //!   carried by the acquisition itself: (tenant, ledger, cap) bind
 //!   BEFORE any grant.
 //!
-//! [`DeclaredCharge`] is the ONE constructor for declaration-priced
+//! `DeclaredCharge` is the ONE constructor for declaration-priced
 //! acquisition — both reservation modes (the substitute leg's
-//! [`crate::substitute::NarBudgetReservation`] and PutPath's
+//! `substitute::NarBudgetReservation` and PutPath's
 //! `reserve_declared`) construct it, and its signature REQUIRES the
 //! cost axis. A new declaration-priced consumer structurally cannot
 //! acquire without consulting the ledger (wave-9's `reserve_declared`
@@ -96,6 +96,68 @@ pub(crate) fn declared_charge_tenant(claims: Option<&rio_auth::hmac::AssignmentC
             }
         },
         None => UNATTRIBUTED_DECLARED_BUCKET,
+    }
+}
+
+// r[impl store.budget.cost-axis]
+/// THE sealed NAR-byte budget home (merged_bug_005's R24 seal — the
+/// module boundary, named): the raw `tokio::sync::Semaphore` is a
+/// MODULE-PRIVATE field of this type, so `add_permits`/`forget`/bare
+/// `acquire_many`/`acquire_many_owned` against the pool are
+/// UNWRITABLE outside `crate::budget`. The only debit paths:
+///
+/// - `DeclaredCharge::new` — declaration-priced (whole charge up
+///   front from a wire-supplied size); the cost axis `(tenant, cap)`
+///   is REQUIRED by the signature and the ledger consult is fused
+///   into the acquisition (this type OWNS the ledger — a caller
+///   cannot pair the pool with the wrong accounting).
+/// - `NarBudget::acquire_chunk` — delivery-priced (trailer mode's
+///   per-chunk accrual; permits track bytes actually received). Its
+///   one chokepoint (`accumulate_chunk`) times every wait with
+///   `BUDGET_WAIT_GRACE` and sheds typed.
+///
+/// Reads are not debits: [`Self::available_permits`] is the
+/// test/gauge face. `Clone` shares IDENTITY (one `Arc` semaphore,
+/// one `Arc`-backed ledger) — main.rs wires ONE instance into both
+/// ingest planes so PutPath and substitution draw from one pool
+/// under one cost accounting.
+#[derive(Debug, Clone)]
+pub struct NarBudget {
+    /// The raw pool. PRIVATE — see the type doc: the seal is this
+    /// field's visibility.
+    semaphore: Arc<Semaphore>,
+    /// The cost-axis accounting (one instance per pool, by
+    /// construction).
+    ledger: TenantReservationLedger,
+}
+
+impl NarBudget {
+    /// A fresh pool of `permits` byte-permits with its own (empty)
+    /// tenant ledger.
+    pub fn new(permits: usize) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(permits)),
+            ledger: TenantReservationLedger::default(),
+        }
+    }
+
+    /// The delivery-priced per-chunk debit face (trailer mode): a
+    /// plain `acquire_many` future for `charge` permits. The caller's
+    /// chokepoint (`accumulate_chunk`) bounds the wait with
+    /// `BUDGET_WAIT_GRACE` and sheds typed on elapse — pricing is the
+    /// delivered bytes themselves, so no per-tenant ledger consult
+    /// (an attacker pays bandwidth; the cost axis is real).
+    pub(crate) fn acquire_chunk(
+        &self,
+        charge: u32,
+    ) -> impl Future<Output = Result<tokio::sync::SemaphorePermit<'_>, tokio::sync::AcquireError>>
+    {
+        self.semaphore.acquire_many(charge)
+    }
+
+    /// Read-only pool headroom (tests/gauges). Reads are not debits.
+    pub fn available_permits(&self) -> usize {
+        self.semaphore.available_permits()
     }
 }
 
@@ -202,16 +264,19 @@ pub(crate) struct DeclaredCharge {
 
 impl DeclaredCharge {
     /// Acquire `declared.max(MIN_NAR_CHUNK_CHARGE)` permits in one
-    /// shot, charging `tenant` on `ledger` against `cap` FIRST: an
-    /// over-cap tenant is REFUSED typed, never queued — the wait
-    /// edge gains no new population. `on_park` runs after the ledger
-    /// admits and before the (possibly parking) semaphore acquire —
-    /// the substitute leg stamps `ClaimPhase::BudgetParked` there;
-    /// the park itself is the lawful unbounded zero-holding wait
-    /// (waiters park free; holders expire).
+    /// shot, charging `tenant` on the budget's OWN ledger against
+    /// `cap` FIRST: an over-cap tenant is REFUSED typed, never
+    /// queued — the wait edge gains no new population. `on_park`
+    /// runs after the ledger admits and before the (possibly
+    /// parking) semaphore acquire — the substitute leg stamps
+    /// `ClaimPhase::BudgetParked` there; the park itself is the
+    /// lawful unbounded zero-holding wait (waiters park free;
+    /// holders expire). The ledger is the budget's module-private
+    /// field (one pool = one accounting; a caller cannot pair the
+    /// pool with a wrong or fresh ledger), `cap` stays explicit —
+    /// the R17 violability lane each plane owns.
     pub(crate) async fn new(
-        budget: Arc<Semaphore>,
-        ledger: &TenantReservationLedger,
+        budget: &NarBudget,
         tenant: Uuid,
         cap: u64,
         declared: u64,
@@ -226,9 +291,11 @@ impl DeclaredCharge {
             });
         }
         let charge = declared.max(u64::from(MIN_NAR_CHUNK_CHARGE)) as u32;
-        let tenant_charge = ledger.checked_charge(tenant, u64::from(charge), cap)?;
+        let tenant_charge = budget
+            .ledger
+            .checked_charge(tenant, u64::from(charge), cap)?;
         on_park();
-        let permits = budget
+        let permits = Arc::clone(&budget.semaphore)
             .acquire_many_owned(charge)
             .await
             .map_err(|_| DeclaredRefusal::BudgetClosed)?;
@@ -250,44 +317,21 @@ mod tests {
     /// headroom; releases restore headroom.
     #[tokio::test]
     async fn declared_charges_aggregate_per_tenant() {
-        let pool = Arc::new(Semaphore::new(8 * MAX_NAR_SIZE as usize));
-        let ledger = TenantReservationLedger::default();
+        let budget = NarBudget::new(8 * MAX_NAR_SIZE as usize);
         let t = Uuid::from_u128(1);
         let u = Uuid::from_u128(2);
         let big = MAX_NAR_SIZE - 1;
 
-        let c1 = DeclaredCharge::new(
-            Arc::clone(&pool),
-            &ledger,
-            t,
-            TENANT_RESERVATION_CAP,
-            big,
-            || {},
-        )
-        .await
-        .expect("charge 1 within cap");
-        let _c2 = DeclaredCharge::new(
-            Arc::clone(&pool),
-            &ledger,
-            t,
-            TENANT_RESERVATION_CAP,
-            big,
-            || {},
-        )
-        .await
-        .expect("charge 2 within cap (2 x (4GiB-1) < 8GiB)");
+        let c1 = DeclaredCharge::new(&budget, t, TENANT_RESERVATION_CAP, big, || {})
+            .await
+            .expect("charge 1 within cap");
+        let _c2 = DeclaredCharge::new(&budget, t, TENANT_RESERVATION_CAP, big, || {})
+            .await
+            .expect("charge 2 within cap (2 x (4GiB-1) < 8GiB)");
 
         // Charge 3 refuses at the AGGREGATE even at minimum size —
         // the per-charge axis cannot launder the cost axis.
-        let refused = DeclaredCharge::new(
-            Arc::clone(&pool),
-            &ledger,
-            t,
-            TENANT_RESERVATION_CAP,
-            1,
-            || {},
-        )
-        .await;
+        let refused = DeclaredCharge::new(&budget, t, TENANT_RESERVATION_CAP, 1, || {}).await;
         assert!(
             matches!(
                 refused,
@@ -298,61 +342,32 @@ mod tests {
         );
 
         // The cap is per-tenant: another tenant's first charge grants.
-        let _u1 = DeclaredCharge::new(
-            Arc::clone(&pool),
-            &ledger,
-            u,
-            TENANT_RESERVATION_CAP,
-            big,
-            || {},
-        )
-        .await
-        .expect("a different tenant has its own headroom");
+        let _u1 = DeclaredCharge::new(&budget, u, TENANT_RESERVATION_CAP, big, || {})
+            .await
+            .expect("a different tenant has its own headroom");
 
         // Release restores headroom (the RAII edge).
         drop(c1);
-        let _c3 = DeclaredCharge::new(
-            Arc::clone(&pool),
-            &ledger,
-            t,
-            TENANT_RESERVATION_CAP,
-            big,
-            || {},
-        )
-        .await
-        .expect("released charge restores tenant headroom");
+        let _c3 = DeclaredCharge::new(&budget, t, TENANT_RESERVATION_CAP, big, || {})
+            .await
+            .expect("released charge restores tenant headroom");
     }
 
     /// The size axis refuses before the ledger is consulted (no
     /// charge is leaked for a refused declaration).
     #[tokio::test]
     async fn too_large_refuses_without_charging() {
-        let pool = Arc::new(Semaphore::new(8 * MAX_NAR_SIZE as usize));
-        let ledger = TenantReservationLedger::default();
+        let budget = NarBudget::new(8 * MAX_NAR_SIZE as usize);
         let t = Uuid::from_u128(3);
-        let refused = DeclaredCharge::new(
-            Arc::clone(&pool),
-            &ledger,
-            t,
-            TENANT_RESERVATION_CAP,
-            MAX_NAR_SIZE,
-            || {},
-        )
-        .await;
+        let refused =
+            DeclaredCharge::new(&budget, t, TENANT_RESERVATION_CAP, MAX_NAR_SIZE, || {}).await;
         assert!(matches!(
             refused,
             Err(DeclaredRefusal::TooLarge { limit }) if limit == MAX_NAR_SIZE
         ));
         // Full cap still available after the refusal.
-        let _ok = DeclaredCharge::new(
-            Arc::clone(&pool),
-            &ledger,
-            t,
-            TENANT_RESERVATION_CAP,
-            MAX_NAR_SIZE - 1,
-            || {},
-        )
-        .await
-        .expect("no charge leaked by the size refusal");
+        let _ok = DeclaredCharge::new(&budget, t, TENANT_RESERVATION_CAP, MAX_NAR_SIZE - 1, || {})
+            .await
+            .expect("no charge leaked by the size refusal");
     }
 }

@@ -722,7 +722,44 @@ the SHAPE --- park free, then hold, exactly the substitute leg's
 single-shot reservation discipline applied to upload. The capability
 boundary is the round-8 refutation carried verbatim: a tee that streams
 while hashing cannot declare, so the field is opt-in rather than a
-release-skew bridge (the `--wipe` posture).
+release-skew bridge (the `--wipe` posture). The declared reservation's
+COST is governed by #rref("store.budget.cost-axis") below.
+
+#r("store.budget.cost-axis")[
+  Every acquisition against the shared NAR-byte budget that is priced by
+  DECLARATION (a wire-supplied size --- the substitute leg's upstream
+  `NarSize` and PutPath's `declared_nar_size` --- rather than by delivered
+  bytes) MUST carry the cost axis before any grant: the acquisition is
+  constructible ONLY through the one `DeclaredCharge` constructor, whose
+  signature requires the charging tenant and aggregate cap and whose ledger
+  consult precedes the semaphore park (an over-cap tenant REFUSES typed and
+  retryable, never queues). The raw semaphore MUST be module-private to the
+  sealed budget home (`rio-store/src/budget.rs` --- `NarBudget`): the only
+  debit paths are `DeclaredCharge::new` and the delivery-priced per-chunk
+  face (`acquire_chunk`, wait-grace-bounded at its one chokepoint);
+  `add_permits`/`forget`/bare acquires are unwritable outside the module,
+  and reads (`available_permits`) are not debits. The declared envelope's
+  axes, ALL bound: *time* --- the hold envelope armed at grant
+  (#rref("store.put.nar-hold-envelope")); *size* --- per-charge
+  `declared < MAX_NAR_SIZE`, refused up front; *cost* --- per-tenant
+  aggregate outstanding charge `<= TENANT_RESERVATION_CAP` (2 ×
+  `MAX_NAR_SIZE` = 8 GiB, ¼ of the default pool), keyed by the
+  HMAC-claims-signed tenant with unattributed authorities sharing one
+  capped nil bucket; *population* --- per-tenant concurrent CHARGE COUNT is
+  documented-N/A: the byte aggregate is the pool's exhaustible resource and
+  the cap bounds it directly, each charge rides a connection-bounded
+  streaming RPC or an admission-gated substitute leg, and ledger memory is
+  one map entry per actively-charged tenant.
+]
+The rule is merged_bug_005's close: wave-9's `reserve_declared` shipped as
+the bare sibling of the substitute reserve --- whole wire-supplied charge,
+no ledger --- so eight ~4 GiB declarations from one worker pinned the full
+32 GiB pool at zero bandwidth, renewable for the whole hold envelope. The
+constructor (not a callsite sweep) is the enforcement: the debit face is
+compile-sealed by module privacy, and the crate-wide acquire-site census
+(`nar_budget_acquire_site_census`, planted-red per R22′) is the belt under
+it. Trailer mode stays delivery-priced by design --- an attacker there pays
+real bandwidth, which IS the cost axis.
 
 #r("store.put.placeholder-claim+2")[
   `insert_manifest_uploading` generates a fresh `claim_id UUID` per placeholder

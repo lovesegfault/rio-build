@@ -161,12 +161,42 @@ impl StoreServiceImpl {
 
         let (raw_info, declared) = common::read_first_metadata(&mut stream).await?;
         // r[impl store.put.declared-reserve]
+        // r[impl store.budget.cost-axis]
         // N1 declared-mode gate: bound the declaration BEFORE the
         // claim (a hostile declaration must not cost a placeholder
         // round-trip). The reservation itself happens inside
         // `ingest_nar_stream` — after the IA claim, before the first
         // chunk — so the park holds no budget and the claim/park
         // ordering matches the substitute leg (claim, then reserve).
+        //
+        // DECLARED-MODE AUTHORITY (merged_bug_005): declared mode is
+        // open to every token-holding caller, but its COST is typed —
+        // the reservation charges the HMAC-claims-signed tenant (or
+        // the capped unattributed bucket) via `DeclaredCharge`, so
+        // authority-to-cost is total over `IngestAuthority`:
+        // Builder(tenant) → that tenant's 8 GiB aggregate;
+        // Builder(tenant-less) / ServiceBypass / DevMode → the shared
+        // capped nil bucket. The is_ca face is the priced residual
+        // (RC-2(iii)): is_ca callers claim POST-ingest, so their
+        // claims never bound concurrent declared streams — each
+        // stream still pays the ledger, so the un-bounded STREAM
+        // COUNT pins at most TENANT_RESERVATION_CAP bytes per signed
+        // tenant, never the pool.
+        //
+        // `declared_nar_size` sink census (every consumer of the wire
+        // field, RC-2(iii) — each priced or refusing):
+        //   1. producer: rio-proto client::store::chunk_nar_for_put
+        //      (:247 — buffered senders declare; trailer must equal);
+        //   2. extraction: common.rs read_first_metadata
+        //      (`> 0` opts in);
+        //   3. THIS pre-claim size gate (refuses >= MAX_NAR_SIZE);
+        //   4. the cost-axis reservation: reserve_declared →
+        //      budget::DeclaredCharge (ledger + cap BEFORE any grant);
+        //   5. the mid-stream binding bound (over-delivery refuses at
+        //      the crossing chunk);
+        //   6. the trailer equality (under/lying-short refuse);
+        //   7. PutPathBatch REJECTS the field outright (not supported
+        //      on the batch plane — a refusing sink).
         if let Some(d) = declared
             && d >= rio_common::limits::MAX_NAR_SIZE
         {

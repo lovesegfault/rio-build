@@ -1247,7 +1247,7 @@ mod bw8s1_budget {
         let service = Svc::new(db.pool.clone())
             .with_nar_budget(budget_bytes)
             .with_nar_ingest_envelope(shrunk_cfg());
-        let budget = service.nar_bytes_budget().clone();
+        let budget = service.nar_budget().clone();
         let (client, _server) = spawn_store_server(service).await?;
 
         // Substituter on the SAME pool (the production main.rs wiring
@@ -1262,7 +1262,7 @@ mod bw8s1_budget {
         let sub = Arc::new(
             Substituter::new(db.pool.clone(), None)
                 .with_http_client(rio_store::test_helpers::sandbox_http())
-                .with_nar_bytes_budget(budget.clone())
+                .with_nar_budget(budget.clone())
                 .with_stall_window(sub_stall),
         );
 
@@ -1367,7 +1367,7 @@ mod bw8s1_budget {
         let service = Svc::new(db.pool.clone())
             .with_nar_budget(budget_bytes)
             .with_nar_ingest_envelope(shrunk_cfg());
-        let budget = service.nar_bytes_budget().clone();
+        let budget = service.nar_budget().clone();
         let (client, _server) = spawn_store_server(service).await?;
 
         let nar: Vec<u8> = rio_test_support::fixtures::pseudo_random_bytes(13, 8192);
@@ -1429,7 +1429,7 @@ mod bw8s1_budget {
         let service = Svc::new(db.pool.clone())
             .with_nar_budget(budget_bytes)
             .with_nar_ingest_envelope(shrunk_cfg());
-        let budget = service.nar_bytes_budget().clone();
+        let budget = service.nar_budget().clone();
         let (client, _server) = spawn_store_server(service).await?;
 
         // Production reservation: substitute leg holds D ≈ 3500,
@@ -1454,7 +1454,7 @@ mod bw8s1_budget {
         let sub = Arc::new(
             Substituter::new(db.pool.clone(), None)
                 .with_http_client(rio_store::test_helpers::sandbox_http())
-                .with_nar_bytes_budget(budget.clone()),
+                .with_nar_budget(budget.clone()),
         );
         let leg = {
             let s = Arc::clone(&sub);
@@ -1523,7 +1523,7 @@ mod bw8s1_budget {
                 budget_wait_grace: Duration::ZERO,
                 ..shrunk_cfg()
             });
-        let budget = service.nar_bytes_budget().clone();
+        let budget = service.nar_budget().clone();
         let (client, _server) = spawn_store_server(service).await?;
 
         // Uncontended: a full upload succeeds under zero grace (the
@@ -1615,7 +1615,7 @@ mod bw8s1_budget {
         let service = Svc::new(db.pool.clone())
             .with_nar_budget(budget_bytes)
             .with_nar_ingest_envelope(shrunk_cfg());
-        let budget = service.nar_bytes_budget().clone();
+        let budget = service.nar_budget().clone();
         let (client, _server) = spawn_store_server(service).await?;
 
         let nar: Vec<u8> = rio_test_support::fixtures::pseudo_random_bytes(19, 8192);
@@ -1716,7 +1716,7 @@ mod bw9s5_tiling {
         let service = Svc::new(db.pool.clone())
             .with_nar_budget(budget_bytes)
             .with_nar_ingest_envelope(tiling_cfg());
-        let budget = service.nar_bytes_budget().clone();
+        let budget = service.nar_budget().clone();
         let (client, _server) = spawn_store_server(service).await?;
 
         // The wedge: an uncommitted placeholder pair for the batch's

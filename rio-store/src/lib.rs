@@ -42,7 +42,7 @@ pub mod authz;
 #[cfg(feature = "server")]
 pub mod backend;
 #[cfg(feature = "server")]
-pub(crate) mod budget;
+pub mod budget;
 #[cfg(feature = "server")]
 pub mod cas;
 #[cfg(feature = "server")]

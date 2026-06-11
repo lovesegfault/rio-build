@@ -213,9 +213,17 @@ pub async fn collect_nar_stream_to_writer(
 /// Build a `PutPath` request stream: metadata first, then [`NAR_CHUNK_SIZE`]
 /// chunks of the NAR, then a `PutPathTrailer` with the hash/size.
 ///
-/// Trailer-mode only: `nar_hash`/`nar_size` are zeroed in the metadata
-/// PathInfo and sent in the trailer. This is the ONLY PutPath mode the
-/// store accepts.
+/// Hash-in-trailer with a DECLARED size: `nar_hash`/`nar_size` are
+/// zeroed in the metadata PathInfo and sent in the trailer (the store
+/// verifies its server-computed digest against them — that part is
+/// mandatory and trailer-only). `declared_nar_size` IS set in the
+/// metadata: this sender has the whole NAR buffered, so it opts into
+/// the store's declared-mode single-shot budget reservation (N1) —
+/// the store reserves the whole charge pre-stream against the
+/// sender's tenant ledger (merged_bug_005's cost axis) instead of
+/// charging chunk-by-chunk while holding, and enforces the
+/// declaration as a binding bound (over-delivery refuses mid-stream;
+/// the trailer must equal it).
 ///
 /// Takes `Arc<[u8]>` so chunks borrow without eagerly materializing
 /// a `Vec<PutPathRequest>`. The returned stream is lazy — chunks are
