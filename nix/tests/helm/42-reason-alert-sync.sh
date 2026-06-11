@@ -27,14 +27,30 @@
 # house pattern): a check that cannot fail its planted fixtures does
 # not gate. Arm A plants the merged_bug_058 shape itself (alert-
 # disposition reason with no expr); arm B a phantom expr reason; arm
-# C an undispositioned reason.
+# C an undispositioned reason. Arms D/E (bug_111) gate the EXTRACTION
+# layer itself with raw-source plants — the wave-9 arms entered one
+# layer short (pre-extracted fixtures certified only the join):
+# arm D a leading-sibling-label + regex-metachar expr (the old
+# `{reason`-anchored grep was blind to any expr whose reason matcher
+# is not the first label); arm E a digit-bearing const member (the
+# old `"[a-z_]*"` class dropped it silently — totality bypassed).
+#
+# EXTRACTION DERIVES FROM OWNED MACHINERY (bug_111): the reason set
+# comes from the shared rust lexer's const-array span primitive
+# (.rust-strip.py --const-strings, staged by the driver) — digits and
+# escapes live by construction, comments excluded by the lexer's own
+# classification, never by a hand regex over source text. The expr
+# side parses the WHOLE matcher block, label-position-independent.
 #
 # Harness contract: runner cd's into $TMPDIR/chart, bash -euo pipefail.
 # The controller source is staged by misc-checks.nix as
-# .observability-source.rs (the 22-alert-quality runbook precedent).
+# .observability-source.rs (the 22-alert-quality runbook precedent);
+# the shared lexer as .rust-strip.py (python3 in the driver inputs).
 
 obs_src=$TMPDIR/chart/.observability-source.rs
 [ -f "$obs_src" ] || { echo "FAIL: staged observability source missing" >&2; exit 1; }
+lexer=$TMPDIR/chart/.rust-strip.py
+[ -f "$lexer" ] || { echo "FAIL: staged shared lexer missing" >&2; exit 1; }
 
 # --- the disposition table (the committed decision record) -----------
 # reason<TAB>disposition. `alert:` rows are checked against rendered
@@ -53,15 +69,24 @@ EOF
 
 # --- extraction -------------------------------------------------------
 extract_reasons() { # <observability.rs> -> one reason per line
-  sed -n '/pub const INTENT_DROP_REASONS/,/^];/p' "$1" \
-    | grep -o '"[a-z_]*"' | tr -d '"'
+  # Span-derived (bug_111): the lexer owns string/comment
+  # classification and the const item's extent; the identifier
+  # grammar is whatever the const carries — digit-bearing members
+  # live (the old "[a-z_]*" class dropped them).
+  python3 "$lexer" --const-strings INTENT_DROP_REASONS "$1"
 }
 
 extract_expr_reasons() { # <rendered-rules.yaml> -> one reason per line
-  # Every reason= matcher on the intent_dropped_total family; regex
-  # matchers (reason=~"a|b") expand to their alternatives.
-  grep -o 'nodeclaim_intent_dropped_total{reason=~\?"[a-z_|]*"' "$1" \
-    | sed 's/.*"\([a-z_|]*\)"/\1/' | tr '|' '\n' | sort -u
+  # Every reason= matcher on the intent_dropped_total family,
+  # LABEL-POSITION-INDEPENDENT (bug_111): the whole `{...}` matcher
+  # block is captured and the reason matcher found anywhere inside it
+  # — a leading sibling label or a regex-metachar sibling matcher no
+  # longer hides the expr from the join. Regex matchers
+  # (reason=~"a|b") expand to their alternatives; the value class is
+  # the identifier grammar (digits live).
+  grep -o 'nodeclaim_intent_dropped_total{[^}]*}' "$1" \
+    | sed -n 's/.*[{,] *reason=~\{0,1\}"\([a-z0-9_|]*\)".*/\1/p' \
+    | tr '|' '\n' | grep -v '^$' | sort -u
 }
 
 check_join() { # <reasons-file> <expr-reasons-file> <dispositions-tsv>
@@ -132,6 +157,41 @@ if check_join "$plant/reasons" "$plant/expr_reasons" "$plant/table" 2>/dev/null;
   echo "FAIL: self-test arm C (reason with no disposition row) did not fail" >&2
   exit 1
 fi
+
+# --- extraction-layer plants (bug_111 — raw source in, reasons out) ----
+# Arm D: a rendered expr whose reason matcher sits BEHIND a sibling
+# label, beside a regex-metachar sibling matcher — both shapes were
+# invisible to the {reason-anchored grep (phantom-reason guarantee
+# (ii) passed silently); and one first-position control row.
+cat >"$plant/rules.yaml" <<'EOF'
+      expr: rate(rio_controller_nodeclaim_intent_dropped_total{pool="general",reason="planted_sibling"}[5m]) > 0
+      expr: rate(rio_controller_nodeclaim_intent_dropped_total{job=~"rio.*",reason=~"planted_meta|planted_alt"}[5m]) > 0
+      expr: rate(rio_controller_nodeclaim_intent_dropped_total{reason="planted_first"}[5m]) > 0
+EOF
+extracted=$(extract_expr_reasons "$plant/rules.yaml" | tr '\n' ' ')
+for want in planted_sibling planted_meta planted_alt planted_first; do
+  case " $extracted " in
+    *" $want "*) ;;
+    *) echo "FAIL: self-test arm D (label-position/metachar extraction) lost '$want' — got: $extracted" >&2; exit 1 ;;
+  esac
+done
+
+# Arm E: a digit-bearing const member must survive extraction (the
+# old [a-z_]-only class silently dropped it — totality (i) bypassed),
+# and a commented-out member must NOT leak in (the lexer's own
+# string/comment classification, not a hand regex).
+cat >"$plant/obs.rs" <<'EOF'
+pub const INTENT_DROP_REASONS: &[&str] = &[
+    "planted_alpha",
+    // "planted_commented",
+    "planted_v2",
+];
+EOF
+got=$(python3 "$lexer" --const-strings INTENT_DROP_REASONS "$plant/obs.rs" | tr '\n' ' ')
+[ "$got" = "planted_alpha planted_v2 " ] || {
+  echo "FAIL: self-test arm E (digit-bearing/comment extraction) — got: '$got'" >&2
+  exit 1
+}
 
 # --- the real check ----------------------------------------------------
 mon=$TMPDIR/42-mon.yaml

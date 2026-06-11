@@ -44,6 +44,30 @@ shared, so string and comment classification cannot disagree).
 `lex` delegates to `lex_full` and keeps its two-tuple contract —
 existing consumers are byte-identical.
 
+SPAN PRIMITIVES (merged_bug_019 / bug_111 — regex-extraction scanners
+fail systematically on EXTENT problems: fixed character windows,
+single-anchor lazy regexes, first-binding-only captures): scanners
+iterate STRUCTURED extents and run their small regexes within them.
+  - `fn_extents(text) -> [(name, start, body_start, body_end)]`:
+    every `fn name…{body}` — body coordinates exclusive of the
+    braces, derived by brace-matching over the LEXED text (so braces
+    in strings/comments never skew); bodyless trait/extern decls are
+    omitted.
+  - `macro_call_extents(text, names) -> [(name, args_start,
+    args_end)]`: every `name!(…)` / `name![…]` / `name!{…}` for the
+    requested macro names, args coordinates exclusive of the
+    delimiters, delimiter-matched over the lexed text.
+  - `const_array_strings(text, const_name) -> [str]`: the string
+    literal bodies inside `const NAME: … = […];` — the item extent
+    found over the lexed text, the VALUES read from the original
+    text via the lexer's own string spans (one walk, one
+    classification). CLI: `rust_strip.py --const-strings NAME FILE`
+    prints one value per line — the shell-fragment face of the same
+    primitive.
+  - `split_top_level(text, start, end) -> [(piece_start,
+    piece_end)]`: top-level comma split within an extent (depth
+    tracked over the lexed text), for macro-argument walks.
+
 `strip_cfg_test(text) -> str` is the attribute-position `#[cfg(test)]`
 pruner (merged_bug_009): ONE implementation of scope-pruning for every
 scanner, replacing the per-scanner truncate-at-first-marker walks that
@@ -243,6 +267,119 @@ def strip_cfg_test(text: str) -> str:
     return "".join(out)
 
 
+_OPEN_TO_CLOSE = {"(": ")", "[": "]", "{": "}"}
+
+
+def _match_delim(lexed: str, i: int) -> int:
+    """Index just past the delimiter matching lexed[i] (one of ([{),
+    or len(lexed) on malformed input. Operates on LEXED text only."""
+    open_c = lexed[i]
+    close_c = _OPEN_TO_CLOSE[open_c]
+    depth = 0
+    n = len(lexed)
+    while i < n:
+        c = lexed[i]
+        if c == open_c:
+            depth += 1
+        elif c == close_c:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n
+
+
+FN_DECL = re.compile(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def fn_extents(text: str):
+    """See the module docstring. Coordinates index the ORIGINAL text
+    (lexing is newline- and offset-preserving)."""
+    lexed, _ = lex(text, blank_string_bodies=True)
+    out = []
+    n = len(lexed)
+    for m in FN_DECL.finditer(lexed):
+        i = m.end()
+        # Walk to the body's `{` at bracket depth 0 — past the
+        # parameter list, generics, return type, where clauses. A `;`
+        # at depth 0 first means a bodyless decl: skip.
+        depth = 0
+        body_start = None
+        while i < n:
+            c = lexed[i]
+            if c in "([":
+                i = _match_delim(lexed, i)
+                continue
+            if c == "{":
+                body_start = i + 1
+                break
+            if c == ";" and depth == 0:
+                break
+            i += 1
+        if body_start is None:
+            continue
+        body_end = _match_delim(lexed, body_start - 1) - 1
+        out.append((m.group(1), m.start(), body_start, body_end))
+    return out
+
+
+def macro_call_extents(text: str, names):
+    """See the module docstring. `names`: iterable of macro names."""
+    lexed, _ = lex(text, blank_string_bodies=True)
+    alt = "|".join(re.escape(x) for x in names)
+    out = []
+    for m in re.finditer(r"\b(" + alt + r")!\s*([(\[{])", lexed):
+        open_i = m.end() - 1
+        close_i = _match_delim(lexed, open_i)
+        out.append((m.group(1), open_i + 1, close_i - 1))
+    return out
+
+
+def split_top_level(text: str, start: int, end: int):
+    """Top-level comma split of text[start:end] (see docstring)."""
+    lexed, _ = lex(text, blank_string_bodies=True)
+    pieces = []
+    depth = 0
+    piece_start = start
+    for i in range(start, min(end, len(lexed))):
+        c = lexed[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == "," and depth == 0:
+            pieces.append((piece_start, i))
+            piece_start = i + 1
+    if piece_start < end:
+        pieces.append((piece_start, end))
+    return pieces
+
+
+CONST_DECL_TMPL = r"\bconst\s+%s\b"
+
+
+def const_array_strings(text: str, const_name: str):
+    """See the module docstring: string bodies inside `const NAME … ;`,
+    read from the ORIGINAL text via the lexer's string spans."""
+    lexed, spans, _ = lex_full(text, blank_string_bodies=True)
+    m = re.search(CONST_DECL_TMPL % re.escape(const_name), lexed)
+    if not m:
+        return []
+    i = m.end()
+    n = len(lexed)
+    # Item extent: to the `;` at depth 0 (delimiters skipped whole).
+    while i < n:
+        c = lexed[i]
+        if c in "([{":
+            i = _match_delim(lexed, i)
+            continue
+        if c == ";":
+            break
+        i += 1
+    end = i
+    return [text[a:b] for a, b, _raw in spans if m.end() <= a and b <= end]
+
+
 def selftest() -> str | None:
     """Exact span/blank assertions, escaped-quote families included."""
     # The merged_bug_049 family: '\'' then a tuple/char soup. The walk
@@ -335,6 +472,43 @@ def selftest() -> str | None:
     pruned = strip_cfg_test(t)
     if "use x::y" in pruned or "keep" not in pruned or "also_keep" not in pruned:
         return f"semicolon/lookalike prune wrong: {pruned!r}"
+    # fn extents: body coordinates exact; braces in strings/comments
+    # never skew; bodyless decls omitted; nested fns both reported.
+    t = 'fn outer(a: &str) -> u32 { let s = "}{"; inner(); 1 }\nfn bodyless();\nfn inner() { /* } */ }\n'
+    exts = fn_extents(t)
+    names = [e[0] for e in exts]
+    if names != ["outer", "inner"]:
+        return f"fn-extent names wrong: {names}"
+    body = t[exts[0][2] : exts[0][3]]
+    if 'let s = "}{"; inner(); 1' not in body or body.count("{") != 1:
+        return f"fn-extent body wrong: {body!r}"
+    # macro-call extents: args exact, string/comment delims inert.
+    t = 'counter!("a_total", "k" => v(x, y), "k2" => "v,2").increment(1); describe!{ inner }'
+    exts = macro_call_extents(t, ["counter", "describe"])
+    if [e[0] for e in exts] != ["counter", "describe"]:
+        return f"macro-extent names wrong: {exts}"
+    args = t[exts[0][1] : exts[0][2]]
+    if args != '"a_total", "k" => v(x, y), "k2" => "v,2"':
+        return f"macro-extent args wrong: {args!r}"
+    # top-level split: commas inside calls and strings never split.
+    pieces = [t[a:b].strip() for a, b in split_top_level(t, exts[0][1], exts[0][2])]
+    if pieces != ['"a_total"', '"k" => v(x, y)', '"k2" => "v,2"']:
+        return f"top-level split wrong: {pieces}"
+    # const-array strings: values from the original text (digits and
+    # escapes live), extent stops at the item's `;`.
+    t = (
+        "pub const REASONS: &[&str] = &[\n"
+        '    "alpha",\n'
+        '    // "commented_out",\n'
+        '    "beta_v2",\n'
+        "];\n"
+        'const OTHER: &str = "gamma";\n'
+    )
+    vals = const_array_strings(t, "REASONS")
+    if vals != ["alpha", "beta_v2"]:
+        return f"const-array strings wrong: {vals}"
+    if const_array_strings(t, "MISSING") != []:
+        return "const-array on a missing const not empty"
     return None
 
 
@@ -345,4 +519,22 @@ if __name__ == "__main__":
     if err:
         print(f"FAIL: rust-strip self-test — {err}", file=sys.stderr)
         sys.exit(1)
+    if len(sys.argv) >= 2 and sys.argv[1] == "--const-strings":
+        # The shell-fragment face of the const-array primitive (the
+        # 42-reason-alert-sync extraction): selftest above gates first.
+        if len(sys.argv) != 4:
+            print("usage: rust_strip.py --const-strings NAME FILE", file=sys.stderr)
+            sys.exit(2)
+        vals = const_array_strings(
+            open(sys.argv[3], encoding="utf-8").read(), sys.argv[2]
+        )
+        if not vals:
+            print(
+                f"FAIL: zero string values under const {sys.argv[2]} in {sys.argv[3]}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        for v in vals:
+            print(v)
+        sys.exit(0)
     print("rust-strip: self-test green")

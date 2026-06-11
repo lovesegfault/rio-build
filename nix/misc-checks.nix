@@ -322,6 +322,10 @@ in
           # PrometheusRule and replays the alert-contract unit tests.
           # promtool ships in the cli output, not out.
           pkgs.prometheus.cli
+          # python3 (fragment 42): the reason census derives from the
+          # shared rust lexer's const-array span primitive (bug_111 —
+          # extraction from owned machinery, not hand regexes).
+          pkgs.python3
         ];
         # merged_bug_067 (fragment 39 leg (i)): the cross-boundary
         # cluster-identity normalization fixture — ONE committed file
@@ -344,8 +348,11 @@ in
         # 42-reason-alert-sync.sh derives the closed reason set from
         # INTENT_DROP_REASONS — stage the const's source file so the
         # check quantifies over the real surface, never a hand copy
-        # (the (vvvvv) staging discipline; the runbook precedent).
+        # (the (vvvvv) staging discipline; the runbook precedent),
+        # plus the shared lexer whose const-array span primitive does
+        # the extraction (bug_111).
         cp ${../rio-controller/src/observability.rs} $TMPDIR/chart/.observability-source.rs
+        cp ${../nix/rust_strip.py} $TMPDIR/chart/.rust-strip.py
 
         # Strict-decode tier (merged_bug_004): wrap helm so every
         # fragment's successful `helm template` output strict-decodes
