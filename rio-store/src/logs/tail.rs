@@ -73,9 +73,13 @@ pub async fn read_manifest_range(
     exec_id: Uuid,
     since_line: u64,
 ) -> Result<Vec<ChunkRef>, Status> {
-    // A since_line past i64::MAX cannot intersect any storable chunk
-    // (the ingest path rejects line numbers above i64::MAX); clamping
-    // keeps the bind in range and yields the correct empty set.
+    // A since_line past i64::MAX cannot intersect any storable chunk:
+    // the ingest kernel's RejectedOverflow gate bounds every stored
+    // row's EXCLUSIVE end (`first_line + line_count`) to BIGINT range
+    // (rio-log-kernel `accept_verdict`, check 1), so the clamp yields
+    // the correct empty set — and the `first_line + line_count` sum in
+    // the query below stays in range on every storable row (no
+    // overflow lane exists for it to surface through).
     let since = i64::try_from(since_line).unwrap_or(i64::MAX);
     // Runtime query: drv_log_chunks is store-owned (no cross-service
     // contract to enforce).

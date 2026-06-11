@@ -89,9 +89,13 @@ const MAX_CONSECUTIVE_CUT_FAILURES: u8 = 3;
 /// store's config; [`Default`] carries the design's production values.
 #[derive(Debug, Clone)]
 pub struct IngestConfig {
-    /// Abort the stream (`RESOURCE_EXHAUSTED`) once this many bytes
-    /// (post-truncation content + `PER_LINE_OVERHEAD` per line) have
-    /// been accepted for the execution.
+    /// Abort the stream (`FAILED_PRECONDITION` via
+    /// [`super::gate::cap_rejection`] — the cap travels with the
+    /// EXECUTION, so no retry anywhere can succeed; never
+    /// `RESOURCE_EXHAUSTED`, which is reserved for per-replica
+    /// capacity) once this many bytes (post-truncation content +
+    /// `PER_LINE_OVERHEAD` per line) have been accepted for the
+    /// execution.
     pub per_exec_byte_cap: u64,
     /// `accept` reports `cut_due` once the buffer holds this many bytes
     /// (post-truncation content + `PER_LINE_OVERHEAD` per line,
@@ -680,8 +684,8 @@ impl IngestSession {
         let batch_bytes: u64 = lines.iter().map(|l| accounted_len(l)).sum();
 
         // -- The per-execution accepted-bytes cap. Stream-fatal: the
-        // builder gets RESOURCE_EXHAUSTED and gives up on the log (the
-        // build itself is unaffected).
+        // builder gets FAILED_PRECONDITION and gives up on the log
+        // (the build itself is unaffected).
         // r[impl store.log.caps-durable]
         // Same status code + metadata class as the gate's open-time
         // check: the cap travels with the EXECUTION, so a retry on

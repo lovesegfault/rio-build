@@ -231,7 +231,7 @@ spec:
             # deployed limit is injected via the downward API, so the
             # binary's validate() refuses budget + reserve > limit at
             # boot — an OOM-kill turned into a typed config error.
-            # nix/tests/helm/42-store-memory-identity.sh pins the
+            # nix/tests/helm/46-store-memory-identity.sh pins the
             # rendered pair.
             - name: RIO_NAR_BUFFER_BUDGET_BYTES
               value: {{ $s.narBufferBudgetBytes | int64 | quote }}

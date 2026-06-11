@@ -1928,6 +1928,16 @@ fn substitute_cell_message(
     match class {
         C::RateLimited => ("rate_limited", format!("substitution of {path}: {detail}")),
         C::Raced => ("raced", format!("substitution of {path}: {detail}")),
+        // Typed trust/content REFUSALS, settled uncharged — their
+        // variant docs pin "never infrastructure trouble (nothing is
+        // broken on our side)", so the message says what the class
+        // says (merged_bug_149: the old fallback narrated these as
+        // infrastructure, re-teaching the contradiction bug_194's
+        // chokepoint exists to prevent).
+        C::Untrusted | C::ContentMismatch => (
+            "",
+            format!("substitution of {path} refused ({class:?}): {detail}"),
+        ),
         _ => (
             "",
             format!("substitution of {path} hit infrastructure trouble ({class:?}): {detail}"),

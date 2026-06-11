@@ -1,14 +1,19 @@
 //! Shared `aws_sdk_s3::Client` builder.
 //!
-//! rio-store (chunk backend) and rio-scheduler (build-log flush +
-//! AdminService log replay) both talk to S3. Before this module each
-//! built its own client with subtly different config — scheduler used
+//! The live consumer set is the store's chunk backend + log planes —
+//! the machine-derived census at
+//! `rio-store/tests/gensets/s3-op-census.txt` is the consumer list's
+//! single source (merged_bug_149: this header previously named
+//! rio-scheduler's build-log flush + AdminService log replay as
+//! consumers after those ops had left the scheduler; trust the
+//! census artifact, not a prose roster here). Historically each
+//! consumer built its own client with subtly different config —
 //! `aws_config::defaults()` (3 retry attempts, stalled-stream
-//! protection ON), store used `from_env()` with raised retries +
-//! stalled-stream protection OFF. The store config is the
-//! battle-tested one (see [`default_client`] for the rationale);
-//! sharing it here means region/endpoint/credential/retry resolution
-//! has one home and the two services can't drift.
+//! protection ON) vs `from_env()` with raised retries +
+//! stalled-stream protection OFF. The battle-tested config lives in
+//! [`default_client`] (see its rationale); sharing it here means
+//! region/endpoint/credential/retry resolution has one home and
+//! consumers can't drift.
 //!
 //! Feature-gated on `aws` so consumers that don't touch S3 stay
 //! aws-sdk-free.

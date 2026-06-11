@@ -512,7 +512,7 @@ store:
     # EKS gets real sizing from xtask deploy. The LIMIT is the D4 pair
     # of narBufferBudgetBytes above: 4 GiB budget + 4 GiB reserve =
     # 8Gi (limits don't reserve node memory, so this schedules
-    # anywhere requests fit). nix/tests/helm/42-store-memory-identity.sh
+    # anywhere requests fit). nix/tests/helm/46-store-memory-identity.sh
     # pins the rendered pair to the law.
     requests: {cpu: 500m, memory: 1Gi}
     limits: {memory: 8Gi}

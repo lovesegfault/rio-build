@@ -451,9 +451,16 @@ pub async fn reap_idle<F: Fn(&str, Option<&str>, &[String]) -> bool>(
         } else {
             na
         };
-        // Last-write-wins per cell within a tick (nodes in a cell share
-        // an hw-class; allocatable can vary across instance types within
-        // the class but the threshold's order of magnitude doesn't).
+        // Last-write-wins per cell within a tick — and the stream
+        // interleaves BOTH threshold families: un-annotated nodes
+        // write `na` while HOLD_OPEN_ANNOTATION nodes write the
+        // hold-open value (2x na under an unset
+        // `max_consolidation_time`, per the r37 coupling above), so
+        // the surviving sample depends on iteration order whenever a
+        // cell mixes annotated and un-annotated nodes. Read it as the
+        // cell's floor-order signal, not a per-node threshold
+        // (allocatable variance within the hw-class and the 2x
+        // hold-open factor both ride inside one order of magnitude).
         // Operator check: `fetcher-*` cells ≥ 600s floor; builder cells
         // ≥ 300s `*` floor. For bin-packed cells (`E[c_fit] ≤ cores/2`,
         // the §13b MostAllocated default for builders), the floor is a

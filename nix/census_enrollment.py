@@ -119,7 +119,10 @@ CLAIM_SHAPES = [
     r"sole call ?sites?",
     r"all (?:call ?sites?|callers?)",
     r"no other (?:callers?|call ?sites?)",
-    r"exactly (?:one|two|three|[0-9]+) (?:callers?|call ?sites?)",
+    # Spelled counts cover the full series writers actually use
+    # (merged_bug_149: the alternation stopped at "three", so
+    # "exactly four callers" silently escaped the claim census).
+    r"exactly (?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|[0-9]+) (?:callers?|call ?sites?)",
     r"never sends?",
 ]
 CLAIM_RE = re.compile(
@@ -318,6 +321,14 @@ def selftest(tmp: Path) -> str | None:
     gf.write_text("rio-planted/src/lib.rs\t// some long-deleted claim\n", encoding="utf-8")
     if quiet_run() != 1:
         return "arm D: planted stale grandfather entry did not fail"
+
+    # (E) merged_bug_149: a spelled count PAST "three" is a claim —
+    # the old alternation stopped at three, so this line escaped the
+    # census silently (the red this plant pins).
+    write("// the fold has exactly four call sites in the actor\nfn planted_four() {}\n")
+    gf.write_text("", encoding="utf-8")
+    if quiet_run() != 1:
+        return "arm E: planted spelled-count-four claim did not fail"
     return None
 
 

@@ -828,12 +828,20 @@ mod summary {
     /// (merged_bug_041: `He said "stop." Next` cuts after the quote);
     /// the whole collapsed string when no real boundary exists.
     /// Intra-doc links `[foo]` are kept as-is — typst renders square
-    /// brackets literally.
+    /// brackets literally. Backtick PARITY is respected
+    /// (merged_bug_149): a terminal inside an open `` ` ``-delimited
+    /// code span is code, not prose — cutting there would emit a
+    /// first sentence with an unbalanced span.
     pub(super) fn first_sentence(desc: &str) -> String {
         let collapsed = desc.split_whitespace().collect::<Vec<_>>().join(" ");
         let bytes = collapsed.as_bytes();
         for i in 0..bytes.len() {
             if !SENTENCE_TERMINALS.contains(&bytes[i]) {
+                continue;
+            }
+            // Backtick parity (merged_bug_149): odd count before the
+            // terminal == inside a code span; never a boundary.
+            if bytes[..i].iter().filter(|&&b| b == b'`').count() % 2 == 1 {
                 continue;
             }
             // Closer run after the terminal (all closers are ASCII,
@@ -1496,6 +1504,25 @@ mod tests {
             "Is the floor hydrated?",
             "the cut must fire at the first SENTENCE_TERMINALS boundary, not \
              only at '.'"
+        );
+    }
+
+    /// merged_bug_149 (backtick parity): a terminal inside an open
+    /// code span is code, not prose — the cut must skip it (the old
+    /// cutter emitted a first sentence with an unbalanced backtick),
+    /// while a terminal after the span closes cuts normally.
+    #[test]
+    fn code_span_terminals_never_cut() {
+        assert_eq!(
+            super::summary::first_sentence("Reads `a.b. Then` from the row. Details follow."),
+            "Reads `a.b. Then` from the row.",
+            "a '.'-then-uppercase inside an open backtick span is not a \
+             sentence boundary"
+        );
+        assert_eq!(
+            super::summary::first_sentence("Plain `code` here. Next sentence."),
+            "Plain `code` here.",
+            "a boundary after the span closes cuts normally"
         );
     }
 

@@ -241,11 +241,18 @@ pub(super) const UNROUTABLE_FEATURES_WARNED_CAP: usize = 1024;
 /// 1024 is far above any legitimate steady-state.
 pub(super) const CAP_MISMATCH_WARNED_CAP: usize = 1024;
 /// LRU cap for [`DagActor::forecast_dropped_warned`] (r34 bug_018).
-/// Key cardinality is `|Queued-with-incomplete-deps drvs| × |reason|`
-/// (reason ∈ {lead_horizon, tenant_budget}, |reason| = 2). Bounded by
-/// the DAG width; 4096 covers the largest observed Queued frontier
-/// (e.g. nixpkgs-cross release closures). Eviction re-arms the warn —
-/// fail-safe over-emit, bounded by cap × eviction churn.
+/// Key cardinality is `|Queued-with-incomplete-deps drvs| × |reason|`,
+/// where the `reason` alphabet is the registered label set of
+/// `rio_scheduler_sla_forecast_dropped_total` in
+/// `crate::sla::metrics::SLA_LABELED_METRICS` — the cap derives from
+/// THAT row, never from a member list restated here (merged_bug_149:
+/// the restated `|reason| = 2` went stale the moment wave-9 appended
+/// `substituting_pacing`; the registered slice is the single source
+/// and the label-extension lane grows it). Bounded by the DAG width;
+/// 4096 covers the largest observed Queued frontier (e.g.
+/// nixpkgs-cross release closures) times any registered reason
+/// cardinality. Eviction re-arms the warn — fail-safe over-emit,
+/// bounded by cap × eviction churn.
 ///
 /// STRIKE-3 on the ONCE_PER_MISS contract (merged_bug_001/r3-BLOCKED →
 /// `unroutable_features_warned` → `cap_mismatch_warned` → this). r35

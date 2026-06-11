@@ -375,6 +375,21 @@ in
         chmod +x $TMPDIR/bin/helm
         export PATH=$TMPDIR/bin:$PATH
 
+
+        # Fragment-number uniqueness gate (merged_bug_149: two wave-9
+        # slots independently minted fragment 42 — parallel-slot
+        # sequence-number minting had no structural collision check;
+        # the NN- prefix is the fragment namespace, so a collision is
+        # a process defect this driver now refuses). Quantifies over
+        # the same numbered namespace the runner loop consumes.
+        dupes=$(for f in ${fragments}/[0-9][0-9]-*.sh; do
+          basename "$f" .sh | sed -n 's/^\([0-9][0-9]*\)-.*/\1/p'
+        done | sort | uniq -d)
+        if [ -n "$dupes" ]; then
+          echo "FAIL: duplicate helm fragment number(s): $dupes — every NN- prefix is unique; rename to the next free number" >&2
+          exit 1
+        fi
+
         # Numbered files are fragments; unnumbered .sh (the
         # regen-key-population.sh ritual) are dev-side tools, not
         # sandbox assertions.
