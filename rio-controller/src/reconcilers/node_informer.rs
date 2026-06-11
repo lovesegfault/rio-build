@@ -1376,16 +1376,43 @@ enum ShipOutcome {
 /// request-disproving residue below) — never contradict a
 /// `JudgesPresentation` ruling.
 ///
-/// Per-arm rationale:
+/// Per-arm rationale (merged_bug_076: every server-emission claim
+/// below is a `producer-census:` row, machine-diffed against the
+/// `Status::` constructors in the server module
+/// `rio-scheduler/src/admin/mod.rs` by the misc-checks
+/// `exposure-producer-census` scan — a cited-but-never-emitted
+/// producer is a check failure, the exact false-cite shape this
+/// rationale shipped with):
 ///
-/// - `InvalidArgument | Unimplemented` — `DisprovesRequest` per the
-///   authority; the same bytes redeliver identically. Refused.
-/// - `OutOfRange` — `Undecided` per the authority; extended here: the
-///   validation gates at `append_interrupt_sample` emit it for
-///   CONTENT this client cannot re-shape. Refused.
-/// - `FailedPrecondition` — `Undecided` per the authority; extended
-///   here: the server names a state the client cannot fix by
-///   re-sending the same request. Refused.
+/// producer-census: invalid_argument = emitted
+/// producer-census: unimplemented = defaulted
+/// producer-census: out_of_range = never-emitted
+/// producer-census: failed_precondition = emitted
+///
+/// - `InvalidArgument` — `DisprovesRequest` per the authority; the
+///   same bytes redeliver identically. The server's validation gates
+///   (`append_interrupt_sample`: kind / finite-value / hw_class
+///   charset) and plane-entry refusals all mint THIS code. Refused.
+/// - `Unimplemented` — `DisprovesRequest` per the authority (the RPC
+///   does not exist server-side; no live emitter required —
+///   defaulted). Refused.
+/// - `OutOfRange` — `Undecided` per the authority and NEVER EMITTED
+///   by the server module (the pre-fix rationale cited the
+///   validation gates as OutOfRange producers — false: all three are
+///   `invalid_argument`). A never-emitted code earns the sibling
+///   never-emitted treatment (`NotFound | AlreadyExists` below):
+///   fail-open toward retention rather than guessing futility for a
+///   producer that does not exist. Transient, no strike.
+/// - `FailedPrecondition` — `Undecided` per the authority; the
+///   server module's only emitters are the LEADER-CHURN family
+///   (ack-lane NotLeader; stale-generation standdown) — answers a
+///   later pass against the new leader plausibly clears. Mapping the
+///   family to the permanent Refused exit would counted-drop the
+///   whole pending backlog on one handoff (the auth-pair shape one
+///   code over). A future request-disproving FailedPrecondition
+///   producer must re-derive this arm — the producer census reds on
+///   emitter-set drift, forcing the re-derivation. Transient, no
+///   strike.
 /// - `Unauthenticated | PermissionDenied` — `JudgesPresentation` per
 ///   the authority: the refusal judges ONE presentation under ONE key
 ///   observation (kubelet Secret-rotation skew), so it cannot prove
@@ -1415,10 +1442,7 @@ enum ShipOutcome {
 fn classify_append_status(code: tonic::Code) -> ShipOutcome {
     use tonic::Code;
     match code {
-        Code::InvalidArgument
-        | Code::OutOfRange
-        | Code::Unimplemented
-        | Code::FailedPrecondition => ShipOutcome::Refused,
+        Code::InvalidArgument | Code::Unimplemented => ShipOutcome::Refused,
         Code::Unauthenticated | Code::PermissionDenied => {
             ShipOutcome::Transient { auth_strike: true }
         }
@@ -1429,6 +1453,8 @@ fn classify_append_status(code: tonic::Code) -> ShipOutcome {
         | Code::NotFound
         | Code::AlreadyExists
         | Code::ResourceExhausted
+        | Code::FailedPrecondition
+        | Code::OutOfRange
         | Code::Aborted
         | Code::Internal
         | Code::Unavailable
@@ -2526,6 +2552,70 @@ mod tests {
     }
 
     // r[verify sec.authz.refusal-adjudication]
+    /// merged_bug_076 (W9-CK behavioral leg): a NotLeader answer —
+    /// the server's ONLY FailedPrecondition family (leader churn /
+    /// stale-generation standdown; verified by the producer census,
+    /// see `classify_append_status`'s producer-census rows and the
+    /// exposure-producer-census check) — through the drain RETAINS
+    /// the slice. Pre-fix the classifier mapped FailedPrecondition to
+    /// the PERMANENT Refused exit: one leader handoff would have
+    /// counted-dropped the whole pending backlog, the exact shape the
+    /// auth-pair close above repaired one code over. Real
+    /// `tonic::Status::failed_precondition` with the production
+    /// NotLeader message, classified through the production
+    /// chokepoint; redelivery pinned uid-verbatim.
+    #[tokio::test(start_paused = true)]
+    async fn not_leader_pass_retains_backlog_without_strikes() {
+        let mut unshipped = minted_backlog(2);
+        let uids_before: Vec<String> = unshipped
+            .iter()
+            .map(|s| s.uid.as_str().to_owned())
+            .collect();
+        let shutdown = rio_common::signal::Token::new();
+        let pass = ship_all(&mut unshipped, &shutdown, EXPOSURE_SHIP_PASS_BUDGET, |_| {
+            let status = tonic::Status::failed_precondition(
+                "not leader — evidence not applied; retry against the current leader",
+            );
+            std::future::ready(classify_append_status(status.code()))
+        })
+        .await;
+        assert_eq!(
+            pass,
+            ShipPass::Completed {
+                retained: 2,
+                refused: 0
+            },
+            "leader churn retains the backlog — a transient mapped to the \
+             permanent Refused exit is the counted-drop defect"
+        );
+        let uids_after: Vec<String> = unshipped
+            .iter()
+            .map(|s| s.uid.as_str().to_owned())
+            .collect();
+        assert_eq!(uids_before, uids_after, "slices retained VERBATIM");
+        assert!(
+            unshipped.iter().all(|s| s.auth_strikes == 0),
+            "leader churn is not a credential observation — no strike"
+        );
+        // The post-churn pass delivers whole (the new leader answers).
+        let pass2 = ship_all(
+            &mut unshipped,
+            &shutdown,
+            EXPOSURE_SHIP_PASS_BUDGET,
+            |_: &PendingExposure| std::future::ready(ShipOutcome::Delivered),
+        )
+        .await;
+        assert_eq!(
+            pass2,
+            ShipPass::Completed {
+                retained: 0,
+                refused: 0
+            }
+        );
+        assert!(unshipped.is_empty());
+    }
+
+    // r[verify sec.authz.refusal-adjudication]
     // r[verify ctrl.informer.exposure-drain-budget+3]
     /// merged_bug_013 red R-1D (R17's violating red for
     /// `AUTH_STRIKE_BUDGET`): a slice carried to `AUTH_STRIKE_BUDGET -
@@ -2634,13 +2724,12 @@ mod tests {
     fn classify_append_status_total_over_tonic_codes() {
         use rio_proto::refusal::{CredentialRegime, RefusalJudgment, judge_refusal};
         use tonic::Code;
-        let refused = [
-            Code::InvalidArgument,
-            Code::OutOfRange,
-            Code::Unimplemented,
-            Code::FailedPrecondition,
-        ];
+        let refused = [Code::InvalidArgument, Code::Unimplemented];
         let auth_strike = [Code::Unauthenticated, Code::PermissionDenied];
+        // merged_bug_076: OutOfRange (never emitted by the server
+        // module) and FailedPrecondition (leader-churn family only)
+        // moved from the Refused cells to retention — the producer
+        // census owns the emitter-set claims.
         let transient = [
             Code::Ok,
             Code::Cancelled,
@@ -2649,6 +2738,8 @@ mod tests {
             Code::NotFound,
             Code::AlreadyExists,
             Code::ResourceExhausted,
+            Code::FailedPrecondition,
+            Code::OutOfRange,
             Code::Aborted,
             Code::Internal,
             Code::Unavailable,

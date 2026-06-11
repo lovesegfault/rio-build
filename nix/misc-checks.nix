@@ -1290,6 +1290,33 @@ in
         touch $out
       '';
 
+  # merged_bug_076: the node_informer drop classifier's producer-cite
+  # rationale, machine-diffed against the Status constructors the
+  # AdminService module actually mints. A `producer-census: <code> =
+  # emitted` row with zero matching constructors is the FALSE-CITE
+  # defect this rationale shipped with; a `never-emitted` row with a
+  # live constructor is emitter-set drift (the classifier arm needs
+  # re-derivation). Planted self-test arms (incl. the shipped defect
+  # verbatim) run before the real scan. Cross-crate by nature
+  # (controller classifier vs scheduler server module) — lives HERE,
+  # not in-crate, because a unit test cannot read the other crate's
+  # source under the per-member fileset (the embed+pin face's
+  # cross-crate sibling).
+  exposure-producer-census =
+    pkgs.runCommand "rio-exposure-producer-census"
+      {
+        # Full-tree staging ((vvvvv)): the scan quantifies over two
+        # crates' sources.
+        src = pkgs.lib.cleanSource ../.;
+        nativeBuildInputs = [ pkgs.python3 ];
+        scanScript = ../nix/exposure_producer_census.py;
+      }
+      ''
+        cp "$scanScript" exposure_producer_census.py
+        python3 exposure_producer_census.py "$src"
+        touch $out
+      '';
+
   census-enrollment =
     pkgs.runCommand "rio-census-enrollment"
       {
