@@ -1039,6 +1039,7 @@ impl MintedClaim {
 
 /// One claim attempt's wire verdict — shared by the listing pass and
 /// the resume pass so the two cannot drift on outcome semantics.
+#[derive(Debug)]
 enum PullAnswer {
     /// Boxed: the assignment dwarfs every other variant (~224 bytes vs
     /// zero) and the enum rides through match arms by value.
@@ -1368,12 +1369,13 @@ struct PassConversion {
     /// Fresh outcomes that were answered conversion-disproving
     /// rejections (`RejectedDisproving` / `RejectedAuth`).
     futile_rejections: usize,
-    /// Conversion-grade evidence (`FutilityEvidence::Conversion` —
-    /// Deliver/Gone), folded from BOTH lanes (round-8 WO-S2-2: the
-    /// pre-fix fold collapsed the typed evidence into an untyped
-    /// bool AND ran fresh-lane only, so a resume-lane Gone — the
-    /// documented reset-grade clean outcome — was invisible to the
-    /// futility latch).
+    /// Conversion-grade evidence (`FutilityEvidence::Conversion`),
+    /// folded LANE-AWARE from all three lanes (round-8 WO-S2-2 made
+    /// the resume-lane Gone visible; bug_152 made the fold take the
+    /// lane axis, so a PROBE Deliver — the standing oracle, payload
+    /// discarded — earns no credit: counted cells are claiming-lane
+    /// Delivers and either-lane Gones, exactly the reset-grade set
+    /// the latch comments document).
     conversions: usize,
     /// Fresh mints answered NotYetReady this pass (the contested
     /// population — round-8 WO-S2-1: [`PassOutcome::Contested`]'s
@@ -1457,14 +1459,43 @@ enum FutilityEvidence {
     Inconclusive,
 }
 
-fn futility_evidence(answer: &PullAnswer) -> FutilityEvidence {
-    match answer {
-        PullAnswer::Deliver(_) | PullAnswer::Gone => FutilityEvidence::Conversion,
-        PullAnswer::RejectedDisproving | PullAnswer::RejectedAuth => {
+/// bug_152 — the classifier takes BOTH axes
+/// `(PresentationLane, PullAnswer)`, the [`standing_effect`] shape:
+/// rustc exhaustiveness forces a per-lane verdict, so a new lane
+/// cannot silently inherit conversion-grade status. Per-arm
+/// rationale:
+///
+///   - `Deliver` is conversion evidence on the MINT-CAPABLE lanes
+///     (Fresh / ResumeClaiming — the claim is the conversion); on a
+///     PROBE it is the standing ORACLE answering "your mint is
+///     live" — payload discarded, entry re-charged — which proves a
+///     PAST conversion's liveness, never this pass's: NotFutile
+///     (no credit, no streak movement);
+///   - `Gone` converts on EVERY lane (the documented reset-grade
+///     clean outcome — an authoritative settle, either lane);
+///   - rejections are futile evidence on the FRESH lane only:
+///     resume/probe disproofs judge the credential PRESENTATION,
+///     never this worker's mint capability (the streak law is
+///     fresh-lane evidence — the law lives HERE, not at call
+///     sites);
+///   - `NotYetReady`/`Unanswered` carry no futility evidence on any
+///     lane; `Shutdown` abandons the pass unobserved.
+fn futility_evidence(lane: PresentationLane, answer: &PullAnswer) -> FutilityEvidence {
+    match (lane, answer) {
+        (PresentationLane::Fresh | PresentationLane::ResumeClaiming, PullAnswer::Deliver(_)) => {
+            FutilityEvidence::Conversion
+        }
+        (PresentationLane::Probe, PullAnswer::Deliver(_)) => FutilityEvidence::NotFutile,
+        (_, PullAnswer::Gone) => FutilityEvidence::Conversion,
+        (PresentationLane::Fresh, PullAnswer::RejectedDisproving | PullAnswer::RejectedAuth) => {
             FutilityEvidence::ConversionDisproved
         }
-        PullAnswer::NotYetReady { .. } | PullAnswer::Unanswered => FutilityEvidence::NotFutile,
-        PullAnswer::Shutdown => FutilityEvidence::Inconclusive,
+        (
+            PresentationLane::ResumeClaiming | PresentationLane::Probe,
+            PullAnswer::RejectedDisproving | PullAnswer::RejectedAuth,
+        ) => FutilityEvidence::NotFutile,
+        (_, PullAnswer::NotYetReady { .. } | PullAnswer::Unanswered) => FutilityEvidence::NotFutile,
+        (_, PullAnswer::Shutdown) => FutilityEvidence::Inconclusive,
     }
 }
 
@@ -1753,14 +1784,26 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
         if let PullAnswer::NotYetReady { retry_after } = &answer {
             pass.fold_retry_floor(*retry_after);
         }
-        // round-8 WO-S2-2 — resume-lane CONVERSION evidence (Gone /
-        // Deliver) folds into the pass: a Gone here is the documented
-        // reset-grade clean outcome the pre-fix fresh-only fold made
-        // invisible to the futility latch. Resume contests and
-        // disproofs stay out of the fold deliberately — they judge
-        // the credential presentation, not this worker's mint
-        // capability (the streak law is fresh-lane evidence only).
-        if matches!(futility_evidence(&answer), FutilityEvidence::Conversion) {
+        // The presentation lane, computed BEFORE any evidence fold
+        // (bug_152: the pre-fix fold ran lane-blind one statement
+        // above this computation).
+        let lane = if probing {
+            PresentationLane::Probe
+        } else {
+            PresentationLane::ResumeClaiming
+        };
+        // round-8 WO-S2-2 + bug_152 — conversion evidence folds
+        // LANE-AWARE through the two-axis classifier: a
+        // ResumeClaiming Deliver or an either-lane Gone converts; a
+        // PROBE Deliver is the standing oracle (payload discarded,
+        // entry re-charged below) and earns no credit; resume
+        // contests and disproofs judge the credential presentation,
+        // not this worker's mint capability (per-arm rationale at
+        // [`futility_evidence`]).
+        if matches!(
+            futility_evidence(lane, &answer),
+            FutilityEvidence::Conversion
+        ) {
             pass.conversions += 1;
         }
         // merged_bug_014 — the ONE transition law settles the
@@ -1777,11 +1820,6 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
         //     blocks probe mints);
         //   RejectedAuth keeps (merged_bug_074: rotation skew judges
         //     the presentation, not the original mint).
-        let lane = if probing {
-            PresentationLane::Probe
-        } else {
-            PresentationLane::ResumeClaiming
-        };
         let effect = standing_effect(lane, &answer);
         let unanswered_break = matches!(answer, PullAnswer::Unanswered);
         match (probing, answer) {
@@ -2068,7 +2106,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
         // PullAnswer alphabet; rustc is the census): the latch
         // consumes the per-variant counts, never a pre-collapsed
         // bool.
-        match futility_evidence(&answer) {
+        match futility_evidence(PresentationLane::Fresh, &answer) {
             FutilityEvidence::Conversion => {
                 pass.conversions += 1;
             }
@@ -6170,6 +6208,133 @@ mod tests {
     }
 
     // ===================================================================
+    // r[verify store.materialize.honest-beat]
+    /// W10-BL (bug_152): a confirm-probe DeliverExisting is a
+    /// STANDING ORACLE (payload discarded, entry re-charged) — it is
+    /// not conversion evidence for this pass and must not zero the
+    /// 64-pass withhold on a non-Delivered seal. Pre-fix the
+    /// conversion fold ran lane-blind BEFORE the lane split, so a
+    /// zero-slot probe's Deliver incremented pass.conversions and
+    /// reset_on_conversion closed the episode — contradicting both
+    /// adjacent comments (fresh/claiming-lane evidence; the reset arm
+    /// narrates Gone-either-lane only).
+    #[tokio::test(start_paused = true)]
+    async fn probe_deliver_does_not_reset_the_futility_withhold() {
+        let d0 = descriptor(70);
+        let d1 = descriptor(71);
+        let mut t = MockTransport::new(
+            vec![
+                Ok(listing(vec![d0.clone()])),
+                Ok(listing(vec![d1.clone()])),
+                Ok(listing(vec![d1.clone()])),
+                Ok(listing(vec![d1.clone()])),
+            ],
+            vec![
+                Ok(not_yet_ready()),
+                Ok(not_yet_ready()),
+                Err(tonic::Status::invalid_argument("shape can never mint")),
+                Ok(not_yet_ready()),
+                Err(tonic::Status::invalid_argument("shape can never mint")),
+                Ok(not_yet_ready()),
+                Err(tonic::Status::invalid_argument("shape can never mint")),
+                // The zero-slot probe: d0's standing oracle answers
+                // with MY LIVE MINT (DeliverExisting).
+                Ok(deliver_for_job(
+                    "exec-live-d0",
+                    "/nix/store/live-d0.drv",
+                    Uuid::nil(),
+                )),
+            ],
+            vec![],
+        );
+        let mut ledger = ResumeLedger::default();
+        let mut latch = ListFailureLatch::default();
+        let mut fut = ConversionFutilityLatch::default();
+        let tok = token();
+        let inst = instance("probe-deliver-w");
+        engage_futility_with_credential(&mut t, &mut ledger, &mut latch, &mut fut, &inst, &tok)
+            .await;
+
+        // The zero-slot pass: the only presentation is d0's confirm
+        // probe (probing = 0 >= 0); its DeliverExisting is discarded.
+        let p = poll_and_claim(&mut t, &inst, 0, &mut ledger, &mut latch, &mut fut, &tok).await;
+        assert!(p.is_empty(), "the probe's payload is discarded");
+        assert!(
+            fut.withholding(),
+            "left: the probe-lane DeliverExisting zeroed the 64-pass \
+             withhold (an unsanctioned reset on a non-Delivered seal) / \
+             right: conversion credit only on sanctioned lanes — the \
+             withhold survives the oracle answer"
+        );
+        assert!(
+            fut.episode_open(),
+            "the episode stays open (no conversion was demonstrated)"
+        );
+    }
+
+    /// W10-BL (the product table, R15): the full
+    /// `(PresentationLane, PullAnswer)` matrix — 3 x 7 = 21 cells,
+    /// each cell's verdict from BOTH alphabets. The consumption is
+    /// exhaustive per axis (arrays over the closed enums), so a new
+    /// lane or answer variant fails this build until its row lands.
+    #[test]
+    fn futility_evidence_lane_answer_product() {
+        use FutilityEvidence as E;
+        use PresentationLane as L;
+        let deliver = || PullAnswer::Deliver(Box::default());
+        // (lane, answer, expected) — every cell, hand-transcribed
+        // (the independent oracle), never computed from the impl.
+        let cells: Vec<(L, PullAnswer, &str)> = vec![
+            (L::Fresh, deliver(), "conversion"),
+            (L::ResumeClaiming, deliver(), "conversion"),
+            (L::Probe, deliver(), "not-futile"),
+            (L::Fresh, PullAnswer::Gone, "conversion"),
+            (L::ResumeClaiming, PullAnswer::Gone, "conversion"),
+            (L::Probe, PullAnswer::Gone, "conversion"),
+            (L::Fresh, PullAnswer::RejectedDisproving, "disproved"),
+            (
+                L::ResumeClaiming,
+                PullAnswer::RejectedDisproving,
+                "not-futile",
+            ),
+            (L::Probe, PullAnswer::RejectedDisproving, "not-futile"),
+            (L::Fresh, PullAnswer::RejectedAuth, "disproved"),
+            (L::ResumeClaiming, PullAnswer::RejectedAuth, "not-futile"),
+            (L::Probe, PullAnswer::RejectedAuth, "not-futile"),
+            (
+                L::Fresh,
+                PullAnswer::NotYetReady { retry_after: None },
+                "not-futile",
+            ),
+            (
+                L::ResumeClaiming,
+                PullAnswer::NotYetReady { retry_after: None },
+                "not-futile",
+            ),
+            (
+                L::Probe,
+                PullAnswer::NotYetReady { retry_after: None },
+                "not-futile",
+            ),
+            (L::Fresh, PullAnswer::Unanswered, "not-futile"),
+            (L::ResumeClaiming, PullAnswer::Unanswered, "not-futile"),
+            (L::Probe, PullAnswer::Unanswered, "not-futile"),
+            (L::Fresh, PullAnswer::Shutdown, "inconclusive"),
+            (L::ResumeClaiming, PullAnswer::Shutdown, "inconclusive"),
+            (L::Probe, PullAnswer::Shutdown, "inconclusive"),
+        ];
+        assert_eq!(cells.len(), 21, "3 lanes x 7 answers — the full product");
+        for (lane, answer, expect) in cells {
+            let got = match futility_evidence(lane, &answer) {
+                E::Conversion => "conversion",
+                E::ConversionDisproved => "disproved",
+                E::NotFutile => "not-futile",
+                E::Inconclusive => "inconclusive",
+            };
+            assert_eq!(got, expect, "cell ({lane:?}, {answer:?})");
+        }
+    }
+
     // Round-9 WO-S1-5 (bug_055) — the zero-slot pass presents resume
     // answers: the resume lane is REQUIREMENT-FREE (the honest-beat
     // rule's own quantifier: "the resume presentation lane MUST never
