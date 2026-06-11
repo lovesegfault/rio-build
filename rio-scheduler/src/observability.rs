@@ -318,6 +318,15 @@ pub enum ReboundPolicy {
 /// BEFORE the tick body persists (sla/cost.rs leader prelude); the
 /// spot-price poller's own edge-skip re-arms the same way. False
 /// stores are monotone-safe: a spurious extra reload is one PG read.
+/// CHECK-TO-WRITE DISTANCE (merged_bug_146, the round-10 axis): this
+/// registry covers latch WRITERS; the distance between a leadership
+/// READ and a durable WRITE is covered structurally — the SLA plane's
+/// PG mutators are reachable only through `sla::cost::
+/// LeaderOwnedPersist`, which re-verifies the latch AND the captured
+/// tenure generation AT the write boundary, with the per-row
+/// monotonicity qual as the PG-side fence (the W10-BB census in this
+/// file's tests holds the population: no bare `.execute(` outside the
+/// sealed row writers).
 pub const LEADER_EDGES: &[LeaderEdge] = &[
     LeaderEdge {
         name: "cost-table-edge-reload-latch",
@@ -500,5 +509,65 @@ mod tests {
                  LEADER_EDGES registry"
             );
         }
+    }
+
+    /// W10-BB (merged_bug_146, [GEN-SET]): the check-to-write distance
+    /// axis — the LEADER_EDGES census covered latch WRITERS but
+    /// nothing forbade an await between a leadership read and a
+    /// durable write. Now structural: every PG-mutating `.execute(`
+    /// in the SLA cost plane lives inside the sealed row writers
+    /// (`persist_rows` / `sweep_interrupt_samples_rows`), whose ONLY
+    /// callers are `LeaderOwnedPersist` methods that re-verify
+    /// leadership AT the write boundary. A gated-at-entry writer
+    /// (check, await, bare execute) is the planted red.
+    #[test]
+    fn w10_bb_cost_plane_durable_writes_are_leader_owned() {
+        /// Violations: `.execute(` outside the sealed-rows region
+        /// (between the first sealed row fn and the
+        /// `LeaderOwnedPersist` definition) in non-test source.
+        fn violations(src: &str) -> Vec<usize> {
+            let prod = src.split("mod tests").next().unwrap_or(src);
+            let start = prod.find("async fn persist_rows");
+            let end = prod.find("struct LeaderOwnedPersist");
+            prod.lines()
+                .enumerate()
+                .scan(0usize, |pos, (i, line)| {
+                    let line_start = *pos;
+                    *pos += line.len() + 1;
+                    Some((i, line_start, line))
+                })
+                .filter(|(_, at, line)| {
+                    line.contains(".execute(")
+                        && !match (start, end) {
+                            (Some(s), Some(e)) => *at > s && *at < e,
+                            _ => false,
+                        }
+                })
+                .map(|(i, _, _)| i + 1)
+                .collect()
+        }
+
+        let live = violations(include_str!("sla/cost.rs"));
+        assert!(
+            live.is_empty(),
+            "durable writes outside the leader-owned sealed rows in \
+             sla/cost.rs at lines {live:?} — route through LeaderOwnedPersist"
+        );
+        // R22′ plant: the gated-at-entry writer shape must red.
+        let plant = "if leader.is_leader() {\n\
+            refresh().await;\n\
+            sqlx::query(\"UPDATE x\").execute(db.pool()).await;\n\
+            }\n";
+        assert_eq!(
+            violations(plant).len(),
+            1,
+            "the gated-at-entry writer plant must red"
+        );
+        // Green twin: an execute inside the sealed region passes.
+        let green = "async fn persist_rows() {\n\
+            q.execute(db.pool()).await;\n\
+            }\n\
+            struct LeaderOwnedPersist;\n";
+        assert!(violations(green).is_empty());
     }
 }

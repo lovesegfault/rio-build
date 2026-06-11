@@ -679,7 +679,17 @@ impl CostTable {
 
     /// Persist all EMAs to `sla_ema_state` (upsert). One row per
     /// `(cluster, key)`; small (≤ 2·|H| + 2·|H| rows), so no batching.
-    pub async fn persist(&self, db: &SchedulerDb) -> anyhow::Result<()> {
+    ///
+    /// PRIVATE BY DESIGN (merged_bug_146, R24): the sole caller is
+    /// [`LeaderOwnedPersist::persist`] — the construction type that
+    /// re-verifies leadership AT the write boundary. Every upsert
+    /// below carries the updated_at/last_observed monotonicity qual
+    /// (the PG-side fence): a row never rewinds, whoever the writer
+    /// is — the exact corruption a deposed writer's stale snapshot
+    /// used to land (rewound updated_at corrupts the next decay dt).
+    /// In-module tests drive this directly for ROW semantics; the
+    /// leadership gate has its own witnesses (W10-BA).
+    async fn persist_rows(&self, db: &SchedulerDb) -> anyhow::Result<()> {
         // Under non-Spot the §Static contract is "seeds only" —
         // skipping the price upsert means leftover Spot-era rows age
         // out instead of being refreshed every 10min by
@@ -693,7 +703,8 @@ impl CostTable {
                 sqlx::query(
                     "INSERT INTO sla_ema_state (cluster, key, value, updated_at) \
                      VALUES ($1, $2, $3, to_timestamp($4)) \
-                     ON CONFLICT (cluster, key) DO UPDATE SET value = $3, updated_at = to_timestamp($4)",
+                     ON CONFLICT (cluster, key) DO UPDATE SET value = $3, updated_at = to_timestamp($4) \
+                     WHERE sla_ema_state.updated_at <= to_timestamp($4)",
                 )
                 .bind(&self.cluster)
                 .bind(format!("price:{}", cell_label(cell)))
@@ -708,7 +719,8 @@ impl CostTable {
                 "INSERT INTO sla_ema_state (cluster, key, value, numerator, denominator, updated_at) \
                  VALUES ($1, $2, $3, $4, $5, to_timestamp($6)) \
                  ON CONFLICT (cluster, key) DO UPDATE SET \
-                   value = $3, numerator = $4, denominator = $5, updated_at = to_timestamp($6)",
+                   value = $3, numerator = $4, denominator = $5, updated_at = to_timestamp($6) \
+                 WHERE sla_ema_state.updated_at <= to_timestamp($6)",
             )
             .bind(&self.cluster)
             .bind(format!("lambda:{h}"))
@@ -723,7 +735,8 @@ impl CostTable {
             sqlx::query(
                 "INSERT INTO sla_ema_state (cluster, key, value, updated_at) \
                  VALUES ($1, $2, $3, to_timestamp($4)) \
-                 ON CONFLICT (cluster, key) DO UPDATE SET value = $3, updated_at = to_timestamp($4)",
+                 ON CONFLICT (cluster, key) DO UPDATE SET value = $3, updated_at = to_timestamp($4) \
+                 WHERE sla_ema_state.updated_at <= to_timestamp($4)",
             )
             .bind(&self.cluster)
             .bind(format!("node_count:{h}"))
@@ -749,7 +762,8 @@ impl CostTable {
                      VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7)) \
                      ON CONFLICT (cluster, hw_class, capacity_type, instance_type) DO UPDATE SET \
                      cores = EXCLUDED.cores, mem_bytes = EXCLUDED.mem_bytes, \
-                     last_observed = EXCLUDED.last_observed",
+                     last_observed = EXCLUDED.last_observed \
+                     WHERE sla_observed_instance_types.last_observed <= EXCLUDED.last_observed",
                 )
                 .bind(&self.cluster)
                 .bind(h)
@@ -1556,6 +1570,11 @@ pub async fn interrupt_housekeeping(
                 continue;
             }
         }
+        // merged_bug_146: capture the leadership facts AT TICK ENTRY —
+        // every durable write below re-verifies against this tenure AT
+        // the write boundary (the entry check above is scheduling, not
+        // the fence; the body spans PG awaits a deposition can race).
+        let owner = LeaderOwnedPersist::begin(&leader, &was_leader);
         // Snapshot → refresh_lambda → write back λ ONLY (don't clobber
         // a concurrent `spot_price_poller` price fold).
         let mut snap = cost.read().clone();
@@ -1564,15 +1583,21 @@ pub async fn interrupt_housekeeping(
         }
         let cluster = snap.cluster.clone();
         cost.write().absorb_lambda(snap);
-        if let Err(e) = sweep_interrupt_samples(&db, &cluster).await {
-            tracing::warn!(error = %e, "interrupt_samples retention sweep failed");
+        match owner.sweep_interrupt_samples(&db, &cluster).await {
+            Ok(Some(_)) | Ok(None) => {}
+            Err(e) => tracing::warn!(error = %e, "interrupt_samples retention sweep failed"),
         }
         // Persist a FRESH snapshot (re-read after absorb so any
         // concurrent price update is included). Bound to a let:
         // parking_lot guards aren't Send across .await.
         let snap = cost.read().clone();
-        if let Err(e) = snap.persist(&db).await {
-            tracing::warn!(error = %e, "cost-table persist failed");
+        match owner.persist(&snap, &db).await {
+            Ok(PersistOutcome::Persisted) => {}
+            Ok(PersistOutcome::RefusedDeposed) => tracing::warn!(
+                "cost-table persist refused at the write boundary: this body \
+                 outlived its tenure (deposed mid-body); the successor owns the plane"
+            ),
+            Err(e) => tracing::warn!(error = %e, "cost-table persist failed"),
         }
     }
 }
@@ -1589,7 +1614,12 @@ pub async fn interrupt_housekeeping(
 /// the `build_samples` age-sweep at `db/history.rs`; the
 /// `(cluster, at)` index from M_043 makes the range delete cheap.
 /// Lease-gated via the caller (one writer).
-pub(crate) async fn sweep_interrupt_samples(db: &SchedulerDb, cluster: &str) -> sqlx::Result<u64> {
+/// PRIVATE BY DESIGN (merged_bug_146, R24): the sole caller is
+/// [`LeaderOwnedPersist::sweep_interrupt_samples`]. The DELETE is
+/// age-keyed retention (idempotent, no rewind face), so the
+/// write-boundary gate is the latch+tenure check alone — there is no
+/// per-row monotonicity to qual.
+async fn sweep_interrupt_samples_rows(db: &SchedulerDb, cluster: &str) -> sqlx::Result<u64> {
     let r = sqlx::query(
         "DELETE FROM interrupt_samples \
          WHERE cluster = $1 AND at < now() - interval '7 days'",
@@ -1598,6 +1628,95 @@ pub(crate) async fn sweep_interrupt_samples(db: &SchedulerDb, cluster: &str) -> 
     .execute(db.pool())
     .await?;
     Ok(r.rows_affected())
+}
+
+/// The R24/R27 construction type for the SLA plane's durable writes
+/// (merged_bug_146): the ONLY path to `sla_ema_state` /
+/// `sla_observed_instance_types` / `interrupt_samples` mutation.
+/// Constructed at tick entry FROM the leadership facts it fences
+/// against; every durable write re-verifies AT THE WRITE BOUNDARY —
+/// the REVIEW.md canon ("persist() gated on the flag AT persist
+/// time") made constructional rather than conventional:
+///
+/// - **The belt (local, cheap):** `still_owner()` re-reads
+///   `is_leader`, the cost `was_leader` latch, and the tenure
+///   GENERATION captured at construction — a lose-then-reacquire
+///   between tick entry and the write changes the generation even
+///   when `is_leader` reads true again, so the stale body refuses.
+/// - **The suspenders (PG-side, per-row):** the upsert SQL carries
+///   the updated_at/last_observed monotonicity qual — a row never
+///   rewinds, whoever the writer is. The deposed-writer corruption
+///   IS a rewind (stale snapshot stamps over the successor's fresher
+///   rows, corrupting the next decay dt), so PG itself refuses it
+///   row by row even if a racing write slips past the latch.
+///
+/// Refusal is typed ([`PersistOutcome::RefusedDeposed`]) and logged
+/// by callers — never an error: a deposed tick has nothing to
+/// persist and the successor owns the plane.
+pub(crate) struct LeaderOwnedPersist {
+    leader: LeaderState,
+    was_leader: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    tenure: u64,
+}
+
+/// What a leader-owned write attempt did at the write boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PersistOutcome {
+    /// The boundary check held and the rows went to PG (rows that
+    /// would rewind are refused inside the SQL, silently — the qual).
+    Persisted,
+    /// The boundary check failed: this body outlived its tenure
+    /// (deposed, or deposed-and-reacquired). Nothing was written.
+    RefusedDeposed,
+}
+
+impl LeaderOwnedPersist {
+    /// Capture the leadership facts at tick entry. The tenure
+    /// generation is the fencing token the write boundary compares.
+    pub(crate) fn begin(
+        leader: &LeaderState,
+        was_leader: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            leader: leader.clone(),
+            was_leader: std::sync::Arc::clone(was_leader),
+            tenure: leader.generation(),
+        }
+    }
+
+    /// The write-boundary check (merged_bug_146): latch AND tenure.
+    fn still_owner(&self) -> bool {
+        self.leader.is_leader()
+            && self.was_leader.load(std::sync::atomic::Ordering::Relaxed)
+            && self.leader.generation() == self.tenure
+    }
+
+    /// Leader-owned [`CostTable::persist_rows`]: refuses at the write
+    /// boundary if this body outlived its tenure.
+    pub(crate) async fn persist(
+        &self,
+        snap: &CostTable,
+        db: &SchedulerDb,
+    ) -> anyhow::Result<PersistOutcome> {
+        if !self.still_owner() {
+            return Ok(PersistOutcome::RefusedDeposed);
+        }
+        snap.persist_rows(db).await?;
+        Ok(PersistOutcome::Persisted)
+    }
+
+    /// Leader-owned retention sweep: same boundary, no rewind face
+    /// (the DELETE is age-keyed and idempotent).
+    pub(crate) async fn sweep_interrupt_samples(
+        &self,
+        db: &SchedulerDb,
+        cluster: &str,
+    ) -> sqlx::Result<Option<u64>> {
+        if !self.still_owner() {
+            return Ok(None);
+        }
+        sweep_interrupt_samples_rows(db, cluster).await.map(Some)
+    }
 }
 
 /// Fold one [`poll_spot_once`] result into `snap` and emit the
@@ -2178,7 +2297,7 @@ mod tests {
             (cell.clone(), "c7i.8xlarge".into(), 32, 64 << 30),
             (cell.clone(), "m7i.8xlarge".into(), 32, 128 << 30),
         ]);
-        a.persist(&sdb).await.unwrap();
+        a.persist_rows(&sdb).await.unwrap();
 
         // Fresh load (Spot) → menu repopulated, sorted.
         let a2 = CostTable::load(&sdb, "us-east-1", HwCostSource::Spot)
@@ -2306,6 +2425,74 @@ mod tests {
         assert!((obs[&("mid-ebs-x86".into(), CapacityType::Spot)] - want).abs() < 1e-9);
     }
 
+    /// W10-BA (merged_bug_146): a replica deposed mid-body cannot
+    /// clobber the successor's rows. Pre-fix the unfenced
+    /// last-writer-wins upsert landed the deposed snapshot wholesale —
+    /// including REWINDING updated_at, corrupting the successor's next
+    /// decay dt (the hazard the persist comment itself named). Both
+    /// layers witnessed: the write-boundary refusal (belt) and the
+    /// per-row monotonicity qual (suspenders).
+    #[tokio::test]
+    async fn w10_ba_deposed_mid_body_cannot_clobber_successor_rows() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let sdb = SchedulerDb::new(db.pool.clone());
+        let cell = ("intel-8".into(), CapacityType::Spot);
+
+        // The SUCCESSOR's fresher row (data-time 2000) is durable.
+        let mut successor = CostTable::seeded("us-east-1", HwCostSource::Spot);
+        successor.set_price("intel-8", CapacityType::Spot, 0.7, 2000.0);
+        successor.persist_rows(&sdb).await.unwrap();
+
+        // The deposed writer captured its tenure at tick entry...
+        let leader = rio_lease::LeaderState::always_leader(Arc::new(AtomicU64::new(7)));
+        let was_leader = Arc::new(AtomicBool::new(true));
+        let owner = LeaderOwnedPersist::begin(&leader, &was_leader);
+        // ...and was deposed mid-body (the LEADER_EDGES lose cell
+        // writes exactly this latch).
+        was_leader.store(false, Ordering::Relaxed);
+
+        // Its snapshot is STALE (data-time 1000, pre-deposition).
+        let mut stale = CostTable::seeded("us-east-1", HwCostSource::Spot);
+        stale.set_price("intel-8", CapacityType::Spot, 0.1, 1000.0);
+
+        // The belt: the write boundary refuses the deposed body.
+        assert_eq!(
+            owner.persist(&stale, &sdb).await.unwrap(),
+            PersistOutcome::RefusedDeposed,
+            "the write boundary must refuse a deposed body"
+        );
+
+        // The tenure face: a lose→re-acquire between entry and write
+        // is a DIFFERENT tenure even though is_leader reads true
+        // again — the captured generation is the fencing token.
+        let leader2 = rio_lease::LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        leader2.on_acquire(3);
+        let was2 = Arc::new(AtomicBool::new(true));
+        let owner2 = LeaderOwnedPersist::begin(&leader2, &was2);
+        leader2.on_lose();
+        leader2.on_acquire(4);
+        assert_eq!(
+            owner2.persist(&stale, &sdb).await.unwrap(),
+            PersistOutcome::RefusedDeposed,
+            "a re-acquired tenure must refuse the old body's write"
+        );
+
+        // The suspenders: even a write that slips the latch entirely
+        // cannot rewind a row — PG's monotonicity qual refuses it.
+        stale.persist_rows(&sdb).await.unwrap();
+        let after = CostTable::load(&sdb, "us-east-1", HwCostSource::Spot)
+            .await
+            .unwrap();
+        assert!(
+            (after.price(&cell) - 0.7).abs() < 1e-9,
+            "the successor's row survives a stale writer: no clobber, no \
+             updated_at rewind (the merged_bug_146 red) — got {}",
+            after.price(&cell)
+        );
+    }
+
     /// `persist`/`load`/`refresh_lambda` are cluster-scoped: two
     /// schedulers writing to the same global DB with different
     /// `cluster` keys don't read each other's EMAs or interrupt rows.
@@ -2320,7 +2507,7 @@ mod tests {
         // interrupt row.
         let mut a = CostTable::seeded("us-east-1", HwCostSource::Spot);
         a.set_price("intel-8", CapacityType::Spot, 0.5, 1000.0);
-        a.persist(&sdb).await.unwrap();
+        a.persist_rows(&sdb).await.unwrap();
         sqlx::query(
             "INSERT INTO interrupt_samples (cluster, hw_class, kind, value) \
              VALUES ('us-east-1', 'intel-8', 'interrupt', 5), \
@@ -2352,7 +2539,7 @@ mod tests {
         // B persists then A reloads: A's price unchanged (PK is
         // (cluster, key) — no overwrite).
         b.set_price("intel-8", CapacityType::Spot, 0.01, 2000.0);
-        b.persist(&sdb).await.unwrap();
+        b.persist_rows(&sdb).await.unwrap();
         let a4 = CostTable::load(&sdb, "us-east-1", HwCostSource::Spot)
             .await
             .unwrap();
@@ -2369,7 +2556,7 @@ mod tests {
         let sdb = SchedulerDb::new(db.pool.clone());
         let mut t = CostTable::seeded("c", HwCostSource::Spot);
         t.set_price("h", CapacityType::Spot, 0.5, 1000.0);
-        t.persist(&sdb).await.unwrap();
+        t.persist_rows(&sdb).await.unwrap();
         let r = CostTable::load(&sdb, "c", HwCostSource::Spot)
             .await
             .unwrap();
@@ -2404,7 +2591,7 @@ mod tests {
             },
         );
         t.set_node_count("intel-7", 12.5, 7100.0);
-        t.persist(&sdb).await.unwrap();
+        t.persist_rows(&sdb).await.unwrap();
 
         let r = CostTable::load(&sdb, "c", HwCostSource::Spot)
             .await
@@ -2460,7 +2647,7 @@ mod tests {
         // top of the load-skip — interrupt_housekeeping persists every
         // 10min regardless of source).
         t.set_price("h1", CapacityType::Spot, 0.099, 2000.0);
-        t.persist(&sdb).await.unwrap();
+        t.persist_rows(&sdb).await.unwrap();
         let n: i64 =
             sqlx::query_scalar("SELECT count(*) FROM sla_ema_state WHERE key LIKE 'price:%'")
                 .fetch_one(&db.pool)
@@ -2761,7 +2948,7 @@ mod tests {
         // Seed PG with the previous leader's evolved state.
         let mut prev = CostTable::seeded("c", HwCostSource::Spot);
         prev.set_price("h", CapacityType::Spot, 0.08, 5000.0);
-        prev.persist(&sdb).await.unwrap();
+        prev.persist_rows(&sdb).await.unwrap();
 
         // This replica's stale in-mem startup snapshot.
         let mut mine = CostTable::seeded("c", HwCostSource::Spot);
@@ -2818,7 +3005,7 @@ mod tests {
         // Seed PG with the previous leader's evolved state.
         let mut prev = CostTable::seeded("c", HwCostSource::Spot);
         prev.set_price("h", CapacityType::Spot, 0.08, 5000.0);
-        prev.persist(&sdb).await.unwrap();
+        prev.persist_rows(&sdb).await.unwrap();
 
         // This replica's stale in-mem startup snapshot.
         let mut mine = CostTable::seeded("c", HwCostSource::Spot);
@@ -3035,7 +3222,7 @@ mod tests {
         .execute(&db.pool)
         .await
         .unwrap();
-        let n = sweep_interrupt_samples(&sdb, "c").await.unwrap();
+        let n = sweep_interrupt_samples_rows(&sdb, "c").await.unwrap();
         assert_eq!(n, 1, "exactly the >7d row in cluster c");
         let left: Vec<(String, f64)> = sqlx::query_as(
             "SELECT cluster, EXTRACT(EPOCH FROM now() - at)::float8 \
