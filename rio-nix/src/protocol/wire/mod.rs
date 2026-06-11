@@ -140,7 +140,7 @@ async fn read_padded_body<R: AsyncRead + Unpin>(r: &mut R, len: usize) -> Result
 /// Read a length-prefixed, padded byte string.
 ///
 /// The `MAX_STRING_LEN` check precedes any allocation, and the body buffer
-/// grows with received data (see [`read_exact_growing`]) — an oversize or
+/// grows with received data (see `read_exact_growing`) — an oversize or
 /// unfulfilled length claim cannot reserve memory it never fills.
 pub async fn read_bytes<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>> {
     let len = read_u64(r).await?;
