@@ -124,4 +124,81 @@ pub fn describe_metrics() {
          degraded fleet-wide; the lines remain durable in the store and \
          readable via `rio-cli logs` regardless."
     );
+
+    // r[impl obs.metric.alert-counter-seeded]
+    seed_alert_counters();
+}
+
+/// One boot-seeded counter family (name + closed label axis). Mirrors
+/// `rio_test_support::metrics::SeededCounter` so the alert-parity test
+/// (tests/alert_metrics.rs) consumes this exact table — the store/
+/// scheduler/controller pattern, adopted when the store ScaledObject's
+/// abort-aware trigger made `rio_gateway_putpath_aborted_retries_total`
+/// the gateway's first alert-referenced counter.
+pub struct SeededSeries {
+    pub name: &'static str,
+    pub label: Option<(&'static str, &'static [&'static str])>,
+}
+
+/// The `attempt` label axis of `rio_gateway_putpath_aborted_retries_total`:
+/// the emit site charges `attempt.to_string()` for attempt in
+/// 1..=`PUT_PATH_ABORTED_MAX_ATTEMPTS` (handler/grpc.rs — attempt is
+/// incremented before the emit, and the budget check caps it at MAX).
+/// The closed production set, pinned to the const by
+/// `putpath_retry_attempt_axis_matches_the_emit_law`.
+pub const PUTPATH_ABORTED_RETRY_ATTEMPTS: &[&str] = &["1", "2", "3", "4", "5", "6", "7", "8"];
+
+/// Every alert-`expr:`-referenced rio_gateway counter, born at 0 at
+/// boot on every replica (the parity test fails when a
+/// PrometheusRule/ScaledObject references a counter missing here).
+/// The store ScaledObject's demand-side inhibitor trigger
+/// (`sum(rate(rio_gateway_putpath_aborted_retries_total[2m]))`) is the
+/// founding member: a scale-down inhibitor evaluating an absent series
+/// until the first abort is exactly the birth-gap class (bug_322) the
+/// seed table exists to kill.
+pub const ALERT_SEEDED_COUNTERS: &[SeededSeries] = &[SeededSeries {
+    name: "rio_gateway_putpath_aborted_retries_total",
+    label: Some(("attempt", PUTPATH_ABORTED_RETRY_ATTEMPTS)),
+}];
+
+/// Birth every [`ALERT_SEEDED_COUNTERS`] series at 0 (tail of
+/// [`describe_metrics`] — `rio_common::server::bootstrap` installs the
+/// exporter immediately before, so the seeds land on the scrape
+/// surface).
+fn seed_alert_counters() {
+    for s in ALERT_SEEDED_COUNTERS {
+        match s.label {
+            None => metrics::counter!(s.name).absolute(0),
+            Some((axis, values)) => {
+                for v in values {
+                    metrics::counter!(s.name, axis => *v).absolute(0);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod alert_seed_tests {
+    use super::*;
+
+    /// The seeded `attempt` axis IS the emit law's value set:
+    /// `(1..=PUT_PATH_ABORTED_MAX_ATTEMPTS).to_string()` — machine-
+    /// derived from the same const the emit site bounds itself by, so
+    /// widening the retry budget without widening the seed product
+    /// fails here instead of leaving the new attempt series birth-
+    /// gapped.
+    #[test]
+    fn putpath_retry_attempt_axis_matches_the_emit_law() {
+        let expect: Vec<String> = (1..=crate::handler::grpc::PUT_PATH_ABORTED_MAX_ATTEMPTS)
+            .map(|a| a.to_string())
+            .collect();
+        let got: Vec<&str> = PUTPATH_ABORTED_RETRY_ATTEMPTS.to_vec();
+        assert_eq!(
+            got,
+            expect.iter().map(String::as_str).collect::<Vec<_>>(),
+            "PUTPATH_ABORTED_RETRY_ATTEMPTS must equal the emit site's \
+             1..=PUT_PATH_ABORTED_MAX_ATTEMPTS string product"
+        );
+    }
 }

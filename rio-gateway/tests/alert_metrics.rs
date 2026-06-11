@@ -1,13 +1,15 @@
 //! Alert-parity policy test (merged_bug_236 adoption — see
 //! rio-scheduler/tests/alert_metrics.rs for the pattern's origin).
 //!
-//! The gateway's only alert-surface metric today is the
-//! `rio_gateway_channels_active` ScaledObject query; this adoption
-//! file is what the `alert-parity-adoption` misc-check requires so a
-//! FUTURE gateway alert cannot reference an unseeded counter or an
-//! unowned gauge without failing here.
+//! Consumes `rio_gateway::ALERT_SEEDED_COUNTERS` (the one-declaration
+//! law: the seeder and this test read the same table). The founding
+//! counter member is `rio_gateway_putpath_aborted_retries_total` —
+//! referenced by the store ScaledObject's demand-side inhibitor
+//! trigger, so its birth gap would blind the scale-down inhibitor
+//! exactly during a quiet boot.
 // r[verify obs.metric.alert-counter-seeded]
 
+use rio_gateway::ALERT_SEEDED_COUNTERS;
 use rio_test_support::metrics::{GaugeExemption, SeededCounter, assert_alert_metrics_covered};
 
 /// Helm templates whose `expr:`/`query:` blocks may reference gateway
@@ -17,10 +19,6 @@ const ALERT_YAMLS: &[&str] = &[
     "../infra/helm/rio-build/templates/store-scaledobject.yaml",
     "../infra/helm/rio-build/templates/gateway-scaledobject.yaml",
 ];
-
-/// No gateway counters are alert-referenced yet — the empty table is
-/// the assertion that none slipped in unseeded.
-const SEEDED: &[SeededCounter] = &[];
 
 fn gauge_exemptions() -> Vec<GaugeExemption> {
     vec![GaugeExemption {
@@ -35,12 +33,19 @@ fn gauge_exemptions() -> Vec<GaugeExemption> {
 
 #[test]
 fn alert_referenced_series_exist_from_boot() {
+    let seeded: Vec<SeededCounter> = ALERT_SEEDED_COUNTERS
+        .iter()
+        .map(|s| SeededCounter {
+            name: s.name,
+            label: s.label,
+        })
+        .collect();
     let exemptions = gauge_exemptions();
     assert_alert_metrics_covered(
         ALERT_YAMLS,
         "rio_gateway_",
         rio_gateway::describe_metrics,
-        SEEDED,
+        &seeded,
         &[],
         &exemptions,
         "rio-gateway",

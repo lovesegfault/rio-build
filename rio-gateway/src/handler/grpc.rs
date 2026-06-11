@@ -237,7 +237,10 @@ pub(super) async fn grpc_is_valid_path(
 /// margin rather than tightened. Shared with rio-builder's PutPath
 /// retry (`upload.rs`): both hit the same store-side placeholder
 /// contention, so they use the same curve+budget.
-const PUT_PATH_ABORTED_MAX_ATTEMPTS: u32 = 8;
+// pub(crate): the alert-seed axis pin in lib.rs
+// (putpath_retry_attempt_axis_matches_the_emit_law) derives the seeded
+// label product from this bound.
+pub(crate) const PUT_PATH_ABORTED_MAX_ATTEMPTS: u32 = 8;
 const PUT_PATH_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Backoff {
     base: std::time::Duration::from_millis(50),
     mult: 2.0,
