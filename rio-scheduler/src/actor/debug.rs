@@ -153,6 +153,14 @@ impl DagActor {
                 });
                 let _ = reply.send(ok);
             }
+            DebugCmd::StallTickPhases {
+                phases,
+                each,
+                reply,
+            } => {
+                self.tick_phase_stall = Some((phases, each));
+                let _ = reply.send(());
+            }
         }
     }
 

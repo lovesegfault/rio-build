@@ -592,6 +592,87 @@ pub enum AdminQuery {
     },
 }
 
+/// Service lane for an [`AdminQuery`] (round-9 B8). `Fast` rides the
+/// dedicated admin fast lane: served between mailbox commands with
+/// priority AND at every Tick phase boundary, so delivery is bounded
+/// by the largest indivisible actor work slice instead of the whole
+/// mailbox FIFO (the live_053 shape: an 18s Tick starved
+/// `MintExecutorTokens`, the controller's 5s admin deadline lapsed,
+/// and spawn ticks were skipped while the fleet sat idle). `Bulk`
+/// stays mailbox-FIFO — `Bulk` is therefore also the lane whose
+/// request/reply round-trip flushes everything queued ahead of it
+/// (the test-harness `barrier()` contract on `GcRoots`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminLane {
+    /// Read-only AND cheap enough to serve mid-Tick: graph-independent
+    /// state reads, or (for the spawn-path mint) one warm-memo
+    /// forecast pass. Reordering ahead of queued commands is safe —
+    /// every gRPC caller holds an independent request/reply pair and
+    /// awaits its own reply before issuing a dependent call.
+    Fast,
+    /// Mailbox-FIFO: graph-bounded reads whose payload is bulk data,
+    /// mutating admin operations, and the barrier query. Serving these
+    /// mid-Tick would trade housekeeping latency for no SLO (their
+    /// callers poll or are operator-driven).
+    Bulk,
+}
+
+impl AdminQuery {
+    /// Lane classification — exhaustive by variant (R14: a new query
+    /// must pick its lane here or this stops compiling; no wildcard).
+    pub(crate) fn lane(&self) -> AdminLane {
+        match self {
+            // The spawn-path mint: the controller calls it under
+            // ADMIN_RPC_TIMEOUT (5s) right after GetSpawnIntents; a
+            // mint that misses the deadline is a SKIPPED SPAWN TICK
+            // (the round-8 erring-mint rider made that the failure
+            // mode). Handler cost is one warm-memo forecast pass +
+            // O(ids) HMAC signs — bounded by the same walk a
+            // GetSpawnIntents poll already runs, priced acceptable
+            // mid-Tick BY DESIGN (housekeeping yields to spawn-path
+            // admin).
+            Self::MintExecutorTokens { .. } => AdminLane::Fast,
+            // Graph-independent estimator/ring reads (dashboard + CLI
+            // surfaces): O(overrides) resolve, O(tiers) dry-run walk,
+            // O(top_n) ring scan, O(classes) table read.
+            Self::SlaStatus { .. }
+            | Self::SlaExplain { .. }
+            | Self::SlaMispredictors { .. }
+            | Self::SlaHwSampled { .. } => AdminLane::Fast,
+            // Graph-bounded bulk reads: full-population intent
+            // compute, O(dag) root scan (ALSO the harness barrier —
+            // must keep mailbox-FIFO semantics), per-build DAG dump.
+            Self::GetSpawnIntents { .. } | Self::GcRoots { .. } | Self::InspectBuildDag { .. } => {
+                AdminLane::Bulk
+            }
+            // Mutating or bulk-export admin ops: rare, operator-driven,
+            // no latency SLO; mid-Tick mutation buys risk for nothing.
+            Self::SlaEvict { .. } | Self::SlaImportCorpus { .. } | Self::SlaExportCorpus { .. } => {
+                AdminLane::Bulk
+            }
+        }
+    }
+}
+
+/// A [`AdminQuery::lane`]`() == Fast` query in flight on the admin
+/// fast lane, stamped at enqueue so the drain can record true
+/// DELIVERY latency (enqueue → handler start) — the axis the mailbox
+/// FIFO starved, and the falsifiable surface for the B8 latency SLO
+/// (`rio_scheduler_actor_admin_fast_delivery_seconds`).
+pub(crate) struct FastAdmin {
+    pub(crate) query: AdminQuery,
+    pub(crate) enqueued_at: std::time::Instant,
+}
+
+impl FastAdmin {
+    pub(crate) fn new(query: AdminQuery) -> Self {
+        Self {
+            query,
+            enqueued_at: std::time::Instant::now(),
+        }
+    }
+}
+
 /// `cfg(test)` debug commands that bypass the state machine / dispatch
 /// path so tests can set up preconditions directly.
 #[cfg(test)]
@@ -707,6 +788,17 @@ pub enum DebugCmd {
         est_deadline_secs: Option<u32>,
         floor: Option<crate::state::ResourceFloor>,
         reply: oneshot::Sender<bool>,
+    },
+    /// Arm a synthetic long Tick (round-9 B8 / W9-AG): the next
+    /// `handle_tick` sleeps `each` (REAL time — the latency SLO is a
+    /// wall-clock law, paused-clock-free by design) inside up to
+    /// `phases` consecutive phase bodies. Models a tick whose total
+    /// cost far exceeds the admin deadline while every individual
+    /// phase stays decomposed — the live_053 starvation shape.
+    StallTickPhases {
+        phases: u32,
+        each: std::time::Duration,
+        reply: oneshot::Sender<()>,
     },
 }
 

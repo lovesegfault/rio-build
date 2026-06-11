@@ -199,7 +199,20 @@ impl DagActor {
                 metrics::histogram!("rio_scheduler_tick_phase_seconds", "phase" => $name)
                     .record(elapsed.as_secs_f64());
                 debug!(?elapsed, phase = $name, "tick phase");
+                // B8: serve queued Fast-lane admin between phases —
+                // EVERY phase boundary is a drain point structurally
+                // (the macro is the chokepoint), so fast delivery is
+                // bounded by the largest single phase, not the whole
+                // Tick. Runs after the elapsed capture and before the
+                // timer reset: drain cost is attributed to NO phase
+                // (the B2 attribution plane stays honest).
+                self.drain_admin_fast_lane();
                 t_phase = Instant::now();
+                // W9-AG hook: the synthetic stall is attributed to the
+                // FOLLOWING phase (sleep after the timer reset) so the
+                // phase histogram shows the modeled load.
+                #[cfg(test)]
+                self.test_stall_phase().await;
             };
         }
         self.maybe_refresh_estimator().await;
@@ -325,6 +338,19 @@ impl DagActor {
         self.snapshot_tx.send_replace(snapshot);
         phase!("18-snapshot-publish");
         let _ = &mut t_phase; // last phase! write is intentionally unread
+    }
+
+    /// W9-AG: consume one armed phase stall (REAL sleep — the admin
+    /// latency SLO is a wall-clock law, paused-clock-free by design).
+    #[cfg(test)]
+    async fn test_stall_phase(&mut self) {
+        if let Some((n, d)) = &mut self.tick_phase_stall
+            && *n > 0
+        {
+            *n -= 1;
+            let d = *d;
+            tokio::time::sleep(d).await;
+        }
     }
 
     // -----------------------------------------------------------------------

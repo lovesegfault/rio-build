@@ -83,6 +83,41 @@ const BACKPRESSURE_HIGH_WATERMARK: f64 = 0.80;
 /// Backpressure: resume accepting work below this fraction.
 const BACKPRESSURE_LOW_WATERMARK: f64 = 0.60;
 
+/// The B8 admin-latency SLO (round-9): a Fast-lane admin command
+/// ([`AdminQuery::lane`]) completes within this budget regardless of
+/// Tick cost. The value MIRRORS the controller's client-side deadline
+/// (`rio-controller/src/reconcilers/mod.rs` `ADMIN_RPC_TIMEOUT = 5s`)
+/// — a doc-pinned mirror, not a shared symbol: minting a shared
+/// constant would edit the controller's cite surface, which belongs
+/// to another round-9 slot (divergence recorded in the WO-S2-10
+/// commit). Violable (R17): if the controller's deadline moves, this
+/// moves with it — the W9-AG witness pins the LAW (delivery bounded
+/// by the largest indivisible work slice, not the whole tick), not
+/// the number.
+pub(crate) const ADMIN_FAST_DELIVERY_SLO: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Capacity of the admin fast lane (round-9 B8). Sized for its real
+/// producers — the controller's per-pool reconcile (one mint per
+/// GetSpawnIntents poll, sequential per pool) plus dashboard/CLI SLA
+/// reads — with two orders of magnitude headroom. A FULL fast lane
+/// fails OPEN: the sender falls back to the main mailbox (the
+/// pre-B8 FIFO path), never drops. Violable (R17): population axis
+/// only; the fallback is what makes any value safe.
+pub(crate) const ADMIN_FAST_LANE_CAPACITY: usize = 256;
+
+/// Work-per-turn quota for fast-lane service (round-9 B8, the A-1
+/// discipline applied to the lane itself): at most this many fast
+/// commands are served per drain visit (one Tick phase boundary or
+/// one main-loop turn run of consecutive fast arms) before yielding
+/// back to the main mailbox / the next phase. Bounds both the
+/// per-boundary Tick inflation and biased-select starvation of the
+/// main mailbox under a fast flood (each serve is one bounded
+/// `handle_admin` call; producers are authenticated admin surfaces).
+/// Violable (R17): time axis rides the per-command handler bound; 16
+/// covers every observed legitimate burst (≤ 2 mints + a handful of
+/// dashboard reads per second).
+pub(crate) const ADMIN_FAST_LANE_DRAIN_QUOTA: usize = 16;
+
 /// Phase 1b: how many times a failure completion whose appending
 /// transaction failed is re-delivered to the actor's own mailbox before
 /// the event is dropped. The derivation stays in its pre-report state
@@ -784,6 +819,19 @@ pub struct DagActor {
     /// to bypass (the merged_bug_033 early-exit-ledger shape is
     /// unrepresentable).
     probe_quota: ProbeQuotaLedger,
+    /// Receiver half of the admin fast lane (round-9 B8). Drained with
+    /// priority between mailbox commands (the biased select arm in
+    /// `run_inner`) and at every Tick phase boundary (the `phase!`
+    /// macro), so Fast-lane admin delivery is bounded by the largest
+    /// indivisible work slice instead of the whole mailbox FIFO. The
+    /// actor owns the receiver as a FIELD precisely so `handle_tick`
+    /// can drain mid-Tick.
+    admin_fast_rx: mpsc::Receiver<FastAdmin>,
+    /// Sender template for the fast lane — cloned into [`ActorHandle`]
+    /// at spawn via [`DagActor::admin_fast_sender`]. The actor holding
+    /// a sender never wedges shutdown (the loop exits via the
+    /// cancellation token, not channel closure).
+    admin_fast_tx: mpsc::Sender<FastAdmin>,
     /// Last [`ClusterSnapshot`] published by `handle_tick`. The
     /// AdminService `cluster_status` handler reads `snapshot_tx.
     /// subscribe().borrow()` via [`ActorHandle::cluster_snapshot_cached`]
@@ -830,6 +878,13 @@ pub struct DagActor {
     /// regression tests fail under their target mutation.
     #[cfg(test)]
     pub(crate) test_counters: TestCounters,
+    /// Test-only: synthetic long-Tick hook (W9-AG). `Some((n, d))` —
+    /// the next `n` phase bodies of `handle_tick` each sleep `d` of
+    /// REAL time before completing. Armed via
+    /// [`DebugCmd::StallTickPhases`]; consumed (decremented) by the
+    /// `phase!` boundary in `handle_tick`.
+    #[cfg(test)]
+    tick_phase_stall: Option<(u32, std::time::Duration)>,
 }
 
 /// Per-actor `#[cfg(test)]` call counters. Incremented at the top of
@@ -895,6 +950,10 @@ impl DagActor {
         let mut dag = DerivationDag::new();
         dag.set_soft_features(cfg.soft_features.clone());
         let max_lead_time = cfg.sla.max_lead_time;
+        // Admin fast lane (B8): the actor owns the receiver (field —
+        // handle_tick drains it at phase boundaries); the sender is
+        // cloned into ActorHandle at spawn.
+        let (admin_fast_tx, admin_fast_rx) = mpsc::channel(ADMIN_FAST_LANE_CAPACITY);
         // §13c-3: in production, `main.rs` calls `set_resolved_global`
         // before actor spawn (after `validate_resolved`). Test/non-K8s
         // code that constructs the actor directly with a fresh
@@ -1013,6 +1072,8 @@ impl DagActor {
             supply_reval: Default::default(),
             probe_generation: 1,
             probe_quota: ProbeQuotaLedger::default(),
+            admin_fast_rx,
+            admin_fast_tx,
             snapshot_tx: watch::channel(Arc::new(ClusterSnapshot::default())).0,
             #[cfg(test)]
             recovery_toctou_gate: plumbing.recovery_toctou_gate,
@@ -1028,6 +1089,8 @@ impl DagActor {
             fail_next_attempt_append: plumbing.fail_next_attempt_append,
             #[cfg(test)]
             test_counters: TestCounters::default(),
+            #[cfg(test)]
+            tick_phase_stall: None,
         }
     }
 
@@ -1171,6 +1234,11 @@ impl DagActor {
             // the next sweep, so a leader transition needs no wipe and
             // gets none (no curated reset site to miss).
             probe_quota: _,
+            // Retained: channel plumbing, not per-term state — every
+            // queued fast query is request/reply and its handler is
+            // leader-agnostic exactly as the mailbox Admin path is.
+            admin_fast_rx: _,
+            admin_fast_tx: _,
             snapshot_tx: _,
             #[cfg(test)]
                 recovery_toctou_gate: _,
@@ -1186,6 +1254,8 @@ impl DagActor {
                 fail_next_job_view_load: _,
             #[cfg(test)]
                 test_counters: _,
+            #[cfg(test)]
+                tick_phase_stall: _,
         } = self;
         *dag = DerivationDag::new();
         dag.set_soft_features(soft_features.clone());
@@ -1363,21 +1433,45 @@ impl DagActor {
     async fn run_inner(&mut self, rx: &mut mpsc::Receiver<ActorCommand>) {
         info!("DAG actor started");
 
+        // B8 fairness: consecutive fast-lane serves between main
+        // commands. The biased fast arm is disabled past the quota so
+        // a fast flood cannot starve the mailbox; the counter resets
+        // when a main command is served, or vacuously when the
+        // mailbox is empty (no main work to be fair to).
+        let mut consecutive_fast: usize = 0;
         loop {
+            if consecutive_fast >= ADMIN_FAST_LANE_DRAIN_QUOTA && rx.is_empty() {
+                consecutive_fast = 0;
+            }
             let cmd = tokio::select! {
-                // biased: check the shutdown arm first so a cancelled
-                // token wins even if commands are pending. On SIGTERM
-                // we want fast drain, not a queue-process-then-exit.
+                // biased: shutdown first (a cancelled token wins even
+                // with commands pending — on SIGTERM we want fast
+                // drain, not queue-process-then-exit), then the admin
+                // fast lane (B8: O(1)-class admin must not starve
+                // behind queued bulk work), then the mailbox.
                 biased;
                 _ = self.shutdown.cancelled() => {
                     info!("actor shutting down");
                     break;
+                }
+                fast = self.admin_fast_rx.recv(),
+                    if consecutive_fast < ADMIN_FAST_LANE_DRAIN_QUOTA =>
+                {
+                    if let Some(fa) = fast {
+                        self.serve_fast_admin(fa);
+                        consecutive_fast += 1;
+                    }
+                    // Not a mailbox command: no depth/backpressure/
+                    // latency bookkeeping (the fast lane has its own
+                    // delivery histogram inside serve_fast_admin).
+                    continue;
                 }
                 cmd = rx.recv() => match cmd {
                     Some(c) => c,
                     None => break,
                 },
             };
+            consecutive_fast = 0;
 
             // Check backpressure state
             let queue_len = rx.len();
@@ -1710,6 +1804,63 @@ impl DagActor {
     /// into ActorHandle. The actor keeps the writable `Arc<AtomicBool>`.
     pub(crate) fn backpressure_flag(&self) -> BackpressureReader {
         BackpressureReader::new(Arc::clone(&self.backpressure_active))
+    }
+
+    /// Clone the admin fast-lane sender for wiring into ActorHandle
+    /// (B8). The actor keeps the receiver as a field.
+    pub(crate) fn admin_fast_sender(&self) -> mpsc::Sender<FastAdmin> {
+        self.admin_fast_tx.clone()
+    }
+
+    /// Serve one fast-lane admin query: record true DELIVERY latency
+    /// (enqueue → here — the axis the mailbox FIFO starved and the
+    /// falsifiable surface of the B8 SLO), then dispatch through the
+    /// same `handle_admin` the mailbox path uses (identical per-query
+    /// semantics; only the queueing differs). Handler time feeds the
+    /// existing per-command histogram under the same `Admin` label the
+    /// mailbox path records, so total-work dashboards see one series.
+    fn serve_fast_admin(&mut self, fa: FastAdmin) {
+        let waited = fa.enqueued_at.elapsed();
+        let name = fa.query.name();
+        metrics::histogram!(
+            "rio_scheduler_actor_admin_fast_delivery_seconds",
+            "cmd" => name
+        )
+        .record(waited.as_secs_f64());
+        if waited >= ADMIN_FAST_DELIVERY_SLO {
+            warn!(
+                cmd = name,
+                waited = ?waited,
+                "fast-lane admin delivery exceeded the SLO; the largest \
+                 indivisible actor work slice is over budget"
+            );
+        }
+        let t = Instant::now();
+        self.handle_admin(fa.query);
+        let elapsed = t.elapsed();
+        metrics::histogram!("rio_scheduler_actor_cmd_seconds", "cmd" => "Admin")
+            .record(elapsed.as_secs_f64());
+        if elapsed >= std::time::Duration::from_secs(1) {
+            warn!(
+                cmd = name,
+                elapsed = ?elapsed,
+                "fast-lane admin handler exceeded 1s; it is inflating the \
+                 work slice that bounds every other fast delivery"
+            );
+        }
+    }
+
+    /// Drain up to [`ADMIN_FAST_LANE_DRAIN_QUOTA`] queued fast-lane
+    /// queries (work-per-turn — the A-1 discipline applied to the lane
+    /// itself). Called at every Tick phase boundary; the run loop's
+    /// biased select covers between-command service.
+    pub(super) fn drain_admin_fast_lane(&mut self) {
+        for _ in 0..ADMIN_FAST_LANE_DRAIN_QUOTA {
+            match self.admin_fast_rx.try_recv() {
+                Ok(fa) => self.serve_fast_admin(fa),
+                Err(_) => break,
+            }
+        }
     }
 
     /// Clone the generation counter (and the recovery-complete flag its

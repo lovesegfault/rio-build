@@ -207,14 +207,26 @@ pub fn describe_metrics() {
          blocks every queued RPC"
     );
     describe_histogram!(
+        "rio_scheduler_actor_admin_fast_delivery_seconds",
+        "Fast-lane admin DELIVERY latency (enqueue to handler start, \
+         labeled by cmd variant: MintExecutorTokens and the SLA reads). \
+         The B8 SLO surface: fast-lane queries are served between \
+         mailbox commands and at every Tick phase boundary, so delivery \
+         is bounded by the largest indivisible actor work slice — \
+         samples at/over the 5s bucket mean a single phase or command \
+         exceeds the controller's admin deadline and spawn-path mints \
+         are at risk again (the live_053 starvation shape)."
+    );
+    describe_histogram!(
         "rio_scheduler_spawn_intents_response_bytes",
         "Encoded (prost wire) size of one GetSpawnIntents response in bytes. \
-         The intent-serving surface is unpaginated — the full Ready set is \
-         serialized per call — and this instrument is the observed input for \
-         sizing its pagination window (pair with \
-         rio_scheduler_spawn_intents_per_response for bytes-per-intent). \
-         Sustained samples in the MiB buckets mean poller reads alone are \
-         taxing the actor."
+         Records the POST-window response (the served page, not the mint): \
+         with the round-9 priority-head window landed this is the page-size \
+         signal consumer tuning reads (pair with \
+         rio_scheduler_spawn_intents_per_response for bytes-per-intent; the \
+         unbounded-demand signal is queued_by_system). Sustained samples in \
+         the MiB buckets mean pollers run unwindowed (limit=0 legacy reads) \
+         and poller traffic alone is taxing the actor."
     );
     describe_histogram!(
         "rio_scheduler_spawn_intents_per_response",

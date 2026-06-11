@@ -183,11 +183,13 @@ pub(crate) fn setup_actor_configured(
     let backpressure = actor.backpressure_flag();
     let generation = actor.generation_reader();
     let snapshot_rx = actor.snapshot_receiver();
+    let admin_fast_tx = actor.admin_fast_sender();
     let self_tx = tx.downgrade();
     let task = tokio::spawn(actor.run_with_self_tx(rx, self_tx));
     (
         ActorHandle {
             tx,
+            admin_fast_tx,
             backpressure,
             generation,
             snapshot_rx,

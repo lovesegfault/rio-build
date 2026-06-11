@@ -42,6 +42,11 @@ rio_test_support::metrics_suite! {
         // the +Inf bucket is the alert, finer resolution above 10s
         // doesn't change the response.
         "rio_scheduler_actor_cmd_seconds",
+        // Same rationale at the delivery axis (B8): fast-lane delivery
+        // should be bounded by one phase slice (sub-second); the 5s
+        // SLO breach lands cleanly inside the default range and
+        // anything past 10s is the same head-of-line alert shape.
+        "rio_scheduler_actor_admin_fast_delivery_seconds",
         // Unitless ratio centred on 1.0; default [0.005..10.0] covers
         // 200×-under to 10×-over which is the full useful range.
         "rio_scheduler_sla_prediction_ratio",

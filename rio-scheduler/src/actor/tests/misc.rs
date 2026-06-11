@@ -3452,3 +3452,80 @@ async fn driven_leader_tick_records_every_phase_cell() -> TestResult {
     );
     Ok(())
 }
+
+/// W9-AG (round-9 B8): admin mint latency is bounded independently of
+/// Tick cost. A Fast-lane admin command (`AdminQuery::lane()` —
+/// MintExecutorTokens is the spawn-path exemplar) completes within
+/// `ADMIN_FAST_DELIVERY_SLO` (5s, mirroring the controller's
+/// ADMIN_RPC_TIMEOUT) even while a Tick whose TOTAL cost exceeds the
+/// SLO is mid-flight, because the fast lane is drained at every phase
+/// boundary — delivery is bounded by the largest indivisible work
+/// slice, not the whole mailbox FIFO.
+///
+/// Wall-clock witness BY DESIGN (the RC-2 carve-out, recorded in the
+/// round-9 book): the law itself is a latency SLO. The synthetic Tick
+/// is paused-clock-FREE (real sleeps via the StallTickPhases hook);
+/// slack: post-fix delivery is expected ≤ one stalled phase (2.2s) +
+/// scheduling jitter — asserting < 5s carries ≥ 2× headroom, so
+/// builder CPU contention cannot flake it without ALSO breaking the
+/// premise assert (which would name the real cause).
+///
+/// Pre-fix red (FIFO delivery behind the whole tick): the first mint
+/// waited out the remaining ~6.3s of the 6.6s tick > 5s SLO.
+#[tokio::test]
+async fn admin_mint_latency_bounded_under_long_tick() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    // Premise: 3 stalled phases × 2.2s = 6.6s total tick — over the
+    // 5s SLO while each individual phase stays well under it (the
+    // decomposed-tick shape; B1 made the worst real phase bounded,
+    // B2's plane measures the rest).
+    let each = std::time::Duration::from_millis(2200);
+    handle.debug_stall_tick_phases(3, each).await?;
+
+    let t_tick = std::time::Instant::now();
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    // Let the tick enter its first stalled phase before minting, so
+    // every delivery below is measured INSIDE the long tick.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Sequential mints during the long tick: enqueue→reply wall time
+    // is the controller-visible delivery axis (the 18s live_053
+    // measurement was exactly this).
+    let mut deliveries: Vec<std::time::Duration> = Vec::new();
+    for _ in 0..4 {
+        let t = std::time::Instant::now();
+        let _map = handle
+            .query_unchecked(|reply| {
+                ActorCommand::Admin(AdminQuery::MintExecutorTokens {
+                    intent_ids: vec!["w9ag-absent-intent".into()],
+                    reply,
+                })
+            })
+            .await?;
+        deliveries.push(t.elapsed());
+    }
+
+    // Premise reachability (RC-2): the tick really was longer than
+    // the SLO — without this the deliveries above could have been
+    // measured against an already-finished tick and the test would
+    // be vacuous. barrier() rides the Bulk lane (GcRoots), so it
+    // flushes the mailbox FIFO including the Tick.
+    barrier(&handle).await;
+    let tick_wall = t_tick.elapsed();
+    assert!(
+        tick_wall > crate::actor::ADMIN_FAST_DELIVERY_SLO,
+        "premise: the synthetic tick must exceed the SLO (got {tick_wall:?}); \
+         the stall hook did not fire — W9-AG is vacuous"
+    );
+
+    for (i, d) in deliveries.iter().enumerate() {
+        assert!(
+            *d < crate::actor::ADMIN_FAST_DELIVERY_SLO,
+            "mint {i} delivered in {d:?} ≥ the {:?} SLO while the tick ran \
+             {tick_wall:?}: Fast-lane admin starved behind Tick cost (W9-AG)",
+            crate::actor::ADMIN_FAST_DELIVERY_SLO
+        );
+    }
+    Ok(())
+}

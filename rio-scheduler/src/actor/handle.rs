@@ -25,6 +25,12 @@ pub struct DebugDerivationInfo {
 #[derive(Clone)]
 pub struct ActorHandle {
     pub(super) tx: mpsc::Sender<ActorCommand>,
+    /// Admin fast lane (round-9 B8): `AdminQuery::lane() == Fast`
+    /// queries are routed here by `send_unchecked` and served with
+    /// priority between mailbox commands AND at every Tick phase
+    /// boundary. Full lane fails OPEN to the main mailbox (the pre-B8
+    /// FIFO path) — never drops.
+    pub(super) admin_fast_tx: mpsc::Sender<FastAdmin>,
     /// Shared read-only backpressure flag with the actor. The actor computes
     /// hysteresis (activate at 80%, deactivate at 60%) and writes to its
     /// `Arc<AtomicBool>`; the handle reads it via this read-only view for
@@ -58,10 +64,12 @@ impl ActorHandle {
         let backpressure = actor.backpressure_flag();
         let generation = actor.generation_reader();
         let snapshot_rx = actor.snapshot_receiver();
+        let admin_fast_tx = actor.admin_fast_sender();
         let self_tx = tx.downgrade();
         rio_common::task::spawn_monitored("dag-actor", actor.run_with_self_tx(rx, self_tx));
         Self {
             tx,
+            admin_fast_tx,
             backpressure,
             generation,
             snapshot_rx,
@@ -141,8 +149,29 @@ impl ActorHandle {
         self.generation.advertised()
     }
 
-    /// Send a command without backpressure check (for worker lifecycle events).
+    /// Send a command without backpressure check (for worker lifecycle
+    /// events and admin queries). `AdminQuery::lane() == Fast` queries
+    /// are routed onto the admin fast lane (B8) — served with priority
+    /// and at Tick phase boundaries, so their delivery is bounded by
+    /// the largest indivisible work slice instead of the mailbox FIFO.
+    /// A FULL fast lane falls back to the mailbox (the pre-B8 path):
+    /// fail open, never drop. Bulk admin and every non-admin command
+    /// keep strict mailbox FIFO (the `barrier()` flush contract).
     pub async fn send_unchecked(&self, cmd: ActorCommand) -> Result<(), ActorError> {
+        use tokio::sync::mpsc::error::TrySendError;
+        let cmd = match cmd {
+            ActorCommand::Admin(q) if q.lane() == AdminLane::Fast => {
+                match self.admin_fast_tx.try_send(FastAdmin::new(q)) {
+                    Ok(()) => return Ok(()),
+                    Err(TrySendError::Full(fa)) => ActorCommand::Admin(fa.query),
+                    // Fast receiver lives inside the actor: closed ⇔
+                    // the actor is gone — same terminal answer the
+                    // main channel would give.
+                    Err(TrySendError::Closed(_)) => return Err(ActorError::ChannelSend),
+                }
+            }
+            other => other,
+        };
         self.tx.send(cmd).await.map_err(|_| ActorError::ChannelSend)
     }
 
@@ -245,6 +274,21 @@ impl ActorHandle {
     pub async fn debug_mark_store_rpc_failure(&self) -> Result<(), ActorError> {
         self.debug(|reply| DebugCmd::MarkStoreRpcFailure { reply })
             .await
+    }
+
+    /// Arm the W9-AG synthetic long Tick: the next `phases` phase
+    /// bodies of `handle_tick` each sleep `each` of real time.
+    pub async fn debug_stall_tick_phases(
+        &self,
+        phases: u32,
+        each: std::time::Duration,
+    ) -> Result<(), ActorError> {
+        self.debug(|reply| DebugCmd::StallTickPhases {
+            phases,
+            each,
+            reply,
+        })
+        .await
     }
 
     /// Read a derivation's in-memory attempt history (the committed
