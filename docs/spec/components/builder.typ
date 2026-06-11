@@ -952,6 +952,20 @@ is the PostgreSQL metadata query, not the SQLite generation.
   PID; forked builders reparent to init.
 ]
 
+#r("builder.cgroup.quiesce-before-collect")[
+  Output collection MUST NOT walk the overlay upper unless the build
+  cgroup's `cgroup.procs` was read as empty after `cgroup.kill`: if
+  processes survive the bounded drain budget, or the cgroup state cannot be
+  verified (read error, teardown race), the executor MUST fail the build as
+  an infrastructure error instead of collecting outputs.
+]
+
+A kill-evading process (uninterruptible D-state, pre-submitted io_uring
+SQEs) can keep mutating the upper tree after `cgroup.kill`; walking it
+during output collection would let the dying build race the NAR dump
+(TOCTOU). Deny-on-failure: an unreadable `cgroup.procs` is an unverified
+cgroup and is refused exactly like a non-empty one.
+
 == Build Resource Limits
 
 A builder pod runs *one* build, then exits. The pod's `resources.limits` ARE
