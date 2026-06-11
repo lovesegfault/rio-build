@@ -471,7 +471,17 @@ pub struct SlaConfig {
     // tuned `scheduler.sla.consolidateExploreEpsilon` observed no
     // change. Deleted rather than wired — there is no consolidation
     // explore loop to wire INTO.)
-    /// Part-B: per-tick NodeClaim creation throttle per cell.
+    /// DEPRECATED-IGNORED (live_049 L1, WO-S7-1): the flat per-cell-
+    /// per-tick mint cap is RETIRED from the mint law — minting is
+    /// bounded by demand (the FFD bin count over placeable-gated
+    /// footprints) and the fleet budget (`maxFleetCores`), the two
+    /// quantities with safety meaning
+    /// (`ctrl.nodeclaim.mint-deficit-proportional`). The field is
+    /// RETAINED parse-only: `SlaConfig` is `deny_unknown_fields` by
+    /// design (fails-loud below), so deleting it would brick every
+    /// helm-rendered scheduler config at boot; the serde default also
+    /// keeps absent keys parsing. NOTHING reads it (the R12
+    /// cap-reader census, cover.rs tests, pins code-readers at zero).
     #[serde(default = "default_max_node_claims_per_cell_per_tick")]
     pub max_node_claims_per_cell_per_tick: u32,
     /// Cluster identifier for `sla_ema_state` / `interrupt_samples`

@@ -4455,7 +4455,7 @@ rec {
     # Healthy lifecycle, no faults: create -> register -> busy/idle ->
     # idle-reap with the FFD reservation respected, the per-class clamp
     # over the config mirror, and the placeable publish.
-    # r[verify ctrl.nodeclaim.budget.per-class+2]
+    # r[verify ctrl.nodeclaim.budget.per-class+3]
     quint-nodeclaim-lifecycle-base = mkQuintCheck {
       name = "nodeclaim-lifecycle-base";
       # quint-policy P1 exemption (bughunt-2 slot 11; the §5-Q13 census
@@ -4492,7 +4492,7 @@ rec {
     # as-built defect, flipped per the invariant map's protocol when
     # the skip was fixed.
     # r[verify ctrl.nodeclaim.consolidate-only-degraded+3]
-    # r[verify ctrl.nodeclaim.budget.per-class+2]
+    # r[verify ctrl.nodeclaim.budget.per-class+3]
     quint-nodeclaim-lifecycle-fault-rpc = mkQuintCheck {
       name = "nodeclaim-lifecycle-fault-rpc";
       # quint-policy P1 exemption (bughunt-2 slot 11; the §5-Q13 census

@@ -16,8 +16,10 @@
 //!    with the same MostAllocated bin-select that
 //!    `kube-scheduler-packed` uses.
 //! 3. Cover the unplaced deficit per `(hw_class, capacity_type)` cell
-//!    with 1×anchor + N×bulk NodeClaims, capped at
-//!    `max_node_claims_per_cell_per_tick` and `max_fleet_cores`.
+//!    with 1×anchor + N×bulk NodeClaims, bounded by demand (the FFD
+//!    bin count) and `max_fleet_cores` (live_049 L1: the flat
+//!    per-cell-per-tick cap is retired —
+//!    `ctrl.nodeclaim.mint-deficit-proportional`).
 //! 4. Reap idle Registered claims via windowed-rate break-even.
 //! 5. Reap unhealthy (OA2 wedge-clustered dead nodes) and ICE-stuck
 //!    claims.
@@ -282,10 +284,6 @@ pub struct NodeClaimPoolConfig {
     /// all owned NodeClaims, Registered + in-flight). Helm:
     /// `sla.maxFleetCores`.
     pub max_fleet_cores: u32,
-    /// §13b per-cell-per-tick NodeClaim create cap. Prevents one cell's
-    /// burst from monopolizing a tick's budget. Helm:
-    /// `sla.maxNodeClaimsPerCellPerTick`.
-    pub max_node_claims_per_cell_per_tick: u32,
     /// §13b lead-time Schmitt clamp ceiling (seconds). Helm:
     /// `sla.maxLeadTime`.
     pub max_lead_time: f64,
@@ -453,7 +451,7 @@ impl NodeClaimPoolConfig {
     ///
     /// Capacity-type is the FIRST listed for the class (Spot for
     /// default classes — cold-start probes are uniform `probe.cpu`-
-    /// shaped and bounded by `max_node_claims_per_cell_per_tick`;
+    /// shaped and bounded by the placeable gate + the fleet budget;
     /// on-demand fallback would defeat the §13b cost model. OnDemand
     /// for od-only classes like metal — §13c). **Consequence:** a
     /// *structural* spot failure (account quota, missing
@@ -554,7 +552,6 @@ impl Default for NodeClaimPoolConfig {
             // Matches helm `sla.maxFleetCores` / `maxNodeClaimsPerCellPerTick`
             // / `maxLeadTime` defaults.
             max_fleet_cores: 10_000,
-            max_node_claims_per_cell_per_tick: 8,
             max_lead_time: 600.0,
             max_consolidation_time: None,
             // r35 bug_050: Karpenter `consolidateAfter: 10m` parity for
@@ -2102,7 +2099,6 @@ impl NodeClaimPoolReconciler {
                 max_node_cores: cls_c.min(global_cores),
                 max_node_mem: cls_m.min(global_mem),
                 max_node_disk: self.cfg.max_node_disk,
-                per_tick_cap: self.cfg.max_node_claims_per_cell_per_tick,
                 budget: cover::class_budget(
                     self.cfg
                         .max_fleet_cores
@@ -2166,14 +2162,17 @@ impl NodeClaimPoolReconciler {
                         )
                         .increment(1);
                         created.push((name, cell.clone()));
-                        // r[impl ctrl.nodeclaim.budget.per-class+2]
+                        // r[impl ctrl.nodeclaim.budget.per-class+3]
                         // r40 bug_015: budget counters track cores MINTED this
                         // tick (`class_budget` doc, cover.rs:339). A failed
                         // create is neither Registered nor in-flight; counting
-                        // it phantom-consumes up to per_tick_cap × max_node_cores
-                        // (8×192 = 1536c) of `global_remaining`, under-
-                        // provisioning cells later in the round-robin. Increment
-                        // only on Ok so `created_cores` ⟺ `created.len()`.
+                        // it phantom-consumes BUDGET-SHAPED headroom — up to
+                        // the cell's remaining `⌊budget/chunk⌋ × max_node_cores`
+                        // of `global_remaining` (live_049 L1: the bound is the
+                        // fleet-budget brake now, not a flat per-tick cap),
+                        // under-provisioning cells later in the round-robin.
+                        // Increment only on Ok so `created_cores` ⟺
+                        // `created.len()`.
                         created_cores += c;
                         *class_created.entry(cell.0.clone()).or_default() += c;
                     }
@@ -2718,7 +2717,6 @@ mod tests {
         assert!(d.lease_name.is_none());
         assert!(d.reference_hw_class.is_empty());
         assert_eq!(d.max_fleet_cores, 10_000);
-        assert_eq!(d.max_node_claims_per_cell_per_tick, 8);
         // r40 bug_018: matches the chart's `buildScheduler.enabled`
         // default — `true` so the second-scheduler routing is on by
         // default and a missing TOML key doesn't silently disable it.

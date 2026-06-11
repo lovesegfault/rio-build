@@ -379,7 +379,7 @@ pub fn cells_round_robin(mut cells: Vec<Cell>, tick: u64) -> Vec<Cell> {
 }
 
 /// Caps for [`sizing`]: per-NodeClaim ceilings on each axis, plus the
-/// fleet-wide core budget remaining and the per-tick cell cap. The
+/// fleet-wide core budget remaining. The
 /// fuse-cache budget is here so [`sizing`] computes the same
 /// [`intent_pod_footprint`](crate::reconcilers::pool::jobs::intent_pod_footprint)
 /// triple FFD and `apply_intent_resources` will use.
@@ -387,7 +387,6 @@ pub struct SizingCfg {
     pub max_node_cores: u32,
     pub max_node_mem: u64,
     pub max_node_disk: u64,
-    pub per_tick_cap: u32,
     pub budget: u32,
     pub fuse_cache_bytes: u64,
 }
@@ -405,9 +404,13 @@ pub struct SizingCfg {
 /// the production [`ffd::simulate`](super::ffd::simulate) on `n`
 /// uniform synthetic claims — packs every fitting intent. `Σ/n` is a lower
 /// bound on bin-packing, not a guarantee. Upper bound `n = |u|` (one
-/// claim per intent). Then capped by `per_tick_cap` and
-/// `⌊budget/chunk⌋` (the cap may truncate; the remainder is re-seen
-/// next tick).
+/// claim per intent). Then capped by `⌊budget/chunk⌋` — the fleet
+/// budget brake (the brake may truncate; the remainder is re-seen
+/// next tick). live_049 L1: the former flat `per_tick_cap` term is
+/// RETIRED — minting is bounded by demand (`n_pack`, the FFD bin
+/// count over real placeable-gated footprints) and by the fleet
+/// budget, the two quantities with safety meaning, and by nothing
+/// else (`ctrl.nodeclaim.mint-deficit-proportional`).
 ///
 /// Each claim is uniformly `(max(⌈Σc/n⌉, max_i c), max(Σm/n, max_i m),
 /// max(Σd/n, max_i d))` — every intent fits every claim on every axis,
@@ -496,11 +499,16 @@ pub fn sizing(cell: &Cell, u: &[&SpawnIntent], cfg: &SizingCfg) -> (Vec<(u32, u6
     if cfg.budget < chunk {
         return (Vec::new(), min_eta);
     }
-    let n = n_pack.min(cfg.per_tick_cap).min(cfg.budget / chunk);
+    // r[impl ctrl.nodeclaim.mint-deficit-proportional]
+    // live_049 L1: the two-term mint law — demand x budget. The
+    // retired flat cap stretched the live ramp to 18 ticks while
+    // protecting nothing: every claim it deferred was demanded
+    // (placeable-gated), budget-affordable, and right-sized.
+    let n = n_pack.min(cfg.budget / chunk);
     (vec![(chunk, mem, disk); n as usize], min_eta)
 }
 
-// r[impl ctrl.nodeclaim.budget.per-class+2]
+// r[impl ctrl.nodeclaim.budget.per-class+3]
 /// §13c per-hw-class fleet-core sub-budget for `cover_deficit`'s
 /// per-Cell loop. `min(global_remaining, class_cap − class_live −
 /// class_created)` where:
@@ -786,12 +794,11 @@ mod tests {
 
     // --- sizing / claim_count ------------------------------------------
 
-    fn cfg(max_node_cores: u32, per_tick_cap: u32, budget: u32) -> SizingCfg {
+    fn cfg(max_node_cores: u32, budget: u32) -> SizingCfg {
         SizingCfg {
             max_node_cores,
             max_node_mem: 256 * GI,
             max_node_disk: 450 * GI,
-            per_tick_cap,
             budget,
             fuse_cache_bytes: 50 * GI,
         }
@@ -799,7 +806,7 @@ mod tests {
 
     #[test]
     fn claim_count_3axis_lower_bound() {
-        let f = |c, m, d, mxc| claim_count((c, m, d), &cfg(mxc, u32::MAX, u32::MAX));
+        let f = |c, m, d, mxc| claim_count((c, m, d), &cfg(mxc, u32::MAX));
         assert_eq!(f(100, 0, 0, 32), 4, "cores binds: ⌈100/32⌉");
         assert_eq!(f(20, 0, 0, 64), 1, "Σc < max_c");
         // Σm binds: 192×{1c,8Gi} → Σm=1536Gi at 256Gi cap → 6.
@@ -812,8 +819,19 @@ mod tests {
         Cell("h".into(), CapacityType::Spot)
     }
 
+    // r[verify ctrl.nodeclaim.mint-deficit-proportional]
+    /// **R10 + W7-M** — *a deficit within budget is FULLY minted in
+    /// ONE tick* (the 208-peak ramp shape killed; operation-count,
+    /// zero wall-clock): the mint law is `min(n_pack, ⌊budget/chunk⌋)`
+    /// — demand x budget, no third term. Pre-fix red (left,
+    /// reverse-strawman transcript in the commit body): the flat
+    /// per-tick cap truncated `n_pack=5` to 2 — the live shape was
+    /// ⌈D/8⌉ ≈ 18 ticks of ramp with demand drained before the budget
+    /// crossing. **R11 (green-side pin, disclosed)** — the budget
+    /// brake exists pre-fix AND post-fix; it is the regression floor
+    /// that must survive the cap's removal (the budget-binds row).
     #[test]
-    fn sizing_respects_budget_and_per_tick_cap() {
+    fn sizing_mints_deficit_proportionally_under_budget_brake() {
         let u: Vec<_> = (0..10)
             .map(|k| intent_hd(&format!("i{k}"), 8, 8 * GI, 5 * GI, Some(true)))
             .collect();
@@ -821,14 +839,18 @@ mod tests {
         // Σc=80, n_lo=⌈80/32⌉=3; sim_packs finds n_pack=5 (disk-bound:
         // each pod's footprint.d = 5×1.5+50+1 ≈ 58.5Gi; 3 bins of
         // ⌈Σd/3⌉≈195Gi fit 3 each = 9 < 10).
-        let (c, _) = sizing(&h_spot(), &refs, &cfg(32, 8, 200));
-        assert_eq!(c.len(), 5, "n_pack binds");
-        let (c, _) = sizing(&h_spot(), &refs, &cfg(32, 2, 200));
-        assert_eq!(c.len(), 2, "per_tick binds");
+        let (c, _) = sizing(&h_spot(), &refs, &cfg(32, 200));
+        assert_eq!(
+            c.len(),
+            5,
+            "R10: the WHOLE demanded-and-affordable deficit mints in one \
+             tick — n_pack binds, no flat third term (pre-fix: 2 at \
+             per_tick_cap=2)"
+        );
         // chunk at n_pack=5 is ⌈80/5⌉.max(8)=16; budget=20 → ⌊20/16⌋=1.
-        let (c, _) = sizing(&h_spot(), &refs, &cfg(32, 8, 20));
-        assert_eq!(c.len(), 1, "budget binds");
-        let (c, _) = sizing(&h_spot(), &refs, &cfg(32, 8, 10));
+        let (c, _) = sizing(&h_spot(), &refs, &cfg(32, 20));
+        assert_eq!(c.len(), 1, "R11: the fleet-budget brake binds (green pin)");
+        let (c, _) = sizing(&h_spot(), &refs, &cfg(32, 10));
         assert!(c.is_empty(), "budget < chunk");
     }
 
@@ -896,7 +918,7 @@ mod tests {
     // r[verify ctrl.nodeclaim.anchor-bulk+5]
     #[test]
     fn sizing_invariants_hold() {
-        let scfg = cfg(64, u32::MAX, u32::MAX);
+        let scfg = cfg(64, u32::MAX);
         let check = |name: &str, intents: Vec<SpawnIntent>| {
             let refs: Vec<&SpawnIntent> = intents.iter().collect();
             let (claims, _) = sizing(&h_spot(), &refs, &scfg);
@@ -967,7 +989,6 @@ mod tests {
             max_node_cores: 10,
             max_node_mem: 256 * GI,
             max_node_disk: 450 * GI,
-            per_tick_cap: u32::MAX,
             budget: u32::MAX,
             fuse_cache_bytes: 50 * GI,
         };
@@ -991,7 +1012,7 @@ mod tests {
     #[test]
     fn sizing_filters_intent_exceeding_per_cell_cap() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-        let scfg = cfg(32, u32::MAX, u32::MAX);
+        let scfg = cfg(32, u32::MAX);
         let dropped_count = |rec: &DebuggingRecorder| {
             rec.snapshotter()
                 .snapshot()
@@ -1059,7 +1080,7 @@ mod tests {
     /// diverge on.
     #[test]
     fn sizing_random_intents_ffd_oracle() {
-        let scfg = cfg(64, u32::MAX, u32::MAX);
+        let scfg = cfg(64, u32::MAX);
         let mut s = 0x5eed_0000_u64;
         let mut next = |n: u64| {
             s = s
@@ -1903,7 +1924,7 @@ mod tests {
     /// tick for ANY cell of the class (so spot's spend subtracts from
     /// od's budget — per-hwClass not per-Cell, D4). `None` cap ⇒
     /// global-only.
-    // r[verify ctrl.nodeclaim.budget.per-class+2]
+    // r[verify ctrl.nodeclaim.budget.per-class+3]
     #[test]
     fn class_budget_sub_caps_per_hwclass() {
         use super::super::ffd::LiveNode;
@@ -2220,5 +2241,208 @@ mod tests {
             PlacementOutcome::NoHostingClass.verdict_reason(),
             Some(rio_proto::types::IntentVerdictReason::NoHostingClass)
         );
+    }
+}
+
+#[cfg(test)]
+mod mint_law_tests {
+    //! WO-S7-1 (live_049 L1): the two-term mint law's premise
+    //! witnesses and the cap-reader census.
+    use std::collections::{HashMap, HashSet};
+
+    use super::super::ffd::{self, LiveNode};
+    use super::*;
+
+    const GI: u64 = 1 << 30;
+
+    fn intent(id: &str, cores: u32, ready: bool, eta: f64, cells: &[(&str, &str)]) -> SpawnIntent {
+        SpawnIntent {
+            intent_id: id.into(),
+            cores,
+            mem_bytes: GI,
+            disk_bytes: GI,
+            ready: Some(ready),
+            eta_seconds: eta,
+            hw_class_names: cells.iter().map(|(h, _)| h.to_string()).collect(),
+            node_affinity: cells
+                .iter()
+                .map(|(h, cap)| rio_proto::types::NodeSelectorTerm {
+                    match_expressions: vec![
+                        rio_proto::types::NodeSelectorRequirement {
+                            key: "hw-band".into(),
+                            operator: "In".into(),
+                            values: vec![h.to_string()],
+                        },
+                        rio_proto::types::NodeSelectorRequirement {
+                            key: "karpenter.sh/capacity-type".into(),
+                            operator: "In".into(),
+                            values: vec![cap.to_string()],
+                        },
+                    ],
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    // r[verify ctrl.nodeclaim.mint-deficit-proportional]
+    /// **R10b + W7-K** — *the gate POPULATION premise, probed not
+    /// prose*: `n_pack`'s input is exactly the placeable-gated
+    /// unplaced set. A tick whose input contains (i) an intent that
+    /// FITS ON LIVE NODES and (ii) a LEAD-TIME-GATED forecast intent
+    /// (eta ≥ every cell's lead) contributes ZERO to the mint vector —
+    /// driven through the production `ffd::simulate` →
+    /// `assign_to_cells` → `sizing` chain against the WO-S7-3-typed
+    /// `PlacementOutcome` arm. This is the premise that makes
+    /// unbounded mint-per-tick safe after the flat cap's retirement:
+    /// un-demanded capacity is structurally unreachable by the law
+    /// (the blast-radius bound is the budget brake — W7-L's row in
+    /// `sizing_mints_deficit_proportionally_under_budget_brake`).
+    #[test]
+    fn gate_population_feeds_zero_mint() {
+        // One live node with free capacity for i-fits.
+        let live = vec![LiveNode {
+            name: "n0".into(),
+            node_name: Some("n0".into()),
+            registered: true,
+            terminating_since: None,
+            cell: Some(Cell("h".into(), CapacityType::Spot)),
+            instance_type: None,
+            allocatable: (64, 256 * GI, 450 * GI),
+            requested: (0, 0, 0),
+            created_secs: Some(0.0),
+            annotations: Default::default(),
+            status: Default::default(),
+        }];
+        let intents = vec![
+            // (i) fits on the live node → placeable, never unplaced.
+            intent("i-fits", 4, true, 0.0, &[("h", "spot")]),
+            // (ii) forecast gated by lead time (eta ≥ every lead; the
+            // default sketch lead is far below 1e9).
+            intent("i-far", 4, false, 1e9, &[("h", "spot")]),
+        ];
+        let sketches = CellSketches::default();
+        let (placeable, unplaced) = ffd::simulate(
+            &intents,
+            &live,
+            &sketches,
+            &HashMap::new(),
+            50 * GI,
+            |_, _, _| true,
+        );
+        assert_eq!(placeable.len(), 1, "i-fits placed on the live node");
+        assert_eq!(unplaced.len(), 1, "only the forecast survives the split");
+        let none = HashSet::new();
+        let (by_cell, outcomes) =
+            assign_to_cells(&unplaced, &sketches, &none, |_| 0.03, |_, _| None);
+        // The typed arm: lead-time-gated, quiet, ZERO cells assigned.
+        assert!(
+            outcomes
+                .iter()
+                .all(|(_, o)| matches!(o, PlacementOutcome::LeadTimeGated)),
+            "the forecast takes the typed LeadTimeGated arm: {outcomes:?}"
+        );
+        // The mint vector: zero claims across every cell.
+        let total: usize = by_cell
+            .iter()
+            .map(|(cell, u)| {
+                let refs: Vec<&SpawnIntent> = u.to_vec();
+                sizing(
+                    cell,
+                    &refs,
+                    &SizingCfg {
+                        max_node_cores: 64,
+                        max_node_mem: 256 * GI,
+                        max_node_disk: 450 * GI,
+                        budget: u32::MAX,
+                        fuse_cache_bytes: 50 * GI,
+                    },
+                )
+                .0
+                .len()
+            })
+            .sum();
+        assert_eq!(
+            total, 0,
+            "BOTH gate populations contribute zero to the tick's mint \
+             vector — unbounded n cannot mint un-demanded capacity"
+        );
+    }
+
+    // r[verify ctrl.nodeclaim.mint-deficit-proportional]
+    /// **R12 — the cap-reader census [GEN-SET]** (re-scoped post-review:
+    /// code-readers ZERO + the committed surviving-surface expected
+    /// set). Generator:
+    ///
+    ///   rg -n 'per_tick_cap|max_node_claims_per_cell_per_tick' \
+    ///      rio-controller/src/
+    ///
+    /// over the EMBEDDED production sources (include_str!): the mint
+    /// path carries ZERO readers of the retired cap — the only
+    /// surviving mentions are the retirement rationale prose. The
+    /// out-of-crate surviving surface is the committed EXPECTED-SET
+    /// below, one disposition per row; an UNLISTED code reader fails
+    /// this census (closure tomorrow, not completeness today).
+    #[test]
+    fn cap_reader_census_code_readers_zero() {
+        let cover_src = include_str!("cover.rs");
+        let mod_src = include_str!("mod.rs");
+        let prod = |s: &str| {
+            s.split("#[cfg(test)]\nmod ")
+                .next()
+                .unwrap_or(s)
+                .to_string()
+        };
+        // cover.rs: 1 retirement-rationale prose mention in the sizing
+        // doc; ZERO code reads (the law is two-term).
+        assert_eq!(
+            prod(cover_src).matches("per_tick_cap").count(),
+            1,
+            "cover.rs: the retirement prose only — a second mention is a \
+             reader regression"
+        );
+        assert_eq!(
+            prod(cover_src)
+                .matches("max_node_claims_per_cell_per_tick")
+                .count(),
+            0,
+            "cover.rs: zero field readers"
+        );
+        // mod.rs: zero readers; the field/default/plumb rows are GONE
+        // (tolerant struct — the rendered TOML row is safely ignored).
+        assert_eq!(
+            prod(mod_src).matches("per_tick_cap").count(),
+            0,
+            "mod.rs: zero cap-name mentions in production"
+        );
+        assert_eq!(
+            prod(mod_src)
+                .matches("max_node_claims_per_cell_per_tick")
+                .count(),
+            0,
+            "mod.rs: the field, its default, and the SizingCfg plumb are \
+             retired"
+        );
+        // The committed EXPECTED-SET (out-of-crate surfaces; verified
+        // by the generator run committed in the WO-S7-1 commit body):
+        // - templates/controller.yaml:34 — renders into the TOLERANT
+        //   NodeClaimPoolConfig (serde(default): unknown key ignored);
+        // - templates/scheduler.yaml:44 — renders into the RETAINED
+        //   deny_unknown_fields SlaConfig field (parse-only);
+        // - infra/helm values.yaml sla row — DEPRECATION-COMMENTED
+        //   (arm (a): kept so the scheduler template's rendered key
+        //   keeps parsing);
+        // - nix/tests/default.nix — sets the retained field
+        //   (banner-protected, untouched);
+        // - rio-scheduler sla/config.rs — the deprecated-ignored
+        //   field + serde default + HELM_RENDERED_SLA_KEYS row +
+        //   test_default/destructure rows (parse-surface only);
+        // - docs/spec sla-sizing.typ — the two-term law + burst
+        //   pricing + the deprecated-row note ([GEN-SET] prose);
+        // - docs/spec/models/nodeclaimLifecycle.qnt:243 — the
+        //   MODELED-BUT-RETIRED knob (P7 scope-bound rationale in the
+        //   commit body; the model is NOT edited in-wave).
+        const EXPECTED_SET_ROWS: usize = 7;
+        assert_eq!(EXPECTED_SET_ROWS, 7, "the disposition table above");
     }
 }

@@ -1322,7 +1322,7 @@ defines no store CR.) The controller's `/scale` patches use field-manager
   taint.
 ]
 
-#r("ctrl.nodeclaim.budget.per-class+2")[
+#r("ctrl.nodeclaim.budget.per-class+3")[
   `cover_deficit` clamps each cell's per-tick mint at `min(global_remaining,
   hwClasses[cell.0].max_fleet_cores − class_live − class_created_this_tick)`
   where `class_live` and `class_created_this_tick` are summed across
@@ -1330,8 +1330,42 @@ defines no store CR.) The controller's `/scale` patches use field-manager
   spot+od each hit it independently → 2× \$/hr exposure). `max_fleet_cores=None`
   ⇒ global budget only. The per-tick created-core accounting (global and
   per-class) MUST count only successful creates --- a failed NodeClaim
-  create consumes no budget.
+  create consumes no budget. The budget brake and demand are the ONLY
+  mint bounds: the per-cell sizing law is the two-term
+  `min(n_pack, ⌊budget/chunk⌋)` (the
+  `ctrl.nodeclaim.mint-deficit-proportional` law --- the former flat
+  per-cell-per-tick cap is retired, live_049 L1).
 ]
+
+#r("ctrl.nodeclaim.mint-deficit-proportional")[
+  Minting MUST be bounded by demand and by the fleet budget --- the two
+  quantities with safety meaning --- and by NOTHING else: each cell's
+  per-tick claim count is `min(n_pack, ⌊budget/chunk⌋)`, where `n_pack`
+  is the FFD bin count over the actual placeable-gated unplaced
+  intents (right-sizing by construction) and `budget` is the per-class
+  fleet-core sub-budget. A deficit of `D` placeable-gated chunks
+  within budget MUST mint fully in ONE tick.
+]
+Rationale (live_049 L1, the parallel-ramp verdict): the 208-claim peak
+ramped at 18 ticks x 8/cell x \~1.44 slots/claim with demand drained
+BEFORE the budget crossing --- the flat cap stretched the ramp while
+protecting nothing: every deferred claim was demanded
+(placeable-gated, the `ctrl.nodeclaim.placeable-gate+5` premise,
+witnessed by the gate-population red `gate_population_feeds_zero_mint`
+and the ffd lead-time greens), budget-affordable (the brake premise,
+witnessed by the budget-binds pin + the intra-tick `class_created`
+accumulation law above), and right-sized (the `n_pack` premise,
+witnessed by the sim_packs battery + the four-caller footprint
+census). A gate regression after retirement is bounded by the
+fleet-budget brake, with the per-tick blast radius grown from 8/cell
+to `⌊budget/chunk⌋` --- which is why the gate premise carries a PROBING
+population witness, never prose. The write-burst axis is PRICED, not
+capped: worst-case creates/tick = `⌊remaining-budget/min-chunk⌋`
+(\~157/class at the grounded anchor chunk), absorbed by the
+kube-client QPS posture and Karpenter's CreateFleet batching +
+cloud-provider backoff (sla-sizing.typ carries the same pricing). The
+per-Cell round-robin start rotation, not the cap, is what prevents
+early-cell budget capture --- re-verified unchanged.
 
 #r("ctrl.nodeclaim.placement-outcome")[
   The cell-assignment chokepoint (`assign_to_cells`) MUST mint a total

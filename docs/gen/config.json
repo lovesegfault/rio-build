@@ -826,12 +826,6 @@
         "description": "§13b deficit-cover budget cap (sum of `allocatable.cpu` across all owned NodeClaims, Registered + in-flight)."
       },
       {
-        "key": "nodeclaim_pool.max_node_claims_per_cell_per_tick",
-        "type": "uint32",
-        "default": "8",
-        "description": "§13b per-cell-per-tick NodeClaim create cap."
-      },
-      {
         "key": "nodeclaim_pool.max_lead_time",
         "type": "double",
         "default": "600.0",

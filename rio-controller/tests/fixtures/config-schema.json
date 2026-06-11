@@ -56,7 +56,6 @@
           "lease_namespace": null,
           "reference_hw_class": "",
           "max_fleet_cores": 10000,
-          "max_node_claims_per_cell_per_tick": 8,
           "max_lead_time": 600.0,
           "max_consolidation_time": null,
           "min_consolidation_time": {
@@ -158,13 +157,6 @@
             "format": "uint32",
             "minimum": 0,
             "default": 10000
-          },
-          "max_node_claims_per_cell_per_tick": {
-            "description": "§13b per-cell-per-tick NodeClaim create cap. Prevents one cell's\nburst from monopolizing a tick's budget. Helm:\n`sla.maxNodeClaimsPerCellPerTick`.",
-            "type": "integer",
-            "format": "uint32",
-            "minimum": 0,
-            "default": 8
           },
           "max_lead_time": {
             "description": "§13b lead-time Schmitt clamp ceiling (seconds). Helm:\n`sla.maxLeadTime`.",
@@ -274,7 +266,6 @@
       "lease_namespace": null,
       "reference_hw_class": "",
       "max_fleet_cores": 10000,
-      "max_node_claims_per_cell_per_tick": 8,
       "max_lead_time": 600.0,
       "max_consolidation_time": null,
       "min_consolidation_time": {
