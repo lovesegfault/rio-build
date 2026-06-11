@@ -254,7 +254,8 @@ impl DagActor {
                 Ok(crate::state::ReleaseOutcome::AlreadyReleased(at)) => {
                     debug!(
                         drv_hash = %drv_hash, status = %at,
-                        "release chokepoint: already at a released status —                          typed no-op; disclosure fan-out proceeds"
+                        "release chokepoint: already at a released status — \
+                         typed no-op; disclosure fan-out proceeds"
                     );
                     affected.extend(self.get_interested_builds(drv_hash));
                 }
