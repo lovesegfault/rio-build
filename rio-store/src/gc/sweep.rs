@@ -353,6 +353,37 @@ async fn decrement_directory_refs(
     Ok(())
 }
 
+/// The `narinfo.references` referrer probe of
+/// [`recheck_has_live_referrer`], parameterized on the candidate's
+/// TEXT store_path (`$1`).
+///
+/// The path is resolved hash→store_path in Rust FIRST (one PK point
+/// lookup) and bound directly, instead of inlining the lookup as a
+/// scalar subquery in the array constructor
+/// (`ARRAY[(SELECT store_path FROM narinfo WHERE ...)]`). With the
+/// inlined subquery the planner stopped using
+/// `idx_narinfo_references_gin` and seq-scanned `narinfo` per probe —
+/// 51.6 ms/probe at 225k rows, 2 probes/path, 98% of post-cascade-fix
+/// sweep time. With a plain TEXT parameter the `@>` probe is a Bitmap
+/// Index Scan again (the M_008/I-145 plan this code always intended).
+/// `sweep_referrer_probe_uses_gin_index` EXPLAIN-asserts the plan.
+///
+/// The NOT EXISTS anti-join probes `sweep_unreachable` by its PRIMARY
+/// KEY (`path_hash`), so no extra index is needed on the temp table.
+///
+/// `const` so the EXPLAIN regression test runs the exact production
+/// SQL, not a copy that can drift.
+const LIVE_REFERRER_PROBE_SQL: &str = r#"
+    SELECT EXISTS (
+        SELECT 1 FROM narinfo n
+         WHERE n."references" @> ARRAY[$1::text]
+           AND NOT EXISTS (
+             SELECT 1 FROM sweep_unreachable su
+              WHERE su.path_hash = n.store_path_hash
+           )
+    )
+"#;
+
 /// Re-check whether `store_path_hash` has any concurrent-writable mark
 /// seed: (i) a `narinfo.references` referrer outside the
 /// `sweep_unreachable` temp table, (ii) a direct `scheduler_live_pins`
@@ -365,27 +396,34 @@ async fn decrement_directory_refs(
 /// every path inside the one batch already in flight when the hold
 /// lands, and unlike arm (iii) it does not require a `path_tenants`
 /// row). See the call-site comment in [`sweep`] for the GIN/anti-join
-/// rationale.
+/// rationale and [`LIVE_REFERRER_PROBE_SQL`] for why the
+/// hash→store_path resolution happens in Rust.
 // r[impl store.gc.hold+2]
 async fn recheck_has_live_referrer(
     tx: &mut Transaction<'_, Postgres>,
     store_path_hash: &[u8],
 ) -> Result<bool, sqlx::Error> {
+    // Resolve the candidate's TEXT store_path (PK point lookup). NULL
+    // (no narinfo row — matches the old ARRAY[NULL]-never-contains
+    // behavior) skips the referrer probe; pins/retention still apply.
+    let store_path: Option<String> =
+        sqlx::query_scalar("SELECT store_path FROM narinfo WHERE store_path_hash = $1")
+            .bind(store_path_hash)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if let Some(path) = store_path {
+        let referred: bool = sqlx::query_scalar(LIVE_REFERRER_PROBE_SQL)
+            .bind(&path)
+            .fetch_one(&mut **tx)
+            .await?;
+        if referred {
+            return Ok(true);
+        }
+    }
     sqlx::query_scalar(concat!(
         r#"
         SELECT
-          EXISTS (
-            SELECT 1 FROM narinfo n
-             WHERE n."references" @> ARRAY[
-                     (SELECT store_path FROM narinfo WHERE store_path_hash = $1)
-                   ]
-               AND NOT EXISTS (
-                 SELECT 1 FROM sweep_unreachable su
-                  WHERE su.path_hash = n.store_path_hash
-               )
-             LIMIT 1
-          )
-          OR EXISTS (SELECT 1 FROM scheduler_live_pins WHERE store_path_hash = $1)
+          EXISTS (SELECT 1 FROM scheduler_live_pins WHERE store_path_hash = $1)
           OR EXISTS (
             SELECT 1 FROM path_tenants pt
               JOIN tenants t USING (tenant_id)
@@ -800,16 +838,18 @@ async fn sweep_one_batch(
         // (there is no advisory lock).
         // r[impl store.gc.sweep-recheck+2]
         //
-        // The subquery resolves hash→path because narinfo."references"
-        // is TEXT[] (store_path strings, not hashes). The GIN index
-        // (migration 008) makes `"references" @> ARRAY[$path]` an
-        // index scan. I-145: the previous `$path = ANY("references")`
-        // form is semantically equivalent but does NOT use GIN — PG's
-        // array-GIN opclass supports `@>`/`<@`/`&&`/`=` only, and the
-        // planner does not rewrite `scalar = ANY(arrcol)` into `@>`.
-        // At 100k+ narinfo rows that was a ~1.3s seqscan per swept
-        // path. EXPLAIN-verified: `@>` → Bitmap Index Scan on
-        // idx_narinfo_references_gin even with the InitPlan subquery.
+        // The hash→path resolution happens in Rust (PK point lookup)
+        // because narinfo."references" is TEXT[] (store_path strings,
+        // not hashes) and the GIN index (migration 008) only
+        // participates when `"references" @> ARRAY[$path]` gets a
+        // plain parameter. I-145: the original `$path =
+        // ANY("references")` form does NOT use GIN — PG's array-GIN
+        // opclass supports `@>`/`<@`/`&&`/`=` only, and the planner
+        // does not rewrite `scalar = ANY(arrcol)` into `@>`. The
+        // intermediate `@> ARRAY[(SELECT ...)]` form regressed the
+        // same way: the scalar subquery inside the array constructor
+        // also defeated the index (51.6 ms seqscan per probe at 225k
+        // rows). See LIVE_REFERRER_PROBE_SQL and its EXPLAIN test.
         //
         // The NOT EXISTS anti-join against sweep_unreachable
         // excludes referrers that are themselves in the unreachable
@@ -2109,5 +2149,62 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(pt_b, 1, "B's fresh path_tenants row survives");
+    }
+
+    /// Plan-shape regression guard for the GC referrer probe:
+    /// `references @> ARRAY[$1::text]` must be answerable by
+    /// `idx_narinfo_references_gin`. The previous shape inlined the
+    /// hash→path resolution as a scalar subquery INSIDE the array
+    /// constructor (`@> ARRAY[(SELECT store_path ...)]`), which
+    /// silently demoted the probe to a seq scan per call (51.6 ms at
+    /// 225k narinfo rows, 2 calls/path — 98% of sweep wall time).
+    ///
+    /// `SET LOCAL enable_seqscan = off` makes this structural, not
+    /// cost-based: it does NOT force an index scan into existence — a
+    /// non-indexable query shape still plans a (cost-penalized) Seq
+    /// Scan — so "no Seq Scan on narinfo" proves the query SHAPE is
+    /// GIN-indexable regardless of test-table size, where default
+    /// costing on a near-empty table would prefer the seq scan and
+    /// make the assertion vacuous.
+    ///
+    /// The probe SQL is the production const with the parameter
+    /// spliced as a literal: PG's extended protocol rejects bind
+    /// parameters in utility statements (EXPLAIN), and a literal
+    /// plans with the same custom-plan shape the first executions of
+    /// the prepared form use.
+    #[tokio::test]
+    async fn sweep_referrer_probe_uses_gin_index() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        // One narinfo row so the planner has a real table + index.
+        StoreSeed::path("gin-probe").seed(&db.pool).await;
+
+        let mut conn = db.pool.acquire().await.unwrap();
+        setup_sweep_unreachable(&mut conn, &[vec![0u8; 32]])
+            .await
+            .unwrap();
+        let mut tx = conn.begin().await.unwrap();
+        sqlx::query("SET LOCAL enable_seqscan = off")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let probe = LIVE_REFERRER_PROBE_SQL.replace("$1::text", "'/nix/store/x-gin-probe'::text");
+        assert_ne!(probe, LIVE_REFERRER_PROBE_SQL, "splice must hit");
+        // AssertSqlSafe: production const + a fixed literal, test-only.
+        let plan_rows: Vec<String> =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("EXPLAIN {probe}")))
+                .fetch_all(&mut *tx)
+                .await
+                .unwrap();
+        let plan = plan_rows.join("\n");
+        assert!(
+            plan.contains("idx_narinfo_references_gin"),
+            "referrer probe must use the GIN index; plan:\n{plan}"
+        );
+        assert!(
+            !plan.contains("Seq Scan on narinfo"),
+            "referrer probe must not seq-scan narinfo (even with \
+             enable_seqscan=off a non-indexable shape still plans one); plan:\n{plan}"
+        );
+        tx.rollback().await.unwrap();
     }
 }
