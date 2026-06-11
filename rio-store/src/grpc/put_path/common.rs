@@ -1016,47 +1016,174 @@ pub(in crate::grpc) async fn stamp_ingest_tenant_in_tx(
 // ===========================================================================
 // W9-E (round-9 WO-S1-2) — the registration-writer census, store crate
 // half (the scheduler half lives beside `upsert_path_tenants_raw` in
-// rio-scheduler/src/db/live_pins.rs; per-crate scans only — hazard
-// (vvvvv): a per-crate nix test sandbox stages only its own crate's
-// source). Proposition: the store's ONE production ownership-INSERT is
+// rio-scheduler/src/db/live_pins.rs; per-crate censuses only).
+// Proposition: the store's ONE production ownership-INSERT is
 // `insert_path_tenant_rows` above; every other occurrence is a test
-// seed pinned by exact count.
+// seed pinned by exact count. Source-scanning generator over the
+// EMBEDDED whole-crate universe (the substitute.rs CENSUS_SOURCES
+// hybrid — hazard (vvvvv): the nix gate runs test binaries without
+// the source tree on disk, so a runtime-only walk is
+// premise-unreachable exactly where it gates); completeness vs the
+// live tree pinned BOTH directions on dev runs, sandbox skip
+// disclosed.
 // ===========================================================================
 #[cfg(test)]
 mod registration_writer_census {
     use std::collections::BTreeMap;
-    use std::path::Path;
 
-    fn scan(dir: &Path, needle: &str, hits: &mut BTreeMap<String, usize>, root: &Path) {
-        for entry in std::fs::read_dir(dir).expect("readable src dir") {
-            let entry = entry.expect("dir entry");
-            let path = entry.path();
-            if path.is_dir() {
-                scan(&path, needle, hits, root);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                let text = std::fs::read_to_string(&path).expect("readable source file");
-                let n = text.matches(needle).count();
-                if n > 0 {
-                    let rel = path
-                        .strip_prefix(root)
-                        .expect("under root")
-                        .to_str()
-                        .expect("source paths are utf-8")
-                        .to_owned();
-                    *hits.entry(rel).or_insert(0) += n;
-                }
-            }
-        }
-    }
+    /// EVERY `.rs` under `rio-store/src`, embedded at compile time.
+    /// Machine-generated (generator command in the owning commit
+    /// body); the completeness pin below tracks the live tree.
+    const CENSUS_SOURCES: &[(&str, &str)] = &[
+        ("admission.rs", include_str!("../../admission.rs")),
+        ("authz.rs", include_str!("../../authz.rs")),
+        ("backend.rs", include_str!("../../backend.rs")),
+        ("cas.rs", include_str!("../../cas.rs")),
+        ("chunker.rs", include_str!("../../chunker.rs")),
+        ("config.rs", include_str!("../../config.rs")),
+        ("error.rs", include_str!("../../error.rs")),
+        ("gc/collect.rs", include_str!("../../gc/collect.rs")),
+        ("gc/drain.rs", include_str!("../../gc/drain.rs")),
+        ("gc/lock.rs", include_str!("../../gc/lock.rs")),
+        ("gc/mark.rs", include_str!("../../gc/mark.rs")),
+        (
+            "gc/mark_scan_bench.rs",
+            include_str!("../../gc/mark_scan_bench.rs"),
+        ),
+        ("gc/mod.rs", include_str!("../../gc/mod.rs")),
+        ("gc/orphan.rs", include_str!("../../gc/orphan.rs")),
+        ("gc/state.rs", include_str!("../../gc/state.rs")),
+        ("gc/sweep.rs", include_str!("../../gc/sweep.rs")),
+        ("gc/tenant.rs", include_str!("../../gc/tenant.rs")),
+        ("grpc/admin.rs", include_str!("../../grpc/admin.rs")),
+        ("grpc/chunk.rs", include_str!("../../grpc/chunk.rs")),
+        ("grpc/get_path.rs", include_str!("../../grpc/get_path.rs")),
+        ("grpc/mod.rs", include_str!("../../grpc/mod.rs")),
+        (
+            "grpc/put_path/common.rs",
+            include_str!("../../grpc/put_path/common.rs"),
+        ),
+        (
+            "grpc/put_path/mod.rs",
+            include_str!("../../grpc/put_path/mod.rs"),
+        ),
+        (
+            "grpc/put_path_batch.rs",
+            include_str!("../../grpc/put_path_batch.rs"),
+        ),
+        ("grpc/queries.rs", include_str!("../../grpc/queries.rs")),
+        ("grpc/sign.rs", include_str!("../../grpc/sign.rs")),
+        ("ingest.rs", include_str!("../../ingest.rs")),
+        ("lib.rs", include_str!("../../lib.rs")),
+        ("logs/chunks.rs", include_str!("../../logs/chunks.rs")),
+        ("logs/gate.rs", include_str!("../../logs/gate.rs")),
+        ("logs/ingest.rs", include_str!("../../logs/ingest.rs")),
+        ("logs/loss.rs", include_str!("../../logs/loss.rs")),
+        ("logs/mbt_tests.rs", include_str!("../../logs/mbt_tests.rs")),
+        ("logs/mod.rs", include_str!("../../logs/mod.rs")),
+        ("logs/service.rs", include_str!("../../logs/service.rs")),
+        ("logs/sessions.rs", include_str!("../../logs/sessions.rs")),
+        ("logs/sweep.rs", include_str!("../../logs/sweep.rs")),
+        ("logs/tail.rs", include_str!("../../logs/tail.rs")),
+        ("main.rs", include_str!("../../main.rs")),
+        ("manifest.rs", include_str!("../../manifest.rs")),
+        (
+            "materialize/client.rs",
+            include_str!("../../materialize/client.rs"),
+        ),
+        (
+            "materialize/executor.rs",
+            include_str!("../../materialize/executor.rs"),
+        ),
+        (
+            "materialize/mod.rs",
+            include_str!("../../materialize/mod.rs"),
+        ),
+        (
+            "metadata/chunked.rs",
+            include_str!("../../metadata/chunked.rs"),
+        ),
+        (
+            "metadata/cluster_key_history.rs",
+            include_str!("../../metadata/cluster_key_history.rs"),
+        ),
+        (
+            "metadata/inline.rs",
+            include_str!("../../metadata/inline.rs"),
+        ),
+        ("metadata/mod.rs", include_str!("../../metadata/mod.rs")),
+        (
+            "metadata/queries.rs",
+            include_str!("../../metadata/queries.rs"),
+        ),
+        (
+            "metadata/tenant_keys.rs",
+            include_str!("../../metadata/tenant_keys.rs"),
+        ),
+        (
+            "metadata/upstreams.rs",
+            include_str!("../../metadata/upstreams.rs"),
+        ),
+        ("realisations.rs", include_str!("../../realisations.rs")),
+        ("signing.rs", include_str!("../../signing.rs")),
+        ("substitute.rs", include_str!("../../substitute.rs")),
+        ("test_helpers.rs", include_str!("../../test_helpers.rs")),
+        ("visibility.rs", include_str!("../../visibility.rs")),
+    ];
 
     /// Needles assembled at runtime so the census never matches its
     /// own source text.
     fn census(parts: &[&str]) -> BTreeMap<String, usize> {
         let needle = parts.join("");
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut hits = BTreeMap::new();
-        scan(&root, &needle, &mut hits, &root);
+        for (rel, text) in CENSUS_SOURCES {
+            let n = text.matches(&needle).count();
+            if n > 0 {
+                *hits.entry((*rel).to_string()).or_insert(0) += n;
+            }
+        }
         hits
+    }
+
+    /// Dev-tree completeness pin (both directions; sandbox skip
+    /// disclosed — the substitute.rs form).
+    #[test]
+    fn census_universe_matches_live_tree() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        if !root.exists() {
+            eprintln!(
+                "src/ not on disk (nix sandbox): universe pinned by the \
+                 dev-tree run of this same commit"
+            );
+            return;
+        }
+        fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).expect("readable src dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(&path, root, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(
+                        path.strip_prefix(root)
+                            .expect("under root")
+                            .to_str()
+                            .expect("source paths are utf-8")
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+        let mut live: Vec<String> = Vec::new();
+        walk(&root, &root, &mut live);
+        live.sort();
+        let mut embedded: Vec<String> = CENSUS_SOURCES.iter().map(|(f, _)| f.to_string()).collect();
+        embedded.sort();
+        assert_eq!(
+            embedded, live,
+            "census universe drifted from the live tree: add/remove the \
+             named files in CENSUS_SOURCES so the registration census sees \
+             the whole crate in the nix sandbox too"
+        );
     }
 
     /// ONE production ownership-INSERT (this file's
@@ -1089,8 +1216,9 @@ mod registration_writer_census {
 
     /// W9-G (round-9 WO-S1-3), store half: the store's
     /// realisation-INSERT population is `realisations.rs` (the
-    /// RegisterRealisation authority) plus one gc/sweep.rs test seed,
-    /// pinned by exact count.
+    /// RegisterRealisation authority) plus one gc/mod.rs identity seed
+    /// and one gc/sweep.rs tombstone-battery seed, pinned by exact
+    /// count.
     #[test]
     fn realisation_writers_pinned() {
         let hits = census(&["INSERT INTO ", "realisations"]);

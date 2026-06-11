@@ -1757,7 +1757,8 @@ unchanged.
 ]
 Every byte-complete upload the store accepted is registered evidence (the
 signed round-9 Q1 invariant). Before this rule, 93.4% of the store sat
-unstamped: visibility for fresh uploads rode entirely on the 2h grace plus
+unstamped: visibility for fresh uploads rode entirely on the
+#(refs.const)("DEFAULT_GC_GRACE_HOURS")h grace plus
 signatures, and an uploaded-then-never-built-against path had no registration
 record at all.
 

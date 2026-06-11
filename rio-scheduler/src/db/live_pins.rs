@@ -416,47 +416,375 @@ impl SchedulerDb {
 // tenant-ownership table — the ONE production SQL body is the
 // witness-funneled `upsert_path_tenants_raw` above, and every caller
 // of the writer family is a censused chokepoint (or a test exercising
-// one of the db fns directly). Source-scanning generator (RC-1 class):
-// the member list comes FROM the tree, never from an author-typed
-// list. Same-crate scan only — the store-crate half of the census
-// lives beside the store's ingest writer (hazard (vvvvv): a per-crate
-// nix test sandbox stages only its own crate's source).
+// one of the db fns directly). Source-scanning generator (RC-1 class)
+// over the EMBEDDED whole-crate universe (the substitute.rs
+// CENSUS_SOURCES / fence_coverage.rs hybrid — the nix gate runs test
+// binaries without the source tree on disk, hazard (vvvvv): a
+// runtime-only walk is premise-unreachable exactly where it gates);
+// completeness of the embed vs the live tree is pinned BOTH directions
+// by `census_universe_matches_live_tree` on every dev run of the same
+// commit (sandbox skip disclosed, never silent). Same-crate scan only
+// — the store-crate half lives beside the store's ingest writer.
 // =======================================================================
 #[cfg(test)]
 mod registration_writer_census {
     use std::collections::BTreeMap;
-    use std::path::Path;
 
-    fn scan(dir: &Path, needle: &str, hits: &mut BTreeMap<String, usize>, root: &Path) {
-        for entry in std::fs::read_dir(dir).expect("readable src dir") {
-            let entry = entry.expect("dir entry");
-            let path = entry.path();
-            if path.is_dir() {
-                scan(&path, needle, hits, root);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                let text = std::fs::read_to_string(&path).expect("readable source file");
-                let n = text.matches(needle).count();
-                if n > 0 {
-                    let rel = path
-                        .strip_prefix(root)
-                        .expect("under root")
-                        .to_str()
-                        .expect("source paths are utf-8")
-                        .to_owned();
-                    *hits.entry(rel).or_insert(0) += n;
+    /// EVERY `.rs` under `rio-scheduler/src`, embedded at compile time.
+    /// Machine-generated (the generator command is recorded in the
+    /// owning commit body); the completeness pin below forces this
+    /// list to track the live tree exactly.
+    const CENSUS_SOURCES: &[(&str, &str)] = &[
+        ("actor/breaker.rs", include_str!("../actor/breaker.rs")),
+        ("actor/build.rs", include_str!("../actor/build.rs")),
+        ("actor/command.rs", include_str!("../actor/command.rs")),
+        (
+            "actor/completion.rs",
+            include_str!("../actor/completion.rs"),
+        ),
+        ("actor/config.rs", include_str!("../actor/config.rs")),
+        ("actor/debug.rs", include_str!("../actor/debug.rs")),
+        ("actor/dispatch.rs", include_str!("../actor/dispatch.rs")),
+        ("actor/event.rs", include_str!("../actor/event.rs")),
+        ("actor/executor.rs", include_str!("../actor/executor.rs")),
+        ("actor/floor.rs", include_str!("../actor/floor.rs")),
+        ("actor/handle.rs", include_str!("../actor/handle.rs")),
+        (
+            "actor/housekeeping.rs",
+            include_str!("../actor/housekeeping.rs"),
+        ),
+        (
+            "actor/materialize.rs",
+            include_str!("../actor/materialize.rs"),
+        ),
+        ("actor/merge.rs", include_str!("../actor/merge.rs")),
+        ("actor/mod.rs", include_str!("../actor/mod.rs")),
+        ("actor/pull.rs", include_str!("../actor/pull.rs")),
+        ("actor/recovery.rs", include_str!("../actor/recovery.rs")),
+        (
+            "actor/report_ctx.rs",
+            include_str!("../actor/report_ctx.rs"),
+        ),
+        ("actor/snapshot.rs", include_str!("../actor/snapshot.rs")),
+        (
+            "actor/tests/build.rs",
+            include_str!("../actor/tests/build.rs"),
+        ),
+        (
+            "actor/tests/completion.rs",
+            include_str!("../actor/tests/completion.rs"),
+        ),
+        (
+            "actor/tests/dispatch.rs",
+            include_str!("../actor/tests/dispatch.rs"),
+        ),
+        (
+            "actor/tests/establishment.rs",
+            include_str!("../actor/tests/establishment.rs"),
+        ),
+        (
+            "actor/tests/executor.rs",
+            include_str!("../actor/tests/executor.rs"),
+        ),
+        (
+            "actor/tests/fencing.rs",
+            include_str!("../actor/tests/fencing.rs"),
+        ),
+        (
+            "actor/tests/helpers.rs",
+            include_str!("../actor/tests/helpers.rs"),
+        ),
+        (
+            "actor/tests/integration.rs",
+            include_str!("../actor/tests/integration.rs"),
+        ),
+        (
+            "actor/tests/keep_going.rs",
+            include_str!("../actor/tests/keep_going.rs"),
+        ),
+        (
+            "actor/tests/lifecycle_sweep.rs",
+            include_str!("../actor/tests/lifecycle_sweep.rs"),
+        ),
+        (
+            "actor/tests/materialize.rs",
+            include_str!("../actor/tests/materialize.rs"),
+        ),
+        (
+            "actor/tests/merge.rs",
+            include_str!("../actor/tests/merge.rs"),
+        ),
+        (
+            "actor/tests/misc.rs",
+            include_str!("../actor/tests/misc.rs"),
+        ),
+        ("actor/tests/mod.rs", include_str!("../actor/tests/mod.rs")),
+        (
+            "actor/tests/pull.rs",
+            include_str!("../actor/tests/pull.rs"),
+        ),
+        (
+            "actor/tests/recovery.rs",
+            include_str!("../actor/tests/recovery.rs"),
+        ),
+        (
+            "actor/tests/sla_contract.rs",
+            include_str!("../actor/tests/sla_contract.rs"),
+        ),
+        (
+            "actor/tests/wiring.rs",
+            include_str!("../actor/tests/wiring.rs"),
+        ),
+        ("admin/builds.rs", include_str!("../admin/builds.rs")),
+        ("admin/executors.rs", include_str!("../admin/executors.rs")),
+        ("admin/gc.rs", include_str!("../admin/gc.rs")),
+        ("admin/graph.rs", include_str!("../admin/graph.rs")),
+        ("admin/mod.rs", include_str!("../admin/mod.rs")),
+        ("admin/sla.rs", include_str!("../admin/sla.rs")),
+        (
+            "admin/spawn_intents.rs",
+            include_str!("../admin/spawn_intents.rs"),
+        ),
+        ("admin/tenants.rs", include_str!("../admin/tenants.rs")),
+        (
+            "admin/tests/builds_tests.rs",
+            include_str!("../admin/tests/builds_tests.rs"),
+        ),
+        (
+            "admin/tests/gc_tests.rs",
+            include_str!("../admin/tests/gc_tests.rs"),
+        ),
+        (
+            "admin/tests/graph_tests.rs",
+            include_str!("../admin/tests/graph_tests.rs"),
+        ),
+        ("admin/tests/mod.rs", include_str!("../admin/tests/mod.rs")),
+        (
+            "admin/tests/spawn_intents_tests.rs",
+            include_str!("../admin/tests/spawn_intents_tests.rs"),
+        ),
+        (
+            "admin/tests/tenants_tests.rs",
+            include_str!("../admin/tests/tenants_tests.rs"),
+        ),
+        (
+            "admin/tests/workers_tests.rs",
+            include_str!("../admin/tests/workers_tests.rs"),
+        ),
+        ("assignment.rs", include_str!("../assignment.rs")),
+        ("ca/mod.rs", include_str!("../ca/mod.rs")),
+        ("ca/resolve.rs", include_str!("../ca/resolve.rs")),
+        ("config.rs", include_str!("../config.rs")),
+        ("critical_path.rs", include_str!("../critical_path.rs")),
+        ("dag/mod.rs", include_str!("../dag/mod.rs")),
+        ("dag/tests.rs", include_str!("../dag/tests.rs")),
+        ("db/assignments.rs", include_str!("../db/assignments.rs")),
+        ("db/attempts.rs", include_str!("../db/attempts.rs")),
+        ("db/batch.rs", include_str!("../db/batch.rs")),
+        ("db/builds.rs", include_str!("../db/builds.rs")),
+        (
+            "db/confirm_fences.rs",
+            include_str!("../db/confirm_fences.rs"),
+        ),
+        ("db/derivations.rs", include_str!("../db/derivations.rs")),
+        ("db/executions.rs", include_str!("../db/executions.rs")),
+        ("db/history.rs", include_str!("../db/history.rs")),
+        ("db/live_pins.rs", include_str!("../db/live_pins.rs")),
+        (
+            "db/materialization.rs",
+            include_str!("../db/materialization.rs"),
+        ),
+        ("db/mod.rs", include_str!("../db/mod.rs")),
+        (
+            "db/open_attempts.rs",
+            include_str!("../db/open_attempts.rs"),
+        ),
+        ("db/recovery.rs", include_str!("../db/recovery.rs")),
+        ("db/tenants.rs", include_str!("../db/tenants.rs")),
+        (
+            "db/tests/assignments.rs",
+            include_str!("../db/tests/assignments.rs"),
+        ),
+        (
+            "db/tests/attempts.rs",
+            include_str!("../db/tests/attempts.rs"),
+        ),
+        ("db/tests/batch.rs", include_str!("../db/tests/batch.rs")),
+        ("db/tests/builds.rs", include_str!("../db/tests/builds.rs")),
+        (
+            "db/tests/confirm_fences.rs",
+            include_str!("../db/tests/confirm_fences.rs"),
+        ),
+        (
+            "db/tests/derivations.rs",
+            include_str!("../db/tests/derivations.rs"),
+        ),
+        (
+            "db/tests/fence_coverage.rs",
+            include_str!("../db/tests/fence_coverage.rs"),
+        ),
+        (
+            "db/tests/fenced_tx.rs",
+            include_str!("../db/tests/fenced_tx.rs"),
+        ),
+        (
+            "db/tests/history.rs",
+            include_str!("../db/tests/history.rs"),
+        ),
+        (
+            "db/tests/live_pins.rs",
+            include_str!("../db/tests/live_pins.rs"),
+        ),
+        (
+            "db/tests/materialization.rs",
+            include_str!("../db/tests/materialization.rs"),
+        ),
+        ("db/tests/mod.rs", include_str!("../db/tests/mod.rs")),
+        (
+            "db/tests/open_attempts.rs",
+            include_str!("../db/tests/open_attempts.rs"),
+        ),
+        (
+            "db/tests/recovery.rs",
+            include_str!("../db/tests/recovery.rs"),
+        ),
+        (
+            "db/tests/tenants.rs",
+            include_str!("../db/tests/tenants.rs"),
+        ),
+        (
+            "db/tests/transactions.rs",
+            include_str!("../db/tests/transactions.rs"),
+        ),
+        ("db/tests/wanted.rs", include_str!("../db/tests/wanted.rs")),
+        ("db/wanted.rs", include_str!("../db/wanted.rs")),
+        ("domain.rs", include_str!("../domain.rs")),
+        (
+            "grpc/actor_guards.rs",
+            include_str!("../grpc/actor_guards.rs"),
+        ),
+        (
+            "grpc/executor_service.rs",
+            include_str!("../grpc/executor_service.rs"),
+        ),
+        ("grpc/mod.rs", include_str!("../grpc/mod.rs")),
+        (
+            "grpc/scheduler_service.rs",
+            include_str!("../grpc/scheduler_service.rs"),
+        ),
+        (
+            "grpc/tests/bridge_tests.rs",
+            include_str!("../grpc/tests/bridge_tests.rs"),
+        ),
+        (
+            "grpc/tests/guards_tests.rs",
+            include_str!("../grpc/tests/guards_tests.rs"),
+        ),
+        ("grpc/tests/mod.rs", include_str!("../grpc/tests/mod.rs")),
+        (
+            "grpc/tests/pull_tests.rs",
+            include_str!("../grpc/tests/pull_tests.rs"),
+        ),
+        (
+            "grpc/tests/submit_tests.rs",
+            include_str!("../grpc/tests/submit_tests.rs"),
+        ),
+        ("lease_hooks.rs", include_str!("../lease_hooks.rs")),
+        ("lib.rs", include_str!("../lib.rs")),
+        ("main.rs", include_str!("../main.rs")),
+        ("observability.rs", include_str!("../observability.rs")),
+        ("retry_policy.rs", include_str!("../retry_policy.rs")),
+        ("sla/alpha.rs", include_str!("../sla/alpha.rs")),
+        ("sla/bootstrap.rs", include_str!("../sla/bootstrap.rs")),
+        ("sla/catalog.rs", include_str!("../sla/catalog.rs")),
+        ("sla/config.rs", include_str!("../sla/config.rs")),
+        ("sla/cost.rs", include_str!("../sla/cost.rs")),
+        ("sla/dip.rs", include_str!("../sla/dip.rs")),
+        ("sla/explain.rs", include_str!("../sla/explain.rs")),
+        ("sla/explore.rs", include_str!("../sla/explore.rs")),
+        ("sla/fit.rs", include_str!("../sla/fit.rs")),
+        ("sla/hw.rs", include_str!("../sla/hw.rs")),
+        ("sla/ingest.rs", include_str!("../sla/ingest.rs")),
+        ("sla/metrics.rs", include_str!("../sla/metrics.rs")),
+        ("sla/mod.rs", include_str!("../sla/mod.rs")),
+        ("sla/override.rs", include_str!("../sla/override.rs")),
+        ("sla/prior.rs", include_str!("../sla/prior.rs")),
+        ("sla/quantile.rs", include_str!("../sla/quantile.rs")),
+        ("sla/solve.rs", include_str!("../sla/solve.rs")),
+        ("sla/types.rs", include_str!("../sla/types.rs")),
+        ("state/build.rs", include_str!("../state/build.rs")),
+        ("state/db_str.rs", include_str!("../state/db_str.rs")),
+        (
+            "state/derivation.rs",
+            include_str!("../state/derivation.rs"),
+        ),
+        ("state/executor.rs", include_str!("../state/executor.rs")),
+        ("state/mod.rs", include_str!("../state/mod.rs")),
+        ("state/newtypes.rs", include_str!("../state/newtypes.rs")),
+        (
+            "state/recovered_instant.rs",
+            include_str!("../state/recovered_instant.rs"),
+        ),
+        ("tests.rs", include_str!("../tests.rs")),
+    ];
+
+    /// Needles are assembled at runtime so the census never matches
+    /// its own source text.
+    fn census(parts: &[&str]) -> BTreeMap<String, usize> {
+        let needle = parts.join("");
+        let mut hits = BTreeMap::new();
+        for (rel, text) in CENSUS_SOURCES {
+            let n = text.matches(&needle).count();
+            if n > 0 {
+                *hits.entry((*rel).to_string()).or_insert(0) += n;
+            }
+        }
+        hits
+    }
+
+    /// Dev-tree completeness pin: the embedded universe equals the
+    /// live `src/` tree EXACTLY (both directions) — a new source file
+    /// fails here until embedded, so the census quantifier domain is
+    /// generator-bounded, never author-bounded. In the nix sandbox
+    /// (no source dir) the embedded scan is the same commit's content;
+    /// the skip is disclosed, not silent (the substitute.rs form).
+    #[test]
+    fn census_universe_matches_live_tree() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        if !root.exists() {
+            eprintln!(
+                "src/ not on disk (nix sandbox): universe pinned by the \
+                 dev-tree run of this same commit"
+            );
+            return;
+        }
+        fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).expect("readable src dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(&path, root, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(
+                        path.strip_prefix(root)
+                            .expect("under root")
+                            .to_str()
+                            .expect("source paths are utf-8")
+                            .to_owned(),
+                    );
                 }
             }
         }
-    }
-
-    /// Needles are assembled at runtime (`concat`-free) so the census
-    /// never matches its own source text.
-    fn census(parts: &[&str]) -> BTreeMap<String, usize> {
-        let needle = parts.join("");
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut hits = BTreeMap::new();
-        scan(&root, &needle, &mut hits, &root);
-        hits
+        let mut live: Vec<String> = Vec::new();
+        walk(&root, &root, &mut live);
+        live.sort();
+        let mut embedded: Vec<String> = CENSUS_SOURCES.iter().map(|(f, _)| f.to_string()).collect();
+        embedded.sort();
+        assert_eq!(
+            embedded, live,
+            "census universe drifted from the live tree: add/remove the \
+             named files in CENSUS_SOURCES so the registration census sees \
+             the whole crate in the nix sandbox too"
+        );
     }
 
     /// The SQL-body census: exactly ONE ownership-INSERT statement in
