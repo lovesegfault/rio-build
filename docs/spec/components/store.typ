@@ -1547,6 +1547,24 @@ cache TTL, silently degrading those paths to build-from-source (the
 2026-05-23 incident class). Recording the error axis makes the clean-miss
 cache contract real for the first time.
 
+#r("store.substitute.ca-self-auth")[
+  An upstream narinfo's `CA:` claim MUST be persisted only if the store path
+  recomputed from it (Nix `makeFixedOutputPath` / `makeTextPath` over the
+  narinfo's references) equals the path being substituted; otherwise the
+  claim is dropped (persisted as absent) and logged at `warn`.
+]
+The narinfo signature fingerprint covers only `(store_path, nar_hash,
+nar_size, references)` --- `Deriver:` and `CA:` are NOT signature-covered, so
+a compromised upstream can attach arbitrary claims to correctly-signed
+content (the rpm CVE-2021-20271 signature-scope class). A self-consistent
+`CA:` is exactly as trustworthy as the (signed) store path, because the path
+name commits to the content address by construction --- this is the same
+self-authentication check reference Nix performs in
+`ValidPathInfo::isContentAddressed`. `Deriver:` is persisted as-is: it is
+informational in the Nix trust model (`nix-store -q --deriver`) and nothing
+security-relevant consumes it (the PutPathChunked deriver/token binding
+applies to builder uploads, not substitution).
+
 #r("store.substitute.stale-reclaim+4")[
   When a claim attempt finds an existing `'uploading'` placeholder for the
   requested path, `claim_placeholder` MUST apply three takeover arms in
