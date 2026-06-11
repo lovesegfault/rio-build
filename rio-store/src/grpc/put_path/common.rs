@@ -1084,4 +1084,24 @@ mod registration_writer_census {
              them here with their witness rationale"
         );
     }
+
+    /// W9-G (round-9 WO-S1-3), store half: the store's
+    /// realisation-INSERT population is `realisations.rs` (the
+    /// RegisterRealisation authority) plus one gc/sweep.rs test seed,
+    /// pinned by exact count.
+    #[test]
+    fn realisation_writers_pinned() {
+        let hits = census(&["INSERT INTO ", "realisations"]);
+        let expected: BTreeMap<String, usize> = [
+            ("realisations.rs".to_string(), 1),
+            ("gc/sweep.rs".to_string(), 1),
+        ]
+        .into();
+        assert_eq!(
+            hits, expected,
+            "the store realisation-INSERT census moved — identity rows \
+             are written by the realisations.rs authority only; census \
+             new writers here with their witness rationale"
+        );
+    }
 }

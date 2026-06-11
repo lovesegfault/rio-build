@@ -210,6 +210,41 @@ impl SchedulerDb {
         Ok(result.rows_affected())
     }
 
+    /// Round-9 WO-S1-3 — the IDENTITY half of the registration writer
+    /// family (the signed Q1 invariant's second half: *registered
+    /// evidence carries identity so resubmission re-associates*): fill
+    /// the (output path ↔ deriver) linkage on the shared narinfo rows
+    /// for paths whose uploader did not declare it. MONOTONE: only
+    /// absent (`NULL`/`''`) deriver cells fill — a wire-declared
+    /// deriver from the ingest lane is never overwritten (the uploader
+    /// is closer to the truth). Parallel arrays pair each path hash
+    /// with ITS drv_path so the batch funnel fills cross-drv in one
+    /// round trip. Best-effort like every registration write.
+    pub(crate) async fn fill_deriver_linkage(
+        &self,
+        path_hashes: &[Vec<u8>],
+        drv_paths: &[String],
+    ) -> Result<u64, sqlx::Error> {
+        debug_assert_eq!(path_hashes.len(), drv_paths.len());
+        if path_hashes.is_empty() {
+            return Ok(0);
+        }
+        let result = sqlx::query(
+            r#"
+            UPDATE narinfo n
+               SET deriver = u.d
+              FROM UNNEST($1::bytea[], $2::text[]) AS u(h, d)
+             WHERE n.store_path_hash = u.h
+               AND (n.deriver IS NULL OR n.deriver = '')
+            "#,
+        )
+        .bind(path_hashes)
+        .bind(drv_paths)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Unpin all live inputs for a drv. Called on terminal status.
     /// Idempotent: unpinning a never-pinned drv = 0 rows deleted.
     ///
@@ -469,6 +504,24 @@ mod registration_writer_census {
              route it through the censused stamp chokepoints \
              (stamp_path_tenants / upsert_path_tenants_for_batch) or \
              census it here with its witness rationale"
+        );
+    }
+
+    /// W9-G (round-9 WO-S1-3): realisation rows are written by
+    /// registration writers ONLY — the scheduler's realisation-INSERT
+    /// population is the `ca/resolve.rs` authority module (production
+    /// insert fns + their in-file battery seeds), pinned by exact
+    /// count. A realisation INSERT in any other file is an uncensused
+    /// identity writer.
+    #[test]
+    fn realisation_writers_pinned() {
+        let hits = census(&["INSERT INTO ", "realisations"]);
+        let expected: BTreeMap<String, usize> = [("ca/resolve.rs".to_string(), 10)].into();
+        assert_eq!(
+            hits, expected,
+            "the realisation-INSERT census moved — identity rows are \
+             written by the ca/resolve.rs authority only; census new \
+             writers here with their witness rationale"
         );
     }
 }

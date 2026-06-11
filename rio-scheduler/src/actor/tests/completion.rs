@@ -5248,3 +5248,141 @@ async fn evicted_shim_report_registers_path_tenants() -> TestResult {
     );
     Ok(())
 }
+
+// =======================================================================
+// Round-9 WO-S1-3 — the IDENTITY half of the signed Q1 invariant:
+// registered evidence carries identity (deriver linkage / CA
+// realisations) so resubmission re-associates. Forensics: realisations
+// 0-written for the IA incident population; the control finding
+// (consecutive resubmits shared 956/~2000 drvs with visibility intact,
+// reuse capped at 0.62% structurally) proves visibility alone does not
+// re-associate.
+// =======================================================================
+
+/// W9-F′ — the composed chain the full signed invariant quantifies
+/// over, driven end-to-end by ONE witness: cancel → late Built report
+/// → Register letter (stamps + identity) → resubmit the identical
+/// un-salted drv → WARM solve (the merge's cache-hit lane completes
+/// the node with zero dispatched attempts). Production constructors
+/// throughout (real merge, real pull mint, real CancelBuild, the
+/// production report intake, real re-merge).
+///
+/// The cross-crate seam, disclosed: the node's outputs are made
+/// byte-complete by seeding the store tables the upload would have
+/// written (narinfo + complete manifest — the scheduler test cannot
+/// run the store's gRPC ingest, PD-13), and the mock store's FMP
+/// answers "present" for them — exactly the verdict the REAL store's
+/// pinned visibility law gives a stamped path (W9-D(b), commit 2).
+///
+/// The identity asserts (the commit-3 red): post-Register the
+/// (path ↔ deriver) linkage EXISTS — narinfo.deriver carries the
+/// drv_path for an upload whose uploader did NOT declare it (the
+/// dev-mode/legacy-builder face; wire-declared deriver is never
+/// overwritten by the monotone fill).
+#[tokio::test]
+async fn cancel_late_report_resubmit_solves_warm_with_identity() -> TestResult {
+    use sha2::Digest;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let drv = "ident-resub";
+    let out_path = test_store_path("ident-resub-out");
+
+    // The un-salted node: stable drv hash, declared output, KNOWN
+    // expected output path (the IA cache-hit lane probes these).
+    let mut node = make_node(drv);
+    node.expected_output_paths = vec![out_path.clone()];
+
+    let b1 = Uuid::new_v4();
+    let _ev = merge_dag(&handle, b1, vec![node.clone()], vec![], false).await?;
+    let exec_id = open_pull_exec(&handle, drv).await;
+    cancel_build(&handle, b1).await?;
+
+    // The upload happened before the report (builder uploads, then
+    // reports): seed the store rows the ingest would have written —
+    // WITHOUT a declared deriver (the identity-gap face).
+    let out_hash = sha2::Sha256::digest(out_path.as_bytes()).to_vec();
+    sqlx::query(
+        "INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size) \
+         VALUES ($1, $2, $3, 0)",
+    )
+    .bind(&out_hash)
+    .bind(&out_path)
+    .bind(vec![0u8; 32])
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO manifests (store_path_hash, status, inline_blob) VALUES ($1, 'complete', '')",
+    )
+    .bind(&out_hash)
+    .execute(&db.pool)
+    .await?;
+
+    // The late BUILT report → the Register letter.
+    let mut payload = pull_payload(rio_proto::types::BuildResult {
+        status: rio_proto::types::BuildResultStatus::Built.into(),
+        built_outputs: vec![rio_proto::types::BuiltOutput {
+            output_name: "out".into(),
+            output_path: out_path.clone(),
+            output_hash: vec![0u8; 32],
+        }],
+        ..Default::default()
+    });
+    payload.final_line_count = 2;
+    pull_report_exec(&handle, exec_id, drv, payload).await?;
+    barrier(&handle).await;
+
+    // Identity assert 1 (the red): the deriver linkage EXISTS.
+    let deriver: Option<String> =
+        sqlx::query_scalar("SELECT deriver FROM narinfo WHERE store_path_hash = $1")
+            .bind(&out_hash)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        deriver,
+        Some(test_drv_path(drv)),
+        "left: the registration carried no identity (narinfo.deriver \
+         absent — re-association has no (path ↔ deriver) record) / \
+         right: the registration writer fills the deriver linkage"
+    );
+
+    // Registration assert (carried from W9-A): the stamp exists.
+    let tenants: Vec<Uuid> =
+        sqlx::query_scalar("SELECT tenant_id FROM path_tenants WHERE store_path_hash = $1")
+            .bind(&out_hash)
+            .fetch_all(&db.pool)
+            .await?;
+    assert_eq!(tenants, vec![DEFAULT_TEST_TENANT]);
+
+    // The store now answers "present" for the registered path — the
+    // real store's pinned verdict for a stamped path (W9-D(b)).
+    store.seed_with_content(&out_path, b"registered bytes");
+
+    // The RESUBMIT: identical un-salted drv, fresh build. The merge's
+    // cache-hit lane must complete it WARM — no dispatch.
+    let b2 = Uuid::new_v4();
+    let _ev = merge_dag(&handle, b2, vec![node], vec![], false).await?;
+
+    // Warm solve: the build reaches Succeeded with ZERO dispatched
+    // attempts (structural: a pull finds nothing deliverable).
+    let mut status = query_status(&handle, b2).await?;
+    for _ in 0..100 {
+        if status.state == rio_proto::types::BuildState::Succeeded as i32 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        status = query_status(&handle, b2).await?;
+    }
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "left: the resubmit re-built from scratch (no re-association; \
+         the merge saw nothing reusable) / right: the registered + \
+         identified outputs solve the resubmit WARM at merge"
+    );
+    let pull = try_pull_attempt(&handle, drv).await;
+    assert!(
+        !matches!(pull, Ok(PullOutcome::Deliver(_))),
+        "warm solve must leave nothing dispatchable; got {pull:?}"
+    );
+    Ok(())
+}

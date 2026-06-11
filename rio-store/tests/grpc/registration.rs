@@ -184,3 +184,34 @@ async fn anonymous_putpath_writes_no_stamp() -> TestResult {
     assert_eq!(n, 0, "anonymous uploads register no tenant ownership");
     Ok(())
 }
+
+/// W9-F's ingest-lane identity member (round-9 WO-S1-3): a declared
+/// deriver persists at the ingest commit — the (path ↔ deriver)
+/// linkage exists for client-declared uploads without any scheduler
+/// involvement; an undeclared deriver stays typed-absent (NULL/empty,
+/// the scheduler's registration fill backstops it at build
+/// registration).
+#[tokio::test]
+async fn ingest_persists_declared_deriver() -> TestResult {
+    use sha2::Digest;
+    let mut s = StoreSession::new().await?;
+    let path = test_store_path("ingest-deriver");
+    let drv_path = test_store_path("ingest-deriver.drv");
+    let nar = make_nar(b"deriver content").0;
+    let mut info: PathInfo = make_path_info_for_nar(&path, &nar).into();
+    info.deriver = drv_path.clone();
+    put_path_raw(&mut s.client, info, nar).await?;
+
+    let hash = sha2::Sha256::digest(path.as_bytes()).to_vec();
+    let deriver: Option<String> =
+        sqlx::query_scalar("SELECT deriver FROM narinfo WHERE store_path_hash = $1")
+            .bind(&hash)
+            .fetch_one(&s.db.pool)
+            .await?;
+    assert_eq!(
+        deriver,
+        Some(drv_path),
+        "the ingest lane persists the declared deriver (identity at upload)"
+    );
+    Ok(())
+}

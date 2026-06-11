@@ -846,6 +846,52 @@ impl DagActor {
                 "path_tenants upsert failed; GC retention may under-retain"
             );
         }
+        // Round-9 WO-S1-3 (the identity half): the registration writer
+        // owns the (path ↔ deriver) linkage — fill it where the
+        // uploader did not declare it (monotone; wire-declared deriver
+        // wins). The deriver is the drv_path: resident nodes carry it;
+        // the late Register arm cold-resolves it with the tenants.
+        let drv_path = self.dag.node(drv_hash).map(|s| s.drv_path().to_string());
+        if let Some(drv_path) = drv_path {
+            self.fill_deriver_for(drv_hash, output_paths, &drv_path)
+                .await;
+        }
+    }
+
+    /// The deriver-linkage fill half of the registration funnel
+    /// (round-9 WO-S1-3): pairs every output path with `drv_path` and
+    /// fills absent narinfo deriver cells. Split out so the late
+    /// Register arm (whose node may be evicted) can call it with the
+    /// COLD-resolved drv_path.
+    pub(super) async fn fill_deriver_for(
+        &self,
+        drv_hash: &DrvHash,
+        output_paths: &[String],
+        drv_path: &str,
+    ) {
+        use sha2::Digest;
+        let hashes: Vec<Vec<u8>> = output_paths
+            .iter()
+            .map(|p| sha2::Sha256::digest(p.as_bytes()).to_vec())
+            .collect();
+        let drv_paths: Vec<String> = vec![drv_path.to_string(); hashes.len()];
+        match self.db.fill_deriver_linkage(&hashes, &drv_paths).await {
+            Ok(filled) if filled > 0 => {
+                debug!(
+                    drv_hash = %drv_hash,
+                    filled,
+                    "deriver linkage filled at registration (identity half)"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    drv_hash = %drv_hash, error = %e,
+                    "deriver-linkage fill failed (best-effort; identity \
+                     re-association degrades until a re-stamp)"
+                );
+            }
+        }
     }
 
     /// Batched [`upsert_path_tenants_for`]: collect `(path_hash,
@@ -862,8 +908,13 @@ impl DagActor {
         drv_hashes: &[DrvHash],
         provenance: &crate::db::live_pins::StampProvenance,
     ) {
+        use sha2::Digest;
         let mut hashes: Vec<Vec<u8>> = Vec::new();
         let mut tids: Vec<Uuid> = Vec::new();
+        // Round-9 WO-S1-3: the identity half rides the same batch —
+        // (output path hash, drv_path) pairs, one fill round-trip.
+        let mut deriver_hashes: Vec<Vec<u8>> = Vec::new();
+        let mut deriver_paths: Vec<String> = Vec::new();
         for drv_hash in drv_hashes {
             let Some(state) = self.dag.node(drv_hash) else {
                 continue;
@@ -882,6 +933,10 @@ impl DagActor {
             // Signed Q2: the lawful pairs derive from the witness —
             // THE one body shared with the single-drv wrapper.
             provenance.lawful_pairs(&state.output_paths, &tenant_ids, &mut hashes, &mut tids);
+            for p in &state.output_paths {
+                deriver_hashes.push(sha2::Sha256::digest(p.as_bytes()).to_vec());
+                deriver_paths.push(state.drv_path().to_string());
+            }
         }
         if hashes.is_empty() {
             return;
@@ -896,6 +951,18 @@ impl DagActor {
                 drvs = drv_hashes.len(),
                 pairs = hashes.len(),
                 "batched path_tenants upsert failed; GC retention may under-retain"
+            );
+        }
+        if let Err(e) = self
+            .db
+            .fill_deriver_linkage(&deriver_hashes, &deriver_paths)
+            .await
+        {
+            warn!(
+                ?e,
+                drvs = drv_hashes.len(),
+                "batched deriver-linkage fill failed (best-effort; identity \
+                 re-association degrades until a re-stamp)"
             );
         }
     }
@@ -1250,9 +1317,9 @@ impl DagActor {
                 // tenants whose builds were interested (LEFT JOIN so a
                 // known drv with zero tenanted builds still resolves
                 // its hash — the stamp is then vacuous, logged).
-                let rows: Vec<(String, Option<Uuid>)> = match sqlx::query_as(
+                let rows: Vec<(String, String, Option<Uuid>)> = match sqlx::query_as(
                     r#"
-                    SELECT d.drv_hash, b.tenant_id
+                    SELECT d.drv_hash, d.drv_path, b.tenant_id
                       FROM derivations d
                       LEFT JOIN build_derivations bd USING (derivation_id)
                       LEFT JOIN builds b
@@ -1276,7 +1343,7 @@ impl DagActor {
                         return;
                     }
                 };
-                let Some((canonical_hash, _)) = rows.first() else {
+                let Some((canonical_hash, canonical_drv_path, _)) = rows.first() else {
                     // The censused no-evidence sibling: no durable drv
                     // row — nothing to address registration to. Loud:
                     // this is the only arm that still drops a
@@ -1291,8 +1358,9 @@ impl DagActor {
                     return;
                 };
                 let canonical = DrvHash::from(canonical_hash.as_str());
+                let canonical_drv_path = canonical_drv_path.clone();
                 let tenants: Vec<Uuid> = {
-                    let mut t: Vec<Uuid> = rows.iter().filter_map(|(_, t)| *t).collect();
+                    let mut t: Vec<Uuid> = rows.iter().filter_map(|(_, _, t)| *t).collect();
                     t.sort();
                     t.dedup();
                     t
@@ -1321,11 +1389,19 @@ impl DagActor {
                     )
                     .await;
                 }
+                // The identity half (round-9 WO-S1-3): the deriver
+                // linkage rides the COLD-resolved drv_path — the
+                // evicted face has no resident node, so the funnel's
+                // warm fill cannot fire; this is the lane that makes
+                // the linkage exist for the full late population.
+                self.fill_deriver_for(&canonical, &paths, &canonical_drv_path)
+                    .await;
                 // CA-shaped late reports reach the SAME gated
                 // realisation insert the success epilogue uses (the
                 // is_ca/needs_resolve gate reads the resident node;
-                // the evicted face is a no-op here until WO-S1-3's
-                // general identity writes).
+                // an EVICTED CA node's modular hash is not durably
+                // resolvable — the priced residual recorded in the
+                // owning commit).
                 self.ca_insert_realisations(&canonical, &outputs).await;
             }
             LateReportEffect::Nothing => {}
