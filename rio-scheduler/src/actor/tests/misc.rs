@@ -533,7 +533,7 @@ async fn test_hmac_assignment_carries_tenant() -> TestResult {
     Ok(())
 }
 
-// r[verify common.hmac.claims+2]
+// r[verify common.hmac.claims+3]
 /// E3, the token-LIFETIME law: the 7-day bound is on the EXPIRY (the
 /// security-relevant quantity — a leaked token's replay window), not
 /// on the timeout input. Pre-fix the clamp bounded the timeout and

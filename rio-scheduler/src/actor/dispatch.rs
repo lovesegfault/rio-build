@@ -969,7 +969,7 @@ impl DagActor {
                 .map_or(rio_common::clamped::DAEMON_DEFAULT_TIMEOUT_SECS, |d| {
                     d.as_secs()
                 });
-            // r[impl common.hmac.claims+2]
+            // r[impl common.hmac.claims+3]
             // E3, the token-LIFETIME law, INDEPENDENT of the wire
             // ceiling (1 yr): the 7-day bound is on the EXPIRY —
             // the security-relevant quantity is a leaked token's
@@ -980,8 +980,14 @@ impl DagActor {
             // expiry − now ≤ MAX_HMAC_LIFETIME_SECS by
             // construction. Pre-fix the clamp bounded the timeout
             // and then doubled it — a 14-day effective window
-            // under a "7 days max" comment.
-            const MAX_HMAC_LIFETIME_SECS: u64 = 7 * 86400;
+            // under a "7 days max" comment. merged_bug_045: the
+            // const MOVED into the signer (`rio_auth::hmac`) — the
+            // LAW is `HmacKey::sign`'s family clamp now; this
+            // derivation keeps the ×2 grace inside the bound so the
+            // signed expiry equals the requested one (a mint the
+            // family clamp would cut is a derivation bug, not a
+            // security event).
+            use rio_auth::hmac::MAX_HMAC_LIFETIME_SECS;
             const HMAC_LIFETIME_GRACE_FACTOR: u64 = 2;
             let timeout_secs =
                 timeout_secs.min(MAX_HMAC_LIFETIME_SECS / HMAC_LIFETIME_GRACE_FACTOR);

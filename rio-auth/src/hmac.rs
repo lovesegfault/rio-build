@@ -41,7 +41,23 @@ type HmacSha256 = Hmac<Sha256>;
 // r[impl sec.authz.service-token]
 pub trait HmacClaims: Serialize + serde::de::DeserializeOwned {
     fn expiry_unix(&self) -> u64;
+    /// The family clamp's write face (merged_bug_045):
+    /// [`HmacKey::sign`] uses it to bound `expiry_unix − now ≤`
+    /// [`MAX_HMAC_LIFETIME_SECS`] for EVERY claims type a family key
+    /// signs — implementing this trait is what makes a type signable,
+    /// so an unclamped family member is unrepresentable.
+    fn set_expiry_unix(&mut self, expiry_unix: u64);
 }
+
+/// The FAMILY lifetime law (merged_bug_045, E3 widened): no token
+/// signed by a family key may carry `expiry_unix − now` greater than
+/// this. Seven days bounds a leaked token's replay window; the value
+/// moved here from the scheduler's dispatch-local clamp so the law
+/// has exactly one home — the signer — and every present and future
+/// claims type sharing a key inherits it (the dispatch's ×2 grace
+/// derivation stays a consumer of this constant: timeout ≤ lifetime ÷
+/// grace keeps the doubled window inside the bound).
+pub const MAX_HMAC_LIFETIME_SECS: u64 = 7 * 86400;
 
 /// Claims embedded in an assignment token. The scheduler builds these
 /// at dispatch time; the store verifies them on PutPath.
@@ -50,7 +66,7 @@ pub trait HmacClaims: Serialize + serde::de::DeserializeOwned {
 /// [`crate::jwt::TenantClaims`] — both appear together in PutPath
 /// handlers, and `hmac::Claims` vs `jwt::Claims` was a recurring
 /// source of confusion.
-// r[impl common.hmac.claims+2]
+// r[impl common.hmac.claims+3]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AssignmentClaims {
@@ -131,6 +147,9 @@ impl HmacClaims for AssignmentClaims {
     fn expiry_unix(&self) -> u64 {
         self.expiry_unix
     }
+    fn set_expiry_unix(&mut self, expiry_unix: u64) {
+        self.expiry_unix = expiry_unix;
+    }
 }
 
 /// Claims for a service-identity token. Minted by trusted control-plane
@@ -206,6 +225,9 @@ pub struct ServiceClaims {
 impl HmacClaims for ServiceClaims {
     fn expiry_unix(&self) -> u64 {
         self.expiry_unix
+    }
+    fn set_expiry_unix(&mut self, expiry_unix: u64) {
+        self.expiry_unix = expiry_unix;
     }
 }
 
@@ -317,6 +339,9 @@ impl<'de> Deserialize<'de> for ExecutorClaims {
 impl HmacClaims for ExecutorClaims {
     fn expiry_unix(&self) -> u64 {
         self.expiry_unix
+    }
+    fn set_expiry_unix(&mut self, expiry_unix: u64) {
+        self.expiry_unix = expiry_unix;
     }
 }
 
@@ -531,7 +556,30 @@ impl HmacKey {
     /// Format: `base64url(json(claims)).base64url(hmac(key, json(claims)))`.
     /// The claims JSON is what's signed — the base64 is just transport
     /// encoding.
-    pub fn sign<C: HmacClaims>(&self, claims: &C) -> String {
+    ///
+    /// THE FAMILY LIFETIME LAW lives here (merged_bug_045, R24): the
+    /// expiry is clamped to `now + `[`MAX_HMAC_LIFETIME_SECS`] before
+    /// signing, for EVERY claims type — this is the only signing body,
+    /// so an over-long mint is unrepresentable for every present and
+    /// future family member; per-mint clamps (the dispatch-local form
+    /// this replaced) are derivation conveniences, never the law. A
+    /// pre-epoch clock degrades fail-closed: `now_unix()` errors fold
+    /// to `now = 0`, the cap lands in 1970, and the clamped token is
+    /// already expired at verify (the same degradation the dispatch
+    /// mint's `unwrap_or(0)` has always had).
+    // r[impl common.hmac.claims+3]
+    pub fn sign<C: HmacClaims + Clone>(&self, claims: &C) -> String {
+        let now = crate::now_unix().unwrap_or(0);
+        let cap = now.saturating_add(MAX_HMAC_LIFETIME_SECS);
+        let clamped_holder;
+        let claims = if claims.expiry_unix() > cap {
+            let mut c = claims.clone();
+            c.set_expiry_unix(cap);
+            clamped_holder = c;
+            &clamped_holder
+        } else {
+            claims
+        };
         let claims_json = serde_json::to_vec(claims)
             .expect("HmacClaims serialization can't fail (no maps with non-string keys)");
         let mut mac = HmacSha256::new_from_slice(&self.key)
@@ -1352,5 +1400,190 @@ mod tests {
             "a nonce-free executor token must be rejected at decode (Q6: no \
              pre-fix token survives a --wipe rollout), got {result:?}"
         );
+    }
+
+    /// W10-P (merged_bug_045) — the FAMILY lifetime law at its own
+    /// quantifier: NO token signed by a family key carries
+    /// `expiry_unix − now > MAX_HMAC_LIFETIME_SECS`, for EVERY claims
+    /// type sharing the key — not just the assignment mint the
+    /// dispatch-local clamp covered. The matrix drives both family
+    /// claims types × {at-cap, over-cap}: at-cap mints sign verbatim
+    /// (the clamp is a bound, not a haircut); over-cap mints come out
+    /// clamped to the cap. The red this test was born failing on
+    /// (pre-fix): a synthetic over-cap mint signs successfully and
+    /// verifies with the full over-long replay window — the law's
+    /// negation at the family quantifier (under production defaults
+    /// the executor mint is bounded ≈24.25h by DEADLINE_CAP_SECS +
+    /// eta + 300, so the red drives the LAW with a synthetic mint,
+    /// not a live overflow).
+    #[test]
+    fn family_lifetime_clamp_bounds_every_claims_type() {
+        let signer = HmacSigner::from_key(TEST_KEY.to_vec());
+        let verifier = HmacVerifier::from_key(TEST_KEY.to_vec());
+        let now = crate::now_unix().expect("test clock after epoch");
+        let cap = now + MAX_HMAC_LIFETIME_SECS;
+
+        // {AssignmentClaims, ExecutorClaims} × {at-cap, over-cap}
+        for (label, requested) in [("at-cap", cap), ("over-cap", cap + 3600)] {
+            let mut ac = test_claims(0);
+            ac.expiry_unix = requested;
+            let verified: AssignmentClaims = verifier
+                .verify(&signer.sign(&ac))
+                .expect("family token verifies");
+            assert!(
+                verified.expiry_unix <= cap,
+                "left (pre-fix): an AssignmentClaims {label} mint signed with \
+                 expiry−now = {}s (> {MAX_HMAC_LIFETIME_SECS}s — the leaked-token \
+                 replay window the seven-day law bounds) / right: the signer \
+                 clamps the family expiry to the cap",
+                verified.expiry_unix - now
+            );
+            if requested <= cap {
+                assert_eq!(
+                    verified.expiry_unix, requested,
+                    "an at-cap mint must sign verbatim (the clamp is a bound)"
+                );
+            }
+
+            let ec = ExecutorClaims {
+                intent_id: "drv-w10p".into(),
+                kind: 0,
+                expiry_unix: requested,
+            };
+            let verified: ExecutorClaims = verifier
+                .verify(&signer.sign(&ec))
+                .expect("family token verifies");
+            assert!(
+                verified.expiry_unix <= cap,
+                "left (pre-fix): an ExecutorClaims {label} mint signed with \
+                 expiry−now = {}s (> {MAX_HMAC_LIFETIME_SECS}s) — the SIBLING \
+                 mint the dispatch-local clamp never covered / right: the \
+                 signer clamps the family expiry",
+                verified.expiry_unix - now
+            );
+            if requested <= cap {
+                assert_eq!(
+                    verified.expiry_unix, requested,
+                    "an at-cap executor mint must sign verbatim"
+                );
+            }
+        }
+    }
+
+    /// W10-Q (merged_bug_045, R15/R22′) — the signing-body census:
+    /// the family lifetime law is only as total as the claim that
+    /// [`HmacKey::sign`] is the ONLY mint. Generated member list (the
+    /// raw-MAC instantiation scan over every src file in this crate,
+    /// embedded per (wwwww) with the dev-tree completeness pin
+    /// below): exactly TWO production sites — THE sign body (clamped)
+    /// and THE verify body (mints nothing) — plus three DISCLOSED
+    /// test fixtures that hand-roll tampered/legacy tokens to drive
+    /// verify's rejects. A new raw-MAC site anywhere in the crate
+    /// fails this census until filed. Out-of-crate raw mints are
+    /// outside this census's jurisdiction by construction (the key
+    /// loader and the claims types live here; consumers sign through
+    /// this module) — disclosed, not silently claimed.
+    #[test]
+    fn raw_mac_mint_sites_pinned() {
+        let hits = mac_census_over(&embedded_sources());
+        let expected: std::collections::BTreeMap<String, usize> =
+            [("hmac.rs".to_string(), 5)].into();
+        mac_assert_census(&hits, &expected).unwrap();
+    }
+
+    /// W10-Q's planted red (R22′): a strawman source file carrying a
+    /// raw-MAC mint that computes its own expiry OUTSIDE the clamped
+    /// signer enters at the SCANNER layer (raw source text); the
+    /// census comparison goes red and names the file. Needle and
+    /// strawman are runtime-assembled so this file's static text
+    /// never matches itself.
+    #[test]
+    fn mac_census_plants_red_on_unclamped_mint() {
+        let strawman = format!(
+            "fn rogue_mint(key: &[u8], json: &[u8]) -> Vec<u8> {{\n\
+             let mut mac = HmacSha256{}{}(key).unwrap();\n\
+             mac.update(json); mac.finalize().into_bytes().to_vec() }}\n",
+            "::", "new_from_slice"
+        );
+        let mut universe = embedded_sources();
+        universe.push(("rogue.rs".to_string(), strawman));
+        let hits = mac_census_over(&universe);
+        let expected: std::collections::BTreeMap<String, usize> =
+            [("hmac.rs".to_string(), 5)].into();
+        let err = mac_assert_census(&hits, &expected)
+            .expect_err("an unlisted raw-MAC mint MUST go census-red");
+        assert!(
+            err.contains("rogue.rs"),
+            "the red must NAME the unlisted mint site; got: {err}"
+        );
+    }
+
+    /// The (wwwww) dual obligation: the embedded census universe
+    /// equals the live `src/` tree exactly (both directions); in the
+    /// nix sandbox (no source dir) the embedded scan is the same
+    /// commit's content — skip disclosed, never silent.
+    #[test]
+    fn mac_census_universe_matches_live_tree() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        if !root.exists() {
+            eprintln!("src/ not on disk (nix sandbox): universe pinned by the dev-tree run");
+            return;
+        }
+        let mut live: Vec<String> = std::fs::read_dir(&root)
+            .expect("readable src dir")
+            .map(|e| {
+                e.expect("entry")
+                    .file_name()
+                    .to_str()
+                    .expect("source file names are utf-8")
+                    .to_owned()
+            })
+            .filter(|n| n.ends_with(".rs"))
+            .collect();
+        live.sort();
+        let mut embedded: Vec<String> = embedded_sources().iter().map(|(f, _)| f.clone()).collect();
+        embedded.sort();
+        assert_eq!(embedded, live, "embed every src file in embedded_sources()");
+    }
+
+    fn embedded_sources() -> Vec<(String, String)> {
+        vec![
+            ("hmac.rs".to_string(), include_str!("hmac.rs").to_string()),
+            ("jwt.rs".to_string(), include_str!("jwt.rs").to_string()),
+            (
+                "jwt_interceptor.rs".to_string(),
+                include_str!("jwt_interceptor.rs").to_string(),
+            ),
+            ("lib.rs".to_string(), include_str!("lib.rs").to_string()),
+        ]
+    }
+
+    /// Needle assembled at runtime so the census never matches its
+    /// own source text.
+    fn mac_census_over(universe: &[(String, String)]) -> std::collections::BTreeMap<String, usize> {
+        let needle = format!("HmacSha256{}{}", "::", "new_from_slice");
+        let mut hits = std::collections::BTreeMap::new();
+        for (rel, text) in universe {
+            let n = text.matches(&needle).count();
+            if n > 0 {
+                *hits.entry(rel.clone()).or_insert(0) += n;
+            }
+        }
+        hits
+    }
+
+    fn mac_assert_census(
+        actual: &std::collections::BTreeMap<String, usize>,
+        expected: &std::collections::BTreeMap<String, usize>,
+    ) -> Result<(), String> {
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(format!(
+                "raw-MAC mint census drifted.\n  actual:   {actual:?}\n  expected: {expected:?}\n\
+                 every signing body must be the clamped HmacKey::sign — file a new \
+                 site here only with its lifetime-law rationale"
+            ))
+        }
     }
 }

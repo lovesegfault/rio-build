@@ -731,7 +731,7 @@ After build completes:
 + Chunk and upload to rio-store (@cas). Each `PutPath` request carries the
   scheduler-issued HMAC @assignment-token in the `x-rio-assignment-token` gRPC
   metadata header; the store verifies the token and rejects uploads for paths
-  not in `claims.expected_outputs` (see #rref("common.hmac.claims+2"))
+  not in `claims.expected_outputs` (see #rref("common.hmac.claims+3"))
 + Register path metadata (@narinfo, references)
 + Discard upper layer
 

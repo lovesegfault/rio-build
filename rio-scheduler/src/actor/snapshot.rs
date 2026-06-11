@@ -1105,7 +1105,13 @@ impl DagActor {
                     kind: intent.kind,
                     // `deadline + eta + 5min`: a forecast-spawned pod's
                     // token covers its boot horizon. Preserved verbatim
-                    // from the pre-split `to_proto` mint.
+                    // from the pre-split `to_proto` mint. merged_bug_045:
+                    // this SIBLING mint of the dispatch assignment-token
+                    // mint (same family key) carried no seven-day clamp —
+                    // the family law now lives inside `sign` itself
+                    // (rio_auth::hmac::MAX_HMAC_LIFETIME_SECS), so this
+                    // expression is a REQUEST the signer bounds, and every
+                    // future family mint inherits the law by construction.
                     expiry_unix: now
                         .saturating_add(u64::from(intent.deadline_secs))
                         .saturating_add(intent.eta_seconds as u64)
