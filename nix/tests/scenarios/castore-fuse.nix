@@ -14,6 +14,7 @@
 #   mount             mounts + prefetches + ready file; one root entry per --store-path
 #   uring-active      session log shows ring registration; no entry failures
 #   metadata          readdir/lookup/stat through FUSE match the original store path
+#   ino-32bit         every st_ino under the mount fits a non-LFS 32-bit ino_t
 #   small-read        ≤ threshold miss: whole-file ReadBlob, byte-identical, promoted 0444 root
 #   streaming-read    > threshold miss: StatBlob+GetChunks fill, byte-identical, chunk cache fills
 #   readlink          symlink targets through FUSE == the targets symlinkDrv wrote
@@ -368,6 +369,22 @@ in
             assert orig == fuse, (
                 "castore-FUSE metadata diverges from the original store path\n"
                 f"--- original ---\n{orig}\n--- fuse ---\n{fuse}"
+            )
+
+        with subtest("ino-32bit: every st_ino fits a non-LFS 32-bit ino_t"):
+            # Production pools advertise i686-linux build payloads; a
+            # non-LFS 32-bit glibc binary gets EOVERFLOW from stat()
+            # and a broken readdir() for any st_ino above 2^32. The VM
+            # carries no i686 toolchain, so this is the 64-bit
+            # structural stand-in: enumerate every inode under the
+            # mount and assert the bound the kernel would enforce for
+            # a 32-bit caller. The old digest-derived inos all had bit
+            # 63 forced, so a single entry would have failed here.
+            inos = client.succeed("find /var/rio/castore/b1 -printf '%i\n'").split()
+            assert inos, "find returned no inodes under the mount"
+            bad = [i for i in inos if int(i) >= 2**32]
+            assert not bad, (
+                f"{len(bad)} st_ino values overflow a 32-bit ino_t, e.g. {bad[:5]}"
             )
 
         with subtest("small-read: whole-file ReadBlob path is byte-identical and promoted"):
