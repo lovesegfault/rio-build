@@ -4334,25 +4334,123 @@ async fn mint_resolves_requested_ids_not_a_reemitted_page() {
     }
     let (tokens, keyless) = actor.mint_executor_tokens(&polled);
     assert!(!keyless, "signer configured");
-    assert_eq!(
-        tokens.len(),
-        polled.len(),
-        "left (pre-fix): the mint re-solved a page in which the newly \
-         merged aa* candidates displaced the HELD zz ids from the budget — \
-         0 of 2 lawfully held intents minted (the controller skips the \
-         token-less Job and loops the Omitted skip while its intent stays \
-         valid) / right: the mint resolves the requested ids against their \
-         OWN nodes (still Queued, still mintable) — full coverage"
+    assert!(
+        tokens.is_empty(),
+        "displaced ids must REFUSE at the credential gate — the newly \
+         admitted aa* work owns the cap now; minting the held zz ids \
+         anyway would put the tenant's credentialed forecast set over \
+         the ceiling (the R26 authorization gate, not churn)"
     );
 
     // ── (b) stationary zero-churn, count-based over 3 mint beats ───
+    // The CURRENT admitted set mints at full coverage every beat —
+    // the deterministic-page property W10-S delivered (pre-W10-S
+    // this looped Omitted on the live arms).
+    let admitted: Vec<String> = actor
+        .compute_spawn_intents(&SpawnIntentsRequest::default())
+        .intents
+        .iter()
+        .map(|i| i.intent_id.clone())
+        .collect();
+    assert_eq!(admitted.len(), 2, "the cap admits exactly the aa pair");
     for beat in 0..3 {
-        let (tokens, _) = actor.mint_executor_tokens(&polled);
+        let (tokens, _) = actor.mint_executor_tokens(&admitted);
         assert_eq!(
             tokens.len(),
-            polled.len(),
+            admitted.len(),
             "beat {beat}: a stationary population must produce ZERO \
              per-tick Omitted churn (count-based)"
         );
     }
+}
+
+// r[verify sec.executor.identity-token+3]
+/// The mint AUTHORIZATION gate (security repair of the per-id form;
+/// R26): `compute_spawn_intents` is the SOLE authority on which ids
+/// are mintable — an executor credential exists ONLY for intents the
+/// admission layer (classification, backoff, probe gate, 1-layer
+/// law, tenant budget) actually emitted. The per-id DAG resolve this
+/// repairs tested membership against the RAW DAG (status ∈
+/// {Ready, Queued}) — an incomplete, unauthorized view: it signed
+/// credentials for never-admissible work (a Queued drv behind a
+/// Queued dep, which NO page ever emits) and for budget-DISPLACED
+/// forecast intents (re-opening the tenant-ceiling bypass at the
+/// credential surface — a worse form of the bug_046 divergence).
+///
+/// Pre-repair red (verbatim in the owning commit): both unadmitted
+/// ids MINT. Post-repair: both REFUSE (omitted from the map — the
+/// controller's existing skip-and-re-poll arm consumes the absence).
+#[tokio::test]
+async fn mint_refuses_ids_outside_the_admitted_emission() {
+    use crate::sla::config::CapacityType;
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+
+    let mut sla = test_sla_config();
+    sla.lead_time_seed
+        .insert(("test-hw".into(), CapacityType::Spot), 200.0);
+    sla.max_forecast_cores_per_tenant = 8; // admits 2 × 4-core intents
+    let plumbing = DagActorPlumbing {
+        hmac_signer: Some(std::sync::Arc::new(rio_auth::hmac::HmacSigner::from_key(
+            b"test-key-at-least-32-bytes-long!".to_vec(),
+        ))),
+        ..Default::default()
+    };
+    let mut actor = DagActor::new(
+        SchedulerDb::new(db.pool.clone()),
+        DagActorConfig {
+            sla,
+            ..Default::default()
+        },
+        plumbing,
+    );
+
+    // (1) NEVER-ADMISSIBLE: Queued behind a Queued dep — the 1-layer
+    // law excludes it from every page, forever.
+    actor.test_inject_at("deep-dep", "x86_64-linux", DerivationStatus::Queued);
+    actor.test_inject_at("deep", "x86_64-linux", DerivationStatus::Queued);
+    actor.test_inject_edge("deep", "deep-dep");
+
+    // (2) BUDGET-DISPLACED: zz forecast intents admitted, then aa
+    // newcomers (near-zero eta) displace them from the cap.
+    for q in ["zz0", "zz1"] {
+        let dep = format!("{q}dep");
+        actor.test_inject_at(&dep, "aarch64-linux", DerivationStatus::Running);
+        actor.test_inject_at(q, "aarch64-linux", DerivationStatus::Queued);
+        actor.test_inject_edge(q, &dep);
+        actor.test_set_running_eta(&dep, 50.0, 10, 4);
+    }
+    for q in ["aa0", "aa1"] {
+        let dep = format!("{q}dep");
+        actor.test_inject_at(&dep, "x86_64-linux", DerivationStatus::Running);
+        actor.test_inject_at(q, "x86_64-linux", DerivationStatus::Queued);
+        actor.test_inject_edge(q, &dep);
+        actor.test_set_running_eta(&dep, 50.0, 49, 4);
+    }
+    // Authority check: the admitted page is exactly {aa0, aa1}.
+    let page: Vec<String> = actor
+        .compute_spawn_intents(&SpawnIntentsRequest::default())
+        .intents
+        .iter()
+        .map(|i| i.intent_id.clone())
+        .collect();
+    assert_eq!(page, vec!["aa0", "aa1"], "precondition: aa displaced zz");
+
+    let requested: Vec<String> = vec!["deep".into(), "zz0".into(), "zz1".into()];
+    let (tokens, keyless) = actor.mint_executor_tokens(&requested);
+    assert!(!keyless, "signer configured");
+    assert!(
+        tokens.is_empty(),
+        "left (pre-repair): the per-id mint signed executor credentials for \
+         {} of 3 ids OUTSIDE the admitted emission — a never-admissible \
+         1-layer-violating drv and two budget-displaced forecast drvs (the \
+         tenant ceiling bypassed at the credential surface) / right: \
+         membership in the computed page is REQUIRED to sign (R26: the \
+         authorized view, not the raw DAG); all three refuse",
+        tokens.len()
+    );
+
+    // The admitted ids still mint — the gate refuses, never starves.
+    let (tokens, _) = actor.mint_executor_tokens(&page);
+    assert_eq!(tokens.len(), 2, "admitted ids mint");
 }
