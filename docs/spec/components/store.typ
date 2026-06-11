@@ -1677,14 +1677,46 @@ cycle (every `run_gc` phase 3 plus the daily backstop,
 each cycle and therefore needs no per-row repair path and no separate
 safety-net scan. No full S3 enumeration needed.
 
-#r("store.gc.sweep-path-tenants")[
+#r("store.gc.sweep-path-tenants+1")[
   Sweep MUST delete `path_tenants` rows for each swept `store_path_hash` in the
-  same transaction as the `narinfo` DELETE. `path_tenants` has no FK CASCADE to
-  `narinfo` (migration 012); without explicit cleanup, orphaned rows survive
-  the sweep and grant wrong-tenant visibility when a different tenant later
-  re-uploads the same store path (the stale row still JOINs in the
-  #rref("store.gc.tenant-retention") CTE arm).
+  same transaction as the `narinfo` DELETE, after copying them into the
+  registration tombstones per #rref("store.gc.evidence-outlives-bytes").
+  `path_tenants` has no FK CASCADE to `narinfo` (migration 012); without
+  explicit cleanup, orphaned rows survive the sweep and grant wrong-tenant
+  visibility when a different tenant later re-uploads the same store path (the
+  stale row still JOINs in the #rref("store.gc.tenant-retention") CTE arm).
 ]
+
+#r("store.gc.evidence-outlives-bytes")[
+  Sweep MUST copy each swept path's registration records (its `path_tenants`
+  rows, with `store_path` and `deriver`) and identity records (its
+  `realisations` rows) into the append-only tombstone tables
+  (`path_tenant_tombstones`, `realisation_tombstones`, migration 103) inside
+  the same transaction that deletes them --- registration and audit evidence
+  outlives the bytes; a swept path's records are atomically either live or
+  tombstoned, never lost.
+]
+The live rows still die with the path: their deletion is what defends the
+wrong-tenant-revival leak (#rref("store.gc.sweep-path-tenants+1")) and keeps
+every live reader's semantics untouched. The tombstones are history, consulted
+by operators and backfills, never by visibility or retention.
+
+#r("store.gc.hold")[
+  The store MUST honor a typed, persisted GC hold (the `gc_holds` table,
+  migration 103): an active global-scope hold makes the whole collection pass
+  (mark, sweep, chunk-collect) a no-op before mark runs, and an active
+  tenant-scope hold makes the held tenant's registered paths reachable in the
+  mark seed and the sweep re-check regardless of their retention window. A
+  hold is active while it is unreleased and unexpired; `expires_at` NULL is an
+  unbounded hold --- an explicit operator decision recorded in the row. An
+  unreadable hold table MUST fail the collection pass closed.
+]
+The hold replaces the freeze-by-scale-to-0 workaround (the signed Q3 record).
+Interim operator surface: the typed in-crate API (`gc::hold`) plus any PG
+session (`INSERT INTO gc_holds (scope, reason, created_by) VALUES ('global',
+..., ...)`; release via `UPDATE gc_holds SET released_at = now() WHERE hold_id
+= ...`); a wire admin verb rides the next proto-granted slot --- this wave's
+proto partition grants the store none (recorded divergence, never silent).
 
 #r("store.gc.sweep-cycle-reclaim")[
   The sweep-phase reference re-check MUST exclude referrers that are themselves
@@ -1707,6 +1739,43 @@ safety-net scan. No full S3 enumeration needed.
   window) is a floor; tenant retention extends it but never shortens it. An
   empty `path_tenants` table makes this arm a no-op (0 rows contributed).
 ]
+
+An active tenant-scope GC hold (#rref("store.gc.hold")) widens the same arm:
+a held tenant's referenced paths stay reachable past the window until the hold
+is released or expires. Reachability only ever widens; the window law above is
+unchanged.
+
+#r("store.registration.ingest-stamps")[
+  The PutPath ingest lanes MUST stamp the authenticated uploading tenant's
+  `path_tenants` registration row at the ingest commit point: PutPathBatch
+  inside the same transaction that completes the manifests; single-path
+  PutPath immediately after the persist commit, before the response.
+  Anonymous uploads (no tenant claims) register no per-tenant ownership. The
+  stamp is the registration record the visibility projection and the
+  tenant-retention mark arm consume --- the signature fallback is
+  defense-in-depth for it, never the only line.
+]
+Every byte-complete upload the store accepted is registered evidence (the
+signed round-9 Q1 invariant). Before this rule, 93.4% of the store sat
+unstamped: visibility for fresh uploads rode entirely on the 2h grace plus
+signatures, and an uploaded-then-never-built-against path had no registration
+record at all.
+
+#r("store.registration.cancel-survives")[
+  Cancellation MAY stop future work; it MUST NOT discard registered or
+  registrable completed work. A late success-class completion report
+  (Built/Substituted/AlreadyValid) for a cancelled or evicted derivation MUST
+  classify to a registration effect at the scheduler's late-report chokepoint
+  --- stamping `path_tenants` for the historically-interested tenants
+  (cold-resolved from the durable build-interest rows), filling the
+  (path-to-deriver) identity linkage, and inserting CA realisations where the
+  modular hash is resolvable --- never to an acknowledged drop.
+]
+The measured pre-rule loss: 1,735/4,529 (38.3%) of one run's completed uploads
+lost their registration to the cancel-intake no-op arm while their bytes
+stayed durable --- tenant-invisible and GC-exposed. The boundary, signed: a
+SIGTERM mid-build before upload is genuinely lost work, a different class out
+of this rule's scope.
 
 #r("store.gc.tenant-quota")[
   Per-tenant store accounting sums `narinfo.nar_size` over all paths the tenant

@@ -208,11 +208,49 @@ async fn select_sweep_order(conn: &mut sqlx::PgConnection) -> Result<Vec<Vec<u8>
 /// GC is the collect cycle's job) — this only touches the path-keyed
 /// tables.
 // r[impl store.realisation.gc-sweep]
-// r[impl store.gc.sweep-path-tenants]
+// r[impl store.gc.sweep-path-tenants+1]
+// r[impl store.gc.evidence-outlives-bytes]
 async fn delete_swept_path(
     tx: &mut Transaction<'_, Postgres>,
     store_path_hash: &[u8],
 ) -> Result<bool, sqlx::Error> {
+    // Round-9 WO-S1-4 (evidence-outlives-bytes, signed Q3): copy the
+    // dying registration/identity records into the append-only
+    // tombstone tables INSIDE this batch tx, BEFORE the deletes — a
+    // swept path's records are atomically either live or tombstoned,
+    // never lost. The LIVE rows still die below (their deletion is
+    // what defends the wrong-tenant-revival leak and keeps every live
+    // reader's semantics intact); what survives is the AUDIT record:
+    // who registered what, when, derived from which drv.
+    sqlx::query(
+        r#"
+        INSERT INTO path_tenant_tombstones
+            (store_path_hash, store_path, tenant_id, first_referenced_at, deriver)
+        SELECT pt.store_path_hash, n.store_path, pt.tenant_id,
+               pt.first_referenced_at, n.deriver
+          FROM path_tenants pt
+          JOIN narinfo n USING (store_path_hash)
+         WHERE pt.store_path_hash = $1
+        "#,
+    )
+    .bind(store_path_hash)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO realisation_tombstones
+            (drv_hash, output_name, output_path, output_hash)
+        SELECT r.drv_hash, r.output_name, r.output_path, r.output_hash
+          FROM realisations r
+         WHERE r.output_path = (
+           SELECT store_path FROM narinfo WHERE store_path_hash = $1
+         )
+        "#,
+    )
+    .bind(store_path_hash)
+    .execute(&mut **tx)
+    .await?;
+
     // Step 2a: DELETE realisations. NOT via CASCADE — realisations has
     // NO FK to narinfo (002_store.sql:134). Without this, dangling
     // realisations rows point to swept paths → wopQueryRealisation
@@ -252,13 +290,16 @@ async fn delete_swept_path(
 /// seed: (i) a `narinfo.references` referrer outside the
 /// `sweep_unreachable` temp table, (ii) a direct `scheduler_live_pins`
 /// entry, or (iii) a `path_tenants` row inside any tenant's retention
-/// window. See the call-site comment in [`sweep`] for the
+/// window OR under an active tenant-scoped GC hold (the round-9 hold
+/// conjunct — a hold set between mark and this path's batch still
+/// protects it). See the call-site comment in [`sweep`] for the
 /// GIN/anti-join rationale.
+// r[impl store.gc.hold]
 async fn recheck_has_live_referrer(
     tx: &mut Transaction<'_, Postgres>,
     store_path_hash: &[u8],
 ) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(
+    sqlx::query_scalar(concat!(
         r#"
         SELECT
           EXISTS (
@@ -277,10 +318,17 @@ async fn recheck_has_live_referrer(
             SELECT 1 FROM path_tenants pt
               JOIN tenants t USING (tenant_id)
              WHERE pt.store_path_hash = $1
-               AND pt.first_referenced_at > now() - make_interval(hours => t.gc_retention_hours)
+               AND (pt.first_referenced_at > now() - make_interval(hours => t.gc_retention_hours)
+                    OR EXISTS (
+                      SELECT 1 FROM gc_holds h
+                       WHERE h.scope = 'tenant' AND h.tenant_id = pt.tenant_id
+                         AND h."#,
+        super::hold::active_hold_predicate!(),
+        r#"
+                    ))
           )
-        "#,
-    )
+        "#
+    ))
     .bind(store_path_hash)
     .fetch_one(&mut **tx)
     .await
@@ -1079,7 +1127,7 @@ mod tests {
     /// without the explicit DELETE, orphaned rows survive and grant
     /// wrong-tenant visibility when a different tenant later
     /// re-uploads the same store path.
-    // r[verify store.gc.sweep-path-tenants]
+    // r[verify store.gc.sweep-path-tenants+1]
     #[tokio::test]
     async fn sweep_deletes_path_tenants() {
         let db = TestDb::new(&crate::MIGRATOR).await;

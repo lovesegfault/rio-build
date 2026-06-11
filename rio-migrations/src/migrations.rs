@@ -2350,6 +2350,42 @@ pub const M_101: () = ();
 /// them.
 pub const M_102: () = ();
 
+/// `103_gc_holds_and_tombstones.sql` — round-9 WO-S1-4 (bw9-s1; the
+/// wave's single sanctioned DDL, R11-as-amended, allocation BANKED
+/// with the full ritual).
+///
+/// Two independent consequences of the signed Q1 registration
+/// invariant ("completed uploads survive cancellation as registered
+/// evidence"), both signed under the Q3 record:
+///
+/// **Evidence-outlives-bytes** (`path_tenant_tombstones`,
+/// `realisation_tombstones`): the pre-103 sweep deleted the
+/// registration stamps and identity rows WITH the path
+/// (`delete_swept_path` steps 2a/2a′ — the Q3 record's "sweep.rs:238
+/// deletes stamps with paths"). Tombstone tables, APPEND-ONLY at
+/// sweep, chosen over in-place `deleted_at` columns deliberately:
+/// every live reader of `path_tenants`/`realisations` (the visibility
+/// projection, mark seed (f), tenant quota, gateway readers) keeps
+/// its semantics untouched — an in-place tombstone would have forced
+/// a `deleted_at IS NULL` filter into every consumer across four
+/// crates and re-opened the wrong-tenant-revival leak the sweep
+/// delete defends against. The copy runs INSIDE the sweep batch
+/// transaction, so a swept path's records are atomically either live
+/// or tombstoned, never lost. No FKs: tombstones reference history
+/// (tenants/paths may be gone).
+///
+/// **GC-hold** (`gc_holds`): the first-class operator control the Q3
+/// signature commissioned ("tonight's freeze was scale-to-0").
+/// Typed axes per R17: `scope` global|tenant (CHECK-paired with
+/// `tenant_id`), mandatory `reason`/`created_by`, `expires_at` NULL =
+/// UNBOUNDED — an explicit operator decision recorded in the row,
+/// not an accident (the column's nullability IS the recorded form);
+/// `released_at` closes a hold without deleting it (the hold history
+/// is itself audit evidence). Mark/sweep consult active holds: a
+/// global hold short-circuits `run_gc` before mark; a tenant hold
+/// joins seed (f) and the sweep re-check as a reachability conjunct.
+pub const M_103: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

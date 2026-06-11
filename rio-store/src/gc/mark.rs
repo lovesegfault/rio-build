@@ -50,7 +50,14 @@ use sqlx::PgPool;
 // The global grace (seed c) is a floor; (f) only extends reachability,
 // never shortens it — a path inside global grace is already reachable
 // via (c) regardless of tenant state.
-const COMPUTE_UNREACHABLE_SQL: &str = r#"
+// Seed (f) carries the round-9 tenant-HOLD conjunct (WO-S1-4, signed
+// Q3): an active tenant-scoped gc_holds row extends the held tenant's
+// registered paths past their retention window — reachability only
+// ever widens. The activity predicate has ONE author
+// (`hold::active_hold_predicate!`), spliced at compile time.
+// r[impl store.gc.hold]
+const COMPUTE_UNREACHABLE_SQL: &str = concat!(
+    r#"
 WITH RECURSIVE reachable(store_path) AS (
     -- Seed (b): in-flight uploads
     SELECT n.store_path
@@ -74,13 +81,20 @@ WITH RECURSIVE reachable(store_path) AS (
       JOIN narinfo n USING (store_path_hash)
     UNION
     -- Seed (f): tenant retention — path survives if ANY tenant's
-    -- window covers it. Global grace (seed c) is a floor; this
-    -- extends, never shortens.
+    -- window covers it, OR the tenant is under an active GC hold.
+    -- Global grace (seed c) is a floor; this extends, never shortens.
     SELECT n.store_path
       FROM narinfo n
       JOIN path_tenants pt USING (store_path_hash)
       JOIN tenants t ON t.tenant_id = pt.tenant_id
      WHERE pt.first_referenced_at > now() - make_interval(hours => t.gc_retention_hours)
+        OR EXISTS (
+          SELECT 1 FROM gc_holds h
+           WHERE h.scope = 'tenant' AND h.tenant_id = pt.tenant_id
+             AND h."#,
+    super::hold::active_hold_predicate!(),
+    r#"
+        )
     UNION
     -- Recursive: references of reachable paths
     SELECT unnest(n."references")
@@ -98,7 +112,8 @@ SELECT n.store_path_hash
    AND NOT EXISTS (
      SELECT 1 FROM reachable r WHERE r.store_path = n.store_path
    )
-"#;
+"#
+);
 
 pub async fn compute_unreachable(
     pool: &PgPool,

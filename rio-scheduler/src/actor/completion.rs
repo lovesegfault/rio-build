@@ -141,6 +141,7 @@ pub(super) enum LateReportEffect {
 /// Law order: the fill is the Cancelled-status report's lane and the
 /// Register is the success-status report's lane — the two cannot
 /// collide on one report (disjoint on `status`).
+// r[impl store.registration.cancel-survives]
 pub(super) fn late_report_effect(
     reporting: Option<ReportingExec>,
     ctx: LateNodeContext,
@@ -1299,6 +1300,7 @@ impl DagActor {
     /// the general identity writes are WO-S1-3's). Best-effort like
     /// every registration write: a PG blip degrades retention, never
     /// the intake.
+    // r[impl store.registration.cancel-survives]
     pub(super) async fn apply_late_report_effect(
         &mut self,
         drv_key: &str,

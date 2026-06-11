@@ -947,6 +947,7 @@ mod verify_nar_tests {
 /// single-path post-persist stamp and the batch in-tx stamp via the
 /// generic executor bound. `ON CONFLICT DO NOTHING`: a re-upload by
 /// the same tenant is idempotent.
+// r[impl store.registration.ingest-stamps]
 async fn insert_path_tenant_rows<'e, E>(
     exec: E,
     hashes: &[Vec<u8>],
@@ -1071,7 +1072,8 @@ mod registration_writer_census {
             ("grpc/put_path/common.rs".to_string(), 1),
             // test seeds (visibility/gc/executor fixtures)
             ("grpc/sign.rs".to_string(), 4),
-            ("gc/mark.rs".to_string(), 3),
+            ("gc/mark.rs".to_string(), 4),
+            ("gc/mod.rs".to_string(), 2),
             ("gc/sweep.rs".to_string(), 3),
             ("materialize/executor.rs".to_string(), 1),
         ]
@@ -1094,6 +1096,7 @@ mod registration_writer_census {
         let hits = census(&["INSERT INTO ", "realisations"]);
         let expected: BTreeMap<String, usize> = [
             ("realisations.rs".to_string(), 1),
+            ("gc/mod.rs".to_string(), 1),
             ("gc/sweep.rs".to_string(), 1),
         ]
         .into();

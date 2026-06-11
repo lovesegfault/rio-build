@@ -51,6 +51,7 @@ async fn spawn_with_fake_jwt(
 /// Pre-fix red: (a) zero rows; (b) the path is pushed into
 /// `missing_paths` by the visibility gate (present-but-invisible — the
 /// I-217 own-tenant-Hidden channel for fresh uploads).
+// r[verify store.registration.ingest-stamps]
 #[tokio::test]
 async fn putpath_stamps_tenant_and_fmp_sees_it() -> TestResult {
     use sha2::Digest;
@@ -104,6 +105,7 @@ async fn putpath_stamps_tenant_and_fmp_sees_it() -> TestResult {
 /// W9-D batch face: PutPathBatch stamps every CREATED output inside
 /// the SAME atomic transaction that completes the manifests (the
 /// ingest commit point — a torn stamp/commit pair is unrepresentable).
+// r[verify store.registration.ingest-stamps]
 #[tokio::test]
 async fn putpathbatch_stamps_tenant_atomically() -> TestResult {
     use sha2::Digest;
@@ -167,6 +169,7 @@ async fn putpathbatch_stamps_tenant_atomically() -> TestResult {
 /// The anonymous face: no tenant claims attached (dev mode / no JWT) —
 /// no per-tenant ownership exists to stamp; the lane stays
 /// stamp-free (visibility is unfiltered for anonymous callers).
+// r[verify store.registration.ingest-stamps]
 #[tokio::test]
 async fn anonymous_putpath_writes_no_stamp() -> TestResult {
     use sha2::Digest;

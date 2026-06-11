@@ -48,6 +48,123 @@
 //! correct. Better than the reverse (S3 deleted, tx rolled back,
 //! dangling chunk ref → GetPath fails).
 
+/// The GC-hold control (round-9 WO-S1-4, signed Q3: "GC-hold as a
+/// first-class operator control — tonight's freeze was scale-to-0").
+///
+/// A typed, persisted hold that mark/sweep consult: a GLOBAL hold
+/// makes `run_gc` a no-op before mark; a TENANT hold makes the held
+/// tenant's registered paths reachable regardless of their retention
+/// window (seed (f) + the sweep re-check gain the conjunct). Holds are
+/// RELEASED, never deleted — the hold history is audit evidence.
+///
+/// R17 axes, priced: `scope` ∈ {global, tenant} (CHECK-paired with
+/// `tenant_id`); mandatory `reason` + `created_by`; `expires_at`
+/// NULL = UNBOUNDED — an explicit operator decision recorded in the
+/// row, not an accident (a bounded hold self-clears at expiry with no
+/// release action; the heal edge is witnessed either way).
+///
+/// Operator surface (divergence from the "admin verb" prescription,
+/// recorded): the wave's R6 proto partition grants this slot no proto
+/// file, so the verb is this typed in-crate API + the persisted row
+/// (settable from any PG session — `kubectl exec` psql is the
+/// documented interim procedure in `store.typ`); the wire verb rides
+/// the next proto-granted slot. The ENFORCEMENT — the signed
+/// invariant's substance — is total here regardless of which surface
+/// sets the row.
+pub mod hold {
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    /// The typed hold scope (the closed axis; no wildcard consumers).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum GcHoldScope {
+        /// Suspend ALL collection (mark, sweep, chunk-collect).
+        Global,
+        /// Pin one tenant's registered paths as reachable.
+        Tenant(Uuid),
+    }
+
+    /// One active hold, as mark/run_gc consult it.
+    #[derive(Debug, sqlx::FromRow)]
+    pub struct ActiveHold {
+        pub hold_id: Uuid,
+        pub reason: String,
+        pub created_by: String,
+    }
+
+    /// Set a hold. `expires_at_secs` = None is an UNBOUNDED hold — the
+    /// operator's explicit decision, recorded in the row. Returns the
+    /// hold id (the release handle).
+    // r[impl store.gc.hold]
+    pub async fn set_hold(
+        pool: &PgPool,
+        scope: GcHoldScope,
+        reason: &str,
+        created_by: &str,
+        expires_in_secs: Option<i64>,
+    ) -> Result<Uuid, sqlx::Error> {
+        let (scope_str, tenant_id) = match scope {
+            GcHoldScope::Global => ("global", None),
+            GcHoldScope::Tenant(t) => ("tenant", Some(t)),
+        };
+        sqlx::query_scalar(
+            r#"
+        INSERT INTO gc_holds (scope, tenant_id, reason, created_by, expires_at)
+        VALUES ($1, $2, $3, $4,
+                CASE WHEN $5::bigint IS NULL THEN NULL
+                     ELSE now() + make_interval(secs => $5::bigint) END)
+        RETURNING hold_id
+        "#,
+        )
+        .bind(scope_str)
+        .bind(tenant_id)
+        .bind(reason)
+        .bind(created_by)
+        .bind(expires_in_secs)
+        .fetch_one(pool)
+        .await
+    }
+
+    /// Release a hold (the heal edge). Idempotent: releasing a released
+    /// or unknown hold affects zero rows and returns false.
+    // r[impl store.gc.hold]
+    pub async fn release_hold(pool: &PgPool, hold_id: Uuid) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE gc_holds SET released_at = now() \
+         WHERE hold_id = $1 AND released_at IS NULL",
+        )
+        .bind(hold_id)
+        .execute(pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// The SQL predicate of an ACTIVE hold row (shared by every consult
+    /// site so the activity law has one author): not released, and not
+    /// past its expiry (NULL expiry = unbounded). A macro (not a const)
+    /// so consult sites can `concat!` it into their `&'static str` SQL
+    /// (sqlx 0.9's `SqlSafeStr` bound).
+    macro_rules! active_hold_predicate {
+        () => {
+            "released_at IS NULL AND (expires_at IS NULL OR expires_at > now())"
+        };
+    }
+    pub(crate) use active_hold_predicate;
+
+    /// The first active GLOBAL hold, if any — `run_gc`'s entry consult.
+    // r[impl store.gc.hold]
+    pub async fn active_global_hold(pool: &PgPool) -> Result<Option<ActiveHold>, sqlx::Error> {
+        sqlx::query_as(concat!(
+            "SELECT hold_id, reason, created_by FROM gc_holds ",
+            "WHERE scope = 'global' AND ",
+            active_hold_predicate!(),
+            " ORDER BY created_at LIMIT 1"
+        ))
+        .fetch_optional(pool)
+        .await
+    }
+}
+
 pub mod collect;
 pub mod drain;
 pub mod lock;
@@ -271,6 +388,48 @@ pub async fn run_gc(
             .await;
         return Ok(None);
     };
+
+    // --- Global-hold consult (round-9 WO-S1-4, signed Q3) ---
+    // r[impl store.gc.hold]
+    // A FIRST-CLASS operator hold replaces the freeze-by-scale-to-0
+    // workaround: an active GLOBAL hold makes the whole collection
+    // pass (mark, sweep, chunk-collect) a no-op — consulted once at
+    // entry, inside the lease so two racing runs serialize their
+    // verdicts. A hold set mid-run binds the NEXT run (the per-run
+    // quantifier W9-J certifies). Tenant-scoped holds bind inside
+    // mark's seed (f) and the sweep re-check instead.
+    match hold::active_global_hold(pool).await {
+        Ok(Some(h)) => {
+            info!(
+                hold_id = %h.hold_id,
+                created_by = %h.created_by,
+                reason = %h.reason,
+                "GC: active global hold; collection suspended"
+            );
+            let _ = progress_tx
+                .send(Ok(GcProgress {
+                    paths_scanned: 0,
+                    paths_collected: 0,
+                    bytes_freed: 0,
+                    is_complete: true,
+                    current_path: format!(
+                        "held: global gc hold active (reason: {}; set by {})",
+                        h.reason, h.created_by
+                    ),
+                }))
+                .await;
+            let _ = lease.release().await;
+            return Ok(None);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            // Fail CLOSED on a destructive subsystem: an unreadable
+            // hold table must not be read as "no hold".
+            warn!(error = %e, "GC: hold consult failed; refusing to collect");
+            let _ = lease.release().await;
+            return Err(Status::internal(format!("gc-hold consult: {e}")));
+        }
+    }
 
     // --- Mark phase ---
     // No mark-vs-PutPath lock (I-192). Mark's CTE takes a point-in-time
@@ -1246,5 +1405,264 @@ mod tests {
             .unwrap();
             assert!(exists, "Q's narinfo must survive sweep");
         }
+    }
+}
+
+// =======================================================================
+// Round-9 WO-S1-4 legs (2)+(3) — evidence-outlives-bytes + the GC-hold
+// control (signed Q3). Witnesses W9-I / W9-J.
+// =======================================================================
+#[cfg(test)]
+mod registration_evidence_tests {
+    use super::*;
+    use crate::test_helpers::{StoreSeed, TenantSeed};
+    use rio_test_support::TestDb;
+    use rio_test_support::fixtures::test_store_path;
+    use tokio::sync::mpsc;
+    use uuid::Uuid;
+
+    async fn run_full_gc(pool: &sqlx::PgPool) -> Option<GcStats> {
+        let (tx, mut rx) = mpsc::channel(64);
+        let stats = run_gc(
+            pool,
+            None,
+            GcParams {
+                dry_run: false,
+                grace_hours: 2,
+                extra_roots: vec![],
+            },
+            tx,
+            &rio_common::signal::Token::new(),
+        )
+        .await
+        .unwrap();
+        while rx.recv().await.is_some() {}
+        stats
+    }
+
+    /// W9-I — sweep deletes BYTES; the registration/audit records
+    /// survive as tombstoned evidence, copied atomically inside the
+    /// sweep batch tx. An expired-window registered path sweeps (the
+    /// retention policy is lawful) but its (tenant, first_referenced,
+    /// deriver) registration record and its realisation identity rows
+    /// persist. The anomaly classes are pinned as non-worsened:
+    /// scheduler_live_pins rows are untouched by the path sweep, and
+    /// no LIVE orphan path_tenants rows are minted (the dying rows
+    /// move to the tombstone table, not to limbo).
+    // r[verify store.gc.evidence-outlives-bytes]
+    // r[verify store.gc.sweep-path-tenants+1]
+    #[tokio::test]
+    async fn sweep_tombstones_registration_evidence() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // A registered path whose tenant window EXPIRED: 100h old,
+        // referenced 72h ago, retention 48h → lawful sweep candidate.
+        let path = test_store_path("evidence-outlives");
+        let drv_path = test_store_path("evidence-outlives.drv");
+        let hash = StoreSeed::raw_path(&path)
+            .created_hours_ago(100)
+            .seed(&db.pool)
+            .await;
+        sqlx::query("UPDATE narinfo SET deriver = $2 WHERE store_path_hash = $1")
+            .bind(&hash)
+            .bind(&drv_path)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let tenant = TenantSeed::new("evidence-tenant")
+            .with_retention_hours(48)
+            .seed(&db.pool)
+            .await;
+        sqlx::query(
+            "INSERT INTO path_tenants (store_path_hash, tenant_id, first_referenced_at) \
+             VALUES ($1, $2, now() - interval '72 hours')",
+        )
+        .bind(&hash)
+        .bind(tenant)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        // An identity row for the same output.
+        sqlx::query(
+            "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash) \
+             VALUES ($1, 'out', $2, $3)",
+        )
+        .bind(vec![7u8; 32])
+        .bind(&path)
+        .bind(vec![9u8; 32])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        // Anomaly-class baseline (672-pin gap / orphan stamps must not
+        // worsen): one unrelated live pin.
+        sqlx::query(
+            "INSERT INTO scheduler_live_pins (store_path_hash, drv_hash) VALUES ($1, 'other-drv')",
+        )
+        .bind(vec![1u8; 32])
+        .bind("x")
+        .execute(&db.pool)
+        .await
+        .ok();
+        let pins_before: i64 = sqlx::query_scalar("SELECT count(*) FROM scheduler_live_pins")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+
+        let stats = run_full_gc(&db.pool).await.expect("gc ran");
+        assert!(stats.paths_deleted >= 1, "the expired path swept");
+
+        // Bytes gone…
+        let narinfo_left: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM narinfo WHERE store_path_hash = $1")
+                .bind(&hash)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(narinfo_left, 0, "the path's bytes/metadata swept");
+
+        // …records survive.
+        let tomb: Option<(Uuid, String, Option<String>)> = sqlx::query_as(
+            "SELECT tenant_id, store_path, deriver FROM path_tenant_tombstones \
+             WHERE store_path_hash = $1",
+        )
+        .bind(&hash)
+        .fetch_optional(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            tomb,
+            Some((tenant, path.clone(), Some(drv_path))),
+            "left: the sweep deleted the registration records WITH the \
+             bytes (no surviving evidence anywhere) / right: the \
+             registration record outlives the bytes as a tombstone"
+        );
+        let real_tomb: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM realisation_tombstones WHERE output_path = $1",
+        )
+        .bind(&path)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(real_tomb, 1, "the identity row outlives the bytes");
+
+        // Non-worsened anomaly classes.
+        let pins_after: i64 = sqlx::query_scalar("SELECT count(*) FROM scheduler_live_pins")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(pins_after, pins_before, "the sweep never touches pins");
+        let live_orphans: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM path_tenants WHERE store_path_hash = $1")
+                .bind(&hash)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(live_orphans, 0, "no LIVE orphan stamps minted by the sweep");
+    }
+
+    /// W9-J global face — hold set ⇒ the whole collection pass is a
+    /// no-op (sweep included); hold released ⇒ the NEXT pass proceeds.
+    /// Both directions through the production control API (the heal
+    /// edge witnessed per T2).
+    // r[verify store.gc.hold]
+    #[tokio::test]
+    async fn global_hold_suspends_and_release_heals() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let path = test_store_path("held-global");
+        let hash = StoreSeed::raw_path(&path)
+            .created_hours_ago(48)
+            .seed(&db.pool)
+            .await;
+
+        let hold_id = hold::set_hold(
+            &db.pool,
+            hold::GcHoldScope::Global,
+            "incident-freeze",
+            "test-operator",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let _ = run_full_gc(&db.pool).await;
+        let still_there: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM narinfo WHERE store_path_hash = $1")
+                .bind(&hash)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            still_there, 1,
+            "left: the sweep ran through an ACTIVE GLOBAL HOLD (the \
+             operator control does not bind) / right: hold set ⇒ \
+             collection is a no-op on the held scope"
+        );
+
+        assert!(hold::release_hold(&db.pool, hold_id).await.unwrap());
+        let stats = run_full_gc(&db.pool).await.expect("gc ran post-release");
+        assert!(
+            stats.paths_deleted >= 1,
+            "hold released ⇒ the next sweep proceeds (the heal edge)"
+        );
+    }
+
+    /// W9-J tenant face — a tenant-scoped hold pins the held tenant's
+    /// registered paths past their retention window; release heals.
+    // r[verify store.gc.hold]
+    #[tokio::test]
+    async fn tenant_hold_pins_registered_paths() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let path = test_store_path("held-tenant");
+        let hash = StoreSeed::raw_path(&path)
+            .created_hours_ago(100)
+            .seed(&db.pool)
+            .await;
+        let tenant = TenantSeed::new("held-tenant")
+            .with_retention_hours(48)
+            .seed(&db.pool)
+            .await;
+        // Window EXPIRED (72h > 48h) — sweepable without the hold.
+        sqlx::query(
+            "INSERT INTO path_tenants (store_path_hash, tenant_id, first_referenced_at) \
+             VALUES ($1, $2, now() - interval '72 hours')",
+        )
+        .bind(&hash)
+        .bind(tenant)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let hold_id = hold::set_hold(
+            &db.pool,
+            hold::GcHoldScope::Tenant(tenant),
+            "tenant-investigation",
+            "test-operator",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let _ = run_full_gc(&db.pool).await;
+        let still_there: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM narinfo WHERE store_path_hash = $1")
+                .bind(&hash)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            still_there, 1,
+            "left: the held tenant's registered path swept anyway / \
+             right: a tenant hold extends reachability past the window"
+        );
+
+        assert!(hold::release_hold(&db.pool, hold_id).await.unwrap());
+        let _ = run_full_gc(&db.pool).await;
+        let gone: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM narinfo WHERE store_path_hash = $1")
+                .bind(&hash)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(gone, 0, "release ⇒ the next sweep proceeds (heal edge)");
     }
 }

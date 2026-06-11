@@ -5076,6 +5076,7 @@ async fn carried_at_cap_deadline_exceeded_is_counted_not_exempt() -> TestResult 
 /// FMP input, so "missing" flips to "present" for this tenant when the
 /// row exists. Composition recorded per W9-A (rows + the cited pinned
 /// laws; no live store RPC in this crate — PD-13).
+// r[verify store.registration.cancel-survives]
 #[tokio::test]
 async fn late_built_report_after_cancel_registers_path_tenants() -> TestResult {
     use sha2::Digest;
@@ -5145,6 +5146,7 @@ async fn late_built_report_after_cancel_registers_path_tenants() -> TestResult {
 /// the attempt row names the drv; the durable interest names the
 /// tenant). Pre-fix this report dies at the unknown-derivation
 /// early-return — zero stamps (the face-(b) shipped truth).
+// r[verify store.registration.cancel-survives]
 #[tokio::test]
 async fn late_built_report_after_eviction_registers_path_tenants() -> TestResult {
     use sha2::Digest;
@@ -5207,6 +5209,7 @@ async fn late_built_report_after_eviction_registers_path_tenants() -> TestResult
 /// unknown-derivation early-return — W9-C folds it into the alphabet's
 /// sight (a Register-or-censused-sibling classification, never a
 /// pre-classifier discard). Same eviction setup, report via the shim.
+// r[verify store.registration.cancel-survives]
 #[tokio::test]
 async fn evicted_shim_report_registers_path_tenants() -> TestResult {
     use sha2::Digest;
@@ -5279,6 +5282,7 @@ async fn evicted_shim_report_registers_path_tenants() -> TestResult {
 /// drv_path for an upload whose uploader did NOT declare it (the
 /// dev-mode/legacy-builder face; wire-declared deriver is never
 /// overwritten by the monotone fill).
+// r[verify store.registration.cancel-survives]
 #[tokio::test]
 async fn cancel_late_report_resubmit_solves_warm_with_identity() -> TestResult {
     use sha2::Digest;

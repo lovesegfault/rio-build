@@ -185,6 +185,14 @@ pub const RETENTION_REGISTRY: &[(&str, RetentionPolicy)] = &[
         ),
     ),
     (
+        "gc_holds",
+        RetentionPolicy::KeepForever(
+            "round-9 WO-S1-4: operator-set GC holds; released_at closes a hold \
+             without deleting it — the hold history is audit evidence by design \
+             (rows are operator-created, bounded by operator action)",
+        ),
+    ),
+    (
         "hw_cost_factors",
         RetentionPolicy::KeepForever(
             "dead on arrival: ADR-023 chose sla_ema_state for the EMA persist; rows are \
@@ -275,6 +283,15 @@ pub const RETENTION_REGISTRY: &[(&str, RetentionPolicy)] = &[
         ),
     ),
     (
+        "path_tenant_tombstones",
+        RetentionPolicy::KeepForever(
+            "round-9 WO-S1-4 (evidence-outlives-bytes, signed Q3): append-only \
+             registration audit records minted at sweep — outliving the bytes \
+             is their purpose; growth is bounded by sweep volume and an \
+             operator truncation is a deliberate audit-disposal act",
+        ),
+    ),
+    (
         "path_tenants",
         RetentionPolicy::SweptBy {
             symbol: "delete_swept_path",
@@ -296,6 +313,14 @@ pub const RETENTION_REGISTRY: &[(&str, RetentionPolicy)] = &[
              Worse than growth: a swept realisation that still has dep rows \
              aborts delete_swept_path's batch — the CA-resolve owner's recorded \
              debt (sweep order or an explicit dep delete is owed)",
+        ),
+    ),
+    (
+        "realisation_tombstones",
+        RetentionPolicy::KeepForever(
+            "round-9 WO-S1-4: append-only identity audit records minted at \
+             sweep (the realisation rows' tombstones) — same disposal posture \
+             as path_tenant_tombstones",
         ),
     ),
     (
