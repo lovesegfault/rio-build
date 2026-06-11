@@ -1194,15 +1194,23 @@ transaction); serves the castore-FUSE builder.
   threshold.
 ]
 
-#r("store.castore.tenant-scope")[
+#r("store.castore.tenant-scope+2")[
   `GetDirectory`/`HasDirectories`/`HasBlobs`/`ReadBlob`/`StatBlob` MUST be
   tenant-scoped: queries resolve a digest to its containing store path(s)
   (`directory_paths` / `file_blobs.store_path_hash`) and join `path_tenants`
   on the caller's `tenant_id` (from JWT `Claims.sub` or HMAC
-  `AssignmentClaims.tenant`, #rref("common.hmac.claims")). `path_tenants` is
-  the single source of tenancy truth at read time. Return NotFound for
-  digests the caller's tenant cannot reach via any owned path. Directory
-  bodies
+  `AssignmentClaims.tenant`, #rref("common.hmac.claims")). When no junction
+  row grants the caller access, a digest MAY still resolve through a
+  substitution-only containing path (zero `path_tenants` rows) whose narinfo
+  signature is visible to the caller
+  (#rref("store.substitute.tenant-sig-visibility")) --- the SAME per-caller
+  predicate the validity surface applies
+  (#rref("store.tenant.valid-paths-filter")), so a path reported valid is
+  always castore-readable. The fallback MUST NOT apply to paths any tenant
+  has built (a `path_tenants` row for another tenant keeps the path hidden
+  regardless of signatures). Return NotFound for digests the caller's tenant
+  cannot reach via any owned path or sig-visible substitution-only path.
+  Directory bodies
   leak child names/digests --- cross-tenant exposure here is a confidentiality
   issue, unlike the chunk-level surface (see "Cross-Tenant Chunk Probing" in
   the security spec). `GetChunks` is *not* tenant-scoped: a 32-byte BLAKE3
@@ -1211,6 +1219,13 @@ transaction); serves the castore-FUSE builder.
   holds --- knowing the digest is the read capability. Adding a `chunk_tenants`
   JOIN would cost dedup-hot-path PG round-trips for no confidentiality gain.
 ]
+
+Without the substitution-only fallback the two surfaces disagreed:
+substituted paths deliberately carry zero `path_tenants` rows, the
+sig-visibility gate reported them VALID to tenants whose trusted keys cover
+them, and the strict junction join then failed every castore read of the same
+path --- valid-but-unreadable, so schedulers never re-registered the path and
+castore mounts of substituted inputs failed forever.
 
 #r("store.castore.gc")[
   `directories` rows are refcounted (one increment per referencing manifest).

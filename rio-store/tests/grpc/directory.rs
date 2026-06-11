@@ -191,6 +191,9 @@ async fn fixture_with_chunk_cache(with_cache: bool) -> Fixture {
         db.pool.clone(),
         Some(Arc::new(HmacVerifier::from_key(KEY.to_vec()))),
         cache,
+        // No signer: the sig-visibility fallback tests derive trust
+        // from `tenant_upstreams.trusted_keys` alone.
+        None,
     );
     let router = Server::builder().add_service(DirectoryServiceServer::new(svc));
     let (addr, server) = rio_test_support::grpc::spawn_grpc_server_layered(router).await;
@@ -213,7 +216,7 @@ async fn fixture_with_chunk_cache(with_cache: bool) -> Fixture {
 /// returns both bodies; non-recursive returns one; cross-tenant calls
 /// see nothing.
 // r[verify store.castore.directory-rpc]
-// r[verify store.castore.tenant-scope]
+// r[verify store.castore.tenant-scope+2]
 #[tokio::test]
 async fn get_directory_recursive_and_tenant_scoped() {
     let mut f = fixture().await;
@@ -311,7 +314,7 @@ async fn get_directory_recursive_and_tenant_scoped() {
 
 /// Bitmap responses: bit i ⇔ digests[i] present and tenant-visible.
 // r[verify store.castore.directory-rpc]
-// r[verify store.castore.tenant-scope]
+// r[verify store.castore.tenant-scope+2]
 #[tokio::test]
 async fn has_directories_and_blobs_bitmaps() {
     let mut f = fixture().await;
@@ -631,7 +634,7 @@ async fn read_blob_single_chunk_skip_and_take() {
 /// Cross-tenant: a digest tenant A produced is NotFound for tenant B,
 /// same status as an unknown digest, so the RPC isn't a presence oracle.
 // r[verify store.castore.blob-read]
-// r[verify store.castore.tenant-scope]
+// r[verify store.castore.tenant-scope+2]
 #[tokio::test]
 async fn read_blob_tenant_scoped() {
     let mut f = fixture().await;
@@ -870,7 +873,7 @@ async fn stat_blob_inline_failed_precondition() {
 /// Cross-tenant: a digest tenant A produced is NotFound for tenant B,
 /// same status as an unknown digest.
 // r[verify store.castore.blob-stat]
-// r[verify store.castore.tenant-scope]
+// r[verify store.castore.tenant-scope+2]
 #[tokio::test]
 async fn stat_blob_tenant_scoped() {
     let mut f = fixture().await;
@@ -962,6 +965,557 @@ async fn stat_blob_window_round_trips_varied_geometry() {
             digest,
             "case {i}: digest mismatch"
         );
+    }
+}
+
+// ──────────────── sig-visibility fallback (substitution-only paths) ────────────────
+//
+// Substituted paths deliberately get ZERO `path_tenants` rows
+// (substitute.rs persists with `tenant: None`); their cross-tenant
+// visibility is signature-gated. The castore read surface must honor
+// the SAME per-caller predicate as the validity surface
+// (`sig_visibility_gate`), or a path is reported valid but every
+// castore read of it fails — the valid-but-unreadable loop
+// `r[store.tenant.valid-paths-filter]` forbids.
+
+/// Trust `key_entry` for `tenant` via a `tenant_upstreams` row — the
+/// trust source `tenant_trusted_set` reads. No substituter is wired;
+/// fixtures are pre-seeded, not miss-then-fetch.
+async fn trust_upstream_key(pool: &sqlx::PgPool, tenant: uuid::Uuid, url: &str, key_entry: &str) {
+    sqlx::query("INSERT INTO tenant_upstreams (tenant_id, url, trusted_keys) VALUES ($1, $2, $3)")
+        .bind(tenant)
+        .bind(url)
+        .bind(vec![key_entry.to_string()])
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// Insert a `narinfo` row for a substitution-only path: ZERO
+/// `path_tenants` rows, optionally signed by `signer` over the exact
+/// stored `(store_path, nar_hash, nar_size, references)` tuple — what
+/// the sig-visibility predicate verifies. `store_path_hash` is sha256
+/// of the FULL store path, matching the gate's hashing convention so
+/// the validity and read surfaces look at the same junction rows.
+async fn seed_subst_only_narinfo(
+    pool: &sqlx::PgPool,
+    store_path: &str,
+    nar_size: i64,
+    signer: Option<&rio_store::signing::Signer>,
+) -> Vec<u8> {
+    let path_hash = sha2::Sha256::digest(store_path.as_bytes()).to_vec();
+    let nar_hash: [u8; 32] = path_hash.as_slice().try_into().unwrap(); // synthetic
+    let sigs: Vec<String> = signer
+        .map(|s| {
+            let fp = rio_nix::narinfo::fingerprint(store_path, &nar_hash, nar_size as u64, &[]);
+            vec![s.sign(&fp)]
+        })
+        .unwrap_or_default();
+    sqlx::query(
+        "INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size, signatures) \
+         VALUES ($1, $2, $1, $3, $4) ON CONFLICT DO NOTHING",
+    )
+    .bind(&path_hash)
+    .bind(store_path)
+    .bind(nar_size)
+    .bind(&sigs)
+    .execute(pool)
+    .await
+    .unwrap();
+    path_hash
+}
+
+/// [`seed_blob`] shape for a SUBSTITUTION-ONLY path: same
+/// narinfo/manifests/file_blobs rows, signed narinfo, no
+/// `path_tenants` row. `store_path` must be a full store path.
+async fn seed_subst_only_blob(
+    f: &Fixture,
+    store_path: &str,
+    b: &BlobNar,
+    chunk_size: Option<usize>,
+    signer: Option<&rio_store::signing::Signer>,
+) -> [u8; 32] {
+    let path_hash =
+        seed_subst_only_narinfo(&f.db.pool, store_path, b.nar.len() as i64, signer).await;
+    if let Some(chunk_size) = chunk_size {
+        sqlx::query("INSERT INTO manifests (store_path_hash, status) VALUES ($1, 'complete')")
+            .bind(&path_hash)
+            .execute(&f.db.pool)
+            .await
+            .unwrap();
+        let mut entries = Vec::new();
+        for piece in b.nar.chunks(chunk_size) {
+            let hash: [u8; 32] = blake3::hash(piece).into();
+            f.chunks
+                .put(&hash, Bytes::copy_from_slice(piece))
+                .await
+                .unwrap();
+            entries.push(ManifestEntry {
+                hash,
+                size: piece.len() as u32,
+            });
+        }
+        let chunk_list = Manifest { entries }.serialize();
+        sqlx::query("INSERT INTO manifest_data (store_path_hash, chunk_list) VALUES ($1, $2)")
+            .bind(&path_hash)
+            .bind(&chunk_list)
+            .execute(&f.db.pool)
+            .await
+            .unwrap();
+    } else {
+        sqlx::query(
+            "INSERT INTO manifests (store_path_hash, status, inline_blob) \
+             VALUES ($1, 'complete', $2)",
+        )
+        .bind(&path_hash)
+        .bind(&b.nar)
+        .execute(&f.db.pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO file_blobs (digest, store_path_hash, nar_offset, size) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(b.file_digest.as_slice())
+    .bind(&path_hash)
+    .bind(BLOB_NAR_OFFSET as i64)
+    .bind(b.file.len() as i64)
+    .execute(&f.db.pool)
+    .await
+    .unwrap();
+    b.file_digest
+}
+
+/// [`put_dir`] shape for a SUBSTITUTION-ONLY backing path.
+async fn seed_subst_only_dir(
+    f: &Fixture,
+    name: &str,
+    children: &[(&str, [u8; 32])],
+    signer: Option<&rio_store::signing::Signer>,
+) -> [u8; 32] {
+    let dir = Directory {
+        directories: children
+            .iter()
+            .map(|(n, d)| DirectoryEntry {
+                name: n.as_bytes().to_vec(),
+                digest: d.to_vec(),
+                size: 0,
+            })
+            .collect(),
+        files: vec![],
+        symlinks: vec![],
+    };
+    let digest: [u8; 32] = blake3::hash(name.as_bytes()).into();
+    let store_path = format!("/nix/store/{name}");
+    let path_hash = seed_subst_only_narinfo(&f.db.pool, &store_path, 0, signer).await;
+    sqlx::query(
+        "INSERT INTO manifests (store_path_hash, status) VALUES ($1, 'complete') \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(&path_hash)
+    .execute(&f.db.pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO directories (digest, body) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+        .bind(digest.as_slice())
+        .bind(dir.encode_to_vec())
+        .execute(&f.db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO directory_paths (digest, store_path_hash) VALUES ($1, $2) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(digest.as_slice())
+    .bind(&path_hash)
+    .execute(&f.db.pool)
+    .await
+    .unwrap();
+    digest
+}
+
+/// THE bug_072 regression: a substitution-only path whose signature
+/// verifies against tenant A's trusted keys is VALID to A
+/// (sig-visibility gate) — so every castore read RPC must serve it to
+/// A too, or the scheduler never re-registers it and castore mounts
+/// of substituted inputs fail forever. Tenant B (no matching trusted
+/// key) must stay denied on every RPC: the fallback is per-caller,
+/// never "substituted ⇒ global".
+// r[verify store.castore.tenant-scope+2]
+// r[verify store.substitute.tenant-sig-visibility+2]
+#[tokio::test]
+async fn sig_visible_substituted_paths_readable() {
+    let mut f = fixture().await;
+    let k = rio_store::signing::Signer::from_seed("key-subst-k", &[0x4Bu8; 32]);
+    trust_upstream_key(
+        &f.db.pool,
+        f.tenant_a,
+        "https://cache-k.example",
+        &k.trusted_key_entry(),
+    )
+    .await;
+    // Tenant B trusts a DIFFERENT key — nonempty trusted set, so the
+    // denial below exercises sig-verify failure, not the empty-set
+    // fast path.
+    trust_upstream_key(
+        &f.db.pool,
+        f.tenant_b,
+        "https://cache-j.example",
+        "key-j:aaaa",
+    )
+    .await;
+
+    let b_inline = make_blob_nar(700, 60);
+    let blob_inline =
+        seed_subst_only_blob(&f, "/nix/store/subst-rb-inline", &b_inline, None, Some(&k)).await;
+    let b_chunked = make_blob_nar(300, 61);
+    let blob_chunked = seed_subst_only_blob(
+        &f,
+        "/nix/store/subst-rb-chunked",
+        &b_chunked,
+        Some(100),
+        Some(&k),
+    )
+    .await;
+    let child = seed_subst_only_dir(&f, "subst-child", &[], Some(&k)).await;
+    let root = seed_subst_only_dir(&f, "subst-root", &[("c", child)], Some(&k)).await;
+
+    let tok_a = token(f.tenant_a);
+    let tok_b = token(f.tenant_b);
+
+    // — Tenant A (sig-visible): every read RPC serves the path —
+    let body = read_blob(&mut f, blob_inline, &tok_a)
+        .await
+        .expect("ReadBlob must honor sig-visibility for substitution-only paths");
+    assert_eq!(body, b_inline.file);
+
+    let resp = stat_blob_with(&mut f, blob_chunked, &tok_a, false)
+        .await
+        .expect("StatBlob probe must honor sig-visibility");
+    assert!(resp.chunks.is_empty());
+    let resp = stat_blob(&mut f, blob_chunked, &tok_a)
+        .await
+        .expect("StatBlob send_chunks must honor sig-visibility");
+    let reassembled = reassemble_stat(&f, &resp).await;
+    assert_eq!(reassembled, b_chunked.file);
+
+    let resp = f
+        .client
+        .get_directory(with_token(
+            GetDirectoryRequest {
+                by_what: Some(get_directory_request::ByWhat::Digest(root.to_vec())),
+                recursive: false,
+                digests: vec![],
+            },
+            &tok_a,
+        ))
+        .await
+        .expect("non-recursive GetDirectory must honor sig-visibility");
+    let bodies: Vec<Directory> = resp.into_inner().filter_map(|r| r.ok()).collect().await;
+    assert_eq!(bodies.len(), 1);
+
+    let resp = f
+        .client
+        .get_directory(with_token(
+            GetDirectoryRequest {
+                by_what: Some(get_directory_request::ByWhat::Digest(root.to_vec())),
+                recursive: true,
+                digests: vec![],
+            },
+            &tok_a,
+        ))
+        .await
+        .unwrap();
+    let bodies: Vec<Directory> = resp.into_inner().filter_map(|r| r.ok()).collect().await;
+    assert_eq!(bodies.len(), 2, "recursive walk reaches sig-visible child");
+
+    let r = f
+        .client
+        .has_blobs(with_token(
+            HasBlobsRequest {
+                digests: vec![blob_inline.to_vec()],
+            },
+            &tok_a,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(r.bitmap, vec![0b1], "HasBlobs must honor sig-visibility");
+    let r = f
+        .client
+        .has_directories(with_token(
+            HasDirectoriesRequest {
+                digests: vec![root.to_vec(), child.to_vec()],
+            },
+            &tok_a,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        r.bitmap,
+        vec![0b11],
+        "HasDirectories must honor sig-visibility"
+    );
+
+    // — Tenant B (key not trusted): everything stays denied —
+    let err = read_blob(&mut f, blob_inline, &tok_b).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::NotFound, "B: ReadBlob denied");
+    let err = stat_blob(&mut f, blob_chunked, &tok_b).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::NotFound, "B: StatBlob denied");
+    let err = stat_blob_with(&mut f, blob_chunked, &tok_b, false)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::NotFound, "B: probe denied");
+    let err = f
+        .client
+        .get_directory(with_token(
+            GetDirectoryRequest {
+                by_what: Some(get_directory_request::ByWhat::Digest(root.to_vec())),
+                recursive: false,
+                digests: vec![],
+            },
+            &tok_b,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::NotFound, "B: GetDirectory denied");
+    let resp = f
+        .client
+        .get_directory(with_token(
+            GetDirectoryRequest {
+                by_what: Some(get_directory_request::ByWhat::Digest(root.to_vec())),
+                recursive: true,
+                digests: vec![],
+            },
+            &tok_b,
+        ))
+        .await
+        .unwrap();
+    let bodies: Vec<Directory> = resp.into_inner().filter_map(|r| r.ok()).collect().await;
+    assert!(bodies.is_empty(), "B: recursive walk streams nothing");
+    let r = f
+        .client
+        .has_blobs(with_token(
+            HasBlobsRequest {
+                digests: vec![blob_inline.to_vec()],
+            },
+            &tok_b,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(r.bitmap, vec![0], "B: HasBlobs zero");
+    let r = f
+        .client
+        .has_directories(with_token(
+            HasDirectoriesRequest {
+                digests: vec![root.to_vec()],
+            },
+            &tok_b,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(r.bitmap, vec![0], "B: HasDirectories zero");
+}
+
+/// Security invariant: the fallback applies ONLY to substitution-only
+/// paths. A path with a `path_tenants` row for ANOTHER tenant is
+/// junction-gated, full stop — a trusted signature must NOT bypass
+/// the I-217 isolation policy (built-by-another ⇒ hidden), matching
+/// `sig_visibility_gate`'s precedence.
+// r[verify store.castore.tenant-scope+2]
+#[tokio::test]
+async fn sig_fallback_requires_substitution_only() {
+    let mut f = fixture().await;
+    let k = rio_store::signing::Signer::from_seed("key-subst-k", &[0x4Bu8; 32]);
+    trust_upstream_key(
+        &f.db.pool,
+        f.tenant_a,
+        "https://cache-k.example",
+        &k.trusted_key_entry(),
+    )
+    .await;
+
+    // Signed by K (which A trusts) but BUILT by tenant B: junction row
+    // for B only.
+    let b = make_blob_nar(64, 62);
+    let blob = seed_subst_only_blob(&f, "/nix/store/built-by-b", &b, None, Some(&k)).await;
+    let dir = seed_subst_only_dir(&f, "built-by-b-dir", &[], Some(&k)).await;
+    for path in ["/nix/store/built-by-b", "/nix/store/built-by-b-dir"] {
+        sqlx::query("INSERT INTO path_tenants (store_path_hash, tenant_id) VALUES ($1, $2)")
+            .bind(sha2::Sha256::digest(path.as_bytes()).as_slice())
+            .bind(f.tenant_b)
+            .execute(&f.db.pool)
+            .await
+            .unwrap();
+    }
+    let tok_a = token(f.tenant_a);
+    let tok_b = token(f.tenant_b);
+
+    // A: denied everywhere despite trusting the signature.
+    let err = read_blob(&mut f, blob, &tok_a).await.unwrap_err();
+    assert_eq!(
+        err.code(),
+        tonic::Code::NotFound,
+        "built-by-another path must stay junction-gated for ReadBlob"
+    );
+    let err = stat_blob_with(&mut f, blob, &tok_a, false)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::NotFound);
+    let r = f
+        .client
+        .has_blobs(with_token(
+            HasBlobsRequest {
+                digests: vec![blob.to_vec()],
+            },
+            &tok_a,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(r.bitmap, vec![0], "HasBlobs must not sig-bypass junctions");
+    let err = f
+        .client
+        .get_directory(with_token(
+            GetDirectoryRequest {
+                by_what: Some(get_directory_request::ByWhat::Digest(dir.to_vec())),
+                recursive: false,
+                digests: vec![],
+            },
+            &tok_a,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::NotFound);
+
+    // B (the owner): junction path still works.
+    let body = read_blob(&mut f, blob, &tok_b).await.unwrap();
+    assert_eq!(body, b.file);
+}
+
+/// Matrix pin: the validity surface (`QueryPathInfo`, which applies
+/// `sig_visibility_gate`) and the castore read surface
+/// (ReadBlob/HasBlobs) must give the SAME verdict for the same
+/// (tenant, path) — `r[store.tenant.valid-paths-filter]`'s "a path
+/// MUST NOT be reported valid to a caller whose castore reads of it
+/// would fail". Four fixture classes × two tenants.
+// r[verify store.tenant.valid-paths-filter]
+// r[verify store.castore.tenant-scope+2]
+#[tokio::test]
+async fn read_surface_matches_sig_visibility_gate() {
+    use rio_proto::StoreServiceServer;
+    use rio_proto::store::store_service_client::StoreServiceClient;
+    use rio_proto::types::QueryPathInfoRequest;
+    use rio_store::grpc::StoreServiceImpl;
+
+    /// StoreService with a fake JWT interceptor pinning `tenant_id` —
+    /// how the gateway's identity reaches QueryPathInfo in production.
+    async fn spawn_store_with_fake_jwt(
+        pool: sqlx::PgPool,
+        tenant_id: uuid::Uuid,
+    ) -> (StoreServiceClient<Channel>, tokio::task::JoinHandle<()>) {
+        let fake_interceptor = move |mut req: tonic::Request<()>| {
+            req.extensions_mut().insert(rio_auth::jwt::TenantClaims {
+                sub: tenant_id,
+                iat: 1_700_000_000,
+                exp: 9_999_999_999,
+                jti: "dir-matrix-fake".into(),
+            });
+            Ok(req)
+        };
+        let router = Server::builder()
+            .layer(tonic::service::InterceptorLayer::new(fake_interceptor))
+            .add_service(StoreServiceServer::new(StoreServiceImpl::new(pool)));
+        let (addr, server) = rio_test_support::grpc::spawn_grpc_server_layered(router).await;
+        let channel = Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        (StoreServiceClient::new(channel), server)
+    }
+
+    let mut f = fixture().await;
+    let k = rio_store::signing::Signer::from_seed("key-matrix-k", &[0x6Bu8; 32]);
+    trust_upstream_key(
+        &f.db.pool,
+        f.tenant_a,
+        "https://cache-k.example",
+        &k.trusted_key_entry(),
+    )
+    .await;
+    // B trusts a different key.
+    trust_upstream_key(
+        &f.db.pool,
+        f.tenant_b,
+        "https://cache-j.example",
+        "key-j:aaaa",
+    )
+    .await;
+
+    // Fixture classes. Store paths must parse (QueryPathInfo
+    // validates), hence test_store_path().
+    let p1 = rio_test_support::fixtures::test_store_path("matrix-subst-signed");
+    let p2 = rio_test_support::fixtures::test_store_path("matrix-subst-unsigned");
+    let p3 = rio_test_support::fixtures::test_store_path("matrix-built-by-a");
+    let p4 = rio_test_support::fixtures::test_store_path("matrix-built-by-b-signed");
+    let b1 = make_blob_nar(32, 63);
+    let b2 = make_blob_nar(32, 64);
+    let b3 = make_blob_nar(32, 65);
+    let b4 = make_blob_nar(32, 66);
+    let d1 = seed_subst_only_blob(&f, &p1, &b1, None, Some(&k)).await;
+    let d2 = seed_subst_only_blob(&f, &p2, &b2, None, None).await;
+    let d3 = seed_subst_only_blob(&f, &p3, &b3, None, None).await;
+    let d4 = seed_subst_only_blob(&f, &p4, &b4, None, Some(&k)).await;
+    for (path, tenant) in [(&p3, f.tenant_a), (&p4, f.tenant_b)] {
+        sqlx::query("INSERT INTO path_tenants (store_path_hash, tenant_id) VALUES ($1, $2)")
+            .bind(sha2::Sha256::digest(path.as_bytes()).as_slice())
+            .bind(tenant)
+            .execute(&f.db.pool)
+            .await
+            .unwrap();
+    }
+
+    let cases: [(&str, [u8; 32]); 4] = [(&p1, d1), (&p2, d2), (&p3, d3), (&p4, d4)];
+    for tenant in [f.tenant_a, f.tenant_b] {
+        let (mut store_client, server) = spawn_store_with_fake_jwt(f.db.pool.clone(), tenant).await;
+        let _guard = scopeguard::guard(server, |h| h.abort());
+        let tok = token(tenant);
+        for (path, digest) in &cases {
+            let valid = store_client
+                .query_path_info(QueryPathInfoRequest {
+                    store_path: (*path).to_string(),
+                })
+                .await
+                .is_ok();
+            let readable = read_blob(&mut f, *digest, &tok).await.is_ok();
+            let has = f
+                .client
+                .has_blobs(with_token(
+                    HasBlobsRequest {
+                        digests: vec![digest.to_vec()],
+                    },
+                    &tok,
+                ))
+                .await
+                .unwrap()
+                .into_inner()
+                .bitmap
+                == vec![0b1];
+            assert_eq!(
+                valid, readable,
+                "tenant {tenant} path {path}: QueryPathInfo={valid} but ReadBlob={readable} \
+                 — validity and castore reads must agree"
+            );
+            assert_eq!(
+                valid, has,
+                "tenant {tenant} path {path}: QueryPathInfo={valid} but HasBlobs={has}"
+            );
+        }
     }
 }
 

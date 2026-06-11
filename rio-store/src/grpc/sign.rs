@@ -11,6 +11,7 @@
 
 use std::collections::HashSet;
 
+use sqlx::PgPool;
 use tonic::Status;
 use tracing::{debug, warn};
 
@@ -18,6 +19,7 @@ use rio_proto::validated::ValidatedPathInfo;
 
 #[cfg(test)]
 use crate::metadata::{self};
+use crate::signing::TenantSigner;
 
 use super::{StoreServiceImpl, metadata_status};
 
@@ -89,6 +91,27 @@ impl VisibleSet {
     pub(in crate::grpc) fn len(&self) -> usize {
         self.set.len()
     }
+}
+
+/// gRPC-side adapter for the castore read fallback's batched
+/// sig-visibility check (`grpc/directory.rs`): of `hashes` (each a
+/// SUBSTITUTION-ONLY `narinfo.store_path_hash` — caller owns that
+/// precondition), which carry a signature `tid` trusts? Body lives in
+/// [`crate::visibility::sig_visible_path_hashes`] (the ONE predicate
+/// the validity gates evaluate, `r[store.visibility.one-body]`); this
+/// wrapper supplies the per-request trust cache and maps
+/// [`crate::error::MetadataError`] → [`Status`].
+// r[impl store.castore.tenant-scope+2]
+pub(super) async fn sig_visible_path_hashes(
+    pool: &PgPool,
+    signer: Option<&TenantSigner>,
+    tid: uuid::Uuid,
+    hashes: &[Vec<u8>],
+) -> Result<HashSet<Vec<u8>>, Status> {
+    let cache = crate::visibility::SharedTrustCache::default();
+    crate::visibility::sig_visible_path_hashes(pool, signer, tid, hashes, &cache)
+        .await
+        .map_err(|e| metadata_status("sig_visible_path_hashes", e))
 }
 
 impl StoreServiceImpl {

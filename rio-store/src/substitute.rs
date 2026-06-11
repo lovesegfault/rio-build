@@ -2458,7 +2458,13 @@ impl Substituter {
                 // junction row would launder it into "built"
                 // (`r[store.substitute.find-missing-gated]`), hiding it
                 // from other tenants who trust the same upstream and
-                // corrupting the scheduler's cached-output check. The
+                // corrupting the scheduler's cached-output check.
+                // Castore reads honor the same sig-visibility predicate
+                // as a fallback when the junction probe misses
+                // (grpc/directory.rs), so the zero-junction state stays
+                // READABLE — not just valid — to every tenant whose
+                // trusted keys cover the signature
+                // (`r[store.tenant.valid-paths-filter]`). The
                 // scheduler's completion upsert (`upsert_path_tenants`
                 // in rio-scheduler) pins substituted outputs for the
                 // tenants whose builds depend on them.

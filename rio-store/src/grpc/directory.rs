@@ -4,9 +4,14 @@
 //! `StatBlob`. All tenant-scoped: every query resolves a digest to the
 //! store path(s) that contain it (`directory_paths` /
 //! `file_blobs.store_path_hash`) and joins `path_tenants` on the
-//! caller's `tenant_id`, so a digest the tenant didn't produce is
-//! invisible (NotFound, or absent from the bitmap). Directory bodies
-//! leak child names/digests — confidentiality, not just isolation.
+//! caller's `tenant_id`. When the junction probe misses, a digest may
+//! still resolve through a SUBSTITUTION-ONLY containing path (zero
+//! `path_tenants` rows) whose narinfo signature verifies against the
+//! caller's trusted keys — the same per-caller predicate the validity
+//! surface applies (`sig_visibility_gate` in sign.rs), so a path
+//! reported valid is always readable. Anything else is invisible
+//! (NotFound, or absent from the bitmap). Directory bodies leak child
+//! names/digests — confidentiality, not just isolation.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -27,8 +32,9 @@ use rio_proto::types::{
     ReadBlobRequest, StatBlobRequest, StatBlobResponse,
 };
 
-use super::drain_with_timeout;
+use super::{drain_with_timeout, sign};
 use crate::cas::ChunkCache;
+use crate::signing::TenantSigner;
 
 /// BFS frontier batch cap. ~33 round trips for a chromium-scale
 /// closure (8k dirs); matches PG's parameter limit headroom. This
@@ -95,6 +101,13 @@ pub struct DirectoryServiceImpl {
     /// inline-only store: chunked files return `FAILED_PRECONDITION`,
     /// inline files still resolve.
     chunk_cache: Option<Arc<ChunkCache>>,
+    /// Same `TenantSigner` the StoreService holds. DirectoryService
+    /// never signs — this only feeds the caller's trusted-key set
+    /// (cluster key + prior rotation history) into the sig-visibility
+    /// fallback, so the read surface and `sig_visibility_gate` derive
+    /// identical trust. `None` = no cluster key in the trusted set
+    /// (upstream `trusted_keys` and `tenant_keys` still apply).
+    signer: Option<Arc<TenantSigner>>,
 }
 
 impl DirectoryServiceImpl {
@@ -102,11 +115,13 @@ impl DirectoryServiceImpl {
         pool: PgPool,
         hmac_verifier: Option<Arc<rio_auth::hmac::HmacVerifier>>,
         chunk_cache: Option<Arc<ChunkCache>>,
+        signer: Option<Arc<TenantSigner>>,
     ) -> Self {
         Self {
             pool,
             hmac_verifier,
             chunk_cache,
+            signer,
         }
     }
 
@@ -116,7 +131,7 @@ impl DirectoryServiceImpl {
     /// uses the same one, so a path committed by a builder is readable
     /// by that builder's tenant). No tenant → `UNAUTHENTICATED`; never
     /// fall back to anonymous.
-    // r[impl store.castore.tenant-scope]
+    // r[impl store.castore.tenant-scope+2]
     fn castore_tenant_id<T>(&self, request: &Request<T>) -> Result<uuid::Uuid, Status> {
         match caller_identity(
             request,
@@ -254,7 +269,7 @@ impl DirectoryService for DirectoryServiceImpl {
                 ));
             }
             let digest = frontier[0];
-            let body: Option<(Vec<u8>,)> = sqlx::query_as(
+            let mut body: Option<(Vec<u8>,)> = sqlx::query_as(
                 "SELECT d.body FROM directories d \
                   JOIN directory_paths dp ON dp.digest = d.digest \
                   JOIN path_tenants pt ON pt.store_path_hash = dp.store_path_hash \
@@ -266,6 +281,27 @@ impl DirectoryService for DirectoryServiceImpl {
             .fetch_optional(&self.pool)
             .await
             .map_err(internal)?;
+            if body.is_none()
+                && sig_fallback_digests(
+                    &self.pool,
+                    self.signer.as_deref(),
+                    SUBST_ONLY_DIRECTORY_CANDIDATES_SQL,
+                    &[digest],
+                    tenant,
+                )
+                .await?
+                .contains(&digest)
+            {
+                // Junction miss but the digest is reachable through a
+                // sig-visible substitution-only path — content lookup
+                // is by digest (directories PK), authorization just
+                // happened above.
+                body = sqlx::query_as("SELECT body FROM directories WHERE digest = $1")
+                    .bind(digest.as_slice())
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(internal)?;
+            }
             let Some((body,)) = body else {
                 return Err(Status::not_found("directory not found"));
             };
@@ -280,6 +316,7 @@ impl DirectoryService for DirectoryServiceImpl {
         // mid-stream is fine — the FUSE prefetch retries from where it
         // left off via the deduped `seen` set on its side.
         let pool = self.pool.clone();
+        let signer = self.signer.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(GET_DIRECTORY_CHANNEL_DEPTH);
         rio_common::task::spawn_monitored("get-directory-bfs", async move {
             let started = Instant::now();
@@ -303,7 +340,7 @@ impl DirectoryService for DirectoryServiceImpl {
                         // DISTINCT: a digest shared by N tenant-visible
                         // paths must count once (and stream once).
                         type SizeRow = (Vec<u8>, i64);
-                        let sizes: Vec<SizeRow> = match sqlx::query_as(
+                        let mut sizes: Vec<SizeRow> = match sqlx::query_as(
                             "SELECT DISTINCT d.digest, length(d.body)::bigint FROM directories d \
                               JOIN directory_paths dp ON dp.digest = d.digest \
                               JOIN path_tenants pt ON pt.store_path_hash = dp.store_path_hash \
@@ -320,18 +357,71 @@ impl DirectoryService for DirectoryServiceImpl {
                                 return;
                             }
                         };
+                        // Junction misses → sig-visibility fallback.
+                        // This stage is where tenant authorization
+                        // happens for the whole batch (junction OR
+                        // sig-visible substitution-only path); the
+                        // body fetch below is a pure content lookup.
+                        let got: HashSet<[u8; 32]> = sizes
+                            .iter()
+                            .filter_map(|(d, _)| d.as_slice().try_into().ok())
+                            .collect();
+                        let missing: Vec<[u8; 32]> = batch
+                            .iter()
+                            .filter(|d| !got.contains(*d))
+                            .copied()
+                            .collect();
+                        if !missing.is_empty() {
+                            let extra = match sig_fallback_digests(
+                                &pool,
+                                signer.as_deref(),
+                                SUBST_ONLY_DIRECTORY_CANDIDATES_SQL,
+                                &missing,
+                                tenant,
+                            )
+                            .await
+                            {
+                                Ok(e) => e,
+                                Err(e) => {
+                                    let _ = tx.send(Err(e)).await;
+                                    return;
+                                }
+                            };
+                            if !extra.is_empty() {
+                                let extra_slices: Vec<&[u8]> =
+                                    extra.iter().map(|d| d.as_slice()).collect();
+                                let extra_sizes: Vec<SizeRow> = match sqlx::query_as(
+                                    "SELECT digest, length(body)::bigint FROM directories \
+                                     WHERE digest = ANY($1::bytea[])",
+                                )
+                                .bind(&extra_slices)
+                                .fetch_all(&pool)
+                                .await
+                                {
+                                    Ok(r) => r,
+                                    Err(e) => {
+                                        let _ = tx.send(Err(internal(e))).await;
+                                        return;
+                                    }
+                                };
+                                sizes.extend(extra_sizes);
+                            }
+                        }
                         for sub in greedy_split_by_bytes(&sizes, GET_DIRECTORY_BATCH_BYTES) {
                             let sub_digests: Vec<&[u8]> =
                                 sub.iter().map(|(d, _)| d.as_slice()).collect();
+                            // No tenancy join here: every digest in
+                            // `sub` was authorized by the size stage
+                            // above (junction or sig-fallback), and
+                            // `directories.digest` is the PK — re-
+                            // joining `path_tenants` would drop the
+                            // sig-visible digests again.
                             let rows: Vec<(Vec<u8>,)> = match sqlx::query_as(
-                                "SELECT DISTINCT ON (d.digest) d.body FROM directories d \
-                              JOIN directory_paths dp ON dp.digest = d.digest \
-                              JOIN path_tenants pt ON pt.store_path_hash = dp.store_path_hash \
-                             WHERE d.digest = ANY($1::bytea[]) AND pt.tenant_id = $2 \
-                             ORDER BY d.digest",
+                                "SELECT body FROM directories \
+                                 WHERE digest = ANY($1::bytea[]) \
+                                 ORDER BY digest",
                             )
                             .bind(&sub_digests)
-                            .bind(tenant)
                             .fetch_all(&pool)
                             .await
                             {
@@ -407,6 +497,7 @@ impl DirectoryService for DirectoryServiceImpl {
         self.has_response(
             &request.into_inner().digests,
             HAS_DIRECTORIES_SQL,
+            SUBST_ONLY_DIRECTORY_CANDIDATES_SQL,
             "HasDirectories",
             tenant,
         )
@@ -427,6 +518,7 @@ impl DirectoryService for DirectoryServiceImpl {
         self.has_response(
             &request.into_inner().digests,
             HAS_BLOBS_SQL,
+            SUBST_ONLY_BLOB_CANDIDATES_SQL,
             "HasBlobs",
             tenant,
         )
@@ -459,7 +551,7 @@ impl DirectoryService for DirectoryServiceImpl {
         // `nar_index.entries` (O(files-in-NAR)) on the FUSE `open()`
         // fast path.
         type BlobRow = (i64, i64, Option<Vec<u8>>, Option<Vec<u8>>);
-        let row: Option<BlobRow> = sqlx::query_as(
+        let mut row: Option<BlobRow> = sqlx::query_as(
             "SELECT f.nar_offset, f.size, m.inline_blob, md.chunk_list \
                FROM file_blobs f \
                JOIN path_tenants pt ON pt.store_path_hash = f.store_path_hash \
@@ -474,6 +566,27 @@ impl DirectoryService for DirectoryServiceImpl {
         .fetch_optional(&self.pool)
         .await
         .map_err(internal)?;
+        if row.is_none() {
+            // Junction miss → sig-visible substitution-only path. Same
+            // row shape, pinned to the path the fallback authorized.
+            if let Some(path_hash) =
+                blob_sig_fallback_hash(&self.pool, self.signer.as_deref(), &digest, tenant).await?
+            {
+                row = sqlx::query_as(
+                    "SELECT f.nar_offset, f.size, m.inline_blob, md.chunk_list \
+                       FROM file_blobs f \
+                       JOIN manifests m ON m.store_path_hash = f.store_path_hash \
+                            AND m.status = 'complete' \
+                       LEFT JOIN manifest_data md ON md.store_path_hash = f.store_path_hash \
+                      WHERE f.digest = $1 AND f.store_path_hash = $2",
+                )
+                .bind(digest.as_slice())
+                .bind(&path_hash)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(internal)?;
+            }
+        }
         let Some((nar_offset, file_size, inline_blob, chunk_list)) = row else {
             return Err(Status::not_found("file blob not found"));
         };
@@ -551,14 +664,19 @@ impl DirectoryService for DirectoryServiceImpl {
             .fetch_optional(&self.pool)
             .await
             .map_err(internal)?;
-            return exists
-                .map(|_| Response::new(StatBlobResponse::default()))
+            // Junction miss → sig-visibility fallback, same as ReadBlob.
+            let visible = exists.is_some()
+                || blob_sig_fallback_hash(&self.pool, self.signer.as_deref(), &digest, tenant)
+                    .await?
+                    .is_some();
+            return visible
+                .then(|| Response::new(StatBlobResponse::default()))
                 .ok_or_else(|| Status::not_found("file blob not found"));
         }
 
         // `IS NOT NULL`, not the bytes: only the classification matters.
         type StatRow = (i64, i64, bool, Option<Vec<u8>>);
-        let row: Option<StatRow> = sqlx::query_as(
+        let mut row: Option<StatRow> = sqlx::query_as(
             "SELECT f.nar_offset, f.size, m.inline_blob IS NOT NULL, md.chunk_list \
                FROM file_blobs f \
                JOIN path_tenants pt ON pt.store_path_hash = f.store_path_hash \
@@ -572,6 +690,27 @@ impl DirectoryService for DirectoryServiceImpl {
         .fetch_optional(&self.pool)
         .await
         .map_err(internal)?;
+        if row.is_none() {
+            // Junction miss → sig-visible substitution-only path, same
+            // as ReadBlob.
+            if let Some(path_hash) =
+                blob_sig_fallback_hash(&self.pool, self.signer.as_deref(), &digest, tenant).await?
+            {
+                row = sqlx::query_as(
+                    "SELECT f.nar_offset, f.size, m.inline_blob IS NOT NULL, md.chunk_list \
+                       FROM file_blobs f \
+                       JOIN manifests m ON m.store_path_hash = f.store_path_hash \
+                            AND m.status = 'complete' \
+                       LEFT JOIN manifest_data md ON md.store_path_hash = f.store_path_hash \
+                      WHERE f.digest = $1 AND f.store_path_hash = $2",
+                )
+                .bind(digest.as_slice())
+                .bind(&path_hash)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(internal)?;
+            }
+        }
         let Some((nar_offset, file_size, is_inline, chunk_list)) = row else {
             return Err(Status::not_found("file blob not found"));
         };
@@ -803,21 +942,143 @@ const HAS_BLOBS_SQL: &str = "SELECT DISTINCT d.digest FROM file_blobs d \
      JOIN path_tenants t ON t.store_path_hash = d.store_path_hash \
      WHERE d.digest = ANY($1::bytea[]) AND t.tenant_id = $2";
 
+/// Sig-visibility fallback candidates over `directory_paths`:
+/// `(digest, store_path_hash)` pairs reachable from the given digests
+/// through SUBSTITUTION-ONLY paths. The `NOT EXISTS` keeps the
+/// fallback per-path: a path with a `path_tenants` row for ANY tenant
+/// is junction-gated only — a trusted signature must not bypass the
+/// I-217 isolation policy (built-by-another ⇒ hidden), matching
+/// `sig_visibility_gate`'s precedence.
+const SUBST_ONLY_DIRECTORY_CANDIDATES_SQL: &str = "SELECT dp.digest, dp.store_path_hash \
+       FROM directory_paths dp \
+      WHERE dp.digest = ANY($1::bytea[]) \
+        AND NOT EXISTS (SELECT 1 FROM path_tenants pt \
+                         WHERE pt.store_path_hash = dp.store_path_hash)";
+
+/// Sig-visibility fallback candidates over `file_blobs` (the direct
+/// junction — no `directory_paths` hop). Same per-path
+/// substitution-only filter as the directory variant.
+const SUBST_ONLY_BLOB_CANDIDATES_SQL: &str = "SELECT f.digest, f.store_path_hash \
+       FROM file_blobs f \
+      WHERE f.digest = ANY($1::bytea[]) \
+        AND NOT EXISTS (SELECT 1 FROM path_tenants pt \
+                         WHERE pt.store_path_hash = f.store_path_hash)";
+
+/// Sig-visibility fallback for digest-level presence: of `missing`
+/// (digests the strict junction probe did NOT grant), return those
+/// reachable through a substitution-only path whose narinfo signature
+/// verifies against `tenant`'s trusted set — the shared predicate
+/// from sign.rs, so the read surface can't drift from the validity
+/// gate. Free function (not a method) so the spawned `GetDirectory`
+/// BFS task can call it without `&self`.
+///
+/// Cost shape: only runs when the junction probe missed; candidate
+/// lookup is a `(digest, store_path_hash)` PK prefix scan, narinfo
+/// verification is a PK `= ANY` fetch inside
+/// [`sign::sig_visible_path_hashes`].
+// r[impl store.castore.tenant-scope+2]
+async fn sig_fallback_digests(
+    pool: &PgPool,
+    signer: Option<&TenantSigner>,
+    sql: &'static str,
+    missing: &[[u8; 32]],
+    tenant: uuid::Uuid,
+) -> Result<HashSet<[u8; 32]>, Status> {
+    if missing.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let slices: Vec<&[u8]> = missing.iter().map(|d| d.as_slice()).collect();
+    let candidates: Vec<(Vec<u8>, Vec<u8>)> = sqlx::query_as(sql)
+        .bind(&slices)
+        .fetch_all(pool)
+        .await
+        .map_err(internal)?;
+    if candidates.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut hashes: Vec<Vec<u8>> = candidates.iter().map(|(_, h)| h.clone()).collect();
+    hashes.sort_unstable();
+    hashes.dedup();
+    let visible = sign::sig_visible_path_hashes(pool, signer, tenant, &hashes).await?;
+    Ok(candidates
+        .into_iter()
+        .filter(|(_, h)| visible.contains(h))
+        .filter_map(|(d, _)| d.try_into().ok())
+        .collect())
+}
+
+/// `ReadBlob`/`StatBlob` arm of the sig-visibility fallback: pick the
+/// substitution-only path (complete manifest) containing `digest`
+/// that is sig-visible to `tenant`. Lowest `store_path_hash` wins for
+/// determinism. `None` ⇒ the caller's NotFound stands.
+// r[impl store.castore.tenant-scope+2]
+async fn blob_sig_fallback_hash(
+    pool: &PgPool,
+    signer: Option<&TenantSigner>,
+    digest: &[u8; 32],
+    tenant: uuid::Uuid,
+) -> Result<Option<Vec<u8>>, Status> {
+    let candidates: Vec<(Vec<u8>,)> = sqlx::query_as(
+        "SELECT f.store_path_hash FROM file_blobs f \
+           JOIN manifests m ON m.store_path_hash = f.store_path_hash \
+                AND m.status = 'complete' \
+          WHERE f.digest = $1 \
+            AND NOT EXISTS (SELECT 1 FROM path_tenants pt \
+                             WHERE pt.store_path_hash = f.store_path_hash)",
+    )
+    .bind(digest.as_slice())
+    .fetch_all(pool)
+    .await
+    .map_err(internal)?;
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let hashes: Vec<Vec<u8>> = candidates.into_iter().map(|(h,)| h).collect();
+    let visible = sign::sig_visible_path_hashes(pool, signer, tenant, &hashes).await?;
+    Ok(hashes.into_iter().filter(|h| visible.contains(h)).min())
+}
+
 impl DirectoryServiceImpl {
     /// Shared `HasDirectories`/`HasBlobs` body: parse digests → record
-    /// the batch-size histogram → presence query → bitmap. The two RPCs
-    /// differ only in the SQL and the `rpc` metric label.
+    /// the batch-size histogram → presence query (junction first, then
+    /// the sig-visibility fallback for the misses) → bitmap. The two
+    /// RPCs differ only in the SQL pair and the `rpc` metric label.
     async fn has_response(
         &self,
         raw: &[Vec<u8>],
         sql: &'static str,
+        fallback_sql: &'static str,
         rpc: &'static str,
         tenant: uuid::Uuid,
     ) -> Result<Response<HasBitmap>, Status> {
         let digests = parse_digests(raw)?;
         metrics::histogram!("rio_store_directory_has_batch_size", "rpc" => rpc)
             .record(digests.len() as f64);
-        let present = self.has_in(sql, &digests, tenant).await?;
+        let mut present = self.has_in(sql, &digests, tenant).await?;
+        // Fallback arm only engages for digests the junction probe
+        // missed — the owned-path fast path stays one query.
+        let missing: Vec<[u8; 32]> = {
+            let mut m: Vec<[u8; 32]> = digests
+                .iter()
+                .filter(|d| !present.contains(*d))
+                .copied()
+                .collect();
+            m.sort_unstable();
+            m.dedup();
+            m
+        };
+        if !missing.is_empty() {
+            present.extend(
+                sig_fallback_digests(
+                    &self.pool,
+                    self.signer.as_deref(),
+                    fallback_sql,
+                    &missing,
+                    tenant,
+                )
+                .await?,
+            );
+        }
         Ok(Response::new(HasBitmap {
             bitmap: build_bitmap(&digests, &present),
         }))
@@ -927,5 +1188,112 @@ mod tests {
             slice_inline(vec![1, 2, 3], 0, 4).unwrap_err().code(),
             tonic::Code::DataLoss
         );
+    }
+
+    /// Dev-only sanity: the sig-visibility fallback queries must stay
+    /// on index scans — the candidate probe via the `file_blobs`
+    /// digest index + `path_tenants` PK anti-join, and the narinfo
+    /// verification fetch via the `narinfo` PK. A seq scan on any of
+    /// these would put O(table) work on the castore-FUSE open() path
+    /// whenever the junction probe misses.
+    ///
+    /// `#[ignore]` because EXPLAIN output depends on PG's cost model
+    /// (same caveat as `scan_query_uses_uploading_partial_idx` in
+    /// gc/orphan.rs). Run locally with
+    /// `cargo test -p rio-store -- --ignored sig_fallback_queries`.
+    #[ignore = "EXPLAIN plan depends on PG cost model; dev-only sanity"]
+    #[tokio::test]
+    async fn sig_fallback_queries_use_indexes() {
+        use rio_test_support::TestDb;
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // Enough rows that the cost model would reject index scans if
+        // the predicates didn't line up with the indexes.
+        sqlx::query(
+            "INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size)
+             SELECT sha256(i::text::bytea),
+                    '/nix/store/' || lpad(to_hex(i), 32, '0') || '-seed',
+                    sha256(i::text::bytea), 0
+             FROM generate_series(1, 2000) AS i",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO manifests (store_path_hash, status)
+             SELECT sha256(i::text::bytea), 'complete'
+             FROM generate_series(1, 2000) AS i",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO file_blobs (digest, store_path_hash, nar_offset, size)
+             SELECT sha256(('blob' || i)::text::bytea), sha256(i::text::bytea), 0, 0
+             FROM generate_series(1, 2000) AS i",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        // Populate path_tenants too — against an empty table PG
+        // (correctly) seq-scans 0 rows, which would vacuously pass the
+        // anti-join assertion below.
+        let tid = crate::test_helpers::seed_tenant(&db.pool, "explain-sanity").await;
+        sqlx::query(
+            "INSERT INTO path_tenants (store_path_hash, tenant_id)
+             SELECT sha256(i::text::bytea), $1 FROM generate_series(1, 2000) AS i",
+        )
+        .bind(tid)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("ANALYZE narinfo, manifests, file_blobs, path_tenants")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let explain = |sql: String| {
+            let pool = db.pool.clone();
+            async move {
+                let digests: Vec<&[u8]> = vec![&[0u8; 32]];
+                // AssertSqlSafe: const SQL + an "EXPLAIN" prefix, no
+                // runtime data in the string.
+                let plan: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+                    .bind(&digests)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+                plan.into_iter()
+                    .map(|(l,)| l)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        };
+
+        for (label, sql) in [
+            (
+                "blob candidates",
+                format!("EXPLAIN (FORMAT TEXT) {SUBST_ONLY_BLOB_CANDIDATES_SQL}"),
+            ),
+            (
+                "directory candidates",
+                format!("EXPLAIN (FORMAT TEXT) {SUBST_ONLY_DIRECTORY_CANDIDATES_SQL}"),
+            ),
+            (
+                "narinfo verification",
+                "EXPLAIN (FORMAT TEXT) SELECT store_path_hash FROM narinfo \
+                 WHERE store_path_hash = ANY($1::bytea[])"
+                    .to_string(),
+            ),
+        ] {
+            let joined = explain(sql).await;
+            eprintln!("{label} plan:\n{joined}\n");
+            for table in ["narinfo", "file_blobs", "directory_paths", "path_tenants"] {
+                assert!(
+                    !joined.contains(&format!("Seq Scan on {table}")),
+                    "{label}: plan should NOT seq-scan {table}; got:\n{joined}"
+                );
+            }
+        }
     }
 }

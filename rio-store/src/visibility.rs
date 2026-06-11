@@ -37,7 +37,7 @@
 //! paths go through the same ownership/sig checks as outputs.
 //! Exempting them made a cross-tenant `.drv` *valid but unreadable* —
 //! the client skipped the upload, then the builder's castore-FUSE read
-//! (strict `path_tenants` join, `r[store.castore.tenant-scope]`) got
+//! (strict `path_tenants` join, `r[store.castore.tenant-scope+2]`) got
 //! NotFound → EIO → infra-retries exhausted. Reporting it invalid
 //! instead makes the client re-upload, and the idempotent-skip
 //! junction write (`r[store.put.tenant-junction]`) grants this tenant
@@ -372,6 +372,80 @@ pub(crate) async fn visible_subset(
             VisibilityVerdict::Visible
         ) {
             visible.insert(info.store_path.to_string());
+        }
+    }
+    Ok(visible)
+}
+
+/// Batched sig-visibility for SUBSTITUTION-ONLY paths, keyed by
+/// `narinfo.store_path_hash`: returns the subset of `hashes` whose
+/// stored narinfo carries a signature `tid` trusts (the SAME
+/// predicate as [`sig_cell`], over the SAME [`trusted_set`]).
+///
+/// Callers own the substitution-only precondition (zero
+/// `path_tenants` rows for each hash) — this answers only the
+/// signature half of the predicate. Hashes absent from `narinfo` are
+/// hidden (same as the single-path gate's NotFound). The castore
+/// read fallback (`grpc/directory.rs`) consults THIS body so a path
+/// the validity gates report visible is always READABLE —
+/// `r[store.tenant.valid-paths-filter]` requires "valid ⇒ readable"
+/// to hold per caller, which only stays true if both surfaces
+/// evaluate the SAME predicate (`r[store.visibility.one-body]`).
+///
+/// PK lookup — never a narinfo seq scan, so the fallback arm stays
+/// index-only even for large batches.
+// r[impl store.substitute.tenant-sig-visibility+2]
+// r[impl store.castore.tenant-scope+2]
+pub(crate) async fn sig_visible_path_hashes(
+    pool: &sqlx::PgPool,
+    signer: Option<&TenantSigner>,
+    tid: Uuid,
+    hashes: &[Vec<u8>],
+    cache: &SharedTrustCache,
+) -> Result<HashSet<Vec<u8>>, MetadataError> {
+    if hashes.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let trusted = trusted_set(pool, signer, tid, cache).await?;
+    if trusted.is_empty() {
+        // Tenant trusts no keys at all → every substitution-only path
+        // is invisible.
+        return Ok(HashSet::new());
+    }
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        store_path_hash: Vec<u8>,
+        store_path: String,
+        nar_hash: Vec<u8>,
+        nar_size: i64,
+        references: Vec<String>,
+        signatures: Vec<String>,
+    }
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT store_path_hash, store_path, nar_hash, nar_size, \"references\", signatures \
+         FROM narinfo WHERE store_path_hash = ANY($1::bytea[])",
+    )
+    .bind(hashes)
+    .fetch_all(pool)
+    .await?;
+    let mut visible = HashSet::with_capacity(rows.len());
+    for r in rows {
+        let Ok(nar_hash): Result<[u8; 32], _> = r.nar_hash.as_slice().try_into() else {
+            // Malformed row — hide (defensive; query_path_info would
+            // MalformedRow on it).
+            continue;
+        };
+        // The [`sig_cell`] body over raw row fields (no
+        // ValidatedPathInfo at this layer — the castore fallback
+        // works in store_path_hash space).
+        let fp = rio_nix::narinfo::fingerprint(
+            &r.store_path,
+            &nar_hash,
+            r.nar_size as u64,
+            &r.references,
+        );
+        if crate::signing::any_sig_trusted(&r.signatures, &trusted, &fp).is_some() {
+            visible.insert(r.store_path_hash);
         }
     }
     Ok(visible)

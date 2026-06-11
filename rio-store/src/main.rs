@@ -244,11 +244,15 @@ async fn main() -> anyhow::Result<()> {
         ChunkServiceImpl::new(pool.clone(), chunk_cache.clone(), hmac_verifier_arc.clone());
 
     // Tenant-scoped via JWT or HMAC assignment-token claim — see
-    // grpc/directory.rs. ReadBlob shares the chunk cache.
+    // grpc/directory.rs. ReadBlob shares the chunk cache; the signer
+    // feeds the sig-visibility fallback's trusted-key set (same
+    // TenantSigner as the StoreService, so the validity gate and the
+    // castore reads derive identical trust).
     let directory_service = rio_store::grpc::DirectoryServiceImpl::new(
         pool.clone(),
         hmac_verifier_arc.clone(),
         chunk_cache.clone(),
+        store_service.signer().cloned(),
     );
 
     // LogService: build-log ingest + tailing. The log chunk store

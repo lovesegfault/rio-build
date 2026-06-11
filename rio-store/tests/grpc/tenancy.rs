@@ -81,6 +81,7 @@ async fn put_path_then_read_blob_same_tenant() -> TestResult {
         db.pool.clone(),
         Some(Arc::new(HmacVerifier::from_key(KEY.to_vec()))),
         None,
+        None,
     );
     let router = Server::builder().add_service(DirectoryServiceServer::new(dir_svc));
     let (addr, dir_server) = rio_test_support::grpc::spawn_grpc_server_layered(router).await;
@@ -389,6 +390,7 @@ async fn find_missing_paths_drv_tenant_scoped() -> TestResult {
     let dir_svc = DirectoryServiceImpl::new(
         db.pool.clone(),
         Some(Arc::new(HmacVerifier::from_key(KEY.to_vec()))),
+        None,
         None,
     );
     let router = Server::builder().add_service(DirectoryServiceServer::new(dir_svc));
