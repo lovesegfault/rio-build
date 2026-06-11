@@ -176,11 +176,14 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_controller_runtime_skew_stalls_total",
-        "Stall episodes per runtime domain (domain=main|guard): edge-triggered when \
-         scheduling delay crosses the guard sentinel's threshold (default 1s). Each \
-         main-domain increment logs a thread-table capture (tid/comm/state) for \
-         attribution. Rate > 0 = the component is being starved; correlate with \
-         rio_controller_runtime_skew_seconds and the captured table in logs."
+        "Stall episodes per runtime domain (domain=main|guard): ONE increment per \
+         episode in both domains (a shared edge latch — the increment is the rising \
+         edge, re-armed at resolution; a main-domain episode that starts and resolves \
+         between probe ticks still counts once at its settle). Live main-domain edges \
+         log a thread-table capture (tid/comm/state) for attribution; settle-counted \
+         episodes do not (nothing live remains). Rate > 0 = the component is being \
+         starved; correlate with rio_controller_runtime_skew_seconds and the captured \
+         table in logs."
     );
     describe_counter!(
         "rio_controller_fenced_mutations_refused_total",

@@ -578,7 +578,7 @@
       {
         "name": "rio_controller_runtime_skew_stalls_total",
         "kind": "counter",
-        "help": "Stall episodes per runtime domain (domain=main|guard): edge-triggered when scheduling delay crosses the guard sentinel's threshold (default 1s). Each main-domain increment logs a thread-table capture (tid/comm/state) for attribution. Rate > 0 = the component is being starved; correlate with rio_controller_runtime_skew_seconds and the captured table in logs."
+        "help": "Stall episodes per runtime domain (domain=main|guard): ONE increment per episode in both domains (a shared edge latch — the increment is the rising edge, re-armed at resolution; a main-domain episode that starts and resolves between probe ticks still counts once at its settle). Live main-domain edges log a thread-table capture (tid/comm/state) for attribution; settle-counted episodes do not (nothing live remains). Rate > 0 = the component is being starved; correlate with rio_controller_runtime_skew_seconds and the captured table in logs."
       },
       {
         "name": "rio_controller_scaling_decisions_total",

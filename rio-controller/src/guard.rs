@@ -140,6 +140,7 @@ pub struct GuardHandle {
     main_skew_us: Arc<AtomicU64>,
     guard_skew_us: Arc<AtomicU64>,
     main_stalls: Arc<AtomicU64>,
+    guard_stalls: Arc<AtomicU64>,
     guard_rt: tokio::runtime::Handle,
     epilogue_tx: tokio::sync::mpsc::UnboundedSender<DrainHandle>,
 }
@@ -209,6 +210,16 @@ impl GuardHandle {
     /// `rio_controller_runtime_skew_stalls_total{domain="main"}`.
     pub fn main_stalls(&self) -> u64 {
         self.main_stalls.load(Ordering::Relaxed)
+    }
+
+    /// Guard-domain stall episodes observed (the same edge semantics
+    /// as [`Self::main_stalls`] — one [`EdgeLatch`], two instances).
+    /// Mirror of
+    /// `rio_controller_runtime_skew_stalls_total{domain="guard"}` —
+    /// the accessor merged_bug_003's witness gap named (W9-AK could
+    /// only pin the main domain).
+    pub fn guard_stalls(&self) -> u64 {
+        self.guard_stalls.load(Ordering::Relaxed)
     }
 
     /// Host the lease renew loop on the guard domain. THE point of
@@ -327,6 +338,7 @@ pub fn spawn(
         main_skew_us: Arc::new(AtomicU64::new(0)),
         guard_skew_us: Arc::new(AtomicU64::new(0)),
         main_stalls: Arc::new(AtomicU64::new(0)),
+        guard_stalls: Arc::new(AtomicU64::new(0)),
         guard_rt: rt.handle().clone(),
         epilogue_tx,
     };
@@ -377,6 +389,7 @@ pub fn spawn(
                     h.main_skew_us.clone(),
                     h.guard_skew_us.clone(),
                     h.main_stalls.clone(),
+                    h.guard_stalls.clone(),
                     cfg.probe_interval,
                     cfg.stall_threshold,
                 ));
@@ -437,19 +450,25 @@ async fn readyz(State(s): State<ReadyState>) -> (StatusCode, &'static str) {
 ///   `now - probe_sent`, so the gauge tracks a live stall in real
 ///   time.
 ///
-/// Threshold crossing is edge-triggered: one thread-table capture +
-/// one `..._stalls_total` increment per stall episode, re-armed when a
-/// probe answers under the threshold.
+/// Threshold crossing is edge-triggered in BOTH domains through one
+/// [`EdgeLatch`] instance each: one `..._stalls_total` increment per
+/// stall episode, re-armed at resolution. A main-domain episode that
+/// starts and resolves between ticks still counts once at its settle;
+/// the thread-table capture fires only on LIVE rising edges (a settled
+/// episode has nothing live left to attribute). When the main runtime
+/// closes, the probe lane retires (typed [`ProbeRespawn`]) and the
+/// guard self-skew keeps serving.
 async fn sentinel(
     main: tokio::runtime::Handle,
     main_skew_us: Arc<AtomicU64>,
     guard_skew_us: Arc<AtomicU64>,
     main_stalls: Arc<AtomicU64>,
+    guard_stalls: Arc<AtomicU64>,
     interval: Duration,
     threshold: Duration,
 ) {
-    let mut outstanding: Option<(Instant, tokio::sync::oneshot::Receiver<Duration>)> = None;
-    let mut stalled = false;
+    let mut watch = MainDomainWatch::new(main_stalls, main_skew_us, threshold);
+    let mut guard_latch = EdgeLatch::new("guard", guard_stalls);
     loop {
         let expected = Instant::now() + interval;
         tokio::time::sleep(interval).await;
@@ -461,9 +480,10 @@ async fn sentinel(
         );
         metrics::gauge!("rio_controller_runtime_skew_seconds", "domain" => "guard")
             .set(guard_over.as_secs_f64());
-        if guard_over >= threshold {
-            metrics::counter!("rio_controller_runtime_skew_stalls_total", "domain" => "guard")
-                .increment(1);
+        // The SAME edge semantics as the main domain: one latch type,
+        // the increment is the rising edge (merged_bug_003 — this arm
+        // used to count every late tick).
+        if guard_latch.observe(guard_over >= threshold) {
             warn!(
                 skew_secs = guard_over.as_secs_f64(),
                 "guard-domain timer overshoot past threshold (guard itself starved \
@@ -471,65 +491,190 @@ async fn sentinel(
             );
         }
 
-        // Main-domain skew: settle or extend the outstanding probe.
-        let observed = match outstanding.take() {
-            None => None,
-            Some((sent, mut rx)) => match rx.try_recv() {
-                Ok(delay) => Some(delay),
-                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
-                    // Still unanswered: export the running lower bound
-                    // and keep waiting — never stack a second probe.
-                    let bound = sent.elapsed();
-                    main_skew_us.store(
-                        bound.as_micros().min(u128::from(u64::MAX)) as u64,
-                        Ordering::Relaxed,
-                    );
-                    metrics::gauge!("rio_controller_runtime_skew_seconds", "domain" => "main")
-                        .set(bound.as_secs_f64());
-                    if bound >= threshold && !stalled {
-                        stalled = true;
-                        main_stalls.fetch_add(1, Ordering::Relaxed);
-                        metrics::counter!(
-                            "rio_controller_runtime_skew_stalls_total",
-                            "domain" => "main"
-                        )
-                        .increment(1);
-                        warn!(
-                            skew_secs = bound.as_secs_f64(),
-                            threads = %capture_thread_table(),
-                            "main-runtime scheduling delay past threshold; thread \
-                             table captured (the 054 attribution record)"
-                        );
-                    }
-                    outstanding = Some((sent, rx));
-                    continue;
-                }
-                // Sender dropped without sending: the main runtime is
-                // shutting down — stop probing, keep serving health.
-                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                    continue;
-                }
-            },
+        // Main-domain skew: observe the outstanding probe, then
+        // launch per the typed respawn policy.
+        match watch.on_tick() {
+            MainTick::Quiet => {}
+            MainTick::Stall { bound } => warn!(
+                skew_secs = bound.as_secs_f64(),
+                threads = %capture_thread_table(),
+                "main-runtime scheduling delay past threshold; thread \
+                 table captured (the 054 attribution record)"
+            ),
+            MainTick::Retired => info!(
+                "main runtime closed; sentinel retires main-domain probing \
+                 (guard self-skew keeps serving)"
+            ),
+        }
+        if watch.wants_probe() {
+            // The closure body runs at first poll: `sent.elapsed()` AT
+            // THAT INSTANT is the scheduling delay.
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let sent = Instant::now();
+            main.spawn(async move {
+                let _ = tx.send(sent.elapsed());
+            });
+            watch.launched(sent, rx);
+        }
+    }
+}
+
+/// Edge-triggered stall accounting shared by BOTH skew domains. The
+/// episode counter mirror and the
+/// `rio_controller_runtime_skew_stalls_total` emission live INSIDE
+/// [`Self::observe`], so a counting arm without the latch is
+/// unrepresentable — one type, one HELP, one semantics
+/// (merged_bug_003).
+struct EdgeLatch {
+    domain: &'static str,
+    in_episode: bool,
+    episodes: Arc<AtomicU64>,
+}
+
+impl EdgeLatch {
+    fn new(domain: &'static str, episodes: Arc<AtomicU64>) -> Self {
+        Self {
+            domain,
+            in_episode: false,
+            episodes,
+        }
+    }
+
+    /// Feed one observation ("the domain is past threshold right
+    /// now"). Returns true exactly on the rising edge; the increment
+    /// IS the edge. Callers hang their edge actions (warn, thread
+    /// table) on the return value, never on private bookkeeping.
+    fn observe(&mut self, over_threshold: bool) -> bool {
+        let edge = over_threshold && !self.in_episode;
+        self.in_episode = over_threshold;
+        if edge {
+            self.episodes.fetch_add(1, Ordering::Relaxed);
+            metrics::counter!(
+                "rio_controller_runtime_skew_stalls_total",
+                "domain" => self.domain
+            )
+            .increment(1);
+        }
+        edge
+    }
+
+    /// Settle at an episode's RESOLUTION: `was_over` says whether the
+    /// resolved observation crossed the threshold. An episode that
+    /// started and resolved between observations (no live edge ever
+    /// seen) still counts exactly once; either way the latch re-arms
+    /// (merged_bug_003: the old Ok-arm only re-armed, so a
+    /// between-ticks episode was systematically uncounted whenever
+    /// stall_threshold < probe_interval).
+    fn settle(&mut self, was_over: bool) {
+        if was_over && !self.in_episode {
+            self.observe(true);
+        }
+        self.observe(false);
+    }
+}
+
+/// Typed respawn policy for the main-domain probe lane
+/// (merged_bug_003: the Closed arm used to fall through to the
+/// unconditional loop-bottom respawn, probing a shut-down runtime
+/// every other tick forever against its own "stop probing" comment).
+#[derive(Debug)]
+enum ProbeRespawn {
+    Continue,
+    Retired,
+}
+
+/// What a main-domain tick observed. The caller's edge actions hang
+/// off this; the watch owns ALL counting via its [`EdgeLatch`].
+enum MainTick {
+    /// Nothing actionable.
+    Quiet,
+    /// LIVE rising edge: the outstanding probe's running lower bound
+    /// crossed the threshold this tick — capture and warn now, while
+    /// there is something live to attribute.
+    Stall { bound: Duration },
+    /// The main runtime shut down (probe sender dropped): bookkeeping
+    /// settled, probe lane retired. Returned exactly once.
+    Retired,
+}
+
+/// The main-domain half of the sentinel, factored so its tick logic
+/// is unit-testable with scripted probes (the settle and retirement
+/// faces are deterministic here; the integration tests keep the
+/// wiring face).
+struct MainDomainWatch {
+    latch: EdgeLatch,
+    skew_us: Arc<AtomicU64>,
+    threshold: Duration,
+    outstanding: Option<(Instant, tokio::sync::oneshot::Receiver<Duration>)>,
+    respawn: ProbeRespawn,
+}
+
+impl MainDomainWatch {
+    fn new(episodes: Arc<AtomicU64>, skew_us: Arc<AtomicU64>, threshold: Duration) -> Self {
+        Self {
+            latch: EdgeLatch::new("main", episodes),
+            skew_us,
+            threshold,
+            outstanding: None,
+            respawn: ProbeRespawn::Continue,
+        }
+    }
+
+    fn export(&self, skew: Duration) {
+        self.skew_us.store(
+            skew.as_micros().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+        metrics::gauge!("rio_controller_runtime_skew_seconds", "domain" => "main")
+            .set(skew.as_secs_f64());
+    }
+
+    /// Observe the outstanding probe (if any). Never spawns — the
+    /// sentinel loop pairs this with [`Self::wants_probe`] /
+    /// [`Self::launched`].
+    fn on_tick(&mut self) -> MainTick {
+        let Some((sent, mut rx)) = self.outstanding.take() else {
+            return MainTick::Quiet;
         };
-        if let Some(delay) = observed {
-            main_skew_us.store(
-                delay.as_micros().min(u128::from(u64::MAX)) as u64,
-                Ordering::Relaxed,
-            );
-            metrics::gauge!("rio_controller_runtime_skew_seconds", "domain" => "main")
-                .set(delay.as_secs_f64());
-            if delay < threshold {
-                stalled = false;
+        match rx.try_recv() {
+            Ok(delay) => {
+                self.export(delay);
+                self.latch.settle(delay >= self.threshold);
+                MainTick::Quiet
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                // Still unanswered: export the running lower bound and
+                // keep waiting — never stack a second probe.
+                let bound = sent.elapsed();
+                self.export(bound);
+                let edge = self.latch.observe(bound >= self.threshold);
+                self.outstanding = Some((sent, rx));
+                if edge {
+                    MainTick::Stall { bound }
+                } else {
+                    MainTick::Quiet
+                }
+            }
+            // Sender dropped without sending: the main runtime is
+            // shutting down — settle the bookkeeping the old bare
+            // continue skipped, retire the probe lane (typed respawn
+            // policy), keep serving guard self-skew.
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                self.latch.settle(false);
+                self.respawn = ProbeRespawn::Retired;
+                MainTick::Retired
             }
         }
-        // Launch the next probe. The closure body runs at first poll:
-        // `sent.elapsed()` AT THAT INSTANT is the scheduling delay.
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let sent = Instant::now();
-        main.spawn(async move {
-            let _ = tx.send(sent.elapsed());
-        });
-        outstanding = Some((sent, rx));
+    }
+
+    /// Launch policy: at most one outstanding probe, none after
+    /// retirement.
+    fn wants_probe(&self) -> bool {
+        self.outstanding.is_none() && matches!(self.respawn, ProbeRespawn::Continue)
+    }
+
+    fn launched(&mut self, sent: Instant, rx: tokio::sync::oneshot::Receiver<Duration>) {
+        self.outstanding = Some((sent, rx));
     }
 }
 
@@ -590,5 +735,132 @@ mod tests {
             assert!(parts.next().is_some(), "comm: {row}");
             assert!(parts.next().is_some(), "state: {row}");
         }
+    }
+
+    /// W10-AT (primitive): ONE EdgeLatch semantics — observations
+    /// within an episode count once at the rising edge; resolution
+    /// re-arms.
+    #[test]
+    fn w10_at_edge_latch_counts_episodes_not_observations() {
+        let episodes = Arc::new(AtomicU64::new(0));
+        let mut latch = EdgeLatch::new("guard", episodes.clone());
+        assert!(latch.observe(true), "first over-threshold tick is the edge");
+        for _ in 0..4 {
+            assert!(!latch.observe(true), "same episode never re-counts");
+        }
+        assert_eq!(episodes.load(Ordering::Relaxed), 1);
+        latch.observe(false);
+        assert!(
+            latch.observe(true),
+            "a new episode after resolution is a new edge"
+        );
+        assert_eq!(episodes.load(Ordering::Relaxed), 2);
+    }
+
+    /// W10-AT (settle face): an episode that starts AND resolves
+    /// between ticks — the probe answered late before any live
+    /// observation — still counts exactly once (the Ok-settle arm used
+    /// to only re-arm; systematic undercount when stall_threshold <
+    /// probe_interval).
+    #[test]
+    fn w10_at_settled_between_ticks_episode_counts_once() {
+        let episodes = Arc::new(AtomicU64::new(0));
+        let mut watch = MainDomainWatch::new(
+            episodes.clone(),
+            Arc::new(AtomicU64::new(0)),
+            Duration::from_millis(50),
+        );
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        watch.launched(Instant::now(), rx);
+        tx.send(Duration::from_millis(300)).expect("receiver alive");
+        assert!(matches!(watch.on_tick(), MainTick::Quiet));
+        assert_eq!(
+            episodes.load(Ordering::Relaxed),
+            1,
+            "a between-ticks episode must count at its settle"
+        );
+        // And the latch re-armed: a following LIVE episode is a new edge.
+        let (_keep, rx2) = tokio::sync::oneshot::channel();
+        watch.launched(
+            Instant::now()
+                .checked_sub(Duration::from_millis(200))
+                .expect("backdate"),
+            rx2,
+        );
+        assert!(matches!(watch.on_tick(), MainTick::Stall { .. }));
+        assert_eq!(episodes.load(Ordering::Relaxed), 2);
+    }
+
+    /// W10-AT (live face): a live episode spanning many observations
+    /// counts once at its rising edge, and the capture action
+    /// (`MainTick::Stall`) fires exactly there.
+    #[test]
+    fn w10_at_live_episode_counts_once_and_captures_at_edge() {
+        let episodes = Arc::new(AtomicU64::new(0));
+        let mut watch = MainDomainWatch::new(
+            episodes.clone(),
+            Arc::new(AtomicU64::new(0)),
+            Duration::from_millis(50),
+        );
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        watch.launched(
+            Instant::now()
+                .checked_sub(Duration::from_millis(200))
+                .expect("backdate"),
+            rx,
+        );
+        assert!(
+            matches!(watch.on_tick(), MainTick::Stall { .. }),
+            "the rising edge carries the capture action"
+        );
+        assert!(
+            matches!(watch.on_tick(), MainTick::Quiet),
+            "the same live episode never re-captures or re-counts"
+        );
+        assert_eq!(episodes.load(Ordering::Relaxed), 1);
+        // The probe finally answers late: same episode, still one count.
+        tx.send(Duration::from_millis(400)).expect("receiver alive");
+        assert!(matches!(watch.on_tick(), MainTick::Quiet));
+        assert_eq!(
+            episodes.load(Ordering::Relaxed),
+            1,
+            "settling the episode a live edge already counted must not double-count"
+        );
+        // Re-armed after resolution: the next late settle is a new episode.
+        let (tx3, rx3) = tokio::sync::oneshot::channel();
+        watch.launched(Instant::now(), rx3);
+        tx3.send(Duration::from_millis(300))
+            .expect("receiver alive");
+        assert!(matches!(watch.on_tick(), MainTick::Quiet));
+        assert_eq!(episodes.load(Ordering::Relaxed), 2);
+    }
+
+    /// W10-AT (retirement face): the probe sender dropping — the main
+    /// runtime shut down — retires the lane: typed, reported once, no
+    /// respawn (the bare-continue form probed a dead runtime every
+    /// other tick forever).
+    #[test]
+    fn w10_at_closed_probe_retires_lane() {
+        let episodes = Arc::new(AtomicU64::new(0));
+        let mut watch = MainDomainWatch::new(
+            episodes.clone(),
+            Arc::new(AtomicU64::new(0)),
+            Duration::from_millis(50),
+        );
+        let (tx, rx) = tokio::sync::oneshot::channel::<Duration>();
+        drop(tx);
+        watch.launched(Instant::now(), rx);
+        assert!(
+            matches!(watch.on_tick(), MainTick::Retired),
+            "sender-dropped must retire the probe lane (typed)"
+        );
+        assert!(
+            !watch.wants_probe(),
+            "a retired lane never respawns against the dead runtime"
+        );
+        assert!(
+            matches!(watch.on_tick(), MainTick::Quiet),
+            "retirement reports exactly once"
+        );
     }
 }

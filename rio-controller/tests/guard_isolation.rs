@@ -272,3 +272,63 @@ fn w9_ak_stall_counter_and_capture_fire_past_threshold() {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+/// W10-AT (wiring face): one sustained guard-domain starvation episode
+/// counts ONCE — the same edge semantics as the main domain (one
+/// `EdgeLatch`, two instances; merged_bug_003's two-semantics
+/// divergence — guard counted LATE TICKS — was the red). Structural:
+/// the storm's end is joined, never timed.
+#[test]
+// r[verify sys.guard.skew-sentinel]
+fn w10_at_guard_domain_counts_episodes_not_late_ticks() {
+    let ready = Arc::new(AtomicBool::new(true));
+    let cfg = GuardConfig {
+        health_addr: free_local_addr(),
+        probe_interval: Duration::from_millis(50),
+        stall_threshold: Duration::from_millis(300),
+        ready_probe_budget: Duration::from_millis(200),
+    };
+    let (_main_rt, guard, _addr, _shutdown) = guard_on_stallable_main(cfg, ready);
+    assert_eq!(guard.guard_stalls(), 0, "no episodes on a healthy guard");
+
+    // ONE sustained partial-starvation episode on the GUARD runtime:
+    // blocking chunks with yields between. Every sentinel fire inside
+    // the storm is ~550ms late (>= the 300ms threshold) — the timer
+    // deadline always lands inside a 600ms block — so the storm is one
+    // continuous episode with no under-threshold fire until it ends.
+    let storm = guard.spawn_on_guard(async {
+        for _ in 0..3 {
+            std::thread::sleep(Duration::from_millis(600));
+            tokio::task::yield_now().await;
+        }
+    });
+
+    // The episode is counted (bounded event poll)...
+    let t0 = Instant::now();
+    while guard.guard_stalls() == 0 {
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "guard-domain episode never counted (guard_skew={:?})",
+            guard.guard_skew()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    // ...and counted ONCE for the whole storm: join the storm's end
+    // (event, not duration), let a few clean ticks settle the latch,
+    // then pin the count.
+    let t0 = Instant::now();
+    while !storm.is_finished() {
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "storm never finished"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    std::thread::sleep(Duration::from_millis(250));
+    assert_eq!(
+        guard.guard_stalls(),
+        1,
+        "one sustained starvation episode = one increment (per-late-tick \
+         counting is the merged_bug_003 anti-shape)"
+    );
+}
