@@ -63,18 +63,26 @@ pub(crate) fn header_lines(
         Some(hw) => format!("{system}/{hw}"),
         None => system.to_string(),
     };
-    let fmt_gib = |b: Option<u64>| {
-        b.map(|n| (n / (1 << 30)).to_string())
-            .unwrap_or_else(|| "?".into())
+    // live_058-d: value-preserving at the reader's granularity — a
+    // present non-zero assignment can never render "0 GiB" (the live
+    // incident's 45-69 MB raw-stamps read as "no memory assigned"
+    // during diagnosis; the header doc above forbids claiming a
+    // precision the banner doesn't have, and rounding sub-GiB to
+    // zero is the inverse violation). ≥1 GiB renders in GiB
+    // (unchanged); sub-GiB renders in MiB; absent stays "? GiB".
+    let fmt_size = |b: Option<u64>| match b {
+        None => "? GiB".to_string(),
+        Some(n) if n >= 1 << 30 => format!("{} GiB", n >> 30),
+        Some(n) => format!("{} MiB", n >> 20),
     };
     let cores_str = cores.map(|c| c.to_string()).unwrap_or_else(|| "?".into());
     let now = format_rfc3339_secs(std::time::SystemTime::now());
     vec![
         format!("rio: exec     {exec_id}").into_bytes(),
         format!(
-            "rio: builder  {builder} ({cores_str}c, {} GiB, {} GiB)",
-            fmt_gib(mem_bytes),
-            fmt_gib(disk_bytes),
+            "rio: builder  {builder} ({cores_str}c, {}, {})",
+            fmt_size(mem_bytes),
+            fmt_size(disk_bytes),
         )
         .into_bytes(),
         format!("rio: started  {now}").into_bytes(),
@@ -173,6 +181,59 @@ mod tests {
             str::from_utf8(&lines[2])
                 .unwrap()
                 .starts_with("rio: started  ")
+        );
+    }
+
+    /// W10-CL (live_058-d): the three-cell matrix — sub-GiB renders
+    /// value-preserving in MiB; >=1 GiB and absent are pinned
+    /// unchanged. During live_058 the wedged pods' banners read
+    /// "(2c, 0 GiB, ...)" for a 69 MiB assignment and the zero was
+    /// read live as "no memory assigned", costing diagnosis time;
+    /// the file's own header doc forbids claiming a precision it
+    /// doesn't have — rendering 69 MiB as 0 GiB is the inverse
+    /// violation.
+    #[test]
+    fn header_renders_sub_gib_sizes_in_mib() {
+        // Cell 1 (the live banner, verbatim shape): 69 MiB mem, 2c.
+        let lines = header_lines(
+            "01976e8b-live058",
+            "x86_64-linux",
+            None,
+            Some(2),
+            Some(69 << 20),
+            Some(25 << 30),
+        );
+        let builder_line = str::from_utf8(&lines[1]).unwrap();
+        assert!(
+            !builder_line.contains("0 GiB"),
+            "left: the live banner rendered '(2c, 0 GiB, …)' for a 69 MiB              assignment (integer division) / right: sub-GiB renders in              MiB: {builder_line}"
+        );
+        assert!(
+            builder_line.contains("(2c, 69 MiB, 25 GiB)"),
+            "sub-GiB must render value-preserving in MiB: {builder_line}"
+        );
+        // Cell 2: >=1 GiB pinned unchanged (covered in depth by
+        // header_renders_with_all_fields; re-pinned here so the
+        // matrix is one test).
+        let lines = header_lines(
+            "x",
+            "x86_64-linux",
+            None,
+            Some(16),
+            Some(32 << 30),
+            Some(100 << 30),
+        );
+        assert!(
+            str::from_utf8(&lines[1])
+                .unwrap()
+                .contains("(16c, 32 GiB, 100 GiB)")
+        );
+        // Cell 3: absent pinned unchanged ('? GiB').
+        let lines = header_lines("x", "x86_64-linux", None, None, None, None);
+        assert!(
+            str::from_utf8(&lines[1])
+                .unwrap()
+                .contains("(?c, ? GiB, ? GiB)")
         );
     }
 
