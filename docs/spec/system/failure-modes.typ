@@ -203,3 +203,39 @@ reads the stall while the sentinel's own skew stays O(ms). It is also
 the named prerequisite for sizing the controller FFD chunk quantum —
 the 054 freeze primitive (mass-blocking polls vs a shared sync
 primitive vs cgroup starvation) is unattributable without it.
+
+= Epilogue Doctrine
+
+A recurring failure class is the fact proven at ENTRY whose effect
+lands AFTER awaits, runtime drops, or abort sites: a shutdown epilogue
+aborted by its own host runtime, a leadership check stale by the time
+the durable write lands, an abort that destroys work a drain would
+have saved. The doctrine rules below give deposition, shutdown, and
+supersession TYPED drain and fence protocols — an entry check alone
+(or an entry check plus a second entry check) is never a conforming
+implementation of any of them.
+
+#r("sys.epilogue.drain")[
+  A runtime that hosts post-cancellation epilogue work MUST NOT key
+  its lifetime to the same cancellation token as its tasks. Spawning
+  an epilogue-bearing task MUST return a drain handle carrying the
+  epilogue's bounded budget, the host root MUST be the handle's only
+  drain site, and the root's shutdown path MUST traverse exactly the
+  states cancelled → draining (every adopted handle awaited, each
+  bounded by its own budget) → dropped — the runtime drops only after
+  the drain state completes, and a budget expiry abandons that one
+  epilogue (logged) without re-entering it.
+]
+
+The transition algebra is deliberately small: *running* →(token
+cancelled)→ *draining* →(all handles drained or expired)→ *dropped*,
+with no edge from draining back to running and no edge that skips
+draining. The controller guard is the founding instance: its lease
+loop owes a graceful-release `step_down()` PATCH after cancellation,
+and the discarded-handle form (bug_118) left the dead pod holding the
+nodeclaim-pool lease for the full steal threshold on every rollout —
+while every loop-level witness stayed green, because the release
+DECISION was proven one level below the hosting wiring that aborted
+its EXECUTION. The drain budget is derived where the epilogue lives
+(the lease crate exports it from its own renew constants), so host
+and epilogue cannot drift independently.

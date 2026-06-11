@@ -55,6 +55,30 @@
 //!    take bounded registry locks with no `.await` inside; a task
 //!    stalled MID-EMIT is the one disclosed residual, priced as
 //!    pathological (emit bodies are lock-short and allocation-free).
+//! 7. `epilogue_tx: mpsc::UnboundedSender<DrainHandle>` — adoption
+//!    sends take a short queue lock, never held across user code or
+//!    `.await`; the receiver lives on the guard root only.
+//!
+//! ## Task-lifetime census (the join-obligation axis; bug_118)
+//!
+//! Locks are not the only cross-domain obligation: a task hosted on
+//! the guard runtime either dies with the runtime BY DESIGN or owes a
+//! post-cancellation EPILOGUE the root must drain. Every guard-runtime
+//! spawn site carries its disposition, exhaustively (enforced by the
+//! W10-AU census in `tests/guard_epilogue.rs`, enumerated from the
+//! spawn sites themselves):
+//!
+//! - health server (`tokio::spawn` in the root): runtime-lifetime —
+//!   graceful-shutdown server, no epilogue.
+//! - skew sentinel (`tokio::spawn` in the root): runtime-lifetime —
+//!   pure measurement loop, no epilogue.
+//! - lease loop ([`GuardHandle::spawn_lease`]): EPILOGUE-BEARING — the
+//!   graceful-release `step_down()` PATCH runs after cancellation;
+//!   spawning returns a [`DrainHandle`] the root drains bounded
+//!   (`sys.epilogue.drain`).
+//! - [`GuardHandle::spawn_on_guard`] (test/diagnostic seam): the
+//!   caller owns the returned `JoinHandle`; production callsites must
+//!   declare a `drain-census:` disposition.
 //!
 //! The lease loop's kube client is NOT shared: `run_lease_loop`
 //! constructs its own client, so apiserver I/O for renewal never rides
@@ -109,14 +133,58 @@ impl Default for GuardConfig {
 }
 
 /// Lock-free cross-domain view of the guard. Cheap to clone; every
-/// field is an `Arc<Atomic*>` or a runtime handle (see the module-doc
-/// census).
+/// field is an `Arc<Atomic*>`, a runtime handle, or a lock-free
+/// channel sender (see the module-doc census).
 #[derive(Clone)]
 pub struct GuardHandle {
     main_skew_us: Arc<AtomicU64>,
     guard_skew_us: Arc<AtomicU64>,
     main_stalls: Arc<AtomicU64>,
     guard_rt: tokio::runtime::Handle,
+    epilogue_tx: tokio::sync::mpsc::UnboundedSender<DrainHandle>,
+}
+
+/// A guard-runtime task that owes a post-cancellation EPILOGUE (the
+/// lease loop's graceful-release `step_down()` PATCH). The R24
+/// construction type for the drain law (`sys.epilogue.drain`): spawning
+/// an epilogue-bearing task RETURNS this handle, and the guard root is
+/// the only drain site — the caller's sole discharge is
+/// [`GuardHandle::adopt_epilogue`], which hands the handle to the root;
+/// on cancellation the root awaits it BOUNDED (the budget the epilogue
+/// crate derives) before the runtime drops. A discarded handle is a
+/// compile-line error under `--deny warnings` and a census red
+/// (W10-AU).
+#[must_use = "the guard root must drain this epilogue before the runtime drops: \
+              pass it to GuardHandle::adopt_epilogue"]
+pub struct DrainHandle {
+    /// Task name for the drain-timeout log line.
+    name: &'static str,
+    /// The epilogue-bearing task.
+    task: tokio::task::JoinHandle<()>,
+    /// Bounded drain window: how long the root keeps the runtime alive
+    /// after cancellation for THIS epilogue to land.
+    budget: Duration,
+}
+
+impl DrainHandle {
+    /// Await the epilogue bounded. Private BY DESIGN: the guard root's
+    /// shutdown path is the only drop site (`sys.epilogue.drain`).
+    async fn drain(self) {
+        // On expiry the epilogue is abandoned (logged) and the runtime
+        // drop proceeds — the lease steal threshold is the fallback.
+        // timeout-census: delay — shutdown delayed ≤ budget while the
+        // epilogue lands. census[gen: rio-controller/tests/timeout_census.txt]
+        match tokio::time::timeout(self.budget, self.task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!(task = self.name, error = %e, "guard epilogue task panicked"),
+            Err(_) => warn!(
+                task = self.name,
+                budget_secs = self.budget.as_secs_f64(),
+                "guard epilogue did not land within its drain budget; proceeding with \
+                 runtime drop (the steal threshold is the fallback)"
+            ),
+        }
+    }
 }
 
 impl GuardHandle {
@@ -150,15 +218,68 @@ impl GuardHandle {
     /// survives admitted-load starvation instead of being violated
     /// 2.5–3× (the 054 measurement). `run_lease_loop` builds its own
     /// kube client on THIS runtime — no main-domain pool sharing.
+    /// Returns the lease loop's [`DrainHandle`] — the epilogue
+    /// obligation (`sys.epilogue.drain`): the loop owes a
+    /// post-cancellation graceful-release PATCH, so the caller MUST
+    /// hand the handle to the guard root via
+    /// [`Self::adopt_epilogue`]; the root drains it bounded
+    /// ([`rio_lease::SHUTDOWN_EPILOGUE_BUDGET`]) before the runtime
+    /// drops.
+    // r[impl sys.epilogue.drain]
     pub fn spawn_lease<H: rio_lease::LeaseHooks>(
         &self,
         cfg: rio_lease::LeaseConfig,
         state: rio_lease::LeaderState,
         hooks: H,
         shutdown: rio_common::signal::Token,
-    ) {
-        self.guard_rt
-            .spawn(rio_lease::run_lease_loop(cfg, state, hooks, shutdown));
+    ) -> DrainHandle {
+        DrainHandle {
+            name: "lease-loop",
+            task: self
+                .guard_rt
+                .spawn(rio_lease::run_lease_loop(cfg, state, hooks, shutdown)),
+            budget: rio_lease::SHUTDOWN_EPILOGUE_BUDGET,
+        }
+    }
+
+    /// The injected-client form of [`Self::spawn_lease`]: the SAME
+    /// hosting wiring (and the same [`DrainHandle`] obligation) with
+    /// the kube client supplied by the caller — the harness seam for
+    /// driving the production lease loop against an in-process mock
+    /// apiserver (the guard drain-protocol test is the consumer).
+    /// Production wiring uses [`Self::spawn_lease`].
+    pub fn spawn_lease_with_client<H: rio_lease::LeaseHooks>(
+        &self,
+        client: kube::Client,
+        cfg: rio_lease::LeaseConfig,
+        state: rio_lease::LeaderState,
+        hooks: H,
+        shutdown: rio_common::signal::Token,
+    ) -> DrainHandle {
+        DrainHandle {
+            name: "lease-loop",
+            task: self.guard_rt.spawn(rio_lease::run_lease_loop_with(
+                client, cfg, state, hooks, shutdown,
+            )),
+            budget: rio_lease::SHUTDOWN_EPILOGUE_BUDGET,
+        }
+    }
+
+    /// Hand an epilogue-bearing task's [`DrainHandle`] to the guard
+    /// root — the ONLY discharge for the handle. The root drains every
+    /// adopted handle bounded after cancellation, BEFORE the guard
+    /// runtime drops (`sys.epilogue.drain`). If the root has already
+    /// exited (shutdown raced the spawn), the obligation is
+    /// undischargeable: log it — the lease steal threshold is the
+    /// designed fallback.
+    pub fn adopt_epilogue(&self, handle: DrainHandle) {
+        if let Err(e) = self.epilogue_tx.send(handle) {
+            warn!(
+                task = e.0.name,
+                "guard root already exited; epilogue cannot be drained \
+                 (the steal threshold is the fallback)"
+            );
+        }
     }
 
     /// Test/diagnostic seam: spawn an arbitrary task onto the guard
@@ -169,6 +290,8 @@ impl GuardHandle {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
+        // drain-census: caller-joined — the JoinHandle is returned;
+        // the caller owns the task's lifetime (test/diagnostic seam).
         self.guard_rt.spawn(fut)
     }
 }
@@ -199,11 +322,13 @@ pub fn spawn(
         .thread_name("rio-guard")
         .build()
         .expect("guard runtime build cannot fail with enable_all on a fresh builder");
+    let (epilogue_tx, mut epilogue_rx) = tokio::sync::mpsc::unbounded_channel::<DrainHandle>();
     let handle = GuardHandle {
         main_skew_us: Arc::new(AtomicU64::new(0)),
         guard_skew_us: Arc::new(AtomicU64::new(0)),
         main_stalls: Arc::new(AtomicU64::new(0)),
         guard_rt: rt.handle().clone(),
+        epilogue_tx,
     };
     let h = handle.clone();
     let thread_shutdown = shutdown.clone();
@@ -223,6 +348,9 @@ pub fn spawn(
                     });
                 let serve_shutdown = thread_shutdown.clone();
                 let health_addr = cfg.health_addr;
+                // drain-census: runtime-lifetime — graceful-shutdown
+                // server, no post-cancellation epilogue; dies with the
+                // runtime BY DESIGN.
                 tokio::spawn(async move {
                     info!(addr = %health_addr, "guard: starting health server");
                     match tokio::net::TcpListener::bind(health_addr).await {
@@ -241,6 +369,9 @@ pub fn spawn(
                         }
                     }
                 });
+                // drain-census: runtime-lifetime — pure measurement
+                // loop, no post-cancellation epilogue; dies with the
+                // runtime BY DESIGN.
                 tokio::spawn(sentinel(
                     main,
                     h.main_skew_us.clone(),
@@ -250,6 +381,21 @@ pub fn spawn(
                     cfg.stall_threshold,
                 ));
                 thread_shutdown.cancelled().await;
+                // sys.epilogue.drain — the root's shutdown path, the
+                // protocol's drain state: this runtime HOSTS epilogue
+                // work (the lease loop's graceful-release PATCH), so
+                // its lifetime must not be the bare cancellation token
+                // its tasks key on. On cancellation the root drains
+                // every adopted epilogue BOUNDED (each handle carries
+                // its own budget), THEN returns — the runtime (and its
+                // in-flight epilogues) drops only after. bug_118: the
+                // discarded-handle form aborted the step_down PATCH
+                // and left the dead pod holding the lease the full
+                // ~19s STEAL_AFTER.
+                epilogue_rx.close();
+                while let Some(epilogue) = epilogue_rx.recv().await {
+                    epilogue.drain().await;
+                }
             });
         })
         .expect("spawning the rio-guard thread cannot fail at boot");

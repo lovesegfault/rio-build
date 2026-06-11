@@ -140,6 +140,27 @@ pub const RENEW_INTERVAL: Duration = Duration::from_secs(5);
 /// while still giving 2 attempts before SELF_FENCE_AFTER.
 const RENEW_SLOP: Duration = Duration::from_secs(2);
 
+/// The shutdown-release epilogue budget a HOST runtime must grant the
+/// lease loop after cancellation, so the graceful-release `step_down()`
+/// PATCH (the loop's post-cancellation epilogue) can EXECUTE before the
+/// hosting runtime drops its tasks (`sys.epilogue.drain` — the bound
+/// rio-controller's guard root drains [`run_lease_loop`] under).
+///
+/// Derived, not invented (R17, time axis): the epilogue's own internal
+/// attempt deadline (`RENEW_INTERVAL − RENEW_SLOP`, the `step_down`
+/// timeout at the loop tail) + 1s of loop-exit/scheduling slack. The
+/// other envelope axes are structurally bounded: cost = one apiserver
+/// GET+PUT round trip; population = one lease loop per host runtime.
+/// Violable and testable — the compile assert below pins the strict
+/// cover, and the guard drain test (W10-AS) exercises the budget
+/// end-to-end.
+pub const SHUTDOWN_EPILOGUE_BUDGET: Duration =
+    Duration::from_secs(RENEW_INTERVAL.as_secs() - RENEW_SLOP.as_secs() + 1);
+const _: () = assert!(
+    SHUTDOWN_EPILOGUE_BUDGET.as_millis() > RENEW_INTERVAL.as_millis() - RENEW_SLOP.as_millis(),
+    "the host-side drain budget must strictly cover the epilogue's own step_down deadline"
+);
+
 /// Per-phase budget for the split renew round-trip
 /// (`sched.lease.cancelled-write`): the 3s belt
 /// (`RENEW_INTERVAL − RENEW_SLOP`) tiled into a read phase and a write
@@ -1103,6 +1124,32 @@ pub async fn run_lease_loop<H: LeaseHooks>(
         }
     };
 
+    run_lease_loop_with_client(
+        client,
+        cfg,
+        state,
+        hooks,
+        shutdown,
+        clock::suspend_aware_now,
+    )
+    .await;
+}
+
+/// The injected-client form of [`run_lease_loop`]: the SAME loop body
+/// and shutdown epilogue, with the kube client supplied by the caller
+/// instead of in-cluster discovery. The harness seam for hosting the
+/// production loop against an in-process mock apiserver
+/// (`rio_test_support::kube_mock`) — rio-controller's guard
+/// drain-protocol test (W10-AS) is the consumer. Production wiring
+/// uses [`run_lease_loop`]; everything else (fence clock included) is
+/// identical.
+pub async fn run_lease_loop_with<H: LeaseHooks>(
+    client: kube::Client,
+    cfg: LeaseConfig,
+    state: LeaderState,
+    hooks: H,
+    shutdown: rio_common::signal::Token,
+) {
     run_lease_loop_with_client(
         client,
         cfg,

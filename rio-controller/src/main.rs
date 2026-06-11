@@ -380,8 +380,17 @@ async fn main() -> anyhow::Result<()> {
             // main-domain stalls, so the lease's fence-check premise
             // survives admitted-load starvation (the 054 violation was
             // 2.5-3x). The loop builds its own kube client on the
-            // guard runtime — no main-domain pool sharing.
-            guard.spawn_lease(lease_cfg, leader.clone(), hooks.clone(), shutdown.clone());
+            // guard runtime — no main-domain pool sharing. The loop
+            // owes a shutdown epilogue (the graceful-release PATCH):
+            // its DrainHandle is adopted into the guard root, which
+            // drains it bounded before the runtime drops
+            // (sys.epilogue.drain; bug_118).
+            guard.adopt_epilogue(guard.spawn_lease(
+                lease_cfg,
+                leader.clone(),
+                hooks.clone(),
+                shutdown.clone(),
+            ));
         }
 
         // `connect_pg` wraps `connect_forever` (returns `None` only on
