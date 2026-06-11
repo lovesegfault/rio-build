@@ -263,12 +263,19 @@ pub fn describe_metrics() {
         "rio_controller_nodeclaim_reaped_total",
         "nodeclaim_pool NodeClaim deletions by `reason` × `cell`. \
          reason=idle: NA-consolidate break-even; reason=ice: \
-         Launched=False (timeout or terminal LaunchFailed reason); \
-         reason=boot-timeout: Launched=True ∧ Registered=False past \
-         timeout; reason=dead: hung node — the controller-side OA2 \
-         per-node deadline-expiry clustering over the open-attempt \
-         view; \
-         reason=vanished: in-flight claim Karpenter-GC'd between ticks."
+         Launched=False (timeout or terminal LaunchFailed reason; \
+         incl. this controller's own ICE delete confirmed one tick \
+         late after an ambiguous delete error); \
+         reason=boot-timeout: Launched=True ∧ Registered=False — the \
+         controller's timeout reap, an external teardown before \
+         registration (e.g. Karpenter registration TTL), or the \
+         controller's own boot-timeout delete confirmed late \
+         (capacity existed; never ICE-masks); reason=dead: hung node \
+         — the controller-side OA2 per-node deadline-expiry \
+         clustering over the open-attempt view; \
+         reason=vanished: in-flight claim Karpenter-GC'd or torn down \
+         between ticks WITHOUT launch evidence and WITHOUT this \
+         controller's own delete provenance (counts as ICE evidence)."
     );
     describe_counter!(
         "rio_controller_node_wedge_marked_total",

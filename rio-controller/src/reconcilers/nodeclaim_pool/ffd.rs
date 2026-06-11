@@ -165,6 +165,25 @@ impl LiveNode {
             .map(|c| c.reason.as_str())
     }
 
+    /// The `Launched` condition projected to the boot/capacity axis:
+    /// `Some(true)` ⇔ `Launched=True` (capacity provably materialized
+    /// — an instance came up), `Some(false)` ⇔ `Launched=False`,
+    /// `None` ⇔ condition absent or `Unknown` (Karpenter has not
+    /// adjudicated the launch — the same capacity-unproven posture as
+    /// `False`; `health::classify`'s timeout arms make the identical
+    /// call). `health::classify_vanish` keys its boot-vs-capacity
+    /// teardown split on this bit (bug_094's Launched axis).
+    /// (Plain-code references: `health` is module-private — a pub-doc
+    /// link would break the doc build without
+    /// `--document-private-items`.)
+    pub fn launched(&self) -> Option<bool> {
+        match self.cond("Launched")? {
+            ("True", _) => Some(true),
+            ("False", _) => Some(false),
+            _ => None,
+        }
+    }
+
     /// Seconds since `metadata.creationTimestamp`. `None` if creation
     /// time is absent (apiserver hasn't round-tripped yet).
     pub fn age_secs(&self, now_secs: f64) -> Option<f64> {
@@ -835,7 +854,8 @@ pub fn cells_of_checked(i: &SpawnIntent) -> CellsDecode {
     CellsDecode { cells, refused }
 }
 
-/// The lossy view of [`cells_of_checked`] — kept for consumers whose
+/// The lossy view of `cells_of_checked` (private — plain-code
+/// reference keeps the pub doc link-clean) — kept for consumers whose
 /// disposition is NOT minted at the cover chokepoint (the FFD sim
 /// places conservatively against whatever decoded; the typed refusal
 /// letter is minted once, at `assign_to_cells`).

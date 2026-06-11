@@ -147,6 +147,30 @@ fn nc_json_terminating(name: &str, created: u64) -> Value {
     v
 }
 
+/// NEVER-Registered NodeClaim with `Launched=True` — capacity
+/// materialized but the kubelet never registered. Past the ice
+/// timeout, [`health::classify`] reaps it as `BootTimeout` (no ICE
+/// mask — the pinned `record_reap` posture).
+fn nc_json_boot_stuck(name: &str, created: u64) -> Value {
+    let mut v = nc_json(name, created, None);
+    v["status"]["conditions"] = json!([{
+        "type": "Launched", "status": "True",
+        "lastTransitionTime": rfc3339(created + 1),
+        "reason": "", "message": "",
+    }]);
+    v
+}
+
+/// [`nc_json_boot_stuck`] observed mid-teardown (`deletionTimestamp`
+/// set, finalizer pending) — the W9-BB ambiguous-commit window: the
+/// controller's earlier DELETE errored but committed server-side.
+fn nc_json_boot_stuck_terminating(name: &str, created: u64) -> Value {
+    let mut v = nc_json_boot_stuck(name, created);
+    v["metadata"]["deletionTimestamp"] = json!(rfc3339(created + 250));
+    v["metadata"]["finalizers"] = json!(["karpenter.sh/termination"]);
+    v
+}
+
 /// In-flight NodeClaim carrying `Launched=False reason=LaunchFailed` —
 /// [`health::classify`] short-circuits this to an ICE reap with no age
 /// gate (the deterministic reap shape).
@@ -335,6 +359,10 @@ impl Lab {
             prev_extra_cells: HashSet::new(),
             prev_unplaced_extras: HashSet::new(),
             inflight_created: HashMap::new(),
+            // Polarity: SUPPRESS — cleared on the acquisition edge
+            // beside `inflight_created` (bug_094; see the per-field
+            // table at the acquire match).
+            delete_tombstones: health::DeleteTombstones::default(),
             consecutive_bot_ticks: 0,
             pending_evidence: Default::default(),
             edge_seen_epoch: 0,
@@ -641,7 +669,7 @@ async fn reload_ok_preserves_evidence_buffered_during_err_window() {
 /// healthy cell; `right:` the buffer holds only the newest polarity,
 /// so the Ack ships the clear alone.
 // r[verify ctrl.nodeclaim.evidence-ack-latch+3]
-// r[verify ctrl.nodeclaim.ice-mark-clear+3]
+// r[verify ctrl.nodeclaim.ice-mark-clear+4]
 #[tokio::test]
 async fn newer_registration_supersedes_buffered_mark_end_to_end() {
     let mut lab = Lab::new().await;
@@ -701,7 +729,7 @@ async fn newer_registration_supersedes_buffered_mark_end_to_end() {
 /// scheduler's fixed clears-then-marks order + epoch gate realize
 /// reset-then-step-0`.
 // r[verify ctrl.nodeclaim.evidence-ack-latch+3]
-// r[verify ctrl.nodeclaim.ice-mark-clear+3]
+// r[verify ctrl.nodeclaim.ice-mark-clear+4]
 #[tokio::test]
 async fn clear_then_mark_ships_both_planes_with_ordered_epochs() {
     let mut lab = Lab::new().await;
@@ -752,7 +780,7 @@ async fn clear_then_mark_ships_both_planes_with_ordered_epochs() {
 /// R2 recency gate: a stale (>3×TICK) Registered edge after the
 /// acquire clear is recorded WITHOUT a sample and WITHOUT an ICE-clear
 /// on the wire (noMassClearAfterFailover / m34CalibNoRecencyGate).
-// r[verify ctrl.nodeclaim.ice-mark-clear+3]
+// r[verify ctrl.nodeclaim.ice-mark-clear+4]
 #[tokio::test]
 async fn post_acquire_stale_registration_records_without_clear_or_sample() {
     let mut lab = Lab::new().await;
@@ -864,6 +892,78 @@ async fn vanish_is_marked_own_reap_is_not() {
         acks.iter()
             .any(|a| carries(&a.unfulfillable_cells, &cell_gone)),
         "vanish marked its cell on the wire; acks: {acks:?}"
+    );
+}
+
+/// W9-BB (bug_094, the provenance half): an ambiguous-commit delete —
+/// the controller's own `BootTimeout` reap whose DELETE RPC errs but
+/// commits server-side — must classify next tick as THIS controller's
+/// reap (no ICE evidence on the wire), never as Karpenter teardown.
+/// The mask it must not mint is exactly the one the pinned
+/// `record_reap` test forbids for `BootTimeout`. Pre-fix red
+/// (verbatim): `an ambiguous-commit BootTimeout delete must never
+/// ICE-mask (...): [.., AckSpawnedIntentsRequest { ..,
+/// unfulfillable_cells: ["mid-ebs-x86:spot@1781162843070"], .. }]` —
+/// tick 2 shipped the false mask through the vanish fold.
+// r[verify ctrl.nodeclaim.ice-mark-clear+4]
+#[tokio::test]
+async fn ambiguous_commit_delete_classifies_as_self_reap_not_ice() {
+    let mut lab = Lab::new().await;
+    lab.r.inflight_created.insert("c-bt".into(), cell());
+
+    // Tick 1: c-bt is boot-stuck (Launched=True, never Registered,
+    // age 200s > the 60s default timeout) → BootTimeout reap; the
+    // DELETE errs 503 AFTER the apiserver committed it.
+    lab.tick(
+        200,
+        full_tick_scenario(
+            vec![],
+            vec![nc_json_boot_stuck("c-bt", 0)],
+            vec![Scenario::k8s_error(
+                Method::DELETE,
+                "/apis/karpenter.sh/v1/nodeclaims/c-bt",
+                503,
+                "ServiceUnavailable",
+                "etcd leader changed",
+            )],
+        ),
+    )
+    .await;
+    // The Err arm tombstones the attempt; the claim stays tracked
+    // (present, not yet terminating in this tick's view).
+    assert!(lab.r.inflight_created.contains_key("c-bt"));
+    assert!(
+        lab.r.delete_tombstones.contains("c-bt"),
+        "the ambiguous attempt's provenance survives the tick"
+    );
+
+    // Tick 2: the commit materialized — the claim is observed
+    // terminating (never Registered). classify skips terminating
+    // claims, so only the vanish fold adjudicates this observation.
+    lab.tick(
+        210,
+        full_tick_scenario(
+            vec![],
+            vec![nc_json_boot_stuck_terminating("c-bt", 0)],
+            vec![],
+        ),
+    )
+    .await;
+
+    let acks = lab.ack_calls();
+    assert!(
+        acks.iter().all(|a| a.unfulfillable_cells.is_empty()),
+        "an ambiguous-commit BootTimeout delete must never ICE-mask \
+         (the teardown is this controller's own reap, not Karpenter \
+         capacity evidence): {acks:?}"
+    );
+    assert!(
+        lab.r.inflight_created.is_empty(),
+        "the confirmed exit leaves tracking"
+    );
+    assert!(
+        lab.r.delete_tombstones.is_empty(),
+        "the confirmed exit consumed the tombstone"
     );
 }
 
@@ -1661,7 +1761,7 @@ async fn no_hosting_class_drop_answers_a_typed_verdict() {
     );
 }
 
-// r[verify ctrl.nodeclaim.ice-mark-clear+3]
+// r[verify ctrl.nodeclaim.ice-mark-clear+4]
 /// live_050(b) red R4-A / W7-D leg A — certifies: *never-registered-
 /// terminating transit through the production retain + reconcile ships
 /// the mark AT THE WIRE ARTIFACT* — `AckSpawnedIntentsRequest.

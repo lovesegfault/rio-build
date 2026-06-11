@@ -1666,7 +1666,7 @@ its clock passes the prior leader's last mint — symmetric in kind and
 magnitude with the scheduler-side handoff posture (in-memory ladder +
 gate state, lease-holder only).
 
-#r("ctrl.nodeclaim.ice-mark-clear+3")[
+#r("ctrl.nodeclaim.ice-mark-clear+4")[
   ICE mark and clear signals sent via `AckSpawnedIntents` MUST be sound:
   `unfulfillable_cells` (marks) are deduplicated to at most one entry per
   cell per tick (the scheduler's backoff ladder climbs once per DISTINCT
@@ -1678,13 +1678,32 @@ gate state, lease-holder only).
   #rref("ctrl.nodeclaim.evidence-ack-latch") --- any other both-planes
   shape is forbidden), and a mark is emitted only for a
   cell whose claim launch-failed, timed out unregistered, or vanished to
-  Karpenter GC --- never for a claim this controller itself reaped
+  Karpenter GC --- never for a claim this controller itself reaped,
+  whether the delete completed OR returned an ambiguous non-404 error
+  that later proves committed: an errored delete's provenance MUST
+  survive across ticks (the delete-attempted tombstone, expiring after
+  a bounded number of ticks) so the claim's subsequent
+  terminating/absent observation classifies as this controller's own
+  reap and applies the ORIGINAL classification's consequence --- mask
+  iff that classification was ICE, counter under the original reason
+  --- never vanish-attributed evidence
   (#rref("ctrl.nodeclaim.inflight-conservation")). A never-Registered
   NodeClaim observed terminating or absent MUST produce the same
-  unfulfillable evidence as a timed-out launch (the closed `VanishClass`
-  exit alphabet: only a REGISTERED claim's teardown is deliberate ---
+  unfulfillable evidence as a timed-out launch EXACTLY WHEN its launch
+  had not provably succeeded and the teardown is not this controller's
+  own (the closed `VanishClass` exit alphabet over presence,
+  registration, termination, the `Launched` condition, and delete
+  provenance: only a REGISTERED claim's teardown is deliberate ---
   live_050(b): the conflated arm starved the scheduler's IceBackoff
-  failover, vanished=101/ice=0, zero od claims); the failover TIME axis
+  failover, vanished=101/ice=0, zero od claims); a `Launched=True`
+  never-Registered teardown is a BOOT failure (capacity provably
+  materialized --- e.g. Karpenter's registration TTL firing before the
+  controller's `ice_timeout` on slow cells) and MUST NOT mask --- it
+  counts `boot-timeout`, the vanish-path mirror of the `BootTimeout`
+  reap's non-mask posture; an absent-without-terminating-observation
+  exit stays capacity-side by construction (the ~1s GC that evades the
+  terminating window is the launch-failure path; a launched claim's
+  teardown rides a multi-tick finalizer). The failover TIME axis
   is the existing IceBackoff ladder (60s -> 120s -> ... <= max-lead-time,
   scheduler-side) and vanish-detection latency is one tick by
   construction (tick-over-tick absence). `registered_cells`

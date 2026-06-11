@@ -184,6 +184,10 @@ pub fn classify(
 /// ICE detection for claims Karpenter GC'd between ticks. `inflight`
 /// holds `(name, cell)` for everything `cover_deficit` created and
 /// hasn't yet observed Registered, terminating, or absent.
+/// `tombstones` carries the delete-provenance axis (bug_094): names
+/// whose delete THIS controller already attempted with an ambiguous
+/// error — consulted so a committed-but-errored delete classifies as
+/// our own reap, and consumed on every exit.
 ///
 /// Drop rules (all `→ false` removes the entry; the closed
 /// [`VanishClass`] alphabet is the classification law):
@@ -194,17 +198,42 @@ pub fn classify(
 ///   rationale is REGISTERED-ONLY — the pre-fix arm applied it to
 ///   never-Registered claims too, silently eating launch-failure
 ///   teardowns.
-/// - **LaunchFailureTeardown** (NEVER-Registered ∧ terminating):
-///   Karpenter terminal launch failure → deletionTimestamp → finalize,
-///   observed mid-GC-transit (the window straddles a 10s tick whenever
+/// - **SelfReap** (tombstoned ∧ (terminating ∨ absent)): the
+///   ambiguous-commit delete CONFIRMED — the teardown is this
+///   controller's own reap arriving one tick late, never Karpenter
+///   evidence. The exit applies the ORIGINAL classification's
+///   consequence (`record_reap` parity: counter under the original
+///   reason; ICE-mask iff the reason was `Ice`) so deferred
+///   confirmation loses no evidence and mints no false ICE (bug_094:
+///   pre-fix this row classified `LaunchFailureTeardown`/`GcVanish` —
+///   the exact mask the `record_reap` pin forbids for `BootTimeout`).
+/// - **BootFailureTeardown** (NEVER-Registered ∧ terminating ∧
+///   `Launched=True`, no tombstone): an EXTERNAL teardown of a claim
+///   whose capacity provably materialized — Karpenter's registration
+///   TTL fires before our `ice_timeout` on slow cells (15min TTL <
+///   2×seed ≈ 20min metal). Boot failure, not capacity failure:
+///   counted `reason=boot-timeout` (feeding the boot-failure alert),
+///   NO ICE mask — the vanish-path mirror of `classify`'s
+///   `BootTimeout` posture.
+/// - **LaunchFailureTeardown** (NEVER-Registered ∧ terminating ∧
+///   `Launched` ∈ {False, absent/Unknown}, no tombstone): Karpenter
+///   terminal launch failure → deletionTimestamp → finalize, observed
+///   mid-GC-transit (the window straddles a 10s tick whenever
 ///   finalization outlasts the tick boundary). Launch-failure
 ///   teardown, NOT deliberate consolidation: produces the SAME
 ///   unfulfillable evidence as a vanish — ICE-mask +
 ///   `reaped_total{reason=vanished}`.
-/// - **GcVanish** (absent from `live`): vanished without ever
-///   Registering. Karpenter GC'd it (the controller's own reaps are
-///   removed from `inflight` by the caller before this runs) ⇒ the
-///   cell is unfulfillable. ICE-mask + `reaped_total{reason=vanished}`.
+/// - **GcVanish** (absent from `live`, no tombstone): vanished without
+///   ever Registering. Karpenter GC'd it (the controller's own
+///   COMPLETED reaps are removed from `inflight` by the caller before
+///   this runs; its AMBIGUOUS ones carry tombstones) ⇒ the cell is
+///   unfulfillable. ICE-mask + `reaped_total{reason=vanished}`. The
+///   `Launched` axis is unreadable here (the object is gone) — absent
+///   stays capacity-side by construction: the fast (~1s) GC that
+///   evades the terminating observation is exactly the
+///   `Launched=False LaunchFailed` path, while a `Launched=True`
+///   teardown rides a ~60–90s finalizer and is observed terminating
+///   across multiple 10s ticks (the BootFailureTeardown row).
 /// - **In-flight (present, not Registered, not terminating)**: KEEP.
 ///   r40 bug_020: dropping on first sighting let a claim observed at
 ///   age ~10s and GC'd at ~13–16s escape every detection path —
@@ -246,23 +275,64 @@ pub fn classify(
 /// (`now - created_at > 2×ice_timeout`; needs an insertion timestamp in
 /// the map value) AND a `rio_controller_nodeclaim_inflight_tracked`
 /// gauge in `emit_live_gauges` so the leak is observable.
-pub fn detect_vanished(inflight: &mut HashMap<String, Cell>, live: &[LiveNode]) -> Vec<Cell> {
+pub fn detect_vanished(
+    inflight: &mut HashMap<String, Cell>,
+    tombstones: &mut DeleteTombstones,
+    live: &[LiveNode],
+) -> Vec<Cell> {
     let live_by_name: HashMap<&str, &LiveNode> =
         live.iter().map(|n| (n.name.as_str(), n)).collect();
     let mut ice = Vec::new();
     inflight.retain(|name, cell| {
-        let Some(class) = classify_vanish(live_by_name.get(name.as_str()).copied()) else {
+        let observed = live_by_name.get(name.as_str()).copied();
+        let Some(class) = classify_vanish(observed, tombstones.reason(name)) else {
             // Still in-flight: KEEP. classify's reason short-circuit
             // and ice_timeout don't cover the GC'd-between-
-            // observations window for slow-ICE cells.
+            // observations window for slow-ICE cells. A tombstone (if
+            // any) stays armed — the apiserver view may be one LIST
+            // behind the committed delete; expiry bounds it.
             return true;
         };
         // Total fold over the exit alphabet (zero wildcard arms):
-        // every exit either hands off quietly or produces the
-        // unfulfillable evidence — never a silent launch-failure exit.
-        // r[impl ctrl.nodeclaim.ice-mark-clear+3]
+        // every exit either hands off quietly or produces its
+        // classification's OWN evidence — never a silent
+        // launch-failure exit, never Karpenter-attributed evidence
+        // for this controller's own delete.
+        // r[impl ctrl.nodeclaim.ice-mark-clear+4]
         match class {
             VanishClass::RegisteredHandoff | VanishClass::DeliberateTeardown => {}
+            VanishClass::SelfReap(reason) => {
+                debug!(
+                    %name, %cell, reason = reason.as_str(),
+                    "tracked NodeClaim exited via this controller's own earlier \
+                     delete (ambiguous commit confirmed); applying the original \
+                     reap consequence"
+                );
+                metrics::counter!(
+                    "rio_controller_nodeclaim_reaped_total",
+                    "reason" => reason.as_str(),
+                    "cell" => cell.to_string(),
+                )
+                .increment(1);
+                if reason == ReapReason::Ice {
+                    ice.push(cell.clone());
+                }
+            }
+            VanishClass::BootFailureTeardown => {
+                warn!(
+                    %name, %cell,
+                    "in-flight NodeClaim torn down before Registering with \
+                     Launched=True (external boot-failure teardown, e.g. \
+                     Karpenter registration TTL); counting boot-timeout, NOT \
+                     ICE-masking (capacity existed)"
+                );
+                metrics::counter!(
+                    "rio_controller_nodeclaim_reaped_total",
+                    "reason" => ReapReason::BootTimeout.as_str(),
+                    "cell" => cell.to_string(),
+                )
+                .increment(1);
+            }
             VanishClass::LaunchFailureTeardown | VanishClass::GcVanish => {
                 warn!(
                     %name, %cell, ?class,
@@ -282,44 +352,176 @@ pub fn detect_vanished(inflight: &mut HashMap<String, Cell>, live: &[LiveNode]) 
                 ice.push(cell.clone());
             }
         }
+        // Every exit consumes the name's provenance — the tracking
+        // story is over; a later same-name claim is fresh evidence.
+        tombstones.remove(name);
         false
     });
     ice
 }
 
-/// The closed exit alphabet at the vanish seam (live_050(b)): *every
-/// launch-failure observation, on every observation path, produces
-/// the same unfulfillable evidence.* `None` = still in-flight (KEEP —
-/// not an exit). The pre-fix retain arm conflated rows 2 and 3
-/// (`registered || terminating() → false`), so a never-Registered
-/// claim observed mid-GC-transit exited tracking with ZERO mark —
-/// the scheduler's IceBackoff failover never armed (live: vanished=101
-/// vs ice=0; zero `:od` claims ever minted).
+/// The closed exit alphabet at the vanish seam (live_050(b), widened
+/// by bug_094): *every launch-failure observation, on every
+/// observation path, produces the same unfulfillable evidence — and
+/// only genuinely capacity-shaped, genuinely foreign teardowns
+/// produce it.* `None` = still in-flight (KEEP — not an exit). The
+/// live_050(b) pre-fix retain arm conflated the registered and
+/// never-registered teardown rows, starving IceBackoff (vanished=101
+/// vs ice=0; zero `:od` claims minted). The bug_094 pre-fix alphabet
+/// classified over (present × registered × terminating) ONLY — the
+/// deciding axes (delete provenance, `Launched`) were never in the
+/// product, so an ambiguous-commit own-reap and a Karpenter
+/// registration-TTL boot teardown both minted the FALSE ICE mask the
+/// `record_reap` pin forbids for `BootTimeout`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VanishClass {
     /// Registered (∧ not terminating): `observe_registered`/FFD own it.
     RegisteredHandoff,
-    /// Registered ∧ terminating: deliberate teardown of a node that
-    /// proved launchable — not an ICE signal.
+    /// Registered ∧ terminating (no tombstone): deliberate teardown of
+    /// a node that proved launchable — not an ICE signal.
     DeliberateTeardown,
-    /// NEVER-Registered ∧ terminating: launch-failure teardown caught
+    /// Tombstoned ∧ (terminating ∨ absent): this controller's OWN
+    /// delete, confirmed after an ambiguous error. Carries the
+    /// original [`ReapReason`]; the exit applies that reason's
+    /// `record_reap` consequence (mask iff `Ice`) — never the
+    /// vanish-attributed evidence.
+    SelfReap(ReapReason),
+    /// NEVER-Registered ∧ terminating ∧ `Launched=True` (no
+    /// tombstone): external boot-failure teardown (Karpenter
+    /// registration TTL) — capacity existed; counts `boot-timeout`,
+    /// never masks.
+    BootFailureTeardown,
+    /// NEVER-Registered ∧ terminating ∧ `Launched` ∈ {False,
+    /// absent/Unknown} (no tombstone): launch-failure teardown caught
     /// mid-GC-transit — IS ICE evidence (marks exactly like GcVanish).
     LaunchFailureTeardown,
-    /// Absent from `live`: GC'd between ticks without Registering.
+    /// Absent from `live` (no tombstone): GC'd between ticks without
+    /// Registering — capacity-side by construction (see the
+    /// [`detect_vanished`] GcVanish row for why `Launched` is
+    /// unreadable AND immaterial here).
     GcVanish,
 }
 
 /// Pure classification law for one tracked claim's observation —
-/// `observed = None` ⇔ absent from `live`. Product-censused by
-/// `vanish_class_census_over_the_observation_product` (registered ×
-/// terminating × present — eight cells from the alphabet).
-pub fn classify_vanish(observed: Option<&LiveNode>) -> Option<VanishClass> {
-    match observed {
-        Some(n) if n.registered && n.terminating() => Some(VanishClass::DeliberateTeardown),
-        Some(n) if n.registered => Some(VanishClass::RegisteredHandoff),
-        Some(n) if n.terminating() => Some(VanishClass::LaunchFailureTeardown),
-        Some(_) => None,
-        None => Some(VanishClass::GcVanish),
+/// `observed = None` ⇔ absent from `live`; `self_delete = Some(r)` ⇔
+/// this controller already attempted the claim's delete for reason
+/// `r` and got an ambiguous (non-404) error back. Product-censused by
+/// `vanish_class_census_over_the_observation_product` (present ×
+/// registered × terminating × launched × provenance — the cells come
+/// FROM the alphabet's axes; bug_094's R22 lesson: the pre-fix census
+/// was enrolled and green over a product MISSING the deciding axes).
+pub fn classify_vanish(
+    observed: Option<&LiveNode>,
+    self_delete: Option<ReapReason>,
+) -> Option<VanishClass> {
+    match (observed, self_delete) {
+        // Provenance rows first: a tombstoned claim observed
+        // terminating or absent is the controller's own delete
+        // confirmed — regardless of registered/Launched (the original
+        // classification already adjudicated those).
+        (None, Some(r)) => Some(VanishClass::SelfReap(r)),
+        (Some(n), Some(r)) if n.terminating() => Some(VanishClass::SelfReap(r)),
+        // Observation rows (tombstone absent, or present but
+        // DISCONFIRMED — the claim is alive and not terminating, so
+        // the attempted delete provably has not committed yet).
+        (Some(n), _) if n.registered && n.terminating() => Some(VanishClass::DeliberateTeardown),
+        (Some(n), _) if n.registered => Some(VanishClass::RegisteredHandoff),
+        (Some(n), _) if n.terminating() => match n.launched() {
+            Some(true) => Some(VanishClass::BootFailureTeardown),
+            _ => Some(VanishClass::LaunchFailureTeardown),
+        },
+        (Some(_), _) => None,
+        (None, None) => Some(VanishClass::GcVanish),
+    }
+}
+
+/// How many leader ticks an unconfirmed delete tombstone survives.
+/// Violable envelope (R17), derivation: confirmation normally lands at
+/// the NEXT tick's LIST (a committed delete shows `deletionTimestamp`
+/// immediately; the ~60–90s finalizer keeps it observable for many
+/// 10s ticks), so 3 covers one stale-LIST tick plus one missed tick —
+/// while bounding the window in which an INDEPENDENT same-name
+/// teardown could be mis-attributed to this controller (that
+/// suppression additionally requires the claim to flip into a
+/// capacity-failure shape after our non-ICE classification — near-
+/// contradictory, since Karpenter never transitions `Launched`
+/// True→False; an `Ice`-reason tombstone's consequence is the mask
+/// either way, so nothing is suppressed on that arm).
+const TOMBSTONE_TTL_TICKS: u64 = 3;
+
+/// One ambiguous delete attempt: the [`ReapReason`] the controller
+/// classified before deleting, and the leader tick that stamped it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeleteAttempt {
+    pub reason: ReapReason,
+    pub tick: u64,
+}
+
+/// Delete-provenance tombstones (bug_094): NodeClaim names whose
+/// `delete()` THIS controller attempted and got a non-404 error back
+/// — an AMBIGUOUS outcome (the apiserver may have committed the
+/// delete before the error). Carried across ticks so the next
+/// observation of the claim terminating/absent classifies as
+/// [`VanishClass::SelfReap`] instead of Karpenter teardown evidence.
+///
+/// Mutators (the `inflight_created` discipline, same shape):
+/// 1. [`stamp`](Self::stamp) — the callers fold
+///    [`ReapOutcome::delete_attempted`] in, stamped with the current
+///    leader tick (re-stamping an existing name refreshes its TTL —
+///    a repeated Err is a fresh ambiguous attempt).
+/// 2. [`remove`](Self::remove) — consumed on every vanish-fold exit
+///    (`detect_vanished`), and by the callers for names a RETRIED
+///    delete completed (`Ok`/404 → `reaped_claims` — the completed
+///    reap's `record_reap` already applied the consequence).
+/// 3. [`prune_expired`](Self::prune_expired) — entries older than
+///    [`TOMBSTONE_TTL_TICKS`] drop (covers names that never re-enter
+///    the fold: claims outside `inflight_created` — prior-tenure or
+///    registered ones — and disconfirmed attempts).
+/// 4. `clear()` on the ACQUISITION EDGE (suppress polarity, the
+///    `inflight_created` row's rationale: a stale previous-tenure
+///    tombstone could suppress a genuine vanish ICE of a same-named
+///    successor claim).
+#[derive(Debug, Default)]
+pub struct DeleteTombstones {
+    entries: HashMap<String, DeleteAttempt>,
+}
+
+impl DeleteTombstones {
+    /// Record an ambiguous delete attempt at `tick`.
+    pub fn stamp(&mut self, name: String, reason: ReapReason, tick: u64) {
+        self.entries.insert(name, DeleteAttempt { reason, tick });
+    }
+
+    /// The tombstoned reason for `name`, if any — the provenance axis
+    /// [`classify_vanish`] consumes.
+    pub fn reason(&self, name: &str) -> Option<ReapReason> {
+        self.entries.get(name).map(|a| a.reason)
+    }
+
+    /// Consume `name`'s tombstone (exit observed or retry completed).
+    pub fn remove(&mut self, name: &str) {
+        self.entries.remove(name);
+    }
+
+    /// Drop entries stamped more than [`TOMBSTONE_TTL_TICKS`] leader
+    /// ticks ago. `wrapping_sub` matches the tick counter's wrap.
+    pub fn prune_expired(&mut self, now_tick: u64) {
+        self.entries
+            .retain(|_, a| now_tick.wrapping_sub(a.tick) <= TOMBSTONE_TTL_TICKS);
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[cfg(test)]
+    pub fn contains(&self, name: &str) -> bool {
+        self.entries.contains_key(name)
     }
 }
 
@@ -337,13 +539,21 @@ pub fn classify_vanish(observed: Option<&LiveNode>) -> Option<VanishClass> {
 ///   must not re-feed the Dead arm or inflate the systemic
 ///   populations.
 ///
-/// `Api::delete` 404 is ignored; other errors warn + skip (next tick
-/// retries).
+/// `Api::delete` 404 is ignored; other errors warn, tombstone the
+/// attempt (`delete_attempted` — the outcome is AMBIGUOUS: the
+/// apiserver may have committed before erring), and skip (next tick
+/// retries if the claim is still alive).
 #[derive(Debug, Default)]
 pub struct ReapOutcome {
     pub ice_cells: Vec<Cell>,
     pub reaped_claims: Vec<String>,
     pub reaped_nodes: Vec<String>,
+    /// `(name, reason)` for deletes that returned a non-404 error.
+    /// The callers stamp these into their [`DeleteTombstones`] so the
+    /// next tick's vanish fold classifies a committed-but-errored
+    /// delete as [`VanishClass::SelfReap`] — this controller's own
+    /// reap, never Karpenter evidence (bug_094).
+    pub delete_attempted: Vec<(String, ReapReason)>,
 }
 
 pub async fn reap_unhealthy(
@@ -407,7 +617,16 @@ pub async fn reap_unhealthy(
                 out.reaped_nodes.extend(n.node_name.clone());
             }
             Err(e) => {
-                warn!(name = %n.name, error = %e, "unhealthy NodeClaim delete failed; skipping");
+                // AMBIGUOUS: the apiserver may have committed the
+                // delete before erring. The name must not vanish from
+                // provenance — a next-tick terminating/absent
+                // observation is OUR reap, not Karpenter evidence.
+                warn!(
+                    name = %n.name, error = %e,
+                    "unhealthy NodeClaim delete failed; tombstoning the attempt \
+                     (ambiguous commit) and retrying next tick if still alive"
+                );
+                out.delete_attempted.push((n.name.clone(), reason));
             }
         }
     }
@@ -512,7 +731,8 @@ mod tests {
         inflight_node.registered = false;
         let live = [inflight_node, reg, term];
 
-        let ice = detect_vanished(&mut inflight, &live);
+        let mut ts = DeleteTombstones::default();
+        let ice = detect_vanished(&mut inflight, &mut ts, &live);
         assert_eq!(ice, vec![h], "only nc-gone (absent) ICE-masked");
         assert_eq!(
             inflight.keys().collect::<Vec<_>>(),
@@ -521,17 +741,17 @@ mod tests {
         );
         // Second call (claim still in-flight, still live): nothing new
         // ICE'd, claim stays tracked.
-        assert!(detect_vanished(&mut inflight, &live).is_empty());
+        assert!(detect_vanished(&mut inflight, &mut ts, &live).is_empty());
         assert_eq!(inflight.len(), 1);
         // Third call: claim GC'd between ticks → ICE.
         assert_eq!(
-            detect_vanished(&mut inflight, &[]),
+            detect_vanished(&mut inflight, &mut ts, &[]),
             vec![Cell("h".into(), CapacityType::Spot)]
         );
         assert!(inflight.is_empty());
     }
 
-    // r[verify ctrl.nodeclaim.ice-mark-clear+3]
+    // r[verify ctrl.nodeclaim.ice-mark-clear+4]
     /// live_050(b) red R3 / witness W7-C — certifies: *a never-Registered
     /// terminating claim produces a buffered-able mark with the vanish
     /// warn/counter — through the production retain path, not a
@@ -550,7 +770,7 @@ mod tests {
         let doomed = set_terminating(doomed);
         let rec = DebuggingRecorder::new();
         let _g = ::metrics::set_default_local_recorder(&rec);
-        let ice = detect_vanished(&mut inflight, &[doomed]);
+        let ice = detect_vanished(&mut inflight, &mut DeleteTombstones::default(), &[doomed]);
         assert_eq!(
             ice,
             vec![h.clone()],
@@ -585,19 +805,180 @@ mod tests {
         reg_term.registered = true;
         let reg_term = set_terminating(reg_term);
         assert!(
-            detect_vanished(&mut inflight, &[reg_term]).is_empty(),
+            detect_vanished(&mut inflight, &mut DeleteTombstones::default(), &[reg_term])
+                .is_empty(),
             "registered teardown is deliberate — not an ICE signal"
         );
         assert!(inflight.is_empty());
     }
 
-    /// R15 vanish-path census: `classify_vanish` product-iterated over
-    /// (present × registered × terminating) — eight cells FROM the
-    /// alphabet, each row asserting its class AND its mark/tracking
-    /// effect through the production `detect_vanished` fold. The
-    /// conflated cell (present, never-registered, terminating) is the
-    /// R3 red's row. Generator: the loop product + rustc
-    /// exhaustiveness at the law match.
+    /// W9-BB unit red (bug_094, the Launched-axis half): a NEVER-
+    /// Registered terminating claim whose `Launched` condition is
+    /// `True` is a BOOT failure observed via external teardown
+    /// (Karpenter registration TTL on slow cells) — capacity provably
+    /// materialized, so it must NOT produce ICE evidence (the same
+    /// non-mask posture `record_reap` pins for `BootTimeout`), and the
+    /// exit counts under `reason=boot-timeout` (the boot-failure alert
+    /// sees it), never `reason=vanished`. Pre-fix red (verbatim):
+    /// `Launched=True teardown is a boot failure, not capacity
+    /// evidence: [Cell("h", Spot)]`.
+    #[test]
+    fn boot_failure_teardown_spares_the_cell() {
+        use super::super::ffd::tests::set_terminating;
+        use metrics_util::debugging::DebuggingRecorder;
+        let h = Cell("h".into(), CapacityType::Spot);
+        let mut inflight: HashMap<String, Cell> = [("nc-ttl".to_string(), h.clone())].into();
+        let mut n = with_conds(
+            node("nc-ttl", "h", CapacityType::Spot, 8, 0, 0),
+            &[("Launched", "True", 1001.0)],
+        );
+        n.registered = false;
+        let n = set_terminating(n);
+        let rec = DebuggingRecorder::new();
+        let _g = ::metrics::set_default_local_recorder(&rec);
+        let ice = detect_vanished(&mut inflight, &mut DeleteTombstones::default(), &[n]);
+        assert!(
+            ice.is_empty(),
+            "Launched=True teardown is a boot failure, not capacity evidence: {ice:?}"
+        );
+        assert!(inflight.is_empty(), "the exit still leaves tracking");
+        // ppppp: snapshot exactly once.
+        let counts = reap_counts(rec.snapshotter().snapshot().into_vec(), &h);
+        assert_eq!(
+            counts,
+            vec![("boot-timeout".to_string(), 1)],
+            "counted as a boot failure, not vanish evidence"
+        );
+    }
+
+    /// `(reason, count)` rows of `nodeclaim_reaped_total` for `cell`
+    /// from one recorder snapshot, sorted (the per-exit counter
+    /// comparator for the vanish-fold tests).
+    fn reap_counts(
+        snap: Vec<(
+            metrics_util::CompositeKey,
+            Option<metrics::Unit>,
+            Option<metrics::SharedString>,
+            metrics_util::debugging::DebugValue,
+        )>,
+        cell: &Cell,
+    ) -> Vec<(String, u64)> {
+        use metrics_util::debugging::DebugValue;
+        let mut out: Vec<(String, u64)> = snap
+            .into_iter()
+            .filter_map(|(k, _, _, v)| {
+                let key = k.key();
+                if key.name() != "rio_controller_nodeclaim_reaped_total"
+                    || !key
+                        .labels()
+                        .any(|l| l.key() == "cell" && l.value() == cell.to_string())
+                {
+                    return None;
+                }
+                let reason = key
+                    .labels()
+                    .find(|l| l.key() == "reason")?
+                    .value()
+                    .to_string();
+                match v {
+                    DebugValue::Counter(c) if c > 0 => Some((reason, c)),
+                    _ => None,
+                }
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// bug_094 provenance half at the unit fold: a tombstoned claim
+    /// observed terminating or absent is [`VanishClass::SelfReap`] —
+    /// the exit applies the ORIGINAL reap's consequence (counter under
+    /// the original reason; mask iff `Ice`), never the
+    /// vanish-attributed evidence, and consumes the tombstone.
+    #[test]
+    fn self_reap_applies_the_original_consequence() {
+        use super::super::ffd::tests::set_terminating;
+        use metrics_util::debugging::DebuggingRecorder;
+        let h = Cell("h".into(), CapacityType::Spot);
+
+        // BootTimeout tombstone + terminating observation → no mask,
+        // counter under boot-timeout (the W9-BB lifecycle red's unit
+        // face).
+        let mut inflight: HashMap<String, Cell> = [("nc-bt".to_string(), h.clone())].into();
+        let mut ts = DeleteTombstones::default();
+        ts.stamp("nc-bt".into(), ReapReason::BootTimeout, 7);
+        let mut n = with_conds(
+            node("nc-bt", "h", CapacityType::Spot, 8, 0, 0),
+            &[("Launched", "True", 1001.0)],
+        );
+        n.registered = false;
+        let n = set_terminating(n);
+        let rec = DebuggingRecorder::new();
+        let _g = ::metrics::set_default_local_recorder(&rec);
+        let ice = detect_vanished(&mut inflight, &mut ts, &[n]);
+        assert!(ice.is_empty(), "BootTimeout self-reap never masks: {ice:?}");
+        assert!(inflight.is_empty() && ts.is_empty(), "exit consumed both");
+        let counts = reap_counts(rec.snapshotter().snapshot().into_vec(), &h);
+        assert_eq!(counts, vec![("boot-timeout".to_string(), 1)]);
+        drop(_g);
+
+        // Ice tombstone + ABSENT observation → the deferred consequence
+        // is the mask (record_reap parity — no evidence lost to the
+        // ambiguous error), counted under ice, NOT vanished.
+        let mut inflight: HashMap<String, Cell> = [("nc-ice".to_string(), h.clone())].into();
+        let mut ts = DeleteTombstones::default();
+        ts.stamp("nc-ice".into(), ReapReason::Ice, 7);
+        let rec = DebuggingRecorder::new();
+        let _g = ::metrics::set_default_local_recorder(&rec);
+        let ice = detect_vanished(&mut inflight, &mut ts, &[]);
+        assert_eq!(ice, vec![h.clone()], "Ice self-reap still masks");
+        assert!(inflight.is_empty() && ts.is_empty());
+        let counts = reap_counts(rec.snapshotter().snapshot().into_vec(), &h);
+        assert_eq!(
+            counts,
+            vec![("ice".to_string(), 1)],
+            "the original reason's counter, never vanished"
+        );
+    }
+
+    /// Tombstone lifecycle: a DISCONFIRMED attempt (claim observed
+    /// alive, not terminating) keeps the entry tracked AND the
+    /// tombstone armed (stale-LIST tolerance); `prune_expired` drops
+    /// it after [`TOMBSTONE_TTL_TICKS`]; a fresh stamp survives its
+    /// own tick's prune.
+    #[test]
+    fn tombstones_expire_and_disconfirmation_keeps_them_armed() {
+        let h = Cell("h".into(), CapacityType::Spot);
+        let mut inflight: HashMap<String, Cell> = [("nc-x".to_string(), h.clone())].into();
+        let mut ts = DeleteTombstones::default();
+        ts.stamp("nc-x".into(), ReapReason::BootTimeout, 10);
+        ts.prune_expired(10);
+        assert!(ts.contains("nc-x"), "fresh stamp survives its own tick");
+
+        // Disconfirmed: present ∧ !terminating → KEEP both.
+        let mut alive = node("nc-x", "h", CapacityType::Spot, 8, 0, 0);
+        alive.registered = false;
+        assert!(detect_vanished(&mut inflight, &mut ts, &[alive]).is_empty());
+        assert!(inflight.contains_key("nc-x") && ts.contains("nc-x"));
+
+        // Expiry: TTL ticks later the tombstone is gone; a subsequent
+        // absence is foreign evidence again (GcVanish → mask).
+        ts.prune_expired(10 + TOMBSTONE_TTL_TICKS + 1);
+        assert!(!ts.contains("nc-x"), "expired past TTL");
+        let ice = detect_vanished(&mut inflight, &mut ts, &[]);
+        assert_eq!(ice, vec![h], "post-expiry absence is Karpenter evidence");
+    }
+
+    /// R15 vanish-path census, widened by bug_094 (R22: the pre-fix
+    /// census was enrolled and GREEN over a product missing the
+    /// deciding axes): `classify_vanish` product-iterated over
+    /// (present × registered × terminating × launched × provenance) —
+    /// 96 cells, every axis value FROM the alphabet (`Option<bool>`
+    /// is `launched()`'s full range; the provenance axis is
+    /// `Option<ReapReason>` over the closed reason enum). Each row
+    /// asserts its class AND its mark/tracking/tombstone effect
+    /// through the production `detect_vanished` fold. Generator: the
+    /// loop product + rustc exhaustiveness at the law match.
     #[test]
     fn vanish_class_census_over_the_observation_product() {
         use super::super::ffd::tests::set_terminating;
@@ -605,40 +986,125 @@ mod tests {
         for present in [false, true] {
             for registered in [false, true] {
                 for terminating in [false, true] {
-                    let mut n = node("nc-x", "h", CapacityType::Spot, 8, 0, 0);
-                    n.registered = registered;
-                    let n = if terminating { set_terminating(n) } else { n };
-                    let want = match (present, registered, terminating) {
-                        (false, _, _) => Some(VanishClass::GcVanish),
-                        (true, true, true) => Some(VanishClass::DeliberateTeardown),
-                        (true, true, false) => Some(VanishClass::RegisteredHandoff),
-                        (true, false, true) => Some(VanishClass::LaunchFailureTeardown),
-                        (true, false, false) => None,
-                    };
-                    let got = classify_vanish(present.then_some(&n));
-                    assert_eq!(got, want, "cell ({present},{registered},{terminating})");
-                    // Effect row through the production fold:
-                    let mut inflight: HashMap<String, Cell> =
-                        [("nc-x".to_string(), h.clone())].into();
-                    let live = if present { vec![n] } else { vec![] };
-                    let ice = detect_vanished(&mut inflight, &live);
-                    let marks = matches!(
-                        want,
-                        Some(VanishClass::LaunchFailureTeardown | VanishClass::GcVanish)
-                    );
-                    assert_eq!(
-                        !ice.is_empty(),
-                        marks,
-                        "mark effect for ({present},{registered},{terminating})"
-                    );
-                    assert_eq!(
-                        inflight.contains_key("nc-x"),
-                        want.is_none(),
-                        "tracking effect for ({present},{registered},{terminating})"
-                    );
+                    for launched in [None, Some(false), Some(true)] {
+                        for tombstoned in [
+                            None,
+                            Some(ReapReason::Ice),
+                            Some(ReapReason::BootTimeout),
+                            Some(ReapReason::Dead),
+                        ] {
+                            let n = match launched {
+                                None => node("nc-x", "h", CapacityType::Spot, 8, 0, 0),
+                                Some(l) => with_conds(
+                                    node("nc-x", "h", CapacityType::Spot, 8, 0, 0),
+                                    &[("Launched", if l { "True" } else { "False" }, 1001.0)],
+                                ),
+                            };
+                            let mut n = n;
+                            n.registered = registered;
+                            let n = if terminating { set_terminating(n) } else { n };
+                            let row = (present, registered, terminating, launched, tombstoned);
+                            // The law table, stated independently of
+                            // the production match (two derivations of
+                            // one law; rustc exhaustiveness on both).
+                            let want = match row {
+                                (false, _, _, _, Some(r)) => Some(VanishClass::SelfReap(r)),
+                                (false, _, _, _, None) => Some(VanishClass::GcVanish),
+                                (true, _, true, _, Some(r)) => Some(VanishClass::SelfReap(r)),
+                                (true, true, true, _, None) => {
+                                    Some(VanishClass::DeliberateTeardown)
+                                }
+                                (true, true, false, _, _) => Some(VanishClass::RegisteredHandoff),
+                                (true, false, true, Some(true), None) => {
+                                    Some(VanishClass::BootFailureTeardown)
+                                }
+                                (true, false, true, _, None) => {
+                                    Some(VanishClass::LaunchFailureTeardown)
+                                }
+                                (true, false, false, _, _) => None,
+                            };
+                            let got = classify_vanish(present.then_some(&n), tombstoned);
+                            assert_eq!(got, want, "class for {row:?}");
+                            // Effect row through the production fold:
+                            let mut inflight: HashMap<String, Cell> =
+                                [("nc-x".to_string(), h.clone())].into();
+                            let mut ts = DeleteTombstones::default();
+                            if let Some(r) = tombstoned {
+                                ts.stamp("nc-x".into(), r, 1);
+                            }
+                            let live = if present { vec![n] } else { vec![] };
+                            let ice = detect_vanished(&mut inflight, &mut ts, &live);
+                            let marks = matches!(
+                                want,
+                                Some(
+                                    VanishClass::LaunchFailureTeardown
+                                        | VanishClass::GcVanish
+                                        | VanishClass::SelfReap(ReapReason::Ice)
+                                )
+                            );
+                            assert_eq!(!ice.is_empty(), marks, "mark effect for {row:?}");
+                            assert_eq!(
+                                inflight.contains_key("nc-x"),
+                                want.is_none(),
+                                "tracking effect for {row:?}"
+                            );
+                            // Tombstone consumption: every EXIT eats
+                            // the provenance; a KEEP retains it.
+                            assert_eq!(
+                                ts.contains("nc-x"),
+                                tombstoned.is_some() && want.is_none(),
+                                "tombstone effect for {row:?}"
+                            );
+                        }
+                    }
                 }
             }
         }
+    }
+
+    /// R22 planted red (axis-omission corpus row, in-file fixture): a
+    /// strawman census generator over the PRE-FIX universe (present ×
+    /// registered × terminating — the wave-8 product) cannot be total
+    /// over the law: rows identical in that projection classify
+    /// DIFFERENTLY along each added axis, so a generator that drops
+    /// either axis certifies one census row for two distinct letters
+    /// — exactly the enrolled-but-wrong-universe shape bug_094
+    /// shipped. If a future edit collapses either axis out of
+    /// `classify_vanish`, one of these inequalities goes red.
+    #[test]
+    fn vanish_census_axis_omission_red_fixture() {
+        use super::super::ffd::tests::set_terminating;
+        let mk = |launched: Option<bool>| {
+            let n = match launched {
+                None => node("nc-x", "h", CapacityType::Spot, 8, 0, 0),
+                Some(l) => with_conds(
+                    node("nc-x", "h", CapacityType::Spot, 8, 0, 0),
+                    &[("Launched", if l { "True" } else { "False" }, 1001.0)],
+                ),
+            };
+            let mut n = n;
+            n.registered = false;
+            set_terminating(n)
+        };
+        // Same (present=true, registered=false, terminating=true)
+        // projection — the launched axis decides boot vs capacity:
+        assert_ne!(
+            classify_vanish(Some(&mk(Some(true))), None),
+            classify_vanish(Some(&mk(Some(false))), None),
+            "a generator without the launched axis maps two letters to one row"
+        );
+        // — and the provenance axis decides ours vs Karpenter's:
+        assert_ne!(
+            classify_vanish(Some(&mk(None)), Some(ReapReason::BootTimeout)),
+            classify_vanish(Some(&mk(None)), None),
+            "a generator without the provenance axis maps two letters to one row"
+        );
+        // The absent projection splits on provenance too:
+        assert_ne!(
+            classify_vanish(None, Some(ReapReason::Dead)),
+            classify_vanish(None, None),
+            "absence is not always GcVanish — provenance decides"
+        );
     }
 
     /// A NodeClaim already terminating (`metadata.deletionTimestamp`

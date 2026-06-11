@@ -820,6 +820,17 @@ pub struct NodeClaimPoolReconciler {
     ///    misread as Karpenter GC.
     // r[impl ctrl.nodeclaim.inflight-conservation+3]
     inflight_created: HashMap<String, Cell>,
+    /// Delete-provenance tombstones (bug_094): names whose `delete()`
+    /// this controller attempted and got an ambiguous (non-404) error
+    /// back. Consulted by [`health::detect_vanished`] so a
+    /// committed-but-errored delete classifies as our own reap
+    /// ([`health::VanishClass::SelfReap`]) instead of minting a false
+    /// ICE mask. Mutator list on the type
+    /// ([`health::DeleteTombstones`]); per-field lease-edge polarity:
+    /// SUPPRESS → cleared on the ACQUISITION EDGE alongside
+    /// `inflight_created` (a stale previous-tenure tombstone could
+    /// suppress a genuine vanish ICE of a same-named successor claim).
+    delete_tombstones: health::DeleteTombstones,
     /// Count of consecutive ticks where `GetSpawnIntents` returned ⊥
     /// (RPC error). Saturates at `u8::MAX`; reset on first success.
     consecutive_bot_ticks: u8,
@@ -949,6 +960,7 @@ impl NodeClaimPoolReconciler {
             prev_extra_cells: HashSet::new(),
             prev_unplaced_extras: HashSet::new(),
             inflight_created: HashMap::new(),
+            delete_tombstones: health::DeleteTombstones::default(),
             consecutive_bot_ticks: 0,
             pending_evidence: PendingSchedulerEvidence::default(),
             edge_seen_epoch: 0,
@@ -1075,6 +1087,10 @@ impl NodeClaimPoolReconciler {
             self.prev_idle.clear();
             self.pending_evidence = PendingSchedulerEvidence::default();
             self.inflight_created.clear();
+            // Same suppress polarity as `inflight_created`: a stale
+            // previous-tenure tombstone would suppress a genuine
+            // vanish ICE of a same-named successor claim (bug_094).
+            self.delete_tombstones.clear();
             self.edge_seen_epoch = epoch;
         }
         if self.reloaded_epoch != epoch {
@@ -1108,6 +1124,12 @@ impl NodeClaimPoolReconciler {
                     //     entry → spurious ICE-mask: the interim
                     //     leader's deliberate reaps would be misread
                     //     as Karpenter GC — so the edge clears it).
+                    //   - `delete_tombstones` suppress → cleared on the
+                    //     ACQUISITION EDGE beside `inflight_created`
+                    //     (bug_094: a stale previous-tenure tombstone
+                    //     would classify a same-named successor
+                    //     claim's genuine vanish as SelfReap and
+                    //     suppress its ICE mark).
                     //   - `prev_idle`       AMPLIFY   → cleared BEFORE the
                     //     match (stale entry inflates idle → over-reap;
                     //     r43 merged_bug_016)
@@ -1571,6 +1593,7 @@ impl NodeClaimPoolReconciler {
             mut ice_cells,
             reaped_claims: reaped,
             reaped_nodes,
+            delete_attempted,
         } = health::reap_unhealthy(
             &self.nodeclaims,
             &live,
@@ -1589,11 +1612,26 @@ impl NodeClaimPoolReconciler {
         // BEFORE detect_vanished scans, so they're not misread as Karpenter
         // GC on the next tick. (reap_idle only reaps registered claims —
         // detect_vanished's `Some(n) if n.registered → false` arm already
-        // drops those.)
+        // drops those.) A COMPLETED retry also consumes its prior
+        // ambiguous-attempt tombstone — record_reap already applied the
+        // consequence (bug_094).
         for name in &reaped {
             self.inflight_created.remove(name);
+            self.delete_tombstones.remove(name);
         }
-        ice_cells.extend(health::detect_vanished(&mut self.inflight_created, &live));
+        // bug_094: ambiguous (non-404 Err) deletes tombstone their
+        // provenance for the vanish fold; stamp-then-prune so a fresh
+        // stamp is never expired by its own tick.
+        for (name, reason) in delete_attempted {
+            self.delete_tombstones
+                .stamp(name, reason, self.tick_counter);
+        }
+        self.delete_tombstones.prune_expired(self.tick_counter);
+        ice_cells.extend(health::detect_vanished(
+            &mut self.inflight_created,
+            &mut self.delete_tombstones,
+            &live,
+        ));
         // bug_082: ICE marks enter the commit-on-Ack buffer AT the
         // production site — `report_unfulfillable` builds the request
         // from the buffer, so a failed Ack retains them exactly like
@@ -1768,11 +1806,23 @@ impl NodeClaimPoolReconciler {
         // doc-comment on `detect_vanished` ("the controller never deletes
         // its own in-flight claims") only holds if every code path that
         // deletes a tracked claim also removes it from `inflight_created`
-        // — `reconcile_once` did, `consolidate_only` did not.
+        // — `reconcile_once` did, `consolidate_only` did not. The
+        // tombstone plane gets the SAME both-modes treatment (bug_094):
+        // completed retries consume, ambiguous attempts stamp.
         for name in &reaped {
             self.inflight_created.remove(name);
+            self.delete_tombstones.remove(name);
         }
-        let vanished = health::detect_vanished(&mut self.inflight_created, &live);
+        for (name, reason) in outcome.delete_attempted {
+            self.delete_tombstones
+                .stamp(name, reason, self.tick_counter);
+        }
+        self.delete_tombstones.prune_expired(self.tick_counter);
+        let vanished = health::detect_vanished(
+            &mut self.inflight_created,
+            &mut self.delete_tombstones,
+            &live,
+        );
         self.pending_evidence.buffer_marks(vanished);
         // FFD-derived gauges (`ffd_unplaced_cores`, `ffd_placeable_intents`)
         // need scheduler intents; live-derived gauges read only `live` +
@@ -2351,7 +2401,7 @@ impl NodeClaimPoolReconciler {
         // idle window (and mis-attributes the next re-dispatch). One
         // Ack per tick is the cost; the old all-empty early-return
         // suppressed exactly the tick that mattered.
-        // r[impl ctrl.nodeclaim.ice-mark-clear+3]
+        // r[impl ctrl.nodeclaim.ice-mark-clear+4]
         // Per-cell dedup (inherent — the buffer keys by cell):
         // `health::reap_unhealthy`/`detect_vanished` push one entry
         // per ICE'd CLAIM (up to 8/cell/tick); the per-cell ordered
