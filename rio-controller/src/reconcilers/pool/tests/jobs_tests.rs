@@ -3894,28 +3894,79 @@ async fn w9_as_keyless_mode_spawns_every_intent_tokenless() {
 
 /// W9-AW (the reap-authority law table, WO-S4-1b): a `queued` count may
 /// drive excess-Pending reaping only when the scheduler answered, the
-/// placeable gate is armed, AND the demand view is COMPLETE. An
-/// incomplete page understates demand — a pending Job whose intent fell
-/// outside the page would read as excess and be reaped while still
-/// wanted (the window-starved-reap shape). The downstream consequence
+/// placeable gate is armed, AND the demand is BOUNDABLE. A complete
+/// page is exact; a truncated page understates demand — a pending Job
+/// whose intent fell outside the page would read as excess and be
+/// reaped while still wanted (the window-starved-reap shape) — so the
+/// truncated arm consumes the `queued_by_system` AGGREGATE upper bound
+/// instead (the uncapped demand truth; over-counting under-reaps), and
+/// a truncated view WITHOUT a usable aggregate (incoherent server)
+/// fail-closes like scheduler-unreachable. The downstream consequence
 /// of `None` is already pinned by
 /// `reap_excess_pending_noop_when_covered_or_unknown`; this table is
-/// the authority conjunction itself, walked over the full cube.
+/// the authority law itself, walked over the full cube × the aggregate
+/// axis. Pre-fix red (the deferred-everywhere strawman — the shipped
+/// 4-arg law lifted verbatim to the new arity): the truncated+aggregate
+/// rows returned `None`, deferring reaps exactly when demand ≫ the
+/// page (the regime large pending sets coincide with).
 #[test]
 fn reap_authority_requires_complete_demand_view() {
     use crate::reconcilers::pool::jobs::reap_queued_known;
     for sched_ok in [false, true] {
         for armed in [false, true] {
             for complete in [false, true] {
-                let got = reap_queued_known(sched_ok, armed, complete, 7);
-                let want = (sched_ok && armed && complete).then_some(7);
-                assert_eq!(
-                    got, want,
-                    "authority cube (sched_ok={sched_ok}, armed={armed}, \
-                     complete={complete}): an incomplete view must \
-                     fail-closed exactly like scheduler-unreachable"
-                );
+                for aggregate in [0u32, 20] {
+                    let got = reap_queued_known(sched_ok, armed, complete, 7, aggregate);
+                    let want = if !(sched_ok && armed) {
+                        None
+                    } else if complete {
+                        Some(7) // exact post-filter count; aggregate ignored
+                    } else if aggregate > 0 {
+                        Some(20) // max(page, aggregate) — the superset bound
+                    } else {
+                        None // truncated + no aggregate: unboundable
+                    };
+                    assert_eq!(
+                        got, want,
+                        "authority law (sched_ok={sched_ok}, armed={armed}, \
+                         complete={complete}, aggregate={aggregate})"
+                    );
+                }
             }
         }
     }
+}
+
+/// The aggregate-bound projection ([`aggregate_upper_for`]): systems
+/// absent from the map contribute zero, present ones sum, and the sum
+/// SATURATES into `u32` (a u64 wire total beyond u32::MAX still yields
+/// a usable — maximal — upper bound instead of wrapping into a small
+/// number that would re-open over-reaping).
+#[test]
+fn aggregate_upper_sums_pool_systems_saturating() {
+    use crate::reconcilers::pool::jobs::aggregate_upper_for;
+    use std::collections::HashMap;
+    let m: HashMap<String, u64> = [
+        ("x86_64-linux".to_string(), 30u64),
+        ("aarch64-linux".to_string(), 12),
+        ("riscv64-linux".to_string(), u64::MAX),
+    ]
+    .into();
+    let sys = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        aggregate_upper_for(&sys(&["x86_64-linux", "aarch64-linux"]), &m),
+        42,
+        "present systems sum"
+    );
+    assert_eq!(
+        aggregate_upper_for(&sys(&["x86_64-linux", "powerpc-none"]), &m),
+        30,
+        "absent systems contribute zero"
+    );
+    assert_eq!(aggregate_upper_for(&sys(&[]), &m), 0, "no systems => 0");
+    assert_eq!(
+        aggregate_upper_for(&sys(&["riscv64-linux", "x86_64-linux"]), &m),
+        u32::MAX,
+        "saturates, never wraps"
+    );
 }

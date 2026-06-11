@@ -1272,6 +1272,21 @@ impl NodeClaimPoolReconciler {
             self.admin
                 .clone()
                 .get_spawn_intents(GetSpawnIntentsRequest {
+                    // DELIBERATE `limit: 0` (unbounded) — the
+                    // window-≥-consumption form (W9-AV, the recorded
+                    // WO-S4-1b derivation): the cover deficit is
+                    // per-CELL and the wire aggregate is by-SYSTEM, so
+                    // a truncated page cannot be aggregate-repaired
+                    // here — it would silently shrink supply. Compute
+                    // is bounded IN-PROCESS by the FFD admission
+                    // window (`ctrl.nodeclaim.sim-window`), and the
+                    // response size is watched by the landed
+                    // spawn-intent response-bytes metric. Contrast the
+                    // per-pool consumer (`pool/jobs::queued_for_pool`)
+                    // whose page IS bounded — its absence-inference
+                    // has the aggregate as a safe superset bound;
+                    // this plane's deficit does not.
+                    limit: 0,
                     ..Default::default()
                 }),
         )

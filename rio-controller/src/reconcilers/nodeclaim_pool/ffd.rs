@@ -2134,6 +2134,89 @@ pub(crate) mod tests {
     }
 
     // r[verify ctrl.nodeclaim.sim-window]
+    /// W9-AU sentinel-oracle face (the deferred post-S3 leg; H3′ item
+    /// 1 — the §1.5-3 composition: the oracle was authored against
+    /// S3's t0 sentinel-API post and is consumed here at the LANDED
+    /// API, zero delta): the REAL D5 guard — `guard::spawn` probing
+    /// THIS test's current_thread runtime, the production freeze-
+    /// attribution sentinel — observes the main domain SCHEDULABLE
+    /// while windowed walks run back-to-back: probes land at the
+    /// walk's yield points, so `main_skew()` stays far under the
+    /// stall threshold and `main_stalls()` records ZERO episodes.
+    ///
+    /// Witness statement (R16, scoped honestly): this face certifies
+    /// the ORACLE COMPOSITION — the same `GuardHandle::main_skew`
+    /// atomics that attribute production freezes read a schedulable
+    /// runtime through the windowed walk. The starvation
+    /// DISCRIMINATOR is the canary face above (deterministic,
+    /// wall-clock-free): at this population a sync walk completes in
+    /// milliseconds and could not trip any honest threshold, so a
+    /// magnitude assertion alone cannot discriminate — the pair is
+    /// the witness. Slack budget (ci-failure-patterns "widen with
+    /// documented slack"): threshold 2s vs µs-scale yield cadence —
+    /// 6 orders of magnitude; an OS-level process pause >2s is the
+    /// only false-red and would red the VM tier first. (ppppp:
+    /// atomics read directly — no recorder snapshot to drain.)
+    #[tokio::test(flavor = "current_thread")]
+    async fn windowed_walk_keeps_the_main_domain_schedulable() {
+        use std::time::Duration;
+        let shutdown = rio_common::signal::Token::new();
+        let guard = crate::guard::spawn(
+            tokio::runtime::Handle::current(),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            crate::guard::GuardConfig {
+                // Ephemeral port: this face never queries HTTP — the
+                // oracle is the lock-free handle.
+                health_addr: ([127, 0, 0, 1], 0).into(),
+                probe_interval: Duration::from_millis(10),
+                stall_threshold: Duration::from_secs(2),
+                ready_probe_budget: Duration::from_secs(1),
+            },
+            shutdown.clone(),
+        );
+        let n = FFD_YIELD_QUANTUM * 8;
+        let intents: Vec<SpawnIntent> = (0..n)
+            .map(|k| intent(&format!("i{k:05}"), 4, GI, &[("h", CapacityType::Spot)]))
+            .collect();
+        let nodes = [node("n", "h", CapacityType::Spot, 8, 64 * GI, 100 * GI)];
+        let sketches = CellSketches::default();
+        let bound = HashMap::new();
+        // Walk back-to-back across ≥10 probe intervals so sentinel
+        // probes land DURING walking (the population: the loop bound
+        // sizes it; the assertions are threshold/episode-shaped).
+        let t0 = std::time::Instant::now();
+        let mut walks = 0u32;
+        while t0.elapsed() < Duration::from_millis(120) {
+            let out = simulate_windowed(
+                &intents,
+                &nodes,
+                &sketches,
+                &bound,
+                0,
+                u64::MAX,
+                0,
+                any_admit,
+            )
+            .await;
+            assert_eq!(out.placeable.len() + out.unplaced.len(), n);
+            walks += 1;
+        }
+        let skew = guard.main_skew();
+        let stalls = guard.main_stalls();
+        shutdown.cancel();
+        assert_eq!(
+            stalls, 0,
+            "zero stall episodes across {walks} windowed walks (the \
+             sentinel saw every probe scheduled at a yield point)"
+        );
+        assert!(
+            skew < Duration::from_secs(2),
+            "main-domain skew {skew:?} stays under the stall threshold \
+             through {walks} back-to-back windowed walks"
+        );
+    }
+
+    // r[verify ctrl.nodeclaim.sim-window]
     /// The admission law: bound intents bypass the window; unbound
     /// admission is cores-capped and round-robin-fair across hw-class
     /// buckets (a pathological class cannot evict a sibling's share);

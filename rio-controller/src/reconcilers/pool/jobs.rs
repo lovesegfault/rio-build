@@ -699,19 +699,24 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // is unreachable: log + treat as queued=0 + requeue. Next tick
     // retries. We ALSO set a SchedulerUnreachable condition on the
     // Pool so operators can see WHY nothing is spawning.
-    let (mut intents, fetch_complete, scheduler_err): (Vec<SpawnIntent>, bool, Option<String>) =
-        match queued_for_pool(ctx, pool).await {
-            Ok(view) => (view.held, view.complete, None),
-            Err(e) => {
-                warn!(
-                    pool = %name, error = %e,
-                    "spawn-intents poll failed; treating as queued=0, will retry"
-                );
-                // `complete=true` is vacuous here: `scheduler_err` already
-                // fail-closes every count consumer on its own conjunct.
-                (Vec::new(), true, Some(e.to_string()))
-            }
-        };
+    let (mut intents, fetch_complete, aggregate_upper, scheduler_err): (
+        Vec<SpawnIntent>,
+        bool,
+        u32,
+        Option<String>,
+    ) = match queued_for_pool(ctx, pool).await {
+        Ok(view) => (view.held, view.complete, view.aggregate_upper, None),
+        Err(e) => {
+            warn!(
+                pool = %name, error = %e,
+                "spawn-intents poll failed; treating as queued=0, will retry"
+            );
+            // `complete=true`/`aggregate_upper=0` are vacuous here:
+            // `scheduler_err` already fail-closes every count consumer
+            // on its own conjunct.
+            (Vec::new(), true, 0, Some(e.to_string()))
+        }
+    };
     // r[impl ctrl.nodeclaim.placeable-gate+5]
     // ADR-023 §13b placeable gate: Builder Jobs spawn only for intents
     // the nodeclaim_pool reconciler's last FFD sim placed on a
@@ -1104,8 +1109,13 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // I-183: spawn-only is half a control loop. `None` when scheduler
     // unreachable OR placeable-gate unarmed OR the demand view is
     // incomplete: reap is fail-CLOSED (spawn is fail-open).
-    let queued_known =
-        reap_queued_known(scheduler_err.is_none(), gate_armed, fetch_complete, queued);
+    let queued_known = reap_queued_known(
+        scheduler_err.is_none(),
+        gate_armed,
+        fetch_complete,
+        queued,
+        aggregate_upper,
+    );
     reap_excess_pending(
         &jobs_api,
         &pods_api,
@@ -1176,35 +1186,63 @@ async fn queued_for_pool(
             systems: pool.spec.systems.clone(),
             features: pod::effective_features(&pool.spec),
             filter_features: true,
-            // Round-9 B3: 0 = unbounded (the pre-window behavior).
-            // The per-pool window + the reap/AD2 totality filter are
-            // the round-9 S4 consumer constituent — landing there,
-            // not here (this line is the wire change's inert
-            // compile-default only).
-            limit: 0,
+            // Round-9 B3, the S4 consumer half: the per-pool fetch
+            // budget is the shared consumer default (R14 shared-const
+            // form — S2 sized it against the landed response-size
+            // metric; this consumer inherits that envelope rather
+            // than minting a second number). The page bounds THIS
+            // consumer's slice only — `queued_by_system` stays the
+            // uncapped demand truth (A-2).
+            limit: rio_proto::SPAWN_INTENTS_DEFAULT_PAGE,
         },
     ))
     .await?
     .into_inner();
-    // Today the fetch is unwindowed, so the page IS the demand truth.
-    // When the GetSpawnIntents pagination fields land scheduler-side
-    // (window + truncation flag), `complete` derives from the response
-    // (`!truncated`) and the request carries the per-pool fetch budget
-    // — the consumer law below is already total either way.
+    // B3 truncation honesty (the proto's own consumer law): a
+    // truncated page understates demand, so absence-inference must
+    // come from the `queued_by_system` aggregate instead. The
+    // aggregate is by SYSTEM, before the kind/feature filters — a
+    // SUPERSET of this pool's demand on its systems, which is exactly
+    // the safe direction for a reap bound (over-counting under-reaps;
+    // the law lives in `reap_queued_known`).
+    let aggregate_upper = aggregate_upper_for(&pool.spec.systems, &resp.queued_by_system);
     Ok(PoolDemandView {
+        complete: !resp.truncated,
+        aggregate_upper,
         held: resp.intents,
-        complete: true,
     })
+}
+
+/// Σ `queued_by_system[s]` over the pool's systems, saturated into
+/// `u32` — the aggregate demand upper bound [`queued_for_pool`] feeds
+/// [`reap_queued_known`]'s truncated arm. Pure (unit-walked beside the
+/// law table): absent systems contribute zero; the sum saturates
+/// rather than wraps.
+pub(crate) fn aggregate_upper_for(
+    systems: &[String],
+    queued_by_system: &std::collections::HashMap<String, u64>,
+) -> u32 {
+    systems
+        .iter()
+        .filter_map(|s| queued_by_system.get(s))
+        .fold(0u64, |a, n| a.saturating_add(*n))
+        .min(u64::from(u32::MAX)) as u32
 }
 
 /// The per-reconcile demand view from [`queued_for_pool`]. `held` is
 /// the intent page this reconcile holds; `complete` says whether `held`
-/// is the WHOLE demand for this pool's filter (the B3/B9 consumer law):
+/// is the WHOLE demand for this pool's filter; `aggregate_upper` is the
+/// `queued_by_system` sum over this pool's systems — the uncapped
+/// demand truth, a SUPERSET of the pool's filtered demand (the B3/B9
+/// consumer law):
 ///
 /// - Counts that infer ABSENCE (`reap_excess_pending`'s `queued_known`)
-///   may only consume a COMPLETE view — an incomplete page understates
-///   demand, and a pending Job whose intent fell outside the page would
-///   read as excess and be reaped while still wanted. Incomplete ⇒
+///   consume the EXACT post-filter count on a COMPLETE view — an
+///   incomplete page understates demand, and a pending Job whose
+///   intent fell outside the page would read as excess and be reaped
+///   while still wanted. On a TRUNCATED view the reap bound is the
+///   aggregate upper bound instead (over-counting under-reaps — the
+///   safe direction); truncated WITHOUT a usable aggregate ⇒
 ///   fail-closed `None` via [`reap_queued_known`], the same lever as
 ///   scheduler-unreachable.
 /// - Per-element walks (the AD2 spawn gate, stale-Job reap, the spawn
@@ -1215,20 +1253,43 @@ async fn queued_for_pool(
 struct PoolDemandView {
     held: Vec<SpawnIntent>,
     complete: bool,
+    /// Σ `queued_by_system[s]` for `s ∈ pool.spec.systems`, saturated
+    /// into `u32` — pre-kind/feature-filter, hence ≥ the pool's true
+    /// demand on every coherent snapshot.
+    aggregate_upper: u32,
 }
 
-/// The reap-authority law (W9-AW): a `queued` count may drive
+/// The reap-authority law (W9-AW): a demand bound may drive
 /// excess-Pending reaping only when the scheduler answered, the
-/// placeable gate is armed, AND the demand view is complete. Pure so
-/// the law table is unit-walkable.
+/// placeable gate is armed, AND the demand is BOUNDABLE — exactly by
+/// the post-filter page count on a complete view, conservatively by
+/// the `queued_by_system` aggregate on a truncated one (B3 truncation
+/// honesty: the aggregate is the uncapped demand truth and a SUPERSET
+/// of every pool filter, so over-counting under-reaps — the safe
+/// direction for absence inference). A truncated view whose aggregate
+/// is empty is incoherent (truncation implies demand exists on the
+/// pool's systems) — fail-closed `None`, the same lever as
+/// scheduler-unreachable. `max(queued, aggregate)` is defensive
+/// against an incoherent snapshot ever reporting aggregate < page.
+/// Pure so the law table is unit-walkable.
 // r[impl ctrl.pool.degraded-polarity]
 pub(crate) fn reap_queued_known(
     scheduler_ok: bool,
     gate_armed: bool,
     complete: bool,
     queued: u32,
+    aggregate_upper: u32,
 ) -> Option<u32> {
-    (scheduler_ok && gate_armed && complete).then_some(queued)
+    if !(scheduler_ok && gate_armed) {
+        return None;
+    }
+    if complete {
+        Some(queued)
+    } else if aggregate_upper > 0 {
+        Some(queued.max(aggregate_upper))
+    } else {
+        None
+    }
 }
 
 /// DNS-1123-safe deterministic suffix from `intent_id`. In production
