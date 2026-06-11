@@ -882,8 +882,15 @@ impl AttemptsViewWitness {
         &self.view.recently_closed
     }
 
-    /// Age of the evidence.
-    fn age(&self) -> Duration {
+    /// Staleness of the evidence: `now − fetched_at`. bug_122: every
+    /// chronology consumer REBASES wire-frozen ages by this quantity
+    /// (`closed_age_secs` is PG-stamped at the view fetch and frozen
+    /// on the wire while Job ages recompute per evaluation — without
+    /// the rebase, witness hold time eats into the §5-Q19 skew slack
+    /// and the generation conjuncts drift permissive by exactly the
+    /// staleness). Also the freshness-gate quantity (a refetch fires
+    /// past [`ATTEMPTS_VIEW_FRESHNESS`]).
+    pub(super) fn staleness(&self) -> Duration {
         self.fetched_at.elapsed()
     }
 
@@ -1016,7 +1023,7 @@ pub(super) async fn delete_job_with_synthesized_report(
     // reap wave pays at most one extra ListOpenAttempts per staleness
     // episode and every subsequent delete still vetoes against the
     // view its selection ran under.
-    if attempts.freshest().age() > ATTEMPTS_VIEW_FRESHNESS {
+    if attempts.freshest().staleness() > ATTEMPTS_VIEW_FRESHNESS {
         match admin_call(
             ctx.admin
                 .clone()
@@ -1371,15 +1378,35 @@ pub(super) async fn reap_orphan_running(
 /// Documented const, deliberately not config (config would drag the
 /// BLESS/docs-data schema obligations for a deployment invariant).
 /// A genuine cancel whose close lands within the slack of Job
-/// creation (insta-cancel inside the window) NEVER binds — both
-/// `closed_age_secs` and the Job's age are live-recomputed, so the
-/// generation inequality is time-invariant for that close, not a
-/// delay: the missed CLASS is bounded by the slack window, and such
+/// creation (insta-cancel inside the window) NEVER binds — bug_122:
+/// `closed_age_secs` is PG-stamped at the view FETCH and frozen on
+/// the wire while the Job's age recomputes per evaluation, so every
+/// chronology consumer rebases the close age by its witness's
+/// staleness (`closed_age + ⌈now − fetched_at⌉` — see
+/// [`rebase_close_age_secs`]). The realized inequality then compares
+/// wall-time facts (`T_close − T_job > slack`) and is time-invariant
+/// in BOTH evaluation time and witness hold time, up to the wire
+/// age's 1 s granularity (absorbed by the same slack that prices the
+/// clock skew; rounding the staleness UP keeps the residual on the
+/// conservative side of every consumer — harder to bind, harder to
+/// cover). The missed CLASS is bounded by the slack window, and such
 /// closes are handled entirely by the backstop pair (orphan-reap /
 /// `activeDeadlineSeconds`, up to ~300s). The signed trade accepts
 /// that bounded miss to keep respawned same-name Jobs structurally
 /// unselectable.
 pub(super) const CANCEL_CLOSE_SKEW_SLACK_SECS: u64 = 10;
+
+/// bug_122: rebase a wire-frozen `closed_age_secs` to evaluation
+/// time: `closed_age + ⌈staleness⌉`, saturating. Rounding UP is the
+/// conservative direction at every chronology consumer (a larger
+/// close age is harder to bind for the cancel arm and harder to
+/// cover for the death mask — fail-toward-not-cancelling /
+/// fail-toward-counting).
+pub(super) fn rebase_close_age_secs(closed_age_secs: u64, staleness: Duration) -> u64 {
+    closed_age_secs
+        .saturating_add(staleness.as_secs())
+        .saturating_add(u64::from(staleness.subsec_nanos() > 0))
+}
 
 /// A close bound to a Job it may tear down — the ONLY way the cancel
 /// arm selects (bug_113). [`CancelTarget::bind`] owns ALL FOUR
@@ -1397,18 +1424,22 @@ impl<'a> CancelTarget<'a> {
     ///    by type);
     /// 2. **intent**: the Job's intent annotation matches the close;
     /// 3. **generation**: the Job PREDATES the close —
-    ///    `job_older_than(closed_age_secs + CANCEL_CLOSE_SKEW_SLACK_SECS)`.
-    ///    A derivation cancelled and re-submitted respawns the SAME
-    ///    deterministic Job name; the fresh Job is younger than the
-    ///    close and therefore structurally unselectable, whether or
-    ///    not its pod has pulled yet (`closed_age_secs` is already on
-    ///    the wire — PG clock; the slack absorbs PG↔apiserver skew);
+    ///    `job_older_than(rebased_closed_age + CANCEL_CLOSE_SKEW_SLACK_SECS)`,
+    ///    where the rebase adds the view witness's staleness to the
+    ///    wire-frozen `closed_age_secs` (bug_122 — the wire field is
+    ///    PG-stamped at fetch; without the rebase, hold time eats the
+    ///    slack). A derivation cancelled and re-submitted respawns
+    ///    the SAME deterministic Job name; the fresh Job is younger
+    ///    than the close and therefore structurally unselectable,
+    ///    whether or not its pod has pulled yet (the slack absorbs
+    ///    PG↔apiserver skew);
     /// 4. **liveness**: no open attempt covers the Job (a re-dispatch
     ///    that already pulled is busy, not cancellable evidence).
     pub(super) fn bind(
         close: &rio_proto::types::ClosedAttempt,
         job: &'a Job,
         open_attempts: &[rio_proto::types::OpenAttempt],
+        staleness: Duration,
     ) -> Option<Self> {
         if close.cause != rio_proto::types::CloseCause::Cancelled as i32 {
             return None;
@@ -1418,8 +1449,7 @@ impl<'a> CancelTarget<'a> {
             return None;
         }
         let min_age = Duration::from_secs(
-            close
-                .closed_age_secs
+            rebase_close_age_secs(close.closed_age_secs, staleness)
                 .saturating_add(CANCEL_CLOSE_SKEW_SLACK_SECS),
         );
         if !job_older_than(job, min_age) {
@@ -1446,13 +1476,14 @@ pub(super) fn select_closed_attempt_jobs<'a>(
     active: &[&'a Job],
     open_attempts: &[rio_proto::types::OpenAttempt],
     recently_closed: &[rio_proto::types::ClosedAttempt],
+    staleness: Duration,
 ) -> Vec<&'a Job> {
     active
         .iter()
         .filter_map(|j| {
             recently_closed
                 .iter()
-                .find_map(|c| CancelTarget::bind(c, j, open_attempts))
+                .find_map(|c| CancelTarget::bind(c, j, open_attempts, staleness))
         })
         .map(|t| t.job)
         .collect()
@@ -1552,15 +1583,23 @@ pub(super) async fn cancel_closed_attempt_jobs(
         // posture — RULED S2-OQ4; see both sites before "fixing"
         // either to match the other).
         for c in attempts_view.freshest().recently_closed() {
-            if let Some(witness) = super::candidate::VerdictWitness::from_recently_closed_build(c) {
+            if let Some(witness) = super::candidate::VerdictWitness::from_recently_closed_build(
+                c,
+                attempts_view.freshest().staleness(),
+            ) {
                 streaks.note_resolution(key, &c.intent_id, witness, std::time::Instant::now());
             }
         }
     }
+    // bug_122: the selection consumes the witness's staleness so the
+    // generation conjunct evaluates the close's REBASED age (the view
+    // was minted just above, so this is ~the RPC latency — passed
+    // structurally, never priced site-by-site).
     let to_cancel: Vec<&Job> = select_closed_attempt_jobs(
         &active,
         attempts_view.freshest().attempts(),
         attempts_view.freshest().recently_closed(),
+        attempts_view.freshest().staleness(),
     );
     let mut cancelled = 0u32;
     for job in to_cancel {
@@ -3178,7 +3217,7 @@ mod tests {
             ..Default::default()
         };
         let active = vec![&fresh];
-        let selected = select_closed_attempt_jobs(&active, &[], &[close]);
+        let selected = select_closed_attempt_jobs(&active, &[], &[close], Duration::ZERO);
         assert!(
             selected.is_empty(),
             "a Job younger than its close must never be cancel-selected: {:?}",
@@ -3203,24 +3242,40 @@ mod tests {
         // All four hold → selected.
         let active = vec![&old_job];
         assert_eq!(
-            select_closed_attempt_jobs(&active, &[], std::slice::from_ref(&cancelled)).len(),
+            select_closed_attempt_jobs(
+                &active,
+                &[],
+                std::slice::from_ref(&cancelled),
+                Duration::ZERO
+            )
+            .len(),
             1
         );
         // Cause: a COMPLETED close is untouchable by type.
         let completed = close(rio_proto::types::CloseCause::Completed);
-        assert!(select_closed_attempt_jobs(&active, &[], &[completed]).is_empty());
+        assert!(select_closed_attempt_jobs(&active, &[], &[completed], Duration::ZERO).is_empty());
         // Intent: no match, no bind.
         let other = job_with_intent("other", "drv-y", Some(1), None, 600);
         let active_other = vec![&other];
         assert!(
-            select_closed_attempt_jobs(&active_other, &[], std::slice::from_ref(&cancelled))
-                .is_empty()
+            select_closed_attempt_jobs(
+                &active_other,
+                &[],
+                std::slice::from_ref(&cancelled),
+                Duration::ZERO
+            )
+            .is_empty()
         );
         // Liveness: a covering open attempt blocks the bind.
         let covering = open_attempt("drv-x");
         assert!(
-            select_closed_attempt_jobs(&active, &[covering], std::slice::from_ref(&cancelled))
-                .is_empty()
+            select_closed_attempt_jobs(
+                &active,
+                &[covering],
+                std::slice::from_ref(&cancelled),
+                Duration::ZERO
+            )
+            .is_empty()
         );
         // Generation borderline: a Job exactly inside the skew slack
         // (age between closed_age and closed_age+slack) is NOT selected
@@ -3234,7 +3289,111 @@ mod tests {
         );
         let active_b = vec![&borderline];
         assert!(
-            select_closed_attempt_jobs(&active_b, &[], std::slice::from_ref(&cancelled)).is_empty()
+            select_closed_attempt_jobs(
+                &active_b,
+                &[],
+                std::slice::from_ref(&cancelled),
+                Duration::ZERO
+            )
+            .is_empty()
+        );
+    }
+
+    // r[verify ctrl.job.cancel-close-cause+2]
+    /// W9-AT (bug_122): the chronology conjuncts (cancel bind
+    /// conjunct 3 + the death-mask postdates check) are INVARIANT in
+    /// witness staleness — the property the §5-Q19 prose claims,
+    /// driven across the staleness axis s ∈ {0, 2 (the
+    /// ATTEMPTS_VIEW_FRESHNESS license edge), 4 (post-latency)} — the
+    /// population the original tests never had. The PHYSICAL
+    /// configuration is held fixed at evaluation time (the Job's age
+    /// and the close's TRUE age both grow with s; the wire stamp is
+    /// what a fetch s seconds ago would have recorded), so the
+    /// verdict must not move with s.
+    ///
+    /// Pre-fix red (both faces, transcripts in the commit body): with
+    /// separation T_close − T_job = 9s < the 10s slack, the frozen
+    /// wire age BOUND the cancel and COVERED the death once 2s of
+    /// hold time ate the slack.
+    #[test]
+    fn w9_at_chronology_verdicts_invariant_in_witness_staleness() {
+        for s in [0u64, 2, 4] {
+            let staleness = Duration::from_secs(s);
+            let close = |cause: rio_proto::types::CloseCause,
+                         wire_age: u64|
+             -> rio_proto::types::ClosedAttempt {
+                rio_proto::types::ClosedAttempt {
+                    intent_id: "drv-inv".into(),
+                    exec_id: "0198c0de-0000-7000-8000-00000000aaaa".into(),
+                    cause: cause as i32,
+                    closed_age_secs: wire_age,
+                    attempt_kind: rio_proto::types::AttemptKind::Build as i32,
+                }
+            };
+            // Config A — separation 13s > slack: binds and covers at
+            // EVERY s. Job is (14+s)s old at evaluation; the close's
+            // true age is (1+s)s, wire-stamped 1 at the fetch.
+            let job_a = job_with_intent("inv-a", "drv-inv", Some(1), None, (14 + s) as i64);
+            let active_a = vec![&job_a];
+            let cancelled = close(rio_proto::types::CloseCause::Cancelled, 1);
+            assert_eq!(
+                select_closed_attempt_jobs(
+                    &active_a,
+                    &[],
+                    std::slice::from_ref(&cancelled),
+                    staleness
+                )
+                .len(),
+                1,
+                "config A (separation > slack) binds at s={s}"
+            );
+            assert!(
+                super::super::candidate::VerdictWitness::covers_job_death(
+                    &close(rio_proto::types::CloseCause::Completed, 1),
+                    &job_a,
+                    staleness
+                )
+                .is_some(),
+                "config A covers the death at s={s}"
+            );
+            // Config B — separation 9s < slack: binds and covers at
+            // NO s. Job is (10+s)s old; same close.
+            let job_b = job_with_intent("inv-b", "drv-inv", Some(1), None, (10 + s) as i64);
+            let active_b = vec![&job_b];
+            assert!(
+                select_closed_attempt_jobs(
+                    &active_b,
+                    &[],
+                    std::slice::from_ref(&cancelled),
+                    staleness
+                )
+                .is_empty(),
+                "config B (separation < slack) must not bind at s={s} — \
+                 the verdict is invariant in witness hold time"
+            );
+            assert!(
+                super::super::candidate::VerdictWitness::covers_job_death(
+                    &close(rio_proto::types::CloseCause::Completed, 1),
+                    &job_b,
+                    staleness
+                )
+                .is_none(),
+                "config B must not cover at s={s} (fail-toward-counting)"
+            );
+        }
+    }
+
+    /// bug_122: the rebase rounds staleness UP (the conservative
+    /// direction at every consumer) and saturates.
+    #[test]
+    fn rebase_close_age_rounds_up_and_saturates() {
+        assert_eq!(rebase_close_age_secs(5, Duration::ZERO), 5);
+        assert_eq!(rebase_close_age_secs(5, Duration::from_secs(2)), 7);
+        assert_eq!(rebase_close_age_secs(5, Duration::from_millis(1)), 6);
+        assert_eq!(rebase_close_age_secs(5, Duration::from_millis(2500)), 8);
+        assert_eq!(
+            rebase_close_age_secs(u64::MAX - 1, Duration::from_secs(7)),
+            u64::MAX
         );
     }
 }

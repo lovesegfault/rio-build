@@ -1677,8 +1677,17 @@ pub(super) async fn reap_stale_for_intents(
                             .any(|c| {
                                 // merged_bug_036 mint 4b: the close
                                 // must POSTDATE the reaped Job's
-                                // creation to cover its death.
-                                candidate::VerdictWitness::covers_job_death(c, j).is_some()
+                                // creation to cover its death —
+                                // bug_122: on the REBASED age (the
+                                // gate view is held up to the 2s
+                                // license; staleness must not eat
+                                // the skew slack).
+                                candidate::VerdictWitness::covers_job_death(
+                                    c,
+                                    j,
+                                    gate_view.staleness(),
+                                )
+                                .is_some()
                             });
                     if !covered_by_build {
                         ctx.exhausted_streak.lock().note_verdict_free_death(

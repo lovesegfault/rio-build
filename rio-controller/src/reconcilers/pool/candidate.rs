@@ -344,13 +344,16 @@ pub enum SpawnResolution {
     /// A recently-closed BUILD attempt for the intent was observed in
     /// the ledger view --- the scheduler holds an adjudicated verdict
     /// for a worker-closed death (the close outran the controller's
-    /// terminal reap). merged_bug_036: the wire age is baked into the
+    /// terminal reap). merged_bug_036: the age is baked into the
     /// witness at mint, so every consumer can bind the chronology
     /// conjunct (adjudication evidence covers only events it
     /// postdates) at its own premise --- the conjunct is unskippable
-    /// once the variant carries the age.
+    /// once the variant carries the age. bug_122: the baked value is
+    /// the staleness-REBASED age (`closed_age_secs + ⌈witness
+    /// staleness⌉` at mint), so it reads as the close's TRUE age at
+    /// mint time, not the wire-frozen fetch-time stamp.
     ClosedBuild {
-        /// `ClosedAttempt.closed_age_secs` at mint time.
+        /// `ClosedAttempt.closed_age_secs` rebased to mint time.
         closed_age_secs: u64,
     },
 }
@@ -427,11 +430,24 @@ impl VerdictWitness {
     /// pre-field scheduler's default would convert skew into money ---
     /// do not "fix" either site to match the other (the cross-reference
     /// lives at both).
+    ///
+    /// bug_122: `staleness` is the view witness's hold time
+    /// (`AttemptsViewWitness::staleness()`); the baked age is REBASED
+    /// to mint time (`closed_age + ⌈staleness⌉`, rounded up ---
+    /// conservative: an older close resets less), so the
+    /// `note_resolution` chronology guard compares the close's TRUE
+    /// age, not the wire-frozen fetch-time stamp.
     // r[impl ctrl.pool.respawn-backoff+2]
-    pub fn from_recently_closed_build(closed: &rio_proto::types::ClosedAttempt) -> Option<Self> {
+    pub fn from_recently_closed_build(
+        closed: &rio_proto::types::ClosedAttempt,
+        staleness: std::time::Duration,
+    ) -> Option<Self> {
         (closed.attempt_kind == rio_proto::types::AttemptKind::Build as i32).then_some(Self(
             SpawnResolution::ClosedBuild {
-                closed_age_secs: closed.closed_age_secs,
+                closed_age_secs: super::job::rebase_close_age_secs(
+                    closed.closed_age_secs,
+                    staleness,
+                ),
             },
         ))
     }
@@ -447,12 +463,21 @@ impl VerdictWitness {
     /// this conjunct). The reap-mask consumes THIS mint; the
     /// windowed-reset lane keeps mint 4 and binds its chronology at
     /// the record ([`PoolStreaks::note_resolution`]).
+    ///
+    /// bug_122: `staleness` rebases the wire-frozen age exactly as at
+    /// mint 4 and conjunct 3 --- the gate view is held up to the 2 s
+    /// license plus latency, and without the rebase that hold time
+    /// drifted the postdates check permissive (covering deaths the
+    /// close does not actually postdate --- uncounted deaths on a
+    /// spend-enabling lane).
     // r[impl ctrl.pool.respawn-backoff+2]
     pub fn covers_job_death(
         closed: &rio_proto::types::ClosedAttempt,
         job: &k8s_openapi::api::batch::v1::Job,
+        staleness: std::time::Duration,
     ) -> Option<Self> {
         let kind_is_build = closed.attempt_kind == rio_proto::types::AttemptKind::Build as i32;
+        let rebased_age_secs = super::job::rebase_close_age_secs(closed.closed_age_secs, staleness);
         // Saturating: a wire age near u64::MAX must not wrap to a
         // tiny window and INVERT the conjunct — saturation yields an
         // astronomically large age, which correctly FAILS the
@@ -460,13 +485,11 @@ impl VerdictWitness {
         let postdates_job = super::job::job_older_than(
             job,
             std::time::Duration::from_secs(
-                closed
-                    .closed_age_secs
-                    .saturating_add(super::job::CANCEL_CLOSE_SKEW_SLACK_SECS),
+                rebased_age_secs.saturating_add(super::job::CANCEL_CLOSE_SKEW_SLACK_SECS),
             ),
         );
         (kind_is_build && postdates_job).then_some(Self(SpawnResolution::ClosedBuild {
-            closed_age_secs: closed.closed_age_secs,
+            closed_age_secs: rebased_age_secs,
         }))
     }
 }

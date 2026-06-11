@@ -3151,6 +3151,55 @@ async fn pre_creation_close_does_not_cover_a_death() {
 }
 
 // r[verify ctrl.pool.respawn-backoff+2]
+/// W9-AT, note_resolution face (bug_122): the windowed-reset
+/// chronology guard is INVARIANT in witness staleness. Fixed physical
+/// config: deaths at now−30s and now−14s (count 2 ⇒ 20s window, so
+/// retention is observable through respawn_blocked); a close whose
+/// TRUE age at evaluation is 5s — ambiguous within the 10s slack of
+/// the 14s-old death (5+10 ≥ 14) ⇒ RETAIN wholesale, at every s. The
+/// wire stamp is what a fetch s seconds ago recorded (5−s); the mint
+/// rebases it back. Pre-fix: the frozen stamp at s=2 read 3+10 < 14
+/// ⇒ the record was ERASED by a close that does not provably
+/// postdate the death (the same frozen-age inequality as the
+/// captured bind/cover reds — one rebase helper closes all three
+/// consumers).
+#[test]
+fn w9_at_note_resolution_retention_invariant_in_staleness() {
+    use crate::reconcilers::pool::candidate::{PoolStreaks, VerdictWitness};
+
+    for s in [0u64, 2, 4] {
+        let mut streaks = PoolStreaks::default();
+        let key = pkey();
+        let now = std::time::Instant::now();
+        streaks.note_verdict_free_death(&key, "nr", now - std::time::Duration::from_secs(30));
+        streaks.note_verdict_free_death(&key, "nr", now - std::time::Duration::from_secs(14));
+        assert!(
+            streaks.respawn_blocked(&key, "nr", now),
+            "premise: two deaths ⇒ 20s window ⇒ blocked at now"
+        );
+        let witness = VerdictWitness::from_recently_closed_build(
+            &rio_proto::types::ClosedAttempt {
+                intent_id: "nr".into(),
+                exec_id: "exec-nr".into(),
+                cause: rio_proto::types::CloseCause::Completed as i32,
+                closed_age_secs: 5 - s,
+                attempt_kind: rio_proto::types::AttemptKind::Build as i32,
+            },
+            std::time::Duration::from_secs(s),
+        )
+        .expect("BUILD kind mints");
+        streaks.note_resolution(&key, "nr", witness, now);
+        assert!(
+            streaks.respawn_blocked(&key, "nr", now),
+            "left (s={s}): record erased — the frozen stamp read the \
+             close as provably postdating the 14s-old death / right: \
+             retained — the rebased age is ambiguous within the slack \
+             at every s"
+        );
+    }
+}
+
+// r[verify ctrl.pool.respawn-backoff+2]
 /// merged_bug_036 R2: a close cannot erase deaths recorded AFTER it.
 /// PROPOSITION CERTIFIED: the chronology conjunct at the record — the
 /// reset loop fed an in-window close at age 70s does NOT remove a
@@ -3167,13 +3216,16 @@ fn older_close_does_not_erase_newer_deaths() {
     // retained record is observable through respawn_blocked.
     streaks.note_verdict_free_death(&key, "newer", now - std::time::Duration::from_secs(5));
 
-    let witness = VerdictWitness::from_recently_closed_build(&rio_proto::types::ClosedAttempt {
-        intent_id: "newer".into(),
-        exec_id: "exec-n1".into(),
-        cause: rio_proto::types::CloseCause::Completed as i32,
-        closed_age_secs: 70,
-        attempt_kind: rio_proto::types::AttemptKind::Build as i32,
-    })
+    let witness = VerdictWitness::from_recently_closed_build(
+        &rio_proto::types::ClosedAttempt {
+            intent_id: "newer".into(),
+            exec_id: "exec-n1".into(),
+            cause: rio_proto::types::CloseCause::Completed as i32,
+            closed_age_secs: 70,
+            attempt_kind: rio_proto::types::AttemptKind::Build as i32,
+        },
+        std::time::Duration::ZERO,
+    )
     .expect("BUILD kind mints");
     streaks.note_resolution(&key, "newer", witness, now);
 
@@ -3265,7 +3317,8 @@ fn near_max_close_age_saturates_and_retains() {
     let key = pkey();
     let now = std::time::Instant::now();
     streaks.note_verdict_free_death(&key, "ovf", now - std::time::Duration::from_secs(5));
-    let w = VerdictWitness::from_recently_closed_build(&hostile("ovf")).expect("BUILD mints");
+    let w = VerdictWitness::from_recently_closed_build(&hostile("ovf"), std::time::Duration::ZERO)
+        .expect("BUILD mints");
     streaks.note_resolution(&key, "ovf", w, now);
     assert!(
         streaks.respawn_blocked(&key, "ovf", now),
@@ -3276,7 +3329,8 @@ fn near_max_close_age_saturates_and_retains() {
     // Reap-mask lane: the hostile age covers nothing.
     let job = terminal_job_for_intent("rio-builder-p-ovf", "ovf");
     assert!(
-        VerdictWitness::covers_job_death(&hostile("ovf"), &job).is_none(),
+        VerdictWitness::covers_job_death(&hostile("ovf"), &job, std::time::Duration::ZERO)
+            .is_none(),
         "left: Some (the wrapped age postdated every Job) / right: None"
     );
 }
@@ -3311,8 +3365,11 @@ fn fast_crash_generations_meet_the_ladder_inside_a_close_window() {
         let now = base + std::time::Duration::from_secs(tick * 10);
         // The close happened at T=0; its wire age grows per tick and
         // stays inside the scheduler's 120s window for the whole run.
-        let w = VerdictWitness::from_recently_closed_build(&closed(tick * 10))
-            .expect("BUILD kind mints");
+        let w = VerdictWitness::from_recently_closed_build(
+            &closed(tick * 10),
+            std::time::Duration::ZERO,
+        )
+        .expect("BUILD kind mints");
         streaks.note_resolution(&key, "ladder", w, now);
         if !streaks.respawn_blocked(&key, "ladder", now) {
             // The pool respawns; the generation fast-crashes
@@ -3495,7 +3552,7 @@ fn cancel_arm_selects_only_cancelled_close_causes() {
     // The re-dispatched intent has a FRESH open attempt covering it.
     let open = vec![pull_attempt("drv-redispatched", "exec-r2", "node-2")];
 
-    let selected = select_closed_attempt_jobs(&active, &open, &window);
+    let selected = select_closed_attempt_jobs(&active, &open, &window, std::time::Duration::ZERO);
     assert_eq!(
         selected.len(),
         1,
@@ -3510,7 +3567,7 @@ fn cancel_arm_selects_only_cancelled_close_causes() {
 
     // An empty window selects nothing, whatever is active.
     assert!(
-        select_closed_attempt_jobs(&active, &open, &[]).is_empty(),
+        select_closed_attempt_jobs(&active, &open, &[], std::time::Duration::ZERO).is_empty(),
         "no closes in the window → no cancellations"
     );
 }
@@ -3537,7 +3594,7 @@ fn cancel_arm_normal_completion_in_lag_window_not_selected() {
         ..Default::default()
     }];
     assert!(
-        select_closed_attempt_jobs(&active, &[], &window).is_empty(),
+        select_closed_attempt_jobs(&active, &[], &window, std::time::Duration::ZERO).is_empty(),
         "a normal completion in the Job-status propagation lag window \
          must not be selected for cancellation"
     );
