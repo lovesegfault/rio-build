@@ -22,6 +22,8 @@ use std::num::ParseIntError;
 
 use thiserror::Error;
 
+use crate::store_path::{STORE_PREFIX, StorePath, StorePathError};
+
 /// Errors from narinfo parsing.
 #[derive(Debug, Error)]
 pub enum NarInfoError {
@@ -44,12 +46,29 @@ pub enum NarInfoError {
 
     #[error("duplicate field: {0}")]
     DuplicateField(&'static str),
+
+    #[error("invalid References entry {value:?}: {source}")]
+    InvalidReference {
+        value: String,
+        #[source]
+        source: StorePathError,
+    },
+
+    #[error("invalid Deriver value {value:?}: {source}")]
+    InvalidDeriver {
+        value: String,
+        #[source]
+        source: StorePathError,
+    },
 }
 
 /// Parsed narinfo metadata.
 ///
-/// All fields use raw string values as they appear in the narinfo text.
-/// Hash parsing and store path validation are deferred to the caller.
+/// Most fields use raw string values as they appear in the narinfo text;
+/// hash parsing and `StorePath:` validation are deferred to the caller.
+/// `references` and `deriver` are the exception: [`NarInfo::parse`]
+/// rejects tokens that are not well-formed store-path basenames, because
+/// [`NarInfo::verify_sig`] rebuilds the signing fingerprint from them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NarInfo {
     /// Full store path (e.g., `/nix/store/abc...-hello`).
@@ -63,8 +82,11 @@ pub struct NarInfo {
     /// NAR size in bytes.
     pub nar_size: u64,
     /// Referenced store path basenames, space-separated in text form.
+    /// Each token is validated as a store-path basename at parse time.
     pub references: Vec<String>,
-    /// Deriver basename (e.g., `xyz...-hello.drv`).
+    /// Deriver basename (e.g., `xyz...-hello.drv`), validated as a
+    /// store-path basename at parse time. Nix's `Deriver: unknown-deriver`
+    /// sentinel is normalized to `None`.
     pub deriver: Option<String>,
     /// Cryptographic signatures.
     pub sigs: Vec<String>,
@@ -74,6 +96,17 @@ pub struct NarInfo {
     pub file_hash: Option<String>,
     /// Compressed file size in bytes.
     pub file_size: Option<u64>,
+}
+
+/// Validate that a `References`/`Deriver` token is a well-formed store-path
+/// basename (`{32-char nixbase32 hash}-{name}`).
+///
+/// `verify_sig` rebuilds the signing fingerprint from these tokens
+/// (store-dir-prefixed, comma-joined), so they must not be able to carry
+/// fingerprint separator bytes (`,`, `;`, `/`, control characters) — hence
+/// the grammar check at parse time, before any signature is verified.
+fn validate_basename(token: &str) -> Result<(), StorePathError> {
+    StorePath::parse(&format!("{STORE_PREFIX}{token}")).map(drop)
 }
 
 impl NarInfo {
@@ -91,6 +124,7 @@ impl NarInfo {
         let mut file_hash = None;
         let mut file_size = None;
         let mut refs_seen = false;
+        let mut deriver_seen = false;
 
         for line in text.lines() {
             let line = line.trim();
@@ -139,11 +173,31 @@ impl NarInfo {
                         return Err(NarInfoError::DuplicateField("References"));
                     }
                     refs_seen = true;
-                    if !value.is_empty() {
-                        references = value.split_whitespace().map(String::from).collect();
+                    for token in value.split_whitespace() {
+                        validate_basename(token).map_err(|e| NarInfoError::InvalidReference {
+                            value: token.to_string(),
+                            source: e,
+                        })?;
+                        references.push(token.to_string());
                     }
                 }
-                "Deriver" => once!(deriver, "Deriver"),
+                "Deriver" => {
+                    if deriver_seen {
+                        return Err(NarInfoError::DuplicateField("Deriver"));
+                    }
+                    deriver_seen = true;
+                    // Nix writes `Deriver: unknown-deriver` for paths with
+                    // no known deriver (nar-info.cc treats it as absent);
+                    // mirror that instead of rejecting the sentinel as an
+                    // invalid basename.
+                    if value != "unknown-deriver" {
+                        validate_basename(value).map_err(|e| NarInfoError::InvalidDeriver {
+                            value: value.to_string(),
+                            source: e,
+                        })?;
+                        deriver = Some(value.to_string());
+                    }
+                }
                 "Sig" => sigs.push(value.to_string()),
                 "CA" => once!(ca, "CA"),
                 "FileHash" => once!(file_hash, "FileHash"),
@@ -559,7 +613,7 @@ References:
     /// second copy of one line.
     #[rstest]
     #[case("StorePath", "StorePath: /nix/store/def-test")]
-    #[case("Deriver", "Deriver: second.drv")]
+    #[case("Deriver", "Deriver: dddddddddddddddddddddddddddddddd-second.drv")]
     #[case("CA", "CA: fixed:sha256:second")]
     #[case("FileHash", "FileHash: sha256:second")]
     fn duplicate_field_rejected(#[case] field: &str, #[case] dup_line: &str) {
@@ -570,7 +624,7 @@ References:
              NarHash: sha256:0000\n\
              NarSize: 100\n\
              References:\n\
-             Deriver: first.drv\n\
+             Deriver: cccccccccccccccccccccccccccccccc-first.drv\n\
              CA: fixed:sha256:first\n\
              FileHash: sha256:first\n\
              {dup_line}\n"
@@ -651,6 +705,104 @@ FileSize: 54321
         assert_eq!(info.file_hash.as_deref(), Some("sha256:f00dcafe"));
         assert_eq!(info.file_size, Some(54321));
         Ok(())
+    }
+
+    /// Minimal narinfo text with the given References value and optional
+    /// Deriver line spliced in. Used by the token-validation tests.
+    fn narinfo_with(references: &str, deriver: Option<&str>) -> String {
+        let mut text = format!(
+            "StorePath: /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-test\n\
+             URL: nar/test.nar.zst\n\
+             Compression: zstd\n\
+             NarHash: sha256:abc123\n\
+             NarSize: 100\n\
+             References: {references}\n"
+        );
+        if let Some(d) = deriver {
+            text.push_str(&format!("Deriver: {d}\n"));
+        }
+        text
+    }
+
+    /// References tokens must be well-formed store-path basenames. The
+    /// signing fingerprint is rebuilt from these tokens (comma-joined,
+    /// store-dir-prefixed), so any byte a signer's serializer could never
+    /// emit — separators, slashes, control chars — must be rejected at
+    /// parse time, not allowed to reach `verify_sig`.
+    #[rstest]
+    #[case::control_char("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dep\u{1},evil")]
+    #[case::trailing_control_char("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dep\u{1}")]
+    #[case::comma_smuggle("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a,bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b")]
+    #[case::slash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dep/../../escape")]
+    #[case::full_path("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dep")]
+    #[case::no_hash("not-a-store-basename")]
+    #[case::bad_hash_alphabet("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-dep")]
+    fn parse_rejects_invalid_reference(#[case] reference: &str) {
+        let text = narinfo_with(reference, None);
+        let err = NarInfo::parse(&text).unwrap_err();
+        assert!(
+            matches!(err, NarInfoError::InvalidReference { .. }),
+            "reference {reference:?}: expected InvalidReference, got: {err:?}"
+        );
+    }
+
+    /// Same grammar check for the Deriver value — it is also an
+    /// attacker-controlled basename that downstream code prefixes with
+    /// the store dir.
+    #[rstest]
+    #[case::inner_space("cccccccccccccccccccccccccccccccc-hello 2.12.2.drv")]
+    #[case::semicolon("cccccccccccccccccccccccccccccccc-hello;rm.drv")]
+    #[case::traversal("../../etc/passwd")]
+    #[case::no_hash("first.drv")]
+    fn parse_rejects_invalid_deriver(#[case] deriver: &str) {
+        let text = narinfo_with("", Some(deriver));
+        let err = NarInfo::parse(&text).unwrap_err();
+        assert!(
+            matches!(err, NarInfoError::InvalidDeriver { .. }),
+            "deriver {deriver:?}: expected InvalidDeriver, got: {err:?}"
+        );
+    }
+
+    /// Nix writes `Deriver: unknown-deriver` for paths with no known
+    /// deriver (nar-info.cc parses it as "absent"). It is not a valid
+    /// basename, but rejecting it would break real-world caches — mirror
+    /// Nix and normalize to `None`.
+    #[test]
+    fn parse_unknown_deriver_treated_as_absent() {
+        let text = narinfo_with("", Some("unknown-deriver"));
+        let info = NarInfo::parse(&text).unwrap();
+        assert!(info.deriver.is_none());
+    }
+
+    /// Happy path through the full pipeline: a narinfo TEXT with valid
+    /// reference basenames parses and its signature still verifies.
+    /// Guards against the validation breaking well-formed inputs.
+    #[test]
+    fn parse_then_verify_sig_happy_path() {
+        let (ni, trusted) = signed_narinfo("test-key-1", [7u8; 32]);
+        let text = format!(
+            "StorePath: {}\n\
+             URL: {}\n\
+             Compression: {}\n\
+             NarHash: {}\n\
+             NarSize: {}\n\
+             References: {}\n\
+             Sig: {}\n",
+            ni.store_path,
+            ni.url,
+            ni.compression,
+            ni.nar_hash,
+            ni.nar_size,
+            ni.references.join(" "),
+            ni.sigs[0],
+        );
+        let parsed = NarInfo::parse(&text).unwrap();
+        assert_eq!(parsed, ni);
+        assert_eq!(
+            parsed.verify_sig(&[trusted]).as_deref(),
+            Some("test-key-1"),
+            "valid narinfo text must still parse and verify"
+        );
     }
 
     #[test]
