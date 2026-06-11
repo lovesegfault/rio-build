@@ -94,6 +94,16 @@ pub(crate) const INTENT_SELECTOR_ANNOTATION: &str = "rio.build/intent-selector";
 /// deploy-generation residual, disclosed at the re-ack assembly.
 pub(crate) const INTENT_CELLS_ANNOTATION: &str = "rio.build/intent-cells";
 
+/// Pod-template annotation carrying the RENDERED idle-exit bound
+/// (round-10 bug_078): the eta-aware `RIO_IDLE_SECS` the pod actually
+/// runs with. The orphan-running reap reads it back so its grace
+/// covers the pod's own patience (`max(ORPHAN_REAP_GRACE, bound+60)`)
+/// — without the readback, a metal-eta forecast pod waiting lawfully
+/// past 300s would be orphan-reaped mid-wait, the same
+/// reaped-while-wanted defect one lane over. Absent (pre-upgrade
+/// Jobs / Ready spawns at the flat bound) ⇒ the flat grace.
+pub(crate) const IDLE_EXIT_SECS_ANNOTATION: &str = "rio.build/idle-exit-secs";
+
 /// Pod-template annotation carrying the controller's create-time
 /// bench-gate decision. `"true"` ⇒ the spawned builder runs the full
 /// K=3 microbench (STREAM/ioseq/alu) before accepting work. Read via
@@ -1963,6 +1973,11 @@ pub(super) enum ReapDisposition {
     /// `reap_orphan_running` (I-165): Running past the grace with no
     /// scheduler assignment.
     OrphanRunning,
+    /// Round-10 bug_078: a verdict-free TERMINAL reap whose Job
+    /// completed CLEANLY (succeeded > 0 — the worker's own lawful
+    /// exit, e.g. a forecast pod whose bound elapsed). Counted, never
+    /// laddered: clean exits do not step the futility breaker.
+    CleanExit,
     /// A verdict-free death stepped the respawn ladder (the
     /// escalation edge — minted with the death, before the next
     /// spawn pass).
@@ -1977,13 +1992,14 @@ impl ReapDisposition {
     /// variant without extending it fails the length assert against
     /// the exhaustive match below). Test-facing census surface.
     #[cfg(test)]
-    pub(super) const ALL: [Self; 8] = [
+    pub(super) const ALL: [Self; 9] = [
         Self::ExcessPending,
         Self::OrphanPending,
         Self::OrphanSuspended,
         Self::StaleTerminal,
         Self::SelectorDrift,
         Self::OrphanRunning,
+        Self::CleanExit,
         Self::Escalated,
         Self::GaveUp,
     ];
@@ -1997,6 +2013,7 @@ impl ReapDisposition {
             Self::StaleTerminal => "stale-terminal",
             Self::SelectorDrift => "selector-drift",
             Self::OrphanRunning => "orphan-running",
+            Self::CleanExit => "clean-exit",
             Self::Escalated => "escalated",
             Self::GaveUp => "gave-up",
         }
@@ -2356,8 +2373,38 @@ pub(super) async fn reap_stale_for_intents(
                         unreachable!("Deferred is peeled by the preceding match arm")
                     }
                 };
+                // Round-10 bug_078 leg (ii): the verdict-free reap
+                // splits into TYPED exit dispositions (R21) — the
+                // §13b-legalized CLEAN idle exit (the worker chose to
+                // exit: Job Complete, succeeded > 0 — a forecast pod
+                // whose work never arrived inside its bound, or any
+                // lawful no-work exit) is NOT pathological and stops
+                // stepping the wedged-builder ladder; a WEDGED death
+                // (Job Failed: OOM, nonzero exit, deadline) steps as
+                // before. The discriminator is the Job's own terminal
+                // status — the same observable the reap classified on.
+                let clean_idle_exit =
+                    j.status.as_ref().and_then(|st| st.succeeded).unwrap_or(0) > 0;
                 if matches!(disposition, ReapDisposition::StaleTerminal)
                     && no_verdict_at_delete
+                    && clean_idle_exit
+                    && let Some(intent_id) = super::job::job_intent_id(j)
+                    && !intent_id.is_empty()
+                {
+                    // The clean letter is COUNTED (observable), never
+                    // laddered: k clean exits step nothing.
+                    note_reap_disposition(pool, ReapDisposition::CleanExit);
+                    debug!(
+                        pool, intent = %intent_id,
+                        "verdict-free CLEAN exit (Job Complete, no \
+                         attempt): respawn proceeds at cadence — the \
+                         futility ladder is for wedged deaths \
+                         (bug_078)"
+                    );
+                }
+                if matches!(disposition, ReapDisposition::StaleTerminal)
+                    && no_verdict_at_delete
+                    && !clean_idle_exit
                     && let Some(intent_id) = super::job::job_intent_id(j)
                     && !intent_id.is_empty()
                 {
@@ -2566,6 +2613,14 @@ pub(super) fn build_job(
         .and_then(|m| m.annotations.as_mut())
         .expect("ephemeral_job sets template.metadata.annotations");
     pod_anns.insert(INTENT_ID_ANNOTATION.into(), intent.intent_id.clone());
+    // Round-10 bug_078: stamp the RENDERED idle bound so the
+    // orphan-running grace can cover the pod's own patience (see
+    // IDLE_EXIT_SECS_ANNOTATION). Stamped unconditionally — the
+    // readback treats absent as the flat bound.
+    pod_anns.insert(
+        IDLE_EXIT_SECS_ANNOTATION.into(),
+        pod::idle_exit_secs(intent).to_string(),
+    );
     // Round-10 merged_bug_049: the durable cell echo for the
     // page-independent re-ack lane (see INTENT_CELLS_ANNOTATION).
     // Fail-open on unrenderable zips — hw-agnostic intents
@@ -2615,7 +2670,7 @@ pub(super) fn build_job(
 /// volume-level limit fires. Budgeting bare `disk_bytes` (1.0×) here
 /// while the overlay sizeLimit is `headroom×` made the headroom
 /// unreachable — pods evicted at ≈p90 instead of `headroom×p90`.
-fn apply_intent_resources(
+pub(super) fn apply_intent_resources(
     pod_spec: &mut PodSpec,
     pool: &Pool,
     i: &SpawnIntent,
@@ -2653,6 +2708,17 @@ fn apply_intent_resources(
         "RIO_DAEMON_TIMEOUT_SECS",
         &worker_timeout.to_string(),
     ));
+    // Round-10 bug_078 leg (i): the eta-aware idle bound. The base
+    // spec renders the flat `RIO_IDLE_SECS` (pod::POOL_IDLE_EXIT_SECS)
+    // intent-free; forecast intents OVERRIDE it in place here —
+    // mutate, never duplicate (kubelet takes the last duplicate but
+    // apply-validation warns, and one name must mean one value).
+    let idle = pod::idle_exit_secs(i);
+    if idle != pod::POOL_IDLE_EXIT_SECS
+        && let Some(e) = env.iter_mut().find(|e| e.name == "RIO_IDLE_SECS")
+    {
+        e.value = Some(idle.to_string());
+    }
     // r[impl ctrl.pool.hw-bench-needed+2]
     // Downward-API env var for `rio.build/hw-bench-needed`. The
     // annotation is stamped at pod-CREATE time by `build_job` (above on
@@ -2979,7 +3045,7 @@ mod tests {
         }
         // The exhaustive match in as_label is the census; ALL must
         // cover it (a new variant fails the match first, then here).
-        assert_eq!(ReapDisposition::ALL.len(), 8);
+        assert_eq!(ReapDisposition::ALL.len(), 9);
     }
 
     /// W9-CO, Job-spec face (live_056-b): the minted Job carries the

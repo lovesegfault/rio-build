@@ -1318,7 +1318,8 @@ async fn attemptless_stale_job_reaps_on_the_second_strike() {
 
     // Attempt-less: the scheduler ledger is empty for this intent.
     mock.open_attempts.write().unwrap().attempts.clear();
-    let job = terminal_job_for_intent("rio-builder-p-strike1", "strike1");
+    // bug_078: the ladder pins the WEDGED shape (Job Failed).
+    let job = failed_job_for_intent("rio-builder-p-strike1", "strike1");
     let intents = [intent_named("strike1")];
 
     // Tick 1: strike — zero deletes (the verifier holds the delete
@@ -1872,7 +1873,7 @@ async fn terminal_sample_gate_still_dedupes_same_object() {
     );
 }
 
-// r[verify ctrl.ephemeral.reap-orphan-running+5]
+// r[verify ctrl.ephemeral.reap-orphan-running+6]
 /// Obligation-(i) posture: the orphan reap's only busy source is the
 /// durable open-attempt view, and an unreadable view (RPC error /
 /// scheduler unreachable) means NO reap this tick — fail-closed. With
@@ -1898,7 +1899,7 @@ async fn reap_orphan_running_fail_closed_on_view_error() {
     // never-answering verifier instead of passing).
 }
 
-// r[verify ctrl.ephemeral.reap-orphan-running+5]
+// r[verify ctrl.ephemeral.reap-orphan-running+6]
 // r[verify ctrl.job.busy-from-open-attempts+2]
 // r[verify ctrl.job.orphan-leader-age]
 /// Positive control for the fail-closed test above, and the busy-view
@@ -2913,6 +2914,20 @@ fn terminal_job_for_intent(name: &str, intent_id: &str) -> Job {
     j
 }
 
+/// Round-10 bug_078: the WEDGED terminal shape (Job Failed — OOM,
+/// nonzero exit, deadline). The futility-ladder tests pin THIS shape;
+/// a `succeeded` terminal is the worker's lawful clean exit and no
+/// longer steps the breaker (W10-AR).
+fn failed_job_for_intent(name: &str, intent_id: &str) -> Job {
+    let mut j = running_job_for_intent(name, intent_id);
+    j.status = Some(JobStatus {
+        ready: Some(0),
+        failed: Some(1),
+        ..Default::default()
+    });
+    j
+}
+
 /// A Job whose `activeDeadlineSeconds` fired: `Failed/DeadlineExceeded`
 /// condition set, intent annotation carried (the
 /// `report_deadline_exceeded_jobs` input shape).
@@ -3177,7 +3192,8 @@ async fn pre_creation_close_does_not_cover_a_death() {
         closed_age_secs: 70,
         attempt_kind: rio_proto::types::AttemptKind::Build as i32,
     }];
-    let mut job = terminal_job_for_intent("rio-builder-p-precre", "precre");
+    // bug_078: the ladder pins the WEDGED shape (Job Failed).
+    let mut job = failed_job_for_intent("rio-builder-p-precre", "precre");
     {
         use k8s_openapi::jiff::{SignedDuration, Timestamp};
         job.metadata.creation_timestamp =
@@ -4513,4 +4529,125 @@ fn w10_al_re_ack_derives_from_job_list_independent_of_paging() {
     );
     assert!(by_id.contains_key("fresh"), "spawned intents chain");
     assert_eq!(acks.len(), 4, "exactly the four lawful acks");
+}
+
+// r[verify ctrl.pool.respawn-backoff+2]
+/// **W10-AR (round-10 bug_078, the breaker discriminator at its own
+/// quantifier).** k CLEAN exits step NOTHING (a verdict-free terminal
+/// reap whose Job COMPLETED is the worker's lawful exit — the typed
+/// `clean-exit` letter is counted, the ladder untouched, the respawn
+/// proceeds at cadence); ONE wedged death (Job Failed) steps. Driven
+/// through the production reap chokepoint with the two-tick strike +
+/// floor crossed per pass.
+///
+/// Pre-fix red (discriminator severed — every verdict-free terminal
+/// stepped): panicked at 'k clean exits step nothing: the respawn
+/// must NOT be blocked after a lawful Complete exit (pre-fix: the
+/// ladder taxed the forecast respawn toward sticky give-up)'
+#[tokio::test]
+async fn w10_ar_clean_exits_never_step_the_ladder_wedged_deaths_do() {
+    use metrics_util::debugging::DebuggingRecorder;
+    let rec = DebuggingRecorder::new();
+    let _g = ::metrics::set_default_local_recorder(&rec);
+
+    let (client, verifier) = ApiServerVerifier::new();
+    let (ctx, mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
+    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+    let key = pkey();
+    mock.open_attempts.write().unwrap().attempts.clear();
+
+    // Three reaping strikes in order: two clean rounds, one wedged.
+    let del = |name: &str| Scenario {
+        method: http::Method::DELETE,
+        path_contains: Box::leak(format!("/namespaces/rio/jobs/{name}").into_boxed_str()),
+        body_contains: Some(r#""propagationPolicy":"Background""#),
+        status: 200,
+        body_json: serde_json::to_string(&Job::default()).unwrap(),
+    };
+    let guard = verifier.run(vec![
+        del("rio-builder-p-cleanfc"),
+        del("rio-builder-p-cleanfc"),
+        del("rio-builder-p-wedgefc"),
+    ]);
+
+    let reap = |job: Job, intent: &'static str| {
+        let jobs_api = jobs_api.clone();
+        let ctx = ctx.clone();
+        let key = key.clone();
+        async move {
+            reap_stale_for_intents(
+                &jobs_api,
+                std::slice::from_ref(&job),
+                &want_complete(&[intent_named(intent)], "p", ExecutorKind::Builder),
+                &ctx,
+                &crate::fixtures::test_pool("p", ExecutorKind::Builder),
+                "p",
+                &key,
+            )
+            .await
+        }
+    };
+
+    // k = 2 clean cycles: Complete Job reaped verdict-free, twice.
+    for round in 0..2u32 {
+        let job = terminal_job_for_intent("rio-builder-p-cleanfc", "cleanfc");
+        let first = reap(job.clone(), "cleanfc").await;
+        assert!(first.is_empty(), "round {round}: strike 1 defers");
+        crate::reconcilers::pool::jobs::backdate_strikes_for_test(
+            &key,
+            std::time::Duration::from_secs(21),
+        );
+        let second = reap(job, "cleanfc").await;
+        assert_eq!(second.len(), 1, "round {round}: strike 2 reaps");
+        assert!(
+            !ctx.exhausted_streak.lock().respawn_blocked(
+                &key,
+                "cleanfc",
+                std::time::Instant::now()
+            ),
+            "k clean exits step nothing: the respawn must NOT be \
+             blocked after a lawful Complete exit (pre-fix: the ladder \
+             taxed the forecast respawn toward sticky give-up)"
+        );
+    }
+
+    // ONE wedged death (Job Failed) steps the ladder immediately.
+    let job = failed_job_for_intent("rio-builder-p-wedgefc", "wedgefc");
+    let first = reap(job.clone(), "wedgefc").await;
+    assert!(first.is_empty(), "wedge: strike 1 defers");
+    crate::reconcilers::pool::jobs::backdate_strikes_for_test(
+        &key,
+        std::time::Duration::from_secs(21),
+    );
+    let second = reap(job, "wedgefc").await;
+    assert_eq!(second.len(), 1, "the wedged death reaps");
+    guard.verified().await;
+    assert!(
+        ctx.exhausted_streak
+            .lock()
+            .respawn_blocked(&key, "wedgefc", std::time::Instant::now()),
+        "one wedged death steps the ladder (the bug_028 economics \
+         survive the discriminator)"
+    );
+
+    // The typed letters: exactly 2 clean-exit counts, 1 escalation.
+    // ppppp: snapshot exactly once.
+    let snap = rec.snapshotter().snapshot().into_vec();
+    let count_of = |disp: &str| {
+        snap.iter()
+            .find_map(|(k, _, _, v)| {
+                let key = k.key();
+                (key.name() == "rio_controller_reap_dispositions_total"
+                    && key
+                        .labels()
+                        .any(|l| l.key() == "disposition" && l.value() == disp))
+                .then_some(match v {
+                    metrics_util::debugging::DebugValue::Counter(n) => *n,
+                    _ => 0,
+                })
+            })
+            .unwrap_or(0)
+    };
+    assert_eq!(count_of("clean-exit"), 2, "two clean letters counted");
+    assert_eq!(count_of("escalated"), 1, "one wedged escalation only");
 }

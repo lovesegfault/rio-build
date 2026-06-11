@@ -52,8 +52,45 @@ const KVM_NODE_LABEL: &str = "rio.build/kvm";
 /// can then assert its headroom at compile time instead of carrying a
 /// "MUST exceed" comment that nothing enforces. 120 s matches the
 /// builder config default, so today's effective value is unchanged.
-// r[impl ctrl.job.idle-render-coupled]
+// r[impl ctrl.job.idle-render-coupled+2]
 pub(super) const POOL_IDLE_EXIT_SECS: u64 = 120;
+
+/// Round-10 bug_078 (triage-corrected close, leg (i)): the slack the
+/// FORECAST idle bound adds above the intent's own eta. DERIVED from
+/// the mint expiry formula (`mint_executor_tokens`: token expiry =
+/// `deadline + eta + 300` — "a forecast-spawned pod's token covers
+/// its boot horizon"; this is the SAME 300s horizon slack, applied to
+/// the idle bound so the pod's patience and its credential agree on
+/// what "the boot horizon" means). A metal forecast pod with
+/// eta ∈ (120s, 600s] deterministically idle-exited at the flat 120s,
+/// was StaleTerminal-reaped while still wanted, and stepped the
+/// wedged-builder futility ladder toward sticky give-up — taxing or
+/// permanently blocking the real spawn. VIOLABLE (R17): time axis —
+/// the idle cost it can add is bounded by `eta + 300s` per forecast
+/// pod (eta itself is lead-seed-bounded ≤ max lead_time_seed);
+/// cost axis = that idle node-time, priced as the warm-hit trade the
+/// §13b forecast exists to buy; population axis = forecast spawns
+/// only (`ready == Some(false)`); size N/A. A const, not config —
+/// the eta is the per-intent variable; the slack is the formula's.
+pub(super) const FORECAST_IDLE_ETA_SLACK_SECS: u64 = 300;
+
+/// The per-intent idle-exit bound (round-10 bug_078): Ready intents
+/// keep the flat [`POOL_IDLE_EXIT_SECS`]; FORECAST intents
+/// (`ready == Some(false)`) wait at least their own eta + the
+/// boot-horizon slack — no forecast spawn carries an idle bound
+/// shorter than the horizon it was spawned to cover (the invariant;
+/// the mint expiry formula already computes the same horizon for the
+/// token). Floored at the flat bound (an overdue-deps forecast with
+/// eta≈0 keeps today's patience; the slack still covers the
+/// dep-completion jitter that made it overdue).
+pub(super) fn idle_exit_secs(intent: &rio_proto::types::SpawnIntent) -> u64 {
+    if intent.ready == Some(false) {
+        let eta = intent.eta_seconds.max(0.0).ceil() as u64;
+        POOL_IDLE_EXIT_SECS.max(eta.saturating_add(FORECAST_IDLE_ETA_SLACK_SECS))
+    } else {
+        POOL_IDLE_EXIT_SECS
+    }
+}
 
 /// The coupling the prose used to carry: a healthy idle pod
 /// self-terminates (idle bound) well before the controller-side
@@ -1402,7 +1439,7 @@ mod tests {
         );
     }
 
-    // r[verify ctrl.job.idle-render-coupled]
+    // r[verify ctrl.job.idle-render-coupled+2]
     /// merged_bug_221 leg 2: the pod spec renders `RIO_IDLE_SECS`
     /// from `POOL_IDLE_EXIT_SECS` (pod env wins over image env), so
     /// the orphan-grace const-assert checks the value pods actually

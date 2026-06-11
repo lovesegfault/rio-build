@@ -116,18 +116,19 @@ pool-delete cleanup.
   for them.
 ]
 
-#r("ctrl.ephemeral.reap-orphan-running+5")[
+#r("ctrl.ephemeral.reap-orphan-running+6")[
   When a Running Job (`JobStatus.ready > 0`) is older than the orphan grace
   (default 5min) AND no open pull-mode attempt from
   `AdminService.ListOpenAttempts` covers it (match key: the Job's
   `rio.build/intent-id` annotation), the controller MUST delete the Job. This
   is the controller-side backstop for I-165: a builder process stuck in
   uninterruptible sleep (D-state FUSE wait, OOM-loop) cannot self-exit via the
-  120s `RIO_IDLE_SECS` idle bound, never completes a pull, and
+  rendered `RIO_IDLE_SECS` idle bound, never completes a pull, and
   would otherwise sit until `activeDeadlineSeconds` (default 1h). The grace
-  MUST exceed the builder's idle bound so the process-level exit is given
-  first chance; the controller reap fires only when the process cannot act on
-  its own. A Job covered by an open attempt is NOT reaped --- the ledger says
+  MUST exceed the Job's RENDERED idle bound (per
+  #rref("ctrl.job.idle-render-coupled") --- eta-priced for forecast spawns)
+  so the process-level exit is given first chance; the controller reap fires
+  only when the process cannot act on its own. A Job covered by an open attempt is NOT reaped --- the ledger says
   a build is in progress; `activeDeadlineSeconds` is the
   backstop for stuck-mid-build. The reap is *skipped entirely* when the
   `ListOpenAttempts` read fails (scheduler unreachable / standby) ---
@@ -1171,14 +1172,23 @@ during a controller outage falls back to the orphan reap ---
 the same backstop pair as before, minus the wrongful teardown of normal
 completions the closed-edge inference allowed.
 
-#r("ctrl.job.idle-render-coupled")[
+#r("ctrl.job.idle-render-coupled+2")[
   The controller MUST render the builder idle-exit bound (`RIO_IDLE_SECS`)
-  into the executor pod env from its own `POOL_IDLE_EXIT_SECS` constant, and
-  the orphan grace MUST satisfy `ORPHAN_REAP_GRACE >= POOL_IDLE_EXIT_SECS +
-  60s` as a compile-time assertion. Pod env wins over image env, so the
-  value pods actually run with is the one the assertion checks --- the
-  reap/idle coupling is enforced where it can fail the build, not stated in
-  prose beside two constants that can drift apart.
+  into the executor pod env from its own constants: the flat
+  `POOL_IDLE_EXIT_SECS` for Ready intents, and for FORECAST intents
+  (`ready == false`) an eta-priced bound of at least
+  `eta + FORECAST_IDLE_ETA_SLACK_SECS` floored at the flat bound --- no
+  forecast spawn may carry an idle bound shorter than the boot horizon it
+  was spawned to cover (the same horizon the executor-token mint prices).
+  The rendered bound MUST be stamped on the Job (the
+  `rio.build/idle-exit-secs` template annotation), and the orphan-running
+  grace MUST cover the pod's own patience: per Job,
+  `max(ORPHAN_REAP_GRACE, rendered_bound + 60s)`, with the flat case
+  additionally pinned by the compile-time assertion
+  `ORPHAN_REAP_GRACE >= POOL_IDLE_EXIT_SECS + 60s`. Pod env wins over image
+  env, so the value pods actually run with is the one the coupling checks
+  --- the reap/idle coupling is enforced where it can fail the build, not
+  stated in prose beside constants that can drift apart.
 ]
 
 = ComponentScaler

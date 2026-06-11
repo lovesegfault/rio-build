@@ -707,69 +707,100 @@ fn any_under_threshold_uses_response_value() {
     assert!(cache.any_under_threshold(a()));
 }
 
-/// ADR-023 §13a ship-standalone gate: forecast (`!ready`) intents are
-/// dropped before any Job-create / reap / ack so a not-yet-Ready drv
-/// never spawns a pod that idles for `eta_seconds` then exits. The
-/// gate is on the FULL `intents` vec (not just the spawn slice) so
-/// `queued`/`reap_excess_pending` see one consistent set. §13b removes
-/// this — `placeable` from the NodeClaim FFD sim becomes the gate
-/// instead.
+// r[verify ctrl.job.idle-render-coupled+2]
+/// **W10-AQ (round-10 bug_078, replacing the vacuous
+/// `forecast_intents_filtered_in_13a`).** The retired test re-implem-
+/// ented a DEAD §13a ready-retain inline on a local vec (its own doc
+/// conceded "§13b removes this") — R20: the concession dies; this
+/// test reaches the real premise. Forecast intents are NOT
+/// ready-filtered: they spawn through the placeable gate, and the
+/// spawn is PRICED — a forecast pod's rendered `RIO_IDLE_SECS` is
+/// `max(flat, eta + 300s)` (the mint-expiry horizon slack), stamped
+/// on the Job for the orphan-grace readback, so a metal-eta pod
+/// (eta ∈ (120s, 600s]) survives to its horizon instead of
+/// deterministically idle-exiting at 120s and stepping the futility
+/// ladder while still wanted.
 ///
-/// bug_030: keys on the explicit `ready` field, NOT
-/// `eta_seconds == 0.0`. The third intent below has overdue deps
-/// (`eta_seconds` clamped to 0.0) but `ready=false` — it MUST be
-/// filtered out.
-///
-/// bug_001: `ready=None` (a pre-§13a scheduler that doesn't know
-/// field 13) MUST be retained — pre-§13a only emitted Ready-loop
-/// intents, so absent ⇒ Ready. The fourth intent below is the
-/// legacy-skew case.
+/// Pre-fix red (the flat bound — `idle_exit_secs` severed to
+/// `POOL_IDLE_EXIT_SECS`):
+///   assertion `left == right` failed: metal-eta forecast pod waits
+///   to its horizon (pre-fix: flat 120s — idle-exit + StaleTerminal
+///   reap + ladder toward sticky give-up)
+///     left: Some("120")  right: Some("780")
 #[test]
-fn forecast_intents_filtered_in_13a() {
-    // Unit-level: the `retain` is one line; assert directly on the
-    // collected hw_classes input so the per-tick RPC doesn't ask for
-    // forecast-only classes. The Job-create skip is asserted
-    // structurally (the `retain` precedes both `hw_sampled` and
-    // `to_spawn_intents`).
-    let intents = [
-        rio_proto::types::SpawnIntent {
-            intent_id: "ready".into(),
-            ready: Some(true),
-            eta_seconds: 0.0,
-            hw_class_names: vec!["intel-7-mid".into()],
-            ..Default::default()
-        },
-        rio_proto::types::SpawnIntent {
-            intent_id: "forecast".into(),
-            ready: Some(false),
-            eta_seconds: 42.5,
-            hw_class_names: vec!["amd-9-hi".into()],
-            ..Default::default()
-        },
-        rio_proto::types::SpawnIntent {
-            intent_id: "overdue".into(),
-            ready: Some(false),
-            eta_seconds: 0.0, // clamped — would pass `eta == 0.0`
-            hw_class_names: vec!["amd-9-hi".into()],
-            ..Default::default()
-        },
-        rio_proto::types::SpawnIntent {
-            intent_id: "legacy".into(),
-            ready: None, // pre-§13a sender — field 13 absent on wire
-            eta_seconds: 0.0,
-            hw_class_names: vec!["arm-v2-lo".into()],
-            ..Default::default()
-        },
-    ];
-    let mut filtered: Vec<_> = intents.to_vec();
-    filtered.retain(|i| i.ready.unwrap_or(true));
-    assert_eq!(filtered.len(), 2);
-    assert_eq!(filtered[0].intent_id, "ready");
-    assert_eq!(filtered[1].intent_id, "legacy");
-    let hs: std::collections::HashSet<_> = filtered.iter().flat_map(jobs::hw_classes_in).collect();
+fn w10_aq_forecast_idle_bound_priced_by_eta() {
+    let wp = test_wp();
+    let mut forecast = rio_proto::types::SpawnIntent {
+        intent_id: "metal-fc".into(),
+        ready: Some(false),
+        eta_seconds: 480.0, // metal lead seed regime: (120, 600]
+        cores: 4,
+        mem_bytes: 1 << 30,
+        ..Default::default()
+    };
+    let mut pod = test_pod_spec(&wp);
+    jobs::apply_intent_resources(&mut pod, &wp, &forecast, &Default::default());
+    let idle = pod.containers[0]
+        .env
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|e| e.name == "RIO_IDLE_SECS")
+        .and_then(|e| e.value.as_deref());
     assert_eq!(
-        hs,
-        std::collections::HashSet::from(["intel-7-mid".into(), "arm-v2-lo".into()])
+        idle,
+        Some("780"),
+        "metal-eta forecast pod waits to its horizon (pre-fix: flat \
+         120s — idle-exit + StaleTerminal reap + ladder toward sticky \
+         give-up)"
+    );
+
+    // Ready intents keep the flat bound (the override narrows to the
+    // forecast population).
+    forecast.ready = Some(true);
+    let mut pod = test_pod_spec(&wp);
+    jobs::apply_intent_resources(&mut pod, &wp, &forecast, &Default::default());
+    let idle = pod.containers[0]
+        .env
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|e| e.name == "RIO_IDLE_SECS")
+        .and_then(|e| e.value.as_deref());
+    assert_eq!(idle, Some("120"), "Ready spawns keep the flat bound");
+
+    // Legacy-skew face (bug_001's quantifier): ready=None (pre-§13a
+    // sender) reads as Ready — flat bound, never eta-priced.
+    forecast.ready = None;
+    let mut pod = test_pod_spec(&wp);
+    jobs::apply_intent_resources(&mut pod, &wp, &forecast, &Default::default());
+    let idle = pod.containers[0]
+        .env
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|e| e.name == "RIO_IDLE_SECS")
+        .and_then(|e| e.value.as_deref());
+    assert_eq!(idle, Some("120"), "absent ready ⇒ Ready semantics");
+
+    // Overdue-deps forecast (eta clamped to 0, bug_030's case): the
+    // slack still applies — 300s ≥ flat, so the bound is the slack.
+    forecast.ready = Some(false);
+    forecast.eta_seconds = 0.0;
+    let mut pod = test_pod_spec(&wp);
+    jobs::apply_intent_resources(&mut pod, &wp, &forecast, &Default::default());
+    let idle = pod.containers[0]
+        .env
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|e| e.name == "RIO_IDLE_SECS")
+        .and_then(|e| e.value.as_deref());
+    assert_eq!(
+        idle,
+        Some("300"),
+        "overdue forecast keeps the horizon slack (dep-completion \
+         jitter is what made it overdue)"
     );
 }
 

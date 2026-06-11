@@ -238,7 +238,7 @@ pub(super) fn is_pending_job(j: &Job) -> bool {
 /// Active AND `status.ready > 0` — the Job's pod container has
 /// started. Complement of [`is_pending_job`] within the active set
 /// (both predicates exclude terminating Jobs). The orphan-reap
-/// boundary for `r[ctrl.ephemeral.reap-orphan-running+5]`: only Running
+/// boundary for `r[ctrl.ephemeral.reap-orphan-running+6]`: only Running
 /// Jobs are candidates (Pending is handled by `reap_excess_pending`;
 /// Complete/Failed by TTL).
 ///
@@ -264,7 +264,7 @@ pub(super) fn is_running_job(j: &Job) -> bool {
 /// reap targets pods that CANNOT self-exit (I-165: D-state FUSE wait,
 /// OOM-loop) and would otherwise burn `activeDeadlineSeconds`
 /// (default 1h) holding a node.
-// r[impl ctrl.ephemeral.reap-orphan-running+5]
+// r[impl ctrl.ephemeral.reap-orphan-running+6]
 pub(super) const ORPHAN_REAP_GRACE: Duration = Duration::from_secs(300);
 
 /// Effective orphan-reap grace: [`ORPHAN_REAP_GRACE`] unless the
@@ -1156,6 +1156,30 @@ pub(super) async fn delete_job_with_synthesized_report(
 /// `creation_timestamp` strictly before `now - min_age`. `None` →
 /// not-old-enough (conservative; same posture as
 /// [`select_excess_pending`]).
+/// Round-10 bug_078: the per-Job orphan grace — the GLOBAL grace
+/// raised to the Job's own RENDERED idle bound + 60s propagation
+/// slack (the same headroom the `POOL_IDLE_EXIT_SECS` const-assert
+/// pins for the flat case). An eta-aware forecast pod lawfully waits
+/// past the flat 300s grace; reaping it mid-wait is the
+/// reaped-while-wanted defect one lane over. Reads the
+/// `rio.build/idle-exit-secs` template annotation the spawn stamped —
+/// the Job itself carries the bound, so the coupling survives paging,
+/// restarts, and off-page intents. Absent/unparseable ⇒ the global
+/// grace (pre-upgrade Jobs; the flat law).
+pub(super) fn effective_orphan_grace(j: &Job, global: Duration) -> Duration {
+    let rendered = j
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.metadata.as_ref())
+        .and_then(|m| m.annotations.as_ref())
+        .and_then(|a| a.get(super::jobs::IDLE_EXIT_SECS_ANNOTATION))
+        .and_then(|v| v.parse::<u64>().ok());
+    match rendered {
+        Some(secs) => global.max(Duration::from_secs(secs.saturating_add(60))),
+        None => global,
+    }
+}
+
 pub(super) fn job_older_than(j: &Job, min_age: Duration) -> bool {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
     // Total over unrepresentable ages: a `min_age` too large for the
@@ -1182,7 +1206,7 @@ pub(super) fn job_older_than(j: &Job, min_age: Duration) -> bool {
 
 /// Running Jobs older than `min_age` with no open pull-mode attempt
 /// covering them — the reap set for
-/// `r[ctrl.ephemeral.reap-orphan-running+5]`.
+/// `r[ctrl.ephemeral.reap-orphan-running+6]`.
 ///
 /// Busy has exactly one carrier: an open attempt from the scheduler's
 /// durable open-attempt view ([`covered_by_open_pull_attempt`]). A
@@ -1212,7 +1236,7 @@ pub(super) fn select_orphan_running<'a>(
     jobs.iter()
         .filter(|j| {
             is_running_job(j)
-                && job_older_than(j, min_age)
+                && job_older_than(j, effective_orphan_grace(j, min_age))
                 && !j
                     .metadata
                     .name
@@ -1231,7 +1255,7 @@ pub(super) fn select_orphan_running<'a>(
         .collect()
 }
 
-// r[impl ctrl.ephemeral.reap-orphan-running+5]
+// r[impl ctrl.ephemeral.reap-orphan-running+6]
 // r[impl ctrl.job.busy-from-open-attempts+2]
 /// Delete Running ephemeral Jobs with no open attempt covering them
 /// after [`orphan_reap_grace`]. Same I-165 stuck-process failure
@@ -3010,7 +3034,7 @@ mod tests {
         assert_eq!(names, vec!["rio-builder-p-a"]);
     }
 
-    // r[verify ctrl.ephemeral.reap-orphan-running+5]
+    // r[verify ctrl.ephemeral.reap-orphan-running+6]
     /// Same-tick consistency for the orphan-running selector: a Job
     /// already foreground-deleted by `reap_stale_for_intents` is not
     /// re-selected (would re-delete + double-count the metric).
@@ -3053,7 +3077,7 @@ mod tests {
         assert!(!is_running_job(&terminating));
     }
 
-    // r[verify ctrl.ephemeral.reap-orphan-running+5]
+    // r[verify ctrl.ephemeral.reap-orphan-running+6]
     /// Grace + phase filtering: Jobs younger than grace are excluded
     /// (process-level idle-exit gets first chance); Pending and
     /// Completed Jobs are excluded (other reapers' territory).
@@ -3137,7 +3161,7 @@ mod tests {
     }
 
     // r[verify ctrl.job.busy-from-open-attempts+2]
-    // r[verify ctrl.ephemeral.reap-orphan-running+5]
+    // r[verify ctrl.ephemeral.reap-orphan-running+6]
     /// The open-attempt busy view: a Running Job past the grace backed
     /// by an open pull-mode attempt is NOT selected; the same Job with
     /// no open attempt still IS selected (the I-165 stuck-pod reap

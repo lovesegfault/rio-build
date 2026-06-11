@@ -6634,7 +6634,7 @@ rec {
       witness = "noReapOfNeverPulledBeforeLeaderAged";
     };
     # r[verify ctrl.job.orphan-leader-age]
-    # r[verify ctrl.ephemeral.reap-orphan-running+5]
+    # r[verify ctrl.ephemeral.reap-orphan-running+6]
     quint-spawn-coherence-leader-age-hold = mkQuintCheck {
       name = "spawn-coherence-leader-age-hold";
       spec = "spawnCoherence";

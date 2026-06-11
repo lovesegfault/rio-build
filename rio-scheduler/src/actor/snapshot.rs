@@ -788,7 +788,12 @@ impl DagActor {
         // return channel — the scheduler stays on the static seed
         // (`max_lead_for`'s "Seed-based approximation" caveat). Empty
         // seed map ⇒ max_lead=0 ⇒ pass disabled (every eta ≥ 0 fails
-        // the gate; controller filters on `ready` regardless).
+        // the gate). Round-10 bug_078 comment repair: the controller
+        // does NOT filter on `ready` — the §13a ready-retain was
+        // normatively REPLACED by the placeable gate
+        // (ctrl.nodeclaim.placeable-gate+5); forecast intents spawn
+        // through FFD warm-hit placements with eta-priced idle
+        // bounds, so the seed map is the pass's ONLY off switch.
         // (r34 merged_bug_006)
         //
         // F1 (WO-S7-R, round-9) re-records that absence as a DECIDED
