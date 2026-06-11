@@ -1518,38 +1518,55 @@ impl SlaConfig {
     ) -> anyhow::Result<()> {
         let (gc, gm) = global;
         // r[impl scheduler.sla.global.derive+2]
-        // live_051(a)/(f2): the global MUST NOT exceed the largest
-        // class ceiling — demand admitted at such a global is hostable
-        // by NO class, and pre-disclosure the first symptom was the
-        // silent empty-cells churn (the cancelled-python-builds
-        // verdict). On the catalog arm this is unreachable through the
-        // pure max (the global IS max over the same map) and reachable
-        // ONLY through the MIN_CORES/MIN_MEM floor clamp on a
-        // degenerate sub-floor catalog — named in the warn. On the
-        // operator-override arm it is a signed operator act: the
+        // live_051(a)/(f2) + merged_bug_062: the global MUST NOT
+        // exceed every class's JOINT hosting ceiling — demand admitted
+        // at such a global is hostable by NO class, and pre-disclosure
+        // the first symptom was the silent empty-cells churn (the
+        // cancelled-python-builds verdict). The disclosure consumes
+        // the SAME chokepoint the enforcement plane consumes
+        // (`class_ceilings` = catalog ∩ cfg ∩ global): the pre-fix
+        // per-axis compare against RAW catalog maxima was silent for
+        // two verified-reachable forms of its own message — (1) legal
+        // per-class tightening overrides (the raw maxima never see
+        // them), and (2) the joint phantom: `resolve_globals` mints
+        // from independent cross-class per-axis maxima, for which
+        // `gc==max_cc ∧ gm==max_cm` holds BY CONSTRUCTION — the exact
+        // phantom `derive_ceilings`' doc forbids within a class,
+        // recreated one level up. An uncatalogued un-overridden class
+        // falls to the global (`class_ceilings`' fallback — the
+        // §13c-2 uncatalogued-fallback law) and therefore hosts it,
+        // matching what the solve actually enforces. On the
+        // operator-override arm this is a signed operator act: the
         // doctrine is disclose-don't-wedge, so this WARNs with the
         // delta and both provenances rather than erroring.
-        if !catalog.is_empty() {
-            let max_cc = catalog.values().map(|&(c, _)| c).max().unwrap_or(0);
-            let max_cm = catalog.values().map(|&(_, m)| m).max().unwrap_or(0);
-            if gc > max_cc || gm > max_cm {
-                tracing::warn!(
-                    global_cores = gc,
-                    global_mem = gm,
-                    max_class_cores = max_cc,
-                    max_class_mem = max_cm,
-                    delta_cores = gc.saturating_sub(max_cc),
-                    delta_mem = gm.saturating_sub(max_cm),
-                    global_source = source,
-                    class_source = "catalog-derived per-class ceilings",
-                    "resolved global ceiling exceeds EVERY class ceiling — \
-                     demand sized at the global can be hosted by no class \
-                     (live_051: such demand churned as no_hosting_class \
-                     until operators cancelled the builds). Check \
-                     sla.maxCores/maxMem against the catalog, or the \
-                     MIN_CORES/MIN_MEM floor clamp on a degenerate catalog."
-                );
-            }
+        let best = self
+            .hw_classes
+            .keys()
+            .map(|h| (h.as_str(), self.class_ceilings(h, catalog, global)))
+            .max_by(|a, b| (a.1.1, a.1.0).cmp(&(b.1.1, b.1.0)));
+        let hosted = self.hw_classes.keys().any(|h| {
+            let (cc, cm) = self.class_ceilings(h, catalog, global);
+            gc <= cc && gm <= cm
+        });
+        if !hosted {
+            let (best_h, (bcc, bcm)) = best.unwrap_or(("<none>", (0, 0)));
+            tracing::warn!(
+                global_cores = gc,
+                global_mem = gm,
+                best_class = best_h,
+                best_class_cores = bcc,
+                best_class_mem = bcm,
+                global_source = source,
+                class_source = "effective class ceilings (catalog ∩ cfg)",
+                "resolved global ceiling exceeds EVERY class ceiling \
+                 JOINTLY — demand sized at the global can be hosted by no \
+                 class (live_051: such demand churned as no_hosting_class \
+                 until operators cancelled the builds; merged_bug_062: \
+                 per-class tightening overrides and cross-class per-axis \
+                 maxima both land here). Check sla.maxCores/maxMem and the \
+                 per-class overrides against the catalog, or the \
+                 MIN_CORES/MIN_MEM floor clamp on a degenerate catalog."
+            );
         }
         let hi = gc as f64;
         self.probe.validate("sla.probe", hi)?;
@@ -3859,7 +3876,18 @@ mod tests {
     #[test]
     #[tracing_test::traced_test]
     fn overridden_global_above_every_class_warns_at_boot() {
-        let cfg = base();
+        let mut cfg = base();
+        // merged_bug_062: the disclosure now reads the EFFECTIVE
+        // class ceilings (catalog ∩ cfg) over the CONFIGURED classes
+        // — a catalog row for an undeclared class hosts nothing, and
+        // base()'s classes are cfg-bounded at (64, 256 GiB). Declare
+        // h1 un-overridden so the within-range face is genuinely
+        // (jointly) hostable.
+        cfg.hw_classes.clear();
+        let mut h1 = test_def("rio.build/hw-class", "h1");
+        h1.max_cores = None;
+        h1.max_mem = None;
+        cfg.hw_classes.insert("h1".into(), h1);
         let catalog: super::super::catalog::CatalogCeilings =
             HashMap::from([("h1".into(), (191u32, 345u64 << 30))]);
         // Kill-isolation FIRST (cumulative log capture): an override
@@ -3878,6 +3906,82 @@ mod tests {
             logs_contain("exceeds EVERY class ceiling"),
             "the unhostable-global foot-gun is named before the first \
              solve consumes it"
+        );
+    }
+
+    /// **W9-AC (merged_bug_062)** — *the boot disclosure consumes the
+    /// enforcement chokepoint*: WARN iff no single class JOINTLY hosts
+    /// the resolved global against the effective `class_ceilings`
+    /// (catalog ∩ cfg) — the message's own predicate. The pre-fix
+    /// per-axis compare against RAW catalog maxima was silent for two
+    /// verified-reachable forms of its own stated condition:
+    /// (1) legal per-class tightening overrides (`class_ceilings =
+    /// min(cat, cfg)` — the raw maxima never see them); (2) the joint
+    /// phantom — `resolve_globals` mints from independent cross-class
+    /// per-axis maxima, for which `gc==max_cc ∧ gm==max_cm` holds BY
+    /// CONSTRUCTION (the exact phantom `derive_ceilings`' doc forbids
+    /// within a class, recreated one level up). Dual face: a jointly
+    /// hostable global stays silent.
+    // r[verify scheduler.sla.global.derive+2]
+    #[test]
+    #[tracing_test::traced_test]
+    fn boot_warn_fires_on_joint_unhostability() {
+        let mut cfg = base();
+        cfg.hw_classes.clear();
+        let mut wide = test_def("rio.build/hw-class", "wide");
+        wide.max_cores = None;
+        wide.max_mem = None;
+        cfg.hw_classes.insert("h-cpu".into(), wide.clone());
+        cfg.hw_classes.insert("h-mem".into(), wide.clone());
+        // Joint phantom: h-cpu hosts the cores axis, h-mem the mem
+        // axis — the per-axis maxima (64, 256 GiB), exactly what
+        // resolve_globals mints, fit NO single class.
+        let catalog: super::super::catalog::CatalogCeilings = HashMap::from([
+            ("h-cpu".into(), (64u32, 8u64 << 30)),
+            ("h-mem".into(), (2u32, 256u64 << 30)),
+        ]);
+        // Dual face FIRST (cumulative log capture): a global jointly
+        // hosted by h-cpu stays silent.
+        cfg.validate_resolved((64, 8 << 30), &catalog, "sla.maxCores/maxMem")
+            .unwrap();
+        assert!(
+            !logs_contain("hosted by no class"),
+            "jointly hostable global stays silent"
+        );
+        // Form 2 — the joint phantom fires.
+        cfg.validate_resolved((64, 256 << 30), &catalog, "derived from catalog max")
+            .unwrap();
+        assert!(
+            logs_contain("hosted by no class"),
+            "the joint phantom (cross-class per-axis maxima) must fire \
+             the boot disclosure (merged_bug_062 form 2)"
+        );
+    }
+
+    /// W9-AC form 1 (merged_bug_062): a legal per-class TIGHTENING
+    /// override fleet — every class cfg-tightened below the global —
+    /// fires the disclosure even though the raw catalog maxima still
+    /// cover the global per-axis.
+    // r[verify scheduler.sla.global.derive+2]
+    #[test]
+    #[tracing_test::traced_test]
+    fn boot_warn_fires_on_override_tightened_fleet() {
+        let mut cfg = base();
+        cfg.hw_classes.clear();
+        let mut tight = test_def("rio.build/hw-class", "tight");
+        tight.max_cores = Some(32);
+        tight.max_mem = Some(64 << 30);
+        cfg.hw_classes.insert("h1".into(), tight);
+        // The catalog covers the global per-axis — the pre-fix check
+        // was structurally silent here.
+        let catalog: super::super::catalog::CatalogCeilings =
+            HashMap::from([("h1".into(), (64u32, 256u64 << 30))]);
+        cfg.validate_resolved((64, 256 << 30), &catalog, "sla.maxCores/maxMem")
+            .unwrap();
+        assert!(
+            logs_contain("hosted by no class"),
+            "an override-tightened fleet must fire the boot disclosure \
+             (merged_bug_062 form 1)"
         );
     }
 
