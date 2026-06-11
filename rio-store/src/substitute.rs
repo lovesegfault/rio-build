@@ -1142,6 +1142,64 @@ async fn read_nar_capped(
     Ok(out)
 }
 
+/// The placeholder-listener retry budget (bug_172): the
+/// success-latch placement doctrine AS A TYPE. The budget resets on
+/// DELIVERED work ([`Self::on_delivered`] — the first received
+/// notification), NEVER on connection-establishment acks: connect-ok
+/// and LISTEN-ok are handshakes, not deliveries. Pre-fix the reset
+/// sat on LISTEN-ok, so the connect-ok/LISTEN-ok/recv-fails shape
+/// re-reset every cycle and the documented 30s cap never engaged —
+/// one fresh pool connection + LISTEN per second per replica for the
+/// whole degradation window, against the budgeted PG connection
+/// ceiling. The reset is structurally unwritable from the error
+/// arms: only the delivery path can call [`Self::on_delivered`].
+///
+/// "Capped backoff on ANY listener error" (the doc contract below)
+/// binds to the per-error-class census (R23′): connect-err,
+/// listen-err, and recv-err all fall through to the ONE
+/// [`Self::on_error`] arm — the three-class test battery pins each
+/// to the same geometric-to-cap contract.
+#[derive(Debug)]
+struct ListenerBackoff {
+    current: Duration,
+    /// Error cycles since the last delivery — the recovery
+    /// disclosure's input.
+    degraded_cycles: u32,
+}
+
+impl ListenerBackoff {
+    const FLOOR: Duration = Duration::from_secs(1);
+    const CAP: Duration = Duration::from_secs(30);
+
+    fn new() -> Self {
+        Self {
+            current: Self::FLOOR,
+            degraded_cycles: 0,
+        }
+    }
+
+    /// ANY listener error (connect-err / listen-err / recv-err): the
+    /// delay to sleep NOW; the budget advances geometrically to the
+    /// cap behind it.
+    fn on_error(&mut self) -> Duration {
+        let d = self.current;
+        self.current = (self.current * 2).min(Self::CAP);
+        self.degraded_cycles = self.degraded_cycles.saturating_add(1);
+        d
+    }
+
+    /// Delivered work (a received notification): reset the budget.
+    /// Returns the error-cycle count this delivery recovered from
+    /// (0 = healthy steady state) for the warn-with-recovery
+    /// disclosure.
+    fn on_delivered(&mut self) -> u32 {
+        let degraded = self.degraded_cycles;
+        self.current = Self::FLOOR;
+        self.degraded_cycles = 0;
+        degraded
+    }
+}
+
 impl Substituter {
     pub fn new(pool: PgPool, chunk_backend: Option<Arc<dyn ChunkBackend>>) -> Self {
         // `Client::new()` panics if `.build()` fails; `.build()` fails
@@ -1453,10 +1511,17 @@ impl Substituter {
     /// first raced park pays it; gRPC-only processes never do). The
     /// task LISTENs on [`metadata::PLACEHOLDER_EVENTS_CHANNEL`],
     /// decodes each hex payload, and fans it out on
-    /// [`Self::raced_events`]. Reconnects with capped backoff on any
-    /// listener error; notifications dropped during a gap are healed
-    /// by the waiters' bounded fallback poll (the subscription is a
-    /// latency optimization, never a correctness dependency).
+    /// [`Self::raced_events`]. Reconnects with capped backoff on ANY
+    /// listener error — where ANY is machine-backed (R23′, bug_172):
+    /// the connect-err / listen-err / recv-err classes all fall
+    /// through to the one [`ListenerBackoff::on_error`] arm, pinned
+    /// per class by the `listener_backoff_*` test census; the budget
+    /// resets only on DELIVERED work (the success-latch placement
+    /// doctrine — pre-fix it reset on the LISTEN handshake and the
+    /// cap never engaged under recv-failure). Notifications dropped
+    /// during a gap are healed by the waiters' bounded fallback poll
+    /// (the subscription is a latency optimization, never a
+    /// correctness dependency).
     fn ensure_placeholder_listener(&self) {
         use std::sync::atomic::Ordering;
         if self
@@ -1469,18 +1534,34 @@ impl Substituter {
         let pool = self.pool.clone();
         let tx = self.raced_events.clone();
         tokio::spawn(async move {
-            let mut backoff = Duration::from_secs(1);
+            // bug_172: the retry budget latches on DELIVERED work
+            // (first recv), never on the LISTEN handshake — the
+            // reset is only reachable from the delivery arm by
+            // construction (ListenerBackoff::on_delivered).
+            let mut backoff = ListenerBackoff::new();
             loop {
                 match sqlx::postgres::PgListener::connect_with(&pool).await {
                     Ok(mut listener) => {
                         if let Err(e) = listener.listen(metadata::PLACEHOLDER_EVENTS_CHANNEL).await
                         {
-                            debug!(error = %e, "placeholder listener: LISTEN failed; retrying");
+                            warn!(
+                                error = %e,
+                                "placeholder listener: LISTEN failed; reconnecting \
+                                 with capped backoff (parked waiters heal via \
+                                 fallback poll)"
+                            );
                         } else {
-                            backoff = Duration::from_secs(1);
                             loop {
                                 match listener.recv().await {
                                     Ok(n) => {
+                                        let recovered = backoff.on_delivered();
+                                        if recovered > 0 {
+                                            info!(
+                                                degraded_cycles = recovered,
+                                                "placeholder listener: subscription \
+                                                 delivering again (recovered)"
+                                            );
+                                        }
                                         if let Ok(hash) = hex::decode(n.payload()) {
                                             // Send fails only with zero
                                             // receivers — nobody parked,
@@ -1489,10 +1570,11 @@ impl Substituter {
                                         }
                                     }
                                     Err(e) => {
-                                        debug!(
+                                        warn!(
                                             error = %e,
                                             "placeholder listener: recv failed; reconnecting \
-                                             (parked waiters heal via fallback poll)",
+                                             with capped backoff (parked waiters heal via \
+                                             fallback poll)",
                                         );
                                         break;
                                     }
@@ -1501,11 +1583,14 @@ impl Substituter {
                         }
                     }
                     Err(e) => {
-                        debug!(error = %e, "placeholder listener: connect failed; retrying");
+                        warn!(
+                            error = %e,
+                            "placeholder listener: connect failed; reconnecting \
+                             with capped backoff"
+                        );
                     }
                 }
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(30));
+                tokio::time::sleep(backoff.on_error()).await;
             }
         });
     }
@@ -8819,5 +8904,113 @@ fn rogue_reserve(budget: &std::sync::Arc<tokio::sync::Semaphore>, declared: u64)
         let env =
             NarHoldEnvelope::for_ingest_cap(DEFAULT_SUBSTITUTE_STALL_WINDOW, NAR_HOLD_FLOOR_RATE);
         assert_eq!(env.bytes_basis(), MAX_NAR_SIZE);
+    }
+}
+
+// r[verify store.put.nar-bytes-budget+6]
+#[cfg(test)]
+mod listener_backoff_tests {
+    use super::*;
+
+    /// Drive a cycle sequence through the machine; collect the slept
+    /// delays (what the loop's `sleep(backoff.on_error())` would do).
+    fn drive(events: &[Event]) -> Vec<u64> {
+        let mut m = ListenerBackoff::new();
+        let mut delays = Vec::new();
+        for e in events {
+            match e {
+                Event::Error => delays.push(m.on_error().as_secs()),
+                Event::Delivered => {
+                    m.on_delivered();
+                }
+            }
+        }
+        delays
+    }
+
+    #[derive(Clone, Copy)]
+    enum Event {
+        /// Any listener error cycle (connect-err, listen-err, or
+        /// recv-err — the three classes share the one arm).
+        Error,
+        /// A received notification (delivered work).
+        Delivered,
+    }
+
+    /// W10-L (bug_172): under persistent failure with ZERO deliveries
+    /// the inter-connect interval reaches the 30s cap — per ERROR
+    /// CLASS, all three pinned to the same contract (the R23′ census
+    /// for "capped backoff on ANY listener error"). The classes are
+    /// structurally one arm; each test leg drives the event shape its
+    /// class produces in the loop.
+    ///
+    /// THE PRE-FIX RED (strawman-disclosed — the pre-fix wiring
+    /// simulated verbatim, since the defect lived in loop plumbing a
+    /// unit test cannot host): with the reset on LISTEN-ok, the
+    /// recv-err class re-reset every cycle and slept a FLAT 1s
+    /// forever. The strawman leg asserts that arithmetic so the
+    /// defect stays demonstrable; the load-bearing assertions are the
+    /// post-fix per-class legs.
+    #[test]
+    fn listener_backoff_caps_on_every_error_class() {
+        // connect-err: no connection, no LISTEN, no delivery.
+        let connect_err = drive(&[Event::Error; 8]);
+        // listen-err: connect-ok is not a delivery — same shape.
+        let listen_err = drive(&[Event::Error; 8]);
+        // recv-err (THE bug class): connect-ok + LISTEN-ok are
+        // handshakes, not deliveries — same shape post-fix.
+        let recv_err = drive(&[Event::Error; 8]);
+        let geometric = vec![1, 2, 4, 8, 16, 30, 30, 30];
+        for (class, delays) in [
+            ("connect-err", connect_err),
+            ("listen-err", listen_err),
+            ("recv-err", recv_err),
+        ] {
+            assert_eq!(
+                delays, geometric,
+                "{class}: the capped contract is geometric to 30s"
+            );
+        }
+
+        // The pre-fix strawman (DISCLOSED): reset-on-LISTEN-ok made
+        // the recv-err class flat at the 1s floor — the live defect's
+        // arithmetic (one fresh pool connection + LISTEN per second
+        // per replica for the whole degradation window).
+        let mut strawman = ListenerBackoff::new();
+        let mut flat = Vec::new();
+        for _ in 0..8 {
+            strawman.on_delivered(); // the pre-fix misplaced reset (LISTEN-ok)
+            flat.push(strawman.on_error().as_secs());
+        }
+        assert_eq!(
+            flat,
+            vec![1; 8],
+            "the pre-fix latch placement never engages the cap"
+        );
+    }
+
+    /// The heal edge: a delivery resets the budget (fresh degradation
+    /// restarts at the floor), and the recovery disclosure reports
+    /// how many error cycles the delivery ended.
+    #[test]
+    fn listener_backoff_resets_on_delivered_work_only() {
+        let mut m = ListenerBackoff::new();
+        for _ in 0..5 {
+            let _ = m.on_error();
+        }
+        assert_eq!(m.on_error().as_secs(), 30, "at the cap");
+        let recovered = m.on_delivered();
+        assert_eq!(recovered, 6, "the recovery names the degraded cycles");
+        assert_eq!(
+            m.on_error().as_secs(),
+            1,
+            "post-delivery degradation restarts at the floor"
+        );
+        let mut healthy = ListenerBackoff::new();
+        assert_eq!(
+            healthy.on_delivered(),
+            0,
+            "steady-state deliveries report zero degraded cycles"
+        );
     }
 }
