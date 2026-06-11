@@ -106,7 +106,7 @@ impl ChunkServiceImpl {
     }
 
     /// Test hook: shrink the `GetChunks` idle budget so the watchdog is
-    /// testable without 300 s waits. See [`Self::stream_idle_timeout`].
+    /// testable without 300 s waits. See `stream_idle_timeout`.
     #[must_use]
     pub fn with_stream_idle_timeout(mut self, idle: Duration) -> Self {
         self.stream_idle_timeout = idle;
@@ -249,7 +249,7 @@ impl ChunkService for ChunkServiceImpl {
     /// carries no information).
     ///
     /// Lifetime contract: the stream is bounded by an IDLE timeout
-    /// ([`Self::stream_idle_timeout`]), not an absolute one — the
+    /// (`stream_idle_timeout`), not an absolute one — the
     /// client reuses one stream for a whole file's fill, so total
     /// lifetime scales with file size and must not be capped.
     // r[impl proto.chunk.batch-bidi]
