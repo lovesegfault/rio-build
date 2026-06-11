@@ -367,9 +367,16 @@ impl Opener {
     /// unlinked it concurrently — which callers treat as an ordinary
     /// cache miss. Any other failure is a real error: the entry is
     /// there but unopenable, and neither a fetch nor a retry fixes a
-    /// corrupted cache layout.
+    /// corrupted cache layout. `O_NOFOLLOW` is defense-in-depth: the
+    /// cache parents are root-owned 0755, so only root could plant a
+    /// symlink here — a leaf entry is never legitimately one.
     fn open_cache_entry(&self, cache_path: &Path) -> Result<Option<File>, Errno> {
-        match File::open(cache_path) {
+        use std::os::unix::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(cache_path)
+        {
             Ok(f) => Ok(Some(f)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => {
