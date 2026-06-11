@@ -216,6 +216,64 @@ async fn test_add_multiple_retries_store_aborted() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// W10-BP wire leg (merged_bug_097): the store's typed NAR-budget
+/// shed (ResourceExhausted + "retry") absorbed end-to-end — nix
+/// client wire → gateway handler → store. Pre-fix the shed hit
+/// grpc_put_path's terminal arm and the client died mid-push with
+/// "store error: ResourceExhausted" despite the invitation; the
+/// builder leg of the contract retries every class (superset
+/// trivially), so the gateway was the only caller dropping it.
+#[tokio::test]
+async fn test_add_multiple_retries_store_shed() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.store
+        .faults
+        .shed_next_puts
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    let (nar_a, hash_a) = make_nar(b"shed-retry");
+    let inner = wire_bytes![
+        u64: 1,
+        string: TEST_PATH_A,
+        string: "",
+        string: &hex::encode(hash_a),
+        strings: wire::NO_STRINGS,
+        u64: 0,
+        u64: nar_a.len() as u64,
+        bool: false,
+        strings: wire::NO_STRINGS,
+        string: "",
+        raw: &nar_a,
+    ];
+    wire_send!(&mut h.stream;
+        u64: 44,
+        bool: false,
+        bool: true,
+        framed: &inner,
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+
+    let calls = h.store.calls.put_calls.read().unwrap().clone();
+    assert_eq!(
+        calls.len(),
+        1,
+        "the absorbed shed should end in exactly one recorded PutPath"
+    );
+    assert_eq!(calls[0].store_path, TEST_PATH_A);
+    assert_eq!(
+        h.store
+            .faults
+            .shed_next_puts
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the injected shed should have been consumed by the retry"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
 /// I-068 negative: exhausting the retry budget surfaces the Aborted
 /// to the client as STDERR_ERROR (proves the loop is bounded and the
 /// final error is propagated, not swallowed).

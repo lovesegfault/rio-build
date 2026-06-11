@@ -147,6 +147,12 @@ pub struct MockStoreCalls {
 pub struct MockStoreFaults {
     /// If > 0, put_path decrements and returns Unavailable. For retry tests.
     pub fail_next_puts: Arc<AtomicU32>,
+    /// If > 0, put_path decrements and returns the store's typed
+    /// NAR-budget shed (`ResourceExhausted` + "retry" text — the
+    /// `rio_common::grpc::STORE_SHED_CLASSES` contract face, the
+    /// merged_bug_097 regression class). For gateway shed-absorption
+    /// tests.
+    pub shed_next_puts: Arc<AtomicU32>,
     /// If > 0, put_path decrements and returns `Aborted("concurrent
     /// PutPath in progress for this path; retry")` — matching the real
     /// store's placeholder-contention response (`put_path.rs`). For
@@ -461,6 +467,21 @@ impl StoreService for MockStore {
             .is_ok()
         {
             return Err(Status::unavailable("mock: injected put failure"));
+        }
+        if self
+            .faults
+            .shed_next_puts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n > 0).then(|| n - 1)
+            })
+            .is_ok()
+        {
+            // The store's NAR-budget shed shape, verbatim class+invite
+            // (put_path/common.rs): typed ResourceExhausted, "retry".
+            return Err(Status::resource_exhausted(
+                "PutPath: NAR buffer budget wait exceeded 180s (pod at its \
+                 in-flight NAR-bytes bound); retry",
+            ));
         }
         if self
             .faults

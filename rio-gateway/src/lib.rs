@@ -98,6 +98,19 @@ pub fn describe_metrics() {
          error surfaced to the client (I-168)."
     );
     describe_counter!(
+        "rio_gateway_putpath_retry_events_total",
+        "Every failure observation at the gateway PutPath chokepoint, labeled \
+         by typed status class (class: the rio_common CODE_CLASS_LABELS \
+         alphabet — aborted, unavailable, deadline_exceeded, \
+         resource_exhausted, ...). THE emit law for the store ScaledObject's \
+         demand-side scale-collapse inhibitor: an outage class cannot be a \
+         non-emitting arm, so the inhibitor's series moves during the \
+         reachability outages it guards (a flat series during a store outage \
+         was the merged_bug_038 defect). Retried observations count too — \
+         rate() here reads upload-plane distress, not client-visible failures \
+         (surfaced errors are the attempt-budget tails)."
+    );
+    describe_counter!(
         "rio_gateway_build_resync_rate_paced_total",
         "WatchBuild re-attach cycles paced by the wall-clock rate axis (token \
          bucket: RATE_MAX cycles per RATE_WINDOW sustained), labeled by the \
@@ -156,10 +169,21 @@ pub const PUTPATH_ABORTED_RETRY_ATTEMPTS: &[&str] = &["1", "2", "3", "4", "5", "
 /// founding member: a scale-down inhibitor evaluating an absent series
 /// until the first abort is exactly the birth-gap class (bug_322) the
 /// seed table exists to kill.
-pub const ALERT_SEEDED_COUNTERS: &[SeededSeries] = &[SeededSeries {
-    name: "rio_gateway_putpath_aborted_retries_total",
-    label: Some(("attempt", PUTPATH_ABORTED_RETRY_ATTEMPTS)),
-}];
+pub const ALERT_SEEDED_COUNTERS: &[SeededSeries] = &[
+    SeededSeries {
+        name: "rio_gateway_putpath_aborted_retries_total",
+        label: Some(("attempt", PUTPATH_ABORTED_RETRY_ATTEMPTS)),
+    },
+    // The class-labeled chokepoint law (merged_bug_038, H8″): seeded
+    // per class so the inhibitor trigger reads a present series from
+    // boot on every replica — the closed axis IS the shared label
+    // alphabet (pinned to the emit fn by rio-common's
+    // code_class_labels_pin_the_fn_image).
+    SeededSeries {
+        name: "rio_gateway_putpath_retry_events_total",
+        label: Some(("class", rio_common::grpc::CODE_CLASS_LABELS)),
+    },
+];
 
 /// Birth every [`ALERT_SEEDED_COUNTERS`] series at 0 (tail of
 /// [`describe_metrics`] — `rio_common::server::bootstrap` installs the

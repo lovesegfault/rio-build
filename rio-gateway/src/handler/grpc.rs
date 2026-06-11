@@ -257,6 +257,16 @@ const PUT_PATH_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Back
 /// surfaced Aborted as a hard wopAddMultipleToStore failure and the
 /// client died mid-push.
 ///
+/// merged_bug_097: non-Aborted failures take the same-file transient
+/// lane ([`transient_retry_after`]) — the store's typed sheds
+/// (`rio_common::grpc::STORE_SHED_CLASSES`: the NAR-budget
+/// `ResourceExhausted` "retry" invitation) previously hit a terminal
+/// arm and hard-failed the nix client's push despite the machinery
+/// sitting in this file wired only to QueryPathInfo/GetPath. Every
+/// failure observation emits the class-labeled
+/// `rio_gateway_putpath_retry_events_total` (merged_bug_038, H8″ —
+/// the inhibitor's series must move during reachability outages).
+///
 /// `nar_data` is held as `Arc<[u8]>` so each retry rebuilds the request
 /// stream without copying the buffer. `info` is `Clone` (cheap — strings
 /// and Vecs already heap-allocated).
@@ -270,6 +280,7 @@ pub(super) async fn grpc_put_path(
 ) -> anyhow::Result<bool> {
     let nar: std::sync::Arc<[u8]> = nar_data.into();
     let mut attempt = 0u32;
+    let mut transient_attempt = 0u32;
     loop {
         let stream =
             rio_proto::client::chunk_nar_for_put(info.clone(), std::sync::Arc::clone(&nar));
@@ -281,41 +292,69 @@ pub(super) async fn grpc_put_path(
             store_client.put_path(req),
         )
         .await;
-        match result {
+        let status = match result {
             Ok(resp) => return Ok(resp.into_inner().created),
-            Err(status) if status.code() == tonic::Code::Aborted => {
-                attempt += 1;
-                // I-168: dashboard-visible retry budget (was log-only).
-                metrics::counter!(
-                    "rio_gateway_putpath_aborted_retries_total",
-                    "attempt" => attempt.to_string(),
-                )
-                .increment(1);
-                if attempt >= PUT_PATH_ABORTED_MAX_ATTEMPTS {
-                    tracing::warn!(
-                        store_path = %info.store_path,
-                        attempts = attempt,
-                        "PutPath: store still Aborted after retry budget; surfacing"
-                    );
-                    return Err(status.into());
-                }
-                // FULL jitter (`U(0, capᵃ]`): N clients retrying the
-                // SAME path don't re-collide in lockstep, and the
-                // I-068 placeholder case stays fast (first retry
-                // ≤50 ms) while the I-168 mark-busy case gets a
-                // multi-second window. `attempt-1` so attempt=1 uses
-                // mult⁰ = base.
-                let delay = PUT_PATH_BACKOFF.duration(attempt - 1);
-                tracing::debug!(
+            Err(status) => status,
+        };
+        // THE class-labeled emit law (merged_bug_038, H8″): every
+        // failure observation at this chokepoint counts, labeled by
+        // its typed class — Unavailable/DeadlineExceeded/… cannot be
+        // non-emitting arms (R21: the uncounted terminal arm died).
+        // The store ScaledObject's demand-side inhibitor consumes
+        // this series; the label alphabet is
+        // rio_common::grpc::CODE_CLASS_LABELS (boot-seeded per class,
+        // lib.rs — bug_322 birth-gap discipline).
+        metrics::counter!(
+            "rio_gateway_putpath_retry_events_total",
+            "class" => rio_common::grpc::code_class_label(status.code()),
+        )
+        .increment(1);
+        if status.code() == tonic::Code::Aborted {
+            attempt += 1;
+            // I-168: dashboard-visible retry budget (was log-only).
+            metrics::counter!(
+                "rio_gateway_putpath_aborted_retries_total",
+                "attempt" => attempt.to_string(),
+            )
+            .increment(1);
+            if attempt >= PUT_PATH_ABORTED_MAX_ATTEMPTS {
+                tracing::warn!(
                     store_path = %info.store_path,
-                    attempt,
-                    backoff = ?delay,
-                    msg = %status.message(),
-                    "PutPath: store Aborted; retrying with exponential backoff"
+                    attempts = attempt,
+                    "PutPath: store still Aborted after retry budget; surfacing"
                 );
-                tokio::time::sleep(delay).await;
+                return Err(status.into());
             }
-            Err(status) => return Err(status.into()),
+            // FULL jitter (`U(0, capᵃ]`): N clients retrying the
+            // SAME path don't re-collide in lockstep, and the
+            // I-068 placeholder case stays fast (first retry
+            // ≤50 ms) while the I-168 mark-busy case gets a
+            // multi-second window. `attempt-1` so attempt=1 uses
+            // mult⁰ = base.
+            let delay = PUT_PATH_BACKOFF.duration(attempt - 1);
+            tracing::debug!(
+                store_path = %info.store_path,
+                attempt,
+                backoff = ?delay,
+                msg = %status.message(),
+                "PutPath: store Aborted; retrying with exponential backoff"
+            );
+            tokio::time::sleep(delay).await;
+        } else {
+            // merged_bug_097: the store's typed sheds
+            // (STORE_SHED_CLASSES — the NAR-budget ResourceExhausted
+            // "retry" invitation) and transport-class blips absorb
+            // through the same-file transient machinery the other
+            // store unaries use; the classifier (is_transient) is a
+            // superset of the shed set BY THE SHARED CONST. The
+            // stream rebuilds from the Arc'd buffer, so replay is
+            // safe (unlike the streaming path, which stays
+            // non-retried by design).
+            transient_attempt += 1;
+            match transient_retry_after("PutPath", transient_attempt, &status) {
+                Some(delay) => tokio::time::sleep(delay).await,
+                None => return Err(status.into()),
+            }
         }
     }
 }
@@ -518,5 +557,108 @@ pub(crate) async fn grpc_get_path(
                 return Err(GatewayError::Store(format!("GetPath for {store_path}: {e}")).into());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering::SeqCst;
+
+    /// sha256(b"nar!") — the mock store re-hashes and validates the
+    /// trailer like the real one.
+    const NAR_FIXTURE: &[u8] = b"nar!";
+    const NAR_FIXTURE_SHA256: &str =
+        "a5a407e7848d7d3863f1dbf17d78856ef27efce7310082eec2157ee03c7b17f3";
+
+    fn put_info(path: &str) -> rio_proto::validated::ValidatedPathInfo {
+        let mut nar_hash = vec![0u8; 32];
+        hex::decode_to_slice(NAR_FIXTURE_SHA256, &mut nar_hash).expect("fixture hex");
+        rio_proto::types::PathInfo {
+            store_path: path.into(),
+            nar_hash,
+            nar_size: NAR_FIXTURE.len() as u64,
+            ..Default::default()
+        }
+        .try_into()
+        .expect("valid fixture path")
+    }
+
+    /// W10-BP (merged_bug_097): the store's typed NAR-budget shed
+    /// (ResourceExhausted + "retry") is an explicit retry invitation
+    /// — the producer's "absorbed by the upload plane's retry
+    /// machinery" claim binds to STORE_SHED_CLASSES, and this caller's
+    /// classifier must be a superset. Parameterized over the shed
+    /// const: the consumer-census leg for the gateway PutPath lane.
+    #[tokio::test]
+    async fn put_path_absorbs_every_store_shed_class() {
+        for (i, shed) in rio_common::grpc::STORE_SHED_CLASSES.into_iter().enumerate() {
+            let (store, addr, _h) = rio_test_support::grpc::spawn_mock_store()
+                .await
+                .expect("mock store");
+            match shed {
+                tonic::Code::ResourceExhausted => {
+                    store.faults.shed_next_puts.store(1, SeqCst);
+                }
+                tonic::Code::Aborted => {
+                    store.faults.abort_next_puts.store(1, SeqCst);
+                }
+                other => panic!("unscripted shed class {other:?}: extend the mock faults"),
+            }
+            let mut client = rio_proto::StoreServiceClient::connect(format!("http://{addr}"))
+                .await
+                .expect("connect");
+            let info = put_info(&format!(
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa{i}-shed-1.0"
+            ));
+            let res = grpc_put_path(&mut client, None, None, info, NAR_FIXTURE.to_vec()).await;
+            assert!(
+                res.is_ok(),
+                "left: the {shed:?} shed hits the terminal arm and the push \
+                 hard-fails (the lost invited retry) / right: retried and \
+                 absorbed; got {res:?}"
+            );
+        }
+    }
+
+    /// W10-BQ (merged_bug_038, the H8'' emit law): every failure
+    /// class observed at the PutPath chokepoint emits the
+    /// class-labeled counter — an injected Unavailable outage must
+    /// move the series (pre-fix the only emit arm was Aborted-only,
+    /// so the inhibitor trigger was structurally flat during the
+    /// reachability outages it guards).
+    #[test]
+    fn put_path_emit_law_counts_every_failure_class() {
+        let rec = rio_test_support::metrics::CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&rec);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (store, addr, _h) = rio_test_support::grpc::spawn_mock_store()
+                .await
+                .expect("mock store");
+            // One Unavailable, then success: the retried observation
+            // must still be counted.
+            store.faults.fail_next_puts.store(1, SeqCst);
+            let mut client = rio_proto::StoreServiceClient::connect(format!("http://{addr}"))
+                .await
+                .expect("connect");
+            let info = put_info("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-emit-1.0");
+            let res = grpc_put_path(&mut client, None, None, info, NAR_FIXTURE.to_vec()).await;
+            assert!(
+                res.is_ok(),
+                "one Unavailable then success must absorb; got {res:?}"
+            );
+        });
+        assert_eq!(
+            rec.get("rio_gateway_putpath_retry_events_total{class=unavailable}"),
+            1,
+            "left: the inhibitor series is flat during an Unavailable \
+             outage (the uncounted terminal arm) / right: the class-labeled \
+             emit law counts it; keys seen: {:?}",
+            rec.all_keys()
+        );
     }
 }

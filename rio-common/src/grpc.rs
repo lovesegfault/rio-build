@@ -430,6 +430,83 @@ pub fn internal(ctx: &str, e: impl Display) -> Status {
 /// own timeout firing — the peer hung past `fetch_timeout`. Retrying
 /// with the same timeout won't help, and on a FUSE-thread caller the
 /// next retry would compound the wait.
+///
+/// CONTRACT (merged_bug_097): this set is a SUPERSET of
+/// [`STORE_SHED_CLASSES`] — the store's explicit retry invitations —
+/// pinned by `shed_classes_are_a_subset_of_every_consumer_classifier`.
+/// Narrowing this set below the shed set is a contract break for
+/// every consumer that classifies through it.
+/// The store's retryable-SHED status classes (merged_bug_097): the
+/// codes the store deliberately RETURNS as an invitation to retry —
+/// the NAR-budget waits shed typed `ResourceExhausted` after their
+/// bounded grace ("...; retry", put_path/common.rs), and PG
+/// conflict/placeholder contention sheds `Aborted` (I-189/I-068).
+///
+/// THE CONTRACT: a chokepoint that converts waits into a "retryable"
+/// status class mints a contract over every caller — each consumer's
+/// retry classifier MUST be a SUPERSET of this set, bound here (the
+/// shared const) instead of producer-side prose. The producer comment
+/// "absorbed by the upload plane's retry machinery" is TRUE exactly
+/// while every caller honors this set: the gateway routes PutPath/
+/// QueryPathInfo/GetPath through [`is_transient`] (⊇ — pinned by
+/// `shed_classes_are_a_subset_of_every_consumer_classifier`), and the
+/// builder's upload plane retries every error class (⊇ trivially).
+/// A caller minting its own narrower classifier is the
+/// merged_bug_097 regression shape; classify through
+/// [`is_transient`] or extend the census test.
+pub const STORE_SHED_CLASSES: [tonic::Code; 2] =
+    [tonic::Code::ResourceExhausted, tonic::Code::Aborted];
+
+/// The canonical metric-label string for a tonic status class at
+/// gateway↔store chokepoints (merged_bug_038, the H8″ emit law): ONE
+/// total mapping — every code has a label, so a failure class cannot
+/// be a non-emitting arm by omission (R21). Exhaustive match, no
+/// wildcard: a tonic alphabet change fails this build.
+pub fn code_class_label(code: tonic::Code) -> &'static str {
+    match code {
+        tonic::Code::Ok => "ok",
+        tonic::Code::Cancelled => "cancelled",
+        tonic::Code::Unknown => "unknown",
+        tonic::Code::InvalidArgument => "invalid_argument",
+        tonic::Code::DeadlineExceeded => "deadline_exceeded",
+        tonic::Code::NotFound => "not_found",
+        tonic::Code::AlreadyExists => "already_exists",
+        tonic::Code::PermissionDenied => "permission_denied",
+        tonic::Code::ResourceExhausted => "resource_exhausted",
+        tonic::Code::FailedPrecondition => "failed_precondition",
+        tonic::Code::Aborted => "aborted",
+        tonic::Code::OutOfRange => "out_of_range",
+        tonic::Code::Unimplemented => "unimplemented",
+        tonic::Code::Internal => "internal",
+        tonic::Code::Unavailable => "unavailable",
+        tonic::Code::DataLoss => "data_loss",
+        tonic::Code::Unauthenticated => "unauthenticated",
+    }
+}
+
+/// The closed production label set of [`code_class_label`] — the seed
+/// axis for class-labeled chokepoint counters (alphabetical). Pinned
+/// to the fn by `code_class_labels_pin_the_fn_image`.
+pub const CODE_CLASS_LABELS: &[&str] = &[
+    "aborted",
+    "already_exists",
+    "cancelled",
+    "data_loss",
+    "deadline_exceeded",
+    "failed_precondition",
+    "internal",
+    "invalid_argument",
+    "not_found",
+    "ok",
+    "out_of_range",
+    "permission_denied",
+    "resource_exhausted",
+    "unauthenticated",
+    "unavailable",
+    "unimplemented",
+    "unknown",
+];
+
 // r[impl builder.fuse.retry-jitter]
 pub fn is_transient(code: tonic::Code) -> bool {
     matches!(
@@ -444,6 +521,68 @@ pub fn is_transient(code: tonic::Code) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W10-BR (merged_bug_097, the contract pins): every consumer
+    /// classifier is a superset of the store's shed alphabet. The
+    /// shared classifier (`is_transient`) is pinned here; the gateway
+    /// PutPath lane is pinned in rio-gateway (parameterized over this
+    /// const); the builder's upload plane retries every class
+    /// (superset trivially). R22′ plant: a strawman caller classifier
+    /// missing a shed class is REFUSED by the census fn.
+    #[test]
+    fn shed_classes_are_a_subset_of_every_consumer_classifier() {
+        fn classifier_covers_shed(classifier: impl Fn(tonic::Code) -> bool) -> Vec<tonic::Code> {
+            STORE_SHED_CLASSES
+                .into_iter()
+                .filter(|c| !classifier(*c))
+                .collect()
+        }
+        assert_eq!(
+            classifier_covers_shed(is_transient),
+            vec![],
+            "is_transient must absorb every store shed class"
+        );
+        // The planted strawman: the pre-fix gateway PutPath
+        // classifier (Aborted-only) — the census fn must refuse it.
+        let aborted_only = |c: tonic::Code| c == tonic::Code::Aborted;
+        assert_eq!(
+            classifier_covers_shed(aborted_only),
+            vec![tonic::Code::ResourceExhausted],
+            "the Aborted-only strawman must be refused with the missing class named"
+        );
+    }
+
+    /// The label fn's image equals the committed closed set — the
+    /// seed axis cannot drift from the emit law (all 17 codes).
+    #[test]
+    fn code_class_labels_pin_the_fn_image() {
+        let all = [
+            tonic::Code::Ok,
+            tonic::Code::Cancelled,
+            tonic::Code::Unknown,
+            tonic::Code::InvalidArgument,
+            tonic::Code::DeadlineExceeded,
+            tonic::Code::NotFound,
+            tonic::Code::AlreadyExists,
+            tonic::Code::PermissionDenied,
+            tonic::Code::ResourceExhausted,
+            tonic::Code::FailedPrecondition,
+            tonic::Code::Aborted,
+            tonic::Code::OutOfRange,
+            tonic::Code::Unimplemented,
+            tonic::Code::Internal,
+            tonic::Code::Unavailable,
+            tonic::Code::DataLoss,
+            tonic::Code::Unauthenticated,
+        ];
+        assert_eq!(all.len(), 17, "the tonic code census is total");
+        let mut image: Vec<&str> = all.into_iter().map(code_class_label).collect();
+        image.sort_unstable();
+        assert_eq!(
+            image, CODE_CLASS_LABELS,
+            "CODE_CLASS_LABELS must equal the fn image, sorted"
+        );
+    }
 
     #[tokio::test]
     async fn test_with_timeout_passes_through_fast_ok() -> anyhow::Result<()> {

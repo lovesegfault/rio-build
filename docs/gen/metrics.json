@@ -84,6 +84,7 @@
     "rio_gateway_opcode_duration_seconds",
     "rio_gateway_opcodes_total",
     "rio_gateway_putpath_aborted_retries_total",
+    "rio_gateway_putpath_retry_events_total",
     "rio_gateway_quota_rejections_total",
     "rio_scheduler_actor_admin_fast_delivery_seconds",
     "rio_scheduler_actor_cmd_seconds",
@@ -687,6 +688,11 @@
         "name": "rio_gateway_putpath_aborted_retries_total",
         "kind": "counter",
         "help": "PutPath retries on store Code::Aborted (labeled by attempt). attempt=PUT_PATH_ABORTED_MAX_ATTEMPTS means budget exhausted and the error surfaced to the client (I-168)."
+      },
+      {
+        "name": "rio_gateway_putpath_retry_events_total",
+        "kind": "counter",
+        "help": "Every failure observation at the gateway PutPath chokepoint, labeled by typed status class (class: the rio_common CODE_CLASS_LABELS alphabet — aborted, unavailable, deadline_exceeded, resource_exhausted, ...). THE emit law for the store ScaledObject's demand-side scale-collapse inhibitor: an outage class cannot be a non-emitting arm, so the inhibitor's series moves during the reachability outages it guards (a flat series during a store outage was the merged_bug_038 defect). Retried observations count too — rate() here reads upload-plane distress, not client-visible failures (surfaced errors are the attempt-budget tails)."
       },
       {
         "name": "rio_gateway_quota_rejections_total",
