@@ -119,7 +119,7 @@ const SPAWN_INTENTS_RESPONSE_BYTES_BUCKETS: &[f64] = &[
 /// Bucket boundaries for `rio_scheduler_spawn_intents_per_response`
 /// (COUNT of intents serialized into one answer). Edges cover the
 /// in-tree window vocabulary a pagination design would draw from
-/// (ListMaterializationJobs 256/512, DISPATCH_PROBE_BATCH_CAP 2048,
+/// (ListMaterializationJobs 256/512, DISPATCH_PROBE_TICK_QUOTA 2048,
 /// GetBuildGraph 5000) plus the unpaginated completion-cascade tail.
 const SPAWN_INTENTS_PER_RESPONSE_BUCKETS: &[f64] =
     &[1.0, 8.0, 64.0, 256.0, 1024.0, 4096.0, 16384.0, 65536.0];

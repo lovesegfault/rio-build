@@ -1819,7 +1819,7 @@ async fn batch_probe_locally_present_batches_pg() -> TestResult {
 // ---------------------------------------------------------------------------
 
 // r[verify sched.dispatch.fod-substitute+3]
-/// With > `DISPATCH_PROBE_BATCH_CAP` Ready leaves and the batch RPC
+/// With > `DISPATCH_PROBE_TICK_QUOTA` Ready leaves and the batch RPC
 /// failing-open, the truncated tail must NOT fall through to the
 /// per-drv `ready_check_or_spawn` (one inline-awaited FMP each =
 /// O(N) sequential 30s timeouts in the actor). Pre-fix:
@@ -1831,10 +1831,10 @@ async fn batch_probe_tail_never_per_drv_fmp() -> TestResult {
     use std::sync::atomic::Ordering;
     let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
 
-    // CAP+12 IA leaves with non-empty expected_output_paths so they're
-    // batch candidates. No worker connected → all defer (we only care
-    // about FMP call count, not assignment).
-    let n = crate::actor::DISPATCH_PROBE_BATCH_CAP + 12;
+    // QUOTA+12 IA leaves with non-empty expected_output_paths so
+    // they're batch candidates. No worker connected → all defer (we
+    // only care about FMP call count, not assignment).
+    let n = crate::actor::DISPATCH_PROBE_TICK_QUOTA + 12;
     let nodes: Vec<_> = (0..n)
         .map(|i| {
             let tag = format!("bpt-{i}");
@@ -1865,6 +1865,157 @@ async fn batch_probe_tail_never_per_drv_fmp() -> TestResult {
         "total FMPs across merge+tick bounded by batch passes, NOT by \
          tail size; got {total} (12 truncated nodes; pre-fix the tail \
          leaked to per-drv calls each pass)"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// W9-AF (round-9 B7): per-tick probe admission quota
+// ---------------------------------------------------------------------------
+
+/// W9-AF — the dispatch probe cap is a PER-TICK admission quota, not a
+/// per-sweep batch size: across however many inline sweeps fire within
+/// one `probe_generation` (merges, completion cascades), the total
+/// candidates admitted to FindMissingPaths is ≤ the quota, the unserved
+/// tail advances on the NEXT tick (never within-tick), and the window
+/// self-heals to full coverage. Structural counts from the mock store's
+/// request-path log — no wall-clock terms.
+///
+/// Pre-fix red: the cap bounded each SWEEP, so a second same-tick sweep
+/// (here: a 1-node merge B while merge A's truncated tail is pending)
+/// advanced the window within the tick — per-generation admissions
+/// reached cap + tail (2549 > 2048), the within-tick re-sweep defeat.
+#[tokio::test]
+async fn probe_admission_bounded_per_generation() -> TestResult {
+    let quota = crate::actor::DISPATCH_PROBE_TICK_QUOTA;
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // Merge A: quota + 500 probeable Ready leaves. Its inline sweep
+    // admits ≤ quota, deferring a 500-candidate tail.
+    let n_a = quota + 500;
+    let nodes_a: Vec<_> = (0..n_a)
+        .map(|i| {
+            let tag = format!("paq-a-{i}");
+            let mut node = make_node(&tag);
+            node.expected_output_paths = vec![test_store_path(&format!("paq-a-{i}-out"))];
+            node
+        })
+        .collect();
+    let _ev_a = merge_dag(&handle, Uuid::new_v4(), nodes_a, vec![], false).await?;
+    let l1 = store.calls.find_missing_paths_log.read().unwrap().len();
+
+    // Merge B: ONE more probeable leaf, same generation (no tick in
+    // between). Its inline sweep sees A's 500-candidate tail + B's
+    // node eligible; with the per-generation quota already exhausted it
+    // must admit ZERO (the tail advances next tick, never within-tick).
+    let mut node_b = make_node("paq-b");
+    node_b.expected_output_paths = vec![test_store_path("paq-b-out")];
+    let _ev_b = merge_dag(&handle, Uuid::new_v4(), vec![node_b], vec![], false).await?;
+    let l2 = store.calls.find_missing_paths_log.read().unwrap().len();
+
+    // Two ticks: generation advances each time, re-arming the quota.
+    tick(&handle).await?;
+    let l3 = store.calls.find_missing_paths_log.read().unwrap().len();
+    tick(&handle).await?;
+    let l4 = store.calls.find_missing_paths_log.read().unwrap().len();
+
+    let log = store.calls.find_missing_paths_log.read().unwrap().clone();
+    let total = n_a + 1;
+
+    // Window accounting (call positions are deterministic — the actor
+    // is single-threaded and each helper awaits its reply):
+    //   [0, l1): merge-A admission FMP (first call) + A's inline sweep
+    //   [l1, l2): merge-B admission FMP (first call) + B's inline sweep
+    //   [l2, l3): tick 1's sweep (generation 2)
+    //   [l3, l4): tick 2's sweep (generation 3)
+    // Merge-time admission FMPs carry the submission's own paths and
+    // are excluded from sweep accounting by position (first call of
+    // each merge window).
+    // Classifier premises: the first call of each merge window is the
+    // merge-time admission FMP carrying the submission's full path set
+    // (NOT a sweep). If merge-time probing ever changes shape these
+    // fire loudly instead of silently mis-attributing sweeps.
+    assert!(l1 >= 1, "merge A issued no FMP at all?");
+    assert_eq!(
+        log[0].len(),
+        n_a,
+        "expected log[0] to be merge A's admission FMP over all {n_a} submission \
+         paths; got {} — the window classifier's premise moved",
+        log[0].len()
+    );
+    assert!(l2 > l1, "merge B issued no FMP at all?");
+    assert_eq!(
+        log[l1].len(),
+        1,
+        "expected log[{l1}] to be merge B's 1-path admission FMP; got {} paths",
+        log[l1].len()
+    );
+    let gen1_sweeps: Vec<&Vec<String>> = log[..l1]
+        .iter()
+        .skip(1)
+        .chain(log[l1..l2].iter().skip(1))
+        .collect();
+    let gen1_admitted: usize = gen1_sweeps.iter().map(|c| c.len()).sum();
+    let gen2_admitted: usize = log[l2..l3].iter().map(|c| c.len()).sum();
+    let gen3_admitted: usize = log[l3..l4].iter().map(|c| c.len()).sum();
+
+    // The quota law, per generation (the pre-fix red: gen1 admitted
+    // quota + 501 — the within-tick re-sweep defeated the cap).
+    assert!(
+        gen1_admitted <= quota,
+        "generation 1 admitted {gen1_admitted} probe candidates > quota {quota}: \
+         the within-tick re-sweep defeated the per-tick admission bound (W9-AF)"
+    );
+    assert!(
+        gen2_admitted <= quota,
+        "generation 2 admitted {gen2_admitted} > quota {quota} (W9-AF)"
+    );
+    assert!(
+        gen3_admitted <= quota,
+        "generation 3 admitted {gen3_admitted} > quota {quota} (W9-AF)"
+    );
+    // RPC-bound subsumption: no single FMP exceeds the quota.
+    for (i, call) in log.iter().enumerate() {
+        assert!(
+            call.len() <= quota.max(total),
+            "call {i} carried {} paths — exceeds every legitimate bound",
+            call.len()
+        );
+    }
+    // Surplus generations fill the whole quota (the bound is tight,
+    // not accidentally smaller): gen 1 has quota+501 eligible, gen 2
+    // has `total` eligible (tail first, oldest-first re-probes fill).
+    assert_eq!(
+        gen1_admitted, quota,
+        "generation 1 had {total} eligible candidates but admitted {gen1_admitted}; \
+         the quota must serve exactly its budget when demand exceeds it"
+    );
+    assert_eq!(
+        gen2_admitted, quota,
+        "generation 2 must fill the re-armed quota (oldest-first window advance)"
+    );
+
+    // Self-healing window: by the end of generation 2 every candidate
+    // has been probed at least once — the deferred tail advanced ahead
+    // of any same-age re-probe (501 gen-0 candidates served before the
+    // generation-1 head re-enters).
+    let mut distinct: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for call in log[..l1].iter().skip(1).chain(log[l1..l2].iter().skip(1)) {
+        for p in call {
+            distinct.insert(p.as_str());
+        }
+    }
+    for call in &log[l2..l3] {
+        for p in call {
+            distinct.insert(p.as_str());
+        }
+    }
+    assert_eq!(
+        distinct.len(),
+        total,
+        "window did not self-heal: {} of {total} candidates probed by the end of \
+         generation 2 — the truncated tail starved behind same-generation re-probes",
+        distinct.len()
     );
     Ok(())
 }

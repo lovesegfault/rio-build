@@ -1198,10 +1198,13 @@ pub struct DerivationState {
     pub traceparent: String,
     /// `DagActor.probe_generation` at the time of the last dispatch-
     /// time `FindMissingPaths` probe for this node. The batch pre-pass
-    /// skips nodes whose `probed_generation == probe_generation` so the
-    /// `truncate(DISPATCH_PROBE_BATCH_CAP)` window advances across
-    /// inline `dispatch_ready` calls instead of re-probing the head.
-    /// `probe_generation` advances once per `handle_tick` (1/s).
+    /// skips nodes whose `probed_generation == probe_generation` (no
+    /// node probed twice per tick) and serves over-quota sweeps
+    /// least-recently-probed first, so the `DISPATCH_PROBE_TICK_QUOTA`
+    /// window advances ACROSS ticks (the deferred tail goes ahead of
+    /// any same-age re-probe) — within one tick the quota ledger caps
+    /// aggregate admissions instead. `probe_generation` advances once
+    /// per `handle_tick` (1/s).
     pub probed_generation: u64,
 }
 

@@ -111,6 +111,14 @@ pub struct MockStoreCalls {
     /// dispatch/settlement probes ask once PER LIVE TENANT instead of
     /// one arbitrarily-picked tenant.
     pub find_missing_tenants: Arc<RwLock<Vec<Option<String>>>>,
+    /// The `store_paths` of every ANSWERED `find_missing_paths` call,
+    /// in arrival order. Fault-injected calls (`fail_find_missing`)
+    /// increment `find_missing_calls` but are NOT logged here — the
+    /// log records what the store actually adjudicated. For structural
+    /// per-cycle admission assertions: the scheduler's dispatch-probe
+    /// quota tests count ADMITTED candidates per tick from the request
+    /// paths themselves instead of trusting scheduler-side bookkeeping.
+    pub find_missing_paths_log: Arc<RwLock<Vec<Vec<String>>>>,
     /// `manifest_hint` from each `get_path` call (None if unset).
     /// I-110c: lets tests assert the FUSE fetch carried the primed
     /// hint.
@@ -909,6 +917,11 @@ impl StoreService for MockStore {
             let _ = rio_nix::store_path::StorePath::parse(p)
                 .map_err(|e| Status::invalid_argument(format!("mock: invalid store path: {e}")))?;
         }
+        self.calls
+            .find_missing_paths_log
+            .write()
+            .unwrap()
+            .push(requested.clone());
         let paths = self.state.paths.read().unwrap();
         // merged_bug_028: the per-tenant unobtainable script overrides
         // the global state for this request's tenant.

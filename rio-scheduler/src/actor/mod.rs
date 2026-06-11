@@ -200,7 +200,7 @@ pub(super) const FORECAST_DROPPED_WARNED_CAP: usize = 4096;
 /// already sits inside the actor for a 153k-node submission, so the
 /// extra 60s is acceptable for that (rare, inherently slow) shape.
 /// Dispatch-time FMP stays on `grpc_timeout` (its batch is bounded by
-/// `DISPATCH_PROBE_BATCH_CAP`).
+/// `DISPATCH_PROBE_TICK_QUOTA`).
 pub const MERGE_FMP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// Delay before cleaning up terminal build state. Keeps the build
@@ -209,20 +209,53 @@ pub const MERGE_FMP_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// snapshot (`r[sched.watch.snapshot-first]`).
 const TERMINAL_CLEANUP_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Max Ready candidates per `FindMissingPaths` batch in the ready-set
-/// store short-circuit (`sweep_ready_cached`). Keeps the FMP RPC in
-/// the actor's ~100ms budget for very wide DAG layers — the sweep runs
-/// under `grpc_timeout` (30s), not [`MERGE_FMP_TIMEOUT`]. The
-/// truncated tail is picked up on the next sweep (same
-/// `probe_generation`, so the window advances rather than re-probing
-/// the head).
-pub(crate) const DISPATCH_PROBE_BATCH_CAP: usize = 2048;
+/// Per-tick admission quota for the ready-set store short-circuit
+/// (`sweep_ready_cached`): across ALL inline sweeps within one
+/// `probe_generation` (after merges, after completion cascades, plus
+/// the Tick's own sweep), at most this many Ready candidates are
+/// admitted to `FindMissingPaths`. Round-9 B7 promoted the old
+/// per-SWEEP batch cap to this deliberate per-tick quota: the cap's
+/// pacing effect was incidental — every same-tick re-sweep advanced
+/// the truncate window and admitted another batch, so per-tick
+/// admissions were bounded by (cap × sweeps/tick), unbounded in
+/// completion-cascade count.
+///
+/// Typed envelope (R17), all axes:
+/// - population: ≤ 2048 candidates admitted per generation; the
+///   unserved tail carries to the NEXT generation (never re-granted
+///   within the same one) and is served oldest-`probed_generation`
+///   first, so the window self-heals to full coverage instead of
+///   starving behind same-age re-probes.
+/// - time: each sweep's FMP batch is ≤ the quota remainder ≤ 2048
+///   paths — the same single-RPC bound the old per-sweep cap enforced
+///   (in the actor's ~100ms budget under `grpc_timeout` (30s), not
+///   [`MERGE_FMP_TIMEOUT`]).
+/// - VIOLABLE: 2048 is the carried wave-8 value (derived from the FMP
+///   RPC budget above, far under the wire's `max_batch_paths`); no
+///   production capture has contradicted it. Retune on evidence of
+///   starved wide layers — the quota law (≤ quota/tick, next-tick
+///   self-heal) is what tests pin, not the number.
+pub(crate) const DISPATCH_PROBE_TICK_QUOTA: usize = 2048;
 
 /// Concurrency ceiling for the per-tenant store-probe fan-out (the
 /// sweep's wall-clock is owned by its `AttemptBudget`, not this knob;
 /// this only caps simultaneous in-flight FindMissingPaths RPCs so a
 /// many-tenant sweep cannot dogpile the store).
 pub(crate) const MAX_PROBE_CONCURRENCY: usize = 8;
+
+/// Generation-keyed admission ledger for
+/// [`DISPATCH_PROBE_TICK_QUOTA`]. `admitted` counts candidates this
+/// `generation` has granted to FindMissingPaths across every sweep;
+/// the sweep resets the count itself when it observes a NEWER
+/// `probe_generation` (structural expiry — no tick-site reset to
+/// bypass, the merged_bug_033 lesson). Default `generation: 0` is
+/// strictly older than the actor's starting `probe_generation` (1), so
+/// the very first sweep begins with a fresh budget.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ProbeQuotaLedger {
+    pub(crate) generation: u64,
+    pub(crate) admitted: usize,
+}
 
 /// Entry in [`DagActor::authoritative_binding`]: kube-authoritative
 /// `spec.nodeName` from the controller's pod informer, plus the
@@ -734,14 +767,23 @@ pub struct DagActor {
     /// this family — see [`snapshot::SupplyRevalidation`]).
     supply_reval: snapshot::SupplyRevalidation,
     /// Advances once per `handle_tick`. The ready-set store
-    /// short-circuit (`sweep_ready_cached`) stamps each checked node's
-    /// `probed_generation` with this value and skips already-stamped
-    /// nodes within the same generation, so the
-    /// [`DISPATCH_PROBE_BATCH_CAP`] truncate window advances across
-    /// inline sweep calls instead of re-FMP'ing the same head. Starts
-    /// at 1 so freshly-inserted nodes (`probed_generation: 0`) are
-    /// immediately eligible.
+    /// short-circuit (`sweep_ready_cached`) stamps each ADMITTED
+    /// node's `probed_generation` with this value and skips
+    /// already-stamped nodes within the same generation, so no node is
+    /// FMP-probed twice per tick; [`DagActor::probe_quota`] keys on
+    /// the same value, so per-tick admissions are bounded by
+    /// [`DISPATCH_PROBE_TICK_QUOTA`] in aggregate and the truncated
+    /// tail advances on the NEXT tick (oldest-generation first), never
+    /// within-tick. Starts at 1 so freshly-inserted nodes
+    /// (`probed_generation: 0`) are immediately eligible.
     probe_generation: u64,
+    /// Per-generation probe-admission ledger for
+    /// [`DISPATCH_PROBE_TICK_QUOTA`]. Expires STRUCTURALLY by key: the
+    /// first sweep of a new `probe_generation` observes the stale
+    /// generation and resets the count — no tick-site reset code path
+    /// to bypass (the merged_bug_033 early-exit-ledger shape is
+    /// unrepresentable).
+    probe_quota: ProbeQuotaLedger,
     /// Last [`ClusterSnapshot`] published by `handle_tick`. The
     /// AdminService `cluster_status` handler reads `snapshot_tx.
     /// subscribe().borrow()` via [`ActorHandle::cluster_snapshot_cached`]
@@ -970,6 +1012,7 @@ impl DagActor {
             )),
             supply_reval: Default::default(),
             probe_generation: 1,
+            probe_quota: ProbeQuotaLedger::default(),
             snapshot_tx: watch::channel(Arc::new(ClusterSnapshot::default())).0,
             #[cfg(test)]
             recovery_toctou_gate: plumbing.recovery_toctou_gate,
@@ -1123,6 +1166,11 @@ impl DagActor {
             // over-emit.
             supply_reval,
             probe_generation: _,
+            // Retained: the probe-admission ledger is generation-KEYED
+            // (structural expiry) — a stale generation resets itself on
+            // the next sweep, so a leader transition needs no wipe and
+            // gets none (no curated reset site to miss).
+            probe_quota: _,
             snapshot_tx: _,
             #[cfg(test)]
                 recovery_toctou_gate: _,

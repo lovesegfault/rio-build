@@ -74,10 +74,12 @@ impl DagActor {
     /// Returns the set of hashes the drain loop must skip
     /// `ready_check_or_spawn` for (I-163). On success this is the
     /// batch-probed head (completed here or definitively found-missing
-    /// one RPC ago) plus the truncated tail (deferred to next pass's
-    /// batch). On RPC error/timeout this is the tail only — the
-    /// stamped head is protected via `probed_generation`, so neither
-    /// hits the per-drv fallback.
+    /// one RPC ago) plus the quota-deferred tail (served by a LATER
+    /// generation's batch, oldest-first — never re-granted within this
+    /// one). On RPC error/timeout this is the tail only — the stamped
+    /// head is protected via `probed_generation`, so neither hits the
+    /// per-drv fallback. A quota-exhausted sweep returns the whole
+    /// candidate set unprobed.
     // r[impl sched.dispatch.fod-substitute+3]
     async fn batch_probe_cached_ready(&mut self) -> HashSet<DrvHash> {
         let Some(store) = &self.store_client else {
@@ -103,23 +105,64 @@ impl DagActor {
         if candidates.is_empty() {
             return HashSet::new();
         }
-        // Belt under the actor's own per-sweep cap (the wire's
-        // max_batch_paths bound is far larger; the actor budget below
-        // is what really prices a sweep). The truncated tail is
-        // inserted into `checked` (so the drain loop skips the per-drv
-        // `ready_check_or_spawn` fallback) but NOT stamped with
-        // `probed_generation` — the next inline `dispatch_ready` (same
-        // generation) batch-probes that window. Letting the tail fall
+        // Per-tick admission quota (round-9 B7). The ledger expires
+        // structurally by generation key: the first sweep of a new
+        // `probe_generation` observes the stale key and re-arms the
+        // budget — there is no tick-site reset to bypass.
+        if self.probe_quota.generation != probe_gen {
+            self.probe_quota = super::ProbeQuotaLedger {
+                generation: probe_gen,
+                admitted: 0,
+            };
+        }
+        let remaining = super::DISPATCH_PROBE_TICK_QUOTA.saturating_sub(self.probe_quota.admitted);
+        // Quota exhausted for this generation: the ENTIRE candidate set
+        // is the deferred tail — unstamped, so the next generation
+        // serves it (oldest-first below); within this generation it is
+        // never re-granted (the within-tick re-sweep defeat is dead).
+        let mut checked = HashSet::with_capacity(candidates.len());
+        if remaining == 0 {
+            for (h, _) in &candidates {
+                checked.insert(h.clone());
+            }
+            return checked;
+        }
+        // Over-quota sweep: serve the least-recently-probed candidates
+        // first ((probed_generation, drv_hash) order — deterministic),
+        // so the deferred tail (older stamps) advances ahead of any
+        // same-tick-age re-probe and the window self-heals to full
+        // coverage across ticks instead of starving behind arbitrary
+        // iteration order. The unserved tail is inserted into `checked`
+        // (the caller-side skip set) but NOT stamped with
+        // `probed_generation` — a LATER generation's sweep batch-probes
+        // that window. Each FMP batch is ≤ the remaining quota ≤ the
+        // full quota — the same single-RPC bound the old per-sweep cap
+        // enforced (the wire's max_batch_paths is far larger; the
+        // budget here is what prices a sweep). Letting the tail fall
         // through to the per-drv path would be O(N) sequential 30s-
         // timeout RPCs in the actor (24h+ stall with a wide layer and
         // an unreachable store; I-139/I-140 invariant).
-        let mut checked = HashSet::with_capacity(candidates.len());
-        if candidates.len() > super::DISPATCH_PROBE_BATCH_CAP {
-            for (h, _) in &candidates[super::DISPATCH_PROBE_BATCH_CAP..] {
+        if candidates.len() > remaining {
+            // Decorate-sort-undecorate: one generation lookup per
+            // candidate (not per comparison) — the over-quota branch
+            // can see 100K+-wide layers.
+            let mut keyed: Vec<(u64, DrvHash, Vec<String>)> = candidates
+                .drain(..)
+                .map(|(h, p)| {
+                    let g = self.dag.node(&h).map_or(0, |s| s.probed_generation);
+                    (g, h, p)
+                })
+                .collect();
+            keyed.sort_unstable_by(|(ga, ha, _), (gb, hb, _)| {
+                ga.cmp(gb).then_with(|| ha.as_ref().cmp(hb.as_ref()))
+            });
+            for (_, h, _) in &keyed[remaining..] {
                 checked.insert(h.clone());
             }
-            candidates.truncate(super::DISPATCH_PROBE_BATCH_CAP);
+            keyed.truncate(remaining);
+            candidates.extend(keyed.into_iter().map(|(_, h, p)| (h, p)));
         }
+        self.probe_quota.admitted += candidates.len();
         for (h, _) in &candidates {
             if let Some(s) = self.dag.node_mut(h) {
                 s.probed_generation = probe_gen;

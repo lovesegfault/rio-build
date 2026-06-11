@@ -275,7 +275,12 @@ impl DagActor {
         // Advance probe_generation here (1/s) — NOT per
         // `sweep_ready_cached` call — so a Ready node is FMP-probed at
         // most once per Tick regardless of how many inline sweeps fire
-        // between Ticks (after merges and completion cascades).
+        // between Ticks (after merges and completion cascades). The
+        // per-tick admission quota (`DISPATCH_PROBE_TICK_QUOTA`)
+        // re-arms with the SAME advance: its ledger is keyed on this
+        // generation value and resets structurally on the first sweep
+        // that observes the new one (round-9 B7 — aggregate admissions
+        // per tick are bounded, not just per-node re-probes).
         self.probe_generation = self.probe_generation.wrapping_add(1);
         // Tick-cadence ready-set store short-circuit. The stream fleet
         // got this cadence implicitly (heartbeats marked the dispatch
