@@ -1572,6 +1572,14 @@ pub(super) struct AckApplyPlan {
     /// alphabet's `NO_HOSTING_CLASS`. Folded by `commit` into the
     /// consecutive-verdict counters.
     verdicts: Vec<(DrvHash, String)>,
+    /// merged_bug_125: the request carried a NON-EMPTY decoded
+    /// rejected plane (ANY reason — OverCap included). The
+    /// verdict-pass ordinal advances on THIS witness, not on the
+    /// NoHost subset above: an OverCap-only cover pass is still a
+    /// pass in which a silent drv received no verdict, and freezing
+    /// the ordinal across it let a masked track read pass-adjacent
+    /// when NoHost resumed (false consecutiveness).
+    verdict_plane_present: bool,
 }
 
 /// One decoded `BoundIntent` row — the typed remnant of the wire
@@ -1897,6 +1905,10 @@ impl AckApplyPlan {
             marks,
             observed,
             verdicts,
+            // Stamped AFTER the full decode: an undecodable entry
+            // refused the request above, so presence here means the
+            // plane applied.
+            verdict_plane_present: !rejected.is_empty(),
         })
     }
 
@@ -1941,12 +1953,20 @@ impl AckApplyPlan {
             marks,
             observed,
             verdicts,
+            verdict_plane_present,
         } = self;
         // 124(d): opportunistic prune keeps the map bounded (entries
         // older than 2× the window are dead: the defer read only
         // consults the window).
         if !acked_spawned.is_empty() {
             let now = crate::db::attempts::epoch_now();
+            // The staleness horizon: an entry at least this old is
+            // history, not a live echo (the same bound the retain
+            // below prunes at — merged_bug_125: the prune is gated
+            // behind spawned-carrying acks and ordered after this
+            // loop, so PRESENCE in the map is an incomplete view of
+            // ack recency; the AGE is the witness).
+            let stale_after = 2.0 * crate::actor::pull::ACKED_SPAWNED_DEFER_SECS;
             for h in acked_spawned {
                 // live_051(c) + merged_bug_043(2): a spawned ack heals
                 // the consecutive-verdict budget only on the FRESH
@@ -1955,13 +1975,19 @@ impl AckApplyPlan {
                 // Job-EXISTS echo, not a hosting witness — and the
                 // pre-fix unconditional reset let a Pending-forever
                 // Job keep a genuinely-unhostable drv looping Ready.
-                // Freshness is structural: the `acked_spawned` entry
-                // is refreshed per ack and pruned at 2× the defer
-                // window, so a still-Pending Job's re-acks always find
-                // a live entry (echo ⇒ no reset), while a genuinely
-                // new spawn after a quiet gap finds none (fresh ⇒
-                // reset — the heal).
-                if actor.acked_spawned.insert(h.clone(), now).is_none() {
+                // merged_bug_125 (R26): freshness is AGE-KEYED, never
+                // bare map-presence — the heal fires when no LIVE
+                // entry exists (absent, or present-but-stale: during
+                // a fleet-quiet gap no spawned-carrying ack arrives,
+                // the gated retain cannot run, and the stale entry
+                // would otherwise make the first genuine post-gap
+                // spawn read as an echo and let an N−1 track cross
+                // into a FALSE NoHostPoison; the sibling
+                // pull.rs defer read is the in-plane age precedent).
+                // A still-Pending Job's re-acks always find a LIVE
+                // entry (refreshed per ack ⇒ echo ⇒ no reset).
+                let prev = actor.acked_spawned.insert(h.clone(), now);
+                if prev.is_none_or(|t| now - t >= stale_after) {
                     actor.supply_reval.no_host_verdicts.remove(&h);
                 }
             }
@@ -1995,9 +2021,19 @@ impl AckApplyPlan {
         }
         // Exhaustive over the closed [`ArmDecode`] alphabet — a new
         // echo-shape variant cannot fall through to a silent no-arm.
+        // merged_bug_125: the negative shape gets an explicit edge —
+        // `Empty` (both arrays empty: the producer POSITIVELY says
+        // "no cells") DISARMS a stale entry left by an earlier Armed
+        // echo, so a re-dispatched intent's first pull cannot
+        // ice.clear() exactly the cell that had been failing.
+        // `LegacyUnarmed` (one array absent — the pre-field-14 echo)
+        // carries NO cell information and neither arms nor disarms.
         for (id, arm) in armed {
             match arm {
-                ArmDecode::Empty | ArmDecode::LegacyUnarmed => {}
+                ArmDecode::Empty => {
+                    actor.dispatched_cells.remove(&id);
+                }
+                ArmDecode::LegacyUnarmed => {}
                 ArmDecode::Armed(cells) => {
                     actor.dispatched_cells.insert(id, cells);
                 }
@@ -2056,19 +2092,25 @@ impl AckApplyPlan {
         // `step_no_host_counter`; the verdict detail is display-only.
         let mut poisons = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
-        // merged_bug_043(3): the verdict-pass ordinal advances once
-        // per APPLIED ack carrying ≥1 verdict — the cover-pass
-        // signature. Tracks stamp it; a track whose stamp is not
-        // adjacent to the current pass restarts at 1 in
-        // `step_no_host_counter` (the typed no-verdict-this-pass
-        // non-event: spawned/masked/reaped drvs break their streak
-        // structurally instead of freezing). Residual (recorded): a
-        // cover pass yielding ZERO verdicts fleet-wide does not
+        // merged_bug_043(3) as repaired by merged_bug_125: the
+        // verdict-pass ordinal advances once per APPLIED ack whose
+        // DECODED rejected plane is non-empty — ANY reason, OverCap
+        // included — the cover-pass signature. Tracks stamp it; a
+        // track whose stamp is not adjacent to the current pass
+        // restarts at 1 in `step_no_host_counter` (the typed
+        // no-verdict-this-pass non-event: spawned/masked/reaped drvs
+        // break their streak structurally instead of freezing).
+        // Pre-merged_bug_125 only the NoHost SUBSET advanced it, so
+        // an OverCap-only pass froze the ordinal and a masked track
+        // read pass-adjacent when NoHost resumed (W10-W pins the
+        // repair). Residual (recorded, NARROWED): a cover pass
+        // yielding a rejected plane that is empty fleet-wide does not
         // advance the ordinal — such a pass is indistinguishable from
-        // no pass on the current wire; any drv-visible gap (the
-        // frozen-29-track shape) requires other drvs' verdicts, which
-        // DO advance it.
-        if !verdicts.is_empty() {
+        // no pass on the current wire; any drv-visible gap now
+        // requires only that SOME drv drew ANY verdict, which DOES
+        // advance it (W10-W is the delivering witness for this
+        // sentence).
+        if verdict_plane_present {
             actor.supply_reval.verdict_pass += 1;
         }
         let pass = actor.supply_reval.verdict_pass;

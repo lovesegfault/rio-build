@@ -6839,3 +6839,327 @@ async fn frozen_track_cannot_claim_false_consecutiveness() {
          — got a poison claiming false consecutiveness: {p:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// merged_bug_125: typed lifecycle edges for the ack-apply planes (W10-U/V/W)
+// ---------------------------------------------------------------------------
+
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation+2]
+/// **W10-U (merged_bug_125 edge 1)** — the spawned-ack heal consumes
+/// an AGE witness, never bare map-presence (R26: presence in the
+/// lazily-pruned `acked_spawned` map is an INCOMPLETE view of ack
+/// history — the retain is gated behind spawned-carrying acks and
+/// ordered after the insert, so a fleet-quiet gap leaves STALE
+/// entries that make a genuinely new spawn read as an echo).
+///
+/// Drive: spawn-ack (entry minted) → N−1 no-host verdicts (none of
+/// these acks carry `spawned`, so the gated retain never runs) → the
+/// fleet-quiet gap (the entry is backdated past the staleness
+/// horizon — state-modeled elapsed time, the `backdate` precedent;
+/// during a real gap the retain cannot fire by construction) → the
+/// controller spawns a FRESH Job for the drv (the old one died in
+/// the gap) and acks it → one more verdict.
+///
+/// Pre-fix red: the stale entry is PRESENT, the fresh spawn reads as
+/// an echo, the track survives at N−1, and the next verdict crosses
+/// the budget — a FALSE NoHostPoison for a drv whose hosting just
+/// got re-witnessed. Post-fix: the heal keys on the entry's AGE (the
+/// same staleness horizon the retain prunes at): stale ⇒ the gap was
+/// genuine ⇒ heal; the track restarts and N−1 further verdicts stay
+/// unpoisoned.
+#[tokio::test]
+async fn quiet_gap_spawn_heals_by_age_not_map_presence() {
+    use crate::actor::snapshot::NO_HOST_VERDICTS_TO_POISON as N;
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw_builders_only(db.pool.clone());
+    actor.test_inject_ready("d-gap", Some("test-pkg"), "x86_64-linux", false);
+    let spawned = rio_proto::types::SpawnIntent {
+        intent_id: "d-gap".into(),
+        ..Default::default()
+    };
+
+    // The first spawn ack mints the entry.
+    actor
+        .handle_ack_spawned_intents(
+            std::slice::from_ref(&spawned),
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[],
+        )
+        .expect("applied");
+    // N−1 verdicts (no spawned plane → the gated retain never runs).
+    for _ in 1..N {
+        actor
+            .handle_ack_spawned_intents(
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                None,
+                &[no_host_verdict("d-gap", "no class hosts")],
+            )
+            .expect("applied");
+    }
+    // The fleet-quiet gap: the entry outlives the staleness horizon
+    // in place (no spawned-carrying ack arrives to prune it).
+    let stale =
+        crate::db::attempts::epoch_now() - 2.0 * crate::actor::pull::ACKED_SPAWNED_DEFER_SECS - 1.0;
+    actor
+        .acked_spawned
+        .insert(crate::state::DrvHash::from("d-gap"), stale);
+
+    // The GENUINE fresh spawn after the gap.
+    actor
+        .handle_ack_spawned_intents(
+            std::slice::from_ref(&spawned),
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[],
+        )
+        .expect("applied");
+    // One more verdict: a healed track sits at 1, far from the budget.
+    let p = actor
+        .handle_ack_spawned_intents(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[no_host_verdict("d-gap", "no class hosts")],
+        )
+        .expect("applied");
+    assert!(
+        p.is_empty(),
+        "left (pre-fix): the stale acked_spawned entry made the genuine \
+         post-gap spawn read as a Job-EXISTS echo — no heal, the N−1 track \
+         survived, and this verdict crossed the budget: a FALSE \
+         NoHostPoison ({p:?}) / right: the heal consumes the AGE witness \
+         (entry older than the staleness horizon ⇒ the gap was genuine ⇒ \
+         reset)"
+    );
+    // And the live-echo half still holds (merged_bug_043(2)): a FRESH
+    // entry's re-ack is an echo — drive back to N−1 and confirm the
+    // echo does not heal.
+    for _ in 2..N {
+        actor
+            .handle_ack_spawned_intents(
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                None,
+                &[no_host_verdict("d-gap", "no class hosts")],
+            )
+            .expect("applied");
+    }
+    actor
+        .handle_ack_spawned_intents(
+            std::slice::from_ref(&spawned),
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[],
+        )
+        .expect("applied (live echo)");
+    let p = actor
+        .handle_ack_spawned_intents(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[no_host_verdict("d-gap", "no class hosts")],
+        )
+        .expect("applied");
+    assert_eq!(
+        p.len(),
+        1,
+        "a LIVE entry's re-ack stays an echo (no heal) — the budget crosses"
+    );
+}
+
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation+2]
+/// **W10-V (merged_bug_125 edge 2)** — `ArmDecode::Empty` is a typed
+/// NEGATIVE edge: a spawned echo declaring "no cells" (both arrays
+/// empty — the hw-agnostic shape) DISARMS a stale `dispatched_cells`
+/// entry left by an earlier Armed echo. Pre-fix the Empty arm was a
+/// no-op, so a re-dispatched intent's first pull `ice.clear()`ed
+/// exactly the cell that had been failing (the stale set). The
+/// no-information sibling stays inert: `LegacyUnarmed` (exactly one
+/// array empty — the pre-field-14 echo) neither arms nor disarms.
+#[tokio::test]
+async fn empty_arm_decode_disarms_stale_dispatched_cells() {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw_builders_only(db.pool.clone());
+    actor.test_inject_ready("d-arm", Some("test-pkg"), "x86_64-linux", false);
+
+    // The producer-shaped Armed echo: take the REAL emitted intent.
+    let snap = actor.compute_spawn_intents(&Default::default());
+    let intent = snap
+        .intents
+        .iter()
+        .find(|i| i.intent_id == "d-arm")
+        .expect("emitted")
+        .clone();
+    assert!(
+        !intent.node_affinity.is_empty(),
+        "precondition: hw-routed intent (Armed echo shape)"
+    );
+    actor
+        .handle_ack_spawned_intents(std::slice::from_ref(&intent), &[], &[], &[], &[], None, &[])
+        .expect("applied");
+    assert!(
+        actor.dispatched_cells.get("d-arm").is_some(),
+        "Armed echo arms dispatched_cells"
+    );
+
+    // The drv re-solves hw-agnostic; the next echo is Empty (both
+    // arrays empty).
+    let empty_echo = rio_proto::types::SpawnIntent {
+        intent_id: "d-arm".into(),
+        ..Default::default()
+    };
+    actor
+        .handle_ack_spawned_intents(
+            std::slice::from_ref(&empty_echo),
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[],
+        )
+        .expect("applied");
+    assert!(
+        actor.dispatched_cells.get("d-arm").is_none(),
+        "left (pre-fix): the Empty decode was a silent no-op — the STALE \
+         armed cells survived, and the re-dispatched intent's first pull \
+         would ice.clear() exactly the failing cell / right: Empty is a \
+         typed negative edge — the entry disarms"
+    );
+
+    // LegacyUnarmed (one side empty) is NO-INFORMATION: re-arm, then a
+    // legacy echo must neither arm nor disarm.
+    actor
+        .handle_ack_spawned_intents(std::slice::from_ref(&intent), &[], &[], &[], &[], None, &[])
+        .expect("applied");
+    let legacy_echo = rio_proto::types::SpawnIntent {
+        intent_id: "d-arm".into(),
+        hw_class_names: intent.hw_class_names.clone(),
+        node_affinity: vec![],
+        ..Default::default()
+    };
+    actor
+        .handle_ack_spawned_intents(
+            std::slice::from_ref(&legacy_echo),
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[],
+        )
+        .expect("applied");
+    assert!(
+        actor.dispatched_cells.get("d-arm").is_some(),
+        "LegacyUnarmed carries no cell information — it must not disarm"
+    );
+}
+
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation+2]
+/// **W10-W (merged_bug_125 edge 3)** — the verdict-pass ordinal
+/// witnesses the FULL decoded rejected plane, not the NoHost subset.
+/// Pre-fix only NoHost-carrying acks advanced it, so an OverCap-ONLY
+/// applied ack (a real cover pass in which this drv received no
+/// verdict) left the ordinal frozen — a masked drv's track read
+/// pass-ADJACENT when NoHost verdicts resumed, claiming false
+/// consecutiveness (the frozen-29 shape one plane over; the residual
+/// comment's "other drvs' verdicts DO advance it" was false for the
+/// OverCap-only pass).
+#[tokio::test]
+async fn over_cap_only_pass_advances_the_verdict_ordinal() {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw_builders_only(db.pool.clone());
+    actor.test_inject_ready("d-pass", Some("test-pkg"), "x86_64-linux", false);
+    actor.test_inject_ready("d-other", Some("test-pkg"), "x86_64-linux", false);
+
+    // Two adjacent NoHost passes: track at 2.
+    for _ in 0..2 {
+        actor
+            .handle_ack_spawned_intents(
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                None,
+                &[no_host_verdict("d-pass", "no class hosts")],
+            )
+            .expect("applied");
+    }
+    assert_eq!(
+        actor
+            .supply_reval
+            .no_host_verdicts
+            .get(&crate::state::DrvHash::from("d-pass"))
+            .map(|t| t.count),
+        Some(2),
+        "precondition: two adjacent passes counted"
+    );
+
+    // A cover pass in which d-pass got NO verdict but ANOTHER drv
+    // drew an OverCap — the rejected plane is non-empty, the pass
+    // happened.
+    actor
+        .handle_ack_spawned_intents(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[over_cap_verdict("d-other")],
+        )
+        .expect("applied");
+
+    // NoHost resumes for d-pass.
+    actor
+        .handle_ack_spawned_intents(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[no_host_verdict("d-pass", "no class hosts")],
+        )
+        .expect("applied");
+    assert_eq!(
+        actor
+            .supply_reval
+            .no_host_verdicts
+            .get(&crate::state::DrvHash::from("d-pass"))
+            .map(|t| t.count),
+        Some(1),
+        "left (pre-fix): the OverCap-only pass did not advance the \
+         ordinal, so the resumed NoHost read pass-adjacent and the track \
+         continued 2 → 3 (false consecutiveness across a real pass gap) / \
+         right: ANY decoded verdict plane advances the ordinal; the gap \
+         restarts the track at 1"
+    );
+}
