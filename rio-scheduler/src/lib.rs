@@ -265,6 +265,15 @@ pub fn describe_metrics() {
         "Total derivation-to-worker assignments"
     );
     describe_counter!(
+        "rio_scheduler_input_closure_unattested_total",
+        "Dispatches whose input closure was NOT attested, labeled by reason \
+         (seeds_unknown/missing_narinfo/db_error/timeout). Each one degrades \
+         the builder to its own drv-parsed closure BFS and the store skips \
+         closure-digest verification for that build; a sustained nonzero \
+         rate means attestation is effectively disabled — compare against \
+         rio_scheduler_assignments_total."
+    );
+    describe_counter!(
         "rio_scheduler_prefetch_hints_sent_total",
         "PrefetchHint messages sent (one per assignment with paths to warm). \
          Missing from a dispatch = leaf drv (no children)."
