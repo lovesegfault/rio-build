@@ -172,7 +172,9 @@ pub fn describe_metrics() {
         "Content integrity check failures, labeled by `site`: \
          `get_path` (whole-NAR SHA-256, indicates bitrot/corruption), \
          `read_blob` (whole-file BLAKE3, indicates cumsum/index drift), \
-         `chunk` (per-chunk BLAKE3, indicates bitrot/corruption)"
+         `chunk` (per-chunk BLAKE3, indicates bitrot/corruption), \
+         `put_path_chunked` (claimed file digest does not hash from \
+         the run's content — rejected forgery attempt)"
     );
     describe_gauge!(
         "rio_store_chunk_dedup_ratio",
@@ -235,8 +237,9 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_store_putpath_verify_unavailable_total",
         "PutPathChunked uploads aborted by a transient failure: a chunk \
-         PUT failed, or a referenced chunk was GC-claimed between the \
-         builder's HasChunks probe and the commit's presence proof. The \
+         PUT failed, a referenced chunk was GC-claimed between the \
+         builder's HasChunks probe and the commit's presence proof, or \
+         a chunk re-fetch during file-digest verification failed. The \
          builder retries."
     );
     describe_counter!(

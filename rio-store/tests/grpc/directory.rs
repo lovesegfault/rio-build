@@ -832,6 +832,48 @@ async fn stat_blob_zero_byte_file() {
     assert_eq!(resp.last_chunk_take, 0);
 }
 
+/// Two `file_blobs` rows for one digest resolve deterministically:
+/// the lowest `store_path_hash` referrer wins, so resolution cannot be
+/// steered by insertion order. The second row binds the digest to a
+/// DIFFERENT path's window (the upload path now rejects creating such
+/// a row — this models a legacy/poisoned binding), making the winner
+/// observable through the returned chunk list.
+#[tokio::test]
+async fn stat_blob_two_referrers_deterministic_winner() {
+    let mut f = fixture().await;
+    let b1 = make_blob_nar(300, 31);
+    let digest = seed_blob(&f, "det-a", &b1, Some(100)).await;
+    let b2 = make_blob_nar(300, 32);
+    let d2 = seed_blob(&f, "det-b", &b2, Some(100)).await;
+    assert_ne!(digest, d2);
+    // Bind b1's digest to det-b's window too.
+    let hash_a = sha2::Sha256::digest(b"det-a").to_vec();
+    let hash_b = sha2::Sha256::digest(b"det-b").to_vec();
+    sqlx::query(
+        "INSERT INTO file_blobs (digest, store_path_hash, nar_offset, size) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(digest.as_slice())
+    .bind(&hash_b)
+    .bind(BLOB_NAR_OFFSET as i64)
+    .bind(300i64)
+    .execute(&f.db.pool)
+    .await
+    .unwrap();
+
+    let tok = token(f.tenant_a);
+    let resp = stat_blob(&mut f, digest, &tok).await.unwrap();
+    // The winner's first window chunk identifies which row resolved:
+    // the two NARs differ in content, so their chunk digests differ.
+    let expected_nar = if hash_a < hash_b { &b1.nar } else { &b2.nar };
+    let first_chunk: [u8; 32] = blake3::hash(&expected_nar[0..100]).into();
+    assert_eq!(
+        resp.chunks[0].digest,
+        first_chunk.to_vec(),
+        "resolution must pick the lowest store_path_hash referrer"
+    );
+}
+
 /// `send_chunks=false` is a presence probe: empty response on a known
 /// digest, NotFound otherwise.
 // r[verify store.castore.blob-stat]

@@ -103,7 +103,7 @@ pub(super) async fn upload_outputs_chunked(
     // r[impl builder.upload.references-scanned+2]
     // Candidate set = echoed input_closure ∪ sibling output paths.
     // This scan is authoritative: the store commits the resolved set
-    // as claimed (`r[store.integrity.verify-on-put+2]`); rationale at
+    // as claimed (`r[store.integrity.verify-on-put+3]`); rationale at
     // the collect_outputs call site (executor/outputs.rs).
     let store_paths: Vec<String> = basenames
         .iter()

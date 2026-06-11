@@ -312,9 +312,9 @@ async fn idempotent_reupload_skips_and_keeps_refcounts() -> TestResult {
     Ok(())
 }
 
-/// Counts backend `get` calls. The §6.3 receive walk must never fetch
-/// chunks: the builder's claims are committed as claimed, so there is
-/// nothing to recompute from already-durable bodies.
+/// Counts backend `get` calls. The §6.3 receive walk never fetches
+/// chunks; the deferred file-digest proof reads chunks back ONLY for
+/// runs that mix deduped chunks into an uncommitted digest.
 #[derive(Default)]
 struct GetCountingBackend {
     inner: MemoryChunkBackend,
@@ -350,13 +350,15 @@ impl ChunkBackend for GetCountingBackend {
     }
 }
 
-/// A fully-deduped upload (every chunk already durable, `novel` empty,
-/// no bodies on the stream) commits without a single backend chunk
-/// read. Pins the structural fix for the deduped-upload stall: the
-/// old verify walk re-fetched every chunk serially to recompute the
-/// NAR hash, which on a large fully-deduped output took longer than
-/// the client's stream timeout.
-// r[verify store.integrity.verify-on-put+2]
+/// A fully-deduped HONEST re-upload (every chunk already durable,
+/// `novel` empty, no bodies on the stream) commits without a single
+/// backend chunk read: every file digest already has a committed
+/// binding with the identical chunk window, so the file-digest proof
+/// resolves on PostgreSQL metadata alone. Pins the structural fix for
+/// the deduped-upload stall — the old verify walk re-fetched every
+/// chunk serially to recompute the NAR hash, which on a large
+/// fully-deduped output took longer than the client's stream timeout.
+// r[verify store.integrity.verify-on-put+3]
 #[tokio::test]
 async fn fully_deduped_upload_commits_with_zero_chunk_reads() -> TestResult {
     let backend = Arc::new(GetCountingBackend::default());
@@ -394,7 +396,7 @@ async fn fully_deduped_upload_commits_with_zero_chunk_reads() -> TestResult {
     assert_eq!(
         backend.gets.load(std::sync::atomic::Ordering::SeqCst),
         0,
-        "PutPathChunked must never read chunks from the backend"
+        "an honest fully-deduped re-upload must not read chunks from the backend"
     );
     let complete: i64 = count(
         &s.db.pool,
@@ -405,7 +407,7 @@ async fn fully_deduped_upload_commits_with_zero_chunk_reads() -> TestResult {
     Ok(())
 }
 
-// r[verify store.integrity.verify-on-put+2]
+// r[verify store.integrity.verify-on-put+3]
 /// Wire-protocol violations: chunks out of `novel` order, a corrupt
 /// chunk body, and an extra frame after `novel` is exhausted are all
 /// INVALID_ARGUMENT; a truncated stream is FAILED_PRECONDITION
@@ -925,6 +927,194 @@ async fn ca_path_mismatch_rejects() -> TestResult {
     Ok(())
 }
 
+// ── file-digest binding tests (server-side whole-file recompute) ───
+
+/// Replace a single-chunk file fixture's manifest with an explicit
+/// two-piece split (file boundaries stay chunk boundaries; intra-file
+/// splits are the builder's choice). Lets a test dedup one half of a
+/// file while streaming the other.
+fn split_single_chunk(fx: &mut TreeFixture, halves: [&[u8]; 2]) {
+    assert_eq!(fx.chunks.len(), 1, "fixture must be a single-chunk file");
+    let whole: Vec<u8> = halves.concat();
+    assert_eq!(fx.chunks[0].1, whole, "halves must concatenate to the file");
+    fx.chunks = halves
+        .iter()
+        .map(|h| (*blake3::hash(h).as_bytes(), h.to_vec()))
+        .collect();
+    fx.output.chunk_manifest = fx
+        .chunks
+        .iter()
+        .map(|(d, body)| ChunkMeta {
+            digest: d.to_vec(),
+            size: body.len() as u64,
+        })
+        .collect();
+}
+
+/// Overwrite a single-file fixture's claimed whole-file digest.
+fn forge_file_digest(fx: &mut TreeFixture, digest: [u8; 32]) {
+    match fx
+        .output
+        .root_node
+        .as_mut()
+        .expect("fixture has a root node")
+        .node
+        .as_mut()
+        .expect("root oneof is set")
+    {
+        rio_proto::castore::root_node::Node::File(f) => f.digest = digest.to_vec(),
+        _ => unreachable!("single-file fixture has a file root"),
+    }
+}
+
+// r[verify store.integrity.verify-on-put+3]
+/// A claimed whole-file digest that does not hash from the uploaded
+/// bytes is rejected during the receive walk (the bytes are in hand),
+/// and the forged digest never lands in the `file_blobs` namespace.
+#[tokio::test]
+async fn forged_file_digest_rejected() -> TestResult {
+    let (mut s, _backend) = StoreSession::new_chunked().await?;
+    let dir = tempfile::TempDir::new()?;
+    let file = dir.path().join("blob");
+    std::fs::write(&file, b"honest content, forged digest claim")?;
+
+    let mut fx = fixture_for_tree(&file, &out_path("fgd"), vec![]);
+    let forged = [0xAB; 32];
+    forge_file_digest(&mut fx, forged);
+    let (begin, frames) = assemble_begin(&[&fx], vec![], &Default::default());
+
+    let err = send_chunked(&mut s.client, begin, frames, None)
+        .await
+        .expect_err("a file digest that does not hash from the uploaded bytes must be rejected");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM file_blobs WHERE digest = $1")
+        .bind(forged.as_slice())
+        .fetch_one(&s.db.pool)
+        .await?;
+    assert_eq!(n, 0, "forged digest must not be bound in file_blobs");
+    let m = poll_scalar_until::<i64>(&s.db.pool, "SELECT COUNT(*) FROM manifests", 0).await;
+    assert_eq!(m, 0, "rejected upload must not leave a manifest behind");
+    Ok(())
+}
+
+// r[verify store.integrity.verify-on-put+3]
+/// The cross-tenant poisoning shape (bughunter merged_081): bind a
+/// victim's file digest to garbage content using only already-durable
+/// chunks — a fully-deduped upload streams no bodies the receive walk
+/// could check, so the binding must be proven another way (window
+/// agreement with the committed binding, else a backend re-fetch).
+/// Both legs disagree with the forged claim → rejected, and the
+/// victim's binding stays the only row for that digest.
+#[tokio::test]
+async fn forged_dedup_binding_rejected() -> TestResult {
+    let (mut s, _backend) = StoreSession::new_chunked().await?;
+    let victim_content = b"victim's legitimate blob bytes!!".as_slice();
+    let garbage_content = b"attacker-controlled garbage data".as_slice();
+    assert_eq!(victim_content.len(), garbage_content.len());
+
+    // The victim commits its file honestly: digest D → victim bytes.
+    let dir_v = tempfile::TempDir::new()?;
+    let victim_file = dir_v.path().join("victim");
+    std::fs::write(&victim_file, victim_content)?;
+    let fx_v = fixture_for_tree(&victim_file, &out_path("fdv"), vec![]);
+    let victim_digest = *blake3::hash(victim_content).as_bytes();
+    let (begin, frames) = assemble_begin(&[&fx_v], vec![], &Default::default());
+    assert_eq!(
+        send_chunked(&mut s.client, begin, frames, None).await?,
+        vec![true]
+    );
+
+    // The attacker makes its garbage chunk durable under honest claims.
+    let dir_a = tempfile::TempDir::new()?;
+    let garbage_file = dir_a.path().join("garbage");
+    std::fs::write(&garbage_file, garbage_content)?;
+    let fx_g = fixture_for_tree(&garbage_file, &out_path("fda"), vec![]);
+    let garbage_chunk = fx_g.chunks[0].0;
+    let (begin, frames) = assemble_begin(&[&fx_g], vec![], &Default::default());
+    assert_eq!(
+        send_chunked(&mut s.client, begin, frames, None).await?,
+        vec![true]
+    );
+
+    // The forgery: a new path claims digest D over the (deduped)
+    // garbage chunk. `novel` is empty — no body crosses the wire.
+    let mut fx_forge = fixture_for_tree(&garbage_file, &out_path("fdf"), vec![]);
+    forge_file_digest(&mut fx_forge, victim_digest);
+    let durable: std::collections::HashSet<[u8; 32]> = [garbage_chunk].into();
+    let (begin, frames) = assemble_begin(&[&fx_forge], vec![], &durable);
+    assert!(
+        begin.novel.is_empty() && frames.is_empty(),
+        "the forgery must be a fully-deduped upload"
+    );
+    let err = send_chunked(&mut s.client, begin, frames, None)
+        .await
+        .expect_err("binding a foreign digest to deduped garbage must be rejected");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+
+    // Exactly one binding for D survives: the victim's.
+    let rows: Vec<Vec<u8>> =
+        sqlx::query_scalar("SELECT store_path_hash FROM file_blobs WHERE digest = $1")
+            .bind(victim_digest.as_slice())
+            .fetch_all(&s.db.pool)
+            .await?;
+    assert_eq!(
+        rows,
+        vec![rio_store::test_helpers::path_hash(&out_path("fdv"))],
+        "the dedup namespace must hold only the victim's binding"
+    );
+    Ok(())
+}
+
+/// Honest incremental-build shape: a file mixing a deduped prefix
+/// chunk with a novel suffix binds a digest the store has never
+/// committed, so the verify task re-fetches the run from the backend
+/// and recomputes — the upload commits and round-trips.
+#[tokio::test]
+async fn mixed_novel_dedup_file_recomputes_and_commits() -> TestResult {
+    let backend = Arc::new(GetCountingBackend::default());
+    let mut s =
+        StoreSession::new_chunked_with_backend(Arc::clone(&backend) as Arc<dyn ChunkBackend>)
+            .await?;
+    let part_a = vec![0x41u8; 1000];
+    let part_b = vec![0x42u8; 1000];
+    let part_c = vec![0x43u8; 1000];
+
+    // Upload 1: file A||B split as [A, B].
+    let dir1 = tempfile::TempDir::new()?;
+    let f1 = dir1.path().join("v1");
+    std::fs::write(&f1, [part_a.as_slice(), part_b.as_slice()].concat())?;
+    let mut fx1 = fixture_for_tree(&f1, &out_path("mx1"), vec![]);
+    split_single_chunk(&mut fx1, [part_a.as_slice(), part_b.as_slice()]);
+    let (begin, frames) = assemble_begin(&[&fx1], vec![], &Default::default());
+    assert_eq!(
+        send_chunked(&mut s.client, begin, frames, None).await?,
+        vec![true]
+    );
+
+    // Upload 2: file A||C split as [A, C]; A dedups, C streams.
+    let dir2 = tempfile::TempDir::new()?;
+    let f2 = dir2.path().join("v2");
+    std::fs::write(&f2, [part_a.as_slice(), part_c.as_slice()].concat())?;
+    let path2 = out_path("mx2");
+    let mut fx2 = fixture_for_tree(&f2, &path2, vec![]);
+    split_single_chunk(&mut fx2, [part_a.as_slice(), part_c.as_slice()]);
+    let durable: std::collections::HashSet<[u8; 32]> = [*blake3::hash(&part_a).as_bytes()].into();
+    let (begin, frames) = assemble_begin(&[&fx2], vec![], &durable);
+    assert_eq!(frames.len(), 1, "only C streams");
+    assert_eq!(
+        send_chunked(&mut s.client, begin, frames, None).await?,
+        vec![true]
+    );
+    let gets = backend.gets.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        (1..=2).contains(&gets),
+        "the deferred recompute reads the run back from the backend (gets={gets})"
+    );
+    assert_eq!(get_path_bytes(&mut s.client, &path2).await?, fx2.nar);
+    Ok(())
+}
+
 // ── verify-pipeline tests (bounded-concurrent chunk PUTs) ──────────
 
 /// Latency-injecting wrapper around the memory backend: tracks the PUT
@@ -981,10 +1171,11 @@ impl ChunkBackend for FailingPutBackend {
         anyhow::bail!("injected S3 outage")
     }
     async fn get(&self, _: &[u8; 32]) -> anyhow::Result<Option<bytes::Bytes>> {
-        // PutPathChunked never GETs chunks at all (the verify walk
-        // checks received bodies only — pinned by
-        // fully_deduped_upload_commits_with_zero_chunk_reads).
-        unimplemented!("PutPathChunked never GETs")
+        // This test's fixture is all-novel, so every file digest is
+        // recomputed inline from the stream and the deferred refetch
+        // path never runs (and the PUT failure aborts before it
+        // could anyway).
+        unimplemented!("all-novel upload never GETs")
     }
     async fn exists_batch(&self, _: &[[u8; 32]]) -> anyhow::Result<Vec<bool>> {
         unimplemented!()

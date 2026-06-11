@@ -48,8 +48,9 @@ impl Write for Counter {
 /// within the canonical NAR encoding — computed by feeding the exact
 /// `frame::*` sequence `NarPieces::push_event` writes into a counting
 /// sink. The `file_digest` is taken from the Directory body's
-/// `FileEntry.digest` — the builder's fused-walk claim, committed as
-/// claimed (`r[store.integrity.verify-on-put+2]`).
+/// `FileEntry.digest` — server-verified against the run's content by
+/// the verify walk / deferred file-digest proof before this runs
+/// (`r[store.integrity.verify-on-put+3]`).
 pub(super) fn tree_to_entries(
     root: &RootNode,
     dirs: &HashMap<[u8; 32], Directory>,

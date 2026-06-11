@@ -59,7 +59,7 @@ pub(crate) struct FileRun {
 pub(crate) struct ValidatedOutput {
     pub store_path: StorePath,
     /// NAR SHA-256, computed by the builder's fused walk and committed
-    /// as claimed (`r[store.integrity.verify-on-put+2]`).
+    /// as claimed (`r[store.integrity.verify-on-put+3]`).
     pub nar_hash: [u8; 32],
     /// NAR byte count — builder-computed, committed as claimed.
     pub nar_size: u64,

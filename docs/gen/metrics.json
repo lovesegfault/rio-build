@@ -1244,7 +1244,7 @@
       {
         "name": "rio_store_integrity_failures_total",
         "kind": "counter",
-        "help": "Content integrity check failures, labeled by `site`: `get_path` (whole-NAR SHA-256, indicates bitrot/corruption), `read_blob` (whole-file BLAKE3, indicates cumsum/index drift), `chunk` (per-chunk BLAKE3, indicates bitrot/corruption)"
+        "help": "Content integrity check failures, labeled by `site`: `get_path` (whole-NAR SHA-256, indicates bitrot/corruption), `read_blob` (whole-file BLAKE3, indicates cumsum/index drift), `chunk` (per-chunk BLAKE3, indicates bitrot/corruption), `put_path_chunked` (claimed file digest does not hash from the run's content — rejected forgery attempt)"
       },
       {
         "name": "rio_store_nar_index_cache_hits_total",
@@ -1294,7 +1294,7 @@
       {
         "name": "rio_store_putpath_verify_unavailable_total",
         "kind": "counter",
-        "help": "PutPathChunked uploads aborted by a transient failure: a chunk PUT failed, or a referenced chunk was GC-claimed between the builder's HasChunks probe and the commit's presence proof. The builder retries."
+        "help": "PutPathChunked uploads aborted by a transient failure: a chunk PUT failed, a referenced chunk was GC-claimed between the builder's HasChunks probe and the commit's presence proof, or a chunk re-fetch during file-digest verification failed. The builder retries."
       },
       {
         "name": "rio_store_s3_deletes_pending",

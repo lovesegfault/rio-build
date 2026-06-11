@@ -497,6 +497,63 @@ pub(crate) async fn insert_pending_chunks(pool: &PgPool, chunks: &[([u8; 32], u3
     Ok(())
 }
 
+/// One committed `file_blobs` binding per requested digest:
+/// `(digest, store_path_hash, nar_offset, size)` for the
+/// lowest-`(store_path_hash, nar_offset)` row whose manifest is
+/// `'complete'` and chunked (`manifest_data` row exists — inline
+/// referrers have no chunk window to compare against).
+///
+/// Used by the `PutPathChunked` deferred file-digest verification: a
+/// deferred run whose claimed digest already has a committed binding
+/// with the *identical* chunk window is proven without re-fetching any
+/// bytes (chunk digests determine content). The `(store_path_hash,
+/// nar_offset)` ordering matches the `ReadBlob`/`StatBlob` `ORDER BY`,
+/// so this picks the same canonical row read-side resolution serves —
+/// except that reads are additionally tenant-filtered, so a tenant
+/// that cannot see the global winner resolves a different (still
+/// proven) binding.
+pub(crate) async fn trusted_file_windows(
+    pool: &PgPool,
+    digests: &[Vec<u8>],
+) -> Result<Vec<(Vec<u8>, Vec<u8>, i64, i64)>> {
+    if digests.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(sqlx::query_as(
+        r#"
+        SELECT DISTINCT ON (f.digest) f.digest, f.store_path_hash, f.nar_offset, f.size
+          FROM file_blobs f
+          JOIN manifests m ON m.store_path_hash = f.store_path_hash
+               AND m.status = 'complete'
+          JOIN manifest_data md ON md.store_path_hash = f.store_path_hash
+         WHERE f.digest = ANY($1)
+         ORDER BY f.digest, f.store_path_hash, f.nar_offset
+        "#,
+    )
+    .bind(digests)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// `manifest_data.chunk_list` for a set of store paths — the second
+/// half of [`trusted_file_windows`]: chunk lists are TOASTed (MBs for
+/// a large NAR), so they are fetched once per distinct referrer, not
+/// once per digest.
+pub(crate) async fn chunk_lists_for_paths(
+    pool: &PgPool,
+    store_path_hashes: &[Vec<u8>],
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    if store_path_hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(sqlx::query_as(
+        "SELECT store_path_hash, chunk_list FROM manifest_data WHERE store_path_hash = ANY($1)",
+    )
+    .bind(store_path_hashes)
+    .fetch_all(pool)
+    .await?)
+}
+
 /// Lock every chunk a multi-statement commit transaction will touch
 /// and return the digests whose S3 object cannot be proven to exist.
 ///

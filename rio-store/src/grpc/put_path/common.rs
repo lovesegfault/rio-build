@@ -266,12 +266,12 @@ pub(in crate::grpc) async fn drain_stream<T>(rpc: &'static str, stream: &mut Str
     }
 }
 
-// r[impl store.integrity.verify-on-put+2]
+// r[impl store.integrity.verify-on-put+3]
 // r[impl sec.drv.validate]
 /// Compare a server-computed NAR digest+size against the
 /// trailer-declared `nar_hash` / `nar_size` (already applied to `info`
 /// via [`apply_trailer`]). The integrity gate of
-/// `r[store.integrity.verify-on-put+2]` — server computes the digest
+/// `r[store.integrity.verify-on-put+3]` — server computes the digest
 /// independently of the client.
 ///
 /// `computed_hash` is the finalized output of an incremental
@@ -853,7 +853,7 @@ impl StoreServiceImpl {
 }
 
 // r[verify sec.drv.validate]
-// r[verify store.integrity.verify-on-put+2]
+// r[verify store.integrity.verify-on-put+3]
 #[cfg(test)]
 mod verify_nar_tests {
     use super::*;

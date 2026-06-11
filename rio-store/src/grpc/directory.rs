@@ -546,10 +546,14 @@ impl DirectoryService for DirectoryServiceImpl {
         // are content-addressed. The `path_tenants` join is on the same
         // `store_path_hash` as `file_blobs`, so the chosen NAR is one
         // this tenant may read — a digest-only join could pick another
-        // tenant's NAR for a content-shared file. `file_blobs.size`
-        // (M_066) is denormalized so this never decodes
-        // `nar_index.entries` (O(files-in-NAR)) on the FUSE `open()`
-        // fast path.
+        // tenant's NAR for a content-shared file. The ORDER BY makes
+        // the winner deterministic (lowest tenant-visible referrer,
+        // same ordering as the upload-side window proof's canonical
+        // row), so a row racing in cannot steer resolution by
+        // insertion order.
+        // `file_blobs.size` (M_066) is denormalized so this never
+        // decodes `nar_index.entries` (O(files-in-NAR)) on the FUSE
+        // `open()` fast path.
         type BlobRow = (i64, i64, Option<Vec<u8>>, Option<Vec<u8>>);
         let mut row: Option<BlobRow> = sqlx::query_as(
             "SELECT f.nar_offset, f.size, m.inline_blob, md.chunk_list \
@@ -559,6 +563,7 @@ impl DirectoryService for DirectoryServiceImpl {
                     AND m.status = 'complete' \
                LEFT JOIN manifest_data md ON md.store_path_hash = f.store_path_hash \
               WHERE f.digest = $1 AND pt.tenant_id = $2 \
+              ORDER BY f.store_path_hash, f.nar_offset \
               LIMIT 1",
         )
         .bind(digest.as_slice())
@@ -674,7 +679,11 @@ impl DirectoryService for DirectoryServiceImpl {
                 .ok_or_else(|| Status::not_found("file blob not found"));
         }
 
-        // `IS NOT NULL`, not the bytes: only the classification matters.
+        // `IS NOT NULL`, not the bytes: only the classification
+        // matters. ORDER BY: same deterministic-winner rule as
+        // `read_blob` — `StatBlob` hands the chunk window straight to
+        // the FUSE caller, so which referrer resolves must not depend
+        // on insertion order.
         type StatRow = (i64, i64, bool, Option<Vec<u8>>);
         let mut row: Option<StatRow> = sqlx::query_as(
             "SELECT f.nar_offset, f.size, m.inline_blob IS NOT NULL, md.chunk_list \
@@ -683,7 +692,9 @@ impl DirectoryService for DirectoryServiceImpl {
                JOIN manifests m ON m.store_path_hash = f.store_path_hash \
                     AND m.status = 'complete' \
                LEFT JOIN manifest_data md ON md.store_path_hash = f.store_path_hash \
-              WHERE f.digest = $1 AND pt.tenant_id = $2 LIMIT 1",
+              WHERE f.digest = $1 AND pt.tenant_id = $2 \
+              ORDER BY f.store_path_hash, f.nar_offset \
+              LIMIT 1",
         )
         .bind(digest.as_slice())
         .bind(tenant)
