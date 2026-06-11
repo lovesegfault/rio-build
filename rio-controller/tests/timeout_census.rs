@@ -198,10 +198,10 @@ fn strip_rust(src: &str) -> String {
     let b: Vec<char> = src.chars().collect();
     let n = b.len();
     let mut out: Vec<char> = b.clone();
-    let mut blank = |o: &mut Vec<char>, a: usize, z: usize| {
-        for k in a..z.min(n) {
-            if o[k] != '\n' {
-                o[k] = ' ';
+    let blank = |o: &mut Vec<char>, a: usize, z: usize| {
+        for c in o.iter_mut().take(z.min(n)).skip(a) {
+            if *c != '\n' {
+                *c = ' ';
             }
         }
     };
