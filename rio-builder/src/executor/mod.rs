@@ -908,8 +908,13 @@ pub async fn execute_build(
         // 3. Castore root nodes for the closure: scheduler-attested
         // `WorkAssignment.input_roots` (P0588) plus a GetNarIndexBatch
         // fallback for anything dispatched without a root_node.
-        let castore_roots =
-            resolve_castore_roots(&store_client, &assignment.input_roots, &input_metadata).await?;
+        let castore_roots = resolve_castore_roots(
+            &store_client,
+            &assignment.assignment_token,
+            &assignment.input_roots,
+            &input_metadata,
+        )
+        .await?;
 
         // r[impl builder.cancel.pre-cgroup-deferred+3]
         // I-166: the cgroup doesn't exist yet (created post-spawn

@@ -711,6 +711,29 @@ impl StoreServiceImpl {
         }
     }
 
+    /// Caller-identity gate for the NAR-index RPCs (`GetNarIndex`,
+    /// `GetNarIndexBatch`) — same ladder as
+    /// `ChunkServiceImpl::require_caller_identity`. The index is a
+    /// path's complete file listing with sizes and per-file BLAKE3
+    /// digests, and nar hashes travel separately from the content they
+    /// name, so serving it anonymously is a cross-tenant metadata
+    /// oracle. Identity-only, like the chunk gate: the index namespace
+    /// is content-addressed and deliberately not tenant-scoped; JWT
+    /// callers are additionally refused by
+    /// `Self::reject_end_user_tenant`.
+    // r[impl store.index.rpc+1]
+    fn require_caller_identity<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        // The verified identity is discarded — only its existence
+        // matters here.
+        directory::caller_identity(
+            request,
+            self.hmac_verifier.as_ref(),
+            "GetNarIndex requires a caller identity: send a JWT or an HMAC \
+             assignment token",
+        )
+        .map(|_| ())
+    }
+
     // r[impl store.substitute.upstream]
     /// On local miss: if the tenant has upstreams configured, try
     /// substituting. Returns `Ok(Some)` if fetched+ingested, `Ok(None)`
@@ -1069,12 +1092,15 @@ impl StoreService for StoreServiceImpl {
     /// path has no complete manifest. Builder-internal like
     /// `BatchGetManifest`: the response carries `file_digest`
     /// capability tokens, so end-user tenants are refused.
-    // r[impl store.index.rpc]
+    // r[impl store.index.rpc+1]
     #[instrument(skip(self, request), fields(rpc = "GetNarIndex"))]
     async fn get_nar_index(
         &self,
         request: Request<rio_proto::types::GetNarIndexRequest>,
     ) -> Result<Response<rio_proto::types::NarIndex>, Status> {
+        // Identity before anything else — an anonymous caller learns
+        // nothing about any nar_hash, not even whether it exists.
+        self.require_caller_identity(&request)?;
         self.reject_end_user_tenant(&request, "GetNarIndex")?;
         let nar_hash = parse_nar_hash(&request.into_inner().nar_hash)?;
         let bytes = self.lookup_nar_index(&nar_hash).await?;
@@ -1091,12 +1117,15 @@ impl StoreService for StoreServiceImpl {
     /// has its index from the moment it becomes visible (written in
     /// the same transaction as the status flip). Builder-internal:
     /// end-user tenants refused.
-    // r[impl store.index.rpc]
+    // r[impl store.index.rpc+1]
     #[instrument(skip(self, request), fields(rpc = "GetNarIndexBatch"))]
     async fn get_nar_index_batch(
         &self,
         request: Request<rio_proto::types::GetNarIndexBatchRequest>,
     ) -> Result<Response<Self::GetNarIndexBatchStream>, Status> {
+        // Same identity-first ordering as GetNarIndex: the gate fires
+        // before the size check and any PG work.
+        self.require_caller_identity(&request)?;
         self.reject_end_user_tenant(&request, "GetNarIndexBatch")?;
         let req = request.into_inner();
         if req.nar_hashes.len() > self.max_batch_paths {

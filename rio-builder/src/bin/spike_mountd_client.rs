@@ -821,7 +821,9 @@ fn serve_castore(socket: &Path, args: ServeCastoreArgs) -> anyhow::Result<()> {
             .await
             .with_context(|| format!("connect to store at {}", args.store_addr))?;
         let clients = StoreClients::from_channel(channel);
-        let roots = resolve_input_roots(clients.store.clone(), &args.store_paths).await?;
+        let roots =
+            resolve_input_roots(clients.store.clone(), &assignment_token, &args.store_paths)
+                .await?;
         anyhow::Ok((clients, roots))
     })?;
 
@@ -880,6 +882,7 @@ fn serve_castore(socket: &Path, args: ServeCastoreArgs) -> anyhow::Result<()> {
 /// the VM test only has to name store paths.
 async fn resolve_input_roots(
     mut store: rio_proto::StoreServiceClient<tonic::transport::Channel>,
+    assignment_token: &str,
     store_paths: &[String],
 ) -> anyhow::Result<Vec<InputRoot>> {
     let mut roots = Vec::with_capacity(store_paths.len());
@@ -892,10 +895,21 @@ async fn resolve_input_roots(
             .with_context(|| format!("QueryPathInfo {path}"))?
             .into_inner();
 
+        // GetNarIndex is identity-gated server-side; send the same
+        // assignment token the FUSE data path presents on GetChunks.
+        let mut req = tonic::Request::new(GetNarIndexRequest {
+            nar_hash: info.nar_hash.clone(),
+        });
+        if !assignment_token.is_empty() {
+            req.metadata_mut().insert(
+                rio_proto::ASSIGNMENT_TOKEN_HEADER,
+                assignment_token
+                    .parse()
+                    .context("assignment token is not a valid ASCII metadata value")?,
+            );
+        }
         let index = store
-            .get_nar_index(GetNarIndexRequest {
-                nar_hash: info.nar_hash.clone(),
-            })
+            .get_nar_index(req)
             .await
             .with_context(|| format!("GetNarIndex for {path}"))?
             .into_inner();
