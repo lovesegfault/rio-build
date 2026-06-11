@@ -141,12 +141,28 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
     // first-install degrade to the model (same path as
     // --deploy-skip-pg-preflight, same loud warning); anything else
     // (5xx, timeout, auth) -> abort. See classify_pg_preflight_gate.
+    //
+    // Hostable arm (D-052-1b): both ceiling paths below also clamp to
+    // what the rio-general Karpenter pool can actually host — the pg
+    // arm is a backstop, not a schedulability statement (live_052:
+    // 173 deployed, 46 hostable, 133 pods Pending). Inputs read from
+    // the chart so a pool-limit change flows through on the next
+    // deploy instead of requiring an xtask edit.
+    let values_yaml =
+        std::fs::read_to_string(crate::sh::repo_root().join("infra/helm/rio-build/values.yaml"))
+            .context(
+                "read infra/helm/rio-build/values.yaml for the store hostable-ceiling inputs",
+            )?;
+    let karpenter_cpu_limit = general_pool_cpu_limit(&values_yaml)?;
+    let node_vcpus = store_node_vcpus(STORE_CPU_REQUEST)?;
     let store_ceiling = if skip_pg_preflight {
         let fallback = derive_store_ceiling(
             modeled_pg_max,
             NON_STORE_PG_BUDGET,
             STORE_PG_MAX_CONNECTIONS_PER_REPLICA,
             STORE_PG_HEADROOM,
+            karpenter_cpu_limit,
+            node_vcpus,
         );
         warn!(
             modeled_pg_max,
@@ -163,6 +179,8 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
                     NON_STORE_PG_BUDGET,
                     STORE_PG_MAX_CONNECTIONS_PER_REPLICA,
                     STORE_PG_HEADROOM,
+                    karpenter_cpu_limit,
+                    node_vcpus,
                 );
                 warn!(
                     modeled_pg_max,
@@ -190,11 +208,19 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
                     NON_STORE_PG_BUDGET,
                     STORE_PG_MAX_CONNECTIONS_PER_REPLICA,
                     STORE_PG_HEADROOM,
+                    karpenter_cpu_limit,
+                    node_vcpus,
                 )
             }
         }
     };
-    info!(store_ceiling, modeled_pg_max, "store autoscaling ceiling");
+    info!(
+        store_ceiling,
+        modeled_pg_max,
+        karpenter_cpu_limit,
+        node_vcpus,
+        "store autoscaling ceiling: min(pg arm, karpenter-hostable arm)"
+    );
 
     // CRDs first, server-side apply.
     ui::step("apply CRDs", || kube::apply_crds(&client)).await?;
@@ -375,7 +401,13 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             .set("controller.resources.requests.cpu", "8")
             .set("controller.resources.requests.memory", "8Gi")
             .set("controller.resources.limits.memory", "64Gi")
-            .set("store.resources.requests.cpu", "16")
+            // Single-sourced with the hostable-arm node-shape
+            // derivation (STORE_CPU_REQUEST -> store_node_vcpus): the
+            // deployed request and the ceiling divisor cannot drift.
+            .set(
+                "store.resources.requests.cpu",
+                STORE_CPU_REQUEST.to_string(),
+            )
             .set("store.resources.requests.memory", "8Gi")
             .set("store.resources.limits.memory", "32Gi")
             .set("scheduler.resources.requests.cpu", "32")
@@ -634,20 +666,147 @@ const STORE_PG_MAX_CONNECTIONS_PER_REPLICA: u32 = 20;
 /// remaining ~30% absorbs migration bursts, ESO, and operator psql.
 const STORE_PG_HEADROOM: f64 = 0.70;
 
-/// Pure ceiling derivation: `floor((headroom x measured - non_store) /
-/// per_replica)`, saturating at 0. The same formula the values.yaml
-/// default comment documents — change both together.
+/// The store Deployment's CPU request on EKS — single source for the
+/// helm `--set` below and the hostable-arm node-shape derivation
+/// (`store_node_vcpus`), so the deployed request and the ceiling's
+/// divisor cannot drift.
+const STORE_CPU_REQUEST: u32 = 16;
+
+/// The chart's `karpenter.nodePools[rio-general]` instance-family pin
+/// (values.yaml). `general_pool_cpu_limit` BAILS if the chart moves
+/// outside this set, because `GENERAL_NODE_VCPU_LADDER` below is
+/// derived from these families — a family change must re-derive the
+/// ladder, not silently divide by the wrong node shape.
+const GENERAL_POOL_FAMILIES: &[&str] = &["c8a", "m8a", "r8a"];
+
+/// vCPU sizes of the rio-general families (c8a/m8a/r8a share the AMD
+/// gen-8 ladder: large..48xlarge). The hostable arm needs the NODE
+/// shape, not the pod request: store placement is required
+/// one-replica-per-node podAntiAffinity (store.yaml), and Karpenter
+/// counts the minted node's full capacity against the pool's
+/// `limits.cpu` — so each replica consumes a whole node from the
+/// budget regardless of its request.
+const GENERAL_NODE_VCPU_LADDER: &[u32] = &[2, 4, 8, 16, 32, 48, 64, 96, 128, 192];
+
+/// Allocatable model: a pod fits a node when its request fits ~90% of
+/// capacity (kubelet/system reserve + daemonsets — the same 90%
+/// approximation the chart uses for `max_node_disk`). This is why a
+/// 16-CPU store request pins a 32-vCPU node, not a 16-vCPU one.
+const NODE_ALLOCATABLE_FRACTION: f64 = 0.9;
+
+/// The node shape one store replica pins: the smallest rio-general
+/// ladder size whose modeled allocatable fits `request_cpu`. Errors
+/// when nothing fits (a request past the ladder top is a config bug,
+/// not a ceiling-0 situation).
+fn store_node_vcpus(request_cpu: u32) -> Result<u32> {
+    GENERAL_NODE_VCPU_LADDER
+        .iter()
+        .copied()
+        .find(|&size| NODE_ALLOCATABLE_FRACTION * f64::from(size) >= f64::from(request_cpu))
+        .with_context(|| {
+            format!(
+                "store cpu request {request_cpu} does not fit any rio-general \
+                 instance size (ladder top {} x {NODE_ALLOCATABLE_FRACTION} \
+                 allocatable); shrink the request or re-derive the ladder",
+                GENERAL_NODE_VCPU_LADDER.last().expect("ladder non-empty"),
+            )
+        })
+}
+
+/// `karpenter.nodePools[rio-general].limits.cpu` from the chart's
+/// values.yaml body — the hostable arm's budget input, read from the
+/// chart (not duplicated here) so an operator raising the pool limit
+/// raises the deployed ceiling on the next `eks up` with no xtask
+/// edit. Also asserts the pool's instance-family pin stays inside
+/// `GENERAL_POOL_FAMILIES` (the ladder's provenance).
+///
+/// No path-reading unit test (crate2nix per-crate builds stage only
+/// the xtask/ subtree, the seccomp-regen precedent); the parser is
+/// tested on an embedded fixture and the runtime read fails loudly.
+fn general_pool_cpu_limit(values_yaml: &str) -> Result<u32> {
+    #[derive(serde::Deserialize)]
+    struct Values {
+        karpenter: Karpenter,
+    }
+    #[derive(serde::Deserialize)]
+    struct Karpenter {
+        #[serde(rename = "nodePools")]
+        node_pools: Vec<NodePool>,
+    }
+    #[derive(serde::Deserialize)]
+    struct NodePool {
+        name: String,
+        #[serde(default)]
+        requirements: Vec<Requirement>,
+        limits: Limits,
+    }
+    #[derive(serde::Deserialize)]
+    struct Requirement {
+        key: String,
+        #[serde(default)]
+        values: Vec<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Limits {
+        cpu: u32,
+    }
+    let v: Values = serde_saphyr::from_str(values_yaml)
+        .context("parse helm values.yaml (karpenter.nodePools shape)")?;
+    let pool = v
+        .karpenter
+        .node_pools
+        .iter()
+        .find(|p| p.name == "rio-general")
+        .context("karpenter.nodePools has no rio-general entry — the store hostable-ceiling derivation needs its limits.cpu")?;
+    for req in &pool.requirements {
+        if req.key == "karpenter.k8s.aws/instance-family" {
+            for fam in &req.values {
+                anyhow::ensure!(
+                    GENERAL_POOL_FAMILIES.contains(&fam.as_str()),
+                    "rio-general instance-family {fam:?} is outside the derived \
+                     vCPU ladder's families {GENERAL_POOL_FAMILIES:?}; re-derive \
+                     GENERAL_NODE_VCPU_LADDER for the new family before deploying"
+                );
+            }
+        }
+    }
+    Ok(pool.limits.cpu)
+}
+
+/// Store autoscaling ceiling: the MIN of two independently-binding
+/// arms (D-052-1b, live_052).
+///
+/// PG arm: `floor((headroom x measured - non_store) / per_replica)`,
+/// saturating at 0 — the connection-budget backstop the values.yaml
+/// default comment documents (change both together).
+///
+/// Hostable arm: `floor(karpenter_cpu_limit / node_vcpus)` — how many
+/// store nodes the rio-general pool can actually mint. live_052: the
+/// PG-only ceiling (173) let KEDA commit 4->173 replicas in 75s
+/// against a pool that hosts 46 nodes; 133 pods sat Pending while
+/// Karpenter churned NodeClaims at the limit. A Pending pod is not
+/// harmless at that volume: every reconcile pass and scheduler sweep
+/// pays for it, and the backlog gauge keeps asking. The deployed
+/// ceiling now stops where hosting stops; the previous live fix was a
+/// hand `--set` to 46 that the next `eks up` would have clobbered
+/// back to 173.
 fn derive_store_ceiling(
     measured_max_connections: u32,
     non_store_budget: u32,
     per_replica: u32,
     headroom: f64,
+    karpenter_cpu_limit: u32,
+    node_vcpus: u32,
 ) -> u32 {
+    debug_assert!(node_vcpus > 0, "store_node_vcpus never yields 0");
     let usable = headroom * f64::from(measured_max_connections) - f64::from(non_store_budget);
-    if usable <= 0.0 {
-        return 0;
-    }
-    (usable / f64::from(per_replica)).floor() as u32
+    let pg_arm = if usable <= 0.0 {
+        0
+    } else {
+        (usable / f64::from(per_replica)).floor() as u32
+    };
+    let hostable_arm = karpenter_cpu_limit / node_vcpus.max(1);
+    pg_arm.min(hostable_arm)
 }
 
 /// What the pg connection-budget preflight should do, decided from
@@ -775,14 +934,109 @@ fn parse_pg_preflight_output(logs: &str) -> Result<u32> {
 mod ceiling_tests {
     use super::*;
 
+    /// A karpenter limit high enough that the hostable arm never
+    /// binds — isolates the PG arm in the tests below.
+    const PG_ARM_ONLY: u32 = 1_000_000;
+
     /// The two documented operating points of the AWS PG table:
-    /// the min-capacity-capped 2,000 and the 32-ACU 5,000.
+    /// the min-capacity-capped 2,000 and the 32-ACU 5,000 (PG arm
+    /// isolated; the deployed value additionally clamps to the
+    /// hostable arm — see the incident test).
     #[test]
     fn derive_store_ceiling_documented_points() {
         // floor((0.70x2000 - 34)/20) = floor(1366/20) = 68
-        assert_eq!(derive_store_ceiling(2000, 34, 20, 0.70), 68);
+        assert_eq!(
+            derive_store_ceiling(2000, 34, 20, 0.70, PG_ARM_ONLY, 32),
+            68
+        );
         // floor((0.70x5000 - 34)/20) = floor(3466/20) = 173
-        assert_eq!(derive_store_ceiling(5000, 34, 20, 0.70), 173);
+        assert_eq!(
+            derive_store_ceiling(5000, 34, 20, 0.70, PG_ARM_ONLY, 32),
+            173
+        );
+    }
+
+    /// THE live_052 numbers (D-052-1b). The pg arm said 173; the
+    /// rio-general pool (limits.cpu 1500) hosts floor(1500/32) = 46
+    /// store nodes under one-replica-per-node anti-affinity — KEDA
+    /// committed 4->173 in 75s and stranded 133 pods Pending. The
+    /// deployed ceiling is the min of the arms.
+    #[test]
+    fn derive_store_ceiling_clamps_to_karpenter_hostable() {
+        // The incident shape: min(173, 46) = 46 — the value the live
+        // hand-override pinned and the next `eks up` would have
+        // clobbered back to 173 before this clamp existed.
+        assert_eq!(derive_store_ceiling(5000, 34, 20, 0.70, 1500, 32), 46);
+        // Both documented PG points clamp identically at the current
+        // pool shape (68 and 173 both exceed 46).
+        assert_eq!(derive_store_ceiling(2000, 34, 20, 0.70, 1500, 32), 46);
+
+        // The naive divisor is the COUNTEREXAMPLE, not the formula:
+        // dividing the pool limit by the store pod's cpu REQUEST
+        // (16) models bin-packing that placement forbids — required
+        // one-replica-per-node podAntiAffinity makes each replica
+        // consume a whole node, and Karpenter counts node CAPACITY
+        // (32 vCPU for the minted shape) against limits.cpu. The
+        // request-divisor answer (93) over-admits 2x.
+        assert_eq!(1500 / STORE_CPU_REQUEST, 93);
+        assert_eq!(store_node_vcpus(STORE_CPU_REQUEST).unwrap(), 32);
+        assert_ne!(
+            1500 / STORE_CPU_REQUEST,
+            derive_store_ceiling(5000, 34, 20, 0.70, 1500, 32),
+            "the hostable arm must divide by the node shape, not the pod request"
+        );
+    }
+
+    /// Node-shape derivation: smallest rio-general ladder size whose
+    /// 90%-allocatable fits the request. A request equal to a ladder
+    /// size never fits that size (capacity != allocatable — exactly
+    /// why 16 cpu pins a 32-vCPU node); past the ladder top is an
+    /// error, not a silent clamp.
+    #[test]
+    fn store_node_vcpus_allocatable_model() {
+        assert_eq!(store_node_vcpus(1).unwrap(), 2); // 0.9*2 = 1.8 >= 1
+        assert_eq!(store_node_vcpus(2).unwrap(), 4); // 0.9*2 = 1.8 < 2
+        assert_eq!(store_node_vcpus(8).unwrap(), 16); // 0.9*8 = 7.2 < 8
+        assert_eq!(store_node_vcpus(16).unwrap(), 32); // 0.9*16 = 14.4 < 16
+        assert_eq!(store_node_vcpus(29).unwrap(), 48); // 0.9*32 = 28.8 < 29
+        assert!(store_node_vcpus(192).is_err()); // 0.9*192 = 172.8 < 192
+    }
+
+    /// values.yaml parser: reads rio-general's limits.cpu, refuses an
+    /// instance-family pin outside the ladder's provenance, refuses a
+    /// values shape with no rio-general pool. Embedded fixture (the
+    /// crate2nix test sandbox stages only xtask/, so the real chart
+    /// file is runtime-read only — the seccomp-regen precedent).
+    #[test]
+    fn general_pool_cpu_limit_parses_and_guards() {
+        let fixture = r#"
+karpenter:
+  nodePools:
+    - name: rio-general
+      weight: 50
+      labels:
+        rio.build/node-role: general
+      taints: []
+      requirements:
+        - key: karpenter.k8s.aws/instance-family
+          operator: In
+          values: [c8a, m8a, r8a]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [on-demand]
+      limits: {cpu: 1500}
+"#;
+        assert_eq!(general_pool_cpu_limit(fixture).unwrap(), 1500);
+
+        let drifted = fixture.replace("c8a", "c9g");
+        let err = general_pool_cpu_limit(&drifted).unwrap_err().to_string();
+        assert!(
+            err.contains("re-derive"),
+            "family drift must demand a ladder re-derivation, got: {err}"
+        );
+
+        let renamed = fixture.replace("rio-general", "rio-everything");
+        assert!(general_pool_cpu_limit(&renamed).is_err());
     }
 
     /// Headroom edges: budgets at or below the non-store floor
@@ -791,12 +1045,18 @@ mod ceiling_tests {
     /// replica first fits.
     #[test]
     fn derive_store_ceiling_edges() {
-        assert_eq!(derive_store_ceiling(0, 34, 20, 0.70), 0);
-        assert_eq!(derive_store_ceiling(48, 34, 20, 0.70), 0); // 33.6 - 34 < 0
-        assert_eq!(derive_store_ceiling(49, 34, 20, 0.70), 0); // 0.3/20 floors to 0
-        assert_eq!(derive_store_ceiling(78, 34, 20, 0.70), 1); // 20.6/20 -> 1
+        assert_eq!(derive_store_ceiling(0, 34, 20, 0.70, PG_ARM_ONLY, 32), 0);
+        // 33.6 - 34 < 0
+        assert_eq!(derive_store_ceiling(48, 34, 20, 0.70, PG_ARM_ONLY, 32), 0);
+        // 0.3/20 floors to 0
+        assert_eq!(derive_store_ceiling(49, 34, 20, 0.70, PG_ARM_ONLY, 32), 0);
+        // 20.6/20 -> 1
+        assert_eq!(derive_store_ceiling(78, 34, 20, 0.70, PG_ARM_ONLY, 32), 1);
         // Full headroom (1.0) sanity: floor((189-34)/20) = 7.
-        assert_eq!(derive_store_ceiling(189, 34, 20, 1.0), 7);
+        assert_eq!(derive_store_ceiling(189, 34, 20, 1.0, PG_ARM_ONLY, 32), 7);
+        // A pool limit below one node floors the hostable arm to 0:
+        // the ceiling honestly says "nothing is hostable".
+        assert_eq!(derive_store_ceiling(5000, 34, 20, 0.70, 31, 32), 0);
     }
 
     /// Output-contract parser: last max_connections= line wins, noise

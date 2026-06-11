@@ -254,37 +254,49 @@ store:
     # 2026-06-02: store scale is Karpenter-bounded; the operative scale
     # knob is karpenter.nodePools[rio-general].limits.cpu below).
     #
-    # This default is the MODELED fallback for chart-only consumers.
-    # On EKS, `xtask deploy`'s pg preflight measures the live
-    # max_connections, asserts it equals the tf model
+    # This default is the MODELED PG fallback for chart-only consumers
+    # (no Karpenter context here — a bare chart install has nothing to
+    # clamp against). On EKS, `xtask deploy`'s pg preflight measures
+    # the live max_connections, asserts it equals the tf model
     # (infra/eks/rds.tf locals — the AWS PG table at the provisioned
     # capacity), and --sets the ceiling derived from the MEASUREMENT;
     # this value is overridden on every deploy.
     #
     # Derivation (deploy.rs derive_store_ceiling — change together):
-    #   floor((0.70 × max_connections − 34) / pgMaxConnections 20)
-    #   where 34 = scheduler 2×10 + controller 4 + psql headroom 10
+    # the MIN of two arms (D-052-1b):
+    #   pg arm: floor((0.70 × max_connections − 34) / pgMaxConnections 20)
+    #     where 34 = scheduler 2×10 + controller 4 + psql headroom 10
+    #   hostable arm: floor(rio-general limits.cpu / store node vCPU)
+    #     — required one-replica-per-node podAntiAffinity (store.yaml)
+    #     means each replica pins a WHOLE node, and Karpenter counts
+    #     node capacity (32 vCPU for the 16-cpu request on the gen-8
+    #     families) against the pool limit. floor(1500/32) = 46.
     # At the modeled config (rds.tf: min_capacity=1 lifts the AWS
     # PG min-capacity cap; max_capacity=32 ⇒ max_connections 5,000;
     # owner decision Q1 2026-06-03):
-    #   floor((0.70×5000 − 34)/20) = floor(3466/20) = 173
-    # ⇒ worst case 173×20 + 34 = 3,494 conns ≈ 70% of the parameter —
-    # ~30% headroom for migration bursts / ESO / ad-hoc psql.
+    #   pg arm floor((0.70×5000 − 34)/20) = 173; deployed = min(173,
+    #   46) = 46 ⇒ worst case 46×20 + 34 = 954 conns, far under the
+    #   70%-of-parameter budget; the pg arm re-binds only if the
+    #   karpenter pool grows ~3.7× (limits.cpu ≳ 5,540).
     # WORST CASE (min_capacity ≤ 0.5 re-caps max_connections at
-    # 2,000): the same formula gives 68 — the preflight derives and
-    # deploys that automatically; do not hand-tune this default for
-    # it. max_connections is a STATIC parameter: a capacity change
-    # takes effect only after an instance reboot.
-    # 173 is 3.7-5.6× the Karpenter-schedulable max (~31-46 store
-    # nodes at limits.cpu=1500 with 32-vCPU one-per-node bin-packing),
-    # so KEDA never binds before Karpenter.
+    # 2,000): the pg arm gives 68, still clamped to 46 — the
+    # preflight derives and deploys automatically; do not hand-tune
+    # this default for it. max_connections is a STATIC parameter: a
+    # capacity change takes effect only after an instance reboot.
+    # live_052 is why the hostable arm exists: the pg-only ceiling
+    # (173) let KEDA commit 4→173 in 75s; 133 replicas were
+    # structurally unschedulable and Karpenter churned NodeClaims at
+    # the pool limit until a hand --set pinned 46 — which the next
+    # `eks up` would have silently clobbered back. The clamp makes
+    # the schedulable bound the deployed bound.
     # S3 is not a binding constraint: content-hashed chunk keys spread
     # prefixes uniformly and ~46 replicas × chunkUploadMaxConcurrent=8
     # ≈ 370 concurrent PUTs, orders below S3's per-prefix envelope.
     # Replicas requested past node capacity simply stay Pending until
     # Karpenter mints a node or the pool limit is raised (the
     # AverageValue triggers divide by the scale subresource's count and
-    # the CPU trigger averages running pods — no thrash).
+    # the CPU trigger averages running pods — no thrash); the clamp
+    # keeps that Pending set near zero instead of fleet-sized.
     maxReplicas: 173
     # Desired replicas (backlog trigger) =
     # ceil(sum(rio_scheduler_substituting_derivations) / this).
