@@ -1174,7 +1174,11 @@ fn migration_corpus(root: &Path) -> Result<Vec<(String, String)>> {
     files.sort();
     let mut out = Vec::new();
     for f in files {
-        let name = f.file_name().unwrap().to_string_lossy().to_string();
+        let name = f
+            .file_name()
+            .and_then(|n| n.to_str())
+            .with_context(|| format!("non-UTF-8 migration filename: {}", f.display()))?
+            .to_string();
         let text = std::fs::read_to_string(&f)?;
         out.push((name, text));
     }

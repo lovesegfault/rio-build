@@ -8972,6 +8972,22 @@ mod listener_backoff_tests {
             );
         }
 
+        // The heal-edge mixed sequence through the SAME driver (the
+        // alphabet's second letter): errors, then a delivery, then a
+        // fresh error restarts at the floor.
+        let healed = drive(&[
+            Event::Error,
+            Event::Error,
+            Event::Error,
+            Event::Delivered,
+            Event::Error,
+        ]);
+        assert_eq!(
+            healed,
+            vec![1, 2, 4, 1],
+            "a delivery resets the budget mid-sequence"
+        );
+
         // The pre-fix strawman (DISCLOSED): reset-on-LISTEN-ok made
         // the recv-err class flat at the 1s floor — the live defect's
         // arithmetic (one fresh pool connection + LISTEN per second
