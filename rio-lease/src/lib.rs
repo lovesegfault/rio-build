@@ -5315,6 +5315,58 @@ mod tests {
         assert_eq!(continues_in_loop(green), 0);
     }
 
+    /// The election.rs step-down R17-envelope census ([GEN-SET],
+    /// R23′): the step-down fn loops on 409 re-reads with no internal
+    /// bound — its boundedness IS the callers' deadline envelope, so
+    /// election.rs's wrap-in-a-deadline population claim is
+    /// load-bearing prose (this test is its bound artifact). Every
+    /// receiver-qualified step-down call in this file must sit inside
+    /// a `timeout(` wrapper, and the population is pinned (2
+    /// production: the in-loop step-down arm + the shutdown epilogue;
+    /// 1 test harness). Scan over the embedded source ((wwwww));
+    /// plants at the raw-source layer. (The needles are runtime-built
+    /// and this comment spells neither the receiver-qualified call
+    /// form nor the enrollment lint's claim tokens, so neither
+    /// scanner can self-match here.)
+    #[test]
+    fn step_down_call_sites_are_deadline_wrapped() {
+        let needle = format!("election.{}()", "step_down");
+        let bare_sites = |src: &str| -> usize {
+            let stripped: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+            let mut bare = 0;
+            let mut from = 0;
+            while let Some(i) = stripped[from..].find(&needle) {
+                let at = from + i;
+                if !stripped[at.saturating_sub(60)..at].contains("timeout(") {
+                    bare += 1;
+                }
+                from = at + needle.len();
+            }
+            bare
+        };
+        let src = include_str!("lib.rs");
+        let stripped: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            stripped.matches(&needle).count(),
+            3,
+            "step-down call-site population moved (2 production + 1 test \
+             harness) — re-derive the envelope claim in election.rs"
+        );
+        assert_eq!(
+            bare_sites(src),
+            0,
+            "every step-down call must be wrapped in a deadline timeout \
+             (the R17 envelope is the caller's; the election loop has no \
+             internal bound)"
+        );
+        // R22′ plant: a bare call site reds.
+        let planted = format!(
+            "{src}\nasyncfnstrawman(){{election.{}().await;}}",
+            "step_down"
+        );
+        assert!(bare_sites(&planted) > 0, "the bare-call plant must red");
+    }
+
     /// W10-AW (bug_143): a believing incumbent whose completed read
     /// observes the lease ABSENT — 404, deleted out from under us; the
     /// Create POST died unanswered — exits belief AT THAT READ. The

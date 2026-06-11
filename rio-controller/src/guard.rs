@@ -213,7 +213,8 @@ impl GuardHandle {
     }
 
     /// Guard-domain stall episodes observed (the same edge semantics
-    /// as [`Self::main_stalls`] — one [`EdgeLatch`], two instances).
+    /// as [`Self::main_stalls`] — one `EdgeLatch` type, two
+    /// instances; the latch type is module-private).
     /// Mirror of
     /// `rio_controller_runtime_skew_stalls_total{domain="guard"}` —
     /// the accessor merged_bug_003's witness gap named (W9-AK could

@@ -2,7 +2,7 @@
 # Regenerate: cargo test -p rio-controller --test timeout_census -- --ignored regenerate_timeout_census
 # Columns: <src-relative path>:<line>\t<class>
 guard.rs:178	delay
-guard.rs:432	refusal
+guard.rs:433	refusal
 reconcilers/componentscaler/mod.rs:230	delay
 reconcilers/componentscaler/mod.rs:287	delay
 reconcilers/componentscaler/mod.rs:92	delay

@@ -73,7 +73,7 @@ pub enum HwCostSource {
     /// Static seeds only — no AWS calls. The cost ranking degenerates
     /// to "spot < on-demand, hi > mid > lo" with fixed ratios
     /// (enforced at [`CostTable::price`] read-site —
-    /// [`CostTable::load`]/[`CostTable::persist`] skip `price:*` under
+    /// [`CostTable::load`]/`CostTable::persist_rows` skip `price:*` under
     /// non-Spot so leftover rows from a Spot run are inert and age
     /// out).
     #[default]
@@ -285,12 +285,12 @@ pub struct CostTable {
     /// `sla_ema_state.cluster` / `interrupt_samples.cluster` scope
     /// (ADR-023 §2.13). Set by [`CostTable::load`]; empty for the
     /// single-cluster default. Carried on the struct so
-    /// [`CostTable::persist`] / [`CostTable::refresh_lambda`] (called
+    /// `CostTable::persist_rows` / [`CostTable::refresh_lambda`] (called
     /// from the poller's snapshot-mutate-swap) don't need it threaded
     /// separately.
     cluster: String,
     /// `[sla].hw_cost_source` — carried so [`CostTable::price`] /
-    /// [`CostTable::load`] / [`CostTable::persist`] can enforce the
+    /// [`CostTable::load`] / `CostTable::persist_rows` can enforce the
     /// "[`HwCostSource::Static`] = seeds only" contract at the read
     /// site rather than relying on the absence of
     /// [`spot_price_poller`] (bug_034).

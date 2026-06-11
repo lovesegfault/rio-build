@@ -694,7 +694,7 @@ impl LeaderElection {
     /// no release ever landed (on shutdown: the dead pod stayed
     /// holder the full steal threshold). Each iteration is one GET +
     /// one PUT; the caller's attempt deadline is the envelope (R17 —
-    /// both call sites wrap this in
+    /// both call sites wrap this in a deadline census[test: step_down_call_sites_are_deadline_wrapped]
     /// `timeout(RENEW_INTERVAL − RENEW_SLOP, ..)`), and a
     /// non-conflict error propagates immediately.
     pub async fn step_down(&self) -> Result<StepDownOutcome, kube::Error> {
