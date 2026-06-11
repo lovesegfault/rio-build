@@ -3359,3 +3359,96 @@ async fn parked_tick_disclosure_carries_the_failure_evidence() -> TestResult {
     });
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Round-9 WO-S2-1 witness-gap delta (W9-O): driven-Tick phase cells
+// ---------------------------------------------------------------------------
+
+/// W9-O (round-9 B2 admissibility): a driven leader Tick populates
+/// EVERY cell of `rio_scheduler_tick_phase_seconds` -- all 19 phases
+/// `00-estimator-refresh`..`18-snapshot-publish`, exactly. The landed
+/// instrument (00fbb0717) is the measurement substrate for every
+/// Banner-A bounding decision (which Tick term gets a work quota
+/// first), so an unreachable phase cell is a silent forensics hole:
+/// the live_053 134.65s Tick was log-silent for ~118s precisely
+/// because nothing named the phase. The describe-side (lllll)
+/// reachability is pinned by the metrics_registered census; this
+/// drives the RECORD side through the production `handle_tick` on an
+/// authoritative leader (the destructive block runs -- an
+/// unauthoritative tick records only the two observe phases, which
+/// this test would catch as 17 missing cells).
+///
+/// Thread-local recorder + current-thread runtime (the
+/// test_not_leader_does_not_set_gauges mechanism); snapshot taken
+/// EXACTLY ONCE (DebuggingRecorder snapshots drain).
+#[tokio::test]
+async fn driven_leader_tick_records_every_phase_cell() -> TestResult {
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor(db.pool.clone());
+    assert!(
+        actor.dag_authority().is_some(),
+        "direct-setup actor must be authoritative (the destructive \
+         phase block is the population under test)"
+    );
+    {
+        let _g = metrics::set_default_local_recorder(&rec);
+        actor.handle_tick().await;
+    }
+
+    // ONE snapshot (drains); collect the phase label set.
+    let recorded: std::collections::BTreeSet<String> = snap
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(key, _, _, _)| key.key().name() == "rio_scheduler_tick_phase_seconds")
+        .flat_map(|(key, _, _, _)| {
+            key.key()
+                .labels()
+                .filter(|l| l.key() == "phase")
+                .map(|l| l.value().to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    const PHASES: [&str; 19] = [
+        "00-estimator-refresh",
+        "01-scan-dag",
+        "02-build-timeouts",
+        "03-stuck-completions",
+        "04-orphaned-builds",
+        "05-expired-poisons",
+        "06-gc-orphan-derivations",
+        "07-gc-attempt-ledger",
+        "08-gc-materialization-jobs",
+        "09-gc-wanted-outputs",
+        "10-sweep-dispatched-cells",
+        "11-flush-status-outbox",
+        "12-establishment-sweep",
+        "13-materialization-backstop",
+        "14-zero-interest-cancel",
+        "15-parked-reevaluation",
+        "16-pending-carriers",
+        "17-ready-cache-sweep",
+        "18-snapshot-publish",
+    ];
+    for phase in PHASES {
+        assert!(
+            recorded.contains(phase),
+            "driven leader Tick must record phase cell {phase:?}; \
+             recorded set: {recorded:?}"
+        );
+    }
+    assert_eq!(
+        recorded.len(),
+        PHASES.len(),
+        "exactly the 19 documented phases (a stray label is a drifted \
+         phase! call): {recorded:?}"
+    );
+    Ok(())
+}

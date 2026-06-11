@@ -11143,3 +11143,117 @@ async fn materialization_probe_is_screened_not_minted() -> TestResult {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Round-9 WO-S2-1 witness-gap delta (W9-N): the sweep's transaction bound
+// ---------------------------------------------------------------------------
+
+/// W9-N (round-9 B1 admissibility): the zero-interest cancel sweep is
+/// O(1) write transactions for N jobs. The landed close (41e722dfc)
+/// replaced the per-job fenced round-trip loop (live_053: 5,258
+/// sequential cancels x 3.16ms = 16.6s inside one 134.65s Tick) with
+/// ONE fenced sweep + ONE pin-release pass; the landed battery
+/// certifies sweep SEMANTICS (rows cancelled, attempts closed, view
+/// folds on the disposition) but nothing pinned the statement-count
+/// bound itself -- the axis the close exists for, and the axis on
+/// which the dead per-job shape would silently return.
+///
+/// Drives the REAL tick fn with N=40 zero-interest jobs (empty DAG ->
+/// every entry takes the `None => true` node-absent arm) and counts
+/// WRITE transactions via `pg_current_xact_id()` deltas: xid
+/// assignment is immediate, global, and throttle-free (unlike
+/// pg_stat_database counters, which lag per-backend up to 1s and can
+/// both false-fail and false-pass a tight bound), and under nextest
+/// each test owns its postgres instance so the counter is
+/// test-private. Each probe forces one xid for its own transaction
+/// (subtracted); the per-job regression shape is >= N fenced write
+/// transactions, the batched form a small constant (the sweep tx;
+/// the pin release is read-only when no pins exist).
+#[tokio::test]
+async fn zero_interest_cancel_sweep_transaction_bound() -> TestResult {
+    const N: usize = 40;
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+
+    // Seed N derivations in one batched tx (setup -- uncounted).
+    let rows: Vec<crate::db::DerivationRow> = (0..N)
+        .map(|i| crate::db::DerivationRow {
+            drv_hash: format!("zi-bound-{i:03}"),
+            drv_path: rio_test_support::fixtures::test_drv_path(&format!("zi-bound-{i:03}")),
+            pname: Some("test-pkg".into()),
+            system: "x86_64-linux".into(),
+            status: DerivationStatus::Created,
+            required_features: vec![],
+            expected_output_paths: vec![],
+            output_names: vec!["out".into()],
+            is_fixed_output: false,
+            is_ca: false,
+        })
+        .collect();
+    let mut tx = db.pool.begin().await?;
+    let ids = crate::db::SchedulerDb::batch_upsert_derivations(&mut tx, &rows).await?;
+    tx.commit().await?;
+
+    let mut actor = bare_actor(db.pool.clone());
+    let generation = actor.serving_generation();
+    for i in 0..N {
+        let hash = format!("zi-bound-{i:03}");
+        let derivation_id = ids.get(hash.as_str()).expect("just inserted").0;
+        let created = sdb(&db.pool)
+            .create_materialization_job_fenced(
+                derivation_id,
+                &hash,
+                None,
+                JobOrigin::Pruned,
+                None,
+                generation,
+            )
+            .await?;
+        let crate::db::materialization::FencedJobCreate::Applied { job_id, .. } = created else {
+            anyhow::bail!("job create must apply");
+        };
+        // Production view-entry constructor (R13); the DAG stays empty
+        // so every entry is zero-interest via the node-absent arm.
+        actor.materialization_jobs.insert(
+            DrvHash::from(hash.as_str()),
+            crate::actor::materialize::JobViewEntry::new_unclaimed(job_id, None),
+        );
+    }
+
+    async fn current_xid(pool: &sqlx::PgPool) -> i64 {
+        sqlx::query_scalar("SELECT pg_current_xact_id()::text::bigint")
+            .fetch_one(pool)
+            .await
+            .expect("xid probe")
+    }
+
+    let authority = actor
+        .dag_authority()
+        .expect("direct-setup actor is authoritative");
+    let xid_before = current_xid(&db.pool).await;
+    actor
+        .tick_cancel_zero_interest_materialization(&authority)
+        .await;
+    let xid_after = current_xid(&db.pool).await;
+    // The after-probe consumed one xid itself.
+    let write_txns = xid_after - xid_before - 1;
+    eprintln!("zero-interest sweep of {N} jobs: {write_txns} write transactions");
+
+    let cancelled: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM materialization_jobs WHERE state = 'cancelled'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(cancelled, N as i64, "all {N} jobs resolved by ONE sweep");
+    assert_eq!(
+        actor.materialization_jobs.iter().count(),
+        0,
+        "every view entry folded on the Applied disposition"
+    );
+    assert!(
+        write_txns < (N / 2) as i64,
+        "the zero-interest sweep of {N} jobs issued {write_txns} write \
+         transactions; the batched close is one fenced sweep (O(1)) -- \
+         a count near {N} is the dead per-job round-trip shape (live_053)"
+    );
+    Ok(())
+}
