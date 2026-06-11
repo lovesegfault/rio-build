@@ -212,9 +212,10 @@ pub(super) enum PullPhaseOutcome {
 /// with no chance of progress; the loops terminate promptly and
 /// loudly instead (`builder.pull.retry-loop+2`).
 ///
-/// Exhaustive over [`RefusalJudgment`] — never `matches!` (which
-/// desugars to `_ => false`): a future judgment variant must decide
-/// its fatality HERE at compile time, not land in silent-retry. The
+/// Exhaustive over [`RefusalJudgment`](rio_proto::refusal::RefusalJudgment)
+/// — never `matches!` (which desugars to `_ => false`): a future
+/// judgment variant must decide its fatality HERE at compile time,
+/// not land in silent-retry. The
 /// agreement census (`fatal_set_agrees_with_the_authority`) pins the
 /// behavioral set: identical to the pre-re-point hand-coded
 /// {PermissionDenied, Unauthenticated, Unimplemented,
