@@ -400,6 +400,7 @@ pub(super) async fn compute_input_closure(
 /// failing as a build defect.
 pub(super) async fn resolve_castore_roots(
     store_client: &StoreServiceClient<Channel>,
+    assignment_token: &str,
     assignment_roots: &[rio_proto::types::InputRoot],
     input_metadata: &[ValidatedPathInfo],
 ) -> Result<Vec<rio_proto::types::InputRoot>, ExecutorError> {
@@ -448,9 +449,18 @@ pub(super) async fn resolve_castore_roots(
     // RPC per path — the fallback can be the whole closure when the
     // scheduler's closure compute timed out).
     let mut client = store_client.clone();
-    let request = rio_proto::types::GetNarIndexBatchRequest {
+    // GetNarIndexBatch is identity-gated server-side (the index is a
+    // full file listing with digests); present the same assignment
+    // token the castore-FUSE data path sends on GetChunks.
+    let mut request = tonic::Request::new(rio_proto::types::GetNarIndexBatchRequest {
         nar_hashes: needs.iter().map(|(_, h)| h.to_vec()).collect(),
-    };
+    });
+    crate::upload::common::attach_assignment_token(&mut request, assignment_token).map_err(
+        |status| ExecutorError::MetadataFetch {
+            path: needs[0].0.clone(),
+            source: status,
+        },
+    )?;
     let infra = |path: &str, msg: String| ExecutorError::InputRoots {
         path: path.to_owned(),
         reason: msg,
@@ -1275,7 +1285,8 @@ mod tests {
             // p_local_only deliberately absent from the assignment.
         ];
 
-        let roots = resolve_castore_roots(&client, &assignment_roots, &metadata).await?;
+        let roots =
+            resolve_castore_roots(&client, "test-token", &assignment_roots, &metadata).await?;
         let by_path: std::collections::HashMap<_, _> = roots
             .iter()
             .map(|r| (r.store_path.as_str(), r.root_node.clone()))
@@ -1311,7 +1322,7 @@ mod tests {
         let metadata = vec![make_path_info(&p, &nar, hash)];
         // NOT seeding a nar_index for `hash`.
 
-        let err = resolve_castore_roots(&client, &[], &metadata)
+        let err = resolve_castore_roots(&client, "test-token", &[], &metadata)
             .await
             .expect_err("missing index must fail the mount, not drop the path");
         match &err {

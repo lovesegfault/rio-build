@@ -1,9 +1,65 @@
-//! `GetNarIndex`/`GetNarIndexBatch` round-trip + cache-hit + cascade.
+//! `GetNarIndex`/`GetNarIndexBatch` round-trip + cache-hit + cascade,
+//! plus the caller-identity gate (no anonymous index reads).
 
 use super::*;
 use rio_nix::nar::{NarEntry, NarNode};
 use rio_proto::types::{GetNarIndexBatchRequest, GetNarIndexRequest, NarEntryKind};
 use sha2::{Digest, Sha256};
+
+/// HMAC key for the NAR-index caller-identity gate. The index RPCs are
+/// not tenant-scoped, but they must never be anonymous — see
+/// `StoreServiceImpl::require_caller_identity`.
+const NAR_HMAC_KEY: &[u8] = b"nar-index-service-test-key-32-b!";
+
+/// A key the server does NOT hold — tokens signed with it must be
+/// rejected exactly like anonymous requests.
+const FORGED_HMAC_KEY: &[u8] = b"not-the-server-key-aaaaaaaaaaaaa";
+
+/// Builder assignment token signed with `key`. Sign with
+/// [`NAR_HMAC_KEY`] for a valid token, any other key for a forged one.
+/// `expected_outputs` matters only for PutPath seeding (the index RPCs
+/// ignore the claim body — identity is all they check).
+fn assignment_token(key: &[u8], expected_outputs: Vec<String>) -> String {
+    rio_auth::hmac::HmacSigner::from_key(key.to_vec()).sign(&rio_auth::hmac::AssignmentClaims {
+        executor_id: "test".into(),
+        drv_hash: "00".repeat(32),
+        expected_outputs,
+        is_ca: false,
+        expiry_unix: 9_999_999_999,
+        tenant: Some(uuid::Uuid::nil().to_string()),
+        input_closure_digest: String::new(),
+    })
+}
+
+/// Wrap `msg` in a request carrying a valid builder assignment token.
+fn authed<T>(msg: T) -> tonic::Request<T> {
+    with_token(msg, &assignment_token(NAR_HMAC_KEY, vec![]))
+}
+
+/// Wrap `msg` in a request carrying `token` verbatim.
+fn with_token<T>(msg: T, token: &str) -> tonic::Request<T> {
+    let mut r = tonic::Request::new(msg);
+    r.metadata_mut().insert(
+        rio_proto::ASSIGNMENT_TOKEN_HEADER,
+        token.parse().expect("token is ASCII"),
+    );
+    r
+}
+
+/// HMAC-gated session + one seeded indexed path. The seed PutPath uses
+/// a valid token with the path in `expected_outputs` (PutPath enforces
+/// the claim body; the index RPCs only require an identity).
+async fn seeded_hmac_session(
+    name: &str,
+    payload: &[u8],
+) -> anyhow::Result<(StoreSession, [u8; 32])> {
+    let mut s = StoreSession::new_with_hmac(NAR_HMAC_KEY.to_vec()).await?;
+    let (nar, nar_hash, path) = make_dir_nar(name, payload);
+    let info = make_path_info(&path, &nar, nar_hash);
+    let token = assignment_token(NAR_HMAC_KEY, vec![path]);
+    put_path_with_token(&mut s.client, info, nar, &token).await?;
+    Ok((s, nar_hash))
+}
 
 /// Build a 3-entry NAR: dir { a (regular), b (symlink), c (regular) }.
 /// Returns `(nar_bytes, sha256, store_path)`.
@@ -41,22 +97,19 @@ fn make_dir_nar(name: &str, payload: &[u8]) -> (Vec<u8>, [u8; 32], String) {
 /// written eagerly in the manifest-complete transaction (ADR-022 §6 /
 /// P0557) — it cannot be recomputed from blob-aligned chunks later —
 /// so the RPC is a pure PG read.
-// r[verify store.index.rpc]
+// r[verify store.index.rpc+1]
 #[tokio::test]
 async fn get_nar_index_returns_eagerly_written_index() -> TestResult {
-    let mut s = StoreSession::new().await?;
-    let (nar, nar_hash, path) = make_dir_nar("nar-index-rt", b"hello nar index");
-    let info = make_path_info(&path, &nar, nar_hash);
-    put_path(&mut s.client, info, nar).await?;
+    let (mut s, nar_hash) = seeded_hmac_session("nar-index-rt", b"hello nar index").await?;
 
     // First call: PG hit (no recompute path exists for indexed paths).
     // The eager-write DB-state assertions live in
     // `put_path_writes_castore_index_atomically`.
     let idx = s
         .client
-        .get_nar_index(GetNarIndexRequest {
+        .get_nar_index(authed(GetNarIndexRequest {
             nar_hash: nar_hash.to_vec(),
-        })
+        }))
         .await?
         .into_inner();
     // root dir + 3 children.
@@ -87,9 +140,9 @@ async fn get_nar_index_returns_eagerly_written_index() -> TestResult {
     // Second call: PG hit, identical result.
     let idx2 = s
         .client
-        .get_nar_index(GetNarIndexRequest {
+        .get_nar_index(authed(GetNarIndexRequest {
             nar_hash: nar_hash.to_vec(),
-        })
+        }))
         .await?
         .into_inner();
     assert_eq!(idx2.entries, idx.entries);
@@ -100,51 +153,141 @@ async fn get_nar_index_returns_eagerly_written_index() -> TestResult {
 /// Unknown nar_hash → `NOT_FOUND`. Wrong-length → `INVALID_ARGUMENT`.
 #[tokio::test]
 async fn get_nar_index_not_found_and_bad_arg() -> TestResult {
-    let mut s = StoreSession::new().await?;
+    let mut s = StoreSession::new_with_hmac(NAR_HMAC_KEY.to_vec()).await?;
     let err = s
         .client
-        .get_nar_index(GetNarIndexRequest {
+        .get_nar_index(authed(GetNarIndexRequest {
             nar_hash: vec![0xAB; 32],
-        })
+        }))
         .await
         .expect_err("unknown nar_hash should fail");
     assert_eq!(err.code(), tonic::Code::NotFound);
 
     let err = s
         .client
-        .get_nar_index(GetNarIndexRequest {
+        .get_nar_index(authed(GetNarIndexRequest {
             nar_hash: vec![0u8; 16],
-        })
+        }))
         .await
         .expect_err("16-byte hash should fail");
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
     Ok(())
 }
 
-/// `GetNarIndexBatch`: hit + miss in request order. A `nar_hash` the
-/// store has no complete path for returns `index = None` in its slot;
-/// the hit is unaffected by the neighboring miss.
-// r[verify store.index.rpc]
+/// An anonymous (or forged-token) `GetNarIndex` is rejected with
+/// `UNAUTHENTICATED` before any PG read. The index discloses a path's
+/// full file listing, sizes, and per-file BLAKE3 digests for any
+/// guessed or leaked nar_hash — an anonymous cross-tenant metadata
+/// oracle (and, combined with the chunk RPCs, a content one). The
+/// authed success on the same seeded hash proves the rejection is not
+/// vacuous.
+// r[verify store.index.rpc+1]
 #[tokio::test]
-async fn get_nar_index_batch_order_and_misses() -> TestResult {
-    let mut s = StoreSession::new().await?;
-    let (nar, nar_hash, path) = make_dir_nar("nar-index-batch", b"batched");
-    let info = make_path_info(&path, &nar, nar_hash);
-    put_path(&mut s.client, info, nar).await?;
+async fn get_nar_index_rejects_anonymous_and_forged_callers() -> TestResult {
+    let (mut s, nar_hash) = seeded_hmac_session("nar-index-anon", b"secret payload").await?;
 
-    // Warm one path via the unary RPC; the second hash is unknown.
-    s.client
+    // No token at all.
+    let err = s
+        .client
         .get_nar_index(GetNarIndexRequest {
             nar_hash: nar_hash.to_vec(),
         })
+        .await
+        .expect_err("anonymous GetNarIndex must be rejected");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    // A token signed with the wrong key.
+    let err = s
+        .client
+        .get_nar_index(with_token(
+            GetNarIndexRequest {
+                nar_hash: nar_hash.to_vec(),
+            },
+            &assignment_token(FORGED_HMAC_KEY, vec![]),
+        ))
+        .await
+        .expect_err("forged-token GetNarIndex must be rejected");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    // Vacuity sentinel: the same request with a valid token succeeds.
+    let idx = s
+        .client
+        .get_nar_index(authed(GetNarIndexRequest {
+            nar_hash: nar_hash.to_vec(),
+        }))
+        .await?
+        .into_inner();
+    assert!(!idx.entries.is_empty());
+    Ok(())
+}
+
+/// Same gate on the batch variant: anonymous or forged-token
+/// `GetNarIndexBatch` fails at the RPC boundary, before any per-hash
+/// PG work.
+// r[verify store.index.rpc+1]
+#[tokio::test]
+async fn get_nar_index_batch_rejects_anonymous_and_forged_callers() -> TestResult {
+    let (mut s, nar_hash) = seeded_hmac_session("nar-index-anon-batch", b"secret batch").await?;
+
+    // No token at all.
+    let err = s
+        .client
+        .get_nar_index_batch(GetNarIndexBatchRequest {
+            nar_hashes: vec![nar_hash.to_vec()],
+        })
+        .await
+        .expect_err("anonymous GetNarIndexBatch must be rejected");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    // A token signed with the wrong key.
+    let err = s
+        .client
+        .get_nar_index_batch(with_token(
+            GetNarIndexBatchRequest {
+                nar_hashes: vec![nar_hash.to_vec()],
+            },
+            &assignment_token(FORGED_HMAC_KEY, vec![]),
+        ))
+        .await
+        .expect_err("forged-token GetNarIndexBatch must be rejected");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    // Vacuity sentinel: the same batch with a valid token streams the
+    // seeded index back.
+    use tokio_stream::StreamExt;
+    let mut stream = s
+        .client
+        .get_nar_index_batch(authed(GetNarIndexBatchRequest {
+            nar_hashes: vec![nar_hash.to_vec()],
+        }))
+        .await?
+        .into_inner();
+    let r0 = stream.next().await.unwrap()?;
+    assert!(r0.index.is_some());
+    Ok(())
+}
+
+/// `GetNarIndexBatch`: hit + miss in request order. A `nar_hash` the
+/// store has no complete path for returns `index = None` in its slot;
+/// the hit is unaffected by the neighboring miss.
+// r[verify store.index.rpc+1]
+#[tokio::test]
+async fn get_nar_index_batch_order_and_misses() -> TestResult {
+    let (mut s, nar_hash) = seeded_hmac_session("nar-index-batch", b"batched").await?;
+
+    // Warm one path via the unary RPC; the second hash is unknown.
+    s.client
+        .get_nar_index(authed(GetNarIndexRequest {
+            nar_hash: nar_hash.to_vec(),
+        }))
         .await?;
 
     use tokio_stream::StreamExt;
     let mut stream = s
         .client
-        .get_nar_index_batch(GetNarIndexBatchRequest {
+        .get_nar_index_batch(authed(GetNarIndexBatchRequest {
             nar_hashes: vec![vec![0xCD; 32], nar_hash.to_vec()],
-        })
+        }))
         .await?
         .into_inner();
     let r0 = stream.next().await.unwrap()?;
@@ -161,22 +304,26 @@ async fn get_nar_index_batch_order_and_misses() -> TestResult {
 async fn get_nar_index_batch_rejects_oversized() -> TestResult {
     const TEST_CAP: usize = 4;
     let db = TestDb::new(&MIGRATOR).await;
-    let service = StoreServiceImpl::new(db.pool.clone()).with_max_batch_paths(TEST_CAP);
+    let service = StoreServiceImpl::new(db.pool.clone())
+        .with_max_batch_paths(TEST_CAP)
+        .with_hmac_verifier(Arc::new(rio_auth::hmac::HmacVerifier::from_key(
+            NAR_HMAC_KEY.to_vec(),
+        )));
     let (mut client, _server) = spawn_store_server(service).await?;
 
     let err = client
-        .get_nar_index_batch(GetNarIndexBatchRequest {
+        .get_nar_index_batch(authed(GetNarIndexBatchRequest {
             nar_hashes: vec![vec![0u8; 32]; TEST_CAP + 1],
-        })
+        }))
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 
     use tokio_stream::StreamExt;
     let mut stream = client
-        .get_nar_index_batch(GetNarIndexBatchRequest {
+        .get_nar_index_batch(authed(GetNarIndexBatchRequest {
             nar_hashes: vec![vec![0u8; 32]; TEST_CAP],
-        })
+        }))
         .await?
         .into_inner();
     let mut n = 0;
