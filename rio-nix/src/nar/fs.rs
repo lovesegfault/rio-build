@@ -62,22 +62,30 @@ fn canonical_times() -> std::fs::FileTimes {
         .set_modified(canon)
 }
 
-/// Open `dest` as a directory fd for metadata application, refusing to
-/// follow a symlink in the final component (`O_NOFOLLOW` → `ELOOP`).
-/// Used by `restore_node` right after `create_dir` so the canonical
-/// mtime set after the children are written goes through a held fd
-/// instead of re-resolving the path (see [`canonical_times`] for the
-/// TOCTOU rationale).
+/// Open the child directory `name` relative to the held `parent` fd,
+/// refusing to follow a symlink in the final component (`O_NOFOLLOW` →
+/// `ELOOP`/`ENOTDIR`). Used by `restore_node` right after `mkdirat`: the
+/// returned fd is the anchor for every operation on the directory's
+/// children AND the post-children canonical-mtime write, so nothing
+/// inside the directory ever re-resolves a path (see [`canonical_times`]
+/// for the TOCTOU rationale).
 ///
 /// `O_RDONLY` suffices — `futimens(2)` only requires the fd's owner to
 /// match (or `CAP_FOWNER`), not write permission, and `O_RDONLY` on a
 /// directory is valid on Linux.
-fn open_dir_nofollow(dest: &std::path::Path) -> io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(dest)
+fn open_subdir_nofollow(
+    parent: std::os::fd::BorrowedFd<'_>,
+    name: &std::ffi::CStr,
+) -> io::Result<std::os::fd::OwnedFd> {
+    use nix::fcntl::{OFlag, openat};
+    use nix::sys::stat::Mode;
+    openat(
+        parent,
+        name,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)
 }
 
 /// Eager in-memory NAR dump. Test/fuzz oracle only — production uses
@@ -331,17 +339,69 @@ fn stream_node(
 /// `dest` must NOT exist; `restore_node` creates it (file, dir, or
 /// symlink) per the root node's type. On error, a partially-written tree
 /// may remain at `dest` — the caller is responsible for cleanup.
+///
+/// # Traversal is dirfd-relative
+///
+/// The parent directory of `dest` (caller-controlled: a tempdir or
+/// builder-owned spool dir) is resolved exactly ONCE, here. Everything
+/// below is `openat`/`mkdirat`/`symlinkat` relative to held directory
+/// fds — no operation in the restore walk ever re-resolves a multi-
+/// component path. A concurrent attacker with write access to the
+/// destination tree who swaps an already-created directory component
+/// for a symlink (CVE-2021-31566 class, intermediate-component variant)
+/// retargets nothing: later writes go through the fd taken before the
+/// swap, which still references the original directory.
 pub fn restore_path_streaming(r: &mut impl Read, dest: &std::path::Path) -> Result<()> {
     let magic = read_string(r)?;
     if magic != NAR_MAGIC {
         return Err(NarError::InvalidMagic(magic));
     }
-    restore_node(r, dest, 0)
+    let name = dest.file_name().ok_or_else(|| {
+        NarError::Io(io::Error::other(format!(
+            "restore destination {} has no final path component",
+            dest.display()
+        )))
+    })?;
+    // All names are passed to the *at syscalls as `&CStr`: nix's
+    // `NixPath` impls for `str`/`OsStr` copy into a PATH_MAX stack
+    // buffer per call, which at MAX_NAR_DEPTH-deep recursion overflows
+    // a test-thread stack; the `CStr` impl passes the pointer through.
+    let name = {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+            NarError::Io(io::Error::other(format!(
+                "restore destination {} contains NUL",
+                dest.display()
+            )))
+        })?
+    };
+    let parent_path = match dest.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    };
+    let parent = nix::fcntl::open(
+        parent_path,
+        nix::fcntl::OFlag::O_RDONLY | nix::fcntl::OFlag::O_DIRECTORY | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )
+    .map_err(|e| NarError::Io(e.into()))?;
+    restore_node(r, std::os::fd::AsFd::as_fd(&parent), &name, dest, 0)
 }
 
 /// Streaming analogue of `extract_to_path(parse_node(r))`. Reads NAR
-/// framing tokens and writes the corresponding filesystem object at
-/// `dest`, copying regular-file contents in 256 KiB chunks.
+/// framing tokens and writes the filesystem object `name` relative to
+/// the held `parent` directory fd, copying regular-file contents in
+/// 256 KiB chunks.
+///
+/// `name` is always a single path component: for the root it is
+/// `dest.file_name()` (caller-controlled), for directory entries it has
+/// passed [`validate_entry_name`] (no `/`, no `..`, no NUL — enforced
+/// below before recursion, same guard as the `parse_directory` ingest
+/// path). Combined with the *at-relative syscalls this means no write
+/// ever resolves more than one (symlink-refused) component.
+///
+/// `path` is the full destination path, used for error messages only —
+/// never passed to a syscall.
 ///
 /// Restored regular files and directories carry the canonical Nix
 /// store-path `mtime` (1 second past Epoch) — the timestamp half of
@@ -349,7 +409,17 @@ pub fn restore_path_streaming(r: &mut impl Read, dest: &std::path::Path) -> Resu
 /// `set-source-date-epoch-to-latest.sh` see input store paths exactly
 /// as a stock Nix daemon would present them.
 // r[impl builder.nar.canonical-mtime]
-fn restore_node(r: &mut impl Read, dest: &std::path::Path, depth: usize) -> Result<()> {
+fn restore_node(
+    r: &mut impl Read,
+    parent: std::os::fd::BorrowedFd<'_>,
+    name: &std::ffi::CStr,
+    path: &std::path::Path,
+    depth: usize,
+) -> Result<()> {
+    use std::os::fd::AsFd;
+
+    use nix::sys::stat::Mode;
+
     if depth > MAX_NAR_DEPTH {
         return Err(NarError::NestingTooDeep(depth));
     }
@@ -358,83 +428,24 @@ fn restore_node(r: &mut impl Read, dest: &std::path::Path, depth: usize) -> Resu
 
     let node_type = read_string(r)?;
     match node_type.as_str() {
-        "regular" => {
-            // Peek: either "executable" or "contents" (same as parse_regular).
-            let token = read_string(r)?;
-            let executable = match token.as_str() {
-                "executable" => {
-                    expect_str(r, "")?;
-                    expect_str(r, "contents")?;
-                    true
-                }
-                "contents" => false,
-                _ => {
-                    return Err(NarError::UnexpectedToken {
-                        expected: "\"executable\" or \"contents\"".to_string(),
-                        got: token,
-                    });
-                }
-            };
-
-            // THE POINT: read the u64 length prefix, then stream `len`
-            // bytes from `r` straight to disk in fixed-size chunks. No
-            // `vec![0; len]` — peak alloc is one STREAM_CHUNK buffer.
-            // No MAX_CONTENT_SIZE check (caller bounds total upstream).
-            let len = read_u64(r)?;
-            // `create_new` (O_CREAT|O_EXCL) — never follows a planted
-            // symlink at `dest` (contract: `dest` must NOT exist). All
-            // metadata below is applied through this held fd, never by
-            // path (see `canonical_times` for the TOCTOU rationale).
-            let mut f = std::fs::File::create_new(dest)?;
-            let mut buf = vec![0u8; STREAM_CHUNK];
-            let mut remaining = len;
-            while remaining > 0 {
-                let to_read = (STREAM_CHUNK as u64).min(remaining) as usize;
-                // read() may return short — loop until we've copied
-                // exactly `len` bytes or hit EOF (truncated NAR).
-                let n = r.read(&mut buf[..to_read])?;
-                if n == 0 {
-                    return Err(NarError::Io(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        format!(
-                            "NAR truncated mid-file: expected {len} bytes for {dest:?}, \
-                             EOF at {} ({} remaining)",
-                            len - remaining,
-                            remaining
-                        ),
-                    )));
-                }
-                f.write_all(&buf[..n])?;
-                remaining -= n as u64;
-            }
-            // Consume NAR padding to 8-byte boundary (validated zero).
-            consume_padding(r, len as usize)?;
-            if executable {
-                use std::os::unix::fs::PermissionsExt;
-                f.set_permissions(std::fs::Permissions::from_mode(0o755))?;
-            }
-            // Canonical mtime LAST — after `write_all` (which bumps
-            // mtime) and the chmod (which only bumps ctime per POSIX,
-            // but ordering it before the mtime set keeps the sequence
-            // obviously-correct on a non-POSIX FS).
-            f.set_times(canonical_times())?;
-            expect_str(r, ")")?;
-        }
+        // The regular/symlink arms live in their own functions: debug
+        // builds don't reuse stack slots across match arms, so keeping
+        // them inline put EVERY arm's locals in the recursive frame —
+        // at MAX_NAR_DEPTH that overflowed a default test-thread stack.
+        // Only the directory arm recurses; only its locals may ride the
+        // recursion.
+        "regular" => restore_regular(r, parent, name, path)?,
         "directory" => {
-            std::fs::create_dir(dest)?;
-            // Directory fd taken immediately after mkdir; the
-            // post-children mtime goes through it instead of a
-            // path-based utimens (see `canonical_times`). O_NOFOLLOW
-            // turns a symlink swapped in since the mkdir into an error.
-            //
-            // TODO: children are still created by path (`dest.join(name)`
-            // below), so a concurrent swap of `dest` for a symlink after
-            // this open can redirect creation of NEW entries into the
-            // symlink target (never overwrites — create_new/create_dir/
-            // symlink all fail on existing paths). Closing that needs
-            // openat()-relative creation with a dirfd per level; the
-            // metadata writes themselves are fd-based and unaffected.
-            let dir = open_dir_nofollow(dest)?;
+            nix::sys::stat::mkdirat(parent, name, Mode::from_bits_truncate(0o777))
+                .map_err(|e| NarError::Io(e.into()))?;
+            // Take the directory fd NOW, immediately after mkdirat, and
+            // anchor every child operation AND the post-children
+            // canonical mtime on it. Path-based child creation would
+            // re-resolve the whole prefix per child — TOCTOU window
+            // (see `canonical_times` and the function docs above).
+            // O_NOFOLLOW turns a symlink swapped in since the mkdirat
+            // into ELOOP/ENOTDIR instead of a retargeted fd.
+            let dir = open_subdir_nofollow(parent, name)?;
             let mut prev_name: Option<String> = None;
             let mut count = 0usize;
             loop {
@@ -458,6 +469,10 @@ fn restore_node(r: &mut impl Read, dest: &std::path::Path, depth: usize) -> Resu
                         // Same path-traversal + sort-order guards as
                         // `parse_directory` — restore writes straight
                         // to the host FS, so this is the safety boundary.
+                        // After this check the name is a single normal
+                        // component (no `/`, `..`, NUL), which is what
+                        // lets the *at calls below treat it as exactly
+                        // one directory entry.
                         validate_entry_name(&name)?;
                         if let Some(ref prev) = prev_name
                             && name <= *prev
@@ -468,7 +483,9 @@ fn restore_node(r: &mut impl Read, dest: &std::path::Path, depth: usize) -> Resu
                             });
                         }
                         expect_str(r, "node")?;
-                        restore_node(r, &dest.join(&name), depth + 1)?;
+                        let cname = std::ffi::CString::new(name.as_bytes())
+                            .expect("validate_entry_name rejects NUL");
+                        restore_node(r, dir.as_fd(), &cname, &path.join(&name), depth + 1)?;
                         expect_str(r, ")")?;
                         prev_name = Some(name);
                     }
@@ -481,27 +498,134 @@ fn restore_node(r: &mut impl Read, dest: &std::path::Path, depth: usize) -> Resu
                 }
             }
             // AFTER all children: every `restore_node(child)` above
-            // created an entry under `dest`, refreshing its mtime each
-            // time. (A child setting its *own* mtime does NOT refresh the
-            // parent's — only namespace operations do.)
-            dir.set_times(canonical_times())?;
+            // created an entry in this directory, refreshing its mtime
+            // each time. (A child setting its *own* mtime does NOT
+            // refresh the parent's — only namespace operations do.)
+            std::fs::File::from(dir).set_times(canonical_times())?;
         }
-        "symlink" => {
-            expect_str(r, "target")?;
-            let target_bytes = read_target_bytes(r)?;
-            let target = String::from_utf8(target_bytes).map_err(|e| NarError::InvalidUtf8 {
-                context: "symlink target",
-                offset: e.utf8_error().valid_up_to(),
-                source: e,
-            })?;
-            std::os::unix::fs::symlink(&target, dest)?;
-            // No mtime canonicalization for symlinks: `canonical_times`
-            // documents why this is correct (no `std` API, the consumer
-            // hooks ignore symlinks, FUSE serve-side covers it).
-            expect_str(r, ")")?;
-        }
+        "symlink" => restore_symlink(r, parent, name, path)?,
         _ => return Err(NarError::UnknownNodeType(node_type)),
     }
+    Ok(())
+}
+
+/// `regular` arm of [`restore_node`], from the post-`type` token to the
+/// closing `)`. Separate function so its locals (chunk handling, fmt
+/// machinery) stay off the directory-recursion stack — see the match in
+/// `restore_node`.
+fn restore_regular(
+    r: &mut impl Read,
+    parent: std::os::fd::BorrowedFd<'_>,
+    name: &std::ffi::CStr,
+    path: &std::path::Path,
+) -> Result<()> {
+    use nix::fcntl::{OFlag, openat};
+    use nix::sys::stat::Mode;
+
+    // Peek: either "executable" or "contents" (same as parse_regular).
+    let token = read_string(r)?;
+    let executable = match token.as_str() {
+        "executable" => {
+            expect_str(r, "")?;
+            expect_str(r, "contents")?;
+            true
+        }
+        "contents" => false,
+        _ => {
+            return Err(NarError::UnexpectedToken {
+                expected: "\"executable\" or \"contents\"".to_string(),
+                got: token,
+            });
+        }
+    };
+
+    // THE POINT: read the u64 length prefix, then stream `len`
+    // bytes from `r` straight to disk in fixed-size chunks. No
+    // `vec![0; len]` — peak alloc is one STREAM_CHUNK buffer.
+    // No MAX_CONTENT_SIZE check (caller bounds total upstream).
+    let len = read_u64(r)?;
+    // `O_CREAT|O_EXCL` relative to the held parent fd — never
+    // follows a planted symlink at the final component, and the
+    // single-component `name` means no intermediate component
+    // exists to be swapped either. A pre-existing entry of any
+    // kind is an error. This fd is what the content write AND
+    // all metadata below are applied through.
+    let fd = openat(
+        parent,
+        name,
+        OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_WRONLY | OFlag::O_CLOEXEC,
+        Mode::from_bits_truncate(0o666),
+    )
+    .map_err(|e| NarError::Io(e.into()))?;
+    let mut f = std::fs::File::from(fd);
+    let mut buf = vec![0u8; STREAM_CHUNK];
+    let mut remaining = len;
+    while remaining > 0 {
+        let to_read = (STREAM_CHUNK as u64).min(remaining) as usize;
+        // read() may return short — loop until we've copied
+        // exactly `len` bytes or hit EOF (truncated NAR).
+        let n = r.read(&mut buf[..to_read])?;
+        if n == 0 {
+            return Err(NarError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "NAR truncated mid-file: expected {len} bytes for {path:?}, \
+                     EOF at {} ({} remaining)",
+                    len - remaining,
+                    remaining
+                ),
+            )));
+        }
+        f.write_all(&buf[..n])?;
+        remaining -= n as u64;
+    }
+    // Consume NAR padding to 8-byte boundary (validated zero).
+    consume_padding(r, len as usize)?;
+    // Metadata through the HELD fd (`fchmod`/`futimens`), never
+    // by path — re-opening the path here would be the TOCTOU
+    // window described at `canonical_times`.
+    if executable {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+    }
+    // Canonical mtime LAST — after `write_all` (which bumps
+    // mtime) and the chmod (which only bumps ctime per POSIX,
+    // but ordering it before the mtime set keeps the sequence
+    // obviously-correct on a non-POSIX FS).
+    f.set_times(canonical_times())?;
+    expect_str(r, ")")?;
+    Ok(())
+}
+
+/// `symlink` arm of [`restore_node`] — see [`restore_regular`] for why
+/// it is a separate function.
+fn restore_symlink(
+    r: &mut impl Read,
+    parent: std::os::fd::BorrowedFd<'_>,
+    name: &std::ffi::CStr,
+    path: &std::path::Path,
+) -> Result<()> {
+    expect_str(r, "target")?;
+    let target_bytes = read_target_bytes(r)?;
+    let target = String::from_utf8(target_bytes).map_err(|e| NarError::InvalidUtf8 {
+        context: "symlink target",
+        offset: e.utf8_error().valid_up_to(),
+        source: e,
+    })?;
+    // Target → CString explicitly (same per-frame stack-buffer
+    // avoidance as `name`; NUL in the target is filesystem-
+    // invalid, matching the old `std::os::unix::fs::symlink`
+    // behavior of rejecting it at conversion).
+    let ctarget = std::ffi::CString::new(target.as_bytes()).map_err(|_| {
+        NarError::Io(io::Error::other(format!(
+            "symlink target for {path:?} contains NUL"
+        )))
+    })?;
+    nix::unistd::symlinkat(ctarget.as_c_str(), parent, name).map_err(|e| NarError::Io(e.into()))?;
+    // No mtime canonicalization for symlinks: `canonical_times`
+    // documents why this is correct (no `std` API, the consumer
+    // hooks ignore symlinks, FUSE serve-side covers it).
+    expect_str(r, ")")?;
     Ok(())
 }
 
@@ -665,28 +789,34 @@ mod tests {
         restore_path_streaming(&mut streamed.as_slice(), &dest_root).unwrap();
     }
 
-    /// The directory-fd open used for post-children mtime application
-    /// must refuse a symlink in the final component (ELOOP), not follow
-    /// it — this is what closes the mkdir→utimens TOCTOU window
-    /// (CVE-2021-31566 class) when an attacker swaps `dest` for a
-    /// symlink mid-restore.
+    /// The directory-fd open that anchors child writes and the
+    /// post-children mtime application must refuse a symlink in the
+    /// final component (ELOOP), not follow it — this is what closes the
+    /// mkdirat→openat TOCTOU window (CVE-2021-31566 class) when an
+    /// attacker swaps the just-created directory for a symlink
+    /// mid-restore.
     #[test]
-    fn open_dir_nofollow_rejects_symlinked_dir() {
+    fn open_subdir_nofollow_rejects_symlinked_dir() {
+        use std::os::fd::AsFd;
+
         let tmp = tempfile::tempdir().unwrap();
+        let parent = std::fs::File::open(tmp.path()).unwrap();
         let real = tmp.path().join("real");
         std::fs::create_dir(&real).unwrap();
-        let link = tmp.path().join("link");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
+        std::os::unix::fs::symlink(&real, tmp.path().join("link")).unwrap();
 
-        let err = open_dir_nofollow(&link).unwrap_err();
+        let err = open_subdir_nofollow(parent.as_fd(), c"link").unwrap_err();
         // O_NOFOLLOW on a symlink is ELOOP; combined with O_DIRECTORY,
         // Linux reports ENOTDIR ("not a directory" wins). Accept either —
         // the invariant is that the open FAILS instead of following.
         assert!(
-            matches!(err.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)),
+            matches!(
+                err.raw_os_error(),
+                Some(nix::libc::ELOOP) | Some(nix::libc::ENOTDIR)
+            ),
             "got {err:?}"
         );
         // The real directory still opens fine.
-        open_dir_nofollow(&real).unwrap();
+        open_subdir_nofollow(parent.as_fd(), c"real").unwrap();
     }
 }

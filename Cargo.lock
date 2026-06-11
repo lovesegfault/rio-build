@@ -6372,7 +6372,7 @@ dependencies = [
  "blake3",
  "ed25519-dalek",
  "hex",
- "libc",
+ "nix 0.31.3",
  "proptest",
  "rstest",
  "serde_json",

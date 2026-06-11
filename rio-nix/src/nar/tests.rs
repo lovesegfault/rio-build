@@ -764,6 +764,141 @@ fn restore_streaming_refuses_symlink_at_dest_dir() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Reader that runs a closure once when its first segment is exhausted,
+/// then continues from the second segment. Lets a test deterministically
+/// mutate the destination tree at a precise point *mid-restore* —
+/// simulating a concurrent attacker without an actual race.
+struct MidStreamTrigger<'a, F: FnMut()> {
+    first: Cursor<&'a [u8]>,
+    second: Cursor<&'a [u8]>,
+    trigger: Option<F>,
+}
+
+impl<F: FnMut()> Read for MidStreamTrigger<'_, F> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.first.read(buf)?;
+        if n > 0 {
+            return Ok(n);
+        }
+        if let Some(mut t) = self.trigger.take() {
+            t();
+        }
+        self.second.read(buf)
+    }
+}
+
+/// THE dirfd-conversion guarantee: swapping an ALREADY-CREATED directory
+/// component of the dest tree for a symlink mid-restore must not let
+/// later writes resolve through the symlink into a victim directory.
+///
+/// Shape: the NAR root is a directory containing one file. The "attacker"
+/// closure fires after the root dir is created (the `directory` token is
+/// consumed → `mkdir` has happened) but before the first `entry` token is
+/// read; it replaces the freshly-created root dir with a symlink to a
+/// victim dir. Path-based restore (`File::create_new(dest.join(name))`)
+/// re-resolves `dest` and creates the file INSIDE THE VICTIM — this test
+/// is red on that code. dirfd-relative restore holds the root directory
+/// fd from before the swap, so the child lands in the (now-unlinked)
+/// original directory and the victim is untouched.
+#[test]
+fn restore_streaming_root_swap_does_not_follow_into_victim() -> anyhow::Result<()> {
+    let tmp = tempfile::TempDir::new()?;
+    let victim = tmp.path().join("victim-dir");
+    std::fs::create_dir(&victim)?;
+    let dest = tmp.path().join("dest");
+
+    let mut nar = Vec::new();
+    serialize(
+        &mut nar,
+        &NarNode::Directory {
+            entries: vec![entry("pwned", reg(false, b"gotcha"))],
+        },
+    )?;
+
+    // Split right before the length prefix of the first "entry" token:
+    // at that point restore has consumed `... ( type directory` and has
+    // created the root dir, but not yet opened/created any child.
+    let entry_pos = nar
+        .windows(5)
+        .position(|w| w == b"entry")
+        .expect("NAR contains an entry token");
+    let split = entry_pos - 8; // u64 length prefix precedes the token
+    let dest_for_trigger = dest.clone();
+    let victim_for_trigger = victim.clone();
+    let mut r = MidStreamTrigger {
+        first: Cursor::new(&nar[..split]),
+        second: Cursor::new(&nar[split..]),
+        trigger: Some(move || {
+            // Attacker: replace the just-created (still empty) root dir
+            // with a symlink to the victim.
+            std::fs::remove_dir(&dest_for_trigger).unwrap();
+            std::os::unix::fs::symlink(&victim_for_trigger, &dest_for_trigger).unwrap();
+        }),
+    };
+
+    // Whether the restore reports success (writes went to the unlinked
+    // original dir) or an error is secondary; the invariant is that
+    // NOTHING was created inside the victim.
+    let _ = restore_path_streaming(&mut r, &dest);
+    assert!(
+        std::fs::read_dir(&victim)?.next().is_none(),
+        "mid-restore dir swap was followed: entry created inside victim dir"
+    );
+    Ok(())
+}
+
+/// Single-level collision variant (structural, not red-provable): a
+/// symlink pre-planted where a SUBDIRECTORY entry will be created must
+/// fail the restore with EEXIST — `mkdirat` (and plain `mkdir` before
+/// the conversion) never follows a symlink in the final component — and
+/// nothing may be created inside the victim.
+#[test]
+fn restore_streaming_refuses_symlink_at_subdir_entry() -> anyhow::Result<()> {
+    let tmp = tempfile::TempDir::new()?;
+    let victim = tmp.path().join("victim-dir");
+    std::fs::create_dir(&victim)?;
+    let dest = tmp.path().join("dest");
+
+    // NAR: dir containing subdir "a" containing a file.
+    let mut nar = Vec::new();
+    serialize(
+        &mut nar,
+        &NarNode::Directory {
+            entries: vec![entry(
+                "a",
+                NarNode::Directory {
+                    entries: vec![entry("pwned", reg(false, b"gotcha"))],
+                },
+            )],
+        },
+    )?;
+
+    // Plant the symlink as soon as the root dir exists (same split point
+    // as the root-swap test: before the first "entry" token is read).
+    let entry_pos = nar.windows(5).position(|w| w == b"entry").unwrap();
+    let split = entry_pos - 8;
+    let dest_for_trigger = dest.clone();
+    let victim_for_trigger = victim.clone();
+    let mut r = MidStreamTrigger {
+        first: Cursor::new(&nar[..split]),
+        second: Cursor::new(&nar[split..]),
+        trigger: Some(move || {
+            std::os::unix::fs::symlink(&victim_for_trigger, dest_for_trigger.join("a")).unwrap();
+        }),
+    };
+
+    let res = restore_path_streaming(&mut r, &dest);
+    assert!(
+        res.is_err(),
+        "restore over a pre-planted subdir symlink must fail, got {res:?}"
+    );
+    assert!(
+        std::fs::read_dir(&victim)?.next().is_none(),
+        "subdir symlink was followed: entry created inside victim dir"
+    );
+    Ok(())
+}
+
 /// Same path-traversal guard as `parse`: `..`, `/`, NUL, empty, `.`
 /// in entry names are rejected BEFORE any filesystem write under
 /// `dest` for that name.
