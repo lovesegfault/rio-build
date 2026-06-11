@@ -1264,6 +1264,36 @@ enum CompletedLoseEvidence {
     ConflictDeferralExhausted,
 }
 
+impl CompletedLoseEvidence {
+    /// Each lose cell's standing posture, EXPLICIT at the type
+    /// (bug_136): evidence kinds with different epistemic weight do
+    /// not collapse into one convergent call — the edge SELECTION is
+    /// the evidence's own, in kani proof scope
+    /// (`lease_standing_lose_edge_selects_posture_by_evidence_kind`).
+    ///
+    /// - [`Self::AnotherHolderObserved`]: a completed read RESOLVED
+    ///   not-leading — exactly the graceful-release gate's clearing
+    ///   event ("has not since observed another holder"); the hold
+    ///   clears.
+    /// - [`Self::ConflictDeferralExhausted`]: every exhausted round's
+    ///   GET named US holder; the 409s prove only rv movement (own
+    ///   zombie commit, foreign metadata patch — the crate's own warn
+    ///   text). The apiserver-unknown epistemic state is the same one
+    ///   the step-down-failure siblings hold, and it takes the same
+    ///   posture: SELF-FENCE — belief and the deferral latch drop, the
+    ///   shutdown-release hold stays. Strictly safe per the
+    ///   graceful-release pricing: a stale hold costs one
+    ///   holder-guarded round-trip; the pre-fix cleared hold on a
+    ///   lease still naming us cost the successor the full 19s steal
+    ///   on a SIGTERM in the window.
+    fn apply(&self, standing: &mut LeaseStanding) {
+        match self {
+            Self::AnotherHolderObserved => standing.on_observed_not_leading(),
+            Self::ConflictDeferralExhausted => standing.on_self_fence(),
+        }
+    }
+}
+
 /// The own-commit evidence baseline (`sched.lease.cancelled-write`):
 /// what the last COMPLETED read observed of the lease's holder-authored
 /// content. Three-state (merged_bug_164): a completed read that
@@ -1838,10 +1868,15 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                                 // arm after the edge match patches this
                                 // tick.
                                 marks_dirty.mark();
-                                // Clears the episode latch too — an
-                                // exhausted deferral does not survive
-                                // its own lose edge.
-                                standing.on_observed_not_leading();
+                                // The standing posture is the
+                                // EVIDENCE's own (bug_136): direct
+                                // holder evidence clears the hold;
+                                // an exhausted deferral — whose every
+                                // read named us — self-fences (hold
+                                // kept). Both clear the episode latch:
+                                // a deferral does not survive its own
+                                // lose edge.
+                                evidence.apply(&mut standing);
                             }
                             None => {
                                 // ---- One-round deferral ----
@@ -2462,8 +2497,8 @@ impl LeaseStanding {
 #[cfg(kani)]
 mod lease_standing_proofs {
     use super::{
-        ActFailedAction, ConflictResolution, ContentCell, HolderCell, LeaseStanding, LedgerCell,
-        route_act_failed_read,
+        ActFailedAction, CompletedLoseEvidence, ConflictResolution, ContentCell, HolderCell,
+        LeaseStanding, LedgerCell, route_act_failed_read,
     };
 
     const MAX_EVENTS: usize = 8;
@@ -2581,6 +2616,77 @@ mod lease_standing_proofs {
             }
             i += 1;
         }
+    }
+
+    /// r[verify sched.lease.graceful-release+2]
+    /// EDGE SELECTION is in proof scope (bug_136): the event alphabet
+    /// widens from bare transitions to the typed lose EVIDENCE folded
+    /// through `CompletedLoseEvidence::apply` — over every bounded
+    /// sequence drawn from {ObservedHeld, ObservedNotLeading,
+    /// SelfFence, BelievingConflict, Lose(AnotherHolderObserved),
+    /// Lose(ConflictDeferralExhausted)}: (a) an exhausted-deferral
+    /// lose NEVER changes the release verdict (it is fence-class —
+    /// every exhausted round's read named us; removing those events
+    /// from the fold yields the same verdict), and (b) a
+    /// direct-evidence lose ALWAYS clears it (the graceful-release
+    /// gate's own clearing event). Both kinds end belief and the
+    /// deferral episode.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn lease_standing_lose_edge_selects_posture_by_evidence_kind() {
+        let events: [u8; MAX_EVENTS] = kani::any();
+
+        let mut with_exhausted = LeaseStanding::new();
+        let mut without_exhausted = LeaseStanding::new();
+        let mut i = 0;
+        while i < MAX_EVENTS {
+            kani::assume(events[i] < 6);
+            match events[i] {
+                0 => {
+                    with_exhausted.on_observed(true);
+                    without_exhausted.on_observed(true);
+                }
+                1 => {
+                    with_exhausted.on_observed(false);
+                    without_exhausted.on_observed(false);
+                }
+                2 => {
+                    with_exhausted.on_self_fence();
+                    without_exhausted.on_self_fence();
+                }
+                3 => {
+                    let _ = with_exhausted.on_believing_conflict();
+                    let _ = without_exhausted.on_believing_conflict();
+                }
+                4 => {
+                    CompletedLoseEvidence::AnotherHolderObserved.apply(&mut with_exhausted);
+                    CompletedLoseEvidence::AnotherHolderObserved.apply(&mut without_exhausted);
+                    assert!(
+                        !with_exhausted.should_release_on_shutdown(),
+                        "direct holder evidence always clears the hold"
+                    );
+                    assert!(
+                        !with_exhausted.believes(),
+                        "every lose evidence ends belief"
+                    );
+                }
+                _ => {
+                    CompletedLoseEvidence::ConflictDeferralExhausted.apply(&mut with_exhausted);
+                    // without_exhausted: the exhausted lose removed.
+                    assert!(
+                        !with_exhausted.believes(),
+                        "every lose evidence ends belief"
+                    );
+                }
+            }
+            i += 1;
+        }
+        assert!(
+            with_exhausted.should_release_on_shutdown()
+                == without_exhausted.should_release_on_shutdown(),
+            "an exhausted-deferral lose is fence-class: it must never change \
+             the release verdict"
+        );
     }
 
     /// r[verify sched.lease.holder-evidenced-lose+2]
@@ -4848,6 +4954,90 @@ mod tests {
             }
         }
         loop_task.await.expect("lease loop exits");
+    }
+
+    /// W10-AV (bug_136): an exhausted deferral whose every round's GET
+    /// named US holder takes the SELF-FENCE posture — belief and the
+    /// latch drop, the shutdown-release hold stays — because the
+    /// epistemic state is apiserver-unknown (the 409s may be non-lose
+    /// rv-movers), the same state as the step-down-failure siblings.
+    /// At the law's quantifier: holder-naming evidence NEVER clears
+    /// the hold. The witness is the lease RECORD: a SIGTERM in the
+    /// window must still fire the release (pre-fix the convergent
+    /// `on_observed_not_leading` cleared the hold, the release was
+    /// skipped, and the successor waited out the 19s steal).
+    // r[verify sched.lease.graceful-release+2]
+    #[tokio::test(start_paused = true)]
+    async fn w10_av_exhausted_deferral_naming_us_keeps_the_hold() {
+        let (client, mut park) = RequestPark::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        drive_to_believing_409(&mut park, &state).await;
+
+        // Round 4: the GET names US again; the PUT bounces again —
+        // the deferral exhausts. Belief drops (the fence face)...
+        let get = park.next().await;
+        get.respond_ok(park_lease_json_rt(Some("us"), 3, 13, 12));
+        let put = park.next().await;
+        put.respond_status(409, "Conflict", "the object has been modified");
+        settle().await;
+        assert!(
+            !state.is_leader(),
+            "exhaustion still drops belief (the bounded-deferral law)"
+        );
+        // The lose edge marks dirty; the same-tick reconcile clears
+        // the leader marks (the merged_bug_122 hoist).
+        let patch = park.next().await;
+        assert!(patch.path.contains("/pods/us"), "marks reconcile PATCH");
+        patch.respond_ok(pod_ok("us"));
+        settle().await;
+
+        // ...and SIGTERM in the window: the lease may still name us,
+        // so the release MUST fire — the lease record is the witness.
+        shutdown.cancel();
+        let get = tokio::time::timeout(Duration::from_secs(30), park.next())
+            .await
+            .expect(
+                "the shutdown release must reach the apiserver: the exhausted \
+                 edge cleared the hold and skipped step_down (the bug_136 red)",
+            );
+        assert!(get.path.contains("/leases/rio-sched"));
+        get.respond_ok(park_lease_json_rt(Some("us"), 3, 13, 12));
+        let put = park.next().await;
+        assert!(
+            put.body["spec"]["holderIdentity"].is_null(),
+            "the release clears holderIdentity — got {}",
+            put.body
+        );
+        put.respond_ok(park_lease_json_rt(None, 3, 14, 12));
+        loop_task.await.expect("lease loop exits");
+
+        // The lose edge still ran exactly once (hooks + marks) — the
+        // posture change touches the HOLD, not the lose transition.
+        assert_eq!(
+            hooks.loses.lock().expect("loses lock").len(),
+            1,
+            "exactly one lose edge at exhaustion"
+        );
     }
 
     /// Q3 evidence path: a deferred 409 whose next completed read names
