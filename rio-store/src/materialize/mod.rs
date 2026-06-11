@@ -443,6 +443,24 @@ async fn claim_loop<T>(
                 );
             }
         }
+        // Round-9 WO-S1-6 (bug_083, T3): the hold's scope is a STATED
+        // invariant — the admission authorizes CLAIM-CONSUMPTION WORK;
+        // the pacing sleep is not work. A delivered claim consumed the
+        // admission above (`admission.take()` moved it into the
+        // execute call — the consume span holds the slot by type); a
+        // claimless pass's admission is still live HERE and must drop
+        // BEFORE pacing, or every idle worker pins a pod-wide path
+        // slot for ~a full beat and re-acquires immediately: at
+        // production n=32/P=32 that is held ≥ P — leftover-only
+        // `try_widen` permanently starves (width-4 fan-out silently
+        // runs at width 1) and the idle sleepers inflate
+        // `rio_store_executor_path_slots_in_use` to near-saturation,
+        // corrupting the nxF>P tripwire. With the drop here the gauge
+        // measures holders-DOING-WORK by construction (no clock
+        // needed: the scope change deletes the idle-hold axis instead
+        // of pricing it).
+        drop(admission);
+
         // live_046 (R-B) → round-8 WO-S2-1: the eager re-poll rides
         // the sealed outcome — work re-polls now, idle passes sleep
         // the jittered beat, contested passes honor the server's
@@ -1348,5 +1366,140 @@ mod tests {
             "a slotless pass minted a claiming pull with zero pod slot headroom"
         );
         drop(admission);
+    }
+
+    // ===================================================================
+    // Round-9 WO-S1-6 (bug_083) — the slot hold is scoped to WORK, not
+    // to the loop: a claimless pass's admission drops BEFORE the pacing
+    // sleep. Pre-fix every claimless pass pinned a pod-wide path slot
+    // for ~a full beat and re-acquired immediately: at production n=32
+    // workers and P=32, held permits ≥ P — leftover-only try_widen
+    // permanently failed (width-4 fan-out silently ran at width 1) and
+    // the idle-sleeper gauge inflation corrupted the nxF>P tripwire.
+    // ===================================================================
+
+    /// W9-L — on an IDLE pod (zero claims), during the pacing beat:
+    /// `rio_store_executor_path_slots_in_use` reads 0 and `try_widen`
+    /// SUCCEEDS (the corrupted-tripwire inverse + the starved-feature
+    /// heal, both structural). The loop runs UNSPAWNED inside join! so
+    /// the task-local recorder sees its gauge edges; one snapshot per
+    /// recorder read (hazard ppppp).
+    ///
+    /// W9-M dual face (the scope did not over-shrink), structural: a
+    /// DELIVERED claim takes the admission BEFORE the post-loop drop
+    /// site (`admission.take()` inside the claims loop moves it into
+    /// `execute_job_with_progress`, which DEMANDS it — claim-without-
+    /// slot does not typecheck), so the consume span still holds the
+    /// slot; the drop below releases only never-consumed admissions.
+    #[tokio::test]
+    async fn idle_pass_releases_slot_before_pacing() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        #[derive(Clone, Default)]
+        struct EmptyTransport;
+        impl client::MaterializeTransport for EmptyTransport {
+            async fn list_jobs(
+                &mut self,
+                _req: rio_proto::types::ListMaterializationJobsRequest,
+            ) -> Result<rio_proto::types::ListMaterializationJobsResponse, tonic::Status>
+            {
+                Ok(rio_proto::types::ListMaterializationJobsResponse { jobs: vec![] })
+            }
+            async fn pull(
+                &mut self,
+                _req: rio_proto::types::PullAssignmentRequest,
+            ) -> Result<rio_proto::types::PullAssignmentResponse, tonic::Status> {
+                Ok(rio_proto::types::PullAssignmentResponse { outcome: None })
+            }
+            async fn report(
+                &mut self,
+                _req: rio_proto::types::ReportOutcomeRequest,
+            ) -> Result<(), tonic::Status> {
+                Ok(())
+            }
+            async fn report_progress(
+                &mut self,
+                _req: rio_proto::types::ReportMaterializationProgressRequest,
+            ) -> Result<(), tonic::Status> {
+                Ok(())
+            }
+        }
+
+        let rec = DebuggingRecorder::new();
+        let snap = rec.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&rec);
+
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let substituter =
+            std::sync::Arc::new(crate::substitute::Substituter::new(db.pool.clone(), None));
+        let shutdown = rio_common::signal::Token::new();
+
+        // capacity 1 = the per-worker miniature of the production
+        // n=32/P=32 saturation: ONE idle worker pinning its slot is
+        // exactly the held-permits ≥ P regime for this pool.
+        let pool1 = executor::PathSlotPool::new(1);
+        let pool_probe = pool1.clone();
+        let ctx = executor::ExecutorContext::new(db.pool.clone(), substituter, 1, pool1);
+
+        // Pause AFTER the PG setup (a paused clock breaks the pool's
+        // connect timeouts — the slotless test's established order).
+        tokio::time::pause();
+
+        let shutdown_for_probe = shutdown.clone();
+        let probe = async move {
+            // Let the first pass complete and park in its beat sleep
+            // (jittered ~1s; 500ms lands mid-sleep deterministically
+            // under paused time).
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            // The structural half: the slot is FREE during pacing —
+            // probed through the same leftover-only try-acquire face
+            // try_widen rides (try_admit_claim is the public probe;
+            // both are `try_acquire` leftovers, so success here is
+            // success for the widening tier at this occupancy).
+            let widened = pool_probe.try_admit_claim();
+            assert!(
+                widened.is_some(),
+                "left: leftover-only acquisition fails during the idle beat \
+                 (the claimless pass pins its admission across the pacing \
+                 sleep; try_widen starves at held ≥ P) / right: the idle \
+                 hold is deleted — the slot returns before pacing"
+            );
+            drop(widened);
+
+            // The gauge half: holders-doing-work by construction.
+            let in_use: f64 = snap
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find_map(|(ck, _, _, v)| {
+                    (ck.key().name() == "rio_store_executor_path_slots_in_use").then(|| match v {
+                        DebugValue::Gauge(g) => g.into_inner(),
+                        _ => f64::NAN,
+                    })
+                })
+                .unwrap_or(0.0);
+            assert_eq!(
+                in_use, 0.0,
+                "an idle pod's path-slot occupancy gauge must read 0 during \
+                 the beat (pre-fix: ≈ P — idle sleepers corrupted the nxF>P \
+                 tripwire)"
+            );
+            shutdown_for_probe.cancel();
+        };
+
+        // UNSPAWNED join!: both futures poll in THIS task, so the
+        // loop's gauge edges hit the task-local recorder.
+        tokio::join!(
+            claim_loop(
+                0,
+                crate::config::MaterializationConfig::default(),
+                ctx,
+                EmptyTransport,
+                executor_instance().with_worker(0),
+                shutdown.clone(),
+            ),
+            probe
+        );
     }
 }
