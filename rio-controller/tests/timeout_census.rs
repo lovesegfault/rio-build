@@ -33,6 +33,21 @@
 //!   population is PRODUCTION arms; test code is excluded (behavior
 //!   pin, not an axis).
 
+//!
+//! Sandbox form (the S1/b870121ac embed precedent — hazard (vvvvv) in
+//! its in-crate face): the nix gate runs test binaries WITHOUT the
+//! source tree on disk and with the COMPILE-TIME `env!` manifest path
+//! pointing at a build dir that no longer exists, so a runtime walk is
+//! premise-unreachable exactly where it gates. The census universe
+//! (every `.rs` under `src/`), the R22 corpus plants, and the
+//! committed snapshot are therefore EMBEDDED at compile time
+//! (machine-generated `include_str!` tables — generator: a python walk
+//! emitting sorted (relpath, include_str!) pairs, command recorded in
+//! the owning commit body); `census_universe_matches_live_tree` pins
+//! embed == live tree in BOTH directions on every dev run (the
+//! sandbox skip is eprintln-disclosed, never silent). The regenerator
+//! stays a dev-only live-tree writer.
+
 use std::path::{Path, PathBuf};
 
 /// One detected timeout call site.
@@ -47,29 +62,86 @@ struct Site {
 /// The closed consequence-class vocabulary (D2).
 const CLASSES: [&str; 3] = ["delay", "refusal", "irreversible"];
 
-/// Scan one root for production `tokio::time::timeout` call sites and
-/// their classifications. Pure function of the tree: the committed
-/// snapshot, the corpus reds, and the production run all go through
-/// here.
-fn scan(root: &Path) -> Vec<Site> {
-    let mut files = Vec::new();
-    collect_rs(root, &mut files);
-    files.sort();
+/// EVERY `.rs` under `rio-controller/src`, embedded at compile time
+/// (the S1/b870121ac CENSUS_SOURCES form). Machine-generated — sorted
+/// (relpath, include_str!) pairs; the completeness pin
+/// (`census_universe_matches_live_tree`) forces this table to track
+/// the live tree exactly in both directions.
+#[rustfmt::skip]
+const CENSUS_SOURCES: &[(&str, &str)] = &[
+    ("config.rs", include_str!("../src/config.rs")),
+    ("error.rs", include_str!("../src/error.rs")),
+    ("fixtures.rs", include_str!("../src/fixtures.rs")),
+    ("guard.rs", include_str!("../src/guard.rs")),
+    ("lib.rs", include_str!("../src/lib.rs")),
+    ("main.rs", include_str!("../src/main.rs")),
+    ("observability.rs", include_str!("../src/observability.rs")),
+    ("reconcilers/componentscaler/decide.rs", include_str!("../src/reconcilers/componentscaler/decide.rs")),
+    ("reconcilers/componentscaler/mod.rs", include_str!("../src/reconcilers/componentscaler/mod.rs")),
+    ("reconcilers/fence.rs", include_str!("../src/reconcilers/fence.rs")),
+    ("reconcilers/gc_schedule.rs", include_str!("../src/reconcilers/gc_schedule.rs")),
+    ("reconcilers/mod.rs", include_str!("../src/reconcilers/mod.rs")),
+    ("reconcilers/node_informer.rs", include_str!("../src/reconcilers/node_informer.rs")),
+    ("reconcilers/nodeclaim_pool/consolidate.rs", include_str!("../src/reconcilers/nodeclaim_pool/consolidate.rs")),
+    ("reconcilers/nodeclaim_pool/cover.rs", include_str!("../src/reconcilers/nodeclaim_pool/cover.rs")),
+    ("reconcilers/nodeclaim_pool/evidence.rs", include_str!("../src/reconcilers/nodeclaim_pool/evidence.rs")),
+    ("reconcilers/nodeclaim_pool/ffd.rs", include_str!("../src/reconcilers/nodeclaim_pool/ffd.rs")),
+    ("reconcilers/nodeclaim_pool/health.rs", include_str!("../src/reconcilers/nodeclaim_pool/health.rs")),
+    ("reconcilers/nodeclaim_pool/lifecycle_tests.rs", include_str!("../src/reconcilers/nodeclaim_pool/lifecycle_tests.rs")),
+    ("reconcilers/nodeclaim_pool/mod.rs", include_str!("../src/reconcilers/nodeclaim_pool/mod.rs")),
+    ("reconcilers/nodeclaim_pool/pods.rs", include_str!("../src/reconcilers/nodeclaim_pool/pods.rs")),
+    ("reconcilers/nodeclaim_pool/sketch.rs", include_str!("../src/reconcilers/nodeclaim_pool/sketch.rs")),
+    ("reconcilers/nodeclaim_pool/wedge.rs", include_str!("../src/reconcilers/nodeclaim_pool/wedge.rs")),
+    ("reconcilers/pool/candidate.rs", include_str!("../src/reconcilers/pool/candidate.rs")),
+    ("reconcilers/pool/disruption.rs", include_str!("../src/reconcilers/pool/disruption.rs")),
+    ("reconcilers/pool/job.rs", include_str!("../src/reconcilers/pool/job.rs")),
+    ("reconcilers/pool/jobs.rs", include_str!("../src/reconcilers/pool/jobs.rs")),
+    ("reconcilers/pool/mod.rs", include_str!("../src/reconcilers/pool/mod.rs")),
+    ("reconcilers/pool/pod.rs", include_str!("../src/reconcilers/pool/pod.rs")),
+    ("reconcilers/pool/tests/builders_tests.rs", include_str!("../src/reconcilers/pool/tests/builders_tests.rs")),
+    ("reconcilers/pool/tests/disruption_tests.rs", include_str!("../src/reconcilers/pool/tests/disruption_tests.rs")),
+    ("reconcilers/pool/tests/jobs_tests.rs", include_str!("../src/reconcilers/pool/tests/jobs_tests.rs")),
+    ("reconcilers/pool/tests/mod.rs", include_str!("../src/reconcilers/pool/tests/mod.rs")),
+];
+/// The R22 corpus plants, embedded the same way: (axis,
+/// relpath-within-axis, contents).
+#[rustfmt::skip]
+const CORPUS_SOURCES: &[(&str, &str, &str)] = &[
+    ("alias-red", "aliased.rs", include_str!("timeout_census_corpus/alias-red/aliased.rs")),
+    ("cfgtest-green", "with_tests.rs", include_str!("timeout_census_corpus/cfgtest-green/with_tests.rs")),
+    ("label-red", "mislabeled.rs", include_str!("timeout_census_corpus/label-red/mislabeled.rs")),
+    ("scope-red", "other-crate/src/lib.rs", include_str!("timeout_census_corpus/scope-red/other-crate/src/lib.rs")),
+];
+
+/// The committed census artifact, embedded (same commit, same bytes —
+/// the gate-time compare is never premise-unreachable).
+const SNAPSHOT: &str = include_str!("timeout_census.txt");
+
+/// Scan a set of embedded (relpath, contents) pairs for production
+/// `tokio::time::timeout` call sites and their classifications. Pure
+/// function of the pairs: the committed snapshot, the corpus reds,
+/// and the production run all go through here.
+fn scan_pairs(pairs: &[(&str, &str)]) -> Vec<Site> {
     let mut out = Vec::new();
-    for f in &files {
-        let src = std::fs::read_to_string(f).expect("read source file");
-        let rel = f
-            .strip_prefix(root)
-            .expect("under root")
-            .to_str()
-            .expect("utf8 path")
-            .replace('\\', "/");
-        scan_file(&src, &rel, &mut out);
+    let mut sorted: Vec<&(&str, &str)> = pairs.iter().collect();
+    sorted.sort();
+    for (rel, contents) in sorted {
+        scan_file(contents, rel, &mut out);
     }
     out.sort();
     out
 }
 
+/// One corpus axis as (relpath, contents) pairs.
+fn corpus_pairs(axis: &str) -> Vec<(&'static str, &'static str)> {
+    CORPUS_SOURCES
+        .iter()
+        .filter(|(a, _, _)| *a == axis)
+        .map(|(_, rel, contents)| (*rel, *contents))
+        .collect()
+}
+
+/// Dev-only live-tree walk (the regenerator + completeness pin).
 fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
@@ -197,7 +269,7 @@ const DECLARED_MARKER: &str =
 /// snapshot equality over the production tree.
 #[test]
 fn timeout_census_is_total_classified_and_frozen() {
-    let sites = scan(&crate_src());
+    let sites = scan_pairs(CENSUS_SOURCES);
     assert!(
         !sites.is_empty(),
         "scanner found ZERO timeout sites in src/ — the generator is broken \
@@ -230,8 +302,9 @@ fn timeout_census_is_total_classified_and_frozen() {
          entry. Do not reclassify — escalate via the wave log:\n{irreversible:#?}"
     );
     // Snapshot equality (scan section only; declared rows preserved).
-    let committed = std::fs::read_to_string(snapshot_path())
-        .expect("tests/timeout_census.txt missing — run the regenerator");
+    // The artifact is EMBEDDED (same commit, same bytes) so the
+    // compare runs in the gate sandbox too.
+    let committed = SNAPSHOT;
     let scan_section: String = committed
         .lines()
         .take_while(|l| !l.starts_with(DECLARED_MARKER.trim_end()))
@@ -264,7 +337,27 @@ fn timeout_census_is_total_classified_and_frozen() {
 #[test]
 #[ignore = "regenerator — run explicitly to rewrite tests/timeout_census.txt"]
 fn regenerate_timeout_census() {
-    let sites = scan(&crate_src());
+    // Dev-only: scan the LIVE tree (cargo rebuilds this binary when
+    // any embedded file changes, but a freshly ADDED src file is not
+    // in CENSUS_SOURCES until the table is regenerated — the live
+    // walk keeps the regenerator authoritative; the completeness pin
+    // keeps the table honest).
+    let root = crate_src();
+    let mut files = Vec::new();
+    collect_rs(&root, &mut files);
+    files.sort();
+    let mut sites = Vec::new();
+    for f in &files {
+        let text = std::fs::read_to_string(f).expect("read source file");
+        let rel = f
+            .strip_prefix(&root)
+            .expect("under root")
+            .to_str()
+            .expect("utf8 path")
+            .replace('\\', "/");
+        scan_file(&text, &rel, &mut sites);
+    }
+    sites.sort();
     let path = snapshot_path();
     let declared: String = std::fs::read_to_string(&path)
         .ok()
@@ -290,15 +383,9 @@ fn regenerate_timeout_census() {
 // and the tree itself is clean (asserted above).
 // ---------------------------------------------------------------------------
 
-fn corpus(axis: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/timeout_census_corpus")
-        .join(axis)
-}
-
 #[test]
 fn corpus_alias_red_fires() {
-    let sites = scan(&corpus("alias-red"));
+    let sites = scan_pairs(&corpus_pairs("alias-red"));
     assert_eq!(
         sites.len(),
         1,
@@ -312,7 +399,7 @@ fn corpus_alias_red_fires() {
 
 #[test]
 fn corpus_scope_red_fires() {
-    let sites = scan(&corpus("scope-red"));
+    let sites = scan_pairs(&corpus_pairs("scope-red"));
     assert_eq!(
         sites.len(),
         1,
@@ -327,7 +414,7 @@ fn corpus_scope_red_fires() {
 
 #[test]
 fn corpus_label_red_fires() {
-    let sites = scan(&corpus("label-red"));
+    let sites = scan_pairs(&corpus_pairs("label-red"));
     assert_eq!(sites.len(), 1, "{sites:#?}");
     let class = sites[0].class.as_deref().expect("tagged");
     assert!(
@@ -338,9 +425,74 @@ fn corpus_label_red_fires() {
 
 #[test]
 fn corpus_cfgtest_green_excluded() {
-    let sites = scan(&corpus("cfgtest-green"));
+    let sites = scan_pairs(&corpus_pairs("cfgtest-green"));
     assert!(
         sites.is_empty(),
         "cfg(test) sites are NOT production population: {sites:#?}"
+    );
+}
+
+/// The S1/b870121ac completeness pin: the embedded universe equals the
+/// live tree in BOTH directions — a new/removed/renamed src file or
+/// corpus plant fails this on every dev run until the tables are
+/// regenerated, so the census quantifier domain stays
+/// generator-bounded. In the gate sandbox the live tree is absent by
+/// design; the skip is DISCLOSED, never silent (the dev-tree run of
+/// this same commit carries the pin).
+#[test]
+fn census_universe_matches_live_tree() {
+    let src_root = crate_src();
+    if !src_root.exists() {
+        eprintln!(
+            "src/ not on disk (nix sandbox): universe pinned by the \
+             dev-tree run of this same commit"
+        );
+        return;
+    }
+    let mut live: Vec<String> = Vec::new();
+    let mut files = Vec::new();
+    collect_rs(&src_root, &mut files);
+    for f in files {
+        live.push(
+            f.strip_prefix(&src_root)
+                .expect("under root")
+                .to_str()
+                .expect("utf8 path")
+                .replace('\\', "/"),
+        );
+    }
+    live.sort();
+    let mut embedded: Vec<String> = CENSUS_SOURCES.iter().map(|(f, _)| f.to_string()).collect();
+    embedded.sort();
+    assert_eq!(
+        embedded, live,
+        "census universe drifted from the live tree: regenerate \
+         CENSUS_SOURCES (sorted python walk of src/**.rs) so the \
+         timeout census sees the whole crate in the nix sandbox too"
+    );
+
+    let corpus_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/timeout_census_corpus");
+    let mut live_corpus: Vec<String> = Vec::new();
+    let mut cfiles = Vec::new();
+    collect_rs(&corpus_root, &mut cfiles);
+    for f in cfiles {
+        live_corpus.push(
+            f.strip_prefix(&corpus_root)
+                .expect("under root")
+                .to_str()
+                .expect("utf8 path")
+                .replace('\\', "/"),
+        );
+    }
+    live_corpus.sort();
+    let mut embedded_corpus: Vec<String> = CORPUS_SOURCES
+        .iter()
+        .map(|(a, r, _)| format!("{a}/{r}"))
+        .collect();
+    embedded_corpus.sort();
+    assert_eq!(
+        embedded_corpus, live_corpus,
+        "corpus universe drifted from the live tree: regenerate \
+         CORPUS_SOURCES (sorted python walk of tests/timeout_census_corpus)"
     );
 }

@@ -685,7 +685,7 @@ struct StreakEntry {
 pub struct DeathNote {
     /// Verdict-free deaths recorded for the intent, after this one.
     pub deaths: u32,
-    /// True iff THIS death crossed [`RESPAWN_GIVE_UP_DEATHS`].
+    /// True iff THIS death crossed `RESPAWN_GIVE_UP_DEATHS`.
     pub gave_up_edge: bool,
 }
 
@@ -839,7 +839,7 @@ impl PoolStreaks {
     /// live_056-b: returns the [`DeathNote`] so the caller can mint
     /// the escalation/give-up reap-disposition letters and the
     /// give-up Event AT THE EDGE (`gave_up_edge` is true exactly once
-    /// --- the call that crosses [`RESPAWN_GIVE_UP_DEATHS`]).
+    /// --- the call that crosses `RESPAWN_GIVE_UP_DEATHS`).
     // r[impl ctrl.pool.respawn-backoff+2]
     pub fn note_verdict_free_death(
         &mut self,

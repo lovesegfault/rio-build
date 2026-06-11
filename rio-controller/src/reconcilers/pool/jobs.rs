@@ -2236,11 +2236,9 @@ mod tests {
     /// pair refreshes docs/gen + the helm metric-help surface).
     #[test]
     fn reap_disposition_help_alphabet_is_total() {
-        let src = std::fs::read_to_string(format!(
-            "{}/src/lib.rs",
-            std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets it")
-        ))
-        .expect("read lib.rs");
+        // Embedded at compile time (the b870121ac form) — no runtime
+        // tree dependence, so the pin holds in the gate sandbox too.
+        let src = include_str!("../../lib.rs");
         let start = src
             .find("rio_controller_reap_dispositions_total")
             .expect("describe present in lib.rs");
