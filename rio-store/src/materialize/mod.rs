@@ -1248,17 +1248,21 @@ mod tests {
     /// would mint a claim) with zero pod slot headroom.
     ///
     /// Composition (RE-DERIVED at the S2 rebase per the t0 handoff,
-    /// consuming S2's DONE response): the zero-budget pass seals
-    /// `PassOutcome::Empty` → `Pace::Beat` BY TYPE — the normal idle
-    /// pacing lane, distinct from charge-pinned `Wedged(BudgetPinned)`
-    /// — and can never feed futility backoff (the streak law is
-    /// mint-guarded; a zero-budget pass mints nothing). The
-    /// resume-presentation leg stays unobservable at this seam (the
-    /// loop-local ledger starts empty). S2's disclosed wobble — Empty
-    /// runs the wedge latch's HEAL arm, so a pool-exhausted stretch
-    /// clears a warned budget wedge early (re-arms at threshold) — is
-    /// accepted as recorded; the suppress-arm is NOT taken (client.rs
-    /// is zero-edit for S3).
+    /// consuming S2's DONE response; round-9 WO-S1-5 re-derivation):
+    /// the obligation-free zero-budget pass seals `PassOutcome::Empty`
+    /// → `Pace::Beat` BY TYPE — the normal idle pacing lane, distinct
+    /// from charge-pinned `Wedged(BudgetPinned)` — and can never feed
+    /// futility backoff (the streak law is mint-guarded; a zero-budget
+    /// pass mints nothing). The resume-presentation leg runs on EVERY
+    /// pass, zero-slot ones included, and is OBSERVED at the
+    /// client-seam witness (`zero_slot_pass_presents_resume_answers` —
+    /// the pre-round-9 concession that the leg was "unobservable at
+    /// this seam" is repaired, not re-disclosed: this loop-level test
+    /// keeps the empty-ledger cell, the client test carries the
+    /// obligation-bearing cell). S2's disclosed wobble — Empty runs
+    /// the wedge latch's HEAL arm, so a pool-exhausted stretch clears
+    /// a warned budget wedge early (re-arms at threshold) — is
+    /// accepted as recorded.
     #[tokio::test]
     async fn slotless_pass_lists_nothing_and_claims_nothing() {
         use std::sync::{Arc, Mutex};

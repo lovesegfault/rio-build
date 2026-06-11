@@ -199,7 +199,9 @@ impl IntoIterator for ClaimedSet {
 #[derive(Debug, Clone, Copy)]
 enum PassExit {
     /// The pass ran to the end of its fresh lane (or had zero slots
-    /// to fill — the zero-budget pass seals [`PassOutcome::Empty`]).
+    /// to fill — the zero-budget pass completes AFTER its resume
+    /// presentations: `Settled` on strict shrink, else
+    /// [`PassOutcome::Empty`]).
     Completed,
     /// The honest-beat gate withheld the listing on mint-headroom
     /// exhaustion. Carries the gate's own verdict; the seal maps the
@@ -288,7 +290,8 @@ pub enum PassOutcome {
         /// Descriptors skipped for a live ledger entry.
         skipped: usize,
     },
-    /// Nothing listed (or the pass had zero slots).
+    /// Nothing listed (or the pass had zero slots and its
+    /// presentations — if any — resolved nothing).
     Empty,
     /// A gated exit with zero deliveries and zero settles — the
     /// typed withhold reason inside.
@@ -1668,21 +1671,22 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             return PollPass { claimed, outcome };
         }};
     }
-    if available_slots == 0 {
-        // The ZERO-BUDGET pass (the round-8 executor-slot handoff:
-        // slot-gated passes drive available_slots = 0 through here):
-        // seals [`PassOutcome::Empty`] — the NORMAL idle pacing lane
-        // (one jittered beat), never the futility lane (the latch's
-        // streak law is mint-guarded and a zero-budget pass mints
-        // nothing). Composition note, recorded for the executor
-        // slot: `Empty` runs the wedge latch's heal arm, so a
-        // pool-exhausted stretch clears a warned budget wedge early
-        // — the warn re-arms at threshold on the next gated streak
-        // (bounded observability wobble; the wedge evidence model
-        // keys on gate outcomes and a zero-budget pass never reaches
-        // the gate).
-        finish!(PassExit::Completed);
-    }
+    // Round-9 WO-S1-5 (bug_055) — PER-LANE ADMISSION REQUIREMENTS,
+    // declared on the lanes (T3): a gate added at pass entry cannot
+    // re-withhold a requirement-free lane.
+    //
+    //   resume-presentation:  NO requirement (answer-gathering; at
+    //                         zero slots every presentation is a
+    //                         slot-free confirm probe — probing =
+    //                         claimed.len() >= available_slots);
+    //   listing (the beat):   mint headroom (the honest-beat gate);
+    //   fresh claim:          a path slot (the budget).
+    //
+    // The zero-budget exit therefore sits AFTER the resume loop (the
+    // pre-fix entry exit withheld the lane the honest-beat rule says
+    // MUST never be withheld — store.typ's resume-lane clause — and
+    // an unanswered nonce's scheduler-side attempt aged to a CHARGED
+    // establishment close).
 
     // bug_251: the RESUME pass runs FIRST — unanswered claims from
     // prior passes are existing obligations (the scheduler may hold an
@@ -1804,6 +1808,28 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             break;
         }
     }
+    if available_slots == 0 {
+        // The ZERO-BUDGET pass completes here, AFTER the
+        // requirement-free resume lane ran (the round-8 executor-slot
+        // handoff drives available_slots = 0 through here routinely
+        // in the 4× oversubscribed helm regime). Sealing follows the
+        // landed PassOutcome law: presentations that RESOLVED entries
+        // seal `Settled` (strict shrink — Pace::Now re-presents the
+        // remainder, structurally terminating on the finite ledger);
+        // a presentation-less or resolution-less pass seals
+        // [`PassOutcome::Empty`] — the NORMAL idle pacing lane (one
+        // jittered beat), never the futility lane (the latch's streak
+        // law is mint-guarded and a zero-budget pass mints nothing).
+        // Composition note, recorded for the executor slot: `Empty`
+        // (and `Settled`) run the wedge latch's heal arm, so a
+        // pool-exhausted stretch clears a warned budget wedge early —
+        // the warn re-arms at threshold on the next gated streak
+        // (bounded observability wobble; the wedge evidence model
+        // keys on gate outcomes and a zero-budget pass never reaches
+        // the gate).
+        finish!(PassExit::Completed);
+    }
+
     // bug_385: the listing window is DECOUPLED from the claim budget.
     // With limit == slots, a refused head — raced to another replica,
     // resolved between list and claim, or freshly parked — hides every
@@ -1840,8 +1866,11 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
     // served job into a claim must not list — mint headroom exhausted
     // (delivered claims, the budget pinned by Charged entries, or the
     // ledger at cap: the SAME predicate the claim loop enforces) or a
-    // conversion-futility streak. The RESUME lane above already ran:
-    // presentations are answer-gathering and are never withheld.
+    // conversion-futility streak. The RESUME lane above already ran —
+    // on EVERY pass, zero-slot ones included (the lane-requirements
+    // table at the top of this fn): presentations are answer-gathering
+    // and are never withheld (round-9 WO-S1-5 restored this to the
+    // honest-beat rule's letter).
     let headroom = ledger.fresh_mint_headroom(claimed.len(), available_slots);
     if headroom != MintHeadroom::Available {
         debug!(
@@ -6073,5 +6102,103 @@ mod tests {
             "the probe pass lists once the budget frees and the \
              countdown has expired"
         );
+    }
+
+    // ===================================================================
+    // Round-9 WO-S1-5 (bug_055) — the zero-slot pass presents resume
+    // answers: the resume lane is REQUIREMENT-FREE (the honest-beat
+    // rule's own quantifier: "the resume presentation lane MUST never
+    // be withheld", store.typ) and at zero slots every presentation is
+    // a slot-free confirm probe (probing = 0 >= 0). Pre-fix the
+    // available_slots==0 exit sealed Empty BEFORE the loop, withholding
+    // the lane — an unanswered nonce's scheduler-side attempt aged to a
+    // CHARGED establishment close and pinned the resume ledger.
+    // ===================================================================
+
+    // r[verify store.registration.cancel-survives] is NOT this lane —
+    // the conformance target is the honest-beat rule, re-verified
+    // un-bumped (the rule text already mandates this law; the code was
+    // the violation).
+    /// W9-K — at `available_slots == 0` with a PENDING RESUME
+    /// OBLIGATION (a real charged credential from a lost answer — the
+    /// T2 admissibility rule: the law's quantifier is
+    /// per-pass-with-obligation, so the fixture carries one, not an
+    /// empty ledger), the pass PRESENTS the answer as a confirm probe
+    /// and the answer RESOLVES the entry — the scheduler-side attempt
+    /// settles instead of aging to a charged establishment close. The
+    /// sealed outcome reflects the presentation work per the landed
+    /// PassOutcome law (Settled on strict shrink).
+    #[tokio::test(start_paused = true)]
+    async fn zero_slot_pass_presents_resume_answers() {
+        let d0 = descriptor(55);
+        let mut t = MockTransport::new(
+            vec![Ok(listing(vec![d0.clone()]))],
+            vec![Ok(gone())],
+            vec![],
+        );
+        // Pass 1 (slots=1): the fresh mint's answer is LOST — the
+        // charged credential is the pending obligation.
+        t.hang_next_pulls = 1;
+        let mut ledger = ResumeLedger::default();
+        let mut latch = ListFailureLatch::default();
+        let mut fut = ConversionFutilityLatch::default();
+        let tok = token();
+        let inst = instance("zero-slot-resume-w");
+        let p = poll_and_claim(&mut t, &inst, 1, &mut ledger, &mut latch, &mut fut, &tok).await;
+        assert!(p.is_empty(), "the lost answer delivers nothing");
+        assert_eq!(ledger.len(), 1, "precondition: a live obligation");
+        let pulls_before = t.pull_calls;
+
+        // Pass 2 (slots=0): the slotless pod. The requirement-free
+        // resume lane MUST run.
+        let p = poll_and_claim(&mut t, &inst, 0, &mut ledger, &mut latch, &mut fut, &tok).await;
+        assert!(p.is_empty(), "zero slots can deliver nothing");
+        assert_eq!(
+            t.pull_calls,
+            pulls_before + 1,
+            "left: the obligation was WITHHELD at zero slots (the entry \
+             gate dominated the requirement-free lane; the scheduler-side \
+             attempt ages to a charged establishment close) / right: the \
+             zero-slot pass presents the resume answer"
+        );
+        let req = t.seen_pull_requests.last().expect("a presentation rode");
+        assert!(
+            req.confirm_only,
+            "zero-slot presentations are slot-free confirm PROBES \
+             (probing = claimed.len() >= available_slots = 0 >= 0)"
+        );
+        assert!(
+            !req.claim_nonce.is_empty(),
+            "the presentation carries the persisted nonce (rule-4b)"
+        );
+        assert_eq!(
+            ledger.len(),
+            0,
+            "the Gone answer RESOLVED the obligation — settled, not aged"
+        );
+        assert!(
+            matches!(p.outcome, PassOutcome::Settled { .. }),
+            "presentation work is reflected in the sealed outcome (the \
+             landed law: strict shrink seals Settled); got {:?}",
+            p.outcome
+        );
+    }
+
+    /// The dual cell: a zero-slot pass with NO obligation stays the
+    /// normal idle lane — seals Empty (Pace::Beat by type), zero
+    /// listings, zero pulls (the wedge-heal composition note holds).
+    #[tokio::test(start_paused = true)]
+    async fn zero_slot_pass_without_obligation_seals_empty() {
+        let mut t = MockTransport::new(vec![], vec![], vec![]);
+        let mut ledger = ResumeLedger::default();
+        let mut latch = ListFailureLatch::default();
+        let mut fut = ConversionFutilityLatch::default();
+        let tok = token();
+        let inst = instance("zero-slot-idle-w");
+        let p = poll_and_claim(&mut t, &inst, 0, &mut ledger, &mut latch, &mut fut, &tok).await;
+        assert!(p.is_empty());
+        assert_eq!(t.list_calls, 0, "no listing at zero slots (no headroom)");
+        assert_eq!(t.pull_calls, 0, "no presentations without obligations");
+        assert_eq!(p.outcome, PassOutcome::Empty, "the normal idle pacing lane");
     }
 }
