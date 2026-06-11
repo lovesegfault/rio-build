@@ -32,6 +32,7 @@
     "rio_controller_ddsketch_seed_fallback_total",
     "rio_controller_disruption_drains_total",
     "rio_controller_ephemeral_jobs_reaped_total",
+    "rio_controller_fenced_mutations_refused_total",
     "rio_controller_ffd_placeable_intents",
     "rio_controller_ffd_unplaced_cores",
     "rio_controller_gc_runs_total",
@@ -413,6 +414,11 @@
         "name": "rio_controller_ephemeral_jobs_reaped_total",
         "kind": "counter",
         "help": "Excess Pending ephemeral Jobs deleted (labeled by pool). Non-zero rate = queued dropped after spawn (user cancel, gateway disconnect); zero rate with stuck Pending pods = reap not firing (check RBAC delete on batch/jobs)."
+      },
+      {
+        "name": "rio_controller_fenced_mutations_refused_total",
+        "kind": "counter",
+        "help": "NodeClaim mutations refused at the D4 generation fence (surface=nodeclaim-create|nodeclaim-reap-unhealthy|nodeclaim-reap-idle): the reconcile pass's lease generation was no longer the live one at the apiserver-write seam — a deposed/stalled actor's mutation was stopped. Any increment = a dual-actor window was closed; correlate with lease transitions and rio_controller_runtime_skew_seconds."
       },
       {
         "name": "rio_controller_ffd_placeable_intents",

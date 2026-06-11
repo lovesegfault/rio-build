@@ -111,6 +111,12 @@ pub struct CoverCfg<'a> {
     /// I-205 metal `instance-size` partition list
     /// (`karpenter.metalSizes`).
     pub metal_sizes: &'a [String],
+    /// The reconcile pass's lease generation (D4, the fence module):
+    /// stamped onto every created NodeClaim as the
+    /// `rio.build/controller-generation` label — the object carrier of
+    /// the mutation fence (forensics: WHICH tenure minted this claim;
+    /// a future apiserver-side consumer can validate against it).
+    pub generation: u64,
 }
 
 /// Per-reason cold-start (`hw_class_names=[]`) drop counts from
@@ -653,6 +659,11 @@ pub fn build_nodeclaim(
         (NODEPOOL_LABEL.into(), SHIM_NODEPOOL.into()),
         (role_k.into(), role_v.into()),
         (owner_k.into(), owner_v.into()),
+        // D4 object carrier: the minting tenure's lease generation.
+        (
+            crate::reconcilers::fence::GENERATION_LABEL.into(),
+            cfg.generation.to_string(),
+        ),
     ]);
     let mk_req = |key: &str, op: &str, values: Vec<String>| NodeSelectorRequirementWithMin {
         key: key.into(),
@@ -1687,6 +1698,7 @@ mod tests {
             &hw_ctx("rio-nvme"),
             &CoverCfg {
                 metal_sizes: &metal,
+                generation: 0,
             },
         );
 
@@ -1787,7 +1799,10 @@ mod tests {
             (4, 8 * GI, 50 * GI),
             0.0,
             &hw,
-            &CoverCfg { metal_sizes: &[] },
+            &CoverCfg {
+                metal_sizes: &[],
+                generation: 0,
+            },
         );
         // eta=0 (all-Ready cell) → no annotation.
         assert!(nc.metadata.annotations.is_none());
@@ -1820,6 +1835,7 @@ mod tests {
             &hw_ctx_metal(),
             &CoverCfg {
                 metal_sizes: &metal,
+                generation: 0,
             },
         );
         let size_req = nc
@@ -1856,6 +1872,7 @@ mod tests {
             &hw_ctx("rio-default"),
             &CoverCfg {
                 metal_sizes: &metal,
+                generation: 0,
             },
         );
         assert_eq!(nc_std.spec.taints.len(), 1);
@@ -1881,7 +1898,10 @@ mod tests {
             (4, 8 * GI, 50 * GI),
             0.0,
             &hw_ctx_fetcher(),
-            &CoverCfg { metal_sizes: &[] },
+            &CoverCfg {
+                metal_sizes: &[],
+                generation: 0,
+            },
         );
         // ONLY the fetcher taint — no builder_taint().
         assert_eq!(

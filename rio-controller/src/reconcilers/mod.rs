@@ -11,6 +11,7 @@
 //! diff via server-side apply. Reconciling twice is a no-op.
 
 pub mod componentscaler;
+pub mod fence;
 pub mod gc_schedule;
 pub mod node_informer;
 pub mod nodeclaim_pool;
@@ -87,11 +88,15 @@ pub fn require_namespace<K: kube::Resource<DynamicType = ()>>(obj: &K) -> Result
 /// forge attempt classifications, or arm false ICE marks. All
 /// controller→scheduler
 /// callsites (`Ctx.admin`, `disruption::run`, `node_informer::*`) use
-/// this alias so a single interceptor covers every RPC.
+/// this alias so a single interceptor covers every RPC. The
+/// service-token interceptor rides inside [`fence::GenerationStamp`],
+/// which additionally stamps the live lease generation on every
+/// request (D4 — the scheduler's evidence-Ack plane refuses stale
+/// generations; see the `fence` module doc).
 pub type AdminClient = rio_proto::AdminServiceClient<
     tonic::service::interceptor::InterceptedService<
         tonic::transport::Channel,
-        rio_auth::hmac::ServiceTokenInterceptor,
+        fence::GenerationStamp,
     >,
 >;
 

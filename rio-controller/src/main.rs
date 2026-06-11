@@ -130,10 +130,22 @@ async fn main() -> anyhow::Result<()> {
     // allowlists. r[store.admin.service-gate].
     let service_interceptor =
         rio_auth::hmac::ServiceTokenInterceptor::new(service_signer, "rio-controller");
-    let admin: AdminClient =
-        rio_proto::AdminServiceClient::with_interceptor(admin_ch, service_interceptor.clone())
-            .max_decoding_message_size(rio_common::grpc::max_message_size())
-            .max_encoding_message_size(rio_common::grpc::max_message_size());
+    // The lease-generation atomic, hoisted ABOVE the admin client so
+    // the generation-stamp interceptor (D4, fence module) can read it
+    // on every RPC. 1 is the generation FLOOR (the value the lease
+    // loop's fetch_max can only raise) — also the steady state in
+    // non-K8s mode; pre-acquire RPCs therefore stamp generation 1,
+    // which the scheduler's watermark treats like any other value.
+    let generation = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let admin: AdminClient = rio_proto::AdminServiceClient::with_interceptor(
+        admin_ch,
+        rio_controller::reconcilers::fence::GenerationStamp::new(
+            service_interceptor.clone(),
+            Arc::clone(&generation),
+        ),
+    )
+    .max_decoding_message_size(rio_common::grpc::max_message_size())
+    .max_encoding_message_size(rio_common::grpc::max_message_size());
 
     ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
@@ -331,12 +343,17 @@ async fn main() -> anyhow::Result<()> {
             cfg.nodeclaim_pool.lease_name.clone(),
             cfg.nodeclaim_pool.lease_namespace.clone(),
         );
-        // 1 is the generation FLOOR (the value the lease loop's
-        // fetch_max can only raise), not a base for an increment. The
-        // controller's generation has no readers — its lease is pure
-        // mutual exclusion, there is no fencing token to derive from
-        // it — so the floor is also the steady state in non-K8s mode.
-        let generation = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        // The controller's generation is CONSUMED (D4; the fence
+        // module): the nodeclaim_pool mutation writers (create /
+        // unhealthy-reap delete / consolidate delete) check a per-pass
+        // MutationFence against it, every AdminService RPC stamps it
+        // as request metadata via GenerationStamp (wired above), and
+        // the scheduler's AckSpawnedIntents refuses generations below
+        // its watermark. The consumer census is pinned by the fence
+        // module tests + the scheduler's generation_fence_tests. The
+        // atomic itself is hoisted above the admin-client construction
+        // so the interceptor can read it; LeaderState below shares the
+        // SAME Arc, so acquire/rebound updates reach every stamp.
         let leader = match &lease_cfg {
             Some(lc) => {
                 info!(

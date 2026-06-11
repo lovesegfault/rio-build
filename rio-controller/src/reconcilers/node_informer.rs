@@ -3613,7 +3613,10 @@ mod tests {
             .expect("connect");
         let mut admin = rio_proto::AdminServiceClient::with_interceptor(
             channel,
-            rio_auth::hmac::ServiceTokenInterceptor::new(None, "rio-controller"),
+            crate::reconcilers::fence::GenerationStamp::new(
+                rio_auth::hmac::ServiceTokenInterceptor::new(None, "rio-controller"),
+                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            ),
         );
 
         let dropped = |rec: &DebuggingRecorder, reason: &str| {

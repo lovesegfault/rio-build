@@ -183,6 +183,15 @@ pub fn describe_metrics() {
          rio_controller_runtime_skew_seconds and the captured table in logs."
     );
     describe_counter!(
+        "rio_controller_fenced_mutations_refused_total",
+        "NodeClaim mutations refused at the D4 generation fence \
+         (surface=nodeclaim-create|nodeclaim-reap-unhealthy|nodeclaim-reap-idle): \
+         the reconcile pass's lease generation was no longer the live one at the \
+         apiserver-write seam — a deposed/stalled actor's mutation was stopped. \
+         Any increment = a dual-actor window was closed; correlate with lease \
+         transitions and rio_controller_runtime_skew_seconds."
+    );
+    describe_counter!(
         "rio_controller_spot_interrupt_dropped_total",
         "SpotInterrupted Events whose interrupt sample was NOT appended to the scheduler \
          (labeled by reason: node_gone | no_hw_class | get_error | append_failed). The first \

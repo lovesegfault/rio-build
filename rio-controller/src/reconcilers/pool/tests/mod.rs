@@ -63,7 +63,10 @@ pub(crate) fn test_ctx_with_admin(
         client,
         admin: rio_proto::AdminServiceClient::with_interceptor(
             admin_channel,
-            rio_auth::hmac::ServiceTokenInterceptor::new(None, "rio-controller"),
+            crate::reconcilers::fence::GenerationStamp::new(
+                rio_auth::hmac::ServiceTokenInterceptor::new(None, "rio-controller"),
+                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            ),
         ),
         scheduler: rio_common::config::UpstreamAddrs {
             addr: "http://127.0.0.1:1".into(),

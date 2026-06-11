@@ -471,6 +471,11 @@
       "doc": "ComponentScaler decision logic — pure functions over the [`ComponentScalerSpec`]/[`ComponentScalerStatus`] state machine."
     },
     {
+      "path": "reconcilers/fence.rs",
+      "depth": 1,
+      "doc": "D4: the lease generation, CONSUMED (WO-S3-3, C4 repriced by Q5)."
+    },
+    {
       "path": "reconcilers/gc_schedule.rs",
       "depth": 1,
       "doc": "GC cron reconciler."

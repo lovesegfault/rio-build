@@ -55,6 +55,17 @@ use opentelemetry::propagation::{Extractor, Injector};
 use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+/// Lease-generation fence header on controller→scheduler RPCs (D4).
+/// The controller stamps its current lease generation on every
+/// AdminService request; the scheduler's evidence-Ack plane keeps a
+/// monotonic watermark and refuses anything below it
+/// (`FailedPrecondition`) — a deposed controller's late mutation
+/// cannot land after the live generation has spoken. Shared constant
+/// (never a mirrored literal) per the cross-crate contract rule: the
+/// producer (rio-controller interceptor seam) and the consumer
+/// (rio-scheduler ack validate) both compile against this name.
+pub const CONTROLLER_GENERATION_KEY: &str = "x-rio-controller-generation";
+
 // r[impl obs.trace.w3c-traceparent]
 /// Inject the current span's trace context as W3C `traceparent` header
 /// into outgoing gRPC metadata.

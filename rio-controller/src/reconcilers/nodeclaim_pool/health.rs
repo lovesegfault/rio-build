@@ -353,6 +353,7 @@ pub async fn reap_unhealthy(
     sketches: &CellSketches,
     cfg: &NodeClaimPoolConfig,
     now_secs: f64,
+    pass_fence: &crate::reconcilers::fence::MutationFence,
 ) -> anyhow::Result<ReapOutcome> {
     let dead: HashSet<&str> = dead_nodes.iter().map(String::as_str).collect();
     let to_reap = classify(live, &dead, sketches, cfg, now_secs);
@@ -375,6 +376,10 @@ pub async fn reap_unhealthy(
             dead_reaped += 1;
         }
         let cell = n.cell.clone().expect("classify filtered cell-less");
+        // D4 mutation seam: a deposed pass deletes nothing more.
+        if pass_fence.check("nodeclaim-reap-unhealthy").is_err() {
+            break;
+        }
         match nodeclaims.delete(&n.name, &DeleteParams::default()).await {
             Ok(_) => {
                 debug!(name = %n.name, %cell, reason = reason.as_str(), "reaped unhealthy NodeClaim");

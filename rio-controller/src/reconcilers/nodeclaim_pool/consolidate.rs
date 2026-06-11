@@ -329,6 +329,7 @@ pub async fn reap_idle<F: Fn(&str, Option<&str>, &[String]) -> bool>(
     nodeclaims: &Api<NodeClaim>,
     live: &[LiveNode],
     sketches: &mut CellSketches,
+    pass_fence: &crate::reconcilers::fence::MutationFence,
     inputs: &ReapInputs<'_, F>,
 ) -> anyhow::Result<Vec<String>> {
     let ReapInputs {
@@ -426,6 +427,10 @@ pub async fn reap_idle<F: Fn(&str, Option<&str>, &[String]) -> bool>(
         .set(threshold);
         if idle <= threshold {
             continue;
+        }
+        // D4 mutation seam: a deposed pass deletes nothing more.
+        if pass_fence.check("nodeclaim-reap-idle").is_err() {
+            break;
         }
         match nodeclaims.delete(&n.name, &DeleteParams::default()).await {
             Ok(_) => {

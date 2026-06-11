@@ -295,7 +295,10 @@ struct Lab {
 fn admin_client(ch: tonic::transport::Channel) -> AdminClient {
     rio_proto::AdminServiceClient::with_interceptor(
         ch,
-        rio_auth::hmac::ServiceTokenInterceptor::new(None, "rio-controller"),
+        crate::reconcilers::fence::GenerationStamp::new(
+            rio_auth::hmac::ServiceTokenInterceptor::new(None, "rio-controller"),
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        ),
     )
 }
 

@@ -139,6 +139,16 @@ pub struct AdminServiceImpl {
     /// actor-independent — a wedged actor doesn't block the controller's
     /// 300s `HwClassConfig` refresh.
     cost_table: Arc<parking_lot::RwLock<crate::sla::cost::CostTable>>,
+    /// D4 fence watermark for the controller evidence-Ack plane: the
+    /// highest `x-rio-controller-generation` seen on
+    /// `AckSpawnedIntents`. Monotonic (`fetch_max`); a request below
+    /// it is a deposed controller's late mutation and is refused
+    /// `FailedPrecondition` — see [`Self::ensure_controller_generation`].
+    /// Process-local by design: a scheduler restart re-learns the
+    /// watermark from the live controller's next ack (one unfenced
+    /// window bounded by the first stamped request; the lease itself
+    /// still serializes holders).
+    controller_ack_generation: std::sync::atomic::AtomicU64,
 }
 
 /// merged_bug_001: HELP for the absorb counter, COLOCATED with its
@@ -192,7 +202,38 @@ impl AdminServiceImpl {
             sla_config,
             service_verifier,
             cost_table,
+            controller_ack_generation: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// D4: refuse evidence-Acks from a deposed controller generation.
+    /// The header is stamped by the controller's AdminService
+    /// interceptor (the producer side of
+    /// [`rio_proto::interceptor::CONTROLLER_GENERATION_KEY`]); the
+    /// watermark is monotonic, so after the live generation's first
+    /// ack a stale (or header-less) actor's late mutation cannot land.
+    /// Absent header at watermark 0 is accepted — nothing to be stale
+    /// against (dev/bootstrap face; the controller always stamps, so
+    /// the first production ack arms the fence).
+    fn ensure_controller_generation(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+    ) -> Result<(), Status> {
+        let generation = metadata
+            .get(rio_proto::interceptor::CONTROLLER_GENERATION_KEY)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let prev = self
+            .controller_ack_generation
+            .fetch_max(generation, std::sync::atomic::Ordering::SeqCst);
+        if generation < prev {
+            return Err(Status::failed_precondition(format!(
+                "stale controller generation {generation} (watermark {prev}): \
+                 a newer lease holder has acked; this actor must stand down"
+            )));
+        }
+        Ok(())
     }
 
     /// Actor-dead check. Delegates to the shared
@@ -768,6 +809,10 @@ impl AdminService for AdminServiceImpl {
         // arms the ICE-backoff timer for arbitrary intent_ids → false
         // ICE marks bias hw-band selection.
         self.ensure_service_caller(request.metadata(), &["rio-controller"])?;
+        // D4 generation fence: a deposed controller's late ack is
+        // refused once the live generation has spoken (the dual-actor
+        // stall/restart-overlap window on the evidence plane).
+        self.ensure_controller_generation(request.metadata())?;
         self.ensure_leader()?;
         self.check_actor_alive()?;
         let req = request.into_inner();
@@ -1442,6 +1487,71 @@ impl AdminService for AdminServiceImpl {
             .increment(1);
         }
         Ok(Response::new(()))
+    }
+}
+
+/// W9-AM (scheduler half): the controller-generation fence on the
+/// evidence-Ack plane. Inline so the watermark, its validate, and its
+/// red live beside the handler they gate.
+#[cfg(test)]
+mod generation_fence_tests {
+    use tonic::Request;
+
+    use super::tests::setup_svc_default;
+    use rio_proto::AdminService;
+    use rio_proto::types::AckSpawnedIntentsRequest;
+
+    fn ack_with_gen(generation: Option<u64>) -> Request<AckSpawnedIntentsRequest> {
+        let mut req = Request::new(AckSpawnedIntentsRequest::default());
+        if let Some(g) = generation {
+            req.metadata_mut().insert(
+                "x-rio-controller-generation",
+                g.to_string().parse().expect("ascii header value"),
+            );
+        }
+        req
+    }
+
+    /// A deposed controller's late Ack (stale lease generation) is
+    /// REJECTED while the live generation's proceeds — both
+    /// directions, plus absence-after-stamp (a stale actor cannot
+    /// dodge the fence by dropping the header).
+    #[tokio::test]
+    async fn w9_am_stale_generation_ack_rejected_live_proceeds() {
+        let (svc, _actor, _task, _db) = setup_svc_default().await;
+        // Live generation 6 raises the watermark.
+        svc.ack_spawned_intents(ack_with_gen(Some(6)))
+            .await
+            .expect("live-generation ack");
+        // The deposed actor's late ack (generation 5) must be refused.
+        match svc.ack_spawned_intents(ack_with_gen(Some(5))).await {
+            Err(s) => assert_eq!(s.code(), tonic::Code::FailedPrecondition, "{s:?}"),
+            Ok(_) => panic!(
+                "stale-generation ack ACCEPTED (the no-readers truth: \
+                 nothing consumes the controller generation)"
+            ),
+        }
+        // Same generation again: normal traffic proceeds.
+        svc.ack_spawned_intents(ack_with_gen(Some(6)))
+            .await
+            .expect("same-generation ack");
+        // Absent header after a stamped one: stale by absence.
+        let res = svc.ack_spawned_intents(ack_with_gen(None)).await;
+        match res {
+            Err(s) => assert_eq!(s.code(), tonic::Code::FailedPrecondition, "{s:?}"),
+            Ok(_) => panic!("absent generation after a stamped ack must be refused"),
+        }
+    }
+
+    /// Bootstrap face: before any stamped ack, an unstamped ack is
+    /// accepted (watermark 0 — nothing to be stale AGAINST), so dev
+    /// flows and old fixtures keep working without a bridge knob.
+    #[tokio::test]
+    async fn unstamped_ack_accepted_at_zero_watermark() {
+        let (svc, _actor, _task, _db) = setup_svc_default().await;
+        svc.ack_spawned_intents(ack_with_gen(None))
+            .await
+            .expect("unstamped ack at watermark 0");
     }
 }
 

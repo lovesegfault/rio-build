@@ -1244,6 +1244,13 @@ impl NodeClaimPoolReconciler {
     // r[impl ctrl.nodeclaim.ffd-sim]
     #[instrument(skip(self, now_sys), fields(tick = self.tick_counter))]
     async fn reconcile_once(&mut self, now_sys: std::time::SystemTime) -> anyhow::Result<()> {
+        // D4: one MutationFence per pass — every NodeClaim mutation
+        // seam below consumes it (create / unhealthy reap / idle
+        // consolidate). Minted AFTER the caller's leadership gate; the
+        // guard-domain lease loop keeps LeaderState truthful through
+        // main-domain stalls, so a steal mid-pass flips the verdict at
+        // the next seam check.
+        let pass_fence = crate::reconcilers::fence::MutationFence::mint(&self.leader);
         // ⊥ on scheduler unreachable: warn + count, don't propagate.
         // `admin_call` bounds at ADMIN_RPC_TIMEOUT so a stalled
         // scheduler doesn't wedge the tick.
@@ -1548,6 +1555,7 @@ impl NodeClaimPoolReconciler {
             &self.sketches,
             &self.cfg,
             now,
+            &pass_fence,
         )
         .await?;
         // All reap reasons feed the wedge eviction stash (consumed by
@@ -1587,7 +1595,9 @@ impl NodeClaimPoolReconciler {
         let mut masked: HashSet<Cell> = Self::decode_mask_entries(&intents.ice_masked_cells);
         masked.extend(self.pending_evidence.ice_cells().cloned());
 
-        let cover = self.cover_deficit(&unplaced, &live, &masked).await?;
+        let cover = self
+            .cover_deficit(&unplaced, &live, &masked, &pass_fence)
+            .await?;
         debug!(created = cover.created.len(), "deficit cover");
         self.inflight_created.extend(cover.created.iter().cloned());
         let rejected = cover.rejected;
@@ -1615,6 +1625,7 @@ impl NodeClaimPoolReconciler {
             &self.nodeclaims,
             &live,
             &mut self.sketches,
+            &pass_fence,
             &consolidate::ReapInputs {
                 placeable: &placeable,
                 all_cells: &all_cells,
@@ -1650,6 +1661,9 @@ impl NodeClaimPoolReconciler {
     /// stale set filters nothing. See [`PlaceableGate`] for the full
     /// staleness argument and the lease-loss contrast.
     async fn consolidate_only(&mut self, now_sys: std::time::SystemTime) -> anyhow::Result<()> {
+        // D4: the degraded mode mutates too (idle reap + unhealthy
+        // reap) — same per-pass fence discipline as reconcile_once.
+        let pass_fence = crate::reconcilers::fence::MutationFence::mint(&self.leader);
         debug!(
             consecutive_bot = self.consecutive_bot_ticks,
             "consolidate-only (scheduler unreachable)"
@@ -1684,6 +1698,7 @@ impl NodeClaimPoolReconciler {
             &self.nodeclaims,
             &live,
             &mut self.sketches,
+            &pass_fence,
             &consolidate::ReapInputs {
                 placeable: &[],
                 all_cells: &all_cells,
@@ -1709,9 +1724,16 @@ impl NodeClaimPoolReconciler {
         // "report_unfulfillable needs the scheduler reachable", which
         // conflated DELIVERY being impossible this tick with the
         // EVIDENCE being disposable).
-        let outcome =
-            health::reap_unhealthy(&self.nodeclaims, &live, &[], &self.sketches, &self.cfg, now)
-                .await?;
+        let outcome = health::reap_unhealthy(
+            &self.nodeclaims,
+            &live,
+            &[],
+            &self.sketches,
+            &self.cfg,
+            now,
+            &pass_fence,
+        )
+        .await?;
         let reaped = outcome.reaped_claims;
         self.pending_wedge_evictions.extend(outcome.reaped_nodes);
         self.pending_evidence.buffer_marks(outcome.ice_cells);
@@ -2005,6 +2027,7 @@ impl NodeClaimPoolReconciler {
         unplaced: &[SpawnIntent],
         live: &[ffd::LiveNode],
         ice: &HashSet<Cell>,
+        pass_fence: &crate::reconcilers::fence::MutationFence,
     ) -> anyhow::Result<CoverResult> {
         if unplaced.is_empty() {
             return Ok(CoverResult::default());
@@ -2149,8 +2172,14 @@ impl NodeClaimPoolReconciler {
             };
             let cover_cfg = cover::CoverCfg {
                 metal_sizes: &self.cfg.metal_sizes,
+                generation: pass_fence.generation(),
             };
             for &(c, m, d) in &claims {
+                // D4 mutation seam: a deposed pass mints nothing more
+                // (the next tenure's pass re-derives the deficit).
+                if pass_fence.check("nodeclaim-create").is_err() {
+                    return Ok(CoverResult { created, rejected });
+                }
                 let nc = cover::build_nodeclaim(cell, (c, m, d), min_eta, &hw, &cover_cfg);
                 match self.nodeclaims.create(&PostParams::default(), &nc).await {
                     Ok(out) => {
