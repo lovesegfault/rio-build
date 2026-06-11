@@ -4440,9 +4440,11 @@ fn w10_ak_disposition_consumers_match_exhaustively() {
 /// controller's own Job LIST (the local complete inventory), not the
 /// page. Off-page Jobs reconstruct their echo from the durable cell
 /// stamp (`rio.build/intent-cells`); on-page Jobs send the
-/// full-fidelity page copy; pre-upgrade (unstamped) Jobs degrade to
-/// the bare-id no-arm echo (the priced one-generation residual);
-/// reaped names are excluded; freshly-spawned intents chain.
+/// full-fidelity page copy; pre-upgrade (unstamped) Jobs are SKIPPED
+/// (the priced one-generation residual — under the S2 merged_bug_125
+/// union an empty echo positively DISARMS, so a bare-id row would
+/// wipe the original spawn ack's cells); reaped names are excluded;
+/// freshly-spawned intents chain.
 ///
 /// Pre-fix red (the page-filter form — off-page lane severed):
 ///   assertion failed: off-page pending Job re-acked from the LIST
@@ -4516,11 +4518,13 @@ fn w10_al_re_ack_derives_from_job_list_independent_of_paging() {
         "capacity value rides the In requirement the arm decode reads"
     );
     assert!(by_id.contains_key("onpage"), "on-page re-ack (page copy)");
-    let legacy = by_id["legacy"];
     assert!(
-        legacy.hw_class_names.is_empty() && legacy.node_affinity.is_empty(),
-        "pre-upgrade Job degrades to the bare-id no-arm echo (priced \
-         one-generation residual)"
+        !by_id.contains_key("legacy"),
+        "pre-upgrade (unstamped) off-page Job is SKIPPED — a bare-id \
+         row would decode ArmDecode::Empty and DISARM the cells its \
+         original spawn ack armed (the merged_bug_125 union; the \
+         priced one-generation residual is no-re-ack, the pre-round-10 \
+         status quo)"
     );
     assert!(
         !by_id.contains_key("reapedid"),
@@ -4528,7 +4532,7 @@ fn w10_al_re_ack_derives_from_job_list_independent_of_paging() {
          soundness)"
     );
     assert!(by_id.contains_key("fresh"), "spawned intents chain");
-    assert_eq!(acks.len(), 4, "exactly the four lawful acks");
+    assert_eq!(acks.len(), 3, "exactly the three lawful acks");
 }
 
 // r[verify ctrl.pool.respawn-backoff+2]

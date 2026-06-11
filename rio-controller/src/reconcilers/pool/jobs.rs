@@ -1814,11 +1814,22 @@ fn cells_from_annotation(
 ///   ([`INTENT_CELLS_ANNOTATION`] → the minimal decodable echo; the
 ///   scheduler reads `intent_id` + the `(names, terms)` zip and
 ///   nothing else from `spawned`);
-/// - off-page with NO stamp (pre-upgrade Job) → the bare `intent_id`
-///   (the legacy no-arm echo: `acked_spawned` witness lands, the arm
-///   is `Empty`) — a one deploy-generation residual, PRICED: bounded
-///   by the Job population spawned before this lane shipped, healed
-///   by each such Job's natural terminal/reap cycle.
+/// - off-page with NO stamp (pre-upgrade Job, or an hw-agnostic Job
+///   spawned unstamped) → SKIPPED ENTIRELY (no re-ack row). Round-10
+///   composition note (the S2 merged_bug_125 union): an empty echo is
+///   no longer a passive no-arm — `ArmDecode::Empty` is a POSITIVE
+///   "no cells" assertion that DISARMS a stale `dispatched_cells`
+///   entry, so a bare-id row here would wipe the cells the Job's
+///   ORIGINAL spawn ack armed, every tick, for exactly the population
+///   this lane meant to leave untouched. Skipping is the pre-round-10
+///   status quo for that population — a one deploy-generation
+///   residual, PRICED: bounded by the unstamped-Job population,
+///   healed by each Job's natural terminal/reap cycle, and covered by
+///   the on-page lane whenever the intent is on the page (the
+///   off-page case needs a >page-limit backlog). The hw-agnostic
+///   face is immaterial: such intents never armed cells, so their
+///   skipped re-ack and an Empty echo are both no-ops on the arm
+///   plane (only the `acked_spawned` witness differs — priced).
 ///
 /// Census row (W10-AH): continuity / derives-from-Job-LIST.
 // r[impl ctrl.pool.demand-completeness]
@@ -1849,7 +1860,9 @@ pub(crate) fn assemble_re_acks(
                 return Some((*on_page).clone());
             }
             // Off-page: the Job LIST is the inventory; the stamps are
-            // the echo.
+            // the echo. NO stamp ⇒ SKIP (never a bare-id row: under
+            // the merged_bug_125 law an empty echo positively
+            // disarms — see the lane doc above).
             let intent_id = super::job::job_intent_id(j)?.to_string();
             if intent_id.is_empty() {
                 return None;
@@ -1860,8 +1873,7 @@ pub(crate) fn assemble_re_acks(
                 .and_then(|s| s.template.metadata.as_ref())
                 .and_then(|m| m.annotations.as_ref())
                 .and_then(|a| a.get(INTENT_CELLS_ANNOTATION))
-                .and_then(|v| cells_from_annotation(v))
-                .unwrap_or_default();
+                .and_then(|v| cells_from_annotation(v))?;
             Some(SpawnIntent {
                 intent_id,
                 hw_class_names,
