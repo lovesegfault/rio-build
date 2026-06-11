@@ -1198,45 +1198,40 @@ async fn pull_once<T: MaterializeTransport>(
         // The report leg consumes the SAME authority
         // (`is_fatal_rejection`), so the two lanes structurally
         // cannot re-diverge.
-        BoundedOutcome::Resolved(Err(status))
-            if matches!(
-                rio_proto::refusal::judge_refusal(
-                    rio_proto::refusal::CredentialRegime::PerRequestService,
-                    status.code()
-                ),
-                rio_proto::refusal::RefusalJudgment::DisprovesRequest
-            ) =>
-        {
-            warn!(drv_hash = %drv_hash,
-                  code = ?status.code(), msg = status.message(),
-                  "materialization claim refused with a mint-disproving \
-                   rejection; dropping the claim — no mint can be pending \
-                   behind it");
-            PullAnswer::RejectedDisproving
-        }
-        BoundedOutcome::Resolved(Err(status))
-            if matches!(
-                rio_proto::refusal::judge_refusal(
-                    rio_proto::refusal::CredentialRegime::PerRequestService,
-                    status.code()
-                ),
-                rio_proto::refusal::RefusalJudgment::JudgesPresentation
-            ) =>
-        {
-            warn!(drv_hash = %drv_hash,
-                  code = ?status.code(), msg = status.message(),
-                  "materialization claim refused at the auth layer \
-                   (rotation skew?); the rejection judges the presentation, \
-                   not the mint");
-            PullAnswer::RejectedAuth
-        }
-        BoundedOutcome::Resolved(Err(status)) => {
-            warn!(drv_hash = %drv_hash,
-                  code = ?status.code(), msg = status.message(),
-                  "materialization claim RPC failed; nonce recorded — the next pass \
-                   resumes it directly");
-            PullAnswer::Unanswered
-        }
+        // bug_118: ONE arm, EXHAUSTIVE over the judgment alphabet (no
+        // matches!/guard fold with an implicit catch-all) — a future
+        // `RefusalJudgment` variant is a compile error HERE, forcing
+        // an explicit lane decision instead of landing in silent
+        // retry. Behavior at the current alphabet is byte-identical
+        // to the replaced guard-arm fold.
+        BoundedOutcome::Resolved(Err(status)) => match rio_proto::refusal::judge_refusal(
+            rio_proto::refusal::CredentialRegime::PerRequestService,
+            status.code(),
+        ) {
+            rio_proto::refusal::RefusalJudgment::DisprovesRequest => {
+                warn!(drv_hash = %drv_hash,
+                      code = ?status.code(), msg = status.message(),
+                      "materialization claim refused with a mint-disproving \
+                       rejection; dropping the claim — no mint can be pending \
+                       behind it");
+                PullAnswer::RejectedDisproving
+            }
+            rio_proto::refusal::RefusalJudgment::JudgesPresentation => {
+                warn!(drv_hash = %drv_hash,
+                      code = ?status.code(), msg = status.message(),
+                      "materialization claim refused at the auth layer \
+                       (rotation skew?); the rejection judges the presentation, \
+                       not the mint");
+                PullAnswer::RejectedAuth
+            }
+            rio_proto::refusal::RefusalJudgment::Undecided => {
+                warn!(drv_hash = %drv_hash,
+                      code = ?status.code(), msg = status.message(),
+                      "materialization claim RPC failed; nonce recorded — the next pass \
+                       resumes it directly");
+                PullAnswer::Unanswered
+            }
+        },
     }
 }
 
@@ -2245,15 +2240,19 @@ pub async fn report_until_acked<T: MaterializeTransport>(
 /// it judges one credential presentation under one key observation
 /// (rotation skew), so those refusals ride the budgeted retry arm
 /// like any other undecided failure. The builder's
-/// `is_fatal_rejection` keeps the auth pair under its ATTEMPT-BOUND
-/// executor token, where re-presentation is byte-identical — same
-/// authority, different regime.
+/// `is_fatal_rejection` (runtime/pull.rs) consumes the SAME authority
+/// under its ATTEMPT-BOUND regime, where re-presentation is
+/// byte-identical — pinned by its own agreement census
+/// (`fatal_set_agrees_with_the_authority`), as this one is by the
+/// store census of the same name: same authority, different regime,
+/// both folds rustc-exhaustive (bug_118 — no implicit `_ => false`
+/// for a future judgment variant to hide in).
 fn is_fatal_rejection(code: tonic::Code) -> bool {
     use rio_proto::refusal::{CredentialRegime, RefusalJudgment, judge_refusal};
-    matches!(
-        judge_refusal(CredentialRegime::PerRequestService, code),
-        RefusalJudgment::DisprovesRequest
-    )
+    match judge_refusal(CredentialRegime::PerRequestService, code) {
+        RefusalJudgment::DisprovesRequest => true,
+        RefusalJudgment::JudgesPresentation | RefusalJudgment::Undecided => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3144,6 +3143,53 @@ mod tests {
         );
         assert_eq!(claimed[0].exec_id, "exec-keep");
         assert!(ledger.is_empty(), "the delivered entry stays resolved");
+    }
+
+    // r[verify sec.authz.refusal-adjudication]
+    /// The agreement census, store consumer (bug_118): the report
+    /// leg's fatal set, derived from the authority through the now
+    /// rustc-exhaustive fold, equals the documented hand-coded set on
+    /// EVERY tonic code — cell-by-cell over all 17, expectation table
+    /// hand-transcribed (the independent oracle), never computed from
+    /// the implementation. Builder twin:
+    /// `rio_builder::runtime::pull::tests::fatal_set_agrees_with_the_authority`
+    /// (AttemptBound regime); controller consumer census-pinned by its
+    /// own exhaustive-match test — three consumers, one authority.
+    #[test]
+    fn fatal_set_agrees_with_the_authority() {
+        use tonic::Code;
+        // The per-request-service mint-disproving set, transcribed
+        // from this module's adjudication doc (the auth pair rides
+        // the budgeted retry arm under this regime).
+        let hand_coded = [Code::InvalidArgument, Code::Unimplemented];
+        let all = [
+            Code::Ok,
+            Code::Cancelled,
+            Code::Unknown,
+            Code::InvalidArgument,
+            Code::DeadlineExceeded,
+            Code::NotFound,
+            Code::AlreadyExists,
+            Code::PermissionDenied,
+            Code::ResourceExhausted,
+            Code::FailedPrecondition,
+            Code::Aborted,
+            Code::OutOfRange,
+            Code::Unimplemented,
+            Code::Internal,
+            Code::Unavailable,
+            Code::DataLoss,
+            Code::Unauthenticated,
+        ];
+        assert_eq!(all.len(), 17, "the tonic code census is total");
+        for code in all {
+            assert_eq!(
+                is_fatal_rejection(code),
+                hand_coded.contains(&code),
+                "code {code:?}: the authority-derived fatal set must \
+                 agree with the documented per-request-service set"
+            );
+        }
     }
 
     /// bug_119: an ANSWERED permanent rejection (auth misconfig) is not
