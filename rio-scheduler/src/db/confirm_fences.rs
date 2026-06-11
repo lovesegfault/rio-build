@@ -45,11 +45,41 @@
 
 use super::{SchedulerDb, ServingGeneration};
 
-/// Fence rows older than this are garbage: any straggler pull has
-/// long since timed out (client deadlines are seconds; the actor
-/// mailbox holds nothing for hours). Swept by the attempt-ledger
-/// housekeeping tick's rider ([`SchedulerDb::gc_confirm_fences`]).
-pub(crate) const CONFIRM_FENCE_GC_SECS: f64 = 24.0 * 3600.0;
+/// Slack the fence horizon carries past the credential bound: clock
+/// skew between the mint's `now` and PG's `now()`, plus one
+/// housekeeping sweep cadence — the row must still be present at the
+/// sweep AFTER the last instant its token could verify.
+pub(crate) const CONFIRM_FENCE_SLACK_SECS: u64 = 3600;
+
+/// The fence GC horizon, DERIVED from the credential it screens
+/// (merged_bug_098, R24): a fence row may be deleted only when NO
+/// token it could screen still verifies. `verify`'s only time input
+/// is `expiry_unix`, and post-WO-S2-2 every family mint is clamped
+/// inside the signer to [`rio_auth::hmac::MAX_HMAC_LIFETIME_SECS`] —
+/// so `family max + slack` bounds every present and future
+/// ExecutorClaims lifetime, whatever the deadline/eta expression or
+/// the configured lead time does. The previous 24h literal was
+/// unrelated to the credential: a near-cap token outlived its fence
+/// row by days, and the swept row re-opened `DeliverNew`'s
+/// mint-and-deliver to the held-token replay adversary this module's
+/// threat model exists for (the GC rationale used to argue only
+/// against RPC stragglers — the adversary is the HELD TOKEN, whose
+/// lifetime is the credential's, not a client deadline's).
+///
+/// The compile-time tie below makes the derivation load-bearing:
+/// either lifetime law evolving moves the fence with it or fails the
+/// build. Swept by the attempt-ledger housekeeping tick's rider
+/// ([`SchedulerDb::gc_confirm_fences`]); one row per confirm-exited
+/// pod, so the longer horizon costs rows ∝ 7 days of pod churn.
+pub(crate) const CONFIRM_FENCE_GC_SECS: f64 =
+    (rio_auth::hmac::MAX_HMAC_LIFETIME_SECS + CONFIRM_FENCE_SLACK_SECS) as f64;
+
+// The structural law, stated as its own check (not just the
+// derivation above): the fence outlives every verifying family token.
+const _: () = assert!(
+    CONFIRM_FENCE_GC_SECS >= rio_auth::hmac::MAX_HMAC_LIFETIME_SECS as f64,
+    "the confirm-fence horizon must cover every token the family signer can mint"
+);
 
 /// Proof that THIS pull observed a durable fence row for its token —
 /// either by writing one ([`SchedulerDb::insert_confirm_fence`]) or by

@@ -792,10 +792,12 @@ impl DagActor {
         }
 
         // merged_bug_145: the confirm-fence TTL rider — same cadence,
-        // after the ledger passes. Fences are garbage once any
-        // straggler pull has long since timed out (24h is orders of
-        // magnitude past every client deadline); one row per
-        // confirm-exited pod, so volume tracks pod churn.
+        // after the ledger passes. Fences are garbage only once NO
+        // token they could screen still verifies — the horizon
+        // derives from the credential family's lifetime clamp
+        // (merged_bug_098; see CONFIRM_FENCE_GC_SECS), not from
+        // client deadlines; one row per confirm-exited pod, so
+        // volume tracks pod churn over the credential window.
         match self
             .db
             .gc_confirm_fences(

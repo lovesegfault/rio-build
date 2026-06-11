@@ -400,3 +400,102 @@ async fn fenced_license_write_at_current_generation_mints_the_witness() -> TestR
     );
     Ok(())
 }
+
+// r[verify sched.executor.confirm-fence]
+/// W10-R (merged_bug_098) — proposition: NO verifying executor token
+/// can outlive its fence row, asserted at the MAX-LIFETIME corner
+/// (not the typical case). Pre-fix `CONFIRM_FENCE_GC_SECS` was a 24h
+/// literal unrelated to the credential it screens: an ExecutorClaims
+/// token lives up to `MAX_HMAC_LIFETIME_SECS` (the WO-S2-2 family
+/// clamp — and before that clamp, deadline+eta+300 with NO hard
+/// ceiling on the configured lead time), so a fence row aged past 24h
+/// while its token still verifies left a window where the sweep
+/// deletes the exit-0 license and the straggler's `DeliverNew`
+/// fence-read finds nothing — `mint_and_deliver` opens the
+/// sweep-invisible ghost attempt the fence exists to prevent.
+///
+/// Drive: the production chain (merge → cancel → keyed live pull =
+/// Gone, fence written write-ahead) with the row's `confirmed_at`
+/// aged 25h — inside (OLD 24h horizon, max token lifetime]; the age
+/// parameterizes the SWEEP INPUT (a durable-row fact, not a paused
+/// clock — the claim is the horizon CONSTANT's relation to the token
+/// bound, and the compile-time tie in confirm_fences.rs carries the
+/// law; this test carries the composition). Then the production
+/// sweep at the production constant, a resubmit re-readying the drv,
+/// and the SAME token's straggler pull.
+///
+/// Pre-fix red (verbatim in the owning commit): the sweep deletes the
+/// aged row → the straggler pull is DELIVERED (the ghost mint) and an
+/// attempt row exists. Post-fix: the horizon derives from the family
+/// clamp (fence ≥ every verifying token's lifetime + slack), the row
+/// survives, the straggler screens to Gone, zero attempts.
+#[tokio::test]
+async fn fence_horizon_outlives_every_verifying_token() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let build_a = Uuid::new_v4();
+    let _ev =
+        merge_single_node(&handle, build_a, "fence-horizon", PriorityClass::Scheduled).await?;
+    cancel_build(&handle, build_a).await?;
+
+    // The pod's live pull: Gone — the fence row is the exit-0 license.
+    let gone = keyed_pull(&handle, "fence-horizon", "pod-h").await;
+    assert!(matches!(gone, Ok(PullOutcome::Gone(_))), "got {gone:?}");
+
+    // Age the durable row to 25h — past the OLD 24h literal, well
+    // inside the token's family-clamped lifetime (7d).
+    let aged = sqlx::query(
+        "UPDATE executor_confirm_fences \
+         SET confirmed_at = now() - interval '25 hours' \
+         WHERE executor_token_sha256 = $1",
+    )
+    .bind("tokhash-pod-h-fence-horizon")
+    .execute(&db.pool)
+    .await?
+    .rows_affected();
+    assert_eq!(aged, 1, "the live-Gone fence row exists to age");
+
+    // The production sweep at the production constant (the same call
+    // housekeeping makes).
+    let sched_db = crate::db::SchedulerDb::new(db.pool.clone());
+    sched_db
+        .gc_confirm_fences(crate::db::confirm_fences::CONFIRM_FENCE_GC_SECS, 512)
+        .await?;
+
+    let survives: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM executor_confirm_fences WHERE executor_token_sha256 = $1",
+    )
+    .bind("tokhash-pod-h-fence-horizon")
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        survives, 1,
+        "left (pre-fix): the 24h-literal sweep deleted the fence row while its \
+         token still verifies (lifetime up to the 7d family clamp) — the \
+         exit-0 license is gone but the credential is not / right: the horizon \
+         derives from the credential lifetime; the row outlives every \
+         verifying token"
+    );
+
+    // The ghost-mint composition: resubmit re-readies the drv; the
+    // SAME token's straggler pull must screen to Gone, never mint.
+    let build_b = Uuid::new_v4();
+    let _ev =
+        merge_single_node(&handle, build_b, "fence-horizon", PriorityClass::Scheduled).await?;
+    let straggler = keyed_pull(&handle, "fence-horizon", "pod-h").await;
+    assert!(
+        matches!(straggler, Ok(PullOutcome::Gone(_))),
+        "left (pre-fix): DeliverNew's fence read found nothing and \
+         mint_and_deliver DELIVERED — the sweep-invisible ghost attempt \
+         (charged later as an unreported executor crash) / right: the \
+         surviving fence screens the straggler to Gone; got {straggler:?}"
+    );
+    let assignments: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM assignments a \
+         JOIN derivations d ON d.derivation_id = a.derivation_id \
+         WHERE d.drv_hash = 'fence-horizon'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(assignments, 0, "zero attempts for the fenced token's drv");
+    Ok(())
+}
