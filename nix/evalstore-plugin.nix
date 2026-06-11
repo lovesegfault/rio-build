@@ -88,7 +88,86 @@ let
         mv info.txt $out
       '';
 
+  fixture = ./fixtures/evalstore-parity;
+
+  # Acceptance check (defines M0 done): the same local fixture evaluated
+  # with the pinned nix-cli both stock (local file store) and through the
+  # plugin must produce byte-identical drvPaths. Any rio-nix/nix path
+  # divergence aborts the plugin eval (hard cross-check error), so a
+  # passing run also proves zero cross-check failures.
+  parity =
+    pkgs.runCommand "evalstore-parity"
+      {
+        nativeBuildInputs = [
+          nixCli
+          pkgs.jq
+        ];
+      }
+      ''
+        export HOME=$TMPDIR
+        export NIX_CONF_DIR=$TMPDIR/conf
+        mkdir -p $NIX_CONF_DIR
+        flags="--extra-experimental-features nix-command --option substitute false"
+
+        # Copy the fixture OUT of the store: a source dir already at a
+        # store path would skip copyPathToStore and bypass addToStore.
+        mkdir -p $TMPDIR/work
+        cp -r ${fixture}/. $TMPDIR/work/
+        chmod -R u+w $TMPDIR/work
+
+        echo "== run A: stock nix, local file store"
+        nix $flags --store "local?root=$TMPDIR/stock" \
+          eval --file $TMPDIR/work/fixture.nix paths --json > stock.json
+        jq . stock.json
+
+        echo "== run B: plugin eval store"
+        # --plugin-files is a global flag and must precede the subcommand;
+        # --eval-store belongs to the eval command itself.
+        nix $flags --plugin-files ${pluginSo} \
+          --store "local?root=$TMPDIR/main" \
+          eval --eval-store "rio://?cas=$TMPDIR/cas" \
+          --file $TMPDIR/work/fixture.nix paths --json > rio.json
+        jq . rio.json
+
+        echo "== drvPath parity"
+        diff stock.json rio.json
+
+        echo "== CAS contains the derivations (index + canonical drv JSON blob)"
+        for attr in plain structured; do
+          drv=$(jq -r ".$attr" rio.json)
+          base=''${drv#/nix/store/}
+          test -f "$TMPDIR/cas/index/$base.json" || { echo "missing index entry $base"; exit 1; }
+          blob=$(jq -r .drv_json_blob "$TMPDIR/cas/index/$base.json")
+          test "$blob" != "null" || { echo "no drv json blob for $base"; exit 1; }
+          test -f "$TMPDIR/cas/blobs/''${blob:0:2}/$blob" || { echo "missing drv json blob $blob"; exit 1; }
+          # The blob is nix's derivation JSON for this drv.
+          jq -e .outputs "$TMPDIR/cas/blobs/''${blob:0:2}/$blob" > /dev/null
+        done
+
+        echo "== CAS contains the copied source dir + toFile text path"
+        for attr in source toFile; do
+          p=$(jq -r ".$attr" rio.json)
+          base=''${p#/nix/store/}
+          test -f "$TMPDIR/cas/index/$base.json" || { echo "missing index entry $base"; exit 1; }
+          test -f "$TMPDIR/cas/paths/$base.json" || { echo "missing DAG for $base"; exit 1; }
+        done
+
+        echo "== warm re-eval: CAS dedup means zero new blob writes"
+        RIO_EVALSTORE_STATS=1 nix $flags --plugin-files ${pluginSo} \
+          --store "local?root=$TMPDIR/main" \
+          eval --eval-store "rio://?cas=$TMPDIR/cas" \
+          --file $TMPDIR/work/fixture.nix paths --json > rio2.json 2> stats.txt
+        diff rio.json rio2.json
+        cat stats.txt
+        grep -q "rio-evalstore op stats" stats.txt || { echo "stats dump missing"; exit 1; }
+        if grep -q "blob_write" stats.txt; then
+          echo "warm re-eval wrote new blobs — CAS dedup regressed"
+          exit 1
+        fi
+
+        cp stats.txt $out
+      '';
 in
 {
-  inherit plugin smoke;
+  inherit plugin smoke parity;
 }
