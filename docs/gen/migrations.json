@@ -97,6 +97,7 @@
     "097_executor_confirm_fences",
     "100_gc_collect_last_attempt",
     "101_derivations_status_changed_at",
-    "102_derivations_status_changed_trigger"
+    "102_derivations_status_changed_trigger",
+    "103_gc_holds_and_tombstones"
   ]
 }
