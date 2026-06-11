@@ -184,6 +184,10 @@ pkgs.testers.runNixOSTest {
             " && test ! -e /var/rio/cache/zz/0000.promoting"
         )
 
+    # The client fills through staging/<id>/chunks/ — the subdir only
+    # shares the root's quota project if mountd tagged the root BEFORE
+    # creating chunks/ (PROJINHERIT is not retroactive), so this also
+    # guards the tag-before-mkdir ordering.
     with subtest("staging-quota: kernel stops writes at the project quota"):
         out = machine.succeed(
             client("build1", "fill-staging --build-id b-fill --staging-root /var/rio/staging --give-up-mib 64")

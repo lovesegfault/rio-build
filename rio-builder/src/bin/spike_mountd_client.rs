@@ -751,7 +751,12 @@ fn fill_staging(
 
     let client = MountdClient::connect(socket)?;
     let (quota, _fuse_fd) = client.mount(build_id, RPC_TIMEOUT)?;
-    let path = staging_root.join(build_id).join("fill");
+    // Fill through `chunks/`, not the staging root: the subdirectory
+    // only inherits the root's project id if mountd tagged the root
+    // before creating it (PROJINHERIT is not retroactive). A root-level
+    // fill would pass even when everything under `chunks/` escapes the
+    // quota.
+    let path = staging_root.join(build_id).join("chunks").join("fill");
     let mut f =
         std::fs::File::create(&path).with_context(|| format!("create {}", path.display()))?;
     let block = vec![0x55u8; 1 << 20];
