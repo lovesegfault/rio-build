@@ -572,8 +572,13 @@ behavior-relevant drift, no rule-version drift, so Stage A stands.
   cells — the lease-edge polarity table, the ⊥-streak early-return and
   consolidate-only modes, vanish detection vs the controller's own
   reaps, the recency-gated Registered clears, the reload latch, the
-  placeable-gate producer guarantee, and the global / per-class /
-  per-tick cover budgets over the hw-class config mirror. Four
+  placeable-gate producer guarantee, and the budget-brake cover law
+  over the hw-class config mirror (global + per-class budgets; the
+  deficit-within-budget-mints-fully-in-one-tick leaf
+  `deficitFullyMinted` — round-9 WO-S7-2, the retired
+  per-cell-per-tick cap gone from relation and invariant; residual
+  abstraction carried as the model's MODEL-DIVERGENCE header on the
+  sizing arithmetic). Four
   regimes: base / fault-rpc / fault-lease / fault-karpenter.
 - **Model I — `iceEvidenceAck.qnt`** (bughunt-5 slot 5): the
   cross-component ICE evidence/ack pipeline at two cells — the
@@ -631,7 +636,8 @@ Model N:
 | `reloadLatchRespected` | F4 | HOLDS | HOLDS | HOLDS | HOLDS |
 | `singleEffectiveProvisioner` | F4/I11 | HOLDS | HOLDS | HOLDS | HOLDS |
 | `gateProducerGuarantee` | F2/I6 producer half | HOLDS | HOLDS | HOLDS | HOLDS |
-| `provisioningBudget` | F5/I10 | HOLDS | HOLDS | HOLDS | HOLDS |
+| `provisioningBudget` | F5/I10 (budget-brake form: global + per-class + full-mint) | HOLDS | HOLDS | HOLDS | HOLDS |
+| `deficitFullyMinted` | F5/I10 full-mint leaf (live_049 L1; non-vacuous via `canReachBurstFullMint`) | HOLDS | HOLDS | HOLDS | HOLDS |
 | `coverRespectsMask` | F3 mask-before-cover | HOLDS | HOLDS | HOLDS | HOLDS |
 | `degradedCoverPolarity` | F2 | HOLDS | HOLDS | HOLDS | HOLDS |
 
@@ -1743,6 +1749,7 @@ the models deliberately do not carry.
 | bug_285 (binding snapshot presence) | S + formal | `ackCarriesSnapshot`: falsified as-built (seed 0x9bc8fa9604158290) / HOLD (`nodeclaimLifecycleSnapshot`) + `canReachBindingCleared` |
 | merged_bug_007 (evidence buffer) | S + formal | `iceClearDelivered`: falsified as-built (seed 0xd5a902daa46a0d88) / HOLD (`nodeclaimLifecycleClearBuffer`) + `canReachBufferedClearDelivered` |
 | bug_346 (acquire-epoch token) | S + formal | `idleSpellSurvivesReloadErr`: falsified as-built (seed 0x66dc8b7b1d990952) / HOLD (`nodeclaimLifecycleEpoch`) + `canReachEdgeIdleClear` |
+| merged_bug_003 (model certified the retired cap law) | formal re-target | `deficitFullyMinted` (the budget-brake full-mint leaf): the OLD invariant asserted against the re-targeted (landed-law) relation falsified — `VBudgetPerTick`, seed 0xab699bc811b01d31, 382 ms (the model refuted the tree) / HOLD all 7 full-tick regimes + `canReachBurstFullMint` (the formerly vacuous burst leaf reachable) + the retired-cap twin (`nCalibRetiredCap`: kill-isolated through `VDeficitDeferred`) + the class-clamp twin re-verified (`VBudgetClass` only — the budget conjunct kills); divergence-header grammar minted at the model (`MODEL-DIVERGENCE(`) |
 | bug_363 (interrupt-sample conservation) | S, none-sensible formal | `interrupt_resolution_classifies_every_cell` (the full 6-cell resolution table) — a quint axis would re-state the same finite table with no environment dynamics; recorded none-sensible |
 
 Local sampled HOLD measurements (rust backend, 200 k samples × 40

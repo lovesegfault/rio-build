@@ -76,9 +76,22 @@
 //   - Sketch contents, FFD/cover sizing arithmetic and λ accounting are
 //     out of model; PG is one abstract cell whose load may fail and
 //     whose overwrite-while-stale is the reload-latch violation.
+//     MODEL-DIVERGENCE(law=ctrl.nodeclaim.mint-deficit-proportional; tree=rio-controller/src/reconcilers/nodeclaim_pool/cover.rs:sizing): the model certifies the two-term STRUCTURE (n = min(deficit, budget) in claim units) — NOT the sizing arithmetic (n_pack FFD packing, the budget/chunk integer granularity, the budget<chunk refusal arm); retarget-by: encoding sizing arithmetic (a Stage-D item) or any change to the sizing law itself.
 //   - The per-tick mark dedup (the BTreeSet in report_unfulfillable) is
 //     by construction here (marks are a set); the soundness checks are
 //     about WHICH cells are marked, not how many times.
+//
+// DIVERGENCE-HEADER GRAMMAR (minted round-9 WO-S7-2 — the R23 model
+//   tier, machine-visible; the census-lint tier-2 drift grep consumes
+//   the literal `MODEL-DIVERGENCE(` token): a law the model
+//   deliberately does NOT certify carries, AT the model (and mirrored
+//   at its invariant-map index row), one single-line header of the
+//   exact form
+//     MODEL-DIVERGENCE(law=<rule-or-law id>; tree=<file:anchor>): <what is not certified> — retarget-by: <trigger>
+//   A change touching a header's `law=` id MUST either re-target the
+//   model in the same wave or rewrite the header — a deferral minuted
+//   anywhere else (the merged_bug_003 shape: a census-test comment in
+//   a foreign crate) does not count as a divergence record.
 //
 // ASSUME-GUARANTEE CHECKLISTS
 //   rio-lease (imported, never re-modeled): at most one believer; an
@@ -116,9 +129,13 @@
 //   gateProducerGuarantee the placeable gate is unarmed by the end of
 //                         any tick that observed a pending lease-loss
 //                         flag and is never re-armed by a degraded tick
-//   provisioningBudget    global, per-class and per-cell-per-tick
-//                         budgets hold with terminating claims still
-//                         counted; failed creates consume no budget
+//   provisioningBudget    the budget-brake mint law (live_049 L1):
+//                         global and per-class budgets hold with
+//                         terminating claims still counted; failed
+//                         creates consume no budget; and a deficit
+//                         within budget mints FULLY in one tick
+//                         (deficitFullyMinted — the per-cell-per-tick
+//                         cap is retired from relation AND invariant)
 //   coverRespectsMask     no create lands in a cell ICE-marked this
 //                         tick or already masked
 //   degradedCoverPolarity no create without loaded ceilings; no create
@@ -212,6 +229,7 @@ module nodeclaimLifecycle {
     | EEdgeIdleClear
     | EBufferedClearDelivered
     | EBindingCleared
+    | EBurstFullMint
 
   type Violation =
     | VIdleOverReap
@@ -223,7 +241,7 @@ module nodeclaimLifecycle {
     | VGateProducer
     | VBudgetGlobal
     | VBudgetClass
-    | VBudgetPerTick
+    | VDeficitDeferred
     | VCreateNoCeilings
     | VCreateUnconfigured
     | VCoverMasked
@@ -240,8 +258,6 @@ module nodeclaimLifecycle {
   /// Per-hwClass fleet cap for cellA (cellB has none — global only),
   /// mirroring HwClassConfig::fleet_cap_for == None for absent caps.
   const CLASS_CAP_A: int
-  /// max_node_claims_per_cell_per_tick.
-  const PER_CELL_TICK_CAP: int
   /// BOT_TICKS_BEFORE_CONSOLIDATE_ONLY (5 in the code; 2 here — one
   /// early-return tick, then consolidate-only).
   const BOT_THRESHOLD: int
@@ -347,10 +363,16 @@ module nodeclaimLifecycle {
   val reloadLatchRespected = not(violations.contains(VStaleOverwrite))
   val singleEffectiveProvisioner = not(violations.contains(VStandbyEffect))
   val gateProducerGuarantee = not(violations.contains(VGateProducer))
+  /// The deficit-full-mint leaf, NAMED single-proposition (P7): a
+  /// deficit within budget (and the slot universe) mints fully in one
+  /// tick — the landed live_049 L1 law, satisfiable and asserted
+  /// (round-9 WO-S7-2; pre-retarget the model asserted the RETIRED
+  /// per-cell-per-tick cap here and refuted the tree).
+  val deficitFullyMinted = not(violations.contains(VDeficitDeferred))
   val provisioningBudget =
     not(violations.contains(VBudgetGlobal))
     and not(violations.contains(VBudgetClass))
-    and not(violations.contains(VBudgetPerTick))
+    and deficitFullyMinted
   val coverRespectsMask = not(violations.contains(VCoverMasked))
   val degradedCoverPolarity =
     not(violations.contains(VCreateNoCeilings))
@@ -366,6 +388,7 @@ module nodeclaimLifecycle {
   val canReachCeilingsFailClosed = not(effects.contains(EFailClosedNoCeilings))
   val canReachUnknownCellDrop = not(effects.contains(EUnknownCellDrop))
   val canReachCreate = not(effects.contains(ECreateOk))
+  val canReachBurstFullMint = not(effects.contains(EBurstFullMint))
   val canReachAcquireWithInflight = not(effects.contains(EAcquireWithInflight))
   val canReachDegradedReloadTick = not(effects.contains(EDegradedReloadTick))
   val canReachFreshClearAfterAcquire =
@@ -817,11 +840,18 @@ module nodeclaimLifecycle {
         and not(masked.contains("cellB"))
       // cellA first, then cellB (the rotation is fairness only).
       pure def min2(a: int, b: int): int = if (a < b) a else b
+      // live_049 L1 / round-9 WO-S7-2 (merged_bug_003): the budget-brake
+      // two-term mint law — demand × budget, nothing else. In claim
+      // units (every claim one core, chunk = 1) the production
+      // `n = n_pack.min(budget / chunk)` (cover.rs::sizing) is
+      // n = min(deficit, remaining budget); the retired flat
+      // per-cell-per-tick cap is GONE from the relation exactly as
+      // 2e2ce1a32 removed it from the tree.
       val wantA = if (coverableA)
-          min2(min2(demandA, classRemainingA), min2(globalRemaining, PER_CELL_TICK_CAP))
+          min2(demandA, min2(classRemainingA, globalRemaining))
         else 0
       val wantB = if (coverableB)
-          min2(min2(demandB, globalRemaining - wantA), PER_CELL_TICK_CAP)
+          min2(demandB, globalRemaining - wantA)
         else 0
       val createNA = min2(wantA, freeSlots.size())
       val createNB = min2(wantB, freeSlots.size() - createNA)
@@ -901,7 +931,30 @@ module nodeclaimLifecycle {
         claimsAfter.get(k).phase != CAbsent and claimsAfter.get(k).cell == "cellA").size()
       val vBudgetGlobal = (createdA + createdB > 0) and totalAfter > MAX_FLEET_CORES
       val vBudgetClass = createdA > 0 and cellAAfter > CLASS_CAP_A
-      val vBudgetPerTick = createdA > PER_CELL_TICK_CAP or createdB > PER_CELL_TICK_CAP
+      // The deficit-full-mint law (ctrl.nodeclaim.mint-deficit-
+      // proportional, live_049 L1): on a successful covering tick the
+      // demanded-and-affordable-and-representable deficit mints FULLY
+      // in ONE tick — a smaller create is the retired-cap class (or
+      // any reintroduced pacing term). Post-hoc against the rule, not
+      // the relation's own vals: the bounds are restated from demand,
+      // budget and the free-slot universe. B's budget bound uses
+      // createdA (the actual debit, the controller's
+      // created_this_tick semantics); in this 2-slot universe a
+      // slot-bound A forces slots-for-B to 0, so created-vs-want
+      // debit cannot diverge on the B bound.
+      val vDeficitDeferred =
+        (coverableA and not(createFails)
+          and createdA < min2(min2(demandA, classRemainingA),
+                              min2(globalRemaining, freeSlots.size())))
+        or
+        (coverableB and not(createFails)
+          and createdB < min2(min2(demandB, globalRemaining - createdA),
+                              freeSlots.size() - createdA))
+      // The burst leaf (non-vacuity): one tick mints MORE than the
+      // retired flat cap (1) ever allowed in a cell — the exact
+      // population the pre-retirement model made unreachable
+      // (vacuous burst invariants, merged_bug_003).
+      val burstFullMint = createdA > 1 or createdB > 1
       val vNoCeil = (createdA + createdB > 0) and not(ceilingsKnown)
       val vUnconfigured =
         (createdA > 0 and not(configuredCells.contains("cellA")))
@@ -934,6 +987,7 @@ module nodeclaimLifecycle {
         hadAcquire' = hadAcquire,
         effects' = Set(EPublished)
           .union(if (createdA + createdB > 0) Set(ECreateOk) else Set())
+          .union(if (burstFullMint) Set(EBurstFullMint) else Set())
           .union(if (createAttempted and createFails) Set(ECreateFailed) else Set())
           .union(if (ackOk and marksThisTick.size() > 0) Set(EIceMarkEmitted) else Set())
           .union(if (ackOk and clears.size() > 0) Set(EClearEmitted) else Set())
@@ -956,7 +1010,7 @@ module nodeclaimLifecycle {
           .union(if (lostSamples) Set(VBootSampleLost) else Set())
           .union(if (vBudgetGlobal) Set(VBudgetGlobal) else Set())
           .union(if (vBudgetClass) Set(VBudgetClass) else Set())
-          .union(if (vBudgetPerTick) Set(VBudgetPerTick) else Set())
+          .union(if (vDeficitDeferred) Set(VDeficitDeferred) else Set())
           .union(if (vNoCeil) Set(VCreateNoCeilings) else Set())
           .union(if (vUnconfigured) Set(VCreateUnconfigured) else Set())
           .union(if (vMasked) Set(VCoverMasked) else Set())
@@ -1253,7 +1307,6 @@ module nodeclaimLifecycleBase {
   import nodeclaimLifecycle(
     MAX_FLEET_CORES = 2,
     CLASS_CAP_A = 1,
-    PER_CELL_TICK_CAP = 1,
     BOT_THRESHOLD = 2,
     ENABLE_RPC_FAULT = false,
     ENABLE_LEASE_FAULT = false,
@@ -1277,7 +1330,6 @@ module nodeclaimLifecycleFaultRpc {
   import nodeclaimLifecycle(
     MAX_FLEET_CORES = 2,
     CLASS_CAP_A = 1,
-    PER_CELL_TICK_CAP = 1,
     BOT_THRESHOLD = 2,
     ENABLE_RPC_FAULT = true,
     ENABLE_LEASE_FAULT = false,
@@ -1331,7 +1383,6 @@ module nodeclaimLifecycleFaultLease {
   import nodeclaimLifecycle(
     MAX_FLEET_CORES = 2,
     CLASS_CAP_A = 1,
-    PER_CELL_TICK_CAP = 1,
     BOT_THRESHOLD = 2,
     ENABLE_RPC_FAULT = false,
     ENABLE_LEASE_FAULT = true,
@@ -1354,7 +1405,6 @@ module nodeclaimLifecycleFaultKarpenter {
   import nodeclaimLifecycle(
     MAX_FLEET_CORES = 2,
     CLASS_CAP_A = 1,
-    PER_CELL_TICK_CAP = 1,
     BOT_THRESHOLD = 2,
     ENABLE_RPC_FAULT = false,
     ENABLE_LEASE_FAULT = false,
@@ -1378,7 +1428,6 @@ module nodeclaimLifecycleEpochAsBuilt {
   import nodeclaimLifecycle(
     MAX_FLEET_CORES = 2,
     CLASS_CAP_A = 1,
-    PER_CELL_TICK_CAP = 1,
     BOT_THRESHOLD = 2,
     ENABLE_RPC_FAULT = false,
     ENABLE_LEASE_FAULT = true,
@@ -1402,7 +1451,6 @@ module nodeclaimLifecycleEpoch {
   import nodeclaimLifecycle(
     MAX_FLEET_CORES = 2,
     CLASS_CAP_A = 1,
-    PER_CELL_TICK_CAP = 1,
     BOT_THRESHOLD = 2,
     ENABLE_RPC_FAULT = false,
     ENABLE_LEASE_FAULT = true,
@@ -1425,7 +1473,6 @@ module nodeclaimLifecycleClearBufferAsBuilt {
   import nodeclaimLifecycle(
     MAX_FLEET_CORES = 2,
     CLASS_CAP_A = 1,
-    PER_CELL_TICK_CAP = 1,
     BOT_THRESHOLD = 2,
     ENABLE_RPC_FAULT = true,
     ENABLE_LEASE_FAULT = false,
@@ -1448,7 +1495,6 @@ module nodeclaimLifecycleClearBuffer {
   import nodeclaimLifecycle(
     MAX_FLEET_CORES = 2,
     CLASS_CAP_A = 1,
-    PER_CELL_TICK_CAP = 1,
     BOT_THRESHOLD = 2,
     ENABLE_RPC_FAULT = true,
     ENABLE_LEASE_FAULT = false,
@@ -1473,7 +1519,6 @@ module nodeclaimLifecycleAckLatchAsBuilt {
   import nodeclaimLifecycle(
     MAX_FLEET_CORES = 2,
     CLASS_CAP_A = 1,
-    PER_CELL_TICK_CAP = 1,
     BOT_THRESHOLD = 2,
     ENABLE_RPC_FAULT = true,
     ENABLE_LEASE_FAULT = false,
@@ -1497,7 +1542,6 @@ module nodeclaimLifecycleSnapshotAsBuilt {
   import nodeclaimLifecycle(
     MAX_FLEET_CORES = 2,
     CLASS_CAP_A = 1,
-    PER_CELL_TICK_CAP = 1,
     BOT_THRESHOLD = 2,
     ENABLE_RPC_FAULT = false,
     ENABLE_LEASE_FAULT = false,
@@ -1521,7 +1565,6 @@ module nodeclaimLifecycleSnapshot {
   import nodeclaimLifecycle(
     MAX_FLEET_CORES = 2,
     CLASS_CAP_A = 1,
-    PER_CELL_TICK_CAP = 1,
     BOT_THRESHOLD = 2,
     ENABLE_RPC_FAULT = false,
     ENABLE_LEASE_FAULT = false,

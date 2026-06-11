@@ -4454,8 +4454,14 @@ rec {
 
     # Healthy lifecycle, no faults: create -> register -> busy/idle ->
     # idle-reap with the FFD reservation respected, the per-class clamp
-    # over the config mirror, and the placeable publish.
+    # over the config mirror, and the placeable publish. Round-9
+    # WO-S7-2 (merged_bug_003): the mint relation is the budget-brake
+    # two-term min and deficitFullyMinted asserts the landed
+    # deficit-within-budget-mints-fully-in-ONE-tick law (the retired
+    # per-cell-per-tick cap is gone from relation AND invariant; the
+    # burst regime is non-vacuous via canReachBurstFullMint below).
     # r[verify ctrl.nodeclaim.budget.per-class+3]
+    # r[verify ctrl.nodeclaim.mint-deficit-proportional]
     quint-nodeclaim-lifecycle-base = mkQuintCheck {
       name = "nodeclaim-lifecycle-base";
       # quint-policy P1 exemption (bughunt-2 slot 11; the §5-Q13 census
@@ -4478,6 +4484,7 @@ rec {
         "singleEffectiveProvisioner"
         "gateProducerGuarantee"
         "provisioningBudget"
+        "deficitFullyMinted"
         "coverRespectsMask"
         "degradedCoverPolarity"
       ];
@@ -4513,6 +4520,7 @@ rec {
         "singleEffectiveProvisioner"
         "gateProducerGuarantee"
         "provisioningBudget"
+        "deficitFullyMinted"
         "coverRespectsMask"
         "degradedCoverPolarity"
         "idleReapSafety"
@@ -4552,6 +4560,7 @@ rec {
         "singleEffectiveProvisioner"
         "gateProducerGuarantee"
         "provisioningBudget"
+        "deficitFullyMinted"
         "coverRespectsMask"
         "degradedCoverPolarity"
       ];
@@ -4586,6 +4595,7 @@ rec {
         "singleEffectiveProvisioner"
         "gateProducerGuarantee"
         "provisioningBudget"
+        "deficitFullyMinted"
         "coverRespectsMask"
         "degradedCoverPolarity"
       ];
@@ -4617,6 +4627,17 @@ rec {
       spec = "nodeclaimLifecycle";
       main = "nodeclaimLifecycleBase";
       witness = "canReachCreate";
+    };
+    # Round-9 WO-S7-2: one tick mints MORE than the retired flat cap
+    # ever allowed (created > 1 in a cell) — the burst leaf the
+    # pre-retarget model made unreachable (vacuous burst invariants,
+    # merged_bug_003) is REACHABLE, so deficitFullyMinted is
+    # non-vacuous exactly where the retired law was certified.
+    quint-nodeclaim-witness-burst-full-mint = mkQuintWitnessCheck {
+      name = "nodeclaim-witness-burst-full-mint";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleBase";
+      witness = "canReachBurstFullMint";
     };
     # The per-class budget binds while the global budget still has room.
     quint-nodeclaim-witness-class-budget = mkQuintWitnessCheck {
@@ -4795,6 +4816,21 @@ rec {
       extraSpecs = [ "nodeclaimLifecycle" ];
       step = "calibStep";
       witness = "provisioningBudget";
+    };
+
+    # Round-9 retired-cap twin (merged_bug_003): re-introducing the
+    # flat per-cell-per-tick cap into the mint relation falsifies
+    # deficitFullyMinted through its OWN conjunct (kill isolation:
+    # the budget letters stay quiet — a cap under-mints, never
+    # over-mints). The model re-finds the retired-cap class if any
+    # pacing term creeps back into the relation.
+    quint-ctrl-calib-n-retired-cap = mkQuintWitnessCheck {
+      name = "ctrl-calib-n-retired-cap";
+      spec = "calibration/controller-n-retired-cap";
+      main = "nCalibRetiredCap";
+      extraSpecs = [ "nodeclaimLifecycle" ];
+      step = "calibStep";
+      witness = "deficitFullyMinted";
     };
 
     # ------------------------------------------------------------------
@@ -7286,6 +7322,7 @@ rec {
         "singleEffectiveProvisioner"
         "gateProducerGuarantee"
         "provisioningBudget"
+        "deficitFullyMinted"
         "coverRespectsMask"
         "degradedCoverPolarity"
         "idleSpellSurvivesReloadErr"
@@ -7333,6 +7370,7 @@ rec {
         "singleEffectiveProvisioner"
         "gateProducerGuarantee"
         "provisioningBudget"
+        "deficitFullyMinted"
         "coverRespectsMask"
         "degradedCoverPolarity"
         "iceClearDelivered"
@@ -7394,6 +7432,7 @@ rec {
         "singleEffectiveProvisioner"
         "gateProducerGuarantee"
         "provisioningBudget"
+        "deficitFullyMinted"
         "coverRespectsMask"
         "degradedCoverPolarity"
         "ackCarriesSnapshot"

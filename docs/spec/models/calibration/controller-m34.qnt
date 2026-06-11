@@ -24,7 +24,6 @@ module m34CalibLatchClearOnAttempt {
   import nodeclaimLifecycle(
     MAX_FLEET_CORES = 2,
     CLASS_CAP_A = 1,
-    PER_CELL_TICK_CAP = 1,
     BOT_THRESHOLD = 2,
     ENABLE_RPC_FAULT = false,
     ENABLE_LEASE_FAULT = true,
@@ -97,10 +96,10 @@ module m34CalibLatchClearOnAttempt {
         and not(masked.contains("cellB"))
       pure def min2(a: int, b: int): int = if (a < b) a else b
       val wantA = if (coverableA)
-          min2(min2(demandA, classRemainingA), min2(globalRemaining, PER_CELL_TICK_CAP))
+          min2(demandA, min2(classRemainingA, globalRemaining))
         else 0
       val wantB = if (coverableB)
-          min2(min2(demandB, globalRemaining - wantA), PER_CELL_TICK_CAP)
+          min2(demandB, globalRemaining - wantA)
         else 0
       val createNA = min2(wantA, freeSlots.size())
       val createNB = min2(wantB, freeSlots.size() - createNA)
@@ -145,7 +144,17 @@ module m34CalibLatchClearOnAttempt {
         claimsAfter.get(k).phase != CAbsent and claimsAfter.get(k).cell == "cellA").size()
       val vBudgetGlobal = (createdA + createdB > 0) and totalAfter > MAX_FLEET_CORES
       val vBudgetClass = createdA > 0 and cellAAfter > CLASS_CAP_A
-      val vBudgetPerTick = createdA > PER_CELL_TICK_CAP or createdB > PER_CELL_TICK_CAP
+      // Round-9 WO-S7-2 mirror: the budget-brake deficit-full-mint law
+      // (the retired per-tick cap is gone from relation AND check;
+      // post-hoc against the rule, mirroring the base model).
+      val vDeficitDeferred =
+        (coverableA and not(createFails)
+          and createdA < min2(min2(demandA, classRemainingA),
+                              min2(globalRemaining, freeSlots.size())))
+        or
+        (coverableB and not(createFails)
+          and createdB < min2(min2(demandB, globalRemaining - createdA),
+                              freeSlots.size() - createdA))
       val vNoCeil = (createdA + createdB > 0) and not(ceilingsKnown)
       val vUnconfigured =
         (createdA > 0 and not(configuredCells.contains("cellA")))
@@ -190,7 +199,7 @@ module m34CalibLatchClearOnAttempt {
           .union(if (staleOverwrite) Set(VStaleOverwrite) else Set())
           .union(if (vBudgetGlobal) Set(VBudgetGlobal) else Set())
           .union(if (vBudgetClass) Set(VBudgetClass) else Set())
-          .union(if (vBudgetPerTick) Set(VBudgetPerTick) else Set())
+          .union(if (vDeficitDeferred) Set(VDeficitDeferred) else Set())
           .union(if (vNoCeil) Set(VCreateNoCeilings) else Set())
           .union(if (vUnconfigured) Set(VCreateUnconfigured) else Set())
           .union(if (vMasked) Set(VCoverMasked) else Set())
@@ -250,7 +259,6 @@ module m34CalibNoRecencyGate {
   import nodeclaimLifecycle(
     MAX_FLEET_CORES = 2,
     CLASS_CAP_A = 1,
-    PER_CELL_TICK_CAP = 1,
     BOT_THRESHOLD = 2,
     ENABLE_RPC_FAULT = false,
     ENABLE_LEASE_FAULT = true,
@@ -330,10 +338,10 @@ module m34CalibNoRecencyGate {
         and not(masked.contains("cellB"))
       pure def min2(a: int, b: int): int = if (a < b) a else b
       val wantA = if (coverableA)
-          min2(min2(demandA, classRemainingA), min2(globalRemaining, PER_CELL_TICK_CAP))
+          min2(demandA, min2(classRemainingA, globalRemaining))
         else 0
       val wantB = if (coverableB)
-          min2(min2(demandB, globalRemaining - wantA), PER_CELL_TICK_CAP)
+          min2(demandB, globalRemaining - wantA)
         else 0
       val createNA = min2(wantA, freeSlots.size())
       val createNB = min2(wantB, freeSlots.size() - createNA)
@@ -378,7 +386,17 @@ module m34CalibNoRecencyGate {
         claimsAfter.get(k).phase != CAbsent and claimsAfter.get(k).cell == "cellA").size()
       val vBudgetGlobal = (createdA + createdB > 0) and totalAfter > MAX_FLEET_CORES
       val vBudgetClass = createdA > 0 and cellAAfter > CLASS_CAP_A
-      val vBudgetPerTick = createdA > PER_CELL_TICK_CAP or createdB > PER_CELL_TICK_CAP
+      // Round-9 WO-S7-2 mirror: the budget-brake deficit-full-mint law
+      // (the retired per-tick cap is gone from relation AND check;
+      // post-hoc against the rule, mirroring the base model).
+      val vDeficitDeferred =
+        (coverableA and not(createFails)
+          and createdA < min2(min2(demandA, classRemainingA),
+                              min2(globalRemaining, freeSlots.size())))
+        or
+        (coverableB and not(createFails)
+          and createdB < min2(min2(demandB, globalRemaining - createdA),
+                              freeSlots.size() - createdA))
       val vNoCeil = (createdA + createdB > 0) and not(ceilingsKnown)
       val vUnconfigured =
         (createdA > 0 and not(configuredCells.contains("cellA")))
@@ -428,7 +446,7 @@ module m34CalibNoRecencyGate {
           .union(if (vStaleClear) Set(VStaleClear) else Set())
           .union(if (vBudgetGlobal) Set(VBudgetGlobal) else Set())
           .union(if (vBudgetClass) Set(VBudgetClass) else Set())
-          .union(if (vBudgetPerTick) Set(VBudgetPerTick) else Set())
+          .union(if (vDeficitDeferred) Set(VDeficitDeferred) else Set())
           .union(if (vNoCeil) Set(VCreateNoCeilings) else Set())
           .union(if (vUnconfigured) Set(VCreateUnconfigured) else Set())
           .union(if (vMasked) Set(VCoverMasked) else Set())

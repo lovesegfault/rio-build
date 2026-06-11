@@ -1,172 +1,32 @@
 // -*- mode: Bluespec; -*-
 //
-// Stage-C calibration overrides, family M2: the inflight_created mirror
-// and ICE (vanish) detection — the four-mutator discipline of
-// ctrl.nodeclaim.inflight-conservation. Same extend-and-override pattern
-// as controller-m1.qnt.
+// Round-9 WO-S7-2 falsify twin (merged_bug_003): the RETIRED flat
+// per-cell-per-tick cap re-introduced into the mint relation — the
+// exact pre-live_049 shape the base model itself asserted until this
+// round's re-target. The check is the NEW budget-brake law
+// (deficitFullyMinted / provisioningBudget): a burst deficit within
+// budget (demand 2, budget 2, both slots free) mints only 1 under the
+// cap, so VDeficitDeferred latches — machine-checked evidence that
+// the re-targeted model RE-FINDS the retired-cap class if any pacing
+// term creeps back into the relation, and that the new leaf is not
+// vacuous for it. Kill isolation: the falsification runs through
+// deficitFullyMinted's own conjunct (the budget conjuncts
+// VBudgetGlobal/VBudgetClass stay quiet — the cap under-mints, never
+// over-mints).
 //
 // Run (serially):
-//   quint verify --backend=tlc --main=<module> --step=calibStep \
-//     --invariant=<predicted> docs/spec/models/calibration/controller-m2.qnt
+//   quint run --backend=rust --main=nCalibRetiredCap \
+//     --step=calibStep --invariant=deficitFullyMinted \
+//     docs/spec/models/calibration/controller-n-retired-cap.qnt
 
 // =========================================================================
-// CALIBRATION — pre-08d49c52c, bug_012 half: consolidate_only ran the
-// idle/unhealthy reaps but never pruned inflight_created against the
-// tick's live set, so a claim the controller itself reaped on the
-// consolidate-only path was misread by the next reachable tick's
-// detect_vanished as a Karpenter GC — a spurious ICE mark for the
-// controller's own delete.
-// PREDICTED: iceMarkSoundness falsifies in the fault-rpc alphabet (the
-// regime that can reach consolidate-only mode); the spurious mark is
-// raised by the UNCHANGED as-built full tick after the pre-fix
-// consolidate-only tick left the stale entry behind.
+// CALIBRATION — round-9 retired-cap twin: the as-built tick with ONE
+// change — the mint relation re-gains the flat per-cell-per-tick cap
+// (1, the historical regime value) on both cells.
+// PREDICTED: deficitFullyMinted falsifies (VDeficitDeferred) on the
+// first burst tick (demand 2 within budget 2 mints 1).
 // =========================================================================
-module m2CalibNoConsolidatePrune {
-  import nodeclaimLifecycle(
-    MAX_FLEET_CORES = 2,
-    CLASS_CAP_A = 1,
-    BOT_THRESHOLD = 2,
-    ENABLE_RPC_FAULT = true,
-    ENABLE_LEASE_FAULT = false,
-    ENABLE_KARPENTER_FAULT = false,
-    START_CEILINGS_KNOWN = false,
-    ENABLE_EPOCH_MACHINERY = false,
-    ENABLE_ACQUIRE_EPOCH = false,
-    ENABLE_CLEARBUF_MACHINERY = false,
-    ENABLE_EVIDENCE_BUFFER = false,
-    ENABLE_ACK_LATCH = false,
-    ENABLE_SNAPSHOT_MACHINERY = false,
-    ENABLE_SNAPSHOT_PRESENCE = false
-  ).* from "../nodeclaimLifecycle"
-
-  /// The as-built consolidate-only tick with the inflight_created prune
-  /// removed: reaped claims keep their entry, vanish detection does not
-  /// run, registered/terminating entries are not dropped.
-  action tickConsolidateOnlyNoPruneWith(pgLoadFails: bool): bool = all {
-      isLeader,
-      ENABLE_RPC_FAULT,
-      botStreak + 1 >= BOT_THRESHOLD,
-      val aged = CLAIMS.mapBy(k => ageWallclock(claims.get(k)))
-      val loadOk = reloadPending and not(pgLoadFails)
-      val afterLatch = CLAIMS.mapBy(k =>
-        if (reloadPending)
-          { ...aged.get(k), pIdle: INotTracked,
-            inflightTracked: if (loadOk) false else aged.get(k).inflightTracked }
-        else aged.get(k))
-      val reloadStillPending = reloadPending and not(loadOk)
-      val observed = CLAIMS.mapBy(k => observeIdleToBusy(afterLatch.get(k)))
-      val obsReg = CLAIMS.mapBy(k => observeRegistered(observed.get(k)))
-      val afterObs = CLAIMS.mapBy(k => obsReg.get(k)._1)
-      val staleRecordOnly = CLAIMS.filter(k => obsReg.get(k)._3).size() > 0
-      val lostSamples = CLAIMS.filter(k => obsReg.get(k)._4).size() > 0
-      val stuckReaped = CLAIMS.filter(k =>
-        afterObs.get(k).phase == CInFlight and afterObs.get(k).stuck)
-      // PRE-FIX (08d49c52c): no detect_vanished pass and no prune in
-      // consolidate-only mode.
-      val idleReaped = CLAIMS.filter(k =>
-        val c = afterObs.get(k)
-        c.phase == CRegistered and c.spell != SNotIdle and c.pIdle == ITrackedOld)
-      val overReap = idleReaped.filter(k => afterObs.get(k).spell != SOld).size() > 0
-      val claimsAfter = CLAIMS.mapBy(k =>
-        val c = afterObs.get(k)
-        if (stuckReaped.contains(k) or idleReaped.contains(k))
-          // PRE-FIX: the controller's own reap leaves the inflight entry
-          // in place.
-          { ...c, phase: CTerminating, stuck: false, spell: SNotIdle,
-            busyTickSeen: false, boot: BRecorded, pIdle: INotTracked,
-            ctrlReaped: true }
-        else c)
-      all {
-        claims' = claimsAfter,
-        placeableArmed' = if (losePending) false else placeableArmed,
-        losePending' = false,
-        isLeader' = isLeader,
-        reloadPending' = reloadStillPending,
-        botStreak' = if (botStreak + 1 > BOT_THRESHOLD) BOT_THRESHOLD else botStreak + 1,
-        iceMasked' = iceMasked,
-        configuredCells' = configuredCells,
-        ceilingsKnown' = ceilingsKnown,
-        hadAcquire' = hadAcquire,
-        // C2 vars: constant under the calibration regimes (axes off).
-        edgeClearDone' = edgeClearDone,
-        pendingClear' = pendingClear,
-        schedBinding' = schedBinding,
-        effects' = Set()
-          .union(if (idleReaped.size() > 0) Set(EIdleReap, EConsolidateOnlyReap) else Set())
-          .union(if (stuckReaped.size() > 0) Set(EStuckReap, EConsolidateOnlyReap) else Set())
-          .union(if (staleRecordOnly) Set(EStaleRecordOnly) else Set())
-          .union(if (reloadStillPending) Set(EDegradedReloadTick) else Set())
-          .union(if (reloadPending and CLAIMS.filter(k => claims.get(k).inflightTracked).size() > 0)
-                   Set(EAcquireWithInflight) else Set()),
-        violations' = violations
-          .union(if (overReap) Set(VIdleOverReap) else Set())
-          .union(if (lostSamples) Set(VBootSampleLost) else Set()),
-      }
-  }
-
-  action tickConsolidateOnlyNoPrune = {
-    nondet pgLoadFails = boolChoices(ENABLE_LEASE_FAULT).oneOf()
-    tickConsolidateOnlyNoPruneWith(pgLoadFails)
-  }
-
-  action calibStep = {
-    nondet k = CLAIMS.oneOf()
-    nondet cell = CELLS.oneOf()
-    any {
-      tickFull,
-      tickBotEarly,
-      tickConsolidateOnlyNoPrune,
-      tickStandby,
-      claimRegisters(k),
-      claimGoesBusy(k),
-      claimGoesIdle(k),
-      claimLaunchStuck(k),
-      karpenterGC(k),
-      karpenterTerminationEdge(k),
-      finalizerCompletes(k),
-      iceClears(cell),
-      leaseLose,
-      leaseAcquire,
-      controllerRestarts,
-      ceilingsLoad,
-      configDropsCell(cell),
-      configRestoresCell(cell),
-    }
-  }
-
-  /// Deterministic reproducer: the bug_012 incident shape — an idle claim
-  /// reaped by consolidate-only mode keeps its inflight entry, and the
-  /// first reachable full tick marks its cell as a Karpenter vanish.
-  run m2NoConsolidatePruneRun =
-    init
-      .then(ceilingsLoad)
-      .then(tickFullWith(false, false, false, 1, 0, Set()))
-      .then(claimRegisters("c1"))
-      .then(tickBotEarly)
-      .then(tickConsolidateOnlyNoPruneWith(false))
-      .then(tickConsolidateOnlyNoPruneWith(false))
-      .then(finalizerCompletes("c1"))
-      .then(tickFullWith(false, false, false, 0, 0, Set()))
-      .expect(violations.contains(VSpuriousMark))
-}
-
-// =========================================================================
-// CALIBRATION — pre-08d49c52c, bug_020 half (the r40 KEEP arm):
-// detect_vanished pruned every inflight_created entry on its FIRST
-// appearance in the live LIST, regardless of registered/terminating
-// state. A claim observed in-flight at ~10 s and Karpenter-GC'd at
-// ~13-16 s escaped every detection path — the cell churned unmasked
-// NodeClaims indefinitely. The as-built rule keeps the entry while the
-// claim is still in-flight and prunes only on registration/termination.
-// The harm is a MISSED mark (a completeness property), so the calibration
-// pins the structural conservation half as a module-local invariant:
-//   inflightKeptWhileInFlight — a claim that is present and still
-//   in-flight keeps its inflight_created entry across a tick.
-// PREDICTED: inflightKeptWhileInFlight falsifies under calibStep; the
-// as-built step over the same base alphabet HOLDS it (the baseline run,
-// no --step flag).
-// =========================================================================
-module m2CalibInflightDropOnSight {
+module nCalibRetiredCap {
   import nodeclaimLifecycle(
     MAX_FLEET_CORES = 2,
     CLASS_CAP_A = 1,
@@ -184,18 +44,10 @@ module m2CalibInflightDropOnSight {
     ENABLE_SNAPSHOT_PRESENCE = false
   ).* from "../nodeclaimLifecycle"
 
-  /// The structural conservation property the KEEP arm protects. Scoped
-  /// to the base alphabet: the lease-acquire Ok-arm clear and the
-  /// controller restart legitimately empty the map in the fault-lease
-  /// regime (the documented one-provisioning-round detection loss).
-  val inflightKeptWhileInFlight =
-    CLAIMS.forall(k =>
-      claims.get(k).phase == CInFlight implies claims.get(k).inflightTracked)
-
-  /// The as-built full tick with ONE change: the inflight prune fires for
-  /// every present claim (drop on first sight in live), not only for
-  /// registered/terminating ones.
-  action tickFullDropOnSightWith(
+  /// The as-built full tick with ONE change: the mint relation
+  /// re-gains the retired flat per-cell-per-tick cap (1) on both
+  /// cells — the pre-live_049 shape.
+  action tickFullRetiredCapWith(
     pgLoadFails: bool, ackFails: bool, createFails: bool,
     demandA: int, demandB: int, reservedChoice: Set[ClaimId]
   ): bool = all {
@@ -243,11 +95,13 @@ module m2CalibInflightDropOnSight {
       val coverableB = demandB > 0 and ceilingsKnown and configuredCells.contains("cellB")
         and not(masked.contains("cellB"))
       pure def min2(a: int, b: int): int = if (a < b) a else b
+      // PRE-FIX (the retired relation): the flat cap bounds every
+      // cell's mint at 1 per tick, demand and budget notwithstanding.
       val wantA = if (coverableA)
-          min2(demandA, min2(classRemainingA, globalRemaining))
+          min2(min2(demandA, classRemainingA), min2(globalRemaining, 1))
         else 0
       val wantB = if (coverableB)
-          min2(demandB, globalRemaining - wantA)
+          min2(min2(demandB, globalRemaining - wantA), 1)
         else 0
       val createNA = min2(wantA, freeSlots.size())
       val createNB = min2(wantB, freeSlots.size() - createNA)
@@ -284,9 +138,7 @@ module m2CalibInflightDropOnSight {
           { phase: CInFlight, cell: "cellB", stuck: false, spell: SNotIdle,
             busyTickSeen: false, boot: BRecorded, inflightTracked: true,
             inflightCell: "cellB", pIdle: INotTracked, ctrlReaped: false }
-        // PRE-FIX (08d49c52c bug_020): every entry whose claim appears in
-        // the live LIST is pruned on first sight — in-flight ones too.
-        else if (c.inflightTracked and c.phase != CAbsent)
+        else if (c.inflightTracked and (c.phase == CRegistered or c.phase == CTerminating))
           { ...c, inflightTracked: false }
         else c)
       val totalAfter = CLAIMS.filter(k => claimsAfter.get(k).phase != CAbsent).size()
@@ -294,9 +146,10 @@ module m2CalibInflightDropOnSight {
         claimsAfter.get(k).phase != CAbsent and claimsAfter.get(k).cell == "cellA").size()
       val vBudgetGlobal = (createdA + createdB > 0) and totalAfter > MAX_FLEET_CORES
       val vBudgetClass = createdA > 0 and cellAAfter > CLASS_CAP_A
-      // Round-9 WO-S7-2 mirror: the budget-brake deficit-full-mint law
-      // (the retired per-tick cap is gone from relation AND check;
-      // post-hoc against the rule, mirroring the base model).
+      // Round-9 WO-S7-2: the budget-brake deficit-full-mint CHECK
+      // mirrors the base model — while this module's RELATION above
+      // deliberately re-gains the retired cap, which is exactly what
+      // the check must catch (PREDICTED: VDeficitDeferred).
       val vDeficitDeferred =
         (coverableA and not(createFails)
           and createdA < min2(min2(demandA, classRemainingA),
@@ -357,21 +210,21 @@ module m2CalibInflightDropOnSight {
       }
   }
 
-  action tickFullDropOnSight = {
+  action tickFullRetiredCap = {
     nondet pgLoadFails = boolChoices(ENABLE_LEASE_FAULT).oneOf()
     nondet ackFails = boolChoices(ENABLE_RPC_FAULT).oneOf()
     nondet createFails = boolChoices(ENABLE_RPC_FAULT).oneOf()
     nondet demandA = Set(0, 1, 2).oneOf()
     nondet demandB = Set(0, 1, 2).oneOf()
     nondet reservedChoice = CLAIMS.powerset().oneOf()
-    tickFullDropOnSightWith(pgLoadFails, ackFails, createFails, demandA, demandB, reservedChoice)
+    tickFullRetiredCapWith(pgLoadFails, ackFails, createFails, demandA, demandB, reservedChoice)
   }
 
   action calibStep = {
     nondet k = CLAIMS.oneOf()
     nondet cell = CELLS.oneOf()
     any {
-      tickFullDropOnSight,
+      tickFullRetiredCap,
       tickBotEarly,
       tickConsolidateOnly,
       tickStandby,
