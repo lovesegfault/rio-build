@@ -215,6 +215,21 @@ spec:
             - name: RIO_SUBSTITUTE_STALL_SECS
               value: {{ $s.substituteStallSecs | quote }}
             {{- end }}
+            # D4 budget/limit law: the budget is a first-class chart
+            # value (paired with limits.memory in values.yaml) and the
+            # deployed limit is injected via the downward API, so the
+            # binary's validate() refuses budget + reserve > limit at
+            # boot — an OOM-kill turned into a typed config error.
+            # nix/tests/helm/42-store-memory-identity.sh pins the
+            # rendered pair.
+            - name: RIO_NAR_BUFFER_BUDGET_BYTES
+              value: {{ $s.narBufferBudgetBytes | int64 | quote }}
+            - name: RIO_MEMORY_LIMIT_BYTES
+              valueFrom:
+                resourceFieldRef:
+                  containerName: store
+                  resource: limits.memory
+                  divisor: "1"
             # Materialization executor (PD-D2: spawns iff schedulerAddr
             # is configured — the env below is the spawn condition).
             - name: RIO_MATERIALIZATION__EXECUTOR_CONCURRENCY

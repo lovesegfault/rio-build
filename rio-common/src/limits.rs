@@ -144,6 +144,47 @@ pub const PULL_MODE_TERMINATION_GRACE_SECS: u64 = 45;
 /// invariant is gone.
 pub const MIN_ESTABLISHMENT_REPORT_SLACK_SECS: u64 = 60;
 
+/// Default global NAR buffer budget for the store: `8 × MAX_NAR_SIZE`
+/// (32 GiB) — lets 8 max-size ingests buffer in parallel before the
+/// 9th parks. THE single source for the store binary's
+/// `nar_buffer_budget_bytes` None-default AND the xtask deploy's
+/// memory-limit derivation (D4: the deployed limit is DERIVED as
+/// `budget + STORE_NON_NAR_RESERVE_BYTES`, never hand-picked) — the
+/// two sides consume this one constant so the budget/limit law cannot
+/// drift apart.
+pub const DEFAULT_STORE_NAR_BUDGET_BYTES: u64 = 8 * MAX_NAR_SIZE;
+
+/// Typed non-NAR memory reserve for the store pod (D4): the memory a
+/// store replica needs ON TOP of its NAR buffer budget. The budget/
+/// limit law — enforced at `rio-store` `Config::validate` (boot,
+/// against the downward-API-injected limit) and satisfied by
+/// construction at the xtask deploy set-site (limit := budget +
+/// reserve) — is:
+///
+/// ```text
+/// nar_buffer_budget_bytes + STORE_NON_NAR_RESERVE_BYTES <= limits.memory
+/// ```
+///
+/// Derivation (each term cites its pinning source; the rio-store
+/// test `non_nar_reserve_derivation` asserts the sum against the
+/// cited defaults):
+///
+/// - 2 GiB — chunk read cache (`chunk_cache_capacity_bytes` default;
+///   moka high-watermark, `ChunkCache::DEFAULT_CACHE_CAPACITY_BYTES`);
+/// - 1 GiB — build-log ingest budget (`log_bytes_budget` default;
+///   deliberately disjoint from the NAR budget so the two ingest
+///   planes cannot starve each other);
+/// - 1 GiB — runtime slack: GetPath prefetch windows (`K × CHUNK_MAX`
+///   ≤ 16 MiB per stream), transient chunk-upload buffers
+///   (`chunk_upload_max_concurrent` × chunk size), sqlx pools,
+///   binary + allocator baseline.
+///
+/// VIOLABLE (R17): this is an engineering envelope, not a theorem —
+/// the slack term is a priced estimate. Operators raising the cache
+/// or log budgets must raise the deployed limit by the same delta
+/// (validate() refuses the incoherent combination at boot).
+pub const STORE_NON_NAR_RESERVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,6 +216,29 @@ mod tests {
         let n = 1000u64;
         let charged: u64 = (0..n).map(|_| nar_chunk_charge(1)).sum();
         assert_eq!(charged, n * MIN_NAR_CHUNK_CHARGE as u64);
+    }
+
+    /// The D4 budget/limit law's const face: the reserve is the sum of
+    /// its three documented terms, and the default budget+reserve pair
+    /// is exactly what the xtask deploy derivation renders (36 GiB).
+    /// The per-term sources are rio-store defaults — the rio-store
+    /// test `non_nar_reserve_derivation` binds those; this pins the
+    /// arithmetic where the consts live.
+    #[test]
+    fn store_reserve_terms_sum_and_budget_relation() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(STORE_NON_NAR_RESERVE_BYTES, 2 * GIB + GIB + GIB);
+        assert_eq!(DEFAULT_STORE_NAR_BUDGET_BYTES, 8 * MAX_NAR_SIZE);
+        // The derived deploy limit is a whole number of Gi (k8s
+        // quantity-friendly) — 32 GiB budget + 4 GiB reserve = 36 Gi.
+        assert_eq!(
+            (DEFAULT_STORE_NAR_BUDGET_BYTES + STORE_NON_NAR_RESERVE_BYTES) % GIB,
+            0
+        );
+        assert_eq!(
+            (DEFAULT_STORE_NAR_BUDGET_BYTES + STORE_NON_NAR_RESERVE_BYTES) / GIB,
+            36
+        );
     }
 
     #[test]

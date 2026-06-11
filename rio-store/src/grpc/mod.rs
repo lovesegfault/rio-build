@@ -288,8 +288,13 @@ pub const DEFAULT_CHUNK_PREFETCH_K: usize = 64;
 
 /// Default global NAR buffer budget: 8 × MAX_NAR_SIZE (32 GiB on 64-bit).
 /// `tokio::sync::Semaphore` max permits is `usize::MAX >> 3`; this fits
-/// comfortably on 64-bit.
-const DEFAULT_NAR_BUDGET: usize = (8 * MAX_NAR_SIZE) as usize;
+/// comfortably on 64-bit. Cast of the shared
+/// [`rio_common::limits::DEFAULT_STORE_NAR_BUDGET_BYTES`] — the same
+/// constant the xtask deploy derives the memory limit from (D4:
+/// `limit := budget + STORE_NON_NAR_RESERVE_BYTES`), so the binary
+/// default and the deployed limit cannot drift apart.
+pub(crate) const DEFAULT_NAR_BUDGET: usize =
+    rio_common::limits::DEFAULT_STORE_NAR_BUDGET_BYTES as usize;
 
 // E-2(ii) backstop (live_047/R-C): the None-default budget admits one
 // whole-NAR substitution reservation; the config-plane premise is the

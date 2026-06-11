@@ -80,6 +80,17 @@ pub struct Config {
     /// was a wedge, not a tuning). Raise it if you have >8 concurrent
     /// max-size ingests and RAM to match.
     pub nar_buffer_budget_bytes: Option<u64>,
+    /// The pod's deployed memory limit in bytes, injected by the helm
+    /// chart via the downward API (`resourceFieldRef: limits.memory`,
+    /// divisor 1). None = no deployed limit known (bare binary, dev) —
+    /// the budget/limit law is then not checkable and is skipped.
+    /// When set, `validate()` enforces the D4 law: the effective NAR
+    /// buffer budget plus the typed non-NAR reserve
+    /// ([`rio_common::limits::STORE_NON_NAR_RESERVE_BYTES`]) must fit
+    /// inside this limit — a pod whose semaphore admits more NAR bytes
+    /// than its cgroup allows is an OOM-kill, not backpressure. Env:
+    /// `RIO_MEMORY_LIMIT_BYTES`.
+    pub memory_limit_bytes: Option<u64>,
     /// ed25519 narinfo signing key path (Nix secret-key format:
     /// `name:base64-seed`). None = signing disabled (paths stored
     /// without our signature; still serveable, just unverified). The
@@ -271,6 +282,7 @@ impl Default for Config {
             // but the config_defaults_are_stable test catches drift.
             chunk_cache_capacity_bytes: 2 * 1024 * 1024 * 1024,
             nar_buffer_budget_bytes: None,
+            memory_limit_bytes: None,
             signing_key_path: None,
             hmac_key_path: None,
             jwt: rio_common::config::JwtConfig::default(),
@@ -457,6 +469,30 @@ impl rio_common::config::ValidateConfig for Config {
              32 GiB default — there is no 'unlimited' sentinel",
             rio_common::limits::MAX_NAR_SIZE
         );
+        // D4 (the budget/limit identity becomes a derived law): when
+        // the deployed memory limit is visible (downward API), the NAR
+        // budget plus the typed non-NAR reserve must fit inside it. A
+        // semaphore that admits more NAR bytes than the cgroup allows
+        // turns "park at the budget" into an OOM-kill — the shipped
+        // identity (budget == limit exactly, reserve zero) was exactly
+        // that config. The xtask deploy satisfies this by construction
+        // (limit := budget + reserve, one derivation site); this arm is
+        // defense at boot for every non-xtask deployment.
+        if let Some(limit) = self.memory_limit_bytes {
+            let budget = self
+                .nar_buffer_budget_bytes
+                .unwrap_or(rio_common::limits::DEFAULT_STORE_NAR_BUDGET_BYTES);
+            let reserve = rio_common::limits::STORE_NON_NAR_RESERVE_BYTES;
+            anyhow::ensure!(
+                budget.saturating_add(reserve) <= limit,
+                "nar_buffer_budget_bytes ({budget}) + the non-NAR reserve \
+                 ({reserve}, rio_common::limits::STORE_NON_NAR_RESERVE_BYTES) \
+                 exceeds the deployed memory limit ({limit}): the budget would \
+                 admit NAR bytes the cgroup cannot host (OOM-kill, not \
+                 backpressure). Raise limits.memory to >= budget + reserve, or \
+                 lower RIO_NAR_BUFFER_BUDGET_BYTES (floor: MAX_NAR_SIZE)"
+            );
+        }
         // 0 → PgPoolOptions max_connections(0) → PoolTimedOut after 30s
         // with a misleading message.
         anyhow::ensure!(
@@ -736,6 +772,73 @@ mod tests {
         assert!(
             err.contains("chunk_upload_max_concurrent"),
             "error names the field: {err}"
+        );
+    }
+
+    /// W9-BF (D4, bughunt-9): the budget/limit law — budget + reserve
+    /// must fit inside the deployed limit. The RED face is the SHIPPED
+    /// truth pinned verbatim: deploy.rs set `limits.memory = "32Gi"`
+    /// while the binary default budget is 8 × MAX_NAR_SIZE = 32 GiB —
+    /// budget == limit EXACTLY, reserve zero. Under the law that
+    /// identity REFUSES at boot with the typed error (pre-fix this
+    /// test was red: validate() had no memory_limit arm and accepted
+    /// the identity).
+    #[test]
+    fn validate_refuses_the_shipped_budget_equals_limit_identity() {
+        let cfg = Config {
+            database_url: "postgres://x".into(),
+            // The shipped pair: default budget (None → 32 GiB) and the
+            // old deploy.rs "32Gi" literal (32 × 2^30 bytes).
+            memory_limit_bytes: Some(32 * 1024 * 1024 * 1024),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("non-NAR reserve") && err.contains("memory limit"),
+            "the refusal names the law, not a generic failure: {err}"
+        );
+    }
+
+    /// The law's green face: the xtask-derived pair (limit = budget +
+    /// reserve) validates, exactly at the boundary and above it; and
+    /// with no deployed limit visible (bare binary, dev) the arm is
+    /// skipped entirely.
+    #[test]
+    fn validate_accepts_derived_limit_and_skips_when_unknown() {
+        let budget = rio_common::limits::DEFAULT_STORE_NAR_BUDGET_BYTES;
+        let reserve = rio_common::limits::STORE_NON_NAR_RESERVE_BYTES;
+        let at_boundary = Config {
+            database_url: "postgres://x".into(),
+            memory_limit_bytes: Some(budget + reserve),
+            ..Default::default()
+        };
+        at_boundary
+            .validate()
+            .expect("budget + reserve == limit is lawful (<=)");
+        let no_limit = Config {
+            database_url: "postgres://x".into(),
+            memory_limit_bytes: None,
+            ..Default::default()
+        };
+        no_limit.validate().expect("no visible limit: arm skipped");
+    }
+
+    /// Binds the reserve's documented derivation terms to the live
+    /// defaults they cite (the rio-common const doc names these; this
+    /// test makes the citation load-bearing): 2 GiB chunk cache +
+    /// 1 GiB log ingest budget + 1 GiB runtime slack.
+    #[test]
+    fn non_nar_reserve_derivation() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let d = Config::default();
+        let cache_term = d.chunk_cache_capacity_bytes; // 2 GiB default
+        let log_term = d.log_bytes_budget; // 1 GiB default
+        let slack_term = GIB; // runtime slack (priced estimate, R17)
+        assert_eq!(
+            rio_common::limits::STORE_NON_NAR_RESERVE_BYTES,
+            cache_term + log_term + slack_term,
+            "the reserve's derivation terms drifted from the defaults \
+             they cite — update the const AND its doc together"
         );
     }
 

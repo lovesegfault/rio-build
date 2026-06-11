@@ -51,6 +51,16 @@
         "minimum": 0,
         "default": null
       },
+      "memory_limit_bytes": {
+        "description": "The pod's deployed memory limit in bytes, injected by the helm\nchart via the downward API (`resourceFieldRef: limits.memory`,\ndivisor 1). None = no deployed limit known (bare binary, dev) —\nthe budget/limit law is then not checkable and is skipped.\nWhen set, `validate()` enforces the D4 law: the effective NAR\nbuffer budget plus the typed non-NAR reserve\n([`rio_common::limits::STORE_NON_NAR_RESERVE_BYTES`]) must fit\ninside this limit — a pod whose semaphore admits more NAR bytes\nthan its cgroup allows is an OOM-kill, not backpressure. Env:\n`RIO_MEMORY_LIMIT_BYTES`.",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "uint64",
+        "minimum": 0,
+        "default": null
+      },
       "signing_key_path": {
         "description": "ed25519 narinfo signing key path (Nix secret-key format:\n`name:base64-seed`). None = signing disabled (paths stored\nwithout our signature; still serveable, just unverified). The\nkey file should be mode 0600 and NOT in git.",
         "type": [
@@ -343,6 +353,7 @@
     },
     "chunk_cache_capacity_bytes": 2147483648,
     "nar_buffer_budget_bytes": null,
+    "memory_limit_bytes": null,
     "signing_key_path": null,
     "hmac_key_path": null,
     "jwt": {

@@ -396,6 +396,12 @@
         "description": "Global NAR buffer budget in bytes — total permits across ALL concurrent NAR ingests, shared by PutPath (per-chunk charges) and upstream substitution (one whole-NAR reservation per leg, live_047/R-C)."
       },
       {
+        "key": "memory_limit_bytes",
+        "type": "integer",
+        "default": "",
+        "description": "The pod's deployed memory limit in bytes, injected by the helm chart via the downward API (`resourceFieldRef: limits.memory`, divisor 1)."
+      },
+      {
         "key": "signing_key_path",
         "type": "string",
         "default": "",

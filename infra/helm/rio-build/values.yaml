@@ -480,11 +480,26 @@ store:
     # The scheduler ExecutorService address — the store→scheduler edge
     # the store-egress netpol allows (port 9001).
     schedulerAddr: rio-scheduler.rio-system:9001
+  # Global NAR buffer budget (bytes) — RIO_NAR_BUFFER_BUDGET_BYTES.
+  # D4 law (enforced by the binary's validate() against the
+  # downward-API memory limit): budget + non-NAR reserve (4 GiB,
+  # rio_common::limits::STORE_NON_NAR_RESERVE_BYTES — chunk cache 2 GiB
+  # + log ingest 1 GiB + runtime slack 1 GiB) <= limits.memory.
+  # Chart default: the MAX_NAR_SIZE floor (4 GiB — one whole-NAR
+  # reservation; validate() rejects anything lower), paired with the
+  # 8Gi limit below at exactly budget + reserve. EKS deploys override
+  # BOTH from one derivation site (xtask deploy: budget 32 GiB,
+  # limit 36Gi) — never hand-tune the pair apart.
+  narBufferBudgetBytes: 4294967296
   resources:
-    # NAR uploads buffer up to one chunk (4MB) per concurrent stream.
-    # 10 × 4MB = 40MB working set + ChunkCache (default 2GB). 4Gi is headroom.
+    # Requests stay small so VM-test k3s (2-node QEMU) can schedule;
+    # EKS gets real sizing from xtask deploy. The LIMIT is the D4 pair
+    # of narBufferBudgetBytes above: 4 GiB budget + 4 GiB reserve =
+    # 8Gi (limits don't reserve node memory, so this schedules
+    # anywhere requests fit). nix/tests/helm/42-store-memory-identity.sh
+    # pins the rendered pair to the law.
     requests: {cpu: 500m, memory: 1Gi}
-    limits: {memory: 4Gi}
+    limits: {memory: 8Gi}
 
 # ──────────────────────────────────────────────────────────────────────────
 # rio-scheduler

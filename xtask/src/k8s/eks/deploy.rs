@@ -409,7 +409,24 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
                 STORE_CPU_REQUEST.to_string(),
             )
             .set("store.resources.requests.memory", "8Gi")
-            .set("store.resources.limits.memory", "32Gi")
+            // D4: the store memory limit is DERIVED, never hand-picked
+            // — limit := NAR budget + the typed non-NAR reserve
+            // (rio_common::limits; the binary's validate() enforces
+            // the same inequality at boot against the downward-API
+            // limit). The old "32Gi" literal made limit == budget
+            // EXACTLY (reserve zero): the semaphore admitted 32 GiB of
+            // NAR bytes into a cgroup that OOM-kills at 32 GiB. The
+            // budget is set explicitly (not left to the binary
+            // default) so the rendered chart states the pair the law
+            // was derived from.
+            .set(
+                "store.narBufferBudgetBytes",
+                rio_common::limits::DEFAULT_STORE_NAR_BUDGET_BYTES.to_string(),
+            )
+            .set(
+                "store.resources.limits.memory",
+                store_memory_limit_quantity(),
+            )
             .set("scheduler.resources.requests.cpu", "32")
             .set("scheduler.resources.requests.memory", "16Gi")
             .set("scheduler.resources.limits.memory", "64Gi")
@@ -810,6 +827,22 @@ fn derive_store_ceiling(
     pg_arm.min(hostable_arm)
 }
 
+/// D4: the store memory limit as a k8s quantity, DERIVED from the NAR
+/// budget plus the typed non-NAR reserve — the one derivation site for
+/// the deployed limit (the binary's `Config::validate` asserts the
+/// same inequality at boot against the downward-API-injected value,
+/// so a hand-edited `--set` that breaks the law refuses to boot
+/// instead of OOM-killing under load). Both constants live in
+/// `rio_common::limits`; the sum is a whole Gi by construction
+/// (asserted there), so the quantity needs no rounding.
+fn store_memory_limit_quantity() -> String {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let bytes = rio_common::limits::DEFAULT_STORE_NAR_BUDGET_BYTES
+        + rio_common::limits::STORE_NON_NAR_RESERVE_BYTES;
+    debug_assert_eq!(bytes % GIB, 0, "the budget+reserve sum is whole Gi");
+    format!("{}Gi", bytes / GIB)
+}
+
 /// What the pg connection-budget preflight should do, decided from
 /// probing the ESO-synced `rio-store/rio-postgres` Secret — the
 /// measurement pod's hard dependency (its env is a secretKeyRef on
@@ -938,6 +971,29 @@ mod ceiling_tests {
     /// A karpenter limit high enough that the hostable arm never
     /// binds — isolates the PG arm in the tests below.
     const PG_ARM_ONLY: u32 = 1_000_000;
+
+    /// W9-BF construction face (D4): the deployed store limit is the
+    /// derived quantity budget + reserve = 32 GiB + 4 GiB = "36Gi" —
+    /// strictly above the budget (the old literal was "32Gi" ==
+    /// budget exactly, the identity the law kills). Parsing the
+    /// quantity back re-asserts the inequality the binary's
+    /// validate() enforces at boot.
+    #[test]
+    fn store_memory_limit_is_derived_above_the_budget() {
+        let q = store_memory_limit_quantity();
+        assert_eq!(q, "36Gi");
+        let gi: u64 = q.strip_suffix("Gi").expect("Gi quantity").parse().unwrap();
+        let limit = gi * 1024 * 1024 * 1024;
+        assert_eq!(
+            limit,
+            rio_common::limits::DEFAULT_STORE_NAR_BUDGET_BYTES
+                + rio_common::limits::STORE_NON_NAR_RESERVE_BYTES
+        );
+        assert!(
+            limit > rio_common::limits::DEFAULT_STORE_NAR_BUDGET_BYTES,
+            "the limit must leave non-NAR headroom above the budget"
+        );
+    }
 
     /// The two documented operating points of the AWS PG table:
     /// the min-capacity-capped 2,000 and the 32-ACU 5,000 (PG arm
