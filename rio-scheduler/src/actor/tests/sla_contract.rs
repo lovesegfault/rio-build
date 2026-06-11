@@ -5820,7 +5820,9 @@ fn stale_solve_revalidation_call_site_censuses() {
     assert_eq!(
         count(solve_src, ".reference_hw_class_for_system("),
         0,
-        "solve.rs never CALLS the resolver (one doc-comment mention at          the §Canonicalize note is prose, not a call site — the          emission fold owns resolution)"
+        "solve.rs never CALLS the resolver (one doc-comment mention at the \
+         §Canonicalize note is prose, not a call site — the emission \
+         fold owns resolution)"
     );
     assert!(
         prod(config_src).contains("pub fn reference_hw_class_for_system("),

@@ -273,6 +273,13 @@ pub fn describe_metrics() {
          the ICE backoff expires *if* the cloud recovers; persistent if \
          structural (e.g. missing AWSServiceRoleForEC2Spot). Check \
          `nodeclaim_reaped_total{reason=~\"ice|vanished\"}` and Karpenter. \
+         reason=ready_all_cells_ice_masked: the READY subset of the \
+         all-masked population (solved demand, named hosting classes, \
+         eta=0) — the silently-starved class the live_050 hang \
+         measured; same cloud-side causes and heal path as \
+         all_cells_ice_masked, but these intents have builds WAITING \
+         (alert-worthy at low thresholds; see the cover WARN naming \
+         the intents and classes). \
          reason=exceeds_cell_cap: intent's pod footprint exceeds the assigned \
          cell's per-class catalog ceiling (or max_node_disk) — \
          the scheduler's ClassCeiling gate didn't reject it (override-bypass \

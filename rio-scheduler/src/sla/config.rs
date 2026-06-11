@@ -3203,11 +3203,19 @@ mod tests {
             pub effect: String,
         }
         pub fn parse() -> Root {
-            let path = concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../infra/helm/rio-build/values.yaml"
+            // RUNTIME env var, not the compile-time `env!` macro: under
+            // the nix nextest sandbox the compile dir is long gone —
+            // cargo/nextest set CARGO_MANIFEST_DIR to the remapped
+            // workspace member at run time, and the workspace fileset
+            // carries the chart values (the docs/gen/metrics.json
+            // precedent in rio-test-support::metrics).
+            let path = format!(
+                "{}/../infra/helm/rio-build/values.yaml",
+                std::env::var("CARGO_MANIFEST_DIR")
+                    .expect("CARGO_MANIFEST_DIR set by cargo/nextest")
             );
-            let body = std::fs::read_to_string(path).expect("shipped values readable");
+            let body = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read shipped values at {path}: {e}"));
             serde_saphyr::from_str(&body).expect("shipped values parse")
         }
     }

@@ -105,6 +105,8 @@ in
       (unfilteredRoot + "/.config/nextest.toml")
       (unfilteredRoot + "/docs/gen/metrics.json")
       alertTemplates
+      # shipped-values battery runtime read (see nextestRunSrc).
+      (unfilteredRoot + "/infra/helm/rio-build/values.yaml")
     ];
   };
   # Fileset for the shared cargo-metadata drv and the
@@ -136,6 +138,14 @@ in
       # the sandbox fileset the check passes locally and
       # fails sandboxed (or worse, the reverse).
       alertTemplates
+      # live_050(c): the rio-scheduler shipped-values battery
+      # (sla::config::tests::shipped*) parses the LIVE chart
+      # values at runtime (fs::read_to_string via
+      # CARGO_MANIFEST_DIR/../infra/…) — the W7-G census kills
+      # author-census rot on the cell/rung tables only if it
+      # reads the real file. Same lives-outside-any-crate-dir
+      # class as metrics.json above.
+      (unfilteredRoot + "/infra/helm/rio-build/values.yaml")
     ];
   };
   # Per-member full src/ for the runtime overlay (mkNextestRun
