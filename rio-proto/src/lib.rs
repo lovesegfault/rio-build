@@ -36,6 +36,24 @@ pub const CONCURRENT_PUTPATH_MSG: &str = "concurrent PutPath in progress";
 /// constant so a rename forces all sites to update in lockstep.
 pub const CGROUP_OOM_MSG: &str = "cgroup OOM during build";
 
+/// Round-9 B3 (Banner A-1): the cited consumer default for
+/// `GetSpawnIntentsRequest.limit` — the priority-head window a
+/// supply-side consumer (the controller pool reconcilers) requests
+/// per call. Cross-crate contract pin (R14): producer and consumers
+/// cite THIS const, never a re-typed literal.
+///
+/// Derivation (R17 — VIOLABLE, the bound is typed and consumers may
+/// pass any limit; recorded because the round-9 B-1 response-size
+/// histogram `rio_scheduler_spawn_intents_response_bytes` landed
+/// pre-wave with no production capture yet): the admission census
+/// derived 150-400 B/intent (never observed); 2048 intents x 400 B
+/// ~= 820 KiB per page, ~5x headroom under the 4 MiB default gRPC
+/// message cap, while covering the measured controller cover-pass
+/// consumption (~hundreds of spawns/tick) with an order of margin.
+/// Re-derive against the histogram's first production capture and
+/// update this note with the observed bytes-per-intent.
+pub const SPAWN_INTENTS_DEFAULT_PAGE: u32 = 2048;
+
 pub mod client;
 pub mod interceptor;
 pub mod refusal;

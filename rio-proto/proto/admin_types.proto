@@ -631,6 +631,16 @@ message GetSpawnIntentsRequest {
   // can't be optional, hence the explicit bool.
   repeated string features = 3;
   bool filter_features = 4;
+  // Round-9 B3 (Banner A-1): the priority-head WINDOW — serve at most
+  // `limit` intents from the head of the priority-sorted set. `0`
+  // (the proto3 default, and what every pre-window client sends) =
+  // unbounded, the pre-window behavior — read-side-first evolution,
+  // no bridge. The bound is on the CONSUMER's slice, never the mint
+  // (A-2: the demand record is the demand truth — `queued_by_system`
+  // and `ice_masked_cells` stay full-population aggregates regardless
+  // of the window). `SPAWN_INTENTS_DEFAULT_PAGE` (rio-proto src) is
+  // the cited consumer default.
+  uint32 limit = 5;
 }
 
 message GetSpawnIntentsResponse {
@@ -654,6 +664,16 @@ message GetSpawnIntentsResponse {
   // @alg-pool excludes the same cells the scheduler has marked
   // ICE-infeasible. Coherent snapshot with `intents` (one tick).
   repeated string ice_masked_cells = 4;
+  // Round-9 B3: TRUNCATION HONESTY — true iff `intents` was cut to
+  // the request's `limit` (more Ready work existed than the window).
+  // A consumer sizing supply work MUST derive demand from the
+  // `queued_by_system` aggregate (the uncapped demand truth), never
+  // from `len(intents)`, whenever this is set — a deficit sized from
+  // a truncated page silently shrinks supply (the cover-deficit
+  // trap; the controller-side consumer constituent lands with the
+  // round-9 S4 work). Old servers never set it (proto3 default
+  // false ⇒ "nothing was truncated", which is also true there).
+  bool truncated = 5;
 }
 
 // Controller → scheduler ack: "I created Jobs for these intents".

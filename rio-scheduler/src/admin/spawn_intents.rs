@@ -49,6 +49,7 @@ pub(super) async fn get_spawn_intents(
         intents: snap.intents,
         queued_by_system: snap.queued_by_system,
         ice_masked_cells: snap.ice_masked_cells,
+        truncated: false,
     };
     // Wire-size measurement (round-9 dossier E2 — the B-2 gate for
     // the GetSpawnIntents pagination constants): the response is the

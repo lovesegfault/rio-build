@@ -79,6 +79,9 @@ fn spawn_intents_proto_roundtrip() {
         ],
         queued_by_system: [("x86_64-linux".into(), 4), ("aarch64-linux".into(), 1)].into(),
         ice_masked_cells: vec!["mid:spot".into()],
+        // Round-9 B3: the truncation-honesty flag roundtrips (true is
+        // the non-default value, so the wire actually carries it).
+        truncated: true,
     };
     let bytes = orig.encode_to_vec();
     let decoded = GetSpawnIntentsResponse::decode(&*bytes).unwrap();

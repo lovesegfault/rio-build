@@ -1148,6 +1148,12 @@ async fn queued_for_pool(
             systems: pool.spec.systems.clone(),
             features: pod::effective_features(&pool.spec),
             filter_features: true,
+            // Round-9 B3: 0 = unbounded (the pre-window behavior).
+            // The per-pool window + the reap/AD2 totality filter are
+            // the round-9 S4 consumer constituent — landing there,
+            // not here (this line is the wire change's inert
+            // compile-default only).
+            limit: 0,
         },
     ))
     .await?
