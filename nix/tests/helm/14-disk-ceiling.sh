@@ -52,3 +52,60 @@ test "$max_node_disk" -ge "$need" || {
   echo "  raise karpenter.dataVolumeSize (max_node_disk = dataVolumeSize × 0.9)" >&2
   exit 1
 }
+
+# live_057-c (W10-CP): the defaultDisk density derivation — the
+# committed table values.yaml narrates at sla.defaultDisk, asserted
+# here against the live values with the same content-mirrored
+# constants (the member-4 census[gen:] precedent at
+# jobs.rs::pod_ephemeral_request), so the helm value and the rust
+# accounting cannot drift silently. Inputs: defaultDisk,
+# poolDefaults.fuseCacheBytes, LOG_BUDGET_BYTES, the no-estimate
+# headroom arm, and the density-input row (allocatable =
+# karpenter.dataVolumeSize × 0.9). Touch ANY input ⇒ re-derive the
+# whole table (narration rows + these asserts together).
+# The recovery path for a too-small default is the worker-classified
+# disk ladder (25→50→100, floor persisted once per pname) — the
+# cross-crate end-to-end witness lives beside the classifier
+# (W10-CM: quota-exhausted build ⇒ DISK_FULL report ⇒ the scheduler's
+# disk floor doubles); the §1.6.4-15 order pin makes this fragment
+# valid only in trees where that ladder is live.
+DEFAULT_HEADROOM_PCT=150   # OVERLAY_HEADROOM_FALLBACK (no-estimate arm)
+default_disk=$(yq '.scheduler.sla.defaultDisk' values.yaml)
+test "$default_disk" = "26843545600" || {
+  echo "FAIL: sla.defaultDisk=$default_disk B != 25 GiB (26843545600 B) —" >&2
+  echo "  the W10-CP density table (values.yaml narration + this fragment)" >&2
+  echo "  derives from 25 GiB; re-derive BOTH before moving the default" >&2
+  exit 1
+}
+default_req=$(( default_disk * DEFAULT_HEADROOM_PCT / 100 + fuse + LOG_BUDGET_BYTES ))
+test "$default_req" = "95026151424" || {
+  echo "FAIL: default-pod ephemeral request $default_req B != the committed" >&2
+  echo "  88.5 GiB row (95026151424 B = 25×1.5 + 50 fuse + 1 log GiB)" >&2
+  exit 1
+}
+# Density-input row: allocatable = dataVolumeSize × 0.9 (the same
+# kubelet-reserve fraction max_node_disk renders from), pods/node =
+# floor(allocatable / request). 500Gi × 0.9 = 450 GiB.
+data_vol=$(yq '.karpenter.dataVolumeSize' values.yaml)
+test "$data_vol" = "500Gi" || {
+  echo "FAIL: karpenter.dataVolumeSize=$data_vol != 500Gi — the W10-CP" >&2
+  echo "  pods/node rows assume 450 GiB allocatable; re-derive the table" >&2
+  exit 1
+}
+alloc=$(( 500 * 1024 * 1024 * 1024 * 9 / 10 ))
+pods=$(( alloc / default_req ))
+test "$pods" -eq 5 || {
+  echo "FAIL: derived pods/node $pods != the committed 5 (the 2→5 density row)" >&2
+  exit 1
+}
+# The historical 100 GiB row, kept as the comparison anchor (the B8
+# live specimen: a 201 GiB ask): 2 pods/node on the same allocatable.
+# (12xlarge nvme: measured 12 at 201 GiB ⇒ allocatable ∈ [2412, 2613)
+# GiB ⇒ 27–29 pods/node at 88.5 GiB — a BAND over instance-store
+# capacities, narration-only: no nvme allocatable renders here.)
+old_req=$(( 107374182400 * DEFAULT_HEADROOM_PCT / 100 + fuse + LOG_BUDGET_BYTES ))
+test $(( alloc / old_req )) -eq 2 || {
+  echo "FAIL: the historical 100 GiB row no longer derives 2 pods/node —" >&2
+  echo "  a density INPUT (fuse/log/allocatable) moved; re-derive the table" >&2
+  exit 1
+}

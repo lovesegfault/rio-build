@@ -622,7 +622,33 @@ scheduler:
     # maxCores: 192
     # maxMem: 1649267441664    # 1.5 TiB
     maxDisk: 214748364800      # 200 GiB
-    defaultDisk: 107374182400  # 100 GiB
+    # 25 GiB (was 100 — live_057-c). The cold-start disk solve for any
+    # pname with NO fitted estimate; the DiskFitEnvelope fits the
+    # per-pname axis from observation, and the reactive disk ladder
+    # recovers a too-small default (25→50→100 doubling, floor
+    # persisted once per pname) on worker-classified disk exhaustion.
+    # Sized for DENSITY with the ladder as the recovery path: a
+    # too-small default self-heals in ≤2 doubled attempts; a too-large
+    # default taxes EVERY warm pod's placement forever.
+    # ORDER-PIN (live_057-c): this flip is valid ONLY in a tree where
+    # the disk ladder is live end-to-end (worker ENOSPC/quota
+    # classification → DISK_FULL → scheduler floor bump, the W10-CM
+    # cross-crate witness); flipping first retry-poisons every pname
+    # whose true overlay need lands in (25, 100] GiB.
+    # Density derivation (bind[14-disk-ceiling.sh] — the W10-CP table
+    # asserts these rows against pod_ephemeral_request's mirrored
+    # constants and the live values; touching ANY input re-derives
+    # BOTH):
+    #   request(default) = default × 1.5 (no-estimate headroom arm)
+    #                      + poolDefaults.fuseCacheBytes (50 GiB)
+    #                      + 1 GiB log budget
+    #   at 100 GiB: 201   GiB request → 450 GiB allocatable: 2 pods/node
+    #   at  25 GiB:  88.5 GiB request → 450 GiB allocatable: 5 pods/node
+    #   (allocatable = karpenter.dataVolumeSize 500Gi × 0.9; the
+    #   12xlarge nvme class measured 12 pods/node at the 100 GiB
+    #   default ⇒ allocatable ∈ [2412, 2613) GiB ⇒ 27–29 pods/node at
+    #   25 GiB — a band over instance-store capacities, not a point.)
+    defaultDisk: 26843545600   # 25 GiB
     hwCostTolerance: 0.15
     hwExploreEpsilon: 0.02
     hwBenchMemFloor: 8589934592  # 8 GiB
