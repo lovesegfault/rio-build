@@ -94,6 +94,26 @@ const ATTEMPT_REQUEUE_BUCKETS: &[f64] = &[
     0.05, 0.25, 1.0, 5.0, 15.0, 30.0, 60.0, 90.0, 120.0, 300.0, 600.0,
 ];
 
+/// Bucket boundaries for `rio_scheduler_spawn_intents_response_bytes`
+/// (BYTES, not seconds — prost `encoded_len` of one GetSpawnIntents
+/// response). Powers-of-~4 from an idle answer (~hundreds of bytes)
+/// through the 4 MiB tonic default message cap up to the modeled
+/// 150K-ready tail (~150K × 150-400 B/intent ≈ 22-60 MiB). The whole
+/// point of the instrument is to OBSERVE that derived tail before the
+/// pagination constants are picked, so the top buckets must resolve
+/// it rather than fold it into +Inf.
+const SPAWN_INTENTS_RESPONSE_BYTES_BUCKETS: &[f64] = &[
+    1024.0, 16384.0, 65536.0, 262144.0, 1048576.0, 4194304.0, 16777216.0, 67108864.0,
+];
+
+/// Bucket boundaries for `rio_scheduler_spawn_intents_per_response`
+/// (COUNT of intents serialized into one answer). Edges cover the
+/// in-tree window vocabulary a pagination design would draw from
+/// (ListMaterializationJobs 256/512, DISPATCH_PROBE_BATCH_CAP 2048,
+/// GetBuildGraph 5000) plus the unpaginated completion-cascade tail.
+const SPAWN_INTENTS_PER_RESPONSE_BUCKETS: &[f64] =
+    &[1.0, 8.0, 64.0, 256.0, 1024.0, 4096.0, 16384.0, 65536.0];
+
 /// Per-crate histogram bucket overrides, passed to
 /// `rio_common::server::bootstrap` → `init_metrics`. Every
 /// `describe_histogram!` in this crate must have an entry here OR be in
@@ -113,6 +133,14 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
     (
         "rio_scheduler_attempt_requeue_seconds",
         ATTEMPT_REQUEUE_BUCKETS,
+    ),
+    (
+        "rio_scheduler_spawn_intents_response_bytes",
+        SPAWN_INTENTS_RESPONSE_BYTES_BUCKETS,
+    ),
+    (
+        "rio_scheduler_spawn_intents_per_response",
+        SPAWN_INTENTS_PER_RESPONSE_BUCKETS,
     ),
 ];
 
@@ -155,6 +183,24 @@ pub fn describe_metrics() {
         "Per-ActorCommand handling latency (labeled by cmd variant); \
          the actor is single-threaded so a slow command head-of-line \
          blocks every queued RPC"
+    );
+    describe_histogram!(
+        "rio_scheduler_spawn_intents_response_bytes",
+        "Encoded (prost wire) size of one GetSpawnIntents response in bytes. \
+         The intent-serving surface is unpaginated — the full Ready set is \
+         serialized per call — and this instrument is the observed input for \
+         sizing its pagination window (pair with \
+         rio_scheduler_spawn_intents_per_response for bytes-per-intent). \
+         Sustained samples in the MiB buckets mean poller reads alone are \
+         taxing the actor."
+    );
+    describe_histogram!(
+        "rio_scheduler_spawn_intents_per_response",
+        "Intents serialized into one GetSpawnIntents response (count, not \
+         seconds). The companion of \
+         rio_scheduler_spawn_intents_response_bytes: divide the two to get \
+         observed bytes-per-intent; watch the top buckets to see \
+         completion-cascade fan-out reaching the pollers unwindowed."
     );
     describe_histogram!(
         "rio_scheduler_build_duration_seconds",

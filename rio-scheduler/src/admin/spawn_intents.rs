@@ -45,11 +45,26 @@ pub(super) async fn get_spawn_intents(
     })
     .await?;
 
-    Ok(GetSpawnIntentsResponse {
+    let resp = GetSpawnIntentsResponse {
         intents: snap.intents,
         queued_by_system: snap.queued_by_system,
         ice_masked_cells: snap.ice_masked_cells,
-    })
+    };
+    // Wire-size measurement (round-9 dossier E2 — the B-2 gate for
+    // the GetSpawnIntents pagination constants): the response is the
+    // largest unpaginated rio surface (full Ready set per call, 379
+    // calls/12min at the incident fleet) and until now NO rio gRPC
+    // surface measured encoded response bytes — the 150-400 B/intent
+    // figure the admission census used was derived, not observed.
+    // `encoded_len` is the exact prost wire size without re-encoding;
+    // the per-response intent count alongside it lets PromQL derive
+    // observed bytes-per-intent. Emitted at the serving chokepoint so
+    // every consumer (per-pool reconcilers, cover sizing) is counted.
+    let encoded_len = rio_proto::prost::Message::encoded_len(&resp);
+    metrics::histogram!("rio_scheduler_spawn_intents_response_bytes").record(encoded_len as f64);
+    metrics::histogram!("rio_scheduler_spawn_intents_per_response")
+        .record(resp.intents.len() as f64);
+    Ok(resp)
 }
 
 /// Query the actor for per-intent `ExecutorClaims` tokens.

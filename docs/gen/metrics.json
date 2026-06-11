@@ -152,6 +152,8 @@
     "rio_scheduler_sla_refit_total",
     "rio_scheduler_sla_residual_multimodal_total",
     "rio_scheduler_sla_suspicious_scaling_total",
+    "rio_scheduler_spawn_intents_per_response",
+    "rio_scheduler_spawn_intents_response_bytes",
     "rio_scheduler_stale_completed_reset_total",
     "rio_scheduler_stale_completed_substituted_total",
     "rio_scheduler_stale_realisation_filtered_total",
@@ -1020,6 +1022,16 @@
         "name": "rio_scheduler_sla_suspicious_scaling_total",
         "kind": "counter",
         "help": "exploration froze at maxCores still saturated (labeled tenant). The build wants more cores than the cluster offers."
+      },
+      {
+        "name": "rio_scheduler_spawn_intents_per_response",
+        "kind": "histogram",
+        "help": "Intents serialized into one GetSpawnIntents response (count, not seconds). The companion of rio_scheduler_spawn_intents_response_bytes: divide the two to get observed bytes-per-intent; watch the top buckets to see completion-cascade fan-out reaching the pollers unwindowed."
+      },
+      {
+        "name": "rio_scheduler_spawn_intents_response_bytes",
+        "kind": "histogram",
+        "help": "Encoded (prost wire) size of one GetSpawnIntents response in bytes. The intent-serving surface is unpaginated — the full Ready set is serialized per call — and this instrument is the observed input for sizing its pagination window (pair with rio_scheduler_spawn_intents_per_response for bytes-per-intent). Sustained samples in the MiB buckets mean poller reads alone are taxing the actor."
       },
       {
         "name": "rio_scheduler_stale_completed_reset_total",
