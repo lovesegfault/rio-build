@@ -1697,7 +1697,9 @@ mod tests {
         let got = apply_disk_override(at_limit, Some(50 * gib), failed());
         assert!(
             matches!(got, Err(ExecutorError::DiskFull)),
-            "left: the quota-exhausted failure presents as ordinary              PermanentFailure (retry-then-poison, floor untouched) /              right: classified DiskFull; got {got:?}"
+            "left: the quota-exhausted failure presents as ordinary \
+             PermanentFailure (retry-then-poison, floor untouched) / \
+             right: classified DiskFull; got {got:?}"
         );
 
         // Ok(Built) preserved even at the limit.
@@ -1753,7 +1755,8 @@ mod tests {
             ExecutorError::DiskFull
                 .to_string()
                 .contains(rio_proto::DISK_FULL_MSG),
-            "ExecutorError::DiskFull Display must carry rio_proto::DISK_FULL_MSG              (the scheduler's floor-bump match key): {}",
+            "ExecutorError::DiskFull Display must carry rio_proto::DISK_FULL_MSG \
+             (the scheduler's floor-bump match key): {}",
             ExecutorError::DiskFull
         );
     }

@@ -206,7 +206,9 @@ mod tests {
         let builder_line = str::from_utf8(&lines[1]).unwrap();
         assert!(
             !builder_line.contains("0 GiB"),
-            "left: the live banner rendered '(2c, 0 GiB, …)' for a 69 MiB              assignment (integer division) / right: sub-GiB renders in              MiB: {builder_line}"
+            "left: the live banner rendered '(2c, 0 GiB, …)' for a 69 MiB \
+             assignment (integer division) / right: sub-GiB renders in \
+             MiB: {builder_line}"
         );
         assert!(
             builder_line.contains("(2c, 69 MiB, 25 GiB)"),
