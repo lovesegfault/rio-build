@@ -1,0 +1,14 @@
+infra/helm/rio-build/templates/gateway-scaledobject.yaml	stale rule citation `gw.conn.session-cap` — the spec defines `gw.conn.session-cap+2`; re-derive the cite against the current rule text and re-stamp
+infra/helm/rio-build/templates/rbac.yaml	stale rule citation `ctrl.ephemeral.reap-excess-pending` — the spec defines `ctrl.ephemeral.reap-excess-pending+3`; re-derive the cite against the current rule text and re-stamp
+infra/helm/rio-build/values.yaml	stale rule citation `store.put.nar-bytes-budget` — the spec defines `store.put.nar-bytes-budget+5`; re-derive the cite against the current rule text and re-stamp
+infra/helm/rio-build/values.yaml	stale rule citation `store.substitute.admission` — the spec defines `store.substitute.admission+2`; re-derive the cite against the current rule text and re-stamp
+infra/helm/rio-build/values.yaml	stale rule citation `store.substitute.stall-abort` — the spec defines `store.substitute.stall-abort+2`; re-derive the cite against the current rule text and re-stamp
+nix/tests/default.nix	stale rule citation `builder.shutdown.sigint+4` — the spec defines `builder.shutdown.sigint+5`; re-derive the cite against the current rule text and re-stamp
+nix/tests/helm/06-jwt-mount.sh	stale rule citation `sec.jwt.pubkey-mount` — the spec defines `sec.jwt.pubkey-mount+2`; re-derive the cite against the current rule text and re-stamp
+nix/tests/scenarios/cli.nix	stale rule citation `sched.admin.clear-poison` — the spec defines `sched.admin.clear-poison+3`; re-derive the cite against the current rule text and re-stamp
+nix/tests/scenarios/lifecycle.nix	stale rule citation `sched.tenant.authz` — the spec defines `sched.tenant.authz+3`; re-derive the cite against the current rule text and re-stamp
+nix/tests/scenarios/lifecycle/jwt-mount-present.nix	stale rule citation `sec.jwt.pubkey-mount` — the spec defines `sec.jwt.pubkey-mount+2`; re-derive the cite against the current rule text and re-stamp
+nix/tests/scenarios/netpol.nix	stale rule citation `fetcher.netpol.egress-open` — the spec defines `fetcher.netpol.egress-open+2`; re-derive the cite against the current rule text and re-stamp
+nix/tests/scenarios/substitute-scale.nix	stale rule citation `sched.merge.substitute-topdown` — the spec defines `sched.merge.substitute-topdown+13`; re-derive the cite against the current rule text and re-stamp
+nix/tests/scenarios/substitute.nix	stale rule citation `sched.tenant.resolve` — the spec defines `sched.tenant.resolve+2`; re-derive the cite against the current rule text and re-stamp
+rio-migrations/src/migrations.rs	stale rule citation `sched.merge.exec-correlation+7` — the spec defines `sched.merge.exec-correlation+8`; re-derive the cite against the current rule text and re-stamp

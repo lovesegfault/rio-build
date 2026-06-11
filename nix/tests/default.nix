@@ -1245,7 +1245,7 @@ in
   # validate() floor (live_047/R-C: cap 1 would make the executor
   # path-slot pool P = 0 and is boot-rejected) — gives P = cap/2 = 1
   # path slot: the 30 walks SLOT-serialize (one in-flight path fleet-
-  # wide — the store.materialize.gate-share law), so with 200ms tc-netem on
+  # wide — the store.materialize.gate-share+1 law), so with 200ms tc-netem on
   # upstream-v6 the cascade still outlives the scheduler's 10s
   # housekeeping tick (the gauge publication cadence) — at the derived
   # default (pg_max×3≥64, P=32), tiny NARs drain in <1s and no tick

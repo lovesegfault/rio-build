@@ -557,7 +557,7 @@ pkgs.testers.runNixOSTest {
         # slot serializes the walks; each fetch ≈ 800ms through the
         # netem'd upstream, 30 serial fetches), so the 1s sampler must
         # catch utilization >= 0.5 — the executor's LAWFUL full-draw
-        # ceiling (r[store.materialize.gate-share]: the executor can
+        # ceiling (r[store.materialize.gate-share+1]: the executor can
         # never saturate the gate; >= cap/2 permits stay free for RPC
         # miss traffic — saturating 1.0 was the pre-law inversion this
         # scenario used as a harness device). Observable on the SAME

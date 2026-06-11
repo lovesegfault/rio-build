@@ -1272,6 +1272,24 @@ in
   # dangling-red, stale-grandfather-red) run before the real scan may
   # gate; the shared exact lexer's selftest gates first (comment-lane
   # matching: string literals can never fire the grammar).
+  rule-citation-versions =
+    pkgs.runCommand "rio-rule-citation-versions"
+      {
+        # Full-tree staging ((vvvvv)): the lint quantifies over EVERY
+        # blind tier (helm yaml comments, scenario files, sh
+        # fragments, migration rationale) against the rule mints in
+        # docs/spec — a narrower fileset would make exactly the blind
+        # tiers it exists for premise-unreachable in the sandbox.
+        src = pkgs.lib.cleanSource ../.;
+        nativeBuildInputs = [ pkgs.python3 ];
+        scanScript = ../nix/rule_citation_versions.py;
+      }
+      ''
+        cp "$scanScript" rule_citation_versions.py
+        python3 rule_citation_versions.py "$src"
+        touch $out
+      '';
+
   census-enrollment =
     pkgs.runCommand "rio-census-enrollment"
       {
