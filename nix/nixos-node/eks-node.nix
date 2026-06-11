@@ -52,7 +52,7 @@ let
   # probes.
   baseRuntimeSpec = import ../base-runtime-spec.nix { inherit pkgs; };
 
-  # r[impl sec.pod.host-users-false]
+  # r[impl sec.pod.host-users-false+2]
   containerdConfig = import ./containerd-config.nix {
     inherit lib pkgs pauseRef;
     runtimeSpecPath = baseRuntimeSpec.runtimePath;

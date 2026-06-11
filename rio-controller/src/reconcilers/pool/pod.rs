@@ -147,8 +147,10 @@ const MOUNTD_SOCKET_PATH: &str = "/run/rio-mountd/rio-mountd.sock";
 ///
 /// The DAC check sees the executor's HOST-side gid: under
 /// `hostUsers: false` that is the kubelet-assigned userns mapping of
-/// 990, not 990 itself (open question for the prod userns posture,
-/// tracked with P0560's helm wiring).
+/// 990, not 990 itself — which is why BOTH executor kinds currently
+/// run `hostUsers: true` (builders via helm poolDefaults / I-186,
+/// fetchers via [`effective_host_users`]'s default). Userns for any
+/// mountd client needs userns-aware access control in mountd first.
 pub(crate) const EXECUTOR_RUN_AS_GROUP: i64 = 990;
 
 /// Upstream gRPC addresses injected into executor pod env: a
@@ -166,8 +168,9 @@ pub use rio_common::config::UpstreamAddrs;
 // node placement via per-intent affinity AND a pool-static
 // `rio.build/fetcher` nodeSelector — the latter is the last-resort
 // restrictive constraint for `system="builtin"` FODs whose
-// `hw_class_names=[]` carries no per-intent affinity — hostUsers:false
-// default, derived `[fetcher]` features) regardless of spec. Each
+// `hw_class_names=[]` carries no per-intent affinity — hostUsers:true
+// default (mountd UDS gid gate, see `effective_host_users`), derived
+// `[fetcher]` features) regardless of spec. Each
 // helper below returns the effective value for one pod-spec field.
 // Builder reads spec verbatim; Fetcher overrides.
 
@@ -220,18 +223,31 @@ fn effective_seccomp(pool: &Pool) -> Option<SeccompProfileKind> {
     }
 }
 
-/// Default `hostUsers: false` for fetchers (ADR-019 userns isolation),
-/// but HONOR the spec override. k3s containerd doesn't chown the pod
-/// cgroup under hostUsers:false → rio-builder's `mkdir
-/// /sys/fs/cgroup/leaf` EACCES → exit 1 in <200ms (vmtest-full-
-/// nonpriv.yaml). The k3s VM tests set `hostUsers: true`; production
-/// EKS (containerd 2.0+) gets the default `false`. Forcing Some(false)
-/// here (Phase-7 first cut) made fetcher pods unrunnable on every CI
-/// fixture.
+/// Default `hostUsers: true` for fetchers, HONORING the spec override.
+///
+/// NOT the ADR-019 userns posture, deliberately: the fetcher's castore
+/// session connects to rio-mountd's UDS, and mountd's only access
+/// control is the socket-file DAC check (0660 root:990, see
+/// [`EXECUTOR_RUN_AS_GROUP`]) against the connecting process's
+/// HOST-side gid. Under `hostUsers: false` the kubelet assigns the pod
+/// a non-init userns, gid 990 maps to some other host gid, and
+/// `connect(2)` fails EACCES — every FOD in the fleet fails. The
+/// earlier `Some(false)` default shipped exactly that outage to EKS
+/// (builders were flipped to hostUsers:true for the castore cutover;
+/// fetchers were missed).
+///
+/// Compensating controls while userns is off: the forced Localhost
+/// `rio-fetcher.json` seccomp profile ([`effective_seccomp`]) and the
+/// rio-fetchers namespace NetworkPolicy.
+///
+/// TODO: default back to `Some(false)` (ADR-019 userns isolation) once
+/// rio-mountd gains userns-aware access control — e.g. an
+/// SO_PEERCRED/pidfd peer check that resolves the client gid through
+/// its userns mapping instead of relying on socket-file DAC.
 #[inline]
 fn effective_host_users(pool: &Pool) -> Option<bool> {
     if is_fetcher(pool) {
-        pool.spec.host_users.or(Some(false))
+        pool.spec.host_users.or(Some(true))
     } else {
         pool.spec.host_users
     }
@@ -508,7 +524,7 @@ pub fn job_name(pool_name: &str, role: ExecutorKind, suffix: &str) -> String {
 }
 
 /// The Job pod spec — shared by both pool kinds.
-// r[impl ctrl.pool.fetcher-hardening+2]
+// r[impl ctrl.pool.fetcher-hardening+3]
 pub fn build_executor_pod_spec(
     pool: &Pool,
     scheduler: &UpstreamAddrs,
@@ -562,7 +578,7 @@ pub fn build_executor_pod_spec(
             .filter(|&h| h)
             .map(|_| "ClusterFirstWithHostNet".into()),
 
-        // r[impl sec.pod.host-users-false]
+        // r[impl sec.pod.host-users-false+2]
         // User-namespace isolation. See ADR-012. Incompatible with
         // privileged and hostNetwork. The spec.hostUsers override
         // handles containerd<2.1 cgroup ownership issues
@@ -1196,7 +1212,7 @@ mod tests {
         assert_eq!(nix_systems_to_k8s_arch(&[]), None);
     }
 
-    // r[verify ctrl.pool.fetcher-hardening+2]
+    // r[verify ctrl.pool.fetcher-hardening+3]
     // r[verify ctrl.crd.fetcher-no-features+2]
     /// `effective_features` is the single chokepoint: Fetcher →
     /// `[fetcher]` regardless of spec; Builder → verbatim. Both

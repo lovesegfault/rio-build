@@ -59,7 +59,7 @@ impl ExecutorKind {
 /// have their own pools). Printer columns: what `kubectl get pools`
 /// shows — Kind/Ready/Desired at a glance is the main thing operators
 /// want.
-// r[impl ctrl.crd.pool+1]
+// r[impl ctrl.crd.pool+2]
 ///
 /// `KubeSchema` alongside `CustomResource`: KubeSchema processes
 /// `#[x_kube(validation)]` attrs into x-kubernetes-validations.
@@ -135,10 +135,10 @@ impl ExecutorKind {
 // hostUsers NOT CEL-gated for Fetcher (unlike privileged/hostNetwork/
 // seccompProfile): k3s containerd doesn't chown the pod cgroup under
 // hostUsers:false → exit-1 EACCES on cgroup mkdir. VM tests need
-// hostUsers:true; production EKS gets the reconciler's default `false`
-// (`pod::effective_host_users`: spec.host_users.or(Some(false))). The
-// reconciler default is the safety net; CEL would make k3s fixtures
-// unrunnable.
+// hostUsers:true, and the reconciler now defaults fetchers to
+// hostUsers:true anyway (`pod::effective_host_users` — mountd's UDS
+// gid gate sees the host-side gid, broken under a non-init userns).
+// CEL gating the field would make k3s fixtures unrunnable.
 #[x_kube(
     validation = Rule::new(
         "self.kind != 'Fetcher' || !has(self.seccompProfile)"
@@ -226,11 +226,14 @@ pub struct PoolSpec {
     #[schemars(schema_with = "crate::any_object_array")]
     pub tolerations: Option<Vec<Toleration>>,
 
-    /// Explicit `hostUsers` override. `None` defaults to `hostUsers:
-    /// false` (userns isolation per ADR-012). Set `true` for k3s/
+    /// Explicit `hostUsers` override. `None` defaults per kind:
+    /// `kind=Builder` → `hostUsers: false` (userns isolation per
+    /// ADR-012); `kind=Fetcher` → `hostUsers: true` (rio-mountd's UDS
+    /// gid gate checks the host-side gid, which a non-init userns
+    /// remaps — userns would EACCES every FOD). Set `true` for k3s/
     /// containerd deployments that don't chown the pod cgroup to the
     /// userns-mapped root UID. NOT CEL-gated for `kind=Fetcher` (k3s
-    /// escape hatch); the reconciler default `false` is the safety net.
+    /// escape hatch).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_users: Option<bool>,
 
@@ -416,7 +419,7 @@ mod tests {
             json.contains("hostNetwork:true requires privileged:true"),
             "hostNetwork→privileged CEL rule has no message"
         );
-        // r[verify ctrl.crd.pool+1]
+        // r[verify ctrl.crd.pool+2]
         // D3: fetcher hardening rules. Admission-time rejection of
         // spec fields ADR-019 forces — the reconciler's belt-and-
         // suspenders override is `pool/pod.rs` fetcher hardening.

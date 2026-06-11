@@ -227,15 +227,18 @@
 
 == Executor Pod Security
 
-#r("sec.pod.host-users-false")[
-  Executor pods MUST set `hostUsers: false` to activate Kubernetes
+#r("sec.pod.host-users-false+2")[
+  Builder pods MUST set `hostUsers: false` to activate Kubernetes
   user-namespace isolation (K8s 1.33+). Container UIDs are remapped to
   unprivileged host UIDs; `CAP_SYS_ADMIN` applies only within the user
   namespace. A container escape gaining `CAP_SYS_ADMIN` cannot affect the host
-  or other pods. See @sec-rationale-privileged. The `privileged: true` escape
-  hatch (for clusters whose containerd lacks `base_runtime_spec` device
-  injection) skips `hostUsers: false` --- privileged containers cannot be
-  user-namespaced.
+  or other pods. See @sec-rationale-privileged. Two exceptions: the
+  `privileged: true` escape hatch (for clusters whose containerd lacks
+  `base_runtime_spec` device injection) skips `hostUsers: false` ---
+  privileged containers cannot be user-namespaced; and Fetcher pods default
+  `hostUsers: true` because rio-mountd's UDS access control is a host-side
+  gid DAC check that a non-init userns breaks (see
+  #rref("ctrl.pool.fetcher-hardening")).
 ]
 
 // rule-id is historical (device-plugin era); FUSE delivery is the rio-mountd

@@ -76,7 +76,7 @@ pub(crate) fn test_ctx(client: kube::Client) -> Arc<Ctx> {
     })
 }
 
-// r[verify ctrl.pool.fetcher-hardening+2]
+// r[verify ctrl.pool.fetcher-hardening+3]
 /// D3 belt-and-suspenders behind the CEL admission gate: a
 /// `Pool{kind=Fetcher}` whose spec slips past CEL with
 /// `seccompProfile: Unconfined` and `hostUsers: true` STILL
@@ -135,13 +135,29 @@ fn fetcher_hardening_ignores_spec() {
         "fetchers never want kvm even if spec.features lists it"
     );
 
-    // Unset spec → ADR-019 default Some(false). Production EKS path.
+    // Unset spec → Some(true). Production EKS path. Deliberately NOT
+    // the ADR-019 hostUsers:false posture: mountd's UDS access control
+    // is the socket-file DAC check (0660 root:990) against the
+    // connecting process's HOST-side gid, and under a non-init userns
+    // the kubelet-assigned mapping of gid 990 is some other host gid →
+    // connect(2) EACCES → every FOD fails. hostUsers:true until mountd
+    // gains userns-aware access control (see effective_host_users).
     pool.spec.host_users = None;
     assert_eq!(
         test_pod_spec(&pool).host_users,
-        Some(false),
-        "Fetcher defaults hostUsers:false when spec is silent"
+        Some(true),
+        "Fetcher defaults hostUsers:true when spec is silent \
+         (mountd UDS gid gate sees the host-side gid)"
     );
+
+    // Explicit spec override still honored in both directions.
+    pool.spec.host_users = Some(false);
+    assert_eq!(
+        test_pod_spec(&pool).host_users,
+        Some(false),
+        "explicit spec hostUsers:false honored for Fetcher"
+    );
+    pool.spec.host_users = None;
 
     // §13e B4: the legacy `rio.build/node-role` pool-static nodeSelector
     // is DELETED, but `effective_node_selector` RESTORES a pool-static

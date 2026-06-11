@@ -878,7 +878,7 @@ in
       # r[verify builder.timeout.no-reassign]
       "build-timeout"
       # r[verify ctrl.pool.reconcile]
-      # r[verify ctrl.crd.pool+1]
+      # r[verify ctrl.crd.pool+2]
       #   pool-lifecycle: apply Pool CRD → wait status → delete
       #   --wait=false. Non-disruptive (no shared-state interference
       #   with the subtests above), so it folds into core rather than

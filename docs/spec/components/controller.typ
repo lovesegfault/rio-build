@@ -8,7 +8,7 @@ Manages rio-build lifecycle on Kubernetes via CRDs.
 
 == Pool
 
-#r("ctrl.crd.pool+1")[
+#r("ctrl.crd.pool+2")[
   ```yaml
   apiVersion: rio.build/v1alpha1
   kind: Pool
@@ -19,7 +19,7 @@ Manages rio-build lifecycle on Kubernetes via CRDs.
     maxConcurrent: 20                            # u32?, optional — concurrent-Job ceiling (one Job = one build); omit = uncapped Job count (the §13b placeable gate + per-class maxFleetCores caps bound fanout, not Job count)
     image: rio-builder:dev                       # string, required — container image ref
     systems: [x86_64-linux]                      # list<string>, required (non-empty per CEL)
-    hostUsers: false                             # bool?, optional — None ⇒ hostUsers:false (userns per ADR-012); CEL-forbidden for Fetcher
+    hostUsers: false                             # bool?, optional — None ⇒ kind-dependent default (Builder: false, userns per ADR-012; Fetcher: true, mountd UDS gid gate); NOT CEL-gated for Fetcher (k3s escape hatch)
     nodeSelector:
       rio.build/builder: "true"
     tolerations:
@@ -239,16 +239,28 @@ gone.
   ownerRef GC handles Job cleanup on Pool delete.
 ]
 
-#r("ctrl.pool.fetcher-hardening+2")[
+#r("ctrl.pool.fetcher-hardening+3")[
   For `kind=Fetcher`, `executor_params` MUST apply ADR-019 hardening regardless
   of spec: `readOnlyRootFilesystem: true`, `seccompProfile: Localhost
-  operator/rio-fetcher.json`, `hostUsers: false`, `privileged: false`, default
+  operator/rio-fetcher.json`, `privileged: false`, default `hostUsers: true`
+  (spec-overridable; NOT the ADR-019 userns posture --- see below), default
   `rio.build/fetcher: true` nodeSelector (§13e key, restored in B4) +
   `rio.build/fetcher:NoSchedule` toleration, `terminationGracePeriodSeconds:
   600`. CRD CEL rejects fetcher specs that set the overridden fields at
   admission time; the reconciler override is belt-and-suspenders for pre-CEL
   specs the apiserver already accepted.
 ]
+
+The `hostUsers: true` default is a deliberate retreat from ADR-019 userns
+isolation. rio-mountd's only access control on its UDS is the socket-file DAC
+check (`0660 root:990`) against the connecting process's *host-side* gid; under
+`hostUsers: false` the kubelet remaps the fetcher's gid 990 into the pod's
+non-init user namespace, the host-side gid is no longer 990, and `connect(2)`
+fails EACCES --- every FOD fetch in the fleet fails. Compensating controls
+while userns is off: the forced Localhost `rio-fetcher.json` seccomp profile
+and the fetcher namespace's default-deny NetworkPolicy. Revisit when mountd
+gains userns-aware access control (e.g. an `SO_PEERCRED`/pidfd check that
+resolves the peer's gid through its userns mapping).
 
 #r("ctrl.pool.fetcher-spawn-builtin")[
   For `kind=Fetcher` pools, `spec.systems` SHOULD include `"builtin"` so

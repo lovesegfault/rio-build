@@ -1270,11 +1270,13 @@ pools:
 # stay single-sourced across all per-arch pools. Helm's `null`-deletes-
 # key deep-merge semantics work for overlays.
 #
-# kind=Fetcher entries SHOULD NOT inherit privileged/hostUsers/
-# seccompProfile (CRD CEL rejects them at admission); the reconciler
-# forces ADR-019 hardening regardless. Fetcher entries typically override
-# `nodeSelector`; image stays `rio-builder` (controller injects
-# RIO_EXECUTOR_KIND per-pod).
+# kind=Fetcher entries SHOULD NOT inherit privileged/seccompProfile
+# (CRD CEL rejects them at admission); the reconciler forces ADR-019
+# hardening regardless. hostUsers is NOT CEL-gated — fetcher entries
+# null it so the reconciler default (hostUsers:true, mountd UDS gid
+# gate — see pod::effective_host_users) stays authoritative. Fetcher
+# entries typically override `nodeSelector`; image stays `rio-builder`
+# (controller injects RIO_EXECUTOR_KIND per-pod).
 poolDefaults:
   enabled: false
   features: []
@@ -1296,8 +1298,10 @@ poolDefaults:
   # fetcher profile keeps all five denied.
   #
   # hostUsers default = true here so k3s VM tests work without
-  # idmap-mount support on /dev/fuse. EKS (NixOS AMI with containerd
-  # cgroup_writable=true) overrides to false via xtask deploy.rs.
+  # idmap-mount support on /dev/fuse. EKS deploys keep true as well:
+  # builders per I-186 (FUSE passthrough needs init-userns
+  # CAP_SYS_ADMIN, see xtask deploy.rs), fetchers per the reconciler
+  # default (mountd UDS gid gate — see pod::effective_host_users).
   privileged: false
   hostUsers: true
   seccompProfile:

@@ -80,11 +80,14 @@ spec:
                 type: boolean
               hostUsers:
                 description: |-
-                  Explicit `hostUsers` override. `None` defaults to `hostUsers:
-                  false` (userns isolation per ADR-012). Set `true` for k3s/
+                  Explicit `hostUsers` override. `None` defaults per kind:
+                  `kind=Builder` → `hostUsers: false` (userns isolation per
+                  ADR-012); `kind=Fetcher` → `hostUsers: true` (rio-mountd's UDS
+                  gid gate checks the host-side gid, which a non-init userns
+                  remaps — userns would EACCES every FOD). Set `true` for k3s/
                   containerd deployments that don't chown the pod cgroup to the
                   userns-mapped root UID. NOT CEL-gated for `kind=Fetcher` (k3s
-                  escape hatch); the reconciler default `false` is the safety net.
+                  escape hatch).
                 nullable: true
                 type: boolean
               image:

@@ -6,7 +6,7 @@
 //! 3. Reap excess Pending and orphan Running Jobs.
 //! 4. Patch Pool.status from active Job count.
 // r[impl ctrl.pool.reconcile]
-// r[impl ctrl.crd.pool+1]
+// r[impl ctrl.crd.pool+2]
 // r[impl ctrl.reconcile.owner-refs]
 // r[impl ctrl.drain.sigterm]
 //!
@@ -109,10 +109,11 @@ fn is_fetcher_spec(s: &rio_crds::pool::PoolSpec) -> bool {
 pub(crate) const DEGRADE_CHECKS: &[DegradeCheck] = &[
     // r[impl ctrl.crd.host-users-network-exclusive]
     // Builder-only: the pod.rs:327 suppression this mirrors only fires
-    // on the Builder path. Fetchers always get `Some(false)` from
-    // `effective_host_users` (never omitted) and `host_network=None`
-    // forced — entry [2] (`FetcherHostNetworkSuppressed`) is the
-    // correct event for a Fetcher with `hostNetwork:true`. Without
+    // on the Builder path. Fetchers always get a `Some` value from
+    // `effective_host_users` (default `true`, never omitted) and
+    // `host_network=None` forced — entry [2]
+    // (`FetcherHostNetworkSuppressed`) is the correct event for a
+    // Fetcher with `hostNetwork:true`. Without
     // this gate, a pre-CEL `Fetcher{hostNetwork:true}` emitted a
     // factually-wrong "hostUsers omitted" + unactionable "Set
     // privileged:true" (forced false for Fetchers).
