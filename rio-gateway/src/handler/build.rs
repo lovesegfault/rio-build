@@ -607,6 +607,7 @@ enum IncomingFamily {
 }
 
 // r[impl gw.display.single-map]
+// r[impl gw.display.family-flip]
 /// THE family-flip chokepoint: every display-family transition — live
 /// relay or snapshot reconcile — projects from this one total function
 /// over (current display, incoming family). Returns `true` iff a flip
@@ -893,6 +894,7 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
             // with N cascaded ancestors, suppressing N misleading
             // hints is the difference between a copy-pasteable failure
             // tail and noise.
+            // r[impl gw.stderr.failure-hint]
             let hint = if drv_event.has_execution {
                 format!("\n  ↳ rio-cli logs '{}'", drv_event.derivation_path)
             } else {
@@ -4023,6 +4025,7 @@ mod tests {
         );
     }
 
+    // r[verify gw.display.family-flip]
     // r[verify gw.activity.subst-progress+4]
     /// merged_bug_003 red R1: a `Started` close fires on fetch FAILURE
     /// (the drv fell through to a build) — it DISPROVES transfer

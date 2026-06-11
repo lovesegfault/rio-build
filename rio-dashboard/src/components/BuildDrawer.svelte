@@ -39,6 +39,7 @@
    * fresh-build value. Exported for the headless census test —
    * `Object.keys(mkDrawerSession(...))` is the machine-derived
    * membership the wholesale-replacement witness iterates. */
+  // r[impl dash.drawer.keyed-session]
   export function mkDrawerSession(buildId: string): DrawerSession {
     return {
       buildId,

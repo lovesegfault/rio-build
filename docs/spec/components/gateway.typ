@@ -2139,6 +2139,38 @@ client showed it stuck forever. One map with a family-valued entry makes
 "swept by every reconcile" a property of the key set rather than of each
 loop's author remembering both families.
 
+#r("gw.display.family-flip")[
+  Every display-family transition MUST project through the single
+  total flip chokepoint over (current display #sym.times incoming
+  family): a flip CLOSES the previous family's display before the
+  caller starts the incoming family's --- closing a build display
+  cuts its dead execution's log tail in the same act (display map and
+  tail set have one lifecycle owner), and closing a substitute pair
+  stamps the flip's typed close cause on the pair --- while
+  same-family and absent cells are no-ops, so every relay and
+  reconcile site invokes the chokepoint unconditionally. The cell
+  product is wildcard-free: a third display family MUST NOT compile
+  without minting its flip cells.
+]
+Conformance rule over the landed flip chokepoint (minted
+rules-after-behavior; the wave-8 close predated this namespace). The
+precision this rule adds over #rref("gw.display.single-map") is the
+TRIGGER: WHAT constitutes a flip (the cell product and its
+unconditional invocation), not just that one map exists.
+
+#r("gw.stderr.failure-hint")[
+  The failure line's log-pointer hint (`rio-cli logs '<drv>'`) MUST be
+  gated on the failure event's STATED execution backing: a failure
+  event that carries no fresh execution renders its failure line
+  WITHOUT the hint --- the gateway never prints a copy-pasteable
+  pointer at a log that does not exist (cascade dependency failures
+  point operators at the trigger derivation's real log instead), and
+  version skew toward absent backing loses only a hint, never invents
+  one.
+]
+Conformance rule over the landed gate (the stated-fact `has_execution`
+close); no spec rule governed the hint before this mint.
+
 #r("gw.reconnect.snapshot-resync")[
   On reconnect, the gateway MUST resynchronize from the `WatchBuild` stream's
   first message — the scheduler's `BuildSnapshot` — before processing live

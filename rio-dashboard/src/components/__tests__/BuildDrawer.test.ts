@@ -280,6 +280,7 @@ describe('BuildDrawer log-stream scope', () => {
     expect(screen.queryByTestId('logs-unfocused')).not.toBeNull();
   });
 
+  // r[verify dash.drawer.keyed-session]
   it('repoint_replaces_the_session_wholesale', async () => {
     // PROPOSITION (machine-censused membership): after a re-point,
     // EVERY session field reads its fresh-mint value -- the membership

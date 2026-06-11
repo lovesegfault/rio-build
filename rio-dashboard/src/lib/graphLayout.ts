@@ -53,6 +53,7 @@ export const WORKER_THRESHOLD = 500;
 // gray. Unknown defaults to gray so a proto/DB addition doesn't crash
 // the node — but the golden cross-check catches that fall-through at
 // test time, not at runtime.
+// r[impl dash.terminal-scope]
 const STATUS_CLASS: Record<string, 'green' | 'yellow' | 'red' | 'gray'> = {
   completed: 'green',
   skipped: 'green',

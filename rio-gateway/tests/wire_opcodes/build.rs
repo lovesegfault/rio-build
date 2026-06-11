@@ -1198,6 +1198,7 @@ async fn test_build_paths_derivation_failed_emits_log_and_stop() -> anyhow::Resu
     Ok(())
 }
 
+// r[verify gw.stderr.failure-hint]
 /// Cascaded `DependencyFailed` ancestors never executed — there is no
 /// log keyed by their `(drv_hash, exec_id)` to point at. The gateway
 /// MUST NOT emit the `↳ rio-cli logs '<drv>'` hint for them: in a

@@ -328,6 +328,44 @@ lower floor there; the dashboard tab has neither bound.
   loop.
 ]
 
+#r("dash.drawer.keyed-session")[
+  Per-build drawer state MUST live in ONE self-keyed session record
+  minted per `buildId`: the record carries its own key, every
+  build-identity change REPLACES the record wholesale before any
+  consumer renders against it (never field-wise mutation of a live
+  record), a stale record keyed to a different build than the one
+  being rendered MUST NOT be consumed, and no per-build drawer state
+  lives outside the record --- the record's key set is the
+  machine-derived census of per-build state, so cross-build bleed
+  (one build's focus, poll, or stream selector surviving into
+  another's render) is structurally unrepresentable rather than
+  reset-by-author-discipline.
+]
+Conformance rule over the landed wave-8 shape (the self-keyed
+`DrawerSession` + pre-render replacement close): minted
+rules-after-behavior because the wave-8 close predated this
+namespace; zero behavior change rides this rule.
+
+#r("dash.terminal-scope")[
+  The dashboard's per-derivation status vocabulary MUST be the
+  scheduler's derivation-status alphabet verbatim, conformance-pinned
+  by the cross-language golden snapshot (`derivation_statuses.json`:
+  every status string AND its `terminal` bit are asserted on both
+  sides): per-derivation surfaces (graph nodes, pills) render
+  derivation/attempt-scoped vocabulary --- `cancelled` is a
+  derivation's attempt state, gray and terminal, NOT a build outcome
+  --- and build-scoped terminal vocabulary enters only through
+  build-level surfaces. A scheduler-side status addition or
+  reclassification MUST fail both the Rust snapshot test and the
+  dashboard cross-language check before any unmapped string can fall
+  through to the gray default at runtime.
+]
+Same conformance form: the wave-8 client-stream close partitioned
+attempt-scoped from build-scoped terminal vocabulary gateway-side
+(#rref("gw.stderr.failure-hint") is the sibling mint from the same
+close family); this rule pins the dashboard half that was outside
+that wave's grant.
+
 #r("dash.graph.auto-stop+3")[
   The Graph tab's 5s `GetBuildGraph` poll MUST downshift to the settled
   cadence (`SETTLED_POLL_MS`, 30s) once every node is in a terminal status

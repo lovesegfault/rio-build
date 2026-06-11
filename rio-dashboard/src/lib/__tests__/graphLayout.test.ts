@@ -148,6 +148,7 @@ describe('graphLayout', () => {
     expect(r.degraded).toBe(false);
   });
 
+  // r[verify dash.terminal-scope]
   it('statusClass maps scheduler DerivationStatus strings', () => {
     // Mirror rio-scheduler/src/state/derivation.rs as_str() — if a new
     // status lands there without a mapping here, it defaults to gray
@@ -209,6 +210,7 @@ describe('graphLayout', () => {
     expect(covered).toEqual(new Set(DERIVATION_STATUSES));
   });
 
+  // r[verify dash.terminal-scope]
   it('TERMINAL mirrors scheduler is_terminal()', () => {
     // Cross-check against derivation.rs: is_terminal() matches
     // Completed|Poisoned|DependencyFailed|Cancelled|Skipped. NOT
