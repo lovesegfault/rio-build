@@ -1017,8 +1017,10 @@ impl DagActor {
 /// `N x the controller ack cadence` (the nodeclaim-pool tick, ~10s
 /// shipped): 30 passes ~= 5 minutes operator-visible budget — long
 /// enough to ride out a config rollout window (a reload that CHANGES
-/// the hosting-class set resets the counter via the detail-change law
-/// in [`step_no_host_counter`]), short enough that the measured live
+/// the hosting-class set resets the counter via the config-census
+/// reset key in [`step_no_host_counter`] — merged_bug_043(1): demand
+/// jitter in the verdict detail does NOT reset), short enough that
+/// the measured live
 /// loop (hours of Ready-forever churn, operator cancellation as the
 /// only exit) dies promptly. Violable by test loop count; the budget
 /// IS the envelope (R17 time axis).
@@ -1033,17 +1035,64 @@ pub(super) struct NoHostPoison {
     pub(super) detail: String,
 }
 
+/// One drv's consecutive-verdict track (merged_bug_043: the typed
+/// transition state — count, reset key, display detail, pass stamp —
+/// replacing the `(u32, String)` pair whose String was BOTH the reset
+/// key and the display message).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct NoHostTrack {
+    /// Consecutive verdict-carrying passes with identical census.
+    pub(super) count: u32,
+    /// The TYPED reset key: [`crate::sla::config::SlaConfig::
+    /// hosting_census`] at fold time — a hosting-class config change
+    /// re-opens the heal window (the law's axis); demand jitter in
+    /// the controller's formatted detail does NOT (merged_bug_043(1)).
+    pub(super) census: u64,
+    /// Latest verdict detail — DISPLAY-ONLY (the operator-actionable
+    /// poison message), never compared.
+    pub(super) detail: String,
+    /// The verdict-pass stamp this track last counted
+    /// (merged_bug_043(3)): "consecutive" means ADJACENT
+    /// verdict-carrying passes — a pass gap (the drv got no verdict
+    /// while others did: spawned, masked `UnplaceableAllMasked`, or
+    /// reaped) breaks the streak STRUCTURALLY, so a frozen track can
+    /// never claim false consecutiveness when verdicts resume (the
+    /// 29+1 false-"30 consecutive" shape). Lazy expiry — no curated
+    /// sweep position to bypass (the merged_bug_033 lesson, T3).
+    pub(super) pass: u64,
+}
+
 /// live_051(c): one consecutive-verdict counter step — pure, so the
-/// counter-lifecycle census walks it as a law table. A verdict whose
-/// `detail` differs from the last counted one RESTARTS the count at 1:
-/// the detail names the intent's footprint AND the configured classes,
-/// so a hosting-class config reload (or a re-solved demand) is
-/// observable in-band and re-opens the heal window — the budget counts
-/// CONSECUTIVE IDENTICAL rejection evidence only.
-pub(super) fn step_no_host_counter(prev: Option<&(u32, String)>, detail: &str) -> (u32, String) {
-    match prev {
-        Some((n, last)) if last == detail => (n.saturating_add(1), detail.to_owned()),
-        _ => (1, detail.to_owned()),
+/// counter-lifecycle census walks it as a law table. The count
+/// CONTINUES iff the hosting-config census is unchanged AND the pass
+/// is adjacent to the last counted one; everything else — census
+/// change (config reload re-opens the heal window), pass gap (the
+/// streak broke: no verdict for this drv on an evidence-carrying
+/// pass), or no prior track — RESTARTS at 1. The budget counts
+/// CONSECUTIVE IDENTICAL-CENSUS rejection evidence only; the
+/// controller's formatted detail (which embeds per-solve demand
+/// jitter) is carried for display, never compared
+/// (merged_bug_043(1)/(3)).
+pub(super) fn step_no_host_counter(
+    prev: Option<&NoHostTrack>,
+    census: u64,
+    detail: &str,
+    pass: u64,
+) -> NoHostTrack {
+    let count = match prev {
+        Some(t) if t.census == census && t.pass.saturating_add(1) == pass => {
+            t.count.saturating_add(1)
+        }
+        // Defensive idempotency: a same-pass re-step (unreachable
+        // through the in-request dedup) keeps the count.
+        Some(t) if t.census == census && t.pass == pass => t.count,
+        _ => 1,
+    };
+    NoHostTrack {
+        count,
+        census,
+        detail: detail.to_owned(),
+        pass,
     }
 }
 
@@ -1109,24 +1158,38 @@ pub(super) enum CellEmission {
 /// type-enforced gate: [`Self::disclose_once`] IS that gate — the LRU
 /// is private to this struct, so an emit site cannot bypass it.
 pub(super) struct SupplyRevalidation {
-    /// `drv -> (consecutive count, last detail)` for
-    /// `IntentVerdict::NO_HOSTING_CLASS` entries. Tenure-scoped
-    /// in-memory state (the IceBackoff precedent: ADR-023 "the
-    /// controller reports, the scheduler decides") — wiped on leader
-    /// transition; the controller re-mints fresh verdicts every tick,
-    /// so a successor re-burns its own budget.
-    pub(super) no_host_verdicts: std::collections::HashMap<DrvHash, (u32, String)>,
+    /// `drv -> NoHostTrack` for `IntentVerdict::NO_HOSTING_CLASS`
+    /// entries. Tenure-scoped in-memory state (the IceBackoff
+    /// precedent: ADR-023 "the controller reports, the scheduler
+    /// decides") — wiped on leader transition; the controller
+    /// re-mints fresh verdicts every tick, so a successor re-burns
+    /// its own budget.
+    pub(super) no_host_verdicts: std::collections::HashMap<DrvHash, NoHostTrack>,
+    /// The verdict-pass ordinal (merged_bug_043(3)): incremented once
+    /// per APPLIED ack that carries ≥1 verdict (the cover-pass
+    /// signature — per-pool acks without a verdict plane do not
+    /// advance it, so they cannot fake a gap). Tracks stamp it at
+    /// step time; adjacency IS consecutiveness.
+    pub(super) verdict_pass: u64,
     /// `(tenant, pname, kind)` emission-revalidation disclosures
     /// already made (kind ∈ {stale_resolved, unhostable} — the
-    /// `exit` label values). Once-per-edge like the mod.rs siblings;
-    /// eviction and leader transition re-arm (fail-safe over-emit).
-    disclosed: parking_lot::Mutex<lru::LruCache<(String, String, &'static str), ()>>,
+    /// `exit` label values), each carrying the DISCLOSING drv.
+    /// Once-per-EPISODE (bug_119): the heal edge — a healthy
+    /// classified emission for the same `(tenant, pname)` BY THE SAME
+    /// drv — pops both kinds, so a relapse discloses again. The
+    /// drv-matched pop keeps the pname-level spam bound sound when
+    /// same-pname drvs have mixed health (per-drv floors): a healthy
+    /// sibling cannot oscillate a latch a sick sibling holds.
+    /// Eviction and leader transition also re-arm (fail-safe
+    /// over-emit).
+    disclosed: parking_lot::Mutex<lru::LruCache<(String, String, &'static str), DrvHash>>,
 }
 
 impl Default for SupplyRevalidation {
     fn default() -> Self {
         Self {
             no_host_verdicts: std::collections::HashMap::new(),
+            verdict_pass: 0,
             disclosed: parking_lot::Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(1024).unwrap(),
             )),
@@ -1135,13 +1198,44 @@ impl Default for SupplyRevalidation {
 }
 
 impl SupplyRevalidation {
-    /// True exactly once per `(tenant, pname, kind)` edge (until
-    /// eviction/transition re-arms) — the type-level debounce gate.
-    pub(super) fn disclose_once(&self, tenant: &str, pname: &str, kind: &'static str) -> bool {
+    /// True exactly once per `(tenant, pname, kind)` EPISODE — the
+    /// type-level debounce gate. An episode opens at the first
+    /// disclosure (recording the disclosing drv) and closes at
+    /// [`Self::heal`]. A different sick drv under a live latch
+    /// re-points the latch at itself without re-disclosing (the
+    /// pname-level spam bound).
+    pub(super) fn disclose_once(
+        &self,
+        tenant: &str,
+        pname: &str,
+        kind: &'static str,
+        drv: &DrvHash,
+    ) -> bool {
         self.disclosed
             .lock()
-            .put((tenant.to_owned(), pname.to_owned(), kind), ())
+            .put((tenant.to_owned(), pname.to_owned(), kind), drv.clone())
             .is_none()
+    }
+
+    /// bug_119: the HEAL EDGE — a healthy classified emission
+    /// (`Cells`/`HwAgnostic`/memo-survives) closes any disclosure
+    /// episode THE SAME drv opened (or last re-pointed), so a relapse
+    /// discloses again. The latch lives where the heal is visible
+    /// (the emission classifier — the `ice_exhausted` rising-edge
+    /// pattern on the SAME metric family is the in-tree precedent);
+    /// pre-fix the LRU was insert-only and the per-episode law
+    /// silently became per-tenure. Drv-matched: a healthy same-pname
+    /// sibling never pops a latch a sick drv holds (per-drv floors
+    /// make mixed health within a pname real — an unmatched pop would
+    /// oscillate the latch into per-poll re-disclosure).
+    pub(super) fn heal(&self, tenant: &str, pname: &str, drv: &DrvHash) {
+        let mut d = self.disclosed.lock();
+        for kind in ["stale_resolved", "unhostable"] {
+            let k = (tenant.to_owned(), pname.to_owned(), kind);
+            if d.peek(&k) == Some(drv) {
+                d.pop(&k);
+            }
+        }
     }
 }
 
@@ -1540,11 +1634,22 @@ impl AckApplyPlan {
         if !acked_spawned.is_empty() {
             let now = crate::db::attempts::epoch_now();
             for h in acked_spawned {
-                // live_051(c): a spawned ack is the success signal for
-                // the consecutive-verdict budget — the track resets
-                // (the heal path of `step_no_host_counter`'s law).
-                actor.supply_reval.no_host_verdicts.remove(&h);
-                actor.acked_spawned.insert(h, now);
+                // live_051(c) + merged_bug_043(2): a spawned ack heals
+                // the consecutive-verdict budget only on the FRESH
+                // spawn edge. The pool reconciler re-acks
+                // already-Pending Jobs in `spawned` every tick — a
+                // Job-EXISTS echo, not a hosting witness — and the
+                // pre-fix unconditional reset let a Pending-forever
+                // Job keep a genuinely-unhostable drv looping Ready.
+                // Freshness is structural: the `acked_spawned` entry
+                // is refreshed per ack and pruned at 2× the defer
+                // window, so a still-Pending Job's re-acks always find
+                // a live entry (echo ⇒ no reset), while a genuinely
+                // new spawn after a quiet gap finds none (fresh ⇒
+                // reset — the heal).
+                if actor.acked_spawned.insert(h.clone(), now).is_none() {
+                    actor.supply_reval.no_host_verdicts.remove(&h);
+                }
             }
             actor
                 .acked_spawned
@@ -1629,18 +1734,48 @@ impl AckApplyPlan {
         // controller's `admin_call` is single-shot per tick), and this
         // fold counts at most once per drv per APPLIED request (the
         // `seen` dedup below kills duplicate entries within one ack).
-        // A spawned entry for a drv is the success signal — its track
-        // resets (the heal path); a detail change restarts at 1 (the
-        // config-reload reset, in-band via the detail's configured-
-        // classes text — see `step_no_host_counter`).
+        // A FRESH spawned entry for a drv is the success signal — its
+        // track resets (the heal edge; a Pending re-ack echo does
+        // not, merged_bug_043(2)); a hosting-config census change
+        // restarts at 1 (the config-reload reset) and a pass gap
+        // restarts at 1 (the typed non-event) — see
+        // `step_no_host_counter`; the verdict detail is display-only.
         let mut poisons = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
+        // merged_bug_043(3): the verdict-pass ordinal advances once
+        // per APPLIED ack carrying ≥1 verdict — the cover-pass
+        // signature. Tracks stamp it; a track whose stamp is not
+        // adjacent to the current pass restarts at 1 in
+        // `step_no_host_counter` (the typed no-verdict-this-pass
+        // non-event: spawned/masked/reaped drvs break their streak
+        // structurally instead of freezing). Residual (recorded): a
+        // cover pass yielding ZERO verdicts fleet-wide does not
+        // advance the ordinal — such a pass is indistinguishable from
+        // no pass on the current wire; any drv-visible gap (the
+        // frozen-29-track shape) requires other drvs' verdicts, which
+        // DO advance it.
+        if !verdicts.is_empty() {
+            actor.supply_reval.verdict_pass += 1;
+        }
+        let pass = actor.supply_reval.verdict_pass;
+        // merged_bug_043(1): the typed reset key — computed once per
+        // verdict-carrying ack, never per verdict.
+        let census = if verdicts.is_empty() {
+            0
+        } else {
+            actor.sla_config.hosting_census()
+        };
         for (drv, detail) in verdicts {
             if !seen.insert(drv.clone()) {
                 continue;
             }
-            let next = step_no_host_counter(actor.supply_reval.no_host_verdicts.get(&drv), &detail);
-            if next.0 >= NO_HOST_VERDICTS_TO_POISON {
+            let next = step_no_host_counter(
+                actor.supply_reval.no_host_verdicts.get(&drv),
+                census,
+                &detail,
+                pass,
+            );
+            if next.count >= NO_HOST_VERDICTS_TO_POISON {
                 // Only the Ready loop population poisons — a drv that
                 // already left Ready (cancelled, substituted,
                 // completed) gets its track dropped instead.
@@ -2237,6 +2372,17 @@ impl DagActor {
                     eff_cores <= cc && eff_mem <= cm
                 });
                 if survives {
+                    // bug_119: a memo emission whose cells survive the
+                    // live ceilings is a HEALTHY letter too — the heal
+                    // edge closes any open disclosure episode here
+                    // exactly as the fold's Cells arm does (the memo
+                    // path bypasses the fold by design when nothing
+                    // re-classifies).
+                    self.supply_reval.heal(
+                        &tenant,
+                        state.pname.as_deref().unwrap_or(""),
+                        &state.drv_hash,
+                    );
                     (
                         memo.a.c_star,
                         memo.a.mem_bytes,
@@ -3006,12 +3152,30 @@ impl DagActor {
         state: &crate::state::DerivationState,
     ) -> (u32, u64, Vec<crate::sla::config::Cell>) {
         match emission {
-            CellEmission::Cells(cells) => (cores, mem, cells),
+            // Healthy letters close any open disclosure episode
+            // (bug_119: the heal edge, visible exactly here — a
+            // routed/agnostic emission means the ceilings host the
+            // demand again, so a relapse must disclose anew).
+            CellEmission::Cells(cells) => {
+                self.supply_reval.heal(
+                    tenant,
+                    state.pname.as_deref().unwrap_or(""),
+                    &state.drv_hash,
+                );
+                (cores, mem, cells)
+            }
             // Genuinely hw-agnostic (∅ features, no
             // infeasibility evidence) — the §13e cold-start
             // quiet edge survives BY TYPE, not by shared
             // emptiness (R18's regression pin).
-            CellEmission::HwAgnostic => (cores, mem, Vec::new()),
+            CellEmission::HwAgnostic => {
+                self.supply_reval.heal(
+                    tenant,
+                    state.pname.as_deref().unwrap_or(""),
+                    &state.drv_hash,
+                );
+                (cores, mem, Vec::new())
+            }
             // Operator `--capacity` pin not hosted — the r31
             // A3 lane already disclosed (debounced warn in
             // `bypass_cells`); emission stays empty so the
@@ -3033,6 +3197,7 @@ impl DagActor {
                     tenant,
                     state.pname.as_deref().unwrap_or(""),
                     "stale_resolved",
+                    &state.drv_hash,
                 ) {
                     ::metrics::counter!(
                         "rio_scheduler_sla_hw_ladder_exhausted_total",
@@ -3067,6 +3232,7 @@ impl DagActor {
                     tenant,
                     state.pname.as_deref().unwrap_or(""),
                     "unhostable",
+                    &state.drv_hash,
                 ) {
                     ::metrics::counter!(
                         "rio_scheduler_sla_hw_ladder_exhausted_total",

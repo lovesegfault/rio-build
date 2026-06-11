@@ -663,6 +663,33 @@ impl SlaConfig {
             .map_or(CapacityType::ALL.as_slice(), |d| &d.capacity_types)
     }
 
+    /// merged_bug_043(1): the hosting-class CONFIG CENSUS — one u64
+    /// over the sorted per-class hosting axes (name, cfg ceilings,
+    /// capacity types, provided features). The consecutive-verdict
+    /// budget's RESET KEY: the live_051(c) law re-opens the heal
+    /// window on "a hosting-class config reload", and pre-fix that
+    /// was approximated by raw byte-equality of the controller's
+    /// verdict detail — which embeds per-solve `cores`/`mem_bytes`,
+    /// so routine refit/price jitter restarted the count forever and
+    /// structurally defeated the budget for exactly the churn
+    /// population it shipped to kill. Demand jitter is NOT a config
+    /// change; this census is the typed axis.
+    pub fn hosting_census(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut names: Vec<&String> = self.hw_classes.keys().collect();
+        names.sort_unstable();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for name in names {
+            let d = &self.hw_classes[name];
+            name.hash(&mut h);
+            d.max_cores.hash(&mut h);
+            d.max_mem.hash(&mut h);
+            d.capacity_types.hash(&mut h);
+            d.provides_features.hash(&mut h);
+        }
+        h.finish()
+    }
+
     /// `[sla.hw_classes.$h].provides_features`. Unknown `h` → `&[]`.
     pub fn provides_for(&self, h: &str) -> &[String] {
         self.hw_classes.get(h).map_or(&[], |d| &d.provides_features)

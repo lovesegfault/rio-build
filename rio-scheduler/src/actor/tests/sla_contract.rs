@@ -5324,8 +5324,8 @@ fn no_host_verdict(id: &str, detail: &str) -> rio_proto::types::IntentVerdict {
 /// Kill-isolation pins (each its own conjunct):
 /// - N−1 verdicts then a SPAWNED echo for the drv → the track resets
 ///   (the heal path) — N−1 further verdicts still do not poison;
-/// - a verdict whose `detail` changed (config reload / re-solved
-///   demand, in-band) restarts the count at 1;
+/// - a hosting-class config change (the census reset key) restarts
+///   the count at 1; detail jitter does NOT (merged_bug_043(1));
 /// - duplicate entries for one drv within ONE ack count once (the
 ///   in-request dedup half of the redelivery law; the cross-request
 ///   half is the PRODUCER's no-buffer law — `CoverResult::rejected`
@@ -5396,7 +5396,7 @@ async fn n_no_host_verdicts_poison_the_drv_with_the_verdict_message() {
 /// plane (see `n_no_host_verdicts_poison_the_drv_with_the_verdict_
 /// message` for the poison half).
 #[tokio::test]
-async fn verdict_budget_resets_on_spawn_detail_change_and_dedups_in_request() {
+async fn verdict_budget_resets_on_spawn_and_census_change_and_dedups_in_request() {
     use crate::actor::snapshot::NO_HOST_VERDICTS_TO_POISON as N;
     let db = TestDb::new(&MIGRATOR).await;
     crate::actor::tests::seed_default_tenant(&db.pool).await;
@@ -5451,8 +5451,12 @@ async fn verdict_budget_resets_on_spawn_detail_change_and_dedups_in_request() {
         );
     }
 
-    // (b) detail change restarts at 1: one B-verdict after the A-run
-    // (count N−1) leaves a track of 1 — N−2 more Bs still no poison.
+    // (b) detail JITTER does NOT restart (merged_bug_043(1)): the
+    // count after the second A-run sits at N−1; one byte-different
+    // B-verdict with an UNCHANGED hosting config is consecutive
+    // evidence — the budget crosses HERE (pre-fix the byte-diff
+    // restarted at 1 and the budget was structurally defeated for
+    // the refit/price-churn population).
     let p = actor
         .handle_ack_spawned_intents(
             &[],
@@ -5464,8 +5468,17 @@ async fn verdict_budget_resets_on_spawn_detail_change_and_dedups_in_request() {
             &[no_host_verdict("d-heal", "B")],
         )
         .expect("applied");
-    assert!(p.is_empty(), "detail change restarts the count at 1");
-    for k in 0..N.saturating_sub(2) {
+    assert_eq!(
+        p.len(),
+        1,
+        "detail jitter is display-only — the budget crosses at N"
+    );
+
+    // (b2) a hosting-class CONFIG change restarts at 1 (the law's
+    // heal-window axis, now keyed on the scheduler's own config
+    // census): drive a fresh track to N−1, mutate the config, then
+    // one more verdict — the count restarted, no poison.
+    for k in 1..N {
         let p = actor
             .handle_ack_spawned_intents(
                 &[],
@@ -5474,10 +5487,48 @@ async fn verdict_budget_resets_on_spawn_detail_change_and_dedups_in_request() {
                 &[],
                 &[],
                 None,
-                &[no_host_verdict("d-heal", "B")],
+                &[no_host_verdict("d-heal", "C")],
             )
             .expect("applied");
-        assert!(p.is_empty(), "B-run still inside the budget at {}", k + 2);
+        assert!(p.is_empty(), "C-run inside the budget at {k}");
+    }
+    actor
+        .sla_config
+        .hw_classes
+        .get_mut("intel-6")
+        .unwrap()
+        .max_mem = Some(64 << 30);
+    let p = actor
+        .handle_ack_spawned_intents(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[no_host_verdict("d-heal", "C")],
+        )
+        .expect("applied");
+    assert!(
+        p.is_empty(),
+        "a hosting-class config change re-opens the heal window \
+         (census restart at 1)"
+    );
+    // Re-build the track to N−1 under the NEW census for the dedup
+    // conjunct below (the restart left it at 1).
+    for k in 2..N {
+        let p = actor
+            .handle_ack_spawned_intents(
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                None,
+                &[no_host_verdict("d-heal", "C")],
+            )
+            .expect("applied");
+        assert!(p.is_empty(), "post-census C-run inside the budget at {k}");
     }
 
     // (c) in-request dedup: ONE ack carrying the drv twice counts
@@ -5502,30 +5553,58 @@ async fn verdict_budget_resets_on_spawn_detail_change_and_dedups_in_request() {
 
 // r[verify scheduler.sla.ceiling.stale-solve-revalidation]
 /// Counter-lifecycle law table (R15 product census over the step
-/// alphabet): `step_no_host_counter` walked over (prev-state ×
-/// event-detail) cells with a HAND-WRITTEN oracle (never the impl's
-/// own expression). The apply-plane composition rows (spawn reset,
-/// in-request dedup, Ready-only poison) are pinned by the two
-/// production-plane tests above.
+/// alphabet, merged_bug_043 form): `step_no_host_counter` walked over
+/// (prev-track × census × pass) cells with a HAND-WRITTEN oracle
+/// (never the impl's own expression). The detail is DISPLAY-ONLY —
+/// rows pin that a byte-different detail with identical census/pass
+/// adjacency CONTINUES the count (the jitter law), that a census
+/// change restarts (the config-reload heal window), and that a pass
+/// gap restarts (the typed no-verdict non-event — a frozen track can
+/// never claim false consecutiveness). The apply-plane composition
+/// rows (fresh-spawn-edge reset, in-request dedup, Ready-only poison)
+/// are pinned by the production-plane tests above.
 #[test]
 fn no_host_counter_step_law_table() {
-    use crate::actor::snapshot::step_no_host_counter as step;
-    // (prev, incoming detail) → (count, detail) — hand oracle.
+    use crate::actor::snapshot::{NoHostTrack, step_no_host_counter as step};
+    let track = |count: u32, census: u64, detail: &str, pass: u64| NoHostTrack {
+        count,
+        census,
+        detail: detail.to_owned(),
+        pass,
+    };
+    // (prev, census, detail, pass) → (count, detail) — hand oracle.
     #[allow(clippy::type_complexity)] // law-table rows read better flat
-    let rows: &[(Option<(u32, &str)>, &str, (u32, &str))] = &[
-        (None, "A", (1, "A")),                         // first evidence
-        (Some((1, "A")), "A", (2, "A")),               // consecutive identical
-        (Some((7, "A")), "A", (8, "A")),               // accumulates
-        (Some((7, "A")), "B", (1, "B")),               // detail change restarts
-        (Some((u32::MAX, "A")), "A", (u32::MAX, "A")), // saturates, no wrap
+    let rows: &[(Option<NoHostTrack>, u64, &str, u64, (u32, &str))] = &[
+        // first evidence
+        (None, 9, "A", 1, (1, "A")),
+        // consecutive identical (adjacent pass, same census)
+        (Some(track(1, 9, "A", 1)), 9, "A", 2, (2, "A")),
+        (Some(track(7, 9, "A", 4)), 9, "A", 5, (8, "A")),
+        // DETAIL JITTER does NOT restart (merged_bug_043(1)): the
+        // detail is display-only — count continues, detail updates.
+        (Some(track(7, 9, "A", 4)), 9, "B", 5, (8, "B")),
+        // census change restarts (the config-reload heal window).
+        (Some(track(7, 9, "A", 4)), 10, "A", 5, (1, "A")),
+        // PASS GAP restarts (merged_bug_043(3)): the streak broke on
+        // an evidence-carrying pass that skipped this drv.
+        (Some(track(29, 9, "A", 4)), 9, "A", 6, (1, "A")),
+        // same-pass re-step is idempotent (defensive; unreachable
+        // through the in-request dedup).
+        (Some(track(7, 9, "A", 4)), 9, "A", 4, (7, "A")),
+        // saturates, no wrap
+        (Some(track(u32::MAX, 9, "A", 4)), 9, "A", 5, (u32::MAX, "A")),
     ];
-    for (prev, detail, want) in rows {
-        let prev_owned = prev.map(|(n, d)| (n, d.to_string()));
-        let got = step(prev_owned.as_ref(), detail);
+    for (prev, census, detail, pass, want) in rows {
+        let got = step(prev.as_ref(), *census, detail, *pass);
         assert_eq!(
-            (got.0, got.1.as_str()),
+            (got.count, got.detail.as_str()),
             (want.0, want.1),
-            "row ({prev:?}, {detail})"
+            "row ({prev:?}, census={census}, {detail}, pass={pass})"
+        );
+        assert_eq!(
+            (got.census, got.pass),
+            (*census, *pass),
+            "the track stamps the step's census and pass"
         );
     }
 }
@@ -6328,5 +6407,326 @@ async fn pinned_demand_prefers_the_pin_honoring_sibling() {
         cells.len() == 1 && matches!(cells[0].1, CapacityType::Spot),
         "the oversize face honors the pin exactly like the fitting \
          face (W9-U): {cells:?}"
+    );
+}
+
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+/// **W9-V (merged_bug_043(1))** — *a genuinely-unhostable drv under
+/// continuous detail-jitter churn POISONS at the budget* (the
+/// eternal-Ready inverse; the jitter population driven).
+///
+/// The controller's verdict detail embeds per-solve `cores`/
+/// `mem_bytes` — routine refit/price churn faster than the ~5min
+/// budget window re-minted a byte-different detail every pass, and
+/// the pre-fix reset key (raw detail equality) restarted the count at
+/// 1 forever: the live_051(c) budget was structurally defeated for
+/// exactly the churn population it shipped to kill. The reset key is
+/// now the scheduler's hosting-class config census (the axis the law
+/// cares about: a config reload re-opens the heal window) — demand
+/// jitter does not reset.
+#[tokio::test]
+async fn jitter_churn_does_not_defeat_the_verdict_budget() {
+    use crate::actor::snapshot::NO_HOST_VERDICTS_TO_POISON as N;
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw_builders_only(db.pool.clone());
+    actor.test_inject_ready("d-jitter", Some("test-pkg"), "x86_64-linux", false);
+    let jitter_detail = |k: u32| {
+        format!(
+            "no [sla.hw_classes] entry hosts system=x86_64-linux cores={} \
+             mem_bytes={} required_features=[]; configured classes: \
+             [intel-6, intel-7, intel-8]",
+            4 + k,
+            (6u64 << 30) + u64::from(k)
+        )
+    };
+
+    // N−1 applied acks, each with a byte-DIFFERENT detail (the
+    // refit/price jitter shape): counted, never poisoned.
+    for k in 1..N {
+        let p = actor
+            .handle_ack_spawned_intents(
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                None,
+                &[no_host_verdict("d-jitter", &jitter_detail(k))],
+            )
+            .expect("applied under leadership");
+        assert!(p.is_empty(), "no poison at {k} < {N}");
+    }
+    // The Nth jittered verdict crosses the budget — the config census
+    // never changed, so the evidence is consecutive.
+    let p = actor
+        .handle_ack_spawned_intents(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[no_host_verdict("d-jitter", &jitter_detail(N))],
+        )
+        .expect("applied under leadership");
+    assert_eq!(
+        p.len(),
+        1,
+        "demand jitter must NOT defeat the verdict budget \
+         (merged_bug_043: the reset key is the config census, never \
+         the formatted detail) — budget crossing at exactly N = {N}"
+    );
+}
+
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+/// **W9-Y (bug_119)** — *heal-then-relapse for the same
+/// `(tenant, pname)` discloses BOTH episodes* (warn + increment) —
+/// the per-episode quantifier driven across the latch boundary.
+///
+/// Pre-fix the `disclose_once` LRU was INSERT-ONLY: no heal-edge pop
+/// existed (re-arm only via leader transition or 1024-entry
+/// eviction), so the spec law's per-episode "clamp disclosed"
+/// obligation silently became per-TENURE — every recurrence within a
+/// tenure was invisible to `increase()`-based monitoring while the
+/// sibling `all_masked` exit on the SAME metric re-armed correctly
+/// via the `ice_exhausted` rising edge. The latch now lives where the
+/// heal edge is visible: a healthy classified emission
+/// (`Cells`/`HwAgnostic`/memo-survives) pops the latch.
+#[tokio::test]
+async fn heal_then_relapse_discloses_both_episodes() {
+    use crate::sla::metrics::counter_map_by;
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    let mut actor = bare_actor_hw(db.pool.clone());
+    for h in ["intel-6", "intel-7", "intel-8"] {
+        actor.sla_config.hw_classes.get_mut(h).unwrap().max_mem = Some(128 << 30);
+    }
+    actor.test_inject_ready("d-relapse", Some("test-pkg"), "x86_64-linux", false);
+    let (hw, cost, g) = actor.solve_inputs();
+
+    // Episode 1: memoize, then bump the floor past every class
+    // ceiling — Unhostable, disclosed.
+    let i0 = actor.solve_intent_for(actor.dag.node("d-relapse").unwrap(), &hw, &cost, g);
+    assert!(!i0.hw_class_names.is_empty(), "precondition: routed");
+    actor
+        .dag
+        .node_mut("d-relapse")
+        .unwrap()
+        .sched
+        .resource_floor
+        .mem_bytes = 160 << 30;
+    {
+        let _g = metrics::set_default_local_recorder(&rec);
+        let _ = actor.solve_intent_for(actor.dag.node("d-relapse").unwrap(), &hw, &cost, g);
+    }
+
+    // HEAL: the class ceilings re-grow past the floor — the emission
+    // routes again (the heal edge, visible at the classifier).
+    for h in ["intel-6", "intel-7", "intel-8"] {
+        actor.sla_config.hw_classes.get_mut(h).unwrap().max_mem = Some(256 << 30);
+    }
+    {
+        let _g = metrics::set_default_local_recorder(&rec);
+        let healed = actor.solve_intent_for(actor.dag.node("d-relapse").unwrap(), &hw, &cost, g);
+        assert!(
+            !healed.hw_class_names.is_empty(),
+            "the heal routes: {healed:?}"
+        );
+    }
+
+    // RELAPSE: ceilings shrink again — the SAME (tenant, pname) must
+    // disclose the second episode.
+    for h in ["intel-6", "intel-7", "intel-8"] {
+        actor.sla_config.hw_classes.get_mut(h).unwrap().max_mem = Some(128 << 30);
+    }
+    {
+        let _g = metrics::set_default_local_recorder(&rec);
+        let _ = actor.solve_intent_for(actor.dag.node("d-relapse").unwrap(), &hw, &cost, g);
+    }
+
+    // ONE snapshot read (it drains) — counters accumulate across the
+    // three recorded passes.
+    let exits = counter_map_by(
+        &snap,
+        "rio_scheduler_sla_hw_ladder_exhausted_total",
+        Some("exit"),
+    );
+    assert_eq!(
+        exits.get("unhostable").copied().unwrap_or(0),
+        2,
+        "heal-then-relapse discloses BOTH episodes (bug_119: the \
+         per-episode law, not per-tenure) — exits: {exits:?}"
+    );
+}
+
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+/// **W9-W (merged_bug_043(2))** — *a Pending re-ack (Job-EXISTS echo)
+/// does NOT reset the counter; the fresh spawn edge does* (both
+/// edges).
+///
+/// The pool reconciler re-acks already-Pending Jobs in `spawned`
+/// every tick; pre-fix the unconditional spawned-ack reset treated
+/// that echo as a heal, so a genuinely-unhostable drv with a
+/// Pending-forever Job kept its track at zero and looped Ready
+/// eternally. The heal witness is now the FRESH edge: an ack whose
+/// drv has no live `acked_spawned` entry (the entry is refreshed per
+/// ack and pruned at 2× the defer window, so a still-Pending Job's
+/// re-acks are echoes by construction).
+#[tokio::test]
+async fn pending_reack_echo_does_not_reset_the_verdict_budget() {
+    use crate::actor::snapshot::NO_HOST_VERDICTS_TO_POISON as N;
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw_builders_only(db.pool.clone());
+    actor.test_inject_ready("d-echo", Some("test-pkg"), "x86_64-linux", false);
+    let spawned = rio_proto::types::SpawnIntent {
+        intent_id: "d-echo".into(),
+        ..Default::default()
+    };
+
+    // Fresh edge: the FIRST spawned ack resets (the heal) — drive the
+    // track to N−1, spawn-ack, then N−1 more verdicts stay unpoisoned.
+    for _ in 1..N {
+        actor
+            .handle_ack_spawned_intents(
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                None,
+                &[no_host_verdict("d-echo", "A")],
+            )
+            .expect("applied");
+    }
+    actor
+        .handle_ack_spawned_intents(
+            std::slice::from_ref(&spawned),
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[],
+        )
+        .expect("applied");
+    for k in 1..N {
+        let p = actor
+            .handle_ack_spawned_intents(
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                None,
+                &[no_host_verdict("d-echo", "A")],
+            )
+            .expect("applied");
+        assert!(p.is_empty(), "fresh spawn edge healed the track ({k})");
+    }
+    // Echo edge: the drv's acked_spawned entry is LIVE (just
+    // refreshed by the verdict-run? no — by the spawn ack above and
+    // every subsequent spawned re-ack below). A re-ack does NOT
+    // reset: the track sits at N−1; one more verdict crosses.
+    actor
+        .handle_ack_spawned_intents(
+            std::slice::from_ref(&spawned),
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[],
+        )
+        .expect("applied (the echo)");
+    let p = actor
+        .handle_ack_spawned_intents(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[no_host_verdict("d-echo", "A")],
+        )
+        .expect("applied");
+    assert_eq!(
+        p.len(),
+        1,
+        "a Job-EXISTS echo is not a hosting witness — the track \
+         survived the re-ack and the budget crossed (merged_bug_043(2))"
+    );
+}
+
+// r[verify scheduler.sla.ceiling.stale-solve-revalidation]
+/// **W9-X (merged_bug_043(3))** — *verdicts-cease-while-Ready decays
+/// the track structurally: a later identical verdict cannot claim
+/// false consecutiveness* (the frozen-29+1 shape pinned).
+///
+/// `UnplaceableAllMasked` ships no verdict (cover.rs's
+/// `verdict_reason` law), so pre-fix a track frozen at 29 survived
+/// any masked period and poisoned on ONE fresh verdict with a false
+/// "30 consecutive" message. The pass stamp types the non-event:
+/// verdict-carrying acks advance the pass ordinal, and a track whose
+/// stamp is not adjacent restarts at 1.
+#[tokio::test]
+async fn frozen_track_cannot_claim_false_consecutiveness() {
+    use crate::actor::snapshot::NO_HOST_VERDICTS_TO_POISON as N;
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_hw_builders_only(db.pool.clone());
+    actor.test_inject_ready("d-frozen", Some("test-pkg"), "x86_64-linux", false);
+    actor.test_inject_ready("d-other", Some("test-pkg"), "x86_64-linux", false);
+
+    // Drive d-frozen to N−1 (29 with the shipped budget).
+    for _ in 1..N {
+        actor
+            .handle_ack_spawned_intents(
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                None,
+                &[no_host_verdict("d-frozen", "A")],
+            )
+            .expect("applied");
+    }
+    // The gap: verdict-carrying passes that SKIP d-frozen (its
+    // outcome went UnplaceableAllMasked — no verdict minted) while
+    // d-other keeps the evidence flowing.
+    for _ in 0..3 {
+        actor
+            .handle_ack_spawned_intents(
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                None,
+                &[no_host_verdict("d-other", "A")],
+            )
+            .expect("applied");
+    }
+    // Verdicts resume for d-frozen with an IDENTICAL detail: the
+    // streak broke — restart at 1, never a false "30 consecutive".
+    let p = actor
+        .handle_ack_spawned_intents(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[no_host_verdict("d-frozen", "A")],
+        )
+        .expect("applied");
+    assert!(
+        p.is_empty(),
+        "a frozen track restarts after a pass gap (merged_bug_043(3)) \
+         — got a poison claiming false consecutiveness: {p:?}"
     );
 }
