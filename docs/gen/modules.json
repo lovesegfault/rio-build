@@ -1398,6 +1398,11 @@
       "doc": "Chunk storage backends."
     },
     {
+      "path": "budget.rs",
+      "depth": 0,
+      "doc": "The shared NAR-budget cost-axis home (merged_bug_005's close)."
+    },
+    {
       "path": "cas.rs",
       "depth": 0,
       "doc": "Chunked content-addressable storage orchestration."
@@ -1431,6 +1436,11 @@
       "path": "gc/drain.rs",
       "depth": 1,
       "doc": "Drain task: consume `pending_s3_deletes`, call `ChunkBackend::delete_by_key`."
+    },
+    {
+      "path": "gc/lane.rs",
+      "depth": 1,
+      "doc": "The destructive-lane protocol (merged_bug_050's close): the GC hold suspends EVERY lane with delete authority, as a property of the lane ABSTRACTION, not of one entry point."
     },
     {
       "path": "gc/lock.rs",

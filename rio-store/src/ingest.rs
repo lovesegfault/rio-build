@@ -189,8 +189,12 @@ pub async fn claim_placeholder(
         // proceed; chunks the dead manifest referenced are the collect
         // cycle's business.
         let threshold = SUBSTITUTE_STALE_THRESHOLD.as_secs() as i64;
-        match crate::gc::orphan::reap_one(pool, store_path_hash, ReapBy::Stale { secs: threshold })
-            .await
+        match crate::gc::orphan::reap_one_consulted(
+            pool,
+            store_path_hash,
+            ReapBy::Stale { secs: threshold },
+        )
+        .await
         {
             Ok(true) => {
                 warn!(
@@ -451,7 +455,8 @@ impl Drop for PlaceholderGuard {
         let claim = self.claim;
         rio_common::task::spawn_monitored("put-path-placeholder-reap", async move {
             if let Err(e) =
-                crate::gc::orphan::reap_one(&pool, &store_path_hash, ReapBy::Claim(claim)).await
+                crate::gc::orphan::reap_one_consulted(&pool, &store_path_hash, ReapBy::Claim(claim))
+                    .await
             {
                 warn!(
                     store_path_hash = %hex::encode(&store_path_hash),
@@ -542,7 +547,9 @@ pub fn spawn_placeholder_guard(
 /// slot. Chunks the aborted upload staged are left for the collect
 /// cycle.
 pub async fn abort_placeholder(pool: &PgPool, store_path_hash: &[u8], claim: Uuid) {
-    if let Err(e) = crate::gc::orphan::reap_one(pool, store_path_hash, ReapBy::Claim(claim)).await {
+    if let Err(e) =
+        crate::gc::orphan::reap_one_consulted(pool, store_path_hash, ReapBy::Claim(claim)).await
+    {
         warn!(
             store_path_hash = %hex::encode(store_path_hash),
             error = %e,

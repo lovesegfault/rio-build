@@ -24,7 +24,7 @@ const MAX_ATTEMPTS: i32 = 10;
 /// Interval between drain iterations. 30s: fast enough to keep
 /// the pending table small under steady-state GC, slow enough to
 /// not hammer S3 when there's nothing to do.
-const DRAIN_INTERVAL: Duration = Duration::from_secs(30);
+pub(crate) const DRAIN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Run one drain iteration. Returns (deleted_count, failed_count).
 ///
@@ -56,9 +56,11 @@ const DRAIN_INTERVAL: Duration = Duration::from_secs(30);
 /// time, equivalent under contention. If a per-row tx rolls back, the
 /// S3 delete that already happened is re-processed next iteration (S3
 /// delete of a non-existent key is a no-op).
+// r[impl store.gc.hold-lanes]
 pub async fn drain_once(
     pool: &PgPool,
     backend: &Arc<dyn ChunkBackend>,
+    _clearance: &crate::gc::hold::HoldClearance,
 ) -> Result<(u64, u64), sqlx::Error> {
     let mut deleted = 0u64;
     let mut failed = 0u64;
@@ -282,15 +284,29 @@ pub fn spawn_drain_task(
     backend: Arc<dyn ChunkBackend>,
     shutdown: rio_common::signal::Token,
 ) -> tokio::task::JoinHandle<()> {
-    rio_common::task::spawn_periodic("gc-drain-task", DRAIN_INTERVAL, shutdown, move || {
-        let pool = pool.clone();
-        let backend = Arc::clone(&backend);
-        async move {
-            if let Err(e) = drain_once(&pool, &backend).await {
-                warn!(error = %e, "drain iteration failed (will retry)");
-            }
-        }
-    })
+    // r[impl store.gc.hold-lanes]
+    // Registered through DestructiveLane (merged_bug_050): during an
+    // active global hold the drain HOLDS its queue —
+    // pending_s3_deletes rows age, never execute — so the
+    // soft-delete recovery window the hold exists to freeze is
+    // actually frozen (pre-fix the un-held drain irreversibly
+    // executed enqueued S3 deletes within 30s of a held collect).
+    let lane_pool = pool.clone();
+    crate::gc::lane::DestructiveLane::spawn_periodic(
+        "gc-drain-task",
+        DRAIN_INTERVAL,
+        pool,
+        shutdown,
+        Box::new(move |clearance| {
+            let pool = lane_pool.clone();
+            let backend = Arc::clone(&backend);
+            Box::pin(async move {
+                if let Err(e) = drain_once(&pool, &backend, clearance).await {
+                    warn!(error = %e, "drain iteration failed (will retry)");
+                }
+            })
+        }),
+    )
 }
 
 // r[verify store.gc.pending-deletes+2]
@@ -321,7 +337,13 @@ mod tests {
 
         // Drain: should delete the chunk from backend + remove
         // the pending row.
-        let (deleted, failed) = drain_once(&db.pool, &backend).await.unwrap();
+        let (deleted, failed) = drain_once(
+            &db.pool,
+            &backend,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
         assert_eq!(deleted, 1, "one row drained");
         assert_eq!(failed, 0);
 
@@ -350,7 +372,13 @@ mod tests {
             .await
             .unwrap();
 
-        let (deleted, failed) = drain_once(&db.pool, &backend).await.unwrap();
+        let (deleted, failed) = drain_once(
+            &db.pool,
+            &backend,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
         assert_eq!(deleted, 0);
         assert_eq!(failed, 1, "invalid key → delete fails");
 
@@ -415,7 +443,13 @@ mod tests {
             .unwrap();
 
         // Drain.
-        let (deleted, failed) = drain_once(&db.pool, &backend).await.unwrap();
+        let (deleted, failed) = drain_once(
+            &db.pool,
+            &backend,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
         assert_eq!(deleted, 1, "only Y S3-deleted; X resurrected → skipped");
         assert_eq!(failed, 0);
 
@@ -457,7 +491,13 @@ mod tests {
             .await
             .unwrap();
 
-        let (deleted, failed) = drain_once(&db.pool, &backend).await.unwrap();
+        let (deleted, failed) = drain_once(
+            &db.pool,
+            &backend,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
         assert_eq!(deleted, 1, "NULL blake3_hash → drain proceeds");
         assert_eq!(failed, 0);
         assert!(
@@ -483,7 +523,13 @@ mod tests {
         let rec = CountingRecorder::default();
         let _g = metrics::set_default_local_recorder(&rec);
 
-        let (deleted, failed) = drain_once(&db.pool, &backend).await.unwrap();
+        let (deleted, failed) = drain_once(
+            &db.pool,
+            &backend,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
         // Both 0: the row is excluded by WHERE attempts < MAX.
         // Operator investigates; this row is effectively "parked."
         assert_eq!(deleted, 0);
@@ -515,7 +561,13 @@ mod tests {
         let rec = CountingRecorder::default();
         let _g = metrics::set_default_local_recorder(&rec);
 
-        let (deleted, failed) = drain_once(&db.pool, &backend).await.unwrap();
+        let (deleted, failed) = drain_once(
+            &db.pool,
+            &backend,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
         assert_eq!((deleted, failed), (0, 0));
 
         assert_eq!(
@@ -579,8 +631,9 @@ mod tests {
         let pool_b = db.pool.clone();
         let backend_a = Arc::clone(&backend);
 
+        let clearance = crate::test_helpers::gc_clearance(&pool_a).await;
         let (drain_res, upsert_res) = tokio::join!(
-            drain_once(&pool_a, &backend_a),
+            drain_once(&pool_a, &backend_a, &clearance),
             // PutPath's chunk upsert: ON CONFLICT clears deleted and
             // touches last_referenced_at. RETURNING (uploaded_at IS
             // NULL) tells the caller whether to upload (true = no
@@ -705,7 +758,14 @@ mod tests {
         });
 
         let pool = db.pool.clone();
-        let drain = tokio::spawn(async move { drain_once(&pool, &backend).await });
+        let drain = tokio::spawn(async move {
+            drain_once(
+                &pool,
+                &backend,
+                &crate::test_helpers::gc_clearance(&pool).await,
+            )
+            .await
+        });
 
         // Wait until row 1 committed and row 2's S3 delete is mid-flight.
         entered_second.notified().await;
@@ -762,9 +822,11 @@ mod tests {
         let backend_a = Arc::clone(&backend);
         let backend_b = Arc::clone(&backend);
 
+        let clearance_a = crate::test_helpers::gc_clearance(&pool_a).await;
+        let clearance_b = crate::test_helpers::gc_clearance(&pool_b).await;
         let (a, b) = tokio::join!(
-            drain_once(&pool_a, &backend_a),
-            drain_once(&pool_b, &backend_b),
+            drain_once(&pool_a, &backend_a, &clearance_a),
+            drain_once(&pool_b, &backend_b, &clearance_b),
         );
         let (del_a, fail_a) = a.unwrap();
         let (del_b, fail_b) = b.unwrap();

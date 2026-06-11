@@ -242,7 +242,7 @@ pub async fn put_chunked(
         // already deleted OUR row and a fresh uploader may now hold
         // the slot — claim_id mismatch makes this a no-op there
         // (M_052).
-        if let Err(e2) = crate::gc::orphan::reap_one(
+        if let Err(e2) = crate::gc::orphan::reap_one_consulted(
             pool,
             &info.store_path_hash,
             crate::gc::orphan::ReapBy::Claim(claim),
@@ -562,7 +562,7 @@ async fn do_upload(
 /// failure shouldn't mask it. The orphan scanner (gc/orphan.rs)
 /// catches any leaked state.
 async fn rollback(pool: &PgPool, store_path_hash: &[u8], claim: uuid::Uuid) {
-    if let Err(e) = crate::gc::orphan::reap_one(
+    if let Err(e) = crate::gc::orphan::reap_one_consulted(
         pool,
         store_path_hash,
         crate::gc::orphan::ReapBy::Claim(claim),

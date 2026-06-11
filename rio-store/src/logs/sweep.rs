@@ -204,39 +204,55 @@ pub fn spawn_log_sweep(
     retention: Duration,
     shutdown: rio_common::signal::Token,
 ) -> tokio::task::JoinHandle<()> {
-    rio_common::task::spawn_periodic("log-ttl-sweep", SWEEP_INTERVAL, shutdown, move || {
-        let pool = pool.clone();
-        let store = Arc::clone(&store);
-        async move {
-            match sweep_expired_logs(&pool, store.as_ref(), retention, SWEEP_BATCH).await {
-                Ok(stats) if stats.executions_swept > 0 => {
-                    info!(
-                        executions_swept = stats.executions_swept,
-                        chunks = stats.chunks,
-                        objects = stats.objects,
-                        "log TTL sweep: deleted expired build logs"
-                    );
+    // r[impl store.gc.hold-lanes]
+    // Registered through DestructiveLane (merged_bug_050, the
+    // §1.6.4-16 spawn-seam conversion): the wrapper consults the
+    // gc-hold gate fail-closed each tick and the WHOLE sweep body
+    // (log TTL delete + stale-session reap) runs under the minted
+    // clearance — during an incident freeze, build-log evidence is
+    // exactly what the hold preserves. The sweep/reap bodies are
+    // unchanged: this lane is SEAM-registered (the census carries
+    // its totality; the clearance param lands on the gc-plane sinks).
+    let lane_pool = pool.clone();
+    crate::gc::lane::DestructiveLane::spawn_periodic(
+        "log-ttl-sweep",
+        SWEEP_INTERVAL,
+        pool,
+        shutdown,
+        Box::new(move |_clearance| {
+            let pool = lane_pool.clone();
+            let store = Arc::clone(&store);
+            Box::pin(async move {
+                match sweep_expired_logs(&pool, store.as_ref(), retention, SWEEP_BATCH).await {
+                    Ok(stats) if stats.executions_swept > 0 => {
+                        info!(
+                            executions_swept = stats.executions_swept,
+                            chunks = stats.chunks,
+                            objects = stats.objects,
+                            "log TTL sweep: deleted expired build logs"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(error = %e, "log TTL sweep failed (will retry next interval)");
+                    }
                 }
-                Ok(_) => {}
-                Err(e) => {
-                    warn!(error = %e, "log TTL sweep failed (will retry next interval)");
+                // Dead-session convergence (bug_234): reap rows whose
+                // owner died uncleanly, independent of the 30-day log TTL.
+                match sweep_stale_sessions(&pool).await {
+                    Ok(0) => {}
+                    Ok(reaped) => {
+                        info!(reaped, "log TTL sweep: reaped stale ingest sessions");
+                        metrics::counter!("rio_store_log_sweep_stale_sessions_reaped_total")
+                            .increment(reaped);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "stale-session reap failed (will retry next interval)");
+                    }
                 }
-            }
-            // Dead-session convergence (bug_234): reap rows whose
-            // owner died uncleanly, independent of the 30-day log TTL.
-            match sweep_stale_sessions(&pool).await {
-                Ok(0) => {}
-                Ok(reaped) => {
-                    info!(reaped, "log TTL sweep: reaped stale ingest sessions");
-                    metrics::counter!("rio_store_log_sweep_stale_sessions_reaped_total")
-                        .increment(reaped);
-                }
-                Err(e) => {
-                    warn!(error = %e, "stale-session reap failed (will retry next interval)");
-                }
-            }
-        }
-    })
+            })
+        }),
+    )
 }
 
 #[cfg(test)]

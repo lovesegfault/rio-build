@@ -201,6 +201,7 @@
     "rio_store_gc_collect_cycles_total",
     "rio_store_gc_collect_parse_failures_total",
     "rio_store_gc_collect_tail_errors_total",
+    "rio_store_gc_hold_lane_skips_total",
     "rio_store_gc_orphan_reap_failed_total",
     "rio_store_gc_path_resurrected_total",
     "rio_store_gc_path_swept_total",
@@ -1286,6 +1287,11 @@
         "name": "rio_store_gc_collect_tail_errors_total",
         "kind": "counter",
         "help": "Post-drain tail failures of the collect cycle, labeled by stage (reap = the tombstone reap batch; cleanup = the mark temp-table drop). The drained cycle still COMMITS its stamp/cursor/backlog (bug_137 — pre-fix a tail error un-committed the cycle and re-ran the full mark expansion up to 24x/day); the tail retries on the next live cycle. Sustained increments mean the reap statement or the cycle session is unhealthy."
+      },
+      {
+        "name": "rio_store_gc_hold_lane_skips_total",
+        "kind": "counter",
+        "help": "Destructive-lane ticks skipped because of the GC hold protocol (merged_bug_050, store.gc.hold-lanes). Labels: lane = the census-derived lane (gc-drain-task|gc-orphan-scanner|gc-collect-backstop|log-ttl-sweep|run_gc) or the demand-driven claim-reap face; cause = held (active global hold) | consult_error (holds table unreadable; fail closed). Nonzero held counts during an incident freeze are the protocol WORKING; sustained consult_error means PG trouble on a destructive subsystem."
       },
       {
         "name": "rio_store_gc_orphan_reap_failed_total",

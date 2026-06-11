@@ -178,6 +178,18 @@ pub fn describe_metrics() {
     use metrics::{describe_counter, describe_gauge, describe_histogram};
 
     describe_counter!(
+        "rio_store_gc_hold_lane_skips_total",
+        "Destructive-lane ticks skipped because of the GC hold protocol \
+         (merged_bug_050, store.gc.hold-lanes). Labels: lane = the \
+         census-derived lane (gc-drain-task|gc-orphan-scanner|\
+         gc-collect-backstop|log-ttl-sweep|run_gc) or the demand-driven \
+         claim-reap face; cause = held (active global hold) | \
+         consult_error (holds table unreadable; fail closed). Nonzero \
+         held counts during an incident freeze are the protocol WORKING; \
+         sustained consult_error means PG trouble on a destructive \
+         subsystem."
+    );
+    describe_counter!(
         "rio_store_put_path_total",
         "Total PutPath operations (per store path; PutPathBatch counts each output)"
     );

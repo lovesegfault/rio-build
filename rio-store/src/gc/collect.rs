@@ -697,13 +697,15 @@ pub(crate) static COLLECT_FAIL_AFTER_BATCHES: std::sync::atomic::AtomicU64 =
 /// aborted (parse-failure) cycle is counted by its own counter and the
 /// `outcome="parse_failure"` cycle counter instead.
 // r[impl store.gc.chunk-collect]
-#[instrument(skip(pool, chunk_backend))]
+// r[impl store.gc.hold-lanes]
+#[instrument(skip(pool, chunk_backend, _clearance))]
 pub(crate) async fn collect_cycle(
     pool: &PgPool,
     chunk_backend: Option<&Arc<dyn ChunkBackend>>,
     grace_secs: i64,
     mode: CollectMode,
     resume_cursor: Option<Vec<u8>>,
+    _clearance: &super::hold::HoldClearance,
 ) -> Result<CollectReport, sqlx::Error> {
     let cycle_started = Instant::now();
     // The shadow arm\'s simulated-sweep exclusion set (None = live).
@@ -1299,10 +1301,12 @@ async fn run_post_drain_tail(mut conn: super::lock::SessionConn, grace_secs: i64
 /// so a cycle that JUST committed is not repeated). Returns `Ok(None)`
 /// when not due or when another holder has the lease.
 // r[impl store.gc.collect-cadence+4]
+// r[impl store.gc.hold-lanes]
 pub(crate) async fn collect_backstop_once(
     pool: &PgPool,
     chunk_backend: Option<&Arc<dyn ChunkBackend>>,
     grace_secs: i64,
+    clearance: &super::hold::HoldClearance,
 ) -> Result<Option<CollectReport>, sqlx::Error> {
     if !super::state::backstop_due_unlocked(pool, COLLECT_BACKSTOP_INTERVAL).await? {
         return Ok(None);
@@ -1331,6 +1335,7 @@ pub(crate) async fn collect_backstop_once(
         grace_secs,
         CollectMode::Live,
         resume_cursor,
+        clearance,
     )
     .await
     {
@@ -1435,21 +1440,35 @@ pub fn spawn_collect_backstop(
         COLLECT_BACKSTOP_CHECK_INTERVAL,
     );
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    rio_common::task::spawn_periodic_with("gc-collect-backstop", ticker, shutdown, move || {
-        let pool = pool.clone();
-        let chunk_backend = chunk_backend.clone();
-        async move {
-            if let Err(e) = collect_backstop_once(
-                &pool,
-                chunk_backend.as_ref(),
-                super::sweep::CHUNK_GRACE_SECS,
-            )
-            .await
-            {
-                warn!(error = %e, "chunk-collect backstop failed (will retry next interval)");
-            }
-        }
-    })
+    // r[impl store.gc.hold-lanes]
+    // Registered through DestructiveLane (merged_bug_050): pre-fix
+    // the backstop ran un-consulted, and a held run_gc starving
+    // last_live_cycle_at GUARANTEED it came due and minted fresh
+    // Live collect cycles during the freeze. Now every check tick
+    // consults the hold gate fail-closed first.
+    let lane_pool = pool.clone();
+    crate::gc::lane::DestructiveLane::spawn_periodic_with(
+        "gc-collect-backstop",
+        ticker,
+        pool,
+        shutdown,
+        Box::new(move |clearance| {
+            let pool = lane_pool.clone();
+            let chunk_backend = chunk_backend.clone();
+            Box::pin(async move {
+                if let Err(e) = collect_backstop_once(
+                    &pool,
+                    chunk_backend.as_ref(),
+                    super::sweep::CHUNK_GRACE_SECS,
+                    clearance,
+                )
+                .await
+                {
+                    warn!(error = %e, "chunk-collect backstop failed (will retry next interval)");
+                }
+            })
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -1567,6 +1586,7 @@ mod tests {
                 simulated_swept: Vec::new(),
             },
             None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("shadow cycle");
@@ -1711,6 +1731,7 @@ mod tests {
                 simulated_swept: Vec::new(),
             },
             None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .unwrap();
@@ -1759,6 +1780,7 @@ mod tests {
                 simulated_swept: Vec::new(),
             },
             None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("abort is not an error");
@@ -1851,6 +1873,7 @@ mod tests {
                 simulated_swept: Vec::new(),
             },
             None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("cycle");
@@ -1905,6 +1928,7 @@ mod tests {
                 simulated_swept: Vec::new(),
             },
             None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await;
         assert!(result.is_err(), "the report query must fail without chunks");
@@ -1944,6 +1968,7 @@ mod tests {
                     simulated_swept: Vec::new(),
                 },
                 None,
+                &crate::test_helpers::gc_clearance(&db.pool).await,
             )
             .await
             .expect("cycle");
@@ -2192,6 +2217,7 @@ mod tests {
                 simulated_swept: Vec::new(),
             },
             None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("baseline shadow");
@@ -2205,6 +2231,7 @@ mod tests {
                 simulated_swept: vec![h],
             },
             None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("excluding shadow");
@@ -2246,6 +2273,7 @@ mod tests {
                 simulated_swept: hashes[..2].to_vec(),
             },
             None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("excluding shadow cycle");
@@ -2300,6 +2328,7 @@ mod tests {
                 simulated_swept: Vec::new(),
             },
             None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("cycle runs");
@@ -2315,6 +2344,7 @@ mod tests {
                 simulated_swept: vec![h],
             },
             None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("cycle runs");
@@ -2362,6 +2392,7 @@ mod tests {
                 simulated_swept: vec![h],
             },
             None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("cycle runs");
@@ -2391,9 +2422,14 @@ mod tests {
             .unwrap();
         assert!(got);
 
-        let skipped = collect_backstop_once(&db.pool, None, super::super::sweep::CHUNK_GRACE_SECS)
-            .await
-            .unwrap();
+        let skipped = collect_backstop_once(
+            &db.pool,
+            None,
+            super::super::sweep::CHUNK_GRACE_SECS,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
         assert!(
             skipped.is_none(),
             "backstop must skip while GC holds the lock"
@@ -2407,9 +2443,14 @@ mod tests {
             .unwrap();
         drop(holder);
 
-        let ran = collect_backstop_once(&db.pool, None, super::super::sweep::CHUNK_GRACE_SECS)
-            .await
-            .unwrap();
+        let ran = collect_backstop_once(
+            &db.pool,
+            None,
+            super::super::sweep::CHUNK_GRACE_SECS,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
         assert!(ran.is_some(), "backstop runs once the lock is free");
         assert_eq!(rec.get("rio_store_gc_collect_cycles_total{outcome=ok}"), 1);
 
@@ -2443,15 +2484,25 @@ mod tests {
         let rec = CountingRecorder::default();
         let _g = metrics::set_default_local_recorder(&rec);
 
-        let first = collect_backstop_once(&db.pool, None, super::super::sweep::CHUNK_GRACE_SECS)
-            .await
-            .unwrap();
+        let first = collect_backstop_once(
+            &db.pool,
+            None,
+            super::super::sweep::CHUNK_GRACE_SECS,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
         assert!(first.is_some(), "never-ran cluster: first check is due");
         assert_eq!(rec.get("rio_store_gc_collect_cycles_total{outcome=ok}"), 1);
 
-        let second = collect_backstop_once(&db.pool, None, super::super::sweep::CHUNK_GRACE_SECS)
-            .await
-            .unwrap();
+        let second = collect_backstop_once(
+            &db.pool,
+            None,
+            super::super::sweep::CHUNK_GRACE_SECS,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
         assert!(
             second.is_none(),
             "the cluster just ran a live cycle — a second replica\'s check skips"
@@ -2475,9 +2526,14 @@ mod tests {
         .execute(&db.pool)
         .await
         .unwrap();
-        let third = collect_backstop_once(&db.pool, None, super::super::sweep::CHUNK_GRACE_SECS)
-            .await
-            .unwrap();
+        let third = collect_backstop_once(
+            &db.pool,
+            None,
+            super::super::sweep::CHUNK_GRACE_SECS,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
         assert!(
             third.is_some(),
             "past the interval the backstop is due again"
@@ -2510,9 +2566,14 @@ mod tests {
         .expect("lock free");
         while rx.recv().await.is_some() {}
 
-        let check = collect_backstop_once(&db.pool, None, super::super::sweep::CHUNK_GRACE_SECS)
-            .await
-            .unwrap();
+        let check = collect_backstop_once(
+            &db.pool,
+            None,
+            super::super::sweep::CHUNK_GRACE_SECS,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
         assert!(
             check.is_none(),
             "run_gc\'s live cycle satisfied the cluster cadence"
@@ -2621,9 +2682,16 @@ mod tests {
         // A live cycle over an otherwise-clean keyspace: completes the
         // pass (nothing left to collect except our seeds, which are
         // either deleted already or referenced/young) and reaps.
-        let report = collect_cycle(&db.pool, Some(&backend), grace, CollectMode::Live, None)
-            .await
-            .expect("live cycle");
+        let report = collect_cycle(
+            &db.pool,
+            Some(&backend),
+            grace,
+            CollectMode::Live,
+            None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .expect("live cycle");
         assert!(report.pass_complete(), "clean keyspace ⇒ pass completes");
         assert_eq!(
             report.chunks_reaped, 1,
@@ -2668,6 +2736,7 @@ mod tests {
             &db.pool,
             Some(&backend),
             super::super::sweep::CHUNK_GRACE_SECS,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("backstop check runs")
@@ -2715,6 +2784,7 @@ mod tests {
             &db.pool,
             Some(&backend),
             super::super::sweep::CHUNK_GRACE_SECS,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("backstop check runs")
@@ -2765,6 +2835,7 @@ mod tests {
             &db.pool,
             Some(&backend),
             super::super::sweep::CHUNK_GRACE_SECS,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("backstop check runs")
@@ -2817,6 +2888,7 @@ mod tests {
             &db.pool,
             Some(&backend),
             super::super::sweep::CHUNK_GRACE_SECS,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("backstop check runs")
@@ -2893,6 +2965,7 @@ mod tests {
             super::super::sweep::CHUNK_GRACE_SECS,
             CollectMode::Live,
             None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("live cycle");
@@ -2909,6 +2982,7 @@ mod tests {
                 simulated_swept: Vec::new(),
             },
             None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("foreign shadow cycle");
@@ -3046,6 +3120,7 @@ mod tests {
             grace,
             CollectMode::Live,
             Some(vec![0x80u8; 32]),
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("live resumed cycle");
@@ -3129,9 +3204,16 @@ mod tests {
             .unwrap()
             .expect("lock free after release");
         lease2.stamp_attempt().await.unwrap();
-        let ours2 = collect_cycle(&db.pool, Some(&backend), grace, CollectMode::Live, None)
-            .await
-            .expect("live full cycle");
+        let ours2 = collect_cycle(
+            &db.pool,
+            Some(&backend),
+            grace,
+            CollectMode::Live,
+            None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .expect("live full cycle");
         assert_eq!(ours2.outcome, CollectOutcome::Ok);
         let our_disposition2 = ours2
             .disposition
@@ -3264,6 +3346,7 @@ mod tests {
             super::super::sweep::CHUNK_GRACE_SECS,
             CollectMode::Live,
             None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("live cycle");
@@ -3326,6 +3409,7 @@ mod tests {
                 simulated_swept: Vec::new(),
             },
             None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("shadow cycle");
@@ -3407,6 +3491,7 @@ mod tests {
             super::super::sweep::CHUNK_GRACE_SECS,
             CollectMode::Live,
             None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("live cycle");
@@ -3489,17 +3574,27 @@ mod tests {
         // fail-closed and commits nothing.
         seed_chunked_manifest(&db.pool, "corrupt-attempt", "complete", &[0xFFu8; 7]).await;
 
-        let first = collect_backstop_once(&db.pool, None, super::super::sweep::CHUNK_GRACE_SECS)
-            .await
-            .expect("first check runs")
-            .expect("due -> a cycle ran");
+        let first = collect_backstop_once(
+            &db.pool,
+            None,
+            super::super::sweep::CHUNK_GRACE_SECS,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .expect("first check runs")
+        .expect("due -> a cycle ran");
         assert_eq!(first.outcome, CollectOutcome::ParseFailure);
 
         // Second check, still inside the backstop interval: the
         // attempt stamp throttles it -- no second heavy cycle.
-        let second = collect_backstop_once(&db.pool, None, super::super::sweep::CHUNK_GRACE_SECS)
-            .await
-            .expect("second check runs");
+        let second = collect_backstop_once(
+            &db.pool,
+            None,
+            super::super::sweep::CHUNK_GRACE_SECS,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .expect("second check runs");
         assert!(
             second.is_none(),
             "an attempt inside the interval is throttled (got a second cycle)"
@@ -3549,6 +3644,7 @@ mod tests {
             &db.pool,
             Some(&backend),
             super::super::sweep::CHUNK_GRACE_SECS,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("backstop cycle")
@@ -3604,9 +3700,16 @@ mod tests {
 
         // Cycle 1: unresumed, caps — and still reaps the row-local
         // eligible tombstone.
-        let report = collect_cycle(&db.pool, Some(&backend), grace, CollectMode::Live, None)
-            .await
-            .expect("capped cycle");
+        let report = collect_cycle(
+            &db.pool,
+            Some(&backend),
+            grace,
+            CollectMode::Live,
+            None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .expect("capped cycle");
         assert!(report.cap_reached, "cycle 1 stops at the cap");
         assert_eq!(
             report.chunks_reaped, 1,
@@ -3621,6 +3724,7 @@ mod tests {
             grace,
             CollectMode::Live,
             report.cursor_at_stop().map(<[u8]>::to_vec),
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("resumed cycle");
@@ -3661,8 +3765,13 @@ mod tests {
             .await
             .expect("drop chunks");
 
-        let result =
-            collect_backstop_once(&db.pool, None, super::super::sweep::CHUNK_GRACE_SECS).await;
+        let result = collect_backstop_once(
+            &db.pool,
+            None,
+            super::super::sweep::CHUNK_GRACE_SECS,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await;
         assert!(result.is_err(), "the cycle must fail without chunks");
 
         assert_eq!(
@@ -3767,6 +3876,7 @@ mod tests {
             super::super::sweep::CHUNK_GRACE_SECS,
             CollectMode::Live,
             None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("live cycle");
@@ -3824,6 +3934,7 @@ mod tests {
             super::super::sweep::CHUNK_GRACE_SECS,
             CollectMode::Live,
             None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("second live cycle");
@@ -3902,6 +4013,7 @@ mod tests {
             super::super::sweep::CHUNK_GRACE_SECS,
             CollectMode::Live,
             None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("live cycle");
@@ -3943,6 +4055,7 @@ mod tests {
             super::super::sweep::CHUNK_GRACE_SECS,
             CollectMode::Live,
             None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("abort is not an error");
@@ -3994,6 +4107,7 @@ mod tests {
             super::super::sweep::CHUNK_GRACE_SECS,
             CollectMode::Live,
             None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("live cycle");
@@ -4031,9 +4145,13 @@ mod tests {
 
         // The stale outbox row from the collect cycle is skipped and
         // dropped by the drain; the backend object survives.
-        let (s3_deleted, failed) = super::super::drain::drain_once(&db.pool, &backend)
-            .await
-            .unwrap();
+        let (s3_deleted, failed) = super::super::drain::drain_once(
+            &db.pool,
+            &backend,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
         assert_eq!(s3_deleted, 0, "resurrected chunk is not S3-deleted");
         assert_eq!(failed, 0);
         assert!(
@@ -4067,6 +4185,7 @@ mod tests {
             super::super::sweep::CHUNK_GRACE_SECS,
             CollectMode::Live,
             None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("live cycle");
@@ -4114,6 +4233,7 @@ mod tests {
             super::super::sweep::CHUNK_GRACE_SECS,
             CollectMode::Live,
             None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await;
         assert!(result.is_err(), "the injected failure surfaces as an error");
@@ -4149,6 +4269,7 @@ mod tests {
             super::super::sweep::CHUNK_GRACE_SECS,
             CollectMode::Live,
             None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("recovery cycle");
@@ -4193,6 +4314,7 @@ mod tests {
                 simulated_swept: Vec::new(),
             },
             None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("anchor cycle");
@@ -4232,6 +4354,7 @@ mod tests {
             super::super::sweep::CHUNK_GRACE_SECS,
             CollectMode::Live,
             cursor_a,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("capped cycle");
@@ -4301,6 +4424,7 @@ mod tests {
             super::super::sweep::CHUNK_GRACE_SECS,
             CollectMode::Live,
             cursor_b,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("resume cycle");
@@ -4370,6 +4494,7 @@ mod tests {
             super::super::sweep::CHUNK_GRACE_SECS,
             CollectMode::Live,
             None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("capped cycle");
@@ -4384,6 +4509,7 @@ mod tests {
             super::super::sweep::CHUNK_GRACE_SECS,
             CollectMode::Live,
             None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("post-restart cycle");
@@ -4579,10 +4705,15 @@ mod tests {
         .await
         .unwrap();
 
-        let report = collect_backstop_once(&db.pool, Some(&backend), grace)
-            .await
-            .expect("backstop")
-            .expect("due ⇒ the cycle ran");
+        let report = collect_backstop_once(
+            &db.pool,
+            Some(&backend),
+            grace,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .expect("backstop")
+        .expect("due ⇒ the cycle ran");
 
         assert_eq!(report.victims_collected, 1, "drained the remainder (high)");
         assert!(
@@ -4637,10 +4768,15 @@ mod tests {
         .execute(&db.pool)
         .await
         .unwrap();
-        let second = collect_backstop_once(&db.pool, Some(&backend), grace)
-            .await
-            .expect("backstop")
-            .expect("due again");
+        let second = collect_backstop_once(
+            &db.pool,
+            Some(&backend),
+            grace,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .expect("backstop")
+        .expect("due again");
         assert!(matches!(
             second.disposition,
             Some(PassDisposition::CompleteFullScan)
@@ -4685,10 +4821,15 @@ mod tests {
         .unwrap();
 
         REAP_FAIL_INJECT.store(true, std::sync::atomic::Ordering::SeqCst);
-        let report = collect_backstop_once(&db.pool, Some(&backend), grace)
-            .await
-            .expect("the cycle must NOT propagate the tail failure")
-            .expect("due ⇒ the cycle ran");
+        let report = collect_backstop_once(
+            &db.pool,
+            Some(&backend),
+            grace,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .expect("the cycle must NOT propagate the tail failure")
+        .expect("due ⇒ the cycle ran");
 
         assert!(matches!(report.outcome, CollectOutcome::Ok));
         assert_eq!(report.chunks_reaped, 0, "the reap failed and was contained");
@@ -4711,10 +4852,15 @@ mod tests {
                 .unwrap();
         assert!(stamped, "the drained cycle committed its stamp");
         assert!(
-            collect_backstop_once(&db.pool, Some(&backend), grace)
-                .await
-                .unwrap()
-                .is_none(),
+            collect_backstop_once(
+                &db.pool,
+                Some(&backend),
+                grace,
+                &crate::test_helpers::gc_clearance(&db.pool).await
+            )
+            .await
+            .unwrap()
+            .is_none(),
             "not due again — no 24x/day re-mark"
         );
     }
@@ -4795,6 +4941,7 @@ mod tests {
                 simulated_swept: vec![],
             },
             None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .expect("shadow cycle");

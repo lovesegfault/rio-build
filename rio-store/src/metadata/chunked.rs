@@ -886,6 +886,7 @@ mod tests {
             &db.pool,
             &sph_a,
             crate::gc::orphan::ReapBy::Claim(claim_a),
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .unwrap();
@@ -1146,6 +1147,7 @@ mod tests {
             &db.pool,
             &sph,
             crate::gc::orphan::ReapBy::Stale { secs: 0 },
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .unwrap();
@@ -1167,10 +1169,14 @@ mod tests {
             .unwrap();
 
         // --- A: hung PUT errors → late rollback fires (A's claim). ---
-        let rolled_back =
-            crate::gc::orphan::reap_one(&db.pool, &sph, crate::gc::orphan::ReapBy::Claim(claim_a))
-                .await
-                .unwrap();
+        let rolled_back = crate::gc::orphan::reap_one(
+            &db.pool,
+            &sph,
+            crate::gc::orphan::ReapBy::Claim(claim_a),
+            &crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
         assert!(!rolled_back, "A's stale claim matches nothing — no-op");
 
         // B's state MUST be intact: chunk row live, manifest_data
@@ -1253,6 +1259,7 @@ mod tests {
                 &db.pool,
                 &sph,
                 crate::gc::orphan::ReapBy::Stale { secs: 0 },
+                &crate::test_helpers::gc_clearance(&db.pool).await,
             )
             .await
             .unwrap()
@@ -1270,10 +1277,14 @@ mod tests {
         assert_ne!(claim_a, claim_b, "B's fresh row has a distinct claim");
 
         // --- A: hung PUT errors → late rollback with A's STALE claim. ---
-        let rolled_back =
-            crate::gc::orphan::reap_one(&db.pool, &sph, crate::gc::orphan::ReapBy::Claim(claim_a))
-                .await
-                .unwrap();
+        let rolled_back = crate::gc::orphan::reap_one(
+            &db.pool,
+            &sph,
+            crate::gc::orphan::ReapBy::Claim(claim_a),
+            &crate::test_helpers::gc_clearance(&db.pool).await,
+        )
+        .await
+        .unwrap();
         assert!(!rolled_back, "A's stale claim ≠ B's fresh claim — no-op");
 
         // B's mid-upload state MUST be intact: chunk row live,
@@ -1309,9 +1320,14 @@ mod tests {
         // This is the claim-roundtrip happy path: an uploader CAN
         // clean up its own placeholder, even after heartbeats.
         assert!(
-            crate::gc::orphan::reap_one(&db.pool, &sph, crate::gc::orphan::ReapBy::Claim(claim_b),)
-                .await
-                .unwrap(),
+            crate::gc::orphan::reap_one(
+                &db.pool,
+                &sph,
+                crate::gc::orphan::ReapBy::Claim(claim_b),
+                &crate::test_helpers::gc_clearance(&db.pool).await,
+            )
+            .await
+            .unwrap(),
             "B's own rollback (matching claim) tears down"
         );
         let status: Option<String> =

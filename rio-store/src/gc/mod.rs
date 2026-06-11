@@ -151,6 +151,44 @@ pub mod hold {
     }
     pub(crate) use active_hold_predicate;
 
+    /// Per-consult destructive capability (merged_bug_050): proof
+    /// that the active-hold predicate was consulted and NO global
+    /// hold is active, minted ONLY by [`gate`] (private field — other
+    /// modules cannot construct one). Non-`Clone`/non-`Copy` and
+    /// passed by reference into tick bodies, so a clearance cannot
+    /// outlive its tick or be stashed for a later one: every named
+    /// delete sink demands `&HoldClearance`, which structurally ties
+    /// every destructive act to a same-tick consult.
+    // r[impl store.gc.hold-lanes]
+    #[derive(Debug)]
+    pub struct HoldClearance {
+        _proof: (),
+    }
+
+    /// The consult verdict for destructive actors — see [`gate`].
+    #[derive(Debug)]
+    pub enum HoldGate {
+        /// No active global hold: the clearance is the capability the
+        /// named delete sinks demand.
+        Clear(HoldClearance),
+        /// An active global hold — every destructive lane MUST skip.
+        Held(ActiveHold),
+    }
+
+    // r[impl store.gc.hold-lanes]
+    /// THE destructive-actor consult: one query, one verdict, the
+    /// only mint point for [`HoldClearance`]. Callers MUST fail
+    /// CLOSED on `Err` (an unreadable hold table is never read as
+    /// "no hold") — the periodic form is
+    /// [`crate::gc::lane::DestructiveLane`]'s tick wrapper; the
+    /// demand-driven form is `orphan::reap_one_consulted`.
+    pub async fn gate(pool: &PgPool) -> Result<HoldGate, sqlx::Error> {
+        Ok(match active_global_hold(pool).await? {
+            Some(h) => HoldGate::Held(h),
+            None => HoldGate::Clear(HoldClearance { _proof: () }),
+        })
+    }
+
     /// The first active GLOBAL hold, if any — `run_gc`'s entry consult.
     // r[impl store.gc.hold]
     pub async fn active_global_hold(pool: &PgPool) -> Result<Option<ActiveHold>, sqlx::Error> {
@@ -167,6 +205,7 @@ pub mod hold {
 
 pub mod collect;
 pub mod drain;
+pub mod lane;
 pub mod lock;
 mod mark;
 #[cfg(test)]
@@ -398,14 +437,24 @@ pub async fn run_gc(
     // verdicts. A hold set mid-run binds the NEXT run (the per-run
     // quantifier W9-J certifies). Tenant-scoped holds bind inside
     // mark's seed (f) and the sweep re-check instead.
-    match hold::active_global_hold(pool).await {
-        Ok(Some(h)) => {
+    // run_gc is the PINNED member of the destructive-lane census
+    // (RPC-spawned per TriggerGC, not spawn-periodic): its entry
+    // consult mints the same HoldClearance the lane wrapper does,
+    // and the clearance threads to the phase-3 chunk-collect — the
+    // named sink demands it (store.gc.hold-lanes).
+    let hold_clearance = match hold::gate(pool).await {
+        Ok(hold::HoldGate::Held(h)) => {
             info!(
                 hold_id = %h.hold_id,
                 created_by = %h.created_by,
                 reason = %h.reason,
                 "GC: active global hold; collection suspended"
             );
+            metrics::counter!(
+                "rio_store_gc_hold_lane_skips_total",
+                "lane" => "run_gc", "cause" => "held"
+            )
+            .increment(1);
             let _ = progress_tx
                 .send(Ok(GcProgress {
                     paths_scanned: 0,
@@ -421,15 +470,20 @@ pub async fn run_gc(
             let _ = lease.release().await;
             return Ok(None);
         }
-        Ok(None) => {}
+        Ok(hold::HoldGate::Clear(c)) => c,
         Err(e) => {
             // Fail CLOSED on a destructive subsystem: an unreadable
             // hold table must not be read as "no hold".
             warn!(error = %e, "GC: hold consult failed; refusing to collect");
+            metrics::counter!(
+                "rio_store_gc_hold_lane_skips_total",
+                "lane" => "run_gc", "cause" => "consult_error"
+            )
+            .increment(1);
             let _ = lease.release().await;
             return Err(Status::internal(format!("gc-hold consult: {e}")));
         }
-    }
+    };
 
     // --- Mark phase ---
     // No mark-vs-PutPath lock (I-192). Mark's CTE takes a point-in-time
@@ -544,6 +598,7 @@ pub async fn run_gc(
         sweep::CHUNK_GRACE_SECS,
         collect_mode,
         resume_cursor,
+        &hold_clearance,
     )
     .await
     {

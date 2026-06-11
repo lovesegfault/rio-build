@@ -1338,6 +1338,7 @@ mod tests {
             CHUNK_GRACE_SECS,
             super::super::collect::CollectMode::Live,
             None,
+            &crate::test_helpers::gc_clearance(&db.pool).await,
         )
         .await
         .unwrap();

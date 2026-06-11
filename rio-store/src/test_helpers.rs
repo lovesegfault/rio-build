@@ -498,3 +498,20 @@ pub fn sandbox_http() -> reqwest::Client {
         .build()
         .expect("empty-cert client build never fails")
 }
+
+/// Mint a destructive-lane clearance through the PRODUCTION consult
+/// (R13: no test-only constructor exists — `HoldClearance`'s field is
+/// private to `gc::hold`): panics if the test DB carries an active
+/// global hold or the consult fails. Tests that exercise HELD
+/// behavior drive `hold::gate` / `DestructiveLane::tick` themselves.
+pub async fn gc_clearance(pool: &sqlx::PgPool) -> crate::gc::hold::HoldClearance {
+    match crate::gc::hold::gate(pool)
+        .await
+        .expect("hold gate readable in test db")
+    {
+        crate::gc::hold::HoldGate::Clear(c) => c,
+        crate::gc::hold::HoldGate::Held(h) => {
+            panic!("test db carries an active global hold: {h:?}")
+        }
+    }
+}

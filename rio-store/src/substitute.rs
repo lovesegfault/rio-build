@@ -7295,6 +7295,7 @@ mod tests {
         ("error.rs", include_str!("error.rs")),
         ("gc/collect.rs", include_str!("gc/collect.rs")),
         ("gc/drain.rs", include_str!("gc/drain.rs")),
+        ("gc/lane.rs", include_str!("gc/lane.rs")),
         ("gc/lock.rs", include_str!("gc/lock.rs")),
         ("gc/mark.rs", include_str!("gc/mark.rs")),
         (
