@@ -246,6 +246,7 @@
   "rio_store_substitute_admission_utilization": "try_substitute admission-gate utilization: (capacity - available) / capacity. Updated on each acquire AND each GetLoad call. Can saturate independently of pg_pool_utilization (upstream HTTP bottleneck).",
   "rio_store_substitute_bytes_total": "Bytes actually INGESTED via upstream substitution: nar_size on a real download+persist, 0 on an AlreadyComplete dedup hit (merged_bug_091 — the producer states its own ingest fact, so dedup hits cannot inflate the ingest rate)",
   "rio_store_substitute_duration_seconds": "Upstream substitution latency (narinfo fetch + NAR download + ingest)",
+  "rio_store_substitute_infra_charge_total": "Per-upstream substitute failures whose kernel disposition is ChargeInfra, labeled by class (stalled|admissionsaturated|fetch|integrity|ingest — the kernel alphabet's Debug repr, lowercased). The D6 (poisoned-pool retry-once) trigger gauge: that rider ships only if this shows sustained production hits from a single poisoned source.",
   "rio_store_substitute_integrity_failures_total": "Upstream substitution NAR hash or size mismatches, labeled by tenant (UUID). Nonzero is a security-relevant signal: upstream served corrupt or tampered bytes / a lying NarSize.",
   "rio_store_substitute_probe_cache_hits_total": "check_available HEAD-probe cache hits (positive or negative cached result; no upstream HEAD made for this path).",
   "rio_store_substitute_probe_cache_misses_total": "check_available HEAD-probe cache misses (path uncached; an upstream HEAD was issued).",

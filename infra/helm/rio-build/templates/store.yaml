@@ -131,6 +131,17 @@ spec:
                   {{- include "rio.selectorLabels" "rio-store" | nindent 18 }}
               topologyKey: kubernetes.io/hostname
       {{- end }}
+      {{- if .Values.karpenter.enabled }}
+      # D1: the store fleet targets its OWN NodePool (rio-store —
+      # WhenEmptyOrUnderutilized reclaim; values.yaml karpenter block)
+      # instead of squatting rio-general's Drifted-0/WhenEmpty nodes.
+      # Gated on karpenter.enabled: the k3s VM tests and local dev run
+      # no Karpenter and must stay schedulable on plain nodes.
+      nodeSelector:
+        rio.build/node-role: store
+      tolerations:
+        - {key: rio.build/store, value: "true", effect: NoSchedule}
+      {{- end }}
       # ≥ RIO_DRAIN_GRACE_SECS(6) + streamDrainSecs + slack. kubelet
       # SIGKILLs at this deadline; the store's own stream_drain timeout
       # fires first and exits cleanly, so SIGKILL is a backstop for a

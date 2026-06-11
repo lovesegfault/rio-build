@@ -143,7 +143,8 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
     // (5xx, timeout, auth) -> abort. See classify_pg_preflight_gate.
     //
     // Hostable arm (D-052-1b): both ceiling paths below also clamp to
-    // what the rio-general Karpenter pool can actually host — the pg
+    // what the rio-store Karpenter pool can actually host (D1: the
+    // store fleet moved off rio-general onto its own pool) — the pg
     // arm is a backstop, not a schedulability statement (live_052:
     // 173 deployed, 46 hostable, 133 pods Pending). Inputs read from
     // the chart so a pool-limit change flows through on the next
@@ -153,7 +154,7 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             .context(
                 "read infra/helm/rio-build/values.yaml for the store hostable-ceiling inputs",
             )?;
-    let karpenter_cpu_limit = general_pool_cpu_limit(&values_yaml)?;
+    let karpenter_cpu_limit = store_pool_cpu_limit(&values_yaml)?;
     let node_vcpus = store_node_vcpus(STORE_CPU_REQUEST)?;
     let store_ceiling = if skip_pg_preflight {
         let fallback = derive_store_ceiling(
@@ -690,7 +691,7 @@ const STORE_PG_HEADROOM: f64 = 0.70;
 const STORE_CPU_REQUEST: u32 = 16;
 
 /// The chart's `karpenter.nodePools[rio-general]` instance-family pin
-/// (values.yaml). `general_pool_cpu_limit` BAILS if the chart moves
+/// (values.yaml). `store_pool_cpu_limit` BAILS if the chart moves
 /// outside this set, because `GENERAL_NODE_VCPU_LADDER` below is
 /// derived from these families — a family change must re-derive the
 /// ladder, not silently divide by the wrong node shape.
@@ -740,7 +741,7 @@ fn store_node_vcpus(request_cpu: u32) -> Result<u32> {
 /// No path-reading unit test (crate2nix per-crate builds stage only
 /// the xtask/ subtree, the seccomp-regen precedent); the parser is
 /// tested on an embedded fixture and the runtime read fails loudly.
-fn general_pool_cpu_limit(values_yaml: &str) -> Result<u32> {
+fn store_pool_cpu_limit(values_yaml: &str) -> Result<u32> {
     #[derive(serde::Deserialize)]
     struct Values {
         karpenter: Karpenter,
@@ -773,14 +774,18 @@ fn general_pool_cpu_limit(values_yaml: &str) -> Result<u32> {
         .karpenter
         .node_pools
         .iter()
-        .find(|p| p.name == "rio-general")
-        .context("karpenter.nodePools has no rio-general entry — the store hostable-ceiling derivation needs its limits.cpu")?;
+        .find(|p| p.name == "rio-store")
+        .context(
+            "karpenter.nodePools has no rio-store entry — the store hostable-ceiling \
+             derivation needs the STORE pool's limits.cpu (D1: the store fleet has its \
+             own NodePool; rio-general no longer hosts it)",
+        )?;
     for req in &pool.requirements {
         if req.key == "karpenter.k8s.aws/instance-family" {
             for fam in &req.values {
                 anyhow::ensure!(
                     GENERAL_POOL_FAMILIES.contains(&fam.as_str()),
-                    "rio-general instance-family {fam:?} is outside the derived \
+                    "rio-store instance-family {fam:?} is outside the derived \
                      vCPU ladder's families {GENERAL_POOL_FAMILIES:?}; re-derive \
                      GENERAL_NODE_VCPU_LADDER for the new family before deploying"
                 );
@@ -1060,21 +1065,24 @@ mod ceiling_tests {
         assert!(store_node_vcpus(192).is_err()); // 0.9*192 = 172.8 < 192
     }
 
-    /// values.yaml parser: reads rio-general's limits.cpu, refuses an
-    /// instance-family pin outside the ladder's provenance, refuses a
-    /// values shape with no rio-general pool. Embedded fixture (the
+    /// values.yaml parser: reads the rio-store pool's limits.cpu (D1:
+    /// the store fleet has its own NodePool — the hostable arm derives
+    /// from the pool that actually hosts it, not rio-general), refuses
+    /// an instance-family pin outside the ladder's provenance, refuses
+    /// a values shape with no rio-store pool. Embedded fixture (the
     /// crate2nix test sandbox stages only xtask/, so the real chart
     /// file is runtime-read only — the seccomp-regen precedent).
     #[test]
-    fn general_pool_cpu_limit_parses_and_guards() {
+    fn store_pool_cpu_limit_parses_and_guards() {
         let fixture = r#"
 karpenter:
   nodePools:
-    - name: rio-general
+    - name: rio-store
       weight: 50
       labels:
-        rio.build/node-role: general
-      taints: []
+        rio.build/node-role: store
+      taints:
+        - {key: rio.build/store, value: "true", effect: NoSchedule}
       requirements:
         - key: karpenter.k8s.aws/instance-family
           operator: In
@@ -1083,18 +1091,32 @@ karpenter:
           operator: In
           values: [on-demand]
       limits: {cpu: 1500}
+    - name: rio-general
+      weight: 50
+      labels:
+        rio.build/node-role: general
+      taints: []
+      requirements: []
+      limits: {cpu: 1500}
 "#;
-        assert_eq!(general_pool_cpu_limit(fixture).unwrap(), 1500);
+        assert_eq!(store_pool_cpu_limit(fixture).unwrap(), 1500);
 
         let drifted = fixture.replace("c8a", "c9g");
-        let err = general_pool_cpu_limit(&drifted).unwrap_err().to_string();
+        let err = store_pool_cpu_limit(&drifted).unwrap_err().to_string();
         assert!(
             err.contains("re-derive"),
             "family drift must demand a ladder re-derivation, got: {err}"
         );
 
-        let renamed = fixture.replace("rio-general", "rio-everything");
-        assert!(general_pool_cpu_limit(&renamed).is_err());
+        // RED face of the D1 re-point: a chart WITHOUT the store pool
+        // (the pre-D1 shape — store squatting rio-general) refuses
+        // loudly instead of silently deriving from the wrong pool.
+        let renamed = fixture.replace("rio-store", "rio-everything");
+        let err = store_pool_cpu_limit(&renamed).unwrap_err().to_string();
+        assert!(
+            err.contains("no rio-store entry"),
+            "the missing store pool must be named: {err}"
+        );
     }
 
     /// Headroom edges: budgets at or below the non-store floor

@@ -247,6 +247,7 @@
     "rio_store_substitute_admission_utilization",
     "rio_store_substitute_bytes_total",
     "rio_store_substitute_duration_seconds",
+    "rio_store_substitute_infra_charge_total",
     "rio_store_substitute_integrity_failures_total",
     "rio_store_substitute_probe_cache_hits_total",
     "rio_store_substitute_probe_cache_misses_total",
@@ -1512,6 +1513,11 @@
         "name": "rio_store_substitute_duration_seconds",
         "kind": "histogram",
         "help": "Upstream substitution latency (narinfo fetch + NAR download + ingest)"
+      },
+      {
+        "name": "rio_store_substitute_infra_charge_total",
+        "kind": "counter",
+        "help": "Per-upstream substitute failures whose kernel disposition is ChargeInfra, labeled by class (stalled|admissionsaturated|fetch|integrity|ingest — the kernel alphabet's Debug repr, lowercased). The D6 (poisoned-pool retry-once) trigger gauge: that rider ships only if this shows sustained production hits from a single poisoned source."
       },
       {
         "name": "rio_store_substitute_integrity_failures_total",

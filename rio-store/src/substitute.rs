@@ -1739,6 +1739,26 @@ impl Substituter {
                         }
                     }
                     let (class, advice) = substitute_error_evidence(&e);
+                    // D6 trigger observability (RULED non-goal-unless,
+                    // bughunt-9): the poisoned-pool retry-once rider
+                    // ships only if ChargeInfra SOURCE instrumentation
+                    // shows production hits — this counter makes that
+                    // trigger measurable. The charged-or-not split is
+                    // the kernel's own total classification table
+                    // (classify_substitute_failure — rustc-exhaustive,
+                    // never an author-typed subset here); the label
+                    // value is derived from the class alphabet's Debug
+                    // repr (machine-derived, total).
+                    if matches!(
+                        rio_evidence_kernel::outcome::classify_substitute_failure(class),
+                        rio_evidence_kernel::outcome::FailureDisposition::ChargeInfra
+                    ) {
+                        metrics::counter!(
+                            "rio_store_substitute_infra_charge_total",
+                            "class" => format!("{class:?}").to_lowercase()
+                        )
+                        .increment(1);
+                    }
                     match cells.record(class, advice) {
                         rio_evidence_kernel::outcome::LoopControl::AbortRaced => {
                             return Err(SubstituteError::Raced);

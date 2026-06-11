@@ -266,11 +266,13 @@ store:
     # the MIN of two arms (D-052-1b):
     #   pg arm: floor((0.70 × max_connections − 34) / pgMaxConnections 20)
     #     where 34 = scheduler 2×10 + controller 4 + psql headroom 10
-    #   hostable arm: floor(rio-general limits.cpu / store node vCPU)
+    #   hostable arm: floor(rio-store pool limits.cpu / store node vCPU)
     #     — required one-replica-per-node podAntiAffinity (store.yaml)
     #     means each replica pins a WHOLE node, and Karpenter counts
     #     node capacity (32 vCPU for the 16-cpu request on the gen-8
     #     families) against the pool limit. floor(1500/32) = 46.
+    #     (D1: the store fleet moved off rio-general onto its own
+    #     rio-store pool; the preflight reads that pool's limit.)
     # At the modeled config (rds.tf: min_capacity=1 lifts the AWS
     # PG min-capacity cap; max_capacity=32 ⇒ max_connections 5,000;
     # owner decision Q1 2026-06-03):
@@ -1414,6 +1416,36 @@ karpenter:
     # total{reason=idle, cell=~"fetcher-.*"}` despite the floor, raise it
     # — the model floor protects against transient lulls, the knob
     # protects against the operator's idle-cost tolerance.
+
+    # D1 (bughunt-9): the STORE fleet's own pool. Store pods previously
+    # rode rio-general, whose Drifted-0 budget + the template's blanket
+    # WhenEmpty policy (a BUILDER rationale that never applied to the
+    # store) meant a 3-millicore store pod pinned a whole 32-vCPU node
+    # indefinitely — store reclaim is now bounded by STORE-plane
+    # policy: WhenEmptyOrUnderutilized + a 5m grace. Tainted so only
+    # store pods (which tolerate it, store.yaml) land here; the
+    # one-replica-per-node antiAffinity makes each replica pin a whole
+    # node, so limits.cpu/32 IS the hostable replica ceiling — the
+    # xtask pg-preflight reads THIS pool's limit for the hostable arm
+    # (deploy.rs store_pool_cpu_limit; change together). Capacity stays
+    # on-demand BY NODEPOOL (the signed doctrine's store exception:
+    # NAR transfers and PG pools don't checkpoint across interruption).
+    - name: rio-store
+      weight: 50
+      labels:
+        rio.build/node-role: store
+      taints:
+        - {key: rio.build/store, value: "true", effect: NoSchedule}
+      requirements:
+        - key: karpenter.k8s.aws/instance-family
+          operator: In
+          values: [c8a, m8a, r8a]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [on-demand]
+      limits: {cpu: 1500}
+      consolidationPolicy: WhenEmptyOrUnderutilized
+      consolidateAfter: 5m
 
     # General: untainted, for future gateway/scheduler HPA overflow.
     # System nodegroup (min=3 max=5) handles today's load; this absorbs

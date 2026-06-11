@@ -536,6 +536,15 @@ pub fn describe_metrics() {
          The rate-limited subset is retried (≤3 passes) after honoring \
          Retry-After; concurrency is halved when >10% of a pass 429s."
     );
+    describe_counter!(
+        "rio_store_substitute_infra_charge_total",
+        "Per-upstream substitute failures whose kernel disposition is \
+         ChargeInfra, labeled by class (stalled|admissionsaturated|fetch|\
+         integrity|ingest — the kernel alphabet's Debug repr, lowercased). \
+         The D6 (poisoned-pool retry-once) trigger gauge: that rider ships \
+         only if this shows sustained production hits from a single \
+         poisoned source."
+    );
     describe_histogram!(
         "rio_store_check_available_duration_seconds",
         "check_available wall-clock (HEAD-probe phase of FindMissingPaths). \

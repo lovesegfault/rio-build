@@ -177,12 +177,17 @@ spec:
   limits:
     cpu: {{ .limits.cpu }}
   disruption:
-    # WhenEmpty only — builds are long-running; don't consolidate a
-    # node with a worker pod on it even if underutilized. 10m default:
-    # ephemeral builds arrive in bursts; a node provisioned for one
-    # stays warm for the next, avoiding ~90s cold-start churn per
-    # build.
-    consolidationPolicy: WhenEmpty
+    # Default WhenEmpty — a BUILDER rationale (builds are long-running;
+    # don't consolidate a node with a worker pod on it even if
+    # underutilized; ephemeral builds arrive in bursts, so a node
+    # provisioned for one stays warm for the next, avoiding ~90s
+    # cold-start churn). D1 (bughunt-9): the rationale was blanket-
+    # applied to EVERY static pool, including ones no build ever
+    # lands on — pools whose pods are droppable-with-drain (the store)
+    # declare their own policy per-entry (values.yaml
+    # consolidationPolicy: WhenEmptyOrUnderutilized) instead of
+    # inheriting the builder default.
+    consolidationPolicy: {{ .consolidationPolicy | default "WhenEmpty" }}
     consolidateAfter: {{ .consolidateAfter | default "10m" }}
     {{- with .budgets }}
     budgets:
