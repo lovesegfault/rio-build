@@ -82,11 +82,45 @@ fn compute_local_nar_hash(path: &Path, algo: FodHashAlgo) -> anyhow::Result<Vec<
 /// multi-GB blobs (CUDA runfiles, JDK bundles, model weights) into
 /// fetcher pods sized at `LOCAL_MEM_BYTES` ≈ 2 GiB; a `fs::read` here
 /// would OOM the pod after the download already succeeded.
+///
+/// Opens with `O_NOFOLLOW|O_NONBLOCK` and rejects non-regular files: a
+/// malicious build could leave a symlink at the output path pointing at
+/// an arbitrary host file whose contents hash to the declared
+/// outputHash (buildah CVE-2024-1753 class) — verification would then
+/// attest content the build never produced — or plant a FIFO that a
+/// blocking open would sleep on forever.
 fn compute_local_flat_hash(path: &Path, algo: FodHashAlgo) -> anyhow::Result<Vec<u8>> {
     fn with<D: sha2::Digest>(path: &Path) -> anyhow::Result<Vec<u8>> {
-        use anyhow::Context;
-        let mut f = std::fs::File::open(path)
-            .with_context(|| format!("failed to open FOD output {}", path.display()))?;
+        use anyhow::{Context, bail};
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NOFOLLOW: open fails with ELOOP if the final component is
+        // a symlink — never hash through a build-written link.
+        // O_NONBLOCK: a blocking open of a build-planted FIFO with no
+        // writer sleeps forever; with O_NONBLOCK it returns at once and
+        // the fstat below rejects it (no effect on regular-file reads).
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+            .open(path)
+            .with_context(|| {
+                format!(
+                    "failed to open FOD output {} (symlinks are rejected)",
+                    path.display()
+                )
+            })?;
+        // fstat the opened fd (not the path — no TOCTOU window) to
+        // reject the remaining non-regular kinds (directory, FIFO,
+        // device): flat hashing is only defined over regular files.
+        let meta = f
+            .metadata()
+            .with_context(|| format!("failed to stat FOD output {}", path.display()))?;
+        if !meta.is_file() {
+            bail!(
+                "FOD output {} is not a regular file ({:?})",
+                path.display(),
+                meta.file_type()
+            );
+        }
         let mut w = DigestWriter { digest: D::new() };
         std::io::copy(&mut f, &mut w)?;
         Ok(w.digest.finalize().to_vec())
@@ -638,6 +672,66 @@ mod tests {
         let expected = hex::encode(sha2::Sha256::digest(&content));
         let drv = make_fod_drv("/nix/store/test-flat-large", "sha256", &expected);
         verify_fod_hashes(&drv, &store_dir)
+    }
+
+    /// A malicious build can leave a SYMLINK at the FOD output path
+    /// pointing at an arbitrary host file whose contents hash to the
+    /// declared outputHash (buildah CVE-2024-1753 class). Flat
+    /// verification must reject the symlink — following it would attest
+    /// content the build never produced and read host files across the
+    /// sandbox boundary.
+    #[test]
+    fn test_verify_fod_flat_symlink_rejected() -> anyhow::Result<()> {
+        use sha2::Digest;
+        let content = b"host file contents the build never produced";
+        let tmp = tempfile::tempdir()?;
+        let store_dir = tmp.path().join("nix/store");
+        std::fs::create_dir_all(&store_dir)?;
+        // "Host" file outside the upper store.
+        let host_file = tmp.path().join("host-secret");
+        std::fs::write(&host_file, content)?;
+        // Build-written symlink at the output path.
+        std::os::unix::fs::symlink(&host_file, store_dir.join("test-flat-symlink"))?;
+
+        // Declared hash matches the symlink TARGET's contents — a
+        // verifier that follows the link would wrongly accept.
+        let declared = hex::encode(sha2::Sha256::digest(content));
+        let drv = make_fod_drv("/nix/store/test-flat-symlink", "sha256", &declared);
+
+        let err = verify_fod_hashes(&drv, &store_dir)
+            .expect_err("flat FOD verification must reject a symlinked output");
+        assert!(
+            err.to_string().contains("failed to open FOD output"),
+            "error should come from the open-time symlink rejection: {err:#}"
+        );
+        Ok(())
+    }
+
+    /// A FIFO at the output path must be rejected, not hung on:
+    /// `O_NOFOLLOW` does not exclude FIFOs, and a blocking `open(2)` of
+    /// a writer-less FIFO sleeps until a writer appears — a build could
+    /// wedge the verifier forever. `O_NONBLOCK` makes the open return
+    /// immediately so the fstat check can reject the FIFO.
+    #[test]
+    fn test_verify_fod_flat_fifo_rejected() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let store_dir = tmp.path().join("nix/store");
+        std::fs::create_dir_all(&store_dir)?;
+        nix::unistd::mkfifo(
+            &store_dir.join("test-flat-fifo"),
+            nix::sys::stat::Mode::from_bits_truncate(0o644),
+        )?;
+
+        let declared = "00".repeat(32);
+        let drv = make_fod_drv("/nix/store/test-flat-fifo", "sha256", &declared);
+
+        let err = verify_fod_hashes(&drv, &store_dir)
+            .expect_err("flat FOD verification must reject a FIFO output");
+        assert!(
+            err.to_string().contains("not a regular file"),
+            "error should come from the fstat file-type check: {err:#}"
+        );
+        Ok(())
     }
 
     /// Unknown algo (e.g., md5 — Nix doesn't support it, but be defensive):
