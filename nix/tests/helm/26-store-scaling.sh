@@ -121,19 +121,22 @@ grep -q 'type: cpu' <<<"$trig" || {
   exit 1
 }
 n_avg=$(grep -c 'metricType: AverageValue' <<<"$trig" || true)
-test "$n_avg" -eq 2 || {
-  echo "FAIL: expected 2 AverageValue prometheus triggers on the store ScaledObject, got $n_avg" >&2
+test "$n_avg" -eq 3 || {
+  echo "FAIL: expected 3 AverageValue prometheus triggers on the store ScaledObject (backlog, builders, D2 demand inhibitor), got $n_avg" >&2
   exit 1
 }
 
-# Scale-down damped (1800s window) but geometric once it engages:
-# max(25%, 1 pod) per 600s (selectPolicy Max), so an uncapped fleet
-# drains 173→2 in ~12-16 periods instead of 171 ticks of Pods-1 alone.
-# Scale-up unstabilized.
+# Scale-down (D2, bughunt-9): the abort-aware fast collapse — 300s
+# stabilization (the N=10-scrape debounce) + Percent-100/60s. The
+# guards moved from the blanket 1800s damping to the TRIGGERS (HPA
+# max-over-triggers: backlog, builders, CPU, and the live_056-c
+# demand-side retry inhibitor — see 45-store-scaledown-inhibitor.sh);
+# post-collapse claim stranding self-heals via the zero-progress
+# reclaim (WO-S5-4, co-derived). Scale-up unstabilized.
 sd=$(yq -N 'select(.kind=="ScaledObject" and .metadata.name=="rio-store") | .spec.advanced.horizontalPodAutoscalerConfig.behavior.scaleDown.stabilizationWindowSeconds' "$out")
 su=$(yq -N 'select(.kind=="ScaledObject" and .metadata.name=="rio-store") | .spec.advanced.horizontalPodAutoscalerConfig.behavior.scaleUp.stabilizationWindowSeconds' "$out")
-test "$sd" = "1800" && test "$su" = "0" || {
-  echo "FAIL: store ScaledObject stabilization scaleDown/scaleUp = $sd/$su, expected 1800/0" >&2
+test "$sd" = "300" && test "$su" = "0" || {
+  echo "FAIL: store ScaledObject stabilization scaleDown/scaleUp = $sd/$su, expected 300/0 (D2: the floor SLO needs the short window; the inhibitor trigger carries the protection)" >&2
   exit 1
 }
 # D-052-2: scale-up keeps the 0s window (a post-wipe wave must scale
@@ -156,17 +159,13 @@ grep -q 'selectPolicy: Max' <<<"$sdp" || {
   echo "FAIL: store scaleDown lost selectPolicy: Max — with multiple policies the HPA default must be explicit" >&2
   exit 1
 }
-grep -q 'type: Percent' <<<"$sdp" && grep -q 'value: 25' <<<"$sdp" || {
-  echo "FAIL: store scaleDown lost the Percent-25 policy — an uncapped fleet would drain at 1 pod / 600s (~17h from the ceiling)" >&2
+grep -q 'type: Percent' <<<"$sdp" && grep -q 'value: 100' <<<"$sdp" || {
+  echo "FAIL: store scaleDown lost the Percent-100 fast-collapse policy (D2: floor within T<=5min once the quiet consensus holds)" >&2
   exit 1
 }
-grep -q 'type: Pods' <<<"$sdp" && grep -q 'value: 1' <<<"$sdp" || {
-  echo "FAIL: store scaleDown lost the Pods-1 policy — small fleets need the at-least-one-pod drain floor" >&2
-  exit 1
-}
-n_600=$(grep -c 'periodSeconds: 600' <<<"$sdp" || true)
-test "$n_600" -eq 2 || {
-  echo "FAIL: expected both scaleDown policies at periodSeconds 600, got $n_600" >&2
+n_60=$(grep -c 'periodSeconds: 60' <<<"$sdp" || true)
+test "$n_60" -eq 1 || {
+  echo "FAIL: expected the one scaleDown policy at periodSeconds 60, got $n_60" >&2
   exit 1
 }
 

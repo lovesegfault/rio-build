@@ -77,17 +77,39 @@ spec:
     horizontalPodAutoscalerConfig:
       behavior:
         scaleDown:
-          stabilizationWindowSeconds: 1800
-          # Max of the two ⇒ geometric drain at scale, single-pod floor
-          # near the bottom (see the damping comment above).
+          # D2 (Q6 COMMISSIONED) + live_056-c (bughunt-9): the
+          # abort-aware fast collapse WITH demand-side inhibitors.
+          # LAW: after a terminal fleet-affecting cancel (all builds
+          # terminal + backlog 0) desired reaches floor within T <=
+          # 5min — AND the dual law: absence of completed work is NOT
+          # evidence of absent demand (live_056-c: KEDA read a
+          # reachability outage as idleness and shrank 8->4 mid-wedge;
+          # a naive fast collapse would have AMPLIFIED the spiral).
+          # The conjunction is structural, not a formula: HPA takes
+          # the MAX over all triggers, so collapse requires backlog=0
+          # AND builders=0 AND cpu-quiet AND demand-plane retry
+          # pressure under threshold (the inhibitor trigger below) —
+          # abort evidence and quiet telemetry must AGREE. Nonzero
+          # retry pressure holds desired up, which structurally DEFERS
+          # the floor clock (the SLO arms only on AGREE — a terminal
+          # cancel during an outage does not violate T).
+          # 300s window = the N-scrape debounce (N=10 at the 30s
+          # prometheus interval), co-derived with WO-S5-4's
+          # zero-progress reclaim: post-collapse SIGKILL claim
+          # stranding self-heals at <= the stall window, retiring the
+          # old 1800s blanket damping whose only job was preventing
+          # exactly that stranding. Percent-100/60s: once the window's
+          # quiet consensus holds, the drain is one HPA pass — the
+          # guards are the TRIGGERS now, not the ladder rate.
+          # nix/tests/helm/26-store-scaling.sh +
+          # 45-store-scaledown-inhibitor.sh pin window, policy, and
+          # the inhibitor trigger.
+          stabilizationWindowSeconds: 300
           selectPolicy: Max
           policies:
             - type: Percent
-              value: 25
-              periodSeconds: 600
-            - type: Pods
-              value: 1
-              periodSeconds: 600
+              value: 100
+              periodSeconds: 60
         scaleUp:
           # D-052-2 (live_052 close). The 0s window is PRESERVED on
           # purpose: a post-wipe warm wave must start scaling the
@@ -149,6 +171,29 @@ spec:
           "rio_scheduler_open_attempts"
           "targetBuildersPerReplica"
           $a.targetBuildersPerReplica) | nindent 4 }}
+    # Demand-side scale-down INHIBITOR (live_056-c, the D2 dual law):
+    # client-plane retry pressure against the store. The series is
+    # DEMAND-PLANE and probe/scrape-immune BY THE LAW: the gateway's
+    # PutPath-retry counter counts retry events on store
+    # Code::Aborted/unreachable — kubelet grpc readiness probes
+    # (store.yaml, real health RPCs every 5s) and tcpSocket liveness
+    # handshakes never enter it, so the release edge ("attempts
+    # cease") is reachable in production (a store-side SYN/accept or
+    # whole-interceptor count would be PERMANENTLY nonzero under
+    # probing and veto the Q6 fast collapse forever). Client-plane
+    # also has no datapath-blackhole gap: a drop before the store
+    # pod's stack still shows as client retries — the exact live_056
+    # shape. zero-work AND nonzero-retries => NOT idle => this
+    # trigger's ceil(rate/threshold) holds desired up; incident-scale
+    # pressure (thousands of builders re-trying) saturates to
+    # maxReplicaCount, so desired never shrinks below current during
+    # a real outage. Threshold: the named violable
+    # targetRetryAttemptsPerReplica (values.yaml — derivation there).
+    {{- include "rio.promTrigger" (list $ $a.prometheusAddress
+          "sum(rate(rio_gateway_putpath_aborted_retries_total[2m]))"
+          "rio_gateway_putpath_aborted_retries_total"
+          "targetRetryAttemptsPerReplica"
+          $a.targetRetryAttemptsPerReplica) | nindent 4 }}
     # Saturation (reactive, all classes): decompression, hashing,
     # chunking, and serve-path proto/TLS make CPU track all three load
     # classes well enough to act as the corrective term. If the

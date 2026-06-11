@@ -320,6 +320,20 @@ store:
     # for the CPU trigger plus an occasional re-tune from the
     # warm-phase capture.
     targetBuildersPerReplica: 50
+    # D2/live_056-c demand-side scale-down inhibitor threshold:
+    # client-plane PutPath retry rate (retries/s) per replica. R17
+    # NAMED VIOLABLE const; derivation: one actively-retrying client
+    # emits ~0.1-0.5 retries/s (the gateway's backoff cadence), so
+    # 0.05 makes a SINGLE struggling client hold a couple of replicas
+    # and incident-scale pressure (hundreds of clients — the live_056
+    # shape) saturate the trigger to the ceiling: desired never
+    # shrinks below current during a reachability outage. The counted
+    # population EXCLUDES platform health traffic BY THE LAW (the
+    # series is gateway retry events; kubelet probes never enter it —
+    # see store-scaledobject.yaml's inhibitor comment). Lower = more
+    # protective (inhibits on fainter demand); raise only with a
+    # recorded re-derivation.
+    targetRetryAttemptsPerReplica: 0.05
     # CPU saturation trigger (percent average utilization).
     cpuUtilization: 70
     # In-cluster prometheus the KEDA scaler queries. Default matches
