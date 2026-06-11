@@ -292,10 +292,36 @@ pub(crate) async fn complete_manifest_chunked(
     castore: Option<&crate::cas::ParsedNar>,
     tenant: Option<uuid::Uuid>,
 ) -> Result<()> {
+    // Single bounded retry on 40P01 (same policy as the sweep batch
+    // loop and other `retry_once_on_deadlock` callers): the sorted
+    // lock-then-flip in `mark_manifest_chunks_durable` SHOULD prevent
+    // deadlock, but PG can still 40P01 under index-page-split
+    // contention — and unlike PutPathBatch (whose caller pre-locks
+    // via `lock_staged_chunks_for_commit` and surfaces retryable
+    // statuses), this single-output commit was the client-visible
+    // ~1%-of-PutPaths failure with no server-side retry. The first
+    // attempt's tx rolled back on deadlock, leaving the placeholder
+    // claim intact for the re-run.
+    crate::metadata::retry_once_on_deadlock(|| {
+        complete_manifest_chunked_attempt(pool, info, claim, castore, tenant)
+    })
+    .await?;
+    debug!(store_path = %info.store_path.as_str(), "chunked upload completed");
+    Ok(())
+}
+
+/// One completion transaction attempt — split out so
+/// [`complete_manifest_chunked`] can retry the whole txn on 40P01.
+async fn complete_manifest_chunked_attempt(
+    pool: &PgPool,
+    info: &ValidatedPathInfo,
+    claim: uuid::Uuid,
+    castore: Option<&crate::cas::ParsedNar>,
+    tenant: Option<uuid::Uuid>,
+) -> Result<()> {
     let mut tx = pool.begin().await?;
     super::complete_manifest_in_conn(&mut tx, info, claim, None, castore, tenant).await?;
     tx.commit().await?;
-    debug!(store_path = %info.store_path.as_str(), "chunked upload completed");
     Ok(())
 }
 
