@@ -71,8 +71,11 @@ pub(crate) struct WalkedTarget {
 /// verifies against.
 pub(crate) struct ChunkFramePlan {
     pub digest: [u8; 32],
-    /// Absolute path of the file containing the chunk.
-    pub abs_path: PathBuf,
+    /// Path of the file containing the chunk, relative to the upper
+    /// store. Re-opened beneath a held upper-store dirfd
+    /// ([`open_chunk_source`]) — never by absolute path through the
+    /// attacker-written output tree.
+    pub rel_path: PathBuf,
     pub offset: u64,
     pub size: u32,
 }
@@ -155,9 +158,18 @@ pub(super) async fn upload_outputs_chunked(
         // referenced chunk was GC-claimed mid-upload — the durable set
         // has changed and the stale `novel` would lie again.
         let durable = probe_durable_chunks(&clients.chunk, &probe_digests, assignment_token).await;
-        let (begin, plan) = build_begin(&targets, upper_store, deriver, input_closure, &durable);
+        let (begin, plan) = build_begin(&targets, deriver, input_closure, &durable);
 
-        match send_chunked(&clients.store, begin, plan, assignment_token, timeout).await {
+        match send_chunked(
+            &clients.store,
+            begin,
+            plan,
+            upper_store,
+            assignment_token,
+            timeout,
+        )
+        .await
+        {
             Ok((created, bytes_streamed)) => {
                 metrics::counter!("rio_builder_upload_bytes_total").increment(bytes_streamed);
                 let mut results = Vec::with_capacity(targets.len());
@@ -322,7 +334,6 @@ async fn probe_durable_chunks(
 // r[impl builder.upload.deriver-populated]
 pub(crate) fn build_begin(
     targets: &[WalkedTarget],
-    upper_store: &Path,
     deriver: &str,
     input_closure: &[String],
     durable: &HashSet<[u8; 32]>,
@@ -368,7 +379,6 @@ pub(crate) fn build_begin(
     let mut novel = Vec::new();
     let mut plan = Vec::new();
     for t in targets {
-        let output_root = upper_store.join(&t.basename);
         for c in &t.walked.chunk_manifest {
             if seen.insert(c.digest) && !durable.contains(&c.digest) {
                 let src =
@@ -378,7 +388,7 @@ pub(crate) fn build_begin(
                 novel.push(c.digest.to_vec());
                 plan.push(ChunkFramePlan {
                     digest: c.digest,
-                    abs_path: src.abs_path(&output_root),
+                    rel_path: src.upper_rel_path(&t.basename),
                     offset: src.offset,
                     size: src.size,
                 });
@@ -398,14 +408,50 @@ pub(crate) fn build_begin(
     )
 }
 
+/// Re-open one walked file for chunk re-reads, beneath the held
+/// upper-store dirfd.
+///
+/// The fused walk read these bytes through fd-relative, symlink-free
+/// resolution; this re-open is the only second resolution of the
+/// attacker-written output tree (the bytes read here go on the wire).
+/// `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` extends the walk's
+/// guarantee to it: a symlink swapped in anywhere under the upper store
+/// between walk and upload fails the open instead of being followed to
+/// an arbitrary host file, and `..` cannot escape the upper store.
+/// `O_NONBLOCK` plus the fstat regular-file check turn a FIFO swap into
+/// an immediate error instead of an indefinitely parked upload task.
+/// The BLAKE3 re-verify downstream still guards WHAT the bytes are;
+/// this guards WHERE they come from.
+fn open_chunk_source(
+    upper: std::os::fd::BorrowedFd<'_>,
+    rel: &Path,
+) -> std::io::Result<std::fs::File> {
+    use nix::fcntl::{OFlag, OpenHow, ResolveFlag, openat2};
+    let how = OpenHow::new()
+        .flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK)
+        .resolve(ResolveFlag::RESOLVE_BENEATH | ResolveFlag::RESOLVE_NO_SYMLINKS);
+    let fd = openat2(upper, rel, how).map_err(std::io::Error::from)?;
+    let f = std::fs::File::from(fd);
+    let meta = f.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::other(format!(
+            "not a regular file ({:?})",
+            meta.file_type()
+        )));
+    }
+    Ok(f)
+}
+
 /// Drive one `PutPathChunked` stream: the `Begin` frame, then one
 /// `ChunkData` per plan entry in order, bytes re-read from disk on the
-/// blocking pool. Returns the per-output `created` flags and the number
-/// of chunk bytes streamed.
+/// blocking pool (re-opened beneath `upper_store` — see
+/// [`open_chunk_source`]). Returns the per-output `created` flags and
+/// the number of chunk bytes streamed.
 pub(super) async fn send_chunked(
     store_client: &StoreServiceClient<Channel>,
     begin: PutPathChunkedBegin,
     plan: Vec<ChunkFramePlan>,
+    upper_store: &Path,
     assignment_token: &str,
     timeout: Duration,
 ) -> Result<(Vec<bool>, u64), tonic::Status> {
@@ -422,15 +468,35 @@ pub(super) async fn send_chunked(
     // Blocking reader: re-read each novel chunk's bytes and forward
     // them. `blocking_send` gives backpressure against the gRPC send —
     // peak memory stays at STREAM_CHANNEL_BUF × FASTCDC_MAX_BYTES.
+    let upper_store = upper_store.to_path_buf();
     let reader = tokio::task::spawn_blocking(move || -> Result<u64, tonic::Status> {
+        use std::os::fd::AsFd;
+        // The upper store dir itself is builder-owned (overlay upper),
+        // not build-writable — resolving it normally, once, is safe.
+        // Everything under it goes through open_chunk_source.
+        let upper = nix::fcntl::open(
+            &upper_store,
+            nix::fcntl::OFlag::O_RDONLY
+                | nix::fcntl::OFlag::O_DIRECTORY
+                | nix::fcntl::OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::empty(),
+        )
+        .map_err(|e| {
+            let msg = format!("failed to open upper store {}: {e}", upper_store.display());
+            tracing::error!("{msg}");
+            tonic::Status::internal(msg)
+        })?;
         let mut total: u64 = 0;
         // Chunks of one file are consecutive in novel order, so caching
         // the last opened file avoids re-opening per 64 KiB chunk.
         let mut open: Option<(PathBuf, std::fs::File)> = None;
         for entry in plan {
-            if open.as_ref().is_none_or(|(p, _)| *p != entry.abs_path) {
-                let f = std::fs::File::open(&entry.abs_path).map_err(|e| {
-                    let msg = format!("chunk re-read failed for {}: {e}", entry.abs_path.display());
+            if open.as_ref().is_none_or(|(p, _)| *p != entry.rel_path) {
+                let f = open_chunk_source(upper.as_fd(), &entry.rel_path).map_err(|e| {
+                    let msg = format!(
+                        "chunk re-read failed for {}: {e}",
+                        upper_store.join(&entry.rel_path).display()
+                    );
                     // Logged here as well as returned: when the server
                     // rejects the truncated stream, the gRPC status wins
                     // the error-priority race below and this worker-side
@@ -438,7 +504,7 @@ pub(super) async fn send_chunked(
                     tracing::error!("{msg}");
                     tonic::Status::internal(msg)
                 })?;
-                open = Some((entry.abs_path.clone(), f));
+                open = Some((entry.rel_path.clone(), f));
             }
             let (_, file) = open.as_mut().expect("opened above");
             let mut buf = vec![0u8; entry.size as usize];
@@ -447,7 +513,7 @@ pub(super) async fn send_chunked(
                 .map_err(|e| {
                     let msg = format!(
                         "chunk re-read failed for {} at offset {}: {e}",
-                        entry.abs_path.display(),
+                        upper_store.join(&entry.rel_path).display(),
                         entry.offset
                     );
                     tracing::error!("{msg}");
@@ -460,7 +526,7 @@ pub(super) async fn send_chunked(
             if *blake3::hash(&buf).as_bytes() != entry.digest {
                 let msg = format!(
                     "chunk at {} offset {} no longer matches its walked digest",
-                    entry.abs_path.display(),
+                    upper_store.join(&entry.rel_path).display(),
                     entry.offset
                 );
                 tracing::error!("{msg}");
@@ -509,6 +575,88 @@ mod tests {
     use super::*;
     use rio_common::grpc::GRPC_STREAM_TIMEOUT;
     use rio_common::limits::MAX_BATCH_OUTPUTS;
+
+    fn upper_fixture() -> (tempfile::TempDir, std::fs::File, PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let upper = tmp.path().join("upper");
+        std::fs::create_dir_all(upper.join("abc-out")).expect("mkdir");
+        std::fs::write(upper.join("abc-out/data"), b"walked chunk bytes").expect("write");
+        let dirfd = std::fs::File::open(&upper).expect("open upper");
+        (tmp, dirfd, upper)
+    }
+
+    /// Baseline: the hardened re-open reads exactly the walked file.
+    #[test]
+    fn chunk_reopen_reads_walked_file() {
+        use std::io::Read;
+        use std::os::fd::AsFd;
+        let (_tmp, dirfd, _upper) = upper_fixture();
+        let mut f =
+            open_chunk_source(dirfd.as_fd(), Path::new("abc-out/data")).expect("open succeeds");
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).expect("read");
+        assert_eq!(buf, b"walked chunk bytes");
+    }
+
+    /// A symlink swapped in under the output root between walk and
+    /// chunk re-read must be rejected at open time — even when its
+    /// target has IDENTICAL content (the BLAKE3 re-verify downstream
+    /// cannot tell). Red-proven on the path-based re-open
+    /// (`File::open(abs_path)`): the open followed the link and the
+    /// upload proceeded through attacker-controlled resolution.
+    #[test]
+    fn chunk_reopen_rejects_symlink_swap() {
+        use std::os::fd::AsFd;
+        let (tmp, dirfd, upper) = upper_fixture();
+        // Host file OUTSIDE the upper store with the same content the
+        // walk hashed.
+        let outside = tmp.path().join("host-file");
+        std::fs::write(&outside, b"walked chunk bytes").expect("write");
+        std::fs::remove_file(upper.join("abc-out/data")).expect("rm");
+        std::os::unix::fs::symlink(&outside, upper.join("abc-out/data")).expect("symlink");
+
+        let res = open_chunk_source(dirfd.as_fd(), Path::new("abc-out/data"));
+        assert!(
+            res.is_err(),
+            "chunk re-open must reject a swapped-in symlink, got {res:?}"
+        );
+    }
+
+    /// A FIFO swapped in must fail immediately (`O_NONBLOCK` + fstat),
+    /// not park the upload task in a blocking open until the gRPC
+    /// timeout fires.
+    #[test]
+    fn chunk_reopen_rejects_fifo_swap() {
+        use std::os::fd::AsFd;
+        let (_tmp, dirfd, upper) = upper_fixture();
+        std::fs::remove_file(upper.join("abc-out/data")).expect("rm");
+        nix::unistd::mkfifo(
+            &upper.join("abc-out/data"),
+            nix::sys::stat::Mode::from_bits_truncate(0o644),
+        )
+        .expect("mkfifo");
+
+        let err = open_chunk_source(dirfd.as_fd(), Path::new("abc-out/data"))
+            .expect_err("chunk re-open must reject a swapped-in FIFO");
+        assert!(
+            err.to_string().contains("not a regular file"),
+            "error should come from the fstat file-type check: {err}"
+        );
+    }
+
+    /// `..` in a plan rel_path cannot escape the upper store
+    /// (`RESOLVE_BENEATH` is a kernel guarantee, not name validation).
+    #[test]
+    fn chunk_reopen_rejects_parent_escape() {
+        use std::os::fd::AsFd;
+        let (tmp, dirfd, _upper) = upper_fixture();
+        std::fs::write(tmp.path().join("escape"), b"outside bytes").expect("write");
+        let res = open_chunk_source(dirfd.as_fd(), Path::new("../escape"));
+        assert!(
+            res.is_err(),
+            "chunk re-open must refuse a `..` escape, got {res:?}"
+        );
+    }
 
     #[test]
     fn chunked_stream_timeout_scales_with_outputs() {
