@@ -105,6 +105,34 @@ spec:
 # ADR-023 §13b shim — Karpenter sees this NodePool, never provisions
 # from it (cpu:0). rio-controller's `nodeclaim_pool` reconciler creates
 # NodeClaims directly with `karpenter.sh/nodepool: rio-nodeclaim-shim`.
+#
+# DESIGNED NOISE (live_057-e, RULED): Karpenter's provisioner
+# evaluates every Pending builder pod against this pool and emits
+# exactly two FailedScheduling message classes for EVERY Pending
+# builder pod, ALWAYS:
+#   "label rio.build/hw-band|storage does not have known values"
+#       — the requirements carry NO rio.build/* keys, BY DESIGN
+#         (see below);
+#   "would exceed limit / instance types exceed limits"
+#       — limits.cpu: "0", BY DESIGN.
+# These events are the shim's standing byproduct, NOT a defect and
+# NOT a capacity signal. The "obvious fix" — adding rio.build/* to
+# the requirements — re-creates the live B8 failure: Karpenter's
+# instance-type discovery knows no rio.build/* labels, so such a
+# requirement matches 0 instance types ⇒ Launched=False ⇒ the claim
+# is GC'd ~1s later (cover.rs's requirements doc names the
+# mechanism; the hw labels ride NodeClaim metadata.labels instead).
+# The inverse pin keeps these requirements rio.build/*-FREE.
+# bind[13-nodeclaim-shim.sh]
+#
+# RUNBOOK (live_057's diagnosis lesson): the Karpenter event stream
+# is NON-DIAGNOSTIC for shim-attributed FailedScheduling — en-masse
+# shim events during an incident mean ONLY "many pods are Pending",
+# never WHY. The authoritative Pending signal is controller-side:
+# pods Pending while their cell's cover_deficit mints ZERO
+# NodeClaims with fleet/class headroom available re-opens as a
+# CONTROLLER defect (the demand-view completeness disclosures are
+# the instrument). RULED trigger recorded in the signed A1 packet.
 apiVersion: karpenter.sh/v1
 kind: NodePool
 metadata:

@@ -35,6 +35,38 @@ test "$n" -eq 0 || {
   pools_of "$on" | grep -E '^rio-builder-' >&2
   exit 1
 }
+
+# live_057-e (W10-CR, the INVERSE PIN): the shim's requirements are
+# rio.build/*-FREE BY DESIGN. Putting rio.build/* into NodePool/
+# NodeClaim requirements matches 0 instance types (Karpenter's
+# instance-type discovery knows no such labels) ⇒ Launched=False ⇒
+# claim GC'd ~1s — the live B8 finding (cover.rs's requirements
+# doc); the hw labels ride NodeClaim metadata.labels instead. The
+# shim's FailedScheduling event noise ("does not have known values"
+# / "would exceed limit") is the DESIGNED byproduct of exactly this
+# label-free + cpu:0 shape — so the "obvious fix" (adding the
+# labels here) is structurally red.
+shim_req_keys=$(yq -N 'select(.kind=="NodePool" and .metadata.name=="rio-nodeclaim-shim")
+                       | .spec.template.spec.requirements[].key' "$on")
+bad_keys=$(grep -E '^rio\.build/' <<<"$shim_req_keys" || true)
+test -z "$bad_keys" || {
+  echo "FAIL: rio-nodeclaim-shim requirements carry rio.build/* keys:" >&2
+  echo "$bad_keys" >&2
+  echo "  rio.build/* in requirements matches 0 instance types ⇒" >&2
+  echo "  Launched=False ⇒ claim GC'd ~1s (B8). hw labels belong in" >&2
+  echo "  metadata.labels; the shim's event noise is designed (live_057-e)" >&2
+  exit 1
+}
+# The narration bind: the shim template names BOTH expected
+# FailedScheduling event classes verbatim (the runbook demotion
+# rides the same block — Karpenter events are non-diagnostic for
+# shim-attributed reasons).
+for phrase in 'does not have known values' 'would exceed limit'; do
+  grep -q "$phrase" templates/karpenter.yaml || {
+    echo "FAIL: shim narration lost the expected-event class '$phrase' (live_057-e)" >&2
+    exit 1
+  }
+done
 # r39: capture pools_of output before grep -q. Same SIGPIPE shape as
 # the yq | grep -q pipes swept in 12-priorityclass.sh — `grep -q`
 # exits at first match → `sort` (the function's last stage) SIGPIPE
@@ -63,11 +95,14 @@ fi
 sched_toml=$(yq -N 'select(.kind=="ConfigMap" and .metadata.name=="rio-scheduler-config")
                     | .data."scheduler.toml"' "$on")
 for h in metal-x86 metal-arm; do
-  block=$(printf '%s\n' "$sched_toml" | awk -v h="$h" '
+  # r39-class note: awk with an early `exit` must NOT sit downstream
+  # of a pipe — the producer races the pipe buffer and SIGPIPEs under
+  # pipefail (141). Here-strings instead of `printf | awk` throughout.
+  block=$(awk -v h="$h" '
     $0 == "[sla.hw_classes.\"" h "\"]" { in_h=1; next }
     in_h && /^\[/ { exit }
     in_h { print }
-  ')
+  ' <<<"$sched_toml")
   test -n "$block" || { echo "FAIL: scheduler.toml missing hw_classes.$h" >&2; exit 1; }
   echo "$block" | grep -q 'node_class = "rio-metal"' || {
     echo "FAIL: $h node_class != rio-metal" >&2; exit 1; }
@@ -95,23 +130,23 @@ done
 # Combined: Σ(metal) + Σ(fetcher) ≤ maxFleetCores − 10000, where the
 # 10000 RHS slack is the pre-§13c floor for non-metal non-fetcher
 # (general builder) classes.
-global_fc=$(printf '%s\n' "$sched_toml" | awk '
+global_fc=$(awk '
   /^\[sla\]/ { in_sla=1 }
   /^\[sla\./ { in_sla=0 }
   in_sla && /^max_fleet_cores = / { print $3; exit }
-')
-metal_sum=$(printf '%s\n' "$sched_toml" | awk '
+' <<<"$sched_toml")
+metal_sum=$(awk '
   /^\[sla\.hw_classes\./ { h=$0; sub(/.*"/,"",h); sub(/".*/,"",h); is_metal=0 }
   h && /^node_class = "rio-metal"/ { is_metal=1 }
   is_metal && /^max_fleet_cores = / { sum+=$3 }
   END { print sum+0 }
-')
-fetcher_sum=$(printf '%s\n' "$sched_toml" | awk '
+' <<<"$sched_toml")
+fetcher_sum=$(awk '
   /^\[sla\.hw_classes\./ { h=$0; sub(/.*"/,"",h); sub(/".*/,"",h); is_fetcher=0 }
   h && /^provides_features = \[.*"fetcher".*\]/ { is_fetcher=1 }
   is_fetcher && /^max_fleet_cores = / { sum+=$3 }
   END { print sum+0 }
-')
+' <<<"$sched_toml")
 test "$metal_sum" -le 10000 || {
   echo "FAIL: Σ metal max_fleet_cores ($metal_sum) > 10000 (D4a cap)" >&2
   exit 1
