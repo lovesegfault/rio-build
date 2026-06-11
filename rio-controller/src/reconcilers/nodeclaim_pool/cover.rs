@@ -170,6 +170,12 @@ pub struct DropTally {
     /// OVER_CAP`, never the poison-feeding reason). Self-heals ≤300s
     /// (GetHwClassConfig skew) or on scheduler re-solve.
     pub over_cap: u64,
+    /// Every unmasked candidate outside the controller's mintable
+    /// universe (bug_050) — the typed disclosure replacing the old
+    /// post-hoc `unknown_cell_intents` count; emitted as
+    /// `intent_dropped_total{reason=unknown_hw_class}` (label
+    /// continuity for the existing alert surface). Self-heals ≤300s.
+    pub unknown_universe: u64,
     /// The intent's `(hw_class_names, node_affinity)` pair had
     /// undecodable entries (merged_bug_006) — the whole intent REFUSES
     /// (`ArmEchoSkewed` posture; counted via
@@ -221,6 +227,17 @@ pub enum PlacementOutcome {
         footprint: (u32, u64, u64),
         cap: (u32, u64, u64),
     },
+    /// Every unmasked candidate cell is OUTSIDE the controller's
+    /// mintable universe (bug_050: scheduler-stamped cells the
+    /// controller's GetHwClassConfig doesn't know — ≤300s rollout
+    /// skew, or a hwClass removed from controller config). The walk
+    /// realizes placements against the LOCAL universe ("placement
+    /// supersets provisioning"), so an all-unknown set takes this
+    /// typed disclosure instead of a silent `Placed` the cover loop
+    /// strands; self-heals at the next refresh. Counted via
+    /// `intent_dropped_total{reason=unknown_hw_class}`. OFF the wire
+    /// (transient local skew; the scheduler's demand is unchanged).
+    UnknownUniverse { candidates: usize },
     /// The intent's `(hw_class_names, node_affinity)` wire pair had
     /// undecodable entries (length mismatch, missing capacity-type
     /// requirement, unparseable capacity value — merged_bug_006). LOUD
@@ -250,6 +267,7 @@ impl PlacementOutcome {
             PlacementOutcome::Placed(_)
             | PlacementOutcome::LeadTimeGated
             | PlacementOutcome::UnplaceableAllMasked { .. }
+            | PlacementOutcome::UnknownUniverse { .. }
             | PlacementOutcome::DecodeRefused { .. } => None,
             PlacementOutcome::NoHostingClass => {
                 Some(rio_proto::types::IntentVerdictReason::NoHostingClass)
@@ -282,6 +300,7 @@ impl DropTally {
                 }
                 PlacementOutcome::NoHostingClass => t.no_hosting_class += 1,
                 PlacementOutcome::OverCap { .. } => t.over_cap += 1,
+                PlacementOutcome::UnknownUniverse { .. } => t.unknown_universe += 1,
                 PlacementOutcome::DecodeRefused { .. } => t.decode_refused += 1,
             }
         }
@@ -356,6 +375,7 @@ pub fn assign_to_cells<'a>(
     unplaced: &'a [SpawnIntent],
     sketches: &CellSketches,
     masked: &HashSet<Cell>,
+    known: &HashSet<Cell>,
     cell_price: impl Fn(&Cell) -> f64,
     fallback: impl Fn(&SpawnIntent, &HashSet<Cell>) -> Option<Cell>,
 ) -> (
@@ -382,12 +402,29 @@ pub fn assign_to_cells<'a>(
                 decoded: decode.decoded,
             }
         } else {
-            match open
-                .into_iter()
-                .filter(|c| !masked.contains(c))
+            // bug_050 (T6): realize the walk against the controller's
+            // MINTABLE universe — prefer controller-known candidates
+            // (mirroring the masked-failover in this same fn: the
+            // cheapest pick runs over known ∩ unmasked first), and
+            // when NO candidate is known, mint the typed disclosure
+            // letter (the genuine skew case) instead of a Placed the
+            // cover loop strands. "Placement supersets provisioning"
+            // is enforced where the walk happens, not where the set
+            // is minted; self-heal is preserved (next refresh
+            // converges).
+            let open_unmasked: Vec<Cell> =
+                open.into_iter().filter(|c| !masked.contains(c)).collect();
+            let unknown_candidates = open_unmasked.iter().filter(|c| !known.contains(c)).count();
+            let pick = open_unmasked
+                .iter()
+                .filter(|c| known.contains(c))
                 .min_by(|a, b| cell_price(a).total_cmp(&cell_price(b)))
-            {
+                .cloned();
+            match pick {
                 Some(c) => PlacementOutcome::Placed(c),
+                None if unknown_candidates > 0 => PlacementOutcome::UnknownUniverse {
+                    candidates: unknown_candidates,
+                },
                 None if !i.hw_class_names.is_empty() => {
                     // Non-empty hw_class_names + empty filtered set is a
                     // DISJUNCTION, not the old "⇔ lead-time-gated" claim
@@ -928,6 +965,27 @@ mod tests {
         }
     }
 
+    /// Forward to [`assign_to_cells`] with `known` = every cell the
+    /// intents decode to (the pre-bug_050 universe assumption: tests
+    /// that don't exercise universe skew see identical behavior; the
+    /// skew tests pass an explicit `known`).
+    fn assign_all_known<'a>(
+        unplaced: &'a [SpawnIntent],
+        sketches: &CellSketches,
+        masked: &HashSet<Cell>,
+        cell_price: impl Fn(&Cell) -> f64,
+        fallback: impl Fn(&SpawnIntent, &HashSet<Cell>) -> Option<Cell>,
+    ) -> (
+        BTreeMap<Cell, Vec<&'a SpawnIntent>>,
+        Vec<PlacementRecord<'a>>,
+    ) {
+        let known: HashSet<Cell> = unplaced
+            .iter()
+            .flat_map(super::super::ffd::cells_of)
+            .collect();
+        assign_to_cells(unplaced, sketches, masked, &known, cell_price, fallback)
+    }
+
     // --- sizing / claim_count ------------------------------------------
 
     fn cfg(max_node_cores: u32, budget: u32) -> SizingCfg {
@@ -1311,9 +1369,10 @@ mod tests {
         // h1 cheaper.
         let price = |c: &Cell| if c.0 == "h1" { 0.03 } else { 0.05 };
         let none = HashSet::new();
-        let (by, o) = assign_to_cells(&unplaced, &CellSketches::default(), &none, price, |_, _| {
-            None
-        });
+        let (by, o) =
+            assign_all_known(&unplaced, &CellSketches::default(), &none, price, |_, _| {
+                None
+            });
         assert_eq!(DropTally::from_outcomes(&o), DropTally::default());
         assert_eq!(by.len(), 2);
         let h1k = Cell("h1".into(), CapacityType::Spot);
@@ -1352,7 +1411,7 @@ mod tests {
         );
         let unplaced = [fod, bld];
         let none = HashSet::new();
-        let (by, o) = assign_to_cells(
+        let (by, o) = assign_all_known(
             &unplaced,
             &CellSketches::default(),
             &none,
@@ -1393,7 +1452,7 @@ mod tests {
         let spot = Cell("h".into(), CapacityType::Spot);
         let od = Cell("h".into(), CapacityType::OnDemand);
         // No mask → spot (cell_rank: spot < od).
-        let (by, _) = assign_to_cells(
+        let (by, _) = assign_all_known(
             &unplaced,
             &CellSketches::default(),
             &HashSet::new(),
@@ -1403,7 +1462,7 @@ mod tests {
         assert_eq!(by[&spot].len(), 1);
         // spot ICE-masked → od.
         let masked: HashSet<Cell> = [spot.clone()].into();
-        let (by, o) = assign_to_cells(
+        let (by, o) = assign_all_known(
             &unplaced,
             &CellSketches::default(),
             &masked,
@@ -1418,7 +1477,7 @@ mod tests {
         // ":silently skipped, NOT counted" expectation pinned the
         // silent starvation as intended; re-derived to the W7-A green).
         let masked: HashSet<Cell> = [spot, od].into();
-        let (by, o) = assign_to_cells(
+        let (by, o) = assign_all_known(
             &unplaced,
             &CellSketches::default(),
             &masked,
@@ -1470,7 +1529,7 @@ mod tests {
             ("hi-ebs-x86-g7", CapacityType::OnDemand),
         ];
         let unplaced = [intent("x", 4, GI, &cells, Some(true))];
-        let (by, o) = assign_to_cells(
+        let (by, o) = assign_all_known(
             &unplaced,
             &CellSketches::default(),
             &HashSet::new(),
@@ -1504,7 +1563,7 @@ mod tests {
         let rung = Cell("hi-ebs-x86-g7".into(), CapacityType::OnDemand);
         // Rung-1 masked ⇒ the walk advances to the last rung.
         let masked: HashSet<Cell> = [parent.clone()].into();
-        let (by, o) = assign_to_cells(
+        let (by, o) = assign_all_known(
             &unplaced,
             &CellSketches::default(),
             &masked,
@@ -1516,7 +1575,7 @@ mod tests {
         assert_eq!(DropTally::from_outcomes(&o), DropTally::default());
         // ALL rungs masked ⇒ loud, never silent (R6).
         let masked: HashSet<Cell> = [parent, rung].into();
-        let (by, o) = assign_to_cells(
+        let (by, o) = assign_all_known(
             &unplaced,
             &CellSketches::default(),
             &masked,
@@ -1568,7 +1627,7 @@ mod tests {
             for target in &universe {
                 let masked: HashSet<Cell> =
                     universe.iter().filter(|c| *c != target).cloned().collect();
-                let (by, _) = assign_to_cells(
+                let (by, _) = assign_all_known(
                     &unplaced,
                     &CellSketches::default(),
                     &masked,
@@ -1619,7 +1678,7 @@ mod tests {
         let fallback = |i: &SpawnIntent, _: &HashSet<Cell>| {
             (i.system == "x86_64-linux").then(|| Cell("ref".into(), CapacityType::Spot))
         };
-        let (by, o) = assign_to_cells(
+        let (by, o) = assign_all_known(
             &unplaced,
             &CellSketches::default(),
             &HashSet::new(),
@@ -1645,7 +1704,7 @@ mod tests {
 
     #[test]
     fn assign_empty_unplaced_empty_output() {
-        let (by, o) = assign_to_cells(
+        let (by, o) = assign_all_known(
             &[],
             &CellSketches::default(),
             &HashSet::new(),
@@ -1716,7 +1775,7 @@ mod tests {
             (!m.contains(&c)).then_some(c)
         };
         let masked: HashSet<Cell> = [ref_cell].into();
-        let (by, o) = assign_to_cells(
+        let (by, o) = assign_all_known(
             &unplaced,
             &CellSketches::default(),
             &masked,
@@ -2158,7 +2217,7 @@ mod tests {
         // `all_cells_ice_masked` (the fallback CAN host it; the cell is
         // just masked).
         let masked: HashSet<Cell> = [ref_cell.clone()].into();
-        let (by, o) = assign_to_cells(
+        let (by, o) = assign_all_known(
             &unplaced,
             &CellSketches::default(),
             &masked,
@@ -2237,7 +2296,7 @@ mod tests {
             Cell("h".into(), CapacityType::OnDemand),
         ]
         .into();
-        let (by, o) = assign_to_cells(
+        let (by, o) = assign_all_known(
             &unplaced,
             &CellSketches::default(),
             &masked,
@@ -2295,7 +2354,7 @@ mod tests {
         let mut i = intent("fc", 4, GI, &[("h1", CapacityType::Spot)], Some(false));
         i.eta_seconds = 999.0; // > every default lead time → A_open empty pre-mask
         let unplaced = [i];
-        let (by, o) = assign_to_cells(
+        let (by, o) = assign_all_known(
             &unplaced,
             &CellSketches::default(),
             &HashSet::new(),
@@ -2312,6 +2371,86 @@ mod tests {
     }
 
     // r[verify ctrl.nodeclaim.placement-outcome+1]
+    /// W9-AZ (bug_050, T6): the walk realizes placements against the
+    /// controller's MINTABLE universe — a scheduler-stamped rung the
+    /// controller does not know cannot strand demand while a known
+    /// open parent exists in the same A_open ("placement supersets
+    /// provisioning", enforced WHERE THE WALK HAPPENS).
+    #[test]
+    fn cheapest_pick_prefers_controller_known_cells() {
+        // rung:spot (band [0,0.5)) outranks parent:od (band [1,1.5))
+        // unconditionally in cell_rank — the deterministic stranding
+        // shape: the rung is scheduler-known but controller-UNKNOWN
+        // (<=300s GetHwClassConfig skew after a rung rollout).
+        let i = intent(
+            "d1",
+            4,
+            GI,
+            &[
+                ("rung-g8", CapacityType::Spot),
+                ("parent", CapacityType::OnDemand),
+            ],
+            Some(true),
+        );
+        let sketches = CellSketches::default();
+        let none = HashSet::new();
+        let known: HashSet<Cell> = [Cell("parent".into(), CapacityType::OnDemand)].into();
+        let (by_cell, outcomes) = assign_to_cells(
+            std::slice::from_ref(&i),
+            &sketches,
+            &none,
+            &known,
+            cell_rank,
+            |_, _| None,
+        );
+        let parent = Cell("parent".into(), CapacityType::OnDemand);
+        assert!(
+            matches!(&outcomes[0].1, PlacementOutcome::Placed(c) if *c == parent),
+            "demand lands on the KNOWN open parent, not the \
+             controller-unknown rung (got {:?}) — the cover loop never \
+             visits unknown cells, so the rung pick strands the demand",
+            outcomes[0].1
+        );
+        assert!(by_cell.contains_key(&parent), "covered via the parent");
+    }
+
+    // r[verify ctrl.nodeclaim.placement-outcome+1]
+    /// W9-AZ (the all-unknown face): when NO candidate is
+    /// controller-known, the typed disclosure letter mints (the
+    /// genuine skew case — self-heals on the next GetHwClassConfig
+    /// refresh) instead of a silent Placed-on-unknown that the cover
+    /// loop strands.
+    #[test]
+    fn all_unknown_candidates_mint_the_disclosure_letter() {
+        let i = intent("d2", 4, GI, &[("rung-g8", CapacityType::Spot)], Some(true));
+        let sketches = CellSketches::default();
+        let none = HashSet::new();
+        let known: HashSet<Cell> = HashSet::new();
+        let (by_cell, outcomes) = assign_to_cells(
+            std::slice::from_ref(&i),
+            &sketches,
+            &none,
+            &known,
+            cell_rank,
+            |_, _| None,
+        );
+        assert!(
+            !matches!(outcomes[0].1, PlacementOutcome::Placed(_)),
+            "an all-unknown candidate set must take the typed unknown \
+             letter, not a silent Placed the cover loop strands; got {:?}",
+            outcomes[0].1
+        );
+        assert!(
+            matches!(
+                outcomes[0].1,
+                PlacementOutcome::UnknownUniverse { candidates: 1 }
+            ),
+            "the disclosure letter carries the candidate count"
+        );
+        assert!(by_cell.is_empty(), "nothing assigned to unknown cells");
+    }
+
+    // r[verify ctrl.nodeclaim.placement-outcome+1]
     /// W9-AX (controller mint face, bug_026): an over-cap drop is a
     /// letter of the placement alphabet reaching the verdict plane —
     /// never a shadow disposition after the chokepoint.
@@ -2320,7 +2459,7 @@ mod tests {
         let i = intent("big", 128, GI, &[("h", CapacityType::Spot)], Some(true));
         let sketches = CellSketches::default();
         let none = HashSet::new();
-        let (by_cell, outcomes) = assign_to_cells(
+        let (by_cell, outcomes) = assign_all_known(
             std::slice::from_ref(&i),
             &sketches,
             &none,
@@ -2394,7 +2533,7 @@ mod tests {
             .retain(|r| r.key != CAPACITY_TYPE_LABEL);
         let sketches = CellSketches::default();
         let none = HashSet::new();
-        let (_, outcomes) = assign_to_cells(
+        let (_, outcomes) = assign_all_known(
             std::slice::from_ref(&i),
             &sketches,
             &none,
@@ -2426,6 +2565,7 @@ mod tests {
                 footprint: (128, 2 * GI, 4 * GI),
                 cap: (64, GI, 2 * GI),
             },
+            PlacementOutcome::UnknownUniverse { candidates: 1 },
             PlacementOutcome::DecodeRefused {
                 refused: 1,
                 decoded: 0,
@@ -2438,10 +2578,11 @@ mod tests {
                 PlacementOutcome::UnplaceableAllMasked { .. } => 2,
                 PlacementOutcome::NoHostingClass => 3,
                 PlacementOutcome::OverCap { .. } => 4,
-                PlacementOutcome::DecodeRefused { .. } => 5,
+                PlacementOutcome::UnknownUniverse { .. } => 5,
+                PlacementOutcome::DecodeRefused { .. } => 6,
             }
         };
-        let mut seen = [false; 6];
+        let mut seen = [false; 7];
         for r in &rows {
             seen[witness(r)] = true;
         }
@@ -2479,6 +2620,10 @@ mod tests {
                 },
                 PlacementOutcome::OverCap { .. } => DropTally {
                     over_cap: 1,
+                    ..Default::default()
+                },
+                PlacementOutcome::UnknownUniverse { .. } => DropTally {
+                    unknown_universe: 1,
                     ..Default::default()
                 },
                 PlacementOutcome::DecodeRefused { .. } => DropTally {
@@ -2618,8 +2763,17 @@ mod mint_law_tests {
         assert_eq!(placeable.len(), 1, "i-fits placed on the live node");
         assert_eq!(unplaced.len(), 1, "only the forecast survives the split");
         let none = HashSet::new();
-        let (by_cell, outcomes) =
-            assign_to_cells(&unplaced, &sketches, &none, |_| 0.03, |_, _| None);
+        let (by_cell, outcomes) = assign_to_cells(
+            &unplaced,
+            &sketches,
+            &none,
+            &unplaced
+                .iter()
+                .flat_map(super::super::ffd::cells_of)
+                .collect(),
+            |_| 0.03,
+            |_, _| None,
+        );
         // The typed arm: lead-time-gated, quiet, ZERO cells assigned.
         assert!(
             outcomes

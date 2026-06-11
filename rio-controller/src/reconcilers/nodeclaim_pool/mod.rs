@@ -885,24 +885,6 @@ fn gauge_universe(
     (to_write, extras)
 }
 
-/// Cells in `by_cell` not in `order` and the count of intents stranded
-/// there. r41 bug_021: scheduler-stamped cells (`cells_of(i)`) the
-/// controller's GetHwClassConfig doesn't know about — the cover loop
-/// never visits them, the intent is silently dropped.
-///
-/// Free function for the same reason as [`gauge_universe`]:
-/// `cover_deficit` is `async` with a `kube::Client` + `PgPool` the test
-/// module can't construct; the partition is the testable invariant.
-fn unknown_cell_intents<'m>(
-    by_cell: &'m BTreeMap<Cell, Vec<&SpawnIntent>>,
-    order: &[Cell],
-) -> (u64, Vec<&'m Cell>) {
-    let known: HashSet<&Cell> = order.iter().collect();
-    let unknown: Vec<&Cell> = by_cell.keys().filter(|c| !known.contains(c)).collect();
-    let n: u64 = unknown.iter().map(|c| by_cell[*c].len() as u64).sum();
-    (n, unknown)
-}
-
 // The per-field stale-state polarity table
 // (`#r("ctrl.nodeclaim.lease-edge-polarity")`) is asserted end-to-end
 // by `lifecycle_tests`: real `tick()`/`reconcile_once`/
@@ -1908,15 +1890,25 @@ impl NodeClaimPoolReconciler {
         // Σ unplaced cores per cheapest-A_open cell — same assignment
         // cover_deficit uses, so the gauge equals cover's per-cell input.
         // No mask: the gauge shows raw demand; ICE-masking is a cover
-        // policy, not a demand metric.
+        // policy, not a demand metric. bug_050: same KNOWN universe as
+        // cover_deficit — the gauge keys demand on the cells the cover
+        // loop can actually visit, so it stays equal to cover's input
+        // under universe skew too (all-unknown demand takes the typed
+        // letter and is disclosed by the tally, not a frozen gauge
+        // cell).
         let none = HashSet::new();
-        let (by_cell, _) =
-            cover::assign_to_cells(unplaced, &self.sketches, &none, cover::cell_rank, |i, m| {
-                self.cfg.fallback_cell(i, &self.hw_config, m)
-            });
-        // r41 bug_021 sibling: same `all_cells()` blind spot as
-        // `cover_deficit` — `by_cell` is keyed on scheduler-stamped
-        // cells. r43 bug_026: extras cells need the same trailing
+        let known: HashSet<Cell> = self.cfg.all_cells(&self.hw_config).into_iter().collect();
+        let (by_cell, _) = cover::assign_to_cells(
+            unplaced,
+            &self.sketches,
+            &none,
+            &known,
+            cover::cell_rank,
+            |i, m| self.cfg.fallback_cell(i, &self.hw_config, m),
+        );
+        // r41 bug_021 sibling (CLOSED by the known-universe walk):
+        // `by_cell` now keys only controller-known cells. r43 bug_026:
+        // extras cells need the same trailing
         // zero-write as `nodeclaim_live*` — once an extras cell drops
         // out of `by_cell`, it's in neither `configured` nor `extras`
         // and the gauge series freezes at its last value forever
@@ -2090,10 +2082,18 @@ impl NodeClaimPoolReconciler {
         let live_cores: u32 = live.iter().map(|n| n.allocatable.0).sum();
         let mut created_cores = 0u32;
 
-        let (by_cell, mut outcomes) =
-            cover::assign_to_cells(unplaced, &self.sketches, ice, cover::cell_rank, |i, m| {
-                self.cfg.fallback_cell(i, &self.hw_config, m)
-            });
+        // bug_050: the controller's mintable universe — the same
+        // all_cells() set the cover loop iterates, so "placement
+        // supersets provisioning" holds by construction at the walk.
+        let known: HashSet<Cell> = self.cfg.all_cells(&self.hw_config).into_iter().collect();
+        let (by_cell, mut outcomes) = cover::assign_to_cells(
+            unplaced,
+            &self.sketches,
+            ice,
+            &known,
+            cover::cell_rank,
+            |i, m| self.cfg.fallback_cell(i, &self.hw_config, m),
+        );
         let order =
             cover::cells_round_robin(self.cfg.all_cells(&self.hw_config), self.tick_counter);
 
@@ -2279,6 +2279,7 @@ impl NodeClaimPoolReconciler {
                     cover::PlacementOutcome::Placed(_)
                     | cover::PlacementOutcome::LeadTimeGated
                     | cover::PlacementOutcome::UnplaceableAllMasked { .. }
+                    | cover::PlacementOutcome::UnknownUniverse { .. }
                     | cover::PlacementOutcome::DecodeRefused { .. } => {
                         unreachable!("verdict_reason() maps these arms to None")
                     }
@@ -2294,6 +2295,7 @@ impl NodeClaimPoolReconciler {
                 | cover::PlacementOutcome::LeadTimeGated
                 | cover::PlacementOutcome::NoHostingClass
                 | cover::PlacementOutcome::OverCap { .. }
+                | cover::PlacementOutcome::UnknownUniverse { .. }
                 | cover::PlacementOutcome::DecodeRefused { .. } => {}
                 cover::PlacementOutcome::UnplaceableAllMasked { open_rungs: 0 } => {}
                 cover::PlacementOutcome::UnplaceableAllMasked { .. } => {
@@ -2302,42 +2304,20 @@ impl NodeClaimPoolReconciler {
             }
         }
         emit_drop_tally(&dropped, &masked_ready, ice.len());
-        // r41 bug_021: `assign_to_cells` keys `by_cell` on scheduler-
-        // stamped cells (`cells_of(i)` reads `hw_class_names`/
-        // `node_affinity`, both written by the SCHEDULER at solve time).
-        // The cover loop above only visits `order = all_cells()` —
-        // derived from the CONTROLLER's `hw_config`, refreshed every
-        // ≤300s via `GetHwClassConfig`. During a config rollout the
-        // scheduler can stamp a hwClass the controller hasn't loaded
-        // yet; those intents land in `by_cell`, the loop never visits
-        // their cell, and they're silently dropped — no NodeClaim, no
-        // metric, no warn. The runbook's
-        // `RioNodeclaimPoolNoHostingClass` diagnose step explicitly
-        // names this case ("the controller's `HwClassConfig` is stale")
-        // and calls the alert "the ONLY signal" — but the alert reads
-        // `intent_dropped_total{reason=no_hosting_class}` which fires
-        // on `fallback_cell → None`, a different path. Surface the skew
-        // with its own reason. Mirrors the sibling
-        // `global_ceilings()`-absent / `labels_for()`-absent failure
-        // modes in this function which already `warn!`.
-        let (skewed, unknown) = unknown_cell_intents(&by_cell, &order);
-        if skewed > 0 {
-            metrics::counter!(
-                "rio_controller_nodeclaim_intent_dropped_total",
-                "reason" => "unknown_hw_class",
-            )
-            .increment(skewed);
-            warn!(
-                dropped = skewed,
-                cells = ?unknown,
-                "SpawnIntents target hwClasses not in the controller's \
-                 all_cells() — scheduler/controller GetHwClassConfig skew \
-                 (self-heals within ≤300s if the RPC is healthy) or hwClass \
-                 removed from controller config; if this persists past 5min, \
-                 check rio-controller GetHwClassConfig RPC errors and the \
-                 scheduler/controller deployment ages"
-            );
-        }
+        // bug_050: the old post-hoc `unknown_cell_intents` count is
+        // premise-dead — the known-universe walk above means a stranded
+        // unknown `by_cell` entry can no longer exist (all-unknown
+        // demand takes the typed `UnknownUniverse` letter: tally +
+        // counter + WARN in `emit_drop_tally`, same `unknown_hw_class`
+        // reason label the runbook diagnose step reads). The invariant
+        // is asserted instead of counted.
+        debug_assert!(
+            {
+                let visitable: HashSet<&Cell> = order.iter().collect();
+                by_cell.keys().all(|c| visitable.contains(c))
+            },
+            "by_cell is a subset of the cover loop's visitable universe (bug_050)"
+        );
         Ok(CoverResult { created, rejected })
     }
 
@@ -2596,6 +2576,26 @@ pub(crate) fn emit_drop_tally(
              (distinct from no_hosting_class; never poison-feeding)"
         );
     }
+    if dropped.unknown_universe > 0 {
+        // bug_050: the typed disclosure for demand whose every unmasked
+        // candidate is outside the controller's mintable universe —
+        // the SAME reason label the old post-hoc count used, so the
+        // runbook's diagnose step and any alert exprs keep reading.
+        metrics::counter!(
+            "rio_controller_nodeclaim_intent_dropped_total",
+            "reason" => "unknown_hw_class",
+        )
+        .increment(dropped.unknown_universe);
+        warn!(
+            dropped = dropped.unknown_universe,
+            "SpawnIntents target hwClasses not in the controller's \
+             all_cells() — scheduler/controller GetHwClassConfig skew \
+             (self-heals within ≤300s if the RPC is healthy) or hwClass \
+             removed from controller config; if this persists past 5min, \
+             check rio-controller GetHwClassConfig RPC errors and the \
+             scheduler/controller deployment ages"
+        );
+    }
     if dropped.decode_refused > 0 {
         // merged_bug_006: the loud decode-refusal lane (the
         // `mask_refused_total` posture) — a skewed
@@ -2849,10 +2849,12 @@ mod tests {
             node_affinity: vec![term],
             ..Default::default()
         }];
+        let known: HashSet<Cell> = [spot.clone()].into();
         let (by_cell, _) = cover::assign_to_cells(
             &unplaced,
             &CellSketches::default(),
             &masked,
+            &known,
             cover::cell_rank,
             |_, _| None,
         );
@@ -3131,33 +3133,6 @@ mod tests {
             !to_write.contains(&orphan),
             "no further writes after trailing tick"
         );
-    }
-
-    /// r41 bug_021: `assign_to_cells` keys `by_cell` on scheduler-
-    /// stamped cells; the cover loop visits only `all_cells()`. The
-    /// difference must be observable so config skew has a signal.
-    #[test]
-    fn unknown_cell_intents_partitions_by_order() {
-        let intent = SpawnIntent::default();
-        let known = Cell("x86-64".into(), CapacityType::OnDemand);
-        let unknown_cell = Cell("unknown-x86".into(), CapacityType::OnDemand);
-        let order = vec![known.clone()];
-
-        // by_cell has an entry the cover loop will never visit.
-        let by_cell: BTreeMap<Cell, Vec<&SpawnIntent>> = [
-            (known.clone(), vec![&intent]),
-            (unknown_cell.clone(), vec![&intent]),
-        ]
-        .into();
-        let (n, unknown) = unknown_cell_intents(&by_cell, &order);
-        assert_eq!(n, 1, "one intent stranded in the scheduler-only cell");
-        assert_eq!(unknown, vec![&unknown_cell]);
-
-        // by_cell ⊆ order → nothing stranded.
-        let by_cell: BTreeMap<Cell, Vec<&SpawnIntent>> = [(known, vec![&intent])].into();
-        let (n, unknown) = unknown_cell_intents(&by_cell, &order);
-        assert_eq!(n, 0);
-        assert!(unknown.is_empty());
     }
 
     /// `fallback_cell`: prefers `(reference_hw_class, Spot)` when its

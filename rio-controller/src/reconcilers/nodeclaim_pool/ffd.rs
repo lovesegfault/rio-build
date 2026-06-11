@@ -2189,8 +2189,16 @@ pub(crate) mod tests {
         let bound = HashMap::new();
         let mint = |unplaced: &[SpawnIntent]| -> Vec<(u32, u64, u64)> {
             let none = std::collections::HashSet::new();
-            let (by_cell, _) =
-                cover::assign_to_cells(unplaced, &sketches, &none, cover::cell_rank, |_, _| None);
+            let known: std::collections::HashSet<Cell> =
+                [Cell("h".into(), CapacityType::Spot)].into();
+            let (by_cell, _) = cover::assign_to_cells(
+                unplaced,
+                &sketches,
+                &none,
+                &known,
+                cover::cell_rank,
+                |_, _| None,
+            );
             by_cell
                 .iter()
                 .flat_map(|(cell, u)| {
