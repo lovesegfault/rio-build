@@ -10,9 +10,10 @@ in
 {
   imports = [
     ./common.nix
-    # FUSE_PASSTHROUGH-capable kernel (>= 6.9) + fuse/overlay modules —
-    # the same module the EKS AMI imports, so VM-test worker nodes run
-    # the kernel shape the castore-FUSE passthrough path needs.
+    # fuse-over-io_uring-capable kernel (>= 6.14; the floor also covers
+    # FUSE_PASSTHROUGH) + fuse/overlay modules — the same module the
+    # EKS AMI imports, so VM-test worker nodes run the kernel shape the
+    # castore-FUSE transport needs.
     ../nixos-node/kernel.nix
   ];
 

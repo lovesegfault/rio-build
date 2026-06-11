@@ -2,18 +2,21 @@
 # specialArgs deps) so nix/tests/fixtures/ imports the same module
 # the AMI uses.
 #
-# No kernelPatches: FUSE_PASSTHROUGH=y is the Kconfig default since
-# 6.9; FUSE_FS/OVERLAY_FS come from autoModules. Stock kernel = binary
+# The castore transport is exclusively fuse-over-io_uring
+# (FUSE_OVER_IO_URING, kernel >= 6.14); that floor also covers
+# FUSE_PASSTHROUGH (Kconfig default since 6.9). No kernelPatches:
+# FUSE_FS/OVERLAY_FS come from autoModules. Stock kernel = binary
 # cache hit.
 { config, lib, ... }:
 {
   # r[impl infra.node.kernel-fuse-passthrough]
   assertions = [
     {
-      assertion = lib.versionAtLeast config.boot.kernelPackages.kernel.version "6.9";
+      assertion = lib.versionAtLeast config.boot.kernelPackages.kernel.version "6.14";
       message = ''
-        rio-builder needs FUSE_PASSTHROUGH (kernel >= 6.9, commit 7dc4e97a4f9a).
-        Got ${config.boot.kernelPackages.kernel.version}. Bump pins.node_kernel_minor.
+        rio-builder needs FUSE_OVER_IO_URING (kernel >= 6.14) — the
+        castore-FUSE's only wire transport. Got
+        ${config.boot.kernelPackages.kernel.version}. Bump pins.node_kernel_minor.
       '';
     }
   ];

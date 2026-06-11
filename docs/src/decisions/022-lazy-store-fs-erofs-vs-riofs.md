@@ -8,7 +8,7 @@ Status: **Accepted.** Three earlier candidates (EROFS+fscache, custom `riofs` km
 
 ## 0. Deployment context
 
-Builder nodes run a NixOS-based AMI. Kernel configuration is first-party: `boot.kernelPatches[].extraStructuredConfig` in the AMI flake sets `OVERLAY_FS=y FUSE_FS=y FUSE_PASSTHROUGH=y` and the node module asserts kernel ≥6.9 at boot. No custom Kconfig symbols are required — all are stock-on in distro defconfigs; the patch block is for `=y` over `=m` only.
+Builder nodes run a NixOS-based AMI. Kernel configuration is first-party: `boot.kernelPatches[].extraStructuredConfig` in the AMI flake sets `OVERLAY_FS=y FUSE_FS=y FUSE_PASSTHROUGH=y` and the node module asserts kernel ≥6.14 at boot (the fuse-over-io_uring transport floor; FUSE_PASSTHROUGH itself needs only ≥6.9). No custom Kconfig symbols are required — all are stock-on in distro defconfigs; the patch block is for `=y` over `=m` only.
 
 Device exposure: `/dev/fuse` reaches the builder via `rio-mountd` fd-handoff (§2.5); `/dev/kvm` reaches kvm-pool builds via `hostPath` CharDevice + `extra-sandbox-paths`. No device-plugin DaemonSet.
 
