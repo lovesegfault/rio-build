@@ -58,7 +58,7 @@ use super::gate::{self, OpenCaps};
 use super::ingest::{
     AbortReason, AcceptOutcome, CutError, FanBatch, IngestConfig, IngestSession, IngestShared,
 };
-use super::sessions::{self, Acquire, HeartbeatOutcome};
+use super::sessions::{self, Acquire};
 use super::tail::{self, LineCursor};
 use rio_log_kernel::{ChunkVisit, GapProvenance, visit_chunk, visit_fanout_batch};
 
@@ -743,44 +743,107 @@ impl LogServiceImpl {
                 // failures, and emits no warns. The boot log is the
                 // single statement of the disabled posture.
                 // r[impl store.log.proxy-disabled-not-failure]
-                if !proxied
-                    && let Some(resolver) = self.peer_resolver.as_ref()
-                    && let Ok(Some(live)) = sessions::lookup_live(&self.pool, exec_id).await
-                    && live.replica_pod != self.replica_pod
-                {
-                    // Owned by another replica: relay its TailLog
-                    // stream so the reader gets the live tail no matter
-                    // which replica it hit. On any failure fall through
-                    // to the history-only view — laggy but correct
-                    // beats an error, and the reader's reconnect loop
-                    // will find the new owner once the builder
-                    // re-establishes its ingest stream.
-                    match self
-                        .proxy_tail(
-                            resolver,
-                            &live.replica_pod,
-                            req.clone(),
-                            tenant_token.clone(),
-                        )
-                        .await
-                    {
-                        Ok(upstream) => {
-                            metrics::counter!("rio_store_log_tail_proxied_total").increment(1);
+                if !proxied && let Some(resolver) = self.peer_resolver.as_ref() {
+                    // Every history-only downgrade of a FOLLOWABLE live
+                    // view is DISCLOSED (bug_148: the pre-fix let-chain
+                    // silently folded "stale row", "lookup failed", and
+                    // "row names this pod but the buffer is gone" into
+                    // the no-session quiet path — a fleet whose rows
+                    // went stale behind parked owners downgraded every
+                    // follower with zero operator signal).
+                    match sessions::lookup_live(&self.pool, exec_id).await {
+                        Ok(sessions::LiveLookup::Live(live))
+                            if live.replica_pod != self.replica_pod =>
+                        {
+                            // Owned by another replica: relay its
+                            // TailLog stream so the reader gets the
+                            // live tail no matter which replica it hit.
+                            // On any failure fall through to the
+                            // history-only view — laggy but correct
+                            // beats an error, and the reader's
+                            // reconnect loop will find the new owner
+                            // once the builder re-establishes its
+                            // ingest stream.
+                            match self
+                                .proxy_tail(
+                                    resolver,
+                                    &live.replica_pod,
+                                    req.clone(),
+                                    tenant_token.clone(),
+                                )
+                                .await
+                            {
+                                Ok(upstream) => {
+                                    metrics::counter!("rio_store_log_tail_proxied_total")
+                                        .increment(1);
+                                    debug!(
+                                        %exec_id,
+                                        owner = %live.replica_pod,
+                                        "TailLog: relaying to the replica holding the live ingest session"
+                                    );
+                                    return relay_stream(upstream);
+                                }
+                                Err(error) => {
+                                    metrics::counter!("rio_store_log_tail_proxy_failures_total")
+                                        .increment(1);
+                                    warn!(
+                                        %exec_id,
+                                        owner = %live.replica_pod,
+                                        %error,
+                                        "TailLog: cross-replica proxy failed; serving history only"
+                                    );
+                                }
+                            }
+                        }
+                        Ok(sessions::LiveLookup::Live(live)) => {
+                            // The row names THIS pod but the local
+                            // registry has no entry: our own session is
+                            // mid-teardown (release pending) or a
+                            // restarted pod re-using the identity. The
+                            // buffer is gone either way.
+                            metrics::counter!(
+                                "rio_store_log_tail_live_downgrades_total",
+                                "reason" => "owner_local_gone"
+                            )
+                            .increment(1);
                             debug!(
                                 %exec_id,
                                 owner = %live.replica_pod,
-                                "TailLog: relaying to the replica holding the live ingest session"
+                                "TailLog: live session row names this replica but no \
+                                 local buffer exists; serving history only"
                             );
-                            return relay_stream(upstream);
                         }
-                        Err(error) => {
-                            metrics::counter!("rio_store_log_tail_proxy_failures_total")
-                                .increment(1);
+                        Ok(sessions::LiveLookup::Stale { replica_pod }) => {
+                            // bug_148's reader-visible face: a session
+                            // row exists but is not renewing. The owner
+                            // died uncleanly — or is alive and parked.
+                            metrics::counter!(
+                                "rio_store_log_tail_live_downgrades_total",
+                                "reason" => "stale_session"
+                            )
+                            .increment(1);
                             warn!(
                                 %exec_id,
-                                owner = %live.replica_pod,
+                                owner = %replica_pod,
+                                "TailLog: ingest session row is stale; serving history \
+                                 only (owner dead or not renewing)"
+                            );
+                        }
+                        Ok(sessions::LiveLookup::Absent) => {
+                            // No session at all — the normal case for a
+                            // finished build. History-only is the
+                            // complete view; nothing to disclose.
+                        }
+                        Err(error) => {
+                            metrics::counter!(
+                                "rio_store_log_tail_live_downgrades_total",
+                                "reason" => "lookup_failed"
+                            )
+                            .increment(1);
+                            warn!(
+                                %exec_id,
                                 %error,
-                                "TailLog: cross-replica proxy failed; serving history only"
+                                "TailLog: live-session lookup failed; serving history only"
                             );
                         }
                     }
@@ -1023,7 +1086,21 @@ impl AppendDriver {
             },
         );
 
-        let exit = self.drive(&mut inbound, &ack_tx).await;
+        // The session-lease heartbeat lives on its OWN task (bug_148,
+        // R27): the drive loop's sibling arms await chunk cuts inline
+        // for up to one cut interval plus an ack send — keeping the
+        // heartbeat as a select arm made a healthy 31-60 s S3 PUT
+        // stale the session row mid-stream (steal admitted, healthy
+        // stream aborted). The dedicated task's cadence is bounded by
+        // construction (sessions::HEARTBEAT_RPC_BOUND, compile-
+        // asserted against the staleness margin) and it keeps beating
+        // through the FINAL DRAIN below — the drain can span several
+        // cut intervals and the pre-fix shape had no heartbeat at all
+        // there. The handle is stopped (joined bounded) on every exit
+        // path before the lease release.
+        let lease = sessions::spawn_heartbeat(self.pool.clone(), exec_id, session_id);
+
+        let exit = self.drive(&mut inbound, &ack_tx, lease.lost_watch()).await;
 
         // ---- Cleanup. Runs on every exit path of `drive` (which has
         // no early returns that bypass it — it returns `LoopExit`).
@@ -1042,6 +1119,12 @@ impl AppendDriver {
         } else {
             None
         };
+
+        // The heartbeat covered the drain; stop it (bounded join)
+        // before the lease is released — the JOIN OBLIGATION on the
+        // spawned liveness task (a discarded handle would renew a
+        // released lease until its next tick observed Lost).
+        lease.stop().await;
 
         // 3. The lease. Released on every path except a stolen lease
         // (the row belongs to the new owner). `release` is
@@ -1117,11 +1200,15 @@ impl AppendDriver {
     }
 
     /// The select loop. Returns how the stream ended; never performs
-    /// cleanup itself.
+    /// cleanup itself. The session-lease heartbeat is NOT an arm here
+    /// (bug_148): it runs on the dedicated task `run` spawned, and this
+    /// loop only observes its Lost latch — no sibling await can starve
+    /// the liveness cadence (`drive_loop_liveness_census` pins this).
     async fn drive(
         &mut self,
         inbound: &mut Streaming<AppendLogRequest>,
         ack_tx: &mpsc::Sender<Result<AppendLogAck, Status>>,
+        mut lease_lost: watch::Receiver<bool>,
     ) -> LoopExit {
         let mut cut_interval = tokio::time::interval(self.session_cut_interval());
         cut_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1129,9 +1216,13 @@ impl AppendDriver {
         // consume it so the first periodic cut happens one interval
         // from now, not at stream open.
         cut_interval.tick().await;
-        let mut heartbeat_interval = tokio::time::interval(sessions::HEARTBEAT_INTERVAL);
-        heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        heartbeat_interval.tick().await;
+        // Housekeeping (the inbound-idle gate + the completeness-
+        // ceiling refresh) keeps the heartbeat arm's old cadence; the
+        // refresh's PG read is bounded so this arm cannot park the
+        // loop past the census's bounds.
+        let mut housekeeping_interval = tokio::time::interval(sessions::HEARTBEAT_INTERVAL);
+        housekeeping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        housekeeping_interval.tick().await;
         let mut last_inbound = tokio::time::Instant::now();
 
         loop {
@@ -1206,25 +1297,58 @@ impl AppendDriver {
                     .increment(1);
                     return LoopExit::Displaced;
                 }
-                _ = heartbeat_interval.tick() => {
+                // The Lost latch from the dedicated heartbeat task
+                // (bug_148): the lease was stolen — stop spending
+                // memory, stop acking; committed chunks stay valid.
+                res = lease_lost.changed() => {
+                    match res {
+                        Ok(()) => {
+                            // The latch only ever flips false→true.
+                            metrics::counter!(
+                                "rio_store_log_ingest_streams_aborted_total",
+                                "reason" => "lease_lost"
+                            )
+                            .increment(1);
+                            return LoopExit::LeaseLost;
+                        }
+                        // The beat task died WITHOUT latching Lost
+                        // (panic). The lease's liveness is unknown
+                        // from here and nothing is renewing it: fail
+                        // closed instead of streaming until the
+                        // un-renewed row is stolen out from under us.
+                        Err(_) => {
+                            metrics::counter!(
+                                "rio_store_log_ingest_streams_aborted_total",
+                                "reason" => "heartbeat_task_died"
+                            )
+                            .increment(1);
+                            return LoopExit::Abort(Status::unavailable(
+                                "AppendLog: the session heartbeat task ended unexpectedly; \
+                                 reconnect and replay from the last ack",
+                            ));
+                        }
+                    }
+                }
+                _ = housekeeping_interval.tick() => {
                     // A silently-vanished builder (the pod was SIGKILLed,
                     // a netsplit ate the FIN) leaves this stream mute
-                    // forever while these PG heartbeats keep renewing the
-                    // ingest lease — an immortal driver pinned to a dead
-                    // peer. With an EMPTY buffer and inbound silence past
-                    // four heartbeats, abort: nothing buffered can be
-                    // lost, and a CONFORMANT peer cannot trip this arm —
-                    // the bilateral contract (rio_common::liveness)
-                    // obliges any client parked on an open, empty-buffer
-                    // session to emit keepalive batches well inside the
-                    // bound (the builder uploader's empty-batch arm; the
-                    // dashboard test's grpcurl writer is its own
-                    // producer). No transport-layer input reaches this
-                    // arm — h2 PINGs vouch for the CONNECTION, not the
-                    // stream's producer, which is exactly why the law
-                    // needs an application-layer producer side. The
-                    // non-empty-buffer case is covered by the bounded
-                    // ack send on the cut path, not this arm.
+                    // forever while the lease heartbeats keep renewing
+                    // the ingest lease — an immortal driver pinned to a
+                    // dead peer. With an EMPTY buffer and inbound
+                    // silence past four heartbeats, abort: nothing
+                    // buffered can be lost, and a CONFORMANT peer cannot
+                    // trip this arm — the bilateral contract
+                    // (rio_common::liveness) obliges any client parked
+                    // on an open, empty-buffer session to emit keepalive
+                    // batches well inside the bound (the builder
+                    // uploader's empty-batch arm; the dashboard test's
+                    // grpcurl writer is its own producer). No
+                    // transport-layer input reaches this arm — h2 PINGs
+                    // vouch for the CONNECTION, not the stream's
+                    // producer, which is exactly why the law needs an
+                    // application-layer producer side. The non-empty-
+                    // buffer case is covered by the bounded ack send on
+                    // the cut path, not this arm.
                     // r[impl store.log.ingest-idle-abort+1]
                     if self.session.buffer_is_empty()
                         && last_inbound.elapsed() >= INBOUND_IDLE_BOUND
@@ -1239,50 +1363,30 @@ impl AppendDriver {
                              reconnect and resume from the last ack",
                         ));
                     }
-                    match sessions::heartbeat(&self.pool, self.session.exec_id, self.session.session_id).await {
-                        Ok(HeartbeatOutcome::Renewed) => {
-                            // Piggyback the completeness-ceiling refresh
-                            // on the heartbeat's existing 15 s DB
-                            // cadence: a seal that lands mid-stream (the
-                            // scheduler stamps the terminal row while
-                            // the builder is still streaming) is
-                            // observed within one heartbeat, after which
-                            // accept() drops lines at or past the
-                            // recorded end. Skipped once known — the
-                            // count is stamped once and never changes.
-                            // Lines accepted between the stamp and this
-                            // refresh are the bounded residual; they are
-                            // over-coverage the completeness fold
-                            // already tolerates, not silent loss.
-                            // A refresh failure (PG blip) just retries
-                            // next tick.
-                            // r[impl store.log.completeness-gate]
-                            if self.session.final_line_count().is_none()
-                                && let Ok(Some(n)) = gate::sealed_final_line_count(
-                                    &self.pool,
-                                    self.session.exec_id,
-                                )
-                                .await
-                            {
-                                self.session.set_final_line_count(n.max(0) as u64);
-                            }
-                        }
-                        Ok(HeartbeatOutcome::Lost) => {
-                            metrics::counter!(
-                                "rio_store_log_ingest_streams_aborted_total",
-                                "reason" => "lease_lost"
-                            )
-                            .increment(1);
-                            return LoopExit::LeaseLost;
-                        }
-                        // A PG blip. Keep going: the lease survives one
-                        // missed heartbeat by construction (15 s beat vs
-                        // a 30 s staleness window), and if PG is really
-                        // down the chunk cuts are failing too and the
-                        // gray-failure abort fires first.
-                        Err(e) => {
-                            warn!(error = %e, "AppendLog: ingest lease heartbeat failed");
-                        }
+                    // The completeness-ceiling refresh keeps the old
+                    // heartbeat-arm cadence (15 s): a seal that lands
+                    // mid-stream (the scheduler stamps the terminal row
+                    // while the builder is still streaming) is observed
+                    // within one tick, after which accept() drops lines
+                    // at or past the recorded end. Skipped once known —
+                    // the count is stamped once and never changes.
+                    // Lines accepted between the stamp and this refresh
+                    // are the bounded residual; they are over-coverage
+                    // the completeness fold already tolerates, not
+                    // silent loss. A refresh failure (PG blip or the
+                    // bound expiring) just retries next tick. BOUNDED:
+                    // this arm must never park the loop unbounded
+                    // (store.log.driver-bounded; the census quotes the
+                    // bound).
+                    // r[impl store.log.completeness-gate]
+                    if self.session.final_line_count().is_none()
+                        && let Ok(Ok(Some(n))) = tokio::time::timeout(
+                            sessions::HEARTBEAT_RPC_BOUND,
+                            gate::sealed_final_line_count(&self.pool, self.session.exec_id),
+                        )
+                        .await
+                    {
+                        self.session.set_final_line_count(n.max(0) as u64);
                     }
                 }
             }
@@ -2535,6 +2639,93 @@ mod tests {
         assert!(src.matches("self.cut_bounded()").count() >= 2);
     }
 
+    /// The production half of this file, whitespace-stripped — the
+    /// embedded census universe ((wwwww): compile-time `include_str!`,
+    /// never a runtime tree walk). Slices at the test-module boundary
+    /// so test code may drive sessions directly.
+    fn production_half() -> String {
+        let full: String = include_str!("service.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let boundary = format!("#[cfg({})]modtests", "test");
+        full[..full.find(&boundary).expect("test module exists")].to_string()
+    }
+
+    /// The liveness-census refusal predicate (bug_148): an inline
+    /// `sessions::heartbeat` call in the driver's production half puts
+    /// the lease cadence back behind sibling cut/ack awaits — the
+    /// exact shape whose bounds (60 s cut watchdog + 60 s ack vs the
+    /// 30 s staleness window) made a healthy PUT stale the row. The
+    /// cadence lives on the dedicated task (`sessions::spawn_heartbeat`,
+    /// RPC-bounded by the sessions.rs compile assert) or nowhere.
+    fn liveness_census_violations(src: &str) -> Vec<&'static str> {
+        let mut v = Vec::new();
+        let inline_beat = format!("sessions::{}(", "heartbeat");
+        if src.matches(&inline_beat).count() != 0 {
+            v.push(
+                "inline sessions::heartbeat call: the lease cadence must live on \
+                 the dedicated task (sessions::spawn_heartbeat), where no sibling \
+                 await can starve it",
+            );
+        }
+        let spawn_beat = format!("sessions::{}(", "spawn_heartbeat");
+        if src.matches(&spawn_beat).count() != 1 {
+            v.push(
+                "exactly one sessions::spawn_heartbeat site: the driver spawns the \
+                 dedicated heartbeat task once per stream (run), and nothing else \
+                 mints one",
+            );
+        }
+        v
+    }
+
+    /// [GEN-SET] The drive-loop liveness census (bug_148): the member
+    /// list is the file's own production text (the embed above), the
+    /// law is the refusal predicate, and the R22′ plant below proves
+    /// the predicate can refuse. Sibling-arm await bounds at this
+    /// census (the assert's input, quoted from the arms): inbound arm
+    /// ≤ per-cut 2x cut-interval via cut_bounded + send_ack_bounded
+    /// (level-triggered loop, one bounded cut per due-check); cut-tick
+    /// arm ≤ 2x cut-interval (one do_cut); housekeeping arm ≤
+    /// HEARTBEAT_RPC_BOUND (the bounded ceiling refresh); lease-lost
+    /// arm and cancel arm await nothing. NONE of these bounds is
+    /// load-bearing for lease liveness any more — that is the point:
+    /// the cadence path's only await is the beat task's own RPC,
+    /// compile-asserted inside the staleness margin (sessions.rs).
+    // r[verify store.log.driver-bounded]
+    #[test]
+    fn drive_loop_liveness_census() {
+        let src = production_half();
+        let violations = liveness_census_violations(&src);
+        assert!(
+            violations.is_empty(),
+            "drive-loop liveness census violations: {violations:?}"
+        );
+
+        // R22′ plant, at the outermost (raw-source) layer: a strawman
+        // select arm that re-inlines the heartbeat — built at runtime
+        // so the needle never self-matches — must be refused.
+        let strawman = format!(
+            "_=heartbeat_interval.tick()=>{{matchsessions::{}(&self.pool,exec,session).await{{}}}}",
+            "heartbeat"
+        );
+        let planted = format!("{src}{strawman}");
+        assert!(
+            !liveness_census_violations(&planted).is_empty(),
+            "the census must refuse a re-inlined heartbeat arm (the plant went green)"
+        );
+        // And a second plant for the spawn-uniqueness axis: a duplicate
+        // spawn site (two beat tasks for one stream fight over the
+        // latch) is refused too.
+        let dup_spawn = format!("sessions::{}(pool,exec,session)", "spawn_heartbeat");
+        let planted2 = format!("{src}{dup_spawn}");
+        assert!(
+            !liveness_census_violations(&planted2).is_empty(),
+            "the census must refuse a second spawn_heartbeat site"
+        );
+    }
+
     /// The ack-park red and its bounded green, side by side on a FULL
     /// 1-slot queue (paused clock — the hour elapses instantly):
     /// the raw send (the merged_bug_135 shape at every pre-fix site)
@@ -2581,6 +2772,182 @@ mod tests {
     #[test]
     fn inbound_idle_bound_is_four_heartbeats() {
         assert_eq!(INBOUND_IDLE_BOUND, sessions::HEARTBEAT_INTERVAL * 4);
+    }
+
+    /// A chunk store whose `put` parks until the test releases it: the
+    /// healthy-but-slow S3 PUT face (bug_148). `get`/`delete_batch`
+    /// pass through. Permits are added by the test to release parked
+    /// puts; each put consumes one.
+    struct GatedChunkStore {
+        inner: MemoryLogChunkStore,
+        gate: tokio::sync::Semaphore,
+        /// How many puts are currently parked (peak-asserted by tests).
+        parked: std::sync::atomic::AtomicU32,
+    }
+
+    impl GatedChunkStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryLogChunkStore::default(),
+                gate: tokio::sync::Semaphore::new(0),
+                parked: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+
+        fn release_one(&self) {
+            self.gate.add_permits(1);
+        }
+
+        fn parked_now(&self) -> u32 {
+            self.parked.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LogChunkStore for GatedChunkStore {
+        async fn put(
+            &self,
+            key: &str,
+            body: Vec<u8>,
+        ) -> Result<crate::logs::chunks::PutOutcome, crate::logs::chunks::LogChunkError> {
+            self.parked
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let permit = self.gate.acquire().await.expect("gate never closed");
+            permit.forget();
+            self.parked
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.put(key, body).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, crate::logs::chunks::LogChunkError> {
+            self.inner.get(key).await
+        }
+
+        async fn delete_batch(
+            &self,
+            keys: &[String],
+        ) -> Result<(), crate::logs::chunks::LogChunkError> {
+            self.inner.delete_batch(keys).await
+        }
+    }
+
+    /// `EXTRACT(EPOCH FROM heartbeat_at)` for the exec's session row —
+    /// the monotone freshness probe the W10-BC assertions compare.
+    async fn heartbeat_epoch(pool: &PgPool, exec: Uuid) -> f64 {
+        sqlx::query_scalar::<_, f64>(
+            "SELECT EXTRACT(EPOCH FROM heartbeat_at)::float8 \
+             FROM log_ingest_sessions WHERE exec_id = $1",
+        )
+        .bind(exec)
+        .fetch_one(pool)
+        .await
+        .expect("session row exists")
+    }
+
+    /// W10-BC (bug_148), the end-to-end face: a HEALTHY chunk PUT that
+    /// outlasts one heartbeat interval must not make the session row
+    /// stale — the row stays fresh THROUGHOUT the in-flight cut, a
+    /// foreign acquire is refused (no steal admitted against a healthy
+    /// stream), lookup_live keeps routing readers to the live owner,
+    /// and the stream then completes cleanly once the PUT lands.
+    ///
+    /// `#[ignore]`: ~17 s of real time (HEARTBEAT_INTERVAL is a const;
+    /// the PG staleness predicate runs on PG's own clock so the clock
+    /// cannot be paused). Run manually:
+    /// `cargo nextest run -p rio-store -E 'test(slow_cut_keeps)' \
+    ///  --run-ignored all`. The gate-time enforcement of the same law
+    /// is structural: the `HEARTBEAT_RPC_BOUND` compile assert
+    /// (sessions.rs) plus `drive_loop_liveness_census` — the assert's
+    /// red is the build.
+    // r[verify store.log.session-keyed]
+    #[tokio::test]
+    #[ignore = "~17s real time (HEARTBEAT_INTERVAL is a const); run with --run-ignored all"]
+    async fn healthy_slow_cut_keeps_session_row_fresh() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let chunk_store = Arc::new(GatedChunkStore::new());
+        let exec = seed_assignment(&db.pool, "builder-0").await;
+        let tok = token("builder-0", DRV);
+
+        let svc = LogServiceImpl::new(
+            db.pool.clone(),
+            Arc::clone(&chunk_store) as Arc<dyn LogChunkStore>,
+            "test-pod".to_string(),
+        )
+        .with_hmac_verifier(Arc::new(HmacVerifier::from_key(TEST_KEY.to_vec())))
+        .with_ingest_config(IngestConfig {
+            // A few hundred bytes trip the size-triggered cut.
+            cut_threshold_bytes: 64,
+            // One cut interval is the cut watchdog: keep it far above
+            // the parked-PUT window so the slow-but-healthy PUT is
+            // never abandoned (the abandonment path is W10-BE's).
+            cut_interval: std::time::Duration::from_secs(300),
+            ..IngestConfig::default()
+        });
+        let router = Server::builder().add_service(LogServiceServer::new(svc));
+        let (addr, server) = spawn_grpc_server(router).await;
+        let mut client = LogServiceClient::connect(format!("http://{addr}"))
+            .await
+            .expect("connect");
+
+        let (tx, mut acks) = open_append(&mut client, &tok, vec![header_msg(exec)])
+            .await
+            .expect("open");
+        let t0 = heartbeat_epoch(&db.pool, exec).await;
+
+        // Cross the cut threshold: the driver enters its in-arm cut and
+        // parks inside the gated PUT.
+        tx.send(batch_msg(0, &["x".repeat(80).as_str()]))
+            .await
+            .unwrap();
+        for _ in 0..200 {
+            if chunk_store.parked_now() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(chunk_store.parked_now(), 1, "the cut's PUT is parked");
+
+        // One full heartbeat interval (plus margin) elapses while the
+        // PUT is still parked. The session row must stay fresh: the
+        // heartbeat cadence is independent of cut latency.
+        tokio::time::sleep(sessions::HEARTBEAT_INTERVAL + std::time::Duration::from_secs(2)).await;
+        assert_eq!(chunk_store.parked_now(), 1, "the PUT is still parked");
+        let mid = heartbeat_epoch(&db.pool, exec).await;
+        assert!(
+            mid > t0,
+            "the session heartbeat must advance while a healthy cut is \
+             in flight (got t0={t0}, mid={mid}: the row went stale behind \
+             a parked PUT — the bug_148 red)"
+        );
+        // The reader-visible face: the row is live, so followers are
+        // routed to the owner instead of silently downgrading.
+        assert!(
+            matches!(
+                sessions::lookup_live(&db.pool, exec).await.unwrap(),
+                sessions::LiveLookup::Live(_)
+            ),
+            "lookup_live must keep naming the healthy owner mid-cut"
+        );
+        // The steal face: a foreign acquire is REFUSED while the owner
+        // is healthy (pre-fix the stale row admitted the steal and the
+        // owner's next heartbeat aborted a healthy stream).
+        match sessions::acquire(&db.pool, exec, Uuid::now_v7(), "other-pod")
+            .await
+            .unwrap()
+        {
+            Acquire::Busy { current_owner } => assert_eq!(current_owner, "test-pod"),
+            other => panic!("a healthy mid-cut session was stolen: {other:?}"),
+        }
+
+        // Release the PUT: the cut completes, the ack arrives, and the
+        // stream closes cleanly — the slow PUT was healthy all along.
+        chunk_store.release_one();
+        let ack = acks.message().await.expect("ack").expect("ack present");
+        assert_eq!(ack.durable_through_line, 0);
+        drop(tx);
+        // The final drain has nothing left; clean close.
+        assert!(acks.message().await.expect("clean close").is_none());
+        server.abort();
     }
 
     /// store.log.completeness-gate, the per-append half: a builder

@@ -2636,10 +2636,14 @@ Clients that bypass the builder uploader are their own producers.
 The driver is the server's representative of one builder; nothing the
 builder does or fails to do (stop reading acks, vanish mid-cut behind a
 wedged backend) may park the driver — its select loop owns the abort
-check, the heartbeat, and the inbound read, so a parked driver is an
-immortal lease-renewer at worst and a leaked slot at best. The two
+check and the inbound read, while the session-lease heartbeat runs on
+its own dedicated task whose single RPC await is compile-asserted
+inside the staleness margin, so no loop await can starve the lease
+cadence and a parked driver is a leaked slot at worst, never an
+immortal lease-renewer or a silently-stale healthy session. The two
 named ack forms and the single named cut form are the only callable
-shapes; an in-file self-scan pins the census.
+shapes; an in-file self-scan pins the census, and the drive-loop
+liveness census pins the heartbeat's off-loop home.
 
 #r("store.log.proxy-disabled-not-failure")[
   A replica whose cross-replica tail proxy is disabled (no peer URL

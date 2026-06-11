@@ -693,12 +693,29 @@ pub fn describe_metrics() {
          lines older than 2x the cut interval), lease_lost (another \
          replica stole the ingest session), chunk_cap (the per-execution \
          chunk-count bound), displaced (a newer ingest session for the \
-         same execution took the registry slot; the old stream exits), or \
+         same execution took the registry slot; the old stream exits), \
          inbound_idle (empty buffer and no inbound traffic for four \
          heartbeats — the driver refuses to renew the lease for a \
-         vanished builder). The builder reconnects and replays its \
-         un-acked tail. Alert on sustained cut_failures/stale_buffer: \
-         this replica cannot durably store logs."
+         vanished builder), or heartbeat_task_died (the dedicated \
+         session-heartbeat task exited without observing Lost; the \
+         driver fails closed rather than stream against an un-renewed \
+         lease). The builder reconnects and replays its un-acked tail. \
+         Alert on sustained cut_failures/stale_buffer: this replica \
+         cannot durably store logs."
+    );
+    describe_counter!(
+        "rio_store_log_tail_live_downgrades_total",
+        "TailLog follow reads downgraded to the history-only view while \
+         the live-session registry suggested a live view should exist, \
+         by reason: stale_session (a log_ingest_sessions row exists but \
+         its heartbeat is past the staleness window — the owner died \
+         uncleanly or is not renewing), owner_local_gone (the row names \
+         this replica but no in-memory buffer is registered — the \
+         session is mid-teardown or the pod restarted), or lookup_failed \
+         (the registry query itself errored). Absent rows — finished \
+         builds — are NOT counted: history-only is their complete view. \
+         Sustained stale_session with healthy builders means ingest \
+         heartbeats are not landing (the bug_148 signature)."
     );
     describe_counter!(
         "rio_store_log_read_data_loss_total",

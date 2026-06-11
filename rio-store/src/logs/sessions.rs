@@ -35,6 +35,8 @@
 use std::time::Duration;
 
 use sqlx::PgPool;
+use tokio::sync::watch;
+use tracing::warn;
 use uuid::Uuid;
 
 /// How often the owning replica refreshes `heartbeat_at` while its
@@ -64,6 +66,34 @@ pub const SESSION_STALE_AFTER: Duration =
 const _: () = assert!(
     HEARTBEAT_INTERVAL.as_secs() * 2 == SESSION_STALE_AFTER.as_secs(),
     "HEARTBEAT_INTERVAL must be half of SESSION_STALE_AFTER"
+);
+
+/// Bound on one heartbeat UPDATE round-trip inside the dedicated
+/// heartbeat task ([`spawn_heartbeat`]). A call past the bound is
+/// abandoned (warned) and the next tick retries — a hung PG connection
+/// costs the cadence at most one in-bound delay, never the cadence
+/// itself.
+pub const HEARTBEAT_RPC_BOUND: Duration = Duration::from_secs(10);
+
+// The liveness cadence's construction-grade bound (bug_148): the
+// dedicated heartbeat task is the ONLY task on the cadence path, and
+// its single await is bounded strictly inside the staleness margin —
+// one hung-then-abandoned call delays the next beat attempt by at most
+// HEARTBEAT_RPC_BOUND, so the inter-beat gap stays within
+// HEARTBEAT_INTERVAL + HEARTBEAT_RPC_BOUND <= SESSION_STALE_AFTER: a
+// single hang costs at most the one-missed-beat budget the lease math
+// above already prices. The pre-fix shape kept the heartbeat as one
+// select arm of the AppendLog driver, whose sibling arms awaited chunk
+// cuts inline for up to one cut interval (60 s) plus an ack send (60 s
+// more) — a healthy 31-60 s S3 PUT made the row stale mid-stream, a
+// steal was admitted, and the owner's next heartbeat aborted a healthy
+// stream. The companion census (`drive_loop_liveness_census`,
+// service.rs) pins that no `sessions::heartbeat` call re-enters the
+// driver loop.
+const _: () = assert!(
+    HEARTBEAT_RPC_BOUND.as_secs() <= SESSION_STALE_AFTER.as_secs() - HEARTBEAT_INTERVAL.as_secs(),
+    "the heartbeat task's RPC bound must fit the staleness margin: \
+     HEARTBEAT_RPC_BOUND <= SESSION_STALE_AFTER - HEARTBEAT_INTERVAL"
 );
 
 /// A live ingest session, as seen by a `TailLog` reader deciding where
@@ -207,29 +237,174 @@ pub async fn release(pool: &PgPool, exec_id: Uuid, session_id: Uuid) -> Result<(
     Ok(())
 }
 
+/// The typed answer to "where is `exec_id`'s live ingest stream?" —
+/// the registry view's THREE states, kept distinct so a reader's
+/// history-only downgrade can disclose WHY (bug_148: the pre-fix
+/// `Option` folded `Stale` into `Absent`, so a row gone stale behind a
+/// healthy-but-parked owner silently downgraded every follower with no
+/// operator-visible signal).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveLookup {
+    /// A fresh-heartbeat session exists: route the reader to it.
+    Live(LiveSession),
+    /// A row exists but its heartbeat is past [`SESSION_STALE_AFTER`]:
+    /// the owner died uncleanly OR (the bug_148 face) is alive but not
+    /// renewing. History-only is the correct serve either way; the
+    /// caller discloses the downgrade.
+    Stale { replica_pod: String },
+    /// No row at all: nothing is ingesting this execution. The normal
+    /// case for any finished build — history-only, no disclosure owed.
+    Absent,
+}
+
 /// Where is `exec_id`'s live ingest stream, if anywhere?
 ///
-/// `None` means no live session: either the execution is not currently
-/// being ingested, or the row exists but its heartbeat is past
-/// [`SESSION_STALE_AFTER`] (the owner is dead and the in-memory buffer
-/// it held is gone). `TailLog` readers fall back to a history-only read
-/// in both cases; the distinction does not matter to them.
-pub async fn lookup_live(pool: &PgPool, exec_id: Uuid) -> Result<Option<LiveSession>, sqlx::Error> {
+/// One round-trip: the row (if any) comes back WITH the shared
+/// liveness predicate evaluated as a column, so `Stale` and `Absent`
+/// stay distinguishable (the predicate itself is the single shared
+/// definition — never a second hand-written comparison; bug_234).
+pub async fn lookup_live(pool: &PgPool, exec_id: Uuid) -> Result<LiveLookup, sqlx::Error> {
     let live_sql = format!(
-        "SELECT session_id, replica_pod FROM log_ingest_sessions \
-         WHERE exec_id = $1 AND {live}",
+        "SELECT session_id, replica_pod, ({live}) AS live \
+         FROM log_ingest_sessions WHERE exec_id = $1",
         live = rio_migrations::sql::live_ingest_session_sql("heartbeat_at", "$2")
     );
     // AssertSqlSafe: const-fragment composition, no runtime data.
-    let row: Option<(Uuid, String)> = sqlx::query_as(sqlx::AssertSqlSafe(live_sql))
+    let row: Option<(Uuid, String, bool)> = sqlx::query_as(sqlx::AssertSqlSafe(live_sql))
         .bind(exec_id)
         .bind(SESSION_STALE_AFTER.as_secs_f64())
         .fetch_optional(pool)
         .await?;
-    Ok(row.map(|(session_id, replica_pod)| LiveSession {
-        session_id,
-        replica_pod,
-    }))
+    Ok(match row {
+        Some((session_id, replica_pod, true)) => LiveLookup::Live(LiveSession {
+            session_id,
+            replica_pod,
+        }),
+        Some((_, replica_pod, false)) => LiveLookup::Stale { replica_pod },
+        None => LiveLookup::Absent,
+    })
+}
+
+/// The owner side of one dedicated session-heartbeat task
+/// ([`spawn_heartbeat`]). The task renews the lease every
+/// [`HEARTBEAT_INTERVAL`] until told to stop, the lease is lost, or
+/// the row errors persistently; nothing else runs on it, so no sibling
+/// await can starve the cadence (bug_148 — the R27 construction: the
+/// liveness cadence lives where nothing can block it).
+pub struct HeartbeatHandle {
+    /// Latches `true` exactly once, when a heartbeat observes
+    /// [`HeartbeatOutcome::Lost`]. The driver selects on `changed()`;
+    /// a `RecvError` there means the task died WITHOUT observing Lost
+    /// (panic) — the driver fails closed.
+    lost: watch::Receiver<bool>,
+    /// Tells the beat task to exit at teardown (after the final drain,
+    /// before the lease release).
+    stop: rio_common::signal::Token,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl HeartbeatHandle {
+    /// The Lost latch, for the driver's select arm.
+    pub fn lost_watch(&self) -> watch::Receiver<bool> {
+        self.lost.clone()
+    }
+
+    /// Stop the beat task and join it, bounded by one RPC bound (its
+    /// longest possible in-flight await); abort as the backstop. The
+    /// JOIN-OBLIGATION rule: the handle's owner MUST call this on
+    /// every teardown path — a discarded handle is a beat task renewing
+    /// a released lease until its next tick observes Lost.
+    pub async fn stop(self) {
+        self.stop.cancel();
+        let mut task = self.task;
+        if tokio::time::timeout(HEARTBEAT_RPC_BOUND, &mut task)
+            .await
+            .is_err()
+        {
+            // The task is parked past its own bound (only possible via
+            // a pathological scheduler stall — every await it holds is
+            // itself bounded). Abort it; the lease release that
+            // follows is session-id-predicated, so a straggler beat
+            // against a released row is a harmless zero-row UPDATE.
+            task.abort();
+            warn!("session heartbeat task did not stop within its bound; aborted");
+        }
+    }
+}
+
+/// Spawn the dedicated heartbeat task for one ingest session
+/// (production cadence: [`HEARTBEAT_INTERVAL`] beats bounded by
+/// [`HEARTBEAT_RPC_BOUND`]).
+pub fn spawn_heartbeat(pool: PgPool, exec_id: Uuid, session_id: Uuid) -> HeartbeatHandle {
+    spawn_heartbeat_with(pool, exec_id, session_id, HEARTBEAT_INTERVAL)
+}
+
+/// [`spawn_heartbeat`] with an injected cadence — the production
+/// constructor pins the const; tests inject a fast interval so the
+/// cadence laws are observable without 15 s real-time waits (the
+/// injected-runner lane, disclosed: the BEAT itself is always the
+/// production `heartbeat` UPDATE against a real pool).
+pub(crate) fn spawn_heartbeat_with(
+    pool: PgPool,
+    exec_id: Uuid,
+    session_id: Uuid,
+    interval: Duration,
+) -> HeartbeatHandle {
+    let (lost_tx, lost_rx) = watch::channel(false);
+    let stop = rio_common::signal::Token::new();
+    let stop_task = stop.clone();
+    let task = tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(interval);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick of a tokio interval fires immediately;
+        // `acquire` just stamped heartbeat_at, so consume it.
+        ticks.tick().await;
+        loop {
+            tokio::select! {
+                _ = stop_task.cancelled() => return,
+                _ = ticks.tick() => {
+                    // The cadence path's ONLY await, bounded by the
+                    // compile-asserted margin: a hang is abandoned and
+                    // the next tick retries.
+                    match tokio::time::timeout(
+                        HEARTBEAT_RPC_BOUND,
+                        heartbeat(&pool, exec_id, session_id),
+                    )
+                    .await
+                    {
+                        Ok(Ok(HeartbeatOutcome::Renewed)) => {}
+                        Ok(Ok(HeartbeatOutcome::Lost)) => {
+                            // Latch and exit: the lease belongs to a
+                            // newer session; renewing further would
+                            // fight the new owner's row.
+                            let _ = lost_tx.send(true);
+                            return;
+                        }
+                        // A PG blip. Keep going: the lease survives one
+                        // missed heartbeat by construction (the beat vs
+                        // 2x-beat staleness window), and if PG is down
+                        // the chunk cuts are failing too — the driver's
+                        // gray-failure abort fires there.
+                        Ok(Err(e)) => {
+                            warn!(%exec_id, error = %e, "ingest lease heartbeat failed");
+                        }
+                        Err(_elapsed) => {
+                            warn!(
+                                %exec_id,
+                                bound_secs = HEARTBEAT_RPC_BOUND.as_secs_f64(),
+                                "ingest lease heartbeat abandoned at its RPC bound"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    });
+    HeartbeatHandle {
+        lost: lost_rx,
+        stop,
+        task,
+    }
 }
 
 #[cfg(test)]
@@ -282,10 +457,12 @@ mod tests {
             fetch_row(&db.pool, exec).await,
             Some((session, "this-pod".to_string()))
         );
-        let live = lookup_live(&db.pool, exec).await.unwrap();
         assert_eq!(
-            live.map(|l| (l.session_id, l.replica_pod)),
-            Some((session, "this-pod".to_string())),
+            lookup_live(&db.pool, exec).await.unwrap(),
+            LiveLookup::Live(LiveSession {
+                session_id: session,
+                replica_pod: "this-pod".to_string(),
+            }),
             "a just-acquired session must be visible as live (fresh heartbeat)"
         );
     }
@@ -334,7 +511,10 @@ mod tests {
             Some((session, "this-pod".to_string()))
         );
         // And the steal refreshed the heartbeat: the row is live again.
-        assert!(lookup_live(&db.pool, exec).await.unwrap().is_some());
+        assert!(matches!(
+            lookup_live(&db.pool, exec).await.unwrap(),
+            LiveLookup::Live(_)
+        ));
     }
 
     #[tokio::test]
@@ -389,27 +569,103 @@ mod tests {
         let fresh_exec = Uuid::now_v7();
         let fresh_session = Uuid::now_v7();
         seed_session(&db.pool, fresh_exec, fresh_session, "pod-a", 0.0).await;
-        let live = lookup_live(&db.pool, fresh_exec)
-            .await
-            .unwrap()
-            .expect("fresh row is live");
-        assert_eq!(live.session_id, fresh_session);
-        assert_eq!(live.replica_pod, "pod-a");
+        match lookup_live(&db.pool, fresh_exec).await.unwrap() {
+            LiveLookup::Live(live) => {
+                assert_eq!(live.session_id, fresh_session);
+                assert_eq!(live.replica_pod, "pod-a");
+            }
+            other => panic!("fresh row must be Live, got {other:?}"),
+        }
 
+        // A row past the staleness threshold is TYPED stale — readers
+        // fall back to history-only AND the downgrade is disclosable
+        // (bug_148: the pre-fix Option folded this into Absent, hiding
+        // a healthy-but-not-renewing owner from every operator signal).
         let stale_exec = Uuid::now_v7();
         seed_session(&db.pool, stale_exec, Uuid::now_v7(), "pod-b", 31.0).await;
-        assert!(
-            lookup_live(&db.pool, stale_exec).await.unwrap().is_none(),
-            "a row past the staleness threshold is dead: readers must fall back to history-only"
+        assert_eq!(
+            lookup_live(&db.pool, stale_exec).await.unwrap(),
+            LiveLookup::Stale {
+                replica_pod: "pod-b".to_string()
+            },
+            "a stale row must be distinguishable from no row at all"
         );
 
         // No row at all.
-        assert!(
-            lookup_live(&db.pool, Uuid::now_v7())
-                .await
-                .unwrap()
-                .is_none()
+        assert_eq!(
+            lookup_live(&db.pool, Uuid::now_v7()).await.unwrap(),
+            LiveLookup::Absent
         );
+    }
+
+    /// The dedicated heartbeat task (bug_148): beats land on their own
+    /// cadence with NOTHING else on the task — a parked sibling
+    /// elsewhere in the process cannot starve them by construction.
+    /// Injected fast cadence (the disclosed `_with` runner lane); the
+    /// beat itself is the production UPDATE against real PG.
+    #[tokio::test]
+    async fn heartbeat_task_beats_on_its_own_cadence() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let exec = Uuid::now_v7();
+        let session = Uuid::now_v7();
+        // Born 5 s ago so every beat measurably ADVANCES heartbeat_at.
+        seed_session(&db.pool, exec, session, "this-pod", 5.0).await;
+        let epoch = |pool: PgPool| async move {
+            sqlx::query_scalar::<_, f64>(
+                "SELECT EXTRACT(EPOCH FROM heartbeat_at)::float8 \
+                 FROM log_ingest_sessions WHERE exec_id = $1",
+            )
+            .bind(exec)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        let t0 = epoch(db.pool.clone()).await;
+
+        let handle =
+            spawn_heartbeat_with(db.pool.clone(), exec, session, Duration::from_millis(100));
+        // A beat lands within the cadence (poll, no wall-clock gate).
+        let mut advanced = false;
+        for _ in 0..100 {
+            if epoch(db.pool.clone()).await > t0 {
+                advanced = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(advanced, "the dedicated task must renew the row");
+        let lost = handle.lost_watch();
+        assert!(!*lost.borrow(), "no Lost while the row is ours");
+        handle.stop().await;
+    }
+
+    /// Lost latches once and the task exits: a stolen lease stops the
+    /// beats (the deposed owner must not fight the new owner's row),
+    /// and the latch is the driver's abort signal.
+    #[tokio::test]
+    async fn heartbeat_task_latches_lost_on_steal() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let exec = Uuid::now_v7();
+        let mine = Uuid::now_v7();
+        seed_session(&db.pool, exec, mine, "this-pod", 0.0).await;
+
+        let handle = spawn_heartbeat_with(db.pool.clone(), exec, mine, Duration::from_millis(100));
+        let mut lost = handle.lost_watch();
+
+        // Steal: another session takes the row.
+        sqlx::query("UPDATE log_ingest_sessions SET session_id = $2 WHERE exec_id = $1")
+            .bind(exec)
+            .bind(Uuid::now_v7())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), lost.changed())
+            .await
+            .expect("the Lost latch must fire within the cadence")
+            .expect("the latch is sent before the task exits");
+        assert!(*lost.borrow(), "Lost latches true");
+        handle.stop().await;
     }
 
     #[tokio::test]
