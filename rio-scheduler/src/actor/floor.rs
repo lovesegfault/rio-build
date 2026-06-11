@@ -74,22 +74,31 @@ pub fn bump_floor_or_count(
             ceil.max_mem,
         ),
         // PARKED BY DESIGN — no live producer reaches this arm: the
-        // only production callers of `bump_resource_floor` pass
-        // `OomKilled` (worker-reported CgroupOom) and
-        // `DeadlineExceeded` (worker-reported TimedOut). The
-        // controller's pod-terminal `EvictedDiskPressure`
-        // classification rides `ReportAttemptOutcome`, a
-        // classification fill that deliberately never promotes (no
-        // durable first-report dedup — sla-sizing.typ "Accepted
-        // residual"), and no worker-side disk-eviction signal exists
-        // (the kubelet evicts the pod wholesale). The disk floor
-        // dimension is therefore inert; the actual disk residual is
-        // the retry/establishment counters (retry-poison), not
-        // promotion. The arm stays: the wire variant exists, unit
-        // tests pin the doubling algebra, and this is the designed
-        // re-entry point if a worker-side disk signal ever ships
-        // (re-introduction needs the durable dedup the residual
-        // names).
+        // production callers of `bump_resource_floor` (pinned by the
+        // caller census, db/live_pins.rs) pass `OomKilled`
+        // (worker-reported CgroupOom AND the controller-witnessed
+        // OomKilled letter at establishment — live_058-b) and
+        // `DeadlineExceeded` (worker-reported TimedOut). Witnessed
+        // evictions are CLASSIFY-ONLY BY RULING
+        // ([`witnessed_disposition`]): the controller's classifier
+        // folds NODE-CONDITION evictions ("DiskPressure",
+        // "ephemeral-storage") together with the pod-attributed
+        // shapes ("ephemeral local storage", "EmptyDir volume") into
+        // the ONE EvictedDiskPressure letter (pool/job.rs
+        // pod_termination_reason), so the letter carries no per-pod
+        // sizing authority — promoting it would re-create the I-199
+        // ambient-cause over-fire on the disk axis (one node-pressure
+        // event evicting k innocent builder pods would double k
+        // sticky M_044 floors). The disk floor dimension is therefore
+        // still inert; the actual disk residual is the
+        // retry/establishment counters (retry-poison), not promotion.
+        // The arm stays: the wire variant exists, unit tests pin the
+        // doubling algebra, and this is the designed re-entry point
+        // for a WORKER-SIDE quota-attributed disk signal (precise by
+        // construction at the prjquota seam, with the worker's
+        // once-per-attempt assignment-token dedup) — that lane, not
+        // the witnessed letter, is the arm's first live producer when
+        // it ships.
         R::EvictedDiskPressure => bump_dim(
             &mut floor.disk_bytes,
             last.map_or(0, |i| i.disk_bytes),
@@ -112,6 +121,104 @@ pub fn bump_floor_or_count(
         R::EvictedOther | R::Completed | R::Error | R::Unknown => FloorOutcome::default(),
     }
 }
+
+/// live_058-b: establish-time disposition of a controller-WITNESSED
+/// terminal letter (the witnessed-terminal mark's reason). Consumed by
+/// the establishment sweep's charge arm — the dispatch over the
+/// producer's FULL wire type, so a new letter cannot ship without
+/// taking a position here (rustc exhaustiveness; the product census
+/// pins one row per letter with EXACTLY ONE promoting row, and the
+/// review default for a new row is classify-only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WitnessedDisposition {
+    /// THE one promoting row: witnessed `OOMKilled` doubles the MEM
+    /// floor at establishment (`bump_resource_floor`, label
+    /// `witnessed_oom`), gated on the establishment transaction's
+    /// append+decide `won` flag — at most once per attempt, ever.
+    PromoteMemFloor,
+    /// Mark + witnessed-clock window + establish + requeue; the floor
+    /// is never touched.
+    ClassifyOnly,
+}
+
+// r[impl sched.attempt.witnessed-terminal]
+/// The per-reason disposition table. The promotion set is derived
+/// PER-REASON, never inherited: kubelet `OOMKilled` is a per-container
+/// `containerStatuses` attribution — the one controller-witnessed
+/// reason that is structurally unambiguous, and the only letter the
+/// I-199 retirement derivation covers (the retired heuristic promoted
+/// on AMBIGUOUS signals; see `bump_resource_floor`'s doc). Every
+/// other letter is classify-only.
+pub(super) fn witnessed_disposition(
+    reason: rio_proto::types::AttemptTerminalReason,
+) -> WitnessedDisposition {
+    use WitnessedDisposition as D;
+    use rio_proto::types::AttemptTerminalReason as R;
+    match reason {
+        // Wire-default / unclassifiable: never a sizing signal.
+        R::Unspecified => D::ClassifyOnly,
+        // THE promoting row: per-container kubelet attribution — the
+        // pod hit ITS memory limit; nothing ambient about it.
+        R::OomKilled => D::PromoteMemFloor,
+        // Classify-only BY RULING: the controller folds node-condition
+        // eviction shapes ("DiskPressure", "ephemeral-storage") AND
+        // pod-attributed shapes ("ephemeral local storage", "EmptyDir
+        // volume") into this ONE letter (pool/job.rs
+        // pod_termination_reason) — promotion here would re-create
+        // the I-199 ambient over-fire on the disk axis. The disk
+        // floor's designed producer is the worker-side
+        // quota-attributed lane (see the parked arm above).
+        R::EvictedDiskPressure => D::ClassifyOnly,
+        // Ambient by definition (MemoryPressure / PID pressure /
+        // node-shutdown): node-cause, never per-pod sizing evidence.
+        R::EvictedOther => D::ClassifyOnly,
+        // Expected one-shot exit: not a failure.
+        R::Completed => D::ClassifyOnly,
+        // Pod death that was not the build's fault (panic, operator
+        // SIGKILL, node failure).
+        R::Error => D::ClassifyOnly,
+        // The deadline floor's producer is the worker-reported
+        // TimedOut lane: the Job-level kill carries no per-container
+        // attribution of WHY the deadline passed (wedge vs slow vs
+        // node), so the witnessed letter stays classify-only.
+        R::DeadlineExceeded => D::ClassifyOnly,
+        // Controller-synthesized verdicts close charge-free in their
+        // own intake arm when the assignment is active; a marked
+        // straggler is operator/platform action, never sizing
+        // evidence.
+        R::Cancelled => D::ClassifyOnly,
+        // Platform disruption (DisruptionTarget): ambient.
+        R::Preempted => D::ClassifyOnly,
+        // Controller reap: platform action.
+        R::Reaped => D::ClassifyOnly,
+        // Spawn-gate verdict: no pod and no attempt — handled before
+        // attempt resolution, a mark cannot exist for it (this row is
+        // the belt).
+        R::NoEligibleSource => D::ClassifyOnly,
+    }
+}
+
+/// Every wire letter exactly once — the product census's iteration
+/// domain, pinned by an exhaustive index match in the census test so
+/// a new variant cannot ship without joining this set AND taking a
+/// disposition row above (the `GcPhase3Outcome::ALL` form).
+#[cfg(test)]
+pub(super) const WITNESSED_LETTERS: [rio_proto::types::AttemptTerminalReason; 11] = {
+    use rio_proto::types::AttemptTerminalReason as R;
+    [
+        R::Unspecified,
+        R::OomKilled,
+        R::EvictedDiskPressure,
+        R::EvictedOther,
+        R::Completed,
+        R::Error,
+        R::DeadlineExceeded,
+        R::Cancelled,
+        R::Preempted,
+        R::Reaped,
+        R::NoEligibleSource,
+    ]
+};
 
 // r[impl scheduler.sla.ceiling.stale-solve-revalidation+2]
 /// live_051(d): the read-time projection of a resource floor under the
@@ -423,5 +530,77 @@ mod tests {
         }
         assert_eq!(s.sched.resource_floor, Default::default());
         assert_eq!(s.retry.infra_count, 0);
+    }
+
+    // r[verify sched.attempt.witnessed-terminal]
+    /// live_058-b: the witnessed-reason x establish-disposition
+    /// product census (the R25 proof obligation — the injectivity of
+    /// the promotion set is COUNTED from the generated table, never
+    /// asserted in prose). Membership is pinned through an exhaustive
+    /// index match (the `GcPhase3Outcome::ALL` form), so a new wire
+    /// letter cannot ship without joining `WITNESSED_LETTERS`, taking
+    /// a `witnessed_disposition` row (rustc exhaustiveness), and
+    /// filing its oracle row here.
+    #[test]
+    fn witnessed_disposition_product_census() {
+        use WitnessedDisposition as D;
+        use rio_proto::types::AttemptTerminalReason as R;
+        // Closure-set census: every letter appears in WITNESSED_LETTERS
+        // exactly once (a new variant fails this match at compile time).
+        fn index(r: R) -> usize {
+            match r {
+                R::Unspecified => 0,
+                R::OomKilled => 1,
+                R::EvictedDiskPressure => 2,
+                R::EvictedOther => 3,
+                R::Completed => 4,
+                R::Error => 5,
+                R::DeadlineExceeded => 6,
+                R::Cancelled => 7,
+                R::Preempted => 8,
+                R::Reaped => 9,
+                R::NoEligibleSource => 10,
+            }
+        }
+        let mut seen = [0u8; WITNESSED_LETTERS.len()];
+        for r in WITNESSED_LETTERS {
+            seen[index(r)] += 1;
+        }
+        assert_eq!(
+            seen,
+            [1; WITNESSED_LETTERS.len()],
+            "WITNESSED_LETTERS is the alphabet"
+        );
+
+        // The product table — hand-written oracle rows, one per
+        // letter, NOT derived from the impl's own match.
+        let table = [
+            (R::Unspecified, D::ClassifyOnly),
+            (R::OomKilled, D::PromoteMemFloor),
+            (R::EvictedDiskPressure, D::ClassifyOnly),
+            (R::EvictedOther, D::ClassifyOnly),
+            (R::Completed, D::ClassifyOnly),
+            (R::Error, D::ClassifyOnly),
+            (R::DeadlineExceeded, D::ClassifyOnly),
+            (R::Cancelled, D::ClassifyOnly),
+            (R::Preempted, D::ClassifyOnly),
+            (R::Reaped, D::ClassifyOnly),
+            (R::NoEligibleSource, D::ClassifyOnly),
+        ];
+        assert_eq!(table.len(), WITNESSED_LETTERS.len());
+        for (letter, want) in table {
+            assert_eq!(witnessed_disposition(letter), want, "letter={letter:?}");
+        }
+
+        // EXACTLY ONE promoting row — the quantifier, counted from
+        // the generated set.
+        assert_eq!(
+            WITNESSED_LETTERS
+                .iter()
+                .filter(|r| witnessed_disposition(**r) == D::PromoteMemFloor)
+                .count(),
+            1,
+            "witnessed-OomKilled is the ONLY promoting letter"
+        );
     }
 }

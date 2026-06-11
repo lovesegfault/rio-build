@@ -923,15 +923,23 @@ pub struct CaState {
 // r[impl sched.sla.reactive-floor+4]
 /// Per-dimension resource floor for the NEXT dispatch (D4).
 ///
-/// Reactive promotion: an explicit WORKER-REPORTED
-/// resource-exhaustion signal (`CgroupOom` → `OomKilled`, `TimedOut`
-/// → `DeadlineExceeded` — the whole live alphabet) calls
-/// `actor::floor::bump_floor_or_count` which doubles the
-/// relevant dimension, capped at `Ceilings`. The disk dimension has
-/// NO live producer: the controller's pod-terminal
-/// `EvictedDiskPressure` classification is a fill that never promotes
-/// (see the parked arm in `actor/floor.rs` and sla-sizing.typ's
-/// accepted residual). `solve_intent_for` clamps
+/// Reactive promotion has three producers, census-pinned
+/// (`bump_resource_floor_caller_census`, db/live_pins.rs): the
+/// explicit WORKER-REPORTED resource-exhaustion signals (`CgroupOom`
+/// → `OomKilled`, `TimedOut` → `DeadlineExceeded`) and the
+/// controller-WITNESSED OomKilled letter promoted at the
+/// establishment sweep (live_058-b: once per attempt via the
+/// establishment transaction's `won` flag; every other witnessed
+/// letter is classify-only — `actor/floor.rs`'s
+/// `witnessed_disposition` table). All route through
+/// `actor::floor::bump_floor_or_count`, which doubles the relevant
+/// dimension, capped at `Ceilings`. The disk dimension has NO live
+/// producer: witnessed `EvictedDiskPressure` is classify-only BY
+/// RULING (the controller folds node-condition and pod-attributed
+/// eviction shapes into that one letter), and no worker-side disk
+/// signal exists yet — the parked arm in `actor/floor.rs` names the
+/// designed re-entry (a worker-side quota-attributed lane).
+/// `solve_intent_for` clamps
 /// its solved (mem, disk) at this floor before returning so the next
 /// SpawnIntent is at least as large.
 ///

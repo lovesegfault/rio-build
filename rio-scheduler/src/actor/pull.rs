@@ -2022,6 +2022,7 @@ impl DagActor {
             // attempt: the scheduler now holds the verdict — Resolved.
             return Ok(AttemptResolution::Resolved);
         }
+        // r[impl sched.attempt.witnessed-terminal]
         // live_058-c: the witnessed-terminal mark. The pod is GONE
         // (controller-witnessed terminal) while the attempt holds no
         // classification row — the worker's own report can only still

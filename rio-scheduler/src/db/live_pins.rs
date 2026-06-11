@@ -1038,4 +1038,32 @@ mod registration_writer_census {
              writers here with their witness rationale"
         );
     }
+
+    // r[verify sched.attempt.witnessed-terminal]
+    /// live_058-b ([GEN-SET], the R23′ bind): the `bump_resource_floor`
+    /// caller alphabet is MACHINE-PINNED — the fn doc's and the lib.rs
+    /// HELP's "the callers are the alphabet" sentences cite THIS census
+    /// instead of restating a list that goes stale (the restated-
+    /// sentence arm is struck: an alphabet/ONLY claim takes the machine
+    /// bind). Current population: the two worker-reported lanes
+    /// (completion.rs — `cgroup_oom`, `timeout`) and the establishment
+    /// sweep's witnessed-OomKilled disposition row (housekeeping.rs —
+    /// `witnessed_oom`, live_058-b). A new caller reds here until it
+    /// files its row, its label, and the lib.rs HELP; rides the same
+    /// embedded-source universe as every census in this module (the
+    /// dev-tree completeness pin is `census_universe_matches_live_tree`;
+    /// the raw-layer plant is `worker_report_taint_sinks_pinned`'s
+    /// strawman, which proves `assert_census` rejects and NAMES
+    /// unlisted rows).
+    #[test]
+    fn bump_resource_floor_caller_census() {
+        let hits = census(&[".bump_resource", "_floor("]);
+        let expected: BTreeMap<String, usize> = [
+            ("actor/completion.rs".to_string(), 2),
+            ("actor/housekeeping.rs".to_string(), 1),
+        ]
+        .into();
+        assert_census(&hits, &expected, "bump_resource_floor callers")
+            .expect("the floor-promotion caller alphabet is census-pinned");
+    }
 }

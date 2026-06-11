@@ -1934,9 +1934,14 @@ pub(super) fn pod_termination_reason(pod: &Pod) -> TerminationReason {
         // eviction manager) says `Usage of EmptyDir volume "<name>"
         // exceeds the limit "<N>".` — neither of the above substrings.
         // Match all three; all classify as EvictedDiskPressure for
-        // the AD2c classification fill (the scheduler intake never
-        // promotes a floor from controller reports — sla-sizing.typ
-        // accepted residual; the floor's disk arm is parked).
+        // the AD2c classification fill. This node-condition +
+        // pod-attributed FOLD is safe because the scheduler treats
+        // the eviction letter as CLASSIFY-ONLY: the only
+        // controller-witnessed letter that promotes a floor is
+        // OomKilled (per-container containerStatuses attribution,
+        // promoted at the establishment sweep once per attempt —
+        // live_058-b; the floor's disk arm stays parked, its designed
+        // producer is a worker-side quota-attributed signal).
         if msg.contains("DiskPressure")
             || msg.contains("ephemeral-storage")
             || msg.contains("ephemeral local storage")

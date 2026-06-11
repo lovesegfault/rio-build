@@ -1176,24 +1176,31 @@ The controller-reported arm of the previous revision (k8s
 `OomKilled`/`EvictedDiskPressure`/`DeadlineExceeded` promoting the floor via
 `ReportExecutorTermination`) retired with that RPC and the stream-era
 disconnect correlation that gave it a first-report-wins dedup. The
-pod-terminal `ReportAttemptOutcome` second installment deliberately changes
-no floor or budget (it is a classification fill, re-reported every controller
-tick), and a pod that dies before any worker report reaches the establishment
-sweep, which carries no resource signal --- so a pod-level resource kill no
-longer auto-promotes the floor. Accepted residual (executor-lifecycle 1d
-disposition, amended by the wave-4 narration sweep): the worker-reported
-arms remain the promotion source for MEM (`CgroupOom`) and DEADLINE
-(`TimedOut`) only --- DISK has NO surviving producer (no worker-side
-disk-eviction signal exists; the kubelet evicts the pod wholesale), so the
-disk floor dimension is parked-inert (`actor/floor.rs` annotates the arm)
-and the actual disk residual is the retry/establishment counters
-(retry-poison), not promotion. Repeated pod-level OOM/eviction loops surface
-through those counters and the SLA refit, and the operator levers are
-`rio-cli sla override` / the probe floor. If production data shows
-under-sizing loops that never trip a worker-reported signal, re-introducing
-a controller-reported promote needs a durable dedup (e.g. keyed to the
-attempt row's first classification) --- a design item, not a silent
-re-add.
+pod-terminal `ReportAttemptOutcome` second installment still changes no
+floor or budget (it is a classification fill, re-reported every controller
+tick). A pod that dies before any worker report now reaches the
+establishment sweep carrying its witnessed-terminal mark
+(#rref("sched.attempt.witnessed-terminal")), and the establishment feeds
+the witnessed reason through a per-reason disposition table: witnessed
+`OOMKilled` --- the per-container kubelet attribution, the one structurally
+unambiguous controller-witnessed reason --- promotes the MEM floor exactly
+once per attempt (the establishment transaction's append+decide `won` flag
+is precisely the durable dedup the previous revision's re-introduction note
+demanded, keyed to the attempt's first classification); EVERY other
+witnessed letter is classify-only --- it establishes on the witnessed clock
+and never touches the floor. In particular `EvictedDiskPressure` carries no
+promotion authority: the controller folds node-condition and pod-attributed
+eviction shapes into that one letter, so promoting it would re-create the
+retired ambient over-fire on the disk axis. The worker-reported arms remain
+the promotion source for MEM (`CgroupOom`) and DEADLINE (`TimedOut`); DISK
+still has NO promoting producer (`actor/floor.rs` annotates the parked
+arm; its designed first producer is a worker-side quota-attributed signal,
+not the witnessed letter), and the disk residual remains the
+retry/establishment counters (retry-poison) until that lane ships.
+Repeated pod-level OOM loops now self-heal in about one witnessed window
+plus one doubling instead of recurring on the dispatch deadline; the
+operator levers (`rio-cli sla override` / the probe floor) stay
+available.
 
 #r("sched.sla.cost-leader-edge-reload+1")[
   On a false→true leader edge, the cost-table poller MUST reload

@@ -144,10 +144,15 @@ message BuildInfo {
 // controller from k8s PodStatus (containerStatuses[].state.terminated.
 // reason for OOMKilled/Completed/Error; status.reason+message for
 // Evicted). The controller sends OomKilled / EvictedDiskPressure over
-// ReportAttemptOutcome as the classification fill (never promotes a
-// floor); floor promotion consumes this vocabulary WORKER-side only
-// (OomKilled <- CgroupOom, DeadlineExceeded <- TimedOut; the disk arm
-// is parked -- no live producer).
+// ReportAttemptOutcome as the classification fill. Scheduler-side,
+// the ONLY controller-witnessed letter that promotes a floor is
+// OomKilled -- per-container containerStatuses attribution, promoted
+// at the establishment sweep once per attempt via the establishment
+// transaction's won flag (live_058-b); every other witnessed letter
+// is classify-only. Worker-side promotion consumes this vocabulary as
+// before (OomKilled <- CgroupOom, DeadlineExceeded <- TimedOut; the
+// disk arm is parked -- its designed producer is a worker-side
+// quota-attributed signal, not this fill).
 enum TerminationReason {
   // Wire-default: controller couldn't classify (no terminated state,
   // status not yet populated). Scheduler treats as no-op.
@@ -156,9 +161,12 @@ enum TerminationReason {
   // memory limit. → bump `resource_floor.mem_bytes`.
   TERMINATION_REASON_OOM_KILLED = 1;
   // status.reason == "Evicted" + message mentions DiskPressure /
-  // ephemeral-storage. Node ran out of disk. → bump
-  // `resource_floor.disk_bytes` (next pod gets a bigger
-  // ephemeral-storage request).
+  // ephemeral-storage (node-condition shapes) OR the pod-attributed
+  // shapes ("ephemeral local storage", "EmptyDir volume") -- the
+  // controller folds BOTH classes into this one letter. Classify-only:
+  // the fold means the letter carries no per-pod sizing authority, so
+  // it NEVER bumps a floor (the disk floor's designed producer is a
+  // worker-side quota-attributed lane, not this classification).
   TERMINATION_REASON_EVICTED_DISK_PRESSURE = 2;
   // status.reason == "Evicted", other cause (MemoryPressure, PID
   // pressure, node-shutdown). NOT a per-drv sizing signal. → no-op.

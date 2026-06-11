@@ -1005,7 +1005,7 @@
       {
         "name": "rio_scheduler_resource_floor_bumps_total",
         "kind": "counter",
-        "help": "resource_floor doublings on explicit resource-exhaustion signals (D4, labeled reason=cgroup_oom|timeout; timeout covers DeadlineExceeded too). The stream-era oom_killed/disk_pressure/deadline_exceeded label arms were retired with the heuristic promote paths — bump_resource_floor's two callers are the alphabet. Reactive upsize: a derivation that OOMs at mem=N retries at mem=2N. Frequent firing for one pname = raise [sla].probe defaults."
+        "help": "resource_floor doublings on explicit resource-exhaustion signals (D4, labeled reason=cgroup_oom|timeout|witnessed_oom; timeout covers DeadlineExceeded too). cgroup_oom and timeout are worker-reported; witnessed_oom is the controller-witnessed OomKilled letter promoted at the establishment sweep, once per attempt ever via the establishment transaction's won flag (live_058-b — witnessed evictions are classify-only and have NO label here). The stream-era oom_killed/disk_pressure/deadline_exceeded label arms were retired with the heuristic promote paths; the caller alphabet is census-pinned (bump_resource_floor_caller_census, db/live_pins.rs). Reactive upsize: a derivation that OOMs at mem=N retries at mem=2N. Frequent firing for one pname = raise [sla].probe defaults."
       },
       {
         "name": "rio_scheduler_sla_als_round_cap_hit_total",

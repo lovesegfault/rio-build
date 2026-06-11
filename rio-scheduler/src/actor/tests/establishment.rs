@@ -57,7 +57,7 @@ async fn assignment_statuses(pool: &sqlx::PgPool, drv_hash: &str) -> Vec<String>
     .expect("assignment statuses")
 }
 
-// r[verify sched.attempt.establishment-window+5]
+// r[verify sched.attempt.establishment-window+6]
 /// (a) An open pull-mode attempt past deadline + slack with no terminal
 /// row is established exactly once as executor_crash/unreported,
 /// charged to failure_count, and the drv requeues.
@@ -110,7 +110,7 @@ async fn establishment_charges_and_requeues_after_window() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.establishment-window+5]
+// r[verify sched.attempt.establishment-window+6]
 /// (b) The same attempt with its outputs present in the store is
 /// adopted as completed (store-probe arm) and never charged.
 #[tokio::test]
@@ -153,7 +153,7 @@ async fn establishment_store_probe_adopts_completed_attempt() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.establishment-window+5]
+// r[verify sched.attempt.establishment-window+6]
 /// (c) An attempt inside the window is never established.
 #[tokio::test]
 async fn establishment_never_fires_inside_window() -> TestResult {
@@ -178,7 +178,7 @@ async fn establishment_never_fires_inside_window() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.establishment-window+5]
+// r[verify sched.attempt.establishment-window+6]
 /// (d) The establishment transaction at a below-floor serving
 /// generation writes nothing (the fence applies to establishment too).
 #[tokio::test]
@@ -215,7 +215,7 @@ async fn establishment_below_floor_writes_nothing() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.establishment-window+5]
+// r[verify sched.attempt.establishment-window+6]
 /// (g) The window is anchored to the deadline the attempt was
 /// dispatched with: a sweep-time re-solve that is smaller than the
 /// persisted deadline must NOT shrink the window (no establishment
@@ -397,7 +397,7 @@ async fn cancelled_attempt_is_never_charged_and_close_is_redriven() -> TestResul
     Ok(())
 }
 
-// r[verify sched.attempt.establishment-window+5]
+// r[verify sched.attempt.establishment-window+6]
 /// merged_bug_232 (bughunt wave, A4): a probe FAILURE is not evidence.
 /// An expired BUILD attempt swept while FindMissingPaths is failing
 /// must DEFER — no executor_crash row, the attempt stays open — and a
@@ -446,7 +446,7 @@ async fn probe_unavailable_defers_build_establishment() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.establishment-window+5]
+// r[verify sched.attempt.establishment-window+6]
 /// merged_bug_232 green pin: the MATERIALIZATION arm still charges on a
 /// failing probe — the kind axis decides before the probe axis (a
 /// mid-walk crash leaves the closure incomplete; outputs-present is
@@ -509,7 +509,7 @@ async fn establishment_mat_arm_charges_with_failing_probe() -> TestResult {
 /// never-probed-or-absent `doc` path as a completed output fabricates
 /// presence evidence (path_tenants upsert + DerivationCompleted event
 /// + downstream input resolution all consume output_paths).
-// r[verify sched.attempt.establishment-window+5]
+// r[verify sched.attempt.establishment-window+6]
 #[tokio::test]
 async fn establishment_adopt_stamps_only_verified_wanted_outputs() -> TestResult {
     let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
@@ -558,7 +558,7 @@ async fn establishment_adopt_stamps_only_verified_wanted_outputs() -> TestResult
 /// is Completed with nothing verifiable — charging executor_crash
 /// there seeds the exclusion ledger and the OA2 wedge clustering with
 /// a crash verdict about work that is already done.
-// r[verify sched.attempt.establishment-window+5]
+// r[verify sched.attempt.establishment-window+6]
 #[tokio::test]
 async fn establishment_terminal_settled_node_closes_charge_free() -> TestResult {
     let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
@@ -883,6 +883,7 @@ async fn report_attempt_outcome(
         .expect("actor alive")
 }
 
+// r[verify sched.attempt.witnessed-terminal]
 /// live_058-c (W10-CG-a, the witnessed pair's first installment): a
 /// controller-witnessed terminal attempt establishes on the WITNESSED
 /// clock — `witnessed_at + establishment_report_slack` — while still
@@ -890,22 +891,23 @@ async fn report_attempt_outcome(
 /// backdate anywhere in this test: the witnessed clock is the only
 /// thing that can expire it). Both window faces are structural:
 /// inside witnessed+slack nothing establishes (−ε); past it the
-/// attempt establishes exactly once and requeues (+ε). The floor is
-/// EXPLICITLY UNCHANGED end-to-end — the honest intermediate: this
-/// installment is the window, the per-reason promotion is the next
-/// installment's, and a seeded last_intent makes the no-bump
-/// assertion non-vacuous.
+/// attempt establishes exactly once and requeues (+ε). W10-CG-b live
+/// composite: the establishment feeds the witnessed OomKilled letter
+/// through the disposition table, so the SAME scenario also doubles
+/// the mem floor via `witnessed_oom` (at the commit-9 boundary this
+/// test asserted the floor EXPLICITLY UNCHANGED — the honest
+/// intermediate; the promotion installment flipped the assertion).
 #[tokio::test]
 async fn witnessed_terminal_establishes_on_witnessed_clock() -> TestResult {
     let (db, handle, _task) = setup().await;
     let _ev = merge_single_node(&handle, Uuid::new_v4(), "wit-a", PriorityClass::Scheduled).await?;
     let assignment = pull_deliver(&handle, "wit-a").await;
     let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
-    // A doubling base exists (4 GiB), so "floor unchanged" below
-    // cannot pass vacuously through the cold-start zero-base arm.
+    // A doubling base exists (256 MiB, safely under the fixture
+    // ceiling so the at-cap arm cannot mask the doubling).
     assert!(
         handle
-            .debug_seed_sched_hint("wit-a", Some(4 << 30), None, None, None)
+            .debug_seed_sched_hint("wit-a", Some(1 << 28), None, None, None)
             .await?
     );
 
@@ -967,10 +969,15 @@ async fn witnessed_terminal_establishes_on_witnessed_clock() -> TestResult {
     );
     assert_eq!(info.retry.failure_count, 1, "charged once (C2)");
     assert_eq!(
-        info.sched.resource_floor,
-        crate::state::ResourceFloor::default(),
-        "the requeue lands at the SAME floor — the witnessed-clock \
-         window installment explicitly does not promote"
+        info.sched.resource_floor.mem_bytes,
+        1 << 29,
+        "the witnessed_oom disposition row doubles the mem floor at \
+         establishment (W10-CG-b: the CG-a scenario now doubles — the \
+         commit-9 honest intermediate asserted the floor UNCHANGED here)"
+    );
+    assert_eq!(
+        info.sched.resource_floor.disk_bytes, 0,
+        "the OOM letter's row is MEM — the disk floor is untouched"
     );
     assert_eq!(
         assignment_statuses(&db.pool, "wit-a").await,
@@ -980,6 +987,7 @@ async fn witnessed_terminal_establishes_on_witnessed_clock() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.attempt.witnessed-terminal]
 /// live_058-c: the mark is first-witnessed-wins. After the mark is
 /// aged past the slack, k level-triggered re-reports arrive — if a
 /// re-report advanced the witnessed clock the next sweep would be
@@ -1046,5 +1054,209 @@ async fn witnessed_mark_first_witnessed_wins_under_re_reports() -> TestResult {
         "the establishment is idempotent under late re-reports"
     );
     assert_eq!(expect_drv(&handle, "wit-b").await.retry.failure_count, 1);
+    Ok(())
+}
+
+// r[verify sched.attempt.witnessed-terminal]
+/// live_058-b (W10-CG-b, the witnessed pair's second installment —
+/// the live incident shape, window AND floor in one scenario): the
+/// witnessed-OOM attempt establishes at witnessed+slack AND the mem
+/// floor doubles via the `witnessed_oom` disposition row. Disk and
+/// deadline floors stay untouched (the bump is the OOM letter's MEM
+/// row, never a sibling dimension).
+#[tokio::test]
+async fn witnessed_oom_promotes_mem_floor_at_establishment() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), "wit-c", PriorityClass::Scheduled).await?;
+    let assignment = pull_deliver(&handle, "wit-c").await;
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+    // Doubling bases on BOTH byte dimensions (under the fixture
+    // ceilings, so the at-cap arm cannot mask either face): the mem
+    // doubling and the disk non-doubling are each observable.
+    assert!(
+        handle
+            .debug_seed_sched_hint("wit-c", Some(1 << 28), Some(1 << 29), None, None)
+            .await?
+    );
+
+    report_attempt_outcome(
+        &handle,
+        exec_id,
+        rio_proto::types::AttemptTerminalReason::OomKilled,
+    )
+    .await
+    .expect("witnessed report acked");
+    assert!(
+        handle
+            .debug_backdate_witnessed_mark(exec_id, 86_400)
+            .await?
+    );
+    tick(&handle).await?;
+
+    let rows = attempt_rows_for(&db.pool, "wit-c").await;
+    assert_eq!(rows.len(), 1, "established exactly once");
+    let info = expect_drv(&handle, "wit-c").await;
+    assert_eq!(
+        info.status,
+        crate::state::DerivationStatus::Ready,
+        "the drv requeues after the witnessed-clock establishment"
+    );
+    assert_eq!(
+        info.sched.resource_floor.mem_bytes,
+        1 << 29,
+        "witnessed-OomKilled is the promoting row: the mem floor doubles \
+         from the dispatched base at establishment"
+    );
+    assert_eq!(
+        info.sched.resource_floor.disk_bytes, 0,
+        "the OOM letter's row is MEM — the disk floor is untouched"
+    );
+    assert_eq!(
+        info.sched.resource_floor.deadline_secs, 0,
+        "the deadline floor is untouched"
+    );
+    Ok(())
+}
+
+// r[verify sched.attempt.witnessed-terminal]
+/// live_058-b (W10-CG-b precision matrix): every non-OOM witnessed
+/// letter that can reach the mark establishes at witnessed+slack with
+/// the floor UNCHANGED — the classify-only row. EvictedDiskPressure
+/// is the load-bearing cell: the controller folds the node-condition
+/// shapes ("DiskPressure", "ephemeral-storage") AND the pod-attributed
+/// shapes ("ephemeral local storage", "EmptyDir volume") into this ONE
+/// wire letter (pool/job.rs pod_termination_reason), so the letter
+/// carries no per-pod sizing authority by construction — both folded
+/// shapes arrive here as the same bytes, which is exactly why the
+/// scheduler-side cell is one row. Granting it promotion would
+/// re-create the I-199 ambient-cause over-fire on the disk axis.
+#[tokio::test]
+async fn witnessed_eviction_letters_establish_classify_only() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    use rio_proto::types::AttemptTerminalReason as R;
+    for (i, reason) in [R::EvictedDiskPressure, R::EvictedOther, R::Error]
+        .into_iter()
+        .enumerate()
+    {
+        let drv = format!("wit-d{i}");
+        let _ev =
+            merge_single_node(&handle, Uuid::new_v4(), &drv, PriorityClass::Scheduled).await?;
+        let assignment = pull_deliver(&handle, &drv).await;
+        let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+        // Doubling bases on both byte dimensions: a conflated
+        // promoting-eviction arm would be observable as a disk (or
+        // mem) doubling here.
+        assert!(
+            handle
+                .debug_seed_sched_hint(&drv, Some(1 << 28), Some(1 << 29), None, None)
+                .await?
+        );
+
+        report_attempt_outcome(&handle, exec_id, reason)
+            .await
+            .expect("witnessed report acked");
+        assert!(
+            handle
+                .debug_backdate_witnessed_mark(exec_id, 86_400)
+                .await?
+        );
+        tick(&handle).await?;
+
+        let rows = attempt_rows_for(&db.pool, &drv).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "{reason:?}: established exactly once on the witnessed clock"
+        );
+        let info = expect_drv(&handle, &drv).await;
+        assert_eq!(
+            info.sched.resource_floor,
+            crate::state::ResourceFloor::default(),
+            "{reason:?} is classify-only: establish + requeue, the floor \
+             is NEVER touched"
+        );
+        assert_eq!(
+            info.status,
+            crate::state::DerivationStatus::Ready,
+            "{reason:?}: the classify-only row still requeues"
+        );
+    }
+    Ok(())
+}
+
+// r[verify sched.attempt.witnessed-terminal]
+/// live_058-b (W10-CH — the once-per-attempt cap of the I-199
+/// non-recreation argument): k level-triggered re-reports before the
+/// sweep, the establishment pass, a late re-report, and a replayed
+/// sweep pass produce EXACTLY ONE bump — the floor shows one doubling
+/// (512 MiB from a 256 MiB base, never 1 GiB), count-based via the
+/// establishment transaction's won flag, not a wall clock.
+#[tokio::test]
+async fn witnessed_oom_bump_capped_once_per_attempt() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), "wit-e", PriorityClass::Scheduled).await?;
+    let assignment = pull_deliver(&handle, "wit-e").await;
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+    assert!(
+        handle
+            .debug_seed_sched_hint("wit-e", Some(1 << 28), None, None, None)
+            .await?
+    );
+
+    report_attempt_outcome(
+        &handle,
+        exec_id,
+        rio_proto::types::AttemptTerminalReason::OomKilled,
+    )
+    .await
+    .expect("witnessed report acked");
+    assert!(
+        handle
+            .debug_backdate_witnessed_mark(exec_id, 86_400)
+            .await?
+    );
+    // k re-reports AFTER the mark aged: none may re-anchor the clock
+    // or queue a second promotion.
+    for _ in 0..3 {
+        report_attempt_outcome(
+            &handle,
+            exec_id,
+            rio_proto::types::AttemptTerminalReason::OomKilled,
+        )
+        .await
+        .expect("re-report acked");
+    }
+
+    tick(&handle).await?;
+
+    // A late re-report (the pod is still listable) plus a replayed
+    // sweep pass: the attempt is closed, the mark is consumed — both
+    // are no-ops.
+    report_attempt_outcome(
+        &handle,
+        exec_id,
+        rio_proto::types::AttemptTerminalReason::OomKilled,
+    )
+    .await
+    .expect("late re-report acked");
+    tick(&handle).await?;
+
+    let info = expect_drv(&handle, "wit-e").await;
+    assert_eq!(
+        info.sched.resource_floor.mem_bytes,
+        1 << 29,
+        "EXACTLY ONE doubling across k re-reports + a replayed pass \
+         (a second bump would read 1 GiB)"
+    );
+    assert_eq!(
+        attempt_rows_for(&db.pool, "wit-e").await.len(),
+        1,
+        "exactly one establishment row"
+    );
+    assert_eq!(
+        expect_drv(&handle, "wit-e").await.retry.failure_count,
+        1,
+        "exactly one charge"
+    );
     Ok(())
 }

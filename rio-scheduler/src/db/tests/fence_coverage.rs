@@ -314,7 +314,7 @@ fn tenure_authority_no_fresh_atomic_reads_in_write_paths() {
 /// production mint: `DagActor::dag_authority`, which reads
 /// `dag_authoritative`. A second construction expression means a
 /// destructive path acquired authority without the bit — review it
-/// against `sched.attempt.establishment-window+5`.
+/// against `sched.attempt.establishment-window+6`.
 #[test]
 fn dag_authority_single_mint_site() {
     let count: usize = ACTOR_SOURCES

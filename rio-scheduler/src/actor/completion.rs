@@ -1188,19 +1188,32 @@ impl DagActor {
     /// handles the dag-node lookup, metric, log, and best-effort PG
     /// persist.
     ///
-    /// Called ONLY from explicit worker-reported resource-exhaustion
-    /// signals:
+    /// Called ONLY from explicit per-attempt resource-exhaustion
+    /// signals — the caller set is MACHINE-PINNED by the
+    /// `bump_resource_floor_caller_census` ([GEN-SET], db/live_pins.rs;
+    /// a new caller reds the census until it files its row AND the
+    /// lib.rs HELP):
     /// - `handle_infrastructure_failure` (worker-reported `CgroupOom`
-    ///   — build child hit cgroup memory.max while pod survived)
-    /// - `handle_timeout_failure` (worker-reported `TimedOut`)
+    ///   — build child hit cgroup memory.max while pod survived) —
+    ///   label `cgroup_oom`
+    /// - `handle_timeout_failure` (worker-reported `TimedOut`) —
+    ///   label `timeout`
+    /// - the establishment sweep's witnessed-OomKilled disposition row
+    ///   (live_058-b, housekeeping.rs — the controller-witnessed
+    ///   per-container kubelet attribution, promoted exactly once per
+    ///   attempt via the establishment transaction's append+decide
+    ///   `won` flag) — label `witnessed_oom`
     ///
     /// The stream-era controller-reported arm
     /// (`ReportExecutorTermination` → OOMKilled / DiskPressure /
-    /// DeadlineExceeded) retired with that RPC; the pod-terminal
-    /// `ReportAttemptOutcome` second installment deliberately does not
-    /// promote (no durable first-report dedup exists for it) — the
-    /// `sched.sla.reactive-floor+4` re-derivation records the accepted
-    /// residual.
+    /// DeadlineExceeded) retired with that RPC. The pod-terminal
+    /// `ReportAttemptOutcome` second installment still never promotes
+    /// (it fills a worker-classified row); the witnessed-terminal
+    /// ESTABLISHMENT lane is the one controller-witnessed promoter,
+    /// for exactly the OomKilled letter, with the durable
+    /// once-per-attempt dedup the retired arm lacked — every other
+    /// witnessed letter is classify-only
+    /// (`floor::witnessed_disposition`).
     ///
     /// NOT called from bare disconnect / `TransientFailure` /
     /// non-OOM `InfrastructureFailure`. The previous
@@ -1211,12 +1224,12 @@ impl DagActor {
     /// paid for an oversized pod.
     ///
     /// `reason_label`: emitted as a label on the metric + the log
-    /// line so operators can tell `cgroup_oom` from `timeout` in
-    /// dashboards. Those two are the WHOLE live alphabet (the
+    /// line so operators can tell the producers apart in dashboards.
+    /// The label alphabet is {`cgroup_oom`, `timeout`,
+    /// `witnessed_oom`} — pinned by the caller census above (the
     /// `oom_killed`/`disk_pressure` arms were retired with the
-    /// over-broad heuristic above; `timeout` covers
-    /// `DeadlineExceeded` too) - keep the lib.rs HELP in lockstep
-    /// when adding a caller.
+    /// over-broad heuristic; `timeout` covers `DeadlineExceeded`
+    /// too) — keep the lib.rs HELP in lockstep when the census grows.
     pub(super) async fn bump_resource_floor(
         &mut self,
         drv_hash: &DrvHash,

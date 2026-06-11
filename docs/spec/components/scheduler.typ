@@ -3268,15 +3268,19 @@ per-class count composes with the sibling uncharged class instead of
 being reset by it (bug_098: alternating the two classes is bounded by
 the SUM of the per-class headrooms, never unbounded).
 
-#r("sched.attempt.establishment-window+5")[
+#r("sched.attempt.establishment-window+6")[
   The establishment sweep MUST visit every open attempt (active assignment ⋈
   execution, no terminal classification) on every sweep, and MUST establish
-  an attempt only after its deadline plus the configured
-  `establishment_report_slack` has elapsed with no terminal row, where the
-  deadline is anchored to the value the attempt was dispatched with (the
-  solved deadline persisted by the pull mint): a sweep-time re-solve may
-  widen the window but MUST never shrink it below the dispatched deadline
-  while the attempt is open. Every expired attempt MUST be dispositioned
+  an attempt only after its window has elapsed with no terminal row. For an
+  attempt carrying a witnessed-terminal mark
+  (#rref("sched.attempt.witnessed-terminal")) the window is the WITNESSED
+  clock --- `witnessed_at` plus the configured `establishment_report_slack`
+  --- in place of the deadline anchor; for every unmarked attempt the window
+  is its deadline plus the same slack, where the deadline is anchored to the
+  value the attempt was dispatched with (the solved deadline persisted by
+  the pull mint): a sweep-time re-solve may widen an unmarked attempt's
+  window but MUST never shrink it below the dispatched deadline while the
+  attempt is open. Every expired attempt MUST be dispositioned
   through the single total establishment kernel
   (`establish_expired_attempt`): the store-probe arm adopts the attempt as
   completed when its outputs are verifiably present, stamping EXACTLY the
@@ -3297,6 +3301,41 @@ the SUM of the per-class headrooms, never unbounded).
   establishing transaction MUST apply the same generation-floor fence as
   the pull transaction.
 ]
+
+#r("sched.attempt.witnessed-terminal")[
+  The `ReportAttemptOutcome` intake MUST record an in-memory
+  witnessed-terminal mark `(exec_id → witnessed_at, witnessed_reason)` for
+  every pod-terminal letter that resolves to an open, unclassified build
+  attempt, idempotently under the controller's level-triggered re-reports:
+  the FIRST witnessing report anchors `witnessed_at`, and a re-report MUST
+  NOT advance it (it re-creates an absent mark and otherwise changes
+  nothing); the intake itself MUST NOT bump a floor, consume budget, or
+  insert rows on the mark path. The establishment sweep MUST expire a
+  marked attempt on the witnessed clock (`witnessed_at +
+  establishment_report_slack`) without waiting for the dispatch-deadline
+  anchor, and at establishment MUST feed the witnessed reason through the
+  per-reason disposition table: witnessed `OOMKilled` --- the per-container
+  kubelet `containerStatuses` attribution --- is the ONLY promoting letter
+  (`bump_resource_floor`, label `witnessed_oom`), gated on the
+  establishment transaction's append+decide `won` flag so promotion fires
+  at most once per attempt, ever; EVERY other witnessed letter (both
+  `EvictedDiskPressure` message shapes included --- the controller folds
+  node-condition and pod-attributed evictions into that one letter) MUST
+  establish classify-only, leaving the floor untouched. Marks MUST be
+  consumed at establishment and pruned against the open-attempt view.
+]
+The promotion narrowing is the I-199 non-recreation argument: the retired
+heuristic's over-fire shape was N pods #sym.times M level-triggered
+re-reports promoting N #sym.times M times on ambient signals; this law caps
+promotion at once-per-attempt (re-reports refresh nothing; the `won` flag
+is the durable dedup) AND restricts the promotion set to the single
+per-container-attributed letter, so ambient/node-cause signals sit
+structurally outside it on both axes (population and rate). The mark is
+in-memory by design --- lost on scheduler failover, re-armed by the next
+level-triggered re-report while the pod stays listable; beyond that window
+the deadline anchor backstops, so degradation is bounded by the prior
+behavior (the priced residual; the durable-column arm is the recorded
+rejected alternative under the wave's single-DDL allocation).
 
 #r("sched.config.slack-floor")[
   `establishment_report_slack_secs` MUST be validated at config load against

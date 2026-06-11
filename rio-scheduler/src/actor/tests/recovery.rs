@@ -3254,7 +3254,7 @@ async fn recovered_stale_build_times_out_on_first_tick() -> TestResult {
 /// inferences. Pre-fix the establishment sweep mapped every durable
 /// open attempt to `Absent → CloseChargeFree` and closed a healthy
 /// predecessor attempt the zombie knows nothing about.
-// r[verify sched.attempt.establishment-window+5]
+// r[verify sched.attempt.establishment-window+6]
 #[tokio::test]
 async fn failed_recovery_ticks_never_close_predecessor_attempts() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;

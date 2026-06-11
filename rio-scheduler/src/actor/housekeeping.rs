@@ -229,7 +229,7 @@ impl DagActor {
         let expired_poisons = self.tick_scan_dag();
         phase!("01-scan-dag");
 
-        // r[impl sched.attempt.establishment-window+5]
+        // r[impl sched.attempt.establishment-window+6]
         // The destructive block (merged_bug_210): every tick below
         // either writes PG or decides from "not in / stale in the
         // DAG" inferences. All of them take the DagAuthority witness,
@@ -1137,7 +1137,7 @@ impl DagActor {
     /// the `DagAuthority` witness; the establishing transaction
     /// additionally carries the same generation-floor fence as the
     /// pull transaction.
-    // r[impl sched.attempt.establishment-window+5]
+    // r[impl sched.attempt.establishment-window+6]
     pub(super) async fn tick_sweep_open_pull_attempts(&mut self, _authority: &super::DagAuthority) {
         let opens = match self.db.list_open_pull_attempts().await {
             Ok(rows) => rows,
@@ -1388,6 +1388,7 @@ impl DagActor {
             .build
             .into_iter()
             .filter(|attempt| {
+                // r[impl sched.attempt.witnessed-terminal]
                 // live_058-c: a controller-witnessed terminal attempt
                 // expires on the WITNESSED clock — the pod is gone, so
                 // the only report the slack still covers is one
@@ -1453,7 +1454,7 @@ impl DagActor {
         let executor = ExecutorId::from(attempt.executor_id.as_str());
 
         // ONE kernel call dispositions the attempt
-        // (sched.attempt.establishment-window+5: every expired attempt
+        // (sched.attempt.establishment-window+6: every expired attempt
         // routes through the total establishment kernel; §4.R2: this is
         // the kernel's single scheduler call site).
         use rio_evidence_kernel::establish::{
@@ -1753,16 +1754,48 @@ impl DagActor {
         };
         // The charging transaction committed (won or lost, the
         // assignment row is closed): the witnessed mark is consumed
-        // with the attempt. live_058-c: a marked attempt reaching this
-        // point established on the WITNESSED clock; the floor is
-        // EXPLICITLY UNCHANGED here — the witnessed-clock window is
-        // this installment's whole delta, and the per-reason
-        // establishment disposition is the promotion installment's.
+        // with the attempt.
         let witnessed = self.witnessed_terminal.remove(&attempt.exec_id);
         if !won {
             // Another classifier landed concurrently (its row holds the
-            // verdict); this pass records and changes nothing.
+            // verdict); this pass records and changes nothing — in
+            // particular no promotion: the won flag is the
+            // once-per-attempt cap (live_058-b).
             return;
+        }
+        // r[impl sched.attempt.witnessed-terminal]
+        // live_058-b: the witnessed reason feeds the per-reason
+        // disposition table — witnessed-OomKilled is the ONE promoting
+        // row (label `witnessed_oom`); every other letter, both
+        // EvictedDiskPressure message shapes included, takes the
+        // classify-only row (`floor::witnessed_disposition`). The bump
+        // rides the establishment's append+decide `won` flag —
+        // exactly-once per attempt, EVER: re-reports refresh nothing
+        // (the mark is first-witnessed-wins) and a lost append
+        // returned above, so the retired N-pods x M-re-reports
+        // promotion surface (I-199) cannot re-form on either axis
+        // (population or rate).
+        if let Some(mark) = witnessed {
+            match super::floor::witnessed_disposition(mark.reason) {
+                super::floor::WitnessedDisposition::PromoteMemFloor => {
+                    // The establishment charge was already decided
+                    // (append+decide above): the bump is sizing
+                    // evidence for the NEXT dispatch, not a
+                    // retry-budget exemption — FloorOutcome's
+                    // promoted/at_cap bits drive the worker-reported
+                    // arms' counter logic, which has no analogue here.
+                    let _ = self
+                        .bump_resource_floor(
+                            &drv_hash,
+                            rio_proto::types::TerminationReason::OomKilled,
+                            "witnessed_oom",
+                        )
+                        .await;
+                }
+                super::floor::WitnessedDisposition::ClassifyOnly => {
+                    // The no-bump row: establish + requeue only.
+                }
+            }
         }
         // OA1 interval, establishment cause: attempt opened → established.
         metrics::histogram!(
