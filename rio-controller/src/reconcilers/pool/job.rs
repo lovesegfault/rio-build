@@ -456,11 +456,16 @@ pub(super) async fn reap_excess_pending(
     if excess.is_empty() {
         return 0;
     }
-    // One best-effort view read per tick-with-deletions (never per Job)
-    // for the synthesize-on-delete arm (this path consumes only the
-    // open half; the death classification consuming `recently_closed`
-    // is the terminal reap's, in `reap_stale_for_intents`).
-    let mut attempts_view = AttemptsViewWitness::fetch(ctx, pool).await;
+    // One view read per tick-with-deletions (never per Job) for the
+    // synthesize-on-delete arm (this path consumes only the open
+    // half; the death classification consuming `recently_closed` is
+    // the terminal reap's, in `reap_stale_for_intents`).
+    // merged_bug_022: a FAILED read defers the whole wave — an empty
+    // view born from an error must never adjudicate deletes.
+    let mut attempts_view = match AttemptsViewWitness::fetch(ctx, pool).await {
+        AttemptsFetch::Fetched(w) => AttemptsPair::at_selection(w),
+        AttemptsFetch::FetchFailed => return 0,
+    };
     let mut reaped = 0u32;
     for job in excess {
         let job_name = job.metadata.name.as_deref().unwrap_or("<unnamed>");
@@ -553,7 +558,7 @@ pub(super) async fn reap_excess_pending(
 /// identity), carries the Job name and the attempt's intent id for the
 /// scheduler's resolution fallbacks, and forwards the attempt's
 /// `source_node` as the AD2c attribution when known.
-// r[impl ctrl.job.synthesize-on-delete+3]
+// r[impl ctrl.job.synthesize-on-delete+4]
 pub(super) fn synthesized_report_for_job(
     job: &Job,
     reason: rio_proto::types::AttemptTerminalReason,
@@ -839,12 +844,31 @@ impl AttemptsViewWitness {
         }
     }
 
-    /// Best-effort production mint (wraps
-    /// [`open_attempts_best_effort`]; empty view on error — callers
-    /// proceed with the plain delete and the establishment sweep
-    /// remains the fallback classifier).
-    pub(super) async fn fetch(ctx: &Ctx, pool: &str) -> Self {
-        Self::minted_now(open_attempts_best_effort(ctx, pool).await)
+    /// Production mint with the fetch outcome TYPED (merged_bug_022):
+    /// a failed `ListOpenAttempts` is [`AttemptsFetch::FetchFailed`],
+    /// never a maximally-fresh EMPTY witness — absence of evidence is
+    /// not evidence of absence, and failure polarity is decided ONCE
+    /// here (FetchFailed defers EVERYWHERE, matching the refetch-Err
+    /// arm's posture inside the delete chokepoint). `minted_now` on an
+    /// error is unconstructible: this is the only production fetch.
+    pub(super) async fn fetch(ctx: &Ctx, pool: &str) -> AttemptsFetch {
+        match admin_call(
+            ctx.admin
+                .clone()
+                .list_open_attempts(rio_proto::types::ListOpenAttemptsRequest {}),
+        )
+        .await
+        {
+            Ok(resp) => AttemptsFetch::Fetched(Self::minted_now(resp.into_inner())),
+            Err(e) => {
+                warn!(
+                    pool, error = %e,
+                    "ListOpenAttempts failed; deferring ALL attempt adjudication \
+                     this tick (no deletes-as-NoOpenAttempt, no backoff tax)"
+                );
+                AttemptsFetch::FetchFailed
+            }
+        }
     }
 
     /// The open half of the view.
@@ -869,6 +893,78 @@ impl AttemptsViewWitness {
     #[cfg(test)]
     pub(super) fn backdate_for_test(&mut self, age: Duration) {
         self.fetched_at = std::time::Instant::now() - age;
+    }
+}
+
+/// The typed fetch outcome (merged_bug_022): the provenance axis a
+/// best-effort-to-default adapter erased. `FetchFailed` carries no
+/// view — consumers structurally cannot adjudicate on it.
+pub(super) enum AttemptsFetch {
+    Fetched(AttemptsViewWitness),
+    FetchFailed,
+}
+
+/// The witness PAIR (bug_080, T2's chronology-role split): one `&mut`
+/// witness cannot serve as both the selection's DECIDING view and the
+/// freshest observation — the wave-8 close protected only the
+/// iteration that tripped the refresh, relocating the harm to sibling
+/// loop iterations. `deciding` is captured immutably at selection
+/// (first fetch of the wave); `freshest` refreshes as before; the
+/// just-pulled veto is a DELTA against `deciding`, evaluated PER JOB
+/// at the delete chokepoint.
+pub(super) struct AttemptsPair {
+    /// The view the wave's selection ran against. Immutable for the
+    /// pair's lifetime — refreshes touch only `freshest`.
+    deciding: rio_proto::types::ListOpenAttemptsResponse,
+    /// The freshest observation (staleness-gated refetch target).
+    freshest: AttemptsViewWitness,
+}
+
+impl AttemptsPair {
+    /// Mint the pair at SELECTION: the first fetched view of the wave
+    /// is both the deciding view and the initial freshest.
+    pub(super) fn at_selection(witness: AttemptsViewWitness) -> Self {
+        Self {
+            deciding: witness.view.clone(),
+            freshest: witness,
+        }
+    }
+
+    /// The freshest observation (synthesis + death-classification
+    /// input — the gate reads the SAME evidence the delete consumed).
+    pub(super) fn freshest(&self) -> &AttemptsViewWitness {
+        &self.freshest
+    }
+
+    /// Replace the freshest observation (the deciding view is
+    /// untouchable by construction).
+    fn refresh(&mut self, witness: AttemptsViewWitness) {
+        self.freshest = witness;
+    }
+
+    /// The per-job veto (bug_080): does the FRESHEST view show a
+    /// covering Job-owned attempt for `intent` that the DECIDING view
+    /// did not contain? Evaluated for EVERY delete in the wave — not
+    /// only the iteration whose staleness tripped a refetch.
+    fn just_pulled_since_deciding(&self, intent: &str) -> bool {
+        let known: std::collections::HashSet<&str> = self
+            .deciding
+            .attempts
+            .iter()
+            .filter(|a| a.intent_id == intent)
+            .map(|a| a.exec_id.as_str())
+            .collect();
+        self.freshest.attempts().iter().any(|a| {
+            a.intent_id == intent
+                && AttemptOwner::Job.owns(a)
+                && !known.contains(a.exec_id.as_str())
+        })
+    }
+
+    /// Test seam: age the freshest half (the staleness arm's driver).
+    #[cfg(test)]
+    pub(super) fn backdate_for_test(&mut self, age: Duration) {
+        self.freshest.backdate_for_test(age);
     }
 }
 
@@ -899,7 +995,7 @@ impl AttemptsViewWitness {
 /// witnesses nothing and resets nothing — merged_bug_080(2b); the
 /// witness mint is `candidate::VerdictWitness::from_resolved_ack`.
 // r[impl ctrl.pool.respawn-backoff+2]
-// r[impl ctrl.job.synthesize-on-delete+3]
+// r[impl ctrl.job.synthesize-on-delete+4]
 #[allow(clippy::too_many_arguments)] // the build_job precedent: reconcile plumbing, not an API
 pub(super) async fn delete_job_with_synthesized_report(
     jobs_api: &Api<Job>,
@@ -908,21 +1004,19 @@ pub(super) async fn delete_job_with_synthesized_report(
     job_name: &str,
     params: &DeleteParams,
     reason: rio_proto::types::AttemptTerminalReason,
-    attempts: &mut AttemptsViewWitness,
+    attempts: &mut AttemptsPair,
     key: &super::candidate::PoolKey,
 ) -> kube::Result<SynthesizedDelete> {
     // live_051(e): the synthesized verdict and the delete it rides
-    // consume attempt evidence within the typed freshness bound. On
-    // stale evidence: ONE refetch, then re-evaluation — a Job whose
-    // FRESH evidence shows a covering open attempt the deciding view
-    // did not contain is NOT deleted this tick (a just-pulled attempt
-    // — the 169-Reaped-within-~200ms shape); a failed refetch defers
-    // too (absence of staleness cannot be proven). The refreshed view
-    // REPLACES the witness in place, so a long reap wave pays at most
-    // one extra ListOpenAttempts per staleness episode and every
-    // subsequent delete (and the callers' death-classification gates)
-    // consumes the fresh evidence.
-    if attempts.age() > ATTEMPTS_VIEW_FRESHNESS {
+    // consume attempt evidence within the typed freshness bound. On a
+    // stale FRESHEST observation: ONE refetch, then re-evaluation; a
+    // failed refetch defers (absence of staleness cannot be proven).
+    // The refreshed view replaces only the PAIR's freshest half — the
+    // deciding view is immutable for the wave (bug_080), so a long
+    // reap wave pays at most one extra ListOpenAttempts per staleness
+    // episode and every subsequent delete still vetoes against the
+    // view its selection ran under.
+    if attempts.freshest().age() > ATTEMPTS_VIEW_FRESHNESS {
         match admin_call(
             ctx.admin
                 .clone()
@@ -930,36 +1024,7 @@ pub(super) async fn delete_job_with_synthesized_report(
         )
         .await
         {
-            Ok(resp) => {
-                let fresh = AttemptsViewWitness::minted_now(resp.into_inner());
-                let intent = job_intent_id(job).filter(|i| !i.is_empty());
-                if let Some(intent) = intent {
-                    let known: std::collections::HashSet<&str> = attempts
-                        .attempts()
-                        .iter()
-                        .filter(|a| a.intent_id == intent)
-                        .map(|a| a.exec_id.as_str())
-                        .collect();
-                    let just_pulled = fresh.attempts().iter().any(|a| {
-                        a.intent_id == intent
-                            && AttemptOwner::Job.owns(a)
-                            && !known.contains(a.exec_id.as_str())
-                    });
-                    if just_pulled {
-                        info!(
-                            job = %job_name, reason = ?reason,
-                            "delete deferred: fresh attempt evidence shows a \
-                             just-pulled covering attempt (live_051(e)); \
-                             re-decided next tick"
-                        );
-                        *attempts = fresh;
-                        return Ok(SynthesizedDelete::Deferred {
-                            fresh_attempt: true,
-                        });
-                    }
-                }
-                *attempts = fresh;
-            }
+            Ok(resp) => attempts.refresh(AttemptsViewWitness::minted_now(resp.into_inner())),
             Err(e) => {
                 warn!(
                     job = %job_name, reason = ?reason, error = %e,
@@ -972,8 +1037,25 @@ pub(super) async fn delete_job_with_synthesized_report(
             }
         }
     }
+    // bug_080: the just-pulled veto is a DELTA against the DECIDING
+    // view, evaluated for EVERY job in the wave — a covering attempt
+    // pulled after selection defers this delete no matter which
+    // iteration's staleness (if any) tripped the refetch.
+    if let Some(intent) = job_intent_id(job).filter(|i| !i.is_empty())
+        && attempts.just_pulled_since_deciding(intent)
+    {
+        info!(
+            job = %job_name, reason = ?reason,
+            "delete deferred: fresh attempt evidence shows a \
+             just-pulled covering attempt (live_051(e)); \
+             re-decided next tick"
+        );
+        return Ok(SynthesizedDelete::Deferred {
+            fresh_attempt: true,
+        });
+    }
     let mut synthesized = SynthesizedDelete::NoOpenAttempt;
-    if let Some(request) = synthesized_report_for_job(job, reason, attempts.attempts()) {
+    if let Some(request) = synthesized_report_for_job(job, reason, attempts.freshest().attempts()) {
         synthesized = SynthesizedDelete::ReportFailed;
         let exec_id = request.exec_id.clone();
         let intent_id = request.intent_id.clone();
@@ -1045,39 +1127,6 @@ pub(super) async fn delete_job_with_synthesized_report(
         }
     }
     jobs_api.delete(job_name, params).await.map(|_| synthesized)
-}
-
-/// Best-effort read of the FULL pull-mode attempt view (open attempts
-/// AND the `recently_closed` window) for the C1/C2 reap paths. Empty
-/// view when unavailable this tick — callers proceed with the plain
-/// delete; the establishment sweep is the fallback classifier.
-/// merged_bug_080(2b): the `recently_closed` half was previously
-/// discarded here, so the reap's death classification could not see
-/// that a worker-closed death was already adjudicated — return the
-/// whole response so the classification consults both halves. The
-/// orphan-Running reap (C3) does NOT use this: its read is fail-closed
-/// (`reap_orphan_running` skips the whole reap on error) because there
-/// the view is a busy-signal input, not just attribution.
-pub(super) async fn open_attempts_best_effort(
-    ctx: &Ctx,
-    pool: &str,
-) -> rio_proto::types::ListOpenAttemptsResponse {
-    match admin_call(
-        ctx.admin
-            .clone()
-            .list_open_attempts(rio_proto::types::ListOpenAttemptsRequest {}),
-    )
-    .await
-    {
-        Ok(resp) => resp.into_inner(),
-        Err(e) => {
-            debug!(
-                pool, error = %e,
-                "ListOpenAttempts unavailable; deleting without synthesized reports this tick"
-            );
-            rio_proto::types::ListOpenAttemptsResponse::default()
-        }
-    }
 }
 
 /// `creation_timestamp` strictly before `now - min_age`. `None` →
@@ -1246,8 +1295,11 @@ pub(super) async fn reap_orphan_running(
         );
         return 0;
     }
-    let mut attempts_view = AttemptsViewWitness::minted_now(resp);
-    let orphans = select_orphan_running(jobs, reaped, attempts_view.attempts(), grace);
+    // bug_080: the pair is minted AT SELECTION — `select_orphan_running`
+    // runs against the deciding view; every delete below vetoes
+    // against that same view even after a mid-wave refresh.
+    let mut attempts_view = AttemptsPair::at_selection(AttemptsViewWitness::minted_now(resp));
+    let orphans = select_orphan_running(jobs, reaped, attempts_view.freshest().attempts(), grace);
     if orphans.is_empty() {
         return 0;
     }
@@ -1470,7 +1522,10 @@ pub(super) async fn cancel_closed_attempt_jobs(
             return 0;
         }
     };
-    let mut attempts_view = AttemptsViewWitness::minted_now(resp);
+    // bug_080: pair minted AT SELECTION — `select_closed_attempt_jobs`
+    // runs against the deciding view; the cancel wave's deletes veto
+    // against that same view even after a mid-wave refresh.
+    let mut attempts_view = AttemptsPair::at_selection(AttemptsViewWitness::minted_now(resp));
     // bug_028 futility breaker reset lane: an open BUILD pull-mode
     // attempt is the ledger's word that the pull ESTABLISHED — a
     // named resolution for any verdict-free-respawn record this pool
@@ -1481,7 +1536,7 @@ pub(super) async fn cancel_closed_attempt_jobs(
     // r[impl ctrl.pool.respawn-backoff+2]
     {
         let mut streaks = ctx.exhausted_streak.lock();
-        for a in attempts_view.attempts() {
+        for a in attempts_view.freshest().attempts() {
             if let Some(witness) = super::candidate::VerdictWitness::from_open_build_attempt(a) {
                 streaks.note_resolution(key, &a.intent_id, witness, std::time::Instant::now());
             }
@@ -1496,7 +1551,7 @@ pub(super) async fn cancel_closed_attempt_jobs(
         // `MintedPullIdentity`'s UNSPECIFIED-reads-as-Build report
         // posture — RULED S2-OQ4; see both sites before "fixing"
         // either to match the other).
-        for c in attempts_view.recently_closed() {
+        for c in attempts_view.freshest().recently_closed() {
             if let Some(witness) = super::candidate::VerdictWitness::from_recently_closed_build(c) {
                 streaks.note_resolution(key, &c.intent_id, witness, std::time::Instant::now());
             }
@@ -1504,8 +1559,8 @@ pub(super) async fn cancel_closed_attempt_jobs(
     }
     let to_cancel: Vec<&Job> = select_closed_attempt_jobs(
         &active,
-        attempts_view.attempts(),
-        attempts_view.recently_closed(),
+        attempts_view.freshest().attempts(),
+        attempts_view.freshest().recently_closed(),
     );
     let mut cancelled = 0u32;
     for job in to_cancel {

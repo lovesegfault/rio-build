@@ -1318,7 +1318,7 @@ pub(super) async fn reap_stale_for_intents(
     // refuses to adjudicate on stale evidence and refreshes the
     // witness in place, so the gate below always folds the same
     // evidence the delete consumed.
-    let mut attempts_view: Option<super::job::AttemptsViewWitness> = None;
+    let mut attempts_view: Option<super::job::AttemptsPair> = None;
     let mut struck_this_tick: HashSet<String> = HashSet::new();
     for j in existing {
         let Some(jn) = j.metadata.name.as_deref() else {
@@ -1383,8 +1383,18 @@ pub(super) async fn reap_stale_for_intents(
         let view = match &mut attempts_view {
             Some(v) => v,
             None => {
-                attempts_view = Some(super::job::AttemptsViewWitness::fetch(ctx, pool).await);
-                attempts_view.as_mut().expect("just set")
+                // merged_bug_022: a FAILED lazy fetch defers every
+                // remaining attempt-affecting delete this tick — no
+                // NoOpenAttempt deletes, no backoff tax, from an
+                // error-born empty view. Strikes recorded above stay
+                // monotone via struck_this_tick; next tick re-decides.
+                match super::job::AttemptsViewWitness::fetch(ctx, pool).await {
+                    super::job::AttemptsFetch::Fetched(w) => {
+                        attempts_view = Some(super::job::AttemptsPair::at_selection(w));
+                        attempts_view.as_mut().expect("just set")
+                    }
+                    super::job::AttemptsFetch::FetchFailed => break,
+                }
             }
         };
         match super::job::delete_job_with_synthesized_report(
@@ -1453,7 +1463,8 @@ pub(super) async fn reap_stale_for_intents(
                     // (refreshed in place on staleness).
                     let gate_view = attempts_view
                         .as_ref()
-                        .expect("witness minted before any delete");
+                        .expect("witness minted before any delete")
+                        .freshest();
                     let covered_by_build = gate_view
                         .attempts()
                         .iter()

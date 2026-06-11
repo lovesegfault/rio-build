@@ -229,7 +229,9 @@ async fn reap_excess_pending_deletes_oldest_and_counts() {
     let _g = metrics::set_default_local_recorder(&recorder);
 
     let (client, verifier) = ApiServerVerifier::new();
-    let ctx = super::test_ctx(client.clone());
+    // merged_bug_022: deletes now require a SUCCESSFUL view fetch (a
+    // genuinely-empty ledger), never an error-born empty view.
+    let (ctx, _mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
     let jobs_api: Api<Job> = Api::namespaced(client.clone(), "rio");
     let pods_api: Api<Pod> = Api::namespaced(client, "rio");
 
@@ -315,7 +317,9 @@ async fn reap_excess_pending_deletes_oldest_and_counts() {
 #[tokio::test]
 async fn reap_stale_for_intents_selector_drift_and_terminal() {
     let (client, verifier) = ApiServerVerifier::new();
-    let ctx = super::test_ctx(client.clone());
+    // merged_bug_022: deletes now require a SUCCESSFUL view fetch (a
+    // genuinely-empty ledger), never an error-born empty view.
+    let (ctx, _mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
     let jobs_api: Api<Job> = Api::namespaced(client, "rio");
 
     fn job(name: &str, sel: Option<&str>, ready: i32, succeeded: i32) -> Job {
@@ -468,7 +472,9 @@ async fn reap_stale_for_intents_selector_drift_and_terminal() {
 #[tokio::test]
 async fn reap_stale_at_ceiling_saturation() {
     let (client, verifier) = ApiServerVerifier::new();
-    let ctx = super::test_ctx(client.clone());
+    // merged_bug_022: deletes now require a SUCCESSFUL view fetch (a
+    // genuinely-empty ledger), never an error-born empty view.
+    let (ctx, _mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
     let jobs_api: Api<Job> = Api::namespaced(client, "rio");
 
     let drifted = |name: &str| Job {
@@ -764,7 +770,9 @@ async fn reap_excess_pending_noop_when_covered_or_unknown() {
 #[tokio::test]
 async fn reap_excess_pending_skips_live_running_pod() {
     let (client, verifier) = ApiServerVerifier::new();
-    let ctx = super::test_ctx(client.clone());
+    // merged_bug_022: deletes now require a SUCCESSFUL view fetch (a
+    // genuinely-empty ledger), never an error-born empty view.
+    let (ctx, _mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
     let jobs_api: Api<Job> = Api::namespaced(client.clone(), "rio");
     let pods_api: Api<Pod> = Api::namespaced(client, "rio");
 
@@ -867,7 +875,9 @@ fn headroom_recompute_never_exceeds_ceiling() {
 #[tokio::test]
 async fn reap_stale_for_intents_reaps_orphan_pending() {
     let (client, verifier) = ApiServerVerifier::new();
-    let ctx = super::test_ctx(client.clone());
+    // merged_bug_022: deletes now require a SUCCESSFUL view fetch (a
+    // genuinely-empty ledger), never an error-born empty view.
+    let (ctx, _mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
     let jobs_api: Api<Job> = Api::namespaced(client, "rio");
 
     let intent = |id: &str| SpawnIntent {
@@ -949,12 +959,14 @@ async fn reap_stale_for_intents_reaps_orphan_pending() {
 /// sole mint; the freshness arm is exercised via `backdate_for_test`).
 fn fresh_witness(
     attempts: Vec<rio_proto::types::OpenAttempt>,
-) -> crate::reconcilers::pool::job::AttemptsViewWitness {
-    crate::reconcilers::pool::job::AttemptsViewWitness::minted_now(
-        rio_proto::types::ListOpenAttemptsResponse {
-            attempts,
-            ..Default::default()
-        },
+) -> crate::reconcilers::pool::job::AttemptsPair {
+    crate::reconcilers::pool::job::AttemptsPair::at_selection(
+        crate::reconcilers::pool::job::AttemptsViewWitness::minted_now(
+            rio_proto::types::ListOpenAttemptsResponse {
+                attempts,
+                ..Default::default()
+            },
+        ),
     )
 }
 
@@ -1071,74 +1083,150 @@ pub(super) async fn ctx_with_mock_admin(
     (super::test_ctx_with_admin(client, channel), mock, handle)
 }
 
-// r[verify ctrl.job.synthesize-on-delete+3]
-/// live_051(e) R1: an attempt opened AFTER the deciding view's fetch
-/// SURVIVES the reap wave. PROPOSITION CERTIFIED (structural — the
-/// production reap chokepoint, operation counts, no wall-clock): with
-/// a STALE deciding view that predates the pull and fresh scheduler
-/// evidence showing the just-pulled covering attempt, the delete is
-/// Deferred{fresh_attempt:true}, the Job stands (ZERO apiserver
-/// delete), and ZERO Reaped synthesis is sent. The harness
-/// interleaves the attempt open between the view fetch and the
-/// delete: the witness is minted over the pre-pull view and aged
-/// past ATTEMPTS_VIEW_FRESHNESS (backdate_for_test — the
-/// force_expire-precedent seam); the mock scheduler's live ledger
-/// carries the attempt the pull just opened.
+// r[verify ctrl.job.synthesize-on-delete+4]
+/// W9-AO (multi-job wave): job k != trigger must also veto
+/// against the DECIDING view. Pre-fix: j1's stale-age refetch resets
+/// the witness age and replaces the view, so j2's delete skips the
+/// veto entirely and synthesizes Reaped for j2's LIVE attempt (the
+/// 169-Reaped/543-wave shape relocated to sibling iterations).
 #[tokio::test]
-async fn just_pulled_attempt_survives_the_reap_wave() {
-    let recorder = rio_test_support::metrics::CountingRecorder::default();
-    let _g = metrics::set_default_local_recorder(&recorder);
-
+async fn w9_ao_every_job_in_the_wave_vetoes_against_the_deciding_view() {
     let (client, verifier) = ApiServerVerifier::new();
     let (ctx, mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
     let jobs_api: Api<Job> = Api::namespaced(client, "rio");
 
-    let job = terminal_job_for_intent("rio-builder-p-race1", "drv-race-1");
-    // The deciding view: fetched BEFORE the pull — no attempt for the
-    // intent — and the wave has run long (stale by the time this
-    // Job's delete fires).
+    let j1 = terminal_job_for_intent("rio-builder-p-w1", "drv-w-1");
+    let j2 = terminal_job_for_intent("rio-builder-p-w2", "drv-w-2");
+    // The deciding view: EMPTY (both selections premised
+    // non-coverage), and the wave has run long.
     let mut witness = fresh_witness(vec![]);
     witness.backdate_for_test(std::time::Duration::from_secs(3));
-    // The pull lands in the window: the scheduler's live ledger now
-    // shows the covering attempt.
-    mock.open_attempts.write().unwrap().attempts =
-        vec![pull_attempt("drv-race-1", "exec-race-1", "node-a")];
+    // BOTH pulls land during the wave: the live ledger now covers
+    // both intents.
+    mock.open_attempts.write().unwrap().attempts = vec![
+        pull_attempt("drv-w-1", "exec-w-1", "node-a"),
+        pull_attempt("drv-w-2", "exec-w-2", "node-b"),
+    ];
 
-    // ZERO apiserver scenarios: a deferred delete issues NO delete.
+    // ZERO apiserver scenarios: EVERY delete in the wave must defer.
     let guard = verifier.run(vec![]);
-    let outcome = crate::reconcilers::pool::job::delete_job_with_synthesized_report(
+    let o1 = crate::reconcilers::pool::job::delete_job_with_synthesized_report(
         &jobs_api,
         &ctx,
-        &job,
-        "rio-builder-p-race1",
+        &j1,
+        "rio-builder-p-w1",
         &DeleteParams::foreground(),
         AttemptTerminalReason::Reaped,
         &mut witness,
         &pkey(),
     )
     .await
-    .expect("a deferred delete is Ok, never an apiserver error");
-    guard.verified().await;
-
+    .expect("deferred delete is Ok");
     assert_eq!(
-        outcome,
+        o1,
         crate::reconcilers::pool::job::SynthesizedDelete::Deferred {
             fresh_attempt: true
         },
-        "left: the Job deleted with the attempt closed charge-free as \
-         Reaped ~200ms after open (live: the synthesized report named \
-         it; client-visible cancelled — here the stale view predates \
-         the pull, so the pre-fix observable is the PLAIN delete \
-         destroying the just-pulled round-trip) / right: delete \
-         Deferred; the attempt survives"
+        "the refresh-tripping job's veto (the wave-8-covered face)"
+    );
+    let o2 = crate::reconcilers::pool::job::delete_job_with_synthesized_report(
+        &jobs_api,
+        &ctx,
+        &j2,
+        "rio-builder-p-w2",
+        &DeleteParams::foreground(),
+        AttemptTerminalReason::Reaped,
+        &mut witness,
+        &pkey(),
+    )
+    .await
+    .expect("deferred delete is Ok");
+    guard.verified().await;
+    assert_eq!(
+        o2,
+        crate::reconcilers::pool::job::SynthesizedDelete::Deferred {
+            fresh_attempt: true
+        },
+        "left: j2 deleted with its just-pulled attempt closed as Reaped \
+         (the rolling witness contains it, so the veto never fires for \
+         k != trigger) / right: every job's veto evaluates against the \
+         deciding view and j2 survives"
     );
     assert!(
         mock.outcome_calls.read().unwrap().is_empty(),
-        "zero Reaped synthesis for the just-pulled attempt"
+        "zero Reaped synthesis anywhere in the wave: {:?}",
+        mock.outcome_calls.read().unwrap()
     );
 }
 
-// r[verify ctrl.job.synthesize-on-delete+3]
+// r[verify ctrl.job.synthesize-on-delete+4]
+/// W9-AP: a FAILED ListOpenAttempts defers ALL adjudication — no
+/// deletes-as-NoOpenAttempt, no verdict-free-death backoff tax. The
+/// fixture drives a REAL RPC failure through the production adapter
+/// (the ctx admin channel points at an unreachable address), the
+/// exact failover-churn population: pre-fix the error became a
+/// maximally-fresh EMPTY witness and a strike-2 wave deleted every
+/// job as NoOpenAttempt while taxing every intent's respawn.
+#[tokio::test]
+async fn w9_ap_failed_listing_defers_all_adjudication() {
+    let (client, verifier) = ApiServerVerifier::new();
+    // The production adapter against a dead endpoint: every
+    // ListOpenAttempts RPC genuinely fails (no fault-injection lane).
+    let ctx = super::test_ctx(client.clone());
+    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+
+    // A terminal Job for a still-wanted intent: the attempt-affecting
+    // arm with the two-tick strike.
+    let j = terminal_job_for_intent("rio-builder-p-ap1", "drv-ap-1");
+    let intents = vec![SpawnIntent {
+        intent_id: "drv-ap-1".into(),
+        ..Default::default()
+    }];
+
+    // Tick 1: strike 1 recorded, defers before any fetch.
+    let guard = verifier.run(vec![]);
+    let reaped = reap_stale_for_intents(
+        &jobs_api,
+        std::slice::from_ref(&j),
+        &intents,
+        &ctx,
+        "p",
+        ExecutorKind::Builder,
+        &pkey(),
+    )
+    .await;
+    assert!(reaped.is_empty(), "strike 1 defers");
+
+    // Tick 2: strike 2 → the wave reaches the lazy fetch → the fetch
+    // FAILS → every remaining delete defers. Zero apiserver deletes.
+    let reaped = reap_stale_for_intents(
+        &jobs_api,
+        std::slice::from_ref(&j),
+        &intents,
+        &ctx,
+        "p",
+        ExecutorKind::Builder,
+        &pkey(),
+    )
+    .await;
+    guard.verified().await;
+    assert!(
+        reaped.is_empty(),
+        "a failed listing must not delete as NoOpenAttempt"
+    );
+    // No backoff tax: the intent's respawn is NOT blocked (the
+    // verdict-free-death lane never stepped — there was no delete).
+    assert!(
+        !ctx.exhausted_streak.lock().respawn_blocked(
+            &pkey(),
+            "drv-ap-1",
+            std::time::Instant::now()
+        ),
+        "no verdict-free-death tax from an error-born view"
+    );
+}
+
+// r[verify ctrl.job.synthesize-on-delete+4]
 /// live_051(e) R1b — the live casualty shape, at the production reap
 /// conduit: a JUST-pulled attempt (open in the scheduler ledger when
 /// the wave's lazy view is fetched) is NOT closed charge-free as
@@ -1188,7 +1276,7 @@ async fn first_tick_reap_never_synthesizes_for_a_live_attempt() {
     );
 }
 
-// r[verify ctrl.job.synthesize-on-delete+3]
+// r[verify ctrl.job.synthesize-on-delete+4]
 /// live_051(e) R2 — DISCLOSED expectation flip (the strike law; never
 /// claimed as a red): a genuinely attempt-less stale Job reaps on the
 /// SECOND consecutive strike with its synthesized-report machinery
@@ -1261,7 +1349,7 @@ async fn attemptless_stale_job_reaps_on_the_second_strike() {
     );
 }
 
-// r[verify ctrl.job.synthesize-on-delete+3]
+// r[verify ctrl.job.synthesize-on-delete+4]
 /// The pure synthesize decision: `Some` exactly when an open pull-mode
 /// attempt covers the Job (so a no-attempt delete attempts no RPC by
 /// construction), carrying the attempt's exec_id / intent and the
@@ -1324,7 +1412,7 @@ fn synthesized_report_decision_pull_only() {
     );
 }
 
-// r[verify ctrl.job.synthesize-on-delete+3]
+// r[verify ctrl.job.synthesize-on-delete+4]
 /// bug_071 (preserving merged_bug_298's INTENT — never close an
 /// attempt you don't own — under producible shapes): with the minted
 /// identity alphabet, a Job delete binds the BUILD pull attempt for
@@ -1377,7 +1465,7 @@ mod minted_identity_props {
     }
 
     proptest! {
-        // r[verify ctrl.job.synthesize-on-delete+3]
+        // r[verify ctrl.job.synthesize-on-delete+4]
         /// bug_071 closure-set law: the classifier is TOTAL over
         /// arbitrary (executor_id, intent_id, kind) triples and never
         /// panics; `Build` holds ONLY under shape∧kind agreement;
@@ -1427,7 +1515,7 @@ mod minted_identity_props {
     }
 }
 
-// r[verify ctrl.job.synthesize-on-delete+3]
+// r[verify ctrl.job.synthesize-on-delete+4]
 /// Deleting a Job that still has an open pull-mode attempt synthesizes
 /// the `ReportAttemptOutcome` (observed via the OA1 histogram sample
 /// the helper records only after the report is ACKED) and still issues
@@ -1470,7 +1558,7 @@ async fn delete_job_synthesizes_report_for_open_pull_attempt() {
     );
 }
 
-// r[verify ctrl.job.synthesize-on-delete+3]
+// r[verify ctrl.job.synthesize-on-delete+4]
 /// Deleting a Job with NO covering open pull-mode attempt (here: a
 /// stream Job mid-build — the pull-filtered view never lists stream
 /// attempts) attempts no `ReportAttemptOutcome` at all: with a working
@@ -1511,7 +1599,7 @@ async fn delete_job_without_open_attempt_attempts_no_rpc() {
     );
 }
 
-// r[verify ctrl.job.synthesize-on-delete+3]
+// r[verify ctrl.job.synthesize-on-delete+4]
 /// The synthesis is best-effort: with the admin channel dead, the
 /// foreground DELETE still goes out and the helper returns the delete
 /// result (the establishment sweep is the fallback classifier).
