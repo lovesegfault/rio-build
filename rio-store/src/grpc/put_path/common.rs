@@ -156,9 +156,16 @@ impl StoreServiceImpl {
 /// and bare-await while it is `None` — waiters park free; holders
 /// expire (the substitute-plane discipline, verbatim).
 pub(in crate::grpc) struct NarIngestHold<'a> {
-    /// Granted budget permits. Private: see the type doc — bare
-    /// awaits while holding must not typecheck outside this module.
+    /// Granted budget permits (TRAILER mode: the delivery-priced
+    /// per-chunk grants). Private: see the type doc — bare awaits
+    /// while holding must not typecheck outside this module.
     permits: Vec<tokio::sync::SemaphorePermit<'a>>,
+    /// The DECLARED-mode single-shot acquisition: permits fused to
+    /// the tenant's cost-axis charge (merged_bug_005 — see
+    /// [`crate::budget::DeclaredCharge`]). Exactly one of
+    /// `permits`/`declared_charge` is populated per mode; dropping
+    /// the hold releases either through its own RAII.
+    _declared_charge: Option<crate::budget::DeclaredCharge>,
     /// THE one hold envelope, armed at the first grant.
     envelope: crate::substitute::NarHoldEnvelope,
     /// Envelope knobs (carried for [`Self::tighten_for_tail`]'s
@@ -175,6 +182,7 @@ impl<'a> NarIngestHold<'a> {
     ) -> Self {
         Self {
             permits: vec![first_permit],
+            _declared_charge: None,
             envelope: crate::substitute::NarHoldEnvelope::for_ingest_cap(
                 cfg.hold_stall_window,
                 cfg.hold_floor_rate,
@@ -185,22 +193,25 @@ impl<'a> NarIngestHold<'a> {
 
     // r[impl store.put.declared-reserve]
     /// The DECLARED-mode hold (N1): the whole charge was granted in
-    /// ONE pre-stream acquisition, so the envelope arms on the
-    /// `declared`-byte basis (the substitute leg's
+    /// ONE pre-stream acquisition — fused to the tenant's cost-axis
+    /// charge by [`crate::budget::DeclaredCharge`] (merged_bug_005)
+    /// — so the envelope arms on the `declared`-byte basis (the
+    /// substitute leg's
     /// [`crate::substitute::NarHoldEnvelope::for_declared`] form) —
     /// tighter than the ingest-cap basis whenever declared < cap,
     /// and exact from the first byte. Everything else COMPOSES with
-    /// the trailer-mode law unchanged: same private permits, same
-    /// [`Self::bounded`] combinator, same monotone
+    /// the trailer-mode law unchanged: same private permit storage,
+    /// same [`Self::bounded`] combinator, same monotone
     /// [`Self::tighten_for_tail`]; [`Self::push`] is simply never
     /// called (there are no later grants to join).
     pub(in crate::grpc) fn arm_declared(
-        whole_permit: tokio::sync::SemaphorePermit<'a>,
+        whole_charge: crate::budget::DeclaredCharge,
         declared: u64,
         cfg: NarIngestEnvelopeCfg,
     ) -> Self {
         Self {
-            permits: vec![whole_permit],
+            permits: Vec::new(),
+            _declared_charge: Some(whole_charge),
             envelope: crate::substitute::NarHoldEnvelope::for_declared(
                 declared,
                 cfg.hold_stall_window,
@@ -705,40 +716,72 @@ impl StoreServiceImpl {
     }
 
     // r[impl store.put.declared-reserve]
+    // r[impl store.budget.cost-axis]
     /// N1 declared-mode reservation: the WHOLE charge in ONE
     /// pre-stream acquisition — the ingest twin of the substitute
-    /// leg's `NarBudgetReservation::reserve` (park free, THEN hold).
+    /// leg's `NarBudgetReservation::reserve` (park free, THEN hold),
+    /// and since merged_bug_005's close the SAME constructor: both
+    /// declaration-priced modes acquire via
+    /// [`crate::budget::DeclaredCharge::new`], whose signature
+    /// REQUIRES the cost axis — `charge_tenant`'s aggregate
+    /// outstanding declared charge is capped at
+    /// [`crate::budget::TENANT_RESERVATION_CAP`] and an over-cap
+    /// caller REFUSES typed (`ResourceExhausted`, retryable), never
+    /// queues. Wave-9 shipped this fn as the bare sibling (whole
+    /// wire-supplied charge, no ledger consult): eight ~4 GiB
+    /// declarations from one worker pinned the full 32 GiB pool at
+    /// zero bandwidth for the whole hold envelope, renewable.
+    ///
     /// The acquiring task holds NOTHING while parked (zero permits,
     /// zero claim — the claim is taken before this call but carries
-    /// no budget), so the park is the lawful unbounded zero-holding
-    /// wait ("waiters park free; holders expire" — boundedness is the
-    /// FIFO induction over the envelope-bounded holders, not a
-    /// clock); the client's own RPC deadline bounds its patience,
-    /// exactly like the trailer path's pre-first-chunk stream read.
+    /// no budget), so the under-cap park is the lawful unbounded
+    /// zero-holding wait ("waiters park free; holders expire" —
+    /// boundedness is the FIFO induction over the envelope-bounded
+    /// holders, not a clock); the client's own RPC deadline bounds
+    /// its patience, exactly like the trailer path's pre-first-chunk
+    /// stream read. Parking is the POOL wait only — the tenant cap
+    /// refuses, never queues (the substitute plane's "Refusal, never
+    /// queueing" discipline, verbatim).
     ///
     /// `declared >= MAX_NAR_SIZE` refuses up front (which also makes
-    /// the u32 charge cast lossless — the substitute reserve's
-    /// defense-in-depth, verbatim). The floor mirrors the per-chunk
+    /// the u32 charge cast lossless). The floor mirrors the per-chunk
     /// charge floor so a 1-byte declared upload charges what its
     /// trailer-mode twin would.
     pub(in crate::grpc) async fn reserve_declared(
         &self,
         declared: u64,
+        charge_tenant: uuid::Uuid,
         ctx_label: &str,
     ) -> Result<NarIngestHold<'_>, Status> {
-        if declared >= MAX_NAR_SIZE {
-            return Err(Status::invalid_argument(format!(
-                "{ctx_label}: declared_nar_size {declared} exceeds size bound {MAX_NAR_SIZE}"
-            )));
-        }
-        let charge = declared.max(u64::from(rio_common::limits::MIN_NAR_CHUNK_CHARGE)) as u32;
-        let permit = self
-            .nar_bytes_budget
-            .acquire_many(charge)
-            .await
-            .map_err(|_| Status::resource_exhausted("NAR buffer budget closed"))?;
+        let charge = crate::budget::DeclaredCharge::new(
+            std::sync::Arc::clone(&self.nar_bytes_budget),
+            &self.tenant_ledger,
+            charge_tenant,
+            crate::budget::TENANT_RESERVATION_CAP,
+            declared,
+            || {},
+        )
+        .await
+        .map_err(|e| match e {
+            crate::budget::DeclaredRefusal::TooLarge { limit } => Status::invalid_argument(
+                format!("{ctx_label}: declared_nar_size {declared} exceeds size bound {limit}"),
+            ),
+            // The TenantBudgetExhausted mirror on the PutPath error
+            // surface: the same typed retryable class the upload
+            // plane already absorbs (the BUDGET_WAIT_GRACE shed
+            // precedent).
+            crate::budget::DeclaredRefusal::TenantBudgetExhausted { cap } => {
+                Status::resource_exhausted(format!(
+                    "{ctx_label}: tenant aggregate declared reservations reached \
+                     the {cap}-byte cap; retry once earlier uploads drain"
+                ))
+            }
+            crate::budget::DeclaredRefusal::BudgetClosed => {
+                Status::resource_exhausted("NAR buffer budget closed")
+            }
+        })?;
         Ok(NarIngestHold::arm_declared(
-            permit,
+            charge,
             declared,
             self.nar_ingest_envelope,
         ))
@@ -802,7 +845,18 @@ impl StoreServiceImpl {
         // keep the incremental path byte-for-byte.
         let mut hold: Option<NarIngestHold<'a>> = match declared {
             Some(d) => {
-                let h = self.reserve_declared(d, "PutPath").await?;
+                // The charge tenant derives from the HMAC-VERIFIED
+                // claims (scheduler-signed attribution), never the
+                // request body; unattributed authorities (dev mode,
+                // service bypass, tenant-less builder tokens) share
+                // the capped nil bucket (merged_bug_005's cost axis).
+                let h = self
+                    .reserve_declared(
+                        d,
+                        crate::budget::declared_charge_tenant(hmac_claims),
+                        "PutPath",
+                    )
+                    .await?;
                 // Capacity is budget-backed: the permits for `d`
                 // bytes are already held.
                 nar_data.reserve_exact(d as usize);
@@ -1293,6 +1347,7 @@ mod registration_writer_census {
         ("admission.rs", include_str!("../../admission.rs")),
         ("authz.rs", include_str!("../../authz.rs")),
         ("backend.rs", include_str!("../../backend.rs")),
+        ("budget.rs", include_str!("../../budget.rs")),
         ("cas.rs", include_str!("../../cas.rs")),
         ("chunker.rs", include_str!("../../chunker.rs")),
         ("config.rs", include_str!("../../config.rs")),
@@ -1488,6 +1543,127 @@ mod registration_writer_census {
             "the store realisation-INSERT census moved — identity rows \
              are written by the realisations.rs authority only; census \
              new writers here with their witness rationale"
+        );
+    }
+}
+
+// r[verify store.budget.cost-axis]
+#[cfg(test)]
+mod declared_budget_tests {
+    use super::*;
+
+    fn lazy_svc() -> StoreServiceImpl {
+        StoreServiceImpl::new(sqlx::PgPool::connect_lazy("postgres://unused").expect("lazy pool"))
+    }
+
+    /// W10-A (merged_bug_005): a single tenant's AGGREGATE declared
+    /// charges cannot exceed `TENANT_RESERVATION_CAP` — the law at
+    /// its own quantifier (aggregate, not per-charge). Pre-fix,
+    /// `reserve_declared` granted the whole wire-supplied size from
+    /// the shared pool with no ledger consult: eight (4 GiB − 1)
+    /// declarations from ONE caller pinned the full 32 GiB pool at
+    /// zero bandwidth (the red ran in the pre-fix one-arg form; this
+    /// is the same proposition at the post-fix signature). Post-fix:
+    /// charges 1–2 grant (the preserved two-max-closure warm),
+    /// charge 3+ refuses typed at the 8 GiB aggregate — even a
+    /// minimum-size declaration.
+    #[tokio::test]
+    async fn declared_reservations_charge_the_tenant_ledger() {
+        let svc = lazy_svc();
+        let tenant = uuid::Uuid::from_u128(0x51);
+        let big = rio_common::limits::MAX_NAR_SIZE - 1;
+        let mut holds = Vec::new();
+        let mut refusal = None;
+        for i in 0..8u32 {
+            match svc.reserve_declared(big, tenant, "W10-A").await {
+                Ok(h) => holds.push(h),
+                Err(e) => {
+                    refusal = Some((i, e));
+                    break;
+                }
+            }
+        }
+        let (at, e) = refusal.expect(
+            "W10-A RED: a single tenant pinned the whole pool — all 8 \
+             declaration-priced charges granted with no ledger consult",
+        );
+        assert_eq!(
+            at, 2,
+            "the third aggregate charge must be the refusal point \
+             (2 x (4GiB-1) holds the two-max-closure warm; +1 exceeds \
+             the 8 GiB cap)"
+        );
+        assert_eq!(
+            e.code(),
+            tonic::Code::ResourceExhausted,
+            "over-cap refusal is the typed retryable class, got {e:?}"
+        );
+        assert!(
+            e.message().contains("tenant"),
+            "the refusal names the cost axis (tenant aggregate), got: {}",
+            e.message()
+        );
+
+        // The aggregate quantifier: even a MINIMUM-size declaration
+        // refuses while the tenant sits at its cap — the per-charge
+        // axis cannot launder the cost axis.
+        let min_refused = svc.reserve_declared(1, tenant, "W10-A").await;
+        assert!(
+            min_refused.is_err_and(|e| e.code() == tonic::Code::ResourceExhausted),
+            "a min-size declaration must also refuse at the aggregate cap"
+        );
+
+        // The cap is PER-TENANT (the pool survives one tenant's cap):
+        // a different tenant's first charge grants immediately.
+        let other = uuid::Uuid::from_u128(0x52);
+        let other_hold = svc
+            .reserve_declared(big, other, "W10-A")
+            .await
+            .expect("a different tenant has its own headroom");
+        drop(other_hold);
+
+        // RAII release restores headroom: dropping one of the held
+        // reservations lets the refused tenant charge again.
+        drop(holds.pop());
+        let _re = svc
+            .reserve_declared(big, tenant, "W10-A")
+            .await
+            .expect("released charge restores tenant headroom");
+    }
+
+    /// The unattributed-bucket derivation (the cost axis is total
+    /// over authorities): no claims, tenant-less claims, and
+    /// malformed signed tenants all charge the capped nil bucket;
+    /// a well-formed signed tenant charges its own.
+    #[test]
+    fn declared_charge_tenant_derivation_is_total() {
+        use crate::budget::{UNATTRIBUTED_DECLARED_BUCKET, declared_charge_tenant};
+        assert_eq!(declared_charge_tenant(None), UNATTRIBUTED_DECLARED_BUCKET);
+        let mut claims = rio_auth::hmac::AssignmentClaims {
+            executor_id: "w".into(),
+            drv_hash: "d".into(),
+            expected_outputs: vec![],
+            is_ca: false,
+            expiry_unix: 0,
+            tenant: None,
+        };
+        assert_eq!(
+            declared_charge_tenant(Some(&claims)),
+            UNATTRIBUTED_DECLARED_BUCKET,
+            "tenant-less builder claims share the capped bucket"
+        );
+        claims.tenant = Some("not-a-uuid".into());
+        assert_eq!(
+            declared_charge_tenant(Some(&claims)),
+            UNATTRIBUTED_DECLARED_BUCKET,
+            "malformed signed attribution fails closed into the capped bucket"
+        );
+        let t = uuid::Uuid::from_u128(7);
+        claims.tenant = Some(t.to_string());
+        assert_eq!(
+            declared_charge_tenant(Some(&claims)),
+            t,
+            "the signed tenant is the charge authority"
         );
     }
 }

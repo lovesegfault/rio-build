@@ -13,15 +13,19 @@ rio-store/src/grpc/put_path/common.rs	.await
 rio-store/src/grpc/put_path/common.rs	.await
 rio-store/src/grpc/put_path/common.rs	.await
 rio-store/src/grpc/put_path/common.rs	.await
+rio-store/src/grpc/put_path/common.rs	.await
+rio-store/src/grpc/put_path/common.rs	.await
 rio-store/src/grpc/put_path/common.rs	.await?
+rio-store/src/grpc/put_path/common.rs	.await?;
 rio-store/src/grpc/put_path/common.rs	.await?;
 rio-store/src/grpc/put_path/common.rs	.await?;
 rio-store/src/grpc/put_path/common.rs	.await?;
 rio-store/src/grpc/put_path/common.rs	None => read.await,
 rio-store/src/grpc/put_path/common.rs	Some(h) => h.bounded("PutPath ingest", read).await?,
 rio-store/src/grpc/put_path/common.rs	if let Err(e) = insert_path_tenant_rows(pool, &[store_path_hash.to_vec()], tid).await {
-rio-store/src/grpc/put_path/common.rs	let h = self.reserve_declared(d, "PutPath").await?;
+rio-store/src/grpc/put_path/common.rs	let min_refused = svc.reserve_declared(1, tenant, "W10-A").await;
 rio-store/src/grpc/put_path/common.rs	let persisted = match tokio::time::timeout(envelope.remaining(), tail).await {
+rio-store/src/grpc/put_path/common.rs	match svc.reserve_declared(big, tenant, "W10-A").await {
 rio-store/src/grpc/put_path/common.rs	match tokio::time::timeout(self.envelope.remaining(), fut).await {
 rio-store/src/grpc/put_path/common.rs	match tokio::time::timeout(self.nar_ingest_envelope.budget_wait_grace, acquire).await {
 rio-store/src/grpc/put_path/common.rs	self.abort_upload(&info.store_path_hash, claim).await;

@@ -238,6 +238,14 @@ pub struct StoreServiceImpl {
     /// Vec, which is the OOM vector: 10 × 4 GiB = 40 GiB RSS.
     // r[impl store.put.nar-bytes-budget+6]
     nar_bytes_budget: Arc<tokio::sync::Semaphore>,
+    /// Cost-axis accounting for DECLARED-mode reservations against
+    /// `nar_bytes_budget` (merged_bug_005): consulted by the one
+    /// `DeclaredCharge` constructor so a single tenant's aggregate
+    /// declared charge is capped at `crate::budget::
+    /// TENANT_RESERVATION_CAP` — trailer mode stays delivery-priced
+    /// and outside it.
+    // r[impl store.budget.cost-axis]
+    tenant_ledger: crate::budget::TenantReservationLedger,
     /// Typed envelope knobs for the ingest plane's budget waits and
     /// holds ([`NarIngestEnvelopeCfg`]) — wait grace at the
     /// `accumulate_chunk` chokepoint, hold envelope over stream
@@ -301,6 +309,12 @@ pub(crate) const DEFAULT_NAR_BUDGET: usize =
 // validate() floor `nar_buffer_budget_bytes >= MAX_NAR_SIZE`.
 const _: () = assert!(MAX_NAR_SIZE as usize <= DEFAULT_NAR_BUDGET);
 
+// The declared-mode tenant cap sits below this plane's default pool
+// (so the cap — not the pool — is the binding constraint for one
+// tenant; merged_bug_005). The substitute plane pins the same
+// relation against its own pool const.
+const _: () = assert!(crate::budget::TENANT_RESERVATION_CAP as usize <= DEFAULT_NAR_BUDGET);
+
 /// Witness: this request is NOT an end-user tenant session — the
 /// deny-tenants polarity check passed (`reject_end_user_tenant`).
 /// The builder-internal batch data fetches REQUIRE one, so the
@@ -340,6 +354,7 @@ impl StoreServiceImpl {
             service_verifier: None,
             service_bypass_callers: vec!["rio-gateway".to_string(), "rio-scheduler".to_string()],
             nar_bytes_budget: Arc::new(tokio::sync::Semaphore::new(DEFAULT_NAR_BUDGET)),
+            tenant_ledger: crate::budget::TenantReservationLedger::default(),
             nar_ingest_envelope: NarIngestEnvelopeCfg::default(),
             substituter: None,
             chunk_upload_max_concurrent: cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,

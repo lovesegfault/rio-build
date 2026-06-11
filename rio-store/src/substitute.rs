@@ -18,7 +18,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Semaphore;
 
 use bytes::Bytes;
 use moka::future::Cache;
@@ -33,7 +33,6 @@ use rio_proto::validated::ValidatedPathInfo;
 
 use rio_common::limits::{
     MAX_CACHE_INFO_BYTES, MAX_NAR_SIZE, MAX_NARINFO_BYTES, MAX_REFERENCES, MAX_SIGNATURES,
-    MIN_NAR_CHUNK_CHARGE,
 };
 
 use crate::admission::{AdmissionError, AdmissionGate};
@@ -787,86 +786,23 @@ pub(crate) const NAR_HOLD_GRACE_FACTOR: u32 = 5;
 // cuts integral slowness.
 const _: () = assert!(NAR_HOLD_GRACE_FACTOR >= 2);
 
-/// Per-tenant cap on AGGREGATE outstanding reservation charge — the
-/// COST axis of the budget law (merged_bug_021's blast radius; R17
-/// all-axes). Substitution charge is DECLARATION-priced (a hostile
-/// upstream's lies are free), unlike PutPath's delivery-priced
-/// incremental charge — so without this cap one tenant's upstream
-/// could pin the whole pool by declaration alone (8 legs × ~4 GiB
-/// against the 32 GiB default). `2 × MAX_NAR_SIZE` (8 GiB = ¼ of the
-/// default pool): ≥ 4 tenants must collude to fill the pool by
-/// declaration, while a single tenant's parallel warm of two max-size
-/// closures is preserved. Refusal, never queueing: over-cap returns
-/// the typed [`SubstituteError::TenantBudgetExhausted`] (retryable —
-/// the executor's existing retry machinery absorbs it); a tenant-axis
-/// queue would mint new lock-order proof obligations for zero
-/// benefit. Violable per R17 via
-/// [`Substituter::with_tenant_reservation_cap`].
-pub(crate) const TENANT_RESERVATION_CAP: u64 = 2 * MAX_NAR_SIZE;
+// The cost-axis family (TENANT_RESERVATION_CAP, the tenant ledger,
+// and the DeclaredCharge constructor) is HOISTED to the shared
+// store-crate home `crate::budget` (merged_bug_005): PutPath's
+// declared mode is the SAME declaration-priced shape as this plane's
+// reserve and consults the SAME law through the one constructor —
+// the pre-hoist comparative prose here ("unlike PutPath's
+// delivery-priced incremental charge") was falsified by wave-9's
+// `reserve_declared`, which acquired by declaration with no ledger
+// consult. PutPath's TRAILER mode remains the delivery-priced
+// incremental charge, by design outside the declared cap.
+pub(crate) use crate::budget::{TENANT_RESERVATION_CAP, TenantReservationLedger};
 
-// The cap admits at least one whole-NAR reservation (so a single
-// honest tenant is never structurally refused), and sits below the
-// default pool (so the cap is the binding constraint for one tenant).
-const _: () = assert!(TENANT_RESERVATION_CAP >= MAX_NAR_SIZE);
+// The cap sits below this plane's default pool (so the cap — not the
+// pool — is the binding constraint for one tenant). The cap's own
+// floor relation (`>= MAX_NAR_SIZE`) is pinned beside its definition
+// in `crate::budget`.
 const _: () = assert!(TENANT_RESERVATION_CAP as usize <= DEFAULT_SUBSTITUTE_NAR_BUDGET);
-
-// r[impl store.put.nar-bytes-budget+6]
-/// Tenant-keyed outstanding reservation charge — the cost-axis
-/// accounting behind [`TENANT_RESERVATION_CAP`]. Consulted inside
-/// [`NarBudgetReservation::reserve`] BEFORE the semaphore park (a
-/// refused tenant never queues, so the wait edge gains no new
-/// population); released when the reservation drops (the
-/// [`TenantChargeGuard`] rides the reservation, so every abort path —
-/// completion, deadline expiry, cancellation — releases through the
-/// ONE `Drop` impl).
-#[derive(Debug, Clone, Default)]
-pub(crate) struct TenantReservationLedger {
-    outstanding: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, u64>>>,
-}
-
-impl TenantReservationLedger {
-    /// Charge `charge` against `tenant_id`'s outstanding total, or
-    /// refuse typed if the aggregate would exceed `cap`. The critical
-    /// section is sync and await-free.
-    pub(crate) fn checked_charge(
-        &self,
-        tenant_id: Uuid,
-        charge: u64,
-        cap: u64,
-    ) -> Result<TenantChargeGuard, SubstituteError> {
-        let mut map = self.outstanding.lock().expect("ledger lock poisoned");
-        let entry = map.entry(tenant_id).or_insert(0);
-        if entry.saturating_add(charge) > cap {
-            return Err(SubstituteError::TenantBudgetExhausted { cap });
-        }
-        *entry += charge;
-        Ok(TenantChargeGuard {
-            outstanding: Arc::clone(&self.outstanding),
-            tenant_id,
-            charge,
-        })
-    }
-}
-
-/// RAII release of one tenant charge — see [`TenantReservationLedger`].
-#[derive(Debug)]
-pub(crate) struct TenantChargeGuard {
-    outstanding: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, u64>>>,
-    tenant_id: Uuid,
-    charge: u64,
-}
-
-impl Drop for TenantChargeGuard {
-    fn drop(&mut self) {
-        let mut map = self.outstanding.lock().expect("ledger lock poisoned");
-        if let Some(e) = map.get_mut(&self.tenant_id) {
-            *e = e.saturating_sub(self.charge);
-            if *e == 0 {
-                map.remove(&self.tenant_id);
-            }
-        }
-    }
-}
 
 // r[impl store.put.nar-hold-envelope+2]
 /// The typed, violable transfer-deadline envelope every NAR-budget
@@ -1020,19 +956,20 @@ impl NarHoldEnvelope {
 /// guard).
 #[derive(Debug)]
 pub(crate) struct NarBudgetReservation {
-    /// `reserve` permits in one `OwnedSemaphorePermit` (acquired via
-    /// `acquire_many_owned`); credited back on drop.
-    _permits: OwnedSemaphorePermit,
+    /// The fused declaration-priced acquisition: permits + the
+    /// tenant's cost-axis charge in ONE RAII value (the shared
+    /// [`crate::budget::DeclaredCharge`] constructor — merged_bug_005:
+    /// both reservation modes construct it, so a declaration-priced
+    /// consumer without the cost axis does not typecheck). Dropping
+    /// credits the semaphore back AND restores the tenant's headroom
+    /// on every abort path — completion, deadline expiry,
+    /// cancellation.
+    _charge: crate::budget::DeclaredCharge,
     /// The typed hold envelope, armed at permit grant. Carried so the
     /// read loop and the post-read tail derive every clock from ONE
     /// deadline (`remaining()`), and so the type system makes an
     /// unenveloped hold unwritable.
     envelope: NarHoldEnvelope,
-    /// The tenant's cost-axis charge (WO-S1-2b): released by the same
-    /// drop that credits the semaphore back, so EVERY abort path —
-    /// completion, deadline expiry, cancellation — restores the
-    /// tenant's headroom through the one `Drop` impl.
-    _tenant_charge: TenantChargeGuard,
 }
 
 impl NarBudgetReservation {
@@ -1058,30 +995,43 @@ impl NarBudgetReservation {
         envelope: NarHoldEnvelope,
         progress_handle: Option<&ingest::ProgressHandle>,
     ) -> Result<Self, SubstituteError> {
-        // Defense in depth: the declared-size gate already rejected
-        // `>= MAX_NAR_SIZE` (which also makes the u32 cast lossless).
-        if declared >= MAX_NAR_SIZE {
-            return Err(SubstituteError::TooLarge {
+        // ONE constructor for both declaration-priced modes
+        // (merged_bug_005): size bound, charge floor, ledger consult
+        // (BEFORE the park — a refused tenant never queues), and the
+        // single-shot acquire all live in `DeclaredCharge::new`; this
+        // plane only maps the typed refusals onto its own alphabet
+        // and stamps the progress phases around the park.
+        let charge = crate::budget::DeclaredCharge::new(
+            budget,
+            ledger,
+            tenant_id,
+            tenant_cap,
+            declared,
+            || {
+                if let Some(h) = progress_handle {
+                    h.set_phase(ingest::ClaimPhase::BudgetParked);
+                }
+            },
+        )
+        .await
+        .map_err(|e| match e {
+            crate::budget::DeclaredRefusal::TooLarge { limit } => SubstituteError::TooLarge {
                 what: "NarSize",
-                limit: MAX_NAR_SIZE,
-            });
-        }
-        let charge = declared.max(MIN_NAR_CHUNK_CHARGE as u64) as u32;
-        let tenant_charge = ledger.checked_charge(tenant_id, charge as u64, tenant_cap)?;
-        if let Some(h) = progress_handle {
-            h.set_phase(ingest::ClaimPhase::BudgetParked);
-        }
-        let permits = budget
-            .acquire_many_owned(charge)
-            .await
-            .map_err(|_| SubstituteError::Fetch("NAR buffer budget closed".into()))?;
+                limit,
+            },
+            crate::budget::DeclaredRefusal::TenantBudgetExhausted { cap } => {
+                SubstituteError::TenantBudgetExhausted { cap }
+            }
+            crate::budget::DeclaredRefusal::BudgetClosed => {
+                SubstituteError::Fetch("NAR buffer budget closed".into())
+            }
+        })?;
         if let Some(h) = progress_handle {
             h.set_phase(ingest::ClaimPhase::Downloading);
         }
         Ok(Self {
-            _permits: permits,
+            _charge: charge,
             envelope: envelope.arm(),
-            _tenant_charge: tenant_charge,
         })
     }
 
@@ -3379,6 +3329,7 @@ mod tests {
     use super::*;
     use crate::signing::Signer;
     use crate::test_helpers::seed_tenant;
+    use rio_common::limits::MIN_NAR_CHUNK_CHARGE;
     use rio_nix::narinfo::fingerprint;
     use rio_test_support::TestDb;
     use std::net::SocketAddr;
@@ -7343,6 +7294,7 @@ mod tests {
         ("admission.rs", include_str!("admission.rs")),
         ("authz.rs", include_str!("authz.rs")),
         ("backend.rs", include_str!("backend.rs")),
+        ("budget.rs", include_str!("budget.rs")),
         ("cas.rs", include_str!("cas.rs")),
         ("chunker.rs", include_str!("chunker.rs")),
         ("config.rs", include_str!("config.rs")),
@@ -7570,22 +7522,24 @@ mod tests {
         // any drift in either direction fails with the live counts.
         const EXPECTED: &[(&str, &str, usize, &str)] = &[
             (
-                "substitute.rs",
+                "budget.rs",
                 "acquire_many_owned",
                 1,
-                "NAR budget — THE whole-NAR reservation (reserve; typed \
-                 zero-holding park, envelope demanded at the constructor)",
+                "NAR budget — THE declaration-priced acquisition \
+                 (DeclaredCharge::new, merged_bug_005): the ONE constructor \
+                 both reservation modes (substitute reserve + PutPath \
+                 reserve_declared) call; cost axis (tenant, ledger, cap) \
+                 REQUIRED by the signature before the zero-holding park",
             ),
             (
                 "grpc/put_path/common.rs",
                 "acquire_many",
-                2,
-                "NAR budget — the TWO ingest regimes' chokepoints: \
-                 accumulate_chunk (trailer mode, per-chunk, \
-                 BUDGET_WAIT_GRACE-timed grant-or-typed-shed) + \
-                 reserve_declared (declared mode, whole-charge single-shot \
-                 pre-stream; zero-holding park, the substitute reserve's \
-                 posture — store.put.declared-reserve)",
+                1,
+                "NAR budget — the trailer-mode delivery-priced chokepoint: \
+                 accumulate_chunk (per-chunk, BUDGET_WAIT_GRACE-timed \
+                 grant-or-typed-shed). reserve_declared no longer acquires \
+                 directly — it constructs budget.rs's DeclaredCharge \
+                 (store.put.declared-reserve, store.budget.cost-axis)",
             ),
             (
                 "admission.rs",
