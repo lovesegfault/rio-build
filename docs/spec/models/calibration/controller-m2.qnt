@@ -36,7 +36,9 @@ module m2CalibNoConsolidatePrune {
     ENABLE_EVIDENCE_BUFFER = false,
     ENABLE_ACK_LATCH = false,
     ENABLE_SNAPSHOT_MACHINERY = false,
-    ENABLE_SNAPSHOT_PRESENCE = false
+    ENABLE_SNAPSHOT_PRESENCE = false,
+    ENABLE_DEFER_MACHINERY = false,
+    ENABLE_DEFER_DEMAND = false
   ).* from "../nodeclaimLifecycle"
 
   /// The as-built consolidate-only tick with the inflight_created prune
@@ -91,6 +93,7 @@ module m2CalibNoConsolidatePrune {
         edgeClearDone' = edgeClearDone,
         pendingClear' = pendingClear,
         schedBinding' = schedBinding,
+        deferredCells' = deferredCells,
         effects' = Set()
           .union(if (idleReaped.size() > 0) Set(EIdleReap, EConsolidateOnlyReap) else Set())
           .union(if (stuckReaped.size() > 0) Set(EStuckReap, EConsolidateOnlyReap) else Set())
@@ -140,13 +143,13 @@ module m2CalibNoConsolidatePrune {
   run m2NoConsolidatePruneRun =
     init
       .then(ceilingsLoad)
-      .then(tickFullWith(false, false, false, 1, 0, Set()))
+      .then(tickFullWith(false, false, false, 1, 0, Set(), Set()))
       .then(claimRegisters("c1"))
       .then(tickBotEarly)
       .then(tickConsolidateOnlyNoPruneWith(false))
       .then(tickConsolidateOnlyNoPruneWith(false))
       .then(finalizerCompletes("c1"))
-      .then(tickFullWith(false, false, false, 0, 0, Set()))
+      .then(tickFullWith(false, false, false, 0, 0, Set(), Set()))
       .expect(violations.contains(VSpuriousMark))
 }
 
@@ -181,7 +184,9 @@ module m2CalibInflightDropOnSight {
     ENABLE_EVIDENCE_BUFFER = false,
     ENABLE_ACK_LATCH = false,
     ENABLE_SNAPSHOT_MACHINERY = false,
-    ENABLE_SNAPSHOT_PRESENCE = false
+    ENABLE_SNAPSHOT_PRESENCE = false,
+    ENABLE_DEFER_MACHINERY = false,
+    ENABLE_DEFER_DEMAND = false
   ).* from "../nodeclaimLifecycle"
 
   /// The structural conservation property the KEEP arm protects. Scoped
@@ -328,6 +333,7 @@ module m2CalibInflightDropOnSight {
         edgeClearDone' = edgeClearDone,
         pendingClear' = pendingClear,
         schedBinding' = schedBinding,
+        deferredCells' = deferredCells,
         effects' = Set(EPublished)
           .union(if (createdA + createdB > 0) Set(ECreateOk) else Set())
           .union(if (createAttempted and createFails) Set(ECreateFailed) else Set())

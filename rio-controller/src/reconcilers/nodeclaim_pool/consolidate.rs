@@ -724,7 +724,8 @@ mod tests {
         assert_eq!(
             e_fitting_cores(&[], &[d(4), d(8), d(12)], 8), // 12 doesn't fit
             6.0,
-            "deferred intents join the fitting population (pre-fix:              0.0 — remaindered cells read zero demand)"
+            "deferred intents join the fitting population (pre-fix: 0.0 — \
+             remaindered cells read zero demand)"
         );
         // Mixed: placeable {4} + deferred {8} on a 8c node → mean 6.
         let p = |c: u32| {

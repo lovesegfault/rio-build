@@ -275,7 +275,8 @@ type PlaceableSet = Option<Arc<PlacedTick>>;
 /// set persists for the duration. That staleness is benign by
 /// construction: the only consumer (`pool/jobs::reconcile`) fetches
 /// its own intent list from the SAME scheduler before calling
-/// [`PlaceableGate::retain`], so when the producer is in
+/// [`PlaceableGate::snapshot`] (the `pool/jobs` gate fold), so when
+/// the producer is in
 /// `consolidate_only` the consumer has `intents=[]` and
 /// `scheduler_err.is_some()` — the stale set has nothing to filter and
 /// `queued_known=None` keeps `reap_excess_pending` fail-closed. The

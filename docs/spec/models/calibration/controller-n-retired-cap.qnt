@@ -41,7 +41,9 @@ module nCalibRetiredCap {
     ENABLE_EVIDENCE_BUFFER = false,
     ENABLE_ACK_LATCH = false,
     ENABLE_SNAPSHOT_MACHINERY = false,
-    ENABLE_SNAPSHOT_PRESENCE = false
+    ENABLE_SNAPSHOT_PRESENCE = false,
+    ENABLE_DEFER_MACHINERY = false,
+    ENABLE_DEFER_DEMAND = false
   ).* from "../nodeclaimLifecycle"
 
   /// The as-built full tick with ONE change: the mint relation
@@ -181,6 +183,7 @@ module nCalibRetiredCap {
         edgeClearDone' = edgeClearDone,
         pendingClear' = pendingClear,
         schedBinding' = schedBinding,
+        deferredCells' = deferredCells,
         effects' = Set(EPublished)
           .union(if (createdA + createdB > 0) Set(ECreateOk) else Set())
           .union(if (createAttempted and createFails) Set(ECreateFailed) else Set())

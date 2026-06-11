@@ -35,7 +35,9 @@ module m34CalibLatchClearOnAttempt {
     ENABLE_EVIDENCE_BUFFER = false,
     ENABLE_ACK_LATCH = false,
     ENABLE_SNAPSHOT_MACHINERY = false,
-    ENABLE_SNAPSHOT_PRESENCE = false
+    ENABLE_SNAPSHOT_PRESENCE = false,
+    ENABLE_DEFER_MACHINERY = false,
+    ENABLE_DEFER_DEMAND = false
   ).* from "../nodeclaimLifecycle"
 
   /// The as-built full tick with TWO coupled changes that are one pre-fix
@@ -178,6 +180,7 @@ module m34CalibLatchClearOnAttempt {
         edgeClearDone' = edgeClearDone,
         pendingClear' = pendingClear,
         schedBinding' = schedBinding,
+        deferredCells' = deferredCells,
         effects' = Set(EPublished)
           .union(if (createdA + createdB > 0) Set(ECreateOk) else Set())
           .union(if (createAttempted and createFails) Set(ECreateFailed) else Set())
@@ -270,7 +273,9 @@ module m34CalibNoRecencyGate {
     ENABLE_EVIDENCE_BUFFER = false,
     ENABLE_ACK_LATCH = false,
     ENABLE_SNAPSHOT_MACHINERY = false,
-    ENABLE_SNAPSHOT_PRESENCE = false
+    ENABLE_SNAPSHOT_PRESENCE = false,
+    ENABLE_DEFER_MACHINERY = false,
+    ENABLE_DEFER_DEMAND = false
   ).* from "../nodeclaimLifecycle"
 
   /// PRE-FIX observe_registered: every unrecorded Registered claim emits
@@ -424,6 +429,7 @@ module m34CalibNoRecencyGate {
         edgeClearDone' = edgeClearDone,
         pendingClear' = pendingClear,
         schedBinding' = schedBinding,
+        deferredCells' = deferredCells,
         effects' = Set(EPublished)
           .union(if (createdA + createdB > 0) Set(ECreateOk) else Set())
           .union(if (createAttempted and createFails) Set(ECreateFailed) else Set())

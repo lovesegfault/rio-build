@@ -388,7 +388,7 @@ async fn main() -> anyhow::Result<()> {
         // shutdown). `spawn_monitored` so a PG outage at boot doesn't
         // block `tokio::join!` below — the Pool/ComponentScaler
         // reconcilers run with the gate UNARMED
-        // (`PlaceableGate::retain` returns false → fail-closed) until
+        // (`PlaceableGate::snapshot` reads None → fail-closed) until
         // PG connects and the reconciler publishes. Named `async fn`
         // (not an `async move` block) because of rustc's HRTB Send
         // check on nested `async ||` borrows — see `run_nodeclaim_pool`
