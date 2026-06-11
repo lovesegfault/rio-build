@@ -8,6 +8,7 @@
     "rio-common": "rio-common",
     "rio-controller": "rio-controller",
     "rio-crds": "rio-crds",
+    "rio-evalstore": "rio-evalstore",
     "rio-gateway": "rio-gateway",
     "rio-lease": "rio-lease",
     "rio-migrations": "rio-migrations",
@@ -19915,6 +19916,70 @@
       ],
       "libCrateTypes": [
         "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
+      ]
+    },
+    "rio-evalstore": {
+      "crateName": "rio-evalstore",
+      "version": "0.1.0",
+      "edition": "2024",
+      "source": {
+        "type": "local",
+        "path": "rio-evalstore"
+      },
+      "dependencies": [
+        {
+          "name": "blake3",
+          "packageId": "blake3"
+        },
+        {
+          "name": "hex",
+          "packageId": "hex"
+        },
+        {
+          "name": "libc",
+          "packageId": "libc"
+        },
+        {
+          "name": "rio-nix",
+          "packageId": "rio-nix"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "serde_json",
+          "packageId": "serde_json"
+        },
+        {
+          "name": "sha2",
+          "packageId": "sha2 0.11.0"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror"
+        },
+        {
+          "name": "workspace-hack",
+          "packageId": "workspace-hack"
+        }
+      ],
+      "devDependencies": [
+        {
+          "name": "anyhow",
+          "packageId": "anyhow"
+        },
+        {
+          "name": "tempfile",
+          "packageId": "tempfile"
+        }
+      ],
+      "libCrateTypes": [
+        "staticlib",
+        "rlib"
       ],
       "authors": [
         "Rio Contributors"

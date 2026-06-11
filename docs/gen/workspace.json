@@ -17,6 +17,10 @@
       "description": "Kubernetes operator for rio-build: Pool, ComponentScaler CRDs"
     },
     {
+      "name": "rio-evalstore",
+      "description": "Client-side eval store: persistent CAS backing the rio:// nix store plugin (ADR-024 M0)"
+    },
+    {
       "name": "rio-gateway",
       "description": "SSH gateway and Nix protocol frontend for rio-build"
     },
@@ -115,6 +119,13 @@
     },
     "rio-crds": {
       "prod": [],
+      "optional": [],
+      "dev": []
+    },
+    "rio-evalstore": {
+      "prod": [
+        "rio-nix"
+      ],
       "optional": [],
       "dev": []
     },
