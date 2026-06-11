@@ -83,41 +83,58 @@ fn compute_local_nar_hash(path: &Path, algo: FodHashAlgo) -> anyhow::Result<Vec<
 /// fetcher pods sized at `LOCAL_MEM_BYTES` ≈ 2 GiB; a `fs::read` here
 /// would OOM the pod after the download already succeeded.
 ///
-/// Opens with `O_NOFOLLOW|O_NONBLOCK` and rejects non-regular files: a
-/// malicious build could leave a symlink at the output path pointing at
-/// an arbitrary host file whose contents hash to the declared
-/// outputHash (buildah CVE-2024-1753 class) — verification would then
-/// attest content the build never produced — or plant a FIFO that a
-/// blocking open would sleep on forever.
-fn compute_local_flat_hash(path: &Path, algo: FodHashAlgo) -> anyhow::Result<Vec<u8>> {
-    fn with<D: sha2::Digest>(path: &Path) -> anyhow::Result<Vec<u8>> {
+/// Opens `rel` (the output's store basename) relative to an
+/// `upper_store` directory fd via `openat2(RESOLVE_BENEATH |
+/// RESOLVE_NO_SYMLINKS)` and rejects non-regular files: a malicious
+/// build could leave a symlink at the output path — or at any parent
+/// component it controls — pointing at an arbitrary host file whose
+/// contents hash to the declared outputHash (buildah CVE-2024-1753
+/// class); verification would then attest content the build never
+/// produced. The kernel guarantees resolution never follows a symlink
+/// in ANY component (`RESOLVE_NO_SYMLINKS`, including the final one)
+/// and never escapes `upper_store` via `..` (`RESOLVE_BENEATH`) —
+/// strictly stronger than the previous final-component-only
+/// `O_NOFOLLOW`. Linux-only, like the rest of the builder (FUSE +
+/// io_uring).
+fn compute_local_flat_hash(
+    upper_store: &Path,
+    rel: &Path,
+    algo: FodHashAlgo,
+) -> anyhow::Result<Vec<u8>> {
+    fn with<D: sha2::Digest>(upper_store: &Path, rel: &Path) -> anyhow::Result<Vec<u8>> {
         use anyhow::{Context, bail};
-        use std::os::unix::fs::OpenOptionsExt;
-        // O_NOFOLLOW: open fails with ELOOP if the final component is
-        // a symlink — never hash through a build-written link.
-        // O_NONBLOCK: a blocking open of a build-planted FIFO with no
-        // writer sleeps forever; with O_NONBLOCK it returns at once and
-        // the fstat below rejects it (no effect on regular-file reads).
-        let mut f = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-            .open(path)
-            .with_context(|| {
-                format!(
-                    "failed to open FOD output {} (symlinks are rejected)",
-                    path.display()
-                )
-            })?;
+        use nix::fcntl::{OFlag, OpenHow, ResolveFlag, open, openat2};
+        use nix::sys::stat::Mode;
+
+        let display = upper_store.join(rel);
+        // The upper store dir itself is builder-owned (overlay upper),
+        // not build-writable — resolving it normally once is safe.
+        let dirfd = open(
+            upper_store,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .with_context(|| format!("failed to open upper store {}", upper_store.display()))?;
+        let how = OpenHow::new()
+            .flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC)
+            .resolve(ResolveFlag::RESOLVE_BENEATH | ResolveFlag::RESOLVE_NO_SYMLINKS);
+        let fd = openat2(&dirfd, rel, how).with_context(|| {
+            format!(
+                "failed to open FOD output {} (symlinks are rejected)",
+                display.display()
+            )
+        })?;
+        let mut f = std::fs::File::from(fd);
         // fstat the opened fd (not the path — no TOCTOU window) to
         // reject the remaining non-regular kinds (directory, FIFO,
         // device): flat hashing is only defined over regular files.
         let meta = f
             .metadata()
-            .with_context(|| format!("failed to stat FOD output {}", path.display()))?;
+            .with_context(|| format!("failed to stat FOD output {}", display.display()))?;
         if !meta.is_file() {
             bail!(
                 "FOD output {} is not a regular file ({:?})",
-                path.display(),
+                display.display(),
                 meta.file_type()
             );
         }
@@ -126,9 +143,9 @@ fn compute_local_flat_hash(path: &Path, algo: FodHashAlgo) -> anyhow::Result<Vec
         Ok(w.digest.finalize().to_vec())
     }
     match algo {
-        FodHashAlgo::Sha1 => with::<sha1::Sha1>(path),
-        FodHashAlgo::Sha256 => with::<sha2::Sha256>(path),
-        FodHashAlgo::Sha512 => with::<sha2::Sha512>(path),
+        FodHashAlgo::Sha1 => with::<sha1::Sha1>(upper_store, rel),
+        FodHashAlgo::Sha256 => with::<sha2::Sha256>(upper_store, rel),
+        FodHashAlgo::Sha512 => with::<sha2::Sha512>(upper_store, rel),
     }
 }
 
@@ -185,7 +202,9 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
             // Flat hash — stream file contents through a digest
             // sink. Same O(1)-memory contract as the recursive
             // branch above (see compute_local_flat_hash doc).
-            compute_local_flat_hash(&fs_path, algo)?
+            // Resolved relative to upper_store so the kernel-enforced
+            // RESOLVE_BENEATH/RESOLVE_NO_SYMLINKS guards apply.
+            compute_local_flat_hash(upper_store, Path::new(store_basename), algo)?
         };
 
         if computed != expected {
@@ -707,29 +726,43 @@ mod tests {
         Ok(())
     }
 
-    /// A FIFO at the output path must be rejected, not hung on:
-    /// `O_NOFOLLOW` does not exclude FIFOs, and a blocking `open(2)` of
-    /// a writer-less FIFO sleeps until a writer appears — a build could
-    /// wedge the verifier forever. `O_NONBLOCK` makes the open return
-    /// immediately so the fstat check can reject the FIFO.
+    /// A symlink at an INTERMEDIATE component of the output path
+    /// (`upper_store/sub` → outside dir, output at `upper_store/sub/out`)
+    /// must be rejected: `O_NOFOLLOW` only guards the FINAL component, so
+    /// a path-based open would happily resolve through `sub` and hash a
+    /// file outside the upper store. `openat2(RESOLVE_BENEATH |
+    /// RESOLVE_NO_SYMLINKS)` rejects symlinks in EVERY component by
+    /// kernel guarantee.
     #[test]
-    fn test_verify_fod_flat_fifo_rejected() -> anyhow::Result<()> {
+    fn test_flat_hash_rejects_intermediate_symlink() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
-        let store_dir = tmp.path().join("nix/store");
-        std::fs::create_dir_all(&store_dir)?;
-        nix::unistd::mkfifo(
-            &store_dir.join("test-flat-fifo"),
-            nix::sys::stat::Mode::from_bits_truncate(0o644),
-        )?;
+        let upper_store = tmp.path().join("upper/nix/store");
+        std::fs::create_dir_all(&upper_store)?;
+        // "Host" dir outside the upper store, with the real file.
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside)?;
+        std::fs::write(outside.join("out"), b"host data the build never produced")?;
+        // Build-written symlink at an intermediate component.
+        std::os::unix::fs::symlink(&outside, upper_store.join("sub"))?;
 
-        let declared = "00".repeat(32);
-        let drv = make_fod_drv("/nix/store/test-flat-fifo", "sha256", &declared);
-
-        let err = verify_fod_hashes(&drv, &store_dir)
-            .expect_err("flat FOD verification must reject a FIFO output");
+        // Red-proven on the O_NOFOLLOW-only code: a full-path open
+        // resolved through `sub` and returned Ok(hash of host data).
+        let res = compute_local_flat_hash(&upper_store, Path::new("sub/out"), FodHashAlgo::Sha256);
         assert!(
-            err.to_string().contains("not a regular file"),
-            "error should come from the fstat file-type check: {err:#}"
+            res.is_err(),
+            "flat hash must reject a symlink in an intermediate component, got {res:?}"
+        );
+
+        // `..` escape is likewise refused by RESOLVE_BENEATH (EXDEV),
+        // independent of any userspace name validation.
+        let res = compute_local_flat_hash(
+            &upper_store,
+            Path::new("../../outside/out"),
+            FodHashAlgo::Sha256,
+        );
+        assert!(
+            res.is_err(),
+            "flat hash must reject a `..` escape from the upper store, got {res:?}"
         );
         Ok(())
     }

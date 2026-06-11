@@ -8612,8 +8612,8 @@
           "packageId": "hex"
         },
         {
-          "name": "libc",
-          "packageId": "libc"
+          "name": "nix",
+          "packageId": "nix"
         },
         {
           "name": "serde_json",
