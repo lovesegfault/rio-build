@@ -34,9 +34,9 @@ The tree is immutable for the mount's lifetime, so the FUSE handler advertises i
 
 ### 2.1 Mount stack
 
-r[builder.fs.castore-stack]
+r[builder.fs.castore-stack+1]
 
-The build's `/nix/store` is a **single read-write overlayfs** with an SSD upper (build outputs land here) over one read-only lower: the castore-FUSE mount. Mount string: `overlay -o userxattr,upperdir=<ssd>/nix/store,workdir=<ssd>/work,lowerdir=<castore_mnt>`; the merged dir is bind-mounted at `/nix/store` inside the build's mount namespace. Upper/work dirs are local SSD (`r[builder.overlay.upper-not-overlayfs]`); outputs and the synthesized `db.sqlite` live under the upper root. This is the same overlay shape as the pre-ADR-022 mount — only the lower's granularity changed.
+The build's `/nix/store` is a **single read-write overlayfs** with an SSD upper (build outputs land here) over one read-only lower: the castore-FUSE mount. Mount string: `overlay -o nosuid,nodev,userxattr,upperdir=<ssd>/nix/store,workdir=<ssd>/work,lowerdir=<castore_mnt>`; the merged dir is bind-mounted at `/nix/store` inside the build's mount namespace. `nosuid,nodev` is mandatory: the upperdir holds whatever the build writes, and without `MS_NOSUID` a setuid binary dropped there would be honored through the merged view (a store never legitimately contains setuid files or device nodes). Upper/work dirs are local SSD (`r[builder.overlay.upper-not-overlayfs]`); outputs and the synthesized `db.sqlite` live under the upper root. This is the same overlay shape as the pre-ADR-022 mount — only the lower's granularity changed.
 
 | Syscall | Resolved by | FUSE upcalls |
 |---|---|---|

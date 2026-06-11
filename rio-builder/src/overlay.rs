@@ -33,7 +33,10 @@ use nix::mount::{MntFlags, MsFlags};
 /// setup failed" message.
 #[derive(Debug, thiserror::Error)]
 pub enum OverlayError {
-    #[error("invalid build_id {0:?}: must be non-empty and contain no '/' or NUL")]
+    #[error(
+        "invalid build_id {0:?}: must match ^[A-Za-z0-9_-]{{1,255}}$ \
+         (single path component, safe to embed in overlayfs mount_data)"
+    )]
     InvalidBuildId(String),
 
     #[error("failed to create directory {path}: {source}")]
@@ -83,6 +86,38 @@ pub enum OverlayError {
         #[source]
         source: nix::errno::Errno,
     },
+}
+
+/// Mount flags for the per-build overlay. The merged view's upperdir
+/// holds whatever the build writes — without MS_NOSUID a setuid binary
+/// dropped into the outputs would be honored through the merged mount
+/// (halfdog CVE-2016-1576 class); MS_NODEV likewise blocks device
+/// nodes. nix-daemon never needs suid or device nodes in a store.
+/// Mirrors `CASTORE_MOUNT_FLAGS` in `castore_fuse::mountd`, minus
+/// MS_RDONLY — the overlay must stay writable for outputs.
+const OVERLAY_MOUNT_FLAGS: MsFlags = MsFlags::MS_NOSUID.union(MsFlags::MS_NODEV);
+
+/// Maximum length of an overlay `build_id`: one directory component
+/// (NAME_MAX). Deliberately wider than mountd's `BUILD_ID_MAX_LEN`
+/// (64): the overlay id is the full `sanitize_build_id` hash+name
+/// form, which regularly exceeds 64 chars — see
+/// `executor::mountd_build_id` for why the two ids differ.
+const OVERLAY_BUILD_ID_MAX_LEN: usize = 255;
+
+/// `^[A-Za-z0-9_-]{1,255}$` — the same character class as
+/// `castore_fuse::mountd::validate_build_id`, with the length bound
+/// widened to NAME_MAX (see [`OVERLAY_BUILD_ID_MAX_LEN`]). The charset
+/// excludes `,` and `=` — `build_id` is embedded in the overlayfs
+/// `lowerdir=…,upperdir=…,workdir=…` mount_data string, where either
+/// byte would inject mount options (cr8escape CVE-2022-0811 class) —
+/// as well as `/`, `.` and NUL, so a validated id is a single,
+/// non-traversing path component.
+fn validate_overlay_build_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= OVERLAY_BUILD_ID_MAX_LEN
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// Shorthand: wrap `fs::create_dir_all` with path context.
@@ -221,7 +256,7 @@ pub fn setup_overlay(
     base_dir: &Path,
     build_id: &str,
 ) -> Result<OverlayMount, OverlayError> {
-    if build_id.is_empty() || build_id.contains('/') || build_id.contains('\0') {
+    if !validate_overlay_build_id(build_id) {
         return Err(OverlayError::InvalidBuildId(build_id.to_string()));
     }
 
@@ -324,7 +359,7 @@ pub fn setup_overlay(
     // userxattr switches overlayfs to user.overlay.* so opaque-dir /
     // copy-up bookkeeping works (the castore lower replies ENODATA to
     // every getxattr, which overlayfs treats as "no state"). Spec'd as
-    // part of the castore mount string (`r[builder.fs.castore-stack]`).
+    // part of the castore mount string (`r[builder.fs.castore-stack+1]`).
     let mount_data = format!(
         "userxattr,lowerdir={},upperdir={},workdir={}",
         lower.display(),
@@ -344,7 +379,7 @@ pub fn setup_overlay(
         Some("overlay"),
         &merged,
         Some("overlay"),
-        MsFlags::empty(),
+        OVERLAY_MOUNT_FLAGS,
         Some(mount_data.as_str()),
     )
     .map_err(|source| OverlayError::Mount { mount_data, source })?;
@@ -417,7 +452,24 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let lower = dir.path();
 
-        for bad in ["", "foo/bar", "foo\0bar"] {
+        let too_long = "a".repeat(256);
+        for bad in [
+            "",
+            "foo/bar",
+            "foo\0bar",
+            // overlayfs mount_data option/value separators (cr8escape
+            // CVE-2022-0811 class): a build_id containing `,` or `=`
+            // would inject mount options via the upperdir/workdir paths.
+            "foo,upperdir=x",
+            "foo=bar",
+            // path traversal
+            "foo/../x",
+            "..",
+            // outside the [A-Za-z0-9_-] charset
+            "foo.bar",
+            "foo bar",
+            too_long.as_str(),
+        ] {
             let Err(err) = setup_overlay(lower, dir.path(), bad) else {
                 panic!("expected InvalidBuildId for {bad:?}");
             };
@@ -426,7 +478,27 @@ mod tests {
                 "expected InvalidBuildId for {bad:?}, got {err:?}"
             );
         }
+        // Validation fires before mkdir/stat/mount — no fs side effects.
+        assert_eq!(
+            fs::read_dir(dir.path())?.count(),
+            0,
+            "rejected build_id must not create anything under base_dir"
+        );
         Ok(())
+    }
+
+    /// The mount(2) call itself needs CAP_SYS_ADMIN, so pin the flags
+    /// constant instead — mirrors the `CASTORE_MOUNT_FLAGS` test in
+    /// `castore_fuse::mountd`. The merged view's upperdir holds
+    /// build-written files; nosuid/nodev must neuter setuid binaries
+    /// and device nodes there (halfdog CVE-2016-1576 class).
+    #[test]
+    fn test_overlay_mount_flags_nosuid_nodev() {
+        assert!(OVERLAY_MOUNT_FLAGS.contains(MsFlags::MS_NOSUID));
+        assert!(OVERLAY_MOUNT_FLAGS.contains(MsFlags::MS_NODEV));
+        // Unlike the castore lower, the overlay must stay writable —
+        // build outputs land in the upperdir through the merged view.
+        assert!(!OVERLAY_MOUNT_FLAGS.contains(MsFlags::MS_RDONLY));
     }
 
     #[test]
