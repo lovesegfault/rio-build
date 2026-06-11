@@ -135,6 +135,9 @@ nix = { version = "0.31", features = [
   # fds + chunk-cache fds scale with max_backing_ids and overflow the
   # 1024 default soft limit.
   "resource",
+  # fd-based directory iteration (fdopendir) in the dirfd-relative NAR
+  # dump walk — rio-nix never re-resolves a path inside a dumped tree.
+  "dir",
 ] }
 # raw_os_error()/raise()/errno constants where the `nix` crate is
 # overkill. Used as a normal dep in rio-gateway (EMFILE/ENFILE accept
