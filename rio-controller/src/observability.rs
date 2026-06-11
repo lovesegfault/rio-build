@@ -45,6 +45,10 @@ pub const REAP_REASONS: &[&str] = &["ice", "boot-timeout", "dead", "vanished", "
 pub const INTENT_DROP_REASONS: &[&str] = &[
     "all_cells_ice_masked",
     "exceeds_cell_cap",
+    // merged_bug_013: the forecast half of the masked split — the
+    // ready lane alerts, this one observes (the witnessed-ready-bit
+    // keying keeps live_050(a)'s loud lane to solved waiting demand).
+    "forecast_all_cells_ice_masked",
     "no_hosting_class",
     "no_pool_covers",
     // live_050(a): the READY all-masked population (solved demand,

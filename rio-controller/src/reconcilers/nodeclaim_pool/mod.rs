@@ -2298,9 +2298,13 @@ impl NodeClaimPoolReconciler {
                 | cover::PlacementOutcome::UnknownUniverse { .. }
                 | cover::PlacementOutcome::DecodeRefused { .. } => {}
                 cover::PlacementOutcome::UnplaceableAllMasked { open_rungs: 0 } => {}
-                cover::PlacementOutcome::UnplaceableAllMasked { .. } => {
+                // merged_bug_013: the named-cells WARN input is the
+                // READY population only — keyed on the WITNESSED bit
+                // riding the record, never the open_rungs proxy.
+                cover::PlacementOutcome::UnplaceableAllMasked { .. } if i.ready.unwrap_or(true) => {
                     masked_ready.push((i.intent_id.as_str(), &i.hw_class_names));
                 }
+                cover::PlacementOutcome::UnplaceableAllMasked { .. } => {}
             }
         }
         emit_drop_tally(&dropped, &masked_ready, ice.len());
@@ -2558,6 +2562,23 @@ pub(crate) fn emit_drop_tally(
              `rio_controller_nodeclaim_reaped_total{{reason=~\"ice|vanished\"}}`; \
              configure a degradation ladder rung if one exists. \
              See sla-model.typ#rionodeclaimpool-icemaskedhigh"
+        );
+    }
+    if dropped.forecast_all_cells_ice_masked > 0 {
+        // merged_bug_013: the forecast-masked population — counted
+        // (operationally real: the cloud gap blocks the forecast lane
+        // too) but NOT page-worthy (no build waiting yet), so debug,
+        // not warn; the alert tier consumes the reason split.
+        metrics::counter!(
+            "rio_controller_nodeclaim_intent_dropped_total",
+            "reason" => "forecast_all_cells_ice_masked",
+        )
+        .increment(dropped.forecast_all_cells_ice_masked);
+        debug!(
+            dropped = dropped.forecast_all_cells_ice_masked,
+            "forecast SpawnIntents with every hosting cell ICE-masked \
+             (cloud capacity gap on the forecast lane; not yet \
+             waiting demand — the ready population alerts separately)"
         );
     }
     if dropped.over_cap > 0 {

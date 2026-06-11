@@ -318,12 +318,18 @@ pub fn describe_metrics() {
          structural (e.g. missing AWSServiceRoleForEC2Spot). Check \
          `nodeclaim_reaped_total{reason=~\"ice|vanished\"}` and Karpenter. \
          reason=ready_all_cells_ice_masked: the READY subset of the \
-         all-masked population (solved demand, named hosting classes, \
-         eta=0) — the silently-starved class the live_050 hang \
-         measured; same cloud-side causes and heal path as \
-         all_cells_ice_masked, but these intents have builds WAITING \
-         (alert-worthy at low thresholds; see the cover WARN naming \
-         the intents and classes). \
+         all-masked population (solved demand, named hosting classes — \
+         keyed on the record's witnessed ready bit) — the \
+         silently-starved class the live_050 hang measured; same \
+         cloud-side causes and heal path as all_cells_ice_masked, but \
+         these intents have builds WAITING (alert-worthy at low \
+         thresholds; see the cover WARN naming the intents and \
+         classes). \
+         reason=forecast_all_cells_ice_masked: the FORECAST half of \
+         the masked split (ready=false, in-window cells all masked) — \
+         operationally real but no build waits yet; observe, don't \
+         page (the split keeps the ready lane's alert calibration \
+         honest during routine ICE x forecast churn). \
          reason=exceeds_cell_cap: intent's pod footprint exceeds the assigned \
          cell's per-class catalog ceiling (or max_node_disk) — \
          the scheduler's ClassCeiling gate didn't reject it (GetHwClassConfig \

@@ -161,6 +161,16 @@ pub struct DropTally {
     /// degradation ladder (`ctrl.nodeclaim.capacity-ladder`) is the
     /// structural consumer that gives the walk a next rung.
     pub ready_all_cells_ice_masked: u64,
+    /// FORECAST intent (`ready=Some(false)`, in-window cells admitted
+    /// by `a_open`) with every hosting cell ICE-masked
+    /// (merged_bug_013): operationally real — the cloud gap also
+    /// blocks the forecast lane — but NOT page-worthy (no build is
+    /// waiting yet; the ETA may still be met once the mask clears).
+    /// Split from the ready lane by the WITNESSED ready bit riding the
+    /// record (never the `open_rungs` proxy, which admits in-window
+    /// forecast cells), so the live_050(a) alert lane measures only
+    /// solved waiting demand. The split is the alert tier's input.
+    pub forecast_all_cells_ice_masked: u64,
     /// Pod footprint exceeds the assigned cell's per-class cap —
     /// [`sizing`]'s over-cap partition, re-classified onto the alphabet
     /// (bug_026). The per-intent counter
@@ -283,20 +293,33 @@ impl DropTally {
     /// The single outcome→tally law: a total fold over the
     /// [`PlacementOutcome`] alphabet (zero wildcard arms — a new
     /// variant fails compilation here, forcing a visibility decision).
-    /// The ICE-masked split is population-keyed: `open_rungs == 0` ⇔
-    /// the cold-start fallback path (`all_cells_ice_masked`),
-    /// `open_rungs > 0` ⇔ the ready path (`ready_all_cells_ice_masked`
-    /// — the live_050(a) population).
+    /// The ICE-masked split is population-keyed THREE ways:
+    /// `open_rungs == 0` ⇔ the cold-start fallback path
+    /// (`all_cells_ice_masked`); `open_rungs > 0` splits on the
+    /// record's WITNESSED ready bit — ready ⇒
+    /// `ready_all_cells_ice_masked` (the live_050(a) population),
+    /// forecast ⇒ `forecast_all_cells_ice_masked` (merged_bug_013:
+    /// `a_open` admits in-window forecast cells, so the old
+    /// `open_rungs > 0` proxy inflated the loud lane during routine
+    /// ICE×forecast churn).
     pub fn from_outcomes(outcomes: &[PlacementRecord<'_>]) -> Self {
         let mut t = Self::default();
-        for (_, o) in outcomes {
+        for (i, o) in outcomes {
             match o {
                 PlacementOutcome::Placed(_) | PlacementOutcome::LeadTimeGated => {}
                 PlacementOutcome::UnplaceableAllMasked { open_rungs: 0 } => {
                     t.all_cells_ice_masked += 1;
                 }
-                PlacementOutcome::UnplaceableAllMasked { .. } => {
+                // merged_bug_013: the loud-lane split keys on the
+                // WITNESSED ready bit riding the record — `open_rungs`
+                // is a proxy (`a_open` admits in-window FORECAST
+                // cells, so `open_rungs > 0` does not witness
+                // readiness).
+                PlacementOutcome::UnplaceableAllMasked { .. } if i.ready.unwrap_or(true) => {
                     t.ready_all_cells_ice_masked += 1;
+                }
+                PlacementOutcome::UnplaceableAllMasked { .. } => {
+                    t.forecast_all_cells_ice_masked += 1;
                 }
                 PlacementOutcome::NoHostingClass => t.no_hosting_class += 1,
                 PlacementOutcome::OverCap { .. } => t.over_cap += 1,
@@ -2549,6 +2572,36 @@ mod tests {
         );
     }
 
+    // r[verify ctrl.nodeclaim.placement-outcome+1]
+    /// W9-BA (merged_bug_013): the loud-lane split keys on the
+    /// WITNESSED ready bit riding the record — not the open_rungs
+    /// proxy. Population: a mixed batch, both kinds (the fold's
+    /// quantifier).
+    #[test]
+    fn masked_tally_keys_on_the_witnessed_ready_bit() {
+        let ready = intent("r", 4, GI, &[("h", CapacityType::Spot)], Some(true));
+        let fcast = intent("f", 4, GI, &[("h", CapacityType::Spot)], Some(false));
+        let got = DropTally::from_outcomes(&[
+            (
+                &ready,
+                PlacementOutcome::UnplaceableAllMasked { open_rungs: 1 },
+            ),
+            (
+                &fcast,
+                PlacementOutcome::UnplaceableAllMasked { open_rungs: 1 },
+            ),
+        ]);
+        assert_eq!(
+            got.ready_all_cells_ice_masked, 1,
+            "exactly the READY record counts in the loud lane"
+        );
+        assert_eq!(
+            got.forecast_all_cells_ice_masked, 1,
+            "the forecast record takes its own tally letter (operationally \
+             real, not page-worthy — the alert-tier split input)"
+        );
+    }
+
     /// R15 census rows for the `PlacementOutcome` alphabet. The
     /// generator is rustc: the `witness` match below fails to compile
     /// when a variant is added, and the coverage pin asserts every
@@ -2599,8 +2652,24 @@ mod tests {
     /// quiet arms map to none.
     #[test]
     fn drop_tally_fold_census_over_the_outcome_alphabet() {
+        // merged_bug_013: the deciding READY axis is part of the
+        // product — masked rows are driven under BOTH probe readiness
+        // values (an enrolled census over a product missing a deciding
+        // axis was the lesson; the masked split is the axis here).
         let probe = intent("p", 4, GI, &[("h", CapacityType::Spot)], Some(true));
+        let probe_forecast = intent("pf", 4, GI, &[("h", CapacityType::Spot)], Some(false));
         for o in outcome_census_rows() {
+            let got_forecast = DropTally::from_outcomes(&[(&probe_forecast, o.clone())]);
+            let want_forecast = match &o {
+                PlacementOutcome::UnplaceableAllMasked { open_rungs } if *open_rungs > 0 => {
+                    DropTally {
+                        forecast_all_cells_ice_masked: 1,
+                        ..Default::default()
+                    }
+                }
+                other => DropTally::from_outcomes(&[(&probe, other.clone())]),
+            };
+            assert_eq!(got_forecast, want_forecast, "forecast-probe outcome {o:?}");
             let got = DropTally::from_outcomes(&[(&probe, o.clone())]);
             let want = match &o {
                 PlacementOutcome::Placed(_) | PlacementOutcome::LeadTimeGated => {
