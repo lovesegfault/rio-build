@@ -1508,21 +1508,30 @@ walk ORDER is derived from cost — capacity-major (the controller's
 name-hash disambiguator within a band, because the scheduler's seed
 prices are capacity-type-only (`seed_price`, sla/cost.rs) and
 `cell_rank` is generation-blind — a declared-order quantifier would be
-unwitnessed (no machinery executes it). Under the committed hi od-only
-posture the realized order is gen8:od → gen7:od for all four shipped
-pairs (hash-verified: `hash("hi-ebs-x86") ≈ 2.84e15` ranks before
-`hash("hi-ebs-x86-g7") ≈ 1.08e19`; same direction for the nvme/arm
-pairs) — capacity-major and generation-major coincide; the within-band
-order is tiebreak-determined and re-derives per name. Per-rung price
-posture: od rungs are a PRICED availability trade, signed by the
-directive; lead-time seeds exist for every pre-existing class×capacity
-row, and NEW rung classes carry PLACEHOLDER seeds derived from their
-gen-8 parents' od rows until `probe-boot` re-runs — the helm/18
-seed-coverage lint structurally refuses an unseeded cell, so the gap
-cannot ship silent (execution superseded the authoring-time
-"ride `defaultLeadTimeSeed`" line; divergence recorded). Rung-advance
-latency ≤ one IceBackoff step + one tick (the backoff ladder's own
-consts, sla/cost.rs cite-only).
+unwitnessed (no machinery executes it).
+// values-bound[infra/helm/rio-build/values.yaml: scheduler.sla.hwClasses
+// *.capacityTypes — this paragraph NARRATES committed chart state and
+// MUST be re-derived on ANY capacityTypes change (the bughunt-9 R23
+// supersession-qualifier form, bug_048: an earlier od-only narration
+// survived TWO same-wave posture flips because nothing bound it).]
+Under the SHIPPED posture — every class, metal included, declares
+`[spot, on-demand]` (the spot+od doctrine; its last divergence, the
+metal od-only carve-out, died with the owner-signed M1 verdict) — the
+realized walk for a laddered pair is capacity-major:
+gen8:spot → gen7:spot → gen8:od → gen7:od; capacity-major and
+generation-major do NOT coincide (the od band is the cross-generation
+failover tier, entered only when the whole spot plane carries ICE
+evidence). The within-band order is tiebreak-determined and re-derives
+per name. Per-rung price posture: od rungs are a PRICED availability
+trade, signed by the directive; metal's spot rungs additionally carry
+the M1 priced residual (interruption mid-VM-test wastes the build;
+relaunch latency worst-in-fleet — recorded in the values doctrine
+block, signed). Lead-time seeds exist for every class×capacity cell —
+the helm/18 seed-coverage lint structurally refuses an unseeded cell,
+so a capacity-axis extension cannot ship seedless (the M1 flip landed
+WITH its `metal-*:spot` rows; helm/43 pins the doctrine).
+Rung-advance latency ≤ one IceBackoff step + one tick (the backoff
+ladder's own consts, sla/cost.rs cite-only).
 
 #r("ctrl.nodeclaim.placeable-gate+5")[
   For Builder pools, the Pool reconciler creates Jobs only for intents the

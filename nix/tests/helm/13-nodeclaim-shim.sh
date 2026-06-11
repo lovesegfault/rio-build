@@ -56,7 +56,10 @@ if grep -qx rio-fetcher <<<"$all_pools"; then
 fi
 
 # §13c: rendered scheduler.toml has metal hwClasses with nodeClass
-# rio-metal, providesFeatures=[kvm], capacityTypes=[on-demand].
+# rio-metal, providesFeatures=[kvm], capacityTypes=[spot, on-demand]
+# (M1, owner-signed: metal joined the spot+od doctrine; the od-only
+# carve-out died with the bughunt-9 wave — see
+# 43-metal-capacity-doctrine.sh for the doctrine pin).
 sched_toml=$(yq -N 'select(.kind=="ConfigMap" and .metadata.name=="rio-scheduler-config")
                     | .data."scheduler.toml"' "$on")
 for h in metal-x86 metal-arm; do
@@ -74,8 +77,8 @@ for h in metal-x86 metal-arm; do
   # rendering shape check (a JSON array literal).
   echo "$block" | grep -q 'provides_features = \[.*"kvm".*\]' || {
     echo "FAIL: $h missing provides_features ⊇ [kvm]" >&2; exit 1; }
-  echo "$block" | grep -q 'capacity_types = \["on-demand"\]' || {
-    echo "FAIL: $h missing capacity_types=[on-demand]" >&2; exit 1; }
+  echo "$block" | grep -q 'capacity_types = \["spot","on-demand"\]' || {
+    echo "FAIL: $h missing capacity_types=[spot, on-demand] (M1)" >&2; exit 1; }
   echo "$block" | grep -q 'taints = \[' || {
     echo "FAIL: $h missing taints" >&2; exit 1; }
   echo "$block" | grep -q '"rio.build/kvm"' || {

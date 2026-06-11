@@ -889,10 +889,26 @@ scheduler:
       # full SLA-solve participation routed by `providesFeatures`.
       # BIOS-AMI partition (instance-size In/NotIn) keys on
       # `nodeClass: rio-metal` (cover.rs METAL_NODE_CLASS).
-      # On-demand only (`capacityTypes`): metal is expensive idle, spot
-      # interruption mid-VM-test wastes the whole build. The
-      # `rio.build/kvm` label is stamped onto the Node and matched by
-      # the per-intent pod nodeAffinity (r33 bug_002: pool-static
+      # M1 (owner, 2026-06-11, SIGNED): metal joins spot+od — the
+      # carve-out ("metal is expensive idle, spot interruption
+      # mid-VM-test wastes the whole build") was an interruption-
+      # economics judgment, NOT market absence: spot EXISTS for 21/21
+      # sampled admitted metal types in us-east-2 with live quotes in
+      # all three AZs at ~70% od discount (c6i.metal $1.18-1.57/hr vs
+      # od ≈$5.44). The owner attacked the carve-out; the doctrine
+      # ("ALL CLASSES spot+on-demand — spot if available, else od")
+      # now has zero divergences. PRICED RESIDUAL (recorded, signed —
+      # a capacity-cost posture, not a safety theorem): a spot
+      # interruption mid-VM-test wastes the whole build (no
+      # checkpoint), and metal relaunch latency is the worst in the
+      # fleet (7-15 min observed boot) — the ladder's od rung is the
+      # failover (vanish-as-ICE feeds the rung advance), so an
+      # interrupted build re-routes to od at one IceBackoff step +
+      # one tick, paying the od premium only while spot evidence
+      # stays red. nix/tests/helm/43-metal-capacity-doctrine.sh pins
+      # both metal classes to the doctrine.
+      # The `rio.build/kvm` label is stamped onto the Node and matched
+      # by the per-intent pod nodeAffinity (r33 bug_002: pool-static
       # nodeSelector deleted); the matching taint keeps non-kvm pods
       # off.
       metal-x86:
@@ -907,7 +923,8 @@ scheduler:
           # NO capacity-type requirement — D5 makes it structural via
           # capacityTypes (a requirement here would conflict with the
           # cell-derived `In [spot]` on a (metal, spot) cell → ICE loop).
-        capacityTypes: [on-demand]
+        # M1 (signed): spot+od — see the doctrine block above.
+        capacityTypes: [spot, on-demand]
         taints:
           - {key: rio.build/kvm, value: "true", effect: NoSchedule}
         # §13d (r30 bug_007): nixpkgs `nixosTest` derivations declare
@@ -933,7 +950,8 @@ scheduler:
           - {key: kubernetes.io/arch, operator: In, values: [arm64]}
           - {key: karpenter.k8s.aws/instance-category, operator: In, values: [c, m, r]}
           - {key: karpenter.k8s.aws/instance-generation, operator: Gt, values: ["5"]}
-        capacityTypes: [on-demand]
+        # M1 (signed): spot+od — see the doctrine block above.
+        capacityTypes: [spot, on-demand]
         taints:
           - {key: rio.build/kvm, value: "true", effect: NoSchedule}
         providesFeatures: [kvm, nixos-test]
@@ -1066,6 +1084,13 @@ scheduler:
       # vector when min > max). (bug_015, bug_001, r34 bug_017)
       "metal-arm:od": 600.0
       "metal-x86:od": 600.0
+      # M1: the spot cells join the ladder at the same maxLeadTime
+      # pin as the od rows (AWS .metal POST + firmware + kubelet boot
+      # dominates; market makes no boot-time difference) — re-run
+      # `xtask k8s probe-boot` to replace with observed seeds, same
+      # caveat as the od rows above.
+      "metal-arm:spot": 600.0
+      "metal-x86:spot": 600.0
       # §13e fetcher cells — placeholder pending `xtask k8s probe-boot`
       # re-run. `nodeClass: rio-default` (virtualized boot, ~18s real
       # like the lo-/mid-/hi- tiers); 30s gives `health::classify` a

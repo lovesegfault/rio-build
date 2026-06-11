@@ -3709,7 +3709,11 @@ mod tests {
             "lo-nvme-arm:on-demand",
             "lo-nvme-x86:spot",
             "lo-nvme-x86:on-demand",
+            // M1 (owner-signed, bughunt-9): metal joined spot+od —
+            // the spot cells entered the shipped universe.
+            "metal-arm:spot",
             "metal-arm:on-demand",
+            "metal-x86:spot",
             "metal-x86:on-demand",
             "mid-ebs-arm:spot",
             "mid-ebs-arm:on-demand",
