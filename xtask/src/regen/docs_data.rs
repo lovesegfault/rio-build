@@ -759,11 +759,30 @@ mod summary {
     /// cut`, in the test battery).
     pub(super) const ABBREVIATIONS: &[&str] = &["e.g.", "i.e.", "etc.", "cf.", "vs."];
 
-    /// THE sentence-terminal alphabet — single author (merged_bug_070):
-    /// the tokenizer's cut loop and the validator
-    /// [`ends_in_terminal_punctuation`] are both projections of this
-    /// one const, so a `.`-vs-`.!?` skew is unrepresentable.
+    /// THE sentence-boundary alphabet PAIR — single author
+    /// (merged_bug_070 for the terminals; merged_bug_041 for the
+    /// closers): the tokenizer's cut loop and the validator
+    /// [`ends_in_terminal_punctuation`] are both projections of BOTH
+    /// consts, so a skew on either axis — `.`-vs-`.!?` or a closer
+    /// the validator trims that the cutter cannot see past — is
+    /// unrepresentable. (Pre-merged_bug_041 only the terminal axis
+    /// was shared: the validator trimmed closers the cut loop did
+    /// not recognize, so a `."`-boundary first sentence was never
+    /// cut yet the un-cut blob still validated.)
     pub(super) const SENTENCE_TERMINALS: &[u8] = b".!?";
+
+    /// Closing quotes/brackets that may wrap a sentence terminal
+    /// (`."`, `.)`, `!"`, …). All ASCII — the cut loop consumes them
+    /// as bytes, the validator as chars, from this one author.
+    ///
+    /// The backtick is DELIBERATELY absent: backticks delimit inline
+    /// CODE, not quoted prose — a terminal inside a code span
+    /// (``describe_*!``, ``try?``) is code syntax, not sentence
+    /// punctuation, so neither the cutter may break there nor the
+    /// validator accept it as a sentence end (the live
+    /// `regen/helm_obs.rs` header is the witness: closer-cutting at
+    /// its ``…`describe_*!`` span truncated the summary mid-phrase).
+    pub(super) const SENTENCE_CLOSERS: &[char] = &['"', '\'', ')', ']', '}'];
 
     /// A validated one-line operator-surface summary. The ONLY mint
     /// is [`summary_of`]; the field is private.
@@ -802,31 +821,44 @@ mod summary {
 
     /// The abbreviation-aware sentence cut (shared with the
     /// config-description emitter): first [`SENTENCE_TERMINALS`] +
-    /// `" "` + uppercase boundary — with the abbreviation lookahead
-    /// applying to `.` only (no abbreviation ends in `!`/`?`) — whose
-    /// preceding token is NOT an alphabet member; the whole collapsed
-    /// string when no real boundary exists. Intra-doc links `[foo]`
-    /// are kept as-is — typst renders square brackets literally.
+    /// optional [`SENTENCE_CLOSERS`] run + `" "` + uppercase boundary
+    /// — with the abbreviation lookahead applying to `.` only (no
+    /// abbreviation ends in `!`/`?`) — whose preceding token is NOT
+    /// an alphabet member; the closer run rides INSIDE the cut
+    /// (merged_bug_041: `He said "stop." Next` cuts after the quote);
+    /// the whole collapsed string when no real boundary exists.
+    /// Intra-doc links `[foo]` are kept as-is — typst renders square
+    /// brackets literally.
     pub(super) fn first_sentence(desc: &str) -> String {
         let collapsed = desc.split_whitespace().collect::<Vec<_>>().join(" ");
         let bytes = collapsed.as_bytes();
-        for i in 0..bytes.len().saturating_sub(2) {
-            if SENTENCE_TERMINALS.contains(&bytes[i])
-                && bytes[i + 1] == b' '
-                && bytes[i + 2].is_ascii_uppercase()
+        for i in 0..bytes.len() {
+            if !SENTENCE_TERMINALS.contains(&bytes[i]) {
+                continue;
+            }
+            // Closer run after the terminal (all closers are ASCII,
+            // so byte-wise consumption is exact).
+            let mut j = i + 1;
+            while j < bytes.len() && SENTENCE_CLOSERS.contains(&(bytes[j] as char)) {
+                j += 1;
+            }
+            if j + 1 < bytes.len()
+                && bytes[j] == b' '
+                && bytes[j + 1].is_ascii_uppercase()
                 && (bytes[i] != b'.' || trailing_abbreviation(&collapsed[..=i]).is_none())
             {
-                return collapsed[..=i].to_string();
+                return collapsed[..j].to_string();
             }
         }
         collapsed
     }
 
-    /// A [`SENTENCE_TERMINALS`] member optionally followed by closing
-    /// quotes/brackets — the validator is a projection of the SAME
-    /// alphabet the cut consumes (merged_bug_070).
+    /// A [`SENTENCE_TERMINALS`] member optionally followed by a
+    /// [`SENTENCE_CLOSERS`] run — the validator is a projection of
+    /// the SAME alphabet pair the cut consumes (merged_bug_070 +
+    /// merged_bug_041).
     pub(super) fn ends_in_terminal_punctuation(s: &str) -> bool {
-        s.trim_end_matches(['"', '\'', '`', ')', ']', '}'])
+        s.trim_end_matches(SENTENCE_CLOSERS)
             .as_bytes()
             .last()
             .is_some_and(|b| SENTENCE_TERMINALS.contains(b))
@@ -1499,6 +1531,57 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// merged_bug_041: a first sentence ending terminal+CLOSER (`."`,
+    /// `.)`, `!"`, …) must cut at its real boundary — the closer run
+    /// rides inside the cut. Pre-fix the cut loop required the literal
+    /// terminal+space+uppercase byte shape while only the VALIDATOR
+    /// trimmed closers, so a closer-wrapped first sentence was never
+    /// cut, the whole multi-sentence paragraph passed `summary_of`'s
+    /// gate (the un-cut blob still ENDS in a terminal), and the
+    /// "skew is unrepresentable" single-source claim was false on the
+    /// closer axis the claim never covered. Cells: every terminal ×
+    /// every closer × single and doubled closer runs, plus the
+    /// abbreviation interplay (a member followed by a closer still
+    /// refuses the cut) and idempotence over every new cell.
+    #[test]
+    fn cut_recognizes_closer_wrapped_boundaries() {
+        let terminals: &[u8] = super::summary::SENTENCE_TERMINALS;
+        let closers: &[char] = super::summary::SENTENCE_CLOSERS;
+        for &t in terminals {
+            for &c in closers {
+                for run in [format!("{c}"), format!("{c}{c}")] {
+                    let first = format!("He said \"stop{}{run}", t as char);
+                    let input = format!("{first} The tail continues.");
+                    let cut = super::summary::first_sentence(&input);
+                    assert_eq!(
+                        cut, first,
+                        "terminal {:?} + closer run {run:?}: the cut must \
+                         end at the closer-wrapped boundary",
+                        t as char
+                    );
+                    assert_eq!(
+                        super::summary::first_sentence(&cut),
+                        cut,
+                        "idempotence over the closer cell {input:?}"
+                    );
+                    assert!(
+                        super::summary::ends_in_terminal_punctuation(&cut),
+                        "cutter and validator agree on the closer cell {cut:?}"
+                    );
+                }
+            }
+        }
+        // Abbreviation interplay: an alphabet member wrapped in a
+        // closer still refuses the cut (the lookahead applies at the
+        // terminal, before the closer run).
+        let abbrev = "Sizes (etc.) The tail continues.";
+        assert_eq!(
+            super::summary::first_sentence(abbrev),
+            abbrev,
+            "a closer-wrapped abbreviation member must not cut"
+        );
     }
 
     /// merged_bug_005 red #2: the regen MUST fail closed on a summary
