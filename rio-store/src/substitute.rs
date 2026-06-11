@@ -762,7 +762,7 @@ impl Drop for TenantChargeGuard {
     }
 }
 
-// r[impl store.put.nar-hold-envelope]
+// r[impl store.put.nar-hold-envelope+2]
 /// The typed, violable transfer-deadline envelope every NAR-budget
 /// HOLD must carry (merged_bug_021's hold-TIME axis; R17 all-axes).
 /// One discipline: **waiters park free; holders expire** — the
@@ -831,6 +831,30 @@ impl NarHoldEnvelope {
     pub(crate) fn arm(mut self) -> Self {
         self.deadline = tokio::time::Instant::now() + self.hold_budget;
         self
+    }
+
+    /// Monotone knowledge-improvement TIGHTEN (bug_114, the tiling
+    /// law's ingest form): once the stream has drained, the bytes the
+    /// hold still has to move are KNOWN (`buffered`), so the tail's
+    /// bound can shrink from the arming-time `MAX_NAR_SIZE` cap basis
+    /// to `derive(buffered)`-from-now — but NEVER grow. Returns
+    /// whichever envelope's deadline is sooner, so the one clock armed
+    /// at first grant stays the upper bound on the whole hold (a
+    /// stream that already spent most of its cap budget cannot buy a
+    /// fresh allowance at drain time; that fresh-clock shape is
+    /// exactly the per-span gap this close kills).
+    pub(crate) fn tightened_for_remaining(
+        self,
+        buffered: u64,
+        stall_window: Duration,
+        floor_rate: u64,
+    ) -> Self {
+        let candidate = Self::derive(buffered, stall_window, floor_rate);
+        if candidate.deadline < self.deadline {
+            candidate
+        } else {
+            self
+        }
     }
 
     /// Time left before the deadline (zero once expired).
@@ -962,7 +986,7 @@ impl NarBudgetReservation {
 }
 
 // r[impl store.put.nar-bytes-budget+5]
-// r[impl store.put.nar-hold-envelope]
+// r[impl store.put.nar-hold-envelope+2]
 /// The substitute leg's read loop, budget-free by construction (§5.1
 /// laws-as-types census): its parameter set is the stream, the caps,
 /// the watchdog inputs, the progress sinks, and the PROOF a whole-NAR
@@ -2040,7 +2064,7 @@ impl Substituter {
                 });
             }
 
-            // r[impl store.put.nar-hold-envelope]
+            // r[impl store.put.nar-hold-envelope+2]
             // — Post-read tail, ENFORCED under the hold envelope —
             // The reservation provably spans hash → sigs → persist,
             // and rio-common's S3 client ships NO TimeoutConfig by
@@ -7407,7 +7431,7 @@ mod tests {
         sub.try_upstream(http, tid, &ups[0], path, &hp, None).await
     }
 
-    // r[verify store.put.nar-hold-envelope]
+    // r[verify store.put.nar-hold-envelope+2]
     // W8-B (R16 statement): a reservation older than its typed
     // deadline cannot exist — abort + credit-back observed under an
     // adversarial trickle that satisfies every per-read clock, never
@@ -7530,7 +7554,7 @@ mod tests {
         }
     }
 
-    // r[verify store.put.nar-hold-envelope]
+    // r[verify store.put.nar-hold-envelope+2]
     // W8-B′ (R16 statement): a black-holed persist cannot hold a
     // reservation past the deadline — the holder parked in the persist
     // span releases by the hold deadline with permits restored and the
@@ -7713,7 +7737,7 @@ mod tests {
             .unwrap();
     }
 
-    // r[verify store.put.nar-hold-envelope]
+    // r[verify store.put.nar-hold-envelope+2]
     // Envelope-violation red (R17, floor-rate axis): the SAME paced
     // stream completes under a loose floor rate and aborts typed under
     // an absurd one — the knob demonstrably BINDS, and the abort fires
@@ -8013,7 +8037,7 @@ mod tests {
         assert!(admitted.is_ok(), "default cap admits: {:?}", admitted.err());
     }
 
-    // r[verify store.put.nar-hold-envelope]
+    // r[verify store.put.nar-hold-envelope+2]
     /// Const-relation pin `hold_grace_exceeds_stall_window` (R17
     /// ordering law; the compile-time half is the
     /// `NAR_HOLD_GRACE_FACTOR >= 2` const assert): the derived
@@ -8033,7 +8057,7 @@ mod tests {
         }
     }
 
-    // r[verify store.put.nar-hold-envelope]
+    // r[verify store.put.nar-hold-envelope+2]
     /// Const-relation pin `wait_grace_within_hold_floor` (R17 ordering
     /// law; compile-time half lives beside BUDGET_WAIT_GRACE): the
     /// chunk-acquire wait grace is strictly inside the smallest hold

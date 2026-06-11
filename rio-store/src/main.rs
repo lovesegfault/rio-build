@@ -572,6 +572,25 @@ async fn init_db_pool(database_url: &str, max_connections: u32) -> anyhow::Resul
         .max_connections(max_connections)
         .min_connections(2)
         .idle_timeout(std::time::Duration::from_secs(60))
+        // bug_114 defense-in-depth: a server-side statement ceiling so
+        // runaway/abandoned queries from dead client connections cannot
+        // pile up server-side (the CLIENT-side hold bound is the typed
+        // NAR-hold envelope — statement_timeout cannot defend the
+        // client against a black-holed network, only the server
+        // against zombie statements). Priced off the statement census:
+        // claim/heartbeat/complete are ms-class; log sweeps s-class;
+        // the long pole is the GC mark CTE / batched sweeps over a
+        // ~155K-path store (minutes-class, observed in the live_054
+        // forensics era). 600s sits above every lawful statement with
+        // headroom and below the kernel TCP-keepalive eternity it
+        // replaces.
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                use sqlx::Executor as _;
+                conn.execute("SET statement_timeout = '600s'").await?;
+                Ok(())
+            })
+        })
         .connect(database_url)
         .await?;
     info!("PostgreSQL connection established");

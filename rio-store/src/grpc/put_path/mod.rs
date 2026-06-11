@@ -205,7 +205,7 @@ impl StoreServiceImpl {
             }
         };
 
-        let (nar_data, _held_permits) = match self
+        let (nar_data, hold) = match self
             .ingest_nar_stream(&mut stream, &mut info, auth.builder_claims())
             .await
         {
@@ -220,12 +220,19 @@ impl StoreServiceImpl {
 
         // CA: NOW claim — verify_ca_store_path has bound store_path to
         // server-hashed content. Stream is already drained, so no
-        // drain_stream in the non-Owned arms.
+        // drain_stream in the non-Owned arms. bug_114: this PG
+        // round-trip runs while the handler HOLDS budget permits — it
+        // rides the hold's one envelope clock, never a bare await
+        // (pre-fix it sat in the gap between the stream clock and the
+        // persist clock with no deadline at all).
         if claim.is_none() {
-            match self
-                .claim_or_return(&store_path_hash, info.store_path.as_str(), &refs_str)
-                .await?
-            {
+            let claiming =
+                self.claim_or_return(&store_path_hash, info.store_path.as_str(), &refs_str);
+            let claimed = match &hold {
+                Some(h) => h.bounded("PutPath ca-claim", claiming).await??,
+                None => claiming.await?,
+            };
+            match claimed {
                 Some(c) => {
                     placeholder_guard =
                         Some(self.spawn_placeholder_guard(store_path_hash.clone(), c));
@@ -236,7 +243,7 @@ impl StoreServiceImpl {
         }
         let claim = claim.expect("claim populated in IA pre-ingest or CA post-ingest arm");
 
-        self.finalize_single(info, claim, nar_data, auth.tenant_id)
+        self.finalize_single(info, claim, nar_data, auth.tenant_id, hold.as_ref())
             .await?;
         if let Some(g) = placeholder_guard {
             g.defuse();

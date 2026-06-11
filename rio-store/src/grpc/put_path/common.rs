@@ -51,7 +51,7 @@ const PUTPATH_HOOKS: ingest::IngestHooks = ingest::IngestHooks {
     ctx_label: "PutPath",
 };
 
-// r[impl store.put.nar-hold-envelope]
+// r[impl store.put.nar-hold-envelope+2]
 /// Bound on any single charged budget wait at the per-chunk acquire
 /// chokepoint ([`StoreServiceImpl::accumulate_chunk`]): a holder's
 /// next-chunk acquire that parks longer than this sheds typed
@@ -121,6 +121,109 @@ impl StoreServiceImpl {
     pub fn with_nar_ingest_envelope(mut self, cfg: NarIngestEnvelopeCfg) -> Self {
         self.nar_ingest_envelope = cfg;
         self
+    }
+}
+
+// r[impl store.put.nar-hold-envelope+2]
+// census[gen: rio-store/tests/gensets/put-path-await-census.txt]
+/// The ingest plane's budget HOLDER (bug_114, the tiling law): the
+/// granted permits and the ONE envelope armed at the FIRST grant,
+/// fused into a type whose awaits are reachable only through the
+/// deadline-consulting combinator [`Self::bounded`].
+///
+/// The wave-8 close armed per-SPAN fresh clocks (stream / stage /
+/// commit), which left the inter-span awaits — the per-output
+/// `claim_placeholder` PG loop, `resolve_batch_signer`, the CA-arm
+/// `claim_or_return` — holding up to `MAX_NAR_SIZE` of shared budget
+/// with NO deadline at all, and let every later span buy itself a
+/// fresh allowance. This type is the structural inverse:
+///
+/// - the permits are PRIVATE — a caller holding a `NarIngestHold`
+///   has no bare `SemaphorePermit`s to sit on; the only way to await
+///   while holding is [`Self::bounded`], which derives its timeout
+///   from the one envelope's `remaining()` (the `read_nar_capped`
+///   laws-as-types move generalized to the time axis);
+/// - the envelope is armed ONCE, at the first grant (`MAX_NAR_SIZE`
+///   ingest-cap basis — total size is unknown until the trailer);
+///   [`Self::tighten_for_tail`] may only ever SHRINK the deadline
+///   (monotone knowledge improvement at stream drain, when the
+///   buffered byte count becomes known);
+/// - dropping the hold releases every permit (unchanged semantics —
+///   the semaphore credit-back rides the `SemaphorePermit` drops).
+///
+/// Zero-holding spans (before the first chunk grant) stay OUTSIDE
+/// this type by construction: callers carry `Option<NarIngestHold>`
+/// and bare-await while it is `None` — waiters park free; holders
+/// expire (the substitute-plane discipline, verbatim).
+pub(in crate::grpc) struct NarIngestHold<'a> {
+    /// Granted budget permits. Private: see the type doc — bare
+    /// awaits while holding must not typecheck outside this module.
+    permits: Vec<tokio::sync::SemaphorePermit<'a>>,
+    /// THE one hold envelope, armed at the first grant.
+    envelope: crate::substitute::NarHoldEnvelope,
+    /// Envelope knobs (carried for [`Self::tighten_for_tail`]'s
+    /// re-derivation).
+    cfg: NarIngestEnvelopeCfg,
+}
+
+impl<'a> NarIngestHold<'a> {
+    /// The hold begins: arm the ONE envelope (ingest-cap basis) and
+    /// take ownership of the first granted permit.
+    pub(in crate::grpc) fn arm(
+        first_permit: tokio::sync::SemaphorePermit<'a>,
+        cfg: NarIngestEnvelopeCfg,
+    ) -> Self {
+        Self {
+            permits: vec![first_permit],
+            envelope: crate::substitute::NarHoldEnvelope::for_ingest_cap(
+                cfg.hold_stall_window,
+                cfg.hold_floor_rate,
+            ),
+            cfg,
+        }
+    }
+
+    /// Add a later grant to the hold. Deliberately does NOT touch the
+    /// envelope: one clock, armed at the first grant.
+    pub(in crate::grpc) fn push(&mut self, permit: tokio::sync::SemaphorePermit<'a>) {
+        self.permits.push(permit);
+    }
+
+    /// THE await combinator while holding: run `fut` under the hold
+    /// envelope's remaining budget; elapse sheds typed
+    /// (`ResourceExhausted`, retryable — permits release with the
+    /// handler frame). `what` names the span for the error text.
+    pub(in crate::grpc) async fn bounded<T>(
+        &self,
+        what: &str,
+        fut: impl std::future::Future<Output = T>,
+    ) -> Result<T, Status> {
+        match tokio::time::timeout(self.envelope.remaining(), fut).await {
+            Ok(v) => Ok(v),
+            Err(_) => Err(Status::resource_exhausted(format!(
+                "{what}: NAR-budget hold exceeded its envelope ({:?} for the \
+                 {}-byte basis); permits released — retry",
+                self.envelope.hold_budget(),
+                self.envelope.bytes_basis(),
+            ))),
+        }
+    }
+
+    /// Monotone tighten at stream drain: the bytes still to move are
+    /// now known, so the tail bound may shrink from the cap basis to
+    /// `derive(buffered)` — never grow (see
+    /// [`crate::substitute::NarHoldEnvelope::tightened_for_remaining`]).
+    pub(in crate::grpc) fn tighten_for_tail(&mut self, buffered: u64) {
+        self.envelope = self.envelope.tightened_for_remaining(
+            buffered,
+            self.cfg.hold_stall_window,
+            self.cfg.hold_floor_rate,
+        );
+    }
+
+    /// The armed (possibly tightened) hold envelope.
+    pub(in crate::grpc) fn envelope(&self) -> &crate::substitute::NarHoldEnvelope {
+        &self.envelope
     }
 }
 
@@ -538,7 +641,7 @@ impl StoreServiceImpl {
                 "{ctx_label}: NAR chunks exceed size bound {MAX_NAR_SIZE} (received {new_len}+ bytes)"
             )));
         }
-        // r[impl store.put.nar-hold-envelope]
+        // r[impl store.put.nar-hold-envelope+2]
         // Wait axis (merged_bug_001): the acquire is grace-bounded —
         // grant or typed shed within `budget_wait_grace`, UNIFORM over
         // all chunk acquires (first included: the chokepoint cannot
@@ -595,25 +698,26 @@ impl StoreServiceImpl {
         stream: &mut Streaming<PutPathRequest>,
         info: &mut ValidatedPathInfo,
         hmac_claims: Option<&rio_auth::hmac::AssignmentClaims>,
-    ) -> Result<(Vec<u8>, Vec<tokio::sync::SemaphorePermit<'a>>), Status> {
+    ) -> Result<(Vec<u8>, Option<NarIngestHold<'a>>), Status> {
         let mut nar_data = Vec::new();
         let mut hasher = Sha256::new();
         let mut trailer: Option<PutPathTrailer> = None;
-        let mut held_permits = Vec::new();
-        // r[impl store.put.nar-hold-envelope]
-        // Hold axis (merged_bug_021's ingest sibling): once this
-        // handler HOLDS budget permits, its client-controlled stream
-        // residency is bounded by a typed ingest envelope (armed at
-        // the FIRST granted permit — before that the read is untimed
-        // zero-holding backpressure, symmetric with the substitute
-        // park). A stopped-but-connected client (h2 keepalives held
-        // open, no messages) previously pinned its permits forever:
-        // PutPath claims keep `fetched_bytes` NULL — the structural
-        // exemption from every download-stall rule — so no watchdog
-        // ever reaps an ingest holder. Expiry aborts typed
-        // (`ResourceExhausted`); placeholder cleanup stays the
-        // caller's `abort_upload` contract.
-        let mut hold_envelope: Option<crate::substitute::NarHoldEnvelope> = None;
+        // r[impl store.put.nar-hold-envelope+2]
+        // Hold axis (merged_bug_021's ingest sibling; bug_114's tiling
+        // form): once this handler HOLDS budget permits, EVERY await
+        // until release rides the ONE envelope armed at the first
+        // grant — the stream reads here, and (via the returned
+        // [`NarIngestHold`]) the caller's claim/persist tail too.
+        // Before the first grant the read is untimed zero-holding
+        // backpressure, symmetric with the substitute park. A
+        // stopped-but-connected client (h2 keepalives held open, no
+        // messages) previously pinned its permits forever: PutPath
+        // claims keep `fetched_bytes` NULL — the structural exemption
+        // from every download-stall rule — so no watchdog ever reaps
+        // an ingest holder. Expiry aborts typed (`ResourceExhausted`);
+        // placeholder cleanup stays the caller's `abort_upload`
+        // contract.
+        let mut hold: Option<NarIngestHold<'a>> = None;
         // Cumulative permits charged (NOT raw bytes — `accumulate_chunk`
         // floors each chunk at MIN_NAR_CHUNK_CHARGE). Checked BEFORE
         // `accumulate_chunk` so a tiny-chunk stream that would exhaust
@@ -623,22 +727,11 @@ impl StoreServiceImpl {
         let mut charged: u64 = 0;
         loop {
             let read = stream.message();
-            let msg = match &hold_envelope {
+            let msg = match &hold {
                 // Zero-holding: untimed backpressure (exempt).
                 None => read.await,
-                // Holding: the stream read is under the envelope clock.
-                Some(env) => match tokio::time::timeout(env.remaining(), read).await {
-                    Ok(r) => r,
-                    Err(_) => {
-                        return Err(Status::resource_exhausted(format!(
-                            "PutPath: NAR-budget hold exceeded its ingest envelope \
-                             ({:?} for the {}-byte charged-permit cap); \
-                             permits released — retry",
-                            env.hold_budget(),
-                            env.bytes_basis()
-                        )));
-                    }
-                },
+                // Holding: the stream read is under the one hold clock.
+                Some(h) => h.bounded("PutPath ingest", read).await?,
             };
             let msg = match msg {
                 Ok(Some(m)) => m,
@@ -665,13 +758,11 @@ impl StoreServiceImpl {
                     let permit = self
                         .accumulate_chunk(&mut nar_data, &mut hasher, &chunk, "PutPath")
                         .await?;
-                    held_permits.push(permit);
-                    // First grant: the hold begins — arm the envelope.
-                    if hold_envelope.is_none() {
-                        hold_envelope = Some(crate::substitute::NarHoldEnvelope::for_ingest_cap(
-                            self.nar_ingest_envelope.hold_stall_window,
-                            self.nar_ingest_envelope.hold_floor_rate,
-                        ));
+                    // First grant: the hold begins — arm the ONE
+                    // envelope; later grants join the same hold.
+                    match &mut hold {
+                        None => hold = Some(NarIngestHold::arm(permit, self.nar_ingest_envelope)),
+                        Some(h) => h.push(permit),
                     }
                 }
                 Some(put_path_request::Msg::Trailer(t)) => {
@@ -705,7 +796,12 @@ impl StoreServiceImpl {
             "PutPath",
         )?;
         verify_ca_store_path(info, hmac_claims, "PutPath")?;
-        Ok((nar_data, held_permits))
+        // Stream drained: the bytes still to move are known — the one
+        // clock may tighten (never extend) for the claim/persist tail.
+        if let Some(h) = &mut hold {
+            h.tighten_for_tail(nar_data.len() as u64);
+        }
+        Ok((nar_data, hold))
     }
 
     /// Sign + persist + emit success metrics for a single validated
@@ -713,31 +809,38 @@ impl StoreServiceImpl {
     /// here; the caller's drop-guard spawn is then a harmless no-op.
     /// `info.store_path_hash` MUST be populated.
     ///
-    /// The caller's `held_permits` (the handler frame) span this whole
-    /// call, so the persist span is a budget HOLD and carries its own
-    /// envelope clock: a fresh [`crate::substitute::NarHoldEnvelope`]
-    /// over the ACTUAL buffered bytes (`nar_data.len()` — the basis
-    /// the permits actually cover), enforced via `timeout`. Same
-    /// Q-108 rationale as the substitute tail: rio-common's S3 client
-    /// ships NO TimeoutConfig by design, so an established-then-
-    /// black-holed persist connection would otherwise pin the
-    /// handler's permits forever — a holder span the no-deadlock
-    /// theorem must bound. Expiry aborts the placeholder and sheds
-    /// typed (`ResourceExhausted`, retryable).
+    /// The caller's [`NarIngestHold`] spans this whole call, so the
+    /// persist span is a budget HOLD and rides THE SAME envelope that
+    /// was armed at the first grant (tightened to the buffered bytes
+    /// at stream drain — bug_114: a fresh per-span clock here let the
+    /// tail buy itself a new allowance after the inter-span awaits
+    /// had already run unbounded). Same Q-108 rationale as the
+    /// substitute tail: rio-common's S3 client ships NO TimeoutConfig
+    /// by design, so an established-then-black-holed persist
+    /// connection would otherwise pin the handler's permits forever —
+    /// a holder span the no-deadlock theorem must bound. Expiry
+    /// aborts the placeholder and sheds typed (`ResourceExhausted`,
+    /// retryable). `hold: None` (a zero-chunk stream holds nothing —
+    /// empty NAR) bounds the tail with a fresh minimal envelope so
+    /// the span stays clocked even when the budget law does not bind.
     // r[impl obs.metric.transfer-volume]
-    // r[impl store.put.nar-hold-envelope]
+    // r[impl store.put.nar-hold-envelope+2]
     pub(in crate::grpc) async fn finalize_single(
         &self,
         mut info: ValidatedPathInfo,
         claim: uuid::Uuid,
         nar_data: Vec<u8>,
         tenant_id: Option<uuid::Uuid>,
+        hold: Option<&NarIngestHold<'_>>,
     ) -> Result<(), Status> {
-        let envelope = crate::substitute::NarHoldEnvelope::for_declared(
-            nar_data.len() as u64,
-            self.nar_ingest_envelope.hold_stall_window,
-            self.nar_ingest_envelope.hold_floor_rate,
-        );
+        let envelope = match hold {
+            Some(h) => *h.envelope(),
+            None => crate::substitute::NarHoldEnvelope::for_declared(
+                nar_data.len() as u64,
+                self.nar_ingest_envelope.hold_stall_window,
+                self.nar_ingest_envelope.hold_floor_rate,
+            ),
+        };
         let tail = async {
             self.maybe_sign(tenant_id, &mut info).await;
             self.persist_nar(&info, claim, nar_data, "PutPath").await

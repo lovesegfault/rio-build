@@ -568,31 +568,42 @@ unreferenced age past grace and are collected by a later collect cycle
   collect cycle). The bound is ≤1 NAR-size per failure.
 ]
 
-#r("store.put.nar-hold-envelope")[
-  Every NAR-budget HOLD must carry a typed transfer-deadline envelope derived
-  from its byte basis at the floor rate (`deadline = NAR_HOLD_GRACE_FACTOR ×
-  stall_window + bytes_basis / NAR_HOLD_FLOOR_RATE`, armed at permit grant —
-  park time never consumes hold time); every non-reservation budget acquire
-  must shed typed (`ResourceExhausted`) within the wait grace
-  (`BUDGET_WAIT_GRACE`); zero-holding parks are exempt backpressure.
+#r("store.put.nar-hold-envelope+2")[
+  Every NAR-budget HOLD must be tiled by ONE typed transfer-deadline envelope
+  from first permit grant to release: the envelope is derived from the hold's
+  byte basis at the floor rate (`deadline = NAR_HOLD_GRACE_FACTOR ×
+  stall_window + bytes_basis / NAR_HOLD_FLOOR_RATE`), armed exactly once at
+  the FIRST grant (park time never consumes hold time), and every await
+  reachable while holding derives its clock from that one envelope's
+  remaining budget — per-span fresh clocks and unclocked inter-span awaits
+  are both violations. Knowledge improvement (the buffered byte count
+  becoming known at stream drain) may only TIGHTEN the deadline, never
+  re-arm it. Every non-reservation budget acquire must shed typed
+  (`ResourceExhausted`) within the wait grace (`BUDGET_WAIT_GRACE`);
+  zero-holding parks are exempt backpressure.
 ]
 
-The envelope's basis is the span's own ceiling: the verified narinfo's
-declared `NarSize` for a substitution hold, the `MAX_NAR_SIZE` charged-permit
-cap for a PutPath/PutPathBatch stream-ingest hold (the handler's own
-cumulative-charge ceiling), and the actual buffered byte count for a persist
-span (`finalize_single`, batch stage/commit — the rio-common S3 client ships
-no TimeoutConfig by design, so per-operation deadlines are the holder's
-duty). The grace factor is pinned `≥ 2` so the per-read stall clock always
-fires first on a genuinely wedged read; the wait grace is pinned strictly
-inside the smallest hold grace so a waiting holder sheds its WAIT before its
-own HOLD deadline can fire. Both knobs and the floor rate are violable
-builder overrides (R17) with violating reds
-(`hold_envelope_floor_rate_binds`, `wait_grace_binds`, `tenant_cap_binds`).
-The one deliberate non-clock: the substitute leg's zero-holding budget park
-stays untimed (`BudgetParked`, takeover-exempt) — parking is backpressure,
-never a strike, and the park's boundedness is the
-#rref("store.put.nar-bytes-budget") theorem, not a clock.
+The envelope's arming basis is the hold's own ceiling: the verified
+narinfo's declared `NarSize` for a substitution hold (known up front), the
+`MAX_NAR_SIZE` charged-permit cap for a PutPath/PutPathBatch ingest hold
+(total size is trailer-only, so the handler's cumulative-charge ceiling is
+the only sound basis at first grant), tightened to the actual buffered byte
+count once the stream drains (`min` of deadlines — a stream that spent most
+of its cap budget cannot buy a fresh tail allowance; that fresh-clock shape
+is the bughunt-9 bug_114 defect: stage/commit clocks re-armed per span while
+the inter-span claim/signer PG round-trips ran unclocked). The ingest plane
+realizes the tiling structurally with a holder type (`NarIngestHold`): the
+permits are private to it and its `bounded()` combinator is the only way to
+await while holding — a bare await on a held frame does not typecheck. The
+grace factor is pinned `≥ 2` so the per-read stall clock always fires first
+on a genuinely wedged read; the wait grace is pinned strictly inside the
+smallest hold grace so a waiting holder sheds its WAIT before its own HOLD
+deadline can fire. Both knobs and the floor rate are violable builder
+overrides (R17) with violating reds (`hold_envelope_floor_rate_binds`,
+`wait_grace_binds`, `tenant_cap_binds`). The one deliberate non-clock: the
+substitute leg's zero-holding budget park stays untimed (`BudgetParked`,
+takeover-exempt) — parking is backpressure, never a strike, and the park's
+boundedness is the #rref("store.put.nar-bytes-budget") theorem, not a clock.
 
 #r("store.put.nar-bytes-budget+5")[
   A process-global `tokio::sync::Semaphore` (default `8 × MAX_NAR_SIZE` = 32

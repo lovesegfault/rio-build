@@ -1349,7 +1349,7 @@ mod bw8s1_budget {
         Ok(())
     }
 
-    // r[verify store.put.nar-hold-envelope]
+    // r[verify store.put.nar-hold-envelope+2]
     // W8-C (R16 statement): ingest-holder residency through the
     // production stream path including cleanup — a stopped-but-
     // connected client cannot hold permits past the ingest envelope.
@@ -1409,7 +1409,7 @@ mod bw8s1_budget {
         Ok(())
     }
 
-    // r[verify store.put.nar-hold-envelope]
+    // r[verify store.put.nar-hold-envelope+2]
     // W8-D (R16 statement): the wait axis at the sole non-reservation
     // acquire chokepoint — grant-or-typed-shed within
     // BUDGET_WAIT_GRACE (batch included by the census-pinned shared
@@ -1507,7 +1507,7 @@ mod bw8s1_budget {
         Ok(())
     }
 
-    // r[verify store.put.nar-hold-envelope]
+    // r[verify store.put.nar-hold-envelope+2]
     // Envelope-violation red (R17, wait-grace axis): zero grace ⇒ a
     // contended chunk acquire sheds immediately, while an uncontended
     // acquire still succeeds — the knob binds the WAIT, not the grant.
@@ -1597,7 +1597,7 @@ mod bw8s1_budget {
         (tx, ReceiverStream::new(rx))
     }
 
-    // r[verify store.put.nar-hold-envelope]
+    // r[verify store.put.nar-hold-envelope+2]
     // W8-F (R16 statement): batch-holder residency through the
     // production batch stream path -- with it, the holder census has
     // zero unenveloped rows and the slot theorem's quantifier domain
@@ -1663,5 +1663,238 @@ mod bw8s1_budget {
         }
         drop(tx);
         Ok(())
+    }
+}
+
+// =========================================================================
+// BW9-S5 tiling battery (bug_114): the inter-span awaits — the
+// population the round-8 per-span witnesses structurally could not see
+// — ride THE ONE envelope armed at first grant.
+// =========================================================================
+
+mod bw9s5_tiling {
+    use super::*;
+    use rio_store::grpc::{NarIngestEnvelopeCfg, StoreServiceImpl as Svc};
+    use sha2::Digest as _;
+    use std::time::Duration;
+
+    /// Envelope for this battery: hold = 5×200ms ≈ 1s (floor rate
+    /// u64::MAX makes the transfer term 0); wait grace 5s — LONGER
+    /// than the hold deadline, so a parked sibling survives the wedge
+    /// and completes once the deadline frees the pool (pre-fix the
+    /// sibling shed typed instead: the pool never freed).
+    fn tiling_cfg() -> NarIngestEnvelopeCfg {
+        NarIngestEnvelopeCfg {
+            budget_wait_grace: Duration::from_secs(5),
+            hold_stall_window: Duration::from_millis(200),
+            hold_floor_rate: u64::MAX,
+        }
+    }
+
+    // r[verify store.put.nar-hold-envelope+2]
+    // W9-BG (R16 statement): a black-holed PG await MID-BATCH — the
+    // phase-2 claim_placeholder round-trip, an INTER-SPAN await that
+    // pre-fix carried no clock at all — releases by the SINGLE
+    // envelope deadline armed at first grant, with permits restored
+    // and a parked sibling completing. The black hole is a REAL
+    // blocked PG statement: an uncommitted conflicting placeholder
+    // insert makes the handler's `INSERT ... ON CONFLICT` wait on the
+    // in-flight unique key until the wedging tx resolves (it never
+    // does, within the test horizon).
+    /// RED pre-fix (verbatim, run with the tiling rewire stashed):
+    /// see the landing commit body — the batch future was still
+    /// pending at 10× the envelope (the bare claim await outlived
+    /// every span clock) and the parked sibling shed
+    /// `ResourceExhausted` instead of completing.
+    #[tokio::test]
+    async fn black_holed_claim_mid_batch_releases_by_the_one_envelope() -> TestResult {
+        let db = TestDb::new(&MIGRATOR).await;
+        let budget_bytes = 4096usize;
+        let service = Svc::new(db.pool.clone())
+            .with_nar_budget(budget_bytes)
+            .with_nar_ingest_envelope(tiling_cfg());
+        let budget = service.nar_bytes_budget().clone();
+        let (client, _server) = spawn_store_server(service).await?;
+
+        // The wedge: an uncommitted placeholder pair for the batch's
+        // output path (the same narinfo-then-manifests shape the
+        // production claim inserts), held open for the whole test.
+        let path = test_store_path("bw9s5-bg");
+        let batch_content = rio_test_support::fixtures::pseudo_random_bytes(90, 3000);
+        let (nar, _h) = make_nar(&batch_content);
+        let info = make_path_info_for_nar(&path, &nar);
+        let sp_hash: [u8; 32] = sha2::Sha256::digest(path.as_bytes()).into();
+        let mut wedge_tx = db.pool.begin().await?;
+        sqlx::query(
+            r#"INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size, "references")
+               VALUES ($1, $2, $3, 0, '{}')"#,
+        )
+        .bind(&sp_hash[..])
+        .bind(&path)
+        .bind(&[0u8; 32][..])
+        .execute(&mut *wedge_tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO manifests (store_path_hash, status, claim_id) \
+             VALUES ($1, 'uploading', gen_random_uuid())",
+        )
+        .bind(&sp_hash[..])
+        .execute(&mut *wedge_tx)
+        .await?;
+
+        // The batch: one fully-sent output (metadata → chunk →
+        // trailer, stream closed) so phase 1 completes — permits HELD
+        // — and phase 2's claim blocks on the wedge.
+        let (tx, rx) = mpsc::channel(16);
+        send_batch_output(&tx, 0, info.into(), nar.clone()).await;
+        drop(tx);
+        let mut batch_client = client.clone();
+        let batch =
+            tokio::spawn(async move { batch_client.put_path_batch(ReceiverStream::new(rx)).await });
+
+        // Sibling: a PutPath for a DIFFERENT path whose first chunk
+        // cannot be granted while the wedged batch holds its permits
+        // (sizing pin below) — it parks within its 5s wait grace.
+        let wait = tokio::time::Instant::now() + Duration::from_secs(5);
+        while budget.available_permits() == budget_bytes {
+            assert!(
+                tokio::time::Instant::now() < wait,
+                "batch never acquired permits"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let held = budget_bytes - budget.available_permits();
+        let sibling_content = rio_test_support::fixtures::pseudo_random_bytes(91, 2800);
+        let (sib_nar, _) = make_nar(&sibling_content);
+        assert!(
+            sib_nar.len() > budget_bytes - held,
+            "sizing pin: sibling ({}) must not be grantable while the batch holds {held}",
+            sib_nar.len()
+        );
+        assert!(
+            sib_nar.len() <= budget_bytes,
+            "sizing pin: sibling fits an empty pool"
+        );
+        let sib_info = make_path_info_for_nar(&test_store_path("bw9s5-bg-sib"), &sib_nar);
+        let mut sib_client = client.clone();
+        let sibling = tokio::spawn(async move {
+            let mut info: PathInfo = sib_info.into();
+            let (tx, rx) = mpsc::channel(8);
+            let trailer = PutPathTrailer {
+                nar_hash: std::mem::take(&mut info.nar_hash),
+                nar_size: std::mem::take(&mut info.nar_size),
+            };
+            tx.send(PutPathRequest {
+                msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
+                    info: Some(info),
+                })),
+            })
+            .await
+            .unwrap();
+            tx.send(PutPathRequest {
+                msg: Some(put_path_request::Msg::NarChunk(sib_nar)),
+            })
+            .await
+            .unwrap();
+            tx.send(PutPathRequest {
+                msg: Some(put_path_request::Msg::Trailer(trailer)),
+            })
+            .await
+            .unwrap();
+            drop(tx);
+            sib_client.put_path(ReceiverStream::new(rx)).await
+        });
+
+        // THE tiling assertion: the batch sheds typed by the ONE
+        // envelope deadline (≈1s armed at first grant; 10× bound),
+        // even though the await it is parked on is a phase-2 PG
+        // round-trip no per-span clock ever covered.
+        let batch_res = tokio::time::timeout(Duration::from_secs(10), batch)
+            .await
+            .expect(
+                "the batch must shed by the one envelope deadline — \
+                     a bare inter-span await outlives every span clock",
+            )
+            .unwrap();
+        let status = batch_res.expect_err("wedged claim must shed typed");
+        assert_eq!(
+            status.code(),
+            tonic::Code::ResourceExhausted,
+            "typed hold-envelope shed expected, got {status:?}"
+        );
+        // Permits restored — the parked sibling now completes inside
+        // its wait grace (it needed the wedge's permits).
+        let sib_res = tokio::time::timeout(Duration::from_secs(10), sibling)
+            .await
+            .expect("sibling must complete after the wedge releases")
+            .unwrap()
+            .expect("sibling upload ok");
+        assert!(sib_res.into_inner().created, "sibling newly created");
+        let restore = tokio::time::Instant::now() + Duration::from_secs(5);
+        while budget.available_permits() != budget_bytes {
+            assert!(
+                tokio::time::Instant::now() < restore,
+                "permits not restored: {} of {budget_bytes}",
+                budget.available_permits()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        wedge_tx.rollback().await?;
+        Ok(())
+    }
+
+    // r[verify store.put.nar-hold-envelope+2]
+    // W9-BI (R16 statement): the await-site census of the ingest
+    // plane is COMMITTED ([GEN-SET]) and current — every `.await` in
+    // the three put-path files is inventoried, so a new await site
+    // (bare or bounded) is a review event, not a silent drift. The
+    // planted-control arm proves the scanner is not vacuous (R22:
+    // the census ships its own red).
+    #[test]
+    fn put_path_await_census_is_current() {
+        let files: [(&str, &str); 3] = [
+            (
+                "rio-store/src/grpc/put_path/mod.rs",
+                include_str!("../../src/grpc/put_path/mod.rs"),
+            ),
+            (
+                "rio-store/src/grpc/put_path/common.rs",
+                include_str!("../../src/grpc/put_path/common.rs"),
+            ),
+            (
+                "rio-store/src/grpc/put_path_batch.rs",
+                include_str!("../../src/grpc/put_path_batch.rs"),
+            ),
+        ];
+        let scan = |name: &str, body: &str| -> Vec<String> {
+            body.lines()
+                .filter(|l| l.contains(".await"))
+                .map(|l| format!("{name}\t{}", l.trim()))
+                .collect()
+        };
+        // Planted control (the census's own red): the scanner MUST
+        // see a bare await in a synthetic body — a scanner that finds
+        // nothing certifies nothing.
+        assert_eq!(
+            scan("planted", "    let x = foo.await;\n").len(),
+            1,
+            "planted bare await must be detected"
+        );
+        let mut derived: Vec<String> = files.iter().flat_map(|(n, b)| scan(n, b)).collect();
+        derived.sort();
+        let committed = include_str!("../gensets/put-path-await-census.txt");
+        let committed: Vec<String> = committed
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            derived, committed,
+            "the ingest-plane await inventory drifted — review the new/removed \
+             await site(s) against the tiling law (every await while holding \
+             routes through NarIngestHold::bounded), then regenerate \
+             rio-store/tests/gensets/put-path-await-census.txt (the test \
+             failure output above IS the new content, one line per site)"
+        );
     }
 }
