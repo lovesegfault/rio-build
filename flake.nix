@@ -1234,6 +1234,10 @@
                   # Plugin loads into the pinned nix-cli and the rio://
                   # scheme registers.
                   evalstore-smoke = evalstorePlugin.smoke;
+                  # ADR-024 M0 acceptance: byte-identical drvPaths vs
+                  # stock nix on the local parity fixture, zero
+                  # cross-check failures.
+                  evalstore-parity = evalstorePlugin.parity;
                 }
                 # Workspace-level policy checks (deny, helm-lint,
                 # tracey-validate, crds-drift, tfvars-fresh, …).
