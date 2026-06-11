@@ -59,6 +59,19 @@ use crate::executor::BuildTaskMessage;
 /// (defensive — the scheduler always suggests one; decision P4 = 5 s).
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(5);
 
+/// R17 domain ceiling for wire-supplied retry hints (merged_bug_156):
+/// the pull loop's sleep wakes only on shutdown and `IdleClock`
+/// credits only between answers, so an unbounded hint parks the loop
+/// past every exit. VIOLABLE, with the derivation: every in-tree
+/// producer is a bounded const (the scheduler's
+/// `NOT_YET_READY_RETRY_AFTER_SECS` = 5 s; the store's materialize
+/// hint clamps at 300 s), and `GRPC_STREAM_TIMEOUT` = 300 s is the
+/// longest the transport itself holds a single call — so 300 s is the
+/// largest hint a non-skewed producer can mean. A larger landed value
+/// trades parked-loop wedge depth for re-pull chatter under a future
+/// slow-poll protocol; measure before moving it.
+const RETRY_AFTER_PACING_CEILING: Duration = Duration::from_secs(300);
+
 /// ±20 % jitter applied to the server-suggested `retry_after`
 /// (decision P4) so a forecast-spawned cohort doesn't re-pull in
 /// lockstep.
@@ -386,11 +399,16 @@ pub(super) async fn pull_until_resolved<T: PullTransport>(
                         // may still mint; only a loop-terminating answer
                         // or the confirm-only pull clears).
                         attempt = 0;
-                        let suggested = if nyr.retry_after_seconds == 0 {
-                            DEFAULT_RETRY_AFTER
-                        } else {
-                            Duration::from_secs(u64::from(nyr.retry_after_seconds))
-                        };
+                        // Proto→sleep seam (merged_bug_156): mint
+                        // through the pacing constructor — the hint
+                        // is bounded by the domain ceiling BY
+                        // CONSTRUCTION, so a skewed producer cannot
+                        // park this loop past the idle exit.
+                        let suggested = rio_common::clamped::WireSecs::from_wire(u64::from(
+                            nyr.retry_after_seconds,
+                        ))
+                        .pacing(RETRY_AFTER_PACING_CEILING)
+                        .unwrap_or(DEFAULT_RETRY_AFTER);
                         // r[impl builder.pull.idle-undroppable]
                         // Errors and empty outcomes between answers are
                         // structurally invisible to the clock — the
@@ -2199,5 +2217,46 @@ mod abort_tests {
         );
         assert_eq!(completion.drv_path, drv);
         drop(guard);
+    }
+}
+
+#[cfg(test)]
+mod pacing_tests {
+    use super::*;
+
+    /// W10-BI (merged_bug_156, builder seam): a skewed or
+    /// unit-bugged producer states a 10^6-second retry hint; the
+    /// loop's next wake must stay under the pacing ceiling (the
+    /// :441-region sleep wakes only on shutdown, and the idle clock
+    /// credits only between answers, so an unbounded hint parks the
+    /// loop past every exit).
+    #[test]
+    fn wire_retry_hint_paced_under_the_domain_ceiling() {
+        // Pre-fix red (the seam converted verbatim:
+        // `Duration::from_secs(u64::from(nyr.retry_after_seconds))`):
+        //   the loop's next wake must stay under the pacing ceiling;
+        //   got 1000000s
+        let nyr_secs: u32 = 1_000_000;
+        // The seam conversion, as landed.
+        let suggested = rio_common::clamped::WireSecs::from_wire(u64::from(nyr_secs))
+            .pacing(RETRY_AFTER_PACING_CEILING)
+            .unwrap_or(DEFAULT_RETRY_AFTER);
+        assert!(
+            suggested <= RETRY_AFTER_PACING_CEILING,
+            "the loop's next wake must stay under the pacing ceiling; got {suggested:?}"
+        );
+        // 0 = no hint stated → the default; sane hints pass exactly.
+        assert_eq!(
+            rio_common::clamped::WireSecs::from_wire(0)
+                .pacing(RETRY_AFTER_PACING_CEILING)
+                .unwrap_or(DEFAULT_RETRY_AFTER),
+            DEFAULT_RETRY_AFTER
+        );
+        assert_eq!(
+            rio_common::clamped::WireSecs::from_wire(7)
+                .pacing(RETRY_AFTER_PACING_CEILING)
+                .unwrap_or(DEFAULT_RETRY_AFTER),
+            Duration::from_secs(7)
+        );
     }
 }

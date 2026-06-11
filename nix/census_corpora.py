@@ -78,6 +78,18 @@ REGISTRY = [
     ("cell-emission-arm-product", "rio-scheduler/src/actor/snapshot.rs", r"classify_cell_emission", {"scope"}, {"fold-site"}),
     ("subst-dep-eta-disposition", "rio-scheduler/src/actor/tests/misc.rs", r"subst_dep_eta_disposition_census", {"scope"}, set()),
     ("refusal-agreement-census", "rio-builder/src/runtime/pull.rs", r"fatal_set_agrees_with_the_authority", {"scope"}, set()),
+    # Riding arm of THIS file (the refusal-census precedent): the
+    # WireSecs pacing-seam census — raw `from_secs` over `*_seconds`
+    # proto fields is banned in production code; proto→sleep seams
+    # mint through WireSecs::pacing(domain_ceiling) (merged_bug_156).
+    # Plant set DERIVED from the use-grammar table (WIRE_SECS_GRAMMAR
+    # — derived_from: every production planted mechanically, R22').
+    # Gap (burn-down): fold-site — the let-bound production is
+    # window-bounded (30 lines); a binding consumed through a helper
+    # fn or beyond the window is unplanted. Trigger: the next
+    # lint-gap finding on this generator upgrades the corpus in the
+    # same close.
+    ("wire-secs-pacing-seams", "nix/census_corpora.py", r"WIRE_SECS_GRAMMAR", {"alias", "scope"}, {"fold-site"}),
 ]
 
 MODEL_DIVERGENCE = re.compile(
@@ -173,6 +185,73 @@ fn is_fatal_rejection(code: tonic::Code) -> bool {
 }
 """
 
+# --- the WireSecs pacing-seam census (merged_bug_156, S6) -------------
+#
+# Proto seconds fields (`*_seconds` by the proto naming convention)
+# must cross the proto→domain seam through the WireSecs constructors
+# (`from_wire` / `.pacing(domain_ceiling)`), never raw
+# `Duration::from_secs` — the clamp law was re-minted-around twice
+# (wave-8 store seam, pre-campaign builder seam) because the forbidden
+# shape still compiled at any new seam. The USE-GRAMMAR below is the
+# derivation source for the plant set: every production is planted
+# mechanically (R22' — all four or none), so the scanner cannot
+# certify coverage it does not have.
+WIRE_SECS_NEEDLE = re.compile(r"from_secs\(\s*(?:u64::from\(\s*)?[\w.()\[\]]*\.\w*_seconds\b")
+WIRE_SECS_LET = re.compile(r"let\s+(\w+)(?::\s*[\w:]+)?\s*=\s*[\w.()\[\]]*\.(\w*_seconds)\s*;")
+WIRE_SECS_ALLOW = re.compile(r"wire-secs-census:\s*allow\(")
+WIRE_SECS_LET_WINDOW = 30
+
+# (production, planted snippet) — the snippet IS the production's
+# minimal instance; the self-test iterates this table, so an unplanted
+# production cannot exist while the table names it.
+WIRE_SECS_GRAMMAR = [
+    ("direct", "let d = Duration::from_secs(resp.retry_after_seconds);\n"),
+    ("u64-conversion", "let d = Duration::from_secs(u64::from(resp.retry_after_seconds));\n"),
+    (
+        "let-bound",
+        "let hint = resp.retry_after_seconds;\nlet d = Duration::from_secs(u64::from(hint));\n",
+    ),
+    ("qualified", "let d = std::time::Duration::from_secs(resp.retry_after_seconds);\n"),
+]
+
+
+def scan_wire_secs_seams(files):
+    """files: iterable of (rel, text). Returns violation list."""
+    fails = []
+    for rel, raw in files:
+        lines = raw.splitlines()
+        stripped = strip_comments(raw)
+        slines = stripped.splitlines()
+
+        def flag(lineno, what):
+            window = "\n".join(lines[max(0, lineno - 7) : lineno])
+            if WIRE_SECS_ALLOW.search(window):
+                return
+            fails.append(
+                f"{rel}:{lineno}: {what} — proto seconds cross the seam through "
+                f"rio_common::clamped::WireSecs (from_wire / .pacing(domain_ceiling)); "
+                f"a documented exception carries `wire-secs-census: allow(<why>)` within 6 lines above"
+            )
+
+        for m in WIRE_SECS_NEEDLE.finditer(stripped):
+            flag(
+                stripped[: m.start()].count("\n") + 1,
+                "raw from_secs over a `*_seconds` proto field",
+            )
+        for i, line in enumerate(slines):
+            lm = WIRE_SECS_LET.search(line)
+            if not lm:
+                continue
+            binding = lm.group(1)
+            tail = "\n".join(slines[i + 1 : i + 1 + WIRE_SECS_LET_WINDOW])
+            if re.search(rf"from_secs\([^)]*\b{re.escape(binding)}\b", tail):
+                flag(
+                    i + 1,
+                    f"`{lm.group(2)}` let-bound to `{binding}` then raw from_secs'd",
+                )
+    return fails
+
+
 REFUSAL_SCAN_CRATES = ["rio-builder", "rio-store", "rio-gateway", "rio-scheduler", "rio-controller"]
 
 
@@ -208,6 +287,28 @@ def main() -> int:
     f_e = check_registry(pathlib.Path("/nonexistent-root"))
     if not any("missing" in x for x in f_e):
         print(f"FAIL: self-test arm E (registry rot) expected missing-anchor failures, got {f_e}", file=sys.stderr)
+        return 1
+
+    # Arm F: the WireSecs pacing-seam plants — DERIVED from the
+    # use-grammar table, one red per production (R22': all four or
+    # the self-test itself fails).
+    for production, snippet in WIRE_SECS_GRAMMAR:
+        f_f = scan_wire_secs_seams([(f"planted/{production}.rs", snippet)])
+        if len(f_f) != 1:
+            print(
+                f"FAIL: self-test arm F (wire-secs plant `{production}`) expected 1 violation, got {f_f}",
+                file=sys.stderr,
+            )
+            return 1
+    # Arm F-allow: the allow grammar admits a documented exception.
+    allowed_ws = "// wire-secs-census: allow(test fixture builds its own clock)\n" + WIRE_SECS_GRAMMAR[0][1]
+    if scan_wire_secs_seams([("planted/allowed.rs", allowed_ws)]):
+        print("FAIL: self-test arm F-allow — the documented site still flagged", file=sys.stderr)
+        return 1
+    # Arm F-mint: the sanctioned constructor shape does NOT flag.
+    minted = "let d = WireSecs::from_wire(u64::from(resp.retry_after_seconds)).pacing(CEILING);\n"
+    if scan_wire_secs_seams([("planted/minted.rs", minted)]):
+        print("FAIL: self-test arm F-mint — the sanctioned WireSecs mint flagged", file=sys.stderr)
         return 1
 
     # --- the real scans -------------------------------------------------
@@ -252,13 +353,14 @@ def main() -> int:
                 raw = raw[:cut]
             refusal_files.append((rel, raw))
     fails += scan_refusal_folds(refusal_files)
+    fails += scan_wire_secs_seams(refusal_files)
 
     gaps = sorted(f"{name}:{ax}" for name, _, _, _, g in REGISTRY for ax in g)
     print(
         f"census-corpora: {len(REGISTRY)} generators enrolled, axes {sorted(AXES)} all exercised, "
         f"{len(gaps)} grandfathered axis gaps (burn-down: {', '.join(gaps)}), "
         f"{md_count} MODEL-DIVERGENCE headers grammar-checked, "
-        f"{len(refusal_files)} files swept by the negative refusal census"
+        f"{len(refusal_files)} files swept by the negative refusal census and the wire-secs pacing-seam census"
     )
     if fails:
         print("FAIL: census-corpora violations —", file=sys.stderr)

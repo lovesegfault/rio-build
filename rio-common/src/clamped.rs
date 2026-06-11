@@ -148,6 +148,34 @@ impl WireSecs {
         }
     }
 
+    /// Pacing-seam conversion (merged_bug_156): a wire-supplied
+    /// retry/poll hint bounded by a PER-DOMAIN ceiling — minutes, not
+    /// the one-year absurdity bound, because saturating a SLEEP at a
+    /// year is still a wedge (the loops these hints feed wake only on
+    /// shutdown, and idle clocks credit only between answers, so an
+    /// absurd hint parks the loop past every exit). `0` stays `None`
+    /// ("no hint stated", the proto3 default); a set value is min'd
+    /// against the ceiling.
+    ///
+    /// Two-part truth (stated at its own strength): (a) BY
+    /// CONSTRUCTION — a seam that converts through `pacing` cannot
+    /// emit a sleep above its domain ceiling; (b) CENSUS-HELD, a
+    /// lint-tier guarantee — the seam POPULATION (no proto→sleep seam
+    /// bypasses this constructor) is held by the
+    /// wire-secs-pacing-seams arm of `nix/census_corpora.py`, which
+    /// refuses raw `from_secs` over `*_seconds` proto fields in
+    /// production code. A prost-layer wrapper that would make the
+    /// population claim compile-literal is the recorded alternative,
+    /// commissionable, not landed here.
+    #[must_use]
+    pub fn pacing(self, domain_ceiling: Duration) -> Option<Duration> {
+        if self.0 == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(self.0).min(domain_ceiling))
+        }
+    }
+
     /// The min-nonzero fold law owned by the type: unset loses to any
     /// set value; two set values take the minimum. (Previously a free
     /// fn beside the scheduler fold; owning it here keeps the law and
@@ -297,6 +325,32 @@ mod tests {
             Some(Duration::from_secs(WireSecs::MAX_SECS)),
             "the saturated duration is Instant-add-safe"
         );
+    }
+
+    /// The pacing law (merged_bug_156): 0 stays None (no hint), sane
+    /// values pass exactly, absurd values min against the PER-DOMAIN
+    /// ceiling — including u64::MAX, which the mint saturates at the
+    /// 1-yr ceiling first and the domain ceiling then bounds to
+    /// sleep-scale.
+    #[test]
+    fn wire_secs_pacing_bounds_under_the_domain_ceiling() {
+        let ceiling = Duration::from_secs(300);
+        assert_eq!(WireSecs::from_wire(0).pacing(ceiling), None);
+        assert_eq!(
+            WireSecs::from_wire(5).pacing(ceiling),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            WireSecs::from_wire(300).pacing(ceiling),
+            Some(Duration::from_secs(300))
+        );
+        for absurd in [1_000_000, WireSecs::MAX_SECS + 1, u64::MAX] {
+            assert_eq!(
+                WireSecs::from_wire(absurd).pacing(ceiling),
+                Some(ceiling),
+                "pacing({absurd}) must bound at the domain ceiling"
+            );
+        }
     }
 
     /// The fold law on the type: unset loses to any set value, two

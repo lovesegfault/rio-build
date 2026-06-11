@@ -26,6 +26,18 @@ use rio_proto::types::{
 /// allowlist accepts exactly this caller).
 pub const STORE_SERVICE_CALLER: &str = "rio-store";
 
+/// R17 domain ceiling for the wire-supplied claim-retry floor
+/// (merged_bug_156): the floor feeds `Pace::Floor` →
+/// `jitter.apply(floor).max(floor)` with a shutdown-only wake, so an
+/// unbounded hint parks the poll loop for its full stated duration.
+/// VIOLABLE, with the derivation: the scheduler's own producer clamps
+/// the hint at 300 s (`materialize.rs` `.clamp(0, 300)`), and
+/// `GRPC_STREAM_TIMEOUT` = 300 s bounds any single call — so 300 s is
+/// the largest floor a non-skewed producer can mean. A larger landed
+/// value trades parked-loop wedge depth for poll chatter; measure
+/// before moving it.
+const CLAIM_RETRY_PACING_CEILING: Duration = Duration::from_secs(300);
+
 /// Retry envelope for unacked outcome reports: exponential 1 s → 30 s
 /// cap, full jitter (the builder pull client's P5 discipline — copied
 /// constants, same rationale: the scheduler may be mid-failover).
@@ -1172,10 +1184,17 @@ async fn pull_once<T: MaterializeTransport>(
                        "materialization claim not delivered (race lost / not ready)");
                 // The ONE wire→type mapping site for the server's
                 // stated retry floor (round-8 WO-S2-1): zero on the
-                // wire = "no floor stated" (proto3 default).
+                // wire = "no floor stated" (proto3 default). Minted
+                // through the pacing constructor (merged_bug_156) —
+                // the floor feeds `Pace::Floor` →
+                // `jitter.apply(floor).max(floor)` with a
+                // shutdown-only wake, so the domain ceiling bounds it
+                // BY CONSTRUCTION.
                 PullAnswer::NotYetReady {
-                    retry_after: (nyr.retry_after_seconds > 0)
-                        .then(|| Duration::from_secs(u64::from(nyr.retry_after_seconds))),
+                    retry_after: rio_common::clamped::WireSecs::from_wire(u64::from(
+                        nyr.retry_after_seconds,
+                    ))
+                    .pacing(CLAIM_RETRY_PACING_CEILING),
                 }
             }
             None => {
@@ -6246,5 +6265,36 @@ mod tests {
         assert_eq!(t.list_calls, 0, "no listing at zero slots (no headroom)");
         assert_eq!(t.pull_calls, 0, "no presentations without obligations");
         assert_eq!(p.outcome, PassOutcome::Empty, "the normal idle pacing lane");
+    }
+
+    /// W10-BI (merged_bug_156, store seam): the ONE wire->type
+    /// mapping site flows into `Pace::Floor` ->
+    /// `jitter.apply(floor).max(floor)` with a shutdown-only wake —
+    /// an absurd wire hint parks the poll loop for its full stated
+    /// duration. The mapped floor must stay under the pacing ceiling.
+    #[test]
+    fn claim_retry_floor_paced_under_the_domain_ceiling() {
+        // Pre-fix red (the seam converted verbatim:
+        // `(wire > 0).then(|| Duration::from_secs(u64::from(wire)))`):
+        //   the claim-retry floor must stay under the pacing ceiling;
+        //   got 1000000s
+        let wire: u32 = 1_000_000;
+        // The seam conversion, as landed.
+        let retry_after = rio_common::clamped::WireSecs::from_wire(u64::from(wire))
+            .pacing(CLAIM_RETRY_PACING_CEILING);
+        let floor = retry_after.expect("set hint maps to a floor");
+        assert!(
+            floor <= CLAIM_RETRY_PACING_CEILING,
+            "the claim-retry floor must stay under the pacing ceiling; got {floor:?}"
+        );
+        // 0 = no floor stated; sane floors pass exactly.
+        assert_eq!(
+            rio_common::clamped::WireSecs::from_wire(0).pacing(CLAIM_RETRY_PACING_CEILING),
+            None
+        );
+        assert_eq!(
+            rio_common::clamped::WireSecs::from_wire(30).pacing(CLAIM_RETRY_PACING_CEILING),
+            Some(Duration::from_secs(30))
+        );
     }
 }
