@@ -559,7 +559,12 @@ impl DagActor {
         // tenant` budget, debited by Ready cores BEFORE the forecast
         // pass runs. Keyed on `attributed_tenant` (Option<Uuid> —
         // `None` for orphaned/recovered nodes; bucketed together so
-        // they're capped, not exempt).
+        // they're capped, not exempt). merged_bug_099: the ledger is
+        // computed against the UNFILTERED population every call —
+        // request filters are emission-time view projections, so the
+        // ceiling holds at the TENANT quantifier across however many
+        // per-pool views poll in a tick (one canonical admitted set;
+        // any view shows a subset of it).
         let mut tenant_forecast_budget: HashMap<Option<Uuid>, i64> = HashMap::new();
         let cap = i64::from(self.sla_config.max_forecast_cores_per_tenant);
 
@@ -692,10 +697,6 @@ impl DagActor {
             // dispatch's overflow walk tries cheapest first, so a
             // kvm builder spawned for ∅-feature work would idle until
             // activeDeadlineSeconds).
-            if !passes_intent_filter(state, kind, req) {
-                continue;
-            }
-
             // r[impl sched.sla.intent-from-solve]
             // ADR-023: per-derivation SpawnIntent. intent_id is the
             // drv_hash itself — the controller stamps it on the pod
@@ -707,9 +708,22 @@ impl DagActor {
             let intent = self.solve_intent_for(state, &hw, &cost, inputs_gen);
             // gap (d): debit Ready cores from the tenant's forecast
             // budget. A negative balance is fine — the forecast pass
-            // checks `> cores`, not `>= 0`.
+            // checks `> cores`, not `>= 0`. merged_bug_099: the debit
+            // runs against the UNFILTERED population — ABOVE the view
+            // filter — so every filtered poll sees the same per-tenant
+            // ledger (the ceiling is per-TENANT, never per-(tenant ×
+            // view); the solve is memoized, so the off-view solve cost
+            // is a SolveCache hit). The population gates above
+            // (classification, backoff, probe) are facts about what
+            // can spawn ANYWHERE and stay upstream of the debit.
             let tenant = state.attributed_tenant(&self.builds);
             *tenant_forecast_budget.entry(tenant).or_insert(cap) -= i64::from(intent.cores);
+            // The request filter is a VIEW PROJECTION over the
+            // population — emission-only, downstream of every
+            // admission/debit decision (merged_bug_099).
+            if !passes_intent_filter(state, kind, req) {
+                continue;
+            }
             // ADR-023 §13a affinity is deterministic (memoized) — no
             // selector-pin needed; the controller's `reap_stale_for_
             // intents` sees the SAME fingerprint across re-polls until
@@ -807,10 +821,11 @@ impl DagActor {
                 if self.has_pending_unclaimed_job(drv_hash) {
                     continue;
                 }
-                let kind = crate::state::kind_for_drv(state.is_fixed_output);
-                if !passes_intent_filter(state, kind, req) {
-                    continue;
-                }
+                // merged_bug_099: NO view filter here — the forecast
+                // candidate set and its budget admission are computed
+                // against the UNFILTERED population; the request
+                // filter projects at emission (below), so every
+                // filtered poll sees one canonical admitted set.
                 // 1-layer check: every incomplete dep is Assigned|
                 // Running with a fitted-curve ETA, OR substitution-
                 // active with the typed prior (F1 below). Any other
@@ -1007,7 +1022,15 @@ impl DagActor {
                     }
                     continue;
                 }
+                // merged_bug_099: the debit is an ADMISSION fact for
+                // the whole population — it lands whether or not this
+                // intent is in the caller's view, so concurrent
+                // per-pool polls cannot each spend a fresh cap.
                 *budget -= i64::from(intent.cores);
+                let kind = crate::state::kind_for_drv(state.is_fixed_output);
+                if !passes_intent_filter(state, kind, req) {
+                    continue;
+                }
                 intents.push((
                     state.sched.priority,
                     to_proto(drv_hash, state, &intent, false, eta),

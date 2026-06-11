@@ -4120,3 +4120,125 @@ async fn admin_mint_latency_bounded_under_long_tick() -> TestResult {
     }
     Ok(())
 }
+
+// r[verify sched.sla.forecast.tenant-ceiling]
+/// W10-S (merged_bug_099) — the tenant ceiling at the TENANT
+/// quantifier, not per-(tenant × filter view). Pre-fix
+/// `tenant_forecast_budget` was seeded fresh inside every
+/// `compute_spawn_intents` call and BOTH the Ready debit and the
+/// forecast gate sat downstream of `passes_intent_filter`, so the
+/// spec MUST (Ready cores subtracted before forecast admission,
+/// per-tenant) was enforced per filter view: the controller's
+/// per-pool polls each saw a fresh cap.
+///
+/// Two cells, one tenant, cap C = 8 (each unfitted intent solves to
+/// probe.cpu = 4):
+///
+/// (a) double-spend: forecast candidates split across two system
+///     views; pre-fix each view admits C worth → combined 2C (the
+///     red); post-fix the admission set is computed against the
+///     UNFILTERED population and views only PROJECT it — combined
+///     ≤ C.
+/// (b) cross-view Ready debit: Ready Σ8 on x86 exhausts the cap;
+///     the aarch64 view's forecast admission must see that debit
+///     (pre-fix it saw none — the Ready nodes fail the view filter
+///     before the debit line).
+#[tokio::test]
+async fn forecast_tenant_ceiling_holds_across_filter_views() {
+    use crate::sla::config::CapacityType;
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+
+    let view = |sys: &str| SpawnIntentsRequest {
+        systems: vec![sys.to_string()],
+        ..Default::default()
+    };
+    let forecast_cores = |snap: &crate::actor::SpawnIntentsSnapshot| -> u32 {
+        snap.intents
+            .iter()
+            .filter(|i| i.ready == Some(false))
+            .map(|i| i.cores)
+            .sum()
+    };
+
+    // ── (a) the double-spend cell ───────────────────────────────────
+    let mut actor = {
+        let mut sla = test_sla_config();
+        for s in ["x86_64-linux", "aarch64-linux"] {
+            let _ = s;
+        }
+        sla.lead_time_seed
+            .insert(("test-hw".into(), CapacityType::Spot), 200.0);
+        sla.max_forecast_cores_per_tenant = 8;
+        bare_actor_cfg(
+            db.pool.clone(),
+            DagActorConfig {
+                sla,
+                ..Default::default()
+            },
+        )
+    };
+    // 3 forecast candidates per system (3×4 = 12 > 8 per side).
+    for (sys, tags) in [
+        ("x86_64-linux", ["xa", "xb", "xc"]),
+        ("aarch64-linux", ["ya", "yb", "yc"]),
+    ] {
+        for q in tags {
+            let dep = format!("{q}dep");
+            actor.test_inject_at(&dep, sys, DerivationStatus::Running);
+            actor.test_inject_at(q, sys, DerivationStatus::Queued);
+            actor.test_inject_edge(q, &dep);
+            actor.test_set_running_eta(&dep, 50.0, 10, 4);
+        }
+    }
+    let spent_a = forecast_cores(&actor.compute_spawn_intents(&view("x86_64-linux")));
+    let spent_b = forecast_cores(&actor.compute_spawn_intents(&view("aarch64-linux")));
+    assert!(
+        spent_a + spent_b <= 8,
+        "left (pre-fix): one tenant, cap 8, TWO filter views — combined \
+         forecast spend {} + {} = {} ≈ 2×cap (each per-pool poll seeded a \
+         fresh budget; the ceiling was per-(tenant × view)) / right: the \
+         admission set is computed once against the unfiltered population \
+         and views only project it — combined ≤ cap at the tenant \
+         quantifier",
+        spent_a,
+        spent_b,
+        spent_a + spent_b
+    );
+
+    // ── (b) the cross-view Ready-debit cell ────────────────────────
+    let mut actor = {
+        let mut sla = test_sla_config();
+        sla.lead_time_seed
+            .insert(("test-hw".into(), CapacityType::Spot), 200.0);
+        sla.max_forecast_cores_per_tenant = 8;
+        bare_actor_cfg(
+            db.pool.clone(),
+            DagActorConfig {
+                sla,
+                ..Default::default()
+            },
+        )
+    };
+    // Ready Σ8 on x86 (2 × 4 cores) exhausts the cap; forecast
+    // candidates live on aarch64 only.
+    for r in ["r0", "r1"] {
+        actor.test_inject_ready(r, None, "x86_64-linux", false);
+    }
+    for q in ["za", "zb"] {
+        let dep = format!("{q}dep");
+        actor.test_inject_at(&dep, "aarch64-linux", DerivationStatus::Running);
+        actor.test_inject_at(q, "aarch64-linux", DerivationStatus::Queued);
+        actor.test_inject_edge(q, &dep);
+        actor.test_set_running_eta(&dep, 50.0, 10, 4);
+    }
+    let spent = forecast_cores(&actor.compute_spawn_intents(&view("aarch64-linux")));
+    assert_eq!(
+        spent, 0,
+        "left (pre-fix): the aarch64 view admitted {spent} forecast cores — \
+         the tenant's x86 Ready Σ8 never debited this view's budget (the \
+         debit sat below the view filter) / right: Ready cores debit the \
+         tenant's budget against the UNFILTERED population; the exhausted \
+         cap admits nothing in any view"
+    );
+}
