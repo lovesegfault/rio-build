@@ -699,24 +699,26 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // is unreachable: log + treat as queued=0 + requeue. Next tick
     // retries. We ALSO set a SchedulerUnreachable condition on the
     // Pool so operators can see WHY nothing is spawning.
-    let (mut intents, fetch_complete, aggregate_upper, scheduler_err): (
-        Vec<SpawnIntent>,
-        bool,
-        u32,
-        Option<String>,
-    ) = match queued_for_pool(ctx, pool).await {
-        Ok(view) => (view.held, view.complete, view.aggregate_upper, None),
-        Err(e) => {
-            warn!(
-                pool = %name, error = %e,
-                "spawn-intents poll failed; treating as queued=0, will retry"
-            );
-            // `complete=true`/`aggregate_upper=0` are vacuous here:
-            // `scheduler_err` already fail-closes every count consumer
-            // on its own conjunct.
-            (Vec::new(), true, 0, Some(e.to_string()))
-        }
-    };
+    let (mut page, evidence, scheduler_err): (IntentPage, DemandEvidence, Option<String>) =
+        match queued_for_pool(ctx, pool).await {
+            Ok(view) => {
+                let (page, evidence) = view.split();
+                (page, evidence, None)
+            }
+            Err(e) => {
+                warn!(
+                    pool = %name, error = %e,
+                    "spawn-intents poll failed; treating as queued=0, will retry"
+                );
+                // The failed-poll view's vacuous completeness is
+                // documented at `PoolDemandView::failed_poll`:
+                // `scheduler_err` fail-closes every count consumer on
+                // its own conjunct, and the empty want-map's
+                // early-return keeps the membership reap closed.
+                let (page, evidence) = PoolDemandView::failed_poll().split();
+                (page, evidence, Some(e.to_string()))
+            }
+        };
     // r[impl ctrl.nodeclaim.placeable-gate+5]
     // ADR-023 §13b placeable gate: Builder Jobs spawn only for intents
     // the nodeclaim_pool reconciler's last FFD sim placed on a
@@ -758,11 +760,11 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // pending; reap deletes it racing the job-tracking finalizer —
     // ci-failure-patterns "job-tracking finalizer orphan").
     let gate_armed = match (&ctx.placeable, pool.spec.kind) {
-        (Some(g), ExecutorKind::Builder) => g.retain(&mut intents),
+        (Some(g), ExecutorKind::Builder) => apply_placeable_gate(&mut page, g),
         (Some(_), _) => true,
         (None, _) => false,
     };
-    let queued = intents.len().min(u32::MAX as usize) as u32;
+    let queued = page.len_page().min(u32::MAX as usize) as u32;
 
     // ---- HwClassSampled (per-tick, one RPC for the union of A's) ----
     // r[impl ctrl.pool.hw-bench-needed+2]
@@ -776,7 +778,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // `!provides_features.is_empty()`) to skip the bench for classes
     // where the cost ladder is cheaper to seed directly.
     let hw_sampled =
-        HwSampledCache::fetch(ctx, intents.iter().flat_map(hw_classes_in).collect()).await;
+        HwSampledCache::fetch(ctx, page.iter_page().flat_map(hw_classes_in).collect()).await;
 
     // ---- Count active Jobs for this pool ----
     // r[impl ctrl.pool.tick-ordering]
@@ -824,23 +826,23 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     //     re-solve (ICE-backoff) NameCollision-blocks the new intent
     //     forever. Delete both before the spawn pass.
     //
-    // Reap sees the FULL intent set, NOT the headroom-truncated
-    // slice: when `ceiling` is set and every active slot is a
-    // selector-drifted Pending, headroom=0 → truncated slice is empty
-    // → reap's `want.is_empty()` early-return fires → nothing freed →
-    // headroom stays 0 forever. Reaping frees slots; it doesn't
-    // consume headroom, so the cap doesn't apply.
-    let reaped = reap_stale_for_intents(
-        &jobs_api,
-        &jobs.items,
-        &intents,
-        ctx,
-        pool,
-        &name,
-        pool.spec.kind,
-        &streak_key,
-    )
-    .await;
+    // Reap sees the FULL page, NOT the headroom-truncated slice: when
+    // `ceiling` is set and every active slot is a selector-drifted
+    // Pending, headroom=0 → truncated slice is empty → reap's
+    // `want.is_empty()` early-return fires → nothing freed → headroom
+    // stays 0 forever. Reaping frees slots; it doesn't consume
+    // headroom, so the cap doesn't apply.
+    //
+    // r[impl ctrl.pool.demand-completeness]
+    // The want-map is the ABSENCE lane: membership fused with the
+    // completeness witness (R26), so the orphan-pending arm's
+    // negative verdict is constructible only on a complete view —
+    // off-page is `Unknowable`, and the destructive arm suspends
+    // (merged_bug_029: the page-built want-map foreground-deleted
+    // still-wanted off-page Pending Jobs at 10s, single-tick).
+    let want = WantMap::for_pool(&page, evidence.coverage(), &name, pool.spec.kind);
+    let reaped =
+        reap_stale_for_intents(&jobs_api, &jobs.items, &want, ctx, pool, &name, &streak_key).await;
     // Reaped active Jobs (selector-drifted / orphan Pending) free
     // slots THIS tick; terminal reaped Jobs weren't counted in
     // `census.active` so don't double-count.
@@ -882,17 +884,19 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         .filter(|n| !reaped.contains(n))
         .collect();
 
-    // Filter-existing over the FULL intent set (bug_028: NO truncate
-    // here): `headroom = ceiling - active` already accounts for
+    // Filter-existing over the FULL page (bug_028: NO truncate here):
+    // `headroom = ceiling - active` already accounts for
     // still-Pending Jobs, but those Jobs' drvs (still Ready, not yet
-    // heartbeated) ALSO appear in `intents`. The wanted set feeds the
+    // heartbeated) ALSO appear on the page. The wanted set feeds the
     // AD2 gate below, which must evaluate EVERY wanted intent — the
     // retired take-before-gate shape derived the gated set from the
     // headroom window, so a genuinely exhausted intent pushed past
     // the cutoff by priority churn read as recovered and its streak
-    // never fired on a ceiling'd pool.
-    let wanted: Vec<SpawnIntent> = intents
-        .iter()
+    // never fired on a ceiling'd pool. (Page-lane walk: the gate's
+    // totality quantifier is per-HELD-element by design — see the
+    // W10-AH census row.)
+    let wanted: Vec<SpawnIntent> = page
+        .iter_page()
         .filter(|i| {
             !existing_names.contains(&pod::job_name(
                 &name,
@@ -1059,8 +1063,8 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         .filter_map(|j| j.metadata.name.clone())
         .filter(|n| !reaped.contains(n))
         .collect();
-    let to_ack: Vec<SpawnIntent> = intents
-        .iter()
+    let to_ack: Vec<SpawnIntent> = page
+        .iter_page()
         .filter(|i| {
             pending_job_names.contains(&pod::job_name(
                 &name,
@@ -1108,13 +1112,16 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // r[impl ctrl.pool.degraded-polarity]
     // I-183: spawn-only is half a control loop. `None` when scheduler
     // unreachable OR placeable-gate unarmed OR the demand view is
-    // incomplete: reap is fail-CLOSED (spawn is fail-open).
+    // unboundable: reap is fail-CLOSED (spawn is fail-open). On a
+    // truncated view the bound sums the TYPED population classes
+    // (Ready + forecast — merged_bug_006).
     let queued_known = reap_queued_known(
         scheduler_err.is_none(),
         gate_armed,
-        fetch_complete,
+        evidence.coverage() == DemandCoverage::Complete,
         queued,
-        aggregate_upper,
+        evidence.ready_upper(),
+        evidence.forecast_upper(),
     );
     reap_excess_pending(
         &jobs_api,
@@ -1198,19 +1205,7 @@ async fn queued_for_pool(
     ))
     .await?
     .into_inner();
-    // B3 truncation honesty (the proto's own consumer law): a
-    // truncated page understates demand, so absence-inference must
-    // come from the `queued_by_system` aggregate instead. The
-    // aggregate is by SYSTEM, before the kind/feature filters — a
-    // SUPERSET of this pool's demand on its systems, which is exactly
-    // the safe direction for a reap bound (over-counting under-reaps;
-    // the law lives in `reap_queued_known`).
-    let aggregate_upper = aggregate_upper_for(&pool.spec.systems, &resp.queued_by_system);
-    Ok(PoolDemandView {
-        complete: !resp.truncated,
-        aggregate_upper,
-        held: resp.intents,
-    })
+    Ok(PoolDemandView::from_response(resp, &pool.spec.systems))
 }
 
 /// Σ `queued_by_system[s]` over the pool's systems, saturated into
@@ -1229,66 +1224,326 @@ pub(crate) fn aggregate_upper_for(
         .min(u64::from(u32::MAX)) as u32
 }
 
-/// The per-reconcile demand view from [`queued_for_pool`]. `held` is
-/// the intent page this reconcile holds; `complete` says whether `held`
-/// is the WHOLE demand for this pool's filter; `aggregate_upper` is the
-/// `queued_by_system` sum over this pool's systems — the uncapped
-/// demand truth, a SUPERSET of the pool's filtered demand (the B3/B9
-/// consumer law):
+/// The per-reconcile demand view from [`queued_for_pool`] — the
+/// round-10 R26 chokepoint (`r[ctrl.pool.demand-completeness]`): the
+/// view is a PAGE of the scheduler's intent stream, and it no longer
+/// hands out its raw slice. The iteration surface is TYPED into
+/// lanes, and absence judgments demand the completeness witness BY
+/// CONSTRUCTION:
 ///
-/// - Counts that infer ABSENCE (`reap_excess_pending`'s `queued_known`)
-///   consume the EXACT post-filter count on a COMPLETE view — an
-///   incomplete page understates demand, and a pending Job whose
-///   intent fell outside the page would read as excess and be reaped
-///   while still wanted. On a TRUNCATED view the reap bound is the
-///   aggregate upper bound instead (over-counting under-reaps — the
-///   safe direction); truncated WITHOUT a usable aggregate ⇒
-///   fail-closed `None` via [`reap_queued_known`], the same lever as
-///   scheduler-unreachable.
-/// - Per-element walks (the AD2 spawn gate, stale-Job reap, the spawn
-///   pass) quantify over `held` only — their conclusions are per-intent
-///   and stay valid under any page (the bug_028 totality property is
-///   per-held-element: every HELD intent is evaluated, absent intents
-///   are simply not judged).
-struct PoolDemandView {
-    held: Vec<SpawnIntent>,
+/// - **Page lane** ([`IntentPage`], via [`Self::split`]): per-held-
+///   element walks whose conclusions are per-intent (the AD2 spawn
+///   gate, the spawn pass, the selector-drift compare, the mint).
+///   Lawful on any page — every HELD intent is evaluated; the lane's
+///   NAME carries the incompleteness so a totality-dependent consumer
+///   is unwritable without naming the page-scope (the W10-AH census
+///   classifies every consumer; the merged_bug_049 failures were
+///   positive walks with totality contracts, which an absence
+///   accessor alone cannot govern).
+/// - **Absence lane** ([`WantMap`], minted via [`WantMap::for_pool`]
+///   from the page + [`DemandCoverage`]): the ONLY source of negative
+///   evidence. On an incomplete view the only verdict an absence
+///   query can return is [`WantVerdict::Unknowable`] — "absent from
+///   page" cannot type-check as "absent from demand"; destructive
+///   absence-keyed arms (the orphan-pending reap) SUSPEND on it
+///   (merged_bug_029's close).
+/// - **Bound lane** ([`DemandEvidence`] → [`reap_queued_known`]):
+///   counts that infer absence consume the exact post-filter count on
+///   a COMPLETE view; on a truncated view the bound is the sum of the
+///   TYPED per-population aggregates (Ready + forecast — over-counting
+///   under-reaps, the safe direction; merged_bug_006's close: a
+///   forecast-backed Pending Job is counted by its own class, never
+///   assumed inside a Ready-only aggregate).
+/// - **Totality/continuity lane**: consumers whose contracts span
+///   pages (re-ack, evidence-expiry) derive from controller-local
+///   complete inventories or suspend while `Incomplete` — the third
+///   declared class; members file as W10-AH census rows.
+pub(crate) struct PoolDemandView {
+    page: IntentPage,
     complete: bool,
     /// Σ `queued_by_system[s]` for `s ∈ pool.spec.systems`, saturated
     /// into `u32` — pre-kind/feature-filter, hence ≥ the pool's true
-    /// demand on every coherent snapshot.
-    aggregate_upper: u32,
+    /// READY demand on every coherent snapshot.
+    ready_upper: u32,
+    /// Σ `forecast_by_system[s]` likewise — the forecast population
+    /// class (counted at the scheduler's emit chokepoint, post
+    /// tenant-budget admission). Absent on a pre-round-10 server ⇒ 0
+    /// (the legacy ready-only bound, typed at the proto field).
+    forecast_upper: u32,
 }
 
-/// The reap-authority law (W9-AW): a demand bound may drive
-/// excess-Pending reaping only when the scheduler answered, the
-/// placeable gate is armed, AND the demand is BOUNDABLE — exactly by
-/// the post-filter page count on a complete view, conservatively by
-/// the `queued_by_system` aggregate on a truncated one (B3 truncation
-/// honesty: the aggregate is the uncapped demand truth and a SUPERSET
-/// of every pool filter, so over-counting under-reaps — the safe
-/// direction for absence inference). A truncated view whose aggregate
-/// is empty is incoherent (truncation implies demand exists on the
-/// pool's systems) — fail-closed `None`, the same lever as
-/// scheduler-unreachable. `max(queued, aggregate)` is defensive
-/// against an incoherent snapshot ever reporting aggregate < page.
-/// Pure so the law table is unit-walkable.
+impl PoolDemandView {
+    /// The sole production constructor — from the wire response.
+    /// Tests construct the proto response (plain data) and enter
+    /// through here (R13: production constructors, no parallel
+    /// fixture lane).
+    pub(crate) fn from_response(
+        resp: rio_proto::types::GetSpawnIntentsResponse,
+        systems: &[String],
+    ) -> Self {
+        // B3 truncation honesty (the proto's own consumer law): a
+        // truncated page understates demand, so absence-inference
+        // must come from the per-class aggregates instead. Each
+        // aggregate is by SYSTEM, before the kind/feature filters — a
+        // SUPERSET of this pool's demand on its systems, which is
+        // exactly the safe direction for a reap bound (over-counting
+        // under-reaps; the law lives in `reap_queued_known`).
+        let ready_upper = aggregate_upper_for(systems, &resp.queued_by_system);
+        let forecast_upper = aggregate_upper_for(systems, &resp.forecast_by_system);
+        Self {
+            complete: !resp.truncated,
+            ready_upper,
+            forecast_upper,
+            page: IntentPage(resp.intents),
+        }
+    }
+
+    /// The failed-poll view: empty page, vacuously complete, zero
+    /// aggregates. `scheduler_err` already fail-closes every count
+    /// consumer on its own conjunct (`reap_queued_known`'s first
+    /// gate), and the empty want-map's early-return keeps the
+    /// membership reap closed — the vacuous `Complete` here is never
+    /// consulted for a destructive verdict.
+    fn failed_poll() -> Self {
+        Self {
+            page: IntentPage(Vec::new()),
+            complete: true,
+            ready_upper: 0,
+            forecast_upper: 0,
+        }
+    }
+
+    /// Decompose into the page lane and the evidence (witness +
+    /// bounds). The page mutates through its own typed surface; the
+    /// evidence is immutable for the tick.
+    pub(crate) fn split(self) -> (IntentPage, DemandEvidence) {
+        (
+            self.page,
+            DemandEvidence {
+                complete: self.complete,
+                ready_upper: self.ready_upper,
+                forecast_upper: self.forecast_upper,
+            },
+        )
+    }
+}
+
+/// The page lane of [`PoolDemandView`]: the held intents, EXPLICITLY
+/// page-scoped. Every read goes through [`Self::iter_page`] (the
+/// page-walk — per-held-element conclusions only) and every mutation
+/// through [`Self::retain_page`]; the inner vector is private, so a
+/// raw-slice membership test is unwritable outside this module and a
+/// consumer cannot quantify over the page without naming the
+/// page-scope. Absence judgments live on [`WantMap`]; demand bounds
+/// on [`DemandEvidence`].
+pub(crate) struct IntentPage(Vec<SpawnIntent>);
+
+impl IntentPage {
+    /// The page-scoped walk: per-held-element consumers only (spawn
+    /// candidates, per-intent RPC fan-out, selector rendering). A
+    /// consumer whose conclusion depends on what is NOT yielded is in
+    /// the wrong lane — see [`WantMap`] (absence) and the W10-AH
+    /// census (totality/continuity).
+    pub(crate) fn iter_page(&self) -> std::slice::Iter<'_, SpawnIntent> {
+        self.0.iter()
+    }
+
+    /// Page-scoped retain (the placeable-gate fold and siblings).
+    pub(crate) fn retain_page(&mut self, f: impl FnMut(&SpawnIntent) -> bool) {
+        self.0.retain(f);
+    }
+
+    /// Drop the whole page (the unarmed-gate posture).
+    pub(crate) fn clear_page(&mut self) {
+        self.0.clear();
+    }
+
+    /// Held-intent count — a PAGE property, not a demand bound
+    /// ([`reap_queued_known`] owns the bound law).
+    pub(crate) fn len_page(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Test-only page constructor (unit tests for the page-lane
+    /// consumers; integration paths enter via
+    /// [`PoolDemandView::from_response`]).
+    #[cfg(test)]
+    pub(crate) fn for_test(intents: Vec<SpawnIntent>) -> Self {
+        Self(intents)
+    }
+}
+
+/// The completeness witness, as a typed letter — constructed only by
+/// [`DemandEvidence::coverage`], so a consumer holding `Complete`
+/// provably read it off the view (R26: the witness is consumed BY the
+/// test, not asserted beside it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DemandCoverage {
+    /// The page IS the whole demand for this pool's filter.
+    Complete,
+    /// The page was truncated — membership absence is unknowable.
+    Incomplete,
+}
+
+/// The non-page half of the demand view: the completeness witness +
+/// the per-population-class demand bounds.
+pub(crate) struct DemandEvidence {
+    complete: bool,
+    ready_upper: u32,
+    forecast_upper: u32,
+}
+
+impl DemandEvidence {
+    /// The typed completeness letter (feeds [`WantMap::for_pool`] and
+    /// the continuity consumers' suspension law).
+    pub(crate) fn coverage(&self) -> DemandCoverage {
+        if self.complete {
+            DemandCoverage::Complete
+        } else {
+            DemandCoverage::Incomplete
+        }
+    }
+
+    /// The Ready-class demand upper bound (pool systems sum).
+    pub(crate) fn ready_upper(&self) -> u32 {
+        self.ready_upper
+    }
+
+    /// The forecast-class demand upper bound (pool systems sum).
+    pub(crate) fn forecast_upper(&self) -> u32 {
+        self.forecast_upper
+    }
+}
+
+/// The absence lane: job-name → render-fingerprint over the page,
+/// FUSED with the completeness witness. The ONLY way to obtain
+/// negative demand evidence ([`WantVerdict::AbsentFromDemand`]) is
+/// through [`Self::verdict`], whose absence arm exists only under
+/// [`DemandCoverage::Complete`] — on an incomplete page the answer is
+/// [`WantVerdict::Unknowable`] and the destructive absence-keyed arms
+/// suspend (merged_bug_029: "absent from page" must not type-check as
+/// "absent from demand").
+pub(crate) struct WantMap {
+    names: HashMap<String, String>,
+    coverage: DemandCoverage,
+}
+
+/// One job-name's demand verdict from [`WantMap::verdict`].
+pub(crate) enum WantVerdict<'a> {
+    /// The page wants this Job; payload = the render fingerprint for
+    /// the selector-drift compare. Positive evidence — valid on ANY
+    /// page (presence on a page proves demand).
+    Wanted(&'a str),
+    /// The COMPLETE view does not contain this Job's intent — true
+    /// negative evidence; the orphan arm may act on it.
+    AbsentFromDemand,
+    /// Not on this page, and the page is incomplete — absence is
+    /// unknowable; destructive arms suspend (re-judged next tick).
+    Unknowable,
+}
+
+impl WantMap {
+    /// Mint the absence lane for one pool from the page + the
+    /// coverage letter. The fingerprint is the same `RenderInputs`
+    /// projection the pod render stamps (`ctrl.pool.intent-candidate-
+    /// set`).
+    pub(crate) fn for_pool(
+        page: &IntentPage,
+        coverage: DemandCoverage,
+        pool: &str,
+        kind: ExecutorKind,
+    ) -> Self {
+        let names = page
+            .iter_page()
+            .map(|i| {
+                (
+                    pod::job_name(pool, kind, &intent_suffix(&i.intent_id)),
+                    candidate::RenderInputs::from_intent(i).fingerprint(),
+                )
+            })
+            .collect();
+        Self { names, coverage }
+    }
+
+    /// The R26 accessor: membership fused with the witness. Absence
+    /// is constructible only on a complete view.
+    pub(crate) fn verdict(&self, job_name: &str) -> WantVerdict<'_> {
+        match self.names.get(job_name) {
+            Some(fp) => WantVerdict::Wanted(fp),
+            None if self.coverage == DemandCoverage::Complete => WantVerdict::AbsentFromDemand,
+            None => WantVerdict::Unknowable,
+        }
+    }
+
+    /// Empty page (fail-closed gate for the membership reap — a
+    /// scheduler error or a cleared gate must not orphan-reap).
+    pub(crate) fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+}
+
+/// The reap-authority law (W9-AW, round-10 per-class form): a demand
+/// bound may drive excess-Pending reaping only when the scheduler
+/// answered, the placeable gate is armed, AND the demand is BOUNDABLE
+/// — exactly by the post-filter page count on a complete view,
+/// conservatively by the SUM OF THE TYPED POPULATION CLASSES (Ready +
+/// forecast aggregates) on a truncated one (B3 truncation honesty:
+/// each aggregate is the uncapped demand truth for its class and a
+/// SUPERSET of every pool filter, so over-counting under-reaps — the
+/// safe direction for absence inference). merged_bug_006: the
+/// single-aggregate form summed a Ready-only aggregate against a
+/// Ready+forecast page, so a forecast-backed Pending Job off-page was
+/// counted by NEITHER term and reaped while still wanted — and its
+/// "truncated with empty aggregate is incoherent" premise was false
+/// for an all-forecast page (fail-closed, but silently disabling the
+/// reap). With typed classes the premise is per-class: a truncated
+/// view where BOTH classes read zero is incoherent — fail-closed
+/// `None`, the same lever as scheduler-unreachable; an all-forecast
+/// page is bounded by its own class. `max(queued, Σclasses)` is
+/// defensive against an incoherent snapshot ever reporting
+/// aggregate < page. Pure so the law table is unit-walkable.
 // r[impl ctrl.pool.degraded-polarity]
+// r[impl ctrl.pool.demand-completeness]
 pub(crate) fn reap_queued_known(
     scheduler_ok: bool,
     gate_armed: bool,
     complete: bool,
     queued: u32,
-    aggregate_upper: u32,
+    ready_upper: u32,
+    forecast_upper: u32,
 ) -> Option<u32> {
     if !(scheduler_ok && gate_armed) {
         return None;
     }
+    let classes_upper = ready_upper.saturating_add(forecast_upper);
     if complete {
         Some(queued)
-    } else if aggregate_upper > 0 {
-        Some(queued.max(aggregate_upper))
+    } else if classes_upper > 0 {
+        Some(queued.max(classes_upper))
     } else {
         None
+    }
+}
+
+/// The placeable-gate fold over the page (Builder pools), through the
+/// page's OWN typed surface (round-10 R26 — the gate reads, the page
+/// mutates): retain to the FFD-placed-on-Registered set when armed;
+/// clear + `false` when unarmed (no FFD tick yet / standby replica) so
+/// `queued_known = None` keeps `reap_excess_pending` fail-closed.
+// r[impl ctrl.nodeclaim.placeable-gate+5]
+pub(crate) fn apply_placeable_gate(
+    page: &mut IntentPage,
+    gate: &crate::reconcilers::nodeclaim_pool::PlaceableGate,
+) -> bool {
+    match gate.snapshot() {
+        Some(placeable) => {
+            page.retain_page(|i| placeable.contains(&i.intent_id));
+            true
+        }
+        None => {
+            page.clear_page();
+            false
+        }
     }
 }
 
@@ -1512,6 +1767,11 @@ pub(super) enum ReapDisposition {
     ExcessPending,
     /// `reap_stale_for_intents` orphan-pending arm: the intent left.
     OrphanPending,
+    /// The orphan-pending arm SUSPENDED on an incomplete demand view
+    /// (round-10 merged_bug_029 / R26): off-page absence is
+    /// unknowable, so no delete — re-judged next tick. A non-delete
+    /// letter (like the ladder edges) so the suspension is observable.
+    OrphanSuspended,
     /// `reap_stale_for_intents` terminal arm: a finished Job blocking
     /// a still-wanted intent's respawn (NameCollision window).
     StaleTerminal,
@@ -1535,9 +1795,10 @@ impl ReapDisposition {
     /// variant without extending it fails the length assert against
     /// the exhaustive match below). Test-facing census surface.
     #[cfg(test)]
-    pub(super) const ALL: [Self; 7] = [
+    pub(super) const ALL: [Self; 8] = [
         Self::ExcessPending,
         Self::OrphanPending,
+        Self::OrphanSuspended,
         Self::StaleTerminal,
         Self::SelectorDrift,
         Self::OrphanRunning,
@@ -1550,6 +1811,7 @@ impl ReapDisposition {
         match self {
             Self::ExcessPending => "excess-pending",
             Self::OrphanPending => "orphan-pending",
+            Self::OrphanSuspended => "orphan-suspended",
             Self::StaleTerminal => "stale-terminal",
             Self::SelectorDrift => "selector-drift",
             Self::OrphanRunning => "orphan-running",
@@ -1697,11 +1959,10 @@ static STALE_STRIKES: std::sync::LazyLock<parking_lot::Mutex<StrikeLedger>> =
 pub(super) async fn reap_stale_for_intents(
     jobs_api: &Api<Job>,
     existing: &[Job],
-    intents: &[SpawnIntent],
+    want: &WantMap,
     ctx: &Ctx,
     pool_obj: &Pool,
     pool: &str,
-    kind: ExecutorKind,
     key: &candidate::PoolKey,
 ) -> HashSet<String> {
     let mut reaped = HashSet::new();
@@ -1712,15 +1973,6 @@ pub(super) async fn reap_stale_for_intents(
     let tick = STALE_STRIKES
         .lock()
         .begin_tick(pool, std::time::Instant::now());
-    let want: HashMap<String, String> = intents
-        .iter()
-        .map(|i| {
-            (
-                pod::job_name(pool, kind, &intent_suffix(&i.intent_id)),
-                candidate::RenderInputs::from_intent(i).fingerprint(),
-            )
-        })
-        .collect();
     if want.is_empty() {
         return reaped;
     }
@@ -1737,37 +1989,62 @@ pub(super) async fn reap_stale_for_intents(
         let Some(jn) = j.metadata.name.as_deref() else {
             continue;
         };
-        let (params, disposition) = match want.get(jn) {
-            // Not in the current intent set. Pending → orphan: the
-            // intent left (cancel / completes-elsewhere / disconnect)
-            // and this Job will never receive an assignment. Reap by
-            // intent-membership HERE so the surplus is the orphan set,
-            // not an arbitrary age-prefix — `select_excess_pending`'s
-            // oldest-first reap would otherwise delete still-live Jobs
-            // (losing in-flight Karpenter provisioning) while orphans
-            // survive ≥1 extra tick. Running → leave alone (may hold
-            // assignment; `reap_orphan_running` owns it). The
-            // `want.is_empty()` early-return above is the fail-closed
-            // gate (scheduler error → no orphan-reap).
-            None if is_pending_job(j) && job_older_than(j, REAP_PENDING_GRACE) => {
+        let (params, disposition) = match want.verdict(jn) {
+            // TRUE negative evidence (complete view only — the R26
+            // accessor). Pending → orphan: the intent left (cancel /
+            // completes-elsewhere / disconnect) and this Job will
+            // never receive an assignment. Reap by intent-membership
+            // HERE so the surplus is the orphan set, not an arbitrary
+            // age-prefix — `select_excess_pending`'s oldest-first reap
+            // would otherwise delete still-live Jobs (losing in-flight
+            // Karpenter provisioning) while orphans survive ≥1 extra
+            // tick. Running → leave alone (may hold assignment;
+            // `reap_orphan_running` owns it). The `want.is_empty()`
+            // early-return above is the fail-closed gate (scheduler
+            // error → no orphan-reap).
+            WantVerdict::AbsentFromDemand
+                if is_pending_job(j) && job_older_than(j, REAP_PENDING_GRACE) =>
+            {
                 (DeleteParams::foreground(), ReapDisposition::OrphanPending)
             }
-            None => continue,
-            Some(_) if !is_active_job(j) => {
+            WantVerdict::AbsentFromDemand => continue,
+            // r[impl ctrl.pool.demand-completeness]
+            // merged_bug_029: off an INCOMPLETE page, absence is
+            // unknowable — the destructive absence-keyed arm SUSPENDS
+            // (typed letter + counter so the suspension is
+            // observable), re-judged next tick. The 10s grace is
+            // unchanged for complete views; a still-wanted off-page
+            // Pending Job survives the window instead of being
+            // foreground-deleted single-tick (delete/respawn churn of
+            // in-flight Karpenter provisioning, exactly in the >2048-
+            // backlog regime the window targets).
+            WantVerdict::Unknowable => {
+                if is_pending_job(j) && job_older_than(j, REAP_PENDING_GRACE) {
+                    note_reap_disposition(pool, ReapDisposition::OrphanSuspended);
+                    debug!(
+                        pool, job = %jn,
+                        "orphan-pending reap suspended: demand view \
+                         incomplete (absence unknowable off-page; \
+                         re-judged next tick)"
+                    );
+                }
+                continue;
+            }
+            WantVerdict::Wanted(_) if !is_active_job(j) => {
                 (DeleteParams::background(), ReapDisposition::StaleTerminal)
             }
-            Some(want_sel)
+            WantVerdict::Wanted(want_sel)
                 if is_pending_job(j)
                     && j.metadata
                         .annotations
                         .as_ref()
                         .and_then(|a| a.get(INTENT_SELECTOR_ANNOTATION))
                         .map(String::as_str)
-                        != Some(want_sel.as_str()) =>
+                        != Some(want_sel) =>
             {
                 (DeleteParams::foreground(), ReapDisposition::SelectorDrift)
             }
-            Some(_) => continue,
+            WantVerdict::Wanted(_) => continue,
         };
         // R21: the log field IS the metric label — one alphabet.
         let why = disposition.as_label();
@@ -2373,7 +2650,7 @@ mod tests {
         }
         // The exhaustive match in as_label is the census; ALL must
         // cover it (a new variant fails the match first, then here).
-        assert_eq!(ReapDisposition::ALL.len(), 7);
+        assert_eq!(ReapDisposition::ALL.len(), 8);
     }
 
     /// W9-CO, Job-spec face (live_056-b): the minted Job carries the
@@ -3313,26 +3590,32 @@ mod tests {
     }
 
     // r[verify ctrl.nodeclaim.placeable-gate+5]
-    /// `PlaceableGate::retain` filters to the FFD-placed-on-Registered
-    /// set; unarmed gate clears + returns `false` so `queued_known =
-    /// None` (fail-closed reap).
+    /// `apply_placeable_gate` (the production fold, via the page's
+    /// typed surface) filters to the FFD-placed-on-Registered set;
+    /// unarmed gate clears + returns `false` so `queued_known = None`
+    /// (fail-closed reap).
     #[test]
     fn placeable_gate_retain_semantics() {
         use crate::reconcilers::nodeclaim_pool::PlaceableGate;
-        let mk = |ids: &[&str]| -> Vec<SpawnIntent> { ids.iter().map(|i| intent(i)).collect() };
+        let mk = |ids: &[&str]| -> IntentPage {
+            IntentPage::for_test(ids.iter().map(|i| intent(i)).collect())
+        };
 
         // Armed → filter to set, armed=true.
         let gate = PlaceableGate::from_ids(["a", "c", "z"]);
-        let mut v = mk(&["a", "b", "c"]);
-        assert!(gate.retain(&mut v));
-        let ids: Vec<&str> = v.iter().map(|i| i.intent_id.as_str()).collect();
+        let mut page = mk(&["a", "b", "c"]);
+        assert!(apply_placeable_gate(&mut page, &gate));
+        let ids: Vec<&str> = page.iter_page().map(|i| i.intent_id.as_str()).collect();
         assert_eq!(ids, vec!["a", "c"]);
 
         // Unarmed → clear, armed=false.
         let gate = PlaceableGate::unarmed();
-        let mut v = mk(&["a", "b"]);
-        assert!(!gate.retain(&mut v), "unarmed → false (fail-closed reap)");
-        assert!(v.is_empty());
+        let mut page = mk(&["a", "b"]);
+        assert!(
+            !apply_placeable_gate(&mut page, &gate),
+            "unarmed → false (fail-closed reap)"
+        );
+        assert_eq!(page.len_page(), 0);
     }
 
     // r[verify ctrl.nodeclaim.placeable-gate+5]
@@ -3343,27 +3626,29 @@ mod tests {
     #[test]
     fn placeable_gate_bounds_spawn_intent_fan_out() {
         use crate::reconcilers::nodeclaim_pool::PlaceableGate;
-        let mut intents: Vec<SpawnIntent> = (0..1226)
-            .map(|k| SpawnIntent {
-                intent_id: format!("i{k:04}"),
-                ready: Some(true),
-                ..Default::default()
-            })
-            .collect();
+        let mut page = IntentPage::for_test(
+            (0..1226)
+                .map(|k| SpawnIntent {
+                    intent_id: format!("i{k:04}"),
+                    ready: Some(true),
+                    ..Default::default()
+                })
+                .collect(),
+        );
         // FFD placed 9 on Registered nodes (arbitrary subset).
         let placed = [
             "i0000", "i0042", "i0137", "i0511", "i0512", "i0777", "i0999", "i1000", "i1225",
         ];
         let gate = PlaceableGate::from_ids(placed);
-        assert!(gate.retain(&mut intents));
+        assert!(apply_placeable_gate(&mut page, &gate));
         assert_eq!(
-            intents.len(),
+            page.len_page(),
             placed.len(),
             "1226 Ready intents → {} placeable Jobs (bounded by Registered-node \
              capacity, not Ready-set size)",
             placed.len()
         );
-        let survived: HashSet<&str> = intents.iter().map(|i| i.intent_id.as_str()).collect();
+        let survived: HashSet<&str> = page.iter_page().map(|i| i.intent_id.as_str()).collect();
         for id in placed {
             assert!(survived.contains(id), "{id} survived");
         }
@@ -3379,8 +3664,8 @@ mod tests {
         use crate::reconcilers::nodeclaim_pool::{Placement, placeable_channel};
         let (tx, gate) = placeable_channel();
         // Unarmed until first publish.
-        let mut v = vec![intent("x")];
-        assert!(!gate.retain(&mut v));
+        let mut page = IntentPage::for_test(vec![intent("x")]);
+        assert!(!apply_placeable_gate(&mut page, &gate));
 
         let placeable: Vec<Placement> = vec![
             (intent("on-reg"), "n1".into(), false),
@@ -3394,9 +3679,13 @@ mod tests {
             .collect();
         tx.send_replace(Some(std::sync::Arc::new(on_registered)));
 
-        let mut v = vec![intent("on-reg"), intent("on-inflight"), intent("on-reg-2")];
-        assert!(gate.retain(&mut v));
-        let ids: Vec<&str> = v.iter().map(|i| i.intent_id.as_str()).collect();
+        let mut page = IntentPage::for_test(vec![
+            intent("on-reg"),
+            intent("on-inflight"),
+            intent("on-reg-2"),
+        ]);
+        assert!(apply_placeable_gate(&mut page, &gate));
+        let ids: Vec<&str> = page.iter_page().map(|i| i.intent_id.as_str()).collect();
         assert_eq!(
             ids,
             vec!["on-reg", "on-reg-2"],
@@ -3623,5 +3912,158 @@ mod disk_four_caller_census {
             HELM_MEMBER_ROWS[1].contains("1 << 30"),
             "the script's LOG_BUDGET_BYTES row mirrors the 1 GiB const"
         );
+    }
+}
+
+#[cfg(test)]
+mod demand_lane_census {
+    //! **W10-AH (round-10 WO-S4-1, R26 banner): the demand-lane
+    //! consumer census** — every production consumer of the
+    //! [`super::PoolDemandView`] iteration/absence surfaces enrolled
+    //! with a CLASS DISPOSITION, machine-counted over the EMBEDDED
+    //! pool sources (include_str! — nix-gate safe, the (wwwww) form).
+    //! [GEN-SET] generator (committed; re-run on any count drift):
+    //!
+    //!   rg -n '\.iter_page\(|\.retain_page\(|\.clear_page\(|\.len_page\(|WantMap::for_pool\(|\.verdict\(' rio-controller/src/reconcilers/pool/
+    //!
+    //! Class dispositions (the row column; cardinality pinned by the
+    //! per-needle counts below):
+    //!
+    //! | site (jobs.rs prod)                  | lane          | class |
+    //! |--------------------------------------|---------------|-------|
+    //! | `WantMap::for_pool` body walk        | absence mint  | snapshot-tolerant (projects the page INTO the witness-fused map) |
+    //! | `HwSampledCache::fetch` fan-out      | page walk     | snapshot-tolerant (per-intent RPC union) |
+    //! | spawn-candidate filter (`wanted`)    | page walk     | snapshot-tolerant (per-held-element; AD2 totality is per-held by design) |
+    //! | `to_ack` pending re-ack              | page walk     | continuity — INTERIM page-lane (restart-totality contract; WO-S4-3 derives it from the controller's own Job LIST) |
+    //! | `apply_placeable_gate` retain/clear  | page mutation | snapshot-tolerant (gate fold) |
+    //! | `queued` count (`len_page`)          | page count    | snapshot-tolerant (bound law owns demand counting) |
+    //! | reconcile `WantMap::for_pool` mint   | absence mint  | the R26 accessor's sole production constructor call |
+    //! | reap loop `want.verdict(jn)`         | absence       | witness-fused verdict (suspends on `Unknowable`) |
+    //!
+    //! R22′ plants (BOTH evasion axes, red at the SCAN layer — the
+    //! corpora are raw-source strings driven through the same
+    //! detectors that police production):
+    //! - the raw-slice membership strawman (the merged_bug_029 shape);
+    //! - the continuity-style consumer on the page lane (an UNENROLLED
+    //!   `.iter_page` hit — the axis the triage named missing).
+
+    const JOBS_SRC: &str = include_str!("jobs.rs");
+    const JOB_SRC: &str = include_str!("job.rs");
+    const CANDIDATE_SRC: &str = include_str!("candidate.rs");
+    const POD_SRC: &str = include_str!("pod.rs");
+
+    /// Production half (same split as `disk_four_caller_census`).
+    fn prod(src: &str) -> &str {
+        src.split("#[cfg(test)]\nmod ").next().unwrap_or(src)
+    }
+
+    /// The committed census: (file, needle, count). A drift = a new
+    /// (or vanished) demand-lane consumer — re-run the generator and
+    /// file the site's class in the module-doc table.
+    const CENSUS: &[(&str, &str, usize)] = &[
+        ("jobs.rs", ".iter_page(", 4),
+        ("jobs.rs", ".retain_page(", 1),
+        ("jobs.rs", ".clear_page(", 1),
+        ("jobs.rs", ".len_page(", 1),
+        ("jobs.rs", "WantMap::for_pool(", 1),
+        ("jobs.rs", ".verdict(", 1),
+        ("job.rs", ".iter_page(", 0),
+        ("job.rs", ".verdict(", 0),
+        ("candidate.rs", ".iter_page(", 0),
+        ("candidate.rs", ".verdict(", 0),
+        ("pod.rs", ".iter_page(", 0),
+        ("pod.rs", ".verdict(", 0),
+    ];
+
+    fn src_for(file: &str) -> &'static str {
+        match file {
+            "jobs.rs" => JOBS_SRC,
+            "job.rs" => JOB_SRC,
+            "candidate.rs" => CANDIDATE_SRC,
+            "pod.rs" => POD_SRC,
+            other => panic!("unenrolled census file {other}"),
+        }
+    }
+
+    /// The raw-slice membership detector: absence inferred by walking
+    /// a bare intent slice for an id — the exact merged_bug_029 shape
+    /// the typed lanes exist to kill. Zero production hits.
+    fn raw_membership_hits(src: &str) -> usize {
+        src.matches(".iter().any(|i| i.intent_id ==").count()
+            + src.matches(".iter().all(|i| i.intent_id !=").count()
+    }
+
+    // r[verify ctrl.pool.demand-completeness]
+    /// Enrollment totality: per-(file, needle) hit counts equal the
+    /// committed census. A NEW page-lane/absence consumer fails here
+    /// naming its file — it enrolls with a class in the module-doc
+    /// table (closure tomorrow, not completeness today).
+    #[test]
+    fn demand_lane_consumers_enrolled() {
+        for (file, needle, want) in CENSUS {
+            let got = prod(src_for(file)).matches(needle).count();
+            assert_eq!(
+                got, *want,
+                "{file}: `{needle}` consumer count drifted — re-run \
+                 the [GEN-SET] generator and file the new site's class \
+                 disposition in the W10-AH table"
+            );
+        }
+    }
+
+    // r[verify ctrl.pool.demand-completeness]
+    /// Zero raw-slice membership tests remain in the pool plane (the
+    /// lanes are the ONLY demand-membership surface).
+    #[test]
+    fn no_raw_slice_membership_tests() {
+        for (file, src) in [
+            ("jobs.rs", JOBS_SRC),
+            ("job.rs", JOB_SRC),
+            ("candidate.rs", CANDIDATE_SRC),
+            ("pod.rs", POD_SRC),
+        ] {
+            assert_eq!(
+                raw_membership_hits(prod(src)),
+                0,
+                "{file}: raw-slice intent-membership test — absence \
+                 judgments go through WantMap::verdict (R26)"
+            );
+        }
+    }
+
+    // r[verify ctrl.pool.demand-completeness]
+    /// R22′ plant axis 1: the raw-membership strawman corpus is RED at
+    /// the scan layer (the detector fires on the planted shape — the
+    /// census's policing is live, not self-reported).
+    #[test]
+    fn plant_raw_membership_detected() {
+        const PLANT: &str =
+            r#"let gone = !intents.iter().any(|i| i.intent_id == wanted_id); if gone { reap(j); }"#;
+        assert!(
+            raw_membership_hits(PLANT) > 0,
+            "the raw-membership detector must fire on the planted \
+             merged_bug_029 shape"
+        );
+    }
+
+    // r[verify ctrl.pool.demand-completeness]
+    /// R22′ plant axis 2 (the axis the triage named missing): a
+    /// continuity-style consumer written on the PAGE lane is RED at
+    /// the scan layer — the scanner counts its `.iter_page(` hit, so
+    /// an unenrolled site (count drift) fails
+    /// `demand_lane_consumers_enrolled`.
+    #[test]
+    fn plant_continuity_on_page_lane_detected() {
+        const PLANT: &str = "let re_acked: Vec<_> = page.iter_page()\
+            .filter(|i| dispatched.contains(&i.intent_id)).collect();";
+        assert_eq!(
+            PLANT.matches(".iter_page(").count(),
+            1,
+            "the scanner must count a page-lane hit in the planted \
+             continuity-consumer corpus (enrollment drift = red)"
+        );
+        // The plant is NOT an enrolled census row — the same string
+        // appearing in any enrolled file would shift its committed
+        // count and fail enrollment totality.
     }
 }

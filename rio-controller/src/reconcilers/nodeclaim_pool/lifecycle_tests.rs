@@ -1078,10 +1078,7 @@ async fn loss_unarms_gate_same_tick() {
     // Arm: a healthy tick publishes (Some(∅) is armed).
     lab.tick(0, full_tick_scenario(vec![], vec![], vec![]))
         .await;
-    assert!(
-        lab.gate.retain(&mut Vec::new()),
-        "gate armed after FFD tick"
-    );
+    assert!(lab.gate.snapshot().is_some(), "gate armed after FFD tick");
 
     lab.r.hooks.on_lose();
     lab.leader_flag.store(false, Ordering::SeqCst);
@@ -1089,7 +1086,7 @@ async fn loss_unarms_gate_same_tick() {
     let acks_before = lab.ack_calls().len();
     lab.tick(10, Vec::new()).await; // empty queue: zero kube traffic
 
-    assert!(!lab.gate.retain(&mut Vec::new()), "gate unarmed same tick");
+    assert!(lab.gate.snapshot().is_none(), "gate unarmed same tick");
     assert_eq!(lab.ack_calls().len(), acks_before, "no admin traffic");
 }
 
@@ -1379,7 +1376,7 @@ async fn bot_tick_makes_exactly_two_lists_no_effects() {
     )
     .await;
     assert!(
-        !lab.gate.retain(&mut Vec::new()),
+        lab.gate.snapshot().is_none(),
         "placeable gate not (re)published on a ⊥ tick"
     );
     assert!(lab.ack_calls().is_empty(), "no ack attempted");

@@ -210,25 +210,18 @@ type PlaceableSet = Option<Arc<HashSet<String>>>;
 pub struct PlaceableGate(tokio::sync::watch::Receiver<PlaceableSet>);
 
 impl PlaceableGate {
-    /// Retain only intents whose `intent_id` is in the last-published
-    /// placeable set. Returns whether the gate is **armed** (a value has
-    /// been published). `false` ⇔ no FFD tick has run yet — caller
-    /// treats `queued` as unknown so `reap_excess_pending` stays
-    /// fail-closed (a standby replica whose lease-gated reconciler never
-    /// publishes would otherwise see `queued=0` and reap the leader's
-    /// Pending Jobs).
+    /// The last-published placeable set, or `None` while UNARMED (no
+    /// FFD tick has published yet — first ~10s after start, or a
+    /// standby replica whose lease-gated reconciler never runs). The
+    /// caller folds the unarmed posture itself: page cleared +
+    /// `queued` treated as unknown so `reap_excess_pending` stays
+    /// fail-closed (a standby replica would otherwise see `queued=0`
+    /// and reap the leader's Pending Jobs). Read-only accessor so the
+    /// page mutation stays on the demand view's own typed surface
+    /// (`IntentPage::retain_page` — round-10 R26).
     // r[impl ctrl.nodeclaim.placeable-gate+5]
-    pub fn retain(&self, intents: &mut Vec<SpawnIntent>) -> bool {
-        match self.0.borrow().clone() {
-            Some(set) => {
-                intents.retain(|i| set.contains(&i.intent_id));
-                true
-            }
-            None => {
-                intents.clear();
-                false
-            }
-        }
+    pub fn snapshot(&self) -> Option<Arc<HashSet<String>>> {
+        self.0.borrow().clone()
     }
 
     /// Test-only: gate seeded with `ids` (armed).

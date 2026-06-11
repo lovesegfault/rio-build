@@ -24,10 +24,25 @@ use crate::reconcilers::pool::job::{
     try_spawn_job,
 };
 use crate::reconcilers::pool::jobs::{
-    INTENT_ID_ANNOTATION, INTENT_SELECTOR_ANNOTATION, reap_stale_for_intents,
+    DemandCoverage, INTENT_ID_ANNOTATION, INTENT_SELECTOR_ANNOTATION, IntentPage, WantMap,
+    reap_stale_for_intents,
 };
 use rio_crds::pool::ExecutorKind;
 use rio_proto::types::{AttemptTerminalReason, OpenAttempt, SpawnIntent};
+
+/// Complete-view want-map over `intents` --- the pre-round-10 call
+/// shape for the legacy reap scenarios (their demand views were
+/// implicitly complete). Incomplete-view scenarios mint their own
+/// coverage via the production [`WantMap::for_pool`] with
+/// [`DemandCoverage::Incomplete`].
+fn want_complete(intents: &[SpawnIntent], pool: &str, kind: ExecutorKind) -> WantMap {
+    WantMap::for_pool(
+        &IntentPage::for_test(intents.to_vec()),
+        DemandCoverage::Complete,
+        pool,
+        kind,
+    )
+}
 
 // r[verify ctrl.pool.ephemeral+1]
 #[test]
@@ -426,11 +441,10 @@ async fn reap_stale_for_intents_selector_drift_and_terminal() {
     let strike_pass = reap_stale_for_intents(
         &jobs_api,
         &existing,
-        &intents,
+        &want_complete(&intents, "p", ExecutorKind::Builder),
         &ctx,
         &crate::fixtures::test_pool("p", ExecutorKind::Builder),
         "p",
-        ExecutorKind::Builder,
         &pkey(),
     )
     .await;
@@ -441,11 +455,10 @@ async fn reap_stale_for_intents_selector_drift_and_terminal() {
     let reaped = reap_stale_for_intents(
         &jobs_api,
         &existing,
-        &intents,
+        &want_complete(&intents, "p", ExecutorKind::Builder),
         &ctx,
         &crate::fixtures::test_pool("p", ExecutorKind::Builder),
         "p",
-        ExecutorKind::Builder,
         &pkey(),
     )
     .await;
@@ -540,11 +553,10 @@ async fn reap_stale_at_ceiling_saturation() {
     let strike_pass = reap_stale_for_intents(
         &jobs_api,
         &existing,
-        &intents,
+        &want_complete(&intents, "p", ExecutorKind::Builder),
         &ctx,
         &crate::fixtures::test_pool("p", ExecutorKind::Builder),
         "p",
-        ExecutorKind::Builder,
         &pkey(),
     )
     .await;
@@ -552,11 +564,10 @@ async fn reap_stale_at_ceiling_saturation() {
     let reaped = reap_stale_for_intents(
         &jobs_api,
         &existing,
-        &intents,
+        &want_complete(&intents, "p", ExecutorKind::Builder),
         &ctx,
         &crate::fixtures::test_pool("p", ExecutorKind::Builder),
         "p",
-        ExecutorKind::Builder,
         &pkey(),
     )
     .await;
@@ -924,11 +935,10 @@ async fn reap_stale_for_intents_reaps_orphan_pending() {
     let reaped = reap_stale_for_intents(
         &jobs_api,
         &existing,
-        &intents,
+        &want_complete(&intents, "p", ExecutorKind::Builder),
         &ctx,
         &crate::fixtures::test_pool("p", ExecutorKind::Builder),
         "p",
-        ExecutorKind::Builder,
         &pkey(),
     )
     .await;
@@ -944,11 +954,10 @@ async fn reap_stale_for_intents_reaps_orphan_pending() {
     let reaped = reap_stale_for_intents(
         &jobs_api2,
         &existing,
-        &[],
+        &want_complete(&[], "p", ExecutorKind::Builder),
         &ctx2,
         &crate::fixtures::test_pool("p", ExecutorKind::Builder),
         "p",
-        ExecutorKind::Builder,
         &pkey(),
     )
     .await;
@@ -1194,11 +1203,10 @@ async fn w9_ap_failed_listing_defers_all_adjudication() {
     let reaped = reap_stale_for_intents(
         &jobs_api,
         std::slice::from_ref(&j),
-        &intents,
+        &want_complete(&intents, "p", ExecutorKind::Builder),
         &ctx,
         &crate::fixtures::test_pool("p", ExecutorKind::Builder),
         "p",
-        ExecutorKind::Builder,
         &pkey(),
     )
     .await;
@@ -1209,11 +1217,10 @@ async fn w9_ap_failed_listing_defers_all_adjudication() {
     let reaped = reap_stale_for_intents(
         &jobs_api,
         std::slice::from_ref(&j),
-        &intents,
+        &want_complete(&intents, "p", ExecutorKind::Builder),
         &ctx,
         &crate::fixtures::test_pool("p", ExecutorKind::Builder),
         "p",
-        ExecutorKind::Builder,
         &pkey(),
     )
     .await;
@@ -1264,11 +1271,10 @@ async fn first_tick_reap_never_synthesizes_for_a_live_attempt() {
     let reaped = reap_stale_for_intents(
         &jobs_api,
         std::slice::from_ref(&job),
-        &[intent_named("race2")],
+        &want_complete(&[intent_named("race2")], "p", ExecutorKind::Builder),
         &ctx,
         &crate::fixtures::test_pool("p", ExecutorKind::Builder),
         "p",
-        ExecutorKind::Builder,
         &pkey(),
     )
     .await;
@@ -1316,11 +1322,10 @@ async fn attemptless_stale_job_reaps_on_the_second_strike() {
     let first = reap_stale_for_intents(
         &jobs_api,
         std::slice::from_ref(&job),
-        &intents,
+        &want_complete(&intents, "p", ExecutorKind::Builder),
         &ctx,
         &crate::fixtures::test_pool("p", ExecutorKind::Builder),
         "p",
-        ExecutorKind::Builder,
         &key,
     )
     .await;
@@ -1335,11 +1340,10 @@ async fn attemptless_stale_job_reaps_on_the_second_strike() {
     let second = reap_stale_for_intents(
         &jobs_api,
         std::slice::from_ref(&job),
-        &intents,
+        &want_complete(&intents, "p", ExecutorKind::Builder),
         &ctx,
         &crate::fixtures::test_pool("p", ExecutorKind::Builder),
         "p",
-        ExecutorKind::Builder,
         &key,
     )
     .await;
@@ -1396,11 +1400,10 @@ async fn w9_aq_strikes_reset_across_empty_want_gap_ticks() {
     let first = reap_stale_for_intents(
         &jobs_api,
         std::slice::from_ref(&job),
-        &intents,
+        &want_complete(&intents, "p", ExecutorKind::Builder),
         &ctx,
         &crate::fixtures::test_pool("p", ExecutorKind::Builder),
         "p",
-        ExecutorKind::Builder,
         &key,
     )
     .await;
@@ -1412,11 +1415,10 @@ async fn w9_aq_strikes_reset_across_empty_want_gap_ticks() {
         let gap = reap_stale_for_intents(
             &jobs_api,
             std::slice::from_ref(&job),
-            &[],
+            &want_complete(&[], "p", ExecutorKind::Builder),
             &ctx,
             &crate::fixtures::test_pool("p", ExecutorKind::Builder),
             "p",
-            ExecutorKind::Builder,
             &key,
         )
         .await;
@@ -1427,11 +1429,10 @@ async fn w9_aq_strikes_reset_across_empty_want_gap_ticks() {
     let post_gap = reap_stale_for_intents(
         &jobs_api,
         std::slice::from_ref(&job),
-        &intents,
+        &want_complete(&intents, "p", ExecutorKind::Builder),
         &ctx,
         &crate::fixtures::test_pool("p", ExecutorKind::Builder),
         "p",
-        ExecutorKind::Builder,
         &key,
     )
     .await;
@@ -1448,11 +1449,10 @@ async fn w9_aq_strikes_reset_across_empty_want_gap_ticks() {
     let adjacent = reap_stale_for_intents(
         &jobs_api,
         std::slice::from_ref(&job),
-        &intents,
+        &want_complete(&intents, "p", ExecutorKind::Builder),
         &ctx,
         &crate::fixtures::test_pool("p", ExecutorKind::Builder),
         "p",
-        ExecutorKind::Builder,
         &key,
     )
     .await;
@@ -2976,11 +2976,10 @@ async fn worker_closed_death_is_not_verdict_free() {
     let strike_pass = reap_stale_for_intents(
         &jobs_api,
         std::slice::from_ref(&job),
-        &[intent_named("wkc")],
+        &want_complete(&[intent_named("wkc")], "p", ExecutorKind::Builder),
         &ctx,
         &crate::fixtures::test_pool("p", ExecutorKind::Builder),
         "p",
-        ExecutorKind::Builder,
         &key,
     )
     .await;
@@ -2988,11 +2987,10 @@ async fn worker_closed_death_is_not_verdict_free() {
     let reaped = reap_stale_for_intents(
         &jobs_api,
         &[job],
-        &[intent_named("wkc")],
+        &want_complete(&[intent_named("wkc")], "p", ExecutorKind::Builder),
         &ctx,
         &crate::fixtures::test_pool("p", ExecutorKind::Builder),
         "p",
-        ExecutorKind::Builder,
         &key,
     )
     .await;
@@ -3134,11 +3132,10 @@ async fn pre_creation_close_does_not_cover_a_death() {
     let first = reap_stale_for_intents(
         &jobs_api,
         std::slice::from_ref(&job),
-        &[intent_named("precre")],
+        &want_complete(&[intent_named("precre")], "p", ExecutorKind::Builder),
         &ctx,
         &crate::fixtures::test_pool("p", ExecutorKind::Builder),
         "p",
-        ExecutorKind::Builder,
         &key,
     )
     .await;
@@ -3146,11 +3143,10 @@ async fn pre_creation_close_does_not_cover_a_death() {
     let reaped = reap_stale_for_intents(
         &jobs_api,
         std::slice::from_ref(&job),
-        &[intent_named("precre")],
+        &want_complete(&[intent_named("precre")], "p", ExecutorKind::Builder),
         &ctx,
         &crate::fixtures::test_pool("p", ExecutorKind::Builder),
         "p",
-        ExecutorKind::Builder,
         &key,
     )
     .await;
@@ -3920,49 +3916,77 @@ async fn w9_as_keyless_mode_spawns_every_intent_tokenless() {
     );
 }
 
-/// W9-AW (the reap-authority law table, WO-S4-1b): a `queued` count may
-/// drive excess-Pending reaping only when the scheduler answered, the
-/// placeable gate is armed, AND the demand is BOUNDABLE. A complete
-/// page is exact; a truncated page understates demand — a pending Job
-/// whose intent fell outside the page would read as excess and be
-/// reaped while still wanted (the window-starved-reap shape) — so the
-/// truncated arm consumes the `queued_by_system` AGGREGATE upper bound
-/// instead (the uncapped demand truth; over-counting under-reaps), and
-/// a truncated view WITHOUT a usable aggregate (incoherent server)
-/// fail-closes like scheduler-unreachable. The downstream consequence
-/// of `None` is already pinned by
-/// `reap_excess_pending_noop_when_covered_or_unknown`; this table is
-/// the authority law itself, walked over the full cube × the aggregate
-/// axis. Pre-fix red (the deferred-everywhere strawman — the shipped
-/// 4-arg law lifted verbatim to the new arity): the truncated+aggregate
-/// rows returned `None`, deferring reaps exactly when demand ≫ the
-/// page (the regime large pending sets coincide with).
+// r[verify ctrl.pool.demand-completeness]
+/// W9-AW, round-10 per-class form (the reap-authority law table): a
+/// `queued` count may drive excess-Pending reaping only when the
+/// scheduler answered, the placeable gate is armed, AND the demand is
+/// BOUNDABLE. A complete page is exact; a truncated page understates
+/// demand — a pending Job whose intent fell outside the page would
+/// read as excess and be reaped while still wanted — so the truncated
+/// arm consumes the SUM OF THE TYPED POPULATION CLASSES (Ready +
+/// forecast aggregates; over-counting under-reaps), and a truncated
+/// view where BOTH classes read zero (incoherent server) fail-closes
+/// like scheduler-unreachable. The table walks the full cube × the
+/// (ready, forecast) class product, pinning the merged_bug_006 rows:
+/// a forecast-only aggregate BOUNDS the reap (the all-forecast page no
+/// longer silently disables it — the old single-aggregate incoherence
+/// premise died with the typed classes), and a mixed page is bounded
+/// by the CLASS SUM, never the Ready class alone.
+///
+/// Pre-fix red (merged_bug_006, captured at the old 5-arg law before
+/// the forecast axis landed): the forecast-only row
+/// `(complete=false, ready=0, forecast=20)` returned `None` (reap
+/// silently disabled) and the mixed row `(ready=20, forecast=15)`
+/// returned `Some(20)` — under-bounding true wanted demand by the
+/// whole forecast class; a forecast-backed Pending Job off-page read
+/// as excess.
 #[test]
 fn reap_authority_requires_complete_demand_view() {
     use crate::reconcilers::pool::jobs::reap_queued_known;
     for sched_ok in [false, true] {
         for armed in [false, true] {
             for complete in [false, true] {
-                for aggregate in [0u32, 20] {
-                    let got = reap_queued_known(sched_ok, armed, complete, 7, aggregate);
-                    let want = if !(sched_ok && armed) {
-                        None
-                    } else if complete {
-                        Some(7) // exact post-filter count; aggregate ignored
-                    } else if aggregate > 0 {
-                        Some(20) // max(page, aggregate) — the superset bound
-                    } else {
-                        None // truncated + no aggregate: unboundable
-                    };
-                    assert_eq!(
-                        got, want,
-                        "authority law (sched_ok={sched_ok}, armed={armed}, \
-                         complete={complete}, aggregate={aggregate})"
-                    );
+                for ready_upper in [0u32, 20] {
+                    for forecast_upper in [0u32, 15] {
+                        let got = reap_queued_known(
+                            sched_ok,
+                            armed,
+                            complete,
+                            7,
+                            ready_upper,
+                            forecast_upper,
+                        );
+                        let classes = ready_upper + forecast_upper;
+                        let want = if !(sched_ok && armed) {
+                            None
+                        } else if complete {
+                            Some(7) // exact post-filter count; classes ignored
+                        } else if classes > 0 {
+                            // max(page, class sum) — the superset bound;
+                            // forecast-only (ready=0) still bounds.
+                            Some(7u32.max(classes))
+                        } else {
+                            None // truncated + both classes zero: unboundable
+                        };
+                        assert_eq!(
+                            got, want,
+                            "authority law (sched_ok={sched_ok}, armed={armed}, \
+                             complete={complete}, ready={ready_upper}, \
+                             forecast={forecast_upper})"
+                        );
+                    }
                 }
             }
         }
     }
+
+    // The saturation corner: u32::MAX + u32::MAX must clamp, not wrap
+    // into a small bound that would re-open over-reaping.
+    assert_eq!(
+        reap_queued_known(true, true, false, 7, u32::MAX, u32::MAX),
+        Some(u32::MAX),
+        "class sum saturates"
+    );
 }
 
 /// The aggregate-bound projection ([`aggregate_upper_for`]): systems
@@ -3997,4 +4021,232 @@ fn aggregate_upper_sums_pool_systems_saturating() {
         u32::MAX,
         "saturates, never wraps"
     );
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Round-10 WO-S4-1: the demand-completeness chokepoint (R26 banner)
+// ───────────────────────────────────────────────────────────────────
+
+// r[verify ctrl.pool.demand-completeness]
+/// **W10-AF (merged_bug_006).** PROPOSITION: under a >page-limit
+/// backlog (truncated view), a forecast-backed Pending Job whose
+/// intent rotated off the page is NOT excess — the truncated-arm
+/// bound sums BOTH typed population classes, so the bound covers it
+/// and `select_excess_pending` selects nothing. Composition walked at
+/// the law's own quantifier: the wire response (the production
+/// `from_response` constructor), the authority law, and the excess
+/// selection — end to end from the bytes the scheduler sends.
+///
+/// Pre-fix red (the 5-arg Ready-only law, captured with the forecast
+/// class severed): the bound read max(2, 3) = 3 against 5 still-wanted
+/// Pending Jobs — the two oldest (both forecast-backed, off-page)
+/// selected for deletion while still wanted:
+///   left: ["rio-old-fc-1", "rio-old-fc-2"] / right: []
+#[test]
+fn w10_af_forecast_backed_job_survives_truncated_bound() {
+    use crate::reconcilers::pool::job::select_excess_pending;
+    use crate::reconcilers::pool::jobs::{PoolDemandView, reap_queued_known};
+
+    // The scheduler's answer at a 2-intent page over a 3-Ready +
+    // 2-forecast backlog (page truncated): both classes aggregated
+    // full-population.
+    let resp = rio_proto::types::GetSpawnIntentsResponse {
+        intents: vec![intent_named("on-page-r"), intent_named("on-page-f")],
+        queued_by_system: [("x86_64-linux".to_string(), 3u64)].into(),
+        forecast_by_system: [("x86_64-linux".to_string(), 2u64)].into(),
+        ice_masked_cells: vec![],
+        truncated: true,
+    };
+    let (page, evidence) =
+        PoolDemandView::from_response(resp, &["x86_64-linux".to_string()]).split();
+    let queued = page.len_page() as u32;
+    let bound = reap_queued_known(
+        true,
+        true,
+        evidence.coverage() == DemandCoverage::Complete,
+        queued,
+        evidence.ready_upper(),
+        evidence.forecast_upper(),
+    );
+    assert_eq!(
+        bound,
+        Some(5),
+        "truncated bound = max(page 2, ready 3 + forecast 2)"
+    );
+
+    // 5 still-wanted Pending Jobs (2 forecast-backed ones the oldest —
+    // their intents are off-page). Post-fix: NOTHING is excess.
+    let jobs = vec![
+        pending_job("rio-old-fc-1", 0, 120),
+        pending_job("rio-old-fc-2", 0, 100),
+        pending_job("rio-r1", 0, 60),
+        pending_job("rio-r2", 0, 50),
+        pending_job("rio-r3", 0, 40),
+    ];
+    let excess = select_excess_pending(
+        &jobs,
+        &HashSet::new(),
+        bound.expect("boundable"),
+        std::time::Duration::ZERO,
+    );
+    let names: Vec<&str> = excess
+        .iter()
+        .filter_map(|j| j.metadata.name.as_deref())
+        .collect();
+    assert_eq!(
+        names,
+        Vec::<&str>::new(),
+        "the class-sum bound covers every still-wanted Pending Job \
+         (no forecast-backed Job reaped while wanted)"
+    );
+}
+
+// r[verify ctrl.pool.demand-completeness]
+/// **W10-AF, the fail-closed face (merged_bug_006 secondary).** An
+/// ALL-FORECAST truncated page no longer silently disables the excess
+/// reap: the forecast class bounds it. (The old single-aggregate law
+/// read ready-agg 0 ⇒ `None` — fail-closed but silent, wrongly
+/// branded "incoherent server"; the incoherence premise is now
+/// per-class: BOTH classes zero.) RECORDED: truncated + both classes
+/// zero stays the fail-closed `None` arm.
+#[test]
+fn w10_af_all_forecast_page_keeps_reap_bounded() {
+    use crate::reconcilers::pool::jobs::{PoolDemandView, reap_queued_known};
+    let resp = rio_proto::types::GetSpawnIntentsResponse {
+        intents: vec![intent_named("fc-a")],
+        queued_by_system: [].into(),
+        forecast_by_system: [("x86_64-linux".to_string(), 4u64)].into(),
+        ice_masked_cells: vec![],
+        truncated: true,
+    };
+    let (page, ev) = PoolDemandView::from_response(resp, &["x86_64-linux".to_string()]).split();
+    assert_eq!(
+        reap_queued_known(
+            true,
+            true,
+            ev.coverage() == DemandCoverage::Complete,
+            page.len_page() as u32,
+            ev.ready_upper(),
+            ev.forecast_upper(),
+        ),
+        Some(4),
+        "forecast-only truncated page is BOUNDED by its own class \
+         (pre-fix: None — the reap silently disabled)"
+    );
+    // The honest incoherence arm survives at the per-class quantifier.
+    assert_eq!(
+        reap_queued_known(true, true, false, 1, 0, 0),
+        None,
+        "truncated + BOTH classes zero = incoherent server, fail-closed"
+    );
+}
+
+// r[verify ctrl.pool.demand-completeness]
+/// **W10-AG (merged_bug_029).** PROPOSITION: a still-wanted Pending
+/// Job whose intent fell off the priority head (>page-limit backlog)
+/// is NOT foreground-deleted by the orphan-pending arm — on an
+/// INCOMPLETE view absence is unknowable ([`WantVerdict::Unknowable`])
+/// and the destructive arm SUSPENDS (typed `orphan-suspended` letter,
+/// counted), re-judged next tick. The verifier carries ZERO delete
+/// scenarios, so the pre-fix arm's foreground DELETE has no backend —
+/// the discriminating observable is the typed letter (absent pre-fix,
+/// exactly-one post-fix) plus the structurally-empty reaped set.
+///
+/// Pre-fix red (the coverage-blind want-map — absence judged off the
+/// bare page; the arm classified OrphanPending and issued the
+/// foreground DELETE against the scenario-less verifier):
+///   panicked at 'orphan-suspended letter not counted: None'
+#[tokio::test]
+async fn w10_ag_orphan_reap_suspends_on_incomplete_view() {
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let rec = DebuggingRecorder::new();
+    let _g = ::metrics::set_default_local_recorder(&rec);
+
+    let (client, verifier) = ApiServerVerifier::new();
+    let (ctx, _mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
+    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+
+    // One on-page intent (its Job lives); one OFF-PAGE Pending Job,
+    // old enough for the grace. View INCOMPLETE (truncated page).
+    let on_page = intent_named("onpage");
+    let want = WantMap::for_pool(
+        &IntentPage::for_test(vec![on_page]),
+        DemandCoverage::Incomplete,
+        "p",
+        ExecutorKind::Builder,
+    );
+    let existing = vec![pending_job("rio-offpage-job", 0, 30)];
+
+    // ZERO scenarios: any DELETE is a guard failure.
+    let guard = verifier.run(vec![]);
+    let reaped = reap_stale_for_intents(
+        &jobs_api,
+        &existing,
+        &want,
+        &ctx,
+        &crate::fixtures::test_pool("p", ExecutorKind::Builder),
+        "p",
+        &pkey(),
+    )
+    .await;
+    assert!(
+        reaped.is_empty(),
+        "off-page absence is unknowable — the orphan arm suspends \
+         instead of foreground-deleting a still-wanted Job"
+    );
+    guard.verified().await;
+
+    // The suspension is OBSERVABLE: the typed letter counted once.
+    // ppppp: snapshot exactly once.
+    let snap = rec.snapshotter().snapshot().into_vec();
+    let suspended = snap.into_iter().find_map(|(k, _, _, v)| {
+        let key = k.key();
+        (key.name() == "rio_controller_reap_dispositions_total"
+            && key
+                .labels()
+                .any(|l| l.key() == "disposition" && l.value() == "orphan-suspended"))
+        .then_some(v)
+    });
+    match suspended {
+        Some(metrics_util::debugging::DebugValue::Counter(n)) => {
+            assert_eq!(n, 1, "exactly one suspension letter this pass")
+        }
+        other => panic!("orphan-suspended letter not counted: {other:?}"),
+    }
+}
+
+// r[verify ctrl.pool.demand-completeness]
+/// The COMPLETE-view inverse of W10-AG: same off-page Pending Job,
+/// but the view is complete — true negative evidence; the orphan arm
+/// acts exactly as before (foreground delete after the grace). Pins
+/// that the suspension narrows to incomplete views only (the 10s
+/// grace semantics unchanged for complete views).
+#[tokio::test]
+async fn w10_ag_complete_view_orphan_reap_unchanged() {
+    let (client, verifier) = ApiServerVerifier::new();
+    let (ctx, _mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
+    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+
+    let want = want_complete(&[intent_named("onpage")], "p", ExecutorKind::Builder);
+    let existing = vec![pending_job("rio-orphan-job", 0, 30)];
+    let guard = verifier.run(vec![Scenario {
+        method: http::Method::DELETE,
+        path_contains: "/namespaces/rio/jobs/rio-orphan-job",
+        body_contains: Some(r#""propagationPolicy":"Foreground""#),
+        status: 200,
+        body_json: serde_json::to_string(&Job::default()).unwrap(),
+    }]);
+    let reaped = reap_stale_for_intents(
+        &jobs_api,
+        &existing,
+        &want,
+        &ctx,
+        &crate::fixtures::test_pool("p", ExecutorKind::Builder),
+        "p",
+        &pkey(),
+    )
+    .await;
+    assert_eq!(reaped, HashSet::from(["rio-orphan-job".to_string()]));
+    guard.verified().await;
 }
