@@ -94,8 +94,9 @@ fn compute_local_nar_hash(path: &Path, algo: FodHashAlgo) -> anyhow::Result<Vec<
 /// in ANY component (`RESOLVE_NO_SYMLINKS`, including the final one)
 /// and never escapes `upper_store` via `..` (`RESOLVE_BENEATH`) —
 /// strictly stronger than the previous final-component-only
-/// `O_NOFOLLOW`. Linux-only, like the rest of the builder (FUSE +
-/// io_uring).
+/// `O_NOFOLLOW`. `O_NONBLOCK` keeps a build-planted writer-less FIFO
+/// from hanging the open; the fstat check then rejects it. Linux-only,
+/// like the rest of the builder (FUSE + io_uring).
 fn compute_local_flat_hash(
     upper_store: &Path,
     rel: &Path,
@@ -115,8 +116,11 @@ fn compute_local_flat_hash(
             Mode::empty(),
         )
         .with_context(|| format!("failed to open upper store {}", upper_store.display()))?;
+        // O_NONBLOCK: a blocking open of a build-planted FIFO with no
+        // writer sleeps forever; with O_NONBLOCK it returns at once and
+        // the fstat below rejects it (no effect on regular-file reads).
         let how = OpenHow::new()
-            .flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC)
+            .flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK)
             .resolve(ResolveFlag::RESOLVE_BENEATH | ResolveFlag::RESOLVE_NO_SYMLINKS);
         let fd = openat2(&dirfd, rel, how).with_context(|| {
             format!(
@@ -763,6 +767,35 @@ mod tests {
         assert!(
             res.is_err(),
             "flat hash must reject a `..` escape from the upper store, got {res:?}"
+        );
+        Ok(())
+    }
+
+    /// A FIFO at the output path must be rejected, not hung on:
+    /// `RESOLVE_NO_SYMLINKS` does not exclude FIFOs, and a blocking
+    /// `openat2` of a writer-less FIFO sleeps until a writer appears —
+    /// a build could wedge the verifier forever. `O_NONBLOCK` makes the
+    /// open return immediately so the fstat check can reject the FIFO.
+    /// Red-proven: without `O_NONBLOCK` in the openat2 `how.flags`,
+    /// this test hangs in the open.
+    #[test]
+    fn test_verify_fod_flat_fifo_rejected() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let store_dir = tmp.path().join("nix/store");
+        std::fs::create_dir_all(&store_dir)?;
+        nix::unistd::mkfifo(
+            &store_dir.join("test-flat-fifo"),
+            nix::sys::stat::Mode::from_bits_truncate(0o644),
+        )?;
+
+        let declared = "00".repeat(32);
+        let drv = make_fod_drv("/nix/store/test-flat-fifo", "sha256", &declared);
+
+        let err = verify_fod_hashes(&drv, &store_dir)
+            .expect_err("flat FOD verification must reject a FIFO output");
+        assert!(
+            err.to_string().contains("not a regular file"),
+            "error should come from the fstat file-type check: {err:#}"
         );
         Ok(())
     }
