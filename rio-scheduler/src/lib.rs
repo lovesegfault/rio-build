@@ -471,9 +471,76 @@ pub fn describe_metrics() {
         "Total derivation-to-worker assignments"
     );
     describe_counter!(
-        "rio_scheduler_cleanup_dropped_total",
-        "Terminal-build cleanup commands dropped due to channel backpressure; alert if rate > 0"
+        "rio_scheduler_input_closure_unattested_total",
+        "Dispatches whose input closure was NOT attested, labeled by reason \
+         (seeds_unknown/missing_narinfo/db_error/timeout). Each one degrades \
+         the builder to its own drv-parsed closure BFS and the store skips \
+         closure-digest verification for that build; a sustained nonzero \
+         rate means attestation is effectively disabled — compare against \
+         rio_scheduler_assignments_total."
     );
+    describe_counter!(
+    ||||||| parent of f90560f10 (fix(rio-scheduler): never attest a truncated input closure)
+            "rio_scheduler_prefetch_hints_sent_total",
+            "PrefetchHint messages sent (one per assignment with paths to warm). \
+             Missing from a dispatch = leaf drv (no children)."
+        );
+    describe_counter!(
+        "rio_scheduler_prefetch_paths_sent_total",
+        "Total paths in sent PrefetchHints. Divide by hints_sent for avg \
+         paths-per-hint."
+    );
+    describe_counter!(
+        "rio_scheduler_warm_gate_fallback_total",
+        "best_executor() fell back to cold workers because NO warm worker \
+         passed the hard filter. Single-worker clusters and mass scale-up \
+         expect nonzero; sustained high rate = workers never warming \
+         (PrefetchComplete not arriving — check worker logs)."
+    );
+    describe_histogram!(
+        "rio_scheduler_warm_prefetch_paths",
+        "Paths fetched per initial warm-gate PrefetchHint (from the worker's \
+         PrefetchComplete ACK). 0 = worker was already warm (cache hit on \
+         everything); high = fresh worker cold-fetched everything."
+    );
+    describe_counter!(
+    =======
+            "rio_scheduler_input_closure_unattested_total",
+            "Dispatches whose input closure was NOT attested, labeled by reason \
+             (seeds_unknown/missing_narinfo/db_error/timeout). Each one degrades \
+             the builder to its own drv-parsed closure BFS and the store skips \
+             closure-digest verification for that build; a sustained nonzero \
+             rate means attestation is effectively disabled — compare against \
+             rio_scheduler_assignments_total."
+        );
+    describe_counter!(
+        "rio_scheduler_prefetch_hints_sent_total",
+        "PrefetchHint messages sent (one per assignment with paths to warm). \
+         Missing from a dispatch = leaf drv (no children)."
+    );
+    describe_counter!(
+        "rio_scheduler_prefetch_paths_sent_total",
+        "Total paths in sent PrefetchHints. Divide by hints_sent for avg \
+         paths-per-hint."
+    );
+    describe_counter!(
+        "rio_scheduler_warm_gate_fallback_total",
+        "best_executor() fell back to cold workers because NO warm worker \
+         passed the hard filter. Single-worker clusters and mass scale-up \
+         expect nonzero; sustained high rate = workers never warming \
+         (PrefetchComplete not arriving — check worker logs)."
+    );
+    describe_histogram!(
+        "rio_scheduler_warm_prefetch_paths",
+        "Paths fetched per initial warm-gate PrefetchHint (from the worker's \
+         PrefetchComplete ACK). 0 = worker was already warm (cache hit on \
+         everything); high = fresh worker cold-fetched everything."
+    );
+    describe_counter!(
+    >>>>>>> f90560f10 (fix(rio-scheduler): never attest a truncated input closure)
+            "rio_scheduler_cleanup_dropped_total",
+            "Terminal-build cleanup commands dropped due to channel backpressure; alert if rate > 0"
+        );
     describe_counter!(
         "rio_scheduler_transition_rejected_total",
         "State-machine transition rejections (labeled by target state); alert if rate > 0"

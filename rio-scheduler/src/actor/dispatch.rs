@@ -1225,6 +1225,9 @@ impl DagActor {
                             debug!(drv_hash = %drv_hash,
                                    "input closure not attestable from scheduler state; \
                                     builder falls back to its own drv-parsed closure");
+                            metrics::counter!("rio_scheduler_input_closure_unattested_total",
+                                              "reason" => "seeds_unknown")
+                            .increment(1);
                             Vec::new()
                         }
                         Some(seeds) if seeds.is_empty() => Vec::new(),
@@ -1235,17 +1238,40 @@ impl DagActor {
                             )
                             .await
                             {
-                                Ok(Ok(rows)) => rows,
+                                Ok(Ok(Some(rows))) => rows,
+                                // A closure member with no narinfo row → the walk
+                                // can't prove the set complete (already warned in
+                                // compute_input_roots). Same degrade as the arms
+                                // below: no attestation, builder computes its own
+                                // drv-parsed closure.
+                                Ok(Ok(None)) => {
+                                    metrics::counter!(
+                                        "rio_scheduler_input_closure_unattested_total",
+                                        "reason" => "missing_narinfo"
+                                    )
+                                    .increment(1);
+                                    Vec::new()
+                                }
                                 Ok(Err(e)) => {
                                     warn!(drv_hash = %drv_hash, error = %e,
                                           "input_roots closure compute failed; \
                                            builder falls back to QueryPathInfo BFS");
+                                    metrics::counter!(
+                                        "rio_scheduler_input_closure_unattested_total",
+                                        "reason" => "db_error"
+                                    )
+                                    .increment(1);
                                     Vec::new()
                                 }
                                 Err(_) => {
                                     warn!(drv_hash = %drv_hash, timeout = ?self.grpc_timeout,
                                           "input_roots closure compute timed out; \
                                            builder falls back to QueryPathInfo BFS");
+                                    metrics::counter!(
+                                        "rio_scheduler_input_closure_unattested_total",
+                                        "reason" => "timeout"
+                                    )
+                                    .increment(1);
                                     Vec::new()
                                 }
                             }

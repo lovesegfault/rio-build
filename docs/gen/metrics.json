@@ -110,6 +110,7 @@
     "rio_scheduler_heartbeat_adoptions_total",
     "rio_scheduler_heartbeat_rejected_total",
     "rio_scheduler_hung_detect_skipped_no_authoritative_total",
+    "rio_scheduler_input_closure_unattested_total",
     "rio_scheduler_lease_acquired_total",
     "rio_scheduler_lease_lost_total",
     "rio_scheduler_log_batches_rejected_total",
@@ -792,6 +793,11 @@
         "name": "rio_scheduler_hung_detect_skipped_no_authoritative_total",
         "kind": "counter",
         "help": "Busy executors skipped by detect_hung_nodes because no controller-reported spec.nodeName binding exists yet (controller-lag or AckSpawnedIntents channel down). Sustained nonzero with hung nodes un-reaped → check rio-controller nodeclaim_pool reconcile loop."
+      },
+      {
+        "name": "rio_scheduler_input_closure_unattested_total",
+        "kind": "counter",
+        "help": "Dispatches whose input closure was NOT attested, labeled by reason (seeds_unknown/missing_narinfo/db_error/timeout). Each one degrades the builder to its own drv-parsed closure BFS and the store skips closure-digest verification for that build; a sustained nonzero rate means attestation is effectively disabled — compare against rio_scheduler_assignments_total."
       },
       {
         "name": "rio_scheduler_lease_acquired_total",

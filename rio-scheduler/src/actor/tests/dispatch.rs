@@ -293,12 +293,30 @@ async fn test_pin_unpin_live_inputs_lifecycle() -> TestResult {
 // r[verify sched.dispatch.input-roots+2]
 #[tokio::test]
 async fn test_dispatch_attests_input_closure_from_parsed_drv() -> TestResult {
-    let (_db, handle, _task, mut rx) = setup_with_worker("attest-w1", "x86_64-linux").await?;
+    let (db, handle, _task, mut rx) = setup_with_worker("attest-w1", "x86_64-linux").await?;
 
     let child_drv_path = test_drv_path("attest-child");
     let child_out = test_store_path("attest-child-out");
     let src = test_store_path("attest-src");
     let parent_out = test_store_path("attest-parent-out");
+
+    // Every closure member needs a narinfo row: a member without one
+    // has unknown references, so compute_input_roots degrades the
+    // whole closure to unattested and this positive-half test would
+    // see an empty input_closure. Real flow: the store wrote these
+    // rows when the paths were uploaded.
+    for p in [&child_out, &src] {
+        use sha2::Digest as _;
+        let h = sha2::Sha256::digest(p.as_bytes()).to_vec();
+        sqlx::query(
+            "INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size, \"references\") \
+             VALUES ($1, $2, $1, 0, '{}')",
+        )
+        .bind(&h)
+        .bind(p)
+        .execute(&db.pool)
+        .await?;
+    }
 
     let mut child = make_node("attest-child");
     child.expected_output_paths = vec![child_out.clone()];
