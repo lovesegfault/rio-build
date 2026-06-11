@@ -122,6 +122,17 @@ impl ChunkBackend for TieredChunkBackend {
         self.remote.delete_by_key(key).await
     }
 
+    /// Remote only, same rationale as [`ChunkBackend::delete_by_key`]
+    /// — and delegating (rather than inheriting the default per-key
+    /// loop) keeps the remote tier's batched `DeleteObjects` in play
+    /// for the prod tiered configuration.
+    async fn delete_by_keys(
+        &self,
+        keys: &[String],
+    ) -> anyhow::Result<Vec<super::BatchDeleteFailure>> {
+        self.remote.delete_by_keys(keys).await
+    }
+
     // Blobs are the stock-Nix binary-cache surface (narinfo / NAR /
     // nix-cache-info). Stock Nix reads them straight from the regional
     // bucket — Express never sees them — so all three ops are

@@ -134,6 +134,16 @@ where
     }
 }
 
+/// One key that a [`ChunkBackend::delete_by_keys`] call failed to
+/// delete, with the backend's error text. The key stays in
+/// `pending_s3_deletes` (attempts incremented) and is retried on a
+/// later drain tick — per-key failures must never be silently dropped.
+#[derive(Debug)]
+pub struct BatchDeleteFailure {
+    pub key: String,
+    pub error: String,
+}
+
 /// Trait for chunk storage backends.
 #[async_trait::async_trait]
 pub trait ChunkBackend: Send + Sync {
@@ -188,6 +198,44 @@ pub trait ChunkBackend: Send + Sync {
     /// with backoff; after max attempts it stops (alert-worthy but not
     /// a process crash — S3 objects leak, PG state is correct).
     async fn delete_by_key(&self, key: &str) -> anyhow::Result<()>;
+
+    /// Delete many keys, returning the per-key failures. Same
+    /// idempotence contract as [`delete_by_key`](Self::delete_by_key).
+    ///
+    /// `Ok(failures)` means the call ran to completion; every key NOT
+    /// in `failures` was deleted (or was already gone). `Err` means
+    /// the call as a whole failed (auth/transport) and nothing can be
+    /// said per key — the caller treats all keys as not deleted.
+    /// [`BackendAuthError`] in the chain keeps its drain semantics
+    /// (stop the tick, don't burn retry attempts).
+    ///
+    /// The default implementation loops
+    /// [`delete_by_key`](Self::delete_by_key) — correct for the
+    /// filesystem/memory backends where a "batch" has no wire-level
+    /// advantage. S3
+    /// overrides this with `DeleteObjects` (1000 keys per round
+    /// trip): the GC drain previously issued one `DeleteObject` per
+    /// key, capping throughput at ~3.3 deletes/s per replica and
+    /// letting the tombstone backlog grow without bound past ~12k
+    /// enqueues/h.
+    async fn delete_by_keys(&self, keys: &[String]) -> anyhow::Result<Vec<BatchDeleteFailure>> {
+        let mut failures = Vec::new();
+        for key in keys {
+            if let Err(e) = self.delete_by_key(key).await {
+                // Auth is call-level, not key-level: the same denial
+                // will hit every remaining key, so surface it as a
+                // whole-call failure the drain can break on.
+                if e.downcast_ref::<BackendAuthError>().is_some() {
+                    return Err(e);
+                }
+                failures.push(BatchDeleteFailure {
+                    key: key.clone(),
+                    error: format!("{e:#}"),
+                });
+            }
+        }
+        Ok(failures)
+    }
 
     /// Store a string-keyed blob next to the chunk namespace.
     ///
@@ -989,6 +1037,77 @@ impl ChunkBackend for S3ChunkBackend {
 
     async fn delete_by_key(&self, key: &str) -> anyhow::Result<()> {
         self.s3_delete(key).await
+    }
+
+    /// Batched `DeleteObjects`: up to 1000 keys per round trip (the S3
+    /// API maximum). `quiet(true)` — the response carries only the
+    /// per-key errors, which map to [`BatchDeleteFailure`]s; a key
+    /// absent from `errors()` was deleted (or didn't exist —
+    /// idempotent, same as `DeleteObject`).
+    async fn delete_by_keys(&self, keys: &[String]) -> anyhow::Result<Vec<BatchDeleteFailure>> {
+        const S3_DELETE_OBJECTS_MAX: usize = 1000;
+        let mut failures = Vec::new();
+        for chunk in keys.chunks(S3_DELETE_OBJECTS_MAX) {
+            metrics::counter!("rio_store_s3_requests_total", "operation" => "delete_objects")
+                .increment(1);
+            let objects = chunk
+                .iter()
+                .map(|k| {
+                    aws_sdk_s3::types::ObjectIdentifier::builder()
+                        .key(k)
+                        .build()
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| anyhow::anyhow!("DeleteObjects key build failed: {e}"))?;
+            let delete = aws_sdk_s3::types::Delete::builder()
+                .set_objects(Some(objects))
+                .quiet(true)
+                .build()
+                .map_err(|e| anyhow::anyhow!("DeleteObjects request build failed: {e}"))?;
+            let out = self
+                .client
+                .delete_objects()
+                .bucket(&self.bucket)
+                .delete(delete)
+                .send()
+                .await
+                .map_err(|e| {
+                    classify_s3_error(
+                        e,
+                        format!(
+                            "S3 DeleteObjects ({} keys) failed for s3://{}",
+                            chunk.len(),
+                            self.bucket
+                        ),
+                    )
+                })?;
+            for err in out.errors() {
+                let error = format!(
+                    "{}: {}",
+                    err.code().unwrap_or("<no code>"),
+                    err.message().unwrap_or("<no message>"),
+                );
+                // An error entry without a Key cannot be attributed to
+                // any pending row. Reporting it under a placeholder key
+                // would leave the genuinely-failed key OUT of the
+                // failure list — the drain would drop its tombstone and
+                // the object would leak with no retry. Fail the whole
+                // call instead: the drain retries every row in the
+                // batch (idempotent for the keys that did delete).
+                let Some(key) = err.key().filter(|k| !k.is_empty()) else {
+                    anyhow::bail!(
+                        "S3 DeleteObjects for s3://{} returned an error entry \
+                         without a key ({error}); treating the batch as failed",
+                        self.bucket
+                    );
+                };
+                failures.push(BatchDeleteFailure {
+                    key: key.to_owned(),
+                    error,
+                });
+            }
+        }
+        Ok(failures)
     }
 
     async fn put_blob(&self, key: &str, data: Bytes) -> anyhow::Result<()> {
@@ -1978,5 +2097,95 @@ mod tests {
         assert!(b.get_blob("../escape").await.is_err());
         assert!(b.delete_blob("../escape").await.is_err());
         Ok(())
+    }
+
+    /// `delete_by_keys` batches N keys into ONE `DeleteObjects`
+    /// request (the whole point — the per-object `DeleteObject` drain
+    /// capped at ~3.3 deletes/s) and an error-free quiet response
+    /// means zero failures.
+    #[tokio::test]
+    async fn s3_delete_by_keys_single_request() -> anyhow::Result<()> {
+        use aws_sdk_s3::operation::delete_objects::DeleteObjectsOutput;
+        let del_r =
+            mock!(Client::delete_objects).then_output(|| DeleteObjectsOutput::builder().build());
+        let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&del_r]);
+        let b = make_s3_backend(client);
+
+        let keys: Vec<String> = (0u8..3).map(|i| b.key_for(&[i; 32])).collect();
+        let failures = b.delete_by_keys(&keys).await?;
+        assert!(failures.is_empty(), "quiet success → no failures");
+        assert_eq!(del_r.num_calls(), 1, "3 keys → ONE DeleteObjects call");
+        Ok(())
+    }
+
+    /// Per-key errors in the `DeleteObjects` response surface as
+    /// `BatchDeleteFailure`s (key + code/message) — the drain keeps
+    /// those rows tombstoned for retry instead of silently dropping
+    /// them with the successful majority.
+    #[tokio::test]
+    async fn s3_delete_by_keys_reports_per_key_errors() -> anyhow::Result<()> {
+        use aws_sdk_s3::operation::delete_objects::DeleteObjectsOutput;
+        use aws_sdk_s3::types::Error as S3Error;
+        let failed_key = "p/chunks/aa/".to_owned() + &"aa".repeat(32);
+        let failed_key_rule = failed_key.clone();
+        let del_r = mock!(Client::delete_objects).then_output(move || {
+            DeleteObjectsOutput::builder()
+                .errors(
+                    S3Error::builder()
+                        .key(&failed_key_rule)
+                        .code("InternalError")
+                        .message("We encountered an internal error.")
+                        .build(),
+                )
+                .build()
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&del_r]);
+        let b = make_s3_backend(client);
+
+        let keys = vec![failed_key.clone(), b.key_for(&[0xBB; 32])];
+        let failures = b.delete_by_keys(&keys).await?;
+        assert_eq!(failures.len(), 1, "only the errored key fails");
+        assert_eq!(failures[0].key, failed_key);
+        assert!(
+            failures[0].error.contains("InternalError"),
+            "error carries the S3 code; got {:?}",
+            failures[0].error
+        );
+        Ok(())
+    }
+
+    /// An error entry WITHOUT a Key cannot be attributed to any
+    /// pending row. Mapping it to `""` would let the genuinely-failed
+    /// key be absent from the failure list — the drain would treat it
+    /// as deleted, remove its tombstone, and the S3 object would leak
+    /// with no retry and no operator signal. It must surface as a
+    /// whole-call `Err` instead: the drain then bumps `attempts` on
+    /// every row in the batch and retries (idempotent for the keys
+    /// that did delete).
+    #[tokio::test]
+    async fn s3_delete_by_keys_keyless_error_fails_whole_call() {
+        use aws_sdk_s3::operation::delete_objects::DeleteObjectsOutput;
+        use aws_sdk_s3::types::Error as S3Error;
+        let del_r = mock!(Client::delete_objects).then_output(|| {
+            DeleteObjectsOutput::builder()
+                .errors(
+                    // No .key(...) — a malformed quiet-mode error entry.
+                    S3Error::builder()
+                        .code("InternalError")
+                        .message("We encountered an internal error.")
+                        .build(),
+                )
+                .build()
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&del_r]);
+        let b = make_s3_backend(client);
+
+        let keys = vec![b.key_for(&[0xAA; 32]), b.key_for(&[0xBB; 32])];
+        let res = b.delete_by_keys(&keys).await;
+        let err = res.expect_err("keyless error entry must fail the whole call");
+        assert!(
+            err.to_string().contains("without a key"),
+            "error should name the keyless entry; got {err:#}"
+        );
     }
 }
