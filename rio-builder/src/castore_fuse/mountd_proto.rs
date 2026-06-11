@@ -227,7 +227,10 @@ pub fn recv_frame(sock: RawFd) -> Result<RecvFrame, FrameError> {
     // overflowing into MSG_CTRUNC and leaking kernel-side fds.
     let mut cmsg = cmsg_space!([RawFd; 4]);
     let mut iov = [IoSliceMut::new(&mut buf)];
-    let msg = recvmsg::<()>(sock, &mut iov, Some(&mut cmsg), MsgFlags::empty())
+    // MSG_CMSG_CLOEXEC: received fds (the /dev/fuse session fd, backing
+    // fds) are capability-bearing and must not leak across exec into
+    // spawned children such as nix-daemon.
+    let msg = recvmsg::<()>(sock, &mut iov, Some(&mut cmsg), MsgFlags::MSG_CMSG_CLOEXEC)
         .map_err(|e| FrameError::Io(e.into()))?;
 
     let mut fds = Vec::new();
