@@ -54,7 +54,7 @@
 /// A typed, persisted hold every destructive actor consults: a
 /// GLOBAL hold suspends EVERY destructive lane — `run_gc` (no-op
 /// before mark, held tick stamped live) plus the whole
-/// census-derived lane set via the [`crate::gc::lane::DestructiveLane`]
+/// census-derived lane set via the `gc::lane::DestructiveLane`
 /// per-tick consult and the demand-driven reap face
 /// (merged_bug_050; `store.gc.hold-lanes`). A TENANT hold makes the
 /// held tenant's registered paths reachable regardless of their
@@ -198,7 +198,7 @@ pub mod hold {
     /// only mint point for [`HoldClearance`]. Callers MUST fail
     /// CLOSED on `Err` (an unreadable hold table is never read as
     /// "no hold") — the periodic form is
-    /// [`crate::gc::lane::DestructiveLane`]'s tick wrapper; the
+    /// `gc::lane::DestructiveLane`'s tick wrapper; the
     /// demand-driven form is `orphan::reap_one_consulted`.
     pub async fn gate(pool: &PgPool) -> Result<HoldGate, sqlx::Error> {
         Ok(match active_global_hold(pool).await? {

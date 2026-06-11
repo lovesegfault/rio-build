@@ -1,8 +1,4 @@
--- 104: gc_holds deletion-vector repair (RESTRICT).
--- The never-deleted doctrine becomes schema: gc_holds rows are audit
--- evidence and carry NO live deletion vector. 103's inline FK was
--- ON DELETE CASCADE; shipped migrations are frozen, so the repair is
--- this new migration (103 untouched). See M_104 for the rationale.
+-- Commentary: see rio-migrations/src/migrations.rs M_104
 
 ALTER TABLE gc_holds
     DROP CONSTRAINT gc_holds_tenant_id_fkey;

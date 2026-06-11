@@ -7,10 +7,10 @@
 //! `pending_s3_deletes` drain, the hourly log TTL sweep, and the
 //! gc-orphan-scanner each kept deleting during the freeze — and a
 //! held `run_gc` starving `last_live_cycle_at` GUARANTEED the
-//! backstop fired. [`DestructiveLane`] is the only way to register a
+//! backstop fired. `DestructiveLane` is the only way to register a
 //! deleting periodic lane: its tick wrapper consults holds
 //! FAIL-CLOSED before invoking the lane body and mints the per-tick
-//! [`hold::HoldClearance`] every named delete sink demands — an
+//! [`super::hold::HoldClearance`] every named delete sink demands — an
 //! unregistered `tokio::spawn` loop cannot reach a named sink at
 //! compile time.
 //!

@@ -2389,6 +2389,12 @@ pub const M_103: () = ();
 /// `104_gc_holds_restrict.sql` — bw10 WO-S1-3 (bug_095; the wave's
 /// single sanctioned DDL, R11-as-amended, full frozen ritual).
 ///
+/// **The statement (the .sql carries only the pointer + bare DDL per
+/// the migration-body policy):** drop and re-add
+/// `gc_holds_tenant_id_fkey` as `ON DELETE RESTRICT` — the
+/// never-deleted doctrine made schema: gc_holds rows are audit
+/// evidence and carry NO live deletion vector.
+///
 /// **The doctrine made schema.** `gc_holds` is KeepForever-registered
 /// ("released, never deleted — the hold history is audit evidence",
 /// stated in gc/mod.rs, M_103 above, and the retention registry), yet

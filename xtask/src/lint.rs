@@ -1995,7 +1995,7 @@ mod tests {
     fn keep_forever_flags_planted_cascade_fixture() {
         use rio_migrations::retention::KeepForeverDeleter;
         let planted = vec![(
-            "900_strawman.sql".to_string(),
+            "strawman_cascade.sql".to_string(),
             "CREATE TABLE evidence_rows (\n\
                  id UUID PRIMARY KEY,\n\
                  tenant_id UUID REFERENCES tenants (tenant_id) ON DELETE CASCADE\n\
@@ -2019,14 +2019,14 @@ mod tests {
         use rio_migrations::retention::KeepForeverDeleter;
         let corpus = vec![
             (
-                "901_create.sql".to_string(),
+                "a_strawman_create.sql".to_string(),
                 "CREATE TABLE evidence_rows (\n\
                      tenant_id UUID REFERENCES tenants (tenant_id) ON DELETE CASCADE\n\
                  );\n"
                     .to_string(),
             ),
             (
-                "902_repair.sql".to_string(),
+                "b_strawman_repair.sql".to_string(),
                 "ALTER TABLE evidence_rows\n\
                      DROP CONSTRAINT evidence_rows_tenant_id_fkey;\n\
                  ALTER TABLE evidence_rows\n\
