@@ -119,6 +119,14 @@ REGISTRY = [
     # lint-gap finding on this generator upgrades the corpus in the
     # same close.
     ("wire-secs-pacing-seams", "nix/census_corpora.py", r"WIRE_SECS_GRAMMAR", {"alias", "scope"}, {"fold-site"}, r"WIRE_SECS_GRAMMAR = \["),
+    # bw10 wave enrollments (the integrator's close): the round-10
+    # slots' new R22'-derived censuses, each row computed from the
+    # named in-generator refusal predicate / production table.
+    ("destructive-lane-census", "rio-store/src/gc/lane.rs", r"planted red", {"scope"}, set(), r"reaches-delete-sink"),
+    ("witnessed-disposition-product", "rio-scheduler/src/actor/floor.rs", r"witnessed_disposition_product_census", {"scope"}, set(), r"WITNESSED_LETTERS"),
+    ("cell-emission-wire-injectivity", "rio-scheduler/src/actor/tests/sla_contract.rs", r"w10z_cell_emission_wire_image_injectivity", {"scope"}, set(), r"classify_cell_emission"),
+    ("pool-demand-view-consumers", "rio-controller/src/reconcilers/pool/jobs.rs", r"W10-AH census", {"scope"}, set(), r"iter_page"),
+    ("leader-edges-census", "rio-scheduler/src/observability.rs", r"Every LEADER_EDGES row is named and total", {"scope"}, set(), r"LEADER_EDGES"),
 ]
 
 MODEL_DIVERGENCE = re.compile(

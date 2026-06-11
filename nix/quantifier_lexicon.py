@@ -72,7 +72,18 @@ import rust_strip
 LEXICON = ("ALL", "EVERY", "ANY", "NEVER", "ALWAYS", "ONLY", "SAME")
 HIT_RE = re.compile(r"\b(" + "|".join(LEXICON) + r")\b")
 
-BIND_RE = re.compile(r"quantifier:\s*(?:census|non-normative)\(\S[^)]*\)")
+BIND_RE = re.compile(
+    r"quantifier:\s*(?:census|non-normative)\(\S[^)]*\)"
+    # The two bind idioms the round-10 wave landed BEFORE this lint
+    # minted (recognizer reconciled at the wave-close tree, recorded):
+    # `bind[<fragment>.sh]` — helm narration bound to the named test
+    # fragment (S7's trigger/narration binds); and `machine-backed`
+    # in apposition to the quantifier — the inline form whose cite
+    # follows in the same comment block (S1's lane-census bind:
+    # "ALL is machine-backed (R23'): the census-derived ... set").
+    r"|bind\[\S+\]"
+    r"|machine-backed"
+)
 AUTO_BOUND = (
     "census[",
     "[GEN-SET]",
@@ -287,6 +298,15 @@ def selftest() -> str | None:
         p.write_text("// EVERY member censused — census[gen: x.txt]\nfn x() {}\n", encoding="utf-8")
         if list(scan(root)):
             return "auto-bound census[ line still hit"
+        # The two landed round-10 bind idioms (recognizer reconciled
+        # at the wave-close tree): S7's bind[<fragment>] tag and S1's
+        # machine-backed apposition both clear the hit.
+        p.write_text("// ALL replicas share the budget. bind[26-store-scaling.sh]\nfn x() {}\n", encoding="utf-8")
+        if list(scan(root)):
+            return "bind[fragment] idiom did not clear the hit"
+        p.write_text("// Suspend ALL collection — where ALL is machine-backed\nfn x() {}\n", encoding="utf-8")
+        if list(scan(root)):
+            return "machine-backed idiom did not clear the hit"
         # Lowercase IS the demoted form: no hit.
         p.write_text("// every member is checked here\nfn x() {}\n", encoding="utf-8")
         if list(scan(root)):

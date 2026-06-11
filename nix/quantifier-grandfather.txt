@@ -37,8 +37,10 @@ docs/spec/components/scheduler.typ	- For each downstream node, check if ALL inpu
 docs/spec/components/scheduler.typ	- Only skip a downstream node if ALL its input edges meet these conditions
 docs/spec/components/scheduler.typ	-and-determinate under EVERY live interested tenant, over a non-empty tenant
 docs/spec/components/scheduler.typ	ANY completed read of a lease this replica holds, observed while it
+docs/spec/components/scheduler.typ	EVERY emission of pinned demand) and MUST fail closed at every
 docs/spec/components/scheduler.typ	EVERY interested tenant, and a materialization job is created when every
 docs/spec/components/scheduler.typ	EVERY reader --- `passes_intent_filter`, `h_all` partition, `override_hash`
+docs/spec/components/scheduler.typ	EVERY report lane: the admitted success epilogue checks the resident node's
 docs/spec/components/scheduler.typ	NotIn` requirement for EVERY class at the derive seam --- one mint, so a
 docs/spec/components/scheduler.typ	Per ADR-019, fixed-output derivations route ONLY to fetcher-kind executors
 docs/spec/components/scheduler.typ	Running derivations are NEVER killed --- cutoff applies pre-dispatch only
@@ -47,6 +49,7 @@ docs/spec/components/scheduler.typ	`all_cells`/`fallback_cell` iterate THIS, not
 docs/spec/components/scheduler.typ	`build_timeout > 0` is settable ONLY via gRPC
 docs/spec/components/scheduler.typ	`resolve_globals` maxes over ALL per-class catalog ceilings, so one loose
 docs/spec/components/scheduler.typ	and non-FODs ONLY to builder-kind executors. The kind boundary is enforced
+docs/spec/components/scheduler.typ	at most once per attempt, ever; EVERY other witnessed letter (both
 docs/spec/components/scheduler.typ	bounds the staleness from ANY marks falsifier --- a foreign sweep racing a
 docs/spec/components/scheduler.typ	budget's exclusion key is the attempt's _source node_, and ONLY that: an
 docs/spec/components/scheduler.typ	cached content, mark that edge as cutoff and skip downstream only when ALL
@@ -55,10 +58,13 @@ docs/spec/components/scheduler.typ	dispatches the SAME shape. `queued_by_system`
 docs/spec/components/scheduler.typ	drv_hash = ANY($1)`. The merge-time resubmit-reset path (`reset_on_resubmit`)
 docs/spec/components/scheduler.typ	intent stays queued and the @fod waits --- the scheduler NEVER hands a FOD to
 docs/spec/components/scheduler.typ	its ceiling or the global --- and the grounding is EXCLUSION-ONLY negative
+docs/spec/components/scheduler.typ	kubelet `containerStatuses` attribution --- is the ONLY promoting letter
 docs/spec/components/scheduler.typ	parameter (`<> ALL($1::text[])`). The partial index `derivations_status_idx`
+docs/spec/components/scheduler.typ	registration sink) ONLY if it is a member of the scheduler-authoritative
 docs/spec/components/scheduler.typ	set confirms a live-wanted path missing-and-unsubstitutable under EVERY
 docs/spec/components/scheduler.typ	status; the ONLY lane that may warn and count a refusal), or
 docs/spec/components/scheduler.typ	widen-only establishment window governs the deadline/reap axis ONLY
+docs/spec/components/sla-sizing.typ	demanded, keyed to the attempt's first classification); EVERY other
 docs/spec/components/store.typ	(bug_284). `last_live_cycle_at` is stamped ONLY by a committed live
 docs/spec/components/store.typ	MUST outlive every log artifact keyed on it, under ANY retention
 docs/spec/components/store.typ	NEVER stall-reclaimable --- they stay under the heartbeat-death rule
@@ -67,8 +73,10 @@ docs/spec/components/store.typ	Sweep MUST, before deleting each candidate path Q
 docs/spec/components/store.typ	The store's log TTL sweep owns log artifacts ONLY: it deletes
 docs/spec/components/store.typ	WHERE blake3_hash = ANY($1)`, `INSERT ... ON CONFLICT` with UNNEST over hash
 docs/spec/components/store.typ	acquires row locks in ANY()/UNNEST scan order; unsorted overlapping sets
+docs/spec/components/store.typ	axes, ALL bound: *time* --- the hold envelope armed at grant
 docs/spec/components/store.typ	clean confirmed miss under EVERY resolved tenant, and an indeterminate view
 docs/spec/components/store.typ	composition is the ONLY way to attach a worker index; the
+docs/spec/components/store.typ	constructible ONLY through the one `DeclaredCharge` constructor, whose
 docs/spec/components/store.typ	contest losses are NEVER futility evidence --- they are the healthy
 docs/spec/components/store.typ	disposition MUST leave the iteration running until EVERY resolved tenant
 docs/spec/components/store.typ	driver task owns ALL job state (frontier, visited set, verdict-cell
@@ -77,6 +85,7 @@ docs/spec/components/store.typ	for EVERY handler in this rule's scope. *The no-d
 docs/spec/components/store.typ	is false). Baseline-slot queuing is MID-WALK-ONLY by construction: the
 docs/spec/components/store.typ	its TTL) MUST be reachable only when EVERY consulted upstream answered
 docs/spec/components/store.typ	merge writes ONLY this table). On match, sweep MUST skip Q and increment
+docs/spec/components/store.typ	migration 103): an active global-scope hold suspends EVERY destructive
 docs/spec/components/store.typ	mutated ONLY by the success-witness commit of a fully-processed
 docs/spec/components/store.typ	passing to downstream ANY() statements. A single defensive retry on 40P01
 docs/spec/components/store.typ	reservation) bounds in-flight NAR bytes across ALL concurrent `PutPath` AND
@@ -86,7 +95,9 @@ docs/spec/components/store.typ	the frontier. A row hidden from EVERY interested 
 docs/spec/components/store.typ	verdict --- the SAME decision body as the tenant-facing read gates,
 docs/spec/system/crate-structure.typ	// the dict below holds ALL trailing per-crate content (#r() markers,
 docs/spec/system/deployment.typ	trigger is its ONLY trigger, MUST set `spec.fallback`
+docs/spec/system/failure-modes.typ	An owner that replaces a live task with a successor for the SAME
 docs/spec/system/security.typ	- The scheduler NEVER routes a FOD to a builder, even under fetcher pressure
+docs/spec/system/security.typ	`expiry_unix − mint ≤ 7 days` for EVERY claims type a family key signs
 docs/spec/system/security.typ	controller, store) set `runAsNonRoot: true`, `capabilities.drop: [ALL]`,
 infra/helm/rio-build/templates/controller.yaml	# env (RIO_* wins for scalars). The [nodeclaim_pool] table is the ONLY way to
 infra/helm/rio-build/templates/gateway-scaledobject.yaml	# ONLY trigger, so fallback pins the HPA at a deliberate serving
@@ -95,6 +106,9 @@ infra/helm/rio-build/templates/jwt-signing-secret.yaml	# ed25519 JWT signing see
 infra/helm/rio-build/templates/karpenter.yaml	# I-205: x86_64 .metal SKUs are legacy-bios ONLY (zero support UEFI per
 infra/helm/rio-build/templates/karpenter.yaml	# Karpenter's generated NodeConfig MIME is the ONLY runtime input.
 infra/helm/rio-build/templates/karpenter.yaml	# applied to EVERY static pool, including ones no build ever
+infra/helm/rio-build/templates/karpenter.yaml	# builder pod, ALWAYS:
+infra/helm/rio-build/templates/karpenter.yaml	# exactly two FailedScheduling message classes for EVERY Pending
+infra/helm/rio-build/templates/karpenter.yaml	# shim events during an incident mean ONLY "many pods are Pending",
 infra/helm/rio-build/templates/namespace.yaml	# drop to restricted (runAsNonRoot, drop-ALL, seccomp:RuntimeDefault).
 infra/helm/rio-build/templates/networkpolicy.yaml	# Controller egress: DNS + kube-apiserver. The controller's ONLY
 infra/helm/rio-build/templates/networkpolicy.yaml	# Pool CRD an operator can apply a Pool{kind=Builder} into ANY
@@ -105,16 +119,21 @@ infra/helm/rio-build/templates/prometheusrule.yaml	# fail-closed -- ANY existing
 infra/helm/rio-build/templates/prometheusrule.yaml	# r41 bug_026: anchor on `ice_timeout_seconds` — the SAME number
 infra/helm/rio-build/templates/prometheusrule.yaml	# signal whenever ANY cell is mid-boot (see the
 infra/helm/rio-build/templates/scheduler.yaml	# All replicas contend for SAME Lease. Presence ENABLES lease mode
+infra/helm/rio-build/templates/store-scaledobject.yaml	# Code::Aborted ONLY — a code a LIVE store mints — so the trigger
+infra/helm/rio-build/templates/store-scaledobject.yaml	# rio_gateway_putpath_retry_events_total — EVERY failure
 infra/helm/rio-build/templates/store.yaml	# SAME origin list the scheduler renders — the contract is
 infra/helm/rio-build/values.yaml	# ("ALL CLASSES spot+on-demand — spot if available, else od")
 infra/helm/rio-build/values.yaml	# All replicas contend for SAME Lease. Presence of this name ENABLES lease
 infra/helm/rio-build/values.yaml	# Bucket-level prefix prepended to ALL rio keys (chunks/, logs/).
 infra/helm/rio-build/values.yaml	# Control plane + store drop to restricted — runAsNonRoot, drop-ALL,
 infra/helm/rio-build/values.yaml	# NEVER commit a real value — set via --set or values override file.
+infra/helm/rio-build/values.yaml	# ORDER-PIN (live_057-c): this flip is valid ONLY in a tree where
 infra/helm/rio-build/values.yaml	# SHAPING-ONLY levers (n bounds claimed jobs, F bounds per-job
 infra/helm/rio-build/values.yaml	# Used ONLY when existingSecret is unset (VM tests — airgapped,
 infra/helm/rio-build/values.yaml	# available to QueryPathInfo/GetPath miss traffic AT ALL TIMES,
 infra/helm/rio-build/values.yaml	# bidirectional ∅-guard means a featureless builder NEVER routes
+infra/helm/rio-build/values.yaml	# constants and the live values; touching ANY input re-derives
+infra/helm/rio-build/values.yaml	# default taxes EVERY warm pod's placement forever.
 infra/helm/rio-build/values.yaml	# expires at the SAME variable + 7 days of slack, so the two
 infra/helm/rio-build/values.yaml	# for ANY value of this knob and pathFanout. n and F are
 infra/helm/rio-build/values.yaml	# git::image_tag()). NEVER committed — private ECR, dev tags include
@@ -135,6 +154,7 @@ nix/quint_policy.py	# (b) a LET-WRAPPED ALL-NAME bundle (anon=0 after unwrap): t
 nix/quint_policy.py	# P7 green: the SAME propositions as NAMED leaves — conj_leaves
 nix/quint_policy.py	# bug_281 red: the SAME attack carried by a `run` declaration's
 nix/tests/helm/02-monitoring-kinds.sh	# r35 B1 (bug_003 second half): the no_hosting_class alert is the ONLY
+nix/tests/helm/14-disk-ceiling.sh	# karpenter.dataVolumeSize × 0.9). Touch ANY input ⇒ re-derive the
 nix/tests/helm/16-controller-checksum-covers-toml.sh	# checksum/controller-toml MUST change when ANY input that lands in the
 nix/tests/helm/18-metal-feature-routing.sh	#    makes the deletion safe ONLY IF a feature provided by a kvm-tainted
 nix/tests/helm/19-scheduler-checksum-covers-toml.sh	# TOML must NOT roll the pod. The named template must be ONLY the TOML —
@@ -153,12 +173,18 @@ nix/tests/helm/36-values-unconsumed-keys.sh	# bless; (3) keys mentioned ONLY in 
 nix/tests/helm/39-cluster-axis-single-source.sh	# external-secrets PG path is the chart's ONLY render-visible
 nix/tests/helm/40-controller-probes.sh	# live_054: the controller's /healthz is an axum task on the SAME
 nix/tests/helm/43-metal-capacity-doctrine.sh	# The spot+od doctrine ("ALL CLASSES spot+on-demand — spot if
+nix/tests/helm/45-store-scaledown-inhibitor.sh	# (b) the trigger narration names EVERY class of the alphabet (the
+nix/tests/helm/45-store-scaledown-inhibitor.sh	# Query strings ONLY for the negative pin — $trig carries the
 rio-auth/src/hmac.rs	// signer and verifier should get the SAME key regardless.
 rio-auth/src/hmac.rs	/// Signed with the SAME assignment-HMAC key as [`AssignmentClaims`]:
+rio-auth/src/hmac.rs	/// [`HmacKey::sign`] is the ONLY mint. Generated member list (the
+rio-auth/src/hmac.rs	/// [`MAX_HMAC_LIFETIME_SECS`] for EVERY claims type a family key
+rio-auth/src/hmac.rs	/// `expiry_unix − now > MAX_HMAC_LIFETIME_SECS`, for EVERY claims
 rio-auth/src/hmac.rs	/// `spawn` nonce (uuid-v4 hex), minted fresh by `Serialize` on EVERY
 rio-auth/src/hmac.rs	/// a `ServiceClaims` with ANY `instance` string that verifies
 rio-auth/src/hmac.rs	/// mints a `ServiceClaims` carrying ANY instance that verifies —
 rio-auth/src/hmac.rs	/// service key is fleet-shared and symmetric, so ANY key holder
+rio-auth/src/hmac.rs	/// signing, for EVERY claims type — this is the only signing body,
 rio-auth/src/jwt_interceptor.rs	// From here down, ANY failure is `UNAUTHENTICATED`. A caller
 rio-auth/src/jwt_interceptor.rs	// Read-lock scope: held ONLY for verify. `jwt::verify` is
 rio-auth/src/jwt_interceptor.rs	/// After a write-lock swap, the SAME interceptor instance (no
@@ -187,6 +213,7 @@ rio-builder/src/executor/mod.rs	// All daemon I/O is in a helper so we can ALWAY
 rio-builder/src/executor/mod.rs	// FUSE userspace; on fetch failure `lookup()` returns EIO (NEVER
 rio-builder/src/executor/mod.rs	// I-196: NEVER pass build_cores=0 to the daemon. 0 means "use
 rio-builder/src/executor/mod.rs	// deadline math is in-range for ANY wire value (u64::MAX
+rio-builder/src/executor/mod.rs	// live_057-a: the SAME sample feeds the disk-exhaustion
 rio-builder/src/executor/mod.rs	// nproc", and nproc inside a pod sees ALL node cores (cgroup CPU
 rio-builder/src/executor/mod.rs	/// so a footer is sent whenever ANY attempt ran a daemon: an
 rio-builder/src/fuse/cache.rs	///   `Some`  → JIT armed: ONLY names in the map are fetched.
@@ -243,6 +270,7 @@ rio-common/src/classify.rs	/// Fail-closed suspension: ALL chunk collection is s
 rio-common/src/classify.rs	/// in [`Self::failure_prefix`] and joining [`Self::ALL`] (the pin test
 rio-common/src/classify.rs	/// match, so a new variant cannot ship without joining ALL and
 rio-common/src/config.rs	//! value and CLI would ALWAYS win, defeating the layering.
+rio-common/src/config.rs	/// Total, saturating mint from raw seconds — the ONLY construction
 rio-common/src/cors.rs	//! rio-scheduler and rio-store expose different RPCs to the SAME
 rio-common/src/dns.rs	//! is the ONLY composition operation — it re-establishes the invariant
 rio-common/src/grpc.rs	// the SAME constant — a typo in a string literal at one site silently
@@ -264,6 +292,10 @@ rio-common/src/wanted_outputs.rs	/// SATURATION over the placeholder dimension (
 rio-common/src/wanted_outputs.rs	/// completion with zero verified paths. For ANY inputs, the
 rio-controller/src/config.rs	/// calls. SAME file as the gateway/scheduler/store
 rio-controller/src/config.rs	/// default is safe ONLY while this deployment's PG is private to
+rio-controller/src/guard.rs	// The SAME edge semantics as the main domain: one latch type,
+rio-controller/src/guard.rs	/// The injected-client form of [`Self::spawn_lease`]: the SAME
+rio-controller/src/guard.rs	/// off this; the watch owns ALL counting via its [`EdgeLatch`].
+rio-controller/src/guard.rs	/// root — the ONLY discharge for the handle. The root drains every
 rio-controller/src/lib.rs	// controller-synthesized delete arms — pinned through the SAME
 rio-controller/src/lib.rs	// must be named — the labels come from the SAME
 rio-controller/src/lib.rs	/// are pinned to the SAME shared consts the record sites consume —
@@ -305,6 +337,7 @@ rio-controller/src/reconcilers/node_informer.rs	/// the server's ONLY FailedPrec
 rio-controller/src/reconcilers/nodeclaim_pool/consolidate.rs	// r37 bug_009: hold-open and non-hold-open read the SAME
 rio-controller/src/reconcilers/nodeclaim_pool/consolidate.rs	// timestamp — the node has been idle since. NEVER seed
 rio-controller/src/reconcilers/nodeclaim_pool/consolidate.rs	// — both arms read the SAME `ctx.na_threshold`, so hold-open ≥
+rio-controller/src/reconcilers/nodeclaim_pool/consolidate.rs	/// (round-10 merged_bug_012): the SAME (intent, cell) admission
 rio-controller/src/reconcilers/nodeclaim_pool/consolidate.rs	/// cell. The ONLY call into `consolidate_after` from `reap_idle` —
 rio-controller/src/reconcilers/nodeclaim_pool/consolidate.rs	/// filter is the SAME predicate FFD's `hw_admits` uses, NOT a
 rio-controller/src/reconcilers/nodeclaim_pool/consolidate.rs	/// nodes ~5× low. The filter is the SAME predicate FFD's `simulate`
@@ -329,6 +362,7 @@ rio-controller/src/reconcilers/nodeclaim_pool/cover.rs	/// `div_ceil` on ALL THR
 rio-controller/src/reconcilers/nodeclaim_pool/cover.rs	/// `n·claim ≥ Σ` holds per-axis at EVERY candidate `n` — swept
 rio-controller/src/reconcilers/nodeclaim_pool/cover.rs	/// `rio.build/fetcher` taint ONLY (no builder_taint), and stamps
 rio-controller/src/reconcilers/nodeclaim_pool/cover.rs	/// cap — [`sizing`] can mint no valid claim of ANY `n` for it this
+rio-controller/src/reconcilers/nodeclaim_pool/cover.rs	/// capacity to a hosting class. NEVER poison-folded and NEVER an
 rio-controller/src/reconcilers/nodeclaim_pool/cover.rs	/// covers ALL intents (FFD oracle), and every claim ≤ per-axis cap.
 rio-controller/src/reconcilers/nodeclaim_pool/cover.rs	/// drives the per-cell role stamp; `taints` carries ONLY the
 rio-controller/src/reconcilers/nodeclaim_pool/cover.rs	/// from the SAME budget the dying node still occupies — the fleet never
@@ -340,9 +374,12 @@ rio-controller/src/reconcilers/nodeclaim_pool/cover.rs	/// tick for ANY cell of 
 rio-controller/src/reconcilers/nodeclaim_pool/evidence.rs	// A further mark advances the mark epoch, keeps the SAME
 rio-controller/src/reconcilers/nodeclaim_pool/evidence.rs	//! RETAINED step), `registered_cells` clears (the ONLY ladder reset).
 rio-controller/src/reconcilers/nodeclaim_pool/evidence.rs	//! [`PendingSchedulerEvidence::merge`] (clears enter ONLY through a
+rio-controller/src/reconcilers/nodeclaim_pool/ffd.rs	// Class A: one 64-core head (window is 32 — can NEVER fit) +
 rio-controller/src/reconcilers/nodeclaim_pool/ffd.rs	// ONLY, even though the partly-loaded dying node would win
+rio-controller/src/reconcilers/nodeclaim_pool/ffd.rs	// share and the oversized head is ALWAYS in the remainder.
 rio-controller/src/reconcilers/nodeclaim_pool/ffd.rs	/// SAME `(c,m,d)` the pod will request, not raw `disk_bytes`.
 rio-controller/src/reconcilers/nodeclaim_pool/ffd.rs	/// SAME tick.
+rio-controller/src/reconcilers/nodeclaim_pool/ffd.rs	/// blocking its class — siblings are admitted across EVERY
 rio-controller/src/reconcilers/nodeclaim_pool/ffd.rs	/// case: eligible on ANY node whose hw-class arch matches
 rio-controller/src/reconcilers/nodeclaim_pool/ffd.rs	/// mb_019(A): FFD compares against the SAME `(c,m,d)` triple the
 rio-controller/src/reconcilers/nodeclaim_pool/health.rs	///   rationale is REGISTERED-ONLY — the pre-fix arm applied it to
@@ -389,6 +426,7 @@ rio-controller/src/reconcilers/nodeclaim_pool/mod.rs	/// uses the SAME predicate
 rio-controller/src/reconcilers/nodeclaim_pool/mod.rs	/// via the SAME `features_compatible` predicate
 rio-controller/src/reconcilers/nodeclaim_pool/mod.rs	/// §13d Pool axis (r31 bug_019): does ANY configured Builder or Fetcher
 rio-controller/src/reconcilers/nodeclaim_pool/pods.rs	/// Rule (c) fail-safe half: an intent whose ONLY pod is terminating
+rio-controller/src/reconcilers/nodeclaim_pool/pods.rs	/// Rule (d), round-10 merged_bug_012: intent ids carried by ANY
 rio-controller/src/reconcilers/nodeclaim_pool/pods.rs	/// keyed like [`Self::bound`] and derived from the SAME rule-(c)
 rio-controller/src/reconcilers/nodeclaim_pool/wedge.rs	// Green half: node-1 re-detects ONLY from
 rio-controller/src/reconcilers/nodeclaim_pool/wedge.rs	// Heal in arbitrary order: only node-1's SAME two attempts are
@@ -432,11 +470,13 @@ rio-controller/src/reconcilers/pool/candidate.rs	/// disclosed strawman): an int
 rio-controller/src/reconcilers/pool/candidate.rs	/// respawn stays blocked at ANY future instant (no window), and
 rio-controller/src/reconcilers/pool/candidate.rs	/// spawn arm consults it on EVERY tick (including fold-skip
 rio-controller/src/reconcilers/pool/candidate.rs	/// universal post-arm filter), then streak liveness by the SAME
+rio-controller/src/reconcilers/pool/candidate.rs	/// whose ONLY key type is [`PoolKey`]. Process-global per-pool
 rio-controller/src/reconcilers/pool/disruption.rs	//! `preStop` fires on EVERY termination, including graceful scale-
 rio-controller/src/reconcilers/pool/job.rs	// DeadlineExceeded fill is a verdict ONLY when the
 rio-controller/src/reconcilers/pool/job.rs	// EVERY pre-existing object read as older-than (merged_bug_036
 rio-controller/src/reconcilers/pool/job.rs	// EVERY s. Job is (14+s)s old at evaluation; the close's
 rio-controller/src/reconcilers/pool/job.rs	// classification fill is a verdict ONLY when the
+rio-controller/src/reconcilers/pool/job.rs	// the eviction letter as CLASSIFY-ONLY: the only
 rio-controller/src/reconcilers/pool/job.rs	// view, evaluated for EVERY job in the wave — a covering attempt
 rio-controller/src/reconcilers/pool/job.rs	///     ALWAYS set (no `None`): a missing deadline means a stuck pod
 rio-controller/src/reconcilers/pool/job.rs	///    the SAME deterministic Job name; the fresh Job is younger
@@ -463,19 +503,26 @@ rio-controller/src/reconcilers/pool/jobs.rs	// reads the SAME witness the delete
 rio-controller/src/reconcilers/pool/jobs.rs	// scheduler ALWAYS populates intents — empty list means empty
 rio-controller/src/reconcilers/pool/jobs.rs	// §13d chokepoint: `pod::taint_to_toleration` is the SAME
 rio-controller/src/reconcilers/pool/jobs.rs	//! intent re-creates the SAME Job name and the apiserver's
+rio-controller/src/reconcilers/pool/jobs.rs	///   from the page + [`DemandCoverage`]): the ONLY source of negative
 rio-controller/src/reconcilers/pool/jobs.rs	/// EVERY letter of the alphabet — a new variant fails here until
+rio-controller/src/reconcilers/pool/jobs.rs	/// FUSED with the completeness witness. The ONLY way to obtain
 rio-controller/src/reconcilers/pool/jobs.rs	/// HwClassConfig.taints_for(h)` — the SAME `[sla.hw_classes.$h]`
 rio-controller/src/reconcilers/pool/jobs.rs	/// NEVER get them — second-scheduler routing stays Builder-only
 rio-controller/src/reconcilers/pool/jobs.rs	/// The rendered deadline the pod is dispatched under — the SAME
 rio-controller/src/reconcilers/pool/jobs.rs	/// Wall clock of the last strike — feeds the memory prune ONLY.
+rio-controller/src/reconcilers/pool/jobs.rs	/// [`stamp_container_resources`], whose signature admits ONLY this
 rio-controller/src/reconcilers/pool/jobs.rs	/// addends are the SAME values that set the `overlays` / `fuse-cache`
 rio-controller/src/reconcilers/pool/jobs.rs	/// both `ALL` and the HELP are extended (and the (ttttt) regen
 rio-controller/src/reconcilers/pool/jobs.rs	/// into EVERY required nodeAffinity term (terms are OR'd, so a
+rio-controller/src/reconcilers/pool/jobs.rs	/// lanes are the ONLY demand-membership surface).
 rio-controller/src/reconcilers/pool/jobs.rs	/// on ANY render-decided axis. Deterministic over key/term order;
 rio-controller/src/reconcilers/pool/jobs.rs	/// on EVERY arm (deaths are noted by the reap before the fold, so a
+rio-controller/src/reconcilers/pool/jobs.rs	/// once each, then a live pool's pass at the horizon prunes ALL
 rio-controller/src/reconcilers/pool/jobs.rs	/// r35 merged_bug_024 (§Simulator-shares-accounting): the SAME
+rio-controller/src/reconcilers/pool/jobs.rs	/// resource map is buildable ONLY from a [`PodFootprint`] — the
 rio-controller/src/reconcilers/pool/jobs.rs	/// series; this alphabet is the unified plane over ALL of them.
 rio-controller/src/reconcilers/pool/jobs.rs	/// the prune horizon via ANY pool's pass entry. The horizon is a
+rio-controller/src/reconcilers/pool/jobs.rs	/// the selector-drift compare. Positive evidence — valid on ANY
 rio-controller/src/reconcilers/pool/jobs.rs	/// until EVERY dim has ≥`trust_threshold` tenants, denying
 rio-controller/src/reconcilers/pool/mod.rs	// ANY non-empty *declared* features: §13e derives `[fetcher]` from
 rio-controller/src/reconcilers/pool/pod.rs	// Container-level seccomp: set ONLY when Localhost is
@@ -486,23 +533,27 @@ rio-controller/src/reconcilers/pool/pod.rs	// `nix_systems_to_k8s_arch` returns 
 rio-controller/src/reconcilers/pool/pod.rs	// circuits on ANY `Some(_)`, including the empty list — the
 rio-controller/src/reconcilers/pool/pod.rs	// is the ONLY writable path — overlay writes still
 rio-controller/src/reconcilers/pool/pod.rs	/// `cover_deficit`), and `apply_intent_resources` all read the SAME
+rio-controller/src/reconcilers/pool/pod.rs	/// its boot horizon"; this is the SAME 300s horizon slack, applied to
 rio-controller/src/reconcilers/pool/pod.rs	/// metal nodeSelector / toleration gate from the SAME
 rio-controller/src/reconcilers/pool/pod.rs	/// toleration gate must read the SAME `provides_features` map. The
 rio-controller/src/reconcilers/pool/tests/disruption_tests.rs	// NOT "kvm" — proves DEGRADE_CHECKS[5] fires for ANY non-empty
 rio-controller/src/reconcilers/pool/tests/jobs_tests.rs	// (d) Negative pin: a Foreign-shaped attempt for the SAME intent is
 rio-controller/src/reconcilers/pool/tests/jobs_tests.rs	// Build pull + materialization claim for the SAME intent: the
 rio-controller/src/reconcilers/pool/tests/jobs_tests.rs	// Materialization claim ONLY → None: a Job delete must not close a
+rio-controller/src/reconcilers/pool/tests/jobs_tests.rs	// Page holds ONLY "onpage" (the >2048 regime: everything else
 rio-controller/src/reconcilers/pool/tests/jobs_tests.rs	// ZERO apiserver scenarios: EVERY delete in the wave must defer.
 rio-controller/src/reconcilers/pool/tests/jobs_tests.rs	// adjacent-pass reap, NEVER by the post-gap pass.
 rio-controller/src/reconcilers/pool/tests/jobs_tests.rs	// prefix != intent) are Foreign under EVERY kind.
 rio-controller/src/reconcilers/pool/tests/jobs_tests.rs	/// (`keyless=true`, empty map) spawns EVERY intent token-less,
 rio-controller/src/reconcilers/pool/tests/jobs_tests.rs	/// (universe arm x per-intent evidence state). Walks EVERY cell of the
+rio-controller/src/reconcilers/pool/tests/jobs_tests.rs	/// ALL-FORECAST truncated page no longer silently disables the excess
 rio-controller/src/reconcilers/pool/tests/jobs_tests.rs	/// W9-AP: a FAILED ListOpenAttempts defers ALL adjudication — no
 rio-controller/src/reconcilers/pool/tests/jobs_tests.rs	/// `Materialization` ONLY under the `{intent}@{instance}`
 rio-controller/src/reconcilers/pool/tests/jobs_tests.rs	/// `spawn_for_each` returns ONLY intents whose Job was `Spawned`.
 rio-controller/src/reconcilers/pool/tests/jobs_tests.rs	/// a red): the withhold is self-limiting by the SAME staleness law as
 rio-controller/src/reconcilers/pool/tests/jobs_tests.rs	/// alphabet (the same-file `ALL` pin + this match: a new phase fails
 rio-controller/src/reconcilers/pool/tests/jobs_tests.rs	/// are `GateUniverse::ALL_DISCRIMINANTS` and `EvidenceState::ALL`,
+rio-controller/src/reconcilers/pool/tests/jobs_tests.rs	/// backlog, EVERY pending Job re-acks — the lane derives from the
 rio-controller/src/reconcilers/pool/tests/jobs_tests.rs	/// bug_028: the AD2 gate evaluates ALL wanted intents, never just the
 rio-controller/src/reconcilers/pool/tests/jobs_tests.rs	/// bug_089 companion pin: the SAME object presented twice (a failed
 rio-controller/src/reconcilers/pool/tests/jobs_tests.rs	/// deaths. `ALL` is pinned exhaustive by the same-file match in
@@ -605,6 +656,7 @@ rio-gateway/src/handler/log_tail.rs	/// Drop-disclosure backstop now fires on EV
 rio-gateway/src/handler/log_tail.rs	/// Drop-safety chokepoint (merged_bug_130): EVERY drop path of the set
 rio-gateway/src/handler/log_tail.rs	/// Dropping the set — ANY drop path: session-loop early return,
 rio-gateway/src/handler/log_tail.rs	/// The store re-served the SAME split — the hole is durable.
+rio-gateway/src/handler/log_tail.rs	/// replaces the relay for a NEW execution on the SAME output
 rio-gateway/src/handler/log_tail.rs	/// retry stream re-serves the SAME hole start but a DIFFERENT
 rio-gateway/src/handler/log_tail.rs	/// the span): EVERY line the store served above the relay floor is
 rio-gateway/src/handler/mod.rs	/// [`token`](Self::token) is the ONLY public read path; it always
@@ -638,20 +690,25 @@ rio-gateway/src/translate.rs	/// `derivationStrict` serializes user attrs into `
 rio-gateway/src/translate.rs	/// over-size submissions. The __noChroot check is ONLY here — the
 rio-lease/src/clock.rs	//! Scope: ONLY the fence blind-time moves to this clock. The standby
 rio-lease/src/election.rs	/// load-bearing (merged_bug_180): the apiserver bumps rv on EVERY
+rio-lease/src/lib.rs	// ...and the SAME TICK services the marks dirt: the leader
 rio-lease/src/lib.rs	// Create, and the response NEVER ARRIVES — the act deadline
+rio-lease/src/lib.rs	// Hoisted AFTER the whole outcome match so EVERY arm services
 rio-lease/src/lib.rs	// Same-epoch keep: a lose + re-acquire at the SAME count while
-rio-lease/src/lib.rs	// bug_002: EVERY completed act-failed read routes
+rio-lease/src/lib.rs	// bug_002 + bug_143: EVERY completed act-failed
 rio-lease/src/lib.rs	// nobody stole in between) is the SAME leadership epoch — the
 rio-lease/src/lib.rs	// nothing to consume — the SAME facts the
 rio-lease/src/lib.rs	// of a lease we hold — the SAME facts the
 rio-lease/src/lib.rs	// proxy for the blind clock's stamped anchor ONLY because this
 rio-lease/src/lib.rs	// request armed for the next believing tick of the SAME tenure
 rio-lease/src/lib.rs	// routes through the SAME
+rio-lease/src/lib.rs	// script; both faces ride the SAME tail reconcile (the
 rio-lease/src/lib.rs	// the SAME transition count — a NEW tenure instance, which
 rio-lease/src/lib.rs	// through the SAME observe-completed-read
-rio-lease/src/lib.rs	// whole outcome match (merged_bug_122) so EVERY arm services
+rio-lease/src/lib.rs	/// At the law's quantifier: holder-naming evidence NEVER clears
 rio-lease/src/lib.rs	/// Mint an anchor from the injected fence clock. Call ONLY before
 rio-lease/src/lib.rs	/// NEVER held the lease should not "step down" — it has nothing
+rio-lease/src/lib.rs	/// The ONLY constructor, and it consumes the producer's FULL
+rio-lease/src/lib.rs	/// The injected-client form of [`run_lease_loop`]: the SAME loop body
 rio-lease/src/lib.rs	/// The own-commit evidence arm consumes the SAME completed-read
 rio-lease/src/lib.rs	/// The spawns are hoisted after the outcome match so EVERY arm
 rio-lease/src/lib.rs	/// `believes x Holder x Content x Ledger` product (the ALL consts
@@ -659,8 +716,11 @@ rio-lease/src/lib.rs	/// a later re-acquire at the SAME count is the deliberate 
 rio-lease/src/lib.rs	/// a lose + re-acquire at the SAME count is the same epoch, and its
 rio-lease/src/lib.rs	/// and no round ever Completed, so the foreign term was NEVER
 rio-lease/src/lib.rs	/// count — so its still-believing leg must run the SAME rebound
+rio-lease/src/lib.rs	/// direct-evidence lose ALWAYS clears it (the graceful-release
 rio-lease/src/lib.rs	/// exhaustion (a previous deferral is still unresolved). The ONLY
+rio-lease/src/lib.rs	/// leader-marks dirt the SAME tick — the step-down arm exits
 rio-lease/src/lib.rs	/// level-triggered: ANY falsifier (a foreign sweep racing a re-acquire,
+rio-lease/src/lib.rs	/// lose NEVER changes the release verdict (it is fence-class —
 rio-lease/src/lib.rs	/// must cover the eldest); it is consumed ONLY by own-commit evidence
 rio-lease/src/lib.rs	/// observed our supersession. Reads ONLY the hold — belief has no
 rio-lease/src/lib.rs	/// re-acquire installs a NEW tenure INSTANCE at the SAME transition
@@ -705,8 +765,10 @@ rio-migrations/src/migrations.rs	/// loads the suffix directly by `derivation_id
 rio-migrations/src/migrations.rs	/// metadata/inline.rs) — strikes ONLY `'downloading'` claims whose
 rio-migrations/src/migrations.rs	/// planner does NOT rewrite `scalar = ANY(arrcol)` into a `@>` probe.
 rio-migrations/src/migrations.rs	/// precedence conjunct previously cut on `updated_at` — a column EVERY
+rio-migrations/src/migrations.rs	/// preserves the protective function — a tenant with ANY hold rows
 rio-migrations/src/migrations.rs	/// so listing 10 builds aggregated EVERY drv of EVERY build. I-102
 rio-migrations/src/migrations.rs	/// ∪ the root request's `OutputsSpec`). The scheduler consults it ONLY
+rio-migrations/src/retention.rs	/// Deleted ONLY inside the named production functions (admin
 rio-migrations/src/sql.rs	/// vanished mid-claim computes the SAME width on both sides.
 rio-nix/src/derivation/aterm.rs	// inputDrvs — ALWAYS empty for BasicDerivation.
 rio-nix/src/derivation/aterm.rs	// input_drvs can map to the SAME modular hash (e.g. FOD aliasing:
@@ -720,7 +782,6 @@ rio-proto/src/client/balance.rs	// Resolve. For a headless Service, CoreDNS retu
 rio-proto/src/client/balance.rs	//! Nothing here may assume the scheduler's 2-replica shape: the SAME
 rio-proto/src/client/balance.rs	//! client balances the rio-store fleet, where EVERY replica is
 rio-proto/src/client/mod.rs	/// drop their retry loop: the channel ALWAYS constructs.
-rio-proto/src/client/store.rs	/// PathInfo and sent in the trailer. This is the ONLY PutPath mode the
 rio-retry-kernel/src/lib.rs	// And the mirror: a materialization-lane reset cuts ONLY the
 rio-retry-kernel/src/lib.rs	// bounded-uncharged run. Pure pacing — drives ONLY the backoff
 rio-retry-kernel/src/lib.rs	// defense-in-depth ONLY — the partition is by attempt kind,
@@ -748,16 +809,19 @@ rio-scheduler/src/actor/command.rs	/// consume-once buffer on Ack-Ok ("the ONLY 
 rio-scheduler/src/actor/completion.rs	// CA-shaped late reports reach the SAME gated
 rio-scheduler/src/actor/completion.rs	// I-127: "concurrent PutPath" is NEVER counted toward the
 rio-scheduler/src/actor/completion.rs	// I-199: bump resource_floor ONLY on the worker-reported
+rio-scheduler/src/actor/completion.rs	// SAME durable row identity resolves from).
 rio-scheduler/src/actor/completion.rs	// Verified = candidates where ALL prior outputs are present.
 rio-scheduler/src/actor/completion.rs	// infra cap. It means another builder is uploading the SAME
 rio-scheduler/src/actor/completion.rs	// where ALL outputs are).
 rio-scheduler/src/actor/completion.rs	// worker problem — the SAME worker with a longer deadline
-rio-scheduler/src/actor/completion.rs	/// Called ONLY from explicit worker-reported resource-exhaustion
+rio-scheduler/src/actor/completion.rs	/// Called ONLY from explicit per-attempt resource-exhaustion
 rio-scheduler/src/actor/completion.rs	/// EVERY hash in `completed`, dedup the union (a parent may be
 rio-scheduler/src/actor/completion.rs	/// I-170/I-173/I-177/I-199 over-broad heuristic (promote on ANY
-rio-scheduler/src/actor/completion.rs	/// Register payload: the SAME two boundary filters the admitted
+rio-scheduler/src/actor/completion.rs	/// Register payload: the SAME name/shape boundary filters the
+rio-scheduler/src/actor/completion.rs	/// SAME set the AssignmentClaims mint signs at dispatch
 rio-scheduler/src/actor/completion.rs	/// `find_newly_ready` returns ALL Queued parents whose deps are now
 rio-scheduler/src/actor/completion.rs	/// into the uncharged Paced lane). Binding-less evidence rides ONLY
+rio-scheduler/src/actor/completion.rs	/// is retained ONLY if it is a member of the
 rio-scheduler/src/actor/completion.rs	/// minted ONLY where the fold resolved its evidence — the pull report
 rio-scheduler/src/actor/completion.rs	/// prior outputs ALL exist in the store, along with the output
 rio-scheduler/src/actor/completion.rs	/// senders). The shim re-runs the SAME kernel admission law the
@@ -771,7 +835,10 @@ rio-scheduler/src/actor/dispatch.rs	// created when EVERY wanted path is obtaina
 rio-scheduler/src/actor/dispatch.rs	// degrading to ALL DECLARED outputs when no live union
 rio-scheduler/src/actor/dispatch.rs	// inline-completion requires present-and-visible under EVERY
 rio-scheduler/src/actor/event.rs	/// a SAME-verdict epilogue arriving after the closer already
+rio-scheduler/src/actor/floor.rs	// evictions remain CLASSIFY-ONLY BY RULING
 rio-scheduler/src/actor/floor.rs	/// Project `floor` under the live `ceil` — the ONLY constructor,
+rio-scheduler/src/actor/floor.rs	/// disposition row above (the `GcPhase3Outcome::ALL` form).
+rio-scheduler/src/actor/floor.rs	/// index match (the `GcPhase3Outcome::ALL` form), so a new wire
 rio-scheduler/src/actor/housekeeping.rs	// CAUTION: with zero grace, the orphan sweep cancels ANY Active build whose
 rio-scheduler/src/actor/housekeeping.rs	// DIAGNOSTIC ONLY (merged_bug_017): the
 rio-scheduler/src/actor/housekeeping.rs	// EVERY phase boundary is a drain point structurally
@@ -874,10 +941,12 @@ rio-scheduler/src/actor/recovery.rs	//! NEVER completed (`sched.recovery.step-do
 rio-scheduler/src/actor/recovery.rs	//! SAME `Arc<AtomicU64>`), is the durable backstop that survives the
 rio-scheduler/src/actor/snapshot.rs	// (`SUBSTITUTING_DEP_ETA_PRIOR_SECS`) rides the SAME seed-
 rio-scheduler/src/actor/snapshot.rs	// 124(d): record the spawn-ack witness for EVERY spawned
+rio-scheduler/src/actor/snapshot.rs	// DECODED rejected plane is non-empty — ANY reason, OverCap
 rio-scheduler/src/actor/snapshot.rs	// ONLY `tenant` (bounded by `Claims.sub`): the per-feature
 rio-scheduler/src/actor/snapshot.rs	// ONLY that tier. Re-solving the full ladder here recorded a
 rio-scheduler/src/actor/snapshot.rs	// `Some(memo)` arm filters `cells` to `cap` post-memo, but ANY
 rio-scheduler/src/actor/snapshot.rs	// `compute_spawn_intents` reads the SAME
+rio-scheduler/src/actor/snapshot.rs	// bounds, so the seed map is the pass's ONLY off switch.
 rio-scheduler/src/actor/snapshot.rs	// cadence ≈ the SAME window): stepping ANY terminal
 rio-scheduler/src/actor/snapshot.rs	// every drv sees the SAME `(hw, cost, inputs_gen)`. Per-drv
 rio-scheduler/src/actor/snapshot.rs	// feature-partitioned, so the SAME ModelKey with DIFFERENT
@@ -889,18 +958,22 @@ rio-scheduler/src/actor/snapshot.rs	// intents` sees the SAME fingerprint across
 rio-scheduler/src/actor/snapshot.rs	// mb_053: project via the SAME `effective_tiers` as
 rio-scheduler/src/actor/snapshot.rs	// pin-aware walk whenever ANY size-hosting class existed,
 rio-scheduler/src/actor/snapshot.rs	// post-overlay demand with the SAME formulas the
+rio-scheduler/src/actor/snapshot.rs	// requires only that SOME drv drew ANY verdict, which DOES
 rio-scheduler/src/actor/snapshot.rs	/// Latest verdict detail — DISPLAY-ONLY (the operator-actionable
 rio-scheduler/src/actor/snapshot.rs	/// `SpawnIntent`. FODs and non-FODs go through the SAME path (D2)
 rio-scheduler/src/actor/snapshot.rs	/// classified emission for the same `(tenant, pname)` BY THE SAME
 rio-scheduler/src/actor/snapshot.rs	/// controller's consume-once evidence ("the ONLY clear" is
 rio-scheduler/src/actor/snapshot.rs	/// episode THE SAME drv opened (or last re-pointed), so a relapse
+rio-scheduler/src/actor/snapshot.rs	/// exists ONLY for intents the admission layer (classification,
 rio-scheduler/src/actor/snapshot.rs	/// filters and the backoff gate, from the SAME [`ReadyClass`]
 rio-scheduler/src/actor/snapshot.rs	/// forecast loop so every drv in one poll sees the SAME notion of
 rio-scheduler/src/actor/snapshot.rs	/// pattern on the SAME metric family is the in-tree precedent);
+rio-scheduler/src/actor/snapshot.rs	/// rejected plane (ANY reason — OverCap included). The
 rio-scheduler/src/actor/snapshot.rs	/// relays to the gRPC layer — `Ok` only when EVERY plane landed,
 rio-scheduler/src/actor/snapshot.rs	/// spawns and the scheduler accepts the SAME shape.
 rio-scheduler/src/actor/snapshot.rs	/// strict decode's SAME-COMMIT precondition: `validate_shape`
 rio-scheduler/src/actor/snapshot.rs	/// validate-then-commit). [`Self::validate`] computes EVERY refusal
+rio-scheduler/src/actor/tests/completion.rs	// CITE-ONLY surface: `bool_or(pt.tenant_id = $2) AS owned`,
 rio-scheduler/src/actor/tests/completion.rs	// Disable distinct-worker poison so we test ONLY max_retries.
 rio-scheduler/src/actor/tests/completion.rs	// Two distinct store paths, SAME name segment `ambig-pkg`.
 rio-scheduler/src/actor/tests/completion.rs	// modular_hash) having registered the SAME output_path. The
@@ -917,6 +990,7 @@ rio-scheduler/src/actor/tests/completion.rs	/// `max_retries=10` for ALL cases s
 rio-scheduler/src/actor/tests/completion.rs	/// `require_distinct_workers` mode: 3× TransientFailure on the SAME
 rio-scheduler/src/actor/tests/completion.rs	/// failure handlers ONLY from the InfrastructureFailure arm. Every
 rio-scheduler/src/actor/tests/completion.rs	/// is permitted ONLY inside `actor/report_ctx.rs` (the two
+rio-scheduler/src/actor/tests/completion.rs	/// mint signs at dispatch) reaches `path_tenants`, on ANY report lane.
 rio-scheduler/src/actor/tests/completion.rs	/// non-floor infra (FUSE EIO) poison at the SAME attempt number.
 rio-scheduler/src/actor/tests/completion.rs	/// the SAME output — the drv succeeded; this worker lost the upload
 rio-scheduler/src/actor/tests/dispatch.rs	// Determinism: re-emit returns the SAME affinity (memoized; no
@@ -926,8 +1000,11 @@ rio-scheduler/src/actor/tests/dispatch.rs	// cap+1 insert via the SAME `on_evict
 rio-scheduler/src/actor/tests/dispatch.rs	/// treating EVERY first-leadership assignment as unset/stale.
 rio-scheduler/src/actor/tests/establishment.rs	/// Cancelled work is NEVER charged, even when the cancel's terminal
 rio-scheduler/src/actor/tests/establishment.rs	/// bug_148 (bughunt-2 wave): the adopt arm must stamp ONLY the
+rio-scheduler/src/actor/tests/establishment.rs	/// through the disposition table, so the SAME scenario also doubles
+rio-scheduler/src/actor/tests/fencing.rs	// SAME token's straggler pull must screen to Gone, never mint.
 rio-scheduler/src/actor/tests/fencing.rs	// The straggler: the SAME token re-pulls (retry still in flight /
 rio-scheduler/src/actor/tests/fencing.rs	// ── The confirm-exit fence, totalized over EVERY keyed licensing
+rio-scheduler/src/actor/tests/fencing.rs	/// and the SAME token's straggler pull.
 rio-scheduler/src/actor/tests/fencing.rs	/// outlives the pod, and so does the claims token); the SAME token's
 rio-scheduler/src/actor/tests/fencing.rs	/// the current generation the SAME production chain mints the witness
 rio-scheduler/src/actor/tests/helpers.rs	// ([`bind_intent_node`]) ONLY (decision P12) -- an unbound attempt charges
@@ -973,6 +1050,7 @@ rio-scheduler/src/actor/tests/materialize.rs	/// one-shot spent) + the topdown-p
 rio-scheduler/src/actor/tests/materialize.rs	/// poll sequences, the cached owner of EVERY window job equals
 rio-scheduler/src/actor/tests/materialize.rs	/// re-delivering the SAME outcome then consumes uncharged (the free
 rio-scheduler/src/actor/tests/materialize.rs	/// re-probe asks EVERY live tenant and `ConfirmedMissing` is the
+rio-scheduler/src/actor/tests/materialize.rs	/// reassignment, skipping" WARN fired on EVERY successful conversion
 rio-scheduler/src/actor/tests/materialize.rs	/// releases to from-source dispatch, NEVER fail-fast. The as-built
 rio-scheduler/src/actor/tests/materialize.rs	/// the recovery job-view rebuild on EVERY leader candidate: a
 rio-scheduler/src/actor/tests/materialize.rs	/// to ALL DECLARED outputs, making arm-0 coverage HARDER to satisfy —
@@ -985,6 +1063,7 @@ rio-scheduler/src/actor/tests/merge.rs	/// A kept (demanded) node whose existing
 rio-scheduler/src/actor/tests/merge.rs	/// After batching to three `ANY($1::text[])` updates, this phase is a
 rio-scheduler/src/actor/tests/merge.rs	/// Build A merges `R → dep` wanting ALL of R's outputs (the empty
 rio-scheduler/src/actor/tests/merge.rs	/// Build A submits `app-a → dep` wanting ALL outputs (the empty
+rio-scheduler/src/actor/tests/misc.rs	// (1) NEVER-ADMISSIBLE: Queued behind a Queued dep — the 1-layer
 rio-scheduler/src/actor/tests/misc.rs	// Build the SAME 3-drv forecast frontier twice with different
 rio-scheduler/src/actor/tests/misc.rs	// Log ring sees ONLY the SubstituteProgress.
 rio-scheduler/src/actor/tests/misc.rs	// One entry per armament state, constructed through the SAME
@@ -995,6 +1074,7 @@ rio-scheduler/src/actor/tests/misc.rs	/// D2/D5: FODs and non-FODs go through th
 rio-scheduler/src/actor/tests/misc.rs	/// EVERY cell of `rio_scheduler_tick_phase_seconds` -- all 19 phases
 rio-scheduler/src/actor/tests/misc.rs	/// Family-driven loss sweep: EVERY declared member — including the
 rio-scheduler/src/actor/tests/misc.rs	/// `BuildNotFound` for the SAME missing build.
+rio-scheduler/src/actor/tests/misc.rs	/// are mintable — an executor credential exists ONLY for intents the
 rio-scheduler/src/actor/tests/misc.rs	/// for ANY requested build_timeout — saturating u64::MAX or the
 rio-scheduler/src/actor/tests/misc.rs	/// output is ceiling-bounded for ANY tenant input, because the seam
 rio-scheduler/src/actor/tests/misc.rs	/// prior flows through the SAME pre/post-solve lead-horizon gates as
@@ -1018,6 +1098,7 @@ rio-scheduler/src/actor/tests/sla_contract.rs	// SAME pin-respect (population: b
 rio-scheduler/src/actor/tests/sla_contract.rs	// The lease-acquire edge reload against the SAME TestDb: the
 rio-scheduler/src/actor/tests/sla_contract.rs	// Two with the SAME feature tuple → debounced bound is 1; per-poll
 rio-scheduler/src/actor/tests/sla_contract.rs	// `hash(drv_hash)` only, so the SAME drv hits or misses
+rio-scheduler/src/actor/tests/sla_contract.rs	// and SPOT-ONLY capacity types so an od pin has no hosting class
 rio-scheduler/src/actor/tests/sla_contract.rs	// capture the full counter map before/after; ONLY the
 rio-scheduler/src/actor/tests/sla_contract.rs	// demand envelope (6 GiB mem fit, 10 GiB disk) fits EVERY class.
 rio-scheduler/src/actor/tests/sla_contract.rs	// kvm intent: hw_class_names == ["metal-x86"] ONLY.
@@ -1029,6 +1110,7 @@ rio-scheduler/src/actor/tests/sla_contract.rs	// ── (e) bug_012: refit chang
 rio-scheduler/src/actor/tests/sla_contract.rs	/// (never the impl's own expression). The detail is DISPLAY-ONLY —
 rio-scheduler/src/actor/tests/sla_contract.rs	/// EVERY configured class's `max_cores` MUST emit empty
 rio-scheduler/src/actor/tests/sla_contract.rs	/// Pre-fix `retain_hosting_cells` appended rung cells at EVERY
+rio-scheduler/src/actor/tests/sla_contract.rs	/// Pre-fix only NoHost-carrying acks advanced it, so an OverCap-ONLY
 rio-scheduler/src/actor/tests/sla_contract.rs	/// Pre-fix the `disclose_once` LRU was INSERT-ONLY: no heal-edge pop
 rio-scheduler/src/actor/tests/sla_contract.rs	/// `[spot, on-demand]` rung config NEVER lands on a spot rung* —
 rio-scheduler/src/actor/tests/sla_contract.rs	/// after the overlay: floor above EVERY class ceiling => Unhostable
@@ -1036,6 +1118,7 @@ rio-scheduler/src/actor/tests/sla_contract.rs	/// and missing-requirement axes O
 rio-scheduler/src/actor/tests/sla_contract.rs	/// and the fn returned `Ok(())` against its own "Ok only when EVERY
 rio-scheduler/src/actor/tests/sla_contract.rs	/// bug_094 red: an undecodable entry in ANY plane refuses the WHOLE
 rio-scheduler/src/actor/tests/sla_contract.rs	/// can NEVER produce `LambdaGate | CLoExceedsCap`, so `all(λ-adjacent)`
+rio-scheduler/src/actor/tests/sla_contract.rs	/// cap-blind reference resolve: PinGated mints ONLY when a
 rio-scheduler/src/actor/tests/sla_contract.rs	/// consume-once buffer ("the ONLY clear"), so the dropped entry was
 rio-scheduler/src/actor/tests/sla_contract.rs	/// elements) and EVERY ε_h draw is infeasible. Tick once → record
 rio-scheduler/src/actor/tests/sla_contract.rs	/// flattened `solve_infeasible: bool` — true for EVERY BestEffort
@@ -1046,6 +1129,7 @@ rio-scheduler/src/actor/tests/sla_contract.rs	/// producer is imported READ-ONLY
 rio-scheduler/src/actor/tests/sla_contract.rs	/// self-healing ≤300s skew; the poison budget is 30 × ~10s ≈ the SAME
 rio-scheduler/src/actor/tests/sla_contract.rs	/// sibling `all_masked` exit on the SAME metric re-armed correctly
 rio-scheduler/src/actor/tests/sla_contract.rs	/// the sibling mark on the SAME request lands too — and SURVIVES the
+rio-scheduler/src/actor/tests/sla_contract.rs	/// to Unhostable ONLY when none does. Cells rows are image-disjoint
 rio-scheduler/src/actor/tests/sla_contract.rs	/// whenever ANY size-hosting class existed — empty emission then
 rio-scheduler/src/admin/mod.rs	// (a uid minted without an axis) takes the SAME edge and was
 rio-scheduler/src/admin/mod.rs	// response the browser can't read. ALL error paths return
@@ -1106,7 +1190,9 @@ rio-scheduler/src/db/derivations.rs	/// trusts that set for the derivation UPDAT
 rio-scheduler/src/db/live_pins.rs	///   ONLY the probing tenant).
 rio-scheduler/src/db/live_pins.rs	/// Build-input pins ONLY (`pin_kind = 'build_input'`): a
 rio-scheduler/src/db/live_pins.rs	/// EVERY `.rs` under `rio-scheduler/src`, embedded at compile time.
+rio-scheduler/src/db/live_pins.rs	/// W10-N plant can push a STRAWMAN SOURCE FILE through the SAME
 rio-scheduler/src/db/live_pins.rs	/// registration writers ONLY — the scheduler's realisation-INSERT
+rio-scheduler/src/db/live_pins.rs	/// sentence arm is struck: an alphabet/ONLY claim takes the machine
 rio-scheduler/src/db/materialization.rs	// created job, in the SAME transaction — the per-job budget
 rio-scheduler/src/db/materialization.rs	/// every interested build is terminal). `pending` jobs are NEVER
 rio-scheduler/src/db/materialization.rs	/// the stale-Completed reset destroyed in memory. `Some` ONLY for
@@ -1166,6 +1252,7 @@ rio-scheduler/src/main.rs	// against the SAME database; sqlx's default blocking
 rio-scheduler/src/main.rs	// live, the port is bound, leader-election is the ONLY thing
 rio-scheduler/src/main.rs	// lock as rio-store. Both services run the SAME migration set
 rio-scheduler/src/observability.rs	//!   SAME table, so an acquire-side effect cannot merge without its
+rio-scheduler/src/observability.rs	/// (`persist_rows` / `sweep_interrupt_samples_rows`), whose ONLY
 rio-scheduler/src/observability.rs	/// [`LeaderGauge`] enum, `ALL`, accessors, and the family-driven
 rio-scheduler/src/observability.rs	/// independent: after ANY lose edge, the first leader housekeeping
 rio-scheduler/src/observability.rs	/// the SAME table — adding an acquire effect without writing its lose
@@ -1187,7 +1274,7 @@ rio-scheduler/src/sla/config.rs	// merged_bug_039 (the strict ArmDecode's SAME-C
 rio-scheduler/src/sla/config.rs	// the SAME chokepoint the enforcement plane consumes
 rio-scheduler/src/sla/config.rs	// types)` cells, gated by the SAME hosting predicate as the
 rio-scheduler/src/sla/config.rs	/// SAME `key` and reads every region's interrupt rows. Helm sets
-rio-scheduler/src/sla/config.rs	/// `CapacityType::ALL`, so an od-only class (e.g. metal) never
+rio-scheduler/src/sla/config.rs	/// `CapacityType::ALL`, so an od-only class never generates a
 rio-scheduler/src/sla/config.rs	/// `[sla.hw_classes.$h].capacity_types`. Unknown `h` → `ALL` (no
 rio-scheduler/src/sla/config.rs	/// a class with `provides_features=["kvm"]` accepts ONLY kvm
 rio-scheduler/src/sla/config.rs	/// an `instance-size NotIn` requirement from this list for EVERY
@@ -1202,11 +1289,14 @@ rio-scheduler/src/sla/config.rs	/// on ANY membership drift — closure tomorrow
 rio-scheduler/src/sla/config.rs	/// predicate on ANY axis (size / arch / features) is skipped
 rio-scheduler/src/sla/config.rs	/// strips ANY cell whose class can't host `(cores, mem)`,
 rio-scheduler/src/sla/cost.rs	// Snapshot → refresh_lambda → write back λ ONLY (don't clobber
+rio-scheduler/src/sla/cost.rs	/// (merged_bug_146): the ONLY path to `sla_ema_state` /
 rio-scheduler/src/sla/cost.rs	/// NEVER from `spawned` (Pending ack) — that's the wrong edge and
 rio-scheduler/src/sla/cost.rs	/// expiry is still the SAME observation — `left: step 0→1 (the
 rio-scheduler/src/sla/cost.rs	/// flip changes `price()` from EMA→seed without ANY caller action.
 rio-scheduler/src/sla/cost.rs	/// window at the SAME rung instead of climbing. The controller
 rio-scheduler/src/sla/fit.rs	/// - `fitted` = the per-pname observed p90 when ANY disk observation
+rio-scheduler/src/sla/fit.rs	/// This envelope is the SOLE constructor for EVERY dispatch lane's
+rio-scheduler/src/sla/fit.rs	/// derive-then-request. The ONLY public mint of [`DiskRequest`].
 rio-scheduler/src/sla/hw.rs	// SAME `tenant_medians` vector. No future filter can sit between
 rio-scheduler/src/sla/hw.rs	// merged_bug_001 coupling: before claims-derived tenant, EVERY
 rio-scheduler/src/sla/hw.rs	/// (vertex), so this is the worst-case `min_factor(α)` over ALL
@@ -1230,7 +1320,11 @@ rio-scheduler/src/sla/solve.rs	// `forced_mem` is hoisted so it overrides mem in
 rio-scheduler/src/sla/solve.rs	// enable_parallel_building=false pins ONLY cores=1; mem/disk
 rio-scheduler/src/sla/solve.rs	// since `LambdaGate` is `if cap == Spot` only, OD can NEVER produce
 rio-scheduler/src/sla/solve.rs	// ── ANY spot non-λ reject → classify_ceiling. r2's witness
+rio-scheduler/src/sla/solve.rs	/// **W10-AB (bug_128)** — the ALL-variant property table: every
+rio-scheduler/src/sla/solve.rs	/// `(cores, mem)` ceiling vector ONLY, so a reason whose axis the
 rio-scheduler/src/sla/solve.rs	/// `CapacityType::ALL`. An od-only hw-class (metal) MUST NOT
+rio-scheduler/src/sla/solve.rs	/// are the ONLY axes with per-class ceilings (the
+rio-scheduler/src/sla/solve.rs	/// emitted the floored 1 GiB for the SAME fit.
 rio-scheduler/src/sla/solve.rs	/// in ALL { assert_eq!(.., 0) }` loops below 5/6-vacuous.
 rio-scheduler/src/sla/solve.rs	/// predicate reads ONLY the population it's defined over — a future
 rio-scheduler/src/state/build.rs	/// The settled terminal payload, if the build is terminal. The ONLY
@@ -1306,6 +1400,12 @@ rio-store/src/gc/collect.rs	/// zero? True ONLY for the full-keyspace scan.
 rio-store/src/gc/drain.rs	// What must NEVER happen (the bug FOR UPDATE fixes):
 rio-store/src/gc/drain.rs	// retries can reorder). `id <> ALL($2)` skips rows this
 rio-store/src/gc/drain.rs	/// concurrent PutPath whose NAR shared ANY chunk in the batch blocked
+rio-store/src/gc/lane.rs	// Skip counters incremented for EVERY census member + the
+rio-store/src/gc/lane.rs	//! hold suspends EVERY lane with delete authority, as a property of
+rio-store/src/gc/lane.rs	/// EVERY census member (the witness population IS the census
+rio-store/src/gc/lane.rs	/// The ONLY way to register a deleting periodic lane — see the
+rio-store/src/gc/lane.rs	/// as "no hold" — EVERY census-member lane skips typed
+rio-store/src/gc/lane.rs	/// sink NOT routed through DestructiveLane is flagged by the SAME
 rio-store/src/gc/lock.rs	// id MUST reach zero — a holder that NEVER leaves pg_locks is
 rio-store/src/gc/lock.rs	/// merged_bug_223: cancelling `try_acquire` at ANY await point —
 rio-store/src/gc/lock.rs	/// the session. The ONLY pool re-entry is [`SessionConn::release_to_pool`],
@@ -1321,8 +1421,9 @@ rio-store/src/gc/mod.rs	// resurrect EVERY Q_i.
 rio-store/src/gc/mod.rs	//! collect batch enqueues S3 keys in the SAME transaction as its
 rio-store/src/gc/mod.rs	/// -- while ALL chunk collection was suspended; the operator best
 rio-store/src/gc/mod.rs	/// Fail-closed ParseFailure: ALL chunk collection is suspended.
-rio-store/src/gc/mod.rs	/// Suspend ALL collection (mark, sweep, chunk-collect).
+rio-store/src/gc/mod.rs	/// GLOBAL hold suspends EVERY destructive lane — `run_gc` (no-op
 rio-store/src/gc/mod.rs	/// The lease's lock is a `lock::PgSessionLock`: ANY exit that does
+rio-store/src/gc/mod.rs	/// hold is active, minted ONLY by [`gate`] (private field — other
 rio-store/src/gc/mod.rs	/// over ALL narinfo including `'uploading'`) is the sole load-bearing
 rio-store/src/gc/state.rs	// The pre-fix unconditional claim survives ONLY here,
 rio-store/src/gc/state.rs	//! row, the backstop fires ONLY when `now - last_live_cycle_at`
@@ -1366,6 +1467,7 @@ rio-store/src/grpc/put_path/common.rs	/// EVERY `.rs` under `rio-store/src`, emb
 rio-store/src/grpc/put_path/common.rs	/// HMAC-gated `store_path` (NEVER from the wire — see step 7); on HMAC
 rio-store/src/grpc/put_path/common.rs	/// SAME atomic transaction that completes the manifests — a torn
 rio-store/src/grpc/put_path/common.rs	/// The ingest write authority — produced ONLY by
+rio-store/src/grpc/put_path/common.rs	/// and since merged_bug_005's close the SAME constructor: both
 rio-store/src/grpc/put_path/common.rs	/// designed capacity answer. Uniform over ALL chunk acquires, first
 rio-store/src/grpc/put_path/common.rs	/// persist span is a budget HOLD and rides THE SAME envelope that
 rio-store/src/grpc/put_path/mod.rs	// an `'uploading'` row for ANY syntactically-valid path
@@ -1388,6 +1490,7 @@ rio-store/src/ingest.rs	/// (`fetched_bytes == nar_size`) is NEVER stall-reclaim
 rio-store/src/ingest.rs	/// merged_bug_003). The stall-takeover predicate strikes ONLY
 rio-store/src/ingest.rs	/// writes `fetched_bytes` and advances `last_progress_at` ONLY
 rio-store/src/logs/gate.rs	/// The serve path's ONLY completeness source: fetch the sealed witness
+rio-store/src/logs/ingest.rs	// PK makes a re-INSERT of the SAME key idempotent — which the
 rio-store/src/logs/ingest.rs	/// SAME formula — bug_298 was exactly that drift: the buffer axes
 rio-store/src/logs/ingest.rs	/// The ONLY constructor, and it takes a `GateOk`: a session
 rio-store/src/logs/ingest.rs	/// — the builder's `LogBatcher` pre-truncates to the SAME constant
@@ -1398,9 +1501,14 @@ rio-store/src/logs/loss.rs	/// that makes `ALL` part of the shipped derivation c
 rio-store/src/logs/loss.rs	/// the array length and the loop bound are both `ALL.len()`, so
 rio-store/src/logs/service.rs	// Read ONLY the snapshot message, then stall the reader.
 rio-store/src/logs/service.rs	// Trust the header's identity but run the SAME shared
+rio-store/src/logs/service.rs	// cap — accept()'s ONLY Err construction,
 rio-store/src/logs/service.rs	// every test is a line that exists ONLY in replica A's live ingest
 rio-store/src/logs/service.rs	// for ANY subscriber, so a burst-end drop is backfilled without
 rio-store/src/logs/service.rs	/// One chunk cut, watchdog-bounded at one cut interval — the ONLY
+rio-store/src/logs/service.rs	/// byte-cap rejection is accept()'s ONLY `Err` construction. The
+rio-store/src/logs/service.rs	/// never retransmits), so the tail of EVERY cap-crossing log was
+rio-store/src/logs/sessions.rs	// The cadence path's ONLY await, bounded by the
+rio-store/src/logs/sessions.rs	// dedicated heartbeat task is the ONLY task on the cadence path, and
 rio-store/src/logs/sweep.rs	/// Executions per batch. Each batch is one indexed SELECT, two `= ANY`
 rio-store/src/logs/sweep.rs	/// log artifacts ONLY — chunks, objects, stale session rows.
 rio-store/src/logs/sweep.rs	/// uncleanly (heartbeat past the grace) and ONLY those — a live
@@ -1424,6 +1532,7 @@ rio-store/src/materialize/client.rs	// refund frees the budget and the SAME pass
 rio-store/src/materialize/client.rs	// short-circuit burns one timeout) — the SAME Charged entry,
 rio-store/src/materialize/client.rs	// the SAME job the descriptor listed → descriptor hints kept.
 rio-store/src/materialize/client.rs	// wedge observer — fed the sealed outcome on EVERY pass —
+rio-store/src/materialize/client.rs	///   - `Gone` converts on EVERY lane (the documented reset-grade
 rio-store/src/materialize/client.rs	/// ([`standing_effect`]), because the kernel mints on ANY claiming
 rio-store/src/materialize/client.rs	/// 64 passes" cadence is honest over ALL exits, gated ones
 rio-store/src/materialize/client.rs	/// A bare `host:port` scheduler address, the ONLY currency
@@ -1481,6 +1590,7 @@ rio-store/src/materialize/executor.rs	/// a path future returns exactly one of t
 rio-store/src/materialize/executor.rs	/// again). Minted ONLY by [`PathSlotPool::try_admit_claim`];
 rio-store/src/materialize/executor.rs	/// bug_041 red: the walk re-reads live wanted EVERY iteration but
 rio-store/src/materialize/executor.rs	/// job through ANY interested tenant's upstreams; a job fails only
+rio-store/src/materialize/executor.rs	/// livelock. Both legs asserted on the SAME rows — the
 rio-store/src/materialize/executor.rs	/// mutated ONLY by [`Self::commit`] — the success witness, called
 rio-store/src/materialize/executor.rs	/// pre-fix the rendezvous NEVER completes, so widening cannot
 rio-store/src/materialize/executor.rs	/// requires the miss to be confirmed under EVERY interested
@@ -1521,30 +1631,38 @@ rio-store/src/signing.rs	/// Two trusted keys with the SAME name (rotation with 
 rio-store/src/substitute.rs	// Capability gate — the SAME helper (and therefore the SAME
 rio-store/src/substitute.rs	// Drop one: headroom restored, the SAME tenant re-admits.
 rio-store/src/substitute.rs	// Envelope-violation red (R17, floor-rate axis): the SAME paced
+rio-store/src/substitute.rs	// The heal-edge mixed sequence through the SAME driver (the
 rio-store/src/substitute.rs	// The per-read stall and the hold-deadline expiry are the SAME
 rio-store/src/substitute.rs	// The sibling rides the SAME pool through its own ungated
 rio-store/src/substitute.rs	// `Hit` if any base 2xx; `Miss` if EVERY base returned a
 rio-store/src/substitute.rs	// across abort paths. The guard rides the reservation, so EVERY
 rio-store/src/substitute.rs	// batch size so EVERY pass-0 request 429s → 100% > 10%
 rio-store/src/substitute.rs	// classify ANY path. The old `default()` answer put
+rio-store/src/substitute.rs	// declared mode is the SAME declaration-priced shape as this plane's
 rio-store/src/substitute.rs	// merged_bug_016: EVERY `result` tick happens inside
 rio-store/src/substitute.rs	// merged_bug_016: a fresh EVERY-upstream GET-404 contradicts
 rio-store/src/substitute.rs	// per-read stall window; the per-read clock NEVER fires.
+rio-store/src/substitute.rs	// reserve and consults the SAME law through the one constructor —
 rio-store/src/substitute.rs	// sig_mode=replace → ONLY rio's sig, upstream's dropped.
 rio-store/src/substitute.rs	///   `NarBudgetReservation` construction lives ONLY in
+rio-store/src/substitute.rs	/// "Capped backoff on ANY listener error" (the doc contract below)
 rio-store/src/substitute.rs	/// - **Holder:** `held_permits` lives ONLY in the two ingest
 rio-store/src/substitute.rs	/// - **No hold-and-wait:** the one [`Self::reserve`] call is the ONLY
 rio-store/src/substitute.rs	/// 200 paths at 128 concurrency; ALL of pass-0 429s. Retry pass
-rio-store/src/substitute.rs	/// Global budget for in-flight NAR bytes — the SAME semaphore
+rio-store/src/substitute.rs	/// ANY listener error (connect-err / listen-err / recv-err): the
+rio-store/src/substitute.rs	/// Global budget for in-flight NAR bytes — the SAME sealed
 rio-store/src/substitute.rs	/// HEAD-only batch probe: which of `paths` exist on ANY of the
 rio-store/src/substitute.rs	/// N concurrent `try_substitute` calls for the SAME `(tenant, path)`
 rio-store/src/substitute.rs	/// The census file universe: EVERY `.rs` under `rio-store/src`,
+rio-store/src/substitute.rs	/// [`Self::raced_events`]. Reconnects with capped backoff on ANY
 rio-store/src/substitute.rs	/// `(tenant, path)` coalesce at the moka singleflight: ALL return
 rio-store/src/substitute.rs	/// `None` (tests / no-op) skips gating. main.rs wires the SAME
 rio-store/src/substitute.rs	/// bug_081 + merged_bug_044 failover-totality: for ANY
-rio-store/src/substitute.rs	/// drop that credits the semaphore back, so EVERY abort path —
 rio-store/src/substitute.rs	/// duration that could ONLY have come from the HTTP-date arm.
+rio-store/src/substitute.rs	/// for "capped backoff on ANY listener error"). The classes are
 rio-store/src/substitute.rs	/// init future observes EVERY escape — pre-loop and loop alike —
+rio-store/src/substitute.rs	/// notification), NEVER on connection-establishment acks: connect-ok
+rio-store/src/substitute.rs	/// seen by the SAME scan the production census runs — planted at
 rio-store/src/substitute.rs	/// shadowed by back-off advice, and an iteration with ANY
 rio-store/src/substitute.rs	/// to `derive(buffered)`-from-now — but NEVER grow. Returns
 rio-store/src/visibility.rs	// F = 2 concurrent misses on the SAME tenant: both callers
