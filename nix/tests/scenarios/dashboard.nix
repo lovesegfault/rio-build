@@ -305,7 +305,7 @@ in
   #      file, holding the session open. While parked it emits an empty
   #      keepalive batch every ~5s: this writer is its OWN producer
   #      under the bilateral liveness law (rio_common::liveness /
-  #      store.log.ingest-idle-abort+1) — it deliberately bypasses the
+  #      store.log.ingest-idle-abort+2) — it deliberately bypasses the
   #      builder uploader to control choreography, so the builder's
   #      UPLOADER_KEEPALIVE_PERIOD producer is never in this write
   #      path, and the ~5s cadence is this client's own conformance

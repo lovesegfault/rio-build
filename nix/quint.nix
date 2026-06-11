@@ -2677,7 +2677,7 @@ rec {
     # 16/822ms; quiet-churn [violation] 143 distinct/832ms;
     # silent-attach [violation] 32 distinct/818ms — the 1800s default
     # budget is three orders of magnitude of headroom.
-    # r[verify store.log.ingest-idle-abort+1]
+    # r[verify store.log.ingest-idle-abort+2]
     # r[verify store.log.attach-hello]
     quint-log-ingest-liveness = mkQuintCheck {
       name = "log-ingest-liveness";

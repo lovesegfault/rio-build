@@ -2596,24 +2596,31 @@ told the builder to "reconnect and replay" with the same effect. The
 classifier on the builder side was correct all along; the server simply
 never spoke the class it listened for.
 
-#r("store.log.ingest-idle-abort+1")[
+#r("store.log.ingest-idle-abort+2")[
   The log-ingest liveness law is bilateral. An AppendLog client whose
   session is open with an empty buffer MUST emit an empty keepalive
   batch at least every `UPLOADER_KEEPALIVE_PERIOD`; an ingest driver
-  whose buffer is empty and whose inbound stream has been silent for
-  `INBOUND_IDLE_ABORT` (four heartbeat intervals) MUST abort the
-  stream (counted, `reason="inbound_idle"`) rather than continue
-  renewing the ingest lease. The two bounds live as one shared const
-  pair whose conformance relation (period times margin strictly less
-  than abort) is enforced by test.
+  holding NO accepted-but-not-yet-durable lines (the buffer and any
+  cut-staged in-flight run both empty — one derived emptiness over
+  every place an accepted line can wait) whose inbound stream has been
+  silent for `INBOUND_IDLE_ABORT` (four heartbeat intervals) MUST
+  abort the stream (counted, `reason="inbound_idle"`) rather than
+  continue renewing the ingest lease; while any accepted line is
+  not yet durable the abort MUST defer (the pending work is retried by
+  the cut path, whose own failure laws bound the stream instead). The
+  two bounds live as one shared const pair whose conformance relation
+  (period times margin strictly less than abort) is enforced by test.
 ]
 
 Lease renewal is thereby structurally coupled to observed stream
 liveness: a builder that vanished without a FIN cannot hold its
-execution's ingest lease indefinitely through a driver that heartbeats
-PG forever. The empty-buffer gate makes the abort loss-free by
-construction; a non-empty buffer's liveness is owned by the cut path's
-bounded ack send.
+execution's ingest lease indefinitely through a driver that renews
+forever. The nothing-pending gate makes the abort loss-free by
+construction — the predecessor form gated on buffer bytes alone, which
+excluded the in-flight run a watchdog-abandoned cut leaves staged, so
+the abort destroyed committable lines the next cut's restore would
+have retried (merged_bug_144); pending lines' liveness is owned by the
+cut path's bounded ack send and its failure counters, not by this arm.
 
 SIGNED 2026-06-08 (owner, bughunt-4 fix-wave #5-S Q1): the idle-abort
 law is bilateral. The builder uploader carries the producer side (an

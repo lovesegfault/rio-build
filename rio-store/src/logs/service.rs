@@ -1014,16 +1014,32 @@ async fn read_header(inbound: &mut Streaming<AppendLogRequest>) -> Result<Append
     }
 }
 
-/// Why the `AppendLog` driver loop stopped.
+/// Why the `AppendLog` driver loop stopped. The abort half is typed by
+/// COMMIT-CAPABILITY (merged_bug_144): whether the replica can still
+/// durably commit decides whether the accepted-but-undurable tail
+/// drains before the trailer — pre-split, one `Abort` conflated the
+/// two and the cap/idle refusals skipped the ClientFinished-only
+/// drain, silently losing the tail of every cap-crossing log (the
+/// builder maps the cap trailer to permanent CapExhausted, so
+/// "retransmit rescues them" never applied).
 enum LoopExit {
     /// The builder half-closed the stream: the normal end of a build's
     /// log. Drain, release, succeed.
     ClientFinished,
-    /// The stream must be torn down with this status. The lease is
-    /// still ours and is released.
-    Abort(Status),
-    /// The lease was stolen by another replica. Same teardown as
-    /// `Abort` EXCEPT the lease row is NOT deleted — it belongs to the
+    /// Stream-fatal refusal minted while the replica CAN still commit
+    /// (the per-execution caps, the inbound-idle law, a protocol
+    /// violation): the accepted under-cap tail DRAINS FIRST, then the
+    /// carried status is the trailer. The lease is still ours and is
+    /// released.
+    AbortRefusesInput(Status),
+    /// The replica CANNOT durably commit (consecutive cut failures,
+    /// stale buffer): draining would burn more attempts against a
+    /// failing backend — the builder's retransmit buffer owns the
+    /// un-acked tail and replays it elsewhere. The lease is still
+    /// ours and is released.
+    AbortCannotCommit(Status),
+    /// The lease was stolen by another replica. Same teardown as the
+    /// aborts EXCEPT the lease row is NOT deleted — it belongs to the
     /// new owner now, and `sessions::release` is session-id-predicated
     /// anyway, but skipping the call entirely makes the intent
     /// auditable.
@@ -1110,14 +1126,20 @@ impl AppendDriver {
         drop(deregister);
 
         // 2. The final drain: one chunk per remaining contiguous run.
-        // Skipped when the stream is aborting because the replica
-        // cannot commit chunks (the drain would just burn three more
-        // failed attempts) — the builder's retransmit buffer still
-        // holds every un-acked line.
-        let drain_stop = if matches!(exit, LoopExit::ClientFinished) {
-            self.drain(&ack_tx).await.err()
-        } else {
-            None
+        // Runs for the clean close AND for every REFUSES-INPUT abort
+        // (merged_bug_144: the replica can still commit, so the
+        // accepted under-cap tail goes durable before the trailer —
+        // pre-split, the cap/idle aborts skipped this and the tail of
+        // every cap-crossing log was silently lost). Skipped when the
+        // replica CANNOT commit (the drain would just burn three more
+        // failed attempts — the builder's retransmit buffer still
+        // holds every un-acked line) and when the lease is no longer
+        // ours (the new owner's session is the committing one now).
+        let drain_stop = match &exit {
+            LoopExit::ClientFinished | LoopExit::AbortRefusesInput(_) => {
+                self.drain(&ack_tx).await.err()
+            }
+            LoopExit::AbortCannotCommit(_) | LoopExit::LeaseLost | LoopExit::Displaced => None,
         };
 
         // The heartbeat covered the drain; stop it (bounded join)
@@ -1174,7 +1196,47 @@ impl AppendDriver {
                     }
                 }
             }
-            LoopExit::Abort(status) => {
+            LoopExit::AbortRefusesInput(status) => {
+                match drain_stop {
+                    // The accepted tail is durable (or there was none):
+                    // the refusal itself is the honest trailer.
+                    None => ack_try_send(&ack_tx, Err(status)),
+                    // The drain hit the per-execution chunk cap: the
+                    // cap verdict supersedes the original refusal —
+                    // permanent everywhere, same class either way.
+                    Some(DrainStop::CapExhausted) => {
+                        ack_try_send(
+                            &ack_tx,
+                            Err(gate::cap_rejection(
+                                "cap",
+                                format!(
+                                    "AppendLog: execution exceeded the {}-chunk cap \
+                                     during the final drain; un-acked lines were not stored",
+                                    self.max_chunks_per_exec
+                                ),
+                            )),
+                        );
+                    }
+                    // The drain FAILED on this replica: the un-acked
+                    // tail is rescuable elsewhere, so the trailer is
+                    // the per-replica retry vocabulary — NOT the
+                    // original (permanent) refusal, which would tell
+                    // the builder to abandon lines a healthy replica
+                    // would still commit. The byte/idle refusal
+                    // re-derives wherever the builder replays (the
+                    // caps are durable-seeded).
+                    Some(DrainStop::CutFailed) => {
+                        ack_try_send(
+                            &ack_tx,
+                            Err(Status::unavailable(
+                                "AppendLog: the final tail flush failed on this replica; \
+                                 un-acked lines were not stored — reconnect and replay",
+                            )),
+                        );
+                    }
+                }
+            }
+            LoopExit::AbortCannotCommit(status) => {
                 ack_try_send(&ack_tx, Err(status));
             }
             LoopExit::LeaseLost => {
@@ -1244,12 +1306,18 @@ impl AppendDriver {
                             | Ok(AcceptOutcome::RejectedOverflow)
                             | Ok(AcceptOutcome::RejectedPastFinal)
                             | Ok(AcceptOutcome::RejectedOversizedBatch) => {}
-                            // Stream-fatal (the per-execution byte cap).
-                            Err(status) => return LoopExit::Abort(status),
+                            // Stream-fatal (the per-execution byte
+                            // cap — accept()'s ONLY Err construction,
+                            // census-pinned). A REFUSAL on a healthy
+                            // replica: the accepted under-cap tail
+                            // drains before this trailer.
+                            Err(status) => return LoopExit::AbortRefusesInput(status),
                         }
                     }
                     Ok(Some(AppendLogRequest { msg: Some(append_log_request::Msg::Header(_)) })) => {
-                        return LoopExit::Abort(Status::invalid_argument(
+                        // A protocol violation, refused while the
+                        // replica is healthy: accepted lines drain.
+                        return LoopExit::AbortRefusesInput(Status::invalid_argument(
                             "AppendLog: duplicate header (the stream's identity is set once)",
                         ));
                     }
@@ -1279,7 +1347,7 @@ impl AppendDriver {
                     // countable failures; the per-tick check converts
                     // them into the failover abort promptly.
                     if let Some(reason) = self.session.should_abort() {
-                        return LoopExit::Abort(self.abort_status(reason));
+                        return LoopExit::AbortCannotCommit(self.abort_status(reason));
                     }
                 }
                 // Displaced by a newer session for the same execution
@@ -1322,7 +1390,11 @@ impl AppendDriver {
                                 "reason" => "heartbeat_task_died"
                             )
                             .increment(1);
-                            return LoopExit::Abort(Status::unavailable(
+                            // The replica can still commit: the
+                            // staged tail drains before the trailer
+                            // (concurrent-session overlap is safe by
+                            // the session-keyed chunk/dedup law).
+                            return LoopExit::AbortRefusesInput(Status::unavailable(
                                 "AppendLog: the session heartbeat task ended unexpectedly; \
                                  reconnect and replay from the last ack",
                             ));
@@ -1334,23 +1406,29 @@ impl AppendDriver {
                     // a netsplit ate the FIN) leaves this stream mute
                     // forever while the lease heartbeats keep renewing
                     // the ingest lease — an immortal driver pinned to a
-                    // dead peer. With an EMPTY buffer and inbound
-                    // silence past four heartbeats, abort: nothing
-                    // buffered can be lost, and a CONFORMANT peer cannot
-                    // trip this arm — the bilateral contract
-                    // (rio_common::liveness) obliges any client parked
-                    // on an open, empty-buffer session to emit keepalive
-                    // batches well inside the bound (the builder
-                    // uploader's empty-batch arm; the dashboard test's
-                    // grpcurl writer is its own producer). No
-                    // transport-layer input reaches this arm — h2 PINGs
-                    // vouch for the CONNECTION, not the stream's
-                    // producer, which is exactly why the law needs an
-                    // application-layer producer side. The non-empty-
-                    // buffer case is covered by the bounded ack send on
-                    // the cut path, not this arm.
-                    // r[impl store.log.ingest-idle-abort+1]
-                    if self.session.buffer_is_empty()
+                    // dead peer. With NOTHING PENDING (buffer and the
+                    // cut-staged in-flight run both empty — derived
+                    // from oldest_pending_since, never from buffer
+                    // bytes alone: a watchdog-abandoned cut leaves
+                    // committable lines staged with zero buffer bytes,
+                    // and aborting then would destroy what the next
+                    // cut's restore_in_flight retries; merged_bug_144)
+                    // and inbound silence past four heartbeats, abort:
+                    // nothing accepted can be lost, and a CONFORMANT
+                    // peer cannot trip this arm — the bilateral
+                    // contract (rio_common::liveness) obliges any
+                    // client parked on an open, nothing-pending session
+                    // to emit keepalive batches well inside the bound
+                    // (the builder uploader's empty-batch arm; the
+                    // dashboard test's grpcurl writer is its own
+                    // producer). No transport-layer input reaches this
+                    // arm — h2 PINGs vouch for the CONNECTION, not the
+                    // stream's producer, which is exactly why the law
+                    // needs an application-layer producer side. The
+                    // pending-lines case is covered by the bounded ack
+                    // send on the cut path, not this arm.
+                    // r[impl store.log.ingest-idle-abort+2]
+                    if self.session.no_pending_lines()
                         && last_inbound.elapsed() >= INBOUND_IDLE_BOUND
                     {
                         metrics::counter!(
@@ -1358,8 +1436,8 @@ impl AppendDriver {
                             "reason" => "inbound_idle"
                         )
                         .increment(1);
-                        return LoopExit::Abort(Status::aborted(
-                            "AppendLog: no inbound traffic for 60s with an empty buffer; \
+                        return LoopExit::AbortRefusesInput(Status::aborted(
+                            "AppendLog: no inbound traffic for 60s with nothing pending; \
                              reconnect and resume from the last ack",
                         ));
                     }
@@ -1411,7 +1489,7 @@ impl AppendDriver {
                     return self
                         .session
                         .should_abort()
-                        .map(|r| LoopExit::Abort(self.abort_status(r)));
+                        .map(|r| LoopExit::AbortCannotCommit(self.abort_status(r)));
                 }
                 CutStep::Exit(exit) => return Some(exit),
             }
@@ -1431,7 +1509,7 @@ impl AppendDriver {
             CutStep::Failed => self
                 .session
                 .should_abort()
-                .map(|r| LoopExit::Abort(self.abort_status(r))),
+                .map(|r| LoopExit::AbortCannotCommit(self.abort_status(r))),
             CutStep::Exit(exit) => Some(exit),
         }
     }
@@ -1479,7 +1557,11 @@ impl AppendDriver {
             // and re-dialed at 1 Hz forever; FAILED_PRECONDITION +
             // x-rio-log-reject: cap maps it onto
             // AbandonReason::CapExhausted (one disclosure, done).
-            return CutStep::Exit(LoopExit::Abort(gate::cap_rejection(
+            // A per-execution refusal on a healthy replica: the
+            // under-cap tail drains first (the drain's own cap check
+            // stops it, so the drain is a no-op exactly when the cap
+            // arithmetic says nothing more may commit).
+            return CutStep::Exit(LoopExit::AbortRefusesInput(gate::cap_rejection(
                 "cap",
                 format!(
                     "AppendLog: execution exceeded the {}-chunk cap",
@@ -2575,7 +2657,7 @@ mod tests {
     /// (2026-06-04, fix neutralized via `if false &&`): the await
     /// below outlived a 100 s timeout — the driver renewed the lease
     /// forever. GREEN: Aborted("no inbound traffic") at ~75 s.
-    // r[verify store.log.ingest-idle-abort+1]
+    // r[verify store.log.ingest-idle-abort+2]
     #[tokio::test]
     #[ignore = "60-75s real time (HEARTBEAT_INTERVAL is a const); run with --run-ignored all"]
     async fn idle_inbound_with_empty_buffer_aborts() {
@@ -2723,6 +2805,113 @@ mod tests {
         assert!(
             !liveness_census_violations(&planted2).is_empty(),
             "the census must refuse a second spawn_heartbeat site"
+        );
+    }
+
+    /// The abort-disposition census predicate (merged_bug_144): every
+    /// `LoopExit` abort site is one of exactly two commit-capability
+    /// classes, and the per-class populations are pinned so a NEW
+    /// abort site cannot land without consciously declaring its drain
+    /// disposition here. Current census ([GEN-SET], from the
+    /// production text): `AbortRefusesInput` = 7 occurrences — 5
+    /// constructions (duplicate header; the accept() byte-cap map; the
+    /// heartbeat-task-died arm; the inbound-idle arm; the do_cut chunk
+    /// cap) + 2 consumers in `run` (the drain gate, the trailer
+    /// match). `AbortCannotCommit` = 5 occurrences — 3 constructions
+    /// (the cut-tick `should_abort` arm; the `cut_while_due` map; the
+    /// `cut_once_if_nonempty` map — all via `abort_status`, the
+    /// replica-failure vocabulary) + the same 2 consumers.
+    fn abort_disposition_census_violations(src: &str) -> Vec<&'static str> {
+        let mut v = Vec::new();
+        let refuses = format!("LoopExit::{}(", "AbortRefusesInput");
+        if src.matches(&refuses).count() != 7 {
+            v.push(
+                "AbortRefusesInput population moved: a refusal site was added or \
+                 removed without re-declaring its drain-first disposition in this \
+                 census",
+            );
+        }
+        let cannot = format!("LoopExit::{}(", "AbortCannotCommit");
+        if src.matches(&cannot).count() != 5 {
+            v.push(
+                "AbortCannotCommit population moved: a replica-failure abort site \
+                 was added or removed without re-declaring its no-drain \
+                 disposition in this census",
+            );
+        }
+        v
+    }
+
+    /// The accept()-Err census predicate: the driver maps accept()'s
+    /// `Err` TOTALLY onto `AbortRefusesInput` — sound only while the
+    /// byte-cap rejection is accept()'s ONLY `Err` construction. The
+    /// member list is ingest.rs's own embedded text ((wwwww)); the
+    /// extent is `pub fn accept` up to the next `pub fn`.
+    fn accept_err_census_violations(ingest_src: &str) -> Vec<&'static str> {
+        let stripped: String = ingest_src.chars().filter(|c| !c.is_whitespace()).collect();
+        let head = format!("pubfn{}(", "accept");
+        let Some(start) = stripped.find(&head) else {
+            return vec!["accept() not found in ingest.rs"];
+        };
+        let tail = &stripped[start + head.len()..];
+        let body = match tail.find("pubfn") {
+            Some(end) => &tail[..end],
+            None => tail,
+        };
+        let ret_err = format!("return{}(", "Err");
+        let cap_form = format!("return{}(super::gate::cap_rejection(", "Err");
+        if body.matches(&ret_err).count() != 1 || body.matches(&cap_form).count() != 1 {
+            return vec![
+                "accept() grew a second Err construction (or the cap rejection \
+                 moved): the driver's Err -> AbortRefusesInput map is no longer \
+                 total — re-derive the disposition for the new Err class",
+            ];
+        }
+        Vec::new()
+    }
+
+    /// [GEN-SET] The abort-disposition + accept-Err censuses
+    /// (merged_bug_144), with R22′ plants at the raw-source layer.
+    #[test]
+    fn abort_disposition_census() {
+        let src = production_half();
+        let violations = abort_disposition_census_violations(&src);
+        assert!(
+            violations.is_empty(),
+            "abort-disposition census violations: {violations:?}"
+        );
+        // Plant: an undeclared new refusal site moves the population.
+        let strawman = format!("returnLoopExit::{}(status);", "AbortRefusesInput");
+        assert!(
+            !abort_disposition_census_violations(&format!("{src}{strawman}")).is_empty(),
+            "the census must refuse an undeclared AbortRefusesInput site"
+        );
+        // Plant: an undeclared replica-failure abort site likewise.
+        let strawman2 = format!("returnLoopExit::{}(status);", "AbortCannotCommit");
+        assert!(
+            !abort_disposition_census_violations(&format!("{src}{strawman2}")).is_empty(),
+            "the census must refuse an undeclared AbortCannotCommit site"
+        );
+
+        let ingest = include_str!("ingest.rs");
+        let violations = accept_err_census_violations(ingest);
+        assert!(
+            violations.is_empty(),
+            "accept-Err census violations: {violations:?}"
+        );
+        // Plant: a second Err construction inside accept()'s extent —
+        // injected right after accept()'s head so it lands inside the
+        // scanned extent.
+        let planted = ingest.replace(
+            "pub fn accept(",
+            &format!(
+                "pub fn accept() {{ return {}(Status::internal(\"strawman\")); }} fn x(",
+                "Err"
+            ),
+        );
+        assert!(
+            !accept_err_census_violations(&planted).is_empty(),
+            "the census must refuse a second Err construction in accept()"
         );
     }
 
@@ -2948,6 +3137,149 @@ mod tests {
         // The final drain has nothing left; clean close.
         assert!(acks.message().await.expect("clean close").is_none());
         server.abort();
+    }
+
+    /// W10-BD (merged_bug_144): a cap-crossing log's accepted under-cap
+    /// tail is committed BEFORE the cap trailer — the byte-cap abort is
+    /// a REFUSAL on a healthy replica, so it drains first. Pre-fix the
+    /// cap abort skipped the ClientFinished-only drain: the trailer is
+    /// permanent (the builder's classifier maps it to CapExhausted and
+    /// never retransmits), so the tail of EVERY cap-crossing log was
+    /// silently lost.
+    // r[verify store.log.cap-reject-class]
+    #[tokio::test]
+    async fn cap_crossing_log_drains_accepted_tail_before_trailer() {
+        let mut h = harness_with(256, |s| {
+            s.with_ingest_config(IngestConfig {
+                // No size-triggered cut: the under-cap tail stays
+                // buffered until the drain.
+                cut_threshold_bytes: 1024 * 1024,
+                // The lifetime byte cap the second batch crosses.
+                per_exec_byte_cap: 1024,
+                ..IngestConfig::default()
+            })
+        })
+        .await;
+        let exec = seed_assignment(&h.db.pool, "builder-0").await;
+        let tok = token("builder-0", DRV);
+
+        let (tx, mut acks) = open_append(&mut h.client, &tok, vec![header_msg(exec)])
+            .await
+            .expect("open");
+        // Two small lines: accepted, buffered, well under the cap.
+        tx.send(batch_msg(0, &["under-cap line zero", "under-cap line one"]))
+            .await
+            .unwrap();
+        // One oversized line: crossing the cap is stream-fatal.
+        let big = "x".repeat(2000);
+        tx.send(batch_msg(2, &[big.as_str()])).await.unwrap();
+
+        // The accepted tail commits FIRST: an ack for lines 0..=1
+        // precedes the trailer, and the chunk is durable.
+        let first = acks
+            .message()
+            .await
+            .expect("the drain ack precedes the cap trailer (pre-fix the trailer came first and the tail was lost — the merged_bug_144 red)")
+            .expect("ack present");
+        assert_eq!(
+            first.durable_through_line, 1,
+            "the under-cap tail (lines 0..=1) is durable before the trailer"
+        );
+        // THEN the cap trailer, in the permanent per-execution class.
+        let trailer = acks
+            .message()
+            .await
+            .expect_err("the stream ends with the cap rejection");
+        assert_eq!(trailer.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            trailer.message().contains("byte"),
+            "the trailer names the byte cap, got: {trailer:?}"
+        );
+        assert_eq!(h.chunk_store.len(), 1, "one chunk holds the drained tail");
+        drop(tx);
+
+        // The read path serves the committed tail.
+        let resp = h
+            .client
+            .tail_log(tail_req(exec, false))
+            .await
+            .expect("tail");
+        let (lines, _) = collect_tail(resp.into_inner()).await.expect("collect");
+        assert_eq!(
+            lines.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            vec![0, 1],
+            "the cap-crossing log's accepted tail is readable"
+        );
+    }
+
+    /// W10-BE (merged_bug_144): a watchdog-abandoned cut leaves its
+    /// drained run STAGED in `in_flight` with `buffer_bytes == 0` —
+    /// the pre-fix idle gate read exactly that weaker face, so an
+    /// inbound-silent stream was aborted with committable lines
+    /// staged, destroying what the next cut's `restore_in_flight`
+    /// retries (the 15 s housekeeping tick deterministically preceded
+    /// the next cut tick). Post-fix the gate input is
+    /// `no_pending_lines()` — derived from `oldest_pending_since`, the
+    /// one field spanning both vecs — so the abort defers and the
+    /// retry commits the staged run.
+    // r[verify store.log.ingest-idle-abort+2]
+    #[tokio::test]
+    async fn idle_gate_emptiness_spans_staged_lines() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let exec = seed_assignment(&db.pool, "builder-0").await;
+        let store = GatedChunkStore::new();
+        let gate_ok = gate::GateOk {
+            drv_hash: rio_nix::store_path::drv_log_hash(DRV_PATH),
+            exec_id: exec,
+            final_line_count: None,
+            prior_accounted_bytes: 0,
+            prior_chunks: 0,
+        };
+        let mut session = IngestSession::new(&gate_ok, Uuid::now_v7(), IngestConfig::default());
+        session
+            .accept(rio_proto::types::BuildLogBatch {
+                derivation_path: DRV_PATH.to_string(),
+                lines: vec![b"staged line".to_vec()],
+                first_line_number: 0,
+                executor_id: String::new(),
+            })
+            .unwrap();
+        assert!(
+            !session.no_pending_lines(),
+            "an accepted line is pending before any cut"
+        );
+        // Watchdog-abandon shape: the cut future is dropped mid-PUT;
+        // the drained run stays STAGED in in_flight.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                session.cut(&store, &db.pool)
+            )
+            .await
+            .is_err(),
+            "the gated PUT parks the cut past the probe timeout"
+        );
+        // The gate input the production idle arm consults: a staged
+        // committable line is PENDING — the idle abort must defer.
+        assert!(
+            !session.no_pending_lines(),
+            "the idle-gate emptiness must span the staged in-flight run \
+             (a committable line is staged; aborting would destroy what \
+             restore_in_flight retries — the merged_bug_144 red)"
+        );
+        // The retry face: the next cut restores the staged run and
+        // commits it; only then is the session pending-empty (and only
+        // then may the idle abort fire, losing nothing).
+        store.release_one();
+        let committed = session
+            .cut(&store, &db.pool)
+            .await
+            .expect("the retried cut commits the restored run");
+        assert_eq!(committed, Some(0), "line 0 is durable through the retry");
+        assert!(
+            session.no_pending_lines(),
+            "nothing pending once the staged run committed"
+        );
     }
 
     /// store.log.completeness-gate, the per-append half: a builder

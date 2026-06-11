@@ -484,12 +484,19 @@ impl IngestSession {
         self.lock_shared().buffer_bytes >= self.config.cut_threshold_bytes
     }
 
-    /// True iff nothing is buffered. The AppendLog driver's
-    /// inbound-idle abort is gated on this: with an empty buffer an
-    /// idle-abort can lose nothing, while a non-empty buffer's
-    /// liveness is owned by the cut path's bounded ack send.
-    pub fn buffer_is_empty(&self) -> bool {
-        self.lock_shared().buffer_bytes == 0
+    /// True iff the session holds NO accepted-but-not-yet-durable
+    /// lines — derived from `oldest_pending_since`, the ONE field whose
+    /// lifecycle spans both vecs (`None` exactly when `buffer` and
+    /// `in_flight` are both empty). The AppendLog driver's inbound-idle
+    /// abort is gated on this: when nothing is pending an idle-abort
+    /// can lose nothing, while pending lines' liveness is owned by the
+    /// cut path's bounded ack send. The predecessor accessor read
+    /// `buffer_bytes == 0`, which EXCLUDES the in-flight run a
+    /// watchdog-abandoned cut leaves staged — the idle abort then
+    /// destroyed committable lines the next cut's `restore_in_flight`
+    /// would have retried (merged_bug_144); that weaker face is gone.
+    pub fn no_pending_lines(&self) -> bool {
+        self.lock_shared().oldest_pending_since.is_none()
     }
 
     /// How many chunk-cut attempts this session has made (== the number
