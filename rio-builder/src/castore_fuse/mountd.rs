@@ -602,22 +602,76 @@ const MAX_INFLIGHT_PROMOTES_PER_CONN: usize = 64;
 
 // ─── Daemon entrypoint ─────────────────────────────────────────────────
 
+/// Ensure one of the daemon-owned base directories exists, open it, and
+/// clamp its ownership and mode through the opened dirfd (so the inode
+/// we checked is the inode we serve — no path re-walk).
+///
+/// CVE-2021-41103 class: `create_dir_all` leaves umask-default 0755,
+/// which lets any local uid traverse into the node-shared caches and
+/// read other tenants' build inputs. The clamp runs on every daemon
+/// start, so it also repairs dirs pre-created too loose by the node
+/// image. Group is `allowed_gid` — the same group that gates the
+/// mountd socket; per-dir mode rationale is at the call sites in
+/// [`run`].
+///
+/// The owner must be the daemon's own euid (root in production): a
+/// foreign-owned base dir means something else claimed the path, and
+/// chmod-ing it would grant that owner's files to `allowed_gid`.
+fn open_base(p: &Path, allowed_gid: u32, mode: Mode) -> anyhow::Result<OwnedFd> {
+    std::fs::create_dir_all(p).with_context(|| format!("create {}", p.display()))?;
+    let fd = nix::fcntl::open(
+        p,
+        OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .with_context(|| format!("open {}", p.display()))?;
+    let st = nix::sys::stat::fstat(&fd).with_context(|| format!("stat {}", p.display()))?;
+    let me = nix::unistd::geteuid();
+    if st.st_uid != me.as_raw() {
+        anyhow::bail!(
+            "{} is owned by uid {} (expected {}); refusing to serve a foreign-owned base dir",
+            p.display(),
+            st.st_uid,
+            me,
+        );
+    }
+    nix::unistd::fchown(&fd, None, Some(Gid::from_raw(allowed_gid)))
+        .with_context(|| format!("chgrp {} to gid {allowed_gid}", p.display()))?;
+    nix::sys::stat::fchmod(&fd, mode)
+        .with_context(|| format!("chmod {} to {:o}", p.display(), mode.bits()))?;
+    Ok(fd)
+}
+
 /// Bind the socket, reap orphans from a previous incarnation, and serve
 /// until cancelled.
 pub async fn run(cfg: MountdConfig) -> anyhow::Result<()> {
-    let open_base = |p: &Path| -> anyhow::Result<OwnedFd> {
-        std::fs::create_dir_all(p).with_context(|| format!("create {}", p.display()))?;
-        nix::fcntl::open(
-            p,
-            OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-            Mode::empty(),
-        )
-        .with_context(|| format!("open {}", p.display()))
-    };
-    let castore_base = open_base(&cfg.castore_dir)?;
-    let staging_base = open_base(&cfg.staging_dir)?;
-    let cache_base = open_base(&cfg.cache_dir)?;
-    let chunks_base = open_base(&cfg.chunks_dir)?;
+    // castore/ is 0751 (world-traverse, no list): the per-build FUSE
+    // mountpoints under it are deliberately reachable by the build's
+    // user-namespace uids (allow_other + rootmode 40555), which are not
+    // guaranteed to carry `allowed_gid` on the host side. The shared
+    // caches and the staging root hold cross-tenant data and are only
+    // ever path-accessed by mountd (root) and the builder daemon
+    // (gid `allowed_gid`), so they get 0750.
+    let castore_base = open_base(
+        &cfg.castore_dir,
+        cfg.allowed_gid,
+        Mode::from_bits_truncate(0o751),
+    )?;
+    let staging_base = open_base(
+        &cfg.staging_dir,
+        cfg.allowed_gid,
+        Mode::from_bits_truncate(0o750),
+    )?;
+    let cache_base = open_base(
+        &cfg.cache_dir,
+        cfg.allowed_gid,
+        Mode::from_bits_truncate(0o750),
+    )?;
+    let chunks_base = open_base(
+        &cfg.chunks_dir,
+        cfg.allowed_gid,
+        Mode::from_bits_truncate(0o750),
+    )?;
 
     reap_orphans(&cfg, &castore_base);
 
@@ -1700,6 +1754,41 @@ mod tests {
             .mode()
             & 0o7777;
         assert_eq!(mode, 0o444, "got {mode:o}");
+    }
+
+    /// CVE-2021-41103 class: the base dirs mountd owns must not be
+    /// world-readable — a 0755 cache/chunks root lets any local uid
+    /// read other tenants' build inputs. `open_base` must clamp both
+    /// the fresh-create path (exercised under a permissive 0000 umask,
+    /// the worst case `create_dir_all` can leave) and dirs pre-created
+    /// too loose by the node image. Safe to mutate the process umask:
+    /// nextest runs each test in its own process.
+    #[test]
+    fn open_base_clamps_mode_group_and_owner() {
+        nix::sys::stat::umask(Mode::from_bits_truncate(0o000));
+        let tmp = tempfile::tempdir().unwrap();
+        let gid = nix::unistd::getegid();
+        let uid = nix::unistd::geteuid();
+        // (role, clamped mode, pre-create with a loose mode first?)
+        let cases = [
+            ("castore", 0o751, false),
+            ("staging", 0o750, false),
+            ("cache", 0o750, false),
+            ("chunks", 0o750, true), // pre-existing 0755 dir gets repaired
+        ];
+        for (name, want_mode, pre_create) in cases {
+            let p = tmp.path().join(name);
+            if pre_create {
+                std::fs::create_dir(&p).unwrap();
+                std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                    .unwrap();
+            }
+            let fd = open_base(&p, gid.as_raw(), Mode::from_bits_truncate(want_mode)).unwrap();
+            let st = nix::sys::stat::fstat(&fd).unwrap();
+            assert_eq!(st.st_mode & 0o7777, want_mode, "{name} mode");
+            assert_eq!(st.st_gid, gid.as_raw(), "{name} group");
+            assert_eq!(st.st_uid, uid.as_raw(), "{name} owner");
+        }
     }
 
     /// Content that does not hash to the claimed digest is rejected and
