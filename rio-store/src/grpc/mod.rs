@@ -219,6 +219,12 @@ fn resolve_tenant_id(
 /// `DEADLINE_EXCEEDED` into the stream for a client that is still
 /// reading.
 ///
+/// The budget is ABSOLUTE — right for the streams this guards, whose
+/// total size is bounded (one NAR, one directory walk, one blob). It is
+/// wrong for `GetChunks`, where the client reuses one bidi stream for a
+/// whole file's fill and lifetime scales with file size: that RPC has
+/// its own IDLE-based watchdog (`chunk.rs`, `stream_idle_timeout`).
+///
 /// Returns `Some(output)` when the drain completed within the timeout,
 /// `None` when it timed out — callers layer site-specific logging or
 /// success-path metrics on top.

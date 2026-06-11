@@ -72,6 +72,16 @@ struct ChunkSession {
 
 impl ChunkSession {
     async fn new() -> anyhow::Result<Self> {
+        Self::build(None).await
+    }
+
+    /// Same harness with a tiny `GetChunks` idle budget so the
+    /// idle-watchdog tests don't wait out the production 300 s.
+    async fn with_stream_idle_timeout(idle: std::time::Duration) -> anyhow::Result<Self> {
+        Self::build(Some(idle)).await
+    }
+
+    async fn build(idle: Option<std::time::Duration>) -> anyhow::Result<Self> {
         let db = TestDb::new(&MIGRATOR).await;
         let backend = mem_backend();
         // ONE cache, shared across StoreService and ChunkService.
@@ -87,13 +97,16 @@ impl ChunkSession {
 
         let store_service =
             StoreServiceImpl::new(db.pool.clone()).with_chunk_cache(Arc::clone(&cache));
-        let chunk_service = ChunkServiceImpl::new(
+        let mut chunk_service = ChunkServiceImpl::new(
             db.pool.clone(),
             Some(cache),
             Some(Arc::new(rio_auth::hmac::HmacVerifier::from_key(
                 CHUNK_HMAC_KEY.to_vec(),
             ))),
         );
+        if let Some(idle) = idle {
+            chunk_service = chunk_service.with_stream_idle_timeout(idle);
+        }
 
         let router = Server::builder()
             .add_service(StoreServiceServer::new(store_service))
@@ -450,6 +463,115 @@ async fn test_getchunks_no_cache_failed_precondition() -> TestResult {
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
 
     server.abort();
+    Ok(())
+}
+
+/// The GetChunks stream timeout is IDLE-based, not absolute: a stream
+/// that keeps transferring outlives many multiples of the budget.
+///
+/// Regression for the large-file livelock: `GRPC_STREAM_TIMEOUT`
+/// (300 s) used to cap the WHOLE bidi stream, but the builder's
+/// castore-FUSE fill reuses ONE stream per file, so any file larger
+/// than 300 s × wire-rate (~4.4 GiB at the ~15 MB/s sizing rate) died
+/// mid-fill and the restarted fill could never complete. Structural
+/// proof with a 300 ms budget: 8 batches spaced 120 ms apart keep one
+/// stream alive for ~1 s ≈ 3× the budget, with every batch answered.
+// r[verify proto.chunk.batch-bidi]
+#[tokio::test]
+async fn test_getchunks_active_stream_outlives_absolute_budget() -> TestResult {
+    let idle = std::time::Duration::from_millis(300);
+    let mut s = ChunkSession::with_stream_idle_timeout(idle).await?;
+    let (nar, info, _) = make_large_nar(60, 512 * 1024);
+    put_path(&mut s.store, info, nar).await?;
+    let hashes: Vec<Vec<u8>> = sqlx::query_scalar("SELECT blake3_hash FROM chunks")
+        .fetch_all(&s.db.pool)
+        .await?;
+
+    let (tx, rx) = mpsc::channel(1);
+    let mut stream = s
+        .chunk
+        .get_chunks(authed(ReceiverStream::new(rx)))
+        .await?
+        .into_inner();
+
+    let start = std::time::Instant::now();
+    for i in 0..8 {
+        // Pace the batches so total stream lifetime is a multiple of
+        // the budget while every inter-frame gap stays well under it —
+        // the cadence of a real fill (`fill_from_chunks` sends the next
+        // frame as soon as the previous batch is written).
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        let digest = hashes[i % hashes.len()].clone();
+        tx.send(GetChunksRequest {
+            digests: vec![digest.clone()],
+        })
+        .await
+        .expect("request side open");
+        let chunk = stream
+            .message()
+            .await?
+            .expect("active stream must stay open past the old absolute deadline");
+        assert_eq!(chunk.digest, digest, "answer matches the batch's digest");
+    }
+    // Vacuity guard: sleeps are lower-bounded, so this can only fail if
+    // the pacing above is edited down — the test proves nothing unless
+    // the stream outlived the budget several times over.
+    assert!(
+        start.elapsed() > idle * 3,
+        "stream must outlive multiple idle budgets for this test to mean anything"
+    );
+
+    drop(tx);
+    assert!(
+        stream.message().await?.is_none(),
+        "request side closed → clean end of stream"
+    );
+    Ok(())
+}
+
+/// The flip side of the idle-based timeout: a stream with NO activity
+/// for longer than the budget is killed with DEADLINE_EXCEEDED. The
+/// watchdog still guards what `drain_with_timeout` guarded — a
+/// half-open client must not pin the drain task (and up to
+/// K × CHUNK_MAX of fetch state) forever.
+// r[verify proto.chunk.batch-bidi]
+#[tokio::test]
+async fn test_getchunks_idle_stream_times_out() -> TestResult {
+    let idle = std::time::Duration::from_millis(300);
+    let mut s = ChunkSession::with_stream_idle_timeout(idle).await?;
+    let (nar, info, _) = make_large_nar(60, 512 * 1024);
+    put_path(&mut s.store, info, nar).await?;
+    let hashes: Vec<Vec<u8>> = sqlx::query_scalar("SELECT blake3_hash FROM chunks")
+        .fetch_all(&s.db.pool)
+        .await?;
+
+    let (tx, rx) = mpsc::channel(1);
+    let mut stream = s
+        .chunk
+        .get_chunks(authed(ReceiverStream::new(rx)))
+        .await?
+        .into_inner();
+
+    // One real batch proves the stream works before it goes idle.
+    tx.send(GetChunksRequest {
+        digests: vec![hashes[0].clone()],
+    })
+    .await
+    .expect("request side open");
+    assert!(
+        stream.message().await?.is_some(),
+        "stream serves while active"
+    );
+
+    // Keep `tx` alive — the request side stays OPEN, the client just
+    // goes silent (the half-open shape). The watchdog must fire on its
+    // own; the 10 s outer bound only turns a hang into a test failure.
+    let err = tokio::time::timeout(std::time::Duration::from_secs(10), stream.message())
+        .await
+        .expect("idle watchdog must fire well within 10 s")
+        .expect_err("idle stream must be killed");
+    assert_eq!(err.code(), tonic::Code::DeadlineExceeded);
+    drop(tx);
     Ok(())
 }
 
