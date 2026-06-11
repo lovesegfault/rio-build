@@ -130,7 +130,12 @@ async fn putpathbatch_stamps_tenant_atomically() -> TestResult {
             nar_size: std::mem::take(&mut info.nar_size),
         };
         for msg in [
-            put_path_request::Msg::Metadata(PutPathMetadata { info: Some(info) }),
+            // declared_nar_size 0 = trailer mode (the batch plane
+            // additionally rejects a nonzero value fail-closed).
+            put_path_request::Msg::Metadata(PutPathMetadata {
+                info: Some(info),
+                declared_nar_size: 0,
+            }),
             put_path_request::Msg::NarChunk(nar.clone()),
             put_path_request::Msg::Trailer(trailer),
         ] {
