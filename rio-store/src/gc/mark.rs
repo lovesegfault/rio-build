@@ -563,3 +563,91 @@ mod tests {
         );
     }
 }
+
+// =======================================================================
+// Round-9 WO-S1-4 leg (1) — GC ROOTS for registered evidence (the
+// signed Q1 invariant's retention face): registered evidence is a mark
+// root INDEPENDENT of build outcome. The in-slot derivation, recorded:
+// seed (f) (path_tenants × tenant retention window) ALREADY roots
+// every stamped path — what was missing was the STAMPS (the slot's
+// commits 1–3: the late-report Register arm + the ingest seam), not a
+// new root. With ingest stamping at the upload commit there is no
+// pre-stamp window for uploads, and the built lane is covered by
+// uploading-manifest (b) + grace (c) + live-pin (e) seeds until its
+// completion/late stamp lands. The scheduler unpin-at-cancel stays
+// UNCHANGED — retention is THIS root, not the build-lifecycle pin
+// (re-pinning would re-couple retention to build outcome, the exact
+// coupling the invariant removes). Rooting is bounded by the tenant
+// retention window BY DESIGN: the invariant demands registration
+// survive cancellation, not immortality — the window is the lawful
+// policy clock, and it starts at first_referenced_at (the stamp), not
+// at build success.
+// =======================================================================
+#[cfg(test)]
+mod registered_evidence_roots {
+    use super::*;
+    use crate::test_helpers::{StoreSeed, TenantSeed};
+    use rio_test_support::TestDb;
+    use rio_test_support::fixtures::test_store_path;
+
+    /// W9-H — a registered-then-cancelled output SURVIVES a post-grace
+    /// mark (the 22:40Z kill chain, miniaturized and inverted: 1,198
+    /// paths swept because cancel released the pins and nothing was
+    /// stamped). Production mark; structural row asserts; the control
+    /// half (identical path WITHOUT registration → sweep candidate)
+    /// proves the stamp is the ONLY thing protecting it — the
+    /// strawman-free pre-fix shape: pre-slot, the cancelled build's
+    /// outputs had no stamp (commit 1's red transcript: path_tenants
+    /// empty), which is exactly the control cell below.
+    #[tokio::test]
+    async fn registered_cancelled_output_survives_post_grace_mark() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // Two byte-complete outputs, both 48h old — way past the 2h
+        // global grace, no pins (the cancel released them), no
+        // uploading manifests. The ONLY difference: one is registered.
+        let registered = test_store_path("cancelled-registered");
+        let unregistered = test_store_path("cancelled-unregistered");
+        let reg_hash = StoreSeed::raw_path(&registered)
+            .created_hours_ago(48)
+            .seed(&db.pool)
+            .await;
+        let unreg_hash = StoreSeed::raw_path(&unregistered)
+            .created_hours_ago(48)
+            .seed(&db.pool)
+            .await;
+
+        // The registration stamp (the slot's Register/ingest writers
+        // produce exactly this row; seeded directly — the writer lanes
+        // carry their own production-constructor witnesses in
+        // rio-scheduler and grpc/registration.rs).
+        let tenant = TenantSeed::new("cancel-survivor")
+            .with_retention_hours(168)
+            .seed(&db.pool)
+            .await;
+        sqlx::query(
+            "INSERT INTO path_tenants (store_path_hash, tenant_id, first_referenced_at) \
+             VALUES ($1, $2, now() - interval '1 hour')",
+        )
+        .bind(&reg_hash)
+        .bind(tenant)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let unreachable = compute_unreachable(&db.pool, 2, &[]).await.unwrap();
+        assert_eq!(
+            unreachable,
+            vec![unreg_hash],
+            "left: the registered output is a sweep candidate (the 22:40Z \
+             chain: registration did not root it) / right: registered \
+             evidence is rooted independently of build outcome — only the \
+             UNREGISTERED control is sweepable"
+        );
+        assert!(
+            !unreachable.contains(&reg_hash),
+            "the registered-then-cancelled output must survive the \
+             post-grace mark"
+        );
+    }
+}
