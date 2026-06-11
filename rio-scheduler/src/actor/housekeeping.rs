@@ -183,12 +183,33 @@ impl DagActor {
         if !self.leader.is_leader() {
             return;
         }
+        // Per-phase attribution (round-9 dossier B2 — the merge.rs
+        // `phase!` pattern verbatim, leader-only by the early-return
+        // above). live_053's 134.65s Tick was log-silent for its
+        // first ~118s: rio_scheduler_actor_cmd_seconds{cmd=Tick}
+        // names the total and nothing named the phase, so the
+        // forensics had to derive the breakdown from side effects
+        // (the 16.6s cancel sweep was measurable only because each
+        // cancel logged). This histogram is the prerequisite for
+        // betting any bounding work on a specific phase.
+        let mut t_phase = Instant::now();
+        macro_rules! phase {
+            ($name:literal) => {
+                let elapsed = t_phase.elapsed();
+                metrics::histogram!("rio_scheduler_tick_phase_seconds", "phase" => $name)
+                    .record(elapsed.as_secs_f64());
+                debug!(?elapsed, phase = $name, "tick phase");
+                t_phase = Instant::now();
+            };
+        }
         self.maybe_refresh_estimator().await;
+        phase!("00-estimator-refresh");
 
         // Ordering is load-bearing: per-build-timeout cancels whole
         // builds (permanent failure) before poison-expire removes DAG
         // nodes.
         let expired_poisons = self.tick_scan_dag();
+        phase!("01-scan-dag");
 
         // r[impl sched.attempt.establishment-window+5]
         // The destructive block (merged_bug_210): every tick below
@@ -201,7 +222,9 @@ impl DagActor {
         // state. Observe-only work (estimator refresh, the poison
         // scan) stays above; the snapshot/gauge tail below is also
         // skipped — publishing zeros computed from a DAG that is not
-        // ground truth is fabricated telemetry.
+        // ground truth is fabricated telemetry. (An unauthoritative
+        // tick records only the two observe phases — the absent
+        // destructive phases ARE the signal that the tick bailed.)
         let Some(authority) = self.dag_authority() else {
             debug!(
                 "DAG not authoritative (pre-recovery or failed recovery); \
@@ -210,29 +233,44 @@ impl DagActor {
             return;
         };
         self.tick_check_build_timeouts(&authority).await;
+        phase!("02-build-timeouts");
         self.tick_recheck_stuck_completions(&authority).await;
+        phase!("03-stuck-completions");
         self.tick_check_orphaned_builds(&authority).await;
+        phase!("04-orphaned-builds");
         self.tick_process_expired_poisons(expired_poisons, &authority)
             .await;
+        phase!("05-expired-poisons");
 
         self.tick_gc_orphan_derivations(&authority).await;
+        phase!("06-gc-orphan-derivations");
         self.tick_gc_attempt_ledger(&authority).await;
+        phase!("07-gc-attempt-ledger");
         self.tick_gc_materialization_jobs(&authority).await;
+        phase!("08-gc-materialization-jobs");
         self.tick_gc_build_wanted_outputs(&authority).await;
+        phase!("09-gc-wanted-outputs");
         self.tick_sweep_dispatched_cells(&authority);
+        phase!("10-sweep-dispatched-cells");
         self.tick_flush_status_outbox(&authority).await;
+        phase!("11-flush-status-outbox");
         self.tick_sweep_open_pull_attempts(&authority).await;
+        phase!("12-establishment-sweep");
         // Materialization sweeps: cancel jobs whose derivation has no
         // live interest left, closing open attempts charge-free; then
         // the PD-20 parked-job arm — re-evaluate parked jobs whose
         // nodes have buildable dependency closures (resolve
         // from-source) and publish the stalled gauge from ground truth.
         self.tick_backstop_materialization_jobs(&authority).await;
+        phase!("13-materialization-backstop");
         self.tick_cancel_zero_interest_materialization(&authority)
             .await;
+        phase!("14-zero-interest-cancel");
         self.tick_reevaluate_parked_materialization_jobs(&authority)
             .await;
+        phase!("15-parked-reevaluation");
         self.tick_retry_pending_carriers(&authority).await;
+        phase!("16-pending-carriers");
 
         // Advance probe_generation here (1/s) — NOT per
         // `sweep_ready_cached` call — so a Ready node is FMP-probed at
@@ -248,6 +286,7 @@ impl DagActor {
         // fleet. `probed_generation` stamping makes it one batched FMP
         // per Tick at most.
         self.sweep_ready_cached().await;
+        phase!("17-ready-cache-sweep");
 
         // r[impl sched.admin.snapshot-cached]
         // send_replace: single-slot overwrite, never blocks, returns
@@ -279,6 +318,8 @@ impl DagActor {
         crate::observability::LeaderGauge::DerivationsRunning
             .set(f64::from(snapshot.running_derivations));
         self.snapshot_tx.send_replace(snapshot);
+        phase!("18-snapshot-publish");
+        let _ = &mut t_phase; // last phase! write is intentionally unread
     }
 
     // -----------------------------------------------------------------------

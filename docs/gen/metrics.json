@@ -163,6 +163,7 @@
     "rio_scheduler_status_outbox_replay_vanished_total",
     "rio_scheduler_store_degraded_requeues_total",
     "rio_scheduler_substituting_derivations",
+    "rio_scheduler_tick_phase_seconds",
     "rio_scheduler_topdown_prune_total",
     "rio_scheduler_topdown_substitute_fail_total",
     "rio_scheduler_transition_rejected_total",
@@ -1079,6 +1080,11 @@
         "kind": "gauge",
         "help": "Derivations carrying a CLAIMABLE materialization job (unclaimed, not parked, not deferred — claimability()'s three axes) — the substitution backlog (the same quantity ClusterStatus.substituting_derivations reports). Non-claimable jobs are pacing, not demand: they leave this gauge (bug_252 — KEDA drains while the backlog paces). PARKED jobs stay visible via rio_scheduler_materialization_stalled; DEFERRED jobs (defer_until — the bounded <=300s re-probe window) are counted in NEITHER gauge for that window. Leader-published every housekeeping tick from the freshly computed cluster snapshot. The leading rio-store KEDA scaling signal: backlog is known at merge time, minutes before the store feels the ingest load.",
         "aggregation": "leader-zeroed"
+      },
+      {
+        "name": "rio_scheduler_tick_phase_seconds",
+        "kind": "histogram",
+        "help": "Per-phase housekeeping Tick latency (labeled by phase: 00-estimator-refresh..18-snapshot-publish). Decomposes rio_scheduler_actor_cmd_seconds{cmd=Tick} the way merge_phase_seconds decomposes MergeDag: the Tick is a leader-only single-threaded actor turn, so one slow phase head-of-line blocks every queued RPC and starves admin-served probes — a phase in the tens-of-seconds buckets names the term to bound, instead of a log-silent stall."
       },
       {
         "name": "rio_scheduler_topdown_prune_total",

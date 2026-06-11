@@ -94,6 +94,16 @@ const ATTEMPT_REQUEUE_BUCKETS: &[f64] = &[
     0.05, 0.25, 1.0, 5.0, 15.0, 30.0, 60.0, 90.0, 120.0, 300.0, 600.0,
 ];
 
+/// Bucket boundaries for `rio_scheduler_tick_phase_seconds`. Same
+/// span rationale as `MERGE_PHASE_BUCKETS` (sub-ms in-memory phases →
+/// PG/store-RPC phases) but the top extends to 300s: live_053's Tick
+/// ran 134.65s with its first ~118s unattributed, and the whole point
+/// of the per-phase decomposition is to resolve that tail, not fold
+/// it into +Inf.
+const TICK_PHASE_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.025, 0.1, 0.5, 1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0,
+];
+
 /// Bucket boundaries for `rio_scheduler_spawn_intents_response_bytes`
 /// (BYTES, not seconds — prost `encoded_len` of one GetSpawnIntents
 /// response). Powers-of-~4 from an idle answer (~hundreds of bytes)
@@ -129,6 +139,7 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
         CRITICAL_PATH_ACCURACY_BUCKETS,
     ),
     ("rio_scheduler_merge_phase_seconds", MERGE_PHASE_BUCKETS),
+    ("rio_scheduler_tick_phase_seconds", TICK_PHASE_BUCKETS),
     ("rio_scheduler_build_graph_edges", GRAPH_EDGES_BUCKETS),
     (
         "rio_scheduler_attempt_requeue_seconds",
@@ -177,6 +188,17 @@ pub fn describe_metrics() {
         "Per-phase MergeDag latency (labeled by phase: 0-topdown-roots..6f). \
          Decomposes rio_scheduler_actor_cmd_seconds{cmd=MergeDag}. A single \
          phase >1s is the I-139 signal — N sequential PG awaits in the actor."
+    );
+    describe_histogram!(
+        "rio_scheduler_tick_phase_seconds",
+        "Per-phase housekeeping Tick latency (labeled by phase: \
+         00-estimator-refresh..18-snapshot-publish). Decomposes \
+         rio_scheduler_actor_cmd_seconds{cmd=Tick} the way \
+         merge_phase_seconds decomposes MergeDag: the Tick is a leader-only \
+         single-threaded actor turn, so one slow phase head-of-line blocks \
+         every queued RPC and starves admin-served probes — a phase in the \
+         tens-of-seconds buckets names the term to bound, instead of a \
+         log-silent stall."
     );
     describe_histogram!(
         "rio_scheduler_actor_cmd_seconds",
