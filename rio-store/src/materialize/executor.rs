@@ -1796,20 +1796,32 @@ async fn live_wanted_paths(
     // Name-level fold: THE one fold body (merged_bug_059 — the
     // scheduler's in-memory view and SQL twin route through the same
     // function, so the width definition cannot fork at the fold).
+    // Name→path resolution: THE single guard (merged_bug_063 — the
+    // fourth leg joins the anchored contract). The pre-fix open-coded
+    // zip had no length-skew refusal and FILTERED placeholders, so a
+    // skewed or mixed concrete/placeholder row walked a shrunken
+    // non-empty subset to Success while the scheduler's
+    // verifiable_wanted_paths leg refused (zero-width close, re-arm):
+    // a paced claim-Success-re-arm livelock forking the documented
+    // same-width contract (sql.rs LIVE_WANTED_NAME_ROWS_BY_DRV_SQL).
+    // None (skew / any wanted-matched placeholder / nothing
+    // verifiable) maps to the EMPTY refusal lane: the caller's
+    // no-verifiable-wanted arm reports infra and the scheduler
+    // re-arms — both crates refuse identically by sharing the fn.
     let mut paths: Vec<String> = match rows.first() {
         None => Vec::new(),
         Some((output_names, expected_paths, _)) => {
             let union = rio_common::wanted_outputs::saturating_wanted_union(
                 rows.iter().map(|(_, _, wanted)| wanted.as_slice()),
             );
-            let all = matches!(&union, Some(v) if v.is_empty());
             let names = union.unwrap_or_default();
-            output_names
-                .iter()
-                .zip(expected_paths.iter())
-                .filter(|(name, path)| (all || names.contains(*name)) && !path.is_empty())
-                .map(|(_, path)| path.clone())
-                .collect()
+            rio_common::wanted_outputs::verifiable_wanted_paths(
+                output_names,
+                expected_paths,
+                &names,
+            )
+            .map(|ps| ps.into_iter().map(str::to_owned).collect())
+            .unwrap_or_default()
         }
     };
 
@@ -3128,6 +3140,104 @@ mod tests {
             "zero live interest must still surface the carried realized \
              paths (the scheduler's consumption leg unions the carrier \
              unconditionally — the two width definitions may not fork)"
+        );
+    }
+
+    /// W10-BM (merged_bug_063): the same-width contract holds BY
+    /// CONSTRUCTION across crates — name-to-path resolution joins the
+    /// anchored triple (sql.rs LIVE_WANTED_NAME_ROWS_BY_DRV_SQL: live
+    /// predicate + name fold + carrier union) through THE single
+    /// guard. On a skewed or mixed concrete/placeholder row the
+    /// pre-fix open-coded zip walked a shrunken non-empty subset to
+    /// Success while the scheduler leg (verifiable_wanted_paths — the
+    /// guard its callers consume as None → zero-width → close
+    /// uncharged → re-arm) refused: a paced claim-Success-re-arm
+    /// livelock. Both legs asserted on the SAME rows — the
+    /// cross-crate quantifier rides the shared fn (rio-store cannot
+    /// link rio-scheduler; the scheduler leg IS
+    /// rio_common::wanted_outputs::verifiable_wanted_paths).
+    #[tokio::test]
+    async fn skewed_and_mixed_rows_refuse_identically_across_crates() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "mat-width-fork").await;
+
+        // (a) MIXED concrete/placeholder row, seeded through the
+        // production seeding path (a floating-CA dev output beside a
+        // concrete out; wanted = all).
+        let concrete = store_path(7, "mat-width-mixed");
+        let seeded = seed_job(
+            &db.pool,
+            "mat-width-mixed-drv",
+            &[("out", concrete.as_str()), ("dev", "")],
+            Some(tenant),
+            Some(tenant),
+            &[],
+        )
+        .await;
+        let rows: Vec<(Vec<String>, Vec<String>, Vec<String>)> =
+            sqlx::query_as(rio_migrations::sql::LIVE_WANTED_NAME_ROWS_BY_DRV_SQL)
+                .bind("mat-width-mixed-drv")
+                .fetch_all(&db.pool)
+                .await
+                .unwrap();
+        let (names, paths, wanted) = &rows[0];
+        assert_eq!(
+            rio_common::wanted_outputs::verifiable_wanted_paths(names, paths, wanted),
+            None,
+            "precondition: the scheduler leg refuses the mixed row \
+             (any wanted-matched placeholder saturates to None)"
+        );
+        let ctx = make_ctx(db.pool.clone());
+        let got = live_wanted_paths(&ctx, &seeded.claimed).await.unwrap();
+        assert_eq!(
+            got,
+            Vec::<String>::new(),
+            "left: the store walks the shrunken non-empty subset to \
+             Success while the scheduler's zero-width arm closes \
+             uncharged and re-arms (the documented same-width contract \
+             forked) / right: both legs refuse identically through the \
+             shared guard"
+        );
+
+        // (b) SKEWED parallel arrays — seeded at the storage layer
+        // (r13 disclosure: no production constructor can mint skew;
+        // the skew IS the adversarial input class the guard's
+        // None-on-skew precondition names, so the fixture writes the
+        // storage shape directly).
+        let seeded2 = seed_job(
+            &db.pool,
+            "mat-width-skew-drv",
+            &[("out", "/nix/store/skew-x"), ("dev", "/nix/store/skew-y")],
+            Some(tenant),
+            Some(tenant),
+            &["out"],
+        )
+        .await;
+        sqlx::query("UPDATE derivations SET expected_output_paths = $1 WHERE drv_hash = $2")
+            .bind(vec!["/nix/store/skew-x".to_string()])
+            .bind("mat-width-skew-drv")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let rows: Vec<(Vec<String>, Vec<String>, Vec<String>)> =
+            sqlx::query_as(rio_migrations::sql::LIVE_WANTED_NAME_ROWS_BY_DRV_SQL)
+                .bind("mat-width-skew-drv")
+                .fetch_all(&db.pool)
+                .await
+                .unwrap();
+        let (names, paths, wanted) = &rows[0];
+        assert_eq!(
+            rio_common::wanted_outputs::verifiable_wanted_paths(names, paths, wanted),
+            None,
+            "precondition: the scheduler leg refuses the skewed row"
+        );
+        let got = live_wanted_paths(&ctx, &seeded2.claimed).await.unwrap();
+        assert_eq!(
+            got,
+            Vec::<String>::new(),
+            "left: the zip truncates to the shorter array and the store \
+             walks the truncation to Success (the fork) / right: skew is \
+             a typed refusal in both crates by sharing the fn"
         );
     }
 
