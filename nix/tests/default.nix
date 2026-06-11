@@ -49,6 +49,7 @@ let
   observability = import ./scenarios/observability.nix;
   lifecycle = import ./scenarios/lifecycle.nix;
   leader-election = import ./scenarios/leader-election.nix;
+  standby-burst = import ./scenarios/standby-burst.nix;
   cli = import ./scenarios/cli.nix;
   dashboard-gateway = import ./scenarios/dashboard-gateway.nix;
   netpol = import ./scenarios/netpol.nix;
@@ -245,6 +246,17 @@ let
   };
 
   leMod = leader-election {
+    inherit pkgs common;
+    fixture = k3sFull { };
+  };
+
+  # ── standby-burst scenario builder (round-9 live_055(e)) ────────────
+  # Scheduler lease stability under a store scale-out burst at
+  # replicas=2 + the standby's Trailers-Only Unavailable posture. The
+  # KEDA closed loop is EKS-only (no operator in the airgapped image
+  # set) — the scenario drives the same actuation via kubectl scale;
+  # see the scenario header for the disclosed VM-scale limits.
+  standbyBurstMod = standby-burst {
     inherit pkgs common;
     fixture = k3sFull { };
   };
@@ -1312,6 +1324,33 @@ in
       #   lease-derived generation alone (transitions+1) is provably
       #   below the claimed one — the PG floor did the work.
       "lease-deletion"
+    ];
+  };
+
+  # ── standby-burst (round-9 live_055(e) constituent, W9-AI) ───────────
+  vm-standby-burst-k3s = standbyBurstMod.mkTest {
+    name = "burst";
+    subtests = [
+      # r[verify sched.grpc.leader-guard]
+      #   The standby's documented posture, end-to-end at the wire: a
+      #   non-leader replica keeps its gRPC server up and refuses
+      #   ClusterStatus as Trailers-Only Unavailable (grpc-status 14
+      #   in the HTTP response headers, EMPTY body — the
+      #   ci-failure-patterns standby shape) within the 10s answer
+      #   budget, while the leader serves a DATA frame — the
+      #   exactly-one-serving face, probed per-pod via port-forward
+      #   (svc/ would round-robin onto an arbitrary replica).
+      "standby-shape"
+      # r[verify sched.lease.k8s-lease+2]
+      #   live_055(e)'s structural inverse: across a store scale-out
+      #   burst (kubectl scale 1→4→1 — the KEDA actuation; no operator
+      #   at VM scale) plus a 4-build burst, leaseTransitions delta ==
+      #   0 and holderIdentity is unchanged (EXACT equality — any
+      #   movement is the flap), and the standby posture re-verifies
+      #   post-burst. The EKS-scale CPU-contention face does not
+      #   reproduce in a 2-node VM; this is the regression PIN for the
+      #   lease-stability law (disclosed in the landing commit).
+      "burst-stability"
     ];
   };
 

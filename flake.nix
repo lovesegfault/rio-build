@@ -861,6 +861,13 @@
                     # and the client isn't instrumented). Excluding keeps
                     # after_n_builds stable.
                     "vm-protocol-warm-lix-standalone"
+                    # Lease-stability regression pin (round-9 live_055(e)):
+                    # drives the same scheduler lease/leader-guard paths
+                    # vm-le-{stability,build}-k3s already cover — only the
+                    # LOAD SHAPE differs (store scale-out burst), which is
+                    # not a coverage axis. Excluding keeps after_n_builds
+                    # stable.
+                    "vm-standby-burst-k3s"
                   ];
 
               # --------------------------------------------------------------
