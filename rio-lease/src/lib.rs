@@ -64,7 +64,7 @@ use tracing::{debug, info, warn};
 
 mod clock;
 mod election;
-pub use election::{Decision, ElectionResult, LeaderElection, Observed, decide};
+pub use election::{Decision, ElectionResult, LeaderElection, Observed, StepDownOutcome, decide};
 
 /// Model-based tests: replay traces from
 /// `docs/spec/models/leaderElection.qnt` against the election machinery.
@@ -1688,15 +1688,24 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
         // releases. Either way the full lose-edge effects run
         // (state, hook, marks) and the NEXT tick resumes candidacy —
         // try_acquire_or_renew steals/acquires normally.
+        // One attempt bound per tick (hoisted — the step-down arm, the
+        // renew round, and the tail reconcile's marks patch share it).
+        let renew_deadline = RENEW_INTERVAL.saturating_sub(RENEW_SLOP);
         if standing.believes() && state.take_step_down_request(state.acquired_instance()) {
             warn!(
                 holder = %cfg.holder_id,
                 "cooperative step-down requested (tenure cannot serve); releasing the lease"
             );
-            let deadline = RENEW_INTERVAL.saturating_sub(RENEW_SLOP);
-            match tokio::time::timeout(deadline, election.step_down()).await {
-                Ok(Ok(())) => {
+            match tokio::time::timeout(renew_deadline, election.step_down()).await {
+                Ok(Ok(StepDownOutcome::Released)) => {
                     info!("step-down: lease released; resuming candidacy next tick");
+                    standing.on_observed_not_leading();
+                }
+                Ok(Ok(StepDownOutcome::NotOurs)) => {
+                    info!(
+                        "step-down: a completed read shows the lease is not ours \
+                         (vacated or another holder) — nothing to release"
+                    );
                     standing.on_observed_not_leading();
                 }
                 Ok(Err(e)) => {
@@ -1707,7 +1716,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                 }
                 Err(_) => {
                     warn!(
-                        ?deadline,
+                        deadline = ?renew_deadline,
                         "step-down release timed out; the next replica will steal in {}s",
                         STEAL_AFTER.as_secs()
                     );
@@ -1717,637 +1726,648 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
             state.on_lose();
             hooks.on_lose();
             marks_dirty.mark();
-            continue;
-        }
-
-        let renew_deadline = RENEW_INTERVAL.saturating_sub(RENEW_SLOP);
-        // Round id BEFORE the attempt starts: a consumer that snapshots
-        // `renew_rounds_started` and later sees `last_leading_round`
-        // above it knows the confirming round began after the snapshot
-        // (sched.recovery.bump-confirm).
-        let round = state.begin_renew_round();
-        // The blind-window anchor for this attempt: minted BEFORE the
-        // await, so anchor <= send <= apiserver commit. A suspend that
-        // straddles the in-flight round-trip is therefore part of the
-        // stamped window — the response's arrival time never enters the
-        // blind clock (there is no API for it).
-        let attempt_anchor = RenewAnchor::mint(&fence_now);
-        match election
-            .renew_phased(RENEW_PHASE_DEADLINE, RENEW_PHASE_DEADLINE)
-            .await
-        {
-            election::RenewOutcome::Completed { result, facts } => {
-                let is_conflict = matches!(result, ElectionResult::Conflict);
-                // Will this round take the one-round 409 deferral
-                // (sched.lease.holder-evidenced-lose)? Computed BEFORE
-                // the stamp: a deferred round must NOT restart the
-                // blind window. The old law could stamp on every
-                // Completed round because every belief-EXTENDING stamp
-                // came coupled with a content write (which resets a
-                // standby's steal clock) or a lose (which ends the
-                // belief the stamp would extend); a stamped DEFERRAL
-                // breaks that coupling — it extends belief with the
-                // lease content frozen, and the leaderElection.qnt
-                // holder-evidence regime produces the dual-belief
-                // counterexample (a frozen-content victim whose
-                // completing 409 lands near its fence deadline keeps
-                // belief past the standby's steal). Deferring on the
-                // PRE-409 blind budget keeps the original
-                // fence-before-steal margin untouched: the deferral
-                // changes WHICH edge runs, never how long belief may
-                // last.
-                let conflict_resolution =
-                    (is_conflict && standing.believes()).then(|| standing.on_believing_conflict());
-                let will_defer = matches!(conflict_resolution, Some(ConflictResolution::Deferred));
-                if !will_defer {
-                    // Successful round-trip (apiserver answered). Even
-                    // Standby (and a RESOLVED Conflict) restart the
-                    // blind window — we KNOW the apiserver answered,
-                    // we just don't hold the lease. The clock tracks
-                    // "am I blind", not "am I leader".
-                    blind.stamp(attempt_anchor);
-                }
-                // Leading/Standby answer the unconfirmed question
-                // wholesale: their facts describe the post-resolution
-                // state, so nothing of ours is left in doubt. A 409
-                // does NOT — it proves only that the rv moved between
-                // our GET and PUT, and the mover may be our own zombie
-                // commit from the cancelled-write ledger (or a foreign
-                // metadata patch). The ledger survives a Conflict so
-                // the NEXT completed read can consume it as own-commit
-                // evidence (sched.lease.holder-evidenced-lose).
-                if !is_conflict {
-                    unconfirmed = None;
-                }
-                content_baseline = match facts {
-                    Some(f) => ContentBaseline::Present {
-                        renew_time: f.renew_time,
-                    },
-                    // Completed Create: the POST left no read facts,
-                    // and Leading just answered the ledger wholesale —
-                    // the next read re-baselines. (The pre-POST 404 is
-                    // stale the instant the Create succeeds.)
-                    None => ContentBaseline::NoCompletedRead,
-                };
-                // Conflict on renew = the CAS bounced; WHO holds is
-                // unknown until the next read (the deferral arm below).
-                // Conflict on steal = another standby raced us → we
-                // were never leading, nothing to defer. Leading carries
-                // the lease's transition count so the acquire arm can
-                // derive the generation from it; None ⇔ not leading.
-                let leading_transitions = match result {
-                    ElectionResult::Leading { transitions } => Some(transitions),
-                    ElectionResult::Standby | ElectionResult::Conflict => None,
-                };
-                let now_leading = leading_transitions.is_some();
-
-                // Edge detection on (leading?, was_leading). Binding
-                // the transition count in the acquire pattern makes
-                // "acquired without a transition count to derive the
-                // generation from" unrepresentable — the arm cannot
-                // execute without a value to hand to on_acquire.
-                match (leading_transitions, standing.believes()) {
-                    (Some(transitions), false) => {
-                        // ---- Acquire transition ----
-                        // on_acquire: write the generation FIRST, then
-                        // set is_leader, both SeqCst. A reader seeing
-                        // is_leader=true also sees the new generation.
-                        // The other order would let dispatch run with
-                        // is_leader=true but OLD generation for one
-                        // pass — harmless (workers compare heartbeat
-                        // gen, not assignment gen, for staleness) but
-                        // conceptually wrong.
-                        //
-                        // The generation derives from the lease's
-                        // transition count (see on_acquire's doc).
-                        let new_gen = state.on_acquire(transitions);
-                        info!(
-                            generation = new_gen,
-                            holder = %cfg.holder_id,
-                            "acquired leadership"
-                        );
-
-                        // r[impl sched.lease.deletion-cost+3]
-                        // The leader marks (pod-deletion-cost=1 so K8s
-                        // kills the standby first on scale-down, plus
-                        // the optional leader label the
-                        // rio-scheduler-leader Service selects on) no
-                        // longer match this pod — the reconcile arm
-                        // after the edge match patches them this same
-                        // tick.
-                        marks_dirty.mark();
-
-                        // r[impl sched.lease.non-blocking-acquire+2]
-                        // Fire the per-component on-acquire hook
-                        // (metrics + actor notification). The hook MUST
-                        // NOT block — see LeaseHooks doc.
-                        //
-                        // NON-BLOCKING IS LOAD-BEARING: if a hook
-                        // awaited recovery, a slow recovery for a
-                        // large DAG would stall the renewal tick —
-                        // the blocked loop can neither renew nor
-                        // self-fence while a standby steals after
-                        // STEAL_AFTER of observed staleness →
-                        // dual-leader. Hooks spawn; the separate
-                        // recovery-completion gate lets the loop keep
-                        // renewing regardless.
-                        hooks.on_acquire();
-                        // Record the believed-held observation THROUGH
-                        // the funnel (merged_bug_114): on_acquire just
-                        // stored this count, so the rebound comparison
-                        // no-ops by construction — and a consumer that
-                        // skipped the funnel would not typecheck (the
-                        // ObservedHeld witness has no other minting
-                        // site).
-                        observe_held_while_believing(
-                            &state,
-                            &mut standing,
-                            &marks_dirty,
-                            &hooks,
-                            &cfg.holder_id,
-                            transitions,
-                        );
-                        // An acquire resolves any pending deferral —
-                        // the funnel's on_observed_held clears the
-                        // episode latch structurally.
+        } else {
+            // Round id BEFORE the attempt starts: a consumer that snapshots
+            // `renew_rounds_started` and later sees `last_leading_round`
+            // above it knows the confirming round began after the snapshot
+            // (sched.recovery.bump-confirm).
+            let round = state.begin_renew_round();
+            // The blind-window anchor for this attempt: minted BEFORE the
+            // await, so anchor <= send <= apiserver commit. A suspend that
+            // straddles the in-flight round-trip is therefore part of the
+            // stamped window — the response's arrival time never enters the
+            // blind clock (there is no API for it).
+            let attempt_anchor = RenewAnchor::mint(&fence_now);
+            match election
+                .renew_phased(RENEW_PHASE_DEADLINE, RENEW_PHASE_DEADLINE)
+                .await
+            {
+                election::RenewOutcome::Completed { result, facts } => {
+                    let is_conflict = matches!(result, ElectionResult::Conflict);
+                    // Will this round take the one-round 409 deferral
+                    // (sched.lease.holder-evidenced-lose)? Computed BEFORE
+                    // the stamp: a deferred round must NOT restart the
+                    // blind window. The old law could stamp on every
+                    // Completed round because every belief-EXTENDING stamp
+                    // came coupled with a content write (which resets a
+                    // standby's steal clock) or a lose (which ends the
+                    // belief the stamp would extend); a stamped DEFERRAL
+                    // breaks that coupling — it extends belief with the
+                    // lease content frozen, and the leaderElection.qnt
+                    // holder-evidence regime produces the dual-belief
+                    // counterexample (a frozen-content victim whose
+                    // completing 409 lands near its fence deadline keeps
+                    // belief past the standby's steal). Deferring on the
+                    // PRE-409 blind budget keeps the original
+                    // fence-before-steal margin untouched: the deferral
+                    // changes WHICH edge runs, never how long belief may
+                    // last.
+                    let conflict_resolution = (is_conflict && standing.believes())
+                        .then(|| standing.on_believing_conflict());
+                    let will_defer =
+                        matches!(conflict_resolution, Some(ConflictResolution::Deferred));
+                    if !will_defer {
+                        // Successful round-trip (apiserver answered). Even
+                        // Standby (and a RESOLVED Conflict) restart the
+                        // blind window — we KNOW the apiserver answered,
+                        // we just don't hold the lease. The clock tracks
+                        // "am I blind", not "am I leader".
+                        blind.stamp(attempt_anchor);
                     }
-                    (None, true) => {
-                        // ---- Lose-or-defer ----
-                        // r[impl sched.lease.holder-evidenced-lose+3]
-                        // The lose edge demands a CompletedLoseEvidence
-                        // witness (see its doc + the SIGNED Q3 block):
-                        // a completed read naming another holder, or an
-                        // exhausted one-round 409 deferral. A bare
-                        // first 409 constructs neither — it defers.
-                        let evidence: Option<CompletedLoseEvidence> = if !is_conflict {
-                            // Standby resolution: the read named a
-                            // fresh foreign holder (or an empty/stale
-                            // one we chose not to steal) — direct
-                            // holder evidence either way: the lease
-                            // provably no longer resolves to us.
-                            Some(CompletedLoseEvidence::AnotherHolderObserved)
-                        } else if matches!(conflict_resolution, Some(ConflictResolution::Exhausted))
-                        {
-                            Some(CompletedLoseEvidence::ConflictDeferralExhausted)
-                        } else {
-                            None
-                        };
-                        match evidence {
-                            Some(evidence) => {
-                                // ---- Lose transition ----
-                                // Stop dispatching. The generation is
-                                // the NEW leader's concern — it derives
-                                // its own from the lease's transition
-                                // count on acquire. on_lose clears both
-                                // is_leader and recovery_complete
-                                // (SeqCst): if we re-acquire, recovery
-                                // runs again — the other replica's
-                                // actions may have changed PG.
-                                state.on_lose();
-                                match evidence {
-                                    CompletedLoseEvidence::AnotherHolderObserved => warn!(
-                                        holder = %cfg.holder_id,
-                                        "lost leadership (a completed read named another holder)"
-                                    ),
-                                    CompletedLoseEvidence::ConflictDeferralExhausted => warn!(
-                                        holder = %cfg.holder_id,
-                                        "lost leadership (two consecutive renew 409s — the \
-                                         one-round holder-evidence deferral is exhausted)"
-                                    ),
-                                }
-
-                                // r[impl sched.lease.standby-tick-noop+2]
-                                // Symmetric with on_acquire above: fire
-                                // the per-component on-lose hook
-                                // (metrics + actor notification). Same
-                                // non-blocking constraint. is_leader is
-                                // already false (above) so the
-                                // consumer's tick early-returns
-                                // regardless; this just lets it drop
-                                // stale state and zero leader-only
-                                // gauges.
-                                hooks.on_lose();
-
-                                // The leader marks must be cleared —
-                                // we're standby now: K8s should prefer
-                                // to kill us over the new leader, and
-                                // the leader-only Service must stop
-                                // routing to us (the dashboard's RPCs
-                                // would land here as Trailers-Only
-                                // Unavailable otherwise). The reconcile
-                                // arm after the edge match patches this
-                                // tick.
-                                marks_dirty.mark();
-                                // The standing posture is the
-                                // EVIDENCE's own (bug_136): direct
-                                // holder evidence clears the hold;
-                                // an exhausted deferral — whose every
-                                // read named us — self-fences (hold
-                                // kept). Both clear the episode latch:
-                                // a deferral does not survive its own
-                                // lose edge.
-                                evidence.apply(&mut standing);
-                            }
-                            None => {
-                                // ---- One-round deferral ----
-                                // Belief, the hold, and the ledger all
-                                // survive: nothing is wiped on a CAS
-                                // bounce that may be our own write
-                                // committing. No hooks, no marks — no
-                                // transition happened. The latch was
-                                // set by on_believing_conflict above.
-                                // The NEXT completed read resolves:
-                                // holder=us → ordinary renew (or
-                                // own-commit evidence on the act-failed
-                                // path — both run the funnel, which
-                                // clears); holder=other → lose WITH
-                                // evidence; another 409 → exhausted,
-                                // lose.
-                                warn!(
-                                    holder = %cfg.holder_id,
-                                    "renew 409 while believing: rv moved but the holder is \
-                                     unknown — deferring the lose edge one round for holder \
-                                     evidence (own zombie commit and foreign metadata writes \
-                                     are non-lose rv-movers)"
-                                );
-                            }
-                        }
+                    // Leading/Standby answer the unconfirmed question
+                    // wholesale: their facts describe the post-resolution
+                    // state, so nothing of ours is left in doubt. A 409
+                    // does NOT — it proves only that the rv moved between
+                    // our GET and PUT, and the mover may be our own zombie
+                    // commit from the cancelled-write ledger (or a foreign
+                    // metadata patch). The ledger survives a Conflict so
+                    // the NEXT completed read can consume it as own-commit
+                    // evidence (sched.lease.holder-evidenced-lose).
+                    if !is_conflict {
+                        unconfirmed = None;
                     }
-                    (Some(transitions), true) => {
-                        // ---- Still leading ----
-                        // THE observe-completed-read body: the rebound
-                        // comparison and the believed-held observation
-                        // are one fused operation (see the funnel's doc
-                        // for the full rationale).
-                        observe_held_while_believing(
-                            &state,
-                            &mut standing,
-                            &marks_dirty,
-                            &hooks,
-                            &cfg.holder_id,
-                            transitions,
-                        );
-                        // A still-leading resolution clears a pending
-                        // deferral — the 409's question is answered
-                        // (the funnel's on_observed_held clears).
-                    }
-                    // Steady state: still standby while someone else
-                    // holds (or a 409 raced our steal — we were never
-                    // leading, nothing to defer; on_observed_not_leading
-                    // clears the latch either way). No log — 5s
-                    // interval would be noisy.
-                    (None, false) => {
-                        standing.on_observed_not_leading();
-                    }
-                }
-                // r[impl sched.recovery.bump-confirm+3]
-                // Confirm AFTER the edge-detection match: when an
-                // acquire edge and a confirmation land in the same
-                // round, on_acquire's stores are already visible by
-                // the time the confirmation is observable. Standby/
-                // Conflict rounds (and the error/timeout arm below)
-                // are never confirmed.
-                if now_leading {
-                    state.confirm_leading_round(round);
-                }
-            }
-            election::RenewOutcome::FetchedActFailed {
-                facts,
-                put_transmitted,
-                error,
-            } => {
-                match &error {
-                    Some(e) => warn!(
-                        error = %e,
-                        put_transmitted,
-                        "lease act phase failed after a completed read; retrying next tick"
-                    ),
-                    None => warn!(
-                        deadline = ?RENEW_PHASE_DEADLINE,
-                        put_transmitted,
-                        "lease act phase timed out after a completed read; retrying next tick"
-                    ),
-                }
+                    content_baseline = match facts {
+                        Some(f) => ContentBaseline::Present {
+                            renew_time: f.renew_time,
+                        },
+                        // Completed Create: the POST left no read facts,
+                        // and Leading just answered the ledger wholesale —
+                        // the next read re-baselines. (The pre-POST 404 is
+                        // stale the instant the Create succeeds.)
+                        None => ContentBaseline::NoCompletedRead,
+                    };
+                    // Conflict on renew = the CAS bounced; WHO holds is
+                    // unknown until the next read (the deferral arm below).
+                    // Conflict on steal = another standby raced us → we
+                    // were never leading, nothing to defer. Leading carries
+                    // the lease's transition count so the acquire arm can
+                    // derive the generation from it; None ⇔ not leading.
+                    let leading_transitions = match result {
+                        ElectionResult::Leading { transitions } => Some(transitions),
+                        ElectionResult::Standby | ElectionResult::Conflict => None,
+                    };
+                    let now_leading = leading_transitions.is_some();
 
-                // r[impl sched.lease.cancelled-write+2]
-                // Own-commit evidence: the read completed, so we have a
-                // fresh holder/content view even though the write phase
-                // died. If the lease names US and the holder-authored
-                // `renewTime` bytes moved since our last completed
-                // read, some write of OURS committed (only our own
-                // renew/steal writes `renewTime` while leaving us as
-                // holder) — consume the ledger and stamp the blind
-                // clock at the LEDGER's anchor (anchor ≤ send ≤ commit;
-                // never the observing read's time). Frozen content
-                // stamps NOTHING — even under foreign rv churn: an
-                // annotation patch moves the rv without any write of
-                // OURS committing, so it is not evidence
-                // (merged_bug_180; the foreign-rv companion test pins
-                // this direction alongside the frozen-rv one).
-                {
-                    // bug_002 + bug_143: EVERY completed act-failed
-                    // read routes through the total cell law —
-                    // INCLUDING the absent read. The old Some-narrowed
-                    // `if let` pre-filter was the R25 escape hatch:
-                    // the 404-observed round bypassed the law, leaked
-                    // a pending 409 deferral across the arm, and left
-                    // belief standing while a peer could re-Create the
-                    // deleted lease with no steal wait. The law
-                    // consumes the producer's FULL output type
-                    // (`Option<FetchFacts>`) so the dispatch IS the
-                    // exhaustive match (W10-AX census).
-                    let action = route_act_failed_read(
-                        standing.believes(),
-                        HolderCell::of_read(facts.as_ref()),
-                        ContentCell::of_read(&content_baseline, facts.as_ref()),
-                        LedgerCell::of(&unconfirmed),
-                    );
-                    // The re-baseline is the match's VALUE: the arm
-                    // cannot record this read's content without
-                    // consuming the routing verdict (the same coupling
-                    // as the acquire arm's bound transition count).
-                    content_baseline = match action {
-                        ActFailedAction::EvidenceResolve => {
-                            let f = facts.as_ref().expect(
-                                "EvidenceResolve is routed only for present reads \
-                             (the absence partition; census + kani pinned)",
+                    // Edge detection on (leading?, was_leading). Binding
+                    // the transition count in the acquire pattern makes
+                    // "acquired without a transition count to derive the
+                    // generation from" unrepresentable — the arm cannot
+                    // execute without a value to hand to on_acquire.
+                    match (leading_transitions, standing.believes()) {
+                        (Some(transitions), false) => {
+                            // ---- Acquire transition ----
+                            // on_acquire: write the generation FIRST, then
+                            // set is_leader, both SeqCst. A reader seeing
+                            // is_leader=true also sees the new generation.
+                            // The other order would let dispatch run with
+                            // is_leader=true but OLD generation for one
+                            // pass — harmless (workers compare heartbeat
+                            // gen, not assignment gen, for staleness) but
+                            // conceptually wrong.
+                            //
+                            // The generation derives from the lease's
+                            // transition count (see on_acquire's doc).
+                            let new_gen = state.on_acquire(transitions);
+                            info!(
+                                generation = new_gen,
+                                holder = %cfg.holder_id,
+                                "acquired leadership"
                             );
-                            let led = unconfirmed.take().expect(
-                                "EvidenceResolve is routed only for an armed ledger \
-                             (route_act_failed_read is total; census + kani pinned)",
-                            );
-                            blind.stamp(led.anchor);
-                            // merged_bug_122: the stamp is unconditional
-                            // (the evidence is real and the ledger is
-                            // consumed) but the ACQUIRE is fence-gated. A
-                            // ledger anchor already past SELF_FENCE_AFTER
-                            // at consumption time makes the acquire
-                            // provably futile — the trailing
-                            // maybe_self_fence in this same arm would
-                            // re-fence it before the next await, churning
-                            // hooks/marks/recovery once per round of a
-                            // slow-commit brownout.
-                            let anchor_age = blind.blind_for(fence_now());
-                            if anchor_age > SELF_FENCE_AFTER {
-                                info!(
-                                    ?anchor_age,
-                                    "own-commit evidence consumed, but its anchor is already \
-                                 past the fence deadline — staying fenced (an acquire \
-                                 here would be re-fenced this same arm)"
-                                );
-                            } else if !standing.believes() {
-                                // A self-fence inside the mid-band window
-                                // already ran the lose edge; the evidence
-                                // proves the apiserver still (or again)
-                                // names us holder, so re-enter through the
-                                // ordinary acquire edge with the FETCHED
-                                // transition count — the same-count case is
-                                // the documented same-epoch re-acquire
-                                // (generation fetch_max no-op, in-flight
-                                // work survives). The bump-confirmation is
-                                // deliberately NOT run here: confirmation
-                                // stays a completed-round property
-                                // (sched.recovery.bump-confirm), and
-                                // pre-fix this regime fenced outright —
-                                // strictly worse than a gated recovery.
-                                let new_gen = state.on_acquire(f.transitions);
-                                info!(
-                                    generation = new_gen,
-                                    holder = %cfg.holder_id,
-                                    "own-commit evidence (holder=us, renewTime moved) restored \
-                                     leadership belief after an abandoned write"
-                                );
-                                marks_dirty.mark();
-                                hooks.on_acquire();
-                                // Counts as a Leading observation: the read
-                                // is apiserver-authoritative about the hold.
-                                // Routed THROUGH the funnel (merged_bug_114)
-                                // — the rebound comparison no-ops on the
-                                // just-recorded count, and the ObservedHeld
-                                // witness keeps a funnel-skipping sibling
-                                // consumer untypeable.
-                                observe_held_while_believing(
-                                    &state,
-                                    &mut standing,
-                                    &marks_dirty,
-                                    &hooks,
-                                    &cfg.holder_id,
-                                    f.transitions,
-                                );
-                            } else {
-                                // Still believing: this is a completed read
-                                // of a lease we hold — the SAME facts the
-                                // Leading renew round consumes, so it routes
-                                // through the SAME observe-completed-read
-                                // body. A foreign term that completed inside
-                                // the observation gap (moved count) rebounds
-                                // here exactly as it would on a Completed
-                                // round; pre-fix this leg skipped the
-                                // comparison and the term was never repaired
-                                // (no round Completes in the reads-complete/
-                                // acts-fail regime, and the evidence
-                                // re-stamps defeat the self-fence).
-                                observe_held_while_believing(
-                                    &state,
-                                    &mut standing,
-                                    &marks_dirty,
-                                    &hooks,
-                                    &cfg.holder_id,
-                                    f.transitions,
-                                );
-                            }
-                            ContentBaseline::Present {
-                                renew_time: f.renew_time.clone(),
-                            }
-                        }
-                        ActFailedAction::FunnelResolve => {
-                            let f = facts.as_ref().expect(
-                                "FunnelResolve is routed only for present reads \
-                             (the absence partition; census + kani pinned)",
-                            );
-                            // A completed read of a lease we hold with
-                            // nothing to consume — the SAME facts the
-                            // Leading renew round consumes, so it
-                            // routes through the SAME
-                            // observe-completed-read body (the :1824
-                            // leg's rationale, now total over the
-                            // holder=us row). NO blind stamp, NO
-                            // ledger consume: frozen content stamps
-                            // NOTHING (sched.lease.cancelled-write —
-                            // the funnel stamps standing, never the
-                            // blind clock), and a moved-content read
-                            // with an empty ledger has nothing in
-                            // doubt to confirm.
+
+                            // r[impl sched.lease.deletion-cost+3]
+                            // The leader marks (pod-deletion-cost=1 so K8s
+                            // kills the standby first on scale-down, plus
+                            // the optional leader label the
+                            // rio-scheduler-leader Service selects on) no
+                            // longer match this pod — the reconcile arm
+                            // after the edge match patches them this same
+                            // tick.
+                            marks_dirty.mark();
+
+                            // r[impl sched.lease.non-blocking-acquire+2]
+                            // Fire the per-component on-acquire hook
+                            // (metrics + actor notification). The hook MUST
+                            // NOT block — see LeaseHooks doc.
+                            //
+                            // NON-BLOCKING IS LOAD-BEARING: if a hook
+                            // awaited recovery, a slow recovery for a
+                            // large DAG would stall the renewal tick —
+                            // the blocked loop can neither renew nor
+                            // self-fence while a standby steals after
+                            // STEAL_AFTER of observed staleness →
+                            // dual-leader. Hooks spawn; the separate
+                            // recovery-completion gate lets the loop keep
+                            // renewing regardless.
+                            hooks.on_acquire();
+                            // Record the believed-held observation THROUGH
+                            // the funnel (merged_bug_114): on_acquire just
+                            // stored this count, so the rebound comparison
+                            // no-ops by construction — and a consumer that
+                            // skipped the funnel would not typecheck (the
+                            // ObservedHeld witness has no other minting
+                            // site).
                             observe_held_while_believing(
                                 &state,
                                 &mut standing,
                                 &marks_dirty,
                                 &hooks,
                                 &cfg.holder_id,
-                                f.transitions,
+                                transitions,
                             );
-                            ContentBaseline::Present {
-                                renew_time: f.renew_time.clone(),
-                            }
+                            // An acquire resolves any pending deferral —
+                            // the funnel's on_observed_held clears the
+                            // episode latch structurally.
                         }
-                        ActFailedAction::EvidencedLose => {
-                            let f = facts.as_ref().expect(
-                                "EvidencedLose is routed only for present reads \
-                             (the absence partition; census + kani pinned)",
-                            );
-                            // The read completed and the lease does
-                            // not resolve to us: the same evidenced
-                            // lose a Completed Standby resolution
-                            // runs (state/hook/marks/standing — the
-                            // standing transition clears any pending
-                            // deferral with it). The ledger is NOT
-                            // consumed and the arming tail below
-                            // still runs: a transmitted steal/renew
-                            // that commits late re-acquires through
-                            // the evidence leg next round (the
-                            // one-round self-heal).
-                            state.on_lose();
-                            warn!(
-                                holder = %cfg.holder_id,
-                                evidence = ?CompletedLoseEvidence::AnotherHolderObserved,
-                                "lost leadership (an act-failed completed read no \
-                                 longer names us as holder)"
-                            );
-                            hooks.on_lose();
-                            marks_dirty.mark();
-                            standing.on_observed_not_leading();
-                            ContentBaseline::Present {
-                                renew_time: f.renew_time.clone(),
-                            }
-                        }
-                        ActFailedAction::ObserveOnly => {
-                            let f = facts.as_ref().expect(
-                                "ObserveOnly is routed only for present reads \
-                             (the absence partition; census + kani pinned)",
-                            );
-                            ContentBaseline::Present {
-                                renew_time: f.renew_time.clone(),
-                            }
-                        }
-                        ActFailedAction::AbsenceLose => {
+                        (None, true) => {
+                            // ---- Lose-or-defer ----
                             // r[impl sched.lease.holder-evidenced-lose+3]
-                            // The completed read OBSERVED the lease
-                            // absent: it resolves to nobody, and a
-                            // peer's re-Create needs no steal wait —
-                            // the fence/steal margin does not shield
-                            // this regime, so belief exits AT the
-                            // read (bug_143). Same lose family as
-                            // EvidencedLose: the standing transition
-                            // clears any pending deferral, and the
-                            // hold clears with it (there is no lease
-                            // object of ours to release). The ledger
-                            // is NOT consumed: the transmitted Create
-                            // resolves through the evidence leg next
-                            // round (holder=us against Absent).
-                            state.on_lose();
-                            warn!(
-                                holder = %cfg.holder_id,
-                                "lost leadership (a completed read observed the lease \
-                                 ABSENT — deleted out from under us; a peer can \
-                                 re-create it with no steal wait)"
-                            );
-                            hooks.on_lose();
-                            marks_dirty.mark();
-                            standing.on_observed_not_leading();
-                            ContentBaseline::Absent
+                            // The lose edge demands a CompletedLoseEvidence
+                            // witness (see its doc + the SIGNED Q3 block):
+                            // a completed read naming another holder, or an
+                            // exhausted one-round 409 deferral. A bare
+                            // first 409 constructs neither — it defers.
+                            let evidence: Option<CompletedLoseEvidence> = if !is_conflict {
+                                // Standby resolution: the read named a
+                                // fresh foreign holder (or an empty/stale
+                                // one we chose not to steal) — direct
+                                // holder evidence either way: the lease
+                                // provably no longer resolves to us.
+                                Some(CompletedLoseEvidence::AnotherHolderObserved)
+                            } else if matches!(
+                                conflict_resolution,
+                                Some(ConflictResolution::Exhausted)
+                            ) {
+                                Some(CompletedLoseEvidence::ConflictDeferralExhausted)
+                            } else {
+                                None
+                            };
+                            match evidence {
+                                Some(evidence) => {
+                                    // ---- Lose transition ----
+                                    // Stop dispatching. The generation is
+                                    // the NEW leader's concern — it derives
+                                    // its own from the lease's transition
+                                    // count on acquire. on_lose clears both
+                                    // is_leader and recovery_complete
+                                    // (SeqCst): if we re-acquire, recovery
+                                    // runs again — the other replica's
+                                    // actions may have changed PG.
+                                    state.on_lose();
+                                    match evidence {
+                                        CompletedLoseEvidence::AnotherHolderObserved => warn!(
+                                            holder = %cfg.holder_id,
+                                            "lost leadership (a completed read named another holder)"
+                                        ),
+                                        CompletedLoseEvidence::ConflictDeferralExhausted => warn!(
+                                            holder = %cfg.holder_id,
+                                            "lost leadership (two consecutive renew 409s — the \
+                                             one-round holder-evidence deferral is exhausted)"
+                                        ),
+                                    }
+
+                                    // r[impl sched.lease.standby-tick-noop+2]
+                                    // Symmetric with on_acquire above: fire
+                                    // the per-component on-lose hook
+                                    // (metrics + actor notification). Same
+                                    // non-blocking constraint. is_leader is
+                                    // already false (above) so the
+                                    // consumer's tick early-returns
+                                    // regardless; this just lets it drop
+                                    // stale state and zero leader-only
+                                    // gauges.
+                                    hooks.on_lose();
+
+                                    // The leader marks must be cleared —
+                                    // we're standby now: K8s should prefer
+                                    // to kill us over the new leader, and
+                                    // the leader-only Service must stop
+                                    // routing to us (the dashboard's RPCs
+                                    // would land here as Trailers-Only
+                                    // Unavailable otherwise). The reconcile
+                                    // arm after the edge match patches this
+                                    // tick.
+                                    marks_dirty.mark();
+                                    // The standing posture is the
+                                    // EVIDENCE's own (bug_136): direct
+                                    // holder evidence clears the hold;
+                                    // an exhausted deferral — whose every
+                                    // read named us — self-fences (hold
+                                    // kept). Both clear the episode latch:
+                                    // a deferral does not survive its own
+                                    // lose edge.
+                                    evidence.apply(&mut standing);
+                                }
+                                None => {
+                                    // ---- One-round deferral ----
+                                    // Belief, the hold, and the ledger all
+                                    // survive: nothing is wiped on a CAS
+                                    // bounce that may be our own write
+                                    // committing. No hooks, no marks — no
+                                    // transition happened. The latch was
+                                    // set by on_believing_conflict above.
+                                    // The NEXT completed read resolves:
+                                    // holder=us → ordinary renew (or
+                                    // own-commit evidence on the act-failed
+                                    // path — both run the funnel, which
+                                    // clears); holder=other → lose WITH
+                                    // evidence; another 409 → exhausted,
+                                    // lose.
+                                    warn!(
+                                        holder = %cfg.holder_id,
+                                        "renew 409 while believing: rv moved but the holder is \
+                                         unknown — deferring the lose edge one round for holder \
+                                         evidence (own zombie commit and foreign metadata writes \
+                                         are non-lose rv-movers)"
+                                    );
+                                }
+                            }
                         }
-                        // 404→Create round whose POST died unanswered,
-                        // observed while standby: the read OBSERVED
-                        // absence — a baseline observation
-                        // (merged_bug_164), exactly what lets the next
-                        // completed read prove the Create committed
-                        // (holder=us against Absent).
-                        ActFailedAction::AbsenceObserve => ContentBaseline::Absent,
-                    };
-                }
-
-                // Record THIS round's transmitted write as in doubt —
-                // kept at the OLDEST anchor: an existing unconsumed
-                // entry is never overwritten (if several writes are in
-                // doubt, the blind window must cover the eldest).
-                if put_transmitted && unconfirmed.is_none() {
-                    unconfirmed = Some(UnconfirmedPut {
-                        anchor: attempt_anchor,
-                    });
-                }
-
-                // The fence still arbitrates: evidence (above) is the
-                // only thing that stamps on this path, so a regime
-                // where writes stop committing fences on the same
-                // schedule as a full outage.
-                if maybe_self_fence(
-                    &state,
-                    &mut standing,
-                    &marks_dirty,
-                    blind.blind_for(fence_now()),
-                ) {
-                    hooks.on_lose();
-                }
-            }
-            election::RenewOutcome::FetchFailed { error } => {
-                // No fresh view of the Lease object at all — and,
-                // because a mutating request is only ever transmitted
-                // after a completed read (renew_phased's phase order),
-                // provably nothing was sent: no ledger entry, the rv
-                // freezes for stealers, and this replica is exactly as
-                // blind as it looks.
-                match &error {
-                    Some(e) => {
-                        warn!(error = %e, "lease renew failed (apiserver error); retrying next tick");
+                        (Some(transitions), true) => {
+                            // ---- Still leading ----
+                            // THE observe-completed-read body: the rebound
+                            // comparison and the believed-held observation
+                            // are one fused operation (see the funnel's doc
+                            // for the full rationale).
+                            observe_held_while_believing(
+                                &state,
+                                &mut standing,
+                                &marks_dirty,
+                                &hooks,
+                                &cfg.holder_id,
+                                transitions,
+                            );
+                            // A still-leading resolution clears a pending
+                            // deferral — the 409's question is answered
+                            // (the funnel's on_observed_held clears).
+                        }
+                        // Steady state: still standby while someone else
+                        // holds (or a 409 raced our steal — we were never
+                        // leading, nothing to defer; on_observed_not_leading
+                        // clears the latch either way). No log — 5s
+                        // interval would be noisy.
+                        (None, false) => {
+                            standing.on_observed_not_leading();
+                        }
                     }
-                    None => {
-                        warn!(deadline = ?RENEW_PHASE_DEADLINE, "lease read phase TIMED OUT (apiserver hung?); retrying next tick");
+                    // r[impl sched.recovery.bump-confirm+3]
+                    // Confirm AFTER the edge-detection match: when an
+                    // acquire edge and a confirmation land in the same
+                    // round, on_acquire's stores are already visible by
+                    // the time the confirmation is observable. Standby/
+                    // Conflict rounds (and the error/timeout arm below)
+                    // are never confirmed.
+                    if now_leading {
+                        state.confirm_leading_round(round);
                     }
                 }
-                //
-                // Local self-fence: if SELF_FENCE_AFTER has elapsed
-                // since the last SUCCESSFUL round-trip, flip is_leader
-                // locally. SELF_FENCE_AFTER is 2×FENCE_MARGIN earlier
-                // than any follower's steal threshold (STEAL_AFTER), so
-                // by the time a replica that CAN reach the apiserver
-                // steals, we have already stopped believing — that
-                // ordering is the neverDual proof in the
-                // leaderElectionAsymmetric regime of
-                // docs/spec/models/leaderElection.qnt. This is the
-                // SECOND fence evaluation in the tick: the tick-time
-                // check at the top of the loop body is what bounds the
-                // fence-check latency to one tick; this one just fires
-                // earlier when a failed attempt resolves before the
-                // next tick.
-                //
-                // The old "DON'T flip — apiserver down for EVERYONE"
-                // argument is wrong once elapsed > the fence deadline.
-                // In the symmetric-partition case (nobody reaches the
-                // apiserver) flipping costs nothing: workers can't be
-                // scheduled anyway. In the asymmetric case (WE are
-                // partitioned, peer is not) NOT flipping makes us a
-                // stale-assignment noise generator. Worker-side
-                // generation fence (r[sched.lease.generation-fence+3])
-                // saves correctness either way; this fence saves ops
-                // sanity.
-                // attempt_anchor is dropped on this path: a failed
-                // round-trip stamps nothing and the window keeps aging.
-                if maybe_self_fence(
-                    &state,
-                    &mut standing,
-                    &marks_dirty,
-                    blind.blind_for(fence_now()),
-                ) {
-                    // Self-fence is a lose-transition: same on-lose
-                    // hook as the explicit lose arm above.
-                    hooks.on_lose();
+                election::RenewOutcome::FetchedActFailed {
+                    facts,
+                    put_transmitted,
+                    error,
+                } => {
+                    match &error {
+                        Some(e) => warn!(
+                            error = %e,
+                            put_transmitted,
+                            "lease act phase failed after a completed read; retrying next tick"
+                        ),
+                        None => warn!(
+                            deadline = ?RENEW_PHASE_DEADLINE,
+                            put_transmitted,
+                            "lease act phase timed out after a completed read; retrying next tick"
+                        ),
+                    }
+
+                    // r[impl sched.lease.cancelled-write+2]
+                    // Own-commit evidence: the read completed, so we have a
+                    // fresh holder/content view even though the write phase
+                    // died. If the lease names US and the holder-authored
+                    // `renewTime` bytes moved since our last completed
+                    // read, some write of OURS committed (only our own
+                    // renew/steal writes `renewTime` while leaving us as
+                    // holder) — consume the ledger and stamp the blind
+                    // clock at the LEDGER's anchor (anchor ≤ send ≤ commit;
+                    // never the observing read's time). Frozen content
+                    // stamps NOTHING — even under foreign rv churn: an
+                    // annotation patch moves the rv without any write of
+                    // OURS committing, so it is not evidence
+                    // (merged_bug_180; the foreign-rv companion test pins
+                    // this direction alongside the frozen-rv one).
+                    {
+                        // bug_002 + bug_143: EVERY completed act-failed
+                        // read routes through the total cell law —
+                        // INCLUDING the absent read. The old Some-narrowed
+                        // `if let` pre-filter was the R25 escape hatch:
+                        // the 404-observed round bypassed the law, leaked
+                        // a pending 409 deferral across the arm, and left
+                        // belief standing while a peer could re-Create the
+                        // deleted lease with no steal wait. The law
+                        // consumes the producer's FULL output type
+                        // (`Option<FetchFacts>`) so the dispatch IS the
+                        // exhaustive match (W10-AX census).
+                        let action = route_act_failed_read(
+                            standing.believes(),
+                            HolderCell::of_read(facts.as_ref()),
+                            ContentCell::of_read(&content_baseline, facts.as_ref()),
+                            LedgerCell::of(&unconfirmed),
+                        );
+                        // The re-baseline is the match's VALUE: the arm
+                        // cannot record this read's content without
+                        // consuming the routing verdict (the same coupling
+                        // as the acquire arm's bound transition count).
+                        content_baseline = match action {
+                            ActFailedAction::EvidenceResolve => {
+                                let f = facts.as_ref().expect(
+                                    "EvidenceResolve is routed only for present reads \
+                             (the absence partition; census + kani pinned)",
+                                );
+                                let led = unconfirmed.take().expect(
+                                    "EvidenceResolve is routed only for an armed ledger \
+                             (route_act_failed_read is total; census + kani pinned)",
+                                );
+                                blind.stamp(led.anchor);
+                                // merged_bug_122: the stamp is unconditional
+                                // (the evidence is real and the ledger is
+                                // consumed) but the ACQUIRE is fence-gated. A
+                                // ledger anchor already past SELF_FENCE_AFTER
+                                // at consumption time makes the acquire
+                                // provably futile — the trailing
+                                // maybe_self_fence in this same arm would
+                                // re-fence it before the next await, churning
+                                // hooks/marks/recovery once per round of a
+                                // slow-commit brownout.
+                                let anchor_age = blind.blind_for(fence_now());
+                                if anchor_age > SELF_FENCE_AFTER {
+                                    info!(
+                                        ?anchor_age,
+                                        "own-commit evidence consumed, but its anchor is already \
+                                 past the fence deadline — staying fenced (an acquire \
+                                 here would be re-fenced this same arm)"
+                                    );
+                                } else if !standing.believes() {
+                                    // A self-fence inside the mid-band window
+                                    // already ran the lose edge; the evidence
+                                    // proves the apiserver still (or again)
+                                    // names us holder, so re-enter through the
+                                    // ordinary acquire edge with the FETCHED
+                                    // transition count — the same-count case is
+                                    // the documented same-epoch re-acquire
+                                    // (generation fetch_max no-op, in-flight
+                                    // work survives). The bump-confirmation is
+                                    // deliberately NOT run here: confirmation
+                                    // stays a completed-round property
+                                    // (sched.recovery.bump-confirm), and
+                                    // pre-fix this regime fenced outright —
+                                    // strictly worse than a gated recovery.
+                                    let new_gen = state.on_acquire(f.transitions);
+                                    info!(
+                                        generation = new_gen,
+                                        holder = %cfg.holder_id,
+                                        "own-commit evidence (holder=us, renewTime moved) restored \
+                                         leadership belief after an abandoned write"
+                                    );
+                                    marks_dirty.mark();
+                                    hooks.on_acquire();
+                                    // Counts as a Leading observation: the read
+                                    // is apiserver-authoritative about the hold.
+                                    // Routed THROUGH the funnel (merged_bug_114)
+                                    // — the rebound comparison no-ops on the
+                                    // just-recorded count, and the ObservedHeld
+                                    // witness keeps a funnel-skipping sibling
+                                    // consumer untypeable.
+                                    observe_held_while_believing(
+                                        &state,
+                                        &mut standing,
+                                        &marks_dirty,
+                                        &hooks,
+                                        &cfg.holder_id,
+                                        f.transitions,
+                                    );
+                                } else {
+                                    // Still believing: this is a completed read
+                                    // of a lease we hold — the SAME facts the
+                                    // Leading renew round consumes, so it routes
+                                    // through the SAME observe-completed-read
+                                    // body. A foreign term that completed inside
+                                    // the observation gap (moved count) rebounds
+                                    // here exactly as it would on a Completed
+                                    // round; pre-fix this leg skipped the
+                                    // comparison and the term was never repaired
+                                    // (no round Completes in the reads-complete/
+                                    // acts-fail regime, and the evidence
+                                    // re-stamps defeat the self-fence).
+                                    observe_held_while_believing(
+                                        &state,
+                                        &mut standing,
+                                        &marks_dirty,
+                                        &hooks,
+                                        &cfg.holder_id,
+                                        f.transitions,
+                                    );
+                                }
+                                ContentBaseline::Present {
+                                    renew_time: f.renew_time.clone(),
+                                }
+                            }
+                            ActFailedAction::FunnelResolve => {
+                                let f = facts.as_ref().expect(
+                                    "FunnelResolve is routed only for present reads \
+                             (the absence partition; census + kani pinned)",
+                                );
+                                // A completed read of a lease we hold with
+                                // nothing to consume — the SAME facts the
+                                // Leading renew round consumes, so it
+                                // routes through the SAME
+                                // observe-completed-read body (the :1824
+                                // leg's rationale, now total over the
+                                // holder=us row). NO blind stamp, NO
+                                // ledger consume: frozen content stamps
+                                // NOTHING (sched.lease.cancelled-write —
+                                // the funnel stamps standing, never the
+                                // blind clock), and a moved-content read
+                                // with an empty ledger has nothing in
+                                // doubt to confirm.
+                                observe_held_while_believing(
+                                    &state,
+                                    &mut standing,
+                                    &marks_dirty,
+                                    &hooks,
+                                    &cfg.holder_id,
+                                    f.transitions,
+                                );
+                                ContentBaseline::Present {
+                                    renew_time: f.renew_time.clone(),
+                                }
+                            }
+                            ActFailedAction::EvidencedLose => {
+                                let f = facts.as_ref().expect(
+                                    "EvidencedLose is routed only for present reads \
+                             (the absence partition; census + kani pinned)",
+                                );
+                                // The read completed and the lease does
+                                // not resolve to us: the same evidenced
+                                // lose a Completed Standby resolution
+                                // runs (state/hook/marks/standing — the
+                                // standing transition clears any pending
+                                // deferral with it). The ledger is NOT
+                                // consumed and the arming tail below
+                                // still runs: a transmitted steal/renew
+                                // that commits late re-acquires through
+                                // the evidence leg next round (the
+                                // one-round self-heal).
+                                state.on_lose();
+                                warn!(
+                                    holder = %cfg.holder_id,
+                                    evidence = ?CompletedLoseEvidence::AnotherHolderObserved,
+                                    "lost leadership (an act-failed completed read no \
+                                     longer names us as holder)"
+                                );
+                                hooks.on_lose();
+                                marks_dirty.mark();
+                                standing.on_observed_not_leading();
+                                ContentBaseline::Present {
+                                    renew_time: f.renew_time.clone(),
+                                }
+                            }
+                            ActFailedAction::ObserveOnly => {
+                                let f = facts.as_ref().expect(
+                                    "ObserveOnly is routed only for present reads \
+                             (the absence partition; census + kani pinned)",
+                                );
+                                ContentBaseline::Present {
+                                    renew_time: f.renew_time.clone(),
+                                }
+                            }
+                            ActFailedAction::AbsenceLose => {
+                                // r[impl sched.lease.holder-evidenced-lose+3]
+                                // The completed read OBSERVED the lease
+                                // absent: it resolves to nobody, and a
+                                // peer's re-Create needs no steal wait —
+                                // the fence/steal margin does not shield
+                                // this regime, so belief exits AT the
+                                // read (bug_143). Same lose family as
+                                // EvidencedLose: the standing transition
+                                // clears any pending deferral, and the
+                                // hold clears with it (there is no lease
+                                // object of ours to release). The ledger
+                                // is NOT consumed: the transmitted Create
+                                // resolves through the evidence leg next
+                                // round (holder=us against Absent).
+                                state.on_lose();
+                                warn!(
+                                    holder = %cfg.holder_id,
+                                    "lost leadership (a completed read observed the lease \
+                                     ABSENT — deleted out from under us; a peer can \
+                                     re-create it with no steal wait)"
+                                );
+                                hooks.on_lose();
+                                marks_dirty.mark();
+                                standing.on_observed_not_leading();
+                                ContentBaseline::Absent
+                            }
+                            // 404→Create round whose POST died unanswered,
+                            // observed while standby: the read OBSERVED
+                            // absence — a baseline observation
+                            // (merged_bug_164), exactly what lets the next
+                            // completed read prove the Create committed
+                            // (holder=us against Absent).
+                            ActFailedAction::AbsenceObserve => ContentBaseline::Absent,
+                        };
+                    }
+
+                    // Record THIS round's transmitted write as in doubt —
+                    // kept at the OLDEST anchor: an existing unconsumed
+                    // entry is never overwritten (if several writes are in
+                    // doubt, the blind window must cover the eldest).
+                    if put_transmitted && unconfirmed.is_none() {
+                        unconfirmed = Some(UnconfirmedPut {
+                            anchor: attempt_anchor,
+                        });
+                    }
+
+                    // The fence still arbitrates: evidence (above) is the
+                    // only thing that stamps on this path, so a regime
+                    // where writes stop committing fences on the same
+                    // schedule as a full outage.
+                    if maybe_self_fence(
+                        &state,
+                        &mut standing,
+                        &marks_dirty,
+                        blind.blind_for(fence_now()),
+                    ) {
+                        hooks.on_lose();
+                    }
+                }
+                election::RenewOutcome::FetchFailed { error } => {
+                    // No fresh view of the Lease object at all — and,
+                    // because a mutating request is only ever transmitted
+                    // after a completed read (renew_phased's phase order),
+                    // provably nothing was sent: no ledger entry, the rv
+                    // freezes for stealers, and this replica is exactly as
+                    // blind as it looks.
+                    match &error {
+                        Some(e) => {
+                            warn!(error = %e, "lease renew failed (apiserver error); retrying next tick");
+                        }
+                        None => {
+                            warn!(deadline = ?RENEW_PHASE_DEADLINE, "lease read phase TIMED OUT (apiserver hung?); retrying next tick");
+                        }
+                    }
+                    //
+                    // Local self-fence: if SELF_FENCE_AFTER has elapsed
+                    // since the last SUCCESSFUL round-trip, flip is_leader
+                    // locally. SELF_FENCE_AFTER is 2×FENCE_MARGIN earlier
+                    // than any follower's steal threshold (STEAL_AFTER), so
+                    // by the time a replica that CAN reach the apiserver
+                    // steals, we have already stopped believing — that
+                    // ordering is the neverDual proof in the
+                    // leaderElectionAsymmetric regime of
+                    // docs/spec/models/leaderElection.qnt. This is the
+                    // SECOND fence evaluation in the tick: the tick-time
+                    // check at the top of the loop body is what bounds the
+                    // fence-check latency to one tick; this one just fires
+                    // earlier when a failed attempt resolves before the
+                    // next tick.
+                    //
+                    // The old "DON'T flip — apiserver down for EVERYONE"
+                    // argument is wrong once elapsed > the fence deadline.
+                    // In the symmetric-partition case (nobody reaches the
+                    // apiserver) flipping costs nothing: workers can't be
+                    // scheduled anyway. In the asymmetric case (WE are
+                    // partitioned, peer is not) NOT flipping makes us a
+                    // stale-assignment noise generator. Worker-side
+                    // generation fence (r[sched.lease.generation-fence+3])
+                    // saves correctness either way; this fence saves ops
+                    // sanity.
+                    // attempt_anchor is dropped on this path: a failed
+                    // round-trip stamps nothing and the window keeps aging.
+                    if maybe_self_fence(
+                        &state,
+                        &mut standing,
+                        &marks_dirty,
+                        blind.blind_for(fence_now()),
+                    ) {
+                        // Self-fence is a lose-transition: same on-lose
+                        // hook as the explicit lose arm above.
+                        hooks.on_lose();
+                    }
                 }
             }
         }
 
         // r[impl sched.lease.deletion-cost+3]
-        // Level-triggered leader-marks reconcile — hoisted AFTER the
-        // whole outcome match (merged_bug_122) so EVERY arm services
+        // r[impl sys.epilogue.reconcile]
+        // Level-triggered leader-marks reconcile — the TICK'S
+        // STRUCTURAL TAIL (merged_bug_072): the step-down arm and the
+        // renew round are the two branches of one if/else, so every
+        // arm exit FLOWS here by construction — there is no `continue`
+        // to write past it (the zero-continue census in `mod tests`
+        // pins the loop body), and the merged_bug_122 hoist's
+        // every-arm promise is structural rather than an enumerated
+        // convention (the old enumeration missed the step-down arm,
+        // whose `continue` left dual leader labels on the load-bearing
+        // Service for one RENEW_INTERVAL after a deliberate handover).
+        // Hoisted AFTER the whole outcome match so EVERY arm services
         // the dirt it minted this tick: the Completed edges, the
         // tick-top and in-arm self-fences, and the evidence-acquire
         // leg of the acts-fail arm — whose own doc names the regime
@@ -2390,7 +2410,9 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
         // short-circuit inside the gate means a divergence found here
         // is repaired by the ordinary reconcile on the NEXT round-trip.
         if now_leading
-            && round.is_multiple_of(MARKS_VERIFY_EVERY)
+            && state
+                .renew_rounds_started()
+                .is_multiple_of(MARKS_VERIFY_EVERY)
             && let Some(task) = maybe_spawn_verify_leader_marks(
                 &pod_patch_client,
                 &cfg,
@@ -2429,7 +2451,10 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
     if standing.should_release_on_shutdown() {
         let deadline = RENEW_INTERVAL.saturating_sub(RENEW_SLOP);
         match tokio::time::timeout(deadline, election.step_down()).await {
-            Ok(Ok(())) => info!("released lease on shutdown"),
+            Ok(Ok(StepDownOutcome::Released)) => info!("released lease on shutdown"),
+            Ok(Ok(StepDownOutcome::NotOurs)) => {
+                info!("shutdown release: lease already not ours (vacated or another holder)");
+            }
             Ok(Err(e)) => warn!(
                 error = %e,
                 "step_down failed; the next replica will steal in {}s",
@@ -5084,6 +5109,210 @@ mod tests {
             }
         }
         loop_task.await.expect("lease loop exits");
+    }
+
+    /// W10-AY (merged_bug_072): a deliberate handover services its
+    /// leader-marks dirt the SAME tick — the step-down arm exits
+    /// through the tick's structural tail reconcile. Pre-fix the arm's
+    /// `continue` bypassed the hoisted reconcile (its arm enumeration
+    /// postdated the hoist and missed step-down): up to one 5s
+    /// RENEW_INTERVAL of dual leader labels on the load-bearing
+    /// Service after a handover.
+    // r[verify sys.epilogue.reconcile]
+    #[tokio::test(start_paused = true)]
+    async fn w10_ay_step_down_services_marks_same_tick() {
+        let (client, mut park) = RequestPark::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            // The deletion-cost mark face: the configured-label path
+            // adds a foreign-sweep GET that interleaves with the park
+            // script; both faces ride the SAME tail reconcile (the
+            // marks unit tests pin the label half).
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        // Round 1: acquire; the reconcile patches the leader marks.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 10));
+        let put = park.next().await;
+        put.respond_ok(park_lease_json(Some("us"), 3, 11));
+        settle().await;
+        assert!(state.is_leader(), "healthy round acquires");
+        let patch = park.next().await;
+        assert!(patch.path.contains("/pods/us"), "leader marks PATCH");
+        patch.respond_ok(pod_ok("us"));
+        settle().await;
+
+        // The handover: a cooperative step-down request; the next
+        // tick's arm releases the lease...
+        state.request_step_down(state.acquired_instance());
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 11));
+        let put = park.next().await;
+        assert!(
+            put.body["spec"]["holderIdentity"].is_null(),
+            "the step-down replace clears holderIdentity"
+        );
+        put.respond_ok(park_lease_json(None, 3, 12));
+        settle().await;
+        assert!(!state.is_leader(), "the handover drops leadership");
+
+        // ...and the SAME TICK services the marks dirt: the leader
+        // label must come OFF now, not one RENEW_INTERVAL later (the
+        // 1s budget is well inside the 5s next tick — the law is the
+        // EVENT, the bound only separates same-tick from next-tick).
+        let marks = tokio::time::timeout(Duration::from_secs(1), park.next())
+            .await
+            .expect(
+                "the step-down tick must service its marks dirt same-tick \
+                 (merged_bug_072 red: the arm's continue bypassed the reconcile)",
+            );
+        assert!(marks.path.contains("/pods/us"), "marks PATCH same tick");
+        marks.respond_ok(pod_ok("us"));
+
+        shutdown.cancel();
+        for _ in 0..4 {
+            if let Some(req) = park.try_next().await {
+                req.respond_status(404, "NotFound", "gone");
+            }
+        }
+        loop_task.await.expect("lease loop exits");
+    }
+
+    /// W10-AZ (merged_bug_072): a spurious 409 at step-down resolves
+    /// through the ONE conflict resolver — re-read, observe
+    /// holder-still-us, retry the release at the fresh rv. The retired
+    /// optimistic inference ("409 ⇒ someone stole it ⇒ released")
+    /// logged a false release on a lease still naming us, cleared the
+    /// hold, and silently re-acquired next tick; on shutdown the dead
+    /// pod stayed holder the full steal threshold.
+    // r[verify sys.epilogue.reconcile]
+    #[tokio::test(start_paused = true)]
+    async fn w10_az_spurious_step_down_409_rereads_and_retries() {
+        let (client, mut park) = RequestPark::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        // Round 1: acquire + marks.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 10));
+        let put = park.next().await;
+        put.respond_ok(park_lease_json(Some("us"), 3, 11));
+        settle().await;
+        assert!(state.is_leader());
+        let patch = park.next().await;
+        patch.respond_ok(pod_ok("us"));
+        settle().await;
+
+        // The handover tick: the release replace bounces on a foreign
+        // rv move (metadata patch — holder untouched).
+        state.request_step_down(state.acquired_instance());
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 11));
+        let put = park.next().await;
+        put.respond_status(409, "Conflict", "the object has been modified");
+
+        // THE RESOLVER: the 409 is rv movement, not holder evidence —
+        // re-read (holder still us at the fresh rv), retry the
+        // release.
+        let get2 = tokio::time::timeout(Duration::from_secs(1), park.next())
+            .await
+            .expect(
+                "a step-down 409 must re-read and resolve, not report released \
+                 (merged_bug_072 red: the optimistic 409⇒Ok inference)",
+            );
+        assert!(
+            get2.path.contains("/leases/rio-sched"),
+            "the resolver re-reads"
+        );
+        get2.respond_ok(park_lease_json(Some("us"), 3, 12));
+        let put2 = park.next().await;
+        assert!(
+            put2.body["spec"]["holderIdentity"].is_null(),
+            "the retried release clears holderIdentity at the fresh rv"
+        );
+        put2.respond_ok(park_lease_json(None, 3, 13));
+        settle().await;
+        assert!(!state.is_leader(), "the handover completes");
+
+        shutdown.cancel();
+        for _ in 0..4 {
+            if let Some(req) = park.try_next().await {
+                req.respond_status(404, "NotFound", "gone");
+            }
+        }
+        loop_task.await.expect("lease loop exits");
+    }
+
+    /// W10-AY companion ([GEN-SET], R23′): the zero-continue census —
+    /// the merged_bug_122 arm-enumeration comment is DEAD (it missed
+    /// the step-down arm); the every-arm promise is structural: the
+    /// reconcile is the tick's tail and NO `continue` exists in the
+    /// loop body to skip it. Scan over the embedded source ((wwwww));
+    /// plants enter at the raw-source scan.
+    #[test]
+    fn w10_ay_loop_body_has_zero_continues() {
+        fn continues_in_loop(src: &str) -> usize {
+            let start = src
+                .find("async fn run_lease_loop_with_client")
+                .expect("loop fn present");
+            let end = src[start..]
+                .find("lease loop exited")
+                .expect("loop tail sentinel present")
+                + start;
+            src[start..end]
+                .lines()
+                .filter(|l| {
+                    let code = l.trim_start();
+                    !code.starts_with("//") && code.contains("continue")
+                })
+                .count()
+        }
+        assert_eq!(
+            continues_in_loop(include_str!("lib.rs")),
+            0,
+            "every tick exit must flow through the tail reconcile — no continue \
+             may exist in the lease loop body (merged_bug_072)"
+        );
+        // R22′ plants.
+        let red = "async fn run_lease_loop_with_client() {\n loop {\n continue;\n }\n // lease loop exited\n}";
+        assert_eq!(continues_in_loop(red), 1, "the continue plant must red");
+        let green = "async fn run_lease_loop_with_client() {\n loop {\n work();\n }\n // lease loop exited\n}";
+        assert_eq!(continues_in_loop(green), 0);
     }
 
     /// W10-AW (bug_143): a believing incumbent whose completed read

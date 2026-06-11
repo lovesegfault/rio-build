@@ -239,3 +239,28 @@ DECISION was proven one level below the hosting wiring that aborted
 its EXECUTION. The drain budget is derived where the epilogue lives
 (the lease crate exports it from its own renew constants), so host
 and epilogue cannot drift independently.
+
+#r("sys.epilogue.reconcile")[
+  A periodic actor whose arms mint reconciliation obligations (dirty
+  marks, pending patches) MUST make the reconcile its tick's
+  STRUCTURAL TAIL: every arm exit flows through it by construction —
+  branch arms compose as alternatives ahead of the tail, never as
+  early exits past it — and an arm-local control-flow escape
+  (`continue`, early return) that skips the tail is a structural
+  defect held out by a machine census over the loop body, not by an
+  enumerated arm list in a comment.
+]
+
+The lease loop is the founding instance (merged_bug_072): the
+step-down arm's `continue` bypassed the hoisted leader-marks
+reconcile — the hoist's own comment enumerated the arms it covered
+and the enumeration silently missed the arm added later, leaving dual
+leader labels on the load-bearing Service for one renew interval
+after every deliberate handover. The structural form replaces the
+enumeration: the step-down arm and the renew round are two branches
+of one conditional whose join IS the reconcile, and the zero-continue
+census pins the loop body. The companion law is conflict-handling
+unification: every 409 on the lease plane resolves through ONE
+evidence-based re-read resolver (a conflict proves resourceVersion
+movement, never holder change), so a retired optimistic inference
+cannot coexist with the deferral model one function over.

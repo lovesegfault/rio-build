@@ -45,6 +45,20 @@ use kube::api::{Api, ObjectMeta, PostParams};
 use rio_crds::KubeErrorExt;
 use tracing::{debug, warn};
 
+/// Typed outcome of a [`LeaderElection::step_down`] attempt
+/// (merged_bug_072): the resolver never reports a release it did not
+/// OBSERVE — a bare 409 is rv movement, resolved by re-reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepDownOutcome {
+    /// Our replace landed: `holderIdentity` is cleared at the
+    /// apiserver — an observed release.
+    Released,
+    /// A completed read showed the lease absent, vacated, or held by
+    /// another: nothing of ours to release — observed not-ours
+    /// (supersession-class evidence, NOT an inference from a 409).
+    NotOurs,
+}
+
 /// Result of one `try_acquire_or_renew()` call.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ElectionResult {
@@ -669,33 +683,51 @@ impl LeaderElection {
     /// standby steals immediately (empty-holder branch in
     /// `decide()`) instead of waiting out the observed-record ttl.
     ///
-    /// 409 on the replace() → someone already stole it → we're
-    /// already not the leader → success from our perspective.
-    /// Only propagates if the GET itself fails.
-    pub async fn step_down(&self) -> Result<(), kube::Error> {
-        let Some(mut lease) = self.api.get_opt(&self.lease_name).await? else {
-            return Ok(());
-        };
-        if lease
-            .spec
-            .as_ref()
-            .and_then(|s| s.holder_identity.as_deref())
-            != Some(&*self.holder_id)
-        {
-            // Already not ours — nothing to release.
-            return Ok(());
-        }
-        let mut spec = lease.spec.take().unwrap_or_default();
-        spec.holder_identity = None;
-        lease.spec = Some(spec);
-        match self
-            .api
-            .replace(&self.lease_name, &PostParams::default(), &lease)
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(e) if e.is_conflict() => Ok(()),
-            Err(e) => Err(e),
+    /// ONE conflict generation (merged_bug_072): a 409 on the replace
+    /// resolves through the evidence-based re-read loop below — the
+    /// renew path's defer-then-resolve model — instead of the retired
+    /// optimistic inference ("409 ⇒ someone stole it ⇒ success").
+    /// This file's own Conflict model states foreign metadata patches
+    /// and zombie commits move the rv WITHOUT changing the holder, so
+    /// a bare 409 proves nothing: the old mapping logged `released`
+    /// on a lease still naming us, the caller cleared its hold, and
+    /// no release ever landed (on shutdown: the dead pod stayed
+    /// holder the full steal threshold). Each iteration is one GET +
+    /// one PUT; the caller's attempt deadline is the envelope (R17 —
+    /// both call sites wrap this in
+    /// `timeout(RENEW_INTERVAL − RENEW_SLOP, ..)`), and a
+    /// non-conflict error propagates immediately.
+    pub async fn step_down(&self) -> Result<StepDownOutcome, kube::Error> {
+        loop {
+            let Some(mut lease) = self.api.get_opt(&self.lease_name).await? else {
+                // No lease object: nothing of ours to release.
+                return Ok(StepDownOutcome::NotOurs);
+            };
+            if lease
+                .spec
+                .as_ref()
+                .and_then(|s| s.holder_identity.as_deref())
+                != Some(&*self.holder_id)
+            {
+                // OBSERVED not-ours (another holder, or vacated) —
+                // released-equivalent, and now evidenced.
+                return Ok(StepDownOutcome::NotOurs);
+            }
+            let mut spec = lease.spec.take().unwrap_or_default();
+            spec.holder_identity = None;
+            lease.spec = Some(spec);
+            match self
+                .api
+                .replace(&self.lease_name, &PostParams::default(), &lease)
+                .await
+            {
+                Ok(_) => return Ok(StepDownOutcome::Released),
+                // A 409 is rv movement, not holder evidence: re-read
+                // and resolve (holder=us ⇒ retry the release at the
+                // fresh rv; holder≠us ⇒ NotOurs with evidence).
+                Err(e) if e.is_conflict() => continue,
+                Err(e) => return Err(e),
+            }
         }
     }
 
