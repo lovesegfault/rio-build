@@ -11,13 +11,13 @@
 //!
 //! Inode numbers are small sequential values allocated during the tree
 //! build (they must fit a non-LFS 32-bit payload's ino_t; see
-//! [`InoAlloc`]), with identity split by node kind: files and symlinks
+//! `InoAlloc`), with identity split by node kind: files and symlinks
 //! are content-deduped (identical bytes anywhere in the closure share
 //! one inode — legal hardlink semantics, reported via `st_nlink`),
 //! while directories are PATH-unique (each alias of a content-deduped
 //! `Directory` body gets its own inode — POSIX forbids hardlinked
 //! directories, and serving them desyncs tree walkers; see
-//! [`InoAlloc::dir`]). The decoded `Directory` bodies, the backing
+//! `InoAlloc::dir`). The decoded `Directory` bodies, the backing
 //! cache, and the chunk store all stay content-deduped — only the
 //! runtime inode numbers multiply, so heap scales with the closure's
 //! path count rather than its content count.
@@ -166,7 +166,7 @@ struct DirChildren {
 /// bytes, directories are one fresh ino per PATH (never deduped —
 /// content-shared directory inos are hardlinked-directory semantics,
 /// which POSIX forbids and which desync fts-based tree walkers; see
-/// [`InoAlloc::dir`]).
+/// `InoAlloc::dir`).
 // r[impl builder.fs.castore-inode-digest+2]
 struct InoAlloc {
     next: u64,
