@@ -3271,7 +3271,13 @@ fn older_close_does_not_erase_newer_deaths() {
 #[tokio::test]
 async fn erring_token_mint_spawns_nothing_this_tick() {
     use crate::reconcilers::pool::jobs::mint_spawn_tokens;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use std::collections::HashMap;
+
+    // W9-CB (E1): the driven mint failure must also INCREMENT the
+    // skipped-tick counter — the PromQL face of the fail-closed law.
+    let rec = DebuggingRecorder::new();
+    let _g = ::metrics::set_default_local_recorder(&rec);
 
     // Production-shaped transport failure: the admin channel is dead
     // (connect_lazy to a closed port — every RPC errs like a
@@ -3309,6 +3315,28 @@ async fn erring_token_mint_spawns_nothing_this_tick() {
         "keyless dev parity: Ok(empty map, keyless=true) rides the \
          Some arm into the Keyless letter — token-less spawn by law"
     );
+
+    // W9-CB: exactly ONE skipped tick counted, at the failing pool —
+    // the vacuous and healthy legs above must not increment (a count
+    // on a served tick would turn the symptom series into noise).
+    // ppppp: snapshot exactly once, after all legs.
+    let snap = rec.snapshotter().snapshot().into_vec();
+    let skipped = snap.into_iter().find_map(|(k, _, _, v)| {
+        let key = k.key();
+        (key.name() == "rio_controller_spawn_mint_skipped_ticks_total"
+            && key.labels().any(|l| l.key() == "pool" && l.value() == "p"))
+        .then_some(v)
+    });
+    match skipped {
+        Some(DebugValue::Counter(n)) => assert_eq!(
+            n, 1,
+            "one driven mint failure = one skipped tick; served legs silent"
+        ),
+        other => panic!(
+            "left: {other:?} / right: Counter(1) — the mint-failure \
+             skipped tick never reached the counter (E1's PromQL face)"
+        ),
+    }
 }
 
 // r[verify ctrl.pool.respawn-backoff+2]

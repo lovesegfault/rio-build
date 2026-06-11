@@ -1463,6 +1463,19 @@ pub(super) async fn mint_spawn_tokens(
             })
         }
         Err(e) => {
+            // E1 (the §1.6.4-15 granted hunk): the mint-failure
+            // SKIPPED TICK, counted at the single site where the
+            // failure is known (this Err arm is the sole None
+            // producer; the consumer match's None arm is data-only).
+            // One PromQL over this series replaces the log grep for
+            // the live_053 fail-closed shape — production
+            // tokenless-spawn is structurally dead, so the tick skip
+            // IS the operator-visible symptom.
+            metrics::counter!(
+                "rio_controller_spawn_mint_skipped_ticks_total",
+                "pool" => pool.to_owned(),
+            )
+            .increment(1);
             warn!(
                 pool, error = %e,
                 "mint_executor_tokens failed; skipping this tick's spawns \

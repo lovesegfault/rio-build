@@ -245,6 +245,17 @@ pub fn describe_metrics() {
          is a wedged-builder investigation, not a retry knob."
     );
     describe_counter!(
+        "rio_controller_spawn_mint_skipped_ticks_total",
+        "Reconcile passes that spawned ZERO Jobs because the executor-token mint RPC \
+         failed (labeled by pool; live_053 / D-053-1 fail-closed law — no token \
+         witness, no spawn; intents stay queued and re-present next tick). One \
+         increment = one skipped tick at that pool, so rate() is spawn-latency \
+         debt added by mint failures. Sustained non-zero = scheduler admin plane \
+         unhealthy (stalled ticks, dead channel, HMAC mint errors) — check \
+         scheduler health and rio_scheduler_executor_auth_rejected_total; a \
+         single blip self-heals one tick later."
+    );
+    describe_counter!(
         "rio_controller_lease_acquired_total",
         "nodeclaim_pool lease acquire transitions. >1 over a short window = leadership churn \
          (check apiserver health / pod restarts)."
