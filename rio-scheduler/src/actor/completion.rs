@@ -1390,7 +1390,9 @@ impl DagActor {
                 // re-stamp), and "" never matches a parsed store
                 // path, so the placeholder can never be forged.
                 // r[impl sched.trust.report-membership]
-                if !(*is_ca && !*is_fo) {
+                // (De Morgan of NOT(is_ca AND NOT is_fo) — the
+                // non-exempt face.)
+                if !*is_ca || *is_fo {
                     Self::retain_expected_members(
                         executor_id,
                         drv_key,
@@ -1968,7 +1970,9 @@ impl DagActor {
         // is exempt under EXACTLY the claims-mint predicate — see
         // [`Self::retain_expected_members`].
         // r[impl sched.trust.report-membership]
-        if !(state.ca.is_ca && !state.is_fixed_output) {
+        // (De Morgan of NOT(is_ca AND NOT is_fixed_output) — the
+        // non-exempt face.)
+        if !state.ca.is_ca || state.is_fixed_output {
             Self::retain_expected_members(
                 executor_id.as_str(),
                 drv_key,
