@@ -6279,6 +6279,7 @@ name = "rio-controller"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "futures-util",
  "hdrhistogram",

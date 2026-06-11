@@ -64,21 +64,30 @@ async fn main() -> anyhow::Result<()> {
     let client = Client::try_default().await?;
     info!("kubernetes client connected");
 
-    // ---- Health server ----
-    // r[impl ctrl.health.ready-gates-connect]
-    // BEFORE dependency connect: liveness = process alive + runtime
-    // responsive (server.rs `/healthz` is unconditional 200), so it
-    // must answer immediately or the chart's livenessProbe
-    // (periodSeconds:10, failureThreshold:3, no startupProbe) kills
-    // the pod at ~20-30s — re-introducing the CrashLoopBackOff that
-    // `connect_forever` exists to avoid. Readiness = dependencies
-    // reachable: `/readyz` is 503 until `ready` flips after
-    // `connect_forever` returns.
+    // ---- Guard domain (health + skew sentinel; lease joins below) ----
+    // r[impl ctrl.health.ready-gates-connect+1]
+    // BEFORE dependency connect: the guard thread binds `/healthz`
+    // immediately, so the chart's livenessProbe (periodSeconds:10,
+    // timeoutSeconds:10, failureThreshold:6, startupProbe 2s×30)
+    // passes during scheduler cold-start — `connect_forever` below
+    // can retry without a CrashLoopBackOff. Round-9 Banner B (the
+    // live_054 close): liveness, lease renewal, and the skew sentinel
+    // are KILL-WIRED surfaces and live on a dedicated current_thread
+    // runtime that stays schedulable when this (main) runtime is not;
+    // readiness stays SHED-WIRED to this working domain — `/readyz`
+    // is 503 until `ready` flips after `connect_forever` returns, and
+    // 503 again whenever the main runtime cannot schedule the guard's
+    // probe within budget (brownout = Endpoints removal, never a
+    // kill). Cross-domain state is lock-free only — the census lives
+    // in the guard module doc.
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    rio_common::server::spawn_axum(
-        "health-server",
-        cfg.health_addr,
-        rio_common::server::health_router(ready.clone()),
+    let guard = rio_controller::guard::spawn(
+        tokio::runtime::Handle::current(),
+        ready.clone(),
+        rio_controller::guard::GuardConfig {
+            health_addr: cfg.health_addr,
+            ..Default::default()
+        },
         shutdown.clone(),
     );
 
@@ -350,15 +359,12 @@ async fn main() -> anyhow::Result<()> {
 
         let hooks = ControllerLeaseHooks::default();
         if let Some(lease_cfg) = lease_cfg {
-            rio_common::task::spawn_monitored(
-                "nodeclaim-pool-lease",
-                rio_lease::run_lease_loop(
-                    lease_cfg,
-                    leader.clone(),
-                    hooks.clone(),
-                    shutdown.clone(),
-                ),
-            );
+            // Kill-wired (D1): renewal keeps its 5s cadence during
+            // main-domain stalls, so the lease's fence-check premise
+            // survives admitted-load starvation (the 054 violation was
+            // 2.5-3x). The loop builds its own kube client on the
+            // guard runtime — no main-domain pool sharing.
+            guard.spawn_lease(lease_cfg, leader.clone(), hooks.clone(), shutdown.clone());
         }
 
         // `connect_pg` wraps `connect_forever` (returns `None` only on

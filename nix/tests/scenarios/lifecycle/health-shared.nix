@@ -81,7 +81,7 @@ scope: with scope; ''
 
   # ══════════════════════════════════════════════════════════════════
   # controller HTTP health: liveness bound BEFORE connect_forever,
-  # readiness gated ON it (ctrl.health.ready-gates-connect)
+  # readiness gated ON it (ctrl.health.ready-gates-connect+1)
   # ══════════════════════════════════════════════════════════════════
   # Regression: pre-fix the health server spawned AFTER
   # connect_forever, so a >~20s scheduler cold-start = 3× connection-

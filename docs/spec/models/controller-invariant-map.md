@@ -331,7 +331,7 @@ Grouped, with the reason they stay outside the Stage-B models:
   executor lifecycle), `ctrl.reconcile.owner-refs`,
   `ctrl.backoff.per-object`, `ctrl.condition.sched-unreachable`
   (observability), `ctrl.probe.named-service`,
-  `ctrl.health.ready-gates-connect`, `ctrl.pool.hw-bench-needed+2`
+  `ctrl.health.ready-gates-connect+1`, `ctrl.pool.hw-bench-needed+2`
   (listed under F2 only as matrix context), `ctrl.pool.fetcher-spawn-builtin`,
   `ctrl.terminated.deadline-exceeded+2` (the controller half of a
   scheduler-side protocol audited by the retry campaign),

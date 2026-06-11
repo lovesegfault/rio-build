@@ -31,6 +31,13 @@ k8s-openapi = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }
 
+# --- Guard domain (src/guard.rs) ---
+# The dedicated current_thread runtime hosts the kill-wired liveness
+# surface; axum here (not via rio-common's spawn_axum) because the
+# guard's /readyz handler probes the MAIN runtime and the router is
+# built guard-side.
+axum = { workspace = true }
+
 # --- Serialization ---
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -936,7 +936,7 @@ in
       #   2-replica state so ordering is immaterial wrt those.
       "jwt-mount-present"
       # r[verify ctrl.probe.named-service]
-      # r[verify ctrl.health.ready-gates-connect]
+      # r[verify ctrl.health.ready-gates-connect+1]
       "health-shared"
       # r[verify builder.cancel.cgroup-kill+2]
       "cancel-cgroup-kill"

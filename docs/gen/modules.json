@@ -436,6 +436,11 @@
       "doc": "Reconciler integration test fixtures."
     },
     {
+      "path": "guard.rs",
+      "depth": 0,
+      "doc": "The guard domain: a dedicated `current_thread` tokio runtime on its own OS thread hosting the kill-wired liveness surface, the lease renew loop, and the runtime-skew sentinel."
+    },
+    {
       "path": "lib.rs",
       "depth": 0,
       "doc": "Kubernetes operator for rio-build."

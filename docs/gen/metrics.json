@@ -56,6 +56,8 @@
     "rio_controller_orphan_jobs_reaped_total",
     "rio_controller_reconcile_duration_seconds",
     "rio_controller_reconcile_errors_total",
+    "rio_controller_runtime_skew_seconds",
+    "rio_controller_runtime_skew_stalls_total",
     "rio_controller_scaling_decisions_total",
     "rio_controller_sketches_reload_pending",
     "rio_controller_spot_exposure_dropped_seconds_total",
@@ -531,6 +533,16 @@
         "name": "rio_controller_reconcile_errors_total",
         "kind": "counter",
         "help": "Reconcile errors. reconciler=pool|componentscaler, error_kind=kube|finalizer|invalid_spec. error_kind is the variant discriminator (stable, low cardinality). Sustained rate > 0 = check controller logs."
+      },
+      {
+        "name": "rio_controller_runtime_skew_seconds",
+        "kind": "gauge",
+        "help": "Executor-scheduling delay per runtime domain (domain=main|guard), measured by the guard-domain sentinel (src/guard.rs): a no-op probe task's time-to-first-poll on the main runtime, and the guard's own timer overshoot. While a main-domain probe is unanswered the exported value is the RUNNING lower bound, so a live stall is visible as it happens. domain=main at seconds-scale = the live_054 starvation shape; domain=guard elevated = the guard itself is starved (cgroup-class pressure — raise the CPU request)."
+      },
+      {
+        "name": "rio_controller_runtime_skew_stalls_total",
+        "kind": "counter",
+        "help": "Stall episodes per runtime domain (domain=main|guard): edge-triggered when scheduling delay crosses the guard sentinel's threshold (default 1s). Each main-domain increment logs a thread-table capture (tid/comm/state) for attribution. Rate > 0 = the component is being starved; correlate with rio_controller_runtime_skew_seconds and the captured table in logs."
       },
       {
         "name": "rio_controller_scaling_decisions_total",

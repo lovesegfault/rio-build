@@ -45,6 +45,7 @@ pub mod config;
 pub(crate) mod error;
 #[cfg(test)]
 pub(crate) mod fixtures;
+pub mod guard;
 pub mod observability;
 pub mod reconcilers;
 
@@ -162,6 +163,24 @@ pub fn describe_metrics() {
         "rio_controller_component_scaler_observed_load",
         "ComponentScaler observed load: max of pg-pool utilization and substitute-admission utilization \
          across loadEndpoint pods at the last tick (labelled by cs=ns/name)."
+    );
+    describe_gauge!(
+        "rio_controller_runtime_skew_seconds",
+        "Executor-scheduling delay per runtime domain (domain=main|guard), measured by \
+         the guard-domain sentinel (src/guard.rs): a no-op probe task's time-to-first-poll \
+         on the main runtime, and the guard's own timer overshoot. While a main-domain \
+         probe is unanswered the exported value is the RUNNING lower bound, so a live \
+         stall is visible as it happens. domain=main at seconds-scale = the live_054 \
+         starvation shape; domain=guard elevated = the guard itself is starved \
+         (cgroup-class pressure — raise the CPU request)."
+    );
+    describe_counter!(
+        "rio_controller_runtime_skew_stalls_total",
+        "Stall episodes per runtime domain (domain=main|guard): edge-triggered when \
+         scheduling delay crosses the guard sentinel's threshold (default 1s). Each \
+         main-domain increment logs a thread-table capture (tid/comm/state) for \
+         attribution. Rate > 0 = the component is being starved; correlate with \
+         rio_controller_runtime_skew_seconds and the captured table in logs."
     );
     describe_counter!(
         "rio_controller_spot_interrupt_dropped_total",

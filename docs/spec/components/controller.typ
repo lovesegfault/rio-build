@@ -953,16 +953,20 @@ Jobs is meaningless (eviction of a Job pod just reschedules the build via
   probes are HTTP (`/healthz`/`/readyz`) and are unrelated to this rule.
 ]
 
-#r("ctrl.health.ready-gates-connect")[
+#r("ctrl.health.ready-gates-connect+1")[
   The controller binds its HTTP health server *before* awaiting
-  `connect_forever` for the scheduler. `/healthz` (liveness) returns 200
-  unconditionally once the kube client is constructed; `/readyz` (readiness)
-  returns 503 until the scheduler admin channel connects, then 200. Spawning
-  the health server _after_ `connect_forever` would leave nothing listening
-  during scheduler cold-start and the chart's livenessProbe (`periodSeconds:10`,
-  `failureThreshold:3`, no `startupProbe`) would SIGTERM the pod at \~20--30s
-  --- re-introducing the CrashLoopBackOff that `connect_forever` was added to
-  fix.
+  `connect_forever` for the scheduler, and serves it from the dedicated guard
+  runtime (`src/guard.rs` --- its own OS thread, schedulable when the working
+  runtime is not). `/healthz` (liveness) returns 200 unconditionally once the
+  guard thread starts; `/readyz` (readiness) returns 503 until the scheduler
+  admin channel connects, then 200 *iff* the working runtime schedules the
+  guard's no-op probe within the ready-probe budget --- a browned-out main
+  runtime sheds (Endpoints removal), it is never killed. Spawning the health
+  server _after_ `connect_forever` would leave nothing listening during
+  scheduler cold-start and the chart's livenessProbe (`periodSeconds:10`,
+  `timeoutSeconds:10`, `failureThreshold:6`, plus the 2s×30 `startupProbe`)
+  would SIGTERM the pod once the startup budget lapsed --- re-introducing the
+  CrashLoopBackOff that `connect_forever` was added to fix.
 ]
 
 #figure(
