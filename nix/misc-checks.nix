@@ -1290,6 +1290,33 @@ in
         touch $out
       '';
 
+  # R22 tier-2 (the round-9 banner instance): the census GENERATORS
+  # are themselves censused. The registry in the script is the closed
+  # enrollment set (per generator: anchor, embedded-plant pattern,
+  # axes covered, NAMED axis gaps under burn-down semantics); a
+  # generator-shaped scanner outside the registry fails (the reverse
+  # direction over the enrollment set itself). Rides two enforcement
+  # arms with embedded plants: the MODEL-DIVERGENCE header grammar
+  # (the model-tier drift grep) and the negative refusal census
+  # (merged_bug_059 — open-coded matches! folds over tonic codes
+  # banned outside the adjudication authority; founding plant = the
+  # pre-fix builder fold, quoted verbatim in the script).
+  census-corpora =
+    pkgs.runCommand "rio-census-corpora"
+      {
+        # Full-tree staging ((vvvvv)): the registry quantifies over
+        # nix scripts, helm fragments, in-crate sources, and
+        # docs/spec/models.
+        src = pkgs.lib.cleanSource ../.;
+        nativeBuildInputs = [ pkgs.python3 ];
+        scanScript = ../nix/census_corpora.py;
+      }
+      ''
+        cp "$scanScript" census_corpora.py
+        python3 census_corpora.py "$src"
+        touch $out
+      '';
+
   # merged_bug_076: the node_informer drop classifier's producer-cite
   # rationale, machine-diffed against the Status constructors the
   # AdminService module actually mints. A `producer-census: <code> =

@@ -76,7 +76,7 @@
 //   - Sketch contents, FFD/cover sizing arithmetic and λ accounting are
 //     out of model; PG is one abstract cell whose load may fail and
 //     whose overwrite-while-stale is the reload-latch violation.
-//     MODEL-DIVERGENCE(law=ctrl.nodeclaim.mint-deficit-proportional; tree=rio-controller/src/reconcilers/nodeclaim_pool/cover.rs:sizing): the model certifies the two-term STRUCTURE (n = min(deficit, budget) in claim units) — NOT the sizing arithmetic (n_pack FFD packing, the budget/chunk integer granularity, the budget<chunk refusal arm); retarget-by: encoding sizing arithmetic (a Stage-D item) or any change to the sizing law itself.
+//     MODEL-DIVERGENCE(law=ctrl.nodeclaim.mint-deficit-proportional; tree=rio-controller/src/reconcilers/nodeclaim_pool/cover.rs:sizing): the model certifies the two-term STRUCTURE (n = min(deficit, budget) in claim units) — NOT the sizing arithmetic (n_pack FFD packing, the budget/chunk integer granularity, the budget<chunk refusal arm) — retarget-by: encoding sizing arithmetic (a Stage-D item) or any change to the sizing law itself.
 //   - The per-tick mark dedup (the BTreeSet in report_unfulfillable) is
 //     by construction here (marks are a set); the soundness checks are
 //     about WHICH cells are marked, not how many times.

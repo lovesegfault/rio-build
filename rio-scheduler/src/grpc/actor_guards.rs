@@ -94,6 +94,8 @@ pub(crate) fn actor_error_to_status(err: ActorError) -> Status {
     // (sched.grpc.fence-retryable): pinned exhaustively by the
     // retry_class_code_consistency unit test; the debug_assert keeps
     // the derivation honest on every dev-mode mapping.
+    // refusal-census: allow(consistency debug_assert of a derivation the
+    // retry_class_code_consistency census pins — not an adjudication site)
     debug_assert_eq!(
         err.retry_class() == crate::actor::RetryClass::Retryable,
         matches!(
@@ -142,6 +144,8 @@ pub(crate) fn pull_rejection_to_status(rejection: &crate::actor::PullRejection) 
         }
         PullRejection::Internal(msg) => Status::internal(msg.clone()),
     };
+    // refusal-census: allow(consistency debug_assert of a derivation the
+    // retry_class_code_consistency census pins — not an adjudication site)
     debug_assert_eq!(
         rejection.retry_class() == crate::actor::RetryClass::Retryable,
         matches!(

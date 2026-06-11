@@ -1168,6 +1168,10 @@ fn classify_open_failure(status: Status) -> OpenFailure {
 /// open? Permanent codes, or any status the store explicitly classed
 /// via `x-rio-log-reject` (the metadata is only ever attached to
 /// permanent rejections).
+// refusal-census: allow(the documented extension site: permanence here is
+// store-CLASSED via x-rio-log-reject metadata, a channel judge_refusal
+// cannot see; the code pair is the metadata-less floor, checked
+// CONSISTENT with the AttemptBound regime at the re-point review)
 fn is_permanent_rejection(status: &Status) -> bool {
     matches!(
         status.code(),
