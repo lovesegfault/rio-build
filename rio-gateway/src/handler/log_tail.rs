@@ -37,6 +37,7 @@
 //! - **Hard-cancel at build terminus** (`LogTailSet::abort_all`).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use rio_common::transport::{OpenOutcome, bounded_open};
@@ -127,13 +128,73 @@ impl TaggedLogChunk {
     }
 }
 
+/// The typed abort disposition shared between a relay's owner and its
+/// [`PendingGapCell`] (`sys.epilogue.supersession`, bug_168). Drop-time
+/// disclosure is the TERMINUS posture and the default: a
+/// non-cooperative abort still owes the consumer the withheld lines
+/// plus the gap marker (merged_bug_111). SUPERSESSION must DISCARD:
+/// the successor relay owns the output channel, and the dead
+/// execution's withheld state would splice into the retry's
+/// client-visible stream as stale lines plus a FALSE "durable log gap"
+/// marker — `TaggedLogChunk` carries no exec_id, so no downstream
+/// consumer can filter the splice out. The owner marks the disposition
+/// BEFORE aborting; the cell consults it before unwinding, so the
+/// context-free Drop backstop is no longer the decision-maker.
+///
+/// (The exec_id-stamping alternative — tag every chunk and filter at
+/// the consumer — is recorded REJECTED: the consumer-filter form
+/// leaves the splice window open until the filter, and every consumer
+/// must then carry the filter forever; the typed disposition kills the
+/// splice at its source.)
+#[derive(Clone)]
+struct RelayDisposition(Arc<std::sync::atomic::AtomicBool>);
+
+impl RelayDisposition {
+    /// The default posture: disclose at drop (the terminus law).
+    fn disclose_at_drop() -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+    }
+
+    /// Flip to must-discard. Called by the OWNER, before the abort —
+    /// the ordering is the protocol: mark, abort, bound-join.
+    fn mark_superseded(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn must_discard(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// How long the SUCCESSOR relay waits for the superseded relay's task
+/// to unwind before producing its first byte. Mirrors the terminus
+/// bound-join discipline (build.rs, the abort_all + 250 ms join at
+/// stream end): an aborted task resolves at its next yield point
+/// (typically <1 ms); the bound only caps a pathological scheduler
+/// stall, and a straggler past it can no longer splice DISCLOSURES
+/// (the disposition is already must-discard) — only an in-flight
+/// regular send, the same priced residual the terminus form carries.
+const SUPERSEDED_JOIN_BOUND: Duration = Duration::from_millis(250);
+
 /// One live subscription: the execution it is keyed on, the signal that
-/// flips it from "re-open forever" to "drain and exit", and the task
-/// handle for the hard-cancel paths.
+/// flips it from "re-open forever" to "drain and exit", the task
+/// handle for the hard-cancel paths, and the abort disposition the
+/// owner sets before superseding it.
 struct TailHandle {
     exec_id: String,
     drain: watch::Sender<bool>,
     task: JoinHandle<()>,
+    disposition: RelayDisposition,
+}
+
+/// The owner→relay wiring minted per subscription: the output channel,
+/// the drain signal, and the abort disposition (the supersession
+/// protocol's carrier). One struct so the relay's signature names the
+/// owner contract once.
+struct RelayWiring {
+    out_tx: mpsc::Sender<TaggedLogChunk>,
+    drain: watch::Receiver<bool>,
+    disposition: RelayDisposition,
 }
 
 /// All live-tail subscriptions for one watched build.
@@ -221,6 +282,7 @@ impl LogTailSet {
         if exec_id.is_empty() {
             return;
         }
+        let mut superseded: Option<JoinHandle<()>> = None;
         if let Some(existing) = self.tasks.get(derivation_path) {
             if existing.exec_id == exec_id {
                 return;
@@ -231,26 +293,53 @@ impl LogTailSet {
                 new_exec = %exec_id,
                 "re-dispatch: replacing log-tail subscription"
             );
+            // r[impl sys.epilogue.supersession]
+            // The supersession protocol (bug_168): mark the typed
+            // discard disposition FIRST — the old relay's
+            // PendingGapCell consults it before unwinding, so its Drop
+            // cannot splice the dead execution's withheld lines or a
+            // false gap marker into the successor's stream — then
+            // abort, then hand the JoinHandle to the successor, whose
+            // FIRST act is the bounded join (the build.rs terminus
+            // bound-join discipline, mirrored): the successor
+            // structurally cannot produce output before the
+            // predecessor unwound.
             if let Some(old) = self.tasks.remove(derivation_path) {
+                old.disposition.mark_superseded();
                 old.task.abort();
+                superseded = Some(old.task);
             }
         }
         let (drain_tx, drain_rx) = watch::channel(false);
+        let disposition = RelayDisposition::disclose_at_drop();
         let span = info_span!(
             "log_tail",
             drv = %derivation_path,
             exec_id = %exec_id,
         );
+        let relay = run_tail(
+            self.client.clone(),
+            self.jwt_token.clone(),
+            derivation_path.to_string(),
+            exec_id.to_string(),
+            RelayWiring {
+                out_tx: self.out_tx.clone(),
+                drain: drain_rx,
+                disposition: disposition.clone(),
+            },
+            self.config,
+        );
         let task = tokio::spawn(
-            run_tail(
-                self.client.clone(),
-                self.jwt_token.clone(),
-                derivation_path.to_string(),
-                exec_id.to_string(),
-                self.out_tx.clone(),
-                drain_rx,
-                self.config,
-            )
+            async move {
+                if let Some(pred) = superseded {
+                    // Bound-join the superseded relay before the new
+                    // execution's relay produces a byte (the splice
+                    // window closes here; the bound caps a
+                    // pathological stall only).
+                    let _ = tokio::time::timeout(SUPERSEDED_JOIN_BOUND, pred).await;
+                }
+                relay.await
+            }
             .instrument(span),
         );
         self.tasks.insert(
@@ -259,6 +348,7 @@ impl LogTailSet {
                 exec_id: exec_id.to_string(),
                 drain: drain_tx,
                 task,
+                disposition,
             },
         );
     }
@@ -401,6 +491,10 @@ enum ServeHeal {
 struct PendingGapCell {
     state: Option<PendingGap>,
     out_tx: mpsc::Sender<TaggedLogChunk>,
+    /// The owner-set abort disposition this Drop consults
+    /// (`sys.epilogue.supersession`): disclose at terminus, discard at
+    /// supersession.
+    disposition: RelayDisposition,
 }
 
 impl Drop for PendingGapCell {
@@ -408,6 +502,14 @@ impl Drop for PendingGapCell {
         let Some(p) = self.state.take() else {
             return;
         };
+        if self.disposition.must_discard() {
+            // Superseded (bug_168): the successor relay owns the
+            // output channel now. The dead execution's withheld lines
+            // are stale content and its hole is not a hole in the NEW
+            // execution's log — relaying either would splice into the
+            // retry's client-visible stream. No try_send, no marker.
+            return;
+        }
         // The pending's span is unmarked by invariant: a recorded
         // pending is exactly a hole whose disclosure has not flushed
         // (every accepted/flushed span empties the cell and raises
@@ -426,10 +528,11 @@ impl Drop for PendingGapCell {
 }
 
 impl PendingGapCell {
-    fn new(out_tx: mpsc::Sender<TaggedLogChunk>) -> Self {
+    fn new(out_tx: mpsc::Sender<TaggedLogChunk>, disposition: RelayDisposition) -> Self {
         Self {
             state: None,
             out_tx,
+            disposition,
         }
     }
 
@@ -529,10 +632,14 @@ async fn run_tail(
     jwt_token: Option<String>,
     derivation_path: String,
     exec_id: String,
-    out_tx: mpsc::Sender<TaggedLogChunk>,
-    mut drain: watch::Receiver<bool>,
+    wiring: RelayWiring,
     config: LogTailConfig,
 ) {
+    let RelayWiring {
+        out_tx,
+        mut drain,
+        disposition,
+    } = wiring;
     // The highest line number forwarded to the output channel. `None`
     // until the first line. Survives re-opens — it is the dedup floor
     // that makes the at-least-once store stream exactly-once on the
@@ -555,7 +662,7 @@ async fn run_tail(
     // once — the loop cannot ping-pong on one hole. The lines that
     // arrived past the jump ride along (merged_bug_150) so EVERY exit
     // path can flush them with the disclosure.
-    let mut pending_gap = PendingGapCell::new(out_tx.clone());
+    let mut pending_gap = PendingGapCell::new(out_tx.clone(), disposition);
     // Gaps at line numbers below this have already been disclosed with
     // a marker; never re-mark them.
     let mut accepted_gap_floor: Option<u64> = None;
@@ -1740,6 +1847,128 @@ mod tests {
         h.set.abort_all();
     }
 
+    /// Collect every tagged chunk that arrives within `quiet` of the
+    /// last one (or the start), flattened to `(line_number, text)`.
+    /// For stream-content assertions where ABSENCE matters (W10-BF):
+    /// the window bounds how long a straggler has to splice.
+    async fn collect_window(
+        rx: &mut mpsc::Receiver<TaggedLogChunk>,
+        quiet: Duration,
+    ) -> Vec<(u64, String)> {
+        let mut out = Vec::new();
+        while let Ok(Some(tagged)) = tokio::time::timeout(quiet, rx.recv()).await {
+            for (i, line) in tagged.lines.iter().enumerate() {
+                out.push((
+                    tagged.first_line_number + i as u64,
+                    // Fixture lines and markers are always UTF-8.
+                    String::from_utf8(line.clone()).expect("test lines are UTF-8"),
+                ));
+            }
+        }
+        out
+    }
+
+    /// W10-BF (bug_168, sys.epilogue.supersession): a re-dispatch
+    /// replaces the relay for a NEW execution on the SAME output
+    /// channel. The superseded relay's withheld-gap state must be
+    /// DISCARDED — pre-fix its `PendingGapCell::drop` try_sent the
+    /// dead execution's withheld lines plus a false "durable log gap"
+    /// marker into the retry's client-visible stream at an arbitrary
+    /// later poll (`TaggedLogChunk` carries no exec_id, so the
+    /// consumer cannot filter). The must-DISCLOSE face is asserted in
+    /// the same test: at build terminus the new relay's own pending
+    /// gap still discloses (marker + withheld lines) — supersession
+    /// narrows the disposition, it does not erase the law.
+    // r[verify sys.epilogue.supersession]
+    #[tokio::test]
+    async fn redispatch_discards_superseded_relay_state_terminus_still_discloses() {
+        let mut h = harness().await;
+        // EXEC_A session 1: a chunk past the floor (lines 5-6) — the
+        // jump records a pending gap with the lines WITHHELD, then the
+        // subscription re-opens at the unchanged floor.
+        h.mock.push_script(vec![chunk(5, 2)], SessionEnd::Hold);
+        // EXEC_A session 2 (the gap's one re-open chance): opens and
+        // serves NOTHING (held) — the pending stays recorded.
+        h.mock.push_script(vec![], SessionEnd::Hold);
+        h.set.on_started(DRV, EXEC_A);
+        wait_for("the gap re-open to be requested", || {
+            h.mock.request_count() == 2
+        })
+        .await;
+
+        // Re-dispatch: the derivation restarts under EXEC_B. The old
+        // relay holds withheld lines 5-6 and an undisclosed 0..5 hole.
+        // (EXEC_B's chunks are stamped with ITS exec — the relay drops
+        // foreign-exec chunks, which is orthogonal to this law: the
+        // splice rides the OUTPUT channel, past that filter.)
+        let chunk_b = TailLogChunk {
+            exec_id: EXEC_B.to_string(),
+            ..chunk(0, 2)
+        };
+        h.mock.push_script(vec![chunk_b], SessionEnd::Hold);
+        h.set.on_started(DRV, EXEC_B);
+        wait_for("the replacement subscription to open", || {
+            h.mock.request_count() == 3
+        })
+        .await;
+
+        // The retry stream: exactly EXEC_B's lines. No superseded
+        // lines (numbers >= 5), no gap marker — pre-fix the aborted
+        // relay's Drop spliced both in (the red).
+        let lines = collect_window(&mut h.out_rx, Duration::from_millis(400)).await;
+        let numbers: Vec<u64> = lines.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            numbers,
+            vec![0, 1],
+            "the retry stream must carry ONLY the new execution's lines; \
+             superseded withheld lines / a false gap marker spliced in \
+             (the bug_168 red): {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|(_, t)| t.contains("durable log gap")),
+            "no gap marker may be minted for the superseded execution: {lines:?}"
+        );
+
+        // The must-DISCLOSE face: EXEC_B's own stream now jumps (lines
+        // 10), recording a fresh pending gap...
+        h.mock.push_script(vec![chunk(10, 1)], SessionEnd::Hold);
+        // Session 3 (EXEC_B) is HELD with nothing withheld, so a
+        // second re-dispatch (B -> A') is the cheapest path to a relay
+        // that holds a fresh pending gap at terminus: it also
+        // exercises supersession over an EMPTY cell (a no-op discard).
+        h.set.on_started(DRV, EXEC_A);
+        wait_for("the disclosure-face subscription to open", || {
+            h.mock.request_count() == 4
+        })
+        .await;
+        // Session 4 served chunk(10,1) against a fresh floor 0: gap
+        // 0..10 recorded, line 10 withheld; session 5 (the re-open) is
+        // unscripted (served as an empty close by the mock).
+        wait_for("the gap re-open of the disclosure face", || {
+            h.mock.request_count() >= 5
+        })
+        .await;
+
+        // Build terminus: hard-cancel + bound-join (the build.rs
+        // discipline). The pending gap MUST disclose into the channel.
+        let handles = h.set.abort_all();
+        let _ = tokio::time::timeout(
+            Duration::from_millis(250),
+            futures_util::future::join_all(handles),
+        )
+        .await;
+        let disclosed = collect_window(&mut h.out_rx, Duration::from_millis(400)).await;
+        assert!(
+            disclosed.iter().any(|(_, t)| t.contains("durable log gap")),
+            "terminus must still disclose the live relay's pending gap \
+             (the must-disclose face survives the supersession close): {disclosed:?}"
+        );
+        assert!(
+            disclosed.iter().any(|(n, _)| *n == 10),
+            "terminus must still flush the live relay's withheld lines: {disclosed:?}"
+        );
+    }
+
     /// Rule 4, first half: the terminal signal arriving while the store
     /// still has lines buffered does not race them away — they are
     /// relayed before the subscription closes.
@@ -2519,8 +2748,11 @@ mod tests {
             None,
             DRV.to_string(),
             EXEC_A.to_string(),
-            out_tx,
-            drain_rx,
+            super::RelayWiring {
+                out_tx,
+                drain: drain_rx,
+                disposition: super::RelayDisposition::disclose_at_drop(),
+            },
             test_config(),
         ));
         tokio::time::timeout(Duration::from_secs(2), task)

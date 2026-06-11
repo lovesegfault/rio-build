@@ -264,3 +264,33 @@ unification: every 409 on the lease plane resolves through ONE
 evidence-based re-read resolver (a conflict proves resourceVersion
 movement, never holder change), so a retired optimistic inference
 cannot coexist with the deferral model one function over.
+
+#r("sys.epilogue.supersession")[
+  An owner that replaces a live task with a successor for the SAME
+  output channel MUST pass a typed abort disposition to the
+  superseded task's disclosure machinery BEFORE aborting it:
+  supersession marks must-discard (the successor owns the channel —
+  Drop-time disclosure of the dead task's withheld state is
+  forbidden: no markers, no stale payload), terminus keeps
+  must-disclose, and the supersession site bound-joins the superseded
+  task before the successor produces output. A context-free Drop
+  backstop that cannot distinguish the two dispositions is never a
+  conforming implementation of either.
+]
+
+The gateway log-tail relay is the founding instance (bug_168): the
+re-dispatch path aborted the old execution's relay with no join and
+no disposition, so the aborted relay's drop-disclosure backstop —
+correct at TERMINUS (merged_bug_111) — fired in the supersession
+context too, splicing the superseded execution's withheld lines plus
+a false "durable log gap" marker into the retry's client-visible
+stream at an arbitrary later poll. The repair is the protocol in the
+rule's order: mark must-discard, abort, hand the join to the
+successor whose FIRST act is the bounded join — the successor
+structurally cannot produce output before the predecessor unwound,
+and the disclosure law survives untouched on every terminus path.
+The chunk-stamping alternative (tag relayed chunks with the
+execution id and filter at the consumer) is recorded REJECTED: it
+leaves the splice window open until the filter and obligates every
+present and future consumer; the typed disposition kills the splice
+at its source.
