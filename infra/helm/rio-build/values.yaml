@@ -1648,6 +1648,40 @@ poolDefaults:
   # Pools schedule on small-disk nodes; prod overrides UP here. Raising
   # this grows EVERY builder pod's ephemeral-storage request — check
   # node capacity headroom before bumping.
+  #
+  # MEASURED RULED (live_057-d, 2026-06-11 — the signed A1 record):
+  # fuseCacheBytes STANDS at 50 GiB until the trigger fires. For warm
+  # pods this addend DOMINATES the request — a 1 GiB solve requests
+  # 1×1.5 + 50 + 1 = 52.5 GiB (the incident's measured shape), and at
+  # the 25 GiB defaultDisk the 88.5 GiB default-pod request is 56%
+  # fuse (bind[14-disk-ceiling.sh] — the W10-CQ rows assert these
+  # numbers against the live values). A blind static cut is the
+  # REJECTED alternative: builder input closures are WORKLOAD-shaped,
+  # not script-shaped (contrast fetcherFuseCacheBytes below — a fetch
+  # script's deps, safely small), and an undersized cache re-creates
+  # the documented retry-to-exhaustion poison with no escalation
+  # lane; the cost asymmetry (a wrong cut poisons builds; a wrong
+  # keep wastes placement) demands measurement first.
+  # TRIGGER (owner queue, EX-2 form; the wipe-redeploy window is the
+  # natural application point): p99 per-pod
+  # rio_builder_fuse_cache_bytes_used over a 7-day production soak
+  # < the candidate budget ⇒ drop fuseCacheBytes to ceil(p99 × 1.5).
+  # The occupancy gauge is the cross-plane instrument (statfs-derived
+  # on the fuse-cache dir, landed beside the builder quota sample —
+  # the H9″ record; quoted here, never re-run).
+  # Evidence basis, machine fact — the committed family grep at the
+  # decision base ba21f094c (`rg -o 'rio_builder_fuse_[a-z_]+'
+  # rio-builder/src/ -N | sort -u`; 8 members, NO bytes-resident /
+  # occupancy gauge among them — WHY measurement had to be
+  # commissioned rather than assumed):
+  #   rio_builder_fuse_cache_hits_total
+  #   rio_builder_fuse_cache_misses_total
+  #   rio_builder_fuse_circuit_open
+  #   rio_builder_fuse_fallback_reads_total
+  #   rio_builder_fuse_fetch_bytes_total
+  #   rio_builder_fuse_fetch_duration_seconds
+  #   rio_builder_fuse_index_divergence_total
+  #   rio_builder_fuse_jit_lookup_total
   fuseCacheBytes: 53687091200
   # 4Gi. Fetcher-pod analogue of fuseCacheBytes
   # (`[nodeclaim_pool].fetcher_fuse_cache_bytes`). A FOD's FUSE cache

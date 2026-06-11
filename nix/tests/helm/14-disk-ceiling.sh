@@ -109,3 +109,39 @@ test $(( alloc / old_req )) -eq 2 || {
   echo "  a density INPUT (fuse/log/allocatable) moved; re-derive the table" >&2
   exit 1
 }
+
+# live_057-d (W10-CQ): the fuse-cache MEASURED-RULED record's
+# narration binds. The values.yaml comment at fuseCacheBytes must
+# name the measured trigger's occupancy gauge, carry the warm-pod
+# dominance rows consistent with the LIVE values, and the value
+# itself stands at the ruled 50 GiB until the 7-day p99 trigger
+# fires (the gauge is the cross-plane instrument, landed beside the
+# builder quota sample; quoted here, never re-run).
+test "$fuse" = "53687091200" || {
+  echo "FAIL: poolDefaults.fuseCacheBytes=$fuse B != the RULED 50 GiB" >&2
+  echo "  (53687091200 B). The measured ruling stands until the 7-day p99" >&2
+  echo "  rio_builder_fuse_cache_bytes_used trigger; re-derive the RULED" >&2
+  echo "  record + the W10-CQ/W10-CP rows together before moving it" >&2
+  exit 1
+}
+grep -q 'rio_builder_fuse_cache_bytes_used' values.yaml || {
+  echo "FAIL: the fuse RULED record lost its trigger gauge name" >&2
+  echo "  (rio_builder_fuse_cache_bytes_used — the H9″ instrument)" >&2
+  exit 1
+}
+warm_req=$(( 1073741824 * DEFAULT_HEADROOM_PCT / 100 + fuse + LOG_BUDGET_BYTES ))
+test "$warm_req" = "56371445760" || {
+  echo "FAIL: warm-pod (1 GiB solve) request $warm_req B != the committed" >&2
+  echo "  52.5 GiB row (56371445760 B) — re-derive the dominance rows" >&2
+  exit 1
+}
+grep -q '52.5 GiB' values.yaml || {
+  echo "FAIL: the warm-pod 52.5 GiB dominance row drifted from values.yaml" >&2
+  exit 1
+}
+fuse_share=$(( fuse * 100 / default_req ))
+test "$fuse_share" -eq 56 || {
+  echo "FAIL: fuse share of the default-pod request is ${fuse_share}%, the" >&2
+  echo "  committed dominance row says 56% — re-derive both" >&2
+  exit 1
+}
