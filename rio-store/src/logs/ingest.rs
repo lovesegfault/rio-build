@@ -911,14 +911,29 @@ impl IngestSession {
 
         // Object first, manifest row second: a crash between the two
         // leaves an unreferenced object (collected by the S3 lifecycle
-        // rule), never a manifest row pointing at nothing.
+        // rule), never a manifest row pointing at nothing. Both
+        // inverse failure directions are priced (bug_139): (a) object
+        // durable, row missing — the unreferenced object is invisible
+        // to readers and lifecycle-collected; (b) row durable,
+        // response lost — the retry re-cuts under a FRESH chunk_seq
+        // (below), landing a contained duplicate row, which the
+        // durable account prunes at read (gate::log_seed merges
+        // coverage intervals, so the cap seed never charges the same
+        // lines twice).
         let key = log_chunk_key(&self.drv_hash, &self.exec_id, &self.session_id, seq);
         store.put(&key, blob).await.map_err(CutError::Store)?;
 
         // ON CONFLICT DO NOTHING: the (exec_id, session_id, chunk_seq)
-        // PK makes a re-INSERT after a lost response idempotent. Runtime
-        // query: drv_log_chunks is store-owned (no cross-service
-        // contract to enforce).
+        // PK makes a re-INSERT of the SAME key idempotent — which the
+        // actual retry shape never produces (bug_139): a commit-but-
+        // error cut is re-cut under a freshly burned chunk_seq (the
+        // restored run re-stages at the buffer front), so its
+        // duplicate lands as a CONTAINED row, not a conflict. The
+        // accounting idempotence lives in gate::log_seed's merged-
+        // coverage prune, not here; this clause only screens the
+        // (rarer) exact same-key replay. Runtime query:
+        // drv_log_chunks is store-owned (no cross-service contract to
+        // enforce).
         sqlx::query(
             "INSERT INTO drv_log_chunks \
              (exec_id, session_id, chunk_seq, first_line, line_count, byte_size, s3_key, \

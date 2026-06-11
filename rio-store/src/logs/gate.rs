@@ -117,14 +117,47 @@ pub(super) fn replica_capacity_status(msg: &'static str) -> Status {
 }
 
 /// The execution's durable log account: committed chunk count and
-/// accounted-byte sum. ONE query, run at every open (the gate side) —
-/// the only reader of `drv_log_chunks.accounted_bytes` besides the
-/// cut that writes it.
+/// accounted-byte sum over MERGED COVERAGE, not raw rows (bug_139).
+/// ONE query, run at every open (the gate side) — the only reader of
+/// `drv_log_chunks.accounted_bytes` besides the cut that writes it.
+///
+/// Why merged: a manifest INSERT that commits server-side but
+/// surfaces as an error (lost response, or a watchdog-abandoned cut
+/// dropped post-commit) is re-cut under a freshly burned chunk_seq,
+/// so the write path is at-least-once with per-attempt rekeying —
+/// duplicate rows covering overlapping
+/// `[first_line, first_line + line_count)` are a NORMAL artifact of
+/// that retry shape, and a bare count+sum charges the same lines
+/// once per attempt against the permanent FAILED_PRECONDITION cap
+/// class. The account prunes every row CONTAINED in another row's
+/// interval (deterministic tiebreak on identical intervals), which
+/// is exact merged coverage for every overlap shape the write path
+/// can produce: a failed run is restored to the FRONT of the buffer,
+/// so a same-session re-cut starts at the same first_line and
+/// extends at least as far (a containment chain), and a
+/// cross-session resend starts at the builder's unacked point at or
+/// before the orphan row's start. A true partial overlap is
+/// unproducible by the write path; if one ever lands, both rows
+/// count (a bounded over-count on the overlap tail — conservative
+/// for a cap, never an under-count).
 pub(super) async fn log_seed(pool: &PgPool, exec_id: Uuid) -> Result<(u64, u32), Status> {
-    // Store-owned table → runtime query.
+    // Store-owned table → runtime query. A row is REDUNDANT iff some
+    // other row covers its interval AND is either strictly wider or
+    // (identical interval) orders after it — so exactly one row per
+    // covered interval survives.
     let row: (i64, i64) = sqlx::query_as(
         "SELECT count(*), COALESCE(sum(accounted_bytes), 0)::BIGINT \
-         FROM drv_log_chunks WHERE exec_id = $1",
+           FROM drv_log_chunks r \
+          WHERE r.exec_id = $1 \
+            AND NOT EXISTS ( \
+              SELECT 1 FROM drv_log_chunks o \
+               WHERE o.exec_id = r.exec_id \
+                 AND (o.session_id, o.chunk_seq) <> (r.session_id, r.chunk_seq) \
+                 AND o.first_line <= r.first_line \
+                 AND o.first_line + o.line_count >= r.first_line + r.line_count \
+                 AND (   o.first_line < r.first_line \
+                      OR o.first_line + o.line_count > r.first_line + r.line_count \
+                      OR (o.session_id, o.chunk_seq) > (r.session_id, r.chunk_seq)))",
     )
     .bind(exec_id)
     .fetch_one(pool)
@@ -1107,5 +1140,74 @@ mod tests {
     #[test]
     fn contiguity_short_coverage() {
         assert!(!manifest_covers_contiguously(&[(0, 99)], 100));
+    }
+
+    /// W10-BO (bug_139): a manifest INSERT that commits server-side
+    /// but surfaces as an error (lost response → CutError::Manifest,
+    /// or a watchdog-abandoned cut dropped post-commit) is re-cut
+    /// under a freshly burned chunk_seq — the ON CONFLICT
+    /// (exec, session, seq) idempotence is structurally dead for that
+    /// retry shape, and duplicate rows covering overlapping
+    /// [first_line, first_line + line_count) land in drv_log_chunks.
+    /// The durable account must be total over MERGED coverage, never
+    /// a bare count+sum — at the overlap quantifier: k contained
+    /// duplicates, seed exact. Cells: a k=3 same-start re-cut chain
+    /// (each retry extends the restored staged run), a disjoint
+    /// committed chunk, a cross-session contained orphan resend, and
+    /// an identical-interval pair (the tiebreak: exactly one
+    /// survives).
+    #[tokio::test]
+    async fn log_seed_counts_merged_coverage_not_duplicate_rows() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let exec = Uuid::now_v7();
+        let sess_a = Uuid::now_v7();
+        let sess_b = Uuid::now_v7();
+        let insert = |sess: Uuid, seq: i32, fl: i64, lc: i64, bytes: i64| {
+            let pool = db.pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO drv_log_chunks \
+                     (exec_id, session_id, chunk_seq, first_line, line_count, byte_size, \
+                      s3_key, accounted_bytes) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                )
+                .bind(exec)
+                .bind(sess)
+                .bind(seq)
+                .bind(fl)
+                .bind(lc)
+                .bind(bytes / 2)
+                .bind(format!("k/{sess}/{seq}"))
+                .bind(bytes)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+        // The commit-but-error chain (same session, same start,
+        // growing run): [100,150) ⊂ [100,180) ⊂ [100,200).
+        insert(sess_a, 0, 100, 50, 5_000).await;
+        insert(sess_a, 1, 100, 80, 8_000).await;
+        insert(sess_a, 2, 100, 100, 10_000).await;
+        // A disjoint committed chunk: [0,100).
+        insert(sess_a, 3, 0, 100, 9_000).await;
+        // Cross-session: the orphan [300,400) committed in session A
+        // post-watchdog-drop; the builder reconnected and re-sent the
+        // unacked range wider in session B: [300,440) ⊇ [300,400).
+        insert(sess_a, 4, 300, 100, 7_000).await;
+        insert(sess_b, 0, 300, 140, 9_500).await;
+        // Identical intervals (a same-content re-cut whose retry took
+        // exactly the same run): exactly ONE may count.
+        insert(sess_a, 5, 500, 20, 2_000).await;
+        insert(sess_a, 6, 500, 20, 2_000).await;
+
+        let (bytes, chunks) = log_seed(&db.pool, exec).await.unwrap();
+        assert_eq!(
+            (bytes, chunks),
+            (10_000 + 9_000 + 9_500 + 2_000, 4),
+            "left: the bare count+sum seed inflated by every contained \
+             duplicate (36000+16500 bytes over 8 rows) / right: the seed \
+             equals merged coverage — one survivor per covered interval"
+        );
     }
 }
