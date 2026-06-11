@@ -44,7 +44,8 @@
 # scaledobject deliberately stays Pods-1 (max 8 vs 105). Scale-up has
 # no stabilization — adding a pod is cheap and the failure mode of
 # being late is the store at the floor through a whole substitution
-# wave.
+# wave — but its per-period COMMITMENT is bounded (Pods 16/30s, see
+# the scaleUp block).
 #
 # Kill switch: deleting the ScaledObject freezes replicas at the
 # current count; `store.autoscaling.enabled=false` instead re-renders
@@ -88,7 +89,30 @@ spec:
               value: 1
               periodSeconds: 600
         scaleUp:
+          # D-052-2 (live_052 close). The 0s window is PRESERVED on
+          # purpose: a post-wipe warm wave must start scaling the
+          # moment the leading backlog signal fires — stabilization
+          # delay here is the failure mode the trigger exists to
+          # avoid. What live_052 showed is that the un-policied
+          # scale-up commits the WHOLE ask in one HPA pass: the
+          # raw-backlog signal took desired 4→173 in 75s against a
+          # ~46-node hostable ceiling, leaving 133 pods structurally
+          # unschedulable and Karpenter churning node mints against
+          # the rio-general pool limit. The Pods policy bounds the
+          # per-period commitment instead of delaying it: 16 pods per
+          # 30s still covers the modeled post-wipe ask (~12 replicas)
+          # in a single period and walks 2→46 in ~90s, but a gauge
+          # spike or a mis-derived ceiling can no longer fleet-commit
+          # in one pass. (Round-9 admission doctrine A-3: a leading
+          # signal MAY lead, but its per-period commitment MUST be
+          # bounded; the ceiling clamp is xtask derive_store_ceiling's
+          # min(pg, hostable) arm.)
+          # nix/tests/helm/26-store-scaling.sh pins window + policy.
           stabilizationWindowSeconds: 0
+          policies:
+            - type: Pods
+              value: 16
+              periodSeconds: 30
   triggers:
     # Substitution backlog (leading, class 1). AverageValue: KEDA
     # divides the fleet-wide backlog by the current replica count, so

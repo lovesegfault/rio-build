@@ -136,6 +136,21 @@ test "$sd" = "1800" && test "$su" = "0" || {
   echo "FAIL: store ScaledObject stabilization scaleDown/scaleUp = $sd/$su, expected 1800/0" >&2
   exit 1
 }
+# D-052-2: scale-up keeps the 0s window (a post-wipe wave must scale
+# out the moment the leading signal fires) but the per-period
+# COMMITMENT is bounded: Pods 16 / 30s. live_052's raw-backlog signal
+# asked 4→173 replicas in 75s against a ~46-node hostable ceiling —
+# 133 pods structurally unschedulable. One Pods policy, exactly.
+sup=$(yq -N 'select(.kind=="ScaledObject" and .metadata.name=="rio-store") | .spec.advanced.horizontalPodAutoscalerConfig.behavior.scaleUp.policies' "$out")
+grep -q 'type: Pods' <<<"$sup" && grep -q 'value: 16' <<<"$sup" && grep -q 'periodSeconds: 30' <<<"$sup" || {
+  echo "FAIL: store scaleUp lost the Pods-16/30s policy — an unbounded scale-up commits the whole ceiling in one HPA pass (live_052)" >&2
+  exit 1
+}
+n_sup=$(grep -c 'type: ' <<<"$sup" || true)
+test "$n_sup" -eq 1 || {
+  echo "FAIL: expected exactly 1 scaleUp policy (Pods 16/30s), got $n_sup — a second policy under the default selectPolicy Max would defeat the bound" >&2
+  exit 1
+}
 sdp=$(yq -N 'select(.kind=="ScaledObject" and .metadata.name=="rio-store") | .spec.advanced.horizontalPodAutoscalerConfig.behavior.scaleDown' "$out")
 grep -q 'selectPolicy: Max' <<<"$sdp" || {
   echo "FAIL: store scaleDown lost selectPolicy: Max — with multiple policies the HPA default must be explicit" >&2

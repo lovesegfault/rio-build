@@ -188,13 +188,40 @@ spec:
           # passes during scheduler cold-start. /readyz: 503 until
           # scheduler admin client connected. Already plaintext HTTP —
           # no TLS retarget needed.
+          #
+          # D-054-1a probe hardening (the rev-5 live values, made
+          # durable — helm's three-way merge reverts chart-rendered
+          # drift, so the kubectl overlay dies at the next upgrade).
+          # live_054: /healthz is an axum task on the SHARED tokio
+          # runtime; a 13-21s reconciler stall under admitted load
+          # reads as sensor silence, and at timeoutSeconds 1 /
+          # failureThreshold 3 kubelet killed a healthy singleton 5×
+          # — each restart re-firing the cold-start load that caused
+          # the stall. Liveness now tolerates 60s of silence (6×10s,
+          # 10s timeout) before the kill verdict; the startupProbe
+          # mirrors /healthz with a 30×2s boot budget so the hardened
+          # liveness clock never gates first boot. Readiness is
+          # shed-wired (failure only removes the pod from Endpoints),
+          # so it stays tighter at 5s. Structural honesty: a
+          # kill-wired probe served from the guarded runtime is still
+          # the wrong failure domain (round-9 banner B / D3) — this
+          # block converts brief starvation from kill-loop into
+          # delay until guard isolation lands.
+          # nix/tests/helm/40-controller-probes.sh pins these values.
           readinessProbe:
             httpGet: {path: /readyz, port: health}
             periodSeconds: 5
+            timeoutSeconds: 5
           livenessProbe:
             httpGet: {path: /healthz, port: health}
             periodSeconds: 10
-            failureThreshold: 3
+            timeoutSeconds: 10
+            failureThreshold: 6
+          startupProbe:
+            httpGet: {path: /healthz, port: health}
+            periodSeconds: 2
+            timeoutSeconds: 10
+            failureThreshold: 30
           resources:
             {{- toYaml $c.resources | nindent 12 }}
       volumes:
