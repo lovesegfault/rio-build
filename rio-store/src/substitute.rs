@@ -379,6 +379,63 @@ pub(crate) fn substitute_error_evidence(
     }
 }
 
+/// The owner-side placeholder cleanup posture after a failed
+/// substitute leg (bug_108): TOTAL over [`SubstituteError`] — derived
+/// from the TYPE, never re-decided positionally at a fold (the
+/// `HoldDeadlineExceeded` defect: the variant was minted for exactly
+/// the adversarial-trickle population, the in-file classifier mapped
+/// it to the same `C::Stalled` posture and CLAIMED "the typed Rust
+/// variant preserves the distinction at every in-crate consumer" —
+/// but the cleanup fold's generic arm silently absorbed it: row
+/// deleted, strike lost, metric unfired, next attempt restarted at
+/// `stall_count = 0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CleanupPosture {
+    /// Release the claim IN PLACE (claim cleared, progress NULLed,
+    /// durable `stall_count += 1`, `stale_reclaimed{stall_abort}`
+    /// emitted, row survives for immediate re-claim) — the
+    /// stall-family posture: the path is fine, the
+    /// infrastructure/transfer stalled, and the evidence must
+    /// accumulate across owners.
+    StrikeReleaseInPlace,
+    /// Delete the placeholder (claim-gated abort) — the default for
+    /// integrity/refusal/transient failures with no stall evidence to
+    /// preserve.
+    Abort,
+}
+
+// r[impl store.substitute.stall-abort+2]
+/// THE one exhaustive `SubstituteError` → [`CleanupPosture`] hop —
+/// the same shape as [`substitute_error_evidence`] one decision over:
+/// NO catch-all, so a new variant forces a compile-time posture
+/// decision HERE instead of falling silently to whichever arm a fold
+/// author wrote last (R22's fold-site axis; the negative census is
+/// "no `_ =>` over a closed error alphabet at a posture decision").
+// census[test: cleanup_posture_is_total_and_strike_parity]
+pub(crate) fn cleanup_posture(e: &SubstituteError) -> CleanupPosture {
+    use CleanupPosture as P;
+    match e {
+        // The per-read stall and the hold-deadline expiry are the SAME
+        // operational posture (the classifier's sentence, now true at
+        // this consumer too): integral progress fell below the typed
+        // floor — strike, release in place, keep the row claimable.
+        SubstituteError::Stalled { .. } => P::StrikeReleaseInPlace,
+        SubstituteError::HoldDeadlineExceeded { .. } => P::StrikeReleaseInPlace,
+        SubstituteError::Raced
+        | SubstituteError::RateLimited { .. }
+        | SubstituteError::TenantBudgetExhausted { .. }
+        | SubstituteError::Admission(_)
+        | SubstituteError::Fetch(_)
+        | SubstituteError::NarInfo(_)
+        | SubstituteError::HashMismatch { .. }
+        | SubstituteError::SizeMismatch { .. }
+        | SubstituteError::TooLarge { .. }
+        | SubstituteError::Ingest(_)
+        | SubstituteError::UntrustedPresent
+        | SubstituteError::ContentMismatch => P::Abort,
+    }
+}
+
 /// Result of probing one upstream for one path. Disambiguates the three
 /// "no PathInfo" outcomes that `Option<ValidatedPathInfo>` collapsed:
 /// `Miss` (try next upstream), `Raced` (another uploader holds the
@@ -2188,54 +2245,69 @@ impl Substituter {
                     ingested_bytes,
                 })
             }
-            // r[impl store.substitute.stall-abort+2]
-            // Owner-side stall abort: release the claim IN PLACE —
-            // claim cleared, progress NULLed, durable stall_count
-            // incremented — instead of deleting the row, so the next
-            // attempt re-claims immediately and the stall evidence
-            // survives. Claim-guarded: a competing stall-reclaim that
-            // already took the row over wins, and this release matches
-            // zero rows — one stall event, exactly one strike.
-            Err(e @ SubstituteError::Stalled { .. }) => {
+            Err(e) => {
                 placeholder_guard.defuse();
-                match metadata::release_placeholder_in_place(&self.pool, &store_path_hash, claim)
-                    .await
-                {
-                    Ok(released) => {
-                        warn!(
-                            %store_path,
-                            claim_id = %claim,
-                            released,
-                            window = ?self.stall_window,
-                            "substitute: download stalled — claim released in place"
-                        );
-                        if released {
-                            metrics::counter!(
-                                SUBSTITUTE_HOOKS.stale_reclaimed_metric,
-                                "reason" => crate::ingest::STALE_RECLAIM_STALL_ABORT
-                            )
-                            .increment(1);
+                // bug_108: the posture is derived from the TYPE
+                // ([`cleanup_posture`], rustc-exhaustive), never
+                // re-decided positionally here — pre-fix this fold
+                // matched `Stalled` by name and its generic arm
+                // silently absorbed `HoldDeadlineExceeded` (row
+                // deleted, strike lost, metric unfired).
+                match cleanup_posture(&e) {
+                    // r[impl store.substitute.stall-abort+2]
+                    // Owner-side stall-family abort: release the claim
+                    // IN PLACE — claim cleared, progress NULLed,
+                    // durable stall_count incremented — instead of
+                    // deleting the row, so the next attempt re-claims
+                    // immediately and the stall evidence survives.
+                    // Claim-guarded: a competing stall-reclaim that
+                    // already took the row over wins, and this release
+                    // matches zero rows — one stall event, exactly one
+                    // strike.
+                    CleanupPosture::StrikeReleaseInPlace => {
+                        match metadata::release_placeholder_in_place(
+                            &self.pool,
+                            &store_path_hash,
+                            claim,
+                        )
+                        .await
+                        {
+                            Ok(released) => {
+                                warn!(
+                                    %store_path,
+                                    claim_id = %claim,
+                                    released,
+                                    error = %e,
+                                    "substitute: stall-family abort — claim released in place"
+                                );
+                                if released {
+                                    metrics::counter!(
+                                        SUBSTITUTE_HOOKS.stale_reclaimed_metric,
+                                        "reason" => crate::ingest::STALE_RECLAIM_STALL_ABORT
+                                    )
+                                    .increment(1);
+                                }
+                            }
+                            Err(release_err) => {
+                                // The release failed (DB error): fall back to
+                                // the claim-gated delete so the row cannot wedge
+                                // the path until heartbeat death. Strike lost —
+                                // availability over evidence.
+                                warn!(%store_path, error = %release_err,
+                                    "substitute: stall release failed; falling back to abort");
+                                ingest::abort_placeholder(&self.pool, &store_path_hash, claim)
+                                    .await;
+                            }
                         }
                     }
-                    Err(release_err) => {
-                        // The release failed (DB error): fall back to
-                        // the claim-gated delete so the row cannot wedge
-                        // the path until heartbeat death. Strike lost —
-                        // availability over evidence.
-                        warn!(%store_path, error = %release_err,
-                            "substitute: stall release failed; falling back to abort");
+                    CleanupPosture::Abort => {
+                        // Abort synchronously so the next upstream in
+                        // `do_substitute`'s loop sees a clean slate
+                        // (the guard's tokio::spawn fires too late for
+                        // that). threshold=None: our placeholder.
                         ingest::abort_placeholder(&self.pool, &store_path_hash, claim).await;
                     }
                 }
-                Err(e)
-            }
-            Err(e) => {
-                // Defuse the drop-guard and abort synchronously so the
-                // next upstream in `do_substitute`'s loop sees a clean
-                // slate (the guard's tokio::spawn fires too late for
-                // that). threshold=None: our placeholder.
-                placeholder_guard.defuse();
-                ingest::abort_placeholder(&self.pool, &store_path_hash, claim).await;
                 Err(e)
             }
         }
@@ -7653,6 +7725,140 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// bug_108 census (R22 fold-site axis): the posture hop is TOTAL
+    /// by rustc exhaustiveness (the generator — no `_ =>` arm exists
+    /// at the decision site), and the strike-parity cell the defect
+    /// silently dropped is pinned: the hold-deadline expiry carries
+    /// EXACTLY the per-read stall's posture (the in-file classifier's
+    /// own sentence, now true at the cleanup consumer too).
+    #[test]
+    fn cleanup_posture_is_total_and_strike_parity() {
+        use std::time::Duration;
+        assert_eq!(
+            cleanup_posture(&SubstituteError::HoldDeadlineExceeded {
+                declared: 1,
+                hold_budget: Duration::from_secs(1),
+            }),
+            CleanupPosture::StrikeReleaseInPlace,
+            "the envelope abort must keep the strike plane (bug_108)"
+        );
+        assert_eq!(
+            cleanup_posture(&SubstituteError::Stalled {
+                window: Duration::from_secs(1)
+            }),
+            CleanupPosture::StrikeReleaseInPlace,
+        );
+        // Representative Abort cells across the non-stall families
+        // (integrity / refusal / transient): the posture fn names
+        // every variant — a new variant fails compilation there, not
+        // silently here.
+        assert_eq!(
+            cleanup_posture(&SubstituteError::Raced),
+            CleanupPosture::Abort
+        );
+        assert_eq!(
+            cleanup_posture(&SubstituteError::HashMismatch {
+                expected: String::new(),
+                got: String::new(),
+            }),
+            CleanupPosture::Abort
+        );
+        assert_eq!(
+            cleanup_posture(&SubstituteError::Ingest(String::new())),
+            CleanupPosture::Abort
+        );
+    }
+
+    // r[verify store.substitute.stall-abort+2]
+    // W9-BJ (R16 statement): a hold-deadline abort STRIKES + emits +
+    // leaves the row reclaimable — full parity with the per-read
+    // stall (the classifier's claim as the oracle). Driven through
+    // the production persist-gate black hole (the same machinery as
+    // W8-B′), then the row state and the immediate re-claim are
+    // asserted durably.
+    /// RED pre-fix (verbatim in the landing commit): the deadline
+    /// abort fell to the generic delete arm — the manifests row was
+    /// GONE (count 0), no strike survived, and the re-claim went
+    /// through a fresh insert at `stall_count = 0`.
+    #[tokio::test]
+    async fn hold_deadline_abort_strikes_and_leaves_the_row_reclaimable() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "bw9s5-bj").await;
+        let (path, nar) = make_path();
+        let fake = spawn_flex_upstream(&path, nar.clone(), "cache.bw9bj", FlexCfg::default()).await;
+        insert_flex(&db.pool, tid, &fake, 50).await;
+        let stall = Duration::from_millis(100);
+        let charge = (nar.len() as u64).max(MIN_NAR_CHUNK_CHARGE as u64) as usize;
+        let budget = Arc::new(Semaphore::new(charge));
+        let persist_gate = Arc::new(tokio::sync::Notify::new());
+        let sub = Arc::new(
+            test_substituter(db.pool.clone())
+                .with_nar_bytes_budget(Arc::clone(&budget))
+                .with_stall_window(stall)
+                .with_persist_gate(persist_gate.clone()),
+        );
+        let deadline_bound = stall * NAR_HOLD_GRACE_FACTOR
+            + Duration::from_secs(nar.len() as u64 / NAR_HOLD_FLOOR_RATE);
+
+        let got = tokio::time::timeout(deadline_bound * 10, {
+            let s = Arc::clone(&sub);
+            let p = path.clone();
+            async move { drive_upstream(&s, tid, &p).await }
+        })
+        .await
+        .expect("the hold deadline must cancel the black-holed persist");
+        assert!(
+            matches!(got, Err(SubstituteError::HoldDeadlineExceeded { .. })),
+            "typed envelope abort expected, got {got:?}"
+        );
+
+        // THE bug_108 assertions: the row SURVIVES released-in-place
+        // with the strike recorded — not deleted.
+        let sp_hash: [u8; 32] = sha2::Sha256::digest(path.as_bytes()).into();
+        let row: Option<(String, Option<uuid::Uuid>, i16)> = sqlx::query_as(
+            "SELECT status, claim_id, stall_count FROM manifests WHERE store_path_hash = $1",
+        )
+        .bind(&sp_hash[..])
+        .fetch_optional(&db.pool)
+        .await
+        .expect("row query");
+        let (status, claim_id, stall_count) = row.expect(
+            "the manifests row must SURVIVE a hold-deadline abort \
+             (released in place, not deleted) — bug_108's lost arm",
+        );
+        assert_eq!(status, "uploading");
+        assert!(claim_id.is_none(), "claim released in place");
+        assert_eq!(stall_count, 1, "the strike must be durable");
+
+        // Immediate re-claim (the released-row arm — no threshold):
+        // the next attempt picks the slot up at once with the stall
+        // evidence preserved.
+        let reclaim = crate::ingest::claim_placeholder(
+            &db.pool,
+            &sp_hash,
+            &path,
+            &[],
+            crate::ingest::IngestHooks {
+                stale_reclaimed_metric: "rio_store_substitute_stale_reclaimed_total",
+                ctx_label: "bw9s5-bj",
+            },
+            None,
+        )
+        .await
+        .expect("re-claim query");
+        assert!(
+            matches!(reclaim, crate::ingest::PlaceholderClaim::Owned(_)),
+            "released row must be immediately re-claimable"
+        );
+        let preserved: i16 =
+            sqlx::query_scalar("SELECT stall_count FROM manifests WHERE store_path_hash = $1")
+                .bind(&sp_hash[..])
+                .fetch_one(&db.pool)
+                .await
+                .expect("stall_count query");
+        assert_eq!(preserved, 1, "re-claim preserves the stall evidence");
     }
 
     // r[verify store.put.nar-bytes-budget+5]
