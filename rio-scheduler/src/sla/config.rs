@@ -4,7 +4,7 @@
 //! block (helm renders it from chart defaults; tests use
 //! [`SlaConfig::test_default`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -1046,14 +1046,36 @@ impl SlaConfig {
         // ladder guarantees the walk has rungs — otherwise a price
         // gap > τ would silently strand the intent on a single rung
         // and ICE evidence would have nowhere to advance it (the
-        // live_050 hang's structural exposure). Derived from RETAINED
-        // classes only (a stripped producer cell is already a
-        // regression signal, not a closure seed). Deterministic append
-        // order: retained-cell order × declared-rung order × the
-        // class's capacity_types order; dedup against everything
-        // already present.
-        let parents: Vec<HwClassName> = out.iter().map(|(h, _)| h.clone()).collect();
-        for parent in parents {
+        // live_050 hang's structural exposure).
+        //
+        // merged_bug_101: the derivation is a WORKLIST FIXPOINT — a
+        // rung class that JOINS the closure enqueues once (walked-set
+        // cycle guard) and its own declared ladder is walked in turn,
+        // so a declared multi-generation chain (g8→g7→g6) can never
+        // silently truncate (pre-fix `parents` was snapshotted before
+        // any rung joined: one level only, and the operator's
+        // declared tail was dead config in exactly the
+        // multi-generation capacity event the ladder exists for —
+        // the §5-S graceful-degradation directive). Seeds are the
+        // RETAINED classes only (a stripped producer cell is already
+        // a regression signal, not a closure seed); an UNHOSTABLE
+        // rung's ladder is NOT walked (it is not a member — the
+        // closure expands over MEMBERS, never over the declared graph
+        // at large). Deterministic append order: breadth-first —
+        // retained-cell order × declared-rung order × the rung's
+        // capacity_types order; dedup against everything already
+        // present.
+        let mut walked: HashSet<HwClassName> = HashSet::new();
+        let mut queue: Vec<HwClassName> = Vec::new();
+        for (h, _) in &out {
+            if walked.insert(h.clone()) {
+                queue.push(h.clone());
+            }
+        }
+        let mut qi = 0;
+        while qi < queue.len() {
+            let parent = queue[qi].clone();
+            qi += 1;
             let Some(ladder) = self.hw_classes.get(&parent).and_then(|d| d.ladder.as_ref()) else {
                 continue;
             };
@@ -1079,6 +1101,14 @@ impl SlaConfig {
                     if hosts(&rung.class, cap).is_some_and(|(a, f, s, c, _)| a && f && s && c) {
                         out.push(cell);
                     }
+                }
+                // The rung class joins the WALK iff it is a closure
+                // MEMBER (≥1 of its cells in `out` — whether pushed
+                // just now or already present from the producer set);
+                // the walked-set makes every class enqueue at most
+                // once, so declared cycles terminate.
+                if out.iter().any(|(h, _)| h == &rung.class) && walked.insert(rung.class.clone()) {
+                    queue.push(rung.class.clone());
                 }
             }
         }
@@ -3204,6 +3234,91 @@ mod tests {
                 ("parent-g7".into(), CapacityType::Od),
             ],
             "already-present rung cell not duplicated"
+        );
+    }
+
+    // r[verify ctrl.nodeclaim.capacity-ladder]
+    /// **W10-AE (merged_bug_101)** — *a closure is a fixpoint: a
+    /// declared multi-generation chain (g8→g7→g6) expands
+    /// TRANSITIVELY — the law's own quantifier is ≥2 transitions* (the
+    /// flat one-transition sibling above is kept but NOT load-bearing
+    /// for this property). Pre-fix `parents` was snapshotted from the
+    /// retained cells before any rung joined, so a rung class's own
+    /// declared ladder was never walked: the operator's declared g6
+    /// fallback was silently dead config in exactly the
+    /// multi-generation capacity event the ladder exists for (the
+    /// graceful-degradation directive: a declared fallback chain is
+    /// never silently dead). Cycle-guard pinned: a rung pointing BACK
+    /// at its parent re-walks nothing (each class enqueues at most
+    /// once).
+    #[test]
+    fn ladder_closure_is_a_transitive_fixpoint() {
+        let cat = super::super::catalog::CatalogCeilings::new();
+        let mut cfg = base();
+        let rungs_of = |classes: &[&str]| {
+            Some(CapacityLadder {
+                rungs: classes
+                    .iter()
+                    .map(|c| LadderRung { class: (*c).into() })
+                    .collect(),
+            })
+        };
+        let mut g8 = test_def("rio.build/hw-band", "g8");
+        g8.ladder = rungs_of(&["gen-g7"]);
+        let mut g7 = test_def("rio.build/hw-band", "g7");
+        g7.ladder = rungs_of(&["gen-g6"]);
+        let g6 = test_def("rio.build/hw-band", "g6");
+        cfg.hw_classes = HashMap::from([
+            ("gen-g8".into(), g8),
+            ("gen-g7".into(), g7),
+            ("gen-g6".into(), g6),
+        ]);
+        let kept = cfg.retain_hosting_cells(
+            vec![("gen-g8".into(), CapacityType::Od)],
+            "x86_64-linux",
+            (1, 0),
+            &[],
+            &cat,
+            base_global(),
+            None,
+        );
+        assert!(
+            kept.contains(&("gen-g7".into(), CapacityType::Od)),
+            "first transition: g7 joins (the flat law); got {kept:?}"
+        );
+        assert!(
+            kept.contains(&("gen-g6".into(), CapacityType::Od)),
+            "SECOND transition: the rung's own declared ladder is \
+             walked — g6 joins the closure (pre-fix: the operator's \
+             declared g8→g7→g6 chain was silently truncated at g7); \
+             got {kept:?}"
+        );
+        // Cycle guard: g6 declares g8 (a back-edge). The walk
+        // terminates and adds nothing new (every class already
+        // walked once).
+        let mut g6_cyclic = test_def("rio.build/hw-band", "g6");
+        g6_cyclic.ladder = rungs_of(&["gen-g8"]);
+        cfg.hw_classes.insert("gen-g6".into(), g6_cyclic);
+        let kept_cyclic = cfg.retain_hosting_cells(
+            vec![("gen-g8".into(), CapacityType::Od)],
+            "x86_64-linux",
+            (1, 0),
+            &[],
+            &cat,
+            base_global(),
+            None,
+        );
+        // Termination is the guarded property; the back-edge's
+        // CONTRIBUTION is legitimate closure growth — g6's declared
+        // fallback to g8 adds the parent's OTHER capacity cell
+        // ((g8, Spot); the producer had emitted only (g8, Od)).
+        // Every class walked exactly once.
+        let mut want_cyclic = kept.clone();
+        want_cyclic.push(("gen-g8".into(), CapacityType::Spot));
+        assert_eq!(
+            kept_cyclic, want_cyclic,
+            "a declared cycle terminates after one walk per class, \
+             with the back-edge's cells joined"
         );
     }
 
