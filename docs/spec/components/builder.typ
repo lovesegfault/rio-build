@@ -1394,7 +1394,7 @@ materialization failures.
       one build's input-closure Directory DAG],
 
     src("rio-builder/src/castore_fuse/tree.rs"),
-    [Mount-time Directory-DAG prefetch + content-addressed inode table],
+    [Mount-time Directory-DAG prefetch + sequentially allocated, content-deduped inode table],
 
     src("rio-builder/src/castore_fuse/open.rs"),
     [`open()` data path: backing-cache broker (whole-file ReadBlob fill,

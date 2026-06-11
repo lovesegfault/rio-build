@@ -311,6 +311,7 @@ in
   # r[verify builder.fs.shared-backing-cache]
   # r[verify builder.fs.io-uring-transport]
   # r[verify builder.fs.io-uring-required]
+  # r[verify builder.fs.castore-inode-digest+2]
   vm-castore-fuse = castore-fuse.mkTest {
     fixture = standalone {
       # P0560 stopgap (implies HMAC, so the store can verify the

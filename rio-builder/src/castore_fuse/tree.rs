@@ -9,16 +9,18 @@
 //! Chunk coordinates are NOT prefetched — `open()` resolves them
 //! server-side via `ReadBlob`/`StatBlob` keyed on `file_digest` alone.
 //!
-//! Inode identity is split by node kind: files and symlinks are
-//! content-derived (identical bytes anywhere in the closure share one
-//! inode — legal hardlink semantics, reported via `st_nlink`), while
-//! directories are PATH-derived (each alias of a content-deduped
+//! Inode numbers are small sequential values allocated during the tree
+//! build (they must fit a non-LFS 32-bit payload's ino_t; see
+//! [`InoAlloc`]), with identity split by node kind: files and symlinks
+//! are content-deduped (identical bytes anywhere in the closure share
+//! one inode — legal hardlink semantics, reported via `st_nlink`),
+//! while directories are PATH-unique (each alias of a content-deduped
 //! `Directory` body gets its own inode — POSIX forbids hardlinked
 //! directories, and serving them desyncs tree walkers; see
-//! [`dir_ino`]). The decoded `Directory` bodies, the backing cache,
-//! and the chunk store all stay content-deduped — only the runtime
-//! inode numbers multiply, so heap scales with the closure's path
-//! count rather than its content count.
+//! [`InoAlloc::dir`]). The decoded `Directory` bodies, the backing
+//! cache, and the chunk store all stay content-deduped — only the
+//! runtime inode numbers multiply, so heap scales with the closure's
+//! path count rather than its content count.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, UNIX_EPOCH};
@@ -109,9 +111,9 @@ pub struct InoMap {
     /// (aliases of a content-deduped body each get their own).
     /// Precomputed at build so the metadata hot path
     /// (`lookup`/`readdir`, the bulk of a cold `find` over the
-    /// closure) never re-derives a child ino (a blake3 hash each) and
-    /// never scans a child list — both showed up as ~11% of
-    /// serve-thread CPU before this index existed.
+    /// closure) never scans a child list — that scan (plus the child
+    /// ino re-derivation the old blake3 scheme needed) showed up as
+    /// ~11% of serve-thread CPU before this index existed.
     children: HashMap<u64, DirChildren>,
     /// `FUSE_ROOT_ID`'s children: store-path basename → child ino.
     /// `BTreeMap` so `readdir(ROOT)` enumerates in a stable order
@@ -135,10 +137,10 @@ struct DirChildren {
     /// exactly one (parent, name) edge.
     parent_ino: u64,
     /// The `Directory` body's canonical order (directories, files,
-    /// symlinks) with each child's derived ino — `readdir`'s stable
+    /// symlinks) with each child's allocated ino — `readdir`'s stable
     /// enumeration, offset-resumable because the order never changes.
     entries: Vec<(Vec<u8>, u64, FileType)>,
-    /// `lookup(parent, name)` probe: name → derived ino.
+    /// `lookup(parent, name)` probe: name → allocated ino.
     by_name: HashMap<Vec<u8>, u64>,
     /// `st_nlink`: 2 + subdirectory count (`.`, the parent's entry,
     /// and one `..` per subdirectory) — the convention fts' leaf-count
@@ -146,67 +148,89 @@ struct DirChildren {
     nlink: u32,
 }
 
-// ── Inode derivation (ADR §2.3) ───────────────────────────────────────
+// ── Inode allocation (ADR §2.3) ──────────────────────────────────────
 //
-// `h` = low 63 bits of blake3 with bit 63 set, so every derived ino is
-// ≥ 2^63 and can never collide with `FUSE_ROOT_ID` (= 1). The three
-// node kinds hash domain-separated inputs (33 raw bytes / "d"-prefixed
-// path edge / "l"-prefixed target), so one kind can only alias another
-// through a blake3 preimage. A 63-bit collision between two distinct
-// nodes is ~2^-63 per pair over a ~572k-ino whole-store tree and would
-// surface as one file's content served for another's path — caught by
-// the build's own output-hash check.
+// Inos are small sequential numbers handed out during the one-shot
+// `from_parts` walk — counter from `FUSE_ROOT_ID + 1` — NOT digest
+// hashes. The production pools advertise 32-bit build payloads
+// (i686-linux), and a non-LFS 32-bit glibc binary gets EOVERFLOW from
+// stat()/readdir() for any st_ino above 2^32; the previous scheme (low
+// 63 bits of blake3 with bit 63 forced) put every ino at ≥ 2^63. The
+// dedup classes are preserved by keying the allocator: same class →
+// same ino, so icache/nlink/page-cache semantics are unchanged. No ino
+// is ever persisted outside FUSE replies, so the numbering being
+// per-mount (allocation-order-dependent) is unobservable.
 
-fn h(input: &[u8]) -> u64 {
-    let d = *blake3::hash(input).as_bytes();
-    let lo = u64::from_le_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]]);
-    lo | (1 << 63)
+/// Sequential ino allocator for one tree build. Dedup classes:
+/// files key on (content digest, executable bit), symlinks on target
+/// bytes, directories are one fresh ino per PATH (never deduped —
+/// content-shared directory inos are hardlinked-directory semantics,
+/// which POSIX forbids and which desync fts-based tree walkers; see
+/// [`InoAlloc::dir`]).
+// r[impl builder.fs.castore-inode-digest+2]
+struct InoAlloc {
+    next: u64,
+    /// (file_digest, executable) → ino. The executable bit is part of
+    /// the key because `st_mode` is per-inode in VFS — two paths
+    /// sharing an inode share their mode. Both inodes still resolve to
+    /// the same backing-cache file (keyed by `file_digest` alone), so
+    /// the split costs one extra `struct inode`, not a second fetch.
+    files: HashMap<([u8; 32], bool), u64>,
+    /// symlink target bytes → ino.
+    symlinks: HashMap<Vec<u8>, u64>,
 }
 
-/// `ino(FileEntry) = h(file_digest ‖ executable)`. The executable bit
-/// is part of the key because `st_mode` is per-inode in VFS — two
-/// paths sharing an inode share their mode. Both inodes still resolve
-/// to the same backing-cache file (keyed by `file_digest` alone), so
-/// the split costs one extra `struct inode`, not a second fetch.
-// r[impl builder.fs.castore-inode-digest+1]
-pub fn file_ino(file_digest: &[u8; 32], executable: bool) -> u64 {
-    let mut buf = [0u8; 33];
-    buf[..32].copy_from_slice(file_digest);
-    buf[32] = u8::from(executable);
-    h(&buf)
-}
+impl InoAlloc {
+    fn new() -> Self {
+        Self {
+            next: INodeNo::ROOT.0 + 1,
+            files: HashMap::new(),
+            symlinks: HashMap::new(),
+        }
+    }
 
-/// `ino(DirectoryEntry) = h("d" ‖ parent_ino LE ‖ name)` — PATH
-/// identity, not content. Content-deduping directory inos (the old
-/// `h(dir_digest)` scheme) gave one inode to every alias of an
-/// identical subtree — hardlinked-directory semantics, which
-/// POSIX/Linux forbid (`link(2)` on a directory is EPERM) precisely
-/// because multiple parents break tree walkers: the kernel holds ONE
-/// dentry for the shared inode and re-parents it whenever a concurrent
-/// walk takes a different alias, so GNU find's fts — ascending via
-/// `openat(fd, "..")` and comparing (dev, ino) against the remembered
-/// parent — sees a mismatch, fabricates ENOENT, and aborts with zero
-/// failing syscalls. Per-path inos restore the single-parent
-/// invariant; the decoded body, backing cache, and chunks stay deduped
-/// by digest. Roots hang under `FUSE_ROOT_ID`:
-/// `dir_ino(INodeNo::ROOT.0, basename)`.
-// r[impl builder.fs.castore-inode-digest+1]
-pub fn dir_ino(parent_ino: u64, name: &[u8]) -> u64 {
-    let mut buf = Vec::with_capacity(1 + 8 + name.len());
-    buf.push(b'd');
-    buf.extend_from_slice(&parent_ino.to_le_bytes());
-    buf.extend_from_slice(name);
-    h(&buf)
-}
+    fn fresh(next: &mut u64) -> u64 {
+        let ino = *next;
+        *next += 1;
+        ino
+    }
 
-/// `ino(SymlinkEntry) = h("l" ‖ target)`. The `"l"` prefix separates
-/// the symlink domain from a hypothetical 32-byte target that could
-/// otherwise alias a dir digest.
-pub fn symlink_ino(target: &[u8]) -> u64 {
-    let mut buf = Vec::with_capacity(1 + target.len());
-    buf.push(b'l');
-    buf.extend_from_slice(target);
-    h(&buf)
+    /// Same (digest, exec) anywhere in the closure → same ino: the
+    /// kernel's icache holds one `struct inode`, one `open()` upcall
+    /// fetches the bytes once, one `BACKING_OPEN` binds them to one
+    /// page-cache.
+    fn file(&mut self, file_digest: [u8; 32], executable: bool) -> u64 {
+        *self
+            .files
+            .entry((file_digest, executable))
+            .or_insert_with(|| Self::fresh(&mut self.next))
+    }
+
+    /// Same target bytes → same ino (an honest hardlink, like files).
+    fn symlink(&mut self, target: &[u8]) -> u64 {
+        if let Some(&ino) = self.symlinks.get(target) {
+            return ino;
+        }
+        let ino = Self::fresh(&mut self.next);
+        self.symlinks.insert(target.to_vec(), ino);
+        ino
+    }
+
+    /// One fresh ino per directory PATH. Content-deduping directory
+    /// inos (the original `h(dir_digest)` scheme) gave one inode to
+    /// every alias of an identical subtree — hardlinked-directory
+    /// semantics, which POSIX/Linux forbid (`link(2)` on a directory
+    /// is EPERM) precisely because multiple parents break tree
+    /// walkers: the kernel holds ONE dentry for the shared inode and
+    /// re-parents it whenever a concurrent walk takes a different
+    /// alias, so GNU find's fts — ascending via `openat(fd, "..")` and
+    /// comparing (dev, ino) against the remembered parent — sees a
+    /// mismatch, fabricates ENOENT, and aborts with zero failing
+    /// syscalls. Per-path inos keep the single-parent invariant; the
+    /// decoded body, backing cache, and chunks stay deduped by digest.
+    fn dir(&mut self) -> u64 {
+        Self::fresh(&mut self.next)
+    }
 }
 
 fn digest32(bytes: &[u8], context: &str) -> Result<[u8; 32], TreeError> {
@@ -319,15 +343,18 @@ impl InoMap {
         // tree can be deep.
         let mut pending: Vec<(u64, [u8; 32], u64)> = Vec::new();
 
+        let mut alloc = InoAlloc::new();
+
         // `ctx` is the error context for a bad digest length: the input
         // root's store path, or the parent directory's hex digest.
         let insert_file = |f: &FileEntry,
                            ctx: &str,
+                           alloc: &mut InoAlloc,
                            inodes: &mut HashMap<u64, Node>,
                            nlink: &mut HashMap<u64, u32>|
          -> Result<u64, TreeError> {
             let digest = digest32(&f.digest, ctx)?;
-            let ino = file_ino(&digest, f.executable);
+            let ino = alloc.file(digest, f.executable);
             inodes.insert(
                 ino,
                 Node::File {
@@ -341,10 +368,11 @@ impl InoMap {
         };
 
         let insert_symlink = |s: &SymlinkEntry,
+                              alloc: &mut InoAlloc,
                               inodes: &mut HashMap<u64, Node>,
                               nlink: &mut HashMap<u64, u32>|
          -> u64 {
-            let ino = symlink_ino(&s.target);
+            let ino = alloc.symlink(&s.target);
             inodes.insert(
                 ino,
                 Node::Symlink {
@@ -367,16 +395,18 @@ impl InoMap {
             let ino = match &root.node {
                 Some(root_node::Node::DirDigest(d)) => {
                     let digest = digest32(d, store_path)?;
-                    let ino = dir_ino(INodeNo::ROOT.0, basename.as_bytes());
+                    let ino = alloc.dir();
                     inodes.insert(ino, Node::Dir { dir_digest: digest });
                     pending.push((ino, digest, INodeNo::ROOT.0));
                     root_nlink += 1;
                     ino
                 }
                 Some(root_node::Node::File(f)) => {
-                    insert_file(f, store_path, &mut inodes, &mut nlink)?
+                    insert_file(f, store_path, &mut alloc, &mut inodes, &mut nlink)?
                 }
-                Some(root_node::Node::Symlink(s)) => insert_symlink(s, &mut inodes, &mut nlink),
+                Some(root_node::Node::Symlink(s)) => {
+                    insert_symlink(s, &mut alloc, &mut inodes, &mut nlink)
+                }
                 None => {
                     return Err(TreeError::MissingRootNode {
                         store_path: store_path.clone(),
@@ -412,7 +442,7 @@ impl InoMap {
                 Vec::with_capacity(dir.directories.len() + dir.files.len() + dir.symlinks.len());
             for d in &dir.directories {
                 let child_digest = digest32(&d.digest, &ctx)?;
-                let ino = dir_ino(self_ino, &d.name);
+                let ino = alloc.dir();
                 inodes.insert(
                     ino,
                     Node::Dir {
@@ -423,11 +453,11 @@ impl InoMap {
                 entries.push((d.name.clone(), ino, FileType::Directory));
             }
             for f in &dir.files {
-                let ino = insert_file(f, &ctx, &mut inodes, &mut nlink)?;
+                let ino = insert_file(f, &ctx, &mut alloc, &mut inodes, &mut nlink)?;
                 entries.push((f.name.clone(), ino, FileType::RegularFile));
             }
             for s in &dir.symlinks {
-                let ino = insert_symlink(s, &mut inodes, &mut nlink);
+                let ino = insert_symlink(s, &mut alloc, &mut inodes, &mut nlink);
                 entries.push((s.name.clone(), ino, FileType::Symlink));
             }
             let by_name = entries
@@ -463,10 +493,10 @@ impl InoMap {
             let ino = *self.roots.get(name)?;
             return Some((ino, self.attr(ino)?));
         }
-        // Two hash probes, no digest re-derivation: the child index was
-        // built alongside the inode table, so a hit here is exactly the
-        // ino the derivation functions produce (and a non-directory
-        // parent has no index → None, same as before).
+        // Two hash probes: the child index was built alongside the
+        // inode table, so a hit here is exactly the ino the allocator
+        // assigned during the build walk (and a non-directory parent
+        // has no index → None).
         let ino = *self.children.get(&parent_ino)?.by_name.get(name)?;
         Some((ino, self.attr(ino)?))
     }
@@ -704,6 +734,95 @@ mod tests {
         (roots, vec![leaf, bin, pkg, dup])
     }
 
+    /// Every (ino, path) reachable from the synthetic root, via the
+    /// public readdir/lookup surface (what a tree walker sees).
+    fn walk_all_inos(map: &InoMap) -> Vec<(u64, String)> {
+        let mut out = vec![(INodeNo::ROOT.0, "/".to_owned())];
+        let mut stack = vec![(INodeNo::ROOT.0, String::new())];
+        while let Some((dir, prefix)) = stack.pop() {
+            // Offset 2 skips `.`/`..` — their inos are already covered
+            // as the directory's own entry and its parent's.
+            for e in map.readdir(dir, 2).expect("is a dir") {
+                let path = format!("{prefix}/{}", e.name.escape_ascii());
+                out.push((e.ino, path.clone()));
+                if e.kind == FileType::Directory {
+                    stack.push((e.ino, path));
+                }
+            }
+        }
+        out
+    }
+
+    /// THE 32-bit payload guard: every inode number must fit in 32
+    /// bits. The production pools advertise i686-linux builds
+    /// (xtask eks deploy `systems`), and a non-LFS 32-bit glibc binary
+    /// gets EOVERFLOW from stat()/readdir() for any st_ino that does
+    /// not fit its 32-bit ino_t. The old digest-derived scheme forced
+    /// bit 63, so EVERY ino overflowed.
+    // r[verify builder.fs.castore-inode-digest+2]
+    #[test]
+    fn inos_fit_in_32_bits_for_non_lfs_payloads() {
+        let (roots, dirs) = sample();
+        let map = InoMap::from_parts(&roots, dirs).expect("build tree");
+        for (ino, path) in walk_all_inos(&map) {
+            assert!(
+                ino < 1u64 << 32,
+                "ino {ino:#x} at {path:?} overflows a 32-bit ino_t"
+            );
+        }
+    }
+
+    /// Allocation is sequential and dense: distinct inos are exactly
+    /// FUSE_ROOT_ID+1 ..= FUSE_ROOT_ID+inode_count, in walk order. A
+    /// gap or a restart would mean two nodes raced one counter slot or
+    /// a dedup class leaked an extra allocation.
+    // r[verify builder.fs.castore-inode-digest+2]
+    #[test]
+    fn allocation_is_sequential_and_dense() {
+        let (roots, dirs) = sample();
+        let map = InoMap::from_parts(&roots, dirs).expect("build tree");
+        let mut inos: Vec<u64> = walk_all_inos(&map)
+            .into_iter()
+            .map(|(ino, _)| ino)
+            .filter(|&ino| ino != INodeNo::ROOT.0)
+            .collect();
+        inos.sort_unstable();
+        inos.dedup();
+        assert_eq!(inos.len(), map.inode_count(), "walk reaches every inode");
+        assert_eq!(
+            inos.first().copied(),
+            Some(INodeNo::ROOT.0 + 1),
+            "allocation starts at FUSE_ROOT_ID + 1"
+        );
+        assert_eq!(
+            inos.last().copied(),
+            Some(INodeNo::ROOT.0 + map.inode_count() as u64),
+            "allocation is dense — the counter never skips"
+        );
+    }
+
+    /// Symlink inode identity: same target bytes anywhere in the
+    /// closure → same inode (with an honest alias count in st_nlink);
+    /// different target → distinct inode.
+    // r[verify builder.fs.castore-inode-digest+2]
+    // r[verify builder.fs.castore-nlink]
+    #[test]
+    fn symlink_inodes_dedup_by_target_bytes() {
+        let (roots, dirs) = sample();
+        let map = InoMap::from_parts(&roots, dirs).expect("build tree");
+
+        // `alias -> libfoo.so` appears under both lib aliases: one ino.
+        let (s1, a1) = lookup_path(&map, &[b"aaa-pkg", b"lib", b"alias"]).unwrap();
+        let (s2, a2) = lookup_path(&map, &[b"bbb-dup", b"lib", b"alias"]).unwrap();
+        assert_eq!(s1, s2, "identical symlink targets share one inode");
+        assert_eq!(a1.nlink, 2, "st_nlink counts both path aliases");
+        assert_eq!(a2.nlink, 2);
+
+        // The root symlink has a different target → distinct inode.
+        let (root_link, _) = map.lookup(INodeNo::ROOT.0, b"ddd-link").unwrap();
+        assert_ne!(s1, root_link, "different targets must not share an inode");
+    }
+
     fn lookup_path(map: &InoMap, path: &[&[u8]]) -> Option<(u64, FileAttr)> {
         let mut cur = INodeNo::ROOT.0;
         let mut last = None;
@@ -784,9 +903,9 @@ mod tests {
     /// cache); same bytes but different executable bit → distinct
     /// inodes (st_mode is per-inode in VFS). Directory identity is
     /// per-path — covered by `dir_alias_inodes_are_per_path`.
-    // r[verify builder.fs.castore-inode-digest+1]
+    // r[verify builder.fs.castore-inode-digest+2]
     #[test]
-    fn inode_identity_is_content_derived() {
+    fn inode_identity_is_content_deduped() {
         let (roots, dirs) = sample();
         let map = InoMap::from_parts(&roots, dirs).expect("build tree");
 
@@ -812,10 +931,13 @@ mod tests {
             })
         );
 
-        // Every derived ino has bit 63 set → can never collide with
-        // FUSE_ROOT_ID.
+        // Allocation starts above FUSE_ROOT_ID → no collision with the
+        // synthetic root.
         for ino in [a, f1, tool] {
-            assert!(ino & (1 << 63) != 0, "derived ino {ino:#x} missing bit 63");
+            assert!(
+                ino > INodeNo::ROOT.0,
+                "allocated ino {ino:#x} collides with ROOT"
+            );
         }
     }
 
@@ -877,39 +999,39 @@ mod tests {
         assert!(map.readdir(file_ino, 0).is_none());
     }
 
-    /// The serve path reads the build-time child index; the derivation
-    /// functions (`file_ino`/`dir_ino`/`symlink_ino`) are the spec
-    /// (ADR §2.3). They must agree — a drifted index would let lookup
-    /// advertise one inode while `open()`/`getattr` (which go through
-    /// the node table) serve another.
-    // r[verify builder.fs.castore-inode-digest+1]
+    /// The serve path reads the build-time child index; the node table
+    /// (`node()`/`attr()`) is what `open()`/`getattr` serve from. They
+    /// must agree for every entry every walker can reach — a drifted
+    /// index would let lookup advertise one inode while the node table
+    /// serves another (or nothing).
+    // r[verify builder.fs.castore-inode-digest+2]
     #[test]
-    fn child_index_agrees_with_ino_derivation() {
+    fn child_index_agrees_with_node_table() {
         let (roots, dirs) = sample();
         let map = InoMap::from_parts(&roots, dirs).expect("build tree");
 
-        // Directory inos chain from the root: h-derived per path edge.
-        let aaa_ino = dir_ino(INodeNo::ROOT.0, b"aaa-pkg");
-        assert_eq!(map.lookup(INodeNo::ROOT.0, b"aaa-pkg").unwrap().0, aaa_ino);
-        let (lib_ino, _) = lookup_path(&map, &[b"aaa-pkg", b"lib"]).unwrap();
-        let (bin_ino, _) = lookup_path(&map, &[b"aaa-pkg", b"bin"]).unwrap();
-        assert_eq!(lib_ino, dir_ino(aaa_ino, b"lib"));
-        assert_eq!(bin_ino, dir_ino(aaa_ino, b"bin"));
-        assert_eq!(
-            map.lookup(lib_ino, b"libfoo.so").unwrap().0,
-            file_ino(&[1u8; 32], false)
-        );
-        assert_eq!(
-            map.lookup(bin_ino, b"tool").unwrap().0,
-            file_ino(&[1u8; 32], true)
-        );
-        assert_eq!(
-            map.lookup(lib_ino, b"alias").unwrap().0,
-            symlink_ino(b"libfoo.so")
-        );
+        for (ino, path) in walk_all_inos(&map) {
+            // Every advertised ino resolves in the attr/node tables
+            // with the kind readdir claimed.
+            let attr = map.attr(ino).unwrap_or_else(|| {
+                panic!("readdir/lookup advertised {ino:#x} at {path:?} but attr() has no entry")
+            });
+            if ino == INodeNo::ROOT.0 {
+                continue;
+            }
+            let node = map.node(ino).expect("non-root ino is in the node table");
+            let node_kind = match node {
+                Node::Dir { .. } => FileType::Directory,
+                Node::File { .. } => FileType::RegularFile,
+                Node::Symlink { .. } => FileType::Symlink,
+            };
+            assert_eq!(attr.kind, node_kind, "attr/node kind mismatch at {path:?}");
+        }
 
         // readdir's precomputed inos match lookup's for every entry
         // (offset 2 skips the dot entries, which have no lookup).
+        let (lib_ino, _) = lookup_path(&map, &[b"aaa-pkg", b"lib"]).unwrap();
+        let (bin_ino, _) = lookup_path(&map, &[b"aaa-pkg", b"bin"]).unwrap();
         for dir in [lib_ino, bin_ino] {
             for e in map.readdir(dir, 2).expect("is a dir") {
                 let (ino, _) = map.lookup(dir, e.name).expect("readdir name resolves");
@@ -930,7 +1052,7 @@ mod tests {
     /// Files and symlinks keep content-derived dedup (legal hardlink
     /// semantics) with an honest st_nlink alias count so du/tar dedup
     /// by (dev, ino, nlink) keeps working.
-    // r[verify builder.fs.castore-inode-digest+1]
+    // r[verify builder.fs.castore-inode-digest+2]
     // r[verify builder.fs.castore-nlink]
     #[test]
     fn dir_alias_inodes_are_per_path() {
