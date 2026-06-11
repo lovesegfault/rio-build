@@ -199,7 +199,7 @@ pub(crate) fn putpath_metadata_status(context: &str, e: metadata::MetadataError)
 /// `path_tenants` on exactly the tenant resolved here, so a write side
 /// that resolved the tenant differently (e.g. JWT-only) would commit
 /// paths its own uploader cannot read back.
-// r[impl store.castore.tenant-scope]
+// r[impl store.castore.tenant-scope+2]
 fn resolve_tenant_id(
     jwt_sub: Option<uuid::Uuid>,
     hmac_claims: Option<&rio_auth::hmac::AssignmentClaims>,

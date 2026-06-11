@@ -716,11 +716,11 @@ pub(crate) async fn commit_chunked_output_in_conn(
     super::complete_manifest_in_conn(conn, info, claim, None, Some(parsed), tenant_id).await
 }
 
-/// `path_tenants` junction insert (`r[store.castore.tenant-scope]`).
+/// `path_tenants` junction insert (`r[store.castore.tenant-scope+2]`).
 /// Idempotent; a `None` tenant (dev mode, service-token caller) writes
 /// nothing. Runs for idempotent-skipped outputs too — the prior commit
 /// may belong to another tenant or predate tenancy.
-// r[impl store.castore.tenant-scope]
+// r[impl store.castore.tenant-scope+2]
 // r[impl store.put.tenant-junction]
 pub(crate) async fn insert_path_tenant_in_conn(
     conn: &mut sqlx::PgConnection,
@@ -778,7 +778,7 @@ pub(crate) fn is_deleted_tenant_fk(err: &MetadataError) -> bool {
 /// transaction usable after PG aborts the failed statement, so callers
 /// MUST be inside a transaction (every caller today is a
 /// manifest-completion transaction).
-// r[impl store.castore.tenant-scope]
+// r[impl store.castore.tenant-scope+2]
 // r[impl store.put.tenant-junction]
 pub(crate) async fn insert_path_tenant_skipping_deleted_in_tx(
     conn: &mut sqlx::PgConnection,

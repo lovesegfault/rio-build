@@ -450,7 +450,7 @@ pub(crate) async fn append_signatures(
 /// (`r[store.chunk.lock-order]`).
 // r[impl store.index.table-cascade]
 // r[impl store.castore.gc]
-// r[impl store.castore.tenant-scope]
+// r[impl store.castore.tenant-scope+2]
 pub async fn set_nar_index_in_conn(
     conn: &mut sqlx::PgConnection,
     store_path_hash: &[u8],
@@ -1170,7 +1170,7 @@ mod tests {
     /// tenant added after first-index sees the path's directories and
     /// blobs.
     // r[verify store.castore.gc]
-    // r[verify store.castore.tenant-scope]
+    // r[verify store.castore.tenant-scope+2]
     #[tokio::test]
     async fn nar_index_castore_inserts() {
         let db = TestDb::new(&crate::MIGRATOR).await;
