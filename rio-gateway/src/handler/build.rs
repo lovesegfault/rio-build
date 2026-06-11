@@ -649,6 +649,53 @@ async fn flip_to_family<W: AsyncWrite + Unpin>(
     }
 }
 
+/// The scope axis of the client-facing CANCELLATION vocabulary
+/// (live_051(f1) — KD-scope, the slot invariant's sixth instance): the
+/// terminal vocabulary PARTITIONS attempt/cycle-scoped (retry-implying)
+/// from build-scoped (final) terminations, each with exactly ONE mint.
+/// A drv-level `Failed{status: Cancelled}` event is CYCLE-scoped — the
+/// scheduler's drv-terminal Cancelled is "retriable on EXPLICIT
+/// resubmit only" and the synthesized attempt closes (reap self-heal,
+/// preemption, failover) stamp cancellation-family vocabulary while
+/// the still-wanted drv requeues and keeps building — so it renders in
+/// the attempt vocabulary below and structurally CANNOT mint the
+/// build-terminal phrase ("build cancelled", whose sole mint is the
+/// outcome fold in `submit_and_process_build`). Derived total from the
+/// closed `BuildResultStatus` alphabet — adding a status forces a
+/// scope decision here (zero wildcard arms).
+enum TerminalScope {
+    /// Attempt/cycle-scoped cancellation: retry-implying — the build
+    /// is NOT over unless its own terminal arrives.
+    AttemptCancelled,
+    /// The generic failure lane (every non-Cancelled failure status).
+    Failure,
+}
+
+impl TerminalScope {
+    /// THE scope classifier — one total function over the wire status
+    /// alphabet; both render sites project from it.
+    fn of(status: types::BuildResultStatus) -> Self {
+        use types::BuildResultStatus as S;
+        match status {
+            S::Cancelled => TerminalScope::AttemptCancelled,
+            S::Unspecified
+            | S::Built
+            | S::Substituted
+            | S::AlreadyValid
+            | S::PermanentFailure
+            | S::TransientFailure
+            | S::CachedFailure
+            | S::DependencyFailed
+            | S::LogLimitExceeded
+            | S::OutputRejected
+            | S::InfrastructureFailure
+            | S::TimedOut
+            | S::NotDeterministic
+            | S::InputRejected => TerminalScope::Failure,
+        }
+    }
+}
+
 // r[impl gw.stderr.activity+2]
 /// Relay one `DerivationEvent` (Started/Completed/Failed/Cached/Queued)
 /// to the client as `actBuild` start/stop activity frames. Mutates
@@ -851,12 +898,24 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
             } else {
                 String::new()
             };
-            stderr
-                .log(&format!(
+            // The vocabulary partition (live_051(f1)): cycle-scoped
+            // cancellations say so — operators reading the stream must
+            // never mistake a self-healing attempt close for a final
+            // build cancellation (the live incident read reap-raced
+            // requeues as "cancelled python builds" while every
+            // affected build was requeued and running).
+            let line = match TerminalScope::of(drv_event.failure_status()) {
+                TerminalScope::AttemptCancelled => format!(
+                    "derivation '{}' attempt cancelled (cycle closed; retriable via \
+                     explicit resubmit): {}{hint}",
+                    drv_event.derivation_path, drv_event.error_message
+                ),
+                TerminalScope::Failure => format!(
                     "derivation '{}' failed: {}{hint}",
                     drv_event.derivation_path, drv_event.error_message
-                ))
-                .await?;
+                ),
+            };
+            stderr.log(&line).await?;
         }
         types::DerivationEventKind::Cached => {
             // Substituting → Cached: close the actSubstitute +
@@ -2368,6 +2427,11 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
             status,
             error_message,
         }) => Ok(BuildResult::failure(status.into(), error_message)),
+        // THE sole build-scoped cancellation mint (live_051(f1) —
+        // KD-scope): "build cancelled" is FINAL vocabulary and exists
+        // only at this fold; the attempt/cycle-scoped lane renders
+        // through TerminalScope::AttemptCancelled and can never reach
+        // this phrase.
         Ok(BuildEventOutcome::Cancelled { reason }) => Ok(BuildResult::failure(
             BuildStatus::TransientFailure,
             format!("build cancelled: {reason}"),
@@ -5823,6 +5887,99 @@ mod tests {
             failure_line.contains("rio-cli logs"),
             "a fresh-execution failure keeps its hint whatever the display family, got: {failure_line:?}"
         );
+    }
+
+    // r[verify gw.stderr.activity+2]
+    /// live_051(f1) — KD-scope: an attempt/cycle-scoped cancellation on
+    /// a drv whose build CONTINUES renders in the attempt vocabulary
+    /// (retry-implying) and never mints the build-terminal phrase; the
+    /// continued work on the same drv is the structural continuation
+    /// witness (the relay keeps tracking it).
+    #[tokio::test]
+    async fn attempt_level_cancel_does_not_render_as_build_termination() {
+        use types::DerivationEventKind::*;
+        let drv = "/nix/store/qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq-reaped.drv";
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
+
+        relay_derivation_status(
+            &mut stderr,
+            &mut act,
+            &mut tails,
+            types::DerivationEvent::failed(
+                drv.into(),
+                "stale Job reaped; attempt closed charge-free".into(),
+                types::BuildResultStatus::Cancelled,
+                rio_proto::VerdictBacking::NoExecution,
+            ),
+        )
+        .await
+        .unwrap();
+        // The drv requeues and keeps building — the stream continues.
+        relay_derivation_status(&mut stderr, &mut act, &mut tails, ev(Started, drv, &[]))
+            .await
+            .unwrap();
+        assert!(
+            matches!(act.display.get(drv), Some(DrvDisplay::Build(_))),
+            "the build continues after the attempt-scoped cancel (structural continuation)"
+        );
+
+        let lines = log_lines(buf).await;
+        let cancel_line = lines
+            .iter()
+            .find(|l| l.contains("cancelled"))
+            .expect("the cancellation line prints");
+        assert!(
+            cancel_line.contains("attempt cancelled")
+                && cancel_line.contains("retriable via explicit resubmit"),
+            "cycle-scoped cancellation must render retry-implying attempt vocabulary, got: {cancel_line:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("build cancelled")),
+            "no attempt-scoped event may mint the build-terminal vocabulary"
+        );
+    }
+
+    /// live_051(f1) W-F2 (GREEN pin, disclosed): the scope classifier is
+    /// total over the closed wire-status alphabet and maps EXACTLY
+    /// Cancelled to the attempt vocabulary — rustc exhaustiveness is
+    /// the census generator (a new BuildResultStatus variant fails to
+    /// compile until it takes a scope position); the build-scoped
+    /// "build cancelled" phrase keeps its sole mint at the outcome fold
+    /// (the existing Cancelled-outcome wire tests pin that mapping).
+    #[test]
+    fn terminal_scope_partitions_exactly_the_cancelled_status() {
+        use types::BuildResultStatus as S;
+        // Membership machine-derived from the prost decoder over the
+        // contiguous wire range (the generator is the wire alphabet,
+        // not an author list); rustc exhaustiveness in
+        // `TerminalScope::of` is the primary census — an added variant
+        // fails to COMPILE until it takes a scope position, decoded or
+        // not.
+        let all: Vec<S> = (0..).map_while(|raw| S::try_from(raw).ok()).collect();
+        assert!(
+            all.contains(&S::Cancelled) && all.len() > 10,
+            "decoder-derived alphabet sane (got {} variants)",
+            all.len()
+        );
+        for status in all {
+            let scope = TerminalScope::of(status);
+            if status == S::Cancelled {
+                assert!(
+                    matches!(scope, TerminalScope::AttemptCancelled),
+                    "Cancelled is the attempt/cycle scope"
+                );
+            } else {
+                assert!(
+                    matches!(scope, TerminalScope::Failure),
+                    "{status:?} rides the generic failure lane"
+                );
+            }
+        }
     }
 
     /// The live Progress arm and the snapshot correction emit the same
