@@ -1737,10 +1737,16 @@ pub(crate) fn attempt_terminal_reason_label(
 
 impl DagActor {
     /// Handle one `ReportAttemptOutcome` (the unified pod-terminal
-    /// intake, scheduler half). Idempotent: the only write it ever
-    /// performs is the reason-only second-installment fill on an
-    /// existing, still-unfilled classification row; it never inserts a
-    /// row, never consumes budget, and never bumps a floor.
+    /// intake, scheduler half). Idempotent: the only writes it ever
+    /// performs are the reason-only second-installment fill on an
+    /// existing, still-unfilled classification row and the in-memory
+    /// witnessed-terminal MARK for an unclassified open attempt
+    /// (first-witnessed-wins — a level-triggered re-report re-creates
+    /// an absent mark and otherwise changes nothing); it never inserts
+    /// a row, never consumes budget, and never bumps a floor. The
+    /// intake MARKS; the establishment sweep ACTS — on the witnessed
+    /// clock (`witnessed_at + establishment_report_slack`) for marked
+    /// attempts, on the dispatch deadline for everything else.
     ///
     /// The no-attempt arm (a pod that died without ever completing a
     /// pull) acknowledges and charges nothing; its only permitted side
@@ -2016,12 +2022,34 @@ impl DagActor {
             // attempt: the scheduler now holds the verdict — Resolved.
             return Ok(AttemptResolution::Resolved);
         }
+        // live_058-c: the witnessed-terminal mark. The pod is GONE
+        // (controller-witnessed terminal) while the attempt holds no
+        // classification row — the worker's own report can only still
+        // be IN FLIGHT, never future — so the establishment sweep may
+        // act at `witnessed_at + establishment_report_slack` instead
+        // of dead-waiting the dispatch deadline. First-witnessed-wins:
+        // the controller re-reports level-triggered every tick while
+        // the pod stays listable, and advancing the clock on each
+        // re-report would defer establishment indefinitely; a
+        // re-report re-creates an absent mark (the post-failover
+        // re-arm) and otherwise changes nothing. The mark bumps,
+        // charges, and classifies NOTHING here — the sweep owns the
+        // action.
+        let mark =
+            self.witnessed_terminal
+                .entry(exec_id)
+                .or_insert_with(|| super::WitnessedTerminal {
+                    witnessed_at: crate::db::attempts::epoch_now(),
+                    reason,
+                });
         debug!(
             %exec_id,
             drv_hash = %b.core.drv_hash,
             ?reason,
+            witnessed_at = mark.witnessed_at,
             "ReportAttemptOutcome for an unclassified open attempt acknowledged (no fill \
-             target; the establishment sweep remains its classifier)"
+             target; witnessed-terminal mark recorded — the establishment sweep acts at \
+             witnessed_at + slack)"
         );
         Ok(AttemptResolution::Unresolved)
     }

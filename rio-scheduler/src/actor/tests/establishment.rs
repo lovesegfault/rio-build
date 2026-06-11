@@ -857,3 +857,194 @@ async fn outbox_reaped_node_batch_still_flushes() -> TestResult {
     );
     Ok(())
 }
+
+// ─── live_058-c: the witnessed-terminal mark / witnessed-clock window ───
+
+/// Send one `ReportAttemptOutcome` through the actor (same as the
+/// pull battery's helper, local to this module).
+async fn report_attempt_outcome(
+    handle: &ActorHandle,
+    exec_id: uuid::Uuid,
+    reason: rio_proto::types::AttemptTerminalReason,
+) -> Result<crate::actor::pull::AttemptResolution, crate::actor::pull::PullRejection> {
+    handle
+        .query_unchecked(|reply| ActorCommand::ReportAttemptOutcome {
+            identity: crate::actor::pull::AttemptIdentity {
+                intent_id: None,
+                job_name: None,
+                exec_id: Some(exec_id),
+            },
+            reason,
+            node_name: Some("node-9".into()),
+            resubmit_cycle: 0,
+            reply,
+        })
+        .await
+        .expect("actor alive")
+}
+
+/// live_058-c (W10-CG-a, the witnessed pair's first installment): a
+/// controller-witnessed terminal attempt establishes on the WITNESSED
+/// clock — `witnessed_at + establishment_report_slack` — while still
+/// DEEP inside its dispatched deadline + slack (no assignment
+/// backdate anywhere in this test: the witnessed clock is the only
+/// thing that can expire it). Both window faces are structural:
+/// inside witnessed+slack nothing establishes (−ε); past it the
+/// attempt establishes exactly once and requeues (+ε). The floor is
+/// EXPLICITLY UNCHANGED end-to-end — the honest intermediate: this
+/// installment is the window, the per-reason promotion is the next
+/// installment's, and a seeded last_intent makes the no-bump
+/// assertion non-vacuous.
+#[tokio::test]
+async fn witnessed_terminal_establishes_on_witnessed_clock() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), "wit-a", PriorityClass::Scheduled).await?;
+    let assignment = pull_deliver(&handle, "wit-a").await;
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+    // A doubling base exists (4 GiB), so "floor unchanged" below
+    // cannot pass vacuously through the cold-start zero-base arm.
+    assert!(
+        handle
+            .debug_seed_sched_hint("wit-a", Some(4 << 30), None, None, None)
+            .await?
+    );
+
+    // The controller witnesses the pod OOMKilled (level-triggered: in
+    // production it re-reports every tick while the pod stays
+    // listable). No worker report exists and none can ever arrive —
+    // the whole-container OOM killed the worker WITH the build.
+    let res = report_attempt_outcome(
+        &handle,
+        exec_id,
+        rio_proto::types::AttemptTerminalReason::OomKilled,
+    )
+    .await
+    .expect("witnessed report acked");
+    assert!(
+        matches!(res, crate::actor::pull::AttemptResolution::Unresolved),
+        "the intake marks, it never classifies an unreported open attempt"
+    );
+
+    // −ε face: inside the witnessed window the sweep establishes
+    // NOTHING (the in-flight-report race is exactly what the slack
+    // covers).
+    tick(&handle).await?;
+    assert!(
+        attempt_rows_for(&db.pool, "wit-a").await.is_empty(),
+        "no establishment inside witnessed_at + slack"
+    );
+    assert_eq!(
+        expect_drv(&handle, "wit-a").await.status,
+        crate::state::DerivationStatus::Running,
+        "the marked attempt is untouched inside the witnessed window"
+    );
+
+    // +ε face: age the mark past the slack (the in-memory twin of
+    // backdate_assignment). The attempt's ASSIGNMENT age is still a
+    // few milliseconds — far inside its dispatched deadline + slack —
+    // so a deadline-anchored sweep would dead-wait here.
+    assert!(
+        handle
+            .debug_backdate_witnessed_mark(exec_id, 86_400)
+            .await?
+    );
+    tick(&handle).await?;
+
+    let rows = attempt_rows_for(&db.pool, "wit-a").await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "established exactly once on the witnessed clock"
+    );
+    assert_eq!(rows[0].outcome_class, OutcomeClass::ExecutorCrash.as_str());
+    assert_eq!(rows[0].termination_reason.as_deref(), Some("unreported"));
+    assert_eq!(rows[0].exec_id, Some(exec_id));
+    let info = expect_drv(&handle, "wit-a").await;
+    assert_eq!(
+        info.status,
+        crate::state::DerivationStatus::Ready,
+        "the drv requeues after the witnessed-clock establishment"
+    );
+    assert_eq!(info.retry.failure_count, 1, "charged once (C2)");
+    assert_eq!(
+        info.sched.resource_floor,
+        crate::state::ResourceFloor::default(),
+        "the requeue lands at the SAME floor — the witnessed-clock \
+         window installment explicitly does not promote"
+    );
+    assert_eq!(
+        assignment_statuses(&db.pool, "wit-a").await,
+        vec!["failed"],
+        "the assignment row minted by the pull is closed"
+    );
+    Ok(())
+}
+
+/// live_058-c: the mark is first-witnessed-wins. After the mark is
+/// aged past the slack, k level-triggered re-reports arrive — if a
+/// re-report advanced the witnessed clock the next sweep would be
+/// back inside the window and establish nothing; first-wins keeps the
+/// aged anchor, the sweep establishes exactly once, and a second pass
+/// is a no-op.
+#[tokio::test]
+async fn witnessed_mark_first_witnessed_wins_under_re_reports() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), "wit-b", PriorityClass::Scheduled).await?;
+    let assignment = pull_deliver(&handle, "wit-b").await;
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+
+    report_attempt_outcome(
+        &handle,
+        exec_id,
+        rio_proto::types::AttemptTerminalReason::OomKilled,
+    )
+    .await
+    .expect("witnessed report acked");
+    assert!(
+        handle
+            .debug_backdate_witnessed_mark(exec_id, 86_400)
+            .await?
+    );
+    // The controller's level-triggered re-reports (the pod is still
+    // listable): none may move the clock forward.
+    for _ in 0..3 {
+        report_attempt_outcome(
+            &handle,
+            exec_id,
+            rio_proto::types::AttemptTerminalReason::OomKilled,
+        )
+        .await
+        .expect("re-report acked");
+    }
+
+    tick(&handle).await?;
+    let rows = attempt_rows_for(&db.pool, "wit-b").await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "re-reports never advance the witnessed clock — the aged mark established"
+    );
+
+    // Post-establishment: a late re-report matches the recorded
+    // terminal classification (Resolved) and re-marks nothing; the
+    // second sweep pass establishes nothing further.
+    let res = report_attempt_outcome(
+        &handle,
+        exec_id,
+        rio_proto::types::AttemptTerminalReason::OomKilled,
+    )
+    .await
+    .expect("late re-report acked");
+    assert!(
+        matches!(res, crate::actor::pull::AttemptResolution::Resolved),
+        "a re-report after establishment matches the recorded verdict"
+    );
+    tick(&handle).await?;
+    assert_eq!(
+        attempt_rows_for(&db.pool, "wit-b").await.len(),
+        1,
+        "the establishment is idempotent under late re-reports"
+    );
+    assert_eq!(expect_drv(&handle, "wit-b").await.retry.failure_count, 1);
+    Ok(())
+}

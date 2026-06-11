@@ -62,6 +62,20 @@ impl DagActor {
             } => {
                 let _ = reply.send(self.handle_debug_backdate_submitted(build_id, secs_ago));
             }
+            DebugCmd::BackdateWitnessedMark {
+                exec_id,
+                secs_ago,
+                reply,
+            } => {
+                let ok = self
+                    .witnessed_terminal
+                    .get_mut(&exec_id)
+                    .is_some_and(|mark| {
+                        mark.witnessed_at -= secs_ago as f64;
+                        true
+                    });
+                let _ = reply.send(ok);
+            }
             DebugCmd::ForcePoisoned {
                 drv_hash,
                 resubmit_cycles,

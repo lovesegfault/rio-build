@@ -278,6 +278,23 @@ impl ActorHandle {
             .await
     }
 
+    /// Backdate a witnessed-terminal mark (live_058-c): age an
+    /// existing mark's `witnessed_at` so the establishment sweep's
+    /// witnessed-clock window can expire without real-time waiting.
+    /// `false` when no mark exists for `exec_id`.
+    pub async fn debug_backdate_witnessed_mark(
+        &self,
+        exec_id: Uuid,
+        secs_ago: u64,
+    ) -> Result<bool, ActorError> {
+        self.debug(|reply| DebugCmd::BackdateWitnessedMark {
+            exec_id,
+            secs_ago,
+            reply,
+        })
+        .await
+    }
+
     /// Arm the W9-AG synthetic long Tick: the next `phases` phase
     /// bodies of `handle_tick` each sleep `each` of real time.
     pub async fn debug_stall_tick_phases(

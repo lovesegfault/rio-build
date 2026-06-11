@@ -714,6 +714,19 @@ pub enum DebugCmd {
         secs_ago: u64,
         reply: oneshot::Sender<bool>,
     },
+    /// Backdate an in-memory witnessed-terminal mark (live_058-c).
+    /// For witnessed-clock establishment tests: the mark's clock is
+    /// `epoch_now()` at intake and the config slack floor is 60s —
+    /// real-time waiting is not a test strategy. The production mint
+    /// stays the `ReportAttemptOutcome` intake; this only AGES an
+    /// existing mark (the in-memory twin of the tests'
+    /// `backdate_assignment` SQL helper). Replies `false` when no
+    /// mark exists.
+    BackdateWitnessedMark {
+        exec_id: Uuid,
+        secs_ago: u64,
+        reply: oneshot::Sender<bool>,
+    },
     /// Force a derivation into `Poisoned` with the given
     /// `resubmit_cycles`. For the I-169 resubmit-bound tests
     /// (`sched.merge.poisoned-resubmit-bounded`).

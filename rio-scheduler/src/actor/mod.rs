@@ -434,6 +434,21 @@ impl DagActor {
     }
 }
 
+/// One controller-witnessed terminal mark (see
+/// [`DagActor::witnessed_terminal`]): when the controller FIRST
+/// witnessed the attempt's pod terminal, and the letter it classified
+/// it with. The clock anchors the establishment window for the marked
+/// attempt; the letter is disclosed at establishment.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WitnessedTerminal {
+    /// Epoch seconds of the FIRST witnessing report. Level-triggered
+    /// re-reports never advance it — the establishment window
+    /// (`witnessed_at + establishment_report_slack`) anchors here.
+    pub(crate) witnessed_at: f64,
+    /// The wire letter as witnessed (`AttemptTerminalReason`).
+    pub(crate) reason: rio_proto::types::AttemptTerminalReason,
+}
+
 pub struct DagActor {
     /// The global derivation DAG.
     dag: DerivationDag,
@@ -489,6 +504,32 @@ pub struct DagActor {
     /// restart the derivation is still in its pre-report state and the
     /// backstop sweep re-drives it.
     pub(crate) attempt_record_retries: HashMap<DrvHash, u32>,
+    /// live_058-c: controller-witnessed terminal marks for OPEN pull
+    /// attempts, keyed by exec_id — the establishment sweep's
+    /// witnessed-clock anchor. Minted by the `ReportAttemptOutcome`
+    /// unclassified-open arm (pull.rs): a pod-terminal letter for an
+    /// open attempt with no worker classification row means the pod
+    /// is GONE — the worker's own report can only still be IN FLIGHT,
+    /// never future — so the sweep establishes marked attempts at
+    /// `witnessed_at + establishment_report_slack` instead of
+    /// dead-waiting the dispatch deadline (the live incident's
+    /// deadline=9803s solve dead-waited ≈2h45m per re-OOM loop
+    /// iteration). Idempotent under the controller's level-triggered
+    /// re-reports (one per tick while the pod stays listable,
+    /// `report_terminated_pods`): first-witnessed-wins — a re-report
+    /// never advances the clock (advancing would indefinitely defer
+    /// establishment) and never re-fires anything; it re-creates the
+    /// mark only when absent (the post-failover re-arm). In-memory BY
+    /// DESIGN (the wave's single DDL allocation is spoken for; the
+    /// durable-column arm is the recorded rejected alternative): lost
+    /// on scheduler failover, re-armed by the next level-triggered
+    /// re-report while the pod stays listable; beyond that window the
+    /// deadline anchor backstops — degradation is bounded by the OLD
+    /// behavior, never worse. Pruned at establishment (the sweep
+    /// consumes the mark) and structurally against the open-attempt
+    /// view every sweep (a mark whose attempt resolved through any
+    /// other path dies on the next pass).
+    pub(crate) witnessed_terminal: HashMap<Uuid, WitnessedTerminal>,
 
     /// bughunt-2 slot 3 C2 (merged_bug_032), re-keyed round 3
     /// (merged_bug_013): corroboration evidence for worker-supplied
@@ -1024,6 +1065,7 @@ impl DagActor {
             authoritative_binding: HashMap::new(),
             acked_spawned: HashMap::new(),
             attempt_record_retries: HashMap::new(),
+            witnessed_terminal: HashMap::new(),
             store_degraded_sightings: HashMap::new(),
             last_store_rpc_failure: None,
             retry_policy: cfg.retry_policy,
@@ -1192,6 +1234,19 @@ impl DagActor {
             builds,
             events,
             attempt_record_retries,
+            // Retained: witnessed-terminal marks are monotone FACTS
+            // (a pod observed terminal stays terminal), keyed by
+            // exec_id — immutable attempt identity, never per-tenure
+            // evidence (the last_store_rpc_failure shape: a leader
+            // transition does not change that the pod died). A
+            // deposed replica's sweep is leader-gated and generation-
+            // fenced, so a stale map acts on nothing; on
+            // re-acquisition the open-view prune drops any mark whose
+            // attempt another leader resolved meanwhile, and a
+            // still-open marked attempt establishes on its original
+            // witnessed clock — strictly better than re-waiting for
+            // the controller's next level-triggered re-report.
+            witnessed_terminal: _,
             // Cleared: term-scoped corroboration evidence — a new
             // tenure re-corroborates within one window (documented
             // self-healing; merged_bug_032).

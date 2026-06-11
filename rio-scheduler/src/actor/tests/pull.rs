@@ -1312,6 +1312,16 @@ async fn establishment_charge_carries_node_from_pod_terminal_report() -> TestRes
     .await
     .expect("pod-terminal report acked");
 
+    // live_058-c: the pod-terminal report MARKED the attempt, so the
+    // sweep runs on the witnessed clock for it — age the mark past
+    // the slack. (The window timing itself is the witnessed-clock
+    // battery's proposition, establishment.rs; this test's is the
+    // node-keyed attribution of the established charge.)
+    assert!(
+        handle
+            .debug_backdate_witnessed_mark(exec_id, 86_400)
+            .await?
+    );
     backdate(&db.pool, exec_id).await?;
     tick(&handle).await?;
 
@@ -1415,6 +1425,14 @@ async fn unreported_crash_loop_reaches_poison_threshold_with_node_keys() -> Test
         )
         .await
         .expect("pod-terminal report acked");
+        // live_058-c: the report marked the attempt — age the mark
+        // past the slack so this pass establishes (the window timing
+        // is the witnessed-clock battery's proposition).
+        assert!(
+            handle
+                .debug_backdate_witnessed_mark(exec_id, 86_400)
+                .await?
+        );
         backdate(&db.pool, exec_id).await?;
         tick(&handle).await?;
         let info = expect_drv(&handle, "psn-d").await;

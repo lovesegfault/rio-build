@@ -1155,6 +1155,22 @@ impl DagActor {
         crate::observability::LeaderGauge::OpenAttempts.set(opens.build.len() as f64);
         crate::observability::LeaderGauge::OpenMaterializationAttempts
             .set(opens.materialization.len() as f64);
+        // live_058-c mark hygiene: a witnessed-terminal mark whose
+        // attempt is no longer OPEN resolved through some other path
+        // (worker report won the race, synthesized close, adoption,
+        // establishment by a prior pass) — drop it. Structural prune
+        // against the same durable view the sweep establishes from,
+        // so every resolution path is covered without per-path
+        // bookkeeping; the map is bounded by the open-attempt
+        // population. (Marks are minted only for BUILD attempts — the
+        // intake's kind witness refuses controller verdicts for
+        // materialization attempts before the mark site.)
+        {
+            let open_execs: std::collections::HashSet<uuid::Uuid> =
+                opens.build.iter().map(|a| a.exec_id).collect();
+            self.witnessed_terminal
+                .retain(|exec_id, _| open_execs.contains(exec_id));
+        }
         // Skew tripwires over the SAME snapshot, both polarities
         // (merged_bug_307 rider + merged_bug_055 C — the
         // `claimed_by.is_some() ⇒ continue` blinder is gone):
@@ -1367,10 +1383,23 @@ impl DagActor {
         // build pod's solve — re-solving a BUILD deadline for a store
         // claim either widened the window by a minutes-scale solve or
         // (post-A2.3) compared apples to the store anchor.
+        let now = crate::db::attempts::epoch_now();
         let mut expired: Vec<crate::db::open_attempts::OpenAttemptRow> = opens
             .build
             .into_iter()
             .filter(|attempt| {
+                // live_058-c: a controller-witnessed terminal attempt
+                // expires on the WITNESSED clock — the pod is gone, so
+                // the only report the slack still covers is one
+                // already in flight; dead-waiting the dispatch
+                // deadline (the pre-fix law — the live incident's
+                // deadline=9803s solve dead-waited ≈2h45m per re-OOM
+                // loop iteration) serves nothing. Unmarked attempts
+                // keep the deadline anchor UNCHANGED below — the
+                // widen-only law for healthy attempts is untouched.
+                if let Some(mark) = self.witnessed_terminal.get(&attempt.exec_id) {
+                    return now > mark.witnessed_at + slack_secs;
+                }
                 let dispatched_deadline = attempt.deadline_secs.unwrap_or(0.0);
                 let resolved_deadline = self
                     .dag
@@ -1541,6 +1570,9 @@ impl DagActor {
                     .await
                 {
                     Ok(o) if o.settled() => {
+                        // The attempt is closed: its witnessed mark
+                        // (if any) is consumed with it.
+                        self.witnessed_terminal.remove(&attempt.exec_id);
                         info!(
                             drv_hash = %attempt.drv_hash, exec_id = %attempt.exec_id,
                             node = ?node,
@@ -1624,6 +1656,9 @@ impl DagActor {
                               "establishment adopt: failed to close the assignment row");
                     }
                 }
+                // The attempt is closed (adopted): its witnessed mark
+                // (if any) is consumed with it.
+                self.witnessed_terminal.remove(&attempt.exec_id);
                 info!(drv_hash = %drv_hash, exec_id = %attempt.exec_id,
                       "establishment sweep: outputs present in store, adopted as completed (no charge)");
                 return;
@@ -1716,6 +1751,14 @@ impl DagActor {
                 return;
             }
         };
+        // The charging transaction committed (won or lost, the
+        // assignment row is closed): the witnessed mark is consumed
+        // with the attempt. live_058-c: a marked attempt reaching this
+        // point established on the WITNESSED clock; the floor is
+        // EXPLICITLY UNCHANGED here — the witnessed-clock window is
+        // this installment's whole delta, and the per-reason
+        // establishment disposition is the promotion installment's.
+        let witnessed = self.witnessed_terminal.remove(&attempt.exec_id);
         if !won {
             // Another classifier landed concurrently (its row holds the
             // verdict); this pass records and changes nothing.
@@ -1741,6 +1784,8 @@ impl DagActor {
             exec_id = %attempt.exec_id,
             executor_id = %executor,
             age_secs = attempt.age_secs,
+            witnessed_reason = witnessed
+                .map(|m| crate::actor::pull::attempt_terminal_reason_label(m.reason)),
             "establishment sweep: open pull-mode attempt established as unreported executor crash"
         );
         if !verdict_eligible {
