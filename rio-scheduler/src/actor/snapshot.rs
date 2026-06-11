@@ -847,22 +847,27 @@ impl DagActor {
     /// immediately after `GetSpawnIntents` so the `SolveCache` is warm
     /// and the second pass is O(dag_nodes) HashMap walk + memo hits.
     /// `intent_ids` not in the snapshot (drv left Ready/Queued between
-    /// the two calls) are omitted from the map; the controller spawns
-    /// those pods without a token and the scheduler's HMAC verifier
-    /// rejects the pull (`unauthenticated`) — the pod exits nonzero
-    /// after the single answer (rio-builder treats it as a permanent
-    /// rejection; retrying cannot succeed), the Job goes Failed via the
-    /// controller's pod-terminal path, and the next spawn-intent cycle
-    /// re-spawns the intent. An occasional blip on
-    /// `rio_scheduler_pull_rejected_total{reason="unauthenticated"}`
-    /// from this race is benign — cross-referenced in that metric's
-    /// HELP. Empty map when `hmac_signer` is None (dev mode).
+    /// the two calls — the two-RPC read-read race) are omitted from
+    /// the map; bug_121: the controller SKIPS an omitted intent this
+    /// tick (a token-less Job under HMAC is unauthenticatable BY
+    /// CONSTRUCTION — the retired posture spawned it into a
+    /// fast-fail + NameCollision + backoff-tax detour) and the intent
+    /// re-presents next tick, minted.
+    ///
+    /// The second tuple element is the bug_121 keyless DISCRIMINATOR:
+    /// `true` iff `hmac_signer` is None (keyless dev mode — no tokens
+    /// EXIST anywhere; the controller spawns token-less), so an
+    /// `Ok(empty)` response is no longer ambiguous between dev mode
+    /// and whole-batch omission.
     ///
     /// [`compute_spawn_intents`]: Self::compute_spawn_intents
     // r[impl sec.executor.identity-token+3]
-    pub(crate) fn mint_executor_tokens(&self, intent_ids: &[String]) -> HashMap<String, String> {
+    pub(crate) fn mint_executor_tokens(
+        &self,
+        intent_ids: &[String],
+    ) -> (HashMap<String, String>, bool) {
         let Some(signer) = &self.hmac_signer else {
-            return HashMap::new();
+            return (HashMap::new(), true);
         };
         let now = rio_auth::now_unix().unwrap_or(0);
         // Unfiltered: same population GetSpawnIntents serves. The
@@ -874,7 +879,7 @@ impl DagActor {
             .iter()
             .map(|i| (i.intent_id.as_str(), i))
             .collect();
-        intent_ids
+        let tokens = intent_ids
             .iter()
             .filter_map(|id| {
                 let intent = by_id.get(id.as_str())?;
@@ -891,7 +896,8 @@ impl DagActor {
                 });
                 Some((id.clone(), token))
             })
-            .collect()
+            .collect();
+        (tokens, false)
     }
 
     /// Process the controller's spawn ack. `registered_cells`

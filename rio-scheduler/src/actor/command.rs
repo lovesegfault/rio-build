@@ -584,11 +584,14 @@ pub enum AdminQuery {
     /// each requested `intent_id`. Controller-only — the credential
     /// lives on a controller-only surface so dashboard/CLI never hold
     /// it (`r[sec.executor.identity-token]`). Reply is
-    /// `intent_id → token`; intent_ids not in the current
-    /// `compute_spawn_intents` snapshot are omitted.
+    /// `(intent_id → token, keyless)`; intent_ids not in the current
+    /// `compute_spawn_intents` snapshot are omitted (the controller
+    /// skips them this tick — bug_121) and `keyless` is the
+    /// dev-mode discriminator (`hmac_signer` is None: no tokens
+    /// exist anywhere; spawn token-less).
     MintExecutorTokens {
         intent_ids: Vec<String>,
-        reply: oneshot::Sender<std::collections::HashMap<String, String>>,
+        reply: oneshot::Sender<(std::collections::HashMap<String, String>, bool)>,
     },
 }
 

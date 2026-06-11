@@ -131,13 +131,17 @@ async fn test_mint_executor_tokens_signs_per_intent() -> anyhow::Result<()> {
 
     // MintExecutorTokens for both → verifiable claims with the right
     // `kind` per intent.
-    let tokens = svc
+    let resp = svc
         .mint_executor_tokens(Request::new(MintExecutorTokensRequest {
             intent_ids: intents.iter().map(|i| i.intent_id.clone()).collect(),
         }))
         .await?
-        .into_inner()
-        .tokens;
+        .into_inner();
+    assert!(
+        !resp.keyless,
+        "bug_121: an HMAC-configured scheduler reports keyless=false"
+    );
+    let tokens = resp.tokens;
     assert_eq!(tokens.len(), 2, "one token per requested intent");
 
     let verifier = HmacVerifier::from_key(key);
@@ -158,15 +162,72 @@ async fn test_mint_executor_tokens_signs_per_intent() -> anyhow::Result<()> {
         );
     }
 
-    // Unknown intent_id → omitted (NOT an error).
-    let tokens = svc
+    // Unknown intent_id → omitted (NOT an error). bug_121: omitted +
+    // keyless=false is the wire face of the Omitted letter — the
+    // controller skips the intent this tick instead of spawning a
+    // token-less Job that is unauthenticatable by construction.
+    let resp = svc
         .mint_executor_tokens(Request::new(MintExecutorTokensRequest {
             intent_ids: vec!["nonexistent".into()],
         }))
         .await?
-        .into_inner()
-        .tokens;
-    assert!(tokens.is_empty(), "unknown intent_id → omitted from map");
+        .into_inner();
+    assert!(
+        resp.tokens.is_empty(),
+        "unknown intent_id → omitted from map"
+    );
+    assert!(
+        !resp.keyless,
+        "bug_121: whole-batch omission under HMAC is NOT conflated \
+         with keyless dev mode (Ok(empty) is no longer ambiguous)"
+    );
+
+    drop(actor);
+    drop(task);
+    Ok(())
+}
+
+// r[verify sec.executor.identity-token+3]
+/// bug_121 keyless face: a scheduler with NO HMAC key reports
+/// `keyless=true` with an empty map — the controller's Keyless letter
+/// (spawn token-less, dev parity, knob-free). Distinct by wire value
+/// from the HMAC-mode omission face above (`keyless=false` + absent
+/// ids), so `Ok(empty)` carries which law applies.
+#[tokio::test]
+async fn mint_keyless_discriminator_distinguishes_dev_from_omission() -> anyhow::Result<()> {
+    use crate::actor::tests::{setup_actor_configured, test_sla_config};
+
+    let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    // No `hmac_signer`: the keyless dev posture.
+    let (actor, task) = setup_actor_configured(db.pool.clone(), None, |c, _p| {
+        c.sla = test_sla_config();
+    });
+    let svc = AdminServiceImpl::new(
+        db.pool.clone(),
+        actor.clone(),
+        "127.0.0.1:1".into(),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        crate::lease::LeaderState::default(),
+        rio_common::signal::Token::new(),
+        String::new(),
+        Arc::new(crate::sla::config::SlaConfig::test_default()),
+        None,
+        Arc::default(),
+    );
+
+    let resp = svc
+        .mint_executor_tokens(Request::new(MintExecutorTokensRequest {
+            intent_ids: vec!["anything".into()],
+        }))
+        .await?
+        .into_inner();
+    assert!(resp.tokens.is_empty(), "keyless mode signs nothing");
+    assert!(
+        resp.keyless,
+        "bug_121: the keyless scheduler DECLARES itself — the \
+         controller spawns token-less instead of skipping"
+    );
 
     drop(actor);
     drop(task);

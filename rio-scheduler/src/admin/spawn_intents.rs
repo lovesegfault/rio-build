@@ -94,12 +94,12 @@ pub(super) async fn mint_executor_tokens(
     actor: &ActorHandle,
     req: MintExecutorTokensRequest,
 ) -> Result<MintExecutorTokensResponse, Status> {
-    let tokens = super::query_actor(actor, |reply| {
+    let (tokens, keyless) = super::query_actor(actor, |reply| {
         ActorCommand::Admin(AdminQuery::MintExecutorTokens {
             intent_ids: req.intent_ids,
             reply,
         })
     })
     .await?;
-    Ok(MintExecutorTokensResponse { tokens })
+    Ok(MintExecutorTokensResponse { tokens, keyless })
 }

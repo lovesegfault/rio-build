@@ -44,6 +44,7 @@ bool filter_features = 4;
 bool has_cache_token = 6;
 bool has_fit = 1;
 bool is_fod = 4;
+bool keyless = 2;
 bool truncated = 5;
 double a = 8;
 double b = 9;

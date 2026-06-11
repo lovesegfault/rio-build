@@ -414,10 +414,11 @@ pub fn describe_metrics() {
          Both are PG-brownout traces, neither an identity fault — alert on \
          the pair). \
          A sustained rate on the identity reasons means a pod fleet holds \
-         mis-bound/expired executor tokens or a key rotation skew; an \
-         occasional unauthenticated blip is the documented mint-skip race \
-         (drv left Ready between GetSpawnIntents and MintExecutorTokens — \
-         see mint_executor_tokens). The rejected pods exit nonzero and \
+         mis-bound/expired executor tokens or a key rotation skew. The \
+         historical mint-skip-race carve-out is retired (bug_121: the \
+         controller skips mint-omitted intents instead of spawning them \
+         token-less — see mint_executor_tokens), so unauthenticated has \
+         no documented benign source. The rejected pods exit nonzero and \
          their logs are ephemeral, so this counter is the alertable trace."
     );
     describe_counter!(

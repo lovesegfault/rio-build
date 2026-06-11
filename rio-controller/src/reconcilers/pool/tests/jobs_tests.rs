@@ -3217,19 +3217,26 @@ async fn erring_token_mint_spawns_nothing_this_tick() {
          witness, no spawn this tick"
     );
 
-    // Parity legs: an EMPTY spawn set never round-trips (Some(empty)),
-    // and a healthy keyless scheduler answers Some (the MockAdmin
-    // default stub = the keyless scheduler's empty-map answer).
-    let empty = mint_spawn_tokens(&ctx, "p", &[]).await;
-    assert_eq!(empty, Some(HashMap::new()), "empty set skips the RPC");
+    // Parity legs: an EMPTY spawn set never round-trips (a vacuous
+    // Some), and a healthy keyless scheduler answers Some with the
+    // keyless discriminator set (MockAdmin::new() = the keyless
+    // scheduler's truthful answer — bug_121).
+    let empty = mint_spawn_tokens(&ctx, "p", &[]).await.expect("vacuous");
+    assert_eq!(
+        (empty.tokens, empty.keyless),
+        (HashMap::new(), false),
+        "empty set skips the RPC (vacuous witness, conservative face)"
+    );
     let (client2, _v2) = ApiServerVerifier::new();
     let (ctx2, _mock, _h) = ctx_with_mock_admin(client2).await;
-    let healthy = mint_spawn_tokens(&ctx2, "p", &intents).await;
+    let healthy = mint_spawn_tokens(&ctx2, "p", &intents)
+        .await
+        .expect("healthy keyless mint rides Some");
     assert_eq!(
-        healthy,
-        Some(HashMap::new()),
-        "keyless dev parity: Ok(empty map) rides the Some arm and \
-         spawns token-less exactly as before"
+        (healthy.tokens.len(), healthy.keyless),
+        (0, true),
+        "keyless dev parity: Ok(empty map, keyless=true) rides the \
+         Some arm into the Keyless letter — token-less spawn by law"
     );
 }
 
@@ -3617,5 +3624,194 @@ async fn orphan_reap_skips_young_leader() {
         reaped, 0,
         "a leader younger than the orphan grace must not reap \
          never-pulled pods (they get one full grace against the NEW leader)"
+    );
+}
+
+// r[verify sec.executor.identity-token+3]
+/// W9-AR (bug_121): no witness, no spawn — PER INTENT. A mixed
+/// HMAC-mode mint (token for A; B OMITTED — the two-RPC read-read
+/// race; keyless=false) spawns A this tick and SKIPS B entirely: no
+/// Job, no NameCollision, no verdict-free backoff tax. B spawns next
+/// tick once minted — the race window closes without the
+/// dead-builder detour. The verifier's strict scenario sequence pins
+/// exactly TWO creates across both ticks (A at tick 1, B at tick 2).
+///
+/// Pre-fix red (strawman-DISCLOSED: the shipped fold was inline in
+/// reconcile — its decision line
+/// `executor_tokens.get(&intent.intent_id).map(String::as_str)`
+/// quoted and driven through production spawn_for_each): B's create
+/// went out token-less — the doomed Job. Transcript in the commit
+/// body.
+#[tokio::test]
+async fn w9_ar_omitted_intent_skips_then_spawns_once_minted() {
+    use crate::reconcilers::pool::jobs::{
+        TokenDisposition, filter_spawnable_by_token, mint_spawn_tokens,
+    };
+
+    let (client, verifier) = ApiServerVerifier::new();
+    let (ctx, mock, _h) = ctx_with_mock_admin(client.clone()).await;
+    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+    let key = pkey();
+
+    // HMAC-mode mint: token for A only; B omitted.
+    {
+        let mut m = mock.mint_tokens.write().unwrap();
+        m.keyless = false;
+        m.tokens = [("aaa".to_string(), "tok-a".to_string())].into();
+    }
+    let intents = vec![intent_named("aaa"), intent_named("bbb")];
+
+    // Exactly TWO creates total across both ticks.
+    let guard = verifier.run(vec![
+        Scenario::ok(
+            http::Method::POST,
+            "/namespaces/rio/jobs",
+            serde_json::to_string(&Job::default()).unwrap(),
+        ),
+        Scenario::ok(
+            http::Method::POST,
+            "/namespaces/rio/jobs",
+            serde_json::to_string(&Job::default()).unwrap(),
+        ),
+    ]);
+
+    // The production closure's letter consumption, minimal Job body
+    // (the law under test is which intents reach the spawn and with
+    // what token evidence — not the Job spec, covered elsewhere).
+    let drive_tick = |grants: crate::reconcilers::pool::jobs::TokenGrants,
+                      spawnable: Vec<SpawnIntent>,
+                      jobs_api: Api<Job>| async move {
+        let mut seen: Vec<(String, Option<String>)> = Vec::new();
+        let spawned = spawn_for_each(&jobs_api, &spawnable, &HashSet::new(), "p", |intent| {
+            let token = match grants.disposition(&intent.intent_id) {
+                TokenDisposition::Token(t) => Some(t),
+                TokenDisposition::Keyless => None,
+                TokenDisposition::Omitted => panic!("Omitted reached the spawn"),
+            };
+            seen.push((intent.intent_id.clone(), token.map(str::to_owned)));
+            Ok(Job {
+                metadata: ObjectMeta {
+                    name: Some(format!("rio-builder-p-{}", intent.intent_id)),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+        })
+        .await;
+        (spawned, seen)
+    };
+
+    // Tick 1: mint → per-intent fold → spawn. B is Omitted.
+    let grants = mint_spawn_tokens(&ctx, "p", &intents).await.expect("Ok");
+    let spawnable = filter_spawnable_by_token("p", &grants, &intents);
+    assert_eq!(
+        spawnable
+            .iter()
+            .map(|i| i.intent_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["aaa"],
+        "the Omitted intent is filtered BEFORE the spawn"
+    );
+    let (spawned, seen) = drive_tick(grants, spawnable, jobs_api.clone()).await;
+    assert_eq!(spawned.len(), 1, "A spawns this tick");
+    assert_eq!(
+        seen,
+        vec![("aaa".to_string(), Some("tok-a".to_string()))],
+        "exactly A reaches the spawn, WITH its token"
+    );
+    // No NameCollision possible (no Job exists for B) and no backoff
+    // tax (no verdict-free death was noted — nothing was reaped).
+    assert!(
+        !ctx.exhausted_streak
+            .lock()
+            .respawn_blocked(&key, "bbb", std::time::Instant::now()),
+        "skipping must not tax B's respawn record"
+    );
+
+    // Tick 2: the scheduler now mints B (the drv re-presented).
+    mock.mint_tokens
+        .write()
+        .unwrap()
+        .tokens
+        .insert("bbb".to_string(), "tok-b".to_string());
+    let grants2 = mint_spawn_tokens(&ctx, "p", &intents).await.expect("Ok");
+    let spawnable2 = filter_spawnable_by_token("p", &grants2, &intents);
+    // A's Job already exists — production passes existing_names as
+    // the skip set; replicate it so only B creates.
+    let spawnable2: Vec<SpawnIntent> = spawnable2
+        .into_iter()
+        .filter(|i| i.intent_id != "aaa")
+        .collect();
+    let (spawned2, seen2) = drive_tick(grants2, spawnable2, jobs_api).await;
+    guard.verified().await;
+    assert_eq!(spawned2.len(), 1, "B spawns next tick");
+    assert_eq!(
+        seen2,
+        vec![("bbb".to_string(), Some("tok-b".to_string()))],
+        "B spawns once minted — the race closed without the detour"
+    );
+}
+
+// r[verify sec.executor.identity-token+3]
+/// W9-AS (bug_121): the discriminator's dual face — keyless dev mode
+/// (`keyless=true`, empty map) spawns EVERY intent token-less,
+/// exactly as today, knob-free. The keyless-deployment validation
+/// lane (hazard ggggg: keyless e2e flows are a standing population —
+/// dev parity breaks are red here, not in prod) is the cited
+/// population. Pre-fix this face was indistinguishable on the wire
+/// from whole-batch omission; the law now keys on the typed letter.
+#[tokio::test]
+async fn w9_as_keyless_mode_spawns_every_intent_tokenless() {
+    use crate::reconcilers::pool::jobs::{
+        TokenDisposition, filter_spawnable_by_token, mint_spawn_tokens,
+    };
+
+    let (client, verifier) = ApiServerVerifier::new();
+    // MockAdmin::new() defaults keyless=true with an empty map — the
+    // truthful keyless scheduler.
+    let (ctx, _mock, _h) = ctx_with_mock_admin(client.clone()).await;
+    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+
+    let intents = vec![intent_named("aaa"), intent_named("bbb")];
+    let guard = verifier.run(vec![
+        Scenario::ok(
+            http::Method::POST,
+            "/namespaces/rio/jobs",
+            serde_json::to_string(&Job::default()).unwrap(),
+        ),
+        Scenario::ok(
+            http::Method::POST,
+            "/namespaces/rio/jobs",
+            serde_json::to_string(&Job::default()).unwrap(),
+        ),
+    ]);
+
+    let grants = mint_spawn_tokens(&ctx, "p", &intents).await.expect("Ok");
+    assert!(grants.keyless, "the mock declares keyless");
+    let spawnable = filter_spawnable_by_token("p", &grants, &intents);
+    assert_eq!(spawnable.len(), 2, "keyless filters nothing");
+    let mut seen: Vec<(String, Option<String>)> = Vec::new();
+    let spawned = spawn_for_each(&jobs_api, &spawnable, &HashSet::new(), "p", |intent| {
+        let token = match grants.disposition(&intent.intent_id) {
+            TokenDisposition::Token(t) => Some(t),
+            TokenDisposition::Keyless => None,
+            TokenDisposition::Omitted => panic!("Omitted under keyless"),
+        };
+        seen.push((intent.intent_id.clone(), token.map(str::to_owned)));
+        Ok(Job {
+            metadata: ObjectMeta {
+                name: Some(format!("rio-builder-p-{}", intent.intent_id)),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    })
+    .await;
+    guard.verified().await;
+    assert_eq!(spawned.len(), 2, "both spawn under keyless");
+    assert_eq!(
+        seen,
+        vec![("aaa".to_string(), None), ("bbb".to_string(), None),],
+        "token-less by LAW (the Keyless letter), not by accident"
     );
 }

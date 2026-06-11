@@ -71,6 +71,9 @@ const MANUAL_METHODS: &[&str] = &[
     // merged_bug_116: call-recording + programmable failure (the
     // node-informer counted-drop suites).
     "AppendInterruptSample",
+    // bug_121: programmable response + call recording (the per-intent
+    // token-disposition suites; `new()` defaults keyless=true).
+    "MintExecutorTokens",
 ];
 
 #[cfg(feature = "full")]

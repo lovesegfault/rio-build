@@ -55,11 +55,26 @@ pub struct MockAdmin {
     /// the generated stub would silently default; the node-informer
     /// suites assert sample content and failure accounting).
     pub interrupt_samples: Arc<RwLock<Vec<types::AppendInterruptSampleRequest>>>,
+    /// Programmed `MintExecutorTokens` response (bug_121). [`Self::new`]
+    /// defaults it to `keyless=true` — the mock signs nothing, so it
+    /// truthfully reports the keyless dev posture and token-less
+    /// spawns flow exactly as against a keyless scheduler. Program
+    /// `tokens` + `keyless=false` to drive the HMAC-mode per-intent
+    /// omission arms.
+    pub mint_tokens: Arc<RwLock<types::MintExecutorTokensResponse>>,
+    /// Every `MintExecutorTokens` request received, in order.
+    pub mint_calls: Arc<RwLock<Vec<types::MintExecutorTokensRequest>>>,
 }
 
 impl MockAdmin {
     pub fn new() -> Self {
-        Self::default()
+        let mock = Self::default();
+        // Truthful default (bug_121 discriminator): the mock holds no
+        // HMAC key. Without this, every unprogrammed mint reads as
+        // HMAC-mode whole-batch omission and the controller's
+        // per-intent fail-closed law spawns nothing.
+        mock.mint_tokens.write().unwrap().keyless = true;
+        mock
     }
 }
 
@@ -168,6 +183,14 @@ impl AdminService for MockAdmin {
         _: Request<types::ListOpenAttemptsRequest>,
     ) -> Result<Response<types::ListOpenAttemptsResponse>, Status> {
         Ok(Response::new(self.open_attempts.read().unwrap().clone()))
+    }
+
+    async fn mint_executor_tokens(
+        &self,
+        request: Request<types::MintExecutorTokensRequest>,
+    ) -> Result<Response<types::MintExecutorTokensResponse>, Status> {
+        self.mint_calls.write().unwrap().push(request.into_inner());
+        Ok(Response::new(self.mint_tokens.read().unwrap().clone()))
     }
 
     async fn append_interrupt_sample(

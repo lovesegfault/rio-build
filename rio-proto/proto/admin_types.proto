@@ -813,17 +813,27 @@ message ObservedInstanceType {
 // `intent_ids` are the `SpawnIntent.intent_id` (= drv_hash) the
 // controller is about to create Jobs for; the response maps each to its
 // HMAC-signed `ExecutorClaims{intent_id, kind, expiry}`. Unknown
-// intent_ids (drv left Ready between GetSpawnIntents and this call) are
-// omitted from the map; the controller spawns those pods without a token
-// (dev-mode parity — the builder omits the header, scheduler rejects
-// under HMAC mode, pod idle-exits, next tick re-spawns).
+// intent_ids (drv left Ready between GetSpawnIntents and this call —
+// the two-RPC read-read race) are omitted from the map; under HMAC the
+// controller MUST NOT spawn an omitted intent this tick (bug_121: a
+// token-less Job is unauthenticatable BY CONSTRUCTION — first pull
+// fast-fails, the terminal Job NameCollision-blocks respawn and steps
+// the verdict-free backoff; the intent stays queued and re-presents
+// next tick, minted).
 message MintExecutorTokensRequest {
   repeated string intent_ids = 1;
 }
 message MintExecutorTokensResponse {
-  // intent_id → signed ExecutorClaims token. Empty map when the
-  // scheduler has no HMAC key configured (dev mode).
+  // intent_id → signed ExecutorClaims token.
   map<string, string> tokens = 1;
+  // bug_121 discriminator: TRUE iff the scheduler holds no HMAC key
+  // (keyless dev mode) — distinguishes "no tokens EXIST anywhere;
+  // spawn token-less" (keyless=true) from "this intent was OMITTED;
+  // skip it this tick" (keyless=false + id absent from `tokens`).
+  // proto3 absence decodes as false = fail-closed Omitted: a
+  // scheduler without this field makes the controller skip rather
+  // than spawn doomed Jobs (--wipe posture; no release-skew bridge).
+  bool keyless = 2;
 }
 
 // ───────────────────────────────────────────────────────────────────────────

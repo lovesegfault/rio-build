@@ -949,12 +949,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // it via `GetSpawnIntents`), so the credential lives here, not on
     // the intent. One RPC per reconcile per pool, only for the
     // headroom-truncated set the controller is about to create Jobs
-    // for. Empty `to_spawn_intents` skips the round-trip. intent_ids
-    // the scheduler no longer recognizes (drv left Ready between the
-    // two calls) are omitted from the map → those pods spawn
-    // token-less, the HMAC verifier rejects the pull, the pod exits,
-    // next tick re-spawns (the benign per-intent race, documented at
-    // the scheduler mint).
+    // for. Empty `to_spawn_intents` skips the round-trip.
     //
     // live_053 / D-053-1 (owner-signed, 2026-06-10): an ERRING mint is
     // FAIL-CLOSED — `None` means no token evidence exists, and a spawn
@@ -965,11 +960,22 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // 134s scheduler stall expired the 5s mint RPC twice. Skipping the
     // tick keeps the intents queued scheduler-side (no Job, no ack, no
     // dispatched_cells entry) — one tick of spawn latency instead of a
-    // guaranteed-dead batch. Dev-mode parity holds WITHOUT a knob: a
-    // keyless scheduler answers Ok with an EMPTY map (the actor mint
-    // returns empty when `hmac_signer` is None), so dev flows through
-    // the Ok arm and spawns token-less exactly as before — the Err arm
-    // is transport failure in every mode.
+    // guaranteed-dead batch.
+    //
+    // bug_121: the SAME law, per element. The batch witness cannot
+    // carry the element law — an intent the mint OMITTED (drv left
+    // Ready between GetSpawnIntents and the mint; the two-RPC
+    // read-read race) has no token evidence either, and spawning it
+    // token-less under HMAC re-enters the dead-builder shape through
+    // the Ok arm: first pull fast-fails Unauthenticated, the terminal
+    // Job NameCollision-blocks respawn behind the two-tick strike and
+    // steps the verdict-free backoff. Each intent's disposition is a
+    // typed letter ({Token, Omitted, Keyless} — keyless is the wire
+    // discriminator, so Ok(empty) is no longer ambiguous between dev
+    // mode and whole-batch omission) total-folded BEFORE the spawn:
+    // Token spawns with it, Omitted skips THIS intent this tick (no
+    // Job, no collision, no backoff tax; it re-presents next tick,
+    // minted), Keyless spawns token-less (dev parity, knob-free).
     let executor_tokens = mint_spawn_tokens(ctx, &name, &to_spawn_intents).await;
 
     // One pod per intent with that intent's resources + annotation.
@@ -978,27 +984,40 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // scheduler ALWAYS populates intents — empty list means empty
     // queue → spawns nothing.
     let spawned = match &executor_tokens {
-        Some(executor_tokens) => {
-            spawn_for_each(
-                &jobs_api,
-                &to_spawn_intents,
-                &existing_names,
-                &name,
-                |intent| {
-                    build_job(
-                        pool,
-                        oref.clone(),
-                        &ctx.scheduler,
-                        &ctx.store,
-                        &ctx.hw_config,
-                        intent,
-                        executor_tokens.get(&intent.intent_id).map(String::as_str),
-                        &hw_sampled,
-                        ctx.hw_bench_mem_floor,
-                        ctx.placeable.is_some() && ctx.kube_build_scheduler_enabled,
-                    )
-                },
-            )
+        Some(grants) => {
+            // bug_121 chokepoint: the per-intent letters fold HERE,
+            // before any Job exists; the build closure consumes the
+            // SAME letter (Token's payload is the spawn's token;
+            // Keyless is token-less by law, not by accident).
+            let spawnable = filter_spawnable_by_token(&name, grants, &to_spawn_intents);
+            spawn_for_each(&jobs_api, &spawnable, &existing_names, &name, |intent| {
+                let token = match grants.disposition(&intent.intent_id) {
+                    TokenDisposition::Token(t) => Some(t),
+                    TokenDisposition::Keyless => None,
+                    // Structurally absent post-filter; refuse rather
+                    // than spawn token-less if a future edit breaks
+                    // the filter/spawn coupling.
+                    TokenDisposition::Omitted => {
+                        return Err(Error::InvalidSpec(format!(
+                            "intent {} reached the spawn without token \
+                             evidence (bug_121 filter bypassed)",
+                            intent.intent_id
+                        )));
+                    }
+                };
+                build_job(
+                    pool,
+                    oref.clone(),
+                    &ctx.scheduler,
+                    &ctx.store,
+                    &ctx.hw_config,
+                    intent,
+                    token,
+                    &hw_sampled,
+                    ctx.hw_bench_mem_floor,
+                    ctx.placeable.is_some() && ctx.kube_build_scheduler_enabled,
+                )
+            })
             .await
         }
         // live_053 / D-053-1: no token evidence — zero spawns this
@@ -1203,31 +1222,119 @@ fn intent_suffix(intent_id: &str) -> String {
 ///     the pod's `job-tracking` finalizer is still live (same
 ///     reasoning as `reap_excess_pending`).
 ///
+/// The minted token evidence for one spawn pass (bug_121). `tokens`
+/// maps intent_id → signed `ExecutorClaims`; `keyless` is the wire
+/// discriminator — TRUE iff the scheduler holds no HMAC key, so an
+/// empty map is no longer ambiguous between "no tokens EXIST
+/// anywhere" (dev mode: spawn token-less) and "these intents were
+/// OMITTED" (HMAC mode: skip them this tick). proto3 absence decodes
+/// `keyless=false` = fail-closed Omitted.
+pub(super) struct TokenGrants {
+    pub(super) tokens: HashMap<String, String>,
+    pub(super) keyless: bool,
+}
+
+/// bug_121: the per-intent token disposition — R21's per-element
+/// letter set. The BATCH witness ([`TokenGrants`]) cannot carry the
+/// element law; each intent folds its own letter at the spawn
+/// chokepoint.
+pub(super) enum TokenDisposition<'a> {
+    /// A signed token covers this intent — spawn with it.
+    Token(&'a str),
+    /// HMAC mode and the mint omitted this id (the two-RPC read-read
+    /// race: the drv left Ready between `GetSpawnIntents` and the
+    /// mint) — SKIP this intent this tick. A token-less Job under
+    /// HMAC is unauthenticatable BY CONSTRUCTION: first pull
+    /// fast-fails Unauthenticated, the terminal Job
+    /// NameCollision-blocks respawn behind the two-tick strike and
+    /// steps the verdict-free backoff — the dead-builder shape
+    /// through the Ok arm. Skipping spawns no Job, collides with
+    /// nothing, taxes no backoff; the intent stays queued and
+    /// re-presents next tick, minted.
+    Omitted,
+    /// Keyless dev mode — no tokens exist anywhere; spawn
+    /// token-less (parity, knob-free).
+    Keyless,
+}
+
+impl TokenGrants {
+    /// Fold one intent's letter. Total over the closed
+    /// {present} × {keyless} product — no wildcard arm.
+    pub(super) fn disposition(&self, intent_id: &str) -> TokenDisposition<'_> {
+        match self.tokens.get(intent_id) {
+            Some(t) => TokenDisposition::Token(t),
+            None if self.keyless => TokenDisposition::Keyless,
+            None => TokenDisposition::Omitted,
+        }
+    }
+}
+
+/// bug_121 chokepoint: total-fold each intent's token letter BEFORE
+/// `spawn_for_each` — Omitted intents never reach the spawn (the
+/// fail-closed D-053-1 posture extended per element). Returns the
+/// spawnable subset in input order.
+pub(super) fn filter_spawnable_by_token(
+    pool: &str,
+    grants: &TokenGrants,
+    intents: &[SpawnIntent],
+) -> Vec<SpawnIntent> {
+    let mut omitted: Vec<&str> = Vec::new();
+    let spawnable: Vec<SpawnIntent> = intents
+        .iter()
+        .filter(|i| match grants.disposition(&i.intent_id) {
+            TokenDisposition::Token(_) | TokenDisposition::Keyless => true,
+            TokenDisposition::Omitted => {
+                omitted.push(&i.intent_id);
+                false
+            }
+        })
+        .cloned()
+        .collect();
+    if !omitted.is_empty() {
+        info!(
+            pool,
+            omitted = omitted.len(),
+            ids = ?omitted,
+            "mint omitted these intents (drv left Ready between \
+             GetSpawnIntents and the mint); spawn skipped this tick — \
+             no Job, no NameCollision, no backoff tax; they re-present \
+             next tick, minted (bug_121)"
+        );
+    }
+    spawnable
+}
+
 /// live_053 / D-053-1 (owner-signed, 2026-06-10): the spawn-token
-/// mint outcome. `Some(map)` is the token WITNESS a spawn may consume
-/// (an empty map = keyless dev mode, or the per-intent
-/// scheduler-omitted race — both documented at the scheduler mint);
-/// `None` = the mint RPC FAILED and no token evidence exists — the
-/// single consumer (the reconcile spawn match) MUST spawn nothing
-/// this tick (fail-closed: the durable-witness-coupling law — a
-/// spawn cannot consume a witness that was never minted). The
-/// retired fail-open arm spawned whole token-less batches that are
-/// unauthenticatable BY CONSTRUCTION under HMAC: 257 builders died
-/// in one night when a 134s scheduler stall expired the 5s mint RPC
-/// twice. Skipping keeps the intents queued scheduler-side (no Job,
-/// no ack, no dispatched_cells entry) — one tick of spawn latency
-/// instead of a guaranteed-dead batch. Dev-mode parity holds WITHOUT
-/// a knob: a keyless scheduler answers Ok with an EMPTY map, so dev
-/// rides the Some arm; the Err arm is transport failure in every
-/// mode.
+/// mint outcome. `Some(grants)` is the token WITNESS a spawn may
+/// consume — per-intent dispositions fold from it via
+/// [`TokenGrants::disposition`] (bug_121: Token spawns, Omitted
+/// skips that intent this tick, Keyless spawns token-less); `None` =
+/// the mint RPC FAILED and no token evidence exists — the single
+/// consumer (the reconcile spawn match) MUST spawn nothing this tick
+/// (fail-closed: the durable-witness-coupling law — a spawn cannot
+/// consume a witness that was never minted). The retired fail-open
+/// arm spawned whole token-less batches that are unauthenticatable
+/// BY CONSTRUCTION under HMAC: 257 builders died in one night when a
+/// 134s scheduler stall expired the 5s mint RPC twice. Skipping
+/// keeps the intents queued scheduler-side (no Job, no ack, no
+/// dispatched_cells entry) — one tick of spawn latency instead of a
+/// guaranteed-dead batch. Dev-mode parity holds WITHOUT a knob: a
+/// keyless scheduler declares itself on the wire (`keyless=true`),
+/// so dev rides the Some arm into the Keyless letter; the Err arm is
+/// transport failure in every mode.
 // r[impl sec.executor.identity-token+3]
 pub(super) async fn mint_spawn_tokens(
     ctx: &Ctx,
     pool: &str,
     to_spawn: &[SpawnIntent],
-) -> Option<HashMap<String, String>> {
+) -> Option<TokenGrants> {
     if to_spawn.is_empty() {
-        return Some(HashMap::new());
+        // Vacuous witness: no disposition will be consulted.
+        // keyless=false is the conservative face.
+        return Some(TokenGrants {
+            tokens: HashMap::new(),
+            keyless: false,
+        });
     }
     match admin_call(ctx.admin.clone().mint_executor_tokens(
         rio_proto::types::MintExecutorTokensRequest {
@@ -1236,7 +1343,13 @@ pub(super) async fn mint_spawn_tokens(
     ))
     .await
     {
-        Ok(r) => Some(r.into_inner().tokens),
+        Ok(r) => {
+            let r = r.into_inner();
+            Some(TokenGrants {
+                tokens: r.tokens,
+                keyless: r.keyless,
+            })
+        }
         Err(e) => {
             warn!(
                 pool, error = %e,
