@@ -111,14 +111,29 @@ pub fn dump_path(path: &std::path::Path) -> Result<Vec<u8>> {
 ///
 /// # Read-during-write detection
 ///
-/// If a file shrinks between the `symlink_metadata()` call that reads its
-/// length and the `read()` loop that copies its contents, the NAR would be
-/// corrupted: the wire format is `u64:len | len bytes | padding`, so a
-/// short read leaves garbage in the byte positions the reader expects to
-/// be content. We detect this (read returns 0 before `remaining` hits 0)
-/// and fail with a clear error. The overlay upper dir is frozen post-build,
-/// so in practice this only catches filesystem bugs or a misconfigured
-/// worker that mounts a still-mutating path.
+/// If a file shrinks between the `fstat` that reads its length and the
+/// `read()` loop that copies its contents (both on the same held fd), the
+/// NAR would be corrupted: the wire format is `u64:len | len bytes |
+/// padding`, so a short read leaves garbage in the byte positions the
+/// reader expects to be content. We detect this (read returns 0 before
+/// `remaining` hits 0) and fail with a clear error. The overlay upper dir
+/// is frozen post-build, so in practice this only catches filesystem bugs
+/// or a misconfigured worker that mounts a still-mutating path.
+///
+/// # Traversal is dirfd-relative
+///
+/// Mirror of [`restore_path_streaming`]'s guarantee, on the read side:
+/// the parent directory of `path` is resolved exactly ONCE; every node
+/// below is opened via `openat(O_NOFOLLOW)` relative to a held directory
+/// fd and its type is decided by `fstat` of the OPENED fd — never by a
+/// separate path-based stat. The production callers walk an overlay
+/// upper that untrusted build code just wrote; with path-based traversal
+/// a concurrent writer could swap a file for a symlink between the type
+/// check and the content open and have an arbitrary host-readable file
+/// serialized as build output (exfiltration through the store), or swap
+/// in a FIFO and park the dump in a blocking `open`. Fd-relative
+/// traversal has no check-to-use gap: the fd pins the inode the type
+/// decision was made on.
 pub fn dump_path_streaming(path: &std::path::Path, w: &mut impl Write) -> Result<u64> {
     dump_path_observed(path, w, &mut ())
 }
@@ -177,14 +192,54 @@ impl WalkObserver for () {}
 
 /// [`dump_path_streaming`] with a [`WalkObserver`] receiving the tree
 /// structure and file contents alongside the NAR byte stream.
+///
+/// The parent directory of `path` (caller-controlled: the builder passes
+/// the builder-owned `upper_store`, tests a tempdir) is the ONLY path
+/// the walk resolves; see [`dump_path_streaming`] for the dirfd-relative
+/// traversal contract.
 pub fn dump_path_observed(
     path: &std::path::Path,
     w: &mut impl Write,
     obs: &mut impl WalkObserver,
 ) -> Result<u64> {
+    let name = path.file_name().ok_or_else(|| {
+        NarError::Io(io::Error::other(format!(
+            "dump source {} has no final path component",
+            path.display()
+        )))
+    })?;
+    // `&CStr` names for the *at syscalls, for the same PATH_MAX
+    // stack-buffer reason as `restore_path_streaming`.
+    let name = {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+            NarError::Io(io::Error::other(format!(
+                "dump source {} contains NUL",
+                path.display()
+            )))
+        })?
+    };
+    let parent_path = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    };
+    let parent = nix::fcntl::open(
+        parent_path,
+        nix::fcntl::OFlag::O_RDONLY | nix::fcntl::OFlag::O_DIRECTORY | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )
+    .map_err(|e| NarError::Io(e.into()))?;
     let mut counter = CountingWriter::new(w);
     frame::magic(&mut counter)?;
-    stream_node(&mut counter, path, 0, b"", obs)?;
+    stream_node(
+        &mut counter,
+        std::os::fd::AsFd::as_fd(&parent),
+        &name,
+        path,
+        0,
+        b"",
+        obs,
+    )?;
     Ok(counter.written)
 }
 
@@ -212,16 +267,35 @@ impl<W: Write> Write for CountingWriter<W> {
     }
 }
 
-/// Streaming analogue of `serialize_node(node_from_path(path))`. Walks
-/// the filesystem and writes NAR framing directly, reading file contents
-/// in 256 KiB chunks.
+/// Streaming analogue of `serialize_node(node_from_path(path))`. Opens
+/// the entry `name` relative to the held `parent` directory fd, writes
+/// NAR framing directly, and reads file contents in 256 KiB chunks.
+///
+/// The type decision comes from `fstat` of the OPENED fd — never from a
+/// separate path-based stat, which would leave a check-to-use gap an
+/// attacker writing to the dumped tree could race (swap file→symlink
+/// between stat and open → arbitrary host-readable file serialized as
+/// build output):
+///
+/// - `O_NOFOLLOW` makes a symlink entry fail the open with `ELOOP`,
+///   which IS the symlink detection; the target is then read with
+///   `readlinkat`, also fd-relative.
+/// - `O_NONBLOCK` makes the open of a FIFO return immediately instead
+///   of blocking until a writer appears (`mkfifo $out/pipe` by
+///   untrusted build code, or a file→FIFO swap mid-walk, must not park
+///   the dump task); the fstat check then rejects it. O_NONBLOCK has no
+///   effect on regular-file reads, so it is never cleared.
+/// - A socket fails the open with `ENXIO`.
 ///
 /// Enforces the same `MAX_NAR_DEPTH` / `MAX_DIRECTORY_ENTRIES` limits as
 /// `restore_node` and rejects non-regular/symlink/directory file types
 /// (matching Nix `dump()`'s "unsupported type" error) — the producer must
-/// emit only what the consumer accepts, and untrusted derivation output
-/// must not be able to hang the worker (e.g. `mkfifo $out/pipe` would
-/// otherwise block in `open(O_RDONLY)` forever).
+/// emit only what the consumer accepts.
+///
+/// `path` is the full source path, used for error messages only — never
+/// passed to a syscall. `name` is passed as `&CStr` and the
+/// non-recursive arms live in their own functions, for the same
+/// stack-frame reasons as `restore_node`.
 // TODO: the whole-archive caps the ingest boundary enforces
 // (`MAX_NAR_ENTRIES`, `MAX_NAR_INDEX_BYTES` — `r[store.ingest.tree-bounds]`)
 // are not enforced here, only the per-axis ones above. Adding them means
@@ -232,91 +306,177 @@ impl<W: Write> Write for CountingWriter<W> {
 // before bytes hit the wire becomes worth the extra plumbing.
 fn stream_node(
     w: &mut impl Write,
+    parent: std::os::fd::BorrowedFd<'_>,
+    name: &std::ffi::CStr,
     path: &std::path::Path,
     depth: usize,
-    name: &[u8],
+    nar_name: &[u8],
     obs: &mut impl WalkObserver,
 ) -> Result<()> {
+    use nix::errno::Errno;
+    use nix::fcntl::{OFlag, openat};
+    use nix::sys::stat::Mode;
+
     if depth > MAX_NAR_DEPTH {
         return Err(NarError::NestingTooDeep(depth));
     }
-    let metadata = std::fs::symlink_metadata(path)?;
+    let opened = openat(
+        parent,
+        name,
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
+        Mode::empty(),
+    );
     frame::node_open(w)?;
 
-    if metadata.is_symlink() {
-        let target = std::fs::read_link(path)?;
-        let target = target.into_os_string().into_string().map_err(|os_str| {
-            NarError::Io(io::Error::other(format!(
-                "symlink target is not valid UTF-8: {os_str:?}"
-            )))
-        })?;
-        frame::symlink(w, target.as_bytes())?;
-        obs.symlink(name, target.as_bytes())?;
-    } else if metadata.is_dir() {
-        frame::directory_open(w)?;
-        obs.enter_dir(name)?;
-        // Collect + sort entries for deterministic output (same as
-        // node_from_path — NAR requires sorted entries).
-        let mut entries: Vec<_> = std::fs::read_dir(path)?.collect::<io::Result<Vec<_>>>()?;
-        if entries.len() >= MAX_DIRECTORY_ENTRIES {
-            return Err(NarError::TooManyEntries(entries.len()));
-        }
-        entries.sort_by_key(|e| e.file_name());
-        for entry in entries {
-            let name = entry.file_name().into_string().map_err(|os_str| {
-                NarError::Io(io::Error::other(format!(
-                    "directory entry name is not valid UTF-8: {os_str:?}"
-                )))
-            })?;
-            frame::entry_open(w, name.as_bytes())?;
-            stream_node(w, &entry.path(), depth + 1, name.as_bytes(), obs)?;
-            frame::entry_close(w)?;
-        }
-        obs.leave_dir()?;
-    } else if metadata.file_type().is_file() {
-        use std::os::unix::fs::PermissionsExt;
-        let executable = metadata.permissions().mode() & 0o111 != 0;
-        let len = metadata.len();
-
-        // THE POINT: the header ends with the length prefix, then contents
-        // stream in chunks. `write_bytes` would need the whole thing in a
-        // slice; we unfold it.
-        frame::regular_header(w, executable, len)?;
-        obs.file_begin(name, executable, len)?;
-        let mut f = std::fs::File::open(path)?;
-        let mut buf = vec![0u8; STREAM_CHUNK];
-        let mut remaining = len;
-        while remaining > 0 {
-            let to_read = (STREAM_CHUNK as u64).min(remaining) as usize;
-            let n = f.read(&mut buf[..to_read])?;
-            if n == 0 {
-                // Short read — file shrank between symlink_metadata and now.
-                // See function docs. The NAR is already corrupt at this
-                // point (we wrote `len` as the length prefix, but can't
-                // provide that many bytes). Fail loud.
-                return Err(NarError::Io(io::Error::other(format!(
-                    "file {path:?} truncated during dump: expected {len} bytes, \
-                     short read at {} ({} remaining). Is the overlay upper \
-                     being mutated?",
-                    len - remaining,
-                    remaining
-                ))));
+    match opened {
+        // O_NOFOLLOW refused a symlink in the final component — the
+        // entry IS a symlink.
+        Err(Errno::ELOOP) => stream_symlink(w, parent, name, path, nar_name, obs)?,
+        // O_RDONLY|O_NONBLOCK on a socket. Nix throws "unsupported
+        // type" here; builders are untrusted — fail fast.
+        Err(Errno::ENXIO) => return Err(NarError::UnsupportedFileType(path.to_path_buf())),
+        Err(e) => return Err(NarError::Io(e.into())),
+        Ok(fd) => {
+            let f = std::fs::File::from(fd);
+            // Type decision from the opened fd (`fstat`) — the fd pins
+            // the inode, so type, metadata, and contents below are all
+            // read from the same object.
+            let meta = f.metadata()?;
+            if meta.is_dir() {
+                // Take the iteration handle from the held fd NOW;
+                // listing and every per-child openat go through it, so
+                // a concurrent dir→symlink swap retargets nothing.
+                let mut dir =
+                    nix::dir::Dir::from_fd(f.into()).map_err(|e| NarError::Io(e.into()))?;
+                frame::directory_open(w)?;
+                obs.enter_dir(nar_name)?;
+                // Collect + sort entries for deterministic output (same
+                // as node_from_path — NAR requires sorted entries).
+                let mut names: Vec<Vec<u8>> = Vec::new();
+                for entry in dir.iter() {
+                    let entry = entry.map_err(|e| NarError::Io(e.into()))?;
+                    let bytes = entry.file_name().to_bytes();
+                    if bytes == b"." || bytes == b".." {
+                        continue;
+                    }
+                    names.push(bytes.to_vec());
+                }
+                if names.len() >= MAX_DIRECTORY_ENTRIES {
+                    return Err(NarError::TooManyEntries(names.len()));
+                }
+                names.sort_unstable();
+                for name_bytes in names {
+                    let entry_name = String::from_utf8(name_bytes).map_err(|e| {
+                        use std::os::unix::ffi::OsStringExt;
+                        let os_str = std::ffi::OsString::from_vec(e.into_bytes());
+                        NarError::Io(io::Error::other(format!(
+                            "directory entry name is not valid UTF-8: {os_str:?}"
+                        )))
+                    })?;
+                    frame::entry_open(w, entry_name.as_bytes())?;
+                    let cname = std::ffi::CString::new(entry_name.as_bytes())
+                        .expect("readdir entry names never contain NUL");
+                    stream_node(
+                        w,
+                        std::os::fd::AsFd::as_fd(&dir),
+                        &cname,
+                        &path.join(&entry_name),
+                        depth + 1,
+                        entry_name.as_bytes(),
+                        obs,
+                    )?;
+                    frame::entry_close(w)?;
+                }
+                obs.leave_dir()?;
+            } else if meta.is_file() {
+                stream_regular(w, f, &meta, path, nar_name, obs)?;
+            } else {
+                // FIFO or device node (O_NONBLOCK above already kept a
+                // writer-less FIFO from hanging the open).
+                return Err(NarError::UnsupportedFileType(path.to_path_buf()));
             }
-            w.write_all(&buf[..n])?;
-            obs.file_data(&buf[..n])?;
-            remaining -= n as u64;
         }
-        // NAR padding to 8-byte boundary (same as write_bytes).
-        frame::contents_padding(w, len)?;
-        obs.file_end()?;
-    } else {
-        // FIFO/socket/device. A FIFO would hang File::open(O_RDONLY)
-        // forever; Nix throws "unsupported type" here. Builders are
-        // untrusted — fail fast.
-        return Err(NarError::UnsupportedFileType(path.to_path_buf()));
     }
 
     frame::node_close(w)?;
+    Ok(())
+}
+
+/// `regular` arm of [`stream_node`]: header fields from the fstat of the
+/// held fd, then contents streamed from that same fd. Separate function
+/// so its locals stay off the directory-recursion stack — see
+/// [`restore_regular`].
+fn stream_regular(
+    w: &mut impl Write,
+    mut f: std::fs::File,
+    meta: &std::fs::Metadata,
+    path: &std::path::Path,
+    nar_name: &[u8],
+    obs: &mut impl WalkObserver,
+) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let executable = meta.permissions().mode() & 0o111 != 0;
+    let len = meta.len();
+
+    // THE POINT: the header ends with the length prefix, then contents
+    // stream in chunks. `write_bytes` would need the whole thing in a
+    // slice; we unfold it.
+    frame::regular_header(w, executable, len)?;
+    obs.file_begin(nar_name, executable, len)?;
+    let mut buf = vec![0u8; STREAM_CHUNK];
+    let mut remaining = len;
+    while remaining > 0 {
+        let to_read = (STREAM_CHUNK as u64).min(remaining) as usize;
+        let n = f.read(&mut buf[..to_read])?;
+        if n == 0 {
+            // Short read — file shrank between the fstat and now. See
+            // dump_path_streaming docs. The NAR is already corrupt at
+            // this point (we wrote `len` as the length prefix, but
+            // can't provide that many bytes). Fail loud.
+            return Err(NarError::Io(io::Error::other(format!(
+                "file {path:?} truncated during dump: expected {len} bytes, \
+                 short read at {} ({} remaining). Is the overlay upper \
+                 being mutated?",
+                len - remaining,
+                remaining
+            ))));
+        }
+        w.write_all(&buf[..n])?;
+        obs.file_data(&buf[..n])?;
+        remaining -= n as u64;
+    }
+    // NAR padding to 8-byte boundary (same as write_bytes).
+    frame::contents_padding(w, len)?;
+    obs.file_end()?;
+    Ok(())
+}
+
+/// `symlink` arm of [`stream_node`] — see [`stream_regular`] for why it
+/// is a separate function.
+fn stream_symlink(
+    w: &mut impl Write,
+    parent: std::os::fd::BorrowedFd<'_>,
+    name: &std::ffi::CStr,
+    path: &std::path::Path,
+    nar_name: &[u8],
+    obs: &mut impl WalkObserver,
+) -> Result<()> {
+    // The ELOOP that routed here proves the entry was a symlink at open
+    // time; if it has been swapped again since, readlinkat fails
+    // (EINVAL) and the dump aborts — it never silently serializes a
+    // different node kind.
+    let target = nix::fcntl::readlinkat(parent, name).map_err(|e| {
+        NarError::Io(io::Error::other(format!(
+            "failed to read symlink target of {path:?}: {e}"
+        )))
+    })?;
+    let target = target.into_string().map_err(|os_str| {
+        NarError::Io(io::Error::other(format!(
+            "symlink target is not valid UTF-8: {os_str:?}"
+        )))
+    })?;
+    frame::symlink(w, target.as_bytes())?;
+    obs.symlink(nar_name, target.as_bytes())?;
     Ok(())
 }
 

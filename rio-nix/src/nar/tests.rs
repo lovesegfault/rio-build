@@ -496,6 +496,172 @@ fn streaming_byte_identical_single_file() -> anyhow::Result<()> {
 }
 
 // -----------------------------------------------------------------------
+// dump walk vs concurrent mutation of the dumped tree
+// -----------------------------------------------------------------------
+
+/// Observer that runs a closure once when the walk reaches a named
+/// entry. Lets a test deterministically mutate the dumped tree at a
+/// precise point *mid-dump* — simulating a concurrent attacker (build
+/// code with write access to the overlay upper) without an actual race.
+struct SwapOnEntry<F: FnMut()> {
+    name: &'static [u8],
+    trigger: Option<F>,
+}
+
+impl<F: FnMut()> SwapOnEntry<F> {
+    fn fire_if(&mut self, name: &[u8]) {
+        if name == self.name
+            && let Some(mut t) = self.trigger.take()
+        {
+            t();
+        }
+    }
+}
+
+impl<F: FnMut()> WalkObserver for SwapOnEntry<F> {
+    fn enter_dir(&mut self, name: &[u8]) -> io::Result<()> {
+        self.fire_if(name);
+        Ok(())
+    }
+    fn file_begin(&mut self, name: &[u8], _executable: bool, _size: u64) -> io::Result<()> {
+        self.fire_if(name);
+        Ok(())
+    }
+}
+
+/// THE dirfd-conversion guarantee on the dump side: swapping a regular
+/// file for a symlink mid-walk must not serialize the symlink TARGET's
+/// contents. Path-based traversal made the type decision
+/// (`symlink_metadata`) and the content open (`File::open`) resolve the
+/// path independently; an attacker swapping the file for a symlink
+/// between the two had an arbitrary host-readable file's bytes
+/// published as build output (exfiltration through the store). This
+/// test is red on that code: the trigger fires after the type decision,
+/// and the secret's bytes end up in the NAR.
+#[test]
+fn dump_swap_file_to_symlink_does_not_exfiltrate() -> anyhow::Result<()> {
+    let tmp = tempfile::TempDir::new()?;
+    // "Host" file outside the dumped tree, same length as the swapped
+    // file (the length the path-based walk had already committed to
+    // the NAR header from the pre-open stat).
+    let secret = tmp.path().join("host-secret");
+    std::fs::write(&secret, b"EXFILTRATED-DATA")?;
+    let root = tmp.path().join("out");
+    std::fs::create_dir(&root)?;
+    std::fs::write(root.join("a"), b"first entry")?;
+    std::fs::write(root.join("b"), b"ORIGINAL-CONTENT")?;
+
+    let target = root.join("b");
+    let mut obs = SwapOnEntry {
+        name: b"b",
+        trigger: Some(move || {
+            std::fs::remove_file(&target).unwrap();
+            std::os::unix::fs::symlink(&secret, &target).unwrap();
+        }),
+    };
+    let mut nar = Vec::new();
+    let res = dump_path_observed(&root, &mut nar, &mut obs);
+    assert!(
+        !nar.windows(16).any(|w| w == b"EXFILTRATED-DATA"),
+        "mid-dump file→symlink swap was followed: host file contents \
+         serialized into the NAR"
+    );
+    // The fd held from before the swap still reads the original file.
+    res?;
+    assert!(nar.windows(16).any(|w| w == b"ORIGINAL-CONTENT"));
+    Ok(())
+}
+
+/// Directory variant: swapping a subdirectory for a symlink mid-walk
+/// must not serialize the symlink target's tree. Path-based traversal
+/// re-resolved the directory path for `read_dir` after the type
+/// decision — a swap between the two serialized an arbitrary
+/// host-readable directory (every file under it) as build output.
+#[test]
+fn dump_swap_dir_to_symlink_does_not_serialize_victim() -> anyhow::Result<()> {
+    let tmp = tempfile::TempDir::new()?;
+    let victim = tmp.path().join("victim");
+    std::fs::create_dir(&victim)?;
+    std::fs::write(victim.join("loot"), b"VICTIM-DIR-DATA")?;
+    let root = tmp.path().join("out");
+    std::fs::create_dir_all(root.join("sub"))?;
+    std::fs::write(root.join("sub/inner"), b"innocent")?;
+
+    let sub = root.join("sub");
+    let mut obs = SwapOnEntry {
+        name: b"sub",
+        trigger: Some(move || {
+            std::fs::remove_dir_all(&sub).unwrap();
+            std::os::unix::fs::symlink(&victim, &sub).unwrap();
+        }),
+    };
+    let mut nar = Vec::new();
+    // Success vs error is secondary (the attacker deleted the subtree
+    // mid-walk); the invariant is that no victim bytes were serialized.
+    let _ = dump_path_observed(&root, &mut nar, &mut obs);
+    assert!(
+        !nar.windows(15).any(|w| w == b"VICTIM-DIR-DATA"),
+        "mid-dump dir→symlink swap was followed: victim directory \
+         contents serialized into the NAR"
+    );
+    assert!(
+        !nar.windows(4).any(|w| w == b"loot"),
+        "mid-dump dir→symlink swap was followed: victim entry name in NAR"
+    );
+    Ok(())
+}
+
+/// A writer-less FIFO planted in the dumped tree must fail fast with
+/// `UnsupportedFileType` — never hang. The per-entry open uses
+/// `O_NONBLOCK`, so the FIFO opens immediately and the fstat type check
+/// rejects it (a blocking `open(O_RDONLY)` would sleep until a writer
+/// appeared).
+#[test]
+fn dump_fifo_in_tree_rejected_fast() -> anyhow::Result<()> {
+    let tmp = tempfile::TempDir::new()?;
+    let root = tmp.path().join("out");
+    std::fs::create_dir(&root)?;
+    nix::unistd::mkfifo(
+        &root.join("pipe"),
+        nix::sys::stat::Mode::from_bits_truncate(0o644),
+    )?;
+    let mut nar = Vec::new();
+    let res = dump_path_streaming(&root, &mut nar);
+    assert!(
+        matches!(res, Err(NarError::UnsupportedFileType(_))),
+        "got {res:?}"
+    );
+    Ok(())
+}
+
+/// Swapping a regular file for a writer-less FIFO mid-walk must not
+/// park the dump task. Path-based traversal opened the path AFTER the
+/// type decision, so the blocking `open(O_RDONLY)` of the planted FIFO
+/// slept until a writer appeared — this test HANGS on that code. The
+/// fd-relative walk reads from the fd opened before the swap and the
+/// dump completes with the original contents.
+#[test]
+fn dump_swap_file_to_fifo_does_not_hang() -> anyhow::Result<()> {
+    let tmp = tempfile::TempDir::new()?;
+    let root = tmp.path().join("out");
+    std::fs::create_dir(&root)?;
+    std::fs::write(root.join("a"), b"first entry")?;
+    std::fs::write(root.join("b"), b"ORIGINAL-CONTENT")?;
+    let target = root.join("b");
+    let mut obs = SwapOnEntry {
+        name: b"b",
+        trigger: Some(move || {
+            std::fs::remove_file(&target).unwrap();
+            nix::unistd::mkfifo(&target, nix::sys::stat::Mode::from_bits_truncate(0o644)).unwrap();
+        }),
+    };
+    let mut nar = Vec::new();
+    dump_path_observed(&root, &mut nar, &mut obs)?;
+    assert!(nar.windows(16).any(|w| w == b"ORIGINAL-CONTENT"));
+    Ok(())
+}
+
+// -----------------------------------------------------------------------
 // restore_path_streaming round-trip with dump_path_streaming
 // -----------------------------------------------------------------------
 
