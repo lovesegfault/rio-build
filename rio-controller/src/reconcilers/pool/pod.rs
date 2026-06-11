@@ -13,9 +13,10 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{
     Capabilities, ConfigMapVolumeSource, Container, ContainerPort, DownwardAPIVolumeFile,
-    DownwardAPIVolumeSource, EmptyDirVolumeSource, EnvVar, EnvVarSource, HostPathVolumeSource,
-    NodeSelectorRequirement, NodeSelectorTerm, ObjectFieldSelector, PodSecurityContext, PodSpec,
-    SeccompProfile, SecurityContext, Toleration, Volume, VolumeMount,
+    DownwardAPIVolumeSource, EmptyDirVolumeSource, EnvVar, EnvVarSource, HTTPGetAction,
+    HostPathVolumeSource, NodeSelectorRequirement, NodeSelectorTerm, ObjectFieldSelector,
+    PodSecurityContext, PodSpec, Probe, SeccompProfile, SecurityContext, Toleration, Volume,
+    VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::ResourceExt;
@@ -1156,12 +1157,53 @@ fn build_executor_container(
             },
         ]),
 
-        // No liveness/readiness/startup probes: executor pods are
-        // one-shot Jobs. activeDeadlineSeconds bounds hangs; nothing
-        // routes via Service (no readiness gate); and a CPU-pegged
-        // build would fail a 1s-timeout liveness probe → kubelet
-        // SIGKILL mid-build → FUSE/overlay torn down → nix-daemon EIO
-        // (I-114).
+        // live_056-b: READINESS wired to the builder's SERVING state
+        // — httpGet /servingz on the builder's own health server,
+        // which answers 200 iff the serving-state file exists
+        // (rio_common::k8s::BUILDER_SERVING_STATE_FILE, written once
+        // connect_upstreams succeeds: post-connect, pre-first-pull).
+        // Pod Ready ⟺ past cold start and asking for work — a
+        // policy-blackholed builder is visibly NotReady for exactly
+        // the un-served window (W9-CO), and JobStatus.ready /
+        // PoolStatus.ready_replicas finally mean what they document.
+        // The is_pending_job reap boundary IMPROVES: started-but-not-
+        // serving reads ready==0 (reapable-pending) — safe, because a
+        // builder with no scheduler channel cannot hold an assignment,
+        // and the pulled-while-probe-lagged sliver is covered by the
+        // live-pod recheck + the delete chokepoint's attempt veto.
+        // Mechanism note (divergence recorded): an exec test on the
+        // file was rejected — the builder image ships no coreutils/
+        // shell (nix + fuse3 + util-linuxMinimal only), so an exec
+        // probe could never pass; the in-tree HealthClient prober
+        // (rio-proto/src/client/balance.rs `probe`) is the cited
+        // CLIENT-side precedent and stays untouched — kubelet's
+        // httpGet against the existing health port is the pod-side
+        // form. The probe is flap-free by construction: the file is
+        // created once and never removed for the pod's one-shot life.
+        readiness_probe: Some(Probe {
+            http_get: Some(HTTPGetAction {
+                path: Some("/servingz".into()),
+                port: k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::String(
+                    "health".into(),
+                ),
+                ..Default::default()
+            }),
+            // Fast flip (the reap boundary consumes this): 2s period,
+            // first probe immediately; one success marks Ready.
+            period_seconds: Some(2),
+            timeout_seconds: Some(1),
+            failure_threshold: Some(3),
+            success_threshold: Some(1),
+            ..Default::default()
+        }),
+
+        // No LIVENESS/STARTUP probes: executor pods are one-shot
+        // Jobs, kill-wired by EXIT (D3 — the cold-start budget exits
+        // nonzero; activeDeadlineSeconds bounds hangs) and a
+        // CPU-pegged build would fail a 1s-timeout liveness probe →
+        // kubelet SIGKILL mid-build → FUSE/overlay torn down →
+        // nix-daemon EIO (I-114's liveness half STANDS; only its
+        // readiness half is revisited above).
         ..Default::default()
     }
 }

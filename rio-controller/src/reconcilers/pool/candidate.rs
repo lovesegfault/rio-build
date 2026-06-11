@@ -561,27 +561,52 @@ impl EvidenceState {
 
 /// Exponential floor cap for the verdict-free-respawn backoff
 /// (bug_028 futility breaker). Schedule: `JOB_REQUEUE × 2^(deaths-1)`
-/// seconds, capped here --- 10, 20, 40, 80, 80, ... The base is the
-/// reconcile cadence (the as-built respawn rate: live exhibit
-/// 2026-06-09, 759 intents respawned 2-8x with ZERO NoEligibleSource
-/// verdicts over 41 min --- every reconcile re-spawned a same-named
-/// Job for an intent whose every prior Job died without a verdict,
-/// converting a TOTAL builder failure into EC2 spend at tick rate).
+/// seconds, capped here --- 10, 20, 40, 80, 160, 320, 640, 1280. The
+/// base is the reconcile cadence (the as-built respawn rate: live
+/// exhibit 2026-06-09, 759 intents respawned 2-8x with ZERO
+/// NoEligibleSource verdicts over 41 min --- every reconcile
+/// re-spawned a same-named Job for an intent whose every prior Job
+/// died without a verdict, converting a TOTAL builder failure into
+/// EC2 spend at tick rate).
 ///
-/// The cap MUST stay below [`POOL_STREAK_ORPHAN_EXPIRY_SECS`] (FS-6
-/// clamp, asserted at compile time below): the record's `touched`
-/// refreshes only on evaluated ticks, so a cap above the expiry would
-/// let a record orphan-expire MID-BACKOFF and silently reset the
-/// respawn cadence to ~the expiry regardless of this const. 80 s =
-/// three doublings of the 10 s cadence --- an order-of-magnitude
-/// spend reduction under total failure while a genuine verdict (the
-/// reset lane) restores full cadence immediately.
+/// live_056-b: 1280 s = seven doublings --- the ladder OUTGROWS any
+/// fixed reap period (the incident orbit: the 80 s cap sat
+/// structurally below the 300 s `ORPHAN_REAP_GRACE`, so a wedged
+/// builder's reap → respawn → wedge cycle never escalated and never
+/// gave up; with the cap past the reap period, respawn intervals
+/// strictly escalate across reap cycles until
+/// [`RESPAWN_GIVE_UP_DEATHS`] stops the orbit entirely).
+///
+/// The retired FS-6 compile-time clamp (`cap <
+/// POOL_STREAK_ORPHAN_EXPIRY_SECS`) guarded mid-backoff
+/// orphan-expiry --- a record whose `touched` went stale DURING its
+/// window silently reset the cadence to ~the expiry. That guard is
+/// now STRUCTURAL, not numeric (option (b) of the joint cap/expiry
+/// derivation): [`RespawnEntry::blocks_respawn`] entries are IMMUNE
+/// to the touched-staleness expiry in [`PoolStreaks::step`], so
+/// mid-backoff expiry is unrepresentable BY VALUE and the cap and
+/// the streak-lane expiry are independent again
+/// ([`POOL_STREAK_ORPHAN_EXPIRY_SECS`] = 120 s stands untouched for
+/// the NoEligibleSource streak lane).
 // r[impl ctrl.pool.respawn-backoff+2]
-pub(crate) const RESPAWN_BACKOFF_CAP_SECS: u64 = 80;
-const _: () = assert!(
-    RESPAWN_BACKOFF_CAP_SECS < POOL_STREAK_ORPHAN_EXPIRY_SECS,
-    "FS-6: a backoff cap at/above the orphan expiry silently clamps at the expiry"
-);
+pub(crate) const RESPAWN_BACKOFF_CAP_SECS: u64 = 1280;
+
+/// live_056-b give-up threshold: after this many verdict-free deaths
+/// the controller STOPS respawning --- `respawn_blocked` answers true
+/// unconditionally until a NAMED resolution
+/// ([`PoolStreaks::note_resolution`]) clears the record. 8 deaths =
+/// the full ladder ridden (10+20+40+80+160+320+640 s of escalating
+/// withholds plus the Job lifetimes --- roughly an hour of structured
+/// retreat); a builder that died verdict-free eight times is
+/// structurally wedged, and orbiting further is invisible spend. The
+/// give-up surfaces on the controller's operator verdict plane (K8s
+/// Event reason=RespawnGiveUp + the GaveUp reap-disposition letter);
+/// the scheduler's view is deliberately unchanged --- the intent
+/// stays queued and its own deadlines bound it
+/// (ReportNoEligibleSource has no reason field; laundering give-up
+/// through the poison lane would misuse a different verdict).
+// r[impl ctrl.pool.respawn-backoff+2]
+pub(crate) const RESPAWN_GIVE_UP_DEATHS: u32 = 8;
 
 /// The backoff floor after `deaths` verdict-free Job deaths.
 fn respawn_backoff(deaths: u32) -> std::time::Duration {
@@ -651,6 +676,19 @@ struct StreakEntry {
     touched: std::time::Instant,
 }
 
+/// The observation [`PoolStreaks::note_verdict_free_death`] returns
+/// (live_056-b): the post-step death count plus the give-up EDGE
+/// (true exactly when this death crossed the threshold --- the caller
+/// mints the GaveUp letter + the RespawnGiveUp Event once, not per
+/// tick).
+#[derive(Debug, Clone, Copy)]
+pub struct DeathNote {
+    /// Verdict-free deaths recorded for the intent, after this one.
+    pub deaths: u32,
+    /// True iff THIS death crossed [`RESPAWN_GIVE_UP_DEATHS`].
+    pub gave_up_edge: bool,
+}
+
 /// One intent's verdict-free-respawn record (bug_028 futility
 /// breaker). Fields private: mutation only through the typed
 /// [`PoolStreaks`] API.
@@ -669,8 +707,27 @@ struct RespawnEntry {
     /// phases, whose alive floors all exceed the expiry); the shared
     /// orphan expiry bounds the map. Only genuinely JOBLESS fold-skip
     /// silence ages it out --- the breaker fails open with the spawn
-    /// arm's documented posture.
+    /// arm's documented posture --- and live_056-b narrows even that:
+    /// a record that CURRENTLY blocks respawn ([`Self::blocks_respawn`])
+    /// is expiry-immune (option (b): mid-backoff and gave-up states
+    /// are unrepresentable as expiry casualties).
     touched: std::time::Instant,
+}
+
+impl RespawnEntry {
+    /// The withhold law, single-sourced (live_056-b): respawn is
+    /// blocked while the entry is inside its escalating backoff
+    /// window OR past the give-up threshold (blocked until a named
+    /// resolution removes the record). Consumed by BOTH
+    /// [`PoolStreaks::respawn_blocked`] (the spawn filter) and
+    /// [`PoolStreaks::step`]'s expiry-immunity arm --- one
+    /// definition, so the spawn law and the retention law cannot
+    /// drift.
+    // r[impl ctrl.pool.respawn-backoff+2]
+    fn blocks_respawn(&self, now: std::time::Instant) -> bool {
+        self.deaths >= RESPAWN_GIVE_UP_DEATHS
+            || now.saturating_duration_since(self.last_death) < respawn_backoff(self.deaths)
+    }
 }
 
 impl PoolStreaks {
@@ -724,7 +781,18 @@ impl PoolStreaks {
             }
         }
         self.respawn.retain(|_, r| {
-            now.saturating_duration_since(r.touched).as_secs() < POOL_STREAK_ORPHAN_EXPIRY_SECS
+            // live_056-b option (b): an entry that currently BLOCKS
+            // respawn (mid-backoff or gave-up) is immune to the
+            // touched-staleness expiry --- mid-backoff expiry is
+            // unrepresentable by value, so the ladder may extend past
+            // the expiry (the retired FS-6 compile-time clamp)
+            // without the silent cadence reset it guarded against.
+            // Jobless silence expires a record only once its window
+            // has fully run out (and never a gave-up record --- that
+            // state holds until a named resolution).
+            r.blocks_respawn(now)
+                || now.saturating_duration_since(r.touched).as_secs()
+                    < POOL_STREAK_ORPHAN_EXPIRY_SECS
         });
         // bug_028 retain law: drop this pool's entry iff the fold
         // EVALUATED the intent and its gated set no longer contains it
@@ -767,13 +835,18 @@ impl PoolStreaks {
     /// and the same-named respawn would otherwise fire at reconcile
     /// cadence). Steps the record (deaths+1) and re-anchors the
     /// backoff at this observation.
+    ///
+    /// live_056-b: returns the [`DeathNote`] so the caller can mint
+    /// the escalation/give-up reap-disposition letters and the
+    /// give-up Event AT THE EDGE (`gave_up_edge` is true exactly once
+    /// --- the call that crosses [`RESPAWN_GIVE_UP_DEATHS`]).
     // r[impl ctrl.pool.respawn-backoff+2]
     pub fn note_verdict_free_death(
         &mut self,
         pool: &PoolKey,
         intent: &str,
         now: std::time::Instant,
-    ) {
+    ) -> DeathNote {
         let e = self
             .respawn
             .entry((pool.clone(), intent.to_owned()))
@@ -782,9 +855,14 @@ impl PoolStreaks {
                 last_death: now,
                 touched: now,
             });
+        let was_given_up = e.deaths >= RESPAWN_GIVE_UP_DEATHS;
         e.deaths = e.deaths.saturating_add(1);
         e.last_death = now;
         e.touched = now;
+        DeathNote {
+            deaths: e.deaths,
+            gave_up_edge: !was_given_up && e.deaths >= RESPAWN_GIVE_UP_DEATHS,
+        }
     }
 
     /// merged_bug_080(2a) structural refresh: a live or terminal
@@ -908,9 +986,7 @@ impl PoolStreaks {
     pub fn respawn_blocked(&self, pool: &PoolKey, intent: &str, now: std::time::Instant) -> bool {
         self.respawn
             .get(&(pool.clone(), intent.to_owned()))
-            .is_some_and(|r| {
-                now.saturating_duration_since(r.last_death) < respawn_backoff(r.deaths)
-            })
+            .is_some_and(|r| r.blocks_respawn(now))
     }
 }
 
@@ -1921,5 +1997,167 @@ mod proptests {
                 row.expected_divergence,
             );
         }
+    }
+
+    // r[verify ctrl.pool.respawn-backoff+2]
+    /// W9-CP (live_056-b): under a persistent wedge (a builder that
+    /// dies verdict-free every ORPHAN_REAP_GRACE=300s cycle),
+    /// same-name respawn intervals STRICTLY ESCALATE across reap
+    /// cycles — the ladder outgrows ANY fixed reap period, so the
+    /// reap → respawn → wedge orbit is structurally impossible.
+    /// Interval-ratio witness, driven with Instant arithmetic (no
+    /// wall-clock gates). Pre-fix red (transcript in the commit
+    /// body): flat at [10, 20, 40, 80, 80, 80] — the 80s cap sat
+    /// below the 300s reap period and the orbit never escalated.
+    #[test]
+    fn w9_cp_respawn_intervals_escalate_past_the_reap_period() {
+        let mut s = PoolStreaks::default();
+        let key = PoolKey::new("rio", "p");
+        let t0 = std::time::Instant::now();
+        let reap_period = std::time::Duration::from_secs(300);
+
+        let mut t = t0;
+        let mut windows: Vec<u64> = Vec::new();
+        for _death in 1..=7u32 {
+            s.note_verdict_free_death(&key, "wedge", t);
+            let w = (0..=4000u64)
+                .find(|d| !s.respawn_blocked(&key, "wedge", t + std::time::Duration::from_secs(*d)))
+                .expect("finite window below the give-up threshold");
+            windows.push(w);
+            t += reap_period;
+        }
+        assert_eq!(
+            windows,
+            vec![10, 20, 40, 80, 160, 320, 640],
+            "the full ladder: JOB_REQUEUE doublings to the 1280s cap"
+        );
+        assert!(
+            windows.windows(2).all(|p| p[1] > p[0]),
+            "strictly escalating across EVERY reap cycle"
+        );
+        assert!(
+            windows.iter().any(|w| *w > reap_period.as_secs()),
+            "the ladder OUTGROWS the reap period — the orbit breaks"
+        );
+    }
+
+    // r[verify ctrl.pool.respawn-backoff+2]
+    /// W9-CP give-up face (live_056-b): the 8th verdict-free death
+    /// crosses RESPAWN_GIVE_UP_DEATHS — the edge fires EXACTLY once,
+    /// respawn stays blocked at ANY future instant (no window), and
+    /// only a NAMED resolution (note_resolution) clears it.
+    #[test]
+    fn w9_cp_give_up_blocks_until_named_resolution() {
+        let mut s = PoolStreaks::default();
+        let key = PoolKey::new("rio", "p");
+        let t0 = std::time::Instant::now();
+
+        let mut edges = Vec::new();
+        let mut t = t0;
+        for _ in 1..=9u32 {
+            let note = s.note_verdict_free_death(&key, "wedge", t);
+            edges.push(note.gave_up_edge);
+            t += std::time::Duration::from_secs(300);
+        }
+        assert_eq!(
+            edges,
+            vec![false, false, false, false, false, false, false, true, false],
+            "the edge fires exactly once, at death {RESPAWN_GIVE_UP_DEATHS}"
+        );
+        // Blocked unconditionally — probe far past any backoff window.
+        assert!(
+            s.respawn_blocked(
+                &key,
+                "wedge",
+                t + std::time::Duration::from_secs(10 * RESPAWN_BACKOFF_CAP_SECS)
+            ),
+            "gave-up: no window ever opens"
+        );
+        // A named resolution clears the record (the ONLY reset lane).
+        let ack = rio_proto::types::ReportAttemptOutcomeResponse {
+            attempt_resolved: true,
+        };
+        let w = VerdictWitness::from_resolved_ack(&ack).expect("resolving ack mints");
+        s.note_resolution(&key, "wedge", w, t);
+        assert!(
+            !s.respawn_blocked(&key, "wedge", t),
+            "a named resolution restores spawn eligibility"
+        );
+    }
+
+    // r[verify ctrl.pool.respawn-backoff+2]
+    /// W9-CP option-(b) arm (live_056-b joint cap/expiry derivation):
+    /// an IN-BACKOFF record under jobless fold-skip silence past
+    /// POOL_STREAK_ORPHAN_EXPIRY_SECS is NOT expired — mid-backoff
+    /// expiry is unrepresentable by value (this arm, not the retired
+    /// FS-6 numeric clamp, now carries the mid-backoff-reset shape);
+    /// a record whose window has fully run out (and is below the
+    /// give-up threshold) still expires — the memory law stands for
+    /// non-blocking records, and the streak-lane expiry semantics
+    /// (120s, NoEligibleSource lane) are untouched.
+    #[test]
+    fn w9_cp_option_b_in_backoff_records_survive_jobless_silence() {
+        let key = PoolKey::new("rio", "p");
+        let t0 = std::time::Instant::now();
+        // The fold-skip shape: nothing evaluated (empty observation).
+        let silence = Observation::from_partition(&[], &[]);
+
+        // (a) Mid-backoff: deaths=5 → 160s window. Silence for 125s
+        // (past the 120s expiry) — the record SURVIVES and still
+        // blocks.
+        let mut s = PoolStreaks::default();
+        for i in 0..5u64 {
+            // Backdate-shaped: all five deaths anchored at t0 (the
+            // last one governs the window).
+            let _ = s.note_verdict_free_death(
+                &key,
+                "wedge",
+                t0 - std::time::Duration::from_secs(1) + std::time::Duration::from_millis(i),
+            );
+        }
+        let t_silent = t0 + std::time::Duration::from_secs(125);
+        let tick = s.begin_tick(&key);
+        let _ = s.step(tick, &silence, t_silent);
+        assert!(
+            s.respawn_blocked(&key, "wedge", t_silent),
+            "left: expired mid-backoff (the FS-6 hazard the numeric \
+             clamp guarded) / right: in-backoff records are \
+             expiry-immune — unrepresentable by value"
+        );
+
+        // (b) Window fully run out (deaths=1 → 10s), silence 125s:
+        // the record expires (memory bound; the next death re-enters
+        // the ladder at 10s — the ladder-position loss priced in the
+        // note_job_alive residual).
+        let mut s2 = PoolStreaks::default();
+        let _ = s2.note_verdict_free_death(&key, "ran-out", t0);
+        let tick2 = s2.begin_tick(&key);
+        let _ = s2.step(tick2, &silence, t_silent);
+        // Re-death after expiry: the ladder restarts at 10s (deaths
+        // would have been 2 → 20s had the record survived).
+        let note = s2.note_verdict_free_death(&key, "ran-out", t_silent);
+        assert_eq!(
+            note.deaths, 1,
+            "a fully-elapsed record expired under silence; the ladder \
+             restarts (position loss only, never an un-backed-off \
+             mid-window respawn)"
+        );
+
+        // (c) GAVE-UP record under the same silence: immune (holds
+        // until a named resolution, never expires).
+        let mut s3 = PoolStreaks::default();
+        for _ in 0..8u32 {
+            let _ = s3.note_verdict_free_death(&key, "gone", t0);
+        }
+        let tick3 = s3.begin_tick(&key);
+        let _ = s3.step(tick3, &silence, t_silent);
+        assert!(
+            s3.respawn_blocked(
+                &key,
+                "gone",
+                t_silent + std::time::Duration::from_secs(100_000)
+            ),
+            "gave-up records are expiry-immune at any horizon"
+        );
     }
 }

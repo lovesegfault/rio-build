@@ -18,6 +18,28 @@ use std::sync::atomic::AtomicBool;
 /// writer and reader.
 pub type ReadyFlag = Arc<AtomicBool>;
 
+/// The builder's health router: the shared `/healthz` + `/readyz`
+/// pair plus the live_056-b `/servingz` SERVING-state endpoint — 200
+/// iff `serving_file` exists (the file `runtime::setup` writes once
+/// `connect_upstreams` succeeds: post-connect, pre-first-pull). The
+/// Job's readiness probe consumes `/servingz`, so Pod Ready ⟺ past
+/// cold start and asking for work; `/readyz` stays the DIFFERENT
+/// pulled/building axis (useful capacity). `serving_file` is a
+/// parameter so the route law is testable without touching the
+/// production path (`rio_common::k8s::BUILDER_SERVING_STATE_FILE`).
+fn builder_health_router(ready: ReadyFlag, serving_file: std::path::PathBuf) -> axum::Router {
+    rio_common::server::health_router(ready).route(
+        "/servingz",
+        axum::routing::get(async move || {
+            if serving_file.exists() {
+                axum::http::StatusCode::OK
+            } else {
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            }
+        }),
+    )
+}
+
 /// Spawn the health server on `addr`. Fire-and-forget via
 /// `spawn_monitored`: if it dies (port conflict), K8s liveness fails
 /// → pod restart → self-healing.
@@ -29,7 +51,10 @@ pub fn spawn_health_server(
     rio_common::server::spawn_axum(
         "health-server",
         addr,
-        rio_common::server::health_router(ready),
+        builder_health_router(
+            ready,
+            std::path::PathBuf::from(rio_common::k8s::BUILDER_SERVING_STATE_FILE),
+        ),
         shutdown,
     );
 }
@@ -87,5 +112,42 @@ mod tests {
             StatusCode::OK,
             "liveness is unconditional — process responding = alive"
         );
+    }
+
+    /// W9-CO, route faces (live_056-b): `/servingz` answers 503
+    /// before the serving-state file exists (a wedged cold-start
+    /// builder is NOT ready) and 200 once it does (a serving builder
+    /// IS) — independent of `/readyz`'s pulled/building axis. Pre-fix
+    /// red: the endpoint did not exist (404 — no probe COULD exist;
+    /// I-114's readiness half), transcript in the commit body.
+    #[tokio::test]
+    async fn w9_co_servingz_tracks_the_serving_state_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let serving = dir.path().join("rio-serving");
+        let ready = Arc::new(AtomicBool::new(false));
+        let app = super::builder_health_router(Arc::clone(&ready), serving.clone());
+
+        // Cold start (file absent): NOT serving — even if /readyz's
+        // flag were set, the axes are independent.
+        ready.store(true, Ordering::Relaxed);
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/servingz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "wedged cold start: never serving, pod stays NotReady"
+        );
+
+        // The builder connects and writes the file: serving.
+        std::fs::write(&serving, b"serving\n").unwrap();
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/servingz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "serving builder is Ready");
     }
 }

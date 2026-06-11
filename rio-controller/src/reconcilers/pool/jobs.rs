@@ -790,10 +790,15 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // `EPHEMERAL_DEADLINE_FLOOR_SECS`, the 600 s terminal TTL) exceeds
     // the 120 s orphan expiry: without this lane the breaker's record
     // died mid-cycle and `deaths` never accumulated past 1. Residual
-    // (disclosed): a >120 s apiserver LIST outage for THIS pool while
-    // sibling pools fold can still expire a record (the `?` above
-    // aborts before this line) --- bounded: no LIST ⇒ no spawn either;
-    // worst case one un-backed-off cycle on recovery.
+    // (re-priced at the live_056-b cap): a >120 s apiserver LIST
+    // outage for THIS pool while sibling pools fold can expire only a
+    // record whose backoff window has FULLY RUN OUT (option (b):
+    // blocking records --- mid-backoff or gave-up --- are
+    // expiry-immune in step's retain), so the loss is the ladder
+    // POSITION, never an un-backed-off respawn: the record was
+    // already spawn-eligible, and the next verdict-free death
+    // re-enters the ladder at 10 s and re-climbs toward the 1280 s
+    // cap. Bounded: no LIST ⇒ no spawn either.
     // r[impl ctrl.pool.respawn-backoff+2]
     ctx.exhausted_streak.lock().note_job_alive(
         &streak_key,
@@ -823,6 +828,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         &jobs.items,
         &intents,
         ctx,
+        pool,
         &name,
         pool.spec.kind,
         &streak_key,
@@ -1362,6 +1368,89 @@ pub(super) async fn mint_spawn_tokens(
     }
 }
 
+/// live_056-b R21: the reap path's terminal-disposition alphabet —
+/// every disposition the reap/respawn machinery mints folds through
+/// ONE chokepoint ([`note_reap_disposition`]) into ONE counter
+/// (`rio_controller_reap_dispositions_total{pool,disposition}`).
+/// Shadow dispositions are unrepresentable: a new reap arm needs a
+/// new letter HERE (rustc exhaustiveness at `as_label` is the
+/// census), and the HELP-alphabet test pins every letter into the
+/// described HELP string. The legacy per-arm counters
+/// (`rio_controller_ephemeral_jobs_reaped_total`,
+/// `rio_controller_orphan_jobs_reaped_total`) keep their published
+/// series; this alphabet is the unified plane over ALL of them.
+///
+/// Divergence (recorded): the book's tentative letter list named a
+/// `respawned` letter — not minted here. A respawn is the loop's
+/// CONTINUATION, not a terminal disposition (R21 binds terminal
+/// dispositions); its observability is the spawn path plus the
+/// W9-CP interval witness, and a letter without a terminal premise
+/// would be the inverse of the shadow-alphabet defect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReapDisposition {
+    /// `reap_excess_pending`: Pending beyond the queue depth.
+    ExcessPending,
+    /// `reap_stale_for_intents` orphan-pending arm: the intent left.
+    OrphanPending,
+    /// `reap_stale_for_intents` terminal arm: a finished Job blocking
+    /// a still-wanted intent's respawn (NameCollision window).
+    StaleTerminal,
+    /// `reap_stale_for_intents` selector-drift arm: a Pending Job
+    /// whose selector no longer matches the scheduler's re-solve.
+    SelectorDrift,
+    /// `reap_orphan_running` (I-165): Running past the grace with no
+    /// scheduler assignment.
+    OrphanRunning,
+    /// A verdict-free death stepped the respawn ladder (the
+    /// escalation edge — minted with the death, before the next
+    /// spawn pass).
+    Escalated,
+    /// The give-up threshold crossed: respawns stop until a named
+    /// resolution (paired with the `RespawnGiveUp` Pool Event).
+    GaveUp,
+}
+
+impl ReapDisposition {
+    /// Every letter (the HELP-alphabet test walks this; adding a
+    /// variant without extending it fails the length assert against
+    /// the exhaustive match below). Test-facing census surface.
+    #[cfg(test)]
+    pub(super) const ALL: [Self; 7] = [
+        Self::ExcessPending,
+        Self::OrphanPending,
+        Self::StaleTerminal,
+        Self::SelectorDrift,
+        Self::OrphanRunning,
+        Self::Escalated,
+        Self::GaveUp,
+    ];
+
+    /// The metric label (rustc-exhaustive — the alphabet census).
+    pub(super) fn as_label(self) -> &'static str {
+        match self {
+            Self::ExcessPending => "excess-pending",
+            Self::OrphanPending => "orphan-pending",
+            Self::StaleTerminal => "stale-terminal",
+            Self::SelectorDrift => "selector-drift",
+            Self::OrphanRunning => "orphan-running",
+            Self::Escalated => "escalated",
+            Self::GaveUp => "gave-up",
+        }
+    }
+}
+
+/// live_056-b R21 chokepoint: the ONE mint site for reap-disposition
+/// letters. Every reap arm and both ladder edges call through here —
+/// `rg note_reap_disposition` is the complete disposition census.
+pub(super) fn note_reap_disposition(pool: &str, d: ReapDisposition) {
+    metrics::counter!(
+        "rio_controller_reap_dispositions_total",
+        "pool" => pool.to_owned(),
+        "disposition" => d.as_label(),
+    )
+    .increment(1);
+}
+
 /// live_051(e): per-Job-uid stale-classification strikes — the
 /// two-tick confirmation on the attempt-affecting reap arms
 /// (`terminal`/`selector-drift`). The first tick a Job classifies
@@ -1484,11 +1573,13 @@ static STALE_STRIKES: std::sync::LazyLock<parking_lot::Mutex<StrikeLedger>> =
 /// reaps UN-wanted intents (no respawn follows) and the
 /// selector-drift arm reaps never-ran Pending Jobs whose respawn is
 /// the INTENDED re-render — neither is a verdict-free death.
+#[allow(clippy::too_many_arguments)] // the build_job precedent: reconcile plumbing, not an API
 pub(super) async fn reap_stale_for_intents(
     jobs_api: &Api<Job>,
     existing: &[Job],
     intents: &[SpawnIntent],
     ctx: &Ctx,
+    pool_obj: &Pool,
     pool: &str,
     kind: ExecutorKind,
     key: &candidate::PoolKey,
@@ -1526,7 +1617,7 @@ pub(super) async fn reap_stale_for_intents(
         let Some(jn) = j.metadata.name.as_deref() else {
             continue;
         };
-        let (params, why) = match want.get(jn) {
+        let (params, disposition) = match want.get(jn) {
             // Not in the current intent set. Pending → orphan: the
             // intent left (cancel / completes-elsewhere / disconnect)
             // and this Job will never receive an assignment. Reap by
@@ -1539,10 +1630,12 @@ pub(super) async fn reap_stale_for_intents(
             // `want.is_empty()` early-return above is the fail-closed
             // gate (scheduler error → no orphan-reap).
             None if is_pending_job(j) && job_older_than(j, REAP_PENDING_GRACE) => {
-                (DeleteParams::foreground(), "orphan-pending")
+                (DeleteParams::foreground(), ReapDisposition::OrphanPending)
             }
             None => continue,
-            Some(_) if !is_active_job(j) => (DeleteParams::background(), "terminal"),
+            Some(_) if !is_active_job(j) => {
+                (DeleteParams::background(), ReapDisposition::StaleTerminal)
+            }
             Some(want_sel)
                 if is_pending_job(j)
                     && j.metadata
@@ -1552,15 +1645,20 @@ pub(super) async fn reap_stale_for_intents(
                         .map(String::as_str)
                         != Some(want_sel.as_str()) =>
             {
-                (DeleteParams::foreground(), "selector-drift")
+                (DeleteParams::foreground(), ReapDisposition::SelectorDrift)
             }
             Some(_) => continue,
         };
+        // R21: the log field IS the metric label — one alphabet.
+        let why = disposition.as_label();
         // live_051(e): two-tick confirmation on the attempt-affecting
         // arms — the first stale classification records a strike and
         // defers; the orphan-pending arm keeps its single-tick path
         // (already age-gated by REAP_PENDING_GRACE).
-        if matches!(why, "terminal" | "selector-drift") {
+        if matches!(
+            disposition,
+            ReapDisposition::StaleTerminal | ReapDisposition::SelectorDrift
+        ) {
             let Some(uid) = j.metadata.uid.clone() else {
                 // No uid: cannot key a strike — defer conservatively
                 // (apiserver objects always carry one in practice).
@@ -1643,7 +1741,7 @@ pub(super) async fn reap_stale_for_intents(
                         unreachable!("Deferred is peeled by the preceding match arm")
                     }
                 };
-                if why == "terminal"
+                if matches!(disposition, ReapDisposition::StaleTerminal)
                     && no_verdict_at_delete
                     && let Some(intent_id) = super::job::job_intent_id(j)
                     && !intent_id.is_empty()
@@ -1690,16 +1788,52 @@ pub(super) async fn reap_stale_for_intents(
                                 .is_some()
                             });
                     if !covered_by_build {
-                        ctx.exhausted_streak.lock().note_verdict_free_death(
+                        // Lock scope ends at the statement — the
+                        // Event publish below must not hold it.
+                        let note = ctx.exhausted_streak.lock().note_verdict_free_death(
                             key,
                             intent_id,
                             std::time::Instant::now(),
                         );
+                        // live_056-b: the ladder edges are alphabet
+                        // letters (R21) — Escalated with every
+                        // verdict-free death, GaveUp exactly once at
+                        // the threshold, paired with the operator
+                        // verdict-plane Event on the Pool.
+                        note_reap_disposition(pool, ReapDisposition::Escalated);
+                        if note.gave_up_edge {
+                            note_reap_disposition(pool, ReapDisposition::GaveUp);
+                            warn!(
+                                pool, intent = %intent_id, deaths = note.deaths,
+                                "respawn GIVE-UP: verdict-free deaths crossed the \
+                                 threshold; respawns stop until a named resolution \
+                                 (live_056-b)"
+                            );
+                            ctx.publish_event(
+                                pool_obj,
+                                &kube::runtime::events::Event {
+                                    type_: kube::runtime::events::EventType::Warning,
+                                    reason: "RespawnGiveUp".into(),
+                                    note: Some(format!(
+                                        "intent {intent_id}: {} verdict-free builder \
+                                         deaths; respawns stop until a named \
+                                         resolution (scheduler verdict or operator \
+                                         action). The intent stays queued.",
+                                        note.deaths
+                                    )),
+                                    action: "Reconcile".into(),
+                                    secondary: None,
+                                },
+                            )
+                            .await;
+                        }
                     }
                 }
+                note_reap_disposition(pool, disposition);
                 reaped.insert(jn.to_owned());
             }
             Err(e) if e.is_not_found() => {
+                note_reap_disposition(pool, disposition);
                 reaped.insert(jn.to_owned());
             }
             Err(e) => {
@@ -2093,6 +2227,61 @@ mod tests {
             l.strikes.is_empty(),
             "absent-pool rows vanish at the stamp horizon (memory bound)"
         );
+    }
+
+    /// live_056-b R21 HELP-alphabet pin: the
+    /// rio_controller_reap_dispositions_total describe HELP names
+    /// EVERY letter of the alphabet — a new variant fails here until
+    /// both `ALL` and the HELP are extended (and the (ttttt) regen
+    /// pair refreshes docs/gen + the helm metric-help surface).
+    #[test]
+    fn reap_disposition_help_alphabet_is_total() {
+        let src = std::fs::read_to_string(format!(
+            "{}/src/lib.rs",
+            std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets it")
+        ))
+        .expect("read lib.rs");
+        let start = src
+            .find("rio_controller_reap_dispositions_total")
+            .expect("describe present in lib.rs");
+        let help = &src[start..(start + 1500).min(src.len())];
+        for d in ReapDisposition::ALL {
+            assert!(
+                help.contains(d.as_label()),
+                "HELP must name '{}' (R21: the alphabet travels with \
+                 the metric)",
+                d.as_label()
+            );
+        }
+        // The exhaustive match in as_label is the census; ALL must
+        // cover it (a new variant fails the match first, then here).
+        assert_eq!(ReapDisposition::ALL.len(), 7);
+    }
+
+    /// W9-CO, Job-spec face (live_056-b): the minted Job carries the
+    /// serving readiness probe — httpGet /servingz on the named
+    /// health port — and NO liveness/startup probes (D3: builders
+    /// are kill-wired by EXIT; I-114's liveness rationale stands —
+    /// a CPU-pegged build must never be SIGKILLed by a probe).
+    #[test]
+    fn job_spec_carries_the_serving_readiness_probe() {
+        let pool = test_pool("probe-pool", ExecutorKind::Builder);
+        let j = job(&pool, &intent("abc123"));
+        let tmpl = j.spec.unwrap().template;
+        let c = &tmpl.spec.unwrap().containers[0];
+        let probe = c.readiness_probe.as_ref().expect("readiness probe minted");
+        let http = probe.http_get.as_ref().expect("httpGet form");
+        assert_eq!(http.path.as_deref(), Some("/servingz"));
+        assert_eq!(
+            http.port,
+            k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::String("health".into()),
+            "probes the builder's own health server"
+        );
+        assert!(
+            c.liveness_probe.is_none(),
+            "kill-wired by exit (D3) — liveness stays absent"
+        );
+        assert!(c.startup_probe.is_none(), "no startup probe either");
     }
 
     /// `build_job` wrapper for tests that don't exercise the §13a

@@ -233,6 +233,18 @@ pub fn describe_metrics() {
          (D-state FUSE wait, OOM-loop); investigate node/kernel health."
     );
     describe_counter!(
+        "rio_controller_reap_dispositions_total",
+        "The reap path's terminal-disposition alphabet (live_056-b R21; labels: pool, \
+         disposition = excess-pending|orphan-pending|stale-terminal|selector-drift|\
+         orphan-running|escalated|gave-up — the COMPLETE letter set; the per-arm \
+         ephemeral/orphan reaped counters are the legacy series this unifies). \
+         escalated = a verdict-free builder death stepped the respawn ladder \
+         (10s doubling to the 1280s cap); gave-up = the 8-death threshold crossed — \
+         respawns STOP until a scheduler verdict or operator action (paired with a \
+         RespawnGiveUp Event on the Pool). A gave-up intent with no Event consumer \
+         is a wedged-builder investigation, not a retry knob."
+    );
+    describe_counter!(
         "rio_controller_lease_acquired_total",
         "nodeclaim_pool lease acquire transitions. >1 over a short window = leadership churn \
          (check apiserver health / pod restarts)."

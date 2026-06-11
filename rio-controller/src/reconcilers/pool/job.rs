@@ -151,15 +151,18 @@ pub(super) fn is_active_job(j: &Job) -> bool {
 }
 
 /// Per-tick Job inventory: `active` (consumes a `maxConcurrent` slot)
-/// and `ready` (container started — heartbeating). Computed once at
-/// the top of `jobs::reconcile` so the headroom math, status patch,
-/// and reap passes see ONE consistent view.
+/// and `ready` (SERVING — past cold start, asking for work; the
+/// live_056-b `/servingz` probe is what flips `JobStatus.ready`).
+/// Computed once at the top of `jobs::reconcile` so the headroom
+/// math, status patch, and reap passes see ONE consistent view.
 ///
 /// `active` excludes `deletion_timestamp` (terminating Jobs do not
 /// consume headroom — they were foreground-deleted on a prior tick and
 /// their slot is free for spawn). `ready` is the [`is_running_job`]
 /// subset, which already excludes terminating; this is what
-/// `PoolStatus.ready_replicas` documents as "passed readinessProbe".
+/// `PoolStatus.ready_replicas` documents as "passed readinessProbe" —
+/// TRUE since live_056-b (a probe exists, and it certifies serving,
+/// not merely container-started).
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct JobCensus {
     pub active: i32,
@@ -200,16 +203,23 @@ pub(super) fn job_census(jobs: &[Job]) -> JobCensus {
     JobCensus { active, ready }
 }
 
-/// Active AND `status.ready == 0` — the Job's pod is in `Pending`
-/// phase (unscheduled or `ContainerCreating`).
+/// Active AND `status.ready == 0` — the Job's pod has not reached
+/// SERVING state (unscheduled, `ContainerCreating`, or started but
+/// still inside its cold-start connect).
 ///
-/// With `parallelism: 1` and no readiness probe (I-114 dropped probes
-/// for ephemeral Jobs), `JobStatus.ready` flips to 1 the moment the
-/// container starts — at which point the worker is dialing the
-/// scheduler and may receive an assignment any millisecond. `ready ==
-/// 0` means the container has NOT started: never heartbeated, never
-/// dispatched, deleting it loses nothing. This is the reap-safety
-/// boundary for `r[ctrl.ephemeral.reap-excess-pending+3]`.
+/// With `parallelism: 1` and the live_056-b readiness probe (httpGet
+/// `/servingz` — Ready ⟺ the builder connected its upstreams and is
+/// asking for work), `JobStatus.ready` flips to 1 only once the
+/// builder SERVES. `ready == 0` therefore includes started-but-not-
+/// serving pods — an IMPROVED reap-safety boundary: a builder with no
+/// scheduler channel cannot hold an assignment, so deleting it loses
+/// nothing, and a policy-blackholed cold start (the incident's
+/// invisible wedge) is visibly pending instead of fake-Running. The
+/// pulled-while-probe-lagged sliver (~one 2 s probe period after the
+/// serving flip) is covered by the live-pod recheck
+/// ([`any_live_running_pod`]) and the delete chokepoint's attempt
+/// veto. This is the reap-safety boundary for
+/// `r[ctrl.ephemeral.reap-excess-pending+3]`.
 ///
 /// `None` status (Job controller hasn't reconciled yet → pod not
 /// created) is treated as Pending. That's the safe direction: a Job
@@ -314,12 +324,13 @@ fn covered_by_open_pull_attempt(
 
 /// Minimum age before a Pending Job is reapable. `JobStatus.ready` is
 /// set by the K8s Job controller AFTER it observes pod readiness — a
-/// container that just started may have already heartbeated and
-/// received an assignment while `ready` is still 0 (Job-controller
-/// sync lag, typically <1s but unbounded under apiserver load). One
-/// requeue tick of grace makes the false-positive window negligible
-/// without materially delaying the I-183 reap (the bug is Jobs sitting
-/// for an HOUR; 10s grace is noise).
+/// container that just started may have already connected and pulled
+/// while `ready` is still 0 (the live_056-b serving probe's ≤2 s
+/// period plus Job-controller sync lag, typically <1s but unbounded
+/// under apiserver load). One requeue tick of grace makes the
+/// false-positive window negligible without materially delaying the
+/// I-183 reap (the bug is Jobs sitting for an HOUR; 10s grace is
+/// noise).
 ///
 /// NOTE: this is age-from-**creation**. A cold-start Job that takes
 /// 50s for Karpenter to provision a node is past this grace the moment
@@ -523,6 +534,12 @@ pub(super) async fn reap_excess_pending(
                 info!(
                     pool, job = %job_name, queued,
                     "reaped excess Pending ephemeral Job (queued dropped below pending)"
+                );
+                // live_056-b R21: the alphabet chokepoint (the legacy
+                // ephemeral_jobs_reaped_total series below stands).
+                super::jobs::note_reap_disposition(
+                    pool,
+                    super::jobs::ReapDisposition::ExcessPending,
                 );
                 reaped += 1;
             }
@@ -1348,6 +1365,12 @@ pub(super) async fn reap_orphan_running(
                     pool, job = %job_name,
                     grace_secs = grace.as_secs(),
                     "reaped orphan Running ephemeral Job (no scheduler assignment past grace)"
+                );
+                // live_056-b R21: the alphabet chokepoint (the legacy
+                // orphan_jobs_reaped_total series below stands).
+                super::jobs::note_reap_disposition(
+                    pool,
+                    super::jobs::ReapDisposition::OrphanRunning,
                 );
                 reaped += 1;
             }
@@ -2846,10 +2869,12 @@ mod tests {
         }
     }
 
-    /// `is_pending_job`: active AND ready==0. With `parallelism=1` and
-    /// no readiness probe, ready==1 ⇔ container started ⇔ may already
-    /// hold an assignment. Only ready==0 (Pending phase / Container-
-    /// Creating) is reap-safe.
+    /// `is_pending_job`: active AND ready==0. live_056-b retired the
+    /// "no readiness probe, ready==1 ⇔ container started ⇔ may
+    /// already hold an assignment" caveat WITH its cause (W9-CO): the
+    /// serving probe makes ready==1 ⇔ SERVING (connected, asking for
+    /// work), and ready==0 — including started-but-not-serving — is
+    /// reap-safe (no scheduler channel ⇒ no assignment).
     #[test]
     fn pending_job_predicate() {
         // Fresh Job, status=None entirely → pending (pod not created).
