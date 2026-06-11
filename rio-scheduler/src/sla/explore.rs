@@ -13,7 +13,7 @@
 use super::config::{Cell, HwClassName, SlaConfig};
 use super::fit::headroom;
 use super::solve::{DrvHints, SolveFullResult, SolveMemo};
-use super::types::{DiskBytes, FittedParams, MemBytes, RawCores};
+use super::types::{FittedParams, MemBytes, RawCores};
 use std::collections::HashSet;
 
 /// Per-tick `{pool, masked}` snapshot for ε_h exploration. Groups the
@@ -231,7 +231,10 @@ pub fn resolve_h_explore(
 pub struct ExploreDecision {
     pub c: RawCores,
     pub mem: MemBytes,
-    pub disk: DiskBytes,
+    /// bug_132 (R24): the sealed dispatch request — the explore lane
+    /// was the envelope's first adopter; the seal makes every sibling
+    /// lane carry the same type.
+    pub disk: super::fit::DiskRequest,
 }
 
 /// Next explore step. `fit=None` (never-seen key) → cold-start at the
@@ -262,8 +265,11 @@ pub fn next(
         // fitted = the prior (no observation yet), floor/ceiling law
         // applied. Same value as the bare default when defaultDisk is
         // within [floor, maxDisk]; typed + clamped when it is not.
-        let env = super::fit::DiskFitEnvelope::derive(None, cfg.default_disk, ceil.max_disk);
-        return decision(probe.cpu, mem_for, env.request());
+        return decision(
+            probe.cpu,
+            mem_for,
+            super::fit::DiskFitEnvelope::fit(None, cfg.default_disk, ceil.max_disk),
+        );
     };
     // `resource_floor` is per-drv_hash so a fresh version would
     // otherwise re-climb OOM/DiskPressure from probe defaults. Disk is
@@ -285,8 +291,7 @@ pub fn next(
     // live_049 L2: the warm path's disk request is the typed envelope —
     // the observed per-pname p90 (now aggregated for probe-shaped fits
     // too) retires the 100 GiB prior; floor/ceiling by construction.
-    let disk =
-        super::fit::DiskFitEnvelope::derive(f.disk_p90, cfg.default_disk, ceil.max_disk).request();
+    let disk = super::fit::DiskFitEnvelope::fit(f.disk_p90, cfg.default_disk, ceil.max_disk);
     let st = &f.explore;
     // First sample landed but min/max not yet diverse → treat as cold.
     if st.max_c.0 <= 0.0 {
@@ -344,7 +349,11 @@ pub(crate) fn frozen(st: &super::types::ExploreState, max_cores: f64) -> bool {
     span >= 4.0 || (st.distinct_c >= 2 && (st.max_c.0 >= max_cores || st.min_c.0 <= 1.0))
 }
 
-fn decision(c: f64, mem_for: impl Fn(f64) -> MemBytes, disk: DiskBytes) -> ExploreDecision {
+fn decision(
+    c: f64,
+    mem_for: impl Fn(f64) -> MemBytes,
+    disk: super::fit::DiskRequest,
+) -> ExploreDecision {
     ExploreDecision {
         c: RawCores(c),
         mem: mem_for(c),
@@ -372,7 +381,7 @@ mod tests {
     use crate::sla::config::{CapacityType, ProbeShape};
     use crate::sla::solve::{AdmissibleSet, InfeasibleReason, Tier};
     use crate::sla::types::{
-        DurationFit, ExploreState, FitDf, MemFit, ModelKey, RingNEff, WallSeconds,
+        DiskBytes, DurationFit, ExploreState, FitDf, MemFit, ModelKey, RingNEff, WallSeconds,
     };
 
     // ─── resolve_h_explore unit tests ────────────────────────────────────
@@ -438,7 +447,7 @@ mod tests {
                 cells,
                 c_star: 4,
                 mem_bytes: 0,
-                disk_bytes: 0,
+                disk_bytes: super::super::fit::DiskFitEnvelope::fit(None, 0, 0),
             },
             all_candidates: Vec::new(),
             tier: "normal".into(),
@@ -449,7 +458,7 @@ mod tests {
         SolveFullResult::BestEffort {
             c: 1,
             mem_bytes: 0,
-            disk_bytes: 0,
+            disk_bytes: super::super::fit::DiskFitEnvelope::fit(None, 0, 0),
             cells: Vec::new(),
             why: InfeasibleReason::SerialFloor,
         }
@@ -830,7 +839,7 @@ mod tests {
         assert_eq!(d.c.0, 4.0);
         // mem = 4·2Gi + 4Gi = 12Gi
         assert_eq!(d.mem.0, 12 << 30);
-        assert_eq!(d.disk.0, 20 << 30);
+        assert_eq!(d.disk.bytes(), 20 << 30);
     }
 
     // r[verify sched.sla.explore-x4-first-bump]
@@ -960,7 +969,9 @@ mod tests {
         // disk_p90=None → cfg.default_disk.
         let f = fit(st(4.0, 4.0, 1, true, 1500.0));
         assert_eq!(
-            next(Some(&f), &cfg(), &DrvHints::default(), &ceil()).disk.0,
+            next(Some(&f), &cfg(), &DrvHints::default(), &ceil())
+                .disk
+                .bytes(),
             20 << 30
         );
         // disk_p90=Some → that value, even mid-ladder. Core-independent
@@ -968,12 +979,16 @@ mod tests {
         let mut f = fit(st(4.0, 4.0, 1, true, 1500.0));
         f.disk_p90 = Some(DiskBytes(75 << 30));
         assert_eq!(
-            next(Some(&f), &cfg(), &DrvHints::default(), &ceil()).disk.0,
+            next(Some(&f), &cfg(), &DrvHints::default(), &ceil())
+                .disk
+                .bytes(),
             75 << 30
         );
         // No fit → cfg.default_disk.
         assert_eq!(
-            next(None, &cfg(), &DrvHints::default(), &ceil()).disk.0,
+            next(None, &cfg(), &DrvHints::default(), &ceil())
+                .disk
+                .bytes(),
             20 << 30
         );
     }
@@ -1097,7 +1112,7 @@ mod disk_axis_tests {
     use crate::sla::ingest::refit;
     use crate::sla::solve::Ceilings;
     use crate::sla::types::{
-        DurationFit, ExploreState, FitDf, MemFit, ModelKey, RingNEff, WallSeconds,
+        DiskBytes, DurationFit, ExploreState, FitDf, MemFit, ModelKey, RingNEff, WallSeconds,
     };
 
     fn cfg_and_ceil() -> (SlaConfig, Ceilings) {
@@ -1171,14 +1186,14 @@ mod disk_axis_tests {
         let (cfg, ceil) = cfg_and_ceil();
         let d = next(Some(&f), &cfg, &Default::default(), &ceil);
         assert!(
-            d.disk.0 * 10 <= cfg.default_disk,
+            d.disk.bytes() * 10 <= cfg.default_disk,
             "fitted request ({}) retires the {} prior by ≥10x \
              (pre-fix: == default)",
-            d.disk.0,
+            d.disk.bytes(),
             cfg.default_disk
         );
         assert!(
-            d.disk.0 >= 2 * GI as u64,
+            d.disk.bytes() >= 2 * GI as u64,
             "and stays at the observed p90 scale, never below the evidence"
         );
     }
@@ -1192,7 +1207,7 @@ mod disk_axis_tests {
     fn cold_pname_probe_keeps_the_prior() {
         let (cfg, ceil) = cfg_and_ceil();
         let d = next(None, &cfg, &Default::default(), &ceil);
-        assert_eq!(d.disk.0, cfg.default_disk);
+        assert_eq!(d.disk.bytes(), cfg.default_disk);
     }
 
     // r[verify sched.sla.disk-reaches-ephemeral-storage+1]
@@ -1212,7 +1227,11 @@ mod disk_axis_tests {
         };
         f.disk_p90 = Some(DiskBytes(500 << 30));
         let d = next(Some(&f), &cfg, &Default::default(), &ceil);
-        assert_eq!(d.disk.0, cfg.max_disk, "ceiling clamps the outlier, typed");
+        assert_eq!(
+            d.disk.bytes(),
+            cfg.max_disk,
+            "ceiling clamps the outlier, typed"
+        );
     }
 
     /// Minimal fitted shell for the clamp test (probe-shaped — the

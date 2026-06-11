@@ -8,11 +8,11 @@ use super::alpha;
 use super::config::{CapacityType, Cell, HwClassDef, HwClassName, SlaConfig};
 use super::cost::CostTable;
 use super::explore;
-use super::fit::headroom;
+use super::fit::{self, headroom};
 use super::hw::{HW_FACTOR_SANITY_FLOOR, HwTable};
 use super::r#override::ResolvedTarget;
 use super::quantile;
-use super::types::{DiskBytes, DurationFit, FittedParams, MemBytes, ModelKey, RawCores};
+use super::types::{DurationFit, FittedParams, MemBytes, ModelKey, RawCores};
 
 /// `prefer_local_build = true` → trivially short. Smallest pod the
 /// controller will spawn.
@@ -80,12 +80,12 @@ pub enum SolveResult {
         tier: String,
         c_star: RawCores,
         mem: MemBytes,
-        disk: DiskBytes,
+        disk: fit::DiskRequest,
     },
     BestEffort {
         c: RawCores,
         mem: MemBytes,
-        disk: DiskBytes,
+        disk: fit::DiskRequest,
     },
 }
 
@@ -101,7 +101,7 @@ impl SolveResult {
             Self::Feasible { mem, .. } | Self::BestEffort { mem, .. } => *mem,
         }
     }
-    pub fn disk(&self) -> DiskBytes {
+    pub fn disk(&self) -> fit::DiskRequest {
         match self {
             Self::Feasible { disk, .. } | Self::BestEffort { disk, .. } => *disk,
         }
@@ -320,7 +320,8 @@ pub struct AdmissibleSet {
     pub cells: Vec<Cell>,
     pub c_star: u32,
     pub mem_bytes: u64,
-    pub disk_bytes: u64,
+    /// bug_132 (R24): the sealed dispatch request — memoized typed.
+    pub disk_bytes: fit::DiskRequest,
 }
 
 /// One memo entry: `(A', candidates, tier)`. `all_candidates` lets the
@@ -419,15 +420,19 @@ pub fn intent_for(
     let probe_mem = (probe.cpu * probe.mem_per_core as f64 + probe.mem_base as f64) as u64;
     let fit_mem_at =
         |c: f64| fit.map(|f| (f.mem.at(RawCores(c)).0 as f64 * headroom(f.n_eff_ring)) as u64);
-    // disk_p90 is core-independent (r[sched.sla.disk-scalar]); resolve
-    // and clamp once so every early-return branch is self-consistent
-    // for `explain.rs`. The `solve_intent_for` chokepoint applies the
-    // same ceiling (alongside mem and the reactive floor), so this is
-    // belt-and-braces.
-    let fit_disk = fit
-        .and_then(|f| f.disk_p90)
-        .map_or(ceil.default_disk, |d| d.0)
-        .min(ceil.max_disk);
+    // disk_p90 is core-independent (r[sched.sla.disk-scalar]); mint
+    // the typed request ONCE so every early-return branch is
+    // self-consistent for `explain.rs`. bug_132 (R24): minted only
+    // via the envelope — floor AND ceiling by construction (the
+    // pre-fix open-coded projection had the ceiling but no floor:
+    // a warm 200 MiB p90 shipped a sub-scratch request). The
+    // `solve_intent_for` chokepoint re-applies the reactive floor +
+    // ceiling on the typed value (`DiskRequest::with_reactive_floor`).
+    let fit_disk = fit::DiskFitEnvelope::fit(
+        fit.and_then(|f| f.disk_p90),
+        ceil.default_disk,
+        ceil.max_disk,
+    );
     // Operator override beats everything — including drv-declared hints.
     // If the operator forced 12 cores on a `prefer_local_build` drv,
     // they had a reason. Mem unset → fall back to the fit's M(c) at the
@@ -459,10 +464,11 @@ pub fn intent_for(
         // pname → never fitted → must NOT fall back to ceil.default_disk
         // (100 GiB chart default, sized for cold-probe of an unknown
         // package). Mirror LOCAL_MEM_BYTES with a minimal disk const.
-        let disk = fit
-            .and_then(|f| f.disk_p90)
-            .map_or(LOCAL_DISK_BYTES, |d| d.0)
-            .min(ceil.max_disk);
+        let disk = fit::DiskFitEnvelope::fit(
+            fit.and_then(|f| f.disk_p90),
+            LOCAL_DISK_BYTES,
+            ceil.max_disk,
+        );
         return IntentDecision {
             cores: LOCAL_CORES,
             mem: forced_mem.unwrap_or(LOCAL_MEM_BYTES),
@@ -495,7 +501,7 @@ pub fn intent_for(
             return IntentDecision {
                 cores: (d.c.0.ceil() as u32).max(1),
                 mem,
-                disk: d.disk.0.min(ceil.max_disk),
+                disk: d.disk,
                 infeasible: None,
             };
         }
@@ -534,13 +540,14 @@ pub fn intent_for(
     IntentDecision {
         cores,
         mem,
-        disk: r.disk().0,
+        disk: r.disk(),
         infeasible,
     }
 }
 
-/// [`intent_for`]'s result. Named struct (NOT a 4-tuple) because
-/// `mem`/`disk` are both `u64` — swap-silent across the ~16 callers.
+/// [`intent_for`]'s result. Named struct (NOT a 4-tuple); `disk` is
+/// the R24-sealed [`fit::DiskRequest`] (bug_132 — a raw `u64`
+/// projection no longer type-checks at this seam; `mem` stays `u64`).
 ///
 /// `infeasible = Some(reason)` iff execution reached the post-
 /// `solve_tier` BestEffort fallthrough with ≥1 bounded tier — i.e. the
@@ -551,7 +558,7 @@ pub fn intent_for(
 pub struct IntentDecision {
     pub cores: u32,
     pub mem: u64,
-    pub disk: u64,
+    pub disk: fit::DiskRequest,
     pub infeasible: Option<InfeasibleReason>,
 }
 
@@ -675,7 +682,14 @@ pub fn solve_tier(fit: &FittedParams, tiers: &[Tier], ceil: &Ceilings) -> SolveR
     );
     let cap_c = fit.fit.p_bar().0.min(fit.fit.c_opt().0).min(ceil.max_cores);
     let h = headroom(fit.n_eff_ring);
-    let disk = fit.disk_p90.map(|d| d.0).unwrap_or(ceil.default_disk);
+    // bug_132 (R24): the REQUEST is minted only via the envelope
+    // (floor + ceiling by construction); the Feasible REJECT gate
+    // keeps reading the RAW observation through the single-sourced
+    // predicate — `fit.D > maxDisk` is the genuine c-invariant
+    // "cannot fit" gate (sla-sizing alg), and the clamped request by
+    // construction can never trip it.
+    let disk = fit::DiskFitEnvelope::fit(fit.disk_p90, ceil.default_disk, ceil.max_disk);
+    let disk_rejects = fit::DiskFitEnvelope::exceeds_ceiling(fit.disk_p90, ceil.max_disk);
 
     for tier in tiers {
         // hw_factor=1.0 / lambda=0.0: phase-13 wires the per-hw_class
@@ -689,14 +703,14 @@ pub fn solve_tier(fit: &FittedParams, tiers: &[Tier], ceil: &Ceilings) -> SolveR
         if mem > ceil.max_mem {
             continue;
         }
-        if disk > ceil.max_disk {
+        if disk_rejects {
             continue;
         }
         return SolveResult::Feasible {
             tier: tier.name.clone(),
             c_star,
             mem: MemBytes(mem),
-            disk: DiskBytes(disk),
+            disk,
         };
     }
     // Pure: callers emit `rio_scheduler_sla_infeasible_total{reason=…}`
@@ -717,12 +731,19 @@ pub fn solve_tier(fit: &FittedParams, tiers: &[Tier], ceil: &Ceilings) -> SolveR
 /// `solve_intent_for`'s floor.max() composes (a `disk_p90 > max_disk`
 /// here used to spawn a permanently-Pending pod). `cap_c` already
 /// includes `c_opt` so a USL fit isn't pushed into its slowdown region.
-fn best_effort(fit: &FittedParams, cap_c: f64, h: f64, disk: u64, ceil: &Ceilings) -> SolveResult {
+fn best_effort(
+    fit: &FittedParams,
+    cap_c: f64,
+    h: f64,
+    disk: fit::DiskRequest,
+    ceil: &Ceilings,
+) -> SolveResult {
     let mem = ((fit.mem.at(RawCores(cap_c)).0 as f64 * h) as u64).min(ceil.max_mem);
     SolveResult::BestEffort {
         c: RawCores(cap_c),
         mem: MemBytes(mem),
-        disk: DiskBytes(disk.min(ceil.max_disk)),
+        // Already `≤ ceiling` by construction (the envelope mint).
+        disk,
     }
 }
 
@@ -754,7 +775,7 @@ pub enum SolveFullResult {
     BestEffort {
         c: u32,
         mem_bytes: u64,
-        disk_bytes: u64,
+        disk_bytes: fit::DiskRequest,
         cells: Vec<Cell>,
         why: InfeasibleReason,
     },
@@ -807,7 +828,6 @@ fn evaluate_cell(
     );
     let factor = hw_factor_for(fit, hw, h);
     let hr = headroom(fit.n_eff_ring);
-    let disk = fit.disk_p90.map(|d| d.0).unwrap_or(ceil.default_disk);
     let cell = (h.clone(), cap);
     let lambda = match cap {
         CapacityType::Spot => cost.lambda_for(h),
@@ -834,7 +854,10 @@ fn evaluate_cell(
     };
     let c_star = (c_star.0.ceil() as u32).max(1);
     let mem = (fit.mem.at(RawCores(f64::from(c_star))).0 as f64 * hr) as u64;
-    if disk > ceil.max_disk {
+    // bug_132: the per-cell disk gate reads the RAW observation via
+    // the single-sourced predicate (the request below is clamped by
+    // construction and can never trip a ceiling gate).
+    if fit::DiskFitEnvelope::exceeds_ceiling(fit.disk_p90, ceil.max_disk) {
         return Err(CellReject::DiskCeiling);
     }
     if mem > ceil.max_mem {
@@ -953,7 +976,10 @@ pub fn solve_full(
         .min(ceil.max_cores)
         .max(1.0);
     let hr = headroom(fit.n_eff_ring);
-    let disk = fit.disk_p90.map(|d| d.0).unwrap_or(ceil.default_disk);
+    // bug_132 (R24): the typed request — floor and ceiling by
+    // construction; per-cell ceiling REJECTS keep reading the raw
+    // observation inside `evaluate_cell`'s shared predicate.
+    let disk = fit::DiskFitEnvelope::fit(fit.disk_p90, ceil.default_disk, ceil.max_disk);
     let tau = cfg.hw_cost_tolerance;
     let k = 2.0;
     // Per-cell rejections accumulated across all tiers, partitioned by
@@ -1064,7 +1090,7 @@ pub fn solve_full(
                 cells,
                 c_star,
                 mem_bytes: mem,
-                disk_bytes: disk.min(ceil.max_disk),
+                disk_bytes: disk,
             },
             all_candidates: candidates,
             tier: tier.name.clone(),
@@ -1088,7 +1114,7 @@ pub fn solve_full(
     SolveFullResult::BestEffort {
         c: (cap_c.ceil() as u32).max(1),
         mem_bytes: mem,
-        disk_bytes: disk.min(ceil.max_disk),
+        disk_bytes: disk,
         cells,
         why,
     }
@@ -1726,8 +1752,99 @@ mod tests {
         else {
             panic!()
         };
-        assert_eq!(disk.0, 200 << 30, "clamped to ceil.max_disk");
+        assert_eq!(disk.bytes(), 200 << 30, "clamped to ceil.max_disk");
     }
+    // r[verify sched.sla.disk-reaches-ephemeral-storage+1]
+    /// **W10-AC (bug_132, R24)** — *a warm small-p90 fit on the
+    /// PRIMARY solve lane: pre-fix `solve_tier` emitted the raw
+    /// 200 MiB observation as the ephemeral-storage request (a
+    /// floor-less open-coded projection beside the envelope);
+    /// post-fix the request is minted only through
+    /// `DiskFitEnvelope` — floor-clamped to 1 GiB.* The common case
+    /// for small packages; a sub-floor request under-provisions the
+    /// build's own unpack+output scratch, and a DiskPressure
+    /// eviction had no recovery path but retry-poison.
+    #[test]
+    fn w10ac_solve_lane_floors_warm_small_p90() {
+        let mut fit = mk_fit(400.0, 100.0, 0.0, f64::INFINITY, 0.1);
+        fit.disk_p90 = Some(DiskBytes(200 << 20)); // 200 MiB warm fit
+        let SolveResult::Feasible { disk, .. } = solve_tier(&fit, &[t("t0", 600.0)], &ceil())
+        else {
+            panic!("600s tier is feasible for the 400+100/c fit")
+        };
+        assert_eq!(
+            disk.bytes(),
+            crate::sla::fit::DiskFitEnvelope::FLOOR_BYTES,
+            "the solve lane's request is floor-clamped through the \
+             envelope (pre-fix: the raw 209715200-byte projection \
+             shipped as the pod's ephemeral-storage request)"
+        );
+    }
+
+    // r[verify sched.sla.disk-reaches-ephemeral-storage+1]
+    /// **W10-AD (bug_132)** — *lane equality at the `FittedParams`
+    /// quantifier: one fit ⇒ byte-identical disk requests across
+    /// every dispatch lane* — `solve_tier` (whichever arm the walk
+    /// lands on), `intent_for`'s hw-agnostic path, and
+    /// `explore::next`'s warm path — swept over the observation grid
+    /// {None, sub-floor, in-band, over-ceiling, zero}. The lane
+    /// CENSUS is rustc (every emission seam carries `DiskRequest`);
+    /// this witness pins the VALUES so a lane passing a different
+    /// `(prior, ceiling)` pair into the shared constructor is caught
+    /// at the quantifier, not per-anecdote. Pre-fix: the solve lanes
+    /// emitted the raw projection — 200 MiB here — while explore
+    /// emitted the floored 1 GiB for the SAME fit.
+    #[test]
+    fn w10ad_lane_equality_at_the_fit_quantifier() {
+        use crate::sla::fit::DiskFitEnvelope;
+        let ceilings = ceil();
+        for obs in [
+            None,
+            Some(DiskBytes(200 << 20)), // sub-floor warm fit
+            Some(DiskBytes(10 << 30)),  // in-band
+            Some(DiskBytes(300 << 30)), // over-ceiling
+            Some(DiskBytes(0)),         // degenerate zero observation
+        ] {
+            let mut fit = mk_fit(400.0, 100.0, 0.0, f64::INFINITY, 0.1);
+            fit.disk_p90 = obs;
+            let law = DiskFitEnvelope::fit(obs, ceilings.default_disk, ceilings.max_disk);
+            // solve_tier — Feasible or BestEffort, the request obeys
+            // the same law.
+            let tier_req = match solve_tier(&fit, &[t("t0", 600.0)], &ceilings) {
+                SolveResult::Feasible { disk, .. } | SolveResult::BestEffort { disk, .. } => disk,
+            };
+            assert_eq!(
+                tier_req.bytes(),
+                law.bytes(),
+                "solve_tier lane diverged from the envelope law at obs={obs:?}"
+            );
+            // intent_for — the hw-agnostic arm reads the same fit.
+            let d = intent_for(
+                Some(&fit),
+                &DrvHints::default(),
+                None,
+                &cfg(),
+                &[t("t0", 600.0)],
+                &ceilings,
+            );
+            assert_eq!(
+                d.disk.bytes(),
+                law.bytes(),
+                "intent_for lane diverged from the envelope law at obs={obs:?}"
+            );
+            // explore::next — the warm path rides the same envelope
+            // (cfg() carries a different default_disk: assert against
+            // ITS law to pin the constructor, not the inputs).
+            let explore_law = DiskFitEnvelope::fit(obs, cfg().default_disk, ceilings.max_disk);
+            let e = explore::next(Some(&fit), &cfg(), &DrvHints::default(), &ceilings);
+            assert_eq!(
+                e.disk.bytes(),
+                explore_law.bytes(),
+                "explore lane diverged from the envelope law at obs={obs:?}"
+            );
+        }
+    }
+
     // r[verify sched.sla.tier-envelope]
     #[test]
     fn envelope_tight_p99_forces_higher_c() {
@@ -1860,7 +1977,7 @@ mod tests {
         let IntentDecision {
             cores, mem, disk, ..
         } = intent_for(fit, hints, None, &cfg(), &[t("normal", 1200.0)], &ceil());
-        (cores, mem, disk)
+        (cores, mem, disk.bytes())
     }
 
     // r[verify sched.sla.override-precedence]
@@ -2210,6 +2327,7 @@ mod tests {
             &[],
             &ceil(),
         );
+        let d = d.bytes();
         assert!(d <= max, "forced_cores: disk {d} > max_disk {max}");
         // prefer_local_build.
         let (_, _, d) = intent(
@@ -2812,7 +2930,7 @@ mod tests {
         let be = |_: &HashSet<Cell>| SolveFullResult::BestEffort {
             c: 1,
             mem_bytes: 0,
-            disk_bytes: 0,
+            disk_bytes: fit::DiskFitEnvelope::fit(None, 0, 0),
             cells: vec![],
             why: InfeasibleReason::DiskCeiling,
         };
@@ -2889,7 +3007,7 @@ mod tests {
         else {
             panic!("disk > ceil → BestEffort, got {r:?}")
         };
-        assert_eq!(disk_bytes, 200 << 30, "clamped");
+        assert_eq!(disk_bytes.bytes(), 200 << 30, "clamped");
         assert_eq!(why, InfeasibleReason::DiskCeiling);
     }
 

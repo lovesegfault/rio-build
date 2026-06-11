@@ -2899,9 +2899,14 @@ impl DagActor {
         let fclamped = super::floor::ClampedFloor::of(floor, &self.sla_ceilings);
         let cores = cores.min(self.sla_ceilings.max_cores as u32).max(1);
         let mem = mem.max(fclamped.mem_bytes).min(self.sla_ceilings.max_mem);
+        // bug_132 (R24): `disk` arrives as the sealed `DiskRequest`
+        // from whichever lane produced it; the reactive-floor overlay
+        // is the type's ONE lawful post-constructor modification
+        // (ceiling re-applied inside), and `.bytes()` is the wire
+        // exit — there is no raw-projection path to this point.
         let disk = disk
-            .max(fclamped.disk_bytes)
-            .min(self.sla_ceilings.max_disk);
+            .with_reactive_floor(fclamped.disk_bytes, self.sla_ceilings.max_disk)
+            .bytes();
         // §13e (was mb_023): `is_fixed_output ⟺ features ∋ fetcher` —
         // the `effective_features` chokepoint projects the role
         // discriminator onto the feature axis, so `retain_hosting_

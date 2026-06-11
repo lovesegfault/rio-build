@@ -22,10 +22,14 @@ use super::types::{
 /// - `ceiling` = `sla.maxDisk` — the operator bound (the solve-side
 ///   `.min(max_disk)` clamps are this law's other impl sites).
 ///
-/// This envelope is the constructor for the EXPLORE lane's disk
-/// request (probe + warm paths); the `solve.rs` fallback arms read the
-/// same `(prior, ceiling)` pair and benefit from the widened `disk_p90`
-/// automatically (census rows in the explore tests name every lane).
+/// This envelope is the SOLE constructor for EVERY dispatch lane's
+/// disk request (bug_132/R24): the lanes do not "benefit
+/// automatically" from sharing inputs — they are UNABLE to emit
+/// anything else, because every emission seam (`IntentDecision`,
+/// `SolveResult`, `SolveFullResult`/`AdmissibleSet`,
+/// `ExploreDecision`) carries [`DiskRequest`], a newtype mintable
+/// only here. A raw `disk_p90` projection no longer type-checks at
+/// any seam; rustc is the lane census.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiskFitEnvelope {
     pub floor: DiskBytes,
@@ -56,9 +60,61 @@ impl DiskFitEnvelope {
         }
     }
 
-    /// The dispatch request — the fitted point of the envelope.
-    pub fn request(&self) -> DiskBytes {
-        self.fitted
+    /// The dispatch request — the fitted point of the envelope,
+    /// already floor/ceiling-lawful by [`Self::derive`].
+    pub fn request(&self) -> DiskRequest {
+        DiskRequest(self.fitted.0)
+    }
+
+    /// The one-step constructor every dispatch lane uses:
+    /// derive-then-request. The ONLY public mint of [`DiskRequest`].
+    pub fn fit(observed_p90: Option<DiskBytes>, prior: u64, ceiling: u64) -> DiskRequest {
+        Self::derive(observed_p90, prior, ceiling).request()
+    }
+
+    /// The Feasible-lane REJECT predicate, single-sourced (bug_128's
+    /// sibling discipline applied here too): a raw observation above
+    /// the operator ceiling is the genuine "cannot fit" gate —
+    /// c-invariant, evaluated on the RAW p90 (never the clamped
+    /// request, which by construction can never exceed the ceiling).
+    /// `solve_tier`'s tier gate, `evaluate_cell`'s per-cell gate, and
+    /// `explain`'s `disk-ceiling` label all read THIS, so the explain
+    /// surface mirrors the solve gates by construction.
+    pub fn exceeds_ceiling(observed_p90: Option<DiskBytes>, ceiling: u64) -> bool {
+        observed_p90.is_some_and(|d| d.0 > ceiling)
+    }
+}
+
+// r[impl sched.sla.disk-reaches-ephemeral-storage+1]
+/// bug_132 (R24 — laws by construction): the dispatch disk value,
+/// UNWRITABLE except through [`DiskFitEnvelope`] (the sole awaiter of
+/// the floor/ceiling law). The inner field is private and there is no
+/// other constructor — `DiskFitEnvelope::fit`/`request` mint it with
+/// `floor ≤ value ≤ ceiling` applied, and
+/// [`Self::with_reactive_floor`] is the one lawful post-solve
+/// modification (the per-drv reactive floor at the emission
+/// chokepoint, ceiling re-applied). Every dispatch lane's output type
+/// (`IntentDecision`, `SolveResult`, `AdmissibleSet`,
+/// `SolveFullResult::BestEffort`, `ExploreDecision`) carries this
+/// newtype, so the wave-8 defect class — a lane keeping a floor-less
+/// open-coded `disk_p90` projection beside the envelope — no longer
+/// compiles. Enforcement tier: compile-sealed (rustc is the census;
+/// no lint arm needed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskRequest(u64);
+
+impl DiskRequest {
+    /// The wire value (`SpawnIntent.disk_bytes`).
+    pub const fn bytes(self) -> u64 {
+        self.0
+    }
+
+    /// The emission chokepoint's reactive-floor overlay
+    /// (`resource_floor.disk_bytes`, clamped at the live ceiling) —
+    /// the ONE lawful post-constructor modification; the result is
+    /// still a lawful request (`≤ ceiling`, `≥` both floors).
+    pub fn with_reactive_floor(self, floor_bytes: u64, ceiling: u64) -> Self {
+        Self(self.0.max(floor_bytes).min(ceiling))
     }
 }
 
@@ -901,7 +957,11 @@ mod disk_envelope_tests {
                 e.floor.0 <= e.fitted.0 && e.fitted.0 <= e.ceiling.0.max(e.floor.0),
                 "ordering law on ({obs:?}, {prior}, {ceiling}): {e:?}"
             );
-            assert_eq!(e.request(), e.fitted, "the request IS the fitted point");
+            assert_eq!(
+                e.request().bytes(),
+                e.fitted.0,
+                "the request IS the fitted point"
+            );
         }
     }
 

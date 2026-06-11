@@ -117,7 +117,11 @@ pub fn explain(
 
     let cap_c = fit.fit.p_bar().0.min(fit.fit.c_opt().0).min(ceil.max_cores);
     let h = headroom(fit.n_eff_ring);
-    let disk = fit.disk_p90.map(|d| d.0).unwrap_or(ceil.default_disk);
+    // bug_132: the disk-ceiling label mirrors the solve gates BY
+    // CONSTRUCTION — the same single-sourced raw-observation
+    // predicate, never a re-derived comparison that can drift.
+    let disk_rejects =
+        crate::sla::fit::DiskFitEnvelope::exceeds_ceiling(fit.disk_p90, ceil.max_disk);
 
     let mut candidates = Vec::with_capacity(walk.len());
     for tier in walk {
@@ -146,7 +150,7 @@ pub fn explain(
             candidates.push(row);
             continue;
         }
-        if disk > ceil.max_disk {
+        if disk_rejects {
             row.binding_constraint = "disk-ceiling".into();
             candidates.push(row);
             continue;
