@@ -431,6 +431,22 @@ data "aws_iam_policy_document" "rio_store_s3" {
     actions   = ["s3:ListBucket"]
     resources = [aws_s3_bucket.chunks.arn]
   }
+  # ADR-023 cache tier: S3 Express auth is session-based —
+  # s3express:CreateSession at BUCKET level is the whole model (the SDK
+  # mints short-lived session credentials per directory bucket; object
+  # ops ride the session, there are no per-object grants to scope).
+  # Scoped to exactly the express cache buckets. Same single store
+  # role as the chunks bucket above: per-tenant read authorization
+  # happens in rio-store's gRPC layer, above the chunk backend, for
+  # BOTH tiers — neither bucket encodes caller identity.
+  dynamic "statement" {
+    for_each = length(var.express_az_ids) > 0 ? [1] : []
+    content {
+      effect    = "Allow"
+      actions   = ["s3express:CreateSession"]
+      resources = [for b in aws_s3_directory_bucket.express_cache : b.arn]
+    }
+  }
 }
 
 module "rio_store_irsa" {

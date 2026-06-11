@@ -1671,6 +1671,16 @@ karpenter:
   # capacity — AZs without Express stay schedulable.
   expressZones: []
 
+  # ADR-023: AZ names that have an S3 Express bucket (keys of
+  # store.chunkBackend.expressBuckets; EKS: xtask deploy sets both from
+  # the same tofu output). Non-empty renders rio-general-express — a
+  # higher-weight clone of rio-general zone-restricted to these AZs.
+  # NodePool requirements are hard constraints, so "preferred" is
+  # expressed structurally: Karpenter tries the heavier pool first and
+  # falls back to the unrestricted rio-general on insufficient
+  # capacity — AZs without Express stay schedulable.
+  expressZones: []
+
   nodePools:
     # §13e: static `rio-fetcher` NodePool DELETED. Fetcher capacity is
     # `fetcher-x86`/`fetcher-arm` hwClasses (sla.hwClasses above) routed

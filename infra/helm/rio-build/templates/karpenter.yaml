@@ -207,7 +207,28 @@ spec:
     consolidateAfter: Never
     budgets:
       - nodes: "0"
+{{- /* ADR-023: when expressZones is set, synthesize rio-general-express
+       — a deep-copied rio-general with +10 weight and a zone
+       requirement on the Express-supported AZs. NodePool requirements
+       are hard constraints, so AZ *preference* is expressed
+       structurally: Karpenter tries pools by descending weight and
+       falls back to the unrestricted rio-general when the preferred
+       zones can't satisfy (ICE) — AZs without Express stay
+       schedulable. Cloning from the values entry (not a second
+       template body) keeps instance families/limits/budgets
+       single-source. */}}
+{{- $pools := list }}
 {{- range $k.nodePools }}
+{{- $pools = append $pools . }}
+{{- if and $k.expressZones (eq .name "rio-general") }}
+{{- $clone := . | mustToJson | mustFromJson }}
+{{- $_ := set $clone "name" "rio-general-express" }}
+{{- $_ := set $clone "weight" (add (.weight | int) 10) }}
+{{- $_ := set $clone "requirements" (append $clone.requirements (dict "key" "topology.kubernetes.io/zone" "operator" "In" "values" $k.expressZones)) }}
+{{- $pools = append $pools $clone }}
+{{- end }}
+{{- end }}
+{{- range $pools }}
 ---
 apiVersion: karpenter.sh/v1
 kind: NodePool
