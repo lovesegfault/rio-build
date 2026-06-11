@@ -1475,6 +1475,30 @@ in
         touch $out
       '';
 
+  # R23' (the round-10 banner; WO-S8-7): emphatic-uppercase quantifier
+  # claims (the lexicon words) in rust comments, helm narration, spec
+  # prose, and script comments bind to machinery
+  # (`quantifier: census(...)`), demote (lowercase / non-normative
+  # tag), or ride the frozen burn-down grandfather. Self-test plants
+  # derive from the LEXICON x TIERS product (R22').
+  quantifier-lexicon =
+    pkgs.runCommand "rio-quantifier-lexicon"
+      {
+        # Full-tree staging ((vvvvv)): the lint quantifies over four
+        # tiers spanning rust sources, helm charts, docs/spec, and
+        # nix scripts — plus the grandfather ledger itself.
+        src = pkgs.lib.cleanSource ../.;
+        nativeBuildInputs = [ pkgs.python3 ];
+        scanScript = ../nix/quantifier_lexicon.py;
+        sharedLexer = ../nix/rust_strip.py;
+      }
+      ''
+        cp "$sharedLexer" rust_strip.py
+        cp "$scanScript" quantifier_lexicon.py
+        python3 quantifier_lexicon.py "$src"
+        touch $out
+      '';
+
   transport-unary-ban =
     pkgs.runCommand "rio-transport-unary-ban"
       {
