@@ -58,15 +58,18 @@ pub(crate) struct ChunkSource {
 }
 
 impl ChunkSource {
-    /// Absolute path of the containing file. `Path::join("")` leaves a
-    /// trailing separator that turns a single-file output root into
-    /// `ENOTDIR` on open, so the empty rel_path (root *is* the file)
-    /// is special-cased.
-    pub fn abs_path(&self, output_root: &Path) -> PathBuf {
+    /// Path of the containing file relative to the upper store
+    /// (`{basename}` or `{basename}/{rel_path}`), for re-opening
+    /// beneath a held upper-store dirfd — chunk re-reads never resolve
+    /// an absolute path through the attacker-written tree.
+    /// `Path::join("")` leaves a trailing separator that turns a
+    /// single-file output root into `ENOTDIR` on open, so the empty
+    /// rel_path (root *is* the file) is special-cased.
+    pub fn upper_rel_path(&self, basename: &str) -> PathBuf {
         if self.rel_path.as_os_str().is_empty() {
-            output_root.to_path_buf()
+            PathBuf::from(basename)
         } else {
-            output_root.join(&self.rel_path)
+            Path::new(basename).join(&self.rel_path)
         }
     }
 }
@@ -460,7 +463,12 @@ mod tests {
     /// Re-read a chunk's bytes via its `ChunkSource`.
     fn read_chunk(output_root: &Path, src: &ChunkSource) -> Vec<u8> {
         use std::io::{Read, Seek, SeekFrom};
-        let mut f = fs::File::open(src.abs_path(output_root)).expect("source file exists");
+        let abs = if src.rel_path.as_os_str().is_empty() {
+            output_root.to_path_buf()
+        } else {
+            output_root.join(&src.rel_path)
+        };
+        let mut f = fs::File::open(abs).expect("source file exists");
         f.seek(SeekFrom::Start(src.offset)).expect("seek");
         let mut buf = vec![0u8; src.size as usize];
         f.read_exact(&mut buf).expect("chunk bytes present");

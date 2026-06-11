@@ -304,7 +304,7 @@ async fn agreement_durable_chunk_omitted_from_stream() -> anyhow::Result<()> {
         walked,
     };
     let durable: HashSet<[u8; 32]> = [*blake3::hash(&shared).as_bytes()].into();
-    let (begin, plan) = build_begin(&[target], &upper_b, DERIVER, &[], &durable);
+    let (begin, plan) = build_begin(&[target], DERIVER, &[], &durable);
     assert!(
         !begin
             .novel
@@ -313,10 +313,16 @@ async fn agreement_durable_chunk_omitted_from_stream() -> anyhow::Result<()> {
         "B's novel must exclude the already-durable shared chunk"
     );
 
-    let (created, _bytes) =
-        send_chunked(&s.store_client, begin, plan, "", chunked_stream_timeout(1))
-            .await
-            .expect("store accepts an upload that omits durable chunk bodies");
+    let (created, _bytes) = send_chunked(
+        &s.store_client,
+        begin,
+        plan,
+        &upper_b,
+        "",
+        chunked_stream_timeout(1),
+    )
+    .await
+    .expect("store accepts an upload that omits durable chunk bodies");
     assert_eq!(created, vec![true]);
     assert_eq!(
         s.backend.len(),
