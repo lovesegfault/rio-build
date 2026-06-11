@@ -1349,6 +1349,106 @@ async fn attemptless_stale_job_reaps_on_the_second_strike() {
     );
 }
 
+/// W9-AQ (merged_bug_033): strikes expire structurally, not
+/// positionally. A strike at tick t followed by k EMPTY-want passes
+/// (idle pool; the fail-closed scheduler-error arm polls as queued=0
+/// — exactly the early return that used to bypass the function-tail
+/// retain) does NOT escalate on the first post-gap classification:
+/// the gap reset consecutiveness BY VALUE, so the post-gap pass is
+/// strike 1 (defers) and only a genuinely adjacent second pass
+/// reaps. Pre-fix red (the frozen strike): the post-gap pass reaped
+/// on a non-consecutive "strike 2" — transcript in the commit body.
+#[tokio::test]
+async fn w9_aq_strikes_reset_across_empty_want_gap_ticks() {
+    let (client, verifier) = ApiServerVerifier::new();
+    let (ctx, mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
+    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+    let key = pkey();
+
+    // Attempt-less terminal Job for a still-wanted intent: the
+    // attempt-affecting arm with the two-tick confirmation.
+    mock.open_attempts.write().unwrap().attempts.clear();
+    let job = terminal_job_for_intent("rio-builder-p-aq1", "aq1");
+    let intents = [intent_named("aq1")];
+
+    // ONE delete scenario total: it must be consumed by the final
+    // adjacent-pass reap, NEVER by the post-gap pass.
+    let guard = verifier.run(vec![Scenario {
+        method: http::Method::DELETE,
+        path_contains: "/namespaces/rio/jobs/rio-builder-p-aq1",
+        body_contains: Some(r#""propagationPolicy":"Background""#),
+        status: 200,
+        body_json: serde_json::to_string(&Job::default()).unwrap(),
+    }]);
+
+    // Tick t: strike 1 — defers.
+    let first = reap_stale_for_intents(
+        &jobs_api,
+        std::slice::from_ref(&job),
+        &intents,
+        &ctx,
+        "p",
+        ExecutorKind::Builder,
+        &key,
+    )
+    .await;
+    assert!(first.is_empty(), "strike 1 defers");
+
+    // Ticks t+1 .. t+3: the outage/idle gap — reap runs with NO
+    // intents and early-returns. Each empty pass IS a tick.
+    for _ in 0..3 {
+        let gap = reap_stale_for_intents(
+            &jobs_api,
+            std::slice::from_ref(&job),
+            &[],
+            &ctx,
+            "p",
+            ExecutorKind::Builder,
+            &key,
+        )
+        .await;
+        assert!(gap.is_empty(), "an empty-want pass reaps nothing");
+    }
+
+    // Post-gap classification: the count RESET to 1 — defers.
+    let post_gap = reap_stale_for_intents(
+        &jobs_api,
+        std::slice::from_ref(&job),
+        &intents,
+        &ctx,
+        "p",
+        ExecutorKind::Builder,
+        &key,
+    )
+    .await;
+    assert!(
+        post_gap.is_empty(),
+        "left: {{rio-builder-p-aq1}} (the frozen strike reaps on a \
+         non-consecutive \"strike 2\" right after the outage heals) / \
+         right: {{}} (the gap reset the confirmation; this pass is \
+         strike 1)"
+    );
+
+    // The genuinely adjacent second pass reaps — the two-tick law
+    // still confirms on back-to-back classifications.
+    let adjacent = reap_stale_for_intents(
+        &jobs_api,
+        std::slice::from_ref(&job),
+        &intents,
+        &ctx,
+        "p",
+        ExecutorKind::Builder,
+        &key,
+    )
+    .await;
+    guard.verified().await;
+    assert_eq!(
+        adjacent,
+        HashSet::from(["rio-builder-p-aq1".to_string()]),
+        "two adjacent-by-value classifications still reap"
+    );
+}
+
 // r[verify ctrl.job.synthesize-on-delete+4]
 /// The pure synthesize decision: `Some` exactly when an open pull-mode
 /// attempt covers the Job (so a no-attempt delete attempts no RPC by

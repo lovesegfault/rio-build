@@ -1256,15 +1256,98 @@ pub(super) async fn mint_spawn_tokens(
 /// CONSECUTIVE tick reaps — any pull in flight at strike one
 /// surfaces in strike two's view (refetched per tick) and vetoes at
 /// the chokepoint. Keyed by (pool, uid) — the uid, never the
-/// reusable name (the bug_089 lesson at the OA1 sample) — and
-/// retained per tick only for uids struck THIS tick, so a Job that
-/// stops classifying (or is deleted by any path) resets/expires its
-/// entry: consecutive means consecutive. Process-local like the
+/// reusable name (the bug_089 lesson at the OA1 sample).
+///
+/// merged_bug_033: "consecutive" is enforced BY VALUE, not by code
+/// position. Every reap pass advances a per-pool tick counter at
+/// FUNCTION ENTRY — an empty-`want` pass (idle pool; the fail-closed
+/// scheduler-error arm that polls as queued=0) IS a tick — and each
+/// strike row carries the tick it was struck. A strike escalates
+/// only when the new tick is ADJACENT to the stamped one
+/// (`last_tick + 1 == tick`); any gap — an empty-want early return,
+/// a pass where the Job did not classify — resets the count to 1, so
+/// every exit path of the reap is correct by construction. The
+/// previous shape (a function-tail `retain` of uids struck this
+/// pass) enforced expiry positionally, and the `want.is_empty()`
+/// early return bypassed it: strikes FROZE across exactly the
+/// scheduler outages the two-tick confirmation absorbs, and the
+/// first post-gap classification reaped on a non-consecutive
+/// "strike 2".
+///
+/// Rows untouched past [`STRIKE_PRUNE_HORIZON`] are dropped at pass
+/// entry — a MEMORY bound (deleted pools and long-gone uids would
+/// otherwise leak in this process-global map forever), never the
+/// correctness bound (adjacency-by-value is). Process-local like the
 /// reconcile loop that feeds it; a controller restart counts afresh
 /// (conservative — one extra tick of deferral). The orphan-pending
 /// arm is OUT of scope: already age-gated by `REAP_PENDING_GRACE`.
-static STALE_STRIKES: std::sync::LazyLock<parking_lot::Mutex<HashMap<(String, String), u8>>> =
-    std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+struct StrikeLedger {
+    /// Per-pool reap-pass counter — the strike clock. Advanced at
+    /// every [`reap_stale_for_intents`] entry for the pool,
+    /// INCLUDING passes that early-return on an empty `want`.
+    ticks: HashMap<String, u64>,
+    /// (pool, uid) → the tick-stamped strike row.
+    strikes: HashMap<(String, String), StrikeEntry>,
+}
+
+struct StrikeEntry {
+    /// Consecutive-adjacent-tick strike count (reap at >= 2).
+    count: u8,
+    /// The pool tick this row was last struck at.
+    last_tick: u64,
+    /// Wall clock of the last strike — feeds the memory prune ONLY.
+    touched: std::time::Instant,
+}
+
+/// Prune horizon for [`StrikeLedger`] rows — the memory bound, not a
+/// correctness bound (see the ledger doc). One hour dwarfs any
+/// plausible reconcile cadence: a row this stale belongs to a deleted
+/// pool or a long-gone Job, and its adjacency has long since lapsed.
+const STRIKE_PRUNE_HORIZON: std::time::Duration = std::time::Duration::from_secs(3600);
+
+impl StrikeLedger {
+    /// Advance `pool`'s tick — every reap pass, an empty-`want` pass
+    /// included — and prune rows past the memory horizon. `now` is
+    /// threaded (house pattern) so the prune law is drivable by
+    /// value in tests.
+    fn begin_tick(&mut self, pool: &str, now: std::time::Instant) -> u64 {
+        self.strikes
+            .retain(|_, e| now.saturating_duration_since(e.touched) < STRIKE_PRUNE_HORIZON);
+        let t = self.ticks.entry(pool.to_owned()).or_insert(0);
+        *t += 1;
+        *t
+    }
+
+    /// Record a strike for (pool, uid) at `tick`; returns the
+    /// resulting count — `previous + 1` when the row's stamp is
+    /// adjacent by value, else 1.
+    fn strike(&mut self, pool: &str, uid: String, tick: u64, now: std::time::Instant) -> u8 {
+        let e = self
+            .strikes
+            .entry((pool.to_owned(), uid))
+            .or_insert(StrikeEntry {
+                count: 0,
+                last_tick: 0,
+                touched: now,
+            });
+        e.count = if e.count > 0 && e.last_tick + 1 == tick {
+            e.count.saturating_add(1)
+        } else {
+            1
+        };
+        e.last_tick = tick;
+        e.touched = now;
+        e.count
+    }
+}
+
+static STALE_STRIKES: std::sync::LazyLock<parking_lot::Mutex<StrikeLedger>> =
+    std::sync::LazyLock::new(|| {
+        parking_lot::Mutex::new(StrikeLedger {
+            ticks: HashMap::new(),
+            strikes: HashMap::new(),
+        })
+    });
 
 /// A Pending Job whose selector MATCHES the current intent is NOT
 /// reaped — that's the intended NameCollision dedupe.
@@ -1298,6 +1381,13 @@ pub(super) async fn reap_stale_for_intents(
     key: &candidate::PoolKey,
 ) -> HashSet<String> {
     let mut reaped = HashSet::new();
+    // merged_bug_033: the strike clock advances at FUNCTION ENTRY,
+    // before the empty-`want` early return below — an empty pass IS
+    // a tick, so strikes stamped before a scheduler outage / idle
+    // stretch read as non-adjacent when classification resumes.
+    let tick = STALE_STRIKES
+        .lock()
+        .begin_tick(pool, std::time::Instant::now());
     let want: HashMap<String, String> = intents
         .iter()
         .map(|i| {
@@ -1319,7 +1409,6 @@ pub(super) async fn reap_stale_for_intents(
     // witness in place, so the gate below always folds the same
     // evidence the delete consumed.
     let mut attempts_view: Option<super::job::AttemptsPair> = None;
-    let mut struck_this_tick: HashSet<String> = HashSet::new();
     for j in existing {
         let Some(jn) = j.metadata.name.as_deref() else {
             continue;
@@ -1364,13 +1453,9 @@ pub(super) async fn reap_stale_for_intents(
                 // (apiserver objects always carry one in practice).
                 continue;
             };
-            struck_this_tick.insert(uid.clone());
-            let strikes = {
-                let mut m = STALE_STRIKES.lock();
-                let e = m.entry((pool.to_owned(), uid)).or_insert(0);
-                *e = e.saturating_add(1);
-                *e
-            };
+            let strikes = STALE_STRIKES
+                .lock()
+                .strike(pool, uid, tick, std::time::Instant::now());
             if strikes < 2 {
                 info!(
                     pool, job = %jn, why,
@@ -1386,8 +1471,9 @@ pub(super) async fn reap_stale_for_intents(
                 // merged_bug_022: a FAILED lazy fetch defers every
                 // remaining attempt-affecting delete this tick — no
                 // NoOpenAttempt deletes, no backoff tax, from an
-                // error-born empty view. Strikes recorded above stay
-                // monotone via struck_this_tick; next tick re-decides.
+                // error-born empty view. Strikes recorded above are
+                // stamped at THIS tick, so the next pass reads
+                // adjacent-by-value and re-decides at count >= 2.
                 match super::job::AttemptsViewWitness::fetch(ctx, pool).await {
                     super::job::AttemptsFetch::Fetched(w) => {
                         attempts_view = Some(super::job::AttemptsPair::at_selection(w));
@@ -1415,8 +1501,9 @@ pub(super) async fn reap_stale_for_intents(
                     "stale-Job reap deferred at the chokepoint on attempt \
                      evidence (live_051(e)); re-decided next tick"
                 );
-                // NOT reaped: the Job stands; the strike is retained
-                // via struck_this_tick, so next tick re-decides
+                // NOT reaped: the Job stands; the strike row is
+                // stamped at this tick, so the next pass reads
+                // adjacent-by-value and re-decides at count >= 2
                 // (strike monotonicity — no infinite-defer arm).
             }
             Ok(synthesized) => {
@@ -1502,13 +1589,9 @@ pub(super) async fn reap_stale_for_intents(
             }
         }
     }
-    // live_051(e): strikes persist only for uids struck THIS tick —
-    // a Job that stops classifying (or was deleted by any path)
-    // expires its entry, so "two strikes" means two CONSECUTIVE
-    // ticks.
-    STALE_STRIKES
-        .lock()
-        .retain(|(p, uid), _| p != pool || struck_this_tick.contains(uid));
+    // merged_bug_033: no function-tail ledger maintenance — expiry
+    // is BY VALUE (tick stamps), so there is no retain for an early
+    // return to bypass.
     reaped
 }
 
@@ -1808,6 +1891,86 @@ mod tests {
             intent_id: id.into(),
             ..Default::default()
         }
+    }
+
+    fn ledger() -> StrikeLedger {
+        StrikeLedger {
+            ticks: HashMap::new(),
+            strikes: HashMap::new(),
+        }
+    }
+
+    /// W9-AQ (merged_bug_033), ledger faces: "consecutive" is
+    /// adjacent ticks BY VALUE — a gap of empty-want passes (each
+    /// advances the clock at function entry) resets the count, so
+    /// the first post-gap classification is strike 1, never a
+    /// frozen "strike 2"; an adjacent follow-up still escalates.
+    #[test]
+    fn w9_aq_strike_gap_resets_consecutiveness_by_value() {
+        let mut l = ledger();
+        let now = std::time::Instant::now();
+        let t1 = l.begin_tick("p", now);
+        assert_eq!(l.strike("p", "uid-1".into(), t1, now), 1);
+        // k empty-want passes: the clock advances, nothing strikes.
+        let _ = l.begin_tick("p", now);
+        let _ = l.begin_tick("p", now);
+        let t4 = l.begin_tick("p", now);
+        assert_eq!(
+            l.strike("p", "uid-1".into(), t4, now),
+            1,
+            "left: 2 (the frozen strike escalates across the gap) / \
+             right: 1 (adjacency by value resets the confirmation)"
+        );
+        // Adjacent follow-up: two genuine back-to-back
+        // classifications still confirm.
+        let t5 = l.begin_tick("p", now);
+        assert_eq!(l.strike("p", "uid-1".into(), t5, now), 2);
+    }
+
+    /// Strike clocks are POOL-scoped: another pool's passes advance
+    /// only that pool's tick — they neither break this pool's
+    /// adjacency nor manufacture a gap.
+    #[test]
+    fn strike_clocks_are_pool_scoped() {
+        let mut l = ledger();
+        let now = std::time::Instant::now();
+        let t1 = l.begin_tick("p", now);
+        assert_eq!(l.strike("p", "uid-1".into(), t1, now), 1);
+        // Sibling-pool passes interleave (the reconcile loop is
+        // per-pool; ticks for q are not ticks for p).
+        let _ = l.begin_tick("q", now);
+        let _ = l.begin_tick("q", now);
+        let t2 = l.begin_tick("p", now);
+        assert_eq!(
+            l.strike("p", "uid-1".into(), t2, now),
+            2,
+            "p's tick 2 is adjacent to p's tick 1 regardless of q's clock"
+        );
+    }
+
+    /// merged_bug_033 leak pin: rows for absent pools (pool deleted,
+    /// uid long gone — nothing ever strikes them again) vanish at
+    /// the prune horizon via ANY pool's pass entry. The horizon is a
+    /// MEMORY bound; correctness rides adjacency-by-value alone.
+    #[test]
+    fn strike_rows_for_absent_pools_prune_at_the_horizon() {
+        let mut l = ledger();
+        let t0 = std::time::Instant::now();
+        let t = l.begin_tick("deleted-pool", t0);
+        l.strike("deleted-pool", "uid-9".into(), t, t0);
+        assert_eq!(l.strikes.len(), 1);
+        // Just inside the horizon: retained.
+        let _ = l.begin_tick(
+            "live-pool",
+            t0 + STRIKE_PRUNE_HORIZON - std::time::Duration::from_secs(1),
+        );
+        assert_eq!(l.strikes.len(), 1, "row inside the horizon is retained");
+        // At the horizon: any pool's next pass prunes globally.
+        let _ = l.begin_tick("live-pool", t0 + STRIKE_PRUNE_HORIZON);
+        assert!(
+            l.strikes.is_empty(),
+            "absent-pool rows vanish at the stamp horizon (memory bound)"
+        );
     }
 
     /// `build_job` wrapper for tests that don't exercise the §13a
