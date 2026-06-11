@@ -618,6 +618,10 @@ impl DagActor {
                 // with only legacy (pod-name-keyed) failures.
                 // r[impl sched.dispatch.fleet-exhaust+5]
                 excluded_nodes: state.excluded_source_nodes(),
+                // bug_121: absent = unpinned (the field's Q6 law); this
+                // arm emits None — the solve-chokepoint pin stamp rides
+                // the same wave's consumer-arm commit.
+                capacity_pin: None,
             }
         };
 

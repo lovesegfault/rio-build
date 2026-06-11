@@ -597,6 +597,27 @@ message SpawnIntent {
   // computed against a stale cycle. 0 = first cycle (and the pre-C2
   // wire default — see the echo field's skew note).
   uint64 resubmit_cycle = 17;
+  // bug_121 (R25 end-to-end alphabets): the operator `--capacity` pin,
+  // surviving serialization as data. Values from the shared cell-wire
+  // alphabet ("spot" / "od"; readers also accept Karpenter's
+  // "on-demand" form — `rio_common::cell_wire::WireCapacity` is the
+  // alphabet's one owner). Stamped on EVERY emission of pinned demand
+  // at the scheduler's post-finalize chokepoint — including pin-gated
+  // emissions whose cell set is empty — so a PinGated emission is no
+  // longer byte-identical to an HwAgnostic one (two letters sharing a
+  // wire image was the silent pin decay: the controller's
+  // `fallback_cell` ran an on-demand-pinned build on spot at the
+  // class's first configured capacity). Consumers MUST fail the pin
+  // closed: the cold-start fallback may only pick cells at this
+  // capacity, and "no class hosts the pin" is the typed ADVISORY pend
+  // (`PlacementOutcome::PinGated`, counted) — NEVER the poison-feeding
+  // no-hosting-class verdict, never a silent off-pin placement.
+  // `optional`: absent = legacy/unpinned — a pre-pin-wire scheduler
+  // only ever emitted unpinned or affinity-constrained intents, so
+  // absence decoding as "no pin" is BY DEFINITION the old behaviour
+  // (Q6 read-side-first additive; back-compat decode pinned in
+  // rio-controller/tests/roundtrip.rs).
+  optional string capacity_pin = 18;
 }
 
 // One conjunction of node-match requirements. Mirrors k8s core/v1
