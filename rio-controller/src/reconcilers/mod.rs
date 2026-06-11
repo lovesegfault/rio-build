@@ -55,6 +55,9 @@ pub(crate) const ADMIN_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) async fn admin_call<T>(
     fut: impl Future<Output = std::result::Result<tonic::Response<T>, tonic::Status>>,
 ) -> std::result::Result<tonic::Response<T>, tonic::Status> {
+    // timeout-census: refusal — typed deadline_exceeded to the caller;
+    // no effect committed (consumers defer or retry next tick).
+    // census[gen: rio-controller/tests/timeout_census.txt]
     match tokio::time::timeout(ADMIN_RPC_TIMEOUT, fut).await {
         Ok(r) => r,
         Err(_elapsed) => Err(tonic::Status::deadline_exceeded(

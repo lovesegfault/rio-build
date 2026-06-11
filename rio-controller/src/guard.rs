@@ -266,6 +266,8 @@ async fn readyz(State(s): State<ReadyState>) -> (StatusCode, &'static str) {
     s.main.spawn(async move {
         let _ = tx.send(());
     });
+    // timeout-census: refusal — readiness sheds 503 (Endpoints removal);
+    // nothing committed. census[gen: rio-controller/tests/timeout_census.txt]
     match tokio::time::timeout(s.budget, rx).await {
         Ok(Ok(())) => (StatusCode::OK, "ok"),
         // Elapsed, or the probe task was dropped (runtime shutting

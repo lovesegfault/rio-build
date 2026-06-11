@@ -169,6 +169,8 @@ pub(crate) async fn run_loop<F, Fut>(
         let result = tokio::select! {
             biased;
             _ = shutdown.cancelled() => break,
+            // timeout-census: delay — run abandoned; the next cron tick
+            // retries. census[gen: rio-controller/tests/timeout_census.txt]
             r = tokio::time::timeout(GC_TICK_TIMEOUT, tick_fn()) => match r {
                 Ok(r) => r,
                 Err(_elapsed) => {
@@ -208,6 +210,8 @@ async fn tick_once(
     // interceptor — `r[store.admin.service-gate]` requires it on
     // `TriggerGC`.
     let connect = rio_proto::client::connect_channel(store_addr);
+    // timeout-census: delay — tick skipped (ConnectFailure); next cron
+    // retries. census[gen: rio-controller/tests/timeout_census.txt]
     let ch = match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {

@@ -86,6 +86,9 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
             // until controller restart (bug_464). Elapsed →
             // InvalidSpec → error_policy 30s requeue keeps the loop
             // alive.
+            // timeout-census: delay — InvalidSpec → error_policy 30s
+            // requeue; scaling resumes next tick.
+            // census[gen: rio-controller/tests/timeout_census.txt]
             let cs = tokio::time::timeout(LOAD_RPC_TIMEOUT, ctx.admin.clone().cluster_status(()))
                 .await
                 .map_err(|_| {
@@ -221,6 +224,8 @@ async fn poll_max_load(
         return None;
     };
 
+    // timeout-census: delay — no load reading this tick; the scaler
+    // re-polls next pass. census[gen: rio-controller/tests/timeout_census.txt]
     let addrs: Vec<_> =
         match tokio::time::timeout(LOAD_RPC_TIMEOUT, tokio::net::lookup_host((host, port))).await {
             Ok(Ok(it)) => it.collect(),
@@ -276,6 +281,9 @@ async fn poll_max_load_addrs(
                     .into_inner();
                 anyhow::Ok(fold_load(&r))
             };
+            // timeout-census: delay — this pod's reading is skipped in
+            // the max() fold; next pass re-polls.
+            // census[gen: rio-controller/tests/timeout_census.txt]
             (addr, tokio::time::timeout(LOAD_RPC_TIMEOUT, load).await)
         });
     }
