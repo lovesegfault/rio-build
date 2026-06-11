@@ -6020,6 +6020,44 @@ async fn cell_emission_arm_product_census() {
         matches!(e, E::Cells(ref c) if !c.is_empty()),
         "row 12 (size evidence, fits): {e:?}"
     );
+    // Row 13 — **W10-AA (bug_128, the prescription-adopted exemplar)**:
+    // ∅ feat × hostable demand × DISK evidence (DiskCeiling).
+    // Disk has NO per-class ceiling (config.rs: global-only via
+    // SlaCeilings BY DESIGN) and the request is already clamped at
+    // the solve chokepoint, so re-routing featureless disk-capped
+    // demand into the (mem,cores)-largest class adds ZERO hostability
+    // while silently concentrating every disk_p90>maxDisk build onto
+    // the most expensive class — the merged_bug_057 concentration
+    // failure re-opened on the disk axis, durably, every tick. The
+    // agnostic lane MUST stay open: the partition predicate derives
+    // from "does any per-class ceiling exist on this axis", never
+    // from variant naming. Pre-fix red: DiskCeiling sat in the size
+    // arm by 'Ceiling' name-analogy → the gate denied the agnostic
+    // lane → the stale walk found the demand fits → plain Cells
+    // pinned to the largest class with no StaleSolve disclosure
+    // (both faces asserted).
+    let e = actor.classify_cell_emission(
+        node("d-plain"),
+        None,
+        4,
+        1 << 30,
+        &cost_big,
+        "t",
+        &no_feat,
+        Some(InfeasibleReason::DiskCeiling),
+        false,
+    );
+    assert!(
+        !matches!(e, E::Cells(_)),
+        "row 13 pre-fix shape: featureless disk-capped demand was \
+         PINNED to the largest class as plain Cells (silent \
+         concentration, zero disclosure): {e:?}"
+    );
+    assert!(
+        matches!(e, E::HwAgnostic),
+        "row 13 (disk evidence): the agnostic lane stays open — the \
+         chokepoint clamp is the disk law; got {e:?}"
+    );
 }
 
 // r[verify scheduler.sla.ceiling.stale-solve-revalidation+2]

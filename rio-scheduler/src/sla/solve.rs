@@ -160,22 +160,57 @@ impl InfeasibleReason {
     /// envelope/supply axis — the populations the agnostic lane is
     /// reserved AWAY from (merged_bug_057: the emission classifier
     /// keys its HwAgnostic gate on this, not on "any infeasibility").
-    /// Time-shaped reasons (`SerialFloor`: `S ≥ bound` at the loosest
-    /// tier; `InterruptRunaway`: λ rejects spot at every `c`) leave
-    /// the demand hostable by every class size-wise, so featureless
-    /// demand KEEPS the designed agnostic lane — clamping it into the
-    /// mem-largest class concentrated demand on the most expensive
-    /// class exactly under capacity/interrupt pressure.
-    /// `CapacityExhausted` cannot reach the emission classifier today
-    /// (it is minted only at the memo arm's read-time ICE-mask edge,
-    /// never by `classify_ceiling`/`classify_best_effort`); it is
-    /// classed size-side conservatively because §Capacity backoff
-    /// reserves the agnostic lane for envelope-infeasibility.
+    ///
+    /// bug_128 (the prescription-adopted exemplar): the partition
+    /// DERIVES from the structural property "does any PER-CLASS
+    /// ceiling exist on this reason's axis" — i.e. can re-routing to
+    /// a different class change hostability — never from variant
+    /// naming. The stale-demand re-route resolves over the per-class
+    /// `(cores, mem)` ceiling vector ONLY, so a reason whose axis the
+    /// re-route cannot move gains nothing from leaving the agnostic
+    /// lane and silently concentrates demand on the largest class
+    /// (the merged_bug_057 failure, re-opened per axis). Per-variant
+    /// derivation (the `size_infeasibility_property_table` census
+    /// pins every row; a new variant fails compilation there until
+    /// filed with its axis):
+    ///
+    /// - `MemCeiling`/`CoreCeiling` → TRUE: per-class mem/cores
+    ///   ceilings exist (`class_ceilings`) and the resolved tuple
+    ///   carries both axes — a larger class CAN host what the bound
+    ///   one refused.
+    /// - `DiskCeiling` → FALSE: disk has NO per-class ceiling
+    ///   (config.rs: global-only via `SlaCeilings` BY DESIGN; the
+    ///   chokepoint `.min(max_disk)` clamp is the disk law) and the
+    ///   resolved tuple does not carry the axis — the re-route adds
+    ///   zero hostability. Featureless disk-capped demand KEEPS the
+    ///   agnostic lane. ('Ceiling' name-analogy filed it size-side
+    ///   pre-fix — the prescription-adopted defect.)
+    /// - `SerialFloor`/`InterruptRunaway` → FALSE: time-shaped
+    ///   (`S ≥ bound` at the loosest tier; λ rejects spot at every
+    ///   `c`) — hostable by every class size-wise; clamping into the
+    ///   mem-largest class concentrated demand on the most expensive
+    ///   class exactly under capacity/interrupt pressure.
+    /// - `CapacityExhausted` → TRUE (conservative reserve): it cannot
+    ///   reach the emission classifier today (minted only at the memo
+    ///   arm's read-time ICE-mask edge, never by `classify_ceiling`/
+    ///   `classify_best_effort`) and it has no size axis; it is
+    ///   classed size-side because §Capacity backoff reserves the
+    ///   agnostic lane for envelope-infeasibility — the property
+    ///   table carries this row as the DOCUMENTED exception with its
+    ///   unreachability premise, so the reserve cannot silently grow.
     pub const fn is_size_infeasibility(&self) -> bool {
         match self {
-            Self::MemCeiling | Self::DiskCeiling | Self::CoreCeiling | Self::CapacityExhausted => {
-                true
-            }
+            // Per-class ceiling exists on the axis (mem / cores) —
+            // the re-route can change hostability.
+            Self::MemCeiling | Self::CoreCeiling => true,
+            // Documented conservative reserve (unreachable at the
+            // classifier; no size axis).
+            Self::CapacityExhausted => true,
+            // No per-class ceiling on the axis: disk is global-only
+            // (the chokepoint clamp is the disk law) — the re-route
+            // gains nothing.
+            Self::DiskCeiling => false,
+            // Time-shaped — hostable by every class size-wise.
             Self::SerialFloor | Self::InterruptRunaway => false,
         }
     }
@@ -1430,6 +1465,113 @@ pub fn cells_to_selector_terms(
 mod tests {
     use super::*;
     use crate::sla::types::*;
+
+    // r[verify scheduler.sla.ceiling.stale-solve-revalidation+2]
+    /// **W10-AB (bug_128)** — the ALL-variant property table: every
+    /// `InfeasibleReason` × its agnostic-gate behavior × the
+    /// structural property that justifies it. The table IS the
+    /// census (R15): the `row` match below is rustc-exhaustive, so a
+    /// new variant FAILS COMPILATION here until filed with its axis
+    /// and justification — it cannot default into either arm by
+    /// name-analogy (the prescription-adopted defect this WO
+    /// closes; strawman demonstrated in the commit body). The
+    /// derivation law asserted per row: `is_size_infeasibility` ⟺
+    /// the reason's axis is one the stale-demand re-route can
+    /// actually move — the per-class ceiling axes `(cores, mem)`,
+    /// exactly the resolved tuple — with `CapacityExhausted` the
+    /// DOCUMENTED conservative reserve (no size axis, unreachable at
+    /// the emission classifier; pinned here so the reserve cannot
+    /// silently grow).
+    #[test]
+    fn size_infeasibility_property_table() {
+        /// The axis a reason binds on. `PerClassMem`/`PerClassCores`
+        /// are the ONLY axes with per-class ceilings (the
+        /// `class_ceilings` vector and the re-route's resolved
+        /// tuple); `GlobalDisk` has a global-only ceiling (the
+        /// chokepoint clamp is the law); `Time` has no ceiling
+        /// vector at all.
+        #[derive(Debug, PartialEq)]
+        enum Axis {
+            PerClassMem,
+            PerClassCores,
+            GlobalDisk,
+            Time,
+            NoSize,
+        }
+        struct Row {
+            gate: bool,
+            axis: Axis,
+            why: &'static str,
+        }
+        let row = |r: &InfeasibleReason| -> Row {
+            match r {
+                InfeasibleReason::MemCeiling => Row {
+                    gate: true,
+                    axis: Axis::PerClassMem,
+                    why: "per-class mem ceilings exist; a larger class can host",
+                },
+                InfeasibleReason::CoreCeiling => Row {
+                    gate: true,
+                    axis: Axis::PerClassCores,
+                    why: "per-class core ceilings exist; a larger class can host",
+                },
+                InfeasibleReason::DiskCeiling => Row {
+                    gate: false,
+                    axis: Axis::GlobalDisk,
+                    why: "disk is global-only BY DESIGN; the chokepoint clamp \
+                          is the disk law — the re-route adds zero hostability",
+                },
+                InfeasibleReason::SerialFloor => Row {
+                    gate: false,
+                    axis: Axis::Time,
+                    why: "S >= bound at the loosest tier — hostable by every \
+                          class size-wise",
+                },
+                InfeasibleReason::InterruptRunaway => Row {
+                    gate: false,
+                    axis: Axis::Time,
+                    why: "lambda rejects spot at every c — hostable by every \
+                          class size-wise",
+                },
+                InfeasibleReason::CapacityExhausted => Row {
+                    gate: true,
+                    axis: Axis::NoSize,
+                    why: "DOCUMENTED reserve: unreachable at the emission \
+                          classifier (memo-arm ICE-mask edge only); the \
+                          agnostic lane is reserved for envelope-infeasibility",
+                },
+            }
+        };
+        for r in InfeasibleReason::ALL {
+            let row = row(&r);
+            assert_eq!(
+                r.is_size_infeasibility(),
+                row.gate,
+                "{r:?}: gate disagrees with the filed table row ({})",
+                row.why
+            );
+            // The derivation: gate ⟺ axis is re-route-movable
+            // (per-class ceilings exist on it) — except the one
+            // documented reserve.
+            let derivable = matches!(row.axis, Axis::PerClassMem | Axis::PerClassCores);
+            match r {
+                InfeasibleReason::CapacityExhausted => {
+                    assert!(
+                        row.gate && !derivable,
+                        "the reserve row must stay the EXPLICIT exception \
+                         (gate=true with no movable axis) — if its axis \
+                         changed, re-derive instead of widening the reserve"
+                    );
+                }
+                _ => assert_eq!(
+                    row.gate, derivable,
+                    "{r:?}: the gate MUST derive from the per-class-ceiling \
+                     property, never from variant naming ({})",
+                    row.why
+                ),
+            }
+        }
+    }
 
     fn mk_fit(s: f64, p: f64, q: f64, p_bar: f64, sigma: f64) -> FittedParams {
         FittedParams {
