@@ -1016,6 +1016,25 @@ process or its FUSE threads.
   metric as a sizing signal.
 ]
 
+#r("builder.disk.quota-classified")[
+  When a build fails AND the post-build project-quota sample shows the
+  overlay's `dqb_curspace` within `DISK_FULL_QUOTA_SLACK_BYTES` of its hard
+  limit AND the node filesystem reports at least
+  `DISK_FULL_NODE_HEADROOM_BYTES` free, the executor MUST reclassify the
+  result as disk exhaustion (`InfrastructureFailure` carrying the pinned
+  `DISK_FULL_MSG` contract substring), never `PermanentFailure` --- a
+  quota-exhausted build is a SIZING signal (the cgroup-OOM twin on the disk
+  axis), and the scheduler bumps the derivation's disk resource floor on the
+  pinned substring. A node-attributed exhaustion (below the headroom floor)
+  MUST keep the non-quota lane: the node's exhaustion is not the build's
+  sizing signal.
+]
+
+The slack term exists because the ENOSPC-refused write never lands ---
+the post-failure usage sample sits below the hard limit by up to the refused
+write's size. Both thresholds are violable typed constants with recorded
+derivations beside the limit-read face (`rio-builder/src/quota.rs`).
+
 The overlay is per-build. Each build gets its own overlayfs mount with
 separate upper and work directories. The Nix sandbox provides process-level
 isolation (user, mount, PID, and network namespaces). Even if the Nix sandbox

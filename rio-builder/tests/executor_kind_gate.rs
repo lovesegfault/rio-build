@@ -26,6 +26,7 @@ fn make_env(kind: ExecutorKind, dir: &std::path::Path) -> ExecutorEnv {
     ExecutorEnv {
         fuse_mount_point: dir.to_path_buf(),
         overlay_base_dir: dir.to_path_buf(),
+        fuse_cache_dir: dir.to_path_buf(),
         executor_id: "test-executor".into(),
         log_limits: LogLimits::UNLIMITED,
         daemon_timeout: rio_common::config::BoundedSecs::from_duration(DEFAULT_DAEMON_TIMEOUT),

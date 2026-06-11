@@ -22,6 +22,67 @@ use std::{fs::File, io, os::fd::AsRawFd, path::Path};
 
 use nix::libc;
 
+/// R17 (live_057-a): the ε in the quota-exhaustion predicate
+/// `used ≥ hard_limit − DISK_FULL_QUOTA_SLACK_BYTES`. Nonzero because
+/// the ENOSPC-refused write never lands: the post-failure
+/// `dqb_curspace` sample sits BELOW the hard limit by up to the
+/// refused write's size, so an exact `used ≥ limit` test misses real
+/// exhaustions. VIOLABLE, hypothesis 64 MiB (the live_057 incident
+/// pods' quota/statfs evidence was not retained, so the derivation
+/// duty falls to the recorded fallback: a refused write is at most a
+/// few output blobs — 64 MiB over-covers typical single-file refusals
+/// while staying ≪ the 25 GiB ladder rung, so a false positive
+/// requires a build that PARKED within 64 MiB of its quota and failed
+/// for an unrelated reason — measure at the first classified
+/// production sample and re-derive). Raising it trades false
+/// negatives (missed sizing signals → retry-poison) for false
+/// positives (a spurious classification inflates every affected
+/// pname's disk request by one doubling).
+pub const DISK_FULL_QUOTA_SLACK_BYTES: u64 = 64 << 20;
+
+/// R17 (live_057-a): the statvfs floor below which disk exhaustion
+/// attributes to the NODE, not the build's quota — when the node
+/// filesystem itself is nearly full, the build's failure is the
+/// node's problem (the result keeps its non-quota infra lane and the
+/// scheduler re-places; S2's witnessed-eviction window is the
+/// pod-level backstop per §1.6.4-15). VIOLABLE, hypothesis 2 GiB
+/// (fallback derivation, same evidence note as the slack const:
+/// kubelet's default imagefs/nodefs eviction thresholds sit at
+/// 10-15% — 2 GiB is comfortably inside the band where kubelet
+/// eviction, not prjquota, is the operative constraint on the
+/// gp3-root pool's smallest nodes; measure and re-derive at the
+/// first node-attributed sample).
+pub const DISK_FULL_NODE_HEADROOM_BYTES: u64 = 2 << 30;
+
+/// One project-quota sample: current usage + the hard limit
+/// (`dqb_bhardlimit`, converted from 1 KiB quota blocks to bytes;
+/// `None` = no limit set on the project).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuotaStatus {
+    /// `dqb_curspace` — current allocated bytes.
+    pub used_bytes: u64,
+    /// `dqb_bhardlimit × 1024`, or `None` when the project has no
+    /// hard limit (0 in the kernel record).
+    pub hard_limit_bytes: Option<u64>,
+}
+
+/// The worker-side disk-exhaustion classification predicate
+/// (live_057-a, the CgroupOom twin's truth table): a failed build is
+/// quota-attributed iff the overlay's project quota is at/over its
+/// hard limit (within [`DISK_FULL_QUOTA_SLACK_BYTES`] — the refused
+/// write never lands) AND the node filesystem is not itself exhausted
+/// (≥ [`DISK_FULL_NODE_HEADROOM_BYTES`] free — otherwise the node,
+/// not the build's sizing, is the cause and the non-quota infra lane
+/// keeps the report).
+pub fn classify_quota_exhaustion(quota: QuotaStatus, node_free_bytes: u64) -> bool {
+    let Some(limit) = quota.hard_limit_bytes else {
+        return false;
+    };
+    limit > 0
+        && quota.used_bytes >= limit.saturating_sub(DISK_FULL_QUOTA_SLACK_BYTES)
+        && node_free_bytes >= DISK_FULL_NODE_HEADROOM_BYTES
+}
+
 /// `_IOR('X', 31, struct fsxattr)` — same value on x86_64 and aarch64
 /// (`sizeof(struct fsxattr) == 28` → `0x801c581f`). The `nix` crate
 /// doesn't bind this ioctl; hard-code rather than pull `ioctl_read!`
@@ -94,9 +155,132 @@ pub fn current_bytes(dir: &Path) -> io::Result<Option<u64>> {
     Ok(Some(dq.dqb_curspace))
 }
 
+/// The limit-read face (live_057-a): one sample of usage AND hard
+/// limit for the project quota at `dir`. Same degradation contract as
+/// [`current_bytes`] — `Ok(None)` when no project quota is assigned
+/// (tmpfs, no `-o prjquota`, kernel <5.14, no quota record).
+pub fn status(dir: &Path) -> io::Result<Option<QuotaStatus>> {
+    let f = File::open(dir)?;
+    let mut x = Fsxattr::default();
+    // SAFETY: as in `current_bytes` — FS_IOC_FSGETXATTR writes exactly
+    // sizeof(Fsxattr) bytes; `x` is repr(C), zeroed, on our stack.
+    if unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_FSGETXATTR, &mut x as *mut _) } < 0 {
+        return Ok(None);
+    }
+    if x.fsx_projid == 0 {
+        return Ok(None);
+    }
+    // SAFETY: dqblk is POD; zeroed is valid. Kernel fills on success.
+    let mut dq: libc::dqblk = unsafe { std::mem::zeroed() };
+    let cmd = qcmd(libc::Q_GETQUOTA, PRJQUOTA);
+    // SAFETY: as in `current_bytes`.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_quotactl_fd,
+            f.as_raw_fd() as libc::c_long,
+            cmd as libc::c_long,
+            x.fsx_projid as libc::c_long,
+            &mut dq as *mut _ as libc::c_long,
+        )
+    };
+    if r < 0 {
+        return Ok(None);
+    }
+    Ok(Some(QuotaStatus {
+        used_bytes: dq.dqb_curspace,
+        // dqb_bhardlimit is in 1 KiB quota blocks; 0 = no limit.
+        hard_limit_bytes: (dq.dqb_bhardlimit > 0).then(|| dq.dqb_bhardlimit.saturating_mul(1024)),
+    }))
+}
+
+/// Free bytes on the filesystem holding `dir` (statvfs;
+/// `f_bavail × f_frsize` — the unprivileged view, matching what a
+/// build's writes can actually use). `None` on any failure.
+pub fn node_free_bytes(dir: &Path) -> Option<u64> {
+    statvfs_of(dir).map(|sv| sv.f_bavail.saturating_mul(sv.f_frsize))
+}
+
+/// USED bytes on the filesystem holding `dir`
+/// (`(f_blocks − f_bfree) × f_frsize`) — the H9″ fuse-cache occupancy
+/// instrument (live_057-d): on a dedicated cache mount this is the
+/// cache's occupancy exactly; on a shared mount it is the
+/// filesystem-level upper bound, which is precisely the eviction-
+/// pressure signal the measured-RULED fuse-addend trigger reads.
+pub fn fs_used_bytes(dir: &Path) -> Option<u64> {
+    statvfs_of(dir).map(|sv| {
+        sv.f_blocks
+            .saturating_sub(sv.f_bfree)
+            .saturating_mul(sv.f_frsize)
+    })
+}
+
+fn statvfs_of(dir: &Path) -> Option<libc::statvfs> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    // SAFETY: statvfs writes exactly one struct statvfs on success;
+    // zeroed is a valid bit-pattern for the out-param.
+    let mut sv: libc::statvfs = unsafe { std::mem::zeroed() };
+    (unsafe { libc::statvfs(c.as_ptr(), &mut sv) } == 0).then_some(sv)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W10-CM (the unit-level matrix cells, live_057-a): the
+    /// classification predicate's truth table, including the two
+    /// negative corners the §1.6.4-15 order-pin's premise rides on.
+    #[test]
+    fn quota_exhaustion_classification_cells() {
+        let gib = 1u64 << 30;
+        let q = |used: u64, limit: u64| QuotaStatus {
+            used_bytes: used,
+            hard_limit_bytes: Some(limit),
+        };
+        // Positive: at the limit, node healthy.
+        assert!(classify_quota_exhaustion(q(25 * gib, 25 * gib), 50 * gib));
+        // Positive: within the slack of the limit (the refused write
+        // never lands — dqb_curspace sits below the hard limit).
+        assert!(classify_quota_exhaustion(
+            q(25 * gib - DISK_FULL_QUOTA_SLACK_BYTES, 25 * gib),
+            50 * gib
+        ));
+        // NEGATIVE (the false-positive corner): one byte below the
+        // slack band — a spurious classification would inflate every
+        // affected pname's disk request by a doubling.
+        assert!(!classify_quota_exhaustion(
+            q(25 * gib - DISK_FULL_QUOTA_SLACK_BYTES - 1, 25 * gib),
+            50 * gib
+        ));
+        // NEGATIVE (the attribution corner): quota at limit but the
+        // NODE fs is itself exhausted — the node's exhaustion is not
+        // the build's sizing signal; the non-quota infra lane keeps
+        // the report.
+        assert!(!classify_quota_exhaustion(
+            q(25 * gib, 25 * gib),
+            DISK_FULL_NODE_HEADROOM_BYTES - 1
+        ));
+        // No hard limit / zero limit → never quota-attributed.
+        assert!(!classify_quota_exhaustion(
+            QuotaStatus {
+                used_bytes: 25 * gib,
+                hard_limit_bytes: None
+            },
+            50 * gib
+        ));
+    }
+
+    /// The statvfs faces degrade to `None`/sane values, never panic
+    /// (the H9″ instrument and the node-headroom read share the
+    /// helper).
+    #[test]
+    fn statvfs_faces_are_total() {
+        assert!(node_free_bytes(std::path::Path::new("/definitely/not/a/path")).is_none());
+        assert!(fs_used_bytes(std::path::Path::new("/definitely/not/a/path")).is_none());
+        // /tmp exists: both faces answer.
+        assert!(node_free_bytes(std::path::Path::new("/tmp")).is_some());
+        assert!(fs_used_bytes(std::path::Path::new("/tmp")).is_some());
+    }
 
     /// tmpfs has no project quotas → `Ok(None)`, not `Err`. Verifies
     /// the ENOTTY-on-ioctl path degrades gracefully (the cgroup poll

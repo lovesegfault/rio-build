@@ -154,6 +154,9 @@ fn fold_error_evidence(e: &ExecutorError, evidence: &mut StoreEvidenceSet) {
         | E::Wire(_)
         | E::Cgroup(_)
         | E::CgroupOom
+        // DiskFull is node-local sizing evidence (the prjquota
+        // classification), not store degradation.
+        | E::DiskFull
         | E::WrongKind { .. }
         | E::Cancelled => {}
     }
@@ -551,6 +554,35 @@ mod tests {
             Some(BuildResultStatus::InfrastructureFailure.into()),
             "CgroupOom is infra (bump resource_floor), not permanent"
         );
+    }
+
+    /// W10-CM (the report cell): `DiskFull` assembles
+    /// InfrastructureFailure with the pinned DISK_FULL_MSG substring
+    /// and carries the peaks — the report the scheduler's floor-bump
+    /// arm matches on (the CgroupOom twin, live_057-a).
+    #[test]
+    fn err_completion_disk_full_is_infra_with_pinned_msg() {
+        let r = err_completion(
+            &ExecutorError::DiskFull,
+            "/nix/store/x.drv".into(),
+            "tok".into(),
+            false,
+            stamp(),
+            1_073_741_824,
+            2.0,
+        );
+        let result = r.result.unwrap();
+        assert_eq!(
+            result.status,
+            i32::from(BuildResultStatus::InfrastructureFailure),
+            "DiskFull is a sizing signal (bump the disk floor), never permanent/poison"
+        );
+        assert!(
+            result.error_msg.contains(rio_proto::DISK_FULL_MSG),
+            "the report must carry the pinned contract substring; got {:?}",
+            result.error_msg
+        );
+        assert_eq!(r.peak_memory_bytes, 1_073_741_824);
     }
 
     /// Pre-cgroup setup errors (here `WrongKind`) genuinely never

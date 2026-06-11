@@ -6,6 +6,7 @@
     "rio_builder_cgroup_leak_total",
     "rio_builder_cgroup_oom_total",
     "rio_builder_cpu_fraction",
+    "rio_builder_fuse_cache_bytes_used",
     "rio_builder_fuse_cache_hits_total",
     "rio_builder_fuse_cache_misses_total",
     "rio_builder_fuse_circuit_open",
@@ -294,6 +295,11 @@
         "name": "rio_builder_cpu_fraction",
         "kind": "gauge",
         "help": "Worker cgroup CPU utilization: delta cpu.stat usage_usec / wall-clock µs. 1.0 = one core fully used; >1.0 on multi-core."
+      },
+      {
+        "name": "rio_builder_fuse_cache_bytes_used",
+        "kind": "gauge",
+        "help": "Bytes used on the filesystem holding the FUSE cache directory (statvfs, refreshed once per build completion). On a dedicated cache mount this is the cache's occupancy exactly; on a shared mount it is the filesystem-level upper bound — either way the eviction-pressure signal the fuseCacheBytes sizing addend's measured-RULED review reads over its soak window (live_057-d)."
       },
       {
         "name": "rio_builder_fuse_cache_hits_total",

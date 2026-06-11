@@ -128,6 +128,7 @@ pub async fn setup(
 
     // Set up FUSE cache and mount. Arc so the executor's manifest-prime
     // / JIT-allowlist path can share it with the FUSE threads.
+    let fuse_cache_dir = cfg.fuse_cache_dir.clone();
     let cache = Arc::new(crate::fuse::cache::Cache::new(cfg.fuse_cache_dir)?);
     let executor_cache = Arc::clone(&cache);
     let runtime = tokio::runtime::Handle::current();
@@ -239,6 +240,7 @@ pub async fn setup(
             rate_lines_per_sec: cfg.log_rate_limit,
             total_bytes: cfg.log_size_limit,
         },
+        fuse_cache_dir,
         daemon_timeout: cfg.daemon_timeout,
         max_silent_time: cfg.max_silent_time.as_secs(),
         cgroup_parent,

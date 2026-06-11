@@ -78,6 +78,9 @@ pub struct ExecutorEnv {
     pub executor_id: String,
     /// Per-build log line/byte limits enforced by the stderr loop.
     pub log_limits: LogLimits,
+    /// FUSE cache directory (the H9″ occupancy instrument samples
+    /// statvfs here once per build completion — live_057-d).
+    pub fuse_cache_dir: std::path::PathBuf,
     /// Timeout for the local nix-daemon subprocess build. Used when the
     /// client didn't specify `BuildOptions.build_timeout`. Intentionally
     /// long (default 2h) — some builds genuinely take that long; the
@@ -227,6 +230,19 @@ pub enum ExecutorError {
     /// `resource_floor` instead of marking it permanently failed.
     #[error("cgroup OOM during build; bumping resource floor")]
     CgroupOom,
+    /// The build failed with its overlay prjquota at/over the hard
+    /// limit while the node fs had headroom (live_057-a — in-build
+    /// ENOSPC; FUSE deliberately surfaces StorageFull as ENOSPC).
+    /// The derivation isn't broken — this builder's DISK is
+    /// undersized: maps to `InfrastructureFailure` so the scheduler
+    /// bumps the drv's disk `resource_floor` (the [`Self::CgroupOom`]
+    /// twin; classification predicate at
+    /// [`crate::quota::classify_quota_exhaustion`], thresholds
+    /// R17-typed beside it). Display pinned to
+    /// `rio_proto::DISK_FULL_MSG` (the cross-crate floor-bump
+    /// contract; `disk_full_display_contains_proto_constant`).
+    #[error("disk full during build (overlay prjquota exhausted); bumping disk floor")]
+    DiskFull,
     /// The derivation's FOD-ness does not match this executor kind.
     #[error(
         "wrong executor kind: derivation is_fod={is_fod} but this executor is {executor_kind:?}"
@@ -857,8 +873,6 @@ pub async fn execute_build(
     // output. If NO attempt ran a daemon, the runtime sends no footer:
     // header with no output and no footer is the documented signal
     // that the build never started.
-    let footer_result = footer_result_str(&build_result);
-
     // ── Post-daemon: peaks now in scope; carry across every Err. ──────
     // r[impl builder.cgroup.memory-peak+2]
     // Sample prjquota BEFORE the build_result/collect_outputs
@@ -866,9 +880,25 @@ pub async fn execute_build(
     // mounted on this path) so an OOM'd build also reports
     // peak_disk_bytes. Previously sampled only at line 11 (teardown),
     // which the `?` at build_result skipped.
-    let peak_disk_bytes = crate::quota::current_bytes(&env.overlay_base_dir)
-        .ok()
-        .flatten();
+    // r[impl builder.disk.quota-classified]
+    // live_057-a: the SAME sample feeds the disk-exhaustion
+    // classification — usage + hard limit (the limit-read face) and
+    // the node statvfs headroom, folded through apply_disk_override
+    // BEFORE the footer renders so the report and the banner agree.
+    let quota_status = crate::quota::status(&env.overlay_base_dir).ok().flatten();
+    let peak_disk_bytes = quota_status.map(|q| q.used_bytes);
+    let node_free = crate::quota::node_free_bytes(&env.overlay_base_dir);
+    let build_result = apply_disk_override(quota_status, node_free, build_result);
+
+    // H9″ (live_057-d instrument): fuse-cache occupancy, statfs-
+    // derived, refreshed once per build completion beside the quota
+    // sample — the measured-RULED fuse-addend trigger's data source
+    // (WO-S7-6 reads the series over its soak window).
+    if let Some(used) = crate::quota::fs_used_bytes(&env.fuse_cache_dir) {
+        metrics::gauge!("rio_builder_fuse_cache_bytes_used").set(used as f64);
+    }
+
+    let footer_result = footer_result_str(&build_result);
     let post_err = |e| ExecuteOutcome {
         result: Err(e),
         peak_memory_bytes,
@@ -1273,6 +1303,58 @@ fn apply_oom_override(
     }
 }
 
+/// Reclassify a FAILED result as `DiskFull` when the post-build quota
+/// sample shows the overlay at/over its prjquota hard limit and the
+/// node fs is not itself exhausted — the [`apply_oom_override`] twin
+/// at the result seam (live_057-a). Precedence and preservation:
+///
+/// - `Ok(Built)` is preserved (a build that succeeded despite
+///   touching its quota is a success; no reclassification).
+/// - `Err(CgroupOom)` is preserved — the OOM watcher's attribution is
+///   the more specific signal and already carries its own floor lane.
+/// - Every other failure shape (the daemon's ordinary failed
+///   `BuildResult` — the live_057 face that previously assembled
+///   PermanentFailure → retry-then-poison — and non-OOM executor
+///   errors) reclassifies to `Err(DiskFull)` iff
+///   [`crate::quota::classify_quota_exhaustion`] holds for the
+///   sampled `(quota, node_free)` pair. No sample / no limit / node
+///   exhausted → the result is kept verbatim (the non-quota lane:
+///   the node's exhaustion is not the build's sizing signal).
+fn apply_disk_override(
+    quota: Option<crate::quota::QuotaStatus>,
+    node_free_bytes: Option<u64>,
+    build_result: Result<rio_nix::protocol::build::BuildResult, ExecutorError>,
+) -> Result<rio_nix::protocol::build::BuildResult, ExecutorError> {
+    let failed = match &build_result {
+        Ok(r) => !r.status.is_success(),
+        // The OOM watcher's attribution wins — its lane already
+        // bumps the memory floor; double-classifying would launder
+        // a memory signal into a disk doubling.
+        Err(ExecutorError::CgroupOom) => false,
+        Err(_) => true,
+    };
+    let quota_attributed = failed
+        && match (quota, node_free_bytes) {
+            (Some(q), Some(free)) => crate::quota::classify_quota_exhaustion(q, free),
+            // No quota sample or no node read → no attribution
+            // (the non-quota lane keeps the report).
+            _ => false,
+        };
+    if quota_attributed {
+        tracing::warn!(
+            used = quota.map(|q| q.used_bytes),
+            hard_limit = quota.and_then(|q| q.hard_limit_bytes),
+            node_free = node_free_bytes,
+            "build failed with overlay prjquota exhausted; classifying \
+             DiskFull (disk sizing signal — the scheduler bumps the \
+             disk floor)"
+        );
+        Err(ExecutorError::DiskFull)
+    } else {
+        build_result
+    }
+}
+
 /// Resolved build inputs: the BasicDerivation (inputDrvs collapsed into
 /// inputSrcs) and the full transitive input closure for the synth DB.
 struct ResolvedInputs {
@@ -1587,6 +1669,95 @@ mod tests {
     /// test is the cross-crate drift guard — rewording the Display
     /// string at line ~179 fails HERE instead of silently disabling
     /// the floor-bump in production.
+    /// W10-CM (live_057-a, the seam matrix): the result seam
+    /// reclassifies a failed build to DiskFull exactly when the
+    /// quota predicate holds. Pre-fix red (the identity seam — NO
+    /// worker-side disk classification existed; grep: zero
+    /// statfs/ENOSPC consumers in the result plane): the quota-at-
+    /// limit failed build stayed PermanentFailure — the build's-own-
+    /// fault lane, retry-then-poison, no floor recovery.
+    // r[verify builder.disk.quota-classified]
+    #[test]
+    fn disk_override_classifies_quota_exhausted_failures() {
+        use rio_nix::protocol::build::{BuildResult, BuildStatus};
+        let gib = 1u64 << 30;
+        let at_limit = Some(crate::quota::QuotaStatus {
+            used_bytes: 25 * gib,
+            hard_limit_bytes: Some(25 * gib),
+        });
+        let failed = || -> Result<BuildResult, ExecutorError> {
+            Ok(BuildResult {
+                status: BuildStatus::PermanentFailure,
+                ..Default::default()
+            })
+        };
+
+        // The positive cell: failed + quota at limit + node healthy
+        // → DiskFull (InfrastructureFailure at err_completion).
+        let got = apply_disk_override(at_limit, Some(50 * gib), failed());
+        assert!(
+            matches!(got, Err(ExecutorError::DiskFull)),
+            "left: the quota-exhausted failure presents as ordinary              PermanentFailure (retry-then-poison, floor untouched) /              right: classified DiskFull; got {got:?}"
+        );
+
+        // Ok(Built) preserved even at the limit.
+        let built = apply_disk_override(
+            at_limit,
+            Some(50 * gib),
+            Ok(BuildResult {
+                status: BuildStatus::Built,
+                ..Default::default()
+            }),
+        );
+        assert!(matches!(built, Ok(ref b) if b.status == BuildStatus::Built));
+
+        // CgroupOom preserved (the more specific signal).
+        let oom = apply_disk_override(at_limit, Some(50 * gib), Err(ExecutorError::CgroupOom));
+        assert!(matches!(oom, Err(ExecutorError::CgroupOom)));
+
+        // The false-positive corner: below the slack band → kept.
+        let below = Some(crate::quota::QuotaStatus {
+            used_bytes: 25 * gib - crate::quota::DISK_FULL_QUOTA_SLACK_BYTES - 1,
+            hard_limit_bytes: Some(25 * gib),
+        });
+        let kept = apply_disk_override(below, Some(50 * gib), failed());
+        assert!(
+            matches!(kept, Ok(ref b) if b.status == BuildStatus::PermanentFailure),
+            "below the slack band the failure keeps its own lane"
+        );
+
+        // The attribution corner: node fs exhausted → NOT
+        // quota-classified (the non-quota lane keeps the report).
+        let node_full = apply_disk_override(
+            at_limit,
+            Some(crate::quota::DISK_FULL_NODE_HEADROOM_BYTES - 1),
+            failed(),
+        );
+        assert!(
+            matches!(node_full, Ok(ref b) if b.status == BuildStatus::PermanentFailure),
+            "the node's exhaustion is not the build's sizing signal"
+        );
+
+        // No sample at all → kept verbatim.
+        let none = apply_disk_override(None, None, failed());
+        assert!(matches!(none, Ok(ref b) if b.status == BuildStatus::PermanentFailure));
+    }
+
+    /// W10-CN: contract pin — rio-scheduler matches
+    /// `error_msg.contains(rio_proto::DISK_FULL_MSG)` to bump the
+    /// disk floor; the Display side is pinned here (the
+    /// `cgroup_oom_display_contains_proto_constant` mirror).
+    #[test]
+    fn disk_full_display_contains_proto_constant() {
+        assert!(
+            ExecutorError::DiskFull
+                .to_string()
+                .contains(rio_proto::DISK_FULL_MSG),
+            "ExecutorError::DiskFull Display must carry rio_proto::DISK_FULL_MSG              (the scheduler's floor-bump match key): {}",
+            ExecutorError::DiskFull
+        );
+    }
+
     #[test]
     fn cgroup_oom_display_contains_proto_constant() {
         assert!(
@@ -1796,6 +1967,7 @@ mod tests {
         ExecutorEnv {
             fuse_mount_point: "/tmp".into(),
             overlay_base_dir: "/tmp".into(),
+            fuse_cache_dir: "/tmp".into(),
             executor_id: "t".into(),
             log_limits: crate::log_stream::LogLimits::UNLIMITED,
             daemon_timeout: rio_common::config::BoundedSecs::from_duration(DEFAULT_DAEMON_TIMEOUT),

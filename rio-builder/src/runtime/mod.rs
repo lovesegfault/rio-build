@@ -96,6 +96,9 @@ pub struct BuildSpawnContext {
     /// task is cheap. Worker-wide (set once at startup from config), not
     /// per-assignment — the limits are a worker policy, not a build option.
     pub log_limits: log_stream::LogLimits,
+    /// FUSE cache directory (from `Config.fuse_cache_dir`) — the H9″
+    /// occupancy instrument's statvfs target (live_057-d).
+    pub fuse_cache_dir: std::path::PathBuf,
     /// nix-daemon subprocess timeout (from `Config.daemon_timeout_secs`).
     /// Ceiling-bounded BY TYPE (bug_117): the bound travels with the
     /// value from parse to the stderr-loop deadline add.
@@ -243,6 +246,7 @@ impl BuildSpawnContext {
             overlay_base_dir: self.overlay_base_dir.clone(),
             executor_id: self.executor_id.clone(),
             log_limits: self.log_limits,
+            fuse_cache_dir: self.fuse_cache_dir.clone(),
             daemon_timeout: self.daemon_timeout,
             max_silent_time: self.max_silent_time,
             cgroup_parent: self.cgroup_parent.clone(),

@@ -133,6 +133,15 @@ pub fn describe_metrics() {
          nonzero = store degraded."
     );
     describe_gauge!(
+        "rio_builder_fuse_cache_bytes_used",
+        "Bytes used on the filesystem holding the FUSE cache directory \
+         (statvfs, refreshed once per build completion). On a dedicated \
+         cache mount this is the cache's occupancy exactly; on a shared \
+         mount it is the filesystem-level upper bound — either way the \
+         eviction-pressure signal the fuseCacheBytes sizing addend's \
+         measured-RULED review reads over its soak window (live_057-d)."
+    );
+    describe_gauge!(
         "rio_builder_jit_inputs_registered",
         "Size of the JIT FUSE allowlist (known_inputs.len()) at daemon spawn. \
          Equals compute_input_closure's output count for this build."

@@ -36,6 +36,18 @@ pub const CONCURRENT_PUTPATH_MSG: &str = "concurrent PutPath in progress";
 /// constant so a rename forces all sites to update in lockstep.
 pub const CGROUP_OOM_MSG: &str = "cgroup OOM during build";
 
+/// Substring carried in `ExecutorError::DiskFull`'s Display impl and
+/// matched by rio-scheduler's `handle_infrastructure_failure` to bump
+/// the derivation's DISK resource floor (live_057-a/-b — the
+/// [`CGROUP_OOM_MSG`] twin for the disk axis: an in-build ENOSPC from
+/// overlay prjquota exhaustion is a SIZING signal, not a build
+/// failure). Single source of truth so the `#[error]` attr and the
+/// `.contains()` consumer can't drift; the
+/// `disk_full_display_contains_proto_constant` test in rio-builder
+/// pins the Display side, and the scheduler fixtures reference this
+/// constant. A CONST, not a wire message — zero `.fields` impact.
+pub const DISK_FULL_MSG: &str = "disk full during build";
+
 /// Round-9 B3 (Banner A-1): the cited consumer default for
 /// `GetSpawnIntentsRequest.limit` — the priority-head window a
 /// supply-side consumer (the controller pool reconcilers) requests

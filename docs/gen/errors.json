@@ -114,6 +114,13 @@
     },
     {
       "enum": "ExecutorError",
+      "name": "DiskFull",
+      "crate": "rio-builder",
+      "msg": "disk full during build (overlay prjquota exhausted); bumping disk floor",
+      "doc": "The build failed with its overlay prjquota at/over the hard limit while the node fs had headroom (live_057-a — in-build ENOSPC; FUSE deliberately surfaces StorageFull as ENOSPC). The derivation isn't broken — this builder's DISK is undersized: maps to `InfrastructureFailure` so the scheduler bumps the drv's disk `resource_floor` (the [`Self::CgroupOom`] twin; classification predicate at [`crate::quota::classify_quota_exhaustion`], thresholds R17-typed beside it). Display pinned to `rio_proto::DISK_FULL_MSG` (the cross-crate floor-bump contract; `disk_full_display_contains_proto_constant`)."
+    },
+    {
+      "enum": "ExecutorError",
       "name": "Grpc",
       "crate": "rio-builder",
       "msg": "gRPC error: {0}",
