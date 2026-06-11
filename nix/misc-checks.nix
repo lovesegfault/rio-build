@@ -320,6 +320,11 @@ in
         # nix/tests/helm/*.sh as build inputs — docs/ is unreachable —
         # so stage the runbook it cross-references.
         cp ${../docs/ops/sla-model.typ} $TMPDIR/chart/.runbook-sla-model.typ
+        # 42-reason-alert-sync.sh derives the closed reason set from
+        # INTENT_DROP_REASONS — stage the const's source file so the
+        # check quantifies over the real surface, never a hand copy
+        # (the (vvvvv) staging discipline; the runbook precedent).
+        cp ${../rio-controller/src/observability.rs} $TMPDIR/chart/.observability-source.rs
 
         for f in ${fragments}/*.sh; do
           echo "▸ helm-lint: $(basename "$f" .sh)" >&2

@@ -37,6 +37,10 @@ override or reset.
   [SpawnIntents dropped — every hosting cell is #gls("ice")-masked],
   [#link(<rionodeclaimpool-icemaskedhigh>)[Admissible set shrinking]],
 
+  [#(refs.alert)("RioNodeclaimPoolReadyAllCellsIceMasked")],
+  [READY SpawnIntents (builds waiting) dropped — every hosting cell #gls("ice")-masked],
+  [#link(<rionodeclaimpool-icemaskedhigh>)[Admissible set shrinking]],
+
   [#(refs.alert)("RioNodeclaimPoolStuckPending")],
   [NodeClaim in-flight >2× cell `ice_timeout` (floor 90s, cap 3×maxLeadTime)],
   [#link(<rionodeclaimpool-stuckpending>)[Provisioning stuck]],
@@ -54,7 +58,7 @@ override or reset.
   [#link(<rionodeclaimpool-stuckterminating>)[Stuck terminating]],
 )
 
-The first three are model-accuracy alerts; the last six are provisioning
+The first three are model-accuracy alerts; the last seven are provisioning
 alerts that share the same `rio-cli sla` diagnostic surface.
 
 = Step 1: Identify the offending pname <step-1>

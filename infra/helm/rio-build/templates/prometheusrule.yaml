@@ -215,6 +215,43 @@ spec:
               ec2:DescribeSpotPriceHistory IRSA; see
               rio_scheduler_sla_hw_cost_fallback_total{reason}.
 
+        # E4 (the wedged-runtime / tcpSocket-blindness alert): the
+        # scheduler's liveness is a blind tcp handshake BY DESIGN
+        # (sys.guard.kill-wired-isolated — liveness on is_leader would
+        # kill the standby), so a wedged runtime keeps "passing"
+        # liveness: the kernel completes handshakes while every worker
+        # is starved. Suffices-or-extend derivation, recorded:
+        # RioSlaHwCostStale does NOT suffice — min() over the
+        # per-replica gauge evaluates to NO DATA when no replica
+        # serves /metrics at all (a wedge serves nothing), and every
+        # other scheduler alert keys on SERVED series the same way.
+        # The only signal that survives a full wedge is the scrape
+        # verdict itself: target present, scrape failing.
+        #
+        # Deliberately `== 0` on present targets, NOT absent(): after
+        # a cluster wipe the targets re-register LATE (live_055(d)'s
+        # metric-blind window — no series at all), and absent() would
+        # page on every wipe recovery. A wiped target is an operator
+        # action; the wedge signature is target-present-scrape-dead.
+        # `for: 5m` prices the (d) re-registration/boot tail (scrape
+        # interval 30s; first scrapes during pod boot may fail) with
+        # headroom; a real wedge persists far past it.
+        - alert: RioSchedulerScrapeDown
+          expr: max(up{job="rio-scheduler-metrics"}) == 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: scheduler /metrics unscrapeable while pods accept tcp
+            description: >-
+              Every rio-scheduler metrics target is failing its scrape while
+              the pod passes its (blind, tcp-level) liveness probe. This is
+              the wedged-runtime trace: kubelet sees an accepting socket, the
+              exporter shares the wedged runtime, every served-series alert
+              has gone silent for lack of data. Check the pod's skew/stack
+              diagnostics and `kubectl describe pod` — restarts are NOT
+              expected (a wedge does not crash); a manual restart recovers.
+
         # ADR-023 §13b: ≥3 distinct cells reaping for `reason=ice`
         # (Launched=False — InsufficientCapacity / quota / unfulfillable
         # instance-type). One cell ICE is routine spot churn; ≥3
@@ -434,6 +471,45 @@ spec:
               deploy/rio-scheduler -n rio-system` clears the in-memory ICE
               backoff immediately (otherwise it self-heals on TTL expiry,
               up to `sla.maxLeadTime`).
+              See docs/ops/sla-model.typ#rionodeclaimpool-icemaskedhigh.
+
+        # merged_bug_058: the wave-8 reason split routed the starved-
+        # READY population (solved demand, named hosting classes,
+        # eta=0 — the live_050(a) hang's measured class) exclusively
+        # to reason="ready_all_cells_ice_masked", whose HELP declares
+        # it "alert-worthy at low thresholds" — but the only alert
+        # exact-matched the disjoint cold-start sibling, so a
+        # live_050(a) recurrence paged NOTHING while the less-severe
+        # population paged. This row joins the reason to the alert
+        # tier; the 42-reason-alert-sync.sh leg pins the join in both
+        # directions (every alert-worthy reason ↔ some alert expr).
+        #
+        # `for: 15m`, same as the cold-start sibling — the noise floor
+        # is identical (ICE backoff TTLs 60s × 2^step self-heal
+        # transient capacity dips within ~10min; a shorter `for:`
+        # would false-fire on every multi-cell spot blip). The
+        # difference is IMPACT, not signal quality: these intents have
+        # builds actively waiting, which the description carries.
+        - alert: RioNodeclaimPoolReadyAllCellsIceMasked
+          expr: |
+            increase(rio_controller_nodeclaim_intent_dropped_total{reason="ready_all_cells_ice_masked"}[15m]) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: READY NodeClaim intents starved — every hosting cell ICE-masked
+            description: >-
+              {{`{{ $value | humanize }}`}} READY SpawnIntents (solved demand,
+              named hosting classes, eta=0) dropped over 15m because every
+              hosting cell is ICE-masked — builds are WAITING on this
+              population (the live_050(a) hang class). Same cloud-side causes
+              and heal path as RioNodeclaimPoolAllCellsIceMasked: check
+              `kubectl logs -n kube-system deploy/karpenter` for CreateFleet
+              errors and
+              `rio_controller_nodeclaim_reaped_total{reason=~"ice|vanished"}`;
+              after the cloud-side fix, `kubectl rollout restart
+              deploy/rio-scheduler -n rio-system` clears the in-memory ICE
+              backoff immediately.
               See docs/ops/sla-model.typ#rionodeclaimpool-icemaskedhigh.
 
         # qa-fix-b r37: a NodeClaim whose Karpenter finalizer never
