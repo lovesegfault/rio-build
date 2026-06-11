@@ -60,6 +60,7 @@ let
   substitute = import ./scenarios/substitute.nix;
   log-service = import ./scenarios/log-service.nix;
   substitute-scale = import ./scenarios/substitute-scale.nix;
+  wipe-burst = import ./scenarios/wipe-burst.nix;
   materialize = import ./scenarios/materialize.nix;
   materialize-failover = import ./scenarios/materialize-failover.nix;
   sla-sizing = import ./scenarios/sla-sizing.nix;
@@ -1276,6 +1277,43 @@ in
   #   cache_opportunity job rows, while the walk-spawn counter stays at
   #   0 (criterion 3). The eager-vs-lazy property.
   vm-substitute-scale-k3s = substituteScaleTest;
+
+  # ── wipe-burst (live_055(c)) ─────────────────────────────────────────
+  #   The dead-claim wedge corpus: wipe (a planted dead zero-progress
+  #   claim — the post-wipe stranded-claim shape) + min-floor (store at
+  #   the 1-replica chart floor) + deep-chain-burst (a depth-24 RUNTIME-
+  #   reference chain, links seeded upstream, every walk's closure
+  #   passing through the wedged head). Asserts reclaim latency ≤ the
+  #   chart-set stall window (completion budget 240s strictly under the
+  #   300s heartbeat reap — the pre-live_055(a) tree fails the budget
+  #   structurally), head-path-cannot-wedge>window (the burst drains),
+  #   and the live_055(b) subscription plane engaging (parks counted
+  #   during the pre-eligibility window). Structural counts only —
+  #   counter entries + durable rows, never gauge samples (N13).
+  #
+  # r[verify store.substitute.stale-reclaim+3]
+  #   head reclaimed: the zero-progress takeover arm under chart-
+  #   rendered config (substituteStallSecs=60, the validate() floor) —
+  #   stall_count=1 exactly, stale_reclaimed{stall_reclaim}=1 exactly,
+  #   completion inside the under-reap budget.
+  # r[verify store.substitute.raced-subscribe]
+  #   burst parks: raced_parks_total ≥ 1 before the wedge's takeover
+  #   eligibility opens — the walks subscribed instead of poll-racing;
+  #   the eligibility cushion makes a takeover-laundered park
+  #   unrepresentable in the observation window.
+  vm-wipe-burst-k3s = wipe-burst {
+    inherit pkgs common;
+    fixture = k3sFull {
+      jwtEnabled = true;
+      extraValuesTyped = {
+        # The validate() floor (2 × the 30s placeholder heartbeat):
+        # the smallest lawful window — keeps eligibility (cushion 30s
+        # + window 60s) and the 240s completion budget inside one
+        # scenario without touching the 300s reap separation.
+        "store.substituteStallSecs" = 60;
+      };
+    };
+  };
 
   # ── materialization under leader failover (T-3.3) ───────────────────
   # What the standalone scenarios cannot prove: materialization jobs are
