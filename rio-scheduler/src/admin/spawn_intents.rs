@@ -45,11 +45,29 @@ pub(super) async fn get_spawn_intents(
     })
     .await?;
 
+    // Round-9 B3 (Banner A-1): the priority-head window. `intents` is
+    // priority-sorted descending (the response contract), so cutting
+    // at `limit` keeps the head — the critical path is served first
+    // and a bounded consumer drops only the lowest-priority tail.
+    // `limit == 0` (the proto3 default and every pre-window client) =
+    // unbounded, the pre-window behavior. The aggregates
+    // (`queued_by_system`, `ice_masked_cells`) stay FULL-population:
+    // the demand record is the demand truth (A-2) — a consumer sizing
+    // supply work derives its deficit from the aggregate whenever
+    // `truncated` is set, never from `len(intents)` (the cover-deficit
+    // trap; the controller-side filter is the registered round-9 S4
+    // constituent).
+    let mut intents = snap.intents;
+    let limit = req.limit as usize;
+    let truncated = limit != 0 && intents.len() > limit;
+    if truncated {
+        intents.truncate(limit);
+    }
     let resp = GetSpawnIntentsResponse {
-        intents: snap.intents,
+        intents,
         queued_by_system: snap.queued_by_system,
         ice_masked_cells: snap.ice_masked_cells,
-        truncated: false,
+        truncated,
     };
     // Wire-size measurement (round-9 dossier E2 — the B-2 gate for
     // the GetSpawnIntents pagination constants): the response is the
