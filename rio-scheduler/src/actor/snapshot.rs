@@ -998,6 +998,12 @@ impl DagActor {
                 ),
                 None,
                 None,
+                // live_051(c): a verdict poison has no pod and no
+                // attempt — the drv looped Ready, the controller
+                // structurally refused to host it; any name-resolved
+                // log would be a PRIOR attempt's (the spawn-gate
+                // NoExecution lane, bug_080's second caller).
+                rio_proto::VerdictBacking::NoExecution,
             )
             .await;
         }
