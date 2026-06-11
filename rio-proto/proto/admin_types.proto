@@ -150,9 +150,10 @@ message BuildInfo {
 // at the establishment sweep once per attempt via the establishment
 // transaction's won flag (live_058-b); every other witnessed letter
 // is classify-only. Worker-side promotion consumes this vocabulary as
-// before (OomKilled <- CgroupOom, DeadlineExceeded <- TimedOut; the
-// disk arm is parked -- its designed producer is a worker-side
-// quota-attributed signal, not this fill).
+// before (OomKilled <- CgroupOom, DeadlineExceeded <- TimedOut,
+// EvictedDiskPressure <- DiskFull: the worker-side prjquota-attributed
+// classification, live_057 -- the disk arm's sole producer; never
+// this fill).
 enum TerminationReason {
   // Wire-default: controller couldn't classify (no terminated state,
   // status not yet populated). Scheduler treats as no-op.
@@ -165,8 +166,9 @@ enum TerminationReason {
   // shapes ("ephemeral local storage", "EmptyDir volume") -- the
   // controller folds BOTH classes into this one letter. Classify-only:
   // the fold means the letter carries no per-pod sizing authority, so
-  // it NEVER bumps a floor (the disk floor's designed producer is a
-  // worker-side quota-attributed lane, not this classification).
+  // it NEVER bumps a floor (the disk floor's sole producer is the
+  // worker-side quota-attributed DiskFull lane, live_057 -- never
+  // this classification).
   TERMINATION_REASON_EVICTED_DISK_PRESSURE = 2;
   // status.reason == "Evicted", other cause (MemoryPressure, PID
   // pressure, node-shutdown). NOT a per-drv sizing signal. → no-op.

@@ -1964,8 +1964,9 @@ pub(super) fn pod_termination_reason(pod: &Pod) -> TerminationReason {
         // controller-witnessed letter that promotes a floor is
         // OomKilled (per-container containerStatuses attribution,
         // promoted at the establishment sweep once per attempt —
-        // live_058-b; the floor's disk arm stays parked, its designed
-        // producer is a worker-side quota-attributed signal).
+        // live_058-b; the floor's disk arm is live with its sole
+        // producer, the worker-side prjquota-attributed DiskFull
+        // lane -- live_057, never this fill).
         if msg.contains("DiskPressure")
             || msg.contains("ephemeral-storage")
             || msg.contains("ephemeral local storage")
