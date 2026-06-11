@@ -759,10 +759,13 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // `{succeeded:0,ready:0}` window before Job-controller sync looks
     // pending; reap deletes it racing the job-tracking finalizer —
     // ci-failure-patterns "job-tracking finalizer orphan").
-    let gate_armed = match (&ctx.placeable, pool.spec.kind) {
-        (Some(g), ExecutorKind::Builder) => apply_placeable_gate(&mut page, g),
-        (Some(_), _) => true,
-        (None, _) => false,
+    let (gate_armed, placed_tick) = match (&ctx.placeable, pool.spec.kind) {
+        (Some(g), ExecutorKind::Builder) => match apply_placeable_gate(&mut page, g) {
+            Some(tick) => (true, Some(tick)),
+            None => (false, None),
+        },
+        (Some(_), _) => (true, None),
+        (None, _) => (false, None),
     };
     let queued = page.len_page().min(u32::MAX as usize) as u32;
 
@@ -895,8 +898,21 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // never fired on a ceiling'd pool. (Page-lane walk: the gate's
     // totality quantifier is per-HELD-element by design — see the
     // W10-AH census row.)
+    // Round-10 merged_bug_012: the SPAWN lane is placed-on-registered
+    // only — a window-DEFERRED intent is demand-visible on the page
+    // (want-map/queued/re-ack above) but not a spawn candidate this
+    // tick (it re-presents when admitted; spawning it would defeat the
+    // window's pacing). `placed_tick == None` ⇔ no Builder gate fold
+    // ran (fetcher pools / CRD-absent), where every page intent is
+    // spawnable as before.
     let wanted: Vec<SpawnIntent> = page
         .iter_page()
+        .filter(|i| {
+            placed_tick.as_ref().is_none_or(|t| {
+                t.disposition(&i.intent_id)
+                    == crate::reconcilers::nodeclaim_pool::FfdDisposition::PlacedRegistered
+            })
+        })
         .filter(|i| {
             !existing_names.contains(&pod::job_name(
                 &name,
@@ -1534,15 +1550,41 @@ pub(crate) fn reap_queued_known(
 pub(crate) fn apply_placeable_gate(
     page: &mut IntentPage,
     gate: &crate::reconcilers::nodeclaim_pool::PlaceableGate,
-) -> bool {
+) -> Option<std::sync::Arc<crate::reconcilers::nodeclaim_pool::PlacedTick>> {
+    use crate::reconcilers::nodeclaim_pool::FfdDisposition;
     match gate.snapshot() {
-        Some(placeable) => {
-            page.retain_page(|i| placeable.contains(&i.intent_id));
-            true
+        Some(tick) => {
+            // The DEMAND fold (R25: every letter named — no if-let
+            // between the producer's alphabet and this law):
+            page.retain_page(|i| match tick.disposition(&i.intent_id) {
+                // Spawnable AND demand-visible.
+                FfdDisposition::PlacedRegistered => true,
+                // Round-10 merged_bug_012: window-deferred intents
+                // stay DEMAND-VISIBLE (want-map membership, queued
+                // count, re-ack) — the spawn pass filters them via
+                // `PlacedTick::disposition` (not spawnable this
+                // tick); pre-fix they were stripped here and their
+                // still-wanted Pending Jobs orphan-reaped at 10s.
+                FfdDisposition::Deferred => true,
+                // Placed on an in-flight claim: NOT spawnable (the
+                // pod would sit Pending until the claim registers)
+                // and NOT demand-visible — the pre-round-10 posture,
+                // kept deliberately: an in-flight placement normally
+                // has no Job (spawn is gated until Registered), so
+                // demand-visibility buys nothing, and widening it is
+                // not this row's close (named here so the fold's
+                // alphabet is total, not an accidental strip).
+                FfdDisposition::PlacedInFlight => false,
+                // Unplaceable this tick: stripped (cover_deficit owns
+                // provisioning; the node-loss reap/respawn cycle is
+                // the designed recovery).
+                FfdDisposition::Unplaced => false,
+            });
+            Some(tick)
         }
         None => {
             page.clear_page();
-            false
+            None
         }
     }
 }
@@ -3604,7 +3646,7 @@ mod tests {
         // Armed → filter to set, armed=true.
         let gate = PlaceableGate::from_ids(["a", "c", "z"]);
         let mut page = mk(&["a", "b", "c"]);
-        assert!(apply_placeable_gate(&mut page, &gate));
+        assert!(apply_placeable_gate(&mut page, &gate).is_some());
         let ids: Vec<&str> = page.iter_page().map(|i| i.intent_id.as_str()).collect();
         assert_eq!(ids, vec!["a", "c"]);
 
@@ -3612,8 +3654,8 @@ mod tests {
         let gate = PlaceableGate::unarmed();
         let mut page = mk(&["a", "b"]);
         assert!(
-            !apply_placeable_gate(&mut page, &gate),
-            "unarmed → false (fail-closed reap)"
+            apply_placeable_gate(&mut page, &gate).is_none(),
+            "unarmed → None (fail-closed reap)"
         );
         assert_eq!(page.len_page(), 0);
     }
@@ -3640,7 +3682,7 @@ mod tests {
             "i0000", "i0042", "i0137", "i0511", "i0512", "i0777", "i0999", "i1000", "i1225",
         ];
         let gate = PlaceableGate::from_ids(placed);
-        assert!(apply_placeable_gate(&mut page, &gate));
+        assert!(apply_placeable_gate(&mut page, &gate).is_some());
         assert_eq!(
             page.len_page(),
             placed.len(),
@@ -3665,26 +3707,24 @@ mod tests {
         let (tx, gate) = placeable_channel();
         // Unarmed until first publish.
         let mut page = IntentPage::for_test(vec![intent("x")]);
-        assert!(!apply_placeable_gate(&mut page, &gate));
+        assert!(apply_placeable_gate(&mut page, &gate).is_none());
 
         let placeable: Vec<Placement> = vec![
             (intent("on-reg"), "n1".into(), false),
             (intent("on-inflight"), "n2".into(), true),
             (intent("on-reg-2"), "n3".into(), false),
         ];
-        let on_registered: HashSet<String> = placeable
-            .iter()
-            .filter(|(_, _, in_flight)| !in_flight)
-            .map(|(i, _, _)| i.intent_id.clone())
-            .collect();
-        tx.send_replace(Some(std::sync::Arc::new(on_registered)));
+        // The production publisher shape: the FULL disposition tick
+        // (in-flight ids land in their own set, not on_registered).
+        let tick = crate::reconcilers::nodeclaim_pool::PlacedTick::from_sim(&placeable, &[]);
+        tx.send_replace(Some(std::sync::Arc::new(tick)));
 
         let mut page = IntentPage::for_test(vec![
             intent("on-reg"),
             intent("on-inflight"),
             intent("on-reg-2"),
         ]);
-        assert!(apply_placeable_gate(&mut page, &gate));
+        assert!(apply_placeable_gate(&mut page, &gate).is_some());
         let ids: Vec<&str> = page.iter_page().map(|i| i.intent_id.as_str()).collect();
         assert_eq!(
             ids,

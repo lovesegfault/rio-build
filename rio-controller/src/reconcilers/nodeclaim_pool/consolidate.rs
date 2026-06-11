@@ -19,6 +19,7 @@ use tracing::{debug, warn};
 use super::NodeClaimPoolConfig;
 use super::ffd::{LiveNode, Placement, cells_of, system_to_arch};
 use super::sketch::{Cell, CellSketches};
+use rio_proto::types::SpawnIntent;
 
 /// Hold-open annotation key. Operator-settable: a NodeClaim carrying
 /// `rio.build/hold-open=true` uses `hold_open_threshold` as its idle
@@ -129,15 +130,20 @@ pub fn consolidate_after(
 }
 
 /// `𝔼[c_arrival | c_arrival ≤ node_cores]` over this tick's
-/// placeable intents — the **conditional** mean cores of intents that
-/// would fit on a `node_cores` node. NOT `𝔼[c·𝟙{c≤cores}]` — λ is
-/// already the fitting-restricted hazard, so dividing by `|fitting|`
-/// is correct (r42 bug_025). Spec: 0 when placeable is ⊥ or empty
-/// (caller passes `&[]` in consolidate-only mode).
-pub fn e_fitting_cores(placeable: &[Placement], node_cores: u32) -> f64 {
+/// placeable AND window-deferred intents — the **conditional** mean
+/// cores of intents that would fit on a `node_cores` node. NOT
+/// `𝔼[c·𝟙{c≤cores}]` — λ is already the fitting-restricted hazard, so
+/// dividing by `|fitting|` is correct (r42 bug_025). Round-10
+/// merged_bug_012: deferred intents JOIN the demand population — they
+/// are real arrivals the window paced, and excluding them read
+/// remaindered cells as zero-demand (idle nodes reaped at the floor
+/// then re-minted). Spec: 0 when both slices are ⊥ or empty (caller
+/// passes `(&[], &[])` in consolidate-only mode).
+pub fn e_fitting_cores(placeable: &[Placement], deferred: &[SpawnIntent], node_cores: u32) -> f64 {
     let fitting: Vec<u32> = placeable
         .iter()
         .map(|(i, _, _)| i.cores)
+        .chain(deferred.iter().map(|i| i.cores))
         .filter(|&c| c <= node_cores)
         .collect();
     if fitting.is_empty() {
@@ -211,6 +217,30 @@ pub fn placeable_for_cell(
         .collect()
 }
 
+/// [`placeable_for_cell`]'s sibling over the window-DEFERRED intents
+/// (round-10 merged_bug_012): the SAME (intent, cell) admission
+/// predicate — `cells_of(i)` membership plus the agnostic-fallback
+/// gate — so the consolidator's view of deferred demand routes
+/// exactly like the placer's would have.
+pub fn deferred_for_cell(
+    deferred: &[SpawnIntent],
+    cell: &Cell,
+    hw_admits: impl Fn(&str, Option<&str>, &[String]) -> bool,
+) -> Vec<SpawnIntent> {
+    deferred
+        .iter()
+        .filter(|i| {
+            cells_of(i).iter().any(|c| c == cell)
+                || (i.hw_class_names.is_empty() && {
+                    let a = system_to_arch(&i.system);
+                    let f = i.required_features.as_slice();
+                    (a.is_some() || !f.is_empty()) && hw_admits(&cell.0, a, f)
+                })
+        })
+        .cloned()
+        .collect()
+}
+
 /// Append `e` to `cell`'s ring-buffered `idle_gap_events`.
 fn push_idle_gap(sketches: &mut CellSketches, cell: &Cell, e: IdleGapEvent) {
     let evs = &mut sketches.cell_mut(cell).idle_gap_events;
@@ -237,6 +267,13 @@ struct CellCtx {
     /// `placeable_for_cell(placeable, cell, hw_admits)` — the per-cell
     /// partition `e_fitting_cores` averages over.
     cell_placeable: Vec<Placement>,
+    /// Round-10 merged_bug_012: the per-cell partition of this tick's
+    /// WINDOW-DEFERRED intents (same admission predicate as
+    /// `placeable_for_cell`). Deferred demand is still demand — the
+    /// NA keep-condition must see it, or the idle node serving a
+    /// deferred backlog is reaped at the floor and re-minted next
+    /// window rotation (reap-then-re-mint churn).
+    cell_deferred: Vec<SpawnIntent>,
     /// `q_0.5(boot[cell])`, or `cfg.seed_for(cell)` for a cold cell.
     boot_median: f64,
     /// Per-class operator floor (`minConsolidationTime`).
@@ -247,6 +284,7 @@ impl CellCtx {
     fn new(
         cell: &Cell,
         placeable: &[Placement],
+        deferred: &[SpawnIntent],
         sketches: &CellSketches,
         cfg: &NodeClaimPoolConfig,
         hw_admits: &impl Fn(&str, Option<&str>, &[String]) -> bool,
@@ -257,6 +295,7 @@ impl CellCtx {
                 .map(|s| s.idle_gap_events.clone())
                 .unwrap_or_default(),
             cell_placeable: placeable_for_cell(placeable, cell, hw_admits),
+            cell_deferred: deferred_for_cell(deferred, cell, hw_admits),
             boot_median: sketches
                 .get(cell)
                 .and_then(|s| s.boot_median())
@@ -276,7 +315,7 @@ impl CellCtx {
     fn na_threshold(&self, node_cores: u32, max: Option<f64>) -> f64 {
         consolidate_after(
             &self.events,
-            e_fitting_cores(&self.cell_placeable, node_cores),
+            e_fitting_cores(&self.cell_placeable, &self.cell_deferred, node_cores),
             node_cores,
             self.boot_median,
             max,
@@ -293,6 +332,10 @@ impl CellCtx {
 pub struct ReapInputs<'a, F: Fn(&str, Option<&str>, &[String]) -> bool> {
     /// FFD placements for this tick (`reserved` + per-cell partition).
     pub placeable: &'a [Placement],
+    /// This tick's window-deferred intents (round-10 merged_bug_012):
+    /// demand the NA keep-condition counts; never `reserved` (a
+    /// deferred intent has no node).
+    pub deferred: &'a [SpawnIntent],
     /// The gauge-reset and per-cell precompute key set. r37 bug_006:
     /// every cell needs a write. r42 bug_023: callers pass the
     /// `gauge_universe` set (configured ∪ live ∪ trailing) so a cell
@@ -334,6 +377,7 @@ pub async fn reap_idle<F: Fn(&str, Option<&str>, &[String]) -> bool>(
 ) -> anyhow::Result<Vec<String>> {
     let ReapInputs {
         placeable,
+        deferred,
         all_cells,
         prev_idle,
         cfg,
@@ -358,7 +402,7 @@ pub async fn reap_idle<F: Fn(&str, Option<&str>, &[String]) -> bool>(
         .set(0.0);
         cell_ctx.insert(
             cell.clone(),
-            CellCtx::new(cell, placeable, sketches, cfg, hw_admits),
+            CellCtx::new(cell, placeable, deferred, sketches, cfg, hw_admits),
         );
     }
 
@@ -392,7 +436,7 @@ pub async fn reap_idle<F: Fn(&str, Option<&str>, &[String]) -> bool>(
         if !cell_ctx.contains_key(cell) {
             cell_ctx.insert(
                 cell.clone(),
-                CellCtx::new(cell, placeable, sketches, cfg, hw_admits),
+                CellCtx::new(cell, placeable, deferred, sketches, cfg, hw_admits),
             );
         }
         let ctx = &cell_ctx[cell];
@@ -652,11 +696,48 @@ mod tests {
             )
         };
         // node=8: intents 4,6,12 → fitting={4,6}, mean=5.
-        assert_eq!(e_fitting_cores(&[p(4), p(6), p(12)], 8), 5.0);
+        assert_eq!(e_fitting_cores(&[p(4), p(6), p(12)], &[], 8), 5.0);
         // None fit → 0.
-        assert_eq!(e_fitting_cores(&[p(12), p(16)], 8), 0.0);
+        assert_eq!(e_fitting_cores(&[p(12), p(16)], &[], 8), 0.0);
         // Empty → 0 (spec: ⊥/empty → 0).
-        assert_eq!(e_fitting_cores(&[], 8), 0.0);
+        assert_eq!(e_fitting_cores(&[], &[], 8), 0.0);
+    }
+
+    // r[verify ctrl.pool.demand-completeness]
+    /// **W10-AI, the consolidate half (round-10 merged_bug_012).**
+    /// Window-DEFERRED intents are DEMAND for the NA keep-condition —
+    /// a cell whose entire backlog was windowed out no longer reads
+    /// `E[c_fit] = 0` (the floor-threshold reap-then-re-mint churn:
+    /// idle node reaped at `boot_median/2`, next rotation admits the
+    /// deferred work, a fresh claim boots ~50s).
+    ///
+    /// Pre-fix red (deferred axis severed — the two-arg mean):
+    ///   left: 0.0  right: 6.0
+    #[test]
+    fn w10_ai_deferred_demand_counts_for_keep_condition() {
+        let d = |c: u32| SpawnIntent {
+            cores: c,
+            ..Default::default()
+        };
+        // All demand deferred this tick (placeable empty): the mean
+        // must still see it.
+        assert_eq!(
+            e_fitting_cores(&[], &[d(4), d(8), d(12)], 8), // 12 doesn't fit
+            6.0,
+            "deferred intents join the fitting population (pre-fix:              0.0 — remaindered cells read zero demand)"
+        );
+        // Mixed: placeable {4} + deferred {8} on a 8c node → mean 6.
+        let p = |c: u32| {
+            (
+                SpawnIntent {
+                    cores: c,
+                    ..Default::default()
+                },
+                "n".to_string(),
+                false,
+            )
+        };
+        assert_eq!(e_fitting_cores(&[p(4)], &[d(8)], 8), 6.0);
     }
 
     /// r35 bug_023 (§Simulator-shares-accounting): `e_fitting_cores`
@@ -709,7 +790,7 @@ mod tests {
         let builder_cell = Cell("hi-ebs-x86".into(), CapacityType::Spot);
         let admits = |_: &str, _: Option<&str>, _: &[String]| true;
         let cell_placeable = placeable_for_cell(&placeable, &builder_cell, admits);
-        let e = e_fitting_cores(&cell_placeable, 32);
+        let e = e_fitting_cores(&cell_placeable, &[], 32);
         assert!(
             (e - 32.0).abs() < 1e-9,
             "per-cell E[c_fit] for hi-ebs-x86 should be 32, got {e} (global mean would be ≈6.17)"
@@ -717,7 +798,7 @@ mod tests {
         // The fetcher cell sees only the 10 fetcher intents.
         let fetcher_cell = Cell("fetcher-x86".into(), CapacityType::Spot);
         let cell_placeable = placeable_for_cell(&placeable, &fetcher_cell, admits);
-        let e = e_fitting_cores(&cell_placeable, 4);
+        let e = e_fitting_cores(&cell_placeable, &[], 4);
         assert!((e - 1.0).abs() < 1e-9, "fetcher cell E[c_fit]=1, got {e}");
         // hw-agnostic intents (`hw_class_names=[]`) only count on cells
         // `hw_admits` accepts — NOT a pass-through for every cell.
@@ -735,13 +816,13 @@ mod tests {
         let admits_builder_only = |h: &str, _: Option<&str>, _: &[String]| h.starts_with("hi-");
         let cp = placeable_for_cell(&mixed, &fetcher_cell, admits_builder_only);
         assert_eq!(
-            e_fitting_cores(&cp, 4),
+            e_fitting_cores(&cp, &[], 4),
             1.0,
             "hw-agnostic intent excluded from fetcher cell when hw_admits rejects"
         );
         let cp = placeable_for_cell(&mixed, &builder_cell, admits_builder_only);
         assert_eq!(
-            e_fitting_cores(&cp, 32),
+            e_fitting_cores(&cp, &[], 32),
             16.0,
             "hw-agnostic intent admitted on builder cell"
         );
@@ -854,7 +935,7 @@ mod tests {
         assert!((idle - 30.0).abs() < 1e-9);
         let threshold = consolidate_after(
             &[],
-            e_fitting_cores(&[], 8),
+            e_fitting_cores(&[], &[], 8),
             8,
             sk.get(&cell).unwrap().boot_median().unwrap(),
             cfg.max_consolidation_time,
@@ -1089,6 +1170,7 @@ mod tests {
         let ctx = CellCtx {
             events: vec![],
             cell_placeable: vec![],
+            cell_deferred: vec![],
             boot_median: 30.0,
             min: Some(600.0),
         };
@@ -1279,7 +1361,7 @@ mod tests {
             ..Default::default()
         };
         let admits = |_: &str, _: Option<&str>, _: &[String]| true;
-        let ctx = CellCtx::new(&cell, &placeable, &sk, &cfg, &admits);
+        let ctx = CellCtx::new(&cell, &placeable, &[], &sk, &cfg, &admits);
         let na = ctx.na_threshold(8, None);
         // Pre-fix hold-open arm: `2.0 * consolidate_after(&[], 0.0, ...)`
         // — always `2×floor` (`λ=0` with no events). With dense arrivals

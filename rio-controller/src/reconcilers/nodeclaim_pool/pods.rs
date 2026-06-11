@@ -59,6 +59,14 @@ pub(super) struct PodSnapshot {
     /// Rules (b)/(c): `intent_id → node_name` for bound, non-terminating
     /// pods.
     bound: HashMap<String, String>,
+    /// Rule (d), round-10 merged_bug_012: intent ids carried by ANY
+    /// non-terminal pod — bound OR still Pending (no `spec.nodeName`).
+    /// The FFD admission window exempts these (their Job already
+    /// exists; deferring one mis-reads existing demand as remainder
+    /// and hands its still-wanted Pending Job to the orphan reap).
+    /// Terminating pods still count: their Job exists until the
+    /// foreground delete completes.
+    job_held: std::collections::HashSet<String>,
     /// The winning pod's `rio.build/deadline-secs` annotation (the
     /// rendered `ephemeral_deadline` the pod was dispatched under),
     /// keyed like [`Self::bound`] and derived from the SAME rule-(c)
@@ -76,6 +84,7 @@ impl PodSnapshot {
         // Rule (c) working state: intent_id → (creation epoch, pod name,
         // node name, rendered deadline) of the winning pod so far.
         let mut bound: HashMap<String, (i64, String, String, Option<u32>)> = HashMap::new();
+        let mut job_held: std::collections::HashSet<String> = std::collections::HashSet::new();
         for pod in pods {
             // Terminal pods hold no resources and carry no binding —
             // kube-scheduler's NodeResourcesFit excludes them too; with
@@ -86,6 +95,19 @@ impl PodSnapshot {
                 Some("Succeeded" | "Failed")
             ) {
                 continue;
+            }
+            // Rule (d): every non-terminal pod (bound, Pending OR
+            // terminating) marks its intent JOB-HELD for the window
+            // exemption — recorded BEFORE the nodeName skip below so
+            // Pending pods count.
+            if let Some(id) = pod
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get(INTENT_ID_ANNOTATION))
+                .filter(|s| !s.is_empty())
+            {
+                job_held.insert(id.clone());
             }
             // Pending pods (no `spec.nodeName`) reserve nothing yet.
             let Some(node) = pod.spec.as_ref().and_then(|s| s.node_name.as_deref()) else {
@@ -141,7 +163,15 @@ impl PodSnapshot {
             requested,
             bound: nodes,
             bound_deadlines: deadlines,
+            job_held,
         }
+    }
+
+    /// Rule (d) reader: intent ids with a live (non-terminal) pod —
+    /// the FFD admission-window exemption set (round-10
+    /// merged_bug_012).
+    pub(super) fn job_held_intents(&self) -> &std::collections::HashSet<String> {
+        &self.job_held
     }
 
     /// Rule (a) reader: `Σ (cores, mem, disk)` over non-terminal pods

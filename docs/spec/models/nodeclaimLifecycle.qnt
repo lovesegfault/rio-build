@@ -230,6 +230,7 @@ module nodeclaimLifecycle {
     | EBufferedClearDelivered
     | EBindingCleared
     | EBurstFullMint
+    | EDeferKept
 
   type Violation =
     | VIdleOverReap
@@ -249,6 +250,7 @@ module nodeclaimLifecycle {
     | VClearEvidenceDropped
     | VClearLostOnAckFailure
     | VStaleBinding
+    | VDeferredDemandReaped
 
   // ------------------------------------------------------------------
   // 2. Constants
@@ -299,12 +301,41 @@ module nodeclaimLifecycle {
   /// CLEARS) vs the as-built empty-suppressed legacy field.
   const ENABLE_SNAPSHOT_MACHINERY: bool
   const ENABLE_SNAPSHOT_PRESENCE: bool
+  /// Round-10 area (merged_bug_012, WO-S4-2): MACHINERY moves the
+  /// per-full-tick deferred-demand cell set (the FFD admission
+  /// window's typed remainder, abstracted to the cells it routes to);
+  /// DEFER_DEMAND selects the FIXED law (window-deferred demand
+  /// counts for the NA keep-condition -- an idle claim in a cell with
+  /// deferred demand is NOT idle-reaped this tick; the threshold rose
+  /// with the demand) vs the as-built absence fold (the consolidator
+  /// read remaindered cells as zero demand: the idle node was reaped
+  /// at the floor and re-minted on the next window rotation -- the
+  /// reap-then-re-mint churn). All pre-round-10 regimes bind both
+  /// false -- deferredCells is constant-empty there and the reachable
+  /// state space is unchanged.
+  ///
+  /// Divergence header (the bw9 grammar): this plane covers the
+  /// CONSOLIDATE consumer of the deferred letter only -- the
+  /// demand-visibility consumers (want-map membership, spawn-lane
+  /// split, queued bound) live in the pool/jobs plane this model does
+  /// not carry; their verification is the W10-AI/AK rust battery.
+  /// Consolidate-only ticks mirror the code's bottom posture
+  /// (deferred := empty -- no scheduler view, no deferral set; the
+  /// stale set is never consulted).
+  const ENABLE_DEFER_MACHINERY: bool
+  const ENABLE_DEFER_DEMAND: bool
 
   pure val CLAIMS: Set[ClaimId] = Set("c1", "c2")
   pure val CELLS: Set[Cell] = Set("cellA", "cellB")
 
   pure def boolChoices(faultOn: bool): Set[bool] =
     if (faultOn) Set(false, true) else Set(false)
+
+  /// Round-10/merged_bug_012: the per-full-tick deferred-cell choices.
+  /// Off-machinery the only choice is the empty set, so pre-round-10
+  /// regimes branch exactly as before (state space unchanged).
+  pure val deferChoices: Set[Set[Cell]] =
+    if (ENABLE_DEFER_MACHINERY) CELLS.powerset() else Set(Set())
 
   pure def claimRank(k: ClaimId): int = if (k == "c1") 1 else 2
 
@@ -349,6 +380,9 @@ module nodeclaimLifecycle {
   /// C2/285: the SCHEDULER's authoritative-binding map, abstracted to
   /// the set of claims it believes bound. Constant empty off-machinery.
   var schedBinding: Set[ClaimId]
+  /// Round-10/merged_bug_012: cells with window-deferred demand as of
+  /// the last full tick. Constant empty off-machinery.
+  var deferredCells: Set[Cell]
   var effects: Set[Effect]
   var violations: Set[Violation]
 
@@ -357,6 +391,10 @@ module nodeclaimLifecycle {
   // ------------------------------------------------------------------
   val boundsOK = botStreak >= 0 and botStreak <= BOT_THRESHOLD
   val idleReapSafety = not(violations.contains(VIdleOverReap))
+  /// Round-10/merged_bug_012: window-deferred demand is never read as
+  /// demand-gone by the idle reap (the consolidate consumer of the
+  /// typed deferred letter).
+  val deferredDemandKept = not(violations.contains(VDeferredDemandReaped))
   val iceMarkSoundness = not(violations.contains(VSpuriousMark))
   val bootSampleNotLost = not(violations.contains(VBootSampleLost))
   val noMassClearAfterFailover = not(violations.contains(VStaleClear))
@@ -380,6 +418,9 @@ module nodeclaimLifecycle {
 
   // Witnesses (expected to be VIOLATED).
   val canReachIdleReap = not(effects.contains(EIdleReap))
+  /// Non-vacuity for the defer plane: a reap-eligible idle claim in a
+  /// deferred-demand cell was actually KEPT under the fixed law.
+  val canReachDeferKept = not(effects.contains(EDeferKept))
   val canReachVanishMark = not(effects.contains(EVanishDetected))
   val canReachClearAfterMark = not(effects.contains(EClearOfMaskedCell))
   val canReachConsolidateOnlyReap = not(effects.contains(EConsolidateOnlyReap))
@@ -512,6 +553,7 @@ module nodeclaimLifecycle {
     edgeClearDone' = edgeClearDone,
     pendingClear' = pendingClear,
     schedBinding' = schedBinding,
+    deferredCells' = deferredCells,
     effects' = Set(),
     violations' = violations,
   }
@@ -589,6 +631,7 @@ module nodeclaimLifecycle {
             pendingClear.union(freshClears)
           else pendingClear,
         schedBinding' = schedBinding,
+        deferredCells' = deferredCells,
         placeableArmed' = if (losePending) false else placeableArmed,
         losePending' = false,
         isLeader' = isLeader,
@@ -714,6 +757,10 @@ module nodeclaimLifecycle {
             pendingClear.union(freshClears)
           else pendingClear,
         schedBinding' = schedBinding,
+        // Round-10/merged_bug_012: the bottom posture — consolidate-only
+        // has no scheduler view, hence no deferral set (the code passes
+        // an empty deferred slice); the stale set is never consulted.
+        deferredCells' = Set(),
         placeableArmed' = if (losePending) false else placeableArmed,
         losePending' = false,
         isLeader' = isLeader,
@@ -752,7 +799,8 @@ module nodeclaimLifecycle {
   /// nondeterministic wrapper used by `step`.
   action tickFullWith(
     pgLoadFails: bool, ackFails: bool, createFails: bool,
-    demandA: int, demandB: int, reservedChoice: Set[ClaimId]
+    demandA: int, demandB: int, reservedChoice: Set[ClaimId],
+    deferredChoice: Set[Cell]
   ): bool = all {
       isLeader,
       val aged = CLAIMS.mapBy(k => ageWallclock(claims.get(k)))
@@ -900,10 +948,23 @@ module nodeclaimLifecycle {
         ENABLE_SNAPSHOT_MACHINERY and ENABLE_SNAPSHOT_PRESENCE and snapAckOk
         and boundNow.size() == 0 and schedBinding.size() > 0
       // ---- reap_idle ------------------------------------------------------
+      // Round-10/merged_bug_012: the deferred-demand cells of THIS
+      // tick's FFD window (machinery-gated; the fixed law keeps an
+      // otherwise-reap-eligible idle claim whose cell still has
+      // deferred demand -- e_fitting_cores counts the deferred
+      // population, so the NA threshold rises with it).
+      val deferredNow = if (ENABLE_DEFER_MACHINERY) deferredChoice else Set()
       val idleReaped = CLAIMS.filter(k =>
         val c = afterObs.get(k)
         c.phase == CRegistered and c.spell != SNotIdle and not(reserved.contains(k))
-        and c.pIdle == ITrackedOld)
+        and c.pIdle == ITrackedOld
+        and not(ENABLE_DEFER_DEMAND and deferredNow.contains(c.cell)))
+      val deferKept = ENABLE_DEFER_DEMAND and CLAIMS.filter(k =>
+        val c = afterObs.get(k)
+        c.phase == CRegistered and c.spell != SNotIdle and not(reserved.contains(k))
+        and c.pIdle == ITrackedOld and deferredNow.contains(c.cell)).size() > 0
+      val vDeferReaped = ENABLE_DEFER_MACHINERY and
+        idleReaped.filter(k => deferredNow.contains(afterObs.get(k).cell)).size() > 0
       val overReap = idleReaped.filter(k => afterObs.get(k).spell != SOld).size() > 0
       // ---- assemble the post-state ----------------------------------------
       val claimsAfter = CLAIMS.mapBy(k =>
@@ -976,6 +1037,7 @@ module nodeclaimLifecycle {
             (if (ENABLE_ACK_LATCH and ackFails) pendingClear else Set())
           else pendingClear,
         schedBinding' = schedBindingAfter,
+        deferredCells' = deferredNow,
         placeableArmed' = true,
         losePending' = false,
         isLeader' = isLeader,
@@ -985,39 +1047,46 @@ module nodeclaimLifecycle {
         configuredCells' = configuredCells,
         ceilingsKnown' = ceilingsKnown,
         hadAcquire' = hadAcquire,
-        effects' = Set(EPublished)
-          .union(if (createdA + createdB > 0) Set(ECreateOk) else Set())
-          .union(if (burstFullMint) Set(EBurstFullMint) else Set())
-          .union(if (createAttempted and createFails) Set(ECreateFailed) else Set())
-          .union(if (ackOk and marksThisTick.size() > 0) Set(EIceMarkEmitted) else Set())
-          .union(if (ackOk and clears.size() > 0) Set(EClearEmitted) else Set())
-          .union(if (clearOfMasked) Set(EClearOfMaskedCell) else Set())
-          .union(if (vanished.size() > 0) Set(EVanishDetected) else Set())
-          .union(if (stuckReaped.size() > 0) Set(EStuckReap) else Set())
-          .union(if (idleReaped.size() > 0) Set(EIdleReap) else Set())
-          .union(if (classBound) Set(EClassBudgetBound) else Set())
-          .union(if (ceilingsBlocked) Set(EFailClosedNoCeilings) else Set())
-          .union(if (dropA or dropB) Set(EUnknownCellDrop) else Set())
-          .union(if (acquireWithInflight) Set(EAcquireWithInflight) else Set())
-          .union(if (reloadStillPending) Set(EDegradedReloadTick) else Set())
-          .union(if (staleRecordOnly) Set(EStaleRecordOnly) else Set())
-          .union(if (edgeClearActed) Set(EEdgeIdleClear) else Set())
-          .union(if (bufferedDelivered) Set(EBufferedClearDelivered) else Set())
-          .union(if (bindingCleared) Set(EBindingCleared) else Set()),
-        violations' = violations
-          .union(if (overReap) Set(VIdleOverReap) else Set())
-          .union(if (spurious) Set(VSpuriousMark) else Set())
-          .union(if (lostSamples) Set(VBootSampleLost) else Set())
-          .union(if (vBudgetGlobal) Set(VBudgetGlobal) else Set())
-          .union(if (vBudgetClass) Set(VBudgetClass) else Set())
-          .union(if (vDeficitDeferred) Set(VDeficitDeferred) else Set())
-          .union(if (vNoCeil) Set(VCreateNoCeilings) else Set())
-          .union(if (vUnconfigured) Set(VCreateUnconfigured) else Set())
-          .union(if (vMasked) Set(VCoverMasked) else Set())
-          .union(if (vGateProd) Set(VGateProducer) else Set())
-          .union(if (vIdleLost) Set(VIdleSpellLost) else Set())
-          .union(if (vClearLostOnAck) Set(VClearLostOnAckFailure) else Set())
-          .union(if (vStaleBinding) Set(VStaleBinding) else Set()),
+        // Width-not-depth (the rust evaluator's serde recursion
+        // limit): one flatten over the per-effect singletons.
+        effects' = Set(EPublished).union(Set(
+          if (createdA + createdB > 0) Set(ECreateOk) else Set(),
+          if (burstFullMint) Set(EBurstFullMint) else Set(),
+          if (deferKept) Set(EDeferKept) else Set(),
+          if (createAttempted and createFails) Set(ECreateFailed) else Set(),
+          if (ackOk and marksThisTick.size() > 0) Set(EIceMarkEmitted) else Set(),
+          if (ackOk and clears.size() > 0) Set(EClearEmitted) else Set(),
+          if (clearOfMasked) Set(EClearOfMaskedCell) else Set(),
+          if (vanished.size() > 0) Set(EVanishDetected) else Set(),
+          if (stuckReaped.size() > 0) Set(EStuckReap) else Set(),
+          if (idleReaped.size() > 0) Set(EIdleReap) else Set(),
+          if (classBound) Set(EClassBudgetBound) else Set(),
+          if (ceilingsBlocked) Set(EFailClosedNoCeilings) else Set(),
+          if (dropA or dropB) Set(EUnknownCellDrop) else Set(),
+          if (acquireWithInflight) Set(EAcquireWithInflight) else Set(),
+          if (reloadStillPending) Set(EDegradedReloadTick) else Set(),
+          if (staleRecordOnly) Set(EStaleRecordOnly) else Set(),
+          if (edgeClearActed) Set(EEdgeIdleClear) else Set(),
+          if (bufferedDelivered) Set(EBufferedClearDelivered) else Set(),
+          if (bindingCleared) Set(EBindingCleared) else Set()).flatten()),
+        // Width-not-depth (the rust evaluator's serde recursion
+        // limit bites on long .union chains): one flatten over the
+        // per-violation singletons.
+        violations' = violations.union(Set(
+          if (overReap) Set(VIdleOverReap) else Set(),
+          if (vDeferReaped) Set(VDeferredDemandReaped) else Set(),
+          if (spurious) Set(VSpuriousMark) else Set(),
+          if (lostSamples) Set(VBootSampleLost) else Set(),
+          if (vBudgetGlobal) Set(VBudgetGlobal) else Set(),
+          if (vBudgetClass) Set(VBudgetClass) else Set(),
+          if (vDeficitDeferred) Set(VDeficitDeferred) else Set(),
+          if (vNoCeil) Set(VCreateNoCeilings) else Set(),
+          if (vUnconfigured) Set(VCreateUnconfigured) else Set(),
+          if (vMasked) Set(VCoverMasked) else Set(),
+          if (vGateProd) Set(VGateProducer) else Set(),
+          if (vIdleLost) Set(VIdleSpellLost) else Set(),
+          if (vClearLostOnAck) Set(VClearLostOnAckFailure) else Set(),
+          if (vStaleBinding) Set(VStaleBinding) else Set()).flatten()),
       }
   }
 
@@ -1028,7 +1097,10 @@ module nodeclaimLifecycle {
     nondet demandA = Set(0, 1, 2).oneOf()
     nondet demandB = Set(0, 1, 2).oneOf()
     nondet reservedChoice = CLAIMS.powerset().oneOf()
-    tickFullWith(pgLoadFails, ackFails, createFails, demandA, demandB, reservedChoice)
+    nondet deferredChoice = deferChoices.oneOf()
+    tickFullWith(
+      pgLoadFails, ackFails, createFails, demandA, demandB, reservedChoice,
+      deferredChoice)
   }
 
   // ------------------------------------------------------------------
@@ -1039,6 +1111,7 @@ module nodeclaimLifecycle {
     edgeClearDone' = edgeClearDone,
     pendingClear' = pendingClear,
     schedBinding' = schedBinding,
+    deferredCells' = deferredCells,
     losePending' = losePending,
     reloadPending' = reloadPending,
     botStreak' = botStreak,
@@ -1138,6 +1211,7 @@ module nodeclaimLifecycle {
     hadAcquire' = hadAcquire, effects' = effects, violations' = violations,
     edgeClearDone' = edgeClearDone, pendingClear' = pendingClear,
     schedBinding' = schedBinding,
+    deferredCells' = deferredCells,
   }
 
   /// The lease is lost: the on_lose hook arms the unarm-gate flag.
@@ -1153,6 +1227,7 @@ module nodeclaimLifecycle {
     hadAcquire' = hadAcquire, effects' = effects, violations' = violations,
     edgeClearDone' = edgeClearDone, pendingClear' = pendingClear,
     schedBinding' = schedBinding,
+    deferredCells' = deferredCells,
   }
 
   /// The lease is (re-)acquired: the on_acquire hook arms the reload
@@ -1173,6 +1248,7 @@ module nodeclaimLifecycle {
     pendingClear' =
       if (ENABLE_CLEARBUF_MACHINERY) Set() else pendingClear,
     schedBinding' = schedBinding,
+    deferredCells' = deferredCells,
     losePending' = losePending, botStreak' = botStreak,
     placeableArmed' = placeableArmed, iceMasked' = iceMasked,
     configuredCells' = configuredCells, ceilingsKnown' = ceilingsKnown,
@@ -1202,6 +1278,7 @@ module nodeclaimLifecycle {
     edgeClearDone' = if (ENABLE_EPOCH_MACHINERY) true else edgeClearDone,
     pendingClear' = if (ENABLE_CLEARBUF_MACHINERY) Set() else pendingClear,
     schedBinding' = schedBinding,
+    deferredCells' = deferredCells,
   }
 
   /// GetHwClassConfig finally delivers the global ceilings.
@@ -1216,6 +1293,7 @@ module nodeclaimLifecycle {
     hadAcquire' = hadAcquire, effects' = effects, violations' = violations,
     edgeClearDone' = edgeClearDone, pendingClear' = pendingClear,
     schedBinding' = schedBinding,
+    deferredCells' = deferredCells,
   }
 
   /// The config mirror loses a cell (hwClass removed mid-rollout).
@@ -1232,6 +1310,7 @@ module nodeclaimLifecycle {
     hadAcquire' = hadAcquire, effects' = effects, violations' = violations,
     edgeClearDone' = edgeClearDone, pendingClear' = pendingClear,
     schedBinding' = schedBinding,
+    deferredCells' = deferredCells,
   }
 
   /// The next refresh restores the cell.
@@ -1247,6 +1326,7 @@ module nodeclaimLifecycle {
     hadAcquire' = hadAcquire, effects' = effects, violations' = violations,
     edgeClearDone' = edgeClearDone, pendingClear' = pendingClear,
     schedBinding' = schedBinding,
+    deferredCells' = deferredCells,
   }
 
   // ------------------------------------------------------------------
@@ -1266,6 +1346,7 @@ module nodeclaimLifecycle {
     edgeClearDone' = true,
     pendingClear' = Set(),
     schedBinding' = Set(),
+    deferredCells' = Set(),
     effects' = Set(),
     violations' = Set(),
   }
@@ -1318,7 +1399,9 @@ module nodeclaimLifecycleBase {
     ENABLE_EVIDENCE_BUFFER = false,
     ENABLE_ACK_LATCH = false,
     ENABLE_SNAPSHOT_MACHINERY = false,
-    ENABLE_SNAPSHOT_PRESENCE = false
+    ENABLE_SNAPSHOT_PRESENCE = false,
+    ENABLE_DEFER_MACHINERY = false,
+    ENABLE_DEFER_DEMAND = false
   ).*
 }
 
@@ -1341,7 +1424,9 @@ module nodeclaimLifecycleFaultRpc {
     ENABLE_EVIDENCE_BUFFER = false,
     ENABLE_ACK_LATCH = false,
     ENABLE_SNAPSHOT_MACHINERY = false,
-    ENABLE_SNAPSHOT_PRESENCE = false
+    ENABLE_SNAPSHOT_PRESENCE = false,
+    ENABLE_DEFER_MACHINERY = false,
+    ENABLE_DEFER_DEMAND = false
   ).*
 
   /// The conflation trace, post-fix: the claim is observed idle, goes
@@ -1352,13 +1437,13 @@ module nodeclaimLifecycleFaultRpc {
   run idlePruneAcrossBotRun =
     init
       .then(ceilingsLoad)
-      .then(tickFullWith(false, false, false, 1, 0, Set()))
+      .then(tickFullWith(false, false, false, 1, 0, Set(), Set()))
       .then(claimRegisters("c1"))
-      .then(tickFullWith(false, false, false, 0, 0, Set()))
+      .then(tickFullWith(false, false, false, 0, 0, Set(), Set()))
       .then(claimGoesBusy("c1"))
       .then(tickBotEarlyWith(false))
       .then(claimGoesIdle("c1"))
-      .then(tickFullWith(false, false, false, 0, 0, Set()))
+      .then(tickFullWith(false, false, false, 0, 0, Set(), Set()))
       .expect(not(violations.contains(VIdleOverReap)))
       .expect(claims.get("c1").pIdle != INotTracked)
 
@@ -1369,10 +1454,10 @@ module nodeclaimLifecycleFaultRpc {
   run bootRecordedAcrossBotRun =
     init
       .then(ceilingsLoad)
-      .then(tickFullWith(false, false, false, 1, 0, Set()))
+      .then(tickFullWith(false, false, false, 1, 0, Set(), Set()))
       .then(claimRegisters("c1"))
       .then(tickBotEarlyWith(false))
-      .then(tickFullWith(false, false, false, 0, 0, Set()))
+      .then(tickFullWith(false, false, false, 0, 0, Set(), Set()))
       .expect(not(violations.contains(VBootSampleLost)))
       .expect(claims.get("c1").boot == BRecorded)
 }
@@ -1394,7 +1479,9 @@ module nodeclaimLifecycleFaultLease {
     ENABLE_EVIDENCE_BUFFER = false,
     ENABLE_ACK_LATCH = false,
     ENABLE_SNAPSHOT_MACHINERY = false,
-    ENABLE_SNAPSHOT_PRESENCE = false
+    ENABLE_SNAPSHOT_PRESENCE = false,
+    ENABLE_DEFER_MACHINERY = false,
+    ENABLE_DEFER_DEMAND = false
   ).*
 }
 
@@ -1416,7 +1503,9 @@ module nodeclaimLifecycleFaultKarpenter {
     ENABLE_EVIDENCE_BUFFER = false,
     ENABLE_ACK_LATCH = false,
     ENABLE_SNAPSHOT_MACHINERY = false,
-    ENABLE_SNAPSHOT_PRESENCE = false
+    ENABLE_SNAPSHOT_PRESENCE = false,
+    ENABLE_DEFER_MACHINERY = false,
+    ENABLE_DEFER_DEMAND = false
   ).*
 }
 
@@ -1439,7 +1528,9 @@ module nodeclaimLifecycleEpochAsBuilt {
     ENABLE_EVIDENCE_BUFFER = false,
     ENABLE_ACK_LATCH = false,
     ENABLE_SNAPSHOT_MACHINERY = false,
-    ENABLE_SNAPSHOT_PRESENCE = false
+    ENABLE_SNAPSHOT_PRESENCE = false,
+    ENABLE_DEFER_MACHINERY = false,
+    ENABLE_DEFER_DEMAND = false
   ).*
 }
 
@@ -1462,7 +1553,9 @@ module nodeclaimLifecycleEpoch {
     ENABLE_EVIDENCE_BUFFER = false,
     ENABLE_ACK_LATCH = false,
     ENABLE_SNAPSHOT_MACHINERY = false,
-    ENABLE_SNAPSHOT_PRESENCE = false
+    ENABLE_SNAPSHOT_PRESENCE = false,
+    ENABLE_DEFER_MACHINERY = false,
+    ENABLE_DEFER_DEMAND = false
   ).*
 }
 
@@ -1484,7 +1577,9 @@ module nodeclaimLifecycleClearBufferAsBuilt {
     ENABLE_EVIDENCE_BUFFER = false,
     ENABLE_ACK_LATCH = false,
     ENABLE_SNAPSHOT_MACHINERY = false,
-    ENABLE_SNAPSHOT_PRESENCE = false
+    ENABLE_SNAPSHOT_PRESENCE = false,
+    ENABLE_DEFER_MACHINERY = false,
+    ENABLE_DEFER_DEMAND = false
   ).*
 }
 
@@ -1506,7 +1601,9 @@ module nodeclaimLifecycleClearBuffer {
     ENABLE_EVIDENCE_BUFFER = true,
     ENABLE_ACK_LATCH = true,
     ENABLE_SNAPSHOT_MACHINERY = false,
-    ENABLE_SNAPSHOT_PRESENCE = false
+    ENABLE_SNAPSHOT_PRESENCE = false,
+    ENABLE_DEFER_MACHINERY = false,
+    ENABLE_DEFER_DEMAND = false
   ).*
 }
 
@@ -1530,7 +1627,9 @@ module nodeclaimLifecycleAckLatchAsBuilt {
     ENABLE_EVIDENCE_BUFFER = true,
     ENABLE_ACK_LATCH = false,
     ENABLE_SNAPSHOT_MACHINERY = false,
-    ENABLE_SNAPSHOT_PRESENCE = false
+    ENABLE_SNAPSHOT_PRESENCE = false,
+    ENABLE_DEFER_MACHINERY = false,
+    ENABLE_DEFER_DEMAND = false
   ).*
 }
 
@@ -1553,7 +1652,9 @@ module nodeclaimLifecycleSnapshotAsBuilt {
     ENABLE_EVIDENCE_BUFFER = false,
     ENABLE_ACK_LATCH = false,
     ENABLE_SNAPSHOT_MACHINERY = true,
-    ENABLE_SNAPSHOT_PRESENCE = false
+    ENABLE_SNAPSHOT_PRESENCE = false,
+    ENABLE_DEFER_MACHINERY = false,
+    ENABLE_DEFER_DEMAND = false
   ).*
 }
 
@@ -1576,6 +1677,61 @@ module nodeclaimLifecycleSnapshot {
     ENABLE_EVIDENCE_BUFFER = false,
     ENABLE_ACK_LATCH = false,
     ENABLE_SNAPSHOT_MACHINERY = true,
-    ENABLE_SNAPSHOT_PRESENCE = true
+    ENABLE_SNAPSHOT_PRESENCE = true,
+    ENABLE_DEFER_MACHINERY = false,
+    ENABLE_DEFER_DEMAND = false
+  ).*
+}
+
+/// Round-10/merged_bug_012 FALSIFY half: the as-built absence fold —
+/// the consolidator reads window-remaindered cells as zero demand, so
+/// a reap-eligible idle claim in a deferred-demand cell is reaped at
+/// the floor (deferredDemandKept is expected to be violated; the next
+/// rotation admits the deferred work onto a freshly-minted claim —
+/// the reap-then-re-mint churn).
+module nodeclaimLifecycleDeferAsBuilt {
+  import nodeclaimLifecycle(
+    MAX_FLEET_CORES = 2,
+    CLASS_CAP_A = 1,
+    BOT_THRESHOLD = 2,
+    ENABLE_RPC_FAULT = false,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_KARPENTER_FAULT = false,
+    START_CEILINGS_KNOWN = true,
+    ENABLE_EPOCH_MACHINERY = false,
+    ENABLE_ACQUIRE_EPOCH = false,
+    ENABLE_CLEARBUF_MACHINERY = false,
+    ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_ACK_LATCH = false,
+    ENABLE_SNAPSHOT_MACHINERY = false,
+    ENABLE_SNAPSHOT_PRESENCE = false,
+    ENABLE_DEFER_MACHINERY = true,
+    ENABLE_DEFER_DEMAND = false
+  ).*
+}
+
+/// Round-10/merged_bug_012 HOLD half: window-deferred demand counts
+/// for the NA keep-condition — an idle claim in a deferred-demand
+/// cell is kept this tick (e_fitting_cores includes the deferred
+/// population, raising the threshold). canReachDeferKept keeps it
+/// non-vacuous.
+module nodeclaimLifecycleDefer {
+  import nodeclaimLifecycle(
+    MAX_FLEET_CORES = 2,
+    CLASS_CAP_A = 1,
+    BOT_THRESHOLD = 2,
+    ENABLE_RPC_FAULT = false,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_KARPENTER_FAULT = false,
+    START_CEILINGS_KNOWN = true,
+    ENABLE_EPOCH_MACHINERY = false,
+    ENABLE_ACQUIRE_EPOCH = false,
+    ENABLE_CLEARBUF_MACHINERY = false,
+    ENABLE_EVIDENCE_BUFFER = false,
+    ENABLE_ACK_LATCH = false,
+    ENABLE_SNAPSHOT_MACHINERY = false,
+    ENABLE_SNAPSHOT_PRESENCE = false,
+    ENABLE_DEFER_MACHINERY = true,
+    ENABLE_DEFER_DEMAND = true
   ).*
 }

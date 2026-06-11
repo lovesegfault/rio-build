@@ -7,7 +7,7 @@
 //! scheduler will do once B12 routes pods to it. The `unplaced` residual
 //! is `cover_deficit`'s (B8) per-cell input.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
@@ -321,10 +321,19 @@ pub struct SimRemainder {
 }
 
 /// One windowed-simulation tick's outcome: the FFD result over the
-/// admitted window plus the typed remainder.
+/// admitted window plus the window-deferred intents — the THIRD tick
+/// disposition as a per-intent typed letter (round-10 merged_bug_012,
+/// R25: the aggregate [`SimRemainder`] is a metric, not the law's
+/// carrier; every consumer hears the per-intent letter through
+/// [`super::PlacedTick`]).
 pub struct SimOutcome {
     pub placeable: Vec<Placement>,
     pub unplaced: Vec<SpawnIntent>,
+    /// Demand beyond this tick's admission window — still wanted,
+    /// re-seen next tick; published per-intent so the demand-visible
+    /// fold (pool jobs) and the consolidator count it instead of
+    /// reading absence as demand-gone.
+    pub deferred: Vec<SpawnIntent>,
     pub remainder: SimRemainder,
 }
 
@@ -356,17 +365,38 @@ pub fn sim_window_cores(live_free_cores: u64, budget_remaining_cores: u64) -> u6
 /// Already-bound intents bypass the window entirely: their simulation
 /// cost is a map lookup and excluding them would mis-read bound work as
 /// remainder.
+///
+/// Round-10 merged_bug_012 amendments:
+/// - **Job-held exemption** (mirroring the bound exemption): an intent
+///   in `job_held` (any live pod — bound OR Pending) bypasses the
+///   window. Its Job already exists, so deferring it cannot pace
+///   anything — it only mis-reads existing demand as remainder and
+///   hands the still-wanted Pending Job to the orphan reap. Sim cost
+///   is bounded by the live-Job population (≤ ceiling), so the
+///   work-bound the window exists for survives.
+/// - **Can-never-fit head skip**: a bucket head whose own cores exceed
+///   the WHOLE window (`cores > window_cores`) can never be admitted
+///   by any rotation of this window — it defers (typed, re-seen when
+///   capacity grows) and the bucket CONTINUES, so one oversized head
+///   no longer starves every sibling in its class across rotations
+///   (the cores-desc sort made that starvation persistent). A head
+///   that would fit a fresh window but not the remaining budget still
+///   blocks its bucket (priority order within a bucket is never
+///   skipped past).
 // r[impl ctrl.nodeclaim.sim-window]
 pub fn admit_window(
     sorted: Vec<SpawnIntent>,
     bound: &HashMap<String, String>,
+    job_held: &HashSet<String>,
     window_cores: u64,
     tick: u64,
 ) -> (Vec<SpawnIntent>, Vec<SpawnIntent>) {
-    // Fast path: total unbound cores within the window — admit all.
+    let exempt =
+        |i: &SpawnIntent| bound.contains_key(&i.intent_id) || job_held.contains(&i.intent_id);
+    // Fast path: total non-exempt cores within the window — admit all.
     let unbound_cores: u64 = sorted
         .iter()
-        .filter(|i| !bound.contains_key(&i.intent_id))
+        .filter(|i| !exempt(i))
         .map(|i| u64::from(i.cores))
         .sum();
     if unbound_cores <= window_cores {
@@ -377,8 +407,8 @@ pub fn admit_window(
     let mut buckets: BTreeMap<&str, std::collections::VecDeque<usize>> = BTreeMap::new();
     let mut admitted_idx: Vec<usize> = Vec::with_capacity(sorted.len());
     for (idx, i) in sorted.iter().enumerate() {
-        if bound.contains_key(&i.intent_id) {
-            admitted_idx.push(idx); // window-exempt
+        if exempt(i) {
+            admitted_idx.push(idx); // window-exempt (bound or job-held)
         } else {
             buckets
                 .entry(i.hw_class_names.first().map_or("", String::as_str))
@@ -401,6 +431,15 @@ pub fn admit_window(
                 continue;
             }
             let q = buckets.get_mut(key).expect("bucket exists");
+            // Can-never-fit heads defer without blocking the bucket
+            // (they go to the remainder via non-admission).
+            while q
+                .front()
+                .is_some_and(|&idx| u64::from(sorted[idx].cores) > window_cores)
+            {
+                q.pop_front();
+                progressed = true;
+            }
             let Some(&idx) = q.front() else {
                 blocked[bi] = true;
                 open -= 1;
@@ -408,8 +447,9 @@ pub fn admit_window(
             };
             let cores = u64::from(sorted[idx].cores);
             if cum.saturating_add(cores) > window_cores {
-                // Head doesn't fit: the bucket blocks (priority order
-                // within a bucket is never skipped past).
+                // Head doesn't fit the REMAINING budget (but could fit
+                // a fresh window): the bucket blocks — priority order
+                // within a bucket is never skipped past.
                 blocked[bi] = true;
                 open -= 1;
                 continue;
@@ -531,6 +571,7 @@ pub async fn simulate_windowed(
     live: &[LiveNode],
     sketches: &CellSketches,
     bound: &HashMap<String, String>,
+    job_held: &HashSet<String>,
     fuse_cache_bytes: u64,
     window_cores: u64,
     tick: u64,
@@ -538,10 +579,10 @@ pub async fn simulate_windowed(
 ) -> SimOutcome {
     let mut sorted: Vec<SpawnIntent> = intents.to_vec();
     sort_ffd(&mut sorted);
-    let (admitted, remainder) = admit_window(sorted, bound, window_cores, tick);
+    let (admitted, deferred) = admit_window(sorted, bound, job_held, window_cores, tick);
     let rem = SimRemainder {
-        intents: remainder.len(),
-        cores: remainder.iter().map(|i| u64::from(i.cores)).sum(),
+        intents: deferred.len(),
+        cores: deferred.iter().map(|i| u64::from(i.cores)).sum(),
     };
     let mut st = SimState::new(live, admitted.len());
     for (n, i) in admitted.into_iter().enumerate() {
@@ -561,6 +602,7 @@ pub async fn simulate_windowed(
     SimOutcome {
         placeable: st.placeable,
         unplaced: st.unplaced,
+        deferred,
         remainder: rem,
     }
 }
@@ -2112,6 +2154,7 @@ pub(crate) mod tests {
             &nodes,
             &sketches,
             &bound,
+            &HashSet::new(),
             0,
             u64::MAX, // capacity-unbounded: this test pins yielding, not the window
             0,
@@ -2192,6 +2235,7 @@ pub(crate) mod tests {
                 &nodes,
                 &sketches,
                 &bound,
+                &HashSet::new(),
                 0,
                 u64::MAX,
                 0,
@@ -2213,6 +2257,115 @@ pub(crate) mod tests {
             skew < Duration::from_secs(2),
             "main-domain skew {skew:?} stays under the stall threshold \
              through {walks} back-to-back windowed walks"
+        );
+    }
+
+    // r[verify ctrl.nodeclaim.sim-window]
+    /// **W10-AJ (round-10 merged_bug_012, the starvation amplifier).**
+    /// PROPOSITION at the head-exceeds-window quantifier: a bucket
+    /// head whose own cores exceed the WHOLE window defers WITHOUT
+    /// blocking its class — siblings are admitted across EVERY
+    /// rotation (count-based: pre-fix the whole bucket starved at
+    /// every tick offset, the cores-desc sort keeping the oversized
+    /// head permanently in front).
+    ///
+    /// Pre-fix red (head-block law, captured before the skip landed):
+    ///   rotation 0: admitted from class A = 0 (expected 3)
+    ///   "can-never-fit head must defer, not starve its bucket"
+    #[test]
+    fn w10_aj_can_never_fit_head_defers_without_starving_bucket() {
+        // Class A: one 64-core head (window is 32 — can NEVER fit) +
+        // three 8-core siblings. Class B: flood of 8-core intents so
+        // the fast path (everything fits) cannot trigger.
+        let mut intents: Vec<SpawnIntent> = vec![
+            intent("a-huge", 64, GI, &[("ca", CapacityType::Spot)]),
+            intent("a-s1", 8, GI, &[("ca", CapacityType::Spot)]),
+            intent("a-s2", 8, GI, &[("ca", CapacityType::Spot)]),
+            intent("a-s3", 8, GI, &[("ca", CapacityType::Spot)]),
+        ];
+        intents.extend(
+            (0..20).map(|k| intent(&format!("b{k:02}"), 8, GI, &[("cb", CapacityType::Spot)])),
+        );
+
+        // Across every rotation offset, class-A siblings get their RR
+        // share and the oversized head is ALWAYS in the remainder.
+        for tick in 0..4u64 {
+            let mut sorted = intents.clone();
+            sort_ffd(&mut sorted);
+            let (admitted, remainder) =
+                admit_window(sorted, &HashMap::new(), &HashSet::new(), 32, tick);
+            let a_adm = admitted
+                .iter()
+                .filter(|i| i.intent_id.starts_with("a-s"))
+                .count();
+            assert!(
+                a_adm >= 1,
+                "rotation {tick}: class-A siblings admitted past the \
+                 can-never-fit head (pre-fix: 0 — the bucket starved)"
+            );
+            assert!(
+                remainder.iter().any(|i| i.intent_id == "a-huge"),
+                "rotation {tick}: the oversized head is typed remainder \
+                 (deferred until capacity grows), never admitted"
+            );
+            assert!(
+                !admitted.iter().any(|i| i.intent_id == "a-huge"),
+                "rotation {tick}: 64c can never enter a 32c window"
+            );
+        }
+    }
+
+    // r[verify ctrl.nodeclaim.sim-window]
+    // r[verify ctrl.pool.demand-completeness]
+    /// **W10-AI, the window-exemption half (round-10 merged_bug_012).**
+    /// A Job-HOLDING intent (live pod — bound or Pending) bypasses the
+    /// admission window exactly like a bound intent: its Job already
+    /// exists, so deferring it cannot pace anything — it only mis-read
+    /// existing demand as remainder (the still-wanted Pending Job then
+    /// fell to the orphan reap pre-fix). The sim outcome carries the
+    /// per-intent deferred letter for everything genuinely windowed
+    /// out.
+    #[tokio::test]
+    async fn w10_ai_job_held_intent_bypasses_window() {
+        let live: Vec<LiveNode> = vec![];
+        let sketches = CellSketches::default();
+        let bound = HashMap::new();
+        // 5 × 8c intents against an 8-core window: only one admits...
+        let mut intents: Vec<SpawnIntent> = (0..5)
+            .map(|k| intent(&format!("i{k}"), 8, GI, &[("ca", CapacityType::Spot)]))
+            .collect();
+        intents.push(intent("held", 8, GI, &[("ca", CapacityType::Spot)]));
+        // ...but "held" carries a live Pending Job — window-exempt.
+        let job_held: HashSet<String> = ["held".to_string()].into();
+        let out = simulate_windowed(
+            &intents,
+            &live,
+            &sketches,
+            &bound,
+            &job_held,
+            0,
+            8,
+            0,
+            |_, _, _| true,
+        )
+        .await;
+        assert!(
+            !out.deferred.iter().any(|i| i.intent_id == "held"),
+            "a Job-holding intent is never window-deferred"
+        );
+        assert_eq!(
+            out.deferred.len(),
+            4,
+            "the other four split one 8c window slot: one admitted, \
+             four deferred — each a typed per-intent letter"
+        );
+        assert_eq!(
+            out.remainder,
+            SimRemainder {
+                intents: 4,
+                cores: 32
+            },
+            "the aggregate stays a metric beside the letters"
         );
     }
 
@@ -2239,7 +2392,7 @@ pub(crate) mod tests {
         let bound: HashMap<String, String> = [("zbound".to_string(), "node-n".to_string())].into();
         let mut sorted = intents.clone();
         sort_ffd(&mut sorted);
-        let (admitted, remainder) = admit_window(sorted, &bound, 32, 0);
+        let (admitted, remainder) = admit_window(sorted, &bound, &HashSet::new(), 32, 0);
         let a_adm = admitted
             .iter()
             .filter(|i| i.intent_id.starts_with('a'))
@@ -2329,7 +2482,15 @@ pub(crate) mod tests {
             .build()
             .unwrap();
         let out = rt.block_on(simulate_windowed(
-            &intents, &live, &sketches, &bound, 0, window, 0, any_admit,
+            &intents,
+            &live,
+            &sketches,
+            &bound,
+            &HashSet::new(),
+            0,
+            window,
+            0,
+            any_admit,
         ));
         assert!(
             out.remainder.intents > 0,

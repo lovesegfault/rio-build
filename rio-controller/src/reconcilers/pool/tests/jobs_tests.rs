@@ -4250,3 +4250,100 @@ async fn w10_ag_complete_view_orphan_reap_unchanged() {
     assert_eq!(reaped, HashSet::from(["rio-orphan-job".to_string()]));
     guard.verified().await;
 }
+
+// r[verify ctrl.pool.demand-completeness]
+/// **W10-AI, the demand-visibility half (round-10 merged_bug_012,
+/// R25).** A window-DEFERRED intent holding a Pending Job: the gate
+/// fold keeps it DEMAND-VISIBLE (want-map membership ⇒ the orphan arm
+/// reads `Wanted`, no delete) while the spawn lane excludes it (the
+/// fold's ternary letter — not spawnable this tick). Pre-fix the
+/// deferred letter folded into the absent arm: stripped from the
+/// page, its still-wanted Pending Job foreground-deleted at the 10s
+/// grace.
+///
+/// Pre-fix red (Deferred arm severed to the pre-round-10 strip):
+///   panicked at 'demand lane: the deferred intent survives the gate
+///   fold (pre-fix: stripped)'
+///     left: 1  right: 2
+#[tokio::test]
+async fn w10_ai_deferred_intent_stays_demand_visible_not_spawnable() {
+    use crate::reconcilers::nodeclaim_pool::{FfdDisposition, PlaceableGate, PlacedTick};
+    use crate::reconcilers::pool::jobs::apply_placeable_gate;
+
+    // FFD tick: "reg" placed-on-registered; "def" window-deferred
+    // (holds a Pending Job from an earlier tick).
+    let gate = PlaceableGate::from_tick(PlacedTick::for_test(["reg"], ["def"]));
+    let mut page = IntentPage::for_test(vec![intent_named("reg"), intent_named("def")]);
+    let tick = apply_placeable_gate(&mut page, &gate).expect("armed");
+
+    // Demand lane: BOTH survive the fold.
+    assert_eq!(
+        page.len_page(),
+        2,
+        "demand lane: the deferred intent survives the gate fold \
+         (pre-fix: stripped)"
+    );
+
+    // Absence lane: the deferred intent's Job reads Wanted — the
+    // orphan arm cannot classify it absent (the pre-fix delete path).
+    let want = want_complete(
+        &page.iter_page().cloned().collect::<Vec<_>>(),
+        "p",
+        ExecutorKind::Builder,
+    );
+    let def_job = crate::reconcilers::pool::pod::job_name(
+        "p",
+        ExecutorKind::Builder,
+        "def", // intent_suffix("def") == "def" (lowercase alnum, <12)
+    );
+    assert!(
+        matches!(
+            want.verdict(&def_job),
+            crate::reconcilers::pool::jobs::WantVerdict::Wanted(_)
+        ),
+        "the deferred intent's Pending Job is WANTED demand"
+    );
+
+    // Spawn lane: deferred is NOT spawnable this tick (the ternary
+    // letter at the consumer — rustc-exhaustive, no if-let fold).
+    assert_eq!(tick.disposition("reg"), FfdDisposition::PlacedRegistered);
+    assert_eq!(tick.disposition("def"), FfdDisposition::Deferred);
+    assert_eq!(tick.disposition("ghost"), FfdDisposition::Unplaced);
+}
+
+// r[verify ctrl.pool.demand-completeness]
+/// **W10-AK (R25 consumer census).** Every consumer of the FFD tick
+/// outcome matches on the FULL disposition alphabet — rustc
+/// exhaustiveness at the typed letter (the `apply_placeable_gate`
+/// fold names all four variants; zero `if let` escape hatches over
+/// `FfdDisposition` anywhere in the pool plane). Source-scan census
+/// over the EMBEDDED sources (the (wwwww) form).
+#[test]
+fn w10_ak_disposition_consumers_match_exhaustively() {
+    let jobs_src = include_str!("../jobs.rs");
+    let prod = jobs_src
+        .split("#[cfg(test)]\nmod ")
+        .next()
+        .unwrap_or(jobs_src);
+    for variant in [
+        "FfdDisposition::PlacedRegistered",
+        "FfdDisposition::PlacedInFlight",
+        "FfdDisposition::Deferred",
+        "FfdDisposition::Unplaced",
+    ] {
+        assert!(
+            prod.contains(variant),
+            "{variant} must be NAMED at the gate fold (a vanished arm \
+             means a wildcard or if-let crept in — the R25 reject)"
+        );
+    }
+    assert_eq!(
+        prod.matches("if let FfdDisposition").count()
+            + prod
+                .matches("if let crate::reconcilers::nodeclaim_pool::FfdDisposition")
+                .count(),
+        0,
+        "no if-let escape hatch between the FFD letter producer and \
+         the demand law (R25)"
+    );
+}

@@ -7445,6 +7445,58 @@ rec {
       witness = "canReachBindingCleared";
     };
 
+    # Round-10/merged_bug_012 (WO-S4-2): the FFD window's deferred
+    # letter at the CONSOLIDATE consumer — window-deferred demand
+    # counts for the NA keep-condition (e_fitting_cores includes the
+    # deferred population). FALSIFY half: the as-built absence fold
+    # reaps a reap-eligible idle claim in a deferred-demand cell
+    # (deferredDemandKept expected violated — the reap-then-re-mint
+    # churn, demonstrated as a model violation).
+    # r[verify ctrl.pool.demand-completeness]
+    quint-nodeclaim-falsify-defer-asbuilt = mkQuintWitnessCheck {
+      name = "nodeclaim-falsify-defer-asbuilt";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleDeferAsBuilt";
+      witness = "deferredDemandKept";
+    };
+    # HOLD half: with the fixed law the violation is unreachable and
+    # the keep actually fires (canReachDeferKept keeps it
+    # non-vacuous via its own witness check below).
+    # r[verify ctrl.pool.demand-completeness]
+    quint-nodeclaim-defer-demand = mkQuintCheck {
+      name = "nodeclaim-defer-demand";
+      # quint-policy P1 exemption (the standing boundsOK form):
+      vacuityExempt = {
+        boundsOK = {
+          class = "boundsOK";
+          reason = "scope-ceiling tripwire: a violation means the regime misconfigured its bound consts, not a protocol defect — a falsifier would assert a misconfiguration, not a behavior";
+        };
+      };
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleDefer";
+      invariants = [
+        "boundsOK"
+        "idleReapSafety"
+        "iceMarkSoundness"
+        "bootSampleNotLost"
+        "noMassClearAfterFailover"
+        "reloadLatchRespected"
+        "singleEffectiveProvisioner"
+        "gateProducerGuarantee"
+        "provisioningBudget"
+        "deficitFullyMinted"
+        "coverRespectsMask"
+        "degradedCoverPolarity"
+        "deferredDemandKept"
+      ];
+    };
+    quint-nodeclaim-witness-defer-kept = mkQuintWitnessCheck {
+      name = "nodeclaim-witness-defer-kept";
+      spec = "nodeclaimLifecycle";
+      main = "nodeclaimLifecycleDefer";
+      witness = "canReachDeferKept";
+    };
+
     # ------------------------------------------------------------------
     # ICE evidence/ack pipeline (bughunt-5 slot 5: bug_094 +
     # merged_bug_134/008/003) — the cross-component contract

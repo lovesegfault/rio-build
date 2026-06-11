@@ -172,10 +172,91 @@ pub const OWNER_LABEL: &str = "rio.build/nodeclaim-pool=builder";
 /// `rio.build/fetcher` (the §13e taint+label key from `hw.labels`).
 pub const NODE_ROLE_LABEL: (&str, &str) = ("rio.build/node-role", "builder");
 
-/// `intent_id` set FFD-placed on a `Registered=True` NodeClaim. `None`
-/// = no FFD tick has published yet (first ~10s after start, or standby
-/// replica whose lease-gated reconciler never runs).
-type PlaceableSet = Option<Arc<HashSet<String>>>;
+/// One FFD tick's per-intent dispositions, published through the
+/// placeable channel (round-10 merged_bug_012, R25: the tick alphabet
+/// is TYPED end-to-end — placed-on-registered / placed-in-flight /
+/// window-deferred / unplaced — so no consumer folds a letter into an
+/// `if let` absence test; the `pool/jobs` fold names every variant).
+#[derive(Debug, Default)]
+pub struct PlacedTick {
+    /// FFD-placed on a `Registered=True` NodeClaim — the SPAWN lane.
+    on_registered: HashSet<String>,
+    /// FFD-placed on a live but not-yet-registered claim — spawn
+    /// waits for the Registered edge (`cover_deficit` provisioned for
+    /// these; the tick after Registered picks them up).
+    in_flight: HashSet<String>,
+    /// Window-deferred (admission window exhausted) — still wanted,
+    /// re-seen next tick; DEMAND-VISIBLE so the orphan/excess reaps
+    /// and the consolidator do not read the deferral as demand-gone.
+    deferred: HashSet<String>,
+}
+
+/// One intent's disposition from [`PlacedTick::disposition`] — the
+/// ternary tick letter (+ the in-flight placement face), consumed
+/// exhaustively at the `pool/jobs` fold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FfdDisposition {
+    /// Placed on a Registered node: spawnable AND demand-visible.
+    PlacedRegistered,
+    /// Placed on an in-flight claim: not spawnable yet; demand
+    /// handling per the consumer's named fold.
+    PlacedInFlight,
+    /// Window-deferred: NOT spawnable this tick; demand-visible.
+    Deferred,
+    /// Not placed anywhere and not deferred: unplaceable this tick
+    /// (`cover_deficit` owns provisioning for these).
+    Unplaced,
+}
+
+impl PlacedTick {
+    /// Build from one sim outcome (the publisher side; pub(crate)
+    /// for the channel-shape test in pool/jobs.rs).
+    pub(crate) fn from_sim(placeable: &[ffd::Placement], deferred: &[SpawnIntent]) -> Self {
+        let mut tick = Self::default();
+        for (i, _, in_flight) in placeable {
+            if *in_flight {
+                tick.in_flight.insert(i.intent_id.clone());
+            } else {
+                tick.on_registered.insert(i.intent_id.clone());
+            }
+        }
+        tick.deferred
+            .extend(deferred.iter().map(|i| i.intent_id.clone()));
+        tick
+    }
+
+    /// The per-intent letter (total — every id answers).
+    pub fn disposition(&self, intent_id: &str) -> FfdDisposition {
+        if self.on_registered.contains(intent_id) {
+            FfdDisposition::PlacedRegistered
+        } else if self.in_flight.contains(intent_id) {
+            FfdDisposition::PlacedInFlight
+        } else if self.deferred.contains(intent_id) {
+            FfdDisposition::Deferred
+        } else {
+            FfdDisposition::Unplaced
+        }
+    }
+
+    /// Test-only tick constructor (gate-fold unit tests).
+    #[cfg(test)]
+    pub fn for_test<R, D>(on_registered: R, deferred: D) -> Self
+    where
+        R: IntoIterator<Item = &'static str>,
+        D: IntoIterator<Item = &'static str>,
+    {
+        Self {
+            on_registered: on_registered.into_iter().map(str::to_owned).collect(),
+            in_flight: HashSet::new(),
+            deferred: deferred.into_iter().map(str::to_owned).collect(),
+        }
+    }
+}
+
+/// The last-published FFD tick dispositions. `None` = no FFD tick has
+/// published yet (first ~10s after start, or standby replica whose
+/// lease-gated reconciler never runs).
+type PlaceableSet = Option<Arc<PlacedTick>>;
 
 /// Receiver-side of the placeable-gate channel, held in [`super::Ctx`]
 /// so the `pool/jobs` reconciler can read it. ADR-023 §13b: Jobs spawn
@@ -210,25 +291,32 @@ type PlaceableSet = Option<Arc<HashSet<String>>>;
 pub struct PlaceableGate(tokio::sync::watch::Receiver<PlaceableSet>);
 
 impl PlaceableGate {
-    /// The last-published placeable set, or `None` while UNARMED (no
-    /// FFD tick has published yet — first ~10s after start, or a
-    /// standby replica whose lease-gated reconciler never runs). The
-    /// caller folds the unarmed posture itself: page cleared +
-    /// `queued` treated as unknown so `reap_excess_pending` stays
-    /// fail-closed (a standby replica would otherwise see `queued=0`
-    /// and reap the leader's Pending Jobs). Read-only accessor so the
-    /// page mutation stays on the demand view's own typed surface
-    /// (`IntentPage::retain_page` — round-10 R26).
+    /// The last-published FFD tick dispositions, or `None` while
+    /// UNARMED (no FFD tick has published yet — first ~10s after
+    /// start, or a standby replica whose lease-gated reconciler never
+    /// runs). The caller folds the unarmed posture itself: page
+    /// cleared + `queued` treated as unknown so `reap_excess_pending`
+    /// stays fail-closed (a standby replica would otherwise see
+    /// `queued=0` and reap the leader's Pending Jobs). Read-only
+    /// accessor so the page mutation stays on the demand view's own
+    /// typed surface (`IntentPage::retain_page` — round-10 R26); the
+    /// per-intent letters come from [`PlacedTick::disposition`].
     // r[impl ctrl.nodeclaim.placeable-gate+5]
-    pub fn snapshot(&self) -> Option<Arc<HashSet<String>>> {
+    pub fn snapshot(&self) -> Option<Arc<PlacedTick>> {
         self.0.borrow().clone()
     }
 
-    /// Test-only: gate seeded with `ids` (armed).
+    /// Test-only: gate seeded with placed-on-registered `ids` (armed,
+    /// nothing deferred).
     #[cfg(test)]
     pub fn from_ids<I: IntoIterator<Item = &'static str>>(ids: I) -> Self {
-        let set: HashSet<String> = ids.into_iter().map(str::to_owned).collect();
-        let (_tx, rx) = tokio::sync::watch::channel(Some(Arc::new(set)));
+        Self::from_tick(PlacedTick::for_test(ids, []))
+    }
+
+    /// Test-only: gate seeded with a full disposition tick (armed).
+    #[cfg(test)]
+    pub fn from_tick(tick: PlacedTick) -> Self {
+        let (_tx, rx) = tokio::sync::watch::channel(Some(Arc::new(tick)));
         Self(rx)
     }
 
@@ -1467,6 +1555,11 @@ impl NodeClaimPoolReconciler {
             &live,
             &self.sketches,
             bound,
+            // Round-10 merged_bug_012: Job-holding intents bypass the
+            // window (their sim cost is already committed — a live
+            // Job exists; deferring them mis-reads existing demand as
+            // remainder).
+            pod_snapshot.job_held_intents(),
             self.cfg.fuse_cache_bytes,
             window_cores,
             self.tick_counter,
@@ -1493,7 +1586,7 @@ impl NodeClaimPoolReconciler {
                  deferred to the next tick (typed, never dropped)"
             );
         }
-        let (placeable, unplaced) = (sim.placeable, sim.unplaced);
+        let (placeable, unplaced, deferred) = (sim.placeable, sim.unplaced, sim.deferred);
         // Schmitt-adjust `lead_time_q` from the per-cell EWMA of
         // `on_reg/(on_reg+on_inf)` — the warm-hit proxy. A cell whose
         // placements land mostly in-flight (low ratio) is
@@ -1520,20 +1613,19 @@ impl NodeClaimPoolReconciler {
         let prev_extras_for_reap = self.prev_extra_cells.clone();
         self.emit_tick_gauges(&live, &placeable, &unplaced, now);
         // r[impl ctrl.nodeclaim.placeable-gate+5]
-        // Publish `intent_id`s FFD-placed on a `Registered=True` node
-        // (`in_flight == false`). The `pool/jobs` reconciler retains
-        // only these — Jobs are NOT created for intents placed on
-        // in-flight claims (the pod would sit Pending until the claim
-        // registers; `cover_deficit` already provisioned for them, so
-        // the next tick after Registered picks them up). `send_replace`:
-        // dropped receivers (controller shutdown) are not an error.
-        let on_registered: HashSet<String> = placeable
-            .iter()
-            .filter(|(_, _, in_flight)| !in_flight)
-            .map(|(i, _, _)| i.intent_id.clone())
-            .collect();
+        // r[impl ctrl.pool.demand-completeness]
+        // Publish the FULL per-intent disposition tick (round-10
+        // merged_bug_012/R25): placed-on-registered (the spawn lane —
+        // Jobs are NOT created for intents placed on in-flight claims;
+        // the pod would sit Pending until the claim registers, and
+        // `cover_deficit` already provisioned for them), placed-in-
+        // flight, and window-DEFERRED (demand-visible to the
+        // `pool/jobs` reaps + counted by the consolidator below — the
+        // aggregate gauges above are metrics, the per-intent letters
+        // are the law's carrier). `send_replace`: dropped receivers
+        // (controller shutdown) are not an error.
         self.placeable_tx
-            .send_replace(Some(Arc::new(on_registered)));
+            .send_replace(Some(Arc::new(PlacedTick::from_sim(&placeable, &deferred))));
 
         // OA2: controller-side per-node wedge clustering — the only
         // hung-node signal (the scheduler's heartbeat-fed detector and
@@ -1713,6 +1805,7 @@ impl NodeClaimPoolReconciler {
             &pass_fence,
             &consolidate::ReapInputs {
                 placeable: &placeable,
+                deferred: &deferred,
                 all_cells: &all_cells,
                 prev_idle: &self.prev_idle,
                 cfg: &self.cfg,
@@ -1786,6 +1879,9 @@ impl NodeClaimPoolReconciler {
             &pass_fence,
             &consolidate::ReapInputs {
                 placeable: &[],
+                // Consolidate-only mode has no scheduler view, hence
+                // no deferred set either (same ⊥ posture as placeable).
+                deferred: &[],
                 all_cells: &all_cells,
                 prev_idle: &self.prev_idle,
                 cfg: &self.cfg,
