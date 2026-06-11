@@ -1407,7 +1407,7 @@
     {
       "path": "gc/drain.rs",
       "depth": 1,
-      "doc": "Drain task: consume `pending_s3_deletes`, call `ChunkBackend::delete_by_key`."
+      "doc": "Drain task: consume `pending_s3_deletes`, call `ChunkBackend::delete_by_keys`."
     },
     {
       "path": "gc/mark.rs",
