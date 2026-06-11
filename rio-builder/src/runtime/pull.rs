@@ -125,8 +125,13 @@ const _: () = assert!(
 /// place to edit):
 ///
 /// - SET by any post-send uncertainty: a timed-out pull, a post-send
-///   shutdown abandonment, or a post-send transport error
-///   ([`MintEvidence::latch_send`]).
+///   shutdown abandonment, a post-send transport error
+///   ([`MintEvidence::latch_send`]), or an answered-UNDECODABLE
+///   outcome — an unknown oneof variant from a newer/older server is
+///   an ANSWER whose content may be a mint (bug_089, the fourth
+///   letter; latched structurally by
+///   [`MintEvidence::witness_answer`], the only consumer of an
+///   answered pull).
 /// - CLEARED only by a LOOP-TERMINATING answer: a delivered
 ///   `Assignment` or `Gone`
 ///   ([`MintEvidence::clear_loop_terminating`]). `NotYetReady`
@@ -173,6 +178,60 @@ impl MintEvidence {
     fn may_exit_zero(&self) -> bool {
         !self.unconfirmed_send
     }
+
+    /// The ONE decode seam for an ANSWERED pull (bug_089): yields the
+    /// typed witness, and the latch decision is the CONSTRUCTOR'S
+    /// effect, not a per-arm call — so a latch omission at a new arm
+    /// is unwritable. The match below is exhaustive over the wire
+    /// alphabet: a new oneof variant fails compilation HERE, forcing
+    /// its latch decision and its witness arm in the same edit (the
+    /// confirm path types this state the same way —
+    /// `resolve_maybe_minted`'s None arm refuses exit 0).
+    ///
+    /// Latch effects per letter: Assignment/Gone CLEAR (loop-
+    /// terminating, authoritative for the whole send history);
+    /// NotYetReady PRESERVES (authoritative only about attempts held
+    /// at its answer time); Undecodable LATCHES (an answer whose
+    /// content may be a mint we cannot read).
+    fn witness_answer(
+        &mut self,
+        outcome: Option<pull_assignment_response::Outcome>,
+    ) -> DecodedAnswer {
+        match outcome {
+            Some(pull_assignment_response::Outcome::Assignment(a)) => {
+                self.clear_loop_terminating();
+                DecodedAnswer::Assignment(Box::new(a))
+            }
+            Some(pull_assignment_response::Outcome::Gone(_)) => {
+                self.clear_loop_terminating();
+                DecodedAnswer::Gone
+            }
+            Some(pull_assignment_response::Outcome::NotYetReady(nyr)) => {
+                DecodedAnswer::NotYetReady(nyr)
+            }
+            None => {
+                self.latch_send();
+                DecodedAnswer::Undecodable
+            }
+        }
+    }
+}
+
+/// The decoded-outcome witness (bug_089): what an ANSWERED pull
+/// resolved to, with the undecodable case a first-class letter.
+/// Mintable only through [`MintEvidence::witness_answer`], so holding
+/// a value proves the latch decision for it already happened.
+#[derive(Debug)]
+enum DecodedAnswer {
+    /// The dispatch payload — build it.
+    Assignment(Box<WorkAssignment>),
+    /// No longer wanted (fence-written ahead of the reply).
+    Gone,
+    /// Wanted but not ready; carries the pacing hint.
+    NotYetReady(rio_proto::types::NotYetReady),
+    /// Answered, but the oneof decoded to no known variant (version
+    /// skew): post-send uncertainty — the latch is already set.
+    Undecodable,
 }
 
 /// What the pull phase resolved to.
@@ -358,101 +417,109 @@ pub(super) async fn pull_until_resolved<T: PullTransport>(
         // a retryable timeout instead of pinning the pod, and race it
         // against SIGTERM so an in-flight pull yields to shutdown
         // (merged_bug_167's pull half).
-        let delay =
-            match bounded_effectful(shutdown, DEFAULT_GRPC_TIMEOUT, transport.pull(req)).await {
-                // Never polled: this request provably did nothing; the
-                // latch keeps whatever earlier attempts established.
-                EffectfulOutcome::ShutdownBeforeSend => {
-                    return PullPhaseOutcome::Shutdown {
-                        maybe_minted: !evidence.may_exit_zero(),
-                    };
+        let delay = match bounded_effectful(shutdown, DEFAULT_GRPC_TIMEOUT, transport.pull(req))
+            .await
+        {
+            // Never polled: this request provably did nothing; the
+            // latch keeps whatever earlier attempts established.
+            EffectfulOutcome::ShutdownBeforeSend => {
+                return PullPhaseOutcome::Shutdown {
+                    maybe_minted: !evidence.may_exit_zero(),
+                };
+            }
+            // Polled then abandoned: the request may be on the wire.
+            EffectfulOutcome::ShutdownAfterSend => {
+                evidence.latch_send();
+                return PullPhaseOutcome::Shutdown { maybe_minted: true };
+            }
+            EffectfulOutcome::TimedOut { after } => {
+                warn!(
+                    after_secs = after.as_secs(),
+                    "PullAssignment unanswered; retrying"
+                );
+                evidence.latch_send();
+                attempt = attempt.saturating_add(1);
+                RETRY_ENVELOPE.duration(attempt - 1)
+            }
+            // The answered seam: every Resolved(Ok) flows
+            // through the witness constructor — decode and latch
+            // decision are one effect (bug_089).
+            EffectfulOutcome::Resolved(Ok(resp)) => match evidence.witness_answer(resp.outcome) {
+                DecodedAnswer::Assignment(a) => {
+                    return PullPhaseOutcome::Assigned(a);
                 }
-                // Polled then abandoned: the request may be on the wire.
-                EffectfulOutcome::ShutdownAfterSend => {
-                    evidence.latch_send();
-                    return PullPhaseOutcome::Shutdown { maybe_minted: true };
+                DecodedAnswer::Gone => {
+                    return PullPhaseOutcome::Gone;
                 }
-                EffectfulOutcome::TimedOut { after } => {
+                DecodedAnswer::NotYetReady(nyr) => {
+                    // A NotYetReady answer is contact with the leader:
+                    // reset the unservable backoff curve. It does NOT
+                    // clear the wire-effect latch (merged_bug_083: the
+                    // answer is authoritative only about attempts held
+                    // at ITS answer time — an earlier abandoned send
+                    // may still mint; only a loop-terminating answer
+                    // or the confirm-only pull clears).
+                    attempt = 0;
+                    // Proto→sleep seam (merged_bug_156): mint
+                    // through the pacing constructor — the hint
+                    // is bounded by the domain ceiling BY
+                    // CONSTRUCTION, so a skewed producer cannot
+                    // park this loop past the idle exit.
+                    let suggested = rio_common::clamped::WireSecs::from_wire(u64::from(
+                        nyr.retry_after_seconds,
+                    ))
+                    .pacing(RETRY_AFTER_PACING_CEILING)
+                    .unwrap_or(DEFAULT_RETRY_AFTER);
+                    // r[impl builder.pull.idle-undroppable]
+                    // Errors and empty outcomes between answers are
+                    // structurally invisible to the clock — the
+                    // pair-discard API no longer exists, so the
+                    // armed pair survives to be credited (capped)
+                    // here.
+                    idle.on_answer(tokio::time::Instant::now(), suggested);
+                    if idle.idle_for() >= idle_timeout {
+                        return PullPhaseOutcome::IdleExit {
+                            maybe_minted: !evidence.may_exit_zero(),
+                        };
+                    }
+                    RETRY_AFTER_JITTER.apply(suggested)
+                }
+                // An empty oneof from a newer/older server is an
+                // ANSWER whose content may be a mint we cannot
+                // read — the witness constructor already latched
+                // send-uncertainty (the fourth letter); retry
+                // like an unservable pull.
+                DecodedAnswer::Undecodable => {
                     warn!(
-                        after_secs = after.as_secs(),
-                        "PullAssignment unanswered; retrying"
+                        "PullAssignment answered with an undecodable outcome \
+                             (version skew?); retrying"
                     );
-                    evidence.latch_send();
                     attempt = attempt.saturating_add(1);
                     RETRY_ENVELOPE.duration(attempt - 1)
                 }
-                EffectfulOutcome::Resolved(Ok(resp)) => match resp.outcome {
-                    Some(pull_assignment_response::Outcome::Assignment(a)) => {
-                        evidence.clear_loop_terminating();
-                        return PullPhaseOutcome::Assigned(Box::new(a));
-                    }
-                    Some(pull_assignment_response::Outcome::Gone(_)) => {
-                        evidence.clear_loop_terminating();
-                        return PullPhaseOutcome::Gone;
-                    }
-                    Some(pull_assignment_response::Outcome::NotYetReady(nyr)) => {
-                        // A NotYetReady answer is contact with the leader:
-                        // reset the unservable backoff curve. It does NOT
-                        // clear the wire-effect latch (merged_bug_083: the
-                        // answer is authoritative only about attempts held
-                        // at ITS answer time — an earlier abandoned send
-                        // may still mint; only a loop-terminating answer
-                        // or the confirm-only pull clears).
-                        attempt = 0;
-                        // Proto→sleep seam (merged_bug_156): mint
-                        // through the pacing constructor — the hint
-                        // is bounded by the domain ceiling BY
-                        // CONSTRUCTION, so a skewed producer cannot
-                        // park this loop past the idle exit.
-                        let suggested = rio_common::clamped::WireSecs::from_wire(u64::from(
-                            nyr.retry_after_seconds,
-                        ))
-                        .pacing(RETRY_AFTER_PACING_CEILING)
-                        .unwrap_or(DEFAULT_RETRY_AFTER);
-                        // r[impl builder.pull.idle-undroppable]
-                        // Errors and empty outcomes between answers are
-                        // structurally invisible to the clock — the
-                        // pair-discard API no longer exists, so the
-                        // armed pair survives to be credited (capped)
-                        // here.
-                        idle.on_answer(tokio::time::Instant::now(), suggested);
-                        if idle.idle_for() >= idle_timeout {
-                            return PullPhaseOutcome::IdleExit {
-                                maybe_minted: !evidence.may_exit_zero(),
-                            };
-                        }
-                        RETRY_AFTER_JITTER.apply(suggested)
-                    }
-                    // Defensive: an empty oneof from a newer/older server is
-                    // not an answer — treat like an unservable pull.
-                    None => {
-                        warn!("PullAssignment returned an empty outcome; retrying");
-                        attempt = attempt.saturating_add(1);
-                        RETRY_ENVELOPE.duration(attempt - 1)
-                    }
-                },
-                EffectfulOutcome::Resolved(Err(status)) if is_fatal_rejection(status.code()) => {
-                    tracing::error!(code = ?status.code(), msg = status.message(),
+            },
+            EffectfulOutcome::Resolved(Err(status)) if is_fatal_rejection(status.code()) => {
+                tracing::error!(code = ?status.code(), msg = status.message(),
                     "PullAssignment permanently rejected; exiting instead of holding the node");
-                    // merged_bug_145: the rejection answered THIS
-                    // request; earlier abandoned sends keep their
-                    // wire-effect latch.
-                    return PullPhaseOutcome::Rejected {
-                        status,
-                        maybe_minted: !evidence.may_exit_zero(),
-                    };
-                }
-                EffectfulOutcome::Resolved(Err(status)) => {
-                    warn!(code = ?status.code(), msg = status.message(),
+                // merged_bug_145: the rejection answered THIS
+                // request; earlier abandoned sends keep their
+                // wire-effect latch.
+                return PullPhaseOutcome::Rejected {
+                    status,
+                    maybe_minted: !evidence.may_exit_zero(),
+                };
+            }
+            EffectfulOutcome::Resolved(Err(status)) => {
+                warn!(code = ?status.code(), msg = status.message(),
                     "PullAssignment unservable; retrying");
-                    // merged_bug_083 residual (1): a post-send transport
-                    // error is the same epistemic state as a timeout —
-                    // the request may have been processed.
-                    evidence.latch_send();
-                    attempt = attempt.saturating_add(1);
-                    RETRY_ENVELOPE.duration(attempt - 1)
-                }
-            };
+                // merged_bug_083 residual (1): a post-send transport
+                // error is the same epistemic state as a timeout —
+                // the request may have been processed.
+                evidence.latch_send();
+                attempt = attempt.saturating_add(1);
+                RETRY_ENVELOPE.duration(attempt - 1)
+            }
+        };
         // Sleep, but wake immediately on SIGTERM (nothing is running
         // yet — exiting promptly is strictly better than waiting out a
         // backoff under a deletion grace period).
@@ -1392,6 +1459,89 @@ mod tests {
             outcome,
             PullPhaseOutcome::Shutdown { maybe_minted: true }
         ));
+    }
+
+    /// W10-BK (bug_089): the FOURTH uncertainty letter. An ANSWERED
+    /// pull whose oneof decoded to None (an unknown variant from a
+    /// newer/older server) is post-send uncertainty — the scheduler
+    /// may have minted under the new variant. Pre-fix the None arm
+    /// was the unique post-send arm that never latched, so persistent
+    /// version skew + SIGTERM routed Shutdown{maybe_minted:false} →
+    /// exit 0 over a possibly-minted attempt — the exact evidence
+    /// resolve_maybe_minted's None arm refuses exit 0 for.
+    // r[verify builder.pull.exit-codes+1]
+    #[tokio::test(start_paused = true)]
+    async fn undecodable_answer_then_sigterm_is_maybe_minted() {
+        let mut t =
+            ScriptedTransport::new(vec![Ok(PullAssignmentResponse { outcome: None })], vec![]);
+        let shutdown = token();
+        let sd = shutdown.clone();
+        tokio::spawn(async move {
+            // Past several answered-undecodable responses, into a
+            // retry backoff.
+            tokio::time::sleep(Duration::from_secs(40)).await;
+            sd.cancel();
+        });
+        let outcome = pull_until_resolved(&mut t, "intent-skew", "tok", IDLE, &shutdown).await;
+        assert!(
+            matches!(outcome, PullPhaseOutcome::Shutdown { maybe_minted: true }),
+            "an answered-undecodable outcome is post-send uncertainty \
+             and must latch; got {outcome:?}"
+        );
+    }
+
+    /// W10-BK (the all-arms quantifier): the answered-seam product —
+    /// every decoded letter × every prior latch state, with the
+    /// expected latch effect per cell. The witness consumption below
+    /// is an EXHAUSTIVE match, so a new oneof variant cannot land
+    /// without (a) a `witness_answer` arm (its match over the wire
+    /// alphabet is exhaustive) and (b) a row here.
+    #[test]
+    fn answered_seam_latch_product_is_total() {
+        use pull_assignment_response::Outcome;
+        for pre_latched in [false, true] {
+            // (cell name, answer, expected latch AFTER the witness)
+            let cells: [(&str, Option<Outcome>, bool); 4] = [
+                (
+                    "assignment-clears",
+                    Some(Outcome::Assignment(WorkAssignment::default())),
+                    false,
+                ),
+                (
+                    "gone-clears",
+                    Some(Outcome::Gone(rio_proto::types::Gone {})),
+                    false,
+                ),
+                (
+                    "nyr-preserves",
+                    Some(Outcome::NotYetReady(rio_proto::types::NotYetReady {
+                        retry_after_seconds: 1,
+                    })),
+                    pre_latched,
+                ),
+                ("undecodable-latches", None, true),
+            ];
+            for (name, outcome, expect_latched) in cells {
+                let mut ev = MintEvidence::default();
+                if pre_latched {
+                    ev.latch_send();
+                }
+                let witness = ev.witness_answer(outcome);
+                assert_eq!(
+                    !ev.may_exit_zero(),
+                    expect_latched,
+                    "cell {name} (pre_latched={pre_latched}): latch effect wrong"
+                );
+                // Exhaustive consumption: a new witness letter fails
+                // compilation at this match.
+                match witness {
+                    DecodedAnswer::Assignment(_)
+                    | DecodedAnswer::Gone
+                    | DecodedAnswer::NotYetReady(_)
+                    | DecodedAnswer::Undecodable => {}
+                }
+            }
+        }
     }
 
     /// (3) shutdown before any pull was sent → provably nothing minted.
