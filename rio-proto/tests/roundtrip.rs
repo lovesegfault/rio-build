@@ -82,6 +82,11 @@ fn spawn_intents_proto_roundtrip() {
             },
         ],
         queued_by_system: [("x86_64-linux".into(), 4), ("aarch64-linux".into(), 1)].into(),
+        // Round-10 merged_bug_006: the forecast population class
+        // roundtrips beside its Ready sibling — distinct counts so a
+        // field-number collision between the two maps cannot decode
+        // cleanly.
+        forecast_by_system: [("aarch64-linux".into(), 2)].into(),
         ice_masked_cells: vec!["mid:spot".into()],
         // Round-9 B3: the truncation-honesty flag roundtrips (true is
         // the non-default value, so the wire actually carries it).

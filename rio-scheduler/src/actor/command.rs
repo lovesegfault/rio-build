@@ -897,6 +897,14 @@ pub struct SpawnIntentsSnapshot {
     /// The ComponentScaler reads this for its predictive signal
     /// (whatever Deployment a CR targets).
     pub queued_by_system: std::collections::HashMap<String, u64>,
+    /// Per-system breakdown of the FORECAST intents emitted in
+    /// `intents` (round-10 merged_bug_006: the second population
+    /// class of the demand aggregate — `queued_by_system` counts the
+    /// Ready class only; a demand bound sums BOTH typed classes).
+    /// Counted at the forecast emit site (post tenant-budget
+    /// admission), so the class covers exactly the forecast intents a
+    /// controller can hold Pending Jobs for.
+    pub forecast_by_system: std::collections::HashMap<String, u64>,
     /// `IceBackoff::masked_cells()` snapshot, formatted via
     /// [`crate::sla::config::cell_label`]. The controller's
     /// `cover_deficit` mask merges this with its own

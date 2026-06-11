@@ -547,6 +547,12 @@ impl DagActor {
     pub(crate) fn compute_spawn_intents(&self, req: &SpawnIntentsRequest) -> SpawnIntentsSnapshot {
         let mut intents = Vec::new();
         let mut queued_by_system: HashMap<String, u64> = HashMap::new();
+        // Round-10 merged_bug_006: the forecast population class,
+        // incremented at the forecast EMIT site below (the same
+        // chokepoint that pushes the intent), so a demand-bound
+        // consumer sums typed classes instead of trusting a prose
+        // superset claim across the crate boundary.
+        let mut forecast_by_system: HashMap<String, u64> = HashMap::new();
         let probe_gate = self.store_client.is_some();
         // ONE snapshot of the shared solve inputs for the whole poll —
         // every drv sees the SAME `(hw, cost, inputs_gen)`. Per-drv
@@ -1041,6 +1047,17 @@ impl DagActor {
                 if !passes_intent_filter(state, kind, req) {
                     continue;
                 }
+                // merged_bug_006: the forecast class increments where
+                // the intent is EMITTED (post budget admission AND
+                // post the merged_bug_099-relocated view filter — the
+                // debit above is population-wide; the emission, and
+                // with it this class, is what the requesting view can
+                // hold Pending Jobs for) — a budget-dropped or
+                // filtered intent spawns no Job for this view; the
+                // Ready class's pre-filter superset form is the
+                // `queued_by_system` increment above
+                // (equal-by-construction with ClusterSnapshot).
+                *forecast_by_system.entry(state.system.clone()).or_default() += 1;
                 intents.push((
                     state.sched.priority,
                     to_proto(drv_hash, state, &intent, false, eta),
@@ -1077,6 +1094,7 @@ impl DagActor {
         SpawnIntentsSnapshot {
             intents: intents.into_iter().map(|(_, i)| i).collect(),
             queued_by_system,
+            forecast_by_system,
             ice_masked_cells: self
                 .ice
                 .masked_cells()

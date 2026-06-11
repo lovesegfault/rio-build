@@ -82,6 +82,7 @@ map<string, HwDimCounts> sampled_count = 1;
 map<string, string> node_selector = 5;
 map<string, string> tokens = 1;
 map<string, uint32> queued_by_system = 11;
+map<string, uint64> forecast_by_system = 6;
 map<string, uint64> queued_by_system = 2;
 optional BindingSnapshot binding_snapshot = 6;
 optional ExecutorKind kind = 1;

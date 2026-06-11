@@ -308,6 +308,41 @@ two reads.
   design.
 ]
 
+#r("ctrl.pool.demand-completeness")[
+  The per-reconcile demand view is a PAGE of the scheduler's intent
+  stream, and absence from a page is not absence from demand. (1) The
+  producer MUST emit per-POPULATION-CLASS demand aggregates (Ready and
+  forecast as distinct typed classes) at the same chokepoint that emits
+  the intents, and a demand bound driving destructive reaping MUST sum
+  the typed classes --- never a single-class aggregate against a
+  mixed-class page. (2) Negative evidence (a membership/absence
+  judgment over the view) MUST be obtainable only through an accessor
+  that consumes the view's completeness witness; on an incomplete view
+  the only lawful absence verdict is "unknowable", and every
+  destructive absence-keyed arm (orphan-pending reap, excess reap)
+  MUST suspend or re-derive from a controller-local complete inventory
+  while the view is incomplete. (3) Consumers whose correctness
+  depends on stream TOTALITY or cross-window CONTINUITY (re-ack/re-arm
+  lanes, evidence-expiry clocks) are a third declared consumer class:
+  each member MUST either derive from a controller-local complete
+  inventory (e.g. the controller's own Job LIST) or suspend its
+  evidence-expiry while the view is incomplete; membership in the
+  class MUST recruit structurally (a typed page-scoped walk plus a
+  generated consumer census), never by doc filing. Per-held-element
+  walks remain lawful on any page exactly because their conclusions
+  are per-element; a per-element walk that quietly aggregates into an
+  absence judgment is class (2).
+]
+
+The wave-9 B3 window (limit 2048) made the page boundary real: a
+forecast-backed Pending Job whose intent rotated off the priority head
+was counted by neither the Ready aggregate nor the page, and the
+orphan/excess reaps read its absence as demand-gone (merged_bug_006,
+merged_bug_029); the re-ack lane and the streak touched-expiry filtered
+the page despite restart-totality/continuity contracts (merged_bug_049).
+The completeness witness already rode the wire (`truncated`); this rule
+makes consuming it structural rather than per-consumer diligence.
+
 #r("ctrl.pool.spawn-once")[
   Job identity is the deterministic name `job_name(pool, kind,
   intent_suffix(intent_id))` --- one intent maps to one Job name per Pool,

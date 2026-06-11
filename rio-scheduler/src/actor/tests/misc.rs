@@ -2472,6 +2472,63 @@ async fn forecast_budget_deterministic() {
     );
 }
 
+/// Round-10 merged_bug_006 (the producer law): the demand aggregate is
+/// PER POPULATION CLASS. `queued_by_system` counts the Ready class
+/// only (its increment sits in the Ready loop); the forecast pass
+/// increments `forecast_by_system` at the EMIT site — post tenant-
+/// budget admission — so the class covers exactly the forecast
+/// intents a controller can hold Pending Jobs for. A budget-dropped
+/// candidate spawns no Job and is counted by NEITHER class.
+///
+/// Population walked: 1 Ready + 2 admitted forecast + 1 budget-dropped
+/// forecast (cap=12: Ready debits 4, leaving 8 = 2×4-core slots).
+/// Asserts BOTH classes' counts AND the cross-check that the forecast
+/// class equals the emitted `ready=Some(false)` population — the
+/// boundary the merged_bug_006 reap bound undercounted.
+// r[verify ctrl.pool.demand-completeness]
+#[tokio::test]
+async fn forecast_aggregate_counts_emitted_class_per_system() {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_forecast(db.pool.clone(), 200.0, 12);
+
+    actor.test_inject_ready("r0", None, "x86_64-linux", false);
+    actor.test_inject_at("dep", "x86_64-linux", DerivationStatus::Running);
+    actor.test_set_running_eta("dep", 100.0, 70, 8);
+    for q in ["fa", "fb", "fc"] {
+        actor.test_inject_at(q, "x86_64-linux", DerivationStatus::Queued);
+        actor.test_inject_edge(q, "dep");
+    }
+
+    let snap = actor.compute_spawn_intents(&SpawnIntentsRequest::default());
+    let emitted_forecast = snap
+        .intents
+        .iter()
+        .filter(|i| i.ready == Some(false))
+        .count() as u64;
+    assert_eq!(
+        emitted_forecast, 2,
+        "budget 12−4=8 admits exactly 2×4-core forecast intents"
+    );
+    assert_eq!(
+        snap.queued_by_system.get("x86_64-linux").copied(),
+        Some(1),
+        "Ready class counts the Ready population only — forecast \
+         intents never inflate it"
+    );
+    assert_eq!(
+        snap.forecast_by_system.get("x86_64-linux").copied(),
+        Some(emitted_forecast),
+        "forecast class == the emitted ready=false population (the \
+         emit-site law; the budget-dropped candidate is uncounted)"
+    );
+    assert_eq!(
+        snap.forecast_by_system.len(),
+        1,
+        "no phantom systems in the forecast class"
+    );
+}
+
 /// `lead_time_seed` empty → `max_lead = 0` → forecast pass disabled.
 /// Deploys without `xtask k8s probe-boot` seeding stay on the v1.0
 /// Ready-only path.

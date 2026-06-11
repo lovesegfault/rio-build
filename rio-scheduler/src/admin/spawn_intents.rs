@@ -67,6 +67,11 @@ pub(super) async fn get_spawn_intents(
     let resp = GetSpawnIntentsResponse {
         intents,
         queued_by_system: snap.queued_by_system,
+        // Round-10 merged_bug_006: the forecast population class —
+        // full-population like its Ready sibling (A-2: the demand
+        // record is the demand truth; the window cuts `intents`,
+        // never the aggregates).
+        forecast_by_system: snap.forecast_by_system,
         ice_masked_cells: snap.ice_masked_cells,
         truncated,
     };

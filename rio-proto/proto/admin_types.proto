@@ -703,6 +703,22 @@ message GetSpawnIntentsResponse {
   // round-9 S4 work). Old servers never set it (proto3 default
   // false ⇒ "nothing was truncated", which is also true there).
   bool truncated = 5;
+  // Round-10 (merged_bug_006): per-system breakdown of the FORECAST
+  // intents emitted in `intents` (§13b: `ready=false`, deps within
+  // the lead horizon, post tenant-budget admission) — the second
+  // POPULATION CLASS of the demand aggregate. `queued_by_system`
+  // (field 2) counts Ready-class demand ONLY (its increment sits in
+  // the Ready loop, equal by construction with
+  // `ClusterStatus.queued_by_system`); forecast intents enter the
+  // same truncatable `intents` vector but were counted by NEITHER
+  // aggregate, so a reap bound summing "the aggregate" undercounted
+  // forecast-backed demand and deleted still-wanted Pending Jobs.
+  // A demand bound MUST sum both typed classes. Additive,
+  // read-side-first (Q6): old servers never set it — absent reads as
+  // an empty map, i.e. the pre-§13b "no forecast class" legacy
+  // semantics, which is also true there (their forecast intents were
+  // never counted; consumers keep the ready-only bound they had).
+  map<string, uint64> forecast_by_system = 6;
 }
 
 // Controller → scheduler ack: "I created Jobs for these intents".
