@@ -148,6 +148,101 @@ fn running_dep_eta(dep: &crate::state::DerivationState, now: std::time::Instant)
     Some((t - elapsed).max(0.0))
 }
 
+/// §13b substitution-face ETA prior (seconds): the typed contribution
+/// of a dependency whose unresolved materialization job is
+/// store-ACTIVE (live_049 lever 3 / WO-S7-R F1 — the "blind
+/// materialization minute": pre-F1, a substituting dep yielded NO
+/// forecast contribution, so a warm-cache run's parents emitted their
+/// first intents only at readiness and paid the full node-provisioning
+/// lead cold).
+///
+/// R17 envelope: VIOLABLE + testable, derivation recorded. Value = the
+/// live_049 blind-minute evidence scale (substitutions complete on the
+/// ~60 s scale; the binding pre-fix error was the EXCLUSION — an
+/// effectively infinite eta — never estimate precision). STATIC by
+/// design: the scheduler retains neither claim timestamps nor byte
+/// progress for materialization jobs (`ReportMaterializationProgress`
+/// is a display-only relay through the event ring —
+/// `handle_substitute_progress` — not retained state), so the prior
+/// cannot decay in-flight. Error model — the same `eta_error`
+/// absorption family as [`running_dep_eta`]'s ref↔wall skew:
+///
+/// - short substitutions: over-estimate bounded by the prior; the
+///   forecast intent still emits the whole blind window earlier than
+///   pre-fix (never later), and the controller's per-cell `a_open`
+///   re-gates every poll;
+/// - wedged claims (live_055(a)): under-estimate, self-healing — the
+///   intent re-emits each poll until the job resolves or parks (park ⇒
+///   the typed pacing exclusion takes over);
+/// - cells with `lead_time < prior`: the lead-horizon gate keeps
+///   dropping the intent (correct by the gate law); the un-recovered
+///   notice is bounded by that cell's own lead. In-flight decay needs
+///   progress retention — a cross-plane change deliberately not taken
+///   this round (see the §13b lead-time comment in
+///   [`DagActor::compute_spawn_intents`]).
+pub(super) const SUBSTITUTING_DEP_ETA_PRIOR_SECS: f64 = 60.0;
+
+/// Which active face contributed the substitution prior — provenance
+/// for tests/diagnostics. The wire carries only `eta_seconds`
+/// (`SpawnIntent` is unchanged); the controller's §13c consumption is
+/// source-agnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SubstActiveFace {
+    /// A store replica holds the claim (fetch executing).
+    Claimed,
+    /// Unclaimed but admittable right now: the next worker beat
+    /// (~1 s poll, ≤1.2 s jittered — `LISTING_STEAL_HORIZON`'s
+    /// calibration note) claims it; claim latency is noise against
+    /// the prior.
+    ClaimableNow,
+}
+
+/// Why a pacing job blocks forecastability — the typed exclusion's
+/// provenance axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SubstPacingFace {
+    /// Durable park backoff (scale: minutes — at/above lead horizons).
+    Parked,
+    /// View-only transient deferral (≤300 s, uncharged 429/raced —
+    /// `RETRY_LATER_MAX_DEFER_SECS`).
+    Deferred,
+}
+
+/// live_049 lever 3 (WO-S7-R F1): the TOTAL typed disposition of a
+/// dependency's materialization job for the §13b forecast dep walk —
+/// the substitution face's sibling alphabet to [`CellEmission`] (R21:
+/// the dep-admission chokepoint's terminal dispositions are typed and
+/// censused; the pacing drop joins the censused
+/// `rio_scheduler_sla_forecast_dropped_total{reason}` value set).
+///
+/// Deliberately NOT a `CellEmission` arm: the dep eta is poll-time
+/// data and `solve_intent_for`'s emission is memoized per `inputs_gen`
+/// (hw+cost only) — an eta embedded in the emission alphabet would
+/// freeze in the memo exactly like the merged_bug_002 overlay class.
+/// Poll-time facts attach ABOVE the memo, where the dep walk computes.
+///
+/// Derived from the one armament source (`claimability`, bug_170) plus
+/// the view-hydration axis; consumed by exactly one fold (the dep
+/// walk) with zero wildcard arms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SubstDepEta {
+    /// Store-active job: the dep resolves on the store plane within
+    /// [`SUBSTITUTING_DEP_ETA_PRIOR_SECS`] — contribute the typed
+    /// prior.
+    Active(SubstActiveFace),
+    /// Pacing job (parked/deferred): not active store work within any
+    /// lead horizon — the parent is not forecastable through this dep;
+    /// the drop is typed + counted (`reason="substituting_pacing"`).
+    Pacing(SubstPacingFace),
+    /// No unresolved job entry for this dep.
+    NoJob,
+    /// Job view unhydrated (post-failover recovery window): job
+    /// knowledge unavailable — fail closed to the pre-F1 status
+    /// disposition, uncounted (counting would assert job knowledge
+    /// this arm exists to deny having).
+    NoView,
+}
+
 impl DagActor {
     /// Dispatch a read-only [`AdminQuery`].
     pub(super) fn handle_admin(&self, q: AdminQuery) {
@@ -263,6 +358,34 @@ impl DagActor {
             ReadyClass::ParkedPacing
         } else {
             ReadyClass::Queued
+        }
+    }
+
+    /// live_049 lever 3 (F1): classify a dependency's materialization
+    /// job for the §13b forecast dep walk. One armament source —
+    /// `JobViewEntry::claimability` (bug_170) — so this cannot
+    /// disagree with pull admission / the KEDA gauge / the listing
+    /// about what "active" means; the only added axis is view
+    /// hydration (fail-closed [`SubstDepEta::NoView`], the
+    /// `has_pending_unclaimed_job` posture). Total over
+    /// `Option<view> × Option<entry> × Claimability` — zero wildcard
+    /// arms.
+    // r[impl sched.sla.forecast.substituting-dep-eta]
+    pub(super) fn subst_dep_eta(&self, drv_hash: &str, now: std::time::Instant) -> SubstDepEta {
+        use super::materialize::Claimability;
+        match self.materialization_jobs.hydrated() {
+            None => SubstDepEta::NoView,
+            Some(view) => match view.get(drv_hash) {
+                None => SubstDepEta::NoJob,
+                Some(entry) => match entry.claimability(now) {
+                    Claimability::Claimed => SubstDepEta::Active(SubstActiveFace::Claimed),
+                    Claimability::ClaimableNow => {
+                        SubstDepEta::Active(SubstActiveFace::ClaimableNow)
+                    }
+                    Claimability::Parked => SubstDepEta::Pacing(SubstPacingFace::Parked),
+                    Claimability::Deferred => SubstDepEta::Pacing(SubstPacingFace::Deferred),
+                },
+            },
         }
     }
 
@@ -509,7 +632,12 @@ impl DagActor {
             // are not builder demand on either surface). Retires the
             // CE-59 spawn-intent churn class as a side effect. Claimed
             // jobs' nodes are Assigned/Running and already excluded by
-            // the status check above.
+            // the status check above. The node itself is never builder
+            // demand while its job is unresolved — but its PARENTS
+            // are: the §13b forecast pass below contributes the typed
+            // substitution prior for deps in exactly this class (F1,
+            // `subst_dep_eta`), so the exclusion here no longer makes
+            // the dependents invisible to provisioning.
             match self.classify_ready_node(drv_hash, spawn_now) {
                 ReadyClass::Substituting | ReadyClass::ParkedPacing => continue,
                 ReadyClass::Queued => {}
@@ -633,6 +761,17 @@ impl DagActor {
         // the gate; controller filters on `ready` regardless).
         // (r34 merged_bug_006)
         //
+        // F1 (WO-S7-R, round-9) re-records that absence as a DECIDED
+        // non-goal, not an oversight: the substituting-dep prior
+        // (`SUBSTITUTING_DEP_ETA_PRIOR_SECS`) rides the SAME seed-
+        // based gates, and the channel was evaluated and not taken —
+        // the F1 invariant (active job ⇒ typed contribution) is
+        // independent of the gate's rhs source, while the field would
+        // be a fifth wire change whose producer is controller-side
+        // code outside this round's plane. The seed approximation's
+        // honesty caveat above remains the operative statement for
+        // BOTH eta sources.
+        //
         // r33 bug_007 §Granularity-coupling: `max_lead` is the GLOBAL
         // max — it gates the whole pass on/off. The per-intent
         // admission gate is `max_lead_for(system, features)` (pre-
@@ -673,11 +812,55 @@ impl DagActor {
                     continue;
                 }
                 // 1-layer check: every incomplete dep is Assigned|
-                // Running with a fitted-curve ETA. Any Queued/Ready/
-                // Created/unfitted dep → not
+                // Running with a fitted-curve ETA, OR substitution-
+                // active with the typed prior (F1 below). Any other
+                // Queued/Ready/Created/unfitted dep → not
                 // forecastable. `had_incomplete` guards the
                 // (degenerate) all-deps-satisfied case — that drv
                 // belongs to the Ready loop, not here.
+                //
+                // r[impl sched.sla.forecast.substituting-dep-eta]
+                // F1 (live_049 lever 3 / WO-S7-R): a dep whose
+                // unresolved materialization job is store-ACTIVE
+                // (claimed, or claimable on the next worker beat)
+                // resolves on the STORE plane within the substitution
+                // prior — it contributes
+                // `SUBSTITUTING_DEP_ETA_PRIOR_SECS` instead of the
+                // pre-F1 exclusion (the blind materialization minute:
+                // warm-cache parents emitted nothing until readiness,
+                // paying the full node-provisioning lead cold). The
+                // contribution is JOB-grounded, not layer-propagated:
+                // the one-layer law's σ_resid-compounding argument
+                // does not apply — substitution resolves the dep
+                // directly, independent of the dep's own subtree, so
+                // a Queued dep with an active job contributes the
+                // same prior (and stays one fold, no recursion).
+                // Disposition law per dep (total over status × job):
+                //   Completed|Skipped            → satisfied;
+                //   Running|Assigned + Claimed   → the prior (a held
+                //     claim IS the executing resolution path; cache
+                //     hits never builder-dispatched have no fitted
+                //     curve at all — pull.rs `DispatchShape::Unsized`
+                //     stamps no `last_intent` — and a leftover curve
+                //     from a pre-substitution dispatch is stale);
+                //   Running|Assigned + other     → the fitted curve
+                //     (an UNCLAIMED job never displaces a live build
+                //     attempt's progress-grounded estimate; pacing
+                //     does not block a live attempt — the PD-20
+                //     park→re-evaluation→from-source family);
+                //   Queued|Ready + Active        → the prior;
+                //   Queued|Ready + Pacing        → typed counted drop
+                //     (park scale is minutes, deferral ≤300 s — not
+                //     active store work within any lead horizon);
+                //   Queued|Ready + NoJob|NoView  → not forecastable
+                //     (the pre-F1 shape; NoView is the fail-closed
+                //     recovery window, uncounted — counting would
+                //     assert job knowledge the arm exists to deny);
+                //   terminal/pre-merge statuses  → not forecastable
+                //     regardless of job state (a Failed/Poisoned/
+                //     Cancelled dep is a dead end, not progressing
+                //     work; Created precedes the materialization
+                //     plane's service surface).
                 let mut eta = 0.0f64;
                 let mut had_incomplete = false;
                 for dep_hash in self.dag.get_children(drv_hash) {
@@ -688,12 +871,46 @@ impl DagActor {
                         DerivationStatus::Completed | DerivationStatus::Skipped => {}
                         DerivationStatus::Running | DerivationStatus::Assigned => {
                             had_incomplete = true;
-                            let Some(d) = running_dep_eta(dep, now) else {
-                                continue 'q;
-                            };
-                            eta = eta.max(d);
+                            match self.subst_dep_eta(&dep_hash, now) {
+                                SubstDepEta::Active(SubstActiveFace::Claimed) => {
+                                    eta = eta.max(SUBSTITUTING_DEP_ETA_PRIOR_SECS);
+                                }
+                                SubstDepEta::Active(SubstActiveFace::ClaimableNow)
+                                | SubstDepEta::Pacing(_)
+                                | SubstDepEta::NoJob
+                                | SubstDepEta::NoView => {
+                                    let Some(d) = running_dep_eta(dep, now) else {
+                                        continue 'q;
+                                    };
+                                    eta = eta.max(d);
+                                }
+                            }
                         }
-                        _ => continue 'q,
+                        DerivationStatus::Queued | DerivationStatus::Ready => {
+                            match self.subst_dep_eta(&dep_hash, now) {
+                                SubstDepEta::Active(_) => {
+                                    had_incomplete = true;
+                                    eta = eta.max(SUBSTITUTING_DEP_ETA_PRIOR_SECS);
+                                }
+                                SubstDepEta::Pacing(_) => {
+                                    if forecast_dropped_first(self, drv_hash, "substituting_pacing")
+                                    {
+                                        ::metrics::counter!(
+                                            "rio_scheduler_sla_forecast_dropped_total",
+                                            "reason" => "substituting_pacing",
+                                        )
+                                        .increment(1);
+                                    }
+                                    continue 'q;
+                                }
+                                SubstDepEta::NoJob | SubstDepEta::NoView => continue 'q,
+                            }
+                        }
+                        DerivationStatus::Created
+                        | DerivationStatus::Failed
+                        | DerivationStatus::Poisoned
+                        | DerivationStatus::DependencyFailed
+                        | DerivationStatus::Cancelled => continue 'q,
                     }
                 }
                 if !had_incomplete {

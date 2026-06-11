@@ -1814,6 +1814,519 @@ async fn eta_is_remaining_not_total() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// §13b substitution face (F1 / live_049 lever 3 / WO-S7-R)
+// ---------------------------------------------------------------------------
+
+/// **W9-BU (the blind-minute inverse).** A Queued drv whose dep is
+/// Ready with a store-ACTIVE (claimable-now) materialization job emits
+/// a FORECAST intent carrying the typed substitution prior — the exact
+/// population the pre-F1 exclusion silently dropped (dep status Ready
+/// → the dep walk killed the parent; the parent's first intent waited
+/// for readiness and paid the full node-provisioning lead cold).
+///
+/// Pre-fix: RED — `warm` emits nothing.
+// r[verify sched.sla.forecast.substituting-dep-eta]
+#[tokio::test]
+async fn forecast_substituting_dep_contributes_typed_eta() {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_forecast(db.pool.clone(), 200.0, 2_000);
+
+    // dep(Ready, unclaimed claimable job) ← warm(Queued).
+    actor.test_inject_at("dep", "x86_64-linux", DerivationStatus::Ready);
+    actor.test_inject_at("warm", "x86_64-linux", DerivationStatus::Queued);
+    actor.test_inject_edge("warm", "dep");
+    actor.materialization_jobs.insert(
+        "dep".into(),
+        crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+    );
+
+    let snap = actor.compute_spawn_intents(&SpawnIntentsRequest::default());
+    let warm = snap
+        .intents
+        .iter()
+        .find(|i| i.intent_id == "warm")
+        .expect("dep has an ACTIVE materialization job → warm is forecastable");
+    assert_eq!(
+        warm.eta_seconds,
+        crate::actor::snapshot::SUBSTITUTING_DEP_ETA_PRIOR_SECS,
+        "the contribution is the typed prior, exact (no elapsed decay \
+         exists — the scheduler retains no claim timestamps)"
+    );
+    assert_eq!(warm.ready, Some(false), "forecast ⇒ ready=false");
+    // The dep itself stays out of BOTH passes (PD-7: substituting
+    // work is never builder demand).
+    assert!(
+        !snap.intents.iter().any(|i| i.intent_id == "dep"),
+        "the substituting dep itself is never an intent"
+    );
+}
+
+/// **W9-BU, claimed face.** A dep under a HELD materialization claim
+/// is Assigned/Running with NO fitted curve (cache hits are never
+/// builder-dispatched — pull.rs `DispatchShape::Unsized` stamps no
+/// `last_intent`), so pre-F1 `running_dep_eta` returned `None` and the
+/// parent was killed. Post-F1 the held claim contributes the prior.
+/// And when a STALE curve exists (a pre-substitution dispatch), the
+/// prior DISPLACES it: the claim is the executing resolution path.
+///
+/// Pre-fix: RED — `p1` emits nothing; `p2` is lead_horizon-dropped on
+/// the stale 500 s curve.
+// r[verify sched.sla.forecast.substituting-dep-eta]
+#[tokio::test]
+async fn forecast_substituting_claimed_dep_uses_prior_not_stale_curve() {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_forecast(db.pool.clone(), 200.0, 2_000);
+
+    // d1(Assigned, held claim, no curve) ← p1(Queued).
+    actor.test_inject_at("d1", "x86_64-linux", DerivationStatus::Assigned);
+    actor.test_inject_at("p1", "x86_64-linux", DerivationStatus::Queued);
+    actor.test_inject_edge("p1", "d1");
+    actor.materialization_jobs.insert(
+        "d1".into(),
+        crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+    );
+    actor
+        .materialization_jobs
+        .get_mut("d1")
+        .unwrap()
+        .mint_claim(crate::state::ExecutorId::from("store-0-w0"));
+
+    // d2(Running, held claim, STALE curve eta=500 ≥ lead=200) ← p2.
+    actor.test_inject_at("d2", "x86_64-linux", DerivationStatus::Running);
+    actor.test_inject_at("p2", "x86_64-linux", DerivationStatus::Queued);
+    actor.test_inject_edge("p2", "d2");
+    actor.test_set_running_eta("d2", 600.0, 100, 4); // curve eta = 500
+    actor.materialization_jobs.insert(
+        "d2".into(),
+        crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+    );
+    actor
+        .materialization_jobs
+        .get_mut("d2")
+        .unwrap()
+        .mint_claim(crate::state::ExecutorId::from("store-0-w1"));
+
+    let snap = actor.compute_spawn_intents(&SpawnIntentsRequest::default());
+    let by_id: std::collections::HashMap<_, _> = snap
+        .intents
+        .iter()
+        .map(|i| (i.intent_id.as_str(), i))
+        .collect();
+    let p1 = by_id
+        .get("p1")
+        .expect("held claim, no curve → prior contributes (pre-F1: killed)");
+    assert_eq!(
+        p1.eta_seconds,
+        crate::actor::snapshot::SUBSTITUTING_DEP_ETA_PRIOR_SECS
+    );
+    let p2 = by_id.get("p2").expect(
+        "held claim DISPLACES the stale build curve (500 s ≥ lead would \
+         have lead_horizon-dropped p2); the substitution prior governs",
+    );
+    assert_eq!(
+        p2.eta_seconds,
+        crate::actor::snapshot::SUBSTITUTING_DEP_ETA_PRIOR_SECS
+    );
+}
+
+/// An UNCLAIMED job never displaces a live build attempt: a Running
+/// dep with a fitted curve AND a claimable (unclaimed) job keeps the
+/// progress-grounded curve — the job is the opportunistic sibling,
+/// the build is the executing path (PD-20 family).
+// r[verify sched.sla.forecast.substituting-dep-eta]
+#[tokio::test]
+async fn forecast_substituting_unclaimed_job_never_displaces_live_build() {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_forecast(db.pool.clone(), 200.0, 2_000);
+
+    // dep(Running, curve eta=30, unclaimed claimable job) ← par.
+    actor.test_inject_at("dep", "x86_64-linux", DerivationStatus::Running);
+    actor.test_inject_at("par", "x86_64-linux", DerivationStatus::Queued);
+    actor.test_inject_edge("par", "dep");
+    actor.test_set_running_eta("dep", 100.0, 70, 4); // curve eta = 30
+    actor.materialization_jobs.insert(
+        "dep".into(),
+        crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+    );
+
+    let snap = actor.compute_spawn_intents(&SpawnIntentsRequest::default());
+    let par = snap
+        .intents
+        .iter()
+        .find(|i| i.intent_id == "par")
+        .expect("live build attempt forecasts as before");
+    assert!(
+        (par.eta_seconds - 30.0).abs() < 2.0,
+        "the curve (30 s) governs, not the prior ({} s); got {}",
+        crate::actor::snapshot::SUBSTITUTING_DEP_ETA_PRIOR_SECS,
+        par.eta_seconds
+    );
+}
+
+/// **Pacing is a typed, counted exclusion.** A parked or deferred job
+/// is not active store work within any lead horizon — the parent is
+/// not forecastable, and the drop joins the censused
+/// `forecast_dropped_total{reason}` alphabet (debounced once per
+/// `(drv, reason)`), instead of vanishing into the silent status kill.
+///
+/// Pre-fix: RED — no `substituting_pacing` letter exists.
+// r[verify sched.sla.forecast.substituting-dep-eta]
+#[tokio::test]
+async fn forecast_substituting_pacing_dep_drops_typed() {
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_forecast(db.pool.clone(), 200.0, 2_000);
+
+    let future = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    // d-park(Ready, parked job) ← p-park(Queued).
+    actor.test_inject_at("d-park", "x86_64-linux", DerivationStatus::Ready);
+    actor.test_inject_at("p-park", "x86_64-linux", DerivationStatus::Queued);
+    actor.test_inject_edge("p-park", "d-park");
+    actor.materialization_jobs.insert(
+        "d-park".into(),
+        crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+    );
+    actor
+        .materialization_jobs
+        .get_mut("d-park")
+        .unwrap()
+        .test_set_parked_until(Some(future));
+    // d-defer(Ready, deferred job) ← p-defer(Queued).
+    actor.test_inject_at("d-defer", "x86_64-linux", DerivationStatus::Ready);
+    actor.test_inject_at("p-defer", "x86_64-linux", DerivationStatus::Queued);
+    actor.test_inject_edge("p-defer", "d-defer");
+    actor.materialization_jobs.insert(
+        "d-defer".into(),
+        crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+    );
+    actor
+        .materialization_jobs
+        .get_mut("d-defer")
+        .unwrap()
+        .test_set_defer_until(Some(future));
+
+    let rec = DebuggingRecorder::new();
+    let snapr = rec.snapshotter();
+    let (s1, s2) = {
+        let _g = metrics::set_default_local_recorder(&rec);
+        let s1 = actor.compute_spawn_intents(&SpawnIntentsRequest::default());
+        // Second poll: the per-(drv, reason) debounce holds — no
+        // double count (hazard ppppp: snapshot taken ONCE below).
+        let s2 = actor.compute_spawn_intents(&SpawnIntentsRequest::default());
+        (s1, s2)
+    };
+    for snap in [&s1, &s2] {
+        assert!(
+            !snap
+                .intents
+                .iter()
+                .any(|i| i.intent_id == "p-park" || i.intent_id == "p-defer"),
+            "pacing (parked/deferred) deps do not contribute — the \
+             parent is not forecastable"
+        );
+    }
+    let dropped = crate::sla::metrics::counter_map_by(
+        &snapr,
+        "rio_scheduler_sla_forecast_dropped_total",
+        Some("reason"),
+    );
+    assert_eq!(
+        dropped.get("substituting_pacing"),
+        Some(&2),
+        "one debounced drop per parent (p-park + p-defer), NOT per \
+         poll; got {dropped:?}"
+    );
+}
+
+/// **W9-BW (the gate inequality, structural).** The substituting-dep
+/// prior flows through the SAME pre/post-solve lead-horizon gates as
+/// running-dep etas: emitted forecast intents satisfy
+/// `eta < cell lead`; a cell whose lead is below the prior keeps
+/// dropping (typed, `lead_horizon`) — the prior never bypasses the
+/// gate law.
+// r[verify sched.sla.forecast.substituting-dep-eta]
+#[tokio::test]
+async fn forecast_substituting_prior_respects_lead_horizon() {
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    // lead 45 < prior 60 → the gate must drop.
+    let mut actor = bare_actor_forecast(db.pool.clone(), 45.0, 2_000);
+
+    actor.test_inject_at("dep", "x86_64-linux", DerivationStatus::Ready);
+    actor.test_inject_at("warm", "x86_64-linux", DerivationStatus::Queued);
+    actor.test_inject_edge("warm", "dep");
+    actor.materialization_jobs.insert(
+        "dep".into(),
+        crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+    );
+
+    let rec = DebuggingRecorder::new();
+    let snapr = rec.snapshotter();
+    let snap = {
+        let _g = metrics::set_default_local_recorder(&rec);
+        actor.compute_spawn_intents(&SpawnIntentsRequest::default())
+    };
+    assert!(
+        !snap.intents.iter().any(|i| i.intent_id == "warm"),
+        "prior (60) ≥ lead (45) → the lead-horizon gate drops the \
+         intent — the substitution face never bypasses the gate"
+    );
+    let dropped = crate::sla::metrics::counter_map_by(
+        &snapr,
+        "rio_scheduler_sla_forecast_dropped_total",
+        Some("reason"),
+    );
+    assert_eq!(
+        dropped.get("lead_horizon"),
+        Some(&1),
+        "the drop is the gate's own typed letter; got {dropped:?}"
+    );
+
+    // Inverse: lead 200 > prior 60 → emitted, eta < lead.
+    let mut actor2 = bare_actor_forecast(db.pool.clone(), 200.0, 2_000);
+    actor2.test_inject_at("dep", "x86_64-linux", DerivationStatus::Ready);
+    actor2.test_inject_at("warm", "x86_64-linux", DerivationStatus::Queued);
+    actor2.test_inject_edge("warm", "dep");
+    actor2.materialization_jobs.insert(
+        "dep".into(),
+        crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+    );
+    let snap2 = actor2.compute_spawn_intents(&SpawnIntentsRequest::default());
+    let warm = snap2
+        .intents
+        .iter()
+        .find(|i| i.intent_id == "warm")
+        .expect("prior within the horizon → emitted");
+    assert!(
+        warm.eta_seconds < 200.0,
+        "every emitted forecast intent satisfies eta < cell lead"
+    );
+}
+
+/// **The job-grounded carve-out of the one-layer law.** A Queued dep
+/// with an ACTIVE job contributes the prior — substitution resolves
+/// the dep directly, independent of its own subtree, so this is direct
+/// evidence, not the σ_resid-compounding layer propagation the
+/// one-layer cutoff forbids. A Queued dep WITHOUT a job still kills
+/// (the pre-F1 law, unchanged).
+// r[verify sched.sla.forecast.substituting-dep-eta]
+// r[verify sched.sla.forecast.one-layer]
+#[tokio::test]
+async fn forecast_substituting_queued_dep_job_grounded() {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_forecast(db.pool.clone(), 200.0, 2_000);
+
+    // dq(Queued, active job) ← pq(Queued): carve-out applies.
+    actor.test_inject_at("dq", "x86_64-linux", DerivationStatus::Queued);
+    actor.test_inject_at("pq", "x86_64-linux", DerivationStatus::Queued);
+    actor.test_inject_edge("pq", "dq");
+    actor.materialization_jobs.insert(
+        "dq".into(),
+        crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+    );
+    // dn(Queued, NO job) ← pn(Queued): the one-layer kill stands.
+    actor.test_inject_at("dn", "x86_64-linux", DerivationStatus::Queued);
+    actor.test_inject_at("pn", "x86_64-linux", DerivationStatus::Queued);
+    actor.test_inject_edge("pn", "dn");
+
+    let snap = actor.compute_spawn_intents(&SpawnIntentsRequest::default());
+    let by_id: std::collections::HashMap<_, _> = snap
+        .intents
+        .iter()
+        .map(|i| (i.intent_id.as_str(), i))
+        .collect();
+    assert!(
+        by_id.contains_key("pq"),
+        "Queued dep + active job → job-grounded contribution"
+    );
+    assert!(
+        !by_id.contains_key("pn"),
+        "Queued dep without a job → not forecastable (one-layer law)"
+    );
+    // dq itself is Queued with a pending job → its own intent is
+    // excluded by the parent-level PD-7 check, on both passes.
+    assert!(!by_id.contains_key("dq"));
+}
+
+/// Terminal dep statuses never contribute, job or no job: a
+/// Failed/Poisoned/Cancelled dep is a dead end, not progressing work —
+/// the parent is not forecastable regardless of the job's armament.
+// r[verify sched.sla.forecast.substituting-dep-eta]
+#[tokio::test]
+async fn forecast_substituting_terminal_dep_never_contributes() {
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_forecast(db.pool.clone(), 200.0, 2_000);
+
+    actor.test_inject_at("df", "x86_64-linux", DerivationStatus::Failed);
+    actor.test_inject_at("pf", "x86_64-linux", DerivationStatus::Queued);
+    actor.test_inject_edge("pf", "df");
+    actor.materialization_jobs.insert(
+        "df".into(),
+        crate::actor::materialize::JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+    );
+
+    let snap = actor.compute_spawn_intents(&SpawnIntentsRequest::default());
+    assert!(
+        !snap.intents.iter().any(|i| i.intent_id == "pf"),
+        "a Failed dep kills forecastability even with an active job"
+    );
+}
+
+/// **NoView fails closed, uncounted.** With the job view unhydrated
+/// (post-failover recovery window) job knowledge is unavailable: the
+/// dep walk falls back to the pre-F1 status disposition — a Ready dep
+/// kills the parent — and emits NO `substituting_pacing` count
+/// (counting would assert job knowledge the arm exists to deny
+/// having). Heals at the next successful recovery rebuild.
+// r[verify sched.sla.forecast.substituting-dep-eta]
+#[tokio::test]
+async fn forecast_substituting_no_view_fails_closed() {
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    use crate::actor::{DagActor, DagActorConfig, DagActorPlumbing};
+    use crate::sla::config::CapacityType;
+    let mut sla = test_sla_config();
+    sla.lead_time_seed
+        .insert(("test-hw".into(), CapacityType::Spot), 200.0);
+    sla.max_forecast_cores_per_tenant = 2_000;
+    let mut actor = DagActor::new(
+        crate::db::SchedulerDb::new(db.pool.clone()),
+        DagActorConfig {
+            sla,
+            ..Default::default()
+        },
+        DagActorPlumbing {
+            start_hydrated_job_view: false,
+            ..Default::default()
+        },
+    );
+
+    actor.test_inject_at("dep", "x86_64-linux", DerivationStatus::Ready);
+    actor.test_inject_at("warm", "x86_64-linux", DerivationStatus::Queued);
+    actor.test_inject_edge("warm", "dep");
+
+    let rec = DebuggingRecorder::new();
+    let snapr = rec.snapshotter();
+    let snap = {
+        let _g = metrics::set_default_local_recorder(&rec);
+        actor.compute_spawn_intents(&SpawnIntentsRequest::default())
+    };
+    assert!(
+        !snap.intents.iter().any(|i| i.intent_id == "warm"),
+        "unhydrated view → fail closed to the pre-F1 kill"
+    );
+    let dropped = crate::sla::metrics::counter_map_by(
+        &snapr,
+        "rio_scheduler_sla_forecast_dropped_total",
+        Some("reason"),
+    );
+    assert_eq!(
+        dropped.get("substituting_pacing"),
+        None,
+        "NoView is uncounted — no job knowledge is asserted; got {dropped:?}"
+    );
+}
+
+/// **W9-BV (disposition census).** The `SubstDepEta` mapping is total
+/// over the `Claimability` alphabet — the member list comes FROM the
+/// alphabet: `expected()` is a wildcard-free match, so a new
+/// `Claimability` variant breaks THIS function at compile time and
+/// forces the census row (R15: rustc exhaustiveness is the generator).
+/// Plus the two non-entry axes: NoJob (hydrated, no entry) and NoView
+/// (unhydrated).
+// r[verify sched.sla.forecast.substituting-dep-eta]
+#[tokio::test]
+async fn subst_dep_eta_disposition_census() {
+    use crate::actor::materialize::{Claimability, JobViewEntry};
+    use crate::actor::snapshot::{SubstActiveFace, SubstDepEta, SubstPacingFace};
+
+    // The alphabet-derived mapping (compile-breaks on new variants).
+    fn expected(c: Claimability) -> SubstDepEta {
+        match c {
+            Claimability::Claimed => SubstDepEta::Active(SubstActiveFace::Claimed),
+            Claimability::ClaimableNow => SubstDepEta::Active(SubstActiveFace::ClaimableNow),
+            Claimability::Parked => SubstDepEta::Pacing(SubstPacingFace::Parked),
+            Claimability::Deferred => SubstDepEta::Pacing(SubstPacingFace::Deferred),
+        }
+    }
+
+    let db = TestDb::new(&MIGRATOR).await;
+    crate::actor::tests::seed_default_tenant(&db.pool).await;
+    let mut actor = bare_actor_forecast(db.pool.clone(), 200.0, 2_000);
+    let now = std::time::Instant::now();
+    let future = now + std::time::Duration::from_secs(600);
+
+    // One entry per armament state, constructed through the SAME
+    // production-shape mutators the armament tests use.
+    actor.test_inject_at("j-claimable", "x86_64-linux", DerivationStatus::Ready);
+    actor.materialization_jobs.insert(
+        "j-claimable".into(),
+        JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+    );
+    actor.test_inject_at("j-claimed", "x86_64-linux", DerivationStatus::Ready);
+    actor.materialization_jobs.insert(
+        "j-claimed".into(),
+        JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+    );
+    actor
+        .materialization_jobs
+        .get_mut("j-claimed")
+        .unwrap()
+        .mint_claim(crate::state::ExecutorId::from("store-0-w0"));
+    actor.test_inject_at("j-parked", "x86_64-linux", DerivationStatus::Ready);
+    actor.materialization_jobs.insert(
+        "j-parked".into(),
+        JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+    );
+    actor
+        .materialization_jobs
+        .get_mut("j-parked")
+        .unwrap()
+        .test_set_parked_until(Some(future));
+    actor.test_inject_at("j-deferred", "x86_64-linux", DerivationStatus::Ready);
+    actor.materialization_jobs.insert(
+        "j-deferred".into(),
+        JobViewEntry::new_unclaimed(Uuid::new_v4(), None),
+    );
+    actor
+        .materialization_jobs
+        .get_mut("j-deferred")
+        .unwrap()
+        .test_set_defer_until(Some(future));
+
+    for drv in ["j-claimable", "j-claimed", "j-parked", "j-deferred"] {
+        let armament = actor
+            .materialization_jobs
+            .get(drv)
+            .unwrap()
+            .claimability(now);
+        assert_eq!(
+            actor.subst_dep_eta(drv, now),
+            expected(armament),
+            "{drv}: the disposition derives from the one armament \
+             source (bug_170) through the alphabet mapping"
+        );
+    }
+    // The two non-entry axes.
+    assert_eq!(
+        actor.subst_dep_eta("no-such-job", now),
+        SubstDepEta::NoJob,
+        "hydrated view, no entry → NoJob"
+    );
+}
+
 /// §Threat-model gap (d): `max_forecast_cores_per_tenant` debited by
 /// Ready cores BEFORE forecast intents are admitted. A tenant whose
 /// Ready frontier already consumes ≥ the cap emits zero forecast

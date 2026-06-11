@@ -150,7 +150,8 @@ pub fn describe_all() {
         "§13b: forecast-pass intent dropped before emit (unique drop \
          events — debounced once per `(drv_hash, reason)` per LRU \
          residency, r34 bug_018). Labeled \
-         `reason` ∈ {lead_horizon, tenant_budget}. `lead_horizon`: ETA \
+         `reason` ∈ {lead_horizon, tenant_budget, substituting_pacing}. \
+         `lead_horizon`: ETA \
          exceeds the per-intent forecast horizon (`max(lead_time_seed)` \
          over routable hwClasses pre-solve, over `intent.hw_class_names` \
          post-solve) — the scheduler's seed-based approximation of the \
@@ -159,10 +160,17 @@ pub fn describe_all() {
          return channel to the scheduler, so when learned drifts above \
          the seed this over-counts); \
          `tenant_budget`: `max_forecast_cores_per_tenant` exhausted by \
-         higher-priority intents this poll. Sustained `lead_horizon` ⇒ \
+         higher-priority intents this poll; \
+         `substituting_pacing`: a dep's materialization job is parked/\
+         deferred (F1 — the substitution prior contributes only for \
+         store-ACTIVE jobs; pacing is not active work within any lead \
+         horizon). Sustained `lead_horizon` ⇒ \
          deps complete far ahead of any seed lead (saved work) OR a \
          routable class's `lead_time_seed` is missing. Sustained \
-         `tenant_budget` ⇒ Ready frontier already saturates the cap."
+         `tenant_budget` ⇒ Ready frontier already saturates the cap. \
+         Sustained `substituting_pacing` ⇒ store-side park/defer churn \
+         is blocking forecast warm-up — look at \
+         rio_scheduler_materialization_stalled."
     );
 }
 
@@ -434,7 +442,11 @@ pub const SLA_LABELED_METRICS: &[(&str, &str, &[&str])] = &[
     (
         "rio_scheduler_sla_forecast_dropped_total",
         "reason",
-        &["lead_horizon", "tenant_budget"],
+        // F1 (live_049 lever 3): `substituting_pacing` appended by the
+        // WO that mints the emit (snapshot.rs §13b dep walk) — the
+        // label-extension lane, zero new names (the hw_ladder row's
+        // precedent above).
+        &["lead_horizon", "tenant_budget", "substituting_pacing"],
     ),
     (
         "rio_scheduler_features_stripped_total",
