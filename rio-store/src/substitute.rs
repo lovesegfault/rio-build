@@ -1653,7 +1653,7 @@ fn narinfo_to_validated(
         .map(|d| format!("{store_dir}{d}"))
         .unwrap_or_default();
 
-    ValidatedPathInfo::try_from(PathInfo {
+    let mut info = ValidatedPathInfo::try_from(PathInfo {
         store_path: ni.store_path.clone(),
         store_path_hash: Vec::new(),
         deriver,
@@ -1665,7 +1665,56 @@ fn narinfo_to_validated(
         signatures: Vec::new(), // filled by sigs_for_mode
         content_address: ni.ca.clone().unwrap_or_default(),
     })
-    .map_err(|e| SubstituteError::NarInfo(format!("narinfo→PathInfo: {e}")))
+    .map_err(|e| SubstituteError::NarInfo(format!("narinfo→PathInfo: {e}")))?;
+
+    // r[impl store.substitute.ca-self-auth]
+    // The narinfo signature fingerprint covers only (store_path,
+    // nar_hash, nar_size, references) — `CA:` is NOT signed, so a
+    // compromised upstream can attach an arbitrary content-address
+    // claim to correctly-signed content. Persist the claim only if it
+    // is self-authenticating: the store path must recompute from it.
+    // The substitution itself proceeds either way; only the unverified
+    // claim is dropped.
+    if let Some(ca) = info.content_address.take() {
+        if ca_recomputes_to_path(&info.store_path, &info.references, &ca) {
+            info.content_address = Some(ca);
+        } else {
+            warn!(
+                store_path = %info.store_path.as_str(),
+                ca,
+                "narinfo CA claim does not recompute to the store path; \
+                 dropping unsigned field (possible upstream forgery)"
+            );
+        }
+    }
+    Ok(info)
+}
+
+/// Self-authentication check for an upstream `CA:` claim: parse the
+/// content-address string and recompute the store path it implies (Nix
+/// `makeFixedOutputPath` / `makeTextPath` over the narinfo references).
+/// Returns true iff that path equals `store_path` — the same check
+/// reference Nix performs in `ValidPathInfo::isContentAddressed`. A
+/// claim that fails to parse is treated as not authenticating.
+fn ca_recomputes_to_path(store_path: &StorePath, references: &[StorePath], ca: &str) -> bool {
+    use rio_nix::hash::NixHash;
+
+    let computed = if let Some(rest) = ca.strip_prefix("text:") {
+        NixHash::parse(rest)
+            .ok()
+            .and_then(|h| StorePath::make_text(store_path.name(), &h, references).ok())
+    } else if let Some(rest) = ca.strip_prefix("fixed:") {
+        let (recursive, rest) = match rest.strip_prefix("r:") {
+            Some(r) => (true, r),
+            None => (false, rest),
+        };
+        NixHash::parse(rest).ok().and_then(|h| {
+            StorePath::make_fixed_output(store_path.name(), &h, recursive, references).ok()
+        })
+    } else {
+        None
+    };
+    computed.is_some_and(|p| p == *store_path)
 }
 
 use sha2::Digest as _;
@@ -1699,7 +1748,27 @@ mod tests {
         nar_bytes: Vec<u8>,
         key_name: &str,
     ) -> FakeUpstream {
-        spawn_fake_upstream_with_delay(store_path, nar_bytes, key_name, Duration::ZERO).await
+        spawn_fake_upstream_with_delay(store_path, nar_bytes, key_name, Duration::ZERO, None).await
+    }
+
+    /// [`spawn_fake_upstream`] with a `CA:` line in the served narinfo.
+    /// The CA tests use this to attach content-address claims (forged or
+    /// genuine) — the field is NOT covered by the narinfo signature, so
+    /// the fixture's `Sig:` stays valid regardless of the CA value.
+    async fn spawn_fake_upstream_with_ca(
+        store_path: &str,
+        nar_bytes: Vec<u8>,
+        key_name: &str,
+        ca: &str,
+    ) -> FakeUpstream {
+        spawn_fake_upstream_with_delay(
+            store_path,
+            nar_bytes,
+            key_name,
+            Duration::ZERO,
+            Some(ca.to_owned()),
+        )
+        .await
     }
 
     /// [`spawn_fake_upstream`] with a `nar_delay` sleep injected before
@@ -1711,6 +1780,7 @@ mod tests {
         nar_bytes: Vec<u8>,
         key_name: &str,
         nar_delay: Duration,
+        ca: Option<String>,
     ) -> FakeUpstream {
         use axum::{Router, routing::get};
         use base64::Engine;
@@ -1735,6 +1805,7 @@ mod tests {
         let sp = StorePath::parse(store_path).unwrap();
         let hash_part = sp.hash_part();
 
+        let ca_line = ca.map(|c| format!("CA: {c}\n")).unwrap_or_default();
         let narinfo = format!(
             "StorePath: {store_path}\n\
              URL: nar/{hash_part}.nar\n\
@@ -1742,7 +1813,8 @@ mod tests {
              NarHash: {nar_hash_str}\n\
              NarSize: {}\n\
              References: \n\
-             Sig: {sig}\n",
+             Sig: {sig}\n\
+             {ca_line}",
             nar_bytes.len()
         );
 
@@ -1961,6 +2033,152 @@ mod tests {
         );
     }
 
+    // r[verify store.substitute.ca-self-auth]
+    /// `ca_recomputes_to_path` over all three CA shapes plus garbage:
+    /// `text:` and flat `fixed:` claims authenticate iff the path was
+    /// derived from them; unparseable or unknown-prefix claims never do.
+    #[test]
+    fn ca_recompute_shapes() {
+        use rio_nix::hash::{HashAlgo, NixHash};
+
+        // text: — builtins.toFile shape.
+        let h = NixHash::compute(HashAlgo::SHA256, b"some text");
+        let sp = StorePath::make_text("t-file", &h, &[]).unwrap();
+        let ca = format!("text:{}", h.to_colon());
+        assert!(ca_recomputes_to_path(&sp, &[], &ca));
+
+        // flat fixed: — fetchurl without recursiveHash.
+        let h = NixHash::compute(HashAlgo::SHA256, b"flat file body");
+        let sp = StorePath::make_fixed_output("flat-src", &h, false, &[]).unwrap();
+        let ca = format!("fixed:{}", h.to_colon());
+        assert!(ca_recomputes_to_path(&sp, &[], &ca));
+        // Same claim against a DIFFERENT path: forged.
+        let other = StorePath::parse(&rio_test_support::fixtures::test_store_path("x")).unwrap();
+        assert!(!ca_recomputes_to_path(&other, &[], &ca));
+        // Method confusion: recursive claim for a flat-derived path.
+        assert!(!ca_recomputes_to_path(
+            &sp,
+            &[],
+            &format!("fixed:r:{}", h.to_colon())
+        ));
+
+        // Garbage shapes never authenticate (and never panic).
+        for bad in [
+            "",
+            "fixed:",
+            "fixed:r:",
+            "fixed:sha256:zz-not-base32",
+            "text:md5:abc",
+            "unknown:sha256:abc",
+            "fixed:r:sha256:",
+        ] {
+            assert!(!ca_recomputes_to_path(&sp, &[], bad), "accepted {bad:?}");
+        }
+    }
+
+    // r[verify store.substitute.ca-self-auth]
+    /// A forged `CA:` claim must NOT be persisted. The narinfo signature
+    /// fingerprint covers only `(store_path, nar_hash, nar_size, refs)`,
+    /// so a compromised upstream can attach an arbitrary `CA:` to
+    /// correctly-signed content (rpm CVE-2021-20271 signature-scope
+    /// class). The claim here even carries the CORRECT nar hash — it is
+    /// rejected because the store path does not recompute from it.
+    #[tokio::test]
+    async fn substitute_drops_forged_ca_claim() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-ca-forged").await;
+        let (path, nar) = make_path();
+        // Plausible-looking CA: right algorithm, right nar hash — but
+        // `path` is an input-addressed test path, so the fixed-output
+        // path recomputed from this claim can never equal it.
+        let nar_hash: [u8; 32] = sha2::Sha256::digest(&nar).into();
+        let forged_ca = format!(
+            "fixed:r:sha256:{}",
+            rio_nix::store_path::nixbase32::encode(&nar_hash)
+        );
+        let fake = spawn_fake_upstream_with_ca(&path, nar.clone(), "cache.ca-1", &forged_ca).await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &fake.url,
+            50,
+            std::slice::from_ref(&fake.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        let sub = test_substituter(db.pool.clone());
+        let got = sub
+            .try_substitute(tid, &path)
+            .await
+            .unwrap()
+            .expect("substitution itself succeeds — only the CA claim is dropped");
+        assert_eq!(
+            got.content_address, None,
+            "forged CA claim must not survive ingest"
+        );
+
+        let stored = metadata::query_path_info(&db.pool, &path)
+            .await
+            .unwrap()
+            .expect("path persisted");
+        assert_eq!(
+            stored.content_address, None,
+            "forged CA claim must not be persisted"
+        );
+    }
+
+    // r[verify store.substitute.ca-self-auth]
+    /// A genuine `CA:` claim — one the store path actually recomputes
+    /// from — is persisted unchanged, so legitimate fixed-output paths
+    /// (fetchurl etc.) from public caches keep their content address.
+    #[tokio::test]
+    async fn substitute_keeps_self_authenticating_ca() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-ca-valid").await;
+        let (nar, _hash) = rio_test_support::fixtures::make_nar(b"ca-payload");
+        // Build a REAL fixed-output path: recursive sha256 over the NAR,
+        // exactly what `fetchurl { recursiveHash = true; }` produces.
+        let nar_hash: [u8; 32] = sha2::Sha256::digest(&nar).into();
+        let h = rio_nix::hash::NixHash::new(rio_nix::hash::HashAlgo::SHA256, nar_hash.to_vec())
+            .unwrap();
+        let sp = StorePath::make_fixed_output("ca-genuine", &h, true, &[]).unwrap();
+        let ca = format!(
+            "fixed:r:sha256:{}",
+            rio_nix::store_path::nixbase32::encode(&nar_hash)
+        );
+        let fake = spawn_fake_upstream_with_ca(sp.as_str(), nar.clone(), "cache.ca-2", &ca).await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &fake.url,
+            50,
+            std::slice::from_ref(&fake.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        let sub = test_substituter(db.pool.clone());
+        let got = sub
+            .try_substitute(tid, sp.as_str())
+            .await
+            .unwrap()
+            .expect("upstream has the path");
+        assert_eq!(got.content_address.as_deref(), Some(ca.as_str()));
+
+        let stored = metadata::query_path_info(&db.pool, sp.as_str())
+            .await
+            .unwrap()
+            .expect("path persisted");
+        assert_eq!(
+            stored.content_address.as_deref(),
+            Some(ca.as_str()),
+            "self-authenticating CA must be persisted verbatim"
+        );
+    }
+
     // r[verify store.substitute.progress-stream]
     /// `try_substitute_with_progress` fires the callback at least once
     /// (the final tick) with `(nar.len(), nar.len(), upstream_base)` and
@@ -2049,6 +2267,7 @@ mod tests {
             nar.clone(),
             "cache.co",
             Duration::from_millis(200),
+            None,
         )
         .await;
         metadata::upstreams::insert(
@@ -3459,6 +3678,7 @@ mod tests {
             nar.clone(),
             "cache.adm-1",
             Duration::from_millis(300),
+            None,
         )
         .await;
         metadata::upstreams::insert(
