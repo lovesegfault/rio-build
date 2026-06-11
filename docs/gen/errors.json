@@ -291,7 +291,7 @@
       "enum": "OverlayError",
       "name": "InvalidBuildId",
       "crate": "rio-builder",
-      "msg": "invalid build_id {0:?}: must be non-empty and contain no '/' or NUL",
+      "msg": "invalid build_id {0:?}: must match ^[A-Za-z0-9_-]{{1,255}}$ (single path component, safe to embed in overlayfs mount_data)",
       "doc": ""
     },
     {
@@ -884,6 +884,13 @@
     },
     {
       "enum": "NarInfoError",
+      "name": "InvalidDeriver",
+      "crate": "rio-nix",
+      "msg": "invalid Deriver value {value:?}: {source}",
+      "doc": ""
+    },
+    {
+      "enum": "NarInfoError",
       "name": "InvalidFileSize",
       "crate": "rio-nix",
       "msg": "invalid FileSize value {value:?}: {source}",
@@ -894,6 +901,13 @@
       "name": "InvalidNarSize",
       "crate": "rio-nix",
       "msg": "invalid NarSize value {value:?}: {source}",
+      "doc": ""
+    },
+    {
+      "enum": "NarInfoError",
+      "name": "InvalidReference",
+      "crate": "rio-nix",
+      "msg": "invalid References entry {value:?}: {source}",
       "doc": ""
     },
     {
@@ -985,6 +999,13 @@
       "name": "TooShort",
       "crate": "rio-nix",
       "msg": "path is too short to contain a hash",
+      "doc": ""
+    },
+    {
+      "enum": "WireError",
+      "name": "CollectionPayloadTooLarge",
+      "crate": "rio-nix",
+      "msg": "collection payload {0} bytes exceeds maximum {MAX_COLLECTION_TOTAL_BYTES}",
       "doc": ""
     },
     {
