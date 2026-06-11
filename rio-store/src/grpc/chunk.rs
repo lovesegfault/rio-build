@@ -19,6 +19,7 @@
 //! the content they name).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
@@ -31,7 +32,6 @@ use rio_proto::types::{
 };
 
 use super::directory::parse_digest;
-use super::drain_with_timeout;
 use crate::cas::{self, ChunkCache};
 
 /// `GetChunks` server-side fan-out width: how many `cas::get_verified()`
@@ -77,6 +77,18 @@ pub struct ChunkServiceImpl {
     /// caller-identity gate every ChunkService RPC passes through.
     /// Same instance as `DirectoryServiceImpl`'s.
     hmac_verifier: Option<Arc<rio_auth::hmac::HmacVerifier>>,
+    /// IDLE budget for the `GetChunks` bidi stream — NOT an absolute
+    /// lifetime cap. The builder's castore-FUSE fill (`RemoteChunks`
+    /// in `rio-builder/src/castore_fuse/stream.rs`) reuses ONE stream
+    /// for a whole file's fill, so total stream lifetime scales with
+    /// file size; an absolute cap of `GRPC_STREAM_TIMEOUT` (300 s)
+    /// killed any fill larger than budget × wire-rate (~4.4 GiB)
+    /// mid-transfer, forever. Instead each await in the drain loop
+    /// (next request frame / backend fetch, response send) gets a
+    /// fresh budget: active streams never trip, half-open clients
+    /// still do. Default [`rio_common::grpc::GRPC_STREAM_TIMEOUT`];
+    /// tests shrink it via [`Self::with_stream_idle_timeout`].
+    stream_idle_timeout: Duration,
 }
 
 impl ChunkServiceImpl {
@@ -89,7 +101,16 @@ impl ChunkServiceImpl {
             pool,
             chunk_cache,
             hmac_verifier,
+            stream_idle_timeout: rio_common::grpc::GRPC_STREAM_TIMEOUT,
         }
+    }
+
+    /// Test hook: shrink the `GetChunks` idle budget so the watchdog is
+    /// testable without 300 s waits. See [`Self::stream_idle_timeout`].
+    #[must_use]
+    pub fn with_stream_idle_timeout(mut self, idle: Duration) -> Self {
+        self.stream_idle_timeout = idle;
+        self
     }
 
     /// Shared guard: all ChunkService RPCs need a cache. Without a
@@ -128,6 +149,22 @@ impl ChunkServiceImpl {
         )
         .map(|_| ())
     }
+}
+
+/// Log a `GetChunks` idle-timeout trip and push DEADLINE_EXCEEDED to a
+/// client that may still be reading. `try_send`, not `send`: when the
+/// trip came from a send that itself stalled, the channel is full and
+/// a blocking send would park this task on the very client that
+/// stopped reading.
+fn report_idle_timeout(
+    stage: &'static str,
+    idle: Duration,
+    tx: &tokio::sync::mpsc::Sender<Result<ChunkData, Status>>,
+) {
+    tracing::warn!(rpc = "GetChunks", stage, timeout = ?idle, "stream idle timeout");
+    let _ = tx.try_send(Err(Status::deadline_exceeded(format!(
+        "GetChunks idle timeout ({stage})"
+    ))));
 }
 
 /// 32-byte parse + cache miss/corrupt → gRPC status. Shared by
@@ -210,6 +247,11 @@ impl ChunkService for ChunkServiceImpl {
     /// can't be assembled, and the client retries only the digests it
     /// didn't receive (chunks are content-addressed; arrival order
     /// carries no information).
+    ///
+    /// Lifetime contract: the stream is bounded by an IDLE timeout
+    /// ([`Self::stream_idle_timeout`]), not an absolute one — the
+    /// client reuses one stream for a whole file's fill, so total
+    /// lifetime scales with file size and must not be capped.
     // r[impl proto.chunk.batch-bidi]
     #[instrument(skip(self, request), fields(rpc = "GetChunks"))]
     async fn get_chunks(
@@ -259,28 +301,52 @@ impl ChunkService for ChunkServiceImpl {
 
         let (tx, rx) = tokio::sync::mpsc::channel(GET_CHUNKS_CHANNEL_DEPTH);
         // A drain parked by a half-open client would pin ~K×CHUNK_MAX
-        // of in-flight chunk data; `drain_with_timeout` is the backstop.
+        // of in-flight chunk data, and `tonic_builder()` sets no h2
+        // keepalive, so the idle watchdog below is the only backstop.
+        // NOT `drain_with_timeout`: its budget is absolute, which
+        // would kill a reused GetChunks stream mid-fill on large files
+        // (see `stream_idle_timeout`).
+        let idle = self.stream_idle_timeout;
         rio_common::task::spawn_monitored("get-chunks-stream", async move {
-            let drain = async {
-                futures_util::pin_mut!(fetches);
-                while let Some(item) = fetches.next().await {
-                    let is_err = item.is_err();
-                    if tx.send(item).await.is_err() {
-                        // Receiver gone — client disconnected. Dropping
-                        // `fetches` cancels in-flight backend reads.
+            futures_util::pin_mut!(fetches);
+            loop {
+                // Covers both "waiting for the client's next request
+                // frame" and "backend fetch in flight" — the latter is
+                // bounded by one S3 GET, far inside any sane budget.
+                let item = match tokio::time::timeout(idle, fetches.next()).await {
+                    Err(_elapsed) => {
+                        report_idle_timeout("recv", idle, &tx);
                         break;
                     }
-                    if is_err {
-                        // First error closes the stream: the file can't
-                        // be assembled, so there's no value finishing
-                        // the remaining fetches. The K in-flight futures
-                        // are dropped (cooperative cancel — bounded by
-                        // one S3 GET each).
+                    // Request side closed and every fetch drained:
+                    // normal end of stream.
+                    Ok(None) => break,
+                    Ok(Some(item)) => item,
+                };
+                let is_err = item.is_err();
+                match tokio::time::timeout(idle, tx.send(item)).await {
+                    Err(_elapsed) => {
+                        // Client stopped reading — h2 backpressure
+                        // propagated all the way into the channel.
+                        report_idle_timeout("send", idle, &tx);
                         break;
+                    }
+                    // Receiver gone — client disconnected. Dropping
+                    // `fetches` cancels in-flight backend reads.
+                    Ok(Err(_)) => break,
+                    Ok(Ok(())) => {
+                        if is_err {
+                            // First error closes the stream: the file
+                            // can't be assembled, so there's no value
+                            // finishing the remaining fetches. The K
+                            // in-flight futures are dropped
+                            // (cooperative cancel — bounded by one S3
+                            // GET each).
+                            break;
+                        }
                     }
                 }
-            };
-            let _ = drain_with_timeout("GetChunks", &tx, drain).await;
+            }
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))

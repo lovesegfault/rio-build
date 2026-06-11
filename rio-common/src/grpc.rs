@@ -114,6 +114,11 @@ pub const DEFAULT_GRPC_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// At `MAX_NAR_SIZE` = 4 GiB and ~15 MB/s, a full transfer is ~270s. 300s
 /// gives headroom without being unbounded.
+///
+/// For `GetChunks` the store uses this value as an IDLE budget (reset
+/// on every frame), not an absolute cap: one bidi stream serves a whole
+/// castore-FUSE file fill, so its total lifetime scales with file size
+/// and an absolute cap would make any file over ~4.4 GiB unfillable.
 pub const GRPC_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Initial h2 per-stream flow-control window (1 MiB). h2's default is

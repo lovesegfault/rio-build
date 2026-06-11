@@ -414,7 +414,10 @@ async fn fill_from_chunks(
     let mut offset: u64 = 0;
     // The GetChunks bidi stream is opened lazily on the first miss and
     // reused for every subsequent batch — one HTTP/2 stream per fill,
-    // not per window.
+    // not per window. Safe for arbitrarily large files: the server
+    // bounds the stream with an IDLE timeout, not an absolute lifetime
+    // cap (see rio-store `ChunkServiceImpl::stream_idle_timeout`), and
+    // this loop never idles longer than one batch's local work.
     let mut remote: Option<RemoteChunks> = None;
 
     // The first batch is a single chunk so the open() reply gate (first
