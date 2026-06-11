@@ -49,6 +49,29 @@ test "$gen_policy" = "WhenEmpty" || {
   exit 1
 }
 
+# merged_bug_004 (W10-BT): the nodeSelector witness is STRUCTURAL —
+# exactly ONE nodeSelector key in the store pod spec, AND its value.
+# The old value-only query was duplicate-tolerant: with the stale
+# rio-general block AND the D1 store block both rendering under the
+# same karpenter gate, yq resolved "store" by block-ordering accident
+# while kubectl strict / ArgoCD / kubeconform rejected the manifest
+# and first-wins parsers silently kept "general" (defeating the D1
+# migration). The driver's strict-decode tier is the document-level
+# law; this is the per-key pin on the RAW document text.
+store_doc=$(awk -v RS='\n---\n' \
+  '$0 ~ /\nkind: Deployment\n/ && $0 ~ /\n  name: rio-store\n/ {print; exit}' "$out")
+test -n "$store_doc" || {
+  echo "FAIL: rio-store Deployment did not render" >&2
+  exit 1
+}
+n_sel=$(grep -cE '^      nodeSelector:' <<<"$store_doc" || true)
+test "$n_sel" -eq 1 || {
+  echo "FAIL: store pod spec renders $n_sel nodeSelector keys, want exactly 1 —" >&2
+  echo "a duplicate key resolves by parser accident (merged_bug_004: the stale" >&2
+  echo "rio-general block shadowed the D1 store block for first-wins parsers)" >&2
+  exit 1
+}
+# Secondary assert: the surviving key's value targets the D1 pool.
 sel=$(yq -N 'select(.kind=="Deployment" and .metadata.name=="rio-store") | .spec.template.spec.nodeSelector."rio.build/node-role"' "$out")
 test "$sel" = "store" || {
   echo "FAIL: store Deployment does not target the store pool (nodeSelector rio.build/node-role: '$sel')" >&2

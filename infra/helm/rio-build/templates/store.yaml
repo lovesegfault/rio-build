@@ -94,10 +94,6 @@ spec:
         {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 8 }}
     spec:
       serviceAccountName: rio-store
-      {{- if .Values.karpenter.enabled }}
-      nodeSelector:
-        rio.build/node-role: general
-      {{- end }}
       {{- /* One replica per node (decision 5), REQUIRED. All three
              store load classes — substitution ingest, builder
              read-serving, builder upload ingest — share the pod's NIC,

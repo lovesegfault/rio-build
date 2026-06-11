@@ -282,12 +282,31 @@ in
   # asserts against the output. The driver below provides the chart
   # workdir (subcharts symlinked) and runs each fragment under
   # `bash -euo pipefail`. Fail-fast: first failing fragment aborts.
+  #
+  # STRICT-DECODE TIER (merged_bug_004, R26 structural form): a value
+  # query on a duplicate-tolerant parser is an INCOMPLETE VIEW of the
+  # document — fragment asserts alone cannot see a duplicated mapping
+  # key (yq resolves it by walk-order accident while kubectl strict /
+  # ArgoCD / kubeconform reject the manifest). The driver therefore
+  # wraps `helm` on PATH: every fragment's SUCCESSFUL `helm template`
+  # render also passes strict_decode.py (duplicate mapping keys and
+  # parse errors are structurally red regardless of which value wins).
+  # Tier grammar (H7″): (1) strict pass = SafeLoader + reject-dup-keys
+  # over every rendered document of every fragment render; (2) the
+  # rendered key-population baseline (rendered-key-population.txt,
+  # [GEN-SET]) diffs the canonical default+karpenter profile renders'
+  # full key-path census so ADJACENCY drift (a key appearing in or
+  # vanishing from a rendered document) is a reviewable diff;
+  # regenerate via nix/tests/helm/regen-key-population.sh. Staged per
+  # (vvvvv): the tool and the baseline ride the fragments fileset.
   helm-lint =
     let
       chart = pkgs.lib.cleanSource ../infra/helm/rio-build;
       fragments = pkgs.lib.fileset.toSource {
         root = ./tests/helm;
-        fileset = pkgs.lib.fileset.fileFilter (f: f.hasExt "sh") ./tests/helm;
+        fileset = pkgs.lib.fileset.fileFilter (
+          f: f.hasExt "sh" || f.hasExt "py" || f.hasExt "txt"
+        ) ./tests/helm;
       };
     in
     pkgs.runCommand "rio-helm-lint"
@@ -297,6 +316,8 @@ in
           pkgs.yq-go
           pkgs.jq
           pkgs.gnugrep
+          # strict_decode.py (the strict-decode tier + key census).
+          (pkgs.python3.withPackages (ps: [ ps.pyyaml ]))
           # promtool (fragment 34): syntax-checks the rendered
           # PrometheusRule and replays the alert-contract unit tests.
           # promtool ships in the cli output, not out.
@@ -326,10 +347,62 @@ in
         # (the (vvvvv) staging discipline; the runbook precedent).
         cp ${../rio-controller/src/observability.rs} $TMPDIR/chart/.observability-source.rs
 
-        for f in ${fragments}/*.sh; do
+        # Strict-decode tier (merged_bug_004): wrap helm so every
+        # fragment's successful `helm template` output strict-decodes
+        # before the fragment sees it. Non-template subcommands and
+        # intentionally-failing renders pass through untouched.
+        mkdir -p $TMPDIR/bin
+        real_helm=$(command -v helm)
+        cat > $TMPDIR/bin/helm <<SHIM
+        #!${pkgs.runtimeShell}
+        out=\$(mktemp)
+        trap 'rm -f "\$out"' EXIT
+        "$real_helm" "\$@" > "\$out"
+        rc=\$?
+        if [ "\$rc" -eq 0 ] && [ "\''${1:-}" = template ]; then
+          python3 ${fragments}/strict_decode.py strict "\$out" >&2 || exit 1
+        fi
+        cat "\$out"
+        exit \$rc
+        SHIM
+        chmod +x $TMPDIR/bin/helm
+        export PATH=$TMPDIR/bin:$PATH
+
+        # Numbered files are fragments; unnumbered .sh (the
+        # regen-key-population.sh ritual) are dev-side tools, not
+        # sandbox assertions.
+        for f in ${fragments}/[0-9][0-9]-*.sh; do
           echo "▸ helm-lint: $(basename "$f" .sh)" >&2
           bash -euo pipefail "$f"
         done
+
+        # Rendered key-population baseline ([GEN-SET], merged_bug_004's
+        # adjacency-drift census): the canonical default + karpenter
+        # profile renders' full key-path population must match the
+        # committed baseline, so a key appearing in or vanishing from a
+        # rendered document is a reviewable diff, never a silent render
+        # change. The renders above go through the strict shim too.
+        echo "▸ helm-lint: rendered-key-population baseline" >&2
+        helm template rio . --set global.image.tag=test > $TMPDIR/kp-default.yaml
+        helm template rio . \
+          --set karpenter.enabled=true \
+          --set karpenter.clusterName=ci \
+          --set karpenter.nodeRoleName=ci-role \
+          --set karpenter.amiTag=test \
+          --set global.image.tag=test > $TMPDIR/kp-karpenter.yaml
+        {
+          python3 ${fragments}/strict_decode.py keys $TMPDIR/kp-default.yaml \
+            | sed 's/^/default\t/'
+          python3 ${fragments}/strict_decode.py keys $TMPDIR/kp-karpenter.yaml \
+            | sed 's/^/karpenter\t/'
+        } > $TMPDIR/key-population.txt
+        diff -u ${fragments}/rendered-key-population.txt $TMPDIR/key-population.txt || {
+          echo "FAIL: rendered key population drifted from the committed baseline." >&2
+          echo "If the render change is intended, regenerate the baseline:" >&2
+          echo "  nix/tests/helm/regen-key-population.sh" >&2
+          echo "and commit nix/tests/helm/rendered-key-population.txt with the template change." >&2
+          exit 1
+        }
         touch $out
       '';
 
