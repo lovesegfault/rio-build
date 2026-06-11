@@ -73,13 +73,16 @@ pub fn bump_floor_or_count(
             last.map_or(0, |i| i.mem_bytes),
             ceil.max_mem,
         ),
-        // PARKED BY DESIGN — no live producer reaches this arm: the
-        // production callers of `bump_resource_floor` (pinned by the
-        // caller census, db/live_pins.rs) pass `OomKilled`
-        // (worker-reported CgroupOom AND the controller-witnessed
-        // OomKilled letter at establishment — live_058-b) and
-        // `DeadlineExceeded` (worker-reported TimedOut). Witnessed
-        // evictions are CLASSIFY-ONLY BY RULING
+        // LIVE with exactly ONE producer (live_057-b): the worker
+        // quota-attributed DiskFull lane — completion.rs matches
+        // `rio_proto::DISK_FULL_MSG` on an InfrastructureFailure
+        // report and calls `bump_resource_floor(EvictedDiskPressure,
+        // "disk_full")`; precise by construction at the prjquota seam
+        // (`apply_disk_override` — the prjquota-vs-statvfs
+        // classification at result assembly), with the worker's
+        // once-per-attempt assignment-token dedup — exactly the
+        // re-entry lane the parked-era note named. Witnessed
+        // evictions remain CLASSIFY-ONLY BY RULING
         // ([`witnessed_disposition`]): the controller's classifier
         // folds NODE-CONDITION evictions ("DiskPressure",
         // "ephemeral-storage") together with the pod-attributed
@@ -89,16 +92,10 @@ pub fn bump_floor_or_count(
         // sizing authority — promoting it would re-create the I-199
         // ambient-cause over-fire on the disk axis (one node-pressure
         // event evicting k innocent builder pods would double k
-        // sticky M_044 floors). The disk floor dimension is therefore
-        // still inert; the actual disk residual is the
-        // retry/establishment counters (retry-poison), not promotion.
-        // The arm stays: the wire variant exists, unit tests pin the
-        // doubling algebra, and this is the designed re-entry point
-        // for a WORKER-SIDE quota-attributed disk signal (precise by
-        // construction at the prjquota seam, with the worker's
-        // once-per-attempt assignment-token dedup) — that lane, not
-        // the witnessed letter, is the arm's first live producer when
-        // it ships.
+        // sticky M_044 floors). Their sizing recovery IS this worker
+        // lane on the next attempt: the kubelet-evicted pname
+        // re-dispatches, and if its own quota is truly the constraint
+        // the worker lane classifies and doubles.
         R::EvictedDiskPressure => bump_dim(
             &mut floor.disk_bytes,
             last.map_or(0, |i| i.disk_bytes),

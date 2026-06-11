@@ -1196,6 +1196,10 @@ impl DagActor {
     /// - `handle_infrastructure_failure` (worker-reported `CgroupOom`
     ///   — build child hit cgroup memory.max while pod survived) —
     ///   label `cgroup_oom`
+    /// - `handle_infrastructure_failure` (worker-reported `DiskFull` —
+    ///   the live_057 prjquota-attributed classification,
+    ///   `apply_disk_override`; the same believed-store suppression
+    ///   gate as the OOM twin) — label `disk_full`
     /// - `handle_timeout_failure` (worker-reported `TimedOut`) —
     ///   label `timeout`
     /// - the establishment sweep's witnessed-OomKilled disposition row
@@ -1225,11 +1229,12 @@ impl DagActor {
     ///
     /// `reason_label`: emitted as a label on the metric + the log
     /// line so operators can tell the producers apart in dashboards.
-    /// The label alphabet is {`cgroup_oom`, `timeout`,
+    /// The label alphabet is {`cgroup_oom`, `disk_full`, `timeout`,
     /// `witnessed_oom`} — pinned by the caller census above (the
     /// `oom_killed`/`disk_pressure` arms were retired with the
     /// over-broad heuristic; `timeout` covers `DeadlineExceeded`
-    /// too) — keep the lib.rs HELP in lockstep when the census grows.
+    /// too; `disk_full` is the live_057 worker quota lane) — keep
+    /// the lib.rs HELP in lockstep when the census grows.
     pub(super) async fn bump_resource_floor(
         &mut self,
         drv_hash: &DrvHash,
@@ -3950,12 +3955,14 @@ impl DagActor {
             row.final_line_count = report.final_line_count;
         }
         // I-199: bump resource_floor ONLY on the worker-reported
-        // `CgroupOom` infra failure (I-196 OOM watcher: build child
-        // hit cgroup memory.max while the pod itself survived). Other
-        // infra failures (FUSE EIO, PutPath race, store-replica-
-        // restart) are NOT size-related — the previous over-broad
-        // promote here is what made cmake go medium→large→xlarge in
-        // live QA from a store-replica-restart with zero builds run.
+        // sizing signals — `CgroupOom` (I-196 OOM watcher: build child
+        // hit cgroup memory.max while the pod itself survived) and
+        // `DiskFull` (live_057: overlay prjquota exhausted with node
+        // headroom — the disk twin). Other infra failures (FUSE EIO,
+        // PutPath race, store-replica-restart) are NOT size-related —
+        // the previous over-broad promote here is what made cmake go
+        // medium→large→xlarge in live QA from a store-replica-restart
+        // with zero builds run.
         // Pod-level OOMKilled (whole pod died) arrives as the
         // controller's `ReportAttemptOutcome` classification fill,
         // which deliberately never promotes (sla-sizing.typ accepted
@@ -3978,11 +3985,30 @@ impl DagActor {
             degraded,
             StoreDegradedDisposition::Paced | StoreDegradedDisposition::RunBound
         );
+        // live_057-b: the DISK twin — worker-reported DiskFull (the
+        // prjquota-attributed classification, apply_disk_override)
+        // bumps the DISK floor through the same machinery. Substring
+        // match on `ExecutorError::DiskFull`'s Display; both sides
+        // reference `rio_proto::DISK_FULL_MSG` (pinned by rio-builder's
+        // `disk_full_display_contains_proto_constant`). The bug_408
+        // believed-store suppression applies IDENTICALLY: a
+        // store-degraded failure is never a sizing signal, on either
+        // axis. Dedup: worker reports are once-per-attempt via the
+        // assignment token (the pull/report cycle), so one failed
+        // attempt bumps at most once — the durable-dedup precondition
+        // the parked arm's re-entry note named.
         let floor_outcome = if !believed_store && error_msg.contains(rio_proto::CGROUP_OOM_MSG) {
             self.bump_resource_floor(
                 drv_hash,
                 rio_proto::types::TerminationReason::OomKilled,
                 "cgroup_oom",
+            )
+            .await
+        } else if !believed_store && error_msg.contains(rio_proto::DISK_FULL_MSG) {
+            self.bump_resource_floor(
+                drv_hash,
+                rio_proto::types::TerminationReason::EvictedDiskPressure,
+                "disk_full",
             )
             .await
         } else {

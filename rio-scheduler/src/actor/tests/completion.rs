@@ -1635,6 +1635,122 @@ async fn test_store_degraded_infra_uncharged_waits_out_the_outage() -> TestResul
     Ok(())
 }
 
+/// W10-CM (live_057-b, the consumer arm — the cross-crate cell):
+/// a worker report whose error_msg carries rio_proto::DISK_FULL_MSG
+/// (the builder's quota-attributed DiskFull Display, the contract
+/// const both sides reference) doubles the DISK resource floor —
+/// the parked EvictedDiskPressure arm's first live producer. The
+/// ladder algebra itself is NOT touched (the floor.rs unit pins
+/// stand); this drives the production intake path end-to-end:
+/// pull → report → floor.
+#[tokio::test]
+async fn test_disk_full_report_doubles_disk_floor() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+    let drv = "disk-floor-drv";
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
+    // Seed est_disk_bytes — the doubling base (the 25 GiB rung).
+    handle
+        .debug_seed_sched_hint(drv, None, Some(25 << 30), None, None)
+        .await?;
+
+    pull_complete_failure(
+        &handle,
+        drv,
+        rio_proto::types::BuildResultStatus::InfrastructureFailure,
+        &format!(
+            "{} (overlay prjquota exhausted); bumping disk floor",
+            rio_proto::DISK_FULL_MSG
+        ),
+    )
+    .await?;
+
+    let s = expect_drv(&handle, drv).await;
+    assert!(
+        s.sched.resource_floor.disk_bytes > 0,
+        "left: the DiskFull report falls into the non-bump infra arm \
+         (retry-poison; the disk recovery ladder never engages, floor \
+         stays 0) / right: the floor doubles from the last-dispatched \
+         intent's disk (the bump_dim law the :302-region unit pins \
+         own); got {}",
+        s.sched.resource_floor.disk_bytes
+    );
+    assert_eq!(
+        s.retry.infra_count, 0,
+        "promoted=true → exempt from the infra cap (the D4 exemption, \
+         the cgroup_oom parity)"
+    );
+    assert_ne!(s.status, DerivationStatus::Poisoned);
+    Ok(())
+}
+
+/// W10-CO (the suppression parity product): {oom, disk} ×
+/// {believed-store, plain}. bug_408's believed-store gate applies
+/// IDENTICALLY to both sizing letters — a store-degraded failure is
+/// never a sizing signal, on either axis; an uncorroborated/plain
+/// report bumps its own dimension and only its own.
+#[rstest]
+#[case::oom_plain(true, false)]
+#[case::oom_believed(true, true)]
+#[case::disk_plain(false, false)]
+#[case::disk_believed(false, true)]
+#[tokio::test]
+async fn test_floor_bump_store_suppression_parity(
+    #[case] oom: bool,
+    #[case] believed_store: bool,
+) -> TestResult {
+    let (_db, handle, _task) = setup().await;
+    let drv = "parity-drv";
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
+    handle
+        .debug_seed_sched_hint(drv, Some(2 << 30), Some(25 << 30), None, None)
+        .await?;
+    if believed_store {
+        // merged_bug_032: corroborate via the store-health leg so the
+        // degraded flag is BELIEVED (Paced/RunBound), not bare.
+        handle.debug_mark_store_rpc_failure().await?;
+    }
+    let msg = if oom {
+        format!("{}; bumping resource floor", rio_proto::CGROUP_OOM_MSG)
+    } else {
+        format!("{}; bumping disk floor", rio_proto::DISK_FULL_MSG)
+    };
+    pull_complete_failure_result(
+        &handle,
+        drv,
+        rio_proto::types::BuildResult {
+            status: rio_proto::types::BuildResultStatus::InfrastructureFailure.into(),
+            error_msg: msg,
+            store_degraded: believed_store,
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    let s = expect_drv(&handle, drv).await;
+    let (mem, disk) = (
+        s.sched.resource_floor.mem_bytes,
+        s.sched.resource_floor.disk_bytes,
+    );
+    if believed_store {
+        assert_eq!(
+            (mem, disk),
+            (0, 0),
+            "believed-store suppresses the sizing signal on BOTH axes \
+             (a store-degraded failure is never a sizing signal)"
+        );
+    } else if oom {
+        assert!(mem > 0, "plain OOM bumps the mem dimension; got {mem}");
+        assert_eq!(disk, 0, "…and ONLY the mem dimension");
+    } else {
+        assert!(
+            disk > 0,
+            "plain DiskFull bumps the disk dimension; got {disk}"
+        );
+        assert_eq!(mem, 0, "…and ONLY the disk dimension");
+    }
+    Ok(())
+}
+
 /// InfrastructureFailure hits `max_infra_retries` → poison. The cap
 /// exists to convert a misclassified permanent failure (e.g. S3 auth
 /// error reported as infra) into a visible poison instead of a hot

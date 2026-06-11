@@ -1045,10 +1045,12 @@ mod registration_writer_census {
     /// HELP's "the callers are the alphabet" sentences cite THIS census
     /// instead of restating a list that goes stale (the restated-
     /// sentence arm is struck: an alphabet/ONLY claim takes the machine
-    /// bind). Current population: the two worker-reported lanes
-    /// (completion.rs — `cgroup_oom`, `timeout`) and the establishment
-    /// sweep's witnessed-OomKilled disposition row (housekeeping.rs —
-    /// `witnessed_oom`, live_058-b). A new caller reds here until it
+    /// bind). Current population: the three worker-reported lanes
+    /// (completion.rs — `cgroup_oom`, `disk_full` [the live_057
+    /// prjquota-attributed DiskFull lane, WO-S6-9], `timeout`) and the
+    /// establishment sweep's witnessed-OomKilled disposition row
+    /// (housekeeping.rs — `witnessed_oom`, live_058-b). A new caller
+    /// reds here until it
     /// files its row, its label, and the lib.rs HELP; rides the same
     /// embedded-source universe as every census in this module (the
     /// dev-tree completeness pin is `census_universe_matches_live_tree`;
@@ -1059,7 +1061,9 @@ mod registration_writer_census {
     fn bump_resource_floor_caller_census() {
         let hits = census(&[".bump_resource", "_floor("]);
         let expected: BTreeMap<String, usize> = [
-            ("actor/completion.rs".to_string(), 2),
+            // 3 = cgroup_oom + timeout + disk_full (the live_057
+            // worker quota lane, WO-S6-9 c10 — the H2″-4 growth).
+            ("actor/completion.rs".to_string(), 3),
             ("actor/housekeeping.rs".to_string(), 1),
         ]
         .into();
