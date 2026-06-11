@@ -4284,7 +4284,7 @@ counters (#(refs.metric)("rio_scheduler_lease_rebound_total"),
 #(refs.metric)("rio_scheduler_lease_acquired_total") counts acquire edges
 only.
 
-#r("sched.lease.holder-evidenced-lose+2")[
+#r("sched.lease.holder-evidenced-lose+3")[
   A renew 409 observed while this replica believes it leads MUST NOT run the
   lose transition by itself: the 409 proves only resourceVersion movement,
   whose mover may be this replica's own cancelled-then-committed write or a
@@ -4299,8 +4299,14 @@ only.
   funnel (own-commit evidence, frozen content, and moved-content-without-
   ledger alike), a read resolving holder=other clears it through the
   evidenced lose --- so two 409s with any completed read between them are
-  never consecutive. A completed read observing ABSENCE re-baselines only:
-  absence is deletion-axis evidence, not holder evidence.
+  never consecutive. A completed read observing ABSENCE is deletion-axis
+  evidence with its own routed row in the same total law: the lease
+  resolves to nobody and a re-creator needs no steal wait, so a believing
+  replica MUST exit belief at that read --- the same lose-class transition,
+  clearing any pending deferral and the release hold with it (there is no
+  lease object of ours to release) --- while a standby replica re-baselines
+  only (the Absent baseline is what lets the next read prove a transmitted
+  Create committed).
 ]
 
 The one-round bound is what preserves the fence/steal separation: an

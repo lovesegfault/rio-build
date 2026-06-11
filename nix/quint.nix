@@ -1539,7 +1539,7 @@ rec {
     # space exceeded 720M generated WITHOUT exhausting — the regime's
     # module comment records the scope trim and what the droppedWrite
     # regime keeps.)
-    # r[verify sched.lease.holder-evidenced-lose+2]
+    # r[verify sched.lease.holder-evidenced-lose+3]
     quint-leader-election-holder-evidence = mkQuintCheck {
       name = "leader-election-holder-evidence";
       # quint-policy P1 exemption (bughunt-2 slot 11; §5-Q13): same

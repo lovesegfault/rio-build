@@ -227,6 +227,20 @@ const _: () = assert!(
 /// result the generation fence (r\[sched.lease.generation-fence+3\])
 /// backstops. The model also shows the bound is tight: one tick less
 /// separation and a dual-belief state is reachable.
+///
+/// THE DERIVATION'S DOMAIN, restated over the widened holder product
+/// (bug_143): the fence/steal separation above shields only the
+/// regime where the lease OBJECT EXISTS — a follower acquires through
+/// observed-record staleness, which takes `STEAL_AFTER`. A DELETED
+/// lease grants a creator immediate acquisition
+/// (`election::FetchOutcome::Create` — no steal wait), so that regime
+/// is covered by READ EVIDENCE instead: a believing replica's
+/// completed read observing 404 routes `HolderCell::Absent` through
+/// [`route_act_failed_read`] to `AbsenceLose` — belief exits AT the
+/// read, bounding the dual window by one read latency rather than by
+/// the margin. (Pre-fix the absent read bypassed the law entirely and
+/// belief survived to the next facts:Some round or the 11s fence —
+/// outside this derivation.)
 const FENCE_MARGIN: Duration = Duration::from_secs(4);
 
 /// The leader self-fences after this long without a successful renew:
@@ -1327,6 +1341,14 @@ enum ContentBaseline {
 enum HolderCell {
     Us,
     Other,
+    /// The completed read observed NO lease object (404): the lease
+    /// resolves to nobody. A cell of the routed product, NOT a
+    /// pre-filter case (bug_143, R25): the absence regime is the one
+    /// where a peer's re-Create needs no steal wait
+    /// (`election::FetchOutcome::Create`), so a believing replica
+    /// must exit belief at this read — the fence(11) < steal(19)
+    /// margin does not shield it.
+    Absent,
 }
 
 impl HolderCell {
@@ -1335,13 +1357,18 @@ impl HolderCell {
     /// fails that match's exhaustiveness before this list can go
     /// stale).
     #[cfg(any(test, kani))]
-    const ALL: [Self; 2] = [Self::Us, Self::Other];
+    const ALL: [Self; 3] = [Self::Us, Self::Other, Self::Absent];
 
-    fn of(facts: &election::FetchFacts) -> Self {
-        if facts.holder_is_us {
-            Self::Us
-        } else {
-            Self::Other
+    /// The ONLY constructor, and it consumes the producer's FULL
+    /// output type (`Option<FetchFacts>` — bug_143): there is no
+    /// facts-only form, so an `if let` pre-filter between the
+    /// producer and the law has nothing to construct from (the W10-AX
+    /// census holds the call-site shape).
+    fn of_read(facts: Option<&election::FetchFacts>) -> Self {
+        match facts {
+            Some(f) if f.holder_is_us => Self::Us,
+            Some(_) => Self::Other,
+            None => Self::Absent,
         }
     }
 }
@@ -1361,7 +1388,15 @@ impl ContentCell {
     #[cfg(any(test, kani))]
     const ALL: [Self; 2] = [Self::Moved, Self::Frozen];
 
-    fn of(baseline: &ContentBaseline, facts: &election::FetchFacts) -> Self {
+    /// Mirrors [`HolderCell::of_read`]: consumes the full read. An
+    /// absent read observed NO holder-authored content — nothing can
+    /// have moved, nothing stamps — so it constructs `Frozen` (the
+    /// Absent rows of the routing law are content-vacuous either way:
+    /// every `Absent × content × ledger` cell names the same action).
+    fn of_read(baseline: &ContentBaseline, facts: Option<&election::FetchFacts>) -> Self {
+        let Some(facts) = facts else {
+            return Self::Frozen;
+        };
         let moved = match baseline {
             ContentBaseline::Present { renew_time: prev } => prev != &facts.renew_time,
             ContentBaseline::Absent => true,
@@ -1426,15 +1461,32 @@ enum ActFailedAction {
     /// Not believing and nothing to consume: record the baseline
     /// only. The latch is invariantly clear here.
     ObserveOnly,
+    /// A believing completed read observed the lease ABSENT (404):
+    /// run the lose-class transitions NOW (bug_143) — the lease
+    /// resolves to nobody, a peer Create needs no steal wait, and the
+    /// fence/steal margin does not shield the absent-lease regime.
+    /// Clears any pending deferral with it (a completed read IS
+    /// evidence); re-baselines to Absent. The hold clears too: there
+    /// is no lease object of ours to release.
+    AbsenceLose,
+    /// A standby completed read observed the lease ABSENT: record the
+    /// Absent baseline only (it is what lets the next read prove a
+    /// transmitted Create committed — holder=us against Absent).
+    AbsenceObserve,
 }
 
-// r[impl sched.lease.holder-evidenced-lose+2]
+// r[impl sched.lease.holder-evidenced-lose+3]
 /// Total routing law for a believing/standby act-failed COMPLETED
 /// read (bug_002): every cell of the `believes x Holder x Content x
 /// Ledger` product names its action — no wildcard arms, so rustc
 /// exhaustiveness IS the census generator (a new cell variant fails
 /// compilation here before any review can miss it). Pure so the kani
 /// routing proof and the product census test fold it directly.
+///
+/// The absence partition (bug_143): `Absent` cells route to exactly
+/// {`AbsenceLose`, `AbsenceObserve`} and present cells never do — the
+/// kani partition proof and the census pin both directions, which is
+/// what discharges the executor's facts-presence expects.
 fn route_act_failed_read(
     believes: bool,
     holder: HolderCell,
@@ -1461,6 +1513,18 @@ fn route_act_failed_read(
         | (true, H::Other, C::Moved, L::Empty)
         | (true, H::Other, C::Frozen, L::Armed)
         | (true, H::Other, C::Frozen, L::Empty) => A::EvidencedLose,
+        // Believing read that observed NO lease object: the lease
+        // resolves to nobody and a peer Create needs no steal wait —
+        // exit belief AT this read (bug_143). The content/ledger axes
+        // are vacuous here (an absent read constructs Frozen and never
+        // consumes the ledger — the transmitted Create resolves via
+        // the evidence leg NEXT round, holder=us against the Absent
+        // baseline); every cell is still named so the product census
+        // stays generated.
+        (true, H::Absent, C::Moved, L::Armed)
+        | (true, H::Absent, C::Moved, L::Empty)
+        | (true, H::Absent, C::Frozen, L::Armed)
+        | (true, H::Absent, C::Frozen, L::Empty) => A::AbsenceLose,
         // Not believing, no evidence: baseline only.
         (false, H::Us, C::Moved, L::Empty)
         | (false, H::Us, C::Frozen, L::Armed)
@@ -1469,6 +1533,12 @@ fn route_act_failed_read(
         | (false, H::Other, C::Moved, L::Empty)
         | (false, H::Other, C::Frozen, L::Armed)
         | (false, H::Other, C::Frozen, L::Empty) => A::ObserveOnly,
+        // Standby read observing absence: record the baseline only
+        // (the latch is invariantly clear when not believing).
+        (false, H::Absent, C::Moved, L::Armed)
+        | (false, H::Absent, C::Moved, L::Empty)
+        | (false, H::Absent, C::Frozen, L::Armed)
+        | (false, H::Absent, C::Frozen, L::Empty) => A::AbsenceObserve,
     }
 }
 
@@ -1803,7 +1873,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                     }
                     (None, true) => {
                         // ---- Lose-or-defer ----
-                        // r[impl sched.lease.holder-evidenced-lose+2]
+                        // r[impl sched.lease.holder-evidenced-lose+3]
                         // The lose edge demands a CompletedLoseEvidence
                         // witness (see its doc + the SIGNED Q3 block):
                         // a completed read naming another holder, or an
@@ -1974,18 +2044,22 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                 // OURS committing, so it is not evidence
                 // (merged_bug_180; the foreign-rv companion test pins
                 // this direction alongside the frozen-rv one).
-                if let Some(f) = &facts {
-                    // bug_002: EVERY completed act-failed read routes
-                    // through the total cell law — the product census
-                    // and the kani routing proof pin that no believing
-                    // read maps to a no-transition action (pre-fix,
-                    // only the Us x Moved x Armed cell ran transitions
-                    // and the other believing cells leaked a pending
-                    // 409 deferral into a false exhaustion).
+                {
+                    // bug_002 + bug_143: EVERY completed act-failed
+                    // read routes through the total cell law —
+                    // INCLUDING the absent read. The old Some-narrowed
+                    // `if let` pre-filter was the R25 escape hatch:
+                    // the 404-observed round bypassed the law, leaked
+                    // a pending 409 deferral across the arm, and left
+                    // belief standing while a peer could re-Create the
+                    // deleted lease with no steal wait. The law
+                    // consumes the producer's FULL output type
+                    // (`Option<FetchFacts>`) so the dispatch IS the
+                    // exhaustive match (W10-AX census).
                     let action = route_act_failed_read(
                         standing.believes(),
-                        HolderCell::of(f),
-                        ContentCell::of(&content_baseline, f),
+                        HolderCell::of_read(facts.as_ref()),
+                        ContentCell::of_read(&content_baseline, facts.as_ref()),
                         LedgerCell::of(&unconfirmed),
                     );
                     // The re-baseline is the match's VALUE: the arm
@@ -1994,6 +2068,10 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                     // as the acquire arm's bound transition count).
                     content_baseline = match action {
                         ActFailedAction::EvidenceResolve => {
+                            let f = facts.as_ref().expect(
+                                "EvidenceResolve is routed only for present reads \
+                             (the absence partition; census + kani pinned)",
+                            );
                             let led = unconfirmed.take().expect(
                                 "EvidenceResolve is routed only for an armed ledger \
                              (route_act_failed_read is total; census + kani pinned)",
@@ -2083,6 +2161,10 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                             }
                         }
                         ActFailedAction::FunnelResolve => {
+                            let f = facts.as_ref().expect(
+                                "FunnelResolve is routed only for present reads \
+                             (the absence partition; census + kani pinned)",
+                            );
                             // A completed read of a lease we hold with
                             // nothing to consume — the SAME facts the
                             // Leading renew round consumes, so it
@@ -2109,6 +2191,10 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                             }
                         }
                         ActFailedAction::EvidencedLose => {
+                            let f = facts.as_ref().expect(
+                                "EvidencedLose is routed only for present reads \
+                             (the absence partition; census + kani pinned)",
+                            );
                             // The read completed and the lease does
                             // not resolve to us: the same evidenced
                             // lose a Completed Standby resolution
@@ -2134,17 +2220,50 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                                 renew_time: f.renew_time.clone(),
                             }
                         }
-                        ActFailedAction::ObserveOnly => ContentBaseline::Present {
-                            renew_time: f.renew_time.clone(),
-                        },
+                        ActFailedAction::ObserveOnly => {
+                            let f = facts.as_ref().expect(
+                                "ObserveOnly is routed only for present reads \
+                             (the absence partition; census + kani pinned)",
+                            );
+                            ContentBaseline::Present {
+                                renew_time: f.renew_time.clone(),
+                            }
+                        }
+                        ActFailedAction::AbsenceLose => {
+                            // r[impl sched.lease.holder-evidenced-lose+3]
+                            // The completed read OBSERVED the lease
+                            // absent: it resolves to nobody, and a
+                            // peer's re-Create needs no steal wait —
+                            // the fence/steal margin does not shield
+                            // this regime, so belief exits AT the
+                            // read (bug_143). Same lose family as
+                            // EvidencedLose: the standing transition
+                            // clears any pending deferral, and the
+                            // hold clears with it (there is no lease
+                            // object of ours to release). The ledger
+                            // is NOT consumed: the transmitted Create
+                            // resolves through the evidence leg next
+                            // round (holder=us against Absent).
+                            state.on_lose();
+                            warn!(
+                                holder = %cfg.holder_id,
+                                "lost leadership (a completed read observed the lease \
+                                 ABSENT — deleted out from under us; a peer can \
+                                 re-create it with no steal wait)"
+                            );
+                            hooks.on_lose();
+                            marks_dirty.mark();
+                            standing.on_observed_not_leading();
+                            ContentBaseline::Absent
+                        }
+                        // 404→Create round whose POST died unanswered,
+                        // observed while standby: the read OBSERVED
+                        // absence — a baseline observation
+                        // (merged_bug_164), exactly what lets the next
+                        // completed read prove the Create committed
+                        // (holder=us against Absent).
+                        ActFailedAction::AbsenceObserve => ContentBaseline::Absent,
                     };
-                } else {
-                    // 404→Create round whose POST died unanswered: the
-                    // read OBSERVED absence — that is a baseline
-                    // observation (merged_bug_164), and it is exactly
-                    // what lets the next completed read prove the
-                    // Create committed (holder=us against Absent).
-                    content_baseline = ContentBaseline::Absent;
                 }
 
                 // Record THIS round's transmitted write as in doubt —
@@ -2569,7 +2688,7 @@ mod lease_standing_proofs {
         );
     }
 
-    /// r[verify sched.lease.holder-evidenced-lose+2]
+    /// r[verify sched.lease.holder-evidenced-lose+3]
     /// The 409 deferral is episode-scoped (merged_bug_002): over every
     /// bounded event sequence drawn from the standing alphabet
     /// {ObservedHeld, ObservedNotLeading, SelfFence, BelievingConflict}
@@ -2689,7 +2808,7 @@ mod lease_standing_proofs {
         );
     }
 
-    /// r[verify sched.lease.holder-evidenced-lose+2]
+    /// r[verify sched.lease.holder-evidenced-lose+3]
     /// Routing totality (bug_002): over the FULL `believes x Holder x
     /// Content x Ledger` product, no believing completed act-failed
     /// read maps to a no-transition action — and folding the routed
@@ -2703,10 +2822,10 @@ mod lease_standing_proofs {
     #[kani::proof]
     fn lease_routing_no_believing_read_is_unconsumed() {
         let believes: bool = kani::any();
-        let holder = if kani::any() {
-            HolderCell::Us
-        } else {
-            HolderCell::Other
+        let holder = match kani::any::<u8>() % 3 {
+            0 => HolderCell::Us,
+            1 => HolderCell::Other,
+            _ => HolderCell::Absent,
         };
         let content = if kani::any() {
             ContentCell::Moved
@@ -2720,9 +2839,20 @@ mod lease_standing_proofs {
         };
 
         let action = route_act_failed_read(believes, holder, content, ledger);
+        // The absence partition (bug_143): absence actions route
+        // exactly the Absent cells — discharges the executor's
+        // facts-presence expects in both directions.
+        let is_absence_action = matches!(
+            action,
+            ActFailedAction::AbsenceLose | ActFailedAction::AbsenceObserve
+        );
+        assert!(
+            is_absence_action == matches!(holder, HolderCell::Absent),
+            "absence actions route exactly the Absent cells"
+        );
         if believes {
             assert!(
-                action != ActFailedAction::ObserveOnly,
+                action != ActFailedAction::ObserveOnly && action != ActFailedAction::AbsenceObserve,
                 "no believing completed read may run no transition"
             );
             // Fold the routed transition through the PRODUCTION
@@ -2735,12 +2865,12 @@ mod lease_standing_proofs {
                 ActFailedAction::EvidenceResolve | ActFailedAction::FunnelResolve => {
                     standing.on_observed(true);
                 }
-                ActFailedAction::EvidencedLose => {
+                ActFailedAction::EvidencedLose | ActFailedAction::AbsenceLose => {
                     standing.on_observed(false);
                 }
-                ActFailedAction::ObserveOnly => {
+                ActFailedAction::ObserveOnly | ActFailedAction::AbsenceObserve => {
                     // Unreachable: asserted above.
-                    assert!(false, "believing cell routed ObserveOnly");
+                    assert!(false, "believing cell routed a no-transition action");
                 }
             }
             assert!(
@@ -4823,7 +4953,7 @@ mod tests {
     /// completed read naming us resolves the deferral as a renew. The
     /// old immediate-lose wiped the DAG/outbox and bounced the leader
     /// marks on what was provably our own write.
-    // r[verify sched.lease.holder-evidenced-lose+2]
+    // r[verify sched.lease.holder-evidenced-lose+3]
     #[tokio::test(start_paused = true)]
     async fn believing_409_defers_for_holder_evidence_then_renews() {
         let (client, mut park) = RequestPark::new();
@@ -4897,7 +5027,7 @@ mod tests {
     /// what keeps the NeverDual fence/steal separation intact (an
     /// unbounded deferral under every-round CAS bounces would retain
     /// belief past a standby's steal).
-    // r[verify sched.lease.holder-evidenced-lose+2]
+    // r[verify sched.lease.holder-evidenced-lose+3]
     #[tokio::test(start_paused = true)]
     async fn second_consecutive_believing_409_loses_with_deferral_exhausted() {
         let (client, mut park) = RequestPark::new();
@@ -4949,6 +5079,88 @@ mod tests {
 
         shutdown.cancel();
         for _ in 0..3 {
+            if let Some(req) = park.try_next().await {
+                req.respond_status(404, "NotFound", "gone");
+            }
+        }
+        loop_task.await.expect("lease loop exits");
+    }
+
+    /// W10-AW (bug_143): a believing incumbent whose completed read
+    /// observes the lease ABSENT — 404, deleted out from under us; the
+    /// Create POST died unanswered — exits belief AT THAT READ. The
+    /// absent-lease regime sits OUTSIDE the fence(11) < steal(19)
+    /// NeverDual derivation: a peer re-Creates with NO steal wait
+    /// (election.rs `FetchOutcome::Create`), so the exit must ride the
+    /// read, not the next facts:Some round (~5s) or the 11s fence.
+    /// Structural: the incumbent's belief IS the dual-dispatch face.
+    /// Pre-fix the facts:None arm bypassed route_act_failed_read (the
+    /// if-let pre-filter) and only re-baselined — belief and a pending
+    /// deferral both leaked across the arm.
+    // r[verify sched.lease.holder-evidenced-lose+3]
+    #[tokio::test(start_paused = true)]
+    async fn w10_aw_completed_404_read_exits_belief_at_the_read() {
+        let (client, mut park) = RequestPark::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        // Round 1 (healthy): acquire + marks reconcile.
+        let get = park.next().await;
+        get.respond_ok(park_lease_json(Some("us"), 3, 10));
+        let put = park.next().await;
+        put.respond_ok(park_lease_json(Some("us"), 3, 11));
+        settle().await;
+        assert!(state.is_leader(), "healthy round acquires");
+        let patch = park.next().await;
+        assert!(patch.path.contains("/pods/us"), "marks reconcile PATCH");
+        patch.respond_ok(pod_ok("us"));
+        settle().await;
+
+        // Round 2: the lease is DELETED out from under us — the GET
+        // completes observing 404; the act phase POSTs a Create that
+        // dies unanswered (FetchedActFailed { facts: None }).
+        let get = park.next().await;
+        get.respond_status(404, "NotFound", "leases \"rio-sched\" not found");
+        let post = park.next().await;
+        assert_eq!(post.method, http::Method::POST, "the 404 routes to Create");
+        post.respond_status(500, "InternalError", "create died unanswered");
+        settle().await;
+
+        // The law: the completed read OBSERVED absence — the lease
+        // provably resolves to nobody, and a peer's re-Create needs no
+        // steal wait. Belief exits at THIS read.
+        assert!(
+            !state.is_leader(),
+            "a believing replica must exit belief at a completed 404 read \
+             (bug_143: the facts:None arm only re-baselined — the dual window \
+             stayed open to the next round or the fence)"
+        );
+        assert_eq!(
+            hooks.loses.lock().expect("loses lock").len(),
+            1,
+            "the absence exit is a routed lose edge (hooks fire once)"
+        );
+
+        shutdown.cancel();
+        for _ in 0..4 {
             if let Some(req) = park.try_next().await {
                 req.respond_status(404, "NotFound", "gone");
             }
@@ -5043,7 +5255,7 @@ mod tests {
     /// Q3 evidence path: a deferred 409 whose next completed read names
     /// a DIFFERENT holder loses WITH holder evidence — the typed lose
     /// edge the signed decision demands.
-    // r[verify sched.lease.holder-evidenced-lose+2]
+    // r[verify sched.lease.holder-evidenced-lose+3]
     #[tokio::test(start_paused = true)]
     async fn deferred_409_resolving_to_foreign_holder_loses_with_evidence() {
         let (client, mut park) = RequestPark::new();
@@ -5113,7 +5325,7 @@ mod tests {
     /// the slow clock is the "rounds fast relative to the fence
     /// budget" regime that makes the believing-observe leg reachable
     /// (the wire shapes are untouched: production loop, park JSON).
-    // r[verify sched.lease.holder-evidenced-lose+2]
+    // r[verify sched.lease.holder-evidenced-lose+3]
     #[tokio::test(start_paused = true)]
     async fn act_failed_own_commit_resolution_clears_the_deferral() {
         let (client, mut park) = RequestPark::new();
@@ -5226,7 +5438,7 @@ mod tests {
     /// so after an evidence re-acquire (a NEW belief episode) the next
     /// believing 409 exhausted immediately from the OLD episode's
     /// latch, violating the ":new belief episode starts clean" law.
-    // r[verify sched.lease.holder-evidenced-lose+2]
+    // r[verify sched.lease.holder-evidenced-lose+3]
     #[tokio::test(start_paused = true)]
     async fn self_fence_resets_the_deferral_for_the_next_belief_episode() {
         let (client, mut park) = RequestPark::new();
@@ -5353,7 +5565,7 @@ mod tests {
     /// eventually happens is the fence law working, not a 409 edge —
     /// and the surviving ledger's own-commit evidence re-acquires in
     /// the same tick.
-    // r[verify sched.lease.holder-evidenced-lose+2]
+    // r[verify sched.lease.holder-evidenced-lose+3]
     // r[verify sched.lease.cancelled-write+2]
     #[tokio::test(start_paused = true)]
     async fn zombie_ledger_survives_the_409_for_evidence_reacquire() {
@@ -7671,7 +7883,7 @@ mod tests {
     /// slow (the same regime as the own-commit-resolution red: rounds
     /// fast relative to the fence budget keeps the believing legs
     /// reachable).
-    // r[verify sched.lease.holder-evidenced-lose+2]
+    // r[verify sched.lease.holder-evidenced-lose+3]
     #[tokio::test(start_paused = true)]
     async fn act_failed_frozen_content_read_resolves_the_deferral() {
         let (client, mut park) = RequestPark::new();
@@ -7780,7 +7992,7 @@ mod tests {
     /// funnel (no evidence consume: there is nothing to consume).
     /// Pre-fix the cell sat outside the unconfirmed.take() gate and
     /// ran nothing; the following 409 exhausted falsely.
-    // r[verify sched.lease.holder-evidenced-lose+2]
+    // r[verify sched.lease.holder-evidenced-lose+3]
     #[tokio::test(start_paused = true)]
     async fn act_failed_moved_content_without_ledger_resolves_the_deferral() {
         let (client, mut park) = RequestPark::new();
@@ -7894,7 +8106,7 @@ mod tests {
     /// transmitted steal also arms the ledger, so the follow-up
     /// holder=us + moved read re-acquires through the evidence leg's
     /// !believes branch — the one-round self-heal pin.
-    // r[verify sched.lease.holder-evidenced-lose+2]
+    // r[verify sched.lease.holder-evidenced-lose+3]
     #[tokio::test(start_paused = true)]
     async fn act_failed_foreign_holder_read_runs_the_evidenced_lose() {
         let (client, mut park) = RequestPark::new();
@@ -7987,7 +8199,92 @@ mod tests {
         loop_task.await.expect("lease loop exits");
     }
 
-    // r[verify sched.lease.holder-evidenced-lose+2]
+    /// W10-AX (bug_143, R22′): the producer-output census — the
+    /// dispatch between the act-failed producer and the routing law
+    /// consumes the producer's FULL output type, with no Some-narrowed
+    /// `if let` pre-filter above it and no facts-only holder
+    /// constructor to narrow WITH. Source-scan over the embedded crate
+    /// source ((wwwww): `include_str!`, no runtime tree walk); plants
+    /// enter at the raw-source scan. All needles are concat!-split in
+    /// THIS test's own source so the census cannot self-match.
+    #[test]
+    fn w10_ax_route_dispatch_consumes_full_producer_output() {
+        // The needles, split so this test's own text never contains
+        // the contiguous forms it scans for.
+        const PREFILTER: &str = concat!("if let ", "Some");
+        const LAW_CALL: &str = concat!("route_act_failed_", "read(");
+        const SOME_ONLY: &str = concat!("HolderCell::", "of(");
+
+        // Violations: (a) the pre-filter shape — PREFILTER within the
+        // 12 lines above a LAW_CALL site (the bug_143 escape hatch,
+        // module-agnostic: tests must not carry it either); (b) any
+        // SOME_ONLY occurrence (the retired Some-only constructor —
+        // of_read is the sole holder constructor, over the full
+        // Option).
+        fn violations(src: &str) -> Vec<String> {
+            const PREFILTER: &str = concat!("if let ", "Some");
+            const LAW_CALL: &str = concat!("route_act_failed_", "read(");
+            const SOME_ONLY: &str = concat!("HolderCell::", "of(");
+            let lines: Vec<&str> = src.lines().collect();
+            let mut v = Vec::new();
+            for (i, line) in lines.iter().enumerate() {
+                if line.contains(SOME_ONLY) {
+                    v.push(format!("{}: retired Some-only constructor", i + 1));
+                }
+                if line.contains(LAW_CALL) && !line.contains("fn ") {
+                    let w = i.saturating_sub(12);
+                    if lines[w..i].iter().any(|l| l.contains(PREFILTER)) {
+                        v.push(format!(
+                            "{}: if-let pre-filter between producer and law",
+                            i + 1
+                        ));
+                    }
+                }
+            }
+            v
+        }
+
+        let live = violations(include_str!("lib.rs"));
+        assert!(
+            live.is_empty(),
+            "producer-output dispatch violations in lib.rs:\n{live:?}"
+        );
+        // Exactly one production dispatch, fed by the full producer
+        // output (the loop's single call site; the needle is split so
+        // this line does not count itself).
+        let dispatch_needle = concat!("HolderCell::", "of_read(facts.as_ref())");
+        assert_eq!(
+            include_str!("lib.rs").matches(dispatch_needle).count(),
+            1,
+            "the loop dispatch is the one production of_read(facts.as_ref()) site"
+        );
+
+        // R22′ plants — the strawman shapes red at the raw-source
+        // scan (assembled from the split needles).
+        let prefilter_red =
+            format!("{PREFILTER}(f) = &facts {{\n// narrowed\nlet action = {LAW_CALL}\n");
+        assert_eq!(
+            violations(&prefilter_red).len(),
+            1,
+            "the if-let pre-filter plant must red"
+        );
+        let some_only_red = format!("let action = {LAW_CALL}\nbelieves,\n{SOME_ONLY}f),\n");
+        assert_eq!(
+            violations(&some_only_red).len(),
+            1,
+            "the Some-only-constructor plant must red"
+        );
+        let green = format!(
+            "let action = {LAW_CALL}\nstanding.believes(),\n{}facts.as_ref()),\n",
+            concat!("HolderCell::", "of_read(")
+        );
+        assert!(
+            violations(&green).is_empty(),
+            "the full-producer dispatch form must pass"
+        );
+    }
+
+    // r[verify sched.lease.holder-evidenced-lose+3]
     /// bug_002 census (Q1-1, machine-derived): iterate the GENERATED
     /// `believes x Holder x Content x Ledger` product (the ALL consts
     /// are pinned by route_act_failed_read's own total match — a new
@@ -7995,7 +8292,8 @@ mod tests {
     /// against an independently written total spec table KEYED by the
     /// product type, so under-enumeration cannot compile in either
     /// function. Also pins the alphabet law directly: no believing
-    /// cell routes to ObserveOnly.
+    /// cell routes to a no-transition action, and the absence
+    /// partition holds in both directions (bug_143).
     #[test]
     fn act_failed_cell_census_total() {
         use ActFailedAction as A;
@@ -8022,6 +8320,18 @@ mod tests {
                 (false, H::Other, C::Moved, L::Empty) => A::ObserveOnly,
                 (false, H::Other, C::Frozen, L::Armed) => A::ObserveOnly,
                 (false, H::Other, C::Frozen, L::Empty) => A::ObserveOnly,
+                // bug_143: the absence rows — believing exits at the
+                // read; standby re-baselines. Content/ledger vacuous
+                // (an absent read constructs Frozen; the law still
+                // names every cell).
+                (true, H::Absent, C::Moved, L::Armed) => A::AbsenceLose,
+                (true, H::Absent, C::Moved, L::Empty) => A::AbsenceLose,
+                (true, H::Absent, C::Frozen, L::Armed) => A::AbsenceLose,
+                (true, H::Absent, C::Frozen, L::Empty) => A::AbsenceLose,
+                (false, H::Absent, C::Moved, L::Armed) => A::AbsenceObserve,
+                (false, H::Absent, C::Moved, L::Empty) => A::AbsenceObserve,
+                (false, H::Absent, C::Frozen, L::Armed) => A::AbsenceObserve,
+                (false, H::Absent, C::Frozen, L::Empty) => A::AbsenceObserve,
             }
         }
         for believes in [false, true] {
@@ -8035,13 +8345,29 @@ mod tests {
                             "cell (believes={believes}, {h:?}, {c:?}, {l:?})"
                         );
                         if believes {
-                            assert_ne!(
-                                routed,
-                                ActFailedAction::ObserveOnly,
+                            assert!(
+                                !matches!(
+                                    routed,
+                                    ActFailedAction::ObserveOnly | ActFailedAction::AbsenceObserve
+                                ),
                                 "believing cell (believes={believes}, {h:?}, {c:?}, \
                                  {l:?}) must run a transition"
                             );
                         }
+                        // The absence partition (bug_143): absence
+                        // actions route exactly the Absent cells —
+                        // this is what discharges the executor's
+                        // facts-presence expects in both directions.
+                        let is_absence_action = matches!(
+                            routed,
+                            ActFailedAction::AbsenceLose | ActFailedAction::AbsenceObserve
+                        );
+                        assert_eq!(
+                            is_absence_action,
+                            matches!(h, HolderCell::Absent),
+                            "absence partition violated at (believes={believes}, \
+                             {h:?}, {c:?}, {l:?}) -> {routed:?}"
+                        );
                     }
                 }
             }
