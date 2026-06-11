@@ -1143,7 +1143,14 @@ async fn run_daemon_lifecycle(
         Err(_) => tracing::warn!("daemon did not exit within 2s after kill (possible zombie)"),
     }
 
-    drain_build_cgroup(build_cgroup).await;
+    // Capture the path before drain consumes the handle — needed for
+    // the quiesce-gate error message below.
+    let build_cgroup_path = build_cgroup.path().to_path_buf();
+    let drain_outcome = drain_build_cgroup(build_cgroup).await;
+    // Structural quiesce gate: never let collect_outputs walk an
+    // overlay upper that may still have live writers.
+    let build_result =
+        refuse_outputs_unless_quiesced(build_result, drain_outcome, &build_cgroup_path);
 
     // Defuse: explicit kill+drain above already ran; guard is redundant.
     scopeguard::ScopeGuard::into_inner(cgroup_kill_guard);
@@ -1175,6 +1182,41 @@ async fn run_daemon_lifecycle(
 /// `is_daemon_transient` (3× local OOM-loop) and from `BuildFailed`
 /// (drv isn't broken). `Ok` → kept; metric still emitted because the
 /// OOM is a real sizing signal.
+/// Structural quiesce gate (companion to the fd-relative NAR-dump
+/// walk): if the build cgroup did not provably drain after
+/// `cgroup.kill` — processes survived the [`monitors::DRAIN_BUDGET`]
+/// (uninterruptible D-state, pre-submitted io_uring SQEs), or the
+/// cgroup state could not be verified at all — the overlay upper may
+/// still be mutating. Collecting outputs from it would let a
+/// kill-evading build process race the dump walk (TOCTOU), so a
+/// non-`Quiesced` drain downgrades `Ok` to `ExecutorError::Cgroup`
+/// (→ `InfrastructureFailure` → scheduler re-dispatches on a fresh
+/// pod) BEFORE `collect_outputs` ever sees the `Ok`.
+///
+/// Deny-on-failure: `DrainOutcome` has no error-tolerant variant —
+/// read failures and poll panics arrive here as `NotQuiesced` and are
+/// refused identically (an unverified cgroup is an unverified cgroup).
+///
+/// An existing `Err` is kept as-is: it is more specific (e.g.
+/// `CgroupOom` drives the resource-floor bump) and `collect_outputs`
+/// is skipped for any `Err` regardless, so the security property holds.
+// r[impl builder.cgroup.quiesce-before-collect]
+fn refuse_outputs_unless_quiesced(
+    build_result: Result<rio_nix::protocol::build::BuildResult, ExecutorError>,
+    drain_outcome: monitors::DrainOutcome,
+    cgroup_path: &std::path::Path,
+) -> Result<rio_nix::protocol::build::BuildResult, ExecutorError> {
+    match drain_outcome {
+        monitors::DrainOutcome::Quiesced => build_result,
+        monitors::DrainOutcome::NotQuiesced { .. } if build_result.is_err() => build_result,
+        monitors::DrainOutcome::NotQuiesced { reason } => Err(ExecutorError::Cgroup(format!(
+            "build cgroup {} not quiesced ({reason}); refusing to collect outputs from a tree \
+             that may still have live writers",
+            cgroup_path.display(),
+        ))),
+    }
+}
+
 // r[impl builder.oom.cgroup-watch+3]
 fn apply_oom_override(
     oom_detected: bool,
@@ -1735,6 +1777,61 @@ mod tests {
             matches!(r, Err(ExecutorError::BuildFailed(_))),
             "got: {r:?}"
         );
+    }
+
+    // r[verify builder.cgroup.quiesce-before-collect]
+    /// Outputs MUST never be collected from a non-quiesced tree: a
+    /// `NotQuiesced` drain outcome downgrades `Ok(Built)` to an
+    /// infrastructure error naming the cgroup BEFORE `collect_outputs`
+    /// sees the `Ok`. `Quiesced` is the ONLY outcome that lets an `Ok`
+    /// through.
+    #[test]
+    fn test_refuse_outputs_unless_quiesced() {
+        use monitors::DrainOutcome;
+        use rio_nix::protocol::build::BuildResult;
+        let cg = std::path::Path::new("/sys/fs/cgroup/rio/build-x");
+        let not_quiesced = || DrainOutcome::NotQuiesced {
+            reason: "2 process(es) survived cgroup.kill past the 30s drain budget".into(),
+        };
+
+        // NotQuiesced + Ok(Built) → Err(Cgroup) naming what happened and where.
+        let r = refuse_outputs_unless_quiesced(Ok(BuildResult::success()), not_quiesced(), cg);
+        match r {
+            Err(ExecutorError::Cgroup(msg)) => {
+                assert!(msg.contains("survived cgroup.kill"), "msg: {msg}");
+                assert!(msg.contains("/sys/fs/cgroup/rio/build-x"), "msg: {msg}");
+            }
+            other => panic!("expected Err(Cgroup), got: {other:?}"),
+        }
+
+        // Deny-on-failure: a read-error outcome refuses collection too.
+        let r = refuse_outputs_unless_quiesced(
+            Ok(BuildResult::success()),
+            DrainOutcome::NotQuiesced {
+                reason: "cgroup.procs unreadable: No such file or directory".into(),
+            },
+            cg,
+        );
+        assert!(matches!(r, Err(ExecutorError::Cgroup(_))), "got: {r:?}");
+
+        // Quiesced → Ok preserved (happy path).
+        let r =
+            refuse_outputs_unless_quiesced(Ok(BuildResult::success()), DrainOutcome::Quiesced, cg);
+        assert!(r.is_ok(), "got: {r:?}");
+
+        // Existing Err preserved: CgroupOom must keep driving the
+        // resource-floor bump, not be masked by the quiesce gate
+        // (collect_outputs is skipped for any Err regardless).
+        let r = refuse_outputs_unless_quiesced(Err(ExecutorError::CgroupOom), not_quiesced(), cg);
+        assert!(matches!(r, Err(ExecutorError::CgroupOom)), "got: {r:?}");
+
+        // The gate's error classifies as InfrastructureFailure:
+        // neither daemon-transient (no local retry into the same
+        // non-quiesced cgroup) nor permanent (fresh pod plausibly fine).
+        let e = refuse_outputs_unless_quiesced(Ok(BuildResult::success()), not_quiesced(), cg)
+            .unwrap_err();
+        assert!(!e.is_daemon_transient());
+        assert!(!e.is_permanent());
     }
 
     fn test_env() -> ExecutorEnv {

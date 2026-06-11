@@ -217,7 +217,37 @@ pub(super) fn spawn_cgroup_monitors(
     }
 }
 
+/// Budget for the post-kill `cgroup.procs` drain poll.
+///
+/// SIGKILL → exit is normally ~ms, but a kill-evading process can
+/// linger far longer: uninterruptible D-state (stuck I/O, writeback
+/// flush) or pre-submitted io_uring SQEs keep a task alive past
+/// `cgroup.kill`. The old 2s budget made the quiesce best-effort
+/// (warn + proceed); output collection now REFUSES to run when the
+/// budget expires non-empty (`refuse_outputs_unless_quiesced` in
+/// mod.rs), so the budget trades teardown latency in the pathological
+/// case against false-positive build aborts. 30s: the loop exits on
+/// the first empty read (builds are already dead in the normal case),
+/// and 30s covers writeback/D-state stalls that 2s demonstrably did
+/// not.
+pub(super) const DRAIN_BUDGET: Duration = Duration::from_secs(30);
+
+/// Result of the post-kill drain poll. [`DrainOutcome::Quiesced`] is
+/// the ONLY value that permits output collection — deny-on-failure:
+/// every error path (read failure, ENOENT teardown race, poll-task
+/// panic) maps to `NotQuiesced`, never to "assume empty".
+#[derive(Debug)]
+pub(super) enum DrainOutcome {
+    /// `cgroup.procs` read as empty — no live writers in the tree.
+    Quiesced,
+    /// Processes survived the budget, or the cgroup state could not be
+    /// verified. `reason` is human-readable for the resulting error.
+    NotQuiesced { reason: String },
+}
+
 /// Kill the per-build cgroup tree, wait for it to drain, then drop.
+/// Returns whether the tree provably quiesced; the caller MUST NOT
+/// collect outputs on [`DrainOutcome::NotQuiesced`].
 ///
 /// `daemon.kill()` in the caller SIGKILLs the nix-daemon process only.
 /// The builder is a GRANDCHILD (forked by the daemon during
@@ -231,42 +261,71 @@ pub(super) fn spawn_cgroup_monitors(
 /// empty cgroup is a no-op — so we call it unconditionally rather than
 /// branching on `build_result.is_err()`.
 // r[impl builder.cgroup.kill-on-teardown]
-pub(super) async fn drain_build_cgroup(build_cgroup: crate::cgroup::BuildCgroup) {
+pub(super) async fn drain_build_cgroup(build_cgroup: crate::cgroup::BuildCgroup) -> DrainOutcome {
     if let Err(e) = build_cgroup.kill() {
         // ENOENT shouldn't happen (we hold the BuildCgroup, Drop hasn't
         // run); EACCES would mean delegation is broken. Log and fall
-        // through — rmdir will fail EBUSY and warn again, but we don't
-        // want to upgrade a successful build to an error here.
+        // through — the poll below decides whether the tree quiesced
+        // anyway (it may already be empty on the success path).
         tracing::warn!(error = %e, "build_cgroup.kill() failed");
     }
     // cgroup.kill is async: write returns before procs are gone. Poll
-    // cgroup.procs until empty or 2s elapsed (same budget as daemon.wait;
-    // SIGKILL → exit is ~ms, 2s is vast headroom for a zombie-reparented
-    // tree). Sync read on blocking pool — 200 iterations of a single-line
-    // procfs read, negligible.
+    // cgroup.procs until empty or DRAIN_BUDGET elapsed. Sync read on
+    // blocking pool — 10ms-interval single-line procfs reads, negligible.
     let cgroup_path_for_poll = build_cgroup.path().to_path_buf();
-    let drained = tokio::task::spawn_blocking(move || {
-        for _ in 0..200 {
-            match std::fs::read_to_string(cgroup_path_for_poll.join("cgroup.procs")) {
-                Ok(s) if s.trim().is_empty() => return true,
-                Ok(_) => std::thread::sleep(Duration::from_millis(10)),
-                // ENOENT: cgroup already gone (shouldn't happen — we
-                // hold the BuildCgroup — but treat as drained).
-                Err(_) => return true,
-            }
-        }
-        false
+    let outcome = tokio::task::spawn_blocking(move || {
+        poll_procs_until_empty(&cgroup_path_for_poll, DRAIN_BUDGET)
     })
     .await
-    .unwrap_or(false);
-    if !drained {
+    // Deny-on-failure: a panicked poll task leaves the cgroup
+    // state unverified.
+    .unwrap_or_else(|e| DrainOutcome::NotQuiesced {
+        reason: format!("drain poll task panicked: {e}"),
+    });
+    if let DrainOutcome::NotQuiesced { reason } = &outcome {
         tracing::warn!(
             cgroup = %build_cgroup.path().display(),
-            "cgroup still has processes 2s after cgroup.kill; rmdir will EBUSY"
+            reason,
+            "build cgroup not quiesced after cgroup.kill; output collection will be refused; rmdir will EBUSY"
         );
     }
+    outcome
     // build_cgroup drops here. rmdir succeeds if the drain above emptied
     // it; otherwise Drop warns EBUSY + leaks (cleared on pod restart).
+}
+
+/// Poll `<cgroup>/cgroup.procs` until it reads empty or `budget`
+/// elapses. Exits early on the first empty read.
+///
+/// Deny-on-failure: any read error returns `NotQuiesced` immediately —
+/// ENOENT (someone else tore the cgroup down — teardown race), EMFILE,
+/// EACCES all mean the tree's state cannot be verified, and an
+/// unverified cgroup must be treated as a cgroup with live writers.
+fn poll_procs_until_empty(cgroup_path: &Path, budget: Duration) -> DrainOutcome {
+    let deadline = std::time::Instant::now() + budget;
+    let procs = cgroup_path.join("cgroup.procs");
+    loop {
+        let remaining = match std::fs::read_to_string(&procs) {
+            Ok(s) => s.lines().filter(|l| !l.trim().is_empty()).count(),
+            Err(e) => {
+                return DrainOutcome::NotQuiesced {
+                    reason: format!("cgroup.procs unreadable: {e}"),
+                };
+            }
+        };
+        if remaining == 0 {
+            return DrainOutcome::Quiesced;
+        }
+        if std::time::Instant::now() >= deadline {
+            return DrainOutcome::NotQuiesced {
+                reason: format!(
+                    "{remaining} process(es) survived cgroup.kill past the {}s drain budget",
+                    budget.as_secs()
+                ),
+            };
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[cfg(test)]
@@ -330,5 +389,85 @@ mod tests {
         let monitors = mk_monitors(parent.path().to_path_buf(), None);
         let (_, oom) = monitors.stop();
         assert!(!oom, "baseline=None means no OOM watching");
+    }
+
+    // r[verify builder.cgroup.quiesce-before-collect]
+    /// A kill-evading process (D-state, pre-submitted io_uring SQEs)
+    /// keeps `cgroup.procs` non-empty past `cgroup.kill`: the poll MUST
+    /// report `NotQuiesced` (with the surviving count in the reason)
+    /// instead of claiming the tree is quiesced — the caller refuses
+    /// output collection on anything but `Quiesced`.
+    #[test]
+    fn test_poll_procs_not_quiesced_when_procs_remain() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cgroup.procs"), "1234\n5678\n").unwrap();
+        match poll_procs_until_empty(dir.path(), Duration::from_millis(50)) {
+            DrainOutcome::NotQuiesced { reason } => {
+                assert!(
+                    reason.contains("2 process(es) survived cgroup.kill"),
+                    "reason must name the surviving count: {reason}"
+                );
+            }
+            DrainOutcome::Quiesced => panic!("non-empty cgroup.procs must not be Quiesced"),
+        }
+    }
+
+    /// Happy path: empty `cgroup.procs` → `Quiesced`, exits on the
+    /// first read without burning the budget.
+    #[test]
+    fn test_poll_procs_empty_is_quiesced() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cgroup.procs"), "").unwrap();
+        let start = std::time::Instant::now();
+        let outcome = poll_procs_until_empty(dir.path(), Duration::from_secs(30));
+        assert!(
+            matches!(outcome, DrainOutcome::Quiesced),
+            "got: {outcome:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "empty cgroup must exit early, not burn the budget"
+        );
+    }
+
+    // r[verify builder.cgroup.quiesce-before-collect]
+    /// Deny-on-failure: an unreadable `cgroup.procs` (ENOENT teardown
+    /// race, fd exhaustion, …) is an UNVERIFIED cgroup — the poll MUST
+    /// report `NotQuiesced`, never map a read error to "assume empty".
+    #[test]
+    fn test_poll_procs_read_error_is_not_quiesced() {
+        let dir = tempfile::tempdir().unwrap();
+        // No cgroup.procs file at all → read errors with ENOENT.
+        match poll_procs_until_empty(dir.path(), Duration::from_millis(50)) {
+            DrainOutcome::NotQuiesced { reason } => {
+                assert!(
+                    reason.contains("cgroup.procs unreadable"),
+                    "reason must say the read failed: {reason}"
+                );
+            }
+            DrainOutcome::Quiesced => panic!("unreadable cgroup.procs must not be Quiesced"),
+        }
+    }
+
+    /// A tree that empties mid-poll is observed as `Quiesced` — the
+    /// poll keeps re-reading until the budget, not just once.
+    #[test]
+    fn test_poll_procs_observes_late_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let procs = dir.path().join("cgroup.procs");
+        std::fs::write(&procs, "1234\n").unwrap();
+        let writer = std::thread::spawn({
+            let procs = procs.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(50));
+                std::fs::write(&procs, "").unwrap();
+            }
+        });
+        let outcome = poll_procs_until_empty(dir.path(), Duration::from_secs(30));
+        writer.join().unwrap();
+        assert!(
+            matches!(outcome, DrainOutcome::Quiesced),
+            "late drain within budget must be observed, got: {outcome:?}"
+        );
     }
 }
