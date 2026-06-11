@@ -86,14 +86,82 @@ impl SchedulerDb {
         .await
     }
 
-    /// Delete a tenant by name. Returns rows_affected > 0. FK CASCADE
+    /// Delete a tenant by name, DISPOSITIONING gc-hold evidence FIRST
+    /// (bug_095 / migration 104): `gc_holds.tenant_id` is `ON DELETE
+    /// RESTRICT` — hold rows are KeepForever audit evidence, so a
+    /// hold-bearing tenant refuses deletion at the schema layer and
+    /// this fn turns each face into a typed outcome BEFORE issuing
+    /// the DELETE (the operator gets the doctrine, not an FK error):
+    /// active holds → release first (the heal edge stays witnessed);
+    /// released history → the tenant is permanently archival (its
+    /// rows anchor the audit's WHO). FK CASCADE
     /// (tenant_keys/upstreams/path_tenants/chunk_tenants) and SET NULL
     /// (builds/derivations) handle the rest — see migrations 009/012/
     /// 017/018/026.
-    pub(crate) async fn delete_tenant(&self, name: &str) -> Result<bool, sqlx::Error> {
+    pub(crate) async fn delete_tenant(
+        &self,
+        name: &str,
+    ) -> Result<TenantDeleteOutcome, sqlx::Error> {
+        let Some(row) = sqlx::query!(
+            r#"SELECT t.tenant_id,
+                      COUNT(h.hold_id) FILTER (
+                          WHERE h.released_at IS NULL
+                            AND (h.expires_at IS NULL OR h.expires_at > now())
+                      ) AS "active_holds!",
+                      COUNT(h.hold_id) AS "total_holds!"
+                 FROM tenants t
+                 LEFT JOIN gc_holds h ON h.tenant_id = t.tenant_id
+                WHERE t.tenant_name = $1
+                GROUP BY t.tenant_id"#,
+            name
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(TenantDeleteOutcome::NotFound);
+        };
+        if row.active_holds > 0 {
+            return Ok(TenantDeleteOutcome::ActiveHolds {
+                count: row.active_holds,
+            });
+        }
+        if row.total_holds > 0 {
+            return Ok(TenantDeleteOutcome::HoldHistory {
+                count: row.total_holds,
+            });
+        }
         let r = sqlx::query!("DELETE FROM tenants WHERE tenant_name = $1", name)
             .execute(&self.pool)
             .await?;
-        Ok(r.rows_affected() > 0)
+        Ok(if r.rows_affected() > 0 {
+            TenantDeleteOutcome::Deleted
+        } else {
+            // Raced with a concurrent delete (or a hold inserted
+            // between the check and the DELETE — RESTRICT would then
+            // error; the race window is the operator-RPC plane).
+            TenantDeleteOutcome::NotFound
+        })
     }
+}
+
+/// Typed offboarding outcome (bug_095): the gc-hold doctrine's faces,
+/// dispositioned BEFORE the DELETE — see [`SchedulerDb::delete_tenant`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TenantDeleteOutcome {
+    /// No hold rows; the tenant row was deleted.
+    Deleted,
+    /// No tenant by that name.
+    NotFound,
+    /// Unreleased, unexpired hold(s): release them first — the heal
+    /// edge stays witnessed (holds are RELEASED, never deleted).
+    ActiveHolds {
+        /// Active hold rows referencing the tenant.
+        count: i64,
+    },
+    /// Released hold history pins the tenant anchor: a hold-bearing
+    /// tenant is permanently archival by doctrine (M_104).
+    HoldHistory {
+        /// Total hold rows referencing the tenant.
+        count: i64,
+    },
 }

@@ -2386,6 +2386,47 @@ pub const M_102: () = ();
 /// joins seed (f) and the sweep re-check as a reachability conjunct.
 pub const M_103: () = ();
 
+/// `104_gc_holds_restrict.sql` — bw10 WO-S1-3 (bug_095; the wave's
+/// single sanctioned DDL, R11-as-amended, full frozen ritual).
+///
+/// **The doctrine made schema.** `gc_holds` is KeepForever-registered
+/// ("released, never deleted — the hold history is audit evidence",
+/// stated in gc/mod.rs, M_103 above, and the retention registry), yet
+/// 103 shipped its `tenant_id` FK inline `ON DELETE CASCADE`: the
+/// live `delete_tenant` admin path silently erased the tenant's
+/// entire hold audit history AND any ACTIVE litigation-class hold
+/// with no release record — an unwitnessed terminal disposition
+/// outside the hold's {released, expired} alphabet. The
+/// retention-truth lint's KeepForever arm was `Ok(())` by
+/// construction (an EXEMPTION, not a checked claim), so the
+/// registry-vs-schema contradiction was CI-green for a full wave.
+///
+/// **Why a NEW migration:** 103 is checksum-frozen (shipped; the
+/// `migration_checksums_frozen` test pins its bytes) — its CASCADE
+/// row is superseded by this RESTRICT re-declaration, never edited in
+/// place. DROP + ADD under the same constraint name
+/// (`gc_holds_tenant_id_fkey`, the PG default 103's inline form
+/// minted).
+///
+/// **RESTRICT semantics, derived (not the no-FK tombstone sibling):**
+/// the hold's protective conjunct joins through `path_tenants`
+/// (also cascaded), so dropping the FK entirely would orphan
+/// `tenant_id` while the CASCADE survived one hop away; RESTRICT
+/// preserves the protective function — a tenant with ANY hold rows
+/// (active OR released) refuses deletion at the schema layer.
+/// Consequence, stated deliberately: a tenant that ever carried a
+/// hold is PERMANENTLY archival — released holds keep their audit
+/// rows and those rows pin their tenant anchor (deleting the tenants
+/// row would orphan the audit's WHO). `delete_tenant` dispositions
+/// the two faces typed: active holds → "release first" (the heal
+/// edge stays witnessed); released-history → the archival refusal
+/// naming this doctrine. `path_tenants` itself needs NO second DDL:
+/// gc_holds RESTRICT structurally precedes any path_tenants cascade
+/// (a tenant with hold rows cannot be deleted at all — derivation
+/// recorded at the WO). Global-scope holds carry `tenant_id` NULL
+/// and are untouched by tenant offboarding.
+pub const M_104: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

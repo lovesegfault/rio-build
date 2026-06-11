@@ -88,14 +88,26 @@ pub(super) async fn delete_tenant(
     if name.is_empty() {
         return Err(Status::invalid_argument("tenant_name is required"));
     }
-    let deleted = db
+    use crate::db::TenantDeleteOutcome as O;
+    match db
         .delete_tenant(name)
         .await
-        .status_internal("delete_tenant")?;
-    if !deleted {
-        return Err(Status::not_found(format!("tenant '{name}' does not exist")));
+        .status_internal("delete_tenant")?
+    {
+        O::Deleted => Ok(DeleteTenantResponse { deleted: true }),
+        O::NotFound => Err(Status::not_found(format!("tenant '{name}' does not exist"))),
+        // bug_095 / migration 104: hold rows are KeepForever audit
+        // evidence — the typed dispositions, never an FK error.
+        O::ActiveHolds { count } => Err(Status::failed_precondition(format!(
+            "tenant '{name}' has {count} active gc hold(s); release them \
+             first — holds are audit evidence (released, never deleted)"
+        ))),
+        O::HoldHistory { count } => Err(Status::failed_precondition(format!(
+            "tenant '{name}' carries gc hold audit history ({count} row(s)); \
+             hold-bearing tenants are permanently archival — offboarding \
+             refuses by doctrine (M_104)"
+        ))),
     }
-    Ok(DeleteTenantResponse { deleted })
 }
 
 pub(super) fn tenant_row_to_proto(row: TenantRow) -> TenantInfo {

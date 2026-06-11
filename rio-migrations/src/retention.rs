@@ -59,7 +59,30 @@ pub enum RetentionPolicy {
     /// sound (bounded cardinality, append-only audit value, singleton)
     /// — or records an HONEST retention debt (growth is visible here
     /// instead of behind a false sweeper claim; §5-Q18 disposition).
-    KeepForever(&'static str),
+    ///
+    /// Since bug_095 this is a CHECKED NEGATIVE CLAIM, not an
+    /// exemption: the retention-truth lint asserts (a) NO cascading
+    /// FK on the table survives the migration corpus (a cascade is a
+    /// live deletion vector regardless of what the registry says —
+    /// gc_holds shipped exactly that contradiction CI-green), and
+    /// (b) workspace `DELETE FROM` statements match the declared
+    /// [`KeepForeverDeleter`] exactly.
+    KeepForever(&'static str, KeepForeverDeleter),
+}
+
+/// How a KeepForever table's rows may nonetheless leave the database
+/// — the checked-negative-claim taxonomy (bug_095). The lint
+/// RESOLVES each variant; none is exempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepForeverDeleter {
+    /// NO deletion vector exists: no cascading FK targeting the
+    /// table's rows, no production `DELETE FROM` anywhere in the
+    /// workspace. Audit/evidence/singleton rows.
+    None,
+    /// Deleted ONLY inside the named production functions (admin
+    /// RPCs / operator verbs): every production `DELETE FROM` hit
+    /// must sit inside a listed fn's body; still no cascading FK.
+    AdminRpc(&'static [&'static str]),
 }
 
 /// Every public table and its lifecycle. Keep ALPHABETICAL — the test
@@ -109,6 +132,7 @@ pub const RETENTION_REGISTRY: &[(&str, RetentionPolicy)] = &[
              (dashboard delete) — no autonomous age sweep bounds growth. Recorded \
              honestly so the growth is visible here instead of behind a sweeper \
              claim that names no retention path",
+            KeepForeverDeleter::AdminRpc(&["delete_build"]),
         ),
     ),
     (
@@ -125,6 +149,7 @@ pub const RETENTION_REGISTRY: &[(&str, RetentionPolicy)] = &[
         RetentionPolicy::KeepForever(
             "key-rotation audit trail; one row per rotation event — cardinality bounded by \
              operational rotations, audit value permanent",
+            KeepForeverDeleter::None,
         ),
     ),
     (
@@ -182,6 +207,7 @@ pub const RETENTION_REGISTRY: &[(&str, RetentionPolicy)] = &[
         "gc_collect_state",
         RetentionPolicy::KeepForever(
             "singleton row (CHECK (singleton)); the collector's durable state",
+            KeepForeverDeleter::None,
         ),
     ),
     (
@@ -190,6 +216,7 @@ pub const RETENTION_REGISTRY: &[(&str, RetentionPolicy)] = &[
             "round-9 WO-S1-4: operator-set GC holds; released_at closes a hold \
              without deleting it — the hold history is audit evidence by design \
              (rows are operator-created, bounded by operator action)",
+            KeepForeverDeleter::None,
         ),
     ),
     (
@@ -198,6 +225,7 @@ pub const RETENTION_REGISTRY: &[(&str, RetentionPolicy)] = &[
             "dead on arrival: ADR-023 chose sla_ema_state for the EMA persist; rows are \
              never written (xtask schema_liveness ALLOW_DEAD names it); DROP TABLE \
              deferred to a future migration because 042 is checksum-frozen",
+            KeepForeverDeleter::None,
         ),
     ),
     (
@@ -224,6 +252,7 @@ pub const RETENTION_REGISTRY: &[(&str, RetentionPolicy)] = &[
              in practice by revocation volume; a bounded-window sweep becomes \
              sound if the owner confirms a cluster-wide max JWT lifetime \
              (exp−iat) — recorded debt until then",
+            KeepForeverDeleter::None,
         ),
     ),
     (
@@ -231,6 +260,7 @@ pub const RETENTION_REGISTRY: &[(&str, RetentionPolicy)] = &[
         RetentionPolicy::KeepForever(
             "one row per leader generation; the claims-floor fence reads MAX(generation) — \
              cardinality bounded by elections, the floor's history is the safety artifact",
+            KeepForeverDeleter::None,
         ),
     ),
     (
@@ -280,6 +310,7 @@ pub const RETENTION_REGISTRY: &[(&str, RetentionPolicy)] = &[
              the fleet configuration and the rows are the controller's durable \
              evidence — the prior 'reconciler deletes' claim named no deleting \
              code",
+            KeepForeverDeleter::None,
         ),
     ),
     (
@@ -289,6 +320,7 @@ pub const RETENTION_REGISTRY: &[(&str, RetentionPolicy)] = &[
              registration audit records minted at sweep — outliving the bytes \
              is their purpose; growth is bounded by sweep volume and an \
              operator truncation is a deliberate audit-disposal act",
+            KeepForeverDeleter::None,
         ),
     ),
     (
@@ -313,6 +345,7 @@ pub const RETENTION_REGISTRY: &[(&str, RetentionPolicy)] = &[
              Worse than growth: a swept realisation that still has dep rows \
              aborts delete_swept_path's batch — the CA-resolve owner's recorded \
              debt (sweep order or an explicit dep delete is owed)",
+            KeepForeverDeleter::None,
         ),
     ),
     (
@@ -321,6 +354,7 @@ pub const RETENTION_REGISTRY: &[(&str, RetentionPolicy)] = &[
             "round-9 WO-S1-4: append-only identity audit records minted at \
              sweep (the realisation rows' tombstones) — same disposal posture \
              as path_tenant_tombstones",
+            KeepForeverDeleter::None,
         ),
     ),
     (
@@ -342,24 +376,33 @@ pub const RETENTION_REGISTRY: &[(&str, RetentionPolicy)] = &[
     ),
     (
         "sla_config_epoch",
-        RetentionPolicy::KeepForever("singleton epoch row; bounded by config pushes"),
+        RetentionPolicy::KeepForever(
+            "singleton epoch row; bounded by config pushes",
+            KeepForeverDeleter::None,
+        ),
     ),
     (
         "sla_ema_state",
         RetentionPolicy::KeepForever(
             "one row per (hw_class, drv family) EMA cell — cardinality bounded by the catalog, \
-             the state IS the model",
+             the state IS the model; the reference-epoch reseed \
+             (check_reference_epoch) resets cluster-scoped cells",
+            KeepForeverDeleter::AdminRpc(&["check_reference_epoch"]),
         ),
     ),
     (
         "sla_observed_instance_types",
         RetentionPolicy::KeepForever(
             "one row per observed instance type — bounded by the cloud catalog",
+            KeepForeverDeleter::None,
         ),
     ),
     (
         "sla_overrides",
-        RetentionPolicy::KeepForever("operator-written rows; deleted by operators only"),
+        RetentionPolicy::KeepForever(
+            "operator-written rows; removed by the delete_sla_override admin verb only",
+            KeepForeverDeleter::AdminRpc(&["delete_sla_override"]),
+        ),
     ),
     (
         "tenant_keys",
@@ -373,10 +416,23 @@ pub const RETENTION_REGISTRY: &[(&str, RetentionPolicy)] = &[
     ),
     (
         "tenant_upstreams",
-        RetentionPolicy::KeepForever("operator-configured upstreams; deleted by admin RPCs only"),
+        RetentionPolicy::CascadeFrom {
+            parent: "tenants",
+            migration: "026_tenant_upstreams.sql",
+            note: "config rows (not audit evidence) die with their tenant; \
+                   the RemoveUpstream admin verb (upstreams::delete) removes \
+                   individual rows. The prior KeepForever claim was \
+                   schema-false — bug_095's checked negative claim caught \
+                   the 026 CASCADE on its first run",
+        },
     ),
     (
         "tenants",
-        RetentionPolicy::KeepForever("operator-managed tenant set; deleted by admin RPCs only"),
+        RetentionPolicy::KeepForever(
+            "operator-managed tenant set; deleted by the delete_tenant admin \
+             RPC only (bug_095: gc_holds RESTRICT additionally refuses while \
+             ANY hold rows reference the tenant)",
+            KeepForeverDeleter::AdminRpc(&["delete_tenant"]),
+        ),
     ),
 ];

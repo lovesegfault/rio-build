@@ -233,3 +233,97 @@ async fn test_delete_tenant() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// r[verify store.gc.hold+2]
+/// W10-G (bug_095, migration 104): tenant offboarding cannot erase
+/// hold evidence. Pre-104 the gc_holds FK was ON DELETE CASCADE — a
+/// tenant delete silently erased the tenant's hold audit history and
+/// any ACTIVE litigation-class hold with no release record (the red:
+/// deleted=true, hold row GONE). Post-104 + the typed disposition:
+/// the delete REFUSES (FailedPrecondition naming the heal edge) while
+/// an active hold exists; releasing the hold flips the refusal to the
+/// ARCHIVAL face (hold history pins the tenant anchor — released
+/// rows are audit evidence and their tenant_id must keep resolving);
+/// the audit row survives every attempt.
+#[tokio::test]
+async fn delete_tenant_dispositions_gc_holds() -> anyhow::Result<()> {
+    let (svc, _actor, _task, db) = setup_svc_default().await;
+
+    svc.create_tenant(Request::new(rio_proto::types::CreateTenantRequest {
+        tenant_name: "held-tenant".into(),
+        ..Default::default()
+    }))
+    .await?;
+    let tenant_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT tenant_id FROM tenants WHERE tenant_name = 'held-tenant'")
+            .fetch_one(&db.pool)
+            .await?;
+
+    // An ACTIVE tenant-scope hold (litigation class).
+    let hold_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO gc_holds (scope, tenant_id, reason, created_by) \
+         VALUES ('tenant', $1, 'litigation hold', 'w10-g') RETURNING hold_id",
+    )
+    .bind(tenant_id)
+    .fetch_one(&db.pool)
+    .await?;
+
+    // Active hold ⇒ the delete REFUSES typed and the hold survives.
+    let refused = svc
+        .delete_tenant(Request::new(rio_proto::types::DeleteTenantRequest {
+            tenant_name: "held-tenant".into(),
+        }))
+        .await;
+    let err = refused.expect_err(
+        "W10-G RED: tenant delete succeeded with an ACTIVE hold — \
+         the cascade erased litigation evidence",
+    );
+    assert_eq!(
+        err.code(),
+        tonic::Code::FailedPrecondition,
+        "the refusal is typed, got {err:?}"
+    );
+    assert!(
+        err.message().contains("active"),
+        "the refusal names the heal edge (release first), got: {}",
+        err.message()
+    );
+    let holds: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM gc_holds WHERE tenant_id = $1")
+        .bind(tenant_id)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(holds, 1, "W10-G RED: the active hold row was erased");
+
+    // Release the hold (the heal edge): the delete now refuses on the
+    // ARCHIVAL face — released holds are audit evidence and pin their
+    // tenant anchor.
+    sqlx::query("UPDATE gc_holds SET released_at = now() WHERE hold_id = $1")
+        .bind(hold_id)
+        .execute(&db.pool)
+        .await?;
+    let archival = svc
+        .delete_tenant(Request::new(rio_proto::types::DeleteTenantRequest {
+            tenant_name: "held-tenant".into(),
+        }))
+        .await;
+    let err = archival.expect_err("hold HISTORY must also refuse (archival doctrine)");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        err.message().contains("archival") || err.message().contains("history"),
+        "the refusal names the doctrine, got: {}",
+        err.message()
+    );
+
+    // The release record survives every offboarding attempt.
+    let released: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM gc_holds WHERE tenant_id = $1 AND released_at IS NOT NULL",
+    )
+    .bind(tenant_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        released, 1,
+        "the release record is permanent audit evidence"
+    );
+    Ok(())
+}

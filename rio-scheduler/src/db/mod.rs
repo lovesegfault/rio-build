@@ -33,6 +33,7 @@ pub(crate) mod materialization;
 pub(crate) mod open_attempts;
 mod recovery;
 mod tenants;
+pub(crate) use tenants::TenantDeleteOutcome;
 pub(crate) mod wanted;
 
 #[cfg(test)]

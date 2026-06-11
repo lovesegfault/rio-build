@@ -570,12 +570,16 @@ fn check_seccomp_profile(
 
 // r[verify sched.db.table-retention+1]
 /// `RetentionTruth`: every registry policy claim resolves — see the
-/// `Lint` variant doc. KeepForever rows are exempt by construction
-/// (their rationale IS the decision; nothing to resolve).
+/// `Lint` variant doc. KeepForever rows are a CHECKED NEGATIVE CLAIM
+/// since bug_095 (no cascading FK survives the migration corpus; the
+/// workspace `DELETE FROM` census matches the declared deleter) —
+/// the prior `Ok(())` exemption let `gc_holds` ship "released, never
+/// deleted" beside an `ON DELETE CASCADE` FK, CI-green.
 fn retention_truth() -> Result<()> {
     use rio_migrations::retention::{RETENTION_REGISTRY, RetentionPolicy};
     let root = repo_root();
     let corpus = retention_corpus(root)?;
+    let migrations = migration_corpus(root)?;
     let mut violations = Vec::new();
     for (table, policy) in RETENTION_REGISTRY {
         let res = match policy {
@@ -583,7 +587,9 @@ fn retention_truth() -> Result<()> {
             RetentionPolicy::CascadeFrom {
                 parent, migration, ..
             } => check_cascade(table, parent, migration, root),
-            RetentionPolicy::KeepForever(_) => Ok(()),
+            RetentionPolicy::KeepForever(_, deleter) => {
+                check_keep_forever(table, *deleter, &corpus, &migrations)
+            }
         };
         if let Err(e) = res {
             violations.push(format!("  {table}: {e:#}"));
@@ -1154,6 +1160,283 @@ fn truncate_list_names(norm: &str, table: &str) -> bool {
     false
 }
 
+/// The migration corpus for KeepForever FK resolution: every
+/// `rio-migrations/migrations/*.sql`, numeric order, as
+/// `(basename, text)`.
+fn migration_corpus(root: &Path) -> Result<Vec<(String, String)>> {
+    let dir = root.join("rio-migrations").join("migrations");
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .with_context(|| format!("read {}", dir.display()))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "sql"))
+        .collect();
+    files.sort();
+    let mut out = Vec::new();
+    for f in files {
+        let name = f.file_name().unwrap().to_string_lossy().to_string();
+        let text = std::fs::read_to_string(&f)?;
+        out.push((name, text));
+    }
+    Ok(out)
+}
+
+/// Final FK state of constraints ON `table` (the child side — the
+/// rows a parent-DELETE could take), folded over the migration corpus
+/// in order: inline `REFERENCES … ON DELETE <action>` clauses in the
+/// table's CREATE block (constraint name synthesized as the PG
+/// default `<table>_<col>_fkey`) + `ALTER TABLE <table>
+/// DROP/ADD CONSTRAINT`. Returns `constraint name → action text`
+/// (uppercased; absent ON DELETE = "NO ACTION").
+fn keep_forever_fk_state(
+    table: &str,
+    migrations: &[(String, String)],
+) -> std::collections::BTreeMap<String, String> {
+    let mut state: std::collections::BTreeMap<String, String> = Default::default();
+    for (_name, text) in migrations {
+        let upper = text.to_uppercase();
+        // --- inline REFERENCES inside CREATE TABLE <table> ( … ) ---
+        let create_pat = format!("CREATE TABLE {} (", table.to_uppercase());
+        if let Some(start) = upper.find(&create_pat) {
+            let body_start = start + create_pat.len();
+            let bytes = upper.as_bytes();
+            let mut depth = 1i32;
+            let mut k = body_start;
+            while k < upper.len() && depth > 0 {
+                match bytes[k] as char {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                k += 1;
+            }
+            let block = &text[body_start..k.saturating_sub(1)];
+            for line in block.lines() {
+                let u = line.to_uppercase();
+                if !u.contains("REFERENCES") {
+                    continue;
+                }
+                let col = line
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim_matches(',')
+                    .to_lowercase();
+                if col.is_empty() || col == "constraint" || col == "foreign" {
+                    // explicit named constraints handled below via
+                    // their CONSTRAINT name if present in-line
+                    continue;
+                }
+                let action = if u.contains("ON DELETE CASCADE") {
+                    "CASCADE"
+                } else if u.contains("ON DELETE SET NULL") {
+                    "SET NULL"
+                } else if u.contains("ON DELETE RESTRICT") {
+                    "RESTRICT"
+                } else {
+                    "NO ACTION"
+                };
+                state.insert(format!("{table}_{col}_fkey"), action.to_string());
+            }
+        }
+        // --- ALTER TABLE <table> DROP/ADD CONSTRAINT ---
+        let alter_pat = format!("ALTER TABLE {}", table.to_uppercase());
+        let mut from = 0;
+        while let Some(i) = upper[from..].find(&alter_pat) {
+            let at = from + i;
+            // statement = up to the next ';'
+            let end = upper[at..].find(';').map(|e| at + e).unwrap_or(upper.len());
+            let stmt_u = &upper[at..end];
+            let stmt = &text[at..end];
+            if let Some(d) = stmt_u.find("DROP CONSTRAINT") {
+                let name = stmt[d + "DROP CONSTRAINT".len()..]
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_lowercase();
+                state.remove(&name);
+            }
+            if let Some(a) = stmt_u.find("ADD CONSTRAINT") {
+                let name = stmt[a + "ADD CONSTRAINT".len()..]
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_lowercase();
+                if stmt_u.contains("FOREIGN KEY") {
+                    let action = if stmt_u.contains("ON DELETE CASCADE") {
+                        "CASCADE"
+                    } else if stmt_u.contains("ON DELETE SET NULL") {
+                        "SET NULL"
+                    } else if stmt_u.contains("ON DELETE RESTRICT") {
+                        "RESTRICT"
+                    } else {
+                        "NO ACTION"
+                    };
+                    state.insert(name, action.to_string());
+                }
+            }
+            from = end;
+        }
+    }
+    state
+}
+
+/// bug_095: the KeepForever CHECKED NEGATIVE CLAIM. (a) No cascading
+/// FK on the table survives the migration corpus — an `ON DELETE
+/// CASCADE` reaching a KeepForever table is a live deletion vector no
+/// registry prose can talk away (gc_holds shipped exactly this,
+/// CI-green, with the live `delete_tenant` path silently erasing
+/// active litigation-class holds). (b) The production `DELETE FROM`
+/// census matches the declared deleter: `None` ⇒ zero hits;
+/// `AdminRpc(symbols)` ⇒ every hit sits inside a listed fn's body
+/// (brace-matched span, the `defines_fn` discipline).
+fn check_keep_forever(
+    table: &str,
+    deleter: rio_migrations::retention::KeepForeverDeleter,
+    corpus: &[(std::path::PathBuf, String)],
+    migrations: &[(String, String)],
+) -> Result<()> {
+    use rio_migrations::retention::KeepForeverDeleter as D;
+    // (a) the cascade-FK face — the schema layer.
+    let fk_state = keep_forever_fk_state(table, migrations);
+    for (name, action) in &fk_state {
+        ensure!(
+            action != "CASCADE",
+            "KeepForever table carries a live deletion vector: FK `{name}` \
+             is ON DELETE CASCADE in the final migration-corpus state — a \
+             parent DELETE silently erases rows the registry declares \
+             never-deleted (repair = a NEW migration re-declaring RESTRICT; \
+             shipped migrations are frozen)"
+        );
+    }
+    // (b) the workspace DELETE FROM face — the code layer.
+    let mut hits: Vec<(std::path::PathBuf, usize)> = Vec::new();
+    for (path, norm) in corpus {
+        let mut from = 0;
+        while let Some(i) = find_stmt(norm, "DELETE FROM", table, from) {
+            hits.push((path.clone(), i));
+            from = i + 1;
+        }
+    }
+    match deleter {
+        D::None => {
+            ensure!(
+                hits.is_empty(),
+                "KeepForever(None) table has production DELETE FROM hit(s) \
+                 in {:?} — either the rows are NOT keep-forever (fix the \
+                 registry) or the delete is a doctrine violation",
+                hits.iter()
+                    .map(|(p, _)| p.display().to_string())
+                    .collect::<Vec<_>>()
+            );
+        }
+        D::AdminRpc(symbols) => {
+            ensure!(
+                !hits.is_empty(),
+                "KeepForever(AdminRpc{symbols:?}) declares sanctioned \
+                 delete fns but no production DELETE FROM {table} exists — \
+                 stale registry row (reclassify as None)"
+            );
+            for (path, pos) in &hits {
+                let norm = &corpus.iter().find(|(p, _)| p == path).unwrap().1;
+                let inside = symbols.iter().any(|sym| {
+                    fn_body_spans(norm, sym)
+                        .iter()
+                        .any(|(s, e)| pos >= s && pos < e)
+                });
+                ensure!(
+                    inside,
+                    "DELETE FROM {table} at {}:{pos} (byte offset) is OUTSIDE \
+                     every sanctioned deleter fn {symbols:?} — an unsanctioned \
+                     deletion vector on a KeepForever table",
+                    path.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Byte offsets of `fn <symbol>` body spans (brace-matched) in `norm`.
+fn fn_body_spans(norm: &str, symbol: &str) -> Vec<(usize, usize)> {
+    let pat = format!("fn {symbol}");
+    let bytes = norm.as_bytes();
+    let mut spans = Vec::new();
+    let mut from = 0;
+    while let Some(i) = norm[from..].find(&pat) {
+        let at = from + i;
+        let after = at + pat.len();
+        // word boundary: next char is ws, '(' or '<'
+        let ok = norm[after..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_whitespace() || c == '(' || c == '<');
+        if !ok {
+            from = after;
+            continue;
+        }
+        // body start: first '{' at paren-depth 0 after the signature
+        let mut depth_paren = 0i32;
+        let mut j = after;
+        let mut body_start = None;
+        while j < norm.len() {
+            match bytes[j] as char {
+                '(' => depth_paren += 1,
+                ')' => depth_paren -= 1,
+                ';' if depth_paren == 0 => break,
+                '{' if depth_paren == 0 => {
+                    body_start = Some(j);
+                    break;
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        if let Some(bs) = body_start {
+            let mut depth = 0i32;
+            let mut k = bs;
+            while k < norm.len() {
+                match bytes[k] as char {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                k += 1;
+            }
+            spans.push((bs, k.min(norm.len())));
+            from = k.min(norm.len());
+        } else {
+            from = j.max(after) + 1;
+        }
+    }
+    spans
+}
+
+/// Byte offset of the next `DELETE FROM <table>` statement hit at or
+/// after `from` (word-bounded on the table name), or None.
+fn find_stmt(norm: &str, verb: &str, table: &str, from: usize) -> Option<usize> {
+    let pat = format!("{verb} {table}");
+    let mut f = from;
+    while let Some(i) = norm[f..].find(&pat) {
+        let at = f + i;
+        let after = at + pat.len();
+        let boundary = norm[after..]
+            .chars()
+            .next()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+        if boundary {
+            return Some(at);
+        }
+        f = after;
+    }
+    None
+}
+
 /// One `SweptBy` claim: the symbol defines somewhere in the corpus,
 /// and a defining file carries the deleting statement for `table`.
 fn check_swept_by(
@@ -1696,5 +1979,98 @@ mod tests {
             BTreeSet::from(["public".to_owned()]),
             "schema captured, not table"
         );
+    }
+
+    /// W10-H (bug_095, R22′ planted red at the OUTERMOST scan layer):
+    /// a fixture migration declaring a KeepForever table WITH a
+    /// cascade FK goes RED — the exact evasion axis the prior
+    /// `Ok(())` exemption shipped (gc_holds + 103's inline CASCADE,
+    /// CI-green for a full wave). The raw .sql text enters the scan;
+    /// no post-extraction fixture.
+    #[test]
+    fn keep_forever_flags_planted_cascade_fixture() {
+        use rio_migrations::retention::KeepForeverDeleter;
+        let planted = vec![(
+            "900_strawman.sql".to_string(),
+            "CREATE TABLE evidence_rows (\n\
+                 id UUID PRIMARY KEY,\n\
+                 tenant_id UUID REFERENCES tenants (tenant_id) ON DELETE CASCADE\n\
+             );\n"
+                .to_string(),
+        )];
+        let err = check_keep_forever("evidence_rows", KeepForeverDeleter::None, &[], &planted)
+            .expect_err("a KeepForever table with a cascade FK MUST go red");
+        assert!(
+            err.to_string().contains("live deletion vector"),
+            "the red names the violation, got: {err:#}"
+        );
+    }
+
+    /// The 103→104 supersession shape resolves: DROP + ADD CONSTRAINT
+    /// RESTRICT in a LATER migration clears the inline CASCADE (the
+    /// frozen-migration repair form) — and the lint reads the FINAL
+    /// corpus state, not any single file.
+    #[test]
+    fn keep_forever_accepts_restrict_supersession() {
+        use rio_migrations::retention::KeepForeverDeleter;
+        let corpus = vec![
+            (
+                "901_create.sql".to_string(),
+                "CREATE TABLE evidence_rows (\n\
+                     tenant_id UUID REFERENCES tenants (tenant_id) ON DELETE CASCADE\n\
+                 );\n"
+                    .to_string(),
+            ),
+            (
+                "902_repair.sql".to_string(),
+                "ALTER TABLE evidence_rows\n\
+                     DROP CONSTRAINT evidence_rows_tenant_id_fkey;\n\
+                 ALTER TABLE evidence_rows\n\
+                     ADD CONSTRAINT evidence_rows_tenant_id_fkey\n\
+                     FOREIGN KEY (tenant_id) REFERENCES tenants (tenant_id)\n\
+                     ON DELETE RESTRICT;\n"
+                    .to_string(),
+            ),
+        ];
+        check_keep_forever("evidence_rows", KeepForeverDeleter::None, &[], &corpus)
+            .expect("RESTRICT supersession is the lawful repair form");
+    }
+
+    /// The DELETE FROM census arms: None refuses a production hit;
+    /// AdminRpc accepts a hit INSIDE the sanctioned fn body and
+    /// refuses one outside it (brace-matched spans, not file-level).
+    #[test]
+    fn keep_forever_delete_census_polarity() {
+        use rio_migrations::retention::KeepForeverDeleter;
+        let inside = "fn delete_thing(pool: &PgPool) {\n    sqlx::query(\"DELETE FROM evidence_rows WHERE id = $1\");\n}\n";
+        let outside = "fn delete_thing(pool: &PgPool) {}\nfn rogue(pool: &PgPool) {\n    sqlx::query(\"DELETE FROM evidence_rows WHERE id = $1\");\n}\n";
+        let corpus_inside = vec![(std::path::PathBuf::from("a.rs"), inside.to_string())];
+        let corpus_outside = vec![(std::path::PathBuf::from("b.rs"), outside.to_string())];
+
+        check_keep_forever(
+            "evidence_rows",
+            KeepForeverDeleter::AdminRpc(&["delete_thing"]),
+            &corpus_inside,
+            &[],
+        )
+        .expect("a hit inside the sanctioned fn is lawful");
+
+        let err = check_keep_forever(
+            "evidence_rows",
+            KeepForeverDeleter::AdminRpc(&["delete_thing"]),
+            &corpus_outside,
+            &[],
+        )
+        .expect_err("a hit OUTSIDE the sanctioned fn must go red");
+        assert!(err.to_string().contains("OUTSIDE"), "got: {err:#}");
+
+        let err = check_keep_forever(
+            "evidence_rows",
+            KeepForeverDeleter::None,
+            &corpus_inside,
+            &[],
+        )
+        .expect_err("None with any production hit must go red");
+        assert!(err.to_string().contains("production DELETE FROM"));
     }
 }
