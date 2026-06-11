@@ -77,4 +77,25 @@ for q in 'rio_scheduler_substituting_derivations' 'rio_scheduler_open_attempts';
   }
 done
 
+# merged_bug_013 (W10-BU): the damping header binds to the RENDERED
+# scaleDown spec — quantified prose contradicting the spec in the
+# same file was the r23-drift shape (the retired 1800s/25%-per-600s
+# ladder narrated as current). The R23' lexicon seed rows.
+w=$(yq -N 'select(.kind=="ScaledObject" and .metadata.name=="rio-store") | .spec.advanced.horizontalPodAutoscalerConfig.behavior.scaleDown.stabilizationWindowSeconds' "$out")
+grep -qE "^# .*${w}s stabilization window" templates/store-scaledobject.yaml || {
+  echo "FAIL: the scaledobject header does not narrate the rendered ${w}s scaleDown window" >&2
+  exit 1
+}
+grep -qE '^# .*Percent-100/60s' templates/store-scaledobject.yaml || {
+  echo "FAIL: the scaledobject header does not narrate the rendered Percent-100/60s collapse policy" >&2
+  exit 1
+}
+# Any surviving 1800s mention must be explicitly historical.
+stale_1800=$(grep -nE '1800s' templates/store-scaledobject.yaml | grep -vE 'retired|old 1800s' || true)
+test -z "$stale_1800" || {
+  echo "FAIL: 1800s damping narrated as current (must carry the retired/historical qualifier):" >&2
+  echo "$stale_1800" >&2
+  exit 1
+}
+
 echo "OK: demand-side inhibitor trigger + 300s/Percent-100 fast collapse on one ScaledObject (AGREE by max-over-triggers)"

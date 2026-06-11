@@ -83,6 +83,34 @@ test "$tol" = "rio.build/store" || {
   exit 1
 }
 
+# merged_bug_013 (W10-BU): narration-vs-render binds for the swept
+# capacity rows — the R23' lexicon seed corpus. The store templates
+# must narrate the RENDERED scale-bound doctrine (the dedicated
+# tainted rio-store NodePool, D1) — never rio-general as the
+# operative bound; the metal capacity narration must not contradict
+# the M1 [spot, on-demand] doctrine (43-metal-capacity-doctrine.sh
+# pins the rendered half).
+if grep -qE 'on-demand rio-general pool' templates/store.yaml; then
+  echo "FAIL: store.yaml still narrates rio-general as the store scale bound (D1 retired it — the store rides its own tainted NodePool)" >&2
+  exit 1
+fi
+grep -qE 'rio-store NodePool' templates/store.yaml || {
+  echo "FAIL: store.yaml narration lost the rio-store pool scale-bound rows (D1)" >&2
+  exit 1
+}
+grep -qE 'rio-store pool limit binds' templates/store-scaledobject.yaml || {
+  echo "FAIL: store-scaledobject.yaml ceiling row does not narrate the rio-store pool as the binding limit (D1)" >&2
+  exit 1
+}
+if grep -qE 'rio-general pool limit binds' templates/store-scaledobject.yaml; then
+  echo "FAIL: store-scaledobject.yaml still narrates the rio-general pool as the binding limit (D1 retired it)" >&2
+  exit 1
+fi
+if grep -qE 'metal-\*: on-demand only' values.yaml; then
+  echo "FAIL: values.yaml still narrates metal as od-only (M1 folded metal into [spot, on-demand])" >&2
+  exit 1
+fi
+
 # The k3s face: karpenter disabled (default) => NO nodeSelector.
 out2=$TMPDIR/store-nodepool-default.yaml
 helm template rio . --set global.image.tag=test >"$out2"

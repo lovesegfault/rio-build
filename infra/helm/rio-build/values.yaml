@@ -999,8 +999,11 @@ scheduler:
       # capacityTypes [spot, on-demand]: a spot interruption mid-FOD is
       # safe (FODs are idempotent, the failure_count machinery retries),
       # and spot is the cheaper default. Narrow if interruption rates
-      # prove problematic. (Contrast metal-*: on-demand only, spot
-      # interruption mid-VM-test wastes the whole build.)
+      # prove problematic. (Metal classes run [spot, on-demand] too
+      # since M1 — od failover absorbs interruption-prone windows; the
+      # od-only-by-nodepool exception is the STORE fleet, not any
+      # builder class. bind[43-metal-capacity-doctrine.sh]
+      # bind[44-store-nodepool.sh])
       fetcher-x86:
         nodeClass: rio-default
         labels:

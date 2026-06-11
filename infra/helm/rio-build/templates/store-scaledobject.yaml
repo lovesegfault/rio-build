@@ -30,22 +30,23 @@
 # signals plus CPU as the reactive corrective term for whatever the
 # ratios miss.
 #
-# Why scale-down is heavily damped: replica count contracting
-# mid-wave re-funnels ingest through fewer NICs exactly when the
-# backlog gauge is sawtoothing; the 1800s stabilization window means
-# a wave has to be over for 30 minutes before the first pod is
-# released. Once draining engages it is geometric, not linear:
-# max(25%, 1 pod) per 600s (selectPolicy Max), so an uncapped fleet
-# drains 105→2 in ~12-16 periods (~2-2.7h; k8s removes ceil(25%) of
-# the remaining count per period — the slower bound assumes floor
-# removal) instead of 103 single-pod ticks (~17h of paid 32-vCPU
-# nodes); at small scale Pods-1 still floors the rate (14→2 in ~5-8
-# periods, at or below the old Pods-1-only pace). The gateway's
-# scaledobject deliberately stays Pods-1 (max 8 vs 105). Scale-up has
-# no stabilization — adding a pod is cheap and the failure mode of
-# being late is the store at the floor through a whole substitution
-# wave — but its per-period COMMITMENT is bounded (Pods 16/30s, see
-# the scaleUp block).
+# Why scale-down is safe to actuate FAST (D2 — the abort-aware
+# collapse): contraction is gated on quiet CONSENSUS, not on a long
+# ladder. The rendered spec is a 300s stabilization window (the N=10
+# scrape debounce at the 30s prometheus interval) followed by
+# Percent-100/60s (selectPolicy Max): once every trigger — backlog,
+# busy builders, CPU, and the demand-side retry inhibitor below —
+# agrees the wave is over for 5 minutes, the drain is one HPA pass.
+# The guards are the TRIGGERS, not the ladder rate (the scaleDown
+# block carries the full derivation; the pre-D2 ladder this replaced
+# was 1800s + max(25%, 1 pod)/600s — retired, kept here only as
+# history). bind[45-store-scaledown-inhibitor.sh]
+# bind[26-store-scaling.sh]
+# The gateway's scaledobject deliberately stays Pods-1 (max 8 vs
+# 105). Scale-up has no stabilization — adding a pod is cheap and the
+# failure mode of being late is the store at the floor through a
+# whole substitution wave — but its per-period COMMITMENT is bounded
+# (Pods 16/30s, see the scaleUp block).
 #
 # Kill switch: deleting the ScaledObject freezes replicas at the
 # current count; `store.autoscaling.enabled=false` instead re-renders
@@ -69,8 +70,10 @@ spec:
   # (store pods request 16 CPU / 8 Gi on EKS). The ceiling is the
   # PG-connection SAFETY BACKSTOP (values.yaml carries the derivation
   # against Aurora's runtime-constant max_connections), never the
-  # operative scale limit — Karpenter's rio-general pool limit binds
-  # first; a pod past node capacity just stays Pending one node-mint.
+  # operative scale limit — Karpenter's rio-store pool limit binds
+  # first (D1: the store fleet's own tainted NodePool;
+  # bind[44-store-nodepool.sh]); a pod past node capacity just stays
+  # Pending one node-mint.
   minReplicaCount: {{ $a.minReplicas }}
   maxReplicaCount: {{ $a.maxReplicas }}
   advanced:

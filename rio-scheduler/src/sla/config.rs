@@ -122,12 +122,13 @@ pub struct HwClassDef {
     #[serde(default)]
     pub max_fleet_cores: Option<u32>,
     /// Capacity-types this hw-class is permitted to provision.
-    /// `r[sched.sla.hwclass.capacity-types]`: `solve_full` and the
+    /// `r[sched.sla.hwclass.capacity-types+2]`: `solve_full` and the
     /// controller's `all_cells`/`fallback_cell` iterate THIS, not
-    /// `CapacityType::ALL`, so an od-only class (e.g. metal) never
-    /// generates a `(h, Spot)` cell — structurally preventing the
+    /// `CapacityType::ALL`, so an od-only class never generates a
+    /// `(h, Spot)` cell — structurally preventing the
     /// conflicting-requirements ICE loop a requirement-based exclusion
-    /// would cause. Default `[Spot, Od]` (both).
+    /// would cause. Default `[Spot, Od]` (both; since M1 no shipped
+    /// class narrows it — metal runs spot+od with od failover).
     #[serde(default = "default_capacity_types")]
     pub capacity_types: Vec<CapacityType>,
     /// live_050(c): typed capacity-degradation ladder. Names the

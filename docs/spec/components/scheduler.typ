@@ -4518,14 +4518,19 @@ This approach keeps per-event processing well under the 1ms budget needed for
   chokepoint + worker `passes_intent_filter`).
 ]
 
-#r("sched.sla.hwclass.capacity-types")[
+#r("sched.sla.hwclass.capacity-types+2")[
   `sla.hwClasses[h].capacityTypes` lists capacity-types $h$ is permitted to
   provision (default `[spot, on-demand]`). `solve_full` and the controller's
   `all_cells`/`fallback_cell` iterate THIS, not `CapacityType::ALL`, so an
-  od-only class (e.g. metal) structurally never generates a `(h, Spot)` cell
+  od-only class structurally never generates a `(h, Spot)` cell
   --- preventing the conflicting-requirements ICE loop a requirement-based
   exclusion would cause.
 ]
+
+(No shipped hw-class is od-only since M1 folded metal into
+`[spot, on-demand]` with od failover --- the doctrine pin is
+`43-metal-capacity-doctrine.sh`; the mechanism above stays normative for any
+operator-narrowed class.)
 
 #r("sched.sla.fod-feature-derivation+3")[
   The scheduler derives a derivation's _effective_ feature set ONCE at DAG-add

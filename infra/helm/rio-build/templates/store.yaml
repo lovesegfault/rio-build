@@ -61,10 +61,11 @@ spec:
   #      apps/v1 default 25% rounds DOWN to 0 for N<4 (rollout deadlock
   #      with required anti-affinity on a fixed-size cluster).
   #   4. REQUIRED-SPREAD-BLOCKS-SCALE-OUT — dissolved by Karpenter: a
-  #      Pending store pod on the untainted on-demand rio-general pool
-  #      mints a node in ~30-60s, up to the pool's limits.cpu — which
-  #      IS the intended operative scale bound (the KEDA ceiling is
-  #      only the PG backstop).
+  #      Pending store pod on the dedicated tainted rio-store NodePool
+  #      (D1 — od-only, WhenEmptyOrUnderutilized reclaim) mints a node
+  #      in ~30-60s, up to that pool's limits.cpu — which IS the
+  #      intended operative scale bound (the KEDA ceiling is only the
+  #      PG backstop). bind[44-store-nodepool.sh]
   {{- /* FLOOR-gated (rio.alwaysRunsMultiple — merged_bug_378's axis
          swap): the explicit maxUnavailable: 1 exists to satisfy the
          merged_021 rollout-deadlock rule, but it is only SAFE when a
@@ -102,9 +103,10 @@ spec:
              mean N NICs, or scale-out merely re-partitions one node's
              bandwidth (the old SOFT spread was capacity-dishonest on
              exactly that premise). Scale-out is never blocked, only
-             delayed one Karpenter node-mint (~30-60s on the untainted
-             on-demand rio-general pool) up to the pool's limits.cpu —
-             the operative scale bound. Gate on the CEILING, like
+             delayed one Karpenter node-mint (~30-60s on the dedicated
+             tainted rio-store NodePool, D1) up to that pool's
+             limits.cpu — the operative scale bound
+             (bind[44-store-nodepool.sh]). Gate on the CEILING, like
              gateway.yaml: KEDA owns the live count anywhere in
              [minReplicas, maxReplicas], so the rule must hold whenever
              the autoscaler MAY run more than one pod (and a required
@@ -194,7 +196,9 @@ spec:
             # Coupled to the S3 logs/ lifecycle via the tf variable
             # (bug_326) — see values.yaml logRetentionDays.
             - name: RIO_LOG_RETENTION_DAYS
-              value: {{ $s.logRetentionDays | default 30 | quote }}
+              # No `| default` shadow (the convention 14 lines up):
+              # values.yaml owns the single default.
+              value: {{ $s.logRetentionDays | quote }}
             # P0542: s3.dualstack.{region}.amazonaws.com has AAAA;
             # the default endpoint is v4-only. Without this, v6-only
             # pods reach S3 via DNS64+NAT64 (works, but adds a hop).

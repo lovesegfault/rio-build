@@ -1004,7 +1004,7 @@ pub fn solve_full(
         let mut candidates: Vec<Candidate> = Vec::with_capacity(h_set.len() * 2);
         for h in h_set {
             let class_max = class_max_of(h);
-            // r[impl sched.sla.hwclass.capacity-types]
+            // r[impl sched.sla.hwclass.capacity-types+2]
             // §13c D5: per-hwClass capacity-types so an od-only class
             // (metal) structurally never produces a (h, Spot) cell —
             // the requirement-based alternative would emit conflicting
@@ -2695,7 +2695,7 @@ mod tests {
     /// `CapacityType::ALL`. An od-only hw-class (metal) MUST NOT
     /// produce `(h, Spot)` candidates — neither in the Feasible
     /// admissible set nor in the BestEffort cell fallback.
-    // r[verify sched.sla.hwclass.capacity-types]
+    // r[verify sched.sla.hwclass.capacity-types+2]
     #[test]
     fn solve_full_respects_per_class_capacity_types() {
         let fit = mk_fit(30.0, 2000.0, 0.0, f64::INFINITY, 0.1);
