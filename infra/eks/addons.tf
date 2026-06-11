@@ -107,6 +107,32 @@ resource "helm_release" "cilium" {
       tunnelProtocol = "geneve"
       bpf            = { masquerade = true }
 
+      # live_056-a (verdict 2026-06-11): per-build-Job CiliumIdentity
+      # explosion. Cilium's DEFAULT identity-relevant label set
+      # includes k8s:job-name / k8s:controller-uid (both forms), so
+      # EVERY ephemeral builder Job minted a fresh CiliumIdentity —
+      # 8.3K identities collapsed policy enforcement and blackholed
+      # builder→store cluster-wide. The build plane is Job-per-build
+      # BY DESIGN: identity cardinality must be a function of the
+      # STABLE label space (namespace/app/component), never of
+      # per-build object identity — fleet churn must not grow the
+      # policy universe.
+      #
+      # v1.19.4 SEMANTICS (source-verified): `!`-prefixed patterns
+      # are EXCLUSIONS-ARE-ADDITIVE — they SUBTRACT from the default
+      # identity-relevant set. WARNING: any NON-`!` inclusion pattern
+      # flips the whole filter to whitelist-mode and REPLACES the
+      # default set; the exclusions-only form below is the only safe
+      # shape — never mix inclusion patterns into this string.
+      #
+      # Mirrored in nix/cilium-render.nix (one chart, two render
+      # paths, one filter; the share-pin assert there keys both to
+      # nix/pins.toml's cilium version, so a pin bump re-validates
+      # the filter semantics by ritual). The k3s fixture-render check
+      # (cilium-labels-filter, nix/misc-checks.nix) asserts the
+      # rendered ConfigMap carries this line.
+      labels = "k8s:!job-name k8s:!batch.kubernetes.io/job-name k8s:!controller-uid k8s:!batch.kubernetes.io/controller-uid"
+
       kubeProxyReplacement = true
       k8sServiceHost       = replace(module.eks.cluster_endpoint, "https://", "")
       k8sServicePort       = 443

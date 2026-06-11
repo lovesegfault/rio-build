@@ -2589,6 +2589,76 @@ in
         fi
         touch $out
       '';
+
+  # live_056-a (bughunt-9 W9-CQ, the founding plant): the cilium
+  # identity-label filter is a COMMITTED default in both render paths.
+  # 8.3K per-build-Job CiliumIdentities (k8s:job-name/controller-uid
+  # identity-relevant by default × the Job-per-build plane) collapsed
+  # policy enforcement and blackholed builder→store cluster-wide; the
+  # k3s fixture reproduced the explosion shape at small scale,
+  # unasserted — this check is the assertion. It renders the SAME
+  # chart the VM tests boot (nix/cilium-render.nix — whose share-pin
+  # assert keys the chart to nix/pins.toml's cilium version, so a pin
+  # bump re-validates the filter semantics by ritual) and asserts:
+  #   (i)  the cilium-config carries the labels filter line;
+  #   (ii) the filter is EXCLUSIONS-ONLY — every pattern is
+  #        `!`-prefixed (v1.19.4 semantics: exclusions SUBTRACT from
+  #        the default identity-relevant set; ONE non-`!` inclusion
+  #        pattern flips the whole filter to whitelist-mode and
+  #        REPLACES the default set — the unsafe shape this guard
+  #        makes unshippable).
+  # The addons.tf side carries the same value (W9-CR: the yamlencode
+  # block is plain HCL — terraform validate covers parse; the
+  # CONTENT pin is the mirror comment + this check on the shared
+  # chart). Scoped honestly: this certifies "the committed default
+  # renders into the chart"; the live identity-cardinality readback
+  # rides the owner-queue act list (the WO-S5-9 retirement record).
+  # No repo-path existence quantification — the rendered derivation
+  # is a build input, so the (vvvvv) staging hazard does not apply.
+  cilium-labels-filter =
+    let
+      rendered = import ./cilium-render.nix {
+        inherit pkgs;
+        inherit (inputs) nixhelm;
+        system = pkgs.stdenv.hostPlatform.system;
+      };
+      want = "k8s:!job-name k8s:!batch.kubernetes.io/job-name k8s:!controller-uid k8s:!batch.kubernetes.io/controller-uid";
+    in
+    pkgs.runCommand "rio-cilium-labels-filter" { } ''
+      cfg=${rendered}/02-cilium.yaml
+      line=$(grep -E '^  labels: ' "$cfg" || true)
+      if [ -z "$line" ]; then
+        echo "FAIL: rendered cilium-config carries NO identity-label filter —" >&2
+        echo "every ephemeral builder Job mints a fresh CiliumIdentity" >&2
+        echo "(live_056-a: 8.3K identities collapsed policy enforcement)." >&2
+        echo "Expected in cilium-render.nix + infra/eks/addons.tf:" >&2
+        echo "  labels: ${want}" >&2
+        exit 1
+      fi
+      case "$line" in
+        *"${want}"*) : ;;
+        *)
+          echo "FAIL: cilium labels filter drifted from the committed default:" >&2
+          echo "  got:  $line" >&2
+          echo "  want: labels: ${want}" >&2
+          exit 1
+          ;;
+      esac
+      # Whitelist-mode guard (exclusions-only law): every pattern
+      # token must be !-prefixed after the k8s: source prefix.
+      for tok in $(printf '%s' "$line" | sed 's/^  labels: //; s/"//g'); do
+        case "$tok" in
+          k8s:!*) : ;;
+          *)
+            echo "FAIL: labels filter contains a non-exclusion pattern '$tok' —" >&2
+            echo "one inclusion pattern flips cilium to whitelist-mode and" >&2
+            echo "REPLACES the default identity-relevant set (v1.19.4 semantics)." >&2
+            exit 1
+            ;;
+        esac
+      done
+      touch $out
+    '';
 }
 # The quint/TLC protocol-model checks and the mbt-* conformance checks
 # used to be spliced in here; they are now imported directly by
