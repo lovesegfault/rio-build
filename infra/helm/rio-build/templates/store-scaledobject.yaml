@@ -175,26 +175,47 @@ spec:
           "targetBuildersPerReplica"
           $a.targetBuildersPerReplica) | nindent 4 }}
     # Demand-side scale-down INHIBITOR (live_056-c, the D2 dual law):
-    # client-plane retry pressure against the store. The series is
-    # DEMAND-PLANE and probe/scrape-immune BY THE LAW: the gateway's
-    # PutPath-retry counter counts retry events on store
-    # Code::Aborted/unreachable — kubelet grpc readiness probes
-    # (store.yaml, real health RPCs every 5s) and tcpSocket liveness
-    # handshakes never enter it, so the release edge ("attempts
-    # cease") is reachable in production (a store-side SYN/accept or
-    # whole-interceptor count would be PERMANENTLY nonzero under
-    # probing and veto the Q6 fast collapse forever). Client-plane
-    # also has no datapath-blackhole gap: a drop before the store
-    # pod's stack still shows as client retries — the exact live_056
-    # shape. zero-work AND nonzero-retries => NOT idle => this
-    # trigger's ceil(rate/threshold) holds desired up; incident-scale
-    # pressure (thousands of builders re-trying) saturates to
-    # maxReplicaCount, so desired never shrinks below current during
-    # a real outage. Threshold: the named violable
-    # targetRetryAttemptsPerReplica (values.yaml — derivation there).
+    # client-plane retry pressure against the store. EMIT-LAW BIND
+    # (merged_bug_038): the trigger consumes
+    # rio_gateway_putpath_retry_events_total — EVERY failure
+    # observation at the gateway PutPath chokepoint, labeled by typed
+    # status class (the rio_common CODE_CLASS_LABELS closed alphabet;
+    # label values aborted / unavailable / deadline_exceeded /
+    # resource_exhausted / ... — boot-seeded per class so no arm can
+    # be silently non-emitting) — and this query SUMS ACROSS the
+    # class label, so an unreachable store (unavailable: the
+    # live_056-c outage class) moves the series the trigger consumes.
+    # The pre-bind trigger consumed
+    # rio_gateway_putpath_aborted_retries_total, which emits on
+    # Code::Aborted ONLY — a code a LIVE store mints — so the trigger
+    # was structurally flat during the exact reachability outages it
+    # guards; that counter persists for the I-168 attempt-budget
+    # dashboard, NOT for this inhibitor. The 300s/Percent-100
+    # collapse spec stands CONDITIONED on this bound inhibitor.
+    # bind[45-store-scaledown-inhibitor.sh] (the per-class legs; the
+    # series-moves half lives crate-side beside the emit law).
+    # The series is DEMAND-PLANE and probe/scrape-immune BY THE LAW:
+    # kubelet grpc readiness probes (store.yaml, real health RPCs
+    # every 5s) and tcpSocket liveness handshakes never enter it, so
+    # the release edge ("attempts cease") is reachable in production
+    # (a store-side SYN/accept or whole-interceptor count would be
+    # PERMANENTLY nonzero under probing and veto the Q6 fast collapse
+    # forever). Client-plane also has no datapath-blackhole gap: a
+    # drop before the store pod's stack lands in the unavailable /
+    # deadline_exceeded arms, counted since the class-labeled emit
+    # law — the live_056 shape. zero-work AND nonzero-retries => NOT
+    # idle => this trigger's ceil(rate/threshold) holds desired up.
+    # non-normative[direct-upload]: builders upload straight to the
+    # store (runtime/setup.rs) with terminal-outcome-only metrics —
+    # incident-scale BUILDER retry cardinality is not observable in
+    # this gateway-plane series and is no part of the inhibitor's
+    # law; holding desired up under real pressure follows from
+    # ceil(rate/threshold) alone.
+    # Threshold: the named violable targetRetryAttemptsPerReplica
+    # (values.yaml — derivation there).
     {{- include "rio.promTrigger" (list $ $a.prometheusAddress
-          "sum(rate(rio_gateway_putpath_aborted_retries_total[2m]))"
-          "rio_gateway_putpath_aborted_retries_total"
+          "sum(rate(rio_gateway_putpath_retry_events_total[2m]))"
+          "rio_gateway_putpath_retry_events_total"
           "targetRetryAttemptsPerReplica"
           $a.targetRetryAttemptsPerReplica) | nindent 4 }}
     # Saturation (reactive, all classes): decompression, hashing,

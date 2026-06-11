@@ -31,15 +31,26 @@ test -n "$trig" || {
 }
 
 # (i)/(ii): the inhibitor trigger exists, queries the CLIENT-plane
-# retry series (rate over the gateway counter), and nothing else.
-grep -q 'rio_gateway_putpath_aborted_retries_total' <<<"$trig" || {
-  echo "FAIL: no demand-side inhibitor trigger — a reachability outage reads as idleness (live_056-c)" >&2
+# retry series (rate over the gateway's class-labeled emit-law
+# counter — merged_bug_038: the aborted-only counter left the
+# trigger structurally flat during reachability outages), and
+# nothing else.
+grep -q 'rio_gateway_putpath_retry_events_total' <<<"$trig" || {
+  echo "FAIL: no demand-side inhibitor trigger on the class-labeled emit-law counter — a reachability outage reads as idleness (live_056-c/merged_bug_038)" >&2
   exit 1
 }
-grep -q 'sum(rate(rio_gateway_putpath_aborted_retries_total\[2m\]))' <<<"$trig" || {
+grep -q 'sum(rate(rio_gateway_putpath_retry_events_total\[2m\]))' <<<"$trig" || {
   echo "FAIL: inhibitor query drifted from the client-plane rate shape" >&2
   exit 1
 }
+# Query strings ONLY for the negative pin — $trig carries the
+# template's narration comments (helm preserves them), which
+# legitimately cite the old counter as history.
+neg_queries=$(yq -N 'select(.kind=="ScaledObject" and .metadata.name=="rio-store") | .spec.triggers[] | select(.type=="prometheus") | .metadata.query' "$out")
+if grep -q 'rio_gateway_putpath_aborted_retries_total' <<<"$neg_queries"; then
+  echo "FAIL: a trigger query still consumes the aborted-only counter — that series is structurally flat during reachability outages (merged_bug_038); it persists for the I-168 dashboard only" >&2
+  exit 1
+fi
 # Probe-immunity (the law's population clause): the inhibitor must
 # NOT be built from health/SYN/accept-level series — those are
 # permanently nonzero under kubelet probing and would veto the Q6
@@ -50,7 +61,7 @@ if grep -qE 'grpc_health|grpc\.health|tcp_accept|syn' <<<"$trig"; then
 fi
 
 # Threshold = the named violable knob (values.yaml), wired verbatim.
-thr=$(yq -N 'select(.kind=="ScaledObject" and .metadata.name=="rio-store") | .spec.triggers[] | select(.metadata.query == "sum(rate(rio_gateway_putpath_aborted_retries_total[2m]))") | .metadata.threshold' "$out")
+thr=$(yq -N 'select(.kind=="ScaledObject" and .metadata.name=="rio-store") | .spec.triggers[] | select(.metadata.query == "sum(rate(rio_gateway_putpath_retry_events_total[2m]))") | .metadata.threshold' "$out")
 test "$thr" = "0.05" || {
   echo "FAIL: inhibitor threshold ($thr) != targetRetryAttemptsPerReplica default (0.05) — the named const is not wired" >&2
   exit 1
@@ -73,6 +84,34 @@ grep -q 'value: 100' <<<"$sd" || {
 for q in 'rio_scheduler_substituting_derivations' 'rio_scheduler_open_attempts'; do
   grep -q "$q" <<<"$trig" || {
     echo "FAIL: work trigger $q missing — the AGREE conjunction needs both planes on one object" >&2
+    exit 1
+  }
+done
+
+# merged_bug_038 (W10-BV, the per-class contract legs): the inhibitor
+# consumes the gateway's class-labeled PutPath retry counter — the
+# H8″ emit-law contract: Aborted / Unavailable / DeadlineExceeded
+# each an emitting arm at the client chokepoint. The render-level
+# halves pinned here: (a) the query SUMS ACROSS the class label (a
+# class= selector re-creates the aborted-only blindness that left
+# the trigger structurally flat during reachability outages), and
+# (b) the trigger narration names EVERY class of the alphabet (the
+# lexicon bind). The series-moves half lives crate-side beside the
+# emit law (inject each guarded class ⇒ the series moves ⇒ the
+# inhibitor holds the floor mid-outage).
+all_queries=$(yq -N 'select(.kind=="ScaledObject" and .metadata.name=="rio-store") | .spec.triggers[] | select(.type=="prometheus") | .metadata.query' "$out")
+case "$all_queries" in
+  *class=*)
+    echo "FAIL: a prometheus trigger narrows by class= — the inhibitor must aggregate the whole typed retry alphabet" >&2
+    exit 1
+    ;;
+esac
+# The landed alphabet's label values (rio_common code_class_label —
+# lowercase snake): the narration must name each guarded class AS
+# THE WIRE-FACING LABEL the query aggregates over.
+for cls in aborted unavailable deadline_exceeded resource_exhausted; do
+  grep -q "$cls" templates/store-scaledobject.yaml || {
+    echo "FAIL: trigger narration does not name typed retry class label '$cls' (the emit-law bind, merged_bug_038)" >&2
     exit 1
   }
 done
